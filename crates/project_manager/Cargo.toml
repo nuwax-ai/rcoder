@@ -1,0 +1,22 @@
+[package]
+name = "project_manager"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+shared_types = { path = "../shared_types" }
+dashmap.workspace = true
+# parking_lot removed - no longer needed without file_watcher
+tokio-fs.workspace = true
+path-clean.workspace = true
+chrono.workspace = true

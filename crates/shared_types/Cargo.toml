@@ -1,0 +1,13 @@
+[package]
+name = "shared_types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+agent-client-protocol.workspace = true
+chrono.workspace = true

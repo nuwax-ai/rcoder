@@ -1,0 +1,29 @@
+[package]
+name = "nuwax_parser"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+reqwest.workspace = true
+futures = { workspace = true }
+sha2.workspace = true
+hex.workspace = true
+walkdir.workspace = true
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lib]
+name = "nuwax_parser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "test_nuwax_parser"
+path = "src/bin/test_nuwax_parser.rs"

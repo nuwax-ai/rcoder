@@ -1,0 +1,23 @@
+[package]
+name = "http_server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+shared_types = { path = "../shared_types" }
+claude_integration = { path = "../claude_integration" }
+project_manager = { path = "../project_manager" }
+chrono.workspace = true

@@ -1,0 +1,65 @@
+[workspace]
+members = [
+    "crates/*",
+]
+exclude = [
+    "tmp/*",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# ACP Protocol
+agent-client-protocol = "0.4"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+
+# HTTP server
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID
+uuid = { version = "1.0", features = ["serde", "v4"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# File system watching
+notify = "6.0"
+
+# File system utilities
+tokio-fs = "0.1"
+path-clean = "1.0"
+
+# Utilities
+dashmap = "6.0"
+futures = "0.3"
+
+# Additional dependencies for nuwax_parser
+sha2 = "0.10"
+hex = "0.4"
+walkdir = "2.5"
+reqwest = { version = "0.11", features = ["stream"] }

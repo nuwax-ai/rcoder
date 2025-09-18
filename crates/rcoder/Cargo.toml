@@ -1,0 +1,21 @@
+[package]
+name = "rcoder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Internal crates
+acp_client = { path = "../acp_client" }
+claude_integration = { path = "../claude_integration" }
+http_server = { path = "../http_server" }
+project_manager = { path = "../project_manager" }
+shared_types = { path = "../shared_types" }
+nuwax_parser = { path = "../nuwax_parser" }
+
+# Workspace dependencies
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
