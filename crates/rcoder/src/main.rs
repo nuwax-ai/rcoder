@@ -1,5 +1,4 @@
 use anyhow::Result;
-use http_server::{run_server, http_interface::{HttpClaudeManager, HttpProjectManager}};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -21,15 +20,7 @@ async fn main() -> Result<()> {
     let working_dir = std::env::current_dir()?.join("projects");
     tokio::fs::create_dir_all(&working_dir).await?;
 
-    let project_manager = Arc::new(
-        HttpProjectManager::new(working_dir)
-    );
-
-    // Initialize Claude Code manager
-    let claude_manager = Arc::new(
-        HttpClaudeManager::new().await
-            .map_err(|e| anyhow::anyhow!("Failed to initialize Claude Code manager: {}", e))?
-    );
+ 
 
     // Start HTTP server
     let port = std::env::var("PORT")
@@ -39,9 +30,9 @@ async fn main() -> Result<()> {
 
     info!("Starting server on port {}", port);
 
-    run_server(claude_manager, project_manager, port)
-        .await
-        .map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
+    // run_server(claude_manager, project_manager, port)
+    //     .await
+    //     .map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
 
     info!("Server shutdown complete");
     Ok(())

@@ -1,0 +1,30 @@
+[package]
+name = "claude"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-client-protocol = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "time",
+    "io-std",
+    "io-util",
+    "net",
+    "process",
+    "sync",
+] }
+tokio-util = { workspace = true, features = ["compat"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+tracing = { workspace = true, features = ["log"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

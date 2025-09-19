@@ -7,13 +7,9 @@ license.workspace = true
 
 [dependencies]
 # Internal crates
-http_server = { path = "../http_server" }
 shared_types = { path = "../shared_types" }
 nuwax_parser = { path = "../nuwax_parser" }
-agent2 = { path = "../agent2" }
-agent_servers = { path = "../agent_servers" }
-acp_thread = { path = "../acp_thread" }
-project = { path = "../project" }
+
 
 # Workspace dependencies
 tokio.workspace = true
