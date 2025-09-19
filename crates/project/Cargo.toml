@@ -29,14 +29,14 @@ test-support = [
 [dependencies]
 aho-corasick.workspace = true
 anyhow.workspace = true
-askpass.workspace = true
+# askpass.workspace = true  # 这个包不存在
 async-trait.workspace = true
 base64.workspace = true
 buffer_diff.workspace = true
 circular-buffer.workspace = true
 client.workspace = true
 clock.workspace = true
-collections.workspace = true
+# collections.workspace = true  # 这个包不存在
 context_server.workspace = true
 dap.workspace = true
 extension.workspace = true
@@ -94,7 +94,7 @@ workspace-hack.workspace = true
 
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }
-collections = { workspace = true, features = ["test-support"] }
+# collections = { workspace = true, features = ["test-support"] }  # 这个包不存在
 context_server = { workspace = true, features = ["test-support"] }
 buffer_diff = { workspace = true, features = ["test-support"] }
 dap = { workspace = true, features = ["test-support"] }

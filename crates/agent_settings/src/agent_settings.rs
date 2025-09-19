@@ -2,7 +2,7 @@ mod agent_profile;
 
 use std::sync::Arc;
 
-use collections::IndexMap;
+use std::collections::HashMap;
 use gpui::{App, Pixels, px};
 use language_model::LanguageModel;
 use schemars::JsonSchema;
@@ -14,10 +14,7 @@ use settings::{
 
 pub use crate::agent_profile::*;
 
-pub const SUMMARIZE_THREAD_PROMPT: &str =
-    include_str!("../../agent/src/prompts/summarize_thread_prompt.txt");
-pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
-    include_str!("../../agent/src/prompts/summarize_thread_detailed_prompt.txt");
+// Prompt constants removed as they are not used in this crate
 
 pub fn init(cx: &mut App) {
     AgentSettings::register(cx);
@@ -56,15 +53,15 @@ impl AgentSettings {
     pub fn temperature_for_model(model: &Arc<dyn LanguageModel>, cx: &App) -> Option<f32> {
         let settings = Self::get_global(cx);
         for setting in settings.model_parameters.iter().rev() {
-            if let Some(provider) = &setting.provider
-                && provider.0 != model.provider_id().0
-            {
-                continue;
+            if let Some(provider) = &setting.provider {
+                if provider.0 != model.provider_id().0 {
+                    continue;
+                }
             }
-            if let Some(setting_model) = &setting.model
-                && *setting_model != model.id().0
-            {
-                continue;
+            if let Some(setting_model) = &setting.model {
+                if *setting_model != model.id().0 {
+                    continue;
+                }
             }
             return setting.temperature;
         }

@@ -22,3 +22,5 @@ agent-client-protocol.workspace = true
 agent_servers = { path = "../agent_servers" }
 acp_thread = { path = "../acp_thread" }
 chrono.workspace = true
+dashmap.workspace = true
+agent_client_protocol.workspace = true

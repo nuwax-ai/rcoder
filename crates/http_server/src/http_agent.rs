@@ -1,16 +1,16 @@
-use std::collections::HashMap;
-use std::collections::DashMap;
-use std::sync::Arc;
+use agent_client_protocol::MessageContent;
 use anyhow::Result;
+use chrono;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use chrono;
 
+use acp_thread::{AcpThread, AgentConnection as AcpThreadConnection};
 use agent_client_protocol as acp;
-use agent_servers::{AgentServer, AgentConnection};
-use acp_thread::{AgentConnection as AcpThreadConnection, AcpThread};
+use agent_servers::{AgentConnection, AgentServer};
 
 /// HTTP友好的Agent适配器
 pub struct HttpNativeAgent {
@@ -45,7 +45,11 @@ impl HttpNativeAgent {
     pub async fn create_session(&self, project_path: PathBuf) -> Result<Uuid> {
         let session_id = Uuid::new_v4();
 
-        info!("Creating HTTP session {} for project: {}", session_id, project_path.display());
+        info!(
+            "Creating HTTP session {} for project: {}",
+            session_id,
+            project_path.display()
+        );
 
         // 确保项目目录存在
         tokio::fs::create_dir_all(&project_path).await?;
@@ -68,11 +72,13 @@ impl HttpNativeAgent {
         };
 
         // 从模型信息中获取上下文限制和模型名称，如果没有则使用合理的默认值
-        let max_context_size = model_info.as_ref()
+        let max_context_size = model_info
+            .as_ref()
             .map(|m| m.max_tokens as usize)
             .unwrap_or(200000); // 如果没有模型信息，使用合理的默认值
 
-        let model_name = model_info.as_ref()
+        let model_name = model_info
+            .as_ref()
             .map(|m| m.name.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
@@ -95,15 +101,23 @@ impl HttpNativeAgent {
     }
 
     async fn create_acp_connection(&self, project_path: &PathBuf) -> Result<AcpThread> {
-        debug!("Creating ACP connection for project: {}", project_path.display());
+        debug!(
+            "Creating ACP connection for project: {}",
+            project_path.display()
+        );
 
         // Note: AcpThread::new requires a different signature than what we're trying to use
         // This method needs to be implemented properly with the correct ACP integration
         // For now, we'll return a placeholder error
-        Err(anyhow::anyhow!("ACP connection not yet implemented - needs proper Zed integration"))
+        Err(anyhow::anyhow!(
+            "ACP connection not yet implemented - needs proper Zed integration"
+        ))
     }
 
-    async fn extract_model_info_from_thread(&self, acp_thread: &AcpThread) -> Result<(Option<ModelInfo>, Option<acp::PromptCapabilities>)> {
+    async fn extract_model_info_from_thread(
+        &self,
+        acp_thread: &AcpThread,
+    ) -> Result<(Option<ModelInfo>, Option<acp::PromptCapabilities>)> {
         // 尝试从 ACP 线程获取模型信息
         // 注意：这里需要根据实际的 Zed ACP 线程 API 来实现
 
@@ -116,7 +130,10 @@ impl HttpNativeAgent {
         Ok((model_info, Some(capabilities)))
     }
 
-    async fn get_prompt_capabilities_from_thread(&self, acp_thread: &AcpThread) -> Result<acp::PromptCapabilities> {
+    async fn get_prompt_capabilities_from_thread(
+        &self,
+        acp_thread: &AcpThread,
+    ) -> Result<acp::PromptCapabilities> {
         // 这里需要调用 ACP 线程的方法来获取能力
         // 由于我们无法直接访问 Zed 的内部 API，这里提供一个默认实现
 
@@ -126,22 +143,27 @@ impl HttpNativeAgent {
         // 暂时返回一个通用的能力集
         Ok(acp::PromptCapabilities {
             meta: None,
-            image: true,  // 假设支持图片
-            audio: false, // 假设不支持音频
+            image: true,            // 假设支持图片
+            audio: false,           // 假设不支持音频
             embedded_context: true, // 支持嵌入式上下文
         })
     }
 
-    fn infer_model_info_from_capabilities(&self, capabilities: &acp::PromptCapabilities) -> Result<Option<ModelInfo>> {
+    fn infer_model_info_from_capabilities(
+        &self,
+        capabilities: &acp::PromptCapabilities,
+    ) -> Result<Option<ModelInfo>> {
         // 从 Claude Code 直接获取模型信息，不使用启发式推断
         // 这里应该调用 ACP 线程的 API 来获取真实的模型信息
         // 如果无法获取，返回 None 让调用者处理
         Ok(None)
     }
 
-
-
-    async fn update_model_info_from_response(&self, session_id: Uuid, response: &acp::Message) -> Result<()> {
+    async fn update_model_info_from_response(
+        &self,
+        session_id: Uuid,
+        response: &acp::Message,
+    ) -> Result<()> {
         // 从响应中提取模型信息并更新会话
         // 例如，响应中可能包含模型名称或 token 限制信息
 
@@ -158,7 +180,10 @@ impl HttpNativeAgent {
                         session.token_usage.model_name = info.name.clone();
                     }
 
-                    info!("Updated model info for session {}: {:?}", session_id, session.model_info);
+                    info!(
+                        "Updated model info for session {}: {:?}",
+                        session_id, session.model_info
+                    );
                 }
             }
         }
@@ -203,14 +228,19 @@ impl HttpNativeAgent {
     pub async fn send_prompt(&self, session_id: Uuid, prompt: String) -> Result<PromptResponse> {
         debug!("Sending prompt to session {}: {}", session_id, prompt);
 
-        let mut session = self.sessions.write().await.get_mut(&session_id)
-            .cloned()
+        let session = self
+            .sessions
+            .get(&session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
-        let acp_thread = session.acp_thread.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ACP connection not initialized for session: {}", session_id))?;
+        let acp_thread = session.acp_thread.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("ACP connection not initialized for session: {}", session_id)
+        })?;
 
         // 构建提示消息
+
+        agent_servers::acp::prompt(acp_thread, prompt, cx)
+        
         let prompt_message = self.build_prompt_message(&prompt).await?;
 
         // 发送提示到 Claude Code
@@ -226,8 +256,6 @@ impl HttpNativeAgent {
     }
 
     async fn build_prompt_message(&self, prompt: &str) -> Result<acp::Message> {
-        use acp::MessageContent;
-
         let content = MessageContent::Text {
             text: prompt.to_string(),
         };
@@ -253,7 +281,11 @@ impl HttpNativeAgent {
         })
     }
 
-    async fn process_response(&self, session_id: Uuid, response: acp::Message) -> Result<PromptResponse> {
+    async fn process_response(
+        &self,
+        session_id: Uuid,
+        response: acp::Message,
+    ) -> Result<PromptResponse> {
         use acp::MessageContent;
 
         let mut files_modified = Vec::new();
@@ -268,7 +300,8 @@ impl HttpNativeAgent {
                 token_usage = self.extract_token_usage_from_text(&text);
 
                 // 尝试从响应中提取模型信息
-                self.update_model_info_from_response(session_id, &response).await?;
+                self.update_model_info_from_response(session_id, &response)
+                    .await?;
             }
             MessageContent::ToolResult { result, .. } => {
                 // 处理工具结果，可能是文件修改
@@ -281,9 +314,11 @@ impl HttpNativeAgent {
                         }
                     }
                 }
-                response_text = result.get("output")
+                response_text = result
+                    .get("output")
                     .and_then(|o| o.as_str())
-                    .unwrap_or("Tool execution completed").to_string();
+                    .unwrap_or("Tool execution completed")
+                    .to_string();
 
                 // 尝试从工具结果中提取 token 使用情况
                 token_usage = self.extract_token_usage_from_result(&result);
@@ -342,21 +377,42 @@ impl HttpNativeAgent {
     }
 
     fn parse_token_usage(&self, usage_obj: &serde_json::Value) -> Option<TokenUsage> {
-        let input_tokens = usage_obj.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let output_tokens = usage_obj.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let cache_tokens = usage_obj.get("cache_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let input_tokens = usage_obj
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let output_tokens = usage_obj
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let cache_tokens = usage_obj
+            .get("cache_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
 
         // 获取模型信息
-        let model_name = usage_obj.get("model")
+        let model_name = usage_obj
+            .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
         let max_tokens = self.get_model_token_limit(model_name).unwrap_or(200000);
 
         if cache_tokens.is_some() {
-            Some(TokenUsage::with_cache(input_tokens, output_tokens, cache_tokens.unwrap(), max_tokens, model_name.to_string()))
+            Some(TokenUsage::with_cache(
+                input_tokens,
+                output_tokens,
+                cache_tokens.unwrap(),
+                max_tokens,
+                model_name.to_string(),
+            ))
         } else {
-            Some(TokenUsage::new(input_tokens, output_tokens, max_tokens, model_name.to_string()))
+            Some(TokenUsage::new(
+                input_tokens,
+                output_tokens,
+                max_tokens,
+                model_name.to_string(),
+            ))
         }
     }
 
@@ -373,7 +429,10 @@ impl HttpNativeAgent {
             // 更新上下文大小
             session.context_size = session.token_usage.total_tokens as usize;
 
-            debug!("Updated token usage for session {}: {:?}", session_id, session.token_usage);
+            debug!(
+                "Updated token usage for session {}: {:?}",
+                session_id, session.token_usage
+            );
         }
         Ok(())
     }
@@ -385,8 +444,10 @@ impl HttpNativeAgent {
 
             // 检查上下文大小是否超过限制
             if session.context_size > session.max_context_size {
-                warn!("Session {} context size {} exceeds limit {}",
-                      session_id, session.context_size, session.max_context_size);
+                warn!(
+                    "Session {} context size {} exceeds limit {}",
+                    session_id, session.context_size, session.max_context_size
+                );
 
                 // 这里可以实现上下文清理策略
                 self.cleanup_session_context(session);
@@ -406,8 +467,10 @@ impl HttpNativeAgent {
             session.context_size = session.max_context_size;
             session.message_count = session.message_count.max(10) - 10; // 保留最近10条消息
 
-            info!("Cleaned up session {} context, reduced to {} messages",
-                  session.id, session.message_count);
+            info!(
+                "Cleaned up session {} context, reduced to {} messages",
+                session.id, session.message_count
+            );
         }
     }
 
@@ -423,7 +486,10 @@ impl HttpNativeAgent {
                 // 关闭 ACP 连接
                 // Note: AcpThread doesn't have a shutdown method
                 // This should be implemented based on the actual ACP thread lifecycle
-                debug!("ACP connection cleanup for session {} (placeholder)", session_id);
+                debug!(
+                    "ACP connection cleanup for session {} (placeholder)",
+                    session_id
+                );
             }
         }
 
@@ -436,7 +502,11 @@ impl HttpNativeAgent {
     }
 
     pub async fn get_session_status(&self, session_id: Uuid) -> Result<SessionStatus> {
-        let session = self.sessions.read().await.get(&session_id)
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
         let status = if session.acp_thread.is_some() {
@@ -465,13 +535,19 @@ impl HttpNativeAgent {
     }
 
     pub async fn get_session_statistics(&self, session_id: Uuid) -> Result<SessionStatistics> {
-        let session = self.sessions.read().await.get(&session_id)
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
         Ok(SessionStatistics {
             session_id: session_id.to_string(),
             project_path: session.project_path.display().to_string(),
-            duration: chrono::Utc::now().signed_duration_since(session.created_at).num_seconds(),
+            duration: chrono::Utc::now()
+                .signed_duration_since(session.created_at)
+                .num_seconds(),
             message_count: session.message_count,
             context_size: session.context_size,
             max_context_size: session.max_context_size,
@@ -497,8 +573,15 @@ impl HttpNativeAgent {
         let total_tokens: u32 = sessions.values().map(|s| s.token_usage.total_tokens).sum();
 
         let total_context_size: usize = sessions.values().map(|s| s.context_size).sum();
-        let max_context_usage = sessions.values()
-            .map(|s| if s.max_context_size > 0 { s.context_size as f32 / s.max_context_size as f32 } else { 0.0 })
+        let max_context_usage = sessions
+            .values()
+            .map(|s| {
+                if s.max_context_size > 0 {
+                    s.context_size as f32 / s.max_context_size as f32
+                } else {
+                    0.0
+                }
+            })
             .fold(0.0, f32::max);
 
         GlobalStatistics {
@@ -508,7 +591,11 @@ impl HttpNativeAgent {
             total_tokens,
             total_context_size,
             max_context_usage,
-            average_tokens_per_session: if total_sessions > 0 { total_tokens / total_sessions as u32 } else { 0 },
+            average_tokens_per_session: if total_sessions > 0 {
+                total_tokens / total_sessions as u32
+            } else {
+                0
+            },
         }
     }
 }
@@ -544,7 +631,13 @@ impl TokenUsage {
         }
     }
 
-    pub fn with_cache(input_tokens: u32, output_tokens: u32, cache_tokens: u32, max_tokens: u32, model_name: String) -> Self {
+    pub fn with_cache(
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_tokens: u32,
+        max_tokens: u32,
+        model_name: String,
+    ) -> Self {
         Self {
             input_tokens,
             output_tokens,

@@ -7,10 +7,10 @@ use std::{
 };
 
 use agent_client_protocol as acp;
-use collections::HashMap;
+use std::collections::HashMap;
 use gpui::{
     App, Empty, Entity, EventEmitter, FocusHandle, Focusable, Global, ListAlignment, ListState,
-    StyleRefinement, Subscription, Task, TextStyleRefinement, Window, actions, list, prelude::*,
+    StyleRefinement, Subscription, Task, TextStyleRefinement, Window, Workspace, actions, list, prelude::*,
 };
 use language::LanguageRegistry;
 use markdown::{CodeBlockRenderer, Markdown, MarkdownElement, MarkdownStyle};
@@ -19,7 +19,6 @@ use settings::Settings;
 use theme::ThemeSettings;
 use ui::prelude::*;
 use util::ResultExt as _;
-use workspace::{Item, Workspace};
 
 actions!(dev, [OpenAcpLogs]);
 

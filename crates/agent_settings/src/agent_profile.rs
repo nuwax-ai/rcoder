@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use collections::IndexMap;
+use indexmap::IndexMap;
 use convert_case::{Case, Casing as _};
 use fs::Fs;
 use gpui::{App, SharedString};
@@ -30,7 +30,7 @@ pub struct AgentProfile {
     id: AgentProfileId,
 }
 
-pub type AvailableProfiles = IndexMap<AgentProfileId, SharedString>;
+pub type AvailableProfiles = HashMap<AgentProfileId, SharedString>;
 
 impl AgentProfile {
     pub fn new(id: AgentProfileId) -> Self {
@@ -93,9 +93,9 @@ impl AgentProfile {
 pub struct AgentProfileSettings {
     /// The name of the profile.
     pub name: SharedString,
-    pub tools: IndexMap<Arc<str>, bool>,
+    pub tools: HashMap<Arc<str>, bool>,
     pub enable_all_context_servers: bool,
-    pub context_servers: IndexMap<Arc<str>, ContextServerPreset>,
+    pub context_servers: HashMap<Arc<str>, ContextServerPreset>,
 }
 
 impl AgentProfileSettings {
@@ -168,7 +168,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
 
 #[derive(Debug, Clone, Default)]
 pub struct ContextServerPreset {
-    pub tools: IndexMap<Arc<str>, bool>,
+    pub tools: HashMap<Arc<str>, bool>,
 }
 
 impl From<settings::ContextServerPresetContent> for ContextServerPreset {

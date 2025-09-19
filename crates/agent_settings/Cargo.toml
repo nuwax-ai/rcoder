@@ -14,7 +14,7 @@ path = "src/agent_settings.rs"
 [dependencies]
 anyhow.workspace = true
 cloud_llm_client.workspace = true
-collections.workspace = true
+# collections.workspace = true  # 这个包不存在
 convert_case.workspace = true
 fs.workspace = true
 gpui.workspace = true

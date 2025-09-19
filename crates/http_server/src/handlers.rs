@@ -4,12 +4,12 @@ use axum::{
     response::Json,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use std::sync::Arc;
 
+use crate::http_interface::{CreateProjectRequest, HttpProject, PromptRequest, PromptResponse};
 use crate::AppState;
-use crate::http_interface::{CreateProjectRequest, PromptRequest, PromptResponse, HttpProject};
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -50,7 +50,10 @@ pub async fn create_project(
     info!("Creating project: {}", request.name);
 
     // Create project in project manager
-    let project = state.project_manager.create_project(request).await
+    let project = state
+        .project_manager
+        .create_project(request)
+        .await
         .map_err(|e| {
             error!("Failed to create project: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -65,7 +68,10 @@ pub async fn get_project(
 ) -> Result<Json<HttpProject>, StatusCode> {
     debug!("Getting project: {}", project_id);
 
-    let project = state.project_manager.get_project(project_id).await
+    let project = state
+        .project_manager
+        .get_project(project_id)
+        .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(project))
@@ -85,7 +91,10 @@ pub async fn update_project(
     info!("Updating project: {}", project_id);
 
     // TODO: 实现项目更新逻辑
-    let project = state.project_manager.get_project(project_id).await
+    let project = state
+        .project_manager
+        .get_project(project_id)
+        .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(project))
@@ -97,7 +106,10 @@ pub async fn delete_project(
 ) -> Result<StatusCode, StatusCode> {
     info!("Deleting project: {}", project_id);
 
-    state.project_manager.delete_project(project_id).await
+    state
+        .project_manager
+        .delete_project(project_id)
+        .await
         .map_err(|e| {
             error!("Failed to delete project: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -140,7 +152,10 @@ pub async fn send_prompt(
 
     let project_id = if let Some(id) = request.project_id {
         // Use existing project
-        let _project = state.project_manager.get_project(id).await
+        let _project = state
+            .project_manager
+            .get_project(id)
+            .await
             .ok_or(StatusCode::NOT_FOUND)?;
         id
     } else {
@@ -149,12 +164,13 @@ pub async fn send_prompt(
             .unwrap_or_else(|| "auto-project".to_string());
 
         let create_request = CreateProjectRequest {
-            name: project_name.clone(),
-            description: Some(format!("Auto-created project for prompt: {}", &request.prompt[..100.min(request.prompt.len())])),
-            template: None,
+            user_id: request.user_id,
         };
 
-        let project = state.project_manager.create_project(create_request).await
+        let project = state
+            .project_manager
+            .create_project(create_request)
+            .await
             .map_err(|e| {
                 error!("Failed to auto-create project: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -164,7 +180,16 @@ pub async fn send_prompt(
     };
 
     // Send prompt to Claude Code
-    let response = state.claude_manager.send_prompt(project_id, request.prompt).await
+    let project = state
+        .project_manager
+        .get_project(project_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let project_id = project.id;
+    let response = state
+        .claude_manager
+        .send_prompt(project_id, request.prompt)
+        .await
         .map_err(|e| {
             error!("Failed to process prompt: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -208,7 +233,10 @@ fn extract_template_from_prompt(prompt: &str) -> Option<String> {
 
     if prompt_lower.contains("rust") || prompt_lower.contains("api") {
         Some("rust-web-api".to_string())
-    } else if prompt_lower.contains("react") || prompt_lower.contains("frontend") || prompt_lower.contains("web") {
+    } else if prompt_lower.contains("react")
+        || prompt_lower.contains("frontend")
+        || prompt_lower.contains("web")
+    {
         Some("react-frontend".to_string())
     } else if prompt_lower.contains("python") || prompt_lower.contains("cli") {
         Some("python-cli".to_string())
@@ -223,7 +251,10 @@ pub async fn get_prompt_status(
 ) -> Result<Json<PromptResponse>, StatusCode> {
     debug!("Getting prompt status: {}", prompt_id);
 
-    let response = state.claude_manager.get_prompt_status(prompt_id).await
+    let response = state
+        .claude_manager
+        .get_prompt_status(prompt_id)
+        .await
         .map_err(|e| {
             error!("Failed to get prompt status: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR

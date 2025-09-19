@@ -72,44 +72,24 @@ path-clean = "1.0"
 dashmap = "6.0"
 futures = "0.3"
 itertools = "0.14"
-collections = "0.2"
+# collections = "0.2"  # 这个包不存在
 
-# Zed dependencies
+# Zed 核心依赖 - 保留 ACP 协议实现必需的组件
 util = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "util" }
 settings = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "settings" }
-gpui = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "gpui" }
-ui = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "ui" }
+text = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "text" }
+url = "2.5"  # 使用 crates.io 版本
+paths = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "paths" }
+watch = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "watch" }
+buffer_diff = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "buffer_diff" }
+action_log = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "action_log" }
 language = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "language" }
 language_model = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "language_model" }
 project = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "project" }
 fs = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "fs" }
-editor = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "editor" }
-terminal = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "terminal" }
 task = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "task" }
 markdown = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "markdown" }
-text = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "text" }
-url = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "url" }
-paths = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "paths" }
-watch = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "watch" }
-workspace-hack = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "workspace-hack" }
-buffer_diff = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "buffer_diff" }
-action_log = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "action_log" }
-client = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "client" }
-context_server = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "context_server" }
-language_models = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "language_models" }
 prompt_store = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "prompt_store" }
-http_client = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "http_client" }
-rpc = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "rpc" }
-remote = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "remote" }
-git = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "git" }
-lsp = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "lsp" }
-node_runtime = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "node_runtime" }
-worktree = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "worktree" }
-db = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "db" }
-sqlez = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "sqlez" }
-telemetry = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "telemetry" }
-portable-pty = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "portable-pty" }
-file_icons = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "file_icons" }
 assistant_context = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "assistant_context" }
 assistant_tool = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "assistant_tool" }
 assistant_tools = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "assistant_tools" }
@@ -117,6 +97,25 @@ cloud_llm_client = { git = "https://github.com/zed-industries/zed.git", branch =
 html_to_markdown = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "html_to_markdown" }
 web_search = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "web_search" }
 zed_env_vars = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "zed_env_vars" }
+# 核心依赖 - 保留 ACP 协议实现必需的
+gpui = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "gpui" }
+ui = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "ui" }
+theme = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "theme" }
+terminal = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "terminal" }
+portable-pty = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "portable-pty" }
+agent = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "agent" }
+client = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "client" }
+context_server = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "context_server" }
+language_models = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "language_models" }
+http_client = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "http_client" }
+remote = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "remote" }
+git = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "git" }
+lsp = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "lsp" }
+node_runtime = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "node_runtime" }
+telemetry = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "telemetry" }
+file_icons = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "file_icons" }
+# 核心依赖
+editor = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "editor" }
 agent_settings = { path = "crates/agent_settings" }
 acp_thread = { path = "crates/acp_thread" }
 agent_servers = { path = "crates/agent_servers" }
@@ -130,18 +129,28 @@ handlebars = { version = "6.0", features = ["rust-embed"] }
 rust-embed = "8.0"
 zstd = "0.13"
 
-# Additional dependencies for Zed crates
+# acp 协议
+agent_client_protocol="0.4"
+
+# 构建工具
+derive_builder = "0.20"
+
+# Zed 核心功能依赖
 libc = "0.2"
-nix = { version = "0.30", features = ["fs", "process", "term"] }
-gpui_tokio = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "gpui_tokio" }
+nix = { version = "0.30.1", features = ["fs", "process", "term"] }
 reqwest_client = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "reqwest_client" }
+gpui_tokio = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "gpui_tokio" }
 clock = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "clock" }
-theme = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "theme" }
-tree-sitter-rust = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "tree-sitter-rust" }
-unindent = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "unindent" }
+unindent = "0.1"  # 使用 crates.io 版本
+open = "5.0"  # 使用 crates.io 版本
+git2 = "0.20.1"
+rpc = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "rpc" }
+worktree = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "worktree" }
+db = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "db" }
+sqlez = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "sqlez" }
+workspace-hack = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "workspace-hack" }
+tree-sitter-rust = "0.21"  # 使用 crates.io 版本
 zlog = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "zlog" }
-open = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "open" }
-agent = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "agent" }
 
 # Additional dependencies for nuwax_parser
 sha2 = "0.10"
@@ -149,13 +158,13 @@ hex = "0.4"
 walkdir = "2.5"
 reqwest = { version = "0.12", features = ["stream"] }
 
-# Additional dependencies from project crate
+# 项目依赖 - 保留核心功能
 aho-corasick = "1.0"
-askpass = "0.1"
+# askpass = "0.1"  # 这个包不存在
 base64 = "0.21"
 circular-buffer = "0.1"
 fancy-regex = "0.11"
-fuzzy = "0.1"
+fuzzy = "0.0.1"
 git_hosting_providers = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "git_hosting_providers" }
 globset = "0.4"
 image = "0.24"
@@ -176,7 +185,6 @@ which = "4.0"
 dap = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "dap" }
 dap_adapters = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "dap_adapters" }
 extension = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "extension" }
-git2 = "0.18"
 release_channel = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "release_channel" }
 
 # Dev dependencies for testing
