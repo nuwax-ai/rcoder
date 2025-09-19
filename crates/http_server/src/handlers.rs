@@ -2,15 +2,14 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
-    Json as AxumJson,
 };
 use serde::{Deserialize, Serialize};
-use shared_types::{CreateProjectRequest, PromptRequest, PromptResponse, Project};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::http_interface::{CreateProjectRequest, PromptRequest, PromptResponse, HttpProject};
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -37,31 +36,17 @@ pub struct ListProjectsQuery {
 pub async fn list_projects(
     State(state): State<AppState>,
     Query(params): Query<ListProjectsQuery>,
-) -> Result<Json<Vec<Project>>, StatusCode> {
+) -> Result<Json<Vec<HttpProject>>, StatusCode> {
     debug!("Listing projects with query: {:?}", params);
 
-    let projects = if let Some(search) = &params.search {
-        // In a real implementation, you would add search functionality
-        state.project_manager.list_projects().await
-            .map_err(|e| {
-                error!("Failed to list projects: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })
-    } else {
-        state.project_manager.list_projects().await
-            .map_err(|e| {
-                error!("Failed to list projects: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })
-    };
-
-    projects.map(Json)
+    let projects = state.project_manager.list_projects().await;
+    Ok(Json(projects))
 }
 
 pub async fn create_project(
     State(state): State<AppState>,
-    AxumJson(request): AxumJson<CreateProjectRequest>,
-) -> Result<Json<Project>, StatusCode> {
+    Json(request): Json<CreateProjectRequest>,
+) -> Result<Json<HttpProject>, StatusCode> {
     info!("Creating project: {}", request.name);
 
     // Create project in project manager
@@ -71,30 +56,13 @@ pub async fn create_project(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Initialize with Claude Code
-    match state.claude_manager.create_project(
-        &project.name,
-        project.description.as_deref(),
-        request.template.as_deref(),
-        Some(&project.path),
-    ).await {
-        Ok(claude_project_id) => {
-            info!("Project initialized with Claude Code: {}", claude_project_id);
-        }
-        Err(e) => {
-            error!("Failed to initialize project with Claude Code: {}", e);
-            // We still return the project since it was created successfully
-            warn!("Project created but Claude Code initialization failed");
-        }
-    }
-
     Ok(Json(project))
 }
 
 pub async fn get_project(
     State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Project>, StatusCode> {
+) -> Result<Json<HttpProject>, StatusCode> {
     debug!("Getting project: {}", project_id);
 
     let project = state.project_manager.get_project(project_id).await
@@ -112,20 +80,13 @@ pub struct UpdateProjectRequest {
 pub async fn update_project(
     State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
-    AxumJson(request): AxumJson<UpdateProjectRequest>,
-) -> Result<Json<Project>, StatusCode> {
+    Json(request): Json<UpdateProjectRequest>,
+) -> Result<Json<HttpProject>, StatusCode> {
     info!("Updating project: {}", project_id);
 
-    let updates = project_manager::ProjectUpdate {
-        name: request.name,
-        description: request.description,
-    };
-
-    let project = state.project_manager.update_project(project_id, &updates).await
-        .map_err(|e| {
-            error!("Failed to update project: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // TODO: 实现项目更新逻辑
+    let project = state.project_manager.get_project(project_id).await
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(project))
 }
@@ -136,13 +97,6 @@ pub async fn delete_project(
 ) -> Result<StatusCode, StatusCode> {
     info!("Deleting project: {}", project_id);
 
-    // First delete from Claude Code
-    if let Err(e) = state.claude_manager.delete_project(project_id).await {
-        error!("Failed to delete project from Claude Code: {}", e);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // Then delete from project manager
     state.project_manager.delete_project(project_id).await
         .map_err(|e| {
             error!("Failed to delete project: {}", e);
@@ -158,13 +112,14 @@ pub async fn get_project_stats(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     debug!("Getting project stats: {}", project_id);
 
-    let stats = state.project_manager.get_project_stats(project_id).await
-        .map_err(|e| {
-            error!("Failed to get project stats: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // TODO: 实现项目统计
+    let stats = serde_json::json!({
+        "project_id": project_id,
+        "file_count": 0,
+        "last_updated": chrono::Utc::now()
+    });
 
-    Ok(Json(serde_json::to_value(stats).unwrap()))
+    Ok(Json(stats))
 }
 
 pub async fn get_project_files(
@@ -173,71 +128,43 @@ pub async fn get_project_files(
 ) -> Result<Json<Vec<std::path::PathBuf>>, StatusCode> {
     debug!("Getting project files: {}", project_id);
 
-    let files = state.project_manager.get_project_files(project_id).await
-        .map_err(|e| {
-            error!("Failed to get project files: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(Json(files))
+    // TODO: 实现文件列表获取
+    Ok(Json(vec![]))
 }
 
 pub async fn send_prompt(
     State(state): State<AppState>,
-    AxumJson(request): AxumJson<PromptRequest>,
+    Json(request): Json<PromptRequest>,
 ) -> Result<Json<PromptResponse>, StatusCode> {
     info!("Processing prompt: {}", request.prompt);
 
     let project_id = if let Some(id) = request.project_id {
         // Use existing project
-        let project = state.project_manager.get_project(id).await
+        let _project = state.project_manager.get_project(id).await
             .ok_or(StatusCode::NOT_FOUND)?;
         id
     } else {
         // Auto-create project based on prompt
-        let auto_create = request.auto_create.unwrap_or(true);
-        if !auto_create {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
         let project_name = extract_project_name_from_prompt(&request.prompt)
             .unwrap_or_else(|| "auto-project".to_string());
 
-        let project = state.project_manager.create_project(shared_types::CreateProjectRequest {
+        let create_request = CreateProjectRequest {
             name: project_name.clone(),
             description: Some(format!("Auto-created project for prompt: {}", &request.prompt[..100.min(request.prompt.len())])),
             template: None,
-            path: None,
-        }).await.map_err(|e| {
-            error!("Failed to auto-create project: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        };
 
-        // Initialize with Claude Code
-        match state.claude_manager.create_project(
-            &project.name,
-            project.description.as_deref(),
-            None, // Let Claude Code detect the template from prompt
-            Some(&project.path),
-        ).await {
-            Ok(claude_project_id) => {
-                info!("Auto-created project initialized with Claude Code: {}", claude_project_id);
-            }
-            Err(e) => {
-                error!("Failed to initialize auto-created project with Claude Code: {}", e);
-                warn!("Auto-created project but Claude Code initialization failed");
-            }
-        }
+        let project = state.project_manager.create_project(create_request).await
+            .map_err(|e| {
+                error!("Failed to auto-create project: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         project.id
     };
 
     // Send prompt to Claude Code
-    let response = state.claude_manager.process_prompt(
-        project_id,
-        &request.prompt,
-        request.context.as_ref().map(|c| c.files.clone()),
-    ).await
+    let response = state.claude_manager.send_prompt(project_id, request.prompt).await
         .map_err(|e| {
             error!("Failed to process prompt: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -292,13 +219,17 @@ fn extract_template_from_prompt(prompt: &str) -> Option<String> {
 
 pub async fn get_prompt_status(
     State(state): State<AppState>,
-    Path((project_id, prompt_id)): Path<(Uuid, Uuid)>,
+    Path(prompt_id): Path<Uuid>,
 ) -> Result<Json<PromptResponse>, StatusCode> {
-    debug!("Getting prompt status for project {}: {}", project_id, prompt_id);
+    debug!("Getting prompt status: {}", prompt_id);
 
-    // In a real implementation, you would fetch the prompt status from the database
-    // For now, we'll return a placeholder
-    Err(StatusCode::NOT_IMPLEMENTED)
+    let response = state.claude_manager.get_prompt_status(prompt_id).await
+        .map_err(|e| {
+            error!("Failed to get prompt status: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(response))
 }
 
 #[derive(Serialize)]
@@ -309,33 +240,7 @@ pub struct TemplateResponse {
     pub files: Vec<String>,
 }
 
-pub async fn list_templates(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<TemplateResponse>>, StatusCode> {
-    debug!("Listing templates");
-
-    let templates = state.claude_manager.template_manager.list_templates();
-    let response = templates.into_iter().map(|t| TemplateResponse {
-        name: t.name.clone(),
-        description: t.description.clone(),
-        language: t.language.clone(),
-        files: t.files.keys().cloned().collect(),
-    }).collect();
-
-    Ok(Json(response))
-}
-
-pub async fn get_template(
-    State(state): State<AppState>,
-    Path(template_name): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    debug!("Getting template: {}", template_name);
-
-    let template = state.claude_manager.template_manager.get_template(&template_name)
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    Ok(Json(serde_json::to_value(template).unwrap()))
-}
+// Template functions removed - templates will be handled by MCP tools
 
 #[derive(Serialize)]
 pub struct ErrorResponse {

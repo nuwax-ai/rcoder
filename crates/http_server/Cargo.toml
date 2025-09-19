@@ -18,6 +18,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 shared_types = { path = "../shared_types" }
-claude_integration = { path = "../claude_integration" }
-project_manager = { path = "../project_manager" }
+agent-client-protocol.workspace = true
+agent_servers = { path = "../agent_servers" }
+acp_thread = { path = "../acp_thread" }
 chrono.workspace = true

@@ -3,7 +3,6 @@ use axum::{
     extract::{MatchedPath, Request},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
-    RequestExt,
 };
 use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::{debug, error, info, span, Level, Span};

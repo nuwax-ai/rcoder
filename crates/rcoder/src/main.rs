@@ -1,7 +1,5 @@
 use anyhow::Result;
-use claude_integration::ClaudeCodeManager;
-use http_server::run_server;
-use project_manager::ProjectManager;
+use http_server::{run_server, http_interface::{HttpClaudeManager, HttpProjectManager}};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -20,23 +18,18 @@ async fn main() -> Result<()> {
     info!("Starting rcoder - AI-powered development platform");
 
     // Initialize project manager
-    let database_url = "sqlite:///./rcoder.db";
+    let working_dir = std::env::current_dir()?.join("projects");
+    tokio::fs::create_dir_all(&working_dir).await?;
+
     let project_manager = Arc::new(
-        ProjectManager::new(database_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to initialize project manager: {}", e))?,
+        HttpProjectManager::new(working_dir)
     );
 
     // Initialize Claude Code manager
-    let mut claude_manager = ClaudeCodeManager::new()
-        .map_err(|e| anyhow::anyhow!("Failed to initialize Claude Code manager: {}", e))?;
-
-    // Initialize Claude Code connection
-    claude_manager.initialize()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to initialize Claude Code: {}", e))?;
-
-    let claude_manager = Arc::new(claude_manager);
+    let claude_manager = Arc::new(
+        HttpClaudeManager::new().await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize Claude Code manager: {}", e))?
+    );
 
     // Start HTTP server
     let port = std::env::var("PORT")

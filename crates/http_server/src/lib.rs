@@ -6,8 +6,6 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use shared_types::{CreateProjectRequest, PromptRequest, PromptResponse, Project};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::cors::{CorsLayer, Any};
 use tracing::{debug, error, info, warn};
@@ -15,18 +13,21 @@ use uuid::Uuid;
 
 pub mod handlers;
 pub mod middleware;
+pub mod http_interface;
+pub mod http_agent;
 
 use handlers::*;
 use middleware::*;
+use http_interface::{HttpClaudeManager, HttpProjectManager};
 
 pub struct AppState {
-    pub claude_manager: Arc<claude_integration::ClaudeCodeManager>,
-    pub project_manager: Arc<project_manager::ProjectManager>,
+    pub claude_manager: Arc<HttpClaudeManager>,
+    pub project_manager: Arc<HttpProjectManager>,
 }
 
 pub async fn create_app(
-    claude_manager: Arc<claude_integration::ClaudeCodeManager>,
-    project_manager: Arc<project_manager::ProjectManager>,
+    claude_manager: Arc<HttpClaudeManager>,
+    project_manager: Arc<HttpProjectManager>,
 ) -> Router {
     let state = AppState {
         claude_manager,
@@ -35,7 +36,7 @@ pub async fn create_app(
 
     Router::new()
         .route("/api/health", get(health_check))
-        .route("/api/projects", get(list_projects))
+        .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/:id", get(get_project).put(update_project).delete(delete_project))
         .route("/api/projects/:id/stats", get(get_project_stats))
         .route("/api/projects/:id/files", get(get_project_files))
@@ -47,8 +48,8 @@ pub async fn create_app(
 }
 
 pub async fn run_server(
-    claude_manager: Arc<claude_integration::ClaudeCodeManager>,
-    project_manager: Arc<project_manager::ProjectManager>,
+    claude_manager: Arc<HttpClaudeManager>,
+    project_manager: Arc<HttpProjectManager>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     info!("Starting HTTP server on port {}", port);

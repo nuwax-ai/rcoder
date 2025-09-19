@@ -23,7 +23,7 @@
 //!     let project_path = PathBuf::from("./my-project");
 //!     let v0_result = project_to_v0_result(&project_path, true).await?;
 //!     println!("Found {} files", v0_result.files.len());
-//!     Ok(())
+//!     Ok(()) 
 //! }
 //! ```
 
