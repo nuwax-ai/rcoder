@@ -66,7 +66,7 @@ impl HttpProjectManager {
 /// HTTP友好的Claude Code管理器
 pub struct HttpClaudeManager {
     agent: Arc<HttpNativeAgent>,
-    project_sessions: Arc<RwLock<HashMap<Uuid, Uuid>>>, // project_id -> session_id
+    project_sessions: DashMap<Uuid, Uuid>, // project_id -> session_id
 }
 
 impl HttpClaudeManager {
@@ -151,9 +151,15 @@ impl HttpClaudeManager {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateProjectRequest {
-    pub name: String,
-    pub description: Option<String>,
-    pub template: Option<String>,
+    pub user_id: String,
+    pub uuid: String,
+}
+
+impl CreateProjectRequest {
+    pub fn new(user_id: String) -> Self {
+        Self { user_id, uuid: Uuid::now_v7().to_string() }
+    }
+    
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -171,4 +177,3 @@ pub struct PromptResponse {
     pub files_modified: Vec<String>,
     pub token_usage: Option<TokenUsage>,
 }
-

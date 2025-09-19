@@ -2,7 +2,7 @@
 name = "acp_tools"
 version = "0.1.0"
 edition.workspace = true
-publish.workspace = true
+publish = false
 license = "GPL-3.0-or-later"
 
 
@@ -27,4 +27,3 @@ theme.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace-hack.workspace = true
-workspace.workspace = true

@@ -7,11 +7,20 @@ exclude = [
 ]
 resolver = "2"
 
+[workspace.lints]
+rustdoc.unbroken_backticks = "warn"
+rustdoc.redundant_explicit_links = "warn"
+rust.unused_lifetimes = "warn"
+rust.unused_qualifications = "warn"
+rust.variant_size_differences = "warn"
+rust.allow_leading_underscore = "warn"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["Your Name <your.email@example.com>"]
 license = "MIT OR Apache-2.0"
+publish = false
 
 [workspace.dependencies]
 # ACP Protocol
@@ -33,6 +42,7 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_json_lenient = "0.1"
 schemars = { version = "0.8", features = ["derive"] }
 
 # Error handling
@@ -46,7 +56,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # UUID
-uuid = { version = "1.0", features = ["serde", "v4"] }
+uuid = { version = "1.0", features = ["serde", "v4","v7"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
@@ -107,6 +117,10 @@ cloud_llm_client = { git = "https://github.com/zed-industries/zed.git", branch =
 html_to_markdown = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "html_to_markdown" }
 web_search = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "web_search" }
 zed_env_vars = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "zed_env_vars" }
+agent_settings = { path = "crates/agent_settings" }
+acp_thread = { path = "crates/acp_thread" }
+agent_servers = { path = "crates/agent_servers" }
+acp_tools = { path = "crates/acp_tools" }
 
 # Additional utilities
 indoc = "2.0"
@@ -135,7 +149,38 @@ hex = "0.4"
 walkdir = "2.5"
 reqwest = { version = "0.12", features = ["stream"] }
 
+# Additional dependencies from project crate
+aho-corasick = "1.0"
+askpass = "0.1"
+base64 = "0.21"
+circular-buffer = "0.1"
+fancy-regex = "0.11"
+fuzzy = "0.1"
+git_hosting_providers = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "git_hosting_providers" }
+globset = "0.4"
+image = "0.24"
+indexmap = "2.0"
+pathdiff = "0.2"
+postage = "0.5"
+prettier = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "prettier" }
+regex = "1.0"
+semver = "1.0"
+shellexpand = "3.0"
+shlex = "1.0"
+smallvec = "1.0"
+snippet = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "snippet" }
+snippet_provider = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "snippet_provider" }
+sum_tree = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "sum_tree" }
+toml = "0.8"
+which = "4.0"
+dap = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "dap" }
+dap_adapters = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "dap_adapters" }
+extension = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "extension" }
+git2 = "0.18"
+release_channel = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "release_channel" }
+
 # Dev dependencies for testing
 ctor = "0.5"
 pretty_assertions = "1.4"
 tempfile = "3.8"
+rand = "0.8"

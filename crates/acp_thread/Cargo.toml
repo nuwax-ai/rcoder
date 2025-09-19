@@ -2,7 +2,7 @@
 name = "acp_thread"
 version = "0.1.0"
 edition.workspace = true
-publish.workspace = true
+publish = false
 license = "GPL-3.0-or-later"
 
 [lints]

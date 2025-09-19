@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::DashMap;
 use std::sync::Arc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -14,8 +14,8 @@ use acp_thread::{AgentConnection as AcpThreadConnection, AcpThread};
 
 /// HTTP友好的Agent适配器
 pub struct HttpNativeAgent {
-    connections: Arc<RwLock<HashMap<Uuid, Arc<dyn AgentConnection>>>>,
-    sessions: Arc<RwLock<HashMap<Uuid, HttpSession>>>,
+    connections: DashMap<Uuid, Arc<dyn AgentConnection>>,
+    sessions: DashMap<Uuid, HttpSession>,
     working_dir: PathBuf,
 }
 
@@ -36,8 +36,8 @@ pub struct HttpSession {
 impl HttpNativeAgent {
     pub fn new() -> Self {
         Self {
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            connections: DashMap::new(),
+            sessions: DashMap::new(),
             working_dir: std::env::current_dir().unwrap_or_default(),
         }
     }
