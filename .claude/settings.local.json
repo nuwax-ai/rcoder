@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Read(//Users/soddy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-0.4.0/rust/**)"
+      "Read(//Users/soddy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-0.4.0/rust/**)",
+      "Read(//Volumes/soddy/**)"
     ],
     "deny": [],
     "ask": []
