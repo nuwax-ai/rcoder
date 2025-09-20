@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
-    response::Json,
+    response::{Json, Sse, sse::Event},
     routing::{get, post},
     Router,
 };
@@ -10,11 +10,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use futures::stream::Stream;
 
 mod http_result;
 use http_result::HttpResult;
@@ -74,6 +78,52 @@ impl std::fmt::Display for AgentType {
     }
 }
 
+/// AI 任务进度事件
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgressEvent {
+    /// 事件类型
+    pub event_type: ProgressEventType,
+    /// 事件消息
+    pub message: String,
+    /// 时间戳
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// 会话ID
+    pub session_id: String,
+    /// 可选的数据
+    pub data: Option<serde_json::Value>,
+}
+
+/// 进度事件类型
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressEventType {
+    /// 任务开始
+    TaskStarted,
+    /// 执行中
+    Executing,
+    /// 命令输出
+    CommandOutput,
+    /// 任务完成
+    TaskCompleted,
+    /// 任务失败
+    TaskFailed,
+    /// 连接保持活跃
+    KeepAlive,
+}
+
+impl std::fmt::Display for ProgressEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProgressEventType::TaskStarted => write!(f, "task_started"),
+            ProgressEventType::Executing => write!(f, "executing"),
+            ProgressEventType::CommandOutput => write!(f, "command_output"),
+            ProgressEventType::TaskCompleted => write!(f, "task_completed"),
+            ProgressEventType::TaskFailed => write!(f, "task_failed"),
+            ProgressEventType::KeepAlive => write!(f, "keep_alive"),
+        }
+    }
+}
+
 /// 应用配置
 #[derive(Debug, Clone)]
 struct AppConfig {
@@ -102,6 +152,8 @@ struct AppState {
     sessions: DashMap<String, SessionInfo>,
     /// 应用配置
     config: AppConfig,
+    /// 进度事件广播通道（session_id -> 发送者列表）
+    progress_senders: DashMap<String, Vec<mpsc::UnboundedSender<ProgressEvent>>>,
 }
 
 type SharedState = Arc<AppState>;
@@ -116,6 +168,33 @@ fn get_trace_id() -> Option<String> {
     // 移除连字符，转换为纯十六进制格式
     let trace_id = uuid.to_string().replace("-", "");
     Some(trace_id)
+}
+
+/// 广播进度事件给所有监听者
+fn broadcast_progress_event(state: &SharedState, session_id: &str, event: ProgressEvent) {
+    if let Some(senders) = state.progress_senders.get(session_id) {
+        let senders = senders.value();
+        let mut failed_indices = Vec::new();
+        
+        for (index, sender) in senders.iter().enumerate() {
+            if let Err(_) = sender.send(event.clone()) {
+                failed_indices.push(index);
+            }
+        }
+        
+        // 清理失败的发送者
+        if !failed_indices.is_empty() {
+            drop(senders); // 释放引用
+            if let Some(mut senders) = state.progress_senders.get_mut(session_id) {
+                // 从后往前删除，避免索引偏移
+                for &index in failed_indices.iter().rev() {
+                    if index < senders.len() {
+                        senders.remove(index);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ==================== HTTP 处理器 ====================
@@ -177,7 +256,7 @@ async fn handle_chat(
     };
 
     // 调用 AI 代理处理请求
-    match execute_ai_command(&agent_type, &request, &state.config).await {
+    match execute_ai_command(&agent_type, &request, &state.config, &state, &session_id).await {
         Ok(response) => {
             // 更新会话活动时间
             update_session_activity(&state, &session_id).await;
@@ -267,6 +346,51 @@ async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
+/// SSE 进度推送端点
+async fn progress_stream(
+    State(state): State<SharedState>,
+    Path(session_id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    
+    // 将新的发送者添加到广播列表中
+    {
+        let mut senders = state.progress_senders.entry(session_id.clone()).or_insert_with(Vec::new);
+        senders.push(tx.clone());
+    }
+    
+    info!("新的 SSE 连接已建立为 session: {}", session_id);
+    
+    // 发送初始连接事件
+    let connect_event = ProgressEvent {
+        event_type: ProgressEventType::KeepAlive,
+        message: "SSE connection established".to_string(),
+        timestamp: chrono::Utc::now(),
+        session_id: session_id.clone(),
+        data: None,
+    };
+    
+    if let Err(e) = tx.send(connect_event) {
+        error!("发送初始连接事件失败: {}", e);
+    }
+    
+    // 创建流
+    let stream = UnboundedReceiverStream::new(rx)
+        .map(|event| {
+            let json_data = serde_json::to_string(&event).unwrap_or_default();
+            Ok(Event::default()
+                .event(&event.event_type.to_string())
+                .data(&json_data))
+        });
+    
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("keep-alive-text")
+        )
+}
+
 // ==================== 辅助函数 ====================
 
 /// 创建新会话
@@ -299,7 +423,22 @@ async fn execute_ai_command(
     agent_type: &AgentType,
     request: &ChatRequest,
     config: &AppConfig,
-) -> Result<String> {
+    state: &SharedState,
+    session_id: &str,
+) -> anyhow::Result<String> {
+    // 发送任务开始事件
+    let start_event = ProgressEvent {
+        event_type: ProgressEventType::TaskStarted,
+        message: format!("开始执行 AI 任务: {}", agent_type),
+        timestamp: chrono::Utc::now(),
+        session_id: session_id.to_string(),
+        data: Some(serde_json::json!({
+            "agent_type": agent_type.to_string(),
+            "prompt": request.prompt
+        })),
+    };
+    broadcast_progress_event(state, session_id, start_event);
+
     let command = match agent_type {
         AgentType::Codex => "codex",
         AgentType::Claude => "claude",
@@ -318,16 +457,57 @@ async fn execute_ai_command(
     
     info!("Executing command: {} {:?}", command, request.prompt);
     
+    // 发送执行中事件
+    let executing_event = ProgressEvent {
+        event_type: ProgressEventType::Executing,
+        message: format!("正在执行命令: {} {}", command, request.prompt),
+        timestamp: chrono::Utc::now(),
+        session_id: session_id.to_string(),
+        data: Some(serde_json::json!({
+            "command": command,
+            "args": [request.prompt.clone()]
+        })),
+    };
+    broadcast_progress_event(state, session_id, executing_event);
+    
     // 执行命令并获取输出
     let output = cmd.output().await?;
     
     if output.status.success() {
         let response = String::from_utf8_lossy(&output.stdout).to_string();
         info!("AI command completed successfully");
+        
+        // 发送任务完成事件
+        let completed_event = ProgressEvent {
+            event_type: ProgressEventType::TaskCompleted,
+            message: "AI 任务执行成功".to_string(),
+            timestamp: chrono::Utc::now(),
+            session_id: session_id.to_string(),
+            data: Some(serde_json::json!({
+                "response_length": response.len(),
+                "success": true
+            })),
+        };
+        broadcast_progress_event(state, session_id, completed_event);
+        
         Ok(response)
     } else {
         let error = String::from_utf8_lossy(&output.stderr).to_string();
         error!("AI command failed: {}", error);
+        
+        // 发送任务失败事件
+        let failed_event = ProgressEvent {
+            event_type: ProgressEventType::TaskFailed,
+            message: format!("AI 任务执行失败: {}", error),
+            timestamp: chrono::Utc::now(),
+            session_id: session_id.to_string(),
+            data: Some(serde_json::json!({
+                "error": error,
+                "success": false
+            })),
+        };
+        broadcast_progress_event(state, session_id, failed_event);
+        
         Err(anyhow::anyhow!("AI command failed: {}", error))
     }
 }
@@ -365,12 +545,13 @@ fn create_router(state: SharedState) -> Router {
         .route("/chat", post(handle_chat))
         .route("/sessions/{session_id}", get(get_session).delete(delete_session))
         .route("/users/{user_id}/sessions", get(get_user_sessions))
+        .route("/progress/{session_id}", get(progress_stream))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     // 初始化 OpenTelemetry
     init_telemetry()?;
 
@@ -387,6 +568,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         sessions: DashMap::new(),
         config: config.clone(),
+        progress_senders: DashMap::new(),
     });
 
     // 创建路由
@@ -403,6 +585,7 @@ async fn main() -> Result<()> {
     info!("  GET  /sessions/:session_id - Get session info");
     info!("  GET  /users/:user_id/sessions - Get user's sessions");
     info!("  DELETE /sessions/:session_id - Delete session");
+    info!("  GET  /progress/:session_id - SSE progress stream for AI tasks");
     info!("  GET  /health - Health check");
     
     // 启动服务器
@@ -416,7 +599,7 @@ async fn main() -> Result<()> {
 }
 
 /// 初始化遥测系统
-fn init_telemetry() -> Result<()> {
+fn init_telemetry() -> anyhow::Result<()> {
     // 混合方案：初始化 tracing subscriber，但使用 OpenTelemetry 的 trace_id 生成
     tracing_subscriber::registry()
         .with(

@@ -9,6 +9,7 @@ pub mod session;
 pub mod mcp;
 pub mod process;
 pub mod types;
+pub mod permission;
 
 // 重新导出主要的公共类型
 pub use config::AcpConfig;
@@ -19,6 +20,7 @@ pub use mcp::{McpManager, McpAdapter, McpTool, McpResource};
 pub use config::McpServerConfig;
 pub use process::{ProcessManager, ProcessHandle};
 pub use types::{SessionId, StreamUpdate, ToolCallId, UserMessageId, Tool};
+pub use permission::{PermissionManager, PermissionSettings, PermissionEvent};
 pub use agent_client_protocol::{ToolCall, ToolCallStatus};
 
 use std::sync::Arc;

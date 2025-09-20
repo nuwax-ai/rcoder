@@ -2,12 +2,22 @@
 
 <cite>
 **本文档引用的文件**  
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs)
-- [connection.rs](file://crates/acp_thread/src/connection.rs)
-- [diff.rs](file://crates/acp_thread/src/diff.rs)
-- [mention.rs](file://crates/acp_thread/src/mention.rs)
-- [terminal.rs](file://crates/acp_thread/src/terminal.rs)
+- [lib.rs](file://crates/acp_adapter/src/lib.rs) - *新增的ACP适配器核心实现*
+- [session.rs](file://crates/acp_adapter/src/session.rs) - *会话管理功能实现*
+- [connection.rs](file://crates/acp_adapter/src/connection.rs) - *连接管理功能实现*
+- [mcp.rs](file://crates/acp_adapter/src/mcp.rs) - *MCP集成实现*
+- [types.rs](file://crates/acp_adapter/src/types.rs) - *类型定义*
+- [config.rs](file://crates/acp_adapter/src/config.rs) - *配置管理*
+- [process.rs](file://crates/acp_adapter/src/process.rs) - *进程管理*
 </cite>
+
+## 更新摘要
+**变更内容**   
+- 根据代码变更，将文档重点从已废弃的 `acp_thread` 模块转移到新引入的 `acp_adapter` crate
+- 新增 `acp_adapter` crate 的架构和核心组件分析
+- 更新项目结构和依赖关系说明
+- 移除关于 `acp_thread`、`diff`、`terminal`、`mention` 等已删除模块的过时内容
+- 添加新的序列图展示 `acp_adapter` 的核心工作流程
 
 ## 目录
 1. [简介](#简介)
@@ -21,279 +31,249 @@
 9. [结论](#结论)
 
 ## 简介
-ACP（Agent Client Protocol）协议是客户端与AI代理之间进行双向通信的核心机制。`acp_thread` crate 实现了该协议的具体会话管理功能，支持实时协作编辑场景下的消息传递、差分同步、终端I/O处理和提及解析等关键功能。本文档深入分析其实现细节，涵盖消息帧格式、连接稳定性维护、错误恢复机制等设计要点。
+ACP（Agent Client Protocol）协议是客户端与AI代理之间进行双向通信的核心机制。根据最新的代码变更，`acp_adapter` crate 已成为ACP协议的核心实现模块，取代了旧的 `acp_thread` 模块。`acp_adapter` 提供了连接管理、会话生命周期、消息处理和MCP（Model Context Protocol）集成等核心功能。本文档深入分析 `acp_adapter` 的实现细节，涵盖其模块化设计、会话管理、连接稳定性维护和错误处理机制。
 
 ## 项目结构
-`acp_thread` crate 是 ACP 协议的核心实现模块，位于 `crates/acp_thread` 目录下。其源码结构清晰地划分了不同功能模块：
+`acp_adapter` crate 是 ACP 协议的新核心实现模块，位于 `crates/acp_adapter` 目录下。其源码结构清晰地划分了不同功能模块：
 
 ```mermaid
 graph TD
-A[acp_thread crate] --> B[acp_thread.rs]
-A --> C[connection.rs]
-A --> D[diff.rs]
-A --> E[mention.rs]
-A --> F[terminal.rs]
-B --> G[会话管理]
-C --> H[连接管理]
-D --> I[差分同步]
-E --> J[提及解析]
-F --> K[终端I/O]
+A[acp_adapter crate] --> B[lib.rs]
+A --> C[session.rs]
+A --> D[connection.rs]
+A --> E[mcp.rs]
+A --> F[types.rs]
+A --> G[config.rs]
+A --> H[process.rs]
+B --> I[主适配器]
+C --> J[会话管理]
+D --> K[连接管理]
+E --> L[MCP集成]
+F --> M[类型定义]
+G --> N[配置管理]
+H --> O[进程管理]
 ```
 
 **图示来源**  
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs)
-- [connection.rs](file://crates/acp_thread/src/connection.rs)
-- [diff.rs](file://crates/acp_thread/src/diff.rs)
-- [mention.rs](file://crates/acp_thread/src/mention.rs)
-- [terminal.rs](file://crates/acp_thread/src/terminal.rs)
+- [lib.rs](file://crates/acp_adapter/src/lib.rs)
+- [session.rs](file://crates/acp_adapter/src/session.rs)
+- [connection.rs](file://crates/acp_adapter/src/connection.rs)
+- [mcp.rs](file://crates/acp_adapter/src/mcp.rs)
+- [types.rs](file://crates/acp_adapter/src/types.rs)
+- [config.rs](file://crates/acp_adapter/src/config.rs)
+- [process.rs](file://crates/acp_adapter/src/process.rs)
 
 **本节来源**  
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs)
-- [Cargo.toml](file://crates/acp_thread/Cargo.toml)
+- [lib.rs](file://crates/acp_adapter/src/lib.rs)
+- [Cargo.toml](file://crates/acp_adapter/Cargo.toml)
 
 ## 核心组件
-`acp_thread` crate 的核心功能围绕 `AcpThread` 结构体展开，它管理着客户端与AI代理之间的完整会话生命周期。主要组件包括消息条目（`AgentThreadEntry`）、工具调用（`ToolCall`）、差分同步（`Diff`）、终端处理（`Terminal`）和提及解析（`MentionUri`）。这些组件协同工作，实现了复杂的实时交互逻辑。
+`acp_adapter` crate 的核心功能围绕 `AcpAdapter` 结构体展开，它作为主协调者，管理着与AI代理的通信会话。主要组件包括 `Session`（会话管理）、`AcpConnection`（连接管理）、`McpManager`（MCP集成）和 `ProcessManager`（进程管理）。这些组件协同工作，实现了从配置初始化到消息收发的完整通信流程。
 
 **本节来源**  
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs#L0-L799)
-- [diff.rs](file://crates/acp_thread/src/diff.rs#L0-L424)
-- [terminal.rs](file://crates/acp_thread/src/terminal.rs#L0-L172)
+- [lib.rs](file://crates/acp_adapter/src/lib.rs#L85-L91)
+- [session.rs](file://crates/acp_adapter/src/session.rs#L0-L685)
+- [connection.rs](file://crates/acp_adapter/src/connection.rs#L20-L30)
+- [mcp.rs](file://crates/acp_adapter/src/mcp.rs#L0-L226)
 
 ## 架构概述
-`acp_thread` crate 采用模块化设计，各组件职责分明，通过清晰的接口进行交互。`AcpThread` 作为核心协调者，依赖 `AgentConnection` trait 与底层传输层（如WebSocket）进行通信。`Diff`、`Terminal` 和 `MentionUri` 等模块则专注于特定领域的数据处理和状态管理。
+`acp_adapter` crate 采用分层的模块化设计，各组件职责分明。`AcpAdapter` 作为顶层入口，聚合了 `ConnectionManager` 和 `McpManager`。`ConnectionManager` 负责管理与代理进程的通信，通过 `ProcessManager` 启动和监控底层进程。`Session` 模块则管理会话状态和消息流，而 `McpManager` 负责与外部MCP服务器的集成。
 
 ```mermaid
 graph LR
-Client[客户端] --> AcpThread[AcpThread]
-AcpThread --> Connection[AgentConnection]
-Connection --> WebSocket[WebSocket/长连接]
-AcpThread --> Diff[Diff]
-AcpThread --> Terminal[Terminal]
-AcpThread --> Mention[MentionUri]
-Diff --> Buffer[Buffer]
-Terminal --> PTY[PTY]
-Mention --> URL[URL解析]
+Client[客户端] --> AcpAdapter[AcpAdapter]
+AcpAdapter --> ConnectionManager[ConnectionManager]
+AcpAdapter --> McpManager[McpManager]
+ConnectionManager --> ProcessManager[ProcessManager]
+ProcessManager --> AgentProcess[AI代理进程]
+ConnectionManager --> AcpConnection[AcpConnection]
+AcpConnection --> MessageStream[消息流]
+AcpAdapter --> Session[Session]
+Session --> SessionHandle[SessionHandle]
+Session --> UpdateSenders[更新发送器]
+McpManager --> McpServer[MCP服务器]
 ```
 
 **图示来源**  
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs#L0-L799)
-- [connection.rs](file://crates/acp_thread/src/connection.rs#L0-L481)
+- [lib.rs](file://crates/acp_adapter/src/lib.rs#L85-L91)
+- [connection.rs](file://crates/acp_adapter/src/connection.rs#L20-L30)
+- [session.rs](file://crates/acp_adapter/src/session.rs#L0-L685)
+- [mcp.rs](file://crates/acp_adapter/src/mcp.rs#L0-L226)
 
 ## 详细组件分析
 
 ### 消息与会话管理分析
-`AcpThread` 结构体是整个会话的中枢，它维护了消息条目列表、计划条目、项目引用、动作日志以及与代理的连接。它通过 `AgentConnection` trait 与外部世界通信，处理来自AI代理的更新，并将用户输入转发给代理。
+`Session` 结构体是整个会话的中枢，它维护了会话状态、消息列表、工具调用信息和统计信息。`SessionHandle` 提供了安全的异步接口，允许外部代码与会话进行交互，如发送提示、取消操作和订阅更新。
 
 ```mermaid
 classDiagram
-class AcpThread {
-+title : SharedString
-+entries : Vec~AgentThreadEntry~
-+plan : Plan
-+project : Entity~Project~
-+action_log : Entity~ActionLog~
-+connection : Rc~AgentConnection~
-+session_id : SessionId
-+token_usage : Option~TokenUsage~
-+terminals : HashMap~TerminalId, Entity~Terminal~~
-+handle_session_update(update : SessionUpdate, cx : &mut Context)
-+create_terminal(...)
-+release_terminal(...)
+class AcpAdapter {
++config : Arc~AcpConfig~
++connection_manager : Arc~ConnectionManager~
++mcp_manager : Arc~McpManager~
++create_session() : SessionHandle
++initialize() : AcpResult
 }
-class AgentThreadEntry {
+class Session {
++id : SessionId
++config : Arc~AcpConfig~
++state : Arc~RwLock~SessionState~~
++messages : Arc~DashMap~UserMessageId, SessionMessage~~
++tool_calls : Arc~DashMap~ToolCallId, ToolCallInfo~~
++stats : Arc~RwLock~SessionStatistics~~
++update_senders : Arc~DashMap~String, Sender~StreamUpdate~~~
++send_prompt(request : PromptRequest) : AcpResult~PromptResponse~
++cancel() : AcpResult
++truncate(message_id : UserMessageId) : AcpResult
++subscribe_to_updates() : Receiver~StreamUpdate~
+}
+class SessionHandle {
++id : SessionId
++session : Arc~Session~
+}
+class SessionMessage {
 <<enumeration>>
-UserMessage
-AssistantMessage
-ToolCall
+User
+Assistant
+System
+ToolCallResult
+Status
 }
-class ToolCall {
+class ToolCallInfo {
 +id : ToolCallId
-+label : Entity~Markdown~
-+kind : ToolKind
-+content : Vec~ToolCallContent~
-+status : ToolCallStatus
-+locations : Vec~ToolCallLocation~
-+resolved_locations : Vec~Option~AgentLocation~~
++name : String
++arguments : Value
++state : ToolCallState
++timestamp : SystemTime
 }
-class ToolCallContent {
-<<enumeration>>
-ContentBlock
-Diff
-Terminal
-}
-AcpThread --> AgentThreadEntry : "包含"
-AcpThread --> ToolCall : "包含"
-AcpThread --> Diff : "使用"
-AcpThread --> Terminal : "使用"
-ToolCall --> ToolCallContent : "包含"
+AcpAdapter --> Session : "创建"
+Session --> SessionHandle : "生成"
+Session --> SessionMessage : "包含"
+Session --> ToolCallInfo : "包含"
 ```
 
 **图示来源**  
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs#L0-L799)
+- [lib.rs](file://crates/acp_adapter/src/lib.rs#L85-L91)
+- [session.rs](file://crates/acp_adapter/src/session.rs#L0-L685)
 
 **本节来源**  
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs#L0-L799)
+- [session.rs](file://crates/acp_adapter/src/session.rs#L0-L685)
 
-### 差分同步机制分析
-`diff` 模块负责处理文件内容的增量更新。它通过 `Diff` 枚举区分“待定”（Pending）和“已定稿”（Finalized）两种状态。`PendingDiff` 在用户编辑时动态更新差异高亮，而 `FinalizedDiff` 则用于展示最终确定的变更。
+### 连接与进程管理分析
+`ConnectionManager` 负责管理与AI代理的底层连接。它通过 `ProcessManager` 启动代理进程，并创建 `AcpConnection` 来处理消息的收发。`AcpConnection` 使用 `MessageStream` 监听进程输出，并将接收到的JSON消息路由到相应的处理函数。
 
 ```mermaid
 sequenceDiagram
-participant User as 用户
-participant AcpThread as AcpThread
-participant Diff as Diff
-participant Buffer as Buffer
-User->>AcpThread : 开始编辑文件
-AcpThread->>Diff : 创建 PendingDiff
-loop 编辑过程中
-User->>Buffer : 修改文本
-Buffer->>Diff : 触发观察者
-Diff->>Diff : 更新差异计算 (update)
-Diff->>Diff : 更新可视范围 (update_visible_ranges)
+participant Client as 客户端
+participant AcpAdapter as AcpAdapter
+participant ConnManager as ConnectionManager
+participant ProcessMgr as ProcessManager
+participant AcpConn as AcpConnection
+participant AgentProc as AI代理进程
+Client->>AcpAdapter : initialize()
+AcpAdapter->>ConnManager : start(config)
+ConnManager->>ProcessMgr : spawn_process(config)
+ProcessMgr->>AgentProc : 启动进程
+ProcessMgr-->>ConnManager : 返回 ProcessHandle
+ConnManager->>AcpConn : 创建 AcpConnection
+AcpConn->>MessageStream : 启动消息处理器
+loop 消息循环
+AgentProc->>AcpConn : 发送JSON消息
+AcpConn->>AcpConn : handle_raw_message()
+AcpConn->>AcpConn : handle_method_call()
+AcpConn->>AcpConn : handle_session_update()
 end
-User->>AcpThread : 提交变更
-AcpThread->>Diff : finalize()
-Diff->>Diff : 生成 FinalizedDiff
-Diff->>AcpThread : 返回最终差异
 ```
 
 **图示来源**  
-- [diff.rs](file://crates/acp_thread/src/diff.rs#L0-L424)
+- [connection.rs](file://crates/acp_adapter/src/connection.rs#L20-L30)
+- [process.rs](file://crates/acp_adapter/src/process.rs#L0-L429)
 
 **本节来源**  
-- [diff.rs](file://crates/acp_thread/src/diff.rs#L0-L424)
+- [connection.rs](file://crates/acp_adapter/src/connection.rs#L20-L30)
+- [process.rs](file://crates/acp_adapter/src/process.rs#L0-L429)
 
-### 终端I/O处理分析
-`terminal` 模块封装了对终端会话的管理。`Terminal` 结构体包装了一个底层的 `terminal::Terminal` 实例，并通过异步任务监控命令的执行状态。它支持输出截断，防止过长的输出影响性能。
+### MCP集成分析
+`McpManager` 负责管理与MCP（Model Context Protocol）服务器的连接。它可以在初始化时启动配置的MCP服务器，并提供获取工具、资源和提示的方法。`McpAdapter` 作为适配层，将MCP工具转换为内部工具格式，供会话使用。
 
 ```mermaid
 flowchart TD
-Start([创建Terminal]) --> Init["初始化: ID, 命令, 工作目录"]
-Init --> Spawn["启动异步任务: 等待命令结束"]
-Spawn --> Wait["等待 _output_task 完成"]
-Wait --> OnExit["命令退出时:"]
-OnExit --> Capture["捕获输出内容和退出状态"]
-Capture --> Truncate["根据 output_byte_limit 截断输出"]
-Truncate --> Store["存储到 TerminalOutput"]
-Store --> Notify["通知UI更新"]
-Notify --> End([Terminal准备就绪])
+Start([初始化]) --> LoadConfig
+LoadConfig --> HasMcpServers
+HasMcpServers --> |是| StartMcpServers
+HasMcpServers --> |否| End
+StartMcpServers --> ForEachServer
+ForEachServer --> StartServer["启动服务器进程"]
+StartServer --> RegisterServer["注册到servers映射"]
+RegisterServer --> UpdateState["设置状态为Connected"]
+UpdateState --> NextServer
+NextServer --> ForEachServer
+ForEachServer --> End
+End([MCP管理器就绪])
 ```
 
 **图示来源**  
-- [terminal.rs](file://crates/acp_thread/src/terminal.rs#L0-L172)
+- [mcp.rs](file://crates/acp_adapter/src/mcp.rs#L0-L226)
 
 **本节来源**  
-- [terminal.rs](file://crates/acp_thread/src/terminal.rs#L0-L172)
-
-### 提及解析功能分析
-`mention` 模块实现了对特殊链接（Mention）的解析和生成。`MentionUri` 枚举定义了多种提及类型，如文件、目录、符号、线程等。它通过解析 `zed://` 或 `file://` 等URL方案，将用户输入中的 `@` 引用转换为结构化的数据。
-
-```mermaid
-stateDiagram-v2
-[*] --> ParseInput
-ParseInput --> CheckScheme
-CheckScheme --> |file : //| ParseFile
-CheckScheme --> |zed : //| ParseZed
-CheckScheme --> |http(s) : //| ParseFetch
-CheckScheme --> |其他| Error
-ParseFile --> HasFragment
-HasFragment --> |是| ParseLineRange
-ParseLineRange --> HasSymbol
-HasSymbol --> |是| CreateSymbolMention
-HasSymbol --> |否| CreateSelectionMention
-HasFragment --> |否| IsDirectory
-IsDirectory --> |是| CreateDirectoryMention
-IsDirectory --> |否| CreateFileMention
-ParseZed --> MatchPath
-MatchPath --> |/agent/thread/| CreateThreadMention
-MatchPath --> |/agent/text-thread/| CreateTextThreadMention
-MatchPath --> |/agent/rule/| CreateRuleMention
-MatchPath --> |/agent/pasted-image| CreatePastedImageMention
-MatchPath --> |/agent/untitled-buffer| CreateSelectionMention
-MatchPath --> |其他| Error
-ParseFetch --> CreateFetchMention
-CreateSymbolMention --> [*]
-CreateSelectionMention --> [*]
-CreateDirectoryMention --> [*]
-CreateFileMention --> [*]
-CreateThreadMention --> [*]
-CreateTextThreadMention --> [*]
-CreateRuleMention --> [*]
-CreatePastedImageMention --> [*]
-CreateFetchMention --> [*]
-Error --> [*]
-```
-
-**图示来源**  
-- [mention.rs](file://crates/acp_thread/src/mention.rs#L0-L502)
-
-**本节来源**  
-- [mention.rs](file://crates/acp_thread/src/mention.rs#L0-L502)
+- [mcp.rs](file://crates/acp_adapter/src/mcp.rs#L0-L226)
 
 ## 依赖分析
-`acp_thread` crate 依赖于多个内部和外部库，形成了一个复杂的依赖网络。
+`acp_adapter` crate 依赖于多个关键库，形成了一个强大的功能组合。
 
 ```mermaid
 erDiagram
-ACP_THREAD ||--o{ AGENT_CLIENT_PROTOCOL : "使用"
-ACP_THREAD ||--o{ GPUI : "使用"
-ACP_THREAD ||--o{ LANGUAGE : "使用"
-ACP_THREAD ||--o{ PROJECT : "使用"
-ACP_THREAD ||--o{ EDITOR : "使用"
-ACP_THREAD ||--o{ MARKDOWN : "使用"
-ACP_THREAD ||--|| TERMINAL : "使用"
-ACP_THREAD ||--o{ BUFFER_DIFF : "使用"
-ACP_THREAD ||--o{ FILE_ICONS : "使用"
-ACP_THREAD ||--o{ PROMPT_STORE : "使用"
-AGENT_CLIENT_PROTOCOL }|--|| ACP_THREAD : "定义协议"
-GPUI }|--|| ACP_THREAD : "提供UI上下文"
-LANGUAGE }|--|| ACP_THREAD : "提供语言支持"
-PROJECT }|--|| ACP_THREAD : "提供项目信息"
-EDITOR }|--|| ACP_THREAD : "提供编辑器功能"
-MARKDOWN }|--|| ACP_THREAD : "渲染Markdown"
-TERMINAL }|--|| ACP_THREAD : "提供终端功能"
-BUFFER_DIFF }|--|| ACP_THREAD : "计算文本差异"
-FILE_ICONS }|--|| ACP_THREAD : "获取文件图标"
-PROMPT_STORE }|--|| ACP_THREAD : "管理提示"
+ACP_ADAPTER ||--o{ AGENT_CLIENT_PROTOCOL : "使用"
+ACP_ADAPTER ||--o{ SERDE : "序列化/反序列化"
+ACP_ADAPTER ||--o{ TOKIO : "异步运行时"
+ACP_ADAPTER ||--o{ TRACING : "日志记录"
+ACP_ADAPTER ||--o{ DASHMAP : "并发哈希映射"
+ACP_ADAPTER ||--o{ UUID : "生成唯一ID"
+AGENT_CLIENT_PROTOCOL }|--|| ACP_ADAPTER : "定义协议类型"
+SERDE }|--|| ACP_ADAPTER : "处理JSON"
+TOKIO }|--|| ACP_ADAPTER : "提供异步I/O"
+TRACING }|--|| ACP_ADAPTER : "提供日志"
+DASHMAP }|--|| ACP_ADAPTER : "提供线程安全集合"
+UUID }|--|| ACP_ADAPTER : "生成会话和工具调用ID"
 ```
 
 **图示来源**  
-- [Cargo.toml](file://crates/acp_thread/Cargo.toml)
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs)
+- [Cargo.toml](file://crates/acp_adapter/Cargo.toml)
+- [lib.rs](file://crates/acp_adapter/src/lib.rs)
 
 **本节来源**  
-- [Cargo.toml](file://crates/acp_thread/Cargo.toml)
-- [acp_thread.rs](file://crates/acp_thread/src/acp_thread.rs)
+- [Cargo.toml](file://crates/acp_adapter/Cargo.toml)
+- [lib.rs](file://crates/acp_adapter/src/lib.rs)
 
 ## 性能考虑
-`acp_thread` crate 在设计时考虑了多项性能优化：
-1.  **增量更新**：`Diff` 模块的 `PendingDiff` 状态允许在用户编辑时进行高效的增量差异计算，避免了全量重算。
-2.  **输出截断**：`Terminal` 模块支持 `output_byte_limit`，可以防止过长的命令输出导致内存占用过高或UI卡顿。
-3.  **异步处理**：所有耗时操作（如差异计算、终端命令执行）都通过 `Task` 在后台异步执行，确保UI的响应性。
-4.  **资源复用**：`ToolCall` 的 `update_fields` 方法会尝试复用现有的 `content` 条目，减少不必要的对象创建和销毁。
+`acp_adapter` crate 在设计时考虑了多项性能优化：
+1.  **并发数据结构**：使用 `dashmap::DashMap` 和 `tokio::sync::RwLock` 等并发安全的数据结构，允许多个任务安全地访问会话和连接状态。
+2.  **异步处理**：所有I/O操作（进程通信、文件读写）都通过 `tokio` 异步执行，确保主线程不会被阻塞。
+3.  **资源复用**：`ProcessManager` 通过监控器自动重启失败的进程，提高了系统的容错性和可用性。
+4.  **高效序列化**：使用 `serde_json` 进行高效的JSON序列化和反序列化，减少消息处理的开销。
 
 ## 故障排除指南
-在使用 `acp_thread` 时可能遇到的常见问题及解决方法：
+在使用 `acp_adapter` 时可能遇到的常见问题及解决方法：
 
-**连接中断**
-- **现象**：WebSocket连接意外断开。
-- **原因**：网络不稳定或代理服务崩溃。
-- **解决**：`AgentConnection` trait 的实现应包含重连逻辑。检查 `connection.rs` 中的 `cancel` 和错误处理方法。
+**连接失败**
+- **现象**：无法启动AI代理进程。
+- **原因**：配置的命令不存在或权限不足。
+- **解决**：检查 `AcpConfig` 中的 `process.command` 是否正确，并确保该命令在系统PATH中或提供完整路径。
 
-**终端命令卡死**
-- **现象**：`Terminal` 的 `_output_task` 长时间不完成。
-- **原因**：执行的命令进入无限循环或等待用户输入。
-- **解决**：调用 `Terminal::kill` 方法强制终止底层进程。确保代理在发送长时间运行的命令前获得用户确认。
+**会话无响应**
+- **现象**：发送提示后长时间无响应。
+- **原因**：代理进程未正确处理输入或输出流。
+- **解决**：检查 `AcpConnection` 的 `handle_raw_message` 方法日志，确认消息是否被正确解析。确保代理进程以 `stdio` 模式运行。
 
-**提及解析失败**
-- **现象**：`MentionUri::parse` 返回错误。
-- **原因**：输入的URL格式不正确，例如行号不是1-based或缺少必要的查询参数。
-- **解决**：参考 `mention.rs` 中的单元测试，确保URL符合规范。检查 `single_query_param` 函数的限制。
+**MCP服务器未启动**
+- **现象**：`McpManager::initialize` 失败。
+- **原因**：MCP服务器配置错误或命令无法执行。
+- **解决**：检查 `AcpConfig` 中的 `mcp_servers` 配置，确保每个服务器的 `command` 和 `args` 正确。
 
 **本节来源**  
-- [connection.rs](file://crates/acp_thread/src/connection.rs#L0-L481)
-- [terminal.rs](file://crates/acp_thread/src/terminal.rs#L0-L172)
-- [mention.rs](file://crates/acp_thread/src/mention.rs#L0-L502)
+- [connection.rs](file://crates/acp_adapter/src/connection.rs#L20-L30)
+- [process.rs](file://crates/acp_adapter/src/process.rs#L0-L429)
+- [mcp.rs](file://crates/acp_adapter/src/mcp.rs#L0-L226)
 
 ## 结论
-`acp_thread` crate 成功实现了一个功能完备的ACP协议客户端会话管理器。其模块化设计使得代码结构清晰，易于维护和扩展。通过 `Diff`、`Terminal` 和 `MentionUri` 等模块，它为实时协作编辑场景提供了强大的支持。未来可以进一步优化错误恢复机制和连接稳定性，以提升用户体验。
+`acp_adapter` crate 成功实现了一个现代化、模块化的ACP协议客户端适配器。它取代了旧的 `acp_thread` 实现，提供了更清晰的架构和更强大的功能，包括对MCP的原生支持。其核心设计围绕 `AcpAdapter`、`Session` 和 `ConnectionManager` 展开，通过异步和并发技术确保了高性能和高响应性。未来可以进一步完善MCP集成和错误恢复机制，以提供更健壮的用户体验。

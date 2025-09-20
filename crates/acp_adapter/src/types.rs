@@ -7,12 +7,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
+use tokio::sync::oneshot;
 
 // 重新导出 agent_client_protocol 中的核心类型
 pub use agent_client_protocol::{
     SessionId, StopReason, Error, ErrorCode, ContentBlock,
     PromptRequest, PromptResponse, ToolCall, ToolCallContent,
-    ToolCallStatus, SessionUpdate, PermissionOption,
+    ToolCallStatus, SessionUpdate, PermissionOption, PermissionOptionKind,
     PermissionOptionId, RequestPermissionRequest, RequestPermissionResponse,
     ReadTextFileRequest, ReadTextFileResponse, WriteTextFileRequest,
     WriteTextFileResponse, ClientCapabilities, ProtocolVersion,
@@ -373,15 +374,15 @@ pub struct AssistantMessage {
     pub tool_calls: Vec<ToolCall>,
 }
 
-/// 工具调用状态 - 扩展 Zed 的状态定义
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 工具调用状态 - 完整实现 Zed 的状态定义
+#[derive(Debug)]
 pub enum ExtendedToolCallStatus {
     /// 工具调用尚未开始运行，但已向用户显示
     Pending,
     /// 工具调用等待用户确认
     WaitingForConfirmation {
         options: Vec<PermissionOption>,
-        respond_tx: String, // 在实际实现中这应该是一个通道发送端
+        respond_tx: Option<oneshot::Sender<PermissionOptionId>>,
     },
     /// 工具调用正在运行
     InProgress,
@@ -395,14 +396,90 @@ pub enum ExtendedToolCallStatus {
     Canceled,
 }
 
+/// 可序列化的工具调用状态 - 用于存储和传输
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SerializableToolCallStatus {
+    Pending,
+    WaitingForConfirmation {
+        options: Vec<PermissionOption>,
+    },
+    InProgress,
+    Completed,
+    Failed,
+    Rejected,
+    Canceled,
+}
+
+impl From<&ExtendedToolCallStatus> for SerializableToolCallStatus {
+    fn from(status: &ExtendedToolCallStatus) -> Self {
+        match status {
+            ExtendedToolCallStatus::Pending => Self::Pending,
+            ExtendedToolCallStatus::WaitingForConfirmation { options, .. } => {
+                Self::WaitingForConfirmation {
+                    options: options.clone(),
+                }
+            }
+            ExtendedToolCallStatus::InProgress => Self::InProgress,
+            ExtendedToolCallStatus::Completed => Self::Completed,
+            ExtendedToolCallStatus::Failed => Self::Failed,
+            ExtendedToolCallStatus::Rejected => Self::Rejected,
+            ExtendedToolCallStatus::Canceled => Self::Canceled,
+        }
+    }
+}
+
+impl std::fmt::Display for ExtendedToolCallStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtendedToolCallStatus::Pending => write!(f, "Pending"),
+            ExtendedToolCallStatus::WaitingForConfirmation { .. } => write!(f, "Waiting for confirmation"),
+            ExtendedToolCallStatus::InProgress => write!(f, "In Progress"),
+            ExtendedToolCallStatus::Completed => write!(f, "Completed"),
+            ExtendedToolCallStatus::Failed => write!(f, "Failed"),
+            ExtendedToolCallStatus::Rejected => write!(f, "Rejected"),
+            ExtendedToolCallStatus::Canceled => write!(f, "Canceled"),
+        }
+    }
+}
+
 impl From<ToolCallStatus> for ExtendedToolCallStatus {
     fn from(status: ToolCallStatus) -> Self {
         match status {
             ToolCallStatus::Pending => ExtendedToolCallStatus::Pending,
+            ToolCallStatus::InProgress => ExtendedToolCallStatus::InProgress,
             ToolCallStatus::Completed => ExtendedToolCallStatus::Completed,
             ToolCallStatus::Failed => ExtendedToolCallStatus::Failed,
-            // 处理其他状态...
-            _ => ExtendedToolCallStatus::Pending,
         }
     }
+}
+
+impl From<ToolCallState> for ExtendedToolCallStatus {
+    fn from(state: ToolCallState) -> Self {
+        match state {
+            ToolCallState::PendingAuthorization => ExtendedToolCallStatus::Pending,
+            ToolCallState::Authorized => ExtendedToolCallStatus::InProgress,
+            ToolCallState::Rejected => ExtendedToolCallStatus::Rejected,
+            ToolCallState::InProgress => ExtendedToolCallStatus::InProgress,
+            ToolCallState::Completed => ExtendedToolCallStatus::Completed,
+            ToolCallState::Failed(_) => ExtendedToolCallStatus::Failed,
+            ToolCallState::Canceled => ExtendedToolCallStatus::Canceled,
+        }
+    }
+}
+
+/// 权限请求状态
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRequestState {
+    pub tool_call_id: ToolCallId,
+    pub options: Vec<PermissionOption>,
+    pub created_at: std::time::SystemTime,
+    pub expires_at: Option<std::time::SystemTime>,
+}
+
+/// 权限响应结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PermissionOutcome {
+    Selected { option_id: PermissionOptionId },
+    Cancelled,
+    Expired,
 }

@@ -3,6 +3,7 @@
 use crate::{
     config::AcpConfig,
     connection::ConnectionManager,
+    permission::{PermissionManager, PermissionEvent},
     types::{
         PermissionRequest, PermissionResponse, SessionId, SessionMessage,
         SessionState, StreamUpdate, ToolCallId, ToolCallInfo, ToolCallState, UserMessageId,
