@@ -1,6 +1,6 @@
 # AI Agents 统一管理库
 
-这个库提供了一个统一的接口来管理和使用不同的 AI 代理工具（Claude、Codex 等），通过 Agent Client Protocol (ACP) 提供透明的访问。
+提供统一的接口来管理不同的 AI 代理（Claude、Codex 等），通过 Agent Client Protocol (ACP) 提供透明的访问。支持配置国内大模型服务（如智谱 GLM）来接入不同的代理工具。
 
 ## 特性
 
@@ -9,13 +9,15 @@
 - 🚀 **自动检测**: 自动检测并注册可用的 AI 代理
 - ⚙️ **灵活配置**: 支持每个代理的独立配置
 - 🔌 **可扩展**: 易于添加新的 AI 代理支持
+- 🌏 **国内大模型支持**: 支持智谱 GLM、百川、通义千问等国内大模型
+- 🛠️ **高级配置**: 支持通过环境变量自动配置不同提供商的 API 端点
 
 ## 支持的 AI 代理
 
-| 代理类型 | 描述 | 环境要求 |
-|---------|------|----------|
-| Claude | Anthropic Claude Code | `CLAUDE_API_KEY` 环境变量 |
-| Codex | OpenAI Codex/GPT | `OPENAI_API_KEY` 环境变量 |
+| 代理类型 | 描述 | 环境要求 | 支持的模型 |
+|---------|------|----------|----------|
+| Claude | Anthropic Claude Code | `ANTHROPIC_API_KEY` 或 `GLM_AUTH_TOKEN` | Claude 3.5 Sonnet, GLM-4.5 |
+| Codex | OpenAI Codex CLI | `OPENAI_API_KEY` 或 `GLM_AUTH_TOKEN` | GPT-4, GLM-4.5, GLM-4.5-Air |
 
 ## 快速开始
 

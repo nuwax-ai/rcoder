@@ -9,10 +9,32 @@ license.workspace = true
 # Internal crates
 shared_types = { path = "../shared_types" }
 nuwax_parser = { path = "../nuwax_parser" }
+ai-agents = { path = "../ai-agents" }
 
+# HTTP server
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 # Workspace dependencies
-tokio.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true }
+
+# OpenTelemetry
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+axum-tracing-opentelemetry = { workspace = true }
+
+# File system
+tokio-fs = { workspace = true }
+path-clean = { workspace = true }

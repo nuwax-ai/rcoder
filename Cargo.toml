@@ -58,6 +58,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"
 env_logger = "0.11"
 
+# OpenTelemetry
+opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.25"
+axum-tracing-opentelemetry = "0.19"
+
 # UUID
 uuid = { version = "1.0", features = ["serde", "v4", "v7"] }
 

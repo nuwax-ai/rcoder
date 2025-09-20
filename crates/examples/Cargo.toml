@@ -1,0 +1,19 @@
+[package]
+name = "ai-agents-examples"
+version = "0.1.0"
+edition = "2021"
+
+[[example]]
+name = "model_configuration"
+path = "examples/model_configuration.rs"
+
+[[example]]
+name = "agent_usage"
+path = "examples/agent_usage.rs"
+
+[dependencies]
+ai-agents = { path = "../ai-agents" }
+agent-client-protocol = "0.4"
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

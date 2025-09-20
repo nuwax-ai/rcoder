@@ -45,6 +45,104 @@ impl std::str::FromStr for AgentType {
     }
 }
 
+/// 模型提供商配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProviderConfig {
+    /// 提供商名称 (如: glm, anthropic, openai)
+    pub name: String,
+    /// API 基础 URL
+    pub base_url: String,
+    /// 环境变量中的密钥名称
+    pub env_key: String,
+    /// 是否需要 OpenAI 兼容的认证
+    pub requires_openai_auth: bool,
+    /// 额外的配置参数
+    pub extra_params: std::collections::HashMap<String, String>,
+}
+
+impl ModelProviderConfig {
+    /// 创建 GLM 提供商配置
+    pub fn glm() -> Self {
+        Self {
+            name: "glm".to_string(),
+            base_url: "https://open.bigmodel.cn/api/coding/paas/v4".to_string(),
+            env_key: "GLM_AUTH_TOKEN".to_string(),
+            requires_openai_auth: false,
+            extra_params: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 创建 Claude 提供商配置
+    pub fn claude() -> Self {
+        Self {
+            name: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            env_key: "ANTHROPIC_API_KEY".to_string(),
+            requires_openai_auth: false,
+            extra_params: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 创建 GLM 通过 Anthropic 接口的配置
+    pub fn glm_anthropic() -> Self {
+        let mut extra_params = std::collections::HashMap::new();
+        extra_params.insert("ANTHROPIC_MODEL".to_string(), "GLM-4.5".to_string());
+        extra_params.insert("ANTHROPIC_SMALL_FAST_MODEL".to_string(), "GLM-4.5-Air".to_string());
+        
+        Self {
+            name: "anthropic_glm".to_string(),
+            base_url: "https://open.bigmodel.cn/api/anthropic".to_string(),
+            env_key: "GLM_AUTH_TOKEN".to_string(),
+            requires_openai_auth: false,
+            extra_params,
+        }
+    }
+
+    /// 创建 OpenAI 提供商配置
+    pub fn openai() -> Self {
+        Self {
+            name: "openai".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            env_key: "OPENAI_API_KEY".to_string(),
+            requires_openai_auth: true,
+            extra_params: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 获取环境变量中的认证令牌
+    pub fn get_auth_token(&self) -> Option<String> {
+        std::env::var(&self.env_key).ok()
+    }
+
+    /// 生成适用于代理的环境变量映射
+    pub fn generate_env_vars(&self, agent_type: AgentType) -> std::collections::HashMap<String, String> {
+        let mut env_vars = std::collections::HashMap::new();
+        
+        // 获取认证令牌
+        if let Some(token) = self.get_auth_token() {
+            match agent_type {
+                AgentType::Codex => {
+                    // 为 Codex 设置 OpenAI 兼容的环境变量
+                    env_vars.insert("OPENAI_API_KEY".to_string(), token);
+                    env_vars.insert("OPENAI_BASE_URL".to_string(), self.base_url.clone());
+                }
+                AgentType::Claude => {
+                    // 为 Claude Code 设置 Anthropic 环境变量
+                    env_vars.insert("ANTHROPIC_AUTH_TOKEN".to_string(), token);
+                    env_vars.insert("ANTHROPIC_BASE_URL".to_string(), self.base_url.clone());
+                    
+                    // 添加额外的模型参数
+                    for (key, value) in &self.extra_params {
+                        env_vars.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        
+        env_vars
+    }
+}
+
 /// AI 代理配置
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -56,8 +154,14 @@ pub struct AgentConfig {
     pub home_dir: std::path::PathBuf,
     /// 使用的模型
     pub model: String,
+    /// 模型提供商配置
+    pub provider: ModelProviderConfig,
     /// 额外的环境变量
     pub env_vars: std::collections::HashMap<String, String>,
+    /// 推理努力程度 (如: high, medium, low)
+    pub reasoning_effort: String,
+    /// 首选的认证方法
+    pub preferred_auth_method: String,
 }
 
 impl Default for AgentConfig {
@@ -69,6 +173,9 @@ impl Default for AgentConfig {
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join(".ai-agents"),
             model: "GLM-4.5".to_string(),  // 默认使用 GLM-4.5 模型
+            provider: ModelProviderConfig::glm(),  // 默认使用 GLM 提供商
+            reasoning_effort: "high".to_string(),  // 默认高推理努力程度
+            preferred_auth_method: "apikey".to_string(),  // 默认使用 API Key 认证
             env_vars: {
                 let mut env = std::collections::HashMap::new();
                 // 为 GLM 设置环境变量
@@ -107,12 +214,30 @@ impl AgentManager {
         config: AgentConfig,
         client_tx: mpsc::UnboundedSender<AgentClientOp>,
     ) -> Result<(), Error> {
+        // 生成与代理类型匹配的环境变量
+        let env_vars = config.provider.generate_env_vars(agent_type);
+        
+        // 设置环境变量到当前进程中（代理启动子进程时会继承这些环境变量）
+        for (key, value) in &env_vars {
+            // 使用 unsafe 块调用 set_var
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        
+        // 合并用户自定义的环境变量
+        for (key, value) in &config.env_vars {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        
         let agent = match agent_type {
             AgentType::Claude => {
                 let claude_config = claude::ClaudeConfig {
                     claude_home: config.home_dir,
                     cwd: config.cwd,
-                    model: config.model,
+                    model: config.model.clone(),
                 };
                 
                 let (client_tx_claude, _) = mpsc::unbounded_channel();
@@ -126,7 +251,7 @@ impl AgentManager {
                 let codex_config = codex::CodexConfig {
                     cwd: config.cwd,
                     codex_home: config.home_dir,
-                    model: config.model,
+                    model: config.model.clone(),
                 };
                 
                 let (client_tx_codex, _) = mpsc::unbounded_channel();
@@ -145,7 +270,8 @@ impl AgentManager {
             self.current_agent = Some(agent_type);
         }
 
-        info!("已注册 {} 代理", agent_type);
+        info!("已注册 {} 代理，使用模型: {}\n提供商: {}\nBase URL: {}\n设置环境变量: {:?}", 
+              agent_type, config.model, config.provider.name, config.provider.base_url, env_vars.keys().collect::<Vec<_>>());
         Ok(())
     }
 
@@ -210,24 +336,16 @@ impl AgentManager {
                 match agent_type {
                     AgentType::Claude => {
                         config.home_dir = base_config.home_dir.join("claude");
-                        if config.model == base_config.model {
-                            config.model = "claude-3-5-sonnet-20241022".to_string();
-                        }
                     }
                     AgentType::Codex => {
                         config.home_dir = base_config.home_dir.join("codex");
-                        if config.model == base_config.model {
-                            config.model = "GLM-4.5".to_string();  // Codex 默认使用 GLM-4.5
-                        }
-                        // 为 GLM 设置环境变量
-                        if let Ok(token) = std::env::var("GLM_AUTH_TOKEN") {
-                            config.env_vars.insert("GLM_AUTH_TOKEN".to_string(), token);
-                        }
                     }
                 }
 
                 if self.register_agent(agent_type, config, client_tx.clone()).is_ok() {
                     registered.push(agent_type);
+                } else {
+                    warn!("注册 {} 代理失败", agent_type);
                 }
             } else {
                 warn!("{} 代理不可用，跳过注册", agent_type);
@@ -420,6 +538,54 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.agent_type, AgentType::Codex);  // 默认使用 Codex
         assert_eq!(config.model, "GLM-4.5");  // 默认使用 GLM-4.5 模型
+        assert_eq!(config.provider.name, "glm");  // 默认使用 GLM 提供商
+        assert_eq!(config.reasoning_effort, "high");
+        assert_eq!(config.preferred_auth_method, "apikey");
+    }
+
+    #[test]
+    fn test_model_provider_config_glm() {
+        let provider = ModelProviderConfig::glm();
+        assert_eq!(provider.name, "glm");
+        assert_eq!(provider.base_url, "https://open.bigmodel.cn/api/coding/paas/v4");
+        assert_eq!(provider.env_key, "GLM_AUTH_TOKEN");
+        assert!(!provider.requires_openai_auth);
+    }
+
+    #[test]
+    fn test_model_provider_config_claude() {
+        let provider = ModelProviderConfig::claude();
+        assert_eq!(provider.name, "anthropic");
+        assert_eq!(provider.base_url, "https://api.anthropic.com");
+        assert_eq!(provider.env_key, "ANTHROPIC_API_KEY");
+        assert!(!provider.requires_openai_auth);
+    }
+
+    #[test]
+    fn test_model_provider_config_glm_anthropic() {
+        let provider = ModelProviderConfig::glm_anthropic();
+        assert_eq!(provider.name, "anthropic_glm");
+        assert_eq!(provider.base_url, "https://open.bigmodel.cn/api/anthropic");
+        assert_eq!(provider.env_key, "GLM_AUTH_TOKEN");
+        assert!(provider.extra_params.contains_key("ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn test_generate_env_vars_codex() {
+        let provider = ModelProviderConfig::glm();
+        // 设置测试环境变量
+        unsafe {
+            std::env::set_var("GLM_AUTH_TOKEN", "test-token");
+        }
+        
+        let env_vars = provider.generate_env_vars(AgentType::Codex);
+        assert_eq!(env_vars.get("OPENAI_API_KEY").unwrap(), "test-token");
+        assert_eq!(env_vars.get("OPENAI_BASE_URL").unwrap(), &provider.base_url);
+        
+        // 清理环境变量
+        unsafe {
+            std::env::remove_var("GLM_AUTH_TOKEN");
+        }
     }
 
     #[tokio::test]
