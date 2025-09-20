@@ -5,11 +5,15 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "codex"
+path = "src/lib.rs"
+
 [dependencies]
-# Codex dependencies
-codex-cli = { git = "https://github.com/openai/codex" , branch = "main"}
-codex-core = { git = "https://github.com/openai/codex" , branch = "main"}
-codex-protocol = { git = "https://github.com/openai/codex" , branch = "main"}
+# OpenAI dependencies would go here when available
+# codex-cli = { git = "https://github.com/openai/codex" , branch = "main"}
+# codex-core = { git = "https://github.com/openai/codex" , branch = "main"}
+# codex-protocol = { git = "https://github.com/openai/codex" , branch = "main"}
 
 agent-client-protocol = { workspace = true }
 acp-adapter = { path = "../acp_adapter" }

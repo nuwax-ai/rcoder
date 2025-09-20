@@ -7,7 +7,7 @@ use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::agent::{CodexAgent, CodexConfig};
-use codex_core::config::{Config, ConfigOverrides};
+// use codex_core::config::{Config, ConfigOverrides}; // 注释掉不存在的依赖
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -26,9 +26,9 @@ async fn main() -> Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
-        let core_config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
+        // let core_config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
         let config = CodexConfig {
-            cwd: core_config.cwd.clone(),
+            cwd: std::env::current_dir()?,
             codex_home: dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".codex"),
             model: "gpt-4".to_string(), // 默认模型
         };
