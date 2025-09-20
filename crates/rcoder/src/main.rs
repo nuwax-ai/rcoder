@@ -20,7 +20,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use futures::stream::Stream;
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
-use acp_adapter::plan::PlanManager;
+use acp_adapter::plan::{PlanManager, PlanUpdateEvent, PlanUpdateType};
+use acp_adapter::types::{Plan, PlanEntry, PlanEntryStatus, PlanStats};
 
 mod http_result;
 use http_result::HttpResult;
@@ -154,6 +155,12 @@ pub enum ProgressEventType {
     TaskFailed,
     /// 连接保持活跃
     KeepAlive,
+    /// Plan相关事件
+    PlanUpdate,
+    /// Plan条目状态更新
+    PlanEntryUpdate,
+    /// Plan统计信息更新
+    PlanStatsUpdate,
 }
 
 impl std::fmt::Display for ProgressEventType {
@@ -165,6 +172,9 @@ impl std::fmt::Display for ProgressEventType {
             ProgressEventType::TaskCompleted => write!(f, "task_completed"),
             ProgressEventType::TaskFailed => write!(f, "task_failed"),
             ProgressEventType::KeepAlive => write!(f, "keep_alive"),
+            ProgressEventType::PlanUpdate => write!(f, "plan_update"),
+            ProgressEventType::PlanEntryUpdate => write!(f, "plan_entry_update"),
+            ProgressEventType::PlanStatsUpdate => write!(f, "plan_stats_update"),
         }
     }
 }
@@ -215,6 +225,84 @@ fn get_trace_id() -> Option<String> {
     // 移除连字符，转换为纯十六进制格式
     let trace_id = uuid.to_string().replace("-", "");
     Some(trace_id)
+}
+
+/// 将Plan更新事件转换为ProgressEvent
+fn plan_update_to_progress_event(plan_update: PlanUpdateEvent) -> ProgressEvent {
+    let (event_type, message, data) = match &plan_update.update_type {
+        PlanUpdateType::FullUpdate => {
+            let entry_count = plan_update.plan.as_ref().map(|p| p.entries.len()).unwrap_or(0);
+            (
+                ProgressEventType::PlanUpdate,
+                format!("Plan已更新，包含{}个任务条目", entry_count),
+                serde_json::json!({
+                    "type": "full_update",
+                    "plan": plan_update.plan,
+                    "stats": plan_update.stats
+                })
+            )
+        }
+        PlanUpdateType::EntryStatusUpdate { entry_id, status } => {
+            let status_text = match status {
+                PlanEntryStatus::Pending => "待处理",
+                PlanEntryStatus::InProgress => "进行中",
+                PlanEntryStatus::Completed => "已完成",
+                PlanEntryStatus::Cancelled => "已取消",
+                PlanEntryStatus::Failed => "已失败",
+            };
+            (
+                ProgressEventType::PlanEntryUpdate,
+                format!("任务条目 {} 状态更新为: {}", entry_id, status_text),
+                serde_json::json!({
+                    "type": "entry_status_update",
+                    "entry_id": entry_id,
+                    "status": status,
+                    "stats": plan_update.stats
+                })
+            )
+        }
+        PlanUpdateType::EntryAdded { entry_id } => {
+            (
+                ProgressEventType::PlanEntryUpdate,
+                format!("新任务条目已添加: {}", entry_id),
+                serde_json::json!({
+                    "type": "entry_added",
+                    "entry_id": entry_id,
+                    "stats": plan_update.stats
+                })
+            )
+        }
+        PlanUpdateType::EntryRemoved { entry_id } => {
+            (
+                ProgressEventType::PlanEntryUpdate,
+                format!("任务条目已移除: {}", entry_id),
+                serde_json::json!({
+                    "type": "entry_removed",
+                    "entry_id": entry_id,
+                    "stats": plan_update.stats
+                })
+            )
+        }
+        PlanUpdateType::StatsUpdate => {
+            (
+                ProgressEventType::PlanStatsUpdate,
+                "Plan统计信息已更新".to_string(),
+                serde_json::json!({
+                    "type": "stats_update",
+                    "stats": plan_update.stats
+                })
+            )
+        }
+    };
+    
+    ProgressEvent {
+        event_type,
+        message,
+        timestamp: chrono::DateTime::from_timestamp_millis(plan_update.timestamp as i64)
+            .unwrap_or_else(|| chrono::Utc::now()),
+        session_id: plan_update.session_id,
+        data: Some(data),
+    }
 }
 
 /// 广播进度事件给所有监听者
@@ -393,7 +481,7 @@ async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
-/// SSE 进度推送端点
+/// SSE 进度推送端点 - 统一处理所有agent数据（包括Plan更新）
 async fn progress_stream(
     State(state): State<SharedState>,
     Path(session_id): Path<String>,
@@ -407,6 +495,25 @@ async fn progress_stream(
     }
     
     info!("新的 SSE 连接已建立为 session: {}", session_id);
+    
+    // 订阅Plan更新事件
+    let plan_update_rx = state.plan_manager.subscribe_updates().await;
+    let tx_clone = tx.clone();
+    let session_id_clone = session_id.clone();
+    
+    // 在后台任务中处理Plan更新事件
+    tokio::spawn(async move {
+        let mut plan_update_rx = plan_update_rx;
+        while let Some(plan_update) = plan_update_rx.recv().await {
+            // 只处理当前session的Plan更新
+            if plan_update.session_id == session_id_clone {
+                let progress_event = plan_update_to_progress_event(plan_update);
+                if let Err(_) = tx_clone.send(progress_event) {
+                    break; // 连接已断开
+                }
+            }
+        }
+    });
     
     // 发送初始连接事件
     let connect_event = ProgressEvent {
@@ -595,7 +702,7 @@ fn create_router(state: SharedState) -> Router {
         .route("/sessions/{session_id}", get(get_session).delete(delete_session))
         .route("/users/{user_id}/sessions", get(get_user_sessions))
         .route("/progress/{session_id}", get(progress_stream))
-        .merge(plan_routes()) // 添加Plan路由
+        .merge(plan_routes()) // 添加Plan路由（只保留查询端点）
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -639,12 +746,12 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET  /sessions/:session_id - Get session info");
     info!("  GET  /users/:user_id/sessions - Get user's sessions");
     info!("  DELETE /sessions/:session_id - Delete session");
-    info!("  GET  /progress/:session_id - SSE progress stream for AI tasks");
+    info!("  GET  /progress/:session_id - SSE progress stream for AI tasks and Plan updates (unified stream)");
     info!("  GET  /health - Health check");
     info!("  === Plan API Endpoints ===");
     info!("  GET  /api/plans/{{session_id}} - Get plan for session (frontend query)");
     info!("  GET  /api/plans/stats - Get stats for all active plans (frontend monitoring)");
-    info!("  GET  /api/plans/{{session_id}}/updates - SSE stream for plan updates (core: agent->frontend)");
+    info!("  NOTE: Plan real-time updates are now unified in /progress/{{session_id}} SSE stream");
     
     // 启动服务器
     axum::serve(listener, app)
