@@ -642,12 +642,9 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET  /progress/:session_id - SSE progress stream for AI tasks");
     info!("  GET  /health - Health check");
     info!("  === Plan API Endpoints ===");
-    info!("  GET  /api/plans/:session_id - Get plan for session");
-    info!("  PUT  /api/plans/:session_id/status - Update plan entry status");
-    info!("  POST /api/plans/:session_id/cleanup - Cleanup completed entries");
-    info!("  POST /api/plans/:session_id/demo - Create demo plan (for testing)");
-    info!("  GET  /api/plans/:session_id/updates - SSE stream for plan updates");
-    info!("  GET  /api/plans/stats - Get stats for all active plans");
+    info!("  GET  /api/plans/{{session_id}} - Get plan for session (frontend query)");
+    info!("  GET  /api/plans/stats - Get stats for all active plans (frontend monitoring)");
+    info!("  GET  /api/plans/{{session_id}}/updates - SSE stream for plan updates (core: agent->frontend)");
     
     // 启动服务器
     axum::serve(listener, app)

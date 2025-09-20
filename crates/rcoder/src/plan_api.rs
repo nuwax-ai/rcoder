@@ -1,13 +1,12 @@
 use crate::{SharedState, HttpResult, get_trace_id};
-use acp_adapter::plan::{PlanManager, PlanUpdateEvent};
-use acp_adapter::types::{Plan, PlanStats, PlanEntryStatus, PlanEntryPriority};
+use acp_adapter::types::{Plan, PlanStats};
 use axum::{
     extract::{Path, State, Query},
-    response::{Json, Sse, sse::Event},
+    response::{Sse, sse::Event},
 };
 use serde::{Deserialize, Serialize};
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
-use tracing::{info, warn, error};
+use tracing::{info, error};
 use std::collections::HashMap;
 
 /// Plan API响应结构
@@ -24,14 +23,7 @@ pub struct PlanQuery {
     pub include_stats: Option<bool>,
 }
 
-/// Plan状态更新请求
-#[derive(Debug, Deserialize)]
-pub struct UpdateEntryStatusRequest {
-    pub entry_id: String,
-    pub status: PlanEntryStatus,
-}
-
-/// 获取指定会话的Plan
+/// 获取指定会话的Plan - 供前端查询使用
 pub async fn get_plan(
     State(state): State<SharedState>,
     Path(session_id): Path<String>,
@@ -58,7 +50,7 @@ pub async fn get_plan(
     HttpResult::success(plan_response, trace_id)
 }
 
-/// 获取所有活跃Plan的统计信息
+/// 获取所有活跃Plan的统计信息 - 供前端监控使用
 pub async fn get_all_plans_stats(
     State(state): State<SharedState>,
 ) -> HttpResult<HashMap<String, PlanStats>> {
@@ -72,71 +64,7 @@ pub async fn get_all_plans_stats(
     HttpResult::success(stats, trace_id)
 }
 
-/// 更新Plan条目状态
-pub async fn update_entry_status(
-    State(state): State<SharedState>,
-    Path(session_id): Path<String>,
-    Json(request): Json<UpdateEntryStatusRequest>,
-) -> HttpResult<PlanResponse> {
-    let trace_id = get_trace_id();
-    
-    info!(
-        "Updating entry {} status to {:?} for session: {}, trace_id={:?}", 
-        request.entry_id, request.status, session_id, trace_id
-    );
-    
-    // 实际更新条目状态
-    match state.plan_manager.update_entry_status(&session_id, &request.entry_id, request.status).await {
-        Ok(_) => {
-            let plan = state.plan_manager.get_plan(&session_id).await;
-            let stats = state.plan_manager.get_plan_stats(&session_id).await;
-            
-            let plan_response = PlanResponse {
-                session_id: session_id.clone(),
-                plan,
-                stats,
-            };
-            
-            HttpResult::success(plan_response, trace_id)
-        }
-        Err(e) => {
-            error!("Failed to update entry status: {}", e);
-            HttpResult::internal_error(&format!("Failed to update entry status: {}", e), trace_id)
-        }
-    }
-}
-
-/// 清理已完成的Plan条目
-pub async fn cleanup_completed_entries(
-    State(state): State<SharedState>,
-    Path(session_id): Path<String>,
-) -> HttpResult<PlanResponse> {
-    let trace_id = get_trace_id();
-    
-    info!("Cleaning up completed entries for session: {}, trace_id={:?}", session_id, trace_id);
-    
-    // 实际清理已完成条目
-    match state.plan_manager.cleanup_completed_entries(&session_id).await {
-        Ok(_) => {
-            let plan = state.plan_manager.get_plan(&session_id).await;
-            let stats = state.plan_manager.get_plan_stats(&session_id).await;
-            
-            let plan_response = PlanResponse {
-                session_id: session_id.clone(),
-                plan,
-                stats,
-            };
-            
-            HttpResult::success(plan_response, trace_id)
-        }
-        Err(e) => {
-            error!("Failed to cleanup completed entries: {}", e);
-            HttpResult::internal_error(&format!("Failed to cleanup completed entries: {}", e), trace_id)
-        }
-    }
-}
-
-/// Plan实时更新SSE端点
+/// Plan实时更新SSE端点 - 核心功能：推送agent生成的Plan更新给前端
 pub async fn plan_updates_stream(
     State(state): State<SharedState>,
     Path(session_id): Path<String>,
@@ -146,7 +74,7 @@ pub async fn plan_updates_stream(
     // 从PlanManager订阅更新
     let update_rx = state.plan_manager.subscribe_updates().await;
     
-    // 创建stream
+    // 创建stream，只推送指定session的Plan更新
     let stream = UnboundedReceiverStream::new(update_rx)
         .filter_map(move |event| {
             // 只返回指定session的事件
@@ -168,50 +96,13 @@ pub async fn plan_updates_stream(
         )
 }
 
-/// 创建一个演示Plan（用于测试）
-pub async fn create_demo_plan(
-    State(state): State<SharedState>,
-    Path(session_id): Path<String>,
-) -> HttpResult<PlanResponse> {
-    let trace_id = get_trace_id();
-    
-    info!("Creating demo plan for session: {}, trace_id={:?}", session_id, trace_id);
-    
-    // 创建演示Plan
-    let mut plan = Plan::new();
-    plan.add_entry("分析用户需求".to_string(), acp_adapter::types::PlanEntryPriority::High);
-    plan.add_entry("设计系统架构".to_string(), acp_adapter::types::PlanEntryPriority::Normal);
-    plan.add_entry("实现核心功能".to_string(), acp_adapter::types::PlanEntryPriority::Normal);
-    plan.add_entry("编写单元测试".to_string(), acp_adapter::types::PlanEntryPriority::Low);
-    plan.add_entry("部署到生产环境".to_string(), acp_adapter::types::PlanEntryPriority::High);
-    
-    // 将plan保存到PlanManager
-    match state.plan_manager.update_plan(&session_id, plan.clone()).await {
-        Ok(_) => {
-            let stats = plan.stats();
-            
-            let plan_response = PlanResponse {
-                session_id: session_id.clone(),
-                plan: Some(plan),
-                stats: Some(stats),
-            };
-            
-            HttpResult::success(plan_response, trace_id)
-        }
-        Err(e) => {
-            error!("Failed to create demo plan: {}", e);
-            HttpResult::internal_error(&format!("Failed to create demo plan: {}", e), trace_id)
-        }
-    }
-}
-
-/// Plan路由配置
+/// Plan路由配置 - 只提供查询和SSE推送，Plan由agent自动维护
 pub fn plan_routes() -> axum::Router<SharedState> {
     axum::Router::new()
+        // 获取Plan详情 - 前端查询用
         .route("/api/plans/{session_id}", axum::routing::get(get_plan))
-        .route("/api/plans/{session_id}/status", axum::routing::put(update_entry_status))
-        .route("/api/plans/{session_id}/cleanup", axum::routing::post(cleanup_completed_entries))
-        .route("/api/plans/{session_id}/demo", axum::routing::post(create_demo_plan))
-        .route("/api/plans/{session_id}/updates", axum::routing::get(plan_updates_stream))
+        // 获取所有Plan统计 - 前端监控用
         .route("/api/plans/stats", axum::routing::get(get_all_plans_stats))
+        // SSE实时推送Plan更新 - 核心功能
+        .route("/api/plans/{session_id}/updates", axum::routing::get(plan_updates_stream))
 }
