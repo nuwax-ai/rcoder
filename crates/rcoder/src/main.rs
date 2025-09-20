@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path, State, Multipart},
+    extract::{Path, State},
     response::{Json, Sse, sse::Event},
     routing::{get, post},
     Router,
@@ -15,17 +15,22 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, Span};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use opentelemetry::trace::TraceContextExt;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use futures::stream::Stream;
-use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
-use acp_adapter::types::{StreamUpdate, SessionModeId};
-use acp_adapter::{SessionManager, SessionHandle, AcpConfig};
+use acp_adapter::mention::ResourceUri;
+use acp_adapter::types::StreamUpdate;
+use acp_adapter::SessionManager;
 use agent_client_protocol::SessionId as AcpSessionId;
 
 mod http_result;
 use http_result::HttpResult;
+
+mod middleware;
+use middleware::TracingMiddleware;
 
 mod multipart_chat;
 use multipart_chat::{handle_multipart_chat, CodeSnippet};
@@ -263,15 +268,15 @@ type SharedState = Arc<AppState>;
 
 // ==================== 辅助函数 ====================
 
-/// 获取当前请求的 trace_id
+/// 获取当前请求的 trace_id - 生成唯一标识符
 fn get_trace_id() -> Option<String> {
-    // 使用 UUID v4 生成 trace_id，符合 OpenTelemetry 格式
-    // UUID v4 的格式为 32 位十六进制字符串，符合 trace_id 的要求
-    let uuid = Uuid::new_v4();
-    // 移除连字符，转换为纯十六进制格式
-    let trace_id = uuid.to_string().replace("-", "");
-    Some(trace_id)
+    // 简化实现：为每个请求生成唯一的 trace_id
+    // 在实际的分布式追踪系统中，这个 ID 应该从上游服务传递过来
+    // 或者从 OpenTelemetry 上下文中提取，但为了避免复杂性，这里直接生成
+    Some(Uuid::new_v4().simple().to_string())
 }
+
+
 
 /// 将StreamUpdate转换为ProgressEvent
 fn stream_update_to_progress_event(stream_update: StreamUpdate) -> ProgressEvent {
@@ -420,7 +425,7 @@ fn broadcast_progress_event(state: &SharedState, session_id: &str, event: Progre
         
         // 清理失败的发送者
         if !failed_indices.is_empty() {
-            drop(senders); // 释放引用
+            let _ = senders; // 释放引用
             if let Some(mut senders) = state.progress_senders.get_mut(session_id) {
                 // 从后往前删除，避免索引偏移
                 for &index in failed_indices.iter().rev() {
@@ -436,15 +441,14 @@ fn broadcast_progress_event(state: &SharedState, session_id: &str, event: Progre
 // ==================== HTTP 处理器 ====================
 
 /// 处理聊天请求
+#[tracing::instrument(skip(state), fields(user_id = %request.user_id, project_id = ?request.project_id, session_id = ?request.session_id))]
 async fn handle_chat(
     State(state): State<SharedState>,
     Json(mut request): Json<ChatRequest>,
 ) -> HttpResult<ChatResponse> {
-    let trace_id = get_trace_id();
-    
     info!(
-        "Received chat request: user_id={}, project_id={:?}, session_id={:?}, trace_id={:?}",
-        request.user_id, request.project_id, request.session_id, trace_id
+        "Received chat request: user_id={}, project_id={:?}, session_id={:?}",
+        request.user_id, request.project_id, request.session_id
     );
 
     // 如果没有提供 project_id，则生成一个 UUID v7
@@ -463,7 +467,6 @@ async fn handle_chat(
                 return HttpResult::error(
                     "DIR001",
                     &format!("Failed to create project directory: {}", e),
-                    trace_id,
                 );
             }
             info!("Created project directory: {:?}", project_path);
@@ -504,32 +507,29 @@ async fn handle_chat(
                 error: None,
             };
             
-            HttpResult::success(chat_response, trace_id)
+            HttpResult::success(chat_response)
         }
         Err(e) => {
             error!("AI command execution failed: {}", e);
             HttpResult::error(
                 "AI001",
                 &format!("AI command execution failed: {}", e),
-                trace_id,
             )
         }
     }
 }
 
 /// 获取会话信息
+#[tracing::instrument(skip(state), fields(session_id = %session_id))]
 async fn get_session(
     State(state): State<SharedState>,
     Path(session_id): Path<String>,
 ) -> HttpResult<SessionInfo> {
-    let trace_id = get_trace_id();
-    
     match state.sessions.get(&session_id) {
-        Some(session) => HttpResult::success(session.clone(), trace_id),
+        Some(session) => HttpResult::success(session.clone()),
         None => HttpResult::error(
             "SES001", 
             &format!("Session '{}' not found", session_id),
-            trace_id,
         ),
     }
 }
@@ -539,15 +539,13 @@ async fn get_user_sessions(
     State(state): State<SharedState>,
     Path(user_id): Path<String>,
 ) -> HttpResult<Vec<SessionInfo>> {
-    let trace_id = get_trace_id();
-    
     let user_sessions: Vec<SessionInfo> = state.sessions
         .iter()
         .filter(|entry| entry.value().user_id == user_id)
         .map(|entry| entry.value().clone())
         .collect();
-        
-    HttpResult::success(user_sessions, trace_id)
+    
+    HttpResult::success(user_sessions)
 }
 
 /// 删除会话
@@ -555,20 +553,16 @@ async fn delete_session(
     State(state): State<SharedState>,
     Path(session_id): Path<String>,
 ) -> HttpResult<String> {
-    let trace_id = get_trace_id();
-    
     match state.sessions.remove(&session_id) {
         Some(_) => {
             info!("Session {} deleted", session_id);
             HttpResult::success(
                 format!("Session '{}' deleted successfully", session_id),
-                trace_id,
             )
         }
         None => HttpResult::error(
             "SES002",
             &format!("Session '{}' not found", session_id),
-            trace_id,
         ),
     }
 }
@@ -673,6 +667,7 @@ async fn update_session_activity(state: &SharedState, session_id: &str) {
 }
 
 /// 执行 AI 命令
+#[tracing::instrument(skip(request, config, state), fields(agent_type = %agent_type, session_id = %session_id))]
 async fn execute_ai_command(
     agent_type: &AgentType,
     request: &ChatRequest,
@@ -680,6 +675,11 @@ async fn execute_ai_command(
     state: &SharedState,
     session_id: &str,
 ) -> anyhow::Result<String> {
+    // 添加 span 属性
+    let current_span = Span::current();
+    current_span.record("ai.agent_type", agent_type.to_string());
+    current_span.record("ai.prompt_length", request.prompt.len());
+    
     // 发送任务开始事件
     let start_event = ProgressEvent {
         event_type: ProgressEventType::TaskStarted,
@@ -803,6 +803,11 @@ fn create_router(state: SharedState) -> Router {
         .route("/users/{user_id}/sessions", get(get_user_sessions))
         .route("/progress/{session_id}", get(progress_stream))
         .layer(CorsLayer::permissive())
+        // 自定义追踪中间件 - 自动生成和管理 trace_id
+        .layer(axum::middleware::from_fn(middleware::tracing_middleware::tracing_middleware_handler))
+        // OpenTelemetry tracing layer for automatic trace context propagation
+        .layer(axum_tracing_opentelemetry::middleware::OtelAxumLayer::default())
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -861,16 +866,22 @@ async fn main() -> anyhow::Result<()> {
 
 /// 初始化遥测系统
 fn init_telemetry() -> anyhow::Result<()> {
-    // 混合方案：初始化 tracing subscriber，但使用 OpenTelemetry 的 trace_id 生成
+    // 简化的 OpenTelemetry 设置，只使用 tracing 和基本的 span 功能
+    // 设置全局文本传播器（用于 trace context 传播）
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new()
+    );
+    
+    // 初始化 tracing subscriber
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rcoder=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "rcoder=debug,tower_http=debug,axum_tracing_opentelemetry=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
         
-    info!("✓ Tracing 初始化成功，支持 trace_id 生成");
+    info!("✓ Tracing 初始化成功，支持 trace_id 生成和传播");
     
     Ok(())
 }

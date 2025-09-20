@@ -1,4 +1,4 @@
-use crate::{SharedState, ProgressEvent, ProgressEventType, broadcast_progress_event, get_trace_id, create_new_session, update_session_activity, execute_ai_command, ChatResponse, HttpResult};
+use crate::{SharedState, ProgressEvent, ProgressEventType, broadcast_progress_event, create_new_session, update_session_activity, execute_ai_command, ChatResponse, HttpResult};
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
 use acp_adapter::permission::{PermissionManager, PermissionEvent};
 use acp_adapter::capability::{AgentConnection, PermissionCapability};
@@ -67,9 +67,7 @@ pub async fn handle_multipart_chat(
     State(state): State<SharedState>,
     mut multipart: Multipart,
 ) -> HttpResult<ChatResponse> {
-    let trace_id = get_trace_id();
-    
-    info!("收到多媒体聊天请求, trace_id={:?}", trace_id);
+    info!("收到多媒体聊天请求");
 
     // 解析 multipart 数据
     let mut request = match parse_multipart_request(&mut multipart, &state).await {
@@ -79,7 +77,6 @@ pub async fn handle_multipart_chat(
             return HttpResult::error(
                 "MULTIPART001",
                 &format!("解析多媒体请求失败: {}", e),
-                trace_id,
             );
         }
     };
@@ -103,11 +100,10 @@ pub async fn handle_multipart_chat(
         if !project_path.exists() {
             if let Err(e) = tokio::fs::create_dir_all(&project_path).await {
                 error!("Failed to create project directory {:?}: {}", project_path, e);
-                return HttpResult::error(
-                    "DIR001",
-                    &format!("Failed to create project directory: {}", e),
-                    trace_id,
-                );
+            return HttpResult::error(
+                "DIR001",
+                &format!("Failed to create project directory: {}", e),
+            );
             }
             info!("Created project directory: {:?}", project_path);
         }
@@ -134,7 +130,6 @@ pub async fn handle_multipart_chat(
             return HttpResult::error(
                 "PROMPT001",
                 &format!("构建增强prompt失败: {}", e),
-                trace_id,
             );
         }
     };
@@ -167,14 +162,13 @@ pub async fn handle_multipart_chat(
                 error: None,
             };
             
-            HttpResult::success(chat_response, trace_id)
+            HttpResult::success(chat_response)
         }
         Err(e) => {
             error!("AI command execution failed: {}", e);
             HttpResult::error(
                 "AI001",
                 &format!("AI command execution failed: {}", e),
-                trace_id,
             )
         }
     }

@@ -1,6 +1,24 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
+use opentelemetry::trace::TraceContextExt;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// 从当前 OpenTelemetry context 获取 trace_id
+fn get_trace_id_from_context() -> Option<String> {
+    let span = tracing::Span::current();
+    let context = span.context();
+    let span_ref = context.span();
+    let span_context = span_ref.span_context();
+    
+    if span_context.is_valid() {
+        // 获取 trace_id 并转换为字符串
+        let trace_id = span_context.trace_id();
+        Some(trace_id.to_string())
+    } else {
+        None
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -14,28 +32,28 @@ pub struct HttpResult<T> {
 }
 
 impl<T> HttpResult<T> {
-    pub fn success(data: T, tid: Option<String>) -> Self {
+    pub fn success(data: T) -> Self {
         HttpResult {
             code: "0000".to_string(),
             message: "成功".to_string(),
             data: Some(data),
-            tid,
+            tid: get_trace_id_from_context(),
             success: true,
         }
     }
 
-    pub fn error(code: &str, message: &str, tid: Option<String>) -> Self {
+    pub fn error(code: &str, message: &str) -> Self {
         HttpResult {
             code: code.to_string(),
             message: message.to_string(),
             data: None,
-            tid,
+            tid: get_trace_id_from_context(),
             success: false,
         }
     }
 
-    pub fn internal_error(message: &str, tid: Option<String>) -> Self {
-        Self::error("5000", message, tid)
+    pub fn internal_error(message: &str) -> Self {
+        Self::error("5000", message)
     }
 }
 
@@ -57,7 +75,15 @@ impl<T: Serialize> Serialize for HttpResult<T> {
 
 impl<T: Serialize> IntoResponse for HttpResult<T> {
     fn into_response(self) -> Response {
-        match serde_json::to_string(&self) {
+        // 创建一个新的 HttpResult，自动从 context 获取 trace_id
+        let mut result = self;
+        
+        // 如果当前没有 trace_id，尝试从 OpenTelemetry context 获取
+        if result.tid.is_none() {
+            result.tid = get_trace_id_from_context();
+        }
+        
+        match serde_json::to_string(&result) {
             Ok(body) => (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],

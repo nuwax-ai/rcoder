@@ -35,7 +35,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Database
-sqlx = { version = "0.7", features = [
+sqlx = { version = "0.8", features = [
     "runtime-tokio-rustls",
     "sqlite",
     "chrono",
@@ -59,10 +59,10 @@ log = "0.4"
 env_logger = "0.11"
 
 # OpenTelemetry
-opentelemetry = "0.24"
-opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
-tracing-opentelemetry = "0.25"
-axum-tracing-opentelemetry = "0.19"
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.31"
+axum-tracing-opentelemetry = "0.30"
 
 # UUID
 uuid = { version = "1.0", features = ["serde", "v4", "v7"] }
@@ -81,7 +81,7 @@ path-clean = "1.0"
 dashmap = "6.0"
 futures = "0.3"
 itertools = "0.14"
-bytes = "1.0"
+bytes = "1.10"
 # collections = "0.2"  # 这个包不存在
 
 
@@ -121,7 +121,7 @@ reqwest = { version = "0.12", features = ["stream"] }
 aho-corasick = "1.0"
 # askpass = "0.1"  # 这个包不存在
 base64 = "0.22"
-circular-buffer = "0.2"
+circular-buffer = "1.2"
 fancy-regex = "0.16"
 fuzzy = "0.0.1"
 git_hosting_providers = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "git_hosting_providers" }
