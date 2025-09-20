@@ -16,6 +16,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Your Name <your.email@example.com>"]
 license = "MIT OR Apache-2.0"
+description = "Rust-based AI agent framework"
 publish = false
 
 [workspace.dependencies]
@@ -74,6 +75,7 @@ path-clean = "1.0"
 dashmap = "6.0"
 futures = "0.3"
 itertools = "0.14"
+bytes = "1.0"
 # collections = "0.2"  # 这个包不存在
 
 
@@ -143,4 +145,5 @@ ctor = "0.5"
 pretty_assertions = "1.4"
 tempfile = "3.8"
 rand = "0.9"
+tokio-test = "0.4"
 

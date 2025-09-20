@@ -6,7 +6,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt 
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::agent::CodexAgent;
+use crate::agent::{CodexAgent, CodexConfig};
 use codex_core::config::{Config, ConfigOverrides};
 
 #[tokio::main(flavor = "current_thread")]
@@ -26,7 +26,12 @@ async fn main() -> Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
-        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
+        let core_config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
+        let config = CodexConfig {
+            cwd: core_config.cwd.clone(),
+            codex_home: dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".codex"),
+            model: "gpt-4".to_string(), // 默认模型
+        };
         let agent = CodexAgent::with_config(tx, client_tx.clone(), config);
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);

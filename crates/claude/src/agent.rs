@@ -2,7 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::SystemTime;
+use std::sync::Arc;
 
+use acp_adapter::{AcpAdapter, AcpConfig, StreamUpdate};
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, CancelNotification, ContentBlock,
@@ -14,7 +16,7 @@ use agent_client_protocol::{
     V1,
 };
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot, oneshot::Sender};
+use tokio::sync::{mpsc, oneshot, oneshot::Sender, Mutex};
 use tokio::task;
 use tracing::{info, warn};
 
@@ -70,6 +72,7 @@ impl Default for ClaudeConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct ClaudeAgent {
     session_update_tx: mpsc::UnboundedSender<(SessionNotification, Sender<()>)>,
     next_session_id: Cell<u64>,
@@ -78,6 +81,8 @@ pub struct ClaudeAgent {
     next_submit_seq: Cell<u64>,
     extra_available_commands: Rc<RefCell<Vec<AvailableCommand>>>,
     client_tx: mpsc::UnboundedSender<ClientOp>,
+    acp_adapter: Option<Arc<AcpAdapter>>,
+    stream_update_receivers: Arc<Mutex<HashMap<String, mpsc::UnboundedReceiver<StreamUpdate>>>>,
 }
 
 impl ClaudeAgent {
@@ -94,9 +99,38 @@ impl ClaudeAgent {
             next_submit_seq: Cell::new(1),
             extra_available_commands: Rc::new(RefCell::new(Vec::new())),
             client_tx,
+            acp_adapter: None,
+            stream_update_receivers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// 初始化 ACP 适配器
+    async fn initialize_acp_adapter(&self) -> Result<Arc<AcpAdapter>, Error> {
+        let acp_config = AcpConfig::claude_code()
+            .with_working_dir(self.config.cwd.clone())
+            .with_env("CLAUDE_API_KEY".to_string(), std::env::var("CLAUDE_API_KEY").unwrap_or_default());
+
+        let adapter = Arc::new(AcpAdapter::new(acp_config));
+
+        // 初始化适配器
+        adapter.initialize().await
+            .map_err(|e| Error::internal_error().with_data(format!("初始化 ACP 适配器失败: {}", e)))?;
+
+        Ok(adapter)
+    }
+
+    /// 获取或创建 ACP 适配器
+    async fn get_or_create_acp_adapter(&self) -> Result<Arc<AcpAdapter>, Error> {
+        if let Some(ref adapter) = self.acp_adapter {
+            Ok(adapter.clone())
+        } else {
+            // 注意：这里我们需要修改结构体以支持内部可变性
+            // 由于 Rust 的借用规则，我们需要使用 Arc<Mutex<T>> 或类似机制
+            Err(Error::internal_error().with_data("ACP 适配器未初始化"))
+        }
+    }
+
+  
     pub fn send_message_chunk(
         &self,
         session_id: &SessionId,
@@ -152,6 +186,10 @@ pub enum ApprovalDecision {
 impl Agent for ClaudeAgent {
     async fn initialize(&self, args: InitializeRequest) -> Result<InitializeResponse, Error> {
         info!(?args, "Received initialize request");
+
+        // 初始化 ACP 适配器
+        let _adapter = self.initialize_acp_adapter().await?;
+
         // Advertise supported auth methods for Claude Code
         let auth_methods = vec![
             AuthMethod {
@@ -372,8 +410,8 @@ impl Agent for ClaudeAgent {
             }
         }
 
-        // Process the prompt with Claude Code
-        self.handle_claude_prompt(&args.session_id, &args.prompt).await?;
+        // 使用 ACP 适配器处理提示
+        self.handle_claude_prompt_with_acp(&args.session_id, &args.prompt).await?;
 
         Ok(PromptResponse {
             stop_reason: StopReason::EndTurn,
@@ -407,6 +445,121 @@ impl Agent for ClaudeAgent {
 }
 
 impl ClaudeAgent {
+    async fn handle_claude_prompt_with_acp(
+        &self,
+        session_id: &SessionId,
+        prompt: &[ContentBlock],
+    ) -> Result<(), Error> {
+        // Extract text content from the prompt
+        let mut text_content = String::new();
+        for block in prompt {
+            match block {
+                ContentBlock::Text(t) => {
+                    text_content.push_str(&t.text);
+                }
+                ContentBlock::Image(img) => {
+                    // For images, we would need to handle them differently
+                    text_content.push_str(&format!("[Image: {}]", img.mime_type));
+                }
+                ContentBlock::Resource(res) => {
+                    if let EmbeddedResourceResource::TextResourceContents(trc) = &res.resource {
+                        text_content.push_str(&trc.text);
+                    }
+                }
+                ContentBlock::ResourceLink(link) => {
+                    text_content.push_str(&format!("[Resource: {}]", link.uri));
+                }
+                ContentBlock::Audio(_) => {
+                    // Audio not supported yet
+                }
+            }
+        }
+
+        // 初始化 ACP 适配器
+        let adapter = self.initialize_acp_adapter().await?;
+
+        // 创建 ACP 会话
+        let session_handle = adapter.create_session().await
+            .map_err(|e| Error::internal_error().with_data(format!("创建会话失败: {}", e)))?;
+
+        // 订阅流式更新
+        let mut update_receiver = session_handle.subscribe_to_updates().await;
+
+        // 创建任务来处理流式更新
+        let session_id_clone = session_id.clone();
+        let session_update_tx = self.session_update_tx.clone();
+        task::spawn_local(async move {
+            while let Some(update) = update_receiver.recv().await {
+                match update {
+                    StreamUpdate::AgentMessageChunk { session_id, content } => {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = session_update_tx.send((
+                            SessionNotification {
+                                session_id,
+                                update: SessionUpdate::AgentMessageChunk {
+                                    content: ContentBlock::Text(agent_client_protocol::TextContent {
+                                        annotations: None,
+                                        text: content,
+                                        meta: None,
+                                    })
+                                },
+                                meta: None,
+                            },
+                            tx,
+                        ));
+                        let _ = rx.await;
+                    }
+                    StreamUpdate::ToolCallStarted { session_id, tool_call_id, tool_name } => {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = session_update_tx.send((
+                            SessionNotification {
+                                session_id,
+                                update: SessionUpdate::AgentThoughtChunk {
+                                    content: ContentBlock::Text(agent_client_protocol::TextContent {
+                                        annotations: None,
+                                        text: format!("开始调用工具: {}", tool_name),
+                                        meta: None,
+                                    })
+                                },
+                                meta: None,
+                            },
+                            tx,
+                        ));
+                        let _ = rx.await;
+                    }
+                    StreamUpdate::ToolCall { session_id, tool_call } => {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = session_update_tx.send((
+                            SessionNotification {
+                                session_id,
+                                update: SessionUpdate::ToolCall(tool_call),
+                                meta: None,
+                            },
+                            tx,
+                        ));
+                        let _ = rx.await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // 构建 ACP 请求
+        let acp_request = PromptRequest {
+            session_id: session_id.clone(),
+            prompt: prompt.to_vec(),
+            meta: None,
+        };
+
+        // 发送提示请求
+        let response = session_handle.send_prompt(acp_request).await
+            .map_err(|e| Error::internal_error().with_data(format!("发送提示失败: {}", e)))?;
+
+        info!(?response.stop_reason, "提示处理完成");
+
+        Ok(())
+    }
+
     async fn handle_claude_prompt(
         &self,
         session_id: &SessionId,
