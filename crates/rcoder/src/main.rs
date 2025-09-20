@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, State, Multipart},
     response::{Json, Sse, sse::Event},
     routing::{get, post},
     Router,
@@ -19,13 +19,17 @@ use tracing::{info, warn, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use futures::stream::Stream;
+use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
 
 mod http_result;
 use http_result::HttpResult;
 
+mod multipart_chat;
+use multipart_chat::{handle_multipart_chat, CodeSnippet};
+
 // ==================== 数据结构定义 ====================
 
-/// 用户请求结构
+/// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
     /// 用户输入的 prompt
@@ -36,6 +40,40 @@ struct ChatRequest {
     project_id: Option<String>,
     /// 可选的会话 ID，如果不提供则创建新会话
     session_id: Option<String>,
+}
+
+/// 多媒体聊天请求结构 - 用于处理文件上传
+#[derive(Debug)]
+struct MultipartChatRequest {
+    /// 用户输入的 prompt
+    prompt: String,
+    /// 用户 ID
+    user_id: String,
+    /// 可选的项目 ID
+    project_id: Option<String>,
+    /// 可选的会话 ID
+    session_id: Option<String>,
+    /// 上传的文件列表
+    files: Vec<UploadedFile>,
+    /// 代码片段列表
+    code_snippets: Vec<CodeSnippet>,
+    /// 选中的代码段引用
+    code_references: Vec<ResourceUri>,
+}
+
+/// 上传的文件信息
+#[derive(Debug)]
+struct UploadedFile {
+    /// 原文件名
+    filename: String,
+    /// MIME 类型
+    content_type: String,
+    /// 文件内容
+    content: Vec<u8>,
+    /// 文件大小
+    size: usize,
+    /// 生成的资源URI
+    resource_uri: ResourceUri,
 }
 
 /// 服务响应结构
@@ -543,6 +581,7 @@ fn create_router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/chat", post(handle_chat))
+        .route("/chat/multipart", post(handle_multipart_chat))
         .route("/sessions/{session_id}", get(get_session).delete(delete_session))
         .route("/users/{user_id}/sessions", get(get_user_sessions))
         .route("/progress/{session_id}", get(progress_stream))

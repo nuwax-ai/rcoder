@@ -10,9 +10,10 @@ license.workspace = true
 shared_types = { path = "../shared_types" }
 nuwax_parser = { path = "../nuwax_parser" }
 ai-agents = { path = "../ai-agents" }
+acp-adapter = { path = "../acp_adapter" }
 
 # HTTP server
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 futures = { workspace = true }

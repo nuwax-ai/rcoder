@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多媒体聊天测试 - Rcoder AI</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 24px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 28px;
+        }
+        .header p {
+            margin: 8px 0 0 0;
+            opacity: 0.9;
+        }
+        .form-section {
+            padding: 24px;
+            border-bottom: 1px solid #eee;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #333;
+        }
+        .form-group input, 
+        .form-group textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e5e9;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        .form-group input:focus, 
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .form-group textarea {
+            resize: vertical;
+            min-height: 120px;
+        }
+        .file-upload {
+            border: 2px dashed #ddd;
+            border-radius: 8px;
+            padding: 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .file-upload:hover {
+            border-color: #667eea;
+            background-color: #f8f9ff;
+        }
+        .file-upload.drag-over {
+            border-color: #667eea;
+            background-color: #f0f4ff;
+        }
+        .file-list {
+            margin-top: 16px;
+        }
+        .file-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            margin-bottom: 8px;
+        }
+        .file-info {
+            display: flex;
+            align-items: center;
+            flex: 1;
+        }
+        .file-icon {
+            width: 20px;
+            height: 20px;
+            margin-right: 8px;
+        }
+        .code-snippet-section {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 16px;
+        }
+        .code-snippet-item {
+            background: white;
+            border: 1px solid #e1e5e9;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 12px;
+        }
+        .code-snippet-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .code-snippet-lang {
+            padding: 4px 8px;
+            background: #667eea;
+            color: white;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 14px 28px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            width: 100%;
+        }
+        .button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+        .button:disabled {
+            background: #ddd;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        .button-secondary {
+            background: #6c757d;
+            margin-right: 12px;
+            width: auto;
+        }
+        .response-section {
+            padding: 24px;
+            background: #f8f9fa;
+        }
+        .response-content {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid #e1e5e9;
+            white-space: pre-wrap;
+            font-family: -apple-system, BlinkMacSystemFont, monospace;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .status {
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+            font-weight: 600;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.loading {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .hidden {
+            display: none;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 多媒体聊天测试</h1>
+            <p>支持文件上传、代码片段和引用的智能对话</p>
+        </div>
+
+        <form id="multipartChatForm" enctype="multipart/form-data">
+            <div class="form-section">
+                <div class="grid">
+                    <div class="form-group">
+                        <label for="userId">用户ID *</label>
+                        <input type="text" id="userId" name="user_id" value="developer123" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="projectId">项目ID（可选）</label>
+                        <input type="text" id="projectId" name="project_id" placeholder="留空自动生成">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="sessionId">会话ID（可选）</label>
+                    <input type="text" id="sessionId" name="session_id" placeholder="留空创建新会话">
+                </div>
+
+                <div class="form-group">
+                    <label for="prompt">任务描述 *</label>
+                    <textarea id="prompt" name="prompt" required placeholder="请描述你需要AI帮助完成的任务...&#10;&#10;例如：&#10;- 帮我分析这个代码文件&#10;- 根据上传的图片创建一个网页&#10;- 解释这段代码的功能"></textarea>
+                </div>
+            </div>
+
+            <div class="form-section">
+                <h3>📎 文件上传</h3>
+                <div class="file-upload" id="fileUpload">
+                    <div>
+                        <div style="font-size: 48px; margin-bottom: 16px;">📁</div>
+                        <p><strong>点击选择文件</strong> 或 <strong>拖拽文件到这里</strong></p>
+                        <p style="color: #666; font-size: 14px;">支持图片、文档、代码文件等</p>
+                    </div>
+                    <input type="file" id="fileInput" name="files" multiple style="display: none;">
+                </div>
+                <div class="file-list" id="fileList"></div>
+            </div>
+
+            <div class="form-section">
+                <h3>📝 代码片段</h3>
+                <div class="code-snippet-section">
+                    <div id="codeSnippets">
+                        <!-- 代码片段将动态添加到这里 -->
+                    </div>
+                    <button type="button" class="button-secondary" onclick="addCodeSnippet()">+ 添加代码片段</button>
+                </div>
+            </div>
+
+            <div class="form-section">
+                <h3>🔗 代码引用</h3>
+                <div class="form-group">
+                    <label for="codeReferences">代码引用（JSON格式）</label>
+                    <textarea id="codeReferences" name="code_references" rows="3" placeholder='["file:///path/to/file.rs#L10:20", "rcoder:///thread/session123?name=相关会话"]'></textarea>
+                    <small style="color: #666;">输入ResourceUri格式的引用列表</small>
+                </div>
+            </div>
+
+            <div class="form-section">
+                <button type="submit" class="button" id="submitBtn">
+                    🚀 发送多媒体聊天请求
+                </button>
+            </div>
+        </form>
+
+        <div class="response-section hidden" id="responseSection">
+            <h3>📋 响应结果</h3>
+            <div id="status"></div>
+            <div class="response-content" id="responseContent"></div>
+        </div>
+    </div>
+
+    <script>
+        let codeSnippetCount = 0;
+        let selectedFiles = [];
+
+        // 文件上传处理
+        const fileUpload = document.getElementById('fileUpload');
+        const fileInput = document.getElementById('fileInput');
+        const fileList = document.getElementById('fileList');
+
+        fileUpload.addEventListener('click', () => fileInput.click());
+        fileUpload.addEventListener('dragover', handleDragOver);
+        fileUpload.addEventListener('drop', handleDrop);
+        fileUpload.addEventListener('dragleave', handleDragLeave);
+        fileInput.addEventListener('change', handleFileSelect);
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            fileUpload.classList.add('drag-over');
+        }
+
+        function handleDragLeave(e) {
+            e.preventDefault();
+            fileUpload.classList.remove('drag-over');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            fileUpload.classList.remove('drag-over');
+            const files = Array.from(e.dataTransfer.files);
+            addFiles(files);
+        }
+
+        function handleFileSelect(e) {
+            const files = Array.from(e.target.files);
+            addFiles(files);
+        }
+
+        function addFiles(files) {
+            files.forEach(file => {
+                if (!selectedFiles.some(f => f.name === file.name && f.size === file.size)) {
+                    selectedFiles.push(file);
+                    addFileToList(file);
+                }
+            });
+        }
+
+        function addFileToList(file) {
+            const fileItem = document.createElement('div');
+            fileItem.className = 'file-item';
+            
+            const fileIcon = getFileIcon(file.type);
+            const fileSize = formatFileSize(file.size);
+            
+            fileItem.innerHTML = `
+                <div class="file-info">
+                    <span class="file-icon">${fileIcon}</span>
+                    <span>${file.name} (${fileSize})</span>
+                </div>
+                <button type="button" onclick="removeFile('${file.name}', ${file.size})" style="background: none; border: none; color: #dc3545; cursor: pointer;">✕</button>
+            `;
+            
+            fileList.appendChild(fileItem);
+        }
+
+        function removeFile(fileName, fileSize) {
+            selectedFiles = selectedFiles.filter(f => !(f.name === fileName && f.size === fileSize));
+            updateFileList();
+        }
+
+        function updateFileList() {
+            fileList.innerHTML = '';
+            selectedFiles.forEach(file => addFileToList(file));
+        }
+
+        function getFileIcon(mimeType) {
+            if (mimeType.startsWith('image/')) return '🖼️';
+            if (mimeType.startsWith('video/')) return '🎥';
+            if (mimeType.startsWith('audio/')) return '🎵';
+            if (mimeType.includes('pdf')) return '📄';
+            if (mimeType.includes('word')) return '📝';
+            if (mimeType.includes('excel')) return '📊';
+            if (mimeType.includes('text/') || mimeType.includes('javascript') || mimeType.includes('json')) return '📋';
+            return '📁';
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // 代码片段处理
+        function addCodeSnippet() {
+            codeSnippetCount++;
+            const codeSnippets = document.getElementById('codeSnippets');
+            
+            const snippetDiv = document.createElement('div');
+            snippetDiv.className = 'code-snippet-item';
+            snippetDiv.innerHTML = `
+                <div class="code-snippet-header">
+                    <input type="text" placeholder="描述或标题" class="snippet-description" style="flex: 1; margin-right: 8px;">
+                    <input type="text" placeholder="语言" class="snippet-language" style="width: 100px; margin-right: 8px;">
+                    <button type="button" onclick="removeCodeSnippet(this)" style="background: #dc3545; color: white; border: none; padding: 4px 8px; border-radius: 4px;">删除</button>
+                </div>
+                <textarea placeholder="粘贴代码内容..." class="snippet-content" rows="6" style="width: 100%; font-family: monospace;"></textarea>
+                <div style="margin-top: 8px;">
+                    <input type="text" placeholder="文件路径（可选）" class="snippet-file-path" style="width: 48%; margin-right: 4%;">
+                    <input type="text" placeholder="行号范围 例如: 10-20" class="snippet-line-range" style="width: 48%;">
+                </div>
+            `;
+            
+            codeSnippets.appendChild(snippetDiv);
+        }
+
+        function removeCodeSnippet(button) {
+            button.closest('.code-snippet-item').remove();
+        }
+
+        function collectCodeSnippets() {
+            const snippets = [];
+            const snippetItems = document.querySelectorAll('.code-snippet-item');
+            
+            snippetItems.forEach(item => {
+                const description = item.querySelector('.snippet-description').value;
+                const language = item.querySelector('.snippet-language').value;
+                const content = item.querySelector('.snippet-content').value;
+                const filePath = item.querySelector('.snippet-file-path').value;
+                const lineRange = item.querySelector('.snippet-line-range').value;
+                
+                if (content.trim()) {
+                    const snippet = {
+                        content: content,
+                        language: language || null,
+                        description: description || null,
+                        file_path: filePath || null,
+                        line_range: null
+                    };
+                    
+                    if (lineRange) {
+                        const match = lineRange.match(/(\d+)-(\d+)/);
+                        if (match) {
+                            snippet.line_range = [parseInt(match[1]), parseInt(match[2])];
+                        }
+                    }
+                    
+                    snippets.push(snippet);
+                }
+            });
+            
+            return snippets;
+        }
+
+        // 表单提交处理
+        document.getElementById('multipartChatForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const submitBtn = document.getElementById('submitBtn');
+            const responseSection = document.getElementById('responseSection');
+            const status = document.getElementById('status');
+            const responseContent = document.getElementById('responseContent');
+            
+            submitBtn.disabled = true;
+            submitBtn.textContent = '发送中...';
+            
+            try {
+                // 准备FormData
+                const formData = new FormData();
+                formData.append('prompt', document.getElementById('prompt').value);
+                formData.append('user_id', document.getElementById('userId').value);
+                
+                const projectId = document.getElementById('projectId').value;
+                if (projectId) {
+                    formData.append('project_id', projectId);
+                }
+                
+                const sessionId = document.getElementById('sessionId').value;
+                if (sessionId) {
+                    formData.append('session_id', sessionId);
+                }
+                
+                // 添加文件
+                selectedFiles.forEach((file, index) => {
+                    formData.append(`files_${index}`, file);
+                });
+                
+                // 添加代码片段
+                const codeSnippets = collectCodeSnippets();
+                if (codeSnippets.length > 0) {
+                    formData.append('code_snippets', JSON.stringify(codeSnippets));
+                }
+                
+                // 添加代码引用
+                const codeReferences = document.getElementById('codeReferences').value;
+                if (codeReferences.trim()) {
+                    try {
+                        const references = JSON.parse(codeReferences);
+                        formData.append('code_references', JSON.stringify(references));
+                    } catch (e) {
+                        throw new Error('代码引用格式错误，请检查JSON格式');
+                    }
+                }
+                
+                // 显示加载状态
+                responseSection.classList.remove('hidden');
+                status.className = 'status loading';
+                status.textContent = '🔄 正在处理多媒体聊天请求...';
+                responseContent.textContent = '';
+                
+                // 发送请求
+                const response = await fetch('http://localhost:3001/chat/multipart', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    status.className = 'status success';
+                    status.textContent = '✅ 多媒体聊天请求成功！';
+                    responseContent.textContent = `会话ID: ${result.data.session_id}\n\nAI响应:\n${result.data.response}`;
+                } else {
+                    throw new Error(result.message || '请求失败');
+                }
+                
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = '❌ 请求失败';
+                responseContent.textContent = `错误信息: ${error.message}`;
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = '🚀 发送多媒体聊天请求';
+            }
+        });
+
+        // 页面加载时添加一个示例代码片段
+        window.addEventListener('load', function() {
+            addCodeSnippet();
+            // 填充示例代码
+            const firstSnippet = document.querySelector('.code-snippet-item');
+            if (firstSnippet) {
+                firstSnippet.querySelector('.snippet-description').value = '示例React组件';
+                firstSnippet.querySelector('.snippet-language').value = 'javascript';
+                firstSnippet.querySelector('.snippet-content').value = `function Welcome({ name }) {
+  return <h1>Hello, {name}!</h1>;
+}
+
+export default Welcome;`;
+                firstSnippet.querySelector('.snippet-file-path').value = 'src/Welcome.js';
+                firstSnippet.querySelector('.snippet-line-range').value = '1-5';
+            }
+        });
+    </script>
+</body>
+</html>
