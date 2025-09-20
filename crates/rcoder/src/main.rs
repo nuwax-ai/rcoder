@@ -20,8 +20,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use futures::stream::Stream;
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
-use acp_adapter::plan::{PlanManager, PlanUpdateEvent, PlanUpdateType};
-use acp_adapter::types::{Plan, PlanEntry, PlanEntryStatus, PlanStats, StreamUpdate, SessionModeId};
+use acp_adapter::types::{StreamUpdate, SessionModeId};
+use acp_adapter::{SessionManager, SessionHandle, AcpConfig};
+use agent_client_protocol::SessionId as AcpSessionId;
 
 mod http_result;
 use http_result::HttpResult;
@@ -31,9 +32,6 @@ use multipart_chat::{handle_multipart_chat, CodeSnippet};
 
 mod acp_multipart_chat;
 use acp_multipart_chat::handle_acp_multipart_chat;
-
-mod plan_api;
-use plan_api::plan_routes;
 
 // ==================== 数据结构定义 ====================
 
@@ -250,7 +248,6 @@ impl Default for AppConfig {
 }
 
 /// 应用状态
-#[derive(Debug)]
 struct AppState {
     /// 活跃的会话映射
     sessions: DashMap<String, SessionInfo>,
@@ -258,8 +255,8 @@ struct AppState {
     config: AppConfig,
     /// 进度事件广播通道（session_id -> 发送者列表）
     progress_senders: DashMap<String, Vec<mpsc::UnboundedSender<ProgressEvent>>>,
-    /// Plan管理器
-    plan_manager: Arc<PlanManager>,
+    /// ACP会话管理器
+    session_manager: Arc<SessionManager>,
 }
 
 type SharedState = Arc<AppState>;
@@ -274,84 +271,6 @@ fn get_trace_id() -> Option<String> {
     // 移除连字符，转换为纯十六进制格式
     let trace_id = uuid.to_string().replace("-", "");
     Some(trace_id)
-}
-
-/// 将Plan更新事件转换为ProgressEvent
-fn plan_update_to_progress_event(plan_update: PlanUpdateEvent) -> ProgressEvent {
-    let (event_type, message, data) = match &plan_update.update_type {
-        PlanUpdateType::FullUpdate => {
-            let entry_count = plan_update.plan.as_ref().map(|p| p.entries.len()).unwrap_or(0);
-            (
-                ProgressEventType::PlanUpdate,
-                format!("Plan已更新，包含{}个任务条目", entry_count),
-                serde_json::json!({
-                    "type": ProgressEventSubType::FullUpdate.to_string(),
-                    "plan": plan_update.plan,
-                    "stats": plan_update.stats
-                })
-            )
-        }
-        PlanUpdateType::EntryStatusUpdate { entry_id, status } => {
-            let status_text = match status {
-                PlanEntryStatus::Pending => "待处理",
-                PlanEntryStatus::InProgress => "进行中",
-                PlanEntryStatus::Completed => "已完成",
-                PlanEntryStatus::Cancelled => "已取消",
-                PlanEntryStatus::Failed => "已失败",
-            };
-            (
-                ProgressEventType::PlanEntryUpdate,
-                format!("任务条目 {} 状态更新为: {}", entry_id, status_text),
-                serde_json::json!({
-                    "type": ProgressEventSubType::EntryStatusUpdate.to_string(),
-                    "entry_id": entry_id,
-                    "status": status,
-                    "stats": plan_update.stats
-                })
-            )
-        }
-        PlanUpdateType::EntryAdded { entry_id } => {
-            (
-                ProgressEventType::PlanEntryUpdate,
-                format!("新任务条目已添加: {}", entry_id),
-                serde_json::json!({
-                    "type": ProgressEventSubType::EntryAdded.to_string(),
-                    "entry_id": entry_id,
-                    "stats": plan_update.stats
-                })
-            )
-        }
-        PlanUpdateType::EntryRemoved { entry_id } => {
-            (
-                ProgressEventType::PlanEntryUpdate,
-                format!("任务条目已移除: {}", entry_id),
-                serde_json::json!({
-                    "type": ProgressEventSubType::EntryRemoved.to_string(),
-                    "entry_id": entry_id,
-                    "stats": plan_update.stats
-                })
-            )
-        }
-        PlanUpdateType::StatsUpdate => {
-            (
-                ProgressEventType::PlanStatsUpdate,
-                "Plan统计信息已更新".to_string(),
-                serde_json::json!({
-                    "type": ProgressEventSubType::StatsUpdate.to_string(),
-                    "stats": plan_update.stats
-                })
-            )
-        }
-    };
-    
-    ProgressEvent {
-        event_type,
-        message,
-        timestamp: chrono::DateTime::from_timestamp_millis(plan_update.timestamp as i64)
-            .unwrap_or_else(|| chrono::Utc::now()),
-        session_id: plan_update.session_id,
-        data: Some(data),
-    }
 }
 
 /// 将StreamUpdate转换为ProgressEvent
@@ -663,7 +582,7 @@ async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
-/// SSE 进度推送端点 - 统一处理所有agent数据（包括Plan更新）
+/// SSE 进度推送端点 - 统一处理所有agent数据（通过ACP StreamUpdate）
 async fn progress_stream(
     State(state): State<SharedState>,
     Path(session_id): Path<String>,
@@ -678,24 +597,23 @@ async fn progress_stream(
     
     info!("新的 SSE 连接已建立为 session: {}", session_id);
     
-    // 订阅Plan更新事件
-    let plan_update_rx = state.plan_manager.subscribe_updates().await;
-    let tx_clone = tx.clone();
-    let session_id_clone = session_id.clone();
-    
-    // 在后台任务中处理Plan更新事件
-    tokio::spawn(async move {
-        let mut plan_update_rx = plan_update_rx;
-        while let Some(plan_update) = plan_update_rx.recv().await {
-            // 只处理当前session的Plan更新
-            if plan_update.session_id == session_id_clone {
-                let progress_event = plan_update_to_progress_event(plan_update);
-                if let Err(_) = tx_clone.send(progress_event) {
+    // 订阅ACP StreamUpdate事件 - 包括Plan更新
+    let acp_session_id = AcpSessionId(session_id.clone().into());
+    if let Some(session_handle) = state.session_manager.get_session(&acp_session_id) {
+        let mut stream_update_rx = session_handle.subscribe_to_updates().await;
+        let tx_acp = tx.clone();
+        tokio::spawn(async move {
+            while let Some(stream_update) = stream_update_rx.recv().await {
+                let progress_event = stream_update_to_progress_event(stream_update);
+                if let Err(_) = tx_acp.send(progress_event) {
                     break; // 连接已断开
                 }
             }
-        }
-    });
+        });
+        info!("✅ 已订阅ACP StreamUpdate事件为session: {}", session_id);
+    } else {
+        warn!("⚠️  未为session {} 找到ACP会话，无法订阅StreamUpdate事件", session_id);
+    }
     
     // 发送初始连接事件
     let connect_event = ProgressEvent {
@@ -884,7 +802,6 @@ fn create_router(state: SharedState) -> Router {
         .route("/sessions/{session_id}", get(get_session).delete(delete_session))
         .route("/users/{user_id}/sessions", get(get_user_sessions))
         .route("/progress/{session_id}", get(progress_stream))
-        .merge(plan_routes()) // 添加Plan路由（只保留查询端点）
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -904,12 +821,12 @@ async fn main() -> anyhow::Result<()> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     // 初始化应用状态
-    let (plan_manager, _plan_event_rx) = PlanManager::new();
+    let session_manager = Arc::new(SessionManager::new());
     let state = Arc::new(AppState {
         sessions: DashMap::new(),
         config: config.clone(),
         progress_senders: DashMap::new(),
-        plan_manager: Arc::new(plan_manager),
+        session_manager,
     });
 
     // 创建路由
@@ -928,12 +845,9 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET  /sessions/:session_id - Get session info");
     info!("  GET  /users/:user_id/sessions - Get user's sessions");
     info!("  DELETE /sessions/:session_id - Delete session");
-    info!("  GET  /progress/:session_id - SSE progress stream for AI tasks and Plan updates (unified stream)");
+    info!("  GET  /progress/:session_id - SSE progress stream for AI tasks (unified stream)");
     info!("  GET  /health - Health check");
-    info!("  === Plan API Endpoints ===");
-    info!("  GET  /api/plans/{{session_id}} - Get plan for session (frontend query)");
-    info!("  GET  /api/plans/stats - Get stats for all active plans (frontend monitoring)");
-    info!("  NOTE: Plan real-time updates are now unified in /progress/{{session_id}} SSE stream");
+    info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
     
     // 启动服务器
     axum::serve(listener, app)
