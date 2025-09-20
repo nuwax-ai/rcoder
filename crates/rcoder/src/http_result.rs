@@ -33,6 +33,10 @@ impl<T> HttpResult<T> {
             success: false,
         }
     }
+
+    pub fn internal_error(message: &str, tid: Option<String>) -> Self {
+        Self::error("5000", message, tid)
+    }
 }
 
 impl<T: Serialize> Serialize for HttpResult<T> {

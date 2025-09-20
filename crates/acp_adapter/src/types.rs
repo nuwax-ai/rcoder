@@ -228,6 +228,7 @@ pub enum StreamUpdate {
         tool_name: String,
     },
     /// 计划更新
+    /// Plan更新事件
     Plan {
         session_id: SessionId,
         plan: serde_json::Value,
@@ -482,4 +483,348 @@ pub enum PermissionOutcome {
     Selected { option_id: PermissionOptionId },
     Cancelled,
     Expired,
+}
+
+// ==================== Plan 相关结构 ====================
+
+/// Plan - 任务计划
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plan {
+    /// Plan条目列表
+    pub entries: Vec<PlanEntry>,
+    /// Plan创建时间
+    pub created_at: std::time::SystemTime,
+    /// 最后更新时间
+    pub updated_at: std::time::SystemTime,
+    /// Plan标题
+    pub title: Option<String>,
+    /// Plan描述
+    pub description: Option<String>,
+    /// Plan类型/分类
+    pub category: Option<String>,
+    /// 总估计耗时（秒）
+    pub total_estimated_duration: Option<u64>,
+    /// 总实际耗时（秒）
+    pub total_actual_duration: Option<u64>,
+    /// Plan状态
+    pub status: PlanStatus,
+    /// 元数据
+    pub meta: Option<serde_json::Value>,
+}
+
+/// Plan条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanEntry {
+    /// 条目ID
+    pub id: String,
+    /// 任务内容（支持Markdown）
+    pub content: String,
+    /// 优先级
+    pub priority: PlanEntryPriority,
+    /// 状态
+    pub status: PlanEntryStatus,
+    /// 创建时间
+    pub created_at: std::time::SystemTime,
+    /// 更新时间
+    pub updated_at: std::time::SystemTime,
+    /// 开始时间
+    pub started_at: Option<std::time::SystemTime>,
+    /// 完成时间
+    pub completed_at: Option<std::time::SystemTime>,
+    /// 预计耗时（秒）
+    pub estimated_duration: Option<u64>,
+    /// 实际耗时（秒）
+    pub actual_duration: Option<u64>,
+    /// 标签
+    pub tags: Vec<String>,
+    /// 描述
+    pub description: Option<String>,
+    /// 依赖的条目ID列表
+    pub dependencies: Vec<String>,
+    /// 进度百分比（0-100）
+    pub progress: Option<u8>,
+    /// 元数据
+    pub meta: Option<serde_json::Value>,
+}
+
+/// Plan条目优先级
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PlanEntryPriority {
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+/// Plan条目状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PlanEntryStatus {
+    /// 待执行
+    Pending,
+    /// 执行中
+    InProgress,
+    /// 已完成
+    Completed,
+    /// 已取消
+    Cancelled,
+    /// 失败
+    Failed,
+}
+
+/// Plan状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PlanStatus {
+    /// 未开始
+    NotStarted,
+    /// 进行中
+    InProgress,
+    /// 已完成
+    Completed,
+    /// 已暂停
+    Paused,
+    /// 已取消
+    Cancelled,
+    /// 部分失败
+    PartiallyFailed,
+}
+
+/// Plan统计信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStats {
+    /// 待执行数量
+    pub pending: u32,
+    /// 执行中数量
+    pub in_progress: u32,
+    /// 已完成数量
+    pub completed: u32,
+    /// 已取消数量
+    pub cancelled: u32,
+    /// 失败数量
+    pub failed: u32,
+    /// 总数量
+    pub total: u32,
+    /// 当前执行中的条目ID
+    pub current_in_progress_entry: Option<String>,
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            created_at: std::time::SystemTime::now(),
+            updated_at: std::time::SystemTime::now(),
+            title: None,
+            description: None,
+            category: None,
+            total_estimated_duration: None,
+            total_actual_duration: None,
+            status: PlanStatus::NotStarted,
+            meta: None,
+        }
+    }
+}
+
+impl Plan {
+    /// 创建新的Plan
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// 是否为空
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    
+    /// 获取统计信息
+    pub fn stats(&self) -> PlanStats {
+        let mut stats = PlanStats {
+            pending: 0,
+            in_progress: 0,
+            completed: 0,
+            cancelled: 0,
+            failed: 0,
+            total: self.entries.len() as u32,
+            current_in_progress_entry: None,
+        };
+        
+        for entry in &self.entries {
+            match entry.status {
+                PlanEntryStatus::Pending => stats.pending += 1,
+                PlanEntryStatus::InProgress => {
+                    stats.in_progress += 1;
+                    if stats.current_in_progress_entry.is_none() {
+                        stats.current_in_progress_entry = Some(entry.id.clone());
+                    }
+                }
+                PlanEntryStatus::Completed => stats.completed += 1,
+                PlanEntryStatus::Cancelled => stats.cancelled += 1,
+                PlanEntryStatus::Failed => stats.failed += 1,
+            }
+        }
+        
+        stats
+    }
+    
+    /// 添加新条目
+    pub fn add_entry(&mut self, content: String, priority: PlanEntryPriority) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now();
+        
+        let entry = PlanEntry {
+            id: id.clone(),
+            content,
+            priority,
+            status: PlanEntryStatus::Pending,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+            estimated_duration: None,
+            actual_duration: None,
+            tags: Vec::new(),
+            description: None,
+            dependencies: Vec::new(),
+            progress: Some(0),
+            meta: None,
+        };
+        
+        self.entries.push(entry);
+        self.updated_at = now;
+        
+        id
+    }
+    
+    /// 更新条目状态
+    pub fn update_entry_status(&mut self, entry_id: &str, status: PlanEntryStatus) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == entry_id) {
+            entry.status = status;
+            entry.updated_at = std::time::SystemTime::now();
+            self.updated_at = entry.updated_at;
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// 获取条目
+    pub fn get_entry(&self, entry_id: &str) -> Option<&PlanEntry> {
+        self.entries.iter().find(|e| e.id == entry_id)
+    }
+    
+    /// 移除已完成的条目
+    pub fn clear_completed(&mut self) {
+        self.entries.retain(|entry| entry.status != PlanEntryStatus::Completed);
+        self.updated_at = std::time::SystemTime::now();
+    }
+}
+
+impl PlanEntry {
+    /// 创建新条目
+    pub fn new(content: String, priority: PlanEntryPriority) -> Self {
+        let now = std::time::SystemTime::now();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            content,
+            priority,
+            status: PlanEntryStatus::Pending,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+            estimated_duration: None,
+            actual_duration: None,
+            tags: Vec::new(),
+            description: None,
+            dependencies: Vec::new(),
+            progress: Some(0),
+            meta: None,
+        }
+    }
+    
+    /// 标记为进行中
+    pub fn mark_in_progress(&mut self) {
+        self.status = PlanEntryStatus::InProgress;
+        self.started_at = Some(std::time::SystemTime::now());
+        self.updated_at = self.started_at.unwrap();
+        self.progress = Some(0);
+    }
+    
+    /// 标记为完成
+    pub fn mark_completed(&mut self) {
+        let now = std::time::SystemTime::now();
+        self.status = PlanEntryStatus::Completed;
+        self.completed_at = Some(now);
+        self.updated_at = now;
+        self.progress = Some(100);
+        
+        // 计算实际耗时
+        if let Some(started) = self.started_at {
+            if let Ok(duration) = now.duration_since(started) {
+                self.actual_duration = Some(duration.as_secs());
+            }
+        }
+    }
+    
+    /// 标记为失败
+    pub fn mark_failed(&mut self) {
+        let now = std::time::SystemTime::now();
+        self.status = PlanEntryStatus::Failed;
+        self.updated_at = now;
+        
+        // 计算实际耗时（即使失败了）
+        if let Some(started) = self.started_at {
+            if let Ok(duration) = now.duration_since(started) {
+                self.actual_duration = Some(duration.as_secs());
+            }
+        }
+    }
+    
+    /// 更新进度
+    pub fn update_progress(&mut self, progress: u8) {
+        self.progress = Some(progress.min(100));
+        self.updated_at = std::time::SystemTime::now();
+    }
+    
+    /// 添加标签
+    pub fn add_tag(&mut self, tag: String) {
+        if !self.tags.contains(&tag) {
+            self.tags.push(tag);
+            self.updated_at = std::time::SystemTime::now();
+        }
+    }
+    
+    /// 设置描述
+    pub fn set_description(&mut self, description: String) {
+        self.description = Some(description);
+        self.updated_at = std::time::SystemTime::now();
+    }
+    
+    /// 添加依赖
+    pub fn add_dependency(&mut self, dependency_id: String) {
+        if !self.dependencies.contains(&dependency_id) {
+            self.dependencies.push(dependency_id);
+            self.updated_at = std::time::SystemTime::now();
+        }
+    }
+    
+    /// 设置预计耗时
+    pub fn set_estimated_duration(&mut self, duration_seconds: u64) {
+        self.estimated_duration = Some(duration_seconds);
+        self.updated_at = std::time::SystemTime::now();
+    }
+    
+    /// 检查依赖是否满足
+    pub fn are_dependencies_satisfied(&self, plan: &Plan) -> bool {
+        self.dependencies.iter().all(|dep_id| {
+            plan.entries.iter()
+                .find(|entry| entry.id == *dep_id)
+                .map(|entry| entry.status == PlanEntryStatus::Completed)
+                .unwrap_or(false)
+        })
+    }
+    
+    /// 获取耗时（已完成的实际耗时或预计耗时）
+    pub fn get_duration(&self) -> Option<u64> {
+        self.actual_duration.or(self.estimated_duration)
+    }
 }

@@ -264,9 +264,11 @@ impl AcpConnection {
                 })
             }
             SessionUpdate::Plan(plan) => {
+                // 在这里我们需要将agent_client_protocol::Plan转换为我们的Plan类型
+                let internal_plan = crate::plan::PlanConverter::from_acp_plan(plan);
                 Some(StreamUpdate::Plan {
                     session_id: SessionId(uuid::Uuid::new_v4().to_string().into()),
-                    plan: serde_json::to_value(plan).unwrap_or_default(),
+                    plan: serde_json::to_value(&internal_plan).unwrap_or_default(),
                 })
             }
             SessionUpdate::AvailableCommandsUpdate { available_commands } => {

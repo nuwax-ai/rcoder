@@ -12,6 +12,9 @@ nuwax_parser = { path = "../nuwax_parser" }
 ai-agents = { path = "../ai-agents" }
 acp-adapter = { path = "../acp_adapter" }
 
+# ACP Protocol
+agent-client-protocol = { workspace = true }
+
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }

@@ -20,12 +20,19 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use futures::stream::Stream;
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
+use acp_adapter::plan::PlanManager;
 
 mod http_result;
 use http_result::HttpResult;
 
 mod multipart_chat;
 use multipart_chat::{handle_multipart_chat, CodeSnippet};
+
+mod acp_multipart_chat;
+use acp_multipart_chat::handle_acp_multipart_chat;
+
+mod plan_api;
+use plan_api::plan_routes;
 
 // ==================== 数据结构定义 ====================
 
@@ -192,6 +199,8 @@ struct AppState {
     config: AppConfig,
     /// 进度事件广播通道（session_id -> 发送者列表）
     progress_senders: DashMap<String, Vec<mpsc::UnboundedSender<ProgressEvent>>>,
+    /// Plan管理器
+    plan_manager: Arc<PlanManager>,
 }
 
 type SharedState = Arc<AppState>;
@@ -582,9 +591,11 @@ fn create_router(state: SharedState) -> Router {
         .route("/health", get(health_check))
         .route("/chat", post(handle_chat))
         .route("/chat/multipart", post(handle_multipart_chat))
+        .route("/chat/acp-multipart", post(handle_acp_multipart_chat))
         .route("/sessions/{session_id}", get(get_session).delete(delete_session))
         .route("/users/{user_id}/sessions", get(get_user_sessions))
         .route("/progress/{session_id}", get(progress_stream))
+        .merge(plan_routes()) // 添加Plan路由
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -604,10 +615,12 @@ async fn main() -> anyhow::Result<()> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     // 初始化应用状态
+    let (plan_manager, _plan_event_rx) = PlanManager::new();
     let state = Arc::new(AppState {
         sessions: DashMap::new(),
         config: config.clone(),
         progress_senders: DashMap::new(),
+        plan_manager: Arc::new(plan_manager),
     });
 
     // 创建路由
@@ -621,11 +634,20 @@ async fn main() -> anyhow::Result<()> {
     info!("Server starting on port {}", config.port);
     info!("API endpoints:");
     info!("  POST /chat - Send chat message to AI agent");
+    info!("  POST /chat/multipart - Send multipart chat with files (legacy)");
+    info!("  POST /chat/acp-multipart - Send multipart chat with ACP native content blocks");
     info!("  GET  /sessions/:session_id - Get session info");
     info!("  GET  /users/:user_id/sessions - Get user's sessions");
     info!("  DELETE /sessions/:session_id - Delete session");
     info!("  GET  /progress/:session_id - SSE progress stream for AI tasks");
     info!("  GET  /health - Health check");
+    info!("  === Plan API Endpoints ===");
+    info!("  GET  /api/plans/:session_id - Get plan for session");
+    info!("  PUT  /api/plans/:session_id/status - Update plan entry status");
+    info!("  POST /api/plans/:session_id/cleanup - Cleanup completed entries");
+    info!("  POST /api/plans/:session_id/demo - Create demo plan (for testing)");
+    info!("  GET  /api/plans/:session_id/updates - SSE stream for plan updates");
+    info!("  GET  /api/plans/stats - Get stats for all active plans");
     
     // 启动服务器
     axum::serve(listener, app)

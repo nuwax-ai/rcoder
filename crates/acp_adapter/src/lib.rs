@@ -13,12 +13,14 @@ pub mod permission;
 pub mod handle;
 pub mod capability;
 pub mod mention;
+pub mod plan;
 
 // 重新导出主要的公共类型
 pub use config::AcpConfig;
 pub use connection::{AcpConnection, ConnectionManager};
 pub use session::{Session, SessionHandle, SessionManager, SessionStatistics};
-pub use types::{SessionState, ConnectionState};
+pub use types::{SessionState, ConnectionState, Plan, PlanEntry, PlanEntryStatus, PlanEntryPriority, PlanStats};
+pub use plan::{PlanManager, PlanEvent, PlanUpdateEvent, PlanUpdateType, PlanConverter};
 pub use mcp::{McpManager, McpAdapter, McpTool, McpResource};
 pub use config::McpServerConfig;
 pub use process::{ProcessManager, ProcessHandle};

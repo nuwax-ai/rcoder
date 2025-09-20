@@ -1,5 +1,8 @@
 use crate::{SharedState, ProgressEvent, ProgressEventType, broadcast_progress_event, get_trace_id, create_new_session, update_session_activity, execute_ai_command, ChatResponse, HttpResult};
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
+use acp_adapter::permission::{PermissionManager, PermissionEvent};
+use acp_adapter::capability::{AgentConnection, PermissionCapability};
+use agent_client_protocol::{PromptRequest, ContentBlock, TextContent, EmbeddedResourceResource, TextResourceContents};
 use axum::{
     extract::{State, Multipart},
     response::Json,
@@ -8,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::{info, warn, error, debug};
 use uuid::Uuid;
+use std::sync::Arc;
 
 /// 多媒体聊天请求结构 - 用于处理文件上传
 #[derive(Debug)]

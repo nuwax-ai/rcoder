@@ -1622,6 +1622,7 @@ name = "rcoder"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
+ "agent-client-protocol",
  "ai-agents",
  "anyhow",
  "axum 0.8.4",
