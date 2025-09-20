@@ -21,7 +21,7 @@ use uuid::Uuid;
 use futures::stream::Stream;
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
 use acp_adapter::plan::{PlanManager, PlanUpdateEvent, PlanUpdateType};
-use acp_adapter::types::{Plan, PlanEntry, PlanEntryStatus, PlanStats};
+use acp_adapter::types::{Plan, PlanEntry, PlanEntryStatus, PlanStats, StreamUpdate, SessionModeId};
 
 mod http_result;
 use http_result::HttpResult;
@@ -139,6 +139,49 @@ pub struct ProgressEvent {
     pub data: Option<serde_json::Value>,
 }
 
+/// 进度事件子类型
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressEventSubType {
+    UserMessageChunk,
+    AgentMessageChunk,
+    AgentThoughtChunk,
+    ToolCall,
+    ToolCallUpdate,
+    PlanUpdate,
+    AvailableCommandsUpdate,
+    CurrentModeUpdate,
+    PromptCompleted,
+    Error,
+    FullUpdate,
+    EntryStatusUpdate,
+    EntryAdded,
+    EntryRemoved,
+    StatsUpdate,
+}
+
+impl std::fmt::Display for ProgressEventSubType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProgressEventSubType::UserMessageChunk => write!(f, "user_message_chunk"),
+            ProgressEventSubType::AgentMessageChunk => write!(f, "agent_message_chunk"),
+            ProgressEventSubType::AgentThoughtChunk => write!(f, "agent_thought_chunk"),
+            ProgressEventSubType::ToolCall => write!(f, "tool_call"),
+            ProgressEventSubType::ToolCallUpdate => write!(f, "tool_call_update"),
+            ProgressEventSubType::PlanUpdate => write!(f, "plan_update"),
+            ProgressEventSubType::AvailableCommandsUpdate => write!(f, "available_commands_update"),
+            ProgressEventSubType::CurrentModeUpdate => write!(f, "current_mode_update"),
+            ProgressEventSubType::PromptCompleted => write!(f, "prompt_completed"),
+            ProgressEventSubType::Error => write!(f, "error"),
+            ProgressEventSubType::FullUpdate => write!(f, "full_update"),
+            ProgressEventSubType::EntryStatusUpdate => write!(f, "entry_status_update"),
+            ProgressEventSubType::EntryAdded => write!(f, "entry_added"),
+            ProgressEventSubType::EntryRemoved => write!(f, "entry_removed"),
+            ProgressEventSubType::StatsUpdate => write!(f, "stats_update"),
+        }
+    }
+}
+
 /// 进度事件类型
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +204,10 @@ pub enum ProgressEventType {
     PlanEntryUpdate,
     /// Plan统计信息更新
     PlanStatsUpdate,
+    /// 可用命令更新
+    AvailableCommandsUpdate,
+    /// 当前模式更新
+    CurrentModeUpdate,
 }
 
 impl std::fmt::Display for ProgressEventType {
@@ -175,6 +222,8 @@ impl std::fmt::Display for ProgressEventType {
             ProgressEventType::PlanUpdate => write!(f, "plan_update"),
             ProgressEventType::PlanEntryUpdate => write!(f, "plan_entry_update"),
             ProgressEventType::PlanStatsUpdate => write!(f, "plan_stats_update"),
+            ProgressEventType::AvailableCommandsUpdate => write!(f, "available_commands_update"),
+            ProgressEventType::CurrentModeUpdate => write!(f, "current_mode_update"),
         }
     }
 }
@@ -236,7 +285,7 @@ fn plan_update_to_progress_event(plan_update: PlanUpdateEvent) -> ProgressEvent 
                 ProgressEventType::PlanUpdate,
                 format!("Plan已更新，包含{}个任务条目", entry_count),
                 serde_json::json!({
-                    "type": "full_update",
+                    "type": ProgressEventSubType::FullUpdate.to_string(),
                     "plan": plan_update.plan,
                     "stats": plan_update.stats
                 })
@@ -254,7 +303,7 @@ fn plan_update_to_progress_event(plan_update: PlanUpdateEvent) -> ProgressEvent 
                 ProgressEventType::PlanEntryUpdate,
                 format!("任务条目 {} 状态更新为: {}", entry_id, status_text),
                 serde_json::json!({
-                    "type": "entry_status_update",
+                    "type": ProgressEventSubType::EntryStatusUpdate.to_string(),
                     "entry_id": entry_id,
                     "status": status,
                     "stats": plan_update.stats
@@ -266,7 +315,7 @@ fn plan_update_to_progress_event(plan_update: PlanUpdateEvent) -> ProgressEvent 
                 ProgressEventType::PlanEntryUpdate,
                 format!("新任务条目已添加: {}", entry_id),
                 serde_json::json!({
-                    "type": "entry_added",
+                    "type": ProgressEventSubType::EntryAdded.to_string(),
                     "entry_id": entry_id,
                     "stats": plan_update.stats
                 })
@@ -277,7 +326,7 @@ fn plan_update_to_progress_event(plan_update: PlanUpdateEvent) -> ProgressEvent 
                 ProgressEventType::PlanEntryUpdate,
                 format!("任务条目已移除: {}", entry_id),
                 serde_json::json!({
-                    "type": "entry_removed",
+                    "type": ProgressEventSubType::EntryRemoved.to_string(),
                     "entry_id": entry_id,
                     "stats": plan_update.stats
                 })
@@ -288,7 +337,7 @@ fn plan_update_to_progress_event(plan_update: PlanUpdateEvent) -> ProgressEvent 
                 ProgressEventType::PlanStatsUpdate,
                 "Plan统计信息已更新".to_string(),
                 serde_json::json!({
-                    "type": "stats_update",
+                    "type": ProgressEventSubType::StatsUpdate.to_string(),
                     "stats": plan_update.stats
                 })
             )
@@ -302,6 +351,139 @@ fn plan_update_to_progress_event(plan_update: PlanUpdateEvent) -> ProgressEvent 
             .unwrap_or_else(|| chrono::Utc::now()),
         session_id: plan_update.session_id,
         data: Some(data),
+    }
+}
+
+/// 将StreamUpdate转换为ProgressEvent
+fn stream_update_to_progress_event(stream_update: StreamUpdate) -> ProgressEvent {
+    let (event_type, message, session_id, data) = match stream_update {
+        StreamUpdate::UserMessageChunk { session_id, content } => {
+            (
+                ProgressEventType::TaskStarted,
+                "用户消息已接收".to_string(),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::UserMessageChunk.to_string(),
+                    "content": content
+                }))
+            )
+        }
+        StreamUpdate::AgentMessageChunk { session_id, content } => {
+            (
+                ProgressEventType::Executing,
+                "AI正在生成回复".to_string(),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::AgentMessageChunk.to_string(),
+                    "content": content
+                }))
+            )
+        }
+        StreamUpdate::AgentThoughtChunk { session_id, content } => {
+            (
+                ProgressEventType::Executing,
+                "AI正在思考".to_string(),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::AgentThoughtChunk.to_string(),
+                    "content": content
+                }))
+            )
+        }
+        StreamUpdate::ToolCall { session_id, tool_call } => {
+            (
+                ProgressEventType::Executing,
+                format!("正在执行工具调用: {}", tool_call.title),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::ToolCall.to_string(),
+                    "tool_call": tool_call
+                }))
+            )
+        }
+        StreamUpdate::ToolCallUpdate { session_id, tool_call_update } => {
+            (
+                ProgressEventType::Executing,
+                format!("工具调用更新: {}", tool_call_update.title),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::ToolCallUpdate.to_string(),
+                    "tool_call_update": tool_call_update
+                }))
+            )
+        }
+        StreamUpdate::Plan { session_id, plan } => {
+            (
+                ProgressEventType::PlanUpdate,
+                "Plan已更新".to_string(),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::PlanUpdate.to_string(),
+                    "plan": plan
+                }))
+            )
+        }
+        StreamUpdate::AvailableCommandsUpdate { session_id, available_commands } => {
+            (
+                ProgressEventType::AvailableCommandsUpdate,
+                format!("可用命令已更新，共{}个命令", available_commands.len()),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::AvailableCommandsUpdate.to_string(),
+                    "commands": available_commands
+                }))
+            )
+        }
+        StreamUpdate::CurrentModeUpdate { session_id, current_mode_id } => {
+            (
+                ProgressEventType::CurrentModeUpdate,
+                format!("当前模式已更新为: {}", current_mode_id.0),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::CurrentModeUpdate.to_string(),
+                    "mode_id": current_mode_id.0
+                }))
+            )
+        }
+        StreamUpdate::PromptCompleted { session_id, stop_reason } => {
+            (
+                ProgressEventType::TaskCompleted,
+                format!("任务完成: {:?}", stop_reason),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::PromptCompleted.to_string(),
+                    "stop_reason": stop_reason
+                }))
+            )
+        }
+        StreamUpdate::Error { session_id, error } => {
+            (
+                ProgressEventType::TaskFailed,
+                format!("任务失败: {}", error),
+                session_id.0.to_string(),
+                Some(serde_json::json!({
+                    "type": ProgressEventSubType::Error.to_string(),
+                    "error": error
+                }))
+            )
+        }
+        _ => {
+            // 对于其他不常用的事件类型，返回通用的任务执行事件
+            (
+                ProgressEventType::Executing,
+                "任务执行中".to_string(),
+                "unknown".to_string(),
+                None
+            )
+        }
+    };
+    
+    ProgressEvent {
+        event_type,
+        message,
+        timestamp: chrono::Utc::now(),
+        session_id,
+        data,
     }
 }
 
