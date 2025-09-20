@@ -10,6 +10,9 @@ pub mod mcp;
 pub mod process;
 pub mod types;
 pub mod permission;
+pub mod handle;
+pub mod capability;
+pub mod mention;
 
 // 重新导出主要的公共类型
 pub use config::AcpConfig;
