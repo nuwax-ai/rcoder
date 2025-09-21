@@ -359,9 +359,11 @@ impl AcpConfig {
     pub fn claude_code() -> Self {
         Self::new(
             "claude".to_string(),
-            "claude-code".to_string(),
+            "npx".to_string(),
         )
-        .with_args(vec!["stdio".to_string()])
+        .with_args(vec![
+            "@zed-industries/claude-code-acp".to_string()
+        ])
         .with_api_key_auth(std::env::var("CLAUDE_API_KEY").unwrap_or_default())
         .with_mcp_enabled(true)
     }
@@ -383,8 +385,8 @@ impl AcpConfig {
         // 根据代理类型设置默认配置
         match agent_type.as_str() {
             "claude" => {
-                config.process.command = "claude-code".to_string();
-                config.process.args = vec!["stdio".to_string()];
+                config.process.command = "npx".to_string();
+                config.process.args = vec!["@zed-industries/claude-code-acp".to_string()];
                 if let Ok(key) = std::env::var("CLAUDE_API_KEY") {
                     config.authentication = AuthenticationMethod::ApiKey {
                         key,
@@ -451,8 +453,8 @@ mod tests {
     fn test_claude_code_config() {
         let config = AcpConfig::claude_code();
         assert_eq!(config.agent_type, "claude");
-        assert_eq!(config.process.command, "claude-code");
-        assert_eq!(config.process.args, vec!["stdio"]);
+        assert_eq!(config.process.command, "npx");
+        assert_eq!(config.process.args, vec!["@zed-industries/claude-code-acp"]);
         assert!(config.mcp_enabled);
     }
 
