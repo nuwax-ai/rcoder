@@ -1,5 +1,5 @@
 [package]
-name = "ai-agents-examples"
+name = "acp-adapter-examples"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,7 +12,7 @@ name = "agent_usage"
 path = "examples/agent_usage.rs"
 
 [dependencies]
-ai-agents = { path = "../ai-agents" }
+acp-adapter = { path = "../acp_adapter" }
 agent-client-protocol = "0.4"
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"

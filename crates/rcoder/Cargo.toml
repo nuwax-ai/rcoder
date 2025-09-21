@@ -9,7 +9,6 @@ license.workspace = true
 # Internal crates
 shared_types = { path = "../shared_types" }
 nuwax_parser = { path = "../nuwax_parser" }
-ai-agents = { path = "../ai-agents" }
 acp-adapter = { path = "../acp_adapter" }
 
 # ACP Protocol

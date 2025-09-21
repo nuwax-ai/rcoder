@@ -56,6 +56,151 @@ impl Default for SessionConfig {
     }
 }
 
+/// 模型提供商配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProviderConfig {
+    /// 提供商名称 (如: glm, anthropic, openai, qwen, ernie, moonshot)
+    pub name: String,
+    /// API 基础 URL
+    pub base_url: String,
+    /// 环境变量中的密钥名称
+    pub env_key: String,
+    /// 是否需要 OpenAI 兼容的认证
+    pub requires_openai_auth: bool,
+    /// 默认模型名称
+    pub default_model: String,
+    /// 额外的配置参数
+    pub extra_params: HashMap<String, String>,
+}
+
+impl ModelProviderConfig {
+    /// 创建 GLM 提供商配置
+    pub fn glm() -> Self {
+        Self {
+            name: "glm".to_string(),
+            base_url: "https://open.bigmodel.cn/api/coding/paas/v4".to_string(),
+            env_key: "GLM_AUTH_TOKEN".to_string(),
+            requires_openai_auth: false,
+            default_model: "GLM-4.5".to_string(),
+            extra_params: HashMap::new(),
+        }
+    }
+
+    /// 创建 Claude 提供商配置
+    pub fn claude() -> Self {
+        Self {
+            name: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            env_key: "ANTHROPIC_API_KEY".to_string(),
+            requires_openai_auth: false,
+            default_model: "claude-3-5-sonnet-20241022".to_string(),
+            extra_params: HashMap::new(),
+        }
+    }
+
+    /// 创建 OpenAI 提供商配置
+    pub fn openai() -> Self {
+        Self {
+            name: "openai".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            env_key: "OPENAI_API_KEY".to_string(),
+            requires_openai_auth: true,
+            default_model: "gpt-4o".to_string(),
+            extra_params: HashMap::new(),
+        }
+    }
+
+    /// 创建通义千问提供商配置
+    pub fn qwen() -> Self {
+        Self {
+            name: "qwen".to_string(),
+            base_url: "https://dashscope.aliyuncs.com/api/v1".to_string(),
+            env_key: "QWEN_API_KEY".to_string(),
+            requires_openai_auth: true,
+            default_model: "qwen-max".to_string(),
+            extra_params: HashMap::new(),
+        }
+    }
+
+    /// 创建文心一言提供商配置
+    pub fn ernie() -> Self {
+        Self {
+            name: "ernie".to_string(),
+            base_url: "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop".to_string(),
+            env_key: "ERNIE_API_KEY".to_string(),
+            requires_openai_auth: false,
+            default_model: "ernie-4.0-8k".to_string(),
+            extra_params: HashMap::new(),
+        }
+    }
+
+    /// 创建月之暗面提供商配置（OpenAI 兼容）
+    pub fn moonshot() -> Self {
+        Self {
+            name: "moonshot".to_string(),
+            base_url: "https://api.moonshot.cn/v1".to_string(),
+            env_key: "MOONSHOT_API_KEY".to_string(),
+            requires_openai_auth: true,
+            default_model: "moonshot-v1-8k".to_string(),
+            extra_params: HashMap::new(),
+        }
+    }
+
+    /// 创建 Kimi 提供商配置（Anthropic 兼容）
+    pub fn kimi() -> Self {
+        Self {
+            name: "kimi".to_string(),
+            base_url: "https://api.moonshot.ai/anthropic".to_string(),
+            env_key: "ANTHROPIC_AUTH_TOKEN".to_string(),
+            requires_openai_auth: false,
+            default_model: "kimi-k2-0905".to_string(),
+            extra_params: HashMap::new(),
+        }
+    }
+
+    /// 创建自定义提供商配置
+    pub fn custom(name: String, base_url: String, env_key: String, default_model: String) -> Self {
+        Self {
+            name,
+            base_url,
+            env_key,
+            requires_openai_auth: false,
+            default_model,
+            extra_params: HashMap::new(),
+        }
+    }
+
+    /// 获取环境变量中的认证令牌
+    pub fn get_auth_token(&self) -> Option<String> {
+        std::env::var(&self.env_key).ok()
+    }
+
+    /// 生成适用于代理的环境变量映射
+    pub fn generate_env_vars(&self) -> HashMap<String, String> {
+        let mut env_vars = HashMap::new();
+        
+        // 获取认证令牌
+        if let Some(token) = self.get_auth_token() {
+            if self.requires_openai_auth {
+                // OpenAI 兼容的环境变量
+                env_vars.insert("OPENAI_API_KEY".to_string(), token);
+                env_vars.insert("OPENAI_BASE_URL".to_string(), self.base_url.clone());
+            } else {
+                // 自定义环境变量
+                env_vars.insert(self.env_key.clone(), token);
+                env_vars.insert(format!("{}_BASE_URL", self.name.to_uppercase()), self.base_url.clone());
+            }
+            
+            // 添加额外的模型参数
+            for (key, value) in &self.extra_params {
+                env_vars.insert(key.clone(), value.clone());
+            }
+        }
+        
+        env_vars
+    }
+}
+
 /// 认证方法
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthenticationMethod {
@@ -63,11 +208,13 @@ pub enum AuthenticationMethod {
     ApiKey {
         key: String,
         header_name: Option<String>,
+        base_url: Option<String>,
     },
     OAuth {
         client_id: String,
         client_secret: String,
         scopes: Vec<String>,
+        base_url: Option<String>,
     },
     Custom {
         name: String,
@@ -130,6 +277,12 @@ pub struct AcpConfig {
     /// 禁用的工具列表
     pub disabled_tools: Vec<String>,
 
+    /// 模型提供商配置
+    pub model_provider: Option<ModelProviderConfig>,
+
+    /// 使用的模型名称
+    pub model_name: Option<String>,
+
     /// 自定义配置
     pub custom: serde_json::Value,
 }
@@ -166,6 +319,8 @@ impl Default for AcpConfig {
             mcp_enabled: false,
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
+            model_provider: None,
+            model_name: None,
             custom: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
@@ -222,6 +377,32 @@ impl AcpConfig {
         self.authentication = AuthenticationMethod::ApiKey {
             key,
             header_name: Some("Authorization".to_string()),
+            base_url: None,
+        };
+        self
+    }
+
+    /// 设置 API 密钥认证（带自定义 base_url）
+    pub fn with_api_key_auth_and_url(mut self, key: String, base_url: String) -> Self {
+        self.authentication = AuthenticationMethod::ApiKey {
+            key,
+            header_name: Some("Authorization".to_string()),
+            base_url: Some(base_url),
+        };
+        self
+    }
+
+    /// 设置 API 密钥认证（完全自定义）
+    pub fn with_custom_api_key_auth(
+        mut self, 
+        key: String, 
+        header_name: Option<String>, 
+        base_url: Option<String>
+    ) -> Self {
+        self.authentication = AuthenticationMethod::ApiKey {
+            key,
+            header_name,
+            base_url,
         };
         self
     }
@@ -367,6 +548,34 @@ impl AcpConfig {
         .with_mcp_enabled(true)
     }
 
+    /// 创建 Claude Code 使用 Kimi 的配置
+    pub fn claude_code_with_kimi() -> Self {
+        Self::new(
+            "claude".to_string(),
+            "npx".to_string(),
+        )
+        .with_args(vec![
+            "@zed-industries/claude-code-acp".to_string()
+        ])
+        .with_mcp_enabled(true)
+        .with_model_provider(ModelProviderConfig::kimi())
+        .with_model_name("kimi-k2-0905".to_string())
+    }
+
+    /// 创建 Claude Code 使用国内大模型的配置
+    pub fn claude_code_with_domestic_model(provider: ModelProviderConfig, model_name: String) -> Self {
+        Self::new(
+            "claude".to_string(),
+            "npx".to_string(),
+        )
+        .with_args(vec![
+            "@zed-industries/claude-code-acp".to_string()
+        ])
+        .with_mcp_enabled(true)
+        .with_model_provider(provider)
+        .with_model_name(model_name)
+    }
+
     /// 创建 Codex 配置
     pub fn codex() -> Self {
         Self::new(
@@ -396,6 +605,7 @@ impl AcpConfig {
                     config.authentication = AuthenticationMethod::ApiKey {
                         key,
                         header_name: Some("Authorization".to_string()),
+                        base_url: None,
                     };
                 }
             }
@@ -421,6 +631,107 @@ impl AcpConfig {
 
         config.validate()?;
         Ok(config)
+    }
+
+    /// 创建国内大模型配置
+    pub fn domestic_model(agent_type: String, command: String, api_key: String, base_url: String) -> Self {
+        Self::new(agent_type, command)
+            .with_custom_api_key_auth(api_key, Some("Authorization".to_string()), Some(base_url))
+    }
+
+    /// 从环境变量创建国内大模型配置
+    pub fn domestic_model_from_env(agent_type: String, command: String) -> Result<Self, String> {
+        let api_key = std::env::var("API_KEY")
+            .or_else(|_| std::env::var("DOMESTIC_API_KEY"))
+            .map_err(|_| "请设置 API_KEY 或 DOMESTIC_API_KEY 环境变量")?;
+        
+        let base_url = std::env::var("BASE_URL")
+            .or_else(|_| std::env::var("DOMESTIC_BASE_URL"))
+            .map_err(|_| "请设置 BASE_URL 或 DOMESTIC_BASE_URL 环境变量")?;
+
+        Ok(Self::domestic_model(agent_type, command, api_key, base_url))
+    }
+
+    /// 设置模型提供商
+    pub fn with_model_provider(mut self, provider: ModelProviderConfig) -> Self {
+        self.model_provider = Some(provider);
+        self
+    }
+
+    /// 设置模型名称
+    pub fn with_model_name(mut self, model_name: String) -> Self {
+        self.model_name = Some(model_name);
+        self
+    }
+
+    /// 创建 GLM 配置
+    pub fn glm(agent_type: String, command: String) -> Self {
+        Self::new(agent_type, command)
+            .with_model_provider(ModelProviderConfig::glm())
+            .with_model_name(ModelProviderConfig::glm().default_model)
+    }
+
+    /// 创建 Claude 配置
+    pub fn claude_provider(agent_type: String, command: String) -> Self {
+        Self::new(agent_type, command)
+            .with_model_provider(ModelProviderConfig::claude())
+            .with_model_name(ModelProviderConfig::claude().default_model)
+    }
+
+    /// 创建 OpenAI 配置
+    pub fn openai(agent_type: String, command: String) -> Self {
+        Self::new(agent_type, command)
+            .with_model_provider(ModelProviderConfig::openai())
+            .with_model_name(ModelProviderConfig::openai().default_model)
+    }
+
+    /// 创建通义千问配置
+    pub fn qwen(agent_type: String, command: String) -> Self {
+        Self::new(agent_type, command)
+            .with_model_provider(ModelProviderConfig::qwen())
+            .with_model_name(ModelProviderConfig::qwen().default_model)
+    }
+
+    /// 创建文心一言配置
+    pub fn ernie(agent_type: String, command: String) -> Self {
+        Self::new(agent_type, command)
+            .with_model_provider(ModelProviderConfig::ernie())
+            .with_model_name(ModelProviderConfig::ernie().default_model)
+    }
+
+    /// 创建月之暗面配置
+    pub fn moonshot(agent_type: String, command: String) -> Self {
+        Self::new(agent_type, command)
+            .with_model_provider(ModelProviderConfig::moonshot())
+            .with_model_name(ModelProviderConfig::moonshot().default_model)
+    }
+
+    /// 创建自定义模型配置
+    pub fn custom_model(
+        agent_type: String, 
+        command: String, 
+        provider_name: String, 
+        base_url: String, 
+        env_key: String, 
+        model_name: String
+    ) -> Self {
+        let provider = ModelProviderConfig::custom(provider_name, base_url, env_key, model_name.clone());
+        Self::new(agent_type, command)
+            .with_model_provider(provider)
+            .with_model_name(model_name)
+    }
+
+    /// 获取完整的环境变量（包含模型提供商的环境变量）
+    pub fn full_environment_with_provider(&self) -> HashMap<String, String> {
+        let mut env = self.full_environment();
+
+        // 如果配置了模型提供商，添加其环境变量
+        if let Some(ref provider) = self.model_provider {
+            let provider_env = provider.generate_env_vars();
+            env.extend(provider_env);
+        }
+
+        env
     }
 }
 
@@ -453,6 +764,44 @@ mod tests {
         assert!(config.mcp_enabled);
     }
 
+    #[test]
+    fn test_domestic_model_config() {
+        let config = AcpConfig::domestic_model(
+            "claude".to_string(),
+            "python".to_string(),
+            "test_key".to_string(),
+            "https://api.example.com".to_string(),
+        );
+        assert_eq!(config.agent_type, "claude");
+        assert_eq!(config.process.command, "python");
+        match config.authentication {
+            AuthenticationMethod::ApiKey { key, base_url, .. } => {
+                assert_eq!(key, "test_key");
+                assert_eq!(base_url, Some("https://api.example.com".to_string()));
+            }
+            _ => panic!("Expected ApiKey authentication"),
+        }
+    }
+
+    #[test]
+    fn test_custom_api_key_auth() {
+        let config = AcpConfig::new("test".to_string(), "test-command".to_string())
+            .with_custom_api_key_auth(
+                "custom_key".to_string(),
+                Some("X-API-Key".to_string()),
+                Some("https://custom.api.com".to_string()),
+            );
+        
+        match config.authentication {
+            AuthenticationMethod::ApiKey { key, header_name, base_url } => {
+                assert_eq!(key, "custom_key");
+                assert_eq!(header_name, Some("X-API-Key".to_string()));
+                assert_eq!(base_url, Some("https://custom.api.com".to_string()));
+            }
+            _ => panic!("Expected ApiKey authentication"),
+        }
+    }
+
     #[tokio::test]
     async fn test_config_validation_async() {
         let mut config = AcpConfig::default();
@@ -460,5 +809,55 @@ mod tests {
 
         config.process.command = "test".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_model_provider_config() {
+        let provider = ModelProviderConfig::glm();
+        assert_eq!(provider.name, "glm");
+        assert_eq!(provider.base_url, "https://open.bigmodel.cn/api/coding/paas/v4");
+        assert_eq!(provider.env_key, "GLM_AUTH_TOKEN");
+        assert_eq!(provider.default_model, "GLM-4.5");
+        assert!(!provider.requires_openai_auth);
+    }
+
+    #[test]
+    fn test_custom_model_config() {
+        let config = AcpConfig::custom_model(
+            "claude".to_string(),
+            "python".to_string(),
+            "custom_provider".to_string(),
+            "https://api.custom.com".to_string(),
+            "CUSTOM_API_KEY".to_string(),
+            "custom-model".to_string(),
+        );
+        
+        assert_eq!(config.agent_type, "claude");
+        assert_eq!(config.process.command, "python");
+        assert!(config.model_provider.is_some());
+        assert_eq!(config.model_name, Some("custom-model".to_string()));
+        
+        let provider = config.model_provider.unwrap();
+        assert_eq!(provider.name, "custom_provider");
+        assert_eq!(provider.base_url, "https://api.custom.com");
+        assert_eq!(provider.env_key, "CUSTOM_API_KEY");
+    }
+
+    #[test]
+    fn test_glm_config() {
+        let config = AcpConfig::glm("claude".to_string(), "python".to_string());
+        assert_eq!(config.agent_type, "claude");
+        assert_eq!(config.process.command, "python");
+        assert!(config.model_provider.is_some());
+        assert_eq!(config.model_name, Some("GLM-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_qwen_config() {
+        let config = AcpConfig::qwen("claude".to_string(), "python".to_string());
+        assert_eq!(config.agent_type, "claude");
+        assert_eq!(config.process.command, "python");
+        assert!(config.model_provider.is_some());
+        assert_eq!(config.model_name, Some("qwen-max".to_string()));
     }
 }

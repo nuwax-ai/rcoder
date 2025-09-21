@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*", "examples"]
-exclude = ["tmp/*"]
+exclude = ["tmp/*", "crates/ai-agents"]
 resolver = "2"
 
 [workspace.lints]

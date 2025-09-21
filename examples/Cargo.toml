@@ -7,6 +7,14 @@ edition = "2021"
 name = "claude_code_acp_example"
 path = "claude_code_acp_example.rs"
 
+[[bin]]
+name = "domestic_model_example"
+path = "domestic_model_example.rs"
+
+[[bin]]
+name = "custom_model_example"
+path = "custom_model_example.rs"
+
 [dependencies]
 acp-adapter = { path = "../crates/acp_adapter" }
 tokio = { version = "1.0", features = ["full"] }

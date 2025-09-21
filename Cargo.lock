@@ -27,6 +27,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "acp-adapter-examples"
+version = "0.1.0"
+dependencies = [
+ "acp-adapter",
+ "agent-client-protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -65,34 +76,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e60d3430d3a69478ad0993f19238d2df97c507009a52b3c10addcd7f6bcb916"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "ai-agents"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "async-trait",
- "claude",
- "codex",
- "dirs",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ai-agents-examples"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "ai-agents",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1563,7 +1546,6 @@ version = "0.1.0"
 dependencies = [
  "acp-adapter",
  "agent-client-protocol",
- "ai-agents",
  "anyhow",
  "axum",
  "axum-tracing-opentelemetry",
