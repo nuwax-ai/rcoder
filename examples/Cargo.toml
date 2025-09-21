@@ -1,0 +1,15 @@
+[package]
+name = "claude_code_acp_example"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "claude_code_acp_example"
+path = "claude_code_acp_example.rs"
+
+[dependencies]
+acp-adapter = { path = "../crates/acp_adapter" }
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"

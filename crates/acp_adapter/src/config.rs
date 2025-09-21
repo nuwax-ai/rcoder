@@ -364,7 +364,6 @@ impl AcpConfig {
         .with_args(vec![
             "@zed-industries/claude-code-acp".to_string()
         ])
-        .with_api_key_auth(std::env::var("CLAUDE_API_KEY").unwrap_or_default())
         .with_mcp_enabled(true)
     }
 
@@ -387,12 +386,8 @@ impl AcpConfig {
             "claude" => {
                 config.process.command = "npx".to_string();
                 config.process.args = vec!["@zed-industries/claude-code-acp".to_string()];
-                if let Ok(key) = std::env::var("CLAUDE_API_KEY") {
-                    config.authentication = AuthenticationMethod::ApiKey {
-                        key,
-                        header_name: Some("Authorization".to_string()),
-                    };
-                }
+                // 不需要设置 API Key，因为 claude-code-acp 会调用本地 claude 命令
+                // 本地 claude 命令已经处理了认证
             }
             "codex" => {
                 config.process.command = "codex".to_string();

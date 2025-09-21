@@ -85,9 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```bash
 # 运行示例
-cargo run --example claude_code_acp_example
+cargo run --package claude_code_acp_example --bin claude_code_acp_example
 
-# 或者运行测试脚本
+# 运行配置测试（不需要真实 API Key）
+./test_config_only.sh
+
+# 运行完整测试（需要真实 API Key）
 ./test_claude_code_acp.sh
 ```
 

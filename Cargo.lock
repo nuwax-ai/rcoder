@@ -358,6 +358,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "claude_code_acp_example"
+version = "0.1.0"
+dependencies = [
+ "acp-adapter",
+ "anyhow",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "codex"
 version = "0.1.0"
 dependencies = [

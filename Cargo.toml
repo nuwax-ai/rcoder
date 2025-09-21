@@ -1,11 +1,7 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "examples"]
 exclude = ["tmp/*"]
 resolver = "2"
-
-[[example]]
-name = "claude_code_acp_example"
-path = "examples/claude_code_acp_example.rs"
 
 [workspace.lints]
 rustdoc.unbroken_backticks = "warn"
