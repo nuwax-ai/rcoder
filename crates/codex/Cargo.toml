@@ -11,9 +11,9 @@ path = "src/lib.rs"
 
 [dependencies]
 # OpenAI dependencies would go here when available
-# codex-cli = { git = "https://github.com/openai/codex" , branch = "main"}
-# codex-core = { git = "https://github.com/openai/codex" , branch = "main"}
-# codex-protocol = { git = "https://github.com/openai/codex" , branch = "main"}
+codex-cli = { git = "https://github.com/openai/codex" , branch = "main"}
+codex-core = { git = "https://github.com/openai/codex" , branch = "main"}
+codex-protocol = { git = "https://github.com/openai/codex" , branch = "main"}
 
 agent-client-protocol = { workspace = true }
 acp-adapter = { path = "../acp_adapter" }
