@@ -12,7 +12,7 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn, error, Span};
+use tracing::{info, warn, error, debug, Span};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -568,62 +568,195 @@ fn broadcast_progress_event(state: &SharedState, session_id: &str, event: Progre
 
 // ==================== HTTP 处理器 ====================
 
+/// 生成不带中划线的随机项目ID
+fn generate_project_id() -> String {
+    Uuid::new_v4().to_string().replace("-", "")
+}
+
+/// 创建项目工作目录
+async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
+    let workspace_dir = PathBuf::from("./project_workspace");
+
+    // 创建 project_workspace 目录（如果不存在）
+    tokio::fs::create_dir_all(&workspace_dir).await?;
+
+    // 创建项目目录
+    let project_dir = workspace_dir.join(project_id);
+    tokio::fs::create_dir_all(&project_dir).await?;
+
+    info!("📁 创建项目工作目录: {:?}", project_dir);
+    Ok(project_dir)
+}
+
 /// 处理聊天请求 - 使用 ACP 协议集成
 async fn handle_chat(
     State(state): State<SharedState>,
     Json(request): Json<ChatRequest>,
 ) -> HttpResult<ChatResponse> {
     info!(
-        "Received chat request: user_id={}, project_id={:?}, session_id={:?}",
-        request.user_id, request.project_id, request.session_id
+        "🚀 [DEBUG] handle_chat 开始处理请求: user_id={}, project_id={:?}, session_id={:?}, prompt={}",
+        request.user_id, request.project_id, request.session_id, request.prompt
     );
 
-    // 生成或使用现有的会话ID
-    let session_id = request.session_id.clone()
-        .unwrap_or_else(|| {
-            let new_session_id = Uuid::new_v4().to_string();
-            // 创建新会话
+    // 检查是否需要生成项目ID
+    let request_with_project = if request.project_id.is_some() {
+        debug!("📝 [DEBUG] 使用请求中的项目ID: {:?}", request.project_id);
+        request.clone()
+    } else {
+        // 如果提供了session_id，先检查会话中是否已有项目ID
+        if let Some(ref session_id) = request.session_id {
+            if let Some(session) = state.sessions.get(session_id) {
+                if let Some(ref project_id) = session.project_id {
+                    debug!("🔄 [DEBUG] 使用会话中的项目ID: {}", project_id);
+                    let mut modified_request = request.clone();
+                    modified_request.project_id = Some(project_id.clone());
+                    modified_request
+                } else {
+                    // 会话存在但没有项目ID，创建新的
+                    let new_project_id = generate_project_id();
+                    debug!("🆕 [DEBUG] 生成新的项目ID: {}", new_project_id);
+
+                    // 创建项目工作目录
+                    if let Err(e) = create_project_workspace(&new_project_id).await {
+                        error!("❌ [DEBUG] 创建项目工作目录失败: {}", e);
+                        return HttpResult::<ChatResponse>::error("FS001", "Failed to create project workspace");
+                    }
+
+                    let mut modified_request = request.clone();
+                    modified_request.project_id = Some(new_project_id);
+                    debug!("📝 [DEBUG] 为请求添加新的项目ID: {:?}", modified_request.project_id);
+                    modified_request
+                }
+            } else {
+                // 会话不存在，创建新的项目ID
+                let new_project_id = generate_project_id();
+                debug!("🆕 [DEBUG] 生成新的项目ID: {}", new_project_id);
+
+                // 创建项目工作目录
+                if let Err(e) = create_project_workspace(&new_project_id).await {
+                    error!("❌ [DEBUG] 创建项目工作目录失败: {}", e);
+                    return HttpResult::<ChatResponse>::error("FS001", "Failed to create project workspace");
+                }
+
+                let mut modified_request = request.clone();
+                modified_request.project_id = Some(new_project_id);
+                debug!("📝 [DEBUG] 为请求添加新的项目ID: {:?}", modified_request.project_id);
+                modified_request
+            }
+        } else {
+            // 没有session_id，创建新的项目ID
+            let new_project_id = generate_project_id();
+            debug!("🆕 [DEBUG] 生成新的项目ID: {}", new_project_id);
+
+            // 创建项目工作目录
+            if let Err(e) = create_project_workspace(&new_project_id).await {
+                error!("❌ [DEBUG] 创建项目工作目录失败: {}", e);
+                return HttpResult::<ChatResponse>::error("FS001", "Failed to create project workspace");
+            }
+
+            let mut modified_request = request.clone();
+            modified_request.project_id = Some(new_project_id);
+            debug!("📝 [DEBUG] 为请求添加新的项目ID: {:?}", modified_request.project_id);
+            modified_request
+        }
+    };
+
+    // 生成或使用现有的会话ID，并正确处理项目ID
+    let session_id = if let Some(ref provided_session_id) = request.session_id {
+        debug!("🔄 [DEBUG] 使用现有会话ID: {}", provided_session_id);
+
+        // 更新现有会话的活动时间
+        if let Some(mut session) = state.sessions.get_mut(provided_session_id) {
+            session.last_activity = chrono::Utc::now();
+            debug!("📝 [DEBUG] 更新会话活动时间: {}", provided_session_id);
+        } else {
+            // 如果会话不存在，创建新会话（使用可能已更新的项目ID）
             let session_info = SessionInfo {
-                session_id: new_session_id.clone(),
-                user_id: request.user_id.clone(),
-                project_id: request.project_id.clone(),
+                session_id: provided_session_id.clone(),
+                user_id: request_with_project.user_id.clone(),
+                project_id: request_with_project.project_id.clone(),
                 agent_type: state.config.default_agent.clone(),
                 created_at: chrono::Utc::now(),
                 last_activity: chrono::Utc::now(),
             };
-            state.sessions.insert(new_session_id.clone(), session_info);
-            new_session_id
-        });
+            state.sessions.insert(provided_session_id.clone(), session_info);
+            debug!("🆕 [DEBUG] 创建新会话（提供的ID不存在）: {}", provided_session_id);
+        }
+
+        provided_session_id.clone()
+    } else {
+        // 创建新会话
+        let new_session_id = Uuid::new_v4().to_string();
+        debug!("🆕 [DEBUG] 创建新会话: {}", new_session_id);
+
+        // 创建新会话（使用可能已更新的项目ID）
+        let session_info = SessionInfo {
+            session_id: new_session_id.clone(),
+            user_id: request_with_project.user_id.clone(),
+            project_id: request_with_project.project_id.clone(),
+            agent_type: state.config.default_agent.clone(),
+            created_at: chrono::Utc::now(),
+            last_activity: chrono::Utc::now(),
+        };
+        state.sessions.insert(new_session_id.clone(), session_info);
+        new_session_id
+    };
+
+    debug!("📋 [DEBUG] 使用会话ID: {}", session_id);
+
+    // 从会话中获取项目ID（如果存在）
+    let session_project_id = if let Some(session) = state.sessions.get(&session_id) {
+        session.project_id.clone()
+    } else {
+        None
+    };
+    debug!("📁 [DEBUG] 从会话中获取的项目ID: {:?}", session_project_id);
+
+    // 如果会话中没有项目ID，则使用请求中的项目ID
+    let final_request = if session_project_id.is_none() {
+        debug!("🔄 [DEBUG] 会话中没有项目ID，使用请求中的项目ID: {:?}", request_with_project.project_id);
+        request_with_project.clone()
+    } else {
+        debug!("📝 [DEBUG] 使用会话中的项目ID: {:?}", session_project_id);
+        let mut modified_request = request_with_project.clone();
+        modified_request.project_id = session_project_id;
+        modified_request
+    };
 
     // 更新会话活动时间
     update_session_activity(&state, &session_id).await;
 
     // 创建单向通道用于处理 AI 请求
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    debug!("📡 [DEBUG] 创建 oneshot 通道成功");
 
     // 克隆需要的数据发送到后台任务
     let agent_type = state.config.default_agent.clone();
-    let request_clone = request.clone();
     let config_clone = state.config.clone();
     let state_clone = state.clone();
     let session_id_clone = session_id.clone();
 
+    debug!("📤 [DEBUG] 准备发送任务到 LocalSet 执行器: agent_type={:?}", agent_type);
+
     // 使用全局 LocalSet 执行任务
     if let Err(e) = state.local_task_sender.send(LocalTaskRequest {
         agent_type,
-        request: request_clone,
+        request: final_request,
         config: config_clone,
         state: state_clone,
         session_id: session_id_clone,
         response_tx: tx,
     }) {
-        error!("Failed to send task to local executor: {}", e);
+        error!("❌ [DEBUG] 发送任务到 LocalSet 执行器失败: {}", e);
         return HttpResult::<ChatResponse>::error("AI003", "Failed to queue AI task");
     }
+
+    debug!("⏳ [DEBUG] 任务已发送，等待响应...");
 
     // 等待后台任务完成
     match rx.await {
         Ok(Ok(response)) => {
+            debug!("✅ [DEBUG] 收到成功响应: {} 字符", response.len());
             HttpResult::success(ChatResponse {
                 session_id: session_id.clone(),
                 response,
@@ -632,11 +765,11 @@ async fn handle_chat(
             })
         }
         Ok(Err(e)) => {
-            error!("Failed to execute AI command: {}", e);
+            error!("❌ [DEBUG] 收到错误响应: {}", e);
             HttpResult::<ChatResponse>::error("AI001", &format!("AI command execution failed: {}", e))
         }
         Err(_) => {
-            error!("AI command execution cancelled");
+            error!("❌ [DEBUG] oneshot 通道被取消或关闭");
             HttpResult::<ChatResponse>::error("AI002", "AI command execution cancelled")
         }
     }
@@ -829,8 +962,15 @@ async fn update_session_activity(state: &SharedState, session_id: &str) {
 
 /// 启动本地任务执行器
 async fn start_local_task_executor(mut receiver: tokio::sync::mpsc::UnboundedReceiver<LocalTaskRequest>) {
+    info!("🔧 [DEBUG] LocalSet 任务执行器启动");
+
     while let Some(task_request) = receiver.recv().await {
+        debug!("📥 [DEBUG] 收到任务请求: session_id={}, agent_type={:?}",
+               task_request.session_id, task_request.agent_type);
+        debug!("📝 [DEBUG] 任务详情: prompt={}", task_request.request.prompt);
+
         // 在 LocalSet 中处理每个任务
+        debug!("⚙️ [DEBUG] 开始执行 AI 命令...");
         let result = execute_ai_command(
             &task_request.agent_type,
             &task_request.request,
@@ -839,9 +979,22 @@ async fn start_local_task_executor(mut receiver: tokio::sync::mpsc::UnboundedRec
             &task_request.session_id,
         ).await.map_err(|e| e.to_string());
 
+        debug!("📤 [DEBUG] AI 命令执行完成，准备发送结果...");
+
         // 发送结果回调用者
-        let _ = task_request.response_tx.send(result);
+        match task_request.response_tx.send(result) {
+            Ok(_) => {
+                debug!("✅ [DEBUG] 结果成功发送回调用者");
+            }
+            Err(e) => {
+                error!("❌ [DEBUG] 发送结果失败: {:?}", e);
+            }
+        }
+
+        debug!("🔄 [DEBUG] 任务处理完成，等待下一个任务...");
     }
+
+    warn!("⚠️ [DEBUG] LocalSet 任务执行器结束");
 }
 
 
@@ -855,11 +1008,14 @@ async fn execute_ai_command(
     state: &SharedState,
     session_id: &str,
 ) -> anyhow::Result<String> {
+    debug!("🤖 [DEBUG] execute_ai_command 开始执行: agent_type={:?}, session_id={}", agent_type, session_id);
+    debug!("📝 [DEBUG] AI 命令详情: prompt={}", request.prompt);
+
     // 添加 span 属性
     let current_span = Span::current();
     current_span.record("ai.agent_type", agent_type.to_string());
     current_span.record("ai.prompt_length", request.prompt.len());
-    
+
     // 发送任务开始事件
     let start_event = ProgressEvent {
         event_type: ProgressEventType::TaskStarted,
@@ -875,7 +1031,7 @@ async fn execute_ai_command(
 
     match agent_type {
         AgentType::Codex => {
-            // 使用 MPMC 架构通过 ACP 协议调用 codex
+            debug!("🧠 [DEBUG] 选择 Codex agent，使用 ACP 协议");
             info!("Using Codex ACP protocol with MPMC architecture");
 
             // 获取项目ID
@@ -886,6 +1042,7 @@ async fn execute_ai_command(
                     // 如果没有提供项目ID，使用session_id作为项目ID
                     session_id
                 });
+            debug!("📁 [DEBUG] 项目ID: {}", project_id);
 
             // 发送执行中事件
             let executing_event = ProgressEvent {
@@ -904,12 +1061,15 @@ async fn execute_ai_command(
             broadcast_progress_event(state, session_id, executing_event);
 
             // 使用全局 Codex 管理器处理请求
+            debug!("📤 [DEBUG] 调用 codex_manager.send_prompt...");
             let response = state.codex_manager.send_prompt(project_id, &request.prompt).await?;
+            debug!("✅ [DEBUG] codex_manager.send_prompt 成功返回: {} 字符", response.len());
 
             info!("Codex MPMC request completed successfully");
             Ok(response)
         }
         AgentType::Claude => {
+            debug!("🤖 [DEBUG] 选择 Claude agent，使用 shell 命令");
             // Claude 仍然使用 shell 命令方式（保持向后兼容）
             info!("Using Claude shell command");
 
@@ -918,12 +1078,14 @@ async fn execute_ai_command(
             // 如果有项目 ID，设置工作目录
             if let Some(ref project_id) = request.project_id {
                 let project_path = config.projects_dir.join(project_id);
-                cmd.current_dir(project_path);
+                cmd.current_dir(&project_path);
+                debug!("📁 [DEBUG] 设置工作目录: {:?}", project_path);
             }
 
             // 添加 prompt 作为参数
             cmd.arg(&request.prompt);
 
+            debug!("📤 [DEBUG] 执行 Claude 命令: claude {:?}", request.prompt);
             info!("Executing Claude command: claude {:?}", request.prompt);
 
             // 发送执行中事件
@@ -940,14 +1102,17 @@ async fn execute_ai_command(
             broadcast_progress_event(state, session_id, executing_event);
 
             // 执行命令并获取输出
+            debug!("⏳ [DEBUG] 等待 Claude 命令执行完成...");
             let output = cmd.output().await?;
 
             if output.status.success() {
                 let response = String::from_utf8_lossy(&output.stdout).to_string();
+                debug!("✅ [DEBUG] Claude 命令执行成功，输出: {} 字符", response.len());
                 info!("Claude command completed successfully");
                 Ok(response)
             } else {
                 let error = String::from_utf8_lossy(&output.stderr).to_string();
+                error!("❌ [DEBUG] Claude 命令执行失败: {}", error);
                 error!("Claude command failed: {}", error);
                 Err(anyhow::anyhow!("Claude command failed: {}", error))
             }

@@ -357,6 +357,8 @@ struct AgentService {
     current_session_id: Option<SessionId>,
     /// 最后活动时间戳
     last_activity: std::time::Instant,
+    /// 连接是否已初始化
+    is_initialized: bool,
 }
 
 /// 发送给 Agent worker 的消息
@@ -631,7 +633,82 @@ impl GlobalAgentManager {
                     // 发送响应
                     let _ = request.response_tx.send(result);
                 } else {
-                    let _ = request.response_tx.send(Err(anyhow::anyhow!("Agent service not found for project: {}", project_id)));
+                    // 没有找到对应的项目服务，自动创建一个新的
+                    info!("未找到项目 {} 的 Agent 服务，正在创建新服务...", project_id);
+
+                    let project_path = std::path::PathBuf::from(format!("./project_workspace/{}", project_id));
+
+                    // 创建新服务
+                    let new_service = match Self::create_agent_service_for_project(
+                        &agents,
+                        &project_id,
+                        &project_path,
+                        ServiceMode::Embedded
+                    ).await {
+                        Ok(service) => service,
+                        Err(e) => {
+                            let error_msg = format!("❌ 创建 Agent 服务失败: {}", e);
+                            error!("{}", error_msg);
+                            let _ = request.response_tx.send(Err(anyhow::anyhow!(error_msg)));
+                            continue;
+                        }
+                    };
+
+                    // 将新服务添加到管理器中
+                    {
+                        let mut agents_guard = agents.lock().await;
+                        agents_guard.insert(project_id.clone(), new_service.clone());
+                        info!("✅ 成功创建并添加项目 {} 的 Agent 服务", project_id);
+                    }
+
+                    // 等待服务完全启动
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                    // 使用新创建的服务处理请求
+                    let result = {
+                        let service_guard = new_service.lock().await;
+
+                        if service_guard.is_active {
+                            info!("新创建的 Agent 服务已激活，处理请求: {}", prompt);
+
+                            if let Some(ref request_tx) = service_guard.agent_request_tx {
+                                let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+
+                                let request = AgentMessage::Prompt {
+                                    request: PromptRequest {
+                                        session_id: SessionId("embedded_session".to_string().into()),
+                                        prompt: vec![prompt.into()],
+                                        meta: None,
+                                    },
+                                    response_tx,
+                                };
+
+                                if let Err(_) = request_tx.send(request) {
+                                    Ok("❌ 发送请求到新 Agent 失败".to_string())
+                                } else {
+                                    match response_rx.recv().await {
+                                        Some(Ok(response)) => {
+                                            Ok("✅ 新创建的嵌入式 Agent 已处理请求".to_string())
+                                        }
+                                        Some(Err(e)) => {
+                                            warn!("新 Agent 处理失败: {}", e);
+                                            Ok(format!("❌ 新 Agent 处理失败: {}", e))
+                                        }
+                                        _ => {
+                                            Ok("❌ 未收到新 Agent 的有效响应".to_string())
+                                        }
+                                    }
+                                }
+                            } else {
+                                Ok("❌ 新创建的服务没有活跃的会话".to_string())
+                            }
+                        } else {
+                            Ok("❌ 新创建的 Agent 服务未激活".to_string())
+                        }
+                    };
+
+                    // 发送响应
+                    let _ = request.response_tx.send(result);
                 }
             }
         });
@@ -725,6 +802,7 @@ impl GlobalAgentManager {
             is_active: false,
             current_session_id: None,
             last_activity: std::time::Instant::now(),
+            is_initialized: false,
         }));
 
         // 启动服务
@@ -738,6 +816,101 @@ impl GlobalAgentManager {
 
         // 发送初始请求
         self.send_to_agent(project_id, initial_prompt).await
+    }
+
+    /// 为项目创建 Agent 服务（静态方法）
+    async fn create_agent_service_for_project(
+        agents: &Arc<Mutex<HashMap<String, Arc<Mutex<AgentService>>>>>,
+        project_id: &str,
+        project_path: &PathBuf,
+        service_mode: ServiceMode,
+    ) -> Result<Arc<Mutex<AgentService>>> {
+        info!("🔧 为项目创建新的 Agent 服务: {}", project_id);
+
+        // 创建项目目录
+        if !project_path.exists() {
+            tokio::fs::create_dir_all(project_path).await?;
+            info!("📁 创建项目目录: {:?}", project_path);
+        }
+
+        // 创建服务实例
+        let service = Arc::new(Mutex::new(AgentService {
+            project_id: project_id.to_string(),
+            project_path: project_path.clone(),
+            client: None,
+            connection: None,
+            agent_request_tx: None,
+            agent_response_rx: None,
+            agent_worker_task: None,
+            service_mode,
+            is_active: false,
+            current_session_id: None,
+            last_activity: std::time::Instant::now(),
+            is_initialized: false,
+        }));
+
+        // 启动服务
+        Self::start_agent_service_static(agents, service.clone()).await?;
+
+        info!("✅ 成功为项目 {} 创建 Agent 服务", project_id);
+        Ok(service)
+    }
+
+    /// 静态方法：启动 Agent 服务
+    async fn start_agent_service_static(
+        agents: &Arc<Mutex<HashMap<String, Arc<Mutex<AgentService>>>>>,
+        service: Arc<Mutex<AgentService>>,
+    ) -> Result<()> {
+        let project_id = {
+            let service_guard = service.lock().await;
+            service_guard.project_id.clone()
+        };
+        let project_path = {
+            let service_guard = service.lock().await;
+            service_guard.project_path.clone()
+        };
+
+        info!("🔧 启动 Agent 服务，项目: {}", project_id);
+
+        // 创建 Codex 客户端
+        let collected_response = Arc::new(Mutex::new(String::new()));
+
+        // 创建一个临时的 agent manager 用于静态方法
+        let temp_manager = Self {
+            agents: agents.clone(),
+            request_tx: mpsc::unbounded_channel().0,
+            config: AgentManagerConfig::default(),
+            notification_manager: Arc::new(SessionNotificationManager::new(1000)),
+        };
+
+        let client = CodexClient {
+            project_id: project_id.clone(),
+            collected_response: collected_response.clone(),
+            agent_manager: temp_manager.clone(),
+        };
+
+        // 根据配置选择启动模式
+        let service_mode = {
+            let service_guard = service.lock().await;
+            service_guard.service_mode.clone()
+        };
+
+        match service_mode {
+            ServiceMode::Subprocess => {
+                warn!("🔧 子进程模式未实现，项目: {}", project_id);
+                return Err(anyhow::anyhow!("Subprocess mode not implemented"));
+            }
+            ServiceMode::Embedded => {
+                // 嵌入式模式需要特殊处理，因为 LocalSet 不能跨线程
+                // 这里直接启动嵌入式服务，不使用 LocalSet
+                if let Err(e) = temp_manager.start_embedded_agent_service_simple(service.clone(), &client).await {
+                    error!("❌ 无法为项目 {} 建立嵌入式 Agent 连接: {}", project_id, e);
+                    return Err(anyhow::anyhow!("Failed to establish Agent embedded connection for project {}: {}", project_id, e));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// 启动 Agent 服务
@@ -825,9 +998,48 @@ impl GlobalAgentManager {
             service_guard.agent_response_rx = Some(response_rx);
             service_guard.agent_worker_task = Some(worker_handle);
             service_guard.current_session_id = None; // 将在第一次通信时建立
+            service_guard.is_initialized = false; // 需要初始化
         }
 
         info!("Embedded Agent service started successfully for project: {}", project_id);
+        Ok(())
+    }
+
+    /// 启动嵌入式 Agent 服务（简化版本，不使用 LocalSet）
+    async fn start_embedded_agent_service_simple(
+        &self,
+        service: Arc<Mutex<AgentService>>,
+        client: &CodexClient,
+    ) -> Result<()> {
+        let project_id = {
+            let service_guard = service.lock().await;
+            service_guard.project_id.clone()
+        };
+        let project_path = {
+            let service_guard = service.lock().await;
+            service_guard.project_path.clone()
+        };
+
+        info!("🔧 启动嵌入式 Agent 服务（简化版），项目: {}", project_id);
+
+        // 创建 Agent 通信通道
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+
+        // 更新服务的状态
+        {
+            let mut service_guard = service.lock().await;
+            service_guard.is_active = true;
+            service_guard.client = Some(client.clone());
+            service_guard.connection = None; // 嵌入式模式不使用直接连接
+            service_guard.agent_request_tx = Some(request_tx);
+            service_guard.agent_response_rx = Some(response_rx);
+            service_guard.agent_worker_task = None; // 暂时不启动 worker
+            service_guard.current_session_id = None; // 将在第一次通信时建立
+            service_guard.is_initialized = false; // 需要初始化
+        }
+
+        info!("🔧 嵌入式 Agent 服务（简化版）启动成功，项目: {}", project_id);
         Ok(())
     }
 
@@ -975,25 +1187,95 @@ async fn agent_worker(
 
         // 启动请求处理任务
         let mut request_handle = tokio::task::spawn_local(async move {
-        while let Some(request) = request_rx.recv().await {
-            match request {
-                AgentMessage::Initialize { request, response_tx } => {
-                    let result = client_conn.initialize(request).await
-                        .map_err(|e| anyhow::anyhow!(e.to_string()));
-                    let _ = response_tx.send(result);
-                }
-                AgentMessage::Prompt { request, response_tx } => {
-                    let result = client_conn.prompt(request).await
-                        .map_err(|e| anyhow::anyhow!(e.to_string()));
-                    let _ = response_tx.send(result);
-                }
-                AgentMessage::Shutdown => {
-                    info!("Received shutdown signal, stopping agent worker");
-                    break;
+            let mut is_initialized = false;
+            let mut current_session_id: Option<SessionId> = None;
+
+            while let Some(request) = request_rx.recv().await {
+                match request {
+                    AgentMessage::Initialize { request, response_tx } => {
+                        let result = client_conn.initialize(request).await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()));
+                        if result.is_ok() {
+                            is_initialized = true;
+                            info!("ACP connection initialized successfully");
+                        }
+                        let _ = response_tx.send(result);
+                    }
+                    AgentMessage::Prompt { request, response_tx } => {
+                        info!("🔧 [DEBUG] Received prompt request in agent_worker");
+
+                        // 确保连接已初始化
+                        if !is_initialized {
+                            info!("🔧 [DEBUG] Initializing ACP connection before prompt");
+                            let init_result = client_conn.initialize(InitializeRequest {
+                                protocol_version: agent_client_protocol::V1,
+                                client_capabilities: Default::default(),
+                                meta: None,
+                            }).await;
+
+                            if let Err(e) = init_result {
+                                let error_msg = format!("❌ ACP 初始化失败: {}", e);
+                                error!("🔧 [DEBUG] {}", error_msg);
+                                let _ = response_tx.send(Err(anyhow::anyhow!(error_msg)));
+                                continue;
+                            }
+                            is_initialized = true;
+                            info!("🔧 [DEBUG] ACP connection initialized successfully");
+                        }
+
+                        // 确保有会话
+                        if current_session_id.is_none() {
+                            info!("🔧 [DEBUG] Creating new ACP session");
+                            let session_result = client_conn.new_session(NewSessionRequest {
+                                mcp_servers: Vec::new(),
+                                cwd: project_path.clone(),
+                                meta: None,
+                            }).await;
+
+                            match session_result {
+                                Ok(session_response) => {
+                                    current_session_id = Some(session_response.session_id.clone());
+                                    info!("🔧 [DEBUG] ACP session created: {:?}", session_response.session_id);
+                                }
+                                Err(e) => {
+                                    let error_msg = format!("❌ ACP 会话创建失败: {}", e);
+                                    error!("🔧 [DEBUG] {}", error_msg);
+                                    let _ = response_tx.send(Err(anyhow::anyhow!(error_msg)));
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // 使用现有的或新创建的会话ID
+                        let mut prompt_request = request;
+                        if let Some(ref session_id) = current_session_id {
+                            prompt_request.session_id = session_id.clone();
+                            info!("🔧 [DEBUG] Using session ID: {:?}", session_id);
+                        }
+
+                        info!("🔧 [DEBUG] Sending prompt to ACP agent");
+                        let result = client_conn.prompt(prompt_request).await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()));
+
+                        match &result {
+                            Ok(response) => {
+                                info!("🔧 [DEBUG] ACP prompt successful, response: {:?}", response);
+                            }
+                            Err(e) => {
+                                error!("🔧 [DEBUG] ACP prompt failed: {}", e);
+                            }
+                        }
+
+                        let _ = response_tx.send(result);
+                        info!("🔧 [DEBUG] Prompt response sent back");
+                    }
+                    AgentMessage::Shutdown => {
+                        info!("Received shutdown signal, stopping agent worker");
+                        break;
+                    }
                 }
             }
-        }
-    });
+        });
 
     // 等待任务完成，使用更安全的方式处理并发任务
     // 创建一个关闭信号通道
