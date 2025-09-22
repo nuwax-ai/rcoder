@@ -80,6 +80,7 @@ path-clean = "1.0"
 # Utilities
 dashmap = "6.0"
 futures = "0.3"
+futures-util = "0.3"
 itertools = "0.14"
 bytes = "1.10"
 # collections = "0.2"  # 这个包不存在

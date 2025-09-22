@@ -1,0 +1,87 @@
+# RCoder HTTP API 测试脚本
+# 用于手动测试 /chat 服务
+
+### 创建新会话的请求
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "test_user",
+  "prompt": "Hello, 请帮我创建一个简单的 Rust 项目",
+  "agent_type": "codex"
+}
+
+###
+
+### 使用现有会话发送请求
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "test_user",
+  "prompt": "现在请帮我添加一个 Cargo.toml 文件",
+  "session_id": "test_session_001",
+  "agent_type": "codex"
+}
+
+### 使用特定 project_id 的请求
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "test_user",
+  "prompt": "创建一个 Python 项目",
+  "project_id": "python_project_123",
+  "agent_type": "codex"
+}
+
+### 带有完整会话信息的请求
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "developer_user",
+  "prompt": "帮我分析这个 Rust 代码的性能问题",
+  "session_id": "rust_analysis_session",
+  "project_id": "rust_performance_project",
+  "agent_type": "codex"
+}
+
+### 测试会话重用（相同的 session_id）
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "developer_user",
+  "prompt": "现在请帮我优化之前分析的代码",
+  "session_id": "rust_analysis_session",
+  "agent_type": "codex"
+}
+
+### 测试不同的项目类型
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "frontend_user",
+  "prompt": "创建一个 React 组件来显示用户列表",
+  "project_id": "react_frontend_project",
+  "agent_type": "codex"
+}
+
+### 测试简单的代码生成请求
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "backend_user",
+  "prompt": "帮我写一个简单的 Express.js 服务器",
+  "project_id": "nodejs_backend_project",
+  "agent_type": "codex"
+}
+
+### 健康检查
+GET http://localhost:3000/health
+
+### 测试不存在的端点
+GET http://localhost:3000/nonexistent

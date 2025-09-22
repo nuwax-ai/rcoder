@@ -5,14 +5,23 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "rcoder"
+path = "src/lib.rs"
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
 nuwax_parser = { path = "../nuwax_parser" }
 acp-adapter = { path = "../acp_adapter" }
+codex-acp-agent = { path = "../codex-acp-agent" }
+codex-core = { git = "https://github.com/openai/codex" , branch = "main" }
 
 # ACP Protocol
 agent-client-protocol = { workspace = true }
+async-trait = "0.1"
+parking_lot = "0.12"
+tempfile = "3.8"
 
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
@@ -27,12 +36,16 @@ serde_json = { workspace = true }
 
 # Workspace dependencies
 tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }
+bytes = "1.0"
+futures-util = { workspace = true }
+piper = "0.2"
 
 # OpenTelemetry
 opentelemetry = { workspace = true }
@@ -43,3 +56,11 @@ axum-tracing-opentelemetry = { workspace = true }
 # File system
 tokio-fs = { workspace = true }
 path-clean = { workspace = true }
+
+[[example]]
+name = "real_acp_example"
+path = "../../examples/real_acp_example.rs"
+
+[[example]]
+name = "simple_acp_test"
+path = "../../examples/simple_acp_test.rs"

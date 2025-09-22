@@ -178,7 +178,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
  "x11rb",
 ]
 
@@ -642,7 +642,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex"
+name = "codex-acp-agent"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
@@ -653,6 +653,7 @@ dependencies = [
  "codex-core",
  "codex-protocol",
  "dirs 5.0.1",
+ "futures 0.3.31",
  "serde",
  "serde_json",
  "tokio",
@@ -1412,7 +1413,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
@@ -3013,6 +3014,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
+name = "piper"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96c8c490f422ef9a4efd2cb5b42b76c8613d7e7dfc1caf667b8a3350a5acc066"
+dependencies = [
+ "atomic-waker",
+ "fastrand",
+ "futures-io",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3244,21 +3256,30 @@ dependencies = [
  "acp-adapter",
  "agent-client-protocol",
  "anyhow",
+ "async-trait",
  "axum",
  "axum-tracing-opentelemetry",
+ "bytes 1.10.1",
  "chrono",
+ "codex-acp-agent",
+ "codex-core",
  "dashmap",
  "futures 0.3.31",
+ "futures-util",
  "nuwax_parser",
  "opentelemetry",
  "opentelemetry_sdk",
+ "parking_lot",
  "path-clean",
+ "piper",
  "serde",
  "serde_json",
  "shared_types",
+ "tempfile",
  "tokio",
  "tokio-fs",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -3427,7 +3448,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

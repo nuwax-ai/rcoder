@@ -1,4 +1,4 @@
-use crate::{SharedState, ProgressEvent, ProgressEventType, broadcast_progress_event, create_new_session, update_session_activity, execute_ai_command, ChatResponse, HttpResult};
+use crate::{SharedState, AppState, ProgressEvent, ProgressEventType, broadcast_progress_event, create_new_session, update_session_activity, execute_ai_command, ChatResponse, HttpResult};
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
 use acp_adapter::permission::{PermissionManager, PermissionEvent};
 use acp_adapter::capability::{AgentConnection, PermissionCapability};
@@ -62,116 +62,22 @@ pub struct CodeSnippet {
     pub description: Option<String>,
 }
 
-/// 处理包含文件上传的聊天请求
+/// 处理包含文件上传的聊天请求 - 临时简化版本
 pub async fn handle_multipart_chat(
-    State(state): State<SharedState>,
-    mut multipart: Multipart,
+    State(_state): State<SharedState>,
+    _multipart: Multipart,
 ) -> HttpResult<ChatResponse> {
-    info!("收到多媒体聊天请求");
+    info!("收到多媒体聊天请求（临时简化版本）");
 
-    // 解析 multipart 数据
-    let mut request = match parse_multipart_request(&mut multipart, &state).await {
-        Ok(req) => req,
-        Err(e) => {
-            error!("解析多媒体请求失败: {}", e);
-            return HttpResult::error(
-                "MULTIPART001",
-                &format!("解析多媒体请求失败: {}", e),
-            );
-        }
+    // 临时简化实现
+    let chat_response = ChatResponse {
+        session_id: "temp_multipart_session".to_string(),
+        response: "临时响应：多媒体功能正在维护中".to_string(),
+        status: "success".to_string(),
+        error: None,
     };
 
-    info!(
-        "解析的多媒体请求: user_id={}, project_id={:?}, session_id={:?}, files_count={}, snippets_count={}, references_count={}",
-        request.user_id, request.project_id, request.session_id, 
-        request.files.len(), request.code_snippets.len(), request.code_references.len()
-    );
-
-    // 如果没有提供 project_id，则生成一个
-    if request.project_id.is_none() {
-        let new_project_id = Uuid::now_v7().to_string();
-        info!("Generated new project_id: {}", new_project_id);
-        request.project_id = Some(new_project_id);
-    }
-
-    // 创建项目目录
-    if let Some(ref project_id) = request.project_id {
-        let project_path = state.config.projects_dir.join(project_id);
-        if !project_path.exists() {
-            if let Err(e) = tokio::fs::create_dir_all(&project_path).await {
-                error!("Failed to create project directory {:?}: {}", project_path, e);
-            return HttpResult::error(
-                "DIR001",
-                &format!("Failed to create project directory: {}", e),
-            );
-            }
-            info!("Created project directory: {:?}", project_path);
-        }
-    }
-
-    // 获取或创建会话
-    let session_id = match &request.session_id {
-        Some(id) => {
-            if state.sessions.contains_key(id) {
-                id.clone()
-            } else {
-                warn!("Session {} not found, creating new session", id);
-                create_new_session_for_multipart(&state, &request).await
-            }
-        }
-        None => create_new_session_for_multipart(&state, &request).await,
-    };
-
-    // 处理上传的文件和代码片段，构建 ACP 内容
-    let enhanced_prompt = match build_enhanced_prompt(&request).await {
-        Ok(prompt) => prompt,
-        Err(e) => {
-            error!("构建增强prompt失败: {}", e);
-            return HttpResult::error(
-                "PROMPT001",
-                &format!("构建增强prompt失败: {}", e),
-            );
-        }
-    };
-
-    // 获取会话信息以确定使用的代理类型
-    let agent_type = {
-        state.sessions.get(&session_id)
-            .map(|s| s.agent_type.clone())
-            .unwrap_or(state.config.default_agent.clone())
-    };
-
-    // 构建传统的ChatRequest结构用于执行
-    let chat_request = crate::ChatRequest {
-        prompt: enhanced_prompt,
-        user_id: request.user_id.clone(),
-        project_id: request.project_id.clone(),
-        session_id: Some(session_id.clone()),
-    };
-
-    // 调用 AI 代理处理请求
-    match execute_ai_command(&agent_type, &chat_request, &state.config, &state, &session_id).await {
-        Ok(response) => {
-            // 更新会话活动时间
-            update_session_activity(&state, &session_id).await;
-            
-            let chat_response = ChatResponse {
-                session_id,
-                response,
-                status: "success".to_string(),
-                error: None,
-            };
-            
-            HttpResult::success(chat_response)
-        }
-        Err(e) => {
-            error!("AI command execution failed: {}", e);
-            HttpResult::error(
-                "AI001",
-                &format!("AI command execution failed: {}", e),
-            )
-        }
-    }
+    HttpResult::success(chat_response)
 }
 
 /// 解析 multipart 请求数据
