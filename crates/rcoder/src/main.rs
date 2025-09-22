@@ -1,9 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
-    response::{Json, Sse, sse::Event},
-    routing::{get, post},
-    Router,
+    extract::{Path, State}, response::{sse::Event, IntoResponse, Sse}, routing::{get, post}, Json, Router
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -22,7 +19,6 @@ use uuid::Uuid;
 mod codex_agent_client;
 use codex_agent_client::{GlobalAgentManager, SerializedSessionNotification};
 
-mod acp_client;
 use opentelemetry::trace::TraceContextExt;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use futures::stream::Stream;
@@ -46,7 +42,7 @@ use acp_multipart_chat::handle_acp_multipart_chat;
 // ==================== 数据结构定义 ====================
 
 /// 用户请求结构 - 支持多媒体内容
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ChatRequest {
     /// 用户输入的 prompt
     prompt: String,
@@ -264,6 +260,17 @@ impl Default for AppConfig {
     }
 }
 
+/// 本地任务请求
+#[derive(Debug)]
+struct LocalTaskRequest {
+    agent_type: AgentType,
+    request: ChatRequest,
+    config: AppConfig,
+    state: SharedState,
+    session_id: String,
+    response_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
 /// 应用状态
 #[derive(Clone)]
 struct AppState {
@@ -277,9 +284,24 @@ struct AppState {
     session_manager: Arc<SessionManager>,
     /// 全局 Codex 管理器（MPMC 架构）- 使用全局单例
     codex_manager: Arc<GlobalAgentManager>,
+    /// 本地任务发送器
+    local_task_sender: tokio::sync::mpsc::UnboundedSender<LocalTaskRequest>,
 }
 
-type SharedState = AppState;
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("sessions", &self.sessions)
+            .field("config", &self.config)
+            .field("progress_senders", &self.progress_senders)
+            .field("session_manager", &"SessionManager")
+            .field("codex_manager", &"GlobalAgentManager")
+            .field("local_task_sender", &"UnboundedSender<LocalTaskRequest>")
+            .finish()
+    }
+}
+
+type SharedState = Arc<AppState>;
 
 // ==================== 辅助函数 ====================
 
@@ -546,7 +568,7 @@ fn broadcast_progress_event(state: &SharedState, session_id: &str, event: Progre
 
 // ==================== HTTP 处理器 ====================
 
-/// 处理聊天请求 - 临时简化版本
+/// 处理聊天请求 - 使用 ACP 协议集成
 async fn handle_chat(
     State(state): State<SharedState>,
     Json(request): Json<ChatRequest>,
@@ -556,15 +578,68 @@ async fn handle_chat(
         request.user_id, request.project_id, request.session_id
     );
 
-    // 临时简化实现
-    let chat_response = ChatResponse {
-        session_id: request.session_id.unwrap_or_else(|| "temp_session".to_string()),
-        response: "临时响应：系统正在维护中".to_string(),
-        status: "success".to_string(),
-        error: None,
-    };
+    // 生成或使用现有的会话ID
+    let session_id = request.session_id.clone()
+        .unwrap_or_else(|| {
+            let new_session_id = Uuid::new_v4().to_string();
+            // 创建新会话
+            let session_info = SessionInfo {
+                session_id: new_session_id.clone(),
+                user_id: request.user_id.clone(),
+                project_id: request.project_id.clone(),
+                agent_type: state.config.default_agent.clone(),
+                created_at: chrono::Utc::now(),
+                last_activity: chrono::Utc::now(),
+            };
+            state.sessions.insert(new_session_id.clone(), session_info);
+            new_session_id
+        });
 
-    HttpResult::success(chat_response)
+    // 更新会话活动时间
+    update_session_activity(&state, &session_id).await;
+
+    // 创建单向通道用于处理 AI 请求
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+
+    // 克隆需要的数据发送到后台任务
+    let agent_type = state.config.default_agent.clone();
+    let request_clone = request.clone();
+    let config_clone = state.config.clone();
+    let state_clone = state.clone();
+    let session_id_clone = session_id.clone();
+
+    // 使用全局 LocalSet 执行任务
+    if let Err(e) = state.local_task_sender.send(LocalTaskRequest {
+        agent_type,
+        request: request_clone,
+        config: config_clone,
+        state: state_clone,
+        session_id: session_id_clone,
+        response_tx: tx,
+    }) {
+        error!("Failed to send task to local executor: {}", e);
+        return HttpResult::<ChatResponse>::error("AI003", "Failed to queue AI task");
+    }
+
+    // 等待后台任务完成
+    match rx.await {
+        Ok(Ok(response)) => {
+            HttpResult::success(ChatResponse {
+                session_id: session_id.clone(),
+                response,
+                status: "success".to_string(),
+                error: None,
+            })
+        }
+        Ok(Err(e)) => {
+            error!("Failed to execute AI command: {}", e);
+            HttpResult::<ChatResponse>::error("AI001", &format!("AI command execution failed: {}", e))
+        }
+        Err(_) => {
+            error!("AI command execution cancelled");
+            HttpResult::<ChatResponse>::error("AI002", "AI command execution cancelled")
+        }
+    }
 }
 
 /// 获取会话信息
@@ -616,8 +691,8 @@ async fn delete_session(
 }
 
 /// 健康检查端点
-async fn health_check() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+async fn health_check() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
         "status": "healthy",
         "timestamp": chrono::Utc::now(),
         "service": "rcoder-ai-service"
@@ -732,7 +807,7 @@ async fn create_new_session(state: &SharedState, request: &ChatRequest) -> Strin
 
     // 如果是 Codex agent，还需要创建 ACP 会话
     if state.config.default_agent == AgentType::Codex {
-        let project_path = if let Some(ref project_id) = request.project_id {
+        let _project_path = if let Some(ref project_id) = request.project_id {
             state.config.projects_dir.join(project_id)
         } else {
             state.config.projects_dir.join("default")
@@ -751,6 +826,25 @@ async fn update_session_activity(state: &SharedState, session_id: &str) {
         session.last_activity = chrono::Utc::now();
     }
 }
+
+/// 启动本地任务执行器
+async fn start_local_task_executor(mut receiver: tokio::sync::mpsc::UnboundedReceiver<LocalTaskRequest>) {
+    while let Some(task_request) = receiver.recv().await {
+        // 在 LocalSet 中处理每个任务
+        let result = execute_ai_command(
+            &task_request.agent_type,
+            &task_request.request,
+            &task_request.config,
+            &task_request.state,
+            &task_request.session_id,
+        ).await.map_err(|e| e.to_string());
+
+        // 发送结果回调用者
+        let _ = task_request.response_tx.send(result);
+    }
+}
+
+
 
 /// 执行 AI 命令
 #[tracing::instrument(skip(request, config, state), fields(agent_type = %agent_type, session_id = %session_id))]
@@ -923,22 +1017,26 @@ async fn main() -> anyhow::Result<()> {
     // 初始化应用状态
     let session_manager = Arc::new(SessionManager::new());
 
-    let state = AppState {
+    // 创建本地任务通道
+    let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
         progress_senders: Arc::new(DashMap::new()),
         session_manager,
         codex_manager: Arc::new(GlobalAgentManager::global()),
-    };
+        local_task_sender,
+    });
 
     // 创建路由
-    let app = create_router(state);
+    let app = create_router(state.clone());
 
     // 启动 HTTP 服务器
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
         .await
         .unwrap();
-    
+
     info!("Server starting on port {}", config.port);
     info!("API endpoints:");
     info!("  POST /chat - Send chat message to AI agent");
@@ -950,18 +1048,31 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET  /progress/:session_id - SSE progress stream for AI tasks (unified stream)");
     info!("  GET  /health - Health check");
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
-    
-    // 创建 LocalSet 来运行本地任务
-    let local = tokio::task::LocalSet::new();
 
-    // 在 LocalSet 中运行服务器
-    local.run_until(async {
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
-        info!("Server shutdown complete");
-        Ok::<(), anyhow::Error>(())
-    }).await?;
+    // 在单独的线程中启动 LocalSet 任务执行器
+    let local_task_handle = std::thread::spawn(move || {
+        let local = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build local runtime");
+
+        local.block_on(async {
+            let local_set = tokio::task::LocalSet::new();
+            local_set.run_until(async {
+                start_local_task_executor(local_task_receiver).await;
+                Ok::<(), anyhow::Error>(())
+            }).await
+        }).expect("Local task executor failed");
+    });
+
+    // 运行 HTTP 服务器（使用多线程）
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
+    info!("Server shutdown complete");
+
+    // 等待本地任务执行器线程结束
+    local_task_handle.join().expect("Local task thread panicked");
 
     Ok(())
 }

@@ -560,8 +560,8 @@ impl GlobalAgentManager {
     fn start_request_dispatcher(&self, mut request_rx: mpsc::UnboundedReceiver<AgentRequest>) {
         let agents = self.agents.clone();
 
-        // 在后台运行请求处理 - 使用 spawn_local 处理非 Send 的 ACP 协议 future
-        tokio::task::spawn_local(async move {
+        // 在后台运行请求处理 - 使用 tokio::spawn
+        tokio::task::spawn(async move {
             while let Some(request) = request_rx.recv().await {
                 let project_id = request.project_id.clone();
                 let prompt = request.prompt.clone();
@@ -620,23 +620,6 @@ impl GlobalAgentManager {
                                         }
                                     }
                                 }
-                            } else if let Some(ref session_id) = service_guard.current_session_id {
-                                if let Some(ref connection) = service_guard.connection {
-                                    if let Some(ref client) = service_guard.client {
-                                        // 子进程模式：使用现有会话发送提示
-                                        match send_prompt_to_client_subprocess(connection, session_id, &prompt, client).await {
-                                            Ok(response) => Ok(response),
-                                            Err(e) => {
-                                                warn!("发送提示失败: {}", e);
-                                                Ok(format!("❌ 处理请求失败: {}", e))
-                                            }
-                                        }
-                                    } else {
-                                        Ok("❌ 客户端未初始化".to_string())
-                                    }
-                                } else {
-                                    Ok("❌ 客户端连接未建立".to_string())
-                                }
                             } else {
                                 Ok("❌ 没有活跃的会话".to_string())
                             }
@@ -660,7 +643,8 @@ impl GlobalAgentManager {
         let timeout_duration = std::time::Duration::from_secs(self.config.project_idle_timeout);
         let cleanup_interval = std::time::Duration::from_secs(self.config.cleanup_interval);
 
-        tokio::task::spawn_local(async move {
+        // 清理任务不需要spawn_local，直接使用tokio::spawn
+        tokio::task::spawn(async move {
             let mut interval_timer = tokio::time::interval(cleanup_interval);
 
             loop {
@@ -786,61 +770,18 @@ impl GlobalAgentManager {
 
         match service_mode {
             ServiceMode::Subprocess => {
-                // 尝试启动 codex agent 子进程
-                match start_codex_agent_subprocess(&project_path, &client).await {
-                    Ok((session_id, connection)) => {
-                        info!("Agent subprocess connection established successfully for project: {}", project_id);
-
-                        // 更新服务的状态
-                        {
-                            let mut service_guard = service.lock().await;
-                            service_guard.is_active = true;
-                            service_guard.client = Some(client);
-                            service_guard.connection = Some(connection);
-                            service_guard.current_session_id = Some(session_id);
-                        }
-
-                        info!("Agent service started successfully for project: {}", project_id);
-                    }
-                    Err(e) => {
-                        warn!("Failed to establish Agent subprocess connection for project {}: {}", project_id, e);
-                        if self.config.prefer_embedded {
-                            info!("Falling back to embedded mode for project: {}", project_id);
-                            // 尝试嵌入式模式
-                            if let Err(embedded_err) = self.start_embedded_agent_service(service.clone(), &client).await {
-                                warn!("Embedded mode also failed for project {}: {}", project_id, embedded_err);
-                                self.set_service_fallback_mode(service.clone(), client).await;
-                            }
-                        } else {
-                            self.set_service_fallback_mode(service.clone(), client).await;
-                        }
-                    }
-                }
+                // 不支持子进程模式
+                warn!("Subprocess mode not implemented for project: {}", project_id);
+                return Err(anyhow::anyhow!("Subprocess mode not implemented"));
             }
             ServiceMode::Embedded => {
-                // 尝试启动嵌入式 agent
-                if let Err(e) = self.start_embedded_agent_service(service.clone(), &client).await {
-                    warn!("Failed to establish Agent embedded connection for project {}: {}", project_id, e);
-                    if self.config.prefer_embedded {
-                        info!("Falling back to subprocess mode for project: {}", project_id);
-                        // 尝试子进程模式
-                        match start_codex_agent_subprocess(&project_path, &client).await {
-                            Ok((session_id, connection)) => {
-                                info!("Agent subprocess fallback connection established successfully for project: {}", project_id);
-                                let mut service_guard = service.lock().await;
-                                service_guard.is_active = true;
-                                service_guard.client = Some(client);
-                                service_guard.connection = Some(connection);
-                                service_guard.current_session_id = Some(session_id);
-                            }
-                            Err(subprocess_err) => {
-                                warn!("Subprocess fallback also failed for project {}: {}", project_id, subprocess_err);
-                                self.set_service_fallback_mode(service.clone(), client).await;
-                            }
-                        }
-                    } else {
-                        self.set_service_fallback_mode(service.clone(), client).await;
-                    }
+                // 尝试启动嵌入式 agent - 使用 LocalSet 来处理非 Send 的 Future
+                let local_set = tokio::task::LocalSet::new();
+                if let Err(e) = local_set.run_until(async move {
+                    self.start_embedded_agent_service(service.clone(), &client).await
+                }).await {
+                    error!("Failed to establish Agent embedded connection for project {}: {}", project_id, e);
+                    return Err(anyhow::anyhow!("Failed to establish Agent embedded connection for project {}: {}", project_id, e));
                 }
             }
         }
@@ -869,8 +810,8 @@ impl GlobalAgentManager {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (response_tx, response_rx) = mpsc::unbounded_channel();
 
-        // 启动 Agent worker 任务
-        let worker_handle = tokio::spawn(async move {
+        // 启动 Agent worker 任务 - 使用 LocalSet 来处理非 Send 的 Future
+        let worker_handle = tokio::task::spawn_local(async move {
             let _ = agent_worker(request_rx, project_path.clone()).await;
         });
 
@@ -888,23 +829,6 @@ impl GlobalAgentManager {
 
         info!("Embedded Agent service started successfully for project: {}", project_id);
         Ok(())
-    }
-
-    /// 设置服务为回退模式
-    async fn set_service_fallback_mode(
-        &self,
-        service: Arc<Mutex<AgentService>>,
-        client: CodexClient,
-    ) {
-        warn!("Service will operate in fallback mode");
-        let mut service_guard = service.lock().await;
-        service_guard.is_active = true;
-        service_guard.client = Some(client);
-        service_guard.connection = None;
-        service_guard.agent_request_tx = None;
-        service_guard.agent_response_rx = None;
-        service_guard.agent_worker_task = None;
-        service_guard.current_session_id = None;
     }
 
     /// 发送请求到指定服务
@@ -938,10 +862,6 @@ impl GlobalAgentManager {
         }
     }
 
-    /// 获取 Session Notification 管理器的引用
-    pub fn notification_manager(&self) -> Arc<SessionNotificationManager> {
-        self.notification_manager.clone()
-    }
 
     /// 发送 Session Notification
     pub async fn send_session_notification(&self, session_id: &str, update: SessionUpdate) -> Result<()> {
@@ -981,131 +901,6 @@ impl Default for GlobalAgentManager {
         Self::new()
     }
 }
-
-/// 启动 codex agent 子进程（向后兼容）
-async fn start_codex_agent_subprocess(
-    project_path: &PathBuf,
-    client: &CodexClient,
-) -> Result<(SessionId, ClientSideConnection)> {
-    info!("启动 codex agent 子进程，工作目录: {:?}", project_path);
-
-    // 创建项目目录
-    if !project_path.exists() {
-        tokio::fs::create_dir_all(project_path).await?;
-    }
-
-    // 启动 codex agent 子进程
-    let mut child = tokio::process::Command::new("cargo")
-        .args(["run", "--bin", "codex-acp-agent", "--", "--stdio"])
-        .current_dir(project_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            error!("Failed to spawn codex agent: {}", e);
-            anyhow::anyhow!("Failed to spawn codex agent: {}", e)
-        })?;
-
-    let stdin = child.stdin.take().unwrap().compat_write();
-    let stdout = child.stdout.take().unwrap().compat();
-
-    // 创建客户端连接
-    let (conn, handle_io) = ClientSideConnection::new(
-        client.clone(),
-        stdin,
-        stdout,
-        |fut| {
-            tokio::task::spawn_local(fut);
-        },
-    );
-
-    // 处理 I/O
-    tokio::task::spawn_local(handle_io);
-
-    // 初始化连接
-    conn.initialize(InitializeRequest {
-        protocol_version: agent_client_protocol::V1,
-        client_capabilities: Default::default(),
-        meta: None,
-    }).await.map_err(|e| {
-        error!("Failed to initialize connection: {}", e);
-        anyhow::anyhow!("Failed to initialize connection: {}", e)
-    })?;
-
-    // 创建新会话
-    let response = conn.new_session(NewSessionRequest {
-        mcp_servers: Vec::new(),
-        cwd: std::env::current_dir()?,
-        meta: None,
-    }).await.map_err(|e| {
-        error!("Failed to create session: {}", e);
-        anyhow::anyhow!("Failed to create session: {}", e)
-    })?;
-
-    info!("Agent 子进程启动成功，会话ID: {:?}", response.session_id);
-
-    Ok((response.session_id, conn))
-}
-
-
-/// 全局便捷函数：发送提示到 Codex
-pub async fn send_prompt_global(project_id: &str, prompt: &str) -> Result<String> {
-    GlobalAgentManager::global().send_prompt(project_id, prompt).await
-}
-
-/// 发送提示到客户端（子进程模式）
-async fn send_prompt_to_client_subprocess(
-    conn: &ClientSideConnection,
-    session_id: &SessionId,
-    prompt: &str,
-    client: &CodexClient,
-) -> Result<String> {
-    info!("发送提示到子进程客户端: {}", prompt);
-
-    // 清空之前的响应
-    {
-        let mut response = client.collected_response.lock().await;
-        response.clear();
-    }
-
-    // 通过连接发送提示
-    conn.prompt(PromptRequest {
-        session_id: session_id.clone(),
-        prompt: vec![prompt.into()],
-        meta: None,
-    }).await.map_err(|e| {
-        error!("Failed to send prompt: {}", e);
-        anyhow::anyhow!("Failed to send prompt: {}", e)
-    })?;
-
-    // 等待响应收集完成
-    let mut attempts = 0;
-    let max_attempts = 30; // 最多等待30秒
-    let response = loop {
-        let current_response = {
-            let response = client.collected_response.lock().await;
-            response.clone()
-        };
-
-        if !current_response.is_empty() {
-            break current_response;
-        }
-
-        attempts += 1;
-        if attempts >= max_attempts {
-            break "⏰ 等待响应超时".to_string();
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    };
-
-    info!("收集到响应: {}", response);
-    Ok(response)
-}
-
-
 
 
 
@@ -1148,34 +943,38 @@ async fn agent_worker(
         config,
     );
 
-    // 创建使用 piper 管道的 AgentSideConnection
-    let (server_conn, server_handle_io) = AgentSideConnection::new(
-        agent,
-        client_to_agent_tx,  // agent 接收来自 client 的数据
-        agent_to_client_rx,  // agent 发送数据给 client
-        |fut| {
-            tokio::task::spawn_local(fut);
-        }
-    );
+    // 使用 LocalSet 来运行 spawn_local 任务
+    let local_set = tokio::task::LocalSet::new();
 
-    // 创建使用 piper 管道的 ClientSideConnection
-    let (client_conn, client_handle_io) = ClientSideConnection::new(
-        EmbeddedClient {},
-        agent_to_client_tx,  // client 接收来自 agent 的数据
-        client_to_agent_rx,  // client 发送数据给 agent
-        |fut| {
-            tokio::task::spawn_local(fut);
-        }
-    );
+    local_set.run_until(async move {
+        // 创建使用 piper 管道的 AgentSideConnection
+        let (_server_conn, server_handle_io) = AgentSideConnection::new(
+            agent,
+            client_to_agent_tx,  // agent 接收来自 client 的数据
+            agent_to_client_rx,  // agent 发送数据给 client
+            move |fut| {
+                tokio::task::spawn_local(fut);
+            }
+        );
 
-    // 启动服务端 IO 处理任务
-    let mut server_io_handle = tokio::task::spawn_local(server_handle_io);
+        // 创建使用 piper 管道的 ClientSideConnection
+        let (client_conn, client_handle_io) = ClientSideConnection::new(
+            EmbeddedClient {},
+            agent_to_client_tx,  // client 接收来自 agent 的数据
+            client_to_agent_rx,  // client 发送数据给 agent
+            move |fut| {
+                tokio::task::spawn_local(fut);
+            }
+        );
 
-    // 启动客户端 IO 处理任务
-    let mut client_io_handle = tokio::task::spawn_local(client_handle_io);
+        // 启动服务端 IO 处理任务
+        let mut server_io_handle = tokio::task::spawn_local(server_handle_io);
 
-    // 启动请求处理任务
-    let mut request_handle = tokio::task::spawn_local(async move {
+        // 启动客户端 IO 处理任务
+        let mut client_io_handle = tokio::task::spawn_local(client_handle_io);
+
+        // 启动请求处理任务
+        let mut request_handle = tokio::task::spawn_local(async move {
         while let Some(request) = request_rx.recv().await {
             match request {
                 AgentMessage::Initialize { request, response_tx } => {
@@ -1246,17 +1045,18 @@ async fn agent_worker(
                 break;
             }
         }
-    }
+        };
 
-    // 等待剩余任务完成
-    let _ = tokio::join!(
-        request_handle,
-        server_io_handle,
-        client_io_handle
-    );
-
-    info!("Agent worker 任务结束");
-    Ok(())
+        // 等待剩余任务完成
+        let _ = tokio::join!(
+            request_handle,
+            server_io_handle,
+            client_io_handle
+        );
+        info!("Agent worker 任务结束");
+        Ok(())
+    }).await
+    
 }
 
 

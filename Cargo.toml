@@ -30,7 +30,14 @@ async-trait = "0.1"
 smol = "2.0"
 
 # HTTP server
-axum = "0.8"
+axum = { version = "0.8", features = [
+    "http2",
+    "query",
+    "tracing",
+    "ws",
+    "multipart",
+    "macros",
+] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
