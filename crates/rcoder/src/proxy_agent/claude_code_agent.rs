@@ -150,6 +150,19 @@ pub async fn start_claude_code_acp_agent_service(
         let result = local_set
             .run_until(async {
                 // 启动子进程
+                // 合并命令自带 env 与当前进程中的必需 ANTHROPIC_* 环境变量
+                let mut merged_envs: std::collections::HashMap<String, String> =
+                    command.env.unwrap_or_default();
+                for key in [
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_MODEL",
+                    "ANTHROPIC_SMALL_FAST_MODEL",
+                ] {
+                    if let Ok(val) = std::env::var(key) {
+                        merged_envs.insert(key.to_string(), val);
+                    }
+                }
                 let mut child = tokio::process::Command::new(&command.path)
                     .args(&command.args)
                     .stdin(Stdio::piped())
@@ -157,7 +170,7 @@ pub async fn start_claude_code_acp_agent_service(
                     .stderr(Stdio::piped())
                     .kill_on_drop(true)
                     .current_dir(&project_path_for_closure)
-                    .envs(command.env.unwrap_or_default())
+                    .envs(merged_envs)
                     .spawn()
                     .context("无法启动 claude-code-acp 子进程")?;
 
