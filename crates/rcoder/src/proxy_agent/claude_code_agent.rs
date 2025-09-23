@@ -22,11 +22,14 @@ pub struct ClaudeCodeAcpClient {
 
 impl ClaudeCodeAcpClient {
     /// 创建新的客户端实例
-    pub fn new() -> Self {
-        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
-        Self {
-            session_notifications: tx,
-        }
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<acp::SessionNotification>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                session_notifications: tx,
+            },
+            rx,
+        )
     }
 }
 
@@ -90,6 +93,28 @@ impl acp::Client for ClaudeCodeAcpClient {
 
     async fn session_notification(&self, args: acp::SessionNotification) -> Result<(), acp::Error> {
         // 转发会话通知到通道
+
+        match args.clone().update {
+            acp::SessionUpdate::AgentMessageChunk { content } => {
+                let text = match content {
+                    acp::ContentBlock::Text(text_content) => text_content.text,
+                    acp::ContentBlock::Image(_) => "<image>".into(),
+                    acp::ContentBlock::Audio(_) => "<audio>".into(),
+                    acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri,
+                    acp::ContentBlock::Resource(_) => "<resource>".into(),
+                };
+                info!("| Agent session_notification : {text}");
+            }
+            acp::SessionUpdate::UserMessageChunk { .. }
+            | acp::SessionUpdate::AgentThoughtChunk { .. }
+            | acp::SessionUpdate::ToolCall(_)
+            | acp::SessionUpdate::ToolCallUpdate(_)
+            | acp::SessionUpdate::Plan(_)
+            | acp::SessionUpdate::CurrentModeUpdate { .. }
+            | acp::SessionUpdate::AvailableCommandsUpdate { .. } => {
+                info!("| Other session_notification: {:?}", args.update);
+            }
+        }
         let _ = self.session_notifications.send(args);
         Ok(())
     }
@@ -224,8 +249,8 @@ pub async fn start_claude_code_acp_agent_service(
                 let outgoing = stdin.compat_write();
                 let incoming = stdout.compat();
 
-                // 创建客户端
-                let client = ClaudeCodeAcpClient::new();
+                // 创建客户端，并获取会话通知接收端
+                let (client, mut session_notif_rx) = ClaudeCodeAcpClient::new();
 
                 // 创建连接
                 let (client_conn, handle_io) =
@@ -235,6 +260,13 @@ pub async fn start_claude_code_acp_agent_service(
 
                 // 启动 I/O 处理任务
                 tokio::task::spawn_local(handle_io);
+
+                // 消费会话通知并输出日志
+                tokio::task::spawn_local(async move {
+                    while let Some(notif) = session_notif_rx.recv().await {
+                        debug!("收到会话通知: {:?}", notif);
+                    }
+                });
 
                 // 初始化连接
                 debug!("初始化 ACP 连接[initialize]");
@@ -305,8 +337,8 @@ pub async fn start_claude_code_acp_agent_service(
                                 req.session_id = session_id_for_prompt.clone();
                             }
                             match client_conn.prompt(req).await {
-                                Ok(_) => {
-                                    debug!("Prompt 发送成功");
+                                Ok(resp) => {
+                                    debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
                                 }
                                 Err(e) => {
                                     error!("发送 Prompt 失败: {:?}", e);
