@@ -46,12 +46,13 @@ struct SessionState {
     token_usage: Option<TokenUsage>,
 }
 
+#[derive(Clone)]
 pub struct CodexAgent {
     session_update_tx: mpsc::UnboundedSender<(SessionNotification, Sender<()>)>,
     next_session_id: Cell<u64>,
     sessions: Rc<RefCell<HashMap<String, SessionState>>>,
     config: Config,
-    conversation_manager: ConversationManager,
+    conversation_manager: Arc<ConversationManager>,
     next_submit_seq: Cell<u64>,
     auth_manager: Arc<std::sync::RwLock<Arc<AuthManager>>>,
     extra_available_commands: Rc<RefCell<Vec<AvailableCommand>>>,
@@ -102,7 +103,7 @@ impl CodexAgent {
             next_session_id: Cell::new(1),
             sessions: Rc::new(RefCell::new(HashMap::new())),
             config,
-            conversation_manager,
+            conversation_manager: Arc::new(conversation_manager),
             next_submit_seq: Cell::new(1),
             auth_manager: Arc::new(std::sync::RwLock::new(auth)),
             extra_available_commands: Rc::new(RefCell::new(Vec::new())),

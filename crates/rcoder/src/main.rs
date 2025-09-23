@@ -11,9 +11,15 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use tower_http::cors::CorsLayer;
-use tracing::{Span, debug, error, info, warn};
+use tracing::{Span, debug, error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+
+mod model;
+mod proxy_agent;
+
+use crate::proxy_agent::*;
+use model::*;
 
 mod codex_agent_client;
 use codex_agent_client::{GlobalAgentManager, SerializedSessionNotification};
@@ -33,17 +39,7 @@ use agent_client_protocol::SessionId as AcpSessionId;
 use futures::stream::Stream;
 // use opentelemetry::trace::TraceContextExt;
 // use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-mod http_result;
-use http_result::HttpResult;
-
 mod middleware;
-
-mod multipart_chat;
-use multipart_chat::{CodeSnippet, handle_multipart_chat};
-
-mod acp_multipart_chat;
-use acp_multipart_chat::handle_acp_multipart_chat;
 
 // ==================== 数据结构定义 ====================
 
@@ -60,39 +56,7 @@ struct ChatRequest {
     session_id: Option<String>,
 }
 
-/// 多媒体聊天请求结构 - 用于处理文件上传
-#[derive(Debug)]
-struct MultipartChatRequest {
-    /// 用户输入的 prompt
-    prompt: String,
-    /// 用户 ID
-    user_id: String,
-    /// 可选的项目 ID
-    project_id: Option<String>,
-    /// 可选的会话 ID
-    session_id: Option<String>,
-    /// 上传的文件列表
-    files: Vec<UploadedFile>,
-    /// 代码片段列表
-    code_snippets: Vec<CodeSnippet>,
-    /// 选中的代码段引用
-    code_references: Vec<ResourceUri>,
-}
 
-/// 上传的文件信息
-#[derive(Debug)]
-struct UploadedFile {
-    /// 原文件名
-    filename: String,
-    /// MIME 类型
-    content_type: String,
-    /// 文件内容
-    content: Vec<u8>,
-    /// 文件大小
-    size: usize,
-    /// 生成的资源URI
-    resource_uri: ResourceUri,
-}
 
 /// 服务响应结构
 #[derive(Debug, Serialize)]
@@ -101,10 +65,6 @@ struct ChatResponse {
     project_id: String,
     /// 会话 ID
     session_id: String,
-    /// AI 响应内容
-    response: String,
-    /// 响应状态
-    status: String,
     /// 可选的错误信息
     error: Option<String>,
 }
@@ -201,7 +161,7 @@ struct AppState {
     /// ACP 代理管理器
     proxy_manager: Arc<ProxyAgentManager>,
     /// 本地任务发送器
-    local_task_sender: tokio::sync::mpsc::UnboundedSender<LocalTaskRequest>,
+    local_task_sender: mpsc::UnboundedSender<LocalSetAgentRequest>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -440,6 +400,13 @@ fn generate_project_id() -> String {
     Uuid::new_v4().to_string().replace("-", "")
 }
 
+/// 获取 project_id 的 workspace_path
+async fn get_project_workspace(project_id: &str) -> Result<PathBuf> {
+    let workspace_dir = PathBuf::from("./project_workspace");
+    let project_dir = workspace_dir.join(project_id);
+    Ok(project_dir)
+}
+
 /// 创建项目工作目录
 async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
     let workspace_dir = PathBuf::from("./project_workspace");
@@ -456,10 +423,12 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
 }
 
 /// 处理聊天请求 - 使用 ACP 协议集成
+#[axum::debug_handler]
+#[instrument(skip(state))]
 async fn handle_chat(
     State(state): State<SharedState>,
     Json(request): Json<ChatRequest>,
-) -> HttpResult<ChatResponse> {
+) -> Result<HttpResult<ChatResponse>, AppError> {
     info!(
         "🚀 [DEBUG] handle_chat 开始处理请求: user_id={}, project_id={:?}, session_id={:?}, prompt={}",
         request.user_id, request.project_id, request.session_id, request.prompt
@@ -474,80 +443,41 @@ async fn handle_chat(
         debug!("🆕 [DEBUG] 生成新的项目ID: {}", new_project_id);
 
         // 创建项目工作目录
-        if let Err(e) = create_project_workspace(&new_project_id).await {
-            error!("❌ [DEBUG] 创建项目工作目录失败: {}", e);
-            return HttpResult::<ChatResponse>::error(
-                "FS001",
-                "Failed to create project workspace",
-            );
-        }
+        create_project_workspace(&new_project_id).await?;
         new_project_id
     };
 
-    // 注意：不再在这里手动创建会话
-    // 会话将由 agent 通过 new_session() 方法创建，sessions 的 key 是 project_id
-    // 如果用户提供了 session_id，直接使用；否则使用 "pending" 作为临时值
-    let session_id = request.session_id.clone();
+    // 获取项目工作目录
+    let project_workspace = get_project_workspace(&project_id).await?;
 
-    // 创建单向通道用于处理 AI 请求
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<LocalTaskResponse, String>>();
-    debug!("📡 [DEBUG] 创建 oneshot 通道成功");
+    let chat_prompt = ChatPrompt {
+        project_id: project_id.clone(),
+        project_path: project_workspace,
+        session_id: request.session_id.clone(),
+        prompt: request.prompt.clone(),
+    };
 
-    // 克隆需要的数据发送到后台任务
-    let agent_type = state.config.default_agent.clone();
-    let config_clone = state.config.clone();
-    let state_clone = state.clone();
+    let (local_task_request, chat_prompt_rx) = LocalSetAgentRequest::new(chat_prompt);
+    state.local_task_sender.send(local_task_request)?;
 
-    // 创建修改后的请求，包含项目ID
-    let mut modified_request = request.clone();
-    modified_request.project_id = Some(project_id.clone());
-
-    debug!(
-        "📤 [DEBUG] 准备发送任务到 LocalSet 执行器: agent_type={:?}",
-        agent_type
-    );
-
-    // 使用全局 LocalSet 执行任务
-    if let Err(e) = state.local_task_sender.send(LocalTaskRequest {
-        agent_type,
-        request: modified_request,
-        config: config_clone,
-        state: state_clone,
-        session_id: session_id,
-        response_tx: tx,
-    }) {
-        error!("❌ [DEBUG] 发送任务到 LocalSet 执行器失败: {}", e);
-        return HttpResult::<ChatResponse>::error("AI003", "Failed to queue AI task");
-    }
-
-    debug!("⏳ [DEBUG] 任务已发送，等待响应...");
-
-    // 等待后台任务提交成功（立即返回，不等待完整执行）
-    match rx.await {
-        Ok(Ok(task_response)) => {
-            debug!("✅ [DEBUG] 收到任务提交成功响应: project_id={}, session_id={}",
-                task_response.project_id, task_response.session_id);
-
+    let result = match chat_prompt_rx.await {
+        Ok(chat_prompt_response) => {
+            info!(
+                "✅ 收到 agent 执行结果: project_id={}, session_id={}",
+                chat_prompt_response.project_id, chat_prompt_response.session_id,
+            );
             HttpResult::success(ChatResponse {
-                project_id: task_response.project_id,
-                session_id: task_response.session_id,
-                response: "任务已提交，正在后台执行中...".to_string(),
-                status: task_response.status,
-                error: task_response.error,
+                project_id: chat_prompt_response.project_id,
+                session_id: chat_prompt_response.session_id,
+                error: None,
             })
         }
-        Ok(Err(e)) => {
-            error!("❌ [DEBUG] 收到错误响应: {}", e);
-            HttpResult::<ChatResponse>::error(
-                "AI001",
-                &format!("AI task submission failed: {}", e),
-            )
+        Err(e) => {
+            error!("❌ 收到 agent 执行结果失败: {}", e);
+            HttpResult::error("LOCAL001", &format!("Local task sender send error: {}", e))
         }
-        Err(_) => {
-            error!("❌ [DEBUG] oneshot 通道被取消或关闭");
-            HttpResult::<ChatResponse>::error("AI002", "AI task submission cancelled")
-        }
-    }
+    };
+    Ok(result)
 }
 
 /// 获取会话信息
@@ -590,92 +520,6 @@ async fn delete_session(
         None => HttpResult::error("SES002", &format!("Session '{}' not found", session_id)),
     }
 }
-
-#[axum::debug_handler]
-/// 处理聊天请求 - 使用 ACP 代理管理器
-async fn handle_chat_proxy(
-    State(state): State<SharedState>,
-    Json(request): Json<ChatRequest>,
-) -> HttpResult<ChatResponse> {
-    info!(
-        "🚀 [PROXY] handle_chat_proxy 开始处理请求: user_id={}, project_id={:?}, session_id={:?}, prompt={}",
-        request.user_id, request.project_id, request.session_id, request.prompt
-    );
-
-    // 确定项目ID
-    let project_id: String = if let Some(ref project_id) = request.project_id {
-        project_id.clone()
-    } else {
-        // 如果没有提供项目ID，生成一个（无中划线）
-        Uuid::new_v4().simple().to_string()
-    };
-
-    // 如果是新生成的项目ID，创建项目工作目录
-    if request.project_id.is_none() {
-        if let Err(e) = create_project_workspace(&project_id).await {
-            error!("❌ [PROXY] 创建项目工作目录失败: {}", e);
-            return HttpResult::<ChatResponse>::error(
-                "FS001",
-                "Failed to create project workspace",
-            );
-        }
-    }
-
-    // 注意：不再在这里提前创建 SessionInfo 和生成 session_id
-    // session_id 将在代理管理器通过 ACP 协议的 new_session() 方法后获取
-    // 我们使用 project_id 作为主要 key 来管理数据
-
-    // 使用代理管理器发送请求并等待 session_id 获取结果
-    let (returned_project_id, actual_session_id) = match state
-        .proxy_manager
-        .send_prompt(&project_id, request.session_id.as_deref(), &request.prompt)
-        .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            error!("❌ [PROXY] 代理管理器请求失败: {}", e);
-            return HttpResult::error("PROXY004", &format!("Proxy manager request failed: {}", e));
-        }
-    };
-
-    info!(
-        "✅ [PROXY] 获取到 session_id: {} for project: {}",
-        actual_session_id, returned_project_id
-    );
-
-    // 创建 SessionInfo 结构体
-    let session_info = SessionInfo {
-        session_id: actual_session_id.clone(),
-        user_id: request.user_id.clone(),
-        project_id: Some(project_id.clone()),
-        agent_type: AgentType::Proxy,
-        created_at: chrono::Utc::now(),
-        last_activity: chrono::Utc::now(),
-    };
-
-    // 保存 SessionInfo
-    state
-        .sessions
-        .insert(actual_session_id.clone(), session_info);
-
-    debug!(
-        "🆕 [PROXY] 创建了新的 SessionInfo: session_id={}, project_id={}",
-        actual_session_id, project_id
-    );
-
-    // 返回成功响应，包含实际的 session_id
-    HttpResult::success(ChatResponse {
-        project_id: returned_project_id.clone(),
-        session_id: actual_session_id.clone(),
-        response: format!(
-            "Session created successfully. Project ID: {}, Session ID: {}",
-            returned_project_id, actual_session_id
-        ),
-        status: "session_created".to_string(),
-        error: None,
-    })
-}
-
 /// 健康检查端点
 async fn health_check() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
@@ -817,7 +661,10 @@ async fn update_session_activity_by_project(state: &SharedState, project_id: &st
         if let Some(session_project_id) = &session.project_id {
             if session_project_id == project_id {
                 session.last_activity = chrono::Utc::now();
-                debug!("🔄 [DEBUG] 更新项目 {} 的会话活动时间: {}", project_id, session.session_id);
+                debug!(
+                    "🔄 [DEBUG] 更新项目 {} 的会话活动时间: {}",
+                    project_id, session.session_id
+                );
             }
         }
     }
@@ -856,51 +703,45 @@ async fn start_local_task_executor(
             task_request.request.prompt
         );
 
-        // 立即返回任务提交成功响应，包含关键字段
-        let immediate_response = LocalTaskResponse {
-            project_id: task_request.request.project_id.clone().unwrap_or_else(|| "unknown".to_string()),
-            session_id: task_request.session_id.clone().unwrap_or_else(|| "pending".to_string()),
-            status: "submitted".to_string(),
-            error: None,
-        };
-
-        debug!("📤 [DEBUG] 发送立即响应: project_id={}, session_id={}",
-            immediate_response.project_id, immediate_response.session_id);
-
-        // 发送立即响应回调用者
-        match task_request.response_tx.send(Ok(immediate_response)) {
-            Ok(_) => {
-                debug!("✅ [DEBUG] 立即响应成功发送回调用者");
-            }
-            Err(e) => {
-                error!("❌ [DEBUG] 发送立即响应失败: {:?}", e);
-                continue;
-            }
-        }
-
         // 在后台异步执行实际的 AI 命令
         let agent_type = task_request.agent_type.clone();
         let request = task_request.request.clone();
         let config = task_request.config.clone();
         let state = task_request.state.clone();
         let session_id = task_request.session_id.clone();
+        let response_tx = task_request.response_tx;
 
-        // 在 LocalSet 中异步执行 AI 任务，不阻塞主循环
+        debug!("⚙️ [DEBUG] 开始执行 AI 命令...");
+
+        // 在 LocalSet 中异步执行 AI 任务
         // 注意：这里使用 tokio::task::spawn_local 来支持非 Send 的 LocalSet
-        if let Err(e) = tokio::task::spawn_local(async move {
-            debug!("⚙️ [DEBUG] 后台开始执行 AI 命令...");
-            if let Err(e) = execute_ai_command_background(
+        let result = tokio::task::spawn_local(async move {
+            let result = execute_ai_command_background(
                 &agent_type,
                 &request,
                 &config,
                 &state,
                 session_id.as_deref(),
-            ).await {
-                error!("❌ [DEBUG] 后台 AI 命令执行失败: {}", e);
+            )
+            .await;
+
+            match result {
+                Ok(task_response) => {
+                    debug!("✅ [DEBUG] AI 命令执行成功，发送结果");
+                    let _ = response_tx.send(Ok(task_response));
+                }
+                Err(e) => {
+                    error!("❌ [DEBUG] AI 命令执行失败: {}", e);
+                    let _ = response_tx.send(Err(e.to_string()));
+                }
             }
-            debug!("🔄 [DEBUG] 后台 AI 命令执行完成");
-        }).await {
+        })
+        .await;
+
+        if let Err(e) = result {
             error!("❌ [DEBUG] 启动后台任务失败: {}", e);
+            // 如果启动失败，我们无法通过 response_tx 发送错误，因为它已经被移动了
+            // 这种情况下，我们只能记录错误，调用者会得到超时
         }
 
         debug!("🔄 [DEBUG] 任务已提交到后台执行，等待下一个任务...");
@@ -1049,7 +890,7 @@ async fn execute_ai_command(
     }
 }
 
-/// 后台执行 AI 命令（不返回结果，只执行）
+/// 后台执行 AI 命令并返回结果
 #[tracing::instrument(skip(request, config, state), fields(agent_type = %agent_type, session_id = ?session_id))]
 async fn execute_ai_command_background(
     agent_type: &AgentType,
@@ -1057,7 +898,7 @@ async fn execute_ai_command_background(
     config: &AppConfig,
     state: &SharedState,
     session_id: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<LocalTaskResponse> {
     debug!(
         "🤖 [DEBUG] execute_ai_command_background 开始执行: agent_type={:?}, session_id={:?}",
         agent_type, session_id
@@ -1091,12 +932,17 @@ async fn execute_ai_command_background(
                 .codex_manager
                 .send_prompt(project_id, &request.prompt)
                 .await?;
-            debug!(
-                "✅ [DEBUG] codex_manager.send_prompt 后台执行完成"
-            );
+            debug!("✅ [DEBUG] codex_manager.send_prompt 后台执行完成");
 
             info!("Codex MPMC background request completed successfully");
-            Ok(())
+
+            // 返回成功响应，包含真实的 session_id
+            Ok(LocalTaskResponse {
+                project_id: project_id.to_string(),
+                session_id: session_id.unwrap_or("pending").to_string(),
+                status: "completed".to_string(),
+                error: None,
+            })
         }
         AgentType::Claude => {
             debug!("🤖 [DEBUG] 选择 Claude agent，使用 shell 命令");
@@ -1115,23 +961,44 @@ async fn execute_ai_command_background(
             cmd.arg(&request.prompt);
 
             debug!("📤 [DEBUG] 执行 Claude 命令: claude {:?}", request.prompt);
-            info!("Executing Claude command (background): claude {:?}", request.prompt);
+            info!(
+                "Executing Claude command (background): claude {:?}",
+                request.prompt
+            );
 
             // 执行命令并获取输出
             debug!("⏳ [DEBUG] 等待 Claude 命令执行完成...");
             let output = cmd.output().await?;
 
             if output.status.success() {
-                debug!(
-                    "✅ [DEBUG] Claude 命令后台执行成功"
-                );
+                debug!("✅ [DEBUG] Claude 命令后台执行成功");
                 info!("Claude background command completed successfully");
-                Ok(())
+
+                // 返回成功响应，Claude 没有 session_id 概念
+                Ok(LocalTaskResponse {
+                    project_id: request
+                        .project_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    session_id: session_id.unwrap_or("claude_session").to_string(),
+                    status: "completed".to_string(),
+                    error: None,
+                })
             } else {
                 let error = String::from_utf8_lossy(&output.stderr).to_string();
                 error!("❌ [DEBUG] Claude 命令后台执行失败: {}", error);
                 error!("Claude background command failed: {}", error);
-                Err(anyhow::anyhow!("Claude background command failed: {}", error))
+
+                // 返回错误响应
+                Ok(LocalTaskResponse {
+                    project_id: request
+                        .project_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    session_id: session_id.unwrap_or("claude_session").to_string(),
+                    status: "failed".to_string(),
+                    error: Some(error),
+                })
             }
         }
         AgentType::Proxy => {
@@ -1155,9 +1022,7 @@ async fn execute_ai_command_background(
                 .proxy_manager
                 .send_prompt(project_id, request.session_id.as_deref(), &request.prompt)
                 .await?;
-            debug!(
-                "✅ [DEBUG] proxy_manager.send_prompt 后台执行完成"
-            );
+            debug!("✅ [DEBUG] proxy_manager.send_prompt 后台执行完成");
 
             // 如果成功获取到了实际的 session_id，创建 SessionInfo
             if !actual_session_id.is_empty() {
@@ -1169,17 +1034,29 @@ async fn execute_ai_command_background(
                     created_at: chrono::Utc::now(),
                     last_activity: chrono::Utc::now(),
                 };
-                state
-                    .sessions
-                    .insert(project_id.to_string(), session_info);
+                state.sessions.insert(project_id.to_string(), session_info);
                 debug!(
                     "🆕 [DEBUG] 创建了新的 SessionInfo: session_id={}, project_id={:?}",
-                    project_id, request.project_id
+                    actual_session_id, request.project_id
                 );
             }
 
             info!("ACP Proxy background request completed successfully");
-            Ok(())
+
+            // 返回成功响应，包含真实的 session_id
+            Ok(LocalTaskResponse {
+                project_id: request
+                    .project_id
+                    .clone()
+                    .unwrap_or_else(|| project_id.to_string()),
+                session_id: if actual_session_id.is_empty() {
+                    session_id.unwrap_or("pending").to_string()
+                } else {
+                    actual_session_id
+                },
+                status: "completed".to_string(),
+                error: None,
+            })
         }
     }
 }
@@ -1217,9 +1094,6 @@ fn create_router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/chat", post(handle_chat))
-        .route("/chat/proxy", post(handle_chat_proxy))
-        .route("/chat/multipart", post(handle_multipart_chat))
-        .route("/chat/acp-multipart", post(handle_acp_multipart_chat))
         .route(
             "/sessions/{session_id}",
             get(get_session).delete(delete_session),
@@ -1265,6 +1139,18 @@ async fn main() -> anyhow::Result<()> {
         max_concurrent_agents: 10,
     };
 
+    // // 创建项目与 Agent 服务池
+    // PROJECT_AND_AGENT_INFO_MAP.get_or_init(|| DashMap::new());
+
+    let local_set = tokio::task::LocalSet::new();
+    local_set
+        .run_until(async move {
+            tokio::task::spawn_local(async move {
+                let _ = proxy_agent::agent_worker(local_task_receiver).await;
+            });
+        })
+        .await;
+
     // 创建代理管理器并获取请求接收器
     let (proxy_manager, proxy_request_rx) = ProxyAgentManager::new(proxy_config).await?;
 
@@ -1302,57 +1188,14 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET  /health - Health check");
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
-    // 在单独的线程中启动 LocalSet 任务执行器
-    let proxy_manager_for_local = state.proxy_manager.clone();
-    let local_task_handle = std::thread::spawn(move || {
-        let local = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build local runtime");
-
-        local.block_on(async {
-            let local_set = tokio::task::LocalSet::new();
-            local_set.run_until(async {
-                // 并发运行代理管理器的消息分发器和本地任务执行器
-                let proxy_dispatcher = start_proxy_manager_dispatcher(proxy_request_rx, proxy_manager_for_local);
-                let task_executor = start_local_task_executor(local_task_receiver);
-
-                tokio::select! {
-                    result = proxy_dispatcher => {
-                        if let Err(e) = result {
-                            error!("Proxy manager dispatcher failed: {}", e);
-                        }
-                        info!("Proxy manager dispatcher ended, waiting for task executor...");
-                    }
-                    _ = task_executor => {
-                        info!("Local task executor ended, waiting for proxy dispatcher...");
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            }).await
-        }).expect("Local task executor failed");
-    });
-
-    // 运行 HTTP 服务器（在 LocalSet 中运行以支持 spawn_local）
-    let local_set = tokio::task::LocalSet::new();
-    local_set
-        .run_until(async {
-            axum::serve(listener, app)
-                .await
-                .map_err(|e| anyhow::anyhow!("Server error: {}", e))
-        })
-        .await?;
-    info!("Server shutdown complete");
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow::anyhow!("Server error: {}", e));
 
     // 关闭代理管理器
     if let Err(e) = state.proxy_manager.shutdown().await {
         error!("Failed to shutdown proxy manager: {}", e);
     }
-
-    // 等待本地任务执行器线程结束
-    local_task_handle
-        .join()
-        .expect("Local task thread panicked");
 
     Ok(())
 }
