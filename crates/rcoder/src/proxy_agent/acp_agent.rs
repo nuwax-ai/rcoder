@@ -12,7 +12,7 @@ use agent_client_protocol::{
 };
 
 use codex_acp_agent::CodexAgent;
-use codex_core::config::Config;
+use codex_core::config::{Config, ConfigToml, find_codex_home, load_config_as_toml};
 use dashmap::DashMap;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -181,8 +181,30 @@ pub async fn start_acp_agent_service(
     let (client_tx, _client_rx) = mpsc::unbounded_channel();
 
     // 加载配置
+    // 首先获取codex home目录 (~/.codex)
+    let codex_home = find_codex_home().map_err(|e| {
+        error!("Failed to find codex home directory: {}", e);
+        anyhow::anyhow!("Failed to find codex home directory: {}", e)
+    })?;
+    
+    info!("Codex home directory: {:?}", codex_home);
+
+    // 从 ~/.codex/config.toml 加载配置
+    let config_toml_value = load_config_as_toml(&codex_home).map_err(|e| {
+        error!("Failed to load config.toml from {:?}: {}", codex_home, e);
+        anyhow::anyhow!("Failed to load config.toml from {:?}: {}", codex_home, e)
+    })?;
+
+    // 将TOML值转换为ConfigToml结构体
+    let cfg: ConfigToml = config_toml_value.try_into().map_err(|e| {
+        error!("Failed to deserialize config.toml: {}", e);
+        anyhow::anyhow!("Failed to deserialize config.toml: {}", e)
+    })?;
+    
+    info!("Loaded codex config: {:?}", cfg);
+
     let config = Config::load_from_base_config_with_overrides(
-        Default::default(),
+        cfg,
         codex_core::config::ConfigOverrides::default(),
         project_path.clone(),
     )
@@ -190,6 +212,7 @@ pub async fn start_acp_agent_service(
         error!("Failed to load config: {}", e);
         anyhow::anyhow!("Failed to load config: {}", e)
     })?;
+
 
     // 创建 Agent
     let agent = CodexAgent::with_config(session_update_tx.clone(), client_tx.clone(), config);
