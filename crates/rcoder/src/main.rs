@@ -56,8 +56,6 @@ struct ChatRequest {
     session_id: Option<String>,
 }
 
-
-
 /// 服务响应结构
 #[derive(Debug, Serialize)]
 struct ChatResponse {
@@ -1142,14 +1140,24 @@ async fn main() -> anyhow::Result<()> {
     // // 创建项目与 Agent 服务池
     // PROJECT_AND_AGENT_INFO_MAP.get_or_init(|| DashMap::new());
 
-    let local_set = tokio::task::LocalSet::new();
-    local_set
-        .run_until(async move {
-            tokio::task::spawn_local(async move {
-                let _ = proxy_agent::agent_worker(local_task_receiver).await;
-            });
-        })
-        .await;
+    // 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build single-thread runtime for LocalSet agents");
+        rt.block_on(async move {
+            let local_set = tokio::task::LocalSet::new();
+            local_set
+                .run_until(async move {
+                    if let Err(e) = proxy_agent::agent_worker(local_task_receiver).await {
+                        error!("Failed to run agent worker: {}", e);
+                    }
+                    warn!("Agent worker stopped");
+                })
+                .await;
+        });
+    });
 
     // 创建代理管理器并获取请求接收器
     let (proxy_manager, proxy_request_rx) = ProxyAgentManager::new(proxy_config).await?;

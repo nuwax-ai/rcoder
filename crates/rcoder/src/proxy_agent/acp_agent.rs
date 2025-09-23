@@ -1,4 +1,7 @@
-use std::sync::LazyLock;
+use std::{
+    path::{Component, PathBuf},
+    sync::LazyLock,
+};
 
 use agent_client_protocol::{
     self as acp, Agent, AgentSideConnection, ClientCapabilities, ClientSideConnection,
@@ -55,16 +58,35 @@ pub async fn agent_worker(
     mut request_rx: mpsc::UnboundedReceiver<LocalSetAgentRequest>,
 ) -> Result<()> {
     while let Some(request) = request_rx.recv().await {
-        let chat_prompt = request.chat_prompt.clone();
+        let mut chat_prompt = request.chat_prompt.clone();
 
-        let project_path = request.chat_prompt.project_path;
+        let original_path = chat_prompt.project_path;
+        // 规范化路径：
+        // - 如果是相对路径，先与当前目录拼接
+        // - 去除路径中的 "./"（CurDir 组件），不依赖文件系统
+        let joined_path = if original_path.is_absolute() {
+            original_path
+        } else {
+            std::env::current_dir().unwrap().join(original_path)
+        };
+        let project_path: PathBuf = joined_path
+            .components()
+            .filter(|c| !matches!(c, Component::CurDir))
+            .collect();
+        // 将规范化后的路径写回，确保后续使用统一
+        chat_prompt.project_path = project_path.clone();
 
         // 创建项目目录
         if !project_path.exists() {
-            return Err(anyhow::anyhow!(
+            info!(
                 "Project path does not exist,project_id={}",
                 request.chat_prompt.project_id
-            ));
+            );
+            //自动创建目录
+            if let Err(e) = tokio::fs::create_dir_all(&project_path).await {
+                error!("Failed to create project directory: {:?}", e);
+                continue;
+            }
         }
 
         // 检查 project_id 有对应的agent 服务,没有则创建
@@ -72,29 +94,36 @@ pub async fn agent_worker(
         let project_and_agent_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
         if project_and_agent_info.is_none() {
             //创建 agent 服务
-            let (session_id, prompt_tx) = start_acp_agent_service(chat_prompt.clone()).await?;
-            let project_and_agent_info = ProjectAndAgentInfo {
-                project_id: project_id.clone(),
-                session_id: session_id.clone(),
-                prompt_tx: prompt_tx.clone(),
-            };
-            PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info.clone());
+            match start_acp_agent_service(chat_prompt.clone()).await {
+                Ok((session_id, prompt_tx)) => {
+                    let project_and_agent_info = ProjectAndAgentInfo {
+                        project_id: project_id.clone(),
+                        session_id: session_id.clone(),
+                        prompt_tx: prompt_tx.clone(),
+                    };
+                    PROJECT_AND_AGENT_INFO_MAP
+                        .insert(project_id.clone(), project_and_agent_info.clone());
 
-            if let Ok(prompt_request) =
-                build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await
-            {
-                if let Err(e) = prompt_tx.send(prompt_request) {
-                    error!("Failed to send prompt request: {:?}", e);
-                    //TODO  后续优化,如何处理异常,这里暂时不处理
+                    if let Ok(prompt_request) =
+                        build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await
+                    {
+                        if let Err(e) = prompt_tx.send(prompt_request) {
+                            error!("Failed to send prompt request: {:?}", e);
+                            //TODO  后续优化,如何处理异常,这里暂时不处理
+                        }
+                    }
+
+                    // 发送回执消息
+                    if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
+                        project_id: project_id.clone(),
+                        session_id: session_id.to_string(),
+                    }) {
+                        error!("Failed to send chat prompt response: {:?}", e);
+                    }
                 }
-            }
-
-            // 发送回执消息
-            if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
-                project_id: project_id.clone(),
-                session_id: session_id.to_string(),
-            }) {
-                error!("Failed to send chat prompt response: {:?}", e);
+                Err(e) => {
+                    error!("Failed to start ACP agent service: {}", e);
+                }
             }
         } else {
             // 发送 prompt 请求
@@ -119,6 +148,7 @@ pub async fn agent_worker(
         }
     }
 
+    info!("Agent worker finished");
     Ok(())
 }
 
