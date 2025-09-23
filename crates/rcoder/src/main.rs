@@ -19,6 +19,12 @@ use uuid::Uuid;
 mod codex_agent_client;
 use codex_agent_client::{GlobalAgentManager, SerializedSessionNotification};
 
+mod proxy_agent_manager;
+use proxy_agent_manager::{ProxyAgentManager, ProxyConfig, ProxyRequest, ProxyResult};
+
+mod progress_events;
+use progress_events::{ProgressEvent, ProgressEventType, ProgressEventSubType, SessionMessageManager};
+
 use opentelemetry::trace::TraceContextExt;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use futures::stream::Stream;
@@ -118,6 +124,7 @@ struct SessionInfo {
 enum AgentType {
     Codex,
     Claude,
+    Proxy,
 }
 
 impl std::fmt::Display for AgentType {
@@ -125,119 +132,14 @@ impl std::fmt::Display for AgentType {
         match self {
             AgentType::Codex => write!(f, "codex"),
             AgentType::Claude => write!(f, "claude"),
+            AgentType::Proxy => write!(f, "proxy"),
         }
     }
 }
 
-/// AI 任务进度事件
-#[derive(Debug, Clone, Serialize)]
-pub struct ProgressEvent {
-    /// 事件类型
-    pub event_type: ProgressEventType,
-    /// 事件消息
-    pub message: String,
-    /// 时间戳
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// 会话ID
-    pub session_id: String,
-    /// 可选的数据
-    pub data: Option<serde_json::Value>,
-}
 
-/// 进度事件子类型
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProgressEventSubType {
-    UserMessageChunk,
-    AgentMessageChunk,
-    AgentThoughtChunk,
-    ToolCall,
-    ToolCallUpdate,
-    PlanUpdate,
-    AvailableCommandsUpdate,
-    CurrentModeUpdate,
-    PromptCompleted,
-    Error,
-    FullUpdate,
-    EntryStatusUpdate,
-    EntryAdded,
-    EntryRemoved,
-    StatsUpdate,
-}
 
-impl std::fmt::Display for ProgressEventSubType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProgressEventSubType::UserMessageChunk => write!(f, "user_message_chunk"),
-            ProgressEventSubType::AgentMessageChunk => write!(f, "agent_message_chunk"),
-            ProgressEventSubType::AgentThoughtChunk => write!(f, "agent_thought_chunk"),
-            ProgressEventSubType::ToolCall => write!(f, "tool_call"),
-            ProgressEventSubType::ToolCallUpdate => write!(f, "tool_call_update"),
-            ProgressEventSubType::PlanUpdate => write!(f, "plan_update"),
-            ProgressEventSubType::AvailableCommandsUpdate => write!(f, "available_commands_update"),
-            ProgressEventSubType::CurrentModeUpdate => write!(f, "current_mode_update"),
-            ProgressEventSubType::PromptCompleted => write!(f, "prompt_completed"),
-            ProgressEventSubType::Error => write!(f, "error"),
-            ProgressEventSubType::FullUpdate => write!(f, "full_update"),
-            ProgressEventSubType::EntryStatusUpdate => write!(f, "entry_status_update"),
-            ProgressEventSubType::EntryAdded => write!(f, "entry_added"),
-            ProgressEventSubType::EntryRemoved => write!(f, "entry_removed"),
-            ProgressEventSubType::StatsUpdate => write!(f, "stats_update"),
-        }
-    }
-}
 
-/// 进度事件类型
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProgressEventType {
-    /// 任务开始
-    TaskStarted,
-    /// 执行中
-    Executing,
-    /// 命令输出
-    CommandOutput,
-    /// 任务完成
-    TaskCompleted,
-    /// 任务失败
-    TaskFailed,
-    /// 连接保持活跃
-    KeepAlive,
-    /// Plan相关事件
-    PlanUpdate,
-    /// Plan条目状态更新
-    PlanEntryUpdate,
-    /// Plan统计信息更新
-    PlanStatsUpdate,
-    /// 可用命令更新
-    AvailableCommandsUpdate,
-    /// 当前模式更新
-    CurrentModeUpdate,
-    /// 工具调用
-    ToolCall,
-    /// 工具调用更新
-    ToolCallUpdate,
-}
-
-impl std::fmt::Display for ProgressEventType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProgressEventType::TaskStarted => write!(f, "task_started"),
-            ProgressEventType::Executing => write!(f, "executing"),
-            ProgressEventType::CommandOutput => write!(f, "command_output"),
-            ProgressEventType::TaskCompleted => write!(f, "task_completed"),
-            ProgressEventType::TaskFailed => write!(f, "task_failed"),
-            ProgressEventType::KeepAlive => write!(f, "keep_alive"),
-            ProgressEventType::PlanUpdate => write!(f, "plan_update"),
-            ProgressEventType::PlanEntryUpdate => write!(f, "plan_entry_update"),
-            ProgressEventType::PlanStatsUpdate => write!(f, "plan_stats_update"),
-            ProgressEventType::AvailableCommandsUpdate => write!(f, "available_commands_update"),
-            ProgressEventType::CurrentModeUpdate => write!(f, "current_mode_update"),
-            ProgressEventType::ToolCall => write!(f, "tool_call"),
-            ProgressEventType::ToolCallUpdate => write!(f, "tool_call_update"),
-        }
-    }
-}
 
 /// 应用配置
 #[derive(Debug, Clone)]
@@ -280,10 +182,14 @@ struct AppState {
     config: AppConfig,
     /// 进度事件广播通道（session_id -> 发送者列表）
     progress_senders: Arc<DashMap<String, Vec<mpsc::UnboundedSender<ProgressEvent>>>>,
+    /// Session 消息管理器 - 为每个 session_id 维护循环数组缓存
+    message_manager: Arc<SessionMessageManager>,
     /// ACP会话管理器
     session_manager: Arc<SessionManager>,
     /// 全局 Codex 管理器（MPMC 架构）- 使用全局单例
     codex_manager: Arc<GlobalAgentManager>,
+    /// ACP 代理管理器
+    proxy_manager: Arc<ProxyAgentManager>,
     /// 本地任务发送器
     local_task_sender: tokio::sync::mpsc::UnboundedSender<LocalTaskRequest>,
 }
@@ -294,8 +200,10 @@ impl std::fmt::Debug for AppState {
             .field("sessions", &self.sessions)
             .field("config", &self.config)
             .field("progress_senders", &self.progress_senders)
+            .field("message_manager", &"SessionMessageManager")
             .field("session_manager", &"SessionManager")
             .field("codex_manager", &"GlobalAgentManager")
+            .field("proxy_manager", &"ProxyAgentManager")
             .field("local_task_sender", &"UnboundedSender<LocalTaskRequest>")
             .finish()
     }
@@ -317,240 +225,195 @@ fn get_trace_id() -> Option<String> {
 
 /// 将StreamUpdate转换为ProgressEvent
 fn stream_update_to_progress_event(stream_update: StreamUpdate) -> ProgressEvent {
-    let (event_type, message, session_id, data) = match stream_update {
+    let (event_type, sub_type, session_id, content) = match stream_update {
         StreamUpdate::UserMessageChunk { session_id, content } => {
             (
                 ProgressEventType::TaskStarted,
-                "用户消息已接收".to_string(),
+                ProgressEventSubType::UserMessageChunk,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::UserMessageChunk.to_string(),
-                    "content": content
-                }))
+                content
             )
         }
         StreamUpdate::AgentMessageChunk { session_id, content } => {
             (
                 ProgressEventType::Executing,
-                "AI正在生成回复".to_string(),
+                ProgressEventSubType::AgentMessageChunk,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::AgentMessageChunk.to_string(),
-                    "content": content
-                }))
+                content
             )
         }
         StreamUpdate::AgentThoughtChunk { session_id, content } => {
             (
                 ProgressEventType::Executing,
-                "AI正在思考".to_string(),
+                ProgressEventSubType::AgentThoughtChunk,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::AgentThoughtChunk.to_string(),
-                    "content": content
-                }))
+                content
             )
         }
         StreamUpdate::ToolCall { session_id, tool_call } => {
             (
-                ProgressEventType::Executing,
-                format!("正在执行工具调用: {}", tool_call.title),
+                ProgressEventType::ToolCall,
+                ProgressEventSubType::ToolCall,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::ToolCall.to_string(),
-                    "tool_call": tool_call
-                }))
+                format!("正在执行工具调用: {}", tool_call.title)
             )
         }
         StreamUpdate::ToolCallUpdate { session_id, tool_call_update } => {
             (
-                ProgressEventType::Executing,
-                format!("工具调用更新: {}", tool_call_update.title),
+                ProgressEventType::ToolCallUpdate,
+                ProgressEventSubType::ToolCallUpdate,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::ToolCallUpdate.to_string(),
-                    "tool_call_update": tool_call_update
-                }))
+                format!("工具调用更新: {}", tool_call_update.title)
             )
         }
         StreamUpdate::Plan { session_id, plan } => {
             (
                 ProgressEventType::PlanUpdate,
-                "Plan已更新".to_string(),
+                ProgressEventSubType::PlanUpdate,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::PlanUpdate.to_string(),
-                    "plan": plan
-                }))
+                "Plan已更新".to_string()
             )
         }
         StreamUpdate::AvailableCommandsUpdate { session_id, available_commands } => {
             (
                 ProgressEventType::AvailableCommandsUpdate,
-                format!("可用命令已更新，共{}个命令", available_commands.len()),
+                ProgressEventSubType::AvailableCommandsUpdate,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::AvailableCommandsUpdate.to_string(),
-                    "commands": available_commands
-                }))
+                format!("可用命令已更新，共{}个命令", available_commands.len())
             )
         }
         StreamUpdate::CurrentModeUpdate { session_id, current_mode_id } => {
             (
                 ProgressEventType::CurrentModeUpdate,
-                format!("当前模式已更新为: {}", current_mode_id.0),
+                ProgressEventSubType::CurrentModeUpdate,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::CurrentModeUpdate.to_string(),
-                    "mode_id": current_mode_id.0
-                }))
+                format!("当前模式已更新为: {}", current_mode_id.0)
             )
         }
         StreamUpdate::PromptCompleted { session_id, stop_reason } => {
             (
                 ProgressEventType::TaskCompleted,
-                format!("任务完成: {:?}", stop_reason),
+                ProgressEventSubType::PromptCompleted,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::PromptCompleted.to_string(),
-                    "stop_reason": stop_reason
-                }))
+                format!("任务完成: {:?}", stop_reason)
             )
         }
         StreamUpdate::Error { session_id, error } => {
             (
                 ProgressEventType::TaskFailed,
-                format!("任务失败: {}", error),
+                ProgressEventSubType::Error,
                 session_id.0.to_string(),
-                Some(serde_json::json!({
-                    "type": ProgressEventSubType::Error.to_string(),
-                    "error": error
-                }))
+                format!("任务失败: {}", error)
             )
         }
         _ => {
             // 对于其他不常用的事件类型，返回通用的任务执行事件
             (
                 ProgressEventType::Executing,
-                "任务执行中".to_string(),
+                ProgressEventSubType::Unknown,
                 "unknown".to_string(),
-                None
+                "任务执行中".to_string()
             )
         }
     };
-    
-    ProgressEvent {
-        event_type,
-        message,
-        timestamp: chrono::Utc::now(),
-        session_id,
-        data,
-    }
+
+    ProgressEvent::new(session_id, event_type, sub_type, content)
 }
 
 /// 将SessionNotification转换为ProgressEvent
 fn session_notification_to_progress_event(notification: SerializedSessionNotification) -> ProgressEvent {
-
-    let (event_type, message, data) = match notification.update_type.as_str() {
+    let (event_type, sub_type, content) = match notification.update_type.as_str() {
         "AgentMessageChunk" => {
             (
                 ProgressEventType::Executing,
-                "Agent响应片段".to_string(),
-                notification.content.map(|content| serde_json::json!({
-                    "type": "AgentMessageChunk",
-                    "content": content
-                }))
+                ProgressEventSubType::AgentMessageChunk,
+                notification.content.unwrap_or_else(|| "Agent响应片段".to_string())
             )
         }
         "UserMessageChunk" => {
             (
                 ProgressEventType::Executing,
-                "用户消息片段".to_string(),
-                notification.content.map(|content| serde_json::json!({
-                    "type": "UserMessageChunk",
-                    "content": content
-                }))
+                ProgressEventSubType::UserMessageChunk,
+                notification.content.unwrap_or_else(|| "用户消息片段".to_string())
             )
         }
         "AgentThoughtChunk" => {
             (
                 ProgressEventType::Executing,
-                "Agent思考片段".to_string(),
-                notification.content.map(|content| serde_json::json!({
-                    "type": "AgentThoughtChunk",
-                    "content": content
-                }))
+                ProgressEventSubType::AgentThoughtChunk,
+                notification.content.unwrap_or_else(|| "Agent思考片段".to_string())
             )
         }
         "ToolCall" => {
             (
                 ProgressEventType::ToolCall,
-                "工具调用".to_string(),
-                notification.raw_data.or_else(|| Some(serde_json::json!({
-                    "type": "ToolCall"
-                })))
+                ProgressEventSubType::ToolCall,
+                "工具调用".to_string()
             )
         }
         "ToolCallUpdate" => {
             (
                 ProgressEventType::ToolCallUpdate,
-                "工具调用更新".to_string(),
-                notification.raw_data.or_else(|| Some(serde_json::json!({
-                    "type": "ToolCallUpdate"
-                })))
+                ProgressEventSubType::ToolCallUpdate,
+                "工具调用更新".to_string()
             )
         }
         "Plan" => {
             (
                 ProgressEventType::PlanUpdate,
-                "计划更新".to_string(),
-                notification.raw_data
+                ProgressEventSubType::PlanUpdate,
+                "计划更新".to_string()
             )
         }
         "AvailableCommandsUpdate" => {
             (
                 ProgressEventType::AvailableCommandsUpdate,
-                "可用命令更新".to_string(),
-                notification.raw_data
+                ProgressEventSubType::AvailableCommandsUpdate,
+                "可用命令更新".to_string()
             )
         }
         "CurrentModeUpdate" => {
             (
                 ProgressEventType::CurrentModeUpdate,
-                "当前模式更新".to_string(),
-                notification.raw_data
+                ProgressEventSubType::CurrentModeUpdate,
+                "当前模式更新".to_string()
             )
         }
         _ => {
             (
                 ProgressEventType::Executing,
-                format!("Session通知: {}", notification.update_type),
-                notification.raw_data
+                ProgressEventSubType::Unknown,
+                format!("Session通知: {}", notification.update_type)
             )
         }
     };
 
-    ProgressEvent {
-        event_type,
-        message,
-        timestamp: notification.timestamp,
-        session_id: notification.session_id,
-        data,
-    }
+    ProgressEvent::new(notification.session_id, event_type, sub_type, content)
 }
 
 /// 广播进度事件给所有监听者
 fn broadcast_progress_event(state: &SharedState, session_id: &str, event: ProgressEvent) {
+    // 首先将事件添加到消息管理器缓存
+    let message_manager = state.message_manager.clone();
+    let session_id_owned = session_id.to_string();
+    let event_clone = event.clone();
+
+    // 在后台任务中添加到缓存，避免阻塞
+    tokio::spawn(async move {
+        message_manager.add_message(&session_id_owned, event_clone).await;
+    });
+
+    // 然后广播给所有 SSE 连接
     if let Some(senders) = state.progress_senders.get(session_id) {
         let senders = senders.value();
         let mut failed_indices = Vec::new();
-        
+
         for (index, sender) in senders.iter().enumerate() {
             if let Err(_) = sender.send(event.clone()) {
                 failed_indices.push(index);
             }
         }
-        
+
         // 清理失败的发送者
         if !failed_indices.is_empty() {
             let _ = senders; // 释放引用
@@ -823,6 +686,79 @@ async fn delete_session(
     }
 }
 
+#[axum::debug_handler]
+/// 处理聊天请求 - 使用 ACP 代理管理器
+async fn handle_chat_proxy(
+    State(state): State<SharedState>,
+    Json(request): Json<ChatRequest>,
+) -> HttpResult<ChatResponse> {
+    info!(
+        "🚀 [PROXY] handle_chat_proxy 开始处理请求: user_id={}, project_id={:?}, session_id={:?}, prompt={}",
+        request.user_id, request.project_id, request.session_id, request.prompt
+    );
+
+    // 确定项目ID
+    let project_id = if let Some(ref project_id) = request.project_id {
+        project_id.as_str()
+    } else {
+        // 如果没有提供项目ID，生成一个
+        &Uuid::new_v4().simple().to_string()
+    };
+
+    // 确定会话ID
+    let session_id = request.session_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    // 创建会话信息并存储
+    let session_info = SessionInfo {
+        session_id: session_id.clone(),
+        user_id: request.user_id.clone(),
+        project_id: Some(project_id.to_string()),
+        agent_type: AgentType::Proxy,
+        created_at: chrono::Utc::now(),
+        last_activity: chrono::Utc::now(),
+    };
+    state.sessions.insert(session_id.clone(), session_info.clone());
+
+    // 使用代理管理器发送请求（异步执行，不等待结果）
+    let project_id_owned = project_id.to_string();
+    let session_id_owned = session_id.clone();
+    let prompt_owned = request.prompt.clone();
+    let state_for_task = state.clone();
+
+    // 创建一个 oneshot 通道用于接收任务执行结果，但不在此等待
+    let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+
+    // 使用 LocalSet 任务执行器来处理 ACP 操作
+    let task = LocalTaskRequest {
+        agent_type: AgentType::Proxy,
+        request: ChatRequest {
+            prompt: prompt_owned,
+            user_id: request.user_id,
+            project_id: Some(project_id_owned),
+            session_id: Some(session_id_owned.clone()),
+        },
+        config: state.config.clone(),
+        state: state_for_task,
+        session_id: session_id_owned.clone(),
+        response_tx: result_tx,
+    };
+
+    if let Err(e) = state.local_task_sender.send(task) {
+        error!("❌ [PROXY] 无法发送任务到 LocalSet 执行器: {}", e);
+        return HttpResult::<ChatResponse>::error("PROXY003", "Failed to send task to LocalSet executor");
+    }
+
+    info!("✅ [PROXY] 任务已提交，session_id={}, project_id={}", session_id, project_id);
+
+    // 立即返回响应，包含 session_id 和 project_id
+    HttpResult::success(ChatResponse {
+        session_id: session_id.clone(),
+        response: format!("Task submitted successfully. Session ID: {}, Project ID: {}", session_id, project_id),
+        status: "processing".to_string(),
+        error: None,
+    })
+}
+
 /// 健康检查端点
 async fn health_check() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
@@ -846,6 +782,18 @@ async fn progress_stream(
     }
 
     info!("新的 SSE 连接已建立为 session: {}", session_id);
+
+    // 首先发送历史缓存消息
+    let historical_messages = state.message_manager.get_messages(&session_id).await;
+    if !historical_messages.is_empty() {
+        info!("发送 {} 条历史消息给 session: {}", historical_messages.len(), session_id);
+        for message in historical_messages {
+            if let Err(_) = tx.send(message) {
+                warn!("发送历史消息失败，连接可能已断开");
+                break;
+            }
+        }
+    }
 
     // 订阅ACP StreamUpdate事件 - 包括Plan更新
     let acp_session_id = AcpSessionId(session_id.clone().into());
@@ -893,13 +841,12 @@ async fn progress_stream(
     });
     
     // 发送初始连接事件
-    let connect_event = ProgressEvent {
-        event_type: ProgressEventType::KeepAlive,
-        message: "SSE connection established".to_string(),
-        timestamp: chrono::Utc::now(),
-        session_id: session_id.clone(),
-        data: None,
-    };
+    let connect_event = ProgressEvent::new(
+        session_id.clone(),
+        ProgressEventType::KeepAlive,
+        ProgressEventSubType::KeepAlive,
+        "SSE connection established".to_string(),
+    );
     
     if let Err(e) = tx.send(connect_event) {
         error!("发送初始连接事件失败: {}", e);
@@ -960,6 +907,23 @@ async fn update_session_activity(state: &SharedState, session_id: &str) {
     }
 }
 
+
+/// 启动代理管理器分发器
+async fn start_proxy_manager_dispatcher(
+    request_rx: mpsc::UnboundedReceiver<ProxyRequest>,
+    proxy_manager: Arc<ProxyAgentManager>,
+) -> ProxyResult<()> {
+    info!("Starting proxy manager dispatcher with shared components");
+
+    // 使用主代理管理器的组件
+    let service_registry = proxy_manager.get_service_registry();
+    let workspaces = proxy_manager.get_workspaces();
+    let config = proxy_manager.get_config();
+
+    // 运行消息分发器
+    ProxyAgentManager::run_message_dispatcher(request_rx, service_registry, workspaces, config).await
+}
+
 /// 启动本地任务执行器
 async fn start_local_task_executor(mut receiver: tokio::sync::mpsc::UnboundedReceiver<LocalTaskRequest>) {
     info!("🔧 [DEBUG] LocalSet 任务执行器启动");
@@ -1017,16 +981,13 @@ async fn execute_ai_command(
     current_span.record("ai.prompt_length", request.prompt.len());
 
     // 发送任务开始事件
-    let start_event = ProgressEvent {
-        event_type: ProgressEventType::TaskStarted,
-        message: format!("开始执行 AI 任务: {}", agent_type),
-        timestamp: chrono::Utc::now(),
-        session_id: session_id.to_string(),
-        data: Some(serde_json::json!({
-            "agent_type": agent_type.to_string(),
-            "prompt": request.prompt
-        })),
-    };
+    let start_event = ProgressEvent::new(
+        session_id.to_string(),
+        ProgressEventType::TaskStarted,
+        ProgressEventSubType::TaskStarted,
+        format!("开始执行 AI 任务: {}", agent_type),
+    ).with_metadata("agent_type".to_string(), serde_json::json!(agent_type.to_string()))
+     .with_metadata("prompt".to_string(), serde_json::json!(request.prompt));
     broadcast_progress_event(state, session_id, start_event);
 
     match agent_type {
@@ -1045,19 +1006,16 @@ async fn execute_ai_command(
             debug!("📁 [DEBUG] 项目ID: {}", project_id);
 
             // 发送执行中事件
-            let executing_event = ProgressEvent {
-                event_type: ProgressEventType::Executing,
-                message: format!("正在通过 MPMC 架构调用 Codex: {}", request.prompt),
-                timestamp: chrono::Utc::now(),
-                session_id: session_id.to_string(),
-                data: Some(serde_json::json!({
-                    "protocol": "ACP",
-                    "architecture": "MPMC",
-                    "agent": "codex",
-                    "project_id": project_id,
-                    "prompt": request.prompt
-                })),
-            };
+            let executing_event = ProgressEvent::new(
+                session_id.to_string(),
+                ProgressEventType::Executing,
+                ProgressEventSubType::Executing,
+                format!("正在通过 MPMC 架构调用 Codex: {}", request.prompt),
+            ).with_metadata("protocol".to_string(), serde_json::json!("ACP"))
+             .with_metadata("architecture".to_string(), serde_json::json!("MPMC"))
+             .with_metadata("agent".to_string(), serde_json::json!("codex"))
+             .with_metadata("project_id".to_string(), serde_json::json!(project_id))
+             .with_metadata("prompt".to_string(), serde_json::json!(request.prompt));
             broadcast_progress_event(state, session_id, executing_event);
 
             // 使用全局 Codex 管理器处理请求
@@ -1089,16 +1047,13 @@ async fn execute_ai_command(
             info!("Executing Claude command: claude {:?}", request.prompt);
 
             // 发送执行中事件
-            let executing_event = ProgressEvent {
-                event_type: ProgressEventType::Executing,
-                message: format!("正在执行 Claude 命令: {}", request.prompt),
-                timestamp: chrono::Utc::now(),
-                session_id: session_id.to_string(),
-                data: Some(serde_json::json!({
-                    "command": "claude",
-                    "args": [request.prompt.clone()]
-                })),
-            };
+            let executing_event = ProgressEvent::new(
+                session_id.to_string(),
+                ProgressEventType::Executing,
+                ProgressEventSubType::Executing,
+                format!("正在执行 Claude 命令: {}", request.prompt),
+            ).with_metadata("command".to_string(), serde_json::json!("claude"))
+             .with_metadata("args".to_string(), serde_json::json!([request.prompt.clone()]));
             broadcast_progress_event(state, session_id, executing_event);
 
             // 执行命令并获取输出
@@ -1116,6 +1071,45 @@ async fn execute_ai_command(
                 error!("Claude command failed: {}", error);
                 Err(anyhow::anyhow!("Claude command failed: {}", error))
             }
+        }
+        AgentType::Proxy => {
+            debug!("🔗 [DEBUG] 选择 Proxy agent，使用 ACP 代理管理器");
+            info!("Using ACP Proxy Agent Manager");
+
+            // 获取项目ID
+            let project_id = request.project_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or_else(|| {
+                    // 如果没有提供项目ID，使用session_id作为项目ID
+                    session_id
+                });
+            debug!("📁 [DEBUG] 项目ID: {}", project_id);
+
+            // 发送执行中事件
+            let executing_event = ProgressEvent::new(
+                session_id.to_string(),
+                ProgressEventType::Executing,
+                ProgressEventSubType::Executing,
+                format!("正在通过 ACP 代理管理器处理请求: {}", request.prompt),
+            ).with_metadata("protocol".to_string(), serde_json::json!("ACP"))
+             .with_metadata("architecture".to_string(), serde_json::json!("Proxy"))
+             .with_metadata("agent".to_string(), serde_json::json!("proxy"))
+             .with_metadata("project_id".to_string(), serde_json::json!(project_id))
+             .with_metadata("prompt".to_string(), serde_json::json!(request.prompt));
+            broadcast_progress_event(state, session_id, executing_event);
+
+            // 使用代理管理器处理请求
+            debug!("📤 [DEBUG] 调用 proxy_manager.send_prompt...");
+            let (response, _session_id) = state.proxy_manager.send_prompt(
+                project_id,
+                request.session_id.as_deref(),
+                &request.prompt
+            ).await?;
+            debug!("✅ [DEBUG] proxy_manager.send_prompt 成功返回: {} 字符", response.len());
+
+            info!("ACP Proxy request completed successfully");
+            Ok(response)
         }
     }
 }
@@ -1151,6 +1145,7 @@ fn create_router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/chat", post(handle_chat))
+        .route("/chat/proxy", post(handle_chat_proxy))
         .route("/chat/multipart", post(handle_multipart_chat))
         .route("/chat/acp-multipart", post(handle_acp_multipart_chat))
         .route("/sessions/{session_id}", get(get_session).delete(delete_session))
@@ -1185,14 +1180,32 @@ async fn main() -> anyhow::Result<()> {
     // 创建本地任务通道
     let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
 
+    // 创建代理管理器配置
+    let proxy_config = ProxyConfig {
+        workspace_root: config.projects_dir.clone(),
+        idle_timeout: 3600, // 1小时空闲超时（秒）
+        cleanup_interval: 300, // 5分钟清理间隔（秒）
+        max_concurrent_agents: 10,
+    };
+
+    // 创建代理管理器
+    let mut proxy_manager = ProxyAgentManager::new(proxy_config).await?;
+
+    // 获取请求接收器，用于在 LocalSet 中启动消息分发器
+    let proxy_request_rx = proxy_manager.take_request_rx().await?;
+
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
         progress_senders: Arc::new(DashMap::new()),
+        message_manager: Arc::new(SessionMessageManager::new(1000)), // 缓存最近1000条消息
         session_manager,
         codex_manager: Arc::new(GlobalAgentManager::global()),
+        proxy_manager: Arc::new(proxy_manager),
         local_task_sender,
     });
+
+    // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
     // 创建路由
     let app = create_router(state.clone());
@@ -1204,7 +1217,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Server starting on port {}", config.port);
     info!("API endpoints:");
-    info!("  POST /chat - Send chat message to AI agent");
+    info!("  POST /chat - Send chat message to AI agent (legacy)");
+    info!("  POST /chat/proxy - Send chat message via ACP Proxy Agent Manager (NEW)");
     info!("  POST /chat/multipart - Send multipart chat with files (legacy)");
     info!("  POST /chat/acp-multipart - Send multipart chat with ACP native content blocks");
     info!("  GET  /sessions/:session_id - Get session info");
@@ -1215,6 +1229,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
     // 在单独的线程中启动 LocalSet 任务执行器
+    let proxy_manager_for_local = state.proxy_manager.clone();
     let local_task_handle = std::thread::spawn(move || {
         let local = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1224,17 +1239,39 @@ async fn main() -> anyhow::Result<()> {
         local.block_on(async {
             let local_set = tokio::task::LocalSet::new();
             local_set.run_until(async {
-                start_local_task_executor(local_task_receiver).await;
+                // 并发运行代理管理器的消息分发器和本地任务执行器
+                let proxy_dispatcher = start_proxy_manager_dispatcher(proxy_request_rx, proxy_manager_for_local);
+                let task_executor = start_local_task_executor(local_task_receiver);
+
+                tokio::select! {
+                    result = proxy_dispatcher => {
+                        if let Err(e) = result {
+                            error!("Proxy manager dispatcher failed: {}", e);
+                        }
+                        info!("Proxy manager dispatcher ended, waiting for task executor...");
+                    }
+                    _ = task_executor => {
+                        info!("Local task executor ended, waiting for proxy dispatcher...");
+                    }
+                }
                 Ok::<(), anyhow::Error>(())
             }).await
         }).expect("Local task executor failed");
     });
 
-    // 运行 HTTP 服务器（使用多线程）
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
+    // 运行 HTTP 服务器（在 LocalSet 中运行以支持 spawn_local）
+    let local_set = tokio::task::LocalSet::new();
+    local_set.run_until(async {
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| anyhow::anyhow!("Server error: {}", e))
+    }).await?;
     info!("Server shutdown complete");
+
+    // 关闭代理管理器
+    if let Err(e) = state.proxy_manager.shutdown().await {
+        error!("Failed to shutdown proxy manager: {}", e);
+    }
 
     // 等待本地任务执行器线程结束
     local_task_handle.join().expect("Local task thread panicked");

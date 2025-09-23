@@ -1,4 +1,4 @@
-use crate::{SharedState, AppState, ProgressEvent, ProgressEventType, broadcast_progress_event, HttpResult, ChatResponse, SessionInfo, AgentType, AppConfig};
+use crate::{SharedState, AppState, ProgressEvent, ProgressEventType, ProgressEventSubType, broadcast_progress_event, HttpResult, ChatResponse, SessionInfo, AgentType, AppConfig};
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
 use acp_adapter::plan::{PlanManager, PlanEvent, PlanUpdateEvent, PlanConverter};
 use acp_adapter::types::{Plan, PlanEntry, PlanEntryStatus, PlanEntryPriority};
@@ -423,16 +423,13 @@ async fn execute_acp_command(
     session_id: &str,
 ) -> Result<String> {
     // 发送任务开始事件
-    let start_event = ProgressEvent {
-        event_type: ProgressEventType::TaskStarted,
-        message: format!("开始执行 ACP 任务: {}", agent_type),
-        timestamp: chrono::Utc::now(),
-        session_id: session_id.to_string(),
-        data: Some(serde_json::json!({
-            "agent_type": agent_type.to_string(),
-            "content_blocks_count": acp_request.prompt.len()
-        })),
-    };
+    let start_event = ProgressEvent::new(
+        session_id.to_string(),
+        ProgressEventType::TaskStarted,
+        ProgressEventSubType::TaskStarted,
+        format!("开始执行 ACP 任务: {}", agent_type),
+    ).with_metadata("agent_type".to_string(), serde_json::json!(agent_type.to_string()))
+     .with_metadata("content_blocks_count".to_string(), serde_json::json!(acp_request.prompt.len()));
     broadcast_progress_event(state, session_id, start_event);
 
     // TODO: 这里需要集成真正的ACP代理调用
@@ -460,16 +457,13 @@ async fn execute_acp_command(
     let response = response_parts.join("\n");
 
     // 发送任务完成事件
-    let complete_event = ProgressEvent {
-        event_type: ProgressEventType::TaskCompleted,
-        message: "ACP任务执行完成".to_string(),
-        timestamp: chrono::Utc::now(),
-        session_id: session_id.to_string(),
-        data: Some(serde_json::json!({
-            "success": true,
-            "response_length": response.len()
-        })),
-    };
+    let complete_event = ProgressEvent::new(
+        session_id.to_string(),
+        ProgressEventType::TaskCompleted,
+        ProgressEventSubType::TaskCompleted,
+        "ACP任务执行完成".to_string(),
+    ).with_metadata("success".to_string(), serde_json::json!(true))
+     .with_metadata("response_length".to_string(), serde_json::json!(response.len()));
     broadcast_progress_event(state, session_id, complete_event);
 
     Ok(response)
