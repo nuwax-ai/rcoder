@@ -635,7 +635,9 @@ name = "claude_code_acp_example"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
+ "agent-client-protocol",
  "anyhow",
+ "claude",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -15,8 +15,14 @@ path = "domestic_model_example.rs"
 name = "custom_model_example"
 path = "custom_model_example.rs"
 
+[[bin]]
+name = "claude_acp_example"
+path = "claude_acp_example.rs"
+
 [dependencies]
 acp-adapter = { path = "../crates/acp_adapter" }
+claude = { path = "../crates/claude" }
+agent-client-protocol = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"

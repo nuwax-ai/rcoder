@@ -10,6 +10,7 @@ use agent_client_protocol::{
     PromptResponse, SessionId, SessionNotification, SetSessionModeResponse, TextContent,
     V1 as VERSION,
 };
+use agent_client_protocol::Client; // bring trait into scope for session_notification
 
 use codex_acp_agent::CodexAgent;
 use codex_core::config::{Config, ConfigToml, find_codex_home, load_config_as_toml, ConfigOverrides};
@@ -180,7 +181,7 @@ pub async fn start_acp_agent_service(
     let project_path = chat_prompt.project_path;
 
     // 会话更新与客户端通道（用于构建 CodexAgent）
-    let (session_update_tx, _session_update_rx) = mpsc::unbounded_channel();
+    let (session_update_tx, mut session_update_rx) = mpsc::unbounded_channel();
     let (client_tx, _client_rx) = mpsc::unbounded_channel();
 
     // 加载配置
@@ -241,7 +242,7 @@ pub async fn start_acp_agent_service(
     let embedded_client = EmbeddedClient {};
 
     // 两端连接
-    let (_server_conn, server_io_task) = AgentSideConnection::new(
+    let (server_conn, server_io_task) = AgentSideConnection::new(
         agent.clone(),
         agent_to_client_tx,
         client_to_agent_rx,
@@ -262,6 +263,24 @@ pub async fn start_acp_agent_service(
     // 持续运行 IO
     tokio::task::spawn_local(server_io_task);
     tokio::task::spawn_local(client_io_task);
+
+    // 转发 Agent 的 SessionNotification 到连接（触发 EmbeddedClient::session_notification）
+    tokio::task::spawn_local(async move {
+        loop {
+            match session_update_rx.recv().await {
+                Some((session_notification, tx)) => {
+                    let result = server_conn.session_notification(session_notification).await;
+                    if let Err(e) = result {
+                        error!("failed to send session notification: {:?}", e);
+                        let _ = tx.send(());
+                        break;
+                    }
+                    let _ = tx.send(());
+                }
+                None => break,
+            }
+        }
+    });
 
     // 初始化 + 创建会话
     client_conn
