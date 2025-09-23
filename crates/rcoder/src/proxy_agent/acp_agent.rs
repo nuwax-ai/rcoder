@@ -3,29 +3,30 @@ use std::{
     sync::LazyLock,
 };
 
+use agent_client_protocol::Client;
 use agent_client_protocol::{
     self as acp, Agent, AgentSideConnection, ClientCapabilities, ClientSideConnection,
     ContentBlock, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
     KillTerminalCommandResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionId, SessionNotification, SetSessionModeResponse, TextContent,
     V1 as VERSION,
-};
-use agent_client_protocol::Client; // bring trait into scope for session_notification
+}; // bring trait into scope for session_notification
 
 use codex_acp_agent::CodexAgent;
-use codex_core::config::{Config, ConfigToml, find_codex_home, load_config_as_toml, ConfigOverrides};
-use codex_core::protocol_config_types::SandboxMode;
+use codex_core::config::{
+    Config, ConfigOverrides, ConfigToml, find_codex_home, load_config_as_toml,
+};
 use codex_core::protocol::AskForApproval;
+use codex_core::protocol_config_types::SandboxMode;
 use dashmap::DashMap;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::{error, info};
 
-use crate::model::{
-    AgentType, ChatPrompt, ChatPromptResponse, EmbeddedClient, ProjectAndAgentInfo,
-};
+use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
 use anyhow::Result;
+use super::codex_agent::EmbeddedCodexClient;
 
 /// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
 pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
@@ -190,7 +191,7 @@ pub async fn start_acp_agent_service(
         error!("Failed to find codex home directory: {}", e);
         anyhow::anyhow!("Failed to find codex home directory: {}", e)
     })?;
-    
+
     info!("Codex home directory: {:?}", codex_home);
 
     // 从 ~/.codex/config.toml 加载配置
@@ -204,27 +205,23 @@ pub async fn start_acp_agent_service(
         error!("Failed to deserialize config.toml: {}", e);
         anyhow::anyhow!("Failed to deserialize config.toml: {}", e)
     })?;
-    
+
     info!("Loaded codex config: {:?}", cfg);
 
     // 默认启用 YOLO 模式配置覆盖
     let mut config_overrides = ConfigOverrides::default();
-    
+
     info!("启用 YOLO 模式: 禁用沙箱，禁用批准请求");
     config_overrides.sandbox_mode = Some(SandboxMode::DangerFullAccess);
     config_overrides.approval_policy = Some(AskForApproval::Never);
     config_overrides.cwd = Some(project_path.clone());
 
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        config_overrides,
-        project_path.clone(),
-    )
-    .map_err(|e| {
-        error!("Failed to load config: {}", e);
-        anyhow::anyhow!("Failed to load config: {}", e)
-    })?;
-
+    let config =
+        Config::load_from_base_config_with_overrides(cfg, config_overrides, project_path.clone())
+            .map_err(|e| {
+            error!("Failed to load config: {}", e);
+            anyhow::anyhow!("Failed to load config: {}", e)
+        })?;
 
     // 创建 Agent
     let agent = CodexAgent::with_config(session_update_tx.clone(), client_tx.clone(), config);
@@ -239,7 +236,7 @@ pub async fn start_acp_agent_service(
     // 在 LocalSet 中启动服务
     let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
 
-    let embedded_client = EmbeddedClient {};
+    let embedded_client = EmbeddedCodexClient {};
 
     // 两端连接
     let (server_conn, server_io_task) = AgentSideConnection::new(
@@ -316,7 +313,7 @@ pub async fn start_acp_agent_service(
 
 // Helper function to create a bidirectional connection
 fn create_connection_pair(
-    client: &EmbeddedClient,
+    client: &EmbeddedCodexClient,
     agent: &CodexAgent,
 ) -> (ClientSideConnection, AgentSideConnection) {
     let (client_to_agent_rx, client_to_agent_tx) = piper::pipe(1024);

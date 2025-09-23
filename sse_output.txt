@@ -1,9 +1,0 @@
-event: task_started
-data: {"id":"cce21add-251e-4179-9374-344e8a790a20","type":"task_started","sub_type":"task_started","session_id":"fe92b746-3bc0-454f-b532-d4b20036efda","timestamp":"2025-09-23T02:24:31.378780Z","content":"开始执行 AI 任务: proxy","metadata":{"prompt":"列出当前目录的文件","agent_type":"proxy"}}
-
-event: executing
-data: {"id":"06bbc3c7-40f9-4751-a990-538accb7571c","type":"executing","sub_type":"executing","session_id":"fe92b746-3bc0-454f-b532-d4b20036efda","timestamp":"2025-09-23T02:24:31.378816Z","content":"正在通过 ACP 代理管理器处理请求: 列出当前目录的文件","metadata":{"protocol":"ACP","architecture":"Proxy","prompt":"列出当前目录的文件","project_id":"test_project_001","agent":"proxy"}}
-
-event: keep_alive
-data: {"id":"a3db5189-e994-438a-9d9c-9e5a07818c42","type":"keep_alive","sub_type":"keep_alive","session_id":"fe92b746-3bc0-454f-b532-d4b20036efda","timestamp":"2025-09-23T02:24:38.915516Z","content":"SSE connection established"}
-
