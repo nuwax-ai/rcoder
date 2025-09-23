@@ -6,7 +6,7 @@ use agent_client_protocol::{
 use claude::ClaudeCodeAcpManager;
 use std::process::Stdio;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::model::ChatPrompt;
 use anyhow::{Context, Result};
@@ -175,6 +175,37 @@ pub async fn start_claude_code_acp_agent_service(
                     .stdout
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdout"))?;
+                let stderr = child
+                    .stderr
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stderr"))?;
+
+                // 启动 stderr 读取任务
+                tokio::task::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut stderr_reader = tokio::io::BufReader::new(stderr);
+                    let mut stderr_buffer = String::new();
+
+                    loop {
+                        match stderr_reader.read_line(&mut stderr_buffer).await {
+                            Ok(0) => {
+                                info!("Claude Code ACP stderr 流已关闭");
+                                break;
+                            }
+                            Ok(bytes_read) => {
+                                let line = &stderr_buffer[..bytes_read];
+                                if !line.trim().is_empty() {
+                                    warn!("Claude Code ACP stderr: {}", line.trim());
+                                }
+                                stderr_buffer.clear();
+                            }
+                            Err(e) => {
+                                error!("读取 Claude Code ACP stderr 失败: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
 
                 // 创建兼容的流
                 let outgoing = stdin.compat_write();
@@ -193,30 +224,56 @@ pub async fn start_claude_code_acp_agent_service(
                 tokio::task::spawn_local(handle_io);
 
                 // 初始化连接
-                client_conn
-                    .initialize(InitializeRequest {
+                debug!("初始化 ACP 连接[initialize]");
+                info!("正在发送 ACP 初始化请求...");
+                let init_result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(30),
+                    client_conn.initialize(InitializeRequest {
                         protocol_version: VERSION,
                         client_capabilities: ClientCapabilities::default(),
                         meta: None,
                     })
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to initialize ACP connection: {:?}", e);
-                        anyhow::anyhow!("Failed to initialize ACP connection: {:?}", e)
-                    })?;
+                ).await;
+
+                match init_result {
+                    Ok(Ok(_)) => {
+                        info!("ACP 连接初始化成功");
+                    }
+                    Ok(Err(e)) => {
+                        error!("ACP 连接初始化失败: {:?}", e);
+                        return Err(anyhow::anyhow!("Failed to initialize ACP connection: {:?}", e));
+                    }
+                    Err(_) => {
+                        error!("ACP 连接初始化超时");
+                        return Err(anyhow::anyhow!("ACP connection initialization timeout"));
+                    }
+                }
 
                 // 创建会话
-                let session_resp = client_conn
-                    .new_session(NewSessionRequest {
+                debug!("创建 ACP 会话[new_session]");
+                let session_result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(30),
+                    client_conn.new_session(NewSessionRequest {
                         mcp_servers: Vec::new(),
                         cwd: project_path_for_closure.clone(),
                         meta: None,
                     })
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to create ACP session: {:?}", e);
-                        anyhow::anyhow!("Failed to create ACP session: {:?}", e)
-                    })?;
+                ).await;
+
+                let session_resp = match session_result {
+                    Ok(Ok(resp)) => {
+                        debug!("ACP 会话创建成功");
+                        resp
+                    }
+                    Ok(Err(e)) => {
+                        error!("ACP 会话创建失败: {:?}", e);
+                        return Err(anyhow::anyhow!("Failed to create ACP session: {:?}", e));
+                    }
+                    Err(_) => {
+                        error!("ACP 会话创建超时");
+                        return Err(anyhow::anyhow!("ACP session creation timeout"));
+                    }
+                };
 
                 info!("ACP 会话已创建，ID: {}", session_resp.session_id.0);
 

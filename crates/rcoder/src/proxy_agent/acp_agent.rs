@@ -4,17 +4,19 @@ use std::{
 };
 
 use agent_client_protocol::{
-    AgentSideConnection, ClientSideConnection, ContentBlock, PromptRequest, SessionId,
-    TextContent,
+    AgentSideConnection, ClientSideConnection, ContentBlock, PromptRequest, SessionId, TextContent,
 }; // bring trait into scope for session_notification
 
 use codex_acp_agent::CodexAgent;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use super::codex_agent::{EmbeddedCodexClient, start_codex_acp_agent_service};
-use crate::{model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo}, proxy_agent::claude_code_agent::start_claude_code_acp_agent_service};
+use crate::{
+    model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
+    proxy_agent::claude_code_agent::start_claude_code_acp_agent_service,
+};
 use anyhow::Result;
 /// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
 pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
@@ -101,8 +103,11 @@ pub async fn agent_worker(
                     {
                         if let Err(e) = prompt_tx.send(prompt_request) {
                             error!("Failed to send prompt request: {:?}", e);
-                            //TODO  后续优化,如何处理异常,这里暂时不处理
+                        } else {
+                            info!("Prompt 请求已发送");
                         }
+                    } else {
+                        error!("Failed to build prompt request");
                     }
 
                     // 发送回执消息
@@ -120,13 +125,19 @@ pub async fn agent_worker(
         } else {
             // 发送 prompt 请求
 
-            let info = project_and_agent_info.unwrap();
-            if let Ok(prompt_request) =
-                build_prompt_to_acp_agent(chat_prompt, info.session_id.clone()).await
-            {
-                if let Err(e) = info.prompt_tx.send(prompt_request) {
-                    error!("Failed to send prompt request: {:?}", e);
-                    //TODO  后续优化,如何处理异常,这里暂时不处理
+            let info: dashmap::mapref::one::Ref<'_, String, ProjectAndAgentInfo> =
+                project_and_agent_info.unwrap();
+
+            match build_prompt_to_acp_agent(chat_prompt, info.session_id.clone()).await {
+                Ok(prompt_request) => {
+                    if let Err(e) = info.prompt_tx.send(prompt_request) {
+                        error!("Failed to send prompt request: {:?}", e);
+                    } else {
+                        debug!("Prompt已发送");
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to build prompt request for existing agent: {}", e);
                 }
             }
 
