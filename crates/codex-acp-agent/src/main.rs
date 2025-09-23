@@ -7,7 +7,7 @@ use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::agent::CodexAgent;
-// use codex_core::config::{Config, ConfigOverrides}; // 注释掉不存在的依赖
+use codex_core::config::{Config, ConfigOverrides};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
-            let config = codex_core::config::Config::load_with_cli_overrides(vec![], codex_core::config::ConfigOverrides::default())?;
+        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
         let agent = CodexAgent::with_config(tx, client_tx.clone(), config);
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);

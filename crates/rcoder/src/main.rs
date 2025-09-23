@@ -24,8 +24,6 @@ use model::*;
 mod codex_agent_client;
 use codex_agent_client::{GlobalAgentManager, SerializedSessionNotification};
 
-mod proxy_agent_manager;
-use proxy_agent_manager::{ProxyAgentManager, ProxyConfig, ProxyRequest, ProxyResult};
 
 mod progress_events;
 use progress_events::{
@@ -107,18 +105,7 @@ struct AppConfig {
     port: u16,
 }
 
-/// 本地任务响应 - 包含关键字段用于立即返回
-#[derive(Debug, Clone, Serialize)]
-struct LocalTaskResponse {
-    /// 项目 ID
-    project_id: String,
-    /// 会话 ID
-    session_id: String,
-    /// 任务状态
-    status: String,
-    /// 可选的错误信息
-    error: Option<String>,
-}
+
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -130,16 +117,6 @@ impl Default for AppConfig {
     }
 }
 
-/// 本地任务请求
-#[derive(Debug)]
-struct LocalTaskRequest {
-    agent_type: AgentType,
-    request: ChatRequest,
-    config: AppConfig,
-    state: SharedState,
-    session_id: Option<String>,
-    response_tx: tokio::sync::oneshot::Sender<Result<LocalTaskResponse, String>>,
-}
 
 /// 应用状态
 #[derive(Clone)]
@@ -156,8 +133,7 @@ struct AppState {
     session_manager: Arc<SessionManager>,
     /// 全局 Codex 管理器（MPMC 架构）- 使用全局单例
     codex_manager: Arc<GlobalAgentManager>,
-    /// ACP 代理管理器
-    proxy_manager: Arc<ProxyAgentManager>,
+  
     /// 本地任务发送器
     local_task_sender: mpsc::UnboundedSender<LocalSetAgentRequest>,
 }
@@ -490,34 +466,8 @@ async fn get_session(
     }
 }
 
-/// 获取用户的所有会话
-async fn get_user_sessions(
-    State(state): State<SharedState>,
-    Path(user_id): Path<String>,
-) -> HttpResult<Vec<SessionInfo>> {
-    let user_sessions: Vec<SessionInfo> = state
-        .sessions
-        .iter()
-        .filter(|entry| entry.value().user_id == user_id)
-        .map(|entry| entry.value().clone())
-        .collect();
 
-    HttpResult::success(user_sessions)
-}
 
-/// 删除会话
-async fn delete_session(
-    State(state): State<SharedState>,
-    Path(session_id): Path<String>,
-) -> HttpResult<String> {
-    match state.sessions.remove(&session_id) {
-        Some(_) => {
-            info!("Session {} deleted", session_id);
-            HttpResult::success(format!("Session '{}' deleted successfully", session_id))
-        }
-        None => HttpResult::error("SES002", &format!("Session '{}' not found", session_id)),
-    }
-}
 /// 健康检查端点
 async fn health_check() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
@@ -668,397 +618,6 @@ async fn update_session_activity_by_project(state: &SharedState, project_id: &st
     }
 }
 
-/// 启动代理管理器分发器
-async fn start_proxy_manager_dispatcher(
-    request_rx: mpsc::UnboundedReceiver<ProxyRequest>,
-    proxy_manager: Arc<ProxyAgentManager>,
-) -> ProxyResult<()> {
-    info!("Starting proxy manager dispatcher with shared components");
-
-    // 使用主代理管理器的组件
-    let service_registry = proxy_manager.get_service_registry();
-    let workspaces = proxy_manager.get_workspaces();
-    let config = proxy_manager.get_config();
-
-    // 运行消息分发器
-    ProxyAgentManager::run_message_dispatcher(request_rx, service_registry, workspaces, config)
-        .await
-}
-
-/// 启动本地任务执行器
-async fn start_local_task_executor(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<LocalTaskRequest>,
-) {
-    info!("🔧 [DEBUG] LocalSet 任务执行器启动");
-
-    while let Some(task_request) = receiver.recv().await {
-        debug!(
-            "📥 [DEBUG] 收到任务请求: session_id={:?}, agent_type={:?}",
-            task_request.session_id, task_request.agent_type
-        );
-        debug!(
-            "📝 [DEBUG] 任务详情: prompt={}",
-            task_request.request.prompt
-        );
-
-        // 在后台异步执行实际的 AI 命令
-        let agent_type = task_request.agent_type.clone();
-        let request = task_request.request.clone();
-        let config = task_request.config.clone();
-        let state = task_request.state.clone();
-        let session_id = task_request.session_id.clone();
-        let response_tx = task_request.response_tx;
-
-        debug!("⚙️ [DEBUG] 开始执行 AI 命令...");
-
-        // 在 LocalSet 中异步执行 AI 任务
-        // 注意：这里使用 tokio::task::spawn_local 来支持非 Send 的 LocalSet
-        let result = tokio::task::spawn_local(async move {
-            let result = execute_ai_command_background(
-                &agent_type,
-                &request,
-                &config,
-                &state,
-                session_id.as_deref(),
-            )
-            .await;
-
-            match result {
-                Ok(task_response) => {
-                    debug!("✅ [DEBUG] AI 命令执行成功，发送结果");
-                    let _ = response_tx.send(Ok(task_response));
-                }
-                Err(e) => {
-                    error!("❌ [DEBUG] AI 命令执行失败: {}", e);
-                    let _ = response_tx.send(Err(e.to_string()));
-                }
-            }
-        })
-        .await;
-
-        if let Err(e) = result {
-            error!("❌ [DEBUG] 启动后台任务失败: {}", e);
-            // 如果启动失败，我们无法通过 response_tx 发送错误，因为它已经被移动了
-            // 这种情况下，我们只能记录错误，调用者会得到超时
-        }
-
-        debug!("🔄 [DEBUG] 任务已提交到后台执行，等待下一个任务...");
-    }
-
-    warn!("⚠️ [DEBUG] LocalSet 任务执行器结束");
-}
-
-/// 执行 AI 命令
-#[tracing::instrument(skip(request, config, state), fields(agent_type = %agent_type, session_id = ?session_id))]
-async fn execute_ai_command(
-    agent_type: &AgentType,
-    request: &ChatRequest,
-    config: &AppConfig,
-    state: &SharedState,
-    session_id: Option<&str>,
-) -> anyhow::Result<String> {
-    debug!(
-        "🤖 [DEBUG] execute_ai_command 开始执行: agent_type={:?}, session_id={:?}",
-        agent_type, session_id
-    );
-    debug!("📝 [DEBUG] AI 命令详情: prompt={}", request.prompt);
-
-    // 添加 span 属性
-    let current_span = Span::current();
-    current_span.record("ai.agent_type", agent_type.to_string());
-    current_span.record("ai.prompt_length", request.prompt.len());
-
-    match agent_type {
-        AgentType::Codex => {
-            debug!("🧠 [DEBUG] 选择 Codex agent，使用 ACP 协议");
-            info!("Using Codex ACP protocol with MPMC architecture");
-
-            // 获取项目ID
-            let project_id = request
-                .project_id
-                .as_ref()
-                .map(|id| id.as_str())
-                .unwrap_or_else(|| {
-                    // 如果没有提供项目ID，使用session_id作为项目ID
-                    session_id.unwrap_or("default")
-                });
-            debug!("📁 [DEBUG] 项目ID: {}", project_id);
-
-            // 使用全局 Codex 管理器处理请求
-            debug!("📤 [DEBUG] 调用 codex_manager.send_prompt...");
-            let response = state
-                .codex_manager
-                .send_prompt(project_id, &request.prompt)
-                .await?;
-            debug!(
-                "✅ [DEBUG] codex_manager.send_prompt 成功返回: {} 字符",
-                response.len()
-            );
-
-            info!("Codex MPMC request completed successfully");
-            Ok(response)
-        }
-        AgentType::Claude => {
-            debug!("🤖 [DEBUG] 选择 Claude agent，使用 shell 命令");
-            // Claude 仍然使用 shell 命令方式（保持向后兼容）
-            info!("Using Claude shell command");
-
-            let mut cmd = tokio::process::Command::new("claude");
-
-            // 如果有项目 ID，设置工作目录
-            if let Some(ref project_id) = request.project_id {
-                let project_path = config.projects_dir.join(project_id);
-                cmd.current_dir(&project_path);
-                debug!("📁 [DEBUG] 设置工作目录: {:?}", project_path);
-            }
-
-            // 添加 prompt 作为参数
-            cmd.arg(&request.prompt);
-
-            debug!("📤 [DEBUG] 执行 Claude 命令: claude {:?}", request.prompt);
-            info!("Executing Claude command: claude {:?}", request.prompt);
-
-            // 执行命令并获取输出
-            debug!("⏳ [DEBUG] 等待 Claude 命令执行完成...");
-            let output = cmd.output().await?;
-
-            if output.status.success() {
-                let response = String::from_utf8_lossy(&output.stdout).to_string();
-                debug!(
-                    "✅ [DEBUG] Claude 命令执行成功，输出: {} 字符",
-                    response.len()
-                );
-                info!("Claude command completed successfully");
-                Ok(response)
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr).to_string();
-                error!("❌ [DEBUG] Claude 命令执行失败: {}", error);
-                error!("Claude command failed: {}", error);
-                Err(anyhow::anyhow!("Claude command failed: {}", error))
-            }
-        }
-        AgentType::Proxy => {
-            debug!("🔗 [DEBUG] 选择 Proxy agent，使用 ACP 代理管理器");
-            info!("Using ACP Proxy Agent Manager");
-
-            // 获取项目ID
-            let project_id = request
-                .project_id
-                .as_ref()
-                .map(|id| id.as_str())
-                .unwrap_or_else(|| {
-                    // 如果没有提供项目ID，使用session_id作为项目ID
-                    session_id.unwrap_or("unknown")
-                });
-            debug!("📁 [DEBUG] 项目ID: {}", project_id);
-
-            // 使用代理管理器处理请求
-            debug!("📤 [DEBUG] 调用 proxy_manager.send_prompt...");
-            let (response, actual_session_id) = state
-                .proxy_manager
-                .send_prompt(project_id, request.session_id.as_deref(), &request.prompt)
-                .await?;
-            debug!(
-                "✅ [DEBUG] proxy_manager.send_prompt 成功返回: {} 字符",
-                response.len()
-            );
-
-            // 如果成功获取到了实际的 session_id，创建 SessionInfo
-            if !actual_session_id.is_empty() {
-                let session_info = SessionInfo {
-                    session_id: actual_session_id.clone(),
-                    user_id: request.user_id.clone(),
-                    project_id: request.project_id.clone(),
-                    agent_type: AgentType::Proxy,
-                    created_at: chrono::Utc::now(),
-                    last_activity: chrono::Utc::now(),
-                };
-                state
-                    .sessions
-                    .insert(actual_session_id.clone(), session_info);
-                debug!(
-                    "🆕 [DEBUG] 创建了新的 SessionInfo: session_id={}, project_id={:?}",
-                    actual_session_id, request.project_id
-                );
-            }
-
-            info!("ACP Proxy request completed successfully");
-            Ok(response)
-        }
-    }
-}
-
-/// 后台执行 AI 命令并返回结果
-#[tracing::instrument(skip(request, config, state), fields(agent_type = %agent_type, session_id = ?session_id))]
-async fn execute_ai_command_background(
-    agent_type: &AgentType,
-    request: &ChatRequest,
-    config: &AppConfig,
-    state: &SharedState,
-    session_id: Option<&str>,
-) -> anyhow::Result<LocalTaskResponse> {
-    debug!(
-        "🤖 [DEBUG] execute_ai_command_background 开始执行: agent_type={:?}, session_id={:?}",
-        agent_type, session_id
-    );
-    debug!("📝 [DEBUG] AI 命令详情: prompt={}", request.prompt);
-
-    // 添加 span 属性
-    let current_span = Span::current();
-    current_span.record("ai.agent_type", agent_type.to_string());
-    current_span.record("ai.prompt_length", request.prompt.len());
-
-    match agent_type {
-        AgentType::Codex => {
-            debug!("🧠 [DEBUG] 选择 Codex agent，使用 ACP 协议");
-            info!("Using Codex ACP protocol with MPMC architecture (background)");
-
-            // 获取项目ID
-            let project_id = request
-                .project_id
-                .as_ref()
-                .map(|id| id.as_str())
-                .unwrap_or_else(|| {
-                    // 如果没有提供项目ID，使用session_id作为项目ID
-                    session_id.unwrap_or("default")
-                });
-            debug!("📁 [DEBUG] 项目ID: {}", project_id);
-
-            // 使用全局 Codex 管理器处理请求
-            debug!("📤 [DEBUG] 调用 codex_manager.send_prompt...");
-            let _response = state
-                .codex_manager
-                .send_prompt(project_id, &request.prompt)
-                .await?;
-            debug!("✅ [DEBUG] codex_manager.send_prompt 后台执行完成");
-
-            info!("Codex MPMC background request completed successfully");
-
-            // 返回成功响应，包含真实的 session_id
-            Ok(LocalTaskResponse {
-                project_id: project_id.to_string(),
-                session_id: session_id.unwrap_or("pending").to_string(),
-                status: "completed".to_string(),
-                error: None,
-            })
-        }
-        AgentType::Claude => {
-            debug!("🤖 [DEBUG] 选择 Claude agent，使用 shell 命令");
-            info!("Using Claude shell command (background)");
-
-            let mut cmd = tokio::process::Command::new("claude");
-
-            // 如果有项目 ID，设置工作目录
-            if let Some(ref project_id) = request.project_id {
-                let project_path = config.projects_dir.join(project_id);
-                cmd.current_dir(&project_path);
-                debug!("📁 [DEBUG] 设置工作目录: {:?}", project_path);
-            }
-
-            // 添加 prompt 作为参数
-            cmd.arg(&request.prompt);
-
-            debug!("📤 [DEBUG] 执行 Claude 命令: claude {:?}", request.prompt);
-            info!(
-                "Executing Claude command (background): claude {:?}",
-                request.prompt
-            );
-
-            // 执行命令并获取输出
-            debug!("⏳ [DEBUG] 等待 Claude 命令执行完成...");
-            let output = cmd.output().await?;
-
-            if output.status.success() {
-                debug!("✅ [DEBUG] Claude 命令后台执行成功");
-                info!("Claude background command completed successfully");
-
-                // 返回成功响应，Claude 没有 session_id 概念
-                Ok(LocalTaskResponse {
-                    project_id: request
-                        .project_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    session_id: session_id.unwrap_or("claude_session").to_string(),
-                    status: "completed".to_string(),
-                    error: None,
-                })
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr).to_string();
-                error!("❌ [DEBUG] Claude 命令后台执行失败: {}", error);
-                error!("Claude background command failed: {}", error);
-
-                // 返回错误响应
-                Ok(LocalTaskResponse {
-                    project_id: request
-                        .project_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    session_id: session_id.unwrap_or("claude_session").to_string(),
-                    status: "failed".to_string(),
-                    error: Some(error),
-                })
-            }
-        }
-        AgentType::Proxy => {
-            debug!("🔗 [DEBUG] 选择 Proxy agent，使用 ACP 代理管理器");
-            info!("Using ACP Proxy Agent Manager (background)");
-
-            // 获取项目ID
-            let project_id = request
-                .project_id
-                .as_ref()
-                .map(|id| id.as_str())
-                .unwrap_or_else(|| {
-                    // 如果没有提供项目ID，使用session_id作为项目ID
-                    session_id.unwrap_or("unknown")
-                });
-            debug!("📁 [DEBUG] 项目ID: {}", project_id);
-
-            // 使用代理管理器处理请求
-            debug!("📤 [DEBUG] 调用 proxy_manager.send_prompt...");
-            let (_response, actual_session_id) = state
-                .proxy_manager
-                .send_prompt(project_id, request.session_id.as_deref(), &request.prompt)
-                .await?;
-            debug!("✅ [DEBUG] proxy_manager.send_prompt 后台执行完成");
-
-            // 如果成功获取到了实际的 session_id，创建 SessionInfo
-            if !actual_session_id.is_empty() {
-                let session_info = SessionInfo {
-                    session_id: actual_session_id.clone(),
-                    user_id: request.user_id.clone(),
-                    project_id: request.project_id.clone(),
-                    agent_type: AgentType::Proxy,
-                    created_at: chrono::Utc::now(),
-                    last_activity: chrono::Utc::now(),
-                };
-                state.sessions.insert(project_id.to_string(), session_info);
-                debug!(
-                    "🆕 [DEBUG] 创建了新的 SessionInfo: session_id={}, project_id={:?}",
-                    actual_session_id, request.project_id
-                );
-            }
-
-            info!("ACP Proxy background request completed successfully");
-
-            // 返回成功响应，包含真实的 session_id
-            Ok(LocalTaskResponse {
-                project_id: request
-                    .project_id
-                    .clone()
-                    .unwrap_or_else(|| project_id.to_string()),
-                session_id: if actual_session_id.is_empty() {
-                    session_id.unwrap_or("pending").to_string()
-                } else {
-                    actual_session_id
-                },
-                status: "completed".to_string(),
-                error: None,
-            })
-        }
-    }
-}
-
 /// 加载配置
 fn load_config() -> AppConfig {
     let mut config = AppConfig::default();
@@ -1092,11 +651,6 @@ fn create_router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/chat", post(handle_chat))
-        .route(
-            "/sessions/{session_id}",
-            get(get_session).delete(delete_session),
-        )
-        .route("/users/{user_id}/sessions", get(get_user_sessions))
         .route("/progress/{session_id}", get(progress_stream))
         .layer(CorsLayer::permissive())
         // 自定义追踪中间件 - 自动生成和管理 trace_id
@@ -1129,16 +683,6 @@ async fn main() -> anyhow::Result<()> {
     // 创建本地任务通道
     let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    // 创建代理管理器配置
-    let proxy_config = ProxyConfig {
-        workspace_root: config.projects_dir.clone(),
-        idle_timeout: 3600,    // 1小时空闲超时（秒）
-        cleanup_interval: 300, // 5分钟清理间隔（秒）
-        max_concurrent_agents: 10,
-    };
-
-    // // 创建项目与 Agent 服务池
-    // PROJECT_AND_AGENT_INFO_MAP.get_or_init(|| DashMap::new());
 
     // 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
     std::thread::spawn(move || {
@@ -1159,8 +703,6 @@ async fn main() -> anyhow::Result<()> {
         });
     });
 
-    // 创建代理管理器并获取请求接收器
-    let (proxy_manager, proxy_request_rx) = ProxyAgentManager::new(proxy_config).await?;
 
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
@@ -1169,7 +711,6 @@ async fn main() -> anyhow::Result<()> {
         message_manager: Arc::new(SessionMessageManager::new(1000)), // 缓存最近1000条消息
         session_manager,
         codex_manager: Arc::new(GlobalAgentManager::global()),
-        proxy_manager: Arc::new(proxy_manager),
         local_task_sender,
     });
 
@@ -1186,12 +727,6 @@ async fn main() -> anyhow::Result<()> {
     info!("Server starting on port {}", config.port);
     info!("API endpoints:");
     info!("  POST /chat - Send chat message to AI agent (legacy)");
-    info!("  POST /chat/proxy - Send chat message via ACP Proxy Agent Manager (NEW)");
-    info!("  POST /chat/multipart - Send multipart chat with files (legacy)");
-    info!("  POST /chat/acp-multipart - Send multipart chat with ACP native content blocks");
-    info!("  GET  /sessions/:session_id - Get session info");
-    info!("  GET  /users/:user_id/sessions - Get user's sessions");
-    info!("  DELETE /sessions/:session_id - Delete session");
     info!("  GET  /progress/:session_id - SSE progress stream for AI tasks (unified stream)");
     info!("  GET  /health - Health check");
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
@@ -1200,10 +735,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Server error: {}", e));
 
-    // 关闭代理管理器
-    if let Err(e) = state.proxy_manager.shutdown().await {
-        error!("Failed to shutdown proxy manager: {}", e);
-    }
 
     Ok(())
 }

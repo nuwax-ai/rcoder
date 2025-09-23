@@ -21,7 +21,7 @@ publish = false
 
 [workspace.dependencies]
 # ACP Protocol
-agent-client-protocol = "0.4"
+agent-client-protocol = "0.4.2"
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }

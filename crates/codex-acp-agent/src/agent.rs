@@ -1,28 +1,16 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
-    AvailableCommand, AvailableCommandInput, CancelNotification, ContentBlock,
-    EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification, SessionUpdate,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, V1,
-    PermissionOptionKind, PermissionOptionId, PermissionOption, RequestPermissionOutcome,
-};
+use agent_client_protocol::{self as acp, Agent, Error, V1};
 use codex_core::{
-    config::{Config as CodexConfig, ConfigOverrides}, protocol::{
-        AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, Submission,
-        TokenUsage,
-    }, AuthManager, CodexConversation,
-    ConversationManager,
-    NewConversation,
+    AuthManager, CodexConversation, ConversationManager, NewConversation,
+    config::Config as CodexConfig,
+    protocol::{
+        AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
+    },
 };
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
@@ -30,15 +18,13 @@ use tokio::task;
 use tracing::{info, warn};
 
 mod commands;
-
-/// Codex 配置
-pub type Config = CodexConfig;
-
-/// 会话状态
+// Placeholder for per-session state. Holds the Codex conversation
+// handle, its id (for status/reporting), and bookkeeping for streaming.
 #[derive(Clone)]
 struct SessionState {
     #[allow(dead_code)]
     created: SystemTime,
+    // Conversation id string for display/logging purposes.
     conversation_id: String,
     conversation: Option<Arc<CodexConversation>>,
     current_approval: AskForApproval,
@@ -48,80 +34,48 @@ struct SessionState {
 
 #[derive(Clone)]
 pub struct CodexAgent {
-    session_update_tx: mpsc::UnboundedSender<(SessionNotification, Sender<()>)>,
-    next_session_id: Cell<u64>,
+    session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
     sessions: Rc<RefCell<HashMap<String, SessionState>>>,
-    config: Config,
+    config: CodexConfig,
     conversation_manager: Arc<ConversationManager>,
-    next_submit_seq: Cell<u64>,
-    auth_manager: Arc<std::sync::RwLock<Arc<AuthManager>>>,
-    extra_available_commands: Rc<RefCell<Vec<AvailableCommand>>>,
+    auth_manager: Arc<RwLock<Arc<AuthManager>>>,
+    available_commands: Vec<acp::AvailableCommand>,
     client_tx: mpsc::UnboundedSender<ClientOp>,
-}
-
-#[derive(Debug)]
-pub enum ClientOp {
-    RequestPermission(
-        RequestPermissionRequest,
-        Sender<Result<RequestPermissionResponse, Error>>,
-    ),
+    client_capabilities: RefCell<acp::ClientCapabilities>,
 }
 
 impl CodexAgent {
-    /// 创建一个新的 CodexAgent 实例，使用默认配置加载
-    pub fn new(
-        session_update_tx: mpsc::UnboundedSender<(SessionNotification, oneshot::Sender<()>)>,
-    ) -> Self {
-        // Fallback config load. This will be replaced by an explicit configuration
-        // path in main.rs and a dedicated constructor once wired.
-        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())
-            .unwrap_or_else(|_| {
-                // As a last resort, build a config from defaults.
-                Config::load_from_base_config_with_overrides(
-                    Default::default(),
-                    ConfigOverrides::default(),
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                )
-                .expect("failed to synthesize default config")
-            });
-        let (client_tx, _client_rx) = mpsc::unbounded_channel();
-        Self::with_config(session_update_tx, client_tx, config)
-    }
-
     pub fn with_config(
-        session_update_tx: mpsc::UnboundedSender<(SessionNotification, Sender<()>)>,
+        session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
         client_tx: mpsc::UnboundedSender<ClientOp>,
-        config: Config,
+        config: CodexConfig,
     ) -> Self {
-        let auth = AuthManager::shared(
-            config.codex_home.clone(),
-        );
+        let auth = AuthManager::shared(config.codex_home.clone());
         let conversation_manager = ConversationManager::new(auth.clone());
 
         Self {
             session_update_tx,
-            next_session_id: Cell::new(1),
             sessions: Rc::new(RefCell::new(HashMap::new())),
             config,
             conversation_manager: Arc::new(conversation_manager),
-            next_submit_seq: Cell::new(1),
-            auth_manager: Arc::new(std::sync::RwLock::new(auth)),
-            extra_available_commands: Rc::new(RefCell::new(Vec::new())),
+            auth_manager: Arc::new(RwLock::new(auth)),
+            available_commands: commands::built_in_commands(),
             client_tx,
+            client_capabilities: RefCell::new(Default::default()),
         }
     }
 
     pub fn send_message_chunk(
         &self,
-        session_id: &SessionId,
-        content: ContentBlock,
+        session_id: &acp::SessionId,
+        content: acp::ContentBlock,
         tx: Sender<()>,
     ) -> Result<(), Error> {
         self.session_update_tx
             .send((
-                SessionNotification {
+                acp::SessionNotification {
                     session_id: session_id.clone(),
-                    update: SessionUpdate::AgentMessageChunk { content },
+                    update: acp::SessionUpdate::AgentMessageChunk { content },
                     meta: None,
                 },
                 tx,
@@ -130,9 +84,9 @@ impl CodexAgent {
         Ok(())
     }
 
-    fn handle_response_outcome(&self, resp: RequestPermissionResponse) -> ReviewDecision {
-        let decision = match resp.outcome {
-            RequestPermissionOutcome::Selected { option_id } => {
+    fn handle_response_outcome(&self, resp: acp::RequestPermissionResponse) -> ReviewDecision {
+        match resp.outcome {
+            acp::RequestPermissionOutcome::Selected { option_id } => {
                 if option_id.0.as_ref() == "approve" {
                     ReviewDecision::Approved
                 } else if option_id.0.as_ref() == "approve_for_session" {
@@ -141,49 +95,68 @@ impl CodexAgent {
                     ReviewDecision::Denied
                 }
             }
-            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
-        };
-        decision
+            acp::RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
+        }
     }
+
+    fn normalize_stream_chunk(chunk: String) -> String {
+        if chunk.trim_end().ends_with("**") && !chunk.ends_with("**\n") {
+            let mut chunk = chunk;
+            chunk.push_str("\n\n");
+            chunk
+        } else {
+            chunk
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ClientOp {
+    RequestPermission(
+        acp::RequestPermissionRequest,
+        Sender<Result<acp::RequestPermissionResponse, Error>>,
+    ),
 }
 
 #[async_trait::async_trait(?Send)]
 impl Agent for CodexAgent {
-    async fn initialize(&self, args: InitializeRequest) -> Result<InitializeResponse, Error> {
+    async fn initialize(
+        &self,
+        args: acp::InitializeRequest,
+    ) -> Result<acp::InitializeResponse, Error> {
         info!(?args, "Received initialize request");
-
+        // Advertise supported auth methods. We surface both ChatGPT and API key.
         let auth_methods = vec![
-            AuthMethod {
-                id: AuthMethodId("chatgpt".into()),
+            acp::AuthMethod {
+                id: acp::AuthMethodId("chatgpt".into()),
                 name: "ChatGPT".into(),
                 description: Some("Sign in with ChatGPT to use your plan".into()),
                 meta: None,
             },
-            AuthMethod {
-                id: AuthMethodId("apikey".into()),
+            acp::AuthMethod {
+                id: acp::AuthMethodId("apikey".into()),
                 name: "OpenAI API Key".into(),
                 description: Some("Use OPENAI_API_KEY from environment or auth.json".into()),
                 meta: None,
             },
         ];
-
-        let capacities = AgentCapabilities {
+        self.client_capabilities.replace(args.client_capabilities);
+        let capacities = acp::AgentCapabilities {
             load_session: true,
-            prompt_capabilities: PromptCapabilities {
+            prompt_capabilities: acp::PromptCapabilities {
                 image: true,
                 audio: false,
                 embedded_context: true,
                 meta: None,
             },
-            mcp_capabilities: McpCapabilities {
+            mcp_capabilities: acp::McpCapabilities {
                 http: true,
                 sse: true,
                 meta: None,
             },
             meta: None,
         };
-
-        Ok(InitializeResponse {
+        Ok(acp::InitializeResponse {
             protocol_version: V1,
             agent_capabilities: capacities,
             auth_methods,
@@ -191,22 +164,17 @@ impl Agent for CodexAgent {
         })
     }
 
-    async fn authenticate(&self, args: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
+    async fn authenticate(
+        &self,
+        args: acp::AuthenticateRequest,
+    ) -> Result<acp::AuthenticateResponse, Error> {
         info!(?args, "Received authenticate request");
         let method = args.method_id.0.as_ref();
         match method {
-            "chatgpt" => {
-                if let Ok(am) = self.auth_manager.read() {
-                    am.reload();
-                    if am.auth().is_some() {
-                        return Ok(Default::default());
-                    }
-                }
-                Err(Error::auth_required()
-                    .with_data("Not signed in. Please run 'codex login' to sign in with ChatGPT."))
-            }
             "apikey" => {
                 if let Ok(am) = self.auth_manager.write() {
+                    // Persisting the API key is handled by Codex core when reloading;
+                    // here we simply reload and check.
                     am.reload();
                     if am.auth().is_some() {
                         return Ok(Default::default());
@@ -220,33 +188,32 @@ impl Agent for CodexAgent {
         }
     }
 
-    async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+    async fn new_session(
+        &self,
+        args: acp::NewSessionRequest,
+    ) -> Result<acp::NewSessionResponse, Error> {
         info!(?args, "Received new session request");
-        let session_id = self.next_session_id.get();
-        self.next_session_id.set(session_id + 1);
-
         // Start a new Codex conversation for this session
-        let codex_config = self.config.clone();
-
-        let (conversation_id, conversation_opt) = match self
+        let (conversation_id, conversation_opt, session_configured) = match self
             .conversation_manager
-            .new_conversation(codex_config)
+            .new_conversation(self.config.clone())
             .await
         {
             Ok(NewConversation {
                 conversation_id,
                 conversation,
-                session_configured: _,
-            }) => (conversation_id, Some(conversation)),
+                session_configured,
+            }) => (conversation_id, Some(conversation), session_configured),
             Err(e) => {
                 warn!(error = %e, "Failed to create Codex conversation");
-                (codex_protocol::mcp_protocol::ConversationId::new(), None)
+                return Err(Error::into_internal_error(e));
             }
         };
 
+        let session_id = session_configured.session_id.to_string();
         // Track the session
         self.sessions.borrow_mut().insert(
-            session_id.to_string(),
+            session_id.clone(),
             SessionState {
                 created: SystemTime::now(),
                 conversation_id: conversation_id.to_string(),
@@ -257,17 +224,18 @@ impl Agent for CodexAgent {
             },
         );
 
-        // Advertise available slash commands to the client
+        // Advertise available slash commands to the client right after
+        // the session is created. Send it asynchronously to avoid racing
+        // with the NewSessionResponse delivery.
         {
-            let available_commands = self.available_commands();
-            let session_id_for_update = SessionId(session_id.to_string().into());
+            let available_commands = self.available_commands.clone();
             let tx_updates = self.session_update_tx.clone();
             task::spawn_local(async move {
                 let (tx, rx) = oneshot::channel();
                 let _ = tx_updates.send((
-                    SessionNotification {
-                        session_id: session_id_for_update,
-                        update: SessionUpdate::AvailableCommandsUpdate { available_commands },
+                    acp::SessionNotification {
+                        session_id: acp::SessionId(session_id.clone().into()),
+                        update: acp::SessionUpdate::AvailableCommandsUpdate { available_commands },
                         meta: None,
                     },
                     tx,
@@ -276,236 +244,42 @@ impl Agent for CodexAgent {
             });
         }
 
-        // Discover custom prompts and advertise them as additional commands
-        {
-            let sid_str = session_id.to_string();
-            let tx_updates = self.session_update_tx.clone();
-            let submit_seq = self.next_submit_seq.get();
-            self.next_submit_seq.set(submit_seq + 1);
-            let submit_id = format!("s{}-{}", sid_str, submit_seq);
-            let session_map = self.sessions.borrow();
-            let extra_cache = self.extra_available_commands.clone();
-            if let Some(state) = session_map.get(&sid_str) {
-                let conversation = state.conversation.clone();
-                let session_id_for_update = SessionId(sid_str.clone().into());
-                task::spawn_local(async move {
-                    let Some(conversation) = conversation else {
-                        return;
-                    };
-
-                    // Request custom prompts
-                    let _ = conversation
-                        .submit_with_id(Submission {
-                            id: submit_id.clone(),
-                            op: Op::ListCustomPrompts,
-                        })
-                        .await;
-
-                    // Wait for response and then update available commands
-                    loop {
-                        match conversation.next_event().await {
-                            Ok(event) if event.id == submit_id => {
-                                match event.msg {
-                                    EventMsg::ListCustomPromptsResponse(resp) => {
-                                        // Build extra commands from custom prompts and cache them
-                                        let mut extra: Vec<AvailableCommand> = Vec::new();
-                                        for p in resp.custom_prompts {
-                                            let desc =
-                                                format!("custom prompt ({})", p.path.display());
-                                            extra.push(AvailableCommand {
-                                                name: p.name,
-                                                description: desc,
-                                                input: Some(AvailableCommandInput::Unstructured {
-                                                    hint: "Additional input (optional)".into(),
-                                                }),
-                                                meta: None,
-                                            });
-                                        }
-                                        {
-                                            let mut cache = extra_cache.borrow_mut();
-                                            *cache = extra.clone();
-                                        }
-                                        // Merge built-ins + cached extra
-                                        let mut cmds = Self::built_in_commands();
-                                        cmds.extend(extra);
-                                        let (tx, rx) = oneshot::channel();
-                                        let _ = tx_updates.send((
-                                            SessionNotification {
-                                                session_id: session_id_for_update,
-                                                update: SessionUpdate::AvailableCommandsUpdate {
-                                                    available_commands: cmds,
-                                                },
-                                                meta: None,
-                                            },
-                                            tx,
-                                        ));
-                                        let _ = rx.await;
-                                        break;
-                                    }
-                                    EventMsg::Error(_) => break,
-                                    _ => {}
-                                }
-                            }
-                            Ok(_) => continue,
-                            Err(_) => break,
-                        }
-                    }
-                });
-            }
-        }
-
-        Ok(NewSessionResponse {
-            session_id: SessionId(session_id.to_string().into()),
-            modes: None,
+        Ok(acp::NewSessionResponse {
+            session_id: acp::SessionId(session_configured.session_id.to_string().into()),
+            modes: Some(acp::SessionModeState {
+                current_mode_id: acp::SessionModeId("auto".into()),
+                available_modes: vec![
+                    acp::SessionMode {
+                        id: acp::SessionModeId("read-only".into()),
+                        name: "Read Only".to_string(),
+                        description: Some("Codex can read files and answer questions. Codex requires approval to make edits, run commands, or access network".to_string()),
+                        meta: None,
+                    },
+                    acp::SessionMode {
+                        id: acp::SessionModeId("auto".into()),
+                        name: "Auto".to_string(),
+                        description: Some("Codex can read files, make edits, and run commands in the workspace. Codex requires approval to work outside the workspace or access network".to_string()),
+                        meta: None,
+                    },
+                    acp::SessionMode {
+                        id: acp::SessionModeId("full-access".into()),
+                        name: "Full Access".to_string(),
+                        description: Some("Codex can read files, make edits, and run commands with network access, without approval. Exercise caution".to_string()),
+                        meta: None,
+                    },
+                ],
+                meta: None,
+            }),
             meta: None,
         })
     }
 
-    async fn load_session(&self, args: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
+    async fn load_session(
+        &self,
+        args: acp::LoadSessionRequest,
+    ) -> Result<acp::LoadSessionResponse, Error> {
         info!(?args, "Received load session request");
-        let sid_str = args.session_id.0.to_string();
-
-        let missing = { !self.sessions.borrow().contains_key(&sid_str) };
-        if missing {
-            // Try to start a Codex conversation for this restored session
-            let codex_config = self.config.clone();
-
-            let (conversation_id, conversation_opt) = match self
-                .conversation_manager
-                .new_conversation(codex_config)
-                .await
-            {
-                Ok(NewConversation {
-                    conversation_id,
-                    conversation,
-                    session_configured: _,
-                }) => (conversation_id, Some(conversation)),
-                Err(e) => {
-                    return Err(Error::into_internal_error(e));
-                }
-            };
-
-            // Track the session
-            self.sessions.borrow_mut().insert(
-                sid_str.clone(),
-                SessionState {
-                    created: SystemTime::now(),
-                    conversation_id: conversation_id.to_string(),
-                    conversation: conversation_opt,
-                    current_approval: AskForApproval::OnRequest,
-                    current_sandbox: SandboxPolicy::new_workspace_write_policy(),
-                    token_usage: None,
-                },
-            );
-
-            // Immediately advertise available commands to the client
-            {
-                let available_commands = self.available_commands();
-                let session_id_for_update = args.session_id.clone();
-                let tx_updates = self.session_update_tx.clone();
-                task::spawn_local(async move {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = tx_updates.send((
-                        SessionNotification {
-                            session_id: session_id_for_update,
-                            update: SessionUpdate::AvailableCommandsUpdate { available_commands },
-                            meta: None,
-                        },
-                        tx,
-                    ));
-                    let _ = rx.await;
-                });
-            }
-
-            // Discover custom prompts and refresh available commands
-            {
-                let sid = sid_str.clone();
-                let tx_updates = self.session_update_tx.clone();
-                let submit_seq = self.next_submit_seq.get();
-                self.next_submit_seq.set(submit_seq + 1);
-                let submit_id = format!("s{}-{}", sid, submit_seq);
-                let session_map = self.sessions.borrow();
-                let extra_cache = self.extra_available_commands.clone();
-                if let Some(state) = session_map.get(&sid) {
-                    let conversation = state.conversation.clone();
-                    let session_id_for_update = args.session_id.clone();
-                    task::spawn_local(async move {
-                        let Some(conversation) = conversation else {
-                            return;
-                        };
-                        let _ = conversation
-                            .submit_with_id(Submission {
-                                id: submit_id.clone(),
-                                op: Op::ListCustomPrompts,
-                            })
-                            .await;
-                        loop {
-                            match conversation.next_event().await {
-                                Ok(event) if event.id == submit_id => match event.msg {
-                                    EventMsg::ListCustomPromptsResponse(resp) => {
-                                        let mut extra: Vec<AvailableCommand> = Vec::new();
-                                        for p in resp.custom_prompts {
-                                            let desc =
-                                                format!("custom prompt ({})", p.path.display());
-                                            extra.push(AvailableCommand {
-                                                name: p.name,
-                                                description: desc,
-                                                input: Some(AvailableCommandInput::Unstructured {
-                                                    hint: "Additional input (optional)".into(),
-                                                }),
-                                                meta: None,
-                                            });
-                                        }
-                                        {
-                                            let mut cache = extra_cache.borrow_mut();
-                                            *cache = extra.clone();
-                                        }
-                                        let mut cmds = Self::built_in_commands();
-                                        cmds.extend(extra.into_iter());
-                                        let (tx, rx) = oneshot::channel();
-                                        let _ = tx_updates.send((
-                                            SessionNotification {
-                                                session_id: session_id_for_update,
-                                                update: SessionUpdate::AvailableCommandsUpdate {
-                                                    available_commands: cmds,
-                                                },
-                                                meta: None,
-                                            },
-                                            tx,
-                                        ));
-                                        let _ = rx.await;
-                                        break;
-                                    }
-                                    EventMsg::Error(_) => break,
-                                    _ => {}
-                                },
-                                Ok(_) => continue,
-                                Err(_) => break,
-                            }
-                        }
-                    });
-                }
-            }
-        } else {
-            // Even if the session exists, re-emit available commands
-            let available_commands = self.available_commands();
-            let session_id_for_update = args.session_id.clone();
-            let tx_updates = self.session_update_tx.clone();
-            task::spawn_local(async move {
-                let (tx, rx) = oneshot::channel();
-                let _ = tx_updates.send((
-                    SessionNotification {
-                        session_id: session_id_for_update,
-                        update: SessionUpdate::AvailableCommandsUpdate { available_commands },
-                        meta: None,
-                    },
-                    tx,
-                ));
-                let _ = rx.await;
-            });
-        }
-
-        Ok(LoadSessionResponse {
+        Ok(acp::LoadSessionResponse {
             modes: None,
             meta: None,
         })
@@ -513,21 +287,22 @@ impl Agent for CodexAgent {
 
     async fn set_session_mode(
         &self,
-        args: SetSessionModeRequest,
-    ) -> Result<SetSessionModeResponse, Error> {
+        args: acp::SetSessionModeRequest,
+    ) -> Result<acp::SetSessionModeResponse, Error> {
         info!(?args, "Received set session mode request");
-        let sid_str = args.session_id.0.to_string();
-        if !self.sessions.borrow().contains_key(&sid_str) {
+        // Validate session exists
+        let session_id = args.session_id.0.to_string();
+        if !self.sessions.borrow().contains_key(&session_id) {
             return Err(Error::invalid_params());
         }
 
-        // Notify client about the new current mode immediately
+        // Notify client about the new current mode immediately.
         let (tx, rx) = oneshot::channel();
         self.session_update_tx
             .send((
-                SessionNotification {
+                acp::SessionNotification {
                     session_id: args.session_id.clone(),
-                    update: SessionUpdate::CurrentModeUpdate {
+                    update: acp::SessionUpdate::CurrentModeUpdate {
                         current_mode_id: args.mode_id,
                     },
                     meta: None,
@@ -536,28 +311,19 @@ impl Agent for CodexAgent {
             ))
             .map_err(Error::into_internal_error)?;
         let _ = rx.await;
-
-        Ok(SetSessionModeResponse { meta: None })
+        Ok(acp::SetSessionModeResponse { meta: None })
     }
 
-    async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
+    async fn prompt(&self, args: acp::PromptRequest) -> Result<acp::PromptResponse, Error> {
         info!(?args, "Received prompt request");
-        let sid = args.session_id.0.to_string();
-        if !self.sessions.borrow().contains_key(&sid) {
-            warn!(session_id = %sid, "unknown session_id");
-            return Err(Error::invalid_params());
-        }
+        let session_id = args.session_id.0.to_string();
+        let session = match self.sessions.borrow().get(&session_id) {
+            Some(s) => s.clone(),
+            None => return Err(Error::invalid_params().with_data("Session not found")),
+        };
 
-        let sid_str = args.session_id.0.to_string();
-        let session = self
-            .sessions
-            .borrow()
-            .get(&sid_str)
-            .cloned()
-            .ok_or_else(Error::invalid_params)?;
-
-        // Handle slash commands
-        if let Some(ContentBlock::Text(t)) = args.prompt.first() {
+        // Handle slash commands (e.g., "/status") when the first block is text starting with '/'
+        if let Some(acp::ContentBlock::Text(t)) = args.prompt.first() {
             let line = t.text.trim();
             if let Some(cmd) = line.strip_prefix('/') {
                 let mut parts = cmd.split_whitespace();
@@ -567,104 +333,91 @@ impl Agent for CodexAgent {
                     .handle_slash_command(&args.session_id, &name, &rest)
                     .await?
                 {
-                    return Ok(PromptResponse {
-                        stop_reason: StopReason::EndTurn,
+                    return Ok(acp::PromptResponse {
+                        stop_reason: acp::StopReason::EndTurn,
                         meta: None,
                     });
                 }
             }
         }
 
-        // Ensure we have a Codex conversation for non-slash content
-        if self
-            .sessions
-            .borrow()
-            .get(&sid_str)
-            .and_then(|s| s.conversation.as_ref())
-            .is_none()
-        {
-            let msg = "No Codex backend available. Use slash commands like /status";
-            let (tx, rx) = oneshot::channel();
-            self.send_message_chunk(&args.session_id, msg.into(), tx)?;
-            let _ = rx.await;
-            return Ok(PromptResponse {
-                stop_reason: StopReason::EndTurn,
-                meta: None,
-            });
-        }
-        let conversation = self
-            .sessions
-            .borrow()
-            .get(&sid_str)
-            .and_then(|s| s.conversation.clone())
-            .unwrap();
+        // Ensure we have a Codex conversation for non-slash content.
+        let conversation = match session.conversation.as_ref() {
+            Some(conv) => conv.clone(),
+            None => {
+                let msg = "No Codex backend available. Use slash commands like /status";
+                let (tx, rx) = oneshot::channel();
+                self.send_message_chunk(&args.session_id, msg.into(), tx)?;
+                let _ = rx.await;
+                return Ok(acp::PromptResponse {
+                    stop_reason: acp::StopReason::EndTurn,
+                    meta: None,
+                });
+            }
+        };
 
-        // Build user input submission items from prompt content blocks
+        // Build user input submission items from prompt content blocks.
         let mut items: Vec<InputItem> = Vec::new();
         for block in &args.prompt {
             match block {
-                ContentBlock::Text(t) => {
+                acp::ContentBlock::Text(t) => {
                     items.push(InputItem::Text {
                         text: t.text.clone(),
                     });
                 }
-                ContentBlock::Image(img) => {
+                acp::ContentBlock::Image(img) => {
                     let url = format!("data:{};base64,{}", img.mime_type, img.data);
                     items.push(InputItem::Image { image_url: url });
                 }
-                ContentBlock::Audio(_a) => {
+                acp::ContentBlock::Audio(_a) => {
                     // Not supported by Codex input yet; skip.
                 }
-                ContentBlock::Resource(res) => {
-                    if let EmbeddedResourceResource::TextResourceContents(trc) = &res.resource {
+                acp::ContentBlock::Resource(res) => {
+                    if let acp::EmbeddedResourceResource::TextResourceContents(trc) = &res.resource
+                    {
                         items.push(InputItem::Text {
                             text: trc.text.clone(),
                         });
                     }
                 }
-                ContentBlock::ResourceLink(link) => {
+                acp::ContentBlock::ResourceLink(link) => {
                     items.push(InputItem::Text {
                         text: format!("Resource: {}", link.uri),
                     });
                 }
             }
         }
-        let submit_id = format!("s{}-{}", sid_str, self.next_submit_seq.get());
-        self.next_submit_seq.set(self.next_submit_seq.get() + 1);
 
-        let submission = Submission {
-            id: submit_id.clone(),
-            op: Op::UserInput { items },
-        };
-
-        // Enqueue work and then stream corresponding events back as ACP updates
-        conversation
-            .submit_with_id(submission)
+        // Enqueue work and then stream corresponding events back as ACP updates.
+        let submit_id = conversation
+            .submit(Op::UserInput { items })
             .await
             .map_err(Error::into_internal_error)?;
 
         let pos = Arc::new(vec![
-            PermissionOption {
-                id: PermissionOptionId("approve_for_session".into()),
+            acp::PermissionOption {
+                id: acp::PermissionOptionId("approve_for_session".into()),
                 name: "Approve for Session".into(),
-                kind: PermissionOptionKind::AllowAlways,
+                kind: acp::PermissionOptionKind::AllowAlways,
                 meta: None,
             },
-            PermissionOption {
-                id: PermissionOptionId("approve".into()),
+            acp::PermissionOption {
+                id: acp::PermissionOptionId("approve".into()),
                 name: "Approve".into(),
-                kind: PermissionOptionKind::AllowOnce,
+                kind: acp::PermissionOptionKind::AllowOnce,
                 meta: None,
             },
-            PermissionOption {
-                id: PermissionOptionId("deny".into()),
+            acp::PermissionOption {
+                id: acp::PermissionOptionId("deny".into()),
                 name: "Deny".into(),
-                kind: PermissionOptionKind::RejectOnce,
+                kind: acp::PermissionOptionKind::RejectOnce,
                 meta: None,
             },
         ]);
 
-        loop {
+        let mut saw_message_delta = false;
+        let mut saw_reasoning_delta = false;
+        let stop_reason = loop {
             let event = conversation
                 .next_event()
                 .await
@@ -675,21 +428,30 @@ impl Agent for CodexAgent {
 
             match event.msg {
                 EventMsg::AgentMessageDelta(delta) => {
+                    let chunk = Self::normalize_stream_chunk(delta.delta);
+                    saw_message_delta = true;
                     let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, delta.delta.into(), tx)?;
+                    self.send_message_chunk(&args.session_id, chunk.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
                 }
                 EventMsg::AgentMessage(msg) => {
+                    if saw_message_delta {
+                        continue;
+                    }
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(&args.session_id, msg.message.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
                 }
                 EventMsg::AgentReasoningDelta(delta) => {
+                    saw_reasoning_delta = true;
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(&args.session_id, delta.delta.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
                 }
                 EventMsg::AgentReasoning(reason) => {
+                    if saw_reasoning_delta {
+                        continue;
+                    }
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(&args.session_id, reason.text.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
@@ -697,11 +459,11 @@ impl Agent for CodexAgent {
                 // MCP tool calls → ACP ToolCall/ToolCallUpdate
                 EventMsg::McpToolCallBegin(begin) => {
                     let title = format!("{}.{}", begin.invocation.server, begin.invocation.tool);
-                    let tool = ToolCall {
-                        id: ToolCallId(begin.call_id.clone().into()),
+                    let tool = acp::ToolCall {
+                        id: acp::ToolCallId(begin.call_id.clone().into()),
                         title,
-                        kind: ToolKind::Fetch,
-                        status: ToolCallStatus::InProgress,
+                        kind: acp::ToolKind::Fetch,
+                        status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
                         locations: Vec::new(),
                         raw_input: begin.invocation.arguments,
@@ -711,9 +473,9 @@ impl Agent for CodexAgent {
                     let (tx, rx) = oneshot::channel();
                     self.session_update_tx
                         .send((
-                            SessionNotification {
+                            acp::SessionNotification {
                                 session_id: args.session_id.clone(),
-                                update: SessionUpdate::ToolCall(tool),
+                                update: acp::SessionUpdate::ToolCall(tool),
                                 meta: None,
                             },
                             tx,
@@ -722,15 +484,16 @@ impl Agent for CodexAgent {
                     let _ = rx.await;
                 }
                 EventMsg::McpToolCallEnd(end) => {
+                    // status and optional output
                     let status = if end.is_success() {
-                        ToolCallStatus::Completed
+                        acp::ToolCallStatus::Completed
                     } else {
-                        ToolCallStatus::Failed
+                        acp::ToolCallStatus::Failed
                     };
                     let raw_output = serde_json::to_value(&end.result).ok();
-                    let update = ToolCallUpdate {
-                        id: ToolCallId(end.call_id.clone().into()),
-                        fields: ToolCallUpdateFields {
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(end.call_id.clone().into()),
+                        fields: acp::ToolCallUpdateFields {
                             status: Some(status),
                             title: Some(format!(
                                 "{}.{}",
@@ -744,9 +507,9 @@ impl Agent for CodexAgent {
                     let (tx, rx) = oneshot::channel();
                     self.session_update_tx
                         .send((
-                            SessionNotification {
+                            acp::SessionNotification {
                                 session_id: args.session_id.clone(),
-                                update: SessionUpdate::ToolCallUpdate(update),
+                                update: acp::SessionUpdate::ToolCallUpdate(update),
                                 meta: None,
                             },
                             tx,
@@ -756,19 +519,17 @@ impl Agent for CodexAgent {
                 }
                 // Exec command begin/end → ACP ToolCall/ToolCallUpdate
                 EventMsg::ExecCommandBegin(beg) => {
-                    let title = beg.command.join(" ");
-                    let loc = ToolCallLocation {
-                        path: beg.cwd.clone(),
-                        line: None,
-                        meta: None,
-                    };
-                    let tool = ToolCall {
-                        id: ToolCallId(beg.call_id.clone().into()),
-                        title,
-                        kind: ToolKind::Execute,
-                        status: ToolCallStatus::InProgress,
+                    let tool = acp::ToolCall {
+                        id: acp::ToolCallId(beg.call_id.clone().into()),
+                        title: beg.command.join(" "),
+                        kind: acp::ToolKind::Execute,
+                        status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
-                        locations: vec![loc],
+                        locations: vec![acp::ToolCallLocation {
+                            path: beg.cwd.clone(),
+                            line: None,
+                            meta: None,
+                        }],
                         raw_input: Some(json!({"command": beg.command, "cwd": beg.cwd})),
                         raw_output: None,
                         meta: None,
@@ -776,9 +537,9 @@ impl Agent for CodexAgent {
                     let (tx, rx) = oneshot::channel();
                     self.session_update_tx
                         .send((
-                            SessionNotification {
+                            acp::SessionNotification {
                                 session_id: args.session_id.clone(),
-                                update: SessionUpdate::ToolCall(tool),
+                                update: acp::SessionUpdate::ToolCall(tool),
                                 meta: None,
                             },
                             tx,
@@ -788,14 +549,14 @@ impl Agent for CodexAgent {
                 }
                 EventMsg::ExecCommandEnd(end) => {
                     let status = if end.exit_code == 0 {
-                        ToolCallStatus::Completed
+                        acp::ToolCallStatus::Completed
                     } else {
-                        ToolCallStatus::Failed
+                        acp::ToolCallStatus::Failed
                     };
 
-                    let mut content: Vec<ToolCallContent> = Vec::new();
+                    let mut content: Vec<acp::ToolCallContent> = Vec::new();
                     if !end.aggregated_output.is_empty() {
-                        content.push(ToolCallContent::from(end.aggregated_output.clone()));
+                        content.push(acp::ToolCallContent::from(end.aggregated_output.clone()));
                     } else if !end.stdout.is_empty() || !end.stderr.is_empty() {
                         let merged = if !end.stderr.is_empty() {
                             format!("{}\n{}", end.stdout, end.stderr)
@@ -803,13 +564,13 @@ impl Agent for CodexAgent {
                             end.stdout.clone()
                         };
                         if !merged.is_empty() {
-                            content.push(ToolCallContent::from(merged));
+                            content.push(acp::ToolCallContent::from(merged));
                         }
                     }
 
-                    let update = ToolCallUpdate {
-                        id: ToolCallId(end.call_id.clone().into()),
-                        fields: ToolCallUpdateFields {
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(end.call_id.clone().into()),
+                        fields: acp::ToolCallUpdateFields {
                             status: Some(status),
                             content: if content.is_empty() {
                                 None
@@ -828,9 +589,9 @@ impl Agent for CodexAgent {
                     let (tx, rx) = oneshot::channel();
                     self.session_update_tx
                         .send((
-                            SessionNotification {
+                            acp::SessionNotification {
                                 session_id: args.session_id.clone(),
-                                update: SessionUpdate::ToolCallUpdate(update),
+                                update: acp::SessionUpdate::ToolCallUpdate(update),
                                 meta: None,
                             },
                             tx,
@@ -841,13 +602,13 @@ impl Agent for CodexAgent {
                 EventMsg::ExecApprovalRequest(req) => {
                     // Build a ToolCallUpdate describing the pending exec
                     let title = format!("`{}`", req.command.join(" "));
-                    let update = ToolCallUpdate {
-                        id: ToolCallId(req.call_id.clone().into()),
-                        fields: ToolCallUpdateFields {
-                            kind: Some(ToolKind::Execute),
-                            status: Some(ToolCallStatus::Pending),
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(req.call_id.clone().into()),
+                        fields: acp::ToolCallUpdateFields {
+                            kind: Some(acp::ToolKind::Execute),
+                            status: Some(acp::ToolCallStatus::Pending),
                             title: Some(title),
-                            locations: Some(vec![ToolCallLocation {
+                            locations: Some(vec![acp::ToolCallLocation {
                                 path: req.cwd.clone(),
                                 line: None,
                                 meta: None,
@@ -857,153 +618,173 @@ impl Agent for CodexAgent {
                         meta: None,
                     };
 
-                    let reqp = RequestPermissionRequest {
+                    let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
                         options: pos.as_ref().clone(),
                         meta: None,
                     };
+
                     let (txp, rxp) = oneshot::channel();
-                    let _ = self.client_tx.send(ClientOp::RequestPermission(reqp, txp));
+                    let _ = self
+                        .client_tx
+                        .send(ClientOp::RequestPermission(permission_req, txp));
                     let outcome = rxp.await.map_err(|_| Error::internal_error())?;
                     if let Ok(resp) = outcome {
                         let decision = self.handle_response_outcome(resp);
-                        // Send ExecApproval back to Codex
-                        let approval_submit_id =
-                            format!("perm-{}-{}", sid_str, self.next_submit_seq.get());
-                        self.next_submit_seq.set(self.next_submit_seq.get() + 1);
-                        if let Some(conv) = session.conversation.as_ref() {
-                            conv.submit_with_id(Submission {
-                                id: approval_submit_id,
-                                op: Op::ExecApproval {
-                                    id: event.id.clone(),
-                                    decision,
-                                },
+                        // Send ExecApproval back to Codex; refer to current event.id
+                        conversation
+                            .submit(Op::ExecApproval {
+                                id: event.id.clone(),
+                                decision,
                             })
                             .await
                             .map_err(Error::into_internal_error)?;
-                        } else {
-                            warn!("Dev mock mode: ExecApproval ignored (no backend)");
-                        }
                     }
                 }
                 EventMsg::ApplyPatchApprovalRequest(req) => {
                     // Summarize patch as content lines
-                    let mut lines = Vec::new();
+                    let mut contents = Vec::new();
                     for (path, change) in req.changes.iter() {
                         use codex_core::protocol::FileChange as FC;
-                        let s = match change {
-                            FC::Add { .. } => format!("Add {}", path.display()),
-                            FC::Delete { .. } => format!("Delete {}", path.display()),
-                            FC::Update { .. } => format!("Update {}", path.display()),
+                        match change {
+                            FC::Add { content } => {
+                                contents.push(acp::ToolCallContent::from(acp::Diff {
+                                    path: path.clone(),
+                                    old_text: Some("".into()),
+                                    new_text: content.clone(),
+                                    meta: None,
+                                }));
+                            }
+                            FC::Delete { content } => {
+                                contents.push(acp::ToolCallContent::from(acp::Diff {
+                                    path: path.clone(),
+                                    old_text: Some(content.clone()),
+                                    new_text: "".into(),
+                                    meta: None,
+                                }));
+                            }
+                            FC::Update { unified_diff, .. } => {
+                                contents.push(acp::ToolCallContent::from(acp::Diff {
+                                    path: path.clone(),
+                                    old_text: Some(unified_diff.into()),
+                                    new_text: unified_diff.clone(),
+                                    meta: None,
+                                }));
+                            }
                         };
-                        lines.push(s);
                     }
+
                     let title = if req.changes.len() == 1 {
-                        lines
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "Apply changes".into())
+                        "Apply changes".to_string()
                     } else {
                         format!("Edit {} files", req.changes.len())
                     };
-                    let update = ToolCallUpdate {
-                        id: ToolCallId(req.call_id.clone().into()),
-                        fields: ToolCallUpdateFields {
-                            kind: Some(ToolKind::Edit),
-                            status: Some(ToolCallStatus::Pending),
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(req.call_id.clone().into()),
+                        fields: acp::ToolCallUpdateFields {
+                            kind: Some(acp::ToolKind::Edit),
+                            status: Some(acp::ToolCallStatus::Pending),
                             title: Some(title),
-                            content: if lines.is_empty() {
+                            content: if contents.is_empty() {
                                 None
                             } else {
-                                Some(vec![ToolCallContent::from(lines.join("\n"))])
+                                Some(contents)
                             },
                             ..Default::default()
                         },
                         meta: None,
                     };
 
-                    let reqp = RequestPermissionRequest {
+                    let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
                         options: pos.as_ref().clone(),
                         meta: None,
                     };
                     let (txp, rxp) = oneshot::channel();
-                    let _ = self.client_tx.send(ClientOp::RequestPermission(reqp, txp));
-                    let outcome = rxp.await.map_err(|_| Error::internal_error())?;
-                    if let Ok(resp) = outcome {
+                    let _ = self
+                        .client_tx
+                        .send(ClientOp::RequestPermission(permission_req, txp));
+                    if let Ok(resp) = rxp.await.map_err(Error::into_internal_error)? {
                         let decision = self.handle_response_outcome(resp);
-                        let approval_submit_id =
-                            format!("perm-{}-{}", sid_str, self.next_submit_seq.get());
-                        self.next_submit_seq.set(self.next_submit_seq.get() + 1);
-                        if let Some(conv) = session.conversation.as_ref() {
-                            conv.submit_with_id(Submission {
-                                id: approval_submit_id,
-                                op: Op::PatchApproval {
-                                    id: event.id.clone(),
-                                    decision,
-                                },
+                        conversation
+                            .submit(Op::PatchApproval {
+                                id: event.id.clone(),
+                                decision,
                             })
                             .await
                             .map_err(Error::into_internal_error)?;
-                        } else {
-                            warn!("Dev mock mode: PatchApproval ignored (no backend)");
-                        }
                     }
                 }
                 EventMsg::TokenCount(tc) => {
                     if let Some(info) = tc.info
                         && let Ok(mut map) = self.sessions.try_borrow_mut()
-                        && let Some(state) = map.get_mut(&sid_str)
+                        && let Some(state) = map.get_mut(&session_id)
                     {
                         state.token_usage = Some(info.total_token_usage.clone());
                     }
                 }
                 EventMsg::TaskComplete(_) => {
-                    break;
+                    break acp::StopReason::EndTurn;
                 }
                 EventMsg::Error(err) => {
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(&args.session_id, err.message.into(), tx)?;
                     let _ = rx.await;
-                    break;
+                    break acp::StopReason::EndTurn;
                 }
-                // Ignore other events for now
+                EventMsg::TurnAborted(_) => {
+                    let (tx, rx) = oneshot::channel();
+                    self.send_message_chunk(&args.session_id, "".into(), tx)?;
+                    let _ = rx.await;
+                    break acp::StopReason::Cancelled;
+                }
+                // Ignore other events for now.
                 _ => {}
             }
-        }
+        };
 
-        Ok(PromptResponse {
-            stop_reason: StopReason::EndTurn,
+        Ok(acp::PromptResponse {
+            stop_reason,
             meta: None,
         })
     }
 
-    async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
+    async fn cancel(&self, args: acp::CancelNotification) -> Result<(), Error> {
         info!(?args, "Received cancel request");
-        let sid_str = args.session_id.0.to_string();
-
-        // If we have an active Codex conversation, forward an interrupt
+        let session_id = args.session_id.0.to_string();
+        // Scope borrow to avoid RefCell issues across await
         let conv_opt = {
             let sessions = self.sessions.borrow();
-            sessions.get(&sid_str).and_then(|s| s.conversation.clone())
+            sessions
+                .get(&session_id)
+                .and_then(|s| s.conversation.clone())
         };
-        if let Some(conv) = conv_opt {
-            // Best-effort: we don't need the submission id here
-            let _ = conv.submit(Op::Interrupt).await;
-        } else {
-            return Err(Error::invalid_params());
+        match conv_opt {
+            Some(conv) => {
+                // Best-effort: we don't need the submission id here.
+                let _ = conv.submit(Op::Interrupt).await;
+                // Remove session from cache after interrupt
+                self.sessions.borrow_mut().remove(&session_id);
+                Ok(())
+            }
+            None => {
+                warn!(
+                    session_id,
+                    "Cancel called but no active Codex conversation found"
+                );
+                Err(Error::invalid_params().with_data("No active Codex backend for cancel"))
+            }
         }
-        Ok(())
     }
 
-    async fn ext_method(&self, args: ExtRequest) -> Result<ExtResponse, Error> {
+    async fn ext_method(&self, args: acp::ExtRequest) -> Result<acp::ExtResponse, Error> {
         info!(method = %args.method, params = ?args.params, "Received extension method call");
         Ok(serde_json::value::to_raw_value(&json!({"example": "response"}))?.into())
     }
 
-    async fn ext_notification(&self, args: ExtNotification) -> Result<(), Error> {
+    async fn ext_notification(&self, args: acp::ExtNotification) -> Result<(), Error> {
         info!(method = %args.method, params = ?args.params, "Received extension notification call");
         Ok(())
     }

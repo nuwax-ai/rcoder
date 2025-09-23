@@ -27,17 +27,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "acp-adapter-examples"
-version = "0.1.0"
-dependencies = [
- "acp-adapter",
- "agent-client-protocol",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -54,9 +43,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc2526e80463b9742afed4829aedd6ae5632d6db778c6cc1fecb80c960c3521b"
+checksum = "00e33b9f4bd34d342b6f80b7156d3a37a04aeec16313f264001e52d6a9118600"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -158,9 +147,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.99"
+version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
+checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "arboard"
@@ -657,6 +646,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-acp"
+version = "0.1.0"
+source = "git+https://github.com/cola-io/codex-acp?branch=main#35998597b0e984a347ade480b5d9b017ba9bce15"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "codex-core",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "codex-acp-agent"
 version = "0.1.0"
 dependencies = [
@@ -664,6 +669,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "codex-acp",
  "codex-cli",
  "codex-core",
  "codex-protocol",
@@ -1915,12 +1921,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashbrown"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2321,7 +2321,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.0",
+ "hashbrown 0.15.5",
  "serde",
  "serde_core",
 ]

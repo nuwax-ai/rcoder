@@ -6,6 +6,7 @@
 //! - 每个项目有独立的 agent 进程和 client 连接
 
 use anyhow::Result;
+use codex_core::config::Config;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -21,7 +22,7 @@ use agent_client_protocol::{
     InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
     PromptRequest, PromptResponse,
 };
-use codex_acp_agent::{CodexAgent, Config};
+use codex_acp_agent::{CodexAgent};
 
 // ==================== Session Notification 相关数据结构 ====================
 

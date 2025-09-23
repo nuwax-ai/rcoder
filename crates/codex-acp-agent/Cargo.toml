@@ -19,6 +19,9 @@ codex-cli = { git = "https://github.com/openai/codex" , branch = "main"}
 codex-core = { git = "https://github.com/openai/codex" , branch = "main"}
 codex-protocol = { git = "https://github.com/openai/codex" , branch = "main"}
 
+
+codex-acp = { git = "https://github.com/cola-io/codex-acp" , branch = "main"}
+
 agent-client-protocol = { workspace = true }
 acp-adapter = { path = "../acp_adapter" }
 anyhow = { workspace = true }
