@@ -270,6 +270,7 @@ impl ProgressEvent {
 }
 
 /// Session 消息管理器 - 为每个 session_id 维护循环数组缓存
+#[derive(Debug)]
 pub struct SessionMessageManager {
     /// 消息缓存映射 (session_id -> 循环数组)
     message_cache: dashmap::DashMap<String, CircularBuffer<ProgressEvent>>,
