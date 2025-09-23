@@ -261,8 +261,8 @@ pub async fn start_codex_acp_agent_service(
                 req.session_id = session_resp.session_id.clone();
             }
             match client_conn.prompt(req).await {
-                Ok(_) => {
-                    debug!("Prompt 发送成功");
+                Ok(resp) => {
+                    debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
                 }
                 Err(e) => {
                     error!("发送 Prompt 失败: {:?}", e);

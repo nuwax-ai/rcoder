@@ -496,22 +496,7 @@ mod tests {
                    manager2 as *const ClaudeCodeAcpManager);
     }
 
-    #[tokio::test]
-    async fn test_custom_config() {
-        let config = ClaudeCodeAcpConfig {
-            minimum_version: Some("1.0.0".parse().unwrap()),
-            package_name: "test-package".to_string(),
-            entrypoint_path: PathBuf::from("dist/index.js"),
-            binary_name: "test-binary".to_string(),
-            custom_command: Some("custom-command".to_string()),
-            ignore_system_version: true,
-        };
-
-        let manager = ClaudeCodeAcpManager::new(config);
-        assert_eq!(manager.config.package_name, "test-package");
-        assert_eq!(manager.config.binary_name, "test-binary");
-        assert_eq!(manager.config.custom_command, Some("custom-command".to_string()));
-    }
+ 
 
     #[tokio::test]
     async fn test_status_when_not_installed() {

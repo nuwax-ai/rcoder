@@ -9,7 +9,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::model::ChatPrompt;
+use agent_client_protocol::PermissionOptionKind as Kind;
 use anyhow::{Context, Result};
+use tokio::io::AsyncWriteExt;
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -22,7 +24,10 @@ pub struct ClaudeCodeAcpClient {
 
 impl ClaudeCodeAcpClient {
     /// 创建新的客户端实例
-    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<acp::SessionNotification>) {
+    pub fn new() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<acp::SessionNotification>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Self {
@@ -37,23 +42,66 @@ impl ClaudeCodeAcpClient {
 impl acp::Client for ClaudeCodeAcpClient {
     async fn request_permission(
         &self,
-        _args: acp::RequestPermissionRequest,
+        args: acp::RequestPermissionRequest,
     ) -> Result<acp::RequestPermissionResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
+        debug!("请求权限: {:?}", args);
+        // 自动允许：优先选择 AllowAlways，其次 AllowOnce；若都无，选第一个选项
+        let selected = args
+            .options
+            .iter()
+            .find(|o| o.kind == Kind::AllowAlways)
+            .or_else(|| args.options.iter().find(|o| o.kind == Kind::AllowOnce))
+            .or_else(|| args.options.first());
+        if let Some(option) = selected {
+            return Ok(acp::RequestPermissionResponse {
+                outcome: agent_client_protocol::RequestPermissionOutcome::Selected {
+                    option_id: option.id.clone(),
+                },
+                meta: None,
+            });
+        }
+        // 无可选项则取消
+        Ok(acp::RequestPermissionResponse {
+            outcome: agent_client_protocol::RequestPermissionOutcome::Cancelled,
+            meta: None,
+        })
     }
 
     async fn write_text_file(
         &self,
-        _args: acp::WriteTextFileRequest,
+        args: acp::WriteTextFileRequest,
     ) -> Result<acp::WriteTextFileResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
+        debug!("写入文件: {:?}", args);
+        if let Some(parent) = std::path::Path::new(&args.path).parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                error!("创建目录失败: {}", e);
+                acp::Error::internal_error()
+            })?;
+        }
+        let mut file = tokio::fs::File::create(&args.path).await.map_err(|e| {
+            error!("创建文件失败: {}", e);
+            acp::Error::internal_error()
+        })?;
+        file.write_all(args.content.as_bytes()).await.map_err(|e| {
+            error!("写入文件失败: {}", e);
+            acp::Error::internal_error()
+        })?;
+        Ok(acp::WriteTextFileResponse { meta: None })
     }
 
     async fn read_text_file(
         &self,
-        _args: acp::ReadTextFileRequest,
+        args: acp::ReadTextFileRequest,
     ) -> Result<acp::ReadTextFileResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
+        debug!("读取文件: {:?}", args);
+        let content = tokio::fs::read_to_string(&args.path).await.map_err(|e| {
+            error!("读取文件失败: {}", e);
+            acp::Error::internal_error()
+        })?;
+        Ok(acp::ReadTextFileResponse {
+            content,
+            meta: None,
+        })
     }
 
     async fn create_terminal(
@@ -167,6 +215,11 @@ pub async fn start_claude_code_acp_agent_service(
     let prompt_tx_for_closure = prompt_tx.clone();
     let project_path_for_closure = project_path.clone();
 
+    info!(
+        "项目工作目录: {}",
+        &project_path_for_closure.to_string_lossy()
+    );
+
     // 启动后台任务来管理子进程和 ACP 连接
     tokio::task::spawn_local(async move {
         // 创建 LocalSet 来运行非 Send 的 ACP 连接
@@ -175,6 +228,11 @@ pub async fn start_claude_code_acp_agent_service(
         let result = local_set
             .run_until(async {
                 // 启动子进程
+                // 追加 yolo 模式（跳过权限确认）参数
+                let mut spawn_args = command.args.clone();
+                if !spawn_args.contains(&"--dangerously-skip-permissions".to_string()) {
+                    spawn_args.push("--dangerously-skip-permissions".to_string());
+                }
                 // 合并命令自带 env 与当前进程中的必需 ANTHROPIC_* 环境变量
                 let mut merged_envs: std::collections::HashMap<String, String> =
                     command.env.unwrap_or_default();
@@ -189,7 +247,7 @@ pub async fn start_claude_code_acp_agent_service(
                     }
                 }
                 let mut child = tokio::process::Command::new(&command.path)
-                    .args(&command.args)
+                    .args(&spawn_args)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -274,7 +332,15 @@ pub async fn start_claude_code_acp_agent_service(
                 let init_result = client_conn
                     .initialize(InitializeRequest {
                         protocol_version: VERSION,
-                        client_capabilities: ClientCapabilities::default(),
+                        client_capabilities: ClientCapabilities {
+                            fs: agent_client_protocol::FileSystemCapability {
+                                read_text_file: true,
+                                write_text_file: true,
+                                meta: None,
+                            },
+                            terminal: false,
+                            meta: None,
+                        },
                         meta: None,
                     })
                     .await;
