@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "examples"]
+members = ["crates/*"]
 exclude = ["tmp/*", "crates/ai-agents"]
 resolver = "2"
 
@@ -132,27 +132,20 @@ base64 = "0.22"
 circular-buffer = "1.2"
 fancy-regex = "0.16"
 fuzzy = "0.0.1"
-git_hosting_providers = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "git_hosting_providers" }
 globset = "0.4"
 image = "0.25"
 indexmap = "2.11"
 pathdiff = "0.2"
 postage = "0.5"
-prettier = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "prettier" }
 regex = "1.0"
 semver = "1.0"
 shellexpand = "3.1"
 shlex = "1.0"
 smallvec = "1.15"
-snippet = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "snippet" }
-snippet_provider = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "snippet_provider" }
-sum_tree = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "sum_tree" }
+
 toml = "0.9"
 which = "8.0"
-dap = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "dap" }
-dap_adapters = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "dap_adapters" }
-extension = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "extension" }
-release_channel = { git = "https://github.com/zed-industries/zed.git", branch = "main", package = "release_channel" }
+
 
 # Dev dependencies for testing
 ctor = "0.5"

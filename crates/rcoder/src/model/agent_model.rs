@@ -4,11 +4,19 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 /// 使用Agent代理的工具类型,都是使用ACP协议包装过的agent代理
+///
+#[derive(Debug, Clone)]
 pub enum AgentType {
     /// OpenAI Codex 代理
     Codex,
     /// Claude Code 代理
     Claude,
+}
+
+impl Default for AgentType {
+    fn default() -> Self {
+        Self::Codex
+    }
 }
 
 /// 项目id与 Agent 服务池，一个项目对应一个 Agent 服务

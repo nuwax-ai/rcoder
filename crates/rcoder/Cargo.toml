@@ -16,6 +16,7 @@ nuwax_parser = { path = "../nuwax_parser" }
 acp-adapter = { path = "../acp_adapter" }
 codex-acp-agent = { path = "../codex-acp-agent" }
 codex-core = { git = "https://github.com/openai/codex" , branch = "main" }
+claude = { path = "../claude" }
 
 # ACP Protocol
 agent-client-protocol = { workspace = true }
@@ -57,11 +58,3 @@ axum-tracing-opentelemetry = { workspace = true }
 # File system
 tokio-fs = { workspace = true }
 path-clean = { workspace = true }
-
-[[example]]
-name = "real_acp_example"
-path = "../../examples/real_acp_example.rs"
-
-[[example]]
-name = "simple_acp_test"
-path = "../../examples/simple_acp_test.rs"
