@@ -228,11 +228,8 @@ pub async fn start_claude_code_acp_agent_service(
         let result = local_set
             .run_until(async {
                 // 启动子进程
-                // 追加 yolo 模式（跳过权限确认）参数
-                let mut spawn_args = command.args.clone();
-                if !spawn_args.contains(&"--dangerously-skip-permissions".to_string()) {
-                    spawn_args.push("--dangerously-skip-permissions".to_string());
-                }
+                // 启动参数保持原样，由环境变量 CLAUDE_CODE_ARGS 控制
+                let spawn_args = command.args.clone();
                 // 合并命令自带 env 与当前进程中的必需 ANTHROPIC_* 环境变量
                 let mut merged_envs: std::collections::HashMap<String, String> =
                     command.env.unwrap_or_default();
@@ -245,6 +242,15 @@ pub async fn start_claude_code_acp_agent_service(
                     if let Ok(val) = std::env::var(key) {
                         merged_envs.insert(key.to_string(), val);
                     }
+                }
+                // 通过环境变量为子进程传递 CLAUDE_CODE_ARGS（默认开启 yolo 模式）
+                if let Ok(val) = std::env::var("CLAUDE_CODE_ARGS") {
+                    merged_envs.insert("CLAUDE_CODE_ARGS".to_string(), val);
+                } else {
+                    merged_envs.insert(
+                        "CLAUDE_CODE_ARGS".to_string(),
+                        "--dangerously-skip-permissions".to_string(),
+                    );
                 }
                 let mut child = tokio::process::Command::new(&command.path)
                     .args(&spawn_args)
