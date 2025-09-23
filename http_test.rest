@@ -7,7 +7,7 @@ Content-Type: application/json
 
 {
   "user_id": "test_user",
-  "prompt": "Hello, 请帮我创建一个简单的 Rust 项目",
+  "prompt": "请帮我创建一个扫雷游戏的前端项目,可以在网页上玩",
   "agent_type": "codex"
 }
 

@@ -12,7 +12,9 @@ use agent_client_protocol::{
 };
 
 use codex_acp_agent::CodexAgent;
-use codex_core::config::{Config, ConfigToml, find_codex_home, load_config_as_toml};
+use codex_core::config::{Config, ConfigToml, find_codex_home, load_config_as_toml, ConfigOverrides};
+use codex_core::protocol_config_types::SandboxMode;
+use codex_core::protocol::AskForApproval;
 use dashmap::DashMap;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -171,6 +173,7 @@ pub async fn build_prompt_to_acp_agent(
 }
 
 /// 启动一个长驻的 ACP Agent 服务，返回会话信息和一个用于持续发送 Prompt 的通道
+/// 默认启用 YOLO 模式（禁用沙箱和批准请求）
 pub async fn start_acp_agent_service(
     chat_prompt: ChatPrompt,
 ) -> Result<(SessionId, mpsc::UnboundedSender<PromptRequest>)> {
@@ -203,9 +206,17 @@ pub async fn start_acp_agent_service(
     
     info!("Loaded codex config: {:?}", cfg);
 
+    // 默认启用 YOLO 模式配置覆盖
+    let mut config_overrides = ConfigOverrides::default();
+    
+    info!("启用 YOLO 模式: 禁用沙箱，禁用批准请求");
+    config_overrides.sandbox_mode = Some(SandboxMode::DangerFullAccess);
+    config_overrides.approval_policy = Some(AskForApproval::Never);
+    config_overrides.cwd = Some(project_path.clone());
+
     let config = Config::load_from_base_config_with_overrides(
         cfg,
-        codex_core::config::ConfigOverrides::default(),
+        config_overrides,
         project_path.clone(),
     )
     .map_err(|e| {
