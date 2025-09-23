@@ -98,7 +98,7 @@ pub async fn agent_worker(
         let project_and_agent_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
         if project_and_agent_info.is_none() {
             //创建 agent 服务
-            match start_acp_agent_service(chat_prompt.clone()).await {
+            match start_codex_acp_agent_service(chat_prompt.clone()).await {
                 Ok((session_id, prompt_tx)) => {
                     let project_and_agent_info = ProjectAndAgentInfo {
                         project_id: project_id.clone(),
@@ -176,7 +176,7 @@ pub async fn build_prompt_to_acp_agent(
 
 /// 启动一个长驻的 ACP Agent 服务，返回会话信息和一个用于持续发送 Prompt 的通道
 /// 默认启用 YOLO 模式（禁用沙箱和批准请求）
-pub async fn start_acp_agent_service(
+pub async fn start_codex_acp_agent_service(
     chat_prompt: ChatPrompt,
 ) -> Result<(SessionId, mpsc::UnboundedSender<PromptRequest>)> {
     let project_path = chat_prompt.project_path;

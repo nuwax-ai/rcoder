@@ -11,26 +11,7 @@ use tracing::{debug, error, info};
 /// Claude Code ACP 客户端实现
 ///
 /// 实现了 acp::Client trait，用于处理来自代理的请求和通知
-pub struct ClaudeCodeAcpClient {
-    session_notifications: tokio::sync::mpsc::UnboundedSender<acp::SessionNotification>,
-}
-
-impl ClaudeCodeAcpClient {
-    /// 创建新的客户端实例
-    pub fn new() -> Self {
-        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
-        Self {
-            session_notifications: tx,
-        }
-    }
-
-    /// 获取会话通知发送器
-    pub fn session_notification_tx(
-        &self,
-    ) -> &tokio::sync::mpsc::UnboundedSender<acp::SessionNotification> {
-        &self.session_notifications
-    }
-}
+pub struct ClaudeCodeAcpClient;
 
 #[async_trait::async_trait(?Send)]
 impl acp::Client for ClaudeCodeAcpClient {
@@ -91,8 +72,28 @@ impl acp::Client for ClaudeCodeAcpClient {
     }
 
     async fn session_notification(&self, args: acp::SessionNotification) -> Result<(), acp::Error> {
-        // 转发会话通知到通道
-        let _ = self.session_notifications.send(args);
+        //TODO 需要实现
+        match args.update {
+            acp::SessionUpdate::AgentMessageChunk { content } => {
+                let text = match content {
+                    acp::ContentBlock::Text(text_content) => text_content.text,
+                    acp::ContentBlock::Image(_) => "<image>".into(),
+                    acp::ContentBlock::Audio(_) => "<audio>".into(),
+                    acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri,
+                    acp::ContentBlock::Resource(_) => "<resource>".into(),
+                };
+                info!("| Agent session_notification : {text}");
+            }
+            acp::SessionUpdate::UserMessageChunk { .. }
+            | acp::SessionUpdate::AgentThoughtChunk { .. }
+            | acp::SessionUpdate::ToolCall(_)
+            | acp::SessionUpdate::ToolCallUpdate(_)
+            | acp::SessionUpdate::Plan(_)
+            | acp::SessionUpdate::CurrentModeUpdate { .. }
+            | acp::SessionUpdate::AvailableCommandsUpdate { .. } => {
+                info!("| Other session_notification: {:?}", args.update);
+            }
+        }
         Ok(())
     }
 
