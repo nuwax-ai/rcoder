@@ -1,6 +1,7 @@
 use acp_adapter::SessionId;
-use agent_client_protocol::{Client, PromptRequest};
+use agent_client_protocol::{self as acp, Client, PromptRequest};
 use tokio::sync::mpsc;
+use tracing::info;
 
 /// 使用Agent代理的工具类型,都是使用ACP协议包装过的agent代理
 pub enum AgentType {
@@ -88,9 +89,30 @@ impl Client for EmbeddedClient {
 
     async fn session_notification(
         &self,
-        _notification: agent_client_protocol::SessionNotification,
+        args: agent_client_protocol::SessionNotification,
     ) -> Result<(), agent_client_protocol::Error> {
         //TODO 需要实现
+        match args.update {
+            acp::SessionUpdate::AgentMessageChunk { content } => {
+                let text = match content {
+                    acp::ContentBlock::Text(text_content) => text_content.text,
+                    acp::ContentBlock::Image(_) => "<image>".into(),
+                    acp::ContentBlock::Audio(_) => "<audio>".into(),
+                    acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri,
+                    acp::ContentBlock::Resource(_) => "<resource>".into(),
+                };
+                info!("| Agent session_notification : {text}");
+            }
+            acp::SessionUpdate::UserMessageChunk { .. }
+            | acp::SessionUpdate::AgentThoughtChunk { .. }
+            | acp::SessionUpdate::ToolCall(_)
+            | acp::SessionUpdate::ToolCallUpdate(_)
+            | acp::SessionUpdate::Plan(_)
+            | acp::SessionUpdate::CurrentModeUpdate { .. }
+            | acp::SessionUpdate::AvailableCommandsUpdate { .. } => {
+                info!("| Other session_notification: {:?}", args.update);
+            }
+        }
         Ok(())
     }
 

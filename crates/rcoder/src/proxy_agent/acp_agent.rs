@@ -198,76 +198,64 @@ pub async fn start_acp_agent_service(
     let (client_to_agent_rx, client_to_agent_tx) = piper::pipe(1024);
     let (agent_to_client_rx, agent_to_client_tx) = piper::pipe(1024);
 
-    // LocalSet 环境
-    let local_set = tokio::task::LocalSet::new();
-
     // 用于外部持续发送 prompt 的通道
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
 
     // 在 LocalSet 中启动服务
     let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
 
-    local_set
-        .run_until(async move {
-            let embedded_client = EmbeddedClient {};
+    let embedded_client = EmbeddedClient {};
 
-            // 两端连接
-            let (_server_conn, server_io_task) = AgentSideConnection::new(
-                agent.clone(),
-                agent_to_client_tx,
-                client_to_agent_rx,
-                |fut| {
-                    tokio::task::spawn_local(fut);
-                },
-            );
+    // 两端连接
+    let (_server_conn, server_io_task) = AgentSideConnection::new(
+        agent.clone(),
+        agent_to_client_tx,
+        client_to_agent_rx,
+        |fut| {
+            tokio::task::spawn_local(fut);
+        },
+    );
 
-            let (client_conn, client_io_task) = ClientSideConnection::new(
-                embedded_client,
-                client_to_agent_tx,
-                agent_to_client_rx,
-                |fut| {
-                    tokio::task::spawn_local(fut);
-                },
-            );
+    let (client_conn, client_io_task) = ClientSideConnection::new(
+        embedded_client,
+        client_to_agent_tx,
+        agent_to_client_rx,
+        |fut| {
+            tokio::task::spawn_local(fut);
+        },
+    );
 
-            // 持续运行 IO
-            tokio::task::spawn_local(server_io_task);
-            tokio::task::spawn_local(client_io_task);
+    // 持续运行 IO
+    tokio::task::spawn_local(server_io_task);
+    tokio::task::spawn_local(client_io_task);
 
-            // 初始化 + 创建会话
-            client_conn
-                .initialize(InitializeRequest {
-                    protocol_version: VERSION,
-                    client_capabilities: ClientCapabilities::default(),
-                    meta: None,
-                })
-                .await?;
-            let session_resp = client_conn
-                .new_session(NewSessionRequest {
-                    mcp_servers: Vec::new(),
-                    cwd: project_path.clone(),
-                    meta: None,
-                })
-                .await?;
-
-            let _ = session_id_tx.send(session_resp.session_id.clone());
-
-            // 长驻循环：接收外部 prompt 并转发到 ACP
-            tokio::task::spawn_local(async move {
-                while let Some(mut req) = prompt_rx.recv().await {
-                    if req.session_id.0.is_empty() {
-                        req.session_id = session_resp.session_id.clone();
-                    }
-                    let _ = client_conn.prompt(req).await; // 错误可在上层处理或加日志
-                }
-            });
-
-            // 阻塞在一个挂起的 future 上，保持 LocalSet 不退出
-            futures::future::pending::<()>().await;
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
+    // 初始化 + 创建会话
+    client_conn
+        .initialize(InitializeRequest {
+            protocol_version: VERSION,
+            client_capabilities: ClientCapabilities::default(),
+            meta: None,
         })
         .await?;
+    let session_resp = client_conn
+        .new_session(NewSessionRequest {
+            mcp_servers: Vec::new(),
+            cwd: project_path.clone(),
+            meta: None,
+        })
+        .await?;
+
+    let _ = session_id_tx.send(session_resp.session_id.clone());
+
+    // 长驻循环：接收外部 prompt 并转发到 ACP
+    tokio::task::spawn_local(async move {
+        while let Some(mut req) = prompt_rx.recv().await {
+            if req.session_id.0.is_empty() {
+                req.session_id = session_resp.session_id.clone();
+            }
+            let _ = client_conn.prompt(req).await; // 错误可在上层处理或加日志
+        }
+    });
 
     let session_id = session_id_rx.await?;
     Ok((session_id, prompt_tx))
