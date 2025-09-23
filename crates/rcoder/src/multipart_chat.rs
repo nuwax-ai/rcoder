@@ -1,4 +1,4 @@
-use crate::{SharedState, AppState, ProgressEvent, ProgressEventType, broadcast_progress_event, create_new_session, update_session_activity, execute_ai_command, ChatResponse, HttpResult};
+use crate::{SharedState, AppState, ProgressEvent, ProgressEventType, broadcast_progress_event, execute_ai_command, ChatResponse, HttpResult};
 use acp_adapter::mention::{ResourceUri, ResourceUriBuilder};
 use acp_adapter::permission::{PermissionManager, PermissionEvent};
 use acp_adapter::capability::{AgentConnection, PermissionCapability};
@@ -71,6 +71,7 @@ pub async fn handle_multipart_chat(
 
     // 临时简化实现
     let chat_response = ChatResponse {
+        project_id: "temp_multipart_project".to_string(),
         session_id: "temp_multipart_session".to_string(),
         response: "临时响应：多媒体功能正在维护中".to_string(),
         status: "success".to_string(),

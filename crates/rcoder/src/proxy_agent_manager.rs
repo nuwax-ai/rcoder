@@ -16,15 +16,14 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::process::Command;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{info, warn, error, debug};
 use uuid::Uuid;
 use piper;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::{Client, ClientSideConnection, AgentSideConnection, Agent, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId};
-use async_trait::async_trait;
+use agent_client_protocol::{
+    Agent, AgentSideConnection, ClientSideConnection, InitializeRequest
+};
 use anyhow::{anyhow, Result as AnyhowResult};
 use codex_acp_agent::{CodexAgent, Config};
 
@@ -104,21 +103,6 @@ pub enum ProxyRequest {
         prompt: String,
         response_tx: oneshot::Sender<ProxyResult<(String, String)>>,
     },
-    /// 创建 Agent 服务
-    CreateAgent {
-        project_id: String,
-        response_tx: oneshot::Sender<ProxyResult<()>>,
-    },
-    /// 获取服务状态
-    GetStatus {
-        project_id: String,
-        response_tx: oneshot::Sender<ProxyResult<AgentServiceStatus>>,
-    },
-    /// 停止服务
-    StopAgent {
-        project_id: String,
-        response_tx: oneshot::Sender<ProxyResult<()>>,
-    },
 }
 
 /// Agent 请求类型
@@ -126,7 +110,7 @@ pub enum ProxyRequest {
 pub enum AgentRequest {
     /// 初始化
     Initialize,
-    /// 处理 prompt
+    /// 处理 prompt - 内部处理 session_id 逻辑
     Prompt {
         session_id: Option<String>,
         content: String,
@@ -161,6 +145,8 @@ pub struct AcpClientConnection {
     connection: acp::ClientSideConnection,
     /// 当前会话 ID
     session_id: Option<String>,
+    /// 消息发送器（用于转发 session_notification 消息到主线程）
+    message_tx: Option<mpsc::UnboundedSender<(String, acp::SessionNotification)>>,
 }
 
 /// 代理管理器的 ACP 客户端实现
@@ -225,9 +211,35 @@ impl acp::Client for ProxyAcpClient {
 
     async fn session_notification(
         &self,
-        _notification: acp::SessionNotification,
+        notification: acp::SessionNotification,
     ) -> AnyhowResult<(), acp::Error> {
-        // 暂时不处理会话通知
+        // 处理会话通知，记录日志
+        match &notification.update {
+            acp::SessionUpdate::AgentMessageChunk { content } => {
+                debug!("Received agent message for session {}: {:?}", notification.session_id, content);
+            }
+            acp::SessionUpdate::UserMessageChunk { content } => {
+                debug!("Received user message for session {}: {:?}", notification.session_id, content);
+            }
+            acp::SessionUpdate::AgentThoughtChunk { content } => {
+                debug!("Received agent thought for session {}: {:?}", notification.session_id, content);
+            }
+            acp::SessionUpdate::ToolCall(tool_call) => {
+                debug!("Received tool call for session {}: {:?}", notification.session_id, tool_call);
+            }
+            acp::SessionUpdate::ToolCallUpdate(tool_call_update) => {
+                debug!("Received tool call update for session {}: {:?}", notification.session_id, tool_call_update);
+            }
+            acp::SessionUpdate::Plan(plan) => {
+                debug!("Received plan for session {}: {:?}", notification.session_id, plan);
+            }
+            acp::SessionUpdate::CurrentModeUpdate { current_mode_id } => {
+                debug!("Received mode update for session {}: {:?}", notification.session_id, current_mode_id);
+            }
+            acp::SessionUpdate::AvailableCommandsUpdate { available_commands } => {
+                debug!("Received commands update for session {}: {:?}", notification.session_id, available_commands);
+            }
+        }
         Ok(())
     }
 
@@ -349,6 +361,7 @@ impl AcpClientConnection {
                 Ok(Self {
                     connection,
                     session_id: None,
+                    message_tx: None,
                 })
             }
             Err(e) => {
@@ -372,6 +385,11 @@ impl AcpClientConnection {
 }
 
 impl AcpClientConnection {
+    /// 设置消息发送器
+    pub fn set_message_sender(&mut self, message_tx: mpsc::UnboundedSender<(String, acp::SessionNotification)>) {
+        self.message_tx = Some(message_tx);
+    }
+
     /// 创建新会话
     pub async fn new_session(&mut self) -> ProxyResult<String> {
         let response = self
@@ -391,6 +409,27 @@ impl AcpClientConnection {
 
         info!("Created new session: {}", session_id);
         Ok(session_id)
+    }
+
+    /// 加载现有会话
+    pub async fn load_session(&mut self, session_id: &str) -> ProxyResult<String> {
+        let response = self
+            .connection
+            .load_session(acp::LoadSessionRequest {
+                session_id: acp::SessionId(session_id.into()),
+                mcp_servers: Vec::new(),
+                cwd: std::env::current_dir().unwrap_or_default(),
+                meta: None,
+            })
+            .await
+            .map_err(|e| ProxyAgentError::ServiceUnavailable {
+                message: format!("Failed to load session: {}", e),
+            })?;
+
+        // 加载成功，更新内部 session_id
+        self.session_id = Some(session_id.to_string());
+        info!("Loaded existing session: {}", session_id);
+        Ok(session_id.to_string())
     }
 
     /// 发送提示
@@ -457,6 +496,8 @@ pub struct AgentServiceHandle {
     pub last_activity: Instant,
     /// 服务状态
     pub status: AgentServiceStatus,
+    /// 当前会话ID
+    session_id: Option<String>,
 }
 
 impl AgentServiceHandle {
@@ -474,6 +515,7 @@ impl AgentServiceHandle {
             created_at: Instant::now(),
             last_activity: Instant::now(),
             status: AgentServiceStatus::Created,
+            session_id: None,
         }
     }
 
@@ -486,6 +528,22 @@ impl AgentServiceHandle {
     /// 更新活动时间
     pub fn update_activity(&mut self) {
         self.last_activity = Instant::now();
+    }
+
+    /// 获取当前会话ID
+    pub fn get_session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// 设置会话ID
+    pub fn set_session_id(&mut self, session_id: String) {
+        self.session_id = Some(session_id);
+        self.last_activity = Instant::now();
+    }
+
+    /// 清除会话ID
+    pub fn clear_session_id(&mut self) {
+        self.session_id = None;
     }
 
     /// 检查是否空闲
@@ -595,19 +653,15 @@ pub struct ProxyAgentManager {
     service_registry: Arc<DashMap<String, AgentServiceHandle>>,
     /// 请求发送器
     request_tx: mpsc::UnboundedSender<ProxyRequest>,
-    /// LocalSet 任务句柄
-    local_set_handle: Option<JoinHandle<()>>,
     /// 配置
     config: ProxyConfig,
     /// 项目工作空间
     workspaces: Arc<DashMap<String, ProjectWorkspace>>,
-    /// 请求接收器 - 用于在 LocalSet 中启动消息分发器
-    request_rx: Option<mpsc::UnboundedReceiver<ProxyRequest>>,
 }
 
 impl ProxyAgentManager {
     /// 创建新的代理管理器
-    pub async fn new(config: ProxyConfig) -> ProxyResult<Self> {
+    pub async fn new(config: ProxyConfig) -> ProxyResult<(Self, mpsc::UnboundedReceiver<ProxyRequest>)> {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let service_registry = Arc::new(DashMap::new());
         let workspaces = Arc::new(DashMap::new());
@@ -616,58 +670,18 @@ impl ProxyAgentManager {
         let manager = Self {
             service_registry: service_registry.clone(),
             request_tx: request_tx.clone(),
-            local_set_handle: None,
             config: config.clone(),
             workspaces,
-            request_rx: Some(request_rx),
         };
 
         // 启动清理任务
         manager.start_cleanup_task().await;
 
         info!("ProxyAgentManager created successfully");
-        Ok(manager)
+        Ok((manager, request_rx))
     }
 
-    /// 获取请求接收器并清除内部引用
-    pub async fn take_request_rx(&mut self) -> ProxyResult<mpsc::UnboundedReceiver<ProxyRequest>> {
-        if let Some(request_rx) = self.request_rx.take() {
-            return Ok(request_rx);
-        }
-
-        // 如果 request_rx 已经被取走，创建一个新的通道
-        let (new_tx, new_rx) = mpsc::unbounded_channel();
-        let old_tx = std::mem::replace(&mut self.request_tx, new_tx);
-
-        // 旧的发送器将被丢弃，这会导致旧的接收器被关闭
-        // 我们返回一个新的接收器，但这不是理想的解决方案
-        // 暂时返回一个假的接收器
-        Ok(new_rx)
-    }
-
-    /// 在 LocalSet 上下文中启动消息分发器
-    pub fn start_in_localset(&mut self) -> ProxyResult<()> {
-        let request_rx = self.request_rx.take().ok_or_else(|| {
-            ProxyAgentError::ConfigError {
-                message: "Request receiver already taken or not available".to_string(),
-            }
-        })?;
-
-        let service_registry = self.service_registry.clone();
-        let workspaces = self.workspaces.clone();
-        let config = self.config.clone();
-
-        // 在 LocalSet 中运行消息分发器
-        let handle = tokio::task::spawn_local(async move {
-            if let Err(e) = Self::run_message_dispatcher(request_rx, service_registry, workspaces, config).await {
-                error!("Message dispatcher failed: {}", e);
-            }
-        });
-
-        self.local_set_handle = Some(handle);
-        Ok(())
-    }
-
+  
     /// 运行消息分发器
     pub async fn run_message_dispatcher(
         mut request_rx: mpsc::UnboundedReceiver<ProxyRequest>,
@@ -683,22 +697,31 @@ impl ProxyAgentManager {
                     prompt,
                     response_tx,
                 } => {
-                    debug!("Dispatching prompt request to project: {}", project_id);
+                    debug!("Dispatching prompt request to project: {} (session: {:?})", project_id, session_id);
 
+                    // 如果服务不存在，先创建服务
+                    if !service_registry.contains_key(&project_id) {
+                        info!("Creating agent service for project: {}", project_id);
+                        if let Err(e) = Self::create_agent_service_static(&project_id, &workspaces, &service_registry, &config).await {
+                            let _ = response_tx.send(Err(e));
+                            continue;
+                        }
+                    }
+
+                    // 发送 prompt 请求，session_id 管理逻辑在 AgentService 内部处理
                     if let Some(service_handle) = service_registry.get(&project_id) {
-                        // 发送实际的 prompt 请求到 LocalSetAgentService
                         let (result_tx, result_rx) = oneshot::channel();
 
                         if let Err(e) = service_handle.send_request(AgentRequest::Prompt {
-                            session_id,
-                            content: prompt,
+                            session_id: session_id.clone(),
+                            content: prompt.clone(),
                             response_tx: result_tx,
                         }) {
                             let _ = response_tx.send(Err(e));
                             continue;
                         }
 
-                        // 等待响应
+                        // 等待响应，返回 (project_id, session_id)
                         match result_rx.await {
                             Ok(result) => {
                                 let _ = response_tx.send(result);
@@ -707,68 +730,6 @@ impl ProxyAgentManager {
                                 let _ = response_tx.send(Err(ProxyAgentError::ServiceUnavailable {
                                     message: "Agent service communication failed".to_string(),
                                 }));
-                            }
-                        }
-                    } else {
-                        let _ = response_tx.send(Err(ProxyAgentError::ServiceUnavailable {
-                            message: format!("Agent service not found for project: {}", project_id),
-                        }));
-                    }
-                }
-                ProxyRequest::CreateAgent {
-                    project_id,
-                    response_tx,
-                } => {
-                    info!("Creating agent service for project: {}", project_id);
-
-                    match Self::create_agent_service_static(&project_id, &workspaces, &service_registry, &config).await {
-                        Ok(_) => {
-                            let _ = response_tx.send(Ok(()));
-                        }
-                        Err(e) => {
-                            let _ = response_tx.send(Err(e));
-                        }
-                    }
-                }
-                ProxyRequest::GetStatus {
-                    project_id,
-                    response_tx,
-                } => {
-                    if let Some(service_handle) = service_registry.get(&project_id) {
-                        let (status_tx, status_rx) = oneshot::channel();
-
-                        if let Err(e) = service_handle.send_request(AgentRequest::GetStatus { response_tx: status_tx }) {
-                            let _ = response_tx.send(Err(e));
-                            continue;
-                        }
-
-                        match status_rx.await {
-                            Ok(status) => {
-                                let _ = response_tx.send(Ok(status));
-                            }
-                            Err(_) => {
-                                let _ = response_tx.send(Err(ProxyAgentError::ServiceUnavailable {
-                                    message: "Status check failed".to_string(),
-                                }));
-                            }
-                        }
-                    } else {
-                        let _ = response_tx.send(Err(ProxyAgentError::ServiceUnavailable {
-                            message: format!("Agent service not found for project: {}", project_id),
-                        }));
-                    }
-                }
-                ProxyRequest::StopAgent {
-                    project_id,
-                    response_tx,
-                } => {
-                    if let Some(mut service_handle) = service_registry.get_mut(&project_id) {
-                        match service_handle.shutdown().await {
-                            Ok(_) => {
-                                let _ = response_tx.send(Ok(()));
-                            }
-                            Err(e) => {
-                                let _ = response_tx.send(Err(e));
                             }
                         }
                     } else {
@@ -825,11 +786,7 @@ impl ProxyAgentManager {
         });
     }
 
-    /// 创建 Agent 服务
-    async fn create_agent_service(&self, project_id: &str) -> ProxyResult<()> {
-        Self::create_agent_service_static(project_id, &self.workspaces, &self.service_registry, &self.config).await
-    }
-
+    
     /// 静态版本的服务创建方法（用于线程间调用）
     async fn create_agent_service_static(
         project_id: &str,
@@ -837,10 +794,7 @@ impl ProxyAgentManager {
         service_registry: &Arc<DashMap<String, AgentServiceHandle>>,
         config: &ProxyConfig,
     ) -> ProxyResult<()> {
-        // 验证项目ID格式
-        if validate_project_id(project_id).is_err() {
-            return Err(ProxyAgentError::InvalidProjectId(project_id.to_string()));
-        }
+       
 
         // 创建或获取工作空间
         let workspace = if let Some(existing) = workspaces.get(project_id) {
@@ -882,18 +836,7 @@ impl ProxyAgentManager {
     ) -> ProxyResult<(String, String)> {
         info!("Sending prompt to project {} (session: {:?}): {}", project_id, session_id, prompt);
 
-        // 验证项目ID格式
-        if validate_project_id(project_id).is_err() {
-            return Err(ProxyAgentError::InvalidProjectId(project_id.to_string()));
-        }
-
-        // 确保服务存在
-        if !self.service_registry.contains_key(project_id) {
-            info!("Creating agent service for project: {}", project_id);
-            self.create_agent_service(project_id).await?;
-        }
-
-        // 发送请求
+          // 发送请求（服务将在消息分发器中按需创建）
         let (response_tx, response_rx) = oneshot::channel();
         let request = ProxyRequest::SendPrompt {
             project_id: project_id.to_string(),
@@ -916,44 +859,24 @@ impl ProxyAgentManager {
     }
 
     /// 获取服务状态
-    pub async fn get_service_status(&self, project_id: &str) -> ProxyResult<AgentServiceStatus> {
-        let (response_tx, response_rx) = oneshot::channel();
-        let request = ProxyRequest::GetStatus {
-            project_id: project_id.to_string(),
-            response_tx,
-        };
-
-        self.request_tx.send(request)
-            .map_err(|_| ProxyAgentError::ServiceUnavailable {
-                message: "Failed to get service status".to_string(),
-            })?;
-
-        match response_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(ProxyAgentError::ServiceUnavailable {
-                message: "Status request timed out".to_string(),
-            }),
+    pub fn get_service_status(&self, project_id: &str) -> ProxyResult<AgentServiceStatus> {
+        if let Some(service_handle) = self.service_registry.get(project_id) {
+            Ok(service_handle.status.clone())
+        } else {
+            Err(ProxyAgentError::ServiceUnavailable {
+                message: format!("Agent service not found for project: {}", project_id),
+            })
         }
     }
 
     /// 停止服务
     pub async fn stop_service(&self, project_id: &str) -> ProxyResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        let request = ProxyRequest::StopAgent {
-            project_id: project_id.to_string(),
-            response_tx,
-        };
-
-        self.request_tx.send(request)
-            .map_err(|_| ProxyAgentError::ServiceUnavailable {
-                message: "Failed to stop service".to_string(),
-            })?;
-
-        match response_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(ProxyAgentError::ServiceUnavailable {
-                message: "Stop request timed out".to_string(),
-            }),
+        if let Some((_, mut service_handle)) = self.service_registry.remove(project_id) {
+            service_handle.shutdown().await
+        } else {
+            Err(ProxyAgentError::ServiceUnavailable {
+                message: format!("Agent service not found for project: {}", project_id),
+            })
         }
     }
 
@@ -1017,10 +940,8 @@ impl Clone for ProxyAgentManager {
         Self {
             service_registry: self.service_registry.clone(),
             request_tx: self.request_tx.clone(),
-            local_set_handle: None, // 不复制运行时句柄
             config: self.config.clone(),
             workspaces: self.workspaces.clone(),
-            request_rx: None, // 不复制运行时接收器
         }
     }
 }
@@ -1082,8 +1003,8 @@ impl LocalSetAgentService {
                     debug!("Initializing agent service");
                 }
                 AgentRequest::Prompt { session_id, content, response_tx } => {
-                    debug!("Processing prompt for session: {:?}", session_id);
-                    let result = self.handle_prompt(session_id.as_deref(), &content).await;
+                    debug!("Processing prompt for session: {:?}, content: {}", session_id, content);
+                    let result = self.handle_prompt_with_session_logic(session_id, &content).await;
                     let _ = response_tx.send(result);
                 }
                 AgentRequest::GetStatus { response_tx } => {
@@ -1100,32 +1021,44 @@ impl LocalSetAgentService {
         Ok(())
     }
 
-    /// 处理 prompt 请求
-    async fn handle_prompt(&mut self, session_id: Option<&str>, prompt: &str) -> ProxyResult<(String, String)> {
-        // 如果有传入的 session_id，使用它；否则让 ACP 连接自己创建
-        let actual_session_id = if let Some(id) = session_id {
-            id.to_string()
-        } else {
-            // 如果没有提供 session_id，让 ACP 连接创建新的会话
-            if let Some(ref mut acp_conn) = self.acp_connection {
-                acp_conn.new_session().await?
-            } else {
-                return Err(ProxyAgentError::ServiceUnavailable {
-                    message: "ACP connection not available".to_string(),
-                });
+    /// 处理带会话逻辑的 prompt 请求
+    async fn handle_prompt_with_session_logic(
+        &mut self,
+        session_id: Option<String>,
+        prompt: &str
+    ) -> ProxyResult<(String, String)> {
+        let acp_conn = self.acp_connection.as_mut()
+            .ok_or_else(|| ProxyAgentError::ServiceUnavailable {
+                message: "ACP connection not available".to_string(),
+            })?;
+
+        // 处理会话逻辑
+        let actual_session_id = if let Some(session_id) = session_id {
+            // 用户提供了 session_id，尝试加载现有会话
+            match acp_conn.load_session(&session_id).await {
+                Ok(loaded_session_id) => {
+                    info!("Loaded existing session: {}", loaded_session_id);
+                    loaded_session_id
+                }
+                Err(e) => {
+                    warn!("Failed to load session {}: {}, creating new session", session_id, e);
+                    // 加载失败，创建新会话
+                    let new_session_id = acp_conn.new_session().await?;
+                    info!("Created new session: {}", new_session_id);
+                    new_session_id
+                }
             }
+        } else {
+            // 没有提供 session_id，创建新会话
+            let new_session_id = acp_conn.new_session().await?;
+            info!("Created new session: {}", new_session_id);
+            new_session_id
         };
 
         // 使用 ACP 连接发送提示
-        if let Some(ref mut acp_conn) = self.acp_connection {
-            let response_text = acp_conn.send_prompt(prompt).await?;
-            info!("Prompt processed for session: {}", actual_session_id);
-            Ok((response_text, actual_session_id))
-        } else {
-            Err(ProxyAgentError::ServiceUnavailable {
-                message: "ACP connection not available".to_string(),
-            })
-        }
+        let response_text = acp_conn.send_prompt(prompt).await?;
+        info!("Prompt processed for session: {}", actual_session_id);
+        Ok((self.project_id.clone(), actual_session_id))
     }
 }
 
@@ -1140,15 +1073,32 @@ pub fn generate_project_id() -> String {
 
 /// 验证项目ID格式
 pub fn validate_project_id(project_id: &str) -> ProxyResult<()> {
-    if project_id.len() != 32 {
+    // 检查项目ID不为空
+    if project_id.is_empty() {
         return Err(ProxyAgentError::InvalidProjectId(
-            "Project ID must be 32 characters long".to_string(),
+            "Project ID cannot be empty".to_string(),
         ));
     }
 
-    if !project_id.chars().all(|c| c.is_ascii_hexdigit()) {
+    // 检查项目ID长度在合理范围内 (1-100字符)
+    if project_id.len() > 100 {
         return Err(ProxyAgentError::InvalidProjectId(
-            "Project ID must contain only hexadecimal characters".to_string(),
+            "Project ID is too long (max 100 characters)".to_string(),
+        ));
+    }
+
+    // 检查项目ID只包含安全字符 (字母、数字、下划线、中划线)
+    if !project_id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return Err(ProxyAgentError::InvalidProjectId(
+            "Project ID can only contain letters, numbers, underscores, and hyphens".to_string(),
+        ));
+    }
+
+    // 检查项目ID不以特殊字符开头或结尾
+    if project_id.starts_with('_') || project_id.starts_with('-') ||
+       project_id.ends_with('_') || project_id.ends_with('-') {
+        return Err(ProxyAgentError::InvalidProjectId(
+            "Project ID cannot start or end with underscore or hyphen".to_string(),
         ));
     }
 
@@ -1172,15 +1122,26 @@ mod tests {
 
     #[test]
     fn test_validate_project_id() {
-        // Valid project IDs
+        // Valid project IDs (UUID format)
         assert!(validate_project_id("a1b2c3d4e5f6789012345678901234ab").is_ok());
         assert!(validate_project_id("1234567890abcdef1234567890abcdef").is_ok());
 
+        // Valid project IDs (user-friendly format)
+        assert!(validate_project_id("test_project_001").is_ok());
+        assert!(validate_project_id("simple_test").is_ok());
+        assert!(validate_project_id("my-project").is_ok());
+        assert!(validate_project_id("project123").is_ok());
+        assert!(validate_project_id("rust_http_server").is_ok());
+
         // Invalid project IDs
-        assert!(validate_project_id("too_short").is_err());
-        assert!(validate_project_id("too_long_for_a_project_id").is_err());
-        assert!(validate_project_id("invalid-chars-here!").is_err());
-        assert!(validate_project_id("").is_err());
+        assert!(validate_project_id("").is_err()); // empty
+        assert!(validate_project_id("_invalid_start").is_err()); // starts with underscore
+        assert!(validate_project_id("-invalid_start").is_err()); // starts with hyphen
+        assert!(validate_project_id("invalid_end_").is_err()); // ends with underscore
+        assert!(validate_project_id("invalid_end-").is_err()); // ends with hyphen
+        assert!(validate_project_id("invalid@chars").is_err()); // contains @
+        assert!(validate_project_id("invalid spaces").is_err()); // contains spaces
+        assert!(validate_project_id(&"a".repeat(101)).is_err()); // too long
     }
 
     #[tokio::test]
