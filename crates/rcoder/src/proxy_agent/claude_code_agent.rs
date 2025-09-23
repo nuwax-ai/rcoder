@@ -226,26 +226,24 @@ pub async fn start_claude_code_acp_agent_service(
                 // 初始化连接
                 debug!("初始化 ACP 连接[initialize]");
                 info!("正在发送 ACP 初始化请求...");
-                let init_result = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(30),
-                    client_conn.initialize(InitializeRequest {
+                let init_result = client_conn
+                    .initialize(InitializeRequest {
                         protocol_version: VERSION,
                         client_capabilities: ClientCapabilities::default(),
                         meta: None,
                     })
-                ).await;
+                    .await;
 
                 match init_result {
-                    Ok(Ok(_)) => {
+                    Ok(_) => {
                         info!("ACP 连接初始化成功");
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         error!("ACP 连接初始化失败: {:?}", e);
-                        return Err(anyhow::anyhow!("Failed to initialize ACP connection: {:?}", e));
-                    }
-                    Err(_) => {
-                        error!("ACP 连接初始化超时");
-                        return Err(anyhow::anyhow!("ACP connection initialization timeout"));
+                        return Err(anyhow::anyhow!(
+                            "Failed to initialize ACP connection: {:?}",
+                            e
+                        ));
                     }
                 }
 
@@ -257,8 +255,9 @@ pub async fn start_claude_code_acp_agent_service(
                         mcp_servers: Vec::new(),
                         cwd: project_path_for_closure.clone(),
                         meta: None,
-                    })
-                ).await;
+                    }),
+                )
+                .await;
 
                 let session_resp = match session_result {
                     Ok(Ok(resp)) => {
