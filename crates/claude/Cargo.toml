@@ -30,6 +30,11 @@ serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 uuid = { workspace = true }
+futures = { workspace = true }
+semver = { workspace = true }
+tempfile = { workspace = true }
+which = { workspace = true }
+dirs = { workspace = true }
 
 [lints]
 workspace = true

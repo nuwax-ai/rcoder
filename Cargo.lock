@@ -616,13 +616,18 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "dirs 6.0.0",
+ "futures 0.3.31",
+ "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "which 8.0.0",
 ]
 
 [[package]]
@@ -3647,6 +3652,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
 
 [[package]]
 name = "serde"
