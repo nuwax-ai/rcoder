@@ -1,6 +1,6 @@
 use agent_client_protocol::{
-    self as acp, Agent, Client, ClientCapabilities, ClientSideConnection, InitializeRequest,
-    NewSessionRequest, PromptRequest, SessionId, V1 as VERSION,
+    self as acp, Agent, ClientCapabilities, ClientSideConnection, ContentBlock, InitializeRequest,
+    NewSessionRequest, PromptRequest, SessionId, TextContent, V1 as VERSION,
 };
 
 use claude::ClaudeCodeAcpManager;
@@ -88,10 +88,7 @@ impl acp::Client for ClaudeCodeAcpClient {
         Err(acp::Error::method_not_found())
     }
 
-    async fn session_notification(
-        &self,
-        args: acp::SessionNotification,
-    ) -> Result<(), acp::Error> {
+    async fn session_notification(&self, args: acp::SessionNotification) -> Result<(), acp::Error> {
         // 转发会话通知到通道
         let _ = self.session_notifications.send(args);
         Ok(())
@@ -120,145 +117,193 @@ pub async fn start_claude_code_acp_agent_service(
     // 检查并安装 claude-code-acp
     if !manager.is_available().await {
         info!("Claude Code ACP 未安装，正在安装...");
-        manager.install_or_update().await
-            .map_err(|e| {
-                error!("Failed to install claude-code-acp: {}", e);
-                anyhow::anyhow!("Failed to install claude-code-acp: {}", e)
-            })?;
+        manager.install_or_update().await.map_err(|e| {
+            error!("Failed to install claude-code-acp: {}", e);
+            anyhow::anyhow!("Failed to install claude-code-acp: {}", e)
+        })?;
         info!("Claude Code ACP 安装完成");
     }
 
     // 获取启动命令
-    let command = manager.get_command().await
-        .map_err(|e| {
-            error!("Failed to get claude-code-acp command: {}", e);
-            anyhow::anyhow!("Failed to get claude-code-acp command: {}", e)
-        })?;
-    info!("Claude Code ACP 命令: {:?} {:?}", command.path, command.args);
+    let command = manager.get_command().await.map_err(|e| {
+        error!("Failed to get claude-code-acp command: {}", e);
+        anyhow::anyhow!("Failed to get claude-code-acp command: {}", e)
+    })?;
+    info!(
+        "Claude Code ACP 命令: {:?} {:?}",
+        command.path, command.args
+    );
 
     // 用于外部持续发送 prompt 的通道
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
-
-    // 在 LocalSet 中启动服务
-    let local_set = LocalSet::new();
     let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
 
-    // 启动子进程
-    let mut child = tokio::process::Command::new(&command.path)
-        .args(&command.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .current_dir(&project_path)
-        .envs(command.env.unwrap_or_default())
-        .spawn()
-        .context("无法启动 claude-code-acp 子进程")?;
+    // 克隆用于闭包
+    let prompt_tx_for_closure = prompt_tx.clone();
+    let project_path_for_closure = project_path.clone();
 
-    info!("Claude Code ACP 子进程已启动，PID: {}", child.id().unwrap_or(0));
+    // 启动后台任务来管理子进程和 ACP 连接
+    tokio::task::spawn_local(async move {
+        // 创建 LocalSet 来运行非 Send 的 ACP 连接
+        let local_set = LocalSet::new();
 
-    // 获取 stdio 句柄
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdout"))?;
+        let result = local_set
+            .run_until(async {
+                // 启动子进程
+                let mut child = tokio::process::Command::new(&command.path)
+                    .args(&command.args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .current_dir(&project_path_for_closure)
+                    .envs(command.env.unwrap_or_default())
+                    .spawn()
+                    .context("无法启动 claude-code-acp 子进程")?;
 
-    // 创建兼容的流
-    let outgoing = stdin.compat_write();
-    let incoming = stdout.compat();
+                info!(
+                    "Claude Code ACP 子进程已启动，PID: {}",
+                    child.id().unwrap_or(0)
+                );
 
-    // 创建客户端
-    let client = ClaudeCodeAcpClient::new();
+                // 获取 stdio 句柄
+                let stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdin"))?;
+                let stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdout"))?;
 
-    // 在 LocalSet 中运行连接逻辑
-    let local_set_result = local_set
-        .run_until(async {
-            // 创建连接
-            let (client_conn, handle_io) = ClientSideConnection::new(
-                client,
-                outgoing,
-                incoming,
-                |fut| {
-                    tokio::task::spawn_local(fut);
-                },
-            );
+                // 创建兼容的流
+                let outgoing = stdin.compat_write();
+                let incoming = stdout.compat();
 
-            // 启动 I/O 处理任务
-            tokio::task::spawn_local(handle_io);
+                // 创建客户端
+                let client = ClaudeCodeAcpClient::new();
 
-            // 初始化连接
-            client_conn
-                .initialize(InitializeRequest {
-                    protocol_version: VERSION,
-                    client_capabilities: ClientCapabilities::default(),
-                    meta: None,
-                })
-                .await
-                .map_err(|e| {
-                    error!("Failed to initialize ACP connection: {:?}", e);
-                    anyhow::anyhow!("Failed to initialize ACP connection: {:?}", e)
-                })?;
+                // 创建连接
+                let (client_conn, handle_io) =
+                    ClientSideConnection::new(client, outgoing, incoming, |fut| {
+                        tokio::task::spawn_local(fut);
+                    });
 
-            // 创建会话
-            let session_resp = client_conn
-                .new_session(NewSessionRequest {
-                    mcp_servers: Vec::new(),
-                    cwd: project_path.clone(),
-                    meta: None,
-                })
-                .await
-                .map_err(|e| {
-                    error!("Failed to create ACP session: {:?}", e);
-                    anyhow::anyhow!("Failed to create ACP session: {:?}", e)
-                })?;
+                // 启动 I/O 处理任务
+                tokio::task::spawn_local(handle_io);
 
-            info!("ACP 会话已创建，ID: {}", session_resp.session_id.0);
+                // 初始化连接
+                client_conn
+                    .initialize(InitializeRequest {
+                        protocol_version: VERSION,
+                        client_capabilities: ClientCapabilities::default(),
+                        meta: None,
+                    })
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to initialize ACP connection: {:?}", e);
+                        anyhow::anyhow!("Failed to initialize ACP connection: {:?}", e)
+                    })?;
 
-            // 发送会话 ID 到主线程
-            let session_id = session_resp.session_id.clone();
-            let _ = session_id_tx.send(session_id.clone());
+                // 创建会话
+                let session_resp = client_conn
+                    .new_session(NewSessionRequest {
+                        mcp_servers: Vec::new(),
+                        cwd: project_path_for_closure.clone(),
+                        meta: None,
+                    })
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to create ACP session: {:?}", e);
+                        anyhow::anyhow!("Failed to create ACP session: {:?}", e)
+                    })?;
 
-            // 长驻循环：接收外部 prompt 并转发到 ACP
-            tokio::task::spawn_local(async move {
-                while let Some(mut req) = prompt_rx.recv().await {
-                    if req.session_id.0.is_empty() {
-                        req.session_id = session_resp.session_id.clone();
+                info!("ACP 会话已创建，ID: {}", session_resp.session_id.0);
+
+                // 发送会话 ID 到主线程
+                let session_id = session_resp.session_id.clone();
+                if session_id_tx.send(session_id.clone()).is_err() {
+                    error!("无法发送会话 ID：接收方已关闭");
+                    return Err(anyhow::anyhow!("无法发送会话 ID"));
+                }
+
+                // 长驻循环：接收外部 prompt 并转发到 ACP
+                tokio::task::spawn_local({
+                    let session_id_for_prompt = session_id.clone();
+                    async move {
+                        while let Some(mut req) = prompt_rx.recv().await {
+                            if req.session_id.0.is_empty() {
+                                req.session_id = session_id_for_prompt.clone();
+                            }
+                            match client_conn.prompt(req).await {
+                                Ok(_) => {
+                                    debug!("Prompt 发送成功");
+                                }
+                                Err(e) => {
+                                    error!("发送 Prompt 失败: {:?}", e);
+                                }
+                            }
+                        }
+                        debug!("Prompt 接收通道已关闭");
                     }
-                    match client_conn.prompt(req).await {
-                        Ok(_) => {
-                            debug!("Prompt 发送成功");
+                });
+
+                // 等待子进程结束（如果进程意外退出）
+                let child_exit = child.wait();
+                tokio::pin!(child_exit);
+
+                // 创建一个未来来保持连接活跃
+                let keep_alive = async {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                        debug!("Claude Code ACP Agent 服务保持活跃");
+                    }
+                };
+
+                tokio::select! {
+                    result = child_exit => {
+                        match result {
+                            Ok(exit_status) => {
+                                error!("Claude Code ACP 子进程退出，状态: {}", exit_status);
+                            }
+                            Err(e) => {
+                                error!("Claude Code ACP 子进程等待失败: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            error!("发送 Prompt 失败: {:?}", e);
-                        }
+                        Err(anyhow::anyhow!("Claude Code ACP 子进程意外退出"))
+                    }
+                    _ = keep_alive => {
+                        Ok(session_id.clone())
                     }
                 }
+            })
+            .await;
+
+        if let Err(e) = result {
+            error!("Claude Code ACP Agent 后台任务失败: {}", e);
+            // 通知主线程任务失败 - 发送一个错误提示作为信号
+            let error_block = ContentBlock::Text(TextContent {
+                text: format!("Claude Code ACP Agent 启动失败: {}", e),
+                annotations: None,
+                meta: None,
             });
-
-            Ok::<SessionId, anyhow::Error>(session_id.clone())
-        })
-        .await;
-
-    // 处理 LocalSet 结果
-    let session_id = match local_set_result {
-        Ok(id) => id,
-        Err(e) => {
-            error!("LocalSet 执行失败: {}", e);
-            return Err(e);
+            let _ = prompt_tx_for_closure.send(PromptRequest {
+                session_id: SessionId("error".into()),
+                prompt: vec![error_block],
+                meta: None,
+            });
         }
-    };
+    });
 
-    // 等待会话 ID（确保已经发送）
-    let final_session_id = session_id_rx.await
-        .map_err(|e| {
-            error!("等待会话 ID 失败: {}", e);
-            anyhow::anyhow!("等待会话 ID 失败: {}", e)
-        })?;
+    // 等待会话 ID 并立即返回
+    let session_id = session_id_rx.await.map_err(|e| {
+        error!("等待会话 ID 失败: {}", e);
+        anyhow::anyhow!("等待会话 ID 失败: {}", e)
+    })?;
 
-    info!("Claude Code ACP Agent 服务启动完成，会话 ID: {}", final_session_id.0);
-    Ok((final_session_id, prompt_tx))
+    info!(
+        "Claude Code ACP Agent 服务启动完成，会话 ID: {}",
+        session_id.0
+    );
+    Ok((session_id, prompt_tx))
 }

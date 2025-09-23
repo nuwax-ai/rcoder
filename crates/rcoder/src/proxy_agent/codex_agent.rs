@@ -1,4 +1,3 @@
-
 use agent_client_protocol::Client;
 use agent_client_protocol::{
     self as acp, Agent, AgentSideConnection, ClientCapabilities, ClientSideConnection,
@@ -18,7 +17,7 @@ use dashmap::DashMap;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
 use anyhow::Result;
@@ -131,9 +130,6 @@ impl Client for EmbeddedCodexClient {
         Err(agent_client_protocol::Error::method_not_found())
     }
 }
-
-
-
 
 /// 启动一个长驻的 ACP Agent 服务，返回会话信息和一个用于持续发送 Prompt 的通道
 /// 默认启用 YOLO 模式（禁用沙箱和批准请求）
@@ -264,7 +260,14 @@ pub async fn start_codex_acp_agent_service(
             if req.session_id.0.is_empty() {
                 req.session_id = session_resp.session_id.clone();
             }
-            let _ = client_conn.prompt(req).await; // 错误可在上层处理或加日志
+            match client_conn.prompt(req).await {
+                Ok(_) => {
+                    debug!("Prompt 发送成功");
+                }
+                Err(e) => {
+                    error!("发送 Prompt 失败: {:?}", e);
+                }
+            }
         }
     });
 

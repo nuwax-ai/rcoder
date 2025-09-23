@@ -22,7 +22,7 @@ pub struct ClaudeCodeAcpConfig {
     /// 二进制名称
     pub binary_name: String,
     /// 自定义命令
-    pub custom_command: Option<String>,
+    pub custom_command: Option<ClaudeCodeAcpCommand>,
     /// 是否忽略系统版本
     pub ignore_system_version: bool,
 }
@@ -32,7 +32,7 @@ impl Default for ClaudeCodeAcpConfig {
         Self {
             minimum_version: Some("0.2.5".parse().unwrap_or_else(|_| "0.0.0".parse().unwrap())),
             package_name: "@zed-industries/claude-code-acp".to_string(),
-            entrypoint_path: PathBuf::from("node_modules/@zed-industries/claude-code-acp/dist/index.js"),
+            entrypoint_path: PathBuf::from("@zed-industries/claude-code-acp/dist/index.js"),
             binary_name: "claude-code-acp".to_string(),
             custom_command: None,
             ignore_system_version: false,
@@ -201,18 +201,45 @@ impl ClaudeCodeAcpManager {
 
     /// 获取命令
     pub async fn get_command(&self) -> Result<ClaudeCodeAcpCommand> {
-        let status = self.get_status().await?;
-
-        if !status.is_installed {
-            return Err(anyhow!("Claude Code ACP 未安装，请先调用 install_or_update"));
+        // 如果配置了自定义命令，优先使用
+        if let Some(ref custom_command) = self.config.custom_command {
+            info!("使用自定义 claude-code-acp 命令");
+            return Ok(custom_command.clone());
         }
 
+        // 如果没有忽略系统版本，尝试查找全局安装的命令
+        if !self.config.ignore_system_version {
+            if let Ok(global_command) = self.find_global_command().await {
+                info!("使用全局安装的 claude-code-acp 命令");
+                return Ok(global_command);
+            }
+            debug!("未找到全局 claude-code-acp 命令");
+        }
+
+        // 使用本地安装的版本（类似 Zed 的方式）
+        info!("{}，将使用本地安装版本",
+            if self.config.ignore_system_version {
+                "配置为忽略系统版本"
+            } else {
+                "未找到全局 claude-code-acp 命令"
+            }
+        );
+
+        // 确保已安装
+        if !self.is_available().await {
+            info!("Claude Code ACP 未安装，正在安装...");
+            self.install_or_update().await?;
+        }
+
+        // 获取安装状态
+        let status = self.get_status().await?;
         let install_path = status.install_path
             .ok_or_else(|| anyhow!("无法确定安装路径"))?;
 
         let node_path = self.find_node_executable().await
             .context("未找到 Node.js 可执行文件")?;
 
+        info!("使用本地安装的 claude-code-acp 版本");
         Ok(ClaudeCodeAcpCommand {
             path: node_path,
             args: vec![install_path.join(&self.config.entrypoint_path)
@@ -220,6 +247,27 @@ impl ClaudeCodeAcpManager {
                 .to_string()],
             env: None,
         })
+    }
+
+    /// 查找全局安装的 claude-code-acp 命令
+    async fn find_global_command(&self) -> Result<ClaudeCodeAcpCommand> {
+        debug!("查找全局安装的 claude-code-acp 命令");
+
+        // 尝试使用 which 查找命令
+        match which::which("claude-code-acp") {
+            Ok(command_path) => {
+                info!("找到全局 claude-code-acp 命令: {:?}", command_path);
+                Ok(ClaudeCodeAcpCommand {
+                    path: command_path,
+                    args: vec![],
+                    env: None,
+                })
+            }
+            Err(e) => {
+                debug!("未找到全局 claude-code-acp 命令: {}", e);
+                Err(anyhow!("未找到全局 claude-code-acp 命令"))
+            }
+        }
     }
 
     /// 检查是否可用
@@ -233,6 +281,7 @@ impl ClaudeCodeAcpManager {
     /// 下载最新版本
     async fn download_latest_version(&self) -> Result<String> {
         debug!("下载最新版本的 {}", self.config.package_name);
+        debug!("安装目录: {:?}", self.install_dir);
 
         // 创建临时目录
         let temp_dir = tempfile::tempdir_in(&self.install_dir)
@@ -248,6 +297,9 @@ impl ClaudeCodeAcpManager {
 
         if !output.status.success() {
             let error_msg = String::from_utf8_lossy(&output.stderr);
+            let stdout_msg = String::from_utf8_lossy(&output.stdout);
+            debug!("npm install stdout: {}", stdout_msg);
+            debug!("npm install stderr: {}", error_msg);
             return Err(anyhow!("npm install 失败: {}", error_msg));
         }
 
@@ -269,12 +321,21 @@ impl ClaudeCodeAcpManager {
 
         // 移动到最终位置
         let target_dir = self.install_dir.join(version);
+        debug!("创建目标目录: {:?}", target_dir);
         tokio::fs::create_dir_all(&target_dir).await
             .context("创建目标目录失败")?;
 
         let node_modules_dir = temp_dir.path().join("node_modules");
+        debug!("复制文件从 {:?} 到 {:?}", node_modules_dir, target_dir);
         Box::pin(self.copy_dir_recursive(&node_modules_dir, &target_dir)).await
             .context("复制文件失败")?;
+
+        // 验证入口文件是否存在
+        let entrypoint_path = target_dir.join(&self.config.entrypoint_path);
+        debug!("验证入口文件: {:?}", entrypoint_path);
+        if !entrypoint_path.exists() {
+            return Err(anyhow!("安装失败：入口文件不存在: {:?}", entrypoint_path));
+        }
 
         Ok(version.to_string())
     }
@@ -291,6 +352,9 @@ impl ClaudeCodeAcpManager {
             "/usr/local/bin/node",
             "/opt/homebrew/bin/node",
             "/usr/bin/node",
+            "/opt/node/bin/node",
+            "/usr/bin/nodejs",
+            "/usr/local/bin/nodejs",
             "C:\\Program Files\\nodejs\\node.exe",
         ];
 
