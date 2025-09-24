@@ -122,28 +122,36 @@ impl Client for AcpAgentClient {
         &self,
         args: agent_client_protocol::SessionNotification,
     ) -> Result<(), agent_client_protocol::Error> {
-        //TODO 需要实现
-        match args.update {
-            acp::SessionUpdate::AgentMessageChunk { content } => {
-                let text = match content {
-                    acp::ContentBlock::Text(text_content) => text_content.text,
-                    acp::ContentBlock::Image(_) => "<image>".into(),
-                    acp::ContentBlock::Audio(_) => "<audio>".into(),
-                    acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri,
-                    acp::ContentBlock::Resource(_) => "<resource>".into(),
-                };
-                info!("| Agent session_notification : {text}");
+        let session_id = args.session_id.to_string();
+
+        // 直接将SessionUpdate转为JSON存入全局缓存
+        match serde_json::to_value(&args.update) {
+            Ok(json_value) => {
+                // 存入全局缓存
+                crate::service::add_session_update(&session_id, json_value);
+
+                // 记录日志（保持原有的详细日志）
+                match &args.update {
+                    acp::SessionUpdate::AgentMessageChunk { content } => {
+                        let text = match content {
+                            acp::ContentBlock::Text(text_content) => text_content.text.clone(),
+                            acp::ContentBlock::Image(_) => "<image>".into(),
+                            acp::ContentBlock::Audio(_) => "<audio>".into(),
+                            acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri.clone(),
+                            acp::ContentBlock::Resource(_) => "<resource>".into(),
+                        };
+                        info!("📥 Agent message cached [session:{}]: {}", session_id, text);
+                    }
+                    _ => {
+                        info!("📥 SessionUpdate cached [session:{}]: {:?}", session_id, args.update);
+                    }
+                }
             }
-            acp::SessionUpdate::UserMessageChunk { .. }
-            | acp::SessionUpdate::AgentThoughtChunk { .. }
-            | acp::SessionUpdate::ToolCall(_)
-            | acp::SessionUpdate::ToolCallUpdate(_)
-            | acp::SessionUpdate::Plan(_)
-            | acp::SessionUpdate::CurrentModeUpdate { .. }
-            | acp::SessionUpdate::AvailableCommandsUpdate { .. } => {
-                info!("| Other session_notification: {:?}", args.update);
+            Err(e) => {
+                error!("❌ Failed to serialize SessionUpdate for session {}: {}", session_id, e);
             }
         }
+
         Ok(())
     }
 
