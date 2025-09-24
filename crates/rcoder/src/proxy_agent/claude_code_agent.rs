@@ -1,14 +1,20 @@
 use agent_client_protocol::{
-    self as acp, Agent, CancelNotification, ClientCapabilities, ClientSideConnection, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId, TextContent, V1 as VERSION
+    self as acp, Agent, CancelNotification, ClientCapabilities, ClientSideConnection, ContentBlock,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId,
+    TextContent, V1 as VERSION,
 };
 
 use claude_code_agent::ClaudeCodeAcpManager;
 use shared_types::ModelProviderConfig;
-use std::process::Stdio;
+use std::{process::Stdio, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::{model::ChatPrompt, proxy_agent::{AcpAgentClient, AcpConnectionInfo}, AgentType};
+use crate::{
+    AgentType,
+    model::ChatPrompt,
+    proxy_agent::{AcpAgentClient, AcpConnectionInfo},
+};
 use anyhow::{Context, Result};
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -145,6 +151,7 @@ pub async fn start_claude_code_acp_agent_service(
                 // 启动 I/O 处理任务
                 tokio::task::spawn_local(handle_io);
 
+                let client_conn = Arc::new(client_conn);
                 // 初始化连接
                 debug!("初始化 ACP 连接[initialize]");
                 let init_result = client_conn
@@ -212,62 +219,30 @@ pub async fn start_claude_code_acp_agent_service(
                     return Err(anyhow::anyhow!("无法发送会话 ID"));
                 }
 
-                // 长驻循环：优先处理 cancel 消息，然后处理 prompt 消息
-                tokio::task::spawn_local({
-                    async move {
-                        loop {
-                            // 优先处理所有可用的 cancel 消息
-                            while let Ok(req) = cancel_rx.try_recv() {
-                                info!("收到 Cancel 消息, session_id={}", req.session_id.0);
-                                let result = client_conn.cancel(req).await;
-                                if let Err(e) = result {
-                                    error!("发送 Cancel 失败: {:?}", e);
-                                }
+                let cancel_client_conn = client_conn.clone();
+                tokio::task::spawn_local(async move {
+                    // 处理所有可用的 cancel 消息
+                    while let Some(req) = cancel_rx.recv().await {
+                        info!("收到 Cancel 消息, session_id={}", req.session_id.0);
+                        let result = cancel_client_conn.cancel(req).await;
+                        if let Err(e) = result {
+                            error!("发送 Cancel 失败: {:?}", e);
+                        }
+                    }
+                });
+
+                tokio::task::spawn_local(async move {
+                    // 处理所有可用的 prompt 消息
+                    while let Some(mut req) = prompt_rx.recv().await {
+                        if req.session_id.0.is_empty() {
+                            req.session_id = session_id.clone();
+                        }
+                        match client_conn.prompt(req).await {
+                            Ok(resp) => {
+                                debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
                             }
-                            
-                            // 然后处理所有可用的 prompt 消息
-                            while let Ok(mut req) = prompt_rx.try_recv() {
-                                if req.session_id.0.is_empty() {
-                                    req.session_id = session_id.clone();
-                                }
-                                match client_conn.prompt(req).await {
-                                    Ok(resp) => {
-                                        debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
-                                    }
-                                    Err(e) => {
-                                        error!("发送 Prompt 失败: {:?}", e);
-                                    }
-                                }
-                            }
-                            
-                            // 如果两个通道都为空，等待任意一个通道有新消息
-                            tokio::select! {
-                                // 等待 cancel 消息
-                                Some(req) = cancel_rx.recv() => {
-                                    let result = client_conn.cancel(req).await;
-                                    if let Err(e) = result {
-                                        error!("发送 Cancel 失败: {:?}", e);
-                                    }
-                                }
-                                // 等待 prompt 消息
-                                Some(mut req) = prompt_rx.recv() => {
-                                    if req.session_id.0.is_empty() {
-                                        req.session_id = session_id.clone();
-                                    }
-                                    match client_conn.prompt(req).await {
-                                        Ok(resp) => {
-                                            debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
-                                        }
-                                        Err(e) => {
-                                            error!("发送 Prompt 失败: {:?}", e);
-                                        }
-                                    }
-                                }
-                                // 两个通道都关闭时退出循环
-                                else => {
-                                    debug!("Cancel 和 Prompt 接收通道都已关闭");
-                                    break;
-                                }
+                            Err(e) => {
+                                error!("发送 Prompt 失败: {:?}", e);
                             }
                         }
                     }
