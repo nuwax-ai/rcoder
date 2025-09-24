@@ -1,14 +1,14 @@
 use agent_client_protocol::{
     self as acp, Agent, ClientCapabilities, ClientSideConnection, ContentBlock, InitializeRequest,
-    NewSessionRequest, PromptRequest, SessionId, TextContent, V1 as VERSION,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId, TextContent, V1 as VERSION,
 };
 
-use claude::ClaudeCodeAcpManager;
+use claude_code_agent::ClaudeCodeAcpManager;
 use std::process::Stdio;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::{proxy_agent::AcpAgentClient, model::ChatPrompt};
+use crate::{model::ChatPrompt, proxy_agent::AcpAgentClient};
 use agent_client_protocol::PermissionOptionKind as Kind;
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
@@ -171,8 +171,8 @@ pub async fn start_claude_code_acp_agent_service(
                         protocol_version: VERSION,
                         client_capabilities: ClientCapabilities {
                             fs: agent_client_protocol::FileSystemCapability {
-                                read_text_file: true,
-                                write_text_file: true,
+                                read_text_file: false,
+                                write_text_file: false,
                                 meta: None,
                             },
                             terminal: false,
@@ -196,36 +196,36 @@ pub async fn start_claude_code_acp_agent_service(
                 }
 
                 // 创建会话
-                debug!("创建 ACP 会话[new_session]");
-                let session_result = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(30),
-                    client_conn.new_session(NewSessionRequest {
-                        mcp_servers: Vec::new(),
-                        cwd: project_path_for_closure.clone(),
-                        meta: None,
-                    }),
-                )
-                .await;
-
-                let session_resp = match session_result {
-                    Ok(Ok(resp)) => {
-                        debug!("ACP 会话创建成功");
-                        resp
+                let session_id = match chat_prompt.session_id {
+                    Some(session_id) => {
+                        debug!("创建 ACP 会话[load_session]");
+                        let session_id = SessionId(session_id.into());
+                        let resp = client_conn
+                            .load_session(LoadSessionRequest {
+                                session_id: session_id.clone(),
+                                mcp_servers: Vec::new(),
+                                cwd: project_path_for_closure.clone(),
+                                meta: None,
+                            })
+                            .await?;
+                        debug!("ACP 会话加载成功[load_session],{:?}", resp);
+                        session_id
                     }
-                    Ok(Err(e)) => {
-                        error!("ACP 会话创建失败: {:?}", e);
-                        return Err(anyhow::anyhow!("Failed to create ACP session: {:?}", e));
-                    }
-                    Err(_) => {
-                        error!("ACP 会话创建超时");
-                        return Err(anyhow::anyhow!("ACP session creation timeout"));
+                    None => {
+                        debug!("创建 ACP 会话[new_session]");
+                        let resp = client_conn
+                            .new_session(NewSessionRequest {
+                                mcp_servers: Vec::new(),
+                                cwd: project_path_for_closure.clone(),
+                                meta: None,
+                            })
+                            .await?;
+                        debug!("ACP 会话创建成功[new_session],{:?}", resp);
+                        resp.session_id
                     }
                 };
 
-                info!("ACP 会话已创建，ID: {}", session_resp.session_id.0);
-
                 // 发送会话 ID 到主线程
-                let session_id = session_resp.session_id.clone();
                 if session_id_tx.send(session_id.clone()).is_err() {
                     error!("无法发送会话 ID：接收方已关闭");
                     return Err(anyhow::anyhow!("无法发送会话 ID"));
@@ -233,11 +233,10 @@ pub async fn start_claude_code_acp_agent_service(
 
                 // 长驻循环：接收外部 prompt 并转发到 ACP
                 tokio::task::spawn_local({
-                    let session_id_for_prompt = session_id.clone();
                     async move {
                         while let Some(mut req) = prompt_rx.recv().await {
                             if req.session_id.0.is_empty() {
-                                req.session_id = session_id_for_prompt.clone();
+                                req.session_id = session_id.clone();
                             }
                             match client_conn.prompt(req).await {
                                 Ok(resp) => {
@@ -277,7 +276,7 @@ pub async fn start_claude_code_acp_agent_service(
                         Err(anyhow::anyhow!("Claude Code ACP 子进程意外退出"))
                     }
                     _ = keep_alive => {
-                        Ok(session_id.clone())
+                        Ok(())
                     }
                 }
             })

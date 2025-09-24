@@ -1,11 +1,11 @@
-use agent_client_protocol::Client;
 use agent_client_protocol::{
     self as acp, Agent, AgentSideConnection, ClientCapabilities, ClientSideConnection,
     ContentBlock, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
     KillTerminalCommandResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionId, SessionNotification, SetSessionModeResponse, TextContent,
     V1 as VERSION,
-}; // bring trait into scope for session_notification
+};
+use agent_client_protocol::{Client, LoadSessionRequest}; // bring trait into scope for session_notification
 
 use codex_acp_agent::CodexAgent;
 use codex_core::config::{
@@ -23,7 +23,6 @@ use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInf
 use anyhow::Result;
 
 use super::AcpAgentClient;
-
 
 /// 启动一个长驻的 ACP Agent 服务，返回会话信息和一个用于持续发送 Prompt 的通道
 /// 默认启用 YOLO 模式（禁用沙箱和批准请求）
@@ -138,21 +137,50 @@ pub async fn start_codex_acp_agent_service(
             meta: None,
         })
         .await?;
-    let session_resp = client_conn
-        .new_session(NewSessionRequest {
-            mcp_servers: Vec::new(),
-            cwd: project_path.clone(),
-            meta: None,
-        })
-        .await?;
+    // let session_resp = client_conn
+    //     .new_session(NewSessionRequest {
+    //         mcp_servers: Vec::new(),
+    //         cwd: project_path.clone(),
+    //         meta: None,
+    //     })
+    //     .await?;
+    // 创建会话
+    let session_id = match chat_prompt.session_id {
+        Some(session_id) => {
+            debug!("创建 ACP 会话[new_session]");
+            let session_id = SessionId(session_id.into());
+            let resp = client_conn
+                .load_session(LoadSessionRequest {
+                    session_id: session_id.clone(),
+                    mcp_servers: Vec::new(),
+                    cwd: project_path.clone(),
+                    meta: None,
+                })
+                .await?;
+            debug!("ACP 会话加载成功[load_session],{:?}", resp);
+            session_id
+        }
+        None => {
+            debug!("创建 ACP 会话[new_session]");
+            let resp = client_conn
+                .new_session(NewSessionRequest {
+                    mcp_servers: Vec::new(),
+                    cwd: project_path.clone(),
+                    meta: None,
+                })
+                .await?;
+            debug!("ACP 会话创建成功[new_session],{:?}", resp);
+            resp.session_id
+        }
+    };
 
-    let _ = session_id_tx.send(session_resp.session_id.clone());
+    let _ = session_id_tx.send(session_id.clone());
 
     // 长驻循环：接收外部 prompt 并转发到 ACP
     tokio::task::spawn_local(async move {
         while let Some(mut req) = prompt_rx.recv().await {
             if req.session_id.0.is_empty() {
-                req.session_id = session_resp.session_id.clone();
+                req.session_id = session_id.clone();
             }
             match client_conn.prompt(req).await {
                 Ok(resp) => {

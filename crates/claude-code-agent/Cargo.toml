@@ -1,12 +1,12 @@
 [package]
-name = "claude"
+name = "claude-code-agent"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "claude"
+name = "claude_code_agent"
 path = "src/lib.rs"
 
 [dependencies]

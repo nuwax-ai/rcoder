@@ -89,12 +89,14 @@ pub async fn handle_chat(
     // 获取项目工作目录
     let project_workspace = get_project_workspace(&project_id).await?;
 
-    let chat_prompt = ChatPrompt {
-        project_id: project_id.clone(),
-        project_path: project_workspace,
-        session_id: request.session_id.clone(),
-        prompt: request.prompt.clone(),
-    };
+
+    let chat_prompt = ChatPromptBuilder::default()
+        .project_id(project_id.clone())
+        .project_path(project_workspace)
+        .session_id(request.session_id.clone())
+        .prompt(request.prompt.clone())
+        .build()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let (local_task_request, chat_prompt_rx) = LocalSetAgentRequest::new(chat_prompt);
     state.local_task_sender.send(local_task_request)?;

@@ -1,13 +1,11 @@
 //! MCP (Model Context Protocol) 集成 - 简化版本
 
-use crate::{
-    config::{AcpConfig, McpServerConfig},
-    AcpAdapterError, AcpResult,
-};
+use crate::config::{AcpConfig, McpServerConfig};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 /// MCP 工具定义
@@ -94,7 +92,7 @@ impl McpManager {
     }
 
     /// 初始化 MCP 管理器
-    pub async fn initialize(&self, config: &AcpConfig) -> AcpResult<()> {
+    pub async fn initialize(&self, config: &AcpConfig) -> Result<()> {
         *self.config.write().await = Some(config.clone());
 
         // 启动所有配置的 MCP 服务器
@@ -102,21 +100,27 @@ impl McpManager {
             self.start_server(server_config).await?;
         }
 
-        info!("MCP 管理器初始化完成，{} 个服务器", config.mcp_servers.len());
+        info!(
+            "MCP 管理器初始化完成，{} 个服务器",
+            config.mcp_servers.len()
+        );
         Ok(())
     }
 
     /// 启动 MCP 服务器
-    async fn start_server(&self, server_config: &McpServerConfig) -> AcpResult<()> {
+    async fn start_server(&self, server_config: &McpServerConfig) -> Result<()> {
         let mut servers = self.servers.write().await;
 
-        servers.insert(server_config.name.clone(), McpServerInfo {
-            config: server_config.clone(),
-            state: McpServerState::Connected, // 简化版本直接设为已连接
-            tools: vec![],
-            resources: vec![],
-            prompts: vec![],
-        });
+        servers.insert(
+            server_config.name.clone(),
+            McpServerInfo {
+                config: server_config.clone(),
+                state: McpServerState::Connected, // 简化版本直接设为已连接
+                tools: vec![],
+                resources: vec![],
+                prompts: vec![],
+            },
+        );
 
         info!("MCP 服务器 {} 已启动", server_config.name);
         Ok(())
@@ -125,7 +129,8 @@ impl McpManager {
     /// 获取所有工具
     pub async fn get_tools(&self) -> Vec<McpTool> {
         let servers = self.servers.read().await;
-        servers.values()
+        servers
+            .values()
             .flat_map(|server| server.tools.clone())
             .collect()
     }
@@ -133,7 +138,8 @@ impl McpManager {
     /// 获取所有资源
     pub async fn get_resources(&self) -> Vec<McpResource> {
         let servers = self.servers.read().await;
-        servers.values()
+        servers
+            .values()
             .flat_map(|server| server.resources.clone())
             .collect()
     }
@@ -141,7 +147,8 @@ impl McpManager {
     /// 获取所有提示
     pub async fn get_prompts(&self) -> Vec<McpPrompt> {
         let servers = self.servers.read().await;
-        servers.values()
+        servers
+            .values()
             .flat_map(|server| server.prompts.clone())
             .collect()
     }
@@ -152,13 +159,13 @@ impl McpManager {
         _server_name: &str,
         _tool_name: &str,
         _arguments: &serde_json::Value,
-    ) -> AcpResult<serde_json::Value> {
+    ) -> Result<serde_json::Value> {
         // 简化版本返回空结果
         Ok(serde_json::json!({"result": "not_implemented"}))
     }
 
     /// 关闭 MCP 管理器
-    pub async fn shutdown(&self) -> AcpResult<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         let mut servers = self.servers.write().await;
 
         for (name, server) in servers.iter_mut() {
@@ -192,18 +199,26 @@ impl McpAdapter {
     pub async fn get_available_tools(&self) -> Vec<crate::types::Tool> {
         let mcp_tools = self.mcp_manager.get_tools().await;
 
-        mcp_tools.into_iter().map(|mcp_tool| crate::types::Tool {
-            name: mcp_tool.name,
-            description: mcp_tool.description,
-            input_schema: mcp_tool.input_schema,
-        }).collect()
+        mcp_tools
+            .into_iter()
+            .map(|mcp_tool| crate::types::Tool {
+                name: mcp_tool.name,
+                description: mcp_tool.description,
+                input_schema: mcp_tool.input_schema,
+            })
+            .collect()
     }
 }
 
 #[async_trait::async_trait]
 pub trait McpHandler: Send + Sync {
     async fn handle_mcp_update(&self, update: McpUpdate);
-    async fn handle_tool_call(&self, server_name: String, tool_name: String, arguments: serde_json::Value) -> AcpResult<serde_json::Value>;
+    async fn handle_tool_call(
+        &self,
+        server_name: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value>;
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use dashmap::DashMap;
-use std::{path::PathBuf, sync::Arc, time::Duration};
-use tracing::{Span, debug, error, info, instrument, warn};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
@@ -15,13 +15,8 @@ mod service;
 use model::*;
 use service::SessionMessageManager;
 
-use acp_adapter::SessionManager;
-
 use config::load_config;
 use router::AppState;
-
-
-
 
 // 路由创建函数已移动到 handler 模块
 
@@ -38,9 +33,6 @@ async fn main() -> anyhow::Result<()> {
     // 创建项目工作目录
     tokio::fs::create_dir_all(&config.projects_dir).await?;
     info!("Projects directory: {:?}", config.projects_dir);
-
-    // 初始化应用状态
-    let session_manager = Arc::new(SessionManager::new());
 
     // 创建本地任务通道
     let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();

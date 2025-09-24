@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+use super::AgentType;
+use derive_builder::Builder;
+
+#[derive(Debug, Clone, Default, Builder)]
+#[builder(setter(into))]
 pub struct ChatPrompt {
     /// 项目ID, 再 ./project_workspace/{project_id} 对应
     pub project_id: String,
@@ -10,6 +14,9 @@ pub struct ChatPrompt {
     pub session_id: Option<String>,
     /// 提示内容 prompt
     pub prompt: String,
+    /// agent 类型
+    #[builder(default)]
+    pub agent_type: AgentType,
 }
 
 /// 返回用户 prompt 的提示,一定有project_id ,session_id ,否则报错
