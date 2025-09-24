@@ -9,10 +9,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
-    proxy_agent::LocalSetAgentRequest,
-    config::AppConfig,
-    handler::{chat_handler, health_handler},
-    service::SessionMessageManager,
+    config::AppConfig, handler, proxy_agent::LocalSetAgentRequest, service::SessionMessageManager,
 };
 
 /// 会话信息结构
@@ -43,7 +40,11 @@ pub struct AppState {
 /// 创建 Axum 路由
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/health", get(health_handler::health_check))
-        .route("/chat", post(chat_handler::handle_chat))
+        .route("/health", get(handler::health_check))
+        .route("/chat", post(handler::handle_chat))
+        .route(
+            "/agent/progress/{project_id}",
+            post(handler::agent_session_notification),
+        )
         .with_state(state)
 }

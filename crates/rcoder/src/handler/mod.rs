@@ -1,4 +1,8 @@
 //! HTTP 路由和处理器模块
+mod agent_session_notification;
+mod chat_handler;
+mod health_handler;
 
-pub mod chat_handler;
-pub mod health_handler;
+pub use agent_session_notification::agent_session_notification;
+pub use chat_handler::handle_chat;
+pub use health_handler::health_check;

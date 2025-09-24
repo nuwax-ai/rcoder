@@ -67,7 +67,7 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChatRequest>,
-) -> Result<Json<crate::model::HttpResult<ChatResponse>>, crate::model::AppError> {
+) -> Result<crate::model::HttpResult<ChatResponse>, crate::model::AppError> {
     info!(
         "🚀 [DEBUG] handle_chat 开始处理请求: user_id={}, project_id={:?}, session_id={:?}, prompt={}",
         request.user_id, request.project_id, request.session_id, request.prompt
@@ -121,5 +121,5 @@ pub async fn handle_chat(
             )
         }
     };
-    Ok(Json(result))
+    Ok(result)
 }
