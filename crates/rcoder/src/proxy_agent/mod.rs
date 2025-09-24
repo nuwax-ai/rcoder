@@ -4,9 +4,9 @@ mod codex_agent;
 
 pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
 use agent_client_protocol::{
-    self as acp, AgentSideConnection, CancelNotification, ClientSideConnection, PromptRequest, SessionId
+    self as acp, AgentSideConnection, ClientSideConnection, PromptRequest, SessionId
 };
-use agent_client_protocol::{Client, PermissionOptionKind};
+use agent_client_protocol::{Client, PermissionOptionKind, CancelNotification};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};

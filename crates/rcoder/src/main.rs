@@ -13,7 +13,6 @@ mod router;
 mod service;
 
 use model::*;
-use service::SessionMessageManager;
 
 use config::load_config;
 use router::AppState;
@@ -59,7 +58,6 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
-        message_manager: Arc::new(SessionMessageManager::new(1000)), // 缓存最近1000条消息
         local_task_sender,
     });
 

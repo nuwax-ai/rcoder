@@ -11,8 +11,7 @@ use std::{convert::Infallible, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, debug};
 
-/// SSE端点：/agent/progress/{session_id}
-///
+
 /// 建立SSE连接，实时推送该session的SessionUpdate消息
 pub async fn agent_session_notification(
     Path(session_id): Path<String>,
