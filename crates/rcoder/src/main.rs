@@ -17,34 +17,11 @@ use service::SessionMessageManager;
 
 use acp_adapter::SessionManager;
 
-use config::AppConfig;
+use config::load_config;
 use router::AppState;
 
-// ==================== HTTP 处理器 ====================
 
-// 聊天处理相关函数已移动到 handler::chat_handler 模块
 
-// 健康检查函数已移动到 handler::health_handler 模块
-
-/// 加载配置
-fn load_config() -> AppConfig {
-    let mut config = AppConfig::default();
-
-    if let Ok(port) = std::env::var("PORT") {
-        config.port = port.parse().unwrap_or(3000);
-    }
-
-    if let Ok(projects_dir) = std::env::var("PROJECTS_DIR") {
-        config.projects_dir = PathBuf::from(projects_dir);
-    }
-
-    info!(
-        "Loaded config: port={}, projects_dir={:?}",
-        config.port, config.projects_dir
-    );
-
-    config
-}
 
 // 路由创建函数已移动到 handler 模块
 
