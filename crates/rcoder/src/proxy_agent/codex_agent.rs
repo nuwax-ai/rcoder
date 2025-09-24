@@ -1,5 +1,5 @@
 use agent_client_protocol::{
-    self as acp, Agent, AgentSideConnection, ClientCapabilities, ClientSideConnection,
+    self as acp, Agent, AgentSideConnection, CancelNotification, ClientCapabilities, ClientSideConnection,
     ContentBlock, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
     KillTerminalCommandResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionId, SessionNotification, SetSessionModeResponse, TextContent,
@@ -23,19 +23,22 @@ use tracing::{debug, error, info};
 use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
 use anyhow::Result;
 
-use super::AcpAgentClient;
+use super::{AcpAgentClient, AcpConnectionInfo};
 
 /// 启动一个长驻的 ACP Agent 服务，返回会话信息和一个用于持续发送 Prompt 的通道
 /// 默认启用 YOLO 模式（禁用沙箱和批准请求）
 pub async fn start_codex_acp_agent_service(
     chat_prompt: ChatPrompt,
     model_provider: Option<ModelProviderConfig>,
-) -> Result<(SessionId, mpsc::UnboundedSender<PromptRequest>)> {
+) -> Result<AcpConnectionInfo> {
     let project_path = chat_prompt.project_path;
 
     // 会话更新与客户端通道（用于构建 CodexAgent）
     let (session_update_tx, mut session_update_rx) = mpsc::unbounded_channel();
     let (client_tx, _client_rx) = mpsc::unbounded_channel();
+
+    // 用户发送 CancelNotification 消息的通道
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<CancelNotification>();
 
     //todo  暂时从环境变量便利加载配置
     let (cfg, _) = AgentType::codex_model_provider(model_provider.clone())?;
@@ -160,23 +163,68 @@ pub async fn start_codex_acp_agent_service(
 
     let _ = session_id_tx.send(session_id.clone());
 
-    // 长驻循环：接收外部 prompt 并转发到 ACP
+    // 长驻循环：优先处理 cancel 消息，然后处理 prompt 消息
     tokio::task::spawn_local(async move {
-        while let Some(mut req) = prompt_rx.recv().await {
-            if req.session_id.0.is_empty() {
-                req.session_id = session_id.clone();
-            }
-            match client_conn.prompt(req).await {
-                Ok(resp) => {
-                    debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
+        loop {
+            // 优先处理所有可用的 cancel 消息
+            while let Ok(req) = cancel_rx.try_recv() {
+                let result = client_conn.cancel(req).await;
+                if let Err(e) = result {
+                    error!("发送 Cancel 失败: {:?}", e);
                 }
-                Err(e) => {
-                    error!("发送 Prompt 失败: {:?}", e);
+            }
+            
+            // 然后处理所有可用的 prompt 消息
+            while let Ok(mut req) = prompt_rx.try_recv() {
+                if req.session_id.0.is_empty() {
+                    req.session_id = session_id.clone();
+                }
+                match client_conn.prompt(req).await {
+                    Ok(resp) => {
+                        debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
+                    }
+                    Err(e) => {
+                        error!("发送 Prompt 失败: {:?}", e);
+                    }
+                }
+            }
+            
+            // 如果两个通道都为空，等待任意一个通道有新消息
+            tokio::select! {
+                // 等待 cancel 消息
+                Some(req) = cancel_rx.recv() => {
+                    let result = client_conn.cancel(req).await;
+                    if let Err(e) = result {
+                        error!("发送 Cancel 失败: {:?}", e);
+                    }
+                }
+                // 等待 prompt 消息
+                Some(mut req) = prompt_rx.recv() => {
+                    if req.session_id.0.is_empty() {
+                        req.session_id = session_id.clone();
+                    }
+                    match client_conn.prompt(req).await {
+                        Ok(resp) => {
+                            debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
+                        }
+                        Err(e) => {
+                            error!("发送 Prompt 失败: {:?}", e);
+                        }
+                    }
+                }
+                // 两个通道都关闭时退出循环
+                else => {
+                    debug!("Cancel 和 Prompt 接收通道都已关闭");
+                    break;
                 }
             }
         }
     });
 
     let session_id = session_id_rx.await?;
-    Ok((session_id, prompt_tx))
+    Ok(AcpConnectionInfo {
+        session_id,
+        prompt_tx,
+        cancel_tx,
+    })
 }

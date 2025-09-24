@@ -2,6 +2,7 @@
 //!
 //! 基于 agent_client_protocol crate 的类型重新导出和扩展
 
+use agent_client_protocol::{ContentBlock, PermissionOption, PermissionOptionId, SessionId, SessionModeId, StopReason, ToolCall, ToolCallStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,16 +10,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 use tokio::sync::oneshot;
 
-// 重新导出 agent_client_protocol 中的核心类型
-pub use agent_client_protocol::{
-    SessionId, StopReason, Error, ErrorCode, ContentBlock,
-    PromptRequest, PromptResponse, ToolCall, ToolCallContent,
-    ToolCallStatus, SessionUpdate, PermissionOption, PermissionOptionKind,
-    PermissionOptionId, RequestPermissionRequest, RequestPermissionResponse,
-    ReadTextFileRequest, ReadTextFileResponse, WriteTextFileRequest,
-    WriteTextFileResponse, ClientCapabilities, ProtocolVersion,
-    SessionMode, SessionModeId, SessionModeState,
-};
 
 /// 用户消息 ID - 扩展类型
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]

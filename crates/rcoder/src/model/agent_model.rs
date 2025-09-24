@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use acp_adapter::SessionId;
-use agent_client_protocol::{self as acp, Client, PromptRequest};
+use agent_client_protocol::SessionId;
+use agent_client_protocol::{self as acp, CancelNotification, Client, PromptRequest};
 use anyhow::Result;
 use codex_core::WireApi;
 use codex_core::{ModelProviderInfo, config::ConfigToml};
@@ -217,6 +217,8 @@ pub struct ProjectAndAgentInfo {
     pub session_id: SessionId,
     /// 用于发送 Prompt 的通道
     pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
+    /// 用于发送取消通知的通道
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotification>,
     /// 模型提供商配置
     pub model_provider: Option<ModelProviderConfig>,
 }

@@ -7,9 +7,8 @@
 pub mod mention;
 pub mod types;
 
-// 重新导出主要的公共类型
-pub use agent_client_protocol::{ToolCall, ToolCallStatus};
+
 pub use types::{
     ConnectionState, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanStats, SessionState,
 };
-pub use types::{SessionId, StreamUpdate, Tool, ToolCallId, UserMessageId};
+pub use types::{StreamUpdate, Tool, ToolCallId, UserMessageId};

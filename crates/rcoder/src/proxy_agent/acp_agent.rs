@@ -135,11 +135,12 @@ pub async fn agent_worker(
                 };
                 //创建 agent 服务
                 match start_agent_result {
-                    Ok((session_id, prompt_tx)) => {
+                    Ok(conn_info) => {
                         let project_and_agent_info = ProjectAndAgentInfo {
                             project_id: project_id.clone(),
-                            session_id: session_id.clone(),
-                            prompt_tx: prompt_tx.clone(),
+                            session_id: conn_info.session_id.clone(),
+                            prompt_tx: conn_info.prompt_tx.clone(),
+                            cancel_tx: conn_info.cancel_tx.clone(),
                             model_provider: model_provider,
                         };
                         //记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
@@ -147,9 +148,9 @@ pub async fn agent_worker(
                             .insert(project_id.clone(), project_and_agent_info.clone());
 
                         if let Ok(prompt_request) =
-                            build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await
+                            build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await
                         {
-                            if let Err(e) = prompt_tx.send(prompt_request) {
+                            if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
                                 error!("Failed to send prompt request: {:?}", e);
                             } else {
                                 info!("Prompt 请求已发送");
@@ -161,7 +162,7 @@ pub async fn agent_worker(
                         // 发送回执消息
                         if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
                             project_id: project_id.clone(),
-                            session_id: session_id.to_string(),
+                            session_id: conn_info.session_id.to_string(),
                         }) {
                             error!("Failed to send chat prompt response: {:?}", e);
                         }

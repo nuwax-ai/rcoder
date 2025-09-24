@@ -3,10 +3,23 @@ mod claude_code_agent;
 mod codex_agent;
 
 pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
-use agent_client_protocol::{self as acp};
+use agent_client_protocol::{
+    self as acp, AgentSideConnection, CancelNotification, ClientSideConnection, PromptRequest, SessionId
+};
 use agent_client_protocol::{Client, PermissionOptionKind};
 use tokio::io::AsyncWriteExt as _;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
+
+/// ACP协议的连接信息
+pub struct AcpConnectionInfo {
+    /// 会话ID
+    pub session_id: SessionId,
+    /// 用于发送 Prompt 的通道
+    pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
+    /// 用于发送取消通知的通道
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotification>,
+}
 
 /// ACP 客户端实现[derive(Clone)]
 pub struct AcpAgentClient;
@@ -137,18 +150,26 @@ impl Client for AcpAgentClient {
                             acp::ContentBlock::Text(text_content) => text_content.text.clone(),
                             acp::ContentBlock::Image(_) => "<image>".into(),
                             acp::ContentBlock::Audio(_) => "<audio>".into(),
-                            acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri.clone(),
+                            acp::ContentBlock::ResourceLink(resource_link) => {
+                                resource_link.uri.clone()
+                            }
                             acp::ContentBlock::Resource(_) => "<resource>".into(),
                         };
                         info!("📥 Agent message cached [session:{}]: {}", session_id, text);
                     }
                     _ => {
-                        info!("📥 SessionUpdate cached [session:{}]: {:?}", session_id, args.update);
+                        info!(
+                            "📥 SessionUpdate cached [session:{}]: {:?}",
+                            session_id, args.update
+                        );
                     }
                 }
             }
             Err(e) => {
-                error!("❌ Failed to serialize SessionUpdate for session {}: {}", session_id, e);
+                error!(
+                    "❌ Failed to serialize SessionUpdate for session {}: {}",
+                    session_id, e
+                );
             }
         }
 
