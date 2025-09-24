@@ -9,6 +9,11 @@ license.workspace = true
 name = "claude_code_agent"
 path = "src/lib.rs"
 
+[[bin]]
+name = "claude-code-agent"
+path = "src/main.rs"
+
+
 [dependencies]
 acp-adapter = { path = "../acp_adapter" }
 agent-client-protocol = { workspace = true }
