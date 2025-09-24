@@ -8,173 +8,12 @@ use std::process::Stdio;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::model::ChatPrompt;
+use crate::{proxy_agent::AcpAgentClient, model::ChatPrompt};
 use agent_client_protocol::PermissionOptionKind as Kind;
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-
-/// Claude Code ACP 客户端实现
-///
-/// 实现了 acp::Client trait，用于处理来自代理的请求和通知
-pub struct ClaudeCodeAcpClient {
-    session_notifications: tokio::sync::mpsc::UnboundedSender<acp::SessionNotification>,
-}
-
-impl ClaudeCodeAcpClient {
-    /// 创建新的客户端实例
-    pub fn new() -> (
-        Self,
-        tokio::sync::mpsc::UnboundedReceiver<acp::SessionNotification>,
-    ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (
-            Self {
-                session_notifications: tx,
-            },
-            rx,
-        )
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl acp::Client for ClaudeCodeAcpClient {
-    async fn request_permission(
-        &self,
-        args: acp::RequestPermissionRequest,
-    ) -> Result<acp::RequestPermissionResponse, acp::Error> {
-        debug!("请求权限: {:?}", args);
-        // 自动允许：优先选择 AllowAlways，其次 AllowOnce；若都无，选第一个选项
-        let selected = args
-            .options
-            .iter()
-            .find(|o| o.kind == Kind::AllowAlways)
-            .or_else(|| args.options.iter().find(|o| o.kind == Kind::AllowOnce))
-            .or_else(|| args.options.first());
-        if let Some(option) = selected {
-            return Ok(acp::RequestPermissionResponse {
-                outcome: agent_client_protocol::RequestPermissionOutcome::Selected {
-                    option_id: option.id.clone(),
-                },
-                meta: None,
-            });
-        }
-        // 无可选项则取消
-        Ok(acp::RequestPermissionResponse {
-            outcome: agent_client_protocol::RequestPermissionOutcome::Cancelled,
-            meta: None,
-        })
-    }
-
-    async fn write_text_file(
-        &self,
-        args: acp::WriteTextFileRequest,
-    ) -> Result<acp::WriteTextFileResponse, acp::Error> {
-        debug!("写入文件: {:?}", args);
-        if let Some(parent) = std::path::Path::new(&args.path).parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                error!("创建目录失败: {}", e);
-                acp::Error::internal_error()
-            })?;
-        }
-        let mut file = tokio::fs::File::create(&args.path).await.map_err(|e| {
-            error!("创建文件失败: {}", e);
-            acp::Error::internal_error()
-        })?;
-        file.write_all(args.content.as_bytes()).await.map_err(|e| {
-            error!("写入文件失败: {}", e);
-            acp::Error::internal_error()
-        })?;
-        Ok(acp::WriteTextFileResponse { meta: None })
-    }
-
-    async fn read_text_file(
-        &self,
-        args: acp::ReadTextFileRequest,
-    ) -> Result<acp::ReadTextFileResponse, acp::Error> {
-        debug!("读取文件: {:?}", args);
-        let content = tokio::fs::read_to_string(&args.path).await.map_err(|e| {
-            error!("读取文件失败: {}", e);
-            acp::Error::internal_error()
-        })?;
-        Ok(acp::ReadTextFileResponse {
-            content,
-            meta: None,
-        })
-    }
-
-    async fn create_terminal(
-        &self,
-        _args: acp::CreateTerminalRequest,
-    ) -> Result<acp::CreateTerminalResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn terminal_output(
-        &self,
-        _args: acp::TerminalOutputRequest,
-    ) -> Result<acp::TerminalOutputResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn release_terminal(
-        &self,
-        _args: acp::ReleaseTerminalRequest,
-    ) -> Result<acp::ReleaseTerminalResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn wait_for_terminal_exit(
-        &self,
-        _args: acp::WaitForTerminalExitRequest,
-    ) -> Result<acp::WaitForTerminalExitResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn kill_terminal_command(
-        &self,
-        _args: acp::KillTerminalCommandRequest,
-    ) -> Result<acp::KillTerminalCommandResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn session_notification(&self, args: acp::SessionNotification) -> Result<(), acp::Error> {
-        // 转发会话通知到通道
-
-        match args.clone().update {
-            acp::SessionUpdate::AgentMessageChunk { content } => {
-                let text = match content {
-                    acp::ContentBlock::Text(text_content) => text_content.text,
-                    acp::ContentBlock::Image(_) => "<image>".into(),
-                    acp::ContentBlock::Audio(_) => "<audio>".into(),
-                    acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri,
-                    acp::ContentBlock::Resource(_) => "<resource>".into(),
-                };
-                info!("| Agent session_notification : {text}");
-            }
-            acp::SessionUpdate::UserMessageChunk { .. }
-            | acp::SessionUpdate::AgentThoughtChunk { .. }
-            | acp::SessionUpdate::ToolCall(_)
-            | acp::SessionUpdate::ToolCallUpdate(_)
-            | acp::SessionUpdate::Plan(_)
-            | acp::SessionUpdate::CurrentModeUpdate { .. }
-            | acp::SessionUpdate::AvailableCommandsUpdate { .. } => {
-                info!("| Other session_notification: {:?}", args.update);
-            }
-        }
-        let _ = self.session_notifications.send(args);
-        Ok(())
-    }
-
-    async fn ext_method(&self, _args: acp::ExtRequest) -> Result<acp::ExtResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn ext_notification(&self, _args: acp::ExtNotification) -> Result<(), acp::Error> {
-        Err(acp::Error::method_not_found())
-    }
-}
 
 /// 启动一个长驻的 Claude Code ACP Agent 服务，返回会话信息和一个用于持续发送 Prompt 的通道
 /// 使用 claude-code-acp 作为代理服务，通过子进程方式启动
@@ -314,7 +153,7 @@ pub async fn start_claude_code_acp_agent_service(
                 let incoming = stdout.compat();
 
                 // 创建客户端，并获取会话通知接收端
-                let (client, mut session_notif_rx) = ClaudeCodeAcpClient::new();
+                let client = AcpAgentClient;
 
                 // 创建连接
                 let (client_conn, handle_io) =
@@ -325,16 +164,8 @@ pub async fn start_claude_code_acp_agent_service(
                 // 启动 I/O 处理任务
                 tokio::task::spawn_local(handle_io);
 
-                // 消费会话通知并输出日志
-                tokio::task::spawn_local(async move {
-                    while let Some(notif) = session_notif_rx.recv().await {
-                        debug!("收到会话通知: {:?}", notif);
-                    }
-                });
-
                 // 初始化连接
                 debug!("初始化 ACP 连接[initialize]");
-                info!("正在发送 ACP 初始化请求...");
                 let init_result = client_conn
                     .initialize(InitializeRequest {
                         protocol_version: VERSION,

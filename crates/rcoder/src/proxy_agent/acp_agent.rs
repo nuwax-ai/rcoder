@@ -3,21 +3,18 @@ use std::{
     sync::LazyLock,
 };
 
-use agent_client_protocol::{
-    AgentSideConnection, ClientSideConnection, ContentBlock, PromptRequest, SessionId, TextContent,
-}; // bring trait into scope for session_notification
+use agent_client_protocol::{ContentBlock, PromptRequest, SessionId, TextContent}; // bring trait into scope for session_notification
 
-use codex_acp_agent::CodexAgent;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
-use super::codex_agent::{EmbeddedCodexClient, start_codex_acp_agent_service};
 use crate::{
     model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::claude_code_agent::start_claude_code_acp_agent_service,
 };
 use anyhow::Result;
+
 /// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
 pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
     LazyLock::new(|| DashMap::new());
@@ -171,37 +168,4 @@ pub async fn build_prompt_to_acp_agent(
         prompt: vec![text_block],
         meta: None,
     })
-}
-
-// Helper function to create a bidirectional connection
-fn create_connection_pair(
-    client: &EmbeddedCodexClient,
-    agent: &CodexAgent,
-) -> (ClientSideConnection, AgentSideConnection) {
-    let (client_to_agent_rx, client_to_agent_tx) = piper::pipe(1024);
-    let (agent_to_client_rx, agent_to_client_tx) = piper::pipe(1024);
-
-    let (agent_conn, agent_io_task) = ClientSideConnection::new(
-        client.clone(),
-        client_to_agent_tx,
-        agent_to_client_rx,
-        |fut| {
-            tokio::task::spawn_local(fut);
-        },
-    );
-
-    let (client_conn, client_io_task) = AgentSideConnection::new(
-        agent.clone(),
-        agent_to_client_tx,
-        client_to_agent_rx,
-        |fut| {
-            tokio::task::spawn_local(fut);
-        },
-    );
-
-    // Spawn the IO tasks
-    tokio::task::spawn_local(agent_io_task);
-    tokio::task::spawn_local(client_io_task);
-
-    (agent_conn, client_conn)
 }

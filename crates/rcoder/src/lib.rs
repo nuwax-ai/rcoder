@@ -4,6 +4,10 @@
 
 mod model;
 mod proxy_agent;
+mod config;
+mod handler;
+mod service;
+mod router;
 
 // 重新导出主要的类型和函数
 pub use proxy_agent::*;
