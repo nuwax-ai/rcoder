@@ -8,7 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use agent_client_protocol::{CancelNotification, SessionId};
 
@@ -95,16 +95,22 @@ async fn try_send_cancel_notification(
 
     match project_info {
         Some(project_info) => {
-            info!("🔍 查找session: {} 对应的agent连接", session_id);
+            debug!("🔍 查找session: {} 对应的agent连接", session_id);
 
             // 通过cancel_tx发送取消通知
             match project_info.cancel_tx.send(cancel_notification) {
                 Ok(_) => {
-                    info!("📤 取消通知成功发送到session: {}", session_id);
+                    info!(
+                        "📤 取消通知成功发送到session: {}, project_id={}",
+                        session_id, project_id
+                    );
                     return Ok(());
                 }
                 Err(e) => {
-                    error!("❌ 发送取消通知失败: session={}, error={}", session_id, e);
+                    error!(
+                        "❌ 发送取消通知失败: session={}, project_id={}, error={}",
+                        session_id, project_id, e
+                    );
                     return Err(format!("发送取消通知失败: {}", e));
                 }
             }

@@ -168,6 +168,7 @@ pub async fn start_codex_acp_agent_service(
         loop {
             // 优先处理所有可用的 cancel 消息
             while let Ok(req) = cancel_rx.try_recv() {
+                info!("收到 Cancel 消息, session_id={}", req.session_id.0);
                 let result = client_conn.cancel(req).await;
                 if let Err(e) = result {
                     error!("发送 Cancel 失败: {:?}", e);

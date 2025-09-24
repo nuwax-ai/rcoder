@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>扫雷游戏</title>
+    <link rel="stylesheet" href="minesweeper.css">
+</head>
+<body>
+    <div class="container">
+        <h1>扫雷游戏</h1>
+
+        <div class="game-controls">
+            <div class="difficulty-selector">
+                <label>难度选择：</label>
+                <select id="difficulty">
+                    <option value="beginner">初级 (9×9, 10个雷)</option>
+                    <option value="intermediate">中级 (16×16, 40个雷)</option>
+                    <option value="expert">高级 (30×16, 99个雷)</option>
+                </select>
+            </div>
+            <button id="new-game">新游戏</button>
+        </div>
+
+        <div class="game-info">
+            <div class="info-item">
+                <span class="label">剩余雷数：</span>
+                <span id="mine-count">10</span>
+            </div>
+            <div class="info-item">
+                <span class="label">时间：</span>
+                <span id="timer">000</span>
+            </div>
+            <div class="info-item">
+                <span id="game-status" class="status-ready">准备开始</span>
+            </div>
+        </div>
+
+        <div id="game-board" class="game-board"></div>
+
+        <div class="game-rules">
+            <h3>游戏规则：</h3>
+            <ul>
+                <li>左键点击：翻开方块</li>
+                <li>右键点击：标记/取消标记地雷</li>
+                <li>数字表示周围8个方块中地雷的数量</li>
+                <li>翻开所有非地雷方块即可获胜</li>
+            </ul>
+        </div>
+    </div>
+
+    <div id="game-over-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2 id="game-result-title">游戏结束</h2>
+            <p id="game-result-message">重新开始游戏？</p>
+            <button id="restart-game">重新开始</button>
+        </div>
+    </div>
+
+    <script src="minesweeper.js"></script>
+</body>
+</html>
