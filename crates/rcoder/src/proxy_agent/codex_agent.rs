@@ -15,6 +15,7 @@ use codex_core::protocol::AskForApproval;
 use codex_core::protocol_config_types::SandboxMode;
 use dashmap::DashMap;
 use serde_json::json;
+use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::{debug, error, info};
@@ -28,6 +29,7 @@ use super::AcpAgentClient;
 /// 默认启用 YOLO 模式（禁用沙箱和批准请求）
 pub async fn start_codex_acp_agent_service(
     chat_prompt: ChatPrompt,
+    model_provider: Option<ModelProviderConfig>,
 ) -> Result<(SessionId, mpsc::UnboundedSender<PromptRequest>)> {
     let project_path = chat_prompt.project_path;
 
@@ -35,26 +37,8 @@ pub async fn start_codex_acp_agent_service(
     let (session_update_tx, mut session_update_rx) = mpsc::unbounded_channel();
     let (client_tx, _client_rx) = mpsc::unbounded_channel();
 
-    // 加载配置
-    // 首先获取codex home目录 (~/.codex)
-    let codex_home = find_codex_home().map_err(|e| {
-        error!("Failed to find codex home directory: {}", e);
-        anyhow::anyhow!("Failed to find codex home directory: {}", e)
-    })?;
-
-    info!("Codex home directory: {:?}", codex_home);
-
-    // 从 ~/.codex/config.toml 加载配置
-    let config_toml_value = load_config_as_toml(&codex_home).map_err(|e| {
-        error!("Failed to load config.toml from {:?}: {}", codex_home, e);
-        anyhow::anyhow!("Failed to load config.toml from {:?}: {}", codex_home, e)
-    })?;
-
-    // 将TOML值转换为ConfigToml结构体
-    let cfg: ConfigToml = config_toml_value.try_into().map_err(|e| {
-        error!("Failed to deserialize config.toml: {}", e);
-        anyhow::anyhow!("Failed to deserialize config.toml: {}", e)
-    })?;
+    //todo  暂时从环境变量便利加载配置
+    let (cfg, _) = AgentType::codex_model_provider(model_provider.clone())?;
 
     info!("Loaded codex config: {:?}", cfg);
 

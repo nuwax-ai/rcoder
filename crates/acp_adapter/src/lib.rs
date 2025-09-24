@@ -3,17 +3,12 @@
 //! 此模块提供了与 ACP 兼容的 AI 代理通信的核心功能，
 //! 包括连接管理、会话生命周期、消息处理和 MCP 集成。
 
-pub mod config;
 
-pub mod mcp;
 pub mod mention;
 pub mod types;
 
 // 重新导出主要的公共类型
 pub use agent_client_protocol::{ToolCall, ToolCallStatus};
-pub use config::AcpConfig;
-pub use config::McpServerConfig;
-pub use mcp::{McpAdapter, McpManager, McpResource, McpTool};
 pub use types::{
     ConnectionState, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanStats, SessionState,
 };

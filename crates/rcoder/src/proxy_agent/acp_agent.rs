@@ -6,6 +6,7 @@ use std::{
 use agent_client_protocol::{ContentBlock, PromptRequest, SessionId, TextContent}; // bring trait into scope for session_notification
 
 use dashmap::DashMap;
+use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
@@ -115,12 +116,22 @@ pub async fn agent_worker(
             None => {
                 //获取 agent_type,判断使用 codex 还是 claude code
                 let agent_type = request.chat_prompt.agent_type.clone();
+                //todo 暂时没有 model_provider, 后续需要有个地方设置获取 model_provider
+                let model_provider: Option<ModelProviderConfig> = None;
+
                 //启动 agent 服务,返回 session_id 和 prompt_tx
                 let start_agent_result = match agent_type {
                     AgentType::Claude => {
-                        start_claude_code_acp_agent_service(chat_prompt.clone()).await
+                        start_claude_code_acp_agent_service(
+                            chat_prompt.clone(),
+                            model_provider.clone(),
+                        )
+                        .await
                     }
-                    AgentType::Codex => start_codex_acp_agent_service(chat_prompt.clone()).await,
+                    AgentType::Codex => {
+                        start_codex_acp_agent_service(chat_prompt.clone(), model_provider.clone())
+                            .await
+                    }
                 };
                 //创建 agent 服务
                 match start_agent_result {
@@ -129,7 +140,9 @@ pub async fn agent_worker(
                             project_id: project_id.clone(),
                             session_id: session_id.clone(),
                             prompt_tx: prompt_tx.clone(),
+                            model_provider: model_provider,
                         };
+                        //记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
                         PROJECT_AND_AGENT_INFO_MAP
                             .insert(project_id.clone(), project_and_agent_info.clone());
 

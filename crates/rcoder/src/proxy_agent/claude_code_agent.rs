@@ -4,14 +4,13 @@ use agent_client_protocol::{
 };
 
 use claude_code_agent::ClaudeCodeAcpManager;
+use shared_types::ModelProviderConfig;
 use std::process::Stdio;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::{model::ChatPrompt, proxy_agent::AcpAgentClient};
-use agent_client_protocol::PermissionOptionKind as Kind;
+use crate::{AgentType, model::ChatPrompt, proxy_agent::AcpAgentClient};
 use anyhow::{Context, Result};
-use tokio::io::AsyncWriteExt;
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -19,6 +18,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 /// 使用 claude-code-acp 作为代理服务，通过子进程方式启动
 pub async fn start_claude_code_acp_agent_service(
     chat_prompt: ChatPrompt,
+    model_provider: Option<ModelProviderConfig>,
 ) -> Result<(SessionId, mpsc::UnboundedSender<PromptRequest>)> {
     let project_path = chat_prompt.project_path;
 
@@ -69,28 +69,8 @@ pub async fn start_claude_code_acp_agent_service(
                 // 启动子进程
                 // 启动参数保持原样，由环境变量 CLAUDE_CODE_ARGS 控制
                 let spawn_args = command.args.clone();
-                // 合并命令自带 env 与当前进程中的必需 ANTHROPIC_* 环境变量
-                let mut merged_envs: std::collections::HashMap<String, String> =
-                    command.env.unwrap_or_default();
-                for key in [
-                    "ANTHROPIC_BASE_URL",
-                    "ANTHROPIC_AUTH_TOKEN",
-                    "ANTHROPIC_MODEL",
-                    "ANTHROPIC_SMALL_FAST_MODEL",
-                ] {
-                    if let Ok(val) = std::env::var(key) {
-                        merged_envs.insert(key.to_string(), val);
-                    }
-                }
-                // 通过环境变量为子进程传递 CLAUDE_CODE_ARGS（默认开启 yolo 模式）
-                if let Ok(val) = std::env::var("CLAUDE_CODE_ARGS") {
-                    merged_envs.insert("CLAUDE_CODE_ARGS".to_string(), val);
-                } else {
-                    merged_envs.insert(
-                        "CLAUDE_CODE_ARGS".to_string(),
-                        "--dangerously-skip-permissions".to_string(),
-                    );
-                }
+                //todo  暂时从环境变量便利加载配置 ,ANTHROPIC_* 环境变量
+                let merged_envs = AgentType::claude_model_provider(model_provider.clone())?;
                 let mut child = tokio::process::Command::new(&command.path)
                     .args(&spawn_args)
                     .stdin(Stdio::piped())
