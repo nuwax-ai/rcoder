@@ -1,0 +1,82 @@
+//! 通用通道处理工具
+//!
+//! 提供可复用的channel消息处理逻辑
+
+use agent_client_protocol::{Agent, CancelNotification, PromptRequest, SessionId};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info};
+
+use crate::{CancelNotificationRequest, CancelNotificationResponse};
+
+/// 通用的Cancel消息处理任务（针对实现了Agent trait的类型）
+pub fn spawn_cancel_handler_for_agent<A>(
+    client_conn: Arc<A>,
+    mut cancel_rx: mpsc::UnboundedReceiver<CancelNotificationRequest>,
+    project_id: &str,
+) where
+    A: Agent + 'static,
+{
+    let project_id = project_id.to_string();
+    tokio::task::spawn_local(async move {
+        while let Some(req) = cancel_rx.recv().await {
+            info!(
+                "项目[{}]收到Cancel消息, session_id={}",
+                project_id, req.cancel_notification.session_id.0
+            );
+
+            let result = client_conn.cancel(req.cancel_notification).await;
+            if let Err(e) = result {
+                error!("项目[{}]发送Cancel失败: {:?}", project_id, e);
+                let _ = req.tx.send(CancelNotificationResponse {
+                    success: false,
+                    message: Some(format!("{:?}", e)),
+                });
+            } else {
+                req.tx.send(CancelNotificationResponse {
+                    success: true,
+                    message: None,
+                });
+            }
+        }
+
+        info!("项目[{}]独立Cancel处理任务结束", project_id);
+    });
+}
+
+/// 通用的Prompt消息处理任务（针对实现了Agent trait的类型）
+pub fn spawn_prompt_handler_for_agent<A>(
+    client_conn: Arc<A>,
+    mut prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
+    session_id: SessionId,
+    project_id: &str,
+) where
+    A: Agent + 'static,
+{
+    let project_id = project_id.to_string();
+    tokio::task::spawn_local(async move {
+        while let Some(mut req) = prompt_rx.recv().await {
+            if req.session_id.0.is_empty() {
+                req.session_id = session_id.clone();
+            }
+            info!(
+                "项目[{}]收到Prompt消息, session_id={}",
+                project_id, req.session_id.0
+            );
+
+            match client_conn.prompt(req).await {
+                Ok(resp) => {
+                    debug!(
+                        "项目[{}]Prompt发送成功, stop_reason={:?}",
+                        project_id, resp.stop_reason
+                    );
+                }
+                Err(e) => {
+                    error!("项目[{}]发送Prompt失败: {:?}", project_id, e);
+                }
+            }
+        }
+
+        info!("项目[{}]独立Prompt处理任务结束", project_id);
+    });
+}

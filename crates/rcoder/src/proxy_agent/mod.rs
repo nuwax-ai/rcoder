@@ -1,15 +1,18 @@
 mod acp_agent;
+mod channel_utils;
 mod claude_code_agent;
 mod codex_agent;
 
 pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
 use agent_client_protocol::{
-    self as acp, AgentSideConnection, ClientSideConnection, PromptRequest, SessionId
+    self as acp, AgentSideConnection, ClientSideConnection, PromptRequest, SessionId,
 };
-use agent_client_protocol::{Client, PermissionOptionKind, CancelNotification};
+use agent_client_protocol::{CancelNotification, Client, PermissionOptionKind};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
+
+use crate::CancelNotificationRequest;
 
 /// ACP协议的连接信息
 pub struct AcpConnectionInfo {
@@ -18,7 +21,7 @@ pub struct AcpConnectionInfo {
     /// 用于发送 Prompt 的通道
     pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
     /// 用于发送取消通知的通道
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotification>,
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequest>,
 }
 
 /// ACP 客户端实现[derive(Clone)]

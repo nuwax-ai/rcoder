@@ -6,7 +6,7 @@ use anyhow::Result;
 use codex_core::WireApi;
 use codex_core::{ModelProviderInfo, config::ConfigToml};
 use shared_types::ModelProviderConfig;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use codex_core::config::{Config, ConfigOverrides, find_codex_home, load_config_as_toml};
@@ -208,6 +208,19 @@ impl AgentType {
     }
 }
 
+/// 取消通知请求
+pub struct CancelNotificationRequest{
+    pub cancel_notification: CancelNotification,
+    pub tx: oneshot::Sender<CancelNotificationResponse>,
+}
+
+/// 取消通知响应
+pub struct CancelNotificationResponse{
+    pub success: bool,
+    pub message: Option<String>,
+}
+
+
 /// 项目id与 Agent 服务池，一个项目对应一个 Agent 服务
 #[derive(Clone)]
 pub struct ProjectAndAgentInfo {
@@ -218,7 +231,7 @@ pub struct ProjectAndAgentInfo {
     /// 用于发送 Prompt 的通道
     pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
     /// 用于发送取消通知的通道
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotification>,
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequest>,
     /// 模型提供商配置
     pub model_provider: Option<ModelProviderConfig>,
 }

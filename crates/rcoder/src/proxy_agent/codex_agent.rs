@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::{debug, error, info};
 
+use crate::CancelNotificationRequest;
 use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
 use anyhow::Result;
 
@@ -40,7 +41,7 @@ pub async fn start_codex_acp_agent_service(
     let (client_tx, _client_rx) = mpsc::unbounded_channel();
 
     // 用户发送 CancelNotification 消息的通道
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<CancelNotification>();
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequest>();
 
     //todo  暂时从环境变量便利加载配置
     let (cfg, _) = AgentType::codex_model_provider(model_provider.clone())?;
@@ -160,34 +161,18 @@ pub async fn start_codex_acp_agent_service(
 
     let _ = session_id_tx.send(session_id.clone());
 
-    let cancel_client_conn = client_conn.clone();
-    tokio::task::spawn_local(async move {
-        // 处理所有可用的 cancel 消息
-        while let Some(req) = cancel_rx.recv().await {
-            info!("收到 Cancel 消息, session_id={}", req.session_id.0);
-            let result = cancel_client_conn.cancel(req).await;
-            if let Err(e) = result {
-                error!("发送 Cancel 失败: {:?}", e);
-            }
-        }
-    });
-
-    tokio::task::spawn_local(async move {
-        // 处理所有可用的 prompt 消息
-        while let Some(mut req) = prompt_rx.recv().await {
-            if req.session_id.0.is_empty() {
-                req.session_id = session_id.clone();
-            }
-            match client_conn.prompt(req).await {
-                Ok(resp) => {
-                    debug!("Prompt 发送成功, stop_reason={:?}", resp.stop_reason);
-                }
-                Err(e) => {
-                    error!("发送 Prompt 失败: {:?}", e);
-                }
-            }
-        }
-    });
+    // 使用共享的通道处理逻辑
+    super::channel_utils::spawn_cancel_handler_for_agent(
+        client_conn.clone(),
+        cancel_rx,
+        &chat_prompt.project_id,
+    );
+    super::channel_utils::spawn_prompt_handler_for_agent(
+        client_conn.clone(),
+        prompt_rx,
+        session_id.clone(),
+        &chat_prompt.project_id,
+    );
 
     let session_id = session_id_rx.await?;
     Ok(AcpConnectionInfo {

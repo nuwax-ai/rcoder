@@ -8,12 +8,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 
 use agent_client_protocol::{CancelNotification, SessionId};
 
-use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
 use crate::{AppError, HttpResult};
+use crate::{CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize)]
@@ -28,7 +29,6 @@ pub struct CancelQuery {
 #[derive(Debug, Serialize)]
 pub struct CancelResponse {
     pub success: bool,
-    pub message: String,
     pub session_id: String,
 }
 
@@ -54,71 +54,46 @@ pub async fn agent_session_cancel(
         meta: None,
     };
 
-    // 通过全局PROJECT_AND_AGENT_INFO_MAP获取对应session的取消通道
-    match try_send_cancel_notification(&session_id, &project_id, cancel_notification).await {
-        Ok(_) => {
-            info!("✅ 成功发送取消通知: session_id={}", session_id);
-
-            let response = CancelResponse {
-                success: true,
-                message: "取消通知已发送".to_string(),
-                session_id: session_id.clone(),
-            };
-
-            Ok(HttpResult::success(response))
-        }
-        Err(e) => {
-            error!(
-                "❌ 发送取消通知失败: session_id={}, error={}",
-                session_id, e
-            );
-
-            let response = CancelResponse {
-                success: false,
-                message: format!("发送取消通知失败: {}", e),
-                session_id: session_id.clone(),
-            };
-
-            Ok(HttpResult::success(response))
-        }
-    }
-}
-
-/// 尝试发送取消通知
-async fn try_send_cancel_notification(
-    session_id: &str,
-    project_id: &str,
-    cancel_notification: CancelNotification,
-) -> Result<(), String> {
     // 从全局映射中查找匹配的session
-    let project_info = PROJECT_AND_AGENT_INFO_MAP.get(project_id);
+    let project_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
 
+    let (tx, rx) = oneshot::channel();
+    let cancel_notification_request = CancelNotificationRequest {
+        cancel_notification,
+        tx,
+    };
     match project_info {
         Some(project_info) => {
             debug!("🔍 查找session: {} 对应的agent连接", session_id);
 
             // 通过cancel_tx发送取消通知
-            match project_info.cancel_tx.send(cancel_notification) {
-                Ok(_) => {
-                    info!(
-                        "📤 取消通知成功发送到session: {}, project_id={}",
-                        session_id, project_id
-                    );
-                    return Ok(());
+            project_info
+                .cancel_tx
+                .send(cancel_notification_request)
+                .map_err(|e| anyhow::anyhow!("发送取消通知失败: {}", e))?;
+
+            // 等待取消通知响应
+            match rx.await {
+                Ok(cancel_notification_response) => {
+                    if cancel_notification_response.success {
+                        Ok(HttpResult::success(CancelResponse {
+                            success: true,
+                            session_id: session_id,
+                        }))
+                    } else {
+                        Ok(HttpResult::error("0001", "停止智能体执行失败"))
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        "❌ 发送取消通知失败: session={}, project_id={}, error={}",
-                        session_id, project_id, e
-                    );
-                    return Err(format!("发送取消通知失败: {}", e));
-                }
+                Err(e) => Err(AppError::AnyhowError(anyhow::anyhow!(
+                    "停止智能体执行失败: {}",
+                    e
+                ))),
             }
         }
         None => {
             error!("❌ 未找到project_id: {} 对应的活跃连接", project_id);
 
-            Err(format!("未找到session_id: {} 对应的活跃连接", session_id))
+            Ok(HttpResult::error("0001", "未找到project_id对应的活跃连接"))
         }
     }
 }
