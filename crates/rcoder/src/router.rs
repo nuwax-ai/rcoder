@@ -38,6 +38,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handler::health_check))
         .route("/chat", post(handler::handle_chat))
         .route("/project/read", post(handler::handle_project_read))
+        .route("/project/zip", post(handler::handle_project_zip))
+        .route("/project/download/:project_id", get(handler::handle_project_download))
         .route(
             "/agent/progress/{session_id}",
             get(handler::agent_session_notification),
