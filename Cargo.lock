@@ -1093,6 +1093,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "content_inspector"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7bda66e858c683005a53a9a60c69a4aca7eeaa45d124526e389f7aec8e62f38"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1633,6 +1642,12 @@ checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
 ]
+
+[[package]]
+name = "file-format"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0eab8aa2fba5f39f494000a22f44bf3c755b7d7f8ffad3f36c6d507893074159"
 
 [[package]]
 name = "filedescriptor"
@@ -2763,12 +2778,17 @@ name = "nuwax_parser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "content_inspector",
+ "derive_builder",
+ "file-format",
  "futures 0.3.31",
  "hex",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
