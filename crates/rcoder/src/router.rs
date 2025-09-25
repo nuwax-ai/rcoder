@@ -37,6 +37,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handler::health_check))
         .route("/chat", post(handler::handle_chat))
+        .route("/project/read", post(handler::handle_project_read))
         .route(
             "/agent/progress/{session_id}",
             get(handler::agent_session_notification),

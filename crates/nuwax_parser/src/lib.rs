@@ -12,5 +12,8 @@
 //! - **WASM兼容**: 可编译为 WebAssembly 供前端使用
 //! - **文件同步**: 智能双向文件同步，支持变更检测
 
-pub mod model;
-pub mod project_op;
+mod model;
+mod project_op;
+
+pub use model::*;
+pub use project_op::*;
