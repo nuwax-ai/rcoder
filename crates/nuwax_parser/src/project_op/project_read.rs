@@ -87,6 +87,9 @@ pub enum ProjectReadError {
     PathNotFound(PathBuf),
     #[error("Invalid path: {0}")]
     InvalidPath(PathBuf),
+    // anyhow error
+    #[error("anyhow error: {0}")]
+    Anyhow(#[from] anyhow::Error),
 }
 
 pub struct ProjectReader {
@@ -119,18 +122,15 @@ impl ProjectReader {
     }
 
     /// 扫描目录
-    pub fn read_project(&self, project_path: impl AsRef<Path>) -> Result<ProjectSourceCode> {
+    pub fn read_project(&self, project_path: impl AsRef<Path>) -> Result<ProjectSourceCode,ProjectReadError> {
         let project_path = project_path.as_ref();
 
         if !project_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Path does not exist: {}",
-                project_path.display()
-            ));
+            return Err(ProjectReadError::InvalidPath(project_path.to_path_buf()));
         }
 
         if !project_path.is_dir() {
-            return Err(anyhow::anyhow!("Invalid path: {}", project_path.display()));
+            return Err(ProjectReadError::InvalidPath(project_path.to_path_buf()));
         }
 
         let mut files = Vec::new();
