@@ -19,7 +19,7 @@ use router::AppState;
 
 // 路由创建函数已移动到 handler 模块
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 初始化 OpenTelemetry
     init_telemetry()?;

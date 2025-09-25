@@ -1,10 +1,9 @@
 use agent_client_protocol::{
-    self as acp, Agent, CancelNotification, ClientCapabilities, ClientSideConnection, ContentBlock,
+    Agent, ClientCapabilities, ClientSideConnection, ContentBlock,
     InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId,
     TextContent, V1 as VERSION,
 };
 
-use claude_code_agent::ClaudeCodeAcpManager;
 use shared_types::ModelProviderConfig;
 use std::{process::Stdio, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
@@ -25,34 +24,15 @@ pub async fn start_claude_code_acp_agent_service(
 ) -> Result<AcpConnectionInfo> {
     let project_path = chat_prompt.project_path;
 
-    // 创建 Claude Code ACP 管理器（使用默认配置）
-    let manager = ClaudeCodeAcpManager::default();
-    info!("Claude Code ACP 管理器创建完成");
-
-    // 检查并安装 claude-code-acp
-    if !manager.is_available().await {
-        info!("Claude Code ACP 未安装，正在安装...");
-        manager.install_or_update().await.map_err(|e| {
-            error!("Failed to install claude-code-acp: {}", e);
-            anyhow::anyhow!("Failed to install claude-code-acp: {}", e)
-        })?;
-        info!("Claude Code ACP 安装完成");
-    }
-
-    // 获取启动命令
-    let command = manager.get_command().await.map_err(|e| {
-        error!("Failed to get claude-code-acp command: {}", e);
-        anyhow::anyhow!("Failed to get claude-code-acp command: {}", e)
-    })?;
-    info!(
-        "Claude Code ACP 命令: {:?} {:?}",
-        command.path, command.args
-    );
+    // 直接使用 claude-code-acp 命令
+    let command_path = "claude-code-acp";
+    let command_args = Vec::<String>::new(); // 空参数列表，可以根据需要添加
+    info!("Claude Code ACP 命令: {} {:?}", command_path, command_args);
     // 用户发送 CancelNotification 消息的通道
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequest>();
+    let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequest>();
 
     // 用于外部持续发送 prompt 的通道
-    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
+    let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
     let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
 
     // 克隆用于闭包
@@ -73,10 +53,10 @@ pub async fn start_claude_code_acp_agent_service(
             .run_until(async {
                 // 启动子进程
                 // 启动参数保持原样，由环境变量 CLAUDE_CODE_ARGS 控制
-                let spawn_args = command.args.clone();
+                let spawn_args = command_args.clone();
                 //todo  暂时从环境变量便利加载配置 ,ANTHROPIC_* 环境变量
                 let merged_envs = AgentType::claude_model_provider(model_provider.clone())?;
-                let mut child = tokio::process::Command::new(&command.path)
+                let mut child = tokio::process::Command::new(command_path)
                     .args(&spawn_args)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
