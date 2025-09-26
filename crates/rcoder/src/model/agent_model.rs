@@ -31,6 +31,19 @@ impl Default for AgentType {
 }
 
 impl AgentType {
+    /// 根据模型提供商配置自动选择 Agent 类型
+    /// - Anthropic 协议使用 Claude Code agent
+    /// - OpenAI 或未知协议使用 Codex agent
+    pub fn from_model_provider(model_provider: Option<&ModelProviderConfig>) -> Self {
+        match model_provider {
+            Some(config) => match config.get_api_protocol() {
+                shared_types::ModelApiProtocol::Anthropic => AgentType::Claude,
+                shared_types::ModelApiProtocol::OpenAI => AgentType::Codex,
+            },
+            None => AgentType::default(), // 默认使用 Claude
+        }
+    }
+
     /// 获取 codex 环境变量的模型提供商配置
     pub fn codex_from_env() -> Result<ConfigToml> {
         // 加载配置

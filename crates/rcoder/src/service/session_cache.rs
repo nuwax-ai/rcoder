@@ -1,11 +1,13 @@
 //! 全局Session缓存模块
 //!
-//! 使用LazyLock初始化全局DashMap，按session_id分组缓存SessionUpdate消息到循环数组
+//! 使用LazyLock初始化全局DashMap，按session_id分组缓存统一会话消息到ringbuf循环缓冲区
 
 use std::sync::LazyLock;
 use dashmap::DashMap;
-use serde_json::Value;
-use std::collections::VecDeque;
+use ringbuf::HeapRb;
+use ringbuf::traits::{RingBuffer, Consumer, Observer};
+use crate::{SessionNotify, UnifiedSessionMessage};
+use anyhow::Result;
 
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, SessionData>> = LazyLock::new(|| {
@@ -13,39 +15,35 @@ pub static SESSION_CACHE: LazyLock<DashMap<String, SessionData>> = LazyLock::new
 });
 
 /// Session数据包装
-#[derive(Debug)]
 pub struct SessionData {
-    /// 循环消息缓存 - 固定大小1000条
-    pub messages: std::sync::Mutex<VecDeque<Value>>,
-    /// 最大缓存数量
-    max_size: usize,
+    /// 循环消息缓存 - 固定大小1000条，使用ringbuf实现
+    rb: std::sync::Mutex<HeapRb<UnifiedSessionMessage>>,
 }
 
 impl SessionData {
     pub fn new(max_size: usize) -> Self {
         Self {
-            messages: std::sync::Mutex::new(VecDeque::with_capacity(max_size * 2)), // 预分配空间避免频繁扩容
-            max_size,
+            rb: std::sync::Mutex::new(HeapRb::new(max_size)),
         }
     }
 
     /// 添加消息到循环缓存
-    pub fn add_message(&self, message: Value) {
-        if let Ok(mut messages) = self.messages.lock() {
-            // 如果满了，移除最老的消息
-            if messages.len() >= self.max_size {
-                messages.pop_front();
-            }
-
-            messages.push_back(message);
+    pub fn add_message(&self, message: UnifiedSessionMessage) {
+        if let Ok(mut rb) = self.rb.lock() {
+            // ringbuf 会自动循环覆盖，不需要手动检查大小
+            let _ = rb.push_overwrite(message); // 如果缓冲区满，会覆盖最老的消息
         }
     }
 
     /// 获取所有消息并清空缓存（用于SSE推送）
-    pub fn drain_messages(&self) -> Vec<Value> {
-        if let Ok(mut messages) = self.messages.lock() {
-            let drained: Vec<Value> = messages.drain(..).collect();
-            drained
+    pub fn drain_messages(&self) -> Vec<UnifiedSessionMessage> {
+        if let Ok(mut rb) = self.rb.lock() {
+            let mut messages = Vec::new();
+            // 读取所有可用消息
+            while let Some(message) = rb.try_pop() {
+                messages.push(message);
+            }
+            messages
         } else {
             Vec::new()
         }
@@ -53,37 +51,27 @@ impl SessionData {
 
     /// 获取消息数量
     pub fn message_count(&self) -> usize {
-        if let Ok(messages) = self.messages.lock() {
-            messages.len()
+        if let Ok(rb) = self.rb.lock() {
+            rb.occupied_len()
         } else {
             0
         }
     }
 }
 
-/// 便捷函数：添加SessionUpdate消息
-pub fn add_session_update(session_id: &str, session_update: Value) {
+/// 便捷函数：添加SessionNotify消息（自动转换为统一格式）
+pub fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
+    let unified_message = notify.to_unified_message();
+
     let session_data = SESSION_CACHE
         .entry(session_id.to_string())
         .or_insert_with(|| SessionData::new(1000));
 
-    session_data.add_message(session_update);
+    session_data.add_message(unified_message);
+    Ok(())
 }
 
-/// 便捷函数：获取并清空消息
-pub fn drain_session_messages(session_id: &str) -> Vec<Value> {
-    if let Some(session_data) = SESSION_CACHE.get(session_id) {
-        session_data.drain_messages()
-    } else {
-        Vec::new()
-    }
-}
 
-/// 便捷函数：获取session消息数量
-pub fn get_session_message_count(session_id: &str) -> usize {
-    if let Some(session_data) = SESSION_CACHE.get(session_id) {
-        session_data.message_count()
-    } else {
-        0
-    }
-}
+
+
+

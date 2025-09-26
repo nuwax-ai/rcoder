@@ -3,6 +3,7 @@
 use anyhow::Result;
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
+use shared_types::ModelProviderConfig;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
@@ -29,6 +30,9 @@ pub struct ChatRequest {
     /// 可选的附件列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// 模型配置
+    #[schema(example = "openai")]
+    pub model_provider: Option<ModelProviderConfig>,
 }
 
 /// 服务响应结构
@@ -159,16 +163,20 @@ pub async fn handle_chat(
     let project_workspace = get_project_workspace(&project_id).await?;
 
 
+    // 根据模型提供商配置自动选择 agent 类型
+    let agent_type = AgentType::from_model_provider(request.model_provider.as_ref());
+
     let chat_prompt = ChatPromptBuilder::default()
         .project_id(project_id.clone())
         .project_path(project_workspace)
         .session_id(request.session_id.clone())
         .prompt(request.prompt.clone())
         .attachments(request.attachments.clone())
+        .agent_type(agent_type)
         .build()
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let (local_task_request, chat_prompt_rx) = LocalSetAgentRequest::new(chat_prompt);
+    let (local_task_request, chat_prompt_rx) = LocalSetAgentRequest::new(chat_prompt, request.model_provider.clone());
     state.local_task_sender.send(local_task_request)?;
 
     let result = match chat_prompt_rx.await {

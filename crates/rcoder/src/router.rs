@@ -63,9 +63,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     ),
     components(
         schemas(
+            // 响应结构体
             handler::HealthResponse,
             handler::ChatRequest,
             handler::ChatResponse,
+            crate::handler::SessionUpdateEvent,
+            // 附件相关结构体
             crate::model::Attachment,
             crate::model::AttachmentSource,
             crate::model::TextAttachment,
@@ -73,26 +76,55 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             crate::model::AudioAttachment,
             crate::model::DocumentAttachment,
             crate::model::ImageDimensions,
+            // 会话消息相关结构体
+            crate::model::UnifiedSessionMessage,
+            crate::model::SessionMessageType,
         )
     ),
     tags(
-        (name = "system", description = "系统相关接口"),
-        (name = "chat", description = "聊天相关接口"),
-        (name = "project", description = "项目管理相关接口"),
+        (name = "system", description = "系统健康检查和状态监控接口"),
+        (name = "chat", description = "AI 聊天对话接口，支持多媒体内容"),
+        (name = "agent", description = "AI 代理会话管理和实时通知接口"),
     ),
     info(
-        description = "RCoder AI 服务 API 文档",
+        description = r#"
+RCoder AI 服务 API
+
+基于 ACP (Agent Client Protocol) 的 AI 驱动开发平台，提供完整的 AI 代理集成解决方案。
+
+## 主要功能
+
+- **智能对话**: 支持文本、图像、音频、文档等多媒体内容的 AI 交互
+- **实时通知**: 通过 SSE 协议提供 AI 代理执行进度的实时推送
+- **会话管理**: 完整的会话生命周期管理，支持任务取消
+- **项目隔离**: 每个对话在独立的项目工作空间中进行，确保安全性
+
+## 技术架构
+
+- **协议**: ACP (Agent Client Protocol) v0.4
+- **代理类型**: 支持 Codex、Claude、Proxy 三种 AI 代理
+- **并发**: 基于 MPMC 架构的高并发处理
+- **实时通信**: Server-Sent Events (SSE) 协议
+
+## 使用流程
+
+1. 调用 `/chat` 接口发送对话请求
+2. 通过 `/agent/progress/{session_id}` 建立 SSE 连接接收实时更新
+3. 可随时通过 `/agent/session/cancel` 取消正在执行的任务
+"#,
         title = "RCoder AI API",
         version = "1.0.0",
-        license(name = "MIT OR Apache-2.0"),
+        license(name = "MIT OR Apache-2.0", url = "https://opensource.org/licenses/MIT"),
         contact(
             name = "RCoder Team",
-            email = "team@rcoder.com"
+            email = "team@rcoder.com",
+            url = "https://github.com/rcoder/rcoder"
         )
     ),
     servers(
-        (url = "http://localhost:3000", description = "开发环境"),
-        (url = "https://api.rcoder.com", description = "生产环境")
+        (url = "http://localhost:3000", description = "本地开发环境"),
+        (url = "https://api.rcoder.com", description = "生产环境"),
+        (url = "https://staging-api.rcoder.com", description = "测试环境")
     )
 )]
 pub struct ApiDoc;

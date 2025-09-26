@@ -32,16 +32,19 @@ pub struct LocalSetAgentRequest {
     chat_prompt: ChatPrompt,
     /// 发送 agent 通知执行prompt 完毕的回执消息
     chat_prompt_tx: oneshot::Sender<ChatPromptResponse>,
+    /// 模型提供商配置
+    model_provider: Option<ModelProviderConfig>,
 }
 
 impl LocalSetAgentRequest {
-    pub fn new(chat_prompt: ChatPrompt) -> (Self, oneshot::Receiver<ChatPromptResponse>) {
+    pub fn new(chat_prompt: ChatPrompt, model_provider: Option<ModelProviderConfig>) -> (Self, oneshot::Receiver<ChatPromptResponse>) {
         let (chat_prompt_tx, chat_prompt_rx) = oneshot::channel();
 
         (
             Self {
                 chat_prompt,
                 chat_prompt_tx,
+                model_provider,
             },
             chat_prompt_rx,
         )
@@ -117,8 +120,8 @@ pub async fn agent_worker(
             None => {
                 //获取 agent_type,判断使用 codex 还是 claude code
                 let agent_type = request.chat_prompt.agent_type.clone();
-                //todo 暂时没有 model_provider, 后续需要有个地方设置获取 model_provider
-                let model_provider: Option<ModelProviderConfig> = None;
+                //使用传入的模型提供商配置
+                let model_provider = request.model_provider.clone();
 
                 //启动 agent 服务,返回 session_id 和 prompt_tx
                 let start_agent_result = match agent_type {

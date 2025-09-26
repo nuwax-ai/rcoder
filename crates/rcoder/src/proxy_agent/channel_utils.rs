@@ -3,11 +3,12 @@
 //! 提供可复用的channel消息处理逻辑
 
 use agent_client_protocol::{Agent, CancelNotification, PromptRequest, SessionId};
+use serde_json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::{CancelNotificationRequest, CancelNotificationResponse};
+use crate::{CancelNotificationRequest, CancelNotificationResponse, model::{SessionNotify, SessionPromptStart, SessionPromptEnd}, service::push_session_update};
 
 /// 通用的Cancel消息处理任务（针对实现了Agent trait的类型）
 pub fn spawn_cancel_handler_for_agent<A>(
@@ -33,7 +34,7 @@ pub fn spawn_cancel_handler_for_agent<A>(
                     message: Some(format!("{:?}", e)),
                 });
             } else {
-                req.tx.send(CancelNotificationResponse {
+                let _ = req.tx.send(CancelNotificationResponse {
                     success: true,
                     message: None,
                 });
@@ -64,15 +65,44 @@ pub fn spawn_prompt_handler_for_agent<A>(
                 project_id, req.session_id.0
             );
 
+            // 发送 SessionPromptStart 通知
+            let session_id_str = req.session_id.0.to_string();
+            let start_notify = SessionNotify::SessionPromptStart(SessionPromptStart {
+                session_id: session_id_str.clone(),
+            });
+            if let Err(e) = push_session_update(&session_id_str, start_notify) {
+                error!("项目[{}]发送SessionPromptStart失败: {:?}", project_id, e);
+            }
+
             match client_conn.prompt(req).await {
                 Ok(resp) => {
                     debug!(
                         "项目[{}]Prompt发送成功, stop_reason={:?}",
                         project_id, resp.stop_reason
                     );
+
+                    // 发送 SessionPromptEnd 通知（成功）
+                    let end_notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                        session_id: session_id_str.clone(),
+                        stop_reason: resp.stop_reason,
+                        error_message: None,
+                    });
+                    if let Err(e) = push_session_update(&session_id_str, end_notify) {
+                        error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
+                    }
                 }
                 Err(e) => {
                     error!("项目[{}]发送Prompt失败: {:?}", project_id, e);
+
+                    // 发送 SessionPromptEnd 通知（失败）
+                    let end_notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                        session_id: session_id_str.clone(),
+                        stop_reason: agent_client_protocol::StopReason::Cancelled,
+                        error_message: Some(format!("{:?}", e)),
+                    });
+                    if let Err(e) = push_session_update(&session_id_str, end_notify) {
+                        error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
+                    }
                 }
             }
         }

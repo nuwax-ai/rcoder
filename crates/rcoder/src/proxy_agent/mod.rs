@@ -12,6 +12,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
+use crate::{service::push_session_update, model::{SessionNotify, AgentSessionUpdate}};
 use crate::CancelNotificationRequest;
 
 /// ACP协议的连接信息
@@ -140,38 +141,37 @@ impl Client for AcpAgentClient {
     ) -> Result<(), agent_client_protocol::Error> {
         let session_id = args.session_id.to_string();
 
-        // 直接将SessionUpdate转为JSON存入全局缓存
-        match serde_json::to_value(&args.update) {
-            Ok(json_value) => {
-                // 存入全局缓存
-                crate::service::add_session_update(&session_id, json_value);
+        // 将SessionUpdate转换为SessionNotify并存入全局缓存
+        let agent_update = AgentSessionUpdate {
+            session_id: session_id.clone(),
+            session_update: args.update.clone(),
+        };
+        let notify = SessionNotify::AgentSessionUpdate(agent_update);
+        if let Err(e) = push_session_update(&session_id, notify) {
+            error!(
+                "❌ Failed to cache SessionUpdate for session {}: {}",
+                session_id, e
+            );
+        }
 
-                // 记录日志（保持原有的详细日志）
-                match &args.update {
-                    acp::SessionUpdate::AgentMessageChunk { content } => {
-                        let text = match content {
-                            acp::ContentBlock::Text(text_content) => text_content.text.clone(),
-                            acp::ContentBlock::Image(_) => "<image>".into(),
-                            acp::ContentBlock::Audio(_) => "<audio>".into(),
-                            acp::ContentBlock::ResourceLink(resource_link) => {
-                                resource_link.uri.clone()
-                            }
-                            acp::ContentBlock::Resource(_) => "<resource>".into(),
-                        };
-                        info!("📥 Agent message cached [session:{}]: {}", session_id, text);
+        // 记录日志（保持原有的详细日志）
+        match &args.update {
+            acp::SessionUpdate::AgentMessageChunk { content } => {
+                let text = match content {
+                    acp::ContentBlock::Text(text_content) => text_content.text.clone(),
+                    acp::ContentBlock::Image(_) => "<image>".into(),
+                    acp::ContentBlock::Audio(_) => "<audio>".into(),
+                    acp::ContentBlock::ResourceLink(resource_link) => {
+                        resource_link.uri.clone()
                     }
-                    _ => {
-                        info!(
-                            "📥 SessionUpdate cached [session:{}]: {:?}",
-                            session_id, args.update
-                        );
-                    }
-                }
+                    acp::ContentBlock::Resource(_) => "<resource>".into(),
+                };
+                info!("📥 Agent message cached [session:{}]: {}", session_id, text);
             }
-            Err(e) => {
-                error!(
-                    "❌ Failed to serialize SessionUpdate for session {}: {}",
-                    session_id, e
+            _ => {
+                info!(
+                    "📥 SessionUpdate cached [session:{}]: {:?}",
+                    session_id, args.update
                 );
             }
         }
