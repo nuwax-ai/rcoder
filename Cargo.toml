@@ -157,5 +157,7 @@ tokio-test = "0.4"
 # File system utilities
 dirs = "6.0"
 
+utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
 

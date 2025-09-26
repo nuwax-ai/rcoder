@@ -3,13 +3,15 @@ use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
+use utoipa::{ToSchema, IntoParams};
 
 use crate::{model::*, router::AppState};
 
 /// 项目读取请求结构
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, IntoParams, ToSchema)]
 pub struct ProjectReadRequest {
     /// 项目 ID
+    #[param(min_length = 1, example = "test_project")]
     pub project_id: String,
 }
 
@@ -20,6 +22,18 @@ async fn get_project_workspace(project_id: &str, projects_dir: &PathBuf) -> Resu
 }
 
 /// 处理项目读取请求
+///
+/// 读取指定项目的所有文件信息
+#[utoipa::path(
+    post,
+    path = "/project/read",
+    request_body = ProjectReadRequest,
+    responses(
+        (status = 200, description = "成功读取项目", body = HttpResult<nuwax_parser::ProjectSourceCode>),
+        (status = 404, description = "项目不存在", body = HttpResult<String>)
+    ),
+    tag = "project"
+)]
 #[axum::debug_handler]
 #[instrument(skip(state))]
 pub async fn handle_project_read(

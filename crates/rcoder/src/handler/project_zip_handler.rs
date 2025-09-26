@@ -3,13 +3,15 @@ use axum::{Json, extract::State, response::{IntoResponse, Response}};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
+use utoipa::{ToSchema, IntoParams};
 
 use crate::{model::*, router::AppState};
 
 /// 项目压缩请求结构
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, IntoParams, ToSchema)]
 pub struct ProjectZipRequest {
     /// 项目 ID
+    #[param(min_length = 1, example = "test_project")]
     pub project_id: String,
 }
 
@@ -20,6 +22,18 @@ async fn get_project_workspace(project_id: &str, projects_dir: &PathBuf) -> Resu
 }
 
 /// 处理项目压缩请求
+///
+/// 压缩指定项目为 ZIP 文件并返回下载链接
+#[utoipa::path(
+    post,
+    path = "/project/zip",
+    request_body = ProjectZipRequest,
+    responses(
+        (status = 200, description = "成功压缩项目", body = HttpResult<String>),
+        (status = 404, description = "项目不存在", body = HttpResult<String>)
+    ),
+    tag = "project"
+)]
 #[axum::debug_handler]
 #[instrument(skip(state))]
 pub async fn handle_project_zip(
@@ -66,6 +80,20 @@ pub async fn handle_project_zip(
 }
 
 /// 处理项目文件下载请求
+///
+/// 下载指定项目的 ZIP 压缩包
+#[utoipa::path(
+    get,
+    path = "/project/download/{project_id}",
+    params(
+        ("project_id" = String, Path, description = "项目 ID")
+    ),
+    responses(
+        (status = 200, description = "成功下载项目 ZIP 文件", content_type = "application/zip"),
+        (status = 404, description = "项目不存在")
+    ),
+    tag = "project"
+)]
 #[axum::debug_handler]
 #[instrument(skip(state))]
 pub async fn handle_project_download(

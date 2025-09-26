@@ -3,6 +3,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use opentelemetry::trace::TraceContextExt;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use utoipa::ToSchema;
 
 /// 从当前 OpenTelemetry context 获取 trace_id
 fn get_trace_id_from_context() -> Option<String> {
@@ -21,7 +22,7 @@ fn get_trace_id_from_context() -> Option<String> {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct HttpResult<T> {
     pub code: String,
     pub message: String,

@@ -6,29 +6,36 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
+use utoipa::ToSchema;
 
 use crate::proxy_agent::*;
 use crate::{model::*, router::AppState};
 
 /// 用户请求结构 - 支持多媒体内容
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
 pub struct ChatRequest {
     /// 用户输入的 prompt
+    #[schema(example = "帮我写一个 Rust 的 Hello World 程序")]
     pub prompt: String,
     /// 用户 ID
+    #[schema(example = "user123")]
     pub user_id: String,
     /// 可选的项目 ID
+    #[schema(example = "test_project")]
     pub project_id: Option<String>,
     /// 可选的会话 ID，如果不提供则创建新会话
+    #[schema(example = "session456")]
     pub session_id: Option<String>,
 }
 
 /// 服务响应结构
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChatResponse {
     /// 项目 ID
+    #[schema(example = "test_project")]
     pub project_id: String,
     /// 会话 ID
+    #[schema(example = "session456")]
     pub session_id: String,
     /// 可选的错误信息
     pub error: Option<String>,
@@ -62,6 +69,18 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
 }
 
 /// 处理聊天请求 - 使用 ACP 协议集成
+///
+/// 发送聊天消息并获取 AI 响应
+#[utoipa::path(
+    post,
+    path = "/chat",
+    request_body = ChatRequest,
+    responses(
+        (status = 200, description = "成功处理聊天请求", body = HttpResult<ChatResponse>),
+        (status = 500, description = "服务器错误", body = HttpResult<String>)
+    ),
+    tag = "chat"
+)]
 #[axum::debug_handler]
 #[instrument(skip(state))]
 pub async fn handle_chat(

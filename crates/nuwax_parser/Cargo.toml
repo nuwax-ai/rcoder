@@ -25,6 +25,7 @@ regex = "1.0"
 file-format ={version = "0.28",features = ["reader-txt"] }
 content_inspector = "0.2.4"
 zip = "2.1"
+utoipa = { workspace = true }
 
 
 

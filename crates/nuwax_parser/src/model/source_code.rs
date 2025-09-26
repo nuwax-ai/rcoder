@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use derive_builder::Builder;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder, ToSchema)]
 #[builder(
     default,
     setter(into, strip_option),
@@ -11,7 +12,7 @@ pub struct ProjectSourceCode {
     pub files: Vec<FileInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder, ToSchema)]
 #[builder(
     default,
     setter(into, strip_option),

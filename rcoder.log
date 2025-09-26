@@ -1,0 +1,406 @@
+warning: codex-acp-agent v0.1.0 (/Volumes/soddy/git_workspace/rcoder/crates/codex-acp-agent) ignoring invalid dependency `codex-acp` which is missing a lib target
+warning[E0602]: unknown lint: `allow_leading_underscore`
+  |
+  = note: requested on the command line with `-W allow_leading_underscore`
+  = note: `#[warn(unknown_lints)]` on by default
+
+For more information about this error, try `rustc --explain E0602`.
+warning: `codex-acp-agent` (lib) generated 1 warning
+warning: unused import: `self`
+ --> crates/nuwax_parser/src/project_op/project_zip.rs:2:15
+  |
+2 | use std::fs::{self, File};
+  |               ^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: `nuwax_parser` (lib) generated 1 warning (run `cargo fix --lib -p nuwax_parser` to apply 1 suggestion)
+warning: `claude-code-agent` (lib) generated 1 warning (1 duplicate)
+warning: unused imports: `Client` and `self as acp`
+ --> crates/rcoder/src/model/agent_model.rs:4:29
+  |
+4 | use agent_client_protocol::{self as acp, CancelNotification, Client, PromptRequest};
+  |                             ^^^^^^^^^^^                      ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `ConfigOverrides` and `Config`
+  --> crates/rcoder/src/model/agent_model.rs:12:26
+   |
+12 | use codex_core::config::{Config, ConfigOverrides, find_codex_home, load_config_as_toml};
+   |                          ^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `Json` and `http::StatusCode`
+ --> crates/rcoder/src/model/app_error.rs:2:5
+  |
+2 |     Json,
+  |     ^^^^
+3 |     http::StatusCode,
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `CancelNotification`
+ --> crates/rcoder/src/proxy_agent/channel_utils.rs:5:36
+  |
+5 | use agent_client_protocol::{Agent, CancelNotification, PromptRequest, SessionId};
+  |                                    ^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CancelNotification`, `ContentBlock`, `ExtNotification`, `ExtRequest`, `ExtResponse`, `KillTerminalCommandResponse`, `NewSessionResponse`, `PromptResponse`, `SessionNotification`, `SetSessionModeResponse`, `TextContent`, and `self as acp`
+ --> crates/rcoder/src/proxy_agent/codex_agent.rs:4:5
+  |
+4 |     self as acp, Agent, AgentSideConnection, CancelNotification, ClientCapabilities,
+  |     ^^^^^^^^^^^                              ^^^^^^^^^^^^^^^^^^
+5 |     ClientSideConnection, ContentBlock, ExtNotification, ExtRequest, ExtResponse,
+  |                           ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^
+6 |     InitializeRequest, KillTerminalCommandResponse, NewSessionRequest, NewSessionResponse,
+  |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^                     ^^^^^^^^^^^^^^^^^^
+7 |     PromptRequest, PromptResponse, SessionId, SessionNotification, SetSessionModeResponse,
+  |                    ^^^^^^^^^^^^^^             ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+8 |     TextContent, V1 as VERSION,
+  |     ^^^^^^^^^^^
+
+warning: unused imports: `ConfigToml`, `find_codex_home`, and `load_config_as_toml`
+  --> crates/rcoder/src/proxy_agent/codex_agent.rs:14:30
+   |
+14 |     Config, ConfigOverrides, ConfigToml, find_codex_home, load_config_as_toml,
+   |                              ^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `dashmap::DashMap`
+  --> crates/rcoder/src/proxy_agent/codex_agent.rs:18:5
+   |
+18 | use dashmap::DashMap;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `serde_json::json`
+  --> crates/rcoder/src/proxy_agent/codex_agent.rs:19:5
+   |
+19 | use serde_json::json;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `TokioAsyncReadCompatExt as _` and `TokioAsyncWriteCompatExt as _`
+  --> crates/rcoder/src/proxy_agent/codex_agent.rs:22:26
+   |
+22 | use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `ChatPromptResponse` and `ProjectAndAgentInfo`
+  --> crates/rcoder/src/proxy_agent/codex_agent.rs:26:43
+   |
+26 | use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
+   |                                           ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `AgentSideConnection` and `ClientSideConnection`
+ --> crates/rcoder/src/proxy_agent/mod.rs:8:18
+  |
+8 |     self as acp, AgentSideConnection, ClientSideConnection, PromptRequest, SessionId,
+  |                  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CancelNotification`
+  --> crates/rcoder/src/proxy_agent/mod.rs:10:29
+   |
+10 | use agent_client_protocol::{CancelNotification, Client, PermissionOptionKind};
+   |                             ^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Path` and `response::Json`
+ --> crates/rcoder/src/handler/agent_cancel_handler.rs:6:15
+  |
+6 |     extract::{Path, Query},
+  |               ^^^^
+7 |     response::Json,
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `utoipa::OpenApi`
+  --> crates/rcoder/src/router.rs:12:5
+   |
+12 | use utoipa::OpenApi;
+   |     ^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+  --> crates/rcoder/src/proxy_agent/codex_agent.rs:44:21
+   |
+44 |     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequest>();
+   |                     ----^^^^^^^^^
+   |                     |
+   |                     help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+  --> crates/rcoder/src/proxy_agent/codex_agent.rs:74:21
+   |
+74 |     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
+   |                     ----^^^^^^^^^
+   |                     |
+   |                     help: remove this `mut`
+
+warning: fields `default_agent` and `port` are never read
+  --> crates/rcoder/src/config.rs:11:9
+   |
+ 9 | pub struct AppConfig {
+   |            --------- fields in this struct
+10 |     /// 默认使用的 AI 代理类型
+11 |     pub default_agent: AgentType,
+   |         ^^^^^^^^^^^^^
+...
+15 |     pub port: u16,
+   |         ^^^^
+   |
+   = note: `AppConfig` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `load_config` is never used
+  --> crates/rcoder/src/config.rs:29:8
+   |
+29 | pub fn load_config() -> AppConfig {
+   |        ^^^^^^^^^^^
+
+warning: struct `CancelQuery` is never constructed
+  --> crates/rcoder/src/handler/agent_cancel_handler.rs:21:12
+   |
+21 | pub struct CancelQuery {
+   |            ^^^^^^^^^^^
+
+warning: struct `CancelResponse` is never constructed
+  --> crates/rcoder/src/handler/agent_cancel_handler.rs:30:12
+   |
+30 | pub struct CancelResponse {
+   |            ^^^^^^^^^^^^^^
+
+warning: function `agent_session_cancel` is never used
+  --> crates/rcoder/src/handler/agent_cancel_handler.rs:38:14
+   |
+38 | pub async fn agent_session_cancel(
+   |              ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `agent_session_notification` is never used
+  --> crates/rcoder/src/handler/agent_session_notification.rs:16:14
+   |
+16 | pub async fn agent_session_notification(
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `handle_chat` is never used
+  --> crates/rcoder/src/handler/chat_handler.rs:86:14
+   |
+86 | pub async fn handle_chat(
+   |              ^^^^^^^^^^^
+
+warning: function `health_check` is never used
+  --> crates/rcoder/src/handler/health_handler.rs:29:14
+   |
+29 | pub async fn health_check() -> Json<HealthResponse> {
+   |              ^^^^^^^^^^^^
+
+warning: function `handle_project_read` is never used
+  --> crates/rcoder/src/handler/project_read_handler.rs:39:14
+   |
+39 | pub async fn handle_project_read(
+   |              ^^^^^^^^^^^^^^^^^^^
+
+warning: function `handle_project_zip` is never used
+  --> crates/rcoder/src/handler/project_zip_handler.rs:39:14
+   |
+39 | pub async fn handle_project_zip(
+   |              ^^^^^^^^^^^^^^^^^^
+
+warning: function `handle_project_download` is never used
+  --> crates/rcoder/src/handler/project_zip_handler.rs:99:14
+   |
+99 | pub async fn handle_project_download(
+   |              ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `drain_messages` and `message_count` are never used
+  --> crates/rcoder/src/service/session_cache.rs:45:12
+   |
+24 | impl SessionData {
+   | ---------------- methods in this implementation
+...
+45 |     pub fn drain_messages(&self) -> Vec<Value> {
+   |            ^^^^^^^^^^^^^^
+...
+55 |     pub fn message_count(&self) -> usize {
+   |            ^^^^^^^^^^^^^
+
+warning: function `drain_session_messages` is never used
+  --> crates/rcoder/src/service/session_cache.rs:74:8
+   |
+74 | pub fn drain_session_messages(session_id: &str) -> Vec<Value> {
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `get_session_message_count` is never used
+  --> crates/rcoder/src/service/session_cache.rs:83:8
+   |
+83 | pub fn get_session_message_count(session_id: &str) -> usize {
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `redirect_to_docs` is never used
+  --> crates/rcoder/src/router.rs:15:10
+   |
+15 | async fn redirect_to_docs() -> impl axum::response::IntoResponse {
+   |          ^^^^^^^^^^^^^^^^
+
+warning: field `sessions` is never read
+  --> crates/rcoder/src/router.rs:33:9
+   |
+31 | pub struct AppState {
+   |            -------- field in this struct
+32 |     /// 活跃的会话映射, project_id -> SessionInfo
+33 |     pub sessions: Arc<DashMap<String, SessionInfo>>,
+   |         ^^^^^^^^
+   |
+   = note: `AppState` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `create_router` is never used
+  --> crates/rcoder/src/router.rs:42:8
+   |
+42 | pub fn create_router(state: Arc<AppState>) -> Router {
+   |        ^^^^^^^^^^^^^
+
+warning: unused `Result` that must be used
+  --> crates/rcoder/src/proxy_agent/channel_utils.rs:36:17
+   |
+36 | /                 req.tx.send(CancelNotificationResponse {
+37 | |                     success: true,
+38 | |                     message: None,
+39 | |                 });
+   | |__________________^
+   |
+   = note: this `Result` may be an `Err` variant, which should be handled
+   = note: `#[warn(unused_must_use)]` on by default
+help: use `let _ = ...` to ignore the resulting value
+   |
+36 |                 let _ = req.tx.send(CancelNotificationResponse {
+   |                 +++++++
+
+warning: `rcoder` (lib) generated 34 warnings (run `cargo fix --lib -p rcoder` to apply 16 suggestions)
+warning: unused imports: `Path` and `response::Json`
+ --> crates/rcoder/src/handler/agent_cancel_handler.rs:6:15
+  |
+6 |     extract::{Path, Query},
+  |               ^^^^
+7 |     response::Json,
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `Client` and `self as acp`
+ --> crates/rcoder/src/model/agent_model.rs:4:29
+  |
+4 | use agent_client_protocol::{self as acp, CancelNotification, Client, PromptRequest};
+  |                             ^^^^^^^^^^^                      ^^^^^^
+
+warning: unused import: `tracing_middleware::TracingMiddleware`
+ --> crates/rcoder/src/middleware/mod.rs:3:9
+  |
+3 | pub use tracing_middleware::TracingMiddleware;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `default_agent` is never read
+  --> crates/rcoder/src/config.rs:11:9
+   |
+ 9 | pub struct AppConfig {
+   |            --------- field in this struct
+10 |     /// 默认使用的 AI 代理类型
+11 |     pub default_agent: AgentType,
+   |         ^^^^^^^^^^^^^
+   |
+   = note: `AppConfig` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` on by default
+
+warning: field `message` is never read
+   --> crates/rcoder/src/model/agent_model.rs:220:9
+    |
+218 | pub struct CancelNotificationResponse{
+    |            -------------------------- field in this struct
+219 |     pub success: bool,
+220 |     pub message: Option<String>,
+    |         ^^^^^^^
+
+warning: fields `project_id` and `model_provider` are never read
+   --> crates/rcoder/src/model/agent_model.rs:228:9
+    |
+226 | pub struct ProjectAndAgentInfo {
+    |            ------------------- fields in this struct
+227 |     /// 项目ID
+228 |     pub project_id: String,
+    |         ^^^^^^^^^^
+...
+236 |     pub model_provider: Option<ModelProviderConfig>,
+    |         ^^^^^^^^^^^^^^
+    |
+    = note: `ProjectAndAgentInfo` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: associated function `internal_error` is never used
+  --> crates/rcoder/src/model/http_result.rs:56:12
+   |
+35 | impl<T> HttpResult<T> {
+   | --------------------- associated function in this implementation
+...
+56 |     pub fn internal_error(message: &str) -> Self {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `TracingMiddleware` is never constructed
+  --> crates/rcoder/src/middleware/tracing_middleware.rs:19:12
+   |
+19 | pub struct TracingMiddleware;
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/rcoder/src/middleware/tracing_middleware.rs:23:12
+   |
+21 | impl TracingMiddleware {
+   | ---------------------- associated function in this implementation
+22 |     /// 创建新的追踪中间件实例
+23 |     pub fn new() -> Self {
+   |            ^^^
+
+warning: function `get_trace_id_from_context` is never used
+  --> crates/rcoder/src/middleware/tracing_middleware.rs:29:4
+   |
+29 | fn get_trace_id_from_context() -> Option<String> {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_trace_id` is never used
+  --> crates/rcoder/src/middleware/tracing_middleware.rs:45:4
+   |
+45 | fn generate_trace_id() -> String {
+   |    ^^^^^^^^^^^^^^^^^
+
+warning: function `extract_trace_id_from_headers` is never used
+  --> crates/rcoder/src/middleware/tracing_middleware.rs:50:4
+   |
+50 | fn extract_trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `tracing_middleware_handler` is never used
+  --> crates/rcoder/src/middleware/tracing_middleware.rs:73:14
+   |
+73 | pub async fn tracing_middleware_handler(
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `add_tracing_layer` is never used
+   --> crates/rcoder/src/middleware/tracing_middleware.rs:129:8
+    |
+129 | pub fn add_tracing_layer<B>(router: axum::Router<B>) -> axum::Router<B>
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: method `message_count` is never used
+  --> crates/rcoder/src/service/session_cache.rs:55:12
+   |
+24 | impl SessionData {
+   | ---------------- method in this implementation
+...
+55 |     pub fn message_count(&self) -> usize {
+   |            ^^^^^^^^^^^^^
+
+warning: `rcoder` (bin "rcoder") generated 32 warnings (17 duplicates) (run `cargo fix --bin "rcoder"` to apply 3 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s
+     Running `target/debug/rcoder`
+[2m2025-09-25T09:41:13.751389Z[0m [32m INFO[0m ✓ Tracing 初始化成功，支持 trace_id 生成和传播
+[2m2025-09-25T09:41:13.751568Z[0m [32m INFO[0m Starting rcoder - AI-powered development platform
+[2m2025-09-25T09:41:13.751655Z[0m [32m INFO[0m Loaded config: port=3000, projects_dir="./project_workspace"
+[2m2025-09-25T09:41:13.752169Z[0m [32m INFO[0m Projects directory: "./project_workspace"
+[2m2025-09-25T09:41:13.753585Z[0m [32m INFO[0m Server starting on port 3000
+[2m2025-09-25T09:41:13.753606Z[0m [32m INFO[0m API endpoints:
+[2m2025-09-25T09:41:13.753622Z[0m [32m INFO[0m   POST /chat - Send chat message to AI agent (legacy)
+[2m2025-09-25T09:41:13.753639Z[0m [32m INFO[0m   GET  /progress/:session_id - SSE progress stream for AI tasks (unified stream)
+[2m2025-09-25T09:41:13.753657Z[0m [32m INFO[0m   GET  /health - Health check
+[2m2025-09-25T09:41:13.753672Z[0m [32m INFO[0m   NOTE: Plan data is delivered via the unified /progress/{session_id} SSE stream
