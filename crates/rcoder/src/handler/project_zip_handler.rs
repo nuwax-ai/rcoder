@@ -27,12 +27,66 @@ async fn get_project_workspace(project_id: &str, projects_dir: &PathBuf) -> Resu
 #[utoipa::path(
     post,
     path = "/project/zip",
-    request_body = ProjectZipRequest,
-    responses(
-        (status = 200, description = "成功压缩项目", body = HttpResult<String>),
-        (status = 404, description = "项目不存在", body = HttpResult<String>)
+    request_body(
+        content = ProjectZipRequest,
+        description = "项目压缩请求，包含项目ID",
+        content_type = "application/json"
     ),
-    tag = "project"
+    responses(
+        (
+            status = 200,
+            description = "成功压缩项目，返回下载链接",
+            body = HttpResult<String>,
+            example = json!({
+                "success": true,
+                "data": "/project/download/test_project",
+                "error": null
+            })
+        ),
+        (
+            status = 400,
+            description = "请求参数错误",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "INVALID_PROJECT_ID",
+                    "message": "Invalid project ID"
+                }
+            })
+        ),
+        (
+            status = 404,
+            description = "项目不存在",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "PROJECT_NOT_FOUND",
+                    "message": "Project directory not found"
+                }
+            })
+        ),
+        (
+            status = 500,
+            description = "压缩项目失败",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "PROJECT_ZIP_FAILED",
+                    "message": "Failed to compress project"
+                }
+            })
+        )
+    ),
+    tag = "project",
+    operation_id = "handle_project_zip",
+    summary = "压缩项目",
+    description = "将指定项目的所有文件压缩为 ZIP 格式，并返回下载链接"
 )]
 #[axum::debug_handler]
 #[instrument(skip(state))]
@@ -86,13 +140,62 @@ pub async fn handle_project_zip(
     get,
     path = "/project/download/{project_id}",
     params(
-        ("project_id" = String, Path, description = "项目 ID")
+        ("project_id" = String, Path, description = "项目 ID", example = "test_project")
     ),
     responses(
-        (status = 200, description = "成功下载项目 ZIP 文件", content_type = "application/zip"),
-        (status = 404, description = "项目不存在")
+        (
+            status = 200,
+            description = "成功下载项目 ZIP 文件",
+            content_type = "application/zip",
+            headers(
+                ("Content-Disposition" = String, description = "文件下载响应头"),
+                ("Cache-Control" = String, description = "缓存控制")
+            )
+        ),
+        (
+            status = 400,
+            description = "无效的项目ID",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "INVALID_PROJECT_ID",
+                    "message": "Invalid project ID"
+                }
+            })
+        ),
+        (
+            status = 404,
+            description = "项目不存在",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "PROJECT_NOT_FOUND",
+                    "message": "Project not found"
+                }
+            })
+        ),
+        (
+            status = 500,
+            description = "下载失败",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "DOWNLOAD_FAILED",
+                    "message": "Failed to download project"
+                }
+            })
+        )
     ),
-    tag = "project"
+    tag = "project",
+    operation_id = "handle_project_download",
+    summary = "下载项目压缩包",
+    description = "下载指定项目的 ZIP 压缩文件，包含所有项目文件和目录结构"
 )]
 #[axum::debug_handler]
 #[instrument(skip(state))]

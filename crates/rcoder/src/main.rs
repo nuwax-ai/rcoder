@@ -11,8 +11,10 @@ mod proxy_agent;
 mod middleware;
 mod router;
 mod service;
+mod utils;
 
 use model::*;
+use utils::*;
 
 use config::load_config;
 use router::AppState;

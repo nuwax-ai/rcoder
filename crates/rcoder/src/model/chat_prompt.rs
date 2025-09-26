@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::AgentType;
+use super::{AgentType, Attachment};
 use derive_builder::Builder;
 
 #[derive(Debug, Clone, Default, Builder)]
@@ -14,6 +14,9 @@ pub struct ChatPrompt {
     pub session_id: Option<String>,
     /// 提示内容 prompt
     pub prompt: String,
+    /// 可选的附件列表
+    #[builder(default)]
+    pub attachments: Vec<Attachment>,
     /// agent 类型
     #[builder(default)]
     pub agent_type: AgentType,

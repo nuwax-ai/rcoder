@@ -8,7 +8,9 @@ mod config;
 mod handler;
 mod service;
 mod router;
+mod utils;
 
 // 重新导出主要的类型和函数
 pub use proxy_agent::*;
 pub use model::*;
+pub use utils::*;

@@ -26,6 +26,9 @@ pub struct ChatRequest {
     /// 可选的会话 ID，如果不提供则创建新会话
     #[schema(example = "session456")]
     pub session_id: Option<String>,
+    /// 可选的附件列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 /// 服务响应结构
@@ -70,16 +73,63 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
 
 /// 处理聊天请求 - 使用 ACP 协议集成
 ///
-/// 发送聊天消息并获取 AI 响应
+/// 发送聊天消息并获取 AI 响应。支持多媒体附件，包括文本、图像、音频和文档。
+/// 如果未提供 project_id，系统会自动生成新的项目 ID 并创建相应的工作目录。
+/// 如果未提供 session_id，系统会创建新的会话。
 #[utoipa::path(
     post,
     path = "/chat",
-    request_body = ChatRequest,
-    responses(
-        (status = 200, description = "成功处理聊天请求", body = HttpResult<ChatResponse>),
-        (status = 500, description = "服务器错误", body = HttpResult<String>)
+    request_body(
+        content = ChatRequest,
+        description = "聊天请求，包含用户输入的 prompt 和可选的多媒体附件",
+        content_type = "application/json"
     ),
-    tag = "chat"
+    responses(
+        (
+            status = 200,
+            description = "成功处理聊天请求，返回项目 ID 和会话 ID",
+            body = HttpResult<ChatResponse>,
+            example = json!({
+                "success": true,
+                "data": {
+                    "project_id": "test_project",
+                    "session_id": "session456",
+                    "error": null
+                },
+                "error": null
+            })
+        ),
+        (
+            status = 400,
+            description = "请求参数错误",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "VALIDATION001",
+                    "message": "Invalid request parameters"
+                }
+            })
+        ),
+        (
+            status = 500,
+            description = "服务器内部错误",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "INTERNAL001",
+                    "message": "Internal server error"
+                }
+            })
+        )
+    ),
+    tag = "chat",
+    operation_id = "handle_chat",
+    summary = "发送聊天消息",
+    description = "通过 ACP 协议发送聊天消息给 AI 代理，支持文本和多媒体内容"
 )]
 #[axum::debug_handler]
 #[instrument(skip(state))]
@@ -114,6 +164,7 @@ pub async fn handle_chat(
         .project_path(project_workspace)
         .session_id(request.session_id.clone())
         .prompt(request.prompt.clone())
+        .attachments(request.attachments.clone())
         .build()
         .map_err(|e| anyhow::anyhow!(e))?;
 

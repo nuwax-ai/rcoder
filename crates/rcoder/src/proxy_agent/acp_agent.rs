@@ -17,6 +17,7 @@ use crate::{
         claude_code_agent::start_claude_code_acp_agent_service,
         codex_agent::start_codex_acp_agent_service,
     },
+    utils::ContentBuilder,
 };
 use anyhow::Result;
 
@@ -148,7 +149,8 @@ pub async fn agent_worker(
                             .insert(project_id.clone(), project_and_agent_info.clone());
 
                         if let Ok(prompt_request) =
-                            build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await
+                            build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone())
+                                .await
                         {
                             if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
                                 error!("Failed to send prompt request: {:?}", e);
@@ -183,15 +185,30 @@ pub async fn build_prompt_to_acp_agent(
     prompt: ChatPrompt,
     session_id: SessionId,
 ) -> Result<PromptRequest> {
+    // 创建文本内容块
     let text_block = ContentBlock::Text(TextContent {
         text: prompt.prompt,
         annotations: None,
         meta: None,
     });
 
+    // 创建内容块列表，以文本开始
+    let mut content_blocks = vec![text_block];
+
+    // 如果有附件，转换为内容块
+    if !prompt.attachments.is_empty() {
+        let attachment_blocks = ContentBuilder::attachments_to_content_blocks(
+            &prompt.attachments,
+            &prompt.project_path,
+        )
+        .await?;
+
+        content_blocks.extend(attachment_blocks);
+    }
+
     Ok(PromptRequest {
         session_id,
-        prompt: vec![text_block],
+        prompt: content_blocks,
         meta: None,
     })
 }

@@ -9,6 +9,10 @@ license.workspace = true
 name = "rcoder"
 path = "src/lib.rs"
 
+[[example]]
+name = "multimedia_chat_example"
+path = "examples/multimedia_chat_example.rs"
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
@@ -22,7 +26,7 @@ claude-code-agent = { path = "../claude-code-agent" }
 agent-client-protocol = { workspace = true }
 async-trait = "0.1"
 parking_lot = "0.12"
-tempfile = "3.8"
+tempfile = { workspace = true }
 
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
@@ -50,6 +54,8 @@ dashmap = { workspace = true }
 bytes = "1.0"
 futures-util = { workspace = true }
 piper = "0.2"
+base64 = "0.21"
+reqwest = { version = "0.11", features = ["json"] }
 
 # OpenTelemetry
 opentelemetry = { workspace = true }

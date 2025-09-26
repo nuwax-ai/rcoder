@@ -40,12 +40,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let api_routes = Router::new()
         .route("/health", get(handler::health_check))
         .route("/chat", post(handler::handle_chat))
-        .route("/project/read", post(handler::handle_project_read))
-        .route("/project/zip", post(handler::handle_project_zip))
-        .route(
-            "/project/download/{project_id}",
-            get(handler::handle_project_download),
-        )
         .route(
             "/agent/progress/{session_id}",
             get(handler::agent_session_notification),
@@ -64,19 +58,21 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     paths(
         handler::health_check,
         handler::handle_chat,
-        handler::handle_project_read,
-        handler::handle_project_zip,
-        handler::handle_project_download,
+        handler::agent_session_notification,
+        handler::agent_session_cancel,
     ),
     components(
         schemas(
             handler::HealthResponse,
             handler::ChatRequest,
             handler::ChatResponse,
-            handler::ProjectReadRequest,
-            handler::ProjectZipRequest,
-            nuwax_parser::ProjectSourceCode,
-            nuwax_parser::FileInfo,
+            crate::model::Attachment,
+            crate::model::AttachmentSource,
+            crate::model::TextAttachment,
+            crate::model::ImageAttachment,
+            crate::model::AudioAttachment,
+            crate::model::DocumentAttachment,
+            crate::model::ImageDimensions,
         )
     ),
     tags(
