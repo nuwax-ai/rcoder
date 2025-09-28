@@ -26,6 +26,9 @@ pub struct ChatPrompt {
     /// 可选的 Context7 API 密钥，如果提供会启用 Context7 MCP 服务
     #[builder(default)]
     pub context7_api_key: Option<String>,
+    /// 是否使用简化提示词（默认为 false，使用完整系统提示词）
+    #[builder(default)]
+    pub use_simple_prompt: bool,
 }
 
 /// 返回用户 prompt 的提示,一定有project_id ,session_id ,否则报错

@@ -17,7 +17,7 @@ use crate::{
         claude_code_agent::start_claude_code_acp_agent_service,
         codex_agent::start_codex_acp_agent_service,
     },
-    utils::ContentBuilder,
+    utils::{ContentBuilder, PromptBuilder},
 };
 use anyhow::Result;
 
@@ -189,9 +189,14 @@ pub async fn build_prompt_to_acp_agent(
     prompt: ChatPrompt,
     session_id: SessionId,
 ) -> Result<PromptRequest> {
+    // 构建最终提示词（包含系统提示词和用户输入）
+    let final_prompt = PromptBuilder::new()
+        .use_simple_prompt(prompt.use_simple_prompt)
+        .build(&prompt.prompt);
+
     // 创建文本内容块
     let text_block = ContentBlock::Text(TextContent {
-        text: prompt.prompt,
+        text: final_prompt,
         annotations: None,
         meta: None,
     });

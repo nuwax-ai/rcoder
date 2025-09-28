@@ -37,10 +37,6 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "req_123456789")]
     pub request_id: Option<String>,
-    /// 可选的 Context7 API 密钥，如果提供会启用 Context7 MCP 服务
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "ctx_example_key")]
-    pub context7_api_key: Option<String>,
 }
 
 /// 服务响应结构
@@ -190,7 +186,7 @@ pub async fn handle_chat(
         .attachments(request.attachments.clone())
         .agent_type(agent_type)
         .request_id(request_id.clone())
-        .context7_api_key(request.context7_api_key.clone())
+        .use_simple_prompt(false) // 固定使用完整系统提示词
         .build()
         .map_err(|e| anyhow::anyhow!(e))?;
 
