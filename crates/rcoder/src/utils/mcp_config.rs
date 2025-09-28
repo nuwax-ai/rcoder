@@ -23,10 +23,7 @@ pub fn create_context7_mcp_server(_api_key: Option<&str>) -> McpServer {
     McpServer::Stdio {
         name: "context7".to_string(),
         command: PathBuf::from("bunx"),
-        args: vec![
-            "-y".to_string(),
-            "@upstash/context7-mcp".to_string(),
-        ],
+        args: vec!["-y".to_string(), "@upstash/context7-mcp".to_string()],
         env: Vec::new(), // 不需要额外的环境变量
     }
 }
@@ -58,10 +55,18 @@ mod tests {
         let server = create_context7_mcp_server(None);
 
         match server {
-            McpServer::Stdio { name, command, args, env } => {
+            McpServer::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => {
                 assert_eq!(name, "context7");
                 assert_eq!(command, std::path::PathBuf::from("bunx"));
-                assert_eq!(args, vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]);
+                assert_eq!(
+                    args,
+                    vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
+                );
                 assert_eq!(env.len(), 0);
             }
             _ => panic!("Expected Stdio variant"),
@@ -77,7 +82,10 @@ mod tests {
         match &servers[0] {
             McpServer::Stdio { name, args, .. } => {
                 assert_eq!(name, "context7");
-                assert_eq!(*args, vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]);
+                assert_eq!(
+                    *args,
+                    vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
+                );
             }
             _ => panic!("Expected Stdio variant"),
         }
@@ -91,7 +99,10 @@ mod tests {
         match server.unwrap() {
             McpServer::Stdio { name, args, .. } => {
                 assert_eq!(name, "context7");
-                assert_eq!(*args, vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]);
+                assert_eq!(
+                    *args,
+                    vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
+                );
             }
             _ => panic!("Expected Stdio variant"),
         }

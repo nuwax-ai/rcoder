@@ -3,6 +3,7 @@
 //! 提供文件读取、验证、转换等实用功能
 
 use anyhow::{Result, Context};
+use base64::{Engine as _, engine::general_purpose};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::{debug, warn, error};
@@ -87,7 +88,7 @@ impl FileUtils {
         let content = fs::read(file_path).await
             .context("读取文件失败")?;
 
-        Ok(base64::encode(content))
+        Ok(general_purpose::STANDARD.encode(content))
     }
 
     /// 读取文本文件
@@ -159,7 +160,7 @@ impl FileUtils {
         description: Option<String>,
     ) -> Result<Attachment> {
         // 验证数据大小
-        let decoded_size = base64::decode(&data)?.len() as u64;
+        let decoded_size = general_purpose::STANDARD.decode(&data)?.len() as u64;
         if decoded_size > self.config.max_file_size {
             return Err(AttachmentError::FileSizeExceeded(decoded_size).into());
         }
@@ -330,7 +331,7 @@ mod tests {
         let base64_content = file_utils.read_file_as_base64(temp_path).await.unwrap();
 
         // 验证 base64 编码是否正确
-        let decoded = base64::decode(base64_content).unwrap();
+        let decoded = general_purpose::STANDARD.decode(base64_content).unwrap();
         let decoded_text = String::from_utf8(decoded).unwrap();
         assert_eq!(decoded_text.trim(), "Hello, World!");
     }
