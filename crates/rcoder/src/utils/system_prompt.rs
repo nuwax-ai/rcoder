@@ -96,30 +96,18 @@ impl SystemPromptConfig {
             system_prompt, user_prompt
         )
     }
-
-    /// 创建简化的提示词（用于不需要复杂系统指令的场景）
-    pub fn build_simple_prompt(&self, user_prompt: &str) -> String {
-        format!(
-            "You are a helpful AI coding assistant with access to MCP tools including context7 for web search. \
-            Please help the user with their request:\n\n\
-            {}",
-            user_prompt
-        )
-    }
 }
 
 /// 提示词构建器
 #[derive(Debug, Clone)]
 pub struct PromptBuilder {
     config: SystemPromptConfig,
-    use_simple_prompt: bool,
 }
 
 impl PromptBuilder {
     pub fn new() -> Self {
         Self {
             config: SystemPromptConfig::default(),
-            use_simple_prompt: false,
         }
     }
 
@@ -129,19 +117,9 @@ impl PromptBuilder {
         self
     }
 
-    /// 使用简化提示词
-    pub fn use_simple_prompt(mut self, use_simple: bool) -> Self {
-        self.use_simple_prompt = use_simple;
-        self
-    }
-
     /// 构建最终提示词
     pub fn build(&self, user_prompt: &str) -> String {
-        if self.use_simple_prompt {
-            self.config.build_simple_prompt(user_prompt)
-        } else {
-            self.config.wrap_user_prompt(user_prompt)
-        }
+        self.config.wrap_user_prompt(user_prompt)
     }
 }
 
@@ -191,27 +169,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_simple_prompt() {
-        let config = SystemPromptConfig::default();
-        let user_prompt = "What is the capital of France?";
-        let simple = config.build_simple_prompt(user_prompt);
-
-        assert!(simple.contains("coding assistant"));
-        assert!(simple.contains("MCP tools"));
-        assert!(simple.contains(user_prompt));
-    }
-
-    #[test]
     fn test_prompt_builder() {
         let user_prompt = "Create a React component";
 
         // 测试默认构建器
         let default_prompt = PromptBuilder::new().build(user_prompt);
         assert!(default_prompt.contains("<SYSTEM_INSTRUCTIONS>"));
-
-        // 测试简化提示词
-        let simple_prompt = PromptBuilder::new().use_simple_prompt(true).build(user_prompt);
-        assert!(!simple_prompt.contains("<SYSTEM_INSTRUCTIONS>"));
-        assert!(simple_prompt.contains("coding assistant"));
+        assert!(default_prompt.contains("<USER_REQUEST>"));
+        assert!(default_prompt.contains(user_prompt));
     }
 }

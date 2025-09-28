@@ -191,7 +191,6 @@ pub async fn build_prompt_to_acp_agent(
 ) -> Result<PromptRequest> {
     // 构建最终提示词（包含系统提示词和用户输入）
     let final_prompt = PromptBuilder::new()
-        .use_simple_prompt(prompt.use_simple_prompt)
         .build(&prompt.prompt);
 
     // 创建文本内容块
