@@ -5,19 +5,17 @@ use std::{
 
 use agent_client_protocol::{ContentBlock, PromptRequest, SessionId, TextContent}; // bring trait into scope for session_notification
 
+use chrono::Utc;
 use dashmap::DashMap;
 use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 use crate::{
-    AgentType,
-    model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
-    proxy_agent::{
+    model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo}, proxy_agent::{
         claude_code_agent::start_claude_code_acp_agent_service,
         codex_agent::start_codex_acp_agent_service,
-    },
-    utils::{ContentBuilder, PromptBuilder},
+    }, utils::{ContentBuilder, PromptBuilder}, AgentStatus, AgentType
 };
 use anyhow::Result;
 
@@ -147,6 +145,10 @@ pub async fn agent_worker(
                             cancel_tx: conn_info.cancel_tx.clone(),
                             model_provider: model_provider,
                             request_id: request.chat_prompt.request_id.clone(),
+                            status: AgentStatus::Idle,
+                            last_activity: Utc::now(),
+                            created_at: Utc::now(),
+                            cleanup_handler: None, // 暂时设置为None，后续可以扩展
                         };
                         //记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
                         PROJECT_AND_AGENT_INFO_MAP

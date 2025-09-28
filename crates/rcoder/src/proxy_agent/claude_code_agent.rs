@@ -67,11 +67,13 @@ pub async fn start_claude_code_acp_agent_service(
                     .spawn()
                     .context("无法启动 claude-code-acp 子进程")?;
 
+                let child_pid = child.id().unwrap_or(0);
                 info!(
                     "Claude Code ACP 子进程已启动，PID: {}",
-                    child.id().unwrap_or(0)
+                    child_pid
                 );
 
+                
                 // 获取 stdio 句柄
                 let stdin = child
                     .stdin

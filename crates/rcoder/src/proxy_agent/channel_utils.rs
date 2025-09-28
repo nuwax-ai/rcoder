@@ -2,13 +2,15 @@
 //!
 //! 提供可复用的channel消息处理逻辑
 
-use agent_client_protocol::{Agent, CancelNotification, PromptRequest, SessionId};
+use agent_client_protocol::{Agent, PromptRequest, SessionId};
 use serde_json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::{CancelNotificationRequest, CancelNotificationResponse, model::{SessionNotify, SessionPromptStart, SessionPromptEnd}, service::push_session_update};
+use chrono::Utc;
+use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
 
 /// 通用的Cancel消息处理任务（针对实现了Agent trait的类型）
 pub fn spawn_cancel_handler_for_agent<A>(
@@ -66,6 +68,14 @@ pub fn spawn_prompt_handler_for_agent<A>(
                 project_id, req.session_id.0
             );
 
+            // 更新agent状态为Active
+            if let Some(mut agent_info) = PROJECT_AND_AGENT_INFO_MAP.get_mut(&project_id) {
+                agent_info.status = crate::model::AgentStatus::Active;
+                agent_info.last_activity = Utc::now();
+                agent_info.request_id = request_id.clone();
+                debug!("项目[{}]agent状态更新为Active", project_id);
+            }
+
             // 发送 SessionPromptStart 通知
             let session_id_str = req.session_id.0.to_string();
             let start_notify = SessionNotify::SessionPromptStart(SessionPromptStart {
@@ -94,6 +104,13 @@ pub fn spawn_prompt_handler_for_agent<A>(
                     if let Err(e) = push_session_update(&session_id_str, end_notify) {
                         error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
                     }
+
+                    // 恢复agent状态为Idle
+                    if let Some(mut agent_info) = PROJECT_AND_AGENT_INFO_MAP.get_mut(&project_id) {
+                        agent_info.status = crate::model::AgentStatus::Idle;
+                        agent_info.last_activity = Utc::now();
+                        debug!("项目[{}]agent状态恢复为Idle", project_id);
+                    }
                 }
                 Err(e) => {
                     error!("项目[{}]发送Prompt失败: {:?}", project_id, e);
@@ -107,6 +124,13 @@ pub fn spawn_prompt_handler_for_agent<A>(
                     });
                     if let Err(e) = push_session_update(&session_id_str, end_notify) {
                         error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
+                    }
+
+                    // 恢复agent状态为Idle
+                    if let Some(mut agent_info) = PROJECT_AND_AGENT_INFO_MAP.get_mut(&project_id) {
+                        agent_info.status = crate::model::AgentStatus::Idle;
+                        agent_info.last_activity = Utc::now();
+                        debug!("项目[{}]agent状态恢复为Idle（错误情况）", project_id);
                     }
                 }
             }

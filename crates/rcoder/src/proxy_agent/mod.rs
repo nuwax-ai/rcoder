@@ -1,13 +1,16 @@
 mod acp_agent;
+pub mod cancel_handler;
 mod channel_utils;
+pub mod cleanup_task;
 mod claude_code_agent;
 mod codex_agent;
 
 pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
+pub use cancel_handler::{CancelHandler, AgentCleanupHandler, ClaudeCodeHandler, CodexHandler};
+pub use cleanup_task::{AgentCleaner, CleanupConfig, CleanupCommand, CleanupStats, start_cleanup_task};
 use agent_client_protocol::{
-    self as acp, AgentSideConnection, ClientSideConnection, PromptRequest, SessionId,
+    Client, PermissionOptionKind, PromptRequest, SessionId,
 };
-use agent_client_protocol::{CancelNotification, Client, PermissionOptionKind};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -32,8 +35,8 @@ pub struct AcpAgentClient;
 impl Client for AcpAgentClient {
     async fn request_permission(
         &self,
-        args: acp::RequestPermissionRequest,
-    ) -> Result<acp::RequestPermissionResponse, acp::Error> {
+        args: agent_client_protocol::RequestPermissionRequest,
+    ) -> Result<agent_client_protocol::RequestPermissionResponse, agent_client_protocol::Error> {
         debug!("请求权限: {:?}", args);
         // 自动允许：优先选择 AllowAlways，其次 AllowOnce；若都无，选第一个选项
         let selected = args
@@ -47,7 +50,7 @@ impl Client for AcpAgentClient {
             })
             .or_else(|| args.options.first());
         if let Some(option) = selected {
-            return Ok(acp::RequestPermissionResponse {
+            return Ok(agent_client_protocol::RequestPermissionResponse {
                 outcome: agent_client_protocol::RequestPermissionOutcome::Selected {
                     option_id: option.id.clone(),
                 },
@@ -55,7 +58,7 @@ impl Client for AcpAgentClient {
             });
         }
         // 无可选项则取消
-        Ok(acp::RequestPermissionResponse {
+        Ok(agent_client_protocol::RequestPermissionResponse {
             outcome: agent_client_protocol::RequestPermissionOutcome::Cancelled,
             meta: None,
         })
@@ -63,36 +66,36 @@ impl Client for AcpAgentClient {
 
     async fn write_text_file(
         &self,
-        args: acp::WriteTextFileRequest,
-    ) -> Result<acp::WriteTextFileResponse, acp::Error> {
+        args: agent_client_protocol::WriteTextFileRequest,
+    ) -> Result<agent_client_protocol::WriteTextFileResponse, agent_client_protocol::Error> {
         debug!("写入文件: {:?}", args);
         if let Some(parent) = std::path::Path::new(&args.path).parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 error!("创建目录失败: {}", e);
-                acp::Error::internal_error()
+                agent_client_protocol::Error::internal_error()
             })?;
         }
         let mut file = tokio::fs::File::create(&args.path).await.map_err(|e| {
             error!("创建文件失败: {}", e);
-            acp::Error::internal_error()
+            agent_client_protocol::Error::internal_error()
         })?;
         file.write_all(args.content.as_bytes()).await.map_err(|e| {
             error!("写入文件失败: {}", e);
-            acp::Error::internal_error()
+            agent_client_protocol::Error::internal_error()
         })?;
-        Ok(acp::WriteTextFileResponse { meta: None })
+        Ok(agent_client_protocol::WriteTextFileResponse { meta: None })
     }
 
     async fn read_text_file(
         &self,
-        args: acp::ReadTextFileRequest,
-    ) -> Result<acp::ReadTextFileResponse, acp::Error> {
+        args: agent_client_protocol::ReadTextFileRequest,
+    ) -> Result<agent_client_protocol::ReadTextFileResponse, agent_client_protocol::Error> {
         debug!("读取文件: {:?}", args);
         let content = tokio::fs::read_to_string(&args.path).await.map_err(|e| {
             error!("读取文件失败: {}", e);
-            acp::Error::internal_error()
+            agent_client_protocol::Error::internal_error()
         })?;
-        Ok(acp::ReadTextFileResponse {
+        Ok(agent_client_protocol::ReadTextFileResponse {
             content,
             meta: None,
         })
@@ -164,15 +167,15 @@ impl Client for AcpAgentClient {
 
         // 记录日志（保持原有的详细日志）
         match &args.update {
-            acp::SessionUpdate::AgentMessageChunk { content } => {
+            agent_client_protocol::SessionUpdate::AgentMessageChunk { content } => {
                 let text = match content {
-                    acp::ContentBlock::Text(text_content) => text_content.text.clone(),
-                    acp::ContentBlock::Image(_) => "<image>".into(),
-                    acp::ContentBlock::Audio(_) => "<audio>".into(),
-                    acp::ContentBlock::ResourceLink(resource_link) => {
+                    agent_client_protocol::ContentBlock::Text(text_content) => text_content.text.clone(),
+                    agent_client_protocol::ContentBlock::Image(_) => "<image>".into(),
+                    agent_client_protocol::ContentBlock::Audio(_) => "<audio>".into(),
+                    agent_client_protocol::ContentBlock::ResourceLink(resource_link) => {
                         resource_link.uri.clone()
                     }
-                    acp::ContentBlock::Resource(_) => "<resource>".into(),
+                    agent_client_protocol::ContentBlock::Resource(_) => "<resource>".into(),
                 };
                 info!("📥 Agent message cached [session:{}]: {}", session_id_str, text);
             }

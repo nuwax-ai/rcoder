@@ -3,13 +3,16 @@ use std::collections::HashMap;
 use agent_client_protocol::SessionId;
 use agent_client_protocol::{self as acp, CancelNotification, Client, PromptRequest};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use codex_core::WireApi;
 use codex_core::{ModelProviderInfo, config::ConfigToml};
 use shared_types::ModelProviderConfig;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use codex_core::config::{Config, ConfigOverrides, find_codex_home, load_config_as_toml};
+use crate::proxy_agent::cancel_handler::AgentCleanupHandler;
 
 pub static CUSTOM_MODEL_PROVIDER_NAME: &str = "custom";
 
@@ -222,17 +225,26 @@ impl AgentType {
 }
 
 /// 取消通知请求
-pub struct CancelNotificationRequest{
+pub struct CancelNotificationRequest {
     pub cancel_notification: CancelNotification,
     pub tx: oneshot::Sender<CancelNotificationResponse>,
 }
 
 /// 取消通知响应
-pub struct CancelNotificationResponse{
+pub struct CancelNotificationResponse {
     pub success: bool,
     pub message: Option<String>,
 }
-
+/// Agent 服务状态
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub enum AgentStatus {
+    /// 活跃状态 - 正在处理请求
+    Active,
+    /// 空闲状态 - 等待新请求
+    Idle,
+    /// 正在终止
+    Terminating,
+}
 
 /// 项目id与 Agent 服务池，一个项目对应一个 Agent 服务
 #[derive(Clone)]
@@ -249,4 +261,12 @@ pub struct ProjectAndAgentInfo {
     pub model_provider: Option<ModelProviderConfig>,
     /// 当前活跃的请求ID，用于标识用户请求
     pub request_id: Option<String>,
+    /// Agent 服务状态
+    pub status: AgentStatus,
+    /// 最后活动时间
+    pub last_activity: DateTime<Utc>,
+    /// 创建时间
+    pub created_at: DateTime<Utc>,
+    /// Agent清理处理器，用于自动停止agent服务
+    pub cleanup_handler: Option<Arc<AgentCleanupHandler>>,
 }

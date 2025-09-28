@@ -7,7 +7,7 @@ mod http_result;
 mod agent_session_notify;
 
 pub use chat_prompt::{ChatPrompt, ChatPromptResponse, ChatPromptBuilder};
-pub use agent_model::{AgentType, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse};
+pub use agent_model::{AgentType, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse, AgentStatus};
 pub use attachment::*;
 pub use agent_session_notify::*;
 

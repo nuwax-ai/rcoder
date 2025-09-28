@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -17,6 +18,7 @@ use model::*;
 use utils::*;
 
 use config::load_config;
+use proxy_agent::{CleanupConfig, CleanupCommand, start_cleanup_task};
 use router::AppState;
 
 // 路由创建函数已移动到 handler 模块
@@ -62,6 +64,20 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         local_task_sender,
     });
+
+    // 启动agent清理任务
+    let cleanup_config = CleanupConfig {
+        idle_timeout: Duration::from_secs(30 * 60), // 30分钟
+        cleanup_interval: Duration::from_secs(5 * 60), // 5分钟
+        force_terminate_timeout: Duration::from_secs(60), // 1分钟
+    };
+
+    let (cleanup_command_tx, cleanup_task_handle) = start_cleanup_task(cleanup_config.clone());
+
+    // 启动清理任务
+    if let Err(_) = cleanup_command_tx.send(CleanupCommand::Start(cleanup_config.clone())).await {
+        error!("Failed to start cleanup task");
+    }
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
