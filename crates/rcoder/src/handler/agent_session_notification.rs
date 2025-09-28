@@ -133,20 +133,181 @@ pub struct SessionNotificationParams {
                     },
                     "timestamp": "2023-12-01T10:30:45Z"
                 }))),
-                ("AgentMessageChunk" = (summary = "Agent响应消息", value = json!({
+                ("UserMessageChunk" = (summary = "用户消息块", value = json!({
+                    "session_id": "session456",
+                    "message_type": "AgentSessionUpdate",
+                    "sub_type": "user_message_chunk",
+                    "data": {
+                        "content": {
+                            "type": "text",
+                            "text": "请帮我创建一个Rust项目，包含Hello World程序",
+                            "annotations": null,
+                            "meta": null
+                        }
+                    },
+                    "timestamp": "2023-12-01T10:30:00Z"
+                }))),
+                ("AgentMessageChunk" = (summary = "Agent响应消息块", value = json!({
                     "session_id": "session456",
                     "message_type": "AgentSessionUpdate",
                     "sub_type": "agent_message_chunk",
                     "data": {
                         "content": {
                             "type": "text",
-                            "text": "当然可以！以下是一个简单的Rust Hello World程序：\\n\\n```rust\\nfn main() {\\n    println!(\\\"Hello, World!\\\");\\n}\\n```",
+                            "text": "当然可以！以下是一个简单的Rust Hello World程序：\\n\\n```rust\\nfn main() {\\n    println!(\\\"Hello, World!\\\");\\n}\\n```\\n\\n要运行这个程序，您需要：\\n1. 安装Rust环境\\n2. 创建项目：`cargo new hello_world`\\n3. 替换src/main.rs内容\\n4. 运行：`cargo run`",
                             "annotations": null,
                             "meta": null
                         },
                         "is_final": false
                     },
                     "timestamp": "2023-12-01T10:30:02Z"
+                }))),
+                ("AgentThoughtChunk" = (summary = "Agent思考过程", value = json!({
+                    "session_id": "session456",
+                    "message_type": "AgentSessionUpdate",
+                    "sub_type": "agent_thought_chunk",
+                    "data": {
+                        "content": {
+                            "type": "text",
+                            "text": "用户要求创建Rust Hello World程序。我需要：1) 创建项目结构，2) 编写main.rs文件，3) 提供运行说明。这是一个基础任务，可以直接完成。",
+                            "annotations": null,
+                            "meta": null
+                        },
+                        "confidence": 0.95
+                    },
+                    "timestamp": "2023-12-01T10:30:01Z"
+                }))),
+                ("ToolCall" = (summary = "工具调用", value = json!({
+                    "session_id": "session456",
+                    "message_type": "AgentSessionUpdate",
+                    "sub_type": "tool_call",
+                    "data": {
+                        "toolCallId": "call_123456",
+                        "title": "创建文件",
+                        "kind": "file",
+                        "status": "pending",
+                        "content": [],
+                        "locations": [
+                            {
+                                "path": "src/main.rs",
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 3, "character": 1 }
+                                }
+                            }
+                        ],
+                        "raw_input": {
+                            "path": "src/main.rs",
+                            "content": "fn main() {\n    println!(\"Hello, World!\");\n}"
+                        },
+                        "raw_output": null
+                    },
+                    "timestamp": "2023-12-01T10:30:03Z"
+                }))),
+                ("ToolCallUpdate" = (summary = "工具调用状态更新", value = json!({
+                    "session_id": "session456",
+                    "message_type": "AgentSessionUpdate",
+                    "sub_type": "tool_call_update",
+                    "data": {
+                        "toolCallId": "call_123456",
+                        "status": "success",
+                        "result": {
+                            "path": "src/main.rs",
+                            "content_length": 48,
+                            "created": true,
+                            "checksum": "abc123"
+                        }
+                    },
+                    "timestamp": "2023-12-01T10:30:04Z"
+                }))),
+                ("Plan" = (summary = "执行计划", value = json!({
+                    "session_id": "session456",
+                    "message_type": "AgentSessionUpdate",
+                    "sub_type": "plan",
+                    "data": {
+                        "entries": [
+                            {
+                                "content": "创建项目目录结构",
+                                "priority": "high",
+                                "status": "completed",
+                                "meta": null
+                            },
+                            {
+                                "content": "编写main.rs文件",
+                                "priority": "high",
+                                "status": "in_progress",
+                                "meta": null
+                            },
+                            {
+                                "content": "验证程序运行",
+                                "priority": "medium",
+                                "status": "pending",
+                                "meta": null
+                            }
+                        ],
+                        "meta": null
+                    },
+                    "timestamp": "2023-12-01T10:30:01Z"
+                }))),
+                ("AvailableCommandsUpdate" = (summary = "可用命令更新", value = json!({
+                    "session_id": "session456",
+                    "message_type": "AgentSessionUpdate",
+                    "sub_type": "available_commands_update",
+                    "data": {
+                        "available_commands": [
+                            {
+                                "name": "write_file",
+                                "description": "写入文件内容",
+                                "input": {
+                                    "hint": "请输入文件路径和内容"
+                                },
+                                "meta": null
+                            },
+                            {
+                                "name": "read_file",
+                                "description": "读取文件内容",
+                                "input": {
+                                    "hint": "请输入文件路径"
+                                },
+                                "meta": null
+                            },
+                            {
+                                "name": "run_command",
+                                "description": "执行系统命令",
+                                "input": {
+                                    "hint": "请输入要执行的命令"
+                                },
+                                "meta": null
+                            }
+                        ]
+                    },
+                    "timestamp": "2023-12-01T10:30:00Z"
+                }))),
+                ("CurrentModeUpdate" = (summary = "当前模式更新", value = json!({
+                    "session_id": "session456",
+                    "message_type": "AgentSessionUpdate",
+                    "sub_type": "current_mode_update",
+                    "data": {
+                        "current_mode_id": "code",
+                        "available_modes": [
+                            {
+                                "id": "ask",
+                                "name": "问答模式",
+                                "description": "回答问题和提供建议"
+                            },
+                            {
+                                "id": "code",
+                                "name": "编程模式",
+                                "description": "编写和修改代码"
+                            },
+                            {
+                                "id": "architect",
+                                "name": "架构模式",
+                                "description": "设计和规划项目架构"
+                            }
+                        ]
+                    },
+                    "timestamp": "2023-12-01T10:30:00Z"
                 }))),
                 ("Heartbeat" = (summary = "心跳消息", value = json!({
                     "session_id": "session456",
