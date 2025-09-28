@@ -146,6 +146,7 @@ pub async fn agent_worker(
                             prompt_tx: conn_info.prompt_tx.clone(),
                             cancel_tx: conn_info.cancel_tx.clone(),
                             model_provider: model_provider,
+                            request_id: request.chat_prompt.request_id.clone(),
                         };
                         //记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
                         PROJECT_AND_AGENT_INFO_MAP

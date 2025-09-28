@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::{debug, error, info};
 
-use crate::CancelNotificationRequest;
+use crate::{CancelNotificationRequest, utils::create_mcp_servers_with_context7};
 use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
 use anyhow::Result;
 
@@ -129,6 +129,19 @@ pub async fn start_codex_acp_agent_service(
         })
         .await?;
 
+    // 创建 MCP 服务器配置（不使用 API key）
+    let mcp_servers = create_mcp_servers_with_context7(None);
+
+    if !mcp_servers.is_empty() {
+        info!("🔧 配置了 {} 个 MCP 服务器: {}", mcp_servers.len(),
+            mcp_servers.iter().map(|s| match s {
+                agent_client_protocol::McpServer::Stdio { name, .. } => name.clone(),
+                _ => "unknown".to_string(),
+            }).collect::<Vec<_>>().join(", "));
+    } else {
+        info!("📝 未配置 MCP 服务器");
+    }
+
     // 创建会话
     let session_id = match chat_prompt.session_id {
         Some(session_id) => {
@@ -137,7 +150,7 @@ pub async fn start_codex_acp_agent_service(
             let resp = client_conn
                 .load_session(LoadSessionRequest {
                     session_id: session_id.clone(),
-                    mcp_servers: Vec::new(),
+                    mcp_servers: mcp_servers.clone(),
                     cwd: project_path.clone(),
                     meta: None,
                 })
@@ -149,7 +162,7 @@ pub async fn start_codex_acp_agent_service(
             debug!("创建 ACP 会话[new_session]");
             let resp = client_conn
                 .new_session(NewSessionRequest {
-                    mcp_servers: Vec::new(),
+                    mcp_servers: mcp_servers.clone(),
                     cwd: project_path.clone(),
                     meta: None,
                 })
@@ -172,6 +185,7 @@ pub async fn start_codex_acp_agent_service(
         prompt_rx,
         session_id.clone(),
         &chat_prompt.project_id,
+        chat_prompt.request_id.clone(),
     );
 
     let session_id = session_id_rx.await?;

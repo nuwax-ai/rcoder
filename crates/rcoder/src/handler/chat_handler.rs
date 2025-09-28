@@ -33,6 +33,14 @@ pub struct ChatRequest {
     /// 模型配置
     #[schema(example = "openai")]
     pub model_provider: Option<ModelProviderConfig>,
+    /// 可选的请求ID，如果不提供则自动生成，用于标识和追踪请求
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "req_123456789")]
+    pub request_id: Option<String>,
+    /// 可选的 Context7 API 密钥，如果提供会启用 Context7 MCP 服务
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "ctx_example_key")]
+    pub context7_api_key: Option<String>,
 }
 
 /// 服务响应结构
@@ -50,6 +58,11 @@ pub struct ChatResponse {
 
 /// 生成不带中划线的随机项目ID
 fn generate_project_id() -> String {
+    Uuid::new_v4().to_string().replace("-", "")
+}
+
+/// 生成不带中划线的随机请求ID
+fn generate_request_id() -> String {
     Uuid::new_v4().to_string().replace("-", "")
 }
 
@@ -166,6 +179,9 @@ pub async fn handle_chat(
     // 根据模型提供商配置自动选择 agent 类型
     let agent_type = AgentType::from_model_provider(request.model_provider.as_ref());
 
+    // 确定或生成 request_id
+    let request_id = request.request_id.clone().unwrap_or_else(generate_request_id);
+
     let chat_prompt = ChatPromptBuilder::default()
         .project_id(project_id.clone())
         .project_path(project_workspace)
@@ -173,6 +189,8 @@ pub async fn handle_chat(
         .prompt(request.prompt.clone())
         .attachments(request.attachments.clone())
         .agent_type(agent_type)
+        .request_id(request_id.clone())
+        .context7_api_key(request.context7_api_key.clone())
         .build()
         .map_err(|e| anyhow::anyhow!(e))?;
 

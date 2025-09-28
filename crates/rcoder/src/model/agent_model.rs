@@ -247,4 +247,6 @@ pub struct ProjectAndAgentInfo {
     pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequest>,
     /// 模型提供商配置
     pub model_provider: Option<ModelProviderConfig>,
+    /// 当前活跃的请求ID，用于标识用户请求
+    pub request_id: Option<String>,
 }

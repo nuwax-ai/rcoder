@@ -20,6 +20,12 @@ pub struct ChatPrompt {
     /// agent 类型
     #[builder(default)]
     pub agent_type: AgentType,
+    /// 可选的请求ID，用于标识和追踪请求
+    #[builder(default)]
+    pub request_id: Option<String>,
+    /// 可选的 Context7 API 密钥，如果提供会启用 Context7 MCP 服务
+    #[builder(default)]
+    pub context7_api_key: Option<String>,
 }
 
 /// 返回用户 prompt 的提示,一定有project_id ,session_id ,否则报错

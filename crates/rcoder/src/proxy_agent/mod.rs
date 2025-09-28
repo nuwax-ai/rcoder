@@ -139,18 +139,26 @@ impl Client for AcpAgentClient {
         &self,
         args: agent_client_protocol::SessionNotification,
     ) -> Result<(), agent_client_protocol::Error> {
-        let session_id = args.session_id.to_string();
+        let session_id_str = args.session_id.to_string();
 
         // 将SessionUpdate转换为SessionNotify并存入全局缓存
+        // 尝试从 PROJECT_AND_AGENT_INFO_MAP 中找到对应的 request_id
+        // 由于 ACP 回调只提供 session_id，我们需要遍历查找对应的 project_id
+        let request_id = PROJECT_AND_AGENT_INFO_MAP.iter()
+            .find(|entry| entry.value().session_id.to_string() == session_id_str)
+            .map(|entry| entry.value().request_id.clone())
+            .unwrap_or(None);
+
         let agent_update = AgentSessionUpdate {
-            session_id: session_id.clone(),
+            session_id: session_id_str.clone(),
             session_update: args.update.clone(),
+            request_id,
         };
         let notify = SessionNotify::AgentSessionUpdate(agent_update);
-        if let Err(e) = push_session_update(&session_id, notify) {
+        if let Err(e) = push_session_update(&session_id_str, notify) {
             error!(
                 "❌ Failed to cache SessionUpdate for session {}: {}",
-                session_id, e
+                session_id_str, e
             );
         }
 
@@ -166,12 +174,12 @@ impl Client for AcpAgentClient {
                     }
                     acp::ContentBlock::Resource(_) => "<resource>".into(),
                 };
-                info!("📥 Agent message cached [session:{}]: {}", session_id, text);
+                info!("📥 Agent message cached [session:{}]: {}", session_id_str, text);
             }
             _ => {
                 info!(
                     "📥 SessionUpdate cached [session:{}]: {:?}",
-                    session_id, args.update
+                    session_id_str, args.update
                 );
             }
         }

@@ -51,6 +51,7 @@ pub fn spawn_prompt_handler_for_agent<A>(
     mut prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
     session_id: SessionId,
     project_id: &str,
+    request_id: Option<String>,
 ) where
     A: Agent + 'static,
 {
@@ -69,7 +70,9 @@ pub fn spawn_prompt_handler_for_agent<A>(
             let session_id_str = req.session_id.0.to_string();
             let start_notify = SessionNotify::SessionPromptStart(SessionPromptStart {
                 session_id: session_id_str.clone(),
+                request_id: request_id.clone(),
             });
+
             if let Err(e) = push_session_update(&session_id_str, start_notify) {
                 error!("项目[{}]发送SessionPromptStart失败: {:?}", project_id, e);
             }
@@ -86,6 +89,7 @@ pub fn spawn_prompt_handler_for_agent<A>(
                         session_id: session_id_str.clone(),
                         stop_reason: resp.stop_reason,
                         error_message: None,
+                        request_id: request_id.clone(),
                     });
                     if let Err(e) = push_session_update(&session_id_str, end_notify) {
                         error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
@@ -99,6 +103,7 @@ pub fn spawn_prompt_handler_for_agent<A>(
                         session_id: session_id_str.clone(),
                         stop_reason: agent_client_protocol::StopReason::Cancelled,
                         error_message: Some(format!("{:?}", e)),
+                        request_id: request_id.clone(),
                     });
                     if let Err(e) = push_session_update(&session_id_str, end_notify) {
                         error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);

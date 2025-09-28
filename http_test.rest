@@ -18,6 +18,19 @@ Content-Type: application/json
 @project_id = {{createSession.response.body.data.project_id}}
 
 ###
+### 请使用 context7 工具搜索,测试mcp工具
+# @name testMcp
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "test_mcp",
+  "prompt": "请使用 context7 工具搜索 tokio 库的官方文档信息"
+
+}
+
+
+###
 
 ### 第二步：建立SSE连接接收Agent实时消息
 # 使用提取的session_id变量
