@@ -3,6 +3,7 @@
 use anyhow::Result;
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use shared_types::ModelProviderConfig;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
@@ -31,7 +32,17 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
     /// 模型配置
-    #[schema(example = "openai")]
+    #[schema(
+        example = json!({
+            "id": "openai_gpt4",
+            "name": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "sk-...",
+            "requires_openai_auth": true,
+            "default_model": "gpt-4",
+            "api_protocol": "openai"
+        })
+    )]
     pub model_provider: Option<ModelProviderConfig>,
     /// 可选的请求ID，如果不提供则自动生成，用于标识和追踪请求
     #[serde(default, skip_serializing_if = "Option::is_none")]

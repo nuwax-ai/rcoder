@@ -71,6 +71,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::ChatResponse,
             handler::StopAgentResponse,
             crate::handler::SessionUpdateEvent,
+            // 模型配置相关结构体
+            shared_types::ModelProviderConfig,
+            shared_types::ModelApiProtocol,
             // 附件相关结构体
             crate::model::Attachment,
             crate::model::AttachmentSource,
