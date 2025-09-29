@@ -1,10 +1,8 @@
 //! ACP 代理服务的公共 trait 定义
 
 use crate::model::{ChatPrompt, ProjectAndAgentInfo};
-use agent_client_protocol::ClientCapabilities;
 use anyhow::Result;
 use shared_types::ModelProviderConfig;
-use std::time::Duration;
 use tracing::{debug, info};
 
 /// ACP 代理服务 trait
@@ -29,20 +27,8 @@ pub trait AcpAgentService {
     /// 获取代理类型名称
     fn agent_type_name(&self) -> &'static str;
 
-    /// 获取客户端能力配置
-    fn get_client_capabilities(&self) -> ClientCapabilities;
-
-    /// 取消agent服务（协作式取消）
-    fn cancel_agent_service(&self, agent_info: &ProjectAndAgentInfo);
-
     /// 停止agent服务（立即停止）
     async fn stop_agent_service(&self, agent_info: &ProjectAndAgentInfo) -> Result<()>;
-
-    /// 检查agent是否闲置
-    fn is_agent_idle(&self, agent_info: &ProjectAndAgentInfo, timeout: Duration) -> bool;
-
-    /// 获取agent的CancellationToken（用于任务协作取消）
-    fn get_cancellation_token(&self, agent_info: &ProjectAndAgentInfo) -> Option<tokio_util::sync::CancellationToken>;
 }
 
 /// 为 AgentType 实现 AcpAgentService trait
@@ -74,30 +60,6 @@ impl AcpAgentService for crate::model::AgentType {
         }
     }
 
-    fn get_client_capabilities(&self) -> ClientCapabilities {
-        match self {
-            crate::model::AgentType::Claude => ClientCapabilities {
-                fs: agent_client_protocol::FileSystemCapability {
-                    read_text_file: false,
-                    write_text_file: false,
-                    meta: None,
-                },
-                terminal: false,
-                meta: None,
-            },
-            crate::model::AgentType::Codex => ClientCapabilities::default(),
-        }
-    }
-
-    fn cancel_agent_service(&self, agent_info: &ProjectAndAgentInfo) {
-        info!(
-            "发送取消信号到[{}] agent服务，项目ID: {}",
-            self.agent_type_name(),
-            agent_info.project_id
-        );
-        agent_info.lifecycle_guard.cancel();
-    }
-
     async fn stop_agent_service(&self, agent_info: &ProjectAndAgentInfo) -> Result<()> {
         info!(
             "停止[{}] agent服务，项目ID: {}",
@@ -105,22 +67,5 @@ impl AcpAgentService for crate::model::AgentType {
             agent_info.project_id
         );
         agent_info.lifecycle_guard.stop_async().await
-    }
-
-    fn is_agent_idle(&self, agent_info: &ProjectAndAgentInfo, timeout: Duration) -> bool {
-        use crate::model::AgentStatus;
-        use chrono::Utc;
-
-        match agent_info.status {
-            AgentStatus::Idle => {
-                let idle_duration = Utc::now().signed_duration_since(agent_info.last_activity);
-                idle_duration.num_seconds() > timeout.as_secs() as i64
-            }
-            _ => false,
-        }
-    }
-
-    fn get_cancellation_token(&self, agent_info: &ProjectAndAgentInfo) -> Option<tokio_util::sync::CancellationToken> {
-        Some(agent_info.lifecycle_guard.cancellation_token().clone())
     }
 }

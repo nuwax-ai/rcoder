@@ -8,7 +8,6 @@ use codex_core::WireApi;
 use codex_core::{ModelProviderInfo, config::ConfigToml};
 use serde::{Serialize, Deserialize};
 use shared_types::ModelProviderConfig;
-use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -248,6 +247,8 @@ pub enum AgentStatus {
 }
 
 /// 项目id与 Agent 服务池，一个项目对应一个 Agent 服务
+/// 
+/// Clone trait 是必需的，因为 DashMap::insert() 要求值类型实现 Clone
 #[derive(Clone)]
 pub struct ProjectAndAgentInfo {
     /// 项目ID
@@ -270,8 +271,6 @@ pub struct ProjectAndAgentInfo {
     pub created_at: DateTime<Utc>,
     /// Agent生命周期守卫，绑定生命周期，drop 时自动清理
     pub lifecycle_guard: AgentLifecycleGuard,
-    /// Agent是否正在停止
-    pub is_stopping: bool,
 }
 
 impl Drop for ProjectAndAgentInfo {

@@ -43,6 +43,9 @@ impl ToString for ModelApiProtocol {
 /// 模型提供商配置
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelProviderConfig {
+    /// 模型id,确保唯一性
+    #[schema(example = "id")]
+    pub id: String,
     /// 提供商名称 (如: glm, anthropic, openai, qwen, ernie, moonshot)
     #[schema(example = "openai")]
     pub name: String,

@@ -3,7 +3,6 @@
 //! 提供可复用的channel消息处理逻辑
 
 use agent_client_protocol::{Agent, PromptRequest, SessionId};
-use serde_json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
