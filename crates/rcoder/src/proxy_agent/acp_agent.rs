@@ -12,11 +12,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 use crate::{
-    model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo}, proxy_agent::{
-        claude_code_agent::start_claude_code_acp_agent_service,
-        codex_agent::start_codex_acp_agent_service,
-    }, utils::{ContentBuilder, PromptBuilder}, AgentStatus, AgentType
+    model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo}, proxy_agent::agent_service::AcpAgentService, utils::{ContentBuilder, PromptBuilder}, AgentStatus
 };
+use crate::proxy_agent::agent_stop_handle::AgentStopGuard;
 use anyhow::Result;
 
 /// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
@@ -116,25 +114,11 @@ pub async fn agent_worker(
                 }
             }
             None => {
-                //获取 agent_type,判断使用 codex 还是 claude code
-                let agent_type = request.chat_prompt.agent_type.clone();
-                //使用传入的模型提供商配置
-                let model_provider = request.model_provider.clone();
-
-                //启动 agent 服务,返回 session_id 和 prompt_tx
-                let start_agent_result = match agent_type {
-                    AgentType::Claude => {
-                        start_claude_code_acp_agent_service(
-                            chat_prompt.clone(),
-                            model_provider.clone(),
-                        )
-                        .await
-                    }
-                    AgentType::Codex => {
-                        start_codex_acp_agent_service(chat_prompt.clone(), model_provider.clone())
-                            .await
-                    }
-                };
+                        // 根据 chat_prompt.agent_type 自动判断使用 codex 还是 claude code
+                let start_agent_result = chat_prompt.agent_type.start_agent_service(
+                    chat_prompt.clone(),
+                    request.model_provider.clone(),
+                ).await;
                 //创建 agent 服务
                 match start_agent_result {
                     Ok(conn_info) => {
@@ -143,12 +127,14 @@ pub async fn agent_worker(
                             session_id: conn_info.session_id.clone(),
                             prompt_tx: conn_info.prompt_tx.clone(),
                             cancel_tx: conn_info.cancel_tx.clone(),
-                            model_provider: model_provider,
+                            model_provider: request.model_provider.clone(),
                             request_id: request.chat_prompt.request_id.clone(),
                             status: AgentStatus::Idle,
                             last_activity: Utc::now(),
                             created_at: Utc::now(),
                             cleanup_handler: None, // 暂时设置为None，后续可以扩展
+                            stop_handle: conn_info.stop_handle.map(AgentStopGuard::new),
+                            is_stopping: false,
                         };
                         //记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
                         PROJECT_AND_AGENT_INFO_MAP

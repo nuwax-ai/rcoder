@@ -17,7 +17,8 @@ pub fn spawn_cancel_handler_for_agent<A>(
     client_conn: Arc<A>,
     mut cancel_rx: mpsc::UnboundedReceiver<CancelNotificationRequest>,
     project_id: &str,
-) where
+) -> tokio::task::JoinHandle<()>
+where
     A: Agent + 'static,
 {
     let project_id = project_id.to_string();
@@ -44,7 +45,7 @@ pub fn spawn_cancel_handler_for_agent<A>(
         }
 
         info!("项目[{}]独立Cancel处理任务结束", project_id);
-    });
+    })
 }
 
 /// 通用的Prompt消息处理任务（针对实现了Agent trait的类型）
@@ -54,7 +55,8 @@ pub fn spawn_prompt_handler_for_agent<A>(
     session_id: SessionId,
     project_id: &str,
     request_id: Option<String>,
-) where
+) -> tokio::task::JoinHandle<()>
+where
     A: Agent + 'static,
 {
     let project_id = project_id.to_string();
@@ -137,5 +139,5 @@ pub fn spawn_prompt_handler_for_agent<A>(
         }
 
         info!("项目[{}]独立Prompt处理任务结束", project_id);
-    });
+    })
 }

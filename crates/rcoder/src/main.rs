@@ -41,7 +41,13 @@ async fn main() -> anyhow::Result<()> {
     let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
 
     // 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
-    std::thread::spawn(move || {
+    let cleanup_config = CleanupConfig {
+        idle_timeout: Duration::from_secs(30 * 60), // 30分钟
+        cleanup_interval: Duration::from_secs(5 * 60), // 5分钟
+        force_terminate_timeout: Duration::from_secs(60), // 1分钟
+    };
+
+    let cleanup_thread_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -50,6 +56,15 @@ async fn main() -> anyhow::Result<()> {
             let local_set = tokio::task::LocalSet::new();
             local_set
                 .run_until(async move {
+                    // 启动 cleanup task（在 LocalSet 中）
+                    let (cleanup_tx, _cleanup_handle) = start_cleanup_task(cleanup_config.clone());
+
+                    // 启动清理任务
+                    if let Err(_) = cleanup_tx.send(CleanupCommand::Start(cleanup_config.clone())).await {
+                        error!("Failed to start cleanup task");
+                    }
+
+                    // 运行 agent worker
                     if let Err(e) = proxy_agent::agent_worker(local_task_receiver).await {
                         error!("Failed to run agent worker: {}", e);
                     }
@@ -59,25 +74,16 @@ async fn main() -> anyhow::Result<()> {
         });
     });
 
+    // 这里cleanup_command_tx实际上在LocalSet中使用了，但外部不需要访问
+    // 所以我们直接使用一个dummy值，实际清理任务在内部启动
+    let cleanup_command_tx: tokio::sync::mpsc::Sender<proxy_agent::cleanup_task::CleanupCommand> =
+        tokio::sync::mpsc::channel(1).0;
+
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
         local_task_sender,
     });
-
-    // 启动agent清理任务
-    let cleanup_config = CleanupConfig {
-        idle_timeout: Duration::from_secs(30 * 60), // 30分钟
-        cleanup_interval: Duration::from_secs(5 * 60), // 5分钟
-        force_terminate_timeout: Duration::from_secs(60), // 1分钟
-    };
-
-    let (cleanup_command_tx, cleanup_task_handle) = start_cleanup_task(cleanup_config.clone());
-
-    // 启动清理任务
-    if let Err(_) = cleanup_command_tx.send(CleanupCommand::Start(cleanup_config.clone())).await {
-        error!("Failed to start cleanup task");
-    }
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 

@@ -19,11 +19,15 @@ use dashmap::DashMap;
 use serde_json::json;
 use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+use tokio_util::{
+    compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _},
+    sync::CancellationToken,
+};
 use tracing::{debug, error, info};
 
 use crate::{CancelNotificationRequest, utils::create_mcp_servers_with_context7};
 use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
+use crate::proxy_agent::agent_stop_handle::{AgentStopHandle, CodexAgentStopHandle, AgentStopHandleArc};
 use anyhow::Result;
 
 use super::{AcpAgentClient, AcpConnectionInfo};
@@ -73,6 +77,9 @@ pub async fn start_codex_acp_agent_service(
     // 用于外部持续发送 prompt 的通道
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
 
+    // 创建 CancellationToken 用于控制嵌入式 Codex agent 生命周期
+    let cancel_token = CancellationToken::new();
+
     // 在 LocalSet 中启动服务
     let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
 
@@ -98,27 +105,45 @@ pub async fn start_codex_acp_agent_service(
     );
 
     let client_conn = Arc::new(client_conn);
-    // 持续运行 IO
-    tokio::task::spawn_local(server_io_task);
-    tokio::task::spawn_local(client_io_task);
+
+    // 保存任务句柄用于后续停止
+    let mut io_task_handles = Vec::new();
+    let mut channel_task_handles = Vec::new();
+
+    // 持续运行 IO，并保存任务句柄
+    let server_io_handle = tokio::task::spawn_local(server_io_task);
+    let client_io_handle = tokio::task::spawn_local(client_io_task);
+    io_task_handles.push(server_io_handle);
+    io_task_handles.push(client_io_handle);
 
     // 转发 Agent 的 SessionNotification 到连接（触发 EmbeddedClient::session_notification）
-    tokio::task::spawn_local(async move {
-        loop {
-            match session_update_rx.recv().await {
-                Some((session_notification, tx)) => {
-                    let result = server_conn.session_notification(session_notification).await;
-                    if let Err(e) = result {
-                        error!("failed to send session notification: {:?}", e);
-                        let _ = tx.send(());
+    {
+        let cancel_token = cancel_token.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!("Codex agent session_update 转发任务收到取消信号，退出");
                         break;
                     }
-                    let _ = tx.send(());
+                    maybe_msg = session_update_rx.recv() => {
+                        match maybe_msg {
+                            Some((session_notification, tx)) => {
+                                let result = server_conn.session_notification(session_notification).await;
+                                if let Err(e) = result {
+                                    error!("failed to send session notification: {:?}", e);
+                                    let _ = tx.send(());
+                                    break;
+                                }
+                                let _ = tx.send(());
+                            }
+                            None => break,
+                        }
+                    }
                 }
-                None => break,
             }
-        }
-    });
+        });
+    }
 
     // 初始化 + 创建会话
     client_conn
@@ -174,24 +199,38 @@ pub async fn start_codex_acp_agent_service(
 
     let _ = session_id_tx.send(session_id.clone());
 
-    // 使用共享的通道处理逻辑
-    super::channel_utils::spawn_cancel_handler_for_agent(
+    // 使用共享的通道处理逻辑，并保存任务句柄
+    let cancel_handle = super::channel_utils::spawn_cancel_handler_for_agent(
         client_conn.clone(),
         cancel_rx,
         &chat_prompt.project_id,
     );
-    super::channel_utils::spawn_prompt_handler_for_agent(
+    channel_task_handles.push(cancel_handle);
+
+    let prompt_handle = super::channel_utils::spawn_prompt_handler_for_agent(
         client_conn.clone(),
         prompt_rx,
         session_id.clone(),
         &chat_prompt.project_id,
         chat_prompt.request_id.clone(),
     );
+    channel_task_handles.push(prompt_handle);
 
     let session_id = session_id_rx.await?;
+
+    // 创建停止句柄（绑定 CancellationToken）
+    let stop_handle = Arc::new(AgentStopHandle::Codex(CodexAgentStopHandle::with_cancellation_token(
+        client_conn.clone(),
+        session_id.clone(),
+        io_task_handles,
+        channel_task_handles,
+        cancel_token.clone(),
+    )));
+
     Ok(AcpConnectionInfo {
         session_id,
         prompt_tx,
         cancel_tx,
+        stop_handle: Some(stop_handle),
     })
 }

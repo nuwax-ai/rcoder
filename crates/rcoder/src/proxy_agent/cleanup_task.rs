@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::model::AgentStatus;
-use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
+use crate::model::{AgentStatus, AgentType};
+use crate::proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, agent_service::AcpAgentService};
 
 /// 清理配置
 #[derive(Debug, Clone)]
@@ -147,26 +147,40 @@ impl AgentCleaner {
     async fn cleanup_agent(&self, project_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("开始清理agent: {}", project_id);
 
-        // 设置状态为Terminating
-        if let Some(mut agent_info) = PROJECT_AND_AGENT_INFO_MAP.get_mut(project_id) {
-            agent_info.status = AgentStatus::Terminating;
-            agent_info.last_activity = Utc::now();
-            debug!("设置agent状态为Terminating: {}", project_id);
-        }
-
-        // 发送取消请求（如果有cleanup_handler）
+        // 获取agent信息
         if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
-            if let Some(handler) = &agent_info.cleanup_handler {
-                // 这里可以调用handler的清理逻辑
-                // 由于Drop trait的限制，我们直接移除条目，让Drop自动处理
-                debug!("Agent有cleanup_handler，准备自动清理: {}", project_id);
+            // 设置状态为Terminating
+            if let Some(mut agent_info) = PROJECT_AND_AGENT_INFO_MAP.get_mut(project_id) {
+                agent_info.status = AgentStatus::Terminating;
+                agent_info.is_stopping = true;
+                agent_info.last_activity = Utc::now();
+                debug!("设置agent状态为Terminating: {}", project_id);
             }
-        }
 
-        // 从map中移除agent信息，触发Drop
-        let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
-        if removed.is_some() {
-            info!("Agent已从map中移除，将触发自动清理: {}", project_id);
+            // 使用AcpAgentService trait的停止方法
+            let agent_type = agent_info.model_provider.as_ref()
+                .map(|mp| AgentType::from_model_provider(Some(mp)))
+                .unwrap_or_default();
+
+            info!("使用[{}] agent的协作停止方法清理: {}", agent_type.agent_type_name(), project_id);
+
+            // 先发送取消信号，让任务优雅退出
+            agent_type.cancel_agent_service(&agent_info);
+
+            // 等待一段时间让任务优雅退出
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            // 如果还没有停止，则强制停止
+            if let Err(e) = agent_type.stop_agent_service(&agent_info).await {
+                error!("停止agent服务失败: {} - {}", project_id, e);
+                // 即使停止失败，也要继续清理流程
+            }
+
+            // 从map中移除agent信息，触发Drop
+            let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
+            if removed.is_some() {
+                info!("Agent已从map中移除: {}", project_id);
+            }
         } else {
             warn!("Agent不存在于map中: {}", project_id);
         }
@@ -236,7 +250,7 @@ pub fn start_cleanup_task(config: CleanupConfig) -> (mpsc::Sender<CleanupCommand
 
     let mut cleaner = AgentCleaner::new(config);
 
-    let handle = tokio::spawn(async move {
+    let handle = tokio::task::spawn_local(async move {
         cleaner.run(command_rx).await;
     });
 

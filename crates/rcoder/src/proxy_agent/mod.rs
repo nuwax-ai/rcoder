@@ -1,4 +1,6 @@
 mod acp_agent;
+pub mod agent_service;
+pub mod agent_stop_handle;
 pub mod cancel_handler;
 mod channel_utils;
 pub mod cleanup_task;
@@ -17,6 +19,7 @@ use tracing::{debug, error, info};
 
 use crate::{service::push_session_update, model::{SessionNotify, AgentSessionUpdate}};
 use crate::CancelNotificationRequest;
+use crate::proxy_agent::agent_stop_handle::{AgentStopHandleArc, AgentStopGuard};
 
 /// ACP协议的连接信息
 pub struct AcpConnectionInfo {
@@ -26,6 +29,8 @@ pub struct AcpConnectionInfo {
     pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
     /// 用于发送取消通知的通道
     pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequest>,
+    /// Agent停止句柄（将被包装为守卫并放入 ProjectAndAgentInfo）
+    pub stop_handle: Option<AgentStopHandleArc>,
 }
 
 /// ACP 客户端实现[derive(Clone)]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use agent_client_protocol::SessionId;
-use agent_client_protocol::{self as acp, CancelNotification, Client, PromptRequest};
+use agent_client_protocol::{CancelNotification, PromptRequest};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use codex_core::WireApi;
@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
-use codex_core::config::{Config, ConfigOverrides, find_codex_home, load_config_as_toml};
-use crate::proxy_agent::cancel_handler::AgentCleanupHandler;
+use codex_core::config::{find_codex_home, load_config_as_toml};
+use crate::proxy_agent::{agent_stop_handle::{AgentStopHandleArc, AgentStopGuard}, cancel_handler::AgentCleanupHandler};
 
 pub static CUSTOM_MODEL_PROVIDER_NAME: &str = "custom";
 
@@ -269,4 +269,23 @@ pub struct ProjectAndAgentInfo {
     pub created_at: DateTime<Utc>,
     /// Agent清理处理器，用于自动停止agent服务
     pub cleanup_handler: Option<Arc<AgentCleanupHandler>>,
+    /// Agent停止守卫，绑定生命周期，drop 时自动清理
+    pub stop_handle: Option<AgentStopGuard>,
+    /// Agent是否正在停止
+    pub is_stopping: bool,
+}
+
+impl Drop for ProjectAndAgentInfo {
+    fn drop(&mut self) {
+        if self.stop_handle.is_some() && !self.is_stopping {
+            info!(
+                "ProjectAndAgentInfo被drop，自动停止agent服务，项目ID: {}",
+                self.project_id
+            );
+
+            // 由于drop是同步的，我们无法在这里直接调用异步的stop方法
+            // 我们需要通过其他方式来处理异步停止逻辑
+            // 这里只是记录日志，实际的停止逻辑需要在其他地方处理
+        }
+    }
 }
