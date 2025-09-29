@@ -7,7 +7,6 @@
 
 use std::time::Duration;
 use chrono::{DateTime, Utc};
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use anyhow::Result;
 
@@ -21,8 +20,9 @@ pub struct CleanupConfig {
     pub idle_timeout: Duration,
     /// 清理检查间隔（默认5分钟）
     pub cleanup_interval: Duration,
-    /// 强制终止超时（默认1分钟）
-    pub force_terminate_timeout: Duration,
+    // 注意：force_terminate_timeout 字段已移除
+    // 因为采用RAII模式，AgentLifecycleGuard会自动处理资源清理
+    // 不需要强制终止超时机制
 }
 
 impl Default for CleanupConfig {
@@ -30,20 +30,8 @@ impl Default for CleanupConfig {
         Self {
             idle_timeout: Duration::from_secs(30 * 60),
             cleanup_interval: Duration::from_secs(5 * 60),
-            force_terminate_timeout: Duration::from_secs(60),
         }
     }
-}
-
-/// 清理任务控制命令
-#[derive(Debug, Clone)]
-pub enum CleanupCommand {
-    /// 启动清理任务
-    Start(CleanupConfig),
-    /// 停止清理任务
-    Stop,
-    /// 立即执行一次清理
-    CleanupNow,
 }
 
 /// 清理任务统计信息
@@ -63,7 +51,6 @@ pub struct CleanupStats {
 pub struct AgentCleaner {
     config: CleanupConfig,
     stats: CleanupStats,
-    running: bool,
 }
 
 impl AgentCleaner {
@@ -72,7 +59,6 @@ impl AgentCleaner {
         Self {
             config,
             stats: CleanupStats::default(),
-            running: false,
         }
     }
 
@@ -90,7 +76,10 @@ impl AgentCleaner {
         let mut success_count = 0;
         let mut failed_count = 0;
 
-        info!("开始清理闲置agent，当前时间: {}", current_time);
+        // 统计当前活动的agent数量
+        let total_agents = PROJECT_AND_AGENT_INFO_MAP.len();
+        
+        info!("开始清理闲置agent，当前时间: {}，当前活动agent数量: {}", current_time, total_agents);
 
         // 收集需要清理的agent ID
         let mut agents_to_remove = Vec::new();
@@ -104,11 +93,12 @@ impl AgentCleaner {
                 if self.is_agent_idle_timeout(agent_info.last_activity, current_time) {
                     let idle_duration = (current_time - agent_info.last_activity).num_seconds();
                     info!(
-                        "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒",
+                        "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒, 创建时间: {}",
                         project_id,
                         agent_info.status,
                         agent_info.last_activity,
-                        idle_duration
+                        idle_duration,
+                        agent_info.created_at
                     );
                     agents_to_remove.push(project_id.clone());
                 }
@@ -136,9 +126,12 @@ impl AgentCleaner {
         self.stats.failed_cleaned += failed_count;
         self.stats.last_cleanup = Some(current_time);
 
+        // 清理完成后的agent数量统计
+        let remaining_agents = PROJECT_AND_AGENT_INFO_MAP.len();
+        
         info!(
-            "清理完成: 总共={}, 成功={}, 失败={}",
-            cleaned_count, success_count, failed_count
+            "清理完成: 总共={}, 成功={}, 失败={}, 清理前agent数量={}, 清理后agent数量={}",
+            cleaned_count, success_count, failed_count, total_agents, remaining_agents
         );
 
         Ok(CleanupStats {
@@ -171,58 +164,20 @@ impl AgentCleaner {
         Ok(())
     }
 
-    /// 运行清理任务
-    pub async fn run(&mut self, mut command_rx: mpsc::Receiver<CleanupCommand>) {
-        info!("Agent清理任务已启动");
+    /// 运行清理任务 - 简化版，只做定时清理
+    pub async fn run(&mut self) {
+        info!("清理任务已启动，配置: {:?}", self.config);
 
+        let mut interval = tokio::time::interval(self.config.cleanup_interval);
+        
         loop {
-            tokio::select! {
-                // 接收命令
-                command = command_rx.recv() => {
-                    match command {
-                        Some(CleanupCommand::Start(config)) => {
-                            self.config = config;
-                            self.running = true;
-                            info!("清理任务已启动，配置: {:?}", self.config);
-                        }
-                        Some(CleanupCommand::Stop) => {
-                            self.running = false;
-                            info!("清理任务已停止");
-                            break;
-                        }
-                        Some(CleanupCommand::CleanupNow) => {
-                            info!("立即执行清理");
-                            match self.cleanup_idle_agents().await {
-                                Ok(stats) => info!("立即清理完成: {:?}", stats),
-                                Err(e) => warn!("立即清理失败: {}", e),
-                            }
-                        }
-                        None => {
-                            info!("命令通道已关闭，停止清理任务");
-                            break;
-                        }
-                    }
-                }
-                // 定期清理
-                _ = async {
-                    if self.running {
-                        tokio::time::sleep(self.config.cleanup_interval).await;
-                    } else {
-                        // 如果没有运行，等待更长时间
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                    }
-                } => {
-                    if self.running {
-                        match self.cleanup_idle_agents().await {
-                            Ok(stats) => debug!("定期清理完成: {:?}", stats),
-                            Err(e) => warn!("定期清理失败: {}", e),
-                        }
-                    }
-                }
+            interval.tick().await;
+            
+            match self.cleanup_idle_agents().await {
+                Ok(stats) => debug!("定时清理完成: {:?}", stats),
+                Err(e) => warn!("定时清理失败: {}", e),
             }
         }
-
-        info!("Agent清理任务已退出");
     }
 
     /// 获取统计信息
@@ -231,15 +186,11 @@ impl AgentCleaner {
     }
 }
 
-/// 启动清理任务
-pub fn start_cleanup_task(config: CleanupConfig) -> (mpsc::Sender<CleanupCommand>, tokio::task::JoinHandle<()>) {
-    let (command_tx, command_rx) = mpsc::channel(32);
-
+/// 启动清理任务 - 简化版
+pub fn start_cleanup_task(config: CleanupConfig) -> tokio::task::JoinHandle<()> {
     let mut cleaner = AgentCleaner::new(config);
 
-    let handle = tokio::task::spawn_local(async move {
-        cleaner.run(command_rx).await;
-    });
-
-    (command_tx, handle)
+    tokio::task::spawn_local(async move {
+        cleaner.run().await;
+    })
 }
