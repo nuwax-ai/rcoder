@@ -45,6 +45,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(handler::agent_session_notification),
         )
         .route("/agent/session/cancel", post(handler::agent_session_cancel))
+        .route("/agent/stop", post(handler::agent_stop))
         .with_state(state.clone());
 
     Router::new()
@@ -60,6 +61,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::handle_chat,
         handler::agent_session_notification,
         handler::agent_session_cancel,
+        handler::agent_stop,
     ),
     components(
         schemas(
@@ -67,6 +69,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::HealthResponse,
             handler::ChatRequest,
             handler::ChatResponse,
+            handler::StopAgentResponse,
             crate::handler::SessionUpdateEvent,
             // 附件相关结构体
             crate::model::Attachment,

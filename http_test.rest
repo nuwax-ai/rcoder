@@ -48,3 +48,36 @@ POST http://localhost:3000/agent/session/cancel?project_id={{project_id}}&sessio
 POST http://localhost:3000/agent/session/cancel?project_id=nonexistent_project&session_id=nonexistent_session
 
 ###
+
+### 第五步：测试停止Agent服务 - 使用提取的project_id变量
+# 使用从第一步提取的project_id变量停止Agent服务
+POST http://localhost:3000/agent/stop?project_id={{project_id}}
+
+###
+
+### 第六步：测试停止不存在的Agent服务
+# 测试停止一个不存在的project_id的Agent服务
+POST http://localhost:3000/agent/stop?project_id=nonexistent_project_123
+
+
+###
+
+### 单独测试：创建Agent然后立即停止
+# @name createAndStop
+# 创建一个新的Agent服务用于测试停止功能
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "test_stop_user",
+  "prompt": "Hello, this is a test for agent stop functionality",
+  "agent_type": "codex"
+}
+
+### 提取测试停止专用的project_id
+@stop_test_project_id = {{createAndStop.response.body.data.project_id}}
+
+### 使用提取的project_id测试停止功能
+POST http://localhost:3000/agent/stop?project_id={{stop_test_project_id}}
+
+###

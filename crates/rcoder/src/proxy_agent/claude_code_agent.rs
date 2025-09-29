@@ -14,7 +14,7 @@ use crate::{
     model::ChatPrompt,
     proxy_agent::{
         AcpAgentClient, AcpConnectionInfo,
-        agent_stop_handle::{AgentStopHandle, AgentStopHandleArc, ClaudeCodeAgentStopHandle},
+        agent_stop_handle::AgentLifecycleGuard,
     },
     utils::create_mcp_servers_with_context7,
 };
@@ -255,23 +255,54 @@ pub async fn start_claude_code_acp_agent_service(
         session_id.0
     );
 
-    // 创建停止句柄 - 使用外部的CancellationToken和stderr流
-    let stop_handle = Arc::new(AgentStopHandle::Claude(
-        ClaudeCodeAgentStopHandle::with_cancellation_token_and_stderr(
-            child,
-            stderr,
-            project_id_for_child.clone(),
-            cancel_token.clone(),
-        ),
-    ));
+    // 创建stderr任务来处理子进程的stderr输出
+    let cancel_token_for_stderr = cancel_token.clone();
+    let project_id_for_stderr = project_id_for_child.clone();
+    let stderr_task = tokio::task::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut stderr_reader = tokio::io::BufReader::new(stderr);
+        let mut stderr_buffer = String::new();
 
-    // 现在停止句柄包含了实际的子进程句柄，可以通过AgentStopHandle::Claude来控制
-    // 同时内部也使用CancellationToken来实现协作式取消
+        loop {
+            // 检查取消令牌
+            if cancel_token_for_stderr.is_cancelled() {
+                info!("Claude Code Agent stderr 任务收到取消信号，退出读取");
+                break;
+            }
+
+            match stderr_reader.read_line(&mut stderr_buffer).await {
+                Ok(0) => {
+                    info!("Claude Code Agent stderr 流已关闭");
+                    break;
+                }
+                Ok(bytes_read) => {
+                    let line = &stderr_buffer[..bytes_read];
+                    if !line.trim().is_empty() {
+                        warn!("Claude Code Agent stderr: {}", line.trim());
+                    }
+                    stderr_buffer.clear();
+                }
+                Err(e) => {
+                    error!("读取 Claude Code Agent stderr 失败: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // 创建生命周期守卫
+    let lifecycle_guard = AgentLifecycleGuard::new_claude(
+        project_id_for_child.clone(),
+        session_id.clone(),
+        child,
+        stderr_task,
+        cancel_token.clone(),
+    );
 
     Ok(AcpConnectionInfo {
         session_id,
         prompt_tx,
         cancel_tx,
-        stop_handle: Some(stop_handle),
+        stop_handle: Some(Arc::new(lifecycle_guard)),
     })
 }

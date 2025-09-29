@@ -18,7 +18,7 @@ use model::*;
 use utils::*;
 
 use config::load_config;
-use proxy_agent::{CleanupConfig, CleanupCommand, start_cleanup_task};
+use proxy_agent::cleanup_task::{CleanupConfig, CleanupCommand, start_cleanup_task};
 use router::AppState;
 
 // 路由创建函数已移动到 handler 模块

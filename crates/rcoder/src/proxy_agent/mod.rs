@@ -1,25 +1,20 @@
 mod acp_agent;
 pub mod agent_service;
 pub mod agent_stop_handle;
-pub mod cancel_handler;
 mod channel_utils;
 pub mod cleanup_task;
 mod claude_code_agent;
 mod codex_agent;
 
 pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
-pub use cancel_handler::{CancelHandler, AgentCleanupHandler, ClaudeCodeHandler, CodexHandler};
-pub use cleanup_task::{AgentCleaner, CleanupConfig, CleanupCommand, CleanupStats, start_cleanup_task};
-use agent_client_protocol::{
-    Client, PermissionOptionKind, PromptRequest, SessionId,
-};
+use agent_client_protocol::{Client, PermissionOptionKind, PromptRequest, SessionId};
+use crate::{service::push_session_update, model::{SessionNotify, AgentSessionUpdate}};
+use crate::CancelNotificationRequest;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::{service::push_session_update, model::{SessionNotify, AgentSessionUpdate}};
-use crate::CancelNotificationRequest;
-use crate::proxy_agent::agent_stop_handle::{AgentStopHandleArc, AgentStopGuard};
+use crate::proxy_agent::agent_stop_handle::AgentStopHandleArc;
 
 /// ACP协议的连接信息
 pub struct AcpConnectionInfo {

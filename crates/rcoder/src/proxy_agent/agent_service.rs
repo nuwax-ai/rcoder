@@ -90,38 +90,21 @@ impl AcpAgentService for crate::model::AgentType {
     }
 
     fn cancel_agent_service(&self, agent_info: &ProjectAndAgentInfo) {
-        if let Some(stop_handle) = &agent_info.stop_handle {
-            info!(
-                "发送取消信号到[{}] agent服务，项目ID: {}",
-                self.agent_type_name(),
-                agent_info.project_id
-            );
-            stop_handle.cancel();
-        } else {
-            info!(
-                "[{}] agent服务没有停止句柄，项目ID: {}",
-                self.agent_type_name(),
-                agent_info.project_id
-            );
-        }
+        info!(
+            "发送取消信号到[{}] agent服务，项目ID: {}",
+            self.agent_type_name(),
+            agent_info.project_id
+        );
+        agent_info.lifecycle_guard.cancel();
     }
 
     async fn stop_agent_service(&self, agent_info: &ProjectAndAgentInfo) -> Result<()> {
-        if let Some(stop_handle) = &agent_info.stop_handle {
-            info!(
-                "停止[{}] agent服务，项目ID: {}",
-                self.agent_type_name(),
-                agent_info.project_id
-            );
-            stop_handle.stop_async().await?;
-        } else {
-            info!(
-                "[{}] agent服务没有停止句柄，项目ID: {}",
-                self.agent_type_name(),
-                agent_info.project_id
-            );
-        }
-        Ok(())
+        info!(
+            "停止[{}] agent服务，项目ID: {}",
+            self.agent_type_name(),
+            agent_info.project_id
+        );
+        agent_info.lifecycle_guard.stop_async().await
     }
 
     fn is_agent_idle(&self, agent_info: &ProjectAndAgentInfo, timeout: Duration) -> bool {
@@ -138,10 +121,6 @@ impl AcpAgentService for crate::model::AgentType {
     }
 
     fn get_cancellation_token(&self, agent_info: &ProjectAndAgentInfo) -> Option<tokio_util::sync::CancellationToken> {
-        if let Some(stop_handle) = &agent_info.stop_handle {
-            Some(stop_handle.cancellation_token())
-        } else {
-            None
-        }
+        Some(agent_info.lifecycle_guard.cancellation_token().clone())
     }
 }

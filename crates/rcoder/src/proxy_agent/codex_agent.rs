@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 
 use crate::{CancelNotificationRequest, utils::create_mcp_servers_with_context7};
 use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
-use crate::proxy_agent::agent_stop_handle::{AgentStopHandle, CodexAgentStopHandle, AgentStopHandleArc};
+use crate::proxy_agent::agent_stop_handle::AgentLifecycleGuard;
 use anyhow::Result;
 
 use super::{AcpAgentClient, AcpConnectionInfo};
@@ -218,19 +218,20 @@ pub async fn start_codex_acp_agent_service(
 
     let session_id = session_id_rx.await?;
 
-    // 创建停止句柄（绑定 CancellationToken）
-    let stop_handle = Arc::new(AgentStopHandle::Codex(CodexAgentStopHandle::with_cancellation_token(
-        client_conn.clone(),
+    // 创建生命周期守卫
+    let lifecycle_guard = AgentLifecycleGuard::new_codex(
+        chat_prompt.project_id.clone(),
         session_id.clone(),
+        client_conn.clone(),
         io_task_handles,
         channel_task_handles,
         cancel_token.clone(),
-    )));
+    );
 
     Ok(AcpConnectionInfo {
         session_id,
         prompt_tx,
         cancel_tx,
-        stop_handle: Some(stop_handle),
+        stop_handle: Some(Arc::new(lifecycle_guard)),
     })
 }

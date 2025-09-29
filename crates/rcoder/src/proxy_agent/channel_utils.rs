@@ -8,9 +8,13 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::{CancelNotificationRequest, CancelNotificationResponse, model::{SessionNotify, SessionPromptStart, SessionPromptEnd}, service::push_session_update};
-use chrono::Utc;
 use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
+use crate::{
+    CancelNotificationRequest, CancelNotificationResponse,
+    model::{SessionNotify, SessionPromptEnd, SessionPromptStart},
+    service::push_session_update,
+};
+use chrono::Utc;
 
 /// 通用的Cancel消息处理任务（针对实现了Agent trait的类型）
 pub fn spawn_cancel_handler_for_agent<A>(
@@ -41,6 +45,13 @@ where
                     success: true,
                     message: None,
                 });
+            }
+
+            // 🎯 取消完成后恢复agent状态为Idle
+            if let Some(mut agent_info) = PROJECT_AND_AGENT_INFO_MAP.get_mut(&project_id) {
+                agent_info.status = crate::model::AgentStatus::Idle;
+                agent_info.last_activity = Utc::now();
+                debug!("项目[{}]agent状态恢复为Idle（取消请求完成）", project_id);
             }
         }
 

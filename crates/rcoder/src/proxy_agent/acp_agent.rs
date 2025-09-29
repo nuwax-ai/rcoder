@@ -12,7 +12,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 use crate::{
-    model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo}, proxy_agent::agent_service::AcpAgentService, utils::{ContentBuilder, PromptBuilder}, AgentStatus
+    model::{ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo, AgentStatus}, 
+    proxy_agent::agent_service::AcpAgentService, 
+    utils::{ContentBuilder, PromptBuilder}
 };
 use crate::proxy_agent::agent_stop_handle::AgentStopGuard;
 use anyhow::Result;
@@ -122,6 +124,11 @@ pub async fn agent_worker(
                 //创建 agent 服务
                 match start_agent_result {
                     Ok(conn_info) => {
+                        // 获取生命周期守卫，如果没有则报错
+                        let lifecycle_guard = conn_info.stop_handle
+                            .ok_or_else(|| anyhow::anyhow!("Missing lifecycle guard from agent service"))?
+                            .as_ref().clone();
+
                         let project_and_agent_info = ProjectAndAgentInfo {
                             project_id: project_id.clone(),
                             session_id: conn_info.session_id.clone(),
@@ -132,8 +139,7 @@ pub async fn agent_worker(
                             status: AgentStatus::Idle,
                             last_activity: Utc::now(),
                             created_at: Utc::now(),
-                            cleanup_handler: None, // 暂时设置为None，后续可以扩展
-                            stop_handle: conn_info.stop_handle.map(AgentStopGuard::new),
+                            lifecycle_guard,
                             is_stopping: false,
                         };
                         //记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
