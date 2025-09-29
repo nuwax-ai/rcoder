@@ -6,6 +6,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use codex_core::WireApi;
 use codex_core::{ModelProviderInfo, config::ConfigToml};
+use serde::{Serialize, Deserialize};
 use shared_types::ModelProviderConfig;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -19,7 +20,7 @@ pub static CUSTOM_MODEL_PROVIDER_NAME: &str = "custom";
 pub static CUSTOM_MODEL_PROVIDER_API_KEY: &str = "API_KEY";
 
 /// 使用Agent代理的工具类型,都是使用ACP协议包装过的agent代理
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AgentType {
     /// OpenAI Codex 代理
     Codex,

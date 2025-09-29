@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use clap::Parser;
 
 mod config;
 mod handler;
@@ -17,7 +18,7 @@ mod utils;
 use model::*;
 use utils::*;
 
-use config::load_config;
+use config::{CliArgs, load_config_with_args};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
 
@@ -30,8 +31,11 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting rcoder - AI-powered development platform");
 
-    // 加载配置
-    let config = load_config();
+    // 解析命令行参数
+    let cli_args = CliArgs::parse();
+    
+    // 加载配置（包含命令行参数）
+    let config = load_config_with_args(cli_args);
 
     // 创建项目工作目录
     tokio::fs::create_dir_all(&config.projects_dir).await?;

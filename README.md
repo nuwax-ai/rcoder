@@ -65,6 +65,24 @@ cargo run --release
 
 服务将在 `http://localhost:3000` 启动。
 
+### 命令行参数
+
+可以使用命令行参数来覆盖配置：
+
+```bash
+# 查看帮助信息
+cargo run --release -- --help
+
+# 指定端口
+cargo run --release -- --port 8080
+
+# 指定项目目录
+cargo run --release -- --projects-dir /path/to/projects
+
+# 同时指定多个参数
+cargo run --release -- --port 8080 --projects-dir /tmp/projects
+```
+
 ### 使用 Claude Code
 
 确保已安装 Claude Code CLI：
@@ -191,12 +209,59 @@ rcoder/
 
 ## 配置
 
+### 配置优先级
+
+RCoder 支持多种配置方式，优先级从高到低为：
+
+1. **命令行参数** - 最高优先级
+2. **环境变量** - 中等优先级
+3. **配置文件** - 较低优先级
+4. **默认配置** - 最低优先级
+
+### 配置文件
+
+RCoder 支持通过 `config.yml` 文件进行配置。在首次启动时，系统会自动在当前目录下创建默认配置文件。
+
+```yaml
+# rcoder 配置文件
+
+# 默认使用的 AI 代理类型
+# 可选值: "Codex", "Claude" 
+default_agent: Codex
+
+# 项目工作的根目录
+projects_dir: "./project_workspace"
+
+# 服务端口
+port: 3000
+```
+
 ### 环境变量
 
-- `PORT`: 服务器端口 (默认: 3000)
+以下环境变量会覆盖配置文件设置（但会被命令行参数覆盖）：
+
+- `RCODER_PORT`: 服务器端口 (覆盖 config.yml 中的 port 设置)
 - `DATABASE_URL`: 数据库连接字符串 (默认: sqlite:///./rcoder.db)
 - `CLAUDE_CODE_PATH`: Claude Code CLI 路径 (默认: claude)
 - `RUST_LOG`: 日志级别 (默认: info)
+
+### 使用示例
+
+```bash
+# 使用命令行参数设置端口和项目目录
+cargo run -- --port 8080 --projects-dir /tmp/projects
+
+# 使用环境变量覆盖端口
+RCODER_PORT=8080 cargo run
+
+# 同时使用环境变量和命令行参数（命令行参数优先）
+RCODER_PORT=8080 cargo run -- --port 9000
+
+# 使用自定义配置文件
+cp config.yml.example config.yml
+# 编辑 config.yml 并运行
+cargo run
+```
 
 ### 配置文件
 

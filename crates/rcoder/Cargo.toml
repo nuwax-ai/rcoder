@@ -22,6 +22,8 @@ codex-acp-agent = { path = "../codex-acp-agent" }
 codex-core = { git = "https://github.com/openai/codex" , branch = "main" }
 claude-code-agent = { path = "../claude-code-agent" }
 
+
+clap ={workspace = true}
 # ACP Protocol
 agent-client-protocol = { workspace = true }
 async-trait = "0.1"
@@ -38,6 +40,7 @@ tokio-stream = "0.1"
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 
 derive_builder= { workspace = true }
 
