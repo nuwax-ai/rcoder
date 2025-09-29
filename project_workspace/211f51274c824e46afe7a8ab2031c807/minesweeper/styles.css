@@ -1,0 +1,164 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    background-color: #f0f0f0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: 20px;
+}
+
+.container {
+    text-align: center;
+    background-color: white;
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+h1 {
+    color: #333;
+    margin-bottom: 20px;
+}
+
+.game-controls {
+    margin-bottom: 20px;
+}
+
+.game-info {
+    display: flex;
+    justify-content: center;
+    gap: 30px;
+    margin-bottom: 15px;
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.difficulty-buttons {
+    margin-bottom: 15px;
+}
+
+.difficulty-buttons button {
+    margin: 0 5px;
+    padding: 8px 16px;
+    border: none;
+    border-radius: 5px;
+    background-color: #007bff;
+    color: white;
+    cursor: pointer;
+    font-size: 14px;
+    transition: background-color 0.3s;
+}
+
+.difficulty-buttons button:hover {
+    background-color: #0056b3;
+}
+
+#new-game {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 5px;
+    background-color: #28a745;
+    color: white;
+    cursor: pointer;
+    font-size: 16px;
+    transition: background-color 0.3s;
+}
+
+#new-game:hover {
+    background-color: #218838;
+}
+
+.game-board {
+    display: inline-grid;
+    gap: 2px;
+    background-color: #ccc;
+    padding: 5px;
+    border-radius: 5px;
+    margin: 0 auto;
+}
+
+.cell {
+    width: 30px;
+    height: 30px;
+    background-color: #ddd;
+    border: 2px solid #999;
+    cursor: pointer;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-weight: bold;
+    font-size: 14px;
+    transition: all 0.1s;
+}
+
+.cell:hover {
+    background-color: #eee;
+}
+
+.cell.revealed {
+    background-color: #fff;
+    border: 1px solid #ccc;
+    cursor: default;
+}
+
+.cell.mine {
+    background-color: #ff4757;
+    color: white;
+}
+
+.cell.flagged {
+    background-color: #ffa502;
+    color: white;
+}
+
+.cell.flagged::after {
+    content: '🚩';
+}
+
+.cell.mine.revealed::after {
+    content: '💣';
+}
+
+.cell.number-1 { color: #0000ff; }
+.cell.number-2 { color: #008000; }
+.cell.number-3 { color: #ff0000; }
+.cell.number-4 { color: #000080; }
+.cell.number-5 { color: #800000; }
+.cell.number-6 { color: #008080; }
+.cell.number-7 { color: #000000; }
+.cell.number-8 { color: #808080; }
+
+.game-message {
+    margin-top: 20px;
+    font-size: 18px;
+    font-weight: bold;
+    height: 30px;
+}
+
+.game-message.win {
+    color: #28a745;
+}
+
+.game-message.lose {
+    color: #dc3545;
+}
+
+@media (max-width: 600px) {
+    .cell {
+        width: 25px;
+        height: 25px;
+        font-size: 12px;
+    }
+
+    .game-info {
+        flex-direction: column;
+        gap: 10px;
+    }
+}

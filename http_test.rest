@@ -4,7 +4,7 @@
 
 ### 第一步：创建新会话并提取变量
 # @name createSession
-POST http://localhost:3000/chat
+POST http://localhost:8087/chat
 Content-Type: application/json
 
 {
