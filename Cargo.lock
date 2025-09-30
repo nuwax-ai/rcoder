@@ -54,9 +54,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aaa2bd05a2401887945f8bfd70026e90bc3cf96c62ab9eba2779835bf21dc60"
+checksum = "25316dd971dc406682d0ca65035ada204a14f68c592aa4b8a08cf7157f9ef532"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -267,9 +267,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "axum"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98e529aee37b5c8206bb4bf4c44797127566d72f76952c970bd3d1e85de8f4e2"
+checksum = "8a18ed336352031311f4e0b4dd2ff392d4fbb370777c9d18d7fc9d7359f73871"
 dependencies = [
  "axum-core",
  "axum-macros",
@@ -305,9 +305,9 @@ dependencies = [
 
 [[package]]
 name = "axum-core"
-version = "0.5.4"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ac7a6beb1182c7e30253ee75c3e918080bfb83f5a3023bcdf7209d85fd147e6"
+checksum = "59446ce19cd142f8833f856eb31f3eb097812d1479ab224f54d72428ca21ea22"
 dependencies = [
  "bytes 1.10.1",
  "futures-core",
@@ -615,7 +615,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "anyhow",
  "similar",
@@ -627,7 +627,7 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "clap",
  "codex-core",
@@ -639,7 +639,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "anyhow",
  "askama",
@@ -693,7 +693,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "anyhow",
  "clap",
@@ -707,7 +707,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-client"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "anyhow",
  "mcp-types",
@@ -721,7 +721,7 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "chrono",
  "codex-protocol",
@@ -742,7 +742,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "base64 0.22.1",
  "icu_decimal",
@@ -763,7 +763,7 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "anyhow",
  "axum",
@@ -2230,7 +2230,7 @@ checksum = "60302e4db3a61da70c0cb7991976248362f30319e88850c487b9b95bbf059e00"
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#d9dbf4882879577ae8a9d81946994b325e359ed7"
+source = "git+https://github.com/openai/codex?branch=main#5b038135dead11f9aa44ecbe5341a859b5ceec69"
 dependencies = [
  "serde",
  "serde_json",
