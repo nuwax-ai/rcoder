@@ -16,7 +16,7 @@ use crate::{
         AcpAgentClient, AcpConnectionInfo,
         agent_stop_handle::AgentLifecycleGuard,
     },
-    utils::create_mcp_servers_with_context7,
+    utils::create_default_mcp_servers,
 };
 use anyhow::{Context, Result};
 use tokio::task::LocalSet;
@@ -149,7 +149,7 @@ pub async fn start_claude_code_acp_agent_service(
                 }
 
                 // 创建 MCP 服务器配置（不使用 API key）
-                let mcp_servers = create_mcp_servers_with_context7(None);
+                let mcp_servers = create_default_mcp_servers(None);
 
                 if !mcp_servers.is_empty() {
                     info!(

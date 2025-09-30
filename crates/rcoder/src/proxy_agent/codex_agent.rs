@@ -25,7 +25,7 @@ use tokio_util::{
 };
 use tracing::{debug, error, info};
 
-use crate::{CancelNotificationRequest, utils::create_mcp_servers_with_context7};
+use crate::{CancelNotificationRequest, utils::create_default_mcp_servers};
 use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
 use crate::proxy_agent::agent_stop_handle::AgentLifecycleGuard;
 use anyhow::Result;
@@ -155,7 +155,7 @@ pub async fn start_codex_acp_agent_service(
         .await?;
 
     // 创建 MCP 服务器配置（不使用 API key）
-    let mcp_servers = create_mcp_servers_with_context7(None);
+    let mcp_servers = create_default_mcp_servers(None);
 
     if !mcp_servers.is_empty() {
         info!("🔧 配置了 {} 个 MCP 服务器: {}", mcp_servers.len(),
