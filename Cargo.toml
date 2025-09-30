@@ -167,3 +167,4 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 ringbuf = "0.4.8"
 
 
+diffy = { version = "0.4.2" }

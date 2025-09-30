@@ -1,47 +1,103 @@
+use super::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::env;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::sync::{Arc, LazyLock, RwLock};
+use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent, Error, V1};
+use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexConversation, ConversationManager, NewConversation,
     config::Config as CodexConfig,
+    config_types::{McpServerConfig, McpServerTransportConfig},
     protocol::{
-        AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
+        AskForApproval, ErrorEvent, EventMsg, InputItem, McpInvocation, Op, PatchApplyEndEvent,
+        ReviewDecision, SandboxPolicy, StreamErrorEvent, TokenUsage,
     },
 };
+use codex_protocol::mcp_protocol::{AuthMode, ConversationId};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
 use tracing::{info, warn};
+use uuid::Uuid;
 
-mod commands;
+use crate::fs::FsBridge;
+
+use crate::commands::AVAILABLE_COMMANDS;
+
+pub static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> =
+    LazyLock::new(builtin_approval_presets);
+
 // Placeholder for per-session state. Holds the Codex conversation
 // handle, its id (for status/reporting), and bookkeeping for streaming.
 #[derive(Clone)]
-struct SessionState {
-    #[allow(dead_code)]
-    created: SystemTime,
+pub(crate) struct SessionState {
     // Conversation id string for display/logging purposes.
-    conversation_id: String,
-    conversation: Option<Arc<CodexConversation>>,
-    current_approval: AskForApproval,
-    current_sandbox: SandboxPolicy,
-    token_usage: Option<TokenUsage>,
+    pub conversation_id: String,
+    pub fs_session_id: String,
+    pub conversation: Option<Arc<CodexConversation>>,
+    pub current_approval: AskForApproval,
+    pub current_sandbox: SandboxPolicy,
+    pub current_mode: acp::SessionModeId,
+    pub token_usage: Option<TokenUsage>,
+    pub reasoning_sections: Vec<String>,
+    pub current_reasoning_chunk: String,
+}
+
+#[derive(Clone)]
+pub struct SessionModeLookup {
+    inner: Rc<RefCell<HashMap<String, SessionState>>>,
+}
+
+impl SessionModeLookup {
+    pub fn current_mode(&self, session_id: &acp::SessionId) -> Option<acp::SessionModeId> {
+        let sessions = self.inner.borrow();
+        if let Some(state) = sessions.get(session_id.0.as_ref()) {
+            return Some(state.current_mode.clone());
+        }
+
+        sessions
+            .values()
+            .find(|state| state.fs_session_id == session_id.0.as_ref())
+            .map(|state| state.current_mode.clone())
+    }
+
+    pub fn is_read_only(&self, session_id: &acp::SessionId) -> bool {
+        self.current_mode(session_id)
+            .map(|mode| mode.0.as_ref() == "read-only")
+            .unwrap_or(false)
+    }
+
+    pub fn resolve_acp_session_id(&self, session_id: &acp::SessionId) -> Option<acp::SessionId> {
+        let sessions = self.inner.borrow();
+        if sessions.contains_key(session_id.0.as_ref()) {
+            return Some(session_id.clone());
+        }
+
+        sessions.iter().find_map(|(key, state)| {
+            if state.fs_session_id == session_id.0.as_ref() {
+                Some(acp::SessionId(key.clone().into()))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Clone)]
 pub struct CodexAgent {
-    session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
-    sessions: Rc<RefCell<HashMap<String, SessionState>>>,
-    config: CodexConfig,
-    conversation_manager: Arc<ConversationManager>,
-    auth_manager: Arc<RwLock<Arc<AuthManager>>>,
-    available_commands: Vec<acp::AvailableCommand>,
-    client_tx: mpsc::UnboundedSender<ClientOp>,
-    client_capabilities: RefCell<acp::ClientCapabilities>,
+    pub(crate) session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
+    pub(crate) sessions: Rc<RefCell<HashMap<String, SessionState>>>,
+    pub(crate) config: CodexConfig,
+    pub(crate) conversation_manager: Arc<ConversationManager>,
+    pub(crate) auth_manager: Arc<RwLock<Arc<AuthManager>>>,
+    pub(crate) client_tx: mpsc::UnboundedSender<ClientOp>,
+    pub(crate) client_capabilities: RefCell<acp::ClientCapabilities>,
+    pub(crate) fs_bridge: Option<Arc<FsBridge>>,
 }
 
 impl CodexAgent {
@@ -49,6 +105,7 @@ impl CodexAgent {
         session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
         client_tx: mpsc::UnboundedSender<ClientOp>,
         config: CodexConfig,
+        fs_bridge: Option<Arc<FsBridge>>,
     ) -> Self {
         let auth = AuthManager::shared(config.codex_home.clone());
         let conversation_manager = ConversationManager::new(auth.clone());
@@ -59,18 +116,149 @@ impl CodexAgent {
             config,
             conversation_manager: Arc::new(conversation_manager),
             auth_manager: Arc::new(RwLock::new(auth)),
-            available_commands: commands::built_in_commands(),
             client_tx,
             client_capabilities: RefCell::new(Default::default()),
+            fs_bridge,
         }
     }
 
-    pub fn send_message_chunk(
+    pub fn session_mode_lookup(&self) -> SessionModeLookup {
+        SessionModeLookup {
+            inner: self.sessions.clone(),
+        }
+    }
+
+    fn prepare_fs_mcp_server_config(
+        &self,
+        session_id: &str,
+        bridge: &FsBridge,
+    ) -> Result<McpServerConfig, Error> {
+        let exe_path = env::current_exe().map_err(|err| {
+            Error::internal_error().with_data(format!("failed to locate agent binary: {err}"))
+        })?;
+
+        let mut env = HashMap::new();
+        env.insert(
+            "ACP_FS_BRIDGE_ADDR".to_string(),
+            bridge.address().to_string(),
+        );
+        env.insert("ACP_FS_SESSION_ID".to_string(), session_id.to_string());
+
+        Ok(McpServerConfig {
+            transport: McpServerTransportConfig::Stdio {
+                command: exe_path.to_string_lossy().into_owned(),
+                args: vec!["--acp-fs-mcp".to_string()],
+                env: Some(env),
+            },
+            startup_timeout_sec: Some(Duration::from_secs(5)),
+            tool_timeout_sec: Some(Duration::from_secs(30)),
+        })
+    }
+
+    fn build_session_config(&self, session_id: &str) -> Result<CodexConfig, Error> {
+        let mut session_config = self.config.clone();
+        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools.\nFollow this workflow:\n1. Call read_text_file once to capture the current content. Results are paged (≈1000 lines / 50KB) and include a <file-read-info> hint when more remains—follow it with the line/limit parameters instead of re-reading from the top, and reuse that snapshot unless the file actually changed.\n2. Plan edits locally instead of mutating files via shell commands.\n3. Apply replacements with edit_text_file (or multi_edit_text_file for multiple sequential edits); these now write through the bridge immediately and return the unified diff with line metadata.\n4. Use write_text_file only when sending a full file replacement.\n\nAvoid issuing redundant read_text_file calls; rely on the content you already loaded unless an external process has modified the file.\nKeep all planning, tool selection, and step-by-step reasoning inside <thinking> blocks (statements like “I'll apply a focused edit…” belong there) so only final answers appear outside them.";
+
+        if let Some(mut base) = session_config.base_instructions.take() {
+            if !base.contains("acp_fs") {
+                if !base.trim_end().is_empty() {
+                    base.push_str("\n\n");
+                }
+                base.push_str(fs_guidance);
+            }
+            session_config.base_instructions = Some(base);
+        } else {
+            session_config.user_instructions = match session_config.user_instructions.take() {
+                Some(mut existing) => {
+                    if !existing.contains("acp_fs") {
+                        if !existing.trim_end().is_empty() {
+                            existing.push_str("\n\n");
+                        }
+                        existing.push_str(fs_guidance);
+                    }
+                    Some(existing)
+                }
+                None => Some(fs_guidance.to_string()),
+            };
+        }
+
+        if let Some(bridge) = &self.fs_bridge {
+            let server_config = self.prepare_fs_mcp_server_config(session_id, bridge.as_ref())?;
+            session_config
+                .mcp_servers
+                .insert("acp_fs".to_string(), server_config);
+        }
+
+        Ok(session_config)
+    }
+
+    pub(crate) fn modes(config: &CodexConfig) -> Option<acp::SessionModeState> {
+        let current_mode_id = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| {
+                preset.approval == config.approval_policy && preset.sandbox == config.sandbox_policy
+            })
+            .map(|preset| acp::SessionModeId(preset.id.into()))?;
+
+        Some(acp::SessionModeState {
+            current_mode_id,
+            available_modes: APPROVAL_PRESETS
+                .iter()
+                .map(|preset| acp::SessionMode {
+                    id: acp::SessionModeId(preset.id.into()),
+                    name: preset.label.to_owned(),
+                    description: Some(preset.description.to_owned()),
+                    meta: None,
+                })
+                .collect(),
+            meta: None,
+        })
+    }
+
+    pub async fn get_conversation(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Result<Arc<CodexConversation>, Error> {
+        let (conversation_opt, conversation_id_str) = {
+            let sessions = self.sessions.borrow();
+            let state = sessions
+                .get(session_id.0.as_ref())
+                .ok_or_else(|| Error::invalid_params().with_data("session not found"))?;
+            (state.conversation.clone(), state.conversation_id.clone())
+        };
+
+        if let Some(conversation) = conversation_opt {
+            return Ok(conversation);
+        }
+
+        let conversation_id_string = if conversation_id_str.is_empty() {
+            session_id.0.as_ref().to_owned()
+        } else {
+            conversation_id_str
+        };
+
+        let conversation_id = ConversationId::from_string(&conversation_id_string)
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        let conversation = self
+            .conversation_manager
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.with_session_state_mut(session_id, |state| {
+            state.conversation = Some(conversation.clone());
+            state.conversation_id = conversation_id_string;
+        });
+        Ok(conversation)
+    }
+
+    pub async fn send_message_chunk(
         &self,
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
-        tx: Sender<()>,
     ) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
         self.session_update_tx
             .send((
                 acp::SessionNotification {
@@ -81,33 +269,176 @@ impl CodexAgent {
                 tx,
             ))
             .map_err(Error::into_internal_error)?;
-        Ok(())
+        rx.await.map_err(Error::into_internal_error)
+    }
+
+    pub async fn send_thought_chunk(
+        &self,
+        session_id: &acp::SessionId,
+        content: acp::ContentBlock,
+    ) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.session_update_tx
+            .send((
+                acp::SessionNotification {
+                    session_id: session_id.clone(),
+                    update: acp::SessionUpdate::AgentThoughtChunk { content },
+                    meta: None,
+                },
+                tx,
+            ))
+            .map_err(Error::into_internal_error)?;
+        rx.await.map_err(Error::into_internal_error)
     }
 
     fn handle_response_outcome(&self, resp: acp::RequestPermissionResponse) -> ReviewDecision {
         match resp.outcome {
-            acp::RequestPermissionOutcome::Selected { option_id } => {
-                if option_id.0.as_ref() == "approve" {
-                    ReviewDecision::Approved
-                } else if option_id.0.as_ref() == "approve_for_session" {
-                    ReviewDecision::ApprovedForSession
-                } else {
-                    ReviewDecision::Denied
-                }
-            }
+            acp::RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+                "approved" => ReviewDecision::Approved,
+                "approved-for-session" => ReviewDecision::ApprovedForSession,
+                _ => ReviewDecision::Denied,
+            },
             acp::RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
         }
     }
 
-    fn normalize_stream_chunk(chunk: String) -> String {
-        if chunk.trim_end().ends_with("**") && !chunk.ends_with("**\n") {
-            let mut chunk = chunk;
-            chunk.push_str("\n\n");
-            chunk
+    pub fn with_session_state_mut<R, F>(&self, session_id: &acp::SessionId, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut SessionState) -> R,
+    {
+        let mut sessions = self.sessions.borrow_mut();
+        let key: &str = session_id.0.as_ref();
+        sessions.get_mut(key).map(f)
+    }
+
+    fn reset_reasoning_tracking(&self, session_id: &acp::SessionId) {
+        self.with_session_state_mut(session_id, |state| {
+            state.reasoning_sections.clear();
+            state.current_reasoning_chunk.clear();
+        });
+    }
+
+    fn append_reasoning_delta(&self, session_id: &acp::SessionId, delta: &str) {
+        self.with_session_state_mut(session_id, |state| {
+            state.current_reasoning_chunk.push_str(delta);
+        });
+    }
+
+    fn finish_current_reasoning_section(&self, session_id: &acp::SessionId) {
+        self.with_session_state_mut(session_id, |state| {
+            if !state.current_reasoning_chunk.is_empty() {
+                let chunk = std::mem::take(&mut state.current_reasoning_chunk);
+                state.reasoning_sections.push(chunk);
+            }
+        });
+    }
+
+    pub fn take_reasoning_text(&self, session_id: &acp::SessionId) -> Option<String> {
+        self.with_session_state_mut(session_id, |state| {
+            let mut combined = String::new();
+            let mut first = true;
+
+            for section in state.reasoning_sections.drain(..) {
+                if section.trim().is_empty() {
+                    continue;
+                }
+                if !first {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(section.trim_end());
+                first = false;
+            }
+
+            if !state.current_reasoning_chunk.trim().is_empty() {
+                if !first {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(state.current_reasoning_chunk.trim_end());
+            }
+
+            state.current_reasoning_chunk.clear();
+
+            if combined.is_empty() {
+                None
+            } else {
+                Some(combined)
+            }
+        })
+        .flatten()
+    }
+
+    pub fn describe_mcp_tool(
+        &self,
+        invocation: &McpInvocation,
+    ) -> (String, Vec<acp::ToolCallLocation>) {
+        if let Some(metadata) = self.fs_tool_metadata(invocation) {
+            let FsToolMetadata {
+                display_path,
+                location_path,
+                line,
+            } = metadata;
+            let location = acp::ToolCallLocation {
+                path: location_path,
+                line,
+                meta: None,
+            };
+            (
+                format!("{}.{} ({display_path})", invocation.server, invocation.tool),
+                vec![location],
+            )
         } else {
-            chunk
+            (
+                format!("{}.{}", invocation.server, invocation.tool),
+                Vec::new(),
+            )
         }
     }
+
+    pub fn fs_tool_metadata(&self, invocation: &McpInvocation) -> Option<FsToolMetadata> {
+        if invocation.server != "acp_fs" {
+            return None;
+        }
+
+        match invocation.tool.as_str() {
+            "read_text_file" | "write_text_file" | "edit_text_file" => {}
+            _ => return None,
+        }
+
+        let args = invocation.arguments.as_ref()?.as_object()?;
+        let path = args.get("path")?.as_str()?.to_string();
+        let line = args
+            .get("line")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as u32);
+        let display_path = self.display_fs_path(&path);
+        let location_path = PathBuf::from(&path);
+
+        Some(FsToolMetadata {
+            display_path,
+            location_path,
+            line,
+        })
+    }
+
+    pub fn display_fs_path(&self, raw_path: &str) -> String {
+        let path = Path::new(raw_path);
+        if let Ok(relative) = path.strip_prefix(&self.config.cwd) {
+            let rel_display = relative.display().to_string();
+            if !rel_display.is_empty() {
+                return rel_display;
+            }
+        }
+
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| raw_path.to_string())
+    }
+}
+
+struct FsToolMetadata {
+    display_path: String,
+    location_path: PathBuf,
+    line: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -115,6 +446,14 @@ pub enum ClientOp {
     RequestPermission(
         acp::RequestPermissionRequest,
         Sender<Result<acp::RequestPermissionResponse, Error>>,
+    ),
+    ReadTextFile(
+        acp::ReadTextFileRequest,
+        Sender<Result<acp::ReadTextFileResponse, Error>>,
+    ),
+    WriteTextFile(
+        acp::WriteTextFileRequest,
+        Sender<Result<acp::WriteTextFileResponse, Error>>,
     ),
 }
 
@@ -142,7 +481,7 @@ impl Agent for CodexAgent {
         ];
         self.client_capabilities.replace(args.client_capabilities);
         let capacities = acp::AgentCapabilities {
-            load_session: true,
+            load_session: false,
             prompt_capabilities: acp::PromptCapabilities {
                 image: true,
                 audio: false,
@@ -182,6 +521,18 @@ impl Agent for CodexAgent {
                 }
                 Err(Error::auth_required().with_data("Failed to load API key auth"))
             }
+            "chatgpt" => {
+                if let Ok(am) = self.auth_manager.write() {
+                    am.reload();
+                    if let Some(auth) = am.auth()
+                        && auth.mode == AuthMode::ChatGPT
+                    {
+                        return Ok(Default::default());
+                    }
+                }
+                Err(Error::auth_required()
+                    .with_data("ChatGPT login not found. Run `codex login` to connect your plan."))
+            }
             other => {
                 Err(Error::invalid_params().with_data(format!("unknown auth method: {}", other)))
             }
@@ -193,34 +544,47 @@ impl Agent for CodexAgent {
         args: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, Error> {
         info!(?args, "Received new session request");
-        // Start a new Codex conversation for this session
-        let (conversation_id, conversation_opt, session_configured) = match self
+        let fs_session_id = Uuid::new_v4().to_string();
+
+        let modes = Self::modes(&self.config);
+        let current_mode = modes
+            .as_ref()
+            .map(|m| m.current_mode_id.clone())
+            .unwrap_or(acp::SessionModeId("auto".into()));
+
+        let session_config = self.build_session_config(&fs_session_id)?;
+
+        let new_conv = self
             .conversation_manager
-            .new_conversation(self.config.clone())
-            .await
-        {
+            .new_conversation(session_config)
+            .await;
+
+        let (conversation, conversation_id) = match new_conv {
             Ok(NewConversation {
-                conversation_id,
                 conversation,
-                session_configured,
-            }) => (conversation_id, Some(conversation), session_configured),
+                conversation_id,
+                ..
+            }) => (conversation, conversation_id),
             Err(e) => {
                 warn!(error = %e, "Failed to create Codex conversation");
                 return Err(Error::into_internal_error(e));
             }
         };
 
-        let session_id = session_configured.session_id.to_string();
-        // Track the session
+        let acp_session_id = conversation_id.to_string();
+
         self.sessions.borrow_mut().insert(
-            session_id.clone(),
+            acp_session_id.clone(),
             SessionState {
-                created: SystemTime::now(),
-                conversation_id: conversation_id.to_string(),
-                conversation: conversation_opt,
-                current_approval: AskForApproval::OnRequest,
-                current_sandbox: SandboxPolicy::new_workspace_write_policy(),
+                fs_session_id: fs_session_id.clone(),
+                conversation_id: acp_session_id.clone(),
+                conversation: Some(conversation.clone()),
+                current_approval: self.config.approval_policy,
+                current_sandbox: self.config.sandbox_policy.clone(),
+                current_mode: current_mode.clone(),
                 token_usage: None,
+                reasoning_sections: Vec::new(),
+                current_reasoning_chunk: String::new(),
             },
         );
 
@@ -228,7 +592,8 @@ impl Agent for CodexAgent {
         // the session is created. Send it asynchronously to avoid racing
         // with the NewSessionResponse delivery.
         {
-            let available_commands = self.available_commands.clone();
+            let session_id = acp_session_id.clone();
+            let available_commands = AVAILABLE_COMMANDS.to_vec();
             let tx_updates = self.session_update_tx.clone();
             task::spawn_local(async move {
                 let (tx, rx) = oneshot::channel();
@@ -245,31 +610,8 @@ impl Agent for CodexAgent {
         }
 
         Ok(acp::NewSessionResponse {
-            session_id: acp::SessionId(session_configured.session_id.to_string().into()),
-            modes: Some(acp::SessionModeState {
-                current_mode_id: acp::SessionModeId("auto".into()),
-                available_modes: vec![
-                    acp::SessionMode {
-                        id: acp::SessionModeId("read-only".into()),
-                        name: "Read Only".to_string(),
-                        description: Some("Codex can read files and answer questions. Codex requires approval to make edits, run commands, or access network".to_string()),
-                        meta: None,
-                    },
-                    acp::SessionMode {
-                        id: acp::SessionModeId("auto".into()),
-                        name: "Auto".to_string(),
-                        description: Some("Codex can read files, make edits, and run commands in the workspace. Codex requires approval to work outside the workspace or access network".to_string()),
-                        meta: None,
-                    },
-                    acp::SessionMode {
-                        id: acp::SessionModeId("full-access".into()),
-                        name: "Full Access".to_string(),
-                        description: Some("Codex can read files, make edits, and run commands with network access, without approval. Exercise caution".to_string()),
-                        meta: None,
-                    },
-                ],
-                meta: None,
-            }),
+            session_id: acp::SessionId(acp_session_id.clone().into()),
+            modes,
             meta: None,
         })
     }
@@ -290,38 +632,38 @@ impl Agent for CodexAgent {
         args: acp::SetSessionModeRequest,
     ) -> Result<acp::SetSessionModeResponse, Error> {
         info!(?args, "Received set session mode request");
-        // Validate session exists
-        let session_id = args.session_id.0.to_string();
-        if !self.sessions.borrow().contains_key(&session_id) {
-            return Err(Error::invalid_params());
-        }
+        let preset = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| args.mode_id.0.as_ref() == preset.id)
+            .ok_or_else(Error::invalid_params)?;
 
-        // Notify client about the new current mode immediately.
-        let (tx, rx) = oneshot::channel();
-        self.session_update_tx
-            .send((
-                acp::SessionNotification {
-                    session_id: args.session_id.clone(),
-                    update: acp::SessionUpdate::CurrentModeUpdate {
-                        current_mode_id: args.mode_id,
-                    },
-                    meta: None,
-                },
-                tx,
-            ))
-            .map_err(Error::into_internal_error)?;
-        let _ = rx.await;
-        Ok(acp::SetSessionModeResponse { meta: None })
+        self.get_conversation(&args.session_id)
+            .await?
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(preset.approval),
+                sandbox_policy: Some(preset.sandbox.clone()),
+                model: None,
+                effort: None,
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.with_session_state_mut(&args.session_id, |state| {
+            state.current_approval = preset.approval;
+            state.current_sandbox = preset.sandbox.clone();
+            state.current_mode = args.mode_id.clone();
+        });
+
+        Ok(acp::SetSessionModeResponse::default())
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> Result<acp::PromptResponse, Error> {
         info!(?args, "Received prompt request");
-        let session_id = args.session_id.0.to_string();
-        let session = match self.sessions.borrow().get(&session_id) {
-            Some(s) => s.clone(),
-            None => return Err(Error::invalid_params().with_data("Session not found")),
-        };
+        let conversation = self.get_conversation(&args.session_id).await?;
 
+        let mut op_opt = None;
         // Handle slash commands (e.g., "/status") when the first block is text starting with '/'
         if let Some(acp::ContentBlock::Text(t)) = args.prompt.first() {
             let line = t.text.trim();
@@ -329,10 +671,11 @@ impl Agent for CodexAgent {
                 let mut parts = cmd.split_whitespace();
                 let name = parts.next().unwrap_or("").to_lowercase();
                 let rest = parts.collect::<Vec<_>>().join(" ");
-                if self
+                let (op, end) = self
                     .handle_slash_command(&args.session_id, &name, &rest)
-                    .await?
-                {
+                    .await?;
+                op_opt = op;
+                if end {
                     return Ok(acp::PromptResponse {
                         stop_reason: acp::StopReason::EndTurn,
                         meta: None,
@@ -341,20 +684,7 @@ impl Agent for CodexAgent {
             }
         }
 
-        // Ensure we have a Codex conversation for non-slash content.
-        let conversation = match session.conversation.as_ref() {
-            Some(conv) => conv.clone(),
-            None => {
-                let msg = "No Codex backend available. Use slash commands like /status";
-                let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(&args.session_id, msg.into(), tx)?;
-                let _ = rx.await;
-                return Ok(acp::PromptResponse {
-                    stop_reason: acp::StopReason::EndTurn,
-                    meta: None,
-                });
-            }
-        };
+        self.reset_reasoning_tracking(&args.session_id);
 
         // Build user input submission items from prompt content blocks.
         let mut items: Vec<InputItem> = Vec::new();
@@ -388,35 +718,39 @@ impl Agent for CodexAgent {
             }
         }
 
+        let op = match op_opt {
+            Some(op) => op,
+            None => Op::UserInput { items },
+        };
+
         // Enqueue work and then stream corresponding events back as ACP updates.
         let submit_id = conversation
-            .submit(Op::UserInput { items })
+            .submit(op)
             .await
             .map_err(Error::into_internal_error)?;
 
-        let pos = Arc::new(vec![
+        let permission_opts = Arc::new(vec![
             acp::PermissionOption {
-                id: acp::PermissionOptionId("approve_for_session".into()),
-                name: "Approve for Session".into(),
+                id: acp::PermissionOptionId("approved-for-session".into()),
+                name: "Approved Always".into(),
                 kind: acp::PermissionOptionKind::AllowAlways,
                 meta: None,
             },
             acp::PermissionOption {
-                id: acp::PermissionOptionId("approve".into()),
-                name: "Approve".into(),
+                id: acp::PermissionOptionId("approved".into()),
+                name: "Approved".into(),
                 kind: acp::PermissionOptionKind::AllowOnce,
                 meta: None,
             },
             acp::PermissionOption {
-                id: acp::PermissionOptionId("deny".into()),
-                name: "Deny".into(),
+                id: acp::PermissionOptionId("abort".into()),
+                name: "Reject".into(),
                 kind: acp::PermissionOptionKind::RejectOnce,
                 meta: None,
             },
         ]);
 
         let mut saw_message_delta = false;
-        let mut saw_reasoning_delta = false;
         let stop_reason = loop {
             let event = conversation
                 .next_event()
@@ -428,44 +762,70 @@ impl Agent for CodexAgent {
 
             match event.msg {
                 EventMsg::AgentMessageDelta(delta) => {
-                    let chunk = Self::normalize_stream_chunk(delta.delta);
                     saw_message_delta = true;
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, chunk.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.send_message_chunk(&args.session_id, delta.delta.into())
+                        .await?;
                 }
                 EventMsg::AgentMessage(msg) => {
                     if saw_message_delta {
                         continue;
                     }
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, msg.message.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.send_message_chunk(&args.session_id, msg.message.into())
+                        .await?;
                 }
                 EventMsg::AgentReasoningDelta(delta) => {
-                    saw_reasoning_delta = true;
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, delta.delta.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.append_reasoning_delta(&args.session_id, &delta.delta);
+                }
+                EventMsg::AgentReasoningRawContentDelta(delta) => {
+                    self.append_reasoning_delta(&args.session_id, &delta.delta);
                 }
                 EventMsg::AgentReasoning(reason) => {
-                    if saw_reasoning_delta {
-                        continue;
+                    self.finish_current_reasoning_section(&args.session_id);
+                    let aggregated = self.take_reasoning_text(&args.session_id);
+                    let normalized_final = if reason.text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(reason.text)
+                    };
+
+                    let content = match (aggregated, normalized_final) {
+                        (Some(agg), Some(final_text)) => {
+                            if final_text.trim().len() > agg.trim().len() {
+                                Some(final_text)
+                            } else {
+                                Some(agg)
+                            }
+                        }
+                        (Some(agg), None) => Some(agg),
+                        (None, Some(final_text)) => Some(final_text),
+                        (None, None) => None,
+                    };
+                    if let Some(text) = content
+                        && !text.trim().is_empty()
+                    {
+                        self.send_thought_chunk(&args.session_id, text.clone().into())
+                            .await?;
                     }
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, reason.text.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                }
+                EventMsg::AgentReasoningRawContent(reason) => {
+                    self.finish_current_reasoning_section(&args.session_id);
+                    if !reason.text.trim().is_empty() {
+                        self.append_reasoning_delta(&args.session_id, &reason.text);
+                    }
+                }
+                EventMsg::AgentReasoningSectionBreak(_) => {
+                    self.finish_current_reasoning_section(&args.session_id);
                 }
                 // MCP tool calls → ACP ToolCall/ToolCallUpdate
                 EventMsg::McpToolCallBegin(begin) => {
-                    let title = format!("{}.{}", begin.invocation.server, begin.invocation.tool);
+                    let (title, locations) = self.describe_mcp_tool(&begin.invocation);
                     let tool = acp::ToolCall {
                         id: acp::ToolCallId(begin.call_id.clone().into()),
                         title,
                         kind: acp::ToolKind::Fetch,
                         status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
-                        locations: Vec::new(),
+                        locations,
                         raw_input: begin.invocation.arguments,
                         raw_output: None,
                         meta: None,
@@ -491,14 +851,17 @@ impl Agent for CodexAgent {
                         acp::ToolCallStatus::Failed
                     };
                     let raw_output = serde_json::to_value(&end.result).ok();
+                    let (title, locations) = self.describe_mcp_tool(&end.invocation);
                     let update = acp::ToolCallUpdate {
                         id: acp::ToolCallId(end.call_id.clone().into()),
                         fields: acp::ToolCallUpdateFields {
                             status: Some(status),
-                            title: Some(format!(
-                                "{}.{}",
-                                end.invocation.server, end.invocation.tool
-                            )),
+                            title: Some(title),
+                            locations: if locations.is_empty() {
+                                None
+                            } else {
+                                Some(locations)
+                            },
                             raw_output,
                             ..Default::default()
                         },
@@ -521,7 +884,7 @@ impl Agent for CodexAgent {
                 EventMsg::ExecCommandBegin(beg) => {
                     let tool = acp::ToolCall {
                         id: acp::ToolCallId(beg.call_id.clone().into()),
-                        title: beg.command.join(" "),
+                        title: format!("Running {}", beg.command.join(" ")),
                         kind: acp::ToolKind::Execute,
                         status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
@@ -621,7 +984,7 @@ impl Agent for CodexAgent {
                     let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
-                        options: pos.as_ref().clone(),
+                        options: permission_opts.as_ref().clone(),
                         meta: None,
                     };
 
@@ -651,7 +1014,7 @@ impl Agent for CodexAgent {
                             FC::Add { content } => {
                                 contents.push(acp::ToolCallContent::from(acp::Diff {
                                     path: path.clone(),
-                                    old_text: Some("".into()),
+                                    old_text: None,
                                     new_text: content.clone(),
                                     meta: None,
                                 }));
@@ -699,7 +1062,7 @@ impl Agent for CodexAgent {
                     let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
-                        options: pos.as_ref().clone(),
+                        options: permission_opts.as_ref().clone(),
                         meta: None,
                     };
                     let (txp, rxp) = oneshot::channel();
@@ -717,33 +1080,73 @@ impl Agent for CodexAgent {
                             .map_err(Error::into_internal_error)?;
                     }
                 }
+                EventMsg::PatchApplyEnd(event) => {
+                    let raw_output = serde_json::json!(&event);
+                    let PatchApplyEndEvent {
+                        call_id,
+                        stdout: _,
+                        stderr: _,
+                        success,
+                    } = event;
+
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(call_id.into()),
+                        fields: acp::ToolCallUpdateFields {
+                            status: Some(if success {
+                                acp::ToolCallStatus::Completed
+                            } else {
+                                acp::ToolCallStatus::Failed
+                            }),
+                            raw_output: Some(raw_output),
+                            ..Default::default()
+                        },
+                        meta: None,
+                    };
+
+                    let (tx, rx) = oneshot::channel();
+                    self.session_update_tx
+                        .send((
+                            acp::SessionNotification {
+                                session_id: args.session_id.clone(),
+                                update: acp::SessionUpdate::ToolCallUpdate(update),
+                                meta: None,
+                            },
+                            tx,
+                        ))
+                        .map_err(Error::into_internal_error)?;
+                    rx.await.map_err(Error::into_internal_error)?;
+                }
                 EventMsg::TokenCount(tc) => {
-                    if let Some(info) = tc.info
-                        && let Ok(mut map) = self.sessions.try_borrow_mut()
-                        && let Some(state) = map.get_mut(&session_id)
-                    {
-                        state.token_usage = Some(info.total_token_usage.clone());
+                    if let Some(info) = tc.info {
+                        self.with_session_state_mut(&args.session_id, |state| {
+                            state.token_usage = Some(info.total_token_usage.clone());
+                        });
                     }
                 }
                 EventMsg::TaskComplete(_) => {
                     break acp::StopReason::EndTurn;
                 }
-                EventMsg::Error(err) => {
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, err.message.into(), tx)?;
-                    let _ = rx.await;
-                    break acp::StopReason::EndTurn;
+                EventMsg::Error(ErrorEvent { message })
+                | EventMsg::StreamError(StreamErrorEvent { message }) => {
+                    let mut msg = String::from(&message);
+                    msg.push_str("\n\n");
+                    self.send_message_chunk(&args.session_id, msg.into())
+                        .await?;
                 }
-                EventMsg::TurnAborted(_) => {
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, "".into(), tx)?;
-                    let _ = rx.await;
+                EventMsg::ShutdownComplete | EventMsg::TurnAborted(_) => {
                     break acp::StopReason::Cancelled;
                 }
                 // Ignore other events for now.
                 _ => {}
             }
         };
+
+        if let Some(text) = self.take_reasoning_text(&args.session_id)
+            && !text.trim().is_empty()
+        {
+            self.send_thought_chunk(&args.session_id, text.into())
+                .await?;
+        }
 
         Ok(acp::PromptResponse {
             stop_reason,
@@ -753,30 +1156,12 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: acp::CancelNotification) -> Result<(), Error> {
         info!(?args, "Received cancel request");
-        let session_id = args.session_id.0.to_string();
-        // Scope borrow to avoid RefCell issues across await
-        let conv_opt = {
-            let sessions = self.sessions.borrow();
-            sessions
-                .get(&session_id)
-                .and_then(|s| s.conversation.clone())
-        };
-        match conv_opt {
-            Some(conv) => {
-                // Best-effort: we don't need the submission id here.
-                let _ = conv.submit(Op::Interrupt).await;
-                // Remove session from cache after interrupt
-                self.sessions.borrow_mut().remove(&session_id);
-                Ok(())
-            }
-            None => {
-                warn!(
-                    session_id,
-                    "Cancel called but no active Codex conversation found"
-                );
-                Err(Error::invalid_params().with_data("No active Codex backend for cancel"))
-            }
-        }
+        self.get_conversation(&args.session_id)
+            .await?
+            .submit(Op::Interrupt)
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!("failed to send interrupt: {}", e)))?;
+        Ok(())
     }
 
     async fn ext_method(&self, args: acp::ExtRequest) -> Result<acp::ExtResponse, Error> {

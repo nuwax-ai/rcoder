@@ -15,12 +15,14 @@ path = "src/main.rs"
 
 [dependencies]
 # OpenAI dependencies would go here when available
-codex-cli = { git = "https://github.com/openai/codex" , branch = "main"}
-codex-core = { git = "https://github.com/openai/codex" , branch = "main"}
-codex-protocol = { git = "https://github.com/openai/codex" , branch = "main"}
+codex-common = { git = "https://github.com/openai/codex", branch = "main", features = [
+    "cli",
+] }
+codex-core = { git = "https://github.com/openai/codex", branch = "main" }
+codex-protocol = { git = "https://github.com/openai/codex", branch = "main" }
+mcp-types = { git = "https://github.com/openai/codex", branch = "main" }
 
-
-codex-acp = { git = "https://github.com/cola-io/codex-acp" , branch = "main"}
+# codex-acp = { git = "https://github.com/cola-io/codex-acp" , branch = "main"}
 
 agent-client-protocol = { workspace = true }
 acp-adapter = { path = "../acp_adapter" }
@@ -44,6 +46,8 @@ tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 uuid = { workspace = true }
 dirs = { workspace = true }
+diffy={workspace = true}
+
 
 [lints]
 workspace = true

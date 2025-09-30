@@ -1,6 +1,10 @@
-mod agent;
-use agent_client_protocol::{AgentSideConnection, Client};
+pub mod agent;
+pub mod fs;
+pub mod commands;
+
+use agent_client_protocol::{AgentSideConnection, Client, Error};
 use anyhow::Result;
+use std::env;
 use tokio::{io, sync::mpsc, task};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::error;
@@ -11,6 +15,10 @@ use codex_core::config::{Config, ConfigOverrides};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("--acp-fs-mcp") {
+        return fs::run_mcp_server().await;
+    }
+
     // Initialize tracing with env filter (RUST_LOG compatible).
     let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?;
     tracing_subscriber::registry()
@@ -27,7 +35,9 @@ async fn main() -> Result<()> {
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
-        let agent = CodexAgent::with_config(tx, client_tx.clone(), config);
+        let fs_bridge = fs::FsBridge::start(client_tx.clone(), config.cwd.clone()).await?;
+        let agent = CodexAgent::with_config(tx, client_tx, config, Some(fs_bridge));
+        let session_modes = agent.session_mode_lookup();
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);
         });
@@ -50,6 +60,40 @@ async fn main() -> Result<()> {
                             Some(agent::ClientOp::RequestPermission(req, tx)) => {
                                 let res = conn.request_permission(req).await;
                                 let _ = tx.send(res);
+                            }
+                            Some(agent::ClientOp::ReadTextFile(mut req, tx)) => {
+                                match session_modes.resolve_acp_session_id(&req.session_id) {
+                                    Some(resolved_id) => {
+                                        req.session_id = resolved_id;
+                                        let res = conn.read_text_file(req).await;
+                                        let _ = tx.send(res);
+                                    }
+                                    None => {
+                                        let err = Error::invalid_params()
+                                            .with_data("unknown session for read_text_file");
+                                        let _ = tx.send(Err(err));
+                                    }
+                                }
+                            }
+                            Some(agent::ClientOp::WriteTextFile(mut req, tx)) => {
+                                match session_modes.resolve_acp_session_id(&req.session_id) {
+                                    Some(resolved_id) => {
+                                        req.session_id = resolved_id.clone();
+                                        if session_modes.is_read_only(&resolved_id) {
+                                            let err = Error::invalid_params()
+                                                .with_data("write_text_file is disabled while session mode is read-only");
+                                            let _ = tx.send(Err(err));
+                                        } else {
+                                            let res = conn.write_text_file(req).await;
+                                            let _ = tx.send(res);
+                                        }
+                                    }
+                                    None => {
+                                        let err = Error::invalid_params()
+                                            .with_data("unknown session for write_text_file");
+                                        let _ = tx.send(Err(err));
+                                    }
+                                }
                             }
                             None => break,
                         }

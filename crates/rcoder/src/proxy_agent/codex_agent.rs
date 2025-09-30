@@ -9,7 +9,7 @@ use agent_client_protocol::{
 };
 use agent_client_protocol::{Client, LoadSessionRequest}; // bring trait into scope for session_notification
 
-use codex_acp_agent::CodexAgent;
+use codex_acp_agent::{CodexAgent, fs::FsBridge};
 use codex_core::config::{
     Config, ConfigOverrides, ConfigToml, find_codex_home, load_config_as_toml,
 };
@@ -67,8 +67,15 @@ pub async fn start_codex_acp_agent_service(
             anyhow::anyhow!("Failed to load config: {}", e)
         })?;
 
+    // 创建 FsBridge
+    let fs_bridge = FsBridge::start(client_tx.clone(), config.cwd.clone()).await
+        .map_err(|e| {
+            error!("Failed to start FsBridge: {}", e);
+            anyhow::anyhow!("Failed to start FsBridge: {}", e)
+        })?;
+
     // 创建 Agent
-    let agent = CodexAgent::with_config(session_update_tx.clone(), client_tx.clone(), config);
+    let agent = CodexAgent::with_config(session_update_tx.clone(), client_tx.clone(), config, Some(fs_bridge));
 
     // 管道
     let (client_to_agent_rx, client_to_agent_tx) = piper::pipe(1024);

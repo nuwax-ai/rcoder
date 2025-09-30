@@ -101,7 +101,7 @@ where
 
             match client_conn.prompt(req).await {
                 Ok(resp) => {
-                    debug!(
+                    info!(
                         "项目[{}]Prompt发送成功, stop_reason={:?}",
                         project_id, resp.stop_reason
                     );
