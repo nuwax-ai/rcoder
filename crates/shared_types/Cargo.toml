@@ -11,3 +11,5 @@ serde_json.workspace = true
 uuid.workspace = true
 agent-client-protocol.workspace = true
 chrono.workspace = true
+
+utoipa.workspace = true

@@ -1,54 +1,87 @@
 [workspace]
-members = [
-    "crates/*",
-]
-exclude = [
-    "tmp/*",
-]
+members = ["crates/*"]
+exclude = ["tmp/*", "crates/ai-agents"]
 resolver = "2"
+
+[workspace.lints]
+rustdoc.unbroken_backticks = "warn"
+rustdoc.redundant_explicit_links = "warn"
+rust.unused_lifetimes = "warn"
+rust.unused_qualifications = "warn"
+rust.variant_size_differences = "warn"
+rust.allow_leading_underscore = "warn"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Your Name <your.email@example.com>"]
 license = "MIT OR Apache-2.0"
+description = "Rust-based AI agent framework"
+publish = false
 
 [workspace.dependencies]
 # ACP Protocol
 agent-client-protocol = "0.4"
 
+
+clap= { version = "4.5", features = ["derive", "env"] }
+
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 async-trait = "0.1"
+smol = "2.0"
 
 # HTTP server
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+axum = { version = "0.8", features = [
+    "http2",
+    "query",
+    "tracing",
+    "ws",
+    "multipart",
+    "macros",
+] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "chrono",
+    "uuid",
+] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_json_lenient = "0.2"
+schemars = { version = "1.0", features = ["derive"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+env_logger = "0.11"
+
+# OpenTelemetry
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.31"
+axum-tracing-opentelemetry = "0.30"
 
 # UUID
-uuid = { version = "1.0", features = ["serde", "v4"] }
+uuid = { version = "1.0", features = ["serde", "v4", "v7"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
 
 # File system watching
-notify = "6.0"
+notify = "8.2"
 
 # File system utilities
 tokio-fs = "0.1"
@@ -57,9 +90,81 @@ path-clean = "1.0"
 # Utilities
 dashmap = "6.0"
 futures = "0.3"
+futures-util = "0.3"
+itertools = "0.14"
+bytes = "1.10"
+# collections = "0.2"  # 这个包不存在
+
+
+url = "2.5" # 使用 crates.io 版本
+
+
+# Additional utilities
+indoc = "2.0"
+parking_lot = "0.12"
+convert_case = "0.8"
+handlebars = { version = "6.3", features = ["rust-embed"] }
+rust-embed = "8.0"
+zstd = "0.13"
+
+# acp 协议
+agent_client_protocol = "0.4"
+
+# 构建工具
+derive_builder = "0.20"
+
+# Zed 核心功能依赖
+libc = "0.2"
+nix = { version = "0.30.1", features = ["fs", "process", "term"] }
+unindent = "0.2"                                                   # 使用 crates.io 版本
+open = "5.0"                                                       # 使用 crates.io 版本
+git2 = "0.20.1"
+tree-sitter-rust = "0.24"                                          # 使用 crates.io 版本
+
 
 # Additional dependencies for nuwax_parser
 sha2 = "0.10"
 hex = "0.4"
 walkdir = "2.5"
-reqwest = { version = "0.11", features = ["stream"] }
+reqwest = { version = "0.12", features = ["stream"] }
+
+# 项目依赖 - 保留核心功能
+aho-corasick = "1.0"
+# askpass = "0.1"  # 这个包不存在
+base64 = "0.22"
+circular-buffer = "1.2"
+fancy-regex = "0.16"
+fuzzy = "0.0.1"
+globset = "0.4"
+image = "0.25"
+indexmap = "2.11"
+pathdiff = "0.2"
+postage = "0.5"
+regex = "1.0"
+semver = "1.0"
+shellexpand = "3.1"
+shlex = "1.0"
+smallvec = "1.15"
+
+toml = "0.9"
+which = "8.0"
+
+
+# Dev dependencies for testing
+ctor = "0.5"
+pretty_assertions = "1.4"
+tempfile = "3.8"
+rand = "0.9"
+tokio-test = "0.4"
+
+# File system utilities
+dirs = "6.0"
+
+utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+
+
+ringbuf = "0.4.8"
+
+
+diffy = { version = "0.4.2" }

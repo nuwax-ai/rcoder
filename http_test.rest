@@ -1,0 +1,83 @@
+# RCoder HTTP API 测试脚本
+# 用于手动测试 RCoder 服务的所有接口
+# 支持REST Client插件的动态变量功能
+
+### 第一步：创建新会话并提取变量
+# @name createSession
+POST http://localhost:8087/chat
+Content-Type: application/json
+
+{
+  "user_id": "test_user",
+  "prompt": "请帮我创建一个扫雷游戏的前端项目,可以在网页上玩",
+  "agent_type": "codex"
+}
+
+### 提取变量（自动从响应中获取）
+@session_id = {{createSession.response.body.data.session_id}}
+@project_id = {{createSession.response.body.data.project_id}}
+
+###
+### 请使用 context7 工具搜索,测试mcp工具
+# @name testMcp
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "test_mcp",
+  "prompt": "请使用 context7 工具搜索 tokio 库的官方文档信息"
+
+}
+
+
+###
+
+### 第二步：建立SSE连接接收Agent实时消息
+# 使用提取的session_id变量
+GET http://localhost:3000/agent/progress/{{session_id}}
+
+###
+
+### 第三步：测试取消Agent任务 - 使用提取的变量
+# 使用提取的project_id和session_id变量
+POST http://localhost:3000/agent/session/cancel?project_id={{project_id}}&session_id={{session_id}}
+
+###
+
+### 第四步：测试取消不存在的会话
+POST http://localhost:3000/agent/session/cancel?project_id=nonexistent_project&session_id=nonexistent_session
+
+###
+
+### 第五步：测试停止Agent服务 - 使用提取的project_id变量
+# 使用从第一步提取的project_id变量停止Agent服务
+POST http://localhost:3000/agent/stop?project_id={{project_id}}
+
+###
+
+### 第六步：测试停止不存在的Agent服务
+# 测试停止一个不存在的project_id的Agent服务
+POST http://localhost:3000/agent/stop?project_id=nonexistent_project_123
+
+
+###
+
+### 单独测试：创建Agent然后立即停止
+# @name createAndStop
+# 创建一个新的Agent服务用于测试停止功能
+POST http://localhost:3000/chat
+Content-Type: application/json
+
+{
+  "user_id": "test_stop_user",
+  "prompt": "Hello, this is a test for agent stop functionality",
+  "agent_type": "codex"
+}
+
+### 提取测试停止专用的project_id
+@stop_test_project_id = {{createAndStop.response.body.data.project_id}}
+
+### 使用提取的project_id测试停止功能
+POST http://localhost:3000/agent/stop?project_id={{stop_test_project_id}}
+
+###
