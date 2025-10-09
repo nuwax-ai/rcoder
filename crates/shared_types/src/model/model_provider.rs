@@ -15,7 +15,7 @@ pub enum ModelApiProtocol {
 
 impl Default for ModelApiProtocol {
     fn default() -> Self {
-        Self::OpenAI
+        Self::Anthropic
     }
 }
 
