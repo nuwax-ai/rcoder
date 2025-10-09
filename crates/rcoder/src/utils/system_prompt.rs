@@ -28,7 +28,7 @@ impl Default for SystemPromptConfig {
                 • **首选框架**：React、Next.js\n\
                 • **样式方案**：Tailwind CSS\n\
                 • **不推荐**：Vue.js、Angular（我们的工具链不支持）\n\n\
-                **关键项目初始化要求**：在处理空项目目录时，你必须使用 frontend-template MCP 服务的 \
+                **关键项目初始化要求**：在处理空项目目录时,或者你需要初始化项目的时候，你必须使用 frontend-template MCP 服务的 \
                 create-frontend() 方法来建立正确的项目基础。该服务仅支持 React 和 Next.js 架构。\
                 这不是可选的 - 这是任何前端开发工作的强制性先决条件。除非用户明确要求非 React 架构，\
                 否则应主动引导用户选择 React 生态系统来获得最佳开发体验。\
