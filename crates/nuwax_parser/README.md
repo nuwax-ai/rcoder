@@ -434,15 +434,83 @@ cargo test -p nuwax_parser
 cargo run -p nuwax_parser --bin test_nuwax_parser
 ```
 
+## 项目文件读取器 (ProjectReader)
+
+新增的通用项目文件读取器，可将任何项目目录转换为 `ProjectSourceCode` 结构，兼容 lovable-sourcecode.json 格式。
+
+### 基本使用
+
+```rust
+use nuwax_parser::project_op::{ProjectReader, ProjectReadConfig};
+
+// 使用默认配置
+let reader = ProjectReader::new();
+let project = reader.read_project("/path/to/project")?;
+
+// 使用自定义配置
+let config = ProjectReadConfig::new()
+    .max_file_size(512 * 1024) // 512KB
+    .include_hidden_files(true)
+    .add_exclude_extension("tmp");
+
+let reader = ProjectReader::with_config(config);
+let project = reader.read_project("/path/to/project")?;
+```
+
+### 配置选项
+
+```rust
+let config = ProjectReadConfig::new()
+    .add_exclude_file("secret.txt")          // 排除特定文件
+    .add_exclude_dir("temp")                  // 排除特定目录
+    .add_exclude_extension("log")             // 排除特定扩展名
+    .max_file_size(1024 * 1024)              // 最大文件大小 1MB
+    .include_hidden_dirs(false)               // 不包含隐藏目录
+    .include_hidden_files(false);             // 不包含隐藏文件
+```
+
+### 默认排除规则
+
+默认情况下会排除：
+- **文件**: `CLAUDE.md`, `node_modules`, `.git`, `target`, `dist`, `build`
+- **目录**: `.git`, `node_modules`, `target`, `dist`, `build`
+- **扩展名**: `.lock`, `.log`
+- **隐藏文件**: 所有以 `.` 开头的文件和目录
+- **大文件**: 超过 1MB 的文件（内容不会被读取）
+
+### 数据结构
+
+```rust
+let project = ProjectSourceCode::new()
+    .with_files(vec![
+        FileInfo::new("src/main.rs")
+            .with_contents("fn main() { println!(\"Hello\"); }")
+            .binary(false)
+            .size_exceeded(false),
+    ]);
+```
+
+### 示例程序
+
+```bash
+cargo run --example read_project -- /path/to/project
+```
+
 ## 模块结构
 
 ```
 src/
-├── lib.rs          # 主入口，包含文档和重新导出
-├── types.rs        # 所有结构体和枚举定义
-├── parsing.rs      # V0 格式解析逻辑
-├── sync.rs         # 文件同步相关功能
-├── utils.rs        # 工具函数和便捷函数
+├── lib.rs                     # 主入口，包含文档和重新导出
+├── model/                    # 数据结构定义
+│   ├── source_code.rs        # ProjectSourceCode 和 FileInfo
+│   └── mod.rs               # 模块导出
+├── project_op/               # 项目操作模块
+│   ├── project_read.rs       # 项目文件读取器
+│   └── mod.rs               # 模块导出
+├── types.rs                  # V0 格式相关结构体
+├── parsing.rs                # V0 格式解析逻辑
+├── sync.rs                   # 文件同步相关功能
+├── utils.rs                  # 工具函数和便捷函数
 └── bin/
     └── test_nuwax_parser.rs  # 测试工具
 ```
