@@ -260,8 +260,12 @@ pub async fn build_prompt_to_acp_agent(
     prompt: ChatPrompt,
     session_id: SessionId,
 ) -> Result<PromptRequest> {
-    // 构建最终提示词（包含系统提示词和用户输入）
-    let final_prompt = PromptBuilder::new().build(&prompt.prompt);
+    // 构建最终提示词（包含系统提示词、用户输入和数据源信息）
+    let final_prompt = if prompt.data_source_attachments.is_empty() {
+        PromptBuilder::new().build(&prompt.prompt)
+    } else {
+        PromptBuilder::new().build_with_data_sources(&prompt.prompt, &prompt.data_source_attachments)
+    };
 
     // 创建文本内容块
     let text_block = ContentBlock::Text(TextContent {

@@ -2,3 +2,11 @@
 /tmp
 /other
 .idea
+
+logs
+.classpath
+.project
+.settings
+.checkstyle
+.checkstyle_suppressions.xml
+.gitignore

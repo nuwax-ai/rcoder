@@ -13,6 +13,14 @@ path = "src/lib.rs"
 name = "multimedia_chat_example"
 path = "examples/multimedia_chat_example.rs"
 
+[[example]]
+name = "chat_with_data_source_example"
+path = "examples/chat_with_data_source_example.rs"
+
+[[example]]
+name = "chat_with_strings_data_source_example"
+path = "examples/chat_with_strings_data_source_example.rs"
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
@@ -50,7 +58,8 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
+tracing-appender = "0.2"
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }

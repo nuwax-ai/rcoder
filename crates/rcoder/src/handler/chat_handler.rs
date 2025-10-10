@@ -19,9 +19,6 @@ pub struct ChatRequest {
     /// 用户输入的 prompt
     #[schema(example = "帮我写一个 Rust 的 Hello World 程序")]
     pub prompt: String,
-    /// 用户 ID
-    #[schema(example = "user123")]
-    pub user_id: String,
     /// 可选的项目 ID
     #[schema(example = "test_project")]
     pub project_id: Option<String>,
@@ -31,6 +28,10 @@ pub struct ChatRequest {
     /// 可选的附件列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// 数据源附件列表 - 用于AI开发时获取外部数据源信息（如API接口、数据库等）
+    /// 直接传递 JSON 字符串数组，简化使用方式
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_source_attachments: Vec<String>,
     /// 模型配置
     #[schema(
         example = json!({
@@ -162,8 +163,8 @@ pub async fn handle_chat(
     Json(request): Json<ChatRequest>,
 ) -> Result<crate::model::HttpResult<ChatResponse>, crate::model::AppError> {
     info!(
-        "🚀 [DEBUG] handle_chat 开始处理请求: user_id={}, project_id={:?}, session_id={:?}, prompt={}",
-        request.user_id, request.project_id, request.session_id, request.prompt
+        "🚀 [DEBUG] handle_chat 开始处理请求: project_id={:?}, session_id={:?}, prompt={}",
+        request.project_id, request.session_id, request.prompt
     );
 
     // 检查是否需要生成项目ID
@@ -195,9 +196,9 @@ pub async fn handle_chat(
         .session_id(request.session_id.clone())
         .prompt(request.prompt.clone())
         .attachments(request.attachments.clone())
+        .data_source_attachments(request.data_source_attachments.clone())
         .agent_type(agent_type)
         .request_id(request_id.clone())
-        .use_simple_prompt(false) // 固定使用完整系统提示词
         .build()
         .map_err(|e| anyhow::anyhow!(e))?;
 

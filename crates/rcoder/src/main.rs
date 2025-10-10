@@ -1,8 +1,10 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use std::path::Path;
 use tracing::{error, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, fmt};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use clap::Parser;
 
 mod config;
@@ -16,7 +18,6 @@ mod service;
 mod utils;
 
 use model::*;
-use utils::*;
 
 use config::{CliArgs, load_config_with_args};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
@@ -102,23 +103,53 @@ async fn main() -> anyhow::Result<()> {
 
 /// 初始化遥测系统
 fn init_telemetry() -> anyhow::Result<()> {
-    // 简化的 OpenTelemetry 设置，只使用 tracing 和基本的 span 功能
+    // 创建 logs 目录（如果不存在）
+    let logs_dir = Path::new("logs");
+    if !logs_dir.exists() {
+        std::fs::create_dir_all(logs_dir)?;
+        info!("创建日志目录: {:?}", logs_dir);
+    }
+
+    
+    // 设置按天滚动的文件 appender
+    let file_appender = RollingFileAppender::new(
+        Rotation::DAILY,
+        logs_dir,
+        "rcoder"
+    );
+
+    // 创建文件日志层 - JSON 格式，便于后续分析
+    let file_layer = fmt::layer()
+        .json()
+        .with_writer(file_appender)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true);
+
+    // 创建控制台日志层 - 简洁格式
+    let console_layer = fmt::layer()
+        .with_target(false)
+        .with_ansi(true);
+
     // 设置全局文本传播器（用于 trace context 传播）
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    // 初始化 tracing subscriber
+    // 初始化 tracing subscriber，同时输出到文件和控制台
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 "rcoder=debug,tower_http=debug,axum_tracing_opentelemetry=info".into()
             }),
         )
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(file_layer)
+        .with(console_layer)
         .init();
 
     info!("✓ Tracing 初始化成功，支持 trace_id 生成和传播");
+    info!("✓ 日志文件将按天滚动保存在 {:?} 目录", logs_dir);
 
     Ok(())
 }

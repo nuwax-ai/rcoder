@@ -201,6 +201,64 @@ impl PromptBuilder {
     pub fn build(&self, user_prompt: &str) -> String {
         self.config.wrap_user_prompt(user_prompt)
     }
+
+    /// 构建最终提示词（带数据源信息）
+    pub fn build_with_data_sources(&self, user_prompt: &str, data_sources: &[String]) -> String {
+        if data_sources.is_empty() {
+            return self.config.wrap_user_prompt(user_prompt);
+        }
+
+        let data_sources_section = self.format_data_sources(data_sources);
+        let enhanced_user_prompt = format!(
+            "{}\n\n\
+            <DATA_SOURCES>\n\
+            以下是可供使用的数据源信息，包含了后端API接口、数据库连接等外部数据源。\n\
+            在开发前端应用时，你可以使用这些数据源来获取真实数据，例如查询比特币交易额、股票价格、天气信息等。\n\
+            请根据开发需求合理使用这些数据源，并确保前端应用能够正确调用相关接口。\n\n\
+            {}\n\
+            </DATA_SOURCES>",
+            user_prompt, data_sources_section
+        );
+
+        self.config.wrap_user_prompt(&enhanced_user_prompt)
+    }
+
+    /// 格式化数据源信息为可读文本
+    fn format_data_sources(&self, data_sources: &[String]) -> String {
+        if data_sources.is_empty() {
+            return "无数据源".to_string();
+        }
+
+        let mut formatted = String::new();
+
+        for (index, data_source) in data_sources.iter().enumerate() {
+            formatted.push_str(&format!("数据源 {}:\n", index + 1));
+
+            // 尝试解析 JSON 字符串并格式化
+            match serde_json::from_str::<serde_json::Value>(data_source) {
+                Ok(json_value) => {
+                    // 成功解析，格式化为易读的 JSON
+                    match serde_json::to_string_pretty(&json_value) {
+                        Ok(pretty_json) => {
+                            formatted.push_str(&pretty_json);
+                        }
+                        Err(_) => {
+                            // 格式化失败，使用原始字符串
+                            formatted.push_str(data_source);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // 不是有效的 JSON，直接使用原始字符串
+                    formatted.push_str(data_source);
+                }
+            }
+
+            formatted.push('\n');
+        }
+
+        formatted
+    }
 }
 
 impl Default for PromptBuilder {
