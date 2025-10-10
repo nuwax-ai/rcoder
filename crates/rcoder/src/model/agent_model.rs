@@ -29,7 +29,7 @@ pub enum AgentType {
 
 impl Default for AgentType {
     fn default() -> Self {
-        Self::Codex
+        Self::Claude
     }
 }
 
