@@ -22,6 +22,7 @@ use model::*;
 use config::{CliArgs, load_config_with_args};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
+use pingora_proxy::{ProxyServer, ProxyConfig};
 
 // 路由创建函数已移动到 handler 模块
 
@@ -73,13 +74,46 @@ async fn main() -> anyhow::Result<()> {
         });
     });
 
+    // proxy_manager 不需要直接访问 app_state，通过参数传递即可
+
+    // 启动代理服务（如果启用）
+    let (proxy_server, proxy_handle) = if let Some(proxy_config) = &config.proxy_config {
+        info!("启动反向代理服务，监听端口: {}", proxy_config.listen_port);
+
+        let pingora_config = ProxyConfig {
+            listen_port: proxy_config.listen_port,
+            default_backend_port: proxy_config.default_backend_port,
+            backend_host: proxy_config.backend_host.clone(),
+            port_param: proxy_config.port_param.clone(),
+            config_file: None,
+            verbose: false,
+        };
+
+        let proxy_server_instance = ProxyServer::new(pingora_config);
+        let service = proxy_server_instance.service();
+
+        // 添加当前服务作为后端
+        service.add_backend(config.port, "127.0.0.1".to_string()).await;
+
+        // 由于AppState需要Arc<ProxyServer>，但start需要所有权，我们使用一个共享的设计
+        // 让我们改变设计，不在AppState中存储整个ProxyServer
+        let handle = tokio::spawn(async move {
+            if let Err(e) = proxy_server_instance.start().await {
+                error!("代理服务器启动失败: {}", e);
+            }
+        });
+
+        (None, Some(handle)) // 暂时不将proxy_server存储在AppState中
+    } else {
+        (None, None)
+    };
+
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
         local_task_sender,
+        proxy_server,
     });
-
-    // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
     // 创建路由
     let app = router::create_router(state.clone());
@@ -96,7 +130,19 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET  /health - Health check");
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
+    if config.proxy_config.is_some() {
+        info!("代理服务已启用，可通过端口 {} 访问后端服务", config.proxy_config.as_ref().unwrap().listen_port);
+        info!("代理使用方式:");
+        info!("  ?port=3000 - 访问端口 3000 的服务");
+        info!("  /proxy/3000/path - 访问端口 3000 的服务");
+    }
+
     axum::serve(listener, app).await?;
+
+    // 等待代理服务完成
+    if let Some(handle) = proxy_handle {
+        handle.await?;
+    }
 
     Ok(())
 }

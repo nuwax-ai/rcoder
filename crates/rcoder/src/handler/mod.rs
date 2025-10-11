@@ -4,9 +4,11 @@ mod agent_session_notification;
 mod agent_stop_handler;
 mod chat_handler;
 mod health_handler;
+pub mod proxy_handler;
 
 pub use agent_cancel_handler::*;
 pub use agent_session_notification::*;
 pub use agent_stop_handler::*;
 pub use chat_handler::*;
 pub use health_handler::*;
+pub use proxy_handler::*;

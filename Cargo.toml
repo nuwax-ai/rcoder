@@ -43,6 +43,7 @@ axum = { version = "0.8", features = [
 ] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+http = "1.0"
 
 # Database
 sqlx = { version = "0.8", features = [
@@ -168,3 +169,6 @@ ringbuf = "0.4.8"
 
 
 diffy = { version = "0.4.2" }
+
+pingora = { version = "0.6", features = ["lb"] }
+structopt = "0.3"

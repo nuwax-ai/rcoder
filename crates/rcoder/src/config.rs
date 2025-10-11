@@ -17,10 +17,22 @@ pub struct CliArgs {
     /// 服务端口
     #[arg(short, long, help = "服务端口")]
     pub port: Option<u16>,
-    
+
     /// 项目工作目录
     #[arg(short = 'd', long, help = "项目工作的根目录")]
     pub projects_dir: Option<PathBuf>,
+
+    /// 启用反向代理
+    #[arg(long, help = "启用基于端口的反向代理")]
+    pub enable_proxy: bool,
+
+    /// 代理监听端口
+    #[arg(long, help = "代理服务监听端口")]
+    pub proxy_port: Option<u16>,
+
+    /// 默认后端端口
+    #[arg(long, help = "默认后端服务端口")]
+    pub default_backend_port: Option<u16>,
 }
 
 /// 应用配置
@@ -32,6 +44,21 @@ pub struct AppConfig {
     pub projects_dir: PathBuf,
     /// 服务端口
     pub port: u16,
+    /// 代理配置
+    pub proxy_config: Option<ProxyConfig>,
+}
+
+/// 代理配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// 代理监听端口
+    pub listen_port: u16,
+    /// 默认后端端口
+    pub default_backend_port: u16,
+    /// 后端服务主机
+    pub backend_host: String,
+    /// URL 中端口参数的名称
+    pub port_param: String,
 }
 
 /// 配置文件路径
@@ -43,6 +70,18 @@ impl Default for AppConfig {
             default_agent: AgentType::Codex,
             projects_dir: PathBuf::from("./project_workspace"),
             port: 3000,
+            proxy_config: None,
+        }
+    }
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            listen_port: 8080,
+            default_backend_port: 3000,
+            backend_host: "127.0.0.1".to_string(),
+            port_param: "port".to_string(),
         }
     }
 }
@@ -84,20 +123,32 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         }
     }
 
-    // 4. 命令行参数覆盖配置（优先级最高）
+    // 4. 处理代理配置
+    if cli_args.enable_proxy {
+        let proxy_config = ProxyConfig {
+            listen_port: cli_args.proxy_port.unwrap_or(8080),
+            default_backend_port: cli_args.default_backend_port.unwrap_or(config.port),
+            backend_host: "127.0.0.1".to_string(),
+            port_param: "port".to_string(),
+        };
+        config.proxy_config = Some(proxy_config);
+        info!("启用反向代理，监听端口: {}", config.proxy_config.as_ref().unwrap().listen_port);
+    }
+
+    // 5. 命令行参数覆盖配置（优先级最高）
     if let Some(port) = cli_args.port {
         config.port = port;
         info!("使用命令行参数设置端口: {}", port);
     }
-    
+
     if let Some(projects_dir) = cli_args.projects_dir {
         config.projects_dir = projects_dir.clone();
         info!("使用命令行参数设置项目目录: {:?}", projects_dir);
     }
 
     info!(
-        "最终配置: port={}, projects_dir={:?}, default_agent={:?}",
-        config.port, config.projects_dir, config.default_agent
+        "最终配置: port={}, projects_dir={:?}, default_agent={:?}, proxy_enabled={}",
+        config.port, config.projects_dir, config.default_agent, config.proxy_config.is_some()
     );
 
     config
@@ -108,6 +159,9 @@ pub fn load_config() -> AppConfig {
     let cli_args = CliArgs {
         port: None,
         projects_dir: None,
+        enable_proxy: false,
+        proxy_port: None,
+        default_backend_port: None,
     };
     load_config_with_args(cli_args)
 }

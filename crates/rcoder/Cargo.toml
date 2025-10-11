@@ -29,6 +29,7 @@ acp-adapter = { path = "../acp_adapter" }
 codex-acp-agent = { path = "../codex-acp-agent" }
 codex-core = { git = "https://github.com/openai/codex" , branch = "main" }
 claude-code-agent = { path = "../claude-code-agent" }
+pingora-proxy = { path = "../pingora-proxy" }
 
 
 clap ={workspace = true}

@@ -24,7 +24,7 @@ pub struct SessionInfo {
 }
 
 /// 应用状态
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AppState {
     /// 活跃的会话映射, project_id -> SessionInfo
     pub sessions: Arc<DashMap<String, SessionInfo>>,
@@ -33,6 +33,9 @@ pub struct AppState {
 
     /// 本地任务发送器
     pub local_task_sender: mpsc::UnboundedSender<LocalSetAgentRequest>,
+
+    /// 反向代理服务器
+    pub proxy_server: Option<Arc<pingora_proxy::ProxyServer>>,
 }
 
 /// 创建 Axum 路由
@@ -48,8 +51,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/agent/stop", post(handler::agent_stop))
         .with_state(state.clone());
 
+    // 代理路由
+    let proxy_routes = Router::new()
+        .route("/proxy", axum::routing::any(handler::proxy_handler::handle_proxy_request))
+        .with_state(state.clone());
+
     Router::new()
         .merge(api_routes)
+        .merge(proxy_routes)
         .merge(create_swagger_ui())
 }
 

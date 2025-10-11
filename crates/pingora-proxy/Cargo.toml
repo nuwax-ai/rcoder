@@ -1,0 +1,20 @@
+[package]
+name = "pingora-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pingora_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+# Core dependencies
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+anyhow = "1.0"
+structopt = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+axum = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+thiserror = "1.0"

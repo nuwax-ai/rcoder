@@ -14,7 +14,9 @@
       "Bash(./target/release/rcoder:*)",
       "Bash(cargo run:*)",
       "Bash(rustc:*)",
-      "Bash(./test_vec_string)"
+      "Bash(./test_vec_string)",
+      "Bash(chmod:*)",
+      "Bash(cargo test:*)"
     ],
     "deny": [],
     "ask": []
