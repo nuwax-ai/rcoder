@@ -26,7 +26,7 @@ impl FromStr for ModelApiProtocol {
         match s.to_lowercase().as_str() {
             "anthropic" => Ok(ModelApiProtocol::Anthropic),
             "openai" => Ok(ModelApiProtocol::OpenAI),
-            _ => Ok(ModelApiProtocol::OpenAI), // 未知协议默认为 OpenAI
+            _ => Ok(ModelApiProtocol::Anthropic), // 未知协议默认为 Anthropic
         }
     }
 }
@@ -34,8 +34,8 @@ impl FromStr for ModelApiProtocol {
 impl ToString for ModelApiProtocol {
     fn to_string(&self) -> String {
         match self {
-            ModelApiProtocol::Anthropic => "anthropic".to_string(),
-            ModelApiProtocol::OpenAI => "openai".to_string(),
+            ModelApiProtocol::Anthropic => "Anthropic".to_string(),
+            ModelApiProtocol::OpenAI => "Openai".to_string(),
         }
     }
 }
