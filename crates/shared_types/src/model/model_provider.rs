@@ -1,7 +1,6 @@
-
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use std::str::FromStr;
+use utoipa::ToSchema;
 
 /// 模型接口协议类型
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]

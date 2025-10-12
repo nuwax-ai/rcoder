@@ -1,15 +1,16 @@
+use crate::{
+    CodexAgent,
+    agent::{APPROVAL_PRESETS, ClientOp, SessionState},
+};
 
-
-use crate::{agent::{APPROVAL_PRESETS, SessionState, ClientOp}, CodexAgent};
-
-use agent_client_protocol::{self as acp,AvailableCommand, AvailableCommandInput, Error};
+use agent_client_protocol::{self as acp, AvailableCommand, AvailableCommandInput, Error};
 use codex_core::{
     NewConversation,
-    protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy, InputItem},
+    protocol::{AskForApproval, InputItem, Op, ReviewRequest, SandboxPolicy},
 };
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::{fs, io};
-use std::path::{Path, PathBuf};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 

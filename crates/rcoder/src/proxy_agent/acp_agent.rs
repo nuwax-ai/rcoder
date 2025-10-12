@@ -264,7 +264,8 @@ pub async fn build_prompt_to_acp_agent(
     let final_prompt = if prompt.data_source_attachments.is_empty() {
         PromptBuilder::new().build(&prompt.prompt)
     } else {
-        PromptBuilder::new().build_with_data_sources(&prompt.prompt, &prompt.data_source_attachments)
+        PromptBuilder::new()
+            .build_with_data_sources(&prompt.prompt, &prompt.data_source_attachments)
     };
 
     // 创建文本内容块

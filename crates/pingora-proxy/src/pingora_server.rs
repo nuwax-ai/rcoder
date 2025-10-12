@@ -2,10 +2,10 @@
 //!
 //! 提供基于 Pingora 库的完整反向代理服务器启动功能，支持 HTTP/1.1 和 HTTP/2。
 
-use std::sync::Arc;
 use anyhow::Result;
-use tracing::{info, error};
+use std::sync::Arc;
 use tokio::sync::oneshot;
+use tracing::{error, info};
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -55,7 +55,7 @@ impl PingoraServerManager {
             &my_server.configuration,
             ProxyServiceWrapper {
                 inner: proxy_service.clone(),
-            }
+            },
         );
 
         // 添加 TCP 监听器
@@ -114,9 +114,7 @@ struct ProxyServiceWrapper {
 impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
     type CTX = ();
 
-    fn new_ctx(&self) -> Self::CTX {
-        
-    }
+    fn new_ctx(&self) -> Self::CTX {}
 
     async fn upstream_peer(
         &self,
@@ -134,7 +132,9 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
         // 委托给内部的 PortProxy 实现
-        self.inner.upstream_request_filter(session, upstream_request, ctx).await
+        self.inner
+            .upstream_request_filter(session, upstream_request, ctx)
+            .await
     }
 
     async fn response_filter(
@@ -144,7 +144,9 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
         // 委托给内部的 PortProxy 实现
-        self.inner.response_filter(session, upstream_response, ctx).await
+        self.inner
+            .response_filter(session, upstream_response, ctx)
+            .await
     }
 }
 

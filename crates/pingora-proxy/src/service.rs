@@ -40,9 +40,7 @@ pub struct PortProxy {
 impl ProxyHttp for PortProxy {
     type CTX = ();
 
-    fn new_ctx(&self) -> Self::CTX {
-        
-    }
+    fn new_ctx(&self) -> Self::CTX {}
 
     /// 过滤请求头和路径
     async fn upstream_request_filter(

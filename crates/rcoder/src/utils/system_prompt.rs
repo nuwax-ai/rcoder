@@ -1,4 +1,3 @@
-
 /// 系统提示词配置
 #[derive(Debug, Clone)]
 pub struct SystemPromptConfig {

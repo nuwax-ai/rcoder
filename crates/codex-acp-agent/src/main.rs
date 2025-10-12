@@ -1,6 +1,6 @@
 pub mod agent;
-pub mod fs;
 pub mod commands;
+pub mod fs;
 
 use agent_client_protocol::{AgentSideConnection, Client, Error};
 use anyhow::Result;

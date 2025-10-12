@@ -1,10 +1,10 @@
-use axum::{extract::{Query, Path}};
+use axum::extract::{Path, Query};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, debug};
-use utoipa::{ToSchema, IntoParams};
+use tracing::{debug, info, warn};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    model::{AppError, HttpResult, AgentStatusResponse},
+    model::{AgentStatusResponse, AppError, HttpResult},
     proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
 };
 
@@ -91,7 +91,7 @@ pub async fn agent_stop(
     Query(query): Query<StopAgentQuery>,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     let project_id = query.project_id.trim();
-    
+
     if project_id.is_empty() {
         return Ok(HttpResult::error(
             "INVALID_PARAMS",
@@ -99,14 +99,11 @@ pub async fn agent_stop(
         ));
     }
 
-    info!(
-        "🛑 收到停止Agent服务请求: project_id={}",
-        project_id
-    );
+    info!("🛑 收到停止Agent服务请求: project_id={}", project_id);
 
     // 检查Agent是否存在
     let agent_exists = PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id);
-    
+
     if !agent_exists {
         warn!("❌ 未找到Agent服务: project_id={}", project_id);
         return Ok(HttpResult::error(
@@ -122,7 +119,7 @@ pub async fn agent_stop(
 
     // 🎯 基于RAII原则：从MAP中移除，AgentLifecycleGuard自动清理资源
     let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
-    
+
     match removed {
         Some(_) => {
             info!(
@@ -130,7 +127,7 @@ pub async fn agent_stop(
                 project_id, session_id
             );
             debug!("AgentLifecycleGuard将自动清理所有相关资源");
-            
+
             Ok(HttpResult::success(StopAgentResponse {
                 success: true,
                 project_id: project_id.to_string(),
@@ -143,7 +140,10 @@ pub async fn agent_stop(
             warn!("⚠️ Agent服务已不存在: project_id={}", project_id);
             Ok(HttpResult::error(
                 "AGENT_ALREADY_STOPPED",
-                &format!("Agent service for project_id {} was already stopped", project_id),
+                &format!(
+                    "Agent service for project_id {} was already stopped",
+                    project_id
+                ),
             ))
         }
     }
@@ -205,7 +205,7 @@ pub async fn agent_status(
     Path(project_id): Path<String>,
 ) -> Result<HttpResult<AgentStatusResponse>, AppError> {
     let project_id = project_id.trim();
-    
+
     if project_id.is_empty() {
         return Ok(HttpResult::error(
             "INVALID_PARAMS",
@@ -213,10 +213,7 @@ pub async fn agent_status(
         ));
     }
 
-    info!(
-        "📊 收到查询Agent状态请求: project_id={}",
-        project_id
-    );
+    info!("📊 收到查询Agent状态请求: project_id={}", project_id);
 
     // 从MAP中获取Agent信息
     if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
@@ -227,7 +224,10 @@ pub async fn agent_status(
             status: agent_info.status,
             last_activity: agent_info.last_activity,
             created_at: agent_info.created_at,
-            model_provider: agent_info.model_provider.as_ref().map(|mp| mp.to_safe_info()),
+            model_provider: agent_info
+                .model_provider
+                .as_ref()
+                .map(|mp| mp.to_safe_info()),
         };
 
         info!(

@@ -1,17 +1,13 @@
 use std::sync::Arc;
 
 use agent_client_protocol::{
-    Agent, AgentSideConnection, ClientCapabilities,
-    ClientSideConnection,
-    InitializeRequest, NewSessionRequest,
-    PromptRequest, SessionId, V1 as VERSION,
+    Agent, AgentSideConnection, ClientCapabilities, ClientSideConnection, InitializeRequest,
+    NewSessionRequest, PromptRequest, SessionId, V1 as VERSION,
 };
 use agent_client_protocol::{Client, LoadSessionRequest}; // bring trait into scope for session_notification
 
 use codex_acp_agent::{CodexAgent, fs::FsBridge};
-use codex_core::config::{
-    Config, ConfigOverrides,
-};
+use codex_core::config::{Config, ConfigOverrides};
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol_config_types::SandboxMode;
 use shared_types::ModelProviderConfig;
@@ -19,9 +15,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-use crate::{CancelNotificationRequest, utils::create_default_mcp_servers};
 use crate::model::{AgentType, ChatPrompt};
 use crate::proxy_agent::agent_stop_handle::AgentLifecycleGuard;
+use crate::{CancelNotificationRequest, utils::create_default_mcp_servers};
 use anyhow::Result;
 
 use super::{AcpAgentClient, AcpConnectionInfo};
@@ -62,14 +58,20 @@ pub async fn start_codex_acp_agent_service(
         })?;
 
     // 创建 FsBridge
-    let fs_bridge = FsBridge::start(client_tx.clone(), config.cwd.clone()).await
+    let fs_bridge = FsBridge::start(client_tx.clone(), config.cwd.clone())
+        .await
         .map_err(|e| {
             error!("Failed to start FsBridge: {}", e);
             anyhow::anyhow!("Failed to start FsBridge: {}", e)
         })?;
 
     // 创建 Agent
-    let agent = CodexAgent::with_config(session_update_tx.clone(), client_tx.clone(), config, Some(fs_bridge));
+    let agent = CodexAgent::with_config(
+        session_update_tx.clone(),
+        client_tx.clone(),
+        config,
+        Some(fs_bridge),
+    );
 
     // 管道
     let (client_to_agent_rx, client_to_agent_tx) = piper::pipe(1024);
@@ -159,11 +161,18 @@ pub async fn start_codex_acp_agent_service(
     let mcp_servers = create_default_mcp_servers(None);
 
     if !mcp_servers.is_empty() {
-        info!("🔧 配置了 {} 个 MCP 服务器: {}", mcp_servers.len(),
-            mcp_servers.iter().map(|s| match s {
-                agent_client_protocol::McpServer::Stdio { name, .. } => name.clone(),
-                _ => "unknown".to_string(),
-            }).collect::<Vec<_>>().join(", "));
+        info!(
+            "🔧 配置了 {} 个 MCP 服务器: {}",
+            mcp_servers.len(),
+            mcp_servers
+                .iter()
+                .map(|s| match s {
+                    agent_client_protocol::McpServer::Stdio { name, .. } => name.clone(),
+                    _ => "unknown".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     } else {
         info!("📝 未配置 MCP 服务器");
     }

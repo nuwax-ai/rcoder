@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use derive_builder::Builder;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder, ToSchema)]
@@ -28,8 +28,6 @@ pub struct FileInfo {
     #[builder(default)]
     pub contents: Option<String>,
 }
-
-
 
 impl FileInfo {
     pub fn new(name: impl Into<String>) -> Self {

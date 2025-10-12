@@ -16,7 +16,7 @@ use crate::model::AgentType;
 use agent_client_protocol::{ClientSideConnection, SessionId};
 
 /// Agent生命周期守卫
-/// 
+///
 /// 遵循RAII原则，当守卫被drop时自动清理agent资源
 pub struct AgentLifecycleGuard {
     inner: Arc<AgentLifecycleInner>,
@@ -110,9 +110,7 @@ impl AgentLifecycleGuard {
 
         info!(
             "[{}] 开始优雅停止agent: {} (session: {})",
-            agent_name,
-            self.inner.project_id,
-            self.inner.session_id.0
+            agent_name, self.inner.project_id, self.inner.session_id.0
         );
 
         // 1. 发送取消信号
@@ -126,8 +124,7 @@ impl AgentLifecycleGuard {
 
         info!(
             "[{}] agent优雅停止完成: {}",
-            agent_name,
-            self.inner.project_id
+            agent_name, self.inner.project_id
         );
 
         Ok(())
@@ -136,7 +133,10 @@ impl AgentLifecycleGuard {
     /// 强制清理资源
     async fn force_cleanup(&self) -> Result<()> {
         match &self.inner.resources {
-            AgentResources::Claude { child_process, stderr_task } => {
+            AgentResources::Claude {
+                child_process,
+                stderr_task,
+            } => {
                 // 停止stderr任务
                 if let Some(task) = stderr_task.lock().await.take() {
                     task.abort();
@@ -144,11 +144,16 @@ impl AgentLifecycleGuard {
 
                 // 终止子进程
                 if let Some(mut child) = child_process.lock().await.take()
-                    && let Err(e) = child.kill().await {
-                        warn!("终止Claude子进程失败: {}", e);
-                    }
+                    && let Err(e) = child.kill().await
+                {
+                    warn!("终止Claude子进程失败: {}", e);
+                }
             }
-            AgentResources::Codex { io_tasks, channel_tasks, .. } => {
+            AgentResources::Codex {
+                io_tasks,
+                channel_tasks,
+                ..
+            } => {
                 // 取消所有任务
                 for task in io_tasks.lock().await.drain(..) {
                     task.abort();
@@ -170,9 +175,7 @@ impl AgentLifecycleGuard {
             };
             info!(
                 "[{}] 发送取消信号: {} (session: {})",
-                agent_name,
-                self.inner.project_id,
-                self.inner.session_id.0
+                agent_name, self.inner.project_id, self.inner.session_id.0
             );
             self.inner.cancel_token.cancel();
         }
@@ -210,45 +213,48 @@ impl Clone for AgentLifecycleGuard {
 impl Drop for AgentLifecycleGuard {
     fn drop(&mut self) {
         // 只有最后一个引用被drop时才执行清理
-        if Arc::strong_count(&self.inner) == 1
-            && !self.inner.stopped.load(Ordering::SeqCst) {
-                let agent_name = match self.inner.agent_type {
-                    AgentType::Claude => "Claude",
-                    AgentType::Codex => "Codex",
-                };
-                info!(
-                    "[{}] AgentLifecycleGuard被drop，清理资源: {}",
-                    agent_name,
-                    self.inner.project_id
-                );
+        if Arc::strong_count(&self.inner) == 1 && !self.inner.stopped.load(Ordering::SeqCst) {
+            let agent_name = match self.inner.agent_type {
+                AgentType::Claude => "Claude",
+                AgentType::Codex => "Codex",
+            };
+            info!(
+                "[{}] AgentLifecycleGuard被drop，清理资源: {}",
+                agent_name, self.inner.project_id
+            );
 
-                // 发送取消信号
-                self.inner.cancel_token.cancel();
+            // 发送取消信号
+            self.inner.cancel_token.cancel();
 
-                // 同步清理关键资源
-                match &self.inner.resources {
-                    AgentResources::Claude { child_process, .. } => {
-                        if let Ok(mut child_guard) = child_process.try_lock()
-                            && let Some(mut child) = child_guard.take() {
-                                let _ = child.start_kill();
-                            }
+            // 同步清理关键资源
+            match &self.inner.resources {
+                AgentResources::Claude { child_process, .. } => {
+                    if let Ok(mut child_guard) = child_process.try_lock()
+                        && let Some(mut child) = child_guard.take()
+                    {
+                        let _ = child.start_kill();
                     }
-                    AgentResources::Codex { io_tasks, channel_tasks, .. } => {
-                        if let Ok(mut tasks) = io_tasks.try_lock() {
-                            for task in tasks.drain(..) {
-                                task.abort();
-                            }
+                }
+                AgentResources::Codex {
+                    io_tasks,
+                    channel_tasks,
+                    ..
+                } => {
+                    if let Ok(mut tasks) = io_tasks.try_lock() {
+                        for task in tasks.drain(..) {
+                            task.abort();
                         }
-                        if let Ok(mut tasks) = channel_tasks.try_lock() {
-                            for task in tasks.drain(..) {
-                                task.abort();
-                            }
+                    }
+                    if let Ok(mut tasks) = channel_tasks.try_lock() {
+                        for task in tasks.drain(..) {
+                            task.abort();
                         }
                     }
                 }
-
-                self.inner.stopped.store(true, Ordering::SeqCst);
             }
+
+            self.inner.stopped.store(true, Ordering::SeqCst);
+        }
     }
 }
 

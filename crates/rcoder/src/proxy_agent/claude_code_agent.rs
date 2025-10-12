@@ -12,10 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     AgentType, CancelNotificationRequest,
     model::ChatPrompt,
-    proxy_agent::{
-        AcpAgentClient, AcpConnectionInfo,
-        agent_stop_handle::AgentLifecycleGuard,
-    },
+    proxy_agent::{AcpAgentClient, AcpConnectionInfo, agent_stop_handle::AgentLifecycleGuard},
     utils::create_default_mcp_servers,
 };
 use anyhow::{Context, Result};

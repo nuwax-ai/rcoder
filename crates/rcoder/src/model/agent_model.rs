@@ -6,14 +6,14 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use codex_core::WireApi;
 use codex_core::{ModelProviderInfo, config::ConfigToml};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use shared_types::{ModelProviderConfig, ModelProviderSafeInfo};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
+use crate::proxy_agent::agent_stop_handle::AgentLifecycleGuard;
 use codex_core::config::{find_codex_home, load_config_as_toml};
-use crate::proxy_agent::agent_stop_handle::{AgentLifecycleGuard};
 
 pub static CUSTOM_MODEL_PROVIDER_NAME: &str = "custom";
 
@@ -248,7 +248,7 @@ pub enum AgentStatus {
 }
 
 /// 项目id与 Agent 服务池，一个项目对应一个 Agent 服务
-/// 
+///
 /// Clone trait 是必需的，因为 DashMap::insert() 要求值类型实现 Clone
 #[derive(Clone)]
 pub struct ProjectAndAgentInfo {

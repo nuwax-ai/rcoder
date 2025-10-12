@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use shared_types::ModelProviderConfig;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
-use uuid::Uuid;
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 use crate::proxy_agent::*;
 use crate::{model::*, router::AppState};
@@ -182,12 +182,14 @@ pub async fn handle_chat(
     // 获取项目工作目录
     let project_workspace = get_project_workspace(&project_id).await?;
 
-
     // 根据模型提供商配置自动选择 agent 类型
     let agent_type = AgentType::from_model_provider(request.model_provider.as_ref());
 
     // 确定或生成 request_id
-    let request_id = request.request_id.clone().unwrap_or_else(generate_request_id);
+    let request_id = request
+        .request_id
+        .clone()
+        .unwrap_or_else(generate_request_id);
 
     let chat_prompt = ChatPromptBuilder::default()
         .project_id(project_id.clone())
@@ -201,7 +203,8 @@ pub async fn handle_chat(
         .build()
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let (local_task_request, chat_prompt_rx) = LocalSetAgentRequest::new(chat_prompt, request.model_provider.clone());
+    let (local_task_request, chat_prompt_rx) =
+        LocalSetAgentRequest::new(chat_prompt, request.model_provider.clone());
     state.local_task_sender.send(local_task_request)?;
 
     let result = match chat_prompt_rx.await {

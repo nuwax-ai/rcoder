@@ -1,16 +1,16 @@
 use agent_client_protocol::{SessionUpdate, StopReason};
-use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// 消息主类型枚举
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionMessageType {
-    SessionPromptStart,    // 用户发送 prompt 开始
-    SessionPromptEnd,      // Agent 执行结束
-    AgentSessionUpdate,    // Agent 执行过程中的更新
-    Heartbeat,            // SSE 连接心跳消息
+    SessionPromptStart, // 用户发送 prompt 开始
+    SessionPromptEnd,   // Agent 执行结束
+    AgentSessionUpdate, // Agent 执行过程中的更新
+    Heartbeat,          // SSE 连接心跳消息
 }
 
 /// 统一的会话消息结构
@@ -172,31 +172,34 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
         SessionUpdate::UserMessageChunk { content } => {
             ("user_message_chunk".to_string(), serde_json::json!(content))
         }
-        SessionUpdate::AgentMessageChunk { content } => {
-            ("agent_message_chunk".to_string(), serde_json::json!(content))
-        }
-        SessionUpdate::AgentThoughtChunk { content } => {
-            ("agent_thought_chunk".to_string(), serde_json::json!(content))
-        }
+        SessionUpdate::AgentMessageChunk { content } => (
+            "agent_message_chunk".to_string(),
+            serde_json::json!(content),
+        ),
+        SessionUpdate::AgentThoughtChunk { content } => (
+            "agent_thought_chunk".to_string(),
+            serde_json::json!(content),
+        ),
         SessionUpdate::ToolCall(tool_call) => {
             ("tool_call".to_string(), serde_json::json!(tool_call))
         }
-        SessionUpdate::ToolCallUpdate(tool_call_update) => {
-            ("tool_call_update".to_string(), serde_json::json!(tool_call_update))
-        }
-        SessionUpdate::Plan(plan) => {
-            ("plan".to_string(), serde_json::json!(plan))
-        }
-        SessionUpdate::AvailableCommandsUpdate { available_commands } => {
-            ("available_commands_update".to_string(), serde_json::json!({
+        SessionUpdate::ToolCallUpdate(tool_call_update) => (
+            "tool_call_update".to_string(),
+            serde_json::json!(tool_call_update),
+        ),
+        SessionUpdate::Plan(plan) => ("plan".to_string(), serde_json::json!(plan)),
+        SessionUpdate::AvailableCommandsUpdate { available_commands } => (
+            "available_commands_update".to_string(),
+            serde_json::json!({
                 "available_commands": available_commands
-            }))
-        }
-        SessionUpdate::CurrentModeUpdate { current_mode_id } => {
-            ("current_mode_update".to_string(), serde_json::json!({
+            }),
+        ),
+        SessionUpdate::CurrentModeUpdate { current_mode_id } => (
+            "current_mode_update".to_string(),
+            serde_json::json!({
                 "current_mode_id": current_mode_id
-            }))
-        }
+            }),
+        ),
     }
 }
 
@@ -215,7 +218,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(matches!(unified.message_type, SessionMessageType::SessionPromptStart), true);
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptStart),
+            true
+        );
         assert_eq!(unified.sub_type, "prompt_start");
         assert_eq!(unified.data, serde_json::json!({}));
     }
@@ -230,7 +236,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(matches!(unified.message_type, SessionMessageType::SessionPromptStart), true);
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptStart),
+            true
+        );
         assert_eq!(unified.sub_type, "prompt_start");
         assert_eq!(unified.data["request_id"], "req_123456789");
     }
@@ -247,11 +256,20 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(matches!(unified.message_type, SessionMessageType::SessionPromptEnd), true);
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
+            true
+        );
         assert_eq!(unified.sub_type, "end_turn");
         assert_eq!(unified.data["reason"], "EndTurn");
         assert_eq!(unified.data["description"], "正常结束");
-        assert!(!unified.data.as_object().unwrap().contains_key("error_message"));
+        assert!(
+            !unified
+                .data
+                .as_object()
+                .unwrap()
+                .contains_key("error_message")
+        );
         assert!(!unified.data.as_object().unwrap().contains_key("request_id"));
     }
 
@@ -267,7 +285,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(matches!(unified.message_type, SessionMessageType::SessionPromptEnd), true);
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
+            true
+        );
         assert_eq!(unified.sub_type, "cancelled");
         assert_eq!(unified.data["reason"], "Cancelled");
         assert_eq!(unified.data["description"], "用户取消");
@@ -287,7 +308,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(matches!(unified.message_type, SessionMessageType::SessionPromptEnd), true);
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
+            true
+        );
         assert_eq!(unified.sub_type, "cancelled");
         assert_eq!(unified.data["reason"], "Cancelled");
         assert_eq!(unified.data["description"], "用户取消");
@@ -313,7 +337,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(matches!(unified.message_type, SessionMessageType::AgentSessionUpdate), true);
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::AgentSessionUpdate),
+            true
+        );
         assert_eq!(unified.sub_type, "agent_message_chunk");
         assert_eq!(unified.data["type"], "text");
         assert_eq!(unified.data["text"], "Hello, World!");
@@ -338,7 +365,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(matches!(unified.message_type, SessionMessageType::AgentSessionUpdate), true);
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::AgentSessionUpdate),
+            true
+        );
         assert_eq!(unified.sub_type, "agent_message_chunk");
         assert_eq!(unified.data["type"], "text");
         assert_eq!(unified.data["text"], "Hello, World!");

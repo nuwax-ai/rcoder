@@ -4,9 +4,7 @@
 //! 与 OpenAI API 的集成。
 
 pub mod agent;
-pub mod fs;
 pub mod commands;
+pub mod fs;
 
-
-pub use agent::{CodexAgent, ClientOp};
-
+pub use agent::{ClientOp, CodexAgent};

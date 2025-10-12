@@ -13,14 +13,6 @@ path = "src/lib.rs"
 name = "multimedia_chat_example"
 path = "examples/multimedia_chat_example.rs"
 
-[[example]]
-name = "chat_with_data_source_example"
-path = "examples/chat_with_data_source_example.rs"
-
-[[example]]
-name = "chat_with_strings_data_source_example"
-path = "examples/chat_with_strings_data_source_example.rs"
-
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }

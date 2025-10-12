@@ -3,16 +3,13 @@ use serde_json;
 
 #[test]
 fn test_source_code_serialization() {
-    let source_code = ProjectSourceCode::new()
-        .with_files(vec![
-            FileInfo::new("test.txt")
-                .with_contents("Hello, World!")
-                .binary(false)
-                .size_exceeded(false),
-            FileInfo::new("image.png")
-                .binary(true)
-                .size_exceeded(false),
-        ]);
+    let source_code = ProjectSourceCode::new().with_files(vec![
+        FileInfo::new("test.txt")
+            .with_contents("Hello, World!")
+            .binary(false)
+            .size_exceeded(false),
+        FileInfo::new("image.png").binary(true).size_exceeded(false),
+    ]);
 
     let json = serde_json::to_string(&source_code).unwrap();
     println!("Serialized: {}", json);
@@ -20,7 +17,10 @@ fn test_source_code_serialization() {
     let deserialized: ProjectSourceCode = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.files.len(), 2);
     assert_eq!(deserialized.files[0].name, "test.txt");
-    assert_eq!(deserialized.files[0].contents, Some("Hello, World!".to_string()));
+    assert_eq!(
+        deserialized.files[0].contents,
+        Some("Hello, World!".to_string())
+    );
     assert_eq!(deserialized.files[1].name, "image.png");
     assert!(deserialized.files[1].binary);
     assert_eq!(deserialized.files[1].contents, None);
@@ -34,7 +34,10 @@ fn test_file_info_builder() {
         .size_exceeded(false);
 
     assert_eq!(file.name, "README.md");
-    assert_eq!(file.contents, Some("# Project Documentation\n\nThis is a README file.".to_string()));
+    assert_eq!(
+        file.contents,
+        Some("# Project Documentation\n\nThis is a README file.".to_string())
+    );
     assert!(!file.binary);
     assert!(!file.size_exceeded);
 }

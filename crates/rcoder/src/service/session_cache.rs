@@ -2,17 +2,15 @@
 //!
 //! 使用LazyLock初始化全局DashMap，按session_id分组缓存统一会话消息到ringbuf循环缓冲区
 
-use std::sync::LazyLock;
-use dashmap::DashMap;
-use ringbuf::HeapRb;
-use ringbuf::traits::{RingBuffer, Consumer, Observer};
 use crate::{SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
+use dashmap::DashMap;
+use ringbuf::HeapRb;
+use ringbuf::traits::{Consumer, Observer, RingBuffer};
+use std::sync::LazyLock;
 
 /// 全局Session缓存 - LazyLock初始化
-pub static SESSION_CACHE: LazyLock<DashMap<String, SessionData>> = LazyLock::new(|| {
-    DashMap::new()
-});
+pub static SESSION_CACHE: LazyLock<DashMap<String, SessionData>> = LazyLock::new(|| DashMap::new());
 
 /// Session数据包装
 pub struct SessionData {
@@ -74,8 +72,8 @@ pub fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()
 
     // 添加调试日志
     tracing::debug!(
-        "📥 推送消息到缓存: session_id={}, message_type={:?}, sub_type={}", 
-        session_id, 
+        "📥 推送消息到缓存: session_id={}, message_type={:?}, sub_type={}",
+        session_id,
         unified_message.message_type,
         unified_message.sub_type
     );
@@ -85,15 +83,14 @@ pub fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()
         .or_insert_with(|| SessionData::new(1000));
 
     session_data.add_message(unified_message);
-    
+
     // 记录缓存中的消息数量
     let message_count = session_data.message_count();
-    tracing::debug!("📊 缓存消息数量: session_id={}, count={}", session_id, message_count);
-    
+    tracing::debug!(
+        "📊 缓存消息数量: session_id={}, count={}",
+        session_id,
+        message_count
+    );
+
     Ok(())
 }
-
-
-
-
-

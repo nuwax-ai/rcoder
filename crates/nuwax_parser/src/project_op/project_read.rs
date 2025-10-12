@@ -122,7 +122,10 @@ impl ProjectReader {
     }
 
     /// 扫描目录
-    pub fn read_project(&self, project_path: impl AsRef<Path>) -> Result<ProjectSourceCode,ProjectReadError> {
+    pub fn read_project(
+        &self,
+        project_path: impl AsRef<Path>,
+    ) -> Result<ProjectSourceCode, ProjectReadError> {
         let project_path = project_path.as_ref();
 
         if !project_path.exists() {
@@ -229,10 +232,7 @@ impl ProjectReader {
 
         let metadata = fs::metadata(file_path)?;
         let file_size = metadata.len();
-        let size_exceeded = self
-            .config
-            .max_file_size
-            .is_some_and(|max| file_size > max);
+        let size_exceeded = self.config.max_file_size.is_some_and(|max| file_size > max);
 
         let binary = self.is_binary_file(file_path, file_name)?;
 

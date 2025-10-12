@@ -11,8 +11,8 @@ use utoipa::{IntoParams, ToSchema};
 
 use agent_client_protocol::{CancelNotification, SessionId};
 
-use crate::{model::AppError, model::HttpResult};
 use crate::{CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP};
+use crate::{model::AppError, model::HttpResult};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]

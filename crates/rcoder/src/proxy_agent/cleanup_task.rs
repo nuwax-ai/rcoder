@@ -5,10 +5,10 @@
 //! 2. 从PROJECT_AND_AGENT_INFO_MAP中移除
 //! 3. AgentLifecycleGuard自动drop并清理资源
 
-use std::time::Duration;
-use chrono::{DateTime, Utc};
-use tracing::{debug, info, warn};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
 use crate::model::AgentStatus;
 use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
@@ -63,9 +63,14 @@ impl AgentCleaner {
     }
 
     /// 检查agent是否闲置超时
-    fn is_agent_idle_timeout(&self, last_activity: DateTime<Utc>, current_time: DateTime<Utc>) -> bool {
+    fn is_agent_idle_timeout(
+        &self,
+        last_activity: DateTime<Utc>,
+        current_time: DateTime<Utc>,
+    ) -> bool {
         let duration = current_time.signed_duration_since(last_activity);
-        duration.num_seconds() > 0 && duration.num_seconds() as u64 > self.config.idle_timeout.as_secs()
+        duration.num_seconds() > 0
+            && duration.num_seconds() as u64 > self.config.idle_timeout.as_secs()
     }
 
     /// 执行一次清理操作 - 基于RAII的简化版
@@ -78,8 +83,11 @@ impl AgentCleaner {
 
         // 统计当前活动的agent数量
         let total_agents = PROJECT_AND_AGENT_INFO_MAP.len();
-        
-        info!("开始清理闲置agent，当前时间: {}，当前活动agent数量: {}", current_time, total_agents);
+
+        info!(
+            "开始清理闲置agent，当前时间: {}，当前活动agent数量: {}",
+            current_time, total_agents
+        );
 
         // 收集需要清理的agent ID
         let mut agents_to_remove = Vec::new();
@@ -90,18 +98,19 @@ impl AgentCleaner {
 
             // 只清理Idle状态的agent，避免中断正在执行的任务
             if agent_info.status == AgentStatus::Idle
-                && self.is_agent_idle_timeout(agent_info.last_activity, current_time) {
-                    let idle_duration = (current_time - agent_info.last_activity).num_seconds();
-                    info!(
-                        "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒, 创建时间: {}",
-                        project_id,
-                        agent_info.status,
-                        agent_info.last_activity,
-                        idle_duration,
-                        agent_info.created_at
-                    );
-                    agents_to_remove.push(project_id.clone());
-                }
+                && self.is_agent_idle_timeout(agent_info.last_activity, current_time)
+            {
+                let idle_duration = (current_time - agent_info.last_activity).num_seconds();
+                info!(
+                    "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒, 创建时间: {}",
+                    project_id,
+                    agent_info.status,
+                    agent_info.last_activity,
+                    idle_duration,
+                    agent_info.created_at
+                );
+                agents_to_remove.push(project_id.clone());
+            }
         }
 
         // 执行清理 - RAII版：直接从 MAP 中移除，AgentLifecycleGuard 会自动清理
@@ -127,7 +136,7 @@ impl AgentCleaner {
 
         // 清理完成后的agent数量统计
         let remaining_agents = PROJECT_AND_AGENT_INFO_MAP.len();
-        
+
         info!(
             "清理完成: 总共={}, 成功={}, 失败={}, 清理前agent数量={}, 清理后agent数量={}",
             cleaned_count, success_count, failed_count, total_agents, remaining_agents
@@ -150,9 +159,12 @@ impl AgentCleaner {
         if PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
             // 直接从MAP中移除，触发AgentLifecycleGuard的Drop
             let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
-            
+
             if removed.is_some() {
-                info!("Agent已从MAP中移除，AgentLifecycleGuard将自动清理资源: {}", project_id);
+                info!(
+                    "Agent已从MAP中移除，AgentLifecycleGuard将自动清理资源: {}",
+                    project_id
+                );
             } else {
                 warn!("尝试移除agent但未找到: {}", project_id);
             }
@@ -168,10 +180,10 @@ impl AgentCleaner {
         info!("清理任务已启动，配置: {:?}", self.config);
 
         let mut interval = tokio::time::interval(self.config.cleanup_interval);
-        
+
         loop {
             interval.tick().await;
-            
+
             match self.cleanup_idle_agents().await {
                 Ok(stats) => debug!("定时清理完成: {:?}", stats),
                 Err(e) => warn!("定时清理失败: {}", e),

@@ -1,11 +1,11 @@
+use clap::Parser;
 use dashmap::DashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use std::path::Path;
 use tracing::{error, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, fmt};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use clap::Parser;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
 mod handler;
@@ -20,9 +20,9 @@ mod utils;
 use model::*;
 
 use config::{CliArgs, load_config_with_args};
+use pingora_proxy::{PingoraServerManager, ProxyConfig};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
-use pingora_proxy::{ProxyConfig, PingoraServerManager};
 
 // 路由创建函数已移动到 handler 模块
 
@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 解析命令行参数
     let cli_args = CliArgs::parse();
-    
+
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
@@ -78,7 +78,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 启动代理服务（如果启用）
     let proxy_handle = if let Some(proxy_config) = &config.proxy_config {
-        info!("启动 Pingora 反向代理服务，监听端口: {}", proxy_config.listen_port);
+        info!(
+            "启动 Pingora 反向代理服务，监听端口: {}",
+            proxy_config.listen_port
+        );
         info!("代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
 
         let pingora_config = ProxyConfig {
@@ -128,13 +131,25 @@ async fn main() -> anyhow::Result<()> {
 
     if config.proxy_config.is_some() {
         info!("🚀 Pingora 反向代理服务已启用");
-        info!("📡 监听端口: {}", config.proxy_config.as_ref().unwrap().listen_port);
+        info!(
+            "📡 监听端口: {}",
+            config.proxy_config.as_ref().unwrap().listen_port
+        );
         info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
         info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
         info!("💡 示例:");
-        info!("   http://localhost:{}/proxy/3000/ → http://127.0.0.1:3000/", config.proxy_config.as_ref().unwrap().listen_port);
-        info!("   http://localhost:{}/proxy/8080/api/users → http://127.0.0.1:8080/api/users", config.proxy_config.as_ref().unwrap().listen_port);
-        info!("   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (动态发现)", config.proxy_config.as_ref().unwrap().listen_port);
+        info!(
+            "   http://localhost:{}/proxy/3000/ → http://127.0.0.1:3000/",
+            config.proxy_config.as_ref().unwrap().listen_port
+        );
+        info!(
+            "   http://localhost:{}/proxy/8080/api/users → http://127.0.0.1:8080/api/users",
+            config.proxy_config.as_ref().unwrap().listen_port
+        );
+        info!(
+            "   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (动态发现)",
+            config.proxy_config.as_ref().unwrap().listen_port
+        );
     }
 
     axum::serve(listener, app).await?;
@@ -156,13 +171,8 @@ fn init_telemetry() -> anyhow::Result<()> {
         info!("创建日志目录: {:?}", logs_dir);
     }
 
-    
     // 设置按天滚动的文件 appender
-    let file_appender = RollingFileAppender::new(
-        Rotation::DAILY,
-        logs_dir,
-        "rcoder"
-    );
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, logs_dir, "rcoder");
 
     // 创建文件日志层 - JSON 格式，便于后续分析
     let file_layer = fmt::layer()
@@ -174,9 +184,7 @@ fn init_telemetry() -> anyhow::Result<()> {
         .with_thread_names(true);
 
     // 创建控制台日志层 - 简洁格式
-    let console_layer = fmt::layer()
-        .with_target(false)
-        .with_ansi(true);
+    let console_layer = fmt::layer().with_target(false).with_ansi(true);
 
     // 设置全局文本传播器（用于 trace context 传播）
     opentelemetry::global::set_text_map_propagator(

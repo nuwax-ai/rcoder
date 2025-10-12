@@ -7,13 +7,13 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use chrono::Utc;
 use serde::Deserialize;
 use std::sync::Arc;
-use chrono::Utc;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::router::AppState;
 use super::proxy_api::*;
+use crate::router::AppState;
 
 /// Pingora 代理状态查询
 #[utoipa::path(
@@ -57,8 +57,10 @@ pub async fn proxy_status(
         },
     };
 
-    info!("查询代理状态: 端口 {}, 默认后端: {}:{}",
-          status.listen_port, status.default_backend_host, status.default_backend_port);
+    info!(
+        "查询代理状态: 端口 {}, 默认后端: {}:{}",
+        status.listen_port, status.default_backend_host, status.default_backend_port
+    );
 
     Ok(Json(status))
 }
@@ -119,9 +121,11 @@ pub async fn proxy_stats(
         ],
     };
 
-    info!("查询代理统计: 总请求 {}, 成功率 {:.2}%",
-          stats.total_requests,
-          (stats.successful_requests as f64 / stats.total_requests as f64) * 100.0);
+    info!(
+        "查询代理统计: 总请求 {}, 成功率 {:.2}%",
+        stats.total_requests,
+        (stats.successful_requests as f64 / stats.total_requests as f64) * 100.0
+    );
 
     Ok(Json(stats))
 }
@@ -169,8 +173,10 @@ pub async fn proxy_config(
         },
     };
 
-    info!("查询代理配置: 监听端口 {}, 默认后端: {}:{}",
-          config.listen_port, config.default_backend_host, config.default_backend_port);
+    info!(
+        "查询代理配置: 监听端口 {}, 默认后端: {}:{}",
+        config.listen_port, config.default_backend_host, config.default_backend_port
+    );
 
     Ok(Json(config))
 }
@@ -269,7 +275,10 @@ async fn proxy_request_handler(
         },
     };
 
-    info!("代理请求文档演示: 端口 {}, 路径 {}, 目标: {}", port, target_path, target_url);
+    info!(
+        "代理请求文档演示: 端口 {}, 路径 {}, 目标: {}",
+        port, target_path, target_url
+    );
 
     Ok(Json(response))
 }
@@ -306,17 +315,22 @@ pub async fn proxy_with_query_params(
     Query(params): Query<ProxyQueryParams>,
 ) -> Result<Json<ProxyResponse>, (StatusCode, Json<ProxyErrorResponse>)> {
     let port = params.port.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, Json(ProxyErrorResponse {
-            error: "MISSING_PORT".to_string(),
-            message: "缺少端口号参数".to_string(),
-            target_port: 0,
-            timestamp: Utc::now().to_rfc3339(),
-        }))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ProxyErrorResponse {
+                error: "MISSING_PORT".to_string(),
+                message: "缺少端口号参数".to_string(),
+                target_port: 0,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        )
     })?;
 
     let path = params.path.clone().unwrap_or_else(|| "/".to_string());
-    warn!("使用了过时的查询参数代理方式，建议使用路径格式: /proxy/{}/{}",
-          port, path);
+    warn!(
+        "使用了过时的查询参数代理方式，建议使用路径格式: /proxy/{}/{}",
+        port, path
+    );
 
     proxy_request_handler(state, port, Some(path)).await
 }

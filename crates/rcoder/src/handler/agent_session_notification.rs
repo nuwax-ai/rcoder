@@ -8,11 +8,11 @@ use axum::{
     response::sse::{Event, Sse},
 };
 use futures::stream::{self, Stream};
+use serde::Deserialize;
 use serde::Serialize;
 use std::{convert::Infallible, time::Duration};
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 use tracing::{debug, info};
-use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 
 /// SSE 事件响应结构
@@ -361,7 +361,7 @@ pub async fn agent_session_notification(
 
     // 定义心跳间隔（30秒）
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-    
+
     // 创建SSE流
     let stream = stream::unfold(
         (params.session_id.clone(), Instant::now()),
@@ -371,45 +371,57 @@ pub async fn agent_session_notification(
                 loop {
                     // 获取一条消息
                     if let Some(session_data) = SESSION_CACHE.get(&session_id_clone)
-                        && let Some(msg) = session_data.pop_message() {
-                            debug!("📤 发送消息到 session: {}, type: {:?}", session_id_clone, msg.message_type);
+                        && let Some(msg) = session_data.pop_message()
+                    {
+                        debug!(
+                            "📤 发送消息到 session: {}, type: {:?}",
+                            session_id_clone, msg.message_type
+                        );
 
-                            // 根据消息类型动态设置事件名称
-                            let event_name = match msg.message_type {
-                                crate::model::SessionMessageType::SessionPromptStart => {
-                                    info!("📝 发送 prompt_start 消息到 session: {}", session_id_clone);
-                                    "prompt_start"
-                                },
-                                crate::model::SessionMessageType::SessionPromptEnd => {
-                                    info!("🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}", 
-                                          session_id_clone, msg.data.get("reason"));
-                                    "prompt_end"
-                                },
-                                crate::model::SessionMessageType::AgentSessionUpdate => {
-                                    debug!("🔄 发送 {} 消息到 session: {}", msg.sub_type, session_id_clone);
-                                    &msg.sub_type
-                                },
-                                crate::model::SessionMessageType::Heartbeat => "heartbeat",
-                            };
+                        // 根据消息类型动态设置事件名称
+                        let event_name = match msg.message_type {
+                            crate::model::SessionMessageType::SessionPromptStart => {
+                                info!("📝 发送 prompt_start 消息到 session: {}", session_id_clone);
+                                "prompt_start"
+                            }
+                            crate::model::SessionMessageType::SessionPromptEnd => {
+                                info!(
+                                    "🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}",
+                                    session_id_clone,
+                                    msg.data.get("reason")
+                                );
+                                "prompt_end"
+                            }
+                            crate::model::SessionMessageType::AgentSessionUpdate => {
+                                debug!(
+                                    "🔄 发送 {} 消息到 session: {}",
+                                    msg.sub_type, session_id_clone
+                                );
+                                &msg.sub_type
+                            }
+                            crate::model::SessionMessageType::Heartbeat => "heartbeat",
+                        };
 
-                            let event: Event = Event::default()
-                                .event(event_name)
-                                .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
+                        let event: Event = Event::default()
+                            .event(event_name)
+                            .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
 
-                            // 更新最后消息时间并返回事件
-                            return Some((Ok(event), (session_id_clone, Instant::now())));
-                        }
+                        // 更新最后消息时间并返回事件
+                        return Some((Ok(event), (session_id_clone, Instant::now())));
+                    }
 
                     // 检查是否需要发送心跳消息
                     let elapsed = last_message_time.elapsed();
                     if elapsed >= HEARTBEAT_INTERVAL {
                         debug!("💓 发送心跳消息到 session: {}", session_id_clone);
-                        
+
                         // 创建心跳消息
-                        let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id_clone.clone());
-                        let event: Event = Event::default()
-                            .event("heartbeat")
-                            .data(serde_json::to_string(&heartbeat_msg).unwrap_or_else(|_| "{}".to_string()));
+                        let heartbeat_msg =
+                            UnifiedSessionMessage::heartbeat(session_id_clone.clone());
+                        let event: Event = Event::default().event("heartbeat").data(
+                            serde_json::to_string(&heartbeat_msg)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        );
 
                         // 更新最后消息时间并返回心跳事件
                         return Some((Ok(event), (session_id_clone, Instant::now())));

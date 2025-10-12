@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_client_protocol::{McpServer, EnvVariable};
+use agent_client_protocol::{EnvVariable, McpServer};
 
 /// 创建 context7 MCP 服务器配置
 ///
@@ -73,7 +73,7 @@ pub fn create_default_mcp_servers(_api_key: Option<&str>) -> Vec<McpServer> {
 
     // 添加 context7 MCP 服务器
     servers.push(create_context7_mcp_server(None));
-    
+
     // 添加前端模板 MCP 服务器
     servers.push(create_xagi_frontend_mcp_server());
 
@@ -149,7 +149,9 @@ mod tests {
 
         // 验证 frontend-template 服务器
         match &servers[1] {
-            McpServer::Stdio { name, args, env, .. } => {
+            McpServer::Stdio {
+                name, args, env, ..
+            } => {
                 assert_eq!(name, "frontend-template");
                 assert_eq!(*args, vec!["xagi-frontend-mcp@latest".to_string()]);
                 assert_eq!(env.len(), 1);
@@ -168,9 +170,9 @@ mod tests {
         assert!(servers.len() >= 1);
 
         // 验证包含 context7 服务器
-        let has_context7 = servers.iter().any(|server| {
-            matches!(server, McpServer::Stdio { name, .. } if name == "context7")
-        });
+        let has_context7 = servers
+            .iter()
+            .any(|server| matches!(server, McpServer::Stdio { name, .. } if name == "context7"));
         assert!(has_context7);
     }
 

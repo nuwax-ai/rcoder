@@ -55,7 +55,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/proxy/config", get(handler::proxy_config))
         .route("/proxy", get(handler::proxy_with_query_params))
         .route("/proxy/{port}", get(handler::proxy_to_port))
-        .route("/proxy/{port}/{*path}", get(handler::proxy_to_port_with_path))
+        .route(
+            "/proxy/{port}/{*path}",
+            get(handler::proxy_to_port_with_path),
+        )
         .with_state(state.clone());
 
     Router::new()

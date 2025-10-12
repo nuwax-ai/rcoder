@@ -1,10 +1,10 @@
-use std::path::PathBuf;
-use std::fs;
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::AgentType;
 
@@ -91,7 +91,7 @@ impl Default for ProxyConfig {
 pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     // 1. 首先加载默认配置
     let mut config = AppConfig::default();
-    
+
     // 2. 尝试从当前目录读取配置文件
     match load_config_from_file() {
         Ok(file_config) => {
@@ -100,7 +100,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         }
         Err(e) => {
             warn!("无法读取配置文件 {}: {}, 使用默认配置", CONFIG_FILE, e);
-            
+
             // 创建默认配置文件
             if let Err(create_err) = create_default_config_file(&config) {
                 error!("创建默认配置文件失败: {}", create_err);
@@ -118,7 +118,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                 info!("使用环境变量 RCODER_PORT 设置端口: {}", p);
             }
             Err(_) => {
-                warn!("环境变量 RCODER_PORT 值无效: {}, 使用配置文件中的端口: {}", port, config.port);
+                warn!(
+                    "环境变量 RCODER_PORT 值无效: {}, 使用配置文件中的端口: {}",
+                    port, config.port
+                );
             }
         }
     }
@@ -132,7 +135,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             port_param: "port".to_string(),
         };
         config.proxy_config = Some(proxy_config);
-        info!("启用反向代理，监听端口: {}", config.proxy_config.as_ref().unwrap().listen_port);
+        info!(
+            "启用反向代理，监听端口: {}",
+            config.proxy_config.as_ref().unwrap().listen_port
+        );
     }
 
     // 5. 命令行参数覆盖配置（优先级最高）
@@ -148,7 +154,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
 
     info!(
         "最终配置: port={}, projects_dir={:?}, default_agent={:?}, proxy_enabled={}",
-        config.port, config.projects_dir, config.default_agent, config.proxy_config.is_some()
+        config.port,
+        config.projects_dir,
+        config.default_agent,
+        config.proxy_config.is_some()
     );
 
     config
@@ -168,12 +177,12 @@ pub fn load_config() -> AppConfig {
 
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
-    let config_content = fs::read_to_string(CONFIG_FILE)
-        .map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
-    
+    let config_content =
+        fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
+
     let config: AppConfig = serde_yaml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
-    
+
     Ok(config)
 }
 
