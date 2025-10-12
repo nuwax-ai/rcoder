@@ -369,27 +369,26 @@ pub async fn agent_session_notification(
             let session_id_clone = session_id.clone();
             async move {
                 loop {
-                    // 获取并清空该session的消息
-                    let messages: Vec<UnifiedSessionMessage> = if let Some(session_data) = SESSION_CACHE.get(&session_id_clone) {
-                        session_data.drain_messages()
-                    } else {
-                        Vec::new()
-                    };
+                    // 获取一条消息
+                    if let Some(session_data) = SESSION_CACHE.get(&session_id_clone) {
+                        if let Some(msg) = session_data.pop_message() {
+                            debug!("📤 发送消息到 session: {}, type: {:?}", session_id_clone, msg.message_type);
 
-                    if !messages.is_empty() {
-                        debug!(
-                            "📤 推送 {} 条消息到 session: {}",
-                            messages.len(),
-                            session_id_clone
-                        );
-
-                        // 逐条发送消息
-                        for msg in messages {
                             // 根据消息类型动态设置事件名称
                             let event_name = match msg.message_type {
-                                crate::model::SessionMessageType::SessionPromptStart => "prompt_start",
-                                crate::model::SessionMessageType::SessionPromptEnd => "prompt_end",
-                                crate::model::SessionMessageType::AgentSessionUpdate => &msg.sub_type,
+                                crate::model::SessionMessageType::SessionPromptStart => {
+                                    info!("📝 发送 prompt_start 消息到 session: {}", session_id_clone);
+                                    "prompt_start"
+                                },
+                                crate::model::SessionMessageType::SessionPromptEnd => {
+                                    info!("🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}", 
+                                          session_id_clone, msg.data.get("reason"));
+                                    "prompt_end"
+                                },
+                                crate::model::SessionMessageType::AgentSessionUpdate => {
+                                    debug!("🔄 发送 {} 消息到 session: {}", msg.sub_type, session_id_clone);
+                                    &msg.sub_type
+                                },
                                 crate::model::SessionMessageType::Heartbeat => "heartbeat",
                             };
 

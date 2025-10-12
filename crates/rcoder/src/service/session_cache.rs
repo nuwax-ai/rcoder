@@ -49,6 +49,15 @@ impl SessionData {
         }
     }
 
+    /// 移除一条消息（用于SSE推送）
+    pub fn pop_message(&self) -> Option<UnifiedSessionMessage> {
+        if let Ok(mut rb) = self.rb.lock() {
+            rb.try_pop()
+        } else {
+            None
+        }
+    }
+
     /// 获取消息数量
     pub fn message_count(&self) -> usize {
         if let Ok(rb) = self.rb.lock() {
@@ -63,11 +72,24 @@ impl SessionData {
 pub fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
     let unified_message = notify.to_unified_message();
 
+    // 添加调试日志
+    tracing::debug!(
+        "📥 推送消息到缓存: session_id={}, message_type={:?}, sub_type={}", 
+        session_id, 
+        unified_message.message_type,
+        unified_message.sub_type
+    );
+
     let session_data = SESSION_CACHE
         .entry(session_id.to_string())
         .or_insert_with(|| SessionData::new(1000));
 
     session_data.add_message(unified_message);
+    
+    // 记录缓存中的消息数量
+    let message_count = session_data.message_count();
+    tracing::debug!("📊 缓存消息数量: session_id={}, count={}", session_id, message_count);
+    
     Ok(())
 }
 
