@@ -1,3 +1,3 @@
 mod model;
 
-pub use model::{ModelProviderConfig, ModelApiProtocol};
+pub use model::{ModelProviderConfig, ModelApiProtocol, ModelProviderSafeInfo};

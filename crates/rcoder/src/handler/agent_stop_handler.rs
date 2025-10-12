@@ -1,11 +1,11 @@
-use axum::{extract::Query};
+use axum::{extract::{Query, Path}};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn, debug};
 use utoipa::{ToSchema, IntoParams};
 
 use crate::{
-    model::{AppError, HttpResult},
+    model::{AppError, HttpResult, AgentStatusResponse},
     proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
 };
 
@@ -147,5 +147,101 @@ pub async fn agent_stop(
                 &format!("Agent service for project_id {} was already stopped", project_id),
             ))
         }
+    }
+}
+
+/// 查询Agent状态
+///
+/// 查询指定项目的Agent服务状态信息
+#[utoipa::path(
+    get,
+    path = "/agent/status/{project_id}",
+    params(
+        ("project_id" = String, Path, description = "项目ID", example = "test_project")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "成功获取Agent状态",
+            body = HttpResult<AgentStatusResponse>,
+            example = json!({
+                "success": true,
+                "data": {
+                    "project_id": "test_project",
+                    "session_id": "session123",
+                    "is_alive": true,
+                    "status": "Active",
+                    "last_activity": "2024-01-01T12:00:00Z",
+                    "created_at": "2024-01-01T10:00:00Z",
+                    "model_provider": {
+                        "id": "custom",
+                        "name": "custom",
+                        "api_protocol": "OpenAI",
+                        "default_model": "gpt-4"
+                    }
+                },
+                "error": null
+            })
+        ),
+        (
+            status = 404,
+            description = "未找到对应的Agent服务",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "AGENT_NOT_FOUND",
+                    "message": "No agent service found for the specified project_id"
+                }
+            })
+        )
+    ),
+    tag = "agent",
+    operation_id = "agent_status",
+    summary = "查询Agent状态",
+    description = "查询指定项目的Agent服务状态信息，包括存活状态、活动时间、模型配置等。"
+)]
+pub async fn agent_status(
+    Path(project_id): Path<String>,
+) -> Result<HttpResult<AgentStatusResponse>, AppError> {
+    let project_id = project_id.trim();
+    
+    if project_id.is_empty() {
+        return Ok(HttpResult::error(
+            "INVALID_PARAMS",
+            "project_id cannot be empty",
+        ));
+    }
+
+    info!(
+        "📊 收到查询Agent状态请求: project_id={}",
+        project_id
+    );
+
+    // 从MAP中获取Agent信息
+    if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
+        let response = AgentStatusResponse {
+            project_id: agent_info.project_id.clone(),
+            session_id: agent_info.session_id.0.to_string(),
+            is_alive: true,
+            status: agent_info.status,
+            last_activity: agent_info.last_activity,
+            created_at: agent_info.created_at,
+            model_provider: agent_info.model_provider.as_ref().map(|mp| mp.to_safe_info()),
+        };
+
+        info!(
+            "✅ 成功获取Agent状态: project_id={}, status={:?}",
+            project_id, agent_info.status
+        );
+
+        Ok(HttpResult::success(response))
+    } else {
+        warn!("❌ 未找到Agent服务: project_id={}", project_id);
+        Ok(HttpResult::error(
+            "AGENT_NOT_FOUND",
+            &format!("No agent service found for project_id: {}", project_id),
+        ))
     }
 }
