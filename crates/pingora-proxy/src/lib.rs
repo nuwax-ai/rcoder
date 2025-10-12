@@ -58,13 +58,15 @@
 
 // 导入模块
 pub mod config;
-pub mod service;
+pub mod pingora_server;
 pub mod server;
+pub mod service;
 
 // 重新导出公共接口
 pub use config::ProxyConfig;
-pub use service::PortProxyService;
-pub use server::{ProxyServer, ProxyServerBuilder};
+pub use pingora_server::PingoraServerManager;
+pub use server::{PingoraServerRunner, ProxyServer, ProxyServerBuilder};
+pub use service::{PingoraProxyService, PortProxyService}; // PortProxyService 是别名
 
 // 库级别的常量和类型
 pub const DEFAULT_PORT: u16 = 8080;

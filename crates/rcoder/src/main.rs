@@ -22,7 +22,7 @@ use model::*;
 use config::{CliArgs, load_config_with_args};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
-use pingora_proxy::{ProxyServer, ProxyConfig};
+use pingora_proxy::{ProxyConfig, PingoraServerManager};
 
 // 路由创建函数已移动到 handler 模块
 
@@ -77,8 +77,9 @@ async fn main() -> anyhow::Result<()> {
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
     // 启动代理服务（如果启用）
-    let (proxy_server, proxy_handle) = if let Some(proxy_config) = &config.proxy_config {
-        info!("启动反向代理服务，监听端口: {}", proxy_config.listen_port);
+    let proxy_handle = if let Some(proxy_config) = &config.proxy_config {
+        info!("启动 Pingora 反向代理服务，监听端口: {}", proxy_config.listen_port);
+        info!("代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
 
         let pingora_config = ProxyConfig {
             listen_port: proxy_config.listen_port,
@@ -89,30 +90,25 @@ async fn main() -> anyhow::Result<()> {
             verbose: false,
         };
 
-        let proxy_server_instance = ProxyServer::new(pingora_config);
-        let service = proxy_server_instance.service();
+        // 创建 Pingora 服务器管理器
+        let mut server_manager = PingoraServerManager::new(pingora_config);
 
-        // 添加当前服务作为后端
-        service.add_backend(config.port, "127.0.0.1".to_string()).await;
-
-        // 由于AppState需要Arc<ProxyServer>，但start需要所有权，我们使用一个共享的设计
-        // 让我们改变设计，不在AppState中存储整个ProxyServer
+        // 在后台任务中启动 Pingora 服务器
         let handle = tokio::spawn(async move {
-            if let Err(e) = proxy_server_instance.start().await {
-                error!("代理服务器启动失败: {}", e);
+            if let Err(e) = server_manager.start().await {
+                error!("Pingora 代理服务器启动失败: {}", e);
             }
         });
 
-        (None, Some(handle)) // 暂时不将proxy_server存储在AppState中
+        Some(handle)
     } else {
-        (None, None)
+        None
     };
 
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
         local_task_sender,
-        proxy_server,
     });
 
     // 创建路由
@@ -131,10 +127,14 @@ async fn main() -> anyhow::Result<()> {
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
     if config.proxy_config.is_some() {
-        info!("代理服务已启用，可通过端口 {} 访问后端服务", config.proxy_config.as_ref().unwrap().listen_port);
-        info!("代理使用方式:");
-        info!("  ?port=3000 - 访问端口 3000 的服务");
-        info!("  /proxy/3000/path - 访问端口 3000 的服务");
+        info!("🚀 Pingora 反向代理服务已启用");
+        info!("📡 监听端口: {}", config.proxy_config.as_ref().unwrap().listen_port);
+        info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
+        info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
+        info!("💡 示例:");
+        info!("   http://localhost:{}/proxy/3000/ → http://127.0.0.1:3000/", config.proxy_config.as_ref().unwrap().listen_port);
+        info!("   http://localhost:{}/proxy/8080/api/users → http://127.0.0.1:8080/api/users", config.proxy_config.as_ref().unwrap().listen_port);
+        info!("   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (动态发现)", config.proxy_config.as_ref().unwrap().listen_port);
     }
 
     axum::serve(listener, app).await?;

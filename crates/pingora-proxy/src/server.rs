@@ -1,84 +1,78 @@
-//! 代理服务器模块
+//! 基于 Pingora 的代理服务器模块
 //!
-//! 提供代理服务器的启动、管理和请求处理功能。
+//! 提供使用 Cloudflare Pingora 库的高性能代理服务器启动、管理和请求处理功能。
 
-use std::sync::Arc;
 use anyhow::Result;
-use tracing::{info, error};
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    response::Response,
-    body::Body,
-    routing::any,
-};
+use std::sync::Arc;
+use tracing::info;
 
 use crate::config::ProxyConfig;
-use crate::service::PortProxyService;
+use crate::service::PingoraProxyService;
 
-/// 代理服务器管理器
+/// 基于 Pingora 的代理服务器管理器
 #[derive(Clone)]
 pub struct ProxyServer {
     config: ProxyConfig,
-    service: Arc<PortProxyService>,
+    service: Arc<PingoraProxyService>,
 }
 
 impl ProxyServer {
     /// 创建新的代理服务器
     pub fn new(config: ProxyConfig) -> Self {
-        let service = Arc::new(PortProxyService::new(config.clone()));
+        let service = Arc::new(PingoraProxyService::new(config.clone()));
         Self { config, service }
     }
 
     /// 启动代理服务器
     pub async fn start(self) -> Result<()> {
         // 验证配置
-        self.config.validate().map_err(|e| {
-            anyhow::anyhow!("配置验证失败: {}", e)
-        })?;
+        self.config
+            .validate()
+            .map_err(|e| anyhow::anyhow!("配置验证失败: {}", e))?;
 
-        info!("启动端口代理服务器，监听端口: {}", self.config.listen_port);
-
-        // 构建 Axum 应用
-        let app = axum::Router::new()
-            .fallback(any(Self::proxy_handler))
-            .with_state(self.service.clone());
-
-        // 启动服务器
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.config.listen_port))
-            .await?;
+        info!(
+            "启动基于 Pingora 的端口代理服务器，监听端口: {}",
+            self.config.listen_port
+        );
 
         self.log_startup_info();
 
-        axum::serve(listener, app).await?;
+        // 注意：这是一个库，实际的 Pingora 服务器需要由调用者启动
+        // 这里只是准备服务实例
+        let pingora_proxy = self.service.create_pingora_proxy();
+        info!("Pingora 代理服务已准备就绪");
+        info!(
+            "负载均衡算法: {}",
+            if pingora_proxy.use_round_robin {
+                "Round Robin"
+            } else {
+                "Ketama Consistent"
+            }
+        );
+
         Ok(())
     }
 
     /// 记录启动信息
     fn log_startup_info(&self) {
-        info!("代理服务器已启动，监听端口: {}", self.config.listen_port);
-        info!("配置信息:");
+        info!("基于 Pingora 的代理服务器配置:");
+        info!("  监听端口: {}", self.config.listen_port);
         info!("  默认后端端口: {}", self.config.default_backend_port);
         info!("  后端主机: {}", self.config.backend_host);
         info!("  端口参数名: {}", self.config.port_param);
         info!("代理使用方式:");
-        info!("  ?port=3000 - 访问端口 3000 的服务");
         info!("  /proxy/3000/path - 访问端口 3000 的服务");
-    }
-
-    /// 代理处理器
-    async fn proxy_handler(
-        axum::extract::State(service): axum::extract::State<Arc<PortProxyService>>,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, StatusCode> {
-        service.proxy_request(req).await.map_err(|e| {
-            error!("代理处理失败: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+        info!("  ?port=3000 - 通过查询参数访问端口 3000 的服务（向后兼容）");
+        info!("Pingora 高级特性:");
+        info!("  - 负载均衡 (Round Robin/Ketama)");
+        info!("  - 健康检查");
+        info!("  - 连接池和连接复用");
+        info!("  - HTTP/1.1 和 HTTP/2 支持");
+        info!("  - 高性能异步 I/O");
     }
 
     /// 获取服务实例
-    pub fn service(&self) -> Arc<PortProxyService> {
+    pub fn service(&self) -> Arc<PingoraProxyService> {
         self.service.clone()
     }
 
@@ -105,32 +99,12 @@ impl ProxyServer {
     /// 预启动检查（不实际启动服务器）
     pub async fn pre_start_check(&self) -> Result<()> {
         // 检查配置
-        self.config.validate().map_err(|e| {
-            anyhow::anyhow!("配置验证失败: {}", e)
-        })?;
+        self.config
+            .validate()
+            .map_err(|e| anyhow::anyhow!("配置验证失败: {}", e))?;
 
-        // 检查端口是否可用
-        if let Err(e) = self.check_port_available().await {
-            return Err(anyhow::anyhow!("端口检查失败: {}", e));
-        }
-
-        info!("预启动检查通过，可以启动代理服务器");
+        info!("Pingora 代理服务器预启动检查通过");
         Ok(())
-    }
-
-    /// 检查端口是否可用
-    async fn check_port_available(&self) -> Result<()> {
-        use tokio::net::TcpListener;
-
-        match TcpListener::bind(format!("0.0.0.0:{}", self.config.listen_port)).await {
-            Ok(_) => {
-                info!("端口 {} 可用", self.config.listen_port);
-                Ok(())
-            }
-            Err(e) => {
-                Err(anyhow::anyhow!("端口 {} 不可用: {}", self.config.listen_port, e))
-            }
-        }
     }
 
     /// 创建带有自定义配置的代理服务器
@@ -165,11 +139,25 @@ impl ProxyServer {
         self.config.default_backend_port = port;
         self
     }
+
+    /// 设置负载均衡算法
+    pub fn with_load_balancing(mut self, use_round_robin: bool) -> Self {
+        // 创建新的服务实例
+        let service = Arc::new(
+            self.service
+                .as_ref()
+                .clone()
+                .with_load_balancing(use_round_robin),
+        );
+        self.service = service;
+        self
+    }
 }
 
 /// 代理服务器构建器
 pub struct ProxyServerBuilder {
     config: ProxyConfig,
+    use_round_robin: bool,
 }
 
 impl ProxyServerBuilder {
@@ -177,6 +165,7 @@ impl ProxyServerBuilder {
     pub fn new() -> Self {
         Self {
             config: ProxyConfig::default(),
+            use_round_robin: true,
         }
     }
 
@@ -216,15 +205,62 @@ impl ProxyServerBuilder {
         self
     }
 
+    /// 设置负载均衡算法
+    pub fn load_balancing(mut self, use_round_robin: bool) -> Self {
+        self.use_round_robin = use_round_robin;
+        self
+    }
+
     /// 构建代理服务器
     pub fn build(self) -> ProxyServer {
-        ProxyServer::new(self.config)
+        let mut server = ProxyServer::new(self.config);
+        server.service = Arc::new(
+            server
+                .service
+                .as_ref()
+                .clone()
+                .with_load_balancing(self.use_round_robin),
+        );
+        server
     }
 }
 
 impl Default for ProxyServerBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Pingora 代理服务器运行器
+///
+/// 提供更直接的 Pingora 服务器控制方式
+pub struct PingoraServerRunner {
+    service: PingoraProxyService,
+}
+
+impl PingoraServerRunner {
+    /// 创建新的运行器
+    pub fn new(config: ProxyConfig) -> Self {
+        Self {
+            service: PingoraProxyService::new(config),
+        }
+    }
+
+    /// 创建带负载均衡的运行器
+    pub fn with_load_balancing(config: ProxyConfig, use_round_robin: bool) -> Self {
+        Self {
+            service: PingoraProxyService::new(config).with_load_balancing(use_round_robin),
+        }
+    }
+
+    /// 获取服务引用
+    pub fn service(&self) -> &PingoraProxyService {
+        &self.service
+    }
+
+    /// 获取 Pingora 代理实例
+    pub fn create_pingora_proxy(&self) -> crate::service::PortProxy {
+        self.service.create_pingora_proxy()
     }
 }
 
@@ -258,6 +294,7 @@ mod tests {
             .backend_host("localhost")
             .port_param("target_port")
             .verbose(true)
+            .load_balancing(false)
             .build();
 
         assert_eq!(server.listen_port(), 9090);
@@ -272,7 +309,8 @@ mod tests {
         let server = ProxyServer::with_listen_port(8080)
             .with_backend_host("example.com")
             .with_port_param("service_port")
-            .with_default_backend_port(80);
+            .with_default_backend_port(80)
+            .with_load_balancing(false);
 
         assert_eq!(server.listen_port(), 8080);
         assert_eq!(server.config().backend_host, "example.com");
@@ -311,5 +349,23 @@ mod tests {
         // 测试可以通过服务器访问服务
         assert_eq!(service.config().default_backend_port, 3000);
         assert_eq!(service.config().listen_port, 8080);
+    }
+
+    #[test]
+    fn test_pingora_server_runner() {
+        let config = ProxyConfig::default();
+        let runner = PingoraServerRunner::new(config);
+
+        // 测试创建运行器
+        assert_eq!(runner.service().config().listen_port, 8080);
+        assert_eq!(runner.service().config().default_backend_port, 3000);
+    }
+
+    #[test]
+    fn test_pingora_server_runner_with_lb() {
+        let config = ProxyConfig::default();
+        let runner = PingoraServerRunner::with_load_balancing(config, false);
+
+        assert!(!runner.service().use_round_robin);
     }
 }

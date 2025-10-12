@@ -13,8 +13,18 @@ tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 anyhow = "1.0"
 structopt = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
 axum = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
-thiserror = "1.0"
+thiserror = "2.0"
+
+# Pingora dependencies - 真正的 Pingora 库
+pingora = { version = "0.6", features = ["lb"] }
+pingora-core = "0.6"
+pingora-http = "0.6"
+pingora-proxy = "0.6"
+pingora-load-balancing = "0.6"
+async-trait = "0.1"
+
+# HTTP client for fallback
+reqwest = { version = "0.12", features = ["json"] }
