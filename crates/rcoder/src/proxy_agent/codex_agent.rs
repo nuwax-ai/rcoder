@@ -1,32 +1,26 @@
 use std::sync::Arc;
 
 use agent_client_protocol::{
-    self as acp, Agent, AgentSideConnection, CancelNotification, ClientCapabilities,
-    ClientSideConnection, ContentBlock, ExtNotification, ExtRequest, ExtResponse,
-    InitializeRequest, KillTerminalCommandResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, SessionId, SessionNotification, SetSessionModeResponse,
-    TextContent, V1 as VERSION,
+    Agent, AgentSideConnection, ClientCapabilities,
+    ClientSideConnection,
+    InitializeRequest, NewSessionRequest,
+    PromptRequest, SessionId, V1 as VERSION,
 };
 use agent_client_protocol::{Client, LoadSessionRequest}; // bring trait into scope for session_notification
 
 use codex_acp_agent::{CodexAgent, fs::FsBridge};
 use codex_core::config::{
-    Config, ConfigOverrides, ConfigToml, find_codex_home, load_config_as_toml,
+    Config, ConfigOverrides,
 };
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol_config_types::SandboxMode;
-use dashmap::DashMap;
-use serde_json::json;
 use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::{
-    compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _},
-    sync::CancellationToken,
-};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use crate::{CancelNotificationRequest, utils::create_default_mcp_servers};
-use crate::model::{AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo};
+use crate::model::{AgentType, ChatPrompt};
 use crate::proxy_agent::agent_stop_handle::AgentLifecycleGuard;
 use anyhow::Result;
 
@@ -45,7 +39,7 @@ pub async fn start_codex_acp_agent_service(
     let (client_tx, _client_rx) = mpsc::unbounded_channel();
 
     // 用户发送 CancelNotification 消息的通道
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequest>();
+    let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequest>();
 
     //todo  暂时从环境变量便利加载配置
     let (cfg, _) = AgentType::codex_model_provider(model_provider.clone())?;
@@ -82,7 +76,7 @@ pub async fn start_codex_acp_agent_service(
     let (agent_to_client_rx, agent_to_client_tx) = piper::pipe(1024);
 
     // 用于外部持续发送 prompt 的通道
-    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
+    let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
 
     // 创建 CancellationToken 用于控制嵌入式 Codex agent 生命周期
     let cancel_token = CancellationToken::new();

@@ -9,7 +9,6 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{config::AppConfig, handler, proxy_agent::LocalSetAgentRequest};
-use axum::Json;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 

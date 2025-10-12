@@ -1,4 +1,3 @@
-use std::fmt;
 
 /// 系统提示词配置
 #[derive(Debug, Clone)]

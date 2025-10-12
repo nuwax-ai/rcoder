@@ -9,9 +9,8 @@ use agent_client_protocol::{
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use std::path::Path;
-use tracing::{debug, warn};
 
-use crate::model::{Attachment, AttachmentError, AttachmentSource};
+use crate::model::{Attachment, AttachmentSource};
 
 /// Content Builder - 将附件转换为 ACP ContentBlock
 pub struct ContentBuilder;

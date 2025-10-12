@@ -8,6 +8,7 @@ use utoipa::ToSchema;
     setter(into, strip_option),
     build_fn(error = "derive_builder::UninitializedFieldError")
 )]
+#[derive(Default)]
 pub struct ProjectSourceCode {
     pub files: Vec<FileInfo>,
 }
@@ -18,6 +19,7 @@ pub struct ProjectSourceCode {
     setter(into, strip_option),
     build_fn(error = "derive_builder::UninitializedFieldError")
 )]
+#[derive(Default)]
 pub struct FileInfo {
     pub name: String,
     pub binary: bool,
@@ -27,24 +29,7 @@ pub struct FileInfo {
     pub contents: Option<String>,
 }
 
-impl Default for ProjectSourceCode {
-    fn default() -> Self {
-        Self {
-            files: Vec::new(),
-        }
-    }
-}
 
-impl Default for FileInfo {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            binary: false,
-            size_exceeded: false,
-            contents: None,
-        }
-    }
-}
 
 impl FileInfo {
     pub fn new(name: impl Into<String>) -> Self {

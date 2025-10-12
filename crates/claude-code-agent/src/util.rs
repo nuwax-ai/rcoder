@@ -398,15 +398,14 @@ impl ClaudeCodeAcpManager {
                 let file_name = entry.file_name();
                 let Some(file_name_str) = file_name.to_str() else { continue };
 
-                if let Ok(version) = Version::from_str(file_name_str) {
-                    if version != *current_version {
+                if let Ok(version) = Version::from_str(file_name_str)
+                    && version != *current_version {
                         let dir_path = self.install_dir.join(file_name_str);
                         if dir_path.exists() {
                             tokio::fs::remove_dir_all(&dir_path).await
                                 .context("清理旧版本失败")?;
                         }
                     }
-                }
             }
         }
 
@@ -438,7 +437,7 @@ static GLOBAL_CLAUDE_ACP_MANAGER: OnceLock<ClaudeCodeAcpManager> = OnceLock::new
 
 /// 获取全局 Claude Code ACP 管理器
 pub fn get_global_claude_acp_manager() -> &'static ClaudeCodeAcpManager {
-    GLOBAL_CLAUDE_ACP_MANAGER.get_or_init(|| ClaudeCodeAcpManager::default())
+    GLOBAL_CLAUDE_ACP_MANAGER.get_or_init(ClaudeCodeAcpManager::default)
 }
 
 /// 便捷函数：确保 Claude Code ACP 已安装

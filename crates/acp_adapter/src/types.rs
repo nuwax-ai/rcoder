@@ -15,6 +15,12 @@ use tokio::sync::oneshot;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct UserMessageId(Arc<str>);
 
+impl Default for UserMessageId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UserMessageId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string().into())
@@ -76,6 +82,12 @@ pub enum ToolCallState {
 /// 工具调用 ID - 扩展类型
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct ToolCallId(Arc<str>);
+
+impl Default for ToolCallId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ToolCallId {
     pub fn new() -> Self {
@@ -749,11 +761,10 @@ impl PlanEntry {
         self.progress = Some(100);
         
         // 计算实际耗时
-        if let Some(started) = self.started_at {
-            if let Ok(duration) = now.duration_since(started) {
+        if let Some(started) = self.started_at
+            && let Ok(duration) = now.duration_since(started) {
                 self.actual_duration = Some(duration.as_secs());
             }
-        }
     }
     
     /// 标记为失败
@@ -763,11 +774,10 @@ impl PlanEntry {
         self.updated_at = now;
         
         // 计算实际耗时（即使失败了）
-        if let Some(started) = self.started_at {
-            if let Ok(duration) = now.duration_since(started) {
+        if let Some(started) = self.started_at
+            && let Ok(duration) = now.duration_since(started) {
                 self.actual_duration = Some(duration.as_secs());
             }
-        }
     }
     
     /// 更新进度

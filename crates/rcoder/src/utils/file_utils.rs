@@ -6,7 +6,7 @@ use anyhow::{Result, Context};
 use base64::{Engine as _, engine::general_purpose};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tracing::{debug, warn, error};
+use tracing::warn;
 
 use crate::model::{Attachment, AttachmentSource, AttachmentError};
 use super::ContentBuilder;

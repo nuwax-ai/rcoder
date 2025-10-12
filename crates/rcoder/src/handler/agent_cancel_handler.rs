@@ -2,10 +2,7 @@
 //!
 //! 通过ACP协议的CancelNotification来取消指定session的agent任务执行
 
-use axum::{
-    extract::{Path, Query},
-    response::Json,
-};
+use axum::extract::Query;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -150,7 +147,7 @@ pub async fn agent_session_cancel(
                     if cancel_notification_response.success {
                         Ok(HttpResult::success(CancelResponse {
                             success: true,
-                            session_id: session_id,
+                            session_id,
                         }))
                     } else {
                         Ok(HttpResult::error("0001", "停止智能体执行失败"))

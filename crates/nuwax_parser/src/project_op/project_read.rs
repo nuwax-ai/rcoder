@@ -232,15 +232,12 @@ impl ProjectReader {
         let size_exceeded = self
             .config
             .max_file_size
-            .map_or(false, |max| file_size > max);
+            .is_some_and(|max| file_size > max);
 
         let binary = self.is_binary_file(file_path, file_name)?;
 
         let contents = if !binary && !size_exceeded {
-            match fs::read_to_string(file_path) {
-                Ok(content) => Some(content),
-                Err(_) => None,
-            }
+            fs::read_to_string(file_path).ok()
         } else {
             None
         };

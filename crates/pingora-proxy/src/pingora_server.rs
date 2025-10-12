@@ -115,7 +115,7 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
     type CTX = ();
 
     fn new_ctx(&self) -> Self::CTX {
-        ()
+        
     }
 
     async fn upstream_peer(

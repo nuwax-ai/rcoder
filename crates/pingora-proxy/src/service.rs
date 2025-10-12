@@ -41,7 +41,7 @@ impl ProxyHttp for PortProxy {
     type CTX = ();
 
     fn new_ctx(&self) -> Self::CTX {
-        ()
+        
     }
 
     /// 过滤请求头和路径

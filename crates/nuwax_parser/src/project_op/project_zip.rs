@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};

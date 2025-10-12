@@ -370,8 +370,8 @@ pub async fn agent_session_notification(
             async move {
                 loop {
                     // 获取一条消息
-                    if let Some(session_data) = SESSION_CACHE.get(&session_id_clone) {
-                        if let Some(msg) = session_data.pop_message() {
+                    if let Some(session_data) = SESSION_CACHE.get(&session_id_clone)
+                        && let Some(msg) = session_data.pop_message() {
                             debug!("📤 发送消息到 session: {}, type: {:?}", session_id_clone, msg.message_type);
 
                             // 根据消息类型动态设置事件名称
@@ -399,7 +399,6 @@ pub async fn agent_session_notification(
                             // 更新最后消息时间并返回事件
                             return Some((Ok(event), (session_id_clone, Instant::now())));
                         }
-                    }
 
                     // 检查是否需要发送心跳消息
                     let elapsed = last_message_time.elapsed();

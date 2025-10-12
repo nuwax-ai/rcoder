@@ -3,7 +3,6 @@
 use anyhow::Result;
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use shared_types::ModelProviderConfig;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};

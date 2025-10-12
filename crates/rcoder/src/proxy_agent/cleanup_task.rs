@@ -89,8 +89,8 @@ impl AgentCleaner {
             let agent_info = entry.value();
 
             // 只清理Idle状态的agent，避免中断正在执行的任务
-            if agent_info.status == AgentStatus::Idle {
-                if self.is_agent_idle_timeout(agent_info.last_activity, current_time) {
+            if agent_info.status == AgentStatus::Idle
+                && self.is_agent_idle_timeout(agent_info.last_activity, current_time) {
                     let idle_duration = (current_time - agent_info.last_activity).num_seconds();
                     info!(
                         "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒, 创建时间: {}",
@@ -102,7 +102,6 @@ impl AgentCleaner {
                     );
                     agents_to_remove.push(project_id.clone());
                 }
-            }
         }
 
         // 执行清理 - RAII版：直接从 MAP 中移除，AgentLifecycleGuard 会自动清理

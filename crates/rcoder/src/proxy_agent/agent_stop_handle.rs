@@ -143,11 +143,10 @@ impl AgentLifecycleGuard {
                 }
 
                 // 终止子进程
-                if let Some(mut child) = child_process.lock().await.take() {
-                    if let Err(e) = child.kill().await {
+                if let Some(mut child) = child_process.lock().await.take()
+                    && let Err(e) = child.kill().await {
                         warn!("终止Claude子进程失败: {}", e);
                     }
-                }
             }
             AgentResources::Codex { io_tasks, channel_tasks, .. } => {
                 // 取消所有任务
@@ -211,8 +210,8 @@ impl Clone for AgentLifecycleGuard {
 impl Drop for AgentLifecycleGuard {
     fn drop(&mut self) {
         // 只有最后一个引用被drop时才执行清理
-        if Arc::strong_count(&self.inner) == 1 {
-            if !self.inner.stopped.load(Ordering::SeqCst) {
+        if Arc::strong_count(&self.inner) == 1
+            && !self.inner.stopped.load(Ordering::SeqCst) {
                 let agent_name = match self.inner.agent_type {
                     AgentType::Claude => "Claude",
                     AgentType::Codex => "Codex",
@@ -229,11 +228,10 @@ impl Drop for AgentLifecycleGuard {
                 // 同步清理关键资源
                 match &self.inner.resources {
                     AgentResources::Claude { child_process, .. } => {
-                        if let Ok(mut child_guard) = child_process.try_lock() {
-                            if let Some(mut child) = child_guard.take() {
+                        if let Ok(mut child_guard) = child_process.try_lock()
+                            && let Some(mut child) = child_guard.take() {
                                 let _ = child.start_kill();
                             }
-                        }
                     }
                     AgentResources::Codex { io_tasks, channel_tasks, .. } => {
                         if let Ok(mut tasks) = io_tasks.try_lock() {
@@ -251,7 +249,6 @@ impl Drop for AgentLifecycleGuard {
 
                 self.inner.stopped.store(true, Ordering::SeqCst);
             }
-        }
     }
 }
 

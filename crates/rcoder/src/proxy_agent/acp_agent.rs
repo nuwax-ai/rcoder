@@ -124,7 +124,7 @@ async fn create_new_agent_service(
 
 /// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
 pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
-    LazyLock::new(|| DashMap::new());
+    LazyLock::new(DashMap::new);
 
 /// 在 LocalSet 中运行的实际 Agent 请求
 #[derive(Debug)]

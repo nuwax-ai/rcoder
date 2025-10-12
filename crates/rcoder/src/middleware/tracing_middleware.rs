@@ -57,13 +57,11 @@ fn extract_trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
     ];
     
     for header_name in &trace_headers {
-        if let Some(header_value) = headers.get(*header_name) {
-            if let Ok(value) = header_value.to_str() {
-                if !value.is_empty() {
+        if let Some(header_value) = headers.get(*header_name)
+            && let Ok(value) = header_value.to_str()
+                && !value.is_empty() {
                     return Some(value.to_string());
                 }
-            }
-        }
     }
     
     None

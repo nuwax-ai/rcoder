@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use chrono::Utc;
 use tracing::{info, debug, warn};
