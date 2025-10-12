@@ -1,7 +1,0 @@
-# rcoder 配置文件
-# 该文件在首次启动时自动生成
-
-default_agent: Codex
-projects_dir: ./project_workspace
-port: 3000
-proxy_config: null

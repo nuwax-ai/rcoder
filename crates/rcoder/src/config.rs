@@ -70,7 +70,7 @@ impl Default for AppConfig {
             default_agent: AgentType::Codex,
             projects_dir: PathBuf::from("./project_workspace"),
             port: 3000,
-            proxy_config: None,
+            proxy_config: Some(ProxyConfig::default()),
         }
     }
 }
@@ -179,17 +179,42 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
 
 /// 创建默认配置文件
 fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
-    let yaml_content = serde_yaml::to_string(config)
-        .map_err(|e| anyhow::anyhow!("序列化配置失败: {}", e))?;
-    
-    // 添加注释
+    // 手动构建带注释的 YAML 内容
     let content_with_comments = format!(
-        "# rcoder 配置文件\n# 该文件在首次启动时自动生成\n\n{}",
-        yaml_content
+        r#"# rcoder 配置文件
+# 该文件在首次启动时自动生成
+
+# 默认使用的 AI 代理类型 (Codex/Claude/Proxy)
+default_agent: {}
+
+# 项目工作目录
+projects_dir: {}
+
+# 主服务端口
+port: {}
+
+# Pingora 反向代理配置
+proxy_config:
+  # 代理服务监听端口 (用于接收外部请求)
+  listen_port: {}
+  # 默认后端服务端口 (当请求未指定端口时使用)
+  default_backend_port: {}
+  # 后端服务主机地址
+  backend_host: "{}"
+  # URL 中端口参数的名称 (用于从路径中提取端口号)
+  port_param: "{}"
+"#,
+        format!("{:?}", config.default_agent),
+        config.projects_dir.display(),
+        config.port,
+        config.proxy_config.as_ref().unwrap().listen_port,
+        config.proxy_config.as_ref().unwrap().default_backend_port,
+        config.proxy_config.as_ref().unwrap().backend_host,
+        config.proxy_config.as_ref().unwrap().port_param
     );
-    
+
     fs::write(CONFIG_FILE, content_with_comments)
         .map_err(|e| anyhow::anyhow!("写入配置文件失败: {}", e))?;
-    
+
     Ok(())
 }
