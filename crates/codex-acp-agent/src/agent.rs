@@ -620,10 +620,7 @@ impl Agent for CodexAgent {
         args: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, Error> {
         info!(?args, "Received load session request");
-        Ok(acp::LoadSessionResponse {
-            modes: None,
-            meta: None,
-        })
+        Err(Error::invalid_params().with_data("load_session not supported"))
     }
 
     async fn set_session_mode(

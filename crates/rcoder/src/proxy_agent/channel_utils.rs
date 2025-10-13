@@ -5,7 +5,7 @@
 use agent_client_protocol::{Agent, PromptRequest, SessionId};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
 use crate::{
@@ -72,7 +72,13 @@ where
     let project_id = project_id.to_string();
     tokio::task::spawn_local(async move {
         while let Some(mut req) = prompt_rx.recv().await {
-            if req.session_id.0.is_empty() {
+            if req.session_id.0 != session_id.0 {
+                warn!(
+                    "项目[{}]收到Prompt的session_id({})与当前agent会话({})不一致，强制覆盖为当前会话",
+                    project_id,
+                    req.session_id.0,
+                    session_id.0
+                );
                 req.session_id = session_id.clone();
             }
             info!(

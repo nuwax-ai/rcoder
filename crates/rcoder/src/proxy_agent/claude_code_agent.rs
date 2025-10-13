@@ -166,15 +166,51 @@ pub async fn start_claude_code_acp_agent_service(
                     info!("📝 未配置 MCP 服务器");
                 }
 
-                //todo 创建会话,claude code的 sdk,暂时没有 load_session 接口,所以启动agnet服务,只能 new_session 方式 启动一个会话
-                let resp = client_conn
+                // 创建会话（兼容未来 SDK 的 load_session，失败则回退 new_session）
+                let session_id = match chat_prompt.session_id {
+                    Some(session_id) => {
+                        debug!("尝试加载 ACP 会话[load_session]");
+                        let given_session_id = SessionId(session_id.into());
+                        match client_conn
+                            .load_session(LoadSessionRequest {
+                                session_id: given_session_id.clone(),
+                                mcp_servers: mcp_servers.clone(),
+                                cwd: project_path_for_closure.clone(),
+                                meta: None,
+                            })
+                            .await
+                        {
+                            Ok(resp) => {
+                                debug!("ACP 会话加载成功[load_session],{:?}", resp);
+                                given_session_id
+                            }
+                            Err(e) => {
+                                warn!("load_session 失败或未实现，回退创建新会话[new_session]: {:?}", e);
+                                let resp = client_conn
+                                    .new_session(NewSessionRequest {
+                                        mcp_servers: mcp_servers.clone(),
+                                        cwd: project_path_for_closure.clone(),
+                                        meta: None,
+                                    })
+                                    .await?;
+                                debug!("ACP 会话创建成功[new_session],{:?}", resp);
+                                resp.session_id
+                            }
+                        }
+                    }
+                    None => {
+                        debug!("创建 ACP 会话[new_session]");
+                        let resp = client_conn
                             .new_session(NewSessionRequest {
                                 mcp_servers: mcp_servers.clone(),
                                 cwd: project_path_for_closure.clone(),
                                 meta: None,
                             })
                             .await?;
-                let session_id = resp.session_id;
+                        debug!("ACP 会话创建成功[new_session],{:?}", resp);
+                        resp.session_id
+                    }
+                };
 
                 // 发送会话 ID 到主线程
                 if session_id_tx.send(session_id.clone()).is_err() {

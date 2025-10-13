@@ -13,7 +13,7 @@ use codex_core::protocol_config_types::SandboxMode;
 use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::model::{AgentType, ChatPrompt};
 use crate::proxy_agent::agent_stop_handle::AgentLifecycleGuard;
@@ -180,18 +180,34 @@ pub async fn start_codex_acp_agent_service(
     // 创建会话
     let session_id = match chat_prompt.session_id {
         Some(session_id) => {
-            debug!("创建 ACP 会话[new_session]");
+            debug!("创建 ACP 会话[load_session]");
             let session_id = SessionId(session_id.into());
-            let resp = client_conn
+            match client_conn
                 .load_session(LoadSessionRequest {
                     session_id: session_id.clone(),
                     mcp_servers: mcp_servers.clone(),
                     cwd: project_path.clone(),
                     meta: None,
                 })
-                .await?;
-            debug!("ACP 会话加载成功[load_session],{:?}", resp);
-            session_id
+                .await
+            {
+                Ok(resp) => {
+                    info!("ACP 会话加载成功[load_session],{:?}", resp);
+                    session_id
+                }
+                Err(e) => {
+                    warn!("load_session 失败，回退为 new_session: {:?}", e);
+                    let resp = client_conn
+                        .new_session(NewSessionRequest {
+                            mcp_servers: mcp_servers.clone(),
+                            cwd: project_path.clone(),
+                            meta: None,
+                        })
+                        .await?;
+                    debug!("ACP 会话创建成功[new_session],{:?}", resp);
+                    resp.session_id
+                }
+            }
         }
         None => {
             debug!("创建 ACP 会话[new_session]");
