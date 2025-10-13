@@ -290,20 +290,25 @@ pub struct AgentStatusResponse {
     /// 项目ID
     #[schema(example = "test_project")]
     pub project_id: String,
-    /// 会话ID
-    #[schema(example = "session123")]
-    pub session_id: String,
     /// Agent 是否存活
     #[schema(example = true)]
     pub is_alive: bool,
-    /// Agent 服务状态
-    pub status: AgentStatus,
-    /// 最后活动时间
+    /// 会话ID（仅当 is_alive 为 true 时存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "session123")]
+    pub session_id: Option<String>,
+    /// Agent 服务状态（仅当 is_alive 为 true 时存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<AgentStatus>,
+    /// 最后活动时间（仅当 is_alive 为 true 时存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "2024-01-01T12:00:00Z")]
-    pub last_activity: DateTime<Utc>,
-    /// 创建时间
+    pub last_activity: Option<DateTime<Utc>>,
+    /// 创建时间（仅当 is_alive 为 true 时存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "2024-01-01T10:00:00Z")]
-    pub created_at: DateTime<Utc>,
-    /// 模型提供商安全信息
+    pub created_at: Option<DateTime<Utc>>,
+    /// 模型提供商安全信息（仅当 is_alive 为 true 时存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<ModelProviderSafeInfo>,
 }
