@@ -89,7 +89,7 @@ impl Default for AppConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            listen_port: 8080,
+            listen_port: 8088,
             default_backend_port: 8086,
             backend_host: "127.0.0.1".to_string(),
             port_param: "port".to_string(),
