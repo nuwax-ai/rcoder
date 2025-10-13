@@ -48,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
 
     // 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
     let cleanup_config = CleanupConfig {
-        idle_timeout: Duration::from_secs(1200),
-        cleanup_interval: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(3600),
+        cleanup_interval: Duration::from_secs(30),
     };
 
     let _ = std::thread::spawn(move || {
