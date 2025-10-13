@@ -200,8 +200,32 @@ pub async fn proxy_config(
 pub async fn proxy_to_port(
     State(state): State<Arc<AppState>>,
     Path(port): Path<u16>,
-) -> Result<Json<ProxyResponse>, (StatusCode, Json<ProxyErrorResponse>)> {
-    proxy_request_handler(state, port, Some("/".to_string())).await
+) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
+    if state.config.proxy_config.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_DISABLED".to_string(),
+                message: "Pingora 代理服务未启用".to_string(),
+                target_port: port,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        ));
+    }
+
+    let proxy_config = state.config.proxy_config.as_ref().unwrap();
+    let listen_port = proxy_config.listen_port;
+
+    // 重定向到 Pingora 真实代理端口
+    let location = format!("http://127.0.0.1:{}/proxy/{}", listen_port, port);
+
+    let resp = axum::http::Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(axum::http::header::LOCATION, location)
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    Ok(resp)
 }
 
 /// 代理到指定端口和路径
@@ -224,14 +248,41 @@ pub async fn proxy_to_port(
 pub async fn proxy_to_port_with_path(
     State(state): State<Arc<AppState>>,
     Path((port, path)): Path<(u16, String)>,
-) -> Result<Json<ProxyResponse>, (StatusCode, Json<ProxyErrorResponse>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
+    if state.config.proxy_config.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_DISABLED".to_string(),
+                message: "Pingora 代理服务未启用".to_string(),
+                target_port: port,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        ));
+    }
+
+    let proxy_config = state.config.proxy_config.as_ref().unwrap();
+    let listen_port = proxy_config.listen_port;
+
     let target_path = if path.is_empty() || path == "/" {
-        Some("/".to_string())
+        "/".to_string()
     } else {
-        Some(format!("/{}", path))
+        format!("/{}", path)
     };
 
-    proxy_request_handler(state, port, target_path).await
+    // 重定向到 Pingora 真实代理端口（保持相同的路径）
+    let location = format!(
+        "http://127.0.0.1:{}/proxy/{}{}",
+        listen_port, port, target_path
+    );
+
+    let resp = axum::http::Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(axum::http::header::LOCATION, location)
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    Ok(resp)
 }
 
 /// 通用代理请求处理器

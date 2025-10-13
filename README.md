@@ -4,65 +4,29 @@ RCoder 是一个基于 Rust 构建的现代化 AI 驱动开发平台，通过 AC
 
 ## ✨ 核心特性
 
-- 🤖 **多 AI 代理支持**: 统一接入 Claude Code、OpenAI Codex 等多种 AI 代理
-- 🌐 **HTTP API**: 简洁易用的 RESTful API 接口
-- ⚡ **异步架构**: 基于 Tokio 的高性能异步处理
-- 🔧 **命令行工具**: 灵活的命令行参数配置
-- 📝 **配置管理**: YAML 配置文件 + 环境变量 + 命令行参数的多层配置
-- 🔄 **实时通信**: 基于 ACP 协议的实时 AI 代理通信
-- 📊 **可观测性**: 集成 OpenTelemetry 的完整链路追踪
+- 🔁 反向代理：集成 Cloudflare Pingora，高性能端口路由 `/proxy/{port}/{path}`
+- 🌐 HTTP API：基于 Axum 的现代化 REST API 与统一 SSE 进度流
+- 🤖 多代理支持：统一接入 Codex、Claude Code 等 AI 代理
+- ⚡ 异步架构：Tokio 驱动的高并发异步处理
+- 🔧 配置系统：命令行 > 环境变量 > 配置文件，多层配置优先级
+- 📜 文档与可视化：自动化 API 文档（utoipa + Swagger UI）
+- 📊 可观测性：Tracing + OpenTelemetry 完整链路追踪
+
 
 ## 🏠 架构概览
 
 ```mermaid
 graph TB
-    subgraph "前端层"
-        A[HTTP 客户端]
-        B[网页界面]
-    end
-    
-    subgraph "HTTP 服务层"
-        C[Axum HTTP Server]
-        D[Router & Middleware]
-        E[中间件：追踪、CORS]
-    end
-    
-    subgraph "AI 代理管理层"
-        F[Agent Service]
-        G[Claude Code Agent]
-        H[OpenAI Codex Agent]
-        I[ACP 协议适配器]
-    end
-    
-    subgraph "核心服务层"
-        J[会话管理]
-        K[项目管理]
-        L[配置管理]
-        M[清理任务]
-    end
-    
-    subgraph "工具层"
-        N[Nuwax Parser]
-        O[文件工具]
-        P[内容构建器]
-    end
-    
-    A --> C
-    B --> C
-    C --> D
-    D --> E
-    E --> F
-    F --> G
-    F --> H
-    F --> I
-    F --> J
-    F --> K
-    F --> L
-    F --> M
-    K --> N
-    K --> O
-    K --> P
+    A[Client] --> B[Axum HTTP Server]
+    A --> C[Pingora Proxy]
+    B --> D[API Routes]
+    B --> E[Agent Worker (LocalSet)]
+    C --> F[Backends: 127.0.0.1:{port}]
 ```
+
+- Axum 主服务负责业务 API、会话管理与 SSE 进度流
+- Pingora 独立监听代理端口，按路径前缀 `/proxy/{port}/{path}` 转发到指定后端
+- 两者并行运行，互不阻塞；Axum 中的 `/proxy/...` 路由仅作文档与重定向到 Pingora
 
 ### 🛠️ 技术栈
 
@@ -81,57 +45,64 @@ graph TB
 
 ### 📝 环境要求
 
-- **Rust**: 1.75+ (支持 2024 Edition)
-- **Claude Code CLI**: 可选，用于 Claude 代理
-- **OpenAI Codex**: 可选，用于 Codex 代理
+- Rust: 1.75+（2024 Edition）
+- 可选：Claude Code CLI（用于 Claude 代理）
+- 可选：OpenAI Codex（用于 Codex 代理）
 
-### 🛠️ 安装步骤
+### 🛠️ 安装与运行
 
-1. **克隆仓库**
+1) 克隆并构建
 ```bash
 git clone https://github.com/your-org/rcoder.git
 cd rcoder
+cargo build --workspace
 ```
 
-2. **构建项目**
+2) 运行主服务（Axum）
 ```bash
-# 开发模式
-cargo build
-
-# 生产模式
-cargo build --release
-```
-
-3. **运行服务**
-```bash
-# 使用默认配置
+# 使用默认端口 3000
 cargo run --bin rcoder
 
 # 指定端口和项目目录
-cargo run --bin rcoder -- --port 8080 --projects-dir ./my-projects
+cargo run --bin rcoder -- --port 8087 --projects-dir ./my-projects
 ```
 
-服务将在 `http://localhost:3000` 启动。
+3) 启用并运行 Pingora 反向代理
+```bash
+# 在同一进程中启用 Pingora，监听 8080
+cargo run --bin rcoder -- --enable-proxy --proxy-port 8080
+
+# 指定默认后端端口（当请求未指定端口时使用）
+cargo run --bin rcoder -- --enable-proxy --proxy-port 8080 --default-backend-port 3000
+```
+
+4) 代理请求示例
+```bash
+# 将请求发送到 Pingora 监听端口（如 8080），路径前缀指定目标端口和路径
+curl "http://127.0.0.1:8080/proxy/5173/page/1977625137029189632/prod/"
+```
+
+> 提示：若请求误发到主服务端口（如 3000/8087）上的 `/proxy/...` 路由，将收到 307 重定向到 Pingora 端口；建议直接请求 Pingora 端口。
+
 
 ### 💻 命令行参数
 
 | 参数 | 短参数 | 说明 | 示例 |
 |------|--------|------|------|
-| `--port` | `-p` | 设置服务端口 | `--port 8080` |
+| `--port` | `-p` | 设置主服务端口（Axum） | `--port 8087` |
 | `--projects-dir` | `-d` | 设置项目工作目录 | `--projects-dir ./projects` |
-| `--help` | `-h` | 显示帮助信息 | `--help` |
-| `--version` | `-V` | 显示版本信息 | `--version` |
+| `--enable-proxy` | 无 | 启用 Pingora 反向代理 | `--enable-proxy` |
+| `--proxy-port` | 无 | 设置 Pingora 监听端口 | `--proxy-port 8080` |
+| `--default-backend-port` | 无 | 未指定端口时的默认后端端口 | `--default-backend-port 3000` |
 
 ```bash
-# 查看所有可用参数
+# 查看所有参数
 cargo run --bin rcoder -- --help
 
-# 基本启动
-cargo run --bin rcoder -- --port 8080
-
-# 完整配置
-cargo run --bin rcoder -- --port 8080 --projects-dir /path/to/projects
+# 启动主服务 + 启用代理
+cargo run --bin rcoder -- --port 8087 --enable-proxy --proxy-port 8080
 ```
+
 
 ### 🌍 AI 代理配置
 
@@ -159,14 +130,101 @@ export ANTHROPIC_MODEL="claude-3-sonnet-20240229"
 
 ## 📚 API 文档
 
+### 🔁 Pingora 反向代理使用指南
+
+Pingora 是项目内置的高性能反向代理，所有真实的代理请求必须发送到 Pingora 的监听端口，并使用路径前缀形式 `/proxy/{port}/{path}` 来指定目标后端端口与路径。
+
+#### 1. 启用与启动
+
+- 在命令行启用代理：
+
+```bash
+# 启用代理并指定代理监听端口（例如 8080）
+cargo run --bin rcoder -- --enable-proxy --proxy-port 8080
+
+# 可选：指定默认后端端口（当未在路径中指定时使用）
+cargo run --bin rcoder -- --enable-proxy --proxy-port 8080 --default-backend-port 3000
+```
+
+- 或在配置文件 `config.yml` 中设置：
+
+```yaml
+proxy_config:
+  listen_port: 8080           # Pingora 监听端口
+  default_backend_port: 3000  # 默认后端端口
+  backend_host: "127.0.0.1"    # 后端主机地址
+  port_param: "port"            # 字段保留（Pingora模式下不解析查询参数）
+```
+
+启动成功后日志中会看到：
+
+```
+启动 Pingora 反向代理服务，监听端口: 8080
+📡 监听端口: 8080
+🔄 路由规则: /proxy/{port}{/path}
+```
+
+#### 2. 请求格式
+
+- 仅支持路径前缀形式（Pingora 模式）：
+  - `GET http://localhost:<listen_port>/proxy/{port}/{path}`
+  - 例如：`http://localhost:8080/proxy/5173/page/1977625137029189632/prod/`
+
+- 注意：Pingora 模式下不支持 `?port=...` 查询参数提取端口（遵循项目规范“代理端口提取规则”）。
+
+#### 3. 示例
+
+假设本机已有一个运行在 5173 端口的前端开发服务器（如 Vite）：
+
+```bash
+# 将请求发送到 Pingora 监听端口（如 8080），并使用路径前缀指定目标端口和路径
+curl "http://127.0.0.1:8080/proxy/5173/page/1977625137029189632/prod/"
+```
+
+如果你误把请求发到主服务端口（如 3000/8087）的 Axum 路由 `/proxy/...`，服务会返回 307 重定向到 Pingora 的端口。你可以使用：
+
+```bash
+# 自动跟随重定向到 Pingora 端口
+curl --location "http://127.0.0.1:3000/proxy/5173/page/1977625137029189632/prod/"
+```
+
+推荐直接请求 Pingora 端口，避免不必要的重定向跳转。
+
+#### 4. 常见问题排查
+
+- “Failed to connect to localhost port 5173”：请确认目标后端（5173）确实在本机启动，Pingora 只能代理到存在的服务。
+- 收到 JSON 演示响应而非真实转发：说明命中了 Axum 的文档接口或重定向前的端口，请改为请求 Pingora 的 `listen_port`。
+- 端口提取失败：检查路径是否正确为 `/proxy/{port}/{path}`，以及 `{port}` 是否为有效的数字端口。
+
+#### 5. 相关接口（文档与状态）
+
+- `GET /proxy/status`：查看代理服务状态（在主服务端口）
+- `GET /proxy/config`：查看代理配置（在主服务端口）
+- `GET /proxy/stats`：查看代理统计信息（在主服务端口）
+
+> 说明：以上接口用于状态查询与文档展示；真实代理请求请直接发送到 Pingora 的监听端口。
+
+
+
 ### 🏥 核心端点
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/health` | GET | 健康检查 |
 | `/chat` | POST | 发送聊天消息给 AI 代理 |
-| `/progress/{session_id}` | GET (SSE) | 获取实时进度流 |
+| `/agent/progress/{session_id}` | GET (SSE) | 获取统一实时进度流 |
+| `/agent/session/cancel` | POST | 取消正在执行的任务 |
+| `/agent/stop` | POST | 停止当前 Agent |
+| `/agent/status/{project_id}` | GET | 查询 Agent 状态 |
 | `/api/docs` | GET | Swagger UI API 文档 |
+
+Pingora 相关（主服务端口，仅文档/状态）：
+- `GET /proxy/status`、`GET /proxy/config`、`GET /proxy/stats`
+- `GET /proxy/{port}/{path}`（返回 307 重定向至 Pingora 端口）
+
+真实代理请求需直接发送到 Pingora 监听端口：
+- `http://localhost:{listen_port}/proxy/{port}/{path}`
+
 
 ### 🚑 健康检查
 
@@ -196,7 +254,7 @@ curl -X POST http://localhost:3000/chat \
 ### 📊 实时进度流
 
 ```bash
-curl -X GET http://localhost:3000/progress/your-session-id \
+curl -X GET http://localhost:3000/agent/progress/your-session-id \
   -H "Accept: text/event-stream"
 ```
 
@@ -210,40 +268,118 @@ data: {"type": "result", "content": "项目创建完成"}
 ## 📁 项目结构
 
 ```
-rcoder/
-├── crates/                    # Rust Workspace Crates
-│   ├── rcoder/                # 主应用程序
-│   │   ├── src/
-│   │   │   ├── handler/       # HTTP 请求处理器
-│   │   │   ├── model/         # 数据模型
-│   │   │   ├── proxy_agent/   # AI 代理代理服务
-│   │   │   ├── service/       # 业务服务层
-│   │   │   ├── utils/         # 工具函数
-│   │   │   ├── config.rs      # 配置管理
-│   │   │   ├── main.rs        # 主程序入口
-│   │   │   └── router.rs      # 路由配置
+.
+├── crates
+│   ├── acp_adapter
+│   │   ├── src
+│   │   │   ├── lib.rs
+│   │   │   ├── mention.rs
+│   │   │   └── types.rs
 │   │   └── Cargo.toml
-│   ├── acp_adapter/           # ACP 协议适配器
-│   ├── claude-code-agent/     # Claude Code 代理
-│   ├── codex-acp-agent/       # OpenAI Codex 代理
-│   ├── nuwax_parser/          # 文件解析器
-│   └── shared_types/          # 共享类型定义
-├── config.yml                 # 配置文件
-├── config.yml.example         # 配置文件示例
-├── Cargo.toml                 # Workspace 配置
-└── README.md                  # 项目说明
+│   ├── claude-code-agent
+│   │   ├── src
+│   │   │   ├── lib.rs
+│   │   │   ├── main.rs
+│   │   │   └── util.rs
+│   │   └── Cargo.toml
+│   ├── codex-acp-agent
+│   │   ├── src
+│   │   │   ├── commands
+│   │   │   │   ├── commands.rs
+│   │   │   │   └── mod.rs
+│   │   │   ├── fs
+│   │   │   │   ├── bridge.rs
+│   │   │   │   ├── mcp_server.rs
+│   │   │   │   └── mod.rs
+│   │   │   ├── agent.rs
+│   │   │   ├── lib.rs
+│   │   │   └── main.rs
+│   │   └── Cargo.toml
+│   ├── nuwax_parser
+│   │   ├── src
+│   │   │   ├── model
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── source_code.rs
+│   │   │   │   └── tests.rs
+│   │   │   ├── project_op
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── project_read.rs
+│   │   │   │   └── project_zip.rs
+│   │   │   └── lib.rs
+│   │   ├── Cargo.toml
+│   │   └── README.md
+│   ├── pingora-proxy
+│   │   ├── src
+│   │   │   ├── config.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── pingora_server.rs
+│   │   │   ├── server.rs
+│   │   │   ├── service.rs
+│   │   │   └── tests.rs
+│   │   └── Cargo.toml
+│   ├── rcoder
+│   │   ├── examples
+│   │   │   └── multimedia_chat_example.rs
+│   │   ├── src
+│   │   │   ├── handler
+│   │   │   │   ├── agent_cancel_handler.rs
+│   │   │   │   ├── agent_session_notification.rs
+│   │   │   │   ├── agent_stop_handler.rs
+│   │   │   │   ├── chat_handler.rs
+│   │   │   │   ├── health_handler.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── proxy_api.rs
+│   │   │   │   └── proxy_handler_api.rs
+│   │   │   ├── middleware
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── tracing_middleware.rs
+│   │   │   ├── model
+│   │   │   │   ├── agent_model.rs
+│   │   │   │   ├── agent_session_notify.rs
+│   │   │   │   ├── app_error.rs
+│   │   │   │   ├── attachment.rs
+│   │   │   │   ├── chat_prompt.rs
+│   │   │   │   ├── http_result.rs
+│   │   │   │   └── mod.rs
+│   │   │   ├── proxy_agent
+│   │   │   │   ├── acp_agent.rs
+│   │   │   │   ├── agent_service.rs
+│   │   │   │   ├── agent_stop_handle.rs
+│   │   │   │   ├── channel_utils.rs
+│   │   │   │   ├── claude_code_agent.rs
+│   │   │   │   ├── cleanup_task.rs
+│   │   │   │   ├── codex_agent.rs
+│   │   │   │   └── mod.rs
+│   │   │   ├── service
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── session_cache.rs
+│   │   │   ├── utils
+│   │   │   │   ├── content_builder.rs
+│   │   │   │   ├── file_utils.rs
+│   │   │   │   ├── mcp_config.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── system_prompt.rs
+│   │   │   ├── config.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── main.rs
+│   │   │   └── router.rs
+│   │   └── Cargo.toml
+│   └── shared_types
+│       ├── src
+│       │   ├── model
+│       │   │   ├── mod.rs
+│       │   │   └── model_provider.rs
+│       │   └── lib.rs
+│       └── Cargo.toml
+├── Cargo.toml
+├── config.yml
+├── README.md
+└── ...
 ```
 
-### 🔍 核心组件说明
-
-| 组件 | 说明 | 责任 |
-|------|------|------|
-| **rcoder** | 主应用程序 | HTTP 服务器、路由、中间件、业务逻辑 |
-| **acp_adapter** | ACP 协议适配器 | 统一 AI 代理通信接口 |
-| **claude-code-agent** | Claude 代理 | Claude Code CLI 集成 |
-| **codex-acp-agent** | Codex 代理 | OpenAI Codex 集成 |
-| **nuwax_parser** | 文件解析器 | 项目文件分析和处理 |
-| **shared_types** | 共享类型 | 跨 crate 数据结构定义 |
+- `crates/rcoder`: 主应用（Axum 路由、业务、配置、代理启动）
+- `crates/pingora-proxy`: Pingora 代理封装（配置、服务、服务器管理）
+- 其他 crates：协议适配、代理实现、工具与共享类型
 
 ## 配置
 
