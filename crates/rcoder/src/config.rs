@@ -48,6 +48,15 @@ pub struct AppConfig {
     pub proxy_config: Option<ProxyConfig>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    pub healthy_threshold: u32,
+    pub unhealthy_threshold: u32,
+}
+
 /// 代理配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -59,6 +68,8 @@ pub struct ProxyConfig {
     pub backend_host: String,
     /// URL 中端口参数的名称
     pub port_param: String,
+    /// 健康检查配置
+    pub health_check: HealthCheckConfig,
 }
 
 /// 配置文件路径
@@ -69,7 +80,7 @@ impl Default for AppConfig {
         Self {
             default_agent: AgentType::Codex,
             projects_dir: PathBuf::from("./project_workspace"),
-            port: 3000,
+            port: 8086,
             proxy_config: Some(ProxyConfig::default()),
         }
     }
@@ -79,9 +90,16 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             listen_port: 8080,
-            default_backend_port: 3000,
+            default_backend_port: 8086,
             backend_host: "127.0.0.1".to_string(),
             port_param: "port".to_string(),
+            health_check: HealthCheckConfig {
+                enabled: true,
+                interval_seconds: 5,
+                timeout_seconds: 1,
+                healthy_threshold: 2,
+                unhealthy_threshold: 3,
+            },
         }
     }
 }
@@ -133,6 +151,13 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             default_backend_port: cli_args.default_backend_port.unwrap_or(config.port),
             backend_host: "127.0.0.1".to_string(),
             port_param: "port".to_string(),
+            health_check: HealthCheckConfig {
+                enabled: true,
+                interval_seconds: 5,
+                timeout_seconds: 1,
+                healthy_threshold: 2,
+                unhealthy_threshold: 3,
+            },
         };
         config.proxy_config = Some(proxy_config);
         info!(
@@ -212,6 +237,13 @@ proxy_config:
   backend_host: "{}"
   # URL 中端口参数的名称 (用于从路径中提取端口号)
   port_param: "{}"
+  # 健康检查配置
+  health_check:
+    enabled: {}
+    interval_seconds: {}
+    timeout_seconds: {}
+    healthy_threshold: {}
+    unhealthy_threshold: {}
 "#,
         format!("{:?}", config.default_agent),
         config.projects_dir.display(),
@@ -219,7 +251,12 @@ proxy_config:
         config.proxy_config.as_ref().unwrap().listen_port,
         config.proxy_config.as_ref().unwrap().default_backend_port,
         config.proxy_config.as_ref().unwrap().backend_host,
-        config.proxy_config.as_ref().unwrap().port_param
+        config.proxy_config.as_ref().unwrap().port_param,
+        config.proxy_config.as_ref().unwrap().health_check.enabled,
+        config.proxy_config.as_ref().unwrap().health_check.interval_seconds,
+        config.proxy_config.as_ref().unwrap().health_check.timeout_seconds,
+        config.proxy_config.as_ref().unwrap().health_check.healthy_threshold,
+        config.proxy_config.as_ref().unwrap().health_check.unhealthy_threshold
     );
 
     fs::write(CONFIG_FILE, content_with_comments)

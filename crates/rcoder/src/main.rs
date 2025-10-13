@@ -20,7 +20,7 @@ mod utils;
 use model::*;
 
 use config::{CliArgs, load_config_with_args};
-use pingora_proxy::{PingoraServerManager, ProxyConfig};
+use pingora_proxy::{PingoraServerManager, ProxyConfig, PingoraProxyService};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
 
@@ -77,12 +77,12 @@ async fn main() -> anyhow::Result<()> {
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
     // 启动代理服务（如果启用）
-    let proxy_handle = if let Some(proxy_config) = &config.proxy_config {
+    let (proxy_handle, pingora_service_opt) = if let Some(proxy_config) = &config.proxy_config {
         info!(
             "启动 Pingora 反向代理服务，监听端口: {}",
             proxy_config.listen_port
         );
-        info!("代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
+        info!("代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/{}/health", config.port);
 
         let pingora_config = ProxyConfig {
             listen_port: proxy_config.listen_port,
@@ -93,8 +93,14 @@ async fn main() -> anyhow::Result<()> {
             verbose: false,
         };
 
-        // 创建 Pingora 服务器管理器
+        // 创建 Pingora 服务器管理器，并提取服务引用用于指标读取
         let mut server_manager = PingoraServerManager::new(pingora_config);
+        let pingora_service = server_manager.service();
+        // 启动健康检查循环（按配置）
+        if config.proxy_config.as_ref().unwrap().health_check.enabled {
+            let hc = &config.proxy_config.as_ref().unwrap().health_check;
+            pingora_service.start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
+        }
 
         // 在后台任务中启动 Pingora 服务器
         let handle = tokio::spawn(async move {
@@ -103,15 +109,16 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        Some(handle)
+        (Some(handle), Some(pingora_service))
     } else {
-        None
+        (None, None)
     };
 
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
         local_task_sender,
+        pingora_service: pingora_service_opt,
     });
 
     // 创建路由
@@ -139,12 +146,16 @@ async fn main() -> anyhow::Result<()> {
         info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
         info!("💡 示例:");
         info!(
-            "   http://localhost:{}/proxy/3000/ → http://127.0.0.1:3000/",
-            config.proxy_config.as_ref().unwrap().listen_port
+            "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
+            config.proxy_config.as_ref().unwrap().listen_port,
+            config.port,
+            config.port
         );
         info!(
-            "   http://localhost:{}/proxy/8080/api/users → http://127.0.0.1:8080/api/users",
-            config.proxy_config.as_ref().unwrap().listen_port
+            "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
+            config.proxy_config.as_ref().unwrap().listen_port,
+            config.port,
+            config.port
         );
         info!(
             "   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (动态发现)",

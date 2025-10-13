@@ -7,13 +7,17 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use chrono::Utc;
+use chrono::{Utc, DateTime};
+use tokio::time::timeout;
+use tokio::net::TcpStream;
+use std::time::Duration;
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::proxy_api::*;
 use crate::router::AppState;
+use std::sync::atomic::Ordering;
 
 /// Pingora 代理状态查询
 #[utoipa::path(
@@ -30,36 +34,65 @@ use crate::router::AppState;
 pub async fn proxy_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProxyStatus>, (StatusCode, Json<ProxyErrorResponse>)> {
-    if state.config.proxy_config.is_none() {
+    if state.config.proxy_config.is_none() || state.pingora_service.is_none() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用".to_string(),
+                message: "Pingora 代理服务未启用或不可用".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
         ));
     }
 
-    let proxy_config = state.config.proxy_config.as_ref().unwrap();
+    let svc = state.pingora_service.as_ref().unwrap();
+    let conf = svc.config().clone();
+
+    // 收集后端列表
+    let backends_arc = svc.backends();
+    let backends_map = backends_arc.read().await;
+    let backend_count = backends_map.len();
+    // 收集后端列表（从缓存快照）
+    let health_map = svc.health_snapshot().await;
+    let backends = backends_map
+        .iter()
+        .map(|(port, host)| {
+            if let Some(health) = health_map.get(port) {
+                let last_check_str = DateTime::<Utc>::from(health.last_check).to_rfc3339();
+                BackendInfo {
+                    port: *port,
+                    host: host.clone(),
+                    health_status: health.status.as_str().to_string(),
+                    last_check: last_check_str,
+                }
+            } else {
+                BackendInfo {
+                    port: *port,
+                    host: host.clone(),
+                    health_status: "unknown".to_string(),
+                    last_check: Utc::now().to_rfc3339(),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
 
     let status = ProxyStatus {
         status: "running".to_string(),
-        listen_port: proxy_config.listen_port,
-        default_backend_port: proxy_config.default_backend_port,
-        default_backend_host: proxy_config.backend_host.clone(),
-        backends: vec![], // 实际实现中可以从 Pingora 服务器获取
+        listen_port: conf.listen_port,
+        default_backend_port: conf.default_backend_port,
+        default_backend_host: conf.backend_host.clone(),
+        backends,
         load_balancer: LoadBalancerInfo {
-            algorithm: "round-robin".to_string(),
+            algorithm: if svc.use_round_robin { "round-robin".to_string() } else { "ketama".to_string() },
             health_check_enabled: true,
-            backend_count: 0,
+            backend_count,
         },
     };
 
     info!(
-        "查询代理状态: 端口 {}, 默认后端: {}:{}",
-        status.listen_port, status.default_backend_host, status.default_backend_port
+        "查询代理状态: 端口 {}, 默认后端: {}:{} (后端数: {})",
+        status.listen_port, status.default_backend_host, status.default_backend_port, backend_count
     );
 
     Ok(Json(status))
@@ -80,51 +113,64 @@ pub async fn proxy_status(
 pub async fn proxy_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProxyStats>, (StatusCode, Json<ProxyErrorResponse>)> {
-    if state.config.proxy_config.is_none() {
+    // 需要代理配置启用且服务可用
+    if state.config.proxy_config.is_none() || state.pingora_service.is_none() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用".to_string(),
+                message: "Pingora 代理服务未启用或不可用".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
         ));
     }
 
-    // 模拟统计数据，实际实现中可以从 Pingora 服务器获取
+    let svc = state.pingora_service.as_ref().unwrap();
+    let m = &svc.metrics;
+
+    let total_requests = m.total_requests.load(Ordering::Relaxed);
+    let successful_requests = m.successful_responses.load(Ordering::Relaxed);
+    let failed_requests = m.failed_responses.load(Ordering::Relaxed);
+    let avg_response_time_ms = m.avg_response_time_ms();
+
+    // 按端口统计
+    let snaps = m.port_snapshots().await;
+    let port_stats = snaps
+        .into_iter()
+        .map(|ps| {
+            let total = ps.successes + ps.failures;
+            let success_rate = if total == 0 {
+                0.0
+            } else {
+                (ps.successes as f64) / (total as f64)
+            };
+            let avg_ms = if total == 0 {
+                0.0
+            } else {
+                (ps.total_response_time_ns as f64) / 1_000_000.0 / (total as f64)
+            };
+            PortStats {
+                port: ps.port,
+                requests: ps.requests,
+                success_rate,
+                avg_response_time_ms: avg_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+
     let stats = ProxyStats {
-        total_requests: 15420,
-        successful_requests: 15200,
-        failed_requests: 220,
-        avg_response_time_ms: 35.5,
-        active_connections: 12,
-        port_stats: vec![
-            PortStats {
-                port: 3000,
-                requests: 8560,
-                success_rate: 0.987,
-                avg_response_time_ms: 28.3,
-            },
-            PortStats {
-                port: 8080,
-                requests: 4320,
-                success_rate: 0.992,
-                avg_response_time_ms: 31.2,
-            },
-            PortStats {
-                port: 9000,
-                requests: 2540,
-                success_rate: 0.978,
-                avg_response_time_ms: 45.8,
-            },
-        ],
+        total_requests,
+        successful_requests,
+        failed_requests,
+        avg_response_time_ms,
+        active_connections: m.active_connections.load(Ordering::Relaxed) as u32,
+        port_stats,
     };
 
     info!(
-        "查询代理统计: 总请求 {}, 成功率 {:.2}%",
-        stats.total_requests,
-        (stats.successful_requests as f64 / stats.total_requests as f64) * 100.0
+        "查询代理统计: 总请求 {}, 成功 {}, 失败 {}, 平均耗时 {:.2}ms",
+        stats.total_requests, stats.successful_requests, stats.failed_requests, stats.avg_response_time_ms
     );
 
     Ok(Json(stats))
@@ -145,37 +191,40 @@ pub async fn proxy_stats(
 pub async fn proxy_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProxyConfig>, (StatusCode, Json<ProxyErrorResponse>)> {
-    if state.config.proxy_config.is_none() {
+    if state.config.proxy_config.is_none() || state.pingora_service.is_none() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用".to_string(),
+                message: "Pingora 代理服务未启用或不可用".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
         ));
     }
 
-    let proxy_config = state.config.proxy_config.as_ref().unwrap();
+    let svc = state.pingora_service.as_ref().unwrap();
+    let conf = svc.config();
+    let app_conf = &state.config;
+    let hc_conf = &app_conf.proxy_config.as_ref().unwrap().health_check;
 
     let config = ProxyConfig {
-        listen_port: proxy_config.listen_port,
-        default_backend_port: proxy_config.default_backend_port,
-        default_backend_host: proxy_config.backend_host.clone(),
-        load_balancing_algorithm: "round-robin".to_string(),
+        listen_port: conf.listen_port,
+        default_backend_port: conf.default_backend_port,
+        default_backend_host: conf.backend_host.clone(),
+        load_balancing_algorithm: if svc.use_round_robin { "round-robin".to_string() } else { "ketama".to_string() },
         health_check: HealthCheckConfig {
-            enabled: true,
-            interval_seconds: 5,
-            timeout_seconds: 3,
-            healthy_threshold: 2,
-            unhealthy_threshold: 3,
+            enabled: hc_conf.enabled,
+            interval_seconds: hc_conf.interval_seconds as u32,
+            timeout_seconds: hc_conf.timeout_seconds as u32,
+            healthy_threshold: hc_conf.healthy_threshold,
+            unhealthy_threshold: hc_conf.unhealthy_threshold,
         },
     };
 
     info!(
-        "查询代理配置: 监听端口 {}, 默认后端: {}:{}",
-        config.listen_port, config.default_backend_host, config.default_backend_port
+        "查询代理配置: 监听端口 {}, 默认后端: {}:{}，LB算法: {}",
+        config.listen_port, config.default_backend_host, config.default_backend_port, config.load_balancing_algorithm
     );
 
     Ok(Json(config))

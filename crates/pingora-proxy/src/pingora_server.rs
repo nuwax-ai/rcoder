@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::{Instant, Duration};
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
@@ -49,7 +50,6 @@ impl PingoraServerManager {
         // 创建代理服务实例
         let proxy_service = self.service.create_pingora_proxy();
         let proxy_service = Arc::new(proxy_service);
-
         // 创建 HTTP 代理服务
         let mut http_proxy = pingora_proxy::http_proxy_service(
             &my_server.configuration,
@@ -112,9 +112,9 @@ struct ProxyServiceWrapper {
 
 #[async_trait::async_trait]
 impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
-    type CTX = ();
+    type CTX = crate::service::TrackingCtx;
 
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self) -> Self::CTX { crate::service::TrackingCtx { start: Instant::now(), target_port: None } }
 
     async fn upstream_peer(
         &self,

@@ -20,3 +20,10 @@ proxy_config:
   backend_host: "127.0.0.1"
   # URL 中端口参数的名称 (用于从路径中提取端口号)
   port_param: "port"
+  # 健康检查配置
+  health_check:
+    enabled: true
+    interval_seconds: 5
+    timeout_seconds: 1
+    healthy_threshold: 2
+    unhealthy_threshold: 3
