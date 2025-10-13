@@ -1,0 +1,155 @@
+# Next.js 14 AI开发规则
+
+## 项目信息
+- 框架: Next.js 14 + React 18
+- 路由: App Router
+- 语言: TypeScript
+- 样式: Tailwind CSS
+- HTTP客户端: Axios
+- 包管理: pnpm (强制要求)
+- 渲染: Server Components (默认) + Client Components
+
+## 代码规范
+1. 使用Next.js 14 App Router
+2. TypeScript严格模式
+3. 优先使用Server Components
+4. 必要时使用Client Components ('use client')
+5. 遵循React 18最佳实践
+6. 使用Tailwind CSS进行样式设计
+
+## 组件开发规则
+- 默认使用Server Components
+- 需要状态或效果时使用Client Components
+- 组件文件使用PascalCase命名
+- 使用TypeScript类型定义
+- 组件props必须定义类型
+- 使用React.memo优化客户端组件
+- 合理拆分组件，保持单一职责
+
+## Server Components规则
+1. 默认所有组件都是Server Components
+2. 不能使用useState, useEffect等客户端钩子
+3. 不能使用浏览器API
+4. 适合静态内容、SEO优化内容
+5. 直接访问数据库和文件系统
+
+## Client Components规则
+1. 在文件顶部添加'use client'
+2. 可以使用所有React Hooks
+3. 可以访问浏览器API
+4. 适合交互性强的功能
+5. 事件处理和状态管理
+
+## 数据获取规则
+1. Server Components: 直接在组件中获取数据
+2. Client Components: 使用useEffect或自定义hooks
+3. 使用async/await语法
+4. 实现加载状态和错误处理
+5. 考虑数据缓存策略
+
+## 路由和布局规则
+1. 使用App Router目录结构
+2. 每个文件夹代表一个路由段
+3. page.tsx作为页面入口
+4. layout.tsx定义布局
+5. template.tsx定义模板
+6. 使用parallel和intercepting routes
+
+## API Routes规则
+1. 在app/api目录下创建API Routes
+2. 使用Next.js API Route处理程序
+3. 实现RESTful API设计
+4. 添加类型定义和验证
+5. 实现错误处理中间件
+
+## 性能优化规则
+1. 使用Server Components减少客户端JavaScript
+2. 实现静态生成(SSG)和增量静态再生成(ISR)
+3. 使用Next.js图片优化组件
+4. 实现代码分割和懒加载
+5. 优化字体加载
+6. 使用React.memo和useMemo
+
+## SEO优化规则
+1. 使用Metadata API
+2. 实现结构化数据
+3. 优化页面标题和描述
+4. 实现面包屑导航
+5. 使用语义化HTML
+6. 优化图片Alt文本
+
+## 样式开发规则
+1. 优先使用Tailwind CSS
+2. 使用CSS Modules（必要时）
+3. 响应式设计优先
+4. 使用CSS变量（自定义主题）
+5. 优化CSS加载性能
+
+## 文件结构规则
+```
+src/
+├── app/                    # App Router
+│   ├── globals.css        # 全局样式
+│   ├── layout.tsx         # 根布局
+│   ├── page.tsx           # 首页
+│   ├── api/               # API Routes
+│   └── [route]/           # 路由页面
+├── components/            # 组件目录
+│   ├── ui/               # 基础UI组件
+│   └── [feature]/        # 功能组件
+└── lib/                  # 工具库
+    ├── api.ts            # HTTP客户端
+    ├── services.ts       # API接口
+    └── utils.ts          # 工具函数
+```
+
+## 类型定义规则
+1. 为所有API响应定义类型
+2. 为组件props定义接口
+3. 为数据库模型定义类型
+4. 使用泛型提升代码复用性
+5. 创建全局类型定义文件
+
+## 错误处理规则
+1. 使用error.js文件处理错误
+2. 实现全局错误边界
+3. API调用添加错误处理
+4. 提供用户友好的错误信息
+5. 实现错误日志记录
+
+## 安全规则
+1. 实现CSRF保护
+2. 输入验证和清理
+3. 安全的API密钥管理
+4. 实现权限验证
+5. 防止XSS攻击
+
+## Git提交规则
+```
+feat: 新功能
+fix: 修复bug
+docs: 文档更新
+style: 代码格式化
+refactor: 重构
+test: 测试相关
+chore: 构建过程或辅助工具的变动
+perf: 性能优化
+ci: CI/CD相关
+```
+
+## AI开发提示
+- 优先考虑Server Components
+- 合理使用Client Components
+- 遵循Next.js 14最佳实践
+- 考虑性能和SEO优化
+- 保持代码风格一致
+- 使用TypeScript提升代码质量
+- 实现良好的错误处理
+
+## 包管理规则
+1. 必须使用 pnpm 作为包管理器
+2. 使用 pnpm workspace 协议引用内部依赖
+3. 依赖安装: `pnpm install`
+4. 开发服务器: `pnpm dev`
+5. 构建: `pnpm build`
+6. 使用 monorepo 模式管理项目依赖

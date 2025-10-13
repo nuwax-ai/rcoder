@@ -7,6 +7,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, RingBuffer};
+use tracing::{debug, info};
 use std::sync::LazyLock;
 
 /// 全局Session缓存 - LazyLock初始化
@@ -82,7 +83,7 @@ pub fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()
     let unified_message = notify.to_unified_message();
 
     // 添加调试日志
-    tracing::debug!(
+   debug!(
         "📥 推送消息到缓存: session_id={}, message_type={:?}, sub_type={}",
         session_id,
         unified_message.message_type,
@@ -97,7 +98,7 @@ pub fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()
 
     // 记录缓存中的消息数量
     let message_count = session_data.message_count();
-    tracing::debug!(
+    debug!(
         "📊 缓存消息数量: session_id={}, count={}",
         session_id,
         message_count
@@ -110,14 +111,14 @@ pub fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()
 pub fn clear_session_messages(session_id: &str) -> usize {
     if let Some(session_data) = SESSION_CACHE.get(session_id) {
         let cleared_count = session_data.clear_messages();
-        tracing::info!(
+        info!(
             "🧹 清空 SSE 消息缓存: session_id={}, cleared_count={}",
             session_id,
             cleared_count
         );
         cleared_count
     } else {
-        tracing::debug!(
+        debug!(
             "⚠️ 试图清空不存在的 session 消息: session_id={}",
             session_id
         );
