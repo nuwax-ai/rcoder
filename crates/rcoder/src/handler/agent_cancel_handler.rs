@@ -6,12 +6,15 @@ use axum::extract::Query;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use agent_client_protocol::{CancelNotification, SessionId};
 
-use crate::{CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP, service::clear_session_messages};
+use crate::{
+    CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
+    service::clear_session_messages,
+};
 use crate::{model::AppError, model::HttpResult};
 
 /// 取消任务的查询参数
@@ -138,10 +141,7 @@ pub async fn agent_session_cancel(
             // 🧹 先清空对应 session_id 的 SSE 消息缓存，避免历史消息积压
             let cleared_count = clear_session_messages(&session_id);
             if cleared_count > 0 {
-                info!(
-                    "📝 在取消Agent任务前清空了 {} 条SSE历史消息",
-                    cleared_count
-                );
+                info!("📝 在取消Agent任务前清空了 {} 条SSE历史消息", cleared_count);
             }
 
             // 通过cancel_tx发送取消通知
@@ -169,9 +169,15 @@ pub async fn agent_session_cancel(
             }
         }
         None => {
-            error!("❌ 未找到project_id: {} 对应的活跃连接", project_id);
+            warn!(
+                "❌ 未找到project_id: {} 对应的活跃连接,无需取消agent当前任务",
+                project_id
+            );
 
-            Ok(HttpResult::error("0001", "未找到project_id对应的活跃连接"))
+            Ok(HttpResult::success(CancelResponse {
+                success: true,
+                session_id,
+            }))
         }
     }
 }
