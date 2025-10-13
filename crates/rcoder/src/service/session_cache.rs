@@ -64,6 +64,17 @@ impl SessionData {
             0
         }
     }
+
+    /// 清空所有消息（用于取消任务时清理）
+    pub fn clear_messages(&self) -> usize {
+        if let Ok(mut rb) = self.rb.lock() {
+            let cleared_count = rb.occupied_len();
+            rb.clear();
+            cleared_count
+        } else {
+            0
+        }
+    }
 }
 
 /// 便捷函数：添加SessionNotify消息（自动转换为统一格式）
@@ -93,4 +104,23 @@ pub fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()
     );
 
     Ok(())
+}
+
+/// 便捷函数：清空指定 session_id 的所有消息（用于取消任务时避免历史消息积压）
+pub fn clear_session_messages(session_id: &str) -> usize {
+    if let Some(session_data) = SESSION_CACHE.get(session_id) {
+        let cleared_count = session_data.clear_messages();
+        tracing::info!(
+            "🧹 清空 SSE 消息缓存: session_id={}, cleared_count={}",
+            session_id,
+            cleared_count
+        );
+        cleared_count
+    } else {
+        tracing::debug!(
+            "⚠️ 试图清空不存在的 session 消息: session_id={}",
+            session_id
+        );
+        0
+    }
 }

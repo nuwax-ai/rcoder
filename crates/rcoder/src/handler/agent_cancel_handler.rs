@@ -11,7 +11,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use agent_client_protocol::{CancelNotification, SessionId};
 
-use crate::{CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP};
+use crate::{CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP, service::clear_session_messages};
 use crate::{model::AppError, model::HttpResult};
 
 /// 取消任务的查询参数
@@ -134,6 +134,15 @@ pub async fn agent_session_cancel(
     match project_info {
         Some(project_info) => {
             debug!("🔍 查找session: {} 对应的agent连接", session_id);
+
+            // 🧹 先清空对应 session_id 的 SSE 消息缓存，避免历史消息积压
+            let cleared_count = clear_session_messages(&session_id);
+            if cleared_count > 0 {
+                info!(
+                    "📝 在取消Agent任务前清空了 {} 条SSE历史消息",
+                    cleared_count
+                );
+            }
 
             // 通过cancel_tx发送取消通知
             project_info
