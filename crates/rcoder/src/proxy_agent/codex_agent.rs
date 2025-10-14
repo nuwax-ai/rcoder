@@ -6,7 +6,7 @@ use agent_client_protocol::{
 };
 use agent_client_protocol::{Client, LoadSessionRequest}; // bring trait into scope for session_notification
 
-use codex_acp_agent::{CodexAgent, fs::FsBridge};
+use codex_acp_agent::{CodexAgent, FsBridge};
 use codex_core::config::{Config, ConfigOverrides};
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol_config_types::SandboxMode;
@@ -38,7 +38,7 @@ pub async fn start_codex_acp_agent_service(
     let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequest>();
 
     //todo  暂时从环境变量便利加载配置
-    let (cfg, _) = AgentType::codex_model_provider(model_provider.clone())?;
+    let (cfg, _) = AgentType::codex_model_provider(model_provider.clone()).await?;
 
     info!("Loaded codex config: {:?}", cfg);
 

@@ -49,7 +49,7 @@ impl AgentType {
     }
 
     /// 获取 codex 环境变量的模型提供商配置
-    pub fn codex_from_env() -> Result<ConfigToml> {
+    pub async fn codex_from_env() -> Result<ConfigToml> {
         // 加载配置
         // 首先获取codex home目录 (~/.codex)
         let codex_home = find_codex_home().map_err(|e| {
@@ -60,10 +60,12 @@ impl AgentType {
         info!("Codex home directory: {:?}", codex_home);
 
         // 从 ~/.codex/config.toml 加载配置
-        let config_toml_value = load_config_as_toml(&codex_home).map_err(|e| {
-            error!("Failed to load config.toml from {:?}: {}", codex_home, e);
-            anyhow::anyhow!("Failed to load config.toml from {:?}: {}", codex_home, e)
-        })?;
+        let config_toml_value = load_config_as_toml(&codex_home)
+            .await
+            .map_err(|e| {
+                error!("Failed to load config.toml from {:?}: {}", codex_home, e);
+                anyhow::anyhow!("Failed to load config.toml from {:?}: {}", codex_home, e)
+            })?;
 
         // 将TOML值转换为ConfigToml结构体
         let cfg: ConfigToml = config_toml_value.try_into().map_err(|e| {
@@ -76,7 +78,7 @@ impl AgentType {
 
     /// 获取 codex 模型提供商配置
     #[allow(dead_code)]
-    pub fn codex_model_provider(
+    pub async fn codex_model_provider(
         model_provider: Option<ModelProviderConfig>,
     ) -> Result<(ConfigToml, HashMap<String, String>)> {
         let result = match model_provider {
@@ -90,8 +92,8 @@ impl AgentType {
                 let mut cfg: ConfigToml = match find_codex_home() {
                     Ok(codex_home) => {
                         info!("Codex home directory: {:?}", codex_home);
-                        // 从 ~/.codex/config.toml 加载配置；失败时回退到默认配置
-                        match load_config_as_toml(&codex_home) {
+                        // 从 ~/.codex/config.toml 加载配置;失败时回退到默认配置
+                        match load_config_as_toml(&codex_home).await {
                             Ok(value) => match value.try_into() {
                                 Ok(cfg) => cfg,
                                 Err(e) => {
@@ -148,7 +150,7 @@ impl AgentType {
                 (cfg, merged_envs)
             }
             None => {
-                let result = AgentType::codex_from_env()?;
+                let result = AgentType::codex_from_env().await?;
                 (result, HashMap::new())
             }
         };

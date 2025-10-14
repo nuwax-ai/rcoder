@@ -3,8 +3,6 @@
 //! 提供基于 OpenAI Codex 的 AI 代理服务，通过 ACP (Agent Client Protocol) 协议实现
 //! 与 OpenAI API 的集成。
 
-pub mod agent;
-pub mod commands;
-pub mod fs;
 
-pub use agent::{ClientOp, CodexAgent};
+pub use codex_acp::*;
+

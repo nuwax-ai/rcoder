@@ -23,6 +23,7 @@ codex-core = { git = "https://github.com/openai/codex" , branch = "main" }
 claude-code-agent = { path = "../claude-code-agent" }
 pingora-proxy = { path = "../pingora-proxy" }
 
+# codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
 
 clap ={workspace = true}
 # ACP Protocol

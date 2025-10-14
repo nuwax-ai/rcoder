@@ -9,45 +9,6 @@ license.workspace = true
 name = "codex_acp_agent"
 path = "src/lib.rs"
 
-[[bin]]
-name = "codex-acp-agent"
-path = "src/main.rs"
 
 [dependencies]
-# OpenAI dependencies would go here when available
-codex-common = { git = "https://github.com/openai/codex", branch = "main", features = [
-    "cli",
-] }
-codex-core = { git = "https://github.com/openai/codex", branch = "main" }
-codex-protocol = { git = "https://github.com/openai/codex", branch = "main" }
-mcp-types = { git = "https://github.com/openai/codex", branch = "main" }
-
-# codex-acp = { git = "https://github.com/cola-io/codex-acp" , branch = "main"}
-
-agent-client-protocol = { workspace = true }
-acp-adapter = { path = "../acp_adapter" }
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-futures = { workspace = true }
-tokio = { workspace = true, features = [
-    "macros",
-    "rt",
-    "time",
-    "io-std",
-    "io-util",
-    "net",
-    "process",
-    "sync",
-] }
-tokio-util = { workspace = true, features = ["compat"] }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["raw_value"] }
-tracing = { workspace = true, features = ["log"] }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-uuid = { workspace = true }
-dirs = { workspace = true }
-diffy={workspace = true}
-
-
-[lints]
-workspace = true
+codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
