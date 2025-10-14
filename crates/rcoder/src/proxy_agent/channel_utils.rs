@@ -64,7 +64,7 @@ pub fn spawn_prompt_handler_for_agent<A>(
     mut prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
     session_id: SessionId,
     project_id: &str,
-    request_id: Option<String>,
+    _request_id: Option<String>, // 保持参数兼容性，但不再使用固定值
 ) -> tokio::task::JoinHandle<()>
 where
     A: Agent + 'static,
@@ -86,12 +86,17 @@ where
                 project_id, req.session_id.0
             );
 
+            // 动态获取最新的request_id，而不是使用闭包捕获的固定值
+            let request_id = PROJECT_AND_AGENT_INFO_MAP
+                .get(&project_id)
+                .and_then(|agent_info| agent_info.request_id.clone());
+
             // 更新agent状态为Active
             if let Some(mut agent_info) = PROJECT_AND_AGENT_INFO_MAP.get_mut(&project_id) {
                 agent_info.status = crate::model::AgentStatus::Active;
                 agent_info.last_activity = Utc::now();
-                agent_info.request_id = request_id.clone();
-                debug!("项目[{}]agent状态更新为Active", project_id);
+                // 不再修改request_id，因为它应该已经在复用时更新了
+                debug!("项目[{}]agent状态更新为Active，当前request_id: {:?}", project_id, agent_info.request_id);
             }
 
             // 发送 SessionPromptStart 通知

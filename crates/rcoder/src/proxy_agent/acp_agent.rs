@@ -208,10 +208,19 @@ pub async fn agent_worker(
             Some(agent_info) if !need_restart_agent => {
                 // 模型配置未变化，复用现有Agent服务
                 info!("复用现有Agent服务，项目ID: {}", project_id);
+                
+                let session_id = agent_info.session_id.clone();
+                let prompt_tx = agent_info.prompt_tx.clone();
+                
+                // 在使用完 agent_info 后，单独更新 request_id
+                if let Some(mut agent_info_mut) = PROJECT_AND_AGENT_INFO_MAP.get_mut(&project_id) {
+                    agent_info_mut.request_id = chat_prompt.request_id.clone();
+                    debug!("更新复用Agent的request_id: {:?}", agent_info_mut.request_id);
+                }
 
-                match build_prompt_to_acp_agent(chat_prompt, agent_info.session_id.clone()).await {
+                match build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await {
                     Ok(prompt_request) => {
-                        if let Err(e) = agent_info.prompt_tx.send(prompt_request) {
+                        if let Err(e) = prompt_tx.send(prompt_request) {
                             error!("Failed to send prompt request: {:?}", e);
                         } else {
                             debug!("Prompt已发送");
@@ -225,7 +234,7 @@ pub async fn agent_worker(
                 // 发送回执消息
                 if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
                     project_id: project_id.clone(),
-                    session_id: agent_info.session_id.to_string(),
+                    session_id: session_id.to_string(),
                 }) {
                     error!("Failed to send chat prompt response: {:?}", e);
                 }
