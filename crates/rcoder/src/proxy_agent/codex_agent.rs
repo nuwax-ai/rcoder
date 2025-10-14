@@ -238,7 +238,6 @@ pub async fn start_codex_acp_agent_service(
         prompt_rx,
         session_id.clone(),
         &chat_prompt.project_id,
-        chat_prompt.request_id.clone(),
     );
     channel_task_handles.push(prompt_handle);
 

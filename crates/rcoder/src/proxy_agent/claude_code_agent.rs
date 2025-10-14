@@ -229,7 +229,6 @@ pub async fn start_claude_code_acp_agent_service(
                     prompt_rx,
                     session_id.clone(),
                     &chat_prompt.project_id,
-                    chat_prompt.request_id.clone(),
                 );
 
                 // Rust 最佳实践：直接等待取消信号，不需要轮询

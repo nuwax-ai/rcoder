@@ -64,7 +64,6 @@ pub fn spawn_prompt_handler_for_agent<A>(
     mut prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
     session_id: SessionId,
     project_id: &str,
-    _request_id: Option<String>, // 保持参数兼容性，但不再使用固定值
 ) -> tokio::task::JoinHandle<()>
 where
     A: Agent + 'static,
@@ -88,21 +87,40 @@ where
                 project_id, req.session_id.0
             );
 
-            // 动态获取最新的request_id，而不是使用闭包捕获的固定值
-            let request_id = PROJECT_AND_AGENT_INFO_MAP
-                .get(&project_id)
-                .and_then(|agent_info| agent_info.request_id.clone());
+            // 从 PromptRequest.meta 中提取 request_id
+            let request_id = if let Some(ref meta) = req.meta {
+                let req_id = meta.get("request_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                debug!(
+                    "🔍 [channel_utils] 项目[{}] 从 PromptRequest.meta 提取 request_id={:?}",
+                    project_id, req_id
+                );
+                req_id
+            } else {
+                debug!("⚠️ [channel_utils] 项目[{}] PromptRequest.meta 为空", project_id);
+                None
+            };
 
-            // 更新agent状态为Active
+            // 更新 agent 状态为 Active（不再更新 request_id）
             if let Some(mut agent_info) = PROJECT_AND_AGENT_INFO_MAP.get_mut(&project_id) {
                 agent_info.status = crate::model::AgentStatus::Active;
                 agent_info.last_activity = Utc::now();
-                // 不再修改request_id，因为它应该已经在复用时更新了
-                debug!("项目[{}]agent状态更新为Active，当前request_id: {:?}", project_id, agent_info.request_id);
             }
 
-            // 发送 SessionPromptStart 通知
+            // 将 request_id 存入会话级别的上下文 MAP，供 session_notification 使用
+            // 注意：使用 project_id 作为 key，确保同一项目的多次请求自动覆盖为最新值
             let session_id_str = req.session_id.0.to_string();
+            if let Some(ref req_id) = request_id {
+                crate::proxy_agent::SESSION_REQUEST_CONTEXT.insert(
+                    project_id.clone(),  // 使用 project_id 而非 session_id
+                    req_id.clone(),
+                );
+                debug!(
+                    "✅ [channel_utils] 项目[{}] 将 request_id={} 存入 SESSION_REQUEST_CONTEXT (key=project_id)",
+                    project_id, req_id
+                );
+            }
             let start_notify = SessionNotify::SessionPromptStart(SessionPromptStart {
                 session_id: session_id_str.clone(),
                 request_id: request_id.clone(),

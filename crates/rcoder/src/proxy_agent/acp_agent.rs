@@ -266,6 +266,10 @@ pub async fn agent_worker(
 
                 // 从映射中移除旧的Agent信息
                 PROJECT_AND_AGENT_INFO_MAP.remove(&project_id);
+                
+                // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
+                crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(&project_id);
+                debug!("🧼 [acp_agent] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}", project_id);
 
                 // 创建新的Agent服务（执行与None分支相同的逻辑）
                 create_new_agent_service(request, chat_prompt, project_id).await;
@@ -314,9 +318,20 @@ pub async fn build_prompt_to_acp_agent(
         content_blocks.extend(attachment_blocks);
     }
 
+    // 将 request_id 放入 meta 字段，以便 channel_utils 可以提取并更新到 MAP
+    let meta = if let Some(request_id) = prompt.request_id {
+        debug!("🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta", request_id);
+        Some(serde_json::json!({
+            "request_id": request_id
+        }))
+    } else {
+        debug!("⚠️ [build_prompt] prompt.request_id 为空，meta 设为 None");
+        None
+    };
+
     Ok(PromptRequest {
         session_id,
         prompt: content_blocks,
-        meta: None,
+        meta,
     })
 }

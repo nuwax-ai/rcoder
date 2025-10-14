@@ -117,8 +117,12 @@ pub async fn agent_stop(
         .get(project_id)
         .map(|info| info.session_id.0.to_string());
 
-    // 🎯 基于RAII原则：从MAP中移除，AgentLifecycleGuard自动清理资源
+    // 🎯 基于RAII原则：从MAPcommented移除，AgentLifecycleGuard自动清理资源
     let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
+        
+    // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
+    crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
+    debug!("🧼 [agent_stop] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}", project_id);
 
     match removed {
         Some(_) => {

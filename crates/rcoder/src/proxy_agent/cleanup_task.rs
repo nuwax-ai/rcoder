@@ -159,6 +159,10 @@ impl AgentCleaner {
         if PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
             // 直接从MAP中移除，触发AgentLifecycleGuard的Drop
             let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
+            
+            // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
+            crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
+            debug!("🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}", project_id);
 
             if removed.is_some() {
                 info!(

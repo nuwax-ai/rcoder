@@ -13,11 +13,20 @@ use crate::{
 };
 pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
 use agent_client_protocol::{Client, PermissionOptionKind, PromptRequest, SessionId};
+use dashmap::DashMap;
+use std::sync::LazyLock;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::proxy_agent::agent_stop_handle::AgentStopHandleArc;
+
+/// 会话级别的 request_id 上下文映射（project_id -> request_id）
+/// 用于在 session_notification 回调中获取当前请求的 request_id
+/// 避免使用 PROJECT_AND_AGENT_INFO_MAP 导致的锁竞争问题
+/// 注意：使用 project_id 而非 session_id，确保同一项目的多次请求能自动覆盖为最新值
+pub static SESSION_REQUEST_CONTEXT: LazyLock<DashMap<String, String>> =
+    LazyLock::new(DashMap::new);
 
 /// ACP协议的连接信息
 pub struct AcpConnectionInfo {
@@ -148,14 +157,46 @@ impl Client for AcpAgentClient {
     ) -> Result<(), agent_client_protocol::Error> {
         let session_id_str = args.session_id.to_string();
 
-        // 将SessionUpdate转换为SessionNotify并存入全局缓存
-        // 尝试从 PROJECT_AND_AGENT_INFO_MAP 中找到对应的 request_id
-        // 由于 ACP 回调只提供 session_id，我们需要遍历查找对应的 project_id
-        let request_id = PROJECT_AND_AGENT_INFO_MAP
-            .iter()
-            .find(|entry| entry.value().session_id.to_string() == session_id_str)
-            .map(|entry| entry.value().request_id.clone())
-            .unwrap_or(None);
+        // 先尝试从 SessionNotification.meta 中获取 request_id
+        let request_id_from_notification = args.meta
+            .as_ref()
+            .and_then(|meta| meta.get("request_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(ref req_id) = request_id_from_notification {
+            debug!(
+                "✅ [session_notification] session_id={} 从 SessionNotification.meta 获取 request_id={}",
+                session_id_str, req_id
+            );
+        }
+
+        // 如果 SessionNotification.meta 中没有 request_id，则通过 session_id 查找 project_id，再从 SESSION_REQUEST_CONTEXT 获取
+        let request_id = request_id_from_notification.or_else(|| {
+            // 从 PROJECT_AND_AGENT_INFO_MAP 中找到对应的 project_id
+            PROJECT_AND_AGENT_INFO_MAP
+                .iter()
+                .find(|entry| entry.value().session_id.to_string() == session_id_str)
+                .and_then(|entry| {
+                    let project_id = entry.key().clone();
+                    // 使用 project_id 从 SESSION_REQUEST_CONTEXT 获取 request_id
+                    SESSION_REQUEST_CONTEXT.get(&project_id).map(|entry| {
+                        let req_id = entry.value().clone();
+                        debug!(
+                            "🔍 [session_notification] session_id={} -> project_id={} 从 SESSION_REQUEST_CONTEXT 获取 request_id={}",
+                            session_id_str, project_id, req_id
+                        );
+                        req_id
+                    })
+                })
+        });
+
+        if request_id.is_none() {
+            debug!(
+                "⚠️ [session_notification] session_id={} 未找到 request_id（SessionNotification.meta 和 SESSION_REQUEST_CONTEXT 中都没有）",
+                session_id_str
+            );
+        }
 
         let agent_update = AgentSessionUpdate {
             session_id: session_id_str.clone(),
