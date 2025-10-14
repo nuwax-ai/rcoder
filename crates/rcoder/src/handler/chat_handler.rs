@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::proxy_agent::*;
-use crate::{model::*, router::AppState};
+use crate::{model::*, router::AppState, service::clear_project_messages};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -182,6 +182,15 @@ pub async fn handle_chat(
         create_project_workspace(&new_project_id).await?;
         new_project_id
     };
+
+    // 🧹 发起新对话前，清空该项目的历史SSE消息，确保前端只看到当前对话的新消息
+    let cleared_count = clear_project_messages(&project_id, &state.sessions);
+    if cleared_count > 0 {
+        info!(
+            "📝 [chat] 发起新对话前清空了 {} 条历史SSE消息: project_id={}",
+            cleared_count, project_id
+        );
+    }
 
     // 获取项目工作目录
     let project_workspace = get_project_workspace(&project_id).await?;

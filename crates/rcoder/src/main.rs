@@ -46,12 +46,16 @@ async fn main() -> anyhow::Result<()> {
     // 创建本地任务通道
     let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    // 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
+    // 创建清理配置
     let cleanup_config = CleanupConfig {
         idle_timeout: Duration::from_secs(3600),
         cleanup_interval: Duration::from_secs(30),
     };
 
+    // 在主异步运行时中启动清理任务
+    let _cleanup_handle = start_cleanup_task(cleanup_config.clone());
+
+    // 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
     let _ = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -61,10 +65,7 @@ async fn main() -> anyhow::Result<()> {
             let local_set = tokio::task::LocalSet::new();
             local_set
                 .run_until(async move {
-                    // 启动 cleanup task（在 LocalSet 中）
-                    let _cleanup_handle = start_cleanup_task(cleanup_config.clone());
-
-                    // 运行 agent worker
+                    // 运行 agent worker（cleanup task 已移到主线程）
                     if let Err(e) = proxy_agent::agent_worker(local_task_receiver).await {
                         error!("Failed to run agent worker: {}", e);
                     }

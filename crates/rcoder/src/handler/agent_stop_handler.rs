@@ -1,11 +1,14 @@
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     model::{AgentStatusResponse, AppError, HttpResult},
     proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
+    router::AppState,
+    service::clear_project_messages,
 };
 
 /// 停止Agent请求参数
@@ -88,6 +91,7 @@ pub struct StopAgentResponse {
     description = "停止指定项目的Agent服务，用于测试和管理。基于RAII原则自动清理所有相关资源。"
 )]
 pub async fn agent_stop(
+    State(state): State<Arc<AppState>>,
     Query(query): Query<StopAgentQuery>,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     let project_id = query.project_id.trim();
@@ -101,15 +105,23 @@ pub async fn agent_stop(
 
     info!("🛑 收到停止Agent服务请求: project_id={}", project_id);
 
+    // 🧹 先清空对应 project_id 的所有 SSE 消息缓存，避免历史消息积压
+    let cleared_count = clear_project_messages(project_id, &state.sessions);
+    if cleared_count > 0 {
+        info!("📝 在停止Agent服务前清空了 {} 条项目SSE历史消息: project_id={}", cleared_count, project_id);
+    }
+
     // 检查Agent是否存在
     let agent_exists = PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id);
 
     if !agent_exists {
-        warn!("❌ 未找到Agent服务: project_id={}", project_id);
-        return Ok(HttpResult::error(
-            "AGENT_NOT_FOUND",
-            &format!("No agent service found for project_id: {}", project_id),
-        ));
+        info!("📭 Agent服务已不存在，认为停止成功: project_id={}", project_id);
+        return Ok(HttpResult::success(StopAgentResponse {
+            success: true,
+            project_id: project_id.to_string(),
+            session_id: None,
+            message: "Agent服务已不存在，停止操作成功".to_string(),
+        }));
     }
 
     // 获取session_id（用于响应）
@@ -141,14 +153,13 @@ pub async fn agent_stop(
         }
         None => {
             // 理论上不应该到这里，因为前面已经检查过存在性
-            warn!("⚠️ Agent服务已不存在: project_id={}", project_id);
-            Ok(HttpResult::error(
-                "AGENT_ALREADY_STOPPED",
-                &format!(
-                    "Agent service for project_id {} was already stopped",
-                    project_id
-                ),
-            ))
+        warn!("⚠️ Agent服务已不存在: project_id={}", project_id);
+        Ok(HttpResult::success(StopAgentResponse {
+            success: true,
+            project_id: project_id.to_string(),
+            session_id,
+            message: "Agent服务已不存在，停止操作成功".to_string(),
+        }))
         }
     }
 }

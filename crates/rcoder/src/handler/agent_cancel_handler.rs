@@ -2,20 +2,20 @@
 //!
 //! 通过ACP协议的CancelNotification来取消指定session的agent任务执行
 
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use agent_client_protocol::{CancelNotification, SessionId};
 
 use crate::{
     CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
-    service::clear_session_messages,
+    service::clear_project_messages,
 };
-use crate::{model::AppError, model::HttpResult};
+use crate::{model::AppError, model::HttpResult, router::AppState};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]
@@ -108,6 +108,7 @@ pub struct CancelResponse {
     description = "通过ACP协议发送取消通知，停止指定会话的AI代理任务执行"
 )]
 pub async fn agent_session_cancel(
+    State(state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     info!(
@@ -138,10 +139,10 @@ pub async fn agent_session_cancel(
         Some(project_info) => {
             debug!("🔍 查找session: {} 对应的agent连接", session_id);
 
-            // 🧹 先清空对应 session_id 的 SSE 消息缓存，避免历史消息积压
-            let cleared_count = clear_session_messages(&session_id);
+            // 🧹 先清空对应 project_id 的所有 SSE 消息缓存，避免历史消息积压
+            let cleared_count = clear_project_messages(&project_id, &state.sessions);
             if cleared_count > 0 {
-                info!("📝 在取消Agent任务前清空了 {} 条SSE历史消息", cleared_count);
+                info!("📝 在取消Agent任务前清空了 {} 条项目SSE历史消息: project_id={}", cleared_count, project_id);
             }
 
             // 通过cancel_tx发送取消通知
