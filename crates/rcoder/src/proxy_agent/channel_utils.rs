@@ -71,7 +71,9 @@ where
 {
     let project_id = project_id.to_string();
     tokio::task::spawn_local(async move {
+        info!("🚀 项目[{}]Prompt处理任务已启动，开始监听消息...", project_id);
         while let Some(mut req) = prompt_rx.recv().await {
+            info!("📨 项目[{}]从prompt_rx接收到Prompt消息", project_id);
             if req.session_id.0 != session_id.0 {
                 warn!(
                     "项目[{}]收到Prompt的session_id({})与当前agent会话({})不一致，强制覆盖为当前会话",

@@ -161,7 +161,9 @@ impl LocalSetAgentRequest {
 pub async fn agent_worker(
     mut request_rx: mpsc::UnboundedReceiver<LocalSetAgentRequest>,
 ) -> Result<()> {
+    info!("🚀 agent_worker 启动，开始监听请求...");
     while let Some(request) = request_rx.recv().await {
+        info!("📨 agent_worker 接收到新请求，project_id: {}", request.chat_prompt.project_id);
         let mut chat_prompt = request.chat_prompt.clone();
 
         let original_path = chat_prompt.project_path;
@@ -193,9 +195,17 @@ pub async fn agent_worker(
             }
         }
 
+        info!("🔍 处理完路径，准备查找Agent，project_id: {}", request.chat_prompt.project_id);
+
         // 检查 project_id 有对应的agent 服务,没有则创建
         let project_id = request.chat_prompt.project_id.clone();
         let project_and_agent_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
+        
+        if project_and_agent_info.is_some() {
+            info!("✅ 找到现有Agent，project_id: {}", project_id);
+        } else {
+            info!("❌ 未找到现有Agent，将创建新Agent，project_id: {}", project_id);
+        }
 
         // 检查是否需要因模型配置变化而重启Agent服务
         let need_restart_agent = if let Some(ref agent_info) = project_and_agent_info {
@@ -212,31 +222,37 @@ pub async fn agent_worker(
                 let session_id = agent_info.session_id.clone();
                 let prompt_tx = agent_info.prompt_tx.clone();
                 
-                // 在使用完 agent_info 后，单独更新 request_id
-                if let Some(mut agent_info_mut) = PROJECT_AND_AGENT_INFO_MAP.get_mut(&project_id) {
-                    agent_info_mut.request_id = chat_prompt.request_id.clone();
-                    debug!("更新复用Agent的request_id: {:?}", agent_info_mut.request_id);
-                }
+                debug!("复用Agent - session_id: {}, prompt_tx可用", session_id.0);
+                
+                // 注意：不在这里更新 request_id，因为 get_mut 会需要写锁，
+                // 可能与正在执行的 Prompt 处理任务产生锁冲突。
+                // 直接将 request_id 包含在 ChatPrompt 中，在构建 PromptRequest 时使用。
+                debug!("使用请求中的request_id: {:?}", chat_prompt.request_id);
 
+                debug!("开始构建Prompt请求，项目ID: {}", project_id);
                 match build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await {
                     Ok(prompt_request) => {
+                        info!("Prompt请求构建成功，准备发送到channel，项目ID: {}", project_id);
                         if let Err(e) = prompt_tx.send(prompt_request) {
-                            error!("Failed to send prompt request: {:?}", e);
+                            error!("❌ 发送Prompt请求到channel失败: {:?}", e);
                         } else {
-                            debug!("Prompt已发送");
+                            info!("✅ Prompt请求已成功发送到channel，项目ID: {}", project_id);
                         }
                     }
                     Err(e) => {
-                        error!("Failed to build prompt request for existing agent: {}", e);
+                        error!("❌ 构建Prompt请求失败: {}", e);
                     }
                 }
 
                 // 发送回执消息
+                debug!("准备发送回执消息，项目ID: {}", project_id);
                 if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
                     project_id: project_id.clone(),
                     session_id: session_id.to_string(),
                 }) {
-                    error!("Failed to send chat prompt response: {:?}", e);
+                    error!("发送回执消息失败: {:?}", e);
+                } else {
+                    info!("✅ 回执消息发送成功，项目ID: {}", project_id);
                 }
             }
             Some(agent_info) => {
