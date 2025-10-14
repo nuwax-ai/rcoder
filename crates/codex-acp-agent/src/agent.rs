@@ -87,7 +87,7 @@ impl SessionModeLookup {
     }
 }
 
-#[derive(Clone)]
+// #[derive(Clone)]
 pub struct CodexAgent {
     pub(crate) session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
     pub(crate) sessions: Rc<RefCell<HashMap<String, SessionState>>>,

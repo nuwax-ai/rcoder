@@ -90,7 +90,7 @@ pub async fn start_codex_acp_agent_service(
 
     // 两端连接
     let (server_conn, server_io_task) = AgentSideConnection::new(
-        agent.clone(),
+        agent,
         agent_to_client_tx,
         client_to_agent_rx,
         |fut| {
