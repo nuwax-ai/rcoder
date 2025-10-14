@@ -61,6 +61,10 @@ pub struct ChatResponse {
     pub session_id: String,
     /// 可选的错误信息
     pub error: Option<String>,
+    /// 请求ID，用于标识和追踪请求
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "req_123456789")]
+    pub request_id: Option<String>,
 }
 
 /// 生成不带中划线的随机项目ID
@@ -217,6 +221,7 @@ pub async fn handle_chat(
                 project_id: chat_prompt_response.project_id,
                 session_id: chat_prompt_response.session_id,
                 error: None,
+                request_id: request.request_id.clone(),
             })
         }
         Err(e) => {
