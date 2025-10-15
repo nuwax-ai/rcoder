@@ -13,7 +13,6 @@ use agent_client_protocol::{CancelNotification, SessionId};
 
 use crate::{
     CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
-    service::clear_project_messages,
 };
 use crate::{model::AppError, model::HttpResult, router::AppState};
 
@@ -108,7 +107,7 @@ pub struct CancelResponse {
     description = "通过ACP协议发送取消通知，停止指定会话的AI代理任务执行"
 )]
 pub async fn agent_session_cancel(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     info!(
@@ -139,10 +138,13 @@ pub async fn agent_session_cancel(
         Some(project_info) => {
             debug!("🔍 查找session: {} 对应的agent连接", session_id);
 
-            // 🧹 先清空对应 project_id 的所有 SSE 消息缓存，避免历史消息积压
-            let cleared_count = clear_project_messages(&project_id, &state.sessions);
-            if cleared_count > 0 {
-                info!("📝 在取消Agent任务前清空了 {} 条项目SSE历史消息: project_id={}", cleared_count, project_id);
+            // 🧹 彻底清空该 session 的所有数据（ringbuf + channel + 设置取消标志）
+            if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
+                let cleared_count = session_data.clear_all();
+                info!(
+                    "🧹 已彻底清空 session 数据并设置取消标志: session_id={}, cleared_count={}",
+                    session_id, cleared_count
+                );
             }
 
             // 通过cancel_tx发送取消通知

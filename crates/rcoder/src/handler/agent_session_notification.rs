@@ -7,11 +7,10 @@ use axum::{
     extract::Path,
     response::sse::{Event, Sse},
 };
-use futures::stream::{self, Stream};
+use futures::stream::Stream;
 use serde::Deserialize;
 use serde::Serialize;
 use std::{convert::Infallible, time::Duration};
-use tokio::time::{Instant, sleep};
 use tracing::{debug, info};
 use utoipa::{IntoParams, ToSchema};
 
@@ -359,111 +358,95 @@ pub async fn agent_session_notification(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     info!("🔌 SSE连接建立: session_id={}", params.session_id);
 
-    // 定义心跳间隔（30秒）
-    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
     let session_id = params.session_id.clone();
 
-    // 【单连接限制】新连接建立时，先触发断开信号断开旧连接
-    if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-        session_data.trigger_disconnect();
-        info!(
-            "🔌 [单连接限制] 新SSE连接建立，断开旧连接: session_id={}",
-            session_id
-        );
-        // 等待一小段时间确保旧连接已经断开
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
-
-    // 获取或创建 SessionData，然后重置断开信号为 false
+    // 获取或创建 SessionData
     let session_data = SESSION_CACHE
         .entry(session_id.clone())
         .or_insert_with(|| crate::service::SessionData::new(1000));
     
-    // 重置断开信号，确保新连接不会立即被断开
-    session_data.reset_disconnect();
-    
-    // 获取断开信号接收端（用于监听后续的断开请求）
-    let mut disconnect_rx = session_data.subscribe_disconnect();
+    // 创建新连接，同时自动取消旧连接（无需手动 trigger 和 sleep）
+    let (mut rx, cancel_token) = session_data.create_new_connection(100);
+
+    // 先发送 ringbuf 中的历史消息到 channel
+    let history_messages = session_data.drain_messages();
+    if !history_messages.is_empty() {
+        info!(
+            "📦 准备发送 {} 条历史消息: session_id={}",
+            history_messages.len(),
+            session_id
+        );
+        for msg in history_messages {
+            // 发送到 channel
+            session_data.send_to_channel(msg);
+        }
+    }
 
     // 创建SSE流
     let stream = async_stream::stream! {
-        let mut last_message_time = Instant::now();
+        // 心跳定时器（30秒）
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
+        // 跳过第一次立即触发
+        heartbeat_interval.tick().await;
 
         loop {
-            // 使用 biased select! 优先处理消息，再检查断开信号
             tokio::select! {
                 biased;
                 
-                // 优先检查消息（每100ms轮询一次）
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    // 检查是否收到断开信号
-                    if *disconnect_rx.borrow() {
-                        info!(
-                            "🔌 检测到SSE断开信号，主动断开连接: session_id={}",
-                            session_id
-                        );
-                        break; // 结束流
-                    }
+                // 优先监听取消令牌（旧连接会在这里立即退出）
+                _ = cancel_token.cancelled() => {
+                    info!(
+                        "🔌 检测到连接被取消（新连接建立），断开旧连接: session_id={}",
+                        session_id
+                    );
+                    break;
+                }
+                
+                // 接收实时消息
+                Some(msg) = rx.recv() => {
+                    debug!(
+                        "📤 发送消息到 session: {}, type: {:?}",
+                        session_id, msg.message_type
+                    );
 
-                    // 获取一条消息
-                    if let Some(session_data) = SESSION_CACHE.get(&session_id)
-                        && let Some(msg) = session_data.pop_message()
-                    {
-                        debug!(
-                            "📤 发送消息到 session: {}, type: {:?}",
-                            session_id, msg.message_type
-                        );
+                    // 根据消息类型动态设置事件名称
+                    let event_name = match msg.message_type {
+                        crate::model::SessionMessageType::SessionPromptStart => {
+                            info!("📝 发送 prompt_start 消息到 session: {}", session_id);
+                            "prompt_start"
+                        }
+                        crate::model::SessionMessageType::SessionPromptEnd => {
+                            info!(
+                                "🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}",
+                                session_id,
+                                msg.data.get("reason")
+                            );
+                            "prompt_end"
+                        }
+                        crate::model::SessionMessageType::AgentSessionUpdate => {
+                            debug!(
+                                "🔄 发送 {} 消息到 session: {}",
+                                msg.sub_type, session_id
+                            );
+                            &msg.sub_type
+                        }
+                        crate::model::SessionMessageType::Heartbeat => "heartbeat",
+                    };
 
-                        // 根据消息类型动态设置事件名称
-                        let event_name = match msg.message_type {
-                            crate::model::SessionMessageType::SessionPromptStart => {
-                                info!("📝 发送 prompt_start 消息到 session: {}", session_id);
-                                "prompt_start"
-                            }
-                            crate::model::SessionMessageType::SessionPromptEnd => {
-                                info!(
-                                    "🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}",
-                                    session_id,
-                                    msg.data.get("reason")
-                                );
-                                "prompt_end"
-                            }
-                            crate::model::SessionMessageType::AgentSessionUpdate => {
-                                debug!(
-                                    "🔄 发送 {} 消息到 session: {}",
-                                    msg.sub_type, session_id
-                                );
-                                &msg.sub_type
-                            }
-                            crate::model::SessionMessageType::Heartbeat => "heartbeat",
-                        };
+                    let event: Event = Event::default()
+                        .event(event_name)
+                        .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
 
-                        let event: Event = Event::default()
-                            .event(event_name)
-                            .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
-
-                        // 更新最后消息时间并yield事件
-                        last_message_time = Instant::now();
-                        yield Ok(event);
-                        continue;
-                    }
-
-                    // 检查是否需要发送心跳消息
-                    let elapsed = last_message_time.elapsed();
-                    if elapsed >= HEARTBEAT_INTERVAL {
-                        debug!("💓 发送心跳消息到 session: {}", session_id);
-
-                        // 创建心跳消息
+                    yield Ok(event);
+                }
+                
+                // 心跳定时器
+                _ = heartbeat_interval.tick() => {
+                    debug!("💓 发送心跳消息到 session: {}", session_id);
+                    
+                    if let Some(session_data) = SESSION_CACHE.get(&session_id) {
                         let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id.clone());
-                        let event: Event = Event::default().event("heartbeat").data(
-                            serde_json::to_string(&heartbeat_msg)
-                                .unwrap_or_else(|_| "{}".to_string()),
-                        );
-
-                        // 更新最后消息时间并yield心跳事件
-                        last_message_time = Instant::now();
-                        yield Ok(event);
+                        session_data.send_to_channel(heartbeat_msg);
                     }
                 }
             }
