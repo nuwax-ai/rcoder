@@ -203,7 +203,7 @@ pub async fn handle_chat(
                 project_id, agent_info.status
             );
             return Ok(crate::model::HttpResult::error(
-                "1010",
+                "9010",
                 "Agent正在执行任务，请等待当前任务完成后再发送新请求",
             ));
         }
