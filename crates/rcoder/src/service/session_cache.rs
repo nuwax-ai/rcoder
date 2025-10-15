@@ -85,11 +85,12 @@ impl SessionData {
 
     /// 创建新连接，同时取消旧连接
     /// 
-    /// 返回 (receiver, cancellation_token)
+    /// 返回 (sender, receiver, cancellation_token)
+    /// - sender: 用于发送消息的 channel 发送端（该连接独享，用于心跳）
     /// - receiver: 用于接收消息的 channel 接收端
     /// - cancellation_token: 用于监听连接取消的令牌
     pub fn create_new_connection(&self, buffer_size: usize) 
-        -> (mpsc::Receiver<UnifiedSessionMessage>, CancellationToken) 
+        -> (mpsc::Sender<UnifiedSessionMessage>, mpsc::Receiver<UnifiedSessionMessage>, CancellationToken) 
     {
         // 1. 取消旧连接
         if let Ok(old_token) = self.cancellation_token.read() {
@@ -106,7 +107,7 @@ impl SessionData {
         // 3. 创建新的消息 channel
         let (tx, rx) = mpsc::channel(buffer_size);
         if let Ok(mut channel_tx) = self.tx.write() {
-            *channel_tx = Some(tx);
+            *channel_tx = Some(tx.clone());
         }
         
         // 4. 重置取消标志
@@ -114,7 +115,8 @@ impl SessionData {
         
         info!("📡 创建新连接和取消令牌，buffer_size={}", buffer_size);
         
-        (rx, new_token)
+        // 返回 tx 副本，让每个连接持有独立的 sender
+        (tx, rx, new_token)
     }
 
     /// 设置取消状态

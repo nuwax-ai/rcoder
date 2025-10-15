@@ -259,12 +259,22 @@ pub async fn agent_worker(
                 // 模型配置发生变化，需要重启Agent服务
                 info!("检测到模型配置变化，重启Agent服务，项目ID: {}", project_id);
 
-                // 停止现有Agent服务
-                if let Err(e) = stop_existing_agent_service(&project_id, &agent_info).await {
-                    error!("停止现有Agent服务失败: {}", e);
+                // ⚠️ 死锁修复：先克隆需要的数据，然后释放读锁，再执行写操作
+                // 1. 克隆 lifecycle_guard（用于停止 agent）
+                let lifecycle_guard = agent_info.lifecycle_guard.clone();
+                let agent_type = crate::model::AgentType::from_model_provider(agent_info.model_provider.as_ref());
+                
+                // 2. 显式释放读锁（agent_info 是 DashMap 的 Ref，持有读锁）
+                //    必须在调用 stop 和 remove 之前释放，否则会死锁
+                drop(agent_info);
+                
+                // 3. 现在可以安全地执行 stop（不持有 MAP 的读锁）
+                info!("[{}] 停止旧 Agent 服务: {}", agent_type.agent_type_name(), project_id);
+                if let Err(e) = lifecycle_guard.stop_async().await {
+                    error!("停止 Agent 服务失败: {}", e);
                 }
 
-                // 从映射中移除旧的Agent信息
+                // 4. 释放读锁后，可以安全地获取写锁并 remove
                 PROJECT_AND_AGENT_INFO_MAP.remove(&project_id);
                 
                 // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id

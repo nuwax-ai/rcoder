@@ -11,7 +11,8 @@ use futures::stream::Stream;
 use serde::Deserialize;
 use serde::Serialize;
 use std::{convert::Infallible, time::Duration};
-use tracing::{debug, info};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 /// SSE 事件响应结构
@@ -366,7 +367,8 @@ pub async fn agent_session_notification(
         .or_insert_with(|| crate::service::SessionData::new(1000));
     
     // 创建新连接，同时自动取消旧连接（无需手动 trigger 和 sleep）
-    let (mut rx, cancel_token) = session_data.create_new_connection(100);
+    // tx: 该连接独享的 sender，用于发送心跳（避免多连接竞态）
+    let (tx, mut rx, cancel_token) = session_data.create_new_connection(100);
 
     // 先发送 ringbuf 中的历史消息到 channel
     let history_messages = session_data.drain_messages();
@@ -444,9 +446,20 @@ pub async fn agent_session_notification(
                 _ = heartbeat_interval.tick() => {
                     debug!("💓 发送心跳消息到 session: {}", session_id);
                     
-                    if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                        let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id.clone());
-                        session_data.send_to_channel(heartbeat_msg);
+                    let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id.clone());
+                    // 使用本地 tx 发送心跳，避免多连接竞态问题
+                    // 旧连接的心跳定时器即使还在运行，也只会发送到自己的 tx（已无接收端）
+                    match tx.try_send(heartbeat_msg) {
+                        Ok(_) => {
+                            debug!("✅ 心跳发送成功: session_id={}", session_id);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("⚠️ 心跳发送失败（Channel已满）: session_id={}", session_id);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            debug!("🔌 心跳发送失败（Channel已关闭，连接已断开）: session_id={}", session_id);
+                            break;  // Channel 关闭说明连接已断开，主动退出循环
+                        }
                     }
                 }
             }
