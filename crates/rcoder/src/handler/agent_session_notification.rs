@@ -362,32 +362,69 @@ pub async fn agent_session_notification(
     // 定义心跳间隔（30秒）
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+    let session_id = params.session_id.clone();
+
+    // 【单连接限制】新连接建立时，先触发断开信号断开旧连接
+    if let Some(session_data) = SESSION_CACHE.get(&session_id) {
+        session_data.trigger_disconnect();
+        info!(
+            "🔌 [单连接限制] 新SSE连接建立，断开旧连接: session_id={}",
+            session_id
+        );
+        // 等待一小段时间确保旧连接已经断开
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    // 获取或创建 SessionData，然后重置断开信号为 false
+    let session_data = SESSION_CACHE
+        .entry(session_id.clone())
+        .or_insert_with(|| crate::service::SessionData::new(1000));
+    
+    // 重置断开信号，确保新连接不会立即被断开
+    session_data.reset_disconnect();
+    
+    // 获取断开信号接收端（用于监听后续的断开请求）
+    let mut disconnect_rx = session_data.subscribe_disconnect();
+
     // 创建SSE流
-    let stream = stream::unfold(
-        (params.session_id.clone(), Instant::now()),
-        move |(session_id, last_message_time)| {
-            let session_id_clone = session_id.clone();
-            async move {
-                loop {
+    let stream = async_stream::stream! {
+        let mut last_message_time = Instant::now();
+
+        loop {
+            // 使用 biased select! 优先处理消息，再检查断开信号
+            tokio::select! {
+                biased;
+                
+                // 优先检查消息（每100ms轮询一次）
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    // 检查是否收到断开信号
+                    if *disconnect_rx.borrow() {
+                        info!(
+                            "🔌 检测到SSE断开信号，主动断开连接: session_id={}",
+                            session_id
+                        );
+                        break; // 结束流
+                    }
+
                     // 获取一条消息
-                    if let Some(session_data) = SESSION_CACHE.get(&session_id_clone)
+                    if let Some(session_data) = SESSION_CACHE.get(&session_id)
                         && let Some(msg) = session_data.pop_message()
                     {
                         debug!(
                             "📤 发送消息到 session: {}, type: {:?}",
-                            session_id_clone, msg.message_type
+                            session_id, msg.message_type
                         );
 
                         // 根据消息类型动态设置事件名称
                         let event_name = match msg.message_type {
                             crate::model::SessionMessageType::SessionPromptStart => {
-                                info!("📝 发送 prompt_start 消息到 session: {}", session_id_clone);
+                                info!("📝 发送 prompt_start 消息到 session: {}", session_id);
                                 "prompt_start"
                             }
                             crate::model::SessionMessageType::SessionPromptEnd => {
                                 info!(
                                     "🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}",
-                                    session_id_clone,
+                                    session_id,
                                     msg.data.get("reason")
                                 );
                                 "prompt_end"
@@ -395,7 +432,7 @@ pub async fn agent_session_notification(
                             crate::model::SessionMessageType::AgentSessionUpdate => {
                                 debug!(
                                     "🔄 发送 {} 消息到 session: {}",
-                                    msg.sub_type, session_id_clone
+                                    msg.sub_type, session_id
                                 );
                                 &msg.sub_type
                             }
@@ -406,33 +443,34 @@ pub async fn agent_session_notification(
                             .event(event_name)
                             .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
 
-                        // 更新最后消息时间并返回事件
-                        return Some((Ok(event), (session_id_clone, Instant::now())));
+                        // 更新最后消息时间并yield事件
+                        last_message_time = Instant::now();
+                        yield Ok(event);
+                        continue;
                     }
 
                     // 检查是否需要发送心跳消息
                     let elapsed = last_message_time.elapsed();
                     if elapsed >= HEARTBEAT_INTERVAL {
-                        debug!("💓 发送心跳消息到 session: {}", session_id_clone);
+                        debug!("💓 发送心跳消息到 session: {}", session_id);
 
                         // 创建心跳消息
-                        let heartbeat_msg =
-                            UnifiedSessionMessage::heartbeat(session_id_clone.clone());
+                        let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id.clone());
                         let event: Event = Event::default().event("heartbeat").data(
                             serde_json::to_string(&heartbeat_msg)
                                 .unwrap_or_else(|_| "{}".to_string()),
                         );
 
-                        // 更新最后消息时间并返回心跳事件
-                        return Some((Ok(event), (session_id_clone, Instant::now())));
+                        // 更新最后消息时间并yield心跳事件
+                        last_message_time = Instant::now();
+                        yield Ok(event);
                     }
-
-                    // 没有消息，等待一段时间再检查
-                    sleep(Duration::from_millis(100)).await;
                 }
             }
-        },
-    );
+        }
+
+        info!("🔌 SSE连接正常关闭: session_id={}", session_id);
+    };
 
     Ok(Sse::new(stream))
 }

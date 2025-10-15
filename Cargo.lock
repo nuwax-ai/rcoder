@@ -4183,6 +4183,7 @@ dependencies = [
  "acp-adapter",
  "agent-client-protocol",
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "axum-tracing-opentelemetry",

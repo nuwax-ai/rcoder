@@ -7,6 +7,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, RingBuffer};
+use tokio::sync::watch;
 use tracing::{debug, info};
 use std::sync::LazyLock;
 
@@ -21,13 +22,36 @@ pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::ne
 pub struct SessionData {
     /// 循环消息缓存 - 固定大小1000条，使用ringbuf实现
     rb: std::sync::Mutex<HeapRb<UnifiedSessionMessage>>,
+    /// SSE断开信号通道 - 用于实现单连接限制
+    disconnect_tx: watch::Sender<bool>,
+    disconnect_rx: watch::Receiver<bool>,
 }
 
 impl SessionData {
     pub fn new(max_size: usize) -> Self {
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
         Self {
             rb: std::sync::Mutex::new(HeapRb::new(max_size)),
+            disconnect_tx,
+            disconnect_rx,
         }
+    }
+
+    /// 获取断开信号的接收端（用于SSE流监听）
+    pub fn subscribe_disconnect(&self) -> watch::Receiver<bool> {
+        self.disconnect_rx.clone()
+    }
+
+    /// 触发断开信号（用于单连接限制：新连接建立时断开旧连接）
+    pub fn trigger_disconnect(&self) {
+        let _ = self.disconnect_tx.send(true);
+        debug!("🔌 触发SSE断开信号（单连接限制）");
+    }
+
+    /// 重置断开信号（用于新连接建立后重置状态）
+    pub fn reset_disconnect(&self) {
+        let _ = self.disconnect_tx.send(false);
+        debug!("🔄 重置SSE断开信号");
     }
 
     /// 添加消息到循环缓存
