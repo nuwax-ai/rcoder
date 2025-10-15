@@ -141,6 +141,18 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
             })
         ),
         (
+            status = 409,
+            description = "Agent正在执行任务，禁止并发请求",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "code": "1010",
+                "message": "Agent正在执行任务，请等待当前任务完成后再发送新请求",
+                "tid": null
+            })
+        ),
+        (
             status = 500,
             description = "服务器内部错误",
             body = HttpResult<String>,
@@ -182,6 +194,20 @@ pub async fn handle_chat(
         create_project_workspace(&new_project_id).await?;
         new_project_id
     };
+
+    // 🚦 检查 Agent 状态，禁止并发请求
+    if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
+        if agent_info.status == AgentStatus::Active {
+            info!(
+                "⚠️ [chat] Agent正在执行任务，拒绝并发请求: project_id={}, status={:?}",
+                project_id, agent_info.status
+            );
+            return Ok(crate::model::HttpResult::error(
+                "1010",
+                "Agent正在执行任务，请等待当前任务完成后再发送新请求",
+            ));
+        }
+    }
 
     // 🧹 发起新对话前，清空该项目的历史SSE消息，确保前端只看到当前对话的新消息
     let cleared_count = clear_project_messages(&project_id, &state.sessions);
