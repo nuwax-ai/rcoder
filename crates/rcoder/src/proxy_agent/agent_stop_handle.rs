@@ -37,7 +37,14 @@ enum AgentResources {
         child_process: Arc<Mutex<Option<tokio::process::Child>>>,
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     },
-    Codex {
+    /// Codex 子进程模式（与 Claude 类似）
+    CodexSubProcess {
+        child_process: Arc<Mutex<Option<tokio::process::Child>>>,
+        stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    },
+    /// Codex 嵌入式模式（已废弃，官方不支持）
+    #[allow(dead_code)]
+    CodexEmbedded {
         client_conn: Arc<ClientSideConnection>,
         io_tasks: Arc<Mutex<Vec<JoinHandle<Result<(), anyhow::Error>>>>>,
         channel_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -70,8 +77,34 @@ impl AgentLifecycleGuard {
         Self { inner }
     }
 
-    /// 为Codex Agent创建生命周期守卫
+    /// 为Codex Agent创建生命周期守卫（子进程模式）
     pub fn new_codex(
+        project_id: String,
+        session_id: SessionId,
+        child_process: tokio::process::Child,
+        stderr_task: JoinHandle<()>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let resources = AgentResources::CodexSubProcess {
+            child_process: Arc::new(Mutex::new(Some(child_process))),
+            stderr_task: Arc::new(Mutex::new(Some(stderr_task))),
+        };
+
+        let inner = Arc::new(AgentLifecycleInner {
+            agent_type: AgentType::Codex,
+            project_id,
+            session_id,
+            cancel_token,
+            resources,
+            stopped: AtomicBool::new(false),
+        });
+
+        Self { inner }
+    }
+
+    /// 为Codex Agent创建生命周期守卫（嵌入式模式，已废弃）
+    #[allow(dead_code)]
+    pub fn new_codex_embedded(
         project_id: String,
         session_id: SessionId,
         client_conn: Arc<ClientSideConnection>,
@@ -79,7 +112,7 @@ impl AgentLifecycleGuard {
         channel_tasks: Vec<JoinHandle<()>>,
         cancel_token: CancellationToken,
     ) -> Self {
-        let resources = AgentResources::Codex {
+        let resources = AgentResources::CodexEmbedded {
             client_conn,
             io_tasks: Arc::new(Mutex::new(io_tasks)),
             channel_tasks: Arc::new(Mutex::new(channel_tasks)),
@@ -149,7 +182,20 @@ impl AgentLifecycleGuard {
                     warn!("终止Claude子进程失败: {}", e);
                 }
             }
-            AgentResources::Codex {
+            AgentResources::CodexSubProcess {
+                child_process,
+                stderr_task,
+            } => {
+                // 停止stderr任务
+                if let Some(task) = stderr_task.lock().await.take() {
+                    task.abort();
+                }
+                // 杀死子进程
+                if let Some(mut child) = child_process.lock().await.take() {
+                    let _ = child.kill().await;
+                }
+            }
+            AgentResources::CodexEmbedded {
                 io_tasks,
                 channel_tasks,
                 ..
@@ -235,7 +281,14 @@ impl Drop for AgentLifecycleGuard {
                         let _ = child.start_kill();
                     }
                 }
-                AgentResources::Codex {
+                AgentResources::CodexSubProcess { child_process, .. } => {
+                    if let Ok(mut child_guard) = child_process.try_lock()
+                        && let Some(mut child) = child_guard.take()
+                    {
+                        let _ = child.start_kill();
+                    }
+                }
+                AgentResources::CodexEmbedded {
                     io_tasks,
                     channel_tasks,
                     ..

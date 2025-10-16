@@ -19,7 +19,8 @@ shared_types = { path = "../shared_types" }
 nuwax_parser = { path = "../nuwax_parser" }
 acp-adapter = { path = "../acp_adapter" }
 codex-acp-agent = { path = "../codex-acp-agent" }
-codex-core = { git = "https://github.com/openai/codex" , branch = "main" }
+codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
+codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 claude-code-agent = { path = "../claude-code-agent" }
 pingora-proxy = { path = "../pingora-proxy" }
 
