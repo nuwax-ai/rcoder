@@ -368,7 +368,7 @@ pub async fn agent_session_notification(
     
     // 创建新连接，同时自动取消旧连接（无需手动 trigger 和 sleep）
     // tx: 该连接独享的 sender，用于发送心跳（避免多连接竞态）
-    let (tx, mut rx, cancel_token) = session_data.create_new_connection(100); // 使用异步有界channel，buffer_size=100
+    let (tx, mut rx, cancel_token) = session_data.create_new_connection(1000);
 
     // 获取历史消息并使用异步任务发送，避免阻塞 SSE 流建立
     let history_messages = session_data.drain_messages();
