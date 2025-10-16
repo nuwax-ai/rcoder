@@ -126,9 +126,9 @@ pub async fn start_codex_acp_agent_service(
             "model_providers.{}.name={}",
             provider_name, provider_name
         ));
-        // 使用 apikey 认证方式
+        // 配置 认证方式
         cli_args.push("-c".to_string());
-        cli_args.push("preferred_auth_method=apikey".to_string());
+        cli_args.push("preferred_auth_method=openai-api-key".to_string());
         
         info!("✨ Codex ACP CLI 配置覆盖参数: {:?}", cli_args);
     }
