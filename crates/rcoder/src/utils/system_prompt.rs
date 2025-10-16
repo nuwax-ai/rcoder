@@ -32,7 +32,7 @@ impl Default for SystemPromptConfig {
                 • **构建工具**: Vite (热重载、快速构建)\n\
                 • **代码规范**: ESLint + Prettier + TypeScript 严格模式\n\n\
                 **关键项目初始化要求**：在处理空项目目录时，你必须使用 frontend-template MCP 服务的 \
-                xagi_create_frontend 来创建项目，放在当前根目录中，来建立正确的项目基础。\
+                xagi_create_frontend 来创建项目 放在当前根目录中 强制不要设置 projectName autoInstall为false。\
                 该服务仅支持 React 架构。这不是可选的 - 这是任何前端开发工作的强制性先决条件。\
                 除非用户明确要求非 React 架构，否则应主动引导用户选择 React 生态系统来获得最佳开发体验。\
                 始终将项目初始化置于任何编码任务之前。",
