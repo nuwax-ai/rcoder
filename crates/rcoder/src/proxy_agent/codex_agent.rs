@@ -16,7 +16,7 @@ use crate::{
     proxy_agent::{AcpAgentClient, AcpConnectionInfo, agent_stop_handle::AgentLifecycleGuard},
     utils::create_default_mcp_servers,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tokio::task::LocalSet;
 
 /// 启动一个长驻的 Codex ACP Agent 服务，返回会话信息和一个用于持续发送 Prompt 的通道
@@ -66,6 +66,7 @@ pub async fn start_codex_acp_agent_service(
         };
         info!("  - {}={}", key, masked_value);
     }
+    info!("✨ 使用 openai-api-key 认证方法，codex-acp-agent 将自动进行认证");
     
     // 构建 CLI 配置覆盖参数（-c key=value 格式）
     let mut cli_args = Vec::<String>::new();
@@ -96,10 +97,10 @@ pub async fn start_codex_acp_agent_service(
             ));
         }
         
-        // env_key (API key 环境变量名)
+        // env_key (API key 环境变量名，使用 OPENAI_API_KEY)
         cli_args.push("-c".to_string());
         cli_args.push(format!(
-            "model_providers.{}.env_key=API_KEY",
+            "model_providers.{}.env_key=OPENAI_API_KEY",
             provider_name
         ));
         
@@ -126,9 +127,9 @@ pub async fn start_codex_acp_agent_service(
             provider_name, provider_name
         ));
         
-        // 设置认证方式为 apikey
+        // 设置认证方式为 openai-api-key（使用环境变量 OPENAI_API_KEY）
         cli_args.push("-c".to_string());
-        cli_args.push("preferred_auth_method=apikey".to_string());
+        cli_args.push("preferred_auth_method=openai-api-key".to_string());
         
         info!("✨ Codex ACP CLI 配置覆盖参数: {:?}", cli_args);
     }

@@ -17,8 +17,6 @@ use codex_core::config::{find_codex_home, load_config_as_toml};
 
 pub static CUSTOM_MODEL_PROVIDER_NAME: &str = "custom";
 
-pub static CUSTOM_MODEL_PROVIDER_API_KEY: &str = "API_KEY";
-
 /// 使用Agent代理的工具类型,都是使用ACP协议包装过的agent代理
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AgentType {
@@ -84,9 +82,10 @@ impl AgentType {
         let result = match model_provider {
             Some(model_provider) => {
                 let mut merged_envs: HashMap<String, String> = HashMap::new();
-                let api_key_name = CUSTOM_MODEL_PROVIDER_API_KEY.to_string();
                 let api_key_value = model_provider.api_key.clone();
-                merged_envs.insert(api_key_name.clone(), api_key_value);
+                // 同时设置两个环境变量，确保 codex-acp-agent 能识别
+                merged_envs.insert("API_KEY".to_string(), api_key_value.clone());
+                merged_envs.insert("OPENAI_API_KEY".to_string(), api_key_value.clone());
                 // 加载配置
                 // 首先获取codex home目录 (~/.codex)。失败则直接使用默认配置
                 let mut cfg: ConfigToml = match find_codex_home() {
@@ -132,7 +131,7 @@ impl AgentType {
                     } else {
                         Some(model_provider.base_url.clone())
                     },
-                    env_key: Some(api_key_name.clone()),
+                    env_key: Some("OPENAI_API_KEY".to_string()),
                     env_key_instructions: None,
                     wire_api: WireApi::default(),
                     query_params: None,
