@@ -307,9 +307,9 @@ pub async fn clear_project_messages(project_id: &str, sessions_map: &dashmap::Da
 /// 返回值: 如果清理了旧数据则返回清理的消息数量，否则返回0
 pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize {
     // 检查当前映射
-    if let Some(entry) = PROJECT_SESSION_MAP.get(project_id) {
-        let mapped_session_id = entry.value().clone(); // 克隆以避免借用问题
-
+    let mapped_session_id = if let Some(entry) = PROJECT_SESSION_MAP.get(project_id) {
+        let mapped_session_id = entry.value().clone();
+        
         // 如果session_id相同，不需要做任何操作
         if mapped_session_id == session_id {
             debug!(
@@ -318,7 +318,17 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             );
             return 0;
         }
-
+        
+        // ⚠️ 关键修复：显式 drop entry，释放读锁，避免后续 insert 时的读写锁冲突
+        drop(entry);
+        
+        Some(mapped_session_id)
+    } else {
+        None
+    };
+    
+    // 如果有旧映射，处理 session 变化
+    if let Some(mapped_session_id) = mapped_session_id {
         // session_id发生变化，需要清理旧session的数据
         info!(
             "🔄 检测到Project session变化: project_id={}, old_session_id={}, new_session_id={}",
@@ -328,7 +338,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
         // 清理旧session的数据
         let cleared_count = clear_session_messages(&mapped_session_id).await;
 
-        // 更新映射关系（entry会在作用域结束时自动释放）
+        // 更新映射关系（现在可以安全获取写锁）
         PROJECT_SESSION_MAP.insert(project_id.to_string(), session_id.to_string());
 
         if cleared_count > 0 {
@@ -345,7 +355,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
 
         cleared_count
     } else {
-        // 第一次建立映射关系
+        // 第一次建立映射关系（无旧映射）
         info!(
             "🆕 建立新的Project session映射: project_id={}, session_id={}",
             project_id, session_id
