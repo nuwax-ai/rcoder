@@ -9,7 +9,7 @@ use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, RingBuffer};
 use tokio::sync::mpsc::{self, Sender, Receiver};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use std::sync::{LazyLock, RwLock, atomic::{AtomicBool, Ordering}};
 
 /// 全局Session缓存 - LazyLock初始化
@@ -60,6 +60,15 @@ impl SessionData {
             messages
         } else {
             Vec::new()
+        }
+    }
+
+    /// 从缓存中取出一条消息（用于循环发送）
+    pub fn pop_message(&self) -> Option<UnifiedSessionMessage> {
+        if let Ok(mut rb) = self.rb.lock() {
+            rb.try_pop()
+        } else {
+            None
         }
     }
 
@@ -196,7 +205,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
     debug!(
         "📥 推送消息到缓存: session_id={}, message_type={:?}, sub_type={}",
         session_id,
-        unified_message.message_type,
+                                    unified_message.message_type,
         unified_message.sub_type
     );
 
@@ -212,9 +221,6 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
             message_count
         );
     }
-
-    // 2. 发送到 channel（如果存在）
-    session_data.send_to_channel(unified_message).await;
 
     Ok(())
 }

@@ -11,8 +11,7 @@ use futures::stream::Stream;
 use serde::Deserialize;
 use serde::Serialize;
 use std::{convert::Infallible, time::Duration};
-use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use utoipa::{IntoParams, ToSchema};
 
 /// SSE 事件响应结构
@@ -370,37 +369,43 @@ pub async fn agent_session_notification(
     // tx: 该连接独享的 sender，用于发送心跳（避免多连接竞态）
     let (tx, mut rx, cancel_token) = session_data.create_new_connection(1000);
 
-    // 获取历史消息并使用异步任务发送，避免阻塞 SSE 流建立
-    let history_messages = session_data.drain_messages();
-    let history_count = history_messages.len();
-    if history_count > 0 {
-        info!(
-            "📦 准备发送 {} 条历史消息: session_id={}",
-            history_count,
-            session_id
-        );
+    // 克隆需要的变量用于异步任务
+    let tx_for_history = tx.clone();
+    let session_id_for_history = session_id.clone();
 
-        // 克隆需要的变量用于异步任务
-        let tx_for_history = tx.clone();
-        let session_id_for_history = session_id.clone();
-
-        // 使用异步任务发送历史消息到 channel，避免阻塞 SSE 流建立
-        tokio::spawn(async move {
-            for msg in history_messages {
-                // 使用异步有界channel，需要 await 发送
-                match tx_for_history.send(msg).await {
-                    Ok(_) => {
-                        debug!("📤 成功发送历史消息到异步有界channel");
-                    }
-                    Err(e) => {
-                        debug!("🔌 历史消息发送失败（Channel已关闭或满）: session_id={}, error={:?}", session_id_for_history, e);
-                        break;
-                    }
+    // 启动异步任务循环发送历史消息，避免阻塞 SSE 流建立
+    tokio::spawn(async move {
+        let mut sent_count = 0;
+        
+        info!("📦 启动历史消息发送任务: session_id={}", session_id_for_history);
+        
+        // 使用循环，一条一条从全局缓存中取出并发送
+        loop {
+            // 从全局缓存中获取 session_data 并取出一条消息
+            let msg = SESSION_CACHE
+                .get(&session_id_for_history)
+                .and_then(|session_data| session_data.pop_message());
+            
+            // 如果没有消息，等待 100ms 后继续扫描
+            let Some(msg) = msg else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            
+            // 使用异步有界channel，需要 await 发送
+            match tx_for_history.send(msg).await {
+                Ok(_) => {
+                    sent_count += 1;
+                    debug!("📤 成功发送第 {} 条历史消息到异步有界channel", sent_count);
+                }
+                Err(e) => {
+                    info!("🔌 历史消息发送任务结束（Channel已关闭）: session_id={}, sent_count={}, error={:?}", 
+                        session_id_for_history, sent_count, e);
+                    break;
                 }
             }
-            debug!("✅ 历史消息发送任务完成: session_id={}, count={}", session_id_for_history, history_count);
-        });
-    }
+        }
+    });
 
     // 创建SSE流
     let stream = async_stream::stream! {
