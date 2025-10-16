@@ -11,4 +11,6 @@ path = "src/lib.rs"
 
 
 [dependencies]
-codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
+# codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
+
+codex-acp = { git = "https://github.com/zed-industries/codex-acp.git" , branch = "main" }

@@ -38,7 +38,7 @@ pub async fn start_codex_acp_agent_service(
     let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequest>();
 
     //todo  暂时从环境变量便利加载配置
-    let (cfg, _) = AgentType::codex_model_provider(model_provider.clone()).await?;
+    let (cfg, merged_envs) = AgentType::codex_model_provider(model_provider.clone()).await?;
 
     info!("Loaded codex config: {:?}", cfg);
 
@@ -50,12 +50,43 @@ pub async fn start_codex_acp_agent_service(
     config_overrides.approval_policy = Some(AskForApproval::Never);
     config_overrides.cwd = Some(project_path.clone());
 
+    // 作用域环境变量：仅在配置加载期间设置，之后立即清除
+    // 保存原始环境变量（如果存在）
+    let mut original_envs: Vec<(String, Option<String>)> = Vec::new();
+    for (key, value) in merged_envs.iter() {
+        let original_value = std::env::var(key).ok();
+        original_envs.push((key.clone(), original_value));
+        // SAFETY: 在受控作用域内临时设置环境变量，加载配置后立即清除
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        info!("🔑 临时设置环境变量（作用域内）: {}=<已隐藏>", key);
+    }
+
+    // 加载配置（此时会读取临时设置的环境变量）
     let config =
         Config::load_from_base_config_with_overrides(cfg, config_overrides, project_path.clone())
             .map_err(|e| {
             error!("Failed to load config: {}", e);
             anyhow::anyhow!("Failed to load config: {}", e)
         })?;
+
+    // 立即恢复原始环境变量（清理临时变量）
+    for (key, original_value) in original_envs {
+        // SAFETY: 恢复环境变量到之前的状态，这是在受控作用域内的清理操作
+        unsafe {
+            match original_value {
+                Some(value) => {
+                    std::env::set_var(&key, value);
+                    info!("🔄 恢复环境变量: {}=<原值>", key);
+                }
+                None => {
+                    std::env::remove_var(&key);
+                    info!("🧹 清除临时环境变量: {}", key);
+                }
+            }
+        }
+    }
 
     // 创建 FsBridge
     let fs_bridge = FsBridge::start(client_tx.clone(), config.cwd.clone())

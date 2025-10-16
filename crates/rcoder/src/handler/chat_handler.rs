@@ -248,16 +248,28 @@ pub async fn handle_chat(
 
     let result = match chat_prompt_rx.await {
         Ok(chat_prompt_response) => {
-            info!(
-                "✅ 收到 agent 执行结果: project_id={}, session_id={}",
-                chat_prompt_response.project_id, chat_prompt_response.session_id,
-            );
-            crate::model::HttpResult::success(ChatResponse {
-                project_id: chat_prompt_response.project_id,
-                session_id: chat_prompt_response.session_id,
-                error: None,
-                request_id: request.request_id.clone(),
-            })
+            // 检查响应中是否有错误
+            if let Some(error_msg) = chat_prompt_response.error {
+                error!(
+                    "❌ Agent 处理失败: project_id={}, session_id={}, error={}",
+                    chat_prompt_response.project_id, chat_prompt_response.session_id, error_msg
+                );
+                crate::model::HttpResult::error(
+                    "PROMPT001",
+                    &error_msg,
+                )
+            } else {
+                info!(
+                    "✅ 收到 agent 执行结果: project_id={}, session_id={}",
+                    chat_prompt_response.project_id, chat_prompt_response.session_id,
+                );
+                crate::model::HttpResult::success(ChatResponse {
+                    project_id: chat_prompt_response.project_id,
+                    session_id: chat_prompt_response.session_id,
+                    error: None,
+                    request_id: request.request_id.clone(),
+                })
+            }
         }
         Err(e) => {
             error!("❌ 收到 agent 执行结果失败: {}", e);

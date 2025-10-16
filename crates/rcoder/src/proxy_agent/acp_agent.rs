@@ -96,23 +96,36 @@ async fn create_new_agent_service(
             // 记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
             PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info.clone());
 
-            if let Ok(prompt_request) =
-                build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await
-            {
-                if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
-                    error!("发送prompt请求失败: {:?}", e);
-                } else {
-                    info!("Prompt 请求已发送，项目ID: {}", project_id);
+            let response = match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {
+                Ok(prompt_request) => {
+                    if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
+                        error!("发送prompt请求失败: {:?}", e);
+                        ChatPromptResponse {
+                            project_id: project_id.clone(),
+                            session_id: conn_info.session_id.to_string(),
+                            error: Some(format!("发送prompt请求失败: {:?}", e)),
+                        }
+                    } else {
+                        info!("Prompt 请求已发送，项目ID: {}", project_id);
+                        ChatPromptResponse {
+                            project_id: project_id.clone(),
+                            session_id: conn_info.session_id.to_string(),
+                            error: None,
+                        }
+                    }
                 }
-            } else {
-                error!("构建prompt请求失败，项目ID: {}", project_id);
-            }
+                Err(e) => {
+                    error!("❌ 构建prompt请求失败，项目ID: {}，错误详情: {:?}", project_id, e);
+                    ChatPromptResponse {
+                        project_id: project_id.clone(),
+                        session_id: conn_info.session_id.to_string(),
+                        error: Some(format!("构建prompt请求失败: {:?}", e)),
+                    }
+                }
+            };
 
             // 发送回执消息
-            if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
-                project_id: project_id.clone(),
-                session_id: conn_info.session_id.to_string(),
-            }) {
+            if let Err(e) = request.chat_prompt_tx.send(response) {
                 error!("发送chat prompt响应失败: {:?}", e);
             }
         }
@@ -249,6 +262,7 @@ pub async fn agent_worker(
                 if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
                     project_id: project_id.clone(),
                     session_id: session_id.to_string(),
+                    error: None,
                 }) {
                     error!("发送回执消息失败: {:?}", e);
                 } else {
