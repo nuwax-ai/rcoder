@@ -97,7 +97,7 @@ async fn create_new_agent_service(
             PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info.clone());
 
            // 建立 project_id -> session_id 映射，确保 cleanup 任务能正确识别活跃 session
-            crate::service::ensure_project_session(&project_id, &conn_info.session_id.0);
+            crate::service::ensure_project_session(&project_id, &conn_info.session_id.0).await;
             info!("🔗 建立 Project-Session 映射: project_id={}, session_id={}", project_id, conn_info.session_id.0);
 
             let response = match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {

@@ -22,7 +22,7 @@ pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::ne
 /// Session数据包装
 pub struct SessionData {
     /// 循环消息缓存 - 固定大小1000条，使用ringbuf实现（不包含heartbeat）
-    rb: std::sync::Mutex<HeapRb<UnifiedSessionMessage>>,
+    rb: tokio::sync::Mutex<HeapRb<UnifiedSessionMessage>>,
     /// 实时消息推送通道 - 使用异步有界channel
     tx: RwLock<Option<Sender<UnifiedSessionMessage>>>,
     /// 取消标志 - 取消后拒绝新消息
@@ -34,7 +34,7 @@ pub struct SessionData {
 impl SessionData {
     pub fn new(max_size: usize) -> Self {
         Self {
-            rb: std::sync::Mutex::new(HeapRb::new(max_size)),
+            rb: tokio::sync::Mutex::new(HeapRb::new(max_size)),
             tx: RwLock::new(None),
             is_cancelled: AtomicBool::new(false),
             cancellation_token: RwLock::new(CancellationToken::new()),
@@ -42,54 +42,41 @@ impl SessionData {
     }
 
     /// 添加消息到循环缓存
-    pub fn add_message(&self, message: UnifiedSessionMessage) {
-        if let Ok(mut rb) = self.rb.lock() {
-            // ringbuf 会自动循环覆盖，不需要手动检查大小
-            let _ = rb.push_overwrite(message); // 如果缓冲区满，会覆盖最老的消息
-        }
+    pub async fn add_message(&self, message: UnifiedSessionMessage) {
+        let mut rb = self.rb.lock().await;
+        // ringbuf 会自动循环覆盖，不需要手动检查大小
+        let _ = rb.push_overwrite(message); // 如果缓冲区满，会覆盖最老的消息
     }
 
     /// 获取所有消息并清空缓存（用于SSE推送）
-    pub fn drain_messages(&self) -> Vec<UnifiedSessionMessage> {
-        if let Ok(mut rb) = self.rb.lock() {
-            let mut messages = Vec::new();
-            // 读取所有可用消息
-            while let Some(message) = rb.try_pop() {
-                messages.push(message);
-            }
-            messages
-        } else {
-            Vec::new()
+    pub async fn drain_messages(&self) -> Vec<UnifiedSessionMessage> {
+        let mut rb = self.rb.lock().await;
+        let mut messages = Vec::new();
+        // 读取所有可用消息
+        while let Some(message) = rb.try_pop() {
+            messages.push(message);
         }
+        messages
     }
 
     /// 从缓存中取出一条消息（用于循环发送）
-    pub fn pop_message(&self) -> Option<UnifiedSessionMessage> {
-        if let Ok(mut rb) = self.rb.lock() {
-            rb.try_pop()
-        } else {
-            None
-        }
+    pub async fn pop_message(&self) -> Option<UnifiedSessionMessage> {
+        let mut rb = self.rb.lock().await;
+        rb.try_pop()
     }
 
     /// 获取消息数量
-    pub fn message_count(&self) -> usize {
-        if let Ok(rb) = self.rb.lock() {
-            rb.occupied_len()
-        } else {
-            0
-        }
+    pub async fn message_count(&self) -> usize {
+        let rb = self.rb.lock().await;
+        rb.occupied_len()
     }
 
     /// 清空所有消息（用于取消任务时清理）
-    pub fn clear_messages(&self) -> usize {
-        if let Ok(mut rb) = self.rb.lock() {
-            let cleared_count = rb.occupied_len();
-            rb.clear();
-            cleared_count
-        } else {
-            0
-        }
+    pub async fn clear_messages(&self) -> usize {
+        let mut rb = self.rb.lock().await;
+        let cleared_count = rb.occupied_len();
+        rb.clear();
+        cleared_count
     }
 
     /// 创建新连接，同时取消旧连接
@@ -163,7 +150,7 @@ impl SessionData {
 
     /// 彻底清空所有数据（用于取消任务）
     /// 清空 ringbuf + drop channel + 设置取消标志
-    pub fn clear_all(&self) -> usize {
+    pub async fn clear_all(&self) -> usize {
         // 1. Drop channel（自动清空未发送消息）
         if let Ok(mut channel_tx) = self.tx.write() {
             *channel_tx = None;
@@ -171,13 +158,9 @@ impl SessionData {
         }
 
         // 2. 清空 ringbuf
-        let cleared_count = if let Ok(mut rb) = self.rb.lock() {
-            let count = rb.occupied_len();
-            rb.clear();
-            count
-        } else {
-            0
-        };
+        let mut rb = self.rb.lock().await;
+        let cleared_count = rb.occupied_len();
+        rb.clear();
 
         // 3. 设置取消标志
         self.is_cancelled.store(true, Ordering::Release);
@@ -211,10 +194,10 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
 
     // 1. 存入 ringbuf（非 heartbeat 消息）
     if !matches!(unified_message.message_type, crate::model::SessionMessageType::Heartbeat) {
-        session_data.add_message(unified_message.clone());
+        session_data.add_message(unified_message.clone()).await;
         
         // 记录缓存中的消息数量
-        let message_count = session_data.message_count();
+        let message_count = session_data.message_count().await;
         debug!(
             "📊 缓存消息数量: session_id={}, count={}",
             session_id,
@@ -231,7 +214,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
 /// 当检测到session_id变化时，会自动清理旧session的数据
 pub async fn push_session_update_with_project(project_id: &str, session_id: &str, notify: SessionNotify) -> Result<()> {
     // 确保project_id对应正确的session_id，如果变化则清理旧数据
-    let cleared_count = ensure_project_session(project_id, session_id);
+    let cleared_count = ensure_project_session(project_id, session_id).await;
 
     if cleared_count > 0 {
         info!(
@@ -245,9 +228,9 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
 }
 
 /// 便捷函数：清空指定 session_id 的所有消息（用于取消任务时避免历史消息积压）
-pub fn clear_session_messages(session_id: &str) -> usize {
+pub async fn clear_session_messages(session_id: &str) -> usize {
     if let Some(session_data) = SESSION_CACHE.get(session_id) {
-        let cleared_count = session_data.clear_messages();
+        let cleared_count = session_data.clear_messages().await;
         info!(
             "🧹 清空 SSE 消息缓存: session_id={}, cleared_count={}",
             session_id,
@@ -272,7 +255,7 @@ pub fn clear_session_messages(session_id: &str) -> usize {
 /// 3. 停止服务时清空历史消息（/agent/stop 接口）
 ///
 /// 确保前端SSE连接获取的都是当前对话触发的最新消息，避免历史消息干扰
-pub fn clear_project_messages(project_id: &str, sessions_map: &dashmap::DashMap<String, crate::router::SessionInfo>) -> usize {
+pub async fn clear_project_messages(project_id: &str, sessions_map: &dashmap::DashMap<String, crate::router::SessionInfo>) -> usize {
     let mut total_cleared = 0;
 
     // 遍历所有活跃的 session，找到属于指定 project_id 的 session
@@ -284,7 +267,7 @@ pub fn clear_project_messages(project_id: &str, sessions_map: &dashmap::DashMap<
         if let Some(session_project_id) = &session_info.project_id {
             if session_project_id == project_id {
                 // 清空这个 session 的消息
-                let cleared_count = clear_session_messages(session_id);
+                let cleared_count = clear_session_messages(session_id).await;
                 total_cleared += cleared_count;
 
                 if cleared_count > 0 {
@@ -322,7 +305,7 @@ pub fn clear_project_messages(project_id: &str, sessions_map: &dashmap::DashMap<
 /// - session_id: 当前会话ID
 ///
 /// 返回值: 如果清理了旧数据则返回清理的消息数量，否则返回0
-pub fn ensure_project_session(project_id: &str, session_id: &str) -> usize {
+pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize {
     // 检查当前映射
     if let Some(entry) = PROJECT_SESSION_MAP.get(project_id) {
         let mapped_session_id = entry.value().clone(); // 克隆以避免借用问题
@@ -343,7 +326,7 @@ pub fn ensure_project_session(project_id: &str, session_id: &str) -> usize {
         );
 
         // 清理旧session的数据
-        let cleared_count = clear_session_messages(&mapped_session_id);
+        let cleared_count = clear_session_messages(&mapped_session_id).await;
 
         // 更新映射关系（entry会在作用域结束时自动释放）
         PROJECT_SESSION_MAP.insert(project_id.to_string(), session_id.to_string());

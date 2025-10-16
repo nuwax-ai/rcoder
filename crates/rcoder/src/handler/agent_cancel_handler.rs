@@ -140,7 +140,7 @@ pub async fn agent_session_cancel(
 
             // 🧹 彻底清空该 session 的所有数据（ringbuf + channel + 设置取消标志）
             if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
-                let cleared_count = session_data.clear_all();
+                let cleared_count = session_data.clear_all().await;
                 info!(
                     "🧹 已彻底清空 session 数据并设置取消标志: session_id={}, cleared_count={}",
                     session_id, cleared_count

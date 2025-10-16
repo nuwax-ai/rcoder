@@ -100,7 +100,7 @@ impl AgentCleaner {
             if !active_session_ids.contains(session_id) {
                 // 检查session中是否有消息
                 if let Some(session_data) = SESSION_CACHE.get(session_id) {
-                    let message_count = session_data.message_count();
+                    let message_count = session_data.message_count().await;
 
                     if message_count > 0 {
                         info!(
@@ -109,11 +109,11 @@ impl AgentCleaner {
                         );
 
                         // 清理这个session的消息
-                        let cleared = clear_session_messages(session_id);
+                        let cleared = clear_session_messages(session_id).await;
                         messages_cleared += cleared as u64;
 
                         // 如果清理后session为空，标记为待删除
-                        if session_data.message_count() == 0 {
+                        if session_data.message_count().await == 0 {
                             sessions_to_remove.push(session_id.clone());
                         }
 

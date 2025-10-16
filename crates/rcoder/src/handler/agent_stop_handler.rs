@@ -106,7 +106,7 @@ pub async fn agent_stop(
     info!("🛑 收到停止Agent服务请求: project_id={}", project_id);
 
     // 🧹 先清空对应 project_id 的所有 SSE 消息缓存，避免历史消息积压
-    let cleared_count = clear_project_messages(project_id, &state.sessions);
+    let cleared_count = clear_project_messages(project_id, &state.sessions).await;
     if cleared_count > 0 {
         info!("📝 在停止Agent服务前清空了 {} 条项目SSE历史消息: project_id={}", cleared_count, project_id);
     }

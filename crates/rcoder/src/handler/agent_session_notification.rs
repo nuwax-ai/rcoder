@@ -382,9 +382,11 @@ pub async fn agent_session_notification(
         // 使用循环，一条一条从全局缓存中取出并发送
         loop {
             // 从全局缓存中获取 session_data 并取出一条消息
-            let msg = SESSION_CACHE
-                .get(&session_id_for_history)
-                .and_then(|session_data| session_data.pop_message());
+            let msg = if let Some(session_data) = SESSION_CACHE.get(&session_id_for_history) {
+                session_data.pop_message().await
+            } else {
+                None
+            };
             
             // 如果没有消息，等待 100ms 后继续扫描
             let Some(msg) = msg else {
