@@ -86,6 +86,7 @@ impl AgentType {
                 // 同时设置两个环境变量，确保 codex-acp-agent 能识别
                 merged_envs.insert("API_KEY".to_string(), api_key_value.clone());
                 merged_envs.insert("OPENAI_API_KEY".to_string(), api_key_value.clone());
+                merged_envs.insert("CODEX_API_KEY".to_string(), api_key_value.clone());
                 // 加载配置
                 // 首先获取codex home目录 (~/.codex)。失败则直接使用默认配置
                 let mut cfg: ConfigToml = match find_codex_home() {

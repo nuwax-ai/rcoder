@@ -97,10 +97,10 @@ pub async fn start_codex_acp_agent_service(
             ));
         }
         
-        // env_key (API key 环境变量名，使用 OPENAI_API_KEY)
+        // env_key (API key 环境变量名，使用 CODEX_API_KEY)
         cli_args.push("-c".to_string());
         cli_args.push(format!(
-            "model_providers.{}.env_key=OPENAI_API_KEY",
+            "model_providers.{}.env_key=CODEX_API_KEY",
             provider_name
         ));
         
@@ -128,7 +128,7 @@ pub async fn start_codex_acp_agent_service(
         ));
         // 配置 认证方式
         cli_args.push("-c".to_string());
-        cli_args.push("preferred_auth_method=openai-api-key".to_string());
+        cli_args.push("preferred_auth_method=codex-api-key".to_string());
         
         info!("✨ Codex ACP CLI 配置覆盖参数: {:?}", cli_args);
     }
