@@ -368,20 +368,38 @@ pub async fn agent_session_notification(
     
     // 创建新连接，同时自动取消旧连接（无需手动 trigger 和 sleep）
     // tx: 该连接独享的 sender，用于发送心跳（避免多连接竞态）
-    let (tx, mut rx, cancel_token) = session_data.create_new_connection(100);
+    let (tx, mut rx, cancel_token) = session_data.create_new_connection(100); // 使用异步有界channel，buffer_size=100
 
-    // 先发送 ringbuf 中的历史消息到 channel
+    // 获取历史消息并使用异步任务发送，避免阻塞 SSE 流建立
     let history_messages = session_data.drain_messages();
-    if !history_messages.is_empty() {
+    let history_count = history_messages.len();
+    if history_count > 0 {
         info!(
             "📦 准备发送 {} 条历史消息: session_id={}",
-            history_messages.len(),
+            history_count,
             session_id
         );
-        for msg in history_messages {
-            // 发送到 channel
-            session_data.send_to_channel(msg);
-        }
+
+        // 克隆需要的变量用于异步任务
+        let tx_for_history = tx.clone();
+        let session_id_for_history = session_id.clone();
+
+        // 使用异步任务发送历史消息到 channel，避免阻塞 SSE 流建立
+        tokio::spawn(async move {
+            for msg in history_messages {
+                // 使用异步有界channel，需要 await 发送
+                match tx_for_history.send(msg).await {
+                    Ok(_) => {
+                        debug!("📤 成功发送历史消息到异步有界channel");
+                    }
+                    Err(e) => {
+                        debug!("🔌 历史消息发送失败（Channel已关闭或满）: session_id={}, error={:?}", session_id_for_history, e);
+                        break;
+                    }
+                }
+            }
+            debug!("✅ 历史消息发送任务完成: session_id={}, count={}", session_id_for_history, history_count);
+        });
     }
 
     // 创建SSE流
@@ -442,25 +460,16 @@ pub async fn agent_session_notification(
                     yield Ok(event);
                 }
                 
-                // 心跳定时器
+                // 心跳定时器 - 直接发送心跳事件到客户端
                 _ = heartbeat_interval.tick() => {
-                    debug!("💓 发送心跳消息到 session: {}", session_id);
-                    
+                    debug!("💓 发送心跳事件到 session: {}", session_id);
+
                     let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id.clone());
-                    // 使用本地 tx 发送心跳，避免多连接竞态问题
-                    // 旧连接的心跳定时器即使还在运行，也只会发送到自己的 tx（已无接收端）
-                    match tx.try_send(heartbeat_msg) {
-                        Ok(_) => {
-                            debug!("✅ 心跳发送成功: session_id={}", session_id);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!("⚠️ 心跳发送失败（Channel已满）: session_id={}", session_id);
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            debug!("🔌 心跳发送失败（Channel已关闭，连接已断开）: session_id={}", session_id);
-                            break;  // Channel 关闭说明连接已断开，主动退出循环
-                        }
-                    }
+                    let event: Event = Event::default()
+                        .event("heartbeat")
+                        .data(serde_json::to_string(&heartbeat_msg).unwrap_or_else(|_| "{}".to_string()));
+
+                    yield Ok(event);
                 }
             }
         }

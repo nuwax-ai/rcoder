@@ -204,7 +204,7 @@ impl Client for AcpAgentClient {
             request_id,
         };
         let notify = SessionNotify::AgentSessionUpdate(agent_update);
-        if let Err(e) = push_session_update(&session_id_str, notify) {
+        if let Err(e) = push_session_update(&session_id_str, notify).await {
             error!(
                 "❌ Failed to cache SessionUpdate for session {}: {}",
                 session_id_str, e

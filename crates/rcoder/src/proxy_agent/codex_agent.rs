@@ -57,6 +57,15 @@ pub async fn start_codex_acp_agent_service(
     // 准备环境变量和 CLI 参数
     let (_, merged_envs) = AgentType::codex_model_provider(model_provider.clone()).await?;
     info!("🔑 为 Codex ACP 子进程准备了 {} 个环境变量", merged_envs.len());
+    for (key, value) in &merged_envs {
+        // 只显示前6位和后4位，中间用*隐藏
+        let masked_value = if value.len() > 10 {
+            format!("{}...{}", &value[..6], &value[value.len()-4..])
+        } else {
+            "***".to_string()
+        };
+        info!("  - {}={}", key, masked_value);
+    }
     
     // 构建 CLI 配置覆盖参数（-c key=value 格式）
     let mut cli_args = Vec::<String>::new();
@@ -303,10 +312,11 @@ pub async fn start_codex_acp_agent_service(
             .await;
 
         if let Err(e) = result {
-            error!("Codex ACP Agent 后台任务失败: {}", e);
+            error!("Codex ACP Agent 后台任务失败: {:?}", e);
+            error!("可能原因：1) base_url 配置错误 2) API key 无效 3) 模型名称不支持");
             // 通知主线程任务失败
             let error_block = ContentBlock::Text(TextContent {
-                text: format!("Codex ACP Agent 启动失败: {}", e),
+                text: format!("Codex ACP Agent 启动失败: {:?}", e),
                 annotations: None,
                 meta: None,
             });

@@ -11,7 +11,7 @@ use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
 use crate::{
     CancelNotificationRequest, CancelNotificationResponse,
     model::{SessionNotify, SessionPromptEnd, SessionPromptStart},
-    service::push_session_update,
+    service::push_session_update_with_project,
 };
 use chrono::Utc;
 
@@ -126,7 +126,7 @@ where
                 request_id: request_id.clone(),
             });
 
-            if let Err(e) = push_session_update(&session_id_str, start_notify) {
+            if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, start_notify).await {
                 error!("项目[{}]发送SessionPromptStart失败: {:?}", project_id, e);
             }
 
@@ -144,7 +144,7 @@ where
                         error_message: None,
                         request_id: request_id.clone(),
                     });
-                    if let Err(e) = push_session_update(&session_id_str, end_notify) {
+                    if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, end_notify).await {
                         error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
                     }
 
@@ -165,7 +165,7 @@ where
                         error_message: Some(format!("{:?}", e)),
                         request_id: request_id.clone(),
                     });
-                    if let Err(e) = push_session_update(&session_id_str, end_notify) {
+                    if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, end_notify).await {
                         error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
                     }
 

@@ -96,6 +96,10 @@ async fn create_new_agent_service(
             // 记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
             PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info.clone());
 
+           // 建立 project_id -> session_id 映射，确保 cleanup 任务能正确识别活跃 session
+            crate::service::ensure_project_session(&project_id, &conn_info.session_id.0);
+            info!("🔗 建立 Project-Session 映射: project_id={}, session_id={}", project_id, conn_info.session_id.0);
+
             let response = match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {
                 Ok(prompt_request) => {
                     if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
@@ -131,6 +135,17 @@ async fn create_new_agent_service(
         }
         Err(e) => {
             error!("启动ACP Agent服务失败，项目ID: {}, 错误: {}", project_id, e);
+            
+            // 发送失败回执给前端
+            let error_response = ChatPromptResponse {
+                project_id: project_id.clone(),
+                session_id: "".to_string(), // 启动失败时没有 session_id
+                error: Some(format!("启动ACP Agent服务失败: {}", e)),
+            };
+            
+            if let Err(send_err) = request.chat_prompt_tx.send(error_response) {
+                error!("发送启动失败回执失败，项目ID: {}, 错误: {:?}", project_id, send_err);
+            }
         }
     }
 }

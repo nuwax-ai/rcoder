@@ -16,7 +16,9 @@
       "Bash(rustc:*)",
       "Bash(./test_vec_string)",
       "Bash(chmod:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(./test_sse_fix.sh:*)",
+      "Bash(curl:*)"
     ],
     "deny": [],
     "ask": []
