@@ -138,8 +138,6 @@ impl SessionData {
     pub async fn send_to_channel(&self, msg: UnifiedSessionMessage) -> bool {
         if let Ok(channel_tx) = self.tx.read() {
             if let Some(tx) = channel_tx.as_ref() {
-                // 使用异步发送，虽然 unbounded_channel 的 send() 不会阻塞，
-                // 但使用 await 更加符合异步编程的语义
                 match tx.send(msg).await {
                     Ok(_) => {
                         debug!("📤 成功异步发送消息到 channel");
@@ -216,7 +214,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
     }
 
     // 2. 发送到 channel（如果存在）
-    session_data.send_to_channel(unified_message);
+    session_data.send_to_channel(unified_message).await;
 
     Ok(())
 }
