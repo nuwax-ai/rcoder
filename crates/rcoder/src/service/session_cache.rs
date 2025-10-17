@@ -30,15 +30,26 @@ pub struct SessionData {
 
 impl SessionData {
     pub fn new(max_size: usize) -> Arc<Self> {
+        let start_time = std::time::Instant::now();
+        debug!("⏱️ [SessionData::new] 开始创建，max_size={}", max_size);
+
+        let channel_start = std::time::Instant::now();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        debug!("⏱️ [SessionData::new] channel创建耗时: {:?}", channel_start.elapsed());
+
+        let arc_start = std::time::Instant::now();
         let session = Arc::new(SessionData {
             command_tx,
             is_cancelled: AtomicBool::new(false),
             version: AtomicU64::new(0),
         });
+        debug!("⏱️ [SessionData::new] Arc创建耗时: {:?}", arc_start.elapsed());
 
+        let spawn_start = std::time::Instant::now();
         SessionWorker::spawn(max_size, command_rx, Arc::downgrade(&session));
+        debug!("⏱️ [SessionData::new] SessionWorker::spawn耗时: {:?}", spawn_start.elapsed());
 
+        debug!("⏱️ [SessionData::new] 总创建耗时: {:?}", start_time.elapsed());
         session
     }
 
@@ -63,25 +74,40 @@ impl SessionData {
         &self,
         buffer_size: usize,
     ) -> Result<(mpsc::Receiver<UnifiedSessionMessage>, CancellationToken, u64)> {
+        let start_time = std::time::Instant::now();
+        debug!("⏱️ [create_new_connection] 开始创建连接，buffer_size={}", buffer_size);
+
+        let token_start = std::time::Instant::now();
         let cancellation_token = CancellationToken::new();
+        debug!("⏱️ [create_new_connection] CancellationToken创建耗时: {:?}", token_start.elapsed());
+
+        let channel_start = std::time::Instant::now();
         let (tx, rx) = mpsc::channel(buffer_size);
         let (ack_tx, ack_rx) = oneshot::channel();
+        debug!("⏱️ [create_new_connection] mpsc channel创建耗时: {:?}", channel_start.elapsed());
 
+        let command_start = std::time::Instant::now();
         let command = SessionCommand::Register {
             sender: tx,
             cancel_token: cancellation_token.clone(),
             ack: ack_tx,
         };
+        debug!("⏱️ [create_new_connection] command创建耗时: {:?}", command_start.elapsed());
 
+        let send_start = std::time::Instant::now();
         self
             .command_tx
             .send(command)
             .map_err(|err| anyhow::anyhow!("发送注册指令失败: {}", err))?;
+        debug!("⏱️ [create_new_connection] command_tx.send耗时: {:?}", send_start.elapsed());
 
+        let wait_start = std::time::Instant::now();
         let version = ack_rx
             .await
             .map_err(|err| anyhow::anyhow!("等待注册响应失败: {}", err))?;
+        debug!("⏱️ [create_new_connection] ack_rx.await耗时: {:?}", wait_start.elapsed());
 
+        debug!("⏱️ [create_new_connection] 总连接创建耗时: {:?}", start_time.elapsed());
         Ok((rx, cancellation_token, version))
     }
 
@@ -112,12 +138,19 @@ impl SessionWorker {
         command_rx: mpsc::UnboundedReceiver<SessionCommand>,
         session: std::sync::Weak<SessionData>,
     ) {
+        let start_time = std::time::Instant::now();
+        debug!("⏱️ [SessionWorker::spawn] 开始创建SessionWorker，max_size={}", max_size);
+
         let worker = SessionWorker {
             max_size,
             command_rx,
             session,
         };
+
+        let spawn_start = std::time::Instant::now();
         tokio::spawn(worker.run());
+        debug!("⏱️ [SessionWorker::spawn] tokio::spawn耗时: {:?}", spawn_start.elapsed());
+        debug!("⏱️ [SessionWorker::spawn] 总spawn耗时: {:?}", start_time.elapsed());
     }
 
     async fn run(mut self) {
@@ -160,6 +193,9 @@ impl SessionWorker {
                     cancel_token,
                     ack,
                 } => {
+                    let register_start = std::time::Instant::now();
+                    debug!("⏱️ [SessionWorker::Register] 开始处理注册命令");
+
                     if let Some(token) = current_cancel.take() {
                         token.cancel();
                     }
@@ -168,25 +204,33 @@ impl SessionWorker {
                     current_cancel = Some(cancel_token);
 
                     // 🎯 原子化版本号递增：在 SessionWorker 中递增，确保顺序一致性
+                    let version_start = std::time::Instant::now();
                     let version = if let Some(session) = self.session.upgrade() {
                         session.version.fetch_add(1, Ordering::SeqCst) + 1
                     } else {
                         0
                     };
+                    debug!("⏱️ [SessionWorker::Register] 版本号递增耗时: {:?}", version_start.elapsed());
 
                     // 🎯 简化的历史消息处理：清空所有历史消息，确保全新开始
+                    let clear_start = std::time::Instant::now();
                     let mut cleared_count = 0;
                     while consumer.try_pop().is_some() {
                         cleared_count += 1;
                     }
                     buffered_len = 0;
+                    debug!("⏱️ [SessionWorker::Register] 清空历史消息耗时: {:?}，清理了{}条", clear_start.elapsed(), cleared_count);
 
                     if cleared_count > 0 {
                         debug!("🧹 新SSE连接(v={})，清空 {} 条历史消息", version, cleared_count);
                     }
 
                     // 返回版本号给调用者
+                    let ack_start = std::time::Instant::now();
                     let _ = ack.send(version);
+                    debug!("⏱️ [SessionWorker::Register] ack.send耗时: {:?}", ack_start.elapsed());
+
+                    debug!("⏱️ [SessionWorker::Register] 总注册处理耗时: {:?}", register_start.elapsed());
                 }
                 SessionCommand::Clear { ack } => {
                     let mut cleared = 0usize;
@@ -220,10 +264,17 @@ enum SessionCommand {
 
 /// 便捷函数：添加SessionNotify消息（自动转换为统一格式）
 pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
-    let session_data = SESSION_CACHE
-        .entry(session_id.to_string())
-        .or_insert_with(|| SessionData::new(1000))
-        .clone();
+    // 🎯 关键修复：直接获取当前 SESSION_CACHE 中的 SessionData，不自动创建新的
+    // 这样确保 Agent 使用的是 SSE 连接创建的最新 SessionData
+    let session_data = if let Some(session_data_ref) = SESSION_CACHE.get(session_id) {
+        session_data_ref.clone()
+    } else {
+        debug!(
+            "🚫 [push_session_update] session={} 不存在于 SESSION_CACHE 中，可能是 SSE 连接未建立",
+            session_id
+        );
+        return Ok(());
+    };
 
     // 🎯 源过滤逻辑：检查session是否已被用户取消且没有新的聊天请求
     // 如果session已被取消且没有新的活跃请求，则忽略消息，防止残留消息

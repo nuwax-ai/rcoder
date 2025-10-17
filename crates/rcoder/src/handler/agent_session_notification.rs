@@ -356,21 +356,27 @@ pub struct SessionNotificationParams {
 pub async fn agent_session_notification(
     Path(params): Path<SessionNotificationParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    info!("🔌 SSE连接建立: session_id={}", params.session_id);
+    let sse_start = std::time::Instant::now();
+    info!("⏱️ [SSE] 开始建立连接: session_id={}", params.session_id);
 
     let session_id = params.session_id.clone();
 
-    // 获取或创建 SessionData，并 clone Arc 以便跨异步使用
-    let session_data = SESSION_CACHE
-        .entry(session_id.clone())
-        .or_insert_with(|| crate::service::SessionData::new(1000))
-        .clone();
+    // 🎯 直接创建全新的 SessionData，覆盖插入 SESSION_CACHE
+    // 这样确保每次 SSE 连接都是全新的开始，没有任何历史消息残留
+    let cache_start = std::time::Instant::now();
+    let session_data = crate::service::SessionData::new(1000);
+    SESSION_CACHE.insert(session_id.clone(), session_data.clone());
+    info!("⏱️ [SSE] 创建并插入新SessionData耗时: {:?}", cache_start.elapsed());
 
-    // 创建新连接，同时自动取消旧连接
+    // 创建新连接
+    let connection_start = std::time::Instant::now();
     let (mut rx, cancel_token, version) = session_data
         .create_new_connection(1000)
         .await
         .map_err(AppError::from)?;
+    info!("⏱️ [SSE] create_new_connection耗时: {:?}", connection_start.elapsed());
+
+    info!("⏱️ [SSE] 总SSE连接建立耗时: {:?}", sse_start.elapsed());
 
     let session_data_for_stream = session_data.clone();
     let session_id_for_stream = session_id.clone();
