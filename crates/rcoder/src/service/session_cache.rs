@@ -372,6 +372,14 @@ pub async fn clear_project_messages(
                         project_id, session_id, cleared_count
                     );
                 }
+
+                if SESSION_CACHE.remove(session_id).is_some() {
+                    info!(
+                        "🧼 移除 SESSION_CACHE 条目: project_id={}, session_id={}",
+                        project_id,
+                        session_id
+                    );
+                }
             }
         }
     }
@@ -387,6 +395,14 @@ pub async fn clear_project_messages(
                     cleared_count
                 );
                 total_cleared += cleared_count;
+            }
+
+            if SESSION_CACHE.remove(target_session).is_some() {
+                info!(
+                    "🧼 移除指定 SESSION_CACHE 条目: project_id={}, session_id={}",
+                    project_id,
+                    target_session
+                );
             }
         }
     }
