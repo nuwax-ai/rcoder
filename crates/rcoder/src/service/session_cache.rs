@@ -341,8 +341,13 @@ pub async fn clear_session_messages(session_id: &str) -> usize {
 /// 3. 停止服务时清空历史消息（/agent/stop 接口）
 ///
 /// 确保前端SSE连接获取的都是当前对话触发的最新消息，避免历史消息干扰
-pub async fn clear_project_messages(project_id: &str, sessions_map: &dashmap::DashMap<String, crate::router::SessionInfo>) -> usize {
+pub async fn clear_project_messages(
+    project_id: &str,
+    sessions_map: &dashmap::DashMap<String, crate::router::SessionInfo>,
+    specific_session: Option<&str>,
+) -> usize {
     let mut total_cleared = 0;
+    let mut specific_session_handled = false;
 
     // 遍历所有活跃的 session，找到属于指定 project_id 的 session
     for session_entry in sessions_map.iter() {
@@ -352,6 +357,11 @@ pub async fn clear_project_messages(project_id: &str, sessions_map: &dashmap::Da
         // 检查这个 session 是否属于指定的 project_id
         if let Some(session_project_id) = &session_info.project_id {
             if session_project_id == project_id {
+                if let Some(target_session) = specific_session {
+                    if target_session == session_id {
+                        specific_session_handled = true;
+                    }
+                }
                 // 清空这个 session 的消息
                 let cleared_count = clear_session_messages(session_id).await;
                 total_cleared += cleared_count;
@@ -362,6 +372,21 @@ pub async fn clear_project_messages(project_id: &str, sessions_map: &dashmap::Da
                         project_id, session_id, cleared_count
                     );
                 }
+            }
+        }
+    }
+
+    if let Some(target_session) = specific_session {
+        if !specific_session_handled {
+            let cleared_count = clear_session_messages(target_session).await;
+            if cleared_count > 0 {
+                info!(
+                    "🧹 针对指定 session 追加清理: project_id={}, session_id={}, cleared_count={}",
+                    project_id,
+                    target_session,
+                    cleared_count
+                );
+                total_cleared += cleared_count;
             }
         }
     }
