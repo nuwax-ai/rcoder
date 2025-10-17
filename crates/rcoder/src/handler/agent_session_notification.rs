@@ -370,7 +370,7 @@ pub async fn agent_session_notification(
 
     // 创建新连接
     let connection_start = std::time::Instant::now();
-    let (mut rx, cancel_token, version) = session_data
+    let (mut rx, cancel_token) = session_data
         .create_new_connection(1000)
         .await
         .map_err(AppError::from)?;
@@ -378,7 +378,6 @@ pub async fn agent_session_notification(
 
     info!("⏱️ [SSE] 总SSE连接建立耗时: {:?}", sse_start.elapsed());
 
-    let session_data_for_stream = session_data.clone();
     let session_id_for_stream = session_id.clone();
 
     // 创建SSE流
@@ -403,16 +402,8 @@ pub async fn agent_session_notification(
                 
                 // 接收实时消息
                 Some(msg) = rx.recv() => {
-                    // 如果检测到版本已更新，说明出现了更新的连接，主动退出
-                    if session_data_for_stream.current_version() != version {
-                        info!(
-                            "🔁 检测到更新版本，关闭旧连接: session_id={}, old_version={}, current_version={}",
-                            session_id_for_stream,
-                            version,
-                            session_data_for_stream.current_version()
-                        );
-                        break;
-                    }
+                    // 🎯 极简设计：不需要版本检查，每次都是全新的 SessionData
+                    // 旧 SessionData 会自然失效，无需手动管理版本
 
                     debug!(
                         "📤 发送消息到 session: {}, type: {:?}",
@@ -452,15 +443,7 @@ pub async fn agent_session_notification(
                 
                 // 心跳定时器 - 直接发送心跳事件到客户端
                 _ = heartbeat_interval.tick() => {
-                    if session_data_for_stream.current_version() != version {
-                        info!(
-                            "🔁 心跳检测到连接版本更新，关闭旧连接: session_id={}, old_version={}, current_version={}",
-                            session_id_for_stream,
-                            version,
-                            session_data_for_stream.current_version()
-                        );
-                        break;
-                    }
+                    // 🎯 极简设计：不需要版本检查，依赖 CancellationToken 自动断开旧连接
 
                     debug!("💓 发送心跳事件到 session: {}", session_id_for_stream);
 

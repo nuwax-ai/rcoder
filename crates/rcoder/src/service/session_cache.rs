@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use std::sync::{Arc, LazyLock, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{Arc, LazyLock};
 
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(|| DashMap::new());
@@ -21,11 +21,9 @@ pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock
 pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(|| DashMap::new());
 
 
-/// Session数据包装 - 保留核心功能的简化版
+/// Session数据包装 - 极简版本，专注消息传输
 pub struct SessionData {
     command_tx: mpsc::UnboundedSender<SessionCommand>,
-    is_cancelled: AtomicBool,
-    version: AtomicU64,
 }
 
 impl SessionData {
@@ -38,29 +36,18 @@ impl SessionData {
         debug!("⏱️ [SessionData::new] channel创建耗时: {:?}", channel_start.elapsed());
 
         let arc_start = std::time::Instant::now();
-        let session = Arc::new(SessionData {
-            command_tx,
-            is_cancelled: AtomicBool::new(false),
-            version: AtomicU64::new(0),
-        });
+        let session = Arc::new(SessionData { command_tx });
         debug!("⏱️ [SessionData::new] Arc创建耗时: {:?}", arc_start.elapsed());
 
         let spawn_start = std::time::Instant::now();
-        SessionWorker::spawn(max_size, command_rx, Arc::downgrade(&session));
+        SessionWorker::spawn(max_size, command_rx);
         debug!("⏱️ [SessionData::new] SessionWorker::spawn耗时: {:?}", spawn_start.elapsed());
 
         debug!("⏱️ [SessionData::new] 总创建耗时: {:?}", start_time.elapsed());
         session
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        self.is_cancelled.load(Ordering::Acquire)
-    }
-
-    pub fn set_cancelled(&self, cancelled: bool) {
-        self.is_cancelled.store(cancelled, Ordering::Release);
-    }
-
+  
     pub async fn message_count(&self) -> usize {
         let (tx, rx) = oneshot::channel();
         if self.command_tx.send(SessionCommand::MessageCount { ack: tx }).is_err() {
@@ -73,7 +60,7 @@ impl SessionData {
     pub async fn create_new_connection(
         &self,
         buffer_size: usize,
-    ) -> Result<(mpsc::Receiver<UnifiedSessionMessage>, CancellationToken, u64)> {
+    ) -> Result<(mpsc::Receiver<UnifiedSessionMessage>, CancellationToken)> {
         let start_time = std::time::Instant::now();
         debug!("⏱️ [create_new_connection] 开始创建连接，buffer_size={}", buffer_size);
 
@@ -83,32 +70,21 @@ impl SessionData {
 
         let channel_start = std::time::Instant::now();
         let (tx, rx) = mpsc::channel(buffer_size);
-        let (ack_tx, ack_rx) = oneshot::channel();
         debug!("⏱️ [create_new_connection] mpsc channel创建耗时: {:?}", channel_start.elapsed());
 
-        let command_start = std::time::Instant::now();
+        let send_start = std::time::Instant::now();
         let command = SessionCommand::Register {
             sender: tx,
             cancel_token: cancellation_token.clone(),
-            ack: ack_tx,
         };
-        debug!("⏱️ [create_new_connection] command创建耗时: {:?}", command_start.elapsed());
-
-        let send_start = std::time::Instant::now();
         self
             .command_tx
             .send(command)
             .map_err(|err| anyhow::anyhow!("发送注册指令失败: {}", err))?;
         debug!("⏱️ [create_new_connection] command_tx.send耗时: {:?}", send_start.elapsed());
 
-        let wait_start = std::time::Instant::now();
-        let version = ack_rx
-            .await
-            .map_err(|err| anyhow::anyhow!("等待注册响应失败: {}", err))?;
-        debug!("⏱️ [create_new_connection] ack_rx.await耗时: {:?}", wait_start.elapsed());
-
         debug!("⏱️ [create_new_connection] 总连接创建耗时: {:?}", start_time.elapsed());
-        Ok((rx, cancellation_token, version))
+        Ok((rx, cancellation_token))
     }
 
     pub fn push_message(&self, message: UnifiedSessionMessage) {
@@ -121,22 +97,17 @@ impl SessionData {
         }
     }
 
-    pub fn current_version(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
     }
-}
 
 struct SessionWorker {
     max_size: usize,
     command_rx: mpsc::UnboundedReceiver<SessionCommand>,
-    session: std::sync::Weak<SessionData>,
 }
 
 impl SessionWorker {
     fn spawn(
         max_size: usize,
         command_rx: mpsc::UnboundedReceiver<SessionCommand>,
-        session: std::sync::Weak<SessionData>,
     ) {
         let start_time = std::time::Instant::now();
         debug!("⏱️ [SessionWorker::spawn] 开始创建SessionWorker，max_size={}", max_size);
@@ -144,7 +115,6 @@ impl SessionWorker {
         let worker = SessionWorker {
             max_size,
             command_rx,
-            session,
         };
 
         let spawn_start = std::time::Instant::now();
@@ -191,7 +161,6 @@ impl SessionWorker {
                 SessionCommand::Register {
                     sender,
                     cancel_token,
-                    ack,
                 } => {
                     let register_start = std::time::Instant::now();
                     debug!("⏱️ [SessionWorker::Register] 开始处理注册命令");
@@ -203,15 +172,6 @@ impl SessionWorker {
                     current_sender = Some(sender.clone());
                     current_cancel = Some(cancel_token);
 
-                    // 🎯 原子化版本号递增：在 SessionWorker 中递增，确保顺序一致性
-                    let version_start = std::time::Instant::now();
-                    let version = if let Some(session) = self.session.upgrade() {
-                        session.version.fetch_add(1, Ordering::SeqCst) + 1
-                    } else {
-                        0
-                    };
-                    debug!("⏱️ [SessionWorker::Register] 版本号递增耗时: {:?}", version_start.elapsed());
-
                     // 🎯 简化的历史消息处理：清空所有历史消息，确保全新开始
                     let clear_start = std::time::Instant::now();
                     let mut cleared_count = 0;
@@ -222,13 +182,8 @@ impl SessionWorker {
                     debug!("⏱️ [SessionWorker::Register] 清空历史消息耗时: {:?}，清理了{}条", clear_start.elapsed(), cleared_count);
 
                     if cleared_count > 0 {
-                        debug!("🧹 新SSE连接(v={})，清空 {} 条历史消息", version, cleared_count);
+                        debug!("🧹 新SSE连接，清空 {} 条历史消息", cleared_count);
                     }
-
-                    // 返回版本号给调用者
-                    let ack_start = std::time::Instant::now();
-                    let _ = ack.send(version);
-                    debug!("⏱️ [SessionWorker::Register] ack.send耗时: {:?}", ack_start.elapsed());
 
                     debug!("⏱️ [SessionWorker::Register] 总注册处理耗时: {:?}", register_start.elapsed());
                 }
@@ -256,7 +211,6 @@ enum SessionCommand {
     Register {
         sender: mpsc::Sender<UnifiedSessionMessage>,
         cancel_token: CancellationToken,
-        ack: oneshot::Sender<u64>, // 返回版本号
     },
     Clear { ack: oneshot::Sender<usize> },
     MessageCount { ack: oneshot::Sender<usize> },
@@ -264,8 +218,8 @@ enum SessionCommand {
 
 /// 便捷函数：添加SessionNotify消息（自动转换为统一格式）
 pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
-    // 🎯 关键修复：直接获取当前 SESSION_CACHE 中的 SessionData，不自动创建新的
-    // 这样确保 Agent 使用的是 SSE 连接创建的最新 SessionData
+    // 🎯 极简设计：直接获取当前 SESSION_CACHE 中的 SessionData
+    // Agent 只能发送到最新创建的 SessionData，确保消息路由清晰
     let session_data = if let Some(session_data_ref) = SESSION_CACHE.get(session_id) {
         session_data_ref.clone()
     } else {
@@ -275,26 +229,6 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
         );
         return Ok(());
     };
-
-    // 🎯 源过滤逻辑：检查session是否已被用户取消且没有新的聊天请求
-    // 如果session已被取消且没有新的活跃请求，则忽略消息，防止残留消息
-    if session_data.is_cancelled() {
-        // 检查是否有活跃的SSE连接（表示有新的聊天请求）
-        let message_count = session_data.message_count().await;
-        if message_count == 0 {
-            // session已被取消且没有活跃消息，说明没有新的聊天请求，忽略消息
-            info!(
-                "🚫 [push_session_update] session={} 已被取消且无活跃请求，忽略消息，防止残留",
-                session_id
-            );
-            return Ok(());
-        } else {
-            debug!(
-                "📝 [push_session_update] session={} 已被取消但有活跃消息({}条)，可能存在新请求，继续处理消息",
-                session_id, message_count
-            );
-        }
-    }
 
     let unified_message = notify.to_unified_message();
 

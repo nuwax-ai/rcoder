@@ -138,11 +138,8 @@ pub async fn agent_session_cancel(
         Some(project_info) => {
             debug!("🔍 查找session: {} 对应的agent连接", session_id);
 
-            // 🎯 先设置session取消标记，确保后续Agent消息被过滤
-            if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
-                session_data.set_cancelled(true);
-                info!("🚫 已设置session取消标记: session_id={}", session_id);
-            }
+            // 🎯 极简设计：不再需要取消标记，直接发送取消通知
+            // Agent 消息会自动路由到最新的 SessionData
 
             // 🔄 修复竞争条件：先发送取消通知，等待Agent完成取消后再清空缓存
             // 通过cancel_tx发送取消通知
@@ -168,21 +165,13 @@ pub async fn agent_session_cancel(
                             session_id,
                         }))
                     } else {
-                        // 如果取消失败，也要重置取消标记，让用户可以重试
-                        if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
-                            session_data.set_cancelled(false);
-                            info!("🔄 取消失败，已重置session取消标记: session_id={}, error={:?}", session_id, cancel_notification_response.message);
-                        }
+                        // 🎯 极简设计：取消失败时不需要重置标记，Agent 消息自然路由
                         Ok(HttpResult::error("0001", "停止智能体执行失败"))
                     }
                 }
                 Err(e) => {
                     error!("❌ [agent_cancel_handler] 等待Agent取消响应失败: session_id={}, error={:?}", session_id, e);
-                    // 如果取消过程出错，也要重置取消标记
-                    if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
-                        session_data.set_cancelled(false);
-                        info!("🔄 取消过程出错，已重置session取消标记: session_id={}", session_id);
-                    }
+                    // 🎯 极简设计：取消过程出错时不需要重置标记
                     Err(AppError::AnyhowError(anyhow::anyhow!(
                         "停止智能体执行失败: {}",
                         e
@@ -196,10 +185,9 @@ pub async fn agent_session_cancel(
                 project_id
             );
 
-            // 🎯 即使没有找到活跃连接，也要设置取消标记，防止可能的残留消息
-            if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
-                session_data.set_cancelled(true);
-                info!("🚫 [agent_cancel] 未找到活跃连接，仍设置session取消标记: session_id={}, project_id={}", session_id, project_id);
+            // 🎯 极简设计：没有找到活跃连接时，直接清空 SESSION_CACHE
+            if crate::service::SESSION_CACHE.remove(&session_id).is_some() {
+                info!("🗑️ [agent_cancel] 未找到活跃连接，已清空 SESSION_CACHE: session_id={}, project_id={}", session_id, project_id);
             }
 
             Ok(HttpResult::success(CancelResponse {

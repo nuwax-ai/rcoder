@@ -104,22 +104,7 @@ pub async fn agent_stop(
 
     info!("🛑 收到停止Agent服务请求: project_id={}", project_id);
 
-    // 🎯 先设置所有相关session的取消标记，确保后续Agent消息被过滤
-    let mut sessions_cancelled = Vec::new();
-    for session_entry in state.sessions.iter() {
-        let session_id = session_entry.key();
-        let session_info = session_entry.value();
-
-        if let Some(session_project_id) = &session_info.project_id {
-            if session_project_id == project_id {
-                if let Some(session_data) = crate::service::SESSION_CACHE.get(session_id) {
-                    session_data.set_cancelled(true);
-                    sessions_cancelled.push(session_id.clone());
-                    debug!("🚫 已为停止服务设置session取消标记: session_id={}, project_id={}", session_id, project_id);
-                }
-            }
-        }
-    }
+    // 🎯 极简设计：不再需要取消标记，直接清空 SESSION_CACHE 即可
 
     // 🧹 直接清空对应 project_id 的所有 SSE 缓存条目，避免阻塞
     let mut cleared_sessions = Vec::new();
@@ -147,10 +132,7 @@ pub async fn agent_stop(
     if !agent_exists {
         info!("📭 Agent服务已不存在，认为停止成功: project_id={}", project_id);
 
-        // 即使Agent不存在，也要确保设置了取消标记
-        if sessions_cancelled.is_empty() {
-            info!("🚫 [agent_stop] Agent不存在但未找到相关session，project_id={}", project_id);
-        }
+        // 🎯 极简设计：Agent不存在时无需额外操作
 
         return Ok(HttpResult::success(StopAgentResponse {
             success: true,
@@ -175,8 +157,8 @@ pub async fn agent_stop(
     match removed {
         Some(_) => {
             info!(
-                "✅ Agent服务已成功停止: project_id={}, session_id={:?}, 已设置取消标记的session数={}",
-                project_id, session_id, sessions_cancelled.len()
+                "✅ Agent服务已成功停止: project_id={}, session_id={:?}, 已清理的session数={}",
+                project_id, session_id, cleared_sessions.len()
             );
             debug!("AgentLifecycleGuard将自动清理所有相关资源");
 
