@@ -382,6 +382,16 @@ pub async fn agent_session_notification(
 
     // 创建SSE流
     let stream = async_stream::stream! {
+        // 🎯 立即发送心跳消息，让前端知道连接已建立
+        let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id_for_stream.clone());
+
+        let heartbeat_event: Event = Event::default()
+            .event("heartbeat")
+            .data(serde_json::to_string(&heartbeat_msg).unwrap_or_else(|_| "{}".to_string()));
+
+        info!("💓 [SSE] 发送初始心跳消息: session_id={}", session_id_for_stream);
+        yield Ok(heartbeat_event);
+
         // 心跳定时器（30秒）
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
         // 跳过第一次立即触发
