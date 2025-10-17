@@ -13,12 +13,7 @@ PORT=8086
 
 # rcoder 可执行文件路径（自动检测当前脚本所在目录）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RCODER_BIN="${SCRIPT_DIR}/target/release/rcoder"
-
-# 如果 release 版本不存在，尝试使用 debug 版本
-if [ ! -f "$RCODER_BIN" ]; then
-    RCODER_BIN="${SCRIPT_DIR}/target/debug/rcoder"
-fi
+RCODER_BIN="${SCRIPT_DIR}/rcoder"
 
 # 工作目录
 WORK_DIR="$SCRIPT_DIR"
