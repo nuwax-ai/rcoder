@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::model::AgentStatus;
 use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
-use crate::service::{SESSION_CACHE, PROJECT_SESSION_MAP, clear_session_messages};
+use crate::service::{SESSION_CACHE, PROJECT_SESSION_MAP};
 
 /// 清理配置
 #[derive(Debug, Clone)]
@@ -114,9 +114,10 @@ impl AgentCleaner {
                             session_id, message_count
                         );
 
-                        // 清理这个session的消息
-                        let cleared = clear_session_messages(&session_id).await;
-                        messages_cleared += cleared as u64;
+                        // 清理这个session的消息 - 直接移除条目
+                        if SESSION_CACHE.remove(&session_id).is_some() {
+                            messages_cleared += 1;
+                        }
 
                         // 如果清理后session为空，标记为待删除
                         if session_data.message_count().await == 0 {

@@ -157,28 +157,6 @@ impl Client for AcpAgentClient {
     ) -> Result<(), agent_client_protocol::Error> {
         let session_id_str = args.session_id.to_string();
 
-        // 🎯 新增过滤逻辑：检查session是否已被用户取消且没有新的聊天请求
-        // 如果session已被取消且没有新的活跃请求，则忽略Agent发送的消息，防止残留消息
-        if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id_str) {
-            if session_data.is_cancelled() {
-                // 检查是否有活跃的SSE连接（表示有新的聊天请求）
-                let message_count = session_data.message_count().await;
-                if message_count == 0 {
-                    // session已被取消且没有活跃消息，说明没有新的聊天请求，忽略Agent消息
-                    info!(
-                        "🚫 [session_notification] session={} 已被取消且无活跃请求，忽略Agent消息，防止残留",
-                        session_id_str
-                    );
-                    return Ok(());
-                } else {
-                    debug!(
-                        "📝 [session_notification] session={} 已被取消但有活跃消息({}条)，可能存在新请求，继续处理Agent消息",
-                        session_id_str, message_count
-                    );
-                }
-            }
-        }
-
         // 先尝试从 SessionNotification.meta 中获取 request_id
         let request_id_from_notification = args.meta
             .as_ref()

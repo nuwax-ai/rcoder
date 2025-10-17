@@ -21,7 +21,7 @@ pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock
 pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(|| DashMap::new());
 
 
-/// Session数据包装
+/// Session数据包装 - 保留核心功能的简化版
 pub struct SessionData {
     command_tx: mpsc::UnboundedSender<SessionCommand>,
     is_cancelled: AtomicBool,
@@ -48,45 +48,21 @@ impl SessionData {
 
     pub fn set_cancelled(&self, cancelled: bool) {
         self.is_cancelled.store(cancelled, Ordering::Release);
-        let _ = self.command_tx.send(SessionCommand::SetCancelled(cancelled));
     }
 
-    pub async fn clear_messages(&self) -> usize {
+    pub async fn message_count(&self) -> usize {
         let (tx, rx) = oneshot::channel();
-        if self.command_tx.send(SessionCommand::Clear { ack: tx }).is_err() {
-            warn!("⚠️ clear_messages 指令发送失败，worker 已退出");
+        if self.command_tx.send(SessionCommand::MessageCount { ack: tx }).is_err() {
+            warn!("⚠️ message_count 指令发送失败，worker 已退出");
             return 0;
         }
         rx.await.unwrap_or(0)
-    }
-
-    pub async fn clear_all(&self) -> usize {
-        // 🎯 优先使用快速强制清理命令，避免阻塞
-        // FastForceClear 会被优先处理，不需要等待队列中的其他命令
-        let (tx, rx) = oneshot::channel();
-        if self.command_tx.send(SessionCommand::FastForceClear { ack: tx }).is_err() {
-            warn!("⚠️ FastForceClear 指令发送失败，worker 已退出");
-            return 0;
-        }
-
-        // 快速清理命令应该立即返回，不需要超时
-        match rx.await {
-            Ok(cleared) => {
-                info!("🚀 FastForceClear 成功清空 {} 条消息", cleared);
-                cleared
-            }
-            Err(_) => {
-                warn!("⚠️ FastForceClear 响应通道关闭，worker 可能已退出");
-                0
-            }
-        }
     }
 
     pub async fn create_new_connection(
         &self,
         buffer_size: usize,
     ) -> Result<(mpsc::Receiver<UnifiedSessionMessage>, CancellationToken, u64)> {
-        let version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
         let cancellation_token = CancellationToken::new();
         let (tx, rx) = mpsc::channel(buffer_size);
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -94,18 +70,15 @@ impl SessionData {
         let command = SessionCommand::Register {
             sender: tx,
             cancel_token: cancellation_token.clone(),
-            version,
             ack: ack_tx,
         };
-
-        self.is_cancelled.store(false, Ordering::Release);
 
         self
             .command_tx
             .send(command)
             .map_err(|err| anyhow::anyhow!("发送注册指令失败: {}", err))?;
 
-        ack_rx
+        let version = ack_rx
             .await
             .map_err(|err| anyhow::anyhow!("等待注册响应失败: {}", err))?;
 
@@ -120,15 +93,6 @@ impl SessionData {
         {
             warn!("⚠️ 推送消息失败，worker 已退出");
         }
-    }
-
-    pub async fn message_count(&self) -> usize {
-        let (tx, rx) = oneshot::channel();
-        if self.command_tx.send(SessionCommand::MessageCount { ack: tx }).is_err() {
-            warn!("⚠️ message_count 指令发送失败，worker 已退出");
-            return 0;
-        }
-        rx.await.unwrap_or(0)
     }
 
     pub fn current_version(&self) -> u64 {
@@ -164,28 +128,6 @@ impl SessionWorker {
 
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
-                // 🚀 FastForceClear 优先处理，用于取消操作时的快速清理
-                SessionCommand::FastForceClear { ack } => {
-                    info!("🚀 [SessionWorker] 处理 FastForceClear 命令，立即清理所有数据");
-
-                    // 立即取消当前 SSE 连接
-                    if let Some(token) = current_cancel.take() {
-                        token.cancel();
-                    }
-                    current_sender = None;
-
-                    // 快速清空所有缓存消息
-                    let mut cleared = 0usize;
-                    while consumer.try_pop().is_some() {
-                        cleared += 1;
-                    }
-                    buffered_len = 0;
-
-                    // 立即响应，不阻塞
-                    let _ = ack.send(cleared);
-                    info!("🚀 [SessionWorker] FastForceClear 完成，清空 {} 条消息", cleared);
-                    continue; // 跳过后续处理，立即处理下一个命令
-                }
                 SessionCommand::Push { message } => {
                     let should_buffer = !matches!(
                         message.message_type,
@@ -204,9 +146,11 @@ impl SessionWorker {
                         }
                     }
 
+                    // 🚀 使用非阻塞发送，避免阻塞其他命令
                     if let Some(sender) = current_sender.as_mut() {
-                        if sender.send(message).await.is_err() {
-                            warn!("⚠️ SSE sender 已关闭，丢弃实时推送");
+                        if sender.try_send(message.clone()).is_err() {
+                            // 如果发送失败，可能是缓冲区满了或连接已关闭
+                            warn!("⚠️ SSE sender 发送失败，关闭实时推送");
                             current_sender = None;
                         }
                     }
@@ -214,7 +158,6 @@ impl SessionWorker {
                 SessionCommand::Register {
                     sender,
                     cancel_token,
-                    version,
                     ack,
                 } => {
                     if let Some(token) = current_cancel.take() {
@@ -224,81 +167,26 @@ impl SessionWorker {
                     current_sender = Some(sender.clone());
                     current_cancel = Some(cancel_token);
 
-                    // 🎯 智能历史消息过滤：只保留未完成请求的消息，避免真正的残留消息
+                    // 🎯 原子化版本号递增：在 SessionWorker 中递增，确保顺序一致性
+                    let version = if let Some(session) = self.session.upgrade() {
+                        session.version.fetch_add(1, Ordering::SeqCst) + 1
+                    } else {
+                        0
+                    };
+
+                    // 🎯 简化的历史消息处理：清空所有历史消息，确保全新开始
                     let mut cleared_count = 0;
-                    let mut retained_count = 0;
-                    let mut filtered_messages = Vec::new();
+                    while consumer.try_pop().is_some() {
+                        cleared_count += 1;
+                    }
+                    buffered_len = 0;
 
-                    // 收集所有历史消息
-                    while let Some(msg) = consumer.try_pop() {
-                        filtered_messages.push(msg);
+                    if cleared_count > 0 {
+                        debug!("🧹 新SSE连接(v={})，清空 {} 条历史消息", version, cleared_count);
                     }
 
-                    // 智能过滤：从后往前找，找到最近的 prompt_end，之后的都保留
-                    let mut found_recent_end = false;
-                    for msg in filtered_messages.iter().rev() {
-                        match msg.message_type {
-                            crate::model::SessionMessageType::SessionPromptEnd => {
-                                // 找到最近的 prompt_end，标记为已完成的请求
-                                found_recent_end = true;
-                                // 这个 prompt_end 及之前的消息都算作残留，跳过
-                            }
-                            _ => {
-                                // 如果还没找到 prompt_end，说明是当前未完成请求的消息，保留
-                                if !found_recent_end {
-                                    retained_count += 1;
-                                } else {
-                                    cleared_count += 1;
-                                }
-                            }
-                        }
-                    }
-
-                    // 只保留未完成请求的消息，确保按时间顺序发送
-                    if retained_count > 0 {
-                        let messages_to_keep: Vec<_> = filtered_messages
-                            .iter()
-                            .rev()
-                            .take(retained_count)
-                            .cloned()
-                            .collect();
-
-                        // 🎯 关键修复：确保消息按正确的时间顺序发送
-                        // messages_to_keep 现在是按时间倒序的，需要再次倒序以恢复原始时间顺序
-                        for msg in messages_to_keep.iter().rev() {
-                            // 先放回 buffer（按时间顺序）
-                            if producer.try_push(msg.clone()).is_ok() {
-                                buffered_len += 1;
-                            }
-                        }
-
-                        // 然后按时间顺序发送给新的 SSE 连接
-                        for msg in messages_to_keep.iter().rev() {
-                            if let Some(sender) = current_sender.as_mut() {
-                                if sender.send(msg.clone()).await.is_err() {
-                                    warn!("⚠️ 保留消息发送失败，SSE sender 已关闭");
-                                    current_sender = None;
-                                    break;
-                                }
-                            }
-                        }
-
-                        debug!(
-                            "🔍 智能过滤：保留 {} 条未完成请求消息（按时间顺序发送），清空 {} 条已完成请求消息",
-                            retained_count, cleared_count
-                        );
-                    } else if cleared_count > 0 {
-                        debug!(
-                            "🧹 智能过滤：清空 {} 条已完成请求的历史消息",
-                            cleared_count
-                        );
-                    }
-
-                    let _ = ack.send(());
-
-                    if let Some(session) = self.session.upgrade() {
-                        session.version.store(version, Ordering::Release);
-                    }
+                    // 返回版本号给调用者
+                    let _ = ack.send(version);
                 }
                 SessionCommand::Clear { ack } => {
                     let mut cleared = 0usize;
@@ -307,27 +195,6 @@ impl SessionWorker {
                     }
                     buffered_len = 0;
                     let _ = ack.send(cleared);
-                }
-                SessionCommand::ClearAll { ack } => {
-                    if let Some(token) = current_cancel.take() {
-                        token.cancel();
-                    }
-                    current_sender = None;
-
-                    let mut cleared = 0usize;
-                    while consumer.try_pop().is_some() {
-                        cleared += 1;
-                    }
-                    buffered_len = 0;
-                    let _ = ack.send(cleared);
-                }
-                SessionCommand::SetCancelled(cancelled) => {
-                    if cancelled {
-                        if let Some(token) = current_cancel.take() {
-                            token.cancel();
-                        }
-                        current_sender = None;
-                    }
                 }
                 SessionCommand::MessageCount { ack } => {
                     let _ = ack.send(buffered_len);
@@ -345,13 +212,9 @@ enum SessionCommand {
     Register {
         sender: mpsc::Sender<UnifiedSessionMessage>,
         cancel_token: CancellationToken,
-        version: u64,
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<u64>, // 返回版本号
     },
     Clear { ack: oneshot::Sender<usize> },
-    ClearAll { ack: oneshot::Sender<usize> },
-    FastForceClear { ack: oneshot::Sender<usize> },
-    SetCancelled(bool),
     MessageCount { ack: oneshot::Sender<usize> },
 }
 
@@ -362,7 +225,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
         .or_insert_with(|| SessionData::new(1000))
         .clone();
 
-    // 🎯 增强过滤逻辑：检查session是否已被用户取消且没有新的聊天请求
+    // 🎯 源过滤逻辑：检查session是否已被用户取消且没有新的聊天请求
     // 如果session已被取消且没有新的活跃请求，则忽略消息，防止残留消息
     if session_data.is_cancelled() {
         // 检查是否有活跃的SSE连接（表示有新的聊天请求）
@@ -417,18 +280,6 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
     push_session_update(session_id, notify).await
 }
 
-/// 便捷函数：清空指定 session_id 的所有消息（用于取消任务时避免历史消息积压）
-pub async fn clear_session_messages(session_id: &str) -> usize {
-    if let Some(session_data) = SESSION_CACHE.get(session_id) {
-        session_data.clear_messages().await
-    } else {
-        info!(
-            "⚠️ 试图清空不存在的 session 消息: session_id={}",
-            session_id
-        );
-        0
-    }
-}
 
 /// 便捷函数：清空指定 project_id 的所有 session 消息
 ///
@@ -514,34 +365,21 @@ pub async fn clear_project_messages(
 /// 彻底清空指定 session_id 的所有消息和缓存
 ///
 /// 这个函数执行彻底的清空操作：
-/// 1. 调用 clear_all() 清空 session 内部所有缓存消息
-/// 2. 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
-/// 3. 防止任何历史消息残留到新的 SSE 连接中
+/// 1. 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
+/// 2. 防止任何历史消息残留到新的 SSE 连接中
 ///
-/// 返回总共清理的消息数量
+/// 返回总共清理的消息数量（这里简化为固定返回1，表示移除了1个session）
 async fn clear_session_completely(session_id: &str) -> usize {
-    let mut total_cleared = 0;
-
-    // 1. 先清空 session 内部所有缓存消息
-    if let Some(session_data) = SESSION_CACHE.get(session_id) {
-        let cleared_count = session_data.clear_all().await;
-        total_cleared += cleared_count;
-
-        debug!(
-            "🧹 清空 session_data 缓存消息: session_id={}, cleared_count={}",
-            session_id, cleared_count
-        );
-    }
-
-    // 2. 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
+    // 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
     if SESSION_CACHE.remove(session_id).is_some() {
         info!(
             "🗑️ 移除 SESSION_CACHE 条目，防止任何残留消息: session_id={}",
             session_id
         );
+        return 1;
     }
 
-    total_cleared
+    0
 }
 
 /// 确保project_id对应正确的session_id
@@ -584,8 +422,12 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             project_id, mapped_session_id, session_id
         );
 
-        // 清理旧session的数据
-        let cleared_count = clear_session_messages(&mapped_session_id).await;
+        // 清理旧session的数据 - 直接移除条目
+        let cleared_count = if SESSION_CACHE.remove(&mapped_session_id).is_some() {
+            1 // 移除了1个session
+        } else {
+            0 // session不存在
+        };
 
         // 更新映射关系（现在可以安全获取写锁）
         PROJECT_SESSION_MAP.insert(project_id.to_string(), session_id.to_string());

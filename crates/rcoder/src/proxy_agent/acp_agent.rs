@@ -14,7 +14,7 @@ use tracing::{debug, error, info};
 use crate::{
     model::{AgentStatus, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::agent_service::AcpAgentService,
-    service::clear_session_messages,
+    service::SESSION_CACHE,
     utils::{ContentBuilder, PromptBuilder},
 };
 
@@ -112,13 +112,11 @@ async fn create_new_agent_service(
             }
 
             // 再次确保当前 session 的历史消息被清空，避免新的 SSE 连接收到旧记录
-            let cleared_session = clear_session_messages(&session_id_str).await;
-            if cleared_session > 0 {
+            // 直接移除 SESSION_CACHE 条目，确保全新开始
+            if SESSION_CACHE.remove(&session_id_str).is_some() {
                 info!(
-                    "🧹 清空当前 session 历史消息: project_id={}, session_id={}, cleared_count={}",
-                    project_id,
-                    session_id_str,
-                    cleared_session
+                    "🗑️ 移除 SESSION_CACHE 条目，确保全新开始: project_id={}, session_id={}",
+                    project_id, session_id_str
                 );
             }
 

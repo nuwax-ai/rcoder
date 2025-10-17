@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::proxy_agent::*;
-use crate::{model::*, router::AppState, service::clear_project_messages};
+use crate::{model::*, router::AppState};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -209,30 +209,31 @@ pub async fn handle_chat(
         }
     }
 
-    // 🧹 发起新对话前，彻底清空该项目的所有历史消息，确保前端只看到当前对话的新消息
-    // clear_project_messages 现在包含彻底清空机制，会：
-    // 1. 清空所有缓存消息
-    // 2. 移除 SESSION_CACHE 条目
-    // 3. 防止任何历史消息残留
-    let cleared_count = clear_project_messages(
-        &project_id,
-        &state.sessions,
-        request.session_id.as_deref(),
-    )
-    .await;
-
-    if cleared_count > 0 {
-        info!(
-            "📝 [chat] 发起新对话前清空了 {} 条历史SSE消息: project_id={}",
-            cleared_count, project_id
-        );
-    }
-
-    // 🎯 重置session取消标记，确保新的Agent消息能正常处理
+    // 🗑️ 简单直接：直接移除所有相关session，确保全新开始
+    // 新的设计：移除旧session → Agent必须重新获取sender → 前端只能获取新消息
     if let Some(ref session_id) = request.session_id {
-        if let Some(session_data) = crate::service::SESSION_CACHE.get(session_id) {
-            session_data.set_cancelled(false);
-            info!("🔄 [chat] 已重置session取消标记: session_id={}, project_id={}", session_id, project_id);
+        // 直接移除指定session
+        if crate::service::SESSION_CACHE.remove(session_id).is_some() {
+            info!("🗑️ [chat] 移除旧session，确保全新开始: session_id={}, project_id={}", session_id, project_id);
+        }
+    } else {
+        // 如果没有指定session_id，清空该项目的所有session
+        let mut cleared_sessions = 0;
+        for session_entry in state.sessions.iter() {
+            let current_session_id = session_entry.key();
+            let session_info = session_entry.value();
+
+            if let Some(session_project_id) = &session_info.project_id {
+                if session_project_id == &project_id {
+                    if crate::service::SESSION_CACHE.remove(current_session_id).is_some() {
+                        cleared_sessions += 1;
+                    }
+                }
+            }
+        }
+
+        if cleared_sessions > 0 {
+            info!("🗑️ [chat] 移除了项目的所有旧session: project_id={}, cleared_count={}", project_id, cleared_sessions);
         }
     }
 

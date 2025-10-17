@@ -5,7 +5,7 @@
 
 logs
 .classpath
-.project
+.project_workspace
 .settings
 .checkstyle
 .checkstyle_suppressions.xml

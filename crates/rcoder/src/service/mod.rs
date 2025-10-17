@@ -6,7 +6,6 @@ pub use session_cache::{
     SessionData,
     push_session_update,
     push_session_update_with_project,
-    clear_session_messages,
     clear_project_messages,
     ensure_project_session,
     get_project_session,
