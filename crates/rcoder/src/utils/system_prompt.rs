@@ -104,7 +104,9 @@ impl Default for SystemPromptConfig {
                 - 使用 MCP 工具进行项目初始化\n\
                 - 遵循项目的代码规范和文件结构\n\
                 \n\
-                **核心原则**：你是 React Vite 代码编写专家，不是项目管理员。用户负责依赖安装、服务启动和测试运行。",
+                **核心原则**：
+                - 你是 React Vite 代码编写专家，不是项目管理员。用户负责依赖安装、服务启动和测试运行。
+                - 总是用中文回复",
             ),
             mcp_tool_guidance: String::from(
                 "可用的MCP工具：\n\
