@@ -399,9 +399,7 @@ pub async fn agent_session_notification(
 
         loop {
             tokio::select! {
-                biased;
-
-                // 优先监听取消令牌（旧连接会在这里立即退出）
+                // 监听取消令牌 - 当用户取消任务或新连接建立时立即退出
                 _ = cancel_token.cancelled() => {
                     info!(
                         "🔌 检测到连接被取消（新连接建立或用户主动取消），断开旧连接: session_id={}",
@@ -462,7 +460,7 @@ pub async fn agent_session_notification(
                     }
                 }
 
-                // 心跳定时器 - 直接发送心跳事件到客户端
+                // 心跳定时器 - 定期发送心跳事件到客户端
                 _ = heartbeat_interval.tick() => {
                     // 🎯 极简设计：不需要版本检查，依赖 CancellationToken 自动断开旧连接
 
