@@ -234,6 +234,7 @@ pub struct CancelNotificationRequest {
 }
 
 /// 取消通知响应
+#[derive(Debug)]
 pub struct CancelNotificationResponse {
     pub success: bool,
     pub message: Option<String>,

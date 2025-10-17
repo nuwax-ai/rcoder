@@ -228,6 +228,14 @@ pub async fn handle_chat(
         );
     }
 
+    // 🎯 重置session取消标记，确保新的Agent消息能正常处理
+    if let Some(ref session_id) = request.session_id {
+        if let Some(session_data) = crate::service::SESSION_CACHE.get(session_id) {
+            session_data.set_cancelled(false);
+            info!("🔄 [chat] 已重置session取消标记: session_id={}, project_id={}", session_id, project_id);
+        }
+    }
+
     // 获取项目工作目录
     let project_workspace = get_project_workspace(&project_id).await?;
 

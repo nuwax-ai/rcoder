@@ -32,18 +32,49 @@ where
                 project_id, req.cancel_notification.session_id.0
             );
 
-            let result = client_conn.cancel(req.cancel_notification).await;
-            if let Err(e) = result {
-                error!("项目[{}]发送Cancel失败: {:?}", project_id, e);
-                let _ = req.tx.send(CancelNotificationResponse {
-                    success: false,
-                    message: Some(format!("{:?}", e)),
-                });
-            } else {
-                let _ = req.tx.send(CancelNotificationResponse {
-                    success: true,
-                    message: None,
-                });
+            // 🎯 添加超时保护，防止Agent cancel调用阻塞
+            let cancel_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(10),
+                client_conn.cancel(req.cancel_notification)
+            ).await;
+
+            match cancel_result {
+                Ok(Ok(_)) => {
+                    info!("项目[{}]Agent取消成功", project_id);
+                    let response = CancelNotificationResponse {
+                        success: true,
+                        message: None,
+                    };
+                    if let Err(e) = req.tx.send(response) {
+                        error!("项目[{}]发送取消成功响应失败: {:?}", project_id, e);
+                    } else {
+                        debug!("项目[{}]取消成功响应发送成功", project_id);
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!("项目[{}]发送Cancel失败: {:?}", project_id, e);
+                    let response = CancelNotificationResponse {
+                        success: false,
+                        message: Some(format!("{:?}", e)),
+                    };
+                    if let Err(e) = req.tx.send(response) {
+                        error!("项目[{}]发送取消失败响应失败: {:?}", project_id, e);
+                    } else {
+                        debug!("项目[{}]取消失败响应发送成功", project_id);
+                    }
+                }
+                Err(timeout_err) => {
+                    warn!("项目[{}]Agent取消超时: {:?}", project_id, timeout_err);
+                    let response = CancelNotificationResponse {
+                        success: false,
+                        message: Some("Agent取消超时".to_string()),
+                    };
+                    if let Err(e) = req.tx.send(response) {
+                        error!("项目[{}]发送取消超时响应失败: {:?}", project_id, e);
+                    } else {
+                        debug!("项目[{}]取消超时响应发送成功", project_id);
+                    }
+                }
             }
 
             // 🎯 取消完成后恢复agent状态为Idle

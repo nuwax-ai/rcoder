@@ -6,7 +6,7 @@ use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use agent_client_protocol::{CancelNotification, SessionId};
@@ -138,15 +138,13 @@ pub async fn agent_session_cancel(
         Some(project_info) => {
             debug!("🔍 查找session: {} 对应的agent连接", session_id);
 
-            // 🧹 彻底清空该 session 的所有数据（ringbuf + channel + 设置取消标志）
+            // 🎯 先设置session取消标记，确保后续Agent消息被过滤
             if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
-                let cleared_count = session_data.clear_all().await;
-                info!(
-                    "🧹 已彻底清空 session 数据并设置取消标志: session_id={}, cleared_count={}",
-                    session_id, cleared_count
-                );
+                session_data.set_cancelled(true);
+                info!("🚫 已设置session取消标记: session_id={}", session_id);
             }
 
+            // 🔄 修复竞争条件：先发送取消通知，等待Agent完成取消后再清空缓存
             // 通过cancel_tx发送取消通知
             project_info
                 .cancel_tx
@@ -154,21 +152,42 @@ pub async fn agent_session_cancel(
                 .map_err(|e| anyhow::anyhow!("发送取消通知失败: {}", e))?;
 
             // 等待取消通知响应
+            info!("📡 [agent_cancel_handler] 等待Agent取消响应: session_id={}", session_id);
             match rx.await {
                 Ok(cancel_notification_response) => {
+                    info!("✅ [agent_cancel_handler] 收到Agent取消响应: session_id={}, success={}", session_id, cancel_notification_response.success);
                     if cancel_notification_response.success {
+                        // 🧹 彻底清空该 session，避免阻塞
+                        // 直接移除 SESSION_CACHE 条目，绕过 SessionWorker 队列
+                        if crate::service::SESSION_CACHE.remove(&session_id).is_some() {
+                            info!("🗑️ Agent取消成功，直接移除 SESSION_CACHE 条目: session_id={}", session_id);
+                        }
+
                         Ok(HttpResult::success(CancelResponse {
                             success: true,
                             session_id,
                         }))
                     } else {
+                        // 如果取消失败，也要重置取消标记，让用户可以重试
+                        if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
+                            session_data.set_cancelled(false);
+                            info!("🔄 取消失败，已重置session取消标记: session_id={}, error={:?}", session_id, cancel_notification_response.message);
+                        }
                         Ok(HttpResult::error("0001", "停止智能体执行失败"))
                     }
                 }
-                Err(e) => Err(AppError::AnyhowError(anyhow::anyhow!(
-                    "停止智能体执行失败: {}",
-                    e
-                ))),
+                Err(e) => {
+                    error!("❌ [agent_cancel_handler] 等待Agent取消响应失败: session_id={}, error={:?}", session_id, e);
+                    // 如果取消过程出错，也要重置取消标记
+                    if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
+                        session_data.set_cancelled(false);
+                        info!("🔄 取消过程出错，已重置session取消标记: session_id={}", session_id);
+                    }
+                    Err(AppError::AnyhowError(anyhow::anyhow!(
+                        "停止智能体执行失败: {}",
+                        e
+                    )))
+                }
             }
         }
         None => {
@@ -176,6 +195,12 @@ pub async fn agent_session_cancel(
                 "❌ 未找到project_id: {} 对应的活跃连接,无需取消agent当前任务",
                 project_id
             );
+
+            // 🎯 即使没有找到活跃连接，也要设置取消标记，防止可能的残留消息
+            if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
+                session_data.set_cancelled(true);
+                info!("🚫 [agent_cancel] 未找到活跃连接，仍设置session取消标记: session_id={}, project_id={}", session_id, project_id);
+            }
 
             Ok(HttpResult::success(CancelResponse {
                 success: true,
