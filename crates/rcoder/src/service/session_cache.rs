@@ -189,18 +189,74 @@ impl SessionWorker {
                     current_sender = Some(sender.clone());
                     current_cancel = Some(cancel_token);
 
-                    let mut drained = Vec::new();
-                    while let Some(msg) = consumer.try_pop() {
-                        drained.push(msg);
-                    }
-                    buffered_len = 0;
+                    // 🎯 智能历史消息过滤：只保留未完成请求的消息，避免真正的残留消息
+                    let mut cleared_count = 0;
+                    let mut retained_count = 0;
+                    let mut filtered_messages = Vec::new();
 
-                    for msg in drained {
-                        if sender.send(msg.clone()).await.is_err() {
-                            warn!("⚠️ 历史消息发送失败，SSE sender 已关闭");
-                            current_sender = None;
-                            break;
+                    // 收集所有历史消息
+                    while let Some(msg) = consumer.try_pop() {
+                        filtered_messages.push(msg);
+                    }
+
+                    // 智能过滤：从后往前找，找到最近的 prompt_end，之后的都保留
+                    let mut found_recent_end = false;
+                    for msg in filtered_messages.iter().rev() {
+                        match msg.message_type {
+                            crate::model::SessionMessageType::SessionPromptEnd => {
+                                // 找到最近的 prompt_end，标记为已完成的请求
+                                found_recent_end = true;
+                                // 这个 prompt_end 及之前的消息都算作残留，跳过
+                            }
+                            _ => {
+                                // 如果还没找到 prompt_end，说明是当前未完成请求的消息，保留
+                                if !found_recent_end {
+                                    retained_count += 1;
+                                } else {
+                                    cleared_count += 1;
+                                }
+                            }
                         }
+                    }
+
+                    // 只保留未完成请求的消息，确保按时间顺序发送
+                    if retained_count > 0 {
+                        let messages_to_keep: Vec<_> = filtered_messages
+                            .iter()
+                            .rev()
+                            .take(retained_count)
+                            .cloned()
+                            .collect();
+
+                        // 🎯 关键修复：确保消息按正确的时间顺序发送
+                        // messages_to_keep 现在是按时间倒序的，需要再次倒序以恢复原始时间顺序
+                        for msg in messages_to_keep.iter().rev() {
+                            // 先放回 buffer（按时间顺序）
+                            if producer.try_push(msg.clone()).is_ok() {
+                                buffered_len += 1;
+                            }
+                        }
+
+                        // 然后按时间顺序发送给新的 SSE 连接
+                        for msg in messages_to_keep.iter().rev() {
+                            if let Some(sender) = current_sender.as_mut() {
+                                if sender.send(msg.clone()).await.is_err() {
+                                    warn!("⚠️ 保留消息发送失败，SSE sender 已关闭");
+                                    current_sender = None;
+                                    break;
+                                }
+                            }
+                        }
+
+                        debug!(
+                            "🔍 智能过滤：保留 {} 条未完成请求消息（按时间顺序发送），清空 {} 条已完成请求消息",
+                            retained_count, cleared_count
+                        );
+                    } else if cleared_count > 0 {
+                        debug!(
+                            "🧹 智能过滤：清空 {} 条已完成请求的历史消息",
+                            cleared_count
+                        );
                     }
 
                     let _ = ack.send(());
@@ -312,17 +368,8 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
 
 /// 便捷函数：清空指定 session_id 的所有消息（用于取消任务时避免历史消息积压）
 pub async fn clear_session_messages(session_id: &str) -> usize {
-    if let Some(session_data_ref) = SESSION_CACHE.get(session_id) {
-        let session_data = session_data_ref.clone();
-        drop(session_data_ref);
-
-        let cleared_count = session_data.clear_messages().await;
-        info!(
-            "🧹 清空 SSE 消息缓存: session_id={}, cleared_count={}",
-            session_id,
-            cleared_count
-        );
-        cleared_count
+    if let Some(session_data) = SESSION_CACHE.get(session_id) {
+        session_data.clear_messages().await
     } else {
         info!(
             "⚠️ 试图清空不存在的 session 消息: session_id={}",
@@ -334,11 +381,16 @@ pub async fn clear_session_messages(session_id: &str) -> usize {
 
 /// 便捷函数：清空指定 project_id 的所有 session 消息
 ///
-/// 这个函数会遍历所有 session，找到属于指定 project_id 的 session 并清空其消息
+/// 这个函数会遍历所有 session，找到属于指定 project_id 的 session 并彻底清空其消息
 /// 主要用于：
 /// 1. 发起新对话时清空历史消息（/chat 接口）
 /// 2. 取消任务时清空历史消息（/agent/session/cancel 接口）
 /// 3. 停止服务时清空历史消息（/agent/stop 接口）
+///
+/// 🎯 彻底清空机制：
+/// - 调用 clear_all() 清空 session 内部所有缓存消息
+/// - 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
+/// - 防止任何历史消息残留到新的 SSE 连接中
 ///
 /// 确保前端SSE连接获取的都是当前对话触发的最新消息，避免历史消息干扰
 pub async fn clear_project_messages(
@@ -362,22 +414,15 @@ pub async fn clear_project_messages(
                         specific_session_handled = true;
                     }
                 }
-                // 清空这个 session 的消息
-                let cleared_count = clear_session_messages(session_id).await;
+
+                // 🎯 彻底清空机制：确保完全清除历史消息
+                let cleared_count = clear_session_completely(session_id).await;
                 total_cleared += cleared_count;
 
                 if cleared_count > 0 {
-                    debug!(
-                        "🧹 清空项目消息: project_id={}, session_id={}, cleared_count={}",
-                        project_id, session_id, cleared_count
-                    );
-                }
-
-                if SESSION_CACHE.remove(session_id).is_some() {
                     info!(
-                        "🧼 移除 SESSION_CACHE 条目: project_id={}, session_id={}",
-                        project_id,
-                        session_id
+                        "🧹 彻底清空项目消息: project_id={}, session_id={}, cleared_count={}",
+                        project_id, session_id, cleared_count
                     );
                 }
             }
@@ -386,36 +431,62 @@ pub async fn clear_project_messages(
 
     if let Some(target_session) = specific_session {
         if !specific_session_handled {
-            let cleared_count = clear_session_messages(target_session).await;
+            // 🎯 对指定 session 进行彻底清空
+            let cleared_count = clear_session_completely(target_session).await;
             if cleared_count > 0 {
                 info!(
-                    "🧹 针对指定 session 追加清理: project_id={}, session_id={}, cleared_count={}",
+                    "🧹 彻底清空指定 session: project_id={}, session_id={}, cleared_count={}",
                     project_id,
                     target_session,
                     cleared_count
                 );
                 total_cleared += cleared_count;
             }
-
-            if SESSION_CACHE.remove(target_session).is_some() {
-                info!(
-                    "🧼 移除指定 SESSION_CACHE 条目: project_id={}, session_id={}",
-                    project_id,
-                    target_session
-                );
-            }
         }
     }
 
     if total_cleared > 0 {
         info!(
-            "📝 项目消息清空完成: project_id={}, total_cleared={}, sessions_found={}",
+            "📝 项目消息彻底清空完成: project_id={}, total_cleared={}, sessions_found={}",
             project_id, total_cleared, sessions_map.len()
         );
     } else {
         debug!(
             "📭 项目无历史消息需要清空: project_id={}",
             project_id
+        );
+    }
+
+    total_cleared
+}
+
+/// 彻底清空指定 session_id 的所有消息和缓存
+///
+/// 这个函数执行彻底的清空操作：
+/// 1. 调用 clear_all() 清空 session 内部所有缓存消息
+/// 2. 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
+/// 3. 防止任何历史消息残留到新的 SSE 连接中
+///
+/// 返回总共清理的消息数量
+async fn clear_session_completely(session_id: &str) -> usize {
+    let mut total_cleared = 0;
+
+    // 1. 先清空 session 内部所有缓存消息
+    if let Some(session_data) = SESSION_CACHE.get(session_id) {
+        let cleared_count = session_data.clear_all().await;
+        total_cleared += cleared_count;
+
+        debug!(
+            "🧹 清空 session_data 缓存消息: session_id={}, cleared_count={}",
+            session_id, cleared_count
+        );
+    }
+
+    // 2. 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
+    if SESSION_CACHE.remove(session_id).is_some() {
+        info!(
+            "🗑️ 移除 SESSION_CACHE 条目，防止任何残留消息: session_id={}",
+            session_id
         );
     }
 

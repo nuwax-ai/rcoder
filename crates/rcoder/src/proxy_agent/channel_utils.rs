@@ -137,15 +137,26 @@ where
                         project_id, resp.stop_reason
                     );
 
-                    // 发送 SessionPromptEnd 通知（成功）
-                    let end_notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
-                        session_id: session_id_str.clone(),
-                        stop_reason: resp.stop_reason,
-                        error_message: None,
-                        request_id: request_id.clone(),
-                    });
-                    if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, end_notify).await {
-                        error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
+                    // 检查session是否已被用户取消，如果已取消则不发送prompt_end消息
+                    let is_cancelled = if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id_str) {
+                        session_data.is_cancelled()
+                    } else {
+                        false
+                    };
+
+                    if !is_cancelled {
+                        // 发送 SessionPromptEnd 通知（成功）
+                        let end_notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                            session_id: session_id_str.clone(),
+                            stop_reason: resp.stop_reason,
+                            error_message: None,
+                            request_id: request_id.clone(),
+                        });
+                        if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, end_notify).await {
+                            error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
+                        }
+                    } else {
+                        info!("🚫 项目[{}]session已被用户取消，跳过发送SessionPromptEnd消息", project_id);
                     }
 
                     // 恢复agent状态为Idle
@@ -158,15 +169,26 @@ where
                 Err(e) => {
                     error!("项目[{}]发送Prompt失败: {:?}", project_id, e);
 
-                    // 发送 SessionPromptEnd 通知（失败）
-                    let end_notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
-                        session_id: session_id_str.clone(),
-                        stop_reason: agent_client_protocol::StopReason::Cancelled,
-                        error_message: Some(format!("{:?}", e)),
-                        request_id: request_id.clone(),
-                    });
-                    if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, end_notify).await {
-                        error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
+                    // 检查session是否已被用户取消，如果已取消则不发送prompt_end消息
+                    let is_cancelled = if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id_str) {
+                        session_data.is_cancelled()
+                    } else {
+                        false
+                    };
+
+                    if !is_cancelled {
+                        // 发送 SessionPromptEnd 通知（失败）
+                        let end_notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                            session_id: session_id_str.clone(),
+                            stop_reason: agent_client_protocol::StopReason::Cancelled,
+                            error_message: Some(format!("{:?}", e)),
+                            request_id: request_id.clone(),
+                        });
+                        if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, end_notify).await {
+                            error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
+                        }
+                    } else {
+                        info!("🚫 项目[{}]session已被用户取消，跳过发送错误SessionPromptEnd消息", project_id);
                     }
 
                     // 恢复agent状态为Idle

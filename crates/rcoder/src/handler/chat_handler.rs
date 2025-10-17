@@ -209,13 +209,18 @@ pub async fn handle_chat(
         }
     }
 
-    // 🧹 发起新对话前，清空该项目的历史SSE消息，确保前端只看到当前对话的新消息
+    // 🧹 发起新对话前，彻底清空该项目的所有历史消息，确保前端只看到当前对话的新消息
+    // clear_project_messages 现在包含彻底清空机制，会：
+    // 1. 清空所有缓存消息
+    // 2. 移除 SESSION_CACHE 条目
+    // 3. 防止任何历史消息残留
     let cleared_count = clear_project_messages(
         &project_id,
         &state.sessions,
         request.session_id.as_deref(),
     )
     .await;
+
     if cleared_count > 0 {
         info!(
             "📝 [chat] 发起新对话前清空了 {} 条历史SSE消息: project_id={}",
