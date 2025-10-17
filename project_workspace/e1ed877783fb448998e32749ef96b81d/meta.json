@@ -1,0 +1,12 @@
+{
+  "name": "React + Vite",
+  "description": "基于 React 18 + Vite 的现代化前端项目模板",
+  "version": "1.0.0",
+  "author": "XAGI Team",
+  "features": ["React 18", "Vite", "TypeScript", "ESLint", "Prettier", "热重载"],
+  "keywords": ["react", "vite", "typescript", "frontend", "spa"],
+  "category": "frontend",
+  "framework": "react",
+  "bundler": "vite",
+  "language": "typescript"
+}

@@ -93,13 +93,19 @@ impl AgentCleaner {
         // 检查SESSION_CACHE中的所有session
         let mut sessions_to_remove = Vec::new();
 
-        for entry in SESSION_CACHE.iter() {
-            let session_id = entry.key();
+        let session_ids: Vec<String> = SESSION_CACHE
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
 
+        for session_id in session_ids {
             // 如果session_id不在活跃映射中，则为孤立session
-            if !active_session_ids.contains(session_id) {
+            if !active_session_ids.contains(&session_id) {
                 // 检查session中是否有消息
-                if let Some(session_data) = SESSION_CACHE.get(session_id) {
+                if let Some(session_data_ref) = SESSION_CACHE.get(&session_id) {
+                    let session_data = session_data_ref.clone();
+                    drop(session_data_ref);
+
                     let message_count = session_data.message_count().await;
 
                     if message_count > 0 {
@@ -109,7 +115,7 @@ impl AgentCleaner {
                         );
 
                         // 清理这个session的消息
-                        let cleared = clear_session_messages(session_id).await;
+                        let cleared = clear_session_messages(&session_id).await;
                         messages_cleared += cleared as u64;
 
                         // 如果清理后session为空，标记为待删除

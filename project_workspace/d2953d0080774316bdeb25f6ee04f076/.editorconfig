@@ -1,0 +1,42 @@
+# EditorConfig 配置文件
+# 用于统一不同编辑器和IDE的代码风格
+
+# 顶级配置文件
+root = true
+
+# 所有文件的通用配置
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Markdown 文件配置
+[*.md]
+trim_trailing_whitespace = false
+
+# JSON 文件配置
+[*.json]
+indent_size = 2
+
+# YAML 文件配置
+[*.{yml,yaml}]
+indent_size = 2
+
+# 配置文件
+[*.{js,ts,jsx,tsx,vue}]
+indent_size = 2
+
+# CSS 文件配置
+[*.{css,scss,sass,less}]
+indent_size = 2
+
+# HTML 文件配置
+[*.html]
+indent_size = 2
+
+# 其他配置文件
+[*.{ini,conf,config}]
+indent_size = 2

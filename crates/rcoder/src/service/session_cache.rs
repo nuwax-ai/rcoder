@@ -6,177 +6,270 @@ use crate::{SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Observer, RingBuffer};
-use tokio::sync::mpsc::{self, Sender, Receiver};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
-use std::sync::{LazyLock, RwLock, atomic::{AtomicBool, Ordering}};
+use tracing::{debug, info, warn};
+use std::sync::{Arc, LazyLock, atomic::{AtomicBool, AtomicU64, Ordering}};
 
 /// 全局Session缓存 - LazyLock初始化
-pub static SESSION_CACHE: LazyLock<DashMap<String, SessionData>> = LazyLock::new(|| DashMap::new());
+pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(|| DashMap::new());
 
 /// Project到当前活跃Session的映射 - 用于确保一个project_id只对应一个session_id
 /// 当project_id对应的session_id发生变化时，会自动清理旧session的数据
 pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(|| DashMap::new());
 
+
 /// Session数据包装
 pub struct SessionData {
-    /// 循环消息缓存 - 固定大小1000条，使用ringbuf实现（不包含heartbeat）
-    rb: tokio::sync::Mutex<HeapRb<UnifiedSessionMessage>>,
-    /// 实时消息推送通道 - 使用异步有界channel
-    tx: RwLock<Option<Sender<UnifiedSessionMessage>>>,
-    /// 取消标志 - 取消后拒绝新消息
+    command_tx: mpsc::UnboundedSender<SessionCommand>,
     is_cancelled: AtomicBool,
-    /// 当前连接的取消令牌 - 用于实现单连接限制（新连接会取消旧连接）
-    cancellation_token: RwLock<CancellationToken>,
+    version: AtomicU64,
 }
 
 impl SessionData {
-    pub fn new(max_size: usize) -> Self {
-        Self {
-            rb: tokio::sync::Mutex::new(HeapRb::new(max_size)),
-            tx: RwLock::new(None),
+    pub fn new(max_size: usize) -> Arc<Self> {
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let session = Arc::new(SessionData {
+            command_tx,
             is_cancelled: AtomicBool::new(false),
-            cancellation_token: RwLock::new(CancellationToken::new()),
-        }
+            version: AtomicU64::new(0),
+        });
+
+        SessionWorker::spawn(max_size, command_rx, Arc::downgrade(&session));
+
+        session
     }
 
-    /// 添加消息到循环缓存
-    pub async fn add_message(&self, message: UnifiedSessionMessage) {
-        let mut rb = self.rb.lock().await;
-        // ringbuf 会自动循环覆盖，不需要手动检查大小
-        let _ = rb.push_overwrite(message); // 如果缓冲区满，会覆盖最老的消息
-    }
-
-    /// 获取所有消息并清空缓存（用于SSE推送）
-    pub async fn drain_messages(&self) -> Vec<UnifiedSessionMessage> {
-        let mut rb = self.rb.lock().await;
-        let mut messages = Vec::new();
-        // 读取所有可用消息
-        while let Some(message) = rb.try_pop() {
-            messages.push(message);
-        }
-        messages
-    }
-
-    /// 从缓存中取出一条消息（用于循环发送）
-    pub async fn pop_message(&self) -> Option<UnifiedSessionMessage> {
-        let mut rb = self.rb.lock().await;
-        rb.try_pop()
-    }
-
-    /// 获取消息数量
-    pub async fn message_count(&self) -> usize {
-        let rb = self.rb.lock().await;
-        rb.occupied_len()
-    }
-
-    /// 清空所有消息（用于取消任务时清理）
-    pub async fn clear_messages(&self) -> usize {
-        let mut rb = self.rb.lock().await;
-        let cleared_count = rb.occupied_len();
-        rb.clear();
-        cleared_count
-    }
-
-    /// 创建新连接，同时取消旧连接
-    ///
-    /// 返回 (sender, receiver, cancellation_token)
-    /// - sender: 用于发送消息的 异步有界channel 发送端（该连接独享，用于心跳）
-    /// - receiver: 用于接收消息的 channel 接收端
-    /// - cancellation_token: 用于监听连接取消的令牌
-    pub fn create_new_connection(&self, buffer_size: usize)
-        -> (Sender<UnifiedSessionMessage>, Receiver<UnifiedSessionMessage>, CancellationToken)
-    {
-        // 1. 取消旧连接
-        if let Ok(old_token) = self.cancellation_token.read() {
-            old_token.cancel();
-            info!("🔌 触发旧连接取消信号（CancellationToken）");
-        }
-
-        // 2. 创建新的取消令牌
-        let new_token = CancellationToken::new();
-        if let Ok(mut token_guard) = self.cancellation_token.write() {
-            *token_guard = new_token.clone();
-        }
-
-        // 3. 创建新的异步有界消息 channel
-        let (tx, rx) = mpsc::channel(buffer_size);
-        if let Ok(mut channel_tx) = self.tx.write() {
-            *channel_tx = Some(tx.clone());
-        }
-
-        // 4. 重置取消标志
-        self.is_cancelled.store(false, Ordering::Release);
-
-        info!("📡 创建新连接和取消令牌，使用异步有界channel，buffer_size={}", buffer_size);
-
-        // 返回 tx 副本，让每个连接持有独立的 sender
-        (tx, rx, new_token)
-    }
-
-    /// 设置取消状态
-    pub fn set_cancelled(&self, cancelled: bool) {
-        self.is_cancelled.store(cancelled, Ordering::Release);
-        if cancelled {
-            debug!("🚫 设置session为已取消状态");
-        } else {
-            debug!("✅ 重置session取消状态");
-        }
-    }
-
-    /// 检查是否已取消
     pub fn is_cancelled(&self) -> bool {
         self.is_cancelled.load(Ordering::Acquire)
     }
 
-    /// 异步发送消息到channel（如果存在）
-    pub async fn send_to_channel(&self, msg: UnifiedSessionMessage) -> bool {
-        if let Ok(channel_tx) = self.tx.read() {
-            if let Some(tx) = channel_tx.as_ref() {
-                match tx.send(msg).await {
-                    Ok(_) => {
-                        debug!("📤 成功异步发送消息到 channel");
-                        return true;
+    pub fn set_cancelled(&self, cancelled: bool) {
+        self.is_cancelled.store(cancelled, Ordering::Release);
+        let _ = self.command_tx.send(SessionCommand::SetCancelled(cancelled));
+    }
+
+    pub async fn clear_messages(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self.command_tx.send(SessionCommand::Clear { ack: tx }).is_err() {
+            warn!("⚠️ clear_messages 指令发送失败，worker 已退出");
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn clear_all(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self.command_tx.send(SessionCommand::ClearAll { ack: tx }).is_err() {
+            warn!("⚠️ clear_all 指令发送失败，worker 已退出");
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn create_new_connection(
+        &self,
+        buffer_size: usize,
+    ) -> Result<(mpsc::Receiver<UnifiedSessionMessage>, CancellationToken, u64)> {
+        let version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancellation_token = CancellationToken::new();
+        let (tx, rx) = mpsc::channel(buffer_size);
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        let command = SessionCommand::Register {
+            sender: tx,
+            cancel_token: cancellation_token.clone(),
+            version,
+            ack: ack_tx,
+        };
+
+        self.is_cancelled.store(false, Ordering::Release);
+
+        self
+            .command_tx
+            .send(command)
+            .map_err(|err| anyhow::anyhow!("发送注册指令失败: {}", err))?;
+
+        ack_rx
+            .await
+            .map_err(|err| anyhow::anyhow!("等待注册响应失败: {}", err))?;
+
+        Ok((rx, cancellation_token, version))
+    }
+
+    pub fn push_message(&self, message: UnifiedSessionMessage) {
+        if self
+            .command_tx
+            .send(SessionCommand::Push { message })
+            .is_err()
+        {
+            warn!("⚠️ 推送消息失败，worker 已退出");
+        }
+    }
+
+    pub async fn message_count(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self.command_tx.send(SessionCommand::MessageCount { ack: tx }).is_err() {
+            warn!("⚠️ message_count 指令发送失败，worker 已退出");
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    pub fn current_version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+}
+
+struct SessionWorker {
+    max_size: usize,
+    command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+    session: std::sync::Weak<SessionData>,
+}
+
+impl SessionWorker {
+    fn spawn(
+        max_size: usize,
+        command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+        session: std::sync::Weak<SessionData>,
+    ) {
+        let worker = SessionWorker {
+            max_size,
+            command_rx,
+            session,
+        };
+        tokio::spawn(worker.run());
+    }
+
+    async fn run(mut self) {
+        let (mut producer, mut consumer) = HeapRb::new(self.max_size).split();
+        let mut buffered_len = 0usize;
+        let mut current_sender: Option<mpsc::Sender<UnifiedSessionMessage>> = None;
+        let mut current_cancel: Option<CancellationToken> = None;
+
+        while let Some(cmd) = self.command_rx.recv().await {
+            match cmd {
+                SessionCommand::Push { message } => {
+                    let should_buffer = !matches!(
+                        message.message_type,
+                        crate::model::SessionMessageType::Heartbeat
+                    );
+
+                    if should_buffer {
+                        if producer.is_full() {
+                            let _ = consumer.try_pop();
+                            buffered_len = buffered_len.saturating_sub(1);
+                        }
+                        if producer.try_push(message.clone()).is_ok() {
+                            buffered_len += 1;
+                        } else {
+                            warn!("⚠️ ring buffer push 失败，只能实时推送");
+                        }
                     }
-                    Err(_) => {
-                        debug!("🔌 异步channel已关闭");
+
+                    if let Some(sender) = current_sender.as_mut() {
+                        if sender.send(message).await.is_err() {
+                            warn!("⚠️ SSE sender 已关闭，丢弃实时推送");
+                            current_sender = None;
+                        }
                     }
+                }
+                SessionCommand::Register {
+                    sender,
+                    cancel_token,
+                    version,
+                    ack,
+                } => {
+                    if let Some(token) = current_cancel.take() {
+                        token.cancel();
+                    }
+
+                    current_sender = Some(sender.clone());
+                    current_cancel = Some(cancel_token);
+
+                    let mut drained = Vec::new();
+                    while let Some(msg) = consumer.try_pop() {
+                        drained.push(msg);
+                    }
+                    buffered_len = 0;
+
+                    for msg in drained {
+                        if sender.send(msg.clone()).await.is_err() {
+                            warn!("⚠️ 历史消息发送失败，SSE sender 已关闭");
+                            current_sender = None;
+                            break;
+                        }
+                    }
+
+                    let _ = ack.send(());
+
+                    if let Some(session) = self.session.upgrade() {
+                        session.version.store(version, Ordering::Release);
+                    }
+                }
+                SessionCommand::Clear { ack } => {
+                    let mut cleared = 0usize;
+                    while consumer.try_pop().is_some() {
+                        cleared += 1;
+                    }
+                    buffered_len = 0;
+                    let _ = ack.send(cleared);
+                }
+                SessionCommand::ClearAll { ack } => {
+                    if let Some(token) = current_cancel.take() {
+                        token.cancel();
+                    }
+                    current_sender = None;
+
+                    let mut cleared = 0usize;
+                    while consumer.try_pop().is_some() {
+                        cleared += 1;
+                    }
+                    buffered_len = 0;
+                    let _ = ack.send(cleared);
+                }
+                SessionCommand::SetCancelled(cancelled) => {
+                    if cancelled {
+                        if let Some(token) = current_cancel.take() {
+                            token.cancel();
+                        }
+                        current_sender = None;
+                    }
+                }
+                SessionCommand::MessageCount { ack } => {
+                    let _ = ack.send(buffered_len);
                 }
             }
         }
-        false
+
+        debug!("🔚 SessionWorker 结束运行");
     }
+}
 
-    /// 彻底清空所有数据（用于取消任务）
-    /// 清空 ringbuf + drop channel + 设置取消标志
-    pub async fn clear_all(&self) -> usize {
-        // 1. Drop channel（自动清空未发送消息）
-        if let Ok(mut channel_tx) = self.tx.write() {
-            *channel_tx = None;
-            debug!("🗑️ 已drop channel");
-        }
-
-        // 2. 清空 ringbuf
-        let mut rb = self.rb.lock().await;
-        let cleared_count = rb.occupied_len();
-        rb.clear();
-
-        // 3. 设置取消标志
-        self.is_cancelled.store(true, Ordering::Release);
-
-        info!("🧹 彻底清空session数据: cleared_count={}", cleared_count);
-        cleared_count
-    }
+#[derive(Debug)]
+enum SessionCommand {
+    Push { message: UnifiedSessionMessage },
+    Register {
+        sender: mpsc::Sender<UnifiedSessionMessage>,
+        cancel_token: CancellationToken,
+        version: u64,
+        ack: oneshot::Sender<()>,
+    },
+    Clear { ack: oneshot::Sender<usize> },
+    ClearAll { ack: oneshot::Sender<usize> },
+    SetCancelled(bool),
+    MessageCount { ack: oneshot::Sender<usize> },
 }
 
 /// 便捷函数：添加SessionNotify消息（自动转换为统一格式）
 pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
     let session_data = SESSION_CACHE
         .entry(session_id.to_string())
-        .or_insert_with(|| SessionData::new(1000));
+        .or_insert_with(|| SessionData::new(1000))
+        .clone();
 
-    // 检查是否已取消
     if session_data.is_cancelled() {
         debug!("🚫 Session已取消，丢弃消息: session_id={}", session_id);
         return Ok(());
@@ -184,31 +277,21 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
 
     let unified_message = notify.to_unified_message();
 
-    // 添加调试日志
     debug!(
         "📥 推送消息到缓存: session_id={}, message_type={:?}, sub_type={}",
         session_id,
-                                    unified_message.message_type,
+        unified_message.message_type,
         unified_message.sub_type
     );
 
-    // 1. 存入 ringbuf（非 heartbeat 消息）
-    if !matches!(unified_message.message_type, crate::model::SessionMessageType::Heartbeat) {
-        session_data.add_message(unified_message.clone()).await;
-        
-        // 记录缓存中的消息数量
-        let message_count = session_data.message_count().await;
-        debug!(
-            "📊 缓存消息数量: session_id={}, count={}",
-            session_id,
-            message_count
-        );
-    }
+    session_data.push_message(unified_message);
 
     Ok(())
 }
 
 /// 便捷函数：添加SessionNotify消息并管理Project-Session映射
+///
+/// 这个函数会自动确保project_id只对应一个活跃的session_id
 ///
 /// 这个函数会自动确保project_id只对应一个活跃的session_id
 /// 当检测到session_id变化时，会自动清理旧session的数据
@@ -229,7 +312,10 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
 
 /// 便捷函数：清空指定 session_id 的所有消息（用于取消任务时避免历史消息积压）
 pub async fn clear_session_messages(session_id: &str) -> usize {
-    if let Some(session_data) = SESSION_CACHE.get(session_id) {
+    if let Some(session_data_ref) = SESSION_CACHE.get(session_id) {
+        let session_data = session_data_ref.clone();
+        drop(session_data_ref);
+
         let cleared_count = session_data.clear_messages().await;
         info!(
             "🧹 清空 SSE 消息缓存: session_id={}, cleared_count={}",

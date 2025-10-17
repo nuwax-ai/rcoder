@@ -360,54 +360,20 @@ pub async fn agent_session_notification(
 
     let session_id = params.session_id.clone();
 
-    // 获取或创建 SessionData
+    // 获取或创建 SessionData，并 clone Arc 以便跨异步使用
     let session_data = SESSION_CACHE
         .entry(session_id.clone())
-        .or_insert_with(|| crate::service::SessionData::new(1000));
-    
-    // 创建新连接，同时自动取消旧连接（无需手动 trigger 和 sleep）
-    // tx: 该连接独享的 sender，用于发送心跳（避免多连接竞态）
-    let (tx, mut rx, cancel_token) = session_data.create_new_connection(1000);
+        .or_insert_with(|| crate::service::SessionData::new(1000))
+        .clone();
 
-    // 克隆需要的变量用于异步任务
-    let tx_for_history = tx.clone();
-    let session_id_for_history = session_id.clone();
+    // 创建新连接，同时自动取消旧连接
+    let (mut rx, cancel_token, version) = session_data
+        .create_new_connection(1000)
+        .await
+        .map_err(AppError::from)?;
 
-    // 启动异步任务循环发送历史消息，避免阻塞 SSE 流建立
-    tokio::spawn(async move {
-        let mut sent_count = 0;
-        
-        info!("📦 启动历史消息发送任务: session_id={}", session_id_for_history);
-        
-        // 使用循环，一条一条从全局缓存中取出并发送
-        loop {
-            // 从全局缓存中获取 session_data 并取出一条消息
-            let msg = if let Some(session_data) = SESSION_CACHE.get(&session_id_for_history) {
-                session_data.pop_message().await
-            } else {
-                None
-            };
-            
-            // 如果没有消息，等待 100ms 后继续扫描
-            let Some(msg) = msg else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            };
-            
-            // 使用异步有界channel，需要 await 发送
-            match tx_for_history.send(msg).await {
-                Ok(_) => {
-                    sent_count += 1;
-                    debug!("📤 成功发送第 {} 条历史消息到异步有界channel", sent_count);
-                }
-                Err(e) => {
-                    info!("🔌 历史消息发送任务结束（Channel已关闭）: session_id={}, sent_count={}, error={:?}", 
-                        session_id_for_history, sent_count, e);
-                    break;
-                }
-            }
-        }
-    });
+    let session_data_for_stream = session_data.clone();
+    let session_id_for_stream = session_id.clone();
 
     // 创建SSE流
     let stream = async_stream::stream! {
@@ -431,21 +397,32 @@ pub async fn agent_session_notification(
                 
                 // 接收实时消息
                 Some(msg) = rx.recv() => {
+                    // 如果检测到版本已更新，说明出现了更新的连接，主动退出
+                    if session_data_for_stream.current_version() != version {
+                        info!(
+                            "🔁 检测到更新版本，关闭旧连接: session_id={}, old_version={}, current_version={}",
+                            session_id_for_stream,
+                            version,
+                            session_data_for_stream.current_version()
+                        );
+                        break;
+                    }
+
                     debug!(
                         "📤 发送消息到 session: {}, type: {:?}",
-                        session_id, msg.message_type
+                        session_id_for_stream, msg.message_type
                     );
 
                     // 根据消息类型动态设置事件名称
                     let event_name = match msg.message_type {
                         crate::model::SessionMessageType::SessionPromptStart => {
-                            info!("📝 发送 prompt_start 消息到 session: {}", session_id);
+                            info!("📝 发送 prompt_start 消息到 session: {}", session_id_for_stream);
                             "prompt_start"
                         }
                         crate::model::SessionMessageType::SessionPromptEnd => {
                             info!(
                                 "🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}",
-                                session_id,
+                                session_id_for_stream,
                                 msg.data.get("reason")
                             );
                             "prompt_end"
@@ -453,7 +430,7 @@ pub async fn agent_session_notification(
                         crate::model::SessionMessageType::AgentSessionUpdate => {
                             debug!(
                                 "🔄 发送 {} 消息到 session: {}",
-                                msg.sub_type, session_id
+                                msg.sub_type, session_id_for_stream
                             );
                             &msg.sub_type
                         }
@@ -469,9 +446,19 @@ pub async fn agent_session_notification(
                 
                 // 心跳定时器 - 直接发送心跳事件到客户端
                 _ = heartbeat_interval.tick() => {
-                    debug!("💓 发送心跳事件到 session: {}", session_id);
+                    if session_data_for_stream.current_version() != version {
+                        info!(
+                            "🔁 心跳检测到连接版本更新，关闭旧连接: session_id={}, old_version={}, current_version={}",
+                            session_id_for_stream,
+                            version,
+                            session_data_for_stream.current_version()
+                        );
+                        break;
+                    }
 
-                    let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id.clone());
+                    debug!("💓 发送心跳事件到 session: {}", session_id_for_stream);
+
+                    let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id_for_stream.clone());
                     let event: Event = Event::default()
                         .event("heartbeat")
                         .data(serde_json::to_string(&heartbeat_msg).unwrap_or_else(|_| "{}".to_string()));
@@ -481,7 +468,7 @@ pub async fn agent_session_notification(
             }
         }
 
-        info!("🔌 SSE连接正常关闭: session_id={}", session_id);
+        info!("🔌 SSE连接正常关闭: session_id={}", session_id_for_stream);
     };
 
     Ok(Sse::new(stream))

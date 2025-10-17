@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>扫雷游戏</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .cell {
+            width: 2rem;
+            height: 2rem;
+            border: 1px solid #4b5563;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.875rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 150ms;
+            user-select: none;
+        }
+
+        .cell:hover {
+            background-color: #e5e7eb;
+        }
+
+        .cell.hidden {
+            background-color: #d1d5db;
+        }
+
+        .cell.revealed {
+            background-color: white;
+        }
+
+        .cell.mine {
+            background-color: #ef4444;
+            color: white;
+        }
+
+        .cell.flagged {
+            background-color: #d1d5db;
+        }
+
+        .cell.revealed.mine {
+            background-color: #ef4444;
+        }
+
+        .cell.revealed.safe-1 { color: #2563eb; }
+        .cell.revealed.safe-2 { color: #16a34a; }
+        .cell.revealed.safe-3 { color: #dc2626; }
+        .cell.revealed.safe-4 { color: #9333ea; }
+        .cell.revealed.safe-5 { color: #ca8a04; }
+        .cell.revealed.safe-6 { color: #db2777; }
+        .cell.revealed.safe-7 { color: #111827; }
+        .cell.revealed.safe-8 { color: #6b7280; }
+
+        .game-board {
+            display: inline-grid;
+            gap: 0;
+            background-color: #e5e7eb;
+            padding: 0.5rem;
+            border-radius: 0.5rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+
+        .game-header {
+            background-color: #374151;
+            color: white;
+            padding: 1rem;
+            border-radius: 0.5rem 0.5rem 0 0;
+        }
+
+        .mine-counter, .timer {
+            background-color: black;
+            color: #ef4444;
+            padding: 0.25rem 0.75rem;
+            border-radius: 0.25rem;
+            font-family: monospace;
+            font-size: 1.125rem;
+        }
+
+        .game-container {
+            background-color: white;
+            border-radius: 0.5rem;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+            overflow: hidden;
+        }
+
+        .difficulty-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 50;
+        }
+
+        .difficulty-modal-content {
+            background-color: white;
+            padding: 1.5rem;
+            border-radius: 0.5rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+            max-width: 20rem;
+            width: 100%;
+            margin: 1rem;
+        }
+
+        body {
+            background: linear-gradient(135deg, #dbeafe, #818cf8);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useRef } = React;
+
+        // 游戏状态枚举
+        const GameState = {
+            READY: 'ready',
+            PLAYING: 'playing',
+            WON: 'won',
+            LOST: 'lost',
+            PAUSED: 'paused',
+        };
+
+        // 难度枚举
+        const Difficulty = {
+            BEGINNER: 'beginner',
+            INTERMEDIATE: 'intermediate',
+            EXPERT: 'expert',
+        };
+
+        // 默认配置
+        const DEFAULT_CONFIGS = {
+            [Difficulty.BEGINNER]: { rows: 9, cols: 9, mines: 10 },
+            [Difficulty.INTERMEDIATE]: { rows: 16, cols: 16, mines: 40 },
+            [Difficulty.EXPERT]: { rows: 16, cols: 30, mines: 99 },
+        };
+
+        // 工具函数
+        function createBoard(config) {
+            const board = [];
+            for (let row = 0; row < config.rows; row++) {
+                board[row] = [];
+                for (let col = 0; col < config.cols; col++) {
+                    board[row][col] = {
+                        row,
+                        col,
+                        isMine: false,
+                        isRevealed: false,
+                        isFlagged: false,
+                        adjacentMines: 0,
+                    };
+                }
+            }
+            return board;
+        }
+
+        function placeMines(board, config, excludeRow, excludeCol) {
+            let minesPlaced = 0;
+            while (minesPlaced < config.mines) {
+                const row = Math.floor(Math.random() * config.rows);
+                const col = Math.floor(Math.random() * config.cols);
+
+                const isExcluded = Math.abs(row - excludeRow) <= 1 && Math.abs(col - excludeCol) <= 1;
+
+                if (!board[row][col].isMine && !isExcluded) {
+                    board[row][col].isMine = true;
+                    minesPlaced++;
+                }
+            }
+        }
+
+        function calculateAdjacentMines(board) {
+            const rows = board.length;
+            const cols = board[0].length;
+
+            for (let row = 0; row < rows; row++) {
+                for (let col = 0; col < cols; col++) {
+                    if (!board[row][col].isMine) {
+                        let count = 0;
+                        for (let dr = -1; dr <= 1; dr++) {
+                            for (let dc = -1; dc <= 1; dc++) {
+                                if (dr === 0 && dc === 0) continue;
+                                const newRow = row + dr;
+                                const newCol = col + dc;
+                                if (newRow >= 0 && newRow < rows && newCol >= 0 && newCol < cols) {
+                                    if (board[newRow][newCol].isMine) count++;
+                                }
+                            }
+                        }
+                        board[row][col].adjacentMines = count;
+                    }
+                }
+            }
+        }
+
+        function revealCell(board, row, col) {
+            const cell = board[row][col];
+            if (cell.isRevealed || cell.isFlagged) return board;
+
+            cell.isRevealed = true;
+
+            if (cell.adjacentMines === 0 && !cell.isMine) {
+                const rows = board.length;
+                const cols = board[0].length;
+
+                for (let dr = -1; dr <= 1; dr++) {
+                    for (let dc = -1; dc <= 1; dc++) {
+                        if (dr === 0 && dc === 0) continue;
+                        const newRow = row + dr;
+                        const newCol = col + dc;
+                        if (newRow >= 0 && newRow < rows && newCol >= 0 && newCol < cols) {
+                            if (!board[newRow][newCol].isRevealed) {
+                                revealCell(board, newRow, newCol);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return board;
+        }
+
+        function checkWin(board, config) {
+            const totalCells = config.rows * config.cols;
+            const mineCells = config.mines;
+            let revealedCells = 0;
+
+            for (let row = 0; row < config.rows; row++) {
+                for (let col = 0; col < config.cols; col++) {
+                    if (board[row][col].isRevealed && !board[row][col].isMine) {
+                        revealedCells++;
+                    }
+                }
+            }
+
+            return revealedCells === totalCells - mineCells;
+        }
+
+        function formatTime(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        // 组件定义
+        function Cell({ cell, onClick, onRightClick, disabled }) {
+            const handleClick = (e) => {
+                e.preventDefault();
+                if (!disabled && !cell.isRevealed && !cell.isFlagged) {
+                    onClick(cell.row, cell.col);
+                }
+            };
+
+            const handleRightClick = (e) => {
+                e.preventDefault();
+                if (!disabled && !cell.isRevealed) {
+                    onRightClick(cell.row, cell.col);
+                }
+            };
+
+            const getCellContent = () => {
+                if (cell.isFlagged) return '🚩';
+                if (cell.isRevealed) {
+                    if (cell.isMine) return '💣';
+                    if (cell.adjacentMines > 0) return cell.adjacentMines;
+                }
+                return '';
+            };
+
+            const getCellStyle = () => {
+                let className = 'cell ';
+                if (cell.isRevealed) {
+                    className += cell.isMine ? 'revealed mine' : 'revealed';
+                    if (!cell.isMine && cell.adjacentMines > 0) {
+                        className += ` safe-${cell.adjacentMines}`;
+                    }
+                } else {
+                    className += 'hidden';
+                    if (cell.isFlagged) className += ' flagged';
+                }
+                return className;
+            };
+
+            return (
+                <button
+                    className={getCellStyle()}
+                    onClick={handleClick}
+                    onContextMenu={handleRightClick}
+                    disabled={disabled}
+                >
+                    {getCellContent()}
+                </button>
+            );
+        }
+
+        function GameBoard({ board, onCellClick, onCellRightClick, disabled }) {
+            return (
+                <div className="game-board" style={{ gridTemplateColumns: `repeat(${board[0]?.length || 0}, 1fr)` }}>
+                    {board.map((row, rowIndex) =>
+                        row.map((cell, colIndex) => (
+                            <Cell
+                                key={`${rowIndex}-${colIndex}`}
+                                cell={cell}
+                                onClick={onCellClick}
+                                onRightClick={onCellRightClick}
+                                disabled={disabled}
+                            />
+                        ))
+                    )}
+                </div>
+            );
+        }
+
+        function GameHeader({ gameData, onRestart, onNewGame }) {
+            const { board, state, stats, config } = gameData;
+
+            const getGameStateEmoji = () => {
+                switch (state) {
+                    case GameState.READY: return '🙂';
+                    case GameState.PLAYING: return '😮';
+                    case GameState.WON: return '😎';
+                    case GameState.LOST: return '😵';
+                    default: return '🙂';
+                }
+            };
+
+            const getGameStateText = () => {
+                switch (state) {
+                    case GameState.READY: return '准备开始';
+                    case GameState.PLAYING: return '游戏中';
+                    case GameState.WON: return '你赢了！';
+                    case GameState.LOST: return '游戏结束';
+                    default: return '';
+                }
+            };
+
+            const flagsUsed = board.flat().filter(cell => cell.isFlagged).length;
+            const flagsLeft = config.mines - flagsUsed;
+
+            return (
+                <div className="game-header">
+                    <div className="flex items-center justify-between max-w-2xl mx-auto">
+                        <div className="mine-counter">
+                            🚩 {flagsLeft.toString().padStart(3, '0')}
+                        </div>
+
+                        <div className="flex flex-col items-center space-y-2">
+                            <button
+                                onClick={state === GameState.WON || state === GameState.LOST ? onNewGame : onRestart}
+                                className="text-4xl hover:scale-110 transition-transform"
+                                title={state === GameState.WON || state === GameState.LOST ? '新游戏' : '重新开始'}
+                            >
+                                {getGameStateEmoji()}
+                            </button>
+                            <div className="text-sm font-medium">
+                                {getGameStateText()}
+                            </div>
+                        </div>
+
+                        <div className="timer">
+                            ⏱️ {formatTime(stats.time)}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function DifficultySelector({ currentDifficulty, onDifficultyChange }) {
+            const difficulties = [
+                { value: Difficulty.BEGINNER, label: '初级', description: '9×9, 10个雷' },
+                { value: Difficulty.INTERMEDIATE, label: '中级', description: '16×16, 40个雷' },
+                { value: Difficulty.EXPERT, label: '高级', description: '16×30, 99个雷' },
+            ];
+
+            return (
+                <div className="difficulty-modal">
+                    <div className="difficulty-modal-content">
+                        <h3 className="text-lg font-bold mb-4">选择难度</h3>
+                        <div className="space-y-2">
+                            {difficulties.map((diff) => (
+                                <button
+                                    key={diff.value}
+                                    onClick={() => onDifficultyChange(diff.value)}
+                                    className="w-full text-left px-4 py-3 rounded-lg border-2 transition-all hover:border-gray-300 hover:bg-gray-50"
+                                >
+                                    <div className="font-medium">{diff.label}</div>
+                                    <div className="text-sm text-gray-600">{diff.description}</div>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function MinesweeperGame() {
+            const [difficulty, setDifficulty] = useState(Difficulty.BEGINNER);
+            const [showDifficultySelector, setShowDifficultySelector] = useState(false);
+
+            const initializeGame = useCallback((diff) => {
+                const config = DEFAULT_CONFIGS[diff];
+                return {
+                    board: createBoard(config),
+                    config,
+                    state: GameState.READY,
+                    stats: { time: 0 },
+                    startTime: null,
+                    endTime: null,
+                };
+            }, []);
+
+            const [gameData, setGameData] = useState(() => initializeGame(difficulty));
+            const timerRef = useRef(null);
+
+            // 计时器效果
+            useEffect(() => {
+                if (gameData.state === GameState.PLAYING && gameData.startTime) {
+                    timerRef.current = setInterval(() => {
+                        setGameData(prev => ({
+                            ...prev,
+                            stats: {
+                                ...prev.stats,
+                                time: Math.floor((Date.now() - (prev.startTime || Date.now())) / 1000)
+                            }
+                        }));
+                    }, 1000);
+                } else {
+                    if (timerRef.current) {
+                        clearInterval(timerRef.current);
+                        timerRef.current = null;
+                    }
+                }
+
+                return () => {
+                    if (timerRef.current) {
+                        clearInterval(timerRef.current);
+                    }
+                };
+            }, [gameData.state, gameData.startTime]);
+
+            const handleCellClick = useCallback((row, col) => {
+                setGameData(prevData => {
+                    let newData = { ...prevData, board: prevData.board.map(row => row.map(cell => ({ ...cell }))) };
+
+                    if (prevData.state === GameState.READY) {
+                        // 第一次点击，开始游戏
+                        placeMines(newData.board, newData.config, row, col);
+                        calculateAdjacentMines(newData.board);
+                        newData.state = GameState.PLAYING;
+                        newData.startTime = Date.now();
+                    }
+
+                    if (newData.state !== GameState.PLAYING) return newData;
+
+                    newData.board = revealCell(newData.board, row, col);
+
+                    // 检查是否踩雷
+                    if (newData.board[row][col].isMine) {
+                        newData.state = GameState.LOST;
+                        newData.endTime = Date.now();
+                        // 显示所有地雷
+                        for (let r = 0; r < newData.config.rows; r++) {
+                            for (let c = 0; c < newData.config.cols; c++) {
+                                if (newData.board[r][c].isMine) {
+                                    newData.board[r][c].isRevealed = true;
+                                }
+                            }
+                        }
+                        return newData;
+                    }
+
+                    // 检查是否获胜
+                    if (checkWin(newData.board, newData.config)) {
+                        newData.state = GameState.WON;
+                        newData.endTime = Date.now();
+                    }
+
+                    return newData;
+                });
+            }, []);
+
+            const handleCellRightClick = useCallback((row, col) => {
+                setGameData(prevData => {
+                    if (prevData.state !== GameState.PLAYING && prevData.state !== GameState.READY) {
+                        return prevData;
+                    }
+
+                    const newData = { ...prevData, board: prevData.board.map(row => row.map(cell => ({ ...cell }))) };
+                    const cell = newData.board[row][col];
+
+                    if (!cell.isRevealed) {
+                        cell.isFlagged = !cell.isFlagged;
+                    }
+
+                    return newData;
+                });
+            }, []);
+
+            const handleRestart = useCallback(() => {
+                setGameData(initializeGame(difficulty));
+            }, [difficulty, initializeGame]);
+
+            const handleNewGame = useCallback(() => {
+                setShowDifficultySelector(true);
+            }, []);
+
+            const handleDifficultyChange = useCallback((newDifficulty) => {
+                setDifficulty(newDifficulty);
+                setGameData(initializeGame(newDifficulty));
+                setShowDifficultySelector(false);
+            }, [initializeGame]);
+
+            const isGameOver = gameData.state === GameState.WON || gameData.state === GameState.LOST;
+
+            if (showDifficultySelector) {
+                return (
+                    <DifficultySelector
+                        currentDifficulty={difficulty}
+                        onDifficultyChange={handleDifficultyChange}
+                    />
+                );
+            }
+
+            return (
+                <div className="min-h-screen flex flex-col items-center justify-center p-4">
+                    <div className="game-container">
+                        <GameHeader
+                            gameData={gameData}
+                            onRestart={handleRestart}
+                            onNewGame={handleNewGame}
+                        />
+                        <div className="p-4 bg-gray-100">
+                            <GameBoard
+                                board={gameData.board}
+                                onCellClick={handleCellClick}
+                                onCellRightClick={handleCellRightClick}
+                                disabled={isGameOver}
+                            />
+                        </div>
+                    </div>
+
+                    <div className="mt-6 text-center text-gray-600 max-w-md">
+                        <h3 className="font-semibold mb-2">游戏说明</h3>
+                        <div className="text-sm space-y-1">
+                            <p>左键点击翻开格子，右键标记地雷</p>
+                            <p>数字表示周围8个格子中的地雷数量</p>
+                            <p>标记出所有地雷或翻开所有安全格子即可获胜</p>
+                        </div>
+                    </div>
+
+                    {isGameOver && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                            <div className="bg-white rounded-lg p-8 text-center max-w-sm mx-4">
+                                <div className="text-6xl mb-4">
+                                    {gameData.state === GameState.WON ? '🎉' : '💥'}
+                                </div>
+                                <h2 className="text-2xl font-bold mb-2">
+                                    {gameData.state === GameState.WON ? '恭喜你赢了！' : '游戏结束！'}
+                                </h2>
+                                <p className="text-gray-600 mb-4">
+                                    用时：{formatTime(gameData.stats.time)}
+                                </p>
+                                <div className="space-y-2">
+                                    <button
+                                        onClick={handleRestart}
+                                        className="w-full bg-blue-500 text-white px-6 py-2 rounded-lg hover:bg-blue-600 transition-colors"
+                                    >
+                                        再玩一次
+                                    </button>
+                                    <button
+                                        onClick={handleNewGame}
+                                        className="w-full bg-gray-300 text-gray-700 px-6 py-2 rounded-lg hover:bg-gray-400 transition-colors"
+                                    >
+                                        选择难度
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // 渲染应用
+        ReactDOM.render(<MinesweeperGame />, document.getElementById('root'));
+    </script>
+</body>
+</html>
