@@ -14,6 +14,7 @@ use tracing::{debug, error, info};
 use crate::{
     model::{AgentStatus, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::agent_service::AcpAgentService,
+    service::clear_session_messages,
     utils::{ContentBuilder, PromptBuilder},
 };
 
@@ -96,9 +97,30 @@ async fn create_new_agent_service(
             // 记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
             PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info.clone());
 
-           // 建立 project_id -> session_id 映射，确保 cleanup 任务能正确识别活跃 session
-            crate::service::ensure_project_session(&project_id, &conn_info.session_id.0).await;
-            info!("🔗 建立 Project-Session 映射: project_id={}, session_id={}", project_id, conn_info.session_id.0);
+            let session_id_str = conn_info.session_id.to_string();
+
+            // 建立 project_id -> session_id 映射，确保 cleanup 任务能正确识别活跃 session
+            let cleared_old = crate::service::ensure_project_session(&project_id, &session_id_str).await;
+            if cleared_old > 0 {
+                info!(
+                    "🧹 Project session 映射更新，已清理旧消息: project_id={}, cleared_count={}",
+                    project_id,
+                    cleared_old
+                );
+            } else {
+                info!("🔗 Project session 映射已同步: project_id={}, session_id={}", project_id, session_id_str);
+            }
+
+            // 再次确保当前 session 的历史消息被清空，避免新的 SSE 连接收到旧记录
+            let cleared_session = clear_session_messages(&session_id_str).await;
+            if cleared_session > 0 {
+                info!(
+                    "🧹 清空当前 session 历史消息: project_id={}, session_id={}, cleared_count={}",
+                    project_id,
+                    session_id_str,
+                    cleared_session
+                );
+            }
 
             let response = match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {
                 Ok(prompt_request) => {
