@@ -106,7 +106,7 @@ pub async fn agent_stop(
 
     // 🎯 极简设计：不再需要取消标记，直接清空 SESSION_CACHE 即可
 
-    // 🧹 直接清空对应 project_id 的所有 SSE 缓存条目，避免阻塞
+    // 🧹 主动关闭对应 project_id 的所有 SSE 连接并清空缓存条目，避免阻塞
     let mut cleared_sessions = Vec::new();
     for session_entry in state.sessions.iter() {
         let session_id = session_entry.key();
@@ -114,6 +114,13 @@ pub async fn agent_stop(
 
         if let Some(session_project_id) = &session_info.project_id {
             if session_project_id == project_id {
+                // 先主动关闭 SSE 连接
+                if let Some(session_data) = crate::service::SESSION_CACHE.get(session_id) {
+                    info!("🔌 [agent_stop] 主动关闭SSE连接: project_id={}, session_id={}", project_id, session_id);
+                    session_data.close_current_connection();
+                }
+
+                // 再移除 SESSION_CACHE 条目
                 if crate::service::SESSION_CACHE.remove(session_id).is_some() {
                     cleared_sessions.push(session_id.clone());
                 }

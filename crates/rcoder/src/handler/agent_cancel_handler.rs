@@ -155,9 +155,14 @@ pub async fn agent_session_cancel(
                     info!("✅ [agent_cancel_handler] 收到Agent取消响应: session_id={}, success={}", session_id, cancel_notification_response.success);
                     if cancel_notification_response.success {
                         // 🧹 彻底清空该 session，避免阻塞
-                        // 直接移除 SESSION_CACHE 条目，绕过 SessionWorker 队列
+                        // 先主动关闭 SSE 连接，再移除 SESSION_CACHE 条目
+                        if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
+                            info!("🔌 [agent_cancel_handler] Agent取消成功，主动关闭SSE连接: session_id={}", session_id);
+                            session_data.close_current_connection();
+                        }
+
                         if crate::service::SESSION_CACHE.remove(&session_id).is_some() {
-                            info!("🗑️ Agent取消成功，直接移除 SESSION_CACHE 条目: session_id={}", session_id);
+                            info!("🗑️ Agent取消成功，移除 SESSION_CACHE 条目: session_id={}", session_id);
                         }
 
                         Ok(HttpResult::success(CancelResponse {
@@ -185,7 +190,12 @@ pub async fn agent_session_cancel(
                 project_id
             );
 
-            // 🎯 极简设计：没有找到活跃连接时，直接清空 SESSION_CACHE
+            // 🎯 极简设计：没有找到活跃连接时，主动关闭 SSE 连接并清空 SESSION_CACHE
+            if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
+                info!("🔌 [agent_cancel] 未找到活跃连接，主动关闭SSE连接: session_id={}, project_id={}", session_id, project_id);
+                session_data.close_current_connection();
+            }
+
             if crate::service::SESSION_CACHE.remove(&session_id).is_some() {
                 info!("🗑️ [agent_cancel] 未找到活跃连接，已清空 SESSION_CACHE: session_id={}, project_id={}", session_id, project_id);
             }

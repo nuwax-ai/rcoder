@@ -24,6 +24,9 @@ pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::ne
 /// Session数据包装 - 极简版本，专注消息传输
 pub struct SessionData {
     command_tx: mpsc::UnboundedSender<SessionCommand>,
+    // 🎯 极简优化：直接存储当前连接，无需命令传递
+    current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+    current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
 }
 
 impl SessionData {
@@ -36,11 +39,15 @@ impl SessionData {
         debug!("⏱️ [SessionData::new] channel创建耗时: {:?}", channel_start.elapsed());
 
         let arc_start = std::time::Instant::now();
-        let session = Arc::new(SessionData { command_tx });
+        let session = Arc::new(SessionData {
+            command_tx,
+            current_sender: Arc::new(tokio::sync::Mutex::new(None)),
+            current_cancel: Arc::new(tokio::sync::Mutex::new(None)),
+        });
         debug!("⏱️ [SessionData::new] Arc创建耗时: {:?}", arc_start.elapsed());
 
         let spawn_start = std::time::Instant::now();
-        SessionWorker::spawn(max_size, command_rx);
+        SessionWorker::spawn(max_size, command_rx, session.current_sender.clone(), session.current_cancel.clone());
         debug!("⏱️ [SessionData::new] SessionWorker::spawn耗时: {:?}", spawn_start.elapsed());
 
         debug!("⏱️ [SessionData::new] 总创建耗时: {:?}", start_time.elapsed());
@@ -72,16 +79,24 @@ impl SessionData {
         let (tx, rx) = mpsc::channel(buffer_size);
         debug!("⏱️ [create_new_connection] mpsc channel创建耗时: {:?}", channel_start.elapsed());
 
-        let send_start = std::time::Instant::now();
-        let command = SessionCommand::Register {
-            sender: tx,
-            cancel_token: cancellation_token.clone(),
-        };
-        self
-            .command_tx
-            .send(command)
-            .map_err(|err| anyhow::anyhow!("发送注册指令失败: {}", err))?;
-        debug!("⏱️ [create_new_connection] command_tx.send耗时: {:?}", send_start.elapsed());
+        let setup_start = std::time::Instant::now();
+        // 🎯 极简优化：直接设置连接状态，无需命令传递
+        {
+            // 取消之前的连接
+            if let Ok(mut current_cancel_guard) = self.current_cancel.try_lock() {
+                if let Some(token) = current_cancel_guard.take() {
+                    token.cancel();
+                }
+                // 设置新的取消令牌
+                *current_cancel_guard = Some(cancellation_token.clone());
+            }
+
+            // 设置新的发送器
+            if let Ok(mut current_sender_guard) = self.current_sender.try_lock() {
+                *current_sender_guard = Some(tx.clone());
+            }
+        }
+        debug!("⏱️ [create_new_connection] 连接状态设置耗时: {:?}", setup_start.elapsed());
 
         debug!("⏱️ [create_new_connection] 总连接创建耗时: {:?}", start_time.elapsed());
         Ok((rx, cancellation_token))
@@ -97,17 +112,49 @@ impl SessionData {
         }
     }
 
+    /// 主动关闭当前 SSE 连接
+    ///
+    /// 当用户取消任务时，需要主动关闭 SSE 连接，而不是让客户端一直等待
+    ///
+    /// 关闭机制：
+    /// 1. 触发 CancellationToken，让 SSE 流立即退出循环
+    /// 2. 显式关闭 channel 发送端，让 rx.recv() 立即返回 None
+    /// 3. 清空连接状态，防止新的消息被发送
+    pub fn close_current_connection(&self) {
+        // 🎯 主动触发取消令牌，关闭 SSE 连接
+        if let Ok(mut current_cancel_guard) = self.current_cancel.try_lock() {
+            if let Some(token) = current_cancel_guard.take() {
+                info!("🔌 [SessionData] 主动触发CancellationToken，关闭SSE连接");
+                token.cancel();
+            }
+        }
+
+        // 🎯 显式关闭 channel 发送端，让接收端立即感知到连接关闭
+        if let Ok(mut current_sender_guard) = self.current_sender.try_lock() {
+            if let Some(_sender) = current_sender_guard.take() {
+                info!("🔌 [SessionData] 显式关闭channel发送端，让接收端立即断开");
+                // 当 Sender 被 drop 时，Receiver 的 recv() 会返回 None
+                // 这里通过 take() 将 sender 从 Option 中移除，触发 drop
+            }
+        }
+    }
+
     }
 
 struct SessionWorker {
     max_size: usize,
     command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+    // 🎯 极简优化：直接共享连接状态，无需命令传递
+    current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+    current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
 }
 
 impl SessionWorker {
     fn spawn(
         max_size: usize,
         command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+        current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+        current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
     ) {
         let start_time = std::time::Instant::now();
         debug!("⏱️ [SessionWorker::spawn] 开始创建SessionWorker，max_size={}", max_size);
@@ -115,6 +162,8 @@ impl SessionWorker {
         let worker = SessionWorker {
             max_size,
             command_rx,
+            current_sender,
+            current_cancel,
         };
 
         let spawn_start = std::time::Instant::now();
@@ -126,8 +175,6 @@ impl SessionWorker {
     async fn run(mut self) {
         let (mut producer, mut consumer) = HeapRb::new(self.max_size).split();
         let mut buffered_len = 0usize;
-        let mut current_sender: Option<mpsc::Sender<UnifiedSessionMessage>> = None;
-        let mut current_cancel: Option<CancellationToken> = None;
 
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
@@ -149,43 +196,16 @@ impl SessionWorker {
                         }
                     }
 
-                    // 🚀 使用非阻塞发送，避免阻塞其他命令
-                    if let Some(sender) = current_sender.as_mut() {
-                        if sender.try_send(message.clone()).is_err() {
-                            // 如果发送失败，可能是缓冲区满了或连接已关闭
-                            warn!("⚠️ SSE sender 发送失败，关闭实时推送");
-                            current_sender = None;
+                    // 🚀 极简优化：直接从共享状态获取当前连接
+                    if let Ok(mut current_sender_guard) = self.current_sender.try_lock() {
+                        if let Some(sender) = current_sender_guard.as_mut() {
+                            if sender.try_send(message.clone()).is_err() {
+                                // 如果发送失败，可能是缓冲区满了或连接已关闭
+                                warn!("⚠️ SSE sender 发送失败，关闭实时推送");
+                                *current_sender_guard = None;
+                            }
                         }
                     }
-                }
-                SessionCommand::Register {
-                    sender,
-                    cancel_token,
-                } => {
-                    let register_start = std::time::Instant::now();
-                    debug!("⏱️ [SessionWorker::Register] 开始处理注册命令");
-
-                    if let Some(token) = current_cancel.take() {
-                        token.cancel();
-                    }
-
-                    current_sender = Some(sender.clone());
-                    current_cancel = Some(cancel_token);
-
-                    // 🎯 简化的历史消息处理：清空所有历史消息，确保全新开始
-                    let clear_start = std::time::Instant::now();
-                    let mut cleared_count = 0;
-                    while consumer.try_pop().is_some() {
-                        cleared_count += 1;
-                    }
-                    buffered_len = 0;
-                    debug!("⏱️ [SessionWorker::Register] 清空历史消息耗时: {:?}，清理了{}条", clear_start.elapsed(), cleared_count);
-
-                    if cleared_count > 0 {
-                        debug!("🧹 新SSE连接，清空 {} 条历史消息", cleared_count);
-                    }
-
-                    debug!("⏱️ [SessionWorker::Register] 总注册处理耗时: {:?}", register_start.elapsed());
                 }
                 SessionCommand::Clear { ack } => {
                     let mut cleared = 0usize;
@@ -208,10 +228,6 @@ impl SessionWorker {
 #[derive(Debug)]
 enum SessionCommand {
     Push { message: UnifiedSessionMessage },
-    Register {
-        sender: mpsc::Sender<UnifiedSessionMessage>,
-        cancel_token: CancellationToken,
-    },
     Clear { ack: oneshot::Sender<usize> },
     MessageCount { ack: oneshot::Sender<usize> },
 }
@@ -266,106 +282,6 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
 }
 
 
-/// 便捷函数：清空指定 project_id 的所有 session 消息
-///
-/// 这个函数会遍历所有 session，找到属于指定 project_id 的 session 并彻底清空其消息
-/// 主要用于：
-/// 1. 发起新对话时清空历史消息（/chat 接口）
-/// 2. 取消任务时清空历史消息（/agent/session/cancel 接口）
-/// 3. 停止服务时清空历史消息（/agent/stop 接口）
-///
-/// 🎯 彻底清空机制：
-/// - 调用 clear_all() 清空 session 内部所有缓存消息
-/// - 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
-/// - 防止任何历史消息残留到新的 SSE 连接中
-///
-/// 确保前端SSE连接获取的都是当前对话触发的最新消息，避免历史消息干扰
-pub async fn clear_project_messages(
-    project_id: &str,
-    sessions_map: &dashmap::DashMap<String, crate::router::SessionInfo>,
-    specific_session: Option<&str>,
-) -> usize {
-    let mut total_cleared = 0;
-    let mut specific_session_handled = false;
-
-    // 遍历所有活跃的 session，找到属于指定 project_id 的 session
-    for session_entry in sessions_map.iter() {
-        let session_id = session_entry.key();
-        let session_info = session_entry.value();
-
-        // 检查这个 session 是否属于指定的 project_id
-        if let Some(session_project_id) = &session_info.project_id {
-            if session_project_id == project_id {
-                if let Some(target_session) = specific_session {
-                    if target_session == session_id {
-                        specific_session_handled = true;
-                    }
-                }
-
-                // 🎯 彻底清空机制：确保完全清除历史消息
-                let cleared_count = clear_session_completely(session_id).await;
-                total_cleared += cleared_count;
-
-                if cleared_count > 0 {
-                    info!(
-                        "🧹 彻底清空项目消息: project_id={}, session_id={}, cleared_count={}",
-                        project_id, session_id, cleared_count
-                    );
-                }
-            }
-        }
-    }
-
-    if let Some(target_session) = specific_session {
-        if !specific_session_handled {
-            // 🎯 对指定 session 进行彻底清空
-            let cleared_count = clear_session_completely(target_session).await;
-            if cleared_count > 0 {
-                info!(
-                    "🧹 彻底清空指定 session: project_id={}, session_id={}, cleared_count={}",
-                    project_id,
-                    target_session,
-                    cleared_count
-                );
-                total_cleared += cleared_count;
-            }
-        }
-    }
-
-    if total_cleared > 0 {
-        info!(
-            "📝 项目消息彻底清空完成: project_id={}, total_cleared={}, sessions_found={}",
-            project_id, total_cleared, sessions_map.len()
-        );
-    } else {
-        debug!(
-            "📭 项目无历史消息需要清空: project_id={}",
-            project_id
-        );
-    }
-
-    total_cleared
-}
-
-/// 彻底清空指定 session_id 的所有消息和缓存
-///
-/// 这个函数执行彻底的清空操作：
-/// 1. 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
-/// 2. 防止任何历史消息残留到新的 SSE 连接中
-///
-/// 返回总共清理的消息数量（这里简化为固定返回1，表示移除了1个session）
-async fn clear_session_completely(session_id: &str) -> usize {
-    // 移除整个 SESSION_CACHE 条目，确保下次连接时创建全新的实例
-    if SESSION_CACHE.remove(session_id).is_some() {
-        info!(
-            "🗑️ 移除 SESSION_CACHE 条目，防止任何残留消息: session_id={}",
-            session_id
-        );
-        return 1;
-    }
-
-    0
-}
 
 /// 确保project_id对应正确的session_id
 ///
@@ -438,31 +354,5 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
         );
         PROJECT_SESSION_MAP.insert(project_id.to_string(), session_id.to_string());
         0
-    }
-}
-
-/// 获取project_id当前对应的session_id
-///
-/// 如果映射不存在则返回None
-pub fn get_project_session(project_id: &str) -> Option<String> {
-    PROJECT_SESSION_MAP.get(project_id).map(|session_id| session_id.clone())
-}
-
-/// 移除project_id的session映射（用于项目清理）
-///
-/// 返回被移除的session_id，如果映射不存在则返回None
-pub fn remove_project_session(project_id: &str) -> Option<String> {
-    if let Some((_, session_id)) = PROJECT_SESSION_MAP.remove(project_id) {
-        info!(
-            "🗑️ 移除Project session映射: project_id={}, session_id={}",
-            project_id, session_id
-        );
-        Some(session_id)
-    } else {
-        debug!(
-            "⚠️ 试图移除不存在的Project session映射: project_id={}",
-            project_id
-        );
-        None
     }
 }

@@ -400,57 +400,68 @@ pub async fn agent_session_notification(
         loop {
             tokio::select! {
                 biased;
-                
+
                 // 优先监听取消令牌（旧连接会在这里立即退出）
                 _ = cancel_token.cancelled() => {
                     info!(
-                        "🔌 检测到连接被取消（新连接建立），断开旧连接: session_id={}",
+                        "🔌 检测到连接被取消（新连接建立或用户主动取消），断开旧连接: session_id={}",
                         session_id
                     );
                     break;
                 }
-                
-                // 接收实时消息
-                Some(msg) = rx.recv() => {
-                    // 🎯 极简设计：不需要版本检查，每次都是全新的 SessionData
-                    // 旧 SessionData 会自然失效，无需手动管理版本
 
-                    debug!(
-                        "📤 发送消息到 session: {}, type: {:?}",
-                        session_id_for_stream, msg.message_type
-                    );
+                // 接收实时消息 - 当 channel 发送端被关闭时，recv() 会返回 None
+                msg = rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            // 🎯 极简设计：不需要版本检查，每次都是全新的 SessionData
+                            // 旧 SessionData 会自然失效，无需手动管理版本
 
-                    // 根据消息类型动态设置事件名称
-                    let event_name = match msg.message_type {
-                        crate::model::SessionMessageType::SessionPromptStart => {
-                            info!("📝 发送 prompt_start 消息到 session: {}", session_id_for_stream);
-                            "prompt_start"
-                        }
-                        crate::model::SessionMessageType::SessionPromptEnd => {
-                            info!(
-                                "🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}",
-                                session_id_for_stream,
-                                msg.data.get("reason")
-                            );
-                            "prompt_end"
-                        }
-                        crate::model::SessionMessageType::AgentSessionUpdate => {
                             debug!(
-                                "🔄 发送 {} 消息到 session: {}",
-                                msg.sub_type, session_id_for_stream
+                                "📤 发送消息到 session: {}, type: {:?}",
+                                session_id_for_stream, msg.message_type
                             );
-                            &msg.sub_type
+
+                            // 根据消息类型动态设置事件名称
+                            let event_name = match msg.message_type {
+                                crate::model::SessionMessageType::SessionPromptStart => {
+                                    info!("📝 发送 prompt_start 消息到 session: {}", session_id_for_stream);
+                                    "prompt_start"
+                                }
+                                crate::model::SessionMessageType::SessionPromptEnd => {
+                                    info!(
+                                        "🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}",
+                                        session_id_for_stream,
+                                        msg.data.get("reason")
+                                    );
+                                    "prompt_end"
+                                }
+                                crate::model::SessionMessageType::AgentSessionUpdate => {
+                                    debug!(
+                                        "🔄 发送 {} 消息到 session: {}",
+                                        msg.sub_type, session_id_for_stream
+                                    );
+                                    &msg.sub_type
+                                }
+                                crate::model::SessionMessageType::Heartbeat => "heartbeat",
+                            };
+
+                            let event: Event = Event::default()
+                                .event(event_name)
+                                .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
+
+                            yield Ok(event);
                         }
-                        crate::model::SessionMessageType::Heartbeat => "heartbeat",
-                    };
-
-                    let event: Event = Event::default()
-                        .event(event_name)
-                        .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
-
-                    yield Ok(event);
+                        None => {
+                            info!(
+                                "🔌 检测到channel发送端已关闭，SSE连接自然断开: session_id={}",
+                                session_id_for_stream
+                            );
+                            break;
+                        }
+                    }
                 }
-                
+
                 // 心跳定时器 - 直接发送心跳事件到客户端
                 _ = heartbeat_interval.tick() => {
                     // 🎯 极简设计：不需要版本检查，依赖 CancellationToken 自动断开旧连接
