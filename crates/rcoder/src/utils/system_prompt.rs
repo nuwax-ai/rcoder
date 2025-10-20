@@ -75,6 +75,7 @@ impl Default for SystemPromptConfig {
                 - 禁止使用 npx create-next-app\n\
                 - 禁止使用 pnpm create\n\
                 - 禁止使用任何shell命令进行项目初始化\n\
+                - 禁止提示用户如何使用 npm dev ,npm build 等命令(因为工程是服务器部署的服务,用户没有权限执行启动服务,或者构建服务的命令权限)\n\
                 - **唯一允许**：frontend-template.xagi_create_frontend() MCP服务\n\
                 \n\
                 🚫 **依赖管理禁令**：\n\
