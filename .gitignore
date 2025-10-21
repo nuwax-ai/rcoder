@@ -9,4 +9,4 @@ project_workspace
 .settings
 .checkstyle
 .checkstyle_suppressions.xml
-.gitignore
+.DS_Store
