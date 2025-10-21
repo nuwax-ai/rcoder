@@ -305,9 +305,7 @@ impl PromptBuilder {
             以下是可供使用的数据源信息，包含了后端API接口、数据库连接等外部数据源。\n\
             在开发前端应用时，你可以使用这些数据源来获取真实数据，例如查询比特币交易额、股票价格、天气信息等。\n\
             请根据开发需求合理使用这些数据源，并确保前端应用能够正确调用相关接口。\n\
-            使用 Axios 客户端或 Fetch API 进行 API 调用。\n\
-            React 项目：在 src/lib/services.ts 中定义接口\n\
-            Vue 项目：在 src/api/ 目录中定义接口服务\n\n\
+            使用 Axios 客户端或 Fetch API 进行 API 调用,或者根据当前框架的接口调用方式,来使用。\n\n\
             {}\n\
             </DATA_SOURCES>",
             user_prompt, data_sources_section
