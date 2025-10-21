@@ -28,6 +28,21 @@ pub struct DockerContainerConfig {
     pub auto_remove: bool,
     /// 资源限制
     pub resource_limits: Option<ResourceLimits>,
+    /// 额外的挂载点
+    pub extra_mounts: Vec<MountPoint>,
+    /// 启动命令
+    pub command: Option<Vec<String>>,
+}
+
+/// 挂载点配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountPoint {
+    /// 主机路径
+    pub host_path: String,
+    /// 容器内路径
+    pub container_path: String,
+    /// 是否只读
+    pub read_only: bool,
 }
 
 /// 资源限制配置
@@ -55,6 +70,8 @@ impl Default for DockerContainerConfig {
             network_mode: crate::DEFAULT_NETWORK_MODE.to_string(),
             auto_remove: false,
             resource_limits: None,
+            extra_mounts: Vec::new(),
+            command: None,
         }
     }
 }

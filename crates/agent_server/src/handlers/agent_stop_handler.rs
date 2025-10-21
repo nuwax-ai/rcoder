@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
 /// 停止 Agent 处理器
@@ -18,15 +18,17 @@ pub async fn stop_agent(
     State(state): State<ApiState>,
     Json(request): Json<StopAgentRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
-    info!("收到停止 Agent 请求，项目ID: {}, 强制: {}",
-          request.project_id,
-          request.force);
+    info!(
+        "收到停止 Agent 请求，项目ID: {}, 强制: {}",
+        request.project_id, request.force
+    );
 
     // 验证项目ID
     if state.config.project_id != request.project_id {
-        warn!("项目ID不匹配，期望: {}, 实际: {}",
-              state.config.project_id,
-              request.project_id);
+        warn!(
+            "项目ID不匹配，期望: {}, 实际: {}",
+            state.config.project_id, request.project_id
+        );
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -41,9 +43,10 @@ pub async fn stop_agent(
 
     // 检查是否有活跃的会话
     let active_sessions = state.agent_manager.list_sessions().await;
-    let processing_sessions = active_sessions.iter().filter(|session| {
-        session.status == crate::agent::SessionStatus::Processing
-    }).count();
+    let processing_sessions = active_sessions
+        .iter()
+        .filter(|session| session.status == crate::agent::SessionStatus::Processing)
+        .count();
 
     if processing_sessions > 0 && !request.force {
         warn!("有 {} 个会话正在处理中，需要强制停止", processing_sessions);
@@ -192,7 +195,7 @@ pub async fn wait_for_agent_stop(
                 Json(json!({
                     "error": "获取状态失败",
                     "message": e.to_string()
-                }))
+                })),
             ));
         }
     };

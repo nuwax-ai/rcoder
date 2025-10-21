@@ -290,6 +290,8 @@ impl ContainerService {
                 cpu_limit: Some(2.0), // 2 核 CPU
                 swap_limit: Some(4 * 1024 * 1024 * 1024), // 4GB 交换空间
             }),
+            extra_mounts: Vec::new(),
+            command: None,
         })
     }
 }

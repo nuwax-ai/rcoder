@@ -1,4 +1,4 @@
-use super::{DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult, ContainerStatus};
+use super::{DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult, ContainerStatus, MountPoint};
 use bollard::{
     models::{ContainerCreateBody, HostConfig, Mount, PortBinding},
     Docker, API_DEFAULT_VERSION,
@@ -76,13 +76,24 @@ impl DockerManager {
         self.ensure_image_exists(&config.image).await?;
 
         // 创建挂载点
-        let mounts = vec![Mount {
+        let mut mounts = vec![Mount {
             target: Some(config.container_path.clone()),
             source: Some(config.host_path.clone()),
             typ: Some(bollard::models::MountTypeEnum::BIND),
             read_only: Some(false),
             ..Default::default()
         }];
+
+        // 添加额外的挂载点
+        for extra_mount in &config.extra_mounts {
+            mounts.push(Mount {
+                target: Some(extra_mount.container_path.clone()),
+                source: Some(extra_mount.host_path.clone()),
+                typ: Some(bollard::models::MountTypeEnum::BIND),
+                read_only: Some(extra_mount.read_only),
+                ..Default::default()
+            });
+        }
 
         // 构建环境变量
         let env_vars: Vec<String> = config
@@ -123,7 +134,7 @@ impl DockerManager {
         }
 
         // 创建容器配置
-        let container_config = ContainerCreateBody {
+        let mut container_config = ContainerCreateBody {
             image: Some(config.image.clone()),
             working_dir: Some(config.work_dir.clone()),
             env: Some(env_vars),
@@ -132,6 +143,11 @@ impl DockerManager {
             open_stdin: Some(true),
             ..Default::default()
         };
+
+        // 设置启动命令
+        if let Some(command) = config.command {
+            container_config.cmd = Some(command);
+        }
 
         // 创建容器选项
         let create_options = CreateContainerOptions {

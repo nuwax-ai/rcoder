@@ -225,6 +225,8 @@ impl DockerAgentManager {
             network_mode: "host".to_string(),
             auto_remove: false,
             resource_limits: None,
+            extra_mounts: Vec::new(),
+            command: None,
         };
 
         Ok(config)

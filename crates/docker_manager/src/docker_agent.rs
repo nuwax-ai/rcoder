@@ -2,7 +2,7 @@
 //!
 //! 这个模块提供了与 Docker 容器内 Agent Server 通信的功能
 
-use super::{DockerContainerConfig, DockerContainerInfo, DockerManager, DockerManagerConfig, DockerResult};
+use super::{DockerContainerConfig, DockerContainerInfo, DockerManager, DockerManagerConfig, DockerResult, MountPoint};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -289,6 +289,8 @@ impl DockerAgentManager {
             network_mode: "host".to_string(),
             auto_remove: false,
             resource_limits: None,
+            extra_mounts: Vec::new(),
+            command: None,
         };
 
         Ok(config)

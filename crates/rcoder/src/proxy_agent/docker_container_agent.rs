@@ -180,6 +180,20 @@ fn create_docker_container_config(
     let mut port_bindings = HashMap::new();
     port_bindings.insert("8086/tcp".to_string(), port.to_string());
 
+    // Docker 镜像内置 agent_server 二进制文件，无需额外挂载
+    let extra_mounts = Vec::new(); // 不需要额外挂载 agent_server
+
+    // 创建启动命令，直接使用镜像内置的 agent_server
+    let command = vec![
+        "/app/agent_server".to_string(),
+        "--port".to_string(),
+        "8086".to_string(),
+        "--project-id".to_string(),
+        project_id.to_string(),
+        "--agent-type".to_string(),
+        "claude".to_string(),
+    ];
+
     Ok(DockerContainerConfig {
         project_id: project_id.to_string(),
         image: "registry.yichamao.com/rcoder:latest".to_string(),
@@ -196,6 +210,8 @@ fn create_docker_container_config(
             cpu_limit: Some(2.0), // 2 核 CPU
             swap_limit: Some(4 * 1024 * 1024 * 1024), // 4GB 交换空间
         }),
+        extra_mounts,
+        command: Some(command),
     })
 }
 
