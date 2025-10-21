@@ -43,6 +43,39 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.projects_dir).await?;
     info!("Projects directory: {:?}", config.projects_dir);
 
+    // 🔄 初始化宿主机路径解析器（自动检测模式）
+    info!("🔍 开始自动检测宿主机挂载路径...");
+    let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH")
+        .unwrap_or_else(|_| {
+            info!("环境变量 DOCKER_SOCKET_PATH 未设置，使用默认值: /var/run/docker.sock");
+            "/var/run/docker.sock".to_string()
+        });
+
+    info!("使用 Docker socket: {}", docker_socket_path);
+
+    let path_resolver = match utils::HostPathResolver::new_with_docker_socket(&docker_socket_path).await {
+        Ok(resolver) => {
+            info!("✅ 宿主机路径解析器初始化成功");
+            info!("  容器内工作目录: {:?}", resolver.container_workspace_base());
+            info!("  宿主机工作目录: {:?}", resolver.host_workspace_base());
+            Some(resolver)
+        }
+        Err(e) => {
+            error!("❌ 宿主机路径解析器初始化失败: {}", e);
+            error!("请检查以下配置:");
+            error!("  1. Docker socket 路径是否正确: {}", docker_socket_path);
+            error!("  2. Docker socket 是否已挂载到容器");
+            error!("  3. 容器是否有权限访问 Docker API");
+            error!("  4. 项目工作目录是否正确挂载");
+
+            // 显示详细的错误信息和解决建议
+            show_docker_configuration_help(&docker_socket_path);
+
+            // 返回错误，停止启动
+            return Err(anyhow::anyhow!("容器自检测失败，无法初始化路径解析器"));
+        }
+    };
+
     // 创建本地任务通道
     let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
 
@@ -218,4 +251,32 @@ fn init_telemetry() -> anyhow::Result<()> {
     info!("✓ 日志文件将按天滚动保存在 {:?} 目录", logs_dir);
 
     Ok(())
+}
+
+/// 显示 Docker 配置帮助信息
+fn show_docker_configuration_help(socket_path: &str) {
+    error!("📋 Docker 配置帮助:");
+    error!("");
+    error!("请确保您的 docker-compose.yml 包含以下配置:");
+    error!("");
+    error!("services:");
+    error!("  rcoder:");
+    error!("    environment:");
+    error!("      - DOCKER_SOCKET_PATH={}", socket_path);
+    error!("    volumes:");
+    error!("      - {}:/var/run/docker.sock:ro", socket_path);
+    error!("      - ./data/rcoder/project_workspace:/app/project_workspace");
+    error!("");
+    error!("🔧 常见 Docker socket 路径:");
+    error!("  Linux 系统: /var/run/docker.sock");
+    error!("  macOS + Docker Desktop: /var/run/docker.sock");
+    error!("  Rootless Docker: /run/user/$UID/docker.sock");
+    error!("");
+    error!("🛠️ 故障排除步骤:");
+    error!("  1. 检查 Docker 是否正在运行: docker ps");
+    error!("  2. 验证 socket 文件存在: ls -l {}", socket_path);
+    error!("  3. 检查权限: groups $USER | grep docker");
+    error!("  4. 测试 Docker API: curl --unix-socket {} http://localhost/info", socket_path);
+    error!("");
+    error!("如果问题持续存在，请查看 rcoder 容器日志获取更多详细信息。");
 }

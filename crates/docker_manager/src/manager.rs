@@ -1,6 +1,6 @@
-use super::{DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult, ContainerStatus, MountPoint};
+use super::{DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult, ContainerStatus, MountPoint, RCODER_NETWORK_NAME};
 use bollard::{
-    models::{ContainerCreateBody, HostConfig, Mount, PortBinding},
+    models::{ContainerCreateBody, HostConfig, Mount, PortBinding, Network, NetworkingConfig},
     Docker, API_DEFAULT_VERSION,
 };
 use bollard::query_parameters::{
@@ -41,11 +41,16 @@ impl DockerManager {
 
         info!("Docker 管理器初始化成功");
 
-        Ok(Self {
+        let manager = Self {
             docker,
             config,
             containers: DashMap::new(),
-        })
+        };
+
+        // 确保 RCoder 网络存在
+        manager.ensure_rcoder_network().await?;
+
+        Ok(manager)
     }
 
     /// 使用默认配置创建 Docker 管理器
@@ -114,11 +119,10 @@ impl DockerManager {
             );
         }
 
-        // 创建主机配置
+        // 创建主机配置 - 不再使用 network_mode，而是通过 NetworkingConfig 连接到网络
         let mut host_config = HostConfig {
             mounts: Some(mounts),
             port_bindings: Some(port_bindings_map),
-            network_mode: Some(config.network_mode.clone()),
             auto_remove: Some(config.auto_remove),
             ..Default::default()
         };
@@ -169,6 +173,11 @@ impl DockerManager {
         self.docker.start_container(&container_id, None::<StartContainerOptions>).await.map_err(|e| {
             DockerError::ContainerStartError(format!("启动容器失败: {}", e))
         })?;
+
+        // 连接到 RCoder 网络（如果不是 host 网络模式）
+        if config.network_mode != "host" {
+            self.connect_container_to_network(&container_id, RCODER_NETWORK_NAME).await?;
+        }
 
         // 等待容器启动完成
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -405,6 +414,133 @@ impl DockerManager {
 
         info!("容器重启成功: {}", container_info.container_name);
         Ok(())
+    }
+
+    /// 确保 RCoder 网络存在
+    async fn ensure_rcoder_network(&self) -> DockerResult<()> {
+        info!("检查 RCoder 网络状态...");
+
+        // 检查网络是否已存在
+        match self.inspect_network(RCODER_NETWORK_NAME).await {
+            Ok(_) => {
+                info!("RCoder 网络已存在: {}", RCODER_NETWORK_NAME);
+                Ok(())
+            }
+            Err(_) => {
+                info!("RCoder 网络不存在，正在创建...");
+                self.create_rcoder_network().await
+            }
+        }
+    }
+
+    /// 创建 RCoder 网络
+    async fn create_rcoder_network(&self) -> DockerResult<()> {
+        use bollard::network::{CreateNetworkOptions, PruneNetworksOptions};
+
+        let created_time = Utc::now().to_rfc3339();
+        let network_config = CreateNetworkOptions {
+            name: RCODER_NETWORK_NAME,
+            driver: "bridge",
+            check_duplicate: true,
+            internal: false,
+            attachable: true,
+            ingress: false,
+            ipam: Default::default(),
+            enable_ipv6: false,
+            options: HashMap::from([
+                ("com.docker.network.bridge.name", "rcoder-br0"),
+                ("com.docker.network.bridge.enable_icc", "true"),
+                ("com.docker.network.bridge.enable_ip_masquerade", "true"),
+            ]),
+            labels: HashMap::from([
+                ("com.rcoder.network", "true"),
+                ("com.rcoder.network.created", &created_time),
+            ]),
+        };
+
+        match self.docker.create_network(network_config).await {
+            Ok(_) => {
+                info!("✅ RCoder 网络创建成功: {}", RCODER_NETWORK_NAME);
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ RCoder 网络创建失败: {}", e);
+                Err(DockerError::ContainerCreationError(format!("创建网络失败: {}", e)))
+            }
+        }
+    }
+
+    /// 检查网络是否存在
+    async fn inspect_network(&self, network_name: &str) -> DockerResult<()> {
+        use bollard::network::ListNetworksOptions;
+
+        let options = ListNetworksOptions {
+            filters: HashMap::from([("name", vec![network_name])]),
+        };
+
+        let networks = self.docker.list_networks(Some(options)).await
+            .map_err(|e| DockerError::ConnectionError(format!("列出网络失败: {}", e)))?;
+
+        if networks.iter().any(|n| n.name.as_ref() == Some(&network_name.to_string())) {
+            Ok(())
+        } else {
+            Err(DockerError::ConnectionError("网络不存在".to_string()))
+        }
+    }
+
+    /// 连接容器到指定网络
+    async fn connect_container_to_network(&self, container_id: &str, network_name: &str) -> DockerResult<()> {
+        use bollard::network::ConnectNetworkOptions;
+
+        let connect_config = ConnectNetworkOptions {
+            container: container_id.to_string(),
+            endpoint_config: Default::default(),
+        };
+
+        match self.docker.connect_network(network_name, connect_config).await {
+            Ok(_) => {
+                info!("✅ 容器 {} 已连接到网络: {}", container_id, network_name);
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ 容器连接网络失败: {}", e);
+                Err(DockerError::ContainerCreationError(format!("容器连接网络失败: {}", e)))
+            }
+        }
+    }
+
+    /// 获取 Docker 客户端实例
+    pub fn get_docker_client(&self) -> &Docker {
+        &self.docker
+    }
+
+    /// 获取容器网络信息
+    pub async fn get_container_network_info(&self, container_id: &str) -> DockerResult<HashMap<String, String>> {
+        use bollard::query_parameters::InspectContainerOptions;
+
+        let inspect = self.docker.inspect_container(container_id, None::<InspectContainerOptions>).await
+            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))?;
+
+        let mut network_ips = HashMap::new();
+
+        if let Some(network_settings) = inspect.network_settings {
+            if let Some(networks) = network_settings.networks {
+                for (network_name, network_info) in networks {
+                    if let Some(ip_address) = network_info.ip_address {
+                        if !ip_address.is_empty() {
+                            network_ips.insert(network_name, ip_address);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(network_ips)
+    }
+
+    /// 获取 RCoder 网络名称
+    pub fn get_rcoder_network_name(&self) -> &'static str {
+        RCODER_NETWORK_NAME
     }
 }
 

@@ -73,7 +73,7 @@ pub async fn start_docker_container_agent_service(
         &project_path,
         assigned_port,
         model_provider.as_ref(),
-    )?;
+    ).await?;
 
     // 创建并启动容器
     let container_info = match docker_manager.create_container(container_config).await {
@@ -88,7 +88,9 @@ pub async fn start_docker_container_agent_service(
     info!("容器已创建: {} (ID: {})", container_info.container_name, container_info.container_id);
 
     // 等待容器内 agent_runer 启动
-    let server_url = format!("http://localhost:{}", assigned_port);
+    // 在 bridge 网络模式下，需要获取容器的 IP 地址
+    let server_url = get_container_ip(&docker_manager, &container_info.container_id, assigned_port).await?;
+
     if let Err(e) = wait_for_agent_server_ready(&server_url).await {
         // 启动失败，清理容器和端口
         error!("容器内 agent_runer 启动失败: {}", e);
@@ -151,7 +153,7 @@ pub async fn start_docker_container_agent_service(
 }
 
 /// 创建 Docker 容器配置
-fn create_docker_container_config(
+async fn create_docker_container_config(
     project_id: &str,
     project_path: &std::path::Path,
     port: u16,
@@ -176,6 +178,11 @@ fn create_docker_container_config(
         }
     }
 
+    // 🔄 关键：将容器内路径转换为宿主机路径（自动检测模式）
+    let host_project_path = crate::utils::resolve_container_path_to_host(project_path).await
+        .context("自动检测宿主机路径失败，请检查 Docker socket 挂载和权限")?;
+    info!("✅ 路径自动检测成功: 容器内 {:?} -> 宿主机 {:?}", project_path, host_project_path);
+
     // 创建端口映射
     let mut port_bindings = HashMap::new();
     port_bindings.insert("8086/tcp".to_string(), port.to_string());
@@ -194,12 +201,12 @@ fn create_docker_container_config(
         project_id: project_id.to_string(),
         image: "registry.yichamao.com/rcoder:latest".to_string(),
         name_prefix: "rcoder-agent".to_string(),
-        host_path: project_path.to_string_lossy().to_string(),
+        host_path: host_project_path.to_string_lossy().to_string(), // 🎯 使用宿主机路径
         container_path: "/app/workspace".to_string(),
         work_dir: "/app/workspace".to_string(),
         env_vars,
         port_bindings,
-        network_mode: "host".to_string(), // 使用 host 网络模式便于通信
+        network_mode: "bridge".to_string(), // 使用 bridge 网络模式避免端口冲突
         auto_remove: true, // 容器停止后自动删除
         resource_limits: Some(ResourceLimits {
             memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB 内存
@@ -376,6 +383,30 @@ async fn handle_cancel_request(
     }
 
     Ok(())
+}
+
+/// 获取容器在 RCoder 网络中的 IP 地址
+async fn get_container_ip(
+    docker_manager: &DockerManager,
+    container_id: &str,
+    port: u16,
+) -> Result<String> {
+    // 等待容器网络配置完成
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // 通过 DockerManager 获取容器的网络信息
+    let network_ips = docker_manager.get_container_network_info(container_id).await
+        .map_err(|e| anyhow::anyhow!("获取容器网络信息失败: {}", e))?;
+
+    // 直接查找 RCoder 网络的 IP 地址
+    let network_name = docker_manager.get_rcoder_network_name();
+    if let Some(ip_address) = network_ips.get(network_name) {
+        let server_url = format!("http://{}:{}", ip_address, port);
+        info!("✅ 获取容器 IP 地址: {} -> {}", container_id, ip_address);
+        Ok(server_url)
+    } else {
+        Err(anyhow::anyhow!("容器 {} 未连接到 RCoder 网络: {}", container_id, network_name))
+    }
 }
 
 /// 从 ContentBlock 中提取文本

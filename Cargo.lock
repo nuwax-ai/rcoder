@@ -4461,6 +4461,7 @@ dependencies = [
  "axum",
  "axum-tracing-opentelemetry",
  "base64 0.21.7",
+ "bollard",
  "bytes 1.10.1",
  "chrono",
  "clap 4.5.49",

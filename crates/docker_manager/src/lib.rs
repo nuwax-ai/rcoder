@@ -14,10 +14,12 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+pub mod container_self_inspector;
 pub mod types;
 pub mod manager;
 pub mod utils;
 
+pub use container_self_inspector::*;
 pub use types::*;
 pub use manager::*;
 pub use utils::*;
@@ -63,4 +65,7 @@ pub const DEFAULT_DOCKER_IMAGE: &str = "registry.yichamao.com/rcoder:latest";
 pub const DEFAULT_WORK_DIR: &str = "/app/workspace";
 
 /// 默认的网络模式
-pub const DEFAULT_NETWORK_MODE: &str = "host";
+pub const DEFAULT_NETWORK_MODE: &str = "bridge";
+
+/// RCoder 专用网络名称
+pub const RCODER_NETWORK_NAME: &str = "rcoder-network";
