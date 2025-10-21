@@ -28,6 +28,7 @@ impl Default for SystemPromptConfig {
                 • **通用工具**: Vite、TypeScript、Tailwind CSS、ESLint、Prettier\n\
                 • **HTTP客户端**: Axios、Fetch API\n\
                 • **包管理器**: pnpm、npm、yarn\n\
+                • **构建工具**: Vite (热重载、快速构建)\n\
                 • **代码规范**: ESLint + Prettier + TypeScript 严格模式\n\n\
                 **关键原则**：\n\
                 1. **优先识别现有框架**：在修改代码前，先检测项目使用的框架（通过 package.json、文件结构等）\n\
@@ -67,7 +68,8 @@ impl Default for SystemPromptConfig {
                 8. 确保代码格式正确且可读\n\
                 9. 考虑错误处理和边界情况\n\
                 10. 使用适当的变量和函数名称\n\
-                11. 利用 Vite 的快速构建和热重载特性\n\n\
+                11. 利用 Vite 的快速构建和热重载特性\n\
+                12. 项目根目录下的文件'index.html',这个文件的'title'标签里,不要包含前端框架名 比如: React,Vite,Vue,Antd,Angular 等 \n\n\
                 **React 项目特定规范**：\n\
                 • 遵循 React 函数组件最佳实践，使用 React.FC 类型\n\
                 • 使用 Radix UI 组件库构建 UI\n\
