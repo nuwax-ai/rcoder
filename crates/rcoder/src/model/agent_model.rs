@@ -12,6 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
+use crate::{ChatPrompt, proxy_agent::AcpConnectionInfo};
+
 use crate::proxy_agent::agent_stop_handle::AgentLifecycleGuard;
 use codex_core::config::{find_codex_home, load_config_as_toml};
 
@@ -36,6 +38,7 @@ impl AgentType {
     /// 根据模型提供商配置自动选择 Agent 类型
     /// - Anthropic 协议使用 Claude Code agent
     /// - OpenAI 或未知协议使用 Codex agent
+    /// - 强制使用 Docker 容器模式运行
     pub fn from_model_provider(model_provider: Option<&ModelProviderConfig>) -> Self {
         match model_provider {
             Some(config) => match config.get_api_protocol() {
@@ -46,6 +49,15 @@ impl AgentType {
         }
     }
 
+    /// 获取 Agent 类型名称
+    pub fn agent_type_name(&self) -> &'static str {
+        match self {
+            AgentType::Codex => "codex",
+            AgentType::Claude => "claude",
+        }
+    }
+
+    
     /// 获取 codex 环境变量的模型提供商配置
     pub async fn codex_from_env() -> Result<ConfigToml> {
         // 加载配置
@@ -224,6 +236,39 @@ impl AgentType {
         };
 
         Ok(result)
+    }
+
+    
+    /// 启动 Agent 服务
+    /// 强制使用 Docker 容器模式：每个 project_id 对应一个独立的 agent 容器
+    pub async fn start_agent_service(
+        &self,
+        chat_prompt: ChatPrompt,
+        model_provider: Option<ModelProviderConfig>,
+    ) -> Result<AcpConnectionInfo> {
+        // 强制使用 Docker 容器模式：每个 project_id 创建一个独立的容器来运行 agent 服务
+        let docker_manager = std::sync::Arc::new(
+            docker_manager::DockerManager::with_default_config().await?
+        );
+
+        // 在容器中启动 agent_server 服务，挂载项目目录，让 agent 修改开发项目
+        crate::proxy_agent::docker_container_agent::start_docker_container_agent_service(
+            chat_prompt, model_provider, docker_manager
+        ).await
+    }
+
+    /// 停止 Agent 服务
+    pub async fn stop_agent_service(&self, agent_info: &ProjectAndAgentInfo) -> Result<()> {
+        match self {
+            AgentType::Codex => {
+                // Codex Agent 停止逻辑
+                agent_info.lifecycle_guard.stop_async().await
+            }
+            AgentType::Claude => {
+                // Claude Code Agent 停止逻辑
+                agent_info.lifecycle_guard.stop_async().await
+            }
+        }
     }
 }
 

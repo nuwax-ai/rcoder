@@ -49,6 +49,12 @@ enum AgentResources {
         io_tasks: Arc<Mutex<Vec<JoinHandle<Result<(), anyhow::Error>>>>>,
         channel_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     },
+    /// Docker 容器模式
+    DockerContainer {
+        docker_manager: Option<Arc<docker_manager::DockerManager>>,
+        container_id: String,
+        allocated_port: Option<u16>,
+    },
 }
 
 impl AgentLifecycleGuard {
@@ -120,6 +126,33 @@ impl AgentLifecycleGuard {
 
         let inner = Arc::new(AgentLifecycleInner {
             agent_type: AgentType::Codex,
+            project_id,
+            session_id,
+            cancel_token,
+            resources,
+            stopped: AtomicBool::new(false),
+        });
+
+        Self { inner }
+    }
+
+    /// 为Docker容器Agent创建生命周期守卫
+    pub fn new_docker_container(
+        project_id: String,
+        session_id: SessionId,
+        docker_manager: Option<Arc<docker_manager::DockerManager>>,
+        container_id: String,
+        allocated_port: Option<u16>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let resources = AgentResources::DockerContainer {
+            docker_manager,
+            container_id,
+            allocated_port,
+        };
+
+        let inner = Arc::new(AgentLifecycleInner {
+            agent_type: AgentType::Claude, // 默认使用 Claude 类型
             project_id,
             session_id,
             cancel_token,
@@ -206,6 +239,25 @@ impl AgentLifecycleGuard {
                 }
                 for task in channel_tasks.lock().await.drain(..) {
                     task.abort();
+                }
+            }
+            AgentResources::DockerContainer {
+                docker_manager,
+                container_id,
+                allocated_port,
+            } => {
+                // 停止Docker容器
+                if let Some(manager) = docker_manager {
+                    info!("停止Docker容器: {}", container_id);
+                    if let Err(e) = manager.stop_container_by_id(container_id).await {
+                        warn!("停止Docker容器失败: {}", e);
+                    }
+                }
+
+                // 释放分配的端口
+                if let Some(port) = allocated_port {
+                    info!("释放端口: {}", port);
+                    crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER.release_port(*port).await;
                 }
             }
         }
@@ -303,6 +355,16 @@ impl Drop for AgentLifecycleGuard {
                             task.abort();
                         }
                     }
+                }
+                AgentResources::DockerContainer {
+                    docker_manager: _,
+                    container_id,
+                    allocated_port,
+                } => {
+                    // 在 Drop 中无法进行异步操作，只能记录日志
+                    // 实际的容器清理应该在 graceful_stop 中完成
+                    warn!("Docker容器未在graceful_stop中清理: {} (端口: {:?})",
+                          container_id, allocated_port);
                 }
             }
 

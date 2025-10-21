@@ -23,6 +23,7 @@ codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp"
 codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 claude-code-agent = { path = "../claude-code-agent" }
 pingora-proxy = { path = "../pingora-proxy" }
+docker_manager = { path = "../docker_manager" }
 
 # codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
 

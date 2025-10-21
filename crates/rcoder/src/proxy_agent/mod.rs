@@ -2,9 +2,14 @@ mod acp_agent;
 pub mod agent_service;
 pub mod agent_stop_handle;
 mod channel_utils;
-mod claude_code_agent;
+pub mod claude_code_agent;
 pub mod cleanup_task;
-mod codex_agent;
+pub mod codex_agent;
+pub mod docker_agent;
+pub mod docker_container_agent;
+pub mod port_manager;
+pub mod container_monitor;
+pub mod container_service;
 
 use crate::CancelNotificationRequest;
 use crate::{
