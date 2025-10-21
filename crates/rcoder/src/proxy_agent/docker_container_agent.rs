@@ -1,6 +1,6 @@
 //! Docker 容器化 Agent 服务
 //!
-//! 通过 docker_manager 动态创建容器来运行 agent_server 服务，
+//! 通过 docker_manager 动态创建容器来运行 agent_runer 服务，
 //! 实现每个项目对应一个独立的 agent 容器
 
 use crate::{
@@ -29,7 +29,7 @@ pub struct DockerContainerAgentClient {
     container_info: DockerContainerInfo,
     /// HTTP 客户端
     http_client: Client,
-    /// 容器内 agent_server 地址
+    /// 容器内 agent_runer 地址
     server_url: String,
 }
 
@@ -44,7 +44,7 @@ pub async fn start_docker_container_agent_service(
     let project_id = chat_prompt.project_id.clone();
     let project_path = chat_prompt.project_path.clone();
 
-    info!("启动 Docker 容器 Agent 服务，项目ID: {}", project_id);
+    info!("启动 Docker 容器 Agent 服务（使用 agent_runer），项目ID: {}", project_id);
 
     // 检查是否已存在该项目的容器
     if let Some(existing_container) = docker_manager.get_container_info(&project_id) {
@@ -87,16 +87,16 @@ pub async fn start_docker_container_agent_service(
     };
     info!("容器已创建: {} (ID: {})", container_info.container_name, container_info.container_id);
 
-    // 等待容器内 agent_server 启动
+    // 等待容器内 agent_runer 启动
     let server_url = format!("http://localhost:{}", assigned_port);
     if let Err(e) = wait_for_agent_server_ready(&server_url).await {
         // 启动失败，清理容器和端口
-        error!("容器内 agent_server 启动失败: {}", e);
+        error!("容器内 agent_runer 启动失败: {}", e);
         if let Err(stop_err) = docker_manager.stop_container_by_id(&container_info.container_id).await {
             error!("清理失败容器失败: {}", stop_err);
         }
         crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER.release_port(assigned_port).await;
-        return Err(anyhow::anyhow!("容器内 agent_server 启动失败: {}", e));
+        return Err(anyhow::anyhow!("容器内 agent_runer 启动失败: {}", e));
     }
 
     // 创建聊天会话
@@ -180,18 +180,14 @@ fn create_docker_container_config(
     let mut port_bindings = HashMap::new();
     port_bindings.insert("8086/tcp".to_string(), port.to_string());
 
-    // Docker 镜像内置 agent_server 二进制文件，无需额外挂载
-    let extra_mounts = Vec::new(); // 不需要额外挂载 agent_server
+    // Docker 镜像内置 agent_runer 二进制文件，无需额外挂载
+    let extra_mounts = Vec::new(); // 不需要额外挂载 agent_runer
 
-    // 创建启动命令，直接使用镜像内置的 agent_server
+    // 创建启动命令，直接使用镜像内置的 agent_runer
     let command = vec![
-        "/app/agent_server".to_string(),
+        "/app/agent_runer".to_string(),
         "--port".to_string(),
         "8086".to_string(),
-        "--project-id".to_string(),
-        project_id.to_string(),
-        "--agent-type".to_string(),
-        "claude".to_string(),
     ];
 
     Ok(DockerContainerConfig {
@@ -216,22 +212,22 @@ fn create_docker_container_config(
 }
 
 
-/// 等待容器内 agent_server 启动就绪
+/// 等待容器内 agent_runer 启动就绪
 async fn wait_for_agent_server_ready(server_url: &str) -> Result<()> {
     let health_url = format!("{}/health", server_url);
     let client = Client::new();
 
-    info!("等待 agent_server 启动: {}", health_url);
+    info!("等待 agent_runer 启动: {}", health_url);
 
     // 最多等待 30 秒
     for attempt in 0..30 {
         match timeout(Duration::from_secs(1), client.get(&health_url).send()).await {
             Ok(Ok(response)) if response.status().is_success() => {
-                info!("agent_server 已就绪");
+                info!("agent_runer 已就绪");
                 return Ok(());
             }
             Ok(_) => {
-                debug!("agent_server 尚未就绪，等待中... ({}/30)", attempt + 1);
+                debug!("agent_runer 尚未就绪，等待中... ({}/30)", attempt + 1);
             }
             Err(_) => {
                 debug!("连接超时，继续等待... ({}/30)", attempt + 1);
@@ -241,7 +237,7 @@ async fn wait_for_agent_server_ready(server_url: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    Err(anyhow::anyhow!("等待 agent_server 启动超时"))
+    Err(anyhow::anyhow!("等待 agent_runer 启动超时"))
 }
 
 /// 创建聊天会话
@@ -326,7 +322,7 @@ async fn handle_prompt_request(
     server_url: &str,
     prompt_request: &PromptRequest,
 ) -> Result<()> {
-    // 将 ACP PromptRequest 转换为 agent_server 的聊天格式
+    // 将 ACP PromptRequest 转换为 agent_runer 的聊天格式
     let chat_url = format!("{}/chat", server_url);
 
     // 这里需要将 ACP 的 ContentBlock 转换为文本

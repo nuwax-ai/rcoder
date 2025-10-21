@@ -1,4 +1,4 @@
-//! Agent 类型定义 - rcoder 和 agent_server 共用
+//! Agent 类型定义 - rcoder 和 agent_runer 共用
 
 use serde::{Deserialize, Serialize};
 use super::model_provider::ModelProviderConfig;

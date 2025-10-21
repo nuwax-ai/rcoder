@@ -251,7 +251,7 @@ impl AgentType {
             docker_manager::DockerManager::with_default_config().await?
         );
 
-        // 在容器中启动 agent_server 服务，挂载项目目录，让 agent 修改开发项目
+        // 在容器中启动 agent_runer 服务，挂载项目目录，让 agent 修改开发项目
         crate::proxy_agent::docker_container_agent::start_docker_container_agent_service(
             chat_prompt, model_provider, docker_manager
         ).await
