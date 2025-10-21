@@ -244,6 +244,9 @@ impl ProxyHttp for PortProxy {
         upstream_request: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
+        // 重写 Host 头为 127.0.0.1
+        upstream_request.insert_header("Host", "127.0.0.1")?;
+
         // 添加自定义头
         upstream_request.insert_header("X-Forwarded-Proto", "http")?;
         upstream_request.insert_header("X-Port-Proxy", "pingora-proxy")?;
