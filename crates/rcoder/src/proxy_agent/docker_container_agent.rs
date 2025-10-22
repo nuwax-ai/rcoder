@@ -208,7 +208,7 @@ async fn create_docker_container_config(
         project_id: project_id.to_string(),
         image: "registry.yichamao.com/rcoder:latest".to_string(),
         name_prefix: "rcoder-agent".to_string(),
-        host_path: std::path::Path::new(&host_project_path).canonicalize().map_err(|e| anyhow::anyhow!("路径解析失败: {}", e))?.to_string_lossy().to_string(), // 🎯 使用绝对路径
+        host_path: host_project_path.to_string_lossy().to_string(), // 🎯 使用宿主机绝对路径
         container_path: "/app/workspace".to_string(),
         work_dir: "/app/workspace".to_string(),
         env_vars,
