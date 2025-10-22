@@ -21,7 +21,7 @@ services:
       - ./start-rcoder.sh:/app/start-rcoder.sh
       # 开发模式：挂载本地编译的 rcoder 可执行文件（仅在开发模式下生效）
       - ./rcoder:/app/rcoder:ro
-    command: ${RCODER_COMMAND:-["/bin/bash", "/app/start-rcoder.sh"]}
+    command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8087/health"]
       interval: 30s
