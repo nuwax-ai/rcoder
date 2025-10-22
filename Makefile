@@ -122,7 +122,7 @@ docker-test: docker-build docker-up
 	@echo "🧪 等待服务启动..."
 	@sleep 5
 	@echo "🔍 检查服务状态..."
-	@curl -f http://localhost:8086/health || (echo "❌ 服务健康检查失败" && docker-compose -f docker/docker-compose.yml logs && exit 1)
+	@curl -f http://localhost:8087/health || (echo "❌ 服务健康检查失败" && docker-compose -f docker/docker-compose.yml logs && exit 1)
 	@echo "✅ 服务启动成功并正常运行"
 	@echo "📋 管理命令:"
 	@echo " 查看日志: make docker-logs"

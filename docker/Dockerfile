@@ -27,7 +27,13 @@ RUN apt-get update && apt-get install -y \
     jq \
     libssl3 \
     ca-certificates \
-    bash
+    bash \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev
+
+
 
 # 创建应用用户和目录
 RUN useradd -m -u 1000 rcoder && \
