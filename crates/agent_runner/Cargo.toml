@@ -1,12 +1,12 @@
 [package]
-name = "agent_runer"
+name = "agent_runner"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "agent_runer"
+name = "agent_runner"
 path = "src/lib.rs"
 
 [dependencies]

@@ -83,7 +83,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent_runer"
+name = "agent_runner"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
