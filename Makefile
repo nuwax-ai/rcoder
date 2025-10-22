@@ -17,6 +17,7 @@ help:
 	@echo "🔧 开发模式命令："
 	@echo "  make dev-up         - 启动开发模式容器（挂载本地编译的可执行文件）"
 	@echo "  make dev-restart    - 重启开发模式容器（重新编译并启动）"
+	@echo "  make dev-restart-full - 完整重启（重新构建镜像+启动，确保代码更改生效）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
 	@echo ""
@@ -131,15 +132,18 @@ dev-logs:
 		exit 1; \
 	fi
 
+
+# 快速重启：依赖 dev-build 确保代码更改生效
 dev-restart: dev-build
-	@echo "🔄 [3/3] 重启容器服务..."
+	@echo "🔄 重启容器服务（使用最新构建的镜像）..."
 	@if [ -f "docker/docker-compose.yml" ]; then \
-		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml restart; \
+		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml down; \
+		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml up -d; \
 		echo "✅ 容器已重启！"; \
 	else \
-		echo "❌ 错误: 未找到 docker/docker-compose.yml"; \
+		echo "❌ 错误: 未找到 docker-compose.yml"; \
 		exit 1; \
 	fi
 	@echo ""
-	@echo "🎉 开发模式重启完成！"
-	@echo "💡 无需重新构建镜像，快速迭代！"
+	@echo "🎉 完整重启完成！"
+	@echo "💡 代码更改已生效，因为重新构建了镜像！"
