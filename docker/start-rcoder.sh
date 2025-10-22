@@ -18,4 +18,4 @@ echo "  RCODER_WORKSPACE: $RCODER_WORKSPACE"
 
 # 启动 rcoder 服务
 echo "📡 启动 rcoder 服务 (端口: $PORT)..."
-exec /usr/local/bin/rcoder -- -p "$PORT"
+exec /usr/local/bin/rcoder -p "$PORT"

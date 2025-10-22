@@ -2,24 +2,26 @@ name: rcoder
 services:
 
   rcoder:
-    image: ${DOCKER_REGISTRY}/rcoder:${RCODER_VERSION}
+    image: rcoder:latest
     ports:
-      - "${RCODER_PORT:-8086}:${RCODER_PORT:-8086}"
+      - "${RCODER_PORT:-8087}:${RCODER_PORT:-8087}"
     environment:
       - TZ=Asia/Shanghai
-      - RCODER_PORT=${RCODER_PORT:-8086}
+      - RCODER_PORT=${RCODER_PORT:-8087}
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
     volumes:
       # 挂载 Docker socket
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+      # 挂载项目工作目录 - 这是关键的挂载！
+      - ./project_workspace:/app/project_workspace
       # 挂载工作目录
       - ./logs/:/app/logs
       # 挂载启动脚本
       - ./start-rcoder.sh:/app/start-rcoder.sh
-    entrypoint: ["/bin/bash", "/app/start-rcoder.sh"]
+    command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${RCODER_PORT:-8086}/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8087/health"]
       interval: 30s
       timeout: 10s
       retries: 3
