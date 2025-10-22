@@ -104,16 +104,9 @@ dev-up:
 	@echo "  - 可执行文件: ./docker/rcoder (本地编译)"
 	@echo "  - 启动命令: 直接执行 /app/rcoder"
 	@RCODER_IMAGE=master-rcoder:latest \
-	RCODER_MODE=dev \
-	RCODER_DEV_VOLUME="" \
-	RCODER_COMMAND='["/app/rcoder"]' \
 	docker-compose -f docker/docker-compose.yml up -d
 	@echo "📋 开发模式服务状态:"
 	@RCODER_MODE=dev docker-compose -f docker/docker-compose.yml ps
-	@echo "📝 开发模式特点："
-	@echo "  - 挂载本地编译的 rcoder 可执行文件"
-	@echo "  - 代码修改后只需运行 'make dev-restart'"
-	@echo "  - dev-restart 只编译+重启，无需重新构建镜像（快速）"
 
 dev-down:
 	@echo "🛑 停止开发模式容器服务..."
