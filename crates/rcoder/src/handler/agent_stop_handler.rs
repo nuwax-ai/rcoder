@@ -37,64 +37,76 @@ pub struct StopAgentResponse {
     pub message: String,
 }
 
-/// 转发停止请求到容器内的 agent_runner 服务
-async fn forward_stop_request_to_container(
+/// 直接销毁指定项目对应的容器
+async fn destroy_container_for_project(
     project_id: &str,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
-    info!(
-        "🚀 [STOP_FORWARD] 开始转发停止请求: project_id={}",
-        project_id
+    info!("🔥 [STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
+
+    // 创建 DockerManager
+    let docker_manager = std::sync::Arc::new(
+        docker_manager::DockerManager::with_default_config()
+            .await
+            .map_err(|e| {
+                error!("❌ [STOP_DESTROY] 创建 DockerManager 失败: {}", e);
+                AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
+            })?,
     );
 
-    // 检查或创建容器
-    let (server_url, _project_id_final) = ensure_container_exists_for_stop(project_id).await?;
+    // 检查容器是否存在
+    let container_info = docker_manager.get_container_info(project_id);
 
-    // 构建容器内 agent_runner 的停止请求
-    let stop_request = serde_json::json!({
-        "project_id": project_id
-    });
+    if let Some(container_info) = container_info {
+        info!(
+            "🎯 [STOP_DESTROY] 找到容器，开始销毁: project_id={}, container_id={}",
+            project_id, container_info.container_id
+        );
 
-    // 转发到容器内的 agent/agent/stop 接口
-    let client = Client::new();
-    let stop_url = format!("{}/agent/agent/stop", server_url);
+        // 停止容器（DockerManager 的 stop_container 方法会自动从映射中移除）
+        let stop_result = docker_manager.stop_container(project_id).await;
 
-    info!("📤 [STOP_FORWARD] 转发停止请求到容器: {}", stop_url);
+        if let Err(e) = stop_result {
+            error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
+            return Ok(HttpResult::error(
+                "STOP001",
+                &format!("停止容器失败: {}", e),
+            ));
+        }
 
-    let response = client
-        .post(&stop_url)
-        .json(&stop_request)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("❌ [STOP_FORWARD] 转发停止请求失败: {}", e);
-            AppError::internal_server_error(&format!("转发停止请求到容器失败: {}", e))
-        })?;
+        // 注意：DockerManager 的 stop_container 方法应该已经处理了容器清理
+        // 我们不需要手动访问 Docker 字段，因为它是私有的
 
-    if response.status().is_success() {
-        // 直接返回容器内的响应
-        let container_response: StopAgentResponse = response.json().await.map_err(|e| {
-            error!("❌ [STOP_FORWARD] 解析容器响应失败: {}", e);
-            AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
-        })?;
+        // 从全局 Agent 映射中移除
+        PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
 
         info!(
-            "✅ [STOP_FORWARD] 容器停止响应成功: project_id={}, success={}",
-            container_response.project_id, container_response.success
+            "✅ [STOP_DESTROY] 容器销毁成功: project_id={}, container_id={}",
+            project_id, container_info.container_id
         );
 
-        Ok(HttpResult::success(container_response))
+        let response = StopAgentResponse {
+            success: true,
+            project_id: project_id.to_string(),
+            session_id: Some(container_info.session_id.clone()),
+            message: "容器已成功销毁".to_string(),
+        };
+
+        Ok(HttpResult::success(response))
     } else {
-        let status = response.status();
-        let body = response.text().await;
-        error!(
-            "❌ [STOP_FORWARD] 容器停止请求失败: status={}, body={:?}",
-            status, body
+        // 容器不存在，但返回成功
+        info!(
+            "📭 [STOP_DESTROY] 容器不存在，无需销毁: project_id={}",
+            project_id
         );
 
-        Ok(HttpResult::error(
-            "STOP001",
-            &format!("容器停止请求失败: {}", status),
-        ))
+        let response = StopAgentResponse {
+            success: true,
+            project_id: project_id.to_string(),
+            session_id: None,
+            message: "容器不存在，无需销毁".to_string(),
+        };
+
+        Ok(HttpResult::success(response))
     }
 }
 
@@ -219,7 +231,7 @@ async fn create_container_for_stop(
 
 /// 停止指定项目的Agent服务
 ///
-/// 转发停止请求到容器内的 agent_runner 服务
+/// 直接销毁 project_id 对应的容器，不向容器内的 agent_runner 发送消息
 #[utoipa::path(
     post,
     path = "/agent/stop",
@@ -229,30 +241,32 @@ async fn create_container_for_stop(
     responses(
         (
             status = 200,
-            description = "成功转发停止请求到容器",
+            description = "成功销毁容器",
             body = HttpResult<StopAgentResponse>,
             example = json!({
                 "success": true,
                 "data": {
                     "success": true,
                     "project_id": "test_project",
-                    "session_id": "session123",
-                    "message": "Agent服务已成功停止"
+                    "session_id": null,
+                    "message": "容器已成功销毁"
                 },
                 "error": null
             })
         ),
         (
-            status = 404,
-            description = "未找到对应的Agent服务",
-            body = HttpResult<String>,
+            status = 200,
+            description = "容器不存在但返回成功",
+            body = HttpResult<StopAgentResponse>,
             example = json!({
-                "success": false,
-                "data": null,
-                "error": {
-                    "code": "AGENT_NOT_FOUND",
-                    "message": "No agent service found for the specified project_id"
-                }
+                "success": true,
+                "data": {
+                    "success": true,
+                    "project_id": "test_project",
+                    "session_id": null,
+                    "message": "容器不存在，无需销毁"
+                },
+                "error": null
             })
         ),
         (
@@ -270,22 +284,22 @@ async fn create_container_for_stop(
         ),
         (
             status = 500,
-            description = "转发停止请求失败",
+            description = "销毁容器失败",
             body = HttpResult<String>,
             example = json!({
                 "success": false,
                 "data": null,
                 "error": {
-                    "code": "STOP_FAILED",
-                    "message": "Failed to forward stop request to container"
+                    "code": "DESTROY_FAILED",
+                    "message": "Failed to destroy container"
                 }
             })
         )
     ),
     tag = "agent",
     operation_id = "agent_stop",
-    summary = "转发Agent停止请求",
-    description = "将停止请求转发到容器内的 agent_runner/agent/stop 接口"
+    summary = "销毁Agent容器",
+    description = "直接销毁 project_id 对应的容器，不向容器内的 agent_runner 发送消息。如果容器不存在，也返回成功。"
 )]
 #[instrument(skip(_state))]
 pub async fn agent_stop(
@@ -302,14 +316,29 @@ pub async fn agent_stop(
     }
 
     info!(
-        "🛑 [STOP_FORWARD] 收到停止Agent服务请求: project_id={}",
+        "🛑 [STOP_DESTROY] 收到销毁容器请求: project_id={}",
         project_id
     );
 
-    // 直接转发到容器内的 agent_runner 服务
-    let result = forward_stop_request_to_container(project_id).await;
+    // 直接销毁容器
+    let result = destroy_container_for_project(project_id).await;
 
-    info!("✅ [STOP_FORWARD] 停止请求转发完成");
+    match &result {
+        Ok(response) => {
+            if response.data.as_ref().unwrap().success {
+                info!("✅ [STOP_DESTROY] 容器销毁成功: project_id={}", project_id);
+            } else {
+                error!("❌ [STOP_DESTROY] 容器销毁失败: project_id={}", project_id);
+            }
+        }
+        Err(e) => {
+            error!(
+                "❌ [STOP_DESTROY] 销毁容器过程中出错: project_id={}, error={}",
+                project_id, e
+            );
+        }
+    }
+
     result
 }
 
