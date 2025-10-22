@@ -1,18 +1,21 @@
-use super::{DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult, ContainerStatus, MountPoint, RCODER_NETWORK_NAME};
-use bollard::{
-    models::{ContainerCreateBody, HostConfig, Mount, PortBinding, Network, NetworkingConfig},
-    Docker, API_DEFAULT_VERSION,
+use super::{
+    ContainerStatus, DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig,
+    DockerResult, MountPoint, RCODER_NETWORK_NAME,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions, RestartContainerOptions, InspectContainerOptions,
+    CreateContainerOptions, CreateImageOptions, InspectContainerOptions, LogsOptions,
+    RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
+};
+use bollard::{
+    API_DEFAULT_VERSION, Docker,
+    models::{ContainerCreateBody, HostConfig, Mount, Network, NetworkingConfig, PortBinding},
 };
 use chrono::Utc;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::{debug, error, info, warn};
 use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Docker 容器管理器
@@ -59,19 +62,30 @@ impl DockerManager {
     }
 
     /// 创建并启动容器
-    pub async fn create_container(&self, config: DockerContainerConfig) -> DockerResult<DockerContainerInfo> {
+    pub async fn create_container(
+        &self,
+        config: DockerContainerConfig,
+    ) -> DockerResult<DockerContainerInfo> {
         info!("开始创建容器，项目ID: {}", config.project_id);
 
         // 生成容器名称
-        let container_name = format!("{}-{}-{}",
+        let container_name = format!(
+            "{}-{}-{}",
             config.name_prefix,
             config.project_id,
-            Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown")
+            Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
         );
 
         // 检查是否已存在该项目的容器
         if let Some(existing) = self.containers.get(&config.project_id) {
-            warn!("项目 {} 已存在容器 {}，将先停止并删除", config.project_id, existing.container_name);
+            warn!(
+                "项目 {} 已存在容器 {}，将先停止并删除",
+                config.project_id, existing.container_name
+            );
             if let Err(e) = self.stop_container(&config.project_id).await {
                 error!("停止现有容器失败: {}", e);
             }
@@ -160,23 +174,24 @@ impl DockerManager {
         };
 
         // 创建容器
-        let create_result = self.docker.create_container(
-            Some(create_options),
-            container_config,
-        ).await.map_err(|e| {
-            DockerError::ContainerCreationError(format!("创建容器失败: {}", e))
-        })?;
+        let create_result = self
+            .docker
+            .create_container(Some(create_options), container_config)
+            .await
+            .map_err(|e| DockerError::ContainerCreationError(format!("创建容器失败: {}", e)))?;
 
         let container_id = create_result.id.clone();
 
         // 启动容器
-        self.docker.start_container(&container_id, None::<StartContainerOptions>).await.map_err(|e| {
-            DockerError::ContainerStartError(format!("启动容器失败: {}", e))
-        })?;
+        self.docker
+            .start_container(&container_id, None::<StartContainerOptions>)
+            .await
+            .map_err(|e| DockerError::ContainerStartError(format!("启动容器失败: {}", e)))?;
 
         // 连接到 RCoder 网络（如果不是 host 网络模式）
         if config.network_mode != "host" {
-            self.connect_container_to_network(&container_id, RCODER_NETWORK_NAME).await?;
+            self.connect_container_to_network(&container_id, RCODER_NETWORK_NAME)
+                .await?;
         }
 
         // 等待容器启动完成
@@ -196,12 +211,18 @@ impl DockerManager {
             port_bindings: config.port_bindings.clone(),
             assigned_port: 3000, // TODO: 使用动态分配的端口
             health_status: None,
+            internal_port: 8080,                    // 默认内部端口
+            session_id: Uuid::new_v4().to_string(), // 生成默认会话ID
         };
 
         // 保存到容器映射
-        self.containers.insert(config.project_id.clone(), container_info.clone());
+        self.containers
+            .insert(config.project_id.clone(), container_info.clone());
 
-        info!("容器创建并启动成功: {} (ID: {})", container_name, container_id);
+        info!(
+            "容器创建并启动成功: {} (ID: {})",
+            container_name, container_id
+        );
 
         Ok(container_info)
     }
@@ -211,28 +232,37 @@ impl DockerManager {
         info!("通过容器ID停止容器: {}", container_id);
 
         // 停止容器
-        if let Err(e) = self.docker.stop_container(container_id, None::<StopContainerOptions>).await {
+        if let Err(e) = self
+            .docker
+            .stop_container(container_id, None::<StopContainerOptions>)
+            .await
+        {
             if !e.to_string().contains("No such container") {
                 warn!("停止容器 {} 失败: {}", container_id, e);
             }
         }
 
         // 删除容器
-        if let Err(e) = self.docker.remove_container(
-            container_id,
-            Some(RemoveContainerOptions {
-                force: true,
-                v: true,
-                link: false,
-            }),
-        ).await {
+        if let Err(e) = self
+            .docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    link: false,
+                }),
+            )
+            .await
+        {
             if !e.to_string().contains("No such container") {
                 warn!("删除容器 {} 失败: {}", container_id, e);
             }
         }
 
         // 从映射中移除（如果存在）
-        self.containers.retain(|_, info| info.container_id != container_id);
+        self.containers
+            .retain(|_, info| info.container_id != container_id);
 
         Ok(())
     }
@@ -249,7 +279,8 @@ impl DockerManager {
         };
 
         // 调用通过ID停止的方法
-        self.stop_container_by_id(&container_info.container_id).await?;
+        self.stop_container_by_id(&container_info.container_id)
+            .await?;
 
         // 从映射中移除
         self.containers.remove(project_id);
@@ -264,11 +295,17 @@ impl DockerManager {
 
     /// 获取所有容器信息
     pub fn list_containers(&self) -> Vec<DockerContainerInfo> {
-        self.containers.iter().map(|entry| entry.value().clone()).collect()
+        self.containers
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// 检查并更新容器状态
-    pub async fn update_container_status(&self, project_id: &str) -> DockerResult<Option<ContainerStatus>> {
+    pub async fn update_container_status(
+        &self,
+        project_id: &str,
+    ) -> DockerResult<Option<ContainerStatus>> {
         let container_info = if let Some(info) = self.containers.get(project_id) {
             info.clone()
         } else {
@@ -276,10 +313,20 @@ impl DockerManager {
         };
 
         // 查询容器状态
-        match self.docker.inspect_container(&container_info.container_id, None::<InspectContainerOptions>).await {
+        match self
+            .docker
+            .inspect_container(
+                &container_info.container_id,
+                None::<InspectContainerOptions>,
+            )
+            .await
+        {
             Ok(details) => {
                 if let Some(state) = details.state {
-                    let status = state.status.map(|s| ContainerStatus::from(s.to_string())).unwrap_or(ContainerStatus::Unknown("unknown".to_string()));
+                    let status = state
+                        .status
+                        .map(|s| ContainerStatus::from(s.to_string()))
+                        .unwrap_or(ContainerStatus::Unknown("unknown".to_string()));
 
                     // 更新状态
                     let mut info = container_info;
@@ -309,7 +356,11 @@ impl DockerManager {
     pub async fn cleanup_all_containers(&self) -> DockerResult<()> {
         info!("开始清理所有容器");
 
-        let project_ids: Vec<String> = self.containers.iter().map(|entry| entry.key().clone()).collect();
+        let project_ids: Vec<String> = self
+            .containers
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
 
         for project_id in project_ids {
             if let Err(e) = self.stop_container(&project_id).await {
@@ -349,7 +400,10 @@ impl DockerManager {
                             }
                         }
                         Err(e) => {
-                            return Err(DockerError::ImagePullError(format!("拉取镜像失败: {}", e)));
+                            return Err(DockerError::ImagePullError(format!(
+                                "拉取镜像失败: {}",
+                                e
+                            )));
                         }
                     }
                 }
@@ -379,7 +433,9 @@ impl DockerManager {
             ..Default::default()
         };
 
-        let mut log_stream = self.docker.logs(&container_info.container_id, Some(log_options));
+        let mut log_stream = self
+            .docker
+            .logs(&container_info.container_id, Some(log_options));
         let mut logs = String::new();
 
         while let Some(result) = log_stream.next().await {
@@ -409,9 +465,13 @@ impl DockerManager {
             )));
         };
 
-        self.docker.restart_container(&container_info.container_id, None::<RestartContainerOptions>).await.map_err(|e| {
-            DockerError::ContainerStartError(format!("重启容器失败: {}", e))
-        })?;
+        self.docker
+            .restart_container(
+                &container_info.container_id,
+                None::<RestartContainerOptions>,
+            )
+            .await
+            .map_err(|e| DockerError::ContainerStartError(format!("重启容器失败: {}", e)))?;
 
         info!("容器重启成功: {}", container_info.container_name);
         Ok(())
@@ -466,7 +526,10 @@ impl DockerManager {
             }
             Err(e) => {
                 error!("❌ RCoder 网络创建失败: {}", e);
-                Err(DockerError::ContainerCreationError(format!("创建网络失败: {}", e)))
+                Err(DockerError::ContainerCreationError(format!(
+                    "创建网络失败: {}",
+                    e
+                )))
             }
         }
     }
@@ -479,10 +542,16 @@ impl DockerManager {
             filters: HashMap::from([("name", vec![network_name])]),
         };
 
-        let networks = self.docker.list_networks(Some(options)).await
+        let networks = self
+            .docker
+            .list_networks(Some(options))
+            .await
             .map_err(|e| DockerError::ConnectionError(format!("列出网络失败: {}", e)))?;
 
-        if networks.iter().any(|n| n.name.as_ref() == Some(&network_name.to_string())) {
+        if networks
+            .iter()
+            .any(|n| n.name.as_ref() == Some(&network_name.to_string()))
+        {
             Ok(())
         } else {
             Err(DockerError::ConnectionError("网络不存在".to_string()))
@@ -490,7 +559,11 @@ impl DockerManager {
     }
 
     /// 连接容器到指定网络
-    async fn connect_container_to_network(&self, container_id: &str, network_name: &str) -> DockerResult<()> {
+    async fn connect_container_to_network(
+        &self,
+        container_id: &str,
+        network_name: &str,
+    ) -> DockerResult<()> {
         use bollard::network::ConnectNetworkOptions;
 
         let connect_config = ConnectNetworkOptions {
@@ -498,14 +571,21 @@ impl DockerManager {
             endpoint_config: Default::default(),
         };
 
-        match self.docker.connect_network(network_name, connect_config).await {
+        match self
+            .docker
+            .connect_network(network_name, connect_config)
+            .await
+        {
             Ok(_) => {
                 info!("✅ 容器 {} 已连接到网络: {}", container_id, network_name);
                 Ok(())
             }
             Err(e) => {
                 error!("❌ 容器连接网络失败: {}", e);
-                Err(DockerError::ContainerCreationError(format!("容器连接网络失败: {}", e)))
+                Err(DockerError::ContainerCreationError(format!(
+                    "容器连接网络失败: {}",
+                    e
+                )))
             }
         }
     }
@@ -516,10 +596,16 @@ impl DockerManager {
     }
 
     /// 获取容器网络信息
-    pub async fn get_container_network_info(&self, container_id: &str) -> DockerResult<HashMap<String, String>> {
+    pub async fn get_container_network_info(
+        &self,
+        container_id: &str,
+    ) -> DockerResult<HashMap<String, String>> {
         use bollard::query_parameters::InspectContainerOptions;
 
-        let inspect = self.docker.inspect_container(container_id, None::<InspectContainerOptions>).await
+        let inspect = self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
             .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))?;
 
         let mut network_ips = HashMap::new();

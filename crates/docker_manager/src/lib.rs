@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use bollard::{
-    container::{Config, CreateContainerOptions, LogsOptions, StartContainerOptions, StopContainerOptions},
+    API_DEFAULT_VERSION, Docker,
+    container::{
+        Config, CreateContainerOptions, LogsOptions, StartContainerOptions, StopContainerOptions,
+    },
     image::CreateImageOptions,
     models::{ContainerCreateResponse, HostConfig, Mount, PortBinding},
-    Docker, API_DEFAULT_VERSION,
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -15,13 +17,13 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub mod container_self_inspector;
-pub mod types;
 pub mod manager;
+pub mod types;
 pub mod utils;
 
 pub use container_self_inspector::*;
-pub use types::*;
 pub use manager::*;
+pub use types::*;
 pub use utils::*;
 
 /// Docker 管理器错误类型

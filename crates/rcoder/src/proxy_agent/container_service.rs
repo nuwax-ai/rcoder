@@ -7,6 +7,7 @@
 //! - 自动化资源管理
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use derive_builder::Builder;
 use docker_manager::{DockerContainerInfo, DockerManager};
@@ -15,18 +16,25 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-use chrono::{DateTime, Utc};
 
 use super::{container_monitor::GLOBAL_CONTAINER_MONITOR, port_manager::GLOBAL_PORT_MANAGER};
 
 // 默认值函数
-fn default_idle_timeout() -> u64 { 1800 }
-fn default_cleanup_interval() -> u64 { 300 }
-fn default_max_lifetime() -> u64 { 86400 }
-fn default_enable_cleanup() -> bool { true }
+fn default_idle_timeout() -> u64 {
+    1800
+}
+fn default_cleanup_interval() -> u64 {
+    300
+}
+fn default_max_lifetime() -> u64 {
+    86400
+}
+fn default_enable_cleanup() -> bool {
+    true
+}
 
 /// 容器自动清理配置
-#[derive(Debug, Clone, Serialize, Deserialize,Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[builder(default, setter(into))]
 pub struct ContainerCleanupConfig {
     /// 空闲超时时间（默认30分钟）
@@ -46,8 +54,8 @@ pub struct ContainerCleanupConfig {
 impl Default for ContainerCleanupConfig {
     fn default() -> Self {
         Self {
-            idle_timeout_seconds: 1800, // 30分钟
-            cleanup_check_interval_seconds: 300, // 5分钟
+            idle_timeout_seconds: 1800,            // 30分钟
+            cleanup_check_interval_seconds: 300,   // 5分钟
             max_container_lifetime_seconds: 86400, // 24小时
             enable_auto_cleanup: true,
         }
@@ -140,7 +148,7 @@ impl ContainerService {
             let service_clone = service.clone();
             tokio::spawn(async move {
                 let mut cleanup_interval = tokio::time::interval(Duration::from_secs(
-                    service_clone.cleanup_config.cleanup_check_interval_seconds
+                    service_clone.cleanup_config.cleanup_check_interval_seconds,
                 ));
 
                 loop {
@@ -160,7 +168,8 @@ impl ContainerService {
     async fn perform_cleanup_check(service: &Arc<Self>) {
         info!("🔍 执行容器清理检查");
 
-        let containers_to_check: Vec<String> = service.project_containers
+        let containers_to_check: Vec<String> = service
+            .project_containers
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
@@ -189,9 +198,17 @@ impl ContainerService {
             let now = Utc::now();
             let container_created_utc: DateTime<Utc> = container_info.created_at.into();
 
-            if now.signed_duration_since(container_created_utc).num_seconds() > service.cleanup_config.max_container_lifetime_seconds as i64 {
-                info!("⏰ 容器超过最大存活时间，将清理: project_id={}, age_seconds={}",
-                       project_id, now.signed_duration_since(container_created_utc).num_seconds());
+            if now
+                .signed_duration_since(container_created_utc)
+                .num_seconds()
+                > service.cleanup_config.max_container_lifetime_seconds as i64
+            {
+                info!(
+                    "⏰ 容器超过最大存活时间，将清理: project_id={}, age_seconds={}",
+                    project_id,
+                    now.signed_duration_since(container_created_utc)
+                        .num_seconds()
+                );
                 Self::cleanup_container(service, project_id).await;
                 return;
             }
@@ -199,8 +216,11 @@ impl ContainerService {
             // 检查是否空闲超时
             let idle_time = now.signed_duration_since(container_info.last_activity);
             if idle_time.num_seconds() > service.cleanup_config.idle_timeout_seconds as i64 {
-                info!("⏱️ 容器空闲超时，将清理: project_id={}, idle_seconds={}",
-                       project_id, idle_time.num_seconds());
+                info!(
+                    "⏱️ 容器空闲超时，将清理: project_id={}, idle_seconds={}",
+                    project_id,
+                    idle_time.num_seconds()
+                );
                 Self::cleanup_container(service, project_id).await;
                 return;
             }
@@ -234,7 +254,9 @@ impl ContainerService {
         }
 
         // 分配端口
-        let allocated_port = GLOBAL_PORT_MANAGER.allocate_port().await
+        let allocated_port = GLOBAL_PORT_MANAGER
+            .allocate_port()
+            .await
             .map_err(|e| anyhow::anyhow!("端口分配失败: {}", e))?;
 
         // 创建容器配置
@@ -262,6 +284,8 @@ impl ContainerService {
                 port_bindings: container_config.port_bindings.clone(),
                 assigned_port: allocated_port,
                 health_status: None,
+                internal_port: 8080,                          // 默认内部端口
+                session_id: uuid::Uuid::new_v4().to_string(), // 生成临时会话ID
             },
             allocated_port: Some(allocated_port),
             created_at: chrono::Utc::now().into(),
@@ -271,7 +295,8 @@ impl ContainerService {
             is_active: true,
         };
 
-        self.project_containers.insert(project_id.to_string(), service_info);
+        self.project_containers
+            .insert(project_id.to_string(), service_info);
 
         // 创建并启动容器
         let container_info = match self.docker_manager.create_container(container_config).await {
@@ -296,7 +321,10 @@ impl ContainerService {
             monitor.add_container(&container_info, Some(allocated_port));
         }
 
-        info!("容器创建成功: {} (端口: {})", container_info.container_name, allocated_port);
+        info!(
+            "容器创建成功: {} (端口: {})",
+            container_info.container_name, allocated_port
+        );
         Ok(allocated_port)
     }
 
@@ -347,7 +375,9 @@ impl ContainerService {
 
     /// 获取项目的容器信息
     pub fn get_container_info(&self, project_id: &str) -> Option<ContainerServiceInfo> {
-        self.project_containers.get(project_id).map(|info| info.clone())
+        self.project_containers
+            .get(project_id)
+            .map(|info| info.clone())
     }
 
     /// 获取所有容器服务信息
@@ -362,7 +392,8 @@ impl ContainerService {
     pub async fn cleanup_all_containers(&self) -> Result<()> {
         info!("清理所有容器服务");
 
-        let containers: Vec<String> = self.project_containers
+        let containers: Vec<String> = self
+            .project_containers
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
@@ -395,12 +426,21 @@ impl ContainerService {
         // 设置模型提供商环境变量
         if let Some(provider) = model_config {
             env_vars.insert("MODEL_PROVIDER_NAME".to_string(), provider.name.clone());
-            env_vars.insert("MODEL_PROVIDER_API_KEY".to_string(), provider.api_key.clone());
+            env_vars.insert(
+                "MODEL_PROVIDER_API_KEY".to_string(),
+                provider.api_key.clone(),
+            );
             if !provider.base_url.is_empty() {
-                env_vars.insert("MODEL_PROVIDER_BASE_URL".to_string(), provider.base_url.clone());
+                env_vars.insert(
+                    "MODEL_PROVIDER_BASE_URL".to_string(),
+                    provider.base_url.clone(),
+                );
             }
             if !provider.default_model.is_empty() {
-                env_vars.insert("MODEL_PROVIDER_DEFAULT_MODEL".to_string(), provider.default_model.clone());
+                env_vars.insert(
+                    "MODEL_PROVIDER_DEFAULT_MODEL".to_string(),
+                    provider.default_model.clone(),
+                );
             }
         }
 
@@ -421,8 +461,8 @@ impl ContainerService {
             auto_remove: true,
             resource_limits: Some(docker_manager::ResourceLimits {
                 memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB 内存
-                cpu_limit: Some(2.0), // 2 核 CPU
-                swap_limit: Some(4 * 1024 * 1024 * 1024), // 4GB 交换空间
+                cpu_limit: Some(2.0),                       // 2 核 CPU
+                swap_limit: Some(4 * 1024 * 1024 * 1024),   // 4GB 交换空间
             }),
             extra_mounts: Vec::new(),
             command: None,

@@ -2,7 +2,10 @@
 //!
 //! 转发取消请求到容器内的 agent_runner 服务
 
-use axum::{extract::{Query, State}, Json};
+use axum::{
+    Json,
+    extract::{Query, State},
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -10,9 +13,11 @@ use tracing::{debug, error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    CancelNotificationRequest, proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent},
+    CancelNotificationRequest,
+    proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent},
     router::AppState,
 };
+use docker_manager::ContainerBasicInfo;
 use shared_types::{AppError, HttpResult};
 
 /// 取消任务的查询参数
@@ -37,18 +42,40 @@ pub struct CancelResponse {
     pub session_id: String,
 }
 
-/// 转发取消请求到容器内的 agent_runner 服务
-async fn forward_cancel_request_to_container(
+/// 获取或创建容器（用于取消请求）
+async fn get_or_create_container_for_cancel(
     project_id: &str,
-    session_id: &str,
-) -> Result<HttpResult<CancelResponse>, AppError> {
+) -> Result<ContainerBasicInfo, AppError> {
     info!(
-        "🚀 [CANCEL_FORWARD] 开始转发取消请求: project_id={}, session_id={}",
-        project_id, session_id
+        "🔍 [CANCEL_CONTAINER] 开始处理容器: project_id={}",
+        project_id
     );
 
-    // 检查或创建容器
-    let (server_url, _project_id_final) = ensure_container_exists_for_cancel(project_id).await?;
+    // 使用新的容器管理服务
+    let container_info =
+        crate::service::container_manager::ContainerManager::get_or_create_container_simple(
+            project_id,
+        )
+        .await?;
+
+    info!(
+        "✅ [CANCEL_CONTAINER] 容器准备就绪: project_id={}, container_id={}, service_url={}",
+        project_id, container_info.container_id, container_info.service_url
+    );
+
+    Ok(container_info)
+}
+
+/// 转发取消请求到容器内的 agent_runner 服务
+async fn forward_cancel_request_to_container_service(
+    project_id: &str,
+    session_id: &str,
+    container_info: &ContainerBasicInfo,
+) -> Result<HttpResult<CancelResponse>, AppError> {
+    info!(
+        "📤 [CANCEL_FORWARD] 转发取消请求到容器: project_id={}, session_id={}, container_id={}",
+        project_id, session_id, container_info.container_id
+    );
 
     // 构建容器内 agent_runner 的取消请求
     let cancel_request = serde_json::json!({
@@ -58,12 +85,9 @@ async fn forward_cancel_request_to_container(
 
     // 转发到容器内的 agent/agent/cancel 接口
     let client = Client::new();
-    let cancel_url = format!("{}/agent/agent/cancel", server_url);
+    let cancel_url = format!("{}/agent/agent/cancel", container_info.service_url);
 
-    info!(
-        "📤 [CANCEL_FORWARD] 转发取消请求到容器: {}",
-        cancel_url
-    );
+    info!("📤 [CANCEL_FORWARD] 发送取消请求到: {}", cancel_url);
 
     let response = client
         .post(&cancel_url)
@@ -76,13 +100,14 @@ async fn forward_cancel_request_to_container(
         })?;
 
     let status = response.status();
+    debug!("📥 [CANCEL_FORWARD] 容器响应状态: {}", status);
+
     if status.is_success() {
         // 直接返回容器内的响应
-        let container_response: CancelResponse = response.json().await
-            .map_err(|e| {
-                error!("❌ [CANCEL_FORWARD] 解析容器响应失败: {}", e);
-                AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
-            })?;
+        let container_response: CancelResponse = response.json().await.map_err(|e| {
+            error!("❌ [CANCEL_FORWARD] 解析容器响应失败: {}", e);
+            AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
+        })?;
 
         info!(
             "✅ [CANCEL_FORWARD] 容器取消响应成功: session_id={}, success={}",
@@ -91,10 +116,11 @@ async fn forward_cancel_request_to_container(
 
         Ok(HttpResult::success(container_response))
     } else {
+        let error_text = format!("容器返回错误状态: {}", status);
+        let response_body = response.text().await.unwrap_or_default();
         error!(
-            "❌ [CANCEL_FORWARD] 容器取消请求失败: status={}, body={:?}",
-            status,
-            response.text().await.unwrap_or_default()
+            "❌ [CANCEL_FORWARD] {}, 响应内容: {}",
+            error_text, response_body
         );
 
         Ok(HttpResult::error(
@@ -104,111 +130,21 @@ async fn forward_cancel_request_to_container(
     }
 }
 
-/// 检查或创建容器（用于取消请求）
-async fn ensure_container_exists_for_cancel(project_id: &str) -> Result<(String, String), AppError> {
-    // 检查容器是否已存在
-    if !PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
-        info!("🏗️ [CANCEL_FORWARD] 容器不存在，创建新容器: project_id={}", project_id);
-
-        // 使用默认配置创建容器
-        let chat_prompt = shared_types::ChatPromptBuilder::default()
-            .project_id(project_id.to_string())
-            .session_id(format!("cancel_session_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)))
-            .prompt("cancel_request".to_string())
-            .build()
-            .map_err(|e| {
-                error!("❌ [CANCEL_FORWARD] 构建 ChatPrompt 失败: {}", e);
-                AppError::internal_server_error(&format!("构建 ChatPrompt 失败: {}", e))
-            })?;
-
-        // 创建容器
-        create_container_for_cancel(&chat_prompt, None).await?;
-    }
-
-    // 获取容器服务 URL
-    if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
-        let docker_manager = std::sync::Arc::new(
-            docker_manager::DockerManager::with_default_config().await
-                .map_err(|e| {
-                    error!("❌ [CANCEL_FORWARD] 创建 DockerManager 失败: {}", e);
-                    AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-                })?
-        );
-
-        // 获取容器 IP 地址
-        let container_info = docker_manager.get_container_info(project_id);
-        if let Some(container_info) = container_info {
-            let server_url = docker_container_agent::get_container_ip(&docker_manager, &container_info.container_id, container_info.assigned_port).await
-                .map_err(|e| {
-                    error!("❌ [CANCEL_FORWARD] 获取容器 IP 失败: {}", e);
-                    AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
-                })?;
-
-            info!("✅ [CANCEL_FORWARD] 获取容器服务 URL: {}", server_url);
-            Ok((server_url, project_id.to_string()))
-        } else {
-            Err(AppError::internal_server_error("未找到容器信息"))
-        }
-    } else {
-        Err(AppError::internal_server_error("容器创建失败"))
-    }
-}
-
-/// 为取消请求创建容器
-async fn create_container_for_cancel(
-    chat_prompt: &shared_types::ChatPrompt,
-    _model_provider: Option<shared_types::ModelProviderConfig>,
-) -> Result<(), AppError> {
-    let project_id = &chat_prompt.project_id;
-    info!("🏗️ [CANCEL_FORWARD] 开始为取消请求创建容器: project_id={}", project_id);
-
-    // 使用 docker_container_agent 创建容器
-    let docker_manager = std::sync::Arc::new(
-        docker_manager::DockerManager::with_default_config().await
-            .map_err(|e| {
-                error!("❌ [CANCEL_FORWARD] 创建 DockerManager 失败: project_id={}, error={}", project_id, e);
-                AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-            })?
+/// 转发取消请求到容器内的 agent_runner 服务（组合函数）
+async fn forward_cancel_request_to_container(
+    project_id: &str,
+    session_id: &str,
+) -> Result<HttpResult<CancelResponse>, AppError> {
+    info!(
+        "🚀 [CANCEL_FORWARD] 开始转发取消请求: project_id={}, session_id={}",
+        project_id, session_id
     );
 
-    let connection_info = docker_container_agent::start_docker_container_agent_service(
-        chat_prompt.clone(),
-        None, // 取消请求不需要特定的 model provider
-        docker_manager,
-    ).await.map_err(|e| {
-        error!("❌ [CANCEL_FORWARD] 创建容器失败: project_id={}, error={}", project_id, e);
-        AppError::internal_server_error(&format!("创建容器失败: {}", e))
-    })?;
+    // 第一步：获取或创建容器
+    let container_info = get_or_create_container_for_cancel(project_id).await?;
 
-    info!("✅ [CANCEL_FORWARD] 容器创建成功: project_id={}, session_id={}",
-          project_id, connection_info.session_id);
-
-    // 创建生命周期守卫并存储到 MAP 中
-    let project_and_agent_info = shared_types::ProjectAndAgentInfo {
-        project_id: project_id.clone(),
-        session_id: connection_info.session_id.clone(),
-        prompt_tx: connection_info.prompt_tx.clone(),
-        cancel_tx: connection_info.cancel_tx.clone(),
-        model_provider: None,
-        request_id: chat_prompt.request_id.clone(),
-        status: shared_types::AgentStatus::Idle,
-        last_activity: chrono::Utc::now(),
-        created_at: chrono::Utc::now(),
-    };
-
-    // 存储到全局 MAP
-    PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info);
-
-    // 建立 project_id -> session_id 映射
-    let session_id_str = connection_info.session_id.to_string();
-    let cleared_old = crate::service::session_cache::ensure_project_session(project_id, &session_id_str).await;
-    if cleared_old > 0 {
-        info!("🧹 Project session 映射更新，已清理旧消息: project_id={}, cleared_count={}",
-              project_id, cleared_old);
-    }
-
-    info!("✅ [CANCEL_FORWARD] 容器创建完成并已注册: project_id={}", project_id);
-    Ok(())
+    // 第二步：转发取消请求到容器服务
+    forward_cancel_request_to_container_service(project_id, session_id, &container_info).await
 }
 
 /// 处理agent任务取消请求
@@ -285,13 +221,35 @@ pub async fn agent_session_cancel(
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     info!(
-        "🛑 [CANCEL_FORWARD] 收到取消任务请求: session_id={}, project_id={:?}",
+        "🛑 [CANCEL_FORWARD] 收到取消任务请求: session_id={}, project_id={}",
         query.session_id, query.project_id
     );
 
-    // 直接转发到容器内的 agent_runner 服务
-    let result = forward_cancel_request_to_container(&query.project_id, &query.session_id).await;
+    // 第一步：获取或创建容器
+    let container_info = get_or_create_container_for_cancel(&query.project_id).await?;
 
-    info!("✅ [CANCEL_FORWARD] 取消请求转发完成");
+    // 第二步：转发取消请求到容器服务
+    let result = forward_cancel_request_to_container_service(
+        &query.project_id,
+        &query.session_id,
+        &container_info,
+    )
+    .await;
+
+    match &result {
+        Ok(_) => {
+            info!(
+                "✅ [CANCEL_FORWARD] 取消请求处理成功: project_id={}",
+                query.project_id
+            );
+        }
+        Err(e) => {
+            error!(
+                "❌ [CANCEL_FORWARD] 取消请求处理失败: project_id={}, error={}",
+                query.project_id, e
+            );
+        }
+    }
+
     result
 }

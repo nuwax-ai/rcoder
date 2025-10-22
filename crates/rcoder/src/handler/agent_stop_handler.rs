@@ -2,7 +2,7 @@
 //!
 //! 转发停止请求到容器内的 agent_runner 服务
 
-use axum::extract::{Query, State, Path};
+use axum::extract::{Path, Query, State};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -58,10 +58,7 @@ async fn forward_stop_request_to_container(
     let client = Client::new();
     let stop_url = format!("{}/agent/agent/stop", server_url);
 
-    info!(
-        "📤 [STOP_FORWARD] 转发停止请求到容器: {}",
-        stop_url
-    );
+    info!("📤 [STOP_FORWARD] 转发停止请求到容器: {}", stop_url);
 
     let response = client
         .post(&stop_url)
@@ -75,11 +72,10 @@ async fn forward_stop_request_to_container(
 
     if response.status().is_success() {
         // 直接返回容器内的响应
-        let container_response: StopAgentResponse = response.json().await
-            .map_err(|e| {
-                error!("❌ [STOP_FORWARD] 解析容器响应失败: {}", e);
-                AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
-            })?;
+        let container_response: StopAgentResponse = response.json().await.map_err(|e| {
+            error!("❌ [STOP_FORWARD] 解析容器响应失败: {}", e);
+            AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
+        })?;
 
         info!(
             "✅ [STOP_FORWARD] 容器停止响应成功: project_id={}, success={}",
@@ -92,8 +88,7 @@ async fn forward_stop_request_to_container(
         let body = response.text().await;
         error!(
             "❌ [STOP_FORWARD] 容器停止请求失败: status={}, body={:?}",
-            status,
-            body
+            status, body
         );
 
         Ok(HttpResult::error(
@@ -107,12 +102,18 @@ async fn forward_stop_request_to_container(
 async fn ensure_container_exists_for_stop(project_id: &str) -> Result<(String, String), AppError> {
     // 检查容器是否已存在
     if !PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
-        info!("🏗️ [STOP_FORWARD] 容器不存在，创建新容器: project_id={}", project_id);
+        info!(
+            "🏗️ [STOP_FORWARD] 容器不存在，创建新容器: project_id={}",
+            project_id
+        );
 
         // 使用默认配置创建容器
         let chat_prompt = shared_types::ChatPromptBuilder::default()
             .project_id(project_id.to_string())
-            .session_id(format!("stop_session_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)))
+            .session_id(format!(
+                "stop_session_{}",
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ))
             .prompt("stop_request".to_string())
             .build()
             .map_err(|e| {
@@ -127,21 +128,27 @@ async fn ensure_container_exists_for_stop(project_id: &str) -> Result<(String, S
     // 获取容器服务 URL
     if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
         let docker_manager = std::sync::Arc::new(
-            docker_manager::DockerManager::with_default_config().await
+            docker_manager::DockerManager::with_default_config()
+                .await
                 .map_err(|e| {
                     error!("❌ [STOP_FORWARD] 创建 DockerManager 失败: {}", e);
                     AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-                })?
+                })?,
         );
 
         // 获取容器 IP 地址
         let container_info = docker_manager.get_container_info(project_id);
         if let Some(container_info) = container_info {
-            let server_url = docker_container_agent::get_container_ip(&docker_manager, &container_info.container_id, container_info.assigned_port).await
-                .map_err(|e| {
-                    error!("❌ [STOP_FORWARD] 获取容器 IP 失败: {}", e);
-                    AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
-                })?;
+            let server_url = docker_container_agent::get_container_ip(
+                &docker_manager,
+                &container_info.container_id,
+                container_info.assigned_port,
+            )
+            .await
+            .map_err(|e| {
+                error!("❌ [STOP_FORWARD] 获取容器 IP 失败: {}", e);
+                AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
+            })?;
 
             info!("✅ [STOP_FORWARD] 获取容器服务 URL: {}", server_url);
             Ok((server_url, project_id.to_string()))
@@ -159,54 +166,54 @@ async fn create_container_for_stop(
     _model_provider: Option<shared_types::ModelProviderConfig>,
 ) -> Result<(), AppError> {
     let project_id = &chat_prompt.project_id;
-    info!("🏗️ [STOP_FORWARD] 开始为停止请求创建容器: project_id={}", project_id);
+    info!(
+        "🏗️ [STOP_FORWARD] 开始为停止请求创建容器: project_id={}",
+        project_id
+    );
 
     // 使用 docker_container_agent 创建容器
     let docker_manager = std::sync::Arc::new(
-        docker_manager::DockerManager::with_default_config().await
+        docker_manager::DockerManager::with_default_config()
+            .await
             .map_err(|e| {
-                error!("❌ [STOP_FORWARD] 创建 DockerManager 失败: project_id={}, error={}", project_id, e);
+                error!(
+                    "❌ [STOP_FORWARD] 创建 DockerManager 失败: project_id={}, error={}",
+                    project_id, e
+                );
                 AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-            })?
+            })?,
     );
 
-    let connection_info = docker_container_agent::start_docker_container_agent_service(
-        chat_prompt.clone(),
-        None, // 停止请求不需要特定的 model provider
-        docker_manager,
-    ).await.map_err(|e| {
-        error!("❌ [STOP_FORWARD] 创建容器失败: project_id={}, error={}", project_id, e);
-        AppError::internal_server_error(&format!("创建容器失败: {}", e))
-    })?;
+    // 创建项目工作目录
+    let project_workspace =
+        crate::service::container_manager::get_project_workspace(project_id).await?;
+    crate::service::container_manager::create_project_workspace(project_id)
+        .await
+        .map_err(|e| {
+            error!(
+                "❌ [STOP_FORWARD] 创建项目工作目录失败: project_id={}, error={}",
+                project_id, e
+            );
+            AppError::internal_server_error(&format!("创建项目工作目录失败: {}", e))
+        })?;
 
-    info!("✅ [STOP_FORWARD] 容器创建成功: project_id={}, session_id={}",
-          project_id, connection_info.session_id);
+    let (_container_info, _server_url) =
+        docker_container_agent::start_docker_container_agent_service(
+            project_id.to_string(),
+            project_workspace.to_string_lossy().to_string(),
+            docker_manager,
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                "❌ [STOP_FORWARD] 创建容器失败: project_id={}, error={}",
+                project_id, e
+            );
+            AppError::internal_server_error(&format!("创建容器失败: {}", e))
+        })?;
 
-    // 创建生命周期守卫并存储到 MAP 中
-    let project_and_agent_info = shared_types::ProjectAndAgentInfo {
-        project_id: project_id.clone(),
-        session_id: connection_info.session_id.clone(),
-        prompt_tx: connection_info.prompt_tx.clone(),
-        cancel_tx: connection_info.cancel_tx.clone(),
-        model_provider: None,
-        request_id: chat_prompt.request_id.clone(),
-        status: shared_types::AgentStatus::Idle,
-        last_activity: chrono::Utc::now(),
-        created_at: chrono::Utc::now(),
-    };
+    info!("✅ [STOP_FORWARD] 容器创建成功: project_id={}", project_id);
 
-    // 存储到全局 MAP
-    PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info);
-
-    // 建立 project_id -> session_id 映射
-    let session_id_str = connection_info.session_id.to_string();
-    let cleared_old = crate::service::session_cache::ensure_project_session(project_id, &session_id_str).await;
-    if cleared_old > 0 {
-        info!("🧹 Project session 映射更新，已清理旧消息: project_id={}, cleared_count={}",
-              project_id, cleared_old);
-    }
-
-    info!("✅ [STOP_FORWARD] 容器创建完成并已注册: project_id={}", project_id);
     Ok(())
 }
 
@@ -294,7 +301,10 @@ pub async fn agent_stop(
         ));
     }
 
-    info!("🛑 [STOP_FORWARD] 收到停止Agent服务请求: project_id={}", project_id);
+    info!(
+        "🛑 [STOP_FORWARD] 收到停止Agent服务请求: project_id={}",
+        project_id
+    );
 
     // 直接转发到容器内的 agent_runner 服务
     let result = forward_stop_request_to_container(project_id).await;
@@ -379,7 +389,10 @@ pub async fn agent_status(
         ));
     }
 
-    info!("📊 [AGENT_STATUS] 收到查询Agent状态请求: project_id={}", project_id);
+    info!(
+        "📊 [AGENT_STATUS] 收到查询Agent状态请求: project_id={}",
+        project_id
+    );
 
     // 从MAP中获取Agent信息
     if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
@@ -390,7 +403,10 @@ pub async fn agent_status(
             status: Some(agent_info.status),
             last_activity: Some(agent_info.last_activity),
             created_at: Some(agent_info.created_at),
-            model_provider: agent_info.model_provider.as_ref().map(|mp| mp.to_safe_info()),
+            model_provider: agent_info
+                .model_provider
+                .as_ref()
+                .map(|mp| mp.to_safe_info()),
         };
 
         info!(
@@ -400,7 +416,10 @@ pub async fn agent_status(
 
         Ok(HttpResult::success(response))
     } else {
-        info!("📭 [AGENT_STATUS] Agent服务不存在: project_id={}", project_id);
+        info!(
+            "📭 [AGENT_STATUS] Agent服务不存在: project_id={}",
+            project_id
+        );
 
         let response = AgentStatusResponse {
             project_id: project_id.to_string(),

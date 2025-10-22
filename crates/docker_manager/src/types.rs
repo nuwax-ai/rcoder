@@ -103,6 +103,35 @@ pub struct DockerContainerInfo {
     pub assigned_port: u16,
     /// 健康检查状态
     pub health_status: Option<String>,
+    /// 内部服务端口
+    pub internal_port: u16,
+    /// 会话ID
+    pub session_id: String,
+}
+
+/// 容器基本信息（用于 API 响应）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerBasicInfo {
+    /// 容器唯一标识ID
+    pub container_id: String,
+    /// 容器名称
+    pub container_name: String,
+    /// 容器IP地址
+    pub container_ip: String,
+    /// 容器内部服务端口
+    pub internal_port: u16,
+    /// 容器外部映射端口
+    pub external_port: u16,
+    /// 项目ID
+    pub project_id: String,
+    /// 会话ID
+    pub session_id: String,
+    /// 容器状态
+    pub status: String,
+    /// 创建时间
+    pub created_at: DateTime<Utc>,
+    /// 服务URL
+    pub service_url: String,
 }
 
 /// 容器状态
