@@ -1,9 +1,8 @@
-mod model;
+// 重新导出 shared_types 中的模型，保持向后兼容
 
-pub use model::{
-    ModelApiProtocol, ModelProviderConfig, ModelProviderSafeInfo, AgentType,
+pub use shared_types::{
     // Agent model exports
-    AgentStatus, AgentStatusResponse, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse,
+    AgentType, AgentStatus, AgentStatusResponse, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse,
     // Session and message exports
     Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
     ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,

@@ -1,24 +1,14 @@
-mod agent_model;
-mod attachment;
-mod chat_prompt;
-
-mod agent_session_notify;
-mod app_error;
-mod http_result;
-
-use serde::{Serialize, Deserialize};
-
-pub use agent_model::{
+// Re-export models from shared_types for backwards compatibility
+pub use shared_types::{
     AgentStatus, AgentStatusResponse, AgentType, CancelNotificationRequest,
     CancelNotificationResponse, ProjectAndAgentInfo,
+    Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
+    ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,
+    AgentSessionUpdate, SessionNotify, ChatPrompt, ChatPromptResponse,
+    AppError, HttpResult,
 };
-pub use agent_session_notify::*;
-pub use attachment::*;
-pub use attachment::AttachmentSource;
-pub use chat_prompt::{ChatPrompt, ChatPromptBuilder, ChatPromptResponse};
 
-pub use app_error::AppError;
-pub use http_result::*;
+use serde::{Serialize, Deserialize};
 
 /// 聊天响应结构
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]

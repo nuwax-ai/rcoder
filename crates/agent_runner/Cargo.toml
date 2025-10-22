@@ -58,8 +58,8 @@ dashmap = { workspace = true }
 bytes = "1.0"
 futures-util = { workspace = true }
 piper = "0.2"
-base64 = "0.21"
-reqwest = { version = "0.11", features = ["json"] }
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
 
 # OpenTelemetry
 opentelemetry = { workspace = true }
