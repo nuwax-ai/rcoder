@@ -88,7 +88,7 @@ impl HostPathResolver {
     /// 将容器内路径转换为宿主机路径
     ///
     /// # Arguments
-    /// * `container_path` - 容器内的路径 (如: /app/project_workspace/abc-123)
+    /// * `container_path` - 容器内的路径 (如: /app/project_workspace/abc-123 或 ./project_workspace/abc-123)
     ///
     /// # Returns
     /// * `PathBuf` - 对应的宿主机路径
@@ -102,18 +102,39 @@ impl HostPathResolver {
     pub fn resolve_to_host_path(&self, container_path: &Path) -> PathBuf {
         debug!("解析路径: {:?}", container_path);
 
-        // 如果路径以容器内基础路径开头，则替换为宿主机基础路径
-        if let Some(relative_path) = container_path.strip_prefix(&self.container_project_workspace).ok() {
-            let host_path = self.host_project_workspace.join(relative_path);
-            debug!("转换结果: {:?} -> {:?}", container_path, host_path);
-            host_path
+        // 第一步：将容器内的相对路径转换为绝对路径
+        let container_absolute_path = if container_path.is_relative() {
+            // 如果是相对路径，先转换为容器内的绝对路径
+            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            current_dir.join(container_path)
         } else {
-            // 如果不是预期的前缀，可能是绝对路径或其他情况
-            warn!("路径 {} 不在预期的容器基础路径 {:?} 下",
-                  container_path.display(), self.container_project_workspace);
-
-            // 尝试直接使用（可能是已经在宿主机上的路径）
             container_path.to_path_buf()
+        };
+
+        debug!("容器内绝对路径: {:?}", container_absolute_path);
+
+        // 第二步：如果容器内绝对路径以项目工作目录开头，提取相对路径
+        if let Some(relative_path) = container_absolute_path.strip_prefix(&self.container_project_workspace).ok() {
+            // 第三步：将相对路径拼接到宿主机基础路径上
+            let host_path = self.host_project_workspace.join(relative_path);
+            debug!("路径转换成功: 容器内 {:?} -> 宿主机 {:?}", container_absolute_path, host_path);
+            return host_path;
+        }
+
+        // 如果路径不在项目工作目录下，可能是已经在宿主机上的路径
+        warn!("路径 {:?} 不在容器项目工作目录 {:?} 下，可能是宿主机路径",
+               container_absolute_path, self.container_project_workspace);
+
+        // 尝试直接解析为绝对路径
+        match container_absolute_path.canonicalize() {
+            Ok(absolute_path) => {
+                debug!("使用绝对路径: {:?}", absolute_path);
+                absolute_path
+            }
+            Err(e) => {
+                warn!("无法解析路径 {:?} 为绝对路径: {}，使用原始路径", container_absolute_path, e);
+                container_absolute_path
+            }
         }
     }
 
