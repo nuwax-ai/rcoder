@@ -10,3 +10,4 @@ project_workspace
 .checkstyle
 .checkstyle_suppressions.xml
 .DS_Store
+docker/rcoder

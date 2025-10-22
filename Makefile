@@ -1,29 +1,48 @@
-.PHONY: help build dev install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs
+.PHONY: help build docker-build install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs
 
 # 默认目标：显示帮助信息
 help:
 	@echo "rcoder 开发模式 Makefile"
 	@echo ""
-	@echo "可用命令："
+	@echo "📦 编译和安装："
+	@echo "  make build          - 本地编译 rcoder（仅编译）"
 	@echo "  make install        - 安装所有二进制到 ~/.cargo/bin/"
 	@echo "  make install-agent  - 仅安装 codex-acp-agent"
 	@echo "  make uninstall      - 卸载所有二进制"
 	@echo ""
-	@echo "开发模式命令（推荐用于开发）："
-	@echo "  make dev-build      - 本地编译 rcoder 并复制到 docker 目录"
+	@echo "🐳 Docker 镜像构建："
+	@echo "  make docker-build   - 仅构建 Docker 镜像"
+	@echo "  make dev-build      - 本地编译 + 构建 Docker 镜像（一键完成）"
+	@echo ""
+	@echo "🔧 开发模式命令："
 	@echo "  make dev-up         - 启动开发模式容器（挂载本地编译的可执行文件）"
 	@echo "  make dev-restart    - 重启开发模式容器（重新编译并启动）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
 	@echo ""
 	@echo "开发模式工作流程："
-	@echo "  1. make dev-build    # 首次编译"
+	@echo "  1. make dev-build    # 首次编译+构建镜像"
 	@echo "  2. make dev-up       # 启动容器"
-	@echo "  3. 修改代码后: make dev-restart  # 重新编译并重启"
+	@echo "  3. 修改代码后: make dev-restart  # 重新编译+构建+重启"
 	@echo ""
 
+# 本地编译（仅编译，不构建镜像）
+build:
+	@echo "🔨 本地编译 rcoder..."
+	@cargo build --release --bin rcoder
+	@echo "✅ 编译完成！"
+	@echo "可执行文件: ./target/release/rcoder"
 
-
+# Docker 镜像构建（仅构建镜像，不编译）
+docker-build:
+	@echo "🐳 构建 Docker 镜像..."
+	@echo "📍 镜像名称: master-rcoder:latest"
+	@echo "📦 使用 Dockerfile 多阶段构建（会在镜像内编译）..."
+	@docker build -f docker/Dockerfile -t master-rcoder:latest .
+	@echo "✅ Docker 镜像构建完成！"
+	@echo ""
+	@echo "🎯 使用方式："
+	@echo "  docker run -d -p 8087:8087 master-rcoder:latest"
 
 # 安装 codex-acp-agent
 install-agent:
@@ -47,15 +66,26 @@ uninstall:
 	@cargo uninstall codex-acp-agent 2>/dev/null || echo "codex-acp-agent 未安装"
 	@echo "✅ 卸载完成"
 
-# 开发模式命令
-dev-build: install-agent
-	@echo "🔨 开发模式：本地编译 rcoder..."
+# 开发模式：本地编译 + Docker 镜像构建（一键完成）
+dev-build:
+	@echo "🔨 [1/2] 本地编译 rcoder..."
 	@cargo build --release --bin rcoder
 	@echo "📁 复制可执行文件到 docker 目录..."
 	@cp ./target/release/rcoder ./docker/rcoder
-	@echo "✅ 开发模式编译完成！"
-	@echo "可执行文件已复制到: ./docker/rcoder"
+	@chmod +x ./docker/rcoder
+	@echo "✅ 本地编译完成！"
+	@echo ""
+	@echo "🐳 [2/2] 构建 Docker 镜像..."
+	@docker build -f docker/Dockerfile -t master-rcoder:latest .
+	@echo ""
+	@echo "🎉 全部完成！"
+	@echo "  ✓ 本地可执行文件: ./docker/rcoder"
+	@echo "  ✓ Docker 镜像: master-rcoder:latest"
+	@echo ""
+	@echo "💡 下一步: make dev-up 启动容器"
 
+
+ 
 dev-up:
 	@echo "🚀 启动开发模式容器服务..."
 	@if [ ! -f "docker/docker-compose.yml" ]; then \
@@ -66,7 +96,6 @@ dev-up:
 		echo "⚠️  警告: 未找到 ./docker/rcoder，请先运行 'make dev-build'"; \
 	fi
 	@echo "🔧 使用开发模式配置："
-	@echo "  - 镜像: master-rcoder:latest (Docker镜像)"
 	@echo "  - 可执行文件: ./docker/rcoder (本地编译)"
 	@echo "  - 启动命令: 直接执行 /app/rcoder"
 	@RCODER_IMAGE=master-rcoder:latest \
