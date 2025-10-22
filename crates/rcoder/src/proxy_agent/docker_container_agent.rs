@@ -41,6 +41,10 @@ pub async fn start_docker_container_agent_service(
         "启动 Docker 容器 Agent 服务（使用 agent_runer），项目ID: {}",
         project_id
     );
+    info!(
+        "📁 [DOCKER_AGENT] 项目工作目录: project_id={}, project_path={:?}",
+        project_id, project_path
+    );
 
     // 检查是否已存在该项目的容器
     if let Some(existing_container) = docker_manager.get_container_info(&project_id) {

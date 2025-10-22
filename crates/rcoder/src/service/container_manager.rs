@@ -31,14 +31,11 @@ impl ContainerManager {
     ///     &chat_request
     /// ).await?;
     /// ```
-    pub async fn get_or_create_container(
-        project_id: &str,
-        request: &ChatRequest,
-    ) -> Result<ContainerBasicInfo, AppError> {
+    pub async fn get_or_create_container(project_id: &str) -> Result<ContainerBasicInfo, AppError> {
         info!("🔍 [CONTAINER_MGR] 开始处理容器: project_id={}", project_id);
 
         // 检查或创建容器
-        let container_info = ensure_container_exists(project_id, request).await?;
+        let container_info = ensure_container_exists(project_id).await?;
 
         info!(
             "✅ [CONTAINER_MGR] 容器准备就绪: project_id={}, container_id={}, service_url={}",
@@ -72,18 +69,7 @@ impl ContainerManager {
             project_id
         );
 
-        // 构建一个最小化的 ChatRequest 用于容器管理
-        let chat_request = ChatRequest {
-            prompt: "container_init".to_string(),
-            project_id: Some(project_id.to_string()),
-            session_id: None,
-            attachments: vec![],
-            data_source_attachments: vec![],
-            model_provider: None,
-            request_id: None,
-        };
-
-        Self::get_or_create_container(project_id, &chat_request).await
+        Self::get_or_create_container(project_id).await
     }
 
     /// 检查容器是否已存在
@@ -287,10 +273,7 @@ impl ContainerManager {
 }
 
 /// 根据 project_id 检查对应容器是否存在，不存在就动态创建容器
-async fn ensure_container_exists(
-    project_id: &str,
-    request: &ChatRequest,
-) -> Result<ContainerBasicInfo, AppError> {
+async fn ensure_container_exists(project_id: &str) -> Result<ContainerBasicInfo, AppError> {
     info!(
         "🔍 [CONTAINER_MGR] 检查容器是否存在: project_id={}",
         project_id
@@ -351,13 +334,12 @@ async fn ensure_container_exists(
         project_id
     );
 
-    create_container_for_request(project_id, request, &docker_manager).await
+    create_container_for_request(project_id, &docker_manager).await
 }
 
 /// 为请求创建容器
 async fn create_container_for_request(
     project_id: &str,
-    request: &ChatRequest,
     docker_manager: &std::sync::Arc<DockerManager>,
 ) -> Result<ContainerBasicInfo, AppError> {
     info!(
@@ -367,6 +349,10 @@ async fn create_container_for_request(
 
     // 确保项目工作目录存在
     let project_workspace = get_project_workspace(project_id).await?;
+    info!(
+        "📁 [CONTAINER_MGR] 项目工作目录: project_id={}, workspace={:?}",
+        project_id, project_workspace
+    );
     create_project_workspace(project_id).await.map_err(|e| {
         error!(
             "❌ [CONTAINER_MGR] 创建项目工作目录失败: project_id={}, error={}",
@@ -374,14 +360,6 @@ async fn create_container_for_request(
         );
         AppError::internal_server_error(&format!("创建项目工作目录失败: {}", e))
     })?;
-
-    // 生成会话ID和请求ID
-    let session_id = request.session_id.clone().unwrap_or_else(|| {
-        format!(
-            "session_{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        )
-    });
 
     // 启动容器（主要目的是创建容器和通信通道）
     let (container_info_docker, server_url) =
@@ -399,10 +377,7 @@ async fn create_container_for_request(
             AppError::internal_server_error(&format!("创建容器失败: {}", e))
         })?;
 
-    info!(
-        "✅ [CONTAINER_MGR] 容器创建成功: project_id={}, session_id={}",
-        project_id, session_id
-    );
+    info!("✅ [CONTAINER_MGR] 容器创建成功: project_id={}", project_id);
 
     // 获取容器详细信息
     let container_info_docker = docker_manager
@@ -451,16 +426,21 @@ async fn create_container_for_request(
     Ok(container_info)
 }
 
+/// 生成新的项目ID（UUID去除连字符）
+pub fn generate_project_id() -> String {
+    uuid::Uuid::new_v4().to_string().replace('-', "")
+}
+
 /// 获取 project_id 的 workspace_path
 pub async fn get_project_workspace(project_id: &str) -> Result<std::path::PathBuf, AppError> {
-    let workspace_dir = std::path::PathBuf::from("./project_workspace");
+    let workspace_dir = std::path::PathBuf::from("/app/project_workspace");
     let project_dir = workspace_dir.join(project_id);
     Ok(project_dir)
 }
 
 /// 创建项目工作目录
 pub async fn create_project_workspace(project_id: &str) -> Result<std::path::PathBuf, AppError> {
-    let workspace_dir = std::path::PathBuf::from("./project_workspace");
+    let workspace_dir = std::path::PathBuf::from("/app/project_workspace");
 
     // 创建 project_workspace 目录（如果不存在）
     tokio::fs::create_dir_all(&workspace_dir)

@@ -1,6 +1,5 @@
 name: rcoder
 services:
-
   rcoder:
     image: ${RCODER_IMAGE:-master-rcoder:latest}
     ports:
@@ -20,7 +19,7 @@ services:
       # 挂载启动脚本
       - ./start-rcoder.sh:/app/start-rcoder.sh
       # 开发模式：挂载本地编译的 rcoder 可执行文件（仅在开发模式下生效）
-      - ./rcoder:/app/rcoder:ro
+      - ./rcoder:/usr/local/bin/rcoder:ro
     command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8087/health"]
@@ -32,14 +31,6 @@ services:
     networks:
       - agent-network
 
-
 networks:
   agent-network:
     driver: bridge
-    # 以下配置可能有助于解决 openEuler 上的网络问题  
-    driver_opts:
-      com.docker.network.bridge.name: agent-bridge
-      com.docker.network.bridge.enable_icc: "true"
-      com.docker.network.bridge.enable_ip_masquerade: "true"
-      # 禁用IPv6
-      com.docker.network.enable_ipv6: "false"
