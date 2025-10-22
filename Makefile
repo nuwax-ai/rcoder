@@ -89,7 +89,7 @@ dev-build:
 	@echo "💡 下一步: make dev-up 启动容器"
 
 
- 
+
 dev-up:
 	@echo "🚀 启动开发模式容器服务..."
 	@if [ ! -f "docker/docker-compose.yml" ]; then \
@@ -131,14 +131,7 @@ dev-logs:
 		exit 1; \
 	fi
 
-dev-restart:
-	@echo "🔄 [1/3] 重新编译 rcoder..."
-	@cargo build --release --bin rcoder
-	@echo "📁 [2/3] 复制可执行文件到 docker 目录..."
-	@cp ./target/release/rcoder ./docker/rcoder
-	@chmod +x ./docker/rcoder
-	@echo "✅ 编译完成！"
-	@echo ""
+dev-restart: dev-build
 	@echo "🔄 [3/3] 重启容器服务..."
 	@if [ -f "docker/docker-compose.yml" ]; then \
 		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml restart; \
