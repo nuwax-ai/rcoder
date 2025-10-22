@@ -2,7 +2,7 @@ name: rcoder
 services:
 
   rcoder:
-    image: rcoder:latest
+    image: ${RCODER_IMAGE:-master-rcoder:latest}
     ports:
       - "${RCODER_PORT:-8087}:${RCODER_PORT:-8087}"
     environment:
@@ -19,7 +19,9 @@ services:
       - ./logs/:/app/logs
       # 挂载启动脚本
       - ./start-rcoder.sh:/app/start-rcoder.sh
-    command: ["/bin/bash", "/app/start-rcoder.sh"]
+      # 开发模式：挂载本地编译的 rcoder 可执行文件（仅在开发模式下生效）
+      - ./rcoder:/app/rcoder:ro${RCODER_DEV_VOLUME:-}
+    command: ${RCODER_COMMAND:-["/bin/bash", "/app/start-rcoder.sh"]}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8087/health"]
       interval: 30s
