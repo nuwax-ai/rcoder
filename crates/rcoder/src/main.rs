@@ -88,25 +88,6 @@ async fn main() -> anyhow::Result<()> {
     // 在主异步运行时中启动清理任务
     let _cleanup_handle = start_cleanup_task(cleanup_config.clone());
 
-    // 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
-    let _ = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build single-thread runtime for LocalSet agents");
-        rt.block_on(async move {
-            let local_set = tokio::task::LocalSet::new();
-            local_set
-                .run_until(async move {
-                    // 运行 agent worker（cleanup task 已移到主线程）
-                    if let Err(e) = proxy_agent::agent_worker(local_task_receiver).await {
-                        error!("Failed to run agent worker: {}", e);
-                    }
-                    warn!("Agent worker stopped");
-                })
-                .await;
-        });
-    });
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 

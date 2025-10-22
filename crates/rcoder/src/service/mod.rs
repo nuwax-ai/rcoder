@@ -1,10 +1,5 @@
-mod session_cache;
+//! 服务模块
+//!
+//! 提供全局的会话管理和缓存功能
 
-pub use session_cache::{
-    SESSION_CACHE,
-    PROJECT_SESSION_MAP,
-    SessionData,
-    push_session_update,
-    push_session_update_with_project,
-    ensure_project_session,
-};
+pub mod session_cache;

@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::model::AgentStatus;
 use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
-use crate::service::{SESSION_CACHE, PROJECT_SESSION_MAP};
+use crate::service::session_cache::{SESSION_CACHE, PROJECT_SESSION_MAP};
 
 /// 清理配置
 #[derive(Debug, Clone)]

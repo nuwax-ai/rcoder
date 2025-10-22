@@ -1,21 +1,49 @@
-//! 容器管理服务 - 统一管理Docker容器的生命周期
+//! 增强容器管理服务 - 统一管理Docker容器的生命周期
+//!
+//! 增强功能：
+//! - 容器空闲检测和自动清理
+//! - 容器健康状态监控
+//! - 容器使用统计和分析
+//! - 自动化资源管理
 
 use anyhow::Result;
 use dashmap::DashMap;
 use docker_manager::{DockerContainerInfo, DockerManager};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use chrono::{DateTime, Utc};
 
 use super::{container_monitor::GLOBAL_CONTAINER_MONITOR, port_manager::GLOBAL_PORT_MANAGER};
 
-/// 容器管理服务
-pub struct ContainerService {
-    /// Docker管理器
-    docker_manager: Arc<DockerManager>,
-    /// 项目到容器信息的映射
-    project_containers: Arc<DashMap<String, ContainerServiceInfo>>,
+/// 容器自动清理配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerCleanupConfig {
+    /// 空闲超时时间（默认30分钟）
+    #[serde(default = "1800")]
+    pub idle_timeout_seconds: u64,
+    /// 清理检查间隔（默认5分钟）
+    #[serde(default = "300")]
+    pub cleanup_check_interval_seconds: u64,
+    /// 最大容器存活时间（默认24小时）
+    #[serde(default = "86400")]
+    pub max_container_lifetime_seconds: u64,
+    /// 是否启用自动清理
+    #[serde(default = "true")]
+    pub enable_auto_cleanup: bool,
+}
+
+impl Default for ContainerCleanupConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_seconds: 1800, // 30分钟
+            cleanup_check_interval_seconds: 300, // 5分钟
+            max_container_lifetime_seconds: 86400, // 24小时
+            enable_auto_cleanup: true,
+        }
+    }
 }
 
 /// 容器服务信息
@@ -31,6 +59,12 @@ pub struct ContainerServiceInfo {
     pub created_at: std::time::SystemTime,
     /// 服务状态
     pub status: ContainerServiceStatus,
+    /// 最后活动时间
+    pub last_activity: DateTime<Utc>,
+    /// 请求计数
+    pub request_count: u64,
+    /// 是否正在使用中
+    pub is_active: bool,
 }
 
 /// 容器服务状态
@@ -48,9 +82,27 @@ pub enum ContainerServiceStatus {
     Error(String),
 }
 
+/// 增强容器管理服务
+pub struct ContainerService {
+    /// Docker管理器
+    pub docker_manager: Arc<DockerManager>,
+    /// 项目到容器信息的映射
+    pub project_containers: Arc<DashMap<String, ContainerServiceInfo>>,
+    /// 清理配置
+    pub cleanup_config: ContainerCleanupConfig,
+    /// 清理任务句柄
+    pub cleanup_task_handle: Arc<tokio::sync::RwLock<Option<tokio::task::JoinHandle<()>>>>,
+}
+
 impl ContainerService {
     /// 创建新的容器管理服务
     pub async fn new() -> Result<Self> {
+        let cleanup_config = ContainerCleanupConfig::default();
+        Self::new_with_config(cleanup_config).await
+    }
+
+    /// 使用指定配置创建容器管理服务
+    pub async fn new_with_config(cleanup_config: ContainerCleanupConfig) -> Result<Self> {
         let docker_manager = Arc::new(DockerManager::with_default_config().await?);
 
         // 初始化容器监控器
@@ -62,10 +114,100 @@ impl ContainerService {
             info!("容器监控器已初始化");
         }
 
+        let cleanup_task_handle = Arc::new(tokio::sync::RwLock::new(None));
+
         Ok(Self {
             docker_manager,
             project_containers: Arc::new(DashMap::new()),
+            cleanup_config,
+            cleanup_task_handle,
         })
+    }
+
+    /// 启动自动清理任务
+    pub async fn start_auto_cleanup_task(service: Arc<Self>) {
+        info!("🧹 启动容器自动清理任务");
+
+        let cleanup_task = {
+            let service_clone = service.clone();
+            tokio::spawn(async move {
+                let mut cleanup_interval = tokio::time::interval(Duration::from_secs(
+                    service_clone.cleanup_config.cleanup_check_interval_seconds
+                ));
+
+                loop {
+                    cleanup_interval.tick().await;
+                    Self::perform_cleanup_check(&service_clone).await;
+                }
+            })
+        };
+
+        let mut handle = service.cleanup_task_handle.write().await;
+        *handle = Some(cleanup_task);
+
+        info!("✅ 容器自动清理任务已启动");
+    }
+
+    /// 执行清理检查
+    async fn perform_cleanup_check(service: &Arc<Self>) {
+        info!("🔍 执行容器清理检查");
+
+        let containers_to_check: Vec<String> = service.project_containers
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for project_id in containers_to_check {
+            Self::check_and_cleanup_container(service, &project_id).await;
+        }
+
+        info!("✅ 容器清理检查完成");
+    }
+
+    /// 检查并清理单个容器
+    async fn check_and_cleanup_container(service: &Arc<Self>, project_id: &str) {
+        if let Some(container_info) = service.project_containers.get(project_id) {
+            // 检查容器是否在运行状态
+            if container_info.status != ContainerServiceStatus::Running {
+                return;
+            }
+
+            // 检查是否启用自动清理
+            if !service.cleanup_config.enable_auto_cleanup {
+                return;
+            }
+
+            // 检查是否超过最大存活时间
+            let now = Utc::now();
+            let container_created_utc = container_info.created_at.with_timezone(&chrono::FixedOffset::east_opt(0, 0)).unwrap_or_else(|| container_info.created_at);
+
+            if now.signed_duration_since(container_created_utc).num_seconds() > service.cleanup_config.max_container_lifetime_seconds as i64 {
+                info!("⏰ 容器超过最大存活时间，将清理: project_id={}, age_seconds={}",
+                       project_id, now.signed_duration_since(container_created_utc).num_seconds());
+                Self::cleanup_container(service, project_id).await;
+                return;
+            }
+
+            // 检查是否空闲超时
+            let idle_time = now.signed_duration_since(container_info.last_activity);
+            if idle_time.num_seconds() > service.cleanup_config.idle_timeout_seconds as i64 {
+                info!("⏱️ 容器空闲超时，将清理: project_id={}, idle_seconds={}",
+                       project_id, idle_time.num_seconds());
+                Self::cleanup_container(service, project_id).await;
+                return;
+            }
+        }
+    }
+
+    /// 清理指定容器
+    async fn cleanup_container(service: &Arc<Self>, project_id: &str) {
+        info!("🗑️ 清理闲置容器: project_id={}", project_id);
+
+        if let Err(e) = service.stop_container_for_project(project_id).await {
+            error!("❌ 清理容器失败: project_id={}, error={}", project_id, e);
+        } else {
+            info!("✅ 闲置容器清理成功: project_id={}", project_id);
+        }
     }
 
     /// 为项目创建并启动容器
@@ -110,11 +252,15 @@ impl ContainerService {
                 host_path: container_config.host_path.clone(),
                 container_path: container_config.container_path.clone(),
                 port_bindings: container_config.port_bindings.clone(),
+                assigned_port: allocated_port,
                 health_status: None,
             },
             allocated_port: Some(allocated_port),
             created_at: chrono::Utc::now().into(),
             status: ContainerServiceStatus::Creating,
+            last_activity: Utc::now(),
+            request_count: 0,
+            is_active: true,
         };
 
         self.project_containers.insert(project_id.to_string(), service_info);
@@ -137,13 +283,12 @@ impl ContainerService {
             service_info.status = ContainerServiceStatus::Running;
         }
 
-        info!("容器创建成功: {} (端口: {})", container_info.container_name, allocated_port);
-
         // 添加到监控器
         if let Some(monitor) = super::container_monitor::get_global_container_monitor().await {
             monitor.add_container(&container_info, Some(allocated_port));
         }
 
+        info!("容器创建成功: {} (端口: {})", container_info.container_name, allocated_port);
         Ok(allocated_port)
     }
 
@@ -215,32 +360,13 @@ impl ContainerService {
             .collect();
 
         for project_id in containers {
-            if let Err(e) = self.stop_container_for_project(&project_id).await {
+            if let Err(e) = self.stop_container_for_project(project_id).await {
                 error!("清理容器失败 {}: {}", project_id, e);
             }
         }
 
         info!("所有容器服务已清理");
         Ok(())
-    }
-
-    /// 获取容器统计信息
-    pub fn get_container_stats(&self) -> ContainerServiceStats {
-        let containers = self.get_all_containers();
-        let mut stats = ContainerServiceStats::default();
-
-        for container in &containers {
-            match container.status {
-                ContainerServiceStatus::Creating => stats.creating_count += 1,
-                ContainerServiceStatus::Running => stats.running_count += 1,
-                ContainerServiceStatus::Stopping => stats.stopping_count += 1,
-                ContainerServiceStatus::Stopped => stats.stopped_count += 1,
-                ContainerServiceStatus::Error(_) => stats.error_count += 1,
-            }
-        }
-
-        stats.total_count = containers.len();
-        stats
     }
 
     /// 创建容器配置
@@ -294,40 +420,68 @@ impl ContainerService {
             command: None,
         })
     }
-}
 
-/// 容器服务统计信息
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ContainerServiceStats {
-    /// 总容器数
-    pub total_count: usize,
-    /// 创建中的容器数
-    pub creating_count: usize,
-    /// 运行中的容器数
-    pub running_count: usize,
-    /// 停止中的容器数
-    pub stopping_count: usize,
-    /// 已停止的容器数
-    pub stopped_count: usize,
-    /// 错误的容器数
-    pub error_count: usize,
-}
+    /// 更新容器活动时间
+    pub async fn update_container_activity(&self, project_id: &str) {
+        if let Some(mut service_info) = self.project_containers.get_mut(project_id) {
+            service_info.last_activity = Utc::now();
+            service_info.request_count += 1;
+            service_info.is_active = true;
+            info!("更新容器活动时间: project_id={}", project_id);
+        }
+    }
 
-/// 全局容器服务实例
-pub static GLOBAL_CONTAINER_SERVICE: std::sync::LazyLock<tokio::sync::RwLock<Option<Arc<ContainerService>>>> =
-    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(None));
+    /// 获取容器统计信息
+    pub fn get_container_stats(&self) -> ContainerServiceStats {
+        let containers = self.get_all_containers();
+        let mut stats = ContainerServiceStats::default();
 
-/// 初始化全局容器服务
-pub async fn init_global_container_service() -> Result<()> {
-    let service = Arc::new(ContainerService::new().await?);
-    let mut global_service = GLOBAL_CONTAINER_SERVICE.write().await;
-    *global_service = Some(service);
+        for container in &containers {
+            match container.status {
+                ContainerServiceStatus::Creating => stats.creating_count += 1,
+                ContainerServiceStatus::Running => stats.running_count += 1,
+                ContainerServiceStatus::Stopping => stats.stopping_count += 1,
+                ContainerServiceStatus::Stopped => stats.stopped_count += 1,
+                ContainerServiceStatus::Error(_) => stats.error_count += 1,
+            }
+        }
 
-    info!("全局容器服务已初始化");
-    Ok(())
-}
+        stats.total_count = containers.len();
+        stats
+    }
 
-/// 获取全局容器服务
-pub async fn get_global_container_service() -> Option<Arc<ContainerService>> {
-    GLOBAL_CONTAINER_SERVICE.read().await.clone()
+    /// 容器服务统计信息
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct ContainerServiceStats {
+        /// 总容器数
+        pub total_count: usize,
+        /// 创建中的容器数
+        pub creating_count: usize,
+        /// 运行中的容器数
+        pub running_count: usize,
+        /// 停止中的容器数
+        pub stopping_count: usize,
+        /// 已停止的容器数
+        pub stopped_count: usize,
+        /// 错误的容器数
+        pub error_count: usize,
+    }
+
+    /// 全局容器服务实例
+    pub static GLOBAL_CONTAINER_SERVICE: std::sync::LazyLock<tokio::sync::RwLock<Option<Arc<ContainerService>>>> =
+        std::sync::LazyLock::new(|| tokio::sync::RwLock::new(None));
+
+    /// 初始化全局容器服务
+    pub async fn init_global_container_service() -> Result<()> {
+        let service = Arc::new(ContainerService::new().await?);
+        let mut global_service = GLOBAL_CONTAINER_SERVICE.write().await;
+        *global_service = Some(service);
+        info!("全局容器服务已初始化");
+        Ok(())
+    }
+
+    /// 获取全局容器服务
+    pub async fn get_global_container_service() -> Option<Arc<ContainerService>> {
+        GLOBAL_CONTAINER_SERVICE.read().await.clone()
+    }
 }

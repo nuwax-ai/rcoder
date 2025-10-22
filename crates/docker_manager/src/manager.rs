@@ -194,6 +194,7 @@ impl DockerManager {
             host_path: config.host_path.clone(),
             container_path: config.container_path.clone(),
             port_bindings: config.port_bindings.clone(),
+            assigned_port: 3000, // TODO: 使用动态分配的端口
             health_status: None,
         };
 

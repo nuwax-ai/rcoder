@@ -386,7 +386,7 @@ async fn handle_cancel_request(
 }
 
 /// 获取容器在 RCoder 网络中的 IP 地址
-async fn get_container_ip(
+pub async fn get_container_ip(
     docker_manager: &DockerManager,
     container_id: &str,
     port: u16,

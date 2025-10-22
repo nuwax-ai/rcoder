@@ -93,7 +93,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             // 响应结构体
             handler::HealthResponse,
             handler::ChatRequest,
-            handler::ChatResponse,
+            crate::model::ChatResponse,
             handler::StopAgentResponse,
             crate::handler::SessionUpdateEvent,
             // 模型配置相关结构体

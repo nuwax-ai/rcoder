@@ -99,6 +99,8 @@ pub struct DockerContainerInfo {
     pub container_path: String,
     /// 端口映射
     pub port_bindings: HashMap<String, String>,
+    /// 分配的端口号
+    pub assigned_port: u16,
     /// 健康检查状态
     pub health_status: Option<String>,
 }

@@ -17,6 +17,13 @@ pub enum AppError {
     ),
 }
 
+impl AppError {
+    /// 创建内部服务器错误
+    pub fn internal_server_error(message: &str) -> Self {
+        Self::AnyhowError(anyhow::anyhow!("Internal Server Error: {}", message))
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let http_result = HttpResult::<()>::error("0001", &self.to_string());

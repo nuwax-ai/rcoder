@@ -1,4 +1,6 @@
 //! 聊天处理器
+//!
+//! 将原始 HTTP 请求直接转发到容器内的 agent_runner 服务
 
 use anyhow::Result;
 use axum::{Json, extract::State};
@@ -8,9 +10,13 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
 use utoipa::ToSchema;
 use uuid::Uuid;
+use reqwest::Client;
 
-use crate::proxy_agent::*;
+use crate::proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent};
+use crate::proxy_agent::container_service::ContainerService;
+use crate::service::session_cache::{SESSION_CACHE, PROJECT_SESSION_MAP};
 use crate::{model::*, router::AppState};
+use crate::utils::prompt_builder::PromptBuilder;
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -50,22 +56,6 @@ pub struct ChatRequest {
     pub request_id: Option<String>,
 }
 
-/// 服务响应结构
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ChatResponse {
-    /// 项目 ID
-    #[schema(example = "test_project")]
-    pub project_id: String,
-    /// 会话 ID
-    #[schema(example = "session456")]
-    pub session_id: String,
-    /// 可选的错误信息
-    pub error: Option<String>,
-    /// 请求ID，用于标识和追踪请求
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "req_123456789")]
-    pub request_id: Option<String>,
-}
 
 /// 生成不带中划线的随机项目ID
 fn generate_project_id() -> String {
@@ -172,62 +162,43 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
     description = "通过 ACP 协议发送聊天消息给 AI 代理，支持文本和多媒体内容"
 )]
 #[axum::debug_handler]
-#[instrument(skip(state))]
+#[instrument(skip(_state))]
 pub async fn handle_chat(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(request): Json<ChatRequest>,
 ) -> Result<crate::model::HttpResult<ChatResponse>, crate::model::AppError> {
     info!(
-        "🚀 [DEBUG] handle_chat 开始处理请求: project_id={:?}, session_id={:?}, prompt={}",
-        request.project_id, request.session_id, request.prompt
+        "🚀 [FORWARD] 开始转发 /chat 请求: project_id={:?}, session_id={:?}",
+        request.project_id, request.session_id
     );
 
-    // 检查是否需要生成项目ID
-    let project_id = if request.project_id.is_some() {
-        debug!("📝 [DEBUG] 使用请求中的项目ID: {:?}", request.project_id);
-        request.project_id.clone().unwrap()
-    } else {
-        let new_project_id = generate_project_id();
-        debug!("🆕 [DEBUG] 生成新的项目ID: {}", new_project_id);
+    // 直接转发原始请求到容器内的 agent_runner
+    let result = forward_request_to_container(&request).await;
 
-        // 创建项目工作目录
-        create_project_workspace(&new_project_id).await?;
-        new_project_id
-    };
+    info!("✅ [FORWARD] /chat 请求转发完成");
+    result
+}
 
-    // 🚦 检查 Agent 状态，禁止并发请求
-    if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
-        if agent_info.status == AgentStatus::Active {
-            info!(
-                "⚠️ [chat] Agent正在执行任务，拒绝并发请求: project_id={}, status={:?}",
-                project_id, agent_info.status
-            );
-            return Ok(crate::model::HttpResult::error(
-                "9010",
-                "Agent正在执行任务，请等待当前任务完成后再发送新请求",
-            ));
-        }
-    }
-
-    // 🗑️ 简单直接：直接移除所有相关session，确保全新开始
-    // 新的设计：移除旧session → Agent必须重新获取sender → 前端只能获取新消息
-    if let Some(ref session_id) = request.session_id {
-        // 直接移除指定session
-        if crate::service::SESSION_CACHE.remove(session_id).is_some() {
-            info!("🗑️ [chat] 移除旧session，确保全新开始: session_id={}, project_id={}", session_id, project_id);
+/// 清理指定项目的 session 数据
+async fn cleanup_sessions_for_project(project_id: &str, session_id: &Option<String>) {
+    if let Some(session_id) = session_id {
+        // 移除指定的 session
+        if SESSION_CACHE.remove(session_id).is_some() {
+            info!("🗑️ [chat] 移除旧session: session_id={}, project_id={}", session_id, project_id);
         }
     } else {
-        // 如果没有指定session_id，清空该项目的所有session
+        // 移除该项目的所有 session
         let mut cleared_sessions = 0;
-        for session_entry in state.sessions.iter() {
+        for session_entry in SESSION_CACHE.iter() {
             let current_session_id = session_entry.key();
-            let session_info = session_entry.value();
+            let session_data = session_entry.value();
 
-            if let Some(session_project_id) = &session_info.project_id {
-                if session_project_id == &project_id {
-                    if crate::service::SESSION_CACHE.remove(current_session_id).is_some() {
-                        cleared_sessions += 1;
-                    }
+            // 检查这个 session 是否属于该项目
+            if PROJECT_SESSION_MAP.get(project_id)
+                .map(|sid| sid.as_str() == current_session_id.as_str())
+                .unwrap_or(false) {
+                if SESSION_CACHE.remove(current_session_id).is_some() {
+                    cleared_sessions += 1;
                 }
             }
         }
@@ -236,67 +207,218 @@ pub async fn handle_chat(
             info!("🗑️ [chat] 移除了项目的所有旧session: project_id={}, cleared_count={}", project_id, cleared_sessions);
         }
     }
+}
 
-    // 获取项目工作目录
-    let project_workspace = get_project_workspace(&project_id).await?;
 
-    // 根据模型提供商配置自动选择 agent 类型
-    let agent_type = AgentType::from_model_provider(request.model_provider.as_ref());
+/// 检查或创建容器，并返回容器服务 URL
+async fn ensure_container_exists(project_id: &str, request: &ChatRequest) -> Result<(String, String)> {
+    // 检查容器是否已存在
+    if !PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
+        info!("🏗️ [FORWARD] 容器不存在，创建新容器: project_id={}", project_id);
 
-    // 确定或生成 request_id
-    let request_id = request
-        .request_id
-        .clone()
-        .unwrap_or_else(generate_request_id);
+        // 构建基本的 ChatPrompt（只包含必要信息用于创建容器）
+        let chat_prompt = ChatPromptBuilder::default()
+            .project_id(project_id.to_string())
+            .project_path(get_project_workspace(project_id).await?)
+            .session_id(request.session_id.clone())
+            .prompt(request.prompt.clone())
+            .attachments(request.attachments.clone())
+            .data_source_attachments(request.data_source_attachments.clone())
+            .agent_type(AgentType::from_model_provider(request.model_provider.as_ref()))
+            .request_id(request.request_id.clone().unwrap_or_else(generate_request_id))
+            .build()
+            .map_err(|e| {
+                error!("❌ [FORWARD] 构建 ChatPrompt 失败: {}", e);
+                crate::model::AppError::internal_server_error(&format!("构建 ChatPrompt 失败: {}", e))
+            })?;
 
-    let chat_prompt = ChatPromptBuilder::default()
-        .project_id(project_id.clone())
-        .project_path(project_workspace)
-        .session_id(request.session_id.clone())
-        .prompt(request.prompt.clone())
-        .attachments(request.attachments.clone())
-        .data_source_attachments(request.data_source_attachments.clone())
-        .agent_type(agent_type)
-        .request_id(request_id.clone())
-        .build()
-        .map_err(|e| anyhow::anyhow!(e))?;
+        // 创建容器
+        create_container_for_request(&chat_prompt, request.model_provider.clone()).await?;
+    }
 
-    let (local_task_request, chat_prompt_rx) =
-        LocalSetAgentRequest::new(chat_prompt, request.model_provider.clone());
-    state.local_task_sender.send(local_task_request)?;
+    // 获取容器服务 URL
+    if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
+        let docker_manager = std::sync::Arc::new(
+            docker_manager::DockerManager::with_default_config().await
+                .map_err(|e| {
+                    error!("❌ [FORWARD] 创建 DockerManager 失败: {}", e);
+                    crate::model::AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
+                })?
+        );
 
-    let result = match chat_prompt_rx.await {
-        Ok(chat_prompt_response) => {
-            // 检查响应中是否有错误
-            if let Some(error_msg) = chat_prompt_response.error {
-                error!(
-                    "❌ Agent 处理失败: project_id={}, session_id={}, error={}",
-                    chat_prompt_response.project_id, chat_prompt_response.session_id, error_msg
-                );
-                crate::model::HttpResult::error(
-                    "PROMPT001",
-                    &error_msg,
-                )
-            } else {
-                info!(
-                    "✅ 收到 agent 执行结果: project_id={}, session_id={}",
-                    chat_prompt_response.project_id, chat_prompt_response.session_id,
-                );
-                crate::model::HttpResult::success(ChatResponse {
-                    project_id: chat_prompt_response.project_id,
-                    session_id: chat_prompt_response.session_id,
-                    error: None,
-                    request_id: request.request_id.clone(),
-                })
-            }
+        // 获取容器 IP 地址
+        let container_info = docker_manager.get_container_info(project_id);
+
+        if let Some(container_info) = container_info {
+            let server_url = docker_container_agent::get_container_ip(&docker_manager, &container_info.container_id, container_info.assigned_port).await
+                .map_err(|e| {
+                    error!("❌ [FORWARD] 获取容器 IP 失败: {}", e);
+                    crate::model::AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
+                })?;
+
+            info!("✅ [FORWARD] 获取容器服务 URL: {}", server_url);
+            Ok((server_url, project_id.to_string()))
+        } else {
+            Err(crate::model::AppError::internal_server_error("未找到容器信息").into())
         }
-        Err(e) => {
-            error!("❌ 收到 agent 执行结果失败: {}", e);
-            crate::model::HttpResult::error(
-                "LOCAL001",
-                &format!("Local task sender send error: {}", e),
-            )
-        }
+    } else {
+        Err(crate::model::AppError::internal_server_error("容器创建失败").into())
+    }
+}
+
+/// 为请求创建容器
+async fn create_container_for_request(
+    chat_prompt: &ChatPrompt,
+    model_provider: Option<ModelProviderConfig>,
+) -> Result<()> {
+    let project_id = &chat_prompt.project_id;
+    info!("🏗️ [FORWARD] 开始为请求创建容器: project_id={}", project_id);
+
+    // 使用 docker_container_agent 创建容器
+    let docker_manager = std::sync::Arc::new(
+        docker_manager::DockerManager::with_default_config().await
+            .map_err(|e| {
+                error!("❌ [FORWARD] 创建 DockerManager 失败: project_id={}, error={}", project_id, e);
+                e
+            })?
+    );
+
+    let connection_info = docker_container_agent::start_docker_container_agent_service(
+        chat_prompt.clone(),
+        model_provider.clone(),
+        docker_manager,
+    ).await.map_err(|e| {
+        error!("❌ [FORWARD] 创建容器失败: project_id={}, error={}", project_id, e);
+        e
+    })?;
+
+    info!("✅ [FORWARD] 容器创建成功: project_id={}, session_id={}",
+          project_id, connection_info.session_id);
+
+    // 创建生命周期守卫并存储到 MAP 中
+    let project_and_agent_info = ProjectAndAgentInfo {
+        project_id: project_id.clone(),
+        session_id: connection_info.session_id.clone(),
+        prompt_tx: connection_info.prompt_tx.clone(),
+        cancel_tx: connection_info.cancel_tx.clone(),
+        model_provider,
+        request_id: chat_prompt.request_id.clone(),
+        status: AgentStatus::Idle,
+        last_activity: chrono::Utc::now(),
+        created_at: chrono::Utc::now(),
+        lifecycle_guard: connection_info.stop_handle
+            .ok_or_else(|| anyhow::anyhow!("缺少生命周期守卫"))?
+            .as_ref().clone(),
     };
-    Ok(result)
+
+    // 存储到全局 MAP
+    PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info);
+
+    // 建立 project_id -> session_id 映射
+    let session_id_str = connection_info.session_id.to_string();
+    let cleared_old = crate::service::session_cache::ensure_project_session(project_id, &session_id_str).await;
+    if cleared_old > 0 {
+        info!("🧹 Project session 映射更新，已清理旧消息: project_id={}, cleared_count={}",
+              project_id, cleared_old);
+    }
+
+    info!("✅ [FORWARD] 容器创建完成并已注册: project_id={}", project_id);
+    Ok(())
+}
+
+
+/// 转发原始 HTTP 请求到容器内的 agent_runner
+async fn forward_request_to_container(request: &ChatRequest) -> Result<crate::model::HttpResult<ChatResponse>, crate::model::AppError> {
+    let project_id = request.project_id.as_deref().unwrap_or_else(|| "default");
+    let session_id = request.session_id.as_deref().unwrap_or_else(|| "default");
+
+    info!("📤 [FORWARD] 转发原始请求到容器: project_id={}, session_id={}", project_id, session_id);
+
+    // 检查或创建容器
+    let (server_url, project_id_final) = ensure_container_exists(&project_id, request).await?;
+
+    // 直接转发原始 JSON 请求到容器内的 agent_runner
+    let client = Client::new();
+    let chat_url = format!("{}/chat", server_url);
+
+    let response = client
+        .post(&chat_url)
+        .json(request)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("❌ [FORWARD] 转发请求失败: {}", e);
+            crate::model::AppError::internal_server_error(&format!("转发请求到容器失败: {}", e))
+        })?;
+
+    if response.status().is_success() {
+        // 直接返回容器内的响应
+        let container_response: crate::model::ChatResponse = response.json().await
+            .map_err(|e| {
+                error!("❌ [FORWARD] 解析容器响应失败: {}", e);
+                crate::model::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
+            })?;
+
+        info!("✅ [FORWARD] 容器响应成功: session_id={}", container_response.session_id);
+        Ok(crate::model::HttpResult::success(container_response))
+    } else {
+        let error_text = format!("容器返回错误状态: {}", response.status());
+        error!("❌ [FORWARD] {}", error_text);
+        Ok(crate::model::HttpResult::error(
+            "CONTAINER_ERROR",
+            &error_text,
+        ))
+    }
+}
+
+/// 构建 Prompt 请求（从 acp_agent.rs 移过来）
+async fn build_prompt_to_acp_agent(
+    prompt: ChatPrompt,
+    session_id: agent_client_protocol::SessionId,
+) -> Result<agent_client_protocol::PromptRequest> {
+    use agent_client_protocol::{ContentBlock, TextContent};
+
+    // 构建最终提示词（包含系统提示词、用户输入和数据源信息）
+    let final_prompt = if prompt.data_source_attachments.is_empty() {
+        PromptBuilder::new().build(&prompt.prompt)
+    } else {
+        PromptBuilder::new()
+            .build_with_data_sources(&prompt.prompt, &prompt.data_source_attachments)
+    };
+
+    // 创建文本内容块
+    let text_block = ContentBlock::Text(TextContent {
+        text: final_prompt,
+        annotations: None,
+        meta: None,
+    });
+
+    // 创建内容块列表，以文本开始
+    let mut content_blocks = vec![text_block];
+
+    // 如果有附件，转换为内容块
+    if !prompt.attachments.is_empty() {
+        let attachment_blocks = crate::utils::ContentBuilder::attachments_to_content_blocks(
+            &prompt.attachments,
+            &prompt.project_path,
+        )
+        .await?;
+
+        content_blocks.extend(attachment_blocks);
+    }
+
+    // 将 request_id 放入 meta 字段
+    let meta = if let Some(request_id) = prompt.request_id {
+        Some(serde_json::json!({
+            "request_id": request_id
+        }))
+    } else {
+        None
+    };
+
+    Ok(agent_client_protocol::PromptRequest {
+        session_id,
+        prompt: content_blocks,
+        meta,
+    })
 }
