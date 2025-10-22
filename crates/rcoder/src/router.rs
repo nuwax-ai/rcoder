@@ -42,10 +42,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let api_routes = Router::new()
         .route("/health", get(handler::health_check))
         .route("/chat", post(handler::handle_chat))
-        .route(
-            "/agent/progress/{session_id}",
-            get(handler::agent_session_notification),
-        )
+        // 移除 axum 的 SSE 处理，改为通过 Pingora 直接透明代理
+        // .route(
+        //     "/agent/progress/{session_id}",
+        //     get(handler::agent_session_notification),
+        // )
         .route("/agent/session/cancel", post(handler::agent_session_cancel))
         .route("/agent/stop", post(handler::agent_stop))
         .route("/agent/status/{project_id}", get(handler::agent_status))
@@ -95,7 +96,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::ChatRequest,
             shared_types::ChatResponse,
             handler::StopAgentResponse,
-            crate::handler::SessionUpdateEvent,
+            // 移除 SessionUpdateEvent，因为现在使用 ProxyRedirectResponse
+            handler::ProxyRedirectResponse,
             // 模型配置相关结构体
             shared_types::ModelProviderConfig,
             shared_types::ModelApiProtocol,
