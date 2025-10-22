@@ -9,9 +9,7 @@ pub enum AgentType {
     /// OpenAI Codex 代理
     Codex,
     /// Claude Code 代理
-    Claude,
-    /// Docker 容器代理
-    Docker,
+    Claude
 }
 
 impl Default for AgentType {
@@ -25,7 +23,6 @@ impl std::fmt::Display for AgentType {
         match self {
             AgentType::Codex => write!(f, "codex"),
             AgentType::Claude => write!(f, "claude"),
-            AgentType::Docker => write!(f, "docker"),
         }
     }
 }
@@ -37,8 +34,7 @@ impl std::str::FromStr for AgentType {
         match s.to_lowercase().as_str() {
             "codex" => Ok(AgentType::Codex),
             "claude" => Ok(AgentType::Claude),
-            "docker" => Ok(AgentType::Docker),
-            _ => Err(format!("Invalid agent type: {}. Must be one of: codex, claude, docker", s)),
+            _ => Err(format!("Invalid agent type: {}. Must be one of: codex, claude", s)),
         }
     }
 }

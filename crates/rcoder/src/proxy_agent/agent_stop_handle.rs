@@ -270,6 +270,7 @@ impl AgentLifecycleGuard {
             let agent_name = match self.inner.agent_type {
                 AgentType::Claude => "Claude",
                 AgentType::Codex => "Codex",
+                AgentType::Docker => "Docker",
             };
             info!(
                 "[{}] 发送取消信号: {} (session: {})",
@@ -315,6 +316,7 @@ impl Drop for AgentLifecycleGuard {
             let agent_name = match self.inner.agent_type {
                 AgentType::Claude => "Claude",
                 AgentType::Codex => "Codex",
+                AgentType::Docker => "Docker",
             };
             info!(
                 "[{}] AgentLifecycleGuard被drop，清理资源: {}",
