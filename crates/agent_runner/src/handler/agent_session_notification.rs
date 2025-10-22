@@ -2,7 +2,7 @@
 //!
 //! 通过SSE协议将UnifiedSessionMessage消息实时推送给前端
 
-use crate::{AppError, model::HttpResult, model::UnifiedSessionMessage, service::SESSION_CACHE};
+use crate::{AppError, HttpResult, UnifiedSessionMessage, service::SESSION_CACHE};
 use axum::{
     extract::Path,
     response::sse::{Event, Sse},

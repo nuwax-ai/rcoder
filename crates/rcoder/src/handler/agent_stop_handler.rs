@@ -2,7 +2,7 @@
 //!
 //! 转发停止请求到容器内的 agent_runner 服务
 
-use axum::extract::{Query, State};
+use axum::extract::{Query, State, Path};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tracing::{debug, error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    model::{AgentStatusResponse, AppError, HttpResult},
+    AgentStatusResponse, AppError, HttpResult,
     proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent},
     router::AppState,
 };
@@ -24,7 +24,7 @@ pub struct StopAgentQuery {
 }
 
 /// 停止Agent响应
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StopAgentResponse {
     /// 是否成功停止
     pub success: bool,
@@ -88,15 +88,17 @@ async fn forward_stop_request_to_container(
 
         Ok(HttpResult::success(container_response))
     } else {
+        let status = response.status();
+        let body = response.text().await;
         error!(
             "❌ [STOP_FORWARD] 容器停止请求失败: status={}, body={:?}",
-            response.status(),
-            response.text().await
+            status,
+            body
         );
 
         Ok(HttpResult::error(
             "STOP001",
-            &format!("容器停止请求失败: {}", response.status()),
+            &format!("容器停止请求失败: {}", status),
         ))
     }
 }
@@ -108,7 +110,7 @@ async fn ensure_container_exists_for_stop(project_id: &str) -> Result<(String, S
         info!("🏗️ [STOP_FORWARD] 容器不存在，创建新容器: project_id={}", project_id);
 
         // 使用默认配置创建容器
-        let chat_prompt = crate::model::ChatPromptBuilder::default()
+        let chat_prompt = shared_types::ChatPromptBuilder::default()
             .project_id(project_id.to_string())
             .session_id(format!("stop_session_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)))
             .prompt("stop_request".to_string())
@@ -153,7 +155,7 @@ async fn ensure_container_exists_for_stop(project_id: &str) -> Result<(String, S
 
 /// 为停止请求创建容器
 async fn create_container_for_stop(
-    chat_prompt: &crate::model::ChatPrompt,
+    chat_prompt: &shared_types::ChatPrompt,
     _model_provider: Option<shared_types::ModelProviderConfig>,
 ) -> Result<(), AppError> {
     let project_id = &chat_prompt.project_id;
@@ -181,19 +183,16 @@ async fn create_container_for_stop(
           project_id, connection_info.session_id);
 
     // 创建生命周期守卫并存储到 MAP 中
-    let project_and_agent_info = crate::model::ProjectAndAgentInfo {
+    let project_and_agent_info = shared_types::ProjectAndAgentInfo {
         project_id: project_id.clone(),
         session_id: connection_info.session_id.clone(),
         prompt_tx: connection_info.prompt_tx.clone(),
         cancel_tx: connection_info.cancel_tx.clone(),
         model_provider: None,
         request_id: chat_prompt.request_id.clone(),
-        status: crate::model::AgentStatus::Idle,
+        status: shared_types::AgentStatus::Idle,
         last_activity: chrono::Utc::now(),
         created_at: chrono::Utc::now(),
-        lifecycle_guard: connection_info.stop_handle
-            .ok_or_else(|| AppError::internal_server_error("缺少生命周期守卫"))?
-            .as_ref().clone(),
     };
 
     // 存储到全局 MAP
@@ -383,7 +382,7 @@ pub async fn agent_status(
     info!("📊 [AGENT_STATUS] 收到查询Agent状态请求: project_id={}", project_id);
 
     // 从MAP中获取Agent信息
-    if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
+    if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
         let response = AgentStatusResponse {
             project_id: agent_info.project_id.clone(),
             is_alive: true,

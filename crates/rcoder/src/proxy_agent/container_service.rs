@@ -8,9 +8,10 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
+use derive_builder::Builder;
 use docker_manager::{DockerContainerInfo, DockerManager};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -18,20 +19,27 @@ use chrono::{DateTime, Utc};
 
 use super::{container_monitor::GLOBAL_CONTAINER_MONITOR, port_manager::GLOBAL_PORT_MANAGER};
 
+// 默认值函数
+fn default_idle_timeout() -> u64 { 1800 }
+fn default_cleanup_interval() -> u64 { 300 }
+fn default_max_lifetime() -> u64 { 86400 }
+fn default_enable_cleanup() -> bool { true }
+
 /// 容器自动清理配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize,Builder)]
+#[builder(default, setter(into))]
 pub struct ContainerCleanupConfig {
     /// 空闲超时时间（默认30分钟）
-    #[serde(default = "1800")]
+    #[serde(default = "default_idle_timeout")]
     pub idle_timeout_seconds: u64,
     /// 清理检查间隔（默认5分钟）
-    #[serde(default = "300")]
+    #[serde(default = "default_cleanup_interval")]
     pub cleanup_check_interval_seconds: u64,
     /// 最大容器存活时间（默认24小时）
-    #[serde(default = "86400")]
+    #[serde(default = "default_max_lifetime")]
     pub max_container_lifetime_seconds: u64,
     /// 是否启用自动清理
-    #[serde(default = "true")]
+    #[serde(default = "default_enable_cleanup")]
     pub enable_auto_cleanup: bool,
 }
 
@@ -179,7 +187,7 @@ impl ContainerService {
 
             // 检查是否超过最大存活时间
             let now = Utc::now();
-            let container_created_utc = container_info.created_at.with_timezone(&chrono::FixedOffset::east_opt(0, 0)).unwrap_or_else(|| container_info.created_at);
+            let container_created_utc: DateTime<Utc> = container_info.created_at.into();
 
             if now.signed_duration_since(container_created_utc).num_seconds() > service.cleanup_config.max_container_lifetime_seconds as i64 {
                 info!("⏰ 容器超过最大存活时间，将清理: project_id={}, age_seconds={}",
@@ -360,7 +368,7 @@ impl ContainerService {
             .collect();
 
         for project_id in containers {
-            if let Err(e) = self.stop_container_for_project(project_id).await {
+            if let Err(e) = self.stop_container_for_project(&project_id).await {
                 error!("清理容器失败 {}: {}", project_id, e);
             }
         }
@@ -449,39 +457,39 @@ impl ContainerService {
         stats.total_count = containers.len();
         stats
     }
+}
 
-    /// 容器服务统计信息
-    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-    pub struct ContainerServiceStats {
-        /// 总容器数
-        pub total_count: usize,
-        /// 创建中的容器数
-        pub creating_count: usize,
-        /// 运行中的容器数
-        pub running_count: usize,
-        /// 停止中的容器数
-        pub stopping_count: usize,
-        /// 已停止的容器数
-        pub stopped_count: usize,
-        /// 错误的容器数
-        pub error_count: usize,
-    }
+/// 容器服务统计信息
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContainerServiceStats {
+    /// 总容器数
+    pub total_count: usize,
+    /// 创建中的容器数
+    pub creating_count: usize,
+    /// 运行中的容器数
+    pub running_count: usize,
+    /// 停止中的容器数
+    pub stopping_count: usize,
+    /// 已停止的容器数
+    pub stopped_count: usize,
+    /// 错误的容器数
+    pub error_count: usize,
+}
 
-    /// 全局容器服务实例
-    pub static GLOBAL_CONTAINER_SERVICE: std::sync::LazyLock<tokio::sync::RwLock<Option<Arc<ContainerService>>>> =
-        std::sync::LazyLock::new(|| tokio::sync::RwLock::new(None));
+/// 全局容器服务实例
+pub static GLOBAL_CONTAINER_SERVICE: LazyLock<tokio::sync::RwLock<Option<Arc<ContainerService>>>> =
+    LazyLock::new(|| tokio::sync::RwLock::new(None));
 
-    /// 初始化全局容器服务
-    pub async fn init_global_container_service() -> Result<()> {
-        let service = Arc::new(ContainerService::new().await?);
-        let mut global_service = GLOBAL_CONTAINER_SERVICE.write().await;
-        *global_service = Some(service);
-        info!("全局容器服务已初始化");
-        Ok(())
-    }
+/// 初始化全局容器服务
+pub async fn init_global_container_service() -> Result<()> {
+    let service = Arc::new(ContainerService::new().await?);
+    let mut global_service = GLOBAL_CONTAINER_SERVICE.write().await;
+    *global_service = Some(service);
+    info!("全局容器服务已初始化");
+    Ok(())
+}
 
-    /// 获取全局容器服务
-    pub async fn get_global_container_service() -> Option<Arc<ContainerService>> {
-        GLOBAL_CONTAINER_SERVICE.read().await.clone()
-    }
+/// 获取全局容器服务
+pub async fn get_global_container_service() -> Option<Arc<ContainerService>> {
+    GLOBAL_CONTAINER_SERVICE.read().await.clone()
 }

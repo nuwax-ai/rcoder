@@ -26,9 +26,6 @@ pub trait AcpAgentService {
 
     /// 获取代理类型名称
     fn agent_type_name(&self) -> &'static str;
-
-    /// 停止agent服务（立即停止）
-    async fn stop_agent_service(&self, agent_info: &ProjectAndAgentInfo) -> Result<()>;
 }
 
 /// 为 AgentType 实现 AcpAgentService trait
@@ -60,12 +57,4 @@ impl AcpAgentService for crate::model::AgentType {
         }
     }
 
-    async fn stop_agent_service(&self, agent_info: &ProjectAndAgentInfo) -> Result<()> {
-        info!(
-            "停止[{}] agent服务，项目ID: {}",
-            self.agent_type_name(),
-            agent_info.project_id
-        );
-        agent_info.lifecycle_guard.stop_async().await
-    }
 }

@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::model::AgentType;
+use crate::AgentType;
 use agent_client_protocol::{ClientSideConnection, SessionId};
 
 /// Agent生命周期守卫
@@ -270,7 +270,6 @@ impl AgentLifecycleGuard {
             let agent_name = match self.inner.agent_type {
                 AgentType::Claude => "Claude",
                 AgentType::Codex => "Codex",
-                AgentType::Docker => "Docker",
             };
             info!(
                 "[{}] 发送取消信号: {} (session: {})",
@@ -316,7 +315,6 @@ impl Drop for AgentLifecycleGuard {
             let agent_name = match self.inner.agent_type {
                 AgentType::Claude => "Claude",
                 AgentType::Codex => "Codex",
-                AgentType::Docker => "Docker",
             };
             info!(
                 "[{}] AgentLifecycleGuard被drop，清理资源: {}",

@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 use crate::{
-    model::{AgentStatus, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
+    AgentStatus, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo,
 };
 
 use anyhow::Result;

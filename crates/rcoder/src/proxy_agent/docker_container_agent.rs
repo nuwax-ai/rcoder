@@ -4,7 +4,7 @@
 //! 实现每个项目对应一个独立的 agent 容器
 
 use crate::{
-    model::ChatPrompt,
+    ChatPrompt,
     proxy_agent::AcpConnectionInfo,
     CancelNotificationRequest,
 };
@@ -375,7 +375,7 @@ async fn handle_cancel_request(
     }
 
     // 发送响应
-    if let Err(_) = cancel_request.tx.send(crate::model::CancelNotificationResponse {
+    if let Err(_) = cancel_request.tx.send(shared_types::CancelNotificationResponse {
         success: true,
         message: Some("取消成功".to_string()),
     }) {

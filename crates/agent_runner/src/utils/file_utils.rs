@@ -9,7 +9,7 @@ use tokio::fs;
 use tracing::warn;
 
 use super::ContentBuilder;
-use crate::model::{Attachment, AttachmentError, AttachmentSource};
+use shared_types::{Attachment, AttachmentError, AttachmentSource};
 
 /// 文件处理配置
 pub struct FileConfig {

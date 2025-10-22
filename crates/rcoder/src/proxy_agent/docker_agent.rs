@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    model::{AgentStatus, AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
+    AgentStatus, AgentType, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo,
     proxy_agent::agent_stop_handle::AgentLifecycleGuard,
 };
 

@@ -35,25 +35,6 @@ fn check_model_config_changed(
     }
 }
 
-/// 停止现有的Agent服务
-async fn stop_existing_agent_service(
-    project_id: &str,
-    agent_info: &ProjectAndAgentInfo,
-) -> Result<()> {
-    info!("开始停止现有Agent服务，项目ID: {}", project_id);
-
-    // 从agent_info获取agent_type
-    let agent_type =
-        crate::model::AgentType::from_model_provider(agent_info.model_provider.as_ref());
-
-    if let Err(e) = agent_type.stop_agent_service(agent_info).await {
-        error!("停止Agent服务失败，项目ID: {}, 错误: {}", project_id, e);
-        return Err(e);
-    }
-
-    info!("成功停止Agent服务，项目ID: {}", project_id);
-    Ok(())
-}
 
 /// 创建新的Agent服务
 async fn create_new_agent_service(
@@ -91,7 +72,6 @@ async fn create_new_agent_service(
                 status: AgentStatus::Idle,
                 last_activity: Utc::now(),
                 created_at: Utc::now(),
-                lifecycle_guard,
             };
 
             // 记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
@@ -100,15 +80,18 @@ async fn create_new_agent_service(
             let session_id_str = conn_info.session_id.to_string();
 
             // 建立 project_id -> session_id 映射，确保 cleanup 任务能正确识别活跃 session
-            let cleared_old = crate::service::ensure_project_session(&project_id, &session_id_str).await;
+            let cleared_old =
+                crate::service::ensure_project_session(&project_id, &session_id_str).await;
             if cleared_old > 0 {
                 info!(
                     "🧹 Project session 映射更新，已清理旧消息: project_id={}, cleared_count={}",
-                    project_id,
-                    cleared_old
+                    project_id, cleared_old
                 );
             } else {
-                info!("🔗 Project session 映射已同步: project_id={}, session_id={}", project_id, session_id_str);
+                info!(
+                    "🔗 Project session 映射已同步: project_id={}, session_id={}",
+                    project_id, session_id_str
+                );
             }
 
             // 再次确保当前 session 的历史消息被清空，避免新的 SSE 连接收到旧记录
@@ -120,33 +103,37 @@ async fn create_new_agent_service(
                 );
             }
 
-            let response = match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {
-                Ok(prompt_request) => {
-                    if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
-                        error!("发送prompt请求失败: {:?}", e);
+            let response =
+                match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {
+                    Ok(prompt_request) => {
+                        if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
+                            error!("发送prompt请求失败: {:?}", e);
+                            ChatPromptResponse {
+                                project_id: project_id.clone(),
+                                session_id: conn_info.session_id.to_string(),
+                                error: Some(format!("发送prompt请求失败: {:?}", e)),
+                            }
+                        } else {
+                            info!("Prompt 请求已发送，项目ID: {}", project_id);
+                            ChatPromptResponse {
+                                project_id: project_id.clone(),
+                                session_id: conn_info.session_id.to_string(),
+                                error: None,
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "❌ 构建prompt请求失败，项目ID: {}，错误详情: {:?}",
+                            project_id, e
+                        );
                         ChatPromptResponse {
                             project_id: project_id.clone(),
                             session_id: conn_info.session_id.to_string(),
-                            error: Some(format!("发送prompt请求失败: {:?}", e)),
-                        }
-                    } else {
-                        info!("Prompt 请求已发送，项目ID: {}", project_id);
-                        ChatPromptResponse {
-                            project_id: project_id.clone(),
-                            session_id: conn_info.session_id.to_string(),
-                            error: None,
+                            error: Some(format!("构建prompt请求失败: {:?}", e)),
                         }
                     }
-                }
-                Err(e) => {
-                    error!("❌ 构建prompt请求失败，项目ID: {}，错误详情: {:?}", project_id, e);
-                    ChatPromptResponse {
-                        project_id: project_id.clone(),
-                        session_id: conn_info.session_id.to_string(),
-                        error: Some(format!("构建prompt请求失败: {:?}", e)),
-                    }
-                }
-            };
+                };
 
             // 发送回执消息
             if let Err(e) = request.chat_prompt_tx.send(response) {
@@ -155,16 +142,19 @@ async fn create_new_agent_service(
         }
         Err(e) => {
             error!("启动ACP Agent服务失败，项目ID: {}, 错误: {}", project_id, e);
-            
+
             // 发送失败回执给前端
             let error_response = ChatPromptResponse {
                 project_id: project_id.clone(),
                 session_id: "".to_string(), // 启动失败时没有 session_id
                 error: Some(format!("启动ACP Agent服务失败: {}", e)),
             };
-            
+
             if let Err(send_err) = request.chat_prompt_tx.send(error_response) {
-                error!("发送启动失败回执失败，项目ID: {}, 错误: {:?}", project_id, send_err);
+                error!(
+                    "发送启动失败回执失败，项目ID: {}, 错误: {:?}",
+                    project_id, send_err
+                );
             }
         }
     }
@@ -211,7 +201,10 @@ pub async fn agent_worker(
 ) -> Result<()> {
     info!("🚀 agent_worker 启动，开始监听请求...");
     while let Some(request) = request_rx.recv().await {
-        info!("📨 agent_worker 接收到新请求，project_id: {}", request.chat_prompt.project_id);
+        info!(
+            "📨 agent_worker 接收到新请求，project_id: {}",
+            request.chat_prompt.project_id
+        );
         let mut chat_prompt = request.chat_prompt.clone();
 
         let original_path = chat_prompt.project_path;
@@ -243,16 +236,22 @@ pub async fn agent_worker(
             }
         }
 
-        info!("🔍 处理完路径，准备查找Agent，project_id: {}", request.chat_prompt.project_id);
+        info!(
+            "🔍 处理完路径，准备查找Agent，project_id: {}",
+            request.chat_prompt.project_id
+        );
 
         // 检查 project_id 有对应的agent 服务,没有则创建
         let project_id = request.chat_prompt.project_id.clone();
         let project_and_agent_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
-        
+
         if project_and_agent_info.is_some() {
             info!("✅ 找到现有Agent，project_id: {}", project_id);
         } else {
-            info!("❌ 未找到现有Agent，将创建新Agent，project_id: {}", project_id);
+            info!(
+                "❌ 未找到现有Agent，将创建新Agent，project_id: {}",
+                project_id
+            );
         }
 
         // 检查是否需要因模型配置变化而重启Agent服务
@@ -266,12 +265,12 @@ pub async fn agent_worker(
             Some(agent_info) if !need_restart_agent => {
                 // 模型配置未变化，复用现有Agent服务
                 info!("复用现有Agent服务，项目ID: {}", project_id);
-                
+
                 let session_id = agent_info.session_id.clone();
                 let prompt_tx = agent_info.prompt_tx.clone();
-                
+
                 debug!("复用Agent - session_id: {}, prompt_tx可用", session_id.0);
-                
+
                 // 注意：不在这里更新 request_id，因为 get_mut 会需要写锁，
                 // 可能与正在执行的 Prompt 处理任务产生锁冲突。
                 // 直接将 request_id 包含在 ChatPrompt 中，在构建 PromptRequest 时使用。
@@ -280,7 +279,10 @@ pub async fn agent_worker(
                 debug!("开始构建Prompt请求，项目ID: {}", project_id);
                 match build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await {
                     Ok(prompt_request) => {
-                        info!("Prompt请求构建成功，准备发送到channel，项目ID: {}", project_id);
+                        info!(
+                            "Prompt请求构建成功，准备发送到channel，项目ID: {}",
+                            project_id
+                        );
                         if let Err(e) = prompt_tx.send(prompt_request) {
                             error!("❌ 发送Prompt请求到channel失败: {:?}", e);
                         } else {
@@ -308,27 +310,15 @@ pub async fn agent_worker(
                 // 模型配置发生变化，需要重启Agent服务
                 info!("检测到模型配置变化，重启Agent服务，项目ID: {}", project_id);
 
-                // ⚠️ 死锁修复：先克隆需要的数据，然后释放读锁，再执行写操作
-                // 1. 克隆 lifecycle_guard（用于停止 agent）
-                let lifecycle_guard = agent_info.lifecycle_guard.clone();
-                let agent_type = crate::model::AgentType::from_model_provider(agent_info.model_provider.as_ref());
-                
-                // 2. 显式释放读锁（agent_info 是 DashMap 的 Ref，持有读锁）
-                //    必须在调用 stop 和 remove 之前释放，否则会死锁
-                drop(agent_info);
-                
-                // 3. 现在可以安全地执行 stop（不持有 MAP 的读锁）
-                info!("[{}] 停止旧 Agent 服务: {}", agent_type.agent_type_name(), project_id);
-                if let Err(e) = lifecycle_guard.stop_async().await {
-                    error!("停止 Agent 服务失败: {}", e);
-                }
-
                 // 4. 释放读锁后，可以安全地获取写锁并 remove
                 PROJECT_AND_AGENT_INFO_MAP.remove(&project_id);
-                
+
                 // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
                 crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(&project_id);
-                debug!("🧼 [acp_agent] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}", project_id);
+                debug!(
+                    "🧼 [acp_agent] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
+                    project_id
+                );
 
                 // 创建新的Agent服务（执行与None分支相同的逻辑）
                 create_new_agent_service(request, chat_prompt, project_id).await;
@@ -379,7 +369,10 @@ pub async fn build_prompt_to_acp_agent(
 
     // 将 request_id 放入 meta 字段，以便 channel_utils 可以提取并更新到 MAP
     let meta = if let Some(request_id) = prompt.request_id {
-        debug!("🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta", request_id);
+        debug!(
+            "🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta",
+            request_id
+        );
         Some(serde_json::json!({
             "request_id": request_id
         }))

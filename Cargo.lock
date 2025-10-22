@@ -3172,6 +3172,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4474,6 +4480,7 @@ dependencies = [
  "docker_manager",
  "futures 0.3.31",
  "futures-util",
+ "md5",
  "nuwax_parser",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -4481,6 +4488,7 @@ dependencies = [
  "path-clean",
  "pingora-proxy 0.1.0",
  "piper",
+ "rand 0.8.5",
  "reqwest 0.11.27",
  "ringbuf",
  "serde",
@@ -5296,6 +5304,8 @@ dependencies = [
  "axum-tracing-opentelemetry",
  "base64 0.22.1",
  "chrono",
+ "codex-common",
+ "codex-core",
  "derive_builder",
  "futures 0.3.31",
  "opentelemetry",

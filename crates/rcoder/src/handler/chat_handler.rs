@@ -13,10 +13,10 @@ use uuid::Uuid;
 use reqwest::Client;
 
 use crate::proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent};
-use crate::proxy_agent::container_service::ContainerService;
 use crate::service::session_cache::{SESSION_CACHE, PROJECT_SESSION_MAP};
-use crate::{model::*, router::AppState};
+use crate::{*, router::AppState};
 use crate::utils::prompt_builder::PromptBuilder;
+use shared_types::{ChatPromptBuilder, AgentType};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -166,7 +166,7 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
 pub async fn handle_chat(
     State(_state): State<Arc<AppState>>,
     Json(request): Json<ChatRequest>,
-) -> Result<crate::model::HttpResult<ChatResponse>, crate::model::AppError> {
+) -> Result<HttpResult<ChatResponse>, AppError> {
     info!(
         "🚀 [FORWARD] 开始转发 /chat 请求: project_id={:?}, session_id={:?}",
         request.project_id, request.session_id
@@ -217,7 +217,7 @@ async fn ensure_container_exists(project_id: &str, request: &ChatRequest) -> Res
         info!("🏗️ [FORWARD] 容器不存在，创建新容器: project_id={}", project_id);
 
         // 构建基本的 ChatPrompt（只包含必要信息用于创建容器）
-        let chat_prompt = ChatPromptBuilder::default()
+        let chat_prompt = shared_types::ChatPromptBuilder::default()
             .project_id(project_id.to_string())
             .project_path(get_project_workspace(project_id).await?)
             .session_id(request.session_id.clone())
@@ -229,7 +229,7 @@ async fn ensure_container_exists(project_id: &str, request: &ChatRequest) -> Res
             .build()
             .map_err(|e| {
                 error!("❌ [FORWARD] 构建 ChatPrompt 失败: {}", e);
-                crate::model::AppError::internal_server_error(&format!("构建 ChatPrompt 失败: {}", e))
+                crate::AppError::internal_server_error(&format!("构建 ChatPrompt 失败: {}", e))
             })?;
 
         // 创建容器
@@ -242,7 +242,7 @@ async fn ensure_container_exists(project_id: &str, request: &ChatRequest) -> Res
             docker_manager::DockerManager::with_default_config().await
                 .map_err(|e| {
                     error!("❌ [FORWARD] 创建 DockerManager 失败: {}", e);
-                    crate::model::AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
+                    crate::AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
                 })?
         );
 
@@ -253,16 +253,16 @@ async fn ensure_container_exists(project_id: &str, request: &ChatRequest) -> Res
             let server_url = docker_container_agent::get_container_ip(&docker_manager, &container_info.container_id, container_info.assigned_port).await
                 .map_err(|e| {
                     error!("❌ [FORWARD] 获取容器 IP 失败: {}", e);
-                    crate::model::AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
+                    crate::AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
                 })?;
 
             info!("✅ [FORWARD] 获取容器服务 URL: {}", server_url);
             Ok((server_url, project_id.to_string()))
         } else {
-            Err(crate::model::AppError::internal_server_error("未找到容器信息").into())
+            Err(crate::AppError::internal_server_error("未找到容器信息").into())
         }
     } else {
-        Err(crate::model::AppError::internal_server_error("容器创建失败").into())
+        Err(crate::AppError::internal_server_error("容器创建失败").into())
     }
 }
 
@@ -295,7 +295,7 @@ async fn create_container_for_request(
     info!("✅ [FORWARD] 容器创建成功: project_id={}, session_id={}",
           project_id, connection_info.session_id);
 
-    // 创建生命周期守卫并存储到 MAP 中
+    // 创建项目Agent信息并存储到 MAP 中
     let project_and_agent_info = ProjectAndAgentInfo {
         project_id: project_id.clone(),
         session_id: connection_info.session_id.clone(),
@@ -306,9 +306,6 @@ async fn create_container_for_request(
         status: AgentStatus::Idle,
         last_activity: chrono::Utc::now(),
         created_at: chrono::Utc::now(),
-        lifecycle_guard: connection_info.stop_handle
-            .ok_or_else(|| anyhow::anyhow!("缺少生命周期守卫"))?
-            .as_ref().clone(),
     };
 
     // 存储到全局 MAP
@@ -328,7 +325,7 @@ async fn create_container_for_request(
 
 
 /// 转发原始 HTTP 请求到容器内的 agent_runner
-async fn forward_request_to_container(request: &ChatRequest) -> Result<crate::model::HttpResult<ChatResponse>, crate::model::AppError> {
+async fn forward_request_to_container(request: &ChatRequest) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
     let project_id = request.project_id.as_deref().unwrap_or_else(|| "default");
     let session_id = request.session_id.as_deref().unwrap_or_else(|| "default");
 
@@ -348,23 +345,23 @@ async fn forward_request_to_container(request: &ChatRequest) -> Result<crate::mo
         .await
         .map_err(|e| {
             error!("❌ [FORWARD] 转发请求失败: {}", e);
-            crate::model::AppError::internal_server_error(&format!("转发请求到容器失败: {}", e))
+            crate::AppError::internal_server_error(&format!("转发请求到容器失败: {}", e))
         })?;
 
     if response.status().is_success() {
         // 直接返回容器内的响应
-        let container_response: crate::model::ChatResponse = response.json().await
+        let container_response: ChatResponse = response.json().await
             .map_err(|e| {
                 error!("❌ [FORWARD] 解析容器响应失败: {}", e);
-                crate::model::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
+                crate::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
             })?;
 
         info!("✅ [FORWARD] 容器响应成功: session_id={}", container_response.session_id);
-        Ok(crate::model::HttpResult::success(container_response))
+        Ok(crate::HttpResult::success(container_response))
     } else {
         let error_text = format!("容器返回错误状态: {}", response.status());
         error!("❌ [FORWARD] {}", error_text);
-        Ok(crate::model::HttpResult::error(
+        Ok(crate::HttpResult::error(
             "CONTAINER_ERROR",
             &error_text,
         ))

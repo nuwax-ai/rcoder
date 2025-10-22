@@ -4,14 +4,13 @@ pub mod cleanup_task;
 pub mod docker_agent;
 pub mod docker_container_agent;
 pub mod port_manager;
-pub mod enhanced_port_manager;
 pub mod network_management;
 pub mod container_monitor;
 pub mod container_service;
 
 use crate::CancelNotificationRequest;
 use crate::{
-    model::{AgentSessionUpdate, SessionNotify},
+    AgentSessionUpdate, AgentType, ProjectAndAgentInfo, SessionNotify,
 };
 pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP};
 use agent_client_protocol::{Client, PermissionOptionKind, PromptRequest, SessionId};

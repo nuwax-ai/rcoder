@@ -47,7 +47,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(handler::agent_session_notification),
         )
         .route("/agent/session/cancel", post(handler::agent_session_cancel))
-        .route("/agent/stop", post(handler::agent_stop))
         .route("/agent/status/{project_id}", get(handler::agent_status))
         .with_state(state.clone());
 
@@ -78,7 +77,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::handle_chat,
         handler::agent_session_notification,
         handler::agent_session_cancel,
-        handler::agent_stop,
         handler::agent_status,
         // Pingora 代理接口
         handler::proxy_status,
@@ -94,7 +92,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::HealthResponse,
             handler::ChatRequest,
             handler::ChatResponse,
-            handler::StopAgentResponse,
             crate::handler::SessionUpdateEvent,
             // 模型配置相关结构体
             shared_types::ModelProviderConfig,

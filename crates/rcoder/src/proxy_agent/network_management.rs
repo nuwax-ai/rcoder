@@ -9,10 +9,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
-use crate::proxy_agent::{
-    enhanced_port_manager::{EnhancedNetworkManager, GLOBAL_ENHANCED_NETWORK_MANAGER},
-    port_manager::GLOBAL_PORT_MANAGER,
-};
+use crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER;
+
+/// 错误转换辅助函数
+fn map_error_to_string<T: Into<String>>(error: T) -> String {
+    error.into()
+}
 
 /// 网络管理状态
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -34,9 +36,8 @@ pub struct NetworkManagementStatus {
 }
 
 /// 统一的网络管理器
+#[derive(Clone)]
 pub struct UnifiedNetworkManager {
-    /// 增强的端口管理器
-    enhanced_port_manager: Option<EnhancedNetworkManager>,
     /// 基础端口管理器（兼容性）
     basic_port_manager: Option<()>,
 }
@@ -52,87 +53,41 @@ impl UnifiedNetworkManager {
         info!("🌐 初始化统一网络管理器: 增强模式={}", use_enhanced);
 
         Self {
-            enhanced_port_manager: if use_enhanced {
-                GLOBAL_ENHANCED_NETWORK_MANAGER.lock().unwrap().clone()
-            } else {
-                None
-            },
             basic_port_manager: None,
         }
     }
 
     /// 分配端口
     pub async fn allocate_port(&self, project_id: &str) -> Result<u16, String> {
-        if let Some(ref enhanced_manager) = self.enhanced_port_manager {
-            info!("🔌 [NETWORK] 使用增强端口管理器分配端口: project_id={}", project_id);
-            enhanced_manager.allocate_port(project_id).await
-        } else {
-            info!("🔌 [NETWORK] 使用基础端口管理器分配端口: project_id={}", project_id);
-            GLOBAL_PORT_MANAGER.allocate_port().await
-        }
+        info!("🔌 [NETWORK] 使用基础端口管理器分配端口: project_id={}", project_id);
+        GLOBAL_PORT_MANAGER.allocate_port().await.map_err(map_error_to_string)
     }
 
     /// 释放端口
     pub async fn release_port(&self, port: u16) -> Result<(), String> {
-        if let Some(ref enhanced_manager) = self.enhanced_port_manager {
-            info!("🔌 [NETWORK] 使用增强端口管理器释放端口: port={}", port);
-            enhanced_manager.release_port(port).await
-        } else {
-            info!("🔌 [NETWORK] 使用基础端口管理器释放端口: port={}", port);
-            GLOBAL_PORT_MANAGER.release_port(port).await
-        }
+        info!("🔌 [NETWORK] 使用基础端口管理器释放端口: port={}", port);
+        GLOBAL_PORT_MANAGER.release_port(port).await;
+        Ok(())
     }
 
     /// 获取网络管理状态
     pub async fn get_network_status(&self) -> NetworkManagementStatus {
-        if let Some(ref enhanced_manager) = self.enhanced_port_manager {
-            let usage_stats = enhanced_manager.get_usage_stats().await;
-            let connections = enhanced_manager.get_active_connections().await;
-
-            let total_ports = enhanced_manager.config.port_range.1 - enhanced_manager.config.port_range.0;
-            let port_utilization = if total_ports > 0 {
-                (usage_stats.used_ports as f64 / total_ports as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            NetworkManagementStatus {
-                total_ports,
-                used_ports: usage_stats.used_ports,
-                port_utilization,
-                active_connections: connections.len(),
-                failed_connections: connections.values()
-                    .filter(|status| {
-                        matches!(status,
-                            crate::proxy_agent::enhanced_port_manager::NetworkConnectionStatus::Failed)
-                    })
-                    .count(),
-                timeout_connections: connections.values()
-                    .filter(|status| {
-                        matches!(status,
-                            crate::proxy_agent::enhanced_port_manager::NetworkConnectionStatus::Timeout)
-                    })
-                    .count(),
-                last_health_check: chrono::Utc::now(),
-            }
+        let allocated_count = GLOBAL_PORT_MANAGER.allocated_count().await;
+        let total_ports = 9999 - 8000 + 1;
+        let port_utilization = if total_ports > 0 {
+            (allocated_count as f64 / total_ports as f64) * 100.0
         } else {
-            let allocated_count = GLOBAL_PORT_MANAGER.allocated_count().await;
-            let total_ports = 9999 - 8000 + 1;
-            let port_utilization = if total_ports > 0 {
-                (allocated_count as f64 / total_ports as f64) * 100.0
-            } else {
-                0.0
-            };
+            0.0
+        };
 
-            NetworkManagementStatus {
-                total_ports,
-                used_ports: allocated_count,
-                port_utilization,
-                active_connections: allocated_count,
-                failed_connections: 0,
-                timeout_connections: 0,
-                last_health_check: chrono::Utc::now(),
-            }
+        NetworkManagementStatus {
+            total_ports,
+            used_ports: allocated_count as u16,
+            port_utilization,
+            active_connections: allocated_count,
+            failed_connections: 0,
+            timeout_connections: 0,
+            last_health_check: chrono::Utc::now(),
         }
     }
 
@@ -140,110 +95,58 @@ impl UnifiedNetworkManager {
     pub async fn perform_health_check(&self) -> Result<NetworkDiagnostics, String> {
         info!("🔍 [NETWORK] 开始网络健康检查");
 
-        if let Some(ref enhanced_manager) = self.enhanced_port_manager {
-            let diagnostics = enhanced_manager.network_diagnostics().await;
-            let status = self.get_network_status().await;
-            let mut recommendations = Vec::new();
+        let status = self.get_network_status().await;
+        let mut diagnostics = HashMap::new();
+        let mut recommendations = Vec::new();
 
-            // 基于诊断结果提供建议
-            if status.port_utilization > 80.0 {
-                recommendations.push("考虑扩展端口范围以避免端口不足".to_string());
-            }
+        // 基础诊断信息
+        diagnostics.insert("端口管理器类型".to_string(), "基础端口管理器".to_string());
+        diagnostics.insert("健康检查时间".to_string(), chrono::Utc::now().to_rfc3339());
 
-            if status.failed_connections > status.active_connections / 4 {
-                recommendations.push("检查网络连接质量和稳定性".to_string());
-            }
-
-            if status.timeout_connections > 0 {
-                recommendations.push("调整网络超时配置".to_string());
-            }
-
-            let diagnostics_result = NetworkDiagnostics {
-                status,
-                diagnostics,
-                recommendations,
-            };
-
-            info!("✅ [NETWORK] 网络健康检查完成: 状态={:?}, 建议={}条",
-                  diagnostics_result.status, diagnostics_result.recommendations.len());
-
-            Ok(diagnostics_result)
-        } else {
-            Err("基础管理器不支持健康检查".to_string())
+        // 基于状态提供建议
+        if status.port_utilization > 80.0 {
+            recommendations.push("考虑扩展端口范围以避免端口不足".to_string());
         }
+
+        let diagnostics_result = NetworkDiagnostics {
+            status,
+            diagnostics,
+            recommendations,
+        };
+
+        info!("✅ [NETWORK] 网络健康检查完成: 状态={:?}, 建议={}条",
+              diagnostics_result.status, diagnostics_result.recommendations.len());
+
+        Ok(diagnostics_result)
     }
 
     /// 清理空闲端口
-    pub async fn cleanup_idle_ports(&self, idle_threshold: std::time::Duration) -> Result<usize, String> {
-        info!("🧹 [NETWORK] 开始清理空闲端口: 阈值={:?}", idle_threshold);
-
-        if let Some(ref enhanced_manager) = self.enhanced_port_manager {
-            let result = enhanced_manager.cleanup_idle_ports(idle_threshold).await?;
-            info!("✅ [NETWORK] 空闲端口清理完成: 清理了{}个端口", result);
-            Ok(result)
-        } else {
-            let allocated_count = GLOBAL_PORT_MANAGER.allocated_count().await;
-            info!("🔌 [NETWORK] 基础管理器端口清理: 当前已分配{}个端口", allocated_count);
-            Ok(0) // 基础管理器返回0，表示没有清理
-        }
+    pub async fn cleanup_idle_ports(&self, _idle_threshold: std::time::Duration) -> Result<usize, String> {
+        info!("🧹 [NETWORK] 基础管理器不支持空闲端口清理");
+        Ok(0) // 基础管理器返回0，表示没有清理
     }
 
     /// 获取端口分配历史
-    pub async fn get_port_allocation_history(&self, limit: Option<usize>) -> Vec<(u16, String, chrono::DateTime<chrono::Utc>)> {
-        if let Some(ref enhanced_manager) = self.enhanced_port_manager {
-            // 简化版本：返回基于使用率的端口分配历史
-            let mut history = Vec::new();
-            let ports = enhanced_manager.config.port_range;
-
-            // 模拟端口分配历史数据
-            for i in 0..std::cmp::min(limit.unwrap_or(10), 10) {
-                let port = ports.0 + (i as u16);
-                let project_id = format!("project_{}", i % 5);
-                let allocated_at = chrono::Utc::now() - chrono::Duration::minutes((i * 5) as i64);
-
-                history.push((port, project_id, allocated_at));
-            }
-
-            history.sort_by_key(|(_, _, timestamp)| *timestamp);
-            history
-        } else {
-            info!("📊 [NETWORK] 基础管理器不支持端口分配历史");
-            Vec::new()
-        }
+    pub async fn get_port_allocation_history(&self, _limit: Option<usize>) -> Vec<(u16, String, chrono::DateTime<chrono::Utc>)> {
+        info!("📊 [NETWORK] 基础管理器不支持端口分配历史");
+        Vec::new()
     }
 
     /// 网络性能测试
-    pub async fn perform_network_performance_test(&self, port: u16) -> Result<HashMap<String, f64>, String> {
-        info!("🚀 [NETWORK] 开始网络性能测试: port={}", port);
-
-        if let Some(ref enhanced_manager) = self.enhanced_port_manager {
-            let results = enhanced_manager.perform_network_performance_test(port).await?;
-            info!("✅ [NETWORK] 网络性能测试完成");
-            Ok(results)
-        } else {
-            Err("基础管理器不支持性能测试".to_string())
-        }
+    pub async fn perform_network_performance_test(&self, _port: u16) -> Result<HashMap<String, f64>, String> {
+        info!("🚀 [NETWORK] 基础管理器不支持网络性能测试");
+        Err("基础管理器不支持性能测试".to_string())
     }
 
     /// 强制端口重新分配
-    pub async fn force_port_reallocation(&self, project_id: &str, old_port: u16) -> Result<u16, String> {
-        info!("🔄 [NETWORK] 强制端口重新分配: project_id={}, old_port={}", project_id, old_port);
+    pub async fn force_port_reallocation(&self, _project_id: &str, old_port: u16) -> Result<u16, String> {
+        info!("🔄 [NETWORK] 基础端口重新分配: old_port={}", old_port);
 
-        if let Some(ref enhanced_manager) = self.enhanced_port_manager {
-            // 先释放旧端口
-            enhanced_manager.release_port(old_port).await?;
-
-            // 分配新端口
-            let new_port = enhanced_manager.allocate_port(project_id).await?;
-            info!("✅ [NETWORK] 端口重新分配完成: {} -> {}", old_port, new_port);
-            Ok(new_port)
-        } else {
-            // 基础管理器的重新分配逻辑
-            GLOBAL_PORT_MANAGER.release_port(old_port).await?;
-            let new_port = GLOBAL_PORT_MANAGER.allocate_port().await?;
-            info!("✅ [NETWORK] 基础端口重新分配完成: {} -> {}", old_port, new_port);
-            Ok(new_port)
-        }
+        // 基础管理器的重新分配逻辑
+        GLOBAL_PORT_MANAGER.release_port(old_port).await;
+        let new_port = GLOBAL_PORT_MANAGER.allocate_port().await.map_err(map_error_to_string)?;
+        info!("✅ [NETWORK] 基础端口重新分配完成: {} -> {}", old_port, new_port);
+        Ok(new_port)
     }
 }
 

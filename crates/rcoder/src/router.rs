@@ -76,7 +76,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     paths(
         handler::health_check,
         handler::handle_chat,
-        handler::agent_session_notification,
+        // handler::agent_session_notification,  // 暂时移除
         handler::agent_session_cancel,
         handler::agent_stop,
         handler::agent_status,
@@ -93,7 +93,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             // 响应结构体
             handler::HealthResponse,
             handler::ChatRequest,
-            crate::model::ChatResponse,
+            shared_types::ChatResponse,
             handler::StopAgentResponse,
             crate::handler::SessionUpdateEvent,
             // 模型配置相关结构体
@@ -101,19 +101,19 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             shared_types::ModelApiProtocol,
             shared_types::ModelProviderSafeInfo,
             // Agent状态相关结构体
-            crate::model::AgentStatusResponse,
-            crate::model::AgentStatus,
+            shared_types::AgentStatusResponse,
+            shared_types::AgentStatus,
             // 附件相关结构体
-            crate::model::Attachment,
-            crate::model::AttachmentSource,
-            crate::model::TextAttachment,
-            crate::model::ImageAttachment,
-            crate::model::AudioAttachment,
-            crate::model::DocumentAttachment,
-            crate::model::ImageDimensions,
+            shared_types::Attachment,
+            shared_types::AttachmentSource,
+            shared_types::TextAttachment,
+            shared_types::ImageAttachment,
+            shared_types::AudioAttachment,
+            shared_types::DocumentAttachment,
+            shared_types::ImageDimensions,
             // 会话消息相关结构体
-            crate::model::UnifiedSessionMessage,
-            crate::model::SessionMessageType,
+            shared_types::UnifiedSessionMessage,
+            shared_types::SessionMessageType,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,

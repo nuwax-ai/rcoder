@@ -3,7 +3,7 @@ mod agent_model;
 mod agent_session_notify;
 mod app_error;
 mod attachment;
-mod chat_prompt;
+pub mod chat_prompt;
 mod chat_response;
 mod http_result;
 mod model_provider;

@@ -9,7 +9,6 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
 mod handler;
-mod model;
 mod proxy_agent;
 
 mod middleware;
@@ -17,7 +16,7 @@ mod router;
 mod service;
 mod utils;
 
-use model::*;
+use rcoder::*;
 
 use config::{CliArgs, load_config_with_args};
 use pingora_proxy::{PingoraServerManager, ProxyConfig, PingoraProxyService};

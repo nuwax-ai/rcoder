@@ -3,14 +3,14 @@
 use anyhow::Result;
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
-use shared_types::ModelProviderConfig;
+use shared_types::{ModelProviderConfig, ChatPromptBuilder};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::proxy_agent::*;
-use crate::{model::*, router::AppState};
+use crate::{*, router::AppState};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]

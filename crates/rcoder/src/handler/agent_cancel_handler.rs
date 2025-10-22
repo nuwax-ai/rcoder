@@ -11,8 +11,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     CancelNotificationRequest, proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent},
+    router::AppState,
 };
-use crate::{model::AppError, model::HttpResult, router::AppState};
+use shared_types::{AppError, HttpResult};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]
@@ -26,7 +27,7 @@ pub struct CancelQuery {
 }
 
 /// 取消任务的响应
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CancelResponse {
     /// 取消操作是否成功
     #[schema(example = true)]
@@ -74,7 +75,8 @@ async fn forward_cancel_request_to_container(
             AppError::internal_server_error(&format!("转发取消请求到容器失败: {}", e))
         })?;
 
-    if response.status().is_success() {
+    let status = response.status();
+    if status.is_success() {
         // 直接返回容器内的响应
         let container_response: CancelResponse = response.json().await
             .map_err(|e| {
@@ -91,13 +93,13 @@ async fn forward_cancel_request_to_container(
     } else {
         error!(
             "❌ [CANCEL_FORWARD] 容器取消请求失败: status={}, body={:?}",
-            response.status(),
-            response.text().await
+            status,
+            response.text().await.unwrap_or_default()
         );
 
         Ok(HttpResult::error(
             "CANCEL001",
-            &format!("容器取消请求失败: {}", response.status()),
+            &format!("容器取消请求失败: {}", status),
         ))
     }
 }
@@ -109,7 +111,7 @@ async fn ensure_container_exists_for_cancel(project_id: &str) -> Result<(String,
         info!("🏗️ [CANCEL_FORWARD] 容器不存在，创建新容器: project_id={}", project_id);
 
         // 使用默认配置创建容器
-        let chat_prompt = crate::model::ChatPromptBuilder::default()
+        let chat_prompt = shared_types::ChatPromptBuilder::default()
             .project_id(project_id.to_string())
             .session_id(format!("cancel_session_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)))
             .prompt("cancel_request".to_string())
@@ -154,7 +156,7 @@ async fn ensure_container_exists_for_cancel(project_id: &str) -> Result<(String,
 
 /// 为取消请求创建容器
 async fn create_container_for_cancel(
-    chat_prompt: &crate::model::ChatPrompt,
+    chat_prompt: &shared_types::ChatPrompt,
     _model_provider: Option<shared_types::ModelProviderConfig>,
 ) -> Result<(), AppError> {
     let project_id = &chat_prompt.project_id;
@@ -182,19 +184,16 @@ async fn create_container_for_cancel(
           project_id, connection_info.session_id);
 
     // 创建生命周期守卫并存储到 MAP 中
-    let project_and_agent_info = crate::model::ProjectAndAgentInfo {
+    let project_and_agent_info = shared_types::ProjectAndAgentInfo {
         project_id: project_id.clone(),
         session_id: connection_info.session_id.clone(),
         prompt_tx: connection_info.prompt_tx.clone(),
         cancel_tx: connection_info.cancel_tx.clone(),
         model_provider: None,
         request_id: chat_prompt.request_id.clone(),
-        status: crate::model::AgentStatus::Idle,
+        status: shared_types::AgentStatus::Idle,
         last_activity: chrono::Utc::now(),
         created_at: chrono::Utc::now(),
-        lifecycle_guard: connection_info.stop_handle
-            .ok_or_else(|| AppError::internal_server_error("缺少生命周期守卫"))?
-            .as_ref().clone(),
     };
 
     // 存储到全局 MAP

@@ -13,8 +13,8 @@ use agent_client_protocol::{CancelNotification, SessionId};
 
 use crate::{
     CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
+    AppError, HttpResult, router::AppState,
 };
-use crate::{model::AppError, model::HttpResult, router::AppState};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]

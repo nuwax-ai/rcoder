@@ -12,6 +12,8 @@ uuid.workspace = true
 agent-client-protocol.workspace = true
 chrono.workspace = true
 
+codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
+codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 
 # OpenAPI documentation
 utoipa = { workspace = true }

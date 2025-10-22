@@ -3,8 +3,8 @@
 //! 用于构建和处理 AI 代理的内容，包括附件转换等
 
 use anyhow::Result;
+use shared_types::{Attachment, AttachmentSource};
 use std::path::Path;
-use crate::model::Attachment;
 use agent_client_protocol::{ContentBlock, TextContent, ImageContent};
 
 /// 内容构建器
@@ -20,7 +20,7 @@ impl ContentBuilder {
 
         for attachment in attachments {
             let content_block = match attachment.source() {
-                crate::model::AttachmentSource::FilePath { path } => {
+                AttachmentSource::FilePath { path } => {
                     // 根据文件扩展名推断内容类型
                     let content = std::fs::read_to_string(&path)
                         .map_err(|e| anyhow::anyhow!("读取文件失败: {}", e))?;
@@ -31,7 +31,7 @@ impl ContentBuilder {
                         meta: None,
                     })
                 }
-                crate::model::AttachmentSource::Base64 { data, mime_type } => {
+                AttachmentSource::Base64 { data, mime_type } => {
                     // 根据MIME类型处理
                     if mime_type.starts_with("image/") {
                         ContentBlock::Image(ImageContent {
@@ -50,7 +50,7 @@ impl ContentBuilder {
                         })
                     }
                 }
-                crate::model::AttachmentSource::Url { url } => {
+                AttachmentSource::Url { url } => {
                     // URL作为文本处理
                     ContentBlock::Text(TextContent {
                         text: format!("URL: {}", url),

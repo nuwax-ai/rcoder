@@ -82,3 +82,7 @@ utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 
 ringbuf={workspace = true}
+
+# Random and hashing
+rand = "0.8"
+md5 = "0.7"

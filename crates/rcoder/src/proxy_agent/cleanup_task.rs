@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::model::AgentStatus;
+use crate::AgentStatus;
 use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
 use crate::service::session_cache::{SESSION_CACHE, PROJECT_SESSION_MAP};
 
