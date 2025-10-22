@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+//! Agent 相关的核心结构体 - rcoder 和 agent_runner 共用
+
 use agent_client_protocol::{SessionId, CancelNotification, PromptRequest};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

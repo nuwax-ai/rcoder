@@ -7,7 +7,7 @@ pub use model::{
     // Session and message exports
     Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
     ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,
-    AgentSessionUpdate, SessionNotify, ChatPrompt, ChatPromptResponse,
+    AgentSessionUpdate, SessionNotify, ChatPrompt, ChatPromptResponse, ChatResponse,
     // Error and HTTP exports
     AppError, HttpResult,
 };
