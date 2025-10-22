@@ -21,9 +21,13 @@ help:
 	@echo "  make dev-logs       - 查看开发模式容器日志"
 	@echo ""
 	@echo "开发模式工作流程："
-	@echo "  1. make dev-build    # 首次编译+构建镜像"
+	@echo "  1. make dev-build    # 首次：编译+构建镜像"
 	@echo "  2. make dev-up       # 启动容器"
-	@echo "  3. 修改代码后: make dev-restart  # 重新编译+构建+重启"
+	@echo "  3. 修改代码后: make dev-restart  # 快速：仅编译+重启容器"
+	@echo ""
+	@echo "💡 提示："
+	@echo "  - dev-build: 首次使用，会构建 Docker 镜像（较慢）"
+	@echo "  - dev-restart: 日常开发，只编译+重启（快速迭代）"
 	@echo ""
 
 # 本地编译（仅编译，不构建镜像）
@@ -107,8 +111,8 @@ dev-up:
 	@RCODER_MODE=dev docker-compose -f docker/docker-compose.yml ps
 	@echo "📝 开发模式特点："
 	@echo "  - 挂载本地编译的 rcoder 可执行文件"
-	@echo "  - 代码修改后只需运行 'make dev-build && make dev-restart'"
-	@echo "  - 无需重新构建 Docker 镜像"
+	@echo "  - 代码修改后只需运行 'make dev-restart'"
+	@echo "  - dev-restart 只编译+重启，无需重新构建镜像（快速）"
 
 dev-down:
 	@echo "🛑 停止开发模式容器服务..."
@@ -127,9 +131,22 @@ dev-logs:
 		exit 1; \
 	fi
 
-dev-restart: dev-build
-	@echo "🔄 重启开发模式容器服务..."
+dev-restart:
+	@echo "🔄 [1/3] 重新编译 rcoder..."
+	@cargo build --release --bin rcoder
+	@echo "📁 [2/3] 复制可执行文件到 docker 目录..."
+	@cp ./target/release/rcoder ./docker/rcoder
+	@chmod +x ./docker/rcoder
+	@echo "✅ 编译完成！"
+	@echo ""
+	@echo "🔄 [3/3] 重启容器服务..."
 	@if [ -f "docker/docker-compose.yml" ]; then \
-		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml down; \
+		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml restart; \
+		echo "✅ 容器已重启！"; \
+	else \
+		echo "❌ 错误: 未找到 docker/docker-compose.yml"; \
+		exit 1; \
 	fi
-	@$(MAKE) dev-up
+	@echo ""
+	@echo "🎉 开发模式重启完成！"
+	@echo "💡 无需重新构建镜像，快速迭代！"
