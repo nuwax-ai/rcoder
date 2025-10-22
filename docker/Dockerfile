@@ -1,5 +1,5 @@
 # 多阶段构建：编译阶段 + 运行阶段
-FROM rust:1.75 AS builder
+FROM rust:1.90 AS builder
 
 # 设置工作目录
 WORKDIR /app
@@ -16,8 +16,7 @@ RUN apt-get update && apt-get install -y \
 COPY . .
 
 # 预编译依赖，只编译 rcoder binary
-RUN cargo fetch --target x86_64-unknown-linux-gnu && \
-    cargo build --release --bin rcoder --target-dir /app/target
+RUN cargo build --release --bin rcoder --target-dir /app/target
 
 # 轻量级运行时镜像
 FROM debian:bookworm-slim
@@ -34,11 +33,9 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -u 1000 rcoder && \
     mkdir -p /app/logs /app/workspace
 
-# 从 builder 阶段复制编译好的二进制
+# 从 builder 阶段复制编译好的二进制和启动脚本
 COPY --from=builder /app/target/release/rcoder /usr/local/bin/
-
-# 复制启动脚本
-COPY docker/start-rcoder.sh /app/start-rcoder.sh
+COPY --from=builder /app/docker/start-rcoder.sh /app/start-rcoder.sh
 RUN chmod +x /app/start-rcoder.sh
 
 # 设置环境变量
