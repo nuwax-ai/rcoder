@@ -154,7 +154,6 @@ async fn ensure_container_exists_for_stop(project_id: &str) -> Result<(String, S
             let server_url = docker_container_agent::get_container_ip(
                 &docker_manager,
                 &container_info.container_id,
-                container_info.assigned_port,
             )
             .await
             .map_err(|e| {

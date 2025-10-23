@@ -76,10 +76,10 @@ pub fn default_platform() -> String {
 }
 
 /// 默认的工作目录
-pub const DEFAULT_WORK_DIR: &str = "/app/workspace";
+pub const DEFAULT_WORK_DIR: &str = "/app";
 
 /// 默认的网络模式
 pub const DEFAULT_NETWORK_MODE: &str = "bridge";
 
 /// RCoder 专用网络名称
-pub const RCODER_NETWORK_NAME: &str = "rcoder-network";
+pub const RCODER_NETWORK_NAME: &str = "agent-network";

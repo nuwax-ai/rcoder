@@ -224,10 +224,17 @@ async fn forward_request_to_container_service(
     debug!("📥 [FORWARD] 容器响应状态: {}", status);
 
     if status.is_success() {
-        // 直接返回容器内的响应，不做任何修改
-        let container_response: ChatResponse = response.json().await.map_err(|e| {
-            error!("❌ [FORWARD] 解析容器响应失败: {}", e);
-            crate::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
+        // 解析容器的 HttpResult<ChatResponse> 响应
+        let container_http_result: shared_types::HttpResult<ChatResponse> =
+            response.json().await.map_err(|e| {
+                error!("❌ [FORWARD] 解析容器响应失败: {}", e);
+                crate::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
+            })?;
+
+        // 提取 data 字段中的 ChatResponse
+        let container_response = container_http_result.data.ok_or_else(|| {
+            error!("❌ [FORWARD] 容器响应缺少 data 字段");
+            crate::AppError::internal_server_error("容器响应缺少 data 字段")
         })?;
 
         info!(

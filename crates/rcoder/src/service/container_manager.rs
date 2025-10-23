@@ -128,17 +128,16 @@ impl ContainerManager {
             );
 
             if let Some(container_info) = docker_manager.get_container_info(project_id) {
-                // 获取容器IP地址
-                let server_url = crate::proxy_agent::docker_container_agent::get_container_ip(
-                    &docker_manager,
-                    &container_info.container_id,
-                    container_info.assigned_port,
-                )
-                .await
-                .map_err(|e| {
-                    error!("❌ [CONTAINER_MGR] 获取容器 IP 失败: {}", e);
-                    AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
-                })?;
+                // 🎯 获取容器服务地址（使用容器名称DNS解析）
+                let server_url =
+                    crate::proxy_agent::docker_container_agent::get_container_server_url(
+                        &container_info.container_name,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("❌ [CONTAINER_MGR] 获取容器服务地址失败: {}", e);
+                        AppError::internal_server_error(&format!("获取容器服务地址失败: {}", e))
+                    })?;
 
                 // 从URL中提取IP地址
                 let ip_address = extract_ip_from_url(&server_url)?;
@@ -292,11 +291,9 @@ async fn ensure_container_exists(project_id: &str) -> Result<ContainerBasicInfo,
             project_id, existing_container_info.container_id
         );
 
-        // 获取容器IP地址
-        let server_url = crate::proxy_agent::docker_container_agent::get_container_ip(
-            &docker_manager,
-            &existing_container_info.container_id,
-            existing_container_info.assigned_port,
+        // 🎯 获取容器服务地址（使用容器名称DNS解析）
+        let server_url = crate::proxy_agent::docker_container_agent::get_container_server_url(
+            &existing_container_info.container_name,
         )
         .await
         .map_err(|e| {
@@ -390,11 +387,10 @@ async fn create_container_for_request(
             AppError::internal_server_error("新创建的容器信息获取失败")
         })?;
 
-    // 获取容器IP地址
+    // 🎯 获取容器IP地址（无宿主机端口映射）
     let server_url = crate::proxy_agent::docker_container_agent::get_container_ip(
         docker_manager,
         &container_info_docker.container_id,
-        container_info_docker.assigned_port,
     )
     .await
     .map_err(|e| {
@@ -410,7 +406,7 @@ async fn create_container_for_request(
         container_name: container_info_docker.container_name.clone(),
         container_ip: ip_address,
         internal_port: container_info_docker.internal_port,
-        external_port: container_info_docker.assigned_port,
+        external_port: 0u16, // 🎯 优化：无宿主机端口映射
         project_id: project_id.to_string(),
         session_id: container_info_docker.session_id.clone(),
         status: container_info_docker.status.to_string(),

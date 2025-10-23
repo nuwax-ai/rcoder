@@ -3,10 +3,7 @@
 //! 使用 Pingora 透明代理处理 SSE 消息，实现高效的 SSE 重定向
 
 use crate::{AppError, HttpResult};
-use axum::{
-    extract::Path,
-    response::Json,
-};
+use axum::{extract::Path, response::Json};
 use serde::{Deserialize, Serialize};
 use shared_types::ProjectAndAgentInfo;
 use tracing::{error, info};
@@ -126,7 +123,7 @@ pub async fn agent_session_notification(
 
             Ok(Json(HttpResult::error(
                 "CONTAINER_NOT_FOUND",
-                "未找到 session_id 对应的活跃容器"
+                "未找到 session_id 对应的活跃容器",
             )))
         }
     }
@@ -154,7 +151,10 @@ pub struct ProxyRedirectResponse {
 
 /// 检查 session_id 对应的容器，返回容器的直接 SSE URL
 async fn check_container_and_proxy_sse(session_id: &str) -> Result<(String, String), AppError> {
-    info!("🔍 [PROXY_REDIRECT] 检查容器可用性: session_id={}", session_id);
+    info!(
+        "🔍 [PROXY_REDIRECT] 检查容器可用性: session_id={}",
+        session_id
+    );
 
     // 查找对应的容器
     if let Some((project_id, agent_info)) = find_container_by_session_id(session_id) {
@@ -167,15 +167,9 @@ async fn check_container_and_proxy_sse(session_id: &str) -> Result<(String, Stri
         let container_service_url = get_container_service_url(&project_id, &agent_info).await?;
 
         // 构建目标容器的 SSE 端点 URL
-        let target_url = format!(
-            "{}/agent/agent/progress",
-            container_service_url
-        );
+        let target_url = format!("{}/agent/agent/progress", container_service_url);
 
-        info!(
-            "🚀 [PROXY_REDIRECT] 容器可用，目标 URL: {}",
-            target_url
-        );
+        info!("🚀 [PROXY_REDIRECT] 容器可用，目标 URL: {}", target_url);
 
         Ok((target_url, project_id))
     } else {
@@ -212,7 +206,6 @@ async fn get_container_service_url(
         let server_url = crate::proxy_agent::docker_container_agent::get_container_ip(
             &docker_manager,
             &container_info.container_id,
-            container_info.assigned_port,
         )
         .await
         .map_err(|e| {

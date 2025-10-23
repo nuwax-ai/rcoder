@@ -56,7 +56,7 @@ pub async fn start_docker_container_agent_service(
             error!("停止现有容器失败: {}", e);
             return Err(anyhow::anyhow!("无法停止现有容器: {}", e));
         }
-        // 释放对应的端口
+        // 释放对应的端口（如果存在端口映射）
         if let Some(port_binding) = existing_container.port_bindings.values().next() {
             if let Ok(port) = port_binding.parse::<u16>() {
                 crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
@@ -67,25 +67,17 @@ pub async fn start_docker_container_agent_service(
         }
     }
 
-    // 分配端口（使用端口管理器避免冲突）
-    let assigned_port = crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-        .allocate_port()
-        .await
-        .map_err(|e| anyhow::anyhow!("端口分配失败: {}", e))?;
-    info!("为容器分配端口: {}", assigned_port);
+    // 🎯 优化：不再需要宿主机端口映射，使用内部网络通信
+    info!("使用容器内部网络通信，无需宿主机端口映射");
 
-    // 创建容器配置
-    let container_config =
-        create_docker_container_config(&project_id, &project_path, assigned_port).await?;
+    // 创建容器配置（无需端口映射）
+    let container_config = create_docker_container_config(&project_id, &project_path).await?;
 
     // 创建并启动容器
     let container_info = match docker_manager.create_container(container_config).await {
         Ok(info) => info,
         Err(e) => {
-            // 创建失败，释放端口
-            crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-                .release_port(assigned_port)
-                .await;
+            // 🎯 优化：使用内部网络，无需端口分配和释放
             error!("创建容器失败: {}", e);
             return Err(anyhow::anyhow!("创建容器失败: {}", e));
         }
@@ -96,12 +88,11 @@ pub async fn start_docker_container_agent_service(
     );
 
     // 等待容器内 agent_runner 启动
-    // 在 bridge 网络模式下，需要获取容器的 IP 地址
-    let server_url =
-        get_container_ip(&docker_manager, &container_info.container_id, assigned_port).await?;
+    // 🎯 优化：使用容器内部IP，无需宿主机端口映射
+    let server_url = get_container_ip(&docker_manager, &container_info.container_id).await?;
 
     if let Err(e) = wait_for_agent_server_ready(&server_url).await {
-        // 启动失败，清理容器和端口
+        // 启动失败，清理容器（无需端口管理）
         error!("容器内 agent_runner 启动失败: {}", e);
         if let Err(stop_err) = docker_manager
             .stop_container_by_id(&container_info.container_id)
@@ -109,9 +100,6 @@ pub async fn start_docker_container_agent_service(
         {
             error!("清理失败容器失败: {}", stop_err);
         }
-        crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-            .release_port(assigned_port)
-            .await;
         return Err(anyhow::anyhow!("容器内 agent_runner 启动失败: {}", e));
     }
 
@@ -119,11 +107,10 @@ pub async fn start_docker_container_agent_service(
     Ok((container_info, server_url))
 }
 
-/// 创建 Docker 容器配置
+/// 创建 Docker 容器配置（内部网络通信，无需端口映射）
 async fn create_docker_container_config(
     project_id: &str,
     project_path: &str,
-    port: u16,
 ) -> Result<DockerContainerConfig> {
     let mut env_vars = HashMap::new();
 
@@ -151,9 +138,8 @@ async fn create_docker_container_config(
         project_path, host_project_path
     );
 
-    // 创建端口映射
-    let mut port_bindings = HashMap::new();
-    port_bindings.insert("8086/tcp".to_string(), port.to_string());
+    // 🎯 优化：无需端口映射，使用内部网络通信
+    let port_bindings = HashMap::new(); // 空的端口映射
 
     // Docker 镜像内置 agent_runner 二进制文件，无需额外挂载
     let extra_mounts = Vec::new(); // 不需要额外挂载 agent_runner
@@ -173,8 +159,8 @@ async fn create_docker_container_config(
         container_path: "/app/workspace".to_string(),
         work_dir: "/app/workspace".to_string(),
         env_vars,
-        port_bindings,
-        network_mode: "bridge".to_string(), // 使用 bridge 网络模式避免端口冲突
+        port_bindings,                      // 空的端口映射
+        network_mode: "bridge".to_string(), // 使用 bridge 网络模式，但不暴露端口
         auto_remove: true,                  // 容器停止后自动删除
         resource_limits: Some(ResourceLimits {
             memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB 内存
@@ -311,11 +297,10 @@ async fn handle_cancel_request(
     Ok(())
 }
 
-/// 获取容器在 RCoder 网络中的 IP 地址
+/// 获取容器在 agent-network 中的 IP 地址（无宿主机端口映射）
 pub async fn get_container_ip(
     docker_manager: &DockerManager,
     container_id: &str,
-    port: u16,
 ) -> Result<String> {
     // 等待容器网络配置完成
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -326,19 +311,31 @@ pub async fn get_container_ip(
         .await
         .map_err(|e| anyhow::anyhow!("获取容器网络信息失败: {}", e))?;
 
-    // 直接查找 RCoder 网络的 IP 地址
+    // 直接查找 agent-network 的 IP 地址
     let network_name = docker_manager.get_rcoder_network_name();
     if let Some(ip_address) = network_ips.get(network_name) {
-        let server_url = format!("http://{}:{}", ip_address, port);
+        let server_url = format!("http://{}:8086", ip_address);
         info!("✅ 获取容器 IP 地址: {} -> {}", container_id, ip_address);
         Ok(server_url)
     } else {
         Err(anyhow::anyhow!(
-            "容器 {} 未连接到 RCoder 网络: {}",
+            "容器 {} 未连接到 agent-network: {}",
             container_id,
             network_name
         ))
     }
+}
+
+/// 🎯 优化：使用容器名称通过 Docker 内置 DNS 解析
+/// 无需获取容器 IP，直接使用容器名称
+pub async fn get_container_server_url(container_name: &str) -> Result<String> {
+    // 直接使用容器名称，Docker 内置 DNS 会自动解析
+    let server_url = format!("http://{}:8086", container_name);
+    info!(
+        "✅ 使用容器名称 DNS 解析: {} -> {}",
+        container_name, server_url
+    );
+    Ok(server_url)
 }
 
 /// 从 ContentBlock 中提取文本
