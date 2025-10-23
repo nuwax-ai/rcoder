@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::AgentStatus;
 use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
-use crate::service::session_cache::{SESSION_CACHE, PROJECT_SESSION_MAP};
+use crate::service::session_cache::{PROJECT_SESSION_MAP, SESSION_CACHE};
 
 /// 清理配置
 #[derive(Debug, Clone)]
@@ -196,9 +196,9 @@ impl AgentCleaner {
             }
         }
 
-        // 执行清理 - RAII版：直接从 MAP 中移除，AgentLifecycleGuard 会自动清理
+        // 执行清理 - RAII版：先销毁Docker容器，再从 MAP 中移除，AgentLifecycleGuard 会自动清理其他资源
         for project_id in agents_to_remove {
-            match self.cleanup_agent_raii(&project_id) {
+            match self.cleanup_agent_raii(&project_id).await {
                 Ok(_) => {
                     success_count += 1;
                     info!("成功清理agent: {}", project_id);
@@ -226,8 +226,13 @@ impl AgentCleaner {
 
         info!(
             "清理完成: agent(总共={}, 成功={}, 失败={}, 剩余={}) | session(活跃={}, 缓存={}) | SSE消息(清理={})",
-            cleaned_count, success_count, failed_count, remaining_agents,
-            active_sessions, cached_sessions, sse_messages
+            cleaned_count,
+            success_count,
+            failed_count,
+            remaining_agents,
+            active_sessions,
+            cached_sessions,
+            sse_messages
         );
 
         Ok(CleanupStats {
@@ -241,9 +246,14 @@ impl AgentCleaner {
     }
 
     /// 基于RAII的简化清理方法
-    /// 只需要从MAP中移除agent，AgentLifecycleGuard会自动清理所有资源
-    fn cleanup_agent_raii(&self, project_id: &str) -> Result<()> {
+    /// 先销毁Docker容器，再从MAP中移除agent，AgentLifecycleGuard会自动清理其他资源
+    async fn cleanup_agent_raii(&self, project_id: &str) -> Result<()> {
         debug!("开始RAII清理agent: {}", project_id);
+
+        // 首先销毁Docker容器（如果存在）
+        if let Err(e) = self.destroy_docker_container(project_id).await {
+            warn!("销毁Docker容器失败: {} - {}", project_id, e);
+        }
 
         // 检查agent是否存在
         if PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
@@ -252,12 +262,17 @@ impl AgentCleaner {
 
             // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
             crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
-            debug!("🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}", project_id);
+            debug!(
+                "🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
+                project_id
+            );
 
             // 清理 PROJECT_SESSION_MAP 中的映射关系
             if let Some((_, removed_session_id)) = PROJECT_SESSION_MAP.remove(project_id) {
-                debug!("🧼 [cleanup] 已清理 PROJECT_SESSION_MAP 映射: project_id={}, session_id={}",
-                       project_id, removed_session_id);
+                debug!(
+                    "🧼 [cleanup] 已清理 PROJECT_SESSION_MAP 映射: project_id={}, session_id={}",
+                    project_id, removed_session_id
+                );
             }
 
             if removed.is_some() {
@@ -270,6 +285,73 @@ impl AgentCleaner {
             }
         } else {
             warn!("Agent不存在于MAP中: {}", project_id);
+        }
+
+        Ok(())
+    }
+
+    /// 销毁Docker容器（参考 agent_stop_handler.rs 的实现）
+    async fn destroy_docker_container(&self, project_id: &str) -> Result<()> {
+        info!("🔥 [cleanup] 开始销毁Docker容器: project_id={}", project_id);
+
+        // 使用全局 DockerManager
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
+
+        // 尝试通过多种方式查找容器
+        // 1. 先通过 project_id 查找
+        let mut container_info = docker_manager.get_container_info(project_id);
+
+        // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
+        if container_info.is_none() {
+            let expected_container_name = format!("rcoder-agent-{}", project_id);
+            info!(
+                "🔍 [cleanup] 通过 project_id 未找到，尝试通过容器名称查找: {}",
+                expected_container_name
+            );
+
+            // 使用新的查找函数
+            container_info = docker_manager
+                .find_container_by_identifier(&expected_container_name)
+                .await;
+        }
+
+        if let Some(container_info) = container_info {
+            info!(
+                "🎯 [cleanup] 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
+                project_id, container_info.container_id, container_info.container_name
+            );
+
+            // 释放对应的端口（如果存在端口映射）
+            if let Some(port_binding) = container_info.port_bindings.values().next() {
+                if let Ok(port) = port_binding.parse::<u16>() {
+                    crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
+                        .release_port(port)
+                        .await;
+                    info!("🧼 [cleanup] 释放端口: {}", port);
+                }
+            }
+
+            // 停止容器
+            let stop_result = docker_manager
+                .stop_container_by_id(&container_info.container_id)
+                .await;
+
+            if let Err(e) = stop_result {
+                return Err(anyhow::anyhow!("停止Docker容器失败: {}", e));
+            }
+
+            info!(
+                "✅ [cleanup] Docker容器销毁成功: project_id={}, container_id={}, container_name={}",
+                project_id, container_info.container_id, container_info.container_name
+            );
+        } else {
+            // 容器不存在，但返回成功
+            info!(
+                "📭 [cleanup] Docker容器不存在，无需销毁: project_id={}",
+                project_id
+            );
         }
 
         Ok(())
