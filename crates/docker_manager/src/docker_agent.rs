@@ -106,7 +106,8 @@ impl DockerAgentManager {
         let container_info = self.docker_manager.create_container(config).await?;
 
         // 等待容器内的 Agent Server 启动
-        let server_url = format!("http://localhost:8086");
+        // 使用容器名称而不是 localhost，确保跨容器网络访问
+        let server_url = format!("http://{}:8086", container_info.container_name);
         self.wait_for_agent_ready(&server_url, 30).await?;
 
         // 创建 Docker Agent 信息

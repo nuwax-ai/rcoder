@@ -6,9 +6,8 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde::Serialize;
-use tokio::sync::mpsc;
 
-use crate::{config::AppConfig, handler, proxy_agent::LocalSetAgentRequest};
+use crate::{config::AppConfig, handler};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -29,9 +28,6 @@ pub struct AppState {
     pub sessions: Arc<DashMap<String, SessionInfo>>,
     /// 应用配置
     pub config: AppConfig,
-
-    /// 本地任务发送器
-    pub local_task_sender: mpsc::UnboundedSender<LocalSetAgentRequest>,
 
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<pingora_proxy::PingoraProxyService>>,

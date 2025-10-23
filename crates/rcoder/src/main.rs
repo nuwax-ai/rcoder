@@ -78,9 +78,6 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-    // 创建本地任务通道
-    let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
-
     // 创建清理配置
     let cleanup_config = CleanupConfig {
         idle_timeout: Duration::from_secs(3600),
@@ -137,8 +134,9 @@ async fn main() -> anyhow::Result<()> {
     // 初始化全局 DockerManager
     info!("🐳 初始化全局 DockerManager...");
     // 使用 rcoder 配置创建 DockerManager 配置
-    let docker_config =
-        docker_manager::utils::DockerUtils::config_from_rcoder_docker_config(config.docker_config.as_ref());
+    let docker_config = docker_manager::utils::DockerUtils::config_from_rcoder_docker_config(
+        config.docker_config.as_ref(),
+    );
     if let Err(e) =
         docker_manager::global::init_global_docker_manager_with_config(docker_config).await
     {
@@ -150,7 +148,6 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
-        local_task_sender,
         pingora_service: pingora_service_opt,
     });
 

@@ -3,7 +3,7 @@
 //! 通过 docker_manager 动态创建容器来运行 agent_runner 服务，
 //! 实现每个项目对应一个独立的 agent 容器
 
-use crate::{CancelNotificationRequest, proxy_agent::AcpConnectionInfo};
+use crate::CancelNotificationRequest;
 use agent_client_protocol::{PromptRequest, SessionId};
 use anyhow::{Context, Result};
 use docker_manager::{DockerContainerConfig, DockerContainerInfo, DockerManager, ResourceLimits};
