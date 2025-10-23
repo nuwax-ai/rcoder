@@ -1,6 +1,6 @@
 use std::{
     path::{Component, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use agent_client_protocol::{ContentBlock, PromptRequest, SessionId, TextContent}; // bring trait into scope for session_notification
@@ -20,6 +20,10 @@ use crate::{
 
 use anyhow::Result;
 
+/// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
+pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
+    LazyLock::new(DashMap::new);
+
 /// 检查模型配置是否发生变化
 fn check_model_config_changed(
     existing_config: &Option<ModelProviderConfig>,
@@ -34,7 +38,6 @@ fn check_model_config_changed(
         }
     }
 }
-
 
 /// 创建新的Agent服务
 async fn create_new_agent_service(
@@ -53,14 +56,10 @@ async fn create_new_agent_service(
     // 创建 agent 服务
     match start_agent_result {
         Ok(conn_info) => {
-            // 获取生命周期守卫，如果没有则报错
-            let lifecycle_guard = match conn_info.stop_handle {
-                Some(handle) => handle.as_ref().clone(),
-                None => {
-                    error!("缺少生命周期守卫，项目ID: {}", project_id);
-                    return;
-                }
-            };
+            // 使用现有的AgentStopHandle作为dyn AgentLifecycle
+            let stop_handle = conn_info.stop_handle.as_ref().map(|guard| {
+                guard.clone() as Arc<dyn shared_types::AgentLifecycle>
+            });
 
             let project_and_agent_info = ProjectAndAgentInfo {
                 project_id: project_id.clone(),
@@ -72,6 +71,7 @@ async fn create_new_agent_service(
                 status: AgentStatus::Idle,
                 last_activity: Utc::now(),
                 created_at: Utc::now(),
+                stop_handle,
             };
 
             // 记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
@@ -90,15 +90,6 @@ async fn create_new_agent_service(
             } else {
                 info!(
                     "🔗 Project session 映射已同步: project_id={}, session_id={}",
-                    project_id, session_id_str
-                );
-            }
-
-            // 再次确保当前 session 的历史消息被清空，避免新的 SSE 连接收到旧记录
-            // 直接移除 SESSION_CACHE 条目，确保全新开始
-            if SESSION_CACHE.remove(&session_id_str).is_some() {
-                info!(
-                    "🗑️ 移除 SESSION_CACHE 条目，确保全新开始: project_id={}, session_id={}",
                     project_id, session_id_str
                 );
             }
@@ -159,10 +150,6 @@ async fn create_new_agent_service(
         }
     }
 }
-
-/// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
-pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
-    LazyLock::new(DashMap::new);
 
 /// 在 LocalSet 中运行的实际 Agent 请求
 #[derive(Debug)]

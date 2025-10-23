@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y \
     cmake \
     build-essential
 
-# 复制源码
+# 复制源码到工作目录
+WORKDIR /app
 COPY . .
 
 # 预编译依赖，只编译 rcoder binary

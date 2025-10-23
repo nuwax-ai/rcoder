@@ -83,3 +83,55 @@ pub const DEFAULT_NETWORK_MODE: &str = "bridge";
 
 /// RCoder 专用网络名称
 pub const RCODER_NETWORK_NAME: &str = "agent-network";
+
+/// 全局 Docker 管理器实例
+pub mod global {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::OnceCell;
+    use tracing::{debug, error, info};
+
+    /// 全局 DockerManager 单例
+    static GLOBAL_DOCKER_MANAGER: OnceCell<Arc<DockerManager>> = OnceCell::const_new();
+
+    /// 初始化全局 DockerManager
+    pub async fn init_global_docker_manager() -> DockerResult<()> {
+        let config = DockerManagerConfig::default();
+        let manager = Arc::new(DockerManager::new(config).await?);
+
+        GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
+            DockerError::IoError(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "全局 DockerManager 已经初始化",
+            ))
+        })?;
+
+        info!("✅ 全局 DockerManager 初始化成功");
+        Ok(())
+    }
+
+    /// 获取全局 DockerManager 实例
+    /// 如果未初始化，会自动初始化
+    pub async fn get_global_docker_manager() -> DockerResult<Arc<DockerManager>> {
+        if GLOBAL_DOCKER_MANAGER.get().is_none() {
+            debug!("全局 DockerManager 未初始化，开始自动初始化");
+            init_global_docker_manager().await?;
+        }
+
+        GLOBAL_DOCKER_MANAGER.get().cloned().ok_or_else(|| {
+            DockerError::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "无法获取全局 DockerManager",
+            ))
+        })
+    }
+
+    /// 使用全局 DockerManager 执行操作
+    pub async fn with_global_docker_manager<F, R>(f: F) -> DockerResult<R>
+    where
+        F: FnOnce(&Arc<DockerManager>) -> R,
+    {
+        let manager = get_global_docker_manager().await?;
+        Ok(f(&manager))
+    }
+}

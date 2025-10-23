@@ -185,7 +185,10 @@ pub async fn start_claude_code_acp_agent_service(
                                 given_session_id
                             }
                             Err(e) => {
-                                warn!("load_session 失败或未实现，回退创建新会话[new_session]: {:?}", e);
+                                warn!(
+                                    "load_session 失败或未实现，回退创建新会话[new_session]: {:?}",
+                                    e
+                                );
                                 let resp = client_conn
                                     .new_session(NewSessionRequest {
                                         mcp_servers: mcp_servers.clone(),

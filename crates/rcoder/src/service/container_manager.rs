@@ -117,15 +117,13 @@ impl ContainerManager {
         debug!("[CONTAINER_MGR] 获取容器信息: project_id={}", project_id);
 
         if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
-            // 获取容器详细信息
-            let docker_manager = Arc::new(
-                docker_manager::DockerManager::with_default_config()
-                    .await
-                    .map_err(|e| {
-                        error!("❌ [CONTAINER_MGR] 创建 DockerManager 失败: {}", e);
-                        AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-                    })?,
-            );
+            // 使用全局 DockerManager 获取容器详细信息
+            let docker_manager = docker_manager::global::get_global_docker_manager()
+                .await
+                .map_err(|e| {
+                    error!("❌ [CONTAINER_MGR] 获取全局 DockerManager 失败: {}", e);
+                    AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+                })?;
 
             if let Some(container_info) = docker_manager.get_container_info(project_id) {
                 // 🎯 获取容器服务地址（使用容器名称DNS解析）
@@ -191,14 +189,13 @@ impl ContainerManager {
     pub async fn stop_container(project_id: &str) -> Result<(), AppError> {
         info!("[CONTAINER_MGR] 停止容器: project_id={}", project_id);
 
-        let docker_manager = Arc::new(
-            docker_manager::DockerManager::with_default_config()
-                .await
-                .map_err(|e| {
-                    error!("❌ [CONTAINER_MGR] 创建 DockerManager 失败: {}", e);
-                    AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-                })?,
-        );
+        // 使用全局 DockerManager
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| {
+                error!("❌ [CONTAINER_MGR] 获取全局 DockerManager 失败: {}", e);
+                AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+            })?;
 
         if let Some(container_info) = docker_manager.get_container_info(project_id) {
             docker_manager
@@ -278,11 +275,13 @@ async fn ensure_container_exists(project_id: &str) -> Result<ContainerBasicInfo,
         project_id
     );
 
-    let docker_manager =
-        std::sync::Arc::new(DockerManager::with_default_config().await.map_err(|e| {
-            error!("❌ [CONTAINER_MGR] 创建 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-        })?);
+    // 使用全局 DockerManager
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [CONTAINER_MGR] 获取全局 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+        })?;
 
     // 首先检查容器是否已存在
     if let Some(existing_container_info) = docker_manager.get_container_info(project_id) {

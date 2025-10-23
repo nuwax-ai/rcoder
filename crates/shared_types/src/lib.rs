@@ -4,6 +4,7 @@ pub use model::{
     ModelApiProtocol, ModelProviderConfig, ModelProviderSafeInfo, AgentType,
     // Agent model exports
     AgentStatus, AgentStatusResponse, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse,
+    AgentLifecycle, AgentStopHandle, AgentLifecycleGuard,
     // Session and message exports
     Attachment, AttachmentError, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
     ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,

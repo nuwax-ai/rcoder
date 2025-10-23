@@ -3,14 +3,14 @@
 use anyhow::Result;
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
-use shared_types::{ModelProviderConfig, ChatPromptBuilder};
+use shared_types::{ChatPromptBuilder, ModelProviderConfig};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::proxy_agent::*;
-use crate::{*, router::AppState};
+use crate::{router::AppState, *};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -214,7 +214,10 @@ pub async fn handle_chat(
     if let Some(ref session_id) = request.session_id {
         // 直接移除指定session
         if crate::service::SESSION_CACHE.remove(session_id).is_some() {
-            info!("🗑️ [chat] 移除旧session，确保全新开始: session_id={}, project_id={}", session_id, project_id);
+            info!(
+                "🗑️ [chat] 移除旧session，确保全新开始: session_id={}, project_id={}",
+                session_id, project_id
+            );
         }
     } else {
         // 如果没有指定session_id，清空该项目的所有session
@@ -225,7 +228,10 @@ pub async fn handle_chat(
 
             if let Some(session_project_id) = &session_info.project_id {
                 if session_project_id == &project_id {
-                    if crate::service::SESSION_CACHE.remove(current_session_id).is_some() {
+                    if crate::service::SESSION_CACHE
+                        .remove(current_session_id)
+                        .is_some()
+                    {
                         cleared_sessions += 1;
                     }
                 }
@@ -233,7 +239,10 @@ pub async fn handle_chat(
         }
 
         if cleared_sessions > 0 {
-            info!("🗑️ [chat] 移除了项目的所有旧session: project_id={}, cleared_count={}", project_id, cleared_sessions);
+            info!(
+                "🗑️ [chat] 移除了项目的所有旧session: project_id={}, cleared_count={}",
+                project_id, cleared_sessions
+            );
         }
     }
 
@@ -273,10 +282,7 @@ pub async fn handle_chat(
                     "❌ Agent 处理失败: project_id={}, session_id={}, error={}",
                     chat_prompt_response.project_id, chat_prompt_response.session_id, error_msg
                 );
-                crate::model::HttpResult::error(
-                    "PROMPT001",
-                    &error_msg,
-                )
+                crate::model::HttpResult::error("PROMPT001", &error_msg)
             } else {
                 info!(
                     "✅ 收到 agent 执行结果: project_id={}, session_id={}",

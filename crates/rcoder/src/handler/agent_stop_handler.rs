@@ -43,15 +43,13 @@ async fn destroy_container_for_project(
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     info!("🔥 [STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
 
-    // 创建 DockerManager
-    let docker_manager = std::sync::Arc::new(
-        docker_manager::DockerManager::with_default_config()
-            .await
-            .map_err(|e| {
-                error!("❌ [STOP_DESTROY] 创建 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-            })?,
-    );
+    // 使用全局 DockerManager
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [STOP_DESTROY] 获取全局 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+        })?;
 
     // 检查容器是否存在
     let container_info = docker_manager.get_container_info(project_id);
@@ -139,14 +137,13 @@ async fn ensure_container_exists_for_stop(project_id: &str) -> Result<(String, S
 
     // 获取容器服务 URL
     if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
-        let docker_manager = std::sync::Arc::new(
-            docker_manager::DockerManager::with_default_config()
-                .await
-                .map_err(|e| {
-                    error!("❌ [STOP_FORWARD] 创建 DockerManager 失败: {}", e);
-                    AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-                })?,
-        );
+        // 使用全局 DockerManager
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| {
+                error!("❌ [STOP_FORWARD] 获取全局 DockerManager 失败: {}", e);
+                AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+            })?;
 
         // 获取容器 IP 地址
         let container_info = docker_manager.get_container_info(project_id);
@@ -182,18 +179,16 @@ async fn create_container_for_stop(
         project_id
     );
 
-    // 使用 docker_container_agent 创建容器
-    let docker_manager = std::sync::Arc::new(
-        docker_manager::DockerManager::with_default_config()
-            .await
-            .map_err(|e| {
-                error!(
-                    "❌ [STOP_FORWARD] 创建 DockerManager 失败: project_id={}, error={}",
-                    project_id, e
-                );
-                AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-            })?,
-    );
+    // 使用全局 DockerManager
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!(
+                "❌ [STOP_FORWARD] 获取全局 DockerManager 失败: project_id={}, error={}",
+                project_id, e
+            );
+            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+        })?;
 
     // 创建项目工作目录
     let project_workspace =

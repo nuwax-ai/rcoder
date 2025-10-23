@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 use crate::model::AgentType;
 use agent_client_protocol::{ClientSideConnection, SessionId};
+use shared_types::{AgentLifecycle, AgentType as SharedAgentType};
 
 /// Agent生命周期守卫
 ///
@@ -132,67 +133,43 @@ impl AgentLifecycleGuard {
 
     /// 优雅停止agent
     pub async fn graceful_stop(&self) -> Result<()> {
-        if self.inner.stopped.swap(true, Ordering::SeqCst) {
-            return Ok(()); // 已经停止
+        if self.inner.stopped.load(Ordering::SeqCst) {
+            info!("Agent already stopped, skipping graceful stop");
+            return Ok(());
         }
 
-        let agent_name = match self.inner.agent_type {
-            AgentType::Claude => "Claude",
-            AgentType::Codex => "Codex",
-        };
-
         info!(
-            "[{}] 开始优雅停止agent: {} (session: {})",
-            agent_name, self.inner.project_id, self.inner.session_id.0
+            "Gracefully stopping {} agent for project: {}",
+            match self.inner.agent_type {
+                AgentType::Claude => "Claude",
+                AgentType::Codex => "Codex",
+            },
+            self.inner.project_id
         );
 
-        // 1. 发送取消信号
+        // 发送取消信号
         self.inner.cancel_token.cancel();
 
-        // 2. 等待任务自然退出
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        // 3. 强制清理资源
-        self.force_cleanup().await?;
-
-        info!(
-            "[{}] agent优雅停止完成: {}",
-            agent_name, self.inner.project_id
-        );
-
-        Ok(())
-    }
-
-    /// 强制清理资源
-    async fn force_cleanup(&self) -> Result<()> {
+        // 根据资源类型执行相应的清理操作
         match &self.inner.resources {
-            AgentResources::Claude {
-                child_process,
-                stderr_task,
-            } => {
-                // 停止stderr任务
-                if let Some(task) = stderr_task.lock().await.take() {
-                    task.abort();
-                }
-
-                // 终止子进程
-                if let Some(mut child) = child_process.lock().await.take()
-                    && let Err(e) = child.kill().await
-                {
-                    warn!("终止Claude子进程失败: {}", e);
+            AgentResources::Claude { child_process, .. } => {
+                let mut child_guard = child_process.lock().await;
+                if let Some(mut child) = child_guard.take() {
+                    info!("Stopping Claude child process");
+                    match child.wait().await {
+                        Ok(status) => info!("Claude process exited with status: {}", status),
+                        Err(e) => warn!("Failed to wait for Claude process: {}", e),
+                    }
                 }
             }
-            AgentResources::CodexSubProcess {
-                child_process,
-                stderr_task,
-            } => {
-                // 停止stderr任务
-                if let Some(task) = stderr_task.lock().await.take() {
-                    task.abort();
-                }
-                // 杀死子进程
-                if let Some(mut child) = child_process.lock().await.take() {
-                    let _ = child.kill().await;
+            AgentResources::CodexSubProcess { child_process, .. } => {
+                let mut child_guard = child_process.lock().await;
+                if let Some(mut child) = child_guard.take() {
+                    info!("Stopping Codex child process");
+                    match child.wait().await {
+                        Ok(status) => info!("Codex process exited with status: {}", status),
+                        Err(e) => warn!("Failed to wait for Codex process: {}", e),
+                    }
                 }
             }
             AgentResources::CodexEmbedded {
@@ -200,36 +177,27 @@ impl AgentLifecycleGuard {
                 channel_tasks,
                 ..
             } => {
-                // 取消所有任务
-                for task in io_tasks.lock().await.drain(..) {
+                // 取消所有IO任务
+                let mut tasks = io_tasks.lock().await;
+                for task in tasks.drain(..) {
                     task.abort();
                 }
-                for task in channel_tasks.lock().await.drain(..) {
+                // 取消所有通道任务
+                let mut tasks = channel_tasks.lock().await;
+                for task in tasks.drain(..) {
                     task.abort();
                 }
             }
         }
+
+        self.inner.stopped.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     /// 发送取消信号（非阻塞）
     pub fn cancel(&self) {
-        if !self.inner.cancel_token.is_cancelled() {
-            let agent_name = match self.inner.agent_type {
-                AgentType::Claude => "Claude",
-                AgentType::Codex => "Codex",
-            };
-            info!(
-                "[{}] 发送取消信号: {} (session: {})",
-                agent_name, self.inner.project_id, self.inner.session_id.0
-            );
-            self.inner.cancel_token.cancel();
-        }
-    }
-
-    /// 异步停止
-    pub async fn stop_async(&self) -> Result<()> {
-        self.graceful_stop().await
+        info!("Sending cancel signal to agent: {}", self.inner.project_id);
+        self.inner.cancel_token.cancel();
     }
 
     /// 检查是否已停止
@@ -311,6 +279,35 @@ impl Drop for AgentLifecycleGuard {
     }
 }
 
+// 为AgentLifecycleGuard实现AgentLifecycle trait
+impl AgentLifecycle for AgentLifecycleGuard {
+    fn graceful_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            AgentLifecycleGuard::graceful_stop(self).await
+        })
+    }
+
+    fn cancel(&self) {
+        AgentLifecycleGuard::cancel(self);
+    }
+
+    fn is_stopped(&self) -> bool {
+        AgentLifecycleGuard::is_stopped(self)
+    }
+
+    fn cancellation_token(&self) -> &CancellationToken {
+        AgentLifecycleGuard::cancellation_token(self)
+    }
+
+    fn agent_type(&self) -> SharedAgentType {
+        match AgentLifecycleGuard::agent_type(self) {
+            AgentType::Claude => SharedAgentType::Claude,
+            AgentType::Codex => SharedAgentType::Codex,
+        }
+    }
+}
+
 // 类型别名
 pub type AgentStopGuard = AgentLifecycleGuard;
 pub type AgentStopHandleArc = Arc<AgentLifecycleGuard>;
+
