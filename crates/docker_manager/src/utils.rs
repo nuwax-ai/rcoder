@@ -164,19 +164,9 @@ impl DockerUtils {
             .to_string()
     }
 
-    /// 生成容器名称
+    /// 生成容器名称：使用 project_id 而不是随机 UUID，便于管理和调试
     pub fn generate_container_name(prefix: &str, project_id: &str) -> String {
-        use uuid::Uuid;
-        format!(
-            "{}-{}-{}",
-            prefix,
-            project_id,
-            Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("unknown")
-        )
+        format!("{}-{}", prefix, project_id)
     }
 
     /// 从环境变量加载 Docker 配置

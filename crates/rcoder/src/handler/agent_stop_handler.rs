@@ -51,17 +51,34 @@ async fn destroy_container_for_project(
             AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
         })?;
 
-    // 检查容器是否存在
-    let container_info = docker_manager.get_container_info(project_id);
+    // 尝试通过多种方式查找容器
+    // 1. 先通过 project_id 查找
+    let mut container_info = docker_manager.get_container_info(project_id);
+
+    // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
+    if container_info.is_none() {
+        let expected_container_name = format!("rcoder-agent-{}", project_id);
+        info!(
+            "🔍 [STOP_DESTROY] 通过 project_id 未找到，尝试通过容器名称查找: {}",
+            expected_container_name
+        );
+
+        // 使用新的查找函数
+        container_info = docker_manager
+            .find_container_by_identifier(&expected_container_name)
+            .await;
+    }
 
     if let Some(container_info) = container_info {
         info!(
-            "🎯 [STOP_DESTROY] 找到容器，开始销毁: project_id={}, container_id={}",
-            project_id, container_info.container_id
+            "🎯 [STOP_DESTROY] 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
+            project_id, container_info.container_id, container_info.container_name
         );
 
-        // 停止容器（DockerManager 的 stop_container 方法会自动从映射中移除）
-        let stop_result = docker_manager.stop_container(project_id).await;
+        // 停止容器
+        let stop_result = docker_manager
+            .stop_container_by_id(&container_info.container_id)
+            .await;
 
         if let Err(e) = stop_result {
             error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
@@ -71,15 +88,14 @@ async fn destroy_container_for_project(
             ));
         }
 
-        // 注意：DockerManager 的 stop_container 方法应该已经处理了容器清理
-        // 我们不需要手动访问 Docker 字段，因为它是私有的
-
-        // 从全局 Agent 映射中移除
-        PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
+        // 从全局 Agent 映射中移除（如果 project_id 不是 "unknown"）
+        if container_info.project_id != "unknown" {
+            PROJECT_AND_AGENT_INFO_MAP.remove(&container_info.project_id);
+        }
 
         info!(
-            "✅ [STOP_DESTROY] 容器销毁成功: project_id={}, container_id={}",
-            project_id, container_info.container_id
+            "✅ [STOP_DESTROY] 容器销毁成功: project_id={}, container_id={}, container_name={}",
+            project_id, container_info.container_id, container_info.container_name
         );
 
         let response = StopAgentResponse {

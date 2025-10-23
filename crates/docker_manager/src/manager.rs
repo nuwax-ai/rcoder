@@ -68,16 +68,10 @@ impl DockerManager {
     ) -> DockerResult<DockerContainerInfo> {
         info!("开始创建容器，项目ID: {}", config.project_id);
 
-        // 生成容器名称
-        let container_name = format!(
-            "{}-{}-{}",
-            config.name_prefix,
-            config.project_id,
-            Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("unknown")
+        // 生成容器名称：使用工具函数统一维护
+        let container_name = super::utils::DockerUtils::generate_container_name(
+            &config.name_prefix,
+            &config.project_id,
         );
 
         // 检查是否已存在该项目的容器
@@ -302,6 +296,71 @@ impl DockerManager {
     /// 获取容器信息
     pub fn get_container_info(&self, project_id: &str) -> Option<DockerContainerInfo> {
         self.containers.get(project_id).map(|info| info.clone())
+    }
+
+    /// 通过多种方式查找容器：project_id 或容器名称
+    pub async fn find_container_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Option<DockerContainerInfo> {
+        // 1. 首先尝试通过 project_id 查找
+        if let Some(info) = self.containers.get(identifier) {
+            return Some(info.clone());
+        }
+
+        // 2. 如果没找到，尝试通过容器名称查找
+        for entry in self.containers.iter() {
+            let info = entry.value();
+            if info.container_name == identifier {
+                return Some(info.clone());
+            }
+        }
+
+        // 3. 如果还没找到，尝试通过 Docker API 直接查找容器（适用于容器存在但映射缺失的情况）
+        use bollard::container::ListContainersOptions;
+        let options = Some(ListContainersOptions::<String> {
+            all: true,
+            ..Default::default()
+        });
+
+        if let Ok(containers) = self.docker.list_containers(options).await {
+            for container in containers {
+                if let Some(names) = container.names {
+                    for name in names {
+                        // Docker 容器名称通常以 '/' 开头，需要去掉
+                        let clean_name = name.trim_start_matches('/');
+                        if clean_name == identifier {
+                            let container_id = container.id.clone().unwrap_or_default();
+                            info!(
+                                "通过 Docker API 找到容器: {} (ID: {})",
+                                identifier, container_id
+                            );
+                            // 创建一个临时的容器信息，用于销毁
+                            return Some(DockerContainerInfo {
+                                container_id,
+                                container_name: clean_name.to_string(),
+                                project_id: "unknown".to_string(), // 我们无法直接知道 project_id
+                                image: container.image.unwrap_or_default(),
+                                status: ContainerStatus::Unknown(
+                                    "found_via_docker_api".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                                started_at: None,
+                                host_path: String::new(),
+                                container_path: String::new(),
+                                port_bindings: std::collections::HashMap::new(),
+                                assigned_port: 0,
+                                health_status: None,
+                                internal_port: 0,
+                                session_id: String::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// 获取所有容器信息
