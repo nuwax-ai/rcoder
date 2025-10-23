@@ -119,7 +119,7 @@ fn generate_request_id() -> String {
     description = "根据 project_id 动态管理容器，将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
 )]
 #[axum::debug_handler]
-#[instrument(skip(_state), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
+#[instrument(skip(_state,request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
 pub async fn handle_chat(
     State(_state): State<Arc<AppState>>,
     Json(mut request): Json<ChatRequest>,
@@ -128,7 +128,7 @@ pub async fn handle_chat(
         Some(id) => id.clone(),
         None => {
             let project_id = crate::service::container_manager::generate_project_id();
-            request.project_id = Some(project_id.clone());  // 设置 project_id
+            request.project_id = Some(project_id.clone()); // 设置 project_id
             project_id
         }
     };

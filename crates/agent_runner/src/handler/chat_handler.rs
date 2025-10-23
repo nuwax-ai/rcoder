@@ -172,7 +172,7 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
     description = "通过 ACP 协议发送聊天消息给 AI 代理，支持文本和多媒体内容"
 )]
 #[axum::debug_handler]
-#[instrument(skip(state))]
+#[instrument(skip(state, request))]
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChatRequest>,
