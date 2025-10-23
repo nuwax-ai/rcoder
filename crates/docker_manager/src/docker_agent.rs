@@ -2,7 +2,10 @@
 //!
 //! 这个模块提供了与 Docker 容器内 Agent Server 通信的功能
 
-use super::{DockerContainerConfig, DockerContainerInfo, DockerManager, DockerManagerConfig, DockerResult, MountPoint};
+use super::{
+    DockerContainerConfig, DockerContainerInfo, DockerManager, DockerManagerConfig, DockerResult,
+    MountPoint,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,7 +77,10 @@ impl DockerAgentManager {
         host_workspace_dir: &str,
         model_provider: Option<HashMap<String, String>>,
     ) -> Result<DockerAgentInfo> {
-        info!("开始创建 Docker Agent，项目ID: {}, Agent类型: {:?}", project_id, agent_type);
+        info!(
+            "开始创建 Docker Agent，项目ID: {}, Agent类型: {:?}",
+            project_id, agent_type
+        );
 
         // 检查是否已存在该项目的 Docker Agent
         if let Some(existing) = self.agents.get(project_id) {
@@ -113,7 +119,8 @@ impl DockerAgentManager {
         };
 
         // 保存到映射
-        self.agents.insert(project_id.to_string(), docker_agent_info.clone());
+        self.agents
+            .insert(project_id.to_string(), docker_agent_info.clone());
 
         info!("Docker Agent 创建成功: {}", container_info.container_name);
 
@@ -143,18 +150,28 @@ impl DockerAgentManager {
 
     /// 列出所有 Docker Agent
     pub fn list_docker_agents(&self) -> Vec<DockerAgentInfo> {
-        self.agents.iter().map(|entry| entry.value().clone()).collect()
+        self.agents
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// 停止所有 Docker Agent
     pub async fn stop_all_docker_agents(&self) -> Result<()> {
         info!("开始停止所有 Docker Agent");
 
-        let project_ids: Vec<String> = self.agents.iter().map(|entry| entry.key().clone()).collect();
+        let project_ids: Vec<String> = self
+            .agents
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
 
         for project_id in project_ids {
             if let Err(e) = self.stop_docker_agent(&project_id).await {
-                error!("停止 Docker Agent 失败，项目ID: {}, 错误: {}", project_id, e);
+                error!(
+                    "停止 Docker Agent 失败，项目ID: {}, 错误: {}",
+                    project_id, e
+                );
             }
         }
 
@@ -164,12 +181,18 @@ impl DockerAgentManager {
 
     /// 检查 Docker Agent 状态
     pub async fn check_agent_status(&self, project_id: &str) -> Result<Option<ContainerStatus>> {
-        self.docker_manager.update_container_status(project_id).await.map_err(|e| anyhow::anyhow!("更新容器状态失败: {}", e))
+        self.docker_manager
+            .update_container_status(project_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("更新容器状态失败: {}", e))
     }
 
     /// 获取 Docker Agent 日志
     pub async fn get_agent_logs(&self, project_id: &str, lines: i64) -> Result<String> {
-        self.docker_manager.get_container_logs(project_id, lines).await.map_err(|e| anyhow::anyhow!("获取容器日志失败: {}", e))
+        self.docker_manager
+            .get_container_logs(project_id, lines)
+            .await
+            .map_err(|e| anyhow::anyhow!("获取容器日志失败: {}", e))
     }
 
     /// 发送聊天请求到 Docker Agent
@@ -178,7 +201,8 @@ impl DockerAgentManager {
         project_id: &str,
         request: ChatRequest,
     ) -> Result<ChatResponse> {
-        let agent_info = self.get_docker_agent(project_id)
+        let agent_info = self
+            .get_docker_agent(project_id)
             .ok_or_else(|| anyhow::anyhow!("项目 {} 没有对应的 Docker Agent", project_id))?;
 
         // 发送 HTTP 请求到容器内的 Agent Server
@@ -196,12 +220,18 @@ impl DockerAgentManager {
             .map_err(|e| anyhow::anyhow!("发送请求失败: {}", e))?;
 
         if response.status().is_success() {
-            let chat_response: ChatResponse = response.json().await
+            let chat_response: ChatResponse = response
+                .json()
+                .await
                 .map_err(|e| anyhow::anyhow!("解析响应失败: {}", e))?;
             Ok(chat_response)
         } else {
             let error_text = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!("请求失败: {} - {}", response.status(), error_text))
+            Err(anyhow::anyhow!(
+                "请求失败: {} - {}",
+                response.status(),
+                error_text
+            ))
         }
     }
 
@@ -279,7 +309,7 @@ impl DockerAgentManager {
         // 创建容器配置
         let config = DockerContainerConfig {
             project_id: project_id.to_string(),
-            image: "registry.yichamao.com/rcoder:latest".to_string(),
+            image: crate::default_docker_image(),
             name_prefix: "rcoder-docker-agent".to_string(),
             host_path: format!("{}/{}", host_workspace_dir, project_id),
             container_path: "/app/workspace".to_string(),
@@ -341,5 +371,5 @@ pub struct Attachment {
     pub size: Option<u64>,
 }
 
-use dashmap::DashMap;
 use agent_client_protocol::ContainerStatus;
+use dashmap::DashMap;

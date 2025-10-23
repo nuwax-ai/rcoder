@@ -170,7 +170,7 @@ impl DockerManager {
         // 创建容器选项
         let create_options = CreateContainerOptions {
             name: Some(container_name.clone()),
-            platform: "linux/amd64".to_string(), // 默认平台
+            platform: self.config.default_platform.clone(), // 使用配置中的平台
         };
 
         // 创建容器

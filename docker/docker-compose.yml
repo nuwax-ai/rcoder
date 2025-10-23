@@ -7,6 +7,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8087}
+      - RUST_LOG=debug # 设置调试日志级别
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
     volumes:

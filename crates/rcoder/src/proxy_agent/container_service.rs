@@ -450,7 +450,7 @@ impl ContainerService {
 
         Ok(docker_manager::DockerContainerConfig {
             project_id: project_id.to_string(),
-            image: "registry.yichamao.com/rcoder:latest".to_string(),
+            image: docker_manager::default_docker_image(),
             name_prefix: "rcoder-agent".to_string(),
             host_path: project_path.to_string_lossy().to_string(),
             container_path: "/app/workspace".to_string(),

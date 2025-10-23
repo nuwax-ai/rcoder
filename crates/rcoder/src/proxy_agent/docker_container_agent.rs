@@ -167,7 +167,7 @@ async fn create_docker_container_config(
 
     Ok(DockerContainerConfig {
         project_id: project_id.to_string(),
-        image: "registry.yichamao.com/rcoder:latest".to_string(),
+        image: docker_manager::default_docker_image(),
         name_prefix: "rcoder-agent".to_string(),
         host_path: host_project_path.to_string_lossy().to_string(), // 🎯 使用宿主机绝对路径
         container_path: "/app/workspace".to_string(),

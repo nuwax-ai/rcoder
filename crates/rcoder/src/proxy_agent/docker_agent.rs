@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashMap;
-use docker_manager::{DockerContainerConfig, DockerContainerInfo, DockerManager, DockerManagerConfig, DockerUtils};
+use docker_manager::{
+    DockerContainerConfig, DockerContainerInfo, DockerManager, DockerManagerConfig, DockerUtils,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -37,7 +39,13 @@ pub struct DockerAgentInfo {
 impl DockerAgentManager {
     /// 创建新的 Docker Agent 管理器
     pub async fn new() -> Result<Self> {
-        let config = DockerManagerConfig::default();
+        let config = DockerUtils::config_from_env();
+
+        // 🔍 调试日志：打印初始化配置
+        info!("🔍 DockerAgentManager 初始化配置:");
+        info!("  - default_platform: {}", config.default_platform);
+        info!("  - default_image: {}", config.default_image);
+
         let docker_manager = Arc::new(DockerManager::new(config).await?);
 
         info!("Docker Agent 管理器初始化成功");
@@ -66,11 +74,17 @@ impl DockerAgentManager {
         chat_prompt: &ChatPrompt,
         agent_type: AgentType,
     ) -> Result<DockerAgentInfo> {
-        info!("开始创建 Docker Agent，项目ID: {}, Agent类型: {:?}", chat_prompt.project_id, agent_type);
+        info!(
+            "开始创建 Docker Agent，项目ID: {}, Agent类型: {:?}",
+            chat_prompt.project_id, agent_type
+        );
 
         // 检查是否已存在该项目的 Docker Agent
         if let Some(existing) = self.agents.get(&chat_prompt.project_id) {
-            warn!("项目 {} 已存在 Docker Agent，将先停止", chat_prompt.project_id);
+            warn!(
+                "项目 {} 已存在 Docker Agent，将先停止",
+                chat_prompt.project_id
+            );
             self.stop_docker_agent(&chat_prompt.project_id).await?;
         }
 
@@ -95,7 +109,8 @@ impl DockerAgentManager {
         };
 
         // 保存到映射
-        self.agents.insert(chat_prompt.project_id.clone(), docker_agent_info.clone());
+        self.agents
+            .insert(chat_prompt.project_id.clone(), docker_agent_info.clone());
 
         info!("Docker Agent 创建成功: {}", container_info.container_name);
 
@@ -125,18 +140,28 @@ impl DockerAgentManager {
 
     /// 列出所有 Docker Agent
     pub fn list_docker_agents(&self) -> Vec<DockerAgentInfo> {
-        self.agents.iter().map(|entry| entry.value().clone()).collect()
+        self.agents
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// 停止所有 Docker Agent
     pub async fn stop_all_docker_agents(&self) -> Result<()> {
         info!("开始停止所有 Docker Agent");
 
-        let project_ids: Vec<String> = self.agents.iter().map(|entry| entry.key().clone()).collect();
+        let project_ids: Vec<String> = self
+            .agents
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
 
         for project_id in project_ids {
             if let Err(e) = self.stop_docker_agent(&project_id).await {
-                error!("停止 Docker Agent 失败，项目ID: {}, 错误: {}", project_id, e);
+                error!(
+                    "停止 Docker Agent 失败，项目ID: {}, 错误: {}",
+                    project_id, e
+                );
             }
         }
 
@@ -145,17 +170,30 @@ impl DockerAgentManager {
     }
 
     /// 检查 Docker Agent 状态
-    pub async fn check_agent_status(&self, project_id: &str) -> Result<Option<docker_manager::ContainerStatus>> {
-        self.docker_manager.update_container_status(project_id).await.map_err(|e| anyhow::anyhow!("更新容器状态失败: {}", e))
+    pub async fn check_agent_status(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<docker_manager::ContainerStatus>> {
+        self.docker_manager
+            .update_container_status(project_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("更新容器状态失败: {}", e))
     }
 
     /// 获取 Docker Agent 日志
     pub async fn get_agent_logs(&self, project_id: &str, lines: i64) -> Result<String> {
-        self.docker_manager.get_container_logs(project_id, lines).await.map_err(|e| anyhow::anyhow!("获取容器日志失败: {}", e))
+        self.docker_manager
+            .get_container_logs(project_id, lines)
+            .await
+            .map_err(|e| anyhow::anyhow!("获取容器日志失败: {}", e))
     }
 
     /// 创建 Docker 容器配置
-    async fn create_docker_config(&self, chat_prompt: &ChatPrompt, agent_type: AgentType) -> Result<DockerContainerConfig> {
+    async fn create_docker_config(
+        &self,
+        chat_prompt: &ChatPrompt,
+        agent_type: AgentType,
+    ) -> Result<DockerContainerConfig> {
         let mut env_vars = HashMap::new();
 
         // 根据 Agent 类型设置环境变量
@@ -164,19 +202,34 @@ impl DockerAgentManager {
                 // Claude Code 环境变量
                 if let Some(model_provider) = &chat_prompt.model_provider {
                     if !model_provider.base_url.is_empty() {
-                        env_vars.insert("ANTHROPIC_BASE_URL".to_string(), model_provider.base_url.clone());
+                        env_vars.insert(
+                            "ANTHROPIC_BASE_URL".to_string(),
+                            model_provider.base_url.clone(),
+                        );
                     }
                     if !model_provider.api_key.is_empty() {
-                        env_vars.insert("ANTHROPIC_AUTH_TOKEN".to_string(), model_provider.api_key.clone());
+                        env_vars.insert(
+                            "ANTHROPIC_AUTH_TOKEN".to_string(),
+                            model_provider.api_key.clone(),
+                        );
                     }
                     if !model_provider.default_model.is_empty() {
-                        env_vars.insert("ANTHROPIC_MODEL".to_string(), model_provider.default_model.clone());
-                        env_vars.insert("ANTHROPIC_SMALL_FAST_MODEL".to_string(), model_provider.default_model.clone());
+                        env_vars.insert(
+                            "ANTHROPIC_MODEL".to_string(),
+                            model_provider.default_model.clone(),
+                        );
+                        env_vars.insert(
+                            "ANTHROPIC_SMALL_FAST_MODEL".to_string(),
+                            model_provider.default_model.clone(),
+                        );
                     }
                 }
 
                 // 固定开启 yolo 模式
-                env_vars.insert("CLAUDE_CODE_ARGS".to_string(), "--dangerously-skip-permissions".to_string());
+                env_vars.insert(
+                    "CLAUDE_CODE_ARGS".to_string(),
+                    "--dangerously-skip-permissions".to_string(),
+                );
 
                 // 添加项目 ID 环境变量
                 env_vars.insert("PROJECT_ID".to_string(), chat_prompt.project_id.clone());
@@ -195,10 +248,16 @@ impl DockerAgentManager {
                     env_vars.insert("CODEX_API_KEY".to_string(), api_key_value.clone());
 
                     if !model_provider.base_url.is_empty() {
-                        env_vars.insert("OPENAI_API_BASE".to_string(), model_provider.base_url.clone());
+                        env_vars.insert(
+                            "OPENAI_API_BASE".to_string(),
+                            model_provider.base_url.clone(),
+                        );
                     }
                     if !model_provider.default_model.is_empty() {
-                        env_vars.insert("OPENAI_MODEL".to_string(), model_provider.default_model.clone());
+                        env_vars.insert(
+                            "OPENAI_MODEL".to_string(),
+                            model_provider.default_model.clone(),
+                        );
                     }
                 }
 
@@ -215,7 +274,7 @@ impl DockerAgentManager {
         // 创建容器配置
         let config = DockerContainerConfig {
             project_id: chat_prompt.project_id.clone(),
-            image: "registry.yichamao.com/rcoder:latest".to_string(),
+            image: docker_manager::default_docker_image(),
             name_prefix: "rcoder-docker-agent".to_string(),
             host_path: chat_prompt.project_path.to_string_lossy().to_string(),
             container_path: "/app/workspace".to_string(),
@@ -249,7 +308,9 @@ impl DockerAgentLifecycleGuard {
 
     /// 异步停止 Docker Agent
     pub async fn stop_async(&self) -> Result<()> {
-        self.docker_manager.stop_docker_agent(&self.project_id).await
+        self.docker_manager
+            .stop_docker_agent(&self.project_id)
+            .await
     }
 }
 

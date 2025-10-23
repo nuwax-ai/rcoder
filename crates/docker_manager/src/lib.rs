@@ -60,8 +60,20 @@ pub enum DockerError {
 /// Docker 管理器结果类型
 pub type DockerResult<T> = Result<T, DockerError>;
 
-/// 默认的 Docker 镜像
-pub const DEFAULT_DOCKER_IMAGE: &str = "registry.yichamao.com/rcoder:latest";
+/// 默认的 Docker 镜像（根据架构自动选择）
+pub fn default_docker_image() -> String {
+    let platform = crate::utils::DockerUtils::auto_detect_platform();
+    match platform.as_str() {
+        "linux/arm64" => "registry.yichamao.com/rcoder:latest-arm64".to_string(),
+        "linux/amd64" => "registry.yichamao.com/rcoder:latest-amd64".to_string(),
+        _ => "registry.yichamao.com/rcoder:latest".to_string(), // 默认回退
+    }
+}
+
+/// 默认的平台（使用自动检测）
+pub fn default_platform() -> String {
+    crate::utils::DockerUtils::auto_detect_platform()
+}
 
 /// 默认的工作目录
 pub const DEFAULT_WORK_DIR: &str = "/app/workspace";

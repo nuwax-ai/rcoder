@@ -7,6 +7,71 @@ use tracing::debug;
 pub struct DockerUtils;
 
 impl DockerUtils {
+    /// 自动检测当前系统架构并返回对应的 Docker 平台字符串
+    pub fn auto_detect_platform() -> String {
+        let arch = std::env::consts::ARCH;
+        let os = std::env::consts::OS;
+
+        debug!("检测到系统架构: {} {}", os, arch);
+
+        match (os, arch) {
+            // macOS ARM64
+            ("macos", "aarch64") => "linux/arm64",
+            // Linux ARM64
+            ("linux", "aarch64") => "linux/arm64",
+            // macOS AMD64
+            ("macos", "x86_64") => "linux/amd64",
+            // Linux AMD64
+            ("linux", "x86_64") => "linux/amd64",
+            // Windows AMD64 (在 Windows 上运行 Docker Desktop)
+            ("windows", "x86_64") => "linux/amd64",
+            // 其他 ARM64 变体
+            (_, "arm64") => "linux/arm64",
+            // 默认回退到 AMD64
+            _ => {
+                debug!("未知架构 {} {}, 默认使用 linux/amd64", os, arch);
+                "linux/amd64"
+            }
+        }
+        .to_string()
+    }
+
+    /// 获取最佳的平台配置（优先使用环境变量，否则自动检测）
+    pub fn get_optimal_platform() -> String {
+        // 优先使用环境变量
+        if let Ok(platform) = std::env::var("DOCKER_DEFAULT_PLATFORM") {
+            debug!("使用环境变量配置的平台: {}", platform);
+            return platform;
+        }
+
+        // 否则自动检测
+        let detected = Self::auto_detect_platform();
+        debug!("自动检测到的平台: {}", detected);
+        detected
+    }
+
+    /// 检查镜像是否与当前架构兼容
+    pub fn is_image_compatible_with_current_arch(image_tag: &str) -> bool {
+        let current_platform = Self::get_optimal_platform();
+
+        // 根据镜像标签判断架构
+        let image_platform = if image_tag.contains("arm64") || image_tag.contains("aarch64") {
+            "linux/arm64"
+        } else if image_tag.contains("amd64") || image_tag.contains("x86_64") {
+            "linux/amd64"
+        } else {
+            // 如果标签不包含架构信息，假设兼容
+            return true;
+        };
+
+        let compatible = current_platform == image_platform;
+        debug!(
+            "镜像 {} 平台 {} 与当前平台 {} 兼容性: {}",
+            image_tag, image_platform, current_platform, compatible
+        );
+        compatible
+    }
+
     /// 根据项目 ID 创建容器配置
     pub fn create_config_from_project_id(
         project_id: &str,
@@ -24,10 +89,17 @@ impl DockerUtils {
         }
 
         // 设置默认环境变量
-        config.env_vars.insert("RUST_LOG".to_string(), "info".to_string());
-        config.env_vars.insert("TZ".to_string(), "Asia/Shanghai".to_string());
+        config
+            .env_vars
+            .insert("RUST_LOG".to_string(), "info".to_string());
+        config
+            .env_vars
+            .insert("TZ".to_string(), "Asia/Shanghai".to_string());
 
-        debug!("为项目 {} 创建 Docker 配置: workspace={}", project_id, project_path);
+        debug!(
+            "为项目 {} 创建 Docker 配置: workspace={}",
+            project_id, project_path
+        );
 
         config
     }
@@ -42,7 +114,9 @@ impl DockerUtils {
         let mut config = Self::create_config_from_project_id(project_id, base_workspace_dir, None);
 
         // 添加 Agent 类型环境变量
-        config.env_vars.insert("AGENT_TYPE".to_string(), agent_type.to_string());
+        config
+            .env_vars
+            .insert("AGENT_TYPE".to_string(), agent_type.to_string());
 
         // 添加额外环境变量
         for (key, value) in additional_env {
@@ -52,7 +126,9 @@ impl DockerUtils {
         // 根据需要设置端口映射
         if agent_type == "claude" {
             // Claude Code 可能需要特定端口
-            config.port_bindings.insert("8086/tcp".to_string(), "0".to_string()); // 动态分配端口
+            config
+                .port_bindings
+                .insert("8086/tcp".to_string(), "0".to_string()); // 动态分配端口
         }
 
         config
@@ -91,7 +167,16 @@ impl DockerUtils {
     /// 生成容器名称
     pub fn generate_container_name(prefix: &str, project_id: &str) -> String {
         use uuid::Uuid;
-        format!("{}-{}-{}", prefix, project_id, Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown"))
+        format!(
+            "{}-{}-{}",
+            prefix,
+            project_id,
+            Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        )
     }
 
     /// 从环境变量加载 Docker 配置
@@ -105,6 +190,14 @@ impl DockerUtils {
         if let Ok(image) = std::env::var("DEFAULT_DOCKER_IMAGE") {
             config.default_image = image;
         }
+
+        // 自动检测平台配置（优先使用环境变量，否则自动检测）
+        config.default_platform = Self::get_optimal_platform();
+
+        // 🔍 调试日志：打印自动检测结果
+        debug!("🔍 DockerUtils::config_from_env 自动检测结果:");
+        debug!("  - default_platform: {}", config.default_platform);
+        debug!("  - default_image: {}", config.default_image);
 
         if let Ok(network) = std::env::var("DOCKER_NETWORK_MODE") {
             config.default_network_mode = network;

@@ -60,7 +60,7 @@ impl Default for DockerContainerConfig {
     fn default() -> Self {
         Self {
             project_id: String::new(),
-            image: crate::DEFAULT_DOCKER_IMAGE.to_string(),
+            image: crate::default_docker_image(),
             name_prefix: "rcoder-agent".to_string(),
             host_path: String::new(),
             container_path: crate::DEFAULT_WORK_DIR.to_string(),
@@ -196,6 +196,8 @@ pub struct DockerManagerConfig {
     pub docker_host: Option<String>,
     /// 默认镜像
     pub default_image: String,
+    /// 默认平台
+    pub default_platform: String,
     /// 默认网络模式
     pub default_network_mode: String,
     /// 默认工作目录
@@ -210,7 +212,8 @@ impl Default for DockerManagerConfig {
     fn default() -> Self {
         Self {
             docker_host: None, // 使用默认的 Docker socket
-            default_image: crate::DEFAULT_DOCKER_IMAGE.to_string(),
+            default_image: crate::default_docker_image(),
+            default_platform: crate::default_platform(),
             default_network_mode: crate::DEFAULT_NETWORK_MODE.to_string(),
             default_work_dir: crate::DEFAULT_WORK_DIR.to_string(),
             auto_cleanup: true,
