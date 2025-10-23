@@ -1,8 +1,8 @@
 # rcoder 配置文件
 # 该文件在首次启动时自动生成
 
-# 默认使用的 AI 代理类型 (Codex/Claude/Proxy)
-default_agent: Codex
+# 默认使用的 AI 代理类型 (Codex/Claude)
+default_agent: Claude
 
 # 项目工作目录
 projects_dir: ./project_workspace
@@ -27,3 +27,27 @@ proxy_config:
     timeout_seconds: 1
     healthy_threshold: 2
     unhealthy_threshold: 3
+
+# Docker 配置
+docker_config:
+  # Docker 镜像名称 (留空使用默认镜像)
+  # 如果指定了此字段，将优先使用该镜像，忽略架构特定镜像
+  image: null
+
+  # ARM64 架构专用镜像
+  arm64_image: "registry.yichamao.com/rcoder:latest-arm64"
+
+  # AMD64 架构专用镜像
+  amd64_image: "registry.yichamao.com/rcoder:latest-amd64"
+
+  # 默认网络模式
+  network_mode: "bridge"
+
+  # 默认工作目录
+  work_dir: "/app"
+
+  # 是否启用自动清理
+  auto_cleanup: true
+
+  # 容器存活时间（秒）
+  container_ttl_seconds: 3600
