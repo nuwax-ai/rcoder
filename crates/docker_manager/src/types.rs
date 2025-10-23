@@ -32,6 +32,8 @@ pub struct DockerContainerConfig {
     pub extra_mounts: Vec<MountPoint>,
     /// 启动命令
     pub command: Option<Vec<String>>,
+    /// 入口点 (覆盖镜像默认入口点)
+    pub entrypoint: Option<Vec<String>>,
 }
 
 /// 挂载点配置
@@ -72,6 +74,7 @@ impl Default for DockerContainerConfig {
             resource_limits: None,
             extra_mounts: Vec::new(),
             command: None,
+            entrypoint: None,
         }
     }
 }

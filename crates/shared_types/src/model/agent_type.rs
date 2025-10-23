@@ -1,8 +1,11 @@
-//! Agent 类型定义 - rcoder 和 agent_runer 共用
+//! Agent 类型定义 - rcoder 和 agent_runner 共用
 
 use super::model_provider::ModelProviderConfig;
 use anyhow::Result;
-use codex_core::{config::{find_codex_home, load_config_as_toml, ConfigToml}, ModelProviderInfo, WireApi};
+use codex_core::{
+    ModelProviderInfo, WireApi,
+    config::{ConfigToml, find_codex_home, load_config_as_toml},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{error, info, warn};

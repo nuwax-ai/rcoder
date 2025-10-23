@@ -167,6 +167,11 @@ impl DockerManager {
             container_config.cmd = Some(command);
         }
 
+        // 设置入口点
+        if let Some(entrypoint) = config.entrypoint {
+            container_config.entrypoint = Some(entrypoint);
+        }
+
         // 创建容器选项
         let create_options = CreateContainerOptions {
             name: Some(container_name.clone()),
@@ -195,7 +200,13 @@ impl DockerManager {
         }
 
         // 等待容器启动完成
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // 检查容器状态，确保容器正在运行
+        self.check_container_health(&container_id).await?;
+
+        // 再次等待确保网络配置完成
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
         // 创建容器信息
         let container_info = DockerContainerInfo {
@@ -623,6 +634,62 @@ impl DockerManager {
         }
 
         Ok(network_ips)
+    }
+
+    /// 检查容器健康状态
+    async fn check_container_health(&self, container_id: &str) -> DockerResult<()> {
+        use bollard::query_parameters::InspectContainerOptions;
+
+        // 检查容器详细信息
+        let inspect = self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| DockerError::ConnectionError(format!("检查容器状态失败: {}", e)))?;
+
+        // 检查容器状态
+        if let Some(state) = inspect.state {
+            let status = state.status.as_deref().unwrap_or("unknown");
+            let exit_code = state.exit_code.unwrap_or(-1);
+
+            match status {
+                "running" => {
+                    info!("✅ 容器 {} 正在运行", container_id);
+                    return Ok(());
+                }
+                "exited" => {
+                    let error_msg = state.error.as_deref().unwrap_or("未知错误");
+                    error!(
+                        "❌ 容器 {} 已退出 (退出码: {}): {}",
+                        container_id, exit_code, error_msg
+                    );
+                    return Err(DockerError::ContainerStartError(format!(
+                        "容器启动后立即退出: {} (退出码: {}), 错误: {}",
+                        container_id, exit_code, error_msg
+                    )));
+                }
+                "created" => {
+                    warn!("⚠️ 容器 {} 已创建但未启动", container_id);
+                    return Err(DockerError::ContainerStartError(format!(
+                        "容器已创建但未启动: {}",
+                        container_id
+                    )));
+                }
+                _ => {
+                    error!("❌ 容器 {} 处于未知状态: {}", container_id, status);
+                    return Err(DockerError::ContainerStartError(format!(
+                        "容器处于未知状态: {} - {}",
+                        container_id, status
+                    )));
+                }
+            }
+        } else {
+            error!("❌ 无法获取容器 {} 的状态信息", container_id);
+            return Err(DockerError::ContainerStartError(format!(
+                "无法获取容器状态信息: {}",
+                container_id
+            )));
+        }
     }
 
     /// 获取 RCoder 网络名称
