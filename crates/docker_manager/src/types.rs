@@ -224,6 +224,25 @@ pub struct DockerImageConfig {
     pub amd64_image: Option<String>,
 }
 
+/// Docker 配置（从 rcoder 配置传递）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerConfig {
+    /// Docker 镜像名称（根据架构自动选择）
+    pub image: Option<String>,
+    /// ARM64 架构的 Docker 镜像
+    pub arm64_image: Option<String>,
+    /// AMD64 架构的 Docker 镜像
+    pub amd64_image: Option<String>,
+    /// 默认网络模式
+    pub network_mode: Option<String>,
+    /// 默认工作目录
+    pub work_dir: Option<String>,
+    /// 是否启用自动清理
+    pub auto_cleanup: Option<bool>,
+    /// 容器存活时间（秒）
+    pub container_ttl_seconds: Option<u64>,
+}
+
 impl Default for DockerManagerConfig {
     fn default() -> Self {
         Self {

@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     info!("🐳 初始化全局 DockerManager...");
     // 使用 rcoder 配置创建 DockerManager 配置
     let docker_config =
-        docker_manager::utils::DockerUtils::config_from_rcoder_config(config.docker_config.clone());
+        docker_manager::utils::DockerUtils::config_from_rcoder_docker_config(config.docker_config.as_ref());
     if let Err(e) =
         docker_manager::global::init_global_docker_manager_with_config(docker_config).await
     {

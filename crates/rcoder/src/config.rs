@@ -141,6 +141,37 @@ impl Default for DockerConfig {
     }
 }
 
+// 为 DockerConfig 实现 DockerConfigTrait，以便与 docker_manager 兼容
+impl docker_manager::utils::DockerConfigTrait for DockerConfig {
+    fn image(&self) -> &Option<String> {
+        &self.image
+    }
+    
+    fn arm64_image(&self) -> &Option<String> {
+        &self.arm64_image
+    }
+    
+    fn amd64_image(&self) -> &Option<String> {
+        &self.amd64_image
+    }
+    
+    fn network_mode(&self) -> &Option<String> {
+        &self.network_mode
+    }
+    
+    fn work_dir(&self) -> &Option<String> {
+        &self.work_dir
+    }
+    
+    fn auto_cleanup(&self) -> &Option<bool> {
+        &self.auto_cleanup
+    }
+    
+    fn container_ttl_seconds(&self) -> &Option<u64> {
+        &self.container_ttl_seconds
+    }
+}
+
 /// 加载配置
 /// 配置优先级：命令行参数 > 环境变量 > 配置文件 > 默认配置
 pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
@@ -364,14 +395,13 @@ docker_config:
             .health_check
             .unhealthy_threshold,
         // Docker 配置部分
-        let docker_config = config.docker_config.as_ref().unwrap();
-        docker_config.image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        docker_config.arm64_image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        docker_config.amd64_image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        docker_config.network_mode.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        docker_config.work_dir.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        docker_config.auto_cleanup.map_or("null".to_string(), |b| b.to_string()),
-        docker_config.container_ttl_seconds.map_or("null".to_string(), |s| s.to_string())
+        config.docker_config.as_ref().unwrap().image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        config.docker_config.as_ref().unwrap().arm64_image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        config.docker_config.as_ref().unwrap().amd64_image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        config.docker_config.as_ref().unwrap().network_mode.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        config.docker_config.as_ref().unwrap().work_dir.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        config.docker_config.as_ref().unwrap().auto_cleanup.map_or("null".to_string(), |b| b.to_string()),
+        config.docker_config.as_ref().unwrap().container_ttl_seconds.map_or("null".to_string(), |s| s.to_string())
     );
 
     fs::write(CONFIG_FILE, content_with_comments)

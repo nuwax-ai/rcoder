@@ -1,4 +1,4 @@
-use super::{DockerContainerConfig, DockerManagerConfig, DockerResult};
+use super::{DockerContainerConfig, DockerManagerConfig, DockerResult, DockerImageConfig};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::debug;
@@ -210,11 +210,16 @@ impl DockerUtils {
 
     /// 从 rcoder 配置和环境变量加载 Docker 配置
     pub fn config_from_rcoder_config(
-        docker_config: Option<crate::config::DockerConfig>,
+        docker_config: Option<crate::types::DockerConfig>,
     ) -> DockerManagerConfig {
         let mut config = Self::config_from_env();
 
         if let Some(docker_cfg) = docker_config {
+            // 克隆镜像配置用于后续使用
+            let image = docker_cfg.image.clone();
+            let arm64_image = docker_cfg.arm64_image.clone();
+            let amd64_image = docker_cfg.amd64_image.clone();
+
             // 使用 rcoder 配置中的镜像设置
             let image_config = DockerImageConfig {
                 default_image: docker_cfg.image,
@@ -239,12 +244,69 @@ impl DockerUtils {
 
             // 根据配置更新默认镜像
             config.default_image = super::get_docker_image_from_config(
-                docker_cfg.image,
-                docker_cfg.arm64_image,
-                docker_cfg.amd64_image,
+                image,
+                arm64_image,
+                amd64_image,
             );
         }
 
         config
     }
+
+    /// 从 rcoder 的 DockerConfig 创建 DockerManagerConfig
+    /// 这是一个兼容性函数，用于处理不同 crate 中的 DockerConfig 类型
+    pub fn config_from_rcoder_docker_config(
+        docker_config: Option<&impl DockerConfigTrait>,
+    ) -> DockerManagerConfig {
+        let mut config = Self::config_from_env();
+
+        if let Some(docker_cfg) = docker_config {
+            // 克隆镜像配置用于后续使用
+            let image = docker_cfg.image().clone();
+            let arm64_image = docker_cfg.arm64_image().clone();
+            let amd64_image = docker_cfg.amd64_image().clone();
+
+            // 使用 rcoder 配置中的镜像设置
+            let image_config = DockerImageConfig {
+                default_image: docker_cfg.image().clone(),
+                arm64_image: docker_cfg.arm64_image().clone(),
+                amd64_image: docker_cfg.amd64_image().clone(),
+            };
+            config.image_config = Some(image_config);
+
+            // 更新其他配置项
+            if let Some(network_mode) = docker_cfg.network_mode() {
+                config.default_network_mode = network_mode.clone();
+            }
+            if let Some(work_dir) = docker_cfg.work_dir() {
+                config.default_work_dir = work_dir.clone();
+            }
+            if let Some(auto_cleanup) = docker_cfg.auto_cleanup() {
+                config.auto_cleanup = *auto_cleanup;
+            }
+            if let Some(ttl) = docker_cfg.container_ttl_seconds() {
+                config.container_ttl_seconds = Some(*ttl);
+            }
+
+            // 根据配置更新默认镜像
+            config.default_image = super::get_docker_image_from_config(
+                image,
+                arm64_image,
+                amd64_image,
+            );
+        }
+
+        config
+    }
+}
+
+/// DockerConfig 特征，用于抽象不同 crate 中的 DockerConfig 类型
+pub trait DockerConfigTrait {
+    fn image(&self) -> &Option<String>;
+    fn arm64_image(&self) -> &Option<String>;
+    fn amd64_image(&self) -> &Option<String>;
+    fn network_mode(&self) -> &Option<String>;
+    fn work_dir(&self) -> &Option<String>;
+    fn auto_cleanup(&self) -> &Option<bool>;
+    fn container_ttl_seconds(&self) -> &Option<u64>;
 }
