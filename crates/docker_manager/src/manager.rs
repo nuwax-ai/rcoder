@@ -649,15 +649,15 @@ impl DockerManager {
 
         // 检查容器状态
         if let Some(state) = inspect.state {
-            let status = state.status.as_deref().unwrap_or("unknown");
+            let status = state.status;
             let exit_code = state.exit_code.unwrap_or(-1);
 
             match status {
-                "running" => {
+                Some(bollard::models::ContainerStateStatusEnum::RUNNING) => {
                     info!("✅ 容器 {} 正在运行", container_id);
                     return Ok(());
                 }
-                "exited" => {
+                Some(bollard::models::ContainerStateStatusEnum::EXITED) => {
                     let error_msg = state.error.as_deref().unwrap_or("未知错误");
                     error!(
                         "❌ 容器 {} 已退出 (退出码: {}): {}",
@@ -668,18 +668,26 @@ impl DockerManager {
                         container_id, exit_code, error_msg
                     )));
                 }
-                "created" => {
+                Some(bollard::models::ContainerStateStatusEnum::CREATED) => {
                     warn!("⚠️ 容器 {} 已创建但未启动", container_id);
                     return Err(DockerError::ContainerStartError(format!(
                         "容器已创建但未启动: {}",
                         container_id
                     )));
                 }
-                _ => {
-                    error!("❌ 容器 {} 处于未知状态: {}", container_id, status);
+                Some(status) => {
+                    let status_str = format!("{:?}", status);
+                    error!("❌ 容器 {} 处于未知状态: {}", container_id, status_str);
                     return Err(DockerError::ContainerStartError(format!(
                         "容器处于未知状态: {} - {}",
-                        container_id, status
+                        container_id, status_str
+                    )));
+                }
+                None => {
+                    error!("❌ 容器 {} 状态为空", container_id);
+                    return Err(DockerError::ContainerStartError(format!(
+                        "容器状态为空: {}",
+                        container_id
                     )));
                 }
             }

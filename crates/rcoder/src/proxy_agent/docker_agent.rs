@@ -286,6 +286,7 @@ impl DockerAgentManager {
             resource_limits: None,
             extra_mounts: Vec::new(),
             command: None,
+            entrypoint: None,
         };
 
         Ok(config)

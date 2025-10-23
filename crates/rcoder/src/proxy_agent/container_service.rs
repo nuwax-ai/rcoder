@@ -466,6 +466,7 @@ impl ContainerService {
             }),
             extra_mounts: Vec::new(),
             command: None,
+            entrypoint: None,
         })
     }
 
