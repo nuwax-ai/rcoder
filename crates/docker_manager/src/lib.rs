@@ -135,6 +135,23 @@ pub mod global {
         Ok(())
     }
 
+    /// 使用自定义配置初始化全局 DockerManager
+    pub async fn init_global_docker_manager_with_config(
+        config: DockerManagerConfig,
+    ) -> DockerResult<()> {
+        let manager = Arc::new(DockerManager::new(config).await?);
+
+        GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
+            DockerError::IoError(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "全局 DockerManager 已经初始化",
+            ))
+        })?;
+
+        info!("✅ 全局 DockerManager 初始化成功（自定义配置）");
+        Ok(())
+    }
+
     /// 获取全局 DockerManager 实例
     /// 如果未初始化，会自动初始化
     pub async fn get_global_docker_manager() -> DockerResult<Arc<DockerManager>> {
