@@ -136,7 +136,12 @@ async fn main() -> anyhow::Result<()> {
 
     // 初始化全局 DockerManager
     info!("🐳 初始化全局 DockerManager...");
-    if let Err(e) = docker_manager::global::init_global_docker_manager().await {
+    // 使用 rcoder 配置创建 DockerManager 配置
+    let docker_config =
+        docker_manager::utils::DockerUtils::config_from_rcoder_config(config.docker_config.clone());
+    if let Err(e) =
+        docker_manager::global::init_global_docker_manager_with_config(docker_config).await
+    {
         error!("❌ 全局 DockerManager 初始化失败: {}", e);
         return Err(anyhow::anyhow!("全局 DockerManager 初始化失败: {}", e));
     }

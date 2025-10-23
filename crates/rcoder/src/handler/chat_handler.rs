@@ -122,11 +122,15 @@ fn generate_request_id() -> String {
 #[instrument(skip(_state), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
 pub async fn handle_chat(
     State(_state): State<Arc<AppState>>,
-    Json(request): Json<ChatRequest>,
+    Json(mut request): Json<ChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     let project_id = match &request.project_id {
         Some(id) => id.clone(),
-        None => crate::service::container_manager::generate_project_id(),
+        None => {
+            let project_id = crate::service::container_manager::generate_project_id();
+            request.project_id = Some(project_id.clone());  // 设置 project_id
+            project_id
+        }
     };
 
     info!(
@@ -188,9 +192,13 @@ async fn forward_request_to_container_service(
     request: &ChatRequest,
     container_info: &ContainerBasicInfo,
 ) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
-    let project_id = match &request.project_id {
-        Some(id) => id.clone(),
-        None => crate::service::container_manager::generate_project_id(),
+    let project_id = if let Some(id) = &request.project_id {
+        id.clone()
+    } else {
+        error!("[FORWARD]会话 project_id 不能为空");
+        return Err(crate::AppError::internal_server_error(
+            "project_id 不能为空",
+        ));
     };
 
     info!(

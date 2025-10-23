@@ -209,6 +209,19 @@ pub struct DockerManagerConfig {
     pub auto_cleanup: bool,
     /// 容器存活时间 (秒)
     pub container_ttl_seconds: Option<u64>,
+    /// Docker 镜像配置（从 rcoder 配置传递）
+    pub image_config: Option<DockerImageConfig>,
+}
+
+/// Docker 镜像配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerImageConfig {
+    /// Docker 镜像名称（根据架构自动选择）
+    pub default_image: Option<String>,
+    /// ARM64 架构的 Docker 镜像
+    pub arm64_image: Option<String>,
+    /// AMD64 架构的 Docker 镜像
+    pub amd64_image: Option<String>,
 }
 
 impl Default for DockerManagerConfig {
@@ -221,6 +234,7 @@ impl Default for DockerManagerConfig {
             default_work_dir: crate::DEFAULT_WORK_DIR.to_string(),
             auto_cleanup: true,
             container_ttl_seconds: Some(3600), // 1小时
+            image_config: None,                // 使用默认镜像
         }
     }
 }

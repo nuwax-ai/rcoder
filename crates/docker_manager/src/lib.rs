@@ -70,6 +70,31 @@ pub fn default_docker_image() -> String {
     }
 }
 
+/// 从 rcoder 配置获取 Docker 镜像
+pub fn get_docker_image_from_config(
+    default_image: Option<String>,
+    arm64_image: Option<String>,
+    amd64_image: Option<String>,
+) -> String {
+    let platform = crate::utils::DockerUtils::auto_detect_platform();
+
+    // 优先使用通用镜像
+    if let Some(image) = default_image {
+        return image;
+    }
+
+    // 根据架构使用特定镜像
+    match platform.as_str() {
+        "linux/arm64" => {
+            arm64_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest-arm64".to_string())
+        }
+        "linux/amd64" => {
+            amd64_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest-amd64".to_string())
+        }
+        _ => "registry.yichamao.com/rcoder:latest".to_string(), // 默认回退
+    }
+}
+
 /// 默认的平台（使用自动检测）
 pub fn default_platform() -> String {
     crate::utils::DockerUtils::auto_detect_platform()

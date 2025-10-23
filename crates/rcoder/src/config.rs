@@ -46,6 +46,8 @@ pub struct AppConfig {
     pub port: u16,
     /// 代理配置
     pub proxy_config: Option<ProxyConfig>,
+    /// Docker 配置
+    pub docker_config: Option<DockerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +74,26 @@ pub struct ProxyConfig {
     pub health_check: HealthCheckConfig,
 }
 
+/// Docker 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerConfig {
+    /// Docker 镜像名称（根据架构自动选择）
+    /// 如果不指定，将使用默认的 registry.yichamao.com/rcoder:latest
+    pub image: Option<String>,
+    /// ARM64 架构的 Docker 镜像
+    pub arm64_image: Option<String>,
+    /// AMD64 架构的 Docker 镜像
+    pub amd64_image: Option<String>,
+    /// 默认网络模式
+    pub network_mode: Option<String>,
+    /// 默认工作目录
+    pub work_dir: Option<String>,
+    /// 是否启用自动清理
+    pub auto_cleanup: Option<bool>,
+    /// 容器存活时间（秒）
+    pub container_ttl_seconds: Option<u64>,
+}
+
 /// 配置文件路径
 const CONFIG_FILE: &str = "config.yml";
 
@@ -82,6 +104,7 @@ impl Default for AppConfig {
             projects_dir: PathBuf::from("./project_workspace"),
             port: 8086,
             proxy_config: Some(ProxyConfig::default()),
+            docker_config: Some(DockerConfig::default()),
         }
     }
 }
@@ -100,6 +123,20 @@ impl Default for ProxyConfig {
                 healthy_threshold: 2,
                 unhealthy_threshold: 3,
             },
+        }
+    }
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        Self {
+            image: None, // 使用默认镜像
+            arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
+            amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
+            network_mode: Some("bridge".to_string()),
+            work_dir: Some("/app".to_string()),
+            auto_cleanup: Some(true),
+            container_ttl_seconds: Some(3600), // 1小时
         }
     }
 }
@@ -142,6 +179,31 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                 );
             }
         }
+    }
+
+    // Docker 镜像环境变量支持
+    if let Ok(docker_image) = env::var("RCODER_DOCKER_IMAGE") {
+        if config.docker_config.is_none() {
+            config.docker_config = Some(DockerConfig::default());
+        }
+        config.docker_config.as_mut().unwrap().image = Some(docker_image);
+        info!("使用环境变量 RCODER_DOCKER_IMAGE 设置 Docker 镜像");
+    }
+
+    if let Ok(docker_arm64_image) = env::var("RCODER_DOCKER_IMAGE_ARM64") {
+        if config.docker_config.is_none() {
+            config.docker_config = Some(DockerConfig::default());
+        }
+        config.docker_config.as_mut().unwrap().arm64_image = Some(docker_arm64_image);
+        info!("使用环境变量 RCODER_DOCKER_IMAGE_ARM64 设置 ARM64 镜像");
+    }
+
+    if let Ok(docker_amd64_image) = env::var("RCODER_DOCKER_IMAGE_AMD64") {
+        if config.docker_config.is_none() {
+            config.docker_config = Some(DockerConfig::default());
+        }
+        config.docker_config.as_mut().unwrap().amd64_image = Some(docker_amd64_image);
+        info!("使用环境变量 RCODER_DOCKER_IMAGE_AMD64 设置 AMD64 镜像");
     }
 
     // 4. 处理代理配置
@@ -244,6 +306,30 @@ proxy_config:
     timeout_seconds: {}
     healthy_threshold: {}
     unhealthy_threshold: {}
+
+# Docker 配置
+docker_config:
+  # Docker 镜像名称 (留空使用默认镜像)
+  # 如果指定了此字段，将优先使用该镜像，忽略架构特定镜像
+  image: {}
+
+  # ARM64 架构专用镜像
+  arm64_image: {}
+
+  # AMD64 架构专用镜像
+  amd64_image: {}
+
+  # 默认网络模式
+  network_mode: {}
+
+  # 默认工作目录
+  work_dir: {}
+
+  # 是否启用自动清理
+  auto_cleanup: {}
+
+  # 容器存活时间（秒）
+  container_ttl_seconds: {}
 "#,
         format!("{:?}", config.default_agent),
         config.projects_dir.display(),
@@ -253,10 +339,39 @@ proxy_config:
         config.proxy_config.as_ref().unwrap().backend_host,
         config.proxy_config.as_ref().unwrap().port_param,
         config.proxy_config.as_ref().unwrap().health_check.enabled,
-        config.proxy_config.as_ref().unwrap().health_check.interval_seconds,
-        config.proxy_config.as_ref().unwrap().health_check.timeout_seconds,
-        config.proxy_config.as_ref().unwrap().health_check.healthy_threshold,
-        config.proxy_config.as_ref().unwrap().health_check.unhealthy_threshold
+        config
+            .proxy_config
+            .as_ref()
+            .unwrap()
+            .health_check
+            .interval_seconds,
+        config
+            .proxy_config
+            .as_ref()
+            .unwrap()
+            .health_check
+            .timeout_seconds,
+        config
+            .proxy_config
+            .as_ref()
+            .unwrap()
+            .health_check
+            .healthy_threshold,
+        config
+            .proxy_config
+            .as_ref()
+            .unwrap()
+            .health_check
+            .unhealthy_threshold,
+        // Docker 配置部分
+        let docker_config = config.docker_config.as_ref().unwrap();
+        docker_config.image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        docker_config.arm64_image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        docker_config.amd64_image.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        docker_config.network_mode.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        docker_config.work_dir.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
+        docker_config.auto_cleanup.map_or("null".to_string(), |b| b.to_string()),
+        docker_config.container_ttl_seconds.map_or("null".to_string(), |s| s.to_string())
     );
 
     fs::write(CONFIG_FILE, content_with_comments)
