@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // 创建清理配置
     let cleanup_config = CleanupConfig {
         idle_timeout: Duration::from_secs(10 * 60),
-        cleanup_interval: Duration::from_secs(3 * 60), // 3分钟间隔
+        cleanup_interval: Duration::from_secs(5 * 60), // 5分钟间隔，平衡性能和资源清理
         docker_stop_timeout: Duration::from_secs(30), // 30秒Docker停止超时
     };
 

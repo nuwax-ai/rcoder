@@ -254,6 +254,7 @@ impl AgentCleaner {
     /// 执行一次清理操作 - 基于RAII的简化版
     /// 只需要从 MAP 中移除闲置agent，AgentLifecycleGuard 会自动清理资源
     async fn cleanup_idle_agents(&mut self) -> Result<CleanupStats> {
+        let start_time = std::time::Instant::now();
         let current_time = Utc::now();
         let mut cleaned_count = 0;
         let mut success_count = 0;
@@ -387,8 +388,9 @@ impl AgentCleaner {
         let remaining_agents = self.state.project_and_agent_map.len();
         let active_sessions = self.state.sessions.len();
 
+        let duration = start_time.elapsed();
         info!(
-            "清理完成 - 清理数量: {}, 成功: {}, 失败: {}, 孤立SSE会话: {}, SSE消息: {}, 孤立容器: {}, 剩余agent: {}, 活跃会话: {}",
+            "清理完成 - 清理数量: {}, 成功: {}, 失败: {}, 孤立SSE会话: {}, SSE消息: {}, 孤立容器: {}, 剩余agent: {}, 活跃会话: {}, 耗时: {:.2}秒",
             cleaned_count,
             success_count,
             failed_count,
@@ -396,7 +398,8 @@ impl AgentCleaner {
             sse_messages,
             orphaned_containers,
             remaining_agents,
-            active_sessions
+            active_sessions,
+            duration.as_secs_f64()
         );
 
         Ok(CleanupStats {
@@ -555,9 +558,12 @@ impl AgentCleaner {
             .await
             .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
 
-        // 尝试通过多种方式查找容器
+        // 尝试通过多种方式查找容器 - 在独立线程池中执行避免阻塞tokio运行时
+        let docker_manager_arc = Arc::new(docker_manager.clone());
+        let project_id_clone = project_id.to_string();
+        
         // 1. 先通过 project_id 查找
-        let mut container_info = docker_manager.get_container_info(project_id);
+        let mut container_info = docker_manager.get_container_info(&project_id);
 
         // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
         if container_info.is_none() {
@@ -568,9 +574,7 @@ impl AgentCleaner {
             );
 
             // 使用新的查找函数
-            container_info = docker_manager
-                .find_container_by_identifier(&expected_container_name)
-                .await;
+            container_info = docker_manager.find_container_by_identifier(&expected_container_name).await;
         }
 
         if let Some(container_info) = container_info {
@@ -591,9 +595,12 @@ impl AgentCleaner {
 
             // 停止容器 - 使用配置的超时时间
             let stop_timeout = self.config.docker_stop_timeout;
+            let container_id = container_info.container_id.clone();
+            let timeout_seconds = stop_timeout.as_secs();
+            
             let stop_result = timeout(
                 stop_timeout,
-                docker_manager.stop_container_by_id_with_timeout(&container_info.container_id, stop_timeout.as_secs())
+                docker_manager.stop_container_by_id_with_timeout(&container_id, timeout_seconds)
             ).await;
 
             match stop_result {
@@ -633,9 +640,20 @@ impl AgentCleaner {
         loop {
             interval.tick().await;
 
-            match self.cleanup_idle_agents().await {
-                Ok(stats) => debug!("定时清理完成: {:?}", stats),
-                Err(e) => warn!("定时清理失败: {}", e),
+            // 为整个清理任务添加超时保护，防止阻塞
+            let cleanup_timeout = Duration::from_secs(120); // 2分钟超时
+            let cleanup_result = timeout(cleanup_timeout, self.cleanup_idle_agents()).await;
+            
+            match cleanup_result {
+                Ok(Ok(stats)) => {
+                    debug!("定时清理完成: {:?}", stats);
+                }
+                Ok(Err(e)) => {
+                    warn!("定时清理失败: {}", e);
+                }
+                Err(_) => {
+                    warn!("定时清理超时，耗时超过{}秒，强制结束", cleanup_timeout.as_secs());
+                }
             }
         }
     }
