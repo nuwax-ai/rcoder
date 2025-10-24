@@ -13,6 +13,61 @@ use tracing::{debug, info, warn};
 
 use crate::AgentStatus;
 use crate::router::AppState;
+use shared_types::ProjectAndContainerInfo;
+
+/// 🆕 Agent信息访问trait，用于统一不同类型的agent信息访问接口
+trait AgentInfoAccess {
+    fn project_id(&self) -> &str;
+    fn last_activity(&self) -> DateTime<Utc>;
+    fn created_at(&self) -> DateTime<Utc>;
+    fn status(&self) -> Option<AgentStatus>;
+}
+
+/// 为ProjectAndContainerInfo实现AgentInfoAccess trait
+impl AgentInfoAccess for ProjectAndContainerInfo {
+    fn project_id(&self) -> &str {
+        // 使用公共方法，避免递归调用
+        ProjectAndContainerInfo::project_id(self)
+    }
+
+    fn last_activity(&self) -> DateTime<Utc> {
+        ProjectAndContainerInfo::last_activity(self)
+    }
+
+    fn created_at(&self) -> DateTime<Utc> {
+        ProjectAndContainerInfo::created_at(self)
+    }
+
+    fn status(&self) -> Option<AgentStatus> {
+        // AgentStatus实现了Copy，可以直接解引用
+        match ProjectAndContainerInfo::status(self) {
+            Some(status) => Some(*status),
+            None => None,
+        }
+    }
+}
+
+/// 为Arc<ProjectAndContainerInfo>实现AgentInfoAccess trait
+impl AgentInfoAccess for Arc<ProjectAndContainerInfo> {
+    fn project_id(&self) -> &str {
+        ProjectAndContainerInfo::project_id(self)
+    }
+
+    fn last_activity(&self) -> DateTime<Utc> {
+        ProjectAndContainerInfo::last_activity(self)
+    }
+
+    fn created_at(&self) -> DateTime<Utc> {
+        ProjectAndContainerInfo::created_at(self)
+    }
+
+    fn status(&self) -> Option<AgentStatus> {
+        match ProjectAndContainerInfo::status(self) {
+            Some(status) => Some(*status),
+            None => None,
+        }
+    }
+}
 
 /// 清理配置
 #[derive(Debug, Clone)]
@@ -78,6 +133,53 @@ impl AgentCleaner {
         let duration = current_time.signed_duration_since(last_activity);
         duration.num_seconds() > 0
             && duration.num_seconds() as u64 > self.config.idle_timeout.as_secs()
+    }
+
+    /// 🆕 改进的超时判断函数，包含创建时间保护
+    ///
+    /// 这个函数解决了新创建容器被立即清理的问题：
+    /// 1. 检查last_activity超时
+    /// 2. 确保容器存在最小保护时间
+    /// 3. 避免时间计算误差导致的误清理
+    fn is_agent_idle_timeout_with_protection(
+        &self,
+        agent_info: &impl AgentInfoAccess,
+        current_time: DateTime<Utc>,
+    ) -> bool {
+        // 🛡️ 最小保护时间：容器创建后5分钟内不会被清理
+        let MIN_PROTECTION_DURATION = Duration::from_secs(5 * 60);
+
+        let last_activity = agent_info.last_activity();
+        let created_at = agent_info.created_at();
+
+        // 1. 检查创建时间保护期
+        let age = current_time.signed_duration_since(created_at);
+        if age.num_seconds() < MIN_PROTECTION_DURATION.as_secs() as i64 {
+            debug!(
+                "🛡️ [cleanup] 容器在保护期内，跳过清理: project_id={}, 创建时长={}秒",
+                agent_info.project_id(),
+                age.num_seconds()
+            );
+            return false;
+        }
+
+        // 2. 检查闲置超时（添加1秒的缓冲时间避免时间误差）
+        let idle_duration = current_time.signed_duration_since(last_activity);
+        let idle_timeout_with_buffer = self.config.idle_timeout.as_secs() + 1;
+
+        let is_timeout = idle_duration.num_seconds() > 0
+            && idle_duration.num_seconds() as u64 > idle_timeout_with_buffer;
+
+        debug!(
+            "🕒 [cleanup] 闲置检查: project_id={}, 最后活动={}, 闲置时长={}秒, 超时阈值={}秒, 是否超时={}",
+            agent_info.project_id(),
+            last_activity,
+            idle_duration.num_seconds(),
+            idle_timeout_with_buffer,
+            is_timeout
+        );
+
+        is_timeout
     }
 
     /// 清理孤立的SSE消息数据
@@ -148,28 +250,89 @@ impl AgentCleaner {
         // 收集需要清理的agent ID
         let mut agents_to_remove = Vec::new();
 
+        // 📊 统计各类agent数量
+        let mut protected_agents = 0;
+        let mut active_agents = 0;
+        let mut non_timeout_agents = 0;
+
+        info!(
+            "🔍 [cleanup] 开始扫描所有agent，总数: {}",
+            self.state.project_and_agent_map.len()
+        );
+
         for entry in self.state.project_and_agent_map.iter() {
             let project_id = entry.key();
             let agent_info = entry.value();
 
-            // 只清理Idle状态的agent，避免中断正在执行的任务
-            if agent_info
-                .status()
-                .is_some_and(|status| matches!(status, AgentStatus::Idle))
-                && self.is_agent_idle_timeout(agent_info.last_activity(), current_time)
-            {
-                let idle_duration = (current_time - agent_info.last_activity()).num_seconds();
-                info!(
-                    "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒, 创建时间: {}",
-                    project_id,
-                    agent_info.status(),
-                    agent_info.last_activity(),
-                    idle_duration,
-                    agent_info.created_at()
-                );
-                agents_to_remove.push(project_id.clone());
+            // 🎯 修复状态检查逻辑：
+            // 1. 清理Idle状态的agent
+            // 2. 也清理状态为None的agent（新创建但未设置状态的容器）
+            // 3. 不清理Active和Terminating状态的agent
+            let should_clean_by_status = match agent_info.status() {
+                Some(AgentStatus::Idle) => {
+                    debug!(
+                        "✅ [cleanup] 状态检查通过: project_id={}, 状态=Idle",
+                        project_id
+                    );
+                    true
+                }
+                None => {
+                    debug!(
+                        "✅ [cleanup] 状态检查通过: project_id={}, 状态=None(新创建)",
+                        project_id
+                    );
+                    true // 新创建的容器状态为None，也应该被检查
+                }
+                Some(AgentStatus::Active) => {
+                    debug!(
+                        "⏸️ [cleanup] 跳过Active状态agent: project_id={}",
+                        project_id
+                    );
+                    active_agents += 1;
+                    false
+                }
+                Some(AgentStatus::Terminating) => {
+                    debug!(
+                        "🔄 [cleanup] 跳过Terminating状态agent: project_id={}",
+                        project_id
+                    );
+                    false
+                }
+            };
+
+            if should_clean_by_status {
+                if self.is_agent_idle_timeout_with_protection(agent_info, current_time) {
+                    let idle_duration = (current_time - agent_info.last_activity()).num_seconds();
+                    let age = (current_time - agent_info.created_at()).num_seconds();
+
+                    info!(
+                        "🎯 [cleanup] 发现待清理agent: project_id={}, 状态={:?}, 最后活动={}, 闲置时长={}秒, 创建时长={}秒, 创建时间={}",
+                        project_id,
+                        agent_info.status(),
+                        agent_info.last_activity(),
+                        idle_duration,
+                        age,
+                        agent_info.created_at()
+                    );
+                    agents_to_remove.push(project_id.clone());
+                } else {
+                    non_timeout_agents += 1;
+                    debug!(
+                        "⏰ [cleanup] Agent未超时，跳过清理: project_id={}",
+                        project_id
+                    );
+                }
             }
         }
+
+        info!(
+            "📊 [cleanup] 扫描完成: 总数={}, 待清理={}, 保护期内={}, 活跃状态={}, 未超时={}",
+            self.state.project_and_agent_map.len(),
+            agents_to_remove.len(),
+            protected_agents,
+            active_agents,
+            non_timeout_agents
+        );
 
         // 执行清理 - RAII版：先销毁Docker容器，再从 MAP 中移除，AgentLifecycleGuard 会自动清理其他资源
         for project_id in agents_to_remove {

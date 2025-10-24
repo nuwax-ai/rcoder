@@ -310,14 +310,13 @@ async fn get_container_sse_url(
         project_id, session_id
     );
 
-    let docker_manager = std::sync::Arc::new(
-        docker_manager::DockerManager::with_default_config()
-            .await
-            .map_err(|e| {
-                error!("❌ [CONTAINER] 创建 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("创建 DockerManager 失败: {}", e))
-            })?,
-    );
+    // 🎯 修复：使用全局DockerManager实例，而不是创建新的实例
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [CONTAINER] 获取全局 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+        })?;
 
     // 获取容器信息
     let container_info = docker_manager.get_container_info(project_id);
@@ -332,11 +331,8 @@ async fn get_container_sse_url(
             AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
         })?;
 
-        // 构建 SSE 端点 URL
-        let sse_url = format!(
-            "{}/agent/agent/progress?session_id={}",
-            server_url, session_id
-        );
+        // 构建 SSE 端点 URL - 注意：agent_runner 内部路由是 /agent/progress/{session_id}
+        let sse_url = format!("{}/agent/progress/{}", server_url, session_id);
 
         info!("✅ [CONTAINER] 获取容器SSE端点: {}", sse_url);
         Ok(sse_url)

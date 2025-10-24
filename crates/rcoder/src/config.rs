@@ -131,6 +131,7 @@ impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             image: None, // 使用默认镜像
+            // 如果需要本地容器测试,可以改为: master-rcoder:latest,用 make dev-restart 启动容器测试
             arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
             amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
             network_mode: Some("bridge".to_string()),
