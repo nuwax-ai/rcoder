@@ -9,6 +9,10 @@ use docker_manager::{ContainerBasicInfo, DockerManager};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+/// Agent 容器默认内部服务端口
+/// 这是 agent 容器内部实际监听的端口
+const AGENT_CONTAINER_DEFAULT_PORT: u16 = 8086;
+
 /// 通用容器管理服务
 pub struct ContainerManager;
 
@@ -75,39 +79,38 @@ impl ContainerManager {
             })?;
 
         if let Some(container_info) = docker_manager.get_container_info(project_id) {
-            // 🎯 获取容器服务地址（优先使用容器名称DNS解析，失败时使用IP地址）
-            let server_url =
-                match crate::proxy_agent::docker_container_agent::get_container_server_url(
-                    &container_info.container_name,
-                )
+            // 🎯 直接使用Docker API获取容器的网络信息
+            let network_ips = docker_manager
+                .get_container_network_info(&container_info.container_id)
                 .await
-                {
-                    Ok(url) => url,
-                    Err(e) => {
-                        warn!(
-                            "⚠️ [CONTAINER_MGR] 容器名称DNS解析失败，尝试使用IP地址: {}",
-                            e
-                        );
-                        // 备用方案：使用容器IP地址
-                        crate::proxy_agent::docker_container_agent::get_container_ip(
-                            &docker_manager,
-                            &container_info.container_id,
-                        )
-                        .await
-                        .map_err(|e| {
-                            error!("❌ [CONTAINER_MGR] 获取容器IP地址也失败: {}", e);
-                            AppError::internal_server_error(&format!("获取容器服务地址失败: {}", e))
-                        })?
-                    }
-                };
+                .map_err(|e| {
+                    error!("❌ [CONTAINER_MGR] 获取容器网络信息失败: {}", e);
+                    AppError::internal_server_error(&format!("获取容器网络信息失败: {}", e))
+                })?;
 
-            // 从URL中提取IP地址
-            let ip_address = extract_ip_from_url(&server_url)?;
+            // 获取容器在 agent-network 中的 IP 地址
+            let network_name = docker_manager.get_rcoder_network_name();
+            let container_ip = network_ips.get(network_name).ok_or_else(|| {
+                error!(
+                    "❌ [CONTAINER_MGR] 容器 {} 未连接到 agent-network: {}",
+                    container_info.container_id, network_name
+                );
+                AppError::internal_server_error("容器未连接到指定的网络")
+            })?;
+
+            // 🎯 直接使用正确的agent容器端口构建服务URL
+            // 注意：container_info.internal_port 可能是8080，但实际agent容器监听的是8086
+            let server_url = format!("http://{}:{}", container_ip, AGENT_CONTAINER_DEFAULT_PORT);
+
+            info!(
+                "✅ [CONTAINER_MGR] 获取容器IP地址: {} -> {}",
+                container_info.container_id, container_ip
+            );
 
             let container_basic_info = ContainerBasicInfo {
                 container_id: container_info.container_id.clone(),
                 container_name: container_info.container_name.clone(),
-                container_ip: ip_address,
+                container_ip: container_ip.clone(), // 直接使用网络中的IP地址
                 internal_port: container_info.internal_port,
                 external_port: container_info.assigned_port,
                 project_id: project_id.to_string(),
@@ -152,23 +155,38 @@ async fn ensure_container_exists(project_id: &str) -> Result<ContainerBasicInfo,
             project_id, existing_container_info.container_id
         );
 
-        // 🎯 获取容器服务地址（使用容器名称DNS解析）
-        let server_url = crate::proxy_agent::docker_container_agent::get_container_server_url(
-            &existing_container_info.container_name,
-        )
-        .await
-        .map_err(|e| {
-            error!("❌ [CONTAINER_MGR] 获取容器 IP 失败: {}", e);
-            AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
+        // 🎯 直接使用Docker API获取容器的网络信息
+        let network_ips = docker_manager
+            .get_container_network_info(&existing_container_info.container_id)
+            .await
+            .map_err(|e| {
+                error!("❌ [CONTAINER_MGR] 获取容器网络信息失败: {}", e);
+                AppError::internal_server_error(&format!("获取容器网络信息失败: {}", e))
+            })?;
+
+        // 获取容器在 agent-network 中的 IP 地址
+        let network_name = docker_manager.get_rcoder_network_name();
+        let container_ip = network_ips.get(network_name).ok_or_else(|| {
+            error!(
+                "❌ [CONTAINER_MGR] 容器 {} 未连接到 agent-network: {}",
+                existing_container_info.container_id, network_name
+            );
+            AppError::internal_server_error("容器未连接到指定的网络")
         })?;
 
-        // 从URL中提取IP地址
-        let ip_address = extract_ip_from_url(&server_url)?;
+        // 🎯 直接使用正确的agent容器端口构建服务URL
+        // 注意：existing_container_info.internal_port 可能是8080，但实际agent容器监听的是8086
+        let server_url = format!("http://{}:{}", container_ip, AGENT_CONTAINER_DEFAULT_PORT);
+
+        info!(
+            "✅ [CONTAINER_MGR] 获取容器IP地址: {} -> {}",
+            existing_container_info.container_id, container_ip
+        );
 
         let container_info = ContainerBasicInfo {
             container_id: existing_container_info.container_id.clone(),
             container_name: existing_container_info.container_name.clone(),
-            container_ip: ip_address,
+            container_ip: container_ip.clone(),
             internal_port: existing_container_info.internal_port,
             external_port: existing_container_info.assigned_port,
             project_id: project_id.to_string(),
@@ -248,24 +266,39 @@ async fn create_container_for_request(
             AppError::internal_server_error("新创建的容器信息获取失败")
         })?;
 
-    // 🎯 获取容器IP地址（无宿主机端口映射）
-    let server_url = crate::proxy_agent::docker_container_agent::get_container_ip(
-        docker_manager,
-        &container_info_docker.container_id,
-    )
-    .await
-    .map_err(|e| {
-        error!("❌ [CONTAINER_MGR] 获取新容器 IP 失败: {}", e);
-        AppError::internal_server_error(&format!("获取新容器 IP 失败: {}", e))
+    // 🎯 直接使用Docker API获取容器的网络信息
+    let network_ips = docker_manager
+        .get_container_network_info(&container_info_docker.container_id)
+        .await
+        .map_err(|e| {
+            error!("❌ [CONTAINER_MGR] 获取新容器网络信息失败: {}", e);
+            AppError::internal_server_error(&format!("获取新容器网络信息失败: {}", e))
+        })?;
+
+    // 获取容器在 agent-network 中的 IP 地址
+    let network_name = docker_manager.get_rcoder_network_name();
+    let container_ip = network_ips.get(network_name).ok_or_else(|| {
+        error!(
+            "❌ [CONTAINER_MGR] 新容器 {} 未连接到 agent-network: {}",
+            container_info_docker.container_id, network_name
+        );
+        AppError::internal_server_error("新容器未连接到指定的网络")
     })?;
 
-    let ip_address = extract_ip_from_url(&server_url)?;
+    // 🎯 直接使用正确的agent容器端口构建服务URL
+    // 注意：container_info_docker.internal_port 可能是8080，但实际agent容器监听的是8086
+    let server_url = format!("http://{}:{}", container_ip, AGENT_CONTAINER_DEFAULT_PORT);
+
+    info!(
+        "✅ [CONTAINER_MGR] 获取新容器IP地址: {} -> {}",
+        container_info_docker.container_id, container_ip
+    );
 
     // 创建容器基本信息结构
     let container_info = ContainerBasicInfo {
         container_id: container_info_docker.container_id.clone(),
         container_name: container_info_docker.container_name.clone(),
-        container_ip: ip_address,
+        container_ip: container_ip.clone(),
         internal_port: container_info_docker.internal_port,
         external_port: 0u16, // 🎯 优化：无宿主机端口映射
         project_id: project_id.to_string(),
@@ -318,46 +351,15 @@ pub async fn create_project_workspace(project_id: &str) -> Result<std::path::Pat
     Ok(project_dir)
 }
 
-/// 从URL中提取IP地址
-fn extract_ip_from_url(url: &str) -> Result<String, AppError> {
-    let url_obj = url::Url::parse(url).map_err(|e| {
-        error!("❌ [CONTAINER_MGR] 解析URL失败: url={}, error={}", url, e);
-        AppError::internal_server_error(&format!("解析URL失败: {}", e))
-    })?;
-
-    let host = url_obj.host_str().ok_or_else(|| {
-        error!("❌ [CONTAINER_MGR] URL中找不到主机地址: {}", url);
-        AppError::internal_server_error("URL中找不到主机地址")
-    })?;
-
-    Ok(host.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_extract_ip_from_url() {
-        // 测试有效的URL
-        let url = "http://172.17.0.2:8080";
-        let ip = extract_ip_from_url(url).unwrap();
-        assert_eq!(ip, "172.17.0.2");
-
-        // 测试带路径的URL
-        let url = "http://localhost:3000/api/v1/chat";
-        let ip = extract_ip_from_url(url).unwrap();
-        assert_eq!(ip, "localhost");
-    }
-
-    #[tokio::test]
-    async fn test_extract_ip_from_url_invalid() {
-        // 测试无效的URL
-        let url = "invalid_url";
-        assert!(extract_ip_from_url(url).is_err());
-
-        // 测试没有主机地址的URL
-        let url = "http:///path";
-        assert!(extract_ip_from_url(url).is_err());
+    async fn test_container_service_url_format() {
+        // 测试容器服务URL格式
+        let ip = "192.168.107.2";
+        let url = format!("http://{}:{}", ip, AGENT_CONTAINER_DEFAULT_PORT);
+        assert_eq!(url, "http://192.168.107.2:8086");
     }
 }

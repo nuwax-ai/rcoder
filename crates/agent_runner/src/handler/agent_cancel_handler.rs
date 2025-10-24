@@ -12,8 +12,8 @@ use utoipa::{IntoParams, ToSchema};
 use agent_client_protocol::{CancelNotification, SessionId};
 
 use crate::{
-    CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
-    AppError, HttpResult, router::AppState,
+    AppError, CancelNotificationRequest, HttpResult, proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
+    router::AppState,
 };
 
 /// 取消任务的查询参数
@@ -149,21 +149,34 @@ pub async fn agent_session_cancel(
                 .map_err(|e| anyhow::anyhow!("发送取消通知失败: {}", e))?;
 
             // 等待取消通知响应
-            info!("📡 [agent_cancel_handler] 等待Agent取消响应: session_id={}", session_id);
+            info!(
+                "📡 [agent_cancel_handler] 等待Agent取消响应: session_id={}",
+                session_id
+            );
             match rx.await {
                 Ok(cancel_notification_response) => {
-                    info!("✅ [agent_cancel_handler] 收到Agent取消响应: session_id={}, success={}", session_id, cancel_notification_response.success);
+                    info!(
+                        "✅ [agent_cancel_handler] 收到Agent取消响应: session_id={}, success={}",
+                        session_id, cancel_notification_response.success
+                    );
                     if cancel_notification_response.success {
                         // 🧹 彻底清空该 session，避免阻塞
                         // 先主动关闭 SSE 连接，再移除 SESSION_CACHE 条目
                         if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
-                            info!("🔌 [agent_cancel_handler] Agent取消成功，主动关闭SSE连接: session_id={}", session_id);
+                            info!(
+                                "🔌 [agent_cancel_handler] Agent取消成功，主动关闭SSE连接: session_id={}",
+                                session_id
+                            );
                             session_data.close_current_connection();
                         }
 
                         if crate::service::SESSION_CACHE.remove(&session_id).is_some() {
-                            info!("🗑️ Agent取消成功，移除 SESSION_CACHE 条目: session_id={}", session_id);
+                            info!(
+                                "🗑️ Agent取消成功，移除 SESSION_CACHE 条目: session_id={}",
+                                session_id
+                            );
                         }
+                        info!("取消成功[project-id]={}", project_id);
 
                         Ok(HttpResult::success(CancelResponse {
                             success: true,
@@ -175,7 +188,10 @@ pub async fn agent_session_cancel(
                     }
                 }
                 Err(e) => {
-                    error!("❌ [agent_cancel_handler] 等待Agent取消响应失败: session_id={}, error={:?}", session_id, e);
+                    error!(
+                        "❌ [agent_cancel_handler] 等待Agent取消响应失败: session_id={}, error={:?}",
+                        session_id, e
+                    );
                     // 🎯 极简设计：取消过程出错时不需要重置标记
                     Err(AppError::AnyhowError(anyhow::anyhow!(
                         "停止智能体执行失败: {}",
@@ -192,12 +208,18 @@ pub async fn agent_session_cancel(
 
             // 🎯 极简设计：没有找到活跃连接时，主动关闭 SSE 连接并清空 SESSION_CACHE
             if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
-                info!("🔌 [agent_cancel] 未找到活跃连接，主动关闭SSE连接: session_id={}, project_id={}", session_id, project_id);
+                info!(
+                    "🔌 [agent_cancel] 未找到活跃连接，主动关闭SSE连接: session_id={}, project_id={}",
+                    session_id, project_id
+                );
                 session_data.close_current_connection();
             }
 
             if crate::service::SESSION_CACHE.remove(&session_id).is_some() {
-                info!("🗑️ [agent_cancel] 未找到活跃连接，已清空 SESSION_CACHE: session_id={}, project_id={}", session_id, project_id);
+                info!(
+                    "🗑️ [agent_cancel] 未找到活跃连接，已清空 SESSION_CACHE: session_id={}, project_id={}",
+                    session_id, project_id
+                );
             }
 
             Ok(HttpResult::success(CancelResponse {
