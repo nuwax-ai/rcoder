@@ -255,7 +255,7 @@ fn init_telemetry() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "rcoder=debug,tower_http=debug,axum_tracing_opentelemetry=info".into()
+                "info".into()
             }),
         )
         .with(file_layer)
