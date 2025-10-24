@@ -152,11 +152,34 @@ impl DockerManager {
         }
 
         // 创建容器配置
+        // 🎯 直接在创建时配置网络，避免先连接bridge网络再手动连接agent-network
+        let networking_config = if config.network_mode != "host" {
+            let mut endpoints = HashMap::new();
+            endpoints.insert(
+                RCODER_NETWORK_NAME.to_string(),
+                bollard::models::EndpointSettings {
+                    aliases: Some(vec![container_name.clone()]),
+                    ..Default::default()
+                },
+            );
+            info!(
+                "🌐 [NETWORK] 容器 {} 将直接连接到 {} 网络，避免多网络DNS冲突",
+                container_name, RCODER_NETWORK_NAME
+            );
+            Some(NetworkingConfig {
+                endpoints_config: Some(endpoints),
+            })
+        } else {
+            info!("🌐 [NETWORK] 容器 {} 使用 host 网络模式", container_name);
+            None // host模式不需要自定义网络配置
+        };
+
         let mut container_config = ContainerCreateBody {
             image: Some(config.image.clone()),
             working_dir: Some(config.work_dir.clone()),
             env: Some(env_vars),
             host_config: Some(host_config),
+            networking_config, // 🎯 直接指定网络配置
             tty: Some(true),
             open_stdin: Some(true),
             ..Default::default()
@@ -193,11 +216,8 @@ impl DockerManager {
             .await
             .map_err(|e| DockerError::ContainerStartError(format!("启动容器失败: {}", e)))?;
 
-        // 连接到 RCoder 网络（如果不是 host 网络模式）
-        if config.network_mode != "host" {
-            self.connect_container_to_network(&container_id, RCODER_NETWORK_NAME)
-                .await?;
-        }
+        // 🎯 不再需要手动连接网络，因为容器创建时已经直接连接到agent-network
+        // 删除原来的手动网络连接逻辑
 
         // 等待容器启动完成
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -231,8 +251,8 @@ impl DockerManager {
             .insert(config.project_id.clone(), container_info.clone());
 
         info!(
-            "容器创建并启动成功: {} (ID: {})",
-            container_name, container_id
+            "✅ 容器创建并启动成功: {} (ID: {}) - 已直接连接到 {} 网络",
+            container_name, container_id, RCODER_NETWORK_NAME
         );
 
         Ok(container_info)
