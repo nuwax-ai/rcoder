@@ -3,8 +3,6 @@
 //! 通过 docker_manager 动态创建容器来运行 agent_runner 服务，
 //! 实现每个项目对应一个独立的 agent 容器
 
-use crate::CancelNotificationRequest;
-use agent_client_protocol::{PromptRequest, SessionId};
 use anyhow::{Context, Result};
 use docker_manager::{DockerContainerConfig, DockerContainerInfo, DockerManager, ResourceLimits};
 use reqwest::Client;
@@ -12,21 +10,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-/// Docker 容器 Agent 客户端
-///
-/// 通过 HTTP API 与容器内的 agent_server 通信
-pub struct DockerContainerAgentClient {
-    /// 容器信息
-    container_info: DockerContainerInfo,
-    /// HTTP 客户端
-    http_client: Client,
-    /// 容器内 agent_runner 地址
-    server_url: String,
-}
 
 // 注意：Docker 容器生命周期守卫现在使用内置的 AgentLifecycleGuard
 
@@ -203,103 +189,6 @@ async fn wait_for_agent_server_ready(server_url: &str) -> Result<()> {
 
     Err(anyhow::anyhow!("等待 agent_runner 启动超时"))
 }
-
-/// 运行 ACP 消息转发任务
-async fn run_acp_message_forwarding(
-    server_url: &str,
-    project_id: &str,
-    session_id: &SessionId,
-    mut prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
-    mut cancel_rx: mpsc::UnboundedReceiver<CancelNotificationRequest>,
-) -> Result<()> {
-    let client = Client::new();
-
-    loop {
-        tokio::select! {
-            // 处理提示请求
-            Some(prompt_request) = prompt_rx.recv() => {
-                if let Err(e) = handle_prompt_request(&client, server_url, &prompt_request).await {
-                    error!("处理提示请求失败: {}", e);
-                }
-            }
-
-            // 处理取消请求
-            Some(cancel_request) = cancel_rx.recv() => {
-                if let Err(e) = handle_cancel_request(&client, server_url, cancel_request).await {
-                    error!("处理取消请求失败: {}", e);
-                }
-            }
-
-            // 任务结束
-            else => {
-                info!("ACP 消息转发任务结束");
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// 处理提示请求
-async fn handle_prompt_request(
-    client: &Client,
-    server_url: &str,
-    prompt_request: &PromptRequest,
-) -> Result<()> {
-    // 将 ACP PromptRequest 转换为 agent_runner 的聊天格式
-    let chat_url = format!("{}/chat", server_url);
-
-    // 这里需要将 ACP 的 ContentBlock 转换为文本
-    let prompt_text = extract_text_from_content_blocks(&prompt_request.prompt);
-
-    let request_body = json!({
-        "prompt": prompt_text,
-        "session_id": prompt_request.session_id.0,
-    });
-
-    let response = client.post(&chat_url).json(&request_body).send().await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!("提示请求失败: {}", response.status()));
-    }
-
-    Ok(())
-}
-
-/// 处理取消请求
-async fn handle_cancel_request(
-    client: &Client,
-    server_url: &str,
-    cancel_request: CancelNotificationRequest,
-) -> Result<()> {
-    let cancel_url = format!("{}/agent/session/cancel", server_url);
-
-    let request_body = json!({
-        "session_id": cancel_request.cancel_notification.session_id.0,
-        "request_id": "cancel_request",
-    });
-
-    let response = client.post(&cancel_url).json(&request_body).send().await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!("取消请求失败: {}", response.status()));
-    }
-
-    // 发送响应
-    if let Err(_) = cancel_request
-        .tx
-        .send(shared_types::CancelNotificationResponse {
-            success: true,
-            message: Some("取消成功".to_string()),
-        })
-    {
-        warn!("发送取消响应失败，接收端已关闭");
-    }
-
-    Ok(())
-}
-
 /// 获取容器在指定网络中的 IP 地址（无宿主机端口映射）
 pub async fn get_container_ip(
     docker_manager: &DockerManager,
@@ -342,16 +231,4 @@ pub async fn get_container_server_url(container_name: &str) -> Result<String> {
     Ok(server_url)
 }
 
-/// 从 ContentBlock 中提取文本
-fn extract_text_from_content_blocks(blocks: &[agent_client_protocol::ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| {
-            if let agent_client_protocol::ContentBlock::Text(text_block) = block {
-                Some(text_block.text.clone())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
+
