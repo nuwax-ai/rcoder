@@ -17,6 +17,109 @@ const AGENT_CONTAINER_DEFAULT_PORT: u16 = 8086;
 pub struct ContainerManager;
 
 impl ContainerManager {
+    /// 通过容器 Labels 获取 Docker Compose 项目名称
+    ///
+    /// # Returns
+    /// 返回项目名称，如果无法获取则返回 None
+    async fn get_compose_project_name_from_labels(&self, docker_manager: &Arc<DockerManager>) -> Option<String> {
+        use bollard::query_parameters::InspectContainerOptions;
+        
+        // 获取当前容器ID
+        let container_id = std::env::var("HOSTNAME").ok()?;
+        
+        info!("🔍 [CONTAINER_MGR] 检测 Docker Compose 项目名称，当前容器ID: {}", container_id);
+        
+        // 检查当前容器信息
+        let inspect = docker_manager.get_docker_client()
+            .inspect_container(&container_id, None::<InspectContainerOptions>)
+            .await
+            .ok()?;
+        
+        // 从 labels 中获取项目名称
+        if let Some(labels) = inspect.config.and_then(|c| c.labels) {
+            // Docker Compose 会添加 com.docker.compose.project 标签
+            if let Some(project_name) = labels.get("com.docker.compose.project") {
+                info!("✅ [CONTAINER_MGR] 通过容器 labels 获取项目名称: {}", project_name);
+                return Some(project_name.clone());
+            }
+            
+            // 或者从 com.docker.compose.project.working_dir 推断
+            if let Some(working_dir) = labels.get("com.docker.compose.project.working_dir") {
+                // 从路径中提取项目名称
+                if let Some(project_name) = working_dir.split('/').last() {
+                    info!("✅ [CONTAINER_MGR] 通过工作目录推断项目名称: {}", project_name);
+                    return Some(project_name.to_string());
+                }
+            }
+        }
+        
+        warn!("⚠️ [CONTAINER_MGR] 无法从容器 labels 获取项目名称");
+        None
+    }
+
+    /// 通过容器名称推断项目名称
+    async fn get_compose_project_name_from_container_name(&self, docker_manager: &Arc<DockerManager>) -> Option<String> {
+        use bollard::query_parameters::InspectContainerOptions;
+        
+        // 获取当前容器ID
+        let container_id = std::env::var("HOSTNAME").ok()?;
+        
+        // 检查容器信息
+        let inspect = docker_manager.get_docker_client()
+            .inspect_container(&container_id, None::<InspectContainerOptions>)
+            .await
+            .ok()?;
+        
+        // 从容器名称推断项目名称
+        if let Some(name) = inspect.name {
+            // 容器名称格式: /{project_name}-{service_name}-{number}
+            // 例如: /docker-rcoder-1 -> docker
+            let clean_name = name.trim_start_matches('/');
+            if let Some(project_name) = clean_name.split('-').next() {
+                info!("✅ [CONTAINER_MGR] 通过容器名称推断项目名称: {}", project_name);
+                return Some(project_name.to_string());
+            }
+        }
+        
+        warn!("⚠️ [CONTAINER_MGR] 无法从容器名称推断项目名称");
+        None
+    }
+
+    /// 动态获取 Docker Compose 项目名称
+    async fn get_dynamic_compose_project_name(&self, docker_manager: &Arc<DockerManager>) -> Option<String> {
+        // 方法1：通过环境变量（最直接）
+        if let Some(project_name) = std::env::var("COMPOSE_PROJECT_NAME").ok() {
+            info!("✅ [CONTAINER_MGR] 通过环境变量获取项目名称: {}", project_name);
+            return Some(project_name);
+        }
+        
+        // 方法2：通过容器 labels
+        if let Some(project_name) = self.get_compose_project_name_from_labels(docker_manager).await {
+            return Some(project_name);
+        }
+        
+        // 方法3：通过容器名称推断
+        if let Some(project_name) = self.get_compose_project_name_from_container_name(docker_manager).await {
+            return Some(project_name);
+        }
+        
+        warn!("⚠️ [CONTAINER_MGR] 无法获取 Docker Compose 项目名称");
+        None
+    }
+
+    /// 动态构建网络名称
+    pub async fn get_dynamic_network_name(&self, docker_manager: &Arc<DockerManager>) -> String {
+        if let Some(project_name) = self.get_dynamic_compose_project_name(docker_manager).await {
+            let network_name = format!("{}_agent-network", project_name);
+            info!("🌐 [CONTAINER_MGR] 动态网络名称: {}", network_name);
+            network_name
+        } else {
+            // 回退到默认网络名称
+            warn!("⚠️ [CONTAINER_MGR] 使用默认网络名称: agent-network");
+            "agent-network".to_string()
+        }
+    }
+
     /// 根据请求获取或创建容器
     ///
     /// # Arguments
@@ -88,11 +191,11 @@ impl ContainerManager {
                     AppError::internal_server_error(&format!("获取容器网络信息失败: {}", e))
                 })?;
 
-            // 获取容器在 agent-network 中的 IP 地址
-            let network_name = docker_manager.get_rcoder_network_name();
-            let container_ip = network_ips.get(network_name).ok_or_else(|| {
+            // 获取容器在动态网络中的 IP 地址
+            let network_name = ContainerManager.get_dynamic_network_name(&docker_manager).await;
+            let container_ip = network_ips.get(&network_name).ok_or_else(|| {
                 error!(
-                    "❌ [CONTAINER_MGR] 容器 {} 未连接到 agent-network: {}",
+                    "❌ [CONTAINER_MGR] 容器 {} 未连接到网络: {}",
                     container_info.container_id, network_name
                 );
                 AppError::internal_server_error("容器未连接到指定的网络")
@@ -164,11 +267,11 @@ async fn ensure_container_exists(project_id: &str) -> Result<ContainerBasicInfo,
                 AppError::internal_server_error(&format!("获取容器网络信息失败: {}", e))
             })?;
 
-        // 获取容器在 agent-network 中的 IP 地址
-        let network_name = docker_manager.get_rcoder_network_name();
-        let container_ip = network_ips.get(network_name).ok_or_else(|| {
+        // 获取容器在动态网络中的 IP 地址
+        let network_name = ContainerManager.get_dynamic_network_name(&docker_manager).await;
+        let container_ip = network_ips.get(&network_name).ok_or_else(|| {
             error!(
-                "❌ [CONTAINER_MGR] 容器 {} 未连接到 agent-network: {}",
+                "❌ [CONTAINER_MGR] 容器 {} 未连接到网络: {}",
                 existing_container_info.container_id, network_name
             );
             AppError::internal_server_error("容器未连接到指定的网络")
@@ -237,12 +340,17 @@ async fn create_container_for_request(
         AppError::internal_server_error(&format!("创建项目工作目录失败: {}", e))
     })?;
 
+    // 获取动态网络名称
+    let network_name = ContainerManager.get_dynamic_network_name(&docker_manager).await;
+    info!("🌐 [CONTAINER_MGR] 使用网络名称: {}", network_name);
+
     // 启动容器（主要目的是创建容器和通信通道）
-    let (container_info_docker, server_url) =
+    let (_container_info_docker, _server_url) =
         crate::proxy_agent::docker_container_agent::start_docker_container_agent_service(
             project_id.to_string(),
             project_workspace.to_string_lossy().to_string(),
             docker_manager.clone(),
+            network_name,
         )
         .await
         .map_err(|e| {
@@ -275,11 +383,11 @@ async fn create_container_for_request(
             AppError::internal_server_error(&format!("获取新容器网络信息失败: {}", e))
         })?;
 
-    // 获取容器在 agent-network 中的 IP 地址
-    let network_name = docker_manager.get_rcoder_network_name();
-    let container_ip = network_ips.get(network_name).ok_or_else(|| {
+    // 获取容器在动态网络中的 IP 地址
+    let network_name = ContainerManager.get_dynamic_network_name(&docker_manager).await;
+    let container_ip = network_ips.get(&network_name).ok_or_else(|| {
         error!(
-            "❌ [CONTAINER_MGR] 新容器 {} 未连接到 agent-network: {}",
+            "❌ [CONTAINER_MGR] 新容器 {} 未连接到网络: {}",
             container_info_docker.container_id, network_name
         );
         AppError::internal_server_error("新容器未连接到指定的网络")

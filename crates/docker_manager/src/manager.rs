@@ -154,9 +154,11 @@ impl DockerManager {
         // 创建容器配置
         // 🎯 直接在创建时配置网络，避免先连接bridge网络再手动连接agent-network
         let networking_config = if config.network_mode != "host" {
+            let default_network = RCODER_NETWORK_NAME.to_string();
+            let network_name = config.network_name.as_ref().unwrap_or(&default_network);
             let mut endpoints = HashMap::new();
             endpoints.insert(
-                RCODER_NETWORK_NAME.to_string(),
+                network_name.clone(),
                 bollard::models::EndpointSettings {
                     aliases: Some(vec![container_name.clone()]),
                     ..Default::default()
@@ -164,7 +166,7 @@ impl DockerManager {
             );
             info!(
                 "🌐 [NETWORK] 容器 {} 将直接连接到 {} 网络，避免多网络DNS冲突",
-                container_name, RCODER_NETWORK_NAME
+                container_name, network_name
             );
             Some(NetworkingConfig {
                 endpoints_config: Some(endpoints),
@@ -228,6 +230,12 @@ impl DockerManager {
         // 再次等待确保网络配置完成
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
+        // 获取实际使用的网络名称
+        let actual_network_name = config
+            .network_name
+            .clone()
+            .unwrap_or_else(|| RCODER_NETWORK_NAME.to_string());
+
         // 创建容器信息
         let container_info = DockerContainerInfo {
             container_id: container_id.clone(),
@@ -244,6 +252,7 @@ impl DockerManager {
             health_status: None,
             internal_port: 8080,                    // 默认内部端口
             session_id: Uuid::new_v4().to_string(), // 生成默认会话ID
+            network_name: actual_network_name,      // 记录使用的网络名称
         };
 
         // 保存到容器映射
@@ -402,6 +411,7 @@ impl DockerManager {
                                 health_status: None,
                                 internal_port: 0,
                                 session_id: String::new(),
+                                network_name: RCODER_NETWORK_NAME.to_string(), // 使用默认网络名称
                             });
                         }
                     }

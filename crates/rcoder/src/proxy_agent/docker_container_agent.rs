@@ -36,6 +36,7 @@ pub async fn start_docker_container_agent_service(
     project_id: String,
     project_path: String,
     docker_manager: Arc<DockerManager>,
+    network_name: String,
 ) -> Result<(DockerContainerInfo, String)> {
     info!(
         "启动 Docker 容器 Agent 服务（使用 agent_runner），项目ID: {}",
@@ -71,7 +72,7 @@ pub async fn start_docker_container_agent_service(
     info!("使用容器内部网络通信，无需宿主机端口映射");
 
     // 创建容器配置（无需端口映射）
-    let container_config = create_docker_container_config(&project_id, &project_path).await?;
+    let container_config = create_docker_container_config(&project_id, &project_path, Some(network_name.clone())).await?;
 
     // 创建并启动容器
     let container_info = match docker_manager.create_container(container_config).await {
@@ -89,7 +90,7 @@ pub async fn start_docker_container_agent_service(
 
     // 等待容器内 agent_runner 启动
     // 🎯 优化：使用容器内部IP，无需宿主机端口映射
-    let server_url = get_container_ip(&docker_manager, &container_info.container_id).await?;
+    let server_url = get_container_ip(&docker_manager, &container_info.container_id, &network_name).await?;
 
     if let Err(e) = wait_for_agent_server_ready(&server_url).await {
         // 启动失败，清理容器（无需端口管理）
@@ -111,6 +112,7 @@ pub async fn start_docker_container_agent_service(
 async fn create_docker_container_config(
     project_id: &str,
     project_path: &str,
+    network_name: Option<String>,
 ) -> Result<DockerContainerConfig> {
     let mut env_vars = HashMap::new();
 
@@ -161,7 +163,7 @@ async fn create_docker_container_config(
         env_vars,
         port_bindings,                      // 空的端口映射
         network_mode: "bridge".to_string(), // 使用 bridge 网络模式，但不暴露端口
-        auto_remove: true,                  // 容器停止后自动删除
+        auto_remove: false,                 // 容器停止后不自动删除，保持容器以便后续使用
         resource_limits: Some(ResourceLimits {
             memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB 内存
             cpu_limit: Some(2.0),                       // 2 核 CPU
@@ -170,6 +172,7 @@ async fn create_docker_container_config(
         extra_mounts,
         command: Some(command),
         entrypoint: Some(Vec::new()), // 覆盖默认入口点，直接运行命令
+        network_name, // 使用动态检测的网络名称
     })
 }
 
@@ -297,10 +300,11 @@ async fn handle_cancel_request(
     Ok(())
 }
 
-/// 获取容器在 agent-network 中的 IP 地址（无宿主机端口映射）
+/// 获取容器在指定网络中的 IP 地址（无宿主机端口映射）
 pub async fn get_container_ip(
     docker_manager: &DockerManager,
     container_id: &str,
+    network_name: &str,
 ) -> Result<String> {
     // 等待容器网络配置完成
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -311,17 +315,17 @@ pub async fn get_container_ip(
         .await
         .map_err(|e| anyhow::anyhow!("获取容器网络信息失败: {}", e))?;
 
-    // 直接查找 agent-network 的 IP 地址
-    let network_name = docker_manager.get_rcoder_network_name();
+    // 查找指定网络的 IP 地址
     if let Some(ip_address) = network_ips.get(network_name) {
         let server_url = format!("http://{}:8086", ip_address);
-        info!("✅ 获取容器 IP 地址: {} -> {}", container_id, ip_address);
+        info!("✅ 获取容器 IP 地址: {} -> {} (网络: {})", container_id, ip_address, network_name);
         Ok(server_url)
     } else {
         Err(anyhow::anyhow!(
-            "容器 {} 未连接到 agent-network: {}",
+            "容器 {} 未连接到网络 {}, 可用网络: {:?}",
             container_id,
-            network_name
+            network_name,
+            network_ips.keys().collect::<Vec<_>>()
         ))
     }
 }

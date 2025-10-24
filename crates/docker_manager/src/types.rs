@@ -34,6 +34,8 @@ pub struct DockerContainerConfig {
     pub command: Option<Vec<String>>,
     /// 入口点 (覆盖镜像默认入口点)
     pub entrypoint: Option<Vec<String>>,
+    /// 网络名称 (可选，如果不指定则使用默认的 RCODER_NETWORK_NAME)
+    pub network_name: Option<String>,
 }
 
 /// 挂载点配置
@@ -75,6 +77,7 @@ impl Default for DockerContainerConfig {
             extra_mounts: Vec::new(),
             command: None,
             entrypoint: None,
+            network_name: None,
         }
     }
 }
@@ -110,6 +113,8 @@ pub struct DockerContainerInfo {
     pub internal_port: u16,
     /// 会话ID
     pub session_id: String,
+    /// 网络名称
+    pub network_name: String,
 }
 
 /// 容器基本信息（用于 API 响应）

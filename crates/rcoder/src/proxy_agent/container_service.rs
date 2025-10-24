@@ -286,6 +286,7 @@ impl ContainerService {
                 health_status: None,
                 internal_port: 8080,                          // 默认内部端口
                 session_id: uuid::Uuid::new_v4().to_string(), // 生成临时会话ID
+                network_name: container_config.network_name.clone().unwrap_or_else(|| docker_manager::RCODER_NETWORK_NAME.to_string()),
             },
             allocated_port: Some(allocated_port),
             created_at: chrono::Utc::now().into(),
@@ -467,6 +468,7 @@ impl ContainerService {
             extra_mounts: Vec::new(),
             command: None,
             entrypoint: None,
+            network_name: None,
         })
     }
 

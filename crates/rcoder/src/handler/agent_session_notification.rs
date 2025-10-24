@@ -321,9 +321,16 @@ async fn get_container_sse_url(
     // 获取容器信息
     let container_info = docker_manager.get_container_info(project_id);
     if let Some(container_info) = container_info {
+        // 获取动态网络名称
+        let container_manager = crate::service::container_manager::ContainerManager;
+        let network_name = container_manager
+            .get_dynamic_network_name(&docker_manager)
+            .await;
+        
         let server_url = crate::proxy_agent::docker_container_agent::get_container_ip(
             &docker_manager,
             &container_info.container_id,
+            &network_name,
         )
         .await
         .map_err(|e| {
