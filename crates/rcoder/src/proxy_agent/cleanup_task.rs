@@ -2,17 +2,17 @@
 //!
 //! 基于AgentLifecycleGuard的RAII原则，简化清理逻辑：
 //! 1. 定时扫描识别闲置的agent
-//! 2. 从PROJECT_AND_AGENT_INFO_MAP中移除
+//! 2. 从state.project_and_agent_map中移除
 //! 3. AgentLifecycleGuard自动drop并清理资源
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::AgentStatus;
-use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
-use crate::service::session_cache::{PROJECT_SESSION_MAP, SESSION_CACHE};
+use crate::router::AppState;
 
 /// 清理配置
 #[derive(Debug, Clone)]
@@ -56,14 +56,16 @@ pub struct CleanupStats {
 pub struct AgentCleaner {
     config: CleanupConfig,
     stats: CleanupStats,
+    state: Arc<AppState>,
 }
 
 impl AgentCleaner {
     /// 创建新的清理器
-    pub fn new(config: CleanupConfig) -> Self {
+    pub fn new(config: CleanupConfig, state: Arc<AppState>) -> Self {
         Self {
             config,
             stats: CleanupStats::default(),
+            state,
         }
     }
 
@@ -79,21 +81,25 @@ impl AgentCleaner {
     }
 
     /// 清理孤立的SSE消息数据
-    /// 清理没有project_id引用的session和长期未活跃的session
+    /// 清理没有在 project_and_agent_map 中对应session_id的条目
     async fn cleanup_orphaned_sse_sessions(&mut self) -> (u64, u64) {
         let mut orphaned_count = 0;
         let mut messages_cleared = 0;
 
-        // 收集所有活跃的session_id（从PROJECT_SESSION_MAP中获取）
-        let active_session_ids: std::collections::HashSet<String> = PROJECT_SESSION_MAP
+        // 收集所有活跃的session_id（从 project_and_agent_map 中获取）
+        let active_session_ids: std::collections::HashSet<String> = self
+            .state
+            .project_and_agent_map
             .iter()
-            .map(|entry| entry.value().clone())
+            .filter_map(|entry| entry.value().session_id.clone())
             .collect();
 
-        // 检查SESSION_CACHE中的所有session
+        // 检查sessions中的所有session
         let mut sessions_to_remove = Vec::new();
 
-        let session_ids: Vec<String> = SESSION_CACHE
+        let session_ids: Vec<String> = self
+            .state
+            .sessions
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
@@ -101,53 +107,20 @@ impl AgentCleaner {
         for session_id in session_ids {
             // 如果session_id不在活跃映射中，则为孤立session
             if !active_session_ids.contains(&session_id) {
-                // 检查session中是否有消息
-                if let Some(session_data_ref) = SESSION_CACHE.get(&session_id) {
-                    let session_data = session_data_ref.clone();
-                    drop(session_data_ref);
+                info!("发现孤立session: session_id={}", session_id);
 
-                    let message_count = session_data.message_count().await;
-
-                    if message_count > 0 {
-                        info!(
-                            "发现孤立session: session_id={}, 消息数量={}",
-                            session_id, message_count
-                        );
-
-                        // 清理这个session的消息 - 直接移除条目
-                        if SESSION_CACHE.remove(&session_id).is_some() {
-                            messages_cleared += 1;
-                        }
-
-                        // 如果清理后session为空，标记为待删除
-                        if session_data.message_count().await == 0 {
-                            sessions_to_remove.push(session_id.clone());
-                        }
-
-                        orphaned_count += 1;
-                    } else {
-                        // 没有消息的空session，直接标记删除
-                        sessions_to_remove.push(session_id.clone());
-                    }
-                } else {
-                    // session_data不存在，也标记删除
-                    sessions_to_remove.push(session_id.clone());
+                // 清理这个session
+                if self.state.sessions.remove(&session_id).is_some() {
+                    orphaned_count += 1;
+                    messages_cleared += 1;
                 }
-            }
-        }
 
-        // 删除空的孤立session
-        for session_id in sessions_to_remove {
-            if let Some((_, _)) = SESSION_CACHE.remove(&session_id) {
-                debug!("移除空session: {}", session_id);
+                sessions_to_remove.push(session_id.clone());
             }
         }
 
         if orphaned_count > 0 {
-            info!(
-                "清理孤立SSE session完成: session数量={}, 消息数量={}",
-                orphaned_count, messages_cleared
-            );
+            info!("清理孤立SSE session完成: session数量={}", orphaned_count);
         }
 
         (orphaned_count, messages_cleared)
@@ -162,7 +135,7 @@ impl AgentCleaner {
         let mut failed_count = 0;
 
         // 统计当前活动的agent数量
-        let total_agents = PROJECT_AND_AGENT_INFO_MAP.len();
+        let total_agents = self.state.project_and_agent_map.len();
 
         info!(
             "开始清理闲置agent和SSE消息，当前时间: {}，当前活动agent数量: {}",
@@ -175,12 +148,12 @@ impl AgentCleaner {
         // 收集需要清理的agent ID
         let mut agents_to_remove = Vec::new();
 
-        for entry in PROJECT_AND_AGENT_INFO_MAP.iter() {
+        for entry in self.state.project_and_agent_map.iter() {
             let project_id = entry.key();
             let agent_info = entry.value();
 
             // 只清理Idle状态的agent，避免中断正在执行的任务
-            if agent_info.status == AgentStatus::Idle
+            if agent_info.status == Some(AgentStatus::Idle)
                 && self.is_agent_idle_timeout(agent_info.last_activity, current_time)
             {
                 let idle_duration = (current_time - agent_info.last_activity).num_seconds();
@@ -211,6 +184,9 @@ impl AgentCleaner {
             cleaned_count += 1;
         }
 
+        // 🆕 清理孤立的容器（MAP中没有记录但容器还在运行的情况）
+        let orphaned_containers = self.cleanup_orphaned_containers().await;
+
         // 更新统计信息
         self.stats.total_cleaned += cleaned_count;
         self.stats.success_cleaned += success_count;
@@ -220,19 +196,19 @@ impl AgentCleaner {
         self.stats.last_cleanup = Some(current_time);
 
         // 清理完成后的统计
-        let remaining_agents = PROJECT_AND_AGENT_INFO_MAP.len();
-        let active_sessions = PROJECT_SESSION_MAP.len();
-        let cached_sessions = SESSION_CACHE.len();
+        let remaining_agents = self.state.project_and_agent_map.len();
+        let active_sessions = self.state.sessions.len();
 
         info!(
-            "清理完成: agent(总共={}, 成功={}, 失败={}, 剩余={}) | session(活跃={}, 缓存={}) | SSE消息(清理={})",
+            "清理完成 - 清理数量: {}, 成功: {}, 失败: {}, 孤立SSE会话: {}, SSE消息: {}, 孤立容器: {}, 剩余agent: {}, 活跃会话: {}",
             cleaned_count,
             success_count,
             failed_count,
+            orphaned_sessions,
+            sse_messages,
+            orphaned_containers,
             remaining_agents,
-            active_sessions,
-            cached_sessions,
-            sse_messages
+            active_sessions
         );
 
         Ok(CleanupStats {
@@ -243,6 +219,75 @@ impl AgentCleaner {
             sse_messages_cleaned: sse_messages,
             last_cleanup: Some(current_time),
         })
+    }
+
+    /// 🆕 清理孤立的容器
+    /// 检查所有运行中的 rcoder-agent 容器，如果在 state.project_and_agent_map 中没有对应记录，则清理
+    async fn cleanup_orphaned_containers(&self) -> u64 {
+        let mut cleaned_count = 0;
+
+        info!("🔍 开始检查孤立的容器");
+
+        // 获取全局 DockerManager
+        let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+            Ok(manager) => manager,
+            Err(e) => {
+                warn!("获取全局 DockerManager 失败，跳过孤立容器清理: {}", e);
+                return 0;
+            }
+        };
+
+        // 列出所有 rcoder-agent 容器
+        let containers = match docker_manager
+            .list_containers_with_pattern("rcoder-agent-*")
+            .await
+        {
+            Ok(containers) => containers,
+            Err(e) => {
+                warn!("列出容器失败，跳过孤立容器清理: {}", e);
+                return 0;
+            }
+        };
+
+        for container in containers {
+            if let Some(container_id) = &container.id {
+                // 从容器名称中提取 project_id
+                if let Some(names) = &container.names {
+                    for name in names {
+                        let clean_name = name.trim_start_matches('/');
+                        if let Some(project_id) = clean_name.strip_prefix("rcoder-agent-") {
+                            // 检查 MAP 中是否有对应记录
+                            if !self.state.project_and_agent_map.contains_key(project_id) {
+                                info!(
+                                    "🗑️ 发现孤立容器: {} (project_id={}), 准备清理",
+                                    clean_name, project_id
+                                );
+
+                                // 清理孤立容器
+                                match self.destroy_docker_container(project_id).await {
+                                    Ok(_) => {
+                                        cleaned_count += 1;
+                                        info!("✅ 成功清理孤立容器: {}", clean_name);
+                                    }
+                                    Err(e) => {
+                                        warn!("❌ 清理孤立容器失败: {} - {}", clean_name, e);
+                                    }
+                                }
+                            }
+                            break; // 找到匹配的名称后跳出内层循环
+                        }
+                    }
+                }
+            }
+        }
+
+        if cleaned_count > 0 {
+            info!("🧹 孤立容器清理完成，共清理 {} 个容器", cleaned_count);
+        } else {
+            debug!("✅ 未发现孤立容器");
+        }
+
+        cleaned_count
     }
 
     /// 基于RAII的简化清理方法
@@ -256,24 +301,27 @@ impl AgentCleaner {
         }
 
         // 检查agent是否存在
-        if PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
-            // 直接从MAP中移除，触发AgentLifecycleGuard的Drop
-            let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
+        if let Some(agent_info) = self.state.project_and_agent_map.get(project_id) {
+            // 在移除前获取 session_id 用于清理 sessions 映射
+            let session_id_to_remove = agent_info.session_id.clone();
 
-            // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
-            crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
+            // 直接从MAP中移除，触发AgentLifecycleGuard的Drop
+            let removed = self.state.project_and_agent_map.remove(project_id);
+
+            // 清理 self.state.sessions 中的映射关系
+            if let Some(ref session_id) = session_id_to_remove {
+                if let Some((_, removed_session_info)) = self.state.sessions.remove(session_id) {
+                    debug!(
+                        "🧼 [cleanup] 已清理 sessions 映射: session_id={}, project_id={}",
+                        session_id, removed_session_info.project_id
+                    );
+                }
+            }
+
             debug!(
                 "🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
                 project_id
             );
-
-            // 清理 PROJECT_SESSION_MAP 中的映射关系
-            if let Some((_, removed_session_id)) = PROJECT_SESSION_MAP.remove(project_id) {
-                debug!(
-                    "🧼 [cleanup] 已清理 PROJECT_SESSION_MAP 映射: project_id={}, session_id={}",
-                    project_id, removed_session_id
-                );
-            }
 
             if removed.is_some() {
                 info!(
@@ -382,8 +430,11 @@ impl AgentCleaner {
 /// 启动清理任务 - 普通异步版本
 ///
 /// 清理任务只操作 Send 数据结构，可以在普通异步线程中运行
-pub fn start_cleanup_task(config: CleanupConfig) -> tokio::task::JoinHandle<()> {
-    let mut cleaner = AgentCleaner::new(config);
+pub fn start_cleanup_task(
+    config: CleanupConfig,
+    state: Arc<AppState>,
+) -> tokio::task::JoinHandle<()> {
+    let mut cleaner = AgentCleaner::new(config, state);
 
     tokio::task::spawn(async move {
         cleaner.run().await;

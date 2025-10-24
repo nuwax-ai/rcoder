@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+docker_manager = { path = "../docker_manager" }
+
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

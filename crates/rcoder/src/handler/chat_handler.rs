@@ -4,17 +4,15 @@
 
 use anyhow::Result;
 use axum::{Json, extract::State};
+use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use shared_types::ModelProviderConfig;
+use shared_types::{ModelProviderConfig, ProjectAndContainerInfo};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent};
-use crate::service::session_cache::{PROJECT_SESSION_MAP, SESSION_CACHE};
-use crate::utils::prompt_builder::PromptBuilder;
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 use shared_types::{AgentType, ChatPromptBuilder};
@@ -119,9 +117,9 @@ fn generate_request_id() -> String {
     description = "根据 project_id 动态管理容器，将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
 )]
 #[axum::debug_handler]
-#[instrument(skip(_state,request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
+#[instrument(skip(state,request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
 pub async fn handle_chat(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(mut request): Json<ChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     let project_id = match &request.project_id {
@@ -152,8 +150,81 @@ pub async fn handle_chat(
         crate::service::container_manager::ContainerManager::get_or_create_container(&project_id)
             .await?;
 
-    // 第二步：转发请求到容器服务
+    // 第二步：获取或创建 ProjectAndContainerInfo
+    let _ = {
+        // 尝试从 map 中获取现有的 ProjectAndContainerInfo
+        if let Some(existing_info) = state.project_and_agent_map.get(&project_id) {
+            // 创建一个新的 ProjectAndContainerInfo，从现有信息复制
+            let mut updated_info = (**existing_info).clone();
+            updated_info.container = Some(container_info.clone());
+            updated_info.model_provider = request.model_provider.clone();
+            updated_info.request_id = request.request_id.clone();
+            updated_info.last_activity = Utc::now();
+
+            // 插入到 map 中（这会替换旧的值）
+            let arc_info = Arc::new(updated_info);
+            state
+                .project_and_agent_map
+                .insert(project_id.clone(), arc_info.clone());
+
+            info!(
+                "📋 [CHAT] 更新现有项目容器信息: project_id={}, container_id={}",
+                project_id, container_info.container_id
+            );
+
+            arc_info
+        } else {
+            // 创建新的 ProjectAndContainerInfo
+            let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
+            new_info.container = Some(container_info.clone());
+            new_info.model_provider = request.model_provider.clone();
+            new_info.request_id = request.request_id.clone();
+
+            // 插入到 map 中
+            let arc_info = Arc::new(new_info);
+            state
+                .project_and_agent_map
+                .insert(project_id.clone(), arc_info.clone());
+
+            info!(
+                "🆕 [CHAT] 创建新的项目容器信息: project_id={}, container_id={}",
+                project_id, container_info.container_id
+            );
+
+            arc_info
+        }
+    };
+
+    // 第三步：转发请求到容器服务
     let result = forward_request_to_container_service(&request, &container_info).await;
+
+    // 从 result 中获取对应的 session_id，如果 result 是成功的话，失败是没有 session_id 的
+    if let Ok(http_result) = &result {
+        if let Some(chat_response) = &http_result.data {
+            // 更新 ProjectAndContainerInfo 中的 session_id
+            if let Some(project_info) = state.project_and_agent_map.get(&project_id) {
+                let mut updated_info = (**project_info).clone();
+                updated_info.session_id = Some(chat_response.session_id.clone());
+                updated_info.last_activity = Utc::now();
+
+                // 更新 map 中的值
+                let arc_info = Arc::new(updated_info);
+                state
+                    .project_and_agent_map
+                    .insert(project_id.clone(), arc_info.clone());
+
+                // state.sessions 的数据维护,记录 session_id 和 project_id 的对应关系
+                state
+                    .sessions
+                    .insert(chat_response.session_id.clone(), arc_info.clone());
+
+                info!(
+                    "📝 [CHAT] 更新项目会话信息: project_id={}, session_id={}",
+                    project_id, chat_response.session_id
+                );
+            }
+        }
+    }
 
     match &result {
         Ok(_) => {

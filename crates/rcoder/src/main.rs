@@ -1,8 +1,9 @@
 use clap::Parser;
 use dashmap::DashMap;
+use shared_types::{ProjectAndAgentInfo, ProjectAndContainerInfo};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -113,9 +114,6 @@ async fn main() -> anyhow::Result<()> {
         cleanup_interval: Duration::from_secs(30),
     };
 
-    // 在主异步运行时中启动清理任务
-    let _cleanup_handle = start_cleanup_task(cleanup_config.clone());
-
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
     // 启动代理服务（如果启用）
@@ -164,11 +162,10 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_tx = setup_signal_handlers();
     let mut shutdown_rx = shutdown_tx.subscribe();
 
-    let state = Arc::new(AppState {
-        sessions: Arc::new(DashMap::new()),
-        config: config.clone(),
-        pingora_service: pingora_service_opt,
-    });
+    let state = Arc::new(AppState::new(config.clone(), pingora_service_opt));
+
+    // 在主异步运行时中启动清理任务
+    let _cleanup_handle = start_cleanup_task(cleanup_config.clone(), state.clone());
 
     // 创建路由
     let app = router::create_router(state.clone());
@@ -382,28 +379,8 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
     let mut cleaned_count = 0;
     let mut failed_count = 0;
 
-    // 收集所有需要清理的 project_id
-    let project_ids: Vec<String> = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP
-        .iter()
-        .map(|entry| entry.key().clone())
-        .collect();
-
-    info!("发现 {} 个需要清理的 agent 容器", project_ids.len());
-
-    for project_id in project_ids {
-        info!("🔥 正在清理容器: project_id={}", project_id);
-
-        match cleanup_single_container(&docker_manager, &project_id).await {
-            Ok(_) => {
-                cleaned_count += 1;
-                info!("✅ 容器清理成功: project_id={}", project_id);
-            }
-            Err(e) => {
-                failed_count += 1;
-                warn!("❌ 容器清理失败: project_id={}, error={}", project_id, e);
-            }
-        }
-    }
+    // 直接查找并清理所有 rcoder-agent-* 容器（不再依赖全局映射）
+    info!("开始查找所有 rcoder-agent 容器...");
 
     // 额外检查：查找可能遗漏的 rcoder-agent-* 容器
     match find_and_cleanup_orphaned_containers(&docker_manager).await {
@@ -422,69 +399,6 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
         "🧹 容器清理完成: 成功={}, 失败={}",
         cleaned_count, failed_count
     );
-
-    Ok(())
-}
-
-/// 清理单个容器
-async fn cleanup_single_container(
-    docker_manager: &docker_manager::DockerManager,
-    project_id: &str,
-) -> anyhow::Result<()> {
-    // 尝试多种方式查找容器
-    let mut container_info = docker_manager.get_container_info(project_id);
-
-    // 如果没找到，尝试通过容器名称查找
-    if container_info.is_none() {
-        let expected_container_name = format!("rcoder-agent-{}", project_id);
-        container_info = docker_manager
-            .find_container_by_identifier(&expected_container_name)
-            .await;
-    }
-
-    if let Some(container_info) = container_info {
-        info!(
-            "🎯 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
-            project_id, container_info.container_id, container_info.container_name
-        );
-
-        // 释放端口
-        if let Some(port_binding) = container_info.port_bindings.values().next() {
-            if let Ok(port) = port_binding.parse::<u16>() {
-                crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-                    .release_port(port)
-                    .await;
-                info!("🧼 释放端口: {}", port);
-            }
-        }
-
-        // 停止并删除容器
-        docker_manager
-            .stop_container_by_id(&container_info.container_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
-
-        // 从全局映射中移除
-        crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
-
-        // 清理相关映射
-        crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
-        if let Some((_, removed_session_id)) =
-            crate::service::session_cache::PROJECT_SESSION_MAP.remove(project_id)
-        {
-            info!(
-                "🧼 清理会话映射: project_id={}, session_id={}",
-                project_id, removed_session_id
-            );
-        }
-
-        info!(
-            "✅ 容器销毁成功: project_id={}, container_id={}, container_name={}",
-            project_id, container_info.container_id, container_info.container_name
-        );
-    } else {
-        info!("📭 容器不存在，无需清理: project_id={}", project_id);
-    }
 
     Ok(())
 }

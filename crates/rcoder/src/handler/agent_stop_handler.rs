@@ -10,8 +10,7 @@ use tracing::{debug, error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AgentStatusResponse, AppError, HttpResult,
-    proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent},
+    AgentStatusResponse, AppError, HttpResult, proxy_agent::docker_container_agent,
     router::AppState,
 };
 
@@ -39,6 +38,7 @@ pub struct StopAgentResponse {
 
 /// 直接销毁指定项目对应的容器
 async fn destroy_container_for_project(
+    state: &Arc<AppState>,
     project_id: &str,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     info!("🔥 [STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
@@ -88,9 +88,11 @@ async fn destroy_container_for_project(
             ));
         }
 
-        // 从全局 Agent 映射中移除（如果 project_id 不是 "unknown"）
+        // 从 Agent 映射中移除（如果 project_id 不是 "unknown"）
         if container_info.project_id != "unknown" {
-            PROJECT_AND_AGENT_INFO_MAP.remove(&container_info.project_id);
+            state
+                .project_and_agent_map
+                .remove(&container_info.project_id);
         }
 
         info!(
@@ -125,9 +127,12 @@ async fn destroy_container_for_project(
 }
 
 /// 检查或创建容器（用于停止请求）
-async fn ensure_container_exists_for_stop(project_id: &str) -> Result<(String, String), AppError> {
+async fn ensure_container_exists_for_stop(
+    state: &Arc<AppState>,
+    project_id: &str,
+) -> Result<(String, String), AppError> {
     // 检查容器是否已存在
-    if !PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
+    if !state.project_and_agent_map.contains_key(project_id) {
         info!(
             "🏗️ [STOP_FORWARD] 容器不存在，创建新容器: project_id={}",
             project_id
@@ -152,7 +157,7 @@ async fn ensure_container_exists_for_stop(project_id: &str) -> Result<(String, S
     }
 
     // 获取容器服务 URL
-    if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
+    if let Some(agent_info) = state.project_and_agent_map.get(project_id) {
         // 使用全局 DockerManager
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
@@ -311,9 +316,9 @@ async fn create_container_for_stop(
     summary = "销毁Agent容器",
     description = "直接销毁 project_id 对应的容器，不向容器内的 agent_runner 发送消息。如果容器不存在，也返回成功。"
 )]
-#[instrument(skip(_state))]
+#[instrument(skip(state))]
 pub async fn agent_stop(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(query): Query<StopAgentQuery>,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     let project_id = query.project_id.trim();
@@ -331,7 +336,7 @@ pub async fn agent_stop(
     );
 
     // 直接销毁容器
-    let result = destroy_container_for_project(project_id).await;
+    let result = destroy_container_for_project(&state, project_id).await;
 
     match &result {
         Ok(response) => {
@@ -414,9 +419,9 @@ pub async fn agent_stop(
     summary = "查询Agent状态",
     description = "查询指定项目的Agent服务状态信息。如果Agent在容器中存在且运行正常，返回完整的状态信息（包括会话ID、活动时间、模型配置等）；如果Agent不存在，只返回project_id和is_alive=false。"
 )]
-#[instrument(skip(_state))]
+#[instrument(skip(state))]
 pub async fn agent_status(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(project_id): Path<String>,
 ) -> Result<HttpResult<AgentStatusResponse>, AppError> {
     let project_id = project_id.trim();
@@ -433,13 +438,13 @@ pub async fn agent_status(
         project_id
     );
 
-    // 从MAP中获取Agent信息
-    if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
+    // 从MAP中获取Agent container 信息, state.project_and_agent_map.get(project_id)
+    if let Some(agent_info) = state.project_and_agent_map.get(project_id) {
         let response = AgentStatusResponse {
             project_id: agent_info.project_id.clone(),
             is_alive: true,
-            session_id: Some(agent_info.session_id.0.to_string()),
-            status: Some(agent_info.status),
+            session_id: agent_info.session_id.clone(),
+            status: agent_info.status.clone(),
             last_activity: Some(agent_info.last_activity),
             created_at: Some(agent_info.created_at),
             model_provider: agent_info

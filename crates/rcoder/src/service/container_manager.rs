@@ -3,7 +3,7 @@
 //! 提供通用的容器创建、管理和复用逻辑
 //! 供各个 handler 模块使用
 
-use crate::{AppError, handler::ChatRequest};
+use crate::AppError;
 use anyhow::Result;
 use docker_manager::{ContainerBasicInfo, DockerManager};
 use std::sync::Arc;
@@ -45,56 +45,6 @@ impl ContainerManager {
         Ok(container_info)
     }
 
-    /// 简化的容器创建接口
-    ///
-    /// 只需要提供 project_id，其他参数使用默认值
-    ///
-    /// # Arguments
-    /// * `project_id` - 项目ID，用于标识容器
-    ///
-    /// # Returns
-    /// 返回容器的基本信息
-    ///
-    /// # Examples
-    /// ```rust
-    /// use crate::service::container_manager::ContainerManager;
-    ///
-    /// let container_info = ContainerManager::get_or_create_container_simple("project_123").await?;
-    /// ```
-    pub async fn get_or_create_container_simple(
-        project_id: &str,
-    ) -> Result<ContainerBasicInfo, AppError> {
-        debug!(
-            "[CONTAINER_MGR] 使用简化接口创建容器: project_id={}",
-            project_id
-        );
-
-        Self::get_or_create_container(project_id).await
-    }
-
-    /// 检查容器是否已存在
-    ///
-    /// # Arguments
-    /// * `project_id` - 项目ID，用于标识容器
-    ///
-    /// # Returns
-    /// 返回容器是否存在
-    ///
-    /// # Examples
-    /// ```rust
-    /// use crate::service::container_manager::ContainerManager;
-    ///
-    /// let exists = ContainerManager::container_exists("project_123").await?;
-    /// ```
-    pub async fn container_exists(project_id: &str) -> bool {
-        debug!(
-            "[CONTAINER_MGR] 检查容器是否存在: project_id={}",
-            project_id
-        );
-
-        crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id)
-    }
-
     /// 获取容器信息
     ///
     /// # Arguments
@@ -116,23 +66,28 @@ impl ContainerManager {
     ) -> Result<Option<ContainerBasicInfo>, AppError> {
         debug!("[CONTAINER_MGR] 获取容器信息: project_id={}", project_id);
 
-        if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
-            // 使用全局 DockerManager 获取容器详细信息
-            let docker_manager = docker_manager::global::get_global_docker_manager()
-                .await
-                .map_err(|e| {
-                    error!("❌ [CONTAINER_MGR] 获取全局 DockerManager 失败: {}", e);
-                    AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
-                })?;
+        // 使用全局 DockerManager 获取容器详细信息
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| {
+                error!("❌ [CONTAINER_MGR] 获取全局 DockerManager 失败: {}", e);
+                AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+            })?;
 
-            if let Some(container_info) = docker_manager.get_container_info(project_id) {
-                // 🎯 获取容器服务地址（优先使用容器名称DNS解析，失败时使用IP地址）
-                let server_url = match crate::proxy_agent::docker_container_agent::get_container_server_url(
+        if let Some(container_info) = docker_manager.get_container_info(project_id) {
+            // 🎯 获取容器服务地址（优先使用容器名称DNS解析，失败时使用IP地址）
+            let server_url =
+                match crate::proxy_agent::docker_container_agent::get_container_server_url(
                     &container_info.container_name,
-                ).await {
+                )
+                .await
+                {
                     Ok(url) => url,
                     Err(e) => {
-                        warn!("⚠️ [CONTAINER_MGR] 容器名称DNS解析失败，尝试使用IP地址: {}", e);
+                        warn!(
+                            "⚠️ [CONTAINER_MGR] 容器名称DNS解析失败，尝试使用IP地址: {}",
+                            e
+                        );
                         // 备用方案：使用容器IP地址
                         crate::proxy_agent::docker_container_agent::get_container_ip(
                             &docker_manager,
@@ -146,134 +101,32 @@ impl ContainerManager {
                     }
                 };
 
-                // 从URL中提取IP地址
-                let ip_address = extract_ip_from_url(&server_url)?;
+            // 从URL中提取IP地址
+            let ip_address = extract_ip_from_url(&server_url)?;
 
-                let container_basic_info = ContainerBasicInfo {
-                    container_id: container_info.container_id.clone(),
-                    container_name: container_info.container_name.clone(),
-                    container_ip: ip_address,
-                    internal_port: container_info.internal_port,
-                    external_port: container_info.assigned_port,
-                    project_id: project_id.to_string(),
-                    session_id: container_info.session_id.clone(),
-                    status: container_info.status.to_string(),
-                    created_at: container_info.created_at,
-                    service_url: server_url,
-                };
+            let container_basic_info = ContainerBasicInfo {
+                container_id: container_info.container_id.clone(),
+                container_name: container_info.container_name.clone(),
+                container_ip: ip_address,
+                internal_port: container_info.internal_port,
+                external_port: container_info.assigned_port,
+                project_id: project_id.to_string(),
+                session_id: container_info.session_id.clone(),
+                status: container_info.status.to_string(),
+                created_at: container_info.created_at,
+                service_url: server_url,
+            };
 
-                debug!(
-                    "[CONTAINER_MGR] 获取容器信息成功: project_id={}, container_id={}",
-                    project_id, container_basic_info.container_id
-                );
+            debug!(
+                "[CONTAINER_MGR] 获取容器信息成功: project_id={}, container_id={}",
+                project_id, container_basic_info.container_id
+            );
 
-                return Ok(Some(container_basic_info));
-            } else {
-                warn!(
-                    "[CONTAINER_MGR] 容器信息获取失败，但Agent信息存在: project_id={}",
-                    project_id
-                );
-                return Ok(None);
-            }
+            return Ok(Some(container_basic_info));
         } else {
             debug!("[CONTAINER_MGR] 容器不存在: project_id={}", project_id);
             return Ok(None);
         }
-    }
-
-    /// 停止容器
-    ///
-    /// # Arguments
-    /// * `project_id` - 项目ID，用于标识容器
-    ///
-    /// # Returns
-    /// 返回操作结果
-    ///
-    /// # Examples
-    /// ```rust
-    /// use crate::service::container_manager::ContainerManager;
-    ///
-    /// ContainerManager::stop_container("project_123").await?;
-    /// ```
-    pub async fn stop_container(project_id: &str) -> Result<(), AppError> {
-        info!("[CONTAINER_MGR] 停止容器: project_id={}", project_id);
-
-        // 使用全局 DockerManager
-        let docker_manager = docker_manager::global::get_global_docker_manager()
-            .await
-            .map_err(|e| {
-                error!("❌ [CONTAINER_MGR] 获取全局 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
-            })?;
-
-        if let Some(container_info) = docker_manager.get_container_info(project_id) {
-            docker_manager
-                .stop_container_by_id(&container_info.container_id)
-                .await
-                .map_err(|e| {
-                    error!(
-                        "❌ [CONTAINER_MGR] 停止容器失败: project_id={}, error={}",
-                        project_id, e
-                    );
-                    AppError::internal_server_error(&format!("停止容器失败: {}", e))
-                })?;
-
-            info!(
-                "[CONTAINER_MGR] 容器停止成功: project_id={}, container_id={}",
-                project_id, container_info.container_id
-            );
-
-            // 释放对应的端口
-            if let Some(port_binding) = container_info.port_bindings.values().next() {
-                if let Ok(port) = port_binding.parse::<u16>() {
-                    crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-                        .release_port(port)
-                        .await;
-                    info!("[CONTAINER_MGR] 释放端口: {}", port);
-                }
-            }
-
-            // 从全局 MAP 中移除
-            crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
-        } else {
-            warn!(
-                "[CONTAINER_MGR] 容器不存在，无需停止: project_id={}",
-                project_id
-            );
-        }
-
-        Ok(())
-    }
-
-    /// 列出所有活跃的容器
-    ///
-    /// # Returns
-    /// 返回所有活跃容器的 project_id 列表
-    ///
-    /// # Examples
-    /// ```rust
-    /// use crate::service::container_manager::ContainerManager;
-    ///
-    /// let active_containers = ContainerManager::list_active_containers().await?;
-    /// for container_id in active_containers {
-    ///     println!("活跃容器: {}", container_id);
-    /// }
-    /// ```
-    pub async fn list_active_containers() -> Result<Vec<String>, AppError> {
-        debug!("[CONTAINER_MGR] 列出所有活跃容器");
-
-        let mut active_containers = Vec::new();
-        for entry in crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.iter() {
-            let project_id = entry.key();
-            active_containers.push(project_id.clone());
-        }
-
-        debug!(
-            "[CONTAINER_MGR] 发现 {} 个活跃容器",
-            active_containers.len()
-        );
-
-        Ok(active_containers)
     }
 }
 

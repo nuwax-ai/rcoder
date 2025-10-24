@@ -5310,6 +5310,7 @@ dependencies = [
  "codex-common",
  "codex-core",
  "derive_builder",
+ "docker_manager",
  "futures 0.3.31",
  "opentelemetry",
  "opentelemetry_sdk",

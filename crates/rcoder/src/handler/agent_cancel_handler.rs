@@ -3,15 +3,15 @@
 //! 转发取消请求到容器内的 agent_runner 服务
 
 use axum::extract::{Query, State};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
-use reqwest::Client;
 
 use crate::router::AppState;
-use shared_types::{AppError, HttpResult};
 use docker_manager::ContainerBasicInfo;
+use shared_types::{AppError, HttpResult};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]
@@ -46,10 +46,8 @@ async fn get_or_create_container_for_cancel(
 
     // 使用新的容器管理服务
     let container_info =
-        crate::service::container_manager::ContainerManager::get_or_create_container_simple(
-            project_id,
-        )
-        .await?;
+        crate::service::container_manager::ContainerManager::get_or_create_container(project_id)
+            .await?;
 
     info!(
         "✅ [CANCEL_CONTAINER] 容器准备就绪: project_id={}, container_id={}, service_url={}",
@@ -89,10 +87,11 @@ async fn forward_cancel_request_to_container_service(
 
     if status.is_success() {
         // 解析容器返回的 HttpResult<CancelResponse> 格式
-        let container_http_result: shared_types::HttpResult<CancelResponse> = response.json().await.map_err(|e| {
-            error!("❌ [CANCEL_FORWARD] 解析容器响应失败: {}", e);
-            AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
-        })?;
+        let container_http_result: shared_types::HttpResult<CancelResponse> =
+            response.json().await.map_err(|e| {
+                error!("❌ [CANCEL_FORWARD] 解析容器响应失败: {}", e);
+                AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
+            })?;
 
         // 提取 data 字段中的 CancelResponse
         let container_response = container_http_result.data.ok_or_else(|| {

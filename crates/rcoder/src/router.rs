@@ -6,6 +6,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde::Serialize;
+use shared_types::ProjectAndContainerInfo;
 
 use crate::{config::AppConfig, handler};
 use utoipa::OpenApi;
@@ -24,13 +25,28 @@ pub struct SessionInfo {
 /// 应用状态
 #[derive(Clone)]
 pub struct AppState {
-    /// 活跃的会话映射, project_id -> SessionInfo
-    pub sessions: Arc<DashMap<String, SessionInfo>>,
     /// 应用配置
     pub config: AppConfig,
-
+    /// 活跃的会话映射, session_id -> ProjectAndContainerInfo,方便sse消息长连接,获取对应的agent所在容器服务
+    pub sessions: DashMap<String, Arc<ProjectAndContainerInfo>>,
+    /// 活跃的项目和容器映射, project_id -> ProjectAndContainerInfo
+    pub project_and_agent_map: DashMap<String, Arc<ProjectAndContainerInfo>>,
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<pingora_proxy::PingoraProxyService>>,
+}
+
+impl AppState {
+    pub fn new(
+        config: AppConfig,
+        pingora: Option<Arc<pingora_proxy::PingoraProxyService>>,
+    ) -> Self {
+        Self {
+            config,
+            sessions: DashMap::new(),
+            project_and_agent_map: DashMap::new(),
+            pingora_service: pingora,
+        }
+    }
 }
 
 /// 创建 Axum 路由

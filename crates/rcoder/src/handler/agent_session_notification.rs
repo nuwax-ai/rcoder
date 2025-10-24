@@ -5,13 +5,16 @@
 use crate::{AppError, HttpResult};
 use axum::{
     extract::{Path, State},
-    response::{sse::{Event, KeepAlive, Sse}, Response},
     http::StatusCode,
+    response::{
+        Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
-use futures_util::{stream::{Stream}, StreamExt, TryStreamExt};
+use futures_util::{StreamExt, stream::Stream};
 use reqwest::Client;
 use serde::Deserialize;
-use shared_types::ProjectAndAgentInfo;
+use shared_types::ProjectAndContainerInfo;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -102,7 +105,7 @@ pub async fn agent_session_notification(
 
     // 检查容器存在性并获取代理目标
     let session_id = params.session_id.clone();
-    match find_container_by_session_id(&session_id) {
+    match find_container_by_session_id(&state, &session_id) {
         Some((project_id, agent_info)) => {
             info!(
                 "✅ [SSE_PROXY] 找到容器: session_id={}, project_id={}",
@@ -312,7 +315,7 @@ fn create_error_response(status: StatusCode, code: &str, message: &str) -> Respo
 /// 获取容器的 SSE 端点 URL
 async fn get_container_sse_url(
     project_id: &str,
-    _agent_info: &ProjectAndAgentInfo,
+    _agent_info: &ProjectAndContainerInfo,
     session_id: &str,
 ) -> Result<String, AppError> {
     info!(
@@ -357,14 +360,21 @@ async fn get_container_sse_url(
 
 /// 根据session_id查找对应的容器
 fn find_container_by_session_id(
+    state: &Arc<crate::router::AppState>,
     session_id: &str,
-) -> Option<(String, std::sync::Arc<ProjectAndAgentInfo>)> {
-    use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
+) -> Option<(String, std::sync::Arc<ProjectAndContainerInfo>)> {
+    // 首先尝试从 sessions 映射中查找（通过 session_id 直接查找）
+    if let Some(project_info) = state.sessions.get(session_id) {
+        return Some((project_info.project_id.clone(), project_info.clone()));
+    }
 
-    for entry in PROJECT_AND_AGENT_INFO_MAP.iter() {
+    // 如果 sessions 中没找到，遍历 project_and_agent_map 查找
+    for entry in state.project_and_agent_map.iter() {
         let agent_info = entry.value();
-        if agent_info.session_id.to_string() == session_id {
-            return Some((entry.key().clone(), std::sync::Arc::new(agent_info.clone())));
+        if let Some(ref agent_session_id) = agent_info.session_id {
+            if agent_session_id == session_id {
+                return Some((entry.key().clone(), agent_info.clone()));
+            }
         }
     }
     None
