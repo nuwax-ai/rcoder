@@ -103,7 +103,7 @@ async fn destroy_container_for_project(
         let response = StopAgentResponse {
             success: true,
             project_id: project_id.to_string(),
-            session_id: Some(container_info.session_id.clone()),
+            session_id: Some(container_info.session_id),
             message: "容器已成功销毁".to_string(),
         };
 
@@ -441,21 +441,22 @@ pub async fn agent_status(
     // 从MAP中获取Agent container 信息, state.project_and_agent_map.get(project_id)
     if let Some(agent_info) = state.project_and_agent_map.get(project_id) {
         let response = AgentStatusResponse {
-            project_id: agent_info.project_id.clone(),
+            project_id: agent_info.project_id().to_string(),
             is_alive: true,
-            session_id: agent_info.session_id.clone(),
-            status: agent_info.status.clone(),
-            last_activity: Some(agent_info.last_activity),
-            created_at: Some(agent_info.created_at),
+            session_id: agent_info.session_id().map(|s| s.to_string()),
+            status: agent_info.status().cloned(),
+            last_activity: Some(agent_info.last_activity()),
+            created_at: Some(agent_info.created_at()),
             model_provider: agent_info
-                .model_provider
+                .model_provider()
                 .as_ref()
                 .map(|mp| mp.to_safe_info()),
         };
 
         info!(
             "✅ [AGENT_STATUS] 成功获取Agent状态: project_id={}, status={:?}",
-            project_id, agent_info.status
+            project_id,
+            agent_info.status()
         );
 
         Ok(HttpResult::success(response))

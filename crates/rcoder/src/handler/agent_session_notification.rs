@@ -352,13 +352,13 @@ fn find_container_by_session_id(
 ) -> Option<(String, std::sync::Arc<ProjectAndContainerInfo>)> {
     // 首先尝试从 sessions 映射中查找（通过 session_id 直接查找）
     if let Some(project_info) = state.sessions.get(session_id) {
-        return Some((project_info.project_id.clone(), project_info.clone()));
+        return Some((project_info.project_id().to_string(), project_info.clone()));
     }
 
     // 如果 sessions 中没找到，遍历 project_and_agent_map 查找
     for entry in state.project_and_agent_map.iter() {
         let agent_info = entry.value();
-        if let Some(ref agent_session_id) = agent_info.session_id {
+        if let Some(agent_session_id) = agent_info.session_id() {
             if agent_session_id == session_id {
                 return Some((entry.key().clone(), agent_info.clone()));
             }

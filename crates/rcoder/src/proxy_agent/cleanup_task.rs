@@ -91,7 +91,7 @@ impl AgentCleaner {
             .state
             .project_and_agent_map
             .iter()
-            .filter_map(|entry| entry.value().session_id.clone())
+            .filter_map(|entry| entry.value().session_id().map(|s| s.to_string()))
             .collect();
 
         // 检查sessions中的所有session
@@ -153,17 +153,19 @@ impl AgentCleaner {
             let agent_info = entry.value();
 
             // 只清理Idle状态的agent，避免中断正在执行的任务
-            if agent_info.status == Some(AgentStatus::Idle)
-                && self.is_agent_idle_timeout(agent_info.last_activity, current_time)
+            if agent_info
+                .status()
+                .is_some_and(|status| matches!(status, AgentStatus::Idle))
+                && self.is_agent_idle_timeout(agent_info.last_activity(), current_time)
             {
-                let idle_duration = (current_time - agent_info.last_activity).num_seconds();
+                let idle_duration = (current_time - agent_info.last_activity()).num_seconds();
                 info!(
                     "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒, 创建时间: {}",
                     project_id,
-                    agent_info.status,
-                    agent_info.last_activity,
+                    agent_info.status(),
+                    agent_info.last_activity(),
                     idle_duration,
-                    agent_info.created_at
+                    agent_info.created_at()
                 );
                 agents_to_remove.push(project_id.clone());
             }
@@ -303,7 +305,7 @@ impl AgentCleaner {
         // 检查agent是否存在
         if let Some(agent_info) = self.state.project_and_agent_map.get(project_id) {
             // 在移除前获取 session_id 用于清理 sessions 映射
-            let session_id_to_remove = agent_info.session_id.clone();
+            let session_id_to_remove = agent_info.session_id().map(|s| s.to_string());
 
             // 直接从MAP中移除，触发AgentLifecycleGuard的Drop
             let removed = self.state.project_and_agent_map.remove(project_id);
@@ -313,7 +315,8 @@ impl AgentCleaner {
                 if let Some((_, removed_session_info)) = self.state.sessions.remove(session_id) {
                     debug!(
                         "🧼 [cleanup] 已清理 sessions 映射: session_id={}, project_id={}",
-                        session_id, removed_session_info.project_id
+                        session_id,
+                        removed_session_info.project_id()
                     );
                 }
             }

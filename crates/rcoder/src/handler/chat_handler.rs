@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared_types::{ModelProviderConfig, ProjectAndContainerInfo};
 use std::{path::PathBuf, sync::Arc};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -150,94 +150,175 @@ pub async fn handle_chat(
         crate::service::container_manager::ContainerManager::get_or_create_container(&project_id)
             .await?;
 
-    // 第二步：获取或创建 ProjectAndContainerInfo
-    let _ = {
-        // 尝试从 map 中获取现有的 ProjectAndContainerInfo
-        if let Some(existing_info) = state.project_and_agent_map.get(&project_id) {
-            // 创建一个新的 ProjectAndContainerInfo，从现有信息复制
-            let mut updated_info = (**existing_info).clone();
-            updated_info.container = Some(container_info.clone());
-            updated_info.model_provider = request.model_provider.clone();
-            updated_info.request_id = request.request_id.clone();
-            updated_info.last_activity = Utc::now();
+    // 第二步：获取或创建 ProjectAndContainerInfo - 使用新的高效状态管理
+    let project_info_ref = {
+        info!("🔍 [CHAT] 开始获取/创建项目信息: project_id={}", project_id);
 
-            // 插入到 map 中（这会替换旧的值）
-            let arc_info = Arc::new(updated_info);
-            state
-                .project_and_agent_map
-                .insert(project_id.clone(), arc_info.clone());
+        // 使用 entry API 一次性处理获取和创建，避免多次锁获取
+        let mut entry = state.project_and_agent_map.entry(project_id.clone());
 
-            info!(
-                "📋 [CHAT] 更新现有项目容器信息: project_id={}, container_id={}",
-                project_id, container_info.container_id
-            );
+        match entry {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
+                info!("📋 [CHAT] 更新现有项目信息: project_id={}", project_id);
 
-            arc_info
-        } else {
-            // 创建新的 ProjectAndContainerInfo
-            let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
-            new_info.container = Some(container_info.clone());
-            new_info.model_provider = request.model_provider.clone();
-            new_info.request_id = request.request_id.clone();
+                // 获取现有信息的可变引用，使用新的高效更新方法
+                let existing_info = occupied_entry.get();
 
-            // 插入到 map 中
-            let arc_info = Arc::new(new_info);
-            state
-                .project_and_agent_map
-                .insert(project_id.clone(), arc_info.clone());
+                // 检查是否需要更新扩展状态（避免不必要的写时复制）
+                let needs_extended_update = existing_info.container().is_none()
+                    || existing_info.model_provider().is_none()
+                    || existing_info.request_id().is_none();
 
-            info!(
-                "🆕 [CHAT] 创建新的项目容器信息: project_id={}, container_id={}",
-                project_id, container_info.container_id
-            );
+                if needs_extended_update {
+                    // 使用新的批量更新方法，减少 Arc::make_mut 调用次数
+                    let mut mutable_info = (**existing_info).clone();
+                    mutable_info.update_extended_from_request(
+                        Some(container_info.clone()),
+                        request.model_provider.clone(),
+                        request.request_id.clone(),
+                    );
+                    mutable_info.update_activity(); // 更新活动时间
 
-            arc_info
+                    let arc_info = Arc::new(mutable_info);
+                    occupied_entry.insert(arc_info.clone());
+
+                    info!(
+                        "✅ [CHAT] 项目信息完整更新完成: project_id={}, container_id={}",
+                        project_id, container_info.container_id
+                    );
+
+                    arc_info
+                } else {
+                    // 只需要更新活动时间
+                    let mut mutable_info = (**existing_info).clone();
+                    mutable_info.update_activity();
+
+                    let arc_info = Arc::new(mutable_info);
+                    occupied_entry.insert(arc_info.clone());
+
+                    info!("✅ [CHAT] 项目活动时间更新完成: project_id={}", project_id);
+
+                    arc_info
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant_entry) => {
+                info!("🆕 [CHAT] 创建新项目信息: project_id={}", project_id);
+
+                // 创建新的 ProjectAndContainerInfo，使用新的初始化方法
+                let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
+                new_info.update_extended_from_request(
+                    Some(container_info.clone()),
+                    request.model_provider.clone(),
+                    request.request_id.clone(),
+                );
+
+                let arc_info = Arc::new(new_info);
+                vacant_entry.insert(arc_info.clone());
+
+                info!(
+                    "✅ [CHAT] 项目信息创建完成: project_id={}, container_id={}",
+                    project_id, container_info.container_id
+                );
+
+                arc_info
+            }
         }
     };
 
     // 第三步：转发请求到容器服务
+    info!("🚀 [CHAT] 开始转发请求到容器服务");
     let result = forward_request_to_container_service(&request, &container_info).await;
+    info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
 
-    // 从 result 中获取对应的 session_id，如果 result 是成功的话，失败是没有 session_id 的
+    // 响应后状态更新 - 使用新的高效会话更新方法
     if let Ok(http_result) = &result {
         if let Some(chat_response) = &http_result.data {
-            // 更新 ProjectAndContainerInfo 中的 session_id
-            if let Some(project_info) = state.project_and_agent_map.get(&project_id) {
-                let mut updated_info = (**project_info).clone();
-                updated_info.session_id = Some(chat_response.session_id.clone());
-                updated_info.last_activity = Utc::now();
+            info!(
+                "📊 [CHAT] 收到聊天响应，开始状态更新: session_id={}",
+                chat_response.session_id
+            );
 
-                // 更新 map 中的值
-                let arc_info = Arc::new(updated_info);
-                state
-                    .project_and_agent_map
-                    .insert(project_id.clone(), arc_info.clone());
+            // 收集会话信息
+            let session_id = chat_response.session_id.clone();
 
-                // state.sessions 的数据维护,记录 session_id 和 project_id 的对应关系
-                state
-                    .sessions
-                    .insert(chat_response.session_id.clone(), arc_info.clone());
+            // 使用新的高效更新方法进行原子性状态更新
+            info!("🔄 [CHAT] 开始更新项目会话状态: project_id={}", project_id);
 
-                info!(
-                    "📝 [CHAT] 更新项目会话信息: project_id={}, session_id={}",
-                    project_id, chat_response.session_id
-                );
-            }
-        }
-    }
+            let updated_arc_info = {
+                let mut entry = state.project_and_agent_map.entry(project_id.clone());
+                match entry {
+                    dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
+                        // 使用新的会话更新方法，自动处理写时复制
+                        let existing_info = occupied_entry.get();
 
-    match &result {
-        Ok(_) => {
-            info!("✅ [CHAT] 聊天请求处理成功: project_id={}", project_id);
-        }
-        Err(e) => {
-            error!(
-                "❌ [CHAT] 聊天请求处理失败: project_id={}, error={}",
-                project_id, e
+                        // 检查是否真的需要更新会话信息
+                        if existing_info.session_id() != Some(&session_id) {
+                            // 创建可变副本并更新会话信息
+                            let mut mutable_info = (**existing_info).clone();
+                            mutable_info.update_session(session_id.clone());
+
+                            let arc_info = Arc::new(mutable_info);
+                            occupied_entry.insert(arc_info.clone());
+
+                            info!(
+                                "✅ [CHAT] 项目会话状态更新完成: project_id={}, session_id={}",
+                                project_id, session_id
+                            );
+
+                            arc_info
+                        } else {
+                            // 只需更新活动时间
+                            let mut mutable_info = (**existing_info).clone();
+                            mutable_info.update_activity();
+
+                            let arc_info = Arc::new(mutable_info);
+                            occupied_entry.insert(arc_info.clone());
+
+                            info!(
+                                "✅ [CHAT] 项目活动时间更新完成: project_id={}, session_id={}",
+                                project_id, session_id
+                            );
+
+                            arc_info
+                        }
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(vacant_entry) => {
+                        warn!(
+                            "⚠️ [CHAT] 项目信息不存在，创建新条目: project_id={}",
+                            project_id
+                        );
+                        let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
+                        new_info.update_session(session_id.clone());
+
+                        let arc_info = Arc::new(new_info);
+                        vacant_entry.insert(arc_info.clone());
+
+                        info!(
+                            "✅ [CHAT] 新项目会话状态创建完成: project_id={}, session_id={}",
+                            project_id, session_id
+                        );
+
+                        arc_info
+                    }
+                }
+            };
+
+            // 更新 sessions 映射 - 使用轻量级索引
+            info!("🔄 [CHAT] 更新会话索引映射: session_id={}", session_id);
+            state
+                .sessions
+                .insert(session_id.clone(), updated_arc_info.clone());
+
+            info!(
+                "🎯 [CHAT] 所有状态更新完成: project_id={}, session_id={}",
+                project_id, session_id
             );
         }
+    } else {
+        error!("❌ [CHAT] 容器服务返回错误: {:?}", result);
     }
 
+    info!("🏁 [CHAT] 准备返回最终结果: project_id={}", project_id);
     result
 }
 
