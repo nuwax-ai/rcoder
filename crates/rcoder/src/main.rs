@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -79,6 +79,34 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+    // 🧹 启动时清理上次可能遗留的容器
+    // 先初始化全局 DockerManager
+    info!("🔍 初始化 Docker Manager...");
+    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+        Ok(dm) => {
+            info!("✅ Docker Manager 初始化成功");
+            dm
+        }
+        Err(e) => {
+            error!("❌ Docker Manager 初始化失败: {}", e);
+            return Err(anyhow::anyhow!("Docker Manager 初始化失败: {}", e));
+        }
+    };
+
+    info!("🔍 检查并清理上次可能遗留的 rcoder-agent 容器...");
+    match startup_cleanup_orphaned_containers(&docker_manager).await {
+        Ok(cleaned_count) => {
+            if cleaned_count > 0 {
+                info!("✅ 启动时清理完成，共清理了 {} 个遗留容器", cleaned_count);
+            } else {
+                info!("✅ 未发现遗留容器，系统环境干净");
+            }
+        }
+        Err(e) => {
+            warn!("⚠️ 启动时容器清理失败: {}，但这不影响服务启动", e);
+        }
+    }
+
     // 创建清理配置
     let cleanup_config = CleanupConfig {
         idle_timeout: Duration::from_secs(3600),
@@ -131,20 +159,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         (None, None)
     };
-
-    // 初始化全局 DockerManager
-    info!("🐳 初始化全局 DockerManager...");
-    // 使用 rcoder 配置创建 DockerManager 配置
-    let docker_config = docker_manager::utils::DockerUtils::config_from_rcoder_docker_config(
-        config.docker_config.as_ref(),
-    );
-    if let Err(e) =
-        docker_manager::global::init_global_docker_manager_with_config(docker_config).await
-    {
-        error!("❌ 全局 DockerManager 初始化失败: {}", e);
-        return Err(anyhow::anyhow!("全局 DockerManager 初始化失败: {}", e));
-    }
-    info!("✅ 全局 DockerManager 初始化成功");
 
     // 设置 Ctrl+C 信号处理
     let shutdown_tx = setup_signal_handlers();
@@ -522,6 +536,83 @@ async fn find_and_cleanup_orphaned_containers(
         Err(e) => {
             error!("❌ 孤立容器清理失败: {}", e);
             Err(anyhow::anyhow!("清理孤立容器失败: {}", e))
+        }
+    }
+}
+
+/// 启动时清理遗留的 rcoder-agent 容器
+/// 使用更激进的清理策略，确保启动时环境干净
+async fn startup_cleanup_orphaned_containers(
+    docker_manager: &docker_manager::DockerManager,
+) -> anyhow::Result<u64> {
+    info!("🧹 启动时清理：查找并清理所有 rcoder-agent-* 容器...");
+
+    // 启动时使用更激进的清理策略
+    let cleanup_options = docker_manager::CleanupOptions {
+        force_remove_running: true,       // 强制删除运行中的容器
+        wait_for_graceful_stop: false,    // 不等待优雅停止，直接删除
+        stop_timeout_seconds: 5,          // 很短的超时时间
+        remove_associated_volumes: false, // 不删除数据卷
+    };
+
+    // 清理所有 rcoder-agent-* 容器
+    match docker_manager
+        .cleanup_containers_with_pattern("rcoder-agent-*", cleanup_options)
+        .await
+    {
+        Ok(result) => {
+            if result.total_found > 0 {
+                info!(
+                    "🧹 启动清理完成: 找到={}, 成功={}, 失败={}",
+                    result.total_found, result.successfully_removed, result.failed_removals
+                );
+
+                if result.has_removals() {
+                    info!("📋 被清理的容器IDs: {:?}", result.removed_container_ids);
+                }
+
+                if !result.is_complete_success() {
+                    // 过滤掉 409 冲突错误（容器已在删除中），这是正常情况
+                    let mut real_failures = Vec::new();
+                    for failure in &result.failed_removals_details {
+                        if failure.error_message.contains("409")
+                            && failure.error_message.contains("already in progress")
+                        {
+                            info!(
+                                "  - 容器 {} ({}): 已在删除中，跳过",
+                                failure.container_id, failure.container_name
+                            );
+                        } else {
+                            real_failures.push(failure);
+                        }
+                    }
+
+                    if !real_failures.is_empty() {
+                        warn!("⚠️ 部分容器清理失败:");
+                        for failure in real_failures {
+                            warn!(
+                                "  - 容器 {} ({}): {}",
+                                failure.container_id, failure.container_name, failure.error_message
+                            );
+                        }
+                    }
+                }
+            } else {
+                debug!("🧹 启动清理: 未发现 rcoder-agent-* 容器");
+            }
+
+            Ok(result.successfully_removed as u64)
+        }
+        Err(e) => {
+            // 检查是否是 409 冲突错误（容器已在删除中）
+            let error_str = e.to_string();
+            if error_str.contains("409") && error_str.contains("already in progress") {
+                info!("🔄 启动时遇到容器正在删除中的情况，这是正常的");
+                Ok(0)
+            } else {
+                error!("❌ 启动时容器清理失败: {}", e);
+                Err(anyhow::anyhow!("启动时清理失败: {}", e))
+            }
         }
     }
 }

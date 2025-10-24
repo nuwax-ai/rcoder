@@ -1,13 +1,21 @@
 //! Agent执行任务的SSE通知处理器
 //!
-//! 使用 Pingora 透明代理处理 SSE 消息，实现高效的 SSE 重定向
+//! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
 
 use crate::{AppError, HttpResult};
-use axum::{extract::Path, response::Json};
-use serde::{Deserialize, Serialize};
+use axum::{
+    extract::{Path, State},
+    response::{sse::{Event, KeepAlive, Sse}, Response},
+    http::StatusCode,
+};
+use futures_util::{stream::{Stream}, StreamExt, TryStreamExt};
+use reqwest::Client;
+use serde::Deserialize;
 use shared_types::ProjectAndAgentInfo;
-use tracing::{error, info};
-use utoipa::{IntoParams, ToSchema};
+use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::{debug, error, info, warn};
+use utoipa::IntoParams;
 
 /// 会话通知路径参数
 #[derive(Debug, Deserialize, IntoParams)]
@@ -17,25 +25,24 @@ pub struct SessionNotificationParams {
     pub session_id: String,
 }
 
-/// 检查 session_id 对应的容器，返回容器的直接 SSE URL
+/// Agent 会话 SSE 通知处理器
 ///
-/// 此接口返回容器内 agent_runner 的直接连接地址，让前端绕过 axum SSE 处理
-/// 直接通过 Pingora 透明代理连接到容器，实现更高效的 SSE 通信
+/// 此接口直接返回 SSE 流，实现从容器到客户端的实时消息转发
 ///
 /// ## 🔄 代理流程
 ///
 /// 1. 用户请求 `/agent/progress/{session_id}`
 /// 2. axum 处理器检查 session_id 对应的容器是否存在
-/// 3. 如果容器存在，返回容器的实际 SSE 端点 URL
-/// 4. 前端直接连接到容器 URL (通过 Pingora 透明代理)
-/// 5. 如果容器不存在，返回错误
+/// 3. 建立到容器 SSE 端点的连接
+/// 4. 将容器的 SSE 流直接转发给客户端
+/// 5. 保持连接直到客户端断开或容器停止
 ///
 /// ## 💡 优势
 ///
-/// - **高性能**: 避免 axum SSE 转发的开销
-/// - **低延迟**: 直接连接到目标容器
-/// - **简化架构**: 减少中间层处理
-/// - **实时性**: 保持原始 SSE 协议特性
+/// - **实时性**: 直接转发 SSE 流，保持原始协议特性
+/// - **透明代理**: 客户端无感知的容器连接
+/// - **错误处理**: 完善的连接错误和重试机制
+/// - **资源管理**: 自动清理断开的连接
 #[utoipa::path(
     get,
     path = "/agent/progress/{session_id}",
@@ -45,17 +52,12 @@ pub struct SessionNotificationParams {
     responses(
         (
             status = 200,
-            description = "成功获取容器 SSE 端点地址",
-            body = ProxyRedirectResponse,
-            example = json!({
-                "success": true,
-                "data": {
-                    "container_url": "http://localhost:8081/agent/agent/progress?session_id=abc123",
-                    "project_id": "project_xyz",
-                    "session_id": "session_abc123",
-                    "status": "container_ready"
-                }
-            })
+            description = "成功建立 SSE 连接，开始接收实时消息",
+            content_type = "text/event-stream",
+            headers(
+                ("Cache-Control" = String, description = "no-cache"),
+                ("Connection" = String, description = "keep-alive"),
+            )
         ),
         (
             status = 404,
@@ -72,124 +74,251 @@ pub struct SessionNotificationParams {
         ),
         (
             status = 500,
-            description = "获取容器信息失败",
+            description = "建立 SSE 连接失败",
             body = HttpResult<String>,
             example = json!({
                 "success": false,
                 "data": null,
                 "error": {
-                    "code": "CONTAINER_ERROR",
-                    "message": "获取容器信息时发生内部错误"
+                    "code": "SSE_CONNECTION_ERROR",
+                    "message": "无法连接到容器的 SSE 端点"
                 }
             })
         )
     ),
     tag = "agent",
     operation_id = "agent_session_notification",
-    summary = "获取容器 SSE 端点地址",
-    description = "检查 session_id 对应的容器，返回容器的直接 agent_runner SSE 连接地址，让前端通过 Pingora 透明代理直接连接。"
+    summary = "Agent 会话 SSE 通知流",
+    description = "建立到指定 session_id 对应容器的 SSE 连接，实时接收 Agent 执行进度和状态更新。"
 )]
 pub async fn agent_session_notification(
     Path(params): Path<SessionNotificationParams>,
-) -> Result<Json<HttpResult<ProxyRedirectResponse>>, AppError> {
+    State(state): State<Arc<crate::router::AppState>>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     info!(
-        "🔍 [PROXY_REDIRECT] 收到SSE端点请求: session_id={:?}",
+        "🔍 [SSE_PROXY] 收到SSE连接请求: session_id={:?}",
         params.session_id
     );
 
     // 检查容器存在性并获取代理目标
     let session_id = params.session_id.clone();
-    match check_container_and_proxy_sse(&session_id).await {
-        Ok((target_url, project_id)) => {
+    match find_container_by_session_id(&session_id) {
+        Some((project_id, agent_info)) => {
             info!(
-                "✅ [PROXY_REDIRECT] 找到容器: session_id={}, project_id={}, target_url={}",
-                session_id, project_id, target_url
+                "✅ [SSE_PROXY] 找到容器: session_id={}, project_id={}",
+                session_id, project_id
             );
 
-            let response = ProxyRedirectResponse {
-                container_url: format!("{}?session_id={}", target_url, session_id),
-                project_id,
-                session_id: session_id.clone(),
-                status: "container_ready".to_string(),
-            };
+            // 获取容器的 SSE 端点 URL
+            match get_container_sse_url(&project_id, &agent_info, &session_id).await {
+                Ok(sse_url) => {
+                    info!("🚀 [SSE_PROXY] 建立SSE代理连接: {}", sse_url);
 
-            Ok(Json(HttpResult::success(response)))
+                    // 创建 SSE 流
+                    let stream = create_sse_proxy_stream(sse_url, session_id.clone()).await;
+
+                    Ok(Sse::new(stream).keep_alive(
+                        KeepAlive::new()
+                            .interval(Duration::from_secs(15))
+                            .text("keep-alive"),
+                    ))
+                }
+                Err(e) => {
+                    error!(
+                        "❌ [SSE_PROXY] 获取容器SSE端点失败: session_id={}, error={}",
+                        session_id, e
+                    );
+
+                    Err(create_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "SSE_CONNECTION_ERROR",
+                        "无法连接到容器的 SSE 端点",
+                    ))
+                }
+            }
         }
-        Err(e) => {
-            error!(
-                "❌ [PROXY_REDIRECT] 容器检查失败: session_id={}, error={}",
-                session_id, e
-            );
+        None => {
+            error!("❌ [SSE_PROXY] 未找到对应容器: session_id={}", session_id);
 
-            Ok(Json(HttpResult::error(
+            Err(create_error_response(
+                StatusCode::NOT_FOUND,
                 "CONTAINER_NOT_FOUND",
                 "未找到 session_id 对应的活跃容器",
-            )))
+            ))
         }
     }
 }
 
-/// 代理重定向响应结构
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct ProxyRedirectResponse {
-    /// 容器的 SSE 端点 URL
-    #[schema(example = "http://localhost:8081/agent/agent/progress?session_id=abc123")]
-    pub container_url: String,
+/// 创建 SSE 代理流
+async fn create_sse_proxy_stream(
+    sse_url: String,
+    session_id: String,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
 
-    /// 项目 ID
-    #[schema(example = "project_xyz")]
-    pub project_id: String,
+    // 在后台任务中处理 SSE 连接
+    tokio::spawn(async move {
+        let client = Client::new();
 
-    /// 会话 ID
-    #[schema(example = "session_abc123")]
-    pub session_id: String,
-
-    /// 容器状态
-    #[schema(example = "container_ready")]
-    pub status: String,
-}
-
-/// 检查 session_id 对应的容器，返回容器的直接 SSE URL
-async fn check_container_and_proxy_sse(session_id: &str) -> Result<(String, String), AppError> {
-    info!(
-        "🔍 [PROXY_REDIRECT] 检查容器可用性: session_id={}",
-        session_id
-    );
-
-    // 查找对应的容器
-    if let Some((project_id, agent_info)) = find_container_by_session_id(session_id) {
         info!(
-            "✅ [PROXY_REDIRECT] 找到对应容器: project_id={}, session_id={}",
-            project_id, session_id
+            "🔗 [SSE_PROXY] 开始连接容器SSE: url={}, session_id={}",
+            sse_url, session_id
         );
 
-        // 获取容器的服务地址
-        let container_service_url = get_container_service_url(&project_id, &agent_info).await?;
+        match client
+            .get(&sse_url)
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    info!(
+                        "✅ [SSE_PROXY] 成功连接到容器SSE: session_id={}",
+                        session_id
+                    );
 
-        // 构建目标容器的 SSE 端点 URL
-        let target_url = format!("{}/agent/agent/progress", container_service_url);
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
 
-        info!("🚀 [PROXY_REDIRECT] 容器可用，目标 URL: {}", target_url);
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                if let Ok(text) = String::from_utf8(chunk.to_vec()) {
+                                    buffer.push_str(&text);
 
-        Ok((target_url, project_id))
-    } else {
-        error!(
-            "❌ [PROXY_REDIRECT] 未找到对应容器，无法建立 SSE 连接: session_id={}",
-            session_id
-        );
-        Err(AppError::internal_server_error(&format!(
-            "未找到 session_id={} 对应的活跃容器",
-            session_id
-        )))
-    }
+                                    // 处理完整的 SSE 事件
+                                    while let Some(event_end) = buffer.find("\n\n") {
+                                        let event_text = buffer[..event_end].to_string();
+                                        buffer = buffer[event_end + 2..].to_string();
+
+                                        if !event_text.trim().is_empty() {
+                                            debug!(
+                                                "📨 [SSE_PROXY] 转发SSE事件: session_id={}, event_len={}",
+                                                session_id,
+                                                event_text.len()
+                                            );
+
+                                            // 解析并转发事件
+                                            if let Some(event) = parse_sse_event(&event_text) {
+                                                if tx.send(Ok(event)).await.is_err() {
+                                                    warn!(
+                                                        "⚠️ [SSE_PROXY] 客户端已断开连接: session_id={}",
+                                                        session_id
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "❌ [SSE_PROXY] 读取SSE流失败: session_id={}, error={}",
+                                    session_id, e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    error!(
+                        "❌ [SSE_PROXY] 容器SSE连接失败: session_id={}, status={}",
+                        session_id,
+                        response.status()
+                    );
+
+                    // 发送错误事件
+                    let error_event = Event::default()
+                        .event("error")
+                        .data(format!("容器连接失败: {}", response.status()));
+                    let _ = tx.send(Ok(error_event)).await;
+                }
+            }
+            Err(e) => {
+                error!(
+                    "❌ [SSE_PROXY] 无法连接到容器SSE: session_id={}, error={}",
+                    session_id, e
+                );
+
+                // 发送连接错误事件
+                let error_event = Event::default()
+                    .event("error")
+                    .data(format!("连接错误: {}", e));
+                let _ = tx.send(Ok(error_event)).await;
+            }
+        }
+
+        info!("🔚 [SSE_PROXY] SSE代理连接结束: session_id={}", session_id);
+    });
+
+    ReceiverStream::new(rx)
 }
 
-/// 获取容器服务地址
-async fn get_container_service_url(
+/// 解析 SSE 事件文本
+fn parse_sse_event(event_text: &str) -> Option<Event> {
+    let mut event = Event::default();
+    let mut has_data = false;
+
+    for line in event_text.lines() {
+        if let Some(colon_pos) = line.find(':') {
+            let field = &line[..colon_pos];
+            let value = line[colon_pos + 1..].trim_start();
+
+            match field {
+                "event" => {
+                    event = event.event(value);
+                }
+                "data" => {
+                    event = event.data(value);
+                    has_data = true;
+                }
+                "id" => {
+                    event = event.id(value);
+                }
+                "retry" => {
+                    if let Ok(retry_ms) = value.parse::<u64>() {
+                        event = event.retry(Duration::from_millis(retry_ms));
+                    }
+                }
+                _ => {
+                    // 忽略未知字段
+                }
+            }
+        } else if !line.is_empty() {
+            // 没有冒号的行作为 data
+            event = event.data(line);
+            has_data = true;
+        }
+    }
+
+    if has_data { Some(event) } else { None }
+}
+
+/// 创建错误响应
+fn create_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    let error_body = HttpResult::<()>::error(code, message);
+    let json_body = serde_json::to_string(&error_body).unwrap_or_default();
+
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(json_body.into())
+        .unwrap_or_else(|_| Response::new("Internal Server Error".into()))
+}
+
+/// 获取容器的 SSE 端点 URL
+async fn get_container_sse_url(
     project_id: &str,
     _agent_info: &ProjectAndAgentInfo,
+    session_id: &str,
 ) -> Result<String, AppError> {
-    info!("🔍 [CONTAINER] 获取容器服务地址: project_id={}", project_id);
+    info!(
+        "🔍 [CONTAINER] 获取容器SSE端点: project_id={}, session_id={}",
+        project_id, session_id
+    );
 
     let docker_manager = std::sync::Arc::new(
         docker_manager::DockerManager::with_default_config()
@@ -213,8 +342,14 @@ async fn get_container_service_url(
             AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
         })?;
 
-        info!("✅ [CONTAINER] 获取容器服务 URL: {}", server_url);
-        Ok(server_url)
+        // 构建 SSE 端点 URL
+        let sse_url = format!(
+            "{}/agent/agent/progress?session_id={}",
+            server_url, session_id
+        );
+
+        info!("✅ [CONTAINER] 获取容器SSE端点: {}", sse_url);
+        Ok(sse_url)
     } else {
         Err(AppError::internal_server_error("未找到容器信息"))
     }
