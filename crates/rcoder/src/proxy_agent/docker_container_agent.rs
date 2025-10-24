@@ -144,7 +144,8 @@ async fn create_docker_container_config(
         image: docker_manager::default_docker_image(),
         name_prefix: "rcoder-agent".to_string(),
         host_path: host_project_path.to_string_lossy().to_string(), // 🎯 使用宿主机绝对路径
-        container_path: "/app/project_workspace".to_string(),
+        // 容器内路径为 /app/project_workspace/{project_id}，工作目录为 /app
+        container_path: format!("/app/project_workspace/{}", project_id).to_string(),
         work_dir: "/app".to_string(),
         env_vars,
         port_bindings,                      // 空的端口映射
