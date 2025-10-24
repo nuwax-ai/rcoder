@@ -144,8 +144,8 @@ async fn create_docker_container_config(
         image: docker_manager::default_docker_image(),
         name_prefix: "rcoder-agent".to_string(),
         host_path: host_project_path.to_string_lossy().to_string(), // 🎯 使用宿主机绝对路径
-        container_path: "/app/workspace".to_string(),
-        work_dir: "/app/workspace".to_string(),
+        container_path: "/app/project_workspace".to_string(),
+        work_dir: "/app".to_string(),
         env_vars,
         port_bindings,                      // 空的端口映射
         network_mode: "bridge".to_string(), // 使用 bridge 网络模式，但不暴露端口
