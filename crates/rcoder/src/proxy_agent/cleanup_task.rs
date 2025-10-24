@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+use tokio::time::timeout;
 
 use crate::AgentStatus;
 use crate::router::AppState;
@@ -76,6 +77,8 @@ pub struct CleanupConfig {
     pub idle_timeout: Duration,
     /// 清理检查间隔（默认5分钟）
     pub cleanup_interval: Duration,
+    /// Docker容器停止超时时间（默认30秒）
+    pub docker_stop_timeout: Duration,
     // 注意：force_terminate_timeout 字段已移除
     // 因为采用RAII模式，AgentLifecycleGuard会自动处理资源清理
     // 不需要强制终止超时机制
@@ -86,6 +89,7 @@ impl Default for CleanupConfig {
         Self {
             idle_timeout: Duration::from_secs(30 * 60),
             cleanup_interval: Duration::from_secs(5 * 60),
+            docker_stop_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -585,13 +589,24 @@ impl AgentCleaner {
                 }
             }
 
-            // 停止容器
-            let stop_result = docker_manager
-                .stop_container_by_id(&container_info.container_id)
-                .await;
+            // 停止容器 - 使用配置的超时时间
+            let stop_timeout = self.config.docker_stop_timeout;
+            let stop_result = timeout(
+                stop_timeout,
+                docker_manager.stop_container_by_id_with_timeout(&container_info.container_id, stop_timeout.as_secs())
+            ).await;
 
-            if let Err(e) = stop_result {
-                return Err(anyhow::anyhow!("停止Docker容器失败: {}", e));
+            match stop_result {
+                Ok(Ok(_)) => {
+                    info!("✅ [cleanup] Docker容器停止成功: {}", container_info.container_id);
+                }
+                Ok(Err(e)) => {
+                    warn!("⚠️ [cleanup] Docker容器停止失败: {} - {}", container_info.container_id, e);
+                }
+                Err(_) => {
+                    warn!("⏰ [cleanup] Docker容器停止超时: {} (超时时间: {}秒)", 
+                          container_info.container_id, stop_timeout.as_secs());
+                }
             }
 
             info!(

@@ -269,12 +269,22 @@ impl DockerManager {
 
     /// 通过容器ID停止容器
     pub async fn stop_container_by_id(&self, container_id: &str) -> DockerResult<()> {
-        info!("通过容器ID停止容器: {}", container_id);
+        self.stop_container_by_id_with_timeout(container_id, 30).await
+    }
 
-        // 停止容器
+    /// 通过容器ID停止容器（带超时参数）
+    pub async fn stop_container_by_id_with_timeout(&self, container_id: &str, timeout_seconds: u64) -> DockerResult<()> {
+        info!("通过容器ID停止容器: {} (超时: {}秒)", container_id, timeout_seconds);
+
+        // 停止容器 - 使用传入的超时时间
+        let stop_options = Some(StopContainerOptions {
+            t: Some(timeout_seconds as i32),
+            signal: None::<String>,
+        });
+        
         if let Err(e) = self
             .docker
-            .stop_container(container_id, None::<StopContainerOptions>)
+            .stop_container(container_id, stop_options)
             .await
         {
             if !e.to_string().contains("No such container") {
