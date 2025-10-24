@@ -1,19 +1,25 @@
 use super::{
-    ContainerStatus, DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig,
-    DockerResult, MountPoint, RCODER_NETWORK_NAME,
+    CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerStatus,
+    DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
+    MountPoint, RCODER_NETWORK_NAME,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, CreateImageOptions, InspectContainerOptions, LogsOptions,
-    RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
+    CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
+    LogsOptions, RemoveContainerOptions, RestartContainerOptions, StartContainerOptions,
+    StopContainerOptions,
 };
 use bollard::{
     API_DEFAULT_VERSION, Docker,
-    models::{ContainerCreateBody, HostConfig, Mount, Network, NetworkingConfig, PortBinding},
+    models::{
+        ContainerCreateBody, ContainerSummary, HostConfig, Mount, Network, NetworkingConfig,
+        PortBinding,
+    },
 };
 use chrono::Utc;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -676,11 +682,11 @@ impl DockerManager {
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))?;
+            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)));
 
         let mut network_ips = HashMap::new();
 
-        if let Some(network_settings) = inspect.network_settings {
+        if let Some(network_settings) = inspect.unwrap().network_settings {
             if let Some(networks) = network_settings.networks {
                 for (network_name, network_info) in networks {
                     if let Some(ip_address) = network_info.ip_address {
@@ -756,6 +762,289 @@ impl DockerManager {
                 "无法获取容器状态信息: {}",
                 container_id
             )));
+        }
+    }
+
+    /// 根据模式列出 Docker 容器
+    ///
+    /// # Arguments
+    /// * `pattern` - 容器名称模式，支持通配符（如 "rcoder-agent-*"）
+    ///
+    /// # Returns
+    /// 返回匹配的容器信息列表
+    pub async fn list_containers_with_pattern(
+        &self,
+        pattern: &str,
+    ) -> DockerResult<Vec<ContainerSummary>> {
+        info!("🔍 查找匹配模式的容器: pattern={}", pattern);
+
+        // 使用 Docker API 列出所有容器（包括停止的）
+        let options = Some(ListContainersOptions {
+            all: true,
+            ..Default::default()
+        });
+
+        let containers = self
+            .docker
+            .list_containers(options)
+            .await
+            .map_err(|e| DockerError::ConnectionError(format!("获取容器列表失败: {}", e)))?;
+
+        // 创建过滤器
+        let filter = ContainerFilter::name_pattern(pattern);
+
+        // 过滤容器
+        let matched_containers: Vec<ContainerSummary> = containers
+            .clone()
+            .into_iter()
+            .filter(|container| filter.matches(container))
+            .collect();
+
+        info!(
+            "✅ 容器查找完成: 总数={}, 匹配数={}, pattern={}",
+            containers.len(),
+            matched_containers.len(),
+            pattern
+        );
+
+        Ok(matched_containers)
+    }
+
+    /// 批量停止并删除指定的容器
+    ///
+    /// # Arguments
+    /// * `container_ids` - 要删除的容器ID列表
+    /// * `options` - 清理选项
+    ///
+    /// # Returns
+    /// 返回清理操作结果统计
+    pub async fn stop_and_remove_containers_by_ids(
+        &self,
+        container_ids: Vec<String>,
+        options: CleanupOptions,
+    ) -> DockerResult<CleanupResult> {
+        info!("🔥 开始批量清理容器: 数量={}", container_ids.len());
+
+        let start_time = Instant::now();
+        let mut result = CleanupResult::default();
+        result.total_found = container_ids.len();
+
+        for container_id in &container_ids {
+            match self
+                .stop_and_remove_single_container(container_id, &options)
+                .await
+            {
+                Ok(_) => {
+                    result.successfully_removed += 1;
+                    result.removed_container_ids.push(container_id.clone());
+                    info!("✅ 容器清理成功: {}", container_id);
+                }
+                Err(e) => {
+                    result.failed_removals += 1;
+                    result
+                        .failed_removals_details
+                        .push(ContainerRemovalFailure {
+                            container_id: container_id.clone(),
+                            container_name: container_id.clone(), // 我们可能不知道名称，使用ID
+                            error_message: e.to_string(),
+                        });
+                    error!("❌ 容器清理失败: {} - {}", container_id, e);
+                }
+            }
+        }
+
+        result.duration_ms = start_time.elapsed().as_millis() as u64;
+
+        info!(
+            "🧹 容器批量清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
+            result.total_found,
+            result.successfully_removed,
+            result.failed_removals,
+            result.duration_ms
+        );
+
+        Ok(result)
+    }
+
+    /// 停止并删除单个容器
+    async fn stop_and_remove_single_container(
+        &self,
+        container_id: &str,
+        options: &CleanupOptions,
+    ) -> DockerResult<()> {
+        info!("🔄 正在清理容器: {}", container_id);
+
+        // 第一步：获取容器信息
+        let container_info = self.inspect_container_for_cleanup(container_id).await?;
+
+        // 第二步：检查容器状态并决定是否需要停止
+        match container_info
+            .state
+            .as_ref()
+            .and_then(|s| s.status.as_ref())
+        {
+            Some(status) if status.to_string() == "running" => {
+                if !options.force_remove_running {
+                    info!("⚠️ 容器 {} 正在运行，跳过删除（非强制模式）", container_id);
+                    return Ok(());
+                }
+
+                if options.wait_for_graceful_stop {
+                    info!("🛑 正在优雅停止容器: {}", container_id);
+                    if let Err(e) = self
+                        .graceful_stop_container(container_id, options.stop_timeout_seconds)
+                        .await
+                    {
+                        warn!("优雅停止失败，强制停止: {} - {}", container_id, e);
+                        // 强制停止
+                        self.force_stop_container(container_id).await?;
+                    }
+                } else {
+                    // 直接强制停止
+                    self.force_stop_container(container_id).await?;
+                }
+            }
+            Some(_) => {
+                info!("📦 容器 {} 未运行，直接删除", container_id);
+            }
+            None => {
+                warn!("⚠️ 无法获取容器 {} 状态，继续尝试删除", container_id);
+            }
+        }
+
+        // 第三步：删除容器
+        self.remove_single_container(container_id, options.remove_associated_volumes)
+            .await?;
+
+        info!("✅ 容器清理完成: {}", container_id);
+        Ok(())
+    }
+
+    /// 获取容器信息用于清理
+    async fn inspect_container_for_cleanup(
+        &self,
+        container_id: &str,
+    ) -> Result<bollard::models::ContainerInspectResponse, DockerError> {
+        let options = Some(InspectContainerOptions { size: false });
+
+        self.docker
+            .inspect_container(container_id, options)
+            .await
+            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))
+    }
+
+    /// 优雅停止容器
+    async fn graceful_stop_container(
+        &self,
+        container_id: &str,
+        timeout_seconds: u64,
+    ) -> DockerResult<()> {
+        let stop_options = Some(StopContainerOptions {
+            t: Some((timeout_seconds as i32).try_into().unwrap()),
+            signal: None::<String>,
+        });
+
+        self.docker
+            .stop_container(container_id, stop_options)
+            .await
+            .map_err(|e| DockerError::ContainerStopError(format!("优雅停止容器失败: {}", e)))
+    }
+
+    /// 强制停止容器
+    async fn force_stop_container(&self, container_id: &str) -> DockerResult<()> {
+        let stop_options = Some(StopContainerOptions {
+            t: None::<i32>,
+            signal: None::<String>,
+        });
+
+        self.docker
+            .stop_container(container_id, stop_options)
+            .await
+            .map_err(|e| DockerError::ContainerStopError(format!("强制停止容器失败: {}", e)))
+    }
+
+    /// 删除单个容器
+    async fn remove_single_container(
+        &self,
+        container_id: &str,
+        remove_volumes: bool,
+    ) -> DockerResult<()> {
+        let remove_options = Some(RemoveContainerOptions {
+            force: true,
+            v: remove_volumes,
+            ..Default::default()
+        });
+
+        self.docker
+            .remove_container(container_id, remove_options)
+            .await
+            .map_err(|e| DockerError::ContainerRemoveError(format!("删除容器失败: {}", e)))
+    }
+
+    /// 使用模式匹配清理容器（主要接口）
+    ///
+    /// # Arguments
+    /// * `pattern` - 容器名称模式（如 "rcoder-agent-*"）
+    /// * `options` - 清理选项
+    ///
+    /// # Returns
+    /// 返回清理结果统计
+    pub async fn cleanup_containers_with_pattern(
+        &self,
+        pattern: &str,
+        options: CleanupOptions,
+    ) -> DockerResult<CleanupResult> {
+        info!("🧹 开始模式匹配清理容器: pattern={:?}", pattern);
+
+        // 第一步：查找匹配的容器
+        let matched_containers = self.list_containers_with_pattern(pattern).await?;
+
+        // 第二步：提取容器ID
+        let container_ids: Vec<String> = matched_containers
+            .iter()
+            .filter_map(|container| container.id.as_ref())
+            .cloned()
+            .collect();
+
+        info!(
+            "🎯 找到 {} 个匹配的容器: pattern={}",
+            container_ids.len(),
+            pattern
+        );
+
+        // 第三步：批量清理
+        let result = self
+            .stop_and_remove_containers_by_ids(container_ids, options)
+            .await;
+
+        // 第四步：从内部映射中移除已清理的容器
+        self.cleanup_internal_mappings(&matched_containers).await;
+
+        result
+    }
+
+    /// 从内部映射中清理已删除的容器
+    async fn cleanup_internal_mappings(&self, removed_containers: &[ContainerSummary]) {
+        for container in removed_containers {
+            if let Some(container_id) = &container.id {
+                // 从内存映射中查找并移除
+                let mut keys_to_remove = Vec::new();
+
+                for entry in self.containers.iter() {
+                    let (project_id, container_info) = entry.pair();
+                    if container_info.container_id == *container_id {
+                        keys_to_remove.push(project_id.clone());
+                    }
+                }
+
+                for project_id in keys_to_remove {
+                    self.containers.remove(&project_id);
+                    info!(
+                        "🧹 从内部映射中移除: project_id={}, container_id={}",
+                        project_id, container_id
+                    );
+                }
+            }
         }
     }
 

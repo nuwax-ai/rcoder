@@ -2,23 +2,16 @@
 //!
 //! 转发取消请求到容器内的 agent_runner 服务
 
-use axum::{
-    Json,
-    extract::{Query, State},
-};
-use reqwest::Client;
+use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
+use reqwest::Client;
 
-use crate::{
-    CancelNotificationRequest,
-    proxy_agent::{PROJECT_AND_AGENT_INFO_MAP, docker_container_agent},
-    router::AppState,
-};
-use docker_manager::ContainerBasicInfo;
+use crate::router::AppState;
 use shared_types::{AppError, HttpResult};
+use docker_manager::ContainerBasicInfo;
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]
@@ -77,36 +70,34 @@ async fn forward_cancel_request_to_container_service(
         project_id, session_id, container_info.container_id
     );
 
-    // 构建容器内 agent_runner 的取消请求
-    let cancel_request = serde_json::json!({
-        "session_id": session_id,
-        "project_id": project_id
-    });
-
-    // 转发到容器内的 agent/agent/cancel 接口
+    // 转发到容器内的 agent/session/cancel 接口（使用查询参数）
     let client = Client::new();
-    let cancel_url = format!("{}/agent/agent/cancel", container_info.service_url);
+    let cancel_url = format!(
+        "{}/agent/session/cancel?project_id={}&session_id={}",
+        container_info.service_url, project_id, session_id
+    );
 
     info!("📤 [CANCEL_FORWARD] 发送取消请求到: {}", cancel_url);
 
-    let response = client
-        .post(&cancel_url)
-        .json(&cancel_request)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("❌ [CANCEL_FORWARD] 转发取消请求失败: {}", e);
-            AppError::internal_server_error(&format!("转发取消请求到容器失败: {}", e))
-        })?;
+    let response = client.post(&cancel_url).send().await.map_err(|e| {
+        error!("❌ [CANCEL_FORWARD] 转发取消请求失败: {}", e);
+        AppError::internal_server_error(&format!("转发取消请求到容器失败: {}", e))
+    })?;
 
     let status = response.status();
     debug!("📥 [CANCEL_FORWARD] 容器响应状态: {}", status);
 
     if status.is_success() {
-        // 直接返回容器内的响应
-        let container_response: CancelResponse = response.json().await.map_err(|e| {
+        // 解析容器返回的 HttpResult<CancelResponse> 格式
+        let container_http_result: shared_types::HttpResult<CancelResponse> = response.json().await.map_err(|e| {
             error!("❌ [CANCEL_FORWARD] 解析容器响应失败: {}", e);
             AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
+        })?;
+
+        // 提取 data 字段中的 CancelResponse
+        let container_response = container_http_result.data.ok_or_else(|| {
+            error!("❌ [CANCEL_FORWARD] 容器响应缺少 data 字段");
+            AppError::internal_server_error("容器响应缺少 data 字段")
         })?;
 
         info!(

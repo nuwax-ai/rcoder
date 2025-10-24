@@ -2,6 +2,7 @@ use clap::Parser;
 use dashmap::DashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -145,6 +146,10 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("✅ 全局 DockerManager 初始化成功");
 
+    // 设置 Ctrl+C 信号处理
+    let shutdown_tx = setup_signal_handlers();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
@@ -193,7 +198,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    axum::serve(listener, app).await?;
+    // 启动服务器，支持优雅关闭
+    let server_handle = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await;
 
     // 等待代理服务完成
     if let Some(handle) = proxy_handle {
@@ -278,4 +286,242 @@ fn show_docker_configuration_help(socket_path: &str) {
     );
     error!("");
     error!("如果问题持续存在，请查看 rcoder 容器日志获取更多详细信息。");
+}
+
+/// 设置信号处理器
+fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    // 设置全局关闭标志
+    static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
+
+    // 注册 Ctrl+C 信号处理
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let shutdown_tx_clone = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let mut sigint = signal(SignalKind::interrupt()).unwrap();
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+
+            tokio::select! {
+                _ = sigint.recv() => {
+                    if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
+                        info!("收到 SIGINT (Ctrl+C) 信号，开始优雅关闭...");
+                        let _ = shutdown_tx_clone.send(());
+                    }
+                }
+                _ = sigterm.recv() => {
+                    if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
+                        info!("收到 SIGTERM 信号，开始优雅关闭...");
+                        let _ = shutdown_tx_clone.send(());
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let shutdown_tx_clone = shutdown_tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal;
+
+            if let Ok(()) = signal::ctrl_c().await {
+                if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
+                    info!("收到 Ctrl+C 信号，开始优雅关闭...");
+                    let _ = shutdown_tx_clone.send(());
+                }
+            }
+        });
+    }
+
+    shutdown_tx
+}
+
+/// 优雅关闭信号处理
+async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+    // 等待关闭信号
+    let _ = shutdown_rx.recv().await;
+
+    info!("🔄 开始优雅关闭流程...");
+
+    // 执行容器清理
+    if let Err(e) = cleanup_all_containers().await {
+        error!("❌ 容器清理失败: {}", e);
+    } else {
+        info!("✅ 容器清理完成");
+    }
+
+    info!("🛑 RCoder 服务优雅关闭完成");
+}
+
+/// 清理所有动态创建的容器
+async fn cleanup_all_containers() -> anyhow::Result<()> {
+    info!("🧹 开始清理所有动态创建的容器...");
+
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
+
+    let mut cleaned_count = 0;
+    let mut failed_count = 0;
+
+    // 收集所有需要清理的 project_id
+    let project_ids: Vec<String> = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    info!("发现 {} 个需要清理的 agent 容器", project_ids.len());
+
+    for project_id in project_ids {
+        info!("🔥 正在清理容器: project_id={}", project_id);
+
+        match cleanup_single_container(&docker_manager, &project_id).await {
+            Ok(_) => {
+                cleaned_count += 1;
+                info!("✅ 容器清理成功: project_id={}", project_id);
+            }
+            Err(e) => {
+                failed_count += 1;
+                warn!("❌ 容器清理失败: project_id={}, error={}", project_id, e);
+            }
+        }
+    }
+
+    // 额外检查：查找可能遗漏的 rcoder-agent-* 容器
+    match find_and_cleanup_orphaned_containers(&docker_manager).await {
+        Ok(orphaned_cleaned) => {
+            if orphaned_cleaned > 0 {
+                info!("🧹 清理了 {} 个孤立的 rcoder-agent 容器", orphaned_cleaned);
+                cleaned_count += orphaned_cleaned;
+            }
+        }
+        Err(e) => {
+            warn!("查找孤立容器时出错: {}", e);
+        }
+    }
+
+    info!(
+        "🧹 容器清理完成: 成功={}, 失败={}",
+        cleaned_count, failed_count
+    );
+
+    Ok(())
+}
+
+/// 清理单个容器
+async fn cleanup_single_container(
+    docker_manager: &docker_manager::DockerManager,
+    project_id: &str,
+) -> anyhow::Result<()> {
+    // 尝试多种方式查找容器
+    let mut container_info = docker_manager.get_container_info(project_id);
+
+    // 如果没找到，尝试通过容器名称查找
+    if container_info.is_none() {
+        let expected_container_name = format!("rcoder-agent-{}", project_id);
+        container_info = docker_manager
+            .find_container_by_identifier(&expected_container_name)
+            .await;
+    }
+
+    if let Some(container_info) = container_info {
+        info!(
+            "🎯 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
+            project_id, container_info.container_id, container_info.container_name
+        );
+
+        // 释放端口
+        if let Some(port_binding) = container_info.port_bindings.values().next() {
+            if let Ok(port) = port_binding.parse::<u16>() {
+                crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
+                    .release_port(port)
+                    .await;
+                info!("🧼 释放端口: {}", port);
+            }
+        }
+
+        // 停止并删除容器
+        docker_manager
+            .stop_container_by_id(&container_info.container_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
+
+        // 从全局映射中移除
+        crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
+
+        // 清理相关映射
+        crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
+        if let Some((_, removed_session_id)) =
+            crate::service::session_cache::PROJECT_SESSION_MAP.remove(project_id)
+        {
+            info!(
+                "🧼 清理会话映射: project_id={}, session_id={}",
+                project_id, removed_session_id
+            );
+        }
+
+        info!(
+            "✅ 容器销毁成功: project_id={}, container_id={}, container_name={}",
+            project_id, container_info.container_id, container_info.container_name
+        );
+    } else {
+        info!("📭 容器不存在，无需清理: project_id={}", project_id);
+    }
+
+    Ok(())
+}
+
+/// 查找并清理孤立的 rcoder-agent 容器
+async fn find_and_cleanup_orphaned_containers(
+    docker_manager: &docker_manager::DockerManager,
+) -> anyhow::Result<u64> {
+    info!("🔍 查找孤立的 rcoder-agent 容器...");
+
+    // 使用新的模式匹配清理功能
+    let cleanup_options = docker_manager::CleanupOptions {
+        force_remove_running: true, // 强制删除运行中的容器（服务关闭时）
+        wait_for_graceful_stop: true,
+        stop_timeout_seconds: 30,
+        remove_associated_volumes: false,
+    };
+
+    // 清理所有 rcoder-agent-* 容器
+    match docker_manager
+        .cleanup_containers_with_pattern("rcoder-agent-*", cleanup_options)
+        .await
+    {
+        Ok(result) => {
+            info!(
+                "🧹 孤立容器清理完成: 找到={}, 成功={}, 失败={}, 成功率={:.1}%",
+                result.total_found,
+                result.successfully_removed,
+                result.failed_removals,
+                result.success_rate()
+            );
+
+            if result.has_removals() {
+                info!("📋 被删除的容器IDs: {:?}", result.removed_container_ids);
+            }
+
+            if !result.is_complete_success() {
+                warn!("⚠️ 部分容器清理失败:");
+                for failure in &result.failed_removals_details {
+                    warn!(
+                        "  - 容器 {} ({}): {}",
+                        failure.container_id, failure.container_name, failure.error_message
+                    );
+                }
+            }
+
+            Ok(result.successfully_removed as u64)
+        }
+        Err(e) => {
+            error!("❌ 孤立容器清理失败: {}", e);
+            Err(anyhow::anyhow!("清理孤立容器失败: {}", e))
+        }
+    }
 }

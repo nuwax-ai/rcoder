@@ -126,16 +126,25 @@ impl ContainerManager {
                 })?;
 
             if let Some(container_info) = docker_manager.get_container_info(project_id) {
-                // 🎯 获取容器服务地址（使用容器名称DNS解析）
-                let server_url =
-                    crate::proxy_agent::docker_container_agent::get_container_server_url(
-                        &container_info.container_name,
-                    )
-                    .await
-                    .map_err(|e| {
-                        error!("❌ [CONTAINER_MGR] 获取容器服务地址失败: {}", e);
-                        AppError::internal_server_error(&format!("获取容器服务地址失败: {}", e))
-                    })?;
+                // 🎯 获取容器服务地址（优先使用容器名称DNS解析，失败时使用IP地址）
+                let server_url = match crate::proxy_agent::docker_container_agent::get_container_server_url(
+                    &container_info.container_name,
+                ).await {
+                    Ok(url) => url,
+                    Err(e) => {
+                        warn!("⚠️ [CONTAINER_MGR] 容器名称DNS解析失败，尝试使用IP地址: {}", e);
+                        // 备用方案：使用容器IP地址
+                        crate::proxy_agent::docker_container_agent::get_container_ip(
+                            &docker_manager,
+                            &container_info.container_id,
+                        )
+                        .await
+                        .map_err(|e| {
+                            error!("❌ [CONTAINER_MGR] 获取容器IP地址也失败: {}", e);
+                            AppError::internal_server_error(&format!("获取容器服务地址失败: {}", e))
+                        })?
+                    }
+                };
 
                 // 从URL中提取IP地址
                 let ip_address = extract_ip_from_url(&server_url)?;
