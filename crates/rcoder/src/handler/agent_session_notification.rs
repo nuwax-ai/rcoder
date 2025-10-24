@@ -266,22 +266,31 @@ async fn create_sse_proxy_stream(
 
 /// 创建透传 SSE 事件
 ///
-/// 直接透传原始 SSE 文本，避免解析和重构的开销
-/// 这样可以保持原始事件的格式，提高性能
+/// 正确解析SSE消息的各个部分，避免重复的data:前缀
 fn create_passthrough_event(event_text: &str) -> Option<Event> {
-    // 检查是否包含有效的 SSE 内容
-    let mut has_data = false;
-
+    let mut event_type = None;
+    let mut data_lines = Vec::new();
+    
+    // 解析SSE消息的各个部分
     for line in event_text.lines() {
-        if line.starts_with("data:") {
-            has_data = true;
-            break;
+        if line.starts_with("event:") {
+            event_type = Some(line[6..].trim().to_string());
+        } else if line.starts_with("data:") {
+            data_lines.push(line[5..].trim());
         }
     }
-
-    if has_data {
-        // 直接使用原始文本作为事件数据，保持原始格式
-        Some(Event::default().data(event_text.trim()))
+    
+    // 只有当有数据内容时才创建事件
+    if !data_lines.is_empty() {
+        let data_content = data_lines.join("\n");
+        let mut event = Event::default().data(data_content);
+        
+        // 如果有事件类型，则设置事件类型
+        if let Some(event_type) = event_type {
+            event = event.event(event_type);
+        }
+        
+        Some(event)
     } else {
         None
     }
@@ -369,3 +378,4 @@ fn find_container_by_session_id(
     }
     None
 }
+
