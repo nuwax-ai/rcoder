@@ -417,6 +417,24 @@ impl AgentCleaner {
     async fn cleanup_orphaned_containers(&self) -> u64 {
         info!("🔍 开始检查孤立的容器");
 
+        // 🚀 优化6: 为整个孤立容器清理添加总超时时间
+        // 超时时间应该远小于清理间隔（5分钟），设置为2分钟
+        let total_timeout = Duration::from_secs(120); // 2分钟总超时
+        
+        match timeout(total_timeout, self.cleanup_orphaned_containers_inner()).await {
+            Ok(cleaned_count) => {
+                info!("✅ 孤立容器清理完成，清理了 {} 个容器", cleaned_count);
+                cleaned_count
+            }
+            Err(_) => {
+                warn!("⏰ 孤立容器清理超时，耗时超过 {} 秒，强制结束", total_timeout.as_secs());
+                0
+            }
+        }
+    }
+
+    /// 内部清理方法，不包含总超时
+    async fn cleanup_orphaned_containers_inner(&self) -> u64 {
         // 获取全局 DockerManager
         let docker_manager = match docker_manager::global::get_global_docker_manager().await {
             Ok(manager) => manager,
