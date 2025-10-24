@@ -401,8 +401,8 @@ async fn forward_request_to_container_service(
 
         debug!("📊 [FORWARD] 解析后的容器响应: {:?}", container_http_result);
 
-        // 检查容器响应是否成功
-        if container_http_result.success {
+        // 检查容器响应是否成功 - 优先检查 code 字段，因为这是业务逻辑标准
+        if container_http_result.code == "0000" {
             // 成功情况：提取 data 字段中的 ChatResponse
             match container_http_result.data {
                 Some(container_response) => {
