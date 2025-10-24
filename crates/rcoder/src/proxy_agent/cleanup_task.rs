@@ -135,6 +135,34 @@ impl AgentCleaner {
             && duration.num_seconds() as u64 > self.config.idle_timeout.as_secs()
     }
 
+    /// 🛡️ 通用容器保护时间检查函数
+    ///
+    /// 统一的保护逻辑，避免新创建的容器被误清理：
+    /// 1. 检查容器创建时间是否在保护期内
+    /// 2. 返回是否应该跳过清理
+    fn should_skip_cleanup_due_to_protection(
+        &self,
+        created_at: DateTime<Utc>,
+        project_id: &str,
+    ) -> bool {
+        // 🛡️ 最小保护时间：容器创建后5分钟内不会被清理
+        let MIN_PROTECTION_DURATION = Duration::from_secs(5 * 60);
+
+        let current_time = Utc::now();
+        let age = current_time.signed_duration_since(created_at);
+
+        if age.num_seconds() < MIN_PROTECTION_DURATION.as_secs() as i64 {
+            info!(
+                "🛡️ [cleanup] 容器在保护期内，跳过清理: project_id={}, 创建时长={}秒",
+                project_id,
+                age.num_seconds()
+            );
+            return true;
+        }
+
+        false
+    }
+
     /// 🆕 改进的超时判断函数，包含创建时间保护
     ///
     /// 这个函数解决了新创建容器被立即清理的问题：
@@ -146,24 +174,15 @@ impl AgentCleaner {
         agent_info: &impl AgentInfoAccess,
         current_time: DateTime<Utc>,
     ) -> bool {
-        // 🛡️ 最小保护时间：容器创建后5分钟内不会被清理
-        let MIN_PROTECTION_DURATION = Duration::from_secs(5 * 60);
-
-        let last_activity = agent_info.last_activity();
-        let created_at = agent_info.created_at();
-
-        // 1. 检查创建时间保护期
-        let age = current_time.signed_duration_since(created_at);
-        if age.num_seconds() < MIN_PROTECTION_DURATION.as_secs() as i64 {
-            debug!(
-                "🛡️ [cleanup] 容器在保护期内，跳过清理: project_id={}, 创建时长={}秒",
-                agent_info.project_id(),
-                age.num_seconds()
-            );
+        // 1. 检查创建时间保护期（使用统一的保护逻辑）
+        if self
+            .should_skip_cleanup_due_to_protection(agent_info.created_at(), agent_info.project_id())
+        {
             return false;
         }
 
         // 2. 检查闲置超时（添加1秒的缓冲时间避免时间误差）
+        let last_activity = agent_info.last_activity();
         let idle_duration = current_time.signed_duration_since(last_activity);
         let idle_timeout_with_buffer = self.config.idle_timeout.as_secs() + 1;
 
@@ -388,8 +407,10 @@ impl AgentCleaner {
 
     /// 🆕 清理孤立的容器
     /// 检查所有运行中的 rcoder-agent 容器，如果在 state.project_and_agent_map 中没有对应记录，则清理
+    /// 🛡️ 使用统一的容器保护逻辑，避免新创建的容器被误清理
     async fn cleanup_orphaned_containers(&self) -> u64 {
         let mut cleaned_count = 0;
+        let mut protected_count = 0;
 
         info!("🔍 开始检查孤立的容器");
 
@@ -423,6 +444,20 @@ impl AgentCleaner {
                         if let Some(project_id) = clean_name.strip_prefix("rcoder-agent-") {
                             // 检查 MAP 中是否有对应记录
                             if !self.state.project_and_agent_map.contains_key(project_id) {
+                                // 🛡️ 新增：检查容器创建时间保护
+                                if let Some(container_info) = docker_manager
+                                    .find_container_by_identifier(&clean_name)
+                                    .await
+                                {
+                                    if self.should_skip_cleanup_due_to_protection(
+                                        container_info.created_at,
+                                        project_id,
+                                    ) {
+                                        protected_count += 1;
+                                        break; // 在保护期内，跳过清理
+                                    }
+                                }
+
                                 info!(
                                     "🗑️ 发现孤立容器: {} (project_id={}), 准备清理",
                                     clean_name, project_id
@@ -446,8 +481,11 @@ impl AgentCleaner {
             }
         }
 
-        if cleaned_count > 0 {
-            info!("🧹 孤立容器清理完成，共清理 {} 个容器", cleaned_count);
+        if cleaned_count > 0 || protected_count > 0 {
+            info!(
+                "🧹 孤立容器检查完成: 共清理 {} 个容器，保护期内 {} 个容器",
+                cleaned_count, protected_count
+            );
         } else {
             debug!("✅ 未发现孤立容器");
         }

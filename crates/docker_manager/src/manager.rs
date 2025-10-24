@@ -15,7 +15,7 @@ use bollard::{
         PortBinding,
     },
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::Path;
@@ -361,6 +361,29 @@ impl DockerManager {
                                 "通过 Docker API 找到容器: {} (ID: {})",
                                 identifier, container_id
                             );
+
+                            // 🛡️ 尝试从容器信息中获取真实的创建时间
+                            let created_at = if let Some(created_timestamp) = container.created {
+                                // Docker API 返回的时间戳通常是 i64 类型
+                                DateTime::from_timestamp(
+                                    created_timestamp / 1000,
+                                    (created_timestamp % 1000) as u32 * 1_000_000,
+                                )
+                                .unwrap_or_else(|| {
+                                    warn!(
+                                        "无法解析容器创建时间，使用当前时间: timestamp={}",
+                                        created_timestamp
+                                    );
+                                    Utc::now()
+                                })
+                            } else {
+                                warn!(
+                                    "容器缺少创建时间信息，使用当前时间作为备用: container_id={}",
+                                    container_id
+                                );
+                                Utc::now()
+                            };
+
                             // 创建一个临时的容器信息，用于销毁
                             return Some(DockerContainerInfo {
                                 container_id,
@@ -370,7 +393,7 @@ impl DockerManager {
                                 status: ContainerStatus::Unknown(
                                     "found_via_docker_api".to_string(),
                                 ),
-                                created_at: Utc::now(),
+                                created_at,
                                 started_at: None,
                                 host_path: String::new(),
                                 container_path: String::new(),
