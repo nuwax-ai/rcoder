@@ -183,28 +183,32 @@ async fn create_sse_proxy_stream(
                     );
 
                     let mut stream = response.bytes_stream();
-                    let mut buffer = String::new();
+                    let mut buffer = Vec::new();
 
                     while let Some(chunk_result) = stream.next().await {
                         match chunk_result {
                             Ok(chunk) => {
-                                if let Ok(text) = String::from_utf8(chunk.to_vec()) {
-                                    buffer.push_str(&text);
+                                buffer.extend_from_slice(&chunk);
 
-                                    // 处理完整的 SSE 事件
-                                    while let Some(event_end) = buffer.find("\n\n") {
-                                        let event_text = buffer[..event_end].to_string();
-                                        buffer = buffer[event_end + 2..].to_string();
+                                // 按双换行符分割 SSE 事件
+                                while let Some(event_end) =
+                                    buffer.windows(2).position(|w| w == [b'\n', b'\n'])
+                                {
+                                    let event_data = buffer[..event_end].to_vec();
+                                    buffer = buffer[event_end + 2..].to_vec();
 
-                                        if !event_text.trim().is_empty() {
-                                            debug!(
-                                                "📨 [SSE_PROXY] 转发SSE事件: session_id={}, event_len={}",
-                                                session_id,
-                                                event_text.len()
-                                            );
+                                    if !event_data.is_empty() {
+                                        debug!(
+                                            "📨 [SSE_PROXY] 透传SSE事件: session_id={}, event_len={}",
+                                            session_id,
+                                            event_data.len()
+                                        );
 
-                                            // 解析并转发事件
-                                            if let Some(event) = parse_sse_event(&event_text) {
+                                        // 直接透传原始 SSE 数据
+                                        if let Ok(event_text) = String::from_utf8(event_data) {
+                                            if let Some(event) =
+                                                create_passthrough_event(&event_text)
+                                            {
                                                 if tx.send(Ok(event)).await.is_err() {
                                                     warn!(
                                                         "⚠️ [SSE_PROXY] 客户端已断开连接: session_id={}",
@@ -260,44 +264,27 @@ async fn create_sse_proxy_stream(
     ReceiverStream::new(rx)
 }
 
-/// 解析 SSE 事件文本
-fn parse_sse_event(event_text: &str) -> Option<Event> {
-    let mut event = Event::default();
+/// 创建透传 SSE 事件
+///
+/// 直接透传原始 SSE 文本，避免解析和重构的开销
+/// 这样可以保持原始事件的格式，提高性能
+fn create_passthrough_event(event_text: &str) -> Option<Event> {
+    // 检查是否包含有效的 SSE 内容
     let mut has_data = false;
 
     for line in event_text.lines() {
-        if let Some(colon_pos) = line.find(':') {
-            let field = &line[..colon_pos];
-            let value = line[colon_pos + 1..].trim_start();
-
-            match field {
-                "event" => {
-                    event = event.event(value);
-                }
-                "data" => {
-                    event = event.data(value);
-                    has_data = true;
-                }
-                "id" => {
-                    event = event.id(value);
-                }
-                "retry" => {
-                    if let Ok(retry_ms) = value.parse::<u64>() {
-                        event = event.retry(Duration::from_millis(retry_ms));
-                    }
-                }
-                _ => {
-                    // 忽略未知字段
-                }
-            }
-        } else if !line.is_empty() {
-            // 没有冒号的行作为 data
-            event = event.data(line);
+        if line.starts_with("data:") {
             has_data = true;
+            break;
         }
     }
 
-    if has_data { Some(event) } else { None }
+    if has_data {
+        // 直接使用原始文本作为事件数据，保持原始格式
+        Some(Event::default().data(event_text.trim()))
+    } else {
+        None
+    }
 }
 
 /// 创建错误响应
