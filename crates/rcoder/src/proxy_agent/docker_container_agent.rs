@@ -149,7 +149,7 @@ async fn create_docker_container_config(
         env_vars,
         port_bindings,                      // 空的端口映射
         network_mode: "bridge".to_string(), // 使用 bridge 网络模式，但不暴露端口
-        auto_remove: false,                 // 容器停止后不自动删除，保持容器以便后续使用
+        auto_remove: true,                  // 容器停止后自动删除，适合临时任务容器
         resource_limits: Some(ResourceLimits {
             memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB 内存
             cpu_limit: Some(2.0),                       // 2 核 CPU

@@ -9,9 +9,7 @@ license.workspace = true
 name = "rcoder"
 path = "src/lib.rs"
 
-[[example]]
-name = "multimedia_chat_example"
-path = "examples/multimedia_chat_example.rs"
+
 
 [dependencies]
 # Internal crates
