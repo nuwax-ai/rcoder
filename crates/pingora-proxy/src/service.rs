@@ -336,7 +336,7 @@ impl ProxyHttp for PortProxy {
                 .await;
         }
         self.metrics.dec_active();
-        info!("收到上游响应: {}", upstream_response.status);
+        debug!("收到上游响应: {}", upstream_response.status);
         Ok(())
     }
 }
