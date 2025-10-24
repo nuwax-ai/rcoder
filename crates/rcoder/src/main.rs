@@ -110,8 +110,8 @@ async fn main() -> anyhow::Result<()> {
 
     // 创建清理配置
     let cleanup_config = CleanupConfig {
-        idle_timeout: Duration::from_secs(3600),
-        cleanup_interval: Duration::from_secs(5 * 60), // 5分钟间隔
+        idle_timeout: Duration::from_secs(10 * 60),
+        cleanup_interval: Duration::from_secs(3 * 60), // 5分钟间隔
     };
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
