@@ -384,24 +384,48 @@ async fn forward_request_to_container_service(
     debug!("📥 [FORWARD] 容器响应状态: {}", status);
 
     if status.is_success() {
+        // 先获取响应文本用于调试
+        let response_text = response.text().await.map_err(|e| {
+            error!("❌ [FORWARD] 读取容器响应文本失败: {}", e);
+            crate::AppError::internal_server_error(&format!("读取容器响应失败: {}", e))
+        })?;
+        
+        debug!("📥 [FORWARD] 容器响应原始内容: {}", response_text);
+        
         // 解析容器的 HttpResult<ChatResponse> 响应
         let container_http_result: shared_types::HttpResult<ChatResponse> =
-            response.json().await.map_err(|e| {
-                error!("❌ [FORWARD] 解析容器响应失败: {}", e);
+            serde_json::from_str(&response_text).map_err(|e| {
+                error!("❌ [FORWARD] 解析容器响应失败: {}, 响应内容: {}", e, response_text);
                 crate::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
             })?;
 
-        // 提取 data 字段中的 ChatResponse
-        let container_response = container_http_result.data.ok_or_else(|| {
-            error!("❌ [FORWARD] 容器响应缺少 data 字段");
-            crate::AppError::internal_server_error("容器响应缺少 data 字段")
-        })?;
+        debug!("📊 [FORWARD] 解析后的容器响应: {:?}", container_http_result);
 
-        info!(
-            "✅ [FORWARD] 容器响应成功: project_id={}, session_id={}",
-            container_response.project_id, container_response.session_id
-        );
-        Ok(crate::HttpResult::success(container_response))
+        // 检查容器响应是否成功
+        if container_http_result.success {
+            // 成功情况：提取 data 字段中的 ChatResponse
+            match container_http_result.data {
+                Some(container_response) => {
+                    info!(
+                        "✅ [FORWARD] 容器响应成功: project_id={}, session_id={}",
+                        container_response.project_id, container_response.session_id
+                    );
+                    Ok(crate::HttpResult::success(container_response))
+                }
+                None => {
+                    error!("❌ [FORWARD] 成功响应但缺少 data 字段, 完整响应: {:?}", container_http_result);
+                    Ok(crate::HttpResult::error("CONTAINER_ERROR", "成功响应但缺少 data 字段"))
+                }
+            }
+        } else {
+            // 错误情况：容器返回了错误响应
+            let error_message = format!(
+                "容器服务错误: code={}, message={}",
+                container_http_result.code, container_http_result.message
+            );
+            error!("❌ [FORWARD] {}", error_message);
+            Ok(crate::HttpResult::error("CONTAINER_ERROR", &error_message))
+        }
     } else {
         let error_text = format!("容器返回错误状态: {}", status);
         let response_body = response.text().await.unwrap_or_default();
