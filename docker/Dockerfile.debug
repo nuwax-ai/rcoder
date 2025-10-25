@@ -63,6 +63,7 @@ RUN apt-get update && apt-get install -y \
     linux-perf \
     gdb \
     strace \
+    ltrace \
     lsof \
     htop \
     iotop \
@@ -74,7 +75,7 @@ RUN apt-get update && apt-get install -y \
     vim \
     less \
     grep \
-    gawk \
+    awk \
     sed \
     net-tools \
     tcpdump \
@@ -107,6 +108,7 @@ RUN useradd -m -u 1000 rcoder && \
 # 从 builder 阶段复制编译好的二进制
 COPY --from=builder /app/target/release/rcoder /usr/local/bin/
 COPY --from=builder /app/docker/start-rcoder.sh /app/start-rcoder.sh
+COPY --from=builder /usr/local/bin/* /usr/local/bin/ 2>/dev/null || true
 
 # 复制调试工具脚本
 COPY docker/install-debug-tools.sh /app/install-debug-tools.sh
