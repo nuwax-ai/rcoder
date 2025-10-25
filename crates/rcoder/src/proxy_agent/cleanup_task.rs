@@ -9,8 +9,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
 use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
 
 use crate::AgentStatus;
 use crate::router::AppState;
@@ -284,67 +284,89 @@ impl AgentCleaner {
             self.state.project_and_agent_map.len()
         );
 
+        // 🔒 使用原子性操作收集需要清理的agent，避免长时间持有读锁
+        let mut agents_to_evaluate = Vec::new();
+
+        // 先快速收集所有项目ID，避免长时间迭代
         for entry in self.state.project_and_agent_map.iter() {
-            let project_id = entry.key();
-            let agent_info = entry.value();
+            agents_to_evaluate.push(entry.key().clone());
+        }
 
-            // 🎯 修复状态检查逻辑：
-            // 1. 清理Idle状态的agent
-            // 2. 也清理状态为None的agent（新创建但未设置状态的容器）
-            // 3. 不清理Active和Terminating状态的agent
-            let should_clean_by_status = match agent_info.status() {
-                Some(AgentStatus::Idle) => {
-                    debug!(
-                        "✅ [cleanup] 状态检查通过: project_id={}, 状态=Idle",
-                        project_id
-                    );
-                    true
-                }
-                None => {
-                    debug!(
-                        "✅ [cleanup] 状态检查通过: project_id={}, 状态=None(新创建)",
-                        project_id
-                    );
-                    true // 新创建的容器状态为None，也应该被检查
-                }
-                Some(AgentStatus::Active) => {
-                    debug!(
-                        "⏸️ [cleanup] 跳过Active状态agent: project_id={}",
-                        project_id
-                    );
-                    active_agents += 1;
-                    false
-                }
-                Some(AgentStatus::Terminating) => {
-                    debug!(
-                        "🔄 [cleanup] 跳过Terminating状态agent: project_id={}",
-                        project_id
-                    );
-                    false
-                }
-            };
+        // 现在逐个检查每个agent，使用原子性操作
+        for project_id in agents_to_evaluate {
+            // 使用 Entry API 原子性地检查和标记待清理的agent
+            if let Some(agent_ref) = self.state.project_and_agent_map.get(&project_id) {
+                let status = agent_ref.status();
+                let last_activity = agent_ref.last_activity();
+                let created_at = agent_ref.created_at();
 
-            if should_clean_by_status {
-                if self.is_agent_idle_timeout_with_protection(agent_info, current_time) {
-                    let idle_duration = (current_time - agent_info.last_activity()).num_seconds();
-                    let age = (current_time - agent_info.created_at()).num_seconds();
+                // 立即释放引用，避免长时间持有
+                drop(agent_ref);
 
-                    info!(
-                        "🎯 [cleanup] 发现待清理agent: project_id={}, 状态={:?}, 最后活动={}, 闲置时长={}秒, 创建时长={}秒, 创建时间={}",
-                        project_id,
-                        agent_info.status(),
-                        agent_info.last_activity(),
-                        idle_duration,
-                        age,
-                        agent_info.created_at()
-                    );
-                    agents_to_remove.push(project_id.clone());
-                } else {
-                    non_timeout_agents += 1;
-                    debug!(
-                        "⏰ [cleanup] Agent未超时，跳过清理: project_id={}",
-                        project_id
-                    );
+                // 🎯 状态检查逻辑：
+                let should_clean_by_status = match status {
+                    Some(AgentStatus::Idle) => {
+                        debug!(
+                            "✅ [cleanup] 状态检查通过: project_id={}, 状态=Idle",
+                            project_id
+                        );
+                        true
+                    }
+                    None => {
+                        debug!(
+                            "✅ [cleanup] 状态检查通过: project_id={}, 状态=None(新创建)",
+                            project_id
+                        );
+                        true // 新创建的容器状态为None，也应该被检查
+                    }
+                    Some(AgentStatus::Active) => {
+                        debug!(
+                            "⏸️ [cleanup] 跳过Active状态agent: project_id={}",
+                            project_id
+                        );
+                        active_agents += 1;
+                        false
+                    }
+                    Some(AgentStatus::Terminating) => {
+                        debug!(
+                            "🔄 [cleanup] 跳过Terminating状态agent: project_id={}",
+                            project_id
+                        );
+                        false
+                    }
+                };
+
+                if should_clean_by_status {
+                    // 超时检查
+                    let idle_duration = current_time - last_activity;
+                    let age = current_time - created_at;
+
+                    let is_timeout = idle_duration
+                        > chrono::Duration::from_std(self.config.idle_timeout).unwrap_or_default();
+                    let is_protected =
+                        self.should_skip_cleanup_due_to_protection(created_at, &project_id);
+
+                    if is_timeout && !is_protected {
+                        let idle_duration_secs = idle_duration.num_seconds();
+                        let age_secs = age.num_seconds();
+
+                        info!(
+                            "🎯 [cleanup] 发现待清理agent: project_id={}, 状态={:?}, 最后活动={}, 闲置时长={}秒, 创建时长={}秒, 创建时间={}",
+                            project_id,
+                            status,
+                            last_activity,
+                            idle_duration_secs,
+                            age_secs,
+                            created_at
+                        );
+                        agents_to_remove.push(project_id);
+                    } else {
+                        non_timeout_agents += 1;
+                        debug!(
+                            "⏰ [cleanup] Agent未超时或在保护期，跳过清理: project_id={}",
+                            project_id
+                        );
+                    }
                 }
             }
         }
@@ -420,14 +442,17 @@ impl AgentCleaner {
         // 🚀 优化6: 为整个孤立容器清理添加总超时时间
         // 超时时间应该远小于清理间隔（5分钟），设置为2分钟
         let total_timeout = Duration::from_secs(120); // 2分钟总超时
-        
+
         match timeout(total_timeout, self.cleanup_orphaned_containers_inner()).await {
             Ok(cleaned_count) => {
                 info!("✅ 孤立容器清理完成，清理了 {} 个容器", cleaned_count);
                 cleaned_count
             }
             Err(_) => {
-                warn!("⏰ 孤立容器清理超时，耗时超过 {} 秒，强制结束", total_timeout.as_secs());
+                warn!(
+                    "⏰ 孤立容器清理超时，耗时超过 {} 秒，强制结束",
+                    total_timeout.as_secs()
+                );
                 0
             }
         }
@@ -477,15 +502,18 @@ impl AgentCleaner {
                             if let Some(created_at) = container.created {
                                 let created_time = DateTime::from_timestamp(created_at, 0)
                                     .unwrap_or_else(|| Utc::now());
-                                
-                                if self.should_skip_cleanup_due_to_protection(created_time, project_id) {
+
+                                if self
+                                    .should_skip_cleanup_due_to_protection(created_time, project_id)
+                                {
                                     protected_count += 1;
                                     debug!("🛡️ 容器在保护期内，跳过: {}", clean_name);
                                     break;
                                 }
                             }
 
-                            orphaned_containers.push((project_id.to_string(), clean_name.to_string()));
+                            orphaned_containers
+                                .push((project_id.to_string(), clean_name.to_string()));
                             break; // 找到匹配的名称后跳出内层循环
                         }
                     }
@@ -509,17 +537,20 @@ impl AgentCleaner {
             .collect::<Vec<_>>();
 
         if containers_to_clean.len() < total_orphaned {
-            info!("🔒 限制单次清理数量为 {}，剩余容器将在下次清理", max_cleanup_per_round);
+            info!(
+                "🔒 限制单次清理数量为 {}，剩余容器将在下次清理",
+                max_cleanup_per_round
+            );
         }
 
         // 🚀 优化5: 并行清理容器，提高效率
         let mut cleanup_tasks = Vec::new();
-        
+
         for (project_id, container_name) in containers_to_clean {
             let docker_manager_clone = docker_manager.clone();
             let state_clone = self.state.clone();
             let config = self.config.clone();
-            
+
             let task = tokio::spawn(async move {
                 let cleanup_timeout = Duration::from_secs(30);
                 match timeout(
@@ -529,9 +560,11 @@ impl AgentCleaner {
                         &state_clone,
                         &config,
                         &project_id,
-                        &container_name
-                    )
-                ).await {
+                        &container_name,
+                    ),
+                )
+                .await
+                {
                     Ok(Ok(_)) => {
                         info!("✅ 成功清理孤立容器: {}", container_name);
                         true
@@ -541,12 +574,16 @@ impl AgentCleaner {
                         false
                     }
                     Err(_) => {
-                        warn!("⏰ 清理孤立容器超时: {} (超时时间: {}秒)", container_name, cleanup_timeout.as_secs());
+                        warn!(
+                            "⏰ 清理孤立容器超时: {} (超时时间: {}秒)",
+                            container_name,
+                            cleanup_timeout.as_secs()
+                        );
                         false
                     }
                 }
             });
-            
+
             cleanup_tasks.push(task);
         }
 
@@ -578,10 +615,16 @@ impl AgentCleaner {
         project_id: &str,
         container_name: &str,
     ) -> Result<()> {
-        info!("🔥 开始清理孤立容器: {} (project_id={})", container_name, project_id);
+        info!(
+            "🔥 开始清理孤立容器: {} (project_id={})",
+            container_name, project_id
+        );
 
         // 查找容器信息
-        let container_info = match docker_manager.find_container_by_identifier(container_name).await {
+        let container_info = match docker_manager
+            .find_container_by_identifier(container_name)
+            .await
+        {
             Some(info) => info,
             None => {
                 info!("📭 容器不存在，无需清理: {}", container_name);
@@ -593,11 +636,12 @@ impl AgentCleaner {
         let stop_timeout = config.docker_stop_timeout;
         let container_id = container_info.container_id.clone();
         let timeout_seconds = stop_timeout.as_secs();
-        
+
         let stop_result = timeout(
             stop_timeout,
-            docker_manager.stop_container_by_id_with_timeout(&container_id, timeout_seconds)
-        ).await;
+            docker_manager.stop_container_by_id_with_timeout(&container_id, timeout_seconds),
+        )
+        .await;
 
         match stop_result {
             Ok(Ok(_)) => {
@@ -607,15 +651,22 @@ impl AgentCleaner {
                 warn!("⚠️ 容器停止失败: {} - {}", container_id, e);
             }
             Err(_) => {
-                warn!("⏰ 容器停止超时: {} (超时时间: {}秒)", container_id, stop_timeout.as_secs());
+                warn!(
+                    "⏰ 容器停止超时: {} (超时时间: {}秒)",
+                    container_id,
+                    stop_timeout.as_secs()
+                );
             }
         }
 
         // 删除容器 - 使用正确的方法名
-        if let Err(e) = docker_manager.stop_and_remove_containers_by_ids(
-            vec![container_id.clone()],
-            docker_manager::types::CleanupOptions::default()
-        ).await {
+        if let Err(e) = docker_manager
+            .stop_and_remove_containers_by_ids(
+                vec![container_id.clone()],
+                docker_manager::types::CleanupOptions::default(),
+            )
+            .await
+        {
             warn!("⚠️ 删除容器失败: {} - {}", container_id, e);
         } else {
             info!("✅ 容器删除成功: {}", container_id);
@@ -627,132 +678,217 @@ impl AgentCleaner {
     /// 基于RAII的简化清理方法
     /// 先销毁Docker容器，再从MAP中移除agent，AgentLifecycleGuard会自动清理其他资源
     async fn cleanup_agent_raii(&self, project_id: &str) -> Result<()> {
-        debug!("开始RAII清理agent: {}", project_id);
+        info!("🚀 [cleanup_agent_raii] 开始RAII清理agent: {}", project_id);
 
-        // 首先销毁Docker容器（如果存在）
-        if let Err(e) = self.destroy_docker_container(project_id).await {
-            warn!("销毁Docker容器失败: {} - {}", project_id, e);
-        }
+        // 为整个清理过程添加超时机制，防止无限阻塞
+        let cleanup_result = tokio::time::timeout(
+            Duration::from_secs(60), // 60秒总超时
+            async {
+                info!("📋 [cleanup_agent_raii] 步骤1: 开始销毁Docker容器: {}", project_id);
 
-        // 检查agent是否存在
-        if let Some(agent_info) = self.state.project_and_agent_map.get(project_id) {
-            // 在移除前获取 session_id 用于清理 sessions 映射
-            let session_id_to_remove = agent_info.session_id().map(|s| s.to_string());
-
-            // 直接从MAP中移除，触发AgentLifecycleGuard的Drop
-            let removed = self.state.project_and_agent_map.remove(project_id);
-
-            // 清理 self.state.sessions 中的映射关系
-            if let Some(ref session_id) = session_id_to_remove {
-                if let Some((_, removed_session_info)) = self.state.sessions.remove(session_id) {
-                    debug!(
-                        "🧼 [cleanup] 已清理 sessions 映射: session_id={}, project_id={}",
-                        session_id,
-                        removed_session_info.project_id()
-                    );
+                // 首先销毁Docker容器（如果存在）
+                if let Err(e) = self.destroy_docker_container(project_id).await {
+                    warn!("⚠️ [cleanup_agent_raii] 销毁Docker容器失败: {} - {}", project_id, e);
+                } else {
+                    info!("✅ [cleanup_agent_raii] Docker容器销毁完成: {}", project_id);
                 }
+
+                info!("📋 [cleanup_agent_raii] 步骤2: 开始清理MAP映射: {}", project_id);
+
+                // 🔒 使用 Entry API 实现原子性操作，避免读写锁竞争
+                info!("🔍 [cleanup_agent_raii] 尝试原子性地移除agent: {}", project_id);
+                let session_id_to_remove = match self.state.project_and_agent_map.entry(project_id.to_string()) {
+                    dashmap::mapref::entry::Entry::Occupied(entry) => {
+                        info!("✅ [cleanup_agent_raii] 找到agent，提取session_id并原子性移除: {}", project_id);
+                        let session_id = entry.get().session_id().map(|s| s.to_string());
+                        info!("📝 [cleanup_agent_raii] 提取session_id: {:?}, project_id: {}", session_id, project_id);
+
+                        // 原子性地移除条目，触发 AgentLifecycleGuard 的 Drop
+                        entry.remove_entry();
+                        info!("✅ [cleanup_agent_raii] 成功原子性移除agent: {}", project_id);
+                        session_id
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(_) => {
+                        info!("📭 [cleanup_agent_raii] Agent不存在于MAP中，无需清理: {}", project_id);
+                        return Ok(());
+                    }
+                };
+
+                // 🗑️ 使用 Entry API 原子性地清理 sessions 映射关系
+                if let Some(ref session_id) = session_id_to_remove {
+                    info!("🗑️ [cleanup_agent_raii] 尝试原子性清理sessions映射: session_id={}, project_id={}", session_id, project_id);
+
+                    match self.state.sessions.entry(session_id.clone()) {
+                        dashmap::mapref::entry::Entry::Occupied(entry) => {
+                            let removed_session_info = entry.get().clone();
+                            entry.remove_entry();
+                            info!(
+                                "✅ [cleanup_agent_raii] 已原子性清理sessions映射: session_id={}, project_id={}",
+                                session_id,
+                                removed_session_info.project_id()
+                            );
+                        }
+                        dashmap::mapref::entry::Entry::Vacant(_) => {
+                            info!("📭 [cleanup_agent_raii] sessions映射不存在（可能已被清理）: session_id={}", session_id);
+                        }
+                    }
+                } else {
+                    info!("📭 [cleanup_agent_raii] 无session_id，跳过sessions清理: {}", project_id);
+                }
+
+                info!("✅ [cleanup_agent_raii] MAP清理完成，AgentLifecycleGuard将自动清理资源: {}", project_id);
+
+                info!("🎯 [cleanup_agent_raii] 所有清理步骤完成: {}", project_id);
+                Ok::<(), anyhow::Error>(())
             }
+        ).await;
 
-            debug!(
-                "🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
-                project_id
-            );
-
-            if removed.is_some() {
-                info!(
-                    "Agent已从MAP中移除，AgentLifecycleGuard将自动清理资源: {}",
+        match cleanup_result {
+            Ok(Ok(())) => {
+                info!("✅ [cleanup_agent_raii] 清理成功完成: {}", project_id);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "⚠️ [cleanup_agent_raii] 清理过程中出错: {} - {}",
+                    project_id, e
+                );
+                Err(e)
+            }
+            Err(_) => {
+                error!(
+                    "⏰ [cleanup_agent_raii] 清理操作超时 (60秒): {}",
                     project_id
                 );
-            } else {
-                warn!("尝试移除agent但未找到: {}", project_id);
+                Err(anyhow::anyhow!("清理操作超时: {}", project_id))
             }
-        } else {
-            warn!("Agent不存在于MAP中: {}", project_id);
         }
-
-        Ok(())
     }
 
     /// 销毁Docker容器（参考 agent_stop_handler.rs 的实现）
     async fn destroy_docker_container(&self, project_id: &str) -> Result<()> {
         info!("🔥 [cleanup] 开始销毁Docker容器: project_id={}", project_id);
 
-        // 使用全局 DockerManager
-        let docker_manager = docker_manager::global::get_global_docker_manager()
-            .await
-            .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
+        // 为Docker操作添加总体超时保护
+        let docker_result = tokio::time::timeout(
+            Duration::from_secs(30), // 30秒总超时
+            async {
+                info!("🐳 [cleanup] 获取全局DockerManager: project_id={}", project_id);
 
-        // 尝试通过多种方式查找容器 - 在独立线程池中执行避免阻塞tokio运行时
-        let docker_manager_arc = Arc::new(docker_manager.clone());
-        let project_id_clone = project_id.to_string();
-        
-        // 1. 先通过 project_id 查找
-        let mut container_info = docker_manager.get_container_info(&project_id);
+                // 使用全局 DockerManager
+                let docker_manager = docker_manager::global::get_global_docker_manager()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
 
-        // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
-        if container_info.is_none() {
-            let expected_container_name = format!("rcoder-agent-{}", project_id);
-            info!(
-                "🔍 [cleanup] 通过 project_id 未找到，尝试通过容器名称查找: {}",
-                expected_container_name
-            );
+                info!("🔍 [cleanup] 开始查找容器: project_id={}", project_id);
 
-            // 使用新的查找函数
-            container_info = docker_manager.find_container_by_identifier(&expected_container_name).await;
-        }
+                // 1. 先通过 project_id 查找
+                let mut container_info = docker_manager.get_container_info(&project_id);
+                info!("📋 [cleanup] 通过project_id查找结果: found={}, project_id={}", container_info.is_some(), project_id);
 
-        if let Some(container_info) = container_info {
-            info!(
-                "🎯 [cleanup] 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
-                project_id, container_info.container_id, container_info.container_name
-            );
+                // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
+                if container_info.is_none() {
+                    let expected_container_name = format!("rcoder-agent-{}", project_id);
+                    info!(
+                        "🔍 [cleanup] 通过 project_id 未找到，尝试通过容器名称查找: {}",
+                        expected_container_name
+                    );
 
-            // 释放对应的端口（如果存在端口映射）
-            if let Some(port_binding) = container_info.port_bindings.values().next() {
-                if let Ok(port) = port_binding.parse::<u16>() {
-                    crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-                        .release_port(port)
-                        .await;
-                    info!("🧼 [cleanup] 释放端口: {}", port);
+                    // 为容器查找添加超时保护
+                    let find_result = tokio::time::timeout(
+                        Duration::from_secs(10), // 10秒查找超时
+                        docker_manager.find_container_by_identifier(&expected_container_name)
+                    ).await;
+
+                    match find_result {
+                        Ok(result) => {
+                            container_info = result;
+                            info!("📋 [cleanup] 通过容器名称查找结果: found={}, name={}", container_info.is_some(), expected_container_name);
+                        }
+                        Err(_) => {
+                            warn!("⏰ [cleanup] 容器查找超时: name={}", expected_container_name);
+                            return Ok(());
+                        }
+                    }
                 }
+
+                if let Some(container_info) = container_info {
+                    info!(
+                        "🎯 [cleanup] 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
+                        project_id, container_info.container_id, container_info.container_name
+                    );
+
+                    info!("🔌 [cleanup] 开始释放端口: project_id={}", project_id);
+
+                    // 释放对应的端口（如果存在端口映射）
+                    if let Some(port_binding) = container_info.port_bindings.values().next() {
+                        if let Ok(port) = port_binding.parse::<u16>() {
+                            crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
+                                .release_port(port)
+                                .await;
+                            info!("🧼 [cleanup] 释放端口成功: port={}, project_id={}", port, project_id);
+                        }
+                    } else {
+                        info!("📝 [cleanup] 无端口需要释放: project_id={}", project_id);
+                    }
+
+                    info!("⚡ [cleanup] 开始强制停止容器 (无优雅时间): container_id={}", container_info.container_id);
+
+                    // 🚀 立即强制停止容器，不给优雅退出时间 (timeout_seconds=0)
+                    let container_id = container_info.container_id.clone();
+
+                    let stop_result = tokio::time::timeout(
+                        Duration::from_secs(15), // 15秒停止超时
+                        docker_manager.stop_container_by_id_with_timeout(&container_id, 0) // 0秒 = 立即强制停止
+                    ).await;
+
+                    match stop_result {
+                        Ok(Ok(_)) => {
+                            info!("✅ [cleanup] Docker容器强制停止成功: container_id={}", container_info.container_id);
+                        }
+                        Ok(Err(e)) => {
+                            warn!("⚠️ [cleanup] Docker容器强制停止失败: {} - {}", container_info.container_id, e);
+                            // 继续执行，不要因为停止失败就中断整个清理过程
+                        }
+                        Err(_) => {
+                            warn!("⏰ [cleanup] Docker容器强制停止超时 (15秒): container_id={}", container_info.container_id);
+                            // 继续执行，不要因为超时就中断整个清理过程
+                        }
+                    }
+
+                    info!(
+                        "✅ [cleanup] Docker容器销毁流程完成: project_id={}, container_id={}, container_name={}",
+                        project_id, container_info.container_id, container_info.container_name
+                    );
+                } else {
+                    // 容器不存在，但返回成功
+                    info!(
+                        "📭 [cleanup] Docker容器不存在，无需销毁: project_id={}",
+                        project_id
+                    );
+                }
+
+                Ok(())
             }
+        ).await;
 
-            // 停止容器 - 使用配置的超时时间
-            let stop_timeout = self.config.docker_stop_timeout;
-            let container_id = container_info.container_id.clone();
-            let timeout_seconds = stop_timeout.as_secs();
-            
-            let stop_result = timeout(
-                stop_timeout,
-                docker_manager.stop_container_by_id_with_timeout(&container_id, timeout_seconds)
-            ).await;
-
-            match stop_result {
-                Ok(Ok(_)) => {
-                    info!("✅ [cleanup] Docker容器停止成功: {}", container_info.container_id);
-                }
-                Ok(Err(e)) => {
-                    warn!("⚠️ [cleanup] Docker容器停止失败: {} - {}", container_info.container_id, e);
-                }
-                Err(_) => {
-                    warn!("⏰ [cleanup] Docker容器停止超时: {} (超时时间: {}秒)", 
-                          container_info.container_id, stop_timeout.as_secs());
-                }
+        match docker_result {
+            Ok(result) => {
+                info!(
+                    "🎯 [cleanup] Docker容器销毁操作完成: project_id={}",
+                    project_id
+                );
+                result
             }
-
-            info!(
-                "✅ [cleanup] Docker容器销毁成功: project_id={}, container_id={}, container_name={}",
-                project_id, container_info.container_id, container_info.container_name
-            );
-        } else {
-            // 容器不存在，但返回成功
-            info!(
-                "📭 [cleanup] Docker容器不存在，无需销毁: project_id={}",
-                project_id
-            );
+            Err(_) => {
+                error!(
+                    "⏰ [cleanup] Docker容器销毁操作超时 (30秒): project_id={}",
+                    project_id
+                );
+                // 即使超时也返回 Ok，不要阻止后续清理
+                Ok(())
+            }
         }
-
-        Ok(())
     }
 
     /// 运行清理任务 - 简化版，只做定时清理
@@ -767,7 +903,7 @@ impl AgentCleaner {
             // 为整个清理任务添加超时保护，防止阻塞
             let cleanup_timeout = Duration::from_secs(120); // 2分钟超时
             let cleanup_result = timeout(cleanup_timeout, self.cleanup_idle_agents()).await;
-            
+
             match cleanup_result {
                 Ok(Ok(stats)) => {
                     debug!("定时清理完成: {:?}", stats);
@@ -776,7 +912,10 @@ impl AgentCleaner {
                     warn!("定时清理失败: {}", e);
                 }
                 Err(_) => {
-                    warn!("定时清理超时，耗时超过{}秒，强制结束", cleanup_timeout.as_secs());
+                    warn!(
+                        "定时清理超时，耗时超过{}秒，强制结束",
+                        cleanup_timeout.as_secs()
+                    );
                 }
             }
         }
