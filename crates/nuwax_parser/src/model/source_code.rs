@@ -1,5 +1,5 @@
-use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
+use derive_builder::Builder;
 use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder, ToSchema)]
@@ -8,7 +8,6 @@ use utoipa::ToSchema;
     setter(into, strip_option),
     build_fn(error = "derive_builder::UninitializedFieldError")
 )]
-#[derive(Default)]
 pub struct ProjectSourceCode {
     pub files: Vec<FileInfo>,
 }
@@ -19,7 +18,6 @@ pub struct ProjectSourceCode {
     setter(into, strip_option),
     build_fn(error = "derive_builder::UninitializedFieldError")
 )]
-#[derive(Default)]
 pub struct FileInfo {
     pub name: String,
     pub binary: bool,
@@ -27,6 +25,25 @@ pub struct FileInfo {
     pub size_exceeded: bool,
     #[builder(default)]
     pub contents: Option<String>,
+}
+
+impl Default for ProjectSourceCode {
+    fn default() -> Self {
+        Self {
+            files: Vec::new(),
+        }
+    }
+}
+
+impl Default for FileInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            binary: false,
+            size_exceeded: false,
+            contents: None,
+        }
+    }
 }
 
 impl FileInfo {

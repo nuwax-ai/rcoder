@@ -3,11 +3,12 @@
 use anyhow::Result;
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use shared_types::ModelProviderConfig;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, instrument};
-use utoipa::ToSchema;
 use uuid::Uuid;
+use utoipa::ToSchema;
 
 use crate::proxy_agent::*;
 use crate::{model::*, router::AppState};
@@ -18,6 +19,9 @@ pub struct ChatRequest {
     /// 用户输入的 prompt
     #[schema(example = "帮我写一个 Rust 的 Hello World 程序")]
     pub prompt: String,
+    /// 用户 ID
+    #[schema(example = "user123")]
+    pub user_id: String,
     /// 可选的项目 ID
     #[schema(example = "test_project")]
     pub project_id: Option<String>,
@@ -27,10 +31,6 @@ pub struct ChatRequest {
     /// 可选的附件列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
-    /// 数据源附件列表 - 用于AI开发时获取外部数据源信息（如API接口、数据库等）
-    /// 直接传递 JSON 字符串数组，简化使用方式
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub data_source_attachments: Vec<String>,
     /// 模型配置
     #[schema(
         example = json!({
@@ -61,10 +61,6 @@ pub struct ChatResponse {
     pub session_id: String,
     /// 可选的错误信息
     pub error: Option<String>,
-    /// 请求ID，用于标识和追踪请求
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "req_123456789")]
-    pub request_id: Option<String>,
 }
 
 /// 生成不带中划线的随机项目ID
@@ -141,18 +137,6 @@ async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
             })
         ),
         (
-            status = 409,
-            description = "Agent正在执行任务，禁止并发请求",
-            body = HttpResult<String>,
-            example = json!({
-                "success": false,
-                "data": null,
-                "code": "1010",
-                "message": "Agent正在执行任务，请等待当前任务完成后再发送新请求",
-                "tid": null
-            })
-        ),
-        (
             status = 500,
             description = "服务器内部错误",
             body = HttpResult<String>,
@@ -178,8 +162,8 @@ pub async fn handle_chat(
     Json(request): Json<ChatRequest>,
 ) -> Result<crate::model::HttpResult<ChatResponse>, crate::model::AppError> {
     info!(
-        "🚀 [DEBUG] handle_chat 开始处理请求: project_id={:?}, session_id={:?}, prompt={}",
-        request.project_id, request.session_id, request.prompt
+        "🚀 [DEBUG] handle_chat 开始处理请求: user_id={}, project_id={:?}, session_id={:?}, prompt={}",
+        request.user_id, request.project_id, request.session_id, request.prompt
     );
 
     // 检查是否需要生成项目ID
@@ -195,59 +179,15 @@ pub async fn handle_chat(
         new_project_id
     };
 
-    // 🚦 检查 Agent 状态，禁止并发请求
-    if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
-        if agent_info.status == AgentStatus::Active {
-            info!(
-                "⚠️ [chat] Agent正在执行任务，拒绝并发请求: project_id={}, status={:?}",
-                project_id, agent_info.status
-            );
-            return Ok(crate::model::HttpResult::error(
-                "9010",
-                "Agent正在执行任务，请等待当前任务完成后再发送新请求",
-            ));
-        }
-    }
-
-    // 🗑️ 简单直接：直接移除所有相关session，确保全新开始
-    // 新的设计：移除旧session → Agent必须重新获取sender → 前端只能获取新消息
-    if let Some(ref session_id) = request.session_id {
-        // 直接移除指定session
-        if crate::service::SESSION_CACHE.remove(session_id).is_some() {
-            info!("🗑️ [chat] 移除旧session，确保全新开始: session_id={}, project_id={}", session_id, project_id);
-        }
-    } else {
-        // 如果没有指定session_id，清空该项目的所有session
-        let mut cleared_sessions = 0;
-        for session_entry in state.sessions.iter() {
-            let current_session_id = session_entry.key();
-            let session_info = session_entry.value();
-
-            if let Some(session_project_id) = &session_info.project_id {
-                if session_project_id == &project_id {
-                    if crate::service::SESSION_CACHE.remove(current_session_id).is_some() {
-                        cleared_sessions += 1;
-                    }
-                }
-            }
-        }
-
-        if cleared_sessions > 0 {
-            info!("🗑️ [chat] 移除了项目的所有旧session: project_id={}, cleared_count={}", project_id, cleared_sessions);
-        }
-    }
-
     // 获取项目工作目录
     let project_workspace = get_project_workspace(&project_id).await?;
+
 
     // 根据模型提供商配置自动选择 agent 类型
     let agent_type = AgentType::from_model_provider(request.model_provider.as_ref());
 
     // 确定或生成 request_id
-    let request_id = request
-        .request_id
-        .clone()
-        .unwrap_or_else(generate_request_id);
+    let request_id = request.request_id.clone().unwrap_or_else(generate_request_id);
 
     let chat_prompt = ChatPromptBuilder::default()
         .project_id(project_id.clone())
@@ -255,40 +195,26 @@ pub async fn handle_chat(
         .session_id(request.session_id.clone())
         .prompt(request.prompt.clone())
         .attachments(request.attachments.clone())
-        .data_source_attachments(request.data_source_attachments.clone())
         .agent_type(agent_type)
         .request_id(request_id.clone())
+        .use_simple_prompt(false) // 固定使用完整系统提示词
         .build()
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let (local_task_request, chat_prompt_rx) =
-        LocalSetAgentRequest::new(chat_prompt, request.model_provider.clone());
+    let (local_task_request, chat_prompt_rx) = LocalSetAgentRequest::new(chat_prompt, request.model_provider.clone());
     state.local_task_sender.send(local_task_request)?;
 
     let result = match chat_prompt_rx.await {
         Ok(chat_prompt_response) => {
-            // 检查响应中是否有错误
-            if let Some(error_msg) = chat_prompt_response.error {
-                error!(
-                    "❌ Agent 处理失败: project_id={}, session_id={}, error={}",
-                    chat_prompt_response.project_id, chat_prompt_response.session_id, error_msg
-                );
-                crate::model::HttpResult::error(
-                    "PROMPT001",
-                    &error_msg,
-                )
-            } else {
-                info!(
-                    "✅ 收到 agent 执行结果: project_id={}, session_id={}",
-                    chat_prompt_response.project_id, chat_prompt_response.session_id,
-                );
-                crate::model::HttpResult::success(ChatResponse {
-                    project_id: chat_prompt_response.project_id,
-                    session_id: chat_prompt_response.session_id,
-                    error: None,
-                    request_id: request.request_id.clone(),
-                })
-            }
+            info!(
+                "✅ 收到 agent 执行结果: project_id={}, session_id={}",
+                chat_prompt_response.project_id, chat_prompt_response.session_id,
+            );
+            crate::model::HttpResult::success(ChatResponse {
+                project_id: chat_prompt_response.project_id,
+                session_id: chat_prompt_response.session_id,
+                error: None,
+            })
         }
         Err(e) => {
             error!("❌ 收到 agent 执行结果失败: {}", e);

@@ -14,7 +14,6 @@ use tracing::{debug, error, info};
 use crate::{
     model::{AgentStatus, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::agent_service::AcpAgentService,
-    service::SESSION_CACHE,
     utils::{ContentBuilder, PromptBuilder},
 };
 
@@ -97,82 +96,35 @@ async fn create_new_agent_service(
             // 记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
             PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info.clone());
 
-            let session_id_str = conn_info.session_id.to_string();
-
-            // 建立 project_id -> session_id 映射，确保 cleanup 任务能正确识别活跃 session
-            let cleared_old = crate::service::ensure_project_session(&project_id, &session_id_str).await;
-            if cleared_old > 0 {
-                info!(
-                    "🧹 Project session 映射更新，已清理旧消息: project_id={}, cleared_count={}",
-                    project_id,
-                    cleared_old
-                );
+            if let Ok(prompt_request) =
+                build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await
+            {
+                if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
+                    error!("发送prompt请求失败: {:?}", e);
+                } else {
+                    info!("Prompt 请求已发送，项目ID: {}", project_id);
+                }
             } else {
-                info!("🔗 Project session 映射已同步: project_id={}, session_id={}", project_id, session_id_str);
+                error!("构建prompt请求失败，项目ID: {}", project_id);
             }
-
-            // 再次确保当前 session 的历史消息被清空，避免新的 SSE 连接收到旧记录
-            // 直接移除 SESSION_CACHE 条目，确保全新开始
-            if SESSION_CACHE.remove(&session_id_str).is_some() {
-                info!(
-                    "🗑️ 移除 SESSION_CACHE 条目，确保全新开始: project_id={}, session_id={}",
-                    project_id, session_id_str
-                );
-            }
-
-            let response = match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {
-                Ok(prompt_request) => {
-                    if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
-                        error!("发送prompt请求失败: {:?}", e);
-                        ChatPromptResponse {
-                            project_id: project_id.clone(),
-                            session_id: conn_info.session_id.to_string(),
-                            error: Some(format!("发送prompt请求失败: {:?}", e)),
-                        }
-                    } else {
-                        info!("Prompt 请求已发送，项目ID: {}", project_id);
-                        ChatPromptResponse {
-                            project_id: project_id.clone(),
-                            session_id: conn_info.session_id.to_string(),
-                            error: None,
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("❌ 构建prompt请求失败，项目ID: {}，错误详情: {:?}", project_id, e);
-                    ChatPromptResponse {
-                        project_id: project_id.clone(),
-                        session_id: conn_info.session_id.to_string(),
-                        error: Some(format!("构建prompt请求失败: {:?}", e)),
-                    }
-                }
-            };
 
             // 发送回执消息
-            if let Err(e) = request.chat_prompt_tx.send(response) {
+            if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
+                project_id: project_id.clone(),
+                session_id: conn_info.session_id.to_string(),
+            }) {
                 error!("发送chat prompt响应失败: {:?}", e);
             }
         }
         Err(e) => {
             error!("启动ACP Agent服务失败，项目ID: {}, 错误: {}", project_id, e);
-            
-            // 发送失败回执给前端
-            let error_response = ChatPromptResponse {
-                project_id: project_id.clone(),
-                session_id: "".to_string(), // 启动失败时没有 session_id
-                error: Some(format!("启动ACP Agent服务失败: {}", e)),
-            };
-            
-            if let Err(send_err) = request.chat_prompt_tx.send(error_response) {
-                error!("发送启动失败回执失败，项目ID: {}, 错误: {:?}", project_id, send_err);
-            }
         }
     }
 }
 
 /// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
 pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
-    LazyLock::new(DashMap::new);
+    LazyLock::new(|| DashMap::new());
 
 /// 在 LocalSet 中运行的实际 Agent 请求
 #[derive(Debug)]
@@ -209,9 +161,7 @@ impl LocalSetAgentRequest {
 pub async fn agent_worker(
     mut request_rx: mpsc::UnboundedReceiver<LocalSetAgentRequest>,
 ) -> Result<()> {
-    info!("🚀 agent_worker 启动，开始监听请求...");
     while let Some(request) = request_rx.recv().await {
-        info!("📨 agent_worker 接收到新请求，project_id: {}", request.chat_prompt.project_id);
         let mut chat_prompt = request.chat_prompt.clone();
 
         let original_path = chat_prompt.project_path;
@@ -243,17 +193,9 @@ pub async fn agent_worker(
             }
         }
 
-        info!("🔍 处理完路径，准备查找Agent，project_id: {}", request.chat_prompt.project_id);
-
         // 检查 project_id 有对应的agent 服务,没有则创建
         let project_id = request.chat_prompt.project_id.clone();
         let project_and_agent_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
-        
-        if project_and_agent_info.is_some() {
-            info!("✅ 找到现有Agent，project_id: {}", project_id);
-        } else {
-            info!("❌ 未找到现有Agent，将创建新Agent，project_id: {}", project_id);
-        }
 
         // 检查是否需要因模型配置变化而重启Agent服务
         let need_restart_agent = if let Some(ref agent_info) = project_and_agent_info {
@@ -266,69 +208,39 @@ pub async fn agent_worker(
             Some(agent_info) if !need_restart_agent => {
                 // 模型配置未变化，复用现有Agent服务
                 info!("复用现有Agent服务，项目ID: {}", project_id);
-                
-                let session_id = agent_info.session_id.clone();
-                let prompt_tx = agent_info.prompt_tx.clone();
-                
-                debug!("复用Agent - session_id: {}, prompt_tx可用", session_id.0);
-                
-                // 注意：不在这里更新 request_id，因为 get_mut 会需要写锁，
-                // 可能与正在执行的 Prompt 处理任务产生锁冲突。
-                // 直接将 request_id 包含在 ChatPrompt 中，在构建 PromptRequest 时使用。
-                debug!("使用请求中的request_id: {:?}", chat_prompt.request_id);
 
-                debug!("开始构建Prompt请求，项目ID: {}", project_id);
-                match build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await {
+                match build_prompt_to_acp_agent(chat_prompt, agent_info.session_id.clone()).await {
                     Ok(prompt_request) => {
-                        info!("Prompt请求构建成功，准备发送到channel，项目ID: {}", project_id);
-                        if let Err(e) = prompt_tx.send(prompt_request) {
-                            error!("❌ 发送Prompt请求到channel失败: {:?}", e);
+                        if let Err(e) = agent_info.prompt_tx.send(prompt_request) {
+                            error!("Failed to send prompt request: {:?}", e);
                         } else {
-                            info!("✅ Prompt请求已成功发送到channel，项目ID: {}", project_id);
+                            debug!("Prompt已发送");
                         }
                     }
                     Err(e) => {
-                        error!("❌ 构建Prompt请求失败: {}", e);
+                        error!("Failed to build prompt request for existing agent: {}", e);
                     }
                 }
 
                 // 发送回执消息
-                debug!("准备发送回执消息，项目ID: {}", project_id);
                 if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
                     project_id: project_id.clone(),
-                    session_id: session_id.to_string(),
-                    error: None,
+                    session_id: agent_info.session_id.to_string(),
                 }) {
-                    error!("发送回执消息失败: {:?}", e);
-                } else {
-                    info!("✅ 回执消息发送成功，项目ID: {}", project_id);
+                    error!("Failed to send chat prompt response: {:?}", e);
                 }
             }
             Some(agent_info) => {
                 // 模型配置发生变化，需要重启Agent服务
                 info!("检测到模型配置变化，重启Agent服务，项目ID: {}", project_id);
 
-                // ⚠️ 死锁修复：先克隆需要的数据，然后释放读锁，再执行写操作
-                // 1. 克隆 lifecycle_guard（用于停止 agent）
-                let lifecycle_guard = agent_info.lifecycle_guard.clone();
-                let agent_type = crate::model::AgentType::from_model_provider(agent_info.model_provider.as_ref());
-                
-                // 2. 显式释放读锁（agent_info 是 DashMap 的 Ref，持有读锁）
-                //    必须在调用 stop 和 remove 之前释放，否则会死锁
-                drop(agent_info);
-                
-                // 3. 现在可以安全地执行 stop（不持有 MAP 的读锁）
-                info!("[{}] 停止旧 Agent 服务: {}", agent_type.agent_type_name(), project_id);
-                if let Err(e) = lifecycle_guard.stop_async().await {
-                    error!("停止 Agent 服务失败: {}", e);
+                // 停止现有Agent服务
+                if let Err(e) = stop_existing_agent_service(&project_id, &agent_info).await {
+                    error!("停止现有Agent服务失败: {}", e);
                 }
 
-                // 4. 释放读锁后，可以安全地获取写锁并 remove
+                // 从映射中移除旧的Agent信息
                 PROJECT_AND_AGENT_INFO_MAP.remove(&project_id);
-                
-                // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
-                crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(&project_id);
-                debug!("🧼 [acp_agent] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}", project_id);
 
                 // 创建新的Agent服务（执行与None分支相同的逻辑）
                 create_new_agent_service(request, chat_prompt, project_id).await;
@@ -348,13 +260,8 @@ pub async fn build_prompt_to_acp_agent(
     prompt: ChatPrompt,
     session_id: SessionId,
 ) -> Result<PromptRequest> {
-    // 构建最终提示词（包含系统提示词、用户输入和数据源信息）
-    let final_prompt = if prompt.data_source_attachments.is_empty() {
-        PromptBuilder::new().build(&prompt.prompt)
-    } else {
-        PromptBuilder::new()
-            .build_with_data_sources(&prompt.prompt, &prompt.data_source_attachments)
-    };
+    // 构建最终提示词（包含系统提示词和用户输入）
+    let final_prompt = PromptBuilder::new().build(&prompt.prompt);
 
     // 创建文本内容块
     let text_block = ContentBlock::Text(TextContent {
@@ -377,20 +284,9 @@ pub async fn build_prompt_to_acp_agent(
         content_blocks.extend(attachment_blocks);
     }
 
-    // 将 request_id 放入 meta 字段，以便 channel_utils 可以提取并更新到 MAP
-    let meta = if let Some(request_id) = prompt.request_id {
-        debug!("🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta", request_id);
-        Some(serde_json::json!({
-            "request_id": request_id
-        }))
-    } else {
-        debug!("⚠️ [build_prompt] prompt.request_id 为空，meta 设为 None");
-        None
-    };
-
     Ok(PromptRequest {
         session_id,
         prompt: content_blocks,
-        meta,
+        meta: None,
     })
 }

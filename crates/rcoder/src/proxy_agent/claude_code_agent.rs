@@ -12,7 +12,10 @@ use tracing::{debug, error, info, warn};
 use crate::{
     AgentType, CancelNotificationRequest,
     model::ChatPrompt,
-    proxy_agent::{AcpAgentClient, AcpConnectionInfo, agent_stop_handle::AgentLifecycleGuard},
+    proxy_agent::{
+        AcpAgentClient, AcpConnectionInfo,
+        agent_stop_handle::AgentLifecycleGuard,
+    },
     utils::create_default_mcp_servers,
 };
 use anyhow::{Context, Result};
@@ -166,37 +169,21 @@ pub async fn start_claude_code_acp_agent_service(
                     info!("📝 未配置 MCP 服务器");
                 }
 
-                // 创建会话（兼容未来 SDK 的 load_session，失败则回退 new_session）
+                // 创建会话
                 let session_id = match chat_prompt.session_id {
                     Some(session_id) => {
-                        debug!("尝试加载 ACP 会话[load_session]");
-                        let given_session_id = SessionId(session_id.into());
-                        match client_conn
+                        debug!("创建 ACP 会话[load_session]");
+                        let session_id = SessionId(session_id.into());
+                        let resp = client_conn
                             .load_session(LoadSessionRequest {
-                                session_id: given_session_id.clone(),
+                                session_id: session_id.clone(),
                                 mcp_servers: mcp_servers.clone(),
                                 cwd: project_path_for_closure.clone(),
                                 meta: None,
                             })
-                            .await
-                        {
-                            Ok(resp) => {
-                                debug!("ACP 会话加载成功[load_session],{:?}", resp);
-                                given_session_id
-                            }
-                            Err(e) => {
-                                warn!("load_session 失败或未实现，回退创建新会话[new_session]: {:?}", e);
-                                let resp = client_conn
-                                    .new_session(NewSessionRequest {
-                                        mcp_servers: mcp_servers.clone(),
-                                        cwd: project_path_for_closure.clone(),
-                                        meta: None,
-                                    })
-                                    .await?;
-                                debug!("ACP 会话创建成功[new_session],{:?}", resp);
-                                resp.session_id
-                            }
-                        }
+                            .await?;
+                        debug!("ACP 会话加载成功[load_session],{:?}", resp);
+                        session_id
                     }
                     None => {
                         debug!("创建 ACP 会话[new_session]");
@@ -229,6 +216,7 @@ pub async fn start_claude_code_acp_agent_service(
                     prompt_rx,
                     session_id.clone(),
                     &chat_prompt.project_id,
+                    chat_prompt.request_id.clone(),
                 );
 
                 // Rust 最佳实践：直接等待取消信号，不需要轮询
