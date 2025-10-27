@@ -19,9 +19,12 @@ shared_types = { path = "../shared_types" }
 nuwax_parser = { path = "../nuwax_parser" }
 acp-adapter = { path = "../acp_adapter" }
 codex-acp-agent = { path = "../codex-acp-agent" }
-codex-core = { git = "https://github.com/openai/codex" , branch = "main" }
+codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
+codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 claude-code-agent = { path = "../claude-code-agent" }
+pingora-proxy = { path = "../pingora-proxy" }
 
+# codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
 
 clap ={workspace = true}
 # ACP Protocol
@@ -36,6 +39,7 @@ tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 futures = { workspace = true }
 tokio-stream = "0.1"
+async-stream = "0.3"
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
@@ -50,7 +54,8 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
+tracing-appender = "0.2"
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }

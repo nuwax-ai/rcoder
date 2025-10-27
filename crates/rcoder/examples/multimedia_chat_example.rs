@@ -2,10 +2,7 @@
 //!
 //! 展示如何使用扩展的聊天接口发送文本和多媒体内容
 
-use rcoder::{
-    Attachment, AttachmentSource, AgentType,
-    ContentBuilder, FileUtils,
-};
+use rcoder::{AgentType, Attachment, AttachmentSource, ContentBuilder, FileUtils};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -22,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 文本附件
     let text_attachment = Attachment::new_text(AttachmentSource::FilePath {
-        path: "docs/readme.md".to_string()
+        path: "docs/readme.md".to_string(),
     });
     println!("文本附件: {}", json!(text_attachment).to_string());
 
@@ -39,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 音频附件
     let audio_attachment = Attachment::new_audio(
         AttachmentSource::Url {
-            url: "https://example.com/audio.mp3".to_string()
+            url: "https://example.com/audio.mp3".to_string(),
         },
         "audio/mp3".to_string(),
     );
@@ -48,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 文档附件
     let doc_attachment = Attachment::new_document(
         AttachmentSource::FilePath {
-            path: "docs/manual.pdf".to_string()
+            path: "docs/manual.pdf".to_string(),
         },
         "application/pdf".to_string(),
     );
@@ -77,11 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::write(&test_file, "这是一个测试文件的内容\n用于演示文件处理功能").await?;
 
     // 从文件创建附件
-    let file_attachment = file_utils.create_attachment_from_file(
-        &test_file,
-        &project_path,
-        Some("示例文件".to_string()),
-    ).await?;
+    let file_attachment = file_utils
+        .create_attachment_from_file(&test_file, &project_path, Some("示例文件".to_string()))
+        .await?;
 
     println!("从文件创建的附件: {}", json!(file_attachment).to_string());
 
