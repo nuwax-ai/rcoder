@@ -1,0 +1,36 @@
+[package]
+name = "docker_manager"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+publish = false
+
+[dependencies]
+# Docker API
+bollard = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+futures-util = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Utilities
+dashmap = { workspace = true }

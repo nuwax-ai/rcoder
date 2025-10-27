@@ -1,3 +1,5 @@
-mod session_cache;
+//! 服务模块
+//!
+//! 提供容器管理功能
 
-pub use session_cache::{push_session_update, SESSION_CACHE};
+pub mod container_manager;

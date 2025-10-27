@@ -1,0 +1,304 @@
+# ==============================================================================
+# RCoder Debug Dockerfile - 增强版调试镜像
+# ==============================================================================
+#
+# 用途：包含完整调试工具的 RCoder 镜像，用于生产环境问题诊断
+# 构建：docker build -f docker/Dockerfile.debug -t rcoder:debug .
+# 运行：docker-compose up 时使用此镜像替换默认镜像
+#
+# ==============================================================================
+
+# 多阶段构建：编译阶段 + 调试运行阶段
+FROM rust:1.90 AS builder
+
+# 设置工作目录
+WORKDIR /app
+
+# 安装编译依赖
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    clang \
+    cmake \
+    build-essential \
+    git
+
+# 复制源码到工作目录
+COPY . .
+
+# 编译 release 版本（带调试符号）
+ENV RUSTFLAGS="-g"
+RUN cargo build --release --bin rcoder --target-dir /app/target
+
+# 同时编译一些有用的 Rust 调试工具
+RUN cargo install tokio-console --locked --root /usr/local 2>/dev/null || echo "tokio-console 安装跳过"
+RUN cargo install flamegraph --locked --root /usr/local 2>/dev/null || echo "flamegraph 安装跳过"
+
+# ==============================================================================
+# 调试增强运行时镜像 - 基于 Debian 完整版而非 slim
+# ==============================================================================
+FROM debian:bookworm
+
+# 设置环境变量 - 启用调试和性能分析
+ENV RUST_LOG=debug
+ENV RUST_BACKTRACE=full
+ENV TOKIO_CONSOLE_ENABLED=1
+
+ENV PORT=8087
+ENV DOCKER_SOCKET_PATH=/var/run/docker.sock
+ENV RCODER_WORKSPACE=/app/workspace
+ENV RCODER_LOGS=/app/logs
+
+# 安装运行时和调试依赖
+RUN apt-get update && apt-get install -y \
+    curl \
+    jq \
+    libssl3 \
+    ca-certificates \
+    bash \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    git \
+    linux-perf \
+    gdb \
+    strace \
+    ltrace \
+    lsof \
+    htop \
+    iotop \
+    sysstat \
+    dstat \
+    procps \
+    psmisc \
+    tree \
+    vim \
+    less \
+    grep \
+    awk \
+    sed \
+    net-tools \
+    tcpdump \
+    nmap \
+    telnet \
+    netcat-openbsd \
+    iproute2 \
+    iputils-ping \
+    iftop \
+    nethogs \
+    valgrind \
+    time \
+    watch \
+    tmux \
+    screen \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 FlameGraph 脚本
+RUN cd /tmp && \
+    git clone https://github.com/brendangregg/FlameGraph.git && \
+    cp FlameGraph/*.pl /usr/local/bin/ && \
+    chmod +x /usr/local/bin/*.pl && \
+    rm -rf /tmp/FlameGraph
+
+# 创建应用用户和目录
+RUN useradd -m -u 1000 rcoder && \
+    mkdir -p /app/logs /app/workspace /app/debug
+
+# 从 builder 阶段复制编译好的二进制
+COPY --from=builder /app/target/release/rcoder /usr/local/bin/
+COPY --from=builder /app/docker/start-rcoder.sh /app/start-rcoder.sh
+COPY --from=builder /usr/local/bin/* /usr/local/bin/ 2>/dev/null || true
+
+# 复制调试工具脚本
+COPY docker/install-debug-tools.sh /app/install-debug-tools.sh
+RUN chmod +x /app/start-rcoder.sh /app/install-debug-tools.sh
+
+# 创建 analyze-rcoder 脚本
+RUN echo '#!/bin/bash' > /usr/local/bin/analyze-rcoder && \
+    echo '# RCoder 进程分析脚本 - 增强版' >> /usr/local/bin/analyze-rcoder && \
+    echo '' >> /usr/local/bin/analyze-rcoder && \
+    echo 'RCODER_PID=$(pgrep rcoder | head -1)' >> /usr/local/bin/analyze-rcoder && \
+    echo '' >> /usr/local/bin/analyze-rcoder && \
+    echo 'if [ -z "$RCODER_PID" ]; then' >> /usr/local/bin/analyze-rcoder && \
+    echo '    echo "❌ 未找到 rcoder 进程"' >> /usr/local/bin/analyze-rcoder && \
+    echo '    exit 1' >> /usr/local/bin/analyze-rcoder && \
+    echo 'fi' >> /usr/local/bin/analyze-rcoder && \
+    echo '' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "🔍 RCoder 进程分析 (PID: $RCODER_PID)"' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "================================================"' >> /usr/local/bin/analyze-rcoder && \
+    echo '' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "📊 基本信息："' >> /usr/local/bin/analyze-rcoder && \
+    echo 'ps aux | grep rcoder | grep -v grep' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo ""' >> /usr/local/bin/analyze-rcoder && \
+    echo '' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "🧵 线程详细状态："' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "ThreadID  Name                 State      WaitChannel"' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "--------  -------------------  ---------  ------------------"' >> /usr/local/bin/analyze-rcoder && \
+    echo 'for tid in $(ls /proc/$RCODER_PID/task/ 2>/dev/null); do' >> /usr/local/bin/analyze-rcoder && \
+    echo '    if [ -f "/proc/$RCODER_PID/task/$tid/comm" ]; then' >> /usr/local/bin/analyze-rcoder && \
+    echo '        comm=$(cat /proc/$RCODER_PID/task/$tid/comm 2>/dev/null || echo "unknown")' >> /usr/local/bin/analyze-rcoder && \
+    echo '        stat=$(cat /proc/$RCODER_PID/task/$tid/stat 2>/dev/null | awk "{print \$3}" || echo "?")' >> /usr/local/bin/analyze-rcoder && \
+    echo '        wchan=$(cat /proc/$RCODER_PID/task/$tid/wchan 2>/dev/null || echo "unknown")' >> /usr/local/bin/analyze-rcoder && \
+    echo '        printf "%-8s  %-19s  %-9s  %s\n" "$tid" "$comm" "$stat" "$wchan"' >> /usr/local/bin/analyze-rcoder && \
+    echo '    fi' >> /usr/local/bin/analyze-rcoder && \
+    echo 'done' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo ""' >> /usr/local/bin/analyze-rcoder && \
+    echo '' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "🔗 网络连接详情："' >> /usr/local/bin/analyze-rcoder && \
+    echo 'ss -tulpn | grep $RCODER_PID' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo ""' >> /usr/local/bin/analyze-rcoder && \
+    echo '' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "📁 文件描述符统计："' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "总FD数: $(ls /proc/$RCODER_PID/fd 2>/dev/null | wc -l)"' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "Socket连接: $(lsof -p $RCODER_PID 2>/dev/null | grep -c socket || echo 0)"' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "管道连接: $(lsof -p $RCODER_PID 2>/dev/null | grep -c pipe || echo 0)"' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo ""' >> /usr/local/bin/analyze-rcoder && \
+    echo '' >> /usr/local/bin/analyze-rcoder && \
+    echo 'echo "💾 内存使用详情："' >> /usr/local/bin/analyze-rcoder && \
+    echo 'cat /proc/$RCODER_PID/status | grep -E "(VmPeak|VmSize|VmRSS|VmData|VmStk|VmExe|Threads)" || echo "无法读取内存信息"' >> /usr/local/bin/analyze-rcoder && \
+    chmod +x /usr/local/bin/analyze-rcoder
+
+# 创建 diagnose-blocking 脚本
+RUN echo '#!/bin/bash' > /usr/local/bin/diagnose-blocking && \
+    echo '# 诊断 RCoder 阻塞问题 - 增强版' >> /usr/local/bin/diagnose-blocking && \
+    echo '' >> /usr/local/bin/diagnose-blocking && \
+    echo 'RCODER_PID=$(pgrep rcoder | head -1)' >> /usr/local/bin/diagnose-blocking && \
+    echo '' >> /usr/local/bin/diagnose-blocking && \
+    echo 'if [ -z "$RCODER_PID" ]; then' >> /usr/local/bin/diagnose-blocking && \
+    echo '    echo "❌ 未找到 rcoder 进程"' >> /usr/local/bin/diagnose-blocking && \
+    echo '    exit 1' >> /usr/local/bin/diagnose-blocking && \
+    echo 'fi' >> /usr/local/bin/diagnose-blocking && \
+    echo '' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "🚨 RCoder 阻塞诊断 - 详细分析 (PID: $RCODER_PID)"' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "================================================"' >> /usr/local/bin/diagnose-blocking && \
+    echo '' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "1️⃣ 进程整体状态："' >> /usr/local/bin/diagnose-blocking && \
+    echo 'ps -o pid,ppid,state,pcpu,pmem,time,comm -p $RCODER_PID' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo ""' >> /usr/local/bin/diagnose-blocking && \
+    echo '' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "2️⃣ 网络队列积压检查："' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "监听端口队列状态："' >> /usr/local/bin/diagnose-blocking && \
+    echo 'ss -tlnp | grep $RCODER_PID | while read line; do' >> /usr/local/bin/diagnose-blocking && \
+    echo '    echo "  $line"' >> /usr/local/bin/diagnose-blocking && \
+    echo 'done' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo ""' >> /usr/local/bin/diagnose-blocking && \
+    echo '' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "3️⃣ 阻塞线程详细分析："' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "🔍 所有非正常等待的线程："' >> /usr/local/bin/diagnose-blocking && \
+    echo 'blocked_threads=0' >> /usr/local/bin/diagnose-blocking && \
+    echo 'for tid in $(ls /proc/$RCODER_PID/task/ 2>/dev/null); do' >> /usr/local/bin/diagnose-blocking && \
+    echo '    if [ -f "/proc/$RCODER_PID/task/$tid/wchan" ]; then' >> /usr/local/bin/diagnose-blocking && \
+    echo '        wchan=$(cat /proc/$RCODER_PID/task/$tid/wchan 2>/dev/null)' >> /usr/local/bin/diagnose-blocking && \
+    echo '        stat=$(cat /proc/$RCODER_PID/task/$tid/stat 2>/dev/null | awk "{print \$3}")' >> /usr/local/bin/diagnose-blocking && \
+    echo '        comm=$(cat /proc/$RCODER_PID/task/$tid/comm 2>/dev/null)' >> /usr/local/bin/diagnose-blocking && \
+    echo '        if [[ "$wchan" != "do_epoll_wait" && "$wchan" != "0" && "$wchan" != "poll_schedule_timeout" ]]; then' >> /usr/local/bin/diagnose-blocking && \
+    echo '            echo "  🚫 Thread $tid ($comm): $wchan (状态: $stat)"' >> /usr/local/bin/diagnose-blocking && \
+    echo '            ((blocked_threads++))' >> /usr/local/bin/diagnose-blocking && \
+    echo '        fi' >> /usr/local/bin/diagnose-blocking && \
+    echo '    fi' >> /usr/local/bin/diagnose-blocking && \
+    echo 'done' >> /usr/local/bin/diagnose-blocking && \
+    echo '' >> /usr/local/bin/diagnose-blocking && \
+    echo 'if [ $blocked_threads -eq 0 ]; then' >> /usr/local/bin/diagnose-blocking && \
+    echo '    echo "  ✅ 未发现明显阻塞的线程"' >> /usr/local/bin/diagnose-blocking && \
+    echo 'else' >> /usr/local/bin/diagnose-blocking && \
+    echo '    echo "  ⚠️  发现 $blocked_threads 个可能阻塞的线程"' >> /usr/local/bin/diagnose-blocking && \
+    echo 'fi' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo ""' >> /usr/local/bin/diagnose-blocking && \
+    echo '' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "4️⃣ 推荐的下一步诊断："' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "  📊 生成火焰图: generate-flamegraph 30"' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "  🔍 实时系统调用: strace -p $RCODER_PID -e trace=network,file"' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "  ⚡ 实时性能: perf top -p $RCODER_PID"' >> /usr/local/bin/diagnose-blocking && \
+    echo 'echo "  🧵 线程监控: htop -p $RCODER_PID"' >> /usr/local/bin/diagnose-blocking && \
+    chmod +x /usr/local/bin/diagnose-blocking
+
+# 创建 generate-flamegraph 脚本
+RUN echo '#!/bin/bash' > /usr/local/bin/generate-flamegraph && \
+    echo '# 生成 RCoder 火焰图 - 增强版' >> /usr/local/bin/generate-flamegraph && \
+    echo '' >> /usr/local/bin/generate-flamegraph && \
+    echo 'RCODER_PID=$(pgrep rcoder | head -1)' >> /usr/local/bin/generate-flamegraph && \
+    echo 'DURATION=${1:-30}' >> /usr/local/bin/generate-flamegraph && \
+    echo 'OUTPUT=${2:-/app/debug/rcoder-flamegraph-$(date +%Y%m%d-%H%M%S).svg}' >> /usr/local/bin/generate-flamegraph && \
+    echo '' >> /usr/local/bin/generate-flamegraph && \
+    echo 'if [ -z "$RCODER_PID" ]; then' >> /usr/local/bin/generate-flamegraph && \
+    echo '    echo "❌ 未找到 rcoder 进程"' >> /usr/local/bin/generate-flamegraph && \
+    echo '    exit 1' >> /usr/local/bin/generate-flamegraph && \
+    echo 'fi' >> /usr/local/bin/generate-flamegraph && \
+    echo '' >> /usr/local/bin/generate-flamegraph && \
+    echo 'echo "🔥 生成 RCoder 火焰图"' >> /usr/local/bin/generate-flamegraph && \
+    echo 'echo "================================================"' >> /usr/local/bin/generate-flamegraph && \
+    echo 'echo "进程PID: $RCODER_PID"' >> /usr/local/bin/generate-flamegraph && \
+    echo 'echo "采样时间: ${DURATION}秒"' >> /usr/local/bin/generate-flamegraph && \
+    echo 'echo "输出文件: $OUTPUT"' >> /usr/local/bin/generate-flamegraph && \
+    echo 'echo ""' >> /usr/local/bin/generate-flamegraph && \
+    echo '' >> /usr/local/bin/generate-flamegraph && \
+    echo 'mkdir -p "$(dirname "$OUTPUT")"' >> /usr/local/bin/generate-flamegraph && \
+    echo '' >> /usr/local/bin/generate-flamegraph && \
+    echo 'echo "📊 开始采样 (${DURATION}秒)..."' >> /usr/local/bin/generate-flamegraph && \
+    echo 'if ! perf record -F 997 -p $RCODER_PID -g -o /tmp/perf.data -- sleep $DURATION 2>/dev/null; then' >> /usr/local/bin/generate-flamegraph && \
+    echo '    echo "❌ perf record 失败，可能需要特权模式"' >> /usr/local/bin/generate-flamegraph && \
+    echo '    echo "💡 尝试: docker run --privileged"' >> /usr/local/bin/generate-flamegraph && \
+    echo '    exit 1' >> /usr/local/bin/generate-flamegraph && \
+    echo 'fi' >> /usr/local/bin/generate-flamegraph && \
+    echo '' >> /usr/local/bin/generate-flamegraph && \
+    echo 'echo "🔥 生成火焰图..."' >> /usr/local/bin/generate-flamegraph && \
+    echo 'if command -v flamegraph.pl &> /dev/null; then' >> /usr/local/bin/generate-flamegraph && \
+    echo '    if perf script -i /tmp/perf.data | flamegraph.pl > "$OUTPUT" 2>/dev/null; then' >> /usr/local/bin/generate-flamegraph && \
+    echo '        echo "✅ 火焰图已生成: $OUTPUT"' >> /usr/local/bin/generate-flamegraph && \
+    echo '    else' >> /usr/local/bin/generate-flamegraph && \
+    echo '        echo "❌ 火焰图生成失败"' >> /usr/local/bin/generate-flamegraph && \
+    echo '    fi' >> /usr/local/bin/generate-flamegraph && \
+    echo 'else' >> /usr/local/bin/generate-flamegraph && \
+    echo '    echo "⚠️  flamegraph.pl 未找到，保存原始数据"' >> /usr/local/bin/generate-flamegraph && \
+    echo '    perf script -i /tmp/perf.data > "${OUTPUT%.svg}.perf"' >> /usr/local/bin/generate-flamegraph && \
+    echo 'fi' >> /usr/local/bin/generate-flamegraph && \
+    echo 'rm -f /tmp/perf.data' >> /usr/local/bin/generate-flamegraph && \
+    chmod +x /usr/local/bin/generate-flamegraph
+
+# 创建 debug-help 脚本
+RUN echo '#!/bin/bash' > /usr/local/bin/debug-help && \
+    echo 'echo "🛠️  RCoder 调试工具完整指南"' >> /usr/local/bin/debug-help && \
+    echo 'echo "================================================"' >> /usr/local/bin/debug-help && \
+    echo 'echo ""' >> /usr/local/bin/debug-help && \
+    echo 'echo "🚀 快速诊断命令："' >> /usr/local/bin/debug-help && \
+    echo 'echo "  analyze-rcoder          - 全面分析进程状态"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  diagnose-blocking       - 专门诊断阻塞问题"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  debug-help              - 显示此帮助信息"' >> /usr/local/bin/debug-help && \
+    echo 'echo ""' >> /usr/local/bin/debug-help && \
+    echo 'echo "🔥 性能分析工具："' >> /usr/local/bin/debug-help && \
+    echo 'echo "  generate-flamegraph [秒数] [输出]  - 生成火焰图"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  perf top -p \$(pgrep rcoder)       - 实时性能监控"' >> /usr/local/bin/debug-help && \
+    echo 'echo ""' >> /usr/local/bin/debug-help && \
+    echo 'echo "🔍 系统调用追踪："' >> /usr/local/bin/debug-help && \
+    echo 'echo "  strace -p \$(pgrep rcoder)                    - 所有系统调用"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  strace -p \$(pgrep rcoder) -e trace=network   - 只看网络调用"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  strace -p \$(pgrep rcoder) -e trace=file      - 只看文件操作"' >> /usr/local/bin/debug-help && \
+    echo 'echo ""' >> /usr/local/bin/debug-help && \
+    echo 'echo "🌐 网络诊断："' >> /usr/local/bin/debug-help && \
+    echo 'echo "  ss -tulpn | grep \$(pgrep rcoder)             - 网络连接状态"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  lsof -p \$(pgrep rcoder) -i                   - 网络文件描述符"' >> /usr/local/bin/debug-help && \
+    echo 'echo ""' >> /usr/local/bin/debug-help && \
+    echo 'echo "💡 故障排查流程："' >> /usr/local/bin/debug-help && \
+    echo 'echo "  1. analyze-rcoder         - 获取整体状况"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  2. diagnose-blocking      - 检查是否有阻塞"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  3. generate-flamegraph    - 生成性能火焰图"' >> /usr/local/bin/debug-help && \
+    echo 'echo "  4. strace 追踪具体调用    - 定位问题系统调用"' >> /usr/local/bin/debug-help && \
+    chmod +x /usr/local/bin/debug-help
+
+# 设置工作目录和权限
+WORKDIR /app
+RUN chown -R rcoder:rcoder /app
+
+# 暴露端口（包括 tokio-console 端口）
+EXPOSE 8087 6669
+
+# 增强的健康检查
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
+    CMD curl -f http://localhost:8087/health || exit 1
+
+# 启动时显示调试信息
+CMD echo "🐛 RCoder Debug Mode Started" && \
+    echo "📖 运行 'debug-help' 查看调试工具使用指南" && \
+    echo "🔍 运行 'analyze-rcoder' 快速分析进程状态" && \
+    /bin/bash /app/start-rcoder.sh
