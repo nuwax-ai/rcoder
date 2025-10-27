@@ -81,28 +81,3 @@ Content-Type: application/json
 POST http://localhost:3000/agent/stop?project_id={{stop_test_project_id}}
 
 ###
-
-### SSE消息清空测试：验证取消任务时历史消息被清理
-# @name testSSEClearOnCancel  
-# 创建一个新的Agent用于测试SSE消息清空
-POST http://localhost:3000/chat
-Content-Type: application/json
-
-{
-  "user_id": "sse_clear_test_user",
-  "prompt": "请生成一个复杂的Python项目，包含多个文件，这会产生很多SSE消息",
-  "agent_type": "codex"
-}
-
-### 提取SSE测试专用的变量
-@sse_test_session_id = {{testSSEClearOnCancel.response.body.data.session_id}}
-@sse_test_project_id = {{testSSEClearOnCancel.response.body.data.project_id}}
-
-### 等待Agent开始工作，然后立即取消（测试SSE消息清空）
-# 注意：这个测试应该在Agent开始生成消息后立即执行
-POST http://localhost:3000/agent/session/cancel?project_id={{sse_test_project_id}}&session_id={{sse_test_session_id}}
-
-### 建立SSE连接查看清空后的消息（应该很少或没有历史消息堆积）
-GET http://localhost:3000/agent/progress/{{sse_test_session_id}}
-
-###

@@ -3,7 +3,7 @@
 use crate::model::{ChatPrompt, ProjectAndAgentInfo};
 use anyhow::Result;
 use shared_types::ModelProviderConfig;
-use tracing::info;
+use tracing::{debug, info};
 
 /// ACP 代理服务 trait
 ///

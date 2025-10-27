@@ -3,12 +3,12 @@
 //! 基于 Zed 编辑器的实现，提供 claude-code-acp 的自动安装和管理功能。
 //! 参考: https://github.com/zed-industries/claude-code-acp
 
-use anyhow::{Context, Result, anyhow};
-use semver::Version;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
-use tracing::{debug, info};
+use anyhow::{Context, Result, anyhow};
+use semver::Version;
+use tracing::{info, debug};
 
 /// Claude Code ACP 代理配置
 #[derive(Debug, Clone)]
@@ -100,21 +100,17 @@ impl ClaudeCodeAcpManager {
 
         // 检查安装目录
         if !self.install_dir.exists() {
-            tokio::fs::create_dir_all(&self.install_dir)
-                .await
+            tokio::fs::create_dir_all(&self.install_dir).await
                 .context("创建安装目录失败")?;
         }
 
         // 扫描已安装的版本
-        let mut entries = tokio::fs::read_dir(&self.install_dir)
-            .await
+        let mut entries = tokio::fs::read_dir(&self.install_dir).await
             .context("读取安装目录失败")?;
 
         while let Some(entry) = entries.next_entry().await? {
             let file_name = entry.file_name();
-            let Some(file_name_str) = file_name.to_str() else {
-                continue;
-            };
+            let Some(file_name_str) = file_name.to_str() else { continue };
 
             if let Ok(version) = Version::from_str(file_name_str) {
                 let entry_path = entry.path().join(&self.config.entrypoint_path);
@@ -132,8 +128,7 @@ impl ClaudeCodeAcpManager {
         for version_dir in to_delete {
             let dir_path = self.install_dir.join(&version_dir);
             if dir_path.exists() {
-                tokio::fs::remove_dir_all(&dir_path)
-                    .await
+                tokio::fs::remove_dir_all(&dir_path).await
                     .context("清理无效版本失败")?;
             }
         }
@@ -142,14 +137,11 @@ impl ClaudeCodeAcpManager {
         installed_versions.sort_by(|a, b| b.0.cmp(&a.0));
 
         let current_version = installed_versions.first().map(|(v, _)| v.clone());
-        let install_path = current_version
-            .as_ref()
+        let install_path = current_version.as_ref()
             .map(|_| self.install_dir.join(installed_versions[0].1.as_str()));
 
         // 检查是否满足最小版本要求
-        let meets_minimum = if let (Some(current), Some(minimum)) =
-            (&current_version, &self.config.minimum_version)
-        {
+        let meets_minimum = if let (Some(current), Some(minimum)) = (&current_version, &self.config.minimum_version) {
             current >= minimum
         } else {
             true
@@ -194,16 +186,11 @@ impl ClaudeCodeAcpManager {
         info!("开始安装 Claude Code ACP");
 
         // 下载最新版本
-        let version = self
-            .download_latest_version()
-            .await
+        let version = self.download_latest_version().await
             .context("下载最新版本失败")?;
 
         // 验证安装
-        let agent_server_path = self
-            .install_dir
-            .join(&version)
-            .join(&self.config.entrypoint_path);
+        let agent_server_path = self.install_dir.join(&version).join(&self.config.entrypoint_path);
         if !agent_server_path.exists() {
             return Err(anyhow!("安装失败：入口文件不存在: {:?}", agent_server_path));
         }
@@ -230,8 +217,7 @@ impl ClaudeCodeAcpManager {
         }
 
         // 使用本地安装的版本（类似 Zed 的方式）
-        info!(
-            "{}，将使用本地安装版本",
+        info!("{}，将使用本地安装版本",
             if self.config.ignore_system_version {
                 "配置为忽略系统版本"
             } else {
@@ -247,24 +233,18 @@ impl ClaudeCodeAcpManager {
 
         // 获取安装状态
         let status = self.get_status().await?;
-        let install_path = status
-            .install_path
+        let install_path = status.install_path
             .ok_or_else(|| anyhow!("无法确定安装路径"))?;
 
-        let node_path = self
-            .find_node_executable()
-            .await
+        let node_path = self.find_node_executable().await
             .context("未找到 Node.js 可执行文件")?;
 
         info!("使用本地安装的 claude-code-acp 版本");
         Ok(ClaudeCodeAcpCommand {
             path: node_path,
-            args: vec![
-                install_path
-                    .join(&self.config.entrypoint_path)
-                    .to_string_lossy()
-                    .to_string(),
-            ],
+            args: vec![install_path.join(&self.config.entrypoint_path)
+                .to_string_lossy()
+                .to_string()],
             env: None,
         })
     }
@@ -304,7 +284,8 @@ impl ClaudeCodeAcpManager {
         debug!("安装目录: {:?}", self.install_dir);
 
         // 创建临时目录
-        let temp_dir = tempfile::tempdir_in(&self.install_dir).context("创建临时目录失败")?;
+        let temp_dir = tempfile::tempdir_in(&self.install_dir)
+            .context("创建临时目录失败")?;
 
         // 使用 npm 安装
         let output = tokio::process::Command::new("npm")
@@ -323,35 +304,30 @@ impl ClaudeCodeAcpManager {
         }
 
         // 获取安装的版本
-        let package_json_path = temp_dir
-            .path()
+        let package_json_path = temp_dir.path()
             .join("node_modules")
             .join(&self.config.package_name)
             .join("package.json");
 
-        let package_json_content = tokio::fs::read_to_string(&package_json_path)
-            .await
+        let package_json_content = tokio::fs::read_to_string(&package_json_path).await
             .context("读取 package.json 失败")?;
 
-        let package_json: serde_json::Value =
-            serde_json::from_str(&package_json_content).context("解析 package.json 失败")?;
+        let package_json: serde_json::Value = serde_json::from_str(&package_json_content)
+            .context("解析 package.json 失败")?;
 
-        let version = package_json
-            .get("version")
+        let version = package_json.get("version")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("package.json 中缺少 version 字段"))?;
 
         // 移动到最终位置
         let target_dir = self.install_dir.join(version);
         debug!("创建目标目录: {:?}", target_dir);
-        tokio::fs::create_dir_all(&target_dir)
-            .await
+        tokio::fs::create_dir_all(&target_dir).await
             .context("创建目标目录失败")?;
 
         let node_modules_dir = temp_dir.path().join("node_modules");
         debug!("复制文件从 {:?} 到 {:?}", node_modules_dir, target_dir);
-        Box::pin(self.copy_dir_recursive(&node_modules_dir, &target_dir))
-            .await
+        Box::pin(self.copy_dir_recursive(&node_modules_dir, &target_dir)).await
             .context("复制文件失败")?;
 
         // 验证入口文件是否存在
@@ -420,18 +396,15 @@ impl ClaudeCodeAcpManager {
 
             while let Some(entry) = entries.next_entry().await? {
                 let file_name = entry.file_name();
-                let Some(file_name_str) = file_name.to_str() else {
-                    continue;
-                };
+                let Some(file_name_str) = file_name.to_str() else { continue };
 
-                if let Ok(version) = Version::from_str(file_name_str)
-                    && version != *current_version
-                {
-                    let dir_path = self.install_dir.join(file_name_str);
-                    if dir_path.exists() {
-                        tokio::fs::remove_dir_all(&dir_path)
-                            .await
-                            .context("清理旧版本失败")?;
+                if let Ok(version) = Version::from_str(file_name_str) {
+                    if version != *current_version {
+                        let dir_path = self.install_dir.join(file_name_str);
+                        if dir_path.exists() {
+                            tokio::fs::remove_dir_all(&dir_path).await
+                                .context("清理旧版本失败")?;
+                        }
                     }
                 }
             }
@@ -441,14 +414,9 @@ impl ClaudeCodeAcpManager {
     }
 
     /// 获取登录命令
-    pub fn get_login_command(
-        &self,
-        command: &ClaudeCodeAcpCommand,
-    ) -> Option<ClaudeCodeAcpCommand> {
+    pub fn get_login_command(&self, command: &ClaudeCodeAcpCommand) -> Option<ClaudeCodeAcpCommand> {
         // 从命令参数中提取路径前缀
-        let path_prefix = command
-            .args
-            .first()
+        let path_prefix = command.args.first()
             .and_then(|path| path.strip_suffix("/@zed-industries/claude-code-acp/dist/index.js"))?;
 
         Some(ClaudeCodeAcpCommand {
@@ -470,7 +438,7 @@ static GLOBAL_CLAUDE_ACP_MANAGER: OnceLock<ClaudeCodeAcpManager> = OnceLock::new
 
 /// 获取全局 Claude Code ACP 管理器
 pub fn get_global_claude_acp_manager() -> &'static ClaudeCodeAcpManager {
-    GLOBAL_CLAUDE_ACP_MANAGER.get_or_init(ClaudeCodeAcpManager::default)
+    GLOBAL_CLAUDE_ACP_MANAGER.get_or_init(|| ClaudeCodeAcpManager::default())
 }
 
 /// 便捷函数：确保 Claude Code ACP 已安装
@@ -500,16 +468,13 @@ pub async fn check_claude_acp_status() -> Result<ClaudeCodeAcpStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
+    use std::fs;
 
     #[tokio::test]
     async fn test_claude_acp_manager_creation() {
         let manager = ClaudeCodeAcpManager::default();
-        assert_eq!(
-            manager.config.package_name,
-            "@zed-industries/claude-code-acp"
-        );
+        assert_eq!(manager.config.package_name, "@zed-industries/claude-code-acp");
         assert_eq!(manager.config.binary_name, "claude-code-acp");
     }
 
@@ -527,11 +492,11 @@ mod tests {
         let manager2 = get_global_claude_acp_manager();
 
         // 应该是同一个实例
-        assert_eq!(
-            manager1 as *const ClaudeCodeAcpManager,
-            manager2 as *const ClaudeCodeAcpManager
-        );
+        assert_eq!(manager1 as *const ClaudeCodeAcpManager,
+                   manager2 as *const ClaudeCodeAcpManager);
     }
+
+ 
 
     #[tokio::test]
     async fn test_status_when_not_installed() {
@@ -628,8 +593,7 @@ mod tests {
 
         // 创建无效的安装（缺少入口文件）
         let invalid_version_dir = install_dir.join("invalid-version");
-        let invalid_entrypoint =
-            invalid_version_dir.join("node_modules/test-package/dist/index.js");
+        let invalid_entrypoint = invalid_version_dir.join("node_modules/test-package/dist/index.js");
         fs::create_dir_all(invalid_entrypoint.parent().unwrap()).unwrap();
         // 故意不创建入口文件
 
@@ -692,7 +656,9 @@ mod tests {
     async fn test_login_command_generation_with_invalid_path() {
         let command = ClaudeCodeAcpCommand {
             path: PathBuf::from("/usr/local/bin/node"),
-            args: vec!["/tmp/claude-code-acp/1.0.0/wrong/path/index.js".to_string()],
+            args: vec![
+                "/tmp/claude-code-acp/1.0.0/wrong/path/index.js".to_string()
+            ],
             env: None,
         };
 

@@ -2,26 +2,18 @@
 //!
 //! 基于 agent_client_protocol crate 的类型重新导出和扩展
 
-use agent_client_protocol::{
-    ContentBlock, PermissionOption, PermissionOptionId, SessionId, SessionModeId, StopReason,
-    ToolCall, ToolCallStatus,
-};
+use agent_client_protocol::{ContentBlock, PermissionOption, PermissionOptionId, SessionId, SessionModeId, StopReason, ToolCall, ToolCallStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use uuid::Uuid;
+use tokio::sync::oneshot;
+
 
 /// 用户消息 ID - 扩展类型
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct UserMessageId(Arc<str>);
-
-impl Default for UserMessageId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl UserMessageId {
     pub fn new() -> Self {
@@ -84,12 +76,6 @@ pub enum ToolCallState {
 /// 工具调用 ID - 扩展类型
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct ToolCallId(Arc<str>);
-
-impl Default for ToolCallId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl ToolCallId {
     pub fn new() -> Self {
@@ -406,7 +392,9 @@ pub enum ExtendedToolCallStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SerializableToolCallStatus {
     Pending,
-    WaitingForConfirmation { options: Vec<PermissionOption> },
+    WaitingForConfirmation {
+        options: Vec<PermissionOption>,
+    },
     InProgress,
     Completed,
     Failed,
@@ -436,9 +424,7 @@ impl std::fmt::Display for ExtendedToolCallStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExtendedToolCallStatus::Pending => write!(f, "Pending"),
-            ExtendedToolCallStatus::WaitingForConfirmation { .. } => {
-                write!(f, "Waiting for confirmation")
-            }
+            ExtendedToolCallStatus::WaitingForConfirmation { .. } => write!(f, "Waiting for confirmation"),
             ExtendedToolCallStatus::InProgress => write!(f, "In Progress"),
             ExtendedToolCallStatus::Completed => write!(f, "Completed"),
             ExtendedToolCallStatus::Failed => write!(f, "Failed"),
@@ -634,12 +620,12 @@ impl Plan {
     pub fn new() -> Self {
         Self::default()
     }
-
+    
     /// 是否为空
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
+    
     /// 获取统计信息
     pub fn stats(&self) -> PlanStats {
         let mut stats = PlanStats {
@@ -651,7 +637,7 @@ impl Plan {
             total: self.entries.len() as u32,
             current_in_progress_entry: None,
         };
-
+        
         for entry in &self.entries {
             match entry.status {
                 PlanEntryStatus::Pending => stats.pending += 1,
@@ -666,15 +652,15 @@ impl Plan {
                 PlanEntryStatus::Failed => stats.failed += 1,
             }
         }
-
+        
         stats
     }
-
+    
     /// 添加新条目
     pub fn add_entry(&mut self, content: String, priority: PlanEntryPriority) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let now = std::time::SystemTime::now();
-
+        
         let entry = PlanEntry {
             id: id.clone(),
             content,
@@ -692,13 +678,13 @@ impl Plan {
             progress: Some(0),
             meta: None,
         };
-
+        
         self.entries.push(entry);
         self.updated_at = now;
-
+        
         id
     }
-
+    
     /// 更新条目状态
     pub fn update_entry_status(&mut self, entry_id: &str, status: PlanEntryStatus) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == entry_id) {
@@ -710,16 +696,15 @@ impl Plan {
             false
         }
     }
-
+    
     /// 获取条目
     pub fn get_entry(&self, entry_id: &str) -> Option<&PlanEntry> {
         self.entries.iter().find(|e| e.id == entry_id)
     }
-
+    
     /// 移除已完成的条目
     pub fn clear_completed(&mut self) {
-        self.entries
-            .retain(|entry| entry.status != PlanEntryStatus::Completed);
+        self.entries.retain(|entry| entry.status != PlanEntryStatus::Completed);
         self.updated_at = std::time::SystemTime::now();
     }
 }
@@ -746,7 +731,7 @@ impl PlanEntry {
             meta: None,
         }
     }
-
+    
     /// 标记为进行中
     pub fn mark_in_progress(&mut self) {
         self.status = PlanEntryStatus::InProgress;
@@ -754,7 +739,7 @@ impl PlanEntry {
         self.updated_at = self.started_at.unwrap();
         self.progress = Some(0);
     }
-
+    
     /// 标记为完成
     pub fn mark_completed(&mut self) {
         let now = std::time::SystemTime::now();
@@ -762,35 +747,35 @@ impl PlanEntry {
         self.completed_at = Some(now);
         self.updated_at = now;
         self.progress = Some(100);
-
+        
         // 计算实际耗时
-        if let Some(started) = self.started_at
-            && let Ok(duration) = now.duration_since(started)
-        {
-            self.actual_duration = Some(duration.as_secs());
+        if let Some(started) = self.started_at {
+            if let Ok(duration) = now.duration_since(started) {
+                self.actual_duration = Some(duration.as_secs());
+            }
         }
     }
-
+    
     /// 标记为失败
     pub fn mark_failed(&mut self) {
         let now = std::time::SystemTime::now();
         self.status = PlanEntryStatus::Failed;
         self.updated_at = now;
-
+        
         // 计算实际耗时（即使失败了）
-        if let Some(started) = self.started_at
-            && let Ok(duration) = now.duration_since(started)
-        {
-            self.actual_duration = Some(duration.as_secs());
+        if let Some(started) = self.started_at {
+            if let Ok(duration) = now.duration_since(started) {
+                self.actual_duration = Some(duration.as_secs());
+            }
         }
     }
-
+    
     /// 更新进度
     pub fn update_progress(&mut self, progress: u8) {
         self.progress = Some(progress.min(100));
         self.updated_at = std::time::SystemTime::now();
     }
-
+    
     /// 添加标签
     pub fn add_tag(&mut self, tag: String) {
         if !self.tags.contains(&tag) {
@@ -798,13 +783,13 @@ impl PlanEntry {
             self.updated_at = std::time::SystemTime::now();
         }
     }
-
+    
     /// 设置描述
     pub fn set_description(&mut self, description: String) {
         self.description = Some(description);
         self.updated_at = std::time::SystemTime::now();
     }
-
+    
     /// 添加依赖
     pub fn add_dependency(&mut self, dependency_id: String) {
         if !self.dependencies.contains(&dependency_id) {
@@ -812,24 +797,23 @@ impl PlanEntry {
             self.updated_at = std::time::SystemTime::now();
         }
     }
-
+    
     /// 设置预计耗时
     pub fn set_estimated_duration(&mut self, duration_seconds: u64) {
         self.estimated_duration = Some(duration_seconds);
         self.updated_at = std::time::SystemTime::now();
     }
-
+    
     /// 检查依赖是否满足
     pub fn are_dependencies_satisfied(&self, plan: &Plan) -> bool {
         self.dependencies.iter().all(|dep_id| {
-            plan.entries
-                .iter()
+            plan.entries.iter()
                 .find(|entry| entry.id == *dep_id)
                 .map(|entry| entry.status == PlanEntryStatus::Completed)
                 .unwrap_or(false)
         })
     }
-
+    
     /// 获取耗时（已完成的实际耗时或预计耗时）
     pub fn get_duration(&self) -> Option<u64> {
         self.actual_duration.or(self.estimated_duration)

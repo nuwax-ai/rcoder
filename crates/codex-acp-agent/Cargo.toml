@@ -11,26 +11,43 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "codex-acp-agent"
-path = "src/bin/codex-acp-agent.rs"
-
+path = "src/main.rs"
 
 [dependencies]
-# 使用自己 fork 的版本，支持 -c 参数
-codex-acp.workspace = true
-codex-core.workspace = true
-codex-common.workspace = true
-codex-arg0.workspace = true
-clap = { workspace = true, features = ["derive"] }
-piper.workspace = true
+# OpenAI dependencies would go here when available
+codex-common = { git = "https://github.com/openai/codex", branch = "main", features = [
+    "cli",
+] }
+codex-core = { git = "https://github.com/openai/codex", branch = "main" }
+codex-protocol = { git = "https://github.com/openai/codex", branch = "main" }
+mcp-types = { git = "https://github.com/openai/codex", branch = "main" }
 
-# 安装工具依赖
-anyhow.workspace = true
-dirs.workspace = true
-reqwest = { workspace = true, features = ["json", "blocking"] }
-serde.workspace = true
-serde_json.workspace = true
-tokio = { workspace = true, features = ["fs", "process"] }
-tracing.workspace = true
-flate2.workspace = true
-tar.workspace = true
-zip.workspace = true
+# codex-acp = { git = "https://github.com/cola-io/codex-acp" , branch = "main"}
+
+agent-client-protocol = { workspace = true }
+acp-adapter = { path = "../acp_adapter" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "time",
+    "io-std",
+    "io-util",
+    "net",
+    "process",
+    "sync",
+] }
+tokio-util = { workspace = true, features = ["compat"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+tracing = { workspace = true, features = ["log"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uuid = { workspace = true }
+dirs = { workspace = true }
+diffy={workspace = true}
+
+
+[lints]
+workspace = true

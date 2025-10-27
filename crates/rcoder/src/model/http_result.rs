@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use opentelemetry::trace::TraceContextExt;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
+use opentelemetry::trace::TraceContextExt;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use utoipa::ToSchema;
 
@@ -11,7 +11,7 @@ fn get_trace_id_from_context() -> Option<String> {
     let context = span.context();
     let span_ref = context.span();
     let span_context = span_ref.span_context();
-
+    
     if span_context.is_valid() {
         // 获取 trace_id 并转换为字符串
         let trace_id = span_context.trace_id();
@@ -78,12 +78,12 @@ impl<T: Serialize> IntoResponse for HttpResult<T> {
     fn into_response(self) -> Response {
         // 创建一个新的 HttpResult，自动从 context 获取 trace_id
         let mut result = self;
-
+        
         // 如果当前没有 trace_id，尝试从 OpenTelemetry context 获取
         if result.tid.is_none() {
             result.tid = get_trace_id_from_context();
         }
-
+        
         match serde_json::to_string(&result) {
             Ok(body) => (
                 StatusCode::OK,

@@ -2,14 +2,14 @@
 //!
 //! 提供文件读取、验证、转换等实用功能
 
-use anyhow::{Context, Result};
+use anyhow::{Result, Context};
 use base64::{Engine as _, engine::general_purpose};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tracing::warn;
+use tracing::{debug, warn, error};
 
+use crate::model::{Attachment, AttachmentSource, AttachmentError};
 use super::ContentBuilder;
-use crate::model::{Attachment, AttachmentError, AttachmentSource};
 
 /// 文件处理配置
 pub struct FileConfig {
@@ -27,14 +27,11 @@ impl Default for FileConfig {
             max_file_size: 50 * 1024 * 1024, // 50MB
             allowed_extensions: vec![
                 "txt", "md", "json", "xml", "html", "css", "js", "ts", // 文本文件
-                "jpg", "jpeg", "png", "gif", "svg", "webp", // 图像文件
-                "mp3", "wav", "ogg", "m4a", // 音频文件
+                "jpg", "jpeg", "png", "gif", "svg", "webp",         // 图像文件
+                "mp3", "wav", "ogg", "m4a",                         // 音频文件
                 "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", // 文档文件
-                "zip", "tar", "gz", "rar", "7z", // 压缩文件
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+                "zip", "tar", "gz", "rar", "7z",                     // 压缩文件
+            ].iter().map(|s| s.to_string()).collect(),
             temp_dir: std::env::temp_dir(),
         }
     }
@@ -61,16 +58,11 @@ impl FileUtils {
     /// 验证文件扩展名是否允许
     pub fn validate_extension(&self, filename: &str) -> Result<()> {
         let path = Path::new(filename);
-        let extension = path
-            .extension()
+        let extension = path.extension()
             .and_then(|ext| ext.to_str())
             .ok_or_else(|| anyhow::anyhow!("文件没有扩展名"))?;
 
-        if !self
-            .config
-            .allowed_extensions
-            .contains(&extension.to_lowercase())
-        {
+        if !self.config.allowed_extensions.contains(&extension.to_lowercase()) {
             return Err(anyhow::anyhow!("不支持的文件扩展名: {}", extension));
         }
 
@@ -79,8 +71,7 @@ impl FileUtils {
 
     /// 验证文件大小
     pub async fn validate_file_size(&self, file_path: &Path) -> Result<()> {
-        let metadata = fs::metadata(file_path)
-            .await
+        let metadata = fs::metadata(file_path).await
             .context("无法获取文件元数据")?;
 
         if metadata.len() > self.config.max_file_size {
@@ -94,7 +85,8 @@ impl FileUtils {
     pub async fn read_file_as_base64(&self, file_path: &Path) -> Result<String> {
         self.validate_file_size(file_path).await?;
 
-        let content = fs::read(file_path).await.context("读取文件失败")?;
+        let content = fs::read(file_path).await
+            .context("读取文件失败")?;
 
         Ok(general_purpose::STANDARD.encode(content))
     }
@@ -103,8 +95,7 @@ impl FileUtils {
     pub async fn read_text_file(&self, file_path: &Path) -> Result<String> {
         self.validate_file_size(file_path).await?;
 
-        let content = fs::read_to_string(file_path)
-            .await
+        let content = fs::read_to_string(file_path).await
             .context("读取文本文件失败")?;
 
         Ok(content)
@@ -118,16 +109,14 @@ impl FileUtils {
         description: Option<String>,
     ) -> Result<Attachment> {
         // 验证文件扩展名
-        let filename = file_path
-            .file_name()
+        let filename = file_path.file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("无效的文件名"))?;
 
         self.validate_extension(filename)?;
 
         // 获取相对于项目路径的路径
-        let relative_path = file_path
-            .strip_prefix(project_path)
+        let relative_path = file_path.strip_prefix(project_path)
             .unwrap_or(file_path)
             .to_string_lossy()
             .to_string();
@@ -138,31 +127,23 @@ impl FileUtils {
         // 根据文件类型创建相应的附件
         let attachment = if mime_type.starts_with("image/") {
             Attachment::new_image(
-                AttachmentSource::FilePath {
-                    path: relative_path,
-                },
+                AttachmentSource::FilePath { path: relative_path },
                 mime_type.to_string(),
             )
         } else if mime_type.starts_with("audio/") {
             Attachment::new_audio(
-                AttachmentSource::FilePath {
-                    path: relative_path,
-                },
+                AttachmentSource::FilePath { path: relative_path },
                 mime_type.to_string(),
             )
         } else if mime_type.starts_with("text/") || mime_type == "application/json" {
-            let mut attachment = Attachment::new_text(AttachmentSource::FilePath {
-                path: relative_path,
-            });
+            let mut attachment = Attachment::new_text(AttachmentSource::FilePath { path: relative_path });
             if let Attachment::Text(ref mut text_attachment) = attachment {
                 text_attachment.description = description;
             }
             attachment
         } else {
             Attachment::new_document(
-                AttachmentSource::FilePath {
-                    path: relative_path,
-                },
+                AttachmentSource::FilePath { path: relative_path },
                 mime_type.to_string(),
             )
         };
@@ -184,10 +165,7 @@ impl FileUtils {
             return Err(AttachmentError::FileSizeExceeded(decoded_size).into());
         }
 
-        let source = AttachmentSource::Base64 {
-            data,
-            mime_type: mime_type.clone(),
-        };
+        let source = AttachmentSource::Base64 { data, mime_type: mime_type.clone() };
 
         let attachment = if mime_type.starts_with("image/") {
             let mut attachment = Attachment::new_image(source, mime_type);
@@ -243,15 +221,12 @@ impl FileUtils {
         }
 
         // 获取 MIME 类型
-        let mime_type = response
-            .headers()
+        let mime_type = response.headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("application/octet-stream");
 
-        let source = AttachmentSource::Url {
-            url: url.to_string(),
-        };
+        let source = AttachmentSource::Url { url: url.to_string() };
 
         let attachment = if mime_type.starts_with("image/") {
             let mut attachment = Attachment::new_image(source, mime_type.to_string());
@@ -295,10 +270,7 @@ impl FileUtils {
         let mut attachments = Vec::new();
 
         for file_path in file_paths {
-            match self
-                .create_attachment_from_file(file_path, project_path, None)
-                .await
-            {
+            match self.create_attachment_from_file(file_path, project_path, None).await {
                 Ok(attachment) => attachments.push(attachment),
                 Err(e) => {
                     warn!("跳过文件 {:?}，创建附件失败: {}", file_path, e);
@@ -313,8 +285,7 @@ impl FileUtils {
     pub async fn cleanup_temp_files(&self, temp_files: &[PathBuf]) -> Result<()> {
         for temp_file in temp_files {
             if temp_file.exists() {
-                fs::remove_file(temp_file)
-                    .await
+                fs::remove_file(temp_file).await
                     .with_context(|| format!("删除临时文件失败: {:?}", temp_file))?;
             }
         }
@@ -331,8 +302,8 @@ impl Default for FileUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::NamedTempFile;
+    use std::io::Write;
 
     #[tokio::test]
     async fn test_validate_extension() {

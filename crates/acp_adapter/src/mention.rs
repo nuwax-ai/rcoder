@@ -12,9 +12,13 @@ use url::Url;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum ResourceUri {
     /// 文件资源
-    File { abs_path: PathBuf },
+    File {
+        abs_path: PathBuf,
+    },
     /// 目录资源
-    Directory { abs_path: PathBuf },
+    Directory {
+        abs_path: PathBuf,
+    },
     /// 代码符号
     Symbol {
         abs_path: PathBuf,
@@ -27,9 +31,15 @@ pub enum ResourceUri {
         line_range: RangeInclusive<u32>,
     },
     /// 会话线程
-    Thread { id: String, name: String },
+    Thread {
+        id: String,
+        name: String,
+    },
     /// 文本会话线程（基于文件的会话）
-    TextThread { path: PathBuf, name: String },
+    TextThread {
+        path: PathBuf,
+        name: String,
+    },
     /// 工具调用
     ToolCall {
         id: String,
@@ -43,9 +53,13 @@ pub enum ResourceUri {
         status: String,
     },
     /// 网络资源
-    Web { url: Url },
+    Web {
+        url: Url,
+    },
     /// 粘贴的图片
-    PastedImage { id: String },
+    PastedImage {
+        id: String,
+    },
     /// 内存中的缓冲区
     Buffer {
         id: String,
@@ -98,7 +112,7 @@ impl ResourceUri {
 
         let url = url::Url::parse(input)?;
         let path = url.path();
-
+        
         match url.scheme() {
             "file" => {
                 let abs_path = url.to_file_path().ok().context("Extracting file path")?;
@@ -137,20 +151,16 @@ impl ResourceUri {
                         name,
                     })
                 } else if let Some(tool_call_id) = path.strip_prefix("/tool-call/") {
-                    let tool_name =
-                        single_query_param(&url, "tool_name")?.context("Missing tool name")?;
-                    let status = single_query_param(&url, "status")?
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let tool_name = single_query_param(&url, "tool_name")?.context("Missing tool name")?;
+                    let status = single_query_param(&url, "status")?.unwrap_or_else(|| "unknown".to_string());
                     Ok(Self::ToolCall {
                         id: tool_call_id.to_string(),
                         tool_name,
                         status,
                     })
                 } else if let Some(terminal_id) = path.strip_prefix("/terminal/") {
-                    let command =
-                        single_query_param(&url, "command")?.context("Missing command")?;
-                    let status = single_query_param(&url, "status")?
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let command = single_query_param(&url, "command")?.context("Missing command")?;
+                    let status = single_query_param(&url, "status")?.unwrap_or_else(|| "unknown".to_string());
                     Ok(Self::Terminal {
                         id: terminal_id.to_string(),
                         command,
@@ -188,20 +198,18 @@ impl ResourceUri {
                     })
                 } else if let Some(repo_path_str) = path.strip_prefix("/git/") {
                     let repo_path = PathBuf::from(repo_path_str);
-                    let resource_type =
-                        if let Some(commit_hash) = single_query_param(&url, "commit")? {
-                            GitResourceType::Commit { hash: commit_hash }
-                        } else if let Some(branch_name) = single_query_param(&url, "branch")? {
-                            GitResourceType::Branch { name: branch_name }
-                        } else if let Some(tag_name) = single_query_param(&url, "tag")? {
-                            GitResourceType::Tag { name: tag_name }
-                        } else if let Some(from) = single_query_param(&url, "from")? {
-                            let to = single_query_param(&url, "to")?
-                                .context("Missing 'to' parameter for diff")?;
-                            GitResourceType::Diff { from, to }
-                        } else {
-                            bail!("Missing git resource type parameters");
-                        };
+                    let resource_type = if let Some(commit_hash) = single_query_param(&url, "commit")? {
+                        GitResourceType::Commit { hash: commit_hash }
+                    } else if let Some(branch_name) = single_query_param(&url, "branch")? {
+                        GitResourceType::Branch { name: branch_name }
+                    } else if let Some(tag_name) = single_query_param(&url, "tag")? {
+                        GitResourceType::Tag { name: tag_name }
+                    } else if let Some(from) = single_query_param(&url, "from")? {
+                        let to = single_query_param(&url, "to")?.context("Missing 'to' parameter for diff")?;
+                        GitResourceType::Diff { from, to }
+                    } else {
+                        bail!("Missing git resource type parameters");
+                    };
                     Ok(Self::Git {
                         repo_path,
                         resource_type,
@@ -218,11 +226,13 @@ impl ResourceUri {
     /// 获取资源的显示名称
     pub fn name(&self) -> String {
         match self {
-            ResourceUri::File { abs_path } | ResourceUri::Directory { abs_path } => abs_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+            ResourceUri::File { abs_path } | ResourceUri::Directory { abs_path } => {
+                abs_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }
             ResourceUri::Symbol { name, .. } => name.clone(),
             ResourceUri::Selection {
                 abs_path: path,
@@ -289,7 +299,8 @@ impl ResourceUri {
                 name,
                 line_range,
             } => {
-                let mut url = Url::from_file_path(abs_path).expect("path should be absolute");
+                let mut url =
+                    Url::from_file_path(abs_path).expect("path should be absolute");
                 url.query_pairs_mut().append_pair("symbol", name);
                 url.set_fragment(Some(&format!(
                     "L{}:{}",
@@ -331,22 +342,14 @@ impl ResourceUri {
                 url.query_pairs_mut().append_pair("name", name);
                 url
             }
-            ResourceUri::ToolCall {
-                id,
-                tool_name,
-                status,
-            } => {
+            ResourceUri::ToolCall { id, tool_name, status } => {
                 let mut url = Url::parse("rcoder:///").unwrap();
                 url.set_path(&format!("/tool-call/{}", id));
                 url.query_pairs_mut().append_pair("tool_name", tool_name);
                 url.query_pairs_mut().append_pair("status", status);
                 url
             }
-            ResourceUri::Terminal {
-                id,
-                command,
-                status,
-            } => {
+            ResourceUri::Terminal { id, command, status } => {
                 let mut url = Url::parse("rcoder:///").unwrap();
                 url.set_path(&format!("/terminal/{}", id));
                 url.query_pairs_mut().append_pair("command", command);
@@ -377,10 +380,7 @@ impl ResourceUri {
                 }
                 url
             }
-            ResourceUri::Git {
-                repo_path,
-                resource_type,
-            } => {
+            ResourceUri::Git { repo_path, resource_type } => {
                 let mut url = Url::parse("rcoder:///").unwrap();
                 url.set_path(&format!("/git/{}", repo_path.to_string_lossy()));
                 match resource_type {
@@ -425,7 +425,7 @@ impl fmt::Display for ResourceLink<'_> {
 fn single_query_param(url: &Url, name: &'static str) -> Result<Option<String>> {
     let pairs = url.query_pairs().collect::<Vec<_>>();
     let matching_pairs: Vec<_> = pairs.iter().filter(|(k, _)| k == name).collect();
-
+    
     match matching_pairs.len() {
         0 => Ok(None),
         1 => Ok(Some(matching_pairs[0].1.to_string())),
@@ -494,20 +494,12 @@ impl ResourceUriBuilder {
 
     /// 创建工具调用URI
     pub fn tool_call(id: String, tool_name: String, status: String) -> ResourceUri {
-        ResourceUri::ToolCall {
-            id,
-            tool_name,
-            status,
-        }
+        ResourceUri::ToolCall { id, tool_name, status }
     }
 
     /// 创建Terminal URI
     pub fn terminal(id: String, command: String, status: String) -> ResourceUri {
-        ResourceUri::Terminal {
-            id,
-            command,
-            status,
-        }
+        ResourceUri::Terminal { id, command, status }
     }
 
     /// 创建Web URI
@@ -591,11 +583,7 @@ mod tests {
         let tool_uri = "rcoder:///tool-call/abc123?tool_name=run_terminal&status=running";
         let parsed = ResourceUri::parse(tool_uri).unwrap();
         match &parsed {
-            ResourceUri::ToolCall {
-                id,
-                tool_name,
-                status,
-            } => {
+            ResourceUri::ToolCall { id, tool_name, status } => {
                 assert_eq!(id, "abc123");
                 assert_eq!(tool_name, "run_terminal");
                 assert_eq!(status, "running");
@@ -610,10 +598,7 @@ mod tests {
         let git_uri = "rcoder:///git/my-repo?commit=abc123def456";
         let parsed = ResourceUri::parse(git_uri).unwrap();
         match &parsed {
-            ResourceUri::Git {
-                repo_path,
-                resource_type,
-            } => {
+            ResourceUri::Git { repo_path, resource_type } => {
                 assert_eq!(repo_path.to_str().unwrap(), "my-repo");
                 match resource_type {
                     GitResourceType::Commit { hash } => {
@@ -632,12 +617,10 @@ mod tests {
         let file_uri = ResourceUriBuilder::file("/path/to/file.rs");
         assert!(matches!(file_uri, ResourceUri::File { .. }));
 
-        let symbol_uri =
-            ResourceUriBuilder::symbol("/path/to/file.rs", "MySymbol".to_string(), 10..=20);
+        let symbol_uri = ResourceUriBuilder::symbol("/path/to/file.rs", "MySymbol".to_string(), 10..=20);
         assert!(matches!(symbol_uri, ResourceUri::Symbol { .. }));
 
-        let thread_uri =
-            ResourceUriBuilder::thread("session123".to_string(), "My Thread".to_string());
+        let thread_uri = ResourceUriBuilder::thread("session123".to_string(), "My Thread".to_string());
         assert!(matches!(thread_uri, ResourceUri::Thread { .. }));
     }
 
@@ -649,11 +632,7 @@ mod tests {
         let dir_uri = ResourceUriBuilder::directory("/test");
         assert_eq!(dir_uri.icon_name(), "folder");
 
-        let terminal_uri = ResourceUriBuilder::terminal(
-            "term1".to_string(),
-            "ls".to_string(),
-            "running".to_string(),
-        );
+        let terminal_uri = ResourceUriBuilder::terminal("term1".to_string(), "ls".to_string(), "running".to_string());
         assert_eq!(terminal_uri.icon_name(), "terminal");
     }
 

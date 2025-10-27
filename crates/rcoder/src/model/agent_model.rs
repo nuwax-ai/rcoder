@@ -6,16 +6,17 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use codex_core::WireApi;
 use codex_core::{ModelProviderInfo, config::ConfigToml};
-use serde::{Deserialize, Serialize};
-use shared_types::{ModelProviderConfig, ModelProviderSafeInfo};
+use serde::{Serialize, Deserialize};
+use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
-use utoipa::ToSchema;
 
-use crate::proxy_agent::agent_stop_handle::AgentLifecycleGuard;
 use codex_core::config::{find_codex_home, load_config_as_toml};
+use crate::proxy_agent::agent_stop_handle::{AgentLifecycleGuard};
 
 pub static CUSTOM_MODEL_PROVIDER_NAME: &str = "custom";
+
+pub static CUSTOM_MODEL_PROVIDER_API_KEY: &str = "API_KEY";
 
 /// 使用Agent代理的工具类型,都是使用ACP协议包装过的agent代理
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -28,7 +29,7 @@ pub enum AgentType {
 
 impl Default for AgentType {
     fn default() -> Self {
-        Self::Claude
+        Self::Codex
     }
 }
 
@@ -47,7 +48,7 @@ impl AgentType {
     }
 
     /// 获取 codex 环境变量的模型提供商配置
-    pub async fn codex_from_env() -> Result<ConfigToml> {
+    pub fn codex_from_env() -> Result<ConfigToml> {
         // 加载配置
         // 首先获取codex home目录 (~/.codex)
         let codex_home = find_codex_home().map_err(|e| {
@@ -58,12 +59,10 @@ impl AgentType {
         info!("Codex home directory: {:?}", codex_home);
 
         // 从 ~/.codex/config.toml 加载配置
-        let config_toml_value = load_config_as_toml(&codex_home)
-            .await
-            .map_err(|e| {
-                error!("Failed to load config.toml from {:?}: {}", codex_home, e);
-                anyhow::anyhow!("Failed to load config.toml from {:?}: {}", codex_home, e)
-            })?;
+        let config_toml_value = load_config_as_toml(&codex_home).map_err(|e| {
+            error!("Failed to load config.toml from {:?}: {}", codex_home, e);
+            anyhow::anyhow!("Failed to load config.toml from {:?}: {}", codex_home, e)
+        })?;
 
         // 将TOML值转换为ConfigToml结构体
         let cfg: ConfigToml = config_toml_value.try_into().map_err(|e| {
@@ -76,24 +75,22 @@ impl AgentType {
 
     /// 获取 codex 模型提供商配置
     #[allow(dead_code)]
-    pub async fn codex_model_provider(
+    pub fn codex_model_provider(
         model_provider: Option<ModelProviderConfig>,
     ) -> Result<(ConfigToml, HashMap<String, String>)> {
         let result = match model_provider {
             Some(model_provider) => {
                 let mut merged_envs: HashMap<String, String> = HashMap::new();
+                let api_key_name = CUSTOM_MODEL_PROVIDER_API_KEY.to_string();
                 let api_key_value = model_provider.api_key.clone();
-                // 同时设置两个环境变量，确保 codex-acp-agent 能识别
-                merged_envs.insert("API_KEY".to_string(), api_key_value.clone());
-                merged_envs.insert("OPENAI_API_KEY".to_string(), api_key_value.clone());
-                merged_envs.insert("CODEX_API_KEY".to_string(), api_key_value.clone());
+                merged_envs.insert(api_key_name.clone(), api_key_value);
                 // 加载配置
                 // 首先获取codex home目录 (~/.codex)。失败则直接使用默认配置
                 let mut cfg: ConfigToml = match find_codex_home() {
                     Ok(codex_home) => {
                         info!("Codex home directory: {:?}", codex_home);
-                        // 从 ~/.codex/config.toml 加载配置;失败时回退到默认配置
-                        match load_config_as_toml(&codex_home).await {
+                        // 从 ~/.codex/config.toml 加载配置；失败时回退到默认配置
+                        match load_config_as_toml(&codex_home) {
                             Ok(value) => match value.try_into() {
                                 Ok(cfg) => cfg,
                                 Err(e) => {
@@ -132,7 +129,7 @@ impl AgentType {
                     } else {
                         Some(model_provider.base_url.clone())
                     },
-                    env_key: Some("OPENAI_API_KEY".to_string()),
+                    env_key: Some(api_key_name.clone()),
                     env_key_instructions: None,
                     wire_api: WireApi::default(),
                     query_params: None,
@@ -150,7 +147,7 @@ impl AgentType {
                 (cfg, merged_envs)
             }
             None => {
-                let result = AgentType::codex_from_env().await?;
+                let result = AgentType::codex_from_env()?;
                 (result, HashMap::new())
             }
         };
@@ -234,13 +231,12 @@ pub struct CancelNotificationRequest {
 }
 
 /// 取消通知响应
-#[derive(Debug)]
 pub struct CancelNotificationResponse {
     pub success: bool,
     pub message: Option<String>,
 }
 /// Agent 服务状态
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub enum AgentStatus {
     /// 活跃状态 - 正在处理请求
     Active,
@@ -251,7 +247,7 @@ pub enum AgentStatus {
 }
 
 /// 项目id与 Agent 服务池，一个项目对应一个 Agent 服务
-///
+/// 
 /// Clone trait 是必需的，因为 DashMap::insert() 要求值类型实现 Clone
 #[derive(Clone)]
 pub struct ProjectAndAgentInfo {
@@ -285,33 +281,4 @@ impl Drop for ProjectAndAgentInfo {
             self.project_id
         );
     }
-}
-
-/// Agent 状态查询响应
-#[derive(Debug, Clone, serde::Serialize, ToSchema)]
-pub struct AgentStatusResponse {
-    /// 项目ID
-    #[schema(example = "test_project")]
-    pub project_id: String,
-    /// Agent 是否存活
-    #[schema(example = true)]
-    pub is_alive: bool,
-    /// 会话ID（仅当 is_alive 为 true 时存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "session123")]
-    pub session_id: Option<String>,
-    /// Agent 服务状态（仅当 is_alive 为 true 时存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<AgentStatus>,
-    /// 最后活动时间（仅当 is_alive 为 true 时存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "2024-01-01T12:00:00Z")]
-    pub last_activity: Option<DateTime<Utc>>,
-    /// 创建时间（仅当 is_alive 为 true 时存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "2024-01-01T10:00:00Z")]
-    pub created_at: Option<DateTime<Utc>>,
-    /// 模型提供商安全信息（仅当 is_alive 为 true 时存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_provider: Option<ModelProviderSafeInfo>,
 }

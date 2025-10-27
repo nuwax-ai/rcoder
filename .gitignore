@@ -2,11 +2,3 @@
 /tmp
 /other
 .idea
-
-logs
-.classpath
-project_workspace
-.settings
-.checkstyle
-.checkstyle_suppressions.xml
-.DS_Store

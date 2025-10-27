@@ -9,8 +9,9 @@ use agent_client_protocol::{
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use std::path::Path;
+use tracing::{debug, warn};
 
-use crate::model::{Attachment, AttachmentSource};
+use crate::model::{Attachment, AttachmentError, AttachmentSource};
 
 /// Content Builder - 将附件转换为 ACP ContentBlock
 pub struct ContentBuilder;
@@ -20,7 +21,7 @@ impl ContentBuilder {
     pub async fn attachment_to_content_block(
         attachment: &Attachment,
         project_path: &std::path::Path,
-    ) -> Result<Option<ContentBlock>> {
+    ) -> Result<ContentBlock> {
         match attachment {
             Attachment::Text(text_attachment) => {
                 Self::text_to_content_block(text_attachment, project_path).await
@@ -38,7 +39,6 @@ impl ContentBuilder {
     }
 
     /// 将多个附件转换为 ContentBlock 列表
-    /// 文件不存在或无法读取的附件会被静默忽略
     pub async fn attachments_to_content_blocks(
         attachments: &[Attachment],
         project_path: &std::path::Path,
@@ -46,73 +46,31 @@ impl ContentBuilder {
         let mut content_blocks = Vec::new();
 
         for attachment in attachments {
-            match Self::attachment_to_content_block(attachment, project_path).await {
-                Ok(Some(content_block)) => {
-                    content_blocks.push(content_block);
-                }
-                Ok(None) => {
-                    // 文件不存在或无法读取，静默忽略
-                    tracing::warn!(
-                        "⚠️ 附件无法加载，已忽略: attachment_id={}",
+            let content_block = Self::attachment_to_content_block(attachment, project_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to convert attachment {} to content block",
                         attachment.id()
-                    );
-                }
-                Err(e) => {
-                    // 其他错误（如网络错误），记录警告但继续处理
-                    tracing::warn!(
-                        "⚠️ 附件转换失败，已忽略: attachment_id={}, error={:?}",
-                        attachment.id(),
-                        e
-                    );
-                }
-            }
+                    )
+                })?;
+            content_blocks.push(content_block);
         }
 
         Ok(content_blocks)
     }
 
     /// 文本附件转换为 ContentBlock
-    /// 如果文件不存在或是压缩文件，返回 Ok(None)
     async fn text_to_content_block(
         text_attachment: &crate::model::TextAttachment,
         project_path: &std::path::Path,
-    ) -> Result<Option<ContentBlock>> {
+    ) -> Result<ContentBlock> {
         let text_content = match &text_attachment.source {
             AttachmentSource::FilePath { path } => {
                 let file_path = project_path.join(path);
-                
-                // 检查文件是否存在
-                if !file_path.exists() {
-                    tracing::warn!(
-                        "⚠️ 附件文件不存在，已忽略: {:?}",
-                        file_path
-                    );
-                    return Ok(None);
-                }
-                
-                // 检查是否为二进制文件（常见压缩格式）
-                if let Some(ext) = file_path.extension() {
-                    let ext_str = ext.to_string_lossy().to_lowercase();
-                    if matches!(ext_str.as_str(), "gz" | "zip" | "tar" | "bz2" | "xz" | "7z" | "rar") {
-                        tracing::warn!(
-                            "⚠️ 不支持压缩文件作为 Text 附件，已忽略: {:?}（文件扩展名: {}）",
-                            file_path, ext_str
-                        );
-                        return Ok(None);
-                    }
-                }
-                
-                // 尝试读取文本文件
-                let text = match tokio::fs::read_to_string(&file_path).await {
-                    Ok(text) => text,
-                    Err(e) => {
-                        tracing::warn!(
-                            "⚠️ 无法读取文本文件，已忽略: {:?}，错误: {}（可能是二进制文件或编码不是 UTF-8）",
-                            file_path, e
-                        );
-                        return Ok(None);
-                    }
-                };
+                let text = tokio::fs::read_to_string(&file_path)
+                    .await
+                    .with_context(|| format!("Failed to read text file: {:?}", file_path))?;
 
                 TextContent {
                     text,
@@ -142,33 +100,20 @@ impl ContentBuilder {
             }
         };
 
-        Ok(Some(ContentBlock::Text(text_content)))
+        Ok(ContentBlock::Text(text_content))
     }
 
     /// 图像附件转换为 ContentBlock
-    /// 如果文件不存在，返回 Ok(None)
     async fn image_to_content_block(
         image_attachment: &crate::model::ImageAttachment,
         project_path: &std::path::Path,
-    ) -> Result<Option<ContentBlock>> {
+    ) -> Result<ContentBlock> {
         let (data, uri) = match &image_attachment.source {
             AttachmentSource::FilePath { path } => {
                 let file_path = project_path.join(path);
-                
-                // 检查文件是否存在
-                if !file_path.exists() {
-                    tracing::warn!("⚠️ 图像文件不存在，已忽略: {:?}", file_path);
-                    return Ok(None);
-                }
-                
-                // 尝试读取文件
-                let data = match tokio::fs::read(&file_path).await {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!("⚠️ 无法读取图像文件，已忽略: {:?}，错误: {}", file_path, e);
-                        return Ok(None);
-                    }
-                };
+                let data = tokio::fs::read(&file_path)
+                    .await
+                    .with_context(|| format!("Failed to read image file: {:?}", file_path))?;
                 let base64_data = general_purpose::STANDARD.encode(data);
                 let uri = file_path.to_string_lossy().to_string();
                 (base64_data, Some(uri))
@@ -183,39 +128,26 @@ impl ContentBuilder {
             }
         };
 
-        Ok(Some(ContentBlock::Image(ImageContent {
+        Ok(ContentBlock::Image(ImageContent {
             data,
             mime_type: image_attachment.mime_type.clone(),
             uri,
             annotations: None,
             meta: None,
-        })))
+        }))
     }
 
     /// 音频附件转换为 ContentBlock
-    /// 如果文件不存在，返回 Ok(None)
     async fn audio_to_content_block(
         audio_attachment: &crate::model::AudioAttachment,
         project_path: &std::path::Path,
-    ) -> Result<Option<ContentBlock>> {
+    ) -> Result<ContentBlock> {
         let data = match &audio_attachment.source {
             AttachmentSource::FilePath { path } => {
                 let file_path = project_path.join(path);
-                
-                // 检查文件是否存在
-                if !file_path.exists() {
-                    tracing::warn!("⚠️ 音频文件不存在，已忽略: {:?}", file_path);
-                    return Ok(None);
-                }
-                
-                // 尝试读取文件
-                let data = match tokio::fs::read(&file_path).await {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!("⚠️ 无法读取音频文件，已忽略: {:?}，错误: {}", file_path, e);
-                        return Ok(None);
-                    }
-                };
+                let data = tokio::fs::read(&file_path)
+                    .await
+                    .with_context(|| format!("Failed to read audio file: {:?}", file_path))?;
                 general_purpose::STANDARD.encode(data)
             }
             AttachmentSource::Base64 { data, .. } => data.clone(),
@@ -227,36 +159,28 @@ impl ContentBuilder {
             }
         };
 
-        Ok(Some(ContentBlock::Audio(AudioContent {
+        Ok(ContentBlock::Audio(AudioContent {
             data,
             mime_type: audio_attachment.mime_type.clone(),
             annotations: None,
             meta: None,
-        })))
+        }))
     }
 
     /// 文档附件转换为 ContentBlock
-    /// 如果文件不存在，返回 Ok(None)
     async fn document_to_content_block(
         document_attachment: &crate::model::DocumentAttachment,
         project_path: &std::path::Path,
-    ) -> Result<Option<ContentBlock>> {
+    ) -> Result<ContentBlock> {
         match &document_attachment.source {
             AttachmentSource::FilePath { path } => {
                 let file_path = project_path.join(path);
-                
-                // 检查文件是否存在
-                if !file_path.exists() {
-                    tracing::warn!("⚠️ 文档文件不存在，已忽略: {:?}", file_path);
-                    return Ok(None);
-                }
-                
                 let uri = file_path.to_string_lossy().to_string();
 
                 // 尝试读取为文本，如果失败则作为二进制处理
                 if document_attachment.mime_type.starts_with("text/") {
                     match tokio::fs::read_to_string(&file_path).await {
-                        Ok(text) => Ok(Some(ContentBlock::Resource(EmbeddedResource {
+                        Ok(text) => Ok(ContentBlock::Resource(EmbeddedResource {
                             resource: EmbeddedResourceResource::TextResourceContents(
                                 TextResourceContents {
                                     mime_type: Some(document_attachment.mime_type.clone()),
@@ -267,7 +191,7 @@ impl ContentBuilder {
                             ),
                             annotations: None,
                             meta: None,
-                        }))),
+                        })),
                         Err(_) => {
                             // 文本读取失败，尝试作为二进制处理
                             Self::handle_binary_document(
@@ -288,7 +212,7 @@ impl ContentBuilder {
 
                 if mime_type.starts_with("text/") {
                     match String::from_utf8(general_purpose::STANDARD.decode(data)?) {
-                        Ok(text) => Ok(Some(ContentBlock::Resource(EmbeddedResource {
+                        Ok(text) => Ok(ContentBlock::Resource(EmbeddedResource {
                             resource: EmbeddedResourceResource::TextResourceContents(
                                 TextResourceContents {
                                     mime_type: Some(mime_type.clone()),
@@ -299,10 +223,10 @@ impl ContentBuilder {
                             ),
                             annotations: None,
                             meta: None,
-                        }))),
+                        })),
                         Err(_) => {
                             // 文本解码失败，作为二进制处理
-                            Ok(Some(ContentBlock::Resource(EmbeddedResource {
+                            Ok(ContentBlock::Resource(EmbeddedResource {
                                 resource: EmbeddedResourceResource::BlobResourceContents(
                                     BlobResourceContents {
                                         blob: data.clone(),
@@ -313,11 +237,11 @@ impl ContentBuilder {
                                 ),
                                 annotations: None,
                                 meta: None,
-                            })))
+                            }))
                         }
                     }
                 } else {
-                    Ok(Some(ContentBlock::Resource(EmbeddedResource {
+                    Ok(ContentBlock::Resource(EmbeddedResource {
                         resource: EmbeddedResourceResource::BlobResourceContents(
                             BlobResourceContents {
                                 blob: data.clone(),
@@ -328,12 +252,12 @@ impl ContentBuilder {
                         ),
                         annotations: None,
                         meta: None,
-                    })))
+                    }))
                 }
             }
             AttachmentSource::Url { url } => {
                 // URL 资源作为 ResourceLink 处理
-                Ok(Some(ContentBlock::ResourceLink(ResourceLink {
+                Ok(ContentBlock::ResourceLink(ResourceLink {
                     name: document_attachment
                         .filename
                         .clone()
@@ -345,28 +269,23 @@ impl ContentBuilder {
                     title: document_attachment.filename.clone(),
                     annotations: None,
                     meta: None,
-                })))
+                }))
             }
         }
     }
 
     /// 处理二进制文档
-    /// 如果文件无法读取，返回 Ok(None)
     async fn handle_binary_document(
         file_path: &Path,
         mime_type: &str,
         uri: &str,
-    ) -> Result<Option<ContentBlock>> {
-        let data = match tokio::fs::read(file_path).await {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::warn!("⚠️ 无法读取二进制文档，已忽略: {:?}，错误: {}", file_path, e);
-                return Ok(None);
-            }
-        };
+    ) -> Result<ContentBlock> {
+        let data = tokio::fs::read(file_path)
+            .await
+            .with_context(|| format!("Failed to read binary document: {:?}", file_path))?;
         let blob = general_purpose::STANDARD.encode(data);
 
-        Ok(Some(ContentBlock::Resource(EmbeddedResource {
+        Ok(ContentBlock::Resource(EmbeddedResource {
             resource: EmbeddedResourceResource::BlobResourceContents(BlobResourceContents {
                 blob,
                 mime_type: Some(mime_type.to_string()),
@@ -375,7 +294,7 @@ impl ContentBuilder {
             }),
             annotations: None,
             meta: None,
-        })))
+        }))
     }
 
     /// 从文件扩展名推断 MIME 类型

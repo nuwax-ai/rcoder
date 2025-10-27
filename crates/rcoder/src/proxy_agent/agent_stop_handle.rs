@@ -16,7 +16,7 @@ use crate::model::AgentType;
 use agent_client_protocol::{ClientSideConnection, SessionId};
 
 /// Agent生命周期守卫
-///
+/// 
 /// 遵循RAII原则，当守卫被drop时自动清理agent资源
 pub struct AgentLifecycleGuard {
     inner: Arc<AgentLifecycleInner>,
@@ -37,14 +37,7 @@ enum AgentResources {
         child_process: Arc<Mutex<Option<tokio::process::Child>>>,
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     },
-    /// Codex 子进程模式（与 Claude 类似）
-    CodexSubProcess {
-        child_process: Arc<Mutex<Option<tokio::process::Child>>>,
-        stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-    },
-    /// Codex 嵌入式模式（已废弃，官方不支持）
-    #[allow(dead_code)]
-    CodexEmbedded {
+    Codex {
         client_conn: Arc<ClientSideConnection>,
         io_tasks: Arc<Mutex<Vec<JoinHandle<Result<(), anyhow::Error>>>>>,
         channel_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -77,34 +70,8 @@ impl AgentLifecycleGuard {
         Self { inner }
     }
 
-    /// 为Codex Agent创建生命周期守卫（子进程模式）
+    /// 为Codex Agent创建生命周期守卫
     pub fn new_codex(
-        project_id: String,
-        session_id: SessionId,
-        child_process: tokio::process::Child,
-        stderr_task: JoinHandle<()>,
-        cancel_token: CancellationToken,
-    ) -> Self {
-        let resources = AgentResources::CodexSubProcess {
-            child_process: Arc::new(Mutex::new(Some(child_process))),
-            stderr_task: Arc::new(Mutex::new(Some(stderr_task))),
-        };
-
-        let inner = Arc::new(AgentLifecycleInner {
-            agent_type: AgentType::Codex,
-            project_id,
-            session_id,
-            cancel_token,
-            resources,
-            stopped: AtomicBool::new(false),
-        });
-
-        Self { inner }
-    }
-
-    /// 为Codex Agent创建生命周期守卫（嵌入式模式，已废弃）
-    #[allow(dead_code)]
-    pub fn new_codex_embedded(
         project_id: String,
         session_id: SessionId,
         client_conn: Arc<ClientSideConnection>,
@@ -112,7 +79,7 @@ impl AgentLifecycleGuard {
         channel_tasks: Vec<JoinHandle<()>>,
         cancel_token: CancellationToken,
     ) -> Self {
-        let resources = AgentResources::CodexEmbedded {
+        let resources = AgentResources::Codex {
             client_conn,
             io_tasks: Arc::new(Mutex::new(io_tasks)),
             channel_tasks: Arc::new(Mutex::new(channel_tasks)),
@@ -143,7 +110,9 @@ impl AgentLifecycleGuard {
 
         info!(
             "[{}] 开始优雅停止agent: {} (session: {})",
-            agent_name, self.inner.project_id, self.inner.session_id.0
+            agent_name,
+            self.inner.project_id,
+            self.inner.session_id.0
         );
 
         // 1. 发送取消信号
@@ -157,7 +126,8 @@ impl AgentLifecycleGuard {
 
         info!(
             "[{}] agent优雅停止完成: {}",
-            agent_name, self.inner.project_id
+            agent_name,
+            self.inner.project_id
         );
 
         Ok(())
@@ -166,40 +136,20 @@ impl AgentLifecycleGuard {
     /// 强制清理资源
     async fn force_cleanup(&self) -> Result<()> {
         match &self.inner.resources {
-            AgentResources::Claude {
-                child_process,
-                stderr_task,
-            } => {
+            AgentResources::Claude { child_process, stderr_task } => {
                 // 停止stderr任务
                 if let Some(task) = stderr_task.lock().await.take() {
                     task.abort();
                 }
 
                 // 终止子进程
-                if let Some(mut child) = child_process.lock().await.take()
-                    && let Err(e) = child.kill().await
-                {
-                    warn!("终止Claude子进程失败: {}", e);
-                }
-            }
-            AgentResources::CodexSubProcess {
-                child_process,
-                stderr_task,
-            } => {
-                // 停止stderr任务
-                if let Some(task) = stderr_task.lock().await.take() {
-                    task.abort();
-                }
-                // 杀死子进程
                 if let Some(mut child) = child_process.lock().await.take() {
-                    let _ = child.kill().await;
+                    if let Err(e) = child.kill().await {
+                        warn!("终止Claude子进程失败: {}", e);
+                    }
                 }
             }
-            AgentResources::CodexEmbedded {
-                io_tasks,
-                channel_tasks,
-                ..
-            } => {
+            AgentResources::Codex { io_tasks, channel_tasks, .. } => {
                 // 取消所有任务
                 for task in io_tasks.lock().await.drain(..) {
                     task.abort();
@@ -221,7 +171,9 @@ impl AgentLifecycleGuard {
             };
             info!(
                 "[{}] 发送取消信号: {} (session: {})",
-                agent_name, self.inner.project_id, self.inner.session_id.0
+                agent_name,
+                self.inner.project_id,
+                self.inner.session_id.0
             );
             self.inner.cancel_token.cancel();
         }
@@ -259,54 +211,46 @@ impl Clone for AgentLifecycleGuard {
 impl Drop for AgentLifecycleGuard {
     fn drop(&mut self) {
         // 只有最后一个引用被drop时才执行清理
-        if Arc::strong_count(&self.inner) == 1 && !self.inner.stopped.load(Ordering::SeqCst) {
-            let agent_name = match self.inner.agent_type {
-                AgentType::Claude => "Claude",
-                AgentType::Codex => "Codex",
-            };
-            info!(
-                "[{}] AgentLifecycleGuard被drop，清理资源: {}",
-                agent_name, self.inner.project_id
-            );
+        if Arc::strong_count(&self.inner) == 1 {
+            if !self.inner.stopped.load(Ordering::SeqCst) {
+                let agent_name = match self.inner.agent_type {
+                    AgentType::Claude => "Claude",
+                    AgentType::Codex => "Codex",
+                };
+                info!(
+                    "[{}] AgentLifecycleGuard被drop，清理资源: {}",
+                    agent_name,
+                    self.inner.project_id
+                );
 
-            // 发送取消信号
-            self.inner.cancel_token.cancel();
+                // 发送取消信号
+                self.inner.cancel_token.cancel();
 
-            // 同步清理关键资源
-            match &self.inner.resources {
-                AgentResources::Claude { child_process, .. } => {
-                    if let Ok(mut child_guard) = child_process.try_lock()
-                        && let Some(mut child) = child_guard.take()
-                    {
-                        let _ = child.start_kill();
-                    }
-                }
-                AgentResources::CodexSubProcess { child_process, .. } => {
-                    if let Ok(mut child_guard) = child_process.try_lock()
-                        && let Some(mut child) = child_guard.take()
-                    {
-                        let _ = child.start_kill();
-                    }
-                }
-                AgentResources::CodexEmbedded {
-                    io_tasks,
-                    channel_tasks,
-                    ..
-                } => {
-                    if let Ok(mut tasks) = io_tasks.try_lock() {
-                        for task in tasks.drain(..) {
-                            task.abort();
+                // 同步清理关键资源
+                match &self.inner.resources {
+                    AgentResources::Claude { child_process, .. } => {
+                        if let Ok(mut child_guard) = child_process.try_lock() {
+                            if let Some(mut child) = child_guard.take() {
+                                let _ = child.start_kill();
+                            }
                         }
                     }
-                    if let Ok(mut tasks) = channel_tasks.try_lock() {
-                        for task in tasks.drain(..) {
-                            task.abort();
+                    AgentResources::Codex { io_tasks, channel_tasks, .. } => {
+                        if let Ok(mut tasks) = io_tasks.try_lock() {
+                            for task in tasks.drain(..) {
+                                task.abort();
+                            }
+                        }
+                        if let Ok(mut tasks) = channel_tasks.try_lock() {
+                            for task in tasks.drain(..) {
+                                task.abort();
+                            }
                         }
                     }
                 }
+
+                self.inner.stopped.store(true, Ordering::SeqCst);
             }
-
-            self.inner.stopped.store(true, Ordering::SeqCst);
         }
     }
 }
