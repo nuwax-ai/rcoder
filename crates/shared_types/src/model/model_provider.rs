@@ -1,7 +1,6 @@
-
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use std::str::FromStr;
+use utoipa::ToSchema;
 
 /// 模型接口协议类型
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -26,7 +25,7 @@ impl FromStr for ModelApiProtocol {
         match s.to_lowercase().as_str() {
             "anthropic" => Ok(ModelApiProtocol::Anthropic),
             "openai" => Ok(ModelApiProtocol::OpenAI),
-            _ => Ok(ModelApiProtocol::OpenAI), // 未知协议默认为 OpenAI
+            _ => Ok(ModelApiProtocol::Anthropic), // 未知协议默认为 Anthropic
         }
     }
 }
@@ -34,8 +33,8 @@ impl FromStr for ModelApiProtocol {
 impl ToString for ModelApiProtocol {
     fn to_string(&self) -> String {
         match self {
-            ModelApiProtocol::Anthropic => "anthropic".to_string(),
-            ModelApiProtocol::OpenAI => "openai".to_string(),
+            ModelApiProtocol::Anthropic => "Anthropic".to_string(),
+            ModelApiProtocol::OpenAI => "Openai".to_string(),
         }
     }
 }
@@ -75,4 +74,31 @@ impl ModelProviderConfig {
             .map(|s| ModelApiProtocol::from_str(s).unwrap_or_default())
             .unwrap_or_default()
     }
+
+    /// 转换为安全的公开信息（不包含敏感字段）
+    pub fn to_safe_info(&self) -> ModelProviderSafeInfo {
+        ModelProviderSafeInfo {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            api_protocol: self.get_api_protocol(),
+            default_model: self.default_model.clone(),
+        }
+    }
+}
+
+/// 模型提供商安全信息（不包含敏感字段）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelProviderSafeInfo {
+    /// 模型id
+    #[schema(example = "id")]
+    pub id: String,
+    /// 提供商名称
+    #[schema(example = "openai")]
+    pub name: String,
+    /// 模型接口协议类型
+    #[schema(example = "openai")]
+    pub api_protocol: ModelApiProtocol,
+    /// 默认模型名称
+    #[schema(example = "gpt-4")]
+    pub default_model: String,
 }

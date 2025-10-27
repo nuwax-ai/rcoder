@@ -17,18 +17,16 @@ pub struct ChatPrompt {
     /// 可选的附件列表
     #[builder(default)]
     pub attachments: Vec<Attachment>,
+    /// 数据源附件列表 - 用于AI开发时获取外部数据源信息（如API接口、数据库等）
+    /// 直接传递 JSON 字符串数组，简化使用方式
+    #[builder(default)]
+    pub data_source_attachments: Vec<String>,
     /// agent 类型
     #[builder(default)]
     pub agent_type: AgentType,
     /// 可选的请求ID，用于标识和追踪请求
     #[builder(default)]
     pub request_id: Option<String>,
-    /// 可选的 Context7 API 密钥，如果提供会启用 Context7 MCP 服务
-    #[builder(default)]
-    pub context7_api_key: Option<String>,
-    /// 是否使用简化提示词（默认为 false，使用完整系统提示词）
-    #[builder(default)]
-    pub use_simple_prompt: bool,
 }
 
 /// 返回用户 prompt 的提示,一定有project_id ,session_id ,否则报错
@@ -38,4 +36,6 @@ pub struct ChatPromptResponse {
     pub project_id: String,
     /// agent 的会话ID ,可能没有,如果没有,agent使用自动创建会话,返回会话id
     pub session_id: String,
+    /// 错误信息，如果有的话
+    pub error: Option<String>,
 }

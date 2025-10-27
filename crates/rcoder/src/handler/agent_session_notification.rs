@@ -7,12 +7,11 @@ use axum::{
     extract::Path,
     response::sse::{Event, Sse},
 };
-use futures::stream::{self, Stream};
+use futures::stream::Stream;
+use serde::Deserialize;
 use serde::Serialize;
 use std::{convert::Infallible, time::Duration};
-use tokio::time::sleep;
 use tracing::{debug, info};
-use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 
 /// SSE 事件响应结构
@@ -357,54 +356,128 @@ pub struct SessionNotificationParams {
 pub async fn agent_session_notification(
     Path(params): Path<SessionNotificationParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    info!("🔌 SSE连接建立: session_id={}", params.session_id);
+    let sse_start = std::time::Instant::now();
+    info!("⏱️ [SSE] 开始建立连接: session_id={}", params.session_id);
+
+    let session_id = params.session_id.clone();
+
+    // 🎯 直接创建全新的 SessionData，覆盖插入 SESSION_CACHE
+    // 这样确保每次 SSE 连接都是全新的开始，没有任何历史消息残留
+    let cache_start = std::time::Instant::now();
+    let session_data = crate::service::SessionData::new(1000);
+    SESSION_CACHE.insert(session_id.clone(), session_data.clone());
+    info!("⏱️ [SSE] 创建并插入新SessionData耗时: {:?}", cache_start.elapsed());
+
+    // 创建新连接
+    let connection_start = std::time::Instant::now();
+    let (mut rx, cancel_token) = session_data
+        .create_new_connection(1000)
+        .await
+        .map_err(AppError::from)?;
+    info!("⏱️ [SSE] create_new_connection耗时: {:?}", connection_start.elapsed());
+
+    info!("⏱️ [SSE] 总SSE连接建立耗时: {:?}", sse_start.elapsed());
+
+    let session_id_for_stream = session_id.clone();
 
     // 创建SSE流
-    let stream = stream::unfold(params.session_id.clone(), move |session_id| {
-        let session_id_clone = session_id.clone();
-        async move {
-            loop {
-                // 获取并清空该session的消息
-                let messages: Vec<UnifiedSessionMessage> = if let Some(session_data) = SESSION_CACHE.get(&session_id_clone) {
-                    session_data.drain_messages()
-                } else {
-                    Vec::new()
-                };
+    let stream = async_stream::stream! {
+        // 🎯 立即发送心跳消息，让前端知道连接已建立
+        let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id_for_stream.clone());
 
-                if !messages.is_empty() {
-                    debug!(
-                        "📤 推送 {} 条消息到 session: {}",
-                        messages.len(),
-                        session_id_clone
+        let heartbeat_event: Event = Event::default()
+            .event("heartbeat")
+            .data(serde_json::to_string(&heartbeat_msg).unwrap_or_else(|_| "{}".to_string()));
+
+        info!("💓 [SSE] 发送初始心跳消息: session_id={}", session_id_for_stream);
+        yield Ok(heartbeat_event);
+
+        // 心跳定时器（30秒）
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
+        // 跳过第一次立即触发
+        heartbeat_interval.tick().await;
+
+        loop {
+            tokio::select! {
+                // 监听取消令牌 - 当用户取消任务或新连接建立时立即退出
+                _ = cancel_token.cancelled() => {
+                    info!(
+                        "🔌 检测到连接被取消（新连接建立或用户主动取消），断开旧连接: session_id={}",
+                        session_id
                     );
+                    break;
+                }
 
-                    // 逐条发送消息
-                    for msg in messages {
-                        // 根据消息类型动态设置事件名称
-                        let event_name = match msg.message_type {
-                            crate::model::SessionMessageType::SessionPromptStart => "prompt_start",
-                            crate::model::SessionMessageType::SessionPromptEnd => "prompt_end",
-                            crate::model::SessionMessageType::AgentSessionUpdate => &msg.sub_type,
-                            crate::model::SessionMessageType::Heartbeat => "heartbeat",
-                        };
+                // 接收实时消息 - 当 channel 发送端被关闭时，recv() 会返回 None
+                msg = rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            // 🎯 极简设计：不需要版本检查，每次都是全新的 SessionData
+                            // 旧 SessionData 会自然失效，无需手动管理版本
 
-                        let event: Event = Event::default()
-                            .event(event_name)
-                            .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
+                            debug!(
+                                "📤 发送消息到 session: {}, type: {:?}",
+                                session_id_for_stream, msg.message_type
+                            );
 
-                        return Some((Ok(event), session_id_clone));
+                            // 根据消息类型动态设置事件名称
+                            let event_name = match msg.message_type {
+                                crate::model::SessionMessageType::SessionPromptStart => {
+                                    info!("📝 发送 prompt_start 消息到 session: {}", session_id_for_stream);
+                                    "prompt_start"
+                                }
+                                crate::model::SessionMessageType::SessionPromptEnd => {
+                                    info!(
+                                        "🎯 发送 prompt_end 消息到 session: {}, stop_reason: {:?}",
+                                        session_id_for_stream,
+                                        msg.data.get("reason")
+                                    );
+                                    "prompt_end"
+                                }
+                                crate::model::SessionMessageType::AgentSessionUpdate => {
+                                    debug!(
+                                        "🔄 发送 {} 消息到 session: {}",
+                                        msg.sub_type, session_id_for_stream
+                                    );
+                                    &msg.sub_type
+                                }
+                                crate::model::SessionMessageType::Heartbeat => "heartbeat",
+                            };
+
+                            let event: Event = Event::default()
+                                .event(event_name)
+                                .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
+
+                            yield Ok(event);
+                        }
+                        None => {
+                            info!(
+                                "🔌 检测到channel发送端已关闭，SSE连接自然断开: session_id={}",
+                                session_id_for_stream
+                            );
+                            break;
+                        }
                     }
                 }
 
-                // 没有消息，等待一段时间再检查
-                sleep(Duration::from_millis(100)).await;
+                // 心跳定时器 - 定期发送心跳事件到客户端
+                _ = heartbeat_interval.tick() => {
+                    // 🎯 极简设计：不需要版本检查，依赖 CancellationToken 自动断开旧连接
 
-                // 发送心跳保持连接（每30秒一次）
-                // 注意：这里简化处理，实际可以用更复杂的心跳逻辑
-                // 暂时通过定期重试来保持连接
+                    debug!("💓 发送心跳事件到 session: {}", session_id_for_stream);
+
+                    let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id_for_stream.clone());
+                    let event: Event = Event::default()
+                        .event("heartbeat")
+                        .data(serde_json::to_string(&heartbeat_msg).unwrap_or_else(|_| "{}".to_string()));
+
+                    yield Ok(event);
+                }
             }
         }
-    });
+
+        info!("🔌 SSE连接正常关闭: session_id={}", session_id_for_stream);
+    };
 
     Ok(Sse::new(stream))
 }

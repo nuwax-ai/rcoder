@@ -2,20 +2,19 @@
 //!
 //! 通过ACP协议的CancelNotification来取消指定session的agent任务执行
 
-use axum::{
-    extract::{Path, Query},
-    response::Json,
-};
+use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use agent_client_protocol::{CancelNotification, SessionId};
 
-use crate::{model::AppError, model::HttpResult};
-use crate::{CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP};
+use crate::{
+    CancelNotificationRequest, proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
+};
+use crate::{model::AppError, model::HttpResult, router::AppState};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]
@@ -108,6 +107,7 @@ pub struct CancelResponse {
     description = "通过ACP协议发送取消通知，停止指定会话的AI代理任务执行"
 )]
 pub async fn agent_session_cancel(
+    State(_state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     info!(
@@ -138,6 +138,10 @@ pub async fn agent_session_cancel(
         Some(project_info) => {
             debug!("🔍 查找session: {} 对应的agent连接", session_id);
 
+            // 🎯 极简设计：不再需要取消标记，直接发送取消通知
+            // Agent 消息会自动路由到最新的 SessionData
+
+            // 🔄 修复竞争条件：先发送取消通知，等待Agent完成取消后再清空缓存
             // 通过cancel_tx发送取消通知
             project_info
                 .cancel_tx
@@ -145,27 +149,61 @@ pub async fn agent_session_cancel(
                 .map_err(|e| anyhow::anyhow!("发送取消通知失败: {}", e))?;
 
             // 等待取消通知响应
+            info!("📡 [agent_cancel_handler] 等待Agent取消响应: session_id={}", session_id);
             match rx.await {
                 Ok(cancel_notification_response) => {
+                    info!("✅ [agent_cancel_handler] 收到Agent取消响应: session_id={}, success={}", session_id, cancel_notification_response.success);
                     if cancel_notification_response.success {
+                        // 🧹 彻底清空该 session，避免阻塞
+                        // 先主动关闭 SSE 连接，再移除 SESSION_CACHE 条目
+                        if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
+                            info!("🔌 [agent_cancel_handler] Agent取消成功，主动关闭SSE连接: session_id={}", session_id);
+                            session_data.close_current_connection();
+                        }
+
+                        if crate::service::SESSION_CACHE.remove(&session_id).is_some() {
+                            info!("🗑️ Agent取消成功，移除 SESSION_CACHE 条目: session_id={}", session_id);
+                        }
+
                         Ok(HttpResult::success(CancelResponse {
                             success: true,
-                            session_id: session_id,
+                            session_id,
                         }))
                     } else {
+                        // 🎯 极简设计：取消失败时不需要重置标记，Agent 消息自然路由
                         Ok(HttpResult::error("0001", "停止智能体执行失败"))
                     }
                 }
-                Err(e) => Err(AppError::AnyhowError(anyhow::anyhow!(
-                    "停止智能体执行失败: {}",
-                    e
-                ))),
+                Err(e) => {
+                    error!("❌ [agent_cancel_handler] 等待Agent取消响应失败: session_id={}, error={:?}", session_id, e);
+                    // 🎯 极简设计：取消过程出错时不需要重置标记
+                    Err(AppError::AnyhowError(anyhow::anyhow!(
+                        "停止智能体执行失败: {}",
+                        e
+                    )))
+                }
             }
         }
         None => {
-            error!("❌ 未找到project_id: {} 对应的活跃连接", project_id);
+            warn!(
+                "❌ 未找到project_id: {} 对应的活跃连接,无需取消agent当前任务",
+                project_id
+            );
 
-            Ok(HttpResult::error("0001", "未找到project_id对应的活跃连接"))
+            // 🎯 极简设计：没有找到活跃连接时，主动关闭 SSE 连接并清空 SESSION_CACHE
+            if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {
+                info!("🔌 [agent_cancel] 未找到活跃连接，主动关闭SSE连接: session_id={}, project_id={}", session_id, project_id);
+                session_data.close_current_connection();
+            }
+
+            if crate::service::SESSION_CACHE.remove(&session_id).is_some() {
+                info!("🗑️ [agent_cancel] 未找到活跃连接，已清空 SESSION_CACHE: session_id={}, project_id={}", session_id, project_id);
+            }
+
+            Ok(HttpResult::success(CancelResponse {
+                success: true,
+                session_id,
+            }))
         }
     }
 }
