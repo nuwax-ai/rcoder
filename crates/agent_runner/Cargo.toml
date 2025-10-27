@@ -1,0 +1,77 @@
+[package]
+name = "agent_runner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "agent_runner"
+path = "src/lib.rs"
+
+[dependencies]
+# Internal crates
+shared_types = { path = "../shared_types" }
+acp-adapter = { path = "../acp_adapter" }
+codex-acp-agent = { path = "../codex-acp-agent" }
+codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
+codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+claude-code-agent = { path = "../claude-code-agent" }
+pingora-proxy = { path = "../pingora-proxy" }
+
+# codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
+
+clap ={workspace = true}
+# ACP Protocol
+agent-client-protocol = { workspace = true }
+async-trait = "0.1"
+parking_lot = "0.12"
+tempfile = { workspace = true }
+
+# HTTP server
+axum = { workspace = true, features = ["multipart"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+futures = { workspace = true }
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+
+derive_builder= { workspace = true }
+
+# Workspace dependencies
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
+tracing-appender = "0.2"
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true }
+bytes = "1.0"
+futures-util = { workspace = true }
+piper = "0.2"
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
+
+# OpenTelemetry
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+axum-tracing-opentelemetry = { workspace = true }
+
+# File system
+tokio-fs = { workspace = true }
+path-clean = { workspace = true }
+
+# OpenAPI documentation
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+
+ringbuf={workspace = true}

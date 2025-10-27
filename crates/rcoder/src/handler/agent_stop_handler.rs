@@ -1,12 +1,17 @@
-use axum::{extract::Query};
+//! Agent任务停止处理器
+//!
+//! 转发停止请求到容器内的 agent_runner 服务
+
+use axum::extract::{Path, Query, State};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tracing::{info, warn, debug};
-use utoipa::{ToSchema, IntoParams};
+use std::sync::Arc;
+use tracing::{debug, error, info, instrument};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    model::{AppError, HttpResult},
-    proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
+    AgentStatusResponse, AppError, HttpResult, proxy_agent::docker_container_agent,
+    router::AppState,
 };
 
 /// 停止Agent请求参数
@@ -18,11 +23,12 @@ pub struct StopAgentQuery {
 }
 
 /// 停止Agent响应
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StopAgentResponse {
     /// 是否成功停止
     pub success: bool,
     /// 项目ID
+    #[schema(example = "test_project")]
     pub project_id: String,
     /// 会话ID（如果存在）
     pub session_id: Option<String>,
@@ -30,10 +36,100 @@ pub struct StopAgentResponse {
     pub message: String,
 }
 
+/// 直接销毁指定项目对应的容器
+async fn destroy_container_for_project(
+    state: &Arc<AppState>,
+    project_id: &str,
+) -> Result<HttpResult<StopAgentResponse>, AppError> {
+    info!("🔥 [STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
+
+    // 使用全局 DockerManager
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [STOP_DESTROY] 获取全局 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+        })?;
+
+    // 尝试通过多种方式查找容器
+    // 1. 先通过 project_id 查找
+    let mut container_info = docker_manager.get_container_info(project_id);
+
+    // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
+    if container_info.is_none() {
+        let expected_container_name = format!("rcoder-agent-{}", project_id);
+        info!(
+            "🔍 [STOP_DESTROY] 通过 project_id 未找到，尝试通过容器名称查找: {}",
+            expected_container_name
+        );
+
+        // 使用新的查找函数
+        container_info = docker_manager
+            .find_container_by_identifier(&expected_container_name)
+            .await;
+    }
+
+    if let Some(container_info) = container_info {
+        info!(
+            "🎯 [STOP_DESTROY] 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
+            project_id, container_info.container_id, container_info.container_name
+        );
+
+        // 停止容器
+        let stop_result = docker_manager
+            .stop_container_by_id(&container_info.container_id)
+            .await;
+
+        if let Err(e) = stop_result {
+            error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
+            return Ok(HttpResult::error(
+                "STOP001",
+                &format!("停止容器失败: {}", e),
+            ));
+        }
+
+        // 从 Agent 映射中移除（如果 project_id 不是 "unknown"）
+        if container_info.project_id != "unknown" {
+            state
+                .project_and_agent_map
+                .remove(&container_info.project_id);
+        }
+
+        info!(
+            "✅ [STOP_DESTROY] 容器销毁成功: project_id={}, container_id={}, container_name={}",
+            project_id, container_info.container_id, container_info.container_name
+        );
+
+        let response = StopAgentResponse {
+            success: true,
+            project_id: project_id.to_string(),
+            session_id: Some(container_info.session_id),
+            message: "容器已成功销毁".to_string(),
+        };
+
+        Ok(HttpResult::success(response))
+    } else {
+        // 容器不存在，但返回成功
+        info!(
+            "📭 [STOP_DESTROY] 容器不存在，无需销毁: project_id={}",
+            project_id
+        );
+
+        let response = StopAgentResponse {
+            success: true,
+            project_id: project_id.to_string(),
+            session_id: None,
+            message: "容器不存在，无需销毁".to_string(),
+        };
+
+        Ok(HttpResult::success(response))
+    }
+}
+
+
 /// 停止指定项目的Agent服务
 ///
-/// 基于RAII原则，从PROJECT_AND_AGENT_INFO_MAP中移除对应project_id，
-/// AgentLifecycleGuard会自动完成所有资源清理
+/// 直接销毁 project_id 对应的容器，不向容器内的 agent_runner 发送消息
 #[utoipa::path(
     post,
     path = "/agent/stop",
@@ -43,30 +139,32 @@ pub struct StopAgentResponse {
     responses(
         (
             status = 200,
-            description = "成功停止Agent服务",
+            description = "成功销毁容器",
             body = HttpResult<StopAgentResponse>,
             example = json!({
                 "success": true,
                 "data": {
                     "success": true,
                     "project_id": "test_project",
-                    "session_id": "session123",
-                    "message": "Agent服务已成功停止"
+                    "session_id": null,
+                    "message": "容器已成功销毁"
                 },
                 "error": null
             })
         ),
         (
-            status = 404,
-            description = "未找到对应的Agent服务",
-            body = HttpResult<String>,
+            status = 200,
+            description = "容器不存在但返回成功",
+            body = HttpResult<StopAgentResponse>,
             example = json!({
-                "success": false,
-                "data": null,
-                "error": {
-                    "code": "AGENT_NOT_FOUND",
-                    "message": "No agent service found for the specified project_id"
-                }
+                "success": true,
+                "data": {
+                    "success": true,
+                    "project_id": "test_project",
+                    "session_id": null,
+                    "message": "容器不存在，无需销毁"
+                },
+                "error": null
             })
         ),
         (
@@ -81,18 +179,33 @@ pub struct StopAgentResponse {
                     "message": "Invalid project_id parameter"
                 }
             })
+        ),
+        (
+            status = 500,
+            description = "销毁容器失败",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "DESTROY_FAILED",
+                    "message": "Failed to destroy container"
+                }
+            })
         )
     ),
     tag = "agent",
     operation_id = "agent_stop",
-    summary = "停止Agent服务",
-    description = "停止指定项目的Agent服务，用于测试和管理。基于RAII原则自动清理所有相关资源。"
+    summary = "销毁Agent容器",
+    description = "直接销毁 project_id 对应的容器，不向容器内的 agent_runner 发送消息。如果容器不存在，也返回成功。"
 )]
+#[instrument(skip(state))]
 pub async fn agent_stop(
+    State(state): State<Arc<AppState>>,
     Query(query): Query<StopAgentQuery>,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     let project_id = query.project_id.trim();
-    
+
     if project_id.is_empty() {
         return Ok(HttpResult::error(
             "INVALID_PARAMS",
@@ -101,51 +214,28 @@ pub async fn agent_stop(
     }
 
     info!(
-        "🛑 收到停止Agent服务请求: project_id={}",
+        "🛑 [STOP_DESTROY] 收到销毁容器请求: project_id={}",
         project_id
     );
 
-    // 检查Agent是否存在
-    let agent_exists = PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id);
-    
-    if !agent_exists {
-        warn!("❌ 未找到Agent服务: project_id={}", project_id);
-        return Ok(HttpResult::error(
-            "AGENT_NOT_FOUND",
-            &format!("No agent service found for project_id: {}", project_id),
-        ));
-    }
+    // 直接销毁容器
+    let result = destroy_container_for_project(&state, project_id).await;
 
-    // 获取session_id（用于响应）
-    let session_id = PROJECT_AND_AGENT_INFO_MAP
-        .get(project_id)
-        .map(|info| info.session_id.0.to_string());
-
-    // 🎯 基于RAII原则：从MAP中移除，AgentLifecycleGuard自动清理资源
-    let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
-    
-    match removed {
-        Some(_) => {
-            info!(
-                "✅ Agent服务已成功停止: project_id={}, session_id={:?}",
-                project_id, session_id
+    match &result {
+        Ok(response) => {
+            if response.data.as_ref().unwrap().success {
+                info!("✅ [STOP_DESTROY] 容器销毁成功: project_id={}", project_id);
+            } else {
+                error!("❌ [STOP_DESTROY] 容器销毁失败: project_id={}", project_id);
+            }
+        }
+        Err(e) => {
+            error!(
+                "❌ [STOP_DESTROY] 销毁容器过程中出错: project_id={}, error={}",
+                project_id, e
             );
-            debug!("AgentLifecycleGuard将自动清理所有相关资源");
-            
-            Ok(HttpResult::success(StopAgentResponse {
-                success: true,
-                project_id: project_id.to_string(),
-                session_id,
-                message: "Agent服务已成功停止，所有资源已清理".to_string(),
-            }))
-        }
-        None => {
-            // 理论上不应该到这里，因为前面已经检查过存在性
-            warn!("⚠️ Agent服务已不存在: project_id={}", project_id);
-            Ok(HttpResult::error(
-                "AGENT_ALREADY_STOPPED",
-                &format!("Agent service for project_id {} was already stopped", project_id),
-            ))
         }
     }
+
+    result
 }
