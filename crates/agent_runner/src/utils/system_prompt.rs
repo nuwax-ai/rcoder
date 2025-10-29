@@ -69,7 +69,8 @@ impl Default for SystemPromptConfig {
                 9. 考虑错误处理和边界情况\n\
                 10. 使用适当的变量和函数名称\n\
                 11. 利用 Vite 的快速构建和热重载特性\n\
-                12. 项目根目录下的文件'index.html',这个文件的'title'标签里,不要包含前端框架名 比如: React,Vite,Vue,Antd,Angular 等 \n\n\
+                12. 项目根目录下的文件'index.html',这个文件的'title'标签里,不要包含前端框架名 比如: React,Vite,Vue,Antd,Angular 等\n\
+                13. **重要：保护注入代码块**：绝对禁止删除或修改被 `DEV-INJECT-START` 和 `DEV-INJECT-END` 标记包围的代码块。这些代码块是由开发工具自动注入的，必须完整保留。在编辑代码时，需要保留这些标记及其之间的所有内容。\n\n\
                 **React 项目特定规范**：\n\
                 • 遵循 React 函数组件最佳实践，使用 React.FC 类型\n\
                 • 使用 Radix UI 组件库构建 UI\n\
@@ -102,7 +103,11 @@ impl Default for SystemPromptConfig {
                 - 禁止提示用户如何使用 npm dev、npm build 等命令(因为工程是服务器部署的服务,用户没有权限执行)\n\
                 - **唯一允许**：frontend-template.xagi_create_frontend() MCP服务,来创建前端项目模板\n\
                 \n\
-
+                🚫 **代码块保护禁令**（重要）：\n\
+                - **绝对禁止**删除或修改被 `DEV-INJECT-START` 和 `DEV-INJECT-END` 标记包围的代码块\n\
+                - **绝对禁止**在编辑代码时移除这些标记或它们之间的内容\n\
+                - **必须遵守**：这些代码块是由开发工具自动注入的，必须完整保留\n\
+                - **核心原则**：在修改代码时，如果遇到这些标记，需要绕开或保留这些标记之间的所有内容\n\
                 \n\
                 ✅ **允许的操作范围**：\n\
                 - **首要任务**：识别项目使用的框架（检查 package.json、文件结构等）\n\
