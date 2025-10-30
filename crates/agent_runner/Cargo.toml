@@ -9,13 +9,15 @@ license.workspace = true
 name = "agent_runner"
 path = "src/lib.rs"
 
+[features]
+default = []
+codex = ["shared_types/codex", "dep:codex-acp-agent"]
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
 acp-adapter = { path = "../acp_adapter" }
-codex-acp-agent = { path = "../codex-acp-agent" }
-codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
-codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+codex-acp-agent = { path = "../codex-acp-agent", optional = true }
 claude-code-agent = { path = "../claude-code-agent" }
 pingora-proxy = { path = "../pingora-proxy" }
 

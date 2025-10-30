@@ -123,11 +123,13 @@ enum AgentResources {
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     },
     /// Codex 子进程模式（与 Claude 类似）
+    #[cfg(feature = "codex")]
     CodexSubProcess {
         child_process: Arc<Mutex<Option<tokio::process::Child>>>,
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     },
     /// Codex 嵌入式模式（已废弃，官方不支持）
+    #[cfg(feature = "codex")]
     #[allow(dead_code)]
     CodexEmbedded {
         client_conn: Arc<ClientSideConnection>,
@@ -163,6 +165,7 @@ impl AgentLifecycleGuard {
     }
 
     /// 为Codex Agent创建生命周期守卫（子进程模式）
+    #[cfg(feature = "codex")]
     pub fn new_codex(
         project_id: String,
         session_id: SessionId,
@@ -188,6 +191,7 @@ impl AgentLifecycleGuard {
     }
 
     /// 为Codex Agent创建生命周期守卫（嵌入式模式，已废弃）
+    #[cfg(feature = "codex")]
     #[allow(dead_code)]
     pub fn new_codex_embedded(
         project_id: String,
@@ -223,6 +227,7 @@ impl AgentLifecycleGuard {
 
         let agent_name = match self.inner.agent_type {
             AgentType::Claude => "Claude",
+            #[cfg(feature = "codex")]
             AgentType::Codex => "Codex",
         };
 
@@ -267,6 +272,7 @@ impl AgentLifecycleGuard {
                     warn!("终止Claude子进程失败: {}", e);
                 }
             }
+            #[cfg(feature = "codex")]
             AgentResources::CodexSubProcess {
                 child_process,
                 stderr_task,
@@ -280,6 +286,7 @@ impl AgentLifecycleGuard {
                     let _ = child.kill().await;
                 }
             }
+            #[cfg(feature = "codex")]
             AgentResources::CodexEmbedded {
                 io_tasks,
                 channel_tasks,
@@ -302,6 +309,7 @@ impl AgentLifecycleGuard {
         if !self.inner.cancel_token.is_cancelled() {
             let agent_name = match self.inner.agent_type {
                 AgentType::Claude => "Claude",
+                #[cfg(feature = "codex")]
                 AgentType::Codex => "Codex",
             };
             info!(
@@ -347,6 +355,7 @@ impl Drop for AgentLifecycleGuard {
         if Arc::strong_count(&self.inner) == 1 && !self.inner.stopped.load(Ordering::SeqCst) {
             let agent_name = match self.inner.agent_type {
                 AgentType::Claude => "Claude",
+                #[cfg(feature = "codex")]
                 AgentType::Codex => "Codex",
             };
             info!(
@@ -366,6 +375,7 @@ impl Drop for AgentLifecycleGuard {
                         let _ = child.start_kill();
                     }
                 }
+                #[cfg(feature = "codex")]
                 AgentResources::CodexSubProcess { child_process, .. } => {
                     if let Ok(mut child_guard) = child_process.try_lock()
                         && let Some(mut child) = child_guard.take()
@@ -373,6 +383,7 @@ impl Drop for AgentLifecycleGuard {
                         let _ = child.start_kill();
                     }
                 }
+                #[cfg(feature = "codex")]
                 AgentResources::CodexEmbedded {
                     io_tasks,
                     channel_tasks,

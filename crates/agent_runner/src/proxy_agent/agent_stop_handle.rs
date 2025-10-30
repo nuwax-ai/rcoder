@@ -39,11 +39,13 @@ enum AgentResources {
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     },
     /// Codex 子进程模式（与 Claude 类似）
+    #[cfg(feature = "codex")]
     CodexSubProcess {
         child_process: Arc<Mutex<Option<tokio::process::Child>>>,
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     },
     /// Codex 嵌入式模式（已废弃，官方不支持）
+    #[cfg(feature = "codex")]
     #[allow(dead_code)]
     CodexEmbedded {
         client_conn: Arc<ClientSideConnection>,
@@ -79,6 +81,7 @@ impl AgentLifecycleGuard {
     }
 
     /// 为Codex Agent创建生命周期守卫（子进程模式）
+    #[cfg(feature = "codex")]
     pub fn new_codex(
         project_id: String,
         session_id: SessionId,
@@ -104,6 +107,7 @@ impl AgentLifecycleGuard {
     }
 
     /// 为Codex Agent创建生命周期守卫（嵌入式模式，已废弃）
+    #[cfg(feature = "codex")]
     #[allow(dead_code)]
     pub fn new_codex_embedded(
         project_id: String,
@@ -142,6 +146,7 @@ impl AgentLifecycleGuard {
             "Gracefully stopping {} agent for project: {}",
             match self.inner.agent_type {
                 AgentType::Claude => "Claude",
+                #[cfg(feature = "codex")]
                 AgentType::Codex => "Codex",
             },
             self.inner.project_id
@@ -162,6 +167,7 @@ impl AgentLifecycleGuard {
                     }
                 }
             }
+            #[cfg(feature = "codex")]
             AgentResources::CodexSubProcess { child_process, .. } => {
                 let mut child_guard = child_process.lock().await;
                 if let Some(mut child) = child_guard.take() {
@@ -172,6 +178,7 @@ impl AgentLifecycleGuard {
                     }
                 }
             }
+            #[cfg(feature = "codex")]
             AgentResources::CodexEmbedded {
                 io_tasks,
                 channel_tasks,
@@ -230,6 +237,7 @@ impl Drop for AgentLifecycleGuard {
         if Arc::strong_count(&self.inner) == 1 && !self.inner.stopped.load(Ordering::SeqCst) {
             let agent_name = match self.inner.agent_type {
                 AgentType::Claude => "Claude",
+                #[cfg(feature = "codex")]
                 AgentType::Codex => "Codex",
             };
             info!(
@@ -249,6 +257,7 @@ impl Drop for AgentLifecycleGuard {
                         let _ = child.start_kill();
                     }
                 }
+                #[cfg(feature = "codex")]
                 AgentResources::CodexSubProcess { child_process, .. } => {
                     if let Ok(mut child_guard) = child_process.try_lock()
                         && let Some(mut child) = child_guard.take()
@@ -256,6 +265,7 @@ impl Drop for AgentLifecycleGuard {
                         let _ = child.start_kill();
                     }
                 }
+                #[cfg(feature = "codex")]
                 AgentResources::CodexEmbedded {
                     io_tasks,
                     channel_tasks,
@@ -281,10 +291,10 @@ impl Drop for AgentLifecycleGuard {
 
 // 为AgentLifecycleGuard实现AgentLifecycle trait
 impl AgentLifecycle for AgentLifecycleGuard {
-    fn graceful_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            AgentLifecycleGuard::graceful_stop(self).await
-        })
+    fn graceful_stop(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move { AgentLifecycleGuard::graceful_stop(self).await })
     }
 
     fn cancel(&self) {
@@ -302,6 +312,7 @@ impl AgentLifecycle for AgentLifecycleGuard {
     fn agent_type(&self) -> SharedAgentType {
         match AgentLifecycleGuard::agent_type(self) {
             AgentType::Claude => SharedAgentType::Claude,
+            #[cfg(feature = "codex")]
             AgentType::Codex => SharedAgentType::Codex,
         }
     }
@@ -310,4 +321,3 @@ impl AgentLifecycle for AgentLifecycleGuard {
 // 类型别名
 pub type AgentStopGuard = AgentLifecycleGuard;
 pub type AgentStopHandleArc = Arc<AgentLifecycleGuard>;
-

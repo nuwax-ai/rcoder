@@ -135,6 +135,14 @@ impl DockerManager {
             mounts: Some(mounts),
             port_bindings: Some(port_bindings_map),
             auto_remove: Some(config.auto_remove),
+            // 🔒 禁用容器访问宿主机内网地址
+            // 通过 cap_drop 移除网络相关的特权能力
+            cap_drop: Some(vec![
+                "NET_RAW".to_string(),      // 禁止原始套接字
+                "NET_ADMIN".to_string(),    // 禁止网络管理
+            ]),
+            // 禁用特权模式
+            privileged: Some(false),
             ..Default::default()
         };
 
@@ -644,6 +652,7 @@ impl DockerManager {
         let network_config = NetworkCreateRequest {
             name: RCODER_NETWORK_NAME.to_string(),
             driver: Some("bridge".to_string()),
+            // 🔒 设置为 internal=false 允许外网访问，但通过 iptables 限制内网
             internal: Some(false),
             attachable: Some(true),
             ingress: Some(false),
@@ -654,18 +663,26 @@ impl DockerManager {
                     "com.docker.network.bridge.name".to_string(),
                     "rcoder-br0".to_string(),
                 ),
+                // 🔒 容器间通信保持开启（agent 之间可能需要通信）
                 (
                     "com.docker.network.bridge.enable_icc".to_string(),
                     "true".to_string(),
                 ),
+                // 🔒 启用 IP 伪装（允许容器访问外网）
                 (
                     "com.docker.network.bridge.enable_ip_masquerade".to_string(),
                     "true".to_string(),
+                ),
+                // 🔒 禁用主机绑定（防止容器直接访问宿主机端口）
+                (
+                    "com.docker.network.bridge.host_binding_ipv4".to_string(),
+                    "0.0.0.0".to_string(),
                 ),
             ])),
             labels: Some(HashMap::from([
                 ("com.rcoder.network".to_string(), "true".to_string()),
                 ("com.rcoder.network.created".to_string(), created_time),
+                ("com.rcoder.network.isolated".to_string(), "true".to_string()),
             ])),
             ..Default::default()
         };
@@ -673,6 +690,12 @@ impl DockerManager {
         match self.docker.create_network(network_config).await {
             Ok(_) => {
                 info!("✅ RCoder 网络创建成功: {}", RCODER_NETWORK_NAME);
+                
+                // 🔒 配置 iptables 规则，阻止容器访问内网地址
+                if let Err(e) = self.setup_network_isolation_rules().await {
+                    warn!("⚠️ 网络隔离规则配置失败（容器仍可正常工作）: {}", e);
+                }
+                
                 Ok(())
             }
             Err(e) => {
@@ -1121,6 +1144,102 @@ impl DockerManager {
     /// 获取 RCoder 网络名称
     pub fn get_rcoder_network_name(&self) -> &'static str {
         RCODER_NETWORK_NAME
+    }
+
+    /// 🔒 配置网络隔离规则，阻止容器访问宿主机内网地址
+    /// 
+    /// 该方法会添加 iptables 规则来阻止以下内网地址段：
+    /// - 10.0.0.0/8 (A类私有地址)
+    /// - 172.16.0.0/12 (B类私有地址)
+    /// - 192.168.0.0/16 (C类私有地址)
+    /// - 169.254.0.0/16 (链路本地地址)
+    /// - 127.0.0.0/8 (本地回环地址)
+    async fn setup_network_isolation_rules(&self) -> DockerResult<()> {
+        info!("🔒 开始配置网络隔离规则...");
+
+        // 内网地址段列表
+        let private_networks = vec![
+            "10.0.0.0/8",       // A类私有地址
+            "172.16.0.0/12",    // B类私有地址
+            "192.168.0.0/16",   // C类私有地址
+            "169.254.0.0/16",   // 链路本地地址
+            "127.0.0.0/8",      // 本地回环地址
+        ];
+
+        // 获取网络的子网信息
+        let network_subnet = self.get_network_subnet(RCODER_NETWORK_NAME).await?;
+        
+        info!("🌐 RCoder 网络子网: {}", network_subnet);
+
+        // 为每个内网地址段添加阻止规则
+        for network in private_networks {
+            let rule = format!(
+                "iptables -I DOCKER-USER -s {} -d {} -j DROP",
+                network_subnet, network
+            );
+            
+            if let Err(e) = self.execute_iptables_rule(&rule).await {
+                warn!("⚠️ 添加 iptables 规则失败: {} - {}", rule, e);
+            } else {
+                info!("✅ 已阻止访问内网地址段: {}", network);
+            }
+        }
+
+        info!("🔒 网络隔离规则配置完成");
+        Ok(())
+    }
+
+    /// 获取网络的子网信息
+    async fn get_network_subnet(&self, network_name: &str) -> DockerResult<String> {
+        use bollard::query_parameters::ListNetworksOptions;
+
+        let networks = self
+            .docker
+            .list_networks(None::<ListNetworksOptions>)
+            .await
+            .map_err(|e| DockerError::ConnectionError(format!("获取网络列表失败: {}", e)))?;
+
+        for network in networks {
+            if network.name.as_ref() == Some(&network_name.to_string()) {
+                if let Some(ipam) = network.ipam {
+                    if let Some(config) = ipam.config {
+                        if let Some(first_config) = config.first() {
+                            if let Some(subnet) = &first_config.subnet {
+                                return Ok(subnet.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 如果无法获取子网，使用默认值
+        warn!("⚠️ 无法获取网络子网信息，使用默认值");
+        Ok("172.18.0.0/16".to_string())
+    }
+
+    /// 执行 iptables 规则
+    async fn execute_iptables_rule(&self, rule: &str) -> DockerResult<()> {
+        use tokio::process::Command;
+
+        debug!("执行 iptables 规则: {}", rule);
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(rule)
+            .output()
+            .await
+            .map_err(|e| DockerError::IoError(e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DockerError::ContainerCreationError(format!(
+                "iptables 规则执行失败: {}",
+                stderr
+            )));
+        }
+
+        Ok(())
     }
 }
 

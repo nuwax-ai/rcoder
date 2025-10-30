@@ -43,6 +43,7 @@ impl AcpAgentService for crate::model::AgentType {
                 )
                 .await
             }
+            #[cfg(feature = "codex")]
             crate::model::AgentType::Codex => {
                 super::codex_agent::start_codex_acp_agent_service(chat_prompt, model_provider).await
             }
@@ -52,6 +53,7 @@ impl AcpAgentService for crate::model::AgentType {
     fn agent_type_name(&self) -> &'static str {
         match self {
             crate::model::AgentType::Claude => "Claude",
+            #[cfg(feature = "codex")]
             crate::model::AgentType::Codex => "Codex",
         }
     }
