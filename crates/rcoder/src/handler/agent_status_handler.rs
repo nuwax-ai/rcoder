@@ -1,12 +1,9 @@
-use axum::extract::{Path, Query, State};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use axum::extract::{Path, State};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument};
-use utoipa::{IntoParams, ToSchema};
+use tracing::{info, instrument};
 
 use crate::{
-    AgentStatusResponse, AppError, HttpResult, proxy_agent::docker_container_agent,
+    AgentStatusResponse, AppError, HttpResult,
     router::AppState,
 };
 

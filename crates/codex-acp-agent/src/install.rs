@@ -106,7 +106,7 @@ fn asset_name(version: &str) -> Option<String> {
 pub async fn fetch_latest_release() -> Result<GitHubRelease> {
     let url = format!("https://api.github.com/repos/{}/releases/latest", CODEX_ACP_REPO);
     
-    let mut client_builder = reqwest::Client::builder()
+    let client_builder = reqwest::Client::builder()
         .user_agent("rcoder-installer/1.0");
     
     let client = client_builder.build()?;
@@ -292,11 +292,10 @@ async fn extract_zip(bytes: &[u8], target_dir: &Path) -> Result<()> {
             if file.is_dir() {
                 std::fs::create_dir_all(&outpath)?;
             } else {
-                if let Some(p) = outpath.parent() {
-                    if !p.exists() {
+                if let Some(p) = outpath.parent()
+                    && !p.exists() {
                         std::fs::create_dir_all(p)?;
                     }
-                }
                 let mut outfile = std::fs::File::create(&outpath)?;
                 std::io::copy(&mut file, &mut outfile)?;
             }
@@ -347,11 +346,10 @@ pub async fn list_installed_versions() -> Result<Vec<String>> {
     
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.is_dir() {
-            if let Some(version) = path.file_name() {
+        if path.is_dir()
+            && let Some(version) = path.file_name() {
                 versions.push(version.to_string_lossy().to_string());
             }
-        }
     }
     
     versions.sort();

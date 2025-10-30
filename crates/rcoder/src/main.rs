@@ -1,9 +1,7 @@
 use clap::Parser;
-use dashmap::DashMap;
-use shared_types::{ProjectAndAgentInfo, ProjectAndContainerInfo};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_appender::rolling::Rotation;
@@ -21,7 +19,7 @@ mod utils;
 use rcoder::*;
 
 use config::{CliArgs, load_config_with_args};
-use pingora_proxy::{PingoraProxyService, PingoraServerManager, ProxyConfig};
+use pingora_proxy::{PingoraServerManager, ProxyConfig};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
 
@@ -178,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 设置 Ctrl+C 信号处理
     let shutdown_tx = setup_signal_handlers();
-    let mut shutdown_rx = shutdown_tx.subscribe();
+    let shutdown_rx = shutdown_tx.subscribe();
 
     let state = Arc::new(AppState::new(config.clone(), pingora_service_opt));
 

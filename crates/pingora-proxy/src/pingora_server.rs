@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::{Instant, Duration};
+use std::time::Instant;
 use tokio::sync::oneshot;
 use tracing::{error, info};
 

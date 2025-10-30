@@ -1,5 +1,4 @@
 use serde::{Serialize, Deserialize};
-use utoipa::ToSchema;
 
 /// 聊天响应结构
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]

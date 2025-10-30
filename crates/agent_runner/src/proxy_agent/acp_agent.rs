@@ -14,7 +14,6 @@ use tracing::{debug, error, info};
 use crate::{
     model::{AgentStatus, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::agent_service::AcpAgentService,
-    service::SESSION_CACHE,
     utils::{ContentBuilder, PromptBuilder},
 };
 

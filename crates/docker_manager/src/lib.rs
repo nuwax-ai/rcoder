@@ -1,20 +1,6 @@
-use std::collections::HashMap;
-use std::path::Path;
 
-use bollard::{
-    API_DEFAULT_VERSION, Docker,
-    container::{
-        Config, CreateContainerOptions, LogsOptions, StartContainerOptions, StopContainerOptions,
-    },
-    image::CreateImageOptions,
-    models::{ContainerCreateResponse, HostConfig, Mount, PortBinding},
-};
-use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::error;
 
 pub mod container_self_inspector;
 pub mod container_stop;
@@ -115,7 +101,7 @@ pub mod global {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::OnceCell;
-    use tracing::{debug, error, info};
+    use tracing::{debug, info};
 
     /// 全局 DockerManager 单例
     static GLOBAL_DOCKER_MANAGER: OnceCell<Arc<DockerManager>> = OnceCell::const_new();

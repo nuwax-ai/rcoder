@@ -6,7 +6,7 @@ use agent_client_protocol::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, ResourceLink, TextContent, TextResourceContents,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
 use std::path::Path;
 

@@ -6,7 +6,6 @@
 use anyhow::{Context, Result};
 use docker_manager::{DockerContainerConfig, DockerContainerInfo, DockerManager, ResourceLimits};
 use reqwest::Client;
-use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,14 +43,13 @@ pub async fn start_docker_container_agent_service(
             return Err(anyhow::anyhow!("无法停止现有容器: {}", e));
         }
         // 释放对应的端口（如果存在端口映射）
-        if let Some(port_binding) = existing_container.port_bindings.values().next() {
-            if let Ok(port) = port_binding.parse::<u16>() {
+        if let Some(port_binding) = existing_container.port_bindings.values().next()
+            && let Ok(port) = port_binding.parse::<u16>() {
                 crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
                     .release_port(port)
                     .await;
                 info!("释放现有端口: {}", port);
             }
-        }
     }
 
     // 🎯 优化：不再需要宿主机端口映射，使用内部网络通信

@@ -4,18 +4,16 @@
 
 use anyhow::Result;
 use axum::{Json, extract::State};
-use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared_types::{ModelProviderConfig, ProjectAndContainerInfo};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
-use shared_types::{AgentType, ChatPromptBuilder};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -155,7 +153,7 @@ pub async fn handle_chat(
         info!("🔍 [CHAT] 开始获取/创建项目信息: project_id={}", project_id);
 
         // 使用 entry API 一次性处理获取和创建，避免多次锁获取
-        let mut entry = state.project_and_agent_map.entry(project_id.clone());
+        let entry = state.project_and_agent_map.entry(project_id.clone());
 
         match entry {
             dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
@@ -245,7 +243,7 @@ pub async fn handle_chat(
             info!("🔄 [CHAT] 开始更新项目会话状态: project_id={}", project_id);
 
             let updated_arc_info = {
-                let mut entry = state.project_and_agent_map.entry(project_id.clone());
+                let entry = state.project_and_agent_map.entry(project_id.clone());
                 match entry {
                     dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
                         // 使用新的会话更新方法，自动处理写时复制

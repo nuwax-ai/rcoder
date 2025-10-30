@@ -13,7 +13,6 @@ use tracing::{info, warn};
 
 use agent_client_protocol::{SessionId, CancelNotification, PromptRequest,ClientSideConnection};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use super::{ModelProviderConfig, ModelProviderSafeInfo, AgentType};
 use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;

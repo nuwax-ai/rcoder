@@ -14,11 +14,11 @@ use tracing::{debug, info, warn};
 use std::sync::{Arc, LazyLock};
 
 /// 全局Session缓存 - LazyLock初始化
-pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(|| DashMap::new());
+pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
 
 /// Project到当前活跃Session的映射 - 用于确保一个project_id只对应一个session_id
 /// 当project_id对应的session_id发生变化时，会自动清理旧session的数据
-pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(|| DashMap::new());
+pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
 
 /// Session数据包装 - 极简版本，专注消息传输
@@ -122,21 +122,19 @@ impl SessionData {
     /// 3. 清空连接状态，防止新的消息被发送
     pub fn close_current_connection(&self) {
         // 🎯 主动触发取消令牌，关闭 SSE 连接
-        if let Ok(mut current_cancel_guard) = self.current_cancel.try_lock() {
-            if let Some(token) = current_cancel_guard.take() {
+        if let Ok(mut current_cancel_guard) = self.current_cancel.try_lock()
+            && let Some(token) = current_cancel_guard.take() {
                 info!("🔌 [SessionData] 主动触发CancellationToken，关闭SSE连接");
                 token.cancel();
             }
-        }
 
         // 🎯 显式关闭 channel 发送端，让接收端立即感知到连接关闭
-        if let Ok(mut current_sender_guard) = self.current_sender.try_lock() {
-            if let Some(_sender) = current_sender_guard.take() {
+        if let Ok(mut current_sender_guard) = self.current_sender.try_lock()
+            && let Some(_sender) = current_sender_guard.take() {
                 info!("🔌 [SessionData] 显式关闭channel发送端，让接收端立即断开");
                 // 当 Sender 被 drop 时，Receiver 的 recv() 会返回 None
                 // 这里通过 take() 将 sender 从 Option 中移除，触发 drop
             }
-        }
     }
 
     }
@@ -197,15 +195,13 @@ impl SessionWorker {
                     }
 
                     // 🚀 极简优化：直接从共享状态获取当前连接
-                    if let Ok(mut current_sender_guard) = self.current_sender.try_lock() {
-                        if let Some(sender) = current_sender_guard.as_mut() {
-                            if sender.try_send(message.clone()).is_err() {
+                    if let Ok(mut current_sender_guard) = self.current_sender.try_lock()
+                        && let Some(sender) = current_sender_guard.as_mut()
+                            && sender.try_send(message.clone()).is_err() {
                                 // 如果发送失败，可能是缓冲区满了或连接已关闭
                                 warn!("⚠️ SSE sender 发送失败，关闭实时推送");
                                 *current_sender_guard = None;
                             }
-                        }
-                    }
                 }
                 SessionCommand::Clear { ack } => {
                     let mut cleared = 0usize;

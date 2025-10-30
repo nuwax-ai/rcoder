@@ -114,7 +114,7 @@ impl HostPathResolver {
         debug!("容器内绝对路径: {:?}", container_absolute_path);
 
         // 第二步：如果容器内绝对路径以项目工作目录开头，提取相对路径
-        if let Some(relative_path) = container_absolute_path.strip_prefix(&self.container_project_workspace).ok() {
+        if let Ok(relative_path) = container_absolute_path.strip_prefix(&self.container_project_workspace) {
             // 第三步：将相对路径拼接到宿主机基础路径上
             let host_path = self.host_project_workspace.join(relative_path);
             debug!("路径转换成功: 容器内 {:?} -> 宿主机 {:?}", container_absolute_path, host_path);
@@ -164,7 +164,7 @@ impl HostPathResolver {
             let mounts = inspector.get_all_mounts().await
                 .context("获取容器挂载信息失败")?;
 
-            let mut diagnostics = format!("容器挂载信息:\n");
+            let mut diagnostics = "容器挂载信息:\n".to_string();
             for (container_path, host_path) in mounts {
                 diagnostics.push_str(&format!("  {} -> {}\n", container_path, host_path));
             }

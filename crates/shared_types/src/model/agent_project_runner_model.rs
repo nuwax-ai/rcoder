@@ -1,4 +1,3 @@
-use agent_client_protocol::SessionId;
 use chrono::{DateTime, Utc};
 use docker_manager::ContainerBasicInfo;
 use std::sync::Arc;
