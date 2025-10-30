@@ -19,9 +19,9 @@ pub struct CancelQuery {
     /// 项目ID，用于标识特定的项目
     #[param(example = "test_project")]
     pub project_id: String,
-    /// 会话ID，用于标识要取消的会话
+    /// 会话ID，用于标识要取消的会话（可选，如果不提供则取消该项目的所有会话）
     #[param(example = "session456")]
-    pub session_id: String,
+    pub session_id: Option<String>,
 }
 
 /// 取消任务的响应
@@ -35,24 +35,31 @@ pub struct CancelResponse {
     pub session_id: String,
 }
 
-/// 获取或创建容器（用于取消请求）
-async fn get_or_create_container_for_cancel(
+/// 获取容器（用于取消请求，不创建）
+async fn get_container_for_cancel(
     project_id: &str,
-) -> Result<ContainerBasicInfo, AppError> {
+) -> Result<Option<ContainerBasicInfo>, AppError> {
     info!(
-        "🔍 [CANCEL_CONTAINER] 开始处理容器: project_id={}",
+        "🔍 [CANCEL_CONTAINER] 查找容器: project_id={}",
         project_id
     );
 
-    // 使用新的容器管理服务
+    // 只获取容器，不创建
     let container_info =
-        crate::service::container_manager::ContainerManager::get_or_create_container(project_id)
+        crate::service::container_manager::ContainerManager::get_container_info(project_id)
             .await?;
 
-    info!(
-        "✅ [CANCEL_CONTAINER] 容器准备就绪: project_id={}, container_id={}, service_url={}",
-        project_id, container_info.container_id, container_info.service_url
-    );
+    if let Some(ref info) = container_info {
+        info!(
+            "✅ [CANCEL_CONTAINER] 找到容器: project_id={}, container_id={}, service_url={}",
+            project_id, info.container_id, info.service_url
+        );
+    } else {
+        info!(
+            "ℹ️ [CANCEL_CONTAINER] 容器不存在: project_id={}, 无需取消",
+            project_id
+        );
+    }
 
     Ok(container_info)
 }
@@ -60,20 +67,28 @@ async fn get_or_create_container_for_cancel(
 /// 转发取消请求到容器内的 agent_runner 服务
 async fn forward_cancel_request_to_container_service(
     project_id: &str,
-    session_id: &str,
+    session_id: Option<&str>,
     container_info: &ContainerBasicInfo,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
+    let session_id_display = session_id.map(|s| s.to_string()).unwrap_or_else(|| "None".to_string());
     info!(
         "📤 [CANCEL_FORWARD] 转发取消请求到容器: project_id={}, session_id={}, container_id={}",
-        project_id, session_id, container_info.container_id
+        project_id, session_id_display, container_info.container_id
     );
 
     // 转发到容器内的 agent/session/cancel 接口（使用查询参数）
     let client = Client::new();
-    let cancel_url = format!(
-        "{}/agent/session/cancel?project_id={}&session_id={}",
-        container_info.service_url, project_id, session_id
-    );
+    let cancel_url = if let Some(sid) = session_id {
+        format!(
+            "{}/agent/session/cancel?project_id={}&session_id={}",
+            container_info.service_url, project_id, sid
+        )
+    } else {
+        format!(
+            "{}/agent/session/cancel?project_id={}",
+            container_info.service_url, project_id
+        )
+    };
 
     info!("📤 [CANCEL_FORWARD] 发送取消请求到: {}", cancel_url);
 
@@ -118,23 +133,6 @@ async fn forward_cancel_request_to_container_service(
             &format!("容器取消请求失败: {}", status),
         ))
     }
-}
-
-/// 转发取消请求到容器内的 agent_runner 服务（组合函数）
-async fn forward_cancel_request_to_container(
-    project_id: &str,
-    session_id: &str,
-) -> Result<HttpResult<CancelResponse>, AppError> {
-    info!(
-        "🚀 [CANCEL_FORWARD] 开始转发取消请求: project_id={}, session_id={}",
-        project_id, session_id
-    );
-
-    // 第一步：获取或创建容器
-    let container_info = get_or_create_container_for_cancel(project_id).await?;
-
-    // 第二步：转发取消请求到容器服务
-    forward_cancel_request_to_container_service(project_id, session_id, &container_info).await
 }
 
 /// 处理agent任务取消请求
@@ -210,18 +208,35 @@ pub async fn agent_session_cancel(
     State(_state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
+    let session_id_display = query
+        .session_id
+        .as_deref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "None".to_string());
     info!(
         "🛑 [CANCEL_FORWARD] 收到取消任务请求: session_id={}, project_id={}",
-        query.session_id, query.project_id
+        session_id_display, query.project_id
     );
 
-    // 第一步：获取或创建容器
-    let container_info = get_or_create_container_for_cancel(&query.project_id).await?;
+    // 第一步：获取容器（不创建）
+    let container_info = get_container_for_cancel(&query.project_id).await?;
+
+    // 如果容器不存在，说明任务已经结束或从未启动，直接返回成功
+    let Some(container_info) = container_info else {
+        info!(
+            "✅ [CANCEL_FORWARD] 容器不存在，取消目标已达成: project_id={}",
+            query.project_id
+        );
+        return Ok(HttpResult::success(CancelResponse {
+            success: true,
+            session_id: query.session_id.unwrap_or_else(|| "all".to_string()),
+        }));
+    };
 
     // 第二步：转发取消请求到容器服务
     let result = forward_cancel_request_to_container_service(
         &query.project_id,
-        &query.session_id,
+        query.session_id.as_deref(),
         &container_info,
     )
     .await;
