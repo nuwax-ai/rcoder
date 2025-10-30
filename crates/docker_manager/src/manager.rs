@@ -269,44 +269,51 @@ impl DockerManager {
 
     /// 通过容器ID停止容器
     pub async fn stop_container_by_id(&self, container_id: &str) -> DockerResult<()> {
-        self.stop_container_by_id_with_timeout(container_id, 30).await
+        self.stop_container_by_id_with_timeout(container_id, 30)
+            .await
     }
 
     /// 通过容器ID停止容器（带超时参数）
-    pub async fn stop_container_by_id_with_timeout(&self, container_id: &str, timeout_seconds: u64) -> DockerResult<()> {
-        info!("通过容器ID停止容器: {} (超时: {}秒)", container_id, timeout_seconds);
+    pub async fn stop_container_by_id_with_timeout(
+        &self,
+        container_id: &str,
+        timeout_seconds: u64,
+    ) -> DockerResult<()> {
+        info!(
+            "快速销毁容器: {} (超时: {}秒)",
+            container_id, timeout_seconds
+        );
 
-        // 停止容器 - 使用传入的超时时间
-        let stop_options = Some(StopContainerOptions {
-            t: Some(timeout_seconds as i32),
-            signal: None::<String>,
+        // 🚀 直接使用 force remove，无需先 stop
+        // force: true 会自动停止运行中的容器
+        // 这样可以避免 "removal already in progress" 的竞态问题
+        let remove_options = Some(RemoveContainerOptions {
+            force: true,
+            v: true,
+            link: false,
         });
-        
-        if let Err(e) = self
-            .docker
-            .stop_container(container_id, stop_options)
-            .await
-        {
-            if !e.to_string().contains("No such container") {
-                warn!("停止容器 {} 失败: {}", container_id, e);
-            }
-        }
 
-        // 删除容器
-        if let Err(e) = self
+        match self
             .docker
-            .remove_container(
-                container_id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    link: false,
-                }),
-            )
+            .remove_container(container_id, remove_options)
             .await
         {
-            if !e.to_string().contains("No such container") {
-                warn!("删除容器 {} 失败: {}", container_id, e);
+            Ok(_) => {
+                info!("✅ 容器销毁成功: {}", container_id);
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                // 忽略容器不存在或已在删除中的错误
+                if error_msg.contains("No such container") {
+                    debug!("容器 {} 不存在，跳过删除", container_id);
+                } else if error_msg.contains("removal of container")
+                    && error_msg.contains("is already in progress")
+                {
+                    debug!("容器 {} 已在删除中，跳过", container_id);
+                } else {
+                    warn!("删除容器 {} 失败: {}", container_id, error_msg);
+                    return Err(DockerError::ContainerRemoveError(error_msg));
+                }
             }
         }
 
