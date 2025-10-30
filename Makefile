@@ -72,20 +72,12 @@ uninstall:
 	@cargo uninstall codex-acp-agent 2>/dev/null || echo "codex-acp-agent 未安装"
 	@echo "✅ 卸载完成"
 
-# 开发模式：本地编译 + Docker 镜像构建（一键完成）
+# 开发模式：Docker 镜像构建（在容器内编译，避免 glibc 版本不匹配）
 dev-build:
-	@echo "🔨 [1/2] 本地编译 rcoder..."
-	@cargo build --release --bin rcoder
-	@echo "📁 复制可执行文件到 docker 目录..."
-	@cp ./target/release/rcoder ./docker/rcoder
-	@chmod +x ./docker/rcoder
-	@echo "✅ 本地编译完成！"
-	@echo ""
-	@echo "🐳 [2/2] 构建 Docker 镜像..."
+	@echo "🐳 构建 Docker 镜像（容器内编译）..."
 	@docker build -f docker/Dockerfile -t master-rcoder:latest .
 	@echo ""
-	@echo "🎉 全部完成！"
-	@echo "  ✓ 本地可执行文件: ./docker/rcoder"
+	@echo "🎉 构建完成！"
 	@echo "  ✓ Docker 镜像: master-rcoder:latest"
 	@echo ""
 	@echo "💡 下一步: make dev-up 启动容器"

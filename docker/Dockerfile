@@ -9,7 +9,7 @@
 # ==============================================================================
 
 # 多阶段构建：编译阶段 + 调试运行阶段
-FROM rust:1.90 AS builder
+FROM rust:1.90-bookworm AS builder
 
 # 设置工作目录
 WORKDIR /app
@@ -37,7 +37,7 @@ RUN cargo install flamegraph --locked --root /usr/local 2>/dev/null || echo "fla
 # ==============================================================================
 # 调试增强运行时镜像 - 基于 Debian 完整版而非 slim
 # ==============================================================================
-FROM debian:bookworm
+FROM rust:1.90-bookworm
 
 # 设置环境变量 - 启用调试和性能分析
 ENV RUST_LOG=debug
