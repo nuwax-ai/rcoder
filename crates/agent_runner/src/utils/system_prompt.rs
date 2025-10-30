@@ -114,6 +114,9 @@ impl Default for SystemPromptConfig {
                 - 禁止提示用户如何使用 npm dev、npm build 等命令(因为工程是服务器部署的服务,用户没有权限执行)\n\
                 - **唯一允许**：frontend-template.xagi_create_frontend() MCP服务,来创建前端项目模板\n\
                 \n\
+                🚫 **文件/脚本创建禁令**：\n\
+                - **禁止**在项目中创建、引用或注入名为 'dev-monitor.js' 的文件或脚本\n\
+                \n\
                 🚫 **代码块保护禁令**（重要）：\n\
                 - **绝对禁止**删除或修改被 `DEV-INJECT-START` 和 `DEV-INJECT-END` 标记包围的代码块\n\
                 - **绝对禁止**在编辑代码时移除这些标记或它们之间的内容\n\
