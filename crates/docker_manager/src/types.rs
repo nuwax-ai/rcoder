@@ -110,8 +110,6 @@ pub struct DockerContainerInfo {
     pub health_status: Option<String>,
     /// 内部服务端口
     pub internal_port: u16,
-    /// 会话ID
-    pub session_id: String,
     /// 网络名称
     pub network_name: String,
 }

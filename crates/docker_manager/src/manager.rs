@@ -1,6 +1,7 @@
 use super::{
     CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerStatus,
-    DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult, RCODER_NETWORK_NAME,
+    DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
+    RCODER_NETWORK_BASE_NAME,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
@@ -10,8 +11,7 @@ use bollard::query_parameters::{
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     models::{
-        ContainerCreateBody, ContainerSummary, HostConfig, Mount, NetworkingConfig,
-        PortBinding,
+        ContainerCreateBody, ContainerSummary, HostConfig, Mount, NetworkingConfig, PortBinding,
     },
 };
 use chrono::{DateTime, Utc};
@@ -29,6 +29,8 @@ pub struct DockerManager {
     config: DockerManagerConfig,
     /// 容器映射: project_id -> container_info
     containers: DashMap<String, DockerContainerInfo>,
+    /// 主网络名称（动态检测或使用默认值）
+    main_network_name: std::sync::Arc<tokio::sync::RwLock<String>>,
 }
 
 impl DockerManager {
@@ -47,10 +49,23 @@ impl DockerManager {
 
         info!("Docker 管理器初始化成功");
 
+        // 🔍 动态检测主网络名称（必须成功）
+        let main_network_name = match Self::detect_main_network_name_static(&docker).await {
+            Ok(network_name) => {
+                info!("✅ 检测到主网络名称: {}", network_name);
+                network_name
+            }
+            Err(e) => {
+                error!("❌ 无法检测主网络名称: {}", e);
+                return Err(e);
+            }
+        };
+
         let manager = Self {
             docker,
             config,
             containers: DashMap::new(),
+            main_network_name: std::sync::Arc::new(tokio::sync::RwLock::new(main_network_name)),
         };
 
         // 确保 RCoder 网络存在
@@ -135,6 +150,18 @@ impl DockerManager {
             mounts: Some(mounts),
             port_bindings: Some(port_bindings_map),
             auto_remove: Some(config.auto_remove),
+            // 🔒 容器网络安全配置
+            // ⚠️ 重要：这些配置只能提供基础防护，无法完全阻止容器通过 IP 地址访问内网
+            // 如需完全隔离，必须在宿主机配置 iptables 规则（但会影响整个网络的所有容器）
+            //
+            // 当前配置的作用：
+            // 1. 移除 NET_RAW 和 NET_ADMIN 能力 - 防止网络嗅探和路由劫持
+            cap_drop: Some(vec![
+                "NET_RAW".to_string(),   // 禁止原始套接字（防止 ping、traceroute 等）
+                "NET_ADMIN".to_string(), // 禁止网络管理（防止修改路由表）
+            ]),
+            // 禁用特权模式
+            privileged: Some(false),
             ..Default::default()
         };
 
@@ -149,10 +176,11 @@ impl DockerManager {
         }
 
         // 创建容器配置
-        // 🎯 直接在创建时配置网络，避免先连接bridge网络再手动连接agent-network
-        let networking_config = if config.network_mode != "host" {
-            let default_network = RCODER_NETWORK_NAME.to_string();
-            let network_name = config.network_name.as_ref().unwrap_or(&default_network);
+        // 🎯 直接连接到主网络，所有容器共享同一网络以便互相通信
+        let (networking_config, container_network_name) = if config.network_mode != "host" {
+            let main_network = self.get_main_network_name().await;
+            let network_name = config.network_name.as_ref().unwrap_or(&main_network);
+
             let mut endpoints = HashMap::new();
             endpoints.insert(
                 network_name.clone(),
@@ -161,16 +189,21 @@ impl DockerManager {
                     ..Default::default()
                 },
             );
+
             info!(
-                "🌐 [NETWORK] 容器 {} 将直接连接到 {} 网络，避免多网络DNS冲突",
+                "🌐 [NETWORK] 容器 {} 连接到主网络: {}",
                 container_name, network_name
             );
-            Some(NetworkingConfig {
-                endpoints_config: Some(endpoints),
-            })
+
+            (
+                Some(NetworkingConfig {
+                    endpoints_config: Some(endpoints),
+                }),
+                network_name.clone(),
+            )
         } else {
             info!("🌐 [NETWORK] 容器 {} 使用 host 网络模式", container_name);
-            None // host模式不需要自定义网络配置
+            (None, "host".to_string())
         };
 
         let mut container_config = ContainerCreateBody {
@@ -181,6 +214,13 @@ impl DockerManager {
             networking_config, // 🎯 直接指定网络配置
             tty: Some(true),
             open_stdin: Some(true),
+            // 🔒 设置容器主机名和域名，便于识别和管理
+            // 注意：这不能阻止容器访问内网 IP，只是设置容器的标识
+            hostname: Some(format!(
+                "agent-{}",
+                &config.project_id[..8.min(config.project_id.len())]
+            )),
+            domainname: Some("rcoder.local".to_string()),
             ..Default::default()
         };
 
@@ -215,9 +255,6 @@ impl DockerManager {
             .await
             .map_err(|e| DockerError::ContainerStartError(format!("启动容器失败: {}", e)))?;
 
-        // 🎯 不再需要手动连接网络，因为容器创建时已经直接连接到agent-network
-        // 删除原来的手动网络连接逻辑
-
         // 等待容器启动完成
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
@@ -226,12 +263,6 @@ impl DockerManager {
 
         // 再次等待确保网络配置完成
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-        // 获取实际使用的网络名称
-        let actual_network_name = config
-            .network_name
-            .clone()
-            .unwrap_or_else(|| RCODER_NETWORK_NAME.to_string());
 
         // 创建容器信息
         let container_info = DockerContainerInfo {
@@ -247,9 +278,8 @@ impl DockerManager {
             port_bindings: config.port_bindings.clone(),
             assigned_port: 3000, // TODO: 使用动态分配的端口
             health_status: None,
-            internal_port: 8080,                    // 默认内部端口
-            session_id: Uuid::new_v4().to_string(), // 生成默认会话ID
-            network_name: actual_network_name,      // 记录使用的网络名称
+            internal_port: 8080,                          // 默认内部端口
+            network_name: container_network_name.clone(), // 记录使用的网络名称
         };
 
         // 保存到容器映射
@@ -257,8 +287,8 @@ impl DockerManager {
             .insert(config.project_id.clone(), container_info.clone());
 
         info!(
-            "✅ 容器创建并启动成功: {} (ID: {}) - 已直接连接到 {} 网络",
-            container_name, container_id, RCODER_NETWORK_NAME
+            "✅ 容器创建并启动成功: {} (ID: {}) - 已连接到网络 {}",
+            container_name, container_id, container_network_name
         );
 
         Ok(container_info)
@@ -391,13 +421,13 @@ impl DockerManager {
                                     created_timestamp / 1000,
                                     (created_timestamp % 1000) as u32 * 1_000_000,
                                 )
-                                    .unwrap_or_else(|| {
-                                        warn!(
+                                .unwrap_or_else(|| {
+                                    warn!(
                                         "无法解析容器创建时间，使用当前时间: timestamp={}",
                                         created_timestamp
                                     );
-                                        Utc::now()
-                                    })
+                                    Utc::now()
+                                })
                             } else {
                                 warn!(
                                     "容器缺少创建时间信息，使用当前时间作为备用: container_id={}",
@@ -424,7 +454,7 @@ impl DockerManager {
                                 health_status: None,
                                 internal_port: 0,
                                 session_id: String::new(),
-                                network_name: RCODER_NETWORK_NAME.to_string(), // 使用默认网络名称
+                                network_name: "unknown".to_string(), // 临时容器信息，网络名称未知
                             });
                         }
                     }
@@ -621,66 +651,21 @@ impl DockerManager {
 
     /// 确保 RCoder 网络存在
     async fn ensure_rcoder_network(&self) -> DockerResult<()> {
-        info!("检查 RCoder 网络状态...");
+        let main_network = self.get_main_network_name().await;
+        info!("检查 RCoder 主网络状态: {}...", main_network);
 
         // 检查网络是否已存在
-        match self.inspect_network(RCODER_NETWORK_NAME).await {
+        match self.inspect_network(&main_network).await {
             Ok(_) => {
-                info!("RCoder 网络已存在: {}", RCODER_NETWORK_NAME);
+                info!("✅ RCoder 主网络已存在: {}", main_network);
                 Ok(())
             }
             Err(_) => {
-                info!("RCoder 网络不存在，正在创建...");
-                self.create_rcoder_network().await
-            }
-        }
-    }
-
-    /// 创建 RCoder 网络
-    async fn create_rcoder_network(&self) -> DockerResult<()> {
-        use bollard::models::NetworkCreateRequest;
-
-        let created_time = Utc::now().to_rfc3339();
-        let network_config = NetworkCreateRequest {
-            name: RCODER_NETWORK_NAME.to_string(),
-            driver: Some("bridge".to_string()),
-            internal: Some(false),
-            attachable: Some(true),
-            ingress: Some(false),
-            ipam: None,
-            enable_ipv6: Some(false),
-            options: Some(HashMap::from([
-                (
-                    "com.docker.network.bridge.name".to_string(),
-                    "rcoder-br0".to_string(),
-                ),
-                (
-                    "com.docker.network.bridge.enable_icc".to_string(),
-                    "true".to_string(),
-                ),
-                (
-                    "com.docker.network.bridge.enable_ip_masquerade".to_string(),
-                    "true".to_string(),
-                ),
-            ])),
-            labels: Some(HashMap::from([
-                ("com.rcoder.network".to_string(), "true".to_string()),
-                ("com.rcoder.network.created".to_string(), created_time),
-            ])),
-            ..Default::default()
-        };
-
-        match self.docker.create_network(network_config).await {
-            Ok(_) => {
-                info!("✅ RCoder 网络创建成功: {}", RCODER_NETWORK_NAME);
+                warn!("⚠️ RCoder 主网络不存在: {}", main_network);
+                warn!("⚠️ 这通常意味着主容器不在预期的网络中");
+                warn!("⚠️ 请检查 Docker Compose 配置");
+                // 不创建网络，因为主网络应该由 Docker Compose 创建
                 Ok(())
-            }
-            Err(e) => {
-                error!("❌ RCoder 网络创建失败: {}", e);
-                Err(DockerError::ContainerCreationError(format!(
-                    "创建网络失败: {}",
-                    e
-                )))
             }
         }
     }
@@ -706,38 +691,6 @@ impl DockerManager {
         }
     }
 
-    /// 连接容器到指定网络
-    async fn connect_container_to_network(
-        &self,
-        container_id: &str,
-        network_name: &str,
-    ) -> DockerResult<()> {
-        use bollard::models::NetworkConnectRequest;
-
-        let connect_config = NetworkConnectRequest {
-            container: Some(container_id.to_string()),
-            endpoint_config: None,
-        };
-
-        match self
-            .docker
-            .connect_network(network_name, connect_config)
-            .await
-        {
-            Ok(_) => {
-                info!("✅ 容器 {} 已连接到网络: {}", container_id, network_name);
-                Ok(())
-            }
-            Err(e) => {
-                error!("❌ 容器连接网络失败: {}", e);
-                Err(DockerError::ContainerCreationError(format!(
-                    "容器连接网络失败: {}",
-                    e
-                )))
-            }
-        }
-    }
-
     /// 获取 Docker 客户端实例
     pub fn get_docker_client(&self) -> &Docker {
         &self.docker
@@ -759,10 +712,12 @@ impl DockerManager {
         let mut network_ips = HashMap::new();
 
         if let Some(network_settings) = inspect.unwrap().network_settings
-            && let Some(networks) = network_settings.networks {
+            && let Some(networks) = network_settings.networks
+        {
             for (network_name, network_info) in networks {
                 if let Some(ip_address) = network_info.ip_address
-                    && !ip_address.is_empty() {
+                    && !ip_address.is_empty()
+                {
                     network_ips.insert(network_name, ip_address);
                 }
             }
@@ -1118,9 +1073,72 @@ impl DockerManager {
         }
     }
 
-    /// 获取 RCoder 网络名称
-    pub fn get_rcoder_network_name(&self) -> &'static str {
-        RCODER_NETWORK_NAME
+    /// 获取主网络名称（异步，返回动态检测的值）
+    pub async fn get_main_network_name(&self) -> String {
+        self.main_network_name.read().await.clone()
+    }
+
+    /// 🔍 动态检测当前主容器所在的网络名称（静态方法，用于初始化）
+    ///
+    /// 通过检查当前容器（运行 DockerManager 的容器）所连接的网络来确定主网络名称
+    /// 这样可以适应不同的 Docker Compose project name
+    async fn detect_main_network_name_static(docker: &Docker) -> DockerResult<String> {
+        use bollard::query_parameters::InspectContainerOptions;
+
+        // 🎯 优化：直接通过 HOSTNAME 环境变量 inspect 当前容器，无需列出所有容器
+        let hostname = std::env::var("HOSTNAME").map_err(|_| {
+            DockerError::ConnectionError(
+                "无法获取 HOSTNAME 环境变量。请确保代码运行在 Docker 容器中。".to_string(),
+            )
+        })?;
+
+        debug!("🔍 检测到容器 hostname: {}", hostname);
+
+        // 直接 inspect 当前容器（hostname 通常是容器 ID 的前12位，但 Docker API 支持前缀匹配）
+        let inspect = docker
+            .inspect_container(&hostname, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| {
+                DockerError::ConnectionError(format!(
+                    "无法获取当前容器信息 (hostname: {}): {}",
+                    hostname, e
+                ))
+            })?;
+
+        // 获取网络配置
+        if let Some(network_settings) = inspect.network_settings {
+            if let Some(networks) = network_settings.networks {
+                // 查找包含 "agent-network" 的网络
+                for (network_name, _) in &networks {
+                    if network_name.contains(RCODER_NETWORK_BASE_NAME) {
+                        info!("✅ 动态检测到主网络: {}", network_name);
+                        return Ok(network_name.clone());
+                    }
+                }
+
+                // 如果没找到包含 "agent-network" 的，返回错误
+                let available_networks: Vec<String> = networks.keys().cloned().collect();
+                return Err(DockerError::ConnectionError(format!(
+                    "当前容器未连接到包含 '{}' 的网络。\n\
+                     可用网络: {:?}\n\
+                     请检查 Docker Compose 配置中的网络设置。",
+                    RCODER_NETWORK_BASE_NAME, available_networks
+                )));
+            }
+        }
+
+        Err(DockerError::ConnectionError(format!(
+            "当前容器 (hostname: {}) 没有网络配置信息",
+            hostname
+        )))
+    }
+
+    /// 🔍 动态检测当前主容器所在的网络名称
+    ///
+    /// 通过检查当前容器（运行 DockerManager 的容器）所连接的网络来确定主网络名称
+    /// 这样可以适应不同的 Docker Compose project name
+    pub async fn detect_main_network_name(&self) -> DockerResult<String> {
+        Self::detect_main_network_name_static(&self.docker).await
     }
 }
 
@@ -1133,5 +1151,5 @@ impl std::fmt::Debug for DockerManager {
     }
 }
 
-/// 为了支持 futures Stream，需要导入 Next trait
+/// 为了支持 futures Stream，需要导入 StreamExt trait
 use futures_util::stream::StreamExt;

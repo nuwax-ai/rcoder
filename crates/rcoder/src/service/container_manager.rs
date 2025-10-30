@@ -109,15 +109,10 @@ impl ContainerManager {
 
     /// 动态构建网络名称
     pub async fn get_dynamic_network_name(&self, docker_manager: &Arc<DockerManager>) -> String {
-        if let Some(project_name) = self.get_dynamic_compose_project_name(docker_manager).await {
-            let network_name = format!("{}_agent-network", project_name);
-            info!("🌐 [CONTAINER_MGR] 动态网络名称: {}", network_name);
-            network_name
-        } else {
-            // 回退到默认网络名称
-            warn!("⚠️ [CONTAINER_MGR] 使用默认网络名称: agent-network");
-            "agent-network".to_string()
-        }
+        // 🎯 直接使用 DockerManager 检测到的主网络名称
+        let network_name = docker_manager.get_main_network_name().await;
+        info!("🌐 [CONTAINER_MGR] 使用检测到的主网络名称: {}", network_name);
+        network_name
     }
 
     /// 根据请求获取或创建容器
