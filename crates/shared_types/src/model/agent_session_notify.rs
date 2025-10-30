@@ -169,14 +169,14 @@ fn stop_reason_to_description(reason: &StopReason) -> &'static str {
 /// 将 SessionUpdate 转换为 (sub_type, data) 元组
 fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value) {
     match update {
-        SessionUpdate::UserMessageChunk { content } => {
+        SessionUpdate::UserMessageChunk(content) => {
             ("user_message_chunk".to_string(), serde_json::json!(content))
         }
-        SessionUpdate::AgentMessageChunk { content } => (
+        SessionUpdate::AgentMessageChunk(content) => (
             "agent_message_chunk".to_string(),
             serde_json::json!(content),
         ),
-        SessionUpdate::AgentThoughtChunk { content } => (
+        SessionUpdate::AgentThoughtChunk(content) => (
             "agent_thought_chunk".to_string(),
             serde_json::json!(content),
         ),
@@ -188,13 +188,13 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
             serde_json::json!(tool_call_update),
         ),
         SessionUpdate::Plan(plan) => ("plan".to_string(), serde_json::json!(plan)),
-        SessionUpdate::AvailableCommandsUpdate { available_commands } => (
+        SessionUpdate::AvailableCommandsUpdate(available_commands) => (
             "available_commands_update".to_string(),
             serde_json::json!({
                 "available_commands": available_commands
             }),
         ),
-        SessionUpdate::CurrentModeUpdate { current_mode_id } => (
+        SessionUpdate::CurrentModeUpdate(current_mode_id) => (
             "current_mode_update".to_string(),
             serde_json::json!({
                 "current_mode_id": current_mode_id
@@ -206,7 +206,7 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::{ContentBlock, TextContent};
+    use agent_client_protocol::{ContentBlock, ContentChunk, TextContent};
 
     #[test]
     fn test_session_prompt_start_to_unified() {
@@ -321,13 +321,16 @@ mod tests {
 
     #[test]
     fn test_agent_session_update_to_unified() {
-        let content = ContentBlock::Text(TextContent {
-            text: "Hello, World!".to_string(),
-            annotations: None,
+        let content = ContentChunk {
+            content: ContentBlock::Text(TextContent {
+                text: "Hello, World!".to_string(),
+                annotations: None,
+                meta: None,
+            }),
             meta: None,
-        });
+        };
 
-        let update = SessionUpdate::AgentMessageChunk { content };
+        let update = SessionUpdate::AgentMessageChunk(content);
         let notify = SessionNotify::AgentSessionUpdate(AgentSessionUpdate {
             session_id: "test_session".to_string(),
             session_update: update,
@@ -349,13 +352,16 @@ mod tests {
 
     #[test]
     fn test_agent_session_update_with_request_id_to_unified() {
-        let content = ContentBlock::Text(TextContent {
-            text: "Hello, World!".to_string(),
-            annotations: None,
+        let content = ContentChunk {
+            content: ContentBlock::Text(TextContent {
+                text: "Hello, World!".to_string(),
+                annotations: None,
+                meta: None,
+            }),
             meta: None,
-        });
+        };
 
-        let update = SessionUpdate::AgentMessageChunk { content };
+        let update = SessionUpdate::AgentMessageChunk(content);
         let notify = SessionNotify::AgentSessionUpdate(AgentSessionUpdate {
             session_id: "test_session".to_string(),
             session_update: update,
