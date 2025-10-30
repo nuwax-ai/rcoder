@@ -129,8 +129,6 @@ pub struct ContainerBasicInfo {
     pub external_port: u16,
     /// 项目ID
     pub project_id: String,
-    /// 会话ID
-    pub session_id: String,
     /// 容器状态
     pub status: String,
     /// 创建时间

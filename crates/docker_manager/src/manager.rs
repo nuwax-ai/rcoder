@@ -453,7 +453,6 @@ impl DockerManager {
                                 assigned_port: 0,
                                 health_status: None,
                                 internal_port: 0,
-                                session_id: String::new(),
                                 network_name: "unknown".to_string(), // 临时容器信息，网络名称未知
                             });
                         }

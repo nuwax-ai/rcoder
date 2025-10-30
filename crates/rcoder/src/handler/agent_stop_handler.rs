@@ -102,7 +102,7 @@ async fn destroy_container_for_project(
         let response = StopAgentResponse {
             success: true,
             project_id: project_id.to_string(),
-            session_id: Some(container_info.session_id),
+            session_id: None,
             message: "容器已成功销毁".to_string(),
         };
 
