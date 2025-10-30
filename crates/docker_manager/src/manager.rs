@@ -369,8 +369,7 @@ impl DockerManager {
         }
 
         // 3. 如果还没找到，尝试通过 Docker API 直接查找容器（适用于容器存在但映射缺失的情况）
-        use bollard::container::ListContainersOptions;
-        let options = Some(ListContainersOptions::<String> {
+        let options = Some(ListContainersOptions {
             all: true,
             ..Default::default()
         });
@@ -642,27 +641,36 @@ impl DockerManager {
 
     /// 创建 RCoder 网络
     async fn create_rcoder_network(&self) -> DockerResult<()> {
-        use bollard::network::{CreateNetworkOptions, PruneNetworksOptions};
+        use bollard::models::NetworkCreateRequest;
 
         let created_time = Utc::now().to_rfc3339();
-        let network_config = CreateNetworkOptions {
-            name: RCODER_NETWORK_NAME,
-            driver: "bridge",
-            check_duplicate: true,
-            internal: false,
-            attachable: true,
-            ingress: false,
-            ipam: Default::default(),
-            enable_ipv6: false,
-            options: HashMap::from([
-                ("com.docker.network.bridge.name", "rcoder-br0"),
-                ("com.docker.network.bridge.enable_icc", "true"),
-                ("com.docker.network.bridge.enable_ip_masquerade", "true"),
-            ]),
-            labels: HashMap::from([
-                ("com.rcoder.network", "true"),
-                ("com.rcoder.network.created", &created_time),
-            ]),
+        let network_config = NetworkCreateRequest {
+            name: RCODER_NETWORK_NAME.to_string(),
+            driver: Some("bridge".to_string()),
+            internal: Some(false),
+            attachable: Some(true),
+            ingress: Some(false),
+            ipam: None,
+            enable_ipv6: Some(false),
+            options: Some(HashMap::from([
+                (
+                    "com.docker.network.bridge.name".to_string(),
+                    "rcoder-br0".to_string(),
+                ),
+                (
+                    "com.docker.network.bridge.enable_icc".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "com.docker.network.bridge.enable_ip_masquerade".to_string(),
+                    "true".to_string(),
+                ),
+            ])),
+            labels: Some(HashMap::from([
+                ("com.rcoder.network".to_string(), "true".to_string()),
+                ("com.rcoder.network.created".to_string(), created_time),
+            ])),
+            ..Default::default()
         };
 
         match self.docker.create_network(network_config).await {
@@ -682,15 +690,12 @@ impl DockerManager {
 
     /// 检查网络是否存在
     async fn inspect_network(&self, network_name: &str) -> DockerResult<()> {
-        use bollard::network::ListNetworksOptions;
+        use bollard::query_parameters::ListNetworksOptions;
 
-        let options = ListNetworksOptions {
-            filters: HashMap::from([("name", vec![network_name])]),
-        };
-
+        // 使用 list_networks 不带参数，然后手动过滤
         let networks = self
             .docker
-            .list_networks(Some(options))
+            .list_networks(None::<ListNetworksOptions>)
             .await
             .map_err(|e| DockerError::ConnectionError(format!("列出网络失败: {}", e)))?;
 
@@ -710,11 +715,11 @@ impl DockerManager {
         container_id: &str,
         network_name: &str,
     ) -> DockerResult<()> {
-        use bollard::network::ConnectNetworkOptions;
+        use bollard::models::NetworkConnectRequest;
 
-        let connect_config = ConnectNetworkOptions {
-            container: container_id.to_string(),
-            endpoint_config: Default::default(),
+        let connect_config = NetworkConnectRequest {
+            container: Some(container_id.to_string()),
+            endpoint_config: None,
         };
 
         match self
