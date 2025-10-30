@@ -24,6 +24,7 @@ pub struct CancelQuery {
     pub project_id: String,
     /// 会话ID，用于标识要取消的会话（可选，如果不提供则从项目会话中获取）
     #[param(example = "session456")]
+    #[serde(default)]
     pub session_id: Option<String>,
 }
 
