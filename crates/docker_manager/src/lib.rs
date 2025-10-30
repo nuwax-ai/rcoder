@@ -1,4 +1,3 @@
-
 use thiserror::Error;
 use tracing::error;
 
@@ -93,8 +92,12 @@ pub const DEFAULT_WORK_DIR: &str = "/app";
 /// 默认的网络模式
 pub const DEFAULT_NETWORK_MODE: &str = "bridge";
 
-/// RCoder 专用网络名称
-pub const RCODER_NETWORK_NAME: &str = "agent-network";
+/// RCoder 专用网络名称（基础名称，不含 project name 前缀）
+/// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_name}
+/// 例如: rcoder_agent-network, myapp_agent-network
+///
+/// ⚠️ 注意：实际使用时必须动态检测主容器所在的网络，不能硬编码
+pub const RCODER_NETWORK_BASE_NAME: &str = "agent-network";
 
 /// 全局 Docker 管理器实例
 pub mod global {

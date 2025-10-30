@@ -203,6 +203,12 @@ pub async fn get_container_ip(
         .await
         .map_err(|e| anyhow::anyhow!("获取容器网络信息失败: {}", e))?;
 
+    // 🔍 调试：打印网络名称的详细信息
+    info!("🔍 查找网络: '{}' (长度: {})", network_name, network_name.len());
+    for (name, ip) in &network_ips {
+        info!("🔍 可用网络: '{}' (长度: {}) -> {}", name, name.len(), ip);
+    }
+
     // 查找指定网络的 IP 地址
     if let Some(ip_address) = network_ips.get(network_name) {
         let server_url = format!("http://{}:8086", ip_address);
