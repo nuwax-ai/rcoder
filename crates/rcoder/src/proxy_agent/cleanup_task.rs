@@ -41,10 +41,7 @@ impl AgentInfoAccess for ProjectAndContainerInfo {
 
     fn status(&self) -> Option<AgentStatus> {
         // AgentStatus实现了Copy，可以直接解引用
-        match ProjectAndContainerInfo::status(self) {
-            Some(status) => Some(*status),
-            None => None,
-        }
+        ProjectAndContainerInfo::status(self).copied()
     }
 }
 
@@ -63,10 +60,7 @@ impl AgentInfoAccess for Arc<ProjectAndContainerInfo> {
     }
 
     fn status(&self) -> Option<AgentStatus> {
-        match ProjectAndContainerInfo::status(self) {
-            Some(status) => Some(*status),
-            None => None,
-        }
+        ProjectAndContainerInfo::status(self).copied()
     }
 }
 
@@ -275,7 +269,7 @@ impl AgentCleaner {
         let mut agents_to_remove = Vec::new();
 
         // 📊 统计各类agent数量
-        let mut protected_agents = 0;
+        let protected_agents = 0;
         let mut active_agents = 0;
         let mut non_timeout_agents = 0;
 
@@ -501,7 +495,7 @@ impl AgentCleaner {
                             // 🚀 优化3: 使用容器的创建时间而不是查询详细信息
                             if let Some(created_at) = container.created {
                                 let created_time = DateTime::from_timestamp(created_at, 0)
-                                    .unwrap_or_else(|| Utc::now());
+                                    .unwrap_or_else(Utc::now);
 
                                 if self
                                     .should_skip_cleanup_due_to_protection(created_time, project_id)
@@ -590,11 +584,10 @@ impl AgentCleaner {
         // 等待所有清理任务完成
         let mut cleaned_count = 0;
         for task in cleanup_tasks {
-            if let Ok(success) = task.await {
-                if success {
+            if let Ok(success) = task.await
+                && success {
                     cleaned_count += 1;
                 }
-            }
         }
 
         if cleaned_count > 0 || protected_count > 0 {
@@ -765,14 +758,13 @@ impl AgentCleaner {
             );
 
             // 释放端口（如果存在）
-            if let Some(port_binding) = container_info.port_bindings.values().next() {
-                if let Ok(port) = port_binding.parse::<u16>() {
+            if let Some(port_binding) = container_info.port_bindings.values().next()
+                && let Ok(port) = port_binding.parse::<u16>() {
                     crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
                         .release_port(port)
                         .await;
                     info!("🧼 [cleanup] 释放端口: port={}", port);
                 }
-            }
 
             // 使用统一的运行时清理接口
             docker_manager::container_stop::runtime_cleanup_container(

@@ -30,6 +30,12 @@ pub struct PerPortMetrics {
     pub total_response_time_ns: AtomicU64,
 }
 
+impl Default for PerPortMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PerPortMetrics {
     pub fn new() -> Self {
         Self {
@@ -200,6 +206,12 @@ pub struct HealthInfo {
 pub struct TrackingCtx {
     pub start: std::time::Instant,
     pub target_port: Option<u16>,
+}
+
+impl Default for TrackingCtx {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TrackingCtx {

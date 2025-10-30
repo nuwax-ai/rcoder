@@ -1,7 +1,6 @@
 use super::{
     CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerStatus,
-    DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
-    MountPoint, RCODER_NETWORK_NAME,
+    DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult, RCODER_NETWORK_NAME,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
@@ -11,16 +10,14 @@ use bollard::query_parameters::{
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     models::{
-        ContainerCreateBody, ContainerSummary, HostConfig, Mount, Network, NetworkingConfig,
+        ContainerCreateBody, ContainerSummary, HostConfig, Mount, NetworkingConfig,
         PortBinding,
     },
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::Instant;
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -761,17 +758,15 @@ impl DockerManager {
 
         let mut network_ips = HashMap::new();
 
-        if let Some(network_settings) = inspect.unwrap().network_settings {
-            if let Some(networks) = network_settings.networks {
+        if let Some(network_settings) = inspect.unwrap().network_settings
+            && let Some(networks) = network_settings.networks {
                 for (network_name, network_info) in networks {
-                    if let Some(ip_address) = network_info.ip_address {
-                        if !ip_address.is_empty() {
+                    if let Some(ip_address) = network_info.ip_address
+                        && !ip_address.is_empty() {
                             network_ips.insert(network_name, ip_address);
                         }
-                    }
                 }
             }
-        }
 
         Ok(network_ips)
     }
@@ -795,7 +790,7 @@ impl DockerManager {
             match status {
                 Some(bollard::models::ContainerStateStatusEnum::RUNNING) => {
                     info!("✅ 容器 {} 正在运行", container_id);
-                    return Ok(());
+                    Ok(())
                 }
                 Some(bollard::models::ContainerStateStatusEnum::EXITED) => {
                     let error_msg = state.error.as_deref().unwrap_or("未知错误");
@@ -803,40 +798,40 @@ impl DockerManager {
                         "❌ 容器 {} 已退出 (退出码: {}): {}",
                         container_id, exit_code, error_msg
                     );
-                    return Err(DockerError::ContainerStartError(format!(
+                    Err(DockerError::ContainerStartError(format!(
                         "容器启动后立即退出: {} (退出码: {}), 错误: {}",
                         container_id, exit_code, error_msg
-                    )));
+                    )))
                 }
                 Some(bollard::models::ContainerStateStatusEnum::CREATED) => {
                     warn!("⚠️ 容器 {} 已创建但未启动", container_id);
-                    return Err(DockerError::ContainerStartError(format!(
+                    Err(DockerError::ContainerStartError(format!(
                         "容器已创建但未启动: {}",
                         container_id
-                    )));
+                    )))
                 }
                 Some(status) => {
                     let status_str = format!("{:?}", status);
                     error!("❌ 容器 {} 处于未知状态: {}", container_id, status_str);
-                    return Err(DockerError::ContainerStartError(format!(
+                    Err(DockerError::ContainerStartError(format!(
                         "容器处于未知状态: {} - {}",
                         container_id, status_str
-                    )));
+                    )))
                 }
                 None => {
                     error!("❌ 容器 {} 状态为空", container_id);
-                    return Err(DockerError::ContainerStartError(format!(
+                    Err(DockerError::ContainerStartError(format!(
                         "容器状态为空: {}",
                         container_id
-                    )));
+                    )))
                 }
             }
         } else {
             error!("❌ 无法获取容器 {} 的状态信息", container_id);
-            return Err(DockerError::ContainerStartError(format!(
+            Err(DockerError::ContainerStartError(format!(
                 "无法获取容器状态信息: {}",
                 container_id
-            )));
+            )))
         }
     }
 

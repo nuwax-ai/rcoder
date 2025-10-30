@@ -3,8 +3,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{debug, info, warn};
 
 /// 端口管理器
 #[derive(Debug)]

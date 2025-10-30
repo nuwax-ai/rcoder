@@ -88,7 +88,7 @@ impl ContainerManager {
     /// 动态获取 Docker Compose 项目名称
     async fn get_dynamic_compose_project_name(&self, docker_manager: &Arc<DockerManager>) -> Option<String> {
         // 方法1：通过环境变量（最直接）
-        if let Some(project_name) = std::env::var("COMPOSE_PROJECT_NAME").ok() {
+        if let Ok(project_name) = std::env::var("COMPOSE_PROJECT_NAME") {
             info!("✅ [CONTAINER_MGR] 通过环境变量获取项目名称: {}", project_name);
             return Some(project_name);
         }
@@ -228,10 +228,10 @@ impl ContainerManager {
                 project_id, container_basic_info.container_id
             );
 
-            return Ok(Some(container_basic_info));
+            Ok(Some(container_basic_info))
         } else {
             debug!("[CONTAINER_MGR] 容器不存在: project_id={}", project_id);
-            return Ok(None);
+            Ok(None)
         }
     }
 }
@@ -341,7 +341,7 @@ async fn create_container_for_request(
     })?;
 
     // 获取动态网络名称
-    let network_name = ContainerManager.get_dynamic_network_name(&docker_manager).await;
+    let network_name = ContainerManager.get_dynamic_network_name(docker_manager).await;
     info!("🌐 [CONTAINER_MGR] 使用网络名称: {}", network_name);
 
     // 启动容器（主要目的是创建容器和通信通道）
@@ -384,7 +384,7 @@ async fn create_container_for_request(
         })?;
 
     // 获取容器在动态网络中的 IP 地址
-    let network_name = ContainerManager.get_dynamic_network_name(&docker_manager).await;
+    let network_name = ContainerManager.get_dynamic_network_name(docker_manager).await;
     let container_ip = network_ips.get(&network_name).ok_or_else(|| {
         error!(
             "❌ [CONTAINER_MGR] 新容器 {} 未连接到网络: {}",

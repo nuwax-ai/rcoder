@@ -205,19 +205,16 @@ async fn create_sse_proxy_stream(
                                         );
 
                                         // 直接透传原始 SSE 数据
-                                        if let Ok(event_text) = String::from_utf8(event_data) {
-                                            if let Some(event) =
+                                        if let Ok(event_text) = String::from_utf8(event_data)
+                                            && let Some(event) =
                                                 create_passthrough_event(&event_text)
-                                            {
-                                                if tx.send(Ok(event)).await.is_err() {
+                                                && tx.send(Ok(event)).await.is_err() {
                                                     warn!(
                                                         "⚠️ [SSE_PROXY] 客户端已断开连接: session_id={}",
                                                         session_id
                                                     );
                                                     break;
                                                 }
-                                            }
-                                        }
                                     }
                                 }
                             }
@@ -370,11 +367,10 @@ fn find_container_by_session_id(
     // 如果 sessions 中没找到，遍历 project_and_agent_map 查找
     for entry in state.project_and_agent_map.iter() {
         let agent_info = entry.value();
-        if let Some(agent_session_id) = agent_info.session_id() {
-            if agent_session_id == session_id {
+        if let Some(agent_session_id) = agent_info.session_id()
+            && agent_session_id == session_id {
                 return Some((entry.key().clone(), agent_info.clone()));
             }
-        }
     }
     None
 }

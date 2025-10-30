@@ -2,15 +2,14 @@
 //!
 //! 转发停止请求到容器内的 agent_runner 服务
 
-use axum::extract::{Path, Query, State};
-use reqwest::Client;
+use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument};
+use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AgentStatusResponse, AppError, HttpResult, proxy_agent::docker_container_agent,
+    AppError, HttpResult,
     router::AppState,
 };
 

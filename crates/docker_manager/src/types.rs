@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
 
 /// Docker 容器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,7 +263,7 @@ impl Default for DockerManagerConfig {
 }
 
 /// 容器清理结果统计
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CleanupResult {
     /// 找到的容器数量
     pub total_found: usize,
@@ -282,19 +281,6 @@ pub struct CleanupResult {
     pub duration_ms: u64,
 }
 
-impl Default for CleanupResult {
-    fn default() -> Self {
-        Self {
-            total_found: 0,
-            successfully_removed: 0,
-            failed_removals: 0,
-            skipped_running: 0,
-            removed_container_ids: Vec::new(),
-            failed_removals_details: Vec::new(),
-            duration_ms: 0,
-        }
-    }
-}
 
 impl CleanupResult {
     /// 是否完全成功（没有失败）
@@ -405,7 +391,7 @@ impl ContainerFilter {
             }
             ContainerFilter::Label(key, value) => {
                 if let Some(labels) = &container.labels {
-                    labels.get(key.as_str()).map_or(false, |v| v == value)
+                    labels.get(key.as_str()) == Some(value)
                 } else {
                     false
                 }

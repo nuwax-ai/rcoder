@@ -1,9 +1,8 @@
 //! ACP 代理服务的公共 trait 定义
 
-use crate::model::{ChatPrompt, ProjectAndAgentInfo};
+use crate::model::ChatPrompt;
 use anyhow::Result;
 use shared_types::ModelProviderConfig;
-use tracing::info;
 
 /// ACP 代理服务 trait
 ///

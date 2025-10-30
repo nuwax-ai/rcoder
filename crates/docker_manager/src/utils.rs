@@ -159,7 +159,7 @@ impl DockerUtils {
         // 规范化路径
         absolute_path
             .canonicalize()
-            .unwrap_or_else(|_| absolute_path)
+            .unwrap_or(absolute_path)
             .to_string_lossy()
             .to_string()
     }

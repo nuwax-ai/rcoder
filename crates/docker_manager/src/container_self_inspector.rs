@@ -5,7 +5,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use bollard::{Docker, API_DEFAULT_VERSION};
-use std::path::Path;
 use tokio::fs;
 use tracing::{debug, info, warn};
 

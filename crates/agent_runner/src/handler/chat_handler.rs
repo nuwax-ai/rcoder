@@ -196,8 +196,8 @@ pub async fn handle_chat(
     };
 
     // 🚦 检查 Agent 状态，禁止并发请求
-    if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
-        if agent_info.status == AgentStatus::Active {
+    if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(&project_id)
+        && agent_info.status == AgentStatus::Active {
             info!(
                 "⚠️ [chat] Agent正在执行任务，拒绝并发请求: project_id={}, status={:?}",
                 project_id, agent_info.status
@@ -207,7 +207,6 @@ pub async fn handle_chat(
                 "Agent正在执行任务，请等待当前任务完成后再发送新请求",
             ));
         }
-    }
 
     // 🗑️ 简单直接：直接移除所有相关session，确保全新开始
     // 新的设计：移除旧session → Agent必须重新获取sender → 前端只能获取新消息
@@ -226,16 +225,14 @@ pub async fn handle_chat(
             let current_session_id = session_entry.key();
             let session_info = session_entry.value();
 
-            if let Some(session_project_id) = &session_info.project_id {
-                if session_project_id == &project_id {
-                    if crate::service::SESSION_CACHE
+            if let Some(session_project_id) = &session_info.project_id
+                && session_project_id == &project_id
+                    && crate::service::SESSION_CACHE
                         .remove(current_session_id)
                         .is_some()
                     {
                         cleared_sessions += 1;
                     }
-                }
-            }
         }
 
         if cleared_sessions > 0 {
