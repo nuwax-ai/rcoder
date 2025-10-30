@@ -78,7 +78,10 @@ const CONFIG_FILE: &str = "config.yml";
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "codex")]
             default_agent: AgentType::Codex,
+            #[cfg(not(feature = "codex"))]
+            default_agent: AgentType::Claude,
             projects_dir: PathBuf::from("./project_workspace"),
             port: 8086,
             proxy_config: Some(ProxyConfig::default()),

@@ -3,6 +3,19 @@ members = ["crates/*"]
 exclude = ["tmp/*", "crates/ai-agents"]
 resolver = "2"
 
+# 默认不编译 codex-acp-agent，只在启用 codex feature 时编译
+default-members = [
+    "crates/rcoder",
+    "crates/agent_runner",
+    "crates/shared_types",
+    "crates/docker_manager",
+    "crates/acp_adapter",
+    "crates/claude-code-agent",
+    "crates/pingora-proxy",
+]
+
+
+
 [workspace.lints]
 rustdoc.unbroken_backticks = "warn"
 rustdoc.redundant_explicit_links = "warn"
@@ -23,11 +36,16 @@ publish = false
 # ACP Protocol
 agent-client-protocol = "0.7"
 
-# Codex dependencies
+# Codex dependencies (optional, enable with --features codex)
 codex-acp = { git = "https://github.com/soddygo/codex-acp.git", branch = "feat-add-args" }
 codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
 codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+
+# 如果上面的版本有问题，可以尝试使用 main 分支或指定 rev
+# codex-core = { git = "https://github.com/zed-industries/codex", branch = "main", optional = true }
+# codex-common = { git = "https://github.com/zed-industries/codex", branch = "main", features = ["cli"], optional = true }
+# codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "main", optional = true }
 piper = "0.2"
 
 clap= { version = "4.5", features = ["derive", "env"] }
@@ -185,3 +203,6 @@ pingora = { version = "0.6", features = ["lb"] }
 structopt = "0.3"
 
 bollard={version = "0.19"}
+
+
+

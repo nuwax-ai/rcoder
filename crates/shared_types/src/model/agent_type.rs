@@ -2,6 +2,7 @@
 
 use super::model_provider::ModelProviderConfig;
 use anyhow::Result;
+#[cfg(feature = "codex")]
 use codex_core::{
     ModelProviderInfo, WireApi,
     config::{ConfigToml, find_codex_home, load_config_as_toml},
@@ -10,12 +11,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{error, info, warn};
 
+#[cfg(feature = "codex")]
 pub static CUSTOM_MODEL_PROVIDER_NAME: &str = "custom";
 
 /// 使用Agent代理的工具类型,都是使用ACP协议包装过的agent代理
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentType {
     /// OpenAI Codex 代理
+    #[cfg(feature = "codex")]
     Codex,
     /// Claude Code 代理
     Claude,
@@ -30,6 +33,7 @@ impl Default for AgentType {
 impl std::fmt::Display for AgentType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "codex")]
             AgentType::Codex => write!(f, "codex"),
             AgentType::Claude => write!(f, "claude"),
         }
@@ -41,18 +45,27 @@ impl std::str::FromStr for AgentType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            #[cfg(feature = "codex")]
             "codex" => Ok(AgentType::Codex),
             "claude" => Ok(AgentType::Claude),
-            _ => Err(format!(
-                "Invalid agent type: {}. Must be one of: codex, claude",
-                s
-            )),
+            _ => {
+                #[cfg(feature = "codex")]
+                let valid_types = "codex, claude";
+                #[cfg(not(feature = "codex"))]
+                let valid_types = "claude";
+                
+                Err(format!(
+                    "Invalid agent type: {}. Must be one of: {}",
+                    s, valid_types
+                ))
+            }
         }
     }
 }
 
 impl AgentType {
     /// 获取 codex 环境变量的模型提供商配置
+    #[cfg(feature = "codex")]
     pub async fn codex_from_env() -> Result<ConfigToml> {
         // 加载配置
         // 首先获取codex home目录 (~/.codex)
@@ -104,6 +117,7 @@ impl AgentType {
         match model_provider {
             Some(provider) => match provider.name.as_str() {
                 "anthropic" => AgentType::Claude,
+                #[cfg(feature = "codex")]
                 "openai" => AgentType::Codex,
                 _ => AgentType::Claude, // 默认使用 Claude
             },
@@ -112,6 +126,7 @@ impl AgentType {
     }
 
     /// 获取 codex 模型提供商配置
+    #[cfg(feature = "codex")]
     #[allow(dead_code)]
     pub async fn codex_model_provider(
         model_provider: Option<ModelProviderConfig>,
