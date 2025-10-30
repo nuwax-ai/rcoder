@@ -6,7 +6,7 @@ version = 4
 name = "acp-adapter"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
+ "agent-client-protocol 0.7.0",
  "anyhow",
  "async-trait",
  "bytes 1.10.1",
@@ -58,7 +58,7 @@ version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76133c067c37ae7a3641c3ad1ec88f36aac06cea5f9b3b49b5c29f18214f9101"
 dependencies = [
- "agent-client-protocol-schema",
+ "agent-client-protocol-schema 0.4.10",
  "anyhow",
  "async-broadcast",
  "async-trait",
@@ -66,6 +66,24 @@ dependencies = [
  "log",
  "parking_lot",
  "schemars 1.0.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "agent-client-protocol"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525705e39c11cd73f7bc784e3681a9386aa30c8d0630808d3dc2237eb4f9cb1b"
+dependencies = [
+ "agent-client-protocol-schema 0.6.2",
+ "anyhow",
+ "async-broadcast",
+ "async-trait",
+ "derive_more",
+ "futures 0.3.31",
+ "log",
+ "parking_lot",
  "serde",
  "serde_json",
 ]
@@ -83,11 +101,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-client-protocol-schema"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecf16c18fea41282d6bbadd1549a06be6836bddb1893f44a6235f340fa24e2af"
+dependencies = [
+ "anyhow",
+ "derive_more",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agent_runner"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol",
+ "agent-client-protocol 0.7.0",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -1005,7 +1036,7 @@ name = "claude-code-agent"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol",
+ "agent-client-protocol 0.7.0",
  "anyhow",
  "async-trait",
  "dirs",
@@ -1036,7 +1067,7 @@ name = "codex-acp"
 version = "0.2.7"
 source = "git+https://github.com/soddygo/codex-acp.git?branch=feat-add-args#3a3c1deebf78d3c7c6cdcfdfb3759e56923ef633"
 dependencies = [
- "agent-client-protocol",
+ "agent-client-protocol 0.4.7",
  "anyhow",
  "async-trait",
  "clap 4.5.49",
@@ -1743,6 +1774,27 @@ checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
 dependencies = [
  "derive_builder_core",
  "syn 2.0.106",
+]
+
+[[package]]
+name = "derive_more"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "093242cf7570c207c83073cf82f79706fe7b8317e98620a47d5be7c3d8497678"
+dependencies = [
+ "derive_more-impl",
+]
+
+[[package]]
+name = "derive_more-impl"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bda628edc44c4bb645fbe0f758797143e4e07926f7ebf4e9bdfbd3d2ce621df3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -4378,7 +4430,7 @@ name = "rcoder"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol",
+ "agent-client-protocol 0.7.0",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -5217,7 +5269,7 @@ dependencies = [
 name = "shared_types"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
+ "agent-client-protocol 0.7.0",
  "anyhow",
  "async-stream",
  "axum",
@@ -6256,6 +6308,12 @@ name = "unicode-width"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
+
+[[package]]
+name = "unicode-xid"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unsafe-libyaml"
