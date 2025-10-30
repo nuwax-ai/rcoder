@@ -25,8 +25,7 @@ use crate::proxy_agent::agent_stop_handle::AgentStopHandleArc;
 /// 用于在 session_notification 回调中获取当前请求的 request_id
 /// 避免使用 PROJECT_AND_AGENT_INFO_MAP 导致的锁竞争问题
 /// 注意：使用 project_id 而非 session_id，确保同一项目的多次请求能自动覆盖为最新值
-pub static SESSION_REQUEST_CONTEXT: LazyLock<DashMap<String, String>> =
-    LazyLock::new(DashMap::new);
+pub static SESSION_REQUEST_CONTEXT: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
 /// ACP协议的连接信息
 pub struct AcpConnectionInfo {
@@ -158,7 +157,8 @@ impl Client for AcpAgentClient {
         let session_id_str = args.session_id.to_string();
 
         // 先尝试从 SessionNotification.meta 中获取 request_id
-        let request_id_from_notification = args.meta
+        let request_id_from_notification = args
+            .meta
             .as_ref()
             .and_then(|meta| meta.get("request_id"))
             .and_then(|v| v.as_str())
@@ -213,8 +213,8 @@ impl Client for AcpAgentClient {
 
         // 记录日志（保持原有的详细日志）
         match &args.update {
-            agent_client_protocol::SessionUpdate::AgentMessageChunk { content } => {
-                let text = match content {
+            agent_client_protocol::SessionUpdate::AgentMessageChunk(content_chunk) => {
+                let text = match &content_chunk.content {
                     agent_client_protocol::ContentBlock::Text(text_content) => {
                         text_content.text.clone()
                     }
