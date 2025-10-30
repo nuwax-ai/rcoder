@@ -22,9 +22,9 @@ pub struct CancelQuery {
     /// 项目ID，用于标识特定的项目
     #[param(example = "test_project")]
     pub project_id: String,
-    /// 会话ID，用于标识要取消的会话
+    /// 会话ID，用于标识要取消的会话（可选，如果不提供则从项目会话中获取）
     #[param(example = "session456")]
-    pub session_id: String,
+    pub session_id: Option<String>,
 }
 
 /// 取消任务的响应
@@ -110,12 +110,40 @@ pub async fn agent_session_cancel(
     State(_state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
+    let project_id = query.project_id.clone();
+
+    // 如果 session_id 为空，从 PROJECT_AND_AGENT_INFO_MAP 中根据 project_id 获取
+    let session_id = match query.session_id {
+        Some(sid) => sid,
+        None => {
+            debug!(
+                "🔍 session_id 为空，尝试从 PROJECT_AND_AGENT_INFO_MAP 中获取: project_id={}",
+                project_id
+            );
+            match PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
+                Some(project_info) => {
+                    let sid = project_info.session_id.to_string();
+                    info!(
+                        "✅ 从 PROJECT_AND_AGENT_INFO_MAP 中获取到 session_id: {}",
+                        sid
+                    );
+                    sid
+                }
+                None => {
+                    warn!("❌ 未找到 project_id: {} 对应的 Agent 信息", project_id);
+                    return Err(AppError::AnyhowError(anyhow::anyhow!(
+                        "未找到项目 {} 对应的 Agent 信息",
+                        project_id
+                    )));
+                }
+            }
+        }
+    };
+
     info!(
-        "🛑 收到取消任务请求: session_id={}, project_id={:?}",
-        query.session_id, query.project_id
+        "🛑 收到取消任务请求: session_id={}, project_id={}",
+        session_id, project_id
     );
-    let session_id = query.session_id;
-    let project_id = query.project_id;
 
     // 创建SessionId
     let session_id_obj = SessionId(Arc::from(session_id.as_str()));

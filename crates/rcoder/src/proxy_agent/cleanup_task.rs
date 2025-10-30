@@ -607,11 +607,13 @@ impl AgentCleaner {
         cleaned_count
     }
 
-    /// 🆕 清理单个孤立容器 - 独立方法，避免重复代码
+    /// 清理单个孤立容器
+    /// 
+    /// 使用统一的运行时清理策略
     async fn cleanup_single_orphaned_container(
-        docker_manager: &docker_manager::DockerManager,
+        docker_manager: &Arc<docker_manager::DockerManager>,
         _state: &Arc<AppState>,
-        config: &CleanupConfig,
+        _config: &CleanupConfig,
         project_id: &str,
         container_name: &str,
     ) -> Result<()> {
@@ -632,46 +634,15 @@ impl AgentCleaner {
             }
         };
 
-        // 停止容器
-        let stop_timeout = config.docker_stop_timeout;
-        let container_id = container_info.container_id.clone();
-        let timeout_seconds = stop_timeout.as_secs();
-
-        let stop_result = timeout(
-            stop_timeout,
-            docker_manager.stop_container_by_id_with_timeout(&container_id, timeout_seconds),
+        // 使用统一的运行时清理接口
+        docker_manager::container_stop::runtime_cleanup_container(
+            docker_manager,
+            &container_info.container_id,
         )
-        .await;
+        .await
+        .map_err(|e| anyhow::anyhow!("清理容器失败: {}", e))?;
 
-        match stop_result {
-            Ok(Ok(_)) => {
-                info!("✅ 容器停止成功: {}", container_id);
-            }
-            Ok(Err(e)) => {
-                warn!("⚠️ 容器停止失败: {} - {}", container_id, e);
-            }
-            Err(_) => {
-                warn!(
-                    "⏰ 容器停止超时: {} (超时时间: {}秒)",
-                    container_id,
-                    stop_timeout.as_secs()
-                );
-            }
-        }
-
-        // 删除容器 - 使用正确的方法名
-        if let Err(e) = docker_manager
-            .stop_and_remove_containers_by_ids(
-                vec![container_id.clone()],
-                docker_manager::types::CleanupOptions::default(),
-            )
-            .await
-        {
-            warn!("⚠️ 删除容器失败: {} - {}", container_id, e);
-        } else {
-            info!("✅ 容器删除成功: {}", container_id);
-        }
-
+        info!("✅ 容器清理成功: {}", container_name);
         Ok(())
     }
 
@@ -765,130 +736,58 @@ impl AgentCleaner {
         }
     }
 
-    /// 销毁Docker容器（参考 agent_stop_handler.rs 的实现）
+    /// 销毁Docker容器
+    /// 
+    /// 使用统一的运行时清理策略
     async fn destroy_docker_container(&self, project_id: &str) -> Result<()> {
         info!("🔥 [cleanup] 开始销毁Docker容器: project_id={}", project_id);
 
-        // 为Docker操作添加总体超时保护
-        let docker_result = tokio::time::timeout(
-            Duration::from_secs(30), // 30秒总超时
-            async {
-                info!("🐳 [cleanup] 获取全局DockerManager: project_id={}", project_id);
+        // 使用全局 DockerManager
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
 
-                // 使用全局 DockerManager
-                let docker_manager = docker_manager::global::get_global_docker_manager()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
+        // 1. 先通过 project_id 查找容器
+        let mut container_info = docker_manager.get_container_info(project_id);
 
-                info!("🔍 [cleanup] 开始查找容器: project_id={}", project_id);
-
-                // 1. 先通过 project_id 查找
-                let mut container_info = docker_manager.get_container_info(&project_id);
-                info!("📋 [cleanup] 通过project_id查找结果: found={}, project_id={}", container_info.is_some(), project_id);
-
-                // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
-                if container_info.is_none() {
-                    let expected_container_name = format!("rcoder-agent-{}", project_id);
-                    info!(
-                        "🔍 [cleanup] 通过 project_id 未找到，尝试通过容器名称查找: {}",
-                        expected_container_name
-                    );
-
-                    // 为容器查找添加超时保护
-                    let find_result = tokio::time::timeout(
-                        Duration::from_secs(10), // 10秒查找超时
-                        docker_manager.find_container_by_identifier(&expected_container_name)
-                    ).await;
-
-                    match find_result {
-                        Ok(result) => {
-                            container_info = result;
-                            info!("📋 [cleanup] 通过容器名称查找结果: found={}, name={}", container_info.is_some(), expected_container_name);
-                        }
-                        Err(_) => {
-                            warn!("⏰ [cleanup] 容器查找超时: name={}", expected_container_name);
-                            return Ok(());
-                        }
-                    }
-                }
-
-                if let Some(container_info) = container_info {
-                    info!(
-                        "🎯 [cleanup] 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
-                        project_id, container_info.container_id, container_info.container_name
-                    );
-
-                    info!("🔌 [cleanup] 开始释放端口: project_id={}", project_id);
-
-                    // 释放对应的端口（如果存在端口映射）
-                    if let Some(port_binding) = container_info.port_bindings.values().next() {
-                        if let Ok(port) = port_binding.parse::<u16>() {
-                            crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-                                .release_port(port)
-                                .await;
-                            info!("🧼 [cleanup] 释放端口成功: port={}, project_id={}", port, project_id);
-                        }
-                    } else {
-                        info!("📝 [cleanup] 无端口需要释放: project_id={}", project_id);
-                    }
-
-                    info!("⚡ [cleanup] 开始强制停止容器 (无优雅时间): container_id={}", container_info.container_id);
-
-                    // 🚀 立即强制停止容器，不给优雅退出时间 (timeout_seconds=0)
-                    let container_id = container_info.container_id.clone();
-
-                    let stop_result = tokio::time::timeout(
-                        Duration::from_secs(15), // 15秒停止超时
-                        docker_manager.stop_container_by_id_with_timeout(&container_id, 0) // 0秒 = 立即强制停止
-                    ).await;
-
-                    match stop_result {
-                        Ok(Ok(_)) => {
-                            info!("✅ [cleanup] Docker容器强制停止成功: container_id={}", container_info.container_id);
-                        }
-                        Ok(Err(e)) => {
-                            warn!("⚠️ [cleanup] Docker容器强制停止失败: {} - {}", container_info.container_id, e);
-                            // 继续执行，不要因为停止失败就中断整个清理过程
-                        }
-                        Err(_) => {
-                            warn!("⏰ [cleanup] Docker容器强制停止超时 (15秒): container_id={}", container_info.container_id);
-                            // 继续执行，不要因为超时就中断整个清理过程
-                        }
-                    }
-
-                    info!(
-                        "✅ [cleanup] Docker容器销毁流程完成: project_id={}, container_id={}, container_name={}",
-                        project_id, container_info.container_id, container_info.container_name
-                    );
-                } else {
-                    // 容器不存在，但返回成功
-                    info!(
-                        "📭 [cleanup] Docker容器不存在，无需销毁: project_id={}",
-                        project_id
-                    );
-                }
-
-                Ok(())
-            }
-        ).await;
-
-        match docker_result {
-            Ok(result) => {
-                info!(
-                    "🎯 [cleanup] Docker容器销毁操作完成: project_id={}",
-                    project_id
-                );
-                result
-            }
-            Err(_) => {
-                error!(
-                    "⏰ [cleanup] Docker容器销毁操作超时 (30秒): project_id={}",
-                    project_id
-                );
-                // 即使超时也返回 Ok，不要阻止后续清理
-                Ok(())
-            }
+        // 2. 如果没找到，尝试通过容器名称查找
+        if container_info.is_none() {
+            let expected_container_name = format!("rcoder-agent-{}", project_id);
+            container_info = docker_manager
+                .find_container_by_identifier(&expected_container_name)
+                .await;
         }
+
+        if let Some(container_info) = container_info {
+            info!(
+                "🎯 [cleanup] 找到容器: project_id={}, container_id={}",
+                project_id, container_info.container_id
+            );
+
+            // 释放端口（如果存在）
+            if let Some(port_binding) = container_info.port_bindings.values().next() {
+                if let Ok(port) = port_binding.parse::<u16>() {
+                    crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
+                        .release_port(port)
+                        .await;
+                    info!("🧼 [cleanup] 释放端口: port={}", port);
+                }
+            }
+
+            // 使用统一的运行时清理接口
+            docker_manager::container_stop::runtime_cleanup_container(
+                &docker_manager,
+                &container_info.container_id,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
+
+            info!("✅ [cleanup] Docker容器销毁完成: project_id={}", project_id);
+        } else {
+            info!("📭 [cleanup] Docker容器不存在: project_id={}", project_id);
+        }
+
+        Ok(())
     }
 
     /// 运行清理任务 - 简化版，只做定时清理

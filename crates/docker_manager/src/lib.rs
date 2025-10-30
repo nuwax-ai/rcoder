@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub mod container_self_inspector;
+pub mod container_stop;
 pub mod manager;
 pub mod types;
 pub mod utils;

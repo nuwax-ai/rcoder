@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
@@ -20,7 +20,7 @@ mod utils;
 use model::*;
 
 use config::{CliArgs, load_config_with_args};
-use pingora_proxy::{PingoraServerManager, ProxyConfig, PingoraProxyService};
+use pingora_proxy::{PingoraProxyService, PingoraServerManager, ProxyConfig};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
 
@@ -83,7 +83,10 @@ async fn main() -> anyhow::Result<()> {
             "启动 Pingora 反向代理服务，监听端口: {}",
             proxy_config.listen_port
         );
-        info!("代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/{}/health", config.port);
+        info!(
+            "代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/{}/health",
+            config.port
+        );
 
         let pingora_config = ProxyConfig {
             listen_port: proxy_config.listen_port,
@@ -100,7 +103,8 @@ async fn main() -> anyhow::Result<()> {
         // 启动健康检查循环（按配置）
         if config.proxy_config.as_ref().unwrap().health_check.enabled {
             let hc = &config.proxy_config.as_ref().unwrap().health_check;
-            pingora_service.start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
+            pingora_service
+                .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
         }
 
         // 在后台任务中启动 Pingora 服务器
@@ -183,8 +187,12 @@ fn init_telemetry() -> anyhow::Result<()> {
         info!("创建日志目录: {:?}", logs_dir);
     }
 
-    // 设置按天滚动的文件 appender
-    let file_appender = RollingFileAppender::new(Rotation::DAILY, logs_dir, "rcoder");
+    // 设置按天滚动的文件 appender，保留最近5天的日志
+    let file_appender = tracing_appender::rolling::Builder::new()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("agent-runner")
+        .max_log_files(5) // 保留最近5个日志文件
+        .build(logs_dir)?;
 
     // 创建文件日志层 - JSON 格式，便于后续分析
     let file_layer = fmt::layer()
@@ -196,7 +204,9 @@ fn init_telemetry() -> anyhow::Result<()> {
         .with_thread_names(true);
 
     // 创建控制台日志层 - 简洁格式
-    let console_layer = fmt::layer().with_target(false).with_ansi(true);
+    let console_layer = fmt::layer()
+        .with_target(false)
+        .with_ansi(true);
 
     // 设置全局文本传播器（用于 trace context 传播）
     opentelemetry::global::set_text_map_propagator(
