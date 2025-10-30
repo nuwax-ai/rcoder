@@ -422,7 +422,7 @@ async fn forward_request_to_container_service(
                 container_http_result.code, container_http_result.message
             );
             error!("❌ [FORWARD] {}", error_message);
-            Ok(crate::HttpResult::error("CONTAINER_ERROR", &error_message))
+            Ok(crate::HttpResult::error(&container_http_result.code, &error_message))
         }
     } else {
         let error_text = format!("容器返回错误状态: {}", status);
