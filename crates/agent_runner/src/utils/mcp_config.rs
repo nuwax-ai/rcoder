@@ -98,8 +98,8 @@ pub fn create_default_mcp_servers(_api_key: Option<&str>) -> Vec<McpServer> {
     // 添加 context7 MCP 服务器
     servers.push(create_context7_mcp_server(None));
 
-    // 添加前端模板 MCP 服务器
-    servers.push(create_xagi_frontend_mcp_server());
+    // // 添加前端模板 MCP 服务器
+    // servers.push(create_xagi_frontend_mcp_server());
 
     // 添加 fetch MCP 服务器
     servers.push(create_fetch_mcp_server());
