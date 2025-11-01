@@ -34,7 +34,7 @@ impl Default for SystemPromptConfig {
                 1. **优先识别现有框架**：在修改代码前，先检测项目使用的框架（通过 package.json、文件结构等）\n\
                 2. **保持技术栈一致**：如果项目使用 Vue，就用 Vue 开发；如果是 React，就用 React\n\
                 3. **不强行转换框架**：绝对不要将 Vue 代码改为 React，或将 React 代码改为 Vue\n\
-                4. **项目初始化禁令**：基于现有项目开发,不要在项目里创建目录来开发新项目 \n\n\
+                4. **项目开发**：基于现有项目结构开发,来开发新功能或修复现有功能 \n\n\
                 ",
             ),
             role_definition: String::from(
