@@ -229,9 +229,11 @@ pub async fn agent_worker(
 
         // 检查 project_id 有对应的agent 服务,没有则创建
         let project_id = request.chat_prompt.project_id.clone();
-        let project_and_agent_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
-
-        if project_and_agent_info.is_some() {
+        
+        // 先检查是否存在Agent并提取必要信息，然后立即释放锁
+        let agent_exists = PROJECT_AND_AGENT_INFO_MAP.contains_key(&project_id);
+        
+        if agent_exists {
             info!("✅ 找到现有Agent，project_id: {}", project_id);
         } else {
             info!(
@@ -241,19 +243,43 @@ pub async fn agent_worker(
         }
 
         // 检查是否需要因模型配置变化而重启Agent服务
-        let need_restart_agent = if let Some(ref agent_info) = project_and_agent_info {
-            check_model_config_changed(&agent_info.model_provider, &request.model_provider)
+        let need_restart_agent = if agent_exists {
+            let agent_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
+            if let Some(ref info) = agent_info {
+                check_model_config_changed(&info.model_provider, &request.model_provider)
+            } else {
+                false
+            }
+            // agent_info 在这里自动释放，读锁被释放
         } else {
             false
         };
 
-        match project_and_agent_info {
-            Some(agent_info) if !need_restart_agent => {
-                // 模型配置未变化，复用现有Agent服务
-                info!("复用现有Agent服务，项目ID: {}", project_id);
+        if agent_exists && need_restart_agent {
+            // 模型配置发生变化，需要重启Agent服务
+            info!("检测到模型配置变化，重启Agent服务，项目ID: {}", project_id);
 
+            // ⚠️ 此时不持有任何锁，可以安全地获取写锁并 remove
+            PROJECT_AND_AGENT_INFO_MAP.remove(&project_id);
+
+            // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
+            crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(&project_id);
+            debug!(
+                "🧼 [acp_agent] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
+                project_id
+            );
+
+            // 创建新的Agent服务
+            create_new_agent_service(request, chat_prompt, project_id).await;
+        } else if agent_exists {
+            // 模型配置未变化，复用现有Agent服务
+            info!("复用现有Agent服务，项目ID: {}", project_id);
+
+            // 重新获取agent_info（短暂持有读锁）
+            if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
                 let session_id = agent_info.session_id.clone();
                 let prompt_tx = agent_info.prompt_tx.clone();
+                // 读锁在此处自动释放
 
                 debug!("复用Agent - session_id: {}, prompt_tx可用", session_id.0);
 
@@ -292,27 +318,9 @@ pub async fn agent_worker(
                     info!("✅ 回执消息发送成功，项目ID: {}", project_id);
                 }
             }
-            Some(agent_info) => {
-                // 模型配置发生变化，需要重启Agent服务
-                info!("检测到模型配置变化，重启Agent服务，项目ID: {}", project_id);
-
-                // 4. 释放读锁后，可以安全地获取写锁并 remove
-                PROJECT_AND_AGENT_INFO_MAP.remove(&project_id);
-
-                // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
-                crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(&project_id);
-                debug!(
-                    "🧼 [acp_agent] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
-                    project_id
-                );
-
-                // 创建新的Agent服务（执行与None分支相同的逻辑）
-                create_new_agent_service(request, chat_prompt, project_id).await;
-            }
-            None => {
-                // 创建新的Agent服务
-                create_new_agent_service(request, chat_prompt, project_id).await;
-            }
+        } else {
+            // 创建新的Agent服务
+            create_new_agent_service(request, chat_prompt, project_id).await;
         }
     }
     debug!("Agent worker finished");
