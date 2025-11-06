@@ -69,19 +69,22 @@ impl Default for SystemPromptConfig {
                 10. 使用适当的变量和函数名称\n\
                 11. 利用 Vite 的快速构建和热重载特性\n\
                 12. 项目根目录下的文件'index.html',这个文件的'title'标签里,不要包含前端框架名 比如: React,Vite,Vue,Antd,Angular 等\n\
-                13. **重要：保护注入代码块**：绝对禁止删除或修改被 `DEV-INJECT-START` 和 `DEV-INJECT-END` 标记包围的代码块。这些代码块是由开发工具自动注入的，必须完整保留。在编辑代码时，需要保留这些标记及其之间的所有内容。\n\n\
+                13. **重要：路由模式规范**：在开发过程中，涉及到路由时请务必使用 hash 模式，例如 `#test`、`#/home` 等。路由配置必须使用 hash 模式，不要使用 history 模式。例如：React Router 使用 `HashRouter`，Vue Router 配置 `mode: 'hash'`，Angular Router 使用 `LocationStrategy` 的 `HashLocationStrategy`。\n\
+                14. **重要：保护注入代码块**：绝对禁止删除或修改被 `DEV-INJECT-START` 和 `DEV-INJECT-END` 标记包围的代码块。这些代码块是由开发工具自动注入的，必须完整保留。在编辑代码时，需要保留这些标记及其之间的所有内容。\n\n\
                 **React 项目特定规范**：\n\
                 • 遵循 React 函数组件最佳实践，使用 React.FC 类型\n\
                 • 使用 Radix UI 组件库构建 UI\n\
                 • 表单使用 React Hook Form + Zod 进行验证\n\
                 • 使用 React.memo、useCallback、useMemo 优化性能\n\
-                • 遵循 React Hooks 规则\n\n\
+                • 遵循 React Hooks 规则\n\
+                • 路由必须使用 `HashRouter`（来自 react-router-dom），不要使用 `BrowserRouter`，路由路径格式：`/#/home`、`/#/test` 等\n\n\
                 **Vue 项目特定规范**：\n\
                 • 优先使用 Composition API（setup 语法糖）\n\
                 • 使用 Element Plus 或其他 Vue UI 组件库\n\
                 • 使用 Pinia 进行状态管理\n\
                 • 遵循 Vue 最佳实践和响应式系统规则\n\
-                • 使用 computed、watch、ref、reactive 等组合式 API",
+                • 使用 computed、watch、ref、reactive 等组合式 API\n\
+                • Vue Router 必须配置为 hash 模式：`createRouter({ history: createWebHashHistory(), ... })`，路由路径格式：`#/home`、`#/test` 等",
             ),
             development_constraints: String::from(
                 "**严格禁止的操作 - 绝对不允许执行**：\n\
@@ -194,7 +197,13 @@ impl Default for SystemPromptConfig {
                 8. 优先考虑该框架的最佳实践和现代开发模式\n\
                 9. 考虑框架特有的错误处理、状态管理、组件设计等\n\
                 10. 遵循项目的代码规范和文件结构约定\n\
-                11. **MCP工具调用规范**：\n\
+                11. **路由配置要求**（重要）：\n\
+                    - 如果涉及路由配置，必须使用 hash 模式\n\
+                    - React 项目：使用 `HashRouter`，路由路径格式如 `/#/home`、`/#/test`\n\
+                    - Vue 项目：使用 `createWebHashHistory()`，路由路径格式如 `#/home`、`#/test`\n\
+                    - Angular 项目：使用 `HashLocationStrategy`\n\
+                    - 绝对禁止使用 history 模式（BrowserRouter、createWebHistory 等）\n\
+                12. **MCP工具调用规范**：\n\
                     - 使用 context7 搜索对应框架的文档和最佳实践\n\
                 \n\
                 **绝对规则（核心中的核心）**：\n\
@@ -207,7 +216,8 @@ impl Default for SystemPromptConfig {
                 ✓ 是否已读取 package.json？\n\
                 ✓ 是否已识别项目框架？\n\
                 ✓ 是否确认使用正确的框架语法？\n\
-                ✓ 是否避免了框架转换？",
+                ✓ 是否避免了框架转换？\n\
+                ✓ 如果涉及路由，是否使用了 hash 模式？",
             ),
         }
     }
