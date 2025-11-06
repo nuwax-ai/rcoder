@@ -53,15 +53,6 @@ pub struct ChatRequest {
     pub request_id: Option<String>,
 }
 
-/// 生成不带中划线的随机项目ID
-fn generate_project_id() -> String {
-    Uuid::new_v4().to_string().replace("-", "")
-}
-
-/// 生成不带中划线的随机请求ID
-fn generate_request_id() -> String {
-    Uuid::new_v4().to_string().replace("-", "")
-}
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
 ///
@@ -152,7 +143,7 @@ pub async fn handle_chat(
             .await?;
 
     // 第二步：获取或创建 ProjectAndContainerInfo - 使用新的高效状态管理
-    let project_info_ref = {
+    let _ = {
         info!("🔍 [CHAT] 开始获取/创建项目信息: project_id={}", project_id);
 
         // 使用 entry API 一次性处理获取和创建，避免多次锁获取
@@ -323,20 +314,7 @@ pub async fn handle_chat(
     result
 }
 
-/// 从URL中提取IP地址
-fn extract_ip_from_url(url: &str) -> Result<String, crate::AppError> {
-    let url_obj = url::Url::parse(url).map_err(|e| {
-        error!("❌ [FORWARD] 解析URL失败: url={}, error={}", url, e);
-        crate::AppError::internal_server_error(&format!("解析URL失败: {}", e))
-    })?;
 
-    let host = url_obj.host_str().ok_or_else(|| {
-        error!("❌ [FORWARD] URL中找不到主机地址: {}", url);
-        crate::AppError::internal_server_error("URL中找不到主机地址")
-    })?;
-
-    Ok(host.to_string())
-}
 
 /// 转发请求到容器内的 agent_runner 服务
 ///
