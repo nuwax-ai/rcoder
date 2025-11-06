@@ -130,11 +130,14 @@ pub async fn handle_chat(
     };
 
     info!(
-        "🚀 [CHAT] 开始处理聊天请求: project_id={}, session_id={:?}, prompt_length={}, attachments_count={}",
+        "🚀 [CHAT] 开始处理聊天请求: project_id={}, session_id={:?}, prompt_length={}, attachments_count={}, model_provider={}",
         project_id,
         request.session_id,
         request.prompt.len(),
-        request.attachments.len()
+        request.attachments.len(),
+        request.model_provider.as_ref()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "None".to_string())
     );
 
     // 直接转发原始请求到容器内的 agent_runner 服务
