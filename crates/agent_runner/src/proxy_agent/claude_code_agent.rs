@@ -1,5 +1,5 @@
 use agent_client_protocol::{
-    Agent, ClientCapabilities, ClientSideConnection, ContentBlock, Implementation,
+    Agent, ClientCapabilities, ClientSideConnection, ContentBlock,
     InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId,
     TextContent, V1 as VERSION,
 };
@@ -129,11 +129,11 @@ pub async fn start_claude_code_acp_agent_service(
                             terminal: false,
                             meta: None,
                         },
-                        client_info: Some(Implementation {
-                            name: "rcoder-agent-runner".to_string(),
-                            title: Some("RCoder Agent Runner".to_string()),
-                            version: env!("CARGO_PKG_VERSION").to_string(),
-                        }),
+                        // client_info: Some(Implementation {
+                        //     name: "rcoder-agent-runner".to_string(),
+                        //     title: Some("RCoder Agent Runner".to_string()),
+                        //     version: env!("CARGO_PKG_VERSION").to_string(),
+                        // }),
                         meta: None,
                     })
                     .await;

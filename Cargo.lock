@@ -6,7 +6,7 @@ version = 4
 name = "acp-adapter"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
+ "agent-client-protocol 0.6.0",
  "anyhow",
  "async-trait",
  "bytes 1.10.1",
@@ -54,11 +54,11 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.7.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "525705e39c11cd73f7bc784e3681a9386aa30c8d0630808d3dc2237eb4f9cb1b"
+checksum = "8c6dd5cbfa40830215128d75817066151f7c09dc3f34c3a4828073a3d981b03a"
 dependencies = [
- "agent-client-protocol-schema",
+ "agent-client-protocol-schema 0.5.0",
  "anyhow",
  "async-broadcast",
  "async-trait",
@@ -66,6 +66,37 @@ dependencies = [
  "futures 0.3.31",
  "log",
  "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "agent-client-protocol"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525705e39c11cd73f7bc784e3681a9386aa30c8d0630808d3dc2237eb4f9cb1b"
+dependencies = [
+ "agent-client-protocol-schema 0.6.3",
+ "anyhow",
+ "async-broadcast",
+ "async-trait",
+ "derive_more",
+ "futures 0.3.31",
+ "log",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "agent-client-protocol-schema"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d510cb051ef98b12786311f27d0f6322580ccadf81ab5f8c1497e735f4e95e4"
+dependencies = [
+ "anyhow",
+ "derive_more",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
 ]
@@ -88,7 +119,7 @@ name = "agent_runner"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol",
+ "agent-client-protocol 0.6.0",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -1020,7 +1051,7 @@ name = "claude-code-agent"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol",
+ "agent-client-protocol 0.6.0",
  "anyhow",
  "async-trait",
  "dirs",
@@ -1051,7 +1082,7 @@ name = "codex-acp"
 version = "0.3.10"
 source = "git+https://github.com/soddygo/codex-acp.git?branch=feat-add-args#eeb63c9f17df55599ebf5cb2fd6eeb96c3b19050"
 dependencies = [
- "agent-client-protocol",
+ "agent-client-protocol 0.7.0",
  "anyhow",
  "async-trait",
  "clap 4.5.51",
@@ -4489,7 +4520,7 @@ name = "rcoder"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol",
+ "agent-client-protocol 0.6.0",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -5332,7 +5363,7 @@ dependencies = [
 name = "shared_types"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
+ "agent-client-protocol 0.6.0",
  "anyhow",
  "async-stream",
  "axum",

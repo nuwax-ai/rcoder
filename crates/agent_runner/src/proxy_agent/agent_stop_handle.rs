@@ -13,7 +13,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::model::AgentType;
-use agent_client_protocol::{ClientSideConnection, SessionId};
+use agent_client_protocol::SessionId;
+#[cfg(feature = "codex")]
+use agent_client_protocol::ClientSideConnection;
 use shared_types::{AgentLifecycle, AgentType as SharedAgentType};
 
 /// Agent生命周期守卫

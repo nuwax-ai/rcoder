@@ -11,3 +11,4 @@ project_workspace
 .checkstyle_suppressions.xml
 .DS_Store
 docker/rcoder
+.vscode
