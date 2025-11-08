@@ -34,7 +34,7 @@ publish = false
 
 [workspace.dependencies]
 # ACP Protocol
-agent-client-protocol = "0.7"
+agent-client-protocol = "0.6"
 
 # Codex dependencies (optional, enable with --features codex)
 codex-acp = { git = "https://github.com/soddygo/codex-acp.git", branch = "feat-add-args" }
