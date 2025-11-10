@@ -34,6 +34,7 @@ pub use model::{
     SessionMessageType,
     SessionNotify,
     SessionPromptEnd,
+    SessionPromptError,
     SessionPromptStart,
     TextAttachment,
     UnifiedSessionMessage,

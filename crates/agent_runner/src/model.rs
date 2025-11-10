@@ -6,7 +6,7 @@ pub use shared_types::{
     // Session and message exports
     Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
     ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,
-    AgentSessionUpdate, SessionNotify, ChatPrompt, ChatPromptResponse,
+    SessionPromptError, AgentSessionUpdate, SessionNotify, ChatPrompt, ChatPromptResponse,
     // Error and HTTP exports
     AppError, HttpResult,
 };
