@@ -2,7 +2,7 @@
 //!
 //! 提供可复用的channel消息处理逻辑
 
-use agent_client_protocol::{Agent, PromptRequest, SessionId, SessionUpdate, ContentChunk, ContentBlock};
+use agent_client_protocol::{Agent, PromptRequest, SessionId};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
 use crate::{
     CancelNotificationRequest, CancelNotificationResponse,
-    model::{SessionNotify, SessionPromptEnd, SessionPromptStart, AgentSessionUpdate},
+    model::{SessionNotify, SessionPromptEnd, SessionPromptStart, SessionPromptError},
     service::push_session_update_with_project,
 };
 use chrono::Utc;
@@ -190,25 +190,20 @@ where
                 Err(e) => {
                     error!("项目[{}]发送Prompt失败: {:?}", project_id, e);
 
-                    // 📤 第一步：发送错误信息到前端（作为 AgentMessageChunk）
-                    // 让前端能够在聊天界面中展示具体的错误信息
-                    let error_message = format!("❌ 执行失败: {:?}", e);
-                    let error_chunk = ContentChunk {
-                        content: ContentBlock::from(error_message.clone()),
-                        meta: None,
-                    };
-                    let error_update = SessionNotify::AgentSessionUpdate(AgentSessionUpdate {
+                    // 先克隆错误消息，因为 e 会被移动
+                    let error_message = e.message.clone();
+
+                    // 📤 第一步：发送 SessionPromptError 消息，包含完整的错误结构（code 和 message）
+                    let error_notify = SessionNotify::SessionPromptError(SessionPromptError {
                         session_id: session_id_str.clone(),
-                        session_update: SessionUpdate::AgentMessageChunk(error_chunk),
+                        error: e,
                         request_id: request_id.clone(),
                     });
-                    if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, error_update).await {
-                        error!("项目[{}]发送AgentMessageChunk错误信息失败: {:?}", project_id, e);
+                    if let Err(e) = push_session_update_with_project(&project_id, &session_id_str, error_notify).await {
+                        error!("项目[{}]发送SessionPromptError失败: {:?}", project_id, e);
                     }
 
                     // 📤 第二步：发送 SessionPromptEnd 消息，标记会话结束
-                    // 🎯 极简设计：直接发送 SessionPromptEnd 消息，无需检查取消状态
-                    // 旧 SSE 连接已自然断开，只会发送到最新的 SessionData
                     let end_notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
                         session_id: session_id_str.clone(),
                         stop_reason: agent_client_protocol::StopReason::Cancelled,

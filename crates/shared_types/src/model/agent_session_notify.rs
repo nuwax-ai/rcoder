@@ -1,4 +1,4 @@
-use agent_client_protocol::{SessionUpdate, StopReason};
+use agent_client_protocol::{Error, SessionUpdate, StopReason};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -45,6 +45,14 @@ pub struct SessionPromptEnd {
     /// 可选的请求ID，用于标识对应的用户请求
     pub request_id: Option<String>,
 }
+///agent 执行任务报错的消息
+pub struct SessionPromptError {
+    pub session_id: String,
+    pub error: Error,
+    /// 可选的请求ID，用于标识对应的用户请求
+    pub request_id: Option<String>,
+}
+    
 
 /// agent 的 session 更新
 pub struct AgentSessionUpdate {
@@ -59,6 +67,7 @@ pub enum SessionNotify {
     AgentSessionUpdate(AgentSessionUpdate),
     SessionPromptStart(SessionPromptStart),
     SessionPromptEnd(SessionPromptEnd),
+    SessionPromptError(SessionPromptError),
 }
 
 impl SessionNotify {
@@ -119,6 +128,27 @@ impl SessionNotify {
                     session_id: update.session_id,
                     message_type: SessionMessageType::AgentSessionUpdate,
                     sub_type,
+                    data,
+                    timestamp,
+                }
+            }
+            SessionNotify::SessionPromptError(error) => {
+                // 将 Error 直接序列化为 JSON，保持其原有结构（包含 code 和 message）
+                let mut data = serde_json::to_value(&error.error)
+                    .unwrap_or_else(|_| serde_json::json!({
+                        "code": -1,
+                        "message": error.error.to_string()
+                    }));
+
+                // 如果有 request_id，添加到 data 中
+                if let Some(request_id) = &error.request_id {
+                    data["request_id"] = serde_json::Value::String(request_id.clone());
+                }
+
+                UnifiedSessionMessage {
+                    session_id: error.session_id,
+                    message_type: SessionMessageType::SessionPromptEnd,
+                    sub_type: "error".to_string(),
                     data,
                     timestamp,
                 }
@@ -378,6 +408,54 @@ mod tests {
         assert_eq!(unified.sub_type, "agent_message_chunk");
         assert_eq!(unified.data["type"], "text");
         assert_eq!(unified.data["text"], "Hello, World!");
+        assert_eq!(unified.data["request_id"], "req_123456789");
+    }
+
+    #[test]
+    fn test_session_prompt_error_to_unified() {
+        let notify = SessionNotify::SessionPromptError(SessionPromptError {
+            session_id: "test_session".to_string(),
+            error: Error::internal_error(),
+            request_id: None,
+        });
+
+        let unified = notify.to_unified_message();
+
+        assert_eq!(unified.session_id, "test_session");
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
+            true
+        );
+        assert_eq!(unified.sub_type, "error");
+        
+        // 验证 data 直接包含 code 和 message 字段
+        let data_obj = unified.data.as_object().unwrap();
+        assert!(data_obj.contains_key("code"));
+        assert!(data_obj.contains_key("message"));
+        assert!(!data_obj.contains_key("request_id"));
+    }
+
+    #[test]
+    fn test_session_prompt_error_with_request_id_to_unified() {
+        let notify = SessionNotify::SessionPromptError(SessionPromptError {
+            session_id: "test_session".to_string(),
+            error: Error::method_not_found(),
+            request_id: Some("req_123456789".to_string()),
+        });
+
+        let unified = notify.to_unified_message();
+
+        assert_eq!(unified.session_id, "test_session");
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
+            true
+        );
+        assert_eq!(unified.sub_type, "error");
+        
+        // 验证 data 直接包含 code 和 message 字段
+        let data_obj = unified.data.as_object().unwrap();
+        assert!(data_obj.contains_key("code"));
+        assert!(data_obj.contains_key("message"));
         assert_eq!(unified.data["request_id"], "req_123456789");
     }
 }
