@@ -40,6 +40,9 @@ docker_config:
   # AMD64 架构专用镜像
   amd64_image: "registry.yichamao.com/rcoder:latest-amd64"
 
+  # 默认回退镜像 (当无法检测架构或架构不匹配时使用)
+  default_image: "registry.yichamao.com/rcoder:latest"
+
   # 默认网络模式
   network_mode: "bridge"
 

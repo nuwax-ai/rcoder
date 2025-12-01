@@ -78,12 +78,14 @@ pub struct ProxyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerConfig {
     /// Docker 镜像名称（根据架构自动选择）
-    /// 如果不指定，将使用默认的 registry.yichamao.com/rcoder:latest
+    /// 如果指定了此字段，将优先使用该镜像，忽略架构特定镜像
     pub image: Option<String>,
     /// ARM64 架构的 Docker 镜像
     pub arm64_image: Option<String>,
     /// AMD64 架构的 Docker 镜像
     pub amd64_image: Option<String>,
+    /// 默认回退镜像（当无法检测架构或架构不匹配时使用）
+    pub default_image: Option<String>,
     /// 默认网络模式
     pub network_mode: Option<String>,
     /// 默认工作目录
@@ -134,6 +136,7 @@ impl Default for DockerConfig {
             // 如果需要本地容器测试,可以改为: master-rcoder:latest,用 make dev-restart 启动容器测试
             arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
             amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
+            default_image: Some("registry.yichamao.com/rcoder:latest".to_string()), // 默认回退镜像
             network_mode: Some("bridge".to_string()),
             work_dir: Some("/app".to_string()),
             auto_cleanup: Some(true),
@@ -154,6 +157,10 @@ impl docker_manager::utils::DockerConfigTrait for DockerConfig {
 
     fn amd64_image(&self) -> &Option<String> {
         &self.amd64_image
+    }
+
+    fn default_image(&self) -> &Option<String> {
+        &self.default_image
     }
 
     fn network_mode(&self) -> &Option<String> {
