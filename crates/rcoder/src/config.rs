@@ -134,9 +134,10 @@ impl Default for DockerConfig {
         Self {
             image: None, // 使用默认镜像
             // 如果需要本地容器测试,可以改为: master-rcoder:latest,用 make dev-restart 启动容器测试
-            arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
-            amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
-            default_image: Some("registry.yichamao.com/rcoder:latest".to_string()), // 默认回退镜像
+            // 从 docker_manager 读取默认镜像配置，保持配置一致性
+            arm64_image: Some(docker_manager::default_arm64_image()),
+            amd64_image: Some(docker_manager::default_amd64_image()),
+            default_image: Some(docker_manager::default_fallback_image()), // 默认回退镜像
             network_mode: Some("bridge".to_string()),
             work_dir: Some("/app".to_string()),
             auto_cleanup: Some(true),
