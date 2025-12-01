@@ -233,6 +233,8 @@ pub struct DockerConfig {
     pub arm64_image: Option<String>,
     /// AMD64 架构的 Docker 镜像
     pub amd64_image: Option<String>,
+    /// 默认回退镜像（当无法检测架构或架构不匹配时使用）
+    pub default_image: Option<String>,
     /// 默认网络模式
     pub network_mode: Option<String>,
     /// 默认工作目录

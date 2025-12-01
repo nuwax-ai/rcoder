@@ -695,6 +695,11 @@ impl DockerManager {
         &self.docker
     }
 
+    /// 获取配置的默认镜像
+    pub fn get_default_image(&self) -> String {
+        self.config.default_image.clone()
+    }
+
     /// 获取容器网络信息
     pub async fn get_container_network_info(
         &self,

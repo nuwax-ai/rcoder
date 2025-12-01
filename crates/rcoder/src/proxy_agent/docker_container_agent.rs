@@ -55,8 +55,11 @@ pub async fn start_docker_container_agent_service(
     // 🎯 优化：不再需要宿主机端口映射，使用内部网络通信
     info!("使用容器内部网络通信，无需宿主机端口映射");
 
+    // 从 DockerManager 配置中获取默认镜像
+    let docker_image = Some(docker_manager.get_default_image());
+
     // 创建容器配置（无需端口映射）
-    let container_config = create_docker_container_config(&project_id, &project_path, Some(network_name.clone())).await?;
+    let container_config = create_docker_container_config(&project_id, &project_path, Some(network_name.clone()), docker_image).await?;
 
     // 创建并启动容器
     let container_info = match docker_manager.create_container(container_config).await {
@@ -97,6 +100,7 @@ async fn create_docker_container_config(
     project_id: &str,
     project_path: &str,
     network_name: Option<String>,
+    docker_image: Option<String>,
 ) -> Result<DockerContainerConfig> {
     let mut env_vars = HashMap::new();
 
@@ -137,9 +141,12 @@ async fn create_docker_container_config(
         "8086".to_string(),
     ];
 
+    // 使用传入的镜像配置，如果没有则使用默认镜像
+    let image = docker_image.unwrap_or_else(|| docker_manager::default_docker_image());
+
     Ok(DockerContainerConfig {
         project_id: project_id.to_string(),
-        image: docker_manager::default_docker_image(),
+        image,
         name_prefix: "rcoder-agent".to_string(),
         host_path: host_project_path.to_string_lossy().to_string(), // 🎯 使用宿主机绝对路径
         // 容器内路径为 /app/project_workspace/{project_id}，工作目录为 /app

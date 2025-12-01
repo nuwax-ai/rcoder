@@ -47,6 +47,9 @@ pub enum DockerError {
 pub type DockerResult<T> = Result<T, DockerError>;
 
 /// 默认的 Docker 镜像（根据架构自动选择）
+/// 
+/// 注意：此函数使用硬编码的默认值，建议使用 `get_docker_image_from_config()` 
+/// 从配置中读取镜像地址
 pub fn default_docker_image() -> String {
     let platform = crate::utils::DockerUtils::auto_detect_platform();
     match platform.as_str() {
@@ -57,27 +60,40 @@ pub fn default_docker_image() -> String {
 }
 
 /// 从 rcoder 配置获取 Docker 镜像
+/// 
+/// # 参数
+/// * `image` - 通用镜像（优先使用，如果指定则忽略架构特定镜像）
+/// * `arm64_image` - ARM64 架构专用镜像
+/// * `amd64_image` - AMD64 架构专用镜像
+/// * `default_image` - 默认回退镜像（当无法检测架构或架构不匹配时使用）
 pub fn get_docker_image_from_config(
-    default_image: Option<String>,
+    image: Option<String>,
     arm64_image: Option<String>,
     amd64_image: Option<String>,
+    default_image: Option<String>,
 ) -> String {
     let platform = crate::utils::DockerUtils::auto_detect_platform();
 
     // 优先使用通用镜像
-    if let Some(image) = default_image {
-        return image;
+    if let Some(img) = image {
+        return img;
     }
 
     // 根据架构使用特定镜像
     match platform.as_str() {
         "linux/arm64" => {
-            arm64_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest-arm64".to_string())
+            arm64_image.unwrap_or_else(|| {
+                default_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest".to_string())
+            })
         }
         "linux/amd64" => {
-            amd64_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest-amd64".to_string())
+            amd64_image.unwrap_or_else(|| {
+                default_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest".to_string())
+            })
         }
-        _ => "registry.yichamao.com/rcoder:latest".to_string(), // 默认回退
+        _ => {
+            default_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest".to_string())
+        }
     }
 }
 

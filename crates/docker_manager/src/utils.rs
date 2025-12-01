@@ -219,12 +219,13 @@ impl DockerUtils {
             let image = docker_cfg.image.clone();
             let arm64_image = docker_cfg.arm64_image.clone();
             let amd64_image = docker_cfg.amd64_image.clone();
+            let default_image = docker_cfg.default_image.clone();
 
             // 使用 rcoder 配置中的镜像设置
             let image_config = DockerImageConfig {
-                default_image: docker_cfg.image,
-                arm64_image: docker_cfg.arm64_image,
-                amd64_image: docker_cfg.amd64_image,
+                default_image: docker_cfg.default_image.clone(),
+                arm64_image: docker_cfg.arm64_image.clone(),
+                amd64_image: docker_cfg.amd64_image.clone(),
             };
             config.image_config = Some(image_config);
 
@@ -247,6 +248,7 @@ impl DockerUtils {
                 image,
                 arm64_image,
                 amd64_image,
+                default_image,
             );
         }
 
@@ -265,10 +267,11 @@ impl DockerUtils {
             let image = docker_cfg.image().clone();
             let arm64_image = docker_cfg.arm64_image().clone();
             let amd64_image = docker_cfg.amd64_image().clone();
+            let default_image = docker_cfg.default_image().clone();
 
             // 使用 rcoder 配置中的镜像设置
             let image_config = DockerImageConfig {
-                default_image: docker_cfg.image().clone(),
+                default_image: docker_cfg.default_image().clone(),
                 arm64_image: docker_cfg.arm64_image().clone(),
                 amd64_image: docker_cfg.amd64_image().clone(),
             };
@@ -293,6 +296,7 @@ impl DockerUtils {
                 image,
                 arm64_image,
                 amd64_image,
+                default_image,
             );
         }
 
@@ -305,6 +309,7 @@ pub trait DockerConfigTrait {
     fn image(&self) -> &Option<String>;
     fn arm64_image(&self) -> &Option<String>;
     fn amd64_image(&self) -> &Option<String>;
+    fn default_image(&self) -> &Option<String>;
     fn network_mode(&self) -> &Option<String>;
     fn work_dir(&self) -> &Option<String>;
     fn auto_cleanup(&self) -> &Option<bool>;
