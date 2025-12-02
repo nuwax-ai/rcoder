@@ -89,7 +89,6 @@ pub async fn start_docker_container_agent_service(
     // 创建容器配置（使用服务配置）
     let container_config = create_docker_container_config(
         &project_id,
-        &project_path,
         Some(network_name.clone()),
         docker_image,
         service_config,
@@ -134,7 +133,6 @@ pub async fn start_docker_container_agent_service(
 /// 创建 Docker 容器配置（内部网络通信，无需端口映射）
 async fn create_docker_container_config(
     project_id: &str,
-    project_path: &str,
     network_name: Option<String>,
     docker_image: Option<String>,
     service_config: Option<shared_types::ServiceImageConfig>,
@@ -163,25 +161,6 @@ async fn create_docker_container_config(
         env_vars.insert("AGENT_TYPE".to_string(), "claude".to_string());
     }
 
-    // 🔄 关键：将容器内路径转换为宿主机路径（自动检测模式）
-    // 先将路径标准化，处理相对路径情况
-    let normalized_path = std::path::PathBuf::from(project_path);
-    let host_project_path = if normalized_path.is_relative() {
-        std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            .join(&normalized_path)
-    } else {
-        normalized_path
-    };
-
-    let host_project_path = crate::utils::resolve_container_path_to_host(&host_project_path)
-        .await
-        .context("自动检测宿主机路径失败，请检查 Docker socket 挂载和权限")?;
-    info!(
-        "✅ 路径自动检测成功: 容器内 {:?} -> 宿主机 {:?}",
-        project_path, host_project_path
-    );
-
     // 🎯 优化：无需端口映射，使用内部网络通信
     let port_bindings = HashMap::new(); // 空的端口映射
 
@@ -200,6 +179,26 @@ async fn create_docker_container_config(
             mount.read_only
         );
     }
+
+    // 🔥 使用配置化的容器路径模板，支持变量替换（必须在 config 字段被移动前调用）
+    let mut variables = std::collections::HashMap::new();
+    variables.insert("project_id".to_string(), project_id.to_string());
+    variables.insert(
+        "service_type".to_string(),
+        config.service_type.as_str().to_string(),
+    );
+    let container_path = config.resolve_container_path(&variables);
+
+    // 🔥 将容器内路径转换为宿主机路径
+    let host_project_path =
+        crate::utils::resolve_container_path_to_host(std::path::Path::new(&container_path))
+            .await
+            .context("自动检测宿主机路径失败，请检查 Docker socket 挂载和权限")?;
+    info!(
+        "✅ 路径自动检测成功: 容器内 {:?} -> 宿主机 {:?}",
+        container_path,
+        host_project_path.display()
+    );
 
     // 🎯 处理配置文件中的挂载配置，使用容器路径解析器转换相对路径
     let extra_mounts = process_mount_configs(config.mounts, project_id).await?;
@@ -229,8 +228,7 @@ async fn create_docker_container_config(
         image,
         name_prefix: "rcoder-agent".to_string(),
         host_path: host_project_path.to_string_lossy().to_string(), // 🎯 使用宿主机绝对路径
-        // 容器内路径为 /app/project_workspace/{project_id}，工作目录从配置获取
-        container_path: format!("/app/project_workspace/{}", project_id).to_string(),
+        container_path,                                             // 使用配置化的容器路径
         work_dir,
         env_vars,
         port_bindings,                          // 空的端口映射

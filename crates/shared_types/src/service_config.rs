@@ -6,6 +6,11 @@ use crate::service_type::ServiceType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// 容器路径模板的默认值
+fn default_container_path_template() -> String {
+    "/app/project_workspace/{project_id}".to_string()
+}
+
 /// 服务镜像配置
 ///
 /// 定义了每个服务类型的详细配置，包括镜像选择、环境变量和挂载点。
@@ -40,6 +45,11 @@ pub struct ServiceImageConfig {
     pub work_dir: String,
     /// 容器网络模式
     pub network_mode: String,
+    /// 容器内挂载路径模板（支持变量替换）
+    /// 默认值: "/app/project_workspace/{project_id}"
+    /// 支持变量: {project_id}, {user_id}, {service_type}
+    #[serde(default = "default_container_path_template")]
+    pub container_path_template: String,
 }
 
 /// 服务挂载点配置
@@ -216,6 +226,39 @@ impl ServiceImageConfig {
             self.get_mounts_description()
         )
     }
+
+    /// 解析容器路径模板，进行变量替换
+    ///
+    /// 支持的变量:
+    /// - {project_id}: 项目ID
+    /// - {user_id}: 用户ID
+    /// - {service_type}: 服务类型
+    ///
+    /// # Arguments
+    /// * `variables` - 包含变量名和值的 HashMap
+    ///
+    /// # Returns
+    /// 解析后的容器路径字符串
+    ///
+    /// # Example
+    /// ```
+    /// use std::collections::HashMap;
+    /// let config = ServiceImageConfig::default();
+    /// let mut variables = HashMap::new();
+    /// variables.insert("project_id".to_string(), "123".to_string());
+    /// let resolved = config.resolve_container_path(&variables);
+    /// assert_eq!(resolved, "/app/project_workspace/123");
+    /// ```
+    pub fn resolve_container_path(
+        &self,
+        variables: &std::collections::HashMap<String, String>,
+    ) -> String {
+        let mut resolved = self.container_path_template.clone();
+        for (key, value) in variables {
+            resolved = resolved.replace(&format!("{{{}}}", key), value);
+        }
+        resolved
+    }
 }
 
 impl ServiceMountConfig {
@@ -309,6 +352,7 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         resource_limits,
         work_dir: "/app".to_string(),
         network_mode: "bridge".to_string(),
+        container_path_template: default_container_path_template(),
     }
 }
 
@@ -352,6 +396,7 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         resource_limits,
         work_dir: "/app".to_string(),
         network_mode: "bridge".to_string(),
+        container_path_template: default_container_path_template(),
     }
 }
 
