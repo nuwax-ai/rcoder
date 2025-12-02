@@ -1,0 +1,500 @@
+//! 服务镜像配置
+//!
+//! 定义了每个服务类型的镜像配置、环境变量、挂载点等信息。
+
+use crate::service_type::ServiceType;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// 服务镜像配置
+///
+/// 定义了每个服务类型的详细配置，包括镜像选择、环境变量和挂载点。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceImageConfig {
+    /// 服务类型
+    pub service_type: ServiceType,
+    /// 通用镜像（优先级最高，如果指定则忽略架构特定镜像）
+    pub image: Option<String>,
+    /// ARM64 架构专用镜像
+    pub arm64_image: Option<String>,
+    /// AMD64 架构专用镜像
+    pub amd64_image: Option<String>,
+    /// 默认回退镜像
+    pub default_image: Option<String>,
+    /// 镜像标签前缀（用于自动构建镜像名称）
+    pub image_tag_prefix: Option<String>,
+    /// 是否启用该服务类型
+    pub enabled: bool,
+    /// 服务特定的环境变量
+    pub environment: HashMap<String, String>,
+    /// 服务特定的挂载点
+    pub mounts: Vec<ServiceMountConfig>,
+    /// 容器启动命令
+    pub command: Vec<String>,
+    /// 容器入口点
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    /// 容器资源限制配置
+    pub resource_limits: ServiceResourceLimits,
+    /// 容器工作目录
+    pub work_dir: String,
+    /// 容器网络模式
+    pub network_mode: String,
+}
+
+/// 服务挂载点配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceMountConfig {
+    /// 容器内路径
+    pub container_path: String,
+    /// 宿主机路径（支持变量替换）
+    pub host_path: String,
+    /// 是否只读
+    pub read_only: bool,
+    /// 挂载类型（bind/volume）
+    pub mount_type: String,
+}
+
+/// 服务资源限制配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceResourceLimits {
+    /// 内存限制（字节）
+    pub memory_limit: Option<u64>,
+    /// CPU 限制（核心数）
+    pub cpu_limit: Option<f64>,
+    /// 交换空间限制（字节）
+    pub swap_limit: Option<u64>,
+    /// 磁盘空间限制（字节）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_limit: Option<u64>,
+    /// 进程数限制
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_limit: Option<u64>,
+}
+
+/// 验证结果
+#[derive(Debug)]
+pub enum ConfigValidationResult {
+    Valid,
+    Warning(String),
+    Error(String),
+}
+
+impl ServiceImageConfig {
+    /// 验证服务镜像配置的有效性
+    pub fn validate(&self) -> ConfigValidationResult {
+        // 验证至少有一个镜像配置
+        if self.image.is_none()
+            && self.arm64_image.is_none()
+            && self.amd64_image.is_none()
+            && self.default_image.is_none()
+        {
+            return ConfigValidationResult::Error(format!(
+                "服务类型 {} 必须至少配置一个镜像",
+                self.service_type.as_str()
+            ));
+        }
+
+        // 验证镜像名称格式
+        for image_name in [
+            &self.image,
+            &self.arm64_image,
+            &self.amd64_image,
+            &self.default_image,
+        ] {
+            if let Some(image) = image_name {
+                if image.trim().is_empty() {
+                    return ConfigValidationResult::Warning(format!(
+                        "服务类型 {} 包含空的镜像名称",
+                        self.service_type.as_str()
+                    ));
+                }
+
+                // 验证镜像名称格式（简单的格式检查）
+                if !image
+                    .chars()
+                    .all(|c: char| c.is_alphanumeric() || "/:.-_".contains(c))
+                {
+                    return ConfigValidationResult::Warning(format!(
+                        "服务类型 {} 的镜像名称 '{}' 可能包含无效字符",
+                        self.service_type.as_str(),
+                        image
+                    ));
+                }
+            }
+        }
+
+        // 验证挂载点配置
+        for mount in &self.mounts {
+            if mount.container_path.trim().is_empty() {
+                return ConfigValidationResult::Error(format!(
+                    "服务类型 {} 包含空的容器挂载路径",
+                    self.service_type.as_str()
+                ));
+            }
+
+            if mount.host_path.trim().is_empty() {
+                return ConfigValidationResult::Error(format!(
+                    "服务类型 {} 包含空的宿主机挂载路径",
+                    self.service_type.as_str()
+                ));
+            }
+
+            // 验证挂载类型
+            if mount.mount_type != "bind" && mount.mount_type != "volume" {
+                return ConfigValidationResult::Warning(format!(
+                    "服务类型 {} 包含不支持的挂载类型 '{}'",
+                    self.service_type.as_str(),
+                    mount.mount_type
+                ));
+            }
+        }
+
+        ConfigValidationResult::Valid
+    }
+
+    /// 根据当前平台选择合适的镜像
+    pub fn get_image_for_platform(&self, platform: &str) -> Option<String> {
+        // 优先使用通用镜像
+        if let Some(ref image) = self.image {
+            return Some(image.clone());
+        }
+
+        // 根据平台选择架构特定镜像
+        match platform {
+            "linux/arm64" => self
+                .arm64_image
+                .clone()
+                .or_else(|| self.default_image.clone()),
+            "linux/amd64" => self
+                .amd64_image
+                .clone()
+                .or_else(|| self.default_image.clone()),
+            _ => {
+                tracing::warn!("未知的平台 '{}，使用默认镜像", platform);
+                self.default_image.clone()
+            }
+        }
+    }
+
+    /// 合并环境变量（基础环境 + 服务特定环境）
+    pub fn merge_environment(&self, base_env: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut merged = base_env.clone();
+        merged.extend(self.environment.clone());
+        merged
+    }
+
+    /// 获取挂载点的字符串表示
+    pub fn get_mounts_description(&self) -> String {
+        if self.mounts.is_empty() {
+            return "无挂载点".to_string();
+        }
+
+        self.mounts
+            .iter()
+            .map(|mount| {
+                format!(
+                    "{} -> {} ({})",
+                    mount.host_path, mount.container_path, mount.mount_type
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// 获取配置摘要
+    pub fn get_summary(&self) -> String {
+        format!(
+            "ServiceType: {}, Enabled: {}, Image: {:?}, Mounts: {}",
+            self.service_type.as_str(),
+            self.enabled,
+            self.image
+                .as_ref()
+                .or(self.arm64_image.as_ref())
+                .or(self.amd64_image.as_ref())
+                .or(self.default_image.as_ref()),
+            self.get_mounts_description()
+        )
+    }
+}
+
+impl ServiceMountConfig {
+    /// 验证挂载点配置
+    pub fn validate(&self) -> ConfigValidationResult {
+        if self.container_path.trim().is_empty() {
+            return ConfigValidationResult::Error("容器挂载路径不能为空".to_string());
+        }
+
+        if self.host_path.trim().is_empty() {
+            return ConfigValidationResult::Error("宿主机挂载路径不能为空".to_string());
+        }
+
+        // 验证路径格式
+        if self.container_path.starts_with('/') {
+            if !self
+                .container_path
+                .chars()
+                .all(|c: char| c.is_alphanumeric() || "/-_.".contains(c))
+            {
+                return ConfigValidationResult::Warning(format!(
+                    "容器挂载路径 '{}' 可能包含无效字符",
+                    self.container_path
+                ));
+            }
+        }
+
+        if self.mount_type != "bind" && self.mount_type != "volume" {
+            return ConfigValidationResult::Error(format!(
+                "不支持的挂载类型 '{}'，必须为 'bind' 或 'volume'",
+                self.mount_type
+            ));
+        }
+
+        ConfigValidationResult::Valid
+    }
+
+    /// 解析宿主机路径中的变量
+    /// 支持的变量：
+    /// - {project_id}: 项目ID
+    /// - {workspace_dir}: 工作目录
+    pub fn resolve_host_path(&self, variables: &HashMap<String, String>) -> String {
+        let mut resolved = self.host_path.clone();
+
+        for (key, value) in variables {
+            resolved = resolved.replace(&format!("{{{}}}", key), value);
+        }
+
+        resolved
+    }
+}
+
+/// 创建默认的 RCoder 服务配置
+pub fn default_rcoder_service_config() -> ServiceImageConfig {
+    let mut environment = HashMap::new();
+    environment.insert("RUST_LOG".to_string(), "info".to_string());
+    environment.insert("SERVICE_MODE".to_string(), "full".to_string());
+    environment.insert("API_PORT".to_string(), "8086".to_string());
+
+    // 🔥 默认不提供挂载配置，让配置文件控制
+    let mounts = vec![];
+
+    // 默认启动命令
+    let command = vec![
+        "/app/bin/agent_runner".to_string(),
+        "--port".to_string(),
+        "8086".to_string(),
+    ];
+
+    // 默认资源限制
+    let resource_limits = ServiceResourceLimits {
+        memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB
+        cpu_limit: Some(2.0),                       // 2 核
+        swap_limit: Some(4 * 1024 * 1024 * 1024),   // 4GB
+        disk_limit: None,                           // 不限制磁盘
+        process_limit: None,                        // 不限制进程数
+    };
+
+    ServiceImageConfig {
+        service_type: ServiceType::RCoder,
+        image: None, // 使用架构特定镜像
+        arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
+        amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
+        default_image: Some("registry.yichamao.com/rcoder:latest".to_string()),
+        image_tag_prefix: Some("rcoder".to_string()),
+        enabled: true, // 当前启用
+        environment,
+        mounts,
+        command,
+        entrypoint: None, // 使用镜像默认入口点
+        resource_limits,
+        work_dir: "/app".to_string(),
+        network_mode: "bridge".to_string(),
+    }
+}
+
+/// 创建默认的 Agent Runner 服务配置
+pub fn default_agent_runner_service_config() -> ServiceImageConfig {
+    let mut environment = HashMap::new();
+    environment.insert("RUST_LOG".to_string(), "debug".to_string());
+    environment.insert("SERVICE_MODE".to_string(), "agent-only".to_string());
+    environment.insert("AGENT_PORT".to_string(), "8086".to_string());
+
+    let mounts = vec![];
+
+    // 默认启动命令
+    let command = vec![
+        "/app/bin/agent_runner".to_string(),
+        "--port".to_string(),
+        "8086".to_string(),
+    ];
+
+    // 默认资源限制（AgentRunner 可能需要更多资源）
+    let resource_limits = ServiceResourceLimits {
+        memory_limit: Some(4 * 1024 * 1024 * 1024), // 4GB
+        cpu_limit: Some(3.0),                       // 3 核
+        swap_limit: Some(8 * 1024 * 1024 * 1024),   // 8GB
+        disk_limit: None,                           // 不限制磁盘
+        process_limit: None,                        // 不限制进程数
+    };
+
+    ServiceImageConfig {
+        service_type: ServiceType::AgentRunner,
+        image: None, // 使用架构特定镜像
+        arm64_image: Some("registry.yichamao.com/rcoder-agent-runner:latest-arm64".to_string()),
+        amd64_image: Some("registry.yichamao.com/rcoder-agent-runner:latest-amd64".to_string()),
+        default_image: Some("registry.yichamao.com/rcoder-agent-runner:latest".to_string()),
+        image_tag_prefix: Some("rcoder-agent-runner".to_string()),
+        enabled: false, // 默认禁用，等待新功能开发
+        environment,
+        mounts,
+        command,
+        entrypoint: None, // 使用镜像默认入口点
+        resource_limits,
+        work_dir: "/app".to_string(),
+        network_mode: "bridge".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_rcoder_config() {
+        let config = default_rcoder_service_config();
+
+        assert_eq!(config.service_type, ServiceType::RCoder);
+        assert!(config.enabled);
+        assert!(config.image.is_none());
+        assert!(config.environment.contains_key("RUST_LOG"));
+        assert_eq!(config.mounts.len(), 1);
+    }
+
+    #[test]
+    fn test_default_agent_runner_config() {
+        let config = default_agent_runner_service_config();
+
+        assert_eq!(config.service_type, ServiceType::AgentRunner);
+        assert!(!config.enabled); // 应该默认禁用
+        assert!(config.image.is_none());
+        assert!(config.environment.contains_key("AGENT_PORT"));
+        assert_eq!(config.mounts.len(), 2);
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let config = default_rcoder_service_config();
+
+        // 有效配置
+        assert!(matches!(config.validate(), ConfigValidationResult::Valid));
+
+        // 无效配置：所有镜像为空
+        let mut invalid_config = config.clone();
+        invalid_config.image = None;
+        invalid_config.arm64_image = None;
+        invalid_config.amd64_image = None;
+        invalid_config.default_image = None;
+        assert!(matches!(
+            invalid_config.validate(),
+            ConfigValidationResult::Error(_)
+        ));
+    }
+
+    #[test]
+    fn test_image_selection_for_platform() {
+        let config = default_rcoder_service_config();
+
+        // 设置不同的镜像配置
+        let mut config_with_image = config.clone();
+        config_with_image.image = Some("my-custom-image:latest".to_string());
+
+        let mut config_with_arm64 = config.clone();
+        config_with_arm64.arm64_image = Some("my-arm64-image:latest".to_string());
+
+        // 测试 ARM64 平台选择
+        assert_eq!(
+            config_with_image.get_image_for_platform("linux/arm64"),
+            Some("my-custom-image:latest".to_string())
+        );
+        assert_eq!(
+            config_with_arm64.get_image_for_platform("linux/arm64"),
+            Some("my-arm64-image:latest".to_string())
+        );
+
+        // 测试 AMD64 平台选择
+        assert_eq!(
+            config_with_image.get_image_for_platform("linux/amd64"),
+            Some("my-custom-image:latest".to_string())
+        );
+        assert_eq!(
+            config_with_arm64.get_image_for_platform("linux/amd64"),
+            Some("my-arm64-image:latest".to_string())
+        );
+
+        // 测试默认回退
+        assert_eq!(
+            config.get_image_for_platform("unknown"),
+            config.default_image
+        );
+    }
+
+    #[test]
+    fn test_environment_merge() {
+        let config = default_rcoder_service_config();
+
+        let mut base_env = HashMap::new();
+        base_env.insert("BASE_VAR".to_string(), "base_value".to_string());
+        base_env.insert("RUST_LOG".to_string(), "debug".to_string()); // 重叠
+
+        let merged = config.merge_environment(&base_env);
+
+        assert_eq!(merged.get("BASE_VAR"), Some(&"base_value".to_string()));
+        // 服务特定环境变量应该覆盖基础变量
+        assert_eq!(merged.get("RUST_LOG"), Some(&"info".to_string())); // RCoder 配置是 info
+        assert_eq!(merged.get("SERVICE_MODE"), Some(&"full".to_string()));
+    }
+
+    #[test]
+    fn test_mount_validation() {
+        let config = default_rcoder_service_config();
+
+        for mount in &config.mounts {
+            assert!(matches!(mount.validate(), ConfigValidationResult::Valid));
+        }
+
+        // 测试无效挂载
+        let mut invalid_mount = config.mounts[0].clone();
+        invalid_mount.container_path = "".to_string();
+        assert!(matches!(
+            invalid_mount.validate(),
+            ConfigValidationResult::Error(_)
+        ));
+    }
+
+    #[test]
+    fn test_mount_path_resolution() {
+        let mut variables = HashMap::new();
+        variables.insert("project_id".to_string(), "test-project-123".to_string());
+        variables.insert("workspace_dir".to_string(), "/app/workspace".to_string());
+
+        let mount = ServiceMountConfig {
+            container_path: "/app/workspace/{project_id}".to_string(),
+            host_path: "{workspace_dir}/projects/{project_id}".to_string(),
+            read_only: false,
+            mount_type: "bind".to_string(),
+        };
+
+        let resolved = mount.resolve_host_path(&variables);
+        assert_eq!(resolved, "/app/workspace/projects/test-project-123");
+    }
+
+    #[test]
+    fn test_get_summary() {
+        let config = default_rcoder_service_config();
+        let summary = config.get_summary();
+
+        assert!(summary.contains("rcoder"));
+        assert!(summary.contains("Enabled: true"));
+        assert!(summary.contains("registry.yichamao.com/rcoder"));
+    }
+}

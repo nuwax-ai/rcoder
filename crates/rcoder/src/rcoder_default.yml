@@ -85,11 +85,13 @@ docker_config:
         network_mode: "bridge"
 
         # 卷挂载配置
-        mounts:
-          - container_path: "/app/specs"
-            host_path: "/app/specs"
-            read_only: false
-            mount_type: "bind"
+        # 注释掉默认挂载配置，临时测试用，改为空数组
+        # mounts:
+        #   - container_path: "/app/specs"
+        #     host_path: "/app/specs"
+        #     read_only: true
+        #     mount_type: "bind"
+        mounts: []
 
       # AgentRunner 服务配置
       agent-runner:
@@ -131,11 +133,13 @@ docker_config:
         network_mode: "bridge"
 
         # 卷挂载配置
-        mounts:
-          - container_path: "/app/specs"
-            host_path: "/app/specs"
-            read_only: false
-            mount_type: "bind"
+        # 注释掉默认挂载配置，临时测试用，改为空数组
+        # mounts:
+        #   - container_path: "/app/specs"
+        #     host_path: "/app/specs"
+        #     read_only: true
+        #     mount_type: "bind"
+        mounts: []
 
     # 镜像选择策略
     selection_strategy: "ServiceOnly"

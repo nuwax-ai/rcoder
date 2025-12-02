@@ -114,28 +114,8 @@ pub struct DockerContainerInfo {
     pub network_name: String,
 }
 
-/// 容器基本信息（用于 API 响应）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContainerBasicInfo {
-    /// 容器唯一标识ID
-    pub container_id: String,
-    /// 容器名称
-    pub container_name: String,
-    /// 容器IP地址
-    pub container_ip: String,
-    /// 容器内部服务端口
-    pub internal_port: u16,
-    /// 容器外部映射端口
-    pub external_port: u16,
-    /// 项目ID
-    pub project_id: String,
-    /// 容器状态
-    pub status: String,
-    /// 创建时间
-    pub created_at: DateTime<Utc>,
-    /// 服务URL
-    pub service_url: String,
-}
+/// 容器基本信息（使用shared_types中的定义）
+pub type ContainerBasicInfo = shared_types::ContainerBasicInfo;
 
 /// 容器状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -209,19 +189,9 @@ pub struct DockerManagerConfig {
     pub auto_cleanup: bool,
     /// 容器存活时间 (秒)
     pub container_ttl_seconds: Option<u64>,
-    /// Docker 镜像配置（从 rcoder 配置传递）
-    pub image_config: Option<DockerImageConfig>,
-}
 
-/// Docker 镜像配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DockerImageConfig {
-    /// Docker 镜像名称（根据架构自动选择）
-    pub default_image: Option<String>,
-    /// ARM64 架构的 Docker 镜像
-    pub arm64_image: Option<String>,
-    /// AMD64 架构的 Docker 镜像
-    pub amd64_image: Option<String>,
+    /// 多镜像配置（从 rcoder 配置传递，始终有值）
+    pub multi_image_config: shared_types::MultiImageConfig,
 }
 
 /// Docker 配置（从 rcoder 配置传递）
@@ -255,7 +225,8 @@ impl Default for DockerManagerConfig {
             default_work_dir: crate::DEFAULT_WORK_DIR.to_string(),
             auto_cleanup: true,
             container_ttl_seconds: Some(3600), // 1小时
-            image_config: None,                // 使用默认镜像
+
+            multi_image_config: shared_types::create_default_multi_image_config(), // 默认多镜像配置
         }
     }
 }
@@ -278,7 +249,6 @@ pub struct CleanupResult {
     /// 清理操作耗时（毫秒）
     pub duration_ms: u64,
 }
-
 
 impl CleanupResult {
     /// 是否完全成功（没有失败）

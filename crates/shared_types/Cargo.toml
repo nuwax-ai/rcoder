@@ -10,7 +10,6 @@ default = []
 codex = ["dep:codex-common", "dep:codex-core"]
 
 [dependencies]
-docker_manager = { path = "../docker_manager" }
 
 serde.workspace = true
 serde_json.workspace = true

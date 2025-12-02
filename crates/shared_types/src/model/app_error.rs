@@ -22,6 +22,11 @@ impl AppError {
     pub fn internal_server_error(msg: &str) -> Self {
         AppError::Generic(format!("Internal server error: {}", msg))
     }
+
+    /// Create a validation error
+    pub fn validation_error(msg: &str) -> Self {
+        AppError::Generic(format!("Validation error: {}", msg))
+    }
 }
 
 // 为 axum 实现 IntoResponse trait
@@ -30,16 +35,13 @@ impl axum::response::IntoResponse for AppError {
         let (status, error_message) = match self {
             AppError::AnyhowError(e) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Internal error: {}", e)
+                format!("Internal error: {}", e),
             ),
             AppError::IoError(e) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("IO error: {}", e)
+                format!("IO error: {}", e),
             ),
-            AppError::Generic(msg) => (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                msg.clone()
-            ),
+            AppError::Generic(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
 
         let body = axum::Json(serde_json::json!({

@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_appender::rolling::Rotation;
@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let cli_args = CliArgs::parse();
 
     // 加载配置（包含命令行参数）
-    let config = load_config_with_args(cli_args);
+    let config = load_config_with_args(cli_args)?;
 
     // 创建项目工作目录
     tokio::fs::create_dir_all(&config.projects_dir).await?;
@@ -82,16 +82,49 @@ async fn main() -> anyhow::Result<()> {
         };
 
     // 🧹 启动时清理上次可能遗留的容器
-    // 先初始化全局 DockerManager
-    info!("🔍 初始化 Docker Manager...");
+    // 先使用正确配置初始化全局 DockerManager
+    info!("🔍 初始化 Docker Manager（使用应用配置）...");
+
+    // 从应用配置创建 DockerManagerConfig
+    let docker_manager_config = if let Some(docker_config) = &config.docker_config {
+        info!("✅ 使用应用中的 Docker 配置，合并多镜像配置");
+        let mut default_config = docker_manager::DockerManagerConfig::default();
+
+        // 合并应用配置中的多镜像配置
+        let app_multi_config = docker_config.get_multi_image_config();
+        default_config.multi_image_config = app_multi_config;
+
+        // 应用其他配置
+        default_config.auto_cleanup = docker_config
+            .auto_cleanup
+            .unwrap_or(default_config.auto_cleanup);
+        if let Some(ttl) = docker_config.container_ttl_seconds {
+            default_config.container_ttl_seconds = Some(ttl);
+        }
+
+        default_config
+    } else {
+        info!("⚠️  应用中无 Docker 配置，使用默认配置");
+        docker_manager::DockerManagerConfig::default()
+    };
+
+    // 使用自定义配置初始化全局 DockerManager
+    if let Err(e) =
+        docker_manager::global::init_global_docker_manager_with_config(docker_manager_config).await
+    {
+        error!("❌ Docker Manager 初始化失败: {}", e);
+        return Err(anyhow::anyhow!("Docker Manager 初始化失败: {}", e));
+    }
+
+    // 获取初始化后的 DockerManager
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(dm) => {
-            info!("✅ Docker Manager 初始化成功");
+            info!("✅ Docker Manager 初始化成功（使用应用配置）");
             dm
         }
         Err(e) => {
-            error!("❌ Docker Manager 初始化失败: {}", e);
-            return Err(anyhow::anyhow!("Docker Manager 初始化失败: {}", e));
+            error!("❌ 获取 Docker Manager 失败: {}", e);
+            return Err(anyhow::anyhow!("获取 Docker Manager 失败: {}", e));
         }
     };
 

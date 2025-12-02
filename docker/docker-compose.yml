@@ -17,6 +17,7 @@ services:
       - ./project_workspace:/app/project_workspace
       # 挂载工作目录
       - ./logs/:/app/logs
+      - ./specs:/app/specs
       # 挂载启动脚本
       - ./start-rcoder.sh:/app/start-rcoder.sh
     command: ["/bin/bash", "/app/start-rcoder.sh"]

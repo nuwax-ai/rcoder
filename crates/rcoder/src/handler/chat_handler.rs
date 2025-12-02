@@ -6,6 +6,7 @@ use anyhow::Result;
 use axum::{Json, extract::State};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use shared_types::ServiceType;
 use shared_types::{ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
@@ -53,15 +54,16 @@ pub struct ChatRequest {
     pub request_id: Option<String>,
 }
 
-
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
 ///
-/// 1. 根据 project_id 检查或动态创建对应的容器
+/// 1. 根据 project_id 检查或动态创建对应的容器（默认使用 ServiceType::RCoder）
 /// 2. 将原始聊天请求直接转发到容器内的 agent_runner 服务
 /// 3. 获取并返回 agent_runner 的处理结果
 ///
-/// 注意：所有参数处理（如 project_id、session_id 生成）都由 agent_runner 处理
-/// RCoder 只负责容器管理和请求转发
+/// 注意：
+/// - 所有参数处理（如 project_id、session_id 生成）都由 agent_runner 处理
+/// - RCoder 只负责容器管理和请求转发
+/// - 当前默认使用 ServiceType::RCoder，AgentRunner 模式正在开发中
 #[utoipa::path(
     post,
     path = "/chat",
@@ -103,7 +105,7 @@ pub struct ChatRequest {
     tag = "chat",
     operation_id = "handle_chat",
     summary = "转发聊天消息到容器化 AI 服务",
-    description = "根据 project_id 动态管理容器，将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
+    description = "根据 project_id 动态管理容器（默认使用 ServiceType::RCoder），将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
 )]
 #[axum::debug_handler]
 #[instrument(skip(state,request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
@@ -126,7 +128,9 @@ pub async fn handle_chat(
         request.session_id,
         request.prompt.len(),
         request.attachments.len(),
-        request.model_provider.as_ref()
+        request
+            .model_provider
+            .as_ref()
             .map(|p| p.to_string())
             .unwrap_or_else(|| "None".to_string())
     );
@@ -137,10 +141,14 @@ pub async fn handle_chat(
     // - 会话管理
     // - AI 处理
 
-    // 第一步：获取或创建容器
+    // 第一步：获取或创建容器，默认使用 ServiceType::RCoder
+    let service_type = shared_types::ServiceType::RCoder;
     let container_info =
-        crate::service::container_manager::ContainerManager::get_or_create_container(&project_id)
-            .await?;
+        crate::service::container_manager::ContainerManager::get_or_create_container(
+            &project_id,
+            &service_type,
+        )
+        .await?;
 
     // 第二步：获取或创建 ProjectAndContainerInfo - 使用新的高效状态管理
     let _ = {
@@ -314,8 +322,6 @@ pub async fn handle_chat(
     result
 }
 
-
-
 /// 转发请求到容器内的 agent_runner 服务
 ///
 /// 将原始聊天请求直接转发到指定的容器服务，获取并返回处理结果
@@ -374,7 +380,10 @@ async fn forward_request_to_container_service(
         // 解析容器的 HttpResult<ChatResponse> 响应
         let container_http_result: shared_types::HttpResult<ChatResponse> =
             serde_json::from_str(&response_text).map_err(|e| {
-                error!("❌ [FORWARD] 解析容器响应失败: {}, 响应内容: {}", e, response_text);
+                error!(
+                    "❌ [FORWARD] 解析容器响应失败: {}, 响应内容: {}",
+                    e, response_text
+                );
                 crate::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
             })?;
 
@@ -392,8 +401,14 @@ async fn forward_request_to_container_service(
                     Ok(crate::HttpResult::success(container_response))
                 }
                 None => {
-                    error!("❌ [FORWARD] 成功响应但缺少 data 字段, 完整响应: {:?}", container_http_result);
-                    Ok(crate::HttpResult::error("CONTAINER_ERROR", "成功响应但缺少 data 字段"))
+                    error!(
+                        "❌ [FORWARD] 成功响应但缺少 data 字段, 完整响应: {:?}",
+                        container_http_result
+                    );
+                    Ok(crate::HttpResult::error(
+                        "CONTAINER_ERROR",
+                        "成功响应但缺少 data 字段",
+                    ))
                 }
             }
         } else {
@@ -403,7 +418,10 @@ async fn forward_request_to_container_service(
                 container_http_result.code, container_http_result.message
             );
             error!("❌ [FORWARD] {}", error_message);
-            Ok(crate::HttpResult::error(&container_http_result.code, &error_message))
+            Ok(crate::HttpResult::error(
+                &container_http_result.code,
+                &error_message,
+            ))
         }
     } else {
         let error_text = format!("容器返回错误状态: {}", status);
