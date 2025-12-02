@@ -177,9 +177,22 @@ pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChatRequest>,
 ) -> Result<crate::model::HttpResult<ChatResponse>, crate::model::AppError> {
+    // 验证prompt不能为空
+    if request.prompt.trim().is_empty() {
+        return Err(crate::model::AppError::validation_error(
+            "prompt 字段不能为空",
+        ));
+    }
+
+    // agent_runner 运行在容器内部，固定使用 RCoder 服务类型
+    let service_type = shared_types::ServiceType::RCoder;
+
     info!(
-        "🚀 [DEBUG] handle_chat 开始处理请求: project_id={:?}, session_id={:?}, prompt={}",
-        request.project_id, request.session_id, request.prompt
+        "🚀 [DEBUG] handle_chat 开始处理请求: project_id={:?}, session_id={:?}, service_type={}, prompt={}",
+        request.project_id,
+        request.session_id,
+        service_type.as_str(),
+        request.prompt
     );
 
     // 检查是否需要生成项目ID
@@ -197,16 +210,17 @@ pub async fn handle_chat(
 
     // 🚦 检查 Agent 状态，禁止并发请求
     if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(&project_id)
-        && agent_info.status == AgentStatus::Active {
-            info!(
-                "⚠️ [chat] Agent正在执行任务，拒绝并发请求: project_id={}, status={:?}",
-                project_id, agent_info.status
-            );
-            return Ok(crate::model::HttpResult::error(
-                "9010",
-                "Agent正在执行任务，请等待当前任务完成后再发送新请求",
-            ));
-        }
+        && agent_info.status == AgentStatus::Active
+    {
+        info!(
+            "⚠️ [chat] Agent正在执行任务，拒绝并发请求: project_id={}, status={:?}",
+            project_id, agent_info.status
+        );
+        return Ok(crate::model::HttpResult::error(
+            "9010",
+            "Agent正在执行任务，请等待当前任务完成后再发送新请求",
+        ));
+    }
 
     // 🗑️ 简单直接：直接移除所有相关session，确保全新开始
     // 新的设计：移除旧session → Agent必须重新获取sender → 前端只能获取新消息
@@ -227,12 +241,12 @@ pub async fn handle_chat(
 
             if let Some(session_project_id) = &session_info.project_id
                 && session_project_id == &project_id
-                    && crate::service::SESSION_CACHE
-                        .remove(current_session_id)
-                        .is_some()
-                    {
-                        cleared_sessions += 1;
-                    }
+                && crate::service::SESSION_CACHE
+                    .remove(current_session_id)
+                    .is_some()
+            {
+                cleared_sessions += 1;
+            }
         }
 
         if cleared_sessions > 0 {
@@ -263,6 +277,7 @@ pub async fn handle_chat(
         .attachments(request.attachments.clone())
         .data_source_attachments(request.data_source_attachments.clone())
         .agent_type(agent_type)
+        .service_type(service_type) // agent_runner 固定使用 RCoder
         .request_id(request_id.clone())
         .build()
         .map_err(|e| anyhow::anyhow!(e))?;

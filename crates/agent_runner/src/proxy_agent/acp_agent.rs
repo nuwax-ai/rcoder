@@ -56,9 +56,10 @@ async fn create_new_agent_service(
     match start_agent_result {
         Ok(conn_info) => {
             // 使用现有的AgentStopHandle作为dyn AgentLifecycle
-            let stop_handle = conn_info.stop_handle.as_ref().map(|guard| {
-                guard.clone() as Arc<dyn shared_types::AgentLifecycle>
-            });
+            let stop_handle = conn_info
+                .stop_handle
+                .as_ref()
+                .map(|guard| guard.clone() as Arc<dyn shared_types::AgentLifecycle>);
 
             let project_and_agent_info = ProjectAndAgentInfo {
                 project_id: project_id.clone(),
@@ -94,7 +95,9 @@ async fn create_new_agent_service(
             }
 
             let response =
-                match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {
+                match build_prompt_to_acp_agent(chat_prompt.clone(), conn_info.session_id.clone())
+                    .await
+                {
                     Ok(prompt_request) => {
                         if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
                             error!("发送prompt请求失败: {:?}", e);
@@ -102,6 +105,8 @@ async fn create_new_agent_service(
                                 project_id: project_id.clone(),
                                 session_id: conn_info.session_id.to_string(),
                                 error: Some(format!("发送prompt请求失败: {:?}", e)),
+                                request_id: chat_prompt.request_id.clone(),
+                                service_type: chat_prompt.service_type.clone(),
                             }
                         } else {
                             info!("Prompt 请求已发送，项目ID: {}", project_id);
@@ -109,6 +114,8 @@ async fn create_new_agent_service(
                                 project_id: project_id.clone(),
                                 session_id: conn_info.session_id.to_string(),
                                 error: None,
+                                request_id: chat_prompt.request_id.clone(),
+                                service_type: chat_prompt.service_type.clone(),
                             }
                         }
                     }
@@ -121,6 +128,8 @@ async fn create_new_agent_service(
                             project_id: project_id.clone(),
                             session_id: conn_info.session_id.to_string(),
                             error: Some(format!("构建prompt请求失败: {:?}", e)),
+                            request_id: chat_prompt.request_id.clone(),
+                            service_type: chat_prompt.service_type.clone(),
                         }
                     }
                 };
@@ -138,6 +147,8 @@ async fn create_new_agent_service(
                 project_id: project_id.clone(),
                 session_id: "".to_string(), // 启动失败时没有 session_id
                 error: Some(format!("启动ACP Agent服务失败: {}", e)),
+                request_id: chat_prompt.request_id.clone(),
+                service_type: chat_prompt.service_type.clone(),
             };
 
             if let Err(send_err) = request.chat_prompt_tx.send(error_response) {
@@ -229,10 +240,10 @@ pub async fn agent_worker(
 
         // 检查 project_id 有对应的agent 服务,没有则创建
         let project_id = request.chat_prompt.project_id.clone();
-        
+
         // 先检查是否存在Agent并提取必要信息，然后立即释放锁
         let agent_exists = PROJECT_AND_AGENT_INFO_MAP.contains_key(&project_id);
-        
+
         if agent_exists {
             info!("✅ 找到现有Agent，project_id: {}", project_id);
         } else {
@@ -312,6 +323,8 @@ pub async fn agent_worker(
                     project_id: project_id.clone(),
                     session_id: session_id.to_string(),
                     error: None,
+                    request_id: request.chat_prompt.request_id.clone(),
+                    service_type: request.chat_prompt.service_type.clone(),
                 }) {
                     error!("发送回执消息失败: {:?}", e);
                 } else {

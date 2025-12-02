@@ -21,7 +21,9 @@ RUN apt-get update && apt-get install -y \
     clang \
     cmake \
     build-essential \
-    git
+    git \
+    protobuf-compiler \
+    libprotobuf-dev
 
 # 复制源码到工作目录
 COPY . .

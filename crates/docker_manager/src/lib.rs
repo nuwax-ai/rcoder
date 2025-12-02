@@ -3,6 +3,7 @@ use tracing::error;
 
 pub mod container_self_inspector;
 pub mod container_stop;
+pub mod image_selector;
 pub mod manager;
 pub mod types;
 pub mod utils;
@@ -33,6 +34,9 @@ pub enum DockerError {
     #[error("镜像拉取失败: {0}")]
     ImagePullError(String),
 
+    #[error("配置错误: {0}")]
+    ConfigurationError(String),
+
     #[error("IO 错误: {0}")]
     IoError(#[from] std::io::Error),
 
@@ -50,17 +54,17 @@ pub type DockerResult<T> = Result<T, DockerError>;
 pub mod default_images {
     /// ARM64 架构的默认镜像
     pub const ARM64: &str = "registry.yichamao.com/agent-runner:latest-arm64";
-    
+
     /// AMD64 架构的默认镜像
     pub const AMD64: &str = "registry.yichamao.com/agent-runner:latest-amd64";
-    
+
     /// 默认回退镜像（当无法检测架构或架构不匹配时使用）
     pub const DEFAULT: &str = "registry.yichamao.com/agent-runner:latest";
 }
 
 /// 默认的 Docker 镜像（根据架构自动选择）
-/// 
-/// 注意：此函数使用硬编码的默认值，建议使用 `get_docker_image_from_config()` 
+///
+/// 注意：此函数使用硬编码的默认值，建议使用 `get_docker_image_from_config()`
 /// 从配置中读取镜像地址
 pub fn default_docker_image() -> String {
     let platform = crate::utils::DockerUtils::auto_detect_platform();
@@ -87,7 +91,7 @@ pub fn default_fallback_image() -> String {
 }
 
 /// 从 rcoder 配置获取 Docker 镜像
-/// 
+///
 /// # 参数
 /// * `image` - 通用镜像（优先使用，如果指定则忽略架构特定镜像）
 /// * `arm64_image` - ARM64 架构专用镜像
@@ -108,19 +112,13 @@ pub fn get_docker_image_from_config(
 
     // 根据架构使用特定镜像
     match platform.as_str() {
-        "linux/arm64" => {
-            arm64_image.unwrap_or_else(|| {
-                default_image.unwrap_or_else(|| default_images::DEFAULT.to_string())
-            })
-        }
-        "linux/amd64" => {
-            amd64_image.unwrap_or_else(|| {
-                default_image.unwrap_or_else(|| default_images::DEFAULT.to_string())
-            })
-        }
-        _ => {
+        "linux/arm64" => arm64_image.unwrap_or_else(|| {
             default_image.unwrap_or_else(|| default_images::DEFAULT.to_string())
-        }
+        }),
+        "linux/amd64" => amd64_image.unwrap_or_else(|| {
+            default_image.unwrap_or_else(|| default_images::DEFAULT.to_string())
+        }),
+        _ => default_image.unwrap_or_else(|| default_images::DEFAULT.to_string()),
     }
 }
 

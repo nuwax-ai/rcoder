@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 use docker_manager::ContainerSelfInspector;
 
@@ -113,17 +113,37 @@ impl HostPathResolver {
 
         debug!("容器内绝对路径: {:?}", container_absolute_path);
 
-        // 第二步：如果容器内绝对路径以项目工作目录开头，提取相对路径
-        if let Ok(relative_path) = container_absolute_path.strip_prefix(&self.container_project_workspace) {
-            // 第三步：将相对路径拼接到宿主机基础路径上
+        // 第二步：尝试通过容器自检测器解析路径
+        if let Some(ref inspector) = self.inspector {
+            if let Some(host_path) =
+                inspector.resolve_container_path_to_host(&container_absolute_path)
+            {
+                debug!(
+                    "通过容器自检测器转换成功: 容器内 {:?} -> 宿主机 {:?}",
+                    container_absolute_path, host_path
+                );
+                return host_path;
+            }
+        }
+
+        // 第三步：如果容器内绝对路径以项目工作目录开头，提取相对路径
+        if let Ok(relative_path) =
+            container_absolute_path.strip_prefix(&self.container_project_workspace)
+        {
+            // 第四步：将相对路径拼接到宿主机基础路径上
             let host_path = self.host_project_workspace.join(relative_path);
-            debug!("路径转换成功: 容器内 {:?} -> 宿主机 {:?}", container_absolute_path, host_path);
+            debug!(
+                "通过项目工作目录转换成功: 容器内 {:?} -> 宿主机 {:?}",
+                container_absolute_path, host_path
+            );
             return host_path;
         }
 
         // 如果路径不在项目工作目录下，可能是已经在宿主机上的路径
-        warn!("路径 {:?} 不在容器项目工作目录 {:?} 下，可能是宿主机路径",
-               container_absolute_path, self.container_project_workspace);
+        warn!(
+            "路径 {:?} 不在容器项目工作目录 {:?} 下，可能是宿主机路径",
+            container_absolute_path, self.container_project_workspace
+        );
 
         // 尝试直接解析为绝对路径
         match container_absolute_path.canonicalize() {
@@ -132,7 +152,10 @@ impl HostPathResolver {
                 absolute_path
             }
             Err(e) => {
-                warn!("无法解析路径 {:?} 为绝对路径: {}，使用原始路径", container_absolute_path, e);
+                warn!(
+                    "无法解析路径 {:?} 为绝对路径: {}，使用原始路径",
+                    container_absolute_path, e
+                );
                 container_absolute_path
             }
         }
@@ -161,7 +184,9 @@ impl HostPathResolver {
     /// 获取诊断信息（用于调试）
     pub async fn get_diagnostics(&self) -> Result<String> {
         if let Some(inspector) = &self.inspector {
-            let mounts = inspector.get_all_mounts().await
+            let mounts = inspector
+                .get_all_mounts()
+                .await
                 .context("获取容器挂载信息失败")?;
 
             let mut diagnostics = "容器挂载信息:\n".to_string();
@@ -178,7 +203,9 @@ impl HostPathResolver {
     /// 检查 Docker 连接状态
     pub async fn check_docker_connection(&self) -> Result<()> {
         if let Some(inspector) = &self.inspector {
-            inspector.verify_docker_connection().await
+            inspector
+                .verify_docker_connection()
+                .await
                 .context("Docker 连接验证失败")?;
         }
         Ok(())

@@ -700,6 +700,32 @@ impl DockerManager {
         self.config.default_image.clone()
     }
 
+    /// 根据服务类型选择镜像
+    pub async fn select_image(
+        &self,
+        service_type: &shared_types::ServiceType,
+        project_overrides: Option<&shared_types::ProjectImageOverrides>,
+    ) -> DockerResult<String> {
+        // 使用多镜像配置选择镜像
+        use crate::image_selector::ImageSelector;
+        let selector = ImageSelector::new(self.config.multi_image_config.clone());
+
+        debug!("使用ImageSelector选择镜像: {:?}", service_type);
+        selector.select_image(service_type, project_overrides).await
+    }
+
+    /// 获取服务配置
+    pub async fn get_service_config(
+        &self,
+        service_type: &shared_types::ServiceType,
+    ) -> DockerResult<shared_types::ServiceImageConfig> {
+        use crate::image_selector::ImageSelector;
+        let selector = ImageSelector::new(self.config.multi_image_config.clone());
+
+        debug!("获取服务配置: {:?}", service_type);
+        selector.get_service_config(service_type).await
+    }
+
     /// 获取容器网络信息
     pub async fn get_container_network_info(
         &self,

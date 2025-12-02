@@ -1,4 +1,4 @@
-use super::{DockerContainerConfig, DockerManagerConfig, DockerResult, DockerImageConfig};
+use super::{DockerContainerConfig, DockerManagerConfig, DockerResult};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::debug;
@@ -221,14 +221,6 @@ impl DockerUtils {
             let amd64_image = docker_cfg.amd64_image.clone();
             let default_image = docker_cfg.default_image.clone();
 
-            // 使用 rcoder 配置中的镜像设置
-            let image_config = DockerImageConfig {
-                default_image: docker_cfg.default_image.clone(),
-                arm64_image: docker_cfg.arm64_image.clone(),
-                amd64_image: docker_cfg.amd64_image.clone(),
-            };
-            config.image_config = Some(image_config);
-
             // 更新其他配置项
             if let Some(network_mode) = docker_cfg.network_mode {
                 config.default_network_mode = network_mode;
@@ -244,12 +236,8 @@ impl DockerUtils {
             }
 
             // 根据配置更新默认镜像
-            config.default_image = super::get_docker_image_from_config(
-                image,
-                arm64_image,
-                amd64_image,
-                default_image,
-            );
+            config.default_image =
+                super::get_docker_image_from_config(image, arm64_image, amd64_image, default_image);
         }
 
         config
@@ -269,14 +257,6 @@ impl DockerUtils {
             let amd64_image = docker_cfg.amd64_image().clone();
             let default_image = docker_cfg.default_image().clone();
 
-            // 使用 rcoder 配置中的镜像设置
-            let image_config = DockerImageConfig {
-                default_image: docker_cfg.default_image().clone(),
-                arm64_image: docker_cfg.arm64_image().clone(),
-                amd64_image: docker_cfg.amd64_image().clone(),
-            };
-            config.image_config = Some(image_config);
-
             // 更新其他配置项
             if let Some(network_mode) = docker_cfg.network_mode() {
                 config.default_network_mode = network_mode.clone();
@@ -292,12 +272,8 @@ impl DockerUtils {
             }
 
             // 根据配置更新默认镜像
-            config.default_image = super::get_docker_image_from_config(
-                image,
-                arm64_image,
-                amd64_image,
-                default_image,
-            );
+            config.default_image =
+                super::get_docker_image_from_config(image, arm64_image, amd64_image, default_image);
         }
 
         config

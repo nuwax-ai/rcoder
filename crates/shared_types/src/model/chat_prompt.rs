@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use super::{AgentType, Attachment, ModelProviderConfig};
 use derive_builder::Builder;
 
-#[derive(Debug, Clone, Default, Builder)]
+#[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct ChatPrompt {
     /// 项目ID, 再 ./project_workspace/{project_id} 对应
@@ -24,6 +24,9 @@ pub struct ChatPrompt {
     /// agent 类型
     #[builder(default)]
     pub agent_type: AgentType,
+    /// 必填：服务类型选择 (强制要求指定)
+    /// "rcoder" 或 "agent-runner"，不允许为空
+    pub service_type: crate::ServiceType,
     /// 可选的请求ID，用于标识和追踪请求
     #[builder(default)]
     pub request_id: Option<String>,
@@ -41,4 +44,8 @@ pub struct ChatPromptResponse {
     pub session_id: String,
     /// 错误信息，如果有的话
     pub error: Option<String>,
+    /// 请求ID，用于标识和追踪请求
+    pub request_id: Option<String>,
+    /// 使用的服务类型
+    pub service_type: crate::ServiceType,
 }
