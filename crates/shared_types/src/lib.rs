@@ -1,6 +1,12 @@
 mod container;
 mod model;
 
+// gRPC 模块
+pub mod grpc {
+    // 包含生成的代码，路径相对于当前文件
+    include!("grpc/agent.rs");
+}
+
 pub use model::{
     AgentLifecycle,
     AgentLifecycleGuard,
@@ -42,4 +48,3 @@ pub use model::{
 
 // 导出ChatPrompt的Builder
 pub use model::chat_prompt::ChatPromptBuilder;
-

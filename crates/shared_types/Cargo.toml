@@ -55,3 +55,13 @@ tower-http = { workspace = true, features = ["cors", "trace"] }
 futures = { workspace = true }
 tokio-stream = "0.1"
 async-stream = "0.3"
+
+# gRPC - 使用 tonic 0.14 运行时
+tonic = { version = "0.14.2", features = ["tls-native-roots"] }
+tonic-prost = "0.14"  # 添加 tonic-prost 依赖
+prost = "0.14"
+prost-types = "0.14"
+
+[build-dependencies]
+# 使用 tonic-prost-build 而不是 tonic-build！
+tonic-prost-build = "0.14"
