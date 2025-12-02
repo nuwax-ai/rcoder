@@ -30,6 +30,7 @@ pub struct UnifiedSessionMessage {
 }
 
 /// chat 对话的 prompt 开始
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPromptStart {
     pub session_id: String,
     /// 可选的请求ID，用于标识对应的用户请求
@@ -37,6 +38,7 @@ pub struct SessionPromptStart {
 }
 
 /// chat 对话的 prompt 结束
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPromptEnd {
     pub session_id: String,
     pub stop_reason: StopReason,
@@ -46,6 +48,7 @@ pub struct SessionPromptEnd {
     pub request_id: Option<String>,
 }
 ///agent 执行任务报错的消息
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPromptError {
     pub session_id: String,
     pub error: Error,
@@ -55,6 +58,7 @@ pub struct SessionPromptError {
     
 
 /// agent 的 session 更新
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionUpdate {
     pub session_id: String,
     pub session_update: SessionUpdate,
@@ -63,6 +67,7 @@ pub struct AgentSessionUpdate {
 }
 
 /// 需要发给前端的消息通知类型
+#[derive(Debug, Clone, Serialize)]
 pub enum SessionNotify {
     AgentSessionUpdate(AgentSessionUpdate),
     SessionPromptStart(SessionPromptStart),
