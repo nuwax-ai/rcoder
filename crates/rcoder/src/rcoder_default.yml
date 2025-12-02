@@ -55,6 +55,11 @@ docker_config:
         image_tag_prefix: "rcoder"
         enabled: true
 
+        # 容器内挂载路径模板（支持变量替换）
+        # 默认值: "/app/project_workspace/{project_id}"
+        # 支持变量: {project_id}, {user_id}, {service_type}
+        container_path_template: "/app/project_workspace/{project_id}"
+
         # 环境变量
         environment:
           RUST_LOG: "info"
@@ -102,6 +107,11 @@ docker_config:
         default_image: "registry.yichamao.com/rcoder-agent-runner:latest"
         image_tag_prefix: "rcoder-agent-runner"
         enabled: true
+
+        # 容器内挂载路径模板（支持变量替换）
+        # 默认值: "/app/project_workspace/{project_id}"
+        # 支持变量: {project_id}, {user_id}, {service_type}
+        container_path_template: "/app/project_workspace/{project_id}"
 
         # 环境变量
         environment:
