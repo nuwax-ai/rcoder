@@ -63,18 +63,16 @@ impl Client for AcpAgentClient {
             })
             .or_else(|| args.options.first());
         if let Some(option) = selected {
-            return Ok(agent_client_protocol::RequestPermissionResponse {
-                outcome: agent_client_protocol::RequestPermissionOutcome::Selected {
-                    option_id: option.id.clone(),
-                },
-                meta: None,
-            });
+            return Ok(agent_client_protocol::RequestPermissionResponse::new(
+                agent_client_protocol::RequestPermissionOutcome::Selected(
+                    agent_client_protocol::SelectedPermissionOutcome::new(option.option_id.clone()),
+                ),
+            ));
         }
         // 无可选项则取消
-        Ok(agent_client_protocol::RequestPermissionResponse {
-            outcome: agent_client_protocol::RequestPermissionOutcome::Cancelled,
-            meta: None,
-        })
+        Ok(agent_client_protocol::RequestPermissionResponse::new(
+            agent_client_protocol::RequestPermissionOutcome::Cancelled,
+        ))
     }
 
     async fn write_text_file(
@@ -96,7 +94,7 @@ impl Client for AcpAgentClient {
             error!("写入文件失败: {}", e);
             agent_client_protocol::Error::internal_error()
         })?;
-        Ok(agent_client_protocol::WriteTextFileResponse { meta: None })
+        Ok(agent_client_protocol::WriteTextFileResponse::new())
     }
 
     async fn read_text_file(
@@ -108,10 +106,7 @@ impl Client for AcpAgentClient {
             error!("读取文件失败: {}", e);
             agent_client_protocol::Error::internal_error()
         })?;
-        Ok(agent_client_protocol::ReadTextFileResponse {
-            content,
-            meta: None,
-        })
+        Ok(agent_client_protocol::ReadTextFileResponse::new(content))
     }
 
     async fn create_terminal(
@@ -225,6 +220,8 @@ impl Client for AcpAgentClient {
                         resource_link.uri.clone()
                     }
                     agent_client_protocol::ContentBlock::Resource(_) => "<resource>".into(),
+                    // 处理未来可能添加的新内容类型
+                    _ => "<unknown>".into(),
                 };
                 info!(
                     "📥 Agent message cached [session:{}]: {}",

@@ -16,7 +16,7 @@ dependencies = [
 name = "acp-adapter"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol 0.6.0",
+ "agent-client-protocol 0.8.0",
  "anyhow",
  "async-trait",
  "bytes 1.11.0",
@@ -64,24 +64,6 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c6dd5cbfa40830215128d75817066151f7c09dc3f34c3a4828073a3d981b03a"
-dependencies = [
- "agent-client-protocol-schema 0.5.0",
- "anyhow",
- "async-broadcast",
- "async-trait",
- "derive_more 2.0.1",
- "futures 0.3.31",
- "log",
- "parking_lot",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "agent-client-protocol"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "525705e39c11cd73f7bc784e3681a9386aa30c8d0630808d3dc2237eb4f9cb1b"
@@ -99,14 +81,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-client-protocol-schema"
-version = "0.5.0"
+name = "agent-client-protocol"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d510cb051ef98b12786311f27d0f6322580ccadf81ab5f8c1497e735f4e95e4"
+checksum = "3e639d6b544ad39f5b4e05802db5eb04e1518284eb05fda1839931003e0244c8"
 dependencies = [
+ "agent-client-protocol-schema 0.9.1",
  "anyhow",
+ "async-broadcast",
+ "async-trait",
  "derive_more 2.0.1",
- "schemars 1.1.0",
+ "futures 0.3.31",
+ "log",
  "serde",
  "serde_json",
 ]
@@ -125,11 +111,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-client-protocol-schema"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f182f5e14bef8232b239719bd99166bb11e986c08fc211f28e392f880d3093ba"
+dependencies = [
+ "anyhow",
+ "derive_more 2.0.1",
+ "schemars 1.1.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agent_runner"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol 0.6.0",
+ "agent-client-protocol 0.8.0",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -1148,7 +1147,7 @@ name = "claude-code-agent"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol 0.6.0",
+ "agent-client-protocol 0.8.0",
  "anyhow",
  "async-trait",
  "dirs",
@@ -5355,7 +5354,7 @@ name = "rcoder"
 version = "0.1.0"
 dependencies = [
  "acp-adapter",
- "agent-client-protocol 0.6.0",
+ "agent-client-protocol 0.8.0",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -6281,7 +6280,7 @@ dependencies = [
 name = "shared_types"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol 0.6.0",
+ "agent-client-protocol 0.8.0",
  "anyhow",
  "async-stream",
  "axum",

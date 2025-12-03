@@ -354,11 +354,7 @@ pub async fn build_prompt_to_acp_agent(
     };
 
     // 创建文本内容块
-    let text_block = ContentBlock::Text(TextContent {
-        text: final_prompt,
-        annotations: None,
-        meta: None,
-    });
+    let text_block = ContentBlock::Text(TextContent::new(final_prompt));
 
     // 创建内容块列表，以文本开始
     let mut content_blocks = vec![text_block];
@@ -375,22 +371,21 @@ pub async fn build_prompt_to_acp_agent(
     }
 
     // 将 request_id 放入 meta 字段，以便 channel_utils 可以提取并更新到 MAP
-    let meta = if let Some(request_id) = prompt.request_id {
+    let prompt_request = if let Some(request_id) = prompt.request_id {
         debug!(
             "🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta",
             request_id
         );
-        Some(serde_json::json!({
-            "request_id": request_id
-        }))
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(request_id),
+        );
+        PromptRequest::new(session_id, content_blocks).meta(meta)
     } else {
-        debug!("⚠️ [build_prompt] prompt.request_id 为空，meta 设为 None");
-        None
+        debug!("⚠️ [build_prompt] prompt.request_id 为空，不设置 meta");
+        PromptRequest::new(session_id, content_blocks)
     };
 
-    Ok(PromptRequest {
-        session_id,
-        prompt: content_blocks,
-        meta,
-    })
+    Ok(prompt_request)
 }

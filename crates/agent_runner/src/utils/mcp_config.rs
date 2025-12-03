@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_client_protocol::{EnvVariable, McpServer};
+use agent_client_protocol::{EnvVariable, McpServer, McpServerStdio};
 
 /// 创建 context7 MCP 服务器配置
 ///
@@ -20,12 +20,10 @@ use agent_client_protocol::{EnvVariable, McpServer};
 /// ```
 /// 注意：不使用 API key，只提供基本功能
 pub fn create_context7_mcp_server(_api_key: Option<&str>) -> McpServer {
-    McpServer::Stdio {
-        name: "context7".to_string(),
-        command: PathBuf::from("bunx"),
-        args: vec!["-y".to_string(), "@upstash/context7-mcp".to_string()],
-        env: Vec::new(), // 不需要额外的环境变量
-    }
+    McpServer::Stdio(
+        McpServerStdio::new("context7", PathBuf::from("bunx"))
+            .args(vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]),
+    )
 }
 
 /// 创建默认的 context7 MCP 服务器配置（不使用 API 密钥）
@@ -53,16 +51,14 @@ pub fn create_default_context7_mcp_server() -> Option<McpServer> {
 /// }
 /// ```
 pub fn create_xagi_frontend_mcp_server() -> McpServer {
-    McpServer::Stdio {
-        name: "frontend-template".to_string(),
-        command: PathBuf::from("npx"),
-        args: vec!["xagi-frontend-mcp@latest".to_string()],
-        env: vec![EnvVariable {
-            name: "NODE_ENV".to_string(),
-            value: "production".to_string(),
-            meta: None,
-        }],
-    }
+    McpServer::Stdio(
+        McpServerStdio::new("frontend-template", PathBuf::from("npx"))
+            .args(vec!["xagi-frontend-mcp@latest".to_string()])
+            .env(vec![EnvVariable::new(
+                "NODE_ENV".to_string(),
+                "production".to_string(),
+            )]),
+    )
 }
 
 /// 创建 fetch MCP 服务器配置
@@ -81,12 +77,10 @@ pub fn create_xagi_frontend_mcp_server() -> McpServer {
 /// }
 /// ```
 pub fn create_fetch_mcp_server() -> McpServer {
-    McpServer::Stdio {
-        name: "fetch".to_string(),
-        command: PathBuf::from("uvx"),
-        args: vec!["mcp-server-fetch".to_string()],
-        env: Vec::new(), // 不需要额外的环境变量
-    }
+    McpServer::Stdio(
+        McpServerStdio::new("fetch", PathBuf::from("uvx"))
+            .args(vec!["mcp-server-fetch".to_string()]),
+    )
 }
 
 /// 创建默认的 MCP 服务器列表
@@ -116,19 +110,14 @@ mod tests {
         let server = create_context7_mcp_server(None);
 
         match server {
-            McpServer::Stdio {
-                name,
-                command,
-                args,
-                env,
-            } => {
-                assert_eq!(name, "context7");
-                assert_eq!(command, std::path::PathBuf::from("bunx"));
+            McpServer::Stdio(server) => {
+                assert_eq!(server.name, "context7");
+                assert_eq!(server.command, std::path::PathBuf::from("bunx"));
                 assert_eq!(
-                    args,
+                    server.args,
                     vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
                 );
-                assert_eq!(env.len(), 0);
+                assert_eq!(server.env.len(), 0);
             }
             _ => panic!("Expected Stdio variant"),
         }
@@ -139,18 +128,13 @@ mod tests {
         let server = create_xagi_frontend_mcp_server();
 
         match server {
-            McpServer::Stdio {
-                name,
-                command,
-                args,
-                env,
-            } => {
-                assert_eq!(name, "frontend-template");
-                assert_eq!(command, std::path::PathBuf::from("npx"));
-                assert_eq!(args, vec!["xagi-frontend-mcp@latest".to_string()]);
-                assert_eq!(env.len(), 1);
-                assert_eq!(env[0].name, "NODE_ENV");
-                assert_eq!(env[0].value, "production");
+            McpServer::Stdio(server) => {
+                assert_eq!(server.name, "frontend-template");
+                assert_eq!(server.command, std::path::PathBuf::from("npx"));
+                assert_eq!(server.args, vec!["xagi-frontend-mcp@latest".to_string()]);
+                assert_eq!(server.env.len(), 1);
+                assert_eq!(server.env[0].name, "NODE_ENV");
+                assert_eq!(server.env[0].value, "production");
             }
             _ => panic!("Expected Stdio variant"),
         }
@@ -161,16 +145,11 @@ mod tests {
         let server = create_fetch_mcp_server();
 
         match server {
-            McpServer::Stdio {
-                name,
-                command,
-                args,
-                env,
-            } => {
-                assert_eq!(name, "fetch");
-                assert_eq!(command, std::path::PathBuf::from("uvx"));
-                assert_eq!(args, vec!["mcp-server-fetch".to_string()]);
-                assert_eq!(env.len(), 0);
+            McpServer::Stdio(server) => {
+                assert_eq!(server.name, "fetch");
+                assert_eq!(server.command, std::path::PathBuf::from("uvx"));
+                assert_eq!(server.args, vec!["mcp-server-fetch".to_string()]);
+                assert_eq!(server.env.len(), 0);
             }
             _ => panic!("Expected Stdio variant"),
         }
@@ -180,43 +159,27 @@ mod tests {
     fn test_create_default_mcp_servers() {
         let servers = create_default_mcp_servers(None);
 
-        assert_eq!(servers.len(), 3);
+        assert_eq!(servers.len(), 2); // 现在只有2个服务器，因为 frontend-template 被注释掉了
 
         // 验证 context7 服务器
         match &servers[0] {
-            McpServer::Stdio { name, args, .. } => {
-                assert_eq!(name, "context7");
+            McpServer::Stdio(server) => {
+                assert_eq!(server.name, "context7");
                 assert_eq!(
-                    *args,
+                    server.args,
                     vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
                 );
             }
             _ => panic!("Expected Stdio variant"),
         }
 
-        // 验证 frontend-template 服务器
-        match &servers[1] {
-            McpServer::Stdio {
-                name, args, env, ..
-            } => {
-                assert_eq!(name, "frontend-template");
-                assert_eq!(*args, vec!["xagi-frontend-mcp@latest".to_string()]);
-                assert_eq!(env.len(), 1);
-                assert_eq!(env[0].name, "NODE_ENV");
-                assert_eq!(env[0].value, "production");
-            }
-            _ => panic!("Expected Stdio variant"),
-        }
-
         // 验证 fetch 服务器
-        match &servers[2] {
-            McpServer::Stdio {
-                name, command, args, env, ..
-            } => {
-                assert_eq!(name, "fetch");
-                assert_eq!(command, &std::path::PathBuf::from("uvx"));
-                assert_eq!(*args, vec!["mcp-server-fetch".to_string()]);
-                assert_eq!(env.len(), 0);
+        match &servers[1] {
+            McpServer::Stdio(server) => {
+                assert_eq!(server.name, "fetch");
+                assert_eq!(server.command, std::path::PathBuf::from("uvx"));
+                assert_eq!(server.args, vec!["mcp-server-fetch".to_string()]);
+                assert_eq!(server.env.len(), 0);
             }
             _ => panic!("Expected Stdio variant"),
         }
@@ -232,13 +195,13 @@ mod tests {
         // 验证包含 context7 服务器
         let has_context7 = servers
             .iter()
-            .any(|server| matches!(server, McpServer::Stdio { name, .. } if name == "context7"));
+            .any(|server| matches!(server, McpServer::Stdio(server) if server.name == "context7"));
         assert!(has_context7);
 
         // 验证包含 fetch 服务器
         let has_fetch = servers
             .iter()
-            .any(|server| matches!(server, McpServer::Stdio { name, .. } if name == "fetch"));
+            .any(|server| matches!(server, McpServer::Stdio(server) if server.name == "fetch"));
         assert!(has_fetch);
     }
 
@@ -248,10 +211,10 @@ mod tests {
         assert!(server.is_some());
 
         match server.unwrap() {
-            McpServer::Stdio { name, args, .. } => {
-                assert_eq!(name, "context7");
+            McpServer::Stdio(server) => {
+                assert_eq!(server.name, "context7");
                 assert_eq!(
-                    *args,
+                    server.args,
                     vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
                 );
             }

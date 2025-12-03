@@ -144,12 +144,12 @@ impl AgentCleaner {
         project_id: &str,
     ) -> bool {
         // 🛡️ 最小保护时间：容器创建后5分钟内不会被清理
-        let MIN_PROTECTION_DURATION = Duration::from_secs(5 * 60);
+        let min_protection_duration = Duration::from_secs(5 * 60);
 
         let current_time = Utc::now();
         let age = current_time.signed_duration_since(created_at);
 
-        if age.num_seconds() < MIN_PROTECTION_DURATION.as_secs() as i64 {
+        if age.num_seconds() < min_protection_duration.as_secs() as i64 {
             info!(
                 "🛡️ [cleanup] 容器在保护期内，跳过清理: project_id={}, 创建时长={}秒",
                 project_id,
@@ -585,9 +585,10 @@ impl AgentCleaner {
         let mut cleaned_count = 0;
         for task in cleanup_tasks {
             if let Ok(success) = task.await
-                && success {
-                    cleaned_count += 1;
-                }
+                && success
+            {
+                cleaned_count += 1;
+            }
         }
 
         if cleaned_count > 0 || protected_count > 0 {
@@ -601,7 +602,7 @@ impl AgentCleaner {
     }
 
     /// 清理单个孤立容器
-    /// 
+    ///
     /// 使用统一的运行时清理策略
     async fn cleanup_single_orphaned_container(
         docker_manager: &Arc<docker_manager::DockerManager>,
@@ -730,7 +731,7 @@ impl AgentCleaner {
     }
 
     /// 销毁Docker容器
-    /// 
+    ///
     /// 使用统一的运行时清理策略
     async fn destroy_docker_container(&self, project_id: &str) -> Result<()> {
         info!("🔥 [cleanup] 开始销毁Docker容器: project_id={}", project_id);
@@ -759,12 +760,13 @@ impl AgentCleaner {
 
             // 释放端口（如果存在）
             if let Some(port_binding) = container_info.port_bindings.values().next()
-                && let Ok(port) = port_binding.parse::<u16>() {
-                    crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-                        .release_port(port)
-                        .await;
-                    info!("🧼 [cleanup] 释放端口: port={}", port);
-                }
+                && let Ok(port) = port_binding.parse::<u16>()
+            {
+                crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
+                    .release_port(port)
+                    .await;
+                info!("🧼 [cleanup] 释放端口: port={}", port);
+            }
 
             // 使用统一的运行时清理接口
             docker_manager::container_stop::runtime_cleanup_container(

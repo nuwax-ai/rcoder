@@ -10,10 +10,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-
-use agent_client_protocol::{SessionId, CancelNotification, PromptRequest,ClientSideConnection};
+use super::{AgentType, ModelProviderConfig, ModelProviderSafeInfo};
+use agent_client_protocol::{CancelNotification, PromptRequest, SessionId};
 use chrono::{DateTime, Utc};
-use super::{ModelProviderConfig, ModelProviderSafeInfo, AgentType};
 use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;
 
@@ -96,9 +95,6 @@ pub struct AgentStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<ModelProviderSafeInfo>,
 }
-
-
-
 
 /// Agent生命周期守卫
 ///
@@ -408,27 +404,29 @@ impl Drop for AgentLifecycleGuard {
 }
 
 /// Agent生命周期trait
-/// 
+///
 /// 定义了Agent生命周期管理的基本接口
 pub trait AgentLifecycle: Send + Sync + 'static {
     /// 优雅停止Agent
-    fn graceful_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
-    
+    fn graceful_stop(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
     /// 发送取消信号（非阻塞）
     fn cancel(&self);
-    
+
     /// 检查是否已停止
     fn is_stopped(&self) -> bool;
-    
+
     /// 获取取消令牌
     fn cancellation_token(&self) -> &CancellationToken;
-    
+
     /// 获取agent类型
     fn agent_type(&self) -> AgentType;
 }
 
 /// Agent停止句柄
-/// 
+///
 /// 包装AgentLifecycleGuard，提供统一的trait接口
 pub struct AgentStopHandle {
     inner: Arc<dyn AgentLifecycle>,
@@ -439,7 +437,7 @@ impl AgentStopHandle {
     pub fn new(inner: Arc<dyn AgentLifecycle>) -> Self {
         Self { inner }
     }
-    
+
     /// 获取内部引用
     pub fn inner(&self) -> &Arc<dyn AgentLifecycle> {
         &self.inner
@@ -448,7 +446,7 @@ impl AgentStopHandle {
 
 impl std::ops::Deref for AgentStopHandle {
     type Target = dyn AgentLifecycle;
-    
+
     fn deref(&self) -> &Self::Target {
         self.inner.as_ref()
     }
@@ -456,24 +454,24 @@ impl std::ops::Deref for AgentStopHandle {
 
 // 为AgentLifecycleGuard实现AgentLifecycle trait
 impl AgentLifecycle for AgentLifecycleGuard {
-    fn graceful_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            self.graceful_stop().await
-        })
+    fn graceful_stop(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move { self.graceful_stop().await })
     }
-    
+
     fn cancel(&self) {
         self.cancel()
     }
-    
+
     fn is_stopped(&self) -> bool {
         self.is_stopped()
     }
-    
+
     fn cancellation_token(&self) -> &CancellationToken {
         self.cancellation_token()
     }
-    
+
     fn agent_type(&self) -> AgentType {
         self.agent_type()
     }

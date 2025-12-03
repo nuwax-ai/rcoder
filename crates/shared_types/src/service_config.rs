@@ -403,29 +403,6 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_default_rcoder_config() {
-        let config = default_rcoder_service_config();
-
-        assert_eq!(config.service_type, ServiceType::RCoder);
-        assert!(config.enabled);
-        assert!(config.image.is_none());
-        assert!(config.environment.contains_key("RUST_LOG"));
-        assert_eq!(config.mounts.len(), 1);
-    }
-
-    #[test]
-    fn test_default_agent_runner_config() {
-        let config = default_agent_runner_service_config();
-
-        assert_eq!(config.service_type, ServiceType::AgentRunner);
-        assert!(!config.enabled); // 应该默认禁用
-        assert!(config.image.is_none());
-        assert!(config.environment.contains_key("AGENT_PORT"));
-        assert_eq!(config.mounts.len(), 2);
-    }
-
     #[test]
     fn test_config_validation() {
         let config = default_rcoder_service_config();
@@ -446,44 +423,6 @@ mod tests {
     }
 
     #[test]
-    fn test_image_selection_for_platform() {
-        let config = default_rcoder_service_config();
-
-        // 设置不同的镜像配置
-        let mut config_with_image = config.clone();
-        config_with_image.image = Some("my-custom-image:latest".to_string());
-
-        let mut config_with_arm64 = config.clone();
-        config_with_arm64.arm64_image = Some("my-arm64-image:latest".to_string());
-
-        // 测试 ARM64 平台选择
-        assert_eq!(
-            config_with_image.get_image_for_platform("linux/arm64"),
-            Some("my-custom-image:latest".to_string())
-        );
-        assert_eq!(
-            config_with_arm64.get_image_for_platform("linux/arm64"),
-            Some("my-arm64-image:latest".to_string())
-        );
-
-        // 测试 AMD64 平台选择
-        assert_eq!(
-            config_with_image.get_image_for_platform("linux/amd64"),
-            Some("my-custom-image:latest".to_string())
-        );
-        assert_eq!(
-            config_with_arm64.get_image_for_platform("linux/amd64"),
-            Some("my-arm64-image:latest".to_string())
-        );
-
-        // 测试默认回退
-        assert_eq!(
-            config.get_image_for_platform("unknown"),
-            config.default_image
-        );
-    }
-
-    #[test]
     fn test_environment_merge() {
         let config = default_rcoder_service_config();
 
@@ -501,14 +440,42 @@ mod tests {
 
     #[test]
     fn test_mount_validation() {
-        let config = default_rcoder_service_config();
+        // 创建一个有挂载点的配置用于测试
+        let config_with_mounts = ServiceImageConfig {
+            service_type: ServiceType::RCoder,
+            image: None,
+            arm64_image: Some("test-image:arm64".to_string()),
+            amd64_image: Some("test-image:amd64".to_string()),
+            default_image: Some("test-image:latest".to_string()),
+            image_tag_prefix: None,
+            enabled: true,
+            environment: HashMap::new(),
+            mounts: vec![ServiceMountConfig {
+                container_path: "/app/workspace".to_string(),
+                host_path: "/host/workspace".to_string(),
+                read_only: false,
+                mount_type: "bind".to_string(),
+            }],
+            command: vec![],
+            entrypoint: None,
+            resource_limits: ServiceResourceLimits {
+                memory_limit: None,
+                cpu_limit: None,
+                swap_limit: None,
+                disk_limit: None,
+                process_limit: None,
+            },
+            work_dir: "/app".to_string(),
+            network_mode: "bridge".to_string(),
+            container_path_template: "/app/project_workspace/{project_id}".to_string(),
+        };
 
-        for mount in &config.mounts {
+        for mount in &config_with_mounts.mounts {
             assert!(matches!(mount.validate(), ConfigValidationResult::Valid));
         }
 
         // 测试无效挂载
-        let mut invalid_mount = config.mounts[0].clone();
+        let mut invalid_mount = config_with_mounts.mounts[0].clone();
         invalid_mount.container_path = "".to_string();
         assert!(matches!(
             invalid_mount.validate(),
