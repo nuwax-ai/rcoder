@@ -455,6 +455,8 @@ impl From<ToolCallStatus> for ExtendedToolCallStatus {
             ToolCallStatus::InProgress => ExtendedToolCallStatus::InProgress,
             ToolCallStatus::Completed => ExtendedToolCallStatus::Completed,
             ToolCallStatus::Failed => ExtendedToolCallStatus::Failed,
+            // 处理未来可能添加的新状态
+            _ => ExtendedToolCallStatus::Failed,
         }
     }
 }

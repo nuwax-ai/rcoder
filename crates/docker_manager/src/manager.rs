@@ -19,7 +19,6 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 /// Docker 容器管理器
 pub struct DockerManager {

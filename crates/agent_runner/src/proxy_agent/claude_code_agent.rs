@@ -1,8 +1,11 @@
 use agent_client_protocol::{
-    Agent, ClientCapabilities, ClientSideConnection, ContentBlock,
-    InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId,
-    TextContent, V1 as VERSION,
+    Agent, ClientSideConnection, ContentBlock, Implementation, InitializeRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId, TextContent,
 };
+
+// 使用默认版本
+const VERSION: agent_client_protocol::ProtocolVersion =
+    agent_client_protocol::ProtocolVersion::LATEST;
 
 use shared_types::ModelProviderConfig;
 use std::{process::Stdio, sync::Arc};
@@ -118,24 +121,12 @@ pub async fn start_claude_code_acp_agent_service(
                 // 初始化连接
                 debug!("初始化 ACP 连接[initialize]");
                 let init_result = client_conn
-                    .initialize(InitializeRequest {
-                        protocol_version: VERSION,
-                        client_capabilities: ClientCapabilities {
-                            fs: agent_client_protocol::FileSystemCapability {
-                                read_text_file: false,
-                                write_text_file: false,
-                                meta: None,
-                            },
-                            terminal: false,
-                            meta: None,
-                        },
-                        // client_info: Some(Implementation {
-                        //     name: "rcoder-agent-runner".to_string(),
-                        //     title: Some("RCoder Agent Runner".to_string()),
-                        //     version: env!("CARGO_PKG_VERSION").to_string(),
-                        // }),
-                        meta: None,
-                    })
+                    .initialize(
+                        InitializeRequest::new(VERSION).client_info(
+                            Implementation::new("rcoder-agent-runner", env!("CARGO_PKG_VERSION"))
+                                .title("RCoder Agent Runner"),
+                        ),
+                    )
                     .await;
 
                 match init_result {
@@ -161,8 +152,8 @@ pub async fn start_claude_code_acp_agent_service(
                         mcp_servers
                             .iter()
                             .map(|s| match s {
-                                agent_client_protocol::McpServer::Stdio { name, .. } =>
-                                    name.clone(),
+                                agent_client_protocol::McpServer::Stdio(server) =>
+                                    server.name.clone(),
                                 _ => "unknown".to_string(),
                             })
                             .collect::<Vec<_>>()
@@ -176,14 +167,12 @@ pub async fn start_claude_code_acp_agent_service(
                 let session_id = match chat_prompt.session_id {
                     Some(session_id) => {
                         debug!("尝试加载 ACP 会话[load_session]");
-                        let given_session_id = SessionId(session_id.into());
+                        let given_session_id = SessionId::new(session_id);
                         match client_conn
-                            .load_session(LoadSessionRequest {
-                                session_id: given_session_id.clone(),
-                                mcp_servers: mcp_servers.clone(),
-                                cwd: project_path_for_closure.clone(),
-                                meta: None,
-                            })
+                            .load_session(LoadSessionRequest::new(
+                                given_session_id.clone(),
+                                project_path_for_closure.clone(),
+                            ))
                             .await
                         {
                             Ok(resp) => {
@@ -195,13 +184,10 @@ pub async fn start_claude_code_acp_agent_service(
                                     "load_session 失败或未实现，回退创建新会话[new_session]: {:?}",
                                     e
                                 );
-                                let resp = client_conn
-                                    .new_session(NewSessionRequest {
-                                        mcp_servers: mcp_servers.clone(),
-                                        cwd: project_path_for_closure.clone(),
-                                        meta: None,
-                                    })
-                                    .await?;
+                                let new_session_request =
+                                    NewSessionRequest::new(project_path_for_closure.clone())
+                                        .mcp_servers(mcp_servers);
+                                let resp = client_conn.new_session(new_session_request).await?;
                                 debug!("ACP 会话创建成功[new_session],{:?}", resp);
                                 resp.session_id
                             }
@@ -209,13 +195,10 @@ pub async fn start_claude_code_acp_agent_service(
                     }
                     None => {
                         debug!("创建 ACP 会话[new_session]");
-                        let resp = client_conn
-                            .new_session(NewSessionRequest {
-                                mcp_servers: mcp_servers.clone(),
-                                cwd: project_path_for_closure.clone(),
-                                meta: None,
-                            })
-                            .await?;
+                        let new_session_request =
+                            NewSessionRequest::new(project_path_for_closure.clone())
+                                .mcp_servers(mcp_servers);
+                        let resp = client_conn.new_session(new_session_request).await?;
                         debug!("ACP 会话创建成功[new_session],{:?}", resp);
                         resp.session_id
                     }
@@ -252,16 +235,14 @@ pub async fn start_claude_code_acp_agent_service(
         if let Err(e) = result {
             error!("Claude Code ACP Agent 后台任务失败: {}", e);
             // 通知主线程任务失败 - 发送一个错误提示作为信号
-            let error_block = ContentBlock::Text(TextContent {
-                text: format!("Claude Code ACP Agent 启动失败: {}", e),
-                annotations: None,
-                meta: None,
-            });
-            let _ = prompt_tx_for_closure.send(PromptRequest {
-                session_id: SessionId("error".into()),
-                prompt: vec![error_block],
-                meta: None,
-            });
+            let error_block = ContentBlock::Text(TextContent::new(format!(
+                "Claude Code ACP Agent 启动失败: {}",
+                e
+            )));
+            let _ = prompt_tx_for_closure.send(PromptRequest::new(
+                SessionId::new("error"),
+                vec![error_block],
+            ));
         }
     });
 

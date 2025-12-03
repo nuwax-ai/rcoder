@@ -350,7 +350,6 @@ impl ContainerFilter {
                         bollard::models::ContainerSummaryStateEnum::REMOVING => "removing",
                         bollard::models::ContainerSummaryStateEnum::DEAD => "dead",
                         bollard::models::ContainerSummaryStateEnum::EMPTY => "unknown",
-                        _ => "unknown",
                     };
                     statuses.iter().any(|s| s.to_string() == state_str)
                 } else {

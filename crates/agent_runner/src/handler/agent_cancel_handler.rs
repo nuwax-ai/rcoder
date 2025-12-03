@@ -147,13 +147,10 @@ pub async fn agent_session_cancel(
     );
 
     // 创建SessionId
-    let session_id_obj = SessionId(Arc::from(session_id.as_str()));
+    let session_id_obj = SessionId::new(Arc::from(session_id.as_str()));
 
-    // 创建CancelNotification
-    let cancel_notification = CancelNotification {
-        session_id: session_id_obj,
-        meta: None,
-    };
+    // 创建CancelNotification - 使用简化的构造函数
+    let cancel_notification = CancelNotification::new(session_id_obj);
 
     // 从全局映射中查找匹配的session
     let project_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);

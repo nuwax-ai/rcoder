@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("使用 Docker socket: {}", docker_socket_path);
 
-    let path_resolver =
+    let _path_resolver =
         match utils::HostPathResolver::new_with_docker_socket(&docker_socket_path).await {
             Ok(resolver) => {
                 info!("✅ 宿主机路径解析器初始化成功");
@@ -259,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 启动服务器，支持优雅关闭
-    let server_handle = axum::serve(listener, app)
+    let _server_handle = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown_rx))
         .await;
 

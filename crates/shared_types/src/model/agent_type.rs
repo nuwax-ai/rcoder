@@ -9,7 +9,6 @@ use codex_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{error, info, warn};
 
 #[cfg(feature = "codex")]
 pub static CUSTOM_MODEL_PROVIDER_NAME: &str = "custom";
@@ -53,7 +52,7 @@ impl std::str::FromStr for AgentType {
                 let valid_types = "codex, claude";
                 #[cfg(not(feature = "codex"))]
                 let valid_types = "claude";
-                
+
                 Err(format!(
                     "Invalid agent type: {}. Must be one of: {}",
                     s, valid_types

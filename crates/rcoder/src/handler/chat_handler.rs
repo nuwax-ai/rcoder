@@ -6,12 +6,10 @@ use anyhow::Result;
 use axum::{Json, extract::State};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use shared_types::ServiceType;
 use shared_types::{ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
-use uuid::Uuid;
 
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;

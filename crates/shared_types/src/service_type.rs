@@ -126,9 +126,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_config() -> MultiImageConfig {
-        use crate::service_config::{
-            GlobalImageDefaults, ImageCacheConfig, ImageSelectionStrategy, ServiceImageConfig,
+        use crate::multi_image_config::{
+            GlobalImageDefaults, ImageCacheConfig, ImageSelectionStrategy,
         };
+        use crate::service_config::{ServiceImageConfig, ServiceResourceLimits};
 
         let mut services = HashMap::new();
 
@@ -144,6 +145,18 @@ mod tests {
                 enabled: true,
                 environment: HashMap::new(),
                 mounts: vec![],
+                command: vec![],
+                entrypoint: None,
+                resource_limits: ServiceResourceLimits {
+                    memory_limit: None,
+                    cpu_limit: None,
+                    swap_limit: None,
+                    disk_limit: None,
+                    process_limit: None,
+                },
+                work_dir: "/app".to_string(),
+                network_mode: "bridge".to_string(),
+                container_path_template: "/app/project_workspace/{project_id}".to_string(),
             },
         );
 
@@ -159,6 +172,18 @@ mod tests {
                 enabled: false, // 默认禁用
                 environment: HashMap::new(),
                 mounts: vec![],
+                command: vec![],
+                entrypoint: None,
+                resource_limits: ServiceResourceLimits {
+                    memory_limit: None,
+                    cpu_limit: None,
+                    swap_limit: None,
+                    disk_limit: None,
+                    process_limit: None,
+                },
+                work_dir: "/app".to_string(),
+                network_mode: "bridge".to_string(),
+                container_path_template: "/app/project_workspace/{project_id}".to_string(),
             },
         );
 

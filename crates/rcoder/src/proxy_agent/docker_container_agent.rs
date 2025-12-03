@@ -8,7 +8,6 @@ use docker_manager::{
     DockerContainerConfig, DockerContainerInfo, DockerManager, MountPoint, ResourceLimits,
 };
 use reqwest::Client;
-use shared_types::{ServiceMountConfig, ServiceType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,7 +149,7 @@ async fn create_docker_container_config(
         }
 
         // 为路径变量进行变量替换
-        for (key, value) in &mut env_vars {
+        for (_key, value) in &mut env_vars {
             if value.contains("{project_id}") {
                 *value = value.replace("{project_id}", project_id);
             }
