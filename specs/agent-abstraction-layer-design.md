@@ -2,7 +2,40 @@
 
 ## 1. 概述
 
-本文档设计了 RCoder 项目的 Agent 抽象层，旨在实现对不同 AI Agent 的统一管理和扩展支持。当前系统主要使用 "claude-code-acp" 作为 Agent 实现，未来需要支持更多类型的 Agent，因此需要建立一个通用的抽象层。
+本设计旨在解决 RCoder 项目中 **Agent、MCP 服务器和提示词硬编码**的核心问题，通过构建独立的配置化模块实现动态扩展能力。
+
+### 🎯 核心目标
+- **Agent 动态配置**：支持多种 AI Agent 类型的插件化管理和运行
+- **MCP 服务动态配置**：支持 MCP 服务器的热插拔和统一管理  
+- **提示词模板化**：将系统提示词和用户提示词包装逻辑配置化
+- **模块化架构**：Agent 和 MCP 以独立 library 形式提供，供 rcoder、agent_runner 等模块使用
+
+### 📦 架构设计原则
+1. **配置驱动**：所有 Agent、MCP、提示词通过 JSON 配置文件定义
+2. **模块解耦**：Agent 抽象层和 MCP 管理器作为独立的 crate 库
+3. **向后兼容**：现有硬编码的 claude-code-acp 实现平滑迁移到新配置系统
+4. **零停机更新**：支持运行时动态加载新的 Agent 和 MCP 服务
+
+### 🏗️ 模块分层
+```
+┌─────────────────────────────────────────┐
+│           RCoder 主应用                  │
+├─────────────────────────────────────────┤
+│         Agent Runner 模块               │
+├─────────────────────────────────────────┤
+│  Agent 抽象层 lib  │ MCP 管理器 lib      │
+│  (多Agent支持)      │ (工具服务管理)      │
+├─────────────────────────────────────────┤
+│         配置管理系统                     │
+│    (Agent/MCP/提示词配置)                │
+└─────────────────────────────────────────┘
+```
+
+### 💡 解决的痛点
+- ❌ **硬编码问题**：Agent 类型、MCP 服务、提示词写死在代码中
+- ❌ **扩展困难**：添加新 Agent 需要修改核心代码
+- ❌ **配置僵化**：无法根据项目需求动态调整 Agent 行为
+- ❌ **维护成本**：每次提示词或配置变更都需要重新编译部署
 
 ## 2. 现状分析
 
@@ -237,12 +270,13 @@ pub struct AgentSpec {
     pub metadata: HashMap<String, String>,
 }
 
-/// 🔥 新增：系统提示词配置
+/// 🔥 系统提示词配置
 /// 
-/// 系统提示词配置，支持模板变量和启用控制
+/// 简洁设计：包含一个模板字段，支持动态变量替换
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemPromptConfig {
     /// 系统提示词模板内容
+    /// 预处理好的完整提示词，支持变量替换（如 {PROJECT_NAME}、{FRAMEWORK} 等）
     pub template: String,
     
     /// 是否启用系统提示词（默认为 true）
@@ -493,14 +527,20 @@ pub struct McpServerConfig {
 /// MCP 服务器来源类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpServerSource {
-    /// 自定义命令行工具
+    /// 自定义命令行工具（支持 npm、uvx、bun、cargo、python 等命令）
+    /// 
+    /// 示例：
+    /// - `npx @modelcontextprotocol/server-fetch`
+    /// - `uvx mcp-server-fetch` 
+    /// - `bun @upstash/context7-mcp`
+    /// - `cargo install --path ./mcp-server`
     Custom,
-    /// 内置扩展
-    Extension,
-    /// 本地可执行文件
+    /// 本地可执行文件（直接指定可执行文件路径）
+    /// 
+    /// 示例：
+    /// - `/usr/local/bin/mcp-server`
+    /// - `/opt/mcp/custom-tools`
     Local,
-    /// NPM 包
-    Npm,
 }
 ```
 
@@ -531,7 +571,7 @@ pub struct ModelProviderConfig {
 | `{MODEL_PROVIDER_NAME}` | `name` | 模型提供商显示名称 | "Claude" |
 | `{MODEL_PROVIDER_BASE_URL}` | `base_url` | API 基础URL | "https://api.anthropic.com" |
 | `{MODEL_PROVIDER_API_KEY}` | `api_key` | API 密钥 | "sk-ant-xxx" |
-| `{MODEL_PROVIDER_DEFAULT_MODEL}` | `default_model` | 默认模型 | "claude-3-5-sonnet-20241022" |
+| `{MODEL_PROVIDER_DEFAULT_MODEL}` | `default_model` | 默认模型 | "glm-4.6" |
 | `{MODEL_PROVIDER_API_PROTOCOL}` | `api_protocol` | API 协议 | "openai" |
 
 **配置文件格式：**
@@ -552,7 +592,7 @@ pub struct ModelProviderConfig {
         "template": "你是一个专业的全栈开发助手，擅长现代 Web 开发和系统架构。专注于 JavaScript/TypeScript、React、Node.js 等技术栈，代码要现代、可维护、注重性能优化和用户体验。遵循最佳实践，重视代码质量和团队协作。"
       },
       "user_prompt": {
-        "template": "你好 {user_prompt}，请帮我分析这个问题并提供详细的解决方案。"
+        "template": "你是RCoder，一个专业的AI编程助手。\n\n## 核心身份与职责\n- 专业的编程助手，帮助用户解决编程问题\n- 提供简洁、实用、可执行的代码解决方案\n- 遵循最佳实践，编写高质量代码\n- 始终将用户需求放在首位\n\n## 代码格式规范\n- 优先使用现代语言特性和标准库\n- 变量和函数命名使用清晰、描述性的英文名称\n- 保持代码简洁，避免过度复杂的抽象\n- 使用适当的注释解释关键逻辑\n\n## 开发约束\n- 避免添加未请求的功能，保持解决方案专注\n- 优先选择最简单有效的实现方式\n- 不要为未来可能的需求添加复杂性\n- 确保代码安全、可维护\n\n## MCP工具使用指导\n- 合理使用可用的工具来辅助开发任务\n- 当需要文件操作、搜索、测试时使用相应的工具\n- 根据上下文选择最合适的工具\n\n## 思考要求\n- 在回答前进行充分的思考和分析\n- 确保解决方案的完整性和正确性\n- 提供清晰、有条理的回答\n\n用户请求：\n{user_prompt}"
       },
       "installation": {
         "package_manager": "npm",
@@ -1261,14 +1301,18 @@ pub struct AgentProcess {
 - **性能优化**：避免重复的状态存储和管理
 - **扩展性**：为未来状态扩展预留接口
 
-**完整使用示例：**
+**🔥 新增：ACP 连接池管理的完整使用示例：**
 
 ```rust
 // 1. 加载配置（由调用方负责）
 let agent_config = AgentServersConfig::from_file("/etc/rcoder/agents.json").await?;
 let env_resolver = EnvironmentVariableResolver::with_standard_mappings();
 
-// 2. 准备 ModelProvider 配置
+// 2. 🔥 新增：初始化 ACP 连接池管理器
+let acp_config = AcpConnectionConfig::default();
+let acp_connection_manager = Arc::new(AcpConnectionManager::new(acp_config));
+
+// 3. 准备 ModelProvider 配置
 let model_provider = ModelProviderConfig {
     id: "anthropic-claude".to_string(),
     name: "Claude".to_string(),
@@ -1279,17 +1323,81 @@ let model_provider = ModelProviderConfig {
     api_protocol: Some("anthropic".to_string()),
 };
 
-// 3. 准备项目上下文
+// 4. 准备项目上下文
 let project_context = ProjectContext {
     project_id: "project-123".to_string(),
     project_name: "my-react-app".to_string(),
     project_path: PathBuf::from("/workspace/project-123"),
 };
 
-// 4. 初始化 Agent 管理器
+// 5. 🔥 新增：创建 Agent 工厂，集成 ACP 连接池
+let agent_factory = Arc::new(AgentFactory::new(
+    registry,
+    launcher,
+    config_manager,
+    mcp_manager,
+    acp_connection_manager.clone(),
+));
+
+// 6. 🔥 新增：通过连接池获取 Agent 连接
+let agent_connection = acp_connection_manager.get_or_create_connection(
+    "claude-code-acp",
+    &agent_config.get_agent("claude-code-acp").unwrap(),
+    &model_provider,
+    &project_context,
+).await?;
+
+// 7. 🔥 新增：使用连接池发送提示词
+let prompt_request = PromptRequest {
+    prompt: "帮我实现一个 React 登录组件".to_string(),
+    session_id: Some("session-123".to_string()),
+    model_provider: Some(model_provider.clone()),
+};
+
+let response = acp_connection_manager.send_prompt("claude-code-acp", prompt_request).await?;
+
+// 8. 🔥 新增：处理提示词包装
+let user_input = "帮我实现一个登录组件";
+let agent_spec = agent_config.get_agent("claude-code-acp").unwrap();
+let wrapped_prompt = env_resolver.resolve_user_prompt(
+    user_input,
+    &agent_spec.user_prompt,
+);
+
+// 9. 🔥 新增：处理系统提示词
+let system_prompt = env_resolver.resolve_system_prompt(
+    &agent_spec.system_prompt,
+    &ResolutionContext {
+        model_provider: model_provider.clone(),
+        project_context: project_context.clone(),
+        custom_variables: HashMap::new(),
+        mcp_variables: HashMap::new(),
+    },
+);
+
+// 10. 🔥 新增：获取连接池统计信息
+let stats = acp_connection_manager.get_connection_stats();
+println!("当前连接数: {}/{}", stats.total_connections, stats.max_connections);
+println!("最大空闲时间: {:?}", stats.max_idle_time);
+
+// 11. 🔥 新增：取消长时间运行的任务
+let cancel_notification = CancelNotification {
+    session_id: "session-123".to_string(),
+    reason: "用户取消请求".to_string(),
+};
+
+acp_connection_manager.cancel_request("claude-code-acp", cancel_notification).await?;
+```
+
+**传统 Agent 管理器使用示例：**
+
+```rust
+// 对于不需要 ACP 连接池的场景，仍可使用传统方式
+
+// 1. 初始化 Agent 管理器
 let mut agent_manager = AgentManager::new(agent_config, env_resolver)?;
 
-// 5. 启动 Agent（根据配置中的 agent_type 自动选择启动方式）
+// 2. 启动 Agent（根据配置中的 agent_type 自动选择启动方式）
 let agent_instance = agent_manager.start_agent(
     "claude-code-acp", 
     "project-123", 
@@ -1470,7 +1578,7 @@ let wrapped = env_resolver.resolve_user_prompt(
         "template": "你是 {MODEL_PROVIDER_NAME} 驱动的全栈开发专家，专注于 {PROJECT_NAME} 项目。使用现代开发实践，代码要简洁、可维护、性能优化。"
       },
       "user_prompt": {
-        "template": "你好，我是 {PROJECT_NAME} 项目的开发者。{user_prompt} 请提供详细的解决方案和代码示例。"
+        "template": "你是RCoder，一个专业的AI编程助手。\n\n## 核心身份与职责\n- 专业的编程助手，帮助用户解决编程问题\n- 提供简洁、实用、可执行的代码解决方案\n- 遵循最佳实践，编写高质量代码\n- 始终将用户需求放在首位\n\n## 代码格式规范\n- 优先使用现代语言特性和标准库\n- 变量和函数命名使用清晰、描述性的英文名称\n- 保持代码简洁，避免过度复杂的抽象\n- 使用适当的注释解释关键逻辑\n\n## 开发约束\n- 避免添加未请求的功能，保持解决方案专注\n- 优先选择最简单有效的实现方式\n- 不要为未来可能的需求添加复杂性\n- 确保代码安全、可维护\n\n## MCP工具使用指导\n- 合理使用可用的工具来辅助开发任务\n- 当需要文件操作、搜索、测试时使用相应的工具\n- 根据上下文选择最合适的工具\n\n## 思考要求\n- 在回答前进行充分的思考和分析\n- 确保解决方案的完整性和正确性\n- 提供清晰、有条理的回答\n\n用户请求：\n{user_prompt}"
       },
       "installation": {
         "package_manager": "npm",
@@ -1655,7 +1763,624 @@ Agent 管理器根据配置中的 `agent_type` 字段自动选择启动方式：
   }
 ```
 
-#### 4.4.5 MCP 服务器管理器
+#### 4.4.5 ACP 连接池管理
+
+**🔥 重要：避免死锁的 ACP 连接池设计**
+
+基于当前 RCoder 工程的深入分析，发现以下死锁风险点：
+1. **DashMap 嵌套访问**：多个 DashMap 同时访问可能造成死锁
+2. **RAII 与显式清理冲突**：生命周期管理和手动状态更新协调不当
+3. **状态更新时序问题**：Agent 状态和连接状态同步更新的竞争条件
+
+**🔧 死锁预防设计原则：**
+
+1. **单一数据源原则**：每个 Agent 只在一个地方管理状态
+2. **无嵌套锁**：避免在持有锁时访问其他可能被锁的资源
+3. **RAII 优先**：以 RAII 为主要资源管理方式，避免显式清理
+4. **原子操作**：状态更新使用原子性操作，避免中间状态
+5. **单向依赖**：建立清晰的依赖层次，避免循环依赖
+
+**重新设计的 ACP 连接池管理器：**
+
+```rust
+/// ACP 连接池管理器
+/// 
+/// 🔥 无死锁风险设计：每个 Agent 使用独立的连接实例，避免共享状态
+pub struct AcpConnectionManager {
+    /// 连接池：agent_id -> AgentConnection
+    /// 📌 使用 RwLock 而不是 DashMap，避免与全局状态映射的嵌套访问
+    connections: Arc<RwLock<HashMap<String, Weak<AgentConnection>>>>,
+    
+    /// 连接配置
+    config: AcpConnectionConfig,
+    
+    /// 后台清理任务句柄
+    cleanup_task: Option<JoinHandle<()>>,
+}
+
+/// ACP 连接配置
+#[derive(Debug, Clone)]
+pub struct AcpConnectionConfig {
+    /// 最大空闲时间，超过此时间的连接将被清理
+    pub max_idle_time: Duration,
+    
+    /// 清理任务间隔
+    pub cleanup_interval: Duration,
+    
+    /// 连接超时时间
+    pub connection_timeout: Duration,
+    
+    /// 最大连接数
+    pub max_connections: usize,
+}
+
+impl Default for AcpConnectionConfig {
+    fn default() -> Self {
+        Self {
+            max_idle_time: Duration::from_secs(300),      // 5分钟
+            cleanup_interval: Duration::from_secs(60),    // 1分钟清理一次
+            connection_timeout: Duration::from_secs(30),   // 30秒连接超时
+            max_connections: 100,                           // 最大100个连接
+        }
+    }
+}
+
+/// Agent 连接包装器
+/// 
+/// 🔥 与 RAII 模式兼容的设计：AgentConnection 本身就是 RAII 资源
+pub struct AgentConnection {
+    /// Agent 唯一标识
+    pub agent_id: String,
+    
+    /// LocalSet 实例（必须在这个 LocalSet 中使用 ACP 连接）
+    /// 📌 使用 Box<LocalSet> 避免与全局 LocalSet 冲突
+    local_set: Box<LocalSet>,
+    
+    /// 客户端连接（非 Send，只能在 LocalSet 内使用）
+    /// 📌 使用 RefCell 而不是 Mutex，避免与全局状态锁冲突
+    client_conn: RefCell<Option<ClientSideConnection>>,
+    
+    /// 生命周期管理器（与现有的 AgentLifecycleGuard 集成）
+    lifecycle_guard: AgentLifecycleGuard,
+    
+    /// 最后活动时间（使用原子类型，避免锁）
+    last_activity: AtomicInstant,
+    
+    /// 连接创建时间
+    created_at: Instant,
+    
+    /// 连接状态（使用原子操作，避免锁竞争）
+    status: AtomicU8, // 存储 ConnectionStatus 的数字表示
+    
+    /// 连接管理器的弱引用，用于自动清理
+    manager_weak: Weak<AcpConnectionManager>,
+}
+
+/// 🔥 原子时间戳包装器，避免使用 Mutex
+#[derive(Debug)]
+pub struct AtomicInstant {
+    inner: AtomicU64,
+}
+
+impl AtomicInstant {
+    pub fn new() -> Self {
+        Self {
+            inner: AtomicU64::new(0),
+        }
+    }
+    
+    pub fn store(&self, instant: Instant) {
+        self.inner.store(instant.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    
+    pub fn load(&self) -> Instant {
+        let nanos = self.inner.load(Ordering::Relaxed);
+        if nanos == 0 {
+            Instant::now()
+        } else {
+            Instant::now() - Duration::from_nanos(nanos)
+        }
+    }
+}
+
+/// 🔥 连接状态（使用数字表示，支持原子操作）
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum ConnectionStatus {
+    /// 连接中
+    Connecting = 1,
+    /// 已连接
+    Connected = 2,
+    /// 空闲
+    Idle = 3,
+    /// 错误
+    Error = 4,
+    /// 已关闭
+    Closed = 5,
+}
+
+impl ConnectionStatus {
+    fn to_u8(self) -> u8 {
+        self as u8
+    }
+    
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Connecting,
+            2 => Self::Connected,
+            3 => Self::Idle,
+            4 => Self::Error,
+            5 => Self::Closed,
+            _ => Self::Closed,
+        }
+    }
+}
+
+impl AcpConnectionManager {
+    /// 创建新的连接池管理器
+    pub fn new(config: AcpConnectionConfig) -> Self {
+        let manager = Self {
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            config,
+            cleanup_task: None,
+        };
+        
+        // 启动后台清理任务
+        manager.start_cleanup_task();
+        manager
+    }
+    
+    /// 🔥 获取或创建 Agent 连接（无死锁设计）
+    /// 
+    /// 关键设计点：
+    /// 1. 每次只获取一个写锁，避免嵌套锁
+    /// 2. 使用 Weak 引用避免循环依赖
+    /// 3. RAII 资源自动清理，无需手动管理
+    pub async fn get_or_create_connection(
+        &self,
+        agent_id: &str,
+        agent_config: &AgentConfig,
+        model_provider: &ModelProviderConfig,
+        project_context: &ProjectContext,
+    ) -> Result<Arc<AgentConnection>, AcpError> {
+        // 📌 步骤1：先检查现有连接（只获取读锁）
+        {
+            let connections = self.connections.read().unwrap();
+            if let Some(weak_conn) = connections.get(agent_id) {
+                if let Some(connection) = weak_conn.upgrade() {
+                    // 检查连接状态（原子操作，无需锁）
+                    let status = connection.get_status();
+                    if status == ConnectionStatus::Connected || status == ConnectionStatus::Idle {
+                        // 原子更新最后活动时间
+                        connection.update_last_activity();
+                        return Ok(connection);
+                    } else {
+                        // 连接状态异常，让它自然销毁
+                        drop(connection);
+                    }
+                }
+            }
+        } // 读锁在这里释放
+        
+        // 📌 步骤2：创建新连接（只获取写锁）
+        let connection = self.create_new_connection(agent_id, agent_config, model_provider, project_context).await?;
+        
+        // 📌 步骤3：注册连接（只获取写锁，原子操作）
+        {
+            let mut connections = self.connections.write().unwrap();
+            connections.insert(agent_id.to_string(), Arc::downgrade(&connection));
+        } // 写锁在这里释放
+        
+        Ok(connection)
+    }
+    
+    /// 🔥 创建新的 ACP 连接（无死锁设计）
+    async fn create_new_connection(
+        &self,
+        agent_id: &str,
+        agent_config: &AgentConfig,
+        model_provider: &ModelProviderConfig,
+        project_context: &ProjectContext,
+    ) -> Result<Arc<AgentConnection>, AcpError> {
+        // 创建 LocalSet 实例（使用 Box 避免与全局 LocalSet 冲突）
+        let local_set = Box::new(LocalSet::new());
+        
+        // 准备 Agent 配置
+        let mut resolved_config = agent_config.clone();
+        let env_resolver = EnvironmentVariableResolver::with_standard_mappings();
+        env_resolver.resolve_agent_config(&mut resolved_config, model_provider, project_context)?;
+        
+        // 🔥 关键设计：将连接创建移到独立的作用域，避免闭包捕获 self
+        let agent_id_clone = agent_id.to_string();
+        let connection_future = async move {
+            // 创建进程（在 LocalSet 中执行）
+            let mut command = tokio::process::Command::new(&resolved_config.command);
+            command.args(&resolved_config.args);
+            command.envs(&resolved_config.env);
+            
+            let child = command.spawn()
+                .map_err(|e| AcpError::ProcessError(e.to_string()))?;
+            
+            // 创建生命周期管理器（与现有工程集成）
+            let lifecycle_guard = AgentLifecycleGuard::new(child, agent_id_clone)?;
+            
+            // 🔥 在 LocalSet 中创建 ACP 连接
+            // 这里需要根据具体的 ACP 协议实现
+            let client_conn = Self::create_acp_connection_internal(&lifecycle_guard).await?;
+            
+            Ok((client_conn, lifecycle_guard))
+        };
+        
+        // 在 LocalSet 中执行连接创建
+        let (client_conn, lifecycle_guard) = local_set.run_until(connection_future).await?;
+        
+        // 🔥 创建连接包装器（RAII 模式）
+        let connection = Arc::new(AgentConnection {
+            agent_id: agent_id.to_string(),
+            local_set,
+            client_conn: RefCell::new(Some(client_conn)),
+            lifecycle_guard,
+            last_activity: AtomicInstant::new(),
+            created_at: Instant::now(),
+            status: AtomicU8::new(ConnectionStatus::Connected.to_u8()),
+            manager_weak: Arc::downgrade(&self.connections),
+        });
+        
+        // 初始化最后活动时间
+        connection.last_activity.store(Instant::now());
+        
+        Ok(connection)
+    }
+    
+    /// 🔥 内部 ACP 连接创建方法（避免捕获 self）
+    async fn create_acp_connection_internal(
+        lifecycle_guard: &AgentLifecycleGuard,
+    ) -> Result<ClientSideConnection, AcpError> {
+        // 在这里实现具体的 ACP 连接创建逻辑
+        // 根据 ACP 协议规范，建立与 Agent 的连接
+        
+        // 示例实现（需要根据实际 ACP 协议调整）：
+        let (stdin, stdout) = lifecycle_guard.get_process_stdio()?;
+        let (outgoing, incoming) = create_acp_channels(stdin, stdout)?;
+        
+        let (client_conn, handle_io) = ClientSideConnection::new(
+            client, outgoing, incoming, |fut| {
+                tokio::task::spawn_local(fut);
+            }
+        );
+        
+        tokio::task::spawn_local(handle_io);
+        
+        Ok(client_conn)
+    }
+    
+    /// 🔥 发送提示词到 Agent（简化的无死锁接口）
+    pub async fn send_prompt(
+        &self,
+        agent_id: &str,
+        prompt_request: PromptRequest,
+    ) -> Result<PromptResponse, AcpError> {
+        // 获取连接（会自动复用或创建新连接）
+        let connection = self.get_or_create_connection(
+            agent_id,
+            &self.get_default_agent_config()?,
+            &self.get_default_model_provider(),
+            &ProjectContext::default(),
+        ).await?;
+        
+        // 使用连接自己的方法执行操作
+        connection.execute_operation(|client_conn| {
+            Box::pin(async move {
+                // 在这里实现具体的提示词发送逻辑
+                let response = client_conn.send_prompt(prompt_request).await?;
+                Ok(response)
+            })
+        }).await
+    }
+    
+    /// 🔥 取消正在执行的任务（简化的无死锁接口）
+    pub async fn cancel_request(
+        &self,
+        agent_id: &str,
+        cancel_notification: CancelNotification,
+    ) -> Result<(), AcpError> {
+        // 获取连接
+        let connection = self.get_or_create_connection(
+            agent_id,
+            &self.get_default_agent_config()?,
+            &self.get_default_model_provider(),
+            &ProjectContext::default(),
+        ).await?;
+        
+        // 使用连接自己的方法执行操作
+        connection.execute_operation(|client_conn| {
+            Box::pin(async move {
+                client_conn.send_cancel(cancel_notification).await?;
+                Ok(())
+            })
+        }).await
+    }
+    
+    /// 🔥 获取连接统计信息（无锁设计）
+    pub fn get_connection_stats(&self) -> ConnectionStats {
+        let connections = self.connections.read().unwrap();
+        ConnectionStats {
+            total_connections: connections.len(),
+            max_connections: self.config.max_connections,
+            cleanup_interval: self.config.cleanup_interval,
+            max_idle_time: self.config.max_idle_time,
+        }
+    }
+    
+    /// 🔥 获取默认 Agent 配置（辅助方法）
+    fn get_default_agent_config(&self) -> Result<AgentConfig, AcpError> {
+        // 这里应该从配置管理器获取，暂时返回默认配置
+        Ok(AgentConfig::default())
+    }
+    
+    /// 🔥 获取默认 ModelProvider（辅助方法）
+    fn get_default_model_provider(&self) -> ModelProviderConfig {
+        // 这里应该从配置获取，暂时返回默认配置
+        ModelProviderConfig::default()
+    }
+    
+    /// 🔥 启动后台清理任务（无死锁设计）
+    fn start_cleanup_task(&mut self) {
+        let connections = self.connections.clone();
+        let max_idle_time = self.config.max_idle_time;
+        let cleanup_interval = self.config.cleanup_interval;
+        
+        let cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(cleanup_interval);
+            
+            loop {
+                interval.tick().await;
+                
+                // 📌 使用 try_read 而不是 read，避免阻塞
+                if let Ok(connections_guard) = connections.try_read() {
+                    let now = Instant::now();
+                    let mut to_remove = Vec::new();
+                    
+                    // 检查空闲连接（使用 Weak 引用，自动处理已销毁的连接）
+                    for (agent_id, weak_conn) in connections_guard.iter() {
+                        if let Some(connection) = weak_conn.upgrade() {
+                            // 检查连接空闲时间（原子操作，无需锁）
+                            if connection.idle_duration() > max_idle_time {
+                                to_remove.push(agent_id.clone());
+                            }
+                        } else {
+                            // Weak 引用已失效，连接已被销毁
+                            to_remove.push(agent_id.clone());
+                        }
+                    }
+                    
+                    // 🔥 清理无效连接（需要获取写锁，但在这里是安全的）
+                    drop(connections_guard); // 释放读锁
+                    
+                    if let Ok(mut connections_guard) = connections.try_write() {
+                        for agent_id in to_remove {
+                            log::info!("清理空闲/无效连接: {}", agent_id);
+                            connections_guard.remove(&agent_id);
+                        }
+                    }
+                }
+                // 如果无法获取读锁，跳过本次清理
+            }
+        });
+        
+        self.cleanup_task = Some(cleanup_task);
+    }
+}
+
+/// 连接统计信息
+#[derive(Debug, Clone)]
+pub struct ConnectionStats {
+    /// 当前总连接数
+    pub total_connections: usize,
+    
+    /// 最大连接数限制
+    pub max_connections: usize,
+    
+    /// 清理间隔
+    pub cleanup_interval: Duration,
+    
+    /// 最大空闲时间
+    pub max_idle_time: Duration,
+}
+
+/// ACP 错误类型
+#[derive(Debug, thiserror::Error)]
+pub enum AcpError {
+    #[error("连接数超过限制")]
+    ConnectionLimitExceeded,
+    
+    #[error("连接不可用")]
+    ConnectionNotAvailable,
+    
+    #[error("进程错误: {0}")]
+    ProcessError(String),
+    
+    #[error("连接超时")]
+    ConnectionTimeout,
+    
+    #[error("协议错误: {0}")]
+    ProtocolError(String),
+    
+    #[error("配置错误: {0}")]
+    ConfigurationError(String),
+    
+    #[error("IO错误: {0}")]
+    IoError(#[from] std::io::Error),
+}
+
+impl AgentConnection {
+    /// 🔥 获取连接状态（原子操作）
+    pub fn get_status(&self) -> ConnectionStatus {
+        ConnectionStatus::from_u8(self.status.load(Ordering::Relaxed))
+    }
+    
+    /// 🔥 设置连接状态（原子操作）
+    pub fn set_status(&self, status: ConnectionStatus) {
+        self.status.store(status.to_u8(), Ordering::Relaxed);
+    }
+    
+    /// 🔥 更新最后活动时间（原子操作）
+    pub fn update_last_activity(&self) {
+        self.last_activity.store(Instant::now());
+    }
+    
+    /// 🔥 获取空闲时长（原子操作）
+    pub fn idle_duration(&self) -> Duration {
+        let last_activity = self.last_activity.load();
+        Instant::now().duration_since(last_activity)
+    }
+    
+    /// 🔥 检查连接是否活跃（原子操作）
+    pub fn is_active(&self) -> bool {
+        matches!(self.get_status(), ConnectionStatus::Connected | ConnectionStatus::Idle)
+    }
+    
+    /// 🔥 在 LocalSet 中执行 ACP 操作（无锁设计）
+    pub async fn execute_operation<F, R>(&self, operation: F) -> Result<R, AcpError>
+    where
+        F: FnOnce(&ClientSideConnection) -> Pin<Box<dyn Future<Output = Result<R, AcpError>> + '_>> + Send + 'static,
+        R: Send + 'static,
+    {
+        // 📌 使用 RefCell 而不是 Mutex，避免与全局状态锁冲突
+        let client_conn = self.client_conn.borrow_mut()
+            .take()
+            .ok_or_else(|| AcpError::ConnectionNotAvailable)?;
+        
+        // 在 LocalSet 中执行操作
+        let operation_future = async move {
+            // 执行用户定义的操作
+            let result = operation(&client_conn).await?;
+            
+            // 重新存入连接（使用 RefCell 的运行时借用检查）
+            Ok((result, client_conn))
+        };
+        
+        let (result, client_conn) = self.local_set.run_until(operation_future).await?;
+        
+        // 重新存入连接
+        *self.client_conn.borrow_mut() = Some(client_conn);
+        
+        Ok(result)
+    }
+}
+
+impl Drop for AgentConnection {
+    /// 🔥 RAII 自动清理：连接销毁时自动从管理器中移除
+    fn drop(&mut self) {
+        // 更新连接状态
+        self.set_status(ConnectionStatus::Closed);
+        
+        // 尝试从管理器中移除自己
+        if let Some(connections_arc) = self.manager_weak.upgrade() {
+            if let Ok(mut connections) = connections_arc.try_write() {
+                connections.remove(&self.agent_id);
+            }
+        }
+        
+        log::info!("Agent 连接已自动清理: {}", self.agent_id);
+    }
+}
+
+impl Drop for AcpConnectionManager {
+    fn drop(&mut self) {
+        // 清理后台任务
+        if let Some(task) = self.cleanup_task.take() {
+            task.abort();
+        }
+        
+        // 清理所有连接
+        for agent_id in self.connections.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>() {
+            tokio::spawn({
+                let manager = self.clone();
+                async move {
+                    manager.cleanup_connection(&agent_id).await;
+                }
+            });
+        }
+    }
+}
+```
+
+**🔥 无死锁 ACP 连接池使用示例：**
+
+```rust
+// 1. 创建连接池管理器（自动启用后台清理）
+let acp_config = AcpConnectionConfig::default();
+let connection_manager = Arc::new(AcpConnectionManager::new(acp_config));
+
+// 2. 🔥 简化的提示词发送（自动处理连接复用和创建）
+let prompt_request = PromptRequest {
+    prompt: "帮我写一个 React 组件".to_string(),
+    session_id: Some("session-123".to_string()),
+    model_provider: Some(model_provider.clone()),
+};
+
+let response = connection_manager.send_prompt("claude-code-acp", prompt_request).await?;
+
+// 3. 🔥 简化的请求取消
+let cancel_notification = CancelNotification {
+    session_id: "session-123".to_string(),
+    reason: "用户取消".to_string(),
+};
+
+connection_manager.cancel_request("claude-code-acp", cancel_notification).await?;
+
+// 4. 🔥 连接自动管理（无需手动清理）
+// 连接会根据 RAII 模式自动清理，后台任务会清理空闲连接
+
+// 5. 获取连接统计（无锁操作）
+let stats = connection_manager.get_connection_stats();
+println!("当前连接数: {}/{}", stats.total_connections, stats.max_connections);
+println!("最大空闲时间: {:?}", stats.max_idle_time);
+
+// 6. 🔥 高级用法：直接使用连接对象
+let agent_connection = connection_manager.get_or_create_connection(
+    "claude-code-acp",
+    &agent_config,
+    &model_provider,
+    &project_context,
+).await?;
+
+// 使用连接自己的 execute_operation 方法
+let custom_result = agent_connection.execute_operation(|client_conn| {
+    Box::pin(async move {
+        // 自定义 ACP 操作
+        let response = client_conn.custom_operation(request).await?;
+        Ok(response)
+    })
+}).await?;
+
+// 🔥 连接会在 agent_connection 离开作用域时自动清理
+```
+
+**🔧 关键优势对比：**
+
+| 特性 | 原设计（死锁风险） | 新设计（无死锁） |
+|------|-------------------|-----------------|
+| **状态管理** | Arc<Mutex<T>> | AtomicU8, AtomicInstant |
+| **连接存储** | DashMap<String, Arc<>> | RwLock<HashMap<String, Weak<>>> |
+| **锁策略** | 多个锁可能嵌套 | 单一锁，原子操作 |
+| **清理方式** | 手动清理 | RAII 自动清理 |
+| **内存泄漏** | 可能发生 | Weak 引用自动处理 |
+| **死锁风险** | 高风险 | 无风险 |
+| **性能** | 锁竞争开销 | 原子操作，高性能 |
+
+**设计要点总结：**
+
+1. **连接复用**：避免重复创建昂贵的 ACP 连接
+2. **资源隔离**：每个连接使用独立的 LocalSet，避免非 Send 问题
+3. **自动清理**：后台任务定期清理空闲连接
+4. **线程安全**：使用 Arc<Mutex<>> 包装非 Send 的 ACP 连接
+5. **状态管理**：完整的连接状态跟踪和管理
+
+这个设计解决了 ACP 协议的技术限制，同时提供了高效的连接管理机制。
+
+#### 4.4.6 MCP 服务器管理器
 
 ```rust
 /// MCP 服务器管理器
@@ -1741,11 +2466,8 @@ impl McpServerManager {
         context: &AgentContext,
     ) -> Result<ProcessHandle, McpError> {
         match &config.source {
-            McpServerSource::Custom | McpServerSource::Local | McpServerSource::Npm => {
+            McpServerSource::Custom | McpServerSource::Local => {
                 self.start_command_server(config, context).await
-            }
-            McpServerSource::Extension => {
-                self.start_extension_server(config, context).await
             }
         }
     }
@@ -1790,21 +2512,7 @@ impl McpServerManager {
         Ok(ProcessHandle::new(child, config.name.clone()))
     }
     
-    /// 启动扩展服务器
-    async fn start_extension_server(
-        &self,
-        config: &McpServerConfig,
-        _context: &AgentContext,
-    ) -> Result<ProcessHandle, McpError> {
-        // 内置扩展服务器的启动逻辑
-        match config.name.as_str() {
-            "mcp-server-context7" => {
-                // 启动内置的 Context7 MCP 服务器
-                self.start_builtin_context7_server(config).await
-            }
-            _ => Err(McpError::UnknownExtension(config.name.clone()))
-        }
-    }
+    
     
     /// 建立 MCP 连接
     async fn establish_mcp_connection(
@@ -1886,6 +2594,8 @@ pub struct AgentFactory {
     launcher: Arc<dyn AgentLauncher>,
     config_manager: Arc<AgentConfigManager>,
     mcp_manager: Arc<McpServerManager>,
+    /// 🔥 新增：ACP 连接池管理器
+    acp_connection_manager: Arc<AcpConnectionManager>,
 }
 
 impl AgentFactory {
@@ -1895,12 +2605,14 @@ impl AgentFactory {
         launcher: Arc<dyn AgentLauncher>,
         config_manager: Arc<AgentConfigManager>,
         mcp_manager: Arc<McpServerManager>,
+        acp_connection_manager: Arc<AcpConnectionManager>,
     ) -> Self {
         Self {
             registry,
             launcher,
             config_manager,
             mcp_manager,
+            acp_connection_manager,
         }
     }
     
@@ -2280,17 +2992,546 @@ factory.register_agent(
 
 ## 7. 迁移策略
 
-### 7.1 向后兼容性
+### 7.1 🔥 向后兼容和默认 Agent 迁移策略
+
+**核心原则：零中断迁移，用户无感知**
+
+基于对当前 `claude-code-acp` 实现的深入分析，我们设计了一个完美的兼容层，确保：
+- **现有 HTTP 接口完全不变**
+- **现有功能 100% 保持**
+- **内部逻辑平滑重构到新配置系统**
+
+#### 7.1.1 当前实现与新配置格式的映射分析
+
+**当前硬编码逻辑 → 新配置文件格式映射：**
+
+| 当前硬编码 | 新配置文件字段 | 映射关系 |
+|------------|----------------|----------|
+| `"claude-code-acp"` | `agent_servers.claude-code-acp.command` | ✅ 直接映射 |
+| `Vec::<String>::new()` | `agent_servers.claude-code-acp.args` | ✅ 直接映射 |
+| `AgentType::claude_model_provider()` | `agent_servers.claude-code-acp.env` | ✅ 环境变量映射 |
+| `create_default_mcp_servers(None)` | `context_servers.*` | ✅ MCP 服务器映射 |
+| `chat_prompt.project_path` | 项目上下文自动注入 | ✅ 工作目录映射 |
+
+#### 7.1.2 默认配置自动生成机制
+
+**🔥 智能默认配置生成器：**
+
+```rust
+/// 🔥 默认配置生成器
+/// 
+/// 根据当前硬编码逻辑自动生成标准配置文件
+pub struct DefaultConfigGenerator;
+
+impl DefaultConfigGenerator {
+    /// 🔥 获取默认系统提示词模板
+    /// 
+    /// 基于现有 system_prompt.rs 的完整内容，预处理的完整系统提示词
+    /// 支持动态变量替换，如 {PROJECT_NAME}、{FRAMEWORK}、{AGENT_VERSION} 等
+    pub fn get_default_system_prompt_template() -> String {
+        r#"<SYSTEM_INSTRUCTIONS>
+
+你是一个专业的前端项目开发专家，集成了MCP（模型上下文协议）工具。
+你精通现代前端开发技术栈，包括 React、Vue、Vite、TypeScript 等主流框架和工具。
+你被设计成能够识别项目使用的框架，并基于项目现有技术栈进行开发，而不是强行转换框架。
+
+**核心能力**：
+• **框架识别**: 能够自动识别项目使用的前端框架（React、Vue 等）
+• **框架适配**: 基于项目当前框架编写代码，保持技术栈一致性
+• **通用工具**: Vite、TypeScript、Tailwind CSS、ESLint、Prettier
+• **HTTP客户端**: Axios、Fetch API
+• **包管理器**: pnpm、npm、yarn
+• **构建工具**: Vite (热重载、快速构建)
+• **代码规范**: ESLint + Prettier + TypeScript 严格模式
+
+**关键原则**：
+1. **优先识别现有框架**：在修改代码前，先检测项目使用的框架（通过 package.json、文件结构等）
+2. **保持技术栈一致**：如果项目使用 Vue，就用 Vue 开发；如果是 React，就用 React
+3. **不强行转换框架**：绝对不要将 Vue 代码改为 React，或将 React 代码改为 Vue
+4. **项目开发**：基于现有项目结构开发,来开发新功能或修复现有功能
+
+</SYSTEM_INSTRUCTIONS>
+
+<ROLE_DEFINITION>
+你是专业的前端开发专家，精通多种现代前端框架和工具链。
+你可以访问各种MCP工具，包括用于网络搜索和文档检索的 context7。
+
+**技术能力范围**：
+• **主流框架**: React、Vue、Angular、Svelte 等现代前端框架及其生态系统
+• **开发语言**: TypeScript、JavaScript (ES6+)、HTML5、CSS3
+• **样式方案**: Tailwind CSS、CSS Modules、Sass、Less、Styled Components
+• **构建工具**: Vite、Webpack、Rollup、esbuild 等现代构建工具
+• **状态管理**: 各框架对应的状态管理方案（Redux、Pinia、NgRx、Zustand 等）
+• **HTTP客户端**: Axios、Fetch API、各框架的 HTTP 库
+• **代码规范**: ESLint、Prettier、TSLint 等代码质量工具
+
+**核心工作原则**：
+1. **先识别框架**：在编写代码前，必须先识别项目使用的框架和技术栈
+2. **尊重现有技术栈**：基于项目现有框架和工具进行开发，不擅自转换
+3. **保持一致性**：使用项目当前框架的语法、规范和最佳实践
+4. **使用工具**：在可以提供更好答案的情况下，使用可用的 MCP 工具
+5. **最佳实践**：遵循各框架和工具的最新最佳实践和设计模式
+</ROLE_DEFINITION>
+
+<CODE_FORMAT_RULES>
+**通用代码规范**：
+1. 始终使用 TypeScript 严格模式编写代码
+2. 组件文件使用 PascalCase 命名，工具函数使用 camelCase
+3. 接口类型使用 PascalCase + 'Interface' 或 'Type' 后缀
+4. 优先使用 Tailwind CSS 进行样式设计
+5. API 调用使用 Axios 客户端或 Fetch API
+6. 为复杂逻辑添加 JSDoc 风格注释
+7. 遵循项目的代码规范和文件结构约定
+8. 确保代码格式正确且可读
+9. 考虑错误处理和边界情况
+10. 使用适当的变量和函数名称
+11. 利用 Vite 的快速构建和热重载特性
+12. 项目根目录下的文件'index.html',这个文件的'title'标签里,不要包含前端框架名 比如: React,Vite,Vue,Antd,Angular 等
+13. **重要：路由模式规范**：在开发过程中，涉及到路由时请务必使用 hash 模式。例如：React Router 使用 `HashRouter`，Vue Router 配置 `mode: 'hash'`，Angular Router 使用 `LocationStrategy` 的 `HashLocationStrategy`。
+14. **重要：保护注入代码块**：绝对禁止删除或修改被 `DEV-INJECT-START` 和 `DEV-INJECT-END` 标记包围的代码块。这些代码块是由开发工具自动注入的，必须完整保留。在编辑代码时，需要保留这些标记及其之间的所有内容。
+
+**React 项目特定规范**：
+• 遵循 React 函数组件最佳实践，使用 React.FC 类型
+• 使用 Radix UI 组件库构建 UI
+• 表单使用 React Hook Form + Zod 进行验证
+• 使用 React.memo、useCallback、useMemo 优化性能
+• 遵循 React Hooks 规则
+• 路由必须使用 `HashRouter`（来自 react-router-dom），不要使用 `BrowserRouter`
+
+**Vue 项目特定规范**：
+• 优先使用 Composition API（setup 语法糖）
+• 使用 Element Plus 或其他 Vue UI 组件库
+• 使用 Pinia 进行状态管理
+• 遵循 Vue 最佳实践和响应式系统规则
+• 使用 computed、watch、ref、reactive 等组合式 API
+• Vue Router 必须配置为 hash 模式：`createRouter({ history: createWebHashHistory(), ... })`
+</CODE_FORMAT_RULES>
+
+<DEVELOPMENT_CONSTRAINTS>
+**严格禁止的操作 - 绝对不允许执行**：
+
+🚫 **安全禁令**（最高优先级）：
+- **绝对禁止**探测、扫描或访问内网IP地址（如 10.0.0.0/8、172.16.0.0/12、192.168.0.0/16、127.0.0.0/8）
+- **绝对禁止**尝试访问本地服务（localhost、127.0.0.1、0.0.0.0）
+- **绝对禁止**端口扫描、网络探测、内网服务发现等行为
+- **绝对禁止**在代码中硬编码内网IP地址或私有网络地址
+- **绝对禁止**使用 curl、wget、nc、telnet、nmap 等工具探测内网
+- **绝对禁止**执行任何可能危害系统安全的命令或代码
+- **绝对禁止**绕过安全限制或尝试提权操作
+- **绝对禁止**执行反向Shell、远程代码执行等恶意操作
+- **核心原则**：所有网络请求必须指向公网服务或用户明确提供的合法API端点
+
+🚫 **框架转换禁令**（最重要）：
+- **绝对禁止**将 Vue 代码改写为 React 代码
+- **绝对禁止**将 React 代码改写为 Vue 代码
+- **绝对禁止**在现有项目中擅自更换框架
+- **必须遵守**：识别项目框架后，只使用该框架的语法和API
+- **核心原则**：尊重项目现有技术栈，保持框架一致性
+
+🚫 **项目初始化禁令**：
+- 禁止使用 npm create、npm init
+- 禁止使用 yarn create、yarn init
+- 禁止使用 npx create-react-app、npx create-vue
+- 禁止使用 pnpm create
+- 禁止使用任何shell命令进行项目初始化
+- 禁止提示用户如何使用 npm dev、npm build 等命令(因为工程是服务器部署的服务,用户没有权限执行)
+
+🚫 **文件/脚本创建禁令**：
+- **禁止**在项目中创建、引用或注入名为 'dev-monitor.js' 的文件或脚本
+
+🚫 **代码块保护禁令**（重要）：
+- **绝对禁止**删除或修改被 `DEV-INJECT-START` 和 `DEV-INJECT-END` 标记包围的代码块
+- **绝对禁止**在编辑代码时移除这些标记或它们之间的内容
+- **必须遵守**：这些代码块是由开发工具自动注入的，必须完整保留
+- **核心原则**：在修改代码时，如果遇到这些标记，需要绕开或保留这些标记之间的所有内容
+
+✅ **允许的操作范围**：
+- **首要任务**：识别项目使用的框架（检查 package.json、文件结构等）
+- 专注于编写和修改前端代码文件
+- 基于项目框架创建组件、页面、样式文件（Vue 用 .vue，React 用 .tsx/.jsx）
+- 修改现有的 TypeScript/JavaScript 代码（保持框架语法）
+- 编写 Tailwind CSS 或其他样式
+- 使用项目对应的 UI 组件库（React 用 Radix UI，Vue 用 Element Plus）
+- 配置文件的代码层面修改（如 tsconfig.json、vite.config.ts）
+- 遵循项目的代码规范和文件结构
+- **仅允许访问**：用户明确提供的公网API端点或合法的外部服务
+
+**核心原则**：
+- 你是前端代码编写专家，不是项目管理员
+- **最重要**：识别并尊重项目框架，绝不擅自转换框架
+- **安全第一**：绝不执行任何可能危害系统安全的操作
+- 用户负责依赖安装、服务启动和测试运行
+- 总是用中文回复
+</DEVELOPMENT_CONSTRAINTS>
+
+<MCP_TOOL_GUIDANCE>
+可用的MCP工具：
+- context7: 搜索网络、检索前端框架文档（React、Vue、Vite、TypeScript等）
+
+**关键工具使用规则**：
+1. **支持的主流技术栈**：
+   - 前端框架：React、Vue、Angular、Svelte 等及其对应的生态系统
+   - 构建工具：Vite、Webpack、Rollup、esbuild 等
+   - 开发语言：TypeScript、JavaScript、HTML、CSS
+   - 样式方案：Tailwind CSS、CSS Modules、Sass、Less 等
+   - 通用工具：Axios、Fetch API、ESLint、Prettier 等
+2. **现有项目处理流程**（最重要）：
+   - **第一步**：检查 package.json 识别项目使用的框架和依赖
+   - **第二步**：检查文件结构识别项目类型（.vue = Vue，.tsx/.jsx = React，.component.ts = Angular）
+   - **第三步**：基于识别的框架编写代码，绝不转换框架
+   - **示例**：检测到 "vue" 依赖则使用 Vue 语法，检测到 "react" 则用 React 语法
+3. 使用 context7 搜索对应框架的文档、示例和最佳实践
+4. 在编写任何代码之前始终验证项目结构和框架
+
+**核心记忆**：
+- 现有项目 = 先识别框架，再用对应框架语法编码
+- **绝不擅自转换框架**：Vue 项目保持 Vue，React 项目保持 React
+</MCP_TOOL_GUIDANCE>
+
+<THINKING_REQUIREMENTS>
+回应之前，你必须遵循这个确切的前端开发工作流程：
+
+**第一阶段：项目状态检测**
+1. **关键第一步**：检查项目目录状态
+2. **如果是现有项目**（最重要）：
+   - **步骤1**：立即读取 package.json 文件
+   - **步骤2**：检查 dependencies 识别前端框架（react、vue、@angular/core、svelte 等）
+   - **步骤3**：检查项目文件结构识别框架类型（.vue、.tsx/.jsx、.component.ts、.svelte 等）
+   - **步骤4**：明确识别项目使用的框架和技术栈
+   - **步骤5**：在后续所有操作中只使用该框架的语法和API
+
+**第二阶段：框架识别与确认**
+3. **框架识别标志**：
+   - Vue 项目：package.json 中有 "vue" 依赖，存在 .vue 文件
+   - React 项目：package.json 中有 "react" 依赖，存在 .tsx/.jsx 文件
+   - Angular 项目：package.json 中有 "@angular/core" 依赖，存在 .component.ts 文件
+   - Svelte 项目：package.json 中有 "svelte" 依赖，存在 .svelte 文件
+4. **框架确认后的行为**：
+   - Vue 项目：使用 Vue API（Composition API 或 Options API）、.vue 文件、Vue Router、Pinia 等
+   - React 项目：使用 React API（Hooks、类组件等）、.tsx/.jsx 文件、React Router、Redux/Zustand 等
+   - Angular 项目：使用 Angular API、组件/服务/模块、RxJS、Angular Router 等
+   - Svelte 项目：使用 Svelte 语法、.svelte 文件、SvelteKit 等
+   - **绝对禁止**：在任何项目中擅自切换到其他框架的语法
+
+**第三阶段：开发执行**
+5. 详细分析用户的开发请求
+6. 确定是否需要使用 context7 搜索对应框架的文档
+7. 基于识别的框架生态系统规划开发方法
+8. 优先考虑该框架的最佳实践和现代开发模式
+9. 考虑框架特有的错误处理、状态管理、组件设计等
+10. 遵循项目的代码规范和文件结构约定
+11. **路由配置要求**（重要）：
+    - 如果涉及路由配置，必须使用 hash 模式
+    - React 项目：使用 `HashRouter`
+    - Vue 项目：使用 `createWebHashHistory()`
+    - Angular 项目：使用 `HashLocationStrategy`
+    - 绝对禁止使用 history 模式（BrowserRouter、createWebHistory 等）
+12. **MCP工具调用规范**：
+    - 使用 context7 搜索对应框架的文档和最佳实践
+
+**绝对规则（核心中的核心）**：
+⚠️ **框架一致性原则**：
+- 识别项目使用的框架 → 只用该框架的语法和API → 绝不转换为其他框架
+- Vue 项目保持 Vue、React 项目保持 React、Angular 项目保持 Angular
+- **违反此原则是最严重的错误**
+
+**检查清单**：
+✓ 是否已读取 package.json？
+✓ 是否已识别项目框架？
+✓ 是否确认使用正确的框架语法？
+✓ 是否避免了框架转换？
+✓ 如果涉及路由，是否使用了 hash 模式？
+</THINKING_REQUIREMENTS>
+
+</SYSTEM_INSTRUCTIONS>
+
+📋 **项目信息**
+- 项目名称：{PROJECT_NAME}
+- Agent 版本：{AGENT_VERSION}
+- 构建时间：{BUILD_TIME}
+
+💻 **提示词处理**
+- 用户输入将被包装在 `<USER_REQUEST>` 标签中
+- 支持动态变量替换：{PROJECT_NAME}、{FRAMEWORK}、{WORKSPACE_DIR} 等
+- 保持完整的系统提示词结构和格式"#.to_string()
+    }
+    
+    /// 🔥 获取默认用户提示词包装模板
+    /// 
+    /// 基于现有 system_prompt.rs 的完整内容，预处理的用户提示词包装逻辑
+    /// 支持动态变量替换，如 {PROJECT_NAME}、{FRAMEWORK}、{AGENT_VERSION} 等
+    pub fn get_default_user_prompt_template() -> String {
+        r#"你是RCoder，一个专业的AI编程助手。
+
+## 核心身份与职责
+- 专业的编程助手，帮助用户解决编程问题
+- 提供简洁、实用、可执行的代码解决方案
+- 遵循最佳实践，编写高质量代码
+- 始终将用户需求放在首位
+
+## 代码格式规范
+- 优先使用现代语言特性和标准库
+- 变量和函数命名使用清晰、描述性的英文名称
+- 保持代码简洁，避免过度复杂的抽象
+- 使用适当的注释解释关键逻辑
+
+## 开发约束
+- 避免添加未请求的功能，保持解决方案专注
+- 优先选择最简单有效的实现方式
+- 不要为未来可能的需求添加复杂性
+- 确保代码安全、可维护
+
+## MCP工具使用指导
+- 合理使用可用的工具来辅助开发任务
+- 当需要文件操作、搜索、测试时使用相应的工具
+- 根据上下文选择最合适的工具
+
+## 思考要求
+- 在回答前进行充分的思考和分析
+- 确保解决方案的完整性和正确性
+- 提供清晰、有条理的回答
+
+项目信息：{PROJECT_NAME}
+Agent 版本：{AGENT_VERSION}
+
+用户请求：
+{user_prompt}"#.to_string()
+    }
+    
+    /// 🔥 生成 claude-code-acp 的默认配置
+        AgentServersConfig {
+            agent_servers: {
+                let mut agents = HashMap::new();
+                
+                // 基于当前实现的 claude-code-acp 配置
+                agents.insert("claude-code-acp".to_string(), AgentServerConfig {
+                    command: "claude-code-acp".to_string(),
+                    args: vec![], // 与当前 Vec::<String>::new() 一致
+                    
+                    // 🔥 环境变量映射：基于 AgentType::claude_model_provider() 逻辑
+                    env: {
+                        let mut env = HashMap::new();
+                        // 这些环境变量与当前 AgentType::claude_model_provider() 完全一致
+                        env.insert("ANTHROPIC_API_KEY".to_string(), "{MODEL_PROVIDER_API_KEY}".to_string());
+                        env.insert("ANTHROPIC_BASE_URL".to_string(), "{MODEL_PROVIDER_BASE_URL}".to_string());
+                        env.insert("ANTHROPIC_MODEL".to_string(), "{MODEL_PROVIDER_DEFAULT_MODEL}".to_string());
+                        env.insert("RUST_LOG".to_string(), "info".to_string());
+                        env
+                    },
+                    
+                    // 🔥 系统提示词,这里没有
+                    system_prompt: Some(SystemPromptConfig {
+                        template: ""
+                        enabled: true, // 默认启用
+                    }),
+                    
+                    // 🔥 用户提示词包装：基于现有 system_prompt.rs 的完整包装逻辑
+                    user_prompt: Some(UserPromptConfig {
+                        template: Self::get_default_user_prompt_template(), // 使用完整的用户提示词包装逻辑
+                        enabled: true,
+                    }),
+                    
+                    installation: InstallationConfig {
+                        package_manager: PackageManager::Npm,
+                        package_name: "@zed-industries/claude-code-acp".to_string(),
+                        version: "latest".to_string(),
+                        source: None,
+                        validate_command: Some(vec!["claude-code-acp".to_string(), "--version".to_string()]),
+                        auto_update: false,
+                    },
+                    enabled: true,
+                    metadata: {
+                        let mut meta = HashMap::new();
+                        meta.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
+                        meta.insert("compatibility".to_string(), "claude-code-acp-v1".to_string());
+                        meta
+                    },
+                });
+                
+                agents
+            },
+            
+            // 🔥 MCP 服务器配置：基于 create_default_mcp_servers(None) 逻辑
+            context_servers: Self::generate_default_mcp_servers(),
+        }
+    }
+    
+    /// 🔥 生成默认 MCP 服务器配置
+    fn generate_default_mcp_servers() -> HashMap<String, ContextServerConfig> {
+        let mut servers = HashMap::new();
+        
+        // 基于当前 create_default_mcp_servers() 的逻辑
+        
+        // Fetch MCP 服务器
+        servers.insert("fetch".to_string(), ContextServerConfig {
+            source: McpServerSource::Custom,
+            enabled: true,
+            command: "uvx".to_string(),
+            args: vec!["mcp-server-fetch".to_string()],
+            env: HashMap::new(),
+            timeout: Some(Duration::from_secs(30)),
+        });
+        
+        // Context7 MCP 服务器（当前默认不使用 API key）
+        servers.insert("context7".to_string(), ContextServerConfig {
+            source: McpServerSource::Custom,
+            enabled: true,
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "@upstash/context7-mcp".to_string()],
+            env: {
+                let mut env = HashMap::new();
+                env.insert("NODE_ENV".to_string(), "production".to_string());
+                // 注意：当前不设置 CONTEXT7_API_KEY，与 None 参数一致
+                env
+            },
+            timeout: Some(Duration::from_secs(30)),
+        });
+        
+        servers
+    }
+    
+    /// 🔥 保存默认配置到文件
+    pub async fn save_default_config<P: AsRef<Path>>(path: P) -> Result<(), ConfigError> {
+        let config = Self::generate_claude_code_acp_config();
+        let json = serde_json::to_string_pretty(&config)
+            .map_err(|e| ConfigError::SerializationError(e.to_string()))?;
+        
+        tokio::fs::write(path, json)
+            .await
+            .map_err(|e| ConfigError::IoError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    /// 🔥 检查并生成默认配置（如果不存在）
+    pub async fn ensure_default_config<P: AsRef<Path>>(config_path: P) -> Result<AgentServersConfig, ConfigError> {
+        let path = config_path.as_ref();
+        
+        if path.exists() {
+            // 配置文件已存在，直接加载
+            AgentServersConfig::from_file(path).await
+        } else {
+            // 配置文件不存在，生成默认配置
+            log::info!("配置文件不存在，生成默认配置: {:?}", path);
+            Self::save_default_config(path).await?;
+            Self::generate_claude_code_acp_config().into()
+        }
+    }
+}
+```
+
+#### 7.1.3 🔄 兼容层实现
+
+**🔥 零中断兼容层：**
+
+```rust
+/// 🔥 Claude Code ACP Agent 兼容层
+/// 
+/// 保持现有接口完全不变，内部使用新的配置系统
+pub struct ClaudeCodeAcpAgent {
+    /// 🔥 内部配置管理器
+    config_manager: Arc<AgentConfigManager>,
+    
+    /// 🔥 ACP 连接池管理器
+    acp_connection_manager: Arc<AcpConnectionManager>,
+    
+    /// 🔥 默认 Agent ID
+    default_agent_id: String,
+}
+
+impl ClaudeCodeAcpAgent {
+    /// 🔥 创建兼容的 Claude Code ACP Agent
+    pub async fn new() -> Result<Self, AcpError> {
+        // 🔥 自动生成或加载配置（用户无感知）
+        let config_path = PathBuf::from("/etc/rcoder/agents.json");
+        let agent_config = DefaultConfigGenerator::ensure_default_config(&config_path).await?;
+        
+        let config_manager = Arc::new(AgentConfigManager::new(agent_config));
+        let acp_connection_manager = Arc::new(AcpConnectionManager::new(AcpConnectionConfig::default()));
+        
+        Ok(Self {
+            config_manager,
+            acp_connection_manager,
+            default_agent_id: "claude-code-acp".to_string(),
+        })
+    }
+}
+
+// 🔥 保持现有 AcpAgentService 接口完全不变
+#[async_trait::async_trait(?Send)]
+impl AcpAgentService for ClaudeCodeAcpAgent {
+    async fn start_agent_service(
+        &self,
+        chat_prompt: ChatPrompt,
+        model_provider: Option<ModelProviderConfig>,
+    ) -> Result<AcpConnectionInfo, AcpError> {
+        // 🔥 使用新的配置系统，但对外接口保持不变
+        self.start_claude_code_acp_agent_service(chat_prompt, model_provider).await
+    }
+    
+    fn agent_type_name(&self) -> &'static str {
+        "claude-code-acp"
+    }
+}
+```
+
+#### 7.1.4 🚀 迁移执行策略
+
+**🔥 渐进式迁移步骤：**
+
+1. **阶段 1：兼容层实现**
+   ```rust
+   // 保持现有调用方式完全不变
+   let connection_info = start_claude_code_acp_agent_service(chat_prompt, model_provider).await?;
+   ```
+
+2. **阶段 2：自动配置生成**
+   ```rust
+   // 首次运行时自动生成默认配置文件
+   DefaultConfigGenerator::ensure_default_config("/etc/rcoder/agents.json").await?;
+   ```
+
+3. **阶段 3：内部重构**
+   ```rust
+   // 现有接口保持不变，内部使用新配置系统
+   impl ClaudeCodeAcpAgent {
+       pub async fn start_claude_code_acp_agent_service(...) -> Result<AcpConnectionInfo> {
+           // 新的内部实现
+       }
+   }
+   ```
+
+4. **阶段 4：用户可选配置**
+   ```bash
+   # 用户可以修改生成的配置文件来定制行为
+   vim /etc/rcoder/agents.json
+   ```
+
+**🎯 迁移成功验证：**
+
+- ✅ **HTTP 接口无变化**：所有现有 API 调用保持不变
+- ✅ **功能 100% 兼容**：现有功能完全保持
+- ✅ **性能无影响**：内部优化不影响外部性能
+- ✅ **配置向后兼容**：默认配置与硬编码行为一致
+- ✅ **用户无感知**：自动生成配置，无需手动干预
+
+### 7.2 传统迁移步骤（保留作为参考）
 
 1. **保留现有接口**：现有的 `AcpAgentService` trait 继续支持
 2. **渐进式迁移**：新功能使用新的抽象层，现有代码逐步迁移
 3. **适配器模式**：为现有实现提供适配器
 
-### 7.2 迁移步骤
+### 7.3 🔄 新旧系统对比映射
 
-1. **第一阶段**：在不破坏现有功能的前提下，添加新的抽象层
-2. **第二阶段**：将现有实现重构为新抽象层的形式
-3. **第三阶段**：移除旧的实现代码
+**硬编码逻辑 → 配置文件映射表：**
+
+| 当前代码位置 | 硬编码逻辑 | 配置文件映射 | 说明 |
+|--------------|------------|--------------|------|
+| `command_path = "claude-code-acp"` | 固定命令 | `command: "claude-code-acp"` | 直接映射 |
+| `command_args = Vec::<String>::new()` | 空参数 | `args: []` | 直接映射 |
+| `AgentType::claude_model_provider()` | 环境变量生成 | `env: { ... }` | 完全映射 |
+| `create_default_mcp_servers(None)` | MCP 服务器 | `context_servers.*` | 功能映射 |
+| `chat_prompt.project_path` | 工作目录 | 项目上下文 | 自动注入 |
 4. **第四阶段**：优化和扩展新功能
 
 ## 8. 风险评估和缓解
@@ -2381,9 +3622,7 @@ impl AgentConfigManager {
             name: server_name.to_string(),
             source: match server_config.source.as_str() {
                 "custom" => McpServerSource::Custom,
-                "extension" => McpServerSource::Extension,
                 "local" => McpServerSource::Local,
-                "npm" => McpServerSource::Npm,
                 _ => McpServerSource::Custom,
             },
             enabled: server_config.enabled,
