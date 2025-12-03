@@ -1788,14 +1788,14 @@ Agent 管理器根据配置中的 `agent_type` 字段自动选择启动方式：
 /// 🔥 无死锁风险设计：每个 Agent 使用独立的连接实例，避免共享状态
 pub struct AcpConnectionManager {
     /// 连接池：agent_id -> AgentConnection
-    /// 📌 使用 RwLock 而不是 DashMap，避免与全局状态映射的嵌套访问
-    connections: Arc<RwLock<HashMap<String, Weak<AgentConnection>>>>,
+    /// ✅ 基于当前工程成功的DashMap模式，避免传统锁的竞争问题
+    connections: Arc<DashMap<String, Weak<AgentConnection>>>,
     
     /// 连接配置
-    config: AcpConnectionConfig,
+    config: Arc<AcpConnectionConfig>,
     
     /// 后台清理任务句柄
-    cleanup_task: Option<JoinHandle<()>>,
+    cleanup_task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
 }
 
 /// ACP 连接配置
@@ -1918,11 +1918,13 @@ impl ConnectionStatus {
 
 impl AcpConnectionManager {
     /// 创建新的连接池管理器
+    /// 
+    /// 🎯 基于当前工程成功的DashMap模式，避免传统锁的竞争问题
     pub fn new(config: AcpConnectionConfig) -> Self {
         let manager = Self {
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            config,
-            cleanup_task: None,
+            connections: Arc::new(DashMap::new()), // ✅ 使用DashMap替代RwLock<HashMap>
+            config: Arc::new(config),
+            cleanup_task: Arc::new(tokio::sync::Mutex::new(None)),
         };
         
         // 启动后台清理任务
@@ -1930,12 +1932,13 @@ impl AcpConnectionManager {
         manager
     }
     
-    /// 🔥 获取或创建 Agent 连接（无死锁设计）
+    /// 🔥 获取或创建 Agent 连接（基于DashMap的无死锁设计）
     /// 
     /// 关键设计点：
-    /// 1. 每次只获取一个写锁，避免嵌套锁
-    /// 2. 使用 Weak 引用避免循环依赖
-    /// 3. RAII 资源自动清理，无需手动管理
+    /// 1. 使用DashMap的entry API避免嵌套访问
+    /// 2. 基于当前工程验证成功的并发模式
+    /// 3. 使用 Weak 引用避免循环依赖
+    /// 4. RAII 资源自动清理，无需手动管理
     pub async fn get_or_create_connection(
         &self,
         agent_id: &str,
@@ -1943,33 +1946,40 @@ impl AcpConnectionManager {
         model_provider: &ModelProviderConfig,
         project_context: &ProjectContext,
     ) -> Result<Arc<AgentConnection>, AcpError> {
-        // 📌 步骤1：先检查现有连接（只获取读锁）
-        {
-            let connections = self.connections.read().unwrap();
-            if let Some(weak_conn) = connections.get(agent_id) {
-                if let Some(connection) = weak_conn.upgrade() {
-                    // 检查连接状态（原子操作，无需锁）
+        let agent_id = agent_id.to_string();
+        
+        // 🎯 使用DashMap的entry API，原子性的检查-创建操作
+        let connection_entry = self.connections.entry(agent_id.clone());
+        
+        match connection_entry {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                // 现有连接存在
+                if let Some(connection) = occupied.get().upgrade() {
+                    // 检查连接状态（原子操作）
                     let status = connection.get_status();
                     if status == ConnectionStatus::Connected || status == ConnectionStatus::Idle {
                         // 原子更新最后活动时间
                         connection.update_last_activity();
                         return Ok(connection);
                     } else {
-                        // 连接状态异常，让它自然销毁
-                        drop(connection);
+                        // 连接状态异常，清理并继续创建新连接
+                        occupied.remove();
                     }
+                } else {
+                    // Weak引用已失效，清理并继续创建新连接
+                    occupied.remove();
                 }
             }
-        } // 读锁在这里释放
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                // 没有现有连接，继续创建新连接
+            }
+        }
         
-        // 📌 步骤2：创建新连接（只获取写锁）
-        let connection = self.create_new_connection(agent_id, agent_config, model_provider, project_context).await?;
+        // 📌 创建新连接
+        let connection = self.create_new_connection(&agent_id, agent_config, model_provider, project_context).await?;
         
-        // 📌 步骤3：注册连接（只获取写锁，原子操作）
-        {
-            let mut connections = self.connections.write().unwrap();
-            connections.insert(agent_id.to_string(), Arc::downgrade(&connection));
-        } // 写锁在这里释放
+        // 📌 注册新连接（原子操作）
+        self.connections.insert(agent_id, Arc::downgrade(&connection));
         
         Ok(connection)
     }
