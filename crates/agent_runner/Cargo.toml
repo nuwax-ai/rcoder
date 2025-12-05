@@ -21,7 +21,7 @@ acp-adapter = { path = "../acp_adapter" }
 claude-code-agent = { path = "../claude-code-agent" }
 pingora-proxy = { path = "../pingora-proxy" }
 
-clap ={workspace = true}
+clap = { workspace = true }
 # ACP Protocol
 agent-client-protocol = { workspace = true }
 async-trait = "0.1"
@@ -36,12 +36,15 @@ futures = { workspace = true }
 tokio-stream = "0.1"
 async-stream = "0.3"
 
+# gRPC Server
+tonic = { workspace = true }
+
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 
-derive_builder= { workspace = true }
+derive_builder = { workspace = true }
 
 # Workspace dependencies
 tokio = { workspace = true, features = ["full"] }
@@ -49,7 +52,11 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
+tracing-subscriber = { workspace = true, features = [
+    "fmt",
+    "env-filter",
+    "json",
+] }
 tracing-appender = "0.2"
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
@@ -74,4 +81,4 @@ path-clean = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 
-ringbuf={workspace = true}
+ringbuf = { workspace = true }

@@ -106,19 +106,22 @@ pub async fn agent_session_notification(
     // 检查容器存在性并获取代理目标
     let session_id = params.session_id.clone();
     match find_container_by_session_id(&state, &session_id) {
-        Some((project_id, agent_info)) => {
+        Some((project_id, _agent_info)) => {
             info!(
                 "✅ [SSE_PROXY] 找到容器: session_id={}, project_id={}",
                 session_id, project_id
             );
 
-            // 获取容器的 SSE 端点 URL
-            match get_container_sse_url(&project_id, &agent_info, &session_id).await {
-                Ok(sse_url) => {
-                    info!("🚀 [SSE_PROXY] 建立SSE代理连接: {}", sse_url);
+            // 🎯 使用 gRPC 替代 HTTP SSE 代理
+            match crate::grpc::get_container_grpc_addr(&project_id, shared_types::GRPC_DEFAULT_PORT)
+                .await
+            {
+                Ok(grpc_addr) => {
+                    info!("🚀 [gRPC_SSE] 建立 gRPC SSE 代理连接: {}", grpc_addr);
 
-                    // 创建 SSE 流
-                    let stream = create_sse_proxy_stream(sse_url, session_id.clone()).await;
+                    // 创建 gRPC SSE 流
+                    let stream =
+                        crate::grpc::create_grpc_sse_stream(grpc_addr, session_id.clone()).await;
 
                     Ok(Sse::new(stream).keep_alive(
                         KeepAlive::new()
@@ -128,14 +131,14 @@ pub async fn agent_session_notification(
                 }
                 Err(e) => {
                     error!(
-                        "❌ [SSE_PROXY] 获取容器SSE端点失败: session_id={}, error={}",
+                        "❌ [gRPC_SSE] 获取容器 gRPC 地址失败: session_id={}, error={}",
                         session_id, e
                     );
 
                     Err(create_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "SSE_CONNECTION_ERROR",
-                        "无法连接到容器的 SSE 端点",
+                        "GRPC_CONNECTION_ERROR",
+                        &format!("无法连接到容器的 gRPC 端点: {}", e),
                     ))
                 }
             }
@@ -208,13 +211,14 @@ async fn create_sse_proxy_stream(
                                         if let Ok(event_text) = String::from_utf8(event_data)
                                             && let Some(event) =
                                                 create_passthrough_event(&event_text)
-                                                && tx.send(Ok(event)).await.is_err() {
-                                                    warn!(
-                                                        "⚠️ [SSE_PROXY] 客户端已断开连接: session_id={}",
-                                                        session_id
-                                                    );
-                                                    break;
-                                                }
+                                            && tx.send(Ok(event)).await.is_err()
+                                        {
+                                            warn!(
+                                                "⚠️ [SSE_PROXY] 客户端已断开连接: session_id={}",
+                                                session_id
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -267,7 +271,7 @@ async fn create_sse_proxy_stream(
 fn create_passthrough_event(event_text: &str) -> Option<Event> {
     let mut event_type = None;
     let mut data_lines = Vec::new();
-    
+
     // 解析SSE消息的各个部分
     for line in event_text.lines() {
         if line.starts_with("event:") {
@@ -276,17 +280,17 @@ fn create_passthrough_event(event_text: &str) -> Option<Event> {
             data_lines.push(line[5..].trim());
         }
     }
-    
+
     // 只有当有数据内容时才创建事件
     if !data_lines.is_empty() {
         let data_content = data_lines.join("\n");
         let mut event = Event::default().data(data_content);
-        
+
         // 如果有事件类型，则设置事件类型
         if let Some(event_type) = event_type {
             event = event.event(event_type);
         }
-        
+
         Some(event)
     } else {
         None
@@ -332,7 +336,7 @@ async fn get_container_sse_url(
         let network_name = container_manager
             .get_dynamic_network_name(&docker_manager)
             .await;
-        
+
         let server_url = crate::proxy_agent::docker_container_agent::get_container_ip(
             &docker_manager,
             &container_info.container_id,
@@ -368,10 +372,10 @@ fn find_container_by_session_id(
     for entry in state.project_and_agent_map.iter() {
         let agent_info = entry.value();
         if let Some(agent_session_id) = agent_info.session_id()
-            && agent_session_id == session_id {
-                return Some((entry.key().clone(), agent_info.clone()));
-            }
+            && agent_session_id == session_id
+        {
+            return Some((entry.key().clone(), agent_info.clone()));
+        }
     }
     None
 }
-

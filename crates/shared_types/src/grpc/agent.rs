@@ -7,64 +7,177 @@ pub struct ChatRequest {
     pub session_id: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub prompt: ::prost::alloc::string::String,
-    /// 模型配置等可选字段
+    /// 模型配置
     #[prost(message, optional, tag = "4")]
     pub model_config: ::core::option::Option<ModelProviderConfig>,
-    /// 附件列表，作为JSON字符串传输，或者后续定义具体的Message
+    /// 附件列表
     #[prost(message, repeated, tag = "5")]
     pub attachments: ::prost::alloc::vec::Vec<Attachment>,
     /// 请求ID
     #[prost(string, optional, tag = "6")]
     pub request_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 数据源附件 (JSON 字符串数组)
+    #[prost(string, repeated, tag = "7")]
+    pub data_source_attachments: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {
     #[prost(string, tag = "1")]
-    pub request_id: ::prost::alloc::string::String,
-    #[prost(bool, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
     pub success: bool,
-    /// 错误信息等
-    #[prost(string, optional, tag = "3")]
+    #[prost(string, optional, tag = "4")]
     pub error: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub request_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProgressRequest {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
 }
+/// ProgressEvent 进度事件（优化版：使用详细的 oneof，移除 json_payload）
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProgressEvent {
-    /// 保留原始 JSON 用于兼容过渡
-    #[prost(string, tag = "10")]
-    pub json_payload: ::prost::alloc::string::String,
-    /// 时间戳 (使用 Unix timestamp)
+    /// 时间戳 (使用 Unix timestamp，单位：毫秒)
     #[prost(int64, tag = "11")]
     pub timestamp: i64,
-    /// 事件类型
-    #[prost(oneof = "progress_event::Event", tags = "1, 2, 3, 4, 5")]
+    /// 事件类型（使用 oneof 实现类型安全）
+    #[prost(oneof = "progress_event::Event", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
     pub event: ::core::option::Option<progress_event::Event>,
 }
 /// Nested message and enum types in `ProgressEvent`.
 pub mod progress_event {
-    /// 事件类型
+    /// 事件类型（使用 oneof 实现类型安全）
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Event {
         /// 普通日志
-        #[prost(string, tag = "1")]
-        Log(::prost::alloc::string::String),
+        #[prost(message, tag = "1")]
+        Log(super::LogEvent),
         /// 思考过程
-        #[prost(string, tag = "2")]
-        Thought(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Thinking(super::ThinkingEvent),
         /// 内容片段
-        #[prost(string, tag = "3")]
-        Chunk(::prost::alloc::string::String),
+        #[prost(message, tag = "3")]
+        Chunk(super::ChunkEvent),
         /// 完成信号
-        #[prost(bool, tag = "4")]
-        Done(bool),
+        #[prost(message, tag = "4")]
+        Completion(super::CompletionEvent),
         /// 错误信息
-        #[prost(string, tag = "5")]
-        Error(::prost::alloc::string::String),
+        #[prost(message, tag = "5")]
+        Error(super::ErrorEvent),
+        /// 询问确认
+        #[prost(message, tag = "6")]
+        AskConfirmation(super::AskConfirmationEvent),
+        /// 进度通知
+        #[prost(message, tag = "7")]
+        ProgressNotification(super::ProgressNotificationEvent),
+        /// 工具使用
+        #[prost(message, tag = "8")]
+        ToolUse(super::ToolUseEvent),
     }
+}
+/// 日志事件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LogEvent {
+    /// 日志级别: "debug", "info", "warn", "error"
+    #[prost(string, tag = "1")]
+    pub level: ::prost::alloc::string::String,
+    /// 日志内容
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// 思考事件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ThinkingEvent {
+    /// 思考内容
+    #[prost(string, tag = "1")]
+    pub content: ::prost::alloc::string::String,
+    /// 是否完成思考
+    #[prost(bool, tag = "2")]
+    pub is_complete: bool,
+}
+/// 内容片段事件（用于流式输出）
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ChunkEvent {
+    /// 内容片段
+    #[prost(string, tag = "1")]
+    pub content: ::prost::alloc::string::String,
+    /// 片段索引
+    #[prost(int32, tag = "2")]
+    pub index: i32,
+}
+/// 完成事件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CompletionEvent {
+    /// 最终结果
+    #[prost(string, tag = "1")]
+    pub result: ::prost::alloc::string::String,
+    /// 总 token 数
+    #[prost(int32, tag = "2")]
+    pub total_tokens: i32,
+    /// 耗时（毫秒）
+    #[prost(int64, tag = "3")]
+    pub duration_ms: i64,
+}
+/// 错误事件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ErrorEvent {
+    /// 错误代码
+    #[prost(string, tag = "1")]
+    pub error_code: ::prost::alloc::string::String,
+    /// 错误消息
+    #[prost(string, tag = "2")]
+    pub error_message: ::prost::alloc::string::String,
+    /// 堆栈跟踪（可选）
+    #[prost(string, optional, tag = "3")]
+    pub stack_trace: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// 询问确认事件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AskConfirmationEvent {
+    /// 询问消息
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+    /// 选项列表
+    #[prost(string, repeated, tag = "2")]
+    pub options: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// 默认选项
+    #[prost(string, optional, tag = "3")]
+    pub default_option: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// 进度通知事件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ProgressNotificationEvent {
+    /// 状态描述
+    #[prost(string, tag = "1")]
+    pub status: ::prost::alloc::string::String,
+    /// 进度百分比 (0-100)
+    #[prost(int32, tag = "2")]
+    pub percentage: i32,
+    /// 详细信息
+    #[prost(string, optional, tag = "3")]
+    pub details: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// 工具使用事件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolUseEvent {
+    /// 工具名称
+    #[prost(string, tag = "1")]
+    pub tool_name: ::prost::alloc::string::String,
+    /// 工具输入 (JSON 格式)
+    #[prost(string, tag = "2")]
+    pub tool_input: ::prost::alloc::string::String,
+    /// 工具输出 (JSON 格式)
+    #[prost(string, optional, tag = "3")]
+    pub tool_output: ::core::option::Option<::prost::alloc::string::String>,
+    /// 是否出错
+    #[prost(bool, tag = "4")]
+    pub is_error: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelRequest {
@@ -73,10 +186,14 @@ pub struct CancelRequest {
     #[prost(string, tag = "2")]
     pub reason: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
+    #[prost(enumeration = "CancelResultType", tag = "2")]
+    pub result: i32,
+    #[prost(string, optional, tag = "3")]
+    pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetStatusRequest {
@@ -100,23 +217,159 @@ pub struct ModelProviderConfig {
     #[prost(string, optional, tag = "4")]
     pub api_base: ::core::option::Option<::prost::alloc::string::String>,
 }
-/// 附件定义
+/// 附件数据源
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Attachment {
+pub struct AttachmentSource {
+    #[prost(oneof = "attachment_source::Source", tags = "1, 2, 3")]
+    pub source: ::core::option::Option<attachment_source::Source>,
+}
+/// Nested message and enum types in `AttachmentSource`.
+pub mod attachment_source {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Source {
+        /// 文件路径
+        #[prost(string, tag = "1")]
+        FilePath(::prost::alloc::string::String),
+        /// Base64 编码数据
+        #[prost(message, tag = "2")]
+        Base64(super::Base64Data),
+        /// URL 链接
+        #[prost(string, tag = "3")]
+        Url(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Base64Data {
     #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// 附件类型: text, image, file 等
+    pub data: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
-    pub kind: ::prost::alloc::string::String,
-    /// 内容，对于文本直接是内容，对于图片可能是base64或者url
-    #[prost(string, tag = "3")]
-    pub content: ::prost::alloc::string::String,
-    /// 来源: local, upload, paste 等
-    #[prost(string, tag = "4")]
-    pub source: ::prost::alloc::string::String,
-    /// 语言 (仅文本)
+    pub mime_type: ::prost::alloc::string::String,
+}
+/// 图像尺寸
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ImageDimensions {
+    #[prost(uint32, tag = "1")]
+    pub width: u32,
+    #[prost(uint32, tag = "2")]
+    pub height: u32,
+}
+/// 文本附件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextAttachment {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub source: ::core::option::Option<AttachmentSource>,
+    #[prost(string, optional, tag = "3")]
+    pub filename: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// 编程语言
     #[prost(string, optional, tag = "5")]
     pub language: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// 图像附件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ImageAttachment {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub source: ::core::option::Option<AttachmentSource>,
+    #[prost(string, tag = "3")]
+    pub mime_type: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub filename: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub dimensions: ::core::option::Option<ImageDimensions>,
+}
+/// 音频附件
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AudioAttachment {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub source: ::core::option::Option<AttachmentSource>,
+    #[prost(string, tag = "3")]
+    pub mime_type: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub filename: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// 时长（秒）
+    #[prost(double, optional, tag = "6")]
+    pub duration: ::core::option::Option<f64>,
+}
+/// 文档附件
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DocumentAttachment {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub source: ::core::option::Option<AttachmentSource>,
+    #[prost(string, tag = "3")]
+    pub mime_type: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub filename: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// 文件大小（字节）
+    #[prost(uint64, optional, tag = "6")]
+    pub size: ::core::option::Option<u64>,
+}
+/// 附件枚举（使用 oneof 区分类型）
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Attachment {
+    #[prost(oneof = "attachment::AttachmentType", tags = "1, 2, 3, 4")]
+    pub attachment_type: ::core::option::Option<attachment::AttachmentType>,
+}
+/// Nested message and enum types in `Attachment`.
+pub mod attachment {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum AttachmentType {
+        #[prost(message, tag = "1")]
+        Text(super::TextAttachment),
+        #[prost(message, tag = "2")]
+        Image(super::ImageAttachment),
+        #[prost(message, tag = "3")]
+        Audio(super::AudioAttachment),
+        #[prost(message, tag = "4")]
+        Document(super::DocumentAttachment),
+    }
+}
+/// 取消结果类型（对应 Rust CancelResult）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CancelResultType {
+    CancelResultUnspecified = 0,
+    CancelResultSuccess = 1,
+    CancelResultFailed = 2,
+    CancelResultTimeout = 3,
+}
+impl CancelResultType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::CancelResultUnspecified => "CANCEL_RESULT_UNSPECIFIED",
+            Self::CancelResultSuccess => "CANCEL_RESULT_SUCCESS",
+            Self::CancelResultFailed => "CANCEL_RESULT_FAILED",
+            Self::CancelResultTimeout => "CANCEL_RESULT_TIMEOUT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CANCEL_RESULT_UNSPECIFIED" => Some(Self::CancelResultUnspecified),
+            "CANCEL_RESULT_SUCCESS" => Some(Self::CancelResultSuccess),
+            "CANCEL_RESULT_FAILED" => Some(Self::CancelResultFailed),
+            "CANCEL_RESULT_TIMEOUT" => Some(Self::CancelResultTimeout),
+            _ => None,
+        }
+    }
 }
 /// Generated client implementations.
 pub mod agent_service_client {

@@ -28,8 +28,13 @@ impl ContainerSelfInspector {
     /// * `Result<Self>` - 检测器实例或错误
     ///
     /// # Examples
-    /// ```
+    /// ```rust,no_run
+    /// use docker_manager::ContainerSelfInspector;
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
     /// let inspector = ContainerSelfInspector::new("/var/run/docker.sock").await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn new(docker_socket_path: &str) -> Result<Self> {
         info!("初始化容器自检测器，Docker socket: {}", docker_socket_path);
@@ -69,8 +74,15 @@ impl ContainerSelfInspector {
     /// * `Result<String>` - 宿主机绝对路径或错误
     ///
     /// # Examples
-    /// ```
+    /// ```rust,no_run
+    /// use docker_manager::ContainerSelfInspector;
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// # let inspector = ContainerSelfInspector::new("/var/run/docker.sock").await?;
     /// let host_path = inspector.detect_host_path_for_container_dir("/app/project_workspace").await?;
+    /// println!("宿主机路径: {:?}", host_path);
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn detect_host_path_for_container_dir(&self, container_path: &str) -> Result<String> {
         info!("检测路径 {} 对应的宿主机路径", container_path);

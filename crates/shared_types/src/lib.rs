@@ -6,6 +6,10 @@ pub mod multi_image_config;
 pub mod service_config;
 pub mod service_type;
 
+// 常量定义模块
+pub mod constants;
+pub use constants::*;
+
 // gRPC 模块
 pub mod grpc {
     // 包含生成的代码，路径相对于当前文件

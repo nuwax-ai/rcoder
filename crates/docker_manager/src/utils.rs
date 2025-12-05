@@ -278,6 +278,109 @@ impl DockerUtils {
 
         config
     }
+
+    /// 获取容器在指定网络中的 IP 地址
+    ///
+    /// # Arguments
+    /// * `docker` - Docker 客户端
+    /// * `container_id` - 容器 ID
+    /// * `network_name` - 网络名称
+    ///
+    /// # Returns
+    /// * `DockerResult<String>` - 容器 IP 地址或错误
+    pub async fn get_container_ip(
+        docker: &bollard::Docker,
+        container_id: &str,
+        network_name: &str,
+    ) -> DockerResult<String> {
+        use bollard::container::InspectContainerOptions;
+
+        // 等待容器网络配置完成
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // Inspect 容器获取网络信息
+        let inspect = docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| {
+                super::DockerError::ConnectionError(format!("获取容器信息失败: {}", e))
+            })?;
+
+        // 获取网络配置
+        if let Some(network_settings) = inspect.network_settings {
+            if let Some(networks) = network_settings.networks {
+                debug!(
+                    "容器 {} 的网络: {:?}",
+                    container_id,
+                    networks.keys().collect::<Vec<_>>()
+                );
+
+                // 查找指定网络的 IP 地址
+                if let Some(network_info) = networks.get(network_name) {
+                    if let Some(ip_address) = &network_info.ip_address {
+                        debug!(
+                            "✅ 获取容器 {} 在网络 {} 中的 IP: {}",
+                            container_id, network_name, ip_address
+                        );
+                        return Ok(ip_address.clone());
+                    }
+                }
+
+                // 未找到指定网络
+                return Err(super::DockerError::ConnectionError(format!(
+                    "容器 {} 未连接到网络 {}，可用网络: {:?}",
+                    container_id,
+                    network_name,
+                    networks.keys().collect::<Vec<_>>()
+                )));
+            }
+        }
+
+        Err(super::DockerError::ConnectionError(format!(
+            "容器 {} 没有网络配置信息",
+            container_id
+        )))
+    }
+
+    /// 构建服务 URL
+    ///
+    /// # Arguments
+    /// * `container_ip` - 容器 IP 地址
+    /// * `port` - 服务端口
+    ///
+    /// # Returns
+    /// * `String` - 服务 URL
+    ///
+    /// # Examples
+    /// ```
+    /// use docker_manager::DockerUtils;
+    ///
+    /// let url = DockerUtils::build_service_url("172.17.0.2", 8086);
+    /// assert_eq!(url, "http://172.17.0.2:8086");
+    /// ```
+    pub fn build_service_url(container_ip: &str, port: u16) -> String {
+        format!("http://{}:{}", container_ip, port)
+    }
+
+    /// 使用容器名称构建服务 URL (通过 Docker DNS 解析)
+    ///
+    /// # Arguments
+    /// * `container_name` - 容器名称
+    /// * `port` - 服务端口
+    ///
+    /// # Returns
+    /// * `String` - 服务 URL
+    ///
+    /// # Examples
+    /// ```
+    /// use docker_manager::DockerUtils;
+    ///
+    /// let url = DockerUtils::build_service_url_by_name("rcoder-agent-project-123", 8086);
+    /// assert_eq!(url, "http://rcoder-agent-project-123:8086");
+    /// ```
+    pub fn build_service_url_by_name(container_name: &str, port: u16) -> String {
+        format!("http://{}:{}", container_name, port)
+    }
 }
 
 /// DockerConfig 特征，用于抽象不同 crate 中的 DockerConfig 类型

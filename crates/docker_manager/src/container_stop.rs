@@ -15,6 +15,11 @@
 //!
 //! ```rust,no_run
 //! use docker_manager::container_stop;
+//! use docker_manager::DockerManager;
+//! use std::sync::Arc;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! # let docker_manager = Arc::new(DockerManager::new(Default::default()).await?);
 //!
 //! // 启动时清理
 //! let result = container_stop::startup_cleanup_containers(
@@ -27,6 +32,8 @@
 //!     &docker_manager,
 //!     "container_id_123"
 //! ).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::{CleanupResult, ContainerRemovalFailure, DockerError, DockerManager, DockerResult};
@@ -71,13 +78,20 @@ const POST_STOP_WAIT_MS: u64 = 100;
 ///
 /// ```rust,no_run
 /// use docker_manager::container_stop;
+/// use docker_manager::DockerManager;
+/// use std::sync::Arc;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// # let docker_manager = Arc::new(DockerManager::new(Default::default()).await?);
 ///
 /// let result = container_stop::startup_cleanup_containers(
 ///     &docker_manager,
 ///     "rcoder-agent-*"
 /// ).await?;
 ///
-/// info!("清理了 {} 个容器", result.successfully_removed);
+/// println!("清理了 {} 个容器", result.successfully_removed);
+/// # Ok(())
+/// # }
 /// ```
 pub async fn startup_cleanup_containers(
     docker_manager: &Arc<DockerManager>,
@@ -243,11 +257,18 @@ fn is_409_conflict_error(error: &DockerError) -> bool {
 ///
 /// ```rust,no_run
 /// use docker_manager::container_stop;
+/// use docker_manager::DockerManager;
+/// use std::sync::Arc;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// # let docker_manager = Arc::new(DockerManager::new(Default::default()).await?);
 ///
 /// container_stop::runtime_cleanup_container(
 ///     &docker_manager,
 ///     "container_id_123"
 /// ).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub async fn runtime_cleanup_container(
     docker_manager: &Arc<DockerManager>,
@@ -289,12 +310,19 @@ pub async fn runtime_cleanup_container(
 ///
 /// ```rust,no_run
 /// use docker_manager::container_stop;
+/// use docker_manager::DockerManager;
+/// use std::sync::Arc;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// # let docker_manager = Arc::new(DockerManager::new(Default::default()).await?);
 ///
 /// let container_ids = vec!["id1".to_string(), "id2".to_string()];
 /// let result = container_stop::runtime_cleanup_containers(
 ///     &docker_manager,
 ///     container_ids
 /// ).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub async fn runtime_cleanup_containers(
     docker_manager: &Arc<DockerManager>,

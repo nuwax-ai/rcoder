@@ -6,7 +6,7 @@ use axum::extract::{Query, State};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::router::AppState;
@@ -66,18 +66,90 @@ async fn get_container_for_cancel(
 }
 
 /// 转发取消请求到容器内的 agent_runner 服务
+///
+/// 🎯 使用 gRPC CancelSession RPC 替代 HTTP 转发
 async fn forward_cancel_request_to_container_service(
     project_id: &str,
     session_id: Option<&str>,
     container_info: &ContainerBasicInfo,
+    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
-    let session_id_display = session_id.map(|s| s.to_string()).unwrap_or_else(|| "None".to_string());
+    let session_id_display = session_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "None".to_string());
     info!(
-        "📤 [CANCEL_FORWARD] 转发取消请求到容器: project_id={}, session_id={}, container_id={}",
+        "📤 [CANCEL_FORWARD] 转发取消请求到容器 (gRPC): project_id={}, session_id={}, container_id={}",
         project_id, session_id_display, container_info.container_id
     );
 
-    // 转发到容器内的 agent/session/cancel 接口（使用查询参数）
+    // 🎯 使用 gRPC 替代 HTTP
+    // 从 service_url 提取 gRPC 地址
+    let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
+
+    debug!(
+        "📡 [CANCEL_FORWARD] 发送 gRPC 取消请求到: {}, session_id={}",
+        grpc_addr, session_id_display
+    );
+
+    // 构建 session_id（如果未提供则使用 "all"）
+    let session_id_str = session_id.unwrap_or("all").to_string();
+    let reason = format!("用户请求取消: project_id={}", project_id);
+
+    // 调用 gRPC CancelSession
+    match crate::grpc::grpc_cancel_session_with_pool(
+        grpc_pool,
+        &grpc_addr,
+        session_id_str.clone(),
+        reason,
+    )
+    .await
+    {
+        Ok(grpc_response) => {
+            if grpc_response.success {
+                info!(
+                    "✅ [CANCEL_FORWARD] gRPC 取消成功: session_id={}",
+                    session_id_str
+                );
+                Ok(HttpResult::success(CancelResponse {
+                    success: true,
+                    session_id: session_id_str,
+                }))
+            } else {
+                let error_msg = grpc_response
+                    .message
+                    .unwrap_or_else(|| "未知错误".to_string());
+                error!("❌ [CANCEL_FORWARD] gRPC 取消失败: {}", error_msg);
+                Ok(HttpResult::error("CANCEL001", &error_msg))
+            }
+        }
+        Err(e) => {
+            error!("❌ [CANCEL_FORWARD] gRPC 调用失败: {}", e);
+            // 尝试回退到 HTTP（可选）
+            warn!("⚠️ [CANCEL_FORWARD] gRPC 失败，尝试 HTTP 回退");
+            forward_cancel_request_via_http(project_id, session_id, container_info).await
+        }
+    }
+}
+
+/// 从 service_url 提取 gRPC 地址
+fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
+    // service_url 格式: http://192.168.1.100:8086
+    let host = service_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .ok_or_else(|| AppError::internal_server_error("无效的 service_url"))?;
+
+    Ok(format!("{}:{}", host, shared_types::GRPC_DEFAULT_PORT))
+}
+
+/// HTTP 回退方案（当 gRPC 不可用时）
+async fn forward_cancel_request_via_http(
+    project_id: &str,
+    session_id: Option<&str>,
+    container_info: &ContainerBasicInfo,
+) -> Result<HttpResult<CancelResponse>, AppError> {
     let client = Client::new();
     let cancel_url = if let Some(sid) = session_id {
         format!(
@@ -91,32 +163,32 @@ async fn forward_cancel_request_to_container_service(
         )
     };
 
-    info!("📤 [CANCEL_FORWARD] 发送取消请求到: {}", cancel_url);
+    debug!("📡 [HTTP_FALLBACK] 发送 HTTP 取消请求到: {}", cancel_url);
 
     let response = client.post(&cancel_url).send().await.map_err(|e| {
-        error!("❌ [CANCEL_FORWARD] 转发取消请求失败: {}", e);
+        error!("❌ [HTTP_FALLBACK] HTTP 请求失败: {}", e);
         AppError::internal_server_error(&format!("转发取消请求到容器失败: {}", e))
     })?;
 
     let status = response.status();
-    debug!("📥 [CANCEL_FORWARD] 容器响应状态: {}", status);
+    debug!("📥 [HTTP_FALLBACK] 容器响应状态: {}", status);
 
     if status.is_success() {
         // 解析容器返回的 HttpResult<CancelResponse> 格式
         let container_http_result: shared_types::HttpResult<CancelResponse> =
             response.json().await.map_err(|e| {
-                error!("❌ [CANCEL_FORWARD] 解析容器响应失败: {}", e);
+                error!("❌ [HTTP_FALLBACK] 解析容器响应失败: {}", e);
                 AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
             })?;
 
         // 提取 data 字段中的 CancelResponse
         let container_response = container_http_result.data.ok_or_else(|| {
-            error!("❌ [CANCEL_FORWARD] 容器响应缺少 data 字段");
+            error!("❌ [HTTP_FALLBACK] 容器响应缺少 data 字段");
             AppError::internal_server_error("容器响应缺少 data 字段")
         })?;
 
         info!(
-            "✅ [CANCEL_FORWARD] 容器取消响应成功: session_id={}, success={}",
+            "✅ [HTTP_FALLBACK] 容器取消响应成功: session_id={}, success={}",
             container_response.session_id, container_response.success
         );
 
@@ -125,7 +197,7 @@ async fn forward_cancel_request_to_container_service(
         let error_text = format!("容器返回错误状态: {}", status);
         let response_body = response.text().await.unwrap_or_default();
         error!(
-            "❌ [CANCEL_FORWARD] {}, 响应内容: {}",
+            "❌ [HTTP_FALLBACK] {}, 响应内容: {}",
             error_text, response_body
         );
 
@@ -136,9 +208,10 @@ async fn forward_cancel_request_to_container_service(
     }
 }
 
+
 /// 处理agent任务取消请求
 ///
-/// 转发取消请求到容器内的 agent_runner 服务
+/// 转发取消请求到容器内的 agent_runner 服务（使用 gRPC）
 #[utoipa::path(
     post,
     path = "/agent/session/cancel",
@@ -201,12 +274,12 @@ async fn forward_cancel_request_to_container_service(
     ),
     tag = "agent",
     operation_id = "agent_session_cancel",
-    summary = "转发Agent任务取消请求",
-    description = "将取消请求转发到容器内的 agent_runner/agent/cancel 接口"
+    summary = "转发Agent任务取消请求（gRPC）",
+    description = "将取消请求通过 gRPC 转发到容器内的 agent_runner 服务"
 )]
-#[instrument(skip(_state))]
+#[instrument(skip(state))]
 pub async fn agent_session_cancel(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let session_id_display = query
@@ -234,11 +307,12 @@ pub async fn agent_session_cancel(
         }));
     };
 
-    // 第二步：转发取消请求到容器服务
+    // 第二步：转发取消请求到容器服务（使用全局连接池）
     let result = forward_cancel_request_to_container_service(
         &query.project_id,
         query.session_id.as_deref(),
         &container_info,
+        &state.grpc_pool,
     )
     .await;
 
