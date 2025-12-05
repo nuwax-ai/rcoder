@@ -17,54 +17,131 @@ service AgentService {
   rpc GetStatus (GetStatusRequest) returns (GetStatusResponse);
 }
 
-// === 消息定义 ===
+// === ChatRequest/Response ===
 
 message ChatRequest {
   string project_id = 1;
   string session_id = 2;
   string prompt = 3;
-  // 模型配置等可选字段
+  // 模型配置
   optional ModelProviderConfig model_config = 4;
-  // 附件列表，作为JSON字符串传输，或者后续定义具体的Message
+  // 附件列表
   repeated Attachment attachments = 5;
   // 请求ID
   optional string request_id = 6;
+  // 数据源附件 (JSON 字符串数组)
+  repeated string data_source_attachments = 7;
 }
 
 message ChatResponse {
-  string request_id = 1;
-  bool success = 2;
-  // 错误信息等
-  optional string error = 3;
+  string project_id = 1;
+  string session_id = 2;
+  bool success = 3;
+  optional string error = 4;
+  optional string request_id = 5;
 }
+
+// === Progress Streaming ===
 
 message ProgressRequest {
   string session_id = 1;
 }
 
+// ProgressEvent 进度事件（优化版：使用详细的 oneof，移除 json_payload）
 message ProgressEvent {
-  // 事件类型
+  // 事件类型（使用 oneof 实现类型安全）
   oneof event {
-    string log = 1;      // 普通日志
-    string thought = 2;  // 思考过程
-    string chunk = 3;    // 内容片段
-    bool done = 4;       // 完成信号
-    string error = 5;    // 错误信息
+    LogEvent log = 1;                              // 普通日志
+    ThinkingEvent thinking = 2;                    // 思考过程
+    ChunkEvent chunk = 3;                          // 内容片段
+    CompletionEvent completion = 4;                // 完成信号
+    ErrorEvent error = 5;                          // 错误信息
+    AskConfirmationEvent ask_confirmation = 6;     // 询问确认
+    ProgressNotificationEvent progress_notification = 7; // 进度通知
+    ToolUseEvent tool_use = 8;                     // 工具使用
   }
-  // 保留原始 JSON 用于兼容过渡
-  string json_payload = 10;
-  // 时间戳 (使用 Unix timestamp)
+  // 时间戳 (使用 Unix timestamp，单位：毫秒)
   int64 timestamp = 11;
 }
+
+// === ProgressEvent 详细事件类型定义 ===
+
+// 日志事件
+message LogEvent {
+  string level = 1;    // 日志级别: "debug", "info", "warn", "error"
+  string message = 2;  // 日志内容
+}
+
+// 思考事件
+message ThinkingEvent {
+  string content = 1;       // 思考内容
+  bool is_complete = 2;     // 是否完成思考
+}
+
+// 内容片段事件（用于流式输出）
+message ChunkEvent {
+  string content = 1;       // 内容片段
+  int32 index = 2;          // 片段索引
+}
+
+// 完成事件
+message CompletionEvent {
+  string result = 1;        // 最终结果
+  int32 total_tokens = 2;   // 总 token 数
+  int64 duration_ms = 3;    // 耗时（毫秒）
+}
+
+// 错误事件
+message ErrorEvent {
+  string error_code = 1;    // 错误代码
+  string error_message = 2; // 错误消息
+  optional string stack_trace = 3; // 堆栈跟踪（可选）
+}
+
+// 询问确认事件
+message AskConfirmationEvent {
+  string message = 1;               // 询问消息
+  repeated string options = 2;      // 选项列表
+  optional string default_option = 3; // 默认选项
+}
+
+// 进度通知事件
+message ProgressNotificationEvent {
+  string status = 1;         // 状态描述
+  int32 percentage = 2;      // 进度百分比 (0-100)
+  optional string details = 3; // 详细信息
+}
+
+// 工具使用事件
+message ToolUseEvent {
+  string tool_name = 1;      // 工具名称
+  string tool_input = 2;     // 工具输入 (JSON 格式)
+  optional string tool_output = 3; // 工具输出 (JSON 格式)
+  bool is_error = 4;         // 是否出错
+}
+
+// === Cancel Session ===
 
 message CancelRequest {
   string session_id = 1;
   string reason = 2;
 }
 
+// 取消结果类型（对应 Rust CancelResult）
+enum CancelResultType {
+  CANCEL_RESULT_UNSPECIFIED = 0;
+  CANCEL_RESULT_SUCCESS = 1;
+  CANCEL_RESULT_FAILED = 2;
+  CANCEL_RESULT_TIMEOUT = 3;
+}
+
 message CancelResponse {
   bool success = 1;
+  CancelResultType result = 2;
+  optional string message = 3;
 }
+
+// === Get Status ===
 
 message GetStatusRequest {
   string project_id = 1;
@@ -74,6 +151,8 @@ message GetStatusResponse {
   string status = 1; // "idle", "busy", "error"
 }
 
+// === Model Provider Config ===
+
 message ModelProviderConfig {
   string provider = 1;
   string model = 2;
@@ -81,17 +160,73 @@ message ModelProviderConfig {
   optional string api_base = 4;
 }
 
-// 附件定义
-message Attachment {
-    string name = 1;
-    // 附件类型: text, image, file 等
-    string kind = 2; 
-    // 内容，对于文本直接是内容，对于图片可能是base64或者url
-    string content = 3;
-    // 来源: local, upload, paste 等
-    string source = 4;
-    // 语言 (仅文本)
-    optional string language = 5;
+// === Attachment 相关定义 ===
+
+// 附件数据源
+message AttachmentSource {
+  oneof source {
+    string file_path = 1;    // 文件路径
+    Base64Data base64 = 2;   // Base64 编码数据
+    string url = 3;          // URL 链接
+  }
 }
 
+message Base64Data {
+  string data = 1;
+  string mime_type = 2;
+}
 
+// 图像尺寸
+message ImageDimensions {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+// 文本附件
+message TextAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  optional string filename = 3;
+  optional string description = 4;
+  optional string language = 5;  // 编程语言
+}
+
+// 图像附件
+message ImageAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional ImageDimensions dimensions = 6;
+}
+
+// 音频附件
+message AudioAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional double duration = 6;  // 时长（秒）
+}
+
+// 文档附件
+message DocumentAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional uint64 size = 6;  // 文件大小（字节）
+}
+
+// 附件枚举（使用 oneof 区分类型）
+message Attachment {
+  oneof attachment_type {
+    TextAttachment text = 1;
+    ImageAttachment image = 2;
+    AudioAttachment audio = 3;
+    DocumentAttachment document = 4;
+  }
+}

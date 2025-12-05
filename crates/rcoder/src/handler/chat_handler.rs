@@ -223,9 +223,9 @@ pub async fn handle_chat(
         }
     };
 
-    // 第三步：转发请求到容器服务
+    // 第三步：转发请求到容器服务（使用全局连接池）
     info!("🚀 [CHAT] 开始转发请求到容器服务");
-    let result = forward_request_to_container_service(&request, &container_info).await;
+    let result = forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
     info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
 
     // 响应后状态更新 - 使用新的高效会话更新方法
@@ -322,10 +322,11 @@ pub async fn handle_chat(
 
 /// 转发请求到容器内的 agent_runner 服务
 ///
-/// 将原始聊天请求直接转发到指定的容器服务，获取并返回处理结果
+/// 🎯 使用 gRPC Chat RPC 替代 HTTP 转发（使用全局连接池）
 async fn forward_request_to_container_service(
     request: &ChatRequest,
     container_info: &ContainerBasicInfo,
+    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
 ) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
     let project_id = if let Some(id) = &request.project_id {
         id.clone()
@@ -337,94 +338,128 @@ async fn forward_request_to_container_service(
     };
 
     info!(
-        "📤 [FORWARD] 转发请求到容器: project_id={}, container_id={}, service_url={}",
+        "📤 [FORWARD] 转发请求到容器 (gRPC): project_id={}, container_id={}, service_url={}",
         project_id, container_info.container_id, container_info.service_url
     );
 
-    // 直接转发原始 JSON 请求到容器内的 agent_runner
-    // 不做任何参数修改，让 agent_runner 处理所有业务逻辑
-    let client = Client::new();
-    let chat_url = format!("{}/chat", container_info.service_url);
+    // 🎯 使用 gRPC 替代 HTTP
+    // 从 service_url 提取主机名
+    let grpc_addr =
+        extract_grpc_addr(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?;
 
     debug!(
-        "📡 [FORWARD] 发送HTTP请求到: {}, body: prompt_length={}, attachments_count={}",
-        chat_url,
+        "📡 [FORWARD] 发送 gRPC 请求到: {}, prompt_length={}, attachments_count={}",
+        grpc_addr,
         request.prompt.len(),
         request.attachments.len()
     );
 
+    // 调用 gRPC Chat（使用全局连接池）
+    match crate::grpc::grpc_chat_with_pool(
+        grpc_pool,
+        &grpc_addr,
+        project_id.clone(),
+        request.session_id.clone(),
+        request.prompt.clone(),
+        request.attachments.clone(),
+        request.data_source_attachments.clone(),
+        request.model_provider.clone(),
+        request.request_id.clone(),
+    )
+    .await
+    {
+        Ok(grpc_response) => {
+            if grpc_response.success {
+                // 转换为内部 ChatResponse
+                let chat_response = crate::grpc::grpc_response_to_chat_response(grpc_response);
+                info!(
+                    "✅ [FORWARD] gRPC 响应成功: project_id={}, session_id={}",
+                    chat_response.project_id, chat_response.session_id
+                );
+                Ok(crate::HttpResult::success(chat_response))
+            } else {
+                let error_msg = grpc_response
+                    .error
+                    .unwrap_or_else(|| "未知错误".to_string());
+                error!("❌ [FORWARD] gRPC 响应错误: {}", error_msg);
+                Ok(crate::HttpResult::error("AGENT_ERROR", &error_msg))
+            }
+        }
+        Err(e) => {
+            error!("❌ [FORWARD] gRPC 调用失败: {}", e);
+            // 尝试回退到 HTTP（可选）
+            warn!("⚠️ [FORWARD] gRPC 失败，尝试 HTTP 回退");
+            forward_request_via_http(request, container_info).await
+        }
+    }
+}
+
+/// 从 service_url 提取 gRPC 地址
+fn extract_grpc_addr(service_url: &str, grpc_port: u16) -> Result<String, crate::AppError> {
+    // service_url 格式: http://192.168.1.100:8086
+    let host = service_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .ok_or_else(|| crate::AppError::internal_server_error("无效的 service_url"))?;
+
+    Ok(format!("{}:{}", host, grpc_port))
+}
+
+/// HTTP 回退方案（当 gRPC 不可用时）
+async fn forward_request_via_http(
+    request: &ChatRequest,
+    container_info: &ContainerBasicInfo,
+) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
+    let client = Client::new();
+    let chat_url = format!("{}/chat", container_info.service_url);
+
+    debug!("📡 [HTTP_FALLBACK] 发送 HTTP 请求到: {}", chat_url);
+
     let response = client
         .post(&chat_url)
-        .json(request) // 直接转发原始请求
+        .json(request)
         .send()
         .await
         .map_err(|e| {
-            error!("❌ [FORWARD] HTTP请求失败: {}", e);
+            error!("❌ [HTTP_FALLBACK] HTTP 请求失败: {}", e);
             crate::AppError::internal_server_error(&format!("转发请求到容器失败: {}", e))
         })?;
 
     let status = response.status();
-    debug!("📥 [FORWARD] 容器响应状态: {}", status);
-
     if status.is_success() {
-        // 先获取响应文本用于调试
         let response_text = response.text().await.map_err(|e| {
-            error!("❌ [FORWARD] 读取容器响应文本失败: {}", e);
             crate::AppError::internal_server_error(&format!("读取容器响应失败: {}", e))
         })?;
 
-        debug!("📥 [FORWARD] 容器响应原始内容: {}", response_text);
-
-        // 解析容器的 HttpResult<ChatResponse> 响应
         let container_http_result: shared_types::HttpResult<ChatResponse> =
             serde_json::from_str(&response_text).map_err(|e| {
-                error!(
-                    "❌ [FORWARD] 解析容器响应失败: {}, 响应内容: {}",
-                    e, response_text
-                );
                 crate::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
             })?;
 
-        debug!("📊 [FORWARD] 解析后的容器响应: {:?}", container_http_result);
-
-        // 检查容器响应是否成功 - 优先检查 code 字段，因为这是业务逻辑标准
         if container_http_result.code == "0000" {
-            // 成功情况：提取 data 字段中的 ChatResponse
             match container_http_result.data {
                 Some(container_response) => {
                     info!(
-                        "✅ [FORWARD] 容器响应成功: project_id={}, session_id={}",
-                        container_response.project_id, container_response.session_id
+                        "✅ [HTTP_FALLBACK] 响应成功: session_id={}",
+                        container_response.session_id
                     );
                     Ok(crate::HttpResult::success(container_response))
                 }
-                None => {
-                    error!(
-                        "❌ [FORWARD] 成功响应但缺少 data 字段, 完整响应: {:?}",
-                        container_http_result
-                    );
-                    Ok(crate::HttpResult::error(
-                        "CONTAINER_ERROR",
-                        "成功响应但缺少 data 字段",
-                    ))
-                }
+                None => Ok(crate::HttpResult::error(
+                    "CONTAINER_ERROR",
+                    "成功响应但缺少 data 字段",
+                )),
             }
         } else {
-            // 错误情况：容器返回了错误响应
-            let error_message = format!(
-                "容器服务错误: code={}, message={}",
-                container_http_result.code, container_http_result.message
-            );
-            error!("❌ [FORWARD] {}", error_message);
             Ok(crate::HttpResult::error(
                 &container_http_result.code,
-                &error_message,
+                &container_http_result.message,
             ))
         }
     } else {
         let error_text = format!("容器返回错误状态: {}", status);
-        let response_body = response.text().await.unwrap_or_default();
-        error!("❌ [FORWARD] {}, 响应内容: {}", error_text, response_body);
         Ok(crate::HttpResult::error("CONTAINER_ERROR", &error_text))
     }
 }

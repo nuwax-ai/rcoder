@@ -15,6 +15,9 @@ bollard = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 
+# HTTP client (for health checks)
+reqwest = { workspace = true }
+
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }

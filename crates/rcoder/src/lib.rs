@@ -3,6 +3,7 @@
 //! 提供 ACP 协议集成和 AI 代理管理功能
 
 mod config;
+pub mod grpc;
 mod handler;
 mod proxy_agent;
 mod router;
@@ -15,9 +16,10 @@ pub use utils::*;
 
 // 重新导出 shared_types 中的类型
 pub use shared_types::{
-    AgentStatus, AgentStatusResponse, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse,
-    Attachment, AttachmentError, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
-    ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,
-    AgentSessionUpdate, SessionNotify, ChatPrompt, ChatPromptResponse,
-    AppError, HttpResult, ModelProviderConfig, ModelProviderSafeInfo, ChatResponse,
+    AgentSessionUpdate, AgentStatus, AgentStatusResponse, AppError, Attachment, AttachmentError,
+    AttachmentSource, AudioAttachment, CancelNotificationRequest, CancelNotificationResponse,
+    ChatPrompt, ChatPromptResponse, ChatResponse, DocumentAttachment, HttpResult, ImageAttachment,
+    ImageDimensions, ModelProviderConfig, ModelProviderSafeInfo, ProjectAndAgentInfo,
+    SessionMessageType, SessionNotify, SessionPromptEnd, SessionPromptStart, TextAttachment,
+    UnifiedSessionMessage,
 };

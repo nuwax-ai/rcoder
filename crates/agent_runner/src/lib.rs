@@ -3,10 +3,11 @@
 //! 提供 ACP 协议集成和 AI 代理管理功能
 
 mod config;
+pub mod grpc;
 mod handler;
 mod model;
 mod proxy_agent;
-mod router;
+pub mod router;
 mod service;
 mod utils;
 

@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     info!("使用 Docker socket: {}", docker_socket_path);
 
     let _path_resolver =
-        match utils::HostPathResolver::new_with_docker_socket(&docker_socket_path).await {
+        match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone())).await {
             Ok(resolver) => {
                 info!("✅ 宿主机路径解析器初始化成功");
                 info!(

@@ -35,6 +35,9 @@ futures = { workspace = true }
 tokio-stream = "0.1"
 async-stream = "0.3"
 
+# gRPC Client
+tonic = { workspace = true }
+
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

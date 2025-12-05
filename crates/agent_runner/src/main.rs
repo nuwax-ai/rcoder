@@ -8,6 +8,7 @@ use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
+mod grpc;
 mod handler;
 mod model;
 mod proxy_agent;
@@ -129,6 +130,24 @@ async fn main() -> anyhow::Result<()> {
     // 创建路由
     let app = router::create_router(state.clone());
 
+    // 启动 gRPC 服务器
+    let grpc_port = shared_types::GRPC_DEFAULT_PORT;
+    let grpc_addr = format!("[::]:{}", grpc_port).parse().unwrap();
+    let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
+        grpc::AgentServiceImpl::new(state.clone()),
+    );
+
+    let grpc_handle = tokio::spawn(async move {
+        info!("🚀 gRPC 服务启动，监听端口: {}", grpc_port);
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(grpc_service)
+            .serve(grpc_addr)
+            .await
+        {
+            error!("gRPC 服务器错误: {}", e);
+        }
+    });
+
     // 启动 HTTP 服务器
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
         .await
@@ -136,10 +155,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Server starting on port {}", config.port);
     info!("API endpoints:");
-    info!("  POST /chat - Send chat message to AI agent (legacy)");
-    info!("  GET  /progress/:session_id - SSE progress stream for AI tasks (unified stream)");
+    info!("  POST /chat - Send chat message to AI agent (HTTP, legacy)");
+    info!("  GET  /progress/:session_id - SSE progress stream for AI tasks");
     info!("  GET  /health - Health check");
-    info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
+    info!("gRPC endpoints (port {}):", grpc_port);
+    info!("  agent.AgentService/Chat - gRPC chat");
+    info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
+    info!("  agent.AgentService/CancelSession - gRPC cancel");
+    info!("  agent.AgentService/GetStatus - gRPC status");
 
     if config.proxy_config.is_some() {
         info!("🚀 Pingora 反向代理服务已启用");
@@ -168,7 +191,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    axum::serve(listener, app).await?;
+    // 并行运行 HTTP 和 gRPC 服务
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            if let Err(e) = result {
+                error!("HTTP 服务器错误: {}", e);
+            }
+        }
+        _ = grpc_handle => {
+            warn!("gRPC 服务已停止");
+        }
+    }
 
     // 等待代理服务完成
     if let Some(handle) = proxy_handle {
@@ -204,9 +237,7 @@ fn init_telemetry() -> anyhow::Result<()> {
         .with_thread_names(true);
 
     // 创建控制台日志层 - 简洁格式
-    let console_layer = fmt::layer()
-        .with_target(false)
-        .with_ansi(true);
+    let console_layer = fmt::layer().with_target(false).with_ansi(true);
 
     // 设置全局文本传播器（用于 trace context 传播）
     opentelemetry::global::set_text_map_propagator(

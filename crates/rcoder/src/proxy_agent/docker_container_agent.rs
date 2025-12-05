@@ -7,11 +7,7 @@ use anyhow::{Context, Result};
 use docker_manager::{
     DockerContainerConfig, DockerContainerInfo, DockerManager, MountPoint, ResourceLimits,
 };
-use reqwest::Client;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 // 注意：Docker 容器生命周期守卫现在使用内置的 AgentLifecycleGuard
@@ -136,32 +132,7 @@ async fn create_docker_container_config(
     docker_image: Option<String>,
     service_config: Option<shared_types::ServiceImageConfig>,
 ) -> Result<DockerContainerConfig> {
-    let mut env_vars = HashMap::new();
-
-    // 设置基本环境变量
-    env_vars.insert("PROJECT_ID".to_string(), project_id.to_string());
-
-    // 从服务配置中获取环境变量，如果有的话
-    if let Some(ref config) = service_config {
-        // 合并服务配置中的环境变量
-        for (key, value) in &config.environment {
-            env_vars.insert(key.clone(), value.clone());
-        }
-
-        // 为路径变量进行变量替换
-        for (_key, value) in &mut env_vars {
-            if value.contains("{project_id}") {
-                *value = value.replace("{project_id}", project_id);
-            }
-        }
-    } else {
-        // 如果没有服务配置，使用默认值
-        env_vars.insert("RUST_LOG".to_string(), "info".to_string());
-        env_vars.insert("AGENT_TYPE".to_string(), "claude".to_string());
-    }
-
-    // 🎯 优化：无需端口映射，使用内部网络通信
-    let port_bindings = HashMap::new(); // 空的端口映射
+    use docker_manager::ContainerConfigBuilder;
 
     // 🔥 服务配置必须有值，配置加载阶段已处理默认值
     let config =
@@ -179,7 +150,7 @@ async fn create_docker_container_config(
         );
     }
 
-    // 🔥 使用配置化的容器路径模板，支持变量替换（必须在 config 字段被移动前调用）
+    // 🔥 使用配置化的容器路径模板，支持变量替换
     let mut variables = std::collections::HashMap::new();
     variables.insert("project_id".to_string(), project_id.to_string());
     variables.insert(
@@ -202,9 +173,6 @@ async fn create_docker_container_config(
     // 🎯 处理配置文件中的挂载配置，使用容器路径解析器转换相对路径
     let extra_mounts = process_mount_configs(config.mounts, project_id).await?;
 
-    // 🔥 启动命令已配置加载阶段提供默认值
-    let command = config.command;
-
     // 使用传入的镜像配置，如果没有则使用默认镜像
     let image = docker_image.unwrap_or_else(|| docker_manager::default_docker_image());
 
@@ -218,27 +186,38 @@ async fn create_docker_container_config(
         }
     };
 
-    // 🔥 工作目录和网络模式必须有值，配置加载阶段已提供默认值
-    let work_dir = config.work_dir.clone();
-    let network_mode = config.network_mode.clone();
+    // ✨ 使用 Builder 模式构建容器配置
+    let mut builder = ContainerConfigBuilder::new(project_id)
+        .image(image)
+        .name_prefix("rcoder-agent")
+        .host_path(host_project_path.to_string_lossy().to_string())
+        .container_path(container_path)
+        .work_dir(config.work_dir.clone())
+        .network_mode(config.network_mode.clone())
+        .auto_remove(true)
+        .resource_limits(resource_limits)
+        .add_mounts(extra_mounts);
 
-    Ok(DockerContainerConfig {
-        project_id: project_id.to_string(),
-        image,
-        name_prefix: "rcoder-agent".to_string(),
-        host_path: host_project_path.to_string_lossy().to_string(), // 🎯 使用宿主机绝对路径
-        container_path,                                             // 使用配置化的容器路径
-        work_dir,
-        env_vars,
-        port_bindings,                          // 空的端口映射
-        network_mode,                           // 从配置获取网络模式
-        auto_remove: true,                      // 容器停止后自动删除，适合临时任务容器
-        resource_limits: Some(resource_limits), // 从配置获取资源限制
-        extra_mounts,
-        command: Some(command),
-        entrypoint: config.entrypoint, // 使用配置中的入口点
-        network_name,                  // 使用动态检测的网络名称
-    })
+    // 添加环境变量
+    builder = builder.env("PROJECT_ID", project_id);
+    for (key, value) in &config.environment {
+        let resolved_value = value.replace("{project_id}", project_id);
+        builder = builder.env(key, resolved_value);
+    }
+
+    // 设置网络名称
+    if let Some(network) = network_name {
+        builder = builder.network_name(network);
+    }
+
+    // 设置启动命令和入口点
+    builder = builder.command(config.command);
+    if let Some(entrypoint) = config.entrypoint {
+        builder = builder.entrypoint(entrypoint);
+    }
+
+    // 构建配置
+    builder.build().map_err(|e| anyhow::anyhow!("构建容器配置失败: {}", e))
 }
 
 /// 处理配置文件中的挂载配置，将容器内路径转换为宿主机路径
@@ -253,31 +232,27 @@ async fn process_mount_configs(
     mounts: Vec<shared_types::ServiceMountConfig>,
     project_id: &str,
 ) -> Result<Vec<MountPoint>> {
-    // 获取当前容器的路径解析器
-    let path_resolver = crate::utils::get_host_path_resolver()
+    use docker_manager::MountProcessor;
+
+    // ✨ 使用 MountProcessor 处理挂载点
+    let processor = MountProcessor::new_async()
         .await
-        .context("获取宿主机路径解析器失败")?;
+        .context("创建挂载点处理器失败")?;
 
-    let processed_mounts = mounts
+    // 准备变量映射
+    let mut variables = std::collections::HashMap::new();
+    variables.insert("project_id".to_string(), project_id.to_string());
+
+    // 转换为 (container_path, host_path, read_only) 格式
+    let mount_inputs: Vec<(String, String, bool)> = mounts
         .into_iter()
-        .map(|mount| {
-            let mut host_path = mount.host_path;
+        .map(|m| (m.container_path, m.host_path, m.read_only))
+        .collect();
 
-            // 🔥 变量替换（如 {project_id}）
-            if host_path.contains("{project_id}") {
-                host_path = host_path.replace("{project_id}", project_id);
-            }
-
-            // 🔥 将相对路径转换为容器内绝对路径，然后转换为宿主机路径
-            let normalized_host_path = resolve_mount_host_path(&path_resolver, &host_path)?;
-
-            Ok(MountPoint {
-                container_path: mount.container_path,
-                host_path: normalized_host_path,
-                read_only: mount.read_only,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // 批量处理挂载点
+    let processed_mounts = processor
+        .process_mounts(mount_inputs, Some(&variables))
+        .context("处理挂载点配置失败")?;
 
     // 🔍 调试：打印处理后的挂载配置
     debug!("🔧 处理后的挂载配置 (共 {} 个):", processed_mounts.len());
@@ -294,132 +269,48 @@ async fn process_mount_configs(
     Ok(processed_mounts)
 }
 
-/// 解析挂载的宿主机路径
-///
-/// # Arguments
-/// * `path_resolver` - 路径解析器
-/// * `host_path` - 原始主机路径（可能是相对路径或容器内绝对路径）
-///
-/// # Returns
-/// * `Result<String>` - 解析后的宿主机绝对路径或错误
-fn resolve_mount_host_path(
-    path_resolver: &crate::utils::HostPathResolver,
-    host_path: &str,
-) -> Result<String> {
-    // 🔥 统一使用路径标准化：先将 host_path 标准化为绝对路径
-    let normalized_path = std::path::Path::new(host_path);
-    let container_absolute_path = if normalized_path.is_relative() {
-        // 相对路径：转换为容器内绝对路径
-        std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/app"))
-            .join(normalized_path)
-    } else {
-        // 已经是绝对路径，直接使用
-        normalized_path.to_path_buf()
-    };
-
-    // 🔍 检查是否为容器内路径
-    let host_abs_path = if container_absolute_path.starts_with("/app") {
-        // 容器内绝对路径：转换为宿主机路径
-        info!(
-            "🔧 转换容器内绝对挂载路径: {} -> 宿主机路径",
-            container_absolute_path.display()
-        );
-
-        let host_abs_path = path_resolver.resolve_to_host_path(&container_absolute_path);
-        info!(
-            "✅ 绝对路径转换成功: {} -> {:?}",
-            container_absolute_path.display(),
-            host_abs_path
-        );
-        host_abs_path.to_string_lossy().to_string()
-    } else {
-        // 可能已经是宿主机路径，直接使用
-        info!(
-            "🔧 使用可能是宿主机的挂载路径: {}",
-            container_absolute_path.display()
-        );
-        container_absolute_path.to_string_lossy().to_string()
-    };
-
-    Ok(host_abs_path)
-}
-
 /// 等待容器内 agent_runner 启动就绪
 async fn wait_for_agent_server_ready(server_url: &str) -> Result<()> {
-    let health_url = format!("{}/health", server_url);
-    let client = Client::new();
-
-    info!("等待 agent_runner 启动: {}", health_url);
-
-    // 最多等待 30 秒
-    for attempt in 0..30 {
-        match timeout(Duration::from_secs(1), client.get(&health_url).send()).await {
-            Ok(Ok(response)) if response.status().is_success() => {
-                info!("agent_runner 已就绪");
-                return Ok(());
-            }
-            Ok(_) => {
-                debug!("agent_runner 尚未就绪，等待中... ({}/30)", attempt + 1);
-            }
-            Err(_) => {
-                debug!("连接超时，继续等待... ({}/30)", attempt + 1);
-            }
-        }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-
-    Err(anyhow::anyhow!("等待 agent_runner 启动超时"))
+    // ✨ 使用 docker_manager 的健康检查功能
+    docker_manager::wait_for_service_ready(server_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("等待服务启动失败: {}", e))
 }
-/// 获取容器在指定网络中的 IP 地址（无宿主机端口映射）
+/// 获取容器在指定网络中的 IP 地址并构建服务 URL
 pub async fn get_container_ip(
     docker_manager: &DockerManager,
     container_id: &str,
     network_name: &str,
 ) -> Result<String> {
-    // 等待容器网络配置完成
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    use docker_manager::DockerUtils;
 
-    // 通过 DockerManager 获取容器的网络信息
-    let network_ips = docker_manager
-        .get_container_network_info(container_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("获取容器网络信息失败: {}", e))?;
-
-    // 🔍 调试：打印网络名称的详细信息
-    info!(
-        "🔍 查找网络: '{}' (长度: {})",
+    // ✨ 使用 DockerUtils 获取容器 IP
+    let container_ip = DockerUtils::get_container_ip(
+        docker_manager.get_docker_client(),
+        container_id,
         network_name,
-        network_name.len()
-    );
-    for (name, ip) in &network_ips {
-        info!("🔍 可用网络: '{}' (长度: {}) -> {}", name, name.len(), ip);
-    }
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("获取容器 IP 失败: {}", e))?;
 
-    // 查找指定网络的 IP 地址
-    if let Some(ip_address) = network_ips.get(network_name) {
-        let server_url = format!("http://{}:8086", ip_address);
-        info!(
-            "✅ 获取容器 IP 地址: {} -> {} (网络: {})",
-            container_id, ip_address, network_name
-        );
-        Ok(server_url)
-    } else {
-        Err(anyhow::anyhow!(
-            "容器 {} 未连接到网络 {}, 可用网络: {:?}",
-            container_id,
-            network_name,
-            network_ips.keys().collect::<Vec<_>>()
-        ))
-    }
+    // 构建服务 URL
+    let server_url = DockerUtils::build_service_url(&container_ip, 8086);
+
+    info!(
+        "✅ 获取容器服务 URL: {} (网络: {}, IP: {})",
+        server_url, network_name, container_ip
+    );
+
+    Ok(server_url)
 }
 
 /// 🎯 优化：使用容器名称通过 Docker 内置 DNS 解析
 /// 无需获取容器 IP，直接使用容器名称
 pub async fn get_container_server_url(container_name: &str) -> Result<String> {
-    // 直接使用容器名称，Docker 内置 DNS 会自动解析
-    let server_url = format!("http://{}:8086", container_name);
+    use docker_manager::DockerUtils;
+
+    // ✨ 使用 DockerUtils 构建服务 URL
+    let server_url = DockerUtils::build_service_url_by_name(container_name, 8086);
     info!(
         "✅ 使用容器名称 DNS 解析: {} -> {}",
         container_name, server_url
