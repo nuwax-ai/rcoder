@@ -18,7 +18,12 @@
       "Bash(chmod:*)",
       "Bash(cargo test:*)",
       "Bash(./test_sse_fix.sh:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:deepwiki.com)",
+      "Bash(tree:*)",
+      "Bash(grep:*)"
     ],
     "deny": [],
     "ask": []

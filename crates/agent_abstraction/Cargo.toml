@@ -1,0 +1,56 @@
+[package]
+name = "agent_abstraction"
+version = "0.1.0"
+edition = "2024"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT OR Apache-2.0"
+description = "Agent abstraction layer for RCoder"
+publish = false
+
+[dependencies]
+# 依赖其他 crate
+agent_config = { path = "../agent_config" }
+shared_types = { path = "../shared_types" }
+
+# 异步运行时
+tokio = { workspace = true }
+
+# 异步 trait
+async-trait = { workspace = true }
+
+# 错误处理
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# 并发集合
+dashmap = { workspace = true }
+
+# 日期时间
+chrono = { workspace = true, features = ["serde"] }
+
+# UUID 生成
+uuid = { workspace = true, features = ["v4"] }
+
+# 序列化
+serde_json = { workspace = true }
+
+# 日志
+tracing = { workspace = true }
+
+# 兼容性
+tokio-util = { workspace = true }
+
+# ACP 协议 - 使用工作空间依赖
+agent-client-protocol = { workspace = true }
+
+# MCP 协议 - rmcp 官方库: https://github.com/modelcontextprotocol/rust-sdk
+rmcp = {  version = "0.10", features = [
+    "client",
+    "transport-child-process",
+] }
+
+# 序列化
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8"

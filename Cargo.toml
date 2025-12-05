@@ -1,9 +1,8 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["tmp/*", "crates/ai-agents"]
+exclude = ["tmp/*", "crates/ai-agents", "crates/codex-acp-agent"]
 resolver = "2"
 
-# 默认不编译 codex-acp-agent，只在启用 codex feature 时编译
 default-members = [
     "crates/rcoder",
     "crates/agent_runner",
@@ -36,16 +35,6 @@ publish = false
 # ACP Protocol
 agent-client-protocol = "0.8"
 
-# Codex dependencies (optional, enable with --features codex)
-codex-acp = { git = "https://github.com/soddygo/codex-acp.git", branch = "feat-add-args" }
-codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
-codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-
-# 如果上面的版本有问题，可以尝试使用 main 分支或指定 rev
-# codex-core = { git = "https://github.com/zed-industries/codex", branch = "main", optional = true }
-# codex-common = { git = "https://github.com/zed-industries/codex", branch = "main", features = ["cli"], optional = true }
-# codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "main", optional = true }
 piper = "0.2"
 
 clap= { version = "4.5", features = ["derive", "env"] }

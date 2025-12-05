@@ -6,8 +6,6 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::AgentType;
-
 /// 命令行参数
 #[derive(Parser, Debug)]
 #[command(name = "rcoder")]
@@ -38,14 +36,19 @@ pub struct CliArgs {
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// 默认使用的 AI 代理类型
-    pub default_agent: AgentType,
+    /// 默认使用的 Agent ID
+    #[serde(default = "default_agent_id")]
+    pub default_agent_id: String,
     /// 项目工作的根目录,根据启动命令的当前目录来确定
     pub projects_dir: PathBuf,
     /// 服务端口
     pub port: u16,
     /// 代理配置
     pub proxy_config: Option<ProxyConfig>,
+}
+
+fn default_agent_id() -> String {
+    "claude-code-acp".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,10 +81,7 @@ const CONFIG_FILE: &str = "config.yml";
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "codex")]
-            default_agent: AgentType::Codex,
-            #[cfg(not(feature = "codex"))]
-            default_agent: AgentType::Claude,
+            default_agent_id: default_agent_id(),
             projects_dir: PathBuf::from("./project_workspace"),
             port: 8086,
             proxy_config: Some(ProxyConfig::default()),
@@ -181,10 +181,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     }
 
     info!(
-        "最终配置: port={}, projects_dir={:?}, default_agent={:?}, proxy_enabled={}",
+        "最终配置: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
         config.port,
         config.projects_dir,
-        config.default_agent,
+        config.default_agent_id,
         config.proxy_config.is_some()
     );
 
@@ -221,8 +221,8 @@ fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
         r#"# rcoder 配置文件
 # 该文件在首次启动时自动生成
 
-# 默认使用的 AI 代理类型 (Codex/Claude/Proxy)
-default_agent: {}
+# 默认使用的 Agent ID
+default_agent_id: {}
 
 # 项目工作目录
 projects_dir: {}
@@ -248,7 +248,7 @@ proxy_config:
     healthy_threshold: {}
     unhealthy_threshold: {}
 "#,
-        format!("{:?}", config.default_agent),
+        config.default_agent_id,
         config.projects_dir.display(),
         config.port,
         config.proxy_config.as_ref().unwrap().listen_port,

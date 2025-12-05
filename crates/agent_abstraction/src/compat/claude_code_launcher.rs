@@ -1,0 +1,487 @@
+//! Claude Code ACP Agent 启动器
+//!
+//! 提供 Claude Code Agent 的启动逻辑，从 agent_runner 迁移而来。
+//! 使用泛型 SessionNotifier 和 Client 替代直接依赖，提供更好的解耦。
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+
+use agent_client_protocol::{
+    Agent, Client, ClientSideConnection, Implementation, InitializeRequest, LoadSessionRequest, McpServer,
+    McpServerStdio, NewSessionRequest, PromptRequest, SessionId,
+};
+use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
+use anyhow::{Context, Result};
+use shared_types::ModelProviderConfig;
+use tokio::sync::mpsc;
+use tokio::task::LocalSet;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+
+use crate::acp::CancelNotificationRequestWrapper;
+use crate::traits::session_notifier::SessionNotifier;
+use crate::traits::AgentStartConfig;
+
+/// 使用默认版本
+const VERSION: agent_client_protocol::ProtocolVersion =
+    agent_client_protocol::ProtocolVersion::LATEST;
+
+/// Agent 配置参数
+#[derive(Debug, Clone)]
+pub struct AgentLaunchConfig {
+    /// 命令路径
+    pub command: String,
+    /// 命令参数
+    pub args: Vec<String>,
+    /// 环境变量
+    pub env: HashMap<String, String>,
+    /// Context 服务器配置 (MCP servers)
+    pub context_servers: HashMap<String, ContextServerConfig>,
+}
+
+/// Agent 连接信息
+#[derive(Debug)]
+pub struct LauncherConnectionInfo {
+    /// 会话 ID
+    pub session_id: SessionId,
+    /// 发送 Prompt 消息的通道
+    pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
+    /// 发送取消请求的通道
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
+    /// 取消令牌
+    pub cancel_token: CancellationToken,
+    /// 子进程
+    pub child: tokio::process::Child,
+    /// stderr 任务句柄
+    pub stderr_task: tokio::task::JoinHandle<()>,
+}
+
+/// 从配置文件加载 Agent 配置
+///
+/// 优先加载嵌入的JSON配置文件，如果加载失败则使用默认配置
+/// 同时检查并自动安装 agent（如果需要）
+pub async fn load_agent_config(
+    model_provider: Option<&ModelProviderConfig>,
+) -> Result<AgentLaunchConfig> {
+    // 使用 load_or_default() 加载嵌入的JSON配置文件
+    let config = AgentServersConfig::load_or_default().await;
+
+    // 获取 claude-code-acp 配置
+    if let Some(agent_config) = config.get_agent("claude-code-acp") {
+        info!("📋 从配置加载 Agent 参数: {}", agent_config.agent_id);
+
+        // 检查并安装 agent（如果有 installation 配置且配置了 package_name）
+        if agent_config.installation.package_name.is_some() {
+            let installation_manager = AgentInstallationManager::new();
+            match installation_manager
+                .ensure_installed(&agent_config.installation, &agent_config.command)
+                .await
+            {
+                Ok(result) => {
+                    if result.already_installed {
+                        debug!("Agent 已安装: {}", agent_config.command);
+                    } else {
+                        info!("✅ Agent 安装成功: {}", result.message);
+                    }
+                }
+                Err(e) => {
+                    warn!("⚠️ Agent 自动安装失败: {}，尝试继续启动", e);
+                    // 不阻止启动，可能命令已经在 PATH 中了
+                }
+            }
+        }
+
+        // 解析环境变量占位符
+        let mut resolved_env = agent_config.env.clone();
+
+        if let Some(provider) = model_provider {
+            // 解析占位符
+            for (_key, value) in resolved_env.iter_mut() {
+                *value = value
+                    .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
+                    .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
+                    .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
+                    .replace("{MODEL_PROVIDER_NAME}", &provider.name);
+            }
+        }
+
+        Ok(AgentLaunchConfig {
+            command: agent_config.command.clone(),
+            args: agent_config.args.clone(),
+            env: resolved_env,
+            context_servers: config.context_servers.clone(),
+        })
+    } else {
+        // 配置中没有找到，使用默认值
+        warn!("⚠️ 配置中未找到 claude-code-acp，使用默认配置");
+        get_default_agent_config(model_provider)
+    }
+}
+
+/// 获取默认的 Agent 配置（后备方案）
+pub fn get_default_agent_config(
+    model_provider: Option<&ModelProviderConfig>,
+) -> Result<AgentLaunchConfig> {
+    let env = if let Some(provider) = model_provider {
+        let mut env = HashMap::new();
+        if !provider.api_key.is_empty() {
+            env.insert("ANTHROPIC_API_KEY".to_string(), provider.api_key.clone());
+        }
+        if !provider.base_url.is_empty() {
+            env.insert("ANTHROPIC_BASE_URL".to_string(), provider.base_url.clone());
+        }
+        if !provider.default_model.is_empty() {
+            env.insert("ANTHROPIC_MODEL".to_string(), provider.default_model.clone());
+        }
+        env.insert("RUST_LOG".to_string(), "info".to_string());
+        env
+    } else {
+        let mut env = HashMap::new();
+        env.insert("RUST_LOG".to_string(), "info".to_string());
+        env
+    };
+
+    Ok(AgentLaunchConfig {
+        command: "claude-code-acp".to_string(),
+        args: Vec::new(),
+        env,
+        context_servers: HashMap::new(), // 默认配置不包含 context servers
+    })
+}
+
+/// 将配置中的 Context 服务器转换为 ACP 协议的 McpServer
+pub fn convert_context_servers(configs: &HashMap<String, ContextServerConfig>) -> Vec<McpServer> {
+    configs
+        .iter()
+        .filter(|(_, c)| c.enabled)
+        .filter_map(|(name, c)| {
+            let command = c.command.as_ref()?;
+            let mut server = McpServerStdio::new(name, PathBuf::from(command));
+
+            // 添加参数
+            if let Some(args) = &c.args {
+                server = server.args(args.clone());
+            }
+
+            // 添加环境变量
+            if let Some(env) = &c.env {
+                let env_vars: Vec<agent_client_protocol::EnvVariable> = env
+                    .iter()
+                    .map(|(k, v)| agent_client_protocol::EnvVariable::new(k.clone(), v.clone()))
+                    .collect();
+                server = server.env(env_vars);
+            }
+
+            Some(McpServer::Stdio(server))
+        })
+        .collect()
+}
+
+/// Claude Code ACP Agent 启动器
+///
+/// 提供启动 Claude Code Agent 子进程和建立 ACP 连接的功能。
+/// 使用泛型 SessionNotifier 和 Client 替代直接依赖，提供更好的解耦。
+///
+/// # 类型参数
+/// - `N`: SessionNotifier 实现，用于推送 SSE 消息
+/// - `C`: Client 实现，用于处理 ACP 协议回调
+pub struct ClaudeCodeLauncher<N: SessionNotifier, C: Client + 'static> {
+    /// 会话通知器
+    notifier: Arc<N>,
+    /// Client 类型标记
+    _client_marker: std::marker::PhantomData<C>,
+}
+
+impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C> {
+    /// 创建新的启动器
+    pub fn new(notifier: Arc<N>) -> Self {
+        Self {
+            notifier,
+            _client_marker: std::marker::PhantomData,
+        }
+    }
+
+    /// 启动 Claude Code ACP Agent 服务
+    ///
+    /// # 参数
+    /// - `project_id`: 项目 ID
+    /// - `project_path`: 项目工作目录
+    /// - `session_id`: 可选的会话 ID（用于恢复会话）
+    /// - `model_provider`: 模型提供商配置
+    /// - `start_config`: Agent 启动配置（包含系统提示词等）
+    /// - `client`: ACP 客户端实现
+    pub async fn launch(
+        &self,
+        project_id: String,
+        project_path: PathBuf,
+        session_id: Option<String>,
+        model_provider: Option<ModelProviderConfig>,
+        start_config: AgentStartConfig,
+        client: C,
+    ) -> Result<LauncherConnectionInfo> {
+        // 从配置加载 Agent 参数
+        let agent_config = load_agent_config(model_provider.as_ref()).await?;
+        let command_path = &agent_config.command;
+        let command_args = &agent_config.args;
+        info!("Claude Code ACP 命令: {} {:?}", command_path, command_args);
+
+        // 创建通道
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequestWrapper>();
+        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
+        let (session_id_tx, session_id_rx) = tokio::sync::oneshot::channel::<SessionId>();
+
+        // 创建 CancellationToken
+        let cancel_token = CancellationToken::new();
+
+        // 克隆用于闭包
+        let project_path_for_closure = project_path.clone();
+        let project_id_for_child = project_id.clone();
+        let session_id_for_closure = session_id.clone();
+        let cancel_token_for_closure = cancel_token.clone();
+        let notifier = self.notifier.clone();
+
+        info!("项目工作目录: {}", &project_path_for_closure.to_string_lossy());
+
+        // 转换配置中的 Context 服务器为 ACP 协议格式
+        let config_mcp_servers = convert_context_servers(&agent_config.context_servers);
+
+        // 合并 start_config 中的 MCP 服务器
+        let mcp_servers = if !config_mcp_servers.is_empty() {
+            info!("📦 使用配置文件中的 MCP 服务器");
+            config_mcp_servers
+        } else if start_config.has_mcp_servers() {
+            info!("📦 使用 AgentStartConfig 中的 MCP 服务器");
+            start_config.mcp_servers.clone()
+        } else {
+            info!("📝 未配置 MCP 服务器");
+            Vec::new()
+        };
+
+        // 构建系统提示词 meta
+        let system_prompt_meta = start_config.build_meta();
+
+        // 启动子进程
+        let spawn_args = command_args.clone();
+        let merged_envs = agent_config.env.clone();
+        let mut child = tokio::process::Command::new(command_path)
+            .args(&spawn_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .current_dir(&project_path_for_closure)
+            .envs(merged_envs)
+            .spawn()
+            .context("无法启动 claude-code-acp 子进程")?;
+
+        let child_pid = child.id().unwrap_or(0);
+        info!("Claude Code ACP 子进程已启动，PID: {}", child_pid);
+
+        // 获取 stdio 句柄
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stderr"))?;
+
+        // 创建兼容的流
+        let outgoing = stdin.compat_write();
+        let incoming = stdout.compat();
+
+        // 创建连接（使用传入的 client）
+        let (client_conn, handle_io) = ClientSideConnection::new(client, outgoing, incoming, |fut| {
+            tokio::task::spawn_local(fut);
+        });
+
+        // 启动 I/O 处理任务
+        tokio::task::spawn_local(handle_io);
+
+        let client_conn = Arc::new(client_conn);
+
+        // 启动后台任务来管理 ACP 连接
+        tokio::task::spawn_local(async move {
+            let local_set = LocalSet::new();
+
+            let result = local_set
+                .run_until(async {
+                    let client_conn = client_conn.clone();
+
+                    // 初始化连接
+                    debug!("初始化 ACP 连接[initialize]");
+                    let init_result = client_conn
+                        .initialize(
+                            InitializeRequest::new(VERSION).client_info(
+                                Implementation::new("rcoder-agent-runner", env!("CARGO_PKG_VERSION"))
+                                    .title("RCoder Agent Runner"),
+                            ),
+                        )
+                        .await;
+
+                    match init_result {
+                        Ok(_) => {
+                            info!("ACP 连接初始化成功");
+                        }
+                        Err(e) => {
+                            error!("ACP 连接初始化失败: {:?}", e);
+                            return Err(anyhow::anyhow!(
+                                "Failed to initialize ACP connection: {:?}",
+                                e
+                            ));
+                        }
+                    }
+
+                    if !mcp_servers.is_empty() {
+                        info!(
+                            "🔧 配置了 {} 个 MCP 服务器: {}",
+                            mcp_servers.len(),
+                            mcp_servers
+                                .iter()
+                                .map(|s| match s {
+                                    agent_client_protocol::McpServer::Stdio(server) =>
+                                        server.name.clone(),
+                                    _ => "unknown".to_string(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+
+                    // 创建会话
+                    let session_id = match session_id_for_closure {
+                        Some(sid) => {
+                            debug!("尝试加载 ACP 会话[load_session]");
+                            let given_session_id = SessionId::new(sid);
+                            match client_conn
+                                .load_session(LoadSessionRequest::new(
+                                    given_session_id.clone(),
+                                    project_path_for_closure.clone(),
+                                ))
+                                .await
+                            {
+                                Ok(resp) => {
+                                    debug!("ACP 会话加载成功[load_session],{:?}", resp);
+                                    given_session_id
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "load_session 失败或未实现，回退创建新会话[new_session]: {:?}",
+                                        e
+                                    );
+                                    let new_session_request =
+                                        NewSessionRequest::new(project_path_for_closure.clone())
+                                            .mcp_servers(mcp_servers.clone())
+                                            .meta(system_prompt_meta.clone());
+                                    let resp = client_conn.new_session(new_session_request).await?;
+                                    debug!("ACP 会话创建成功[new_session],{:?}", resp);
+                                    resp.session_id
+                                }
+                            }
+                        }
+                        None => {
+                            debug!("创建 ACP 会话[new_session]");
+                            let new_session_request =
+                                NewSessionRequest::new(project_path_for_closure.clone())
+                                    .mcp_servers(mcp_servers)
+                                    .meta(system_prompt_meta);
+                            let resp = client_conn.new_session(new_session_request).await?;
+                            debug!("ACP 会话创建成功[new_session],{:?}", resp);
+                            resp.session_id
+                        }
+                    };
+
+                    // 发送会话 ID
+                    if session_id_tx.send(session_id.clone()).is_err() {
+                        error!("无法发送会话 ID：接收方已关闭");
+                        return Err(anyhow::anyhow!("无法发送会话 ID"));
+                    }
+
+                    // 启动通道处理器
+                    super::channel_utils::spawn_cancel_handler_for_agent(
+                        client_conn.clone(),
+                        cancel_rx,
+                        &project_id_for_child,
+                    );
+                    super::channel_utils::spawn_prompt_handler_for_agent(
+                        client_conn.clone(),
+                        prompt_rx,
+                        session_id.clone(),
+                        &project_id_for_child,
+                        notifier,
+                    );
+
+                    // 等待取消信号
+                    cancel_token_for_closure.cancelled().await;
+                    info!("Claude Code ACP Agent 收到取消信号，将清理资源并退出");
+                    Ok(())
+                })
+                .await;
+
+            if let Err(e) = result {
+                error!("Claude Code ACP Agent 后台任务失败: {}", e);
+            }
+        });
+
+        // 等待会话 ID
+        let session_id = session_id_rx.await.map_err(|e| {
+            error!("等待会话 ID 失败: {}", e);
+            anyhow::anyhow!("等待会话 ID 失败: {}", e)
+        })?;
+
+        info!(
+            "Claude Code ACP Agent 服务启动完成，会话 ID: {}",
+            session_id.0
+        );
+
+        // 创建 stderr 任务
+        let cancel_token_for_stderr = cancel_token.clone();
+        let stderr_task = tokio::task::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut stderr_reader = tokio::io::BufReader::new(stderr);
+            let mut stderr_buffer = String::new();
+
+            loop {
+                if cancel_token_for_stderr.is_cancelled() {
+                    info!("Claude Code Agent stderr 任务收到取消信号，退出读取");
+                    break;
+                }
+
+                match stderr_reader.read_line(&mut stderr_buffer).await {
+                    Ok(0) => {
+                        info!("Claude Code Agent stderr 流已关闭");
+                        break;
+                    }
+                    Ok(bytes_read) => {
+                        let line = &stderr_buffer[..bytes_read];
+                        if !line.trim().is_empty() {
+                            warn!("Claude Code Agent stderr: {}", line.trim());
+                        }
+                        stderr_buffer.clear();
+                    }
+                    Err(e) => {
+                        error!("读取 Claude Code Agent stderr 失败: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(LauncherConnectionInfo {
+            session_id,
+            prompt_tx,
+            cancel_tx,
+            cancel_token,
+            child,
+            stderr_task,
+        })
+    }
+}

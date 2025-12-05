@@ -1,6 +1,6 @@
 //! rcoder 库
 //!
-//! 提供 ACP 协议集成和 codex 代理管理功能
+//! 提供 ACP 协议集成和 AI 代理管理功能
 
 mod config;
 mod handler;
@@ -15,7 +15,7 @@ pub use utils::*;
 
 // 重新导出 shared_types 中的类型
 pub use shared_types::{
-    AgentType, AgentStatus, AgentStatusResponse, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse,
+    AgentStatus, AgentStatusResponse, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse,
     Attachment, AttachmentError, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
     ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,
     AgentSessionUpdate, SessionNotify, ChatPrompt, ChatPromptResponse,

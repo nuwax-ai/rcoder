@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::{AgentType, Attachment, ModelProviderConfig};
+use super::{Attachment, ModelProviderConfig};
 use derive_builder::Builder;
 
 #[derive(Debug, Clone, Builder)]
@@ -21,9 +21,6 @@ pub struct ChatPrompt {
     /// 直接传递 JSON 字符串数组，简化使用方式
     #[builder(default)]
     pub data_source_attachments: Vec<String>,
-    /// agent 类型
-    #[builder(default)]
-    pub agent_type: AgentType,
     /// 必填：服务类型选择 (强制要求指定)
     /// "rcoder" 或 "agent-runner"，不允许为空
     pub service_type: crate::ServiceType,

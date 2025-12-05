@@ -20,7 +20,6 @@ pub use model::{
     AgentStatus,
     AgentStatusResponse,
     AgentStopHandle,
-    AgentType,
     // Error and HTTP exports
     AppError,
     // Session and message exports

@@ -11,17 +11,15 @@ path = "src/lib.rs"
 
 [features]
 default = []
-codex = ["shared_types/codex", "dep:codex-acp-agent"]
 
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
+agent_config = { path = "../agent_config" }
+agent_abstraction = { path = "../agent_abstraction" }
 acp-adapter = { path = "../acp_adapter" }
-codex-acp-agent = { path = "../codex-acp-agent", optional = true }
 claude-code-agent = { path = "../claude-code-agent" }
 pingora-proxy = { path = "../pingora-proxy" }
-
-# codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
 
 clap ={workspace = true}
 # ACP Protocol
