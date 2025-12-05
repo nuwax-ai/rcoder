@@ -15,32 +15,35 @@ graph LR
 ### 1.2 当前架构的核心问题
 
 > [!WARNING]
-> **核心矛盾**：`rcoder` 和 `agent_runner` 的请求/响应参数结构**完全相同**，`rcoder` 本质上只是做**纯转发**，但却需要完整的 HTTP + JSON 序列化/反序列化流程。
+> **核心矛盾**：`rcoder` 本质上只是做**纯转发**，但却需要完整的 HTTP + JSON 序列化/反序列化流程。
 
 **问题详解**：
 
-1. **参数重复定义**
-   - `rcoder` 定义了 `ChatRequest`（`handler/chat_handler.rs`）
-   - `agent_runner` 也定义了相同结构的 `ChatRequest`（`handler/chat_handler.rs`）
-   - 两边手工维护相同的结构，容易不同步
+1. ~~**参数重复定义**~~ ✅ **已解决**
+   - `agent_runner/src/model.rs` 现在完全从 `shared_types` 重新导出所有类型
+   - 新增 `CancelNotificationRequestWrapper` 和 `CancelResult` 统一取消操作
+   - 两端共享同一套类型定义，不再需要手工同步
 
-2. **无意义的序列化开销**
+2. **无意义的序列化开销** ⚠️ 待解决
    ```
    Client JSON → rcoder 反序列化 → 再序列化 JSON → agent_runner 反序列化
    ```
    rcoder 收到 JSON 后反序列化为 Rust 结构体，然后又序列化回 JSON 发给 agent_runner，这是**完全冗余的**。
 
-3. **SSE 文本解析脆弱**
+3. **SSE 文本解析脆弱** ⚠️ 待解决
    - agent_runner 生成 SSE 事件（`data: {...}\n\n`）
    - rcoder 接收后需要手工解析 `event:`、`data:` 等文本标记
    - 再重新构造 SSE 事件发给 Client
    - 这种文本层面的"拆解-重组"极易出错
 
-4. **类型约束缺失**
+4. **类型约束缺失** ⚠️ 待解决
    - 两个模块通过 HTTP/JSON 通信，接口兼容性依赖运行时检查
    - 一方改了字段名或类型，另一方可能静默失败
 
 **根本原因**：内部模块通信使用了设计给"外部调用"的 HTTP + JSON 协议，不适合紧密耦合的模块间通信场景。
+
+> [!NOTE]
+> **进展**：类型共享已通过 `shared_types` 模块实现，gRPC 改造将进一步解决序列化开销和 SSE 解析问题。
 
 ### 1.3 改造边界
 
@@ -198,6 +201,24 @@ message AttachmentSource {
 message Base64Data {
   string data = 1;
   string mime_type = 2;
+}
+
+message CancelRequest {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message CancelResponse {
+  bool success = 1;
+  CancelResultType result = 2;  // 新增：取消结果类型
+  optional string message = 3;  // 新增：错误/描述信息
+}
+
+// 新增：取消结果枚举（对应 Rust CancelResult）
+enum CancelResultType {
+  CANCEL_RESULT_SUCCESS = 0;
+  CANCEL_RESULT_FAILED = 1;
+  CANCEL_RESULT_TIMEOUT = 2;
 }
 
 // === 附件类型定义 ===
@@ -669,7 +690,10 @@ tonic-prost-build = "0.14"
 
 ---
 
-**文档版本**: v1.1  
+**文档版本**: v1.2  
 **创建日期**: 2025-12-05  
-**更新日期**: 2025-12-05  
-**作者**: AI Assistant based on codebase analysis
+**更新日期**: 2025-12-06  
+**变更记录**:
+- v1.2 (2025-12-06): 更新类型共享现状（已通过 shared_types 实现），新增 CancelResult 类型定义
+- v1.1 (2025-12-05): 明确改造边界，扩展 Attachment Proto 定义
+- v1.0 (2025-12-05): 初始版本
