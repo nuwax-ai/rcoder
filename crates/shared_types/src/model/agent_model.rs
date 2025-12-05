@@ -16,17 +16,86 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;
 
-/// 取消通知请求
+/// 取消操作结果（新类型）
+///
+/// 用于统一取消操作的返回结果
+#[derive(Debug, Clone)]
+pub enum CancelResult {
+    /// 取消成功
+    Success,
+    /// 取消失败
+    Failed(String),
+    /// 取消超时
+    Timeout,
+}
+
+impl CancelResult {
+    /// 是否成功
+    pub fn is_success(&self) -> bool {
+        matches!(self, CancelResult::Success)
+    }
+
+    /// 获取错误信息
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            CancelResult::Failed(msg) => Some(msg),
+            CancelResult::Timeout => Some("Cancel operation timed out"),
+            CancelResult::Success => None,
+        }
+    }
+}
+
+/// 取消通知请求包装器（新类型）
+///
+/// 直接包含 CancelNotification 和结果回调通道，
+/// 替代旧的 CancelNotificationRequest
+pub struct CancelNotificationRequestWrapper {
+    /// 取消通知
+    pub cancel_notification: CancelNotification,
+    /// 结果回调通道
+    pub result_tx: oneshot::Sender<CancelResult>,
+}
+
+impl std::fmt::Debug for CancelNotificationRequestWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelNotificationRequestWrapper")
+            .field("cancel_notification", &"<CancelNotification>")
+            .field("result_tx", &"<oneshot::Sender>")
+            .finish()
+    }
+}
+
+/// 取消通知请求（旧类型，保留兼容性）
+#[deprecated(note = "Use CancelNotificationRequestWrapper instead")]
 pub struct CancelNotificationRequest {
     pub cancel_notification: CancelNotification,
     pub tx: oneshot::Sender<CancelNotificationResponse>,
 }
 
-/// 取消通知响应
+/// 取消通知响应（旧类型，保留用于 HTTP 响应）
 #[derive(Debug)]
 pub struct CancelNotificationResponse {
     pub success: bool,
     pub message: Option<String>,
+}
+
+impl From<CancelResult> for CancelNotificationResponse {
+    fn from(result: CancelResult) -> Self {
+        match result {
+            CancelResult::Success => CancelNotificationResponse {
+                success: true,
+                message: None,
+            },
+            CancelResult::Failed(msg) => CancelNotificationResponse {
+                success: false,
+                message: Some(msg),
+            },
+            CancelResult::Timeout => CancelNotificationResponse {
+                success: false,
+                message: Some("取消请求超时".to_string()),
+            },
+        }
+    }
 }
 
 /// Agent 服务状态
@@ -51,8 +120,8 @@ pub struct ProjectAndAgentInfo {
     pub session_id: SessionId,
     /// 用于发送 Prompt 的通道
     pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    /// 用于发送取消通知的通道
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequest>,
+    /// 用于发送取消通知的通道（使用新类型）
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
     /// 模型提供商配置
     pub model_provider: Option<ModelProviderConfig>,
     /// 当前活跃的请求ID，用于标识用户请求

@@ -12,8 +12,8 @@ use utoipa::{IntoParams, ToSchema};
 use agent_client_protocol::{CancelNotification, SessionId};
 
 use crate::{
-    AppError, CancelNotificationRequest, HttpResult, proxy_agent::PROJECT_AND_AGENT_INFO_MAP,
-    router::AppState,
+    AppError, CancelNotificationRequestWrapper, CancelResult, HttpResult,
+    proxy_agent::PROJECT_AND_AGENT_INFO_MAP, router::AppState,
 };
 
 /// 取消任务的查询参数
@@ -155,10 +155,10 @@ pub async fn agent_session_cancel(
     // 从全局映射中查找匹配的session
     let project_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
 
-    let (tx, rx) = oneshot::channel();
-    let cancel_notification_request = CancelNotificationRequest {
+    let (result_tx, result_rx) = oneshot::channel::<CancelResult>();
+    let cancel_notification_request = CancelNotificationRequestWrapper {
         cancel_notification,
-        tx,
+        result_tx,
     };
     match project_info {
         Some(project_info) => {
@@ -179,13 +179,14 @@ pub async fn agent_session_cancel(
                 "📡 [agent_cancel_handler] 等待Agent取消响应: session_id={}",
                 session_id
             );
-            match rx.await {
-                Ok(cancel_notification_response) => {
+            match result_rx.await {
+                Ok(cancel_result) => {
+                    let is_success = cancel_result.is_success();
                     info!(
                         "✅ [agent_cancel_handler] 收到Agent取消响应: session_id={}, success={}",
-                        session_id, cancel_notification_response.success
+                        session_id, is_success
                     );
-                    if cancel_notification_response.success {
+                    if is_success {
                         // 🧹 彻底清空该 session，避免阻塞
                         // 先主动关闭 SSE 连接，再移除 SESSION_CACHE 条目
                         if let Some(session_data) = crate::service::SESSION_CACHE.get(&session_id) {

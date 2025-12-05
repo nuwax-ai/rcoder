@@ -22,8 +22,8 @@ pub fn spawn_cancel_handler_for_agent(
         while let Some(cancel_request_wrapper) = cancel_rx.recv().await {
             info!("项目[{}]收到取消请求", project_id);
 
-            // 提取内部的 CancelNotification 和结果通道
-            let cancel_notification = cancel_request_wrapper.inner.cancel_notification;
+            // 直接从包装器中提取 CancelNotification 和结果通道
+            let cancel_notification = cancel_request_wrapper.cancel_notification;
             let result_tx = cancel_request_wrapper.result_tx;
 
             // 添加超时保护，防止 Agent cancel 调用阻塞

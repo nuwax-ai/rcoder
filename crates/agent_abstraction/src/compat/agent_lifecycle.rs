@@ -22,6 +22,16 @@ pub struct AgentLifecycleGuard {
     inner: Arc<AgentLifecycleInner>,
 }
 
+impl std::fmt::Debug for AgentLifecycleGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentLifecycleGuard")
+            .field("project_id", &self.inner.project_id)
+            .field("session_id", &self.inner.session_id)
+            .field("stopped", &self.inner.stopped.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
 struct AgentLifecycleInner {
     project_id: String,
     session_id: SessionId,

@@ -9,13 +9,10 @@
 use std::path::PathBuf;
 
 use agent_client_protocol::{McpServer, PromptRequest, SessionId};
-use shared_types::CancelNotificationRequest;
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
+use shared_types::CancelNotificationRequestWrapper;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
-use crate::launcher::LaunchedProcess;
 
 /// Established ACP connection result
 #[derive(Debug)]
@@ -24,8 +21,8 @@ pub struct EstablishedConnection {
     pub session_id: SessionId,
     /// Prompt sender channel
     pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    /// Cancel sender channel
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequest>,
+    /// Cancel sender channel (使用新的统一类型)
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
     /// Stderr monitoring task handle
     pub stderr_task: JoinHandle<()>,
     /// Cancellation token

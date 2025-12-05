@@ -2,35 +2,11 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::SessionId;
+use agent_client_protocol::{CancelNotification, SessionId};
 use tokio::sync::{mpsc, oneshot};
 
-/// 取消操作结果
-#[derive(Debug, Clone)]
-pub enum CancelResult {
-    /// 取消成功
-    Success,
-    /// 取消失败
-    Failed(String),
-    /// 取消超时
-    Timeout,
-}
-
-impl CancelResult {
-    /// 是否成功
-    pub fn is_success(&self) -> bool {
-        matches!(self, CancelResult::Success)
-    }
-
-    /// 获取错误信息
-    pub fn error_message(&self) -> Option<&str> {
-        match self {
-            CancelResult::Failed(msg) => Some(msg),
-            CancelResult::Timeout => Some("Cancel operation timed out"),
-            CancelResult::Success => None,
-        }
-    }
-}
+// 重新导出 shared_types 中的统一类型
+pub use shared_types::{CancelNotificationRequestWrapper, CancelResult};
 
 /// Agent connection wrapper
 #[derive(Debug)]
@@ -54,23 +30,6 @@ pub struct AgentConnection {
     pub prompt_tx: Arc<mpsc::UnboundedSender<agent_client_protocol::PromptRequest>>,
     /// Cancel sender channel - wrapped in Arc to avoid Debug requirement
     pub cancel_tx: Arc<mpsc::UnboundedSender<CancelNotificationRequestWrapper>>,
-}
-
-/// Wrapper for CancelNotificationRequest with result channel
-pub struct CancelNotificationRequestWrapper {
-    /// 取消请求内容
-    pub inner: shared_types::CancelNotificationRequest,
-    /// 结果回调通道
-    pub result_tx: oneshot::Sender<CancelResult>,
-}
-
-impl std::fmt::Debug for CancelNotificationRequestWrapper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CancelNotificationRequestWrapper")
-            .field("inner", &"<CancelNotificationRequest>")
-            .field("result_tx", &"<oneshot::Sender>")
-            .finish()
-    }
 }
 
 impl AgentConnection {
@@ -149,13 +108,13 @@ impl AgentConnection {
     /// - `Err`: 发送请求失败（channel 已关闭）
     pub async fn send_cancel(
         &self,
-        cancel: shared_types::CancelNotificationRequest,
+        cancel_notification: CancelNotification,
     ) -> Result<oneshot::Receiver<CancelResult>, Box<dyn std::error::Error + Send + Sync>> {
         let (result_tx, result_rx) = oneshot::channel();
 
         self.cancel_tx
             .send(CancelNotificationRequestWrapper {
-                inner: cancel,
+                cancel_notification,
                 result_tx,
             })
             .map_err(|e| {
@@ -171,9 +130,9 @@ impl AgentConnection {
     /// 发送取消请求并等待结果
     pub async fn send_cancel_and_wait(
         &self,
-        cancel: shared_types::CancelNotificationRequest,
+        cancel_notification: CancelNotification,
     ) -> Result<CancelResult, Box<dyn std::error::Error + Send + Sync>> {
-        let result_rx = self.send_cancel(cancel).await?;
+        let result_rx = self.send_cancel(cancel_notification).await?;
 
         result_rx.await.map_err(|e| {
             Box::new(std::io::Error::new(

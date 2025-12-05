@@ -1,7 +1,8 @@
 //! Tests for ACP connection module.
 
 use super::*;
-use crate::acp::{AgentConnection, CancelNotificationRequestWrapper};
+use crate::acp::{AgentConnection, CancelNotificationRequestWrapper, CancelResult};
+use agent_client_protocol::{CancelNotification, SessionId as AcpSessionId};
 
 #[tokio::test]
 async fn test_agent_connection_creation() {
@@ -63,17 +64,18 @@ async fn test_agent_connection_send_prompt() {
 
 #[test]
 fn test_cancel_notification_request_wrapper() {
-    let inner_request = shared_types::CancelNotificationRequest {
-        cancel_notification: shared_types::CancelNotification {
-            request_id: "test-request".to_string(),
-        },
-        tx: tokio::sync::oneshot::channel().0,
-    };
+    // 使用新的统一类型
+    let session_id = AcpSessionId::new("test-session");
+    let cancel_notification = CancelNotification::new(session_id);
+    let (result_tx, _result_rx) = tokio::sync::oneshot::channel::<CancelResult>();
 
     let wrapper = CancelNotificationRequestWrapper {
-        inner: inner_request,
+        cancel_notification,
+        result_tx,
     };
-    assert!(wrapper.inner.cancel_notification.request_id == "test-request");
+
+    // 新类型直接包含 cancel_notification
+    assert_eq!(wrapper.cancel_notification.session_id.0.as_ref(), "test-session");
 }
 
 #[test]
@@ -139,21 +141,16 @@ async fn test_agent_connection_send_cancel() {
     let connection = AgentConnection::new(
         project_id.clone(),
         shared_types::ServiceType::RCoder,
-        Some(session_id),
+        Some(session_id.clone()),
         std::sync::Arc::new(prompt_tx),
         std::sync::Arc::new(cancel_tx),
     );
 
-    // Create a cancel request
-    let cancel_request = shared_types::CancelNotificationRequest {
-        cancel_notification: shared_types::CancelNotification {
-            request_id: "test-cancel".to_string(),
-        },
-        tx: tokio::sync::oneshot::channel().0,
-    };
+    // Create a cancel notification (使用新类型)
+    let cancel_notification = CancelNotification::new(session_id);
 
     // Send the cancel request
-    let result = connection.send_cancel(cancel_request).await;
+    let result = connection.send_cancel(cancel_notification).await;
     assert!(result.is_ok());
 }
 
@@ -224,6 +221,7 @@ fn test_agent_connection_project_id() {
 
     let connection = AgentConnection::new(
         project_id.clone(),
+        shared_types::ServiceType::RCoder,
         Some(session_id),
         std::sync::Arc::new(prompt_tx),
         std::sync::Arc::new(cancel_tx),
