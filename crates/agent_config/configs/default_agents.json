@@ -1,0 +1,52 @@
+{
+  "agent_servers": {
+    "claude-code-acp": {
+      "agent_id": "claude-code-acp",
+      "agent_type": "claude",
+      "command": "claude-code-acp",
+      "args": [],
+      "env": {
+        "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}",
+        "ANTHROPIC_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
+        "ANTHROPIC_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
+        "RUST_LOG": "info"
+      },
+      "system_prompt": {
+        "source": "embedded",
+        "template": "",
+        "enabled": true
+      },
+      "user_prompt": {
+        "template": "{user_prompt}",
+        "enabled": false
+      },
+      "installation": {
+        "package_manager": "npm",
+        "package_name": "@anthropics/claude-code-acp",
+        "version": "latest",
+        "validate_command": ["claude-code-acp", "--version"]
+      },
+      "enabled": true,
+      "metadata": {
+        "description": "Claude Code ACP Agent - Default configuration",
+        "version": "1.0.0"
+      }
+    }
+  },
+  "context_servers": {
+    "context7": {
+      "source": "custom",
+      "enabled": true,
+      "command": "bunx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "env": {}
+    },
+    "fetch": {
+      "source": "custom",
+      "enabled": true,
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "env": {}
+    }
+  }
+}

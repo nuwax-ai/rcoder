@@ -7,7 +7,6 @@ license.workspace = true
 
 [features]
 default = []
-codex = ["dep:codex-common", "dep:codex-core"]
 
 [dependencies]
 
@@ -16,9 +15,6 @@ serde_json.workspace = true
 uuid.workspace = true
 agent-client-protocol.workspace = true
 chrono.workspace = true
-
-codex-common = { workspace = true, optional = true }
-codex-core = { workspace = true, optional = true }
 
 # OpenAPI documentation
 utoipa = { workspace = true }

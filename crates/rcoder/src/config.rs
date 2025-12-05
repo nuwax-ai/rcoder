@@ -5,8 +5,6 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::AgentType;
-
 /// 命令行参数
 #[derive(Parser, Debug)]
 #[command(name = "rcoder")]
@@ -37,8 +35,9 @@ pub struct CliArgs {
 /// 应用程序配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// 默认使用的 AI 代理类型
-    pub default_agent: AgentType,
+    /// 默认使用的 Agent ID
+    #[serde(default = "default_agent_id")]
+    pub default_agent_id: String,
     /// 项目工作目录
     pub projects_dir: PathBuf,
     /// 主服务端口
@@ -47,6 +46,10 @@ pub struct AppConfig {
     pub proxy_config: Option<ProxyConfig>,
     /// Docker 配置
     pub docker_config: Option<DockerConfig>,
+}
+
+fn default_agent_id() -> String {
+    "claude-code-acp".to_string()
 }
 
 /// 健康检查配置
@@ -100,7 +103,7 @@ const CONFIG_FILE: &str = "config.yml";
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            default_agent: AgentType::Claude,
+            default_agent_id: default_agent_id(),
             projects_dir: PathBuf::from("./project_workspace"),
             port: 8087,
             proxy_config: Some(ProxyConfig::default()),
@@ -321,10 +324,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     }
 
     info!(
-        "最终配置: port={}, projects_dir={:?}, default_agent={:?}, proxy_enabled={}",
+        "最终配置: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
         config.port,
         config.projects_dir,
-        config.default_agent,
+        config.default_agent_id,
         config.proxy_config.is_some()
     );
 

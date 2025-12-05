@@ -1,4 +1,5 @@
 mod session_cache;
+mod session_notifier;
 
 pub use session_cache::{
     SESSION_CACHE,
@@ -8,3 +9,4 @@ pub use session_cache::{
     push_session_update_with_project,
     ensure_project_session,
 };
+pub use session_notifier::SseSessionNotifier;

@@ -1,7 +1,6 @@
 mod agent_model;
 mod agent_project_runner_model;
 mod agent_session_notify;
-mod agent_type;
 mod app_error;
 mod attachment;
 pub mod chat_prompt;
@@ -12,7 +11,6 @@ mod model_provider;
 pub use agent_model::*;
 pub use agent_project_runner_model::*;
 pub use agent_session_notify::*;
-pub use agent_type::AgentType;
 pub use app_error::AppError;
 pub use attachment::*;
 pub use chat_prompt::*;

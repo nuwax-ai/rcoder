@@ -4,8 +4,6 @@ pub mod agent_stop_handle;
 mod channel_utils;
 mod claude_code_agent;
 pub mod cleanup_task;
-#[cfg(feature = "codex")]
-mod codex_agent;
 
 use crate::CancelNotificationRequest;
 use crate::{

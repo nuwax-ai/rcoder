@@ -1,6 +1,6 @@
 //! rcoder 库
 //!
-//! 提供 ACP 协议集成和 codex 代理管理功能
+//! 提供 ACP 协议集成和 AI 代理管理功能
 
 mod config;
 mod handler;

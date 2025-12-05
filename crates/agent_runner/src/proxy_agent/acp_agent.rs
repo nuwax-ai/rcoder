@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 use crate::{
-    model::{AgentStatus, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
+    model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::agent_service::AcpAgentService,
     utils::{ContentBuilder, PromptBuilder},
 };
@@ -39,17 +39,16 @@ fn check_model_config_changed(
 }
 
 /// 创建新的Agent服务
-async fn create_new_agent_service(
-    request: LocalSetAgentRequest,
-    chat_prompt: ChatPrompt,
-    project_id: String,
-) {
+async fn create_new_agent_service(request: LocalSetAgentRequest) {
+    let project_id = request.prompt_message.project_id.clone();
+    let prompt_message = request.prompt_message.clone();
+
     info!("开始创建新的Agent服务，项目ID: {}", project_id);
 
-    // 根据 chat_prompt.agent_type 自动判断使用 codex 还是 claude code
-    let start_agent_result = chat_prompt
-        .agent_type
-        .start_agent_service(chat_prompt.clone(), request.model_provider.clone())
+    // 使用默认的 Claude Agent 服务
+    let agent_service = super::agent_service::get_default_agent_service();
+    let start_agent_result = agent_service
+        .start_agent_service(prompt_message.clone(), request.model_provider.clone())
         .await;
 
     // 创建 agent 服务
@@ -67,7 +66,7 @@ async fn create_new_agent_service(
                 prompt_tx: conn_info.prompt_tx.clone(),
                 cancel_tx: conn_info.cancel_tx.clone(),
                 model_provider: request.model_provider.clone(),
-                request_id: request.chat_prompt.request_id.clone(),
+                request_id: Some(prompt_message.request_id.clone()),
                 status: AgentStatus::Idle,
                 last_activity: Utc::now(),
                 created_at: Utc::now(),
@@ -95,7 +94,7 @@ async fn create_new_agent_service(
             }
 
             let response =
-                match build_prompt_to_acp_agent(chat_prompt.clone(), conn_info.session_id.clone())
+                match build_prompt_to_acp_agent(prompt_message.clone(), conn_info.session_id.clone())
                     .await
                 {
                     Ok(prompt_request) => {
@@ -105,8 +104,8 @@ async fn create_new_agent_service(
                                 project_id: project_id.clone(),
                                 session_id: conn_info.session_id.to_string(),
                                 error: Some(format!("发送prompt请求失败: {:?}", e)),
-                                request_id: chat_prompt.request_id.clone(),
-                                service_type: chat_prompt.service_type.clone(),
+                                request_id: Some(prompt_message.request_id.clone()),
+                                service_type: prompt_message.service_type.clone(),
                             }
                         } else {
                             info!("Prompt 请求已发送，项目ID: {}", project_id);
@@ -114,8 +113,8 @@ async fn create_new_agent_service(
                                 project_id: project_id.clone(),
                                 session_id: conn_info.session_id.to_string(),
                                 error: None,
-                                request_id: chat_prompt.request_id.clone(),
-                                service_type: chat_prompt.service_type.clone(),
+                                request_id: Some(prompt_message.request_id.clone()),
+                                service_type: prompt_message.service_type.clone(),
                             }
                         }
                     }
@@ -128,8 +127,8 @@ async fn create_new_agent_service(
                             project_id: project_id.clone(),
                             session_id: conn_info.session_id.to_string(),
                             error: Some(format!("构建prompt请求失败: {:?}", e)),
-                            request_id: chat_prompt.request_id.clone(),
-                            service_type: chat_prompt.service_type.clone(),
+                            request_id: Some(prompt_message.request_id.clone()),
+                            service_type: prompt_message.service_type.clone(),
                         }
                     }
                 };
@@ -147,8 +146,8 @@ async fn create_new_agent_service(
                 project_id: project_id.clone(),
                 session_id: "".to_string(), // 启动失败时没有 session_id
                 error: Some(format!("启动ACP Agent服务失败: {}", e)),
-                request_id: chat_prompt.request_id.clone(),
-                service_type: chat_prompt.service_type.clone(),
+                request_id: Some(prompt_message.request_id.clone()),
+                service_type: prompt_message.service_type.clone(),
             };
 
             if let Err(send_err) = request.chat_prompt_tx.send(error_response) {
@@ -164,8 +163,8 @@ async fn create_new_agent_service(
 /// 在 LocalSet 中运行的实际 Agent 请求
 #[derive(Debug)]
 pub struct LocalSetAgentRequest {
-    /// 用户端发送的 prompt 请求
-    chat_prompt: ChatPrompt,
+    /// Agent 抽象层的 prompt 消息（从 ChatPrompt 转换而来）
+    prompt_message: agent_abstraction::PromptMessage,
     /// 发送 agent 通知执行prompt 完毕的回执消息
     chat_prompt_tx: oneshot::Sender<ChatPromptResponse>,
     /// 模型提供商配置
@@ -174,14 +173,14 @@ pub struct LocalSetAgentRequest {
 
 impl LocalSetAgentRequest {
     pub fn new(
-        chat_prompt: ChatPrompt,
+        prompt_message: agent_abstraction::PromptMessage,
         model_provider: Option<ModelProviderConfig>,
     ) -> (Self, oneshot::Receiver<ChatPromptResponse>) {
         let (chat_prompt_tx, chat_prompt_rx) = oneshot::channel();
 
         (
             Self {
-                chat_prompt,
+                prompt_message,
                 chat_prompt_tx,
                 model_provider,
             },
@@ -197,14 +196,13 @@ pub async fn agent_worker(
     mut request_rx: mpsc::UnboundedReceiver<LocalSetAgentRequest>,
 ) -> Result<()> {
     info!("🚀 agent_worker 启动，开始监听请求...");
-    while let Some(request) = request_rx.recv().await {
+    while let Some(mut request) = request_rx.recv().await {
         info!(
             "📨 agent_worker 接收到新请求，project_id: {}",
-            request.chat_prompt.project_id
+            request.prompt_message.project_id
         );
-        let mut chat_prompt = request.chat_prompt.clone();
 
-        let original_path = chat_prompt.project_path;
+        let original_path = request.prompt_message.project_path.clone();
         // 规范化路径：
         // - 如果是相对路径，先与当前目录拼接
         // - 去除路径中的 "./"（CurDir 组件），不依赖文件系统
@@ -218,13 +216,13 @@ pub async fn agent_worker(
             .filter(|c| !matches!(c, Component::CurDir))
             .collect();
         // 将规范化后的路径写回，确保后续使用统一
-        chat_prompt.project_path = project_path.clone();
+        request.prompt_message.project_path = project_path.clone();
 
         // 创建项目目录
         if !project_path.exists() {
             info!(
                 "Project path does not exist,project_id={}",
-                request.chat_prompt.project_id
+                request.prompt_message.project_id
             );
             //自动创建目录
             if let Err(e) = tokio::fs::create_dir_all(&project_path).await {
@@ -235,11 +233,11 @@ pub async fn agent_worker(
 
         info!(
             "🔍 处理完路径，准备查找Agent，project_id: {}",
-            request.chat_prompt.project_id
+            request.prompt_message.project_id
         );
 
         // 检查 project_id 有对应的agent 服务,没有则创建
-        let project_id = request.chat_prompt.project_id.clone();
+        let project_id = request.prompt_message.project_id.clone();
 
         // 先检查是否存在Agent并提取必要信息，然后立即释放锁
         let agent_exists = PROJECT_AND_AGENT_INFO_MAP.contains_key(&project_id);
@@ -281,7 +279,7 @@ pub async fn agent_worker(
             );
 
             // 创建新的Agent服务
-            create_new_agent_service(request, chat_prompt, project_id).await;
+            create_new_agent_service(request).await;
         } else if agent_exists {
             // 模型配置未变化，复用现有Agent服务
             info!("复用现有Agent服务，项目ID: {}", project_id);
@@ -296,11 +294,11 @@ pub async fn agent_worker(
 
                 // 注意：不在这里更新 request_id，因为 get_mut 会需要写锁，
                 // 可能与正在执行的 Prompt 处理任务产生锁冲突。
-                // 直接将 request_id 包含在 ChatPrompt 中，在构建 PromptRequest 时使用。
-                debug!("使用请求中的request_id: {:?}", chat_prompt.request_id);
+                // 直接将 request_id 包含在 PromptMessage 中，在构建 PromptRequest 时使用。
+                debug!("使用请求中的request_id: {}", request.prompt_message.request_id);
 
                 debug!("开始构建Prompt请求，项目ID: {}", project_id);
-                match build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await {
+                match build_prompt_to_acp_agent(request.prompt_message.clone(), session_id.clone()).await {
                     Ok(prompt_request) => {
                         info!(
                             "Prompt请求构建成功，准备发送到channel，项目ID: {}",
@@ -323,8 +321,8 @@ pub async fn agent_worker(
                     project_id: project_id.clone(),
                     session_id: session_id.to_string(),
                     error: None,
-                    request_id: request.chat_prompt.request_id.clone(),
-                    service_type: request.chat_prompt.service_type.clone(),
+                    request_id: Some(request.prompt_message.request_id.clone()),
+                    service_type: request.prompt_message.service_type.clone(),
                 }) {
                     error!("发送回执消息失败: {:?}", e);
                 } else {
@@ -333,7 +331,7 @@ pub async fn agent_worker(
             }
         } else {
             // 创建新的Agent服务
-            create_new_agent_service(request, chat_prompt, project_id).await;
+            create_new_agent_service(request).await;
         }
     }
     debug!("Agent worker finished");
@@ -341,16 +339,21 @@ pub async fn agent_worker(
 }
 
 /// 构建 Prompt 请求
+///
+/// 使用 ACP 协议分离模式：
+/// - 系统提示词已在 NewSessionRequest._meta.systemPrompt 中传递（只传递一次）
+/// - 这里只构建纯用户提示词和附件，不再包含系统提示词
 pub async fn build_prompt_to_acp_agent(
-    prompt: ChatPrompt,
+    prompt: agent_abstraction::PromptMessage,
     session_id: SessionId,
 ) -> Result<PromptRequest> {
-    // 构建最终提示词（包含系统提示词、用户输入和数据源信息）
+    // 构建纯用户提示词（不包含系统提示词）
+    // 系统提示词已通过 NewSessionRequest._meta.systemPrompt.append 传递
     let final_prompt = if prompt.data_source_attachments.is_empty() {
-        PromptBuilder::new().build(&prompt.prompt)
+        PromptBuilder::new().build_user_prompt(&prompt.content)
     } else {
         PromptBuilder::new()
-            .build_with_data_sources(&prompt.prompt, &prompt.data_source_attachments)
+            .build_user_prompt_with_data_sources(&prompt.content, &prompt.data_source_attachments)
     };
 
     // 创建文本内容块
@@ -371,21 +374,16 @@ pub async fn build_prompt_to_acp_agent(
     }
 
     // 将 request_id 放入 meta 字段，以便 channel_utils 可以提取并更新到 MAP
-    let prompt_request = if let Some(request_id) = prompt.request_id {
-        debug!(
-            "🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta",
-            request_id
-        );
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "request_id".to_string(),
-            serde_json::Value::String(request_id),
-        );
-        PromptRequest::new(session_id, content_blocks).meta(meta)
-    } else {
-        debug!("⚠️ [build_prompt] prompt.request_id 为空，不设置 meta");
-        PromptRequest::new(session_id, content_blocks)
-    };
+    debug!(
+        "🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta",
+        prompt.request_id
+    );
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "request_id".to_string(),
+        serde_json::Value::String(prompt.request_id),
+    );
+    let prompt_request = PromptRequest::new(session_id, content_blocks).meta(meta);
 
     Ok(prompt_request)
 }
