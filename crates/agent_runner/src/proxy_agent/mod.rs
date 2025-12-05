@@ -1,24 +1,19 @@
 mod acp_agent;
-pub mod agent_service;
-pub mod agent_stop_handle;
-mod channel_utils;
-mod claude_code_agent;
 pub mod cleanup_task;
 
-use crate::CancelNotificationRequest;
+use crate::CancelNotificationRequestWrapper;
 use crate::{
     model::{AgentSessionUpdate, SessionNotify},
     service::push_session_update,
 };
 pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
+use agent_abstraction::compat::AgentStopHandleArc;
 use agent_client_protocol::{Client, PermissionOptionKind, PromptRequest, SessionId};
 use dashmap::DashMap;
 use std::sync::LazyLock;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
-
-use crate::proxy_agent::agent_stop_handle::AgentStopHandleArc;
 
 /// 会话级别的 request_id 上下文映射（project_id -> request_id）
 /// 用于在 session_notification 回调中获取当前请求的 request_id
@@ -32,13 +27,14 @@ pub struct AcpConnectionInfo {
     pub session_id: SessionId,
     /// 用于发送 Prompt 的通道
     pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    /// 用于发送取消通知的通道
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequest>,
+    /// 用于发送取消通知的通道（使用新类型）
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
     /// Agent停止句柄（将被包装为守卫并放入 ProjectAndAgentInfo）
     pub stop_handle: Option<AgentStopHandleArc>,
 }
 
-/// ACP 客户端实现[derive(Clone)]
+/// ACP 客户端实现
+#[derive(Clone, Default)]
 pub struct AcpAgentClient;
 
 #[async_trait::async_trait(?Send)]

@@ -12,6 +12,7 @@ pub mod manager;
 pub mod mcp;
 pub mod process;
 pub mod registry;
+pub mod session;
 pub mod traits;
 
 // Re-export types from submodules
@@ -19,11 +20,11 @@ pub use acp::{
     AcpAgentClient, AcpConnectionBuilder, AgentConnection, AgentStatus, CancelResult,
     ConnectionStats, EstablishedConnection,
 };
-pub use compat::ClaudeCodeAcpAgent;
 pub use compat::{
-    AgentLaunchConfig, ClaudeCodeLauncher, LauncherConnectionInfo, convert_context_servers,
-    get_default_agent_config, load_agent_config, spawn_cancel_handler_for_agent,
-    spawn_prompt_handler_for_agent,
+    AgentLaunchConfig, AgentLifecycleGuard, AgentStopGuard, AgentStopHandleArc,
+    ClaudeCodeLauncher, LauncherConnectionInfo, LauncherConnectionInfoComplete,
+    convert_context_servers, get_default_agent_config, load_agent_config,
+    spawn_cancel_handler_for_agent, spawn_prompt_handler_for_agent,
 };
 pub use error::AgentAbstractionError;
 pub use factory::{AgentFactory, AgentInstance, AgentInstanceStatus, ValidationError, ValidationResult};
@@ -39,5 +40,9 @@ pub use mcp::{
 };
 pub use process::AgentProcess;
 pub use registry::{AgentRegistry, AgentSpec};
+pub use session::{
+    AcpAgentWorker, AcpSessionManager, AgentWorker, SessionHandles, SessionInfo, WorkerRequest,
+    WorkerResponse,
+};
 pub use traits::agent::{Agent, AgentStartConfig, ProcessLaunchInfo, PromptMessage};
 pub use traits::session_notifier::{NoOpSessionNotifier, SessionNotifier};

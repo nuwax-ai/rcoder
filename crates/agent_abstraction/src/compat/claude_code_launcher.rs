@@ -9,8 +9,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use agent_client_protocol::{
-    Agent, Client, ClientSideConnection, Implementation, InitializeRequest, LoadSessionRequest, McpServer,
-    McpServerStdio, NewSessionRequest, PromptRequest, SessionId,
+    Agent, Client, ClientSideConnection, Implementation, InitializeRequest, LoadSessionRequest,
+    McpServer, McpServerStdio, NewSessionRequest, PromptRequest, SessionId,
 };
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
@@ -22,8 +22,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::acp::CancelNotificationRequestWrapper;
-use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::AgentStartConfig;
+use crate::traits::session_notifier::SessionNotifier;
+
+// 导入生命周期管理
+use super::agent_lifecycle::AgentLifecycleGuard;
 
 /// 使用默认版本
 const VERSION: agent_client_protocol::ProtocolVersion =
@@ -57,6 +60,22 @@ pub struct LauncherConnectionInfo {
     pub child: tokio::process::Child,
     /// stderr 任务句柄
     pub stderr_task: tokio::task::JoinHandle<()>,
+}
+
+/// Agent 连接信息（完整版，包含生命周期守卫）
+///
+/// 这是推荐使用的返回类型，包含了封装好的 AgentLifecycleGuard，
+/// 提供 RAII 自动资源清理机制。
+#[derive(Debug)]
+pub struct LauncherConnectionInfoComplete {
+    /// 会话 ID
+    pub session_id: SessionId,
+    /// 发送 Prompt 消息的通道
+    pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
+    /// 发送取消请求的通道
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
+    /// 生命周期守卫（自动清理资源）
+    pub lifecycle_guard: Arc<AgentLifecycleGuard>,
 }
 
 /// 从配置文件加载 Agent 配置
@@ -134,7 +153,10 @@ pub fn get_default_agent_config(
             env.insert("ANTHROPIC_BASE_URL".to_string(), provider.base_url.clone());
         }
         if !provider.default_model.is_empty() {
-            env.insert("ANTHROPIC_MODEL".to_string(), provider.default_model.clone());
+            env.insert(
+                "ANTHROPIC_MODEL".to_string(),
+                provider.default_model.clone(),
+            );
         }
         env.insert("RUST_LOG".to_string(), "info".to_string());
         env
@@ -213,6 +235,9 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
     /// - `model_provider`: 模型提供商配置
     /// - `start_config`: Agent 启动配置（包含系统提示词等）
     /// - `client`: ACP 客户端实现
+    ///
+    /// # 返回值
+    /// 返回 LauncherConnectionInfoComplete，包含会话信息和生命周期守卫
     pub async fn launch(
         &self,
         project_id: String,
@@ -221,7 +246,7 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
-    ) -> Result<LauncherConnectionInfo> {
+    ) -> Result<LauncherConnectionInfoComplete> {
         // 从配置加载 Agent 参数
         let agent_config = load_agent_config(model_provider.as_ref()).await?;
         let command_path = &agent_config.command;
@@ -243,7 +268,10 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
         let cancel_token_for_closure = cancel_token.clone();
         let notifier = self.notifier.clone();
 
-        info!("项目工作目录: {}", &project_path_for_closure.to_string_lossy());
+        info!(
+            "项目工作目录: {}",
+            &project_path_for_closure.to_string_lossy()
+        );
 
         // 转换配置中的 Context 服务器为 ACP 协议格式
         let config_mcp_servers = convert_context_servers(&agent_config.context_servers);
@@ -299,9 +327,10 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
         let incoming = stdout.compat();
 
         // 创建连接（使用传入的 client）
-        let (client_conn, handle_io) = ClientSideConnection::new(client, outgoing, incoming, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let (client_conn, handle_io) =
+            ClientSideConnection::new(client, outgoing, incoming, |fut| {
+                tokio::task::spawn_local(fut);
+            });
 
         // 启动 I/O 处理任务
         tokio::task::spawn_local(handle_io);
@@ -475,13 +504,20 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
             }
         });
 
-        Ok(LauncherConnectionInfo {
+        // 创建生命周期守卫
+        let lifecycle_guard = AgentLifecycleGuard::new_claude(
+            project_id.clone(),
+            session_id.clone(),
+            child,
+            stderr_task,
+            cancel_token.clone(),
+        );
+
+        Ok(LauncherConnectionInfoComplete {
             session_id,
             prompt_tx,
             cancel_tx,
-            cancel_token,
-            child,
-            stderr_task,
+            lifecycle_guard: Arc::new(lifecycle_guard),
         })
     }
 }
