@@ -683,6 +683,7 @@ impl AgentCleaner {
                 if let Some(ref session_id) = session_id_to_remove {
                     info!("🗑️ [cleanup_agent_raii] 尝试原子性清理sessions映射: session_id={}, project_id={}", session_id, project_id);
 
+                    // 清理 state.sessions
                     match self.state.sessions.entry(session_id.clone()) {
                         dashmap::mapref::entry::Entry::Occupied(entry) => {
                             let removed_session_info = entry.get().clone();
@@ -697,6 +698,14 @@ impl AgentCleaner {
                             info!("📭 [cleanup_agent_raii] sessions映射不存在（可能已被清理）: session_id={}", session_id);
                         }
                     }
+
+                    // 阶段 2.4: 清理 session_to_container_id 映射
+                    if self.state.session_to_container_id.remove(session_id).is_some() {
+                        info!("✅ [cleanup_agent_raii] 已清理 session_to_container_id 映射: session_id={}", session_id);
+                    } else {
+                        warn!("⚠️ [cleanup_agent_raii] session_to_container_id 映射中未找到: session_id={}", session_id);
+                    }
+
                 } else {
                     info!("📭 [cleanup_agent_raii] 无session_id，跳过sessions清理: {}", project_id);
                 }
@@ -733,6 +742,7 @@ impl AgentCleaner {
     /// 销毁Docker容器
     ///
     /// 使用统一的运行时清理策略
+    /// 🚀 重构：使用 DockerManager 的高级 API，移除底层查找和解析逻辑
     async fn destroy_docker_container(&self, project_id: &str) -> Result<()> {
         info!("🔥 [cleanup] 开始销毁Docker容器: project_id={}", project_id);
 
@@ -741,34 +751,48 @@ impl AgentCleaner {
             .await
             .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
 
-        // 1. 先通过 project_id 查找容器
-        let mut container_info = docker_manager.get_container_info(project_id);
+        // 获取 ServiceType，如果未找到则默认为 RCoder
+        let service_type = if let Some(info) = self.state.project_and_agent_map.get(project_id) {
+            info.service_type()
+                .unwrap_or(shared_types::ServiceType::RCoder)
+        } else {
+            shared_types::ServiceType::RCoder
+        };
 
-        // 2. 如果没找到，尝试通过容器名称查找
-        if container_info.is_none() {
-            let expected_container_name = format!("rcoder-agent-{}", project_id);
-            container_info = docker_manager
-                .find_container_by_identifier(&expected_container_name)
-                .await;
-        }
-
-        if let Some(container_info) = container_info {
+        // 1. 查找容器 (使用新 API)
+        if let Some(container_info) = docker_manager
+            .find_agent_container(project_id, &service_type)
+            .await
+        {
             info!(
                 "🎯 [cleanup] 找到容器: project_id={}, container_id={}",
                 project_id, container_info.container_id
             );
 
-            // 释放端口（如果存在）
-            if let Some(port_binding) = container_info.port_bindings.values().next()
-                && let Ok(port) = port_binding.parse::<u16>()
+            // 2. 获取连接信息 (使用新 API)
+            match docker_manager
+                .get_container_connection_info(&container_info)
+                .await
             {
-                crate::proxy_agent::port_manager::GLOBAL_PORT_MANAGER
-                    .release_port(port)
-                    .await;
-                info!("🧼 [cleanup] 释放端口: port={}", port);
+                Ok(ip_addr) => {
+                    // 3. 清理 gRPC 连接池
+                    if let Some(ip) = ip_addr {
+                        let grpc_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
+                        info!("🔌 [gRPC Cleanup] 准备从连接池移除: {}", grpc_addr);
+                        self.state.grpc_pool.remove(&grpc_addr);
+                    } else {
+                        warn!(
+                            "⚠️ [gRPC Cleanup] 无法获取容器 IP，无法从连接池中清理: {}",
+                            project_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("⚠️ [cleanup] 获取容器连接信息失败: {} - {}", project_id, e);
+                }
             }
 
-            // 使用统一的运行时清理接口
+            // 4. 执行物理销毁 (使用统一接口)
             docker_manager::container_stop::runtime_cleanup_container(
                 &docker_manager,
                 &container_info.container_id,

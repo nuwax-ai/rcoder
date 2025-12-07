@@ -197,6 +197,24 @@ impl AgentService for AgentServiceImpl {
                                             }
                                         }
                                     }
+                                    // ✅ 新增：定期发送心跳，防止连接被中间网络设备断开
+                                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                                        use shared_types::grpc::progress_event::Event;
+                                        use shared_types::grpc::LogEvent;
+
+                                        let heartbeat = ProgressEvent {
+                                            event: Some(Event::Log(LogEvent {
+                                                level: "debug".to_string(),
+                                                message: "heartbeat".to_string(),
+                                            })),
+                                            timestamp: chrono::Utc::now().timestamp_millis(),
+                                        };
+
+                                        if tx.send(Ok(heartbeat)).await.is_err() {
+                                            debug!("📡 [gRPC] 发送心跳失败，客户端已断开连接");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }

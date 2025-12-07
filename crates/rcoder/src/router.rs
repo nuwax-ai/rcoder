@@ -31,6 +31,8 @@ pub struct AppState {
     pub sessions: DashMap<String, Arc<ProjectAndContainerInfo>>,
     /// 活跃的项目和容器映射, project_id -> ProjectAndContainerInfo
     pub project_and_agent_map: DashMap<String, Arc<ProjectAndContainerInfo>>,
+    /// 会话到容器ID的映射, session_id -> container_id
+    pub session_to_container_id: DashMap<String, String>,
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<pingora_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
@@ -46,6 +48,7 @@ impl AppState {
             config,
             sessions: DashMap::new(),
             project_and_agent_map: DashMap::new(),
+            session_to_container_id: DashMap::new(),
             pingora_service: pingora,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
         }

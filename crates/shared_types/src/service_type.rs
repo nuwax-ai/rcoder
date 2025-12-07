@@ -51,6 +51,14 @@ impl ServiceType {
         }
     }
 
+    /// 获取容器名称前缀
+    pub fn container_prefix(&self) -> &str {
+        match self {
+            ServiceType::RCoder => "rcoder-agent",
+            ServiceType::AgentRunner => "agent-runner",
+        }
+    }
+
     /// 检查服务是否在给定的多镜像配置中启用
     pub fn is_enabled(&self, config: &crate::MultiImageConfig) -> bool {
         let service_key = self.as_str();

@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::ServiceType;
 use super::{AgentStatus, ModelProviderConfig};
 
 /// 容器基本信息
@@ -78,6 +79,8 @@ pub struct ProjectExtendedState {
     pub request_id: Option<String>,
     /// Agent 服务状态
     pub status: Option<AgentStatus>,
+    /// 服务类型
+    pub service_type: Option<ServiceType>,
 }
 
 impl ProjectExtendedState {
@@ -87,6 +90,7 @@ impl ProjectExtendedState {
             container: None,
             request_id: None,
             status: None,
+            service_type: None,
         }
     }
 
@@ -96,10 +100,14 @@ impl ProjectExtendedState {
         container: Option<ContainerBasicInfo>,
         model_provider: Option<ModelProviderConfig>,
         request_id: Option<String>,
+        service_type: Option<ServiceType>,
     ) {
         self.container = container;
         self.model_provider = model_provider;
         self.request_id = request_id;
+        if let Some(st) = service_type {
+            self.service_type = Some(st);
+        }
     }
 }
 
@@ -194,9 +202,10 @@ impl ProjectAndContainerInfo {
         container: Option<ContainerBasicInfo>,
         model_provider: Option<ModelProviderConfig>,
         request_id: Option<String>,
+        service_type: Option<ServiceType>,
     ) {
         self.state.update_extended(|extended| {
-            extended.update_from_request(container, model_provider, request_id);
+            extended.update_from_request(container, model_provider, request_id, service_type);
         });
     }
 }
@@ -235,6 +244,10 @@ impl ProjectAndContainerInfo {
         self.state.extended.status.as_ref()
     }
 
+    pub fn service_type(&self) -> Option<ServiceType> {
+        self.state.extended.service_type.clone()
+    }
+
     // ========== 可变访问器（会触发写时复制） ==========
 
     pub fn set_session_id(&mut self, session_id: Option<String>) {
@@ -264,6 +277,14 @@ impl ProjectAndContainerInfo {
     pub fn set_status(&mut self, status: Option<AgentStatus>) {
         self.state.update_extended(|extended| {
             extended.status = status;
+        });
+    }
+
+    pub fn set_service_type(&mut self, service_type: Option<ServiceType>) {
+        self.state.update_extended(|extended| {
+            if let Some(st) = service_type {
+                extended.service_type = Some(st);
+            }
         });
     }
 }

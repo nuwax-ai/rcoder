@@ -11,9 +11,12 @@ use tracing::{debug, error, info, warn};
 ///
 /// 通过 gRPC `SubscribeProgress` 方法订阅 agent_runner 的进度事件，
 /// 并将事件转换为 SSE 格式返回
+/// 
+/// 🚀 优化：使用连接池 + 智能重试机制
 pub async fn create_grpc_sse_stream(
     grpc_addr: String,
     session_id: String,
+    pool: std::sync::Arc<crate::grpc::GrpcChannelPool>,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
     let (tx, rx) = tokio::sync::mpsc::channel(100);
@@ -26,94 +29,91 @@ pub async fn create_grpc_sse_stream(
             grpc_addr, session_id_clone
         );
 
-        // 建立 gRPC 连接
-        let endpoint = format!("http://{}", grpc_addr);
-        match Channel::from_shared(endpoint.clone()) {
-            Ok(channel_builder) => {
-                match channel_builder
-                    .connect_timeout(std::time::Duration::from_secs(
-                        shared_types::GRPC_CONNECT_TIMEOUT_SECS,
-                    ))
-                    .timeout(std::time::Duration::from_secs(
-                        shared_types::GRPC_REQUEST_TIMEOUT_SECS,
-                    ))
-                    .connect()
-                    .await
-                {
-                    Ok(channel) => {
-                        let mut client = AgentServiceClient::new(channel);
+        let max_retries = 2;
+        let mut last_error_msg = String::new();
 
-                        // 发送 SubscribeProgress 请求
-                        let request = tonic::Request::new(ProgressRequest {
-                            session_id: session_id_clone.clone(),
-                        });
+        for attempt in 1..=max_retries {
+            // 1. 从连接池获取客户端
+            let mut client = match pool.get_client(&grpc_addr).await {
+                Ok(client) => client,
+                Err(e) => {
+                    warn!(
+                        "⚠️ [gRPC_SSE] 获取客户端失败 (尝试 {}/{}): {}, 清理连接池并重试...",
+                        attempt, max_retries, e
+                    );
+                    pool.remove(&grpc_addr);
+                    last_error_msg = format!("获取客户端失败: {}", e);
+                    continue;
+                }
+            };
 
-                        match client.subscribe_progress(request).await {
-                            Ok(response) => {
-                                info!(
-                                    "✅ [gRPC_SSE] 成功建立 SubscribeProgress 流: session_id={}",
-                                    session_id_clone
-                                );
+            // 2. 发送 SubscribeProgress 请求
+            let request = tonic::Request::new(ProgressRequest {
+                session_id: session_id_clone.clone(),
+            });
 
-                                let mut stream = response.into_inner();
+            match client.subscribe_progress(request).await {
+                Ok(response) => {
+                    info!(
+                        "✅ [gRPC_SSE] 成功建立 SubscribeProgress 流: session_id={}",
+                        session_id_clone
+                    );
 
-                                // 持续接收 gRPC 流中的事件
-                                while let Ok(Some(progress_event)) = stream.message().await {
-                                    debug!(
-                                        "📨 [gRPC_SSE] 收到进度事件: session_id={}, timestamp={}",
-                                        session_id_clone, progress_event.timestamp
-                                    );
+                    let mut stream = response.into_inner();
 
-                                    // 将 ProgressEvent 转换为 SSE Event
-                                    let sse_event = progress_event_to_sse(&progress_event);
-
-                                    if tx.send(Ok(sse_event)).await.is_err() {
-                                        warn!(
-                                            "⚠️ [gRPC_SSE] 客户端已断开连接: session_id={}",
-                                            session_id_clone
-                                        );
-                                        break;
-                                    }
-                                }
-
-                                info!("🔚 [gRPC_SSE] gRPC 流结束: session_id={}", session_id_clone);
-                            }
-                            Err(e) => {
-                                error!(
-                                    "❌ [gRPC_SSE] SubscribeProgress 调用失败: session_id={}, error={}",
-                                    session_id_clone, e
-                                );
-
-                                // 发送错误事件
-                                let error_event = axum::response::sse::Event::default()
-                                    .event("error")
-                                    .data(format!("gRPC 流订阅失败: {}", e));
-                                let _ = tx.send(Ok(error_event)).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "❌ [gRPC_SSE] 无法连接到 gRPC 服务: addr={}, error={}",
-                            endpoint, e
+                    // 持续接收 gRPC 流中的事件
+                    while let Ok(Some(progress_event)) = stream.message().await {
+                        debug!(
+                            "📨 [gRPC_SSE] 收到进度事件: session_id={}, timestamp={}",
+                            session_id_clone, progress_event.timestamp
                         );
 
-                        let error_event = axum::response::sse::Event::default()
-                            .event("error")
-                            .data(format!("gRPC 连接失败: {}", e));
-                        let _ = tx.send(Ok(error_event)).await;
+                        // 将 ProgressEvent 转换为 SSE Event
+                        let sse_event = progress_event_to_sse(&progress_event);
+
+                        if tx.send(Ok(sse_event)).await.is_err() {
+                            warn!(
+                                "⚠️ [gRPC_SSE] 客户端已断开连接: session_id={}",
+                                session_id_clone
+                            );
+                            // 客户端断开，直接退出任务
+                            return;
+                        }
                     }
+
+                    info!("🔚 [gRPC_SSE] gRPC 流结束: session_id={}", session_id_clone);
+                    // 正常结束，直接返回
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [gRPC_SSE] SubscribeProgress 调用失败 (尝试 {}/{}): {}",
+                        attempt, max_retries, e
+                    );
+                    
+                    // 如果不是最后一次尝试，清理连接池并重试
+                    if attempt < max_retries {
+                        info!("🔌 [gRPC_SSE] 可能是连接已断开，从连接池移除 {} 并重试...", grpc_addr);
+                        pool.remove(&grpc_addr);
+                        last_error_msg = format!("流订阅失败: {}", e);
+                        continue;
+                    }
+                    
+                    last_error_msg = format!("流订阅最终失败: {}", e);
                 }
             }
-            Err(e) => {
-                error!("❌ [gRPC_SSE] 无效的 gRPC 地址: {}, error={}", grpc_addr, e);
-
-                let error_event = axum::response::sse::Event::default()
-                    .event("error")
-                    .data(format!("无效的 gRPC 地址: {}", e));
-                let _ = tx.send(Ok(error_event)).await;
-            }
         }
+
+        // 如果循环结束还没有 return，说明所有重试都失败了
+        error!(
+            "❌ [gRPC_SSE] 重试 {} 次后最终失败: session_id={}, error={}",
+            max_retries, session_id_clone, last_error_msg
+        );
+
+        let error_event = axum::response::sse::Event::default()
+            .event("error")
+            .data(format!("gRPC 连接失败: {}", last_error_msg));
+        let _ = tx.send(Ok(error_event)).await;
     });
 
     tokio_stream::wrappers::ReceiverStream::new(rx)
@@ -235,35 +235,13 @@ pub async fn get_container_grpc_addr(project_id: &str, grpc_port: u16) -> anyhow
         .await
         .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
 
-    // 获取容器信息
-    let container_info = docker_manager
-        .get_container_info(project_id)
+    // 使用高级 API 获取容器信息（包含 IP）
+    let agent_info = docker_manager
+        .get_agent_info(project_id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("未找到容器信息: project_id={}", project_id))?;
 
-    // 获取动态网络名称
-    let container_manager = crate::service::container_manager::ContainerManager;
-    let network_name = container_manager
-        .get_dynamic_network_name(&docker_manager)
-        .await;
-
-    // 获取容器 IP
-    let container_ip = crate::proxy_agent::docker_container_agent::get_container_ip(
-        &docker_manager,
-        &container_info.container_id,
-        &network_name,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("获取容器 IP 失败: {}", e))?;
-
-    // 移除 http:// 前缀（如果有）并提取主机名
-    let host = container_ip
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(':')
-        .next()
-        .unwrap_or(&container_ip);
-
-    let grpc_addr = format!("{}:{}", host, grpc_port);
+    let grpc_addr = format!("{}:{}", agent_info.container_ip, grpc_port);
 
     info!("✅ [CONTAINER] 获取容器 gRPC 地址: {}", grpc_addr);
     Ok(grpc_addr)
