@@ -4,8 +4,7 @@
 
 use crate::grpc::GrpcChannelPool;
 use shared_types::grpc::{
-    CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest,
-    ChatResponse as GrpcChatResponse,
+    CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest, ChatResponse as GrpcChatResponse,
 };
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -21,6 +20,7 @@ pub async fn grpc_chat_with_pool(
     data_source_attachments: Vec<String>,
     model_config: Option<shared_types::ModelProviderConfig>,
     request_id: Option<String>,
+    request_timeout: Option<std::time::Duration>, // ✅ 新增：可选的请求级别超时
 ) -> anyhow::Result<GrpcChatResponse> {
     info!(
         "🚀 [gRPC_CHAT] 发送 Chat 请求 (连接池): addr={}, project_id={}",
@@ -46,14 +46,20 @@ pub async fn grpc_chat_with_pool(
 
     debug!("📤 [gRPC_CHAT] 发送请求: {:?}", grpc_request);
 
+    // 构建 tonic Request 并设置请求级别超时
+    let mut request = tonic::Request::new(grpc_request);
+
+    // ✅ 使用 Tonic 原生 API 设置请求超时
+    if let Some(timeout) = request_timeout {
+        request.set_timeout(timeout);
+        debug!("⏱️ [gRPC_CHAT] 设置请求超时: {:?}", timeout);
+    }
+
     // 发送请求
-    let response = client
-        .chat(tonic::Request::new(grpc_request))
-        .await
-        .map_err(|e| {
-            error!("❌ [gRPC_CHAT] Chat RPC 调用失败: {}", e);
-            anyhow::anyhow!("gRPC Chat 调用失败: {}", e)
-        })?;
+    let response = client.chat(request).await.map_err(|e| {
+        error!("❌ [gRPC_CHAT] Chat RPC 调用失败: {}", e);
+        anyhow::anyhow!("gRPC Chat 调用失败: {}", e)
+    })?;
 
     let chat_response = response.into_inner();
 
@@ -88,6 +94,7 @@ pub async fn grpc_chat(
         data_source_attachments,
         model_config,
         request_id,
+        None, // ✅ 默认无请求超时，使用连接级别超时
     )
     .await
 }

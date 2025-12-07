@@ -45,6 +45,13 @@ impl GrpcChannelPool {
             .timeout(std::time::Duration::from_secs(
                 shared_types::GRPC_REQUEST_TIMEOUT_SECS,
             ))
+            // ✅ 新增：HTTP/2 Keepalive 配置（基于 Tonic 原生 API）
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .keep_alive_timeout(std::time::Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            // ✅ 新增：TCP Keepalive 配置
+            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+            .tcp_nodelay(true)
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;

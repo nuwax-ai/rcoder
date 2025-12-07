@@ -98,17 +98,69 @@ pub async fn agent_session_notification(
     Path(params): Path<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    let session_id = &params.session_id;
     info!(
         "🔍 [SSE_PROXY] 收到SSE连接请求: session_id={:?}",
-        params.session_id
+        session_id
     );
 
-    // 检查容器存在性并获取代理目标
-    let session_id = params.session_id.clone();
+    // 阶段 2.3: 容器存在性预检
+    let container_id = match state.session_to_container_id.get(session_id) {
+        Some(cid) => cid.value().clone(),
+        None => {
+            warn!("❌ [SSE_PROXY] 在 session_to_container_id 映射中未找到会话: session_id={}", session_id);
+            return Err(create_error_response(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                "会话不存在或已过期。请重新发起请求。",
+            ));
+        }
+    };
+
+    // 检查容器是否仍在运行
+    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+        Ok(dm) => dm,
+        Err(e) => {
+            error!("❌ [SSE_PROXY] 获取全局 DockerManager 失败: {}", e);
+            return Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "无法访问 Docker 服务，请联系管理员。",
+            ));
+        }
+    };
+
+    match docker_manager.is_container_running(&container_id).await {
+        Ok(true) => {
+            info!("✅ [SSE_PROXY] 容器检查通过: container_id={}, 状态=运行中", container_id);
+            // 容器正在运行，继续执行
+        }
+        Ok(false) => {
+            error!("❌ [SSE_PROXY] 容器已停止: container_id={}", container_id);
+            // 清理陈旧的会话条目
+            state.session_to_container_id.remove(session_id);
+            return Err(create_error_response(
+                StatusCode::NOT_FOUND,
+                "SESSION_EXPIRED",
+                "会话因不活动已被清理。请重新发起请求。",
+            ));
+        }
+        Err(e) => {
+            error!("❌ [SSE_PROXY] 检查容器状态失败: container_id={}, error={}", container_id, e);
+            return Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "检查会话状态时出错，请稍后重试。",
+            ));
+        }
+    };
+
+    // 容器验证通过后，继续后续逻辑
+    // 注意：这里的 'find_container_by_session_id' 逻辑现在是多余的，我们直接使用已验证的信息
     match find_container_by_session_id(&state, &session_id) {
         Some((project_id, _agent_info)) => {
             info!(
-                "✅ [SSE_PROXY] 找到容器: session_id={}, project_id={}",
+                "✅ [SSE_PROXY] 找到项目: session_id={}, project_id={}",
                 session_id, project_id
             );
 
@@ -120,8 +172,12 @@ pub async fn agent_session_notification(
                     info!("🚀 [gRPC_SSE] 建立 gRPC SSE 代理连接: {}", grpc_addr);
 
                     // 创建 gRPC SSE 流
-                    let stream =
-                        crate::grpc::create_grpc_sse_stream(grpc_addr, session_id.clone()).await;
+                    let stream = crate::grpc::create_grpc_sse_stream(
+                        grpc_addr,
+                        session_id.clone(),
+                        state.grpc_pool.clone(),
+                    )
+                    .await;
 
                     Ok(Sse::new(stream).keep_alive(
                         KeepAlive::new()
@@ -144,12 +200,13 @@ pub async fn agent_session_notification(
             }
         }
         None => {
-            error!("❌ [SSE_PROXY] 未找到对应容器: session_id={}", session_id);
+            // 理论上在预检后不应该发生，但作为保障
+            error!("❌ [SSE_PROXY] 状态不一致：预检通过但在 project_and_agent_map 中未找到: session_id={}", session_id);
 
             Err(create_error_response(
-                StatusCode::NOT_FOUND,
-                "CONTAINER_NOT_FOUND",
-                "未找到 session_id 对应的活跃容器",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INCONSISTENT_STATE",
+                "会话状态不一致，请重新发起请求。",
             ))
         }
     }
@@ -320,7 +377,7 @@ async fn get_container_sse_url(
         project_id, session_id
     );
 
-    // 🎯 修复：使用全局DockerManager实例，而不是创建新的实例
+    // 🎯 修复：使用全局DockerManager实例
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
@@ -328,28 +385,14 @@ async fn get_container_sse_url(
             AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
         })?;
 
-    // 获取容器信息
-    let container_info = docker_manager.get_container_info(project_id);
-    if let Some(container_info) = container_info {
-        // 获取动态网络名称
-        let container_manager = crate::service::container_manager::ContainerManager;
-        let network_name = container_manager
-            .get_dynamic_network_name(&docker_manager)
-            .await;
-
-        let server_url = crate::proxy_agent::docker_container_agent::get_container_ip(
-            &docker_manager,
-            &container_info.container_id,
-            &network_name,
-        )
-        .await
-        .map_err(|e| {
-            error!("❌ [CONTAINER] 获取容器 IP 失败: {}", e);
-            AppError::internal_server_error(&format!("获取容器 IP 失败: {}", e))
-        })?;
-
-        // 构建 SSE 端点 URL - 注意：agent_runner 内部路由是 /agent/progress/{session_id}
-        let sse_url = format!("{}/agent/progress/{}", server_url, session_id);
+    // 使用高级 API 获取容器信息
+    if let Some(info) = docker_manager.get_agent_info(project_id).await.map_err(|e| {
+        error!("❌ [CONTAINER] 获取容器信息失败: {}", e);
+        AppError::internal_server_error(&format!("获取容器信息失败: {}", e))
+    })? {
+        // 构建 SSE 端点 URL
+        // info.service_url 格式为 http://ip:8086
+        let sse_url = format!("{}/agent/progress/{}", info.service_url, session_id);
 
         info!("✅ [CONTAINER] 获取容器SSE端点: {}", sse_url);
         Ok(sse_url)

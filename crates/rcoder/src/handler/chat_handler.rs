@@ -174,6 +174,7 @@ pub async fn handle_chat(
                         Some(container_info.clone()),
                         request.model_provider.clone(),
                         request.request_id.clone(),
+                        Some(service_type.clone()),
                     );
                     mutable_info.update_activity(); // 更新活动时间
 
@@ -208,6 +209,7 @@ pub async fn handle_chat(
                     Some(container_info.clone()),
                     request.model_provider.clone(),
                     request.request_id.clone(),
+                    Some(service_type.clone()),
                 );
 
                 let arc_info = Arc::new(new_info);
@@ -225,7 +227,8 @@ pub async fn handle_chat(
 
     // 第三步：转发请求到容器服务（使用全局连接池）
     info!("🚀 [CHAT] 开始转发请求到容器服务");
-    let result = forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
+    let result =
+        forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
     info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
 
     // 响应后状态更新 - 使用新的高效会话更新方法
@@ -238,6 +241,16 @@ pub async fn handle_chat(
 
             // 收集会话信息
             let session_id = chat_response.session_id.clone();
+            let container_id = container_info.container_id.clone();
+
+            // 🔗 阶段 2.2: 填充 session_id -> container_id 的映射
+            info!(
+                "🔗 [SESSION_MAP] 关联 session_id {} 到 container_id {}",
+                session_id, container_id
+            );
+            state
+                .session_to_container_id
+                .insert(session_id.clone(), container_id);
 
             // 使用新的高效更新方法进行原子性状态更新
             info!("🔄 [CHAT] 开始更新项目会话状态: project_id={}", project_id);
@@ -354,43 +367,82 @@ async fn forward_request_to_container_service(
         request.attachments.len()
     );
 
-    // 调用 gRPC Chat（使用全局连接池）
-    match crate::grpc::grpc_chat_with_pool(
-        grpc_pool,
-        &grpc_addr,
-        project_id.clone(),
-        request.session_id.clone(),
-        request.prompt.clone(),
-        request.attachments.clone(),
-        request.data_source_attachments.clone(),
-        request.model_provider.clone(),
-        request.request_id.clone(),
-    )
-    .await
-    {
-        Ok(grpc_response) => {
-            if grpc_response.success {
-                // 转换为内部 ChatResponse
-                let chat_response = crate::grpc::grpc_response_to_chat_response(grpc_response);
-                info!(
-                    "✅ [FORWARD] gRPC 响应成功: project_id={}, session_id={}",
-                    chat_response.project_id, chat_response.session_id
+    // 调用 gRPC Chat（使用全局连接池，带重试和被动驱逐机制）
+    let max_retries = 2;
+    let mut last_error = None;
+
+    for attempt in 1..=max_retries {
+        match crate::grpc::grpc_chat_with_pool(
+            grpc_pool,
+            &grpc_addr,
+            project_id.clone(),
+            request.session_id.clone(),
+            request.prompt.clone(),
+            request.attachments.clone(),
+            request.data_source_attachments.clone(),
+            request.model_provider.clone(),
+            request.request_id.clone(),
+            None, // ✅ 使用连接级别默认超时，未来可根据需要设置
+        )
+        .await
+        {
+            Ok(grpc_response) => {
+                if grpc_response.success {
+                    // 转换为内部 ChatResponse
+                    let chat_response = crate::grpc::grpc_response_to_chat_response(grpc_response);
+                    info!(
+                        "✅ [FORWARD] gRPC 响应成功: project_id={}, session_id={}",
+                        chat_response.project_id, chat_response.session_id
+                    );
+                    return Ok(crate::HttpResult::success(chat_response));
+                } else {
+                    let error_msg = grpc_response
+                        .error
+                        .unwrap_or_else(|| "未知错误".to_string());
+                    error!("❌ [FORWARD] gRPC 响应错误: {}", error_msg);
+                    return Ok(crate::HttpResult::error("AGENT_ERROR", &error_msg));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️ [FORWARD] gRPC 调用失败 (第 {}/{} 次): {}",
+                    attempt, max_retries, e
                 );
-                Ok(crate::HttpResult::success(chat_response))
-            } else {
-                let error_msg = grpc_response
-                    .error
-                    .unwrap_or_else(|| "未知错误".to_string());
-                error!("❌ [FORWARD] gRPC 响应错误: {}", error_msg);
-                Ok(crate::HttpResult::error("AGENT_ERROR", &error_msg))
+
+                // ✅ 使用错误分类判断是否应该重试
+                let should_retry = crate::grpc::should_retry_error(&e);
+
+                if should_retry && attempt < max_retries {
+                    // 可重试错误：清理连接池并重试
+                    info!(
+                        "🔄 [FORWARD] 检测到可重试错误，从连接池移除 {} 并重试...",
+                        grpc_addr
+                    );
+                    grpc_pool.remove(&grpc_addr);
+                    last_error = Some(e);
+                    continue;
+                } else if !should_retry {
+                    // 不可重试错误：直接返回
+                    error!("❌ [FORWARD] 检测到不可重试错误，停止重试: {}", e);
+                    last_error = Some(e);
+                    break;
+                }
+
+                // 最后一次尝试失败
+                last_error = Some(e);
             }
         }
-        Err(e) => {
-            error!("❌ [FORWARD] gRPC 调用失败: {}", e);
-            // 尝试回退到 HTTP（可选）
-            warn!("⚠️ [FORWARD] gRPC 失败，尝试 HTTP 回退");
-            forward_request_via_http(request, container_info).await
-        }
+    }
+
+    // 如果所有重试都失败
+    if let Some(e) = last_error {
+        error!("❌ [FORWARD] gRPC 最终调用失败: {}", e);
+        // 尝试回退到 HTTP（可选）
+        warn!("⚠️ [FORWARD] gRPC 失败，尝试 HTTP 回退");
+        forward_request_via_http(request, container_info).await
+    } else {
+        // 理论上不会走到这里，除非 max_retries < 1
+        Err(crate::AppError::internal_server_error("未知重试错误"))
     }
 }
 

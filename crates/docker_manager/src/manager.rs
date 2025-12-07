@@ -3,6 +3,7 @@ use super::{
     DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
     RCODER_NETWORK_BASE_NAME,
 };
+use shared_types::ContainerBasicInfo;
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
     LogsOptions, RemoveContainerOptions, RestartContainerOptions, StartContainerOptions,
@@ -469,6 +470,218 @@ impl DockerManager {
             .iter()
             .map(|entry| entry.value().clone())
             .collect()
+    }
+
+    /// 检查指定ID的容器是否正在运行
+    pub async fn is_container_running(&self, container_id: &str) -> DockerResult<bool> {
+        match self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(details) => {
+                if let Some(state) = details.state {
+                    if let Some(status) = state.status {
+                        return Ok(status == bollard::models::ContainerStateStatusEnum::RUNNING);
+                    }
+                }
+                Ok(false)
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // 容器不存在，安全地返回 false
+                Ok(false)
+            }
+            Err(e) => {
+                // 其他类型的错误，作为错误返回
+                Err(DockerError::BollardError(e))
+            }
+        }
+    }
+
+    /// 启动 Agent 容器（全流程封装）
+    ///
+    /// 替代 rcoder 层的复杂编排逻辑
+    pub async fn start_agent_container(
+        &self,
+        project_id: &str,
+        host_workspace_path: &str,
+        service_type: shared_types::ServiceType,
+    ) -> DockerResult<ContainerBasicInfo> {
+        info!(
+            "启动 Agent 容器: project_id={}, type={:?}, host_path={}",
+            project_id, service_type, host_workspace_path
+        );
+
+        // 1. 清理旧容器
+        if let Some(existing) = self.get_container_info(project_id) {
+            warn!("发现旧容器 {}，正在停止...", existing.container_name);
+            self.stop_container(project_id).await?;
+        }
+
+        // 2. 获取配置和镜像
+        let service_config = self.get_service_config(&service_type).await?;
+        let image = self.select_image(&service_type, None).await?;
+
+        // 3. 准备配置
+        use crate::container_builder::ContainerConfigBuilder;
+
+        // 解析容器内工作目录路径
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("project_id".to_string(), project_id.to_string());
+        variables.insert(
+            "service_type".to_string(),
+            service_type.as_str().to_string(),
+        );
+        let container_work_path = service_config.resolve_container_path(&variables);
+
+        // 构建基础配置
+        let mut builder = ContainerConfigBuilder::new(project_id)
+            .image(image)
+            .name_prefix(service_type.container_prefix())
+            .host_path(host_workspace_path.to_string())
+            .container_path(container_work_path)
+            .work_dir(service_config.work_dir.clone())
+            .network_mode(service_config.network_mode.clone())
+            .auto_remove(true);
+
+        // 应用资源限制
+        let limits = service_config.resource_limits;
+        builder = builder.resource_limits(crate::types::ResourceLimits {
+            memory_limit: limits.memory_limit.map(|v| v as i64),
+            cpu_limit: limits.cpu_limit,
+            swap_limit: limits.swap_limit.map(|v| v as i64),
+        });
+
+        // 添加环境变量
+        builder = builder.env("PROJECT_ID", project_id);
+        for (key, value) in &service_config.environment {
+            builder = builder.env(key, value.replace("{project_id}", project_id));
+        }
+
+        // 设置网络
+        let network_name = self.get_main_network_name().await;
+        builder = builder.network_name(network_name);
+
+        // 设置命令
+        builder = builder.command(service_config.command);
+        if let Some(entry) = service_config.entrypoint {
+            builder = builder.entrypoint(entry);
+        }
+
+        // 4. 创建并启动
+        let config = builder
+            .build()
+            .map_err(|e| DockerError::ContainerCreationError(e.to_string()))?;
+        
+        self.create_container(config).await?;
+
+        // 5. 等待就绪并返回信息
+        let info = self
+            .get_agent_info(project_id)
+            .await?
+            .ok_or_else(|| {
+                DockerError::ContainerStartError("容器启动后无法获取信息".to_string())
+            })?;
+
+        // 健康检查
+        crate::health::wait_for_service_ready(&info.service_url)
+            .await
+            .map_err(|e| DockerError::ContainerStartError(format!("健康检查失败: {}", e)))?;
+
+        info!("✅ Agent 容器启动并就绪: {}", info.service_url);
+        Ok(info)
+    }
+
+    /// 智能查找 Agent 容器
+    ///
+    /// 策略：
+    /// 1. 查找内部 Map (project_id)
+    /// 2. 构造默认名称查找 ({prefix}-{project_id})
+    pub async fn find_agent_container(
+        &self,
+        project_id: &str,
+        service_type: &shared_types::ServiceType,
+    ) -> Option<DockerContainerInfo> {
+        // 1. 查 Map
+        if let Some(info) = self.containers.get(project_id) {
+            return Some(info.clone());
+        }
+
+        // 2. 查 Docker API (构造名称)
+        let prefix = service_type.container_prefix();
+        let expected_container_name = format!("{}-{}", prefix, project_id);
+        self.find_container_by_identifier(&expected_container_name)
+            .await
+    }
+
+    /// 获取 Agent 容器的高级信息
+    ///
+    /// 封装了容器查找、IP解析、URL构建和信息转换逻辑
+    /// 替代 rcoder 层的手动拼装逻辑
+    pub async fn get_agent_info(
+        &self,
+        project_id: &str,
+    ) -> DockerResult<Option<ContainerBasicInfo>> {
+        // 1. 查找容器信息
+        let container_info = match self.get_container_info(project_id) {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        // 2. 获取容器 IP (优先使用主网络)
+        let network_name = self.get_main_network_name().await;
+        let network_ips = self
+            .get_container_network_info(&container_info.container_id)
+            .await?;
+
+        let container_ip = network_ips
+            .get(&network_name)
+            .cloned()
+            .or_else(|| network_ips.values().next().cloned())
+            .ok_or_else(|| DockerError::ConnectionError("容器未连接到任何网络".to_string()))?;
+
+        // 3. 构建服务 URL (Agent 内部默认监听 8086)
+        let server_url = format!("http://{}:8086", container_ip);
+
+        // 4. 转换并返回
+        Ok(Some(ContainerBasicInfo {
+            container_id: container_info.container_id,
+            container_name: container_info.container_name,
+            container_ip,
+            internal_port: container_info.internal_port,
+            external_port: container_info.assigned_port,
+            project_id: container_info.project_id,
+            status: container_info.status.to_string(),
+            created_at: container_info.created_at,
+            service_url: server_url,
+        }))
+    }
+
+    /// 获取容器的连接信息 (IP)
+    ///
+    /// 用于清理任务获取资源回收所需的信息
+    pub async fn get_container_connection_info(
+        &self,
+        container_info: &DockerContainerInfo,
+    ) -> DockerResult<Option<String>> {
+        // 1. 获取 IP
+        let ip_addr = match self
+            .get_container_network_info(&container_info.container_id)
+            .await
+        {
+            Ok(network_ips) => network_ips
+                .get(&container_info.network_name)
+                .cloned()
+                .or_else(|| network_ips.values().next().cloned()),
+            Err(e) => {
+                warn!("获取容器网络信息失败: {}", e);
+                None
+            }
+        };
+
+        Ok(ip_addr)
     }
 
     /// 检查并更新容器状态

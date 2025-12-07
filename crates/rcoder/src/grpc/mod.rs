@@ -5,9 +5,11 @@
 pub mod channel_pool;
 pub mod chat_client;
 pub mod converters;
+pub mod error;
 pub mod sse_stream;
 
 pub use channel_pool::GrpcChannelPool;
 pub use chat_client::*;
 pub use converters::*;
+pub use error::*;
 pub use sse_stream::*;
