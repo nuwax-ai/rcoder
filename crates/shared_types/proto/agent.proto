@@ -47,77 +47,24 @@ message ProgressRequest {
   string session_id = 1;
 }
 
-// ProgressEvent 进度事件（优化版：使用详细的 oneof，移除 json_payload）
+// ProgressEvent 进度事件（简化版：完全透传 ACP JSON）
+//
+// 设计理念：不再尝试映射 ACP 到固定的事件类型，而是直接透传 ACP 消息的 JSON
+// 优势：
+// 1. 零字段丢失：完整保留 ACP 结构
+// 2. 零维护成本：ACP 协议更新时后端无需修改
+// 3. 前端灵活性：前端可按需解析任意字段
 message ProgressEvent {
-  // 事件类型（使用 oneof 实现类型安全）
-  oneof event {
-    LogEvent log = 1;                              // 普通日志
-    ThinkingEvent thinking = 2;                    // 思考过程
-    ChunkEvent chunk = 3;                          // 内容片段
-    CompletionEvent completion = 4;                // 完成信号
-    ErrorEvent error = 5;                          // 错误信息
-    AskConfirmationEvent ask_confirmation = 6;     // 询问确认
-    ProgressNotificationEvent progress_notification = 7; // 进度通知
-    ToolUseEvent tool_use = 8;                     // 工具使用
-  }
+  // 消息主类型：SessionPromptStart, SessionPromptEnd, AgentSessionUpdate, Heartbeat
+  string message_type = 1;
+  // 消息子类型：agent_message_chunk, tool_call, plan, end_turn 等
+  string sub_type = 2;
+  // ACP 消息的完整 JSON 载荷
+  string payload = 3;
+  // 可选的请求 ID，用于关联请求和响应
+  optional string request_id = 4;
   // 时间戳 (使用 Unix timestamp，单位：毫秒)
   int64 timestamp = 11;
-}
-
-// === ProgressEvent 详细事件类型定义 ===
-
-// 日志事件
-message LogEvent {
-  string level = 1;    // 日志级别: "debug", "info", "warn", "error"
-  string message = 2;  // 日志内容
-}
-
-// 思考事件
-message ThinkingEvent {
-  string content = 1;       // 思考内容
-  bool is_complete = 2;     // 是否完成思考
-}
-
-// 内容片段事件（用于流式输出）
-message ChunkEvent {
-  string content = 1;       // 内容片段
-  int32 index = 2;          // 片段索引
-}
-
-// 完成事件
-message CompletionEvent {
-  string result = 1;        // 最终结果
-  int32 total_tokens = 2;   // 总 token 数
-  int64 duration_ms = 3;    // 耗时（毫秒）
-}
-
-// 错误事件
-message ErrorEvent {
-  string error_code = 1;    // 错误代码
-  string error_message = 2; // 错误消息
-  optional string stack_trace = 3; // 堆栈跟踪（可选）
-}
-
-// 询问确认事件
-message AskConfirmationEvent {
-  string message = 1;               // 询问消息
-  repeated string options = 2;      // 选项列表
-  optional string default_option = 3; // 默认选项
-}
-
-// 进度通知事件
-message ProgressNotificationEvent {
-  string status = 1;         // 状态描述
-  int32 percentage = 2;      // 进度百分比 (0-100)
-  optional string details = 3; // 详细信息
-}
-
-// 工具使用事件
-message ToolUseEvent {
-  string tool_name = 1;      // 工具名称
-  string tool_input = 2;     // 工具输入 (JSON 格式)
-  optional string tool_output = 3; // 工具输出 (JSON 格式)
-  bool is_error = 4;         // 是否出错
 }
 
 // === Cancel Session ===

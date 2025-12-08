@@ -3,8 +3,7 @@
 //! 通过 gRPC SubscribeProgress 接收 agent_runner 的进度事件，
 //! 并转换为 SSE 事件返回给客户端
 
-use shared_types::grpc::{ProgressRequest, agent_service_client::AgentServiceClient};
-use tonic::transport::Channel;
+use shared_types::grpc::ProgressRequest;
 use tracing::{debug, error, info, warn};
 
 /// 创建基于 gRPC 的 SSE 代理流
@@ -121,103 +120,14 @@ pub async fn create_grpc_sse_stream(
 
 /// 将 gRPC ProgressEvent 转换为 SSE Event
 ///
-/// 使用 oneof event 字段进行类型安全的转换
+/// 简化版：直接透传 ACP JSON 载荷
+/// 使用 sub_type 作为 SSE 事件名，前端通过 eventSource.addEventListener(sub_type, ...) 监听
 fn progress_event_to_sse(event: &shared_types::grpc::ProgressEvent) -> axum::response::sse::Event {
-    use shared_types::grpc::progress_event::Event;
-
-    // 处理 oneof event 字段
-    if let Some(ref event_data) = event.event {
-        match event_data {
-            Event::Log(log) => {
-                let data = serde_json::json!({
-                    "level": log.level,
-                    "message": log.message
-                });
-                axum::response::sse::Event::default()
-                    .event("log")
-                    .data(data.to_string())
-            }
-
-            Event::Thinking(thinking) => {
-                let data = serde_json::json!({
-                    "content": thinking.content,
-                    "is_complete": thinking.is_complete
-                });
-                axum::response::sse::Event::default()
-                    .event("thinking")
-                    .data(data.to_string())
-            }
-
-            Event::Chunk(chunk) => {
-                let data = serde_json::json!({
-                    "content": chunk.content,
-                    "index": chunk.index
-                });
-                axum::response::sse::Event::default()
-                    .event("chunk")
-                    .data(data.to_string())
-            }
-
-            Event::Completion(completion) => {
-                let data = serde_json::json!({
-                    "result": completion.result,
-                    "total_tokens": completion.total_tokens,
-                    "duration_ms": completion.duration_ms
-                });
-                axum::response::sse::Event::default()
-                    .event("completion")
-                    .data(data.to_string())
-            }
-
-            Event::Error(error) => {
-                let data = serde_json::json!({
-                    "error_code": error.error_code,
-                    "error_message": error.error_message,
-                    "stack_trace": error.stack_trace
-                });
-                axum::response::sse::Event::default()
-                    .event("error")
-                    .data(data.to_string())
-            }
-
-            Event::AskConfirmation(ask) => {
-                let data = serde_json::json!({
-                    "message": ask.message,
-                    "options": ask.options,
-                    "default_option": ask.default_option
-                });
-                axum::response::sse::Event::default()
-                    .event("ask_confirmation")
-                    .data(data.to_string())
-            }
-
-            Event::ProgressNotification(progress) => {
-                let data = serde_json::json!({
-                    "status": progress.status,
-                    "percentage": progress.percentage,
-                    "details": progress.details
-                });
-                axum::response::sse::Event::default()
-                    .event("progress_notification")
-                    .data(data.to_string())
-            }
-
-            Event::ToolUse(tool) => {
-                let data = serde_json::json!({
-                    "tool_name": tool.tool_name,
-                    "tool_input": tool.tool_input,
-                    "tool_output": tool.tool_output,
-                    "is_error": tool.is_error
-                });
-                axum::response::sse::Event::default()
-                    .event("tool_use")
-                    .data(data.to_string())
-            }
-        }
-    } else {
-        // 空事件，发送心跳
-        axum::response::sse::Event::default().comment("heartbeat")
-    }
+    // 使用 sub_type 作为 SSE 事件名
+    // 前端通过 eventSource.addEventListener('agent_message_chunk', ...) 等方式监听
+    axum::response::sse::Event::default()
+        .event(&event.sub_type)
+        .data(event.payload.clone())  // 直接透传 ACP JSON
 }
 
 /// 获取容器的 gRPC 地址
