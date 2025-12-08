@@ -13,7 +13,7 @@ use agent_client_protocol::{CancelNotification, SessionId};
 
 use crate::{
     AppError, CancelNotificationRequestWrapper, CancelResult, HttpResult,
-    proxy_agent::PROJECT_AND_AGENT_INFO_MAP, router::AppState,
+    service::AGENT_REGISTRY, router::AppState,
 };
 
 /// 取消任务的查询参数
@@ -113,19 +113,19 @@ pub async fn agent_session_cancel(
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let project_id = query.project_id.clone();
 
-    // 如果 session_id 为空，从 PROJECT_AND_AGENT_INFO_MAP 中根据 project_id 获取
+    // 如果 session_id 为空，从统一 Registry 中根据 project_id 获取
     let session_id = match query.session_id {
         Some(sid) => sid,
         None => {
             debug!(
-                "🔍 session_id 为空，尝试从 PROJECT_AND_AGENT_INFO_MAP 中获取: project_id={}",
+                "🔍 session_id 为空，尝试从 AGENT_REGISTRY 中获取: project_id={}",
                 project_id
             );
-            match PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
+            match AGENT_REGISTRY.get_agent_info(&project_id) {
                 Some(project_info) => {
                     let sid = project_info.session_id.to_string();
                     info!(
-                        "✅ 从 PROJECT_AND_AGENT_INFO_MAP 中获取到 session_id: {}",
+                        "✅ 从 AGENT_REGISTRY 中获取到 session_id: {}",
                         sid
                     );
                     sid
@@ -152,8 +152,8 @@ pub async fn agent_session_cancel(
     // 创建CancelNotification - 使用简化的构造函数
     let cancel_notification = CancelNotification::new(session_id_obj);
 
-    // 从全局映射中查找匹配的session
-    let project_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
+    // 从统一 Registry 中查找匹配的 session
+    let project_info = AGENT_REGISTRY.get_agent_info(&project_id);
 
     let (result_tx, result_rx) = oneshot::channel::<CancelResult>();
     let cancel_notification_request = CancelNotificationRequestWrapper {

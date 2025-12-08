@@ -13,12 +13,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use std::sync::{Arc, LazyLock};
 
+use super::AGENT_REGISTRY;
+
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
-
-/// Project到当前活跃Session的映射 - 用于确保一个project_id只对应一个session_id
-/// 当project_id对应的session_id发生变化时，会自动清理旧session的数据
-pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
 
 /// Session数据包装 - 极简版本，专注消息传输
@@ -281,6 +279,7 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
 
 /// 确保project_id对应正确的session_id
 ///
+/// 使用统一的 AGENT_REGISTRY 管理 project-session 映射
 /// 如果project_id对应的session_id发生变化，会自动清理旧session的数据
 /// 如果session_id相同，则不做任何操作
 ///
@@ -290,65 +289,58 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
 ///
 /// 返回值: 如果清理了旧数据则返回清理的消息数量，否则返回0
 pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize {
-    // 检查当前映射
-    let mapped_session_id = if let Some(entry) = PROJECT_SESSION_MAP.get(project_id) {
-        let mapped_session_id = entry.value().clone();
-        
-        // 如果session_id相同，不需要做任何操作
-        if mapped_session_id == session_id {
+    // 使用统一 Registry 检查当前映射
+    let mapped_session_id = AGENT_REGISTRY.get_session_by_project(project_id);
+
+    match mapped_session_id {
+        Some(mapped_sid) if mapped_sid == session_id => {
+            // session_id 相同，不需要做任何操作
             debug!(
                 "📋 Project session映射未变化: project_id={}, session_id={}",
                 project_id, session_id
             );
-            return 0;
+            0
         }
-        
-        // ⚠️ 关键修复：显式 drop entry，释放读锁，避免后续 insert 时的读写锁冲突
-        drop(entry);
-        
-        Some(mapped_session_id)
-    } else {
-        None
-    };
-    
-    // 如果有旧映射，处理 session 变化
-    if let Some(mapped_session_id) = mapped_session_id {
-        // session_id发生变化，需要清理旧session的数据
-        info!(
-            "🔄 检测到Project session变化: project_id={}, old_session_id={}, new_session_id={}",
-            project_id, mapped_session_id, session_id
-        );
-
-        // 清理旧session的数据 - 直接移除条目
-        let cleared_count = if SESSION_CACHE.remove(&mapped_session_id).is_some() {
-            1 // 移除了1个session
-        } else {
-            0 // session不存在
-        };
-
-        // 更新映射关系（现在可以安全获取写锁）
-        PROJECT_SESSION_MAP.insert(project_id.to_string(), session_id.to_string());
-
-        if cleared_count > 0 {
+        Some(old_session_id) => {
+            // session_id 发生变化，需要清理旧 session 的数据
             info!(
-                "🧹 已清理旧session数据并更新映射: project_id={}, old_session_id={}, new_session_id={}, cleared_count={}",
-                project_id, mapped_session_id, session_id, cleared_count
+                "🔄 检测到Project session变化: project_id={}, old_session_id={}, new_session_id={}",
+                project_id, old_session_id, session_id
             );
-        } else {
-            info!(
-                "📝 已更新Project session映射: project_id={}, old_session_id={}, new_session_id={}",
-                project_id, mapped_session_id, session_id
-            );
+
+            // 清理旧 session 的 SSE 数据
+            let cleared_count = if SESSION_CACHE.remove(&old_session_id).is_some() {
+                1 // 移除了1个session
+            } else {
+                0 // session不存在
+            };
+
+            // 更新 AGENT_REGISTRY 中的映射关系
+            let _ = AGENT_REGISTRY.update_session(project_id, session_id);
+
+            if cleared_count > 0 {
+                info!(
+                    "🧹 已清理旧session数据并更新映射: project_id={}, old_session_id={}, new_session_id={}, cleared_count={}",
+                    project_id, old_session_id, session_id, cleared_count
+                );
+            } else {
+                info!(
+                    "📝 已更新Project session映射: project_id={}, old_session_id={}, new_session_id={}",
+                    project_id, old_session_id, session_id
+                );
+            }
+
+            cleared_count
         }
-
-        cleared_count
-    } else {
-        // 第一次建立映射关系（无旧映射）
-        info!(
-            "🆕 建立新的Project session映射: project_id={}, session_id={}",
-            project_id, session_id
-        );
-        PROJECT_SESSION_MAP.insert(project_id.to_string(), session_id.to_string());
-        0
+        None => {
+            // 第一次建立映射关系（无旧映射）
+            // 注意：此时 AGENT_REGISTRY 中可能还没有这个 project 的记录
+            // 这种情况下不需要调用 update_session，因为 agent 注册时会调用 register
+            info!(
+                "🆕 Project session 首次出现: project_id={}, session_id={}",
+                project_id, session_id
+            );
+            0
+        }
     }
 }

@@ -2,7 +2,7 @@ use axum::extract::Path;
 use shared_types::{AgentStatusResponse, AppError, HttpResult};
 use tracing::info;
 
-use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
+use crate::service::AGENT_REGISTRY;
 
 
 /// 查询Agent状态
@@ -81,8 +81,8 @@ pub async fn agent_status(
 
     info!("📊 收到查询Agent状态请求: project_id={}", project_id);
 
-    // 从MAP中获取Agent信息
-    if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(project_id) {
+    // 从统一 Registry 获取 Agent 信息
+    if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(project_id) {
         let response = AgentStatusResponse {
             project_id: agent_info.project_id.clone(),
             is_alive: true,
