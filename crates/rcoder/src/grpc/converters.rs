@@ -58,152 +58,34 @@ pub fn from_grpc_chat_response(resp: GrpcChatResponse) -> (String, String, bool,
 
 /// 从 gRPC ProgressEvent 转换为 UnifiedSessionMessage
 ///
-/// 使用 oneof event 字段进行类型安全的转换
+/// 简化版：直接使用透传的字段
 pub fn from_grpc_progress_event(
     event: ProgressEvent,
     session_id: &str,
 ) -> Option<UnifiedSessionMessage> {
     use chrono::Utc;
-    use shared_types::grpc::progress_event::Event;
     use shared_types::SessionMessageType;
 
     let timestamp = chrono::DateTime::from_timestamp_millis(event.timestamp)
         .unwrap_or_else(|| Utc::now());
 
-    let event_data = event.event?;
-
-    let (message_type, sub_type, data) = match event_data {
-        // 思考事件 → AgentSessionUpdate + agent_thought_chunk
-        Event::Thinking(thinking) => {
-            let data = serde_json::json!({
-                "thinking": thinking.content,
-                "is_complete": thinking.is_complete,
-            });
-            (
-                SessionMessageType::AgentSessionUpdate,
-                "agent_thought_chunk".to_string(),
-                data,
-            )
-        }
-
-        // 内容片段 → AgentSessionUpdate + agent_message_chunk
-        Event::Chunk(chunk) => {
-            let data = serde_json::json!({
-                "content": {
-                    "type": "text",
-                    "text": chunk.content
-                },
-                "index": chunk.index,
-                "is_final": false
-            });
-            (
-                SessionMessageType::AgentSessionUpdate,
-                "agent_message_chunk".to_string(),
-                data,
-            )
-        }
-
-        // 工具使用 → AgentSessionUpdate + tool_call/tool_call_update
-        Event::ToolUse(tool) => {
-            let (sub_type, data) = if tool.tool_output.is_some() {
-                // 有输出 = 工具调用更新
-                let data = serde_json::json!({
-                    "tool_call_id": tool.tool_name,
-                    "result": {
-                        "status": if tool.is_error { "error" } else { "success" },
-                        "output": serde_json::from_str::<serde_json::Value>(&tool.tool_output.unwrap_or_default()).ok()
-                    }
-                });
-                ("tool_call_update".to_string(), data)
-            } else {
-                // 无输出 = 工具调用开始
-                let data = serde_json::json!({
-                    "tool_call": {
-                        "name": tool.tool_name,
-                        "arguments": serde_json::from_str::<serde_json::Value>(&tool.tool_input).ok(),
-                    },
-                    "status": "started"
-                });
-                ("tool_call".to_string(), data)
-            };
-            (SessionMessageType::AgentSessionUpdate, sub_type, data)
-        }
-
-        // 完成事件 → SessionPromptEnd + end_turn
-        Event::Completion(completion) => {
-            let data = serde_json::json!({
-                "stop_reason": "end_turn",
-                "message": completion.result,
-                "total_tokens": completion.total_tokens,
-                "duration_ms": completion.duration_ms
-            });
-            (
-                SessionMessageType::SessionPromptEnd,
-                "end_turn".to_string(),
-                data,
-            )
-        }
-
-        // 错误事件 → SessionPromptEnd + cancelled/max_tokens
-        Event::Error(error) => {
-            let data = serde_json::json!({
-                "stop_reason": error.error_code.clone(),
-                "error_message": error.error_message,
-                "stack_trace": error.stack_trace
-            });
-            (
-                SessionMessageType::SessionPromptEnd,
-                error.error_code,
-                data,
-            )
-        }
-
-        // 日志事件 → AgentSessionUpdate + log
-        Event::Log(log) => {
-            let data = serde_json::json!({
-                "level": log.level,
-                "message": log.message
-            });
-            (
-                SessionMessageType::AgentSessionUpdate,
-                "log".to_string(),
-                data,
-            )
-        }
-
-        // AskConfirmation → AgentSessionUpdate + ask_confirmation
-        Event::AskConfirmation(ask) => {
-            let data = serde_json::json!({
-                "message": ask.message,
-                "options": ask.options,
-                "default_option": ask.default_option
-            });
-            (
-                SessionMessageType::AgentSessionUpdate,
-                "ask_confirmation".to_string(),
-                data,
-            )
-        }
-
-        // ProgressNotification → AgentSessionUpdate + progress_notification
-        Event::ProgressNotification(progress) => {
-            let data = serde_json::json!({
-                "status": progress.status,
-                "percentage": progress.percentage,
-                "details": progress.details
-            });
-            (
-                SessionMessageType::AgentSessionUpdate,
-                "progress_notification".to_string(),
-                data,
-            )
-        }
+    // 从 message_type 字符串解析枚举
+    let message_type = match event.message_type.as_str() {
+        "SessionPromptStart" => SessionMessageType::SessionPromptStart,
+        "SessionPromptEnd" => SessionMessageType::SessionPromptEnd,
+        "AgentSessionUpdate" => SessionMessageType::AgentSessionUpdate,
+        "Heartbeat" => SessionMessageType::Heartbeat,
+        _ => SessionMessageType::AgentSessionUpdate, // 默认为 AgentSessionUpdate
     };
+
+    // 直接解析 payload JSON
+    let data = serde_json::from_str(&event.payload)
+        .unwrap_or_else(|_| serde_json::json!({}));
 
     Some(UnifiedSessionMessage {
         session_id: session_id.to_string(),
         message_type,
-        sub_type,
+        sub_type: event.sub_type,
         data,
         timestamp,
     })

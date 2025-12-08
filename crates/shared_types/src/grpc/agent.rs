@@ -40,144 +40,31 @@ pub struct ProgressRequest {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
 }
-/// ProgressEvent 进度事件（优化版：使用详细的 oneof，移除 json_payload）
+/// ProgressEvent 进度事件（简化版：完全透传 ACP JSON）
+///
+/// 设计理念：不再尝试映射 ACP 到固定的事件类型，而是直接透传 ACP 消息的 JSON
+/// 优势：
+///
+/// 1. 零字段丢失：完整保留 ACP 结构
+/// 1. 零维护成本：ACP 协议更新时后端无需修改
+/// 1. 前端灵活性：前端可按需解析任意字段
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProgressEvent {
+    /// 消息主类型：SessionPromptStart, SessionPromptEnd, AgentSessionUpdate, Heartbeat
+    #[prost(string, tag = "1")]
+    pub message_type: ::prost::alloc::string::String,
+    /// 消息子类型：agent_message_chunk, tool_call, plan, end_turn 等
+    #[prost(string, tag = "2")]
+    pub sub_type: ::prost::alloc::string::String,
+    /// ACP 消息的完整 JSON 载荷
+    #[prost(string, tag = "3")]
+    pub payload: ::prost::alloc::string::String,
+    /// 可选的请求 ID，用于关联请求和响应
+    #[prost(string, optional, tag = "4")]
+    pub request_id: ::core::option::Option<::prost::alloc::string::String>,
     /// 时间戳 (使用 Unix timestamp，单位：毫秒)
     #[prost(int64, tag = "11")]
     pub timestamp: i64,
-    /// 事件类型（使用 oneof 实现类型安全）
-    #[prost(oneof = "progress_event::Event", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
-    pub event: ::core::option::Option<progress_event::Event>,
-}
-/// Nested message and enum types in `ProgressEvent`.
-pub mod progress_event {
-    /// 事件类型（使用 oneof 实现类型安全）
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Event {
-        /// 普通日志
-        #[prost(message, tag = "1")]
-        Log(super::LogEvent),
-        /// 思考过程
-        #[prost(message, tag = "2")]
-        Thinking(super::ThinkingEvent),
-        /// 内容片段
-        #[prost(message, tag = "3")]
-        Chunk(super::ChunkEvent),
-        /// 完成信号
-        #[prost(message, tag = "4")]
-        Completion(super::CompletionEvent),
-        /// 错误信息
-        #[prost(message, tag = "5")]
-        Error(super::ErrorEvent),
-        /// 询问确认
-        #[prost(message, tag = "6")]
-        AskConfirmation(super::AskConfirmationEvent),
-        /// 进度通知
-        #[prost(message, tag = "7")]
-        ProgressNotification(super::ProgressNotificationEvent),
-        /// 工具使用
-        #[prost(message, tag = "8")]
-        ToolUse(super::ToolUseEvent),
-    }
-}
-/// 日志事件
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct LogEvent {
-    /// 日志级别: "debug", "info", "warn", "error"
-    #[prost(string, tag = "1")]
-    pub level: ::prost::alloc::string::String,
-    /// 日志内容
-    #[prost(string, tag = "2")]
-    pub message: ::prost::alloc::string::String,
-}
-/// 思考事件
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ThinkingEvent {
-    /// 思考内容
-    #[prost(string, tag = "1")]
-    pub content: ::prost::alloc::string::String,
-    /// 是否完成思考
-    #[prost(bool, tag = "2")]
-    pub is_complete: bool,
-}
-/// 内容片段事件（用于流式输出）
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ChunkEvent {
-    /// 内容片段
-    #[prost(string, tag = "1")]
-    pub content: ::prost::alloc::string::String,
-    /// 片段索引
-    #[prost(int32, tag = "2")]
-    pub index: i32,
-}
-/// 完成事件
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CompletionEvent {
-    /// 最终结果
-    #[prost(string, tag = "1")]
-    pub result: ::prost::alloc::string::String,
-    /// 总 token 数
-    #[prost(int32, tag = "2")]
-    pub total_tokens: i32,
-    /// 耗时（毫秒）
-    #[prost(int64, tag = "3")]
-    pub duration_ms: i64,
-}
-/// 错误事件
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ErrorEvent {
-    /// 错误代码
-    #[prost(string, tag = "1")]
-    pub error_code: ::prost::alloc::string::String,
-    /// 错误消息
-    #[prost(string, tag = "2")]
-    pub error_message: ::prost::alloc::string::String,
-    /// 堆栈跟踪（可选）
-    #[prost(string, optional, tag = "3")]
-    pub stack_trace: ::core::option::Option<::prost::alloc::string::String>,
-}
-/// 询问确认事件
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct AskConfirmationEvent {
-    /// 询问消息
-    #[prost(string, tag = "1")]
-    pub message: ::prost::alloc::string::String,
-    /// 选项列表
-    #[prost(string, repeated, tag = "2")]
-    pub options: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// 默认选项
-    #[prost(string, optional, tag = "3")]
-    pub default_option: ::core::option::Option<::prost::alloc::string::String>,
-}
-/// 进度通知事件
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ProgressNotificationEvent {
-    /// 状态描述
-    #[prost(string, tag = "1")]
-    pub status: ::prost::alloc::string::String,
-    /// 进度百分比 (0-100)
-    #[prost(int32, tag = "2")]
-    pub percentage: i32,
-    /// 详细信息
-    #[prost(string, optional, tag = "3")]
-    pub details: ::core::option::Option<::prost::alloc::string::String>,
-}
-/// 工具使用事件
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ToolUseEvent {
-    /// 工具名称
-    #[prost(string, tag = "1")]
-    pub tool_name: ::prost::alloc::string::String,
-    /// 工具输入 (JSON 格式)
-    #[prost(string, tag = "2")]
-    pub tool_input: ::prost::alloc::string::String,
-    /// 工具输出 (JSON 格式)
-    #[prost(string, optional, tag = "3")]
-    pub tool_output: ::core::option::Option<::prost::alloc::string::String>,
-    /// 是否出错
-    #[prost(bool, tag = "4")]
-    pub is_error: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelRequest {

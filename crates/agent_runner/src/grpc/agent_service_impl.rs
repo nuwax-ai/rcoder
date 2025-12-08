@@ -241,14 +241,11 @@ impl AgentService for AgentServiceImpl {
                             }
                             // ✅ 新增：定期发送心跳，防止连接被中间网络设备断开
                             _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                                use shared_types::grpc::progress_event::Event;
-                                use shared_types::grpc::LogEvent;
-
                                 let heartbeat = ProgressEvent {
-                                    event: Some(Event::Log(LogEvent {
-                                        level: "debug".to_string(),
-                                        message: "heartbeat".to_string(),
-                                    })),
+                                    message_type: "Heartbeat".to_string(),
+                                    sub_type: "ping".to_string(),
+                                    payload: r#"{"type":"heartbeat","message":"keep-alive"}"#.to_string(),
+                                    request_id: None,
                                     timestamp: chrono::Utc::now().timestamp_millis(),
                                 };
 
@@ -327,194 +324,25 @@ impl AgentService for AgentServiceImpl {
 
 /// 将 UnifiedSessionMessage 转换为 gRPC ProgressEvent
 ///
-/// 根据 message_type 和 sub_type 映射到具体的 ProgressEvent 类型：
-/// - agent_thought_chunk → ThinkingEvent
-/// - agent_message_chunk → ChunkEvent
-/// - tool_call / tool_call_update → ToolUseEvent
-/// - end_turn / prompt_end → CompletionEvent
-/// - cancelled / max_tokens → ErrorEvent
-/// - 其他 → LogEvent
+/// 简化版：直接透传 ACP JSON，不做任何字段提取
+///
+/// 优势：
+/// 1. 零字段丢失：完整保留 ACP 结构
+/// 2. 零维护成本：ACP 协议更新时后端无需修改
+/// 3. 前端灵活性：前端可按需解析任意字段
 fn unified_message_to_progress_event(
     message: &shared_types::UnifiedSessionMessage,
 ) -> ProgressEvent {
-    use shared_types::SessionMessageType;
-    use shared_types::grpc::progress_event::Event;
-    use shared_types::grpc::{
-        ChunkEvent, CompletionEvent, ErrorEvent, LogEvent, ThinkingEvent, ToolUseEvent,
-    };
-
     let timestamp = message.timestamp.timestamp_millis();
 
-    let event = match &message.message_type {
-        SessionMessageType::AgentSessionUpdate => {
-            match message.sub_type.as_str() {
-                // 思考过程
-                "agent_thought_chunk" => {
-                    let thinking_content = message
-                        .data
-                        .get("thinking")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    Event::Thinking(ThinkingEvent {
-                        content: thinking_content,
-                        is_complete: false,
-                    })
-                }
-
-                // 内容片段
-                "agent_message_chunk" => {
-                    let content = message
-                        .data
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    Event::Chunk(ChunkEvent {
-                        content,
-                        index: 0, // TODO: 从 data 中提取实际索引
-                    })
-                }
-
-                // 工具调用
-                "tool_call" => {
-                    let tool_name = message
-                        .data
-                        .get("tool_call")
-                        .and_then(|tc| tc.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    let tool_input = message
-                        .data
-                        .get("tool_call")
-                        .and_then(|tc| tc.get("arguments"))
-                        .and_then(|args| serde_json::to_string(args).ok())
-                        .unwrap_or_default();
-
-                    Event::ToolUse(ToolUseEvent {
-                        tool_name,
-                        tool_input,
-                        tool_output: None,
-                        is_error: false,
-                    })
-                }
-
-                // 工具调用更新
-                "tool_call_update" => {
-                    let tool_name = message
-                        .data
-                        .get("tool_call_id")
-                        .and_then(|id| id.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    let tool_output = message
-                        .data
-                        .get("result")
-                        .and_then(|r| serde_json::to_string(r).ok())
-                        .unwrap_or_default();
-
-                    let is_error = message
-                        .data
-                        .get("result")
-                        .and_then(|r| r.get("status"))
-                        .and_then(|s| s.as_str())
-                        .map(|s| s != "success")
-                        .unwrap_or(false);
-
-                    Event::ToolUse(ToolUseEvent {
-                        tool_name,
-                        tool_input: String::new(),
-                        tool_output: Some(tool_output),
-                        is_error,
-                    })
-                }
-
-                // 其他更新消息作为日志
-                _ => Event::Log(LogEvent {
-                    level: "info".to_string(),
-                    message: format!(
-                        "[{}] {}",
-                        message.sub_type,
-                        serde_json::to_string(&message.data).unwrap_or_default()
-                    ),
-                }),
-            }
-        }
-
-        SessionMessageType::SessionPromptEnd => {
-            match message.sub_type.as_str() {
-                // 正常结束
-                "end_turn" | "prompt_end" => {
-                    let result = message
-                        .data
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("执行完成")
-                        .to_string();
-
-                    let total_tokens = message
-                        .data
-                        .get("total_tokens")
-                        .and_then(|t| t.as_i64())
-                        .unwrap_or(0) as i32;
-
-                    let duration_ms = message
-                        .data
-                        .get("duration_ms")
-                        .and_then(|d| d.as_i64())
-                        .unwrap_or(0);
-
-                    Event::Completion(CompletionEvent {
-                        result,
-                        total_tokens,
-                        duration_ms,
-                    })
-                }
-
-                // 错误结束
-                "cancelled" | "max_tokens" => {
-                    let error_code = message.sub_type.clone();
-                    let error_message = message
-                        .data
-                        .get("error_message")
-                        .and_then(|e| e.as_str())
-                        .or_else(|| message.data.get("message").and_then(|m| m.as_str()))
-                        .unwrap_or("执行失败")
-                        .to_string();
-
-                    Event::Error(ErrorEvent {
-                        error_code,
-                        error_message,
-                        stack_trace: None,
-                    })
-                }
-
-                _ => Event::Log(LogEvent {
-                    level: "info".to_string(),
-                    message: format!("会话结束: {}", message.sub_type),
-                }),
-            }
-        }
-
-        SessionMessageType::SessionPromptStart => Event::Log(LogEvent {
-            level: "info".to_string(),
-            message: "会话开始".to_string(),
-        }),
-
-        SessionMessageType::Heartbeat => Event::Log(LogEvent {
-            level: "debug".to_string(),
-            message: "heartbeat".to_string(),
-        }),
-    };
-
+    // 直接透传，不做任何字段提取
     ProgressEvent {
-        event: Some(event),
+        message_type: format!("{:?}", message.message_type),
+        sub_type: message.sub_type.clone(),
+        payload: serde_json::to_string(&message.data).unwrap_or_default(),
+        request_id: message.data.get("request_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         timestamp,
     }
 }
