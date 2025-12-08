@@ -6,10 +6,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use shared_types::ModelProviderConfig;
 use shared_types::grpc::{
     CancelRequest, CancelResponse, CancelResultType, ChatRequest as GrpcChatRequest,
-    ChatResponse as GrpcChatResponse, GetStatusRequest, GetStatusResponse, ProgressEvent,
-    ProgressRequest, agent_service_server::AgentService,
+    ChatResponse as GrpcChatResponse, GetStatusRequest, GetStatusResponse,
+    ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent, ProgressRequest,
+    agent_service_server::AgentService,
 };
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
@@ -22,6 +24,19 @@ use crate::proxy_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP};
 use crate::router::AppState;
 use crate::service::SESSION_CACHE;
 use shared_types::ChatPromptBuilder;
+
+/// 将 gRPC ModelProviderConfig 转换为内部 ModelProviderConfig
+fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: uuid::Uuid::new_v4().to_string(), // 生成唯一 ID
+        name: grpc_config.provider,
+        base_url: grpc_config.api_base.unwrap_or_default(),
+        api_key: grpc_config.api_key.unwrap_or_default(),
+        requires_openai_auth: true, // 默认值
+        default_model: grpc_config.model,
+        api_protocol: None, // 从 provider 名称推断
+    }
+}
 
 /// gRPC AgentService 实现
 pub struct AgentServiceImpl {
@@ -112,7 +127,20 @@ impl AgentService for AgentServiceImpl {
         // 转换为 PromptMessage
         let prompt_message = agent_abstraction::PromptMessage::from(chat_prompt);
 
-        let (local_task_request, chat_prompt_rx) = LocalSetAgentRequest::new(prompt_message, None);
+        // 转换 model_provider
+        let model_provider = req.model_config.map(convert_model_provider);
+
+        if let Some(ref provider) = model_provider {
+            debug!(
+                "📝 [gRPC] 使用模型配置: provider={}, model={}, base_url={}",
+                provider.name, provider.default_model, provider.base_url
+            );
+        } else {
+            warn!("⚠️ [gRPC] 未提供模型配置，将使用环境变量或默认配置");
+        }
+
+        let (local_task_request, chat_prompt_rx) =
+            LocalSetAgentRequest::new(prompt_message, model_provider);
 
         self.app_state
             .local_task_sender
@@ -161,83 +189,83 @@ impl AgentService for AgentServiceImpl {
 
         // 启动后台任务来转发事件
         tokio::spawn(async move {
-            // 等待 session 出现并创建连接
-            let mut attempts = 0;
-            let max_attempts = 30; // 最多等待 30 秒
+            // 🎯 关键修复：主动创建 SessionData 并插入 SESSION_CACHE
+            // gRPC 流程中不会调用 HTTP endpoint，所以需要在这里创建
+            use dashmap::mapref::entry::Entry;
 
-            loop {
-                if let Some(entry) = SESSION_CACHE.get(&session_id_clone) {
-                    let session_data = entry.value().clone();
-                    drop(entry); // 释放锁
+            let session_data = match SESSION_CACHE.entry(session_id_clone.clone()) {
+                Entry::Occupied(entry) => {
+                    info!(
+                        "📦 [gRPC] SESSION_CACHE 已存在，复用: session_id={}",
+                        session_id_clone
+                    );
+                    entry.get().clone()
+                }
+                Entry::Vacant(entry) => {
+                    info!(
+                        "🆕 [gRPC] SESSION_CACHE 不存在，创建新的: session_id={}",
+                        session_id_clone
+                    );
+                    let session_data = crate::service::SessionData::new(1000);
+                    entry.insert(session_data.clone());
+                    session_data
+                }
+            };
 
-                    // 创建新连接获取 receiver
-                    match session_data.create_new_connection(100).await {
-                        Ok((mut message_rx, cancellation_token)) => {
-                            info!("📡 [gRPC] 成功创建 session 连接: {}", session_id_clone);
+            // 创建新连接获取 receiver
+            match session_data.create_new_connection(100).await {
+                Ok((mut message_rx, cancellation_token)) => {
+                    info!("📡 [gRPC] 成功创建 session 连接: {}", session_id_clone);
 
-                            // 持续接收消息并转换为 ProgressEvent
-                            loop {
-                                tokio::select! {
-                                    _ = cancellation_token.cancelled() => {
-                                        debug!("📡 [gRPC] Session 连接被取消: {}", session_id_clone);
-                                        break;
-                                    }
-                                    msg = message_rx.recv() => {
-                                        match msg {
-                                            Some(unified_message) => {
-                                                let event = unified_message_to_progress_event(&unified_message);
-                                                if tx.send(Ok(event)).await.is_err() {
-                                                    debug!("📡 [gRPC] 客户端已断开连接");
-                                                    break;
-                                                }
-                                            }
-                                            None => {
-                                                debug!("📡 [gRPC] Session 消息通道已关闭");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    // ✅ 新增：定期发送心跳，防止连接被中间网络设备断开
-                                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                                        use shared_types::grpc::progress_event::Event;
-                                        use shared_types::grpc::LogEvent;
-
-                                        let heartbeat = ProgressEvent {
-                                            event: Some(Event::Log(LogEvent {
-                                                level: "debug".to_string(),
-                                                message: "heartbeat".to_string(),
-                                            })),
-                                            timestamp: chrono::Utc::now().timestamp_millis(),
-                                        };
-
-                                        if tx.send(Ok(heartbeat)).await.is_err() {
-                                            debug!("📡 [gRPC] 发送心跳失败，客户端已断开连接");
+                    // 持续接收消息并转换为 ProgressEvent
+                    loop {
+                        tokio::select! {
+                            _ = cancellation_token.cancelled() => {
+                                debug!("📡 [gRPC] Session 连接被取消: {}", session_id_clone);
+                                break;
+                            }
+                            msg = message_rx.recv() => {
+                                match msg {
+                                    Some(unified_message) => {
+                                        let event = unified_message_to_progress_event(&unified_message);
+                                        if tx.send(Ok(event)).await.is_err() {
+                                            debug!("📡 [gRPC] 客户端已断开连接");
                                             break;
                                         }
                                     }
+                                    None => {
+                                        debug!("📡 [gRPC] Session 消息通道已关闭");
+                                        break;
+                                    }
+                                }
+                            }
+                            // ✅ 新增：定期发送心跳，防止连接被中间网络设备断开
+                            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                                use shared_types::grpc::progress_event::Event;
+                                use shared_types::grpc::LogEvent;
+
+                                let heartbeat = ProgressEvent {
+                                    event: Some(Event::Log(LogEvent {
+                                        level: "debug".to_string(),
+                                        message: "heartbeat".to_string(),
+                                    })),
+                                    timestamp: chrono::Utc::now().timestamp_millis(),
+                                };
+
+                                if tx.send(Ok(heartbeat)).await.is_err() {
+                                    debug!("📡 [gRPC] 发送心跳失败，客户端已断开连接");
+                                    break;
                                 }
                             }
                         }
-                        Err(e) => {
-                            warn!("⚠️ [gRPC] 创建 session 连接失败: {}", e);
-                            let _ = tx
-                                .send(Err(Status::internal(format!("创建连接失败: {}", e))))
-                                .await;
-                        }
                     }
-                    break;
                 }
-
-                attempts += 1;
-                if attempts >= max_attempts {
-                    warn!("⏰ [gRPC] 等待 session 超时: {}", session_id_clone);
+                Err(e) => {
+                    warn!("⚠️ [gRPC] 创建 session 连接失败: {}", e);
                     let _ = tx
-                        .send(Err(Status::deadline_exceeded("Session 等待超时")))
+                        .send(Err(Status::internal(format!("创建连接失败: {}", e))))
                         .await;
-                    break;
                 }
-
-                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
 
@@ -309,11 +337,11 @@ impl AgentService for AgentServiceImpl {
 fn unified_message_to_progress_event(
     message: &shared_types::UnifiedSessionMessage,
 ) -> ProgressEvent {
+    use shared_types::SessionMessageType;
     use shared_types::grpc::progress_event::Event;
     use shared_types::grpc::{
         ChunkEvent, CompletionEvent, ErrorEvent, LogEvent, ThinkingEvent, ToolUseEvent,
     };
-    use shared_types::SessionMessageType;
 
     let timestamp = message.timestamp.timestamp_millis();
 
@@ -322,9 +350,12 @@ fn unified_message_to_progress_event(
             match message.sub_type.as_str() {
                 // 思考过程
                 "agent_thought_chunk" => {
-                    let thinking_content = message.data.get("thinking")
+                    let thinking_content = message
+                        .data
+                        .get("thinking")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("").to_string();
+                        .unwrap_or("")
+                        .to_string();
 
                     Event::Thinking(ThinkingEvent {
                         content: thinking_content,
@@ -334,10 +365,13 @@ fn unified_message_to_progress_event(
 
                 // 内容片段
                 "agent_message_chunk" => {
-                    let content = message.data.get("content")
+                    let content = message
+                        .data
+                        .get("content")
                         .and_then(|c| c.get("text"))
                         .and_then(|t| t.as_str())
-                        .unwrap_or("").to_string();
+                        .unwrap_or("")
+                        .to_string();
 
                     Event::Chunk(ChunkEvent {
                         content,
@@ -347,12 +381,17 @@ fn unified_message_to_progress_event(
 
                 // 工具调用
                 "tool_call" => {
-                    let tool_name = message.data.get("tool_call")
+                    let tool_name = message
+                        .data
+                        .get("tool_call")
                         .and_then(|tc| tc.get("name"))
                         .and_then(|n| n.as_str())
-                        .unwrap_or("unknown").to_string();
+                        .unwrap_or("unknown")
+                        .to_string();
 
-                    let tool_input = message.data.get("tool_call")
+                    let tool_input = message
+                        .data
+                        .get("tool_call")
                         .and_then(|tc| tc.get("arguments"))
                         .and_then(|args| serde_json::to_string(args).ok())
                         .unwrap_or_default();
@@ -367,15 +406,22 @@ fn unified_message_to_progress_event(
 
                 // 工具调用更新
                 "tool_call_update" => {
-                    let tool_name = message.data.get("tool_call_id")
+                    let tool_name = message
+                        .data
+                        .get("tool_call_id")
                         .and_then(|id| id.as_str())
-                        .unwrap_or("unknown").to_string();
+                        .unwrap_or("unknown")
+                        .to_string();
 
-                    let tool_output = message.data.get("result")
+                    let tool_output = message
+                        .data
+                        .get("result")
                         .and_then(|r| serde_json::to_string(r).ok())
                         .unwrap_or_default();
 
-                    let is_error = message.data.get("result")
+                    let is_error = message
+                        .data
+                        .get("result")
                         .and_then(|r| r.get("status"))
                         .and_then(|s| s.as_str())
                         .map(|s| s != "success")
@@ -405,15 +451,22 @@ fn unified_message_to_progress_event(
             match message.sub_type.as_str() {
                 // 正常结束
                 "end_turn" | "prompt_end" => {
-                    let result = message.data.get("message")
+                    let result = message
+                        .data
+                        .get("message")
                         .and_then(|m| m.as_str())
-                        .unwrap_or("执行完成").to_string();
+                        .unwrap_or("执行完成")
+                        .to_string();
 
-                    let total_tokens = message.data.get("total_tokens")
+                    let total_tokens = message
+                        .data
+                        .get("total_tokens")
                         .and_then(|t| t.as_i64())
                         .unwrap_or(0) as i32;
 
-                    let duration_ms = message.data.get("duration_ms")
+                    let duration_ms = message
+                        .data
+                        .get("duration_ms")
                         .and_then(|d| d.as_i64())
                         .unwrap_or(0);
 
@@ -427,10 +480,13 @@ fn unified_message_to_progress_event(
                 // 错误结束
                 "cancelled" | "max_tokens" => {
                     let error_code = message.sub_type.clone();
-                    let error_message = message.data.get("error_message")
+                    let error_message = message
+                        .data
+                        .get("error_message")
                         .and_then(|e| e.as_str())
                         .or_else(|| message.data.get("message").and_then(|m| m.as_str()))
-                        .unwrap_or("执行失败").to_string();
+                        .unwrap_or("执行失败")
+                        .to_string();
 
                     Event::Error(ErrorEvent {
                         error_code,
@@ -446,19 +502,15 @@ fn unified_message_to_progress_event(
             }
         }
 
-        SessionMessageType::SessionPromptStart => {
-            Event::Log(LogEvent {
-                level: "info".to_string(),
-                message: "会话开始".to_string(),
-            })
-        }
+        SessionMessageType::SessionPromptStart => Event::Log(LogEvent {
+            level: "info".to_string(),
+            message: "会话开始".to_string(),
+        }),
 
-        SessionMessageType::Heartbeat => {
-            Event::Log(LogEvent {
-                level: "debug".to_string(),
-                message: "heartbeat".to_string(),
-            })
-        }
+        SessionMessageType::Heartbeat => Event::Log(LogEvent {
+            level: "debug".to_string(),
+            message: "heartbeat".to_string(),
+        }),
     };
 
     ProgressEvent {

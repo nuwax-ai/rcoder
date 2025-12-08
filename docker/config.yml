@@ -1,0 +1,119 @@
+# RCoder 本地 Docker 容器测试配置
+# 用于在 docker-compose 启动的容器中测试动态启动子容器
+
+# 默认使用的 AI 代理类型 (Claude/Codex)
+default_agent: "Claude"
+
+# 项目工作目录
+projects_dir: "/app/project_workspace"
+
+# 主服务端口
+port: 8087
+
+# Pingora 反向代理配置
+proxy_config:
+  listen_port: 8088
+  default_backend_port: 8087
+  backend_host: "127.0.0.1"
+  port_param: "port"
+  health_check:
+    enabled: true
+    interval_seconds: 5
+    timeout_seconds: 1
+    healthy_threshold: 2
+    unhealthy_threshold: 3
+
+# Docker 配置
+docker_config:
+  # 多镜像配置系统
+  multi_image_config:
+    # 全局默认配置
+    global_defaults:
+      registry_prefix: "registry.yichamao.com"
+
+    # 服务镜像配置
+    services:
+      # RCoder 主服务配置（使用与主容器相同的镜像）
+      rcoder:
+        service_type: "RCoder"
+        # 🎯 使用本地测试镜像（与主容器相同）
+        image: "master-rcoder:latest"
+        arm64_image: "master-rcoder:latest"
+        amd64_image: "master-rcoder:latest"
+        default_image: "master-rcoder:latest"
+        image_tag_prefix: "rcoder"
+        enabled: true
+
+        environment:
+          RUST_LOG: "debug"
+          SERVICE_MODE: "full"
+          API_PORT: "8086"
+
+        command:
+          - "/app/bin/agent_runner"
+          - "--port"
+          - "8086"
+
+        resource_limits:
+          memory_limit: 2147483648 # 2GB
+          cpu_limit: 2.0
+          swap_limit: 4294967296 # 4GB
+
+        work_dir: "/app"
+        network_mode: "bridge"
+
+        mounts:
+          - container_path: "/app/specs"
+            host_path: "/app/specs"
+            read_only: false
+            mount_type: "bind"
+
+      # AgentRunner 服务配置（使用与主容器相同的镜像）
+      agent-runner:
+        service_type: "AgentRunner"
+        # 🎯 使用本地测试镜像（与主容器相同）
+        image: "master-rcoder:latest"
+        arm64_image: "master-rcoder:latest"
+        amd64_image: "master-rcoder:latest"
+        default_image: "master-rcoder:latest"
+        image_tag_prefix: "rcoder-agent-runner"
+        enabled: true
+
+        environment:
+          RUST_LOG: "debug"
+          SERVICE_MODE: "agent-only"
+          AGENT_PORT: "8086"
+
+        command:
+          - "/app/bin/agent_runner"
+          - "--port"
+          - "8086"
+
+        resource_limits:
+          memory_limit: 4294967296 # 4GB
+          cpu_limit: 3.0
+          swap_limit: 8589934592 # 8GB
+
+        work_dir: "/app"
+        network_mode: "bridge"
+
+        mounts:
+          - container_path: "/app/specs"
+            host_path: "/app/specs"
+            read_only: false
+            mount_type: "bind"
+
+    # 镜像选择策略
+    selection_strategy: "ServiceOnly"
+
+    # 缓存配置
+    cache_config:
+      enabled: true
+      ttl_seconds: 3600
+      max_entries: 50
+
+  # 其他 Docker 配置
+  network_mode: "bridge"
+  work_dir: "/app"
+  auto_cleanup: true
+  container_ttl_seconds: 3600

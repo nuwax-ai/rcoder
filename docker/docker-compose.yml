@@ -13,11 +13,12 @@ services:
     volumes:
       # 挂载 Docker socket
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+      # 🎯 挂载本地测试配置文件（使用与主容器相同的镜像）
+      - ./config.yml:/app/config.yml
       # 挂载项目工作目录 - 这是关键的挂载！
       - ./project_workspace:/app/project_workspace
       # 挂载工作目录
       - ./logs/:/app/logs
-      - ./specs:/app/specs
       # 挂载启动脚本
       - ./start-rcoder.sh:/app/start-rcoder.sh
     command: ["/bin/bash", "/app/start-rcoder.sh"]
@@ -29,8 +30,8 @@ services:
       start_period: 60s
     restart: always
     networks:
-      - agent-network
+      - local-agent-network
 
 networks:
-  agent-network:
+  local-agent-network:
     driver: bridge

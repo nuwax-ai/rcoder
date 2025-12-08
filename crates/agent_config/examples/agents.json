@@ -14,8 +14,7 @@
       "installation": {
         "package_manager": "npm",
         "package_name": "@zed-industries/claude-code-acp",
-        "version": "latest",
-        "validate_command": ["claude-code-acp", "--version"]
+        "version": "latest"
       },
       "enabled": true,
       "metadata": {
