@@ -16,20 +16,19 @@ help:
 	@echo "  make update-image-tag - 根据系统架构更新镜像标签 (arm64/amd64 -> latest)"
 	@echo ""
 	@echo "🔧 开发模式命令："
-	@echo "  make dev-up         - 启动开发模式容器（挂载本地编译的可执行文件）"
-	@echo "  make dev-restart    - 重启开发模式容器（重新编译并启动）"
-	@echo "  make dev-restart-full - 完整重启（重新构建镜像+启动，确保代码更改生效）"
+	@echo "  make dev-up         - 启动开发模式容器（使用镜像内编译的二进制）"
+	@echo "  make dev-restart    - 重启开发模式容器（重新构建镜像并启动）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
 	@echo ""
 	@echo "开发模式工作流程："
-	@echo "  1. make dev-build    # 首次：编译+构建镜像"
+	@echo "  1. make dev-build    # 首次：构建 Docker 镜像（容器内编译）"
 	@echo "  2. make dev-up       # 启动容器"
-	@echo "  3. 修改代码后: make dev-restart  # 快速：仅编译+重启容器"
+	@echo "  3. 修改代码后: make dev-restart  # 重新构建镜像+重启容器"
 	@echo ""
 	@echo "💡 提示："
-	@echo "  - dev-build: 首次使用，会构建 Docker 镜像（较慢）"
-	@echo "  - dev-restart: 日常开发，只编译+重启（快速迭代）"
+	@echo "  - dev-build: 在 Docker 容器内编译，确保 Linux 兼容性"
+	@echo "  - dev-restart: 每次代码修改都需要重新构建镜像（容器内重新编译）"
 	@echo ""
 
 # 本地编译（仅编译，不构建镜像）
@@ -44,7 +43,7 @@ docker-build:
 	@echo "🐳 构建 Docker 镜像..."
 	@echo "📍 镜像名称: master-rcoder:latest"
 	@echo "📦 使用 Dockerfile 多阶段构建（会在镜像内编译）..."
-	@docker build -f docker/Dockerfile -t master-rcoder:latest .
+	@docker build -f docker/rcoder-master/Dockerfile -t master-rcoder:latest .
 	@echo "✅ Docker 镜像构建完成！"
 	@echo ""
 	@echo "🎯 使用方式："
@@ -75,7 +74,7 @@ uninstall:
 # 开发模式：Docker 镜像构建（在容器内编译，避免 glibc 版本不匹配）
 dev-build:
 	@echo "🐳 构建 Docker 镜像（容器内编译）..."
-	@docker build -f docker/Dockerfile -t master-rcoder:latest .
+	@docker build -f docker/rcoder-master/Dockerfile -t master-rcoder:latest .
 	@echo ""
 	@echo "🎉 构建完成！"
 	@echo "  ✓ Docker 镜像: master-rcoder:latest"
@@ -90,21 +89,18 @@ dev-up:
 		echo "❌ 错误: 未找到 docker/docker-compose.yml"; \
 		exit 1; \
 	fi
-	@if [ ! -f "docker/rcoder" ]; then \
-		echo "⚠️  警告: 未找到 ./docker/rcoder，请先运行 'make dev-build'"; \
-	fi
 	@echo "🔧 使用开发模式配置："
-	@echo "  - 可执行文件: ./docker/rcoder (本地编译)"
+	@echo "  - 镜像: master-rcoder:latest (容器内编译的 Linux 二进制)"
 	@echo "  - 启动命令: 直接执行 /app/rcoder"
 	@RCODER_IMAGE=master-rcoder:latest \
 	docker-compose -f docker/docker-compose.yml up -d
 	@echo "📋 开发模式服务状态:"
-	@RCODER_MODE=dev docker-compose -f docker/docker-compose.yml ps
+	@docker-compose -f docker/docker-compose.yml ps
 
 dev-down:
 	@echo "🛑 停止开发模式容器服务..."
 	@if [ -f "docker/docker-compose.yml" ]; then \
-		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml down; \
+		docker-compose -f docker/docker-compose.yml down; \
 	else \
 		echo "⚠️  docker-compose.yml 未找到，跳过停止操作"; \
 	fi
@@ -112,7 +108,7 @@ dev-down:
 dev-logs:
 	@echo "📋 查看开发模式服务日志..."
 	@if [ -f "docker/docker-compose.yml" ]; then \
-		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml logs -f; \
+		docker-compose -f docker/docker-compose.yml logs -f; \
 	else \
 		echo "❌ 错误: 未找到 docker/docker-compose.yml"; \
 		exit 1; \
@@ -123,8 +119,8 @@ dev-logs:
 dev-restart: dev-build
 	@echo "🔄 重启容器服务（使用最新构建的镜像）..."
 	@if [ -f "docker/docker-compose.yml" ]; then \
-		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml down; \
-		RCODER_MODE=dev docker-compose -f docker/docker-compose.yml up -d; \
+		docker-compose -f docker/docker-compose.yml down; \
+		docker-compose -f docker/docker-compose.yml up -d; \
 		echo "✅ 容器已重启！"; \
 	else \
 		echo "❌ 错误: 未找到 docker-compose.yml"; \

@@ -153,7 +153,29 @@ impl AgentInstallationManager {
         }
 
         // Not installed or validation failed, try to install
-        self.install(config, None).await
+        info!("📦 尝试安装 Agent: {}", command);
+        let result = self.install(config, None).await;
+
+        match &result {
+            Ok(install_result) => {
+                if install_result.success {
+                    info!(
+                        "✅ Agent 安装成功: {} - {}",
+                        command, install_result.message
+                    );
+                } else {
+                    warn!(
+                        "⚠️ Agent 安装失败: {} - {}",
+                        command, install_result.message
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("❌ Agent 安装过程出错: {} - {}", command, e);
+            }
+        }
+
+        result
     }
 
     /// Install agent using appropriate package manager
@@ -198,14 +220,14 @@ impl AgentInstallationManager {
 
         // 使用 which 检查命令是否可用（适用于 Debian/Docker 环境）
         // which::which 是 Rust crate，不依赖系统 which 命令
+        // 注意：只检查命令是否在 PATH 中，不运行命令避免副作用（如 claude-code-acp --version 会阻塞）
         if self.is_command_available(command).await {
             debug!("✅ 命令存在于 PATH 中: {}", command);
             return Ok(true);
         }
 
-        // 如果 which 失败，尝试运行 --version 作为后备验证
-        let result = self.try_version_check(command).await;
-        Ok(result)
+        debug!("❌ 命令不在 PATH 中: {}", command);
+        Ok(false)
     }
 
     /// Check if a command is available in PATH
@@ -234,33 +256,6 @@ impl AgentInstallationManager {
             })?;
 
         Ok(output.status.success())
-    }
-
-    /// Try running command with --version to check if it works
-    async fn try_version_check(&self, command: &str) -> bool {
-        // Try --version first
-        if let Ok(output) = tokio::process::Command::new(command)
-            .arg("--version")
-            .output()
-            .await
-        {
-            if output.status.success() {
-                let version = String::from_utf8_lossy(&output.stdout);
-                debug!("版本检查成功: {} -> {}", command, version.trim());
-                return true;
-            }
-        }
-
-        // Try --help as fallback
-        if let Ok(output) = tokio::process::Command::new(command)
-            .arg("--help")
-            .output()
-            .await
-        {
-            return output.status.success();
-        }
-
-        false
     }
 
     /// Update agent to latest version

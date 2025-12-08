@@ -23,8 +23,7 @@
       "installation": {
         "package_manager": "npm",
         "package_name": "@anthropics/claude-code-acp",
-        "version": "latest",
-        "validate_command": ["claude-code-acp", "--version"]
+        "version": "latest"
       },
       "enabled": true,
       "metadata": {
