@@ -10,6 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::proxy_agent::*;
+use crate::service::AGENT_REGISTRY;
 use crate::{router::AppState, *};
 
 /// 用户请求结构 - 支持多媒体内容
@@ -208,8 +209,8 @@ pub async fn handle_chat(
         new_project_id
     };
 
-    // 🚦 检查 Agent 状态，禁止并发请求
-    if let Some(agent_info) = crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP.get(&project_id)
+    // 🚦 检查 Agent 状态，禁止并发请求（使用统一 Registry）
+    if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id)
         && agent_info.status == AgentStatus::Active
     {
         info!(

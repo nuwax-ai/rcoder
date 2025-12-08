@@ -4,9 +4,9 @@ pub mod cleanup_task;
 use crate::CancelNotificationRequestWrapper;
 use crate::{
     model::{AgentSessionUpdate, SessionNotify},
-    service::push_session_update,
+    service::{push_session_update, AGENT_REGISTRY},
 };
-pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
+pub use acp_agent::{LocalSetAgentRequest, agent_worker};
 use agent_abstraction::compat::AgentStopHandleArc;
 use agent_client_protocol::{Client, PermissionOptionKind, PromptRequest, SessionId};
 use dashmap::DashMap;
@@ -163,12 +163,10 @@ impl Client for AcpAgentClient {
 
         // 如果 SessionNotification.meta 中没有 request_id，则通过 session_id 查找 project_id，再从 SESSION_REQUEST_CONTEXT 获取
         let request_id = request_id_from_notification.or_else(|| {
-            // 从 PROJECT_AND_AGENT_INFO_MAP 中找到对应的 project_id
-            PROJECT_AND_AGENT_INFO_MAP
-                .iter()
-                .find(|entry| entry.value().session_id.to_string() == session_id_str)
-                .and_then(|entry| {
-                    let project_id = entry.key().clone();
+            // 使用统一 Registry 的 O(1) 反向查询（替代旧的 O(n) 遍历）
+            AGENT_REGISTRY
+                .get_project_by_session(&session_id_str)
+                .and_then(|project_id| {
                     // 使用 project_id 从 SESSION_REQUEST_CONTEXT 获取 request_id
                     SESSION_REQUEST_CONTEXT.get(&project_id).map(|entry| {
                         let req_id = entry.value().clone();

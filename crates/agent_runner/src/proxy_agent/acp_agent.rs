@@ -3,13 +3,12 @@
 //! 负责处理 Agent 请求队列，管理 Agent 会话的创建和复用。
 //! 使用 AcpSessionManager 进行会话管理。
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use agent_abstraction::session::AcpSessionManager;
 use agent_client_protocol::{PromptRequest, SessionId};
 use anyhow::Result;
 use chrono::Utc;
-use dashmap::DashMap;
 use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
@@ -17,16 +16,9 @@ use tracing::{debug, error, info};
 use crate::{
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
-    service::StateAwareNotifier,
+    service::{StateAwareNotifier, AGENT_REGISTRY},
     utils::ContentBuilder,
 };
-
-/// 全局 ProjectAndAgentInfo 映射
-///
-/// 保留此全局变量以保持与现有 HTTP API 的兼容性。
-/// 内部使用 AcpSessionManager 进行会话管理。
-pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
-    LazyLock::new(DashMap::new);
 
 /// LocalSet 中运行的 Agent 请求
 #[derive(Debug)]
@@ -135,10 +127,10 @@ pub async fn agent_worker(
             }
         };
 
-        // 4. 更新全局状态（HTTP API 兼容性）
+        // 4. 更新全局状态（使用统一的 AGENT_REGISTRY）
         if worker_response.is_new_session {
             if let Some(handles) = &worker_response.session_handles {
-                debug!("🆕 新会话，更新 PROJECT_AND_AGENT_INFO_MAP");
+                debug!("🆕 新会话，注册到 AGENT_REGISTRY");
 
                 let project_and_agent_info = ProjectAndAgentInfo {
                     project_id: project_id.clone(),
@@ -153,29 +145,20 @@ pub async fn agent_worker(
                     stop_handle: handles.lifecycle_handle.clone(),
                 };
 
-                PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info);
-
-                // 建立 project_id -> session_id 映射
-                let cleared = crate::service::ensure_project_session(
+                // 使用统一的 AGENT_REGISTRY 注册（自动处理所有映射）
+                AGENT_REGISTRY.register(
                     &project_id,
                     &worker_response.session_id,
-                )
-                .await;
+                    project_and_agent_info,
+                );
 
-                if cleared > 0 {
-                    info!(
-                        "🧹 Project session 映射更新，已清理旧消息: project_id={}, cleared_count={}",
-                        project_id, cleared
-                    );
-                } else {
-                    info!(
-                        "🔗 Project session 映射已同步: project_id={}, session_id={}",
-                        project_id, worker_response.session_id
-                    );
-                }
+                info!(
+                    "🔗 Agent 已注册到 AGENT_REGISTRY: project_id={}, session_id={}",
+                    project_id, worker_response.session_id
+                );
             }
         } else {
-            debug!("♻️ 复用会话，无需更新全局 MAP");
+            debug!("♻️ 复用会话，无需更新全局 Registry");
         }
 
         // 5. 更新 SESSION_REQUEST_CONTEXT（请求追踪）

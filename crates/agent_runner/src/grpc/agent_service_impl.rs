@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_client_protocol::{CancelNotification, SessionId};
 use shared_types::ModelProviderConfig;
 use shared_types::grpc::{
     CancelRequest, CancelResponse, CancelResultType, ChatRequest as GrpcChatRequest,
@@ -13,16 +14,17 @@ use shared_types::grpc::{
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent, ProgressRequest,
     agent_service_server::AgentService,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::model::AgentStatus;
-use crate::proxy_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP};
+use crate::proxy_agent::LocalSetAgentRequest;
 use crate::router::AppState;
-use crate::service::SESSION_CACHE;
+use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
+use crate::{CancelNotificationRequestWrapper, CancelResult};
 use shared_types::ChatPromptBuilder;
 
 /// 将 gRPC ModelProviderConfig 转换为内部 ModelProviderConfig
@@ -81,8 +83,8 @@ impl AgentService for AgentServiceImpl {
             Some(req.session_id.clone())
         };
 
-        // 检查 Agent 状态，禁止并发请求
-        if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
+        // 检查 Agent 状态，禁止并发请求（使用统一 Registry）
+        if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id) {
             if agent_info.status == AgentStatus::Active {
                 return Err(Status::failed_precondition(
                     "Agent正在执行任务，请等待当前任务完成后再发送新请求",
@@ -284,15 +286,124 @@ impl AgentService for AgentServiceImpl {
             req.session_id, req.reason
         );
 
-        // TODO: 实现取消逻辑，复用现有 agent_session_cancel handler
-        // 目前返回成功响应
-        let response = CancelResponse {
-            success: true,
-            result: CancelResultType::CancelResultSuccess as i32,
-            message: Some("取消请求已接收".to_string()),
+        // 1. 通过统一 Registry 的 O(1) 反向查询获取 project_id
+        let project_id = match AGENT_REGISTRY.get_project_by_session(&req.session_id) {
+            Some(pid) => {
+                debug!(
+                    "✅ [gRPC] 找到 session_id={} 对应的 project_id={}",
+                    req.session_id, pid
+                );
+                pid
+            }
+            None => {
+                warn!(
+                    "⚠️ [gRPC] 未找到 session_id={} 对应的 project",
+                    req.session_id
+                );
+                // 会话不存在或已完成，返回成功（幂等设计）
+                return Ok(Response::new(CancelResponse {
+                    success: true,
+                    result: CancelResultType::CancelResultSuccess as i32,
+                    message: Some("会话不存在或已完成".to_string()),
+                }));
+            }
         };
 
-        Ok(Response::new(response))
+        // 2. 获取 agent_info
+        let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
+            Some(info) => info,
+            None => {
+                return Ok(Response::new(CancelResponse {
+                    success: true,
+                    result: CancelResultType::CancelResultSuccess as i32,
+                    message: Some("Agent 已停止".to_string()),
+                }));
+            }
+        };
+
+        // 3. 创建 SessionId 和 CancelNotification
+        let session_id_obj = SessionId::new(Arc::from(req.session_id.as_str()));
+        let cancel_notification = CancelNotification::new(session_id_obj);
+
+        // 4. 创建 oneshot channel 等待取消结果
+        let (result_tx, result_rx) = oneshot::channel::<CancelResult>();
+        let cancel_request = CancelNotificationRequestWrapper {
+            cancel_notification,
+            result_tx,
+        };
+
+        // 5. 发送取消通知
+        if let Err(e) = agent_info.cancel_tx.send(cancel_request) {
+            error!("❌ [gRPC] 发送取消通知失败: {}", e);
+            return Ok(Response::new(CancelResponse {
+                success: false,
+                result: CancelResultType::CancelResultFailed as i32,
+                message: Some(format!("发送取消通知失败: {}", e)),
+            }));
+        }
+
+        info!(
+            "📡 [gRPC] 等待 Agent 取消响应: session_id={}",
+            req.session_id
+        );
+
+        // 6. 等待取消响应（带超时）
+        match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
+            Ok(Ok(cancel_result)) => {
+                let is_success = cancel_result.is_success();
+                info!(
+                    "✅ [gRPC] 收到 Agent 取消响应: session_id={}, success={}",
+                    req.session_id, is_success
+                );
+
+                if is_success {
+                    // 清理 SESSION_CACHE
+                    if let Some(session_data) = SESSION_CACHE.get(&req.session_id) {
+                        session_data.close_current_connection();
+                    }
+                    if SESSION_CACHE.remove(&req.session_id).is_some() {
+                        info!(
+                            "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
+                            req.session_id
+                        );
+                    }
+
+                    Ok(Response::new(CancelResponse {
+                        success: true,
+                        result: CancelResultType::CancelResultSuccess as i32,
+                        message: Some("取消成功".to_string()),
+                    }))
+                } else {
+                    Ok(Response::new(CancelResponse {
+                        success: false,
+                        result: CancelResultType::CancelResultFailed as i32,
+                        message: Some("Agent 取消执行失败".to_string()),
+                    }))
+                }
+            }
+            Ok(Err(e)) => {
+                error!(
+                    "❌ [gRPC] 等待 Agent 取消响应通道关闭: session_id={}, error={:?}",
+                    req.session_id, e
+                );
+                Ok(Response::new(CancelResponse {
+                    success: false,
+                    result: CancelResultType::CancelResultFailed as i32,
+                    message: Some(format!("响应通道关闭: {}", e)),
+                }))
+            }
+            Err(_) => {
+                warn!(
+                    "⚠️ [gRPC] 等待 Agent 取消响应超时: session_id={}",
+                    req.session_id
+                );
+                Ok(Response::new(CancelResponse {
+                    success: false,
+                    result: CancelResultType::CancelResultTimeout as i32,
+                    message: Some("取消请求超时（30秒）".to_string()),
+                }))
+            }
+        }
     }
 
     /// 获取 Agent 状态
@@ -304,7 +415,8 @@ impl AgentService for AgentServiceImpl {
         let req = request.into_inner();
         info!("📊 [gRPC] GetStatus: project_id={}", req.project_id);
 
-        let status = if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(&req.project_id) {
+        // 使用统一 Registry 获取 Agent 状态
+        let status = if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&req.project_id) {
             match agent_info.status {
                 AgentStatus::Active => "busy",
                 AgentStatus::Idle => "idle",
