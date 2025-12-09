@@ -76,11 +76,18 @@ impl<
         // 应用用户提示词模板（如果有）
         let final_user_prompt =
             assembler.apply_user_prompt(default_agent_id, &request.prompt_message.content);
-        debug!(
-            "📝 用户提示词: has_template={}, original_len={}, final_len={}",
+        info!(
+            "📝 用户提示词处理: has_template={}, original_len={}, final_len={}",
             assembler.has_user_prompt_template_override(),
             request.prompt_message.content.len(),
             final_user_prompt.len()
+        );
+        debug!(
+            "📝 用户提示词: has_template={}, original_len={}, final_len={}, final_content={}",
+            assembler.has_user_prompt_template_override(),
+            request.prompt_message.content.len(),
+            final_user_prompt.len(),
+            final_user_prompt
         );
 
         // 获取 MCP 服务器配置（入参有值则使用入参，否则使用默认配置）
