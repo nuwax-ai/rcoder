@@ -128,6 +128,23 @@ pub struct PromptMessage {
 
     /// 服务类型
     pub service_type: shared_types::ServiceType,
+
+    // === 新增字段 (v2) ===
+
+    /// 系统提示词覆盖
+    ///
+    /// 如果提供，将覆盖默认的系统提示词配置
+    pub system_prompt_override: Option<String>,
+
+    /// 用户提示词模板覆盖
+    ///
+    /// 如果提供，将使用此模板替换 `{user_prompt}` 变量
+    pub user_prompt_template_override: Option<String>,
+
+    /// Agent 运行时配置覆盖（MCP 服务器等）
+    ///
+    /// 包含 Agent 服务器配置和 MCP 服务器配置
+    pub agent_config_override: Option<shared_types::ChatAgentConfig>,
 }
 
 impl PromptMessage {
@@ -148,6 +165,10 @@ impl PromptMessage {
             attachments: Vec::new(),
             data_source_attachments: Vec::new(),
             service_type,
+            // 新增字段默认为 None
+            system_prompt_override: None,
+            user_prompt_template_override: None,
+            agent_config_override: None,
         }
     }
 
@@ -168,6 +189,27 @@ impl PromptMessage {
         self.data_source_attachments = data_source_attachments;
         self
     }
+
+    /// 设置系统提示词覆盖
+    pub fn with_system_prompt_override(mut self, system_prompt: Option<String>) -> Self {
+        self.system_prompt_override = system_prompt;
+        self
+    }
+
+    /// 设置用户提示词模板覆盖
+    pub fn with_user_prompt_template_override(mut self, template: Option<String>) -> Self {
+        self.user_prompt_template_override = template;
+        self
+    }
+
+    /// 设置 Agent 配置覆盖
+    pub fn with_agent_config_override(
+        mut self,
+        config: Option<shared_types::ChatAgentConfig>,
+    ) -> Self {
+        self.agent_config_override = config;
+        self
+    }
 }
 
 /// 从 ChatPrompt 转换为 PromptMessage
@@ -185,6 +227,10 @@ impl From<shared_types::ChatPrompt> for PromptMessage {
             attachments: chat_prompt.attachments,
             data_source_attachments: chat_prompt.data_source_attachments,
             service_type: chat_prompt.service_type,
+            // 新增字段映射
+            system_prompt_override: chat_prompt.system_prompt_override,
+            user_prompt_template_override: chat_prompt.user_prompt_template_override,
+            agent_config_override: chat_prompt.agent_config_override,
         }
     }
 }

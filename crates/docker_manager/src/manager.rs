@@ -3,7 +3,6 @@ use super::{
     DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
     RCODER_NETWORK_BASE_NAME,
 };
-use shared_types::ContainerBasicInfo;
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
     LogsOptions, RemoveContainerOptions, RestartContainerOptions, StartContainerOptions,
@@ -17,6 +16,7 @@ use bollard::{
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use shared_types::ContainerBasicInfo;
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -508,6 +508,7 @@ impl DockerManager {
         project_id: &str,
         host_workspace_path: &str,
         service_type: shared_types::ServiceType,
+        request_resource_limits: Option<shared_types::ServiceResourceLimits>,
     ) -> DockerResult<ContainerBasicInfo> {
         info!(
             "启动 Agent 容器: project_id={}, type={:?}, host_path={}",
@@ -530,10 +531,7 @@ impl DockerManager {
         // 解析容器内工作目录路径
         let mut variables = std::collections::HashMap::new();
         variables.insert("project_id".to_string(), project_id.to_string());
-        variables.insert(
-            "service_type".to_string(),
-            service_type.to_string(),
-        );
+        variables.insert("service_type".to_string(), service_type.to_string());
         let container_work_path = service_config.resolve_container_path(&variables);
 
         // 构建基础配置
@@ -548,10 +546,25 @@ impl DockerManager {
 
         // 应用资源限制
         let limits = service_config.resource_limits;
+
+        // 合并资源限制：请求级别覆盖服务级别
+        let final_resource_limits = match request_resource_limits {
+            Some(request_limits) => {
+                // 再次验证（防御性编程）
+                request_limits.validate().map_err(|e| {
+                    DockerError::ConfigurationError(format!("Invalid resource limits: {}", e))
+                })?;
+
+                // 合并配置
+                limits.merge_with(&request_limits)
+            }
+            None => limits,
+        };
+
         builder = builder.resource_limits(crate::types::ResourceLimits {
-            memory_limit: limits.memory_limit.map(|v| v as i64),
-            cpu_limit: limits.cpu_limit,
-            swap_limit: limits.swap_limit.map(|v| v as i64),
+            memory_limit: final_resource_limits.memory_limit.map(|v| v as i64),
+            cpu_limit: final_resource_limits.cpu_limit,
+            swap_limit: final_resource_limits.swap_limit.map(|v| v as i64),
         });
 
         // 添加环境变量
@@ -574,16 +587,13 @@ impl DockerManager {
         let config = builder
             .build()
             .map_err(|e| DockerError::ContainerCreationError(e.to_string()))?;
-        
+
         self.create_container(config).await?;
 
         // 5. 等待就绪并返回信息
-        let info = self
-            .get_agent_info(project_id)
-            .await?
-            .ok_or_else(|| {
-                DockerError::ContainerStartError("容器启动后无法获取信息".to_string())
-            })?;
+        let info = self.get_agent_info(project_id).await?.ok_or_else(|| {
+            DockerError::ContainerStartError("容器启动后无法获取信息".to_string())
+        })?;
 
         // 健康检查
         crate::health::wait_for_service_ready(&info.service_url)

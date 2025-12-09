@@ -9,10 +9,17 @@ use std::time::Duration;
 use agent_client_protocol::{CancelNotification, SessionId};
 use shared_types::ModelProviderConfig;
 use shared_types::grpc::{
-    CancelRequest, CancelResponse, CancelResultType, ChatRequest as GrpcChatRequest,
+    CancelRequest, CancelResponse, CancelResultType, ChatAgentConfig as GrpcChatAgentConfig,
+    ChatAgentServerConfig as GrpcChatAgentServerConfig,
+    ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, GetStatusRequest, GetStatusResponse,
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent, ProgressRequest,
-    agent_service_server::AgentService,
+    agent_service_server::AgentService, attachment, attachment_source,
+};
+use shared_types::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
+use shared_types::{
+    Attachment, AttachmentSource, AudioAttachment, DocumentAttachment, ImageAttachment,
+    ImageDimensions, TextAttachment,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::Stream;
@@ -38,6 +45,127 @@ fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProvider
         default_model: grpc_config.model,
         api_protocol: None, // 从 provider 名称推断
     }
+}
+
+/// 将 gRPC ChatAgentConfig 转换为内部 ChatAgentConfig
+fn convert_agent_config(grpc_config: GrpcChatAgentConfig) -> ChatAgentConfig {
+    ChatAgentConfig {
+        agent_server: grpc_config.agent_server.map(convert_agent_server_config),
+        context_servers: grpc_config
+            .context_servers
+            .into_iter()
+            .map(|(k, v)| (k, convert_context_server_config(v)))
+            .collect(),
+        resource_limits: None, // gRPC 消息中暂时不传递 resource_limits
+    }
+}
+
+/// 将 gRPC ChatAgentServerConfig 转换为内部 ChatAgentServerConfig
+fn convert_agent_server_config(grpc_config: GrpcChatAgentServerConfig) -> ChatAgentServerConfig {
+    ChatAgentServerConfig {
+        agent_id: grpc_config.agent_id,
+        command: grpc_config.command,
+        args: if grpc_config.args.is_empty() {
+            None
+        } else {
+            Some(grpc_config.args)
+        },
+        env: if grpc_config.env.is_empty() {
+            None
+        } else {
+            Some(grpc_config.env)
+        },
+        metadata: if grpc_config.metadata.is_empty() {
+            None
+        } else {
+            Some(grpc_config.metadata)
+        },
+    }
+}
+
+/// 将 gRPC ChatContextServerConfig 转换为内部 ChatContextServerConfig
+fn convert_context_server_config(
+    grpc_config: GrpcChatContextServerConfig,
+) -> ChatContextServerConfig {
+    ChatContextServerConfig {
+        source: grpc_config.source,
+        enabled: grpc_config.enabled,
+        command: grpc_config.command,
+        args: if grpc_config.args.is_empty() {
+            None
+        } else {
+            Some(grpc_config.args)
+        },
+        env: if grpc_config.env.is_empty() {
+            None
+        } else {
+            Some(grpc_config.env)
+        },
+    }
+}
+
+/// 将 gRPC AttachmentSource 转换为内部 AttachmentSource
+fn convert_attachment_source(
+    grpc_source: Option<shared_types::grpc::AttachmentSource>,
+) -> Option<AttachmentSource> {
+    let source = grpc_source?.source?;
+    Some(match source {
+        attachment_source::Source::FilePath(path) => AttachmentSource::FilePath { path },
+        attachment_source::Source::Base64(data) => AttachmentSource::Base64 {
+            data: data.data,
+            mime_type: data.mime_type,
+        },
+        attachment_source::Source::Url(url) => AttachmentSource::Url { url },
+    })
+}
+
+/// 将 gRPC Attachment 转换为内部 Attachment
+fn convert_attachment(grpc_attachment: shared_types::grpc::Attachment) -> Option<Attachment> {
+    let attachment_type = grpc_attachment.attachment_type?;
+
+    Some(match attachment_type {
+        attachment::AttachmentType::Text(text) => Attachment::Text(TextAttachment {
+            id: text.id,
+            source: convert_attachment_source(text.source)?,
+            filename: text.filename,
+            description: text.description,
+        }),
+        attachment::AttachmentType::Image(image) => Attachment::Image(ImageAttachment {
+            id: image.id,
+            source: convert_attachment_source(image.source)?,
+            mime_type: image.mime_type,
+            filename: image.filename,
+            description: image.description,
+            dimensions: image.dimensions.map(|d| ImageDimensions {
+                width: d.width,
+                height: d.height,
+            }),
+        }),
+        attachment::AttachmentType::Audio(audio) => Attachment::Audio(AudioAttachment {
+            id: audio.id,
+            source: convert_attachment_source(audio.source)?,
+            mime_type: audio.mime_type,
+            filename: audio.filename,
+            description: audio.description,
+            duration: audio.duration,
+        }),
+        attachment::AttachmentType::Document(doc) => Attachment::Document(DocumentAttachment {
+            id: doc.id,
+            source: convert_attachment_source(doc.source)?,
+            mime_type: doc.mime_type,
+            filename: doc.filename,
+            description: doc.description,
+            size: doc.size,
+        }),
+    })
+}
+
+/// 批量转换附件列表
+fn convert_attachments(grpc_attachments: Vec<shared_types::grpc::Attachment>) -> Vec<Attachment> {
+    grpc_attachments
+        .into_iter()
+        .filter_map(convert_attachment)
+        .collect()
 }
 
 /// gRPC AgentService 实现
@@ -111,18 +239,26 @@ impl AgentService for AgentServiceImpl {
         // 生成 request_id
         let request_id = req
             .request_id
+            .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace("-", ""));
 
-        // 构建 ChatPrompt
+        // 转换新增的配置字段 (v2)
+        let agent_config_override = req.agent_config.map(convert_agent_config);
+
+        // 构建 ChatPrompt（包含新增的 override 字段）
         let chat_prompt = ChatPromptBuilder::default()
             .project_id(project_id.clone())
             .project_path(project_dir)
             .session_id(session_id.clone())
             .prompt(req.prompt)
-            .attachments(vec![]) // TODO: 转换 gRPC Attachment 到内部类型
+            .attachments(convert_attachments(req.attachments))
             .data_source_attachments(req.data_source_attachments)
             .service_type(shared_types::ServiceType::RCoder)
             .request_id(request_id.clone())
+            // 新增字段 (v2)
+            .system_prompt_override(req.system_prompt)
+            .user_prompt_template_override(req.user_prompt)
+            .agent_config_override(agent_config_override)
             .build()
             .map_err(|e| Status::internal(format!("构建 ChatPrompt 失败: {}", e)))?;
 
@@ -282,23 +418,56 @@ impl AgentService for AgentServiceImpl {
     ) -> Result<Response<CancelResponse>, Status> {
         let req = request.into_inner();
         info!(
-            "🛑 [gRPC] CancelSession: session_id={}, reason={}",
-            req.session_id, req.reason
+            "🛑 [gRPC] CancelSession: session_id={}, project_id={}, reason={}",
+            req.session_id, req.project_id, req.reason
         );
 
+        // 🔧 确定实际的 session_id
+        // 当 session_id 为空时，根据 project_id 查找
+        let actual_session_id = if req.session_id.is_empty() {
+            info!(
+                "📝 [gRPC] session_id 为空，根据 project_id={} 查找",
+                req.project_id
+            );
+
+            match AGENT_REGISTRY.get_agent_info(&req.project_id) {
+                Some(info) => {
+                    let sid = info.session_id.to_string();
+                    info!(
+                        "✅ [gRPC] 从 project_id={} 获取到 session_id={}",
+                        req.project_id, sid
+                    );
+                    sid
+                }
+                None => {
+                    info!(
+                        "ℹ️ [gRPC] project_id={} 无活动会话，取消目标已达成",
+                        req.project_id
+                    );
+                    return Ok(Response::new(CancelResponse {
+                        success: true,
+                        result: CancelResultType::CancelResultSuccess as i32,
+                        message: Some("项目无活动会话".to_string()),
+                    }));
+                }
+            }
+        } else {
+            req.session_id.clone()
+        };
+
         // 1. 通过统一 Registry 的 O(1) 反向查询获取 project_id
-        let project_id = match AGENT_REGISTRY.get_project_by_session(&req.session_id) {
+        let project_id = match AGENT_REGISTRY.get_project_by_session(&actual_session_id) {
             Some(pid) => {
                 debug!(
                     "✅ [gRPC] 找到 session_id={} 对应的 project_id={}",
-                    req.session_id, pid
+                    actual_session_id, pid
                 );
                 pid
             }
             None => {
                 warn!(
                     "⚠️ [gRPC] 未找到 session_id={} 对应的 project",
-                    req.session_id
+                    actual_session_id
                 );
                 // 会话不存在或已完成，返回成功（幂等设计）
                 return Ok(Response::new(CancelResponse {
@@ -322,7 +491,7 @@ impl AgentService for AgentServiceImpl {
         };
 
         // 3. 创建 SessionId 和 CancelNotification
-        let session_id_obj = SessionId::new(Arc::from(req.session_id.as_str()));
+        let session_id_obj = SessionId::new(Arc::from(actual_session_id.as_str()));
         let cancel_notification = CancelNotification::new(session_id_obj);
 
         // 4. 创建 oneshot channel 等待取消结果
@@ -344,7 +513,7 @@ impl AgentService for AgentServiceImpl {
 
         info!(
             "📡 [gRPC] 等待 Agent 取消响应: session_id={}",
-            req.session_id
+            actual_session_id
         );
 
         // 6. 等待取消响应（带超时）
@@ -353,18 +522,18 @@ impl AgentService for AgentServiceImpl {
                 let is_success = cancel_result.is_success();
                 info!(
                     "✅ [gRPC] 收到 Agent 取消响应: session_id={}, success={}",
-                    req.session_id, is_success
+                    actual_session_id, is_success
                 );
 
                 if is_success {
                     // 清理 SESSION_CACHE
-                    if let Some(session_data) = SESSION_CACHE.get(&req.session_id) {
+                    if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
                         session_data.close_current_connection();
                     }
-                    if SESSION_CACHE.remove(&req.session_id).is_some() {
+                    if SESSION_CACHE.remove(&actual_session_id).is_some() {
                         info!(
                             "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
-                            req.session_id
+                            actual_session_id
                         );
                     }
 
@@ -384,7 +553,7 @@ impl AgentService for AgentServiceImpl {
             Ok(Err(e)) => {
                 error!(
                     "❌ [gRPC] 等待 Agent 取消响应通道关闭: session_id={}, error={:?}",
-                    req.session_id, e
+                    actual_session_id, e
                 );
                 Ok(Response::new(CancelResponse {
                     success: false,
@@ -395,7 +564,7 @@ impl AgentService for AgentServiceImpl {
             Err(_) => {
                 warn!(
                     "⚠️ [gRPC] 等待 Agent 取消响应超时: session_id={}",
-                    req.session_id
+                    actual_session_id
                 );
                 Ok(Response::new(CancelResponse {
                     success: false,
@@ -452,7 +621,9 @@ fn unified_message_to_progress_event(
         message_type: format!("{:?}", message.message_type),
         sub_type: message.sub_type.clone(),
         payload: serde_json::to_string(&message.data).unwrap_or_default(),
-        request_id: message.data.get("request_id")
+        request_id: message
+            .data
+            .get("request_id")
             .and_then(|v| v.as_str())
             .map(String::from),
         timestamp,

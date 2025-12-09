@@ -21,6 +21,16 @@ pub struct ChatRequest {
     pub data_source_attachments: ::prost::alloc::vec::Vec<
         ::prost::alloc::string::String,
     >,
+    /// === 新增字段 (v2) ===
+    /// 系统提示词（可选，覆盖默认配置）
+    #[prost(string, optional, tag = "8")]
+    pub system_prompt: ::core::option::Option<::prost::alloc::string::String>,
+    /// 用户提示词模板（可选，支持 {user_prompt} 变量替换）
+    #[prost(string, optional, tag = "9")]
+    pub user_prompt: ::core::option::Option<::prost::alloc::string::String>,
+    /// Agent 运行时配置（可选，包含 Agent 服务器和 MCP 服务器配置）
+    #[prost(message, optional, tag = "10")]
+    pub agent_config: ::core::option::Option<ChatAgentConfig>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {
@@ -68,10 +78,14 @@ pub struct ProgressEvent {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelRequest {
+    /// 可选，为空时使用 project_id 查找
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub reason: ::prost::alloc::string::String,
+    /// 用于按项目取消（当 session_id 为空时）
+    #[prost(string, tag = "3")]
+    pub project_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelResponse {
@@ -151,9 +165,6 @@ pub struct TextAttachment {
     pub filename: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "4")]
     pub description: ::core::option::Option<::prost::alloc::string::String>,
-    /// 编程语言
-    #[prost(string, optional, tag = "5")]
-    pub language: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// 图像附件
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -224,6 +235,66 @@ pub mod attachment {
         #[prost(message, tag = "4")]
         Document(super::DocumentAttachment),
     }
+}
+/// Agent 运行时配置
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChatAgentConfig {
+    /// 单个 Agent 服务器配置（可选）
+    #[prost(message, optional, tag = "1")]
+    pub agent_server: ::core::option::Option<ChatAgentServerConfig>,
+    /// MCP 服务器配置（多个）
+    #[prost(map = "string, message", tag = "2")]
+    pub context_servers: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ChatContextServerConfig,
+    >,
+}
+/// 单个 Agent 服务器配置
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChatAgentServerConfig {
+    /// Agent 标识符（可选，默认 "claude-code-acp"）
+    #[prost(string, optional, tag = "1")]
+    pub agent_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 执行命令
+    #[prost(string, optional, tag = "2")]
+    pub command: ::core::option::Option<::prost::alloc::string::String>,
+    /// 命令参数
+    #[prost(string, repeated, tag = "3")]
+    pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// 环境变量
+    #[prost(map = "string, string", tag = "4")]
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+    /// 元数据
+    #[prost(map = "string, string", tag = "5")]
+    pub metadata: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+/// MCP 服务器配置
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChatContextServerConfig {
+    /// 服务器来源类型: "custom" 或 "local"
+    #[prost(string, tag = "1")]
+    pub source: ::prost::alloc::string::String,
+    /// 是否启用
+    #[prost(bool, tag = "2")]
+    pub enabled: bool,
+    /// 执行命令 (如 "bunx", "uvx", "npx")
+    #[prost(string, optional, tag = "3")]
+    pub command: ::core::option::Option<::prost::alloc::string::String>,
+    /// 命令参数
+    #[prost(string, repeated, tag = "4")]
+    pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// 环境变量
+    #[prost(map = "string, string", tag = "5")]
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// 取消结果类型（对应 Rust CancelResult）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

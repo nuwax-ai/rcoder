@@ -17,6 +17,7 @@ impl ContainerManager {
     pub async fn get_or_create_container(
         project_id: &str,
         service_type: &shared_types::ServiceType,
+        request_resource_limits: Option<shared_types::ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
             "🔍 [CONTAINER_MGR] 开始处理容器: project_id={}, service_type={:?}",
@@ -24,7 +25,8 @@ impl ContainerManager {
         );
 
         // 检查或创建容器
-        let container_info = ensure_container_exists(project_id, service_type).await?;
+        let container_info =
+            ensure_container_exists(project_id, service_type, request_resource_limits).await?;
 
         info!(
             "✅ [CONTAINER_MGR] 容器准备就绪: project_id={}, container_id={}",
@@ -62,6 +64,7 @@ impl ContainerManager {
 async fn ensure_container_exists(
     project_id: &str,
     service_type: &shared_types::ServiceType,
+    request_resource_limits: Option<shared_types::ServiceResourceLimits>,
 ) -> Result<ContainerBasicInfo, AppError> {
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
@@ -82,7 +85,13 @@ async fn ensure_container_exists(
         project_id, service_type
     );
 
-    create_container_for_request(project_id, service_type, &docker_manager).await
+    create_container_for_request(
+        project_id,
+        service_type,
+        &docker_manager,
+        request_resource_limits,
+    )
+    .await
 }
 
 /// 为请求创建容器
@@ -90,12 +99,13 @@ async fn create_container_for_request(
     project_id: &str,
     service_type: &shared_types::ServiceType,
     docker_manager: &std::sync::Arc<DockerManager>,
+    request_resource_limits: Option<shared_types::ServiceResourceLimits>,
 ) -> Result<ContainerBasicInfo, AppError> {
     // 1. 准备工作目录
     let project_workspace = get_project_workspace(project_id).await?;
-    create_project_workspace(project_id).await.map_err(|e| {
-        AppError::internal_server_error(&format!("创建工作目录失败: {}", e))
-    })?;
+    create_project_workspace(project_id)
+        .await
+        .map_err(|e| AppError::internal_server_error(&format!("创建工作目录失败: {}", e)))?;
 
     // 2. 解析宿主机路径
     // rcoder 运行在容器内，需要知道其挂载卷在宿主机上的真实路径
@@ -117,6 +127,7 @@ async fn create_container_for_request(
             project_id,
             &host_path.to_string_lossy(),
             service_type.clone(),
+            request_resource_limits,
         )
         .await
         .map_err(|e| {

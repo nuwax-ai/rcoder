@@ -8,6 +8,7 @@ pub mod resolver;
 pub mod types;
 
 // Re-export main types
+pub use config::prompt_assembler::PromptConfigAssembler;
 pub use config::servers_config::AgentServersConfig;
 pub use resolver::env_resolver::EnvironmentVariableResolver;
 pub use types::agent_config::AgentConfig;

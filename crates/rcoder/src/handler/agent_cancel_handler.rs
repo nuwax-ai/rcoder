@@ -91,9 +91,9 @@ async fn forward_cancel_request_to_container_service(
         grpc_addr, session_id_display
     );
 
-    // 构建 session_id（如果未提供则使用 "all"）
-    let session_id_str = session_id.unwrap_or("all").to_string();
-    let reason = format!("用户请求取消: project_id={}", project_id);
+    // 构建 session_id（如果未提供则使用空字符串，由 Agent Runner 根据 project_id 查找）
+    let session_id_str = session_id.unwrap_or("").to_string();
+    let reason = "用户请求取消".to_string();
 
     // 调用 gRPC CancelSession
     match crate::grpc::grpc_cancel_session_with_pool(
@@ -101,6 +101,7 @@ async fn forward_cancel_request_to_container_service(
         &grpc_addr,
         session_id_str.clone(),
         reason,
+        project_id.to_string(),
     )
     .await
     {

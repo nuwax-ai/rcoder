@@ -48,7 +48,6 @@ impl std::str::FromStr for ServiceType {
 }
 
 impl ServiceType {
-
     /// 获取服务类型的描述
     pub fn description(&self) -> &str {
         match self {
@@ -149,8 +148,6 @@ mod tests {
                     memory_limit: None,
                     cpu_limit: None,
                     swap_limit: None,
-                    disk_limit: None,
-                    process_limit: None,
                 },
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
@@ -176,8 +173,6 @@ mod tests {
                     memory_limit: None,
                     cpu_limit: None,
                     swap_limit: None,
-                    disk_limit: None,
-                    process_limit: None,
                 },
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
@@ -206,10 +201,17 @@ mod tests {
     #[test]
     fn test_service_type_basic() {
         assert_eq!(ServiceType::RCoder.to_string(), "rcoder");
-        assert_eq!(ServiceType::ComputerAgentRunner.to_string(), "computer-agent-runner");
+        assert_eq!(
+            ServiceType::ComputerAgentRunner.to_string(),
+            "computer-agent-runner"
+        );
 
         assert!(ServiceType::RCoder.description().contains("完整"));
-        assert!(ServiceType::ComputerAgentRunner.description().contains("执行"));
+        assert!(
+            ServiceType::ComputerAgentRunner
+                .description()
+                .contains("执行")
+        );
     }
 
     #[test]

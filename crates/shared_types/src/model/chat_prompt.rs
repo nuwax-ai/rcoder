@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use super::{Attachment, ModelProviderConfig};
+use crate::ChatAgentConfig;
 use derive_builder::Builder;
 
 #[derive(Debug, Clone, Builder)]
@@ -30,6 +31,26 @@ pub struct ChatPrompt {
     /// 模型提供商配置
     #[builder(default)]
     pub model_provider: Option<ModelProviderConfig>,
+
+    // === 新增字段 (v2) ===
+
+    /// 可选的系统提示词覆盖
+    ///
+    /// 如果提供，将覆盖默认的系统提示词配置
+    #[builder(default)]
+    pub system_prompt_override: Option<String>,
+
+    /// 可选的用户提示词模板覆盖
+    ///
+    /// 如果提供，将使用此模板替换 `{user_prompt}` 变量
+    #[builder(default)]
+    pub user_prompt_template_override: Option<String>,
+
+    /// 可选的 Agent 运行时配置覆盖
+    ///
+    /// 包含 Agent 服务器配置和 MCP 服务器配置
+    #[builder(default)]
+    pub agent_config_override: Option<ChatAgentConfig>,
 }
 
 /// 返回用户 prompt 的提示,一定有project_id ,session_id ,否则报错

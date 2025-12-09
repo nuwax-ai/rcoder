@@ -66,7 +66,7 @@ pub struct ServiceMountConfig {
 }
 
 /// 服务资源限制配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceResourceLimits {
     /// 内存限制（字节）
     pub memory_limit: Option<u64>,
@@ -74,12 +74,49 @@ pub struct ServiceResourceLimits {
     pub cpu_limit: Option<f64>,
     /// 交换空间限制（字节）
     pub swap_limit: Option<u64>,
-    /// 磁盘空间限制（字节）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disk_limit: Option<u64>,
-    /// 进程数限制
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub process_limit: Option<u64>,
+}
+
+impl ServiceResourceLimits {
+    /// 验证资源限制的合理性
+    pub fn validate(&self) -> Result<(), String> {
+        // 内存限制：512MB ~ 64GB
+        if let Some(memory) = self.memory_limit {
+            if memory < 512 * 1024 * 1024 {
+                return Err("memory_limit must be at least 512MB".to_string());
+            }
+            if memory > 64 * 1024 * 1024 * 1024 {
+                return Err("memory_limit cannot exceed 64GB".to_string());
+            }
+        }
+
+        // CPU 限制：0.5 ~ 32 核
+        if let Some(cpu) = self.cpu_limit {
+            if cpu < 0.5 {
+                return Err("cpu_limit must be at least 0.5 cores".to_string());
+            }
+            if cpu > 32.0 {
+                return Err("cpu_limit cannot exceed 32 cores".to_string());
+            }
+        }
+
+        // Swap 应该 >= 内存
+        if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit) {
+            if swap < memory {
+                return Err("swap_limit should be >= memory_limit".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 合并资源限制（override_limits 覆盖 self 中的字段）
+    pub fn merge_with(&self, override_limits: &ServiceResourceLimits) -> Self {
+        Self {
+            memory_limit: override_limits.memory_limit.or(self.memory_limit),
+            cpu_limit: override_limits.cpu_limit.or(self.cpu_limit),
+            swap_limit: override_limits.swap_limit.or(self.swap_limit),
+        }
+    }
 }
 
 /// 验证结果
@@ -127,8 +164,7 @@ impl ServiceImageConfig {
                 {
                     return ConfigValidationResult::Warning(format!(
                         "服务类型 {} 的镜像名称 '{}' 可能包含无效字符",
-                        self.service_type,
-                        image
+                        self.service_type, image
                     ));
                 }
             }
@@ -154,8 +190,7 @@ impl ServiceImageConfig {
             if mount.mount_type != "bind" && mount.mount_type != "volume" {
                 return ConfigValidationResult::Warning(format!(
                     "服务类型 {} 包含不支持的挂载类型 '{}'",
-                    self.service_type,
-                    mount.mount_type
+                    self.service_type, mount.mount_type
                 ));
             }
         }
@@ -333,8 +368,6 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB
         cpu_limit: Some(2.0),                       // 2 核
         swap_limit: Some(4 * 1024 * 1024 * 1024),   // 4GB
-        disk_limit: None,                           // 不限制磁盘
-        process_limit: None,                        // 不限制进程数
     };
 
     ServiceImageConfig {
@@ -377,16 +410,20 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         memory_limit: Some(4 * 1024 * 1024 * 1024), // 4GB
         cpu_limit: Some(3.0),                       // 3 核
         swap_limit: Some(8 * 1024 * 1024 * 1024),   // 8GB
-        disk_limit: None,                           // 不限制磁盘
-        process_limit: None,                        // 不限制进程数
     };
 
     ServiceImageConfig {
         service_type: ServiceType::ComputerAgentRunner,
         image: None, // 使用架构特定镜像
-        arm64_image: Some("registry.yichamao.com/rcoder-computer-agent-runner:latest-arm64".to_string()),
-        amd64_image: Some("registry.yichamao.com/rcoder-computer-agent-runner:latest-amd64".to_string()),
-        default_image: Some("registry.yichamao.com/rcoder-computer-agent-runner:latest".to_string()),
+        arm64_image: Some(
+            "registry.yichamao.com/rcoder-computer-agent-runner:latest-arm64".to_string(),
+        ),
+        amd64_image: Some(
+            "registry.yichamao.com/rcoder-computer-agent-runner:latest-amd64".to_string(),
+        ),
+        default_image: Some(
+            "registry.yichamao.com/rcoder-computer-agent-runner:latest".to_string(),
+        ),
         image_tag_prefix: Some("rcoder-computer-agent-runner".to_string()),
         enabled: false, // 默认禁用，等待新功能开发
         environment,
@@ -462,8 +499,6 @@ mod tests {
                 memory_limit: None,
                 cpu_limit: None,
                 swap_limit: None,
-                disk_limit: None,
-                process_limit: None,
             },
             work_dir: "/app".to_string(),
             network_mode: "bridge".to_string(),
@@ -508,5 +543,115 @@ mod tests {
         assert!(summary.contains("rcoder"));
         assert!(summary.contains("Enabled: true"));
         assert!(summary.contains("registry.yichamao.com/rcoder"));
+    }
+
+    #[test]
+    fn test_resource_limits_validation_valid() {
+        let valid = ServiceResourceLimits {
+            memory_limit: Some(1024 * 1024 * 1024), // 1GB
+            cpu_limit: Some(2.0),
+            swap_limit: Some(2 * 1024 * 1024 * 1024),
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn test_resource_limits_validation_invalid_memory_too_small() {
+        let invalid = ServiceResourceLimits {
+            memory_limit: Some(256 * 1024 * 1024), // 256MB - 太小
+            cpu_limit: None,
+            swap_limit: None,
+        };
+        assert!(invalid.validate().is_err());
+        assert!(invalid.validate().unwrap_err().contains("at least 512MB"));
+    }
+
+    #[test]
+    fn test_resource_limits_validation_invalid_memory_too_large() {
+        let invalid = ServiceResourceLimits {
+            memory_limit: Some(100 * 1024 * 1024 * 1024), // 100GB - 太大
+            cpu_limit: None,
+            swap_limit: None,
+        };
+        assert!(invalid.validate().is_err());
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("cannot exceed 64GB")
+        );
+    }
+
+    #[test]
+    fn test_resource_limits_validation_invalid_cpu_too_small() {
+        let invalid = ServiceResourceLimits {
+            memory_limit: None,
+            cpu_limit: Some(0.1), // 太小
+            swap_limit: None,
+        };
+        assert!(invalid.validate().is_err());
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("at least 0.5 cores")
+        );
+    }
+
+    #[test]
+    fn test_resource_limits_validation_invalid_swap_less_than_memory() {
+        let invalid = ServiceResourceLimits {
+            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            cpu_limit: None,
+            swap_limit: Some(1024 * 1024 * 1024), // swap < memory
+        };
+        assert!(invalid.validate().is_err());
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("should be >= memory_limit")
+        );
+    }
+
+    #[test]
+    fn test_resource_limits_merge() {
+        let default_limits = ServiceResourceLimits {
+            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            cpu_limit: Some(2.0),
+            swap_limit: Some(4 * 1024 * 1024 * 1024),
+        };
+
+        let override_limits = ServiceResourceLimits {
+            memory_limit: Some(4 * 1024 * 1024 * 1024), // 覆盖
+            cpu_limit: None,                            // 不覆盖
+            swap_limit: Some(8 * 1024 * 1024 * 1024),   // 覆盖
+        };
+
+        let merged = default_limits.merge_with(&override_limits);
+        assert_eq!(merged.memory_limit, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(merged.cpu_limit, Some(2.0)); // 保留默认
+        assert_eq!(merged.swap_limit, Some(8 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_resource_limits_merge_all_none() {
+        let default_limits = ServiceResourceLimits {
+            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            cpu_limit: Some(2.0),
+            swap_limit: Some(4 * 1024 * 1024 * 1024),
+        };
+
+        let override_limits = ServiceResourceLimits {
+            memory_limit: None,
+            cpu_limit: None,
+            swap_limit: None,
+        };
+
+        let merged = default_limits.merge_with(&override_limits);
+        // 所有字段都应该保留默认值
+        assert_eq!(merged.memory_limit, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(merged.cpu_limit, Some(2.0));
+        assert_eq!(merged.swap_limit, Some(4 * 1024 * 1024 * 1024));
     }
 }
