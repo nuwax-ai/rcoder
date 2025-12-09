@@ -415,3 +415,147 @@ async fn stop_container_runtime_mode(
 
     Ok(())
 }
+
+/// 为所有启用的服务构建容器清理模式列表
+///
+/// 从多镜像配置中获取所有启用的服务类型，并生成对应的容器名称模式
+///
+/// # Arguments
+///
+/// * `multi_image_config` - 多镜像配置
+///
+/// # Returns
+///
+/// 返回容器名称模式列表，如 `["rcoder-agent-*", "agent-runner-*"]`
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use docker_manager::container_stop;
+/// use shared_types;
+///
+/// let config = shared_types::create_default_multi_image_config();
+/// let patterns = container_stop::get_container_patterns_for_enabled_services(&config);
+/// println!("容器模式: {:?}", patterns);
+/// ```
+pub fn get_container_patterns_for_enabled_services(
+    multi_image_config: &shared_types::MultiImageConfig,
+) -> Vec<String> {
+    shared_types::get_enabled_service_types(multi_image_config)
+        .into_iter()
+        .filter_map(|service_name| {
+            // 使用 parse() 并处理错误
+            match service_name.parse::<shared_types::ServiceType>() {
+                Ok(service_type) => {
+                    Some(format!("{}-*", service_type.container_prefix()))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "解析服务类型失败: {} - {:?}，跳过生成容器模式",
+                        service_name,
+                        e
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// 清理所有启用服务的容器（启动时清理）
+///
+/// 自动从配置中获取所有启用的服务，并清理对应的容器。此函数会：
+/// - 从配置中读取启用的服务类型
+/// - 为每个服务类型生成容器模式
+/// - 并行清理多个服务类型的容器
+/// - 聚合所有清理结果
+///
+/// # Arguments
+///
+/// * `docker_manager` - Docker管理器实例
+/// * `multi_image_config` - 多镜像配置
+///
+/// # Returns
+///
+/// 返回聚合的 `CleanupResult` 包含所有服务的清理统计信息
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use docker_manager::container_stop;
+/// use docker_manager::DockerManager;
+/// use shared_types;
+/// use std::sync::Arc;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// # let docker_manager = Arc::new(DockerManager::new(Default::default()).await?);
+/// let config = shared_types::create_default_multi_image_config();
+///
+/// let result = container_stop::startup_cleanup_all_enabled_services(
+///     &docker_manager,
+///     &config
+/// ).await?;
+///
+/// println!("清理了 {} 个容器", result.successfully_removed);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn startup_cleanup_all_enabled_services(
+    docker_manager: &Arc<DockerManager>,
+    multi_image_config: &shared_types::MultiImageConfig,
+) -> DockerResult<CleanupResult> {
+    let patterns = get_container_patterns_for_enabled_services(multi_image_config);
+
+    if patterns.is_empty() {
+        warn!("⚠️ 没有启用的服务，跳过容器清理");
+        return Ok(CleanupResult::default());
+    }
+
+    info!("🧹 开始清理所有启用服务的容器: {:?}", patterns);
+    let start_time = Instant::now();
+
+    // 并行清理多个服务类型的容器
+    let cleanup_tasks: Vec<_> = patterns
+        .into_iter()
+        .map(|pattern| {
+            let docker_manager = docker_manager.clone();
+            let pattern_clone = pattern.clone();
+            tokio::spawn(async move {
+                startup_cleanup_containers(&docker_manager, &pattern_clone).await
+            })
+        })
+        .collect();
+
+    // 聚合所有清理结果
+    let mut aggregated_result = CleanupResult::default();
+    for task in cleanup_tasks {
+        match task.await {
+            Ok(Ok(result)) => {
+                aggregated_result.total_found += result.total_found;
+                aggregated_result.successfully_removed += result.successfully_removed;
+                aggregated_result.failed_removals += result.failed_removals;
+                aggregated_result.skipped_running += result.skipped_running;
+                aggregated_result.removed_container_ids.extend(result.removed_container_ids);
+                aggregated_result.failed_removals_details.extend(result.failed_removals_details);
+            }
+            Ok(Err(e)) => {
+                warn!("清理服务容器失败: {}", e);
+            }
+            Err(e) => {
+                warn!("清理任务执行失败: {}", e);
+            }
+        }
+    }
+
+    aggregated_result.duration_ms = start_time.elapsed().as_millis() as u64;
+
+    info!(
+        "🎯 [MULTI_SERVICE_CLEANUP] 多服务清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
+        aggregated_result.total_found,
+        aggregated_result.successfully_removed,
+        aggregated_result.failed_removals,
+        aggregated_result.duration_ms
+    );
+
+    Ok(aggregated_result)
+}

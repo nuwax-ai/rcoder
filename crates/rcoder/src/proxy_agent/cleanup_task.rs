@@ -110,15 +110,43 @@ pub struct AgentCleaner {
     config: CleanupConfig,
     stats: CleanupStats,
     state: Arc<AppState>,
+    /// 🆕 预计算的容器模式列表（支持多服务类型）
+    container_patterns: Vec<String>,
 }
 
 impl AgentCleaner {
     /// 创建新的清理器
-    pub fn new(config: CleanupConfig, state: Arc<AppState>) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - 清理配置
+    /// * `state` - 应用状态
+    /// * `multi_image_config` - 多镜像配置，用于获取启用的服务类型
+    pub fn new(
+        config: CleanupConfig,
+        state: Arc<AppState>,
+        multi_image_config: shared_types::MultiImageConfig,
+    ) -> Self {
+        // 预计算所有启用服务的容器模式
+        let container_patterns =
+            docker_manager::container_stop::get_container_patterns_for_enabled_services(
+                &multi_image_config,
+            );
+
+        if container_patterns.is_empty() {
+            warn!("⚠️ 没有启用的服务，孤立容器清理将跳过");
+        } else {
+            info!(
+                "📋 [cleanup] 孤立容器清理将监控以下模式: {:?}",
+                container_patterns
+            );
+        }
+
         Self {
             config,
             stats: CleanupStats::default(),
             state,
+            container_patterns,
         }
     }
 
@@ -463,142 +491,217 @@ impl AgentCleaner {
             }
         };
 
-        // 🚀 优化1: 使用更快的容器列表查询，只获取基本信息
-        let containers = match docker_manager
-            .list_containers_with_pattern("rcoder-agent-*")
-            .await
-        {
-            Ok(containers) => containers,
-            Err(e) => {
-                warn!("列出容器失败，跳过孤立容器清理: {}", e);
-                return 0;
-            }
-        };
-
-        if containers.is_empty() {
-            debug!("✅ 未发现任何 rcoder-agent 容器");
+        // 🔧 使用预计算的容器模式列表
+        if self.container_patterns.is_empty() {
+            warn!("⚠️ 没有启用的服务，跳过孤立容器清理");
             return 0;
         }
 
-        // 🚀 优化2: 批量处理，减少Docker API调用次数
-        let mut orphaned_containers = Vec::new();
-        let mut protected_count = 0;
+        info!(
+            "🔍 [cleanup] 检查孤立容器，服务模式: {:?}",
+            self.container_patterns
+        );
 
-        // 快速筛选孤立容器（不进行详细的Docker查询）
-        for container in containers {
-            if let Some(names) = &container.names {
-                for name in names {
-                    let clean_name = name.trim_start_matches('/');
-                    if let Some(project_id) = clean_name.strip_prefix("rcoder-agent-") {
-                        // 检查 MAP 中是否有对应记录
-                        if !self.state.project_and_agent_map.contains_key(project_id) {
-                            // 🚀 优化3: 使用容器的创建时间而不是查询详细信息
-                            if let Some(created_at) = container.created {
-                                let created_time = DateTime::from_timestamp(created_at, 0)
-                                    .unwrap_or_else(Utc::now);
+        let mut total_cleaned = 0;
 
-                                if self
-                                    .should_skip_cleanup_due_to_protection(created_time, project_id)
-                                {
-                                    protected_count += 1;
-                                    debug!("🛡️ 容器在保护期内，跳过: {}", clean_name);
-                                    break;
+        // 🔧 遍历所有服务类型的容器模式
+        for pattern in &self.container_patterns {
+            info!("🔍 [cleanup] 扫描模式: {}", pattern);
+
+            // 🚀 优化1: 使用更快的容器列表查询，只获取基本信息
+            let containers = match docker_manager.list_containers_with_pattern(pattern).await {
+                Ok(containers) => containers,
+                Err(e) => {
+                    warn!("列出容器失败（模式: {}），跳过: {}", pattern, e);
+                    continue;
+                }
+            };
+
+            if containers.is_empty() {
+                debug!("✅ [cleanup] 未发现任何 {} 容器", pattern);
+                continue;
+            }
+
+            info!(
+                "🔍 [cleanup] 找到 {} 个匹配模式 '{}' 的容器",
+                containers.len(),
+                pattern
+            );
+
+            // 🚀 优化2: 批量处理，减少Docker API调用次数
+            let mut orphaned_containers = Vec::new();
+            let mut protected_count = 0;
+
+            // 快速筛选孤立容器（不进行详细的Docker查询）
+            for container in containers {
+                if let Some(names) = &container.names {
+                    for name in names {
+                        let clean_name = name.trim_start_matches('/');
+
+                        // 🔧 动态解析前缀（兼容多种服务类型）
+                        if let Some(project_id) =
+                            Self::extract_project_id_from_container_name(clean_name)
+                        {
+                            // 检查 MAP 中是否有对应记录
+                            if !self.state.project_and_agent_map.contains_key(&project_id) {
+                                // 🚀 优化3: 使用容器的创建时间而不是查询详细信息
+                                if let Some(created_at) = container.created {
+                                    let created_time = DateTime::from_timestamp(created_at, 0)
+                                        .unwrap_or_else(Utc::now);
+
+                                    if self.should_skip_cleanup_due_to_protection(
+                                        created_time,
+                                        &project_id,
+                                    ) {
+                                        protected_count += 1;
+                                        debug!("🛡️ [cleanup] 容器在保护期内，跳过: {}", clean_name);
+                                        break;
+                                    }
                                 }
-                            }
 
-                            orphaned_containers
-                                .push((project_id.to_string(), clean_name.to_string()));
-                            break; // 找到匹配的名称后跳出内层循环
+                                info!(
+                                    "🗑️ [cleanup] 发现孤立容器: {} (project_id={})",
+                                    clean_name, project_id
+                                );
+                                orphaned_containers.push((project_id, clean_name.to_string()));
+                                break; // 找到匹配的名称后跳出内层循环
+                            }
+                        } else {
+                            warn!("⚠️ [cleanup] 无法解析容器名称: {}", clean_name);
                         }
                     }
                 }
             }
-        }
 
-        if orphaned_containers.is_empty() {
-            debug!("✅ 未发现孤立容器");
-            return 0;
-        }
+            if orphaned_containers.is_empty() {
+                debug!("✅ [cleanup] 未发现孤立容器（模式: {}）", pattern);
+                continue;
+            }
 
-        info!("🗑️ 发现 {} 个孤立容器，开始清理", orphaned_containers.len());
-
-        // 🚀 优化4: 限制单次清理数量，避免长时间阻塞
-        let max_cleanup_per_round = 5; // 减少到5个，避免阻塞
-        let total_orphaned = orphaned_containers.len();
-        let containers_to_clean = orphaned_containers
-            .into_iter()
-            .take(max_cleanup_per_round)
-            .collect::<Vec<_>>();
-
-        if containers_to_clean.len() < total_orphaned {
             info!(
-                "🔒 限制单次清理数量为 {}，剩余容器将在下次清理",
-                max_cleanup_per_round
+                "🗑️ [cleanup] 发现 {} 个孤立容器（模式: {}），开始清理",
+                orphaned_containers.len(),
+                pattern
             );
-        }
 
-        // 🚀 优化5: 并行清理容器，提高效率
-        let mut cleanup_tasks = Vec::new();
+            // 🚀 优化4: 限制单次清理数量，避免长时间阻塞
+            let max_cleanup_per_round = 5; // 减少到5个，避免阻塞
+            let total_orphaned = orphaned_containers.len();
+            let containers_to_clean = orphaned_containers
+                .into_iter()
+                .take(max_cleanup_per_round)
+                .collect::<Vec<_>>();
 
-        for (project_id, container_name) in containers_to_clean {
-            let docker_manager_clone = docker_manager.clone();
-            let state_clone = self.state.clone();
-            let config = self.config.clone();
+            if containers_to_clean.len() < total_orphaned {
+                info!(
+                    "🔒 [cleanup] 限制单次清理数量为 {}，剩余容器将在下次清理",
+                    max_cleanup_per_round
+                );
+            }
 
-            let task = tokio::spawn(async move {
-                let cleanup_timeout = Duration::from_secs(30);
-                match timeout(
-                    cleanup_timeout,
-                    Self::cleanup_single_orphaned_container(
-                        &docker_manager_clone,
-                        &state_clone,
-                        &config,
-                        &project_id,
-                        &container_name,
-                    ),
-                )
-                .await
+            // 🚀 优化5: 并行清理容器，提高效率
+            let mut cleanup_tasks = Vec::new();
+
+            for (project_id, container_name) in containers_to_clean {
+                let docker_manager_clone = docker_manager.clone();
+                let state_clone = self.state.clone();
+                let config = self.config.clone();
+
+                let task = tokio::spawn(async move {
+                    let cleanup_timeout = Duration::from_secs(30);
+                    match timeout(
+                        cleanup_timeout,
+                        Self::cleanup_single_orphaned_container(
+                            &docker_manager_clone,
+                            &state_clone,
+                            &config,
+                            &project_id,
+                            &container_name,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            info!("✅ [cleanup] 成功清理孤立容器: {}", container_name);
+                            true
+                        }
+                        Ok(Err(e)) => {
+                            warn!("❌ [cleanup] 清理孤立容器失败: {} - {}", container_name, e);
+                            false
+                        }
+                        Err(_) => {
+                            warn!(
+                                "⏰ [cleanup] 清理孤立容器超时: {} (超时时间: {}秒)",
+                                container_name,
+                                cleanup_timeout.as_secs()
+                            );
+                            false
+                        }
+                    }
+                });
+
+                cleanup_tasks.push(task);
+            }
+
+            // 等待所有清理任务完成
+            for task in cleanup_tasks {
+                if let Ok(success) = task.await
+                    && success
                 {
-                    Ok(Ok(_)) => {
-                        info!("✅ 成功清理孤立容器: {}", container_name);
-                        true
-                    }
-                    Ok(Err(e)) => {
-                        warn!("❌ 清理孤立容器失败: {} - {}", container_name, e);
-                        false
-                    }
-                    Err(_) => {
-                        warn!(
-                            "⏰ 清理孤立容器超时: {} (超时时间: {}秒)",
-                            container_name,
-                            cleanup_timeout.as_secs()
-                        );
-                        false
-                    }
+                    total_cleaned += 1;
                 }
-            });
+            }
 
-            cleanup_tasks.push(task);
-        }
-
-        // 等待所有清理任务完成
-        let mut cleaned_count = 0;
-        for task in cleanup_tasks {
-            if let Ok(success) = task.await
-                && success
-            {
-                cleaned_count += 1;
+            if protected_count > 0 {
+                info!(
+                    "🛡️ [cleanup] 保护期内容器数量（模式: {}）: {}",
+                    pattern, protected_count
+                );
             }
         }
 
-        if cleaned_count > 0 || protected_count > 0 {
+        if total_cleaned > 0 {
             info!(
-                "🧹 孤立容器检查完成: 共清理 {} 个容器，保护期内 {} 个容器",
-                cleaned_count, protected_count
+                "🧹 [cleanup] 孤立容器检查完成: 共清理 {} 个容器（所有服务类型）",
+                total_cleaned
             );
+        } else {
+            debug!("✅ [cleanup] 未发现需要清理的孤立容器");
         }
 
-        cleaned_count
+        total_cleaned
+    }
+
+    /// 从容器名称中提取 project_id
+    ///
+    /// 支持多种服务类型的容器命名：
+    /// - rcoder-agent-{project_id}
+    /// - agent-runner-{project_id}
+    ///
+    /// # Arguments
+    ///
+    /// * `container_name` - 容器名称（已去除前导斜杠）
+    ///
+    /// # Returns
+    ///
+    /// 如果成功解析返回 `Some(project_id)`，否则返回 `None`
+    fn extract_project_id_from_container_name(container_name: &str) -> Option<String> {
+        // 移除前导斜杠（如果还有的话）
+        let name = container_name.trim_start_matches('/');
+
+        // 尝试匹配已知的服务前缀
+        for service_type in [
+            shared_types::ServiceType::RCoder,
+            shared_types::ServiceType::ComputerAgentRunner,
+        ] {
+            let prefix = format!("{}-", service_type.container_prefix());
+            if let Some(project_id) = name.strip_prefix(&prefix) {
+                return Some(project_id.to_string());
+            }
+        }
+
+        // 如果都不匹配，返回 None
+        None
     }
 
     /// 清理单个孤立容器
@@ -851,7 +954,15 @@ pub fn start_cleanup_task(
     config: CleanupConfig,
     state: Arc<AppState>,
 ) -> tokio::task::JoinHandle<()> {
-    let mut cleaner = AgentCleaner::new(config, state);
+    // 🔧 从 AppState 获取多镜像配置
+    let multi_image_config = state
+        .config
+        .docker_config
+        .as_ref()
+        .map(|dc| dc.get_multi_image_config())
+        .unwrap_or_else(shared_types::create_default_multi_image_config);
+
+    let mut cleaner = AgentCleaner::new(config, state, multi_image_config);
 
     tokio::task::spawn(async move {
         cleaner.run().await;

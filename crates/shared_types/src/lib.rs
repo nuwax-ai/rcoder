@@ -69,8 +69,7 @@ pub use service_config::{
     default_rcoder_service_config,
 };
 pub use service_type::{
-    ServiceType, get_enabled_service_types, get_supported_service_types, validate_service_enabled,
-    validate_service_type,
+    ServiceType, ServiceTypeError, get_enabled_service_types, get_supported_service_types,
 };
 
 // 导出ChatPrompt的Builder

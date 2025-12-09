@@ -124,11 +124,11 @@ impl MultiImageConfig {
         // 验证服务配置
         for (service_key, service_config) in &self.services {
             // 验证服务名称一致性
-            if service_config.service_type.as_str() != service_key {
+            if service_config.service_type.to_string() != *service_key {
                 return Err(ConfigError::ValidationError(format!(
                     "服务键 '{}'与服务类型 '{}' 不匹配",
                     service_key,
-                    service_config.service_type.as_str()
+                    service_config.service_type
                 )));
             }
 
@@ -162,8 +162,8 @@ impl MultiImageConfig {
 
     /// 获取指定服务类型的配置
     pub fn get_service_config(&self, service_type: &ServiceType) -> Option<&ServiceImageConfig> {
-        let service_key = service_type.as_str();
-        self.services.get(service_key)
+        let service_key = service_type.to_string();
+        self.services.get(&service_key)
     }
 
     /// 获取指定服务类型的可变配置
@@ -171,14 +171,14 @@ impl MultiImageConfig {
         &mut self,
         service_type: &ServiceType,
     ) -> Option<&mut ServiceImageConfig> {
-        let service_key = service_type.as_str();
-        self.services.get_mut(service_key)
+        let service_key = service_type.to_string();
+        self.services.get_mut(&service_key)
     }
 
     /// 添加或更新服务配置
     pub fn set_service_config(&mut self, service_type: ServiceType, config: ServiceImageConfig) {
-        let service_key = service_type.as_str();
-        self.services.insert(service_key.to_string(), config);
+        let service_key = service_type.to_string();
+        self.services.insert(service_key, config);
     }
 
     /// 获取启用的服务类型列表
@@ -213,7 +213,7 @@ impl MultiImageConfig {
             Ok(())
         } else {
             Err(ConfigError::ServiceNotFound(
-                service_type.as_str().to_string(),
+                service_type.to_string(),
             ))
         }
     }
@@ -279,9 +279,9 @@ impl Default for MultiImageConfig {
             crate::service_config::default_rcoder_service_config(),
         );
 
-        // 添加默认的 AgentRunner 服务配置
+        // 添加默认的 ComputerAgentRunner 服务配置
         services.insert(
-            "agent-runner".to_string(),
+            "computer-agent-runner".to_string(),
             crate::service_config::default_agent_runner_service_config(),
         );
 
@@ -341,10 +341,10 @@ impl ProjectImageOverrides {
         service_type: &ServiceType,
         config: &mut ServiceImageConfig,
     ) -> Result<(), ConfigError> {
-        let service_key = service_type.as_str();
+        let service_key = service_type.to_string();
 
         // 应用镜像覆盖
-        if let Some(override_image) = self.images.get(service_key) {
+        if let Some(override_image) = self.images.get(&service_key) {
             config.image = Some(override_image.clone());
             tracing::info!(
                 "应用项目级镜像覆盖到服务 '{}': {}",
@@ -390,8 +390,8 @@ impl ProjectImageOverrides {
 
     /// 检查服务是否在项目级配置中启用
     pub fn is_service_enabled(&self, service_type: &ServiceType) -> bool {
-        let service_key = service_type.as_str();
-        self.enabled_services.contains(&service_key.to_string())
+        let service_key = service_type.to_string();
+        self.enabled_services.contains(&service_key)
     }
 
     /// 获取配置摘要
@@ -470,9 +470,9 @@ mod tests {
             config.selection_strategy,
             ImageSelectionStrategy::ServiceOnly
         ));
-        assert_eq!(config.services.len(), 2); // rcoder + agent-runner
+        assert_eq!(config.services.len(), 2); // rcoder + computer-agent-runner
         assert!(config.is_service_enabled(&ServiceType::RCoder));
-        assert!(!config.is_service_enabled(&ServiceType::AgentRunner)); // 默认禁用
+        assert!(!config.is_service_enabled(&ServiceType::ComputerAgentRunner)); // 默认禁用
 
         // 验证配置摘要
         let summary = config.get_summary();
@@ -514,7 +514,7 @@ mod tests {
         // 测试不存在的服务
         assert!(
             config
-                .set_service_enabled(&ServiceType::AgentRunner, true)
+                .set_service_enabled(&ServiceType::ComputerAgentRunner, true)
                 .is_ok()
         ); // 存在
     }

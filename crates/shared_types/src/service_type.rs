@@ -1,6 +1,6 @@
 //! 服务类型定义
 //!
-//! 定义 RCoder 系统支持的服务类型，目前包括 RCoder 和 AgentRunner 两种类型。
+//! 定义 RCoder 系统支持的服务类型，目前包括 RCoder 和 ComputerAgentRunner 两种类型。
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,39 +15,45 @@ pub enum ServiceType {
     /// 标准 RCoder 服务 (当前使用)
     /// 提供完整的 AI 开发功能，包括项目管理、代码生成、文件操作等
     RCoder,
-    /// Agent Runner 服务 (新功能，后续开发使用)
+    /// Computer Agent Runner 服务 (新功能，后续开发使用)
     /// 专注于代理运行和执行，提供轻量级的代理执行环境
-    AgentRunner,
+    ComputerAgentRunner,
+}
+
+impl std::fmt::Display for ServiceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceType::RCoder => write!(f, "rcoder"),
+            ServiceType::ComputerAgentRunner => write!(f, "computer-agent-runner"),
+        }
+    }
+}
+
+impl std::str::FromStr for ServiceType {
+    type Err = ServiceTypeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // 空字符串检查
+        if s.trim().is_empty() {
+            return Err(ServiceTypeError::EmptyServiceType);
+        }
+
+        // 精确匹配
+        match s {
+            "rcoder" => Ok(ServiceType::RCoder),
+            "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
+            _ => Err(ServiceTypeError::InvalidServiceType(s.to_string())),
+        }
+    }
 }
 
 impl ServiceType {
-    /// 获取服务类型的字符串表示
-    pub fn as_str(&self) -> &str {
-        match self {
-            ServiceType::RCoder => "rcoder",
-            ServiceType::AgentRunner => "agent-runner",
-        }
-    }
-
-    /// 从字符串解析服务类型
-    ///
-    /// 如果传入的服务类型无效，会记录警告并默认返回 RCoder 服务
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "rcoder" => ServiceType::RCoder,
-            "agent-runner" => ServiceType::AgentRunner,
-            _ => {
-                tracing::warn!("未知的服务类型 '{}'，使用默认的 RCoder 服务", s);
-                ServiceType::RCoder
-            }
-        }
-    }
 
     /// 获取服务类型的描述
     pub fn description(&self) -> &str {
         match self {
             ServiceType::RCoder => "标准 RCoder 服务，提供完整的 AI 开发功能",
-            ServiceType::AgentRunner => "Agent Runner 服务，专注于代理运行和执行",
+            ServiceType::ComputerAgentRunner => "Computer Agent Runner 服务，专注于代理运行和执行",
         }
     }
 
@@ -55,14 +61,14 @@ impl ServiceType {
     pub fn container_prefix(&self) -> &str {
         match self {
             ServiceType::RCoder => "rcoder-agent",
-            ServiceType::AgentRunner => "agent-runner",
+            ServiceType::ComputerAgentRunner => "computer-agent-runner",
         }
     }
 
     /// 检查服务是否在给定的多镜像配置中启用
     pub fn is_enabled(&self, config: &crate::MultiImageConfig) -> bool {
-        let service_key = self.as_str();
-        if let Some(service_config) = config.services.get(service_key) {
+        let service_key = self.to_string();
+        if let Some(service_config) = config.services.get(&service_key) {
             service_config.enabled
         } else {
             tracing::warn!("服务类型 '{}' 未在配置中找到", service_key);
@@ -76,43 +82,15 @@ impl ServiceType {
 pub enum ServiceTypeError {
     #[error("服务类型不能为空")]
     EmptyServiceType,
-    #[error("不支持的服务类型 '{0}'，请使用 'rcoder' 或 'agent-runner'")]
+    #[error("不支持的服务类型 '{0}'，请使用 'rcoder' 或 'computer-agent-runner'")]
     InvalidServiceType(String),
     #[error("服务类型 '{0}' 已禁用")]
     ServiceDisabled(String),
 }
 
-/// 验证服务类型是否有效
-pub fn validate_service_type(service_type: &str) -> Result<ServiceType, ServiceTypeError> {
-    if service_type.trim().is_empty() {
-        return Err(ServiceTypeError::EmptyServiceType);
-    }
-
-    match service_type {
-        "rcoder" => Ok(ServiceType::RCoder),
-        "agent-runner" => Ok(ServiceType::AgentRunner),
-        _ => Err(ServiceTypeError::InvalidServiceType(
-            service_type.to_string(),
-        )),
-    }
-}
-
-/// 验证服务类型是否已启用
-pub fn validate_service_enabled(
-    service_type: &ServiceType,
-    config: &crate::MultiImageConfig,
-) -> Result<(), ServiceTypeError> {
-    if !service_type.is_enabled(config) {
-        return Err(ServiceTypeError::ServiceDisabled(
-            service_type.as_str().to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// 获取所有支持的服务类型
 pub fn get_supported_service_types() -> Vec<String> {
-    vec!["rcoder".to_string(), "agent-runner".to_string()]
+    vec!["rcoder".to_string(), "computer-agent-runner".to_string()]
 }
 
 /// 获取启用的服务类型列表
@@ -120,9 +98,21 @@ pub fn get_enabled_service_types(config: &crate::MultiImageConfig) -> Vec<String
     let supported = get_supported_service_types();
     supported
         .into_iter()
-        .filter(|service_type| {
-            let service = ServiceType::from_str(service_type);
-            service.is_enabled(config)
+        .filter_map(|service_type| {
+            // 使用 parse() 替代 from_str()
+            match service_type.parse::<ServiceType>() {
+                Ok(service) => {
+                    if service.is_enabled(config) {
+                        Some(service_type)
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("解析服务类型失败: {} - {:?}", service_type, e);
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -169,14 +159,14 @@ mod tests {
         );
 
         services.insert(
-            "agent-runner".to_string(),
+            "computer-agent-runner".to_string(),
             ServiceImageConfig {
-                service_type: ServiceType::AgentRunner,
+                service_type: ServiceType::ComputerAgentRunner,
                 image: None,
-                arm64_image: Some("registry.yichamao.com/agent-runner:arm64".to_string()),
-                amd64_image: Some("registry.yichamao.com/agent-runner:amd64".to_string()),
+                arm64_image: Some("registry.yichamao.com/computer-agent-runner:arm64".to_string()),
+                amd64_image: Some("registry.yichamao.com/computer-agent-runner:amd64".to_string()),
                 default_image: None,
-                image_tag_prefix: Some("agent-runner".to_string()),
+                image_tag_prefix: Some("computer-agent-runner".to_string()),
                 enabled: false, // 默认禁用
                 environment: HashMap::new(),
                 mounts: vec![],
@@ -215,33 +205,31 @@ mod tests {
 
     #[test]
     fn test_service_type_basic() {
-        assert_eq!(ServiceType::RCoder.as_str(), "rcoder");
-        assert_eq!(ServiceType::AgentRunner.as_str(), "agent-runner");
+        assert_eq!(ServiceType::RCoder.to_string(), "rcoder");
+        assert_eq!(ServiceType::ComputerAgentRunner.to_string(), "computer-agent-runner");
 
         assert!(ServiceType::RCoder.description().contains("完整"));
-        assert!(ServiceType::AgentRunner.description().contains("执行"));
+        assert!(ServiceType::ComputerAgentRunner.description().contains("执行"));
     }
 
     #[test]
     fn test_service_type_from_str() {
-        assert_eq!(ServiceType::from_str("rcoder"), ServiceType::RCoder);
+        // 有效的服务类型
         assert_eq!(
-            ServiceType::from_str("agent-runner"),
-            ServiceType::AgentRunner
+            "rcoder".parse::<ServiceType>().unwrap(),
+            ServiceType::RCoder
+        );
+        assert_eq!(
+            "computer-agent-runner".parse::<ServiceType>().unwrap(),
+            ServiceType::ComputerAgentRunner
         );
 
-        // 未知类型应该默认返回 RCoder
-        assert_eq!(ServiceType::from_str("unknown"), ServiceType::RCoder);
-    }
+        // 未知类型应该返回错误
+        assert!("unknown".parse::<ServiceType>().is_err());
 
-    #[test]
-    fn test_validate_service_type() {
-        assert!(validate_service_type("rcoder").is_ok());
-        assert!(validate_service_type("agent-runner").is_ok());
-
-        assert!(validate_service_type("").is_err());
-        assert!(validate_service_type("   ").is_err());
-        assert!(validate_service_type("unknown").is_err());
+        // 空字符串应该返回错误
+        assert!("".parse::<ServiceType>().is_err());
+        assert!("   ".parse::<ServiceType>().is_err());
     }
 
     #[test]
@@ -251,19 +239,8 @@ mod tests {
         // RCoder 应该启用
         assert!(ServiceType::RCoder.is_enabled(&config));
 
-        // AgentRunner 应该禁用
-        assert!(!ServiceType::AgentRunner.is_enabled(&config));
-    }
-
-    #[test]
-    fn test_validate_service_enabled() {
-        let config = create_test_config();
-
-        // RCoder 应该通过验证
-        assert!(validate_service_enabled(&ServiceType::RCoder, &config).is_ok());
-
-        // AgentRunner 应该失败
-        assert!(validate_service_enabled(&ServiceType::AgentRunner, &config).is_err());
+        // ComputerAgentRunner 应该禁用
+        assert!(!ServiceType::ComputerAgentRunner.is_enabled(&config));
     }
 
     #[test]
@@ -271,7 +248,7 @@ mod tests {
         let types = get_supported_service_types();
         assert_eq!(types.len(), 2);
         assert!(types.contains(&"rcoder".to_string()));
-        assert!(types.contains(&"agent-runner".to_string()));
+        assert!(types.contains(&"computer-agent-runner".to_string()));
     }
 
     #[test]
@@ -281,7 +258,7 @@ mod tests {
 
         assert_eq!(enabled.len(), 1);
         assert!(enabled.contains(&"rcoder".to_string()));
-        assert!(!enabled.contains(&"agent-runner".to_string()));
+        assert!(!enabled.contains(&"computer-agent-runner".to_string()));
     }
 
     #[test]
@@ -301,7 +278,7 @@ mod tests {
         let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
 
         ServiceType::RCoder.hash(&mut hasher1);
-        ServiceType::AgentRunner.hash(&mut hasher2);
+        ServiceType::ComputerAgentRunner.hash(&mut hasher2);
 
         assert_ne!(hasher1.finish(), hasher2.finish());
     }

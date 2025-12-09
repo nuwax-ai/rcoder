@@ -532,7 +532,7 @@ impl DockerManager {
         variables.insert("project_id".to_string(), project_id.to_string());
         variables.insert(
             "service_type".to_string(),
-            service_type.as_str().to_string(),
+            service_type.to_string(),
         );
         let container_work_path = service_config.resolve_container_path(&variables);
 

@@ -101,7 +101,7 @@ impl ServiceImageConfig {
         {
             return ConfigValidationResult::Error(format!(
                 "服务类型 {} 必须至少配置一个镜像",
-                self.service_type.as_str()
+                self.service_type
             ));
         }
 
@@ -116,7 +116,7 @@ impl ServiceImageConfig {
                 if image.trim().is_empty() {
                     return ConfigValidationResult::Warning(format!(
                         "服务类型 {} 包含空的镜像名称",
-                        self.service_type.as_str()
+                        self.service_type
                     ));
                 }
 
@@ -127,7 +127,7 @@ impl ServiceImageConfig {
                 {
                     return ConfigValidationResult::Warning(format!(
                         "服务类型 {} 的镜像名称 '{}' 可能包含无效字符",
-                        self.service_type.as_str(),
+                        self.service_type,
                         image
                     ));
                 }
@@ -139,14 +139,14 @@ impl ServiceImageConfig {
             if mount.container_path.trim().is_empty() {
                 return ConfigValidationResult::Error(format!(
                     "服务类型 {} 包含空的容器挂载路径",
-                    self.service_type.as_str()
+                    self.service_type
                 ));
             }
 
             if mount.host_path.trim().is_empty() {
                 return ConfigValidationResult::Error(format!(
                     "服务类型 {} 包含空的宿主机挂载路径",
-                    self.service_type.as_str()
+                    self.service_type
                 ));
             }
 
@@ -154,7 +154,7 @@ impl ServiceImageConfig {
             if mount.mount_type != "bind" && mount.mount_type != "volume" {
                 return ConfigValidationResult::Warning(format!(
                     "服务类型 {} 包含不支持的挂载类型 '{}'",
-                    self.service_type.as_str(),
+                    self.service_type,
                     mount.mount_type
                 ));
             }
@@ -216,7 +216,7 @@ impl ServiceImageConfig {
     pub fn get_summary(&self) -> String {
         format!(
             "ServiceType: {}, Enabled: {}, Image: {:?}, Mounts: {}",
-            self.service_type.as_str(),
+            self.service_type,
             self.enabled,
             self.image
                 .as_ref()
@@ -356,7 +356,7 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
     }
 }
 
-/// 创建默认的 Agent Runner 服务配置
+/// 创建默认的 Computer Agent Runner 服务配置
 pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     let mut environment = HashMap::new();
     environment.insert("RUST_LOG".to_string(), "debug".to_string());
@@ -372,7 +372,7 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         "8086".to_string(),
     ];
 
-    // 默认资源限制（AgentRunner 可能需要更多资源）
+    // 默认资源限制（ComputerAgentRunner 可能需要更多资源）
     let resource_limits = ServiceResourceLimits {
         memory_limit: Some(4 * 1024 * 1024 * 1024), // 4GB
         cpu_limit: Some(3.0),                       // 3 核
@@ -382,12 +382,12 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     };
 
     ServiceImageConfig {
-        service_type: ServiceType::AgentRunner,
+        service_type: ServiceType::ComputerAgentRunner,
         image: None, // 使用架构特定镜像
-        arm64_image: Some("registry.yichamao.com/rcoder-agent-runner:latest-arm64".to_string()),
-        amd64_image: Some("registry.yichamao.com/rcoder-agent-runner:latest-amd64".to_string()),
-        default_image: Some("registry.yichamao.com/rcoder-agent-runner:latest".to_string()),
-        image_tag_prefix: Some("rcoder-agent-runner".to_string()),
+        arm64_image: Some("registry.yichamao.com/rcoder-computer-agent-runner:latest-arm64".to_string()),
+        amd64_image: Some("registry.yichamao.com/rcoder-computer-agent-runner:latest-amd64".to_string()),
+        default_image: Some("registry.yichamao.com/rcoder-computer-agent-runner:latest".to_string()),
+        image_tag_prefix: Some("rcoder-computer-agent-runner".to_string()),
         enabled: false, // 默认禁用，等待新功能开发
         environment,
         mounts,

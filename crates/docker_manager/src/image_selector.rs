@@ -43,7 +43,7 @@ impl ImageSelector {
         if !self.is_service_enabled(service_type) {
             return Err(DockerError::ConfigurationError(format!(
                 "服务类型 '{}' 未启用或配置不存在",
-                service_type.as_str()
+                service_type
             )));
         }
 
@@ -55,7 +55,7 @@ impl ImageSelector {
         info!(
             "选择镜像: {} (服务: {}, 平台: {})",
             image_name,
-            service_type.as_str(),
+            service_type,
             self.platform
         );
 
@@ -71,33 +71,33 @@ impl ImageSelector {
         if !self.is_service_enabled(service_type) {
             return Err(DockerError::ConfigurationError(format!(
                 "服务类型 '{}' 未启用或配置不存在",
-                service_type.as_str()
+                service_type
             )));
         }
 
         // 从配置中获取服务配置
-        let service_key = service_type.as_str();
-        match self.config.services.get(service_key) {
+        let service_key = service_type.to_string();
+        match self.config.services.get(&service_key) {
             Some(service_config) => {
                 info!("获取服务配置成功: {}", service_key);
                 Ok(service_config.clone())
             }
             None => Err(DockerError::ConfigurationError(format!(
                 "服务类型 '{}' 的配置不存在",
-                service_type.as_str()
+                service_type
             ))),
         }
     }
 
     /// 检查服务是否已启用和配置
     pub fn is_service_enabled(&self, service_type: &ServiceType) -> bool {
-        let service_key = service_type.as_str();
+        let service_key = service_type.to_string();
         info!(
             "🔍 [IMAGE_SELECTOR] 检查服务是否启用: service_type={:?}, service_key={}",
             service_type, service_key
         );
 
-        if let Some(service_config) = self.config.services.get(service_key) {
+        if let Some(service_config) = self.config.services.get(&service_key) {
             info!(
                 "✅ [IMAGE_SELECTOR] 服务已找到: enabled={}, arm64_image={:?}",
                 service_config.enabled, service_config.arm64_image
@@ -120,10 +120,10 @@ impl ImageSelector {
         service_type: &ServiceType,
         _project_overrides: Option<&ProjectImageOverrides>,
     ) -> DockerResult<String> {
-        let service_key = service_type.as_str();
+        let service_key = service_type.to_string();
 
         // 1. 优先使用服务特定配置
-        if let Some(service_config) = self.config.services.get(service_key) {
+        if let Some(service_config) = self.config.services.get(&service_key) {
             // 服务级通用镜像（最高优先级）
             if let Some(image) = &service_config.image {
                 debug!("使用服务特定镜像: {}", image);

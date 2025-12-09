@@ -59,12 +59,36 @@ pub struct ResourceLimits {
     pub swap_limit: Option<i64>,
 }
 
-impl Default for DockerContainerConfig {
-    fn default() -> Self {
+impl DockerContainerConfig {
+    /// 为指定服务类型创建配置
+    ///
+    /// 使用服务类型动态获取容器名称前缀，避免硬编码
+    ///
+    /// # Arguments
+    ///
+    /// * `service_type` - 服务类型（RCoder 或 ComputerAgentRunner）
+    ///
+    /// # Returns
+    ///
+    /// 返回配置了正确容器前缀的 DockerContainerConfig
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use docker_manager::DockerContainerConfig;
+    /// use shared_types::ServiceType;
+    ///
+    /// let config = DockerContainerConfig::new_for_service(ServiceType::RCoder);
+    /// assert_eq!(config.name_prefix, "rcoder-agent");
+    ///
+    /// let config = DockerContainerConfig::new_for_service(ServiceType::ComputerAgentRunner);
+    /// assert_eq!(config.name_prefix, "computer-agent-runner");
+    /// ```
+    pub fn new_for_service(service_type: shared_types::ServiceType) -> Self {
         Self {
             project_id: String::new(),
             image: crate::default_docker_image(),
-            name_prefix: "rcoder-agent".to_string(),
+            name_prefix: service_type.container_prefix().to_string(), // 🔧 动态获取
             host_path: String::new(),
             container_path: crate::DEFAULT_WORK_DIR.to_string(),
             work_dir: crate::DEFAULT_WORK_DIR.to_string(),
@@ -78,6 +102,13 @@ impl Default for DockerContainerConfig {
             entrypoint: None,
             network_name: None,
         }
+    }
+}
+
+impl Default for DockerContainerConfig {
+    fn default() -> Self {
+        // 默认使用 RCoder 服务
+        Self::new_for_service(shared_types::ServiceType::RCoder)
     }
 }
 

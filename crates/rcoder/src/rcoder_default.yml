@@ -98,14 +98,14 @@ docker_config:
         #     mount_type: "bind"
         mounts: []
 
-      # AgentRunner 服务配置
-      agent-runner:
-        service_type: "AgentRunner"
+      # ComputerAgentRunner 服务配置
+      computer-agent-runner:
+        service_type: "ComputerAgentRunner"
         # 镜像配置（使用架构特定镜像）
-        arm64_image: "registry.yichamao.com/rcoder-agent-runner:latest-arm64"
-        amd64_image: "registry.yichamao.com/rcoder-agent-runner:latest-amd64"
-        default_image: "registry.yichamao.com/rcoder-agent-runner:latest"
-        image_tag_prefix: "rcoder-agent-runner"
+        arm64_image: "registry.yichamao.com/rcoder-computer-agent-runner:latest-arm64"
+        amd64_image: "registry.yichamao.com/rcoder-computer-agent-runner:latest-amd64"
+        default_image: "registry.yichamao.com/rcoder-computer-agent-runner:latest"
+        image_tag_prefix: "rcoder-computer-agent-runner"
         enabled: true
 
         # 容器内挂载路径模板（支持变量替换）
