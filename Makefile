@@ -105,16 +105,6 @@ dev-down:
 		echo "⚠️  docker-compose.yml 未找到，跳过停止操作"; \
 	fi
 
-dev-logs:
-	@echo "📋 查看开发模式服务日志..."
-	@if [ -f "docker/docker-compose.yml" ]; then \
-		docker-compose -f docker/docker-compose.yml logs -f; \
-	else \
-		echo "❌ 错误: 未找到 docker/docker-compose.yml"; \
-		exit 1; \
-	fi
-
-
 # 快速重启：依赖 dev-build 确保代码更改生效
 dev-restart: dev-build
 	@echo "🔄 重启容器服务（使用最新构建的镜像）..."
@@ -129,33 +119,3 @@ dev-restart: dev-build
 	@echo ""
 	@echo "🎉 完整重启完成！"
 	@echo "💡 代码更改已生效，因为重新构建了镜像！"
-
-# 更新镜像标签：根据当前系统架构选择合适的镜像标记为 latest
-update-image-tag:
-	@echo "🏷️  更新镜像标签..."
-	@echo "🔍 检测当前系统架构..."
-	@ARCH=$$(uname -m); \
-	if [ "$$ARCH" = "arm64" ] || [ "$$ARCH" = "aarch64" ]; then \
-		SOURCE_TAG="latest-arm64"; \
-		echo "📱 检测到 ARM64 架构"; \
-	elif [ "$$ARCH" = "x86_64" ]; then \
-		SOURCE_TAG="latest-amd64"; \
-		echo "💻 检测到 AMD64 架构"; \
-	else \
-		echo "❌ 不支持的架构: $$ARCH"; \
-		exit 1; \
-	fi; \
-	echo "📋 源镜像: registry.yichamao.com/rcoder:$$SOURCE_TAG"; \
-	echo "📋 目标镜像: registry.yichamao.com/rcoder:latest"; \
-	echo ""; \
-	if docker images --format "table {{.Repository}}:{{.Tag}}" | grep -q "registry.yichamao.com/rcoder:$$SOURCE_TAG"; then \
-		echo "✅ 找到源镜像，开始重新标记..."; \
-		docker tag registry.yichamao.com/rcoder:$$SOURCE_TAG registry.yichamao.com/rcoder:latest; \
-		echo "✅ 镜像标签更新完成！"; \
-		echo "📋 更新后的镜像:"; \
-		docker images --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}" | grep "registry.yichamao.com/rcoder"; \
-	else \
-		echo "❌ 错误: 未找到源镜像 registry.yichamao.com/rcoder:$$SOURCE_TAG"; \
-		echo "💡 请先拉取镜像: docker pull registry.yichamao.com/rcoder:$$SOURCE_TAG"; \
-		exit 1; \
-	fi
