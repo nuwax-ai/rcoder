@@ -80,8 +80,6 @@ docker_config:
           memory_limit: 2147483648 # 2GB (字节)
           cpu_limit: 2.0 # 2 核 CPU
           swap_limit: 4294967296 # 4GB 交换空间 (字节)
-          # disk_limit: null         # 不限制磁盘空间
-          # process_limit: null      # 不限制进程数
 
         # 容器工作目录
         work_dir: "/app"
@@ -133,8 +131,6 @@ docker_config:
           memory_limit: 4294967296 # 4GB (字节)
           cpu_limit: 3.0 # 3 核 CPU
           swap_limit: 8589934592 # 8GB 交换空间 (字节)
-          # disk_limit: null         # 不限制磁盘空间
-          # process_limit: null      # 不限制进程数
 
         # 容器工作目录
         work_dir: "/app"

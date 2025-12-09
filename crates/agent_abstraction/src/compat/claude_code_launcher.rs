@@ -273,16 +273,15 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
             &project_path_for_closure.to_string_lossy()
         );
 
-        // 转换配置中的 Context 服务器为 ACP 协议格式
-        let config_mcp_servers = convert_context_servers(&agent_config.context_servers);
-
-        // 合并 start_config 中的 MCP 服务器
-        let mcp_servers = if !config_mcp_servers.is_empty() {
-            info!("📦 使用配置文件中的 MCP 服务器");
-            config_mcp_servers
-        } else if start_config.has_mcp_servers() {
-            info!("📦 使用 AgentStartConfig 中的 MCP 服务器");
+        // 优先使用 start_config 中的 MCP 服务器（worker 层已处理 HTTP 覆盖）
+        let mcp_servers = if start_config.has_mcp_servers() {
+            info!("📦 使用 AgentStartConfig 中的 MCP 服务器（支持 HTTP 覆盖）");
             start_config.mcp_servers.clone()
+        } else if !agent_config.context_servers.is_empty() {
+            // 回退方案：兼容未通过 worker 层调用的场景（如直接调用 launcher）
+            // 注意：通过 acp_worker 的正常流程不会走到这里，因为 worker 层已处理默认配置
+            info!("📦 使用配置文件中的 MCP 服务器（回退方案）");
+            convert_context_servers(&agent_config.context_servers)
         } else {
             info!("📝 未配置 MCP 服务器");
             Vec::new()

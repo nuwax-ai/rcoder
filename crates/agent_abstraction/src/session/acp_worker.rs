@@ -5,12 +5,13 @@
 use std::sync::Arc;
 
 use agent_client_protocol::Client;
-use agent_config::AgentServersConfig;
+use agent_config::{AgentServersConfig, PromptConfigAssembler};
 use anyhow::Result;
 use async_trait::async_trait;
 use tracing::{debug, error, info};
 
 use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
+use crate::compat::convert_context_servers;
 use crate::traits::{AgentStartConfig, SessionNotifier};
 
 /// ACP Agent Worker
@@ -28,8 +29,10 @@ impl<N: SessionNotifier, C: Client + 'static> AcpAgentWorker<N, C> {
 }
 
 #[async_trait::async_trait]
-impl<N: SessionNotifier + Send + Sync + 'static, C: Client + Clone + Default + Send + Sync + 'static> AgentWorker
-    for AcpAgentWorker<N, C>
+impl<
+    N: SessionNotifier + Send + Sync + 'static,
+    C: Client + Clone + Default + Send + Sync + 'static,
+> AgentWorker for AcpAgentWorker<N, C>
 {
     fn name(&self) -> &'static str {
         "AcpAgentWorker"
@@ -53,21 +56,64 @@ impl<N: SessionNotifier + Send + Sync + 'static, C: Client + Clone + Default + S
                 e
             })?;
 
-        // 3. 准备 AgentStartConfig
+        // 3. 使用 PromptConfigAssembler 组装配置
+        let default_agent_id = "claude-code-acp";
         let servers_config = AgentServersConfig::load_or_default().await;
-        let system_prompt = servers_config.get_system_prompt("claude-code-acp");
-        let start_config = AgentStartConfig::new().with_system_prompt(system_prompt);
+
+        let assembler = PromptConfigAssembler::new(servers_config)
+            .with_system_prompt(request.prompt_message.system_prompt_override.clone())
+            .with_user_prompt_template(request.prompt_message.user_prompt_template_override.clone())
+            .with_agent_config(request.prompt_message.agent_config_override.clone());
+
+        // 获取最终的系统提示词（入参有值则使用入参，否则使用默认配置）
+        let system_prompt = assembler.get_system_prompt(default_agent_id);
+        debug!(
+            "📝 系统提示词: has_override={}, length={}",
+            assembler.has_system_prompt_override(),
+            system_prompt.len()
+        );
+
+        // 应用用户提示词模板（如果有）
+        let final_user_prompt =
+            assembler.apply_user_prompt(default_agent_id, &request.prompt_message.content);
+        debug!(
+            "📝 用户提示词: has_template={}, original_len={}, final_len={}",
+            assembler.has_user_prompt_template_override(),
+            request.prompt_message.content.len(),
+            final_user_prompt.len()
+        );
+
+        // 获取 MCP 服务器配置（入参有值则使用入参，否则使用默认配置）
+        let context_servers = assembler.get_context_servers();
+        debug!(
+            "🔌 MCP 服务器配置: has_override={}, count={}",
+            assembler.has_agent_config_override(),
+            context_servers.len()
+        );
+
+        // 将 context_servers 转换为 ACP 协议的 McpServer 格式
+        let mcp_servers = convert_context_servers(&context_servers);
+        debug!("🔌 转换后的 MCP 服务器数量: {}", mcp_servers.len());
+
+        // 构建 AgentStartConfig 并传递 MCP 服务器
+        let start_config = AgentStartConfig::new()
+            .with_system_prompt(system_prompt)
+            .with_mcp_servers(mcp_servers);
 
         // 4. 创建 Client 实例
         let client = C::default();
 
-        // 5. 获取或创建会话
+        // 5. 更新 prompt_message 的 content 为处理后的用户提示词
+        let mut prompt_message = request.prompt_message.clone();
+        prompt_message.content = final_user_prompt;
+
+        // 6. 获取或创建会话
         let (session_info, is_new) = self
             .session_manager
             .get_or_create_session(
                 &project_id,
                 normalized_path,
-                request.prompt_message.session_id.clone(),
+                prompt_message.session_id.clone(),
                 request.model_provider.clone(),
                 start_config,
                 client,
@@ -83,23 +129,23 @@ impl<N: SessionNotifier + Send + Sync + 'static, C: Client + Clone + Default + S
             session_info.session_id.0, is_new
         );
 
-        // 6. 构建 Prompt 请求
+        // 7. 构建 Prompt 请求
         let prompt_request = if let Some(ref attachment_blocks) = request.attachment_blocks {
             debug!("📎 构建带附件的 Prompt 请求");
             AcpSessionManager::<N, C>::build_prompt_request_with_attachments(
-                &request.prompt_message,
+                &prompt_message,
                 session_info.session_id.clone(),
                 attachment_blocks.clone(),
             )?
         } else {
             debug!("📝 构建纯文本 Prompt 请求");
             AcpSessionManager::<N, C>::build_text_prompt_request(
-                &request.prompt_message,
+                &prompt_message,
                 session_info.session_id.clone(),
             )?
         };
 
-        // 7. 发送 Prompt
+        // 8. 发送 Prompt
         self.session_manager
             .send_prompt_request(&project_id, prompt_request)
             .map_err(|e| {
@@ -109,13 +155,13 @@ impl<N: SessionNotifier + Send + Sync + 'static, C: Client + Clone + Default + S
 
         info!("✅ Prompt 请求已发送，project_id: {}", project_id);
 
-        // 8. 构建响应
+        // 9. 构建响应
         if is_new {
             Ok(WorkerResponse::new_session_success(
                 project_id,
                 session_info.session_id.0.to_string(),
                 Some(request.request_id().to_string()),
-                request.prompt_message.service_type.clone(),
+                prompt_message.service_type.clone(),
                 SessionHandles {
                     prompt_tx: session_info.prompt_tx.clone(),
                     cancel_tx: session_info.cancel_tx.clone(),
@@ -127,7 +173,7 @@ impl<N: SessionNotifier + Send + Sync + 'static, C: Client + Clone + Default + S
                 project_id,
                 session_info.session_id.0.to_string(),
                 Some(request.request_id().to_string()),
-                request.prompt_message.service_type.clone(),
+                prompt_message.service_type.clone(),
             ))
         }
     }

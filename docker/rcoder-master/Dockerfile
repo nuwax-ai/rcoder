@@ -90,9 +90,16 @@ RUN curl -fsSL https://bun.sh/install | bash
 # 添加 Bun 到 PATH
 ENV PATH="/root/.bun/bin:${PATH}"
 
-# 配置 Bun 使用国内镜像
-RUN echo '[install]' > /root/.bunfig.toml && \
-    echo 'registry = "https://registry.npmmirror.com"' >> /root/.bunfig.toml
+# 【新增】复制 .npmrc 文件
+COPY docker/rcoder-master/.npmrc /root/.npmrc
+
+# Bun 配置
+RUN mkdir -p /root/.bun && \
+    echo '[install]' > /root/.bunfig.toml && \
+    echo 'registry = "https://registry.npmmirror.com"' >> /root/.bunfig.toml && \
+    echo '' >> /root/.bunfig.toml && \
+    echo '[install.scopes]' >> /root/.bunfig.toml && \
+    echo '"@upstash" = "https://registry.npmmirror.com"' >> /root/.bunfig.toml
 
 # 安装 uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh

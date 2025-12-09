@@ -1,6 +1,10 @@
 mod container;
 mod model;
 
+// Chat Agent 配置模块
+mod chat_agent_config;
+pub use chat_agent_config::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
+
 // 新增多镜像配置相关模块
 pub mod multi_image_config;
 pub mod service_config;
@@ -31,12 +35,12 @@ pub use model::{
     AttachmentError,
     AttachmentSource,
     AudioAttachment,
-    // 取消相关类型（新类型优先）
-    CancelNotificationRequestWrapper,
-    CancelResult,
     // 旧类型保留兼容性（deprecated）
     CancelNotificationRequest,
+    // 取消相关类型（新类型优先）
+    CancelNotificationRequestWrapper,
     CancelNotificationResponse,
+    CancelResult,
     ChatPrompt,
     ChatPromptResponse,
     ChatResponse,
@@ -65,8 +69,8 @@ pub use multi_image_config::{
     ProjectImageOverrides, create_default_multi_image_config, create_legacy_multi_image_config,
 };
 pub use service_config::{
-    ServiceImageConfig, ServiceMountConfig, default_agent_runner_service_config,
-    default_rcoder_service_config,
+    ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits,
+    default_agent_runner_service_config, default_rcoder_service_config,
 };
 pub use service_type::{
     ServiceType, ServiceTypeError, get_enabled_service_types, get_supported_service_types,

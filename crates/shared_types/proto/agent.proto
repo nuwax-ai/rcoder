@@ -31,6 +31,14 @@ message ChatRequest {
   optional string request_id = 6;
   // 数据源附件 (JSON 字符串数组)
   repeated string data_source_attachments = 7;
+
+  // === 新增字段 (v2) ===
+  // 系统提示词（可选，覆盖默认配置）
+  optional string system_prompt = 8;
+  // 用户提示词模板（可选，支持 {user_prompt} 变量替换）
+  optional string user_prompt = 9;
+  // Agent 运行时配置（可选，包含 Agent 服务器和 MCP 服务器配置）
+  optional ChatAgentConfig agent_config = 10;
 }
 
 message ChatResponse {
@@ -70,8 +78,9 @@ message ProgressEvent {
 // === Cancel Session ===
 
 message CancelRequest {
-  string session_id = 1;
+  string session_id = 1;      // 可选，为空时使用 project_id 查找
   string reason = 2;
+  string project_id = 3;      // 用于按项目取消（当 session_id 为空时）
 }
 
 // 取消结果类型（对应 Rust CancelResult）
@@ -135,7 +144,6 @@ message TextAttachment {
   AttachmentSource source = 2;
   optional string filename = 3;
   optional string description = 4;
-  optional string language = 5;  // 编程语言
 }
 
 // 图像附件
@@ -176,4 +184,42 @@ message Attachment {
     AudioAttachment audio = 3;
     DocumentAttachment document = 4;
   }
+}
+
+// === Chat Agent 配置 (v2) ===
+
+// Agent 运行时配置
+message ChatAgentConfig {
+  // 单个 Agent 服务器配置（可选）
+  optional ChatAgentServerConfig agent_server = 1;
+  // MCP 服务器配置（多个）
+  map<string, ChatContextServerConfig> context_servers = 2;
+}
+
+// 单个 Agent 服务器配置
+message ChatAgentServerConfig {
+  // Agent 标识符（可选，默认 "claude-code-acp"）
+  optional string agent_id = 1;
+  // 执行命令
+  optional string command = 2;
+  // 命令参数
+  repeated string args = 3;
+  // 环境变量
+  map<string, string> env = 4;
+  // 元数据
+  map<string, string> metadata = 5;
+}
+
+// MCP 服务器配置
+message ChatContextServerConfig {
+  // 服务器来源类型: "custom" 或 "local"
+  string source = 1;
+  // 是否启用
+  bool enabled = 2;
+  // 执行命令 (如 "bunx", "uvx", "npx")
+  optional string command = 3;
+  // 命令参数
+  repeated string args = 4;
+  // 环境变量
+  map<string, string> env = 5;
 }

@@ -6,7 +6,7 @@ use anyhow::Result;
 use axum::{Json, extract::State};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use shared_types::{ModelProviderConfig, ProjectAndContainerInfo};
+use shared_types::{ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
@@ -50,6 +50,21 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "req_123456789")]
     pub request_id: Option<String>,
+
+    // === 新增字段 (v2) ===
+    /// 可选的系统提示词，覆盖默认配置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "你是一个专业的 Rust 开发者")]
+    pub system_prompt: Option<String>,
+
+    /// 可选的用户提示词模板，支持 {user_prompt} 变量替换
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "请用 Rust 完成：{user_prompt}")]
+    pub user_prompt: Option<String>,
+
+    /// 可选的 Agent 运行时配置（Agent 服务器 + MCP 服务器）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_config: Option<ChatAgentConfig>,
 }
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
@@ -120,6 +135,15 @@ pub async fn handle_chat(
         }
     };
 
+    // 验证资源限制配置
+    if let Some(ref agent_config) = request.agent_config {
+        if let Some(ref resource_limits) = agent_config.resource_limits {
+            resource_limits.validate().map_err(|e| {
+                AppError::validation_error(&format!("Invalid resource limits: {}", e))
+            })?;
+        }
+    }
+
     info!(
         "🚀 [CHAT] 开始处理聊天请求: project_id={}, session_id={:?}, prompt_length={}, attachments_count={}, model_provider={}",
         project_id,
@@ -145,6 +169,10 @@ pub async fn handle_chat(
         crate::service::container_manager::ContainerManager::get_or_create_container(
             &project_id,
             &service_type,
+            request
+                .agent_config
+                .as_ref()
+                .and_then(|c| c.resource_limits.clone()),
         )
         .await?;
 
@@ -383,6 +411,10 @@ async fn forward_request_to_container_service(
             request.model_provider.clone(),
             request.request_id.clone(),
             None, // ✅ 使用连接级别默认超时，未来可根据需要设置
+            // 新增参数 (v2)
+            request.system_prompt.clone(),
+            request.user_prompt.clone(),
+            request.agent_config.clone(),
         )
         .await
         {
