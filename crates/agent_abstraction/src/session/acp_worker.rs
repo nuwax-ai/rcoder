@@ -67,20 +67,24 @@ impl<
 
         // 获取最终的系统提示词（入参有值则使用入参，否则使用默认配置）
         let system_prompt = assembler.get_system_prompt(default_agent_id);
-        debug!(
-            "📝 系统提示词: has_override={}, length={}",
-            assembler.has_system_prompt_override(),
-            system_prompt.len()
-        );
-
         // 应用用户提示词模板（如果有）
         let final_user_prompt =
             assembler.apply_user_prompt(default_agent_id, &request.prompt_message.content);
+
         info!(
-            "📝 用户提示词处理: has_template={}, original_len={}, final_len={}",
+            "📝 提示词处理 - 系统提示词: has_override={}, length={} | 用户提示词: has_template={}, original_len={}, final_len={}",
+            assembler.has_system_prompt_override(),
+            system_prompt.len(),
             assembler.has_user_prompt_template_override(),
             request.prompt_message.content.len(),
             final_user_prompt.len()
+        );
+
+        debug!(
+            "📝 系统提示词: has_override={}, length={}, content={}",
+            assembler.has_system_prompt_override(),
+            system_prompt.len(),
+            system_prompt
         );
         debug!(
             "📝 用户提示词: has_template={}, original_len={}, final_len={}, final_content={}",
