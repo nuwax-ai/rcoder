@@ -68,15 +68,15 @@ docker_config:
             read_only: false
             mount_type: "bind"
 
-      # AgentRunner 服务配置（使用与主容器相同的镜像）
-      agent-runner:
-        service_type: "AgentRunner"
+      # ComputerAgentRunner 服务配置（使用与主容器相同的镜像）
+      computer-agent-runner:
+        service_type: "ComputerAgentRunner"
         # 🎯 使用本地测试镜像（与主容器相同）
         image: "master-rcoder:latest"
         arm64_image: "master-rcoder:latest"
         amd64_image: "master-rcoder:latest"
         default_image: "master-rcoder:latest"
-        image_tag_prefix: "rcoder-agent-runner"
+        image_tag_prefix: "rcoder-computer-agent-runner"
         enabled: true
 
         environment:

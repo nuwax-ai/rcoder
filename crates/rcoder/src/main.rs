@@ -128,13 +128,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    info!("🔍 检查并清理上次可能遗留的 rcoder-agent 容器...");
-    match container_stop::startup_cleanup_containers(&docker_manager, "rcoder-agent-*").await {
+    // 🔧 从配置获取多镜像配置用于容器清理
+    let multi_image_config = if let Some(docker_config) = &config.docker_config {
+        docker_config.get_multi_image_config()
+    } else {
+        shared_types::create_default_multi_image_config()
+    };
+
+    info!("🔍 检查并清理上次可能遗留的容器（所有启用的服务）...");
+    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config).await {
         Ok(result) => {
+            let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
             if result.successfully_removed > 0 {
                 info!(
-                    "✅ 启动时清理完成，共清理了 {} 个遗留容器",
-                    result.successfully_removed
+                    "✅ 启动时清理完成，共清理了 {} 个遗留容器（涵盖 {} 个服务类型）",
+                    result.successfully_removed,
+                    enabled_services.len()
                 );
             } else {
                 info!("✅ 未发现遗留容器，系统环境干净");
@@ -427,12 +436,16 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
 
+    // 🔧 使用默认多镜像配置
+    // 注意：在关闭时使用默认配置是安全的，因为启用的服务类型在默认配置中已定义
+    let multi_image_config = shared_types::create_default_multi_image_config();
+
     // 使用启动清理策略（服务关闭时也使用相同策略）
-    match container_stop::startup_cleanup_containers(&docker_manager, "rcoder-agent-*").await {
+    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config).await {
         Ok(result) => {
             if result.successfully_removed > 0 {
                 info!(
-                    "🧹 清理了 {} 个 rcoder-agent 容器",
+                    "🧹 清理了 {} 个容器（所有启用的服务）",
                     result.successfully_removed
                 );
             }

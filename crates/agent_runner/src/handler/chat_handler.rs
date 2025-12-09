@@ -192,7 +192,7 @@ pub async fn handle_chat(
         "🚀 [DEBUG] handle_chat 开始处理请求: project_id={:?}, session_id={:?}, service_type={}, prompt={}",
         request.project_id,
         request.session_id,
-        service_type.as_str(),
+        service_type,
         request.prompt
     );
 
