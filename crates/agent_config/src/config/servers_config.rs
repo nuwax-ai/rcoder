@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::default_agent_config::{default_agent_servers, default_context_servers};
+use super::default_agent_config::{
+    default_agent_servers, default_agent_servers_for_service, default_context_servers,
+    default_context_servers_for_service,
+};
 use crate::types::agent_config::AgentConfig;
 use crate::types::error::{ConfigError, Result};
 use crate::types::mcp_config::ContextServerConfig;
@@ -31,9 +34,40 @@ impl AgentServersConfig {
     /// 获取默认配置
     ///
     /// 返回从 `configs/default_agents.json` 加载的配置。
-    /// 这是推荐的获取配置的方式。
+    ///
+    /// # 已弃用
+    ///
+    /// 此方法已弃用，请使用 `load_or_default_for_service` 以支持多服务类型。
+    #[deprecated(since = "0.2.0", note = "请使用 load_or_default_for_service 以支持多服务类型")]
     pub async fn load_or_default() -> Self {
         Self::default()
+    }
+
+    /// 根据服务类型加载或使用默认配置
+    ///
+    /// # 参数
+    /// - `service_type`: 服务类型（RCoder 或 ComputerAgentRunner）
+    ///
+    /// # 返回
+    /// 对应服务类型的默认配置
+    pub async fn load_or_default_for_service(
+        service_type: &shared_types::ServiceType,
+    ) -> Self {
+        Self::default_for_service(service_type)
+    }
+
+    /// 根据服务类型创建默认配置
+    ///
+    /// # 参数
+    /// - `service_type`: 服务类型
+    ///
+    /// # 返回
+    /// 对应服务类型的默认配置实例
+    pub fn default_for_service(service_type: &shared_types::ServiceType) -> Self {
+        Self {
+            agent_servers: default_agent_servers_for_service(service_type),
+            context_servers: default_context_servers_for_service(service_type),
+        }
     }
 
     /// 从外部文件加载配置
@@ -148,5 +182,43 @@ impl AgentServersConfig {
             agent_servers: default_agent_servers(),
             context_servers: default_context_servers(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_load_or_default_for_service() {
+        // 测试 RCoder
+        let rcoder_config =
+            AgentServersConfig::load_or_default_for_service(&shared_types::ServiceType::RCoder)
+                .await;
+        assert!(!rcoder_config.agent_servers.is_empty());
+
+        // 测试 ComputerAgentRunner
+        let car_config = AgentServersConfig::load_or_default_for_service(
+            &shared_types::ServiceType::ComputerAgentRunner,
+        )
+        .await;
+        assert!(!car_config.agent_servers.is_empty());
+    }
+
+    #[test]
+    fn test_default_for_service() {
+        // 测试 RCoder
+        let rcoder_config =
+            AgentServersConfig::default_for_service(&shared_types::ServiceType::RCoder);
+        assert!(!rcoder_config.agent_servers.is_empty());
+
+        // 测试 ComputerAgentRunner
+        let car_config =
+            AgentServersConfig::default_for_service(&shared_types::ServiceType::ComputerAgentRunner);
+        assert!(!car_config.agent_servers.is_empty());
+
+        // 验证配置不同
+        // ComputerAgentRunner 应该有更多或不同的 context servers
+        assert!(car_config.context_servers.len() >= rcoder_config.context_servers.len());
     }
 }

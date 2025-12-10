@@ -70,6 +70,25 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/agent/status/{project_id}", get(handler::agent_status))
         .with_state(state.clone());
 
+    // Computer Agent Runner 路由
+    let computer_routes = Router::new()
+        .route("/computer/chat", post(handler::handle_computer_chat))
+        .route(
+            "/computer/agent/stop",
+            post(handler::computer_agent_stop),
+        )
+        // 进度流复用现有的 agent_session_notification
+        .route(
+            "/computer/progress/{session_id}",
+            get(handler::agent_session_notification),
+        )
+        // VNC 桌面访问
+        .route(
+            "/computer/desktop/{user_id}/{project_id}",
+            get(handler::computer_desktop_vnc),
+        )
+        .with_state(state.clone());
+
     // Pingora 代理 API 路由（用于文档和状态查询）
     let proxy_api_routes = Router::new()
         .route("/proxy/status", get(handler::proxy_status))
@@ -85,6 +104,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .merge(api_routes)
+        .merge(computer_routes)
         .merge(proxy_api_routes)
         .merge(create_swagger_ui())
 }

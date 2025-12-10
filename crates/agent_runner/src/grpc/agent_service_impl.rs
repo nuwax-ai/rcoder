@@ -601,6 +601,226 @@ impl AgentService for AgentServiceImpl {
 
         Ok(Response::new(response))
     }
+
+    /// 停止 Agent（用于 ComputerAgentRunner 模式）
+    ///
+    /// 停止指定项目的 Agent，但不销毁容器。
+    /// 与 cancel_session 的区别：
+    /// - cancel_session: 取消单个会话任务
+    /// - stop_agent: 停止整个 Agent 进程（可能有多个会话）
+    #[instrument(skip(self, request))]
+    async fn stop_agent(
+        &self,
+        request: Request<shared_types::grpc::StopAgentRequest>,
+    ) -> Result<Response<shared_types::grpc::StopAgentResponse>, Status> {
+        use shared_types::grpc::StopAgentResponse;
+
+        let req = request.into_inner();
+        let project_id = req.project_id.clone();
+        let force = req.force;
+        let reason = req.reason.clone().unwrap_or_else(|| "用户请求停止".to_string());
+
+        info!(
+            "🛑 [gRPC] StopAgent: project_id={}, force={}, reason={}",
+            project_id, force, reason
+        );
+
+        // 检查 Agent 是否存在
+        let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
+            Some(info) => info,
+            None => {
+                info!("📭 [gRPC] Agent 不存在: project_id={}", project_id);
+                return Ok(Response::new(StopAgentResponse {
+                    success: true,
+                    result: "not_found".to_string(),
+                    message: Some(format!("项目 {} 的 Agent 不存在或已停止", project_id)),
+                    project_id,
+                }));
+            }
+        };
+
+        // 如果 Agent 已经在 Terminating 状态，返回 already_stopped
+        if agent_info.status == AgentStatus::Terminating {
+            info!(
+                "ℹ️ [gRPC] Agent 已经在停止中: project_id={}",
+                project_id
+            );
+            return Ok(Response::new(StopAgentResponse {
+                success: true,
+                result: "already_stopped".to_string(),
+                message: Some(format!("项目 {} 的 Agent 已在停止中", project_id)),
+                project_id,
+            }));
+        }
+
+        // 获取当前 session_id（如果有活动会话）
+        let session_id = agent_info.session_id.to_string();
+
+        // 如果 force=true 或者 Agent 处于 Idle 状态，直接停止
+        if force || agent_info.status == AgentStatus::Idle {
+            info!(
+                "🔥 [gRPC] 强制停止或 Idle 状态，直接清理: project_id={}",
+                project_id
+            );
+
+            // 清理 SESSION_CACHE
+            if !session_id.is_empty() {
+                if let Some(session_data) = SESSION_CACHE.get(&session_id) {
+                    session_data.close_current_connection();
+                }
+                if SESSION_CACHE.remove(&session_id).is_some() {
+                    info!(
+                        "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
+                        session_id
+                    );
+                }
+            }
+
+            // 从 AGENT_REGISTRY 移除（触发 AgentLifecycleGuard drop）
+            if AGENT_REGISTRY.remove_by_project(&project_id).is_some() {
+                info!("✅ [gRPC] Agent 已停止: project_id={}", project_id);
+                return Ok(Response::new(StopAgentResponse {
+                    success: true,
+                    result: "stopped".to_string(),
+                    message: Some(format!("项目 {} 的 Agent 已成功停止", project_id)),
+                    project_id,
+                }));
+            } else {
+                warn!(
+                    "⚠️ [gRPC] 从 Registry 移除 Agent 失败: project_id={}",
+                    project_id
+                );
+                return Ok(Response::new(StopAgentResponse {
+                    success: false,
+                    result: "error".to_string(),
+                    message: Some("移除 Agent 失败".to_string()),
+                    project_id,
+                }));
+            }
+        }
+
+        // 如果 force=false 且 Agent 正在执行任务（Active），需要先取消会话
+        if agent_info.status == AgentStatus::Active {
+            info!(
+                "📡 [gRPC] Agent 正在执行任务，先取消会话: project_id={}, session_id={}",
+                project_id, session_id
+            );
+
+            // 创建 SessionId 和 CancelNotification
+            let session_id_obj = SessionId::new(Arc::from(session_id.as_str()));
+            let cancel_notification = CancelNotification::new(session_id_obj);
+
+            // 创建 oneshot channel 等待取消结果
+            let (result_tx, result_rx) = oneshot::channel::<CancelResult>();
+            let cancel_request = CancelNotificationRequestWrapper {
+                cancel_notification,
+                result_tx,
+            };
+
+            // 发送取消通知
+            if let Err(e) = agent_info.cancel_tx.send(cancel_request) {
+                error!(
+                    "❌ [gRPC] 发送取消通知失败: project_id={}, error={}",
+                    project_id, e
+                );
+                return Ok(Response::new(StopAgentResponse {
+                    success: false,
+                    result: "error".to_string(),
+                    message: Some(format!("发送取消通知失败: {}", e)),
+                    project_id,
+                }));
+            }
+
+            // 等待取消响应（带超时）
+            match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
+                Ok(Ok(cancel_result)) => {
+                    if cancel_result.is_success() {
+                        info!(
+                            "✅ [gRPC] 会话取消成功，继续停止 Agent: project_id={}",
+                            project_id
+                        );
+
+                        // 清理 SESSION_CACHE
+                        if let Some(session_data) = SESSION_CACHE.get(&session_id) {
+                            session_data.close_current_connection();
+                        }
+                        if SESSION_CACHE.remove(&session_id).is_some() {
+                            info!(
+                                "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
+                                session_id
+                            );
+                        }
+
+                        // 从 AGENT_REGISTRY 移除
+                        if AGENT_REGISTRY.remove_by_project(&project_id).is_some() {
+                            info!("✅ [gRPC] Agent 已停止: project_id={}", project_id);
+                            return Ok(Response::new(StopAgentResponse {
+                                success: true,
+                                result: "stopped".to_string(),
+                                message: Some(format!("项目 {} 的 Agent 已成功停止", project_id)),
+                                project_id,
+                            }));
+                        } else {
+                            warn!(
+                                "⚠️ [gRPC] 从 Registry 移除 Agent 失败: project_id={}",
+                                project_id
+                            );
+                            return Ok(Response::new(StopAgentResponse {
+                                success: false,
+                                result: "error".to_string(),
+                                message: Some("移除 Agent 失败".to_string()),
+                                project_id,
+                            }));
+                        }
+                    } else {
+                        warn!(
+                            "⚠️ [gRPC] 会话取消失败，Agent 停止失败: project_id={}",
+                            project_id
+                        );
+                        return Ok(Response::new(StopAgentResponse {
+                            success: false,
+                            result: "error".to_string(),
+                            message: Some("取消会话失败".to_string()),
+                            project_id,
+                        }));
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!(
+                        "❌ [gRPC] 等待取消响应通道关闭: project_id={}, error={:?}",
+                        project_id, e
+                    );
+                    return Ok(Response::new(StopAgentResponse {
+                        success: false,
+                        result: "error".to_string(),
+                        message: Some(format!("响应通道关闭: {}", e)),
+                        project_id,
+                    }));
+                }
+                Err(_) => {
+                    warn!(
+                        "⏰ [gRPC] 等待取消响应超时: project_id={}",
+                        project_id
+                    );
+                    return Ok(Response::new(StopAgentResponse {
+                        success: false,
+                        result: "error".to_string(),
+                        message: Some("取消请求超时（30秒）".to_string()),
+                        project_id,
+                    }));
+                }
+            }
+        }
+
+        // 理论上不会走到这里
+        warn!("⚠️ [gRPC] StopAgent 走到了意外分支: project_id={}", project_id);
+        Ok(Response::new(StopAgentResponse {
+            success: false,
+            result: "error".to_string(),
+            message: Some("意外的代码分支".to_string()),
+            project_id,
+        }))
+    }
 }
 
 /// 将 UnifiedSessionMessage 转换为 gRPC ProgressEvent
