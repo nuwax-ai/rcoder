@@ -1017,101 +1017,200 @@ pub async fn handle_computer_chat(
 }
 ```
 
-### 4.4 agent_runner 多实例支持
+### 4.4 agent_runner 复用 agent_abstraction 模块
 
-#### 4.4.1 ProjectAgentManager
+#### 4.4.1 设计原则
 
-**文件**: `crates/agent_runner/src/service/project_agent_manager.rs`
+**不要重复造轮！** agent_runner 应该直接复用现有的 `crates/agent_abstraction` 模块，该模块已经提供了完整的多 Agent 实例管理功能。
+
+#### 4.4.2 现有模块功能分析
+
+**文件位置**: `crates/agent_abstraction/`
+
+**核心组件**：
+
+1. **AcpSessionManager** - 多会话管理器
+   ```rust
+   pub struct AcpSessionManager<N: SessionNotifier, C: Client + 'static> {
+       /// project_id -> SessionInfo 映射（DashMap 并发安全）
+       sessions: DashMap<String, Arc<SessionInfo>>,
+       notifier: Arc<N>,
+       _client_marker: std::marker::PhantomData<C>,
+   }
+   ```
+
+   **功能**：
+   - 基于 project_id 的会话管理和复用
+   - 自动检测模型配置变化并重建会话
+   - 线程安全的并发访问
+   - `get_or_create_session()` - 智能会话复用
+   - `send_prompt_request()` - 发送请求到指定会话
+   - `list_sessions()` - 列出所有会话
+
+2. **AgentLifecycleManager** - 生命周期管理器
+   ```rust
+   pub struct AgentLifecycleManager {
+       /// 活跃的 agent 进程
+       processes: DashMap<String, Arc<ConnectedAgent>>,
+       /// Agent 状态信息
+       agent_status_map: DashMap<String, AgentStatusInfo>,
+       /// 保存的启动配置（用于重启）
+       launch_configs: DashMap<String, ProcessLaunchInfo>,
+   }
+   ```
+
+   **功能**：
+   - 管理多个 Agent 进程（按 agent_id）
+   - 跟踪 Agent 状态（Idle/Active/Terminating）
+   - `spawn_agent()` - 启动新 Agent
+   - `stop_agent()` - 停止特定 Agent
+   - `restart_agent()` - 重启 Agent
+   - `set_agent_active/idle()` - 更新 Agent 状态
+   - `get_running_agents()` - 列出运行中的 Agent
+
+3. **AcpAgentWorker** - Worker 模式处理器
+   ```rust
+   pub struct AcpAgentWorker<N: SessionNotifier, C: Client + 'static> {
+       session_manager: Arc<AcpSessionManager<N, C>>,
+   }
+
+   impl<N, C> AgentWorker for AcpAgentWorker<N, C> {
+       async fn process_request(&self, request: WorkerRequest) -> Result<WorkerResponse>;
+   }
+   ```
+
+   **功能**：
+   - 统一的请求处理接口
+   - 自动路径规范化
+   - 项目目录管理
+   - 配置组装和 Client 实例化
+
+#### 4.4.3 集成方案
+
+**文件**: `crates/agent_runner/src/main.rs`
 
 ```rust
-use dashmap::DashMap;
-use std::sync::Arc;
-use tracing::{info, warn, error};
-use anyhow::Result;
+use agent_abstraction::{
+    AcpSessionManager,
+    AgentLifecycleManager,
+    AcpAgentWorker,
+    SessionNotifier,
+};
+use shared_types::Client;
 
-/// Agent 实例
-/// 封装单个 project_id 对应的 agent 运行时
-pub struct AgentInstance {
-    pub project_id: String,
-    // TODO: 添加 ACP agent 相关字段
-    // pub agent_handle: tokio::task::JoinHandle<()>,
-    // pub sender: mpsc::UnboundedSender<AgentMessage>,
+/// Agent Runner 状态
+pub struct AgentRunnerState<N: SessionNotifier, C: Client + 'static> {
+    /// 会话管理器（复用 agent_abstraction）
+    session_manager: Arc<AcpSessionManager<N, C>>,
+
+    /// 生命周期管理器（复用 agent_abstraction）
+    lifecycle_manager: Arc<AgentLifecycleManager>,
+
+    /// Worker 处理器（复用 agent_abstraction）
+    worker: Arc<AcpAgentWorker<N, C>>,
 }
 
-/// 项目 Agent 管理器
-/// 在一个容器内管理多个 project_id 对应的 agent 实例
-pub struct ProjectAgentManager {
-    /// 所有 agent 实例映射
-    /// key: project_id, value: AgentInstance
-    agents: DashMap<String, Arc<AgentInstance>>,
-}
+impl<N: SessionNotifier, C: Client + 'static> AgentRunnerState<N, C> {
+    pub fn new(
+        notifier: Arc<N>,
+        lifecycle_manager: Arc<AgentLifecycleManager>,
+    ) -> Self {
+        let session_manager = Arc::new(AcpSessionManager::new(notifier));
+        let worker = Arc::new(AcpAgentWorker::new(session_manager.clone()));
 
-impl ProjectAgentManager {
-    pub fn new() -> Self {
         Self {
-            agents: DashMap::new(),
+            session_manager,
+            lifecycle_manager,
+            worker,
         }
     }
 
-    /// 获取或创建 agent 实例
-    ///
-    /// 注意：必须在 LocalSet 上下文中调用
-    pub async fn get_or_create_agent(&self, project_id: &str) -> Result<Arc<AgentInstance>> {
-        // 检查是否已存在
-        if let Some(agent) = self.agents.get(project_id) {
-            info!("✅ [AGENT_MGR] Agent 已存在: project_id={}", project_id);
-            return Ok(agent.clone());
-        }
-
-        // 创建新的 agent 实例
-        info!("🏗️ [AGENT_MGR] 创建新 Agent: project_id={}", project_id);
-
-        // TODO: 实现 agent 创建逻辑
-        // 1. 在 LocalSet 中 spawn_local 新任务
-        // 2. 初始化 ACP 连接
-        // 3. 配置 MCP 工具（Chrome DevTools）
-
-        let agent = Arc::new(AgentInstance {
-            project_id: project_id.to_string(),
-        });
-
-        // 添加到映射
-        self.agents.insert(project_id.to_string(), agent.clone());
-
-        Ok(agent)
+    /// 处理聊天请求（自动路由到对应的 project_id）
+    pub async fn handle_chat(&self, request: WorkerRequest) -> Result<WorkerResponse> {
+        self.worker.process_request(request).await
     }
 
     /// 停止特定 project_id 的 agent
     pub async fn stop_agent(&self, project_id: &str) -> Result<()> {
-        info!("🛑 [AGENT_MGR] 停止 Agent: project_id={}", project_id);
+        // 1. 从会话管理器移除会话
+        self.session_manager.remove_session(project_id);
 
-        if let Some((_, agent)) = self.agents.remove(project_id) {
-            // TODO: 实现 agent 停止逻辑
-            // 1. 取消 spawn_local 任务
-            // 2. 关闭 ACP 连接
-            // 3. 清理资源
-
-            info!("✅ [AGENT_MGR] Agent 已停止: project_id={}", project_id);
-            Ok(())
-        } else {
-            warn!("⚠️ [AGENT_MGR] Agent 不存在: project_id={}", project_id);
-            Err(anyhow::anyhow!("Agent 不存在: {}", project_id))
-        }
+        // 2. 停止对应的 agent 进程
+        self.lifecycle_manager.stop_agent(project_id).await
     }
 
-    /// 列出所有 agent
-    pub fn list_agents(&self) -> Vec<String> {
-        self.agents.iter().map(|r| r.key().clone()).collect()
+    /// 列出所有活跃的会话
+    pub fn list_sessions(&self) -> Vec<String> {
+        self.session_manager.list_sessions()
     }
 
-    /// 获取 agent 数量
-    pub fn agent_count(&self) -> usize {
-        self.agents.len()
+    /// 获取 Agent 状态
+    pub fn get_agent_status(&self, project_id: &str) -> Option<AgentStatus> {
+        self.lifecycle_manager.get_agent_status(project_id)
     }
 }
 ```
 
-#### 4.4.2 gRPC Proto 扩展
+#### 4.4.4 gRPC 服务实现
+
+**文件**: `crates/agent_runner/src/grpc/agent_service_impl.rs`
+
+```rust
+use tonic::{Request, Response, Status};
+use agent_runner_state::AgentRunnerState;
+
+pub struct AgentServiceImpl<N: SessionNotifier, C: Client + 'static> {
+    state: Arc<AgentRunnerState<N, C>>,
+}
+
+#[tonic::async_trait]
+impl<N: SessionNotifier, C: Client + 'static> AgentService for AgentServiceImpl<N, C> {
+    async fn chat(
+        &self,
+        request: Request<GrpcChatRequest>,
+    ) -> Result<Response<GrpcChatResponse>, Status> {
+        let req = request.into_inner();
+
+        // 构建 WorkerRequest
+        let worker_request = WorkerRequest {
+            prompt_message: /* 转换 */,
+            model_provider: req.model_provider,
+            attachment_blocks: /* 转换 */,
+        };
+
+        // 调用 worker 处理（自动路由到 project_id）
+        let response = self.state.handle_chat(worker_request)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // 转换为 gRPC 响应
+        Ok(Response::new(GrpcChatResponse {
+            session_id: response.session_id,
+            project_id: response.project_id,
+            // ...
+        }))
+    }
+
+    async fn stop_agent(
+        &self,
+        request: Request<StopAgentRequest>,
+    ) -> Result<Response<StopAgentResponse>, Status> {
+        let req = request.into_inner();
+
+        // 调用 state 停止 agent
+        self.state.stop_agent(&req.project_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(StopAgentResponse {
+            success: true,
+            message: format!("Agent {} stopped", req.project_id),
+        }))
+    }
+}
+```
+
+#### 4.4.5 gRPC Proto 扩展
 
 **文件**: `crates/shared_types/proto/agent.proto`
 
