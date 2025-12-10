@@ -108,6 +108,32 @@ pub struct GetStatusResponse {
     pub status: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StopAgentRequest {
+    /// 项目 ID (必填)
+    #[prost(string, tag = "1")]
+    pub project_id: ::prost::alloc::string::String,
+    /// 可选的停止原因
+    #[prost(string, optional, tag = "2")]
+    pub reason: ::core::option::Option<::prost::alloc::string::String>,
+    /// 是否强制停止（不等待当前任务完成）
+    #[prost(bool, tag = "3")]
+    pub force: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StopAgentResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    /// 停止结果：stopped, not_found, already_stopped, error
+    #[prost(string, tag = "2")]
+    pub result: ::prost::alloc::string::String,
+    /// 可选的详细消息
+    #[prost(string, optional, tag = "3")]
+    pub message: ::core::option::Option<::prost::alloc::string::String>,
+    /// 被停止的 Agent 的项目 ID
+    #[prost(string, tag = "4")]
+    pub project_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ModelProviderConfig {
     #[prost(string, tag = "1")]
     pub provider: ::prost::alloc::string::String,
@@ -513,6 +539,32 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("agent.AgentService", "GetStatus"));
             self.inner.unary(req, path, codec).await
         }
+        /// 停止特定 project_id 的 Agent (Unary)
+        /// 用于 ComputerAgentRunner 模式：停止单个项目的 Agent，不销毁容器
+        pub async fn stop_agent(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StopAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StopAgentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentService/StopAgent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentService", "StopAgent"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -559,6 +611,15 @@ pub mod agent_service_server {
             request: tonic::Request<super::GetStatusRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetStatusResponse>,
+            tonic::Status,
+        >;
+        /// 停止特定 project_id 的 Agent (Unary)
+        /// 用于 ComputerAgentRunner 模式：停止单个项目的 Agent，不销毁容器
+        async fn stop_agent(
+            &self,
+            request: tonic::Request<super::StopAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StopAgentResponse>,
             tonic::Status,
         >;
     }
@@ -804,6 +865,51 @@ pub mod agent_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentService/StopAgent" => {
+                    #[allow(non_camel_case_types)]
+                    struct StopAgentSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::StopAgentRequest>
+                    for StopAgentSvc<T> {
+                        type Response = super::StopAgentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StopAgentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::stop_agent(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StopAgentSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

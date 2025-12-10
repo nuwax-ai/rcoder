@@ -4,6 +4,10 @@
 //! 1. 定时扫描识别闲置的agent
 //! 2. 从state.project_and_agent_map中移除
 //! 3. AgentLifecycleGuard自动drop并清理资源
+//!
+//! ## 支持的服务类型
+//! - **RCoder**: project_id 闲置即清理
+//! - **ComputerAgentRunner**: 销毁容器时同时清理 Pingora VNC 后端映射
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -62,6 +66,21 @@ impl AgentInfoAccess for Arc<ProjectAndContainerInfo> {
     fn status(&self) -> Option<AgentStatus> {
         ProjectAndContainerInfo::status(self).copied()
     }
+}
+
+/// 孤立容器信息
+///
+/// 在筛选孤立容器时收集完整的上下文信息，避免后续重复解析
+#[derive(Debug, Clone)]
+struct OrphanedContainerInfo {
+    /// 标识符（project_id 或 user_id，取决于服务类型）
+    id: String,
+    /// 容器名称
+    container_name: String,
+    /// 服务类型
+    service_type: shared_types::ServiceType,
+    /// 容器创建时间（如果可用）
+    created_at: Option<DateTime<Utc>>,
 }
 
 /// 清理配置
@@ -147,6 +166,28 @@ impl AgentCleaner {
             stats: CleanupStats::default(),
             state,
             container_patterns,
+        }
+    }
+
+    /// 从容器模式推断服务类型
+    ///
+    /// 根据 docker_manager 返回的容器模式，推断对应的服务类型
+    ///
+    /// # 参数
+    /// * `pattern` - 容器名称模式（如 "rcoder-agent-*", "computer-agent-runner-*"）
+    ///
+    /// # 返回
+    /// 对应的 ServiceType，如果无法识别则返回 None
+    fn infer_service_type_from_pattern(pattern: &str) -> Option<shared_types::ServiceType> {
+        if pattern.starts_with("rcoder-agent-") || pattern.contains("rcoder-agent") {
+            Some(shared_types::ServiceType::RCoder)
+        } else if pattern.starts_with("computer-agent-runner-")
+            || pattern.contains("computer-agent-runner")
+        {
+            Some(shared_types::ServiceType::ComputerAgentRunner)
+        } else {
+            // 未知模式
+            None
         }
     }
 
@@ -508,6 +549,16 @@ impl AgentCleaner {
         for pattern in &self.container_patterns {
             info!("🔍 [cleanup] 扫描模式: {}", pattern);
 
+            // 从模式推断服务类型
+            let service_type = Self::infer_service_type_from_pattern(pattern);
+
+            if service_type.is_none() {
+                warn!("⚠️ [cleanup] 无法识别的容器模式: {}", pattern);
+                continue;
+            }
+
+            let service_type = service_type.unwrap();
+
             // 🚀 优化1: 使用更快的容器列表查询，只获取基本信息
             let containers = match docker_manager.list_containers_with_pattern(pattern).await {
                 Ok(containers) => containers,
@@ -529,7 +580,7 @@ impl AgentCleaner {
             );
 
             // 🚀 优化2: 批量处理，减少Docker API调用次数
-            let mut orphaned_containers = Vec::new();
+            let mut orphaned_containers: Vec<OrphanedContainerInfo> = Vec::new();
             let mut protected_count = 0;
 
             // 快速筛选孤立容器（不进行详细的Docker查询）
@@ -545,12 +596,13 @@ impl AgentCleaner {
                             // 检查 MAP 中是否有对应记录
                             if !self.state.project_and_agent_map.contains_key(&project_id) {
                                 // 🚀 优化3: 使用容器的创建时间而不是查询详细信息
-                                if let Some(created_at) = container.created {
-                                    let created_time = DateTime::from_timestamp(created_at, 0)
-                                        .unwrap_or_else(Utc::now);
+                                let created_time = container.created.and_then(|ts| {
+                                    DateTime::from_timestamp(ts, 0)
+                                });
 
+                                if let Some(created_at) = created_time {
                                     if self.should_skip_cleanup_due_to_protection(
-                                        created_time,
+                                        created_at,
                                         &project_id,
                                     ) {
                                         protected_count += 1;
@@ -560,10 +612,17 @@ impl AgentCleaner {
                                 }
 
                                 info!(
-                                    "🗑️ [cleanup] 发现孤立容器: {} (project_id={})",
-                                    clean_name, project_id
+                                    "🗑️ [cleanup] 发现孤立容器: {} (id={}, type={:?})",
+                                    clean_name, project_id, service_type
                                 );
-                                orphaned_containers.push((project_id, clean_name.to_string()));
+
+                                // 👈 使用新的结构体
+                                orphaned_containers.push(OrphanedContainerInfo {
+                                    id: project_id.clone(),
+                                    container_name: clean_name.to_string(),
+                                    service_type: service_type.clone(),
+                                    created_at: created_time,
+                                });
                                 break; // 找到匹配的名称后跳出内层循环
                             }
                         } else {
@@ -602,10 +661,9 @@ impl AgentCleaner {
             // 🚀 优化5: 并行清理容器，提高效率
             let mut cleanup_tasks = Vec::new();
 
-            for (project_id, container_name) in containers_to_clean {
+            for container_info in containers_to_clean {
                 let docker_manager_clone = docker_manager.clone();
                 let state_clone = self.state.clone();
-                let config = self.config.clone();
 
                 let task = tokio::spawn(async move {
                     let cleanup_timeout = Duration::from_secs(30);
@@ -614,25 +672,29 @@ impl AgentCleaner {
                         Self::cleanup_single_orphaned_container(
                             &docker_manager_clone,
                             &state_clone,
-                            &config,
-                            &project_id,
-                            &container_name,
+                            &container_info, // 👈 传递完整信息
                         ),
                     )
                     .await
                     {
                         Ok(Ok(_)) => {
-                            info!("✅ [cleanup] 成功清理孤立容器: {}", container_name);
+                            info!(
+                                "✅ [cleanup] 成功清理孤立容器: {}",
+                                container_info.container_name
+                            );
                             true
                         }
                         Ok(Err(e)) => {
-                            warn!("❌ [cleanup] 清理孤立容器失败: {} - {}", container_name, e);
+                            warn!(
+                                "❌ [cleanup] 清理孤立容器失败: {} - {}",
+                                container_info.container_name, e
+                            );
                             false
                         }
                         Err(_) => {
                             warn!(
                                 "⏰ [cleanup] 清理孤立容器超时: {} (超时时间: {}秒)",
-                                container_name,
+                                container_info.container_name,
                                 cleanup_timeout.as_secs()
                             );
                             false
@@ -672,11 +734,12 @@ impl AgentCleaner {
         total_cleaned
     }
 
-    /// 从容器名称中提取 project_id
+    /// 从容器名称中提取 project_id 或 user_id
     ///
     /// 支持多种服务类型的容器命名：
     /// - rcoder-agent-{project_id}
     /// - agent-runner-{project_id}
+    /// - computer-agent-runner-{user_id}
     ///
     /// # Arguments
     ///
@@ -704,29 +767,73 @@ impl AgentCleaner {
         None
     }
 
+    /// 从容器名称中提取标识符及其服务类型
+    ///
+    /// **已废弃**: 使用 `infer_service_type_from_pattern` + `extract_project_id_from_container_name` 替代
+    ///
+    /// 支持多种服务类型的容器命名：
+    /// - rcoder-agent-{project_id} -> (project_id, ServiceType::RCoder)
+    /// - computer-agent-runner-{user_id} -> (user_id, ServiceType::ComputerAgentRunner)
+    ///
+    /// # Arguments
+    ///
+    /// * `container_name` - 容器名称（已去除前导斜杠）
+    ///
+    /// # Returns
+    ///
+    /// 如果成功解析返回 `Some((id, ServiceType))`，否则返回 `None`
+    #[deprecated(
+        note = "使用 infer_service_type_from_pattern 和 OrphanedContainerInfo 替代"
+    )]
+    #[allow(dead_code)]
+    fn extract_id_and_service_type_from_container_name(
+        container_name: &str,
+    ) -> Option<(String, shared_types::ServiceType)> {
+        // 移除前导斜杠（如果还有的话）
+        let name = container_name.trim_start_matches('/');
+
+        // 尝试匹配已知的服务前缀
+        for service_type in [
+            shared_types::ServiceType::RCoder,
+            shared_types::ServiceType::ComputerAgentRunner,
+        ] {
+            let prefix = format!("{}-", service_type.container_prefix());
+            if let Some(id) = name.strip_prefix(&prefix) {
+                return Some((id.to_string(), service_type));
+            }
+        }
+
+        // 如果都不匹配，返回 None
+        None
+    }
+
     /// 清理单个孤立容器
     ///
     /// 使用统一的运行时清理策略
+    /// 对于 ComputerAgentRunner 容器，同时清理 Pingora VNC 后端映射
+    ///
+    /// # 参数
+    /// * `docker_manager` - Docker 管理器
+    /// * `state` - 应用状态
+    /// * `info` - 孤立容器的完整信息（包含 ServiceType）
     async fn cleanup_single_orphaned_container(
         docker_manager: &Arc<docker_manager::DockerManager>,
-        _state: &Arc<AppState>,
-        _config: &CleanupConfig,
-        project_id: &str,
-        container_name: &str,
+        state: &Arc<AppState>,
+        info: &OrphanedContainerInfo,
     ) -> Result<()> {
         info!(
-            "🔥 开始清理孤立容器: {} (project_id={})",
-            container_name, project_id
+            "🔥 开始清理孤立容器: {} (id={}, type={:?})",
+            info.container_name, info.id, info.service_type
         );
 
         // 查找容器信息
         let container_info = match docker_manager
-            .find_container_by_identifier(container_name)
+            .find_container_by_identifier(&info.container_name)
             .await
         {
             Some(info) => info,
             None => {
-                info!("📭 容器不存在，无需清理: {}", container_name);
+                info!("📭 容器不存在，无需清理: {}", info.container_name);
                 return Ok(());
             }
         };
@@ -739,7 +846,26 @@ impl AgentCleaner {
         .await
         .map_err(|e| anyhow::anyhow!("清理容器失败: {}", e))?;
 
-        info!("✅ 容器清理成功: {}", container_name);
+        // 🆕 对于 ComputerAgentRunner 容器，清理 Pingora VNC 后端映射
+        // 👍 直接使用已知的 service_type，无需重新解析
+        if info.service_type == shared_types::ServiceType::ComputerAgentRunner {
+            if let Some(ref pingora_service) = state.pingora_service {
+                // 对于 ComputerAgentRunner，info.id 是 user_id
+                if let Some(removed_ip) = pingora_service.remove_vnc_backend(&info.id) {
+                    info!(
+                        "🧹 [VNC] 已清理 VNC 后端映射: user_id={} -> {}",
+                        info.id, removed_ip
+                    );
+                } else {
+                    debug!(
+                        "📭 [VNC] VNC 后端映射不存在，跳过清理: user_id={}",
+                        info.id
+                    );
+                }
+            }
+        }
+
+        info!("✅ 容器清理成功: {}", info.container_name);
         Ok(())
     }
 
@@ -846,6 +972,7 @@ impl AgentCleaner {
     ///
     /// 使用统一的运行时清理策略
     /// 🚀 重构：使用 DockerManager 的高级 API，移除底层查找和解析逻辑
+    /// 🆕 支持 ComputerAgentRunner 容器的 VNC 后端清理
     async fn destroy_docker_container(&self, project_id: &str) -> Result<()> {
         info!("🔥 [cleanup] 开始销毁Docker容器: project_id={}", project_id);
 
@@ -902,6 +1029,25 @@ impl AgentCleaner {
             )
             .await
             .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
+
+            // 🆕 5. 对于 ComputerAgentRunner 容器，清理 Pingora VNC 后端映射
+            if service_type == shared_types::ServiceType::ComputerAgentRunner {
+                if let Some(ref pingora_service) = self.state.pingora_service {
+                    // 对于 ComputerAgentRunner，project_id 实际上是 user_id
+                    let user_id = project_id;
+                    if let Some(removed_ip) = pingora_service.remove_vnc_backend(user_id) {
+                        info!(
+                            "🧹 [VNC] 已清理 VNC 后端映射: user_id={} -> {}",
+                            user_id, removed_ip
+                        );
+                    } else {
+                        debug!(
+                            "📭 [VNC] VNC 后端映射不存在，跳过清理: user_id={}",
+                            user_id
+                        );
+                    }
+                }
+            }
 
             info!("✅ [cleanup] Docker容器销毁完成: project_id={}", project_id);
         } else {

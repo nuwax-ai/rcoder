@@ -12,9 +12,13 @@ service AgentService {
 
   // 取消会话任务 (Unary)
   rpc CancelSession (CancelRequest) returns (CancelResponse);
-  
+
   // 获取 Agent 状态 (Unary)
   rpc GetStatus (GetStatusRequest) returns (GetStatusResponse);
+
+  // 停止特定 project_id 的 Agent (Unary)
+  // 用于 ComputerAgentRunner 模式：停止单个项目的 Agent，不销毁容器
+  rpc StopAgent (StopAgentRequest) returns (StopAgentResponse);
 }
 
 // === ChatRequest/Response ===
@@ -105,6 +109,27 @@ message GetStatusRequest {
 
 message GetStatusResponse {
   string status = 1; // "idle", "busy", "error"
+}
+
+// === Stop Agent ===
+
+message StopAgentRequest {
+  // 项目 ID (必填)
+  string project_id = 1;
+  // 可选的停止原因
+  optional string reason = 2;
+  // 是否强制停止（不等待当前任务完成）
+  bool force = 3;
+}
+
+message StopAgentResponse {
+  bool success = 1;
+  // 停止结果：stopped, not_found, already_stopped, error
+  string result = 2;
+  // 可选的详细消息
+  optional string message = 3;
+  // 被停止的 Agent 的项目 ID
+  string project_id = 4;
 }
 
 // === Model Provider Config ===

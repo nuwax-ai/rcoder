@@ -9,22 +9,24 @@ path = "src/lib.rs"
 
 [dependencies]
 # Core dependencies
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
-anyhow = "1.0"
-structopt = "0.3"
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+structopt = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
-thiserror = "2.0"
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+matchit = { workspace = true }
 
 # Pingora dependencies - 真正的 Pingora 库
-pingora = { version = "0.6", features = ["lb"] }
-pingora-core = "0.6"
-pingora-http = "0.6"
-pingora-proxy = "0.6"
-pingora-load-balancing = "0.6"
-async-trait = "0.1"
+pingora = { workspace = true }
+pingora-core = { workspace = true }
+pingora-http = { workspace = true }
+pingora-proxy = { workspace = true }
+pingora-load-balancing = { workspace = true }
+async-trait = { workspace = true }
 
 # HTTP client for fallback
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { workspace = true }

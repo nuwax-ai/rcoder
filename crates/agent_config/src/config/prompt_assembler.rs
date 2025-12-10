@@ -303,6 +303,7 @@ mod tests {
         let agent_config = ChatAgentConfig {
             agent_server: None,
             context_servers,
+            resource_limits: None,
         };
 
         let assembler =
@@ -335,6 +336,7 @@ mod tests {
                 metadata: None,
             }),
             context_servers: HashMap::new(),
+            resource_limits: None,
         };
 
         let assembler =
@@ -368,6 +370,7 @@ mod tests {
                 metadata: None,
             }),
             context_servers: HashMap::new(),
+            resource_limits: None,
         };
 
         let assembler =

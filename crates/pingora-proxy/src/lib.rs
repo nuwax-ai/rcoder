@@ -59,12 +59,14 @@
 // 导入模块
 pub mod config;
 pub mod pingora_server;
+pub mod router;
 pub mod server;
 pub mod service;
 
 // 重新导出公共接口
 pub use config::ProxyConfig;
 pub use pingora_server::PingoraServerManager;
+pub use router::{create_router, get_routes_documentation, RouteType};
 pub use server::{PingoraServerRunner, ProxyServer, ProxyServerBuilder};
 pub use service::{PingoraProxyService, PortProxyService}; // PortProxyService 是别名
 

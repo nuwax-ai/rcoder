@@ -114,7 +114,7 @@ struct ProxyServiceWrapper {
 impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
     type CTX = crate::service::TrackingCtx;
 
-    fn new_ctx(&self) -> Self::CTX { crate::service::TrackingCtx { start: Instant::now(), target_port: None } }
+    fn new_ctx(&self) -> Self::CTX { crate::service::TrackingCtx { start: Instant::now(), target_port: None, vnc_target_ip: None } }
 
     async fn upstream_peer(
         &self,
@@ -172,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_stop_server() {
-        let mut manager = PingoraServerManager::new(ProxyConfig::with_listen_port(8081));
+        let _manager = PingoraServerManager::new(ProxyConfig::with_listen_port(8081));
 
         // 测试启动和停止（在测试中可能需要更复杂的逻辑）
         // 这里只是验证方法调用不 panic

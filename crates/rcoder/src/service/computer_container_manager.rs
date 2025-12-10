@@ -1,0 +1,240 @@
+//! Computer Agent Runner 容器管理服务
+//!
+//! 提供用户级容器的创建和管理逻辑。
+//! 与 RCoder 的 project_id 容器模式不同，ComputerAgentRunner 使用 user_id 作为容器标识。
+//!
+//! ## 与 RCoder ContainerManager 的区别
+//!
+//! | 维度 | RCoder | ComputerAgentRunner |
+//! |------|--------|---------------------|
+//! | 容器标识 | `project_id` | `user_id` |
+//! | 容器命名 | `rcoder-agent-{project_id}` | `computer-agent-runner-{user_id}` |
+//! | 工作目录 | `/app/project_workspace/{project_id}` | `/app/computer-project-workspace/{user_id}` |
+//! | Agent 实例 | 1 个 | 多个（按 project_id 区分） |
+
+use crate::AppError;
+use docker_manager::ContainerBasicInfo;
+use shared_types::{ServiceResourceLimits, ServiceType};
+use std::path::PathBuf;
+use tracing::{debug, error, info};
+
+/// Computer Agent Runner 容器管理服务
+///
+/// 负责根据 `user_id` 获取或创建容器。
+/// 一个用户对应一个容器，容器内可以运行多个 project_id 的 Agent 实例。
+pub struct ComputerContainerManager;
+
+impl ComputerContainerManager {
+    /// 根据 user_id 获取或创建容器
+    ///
+    /// 容器命名规则: `computer-agent-runner-{user_id}`
+    /// 工作区路径: `/app/computer-project-workspace/{user_id}`
+    ///
+    /// # 参数
+    /// - `user_id`: 用户唯一标识符
+    /// - `resource_limits`: 可选的资源限额配置
+    ///
+    /// # 返回
+    /// 容器基本信息，包含容器 ID、IP 地址等
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let container_info = ComputerContainerManager::get_or_create_container_for_user(
+    ///     "user_123",
+    ///     None,
+    /// ).await?;
+    /// println!("Container IP: {}", container_info.container_ip);
+    /// ```
+    pub async fn get_or_create_container_for_user(
+        user_id: &str,
+        resource_limits: Option<ServiceResourceLimits>,
+    ) -> Result<ContainerBasicInfo, AppError> {
+        info!(
+            "🔍 [COMPUTER_CONTAINER] 获取/创建用户容器: user_id={}",
+            user_id
+        );
+
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| {
+                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
+                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            })?;
+
+        // 1. 尝试获取现有容器
+        // 使用 user_id 作为容器标识进行查询
+        if let Ok(Some(info)) = docker_manager.get_agent_info(user_id).await {
+            info!(
+                "✅ [COMPUTER_CONTAINER] 用户容器已存在: user_id={}, container_id={}",
+                user_id, info.container_id
+            );
+            return Ok(info);
+        }
+
+        // 2. 容器不存在，创建新容器
+        info!(
+            "🏗️ [COMPUTER_CONTAINER] 创建新用户容器: user_id={}",
+            user_id
+        );
+        Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
+    }
+
+    /// 为用户创建容器
+    ///
+    /// 内部方法，负责实际的容器创建逻辑。
+    async fn create_container_for_user(
+        user_id: &str,
+        docker_manager: &std::sync::Arc<docker_manager::DockerManager>,
+        resource_limits: Option<ServiceResourceLimits>,
+    ) -> Result<ContainerBasicInfo, AppError> {
+        // 1. 准备用户级工作目录
+        let user_workspace = Self::get_user_workspace(user_id).await?;
+        Self::create_user_workspace(user_id).await?;
+
+        // 2. 解析宿主机路径
+        // rcoder 运行在容器内，需要知道其挂载卷在宿主机上的真实路径
+        let host_path = crate::utils::resolve_container_path_to_host(&user_workspace)
+            .await
+            .map_err(|e| {
+                error!("❌ [COMPUTER_CONTAINER] 路径解析失败: {}", e);
+                AppError::internal_server_error(&format!("路径解析失败: {}", e))
+            })?;
+
+        info!(
+            "📁 [COMPUTER_CONTAINER] 用户工作区路径映射: 容器内={:?}, 宿主机={:?}",
+            user_workspace, host_path
+        );
+
+        // 3. 调用 DockerManager 启动容器
+        // 注意: 使用 user_id 作为 project_id 传递给 Docker Manager
+        // 容器命名会自动根据 ServiceType::ComputerAgentRunner 生成为 computer-agent-runner-{user_id}
+        let container_info = docker_manager
+            .start_agent_container(
+                user_id, // 使用 user_id 作为容器标识
+                &host_path.to_string_lossy(),
+                ServiceType::ComputerAgentRunner,
+                resource_limits,
+            )
+            .await
+            .map_err(|e| {
+                error!("❌ [COMPUTER_CONTAINER] 启动容器失败: {}", e);
+                AppError::internal_server_error(&format!("启动容器失败: {}", e))
+            })?;
+
+        info!(
+            "🚀 [COMPUTER_CONTAINER] 用户容器创建成功: user_id={}, container_id={}, ip={}",
+            user_id, container_info.container_id, container_info.container_ip
+        );
+
+        Ok(container_info)
+    }
+
+    /// 获取用户工作区路径
+    ///
+    /// 路径格式: `/app/computer-project-workspace/{user_id}`
+    ///
+    /// 注意：project_id 作为子目录由容器内的 agent 自己管理
+    pub async fn get_user_workspace(user_id: &str) -> Result<PathBuf, AppError> {
+        let workspace_dir = PathBuf::from("/app/computer-project-workspace");
+        let user_dir = workspace_dir.join(user_id);
+        Ok(user_dir)
+    }
+
+    /// 创建用户工作区目录
+    ///
+    /// 创建 `/app/computer-project-workspace/{user_id}` 目录
+    pub async fn create_user_workspace(user_id: &str) -> Result<PathBuf, AppError> {
+        let workspace_dir = PathBuf::from("/app/computer-project-workspace");
+
+        // 确保根目录存在
+        tokio::fs::create_dir_all(&workspace_dir)
+            .await
+            .map_err(|e| {
+                error!(
+                    "❌ [COMPUTER_CONTAINER] 创建 workspace 目录失败: {:?}",
+                    e
+                );
+                AppError::internal_server_error(&format!("创建 workspace 目录失败: {}", e))
+            })?;
+
+        // 创建用户目录
+        let user_dir = workspace_dir.join(user_id);
+        tokio::fs::create_dir_all(&user_dir).await.map_err(|e| {
+            error!("❌ [COMPUTER_CONTAINER] 创建用户目录失败: {:?}", e);
+            AppError::internal_server_error(&format!("创建用户目录失败: {}", e))
+        })?;
+
+        debug!(
+            "📁 [COMPUTER_CONTAINER] 用户工作区创建成功: {:?}",
+            user_dir
+        );
+
+        Ok(user_dir)
+    }
+
+    /// 获取容器信息
+    ///
+    /// 通过 user_id 查询容器是否存在
+    pub async fn get_container_info(
+        user_id: &str,
+    ) -> Result<Option<ContainerBasicInfo>, AppError> {
+        debug!(
+            "[COMPUTER_CONTAINER] 获取容器信息: user_id={}",
+            user_id
+        );
+
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| {
+                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
+                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            })?;
+
+        docker_manager
+            .get_agent_info(user_id)
+            .await
+            .map_err(|e| {
+                error!("❌ [COMPUTER_CONTAINER] 查询容器信息失败: {}", e);
+                AppError::internal_server_error(&format!("查询容器信息失败: {}", e))
+            })
+    }
+}
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_user_workspace_path() {
+        // 测试路径格式
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = ComputerContainerManager::get_user_workspace("user_123")
+                .await
+                .unwrap();
+            assert_eq!(
+                path,
+                PathBuf::from("/app/computer-project-workspace/user_123")
+            );
+        });
+    }
+
+    #[test]
+    fn test_workspace_path_with_special_chars() {
+        // 测试带特殊字符的 user_id
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = ComputerContainerManager::get_user_workspace("user-with-dash_123")
+                .await
+                .unwrap();
+            assert_eq!(
+                path,
+                PathBuf::from("/app/computer-project-workspace/user-with-dash_123")
+            );
+        });
+    }
+}

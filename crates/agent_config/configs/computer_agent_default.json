@@ -1,0 +1,91 @@
+{
+  "agent_servers": {
+    "claude-code-acp": {
+      "agent_id": "claude-code-acp",
+      "agent_type": "claude",
+      "command": "claude-code-acp",
+      "args": [],
+      "env": {
+        "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}",
+        "ANTHROPIC_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
+        "ANTHROPIC_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
+        "RUST_LOG": "info"
+      },
+      "system_prompt": {
+        "source": "embedded",
+        "template": "",
+        "enabled": true
+      },
+      "user_prompt": {
+        "template": "{user_prompt}",
+        "enabled": false
+      },
+      "installation": {
+        "package_manager": "npm",
+        "package_name": "@anthropics/claude-code-acp",
+        "version": "latest"
+      },
+      "enabled": true,
+      "metadata": {
+        "description": "Claude Code ACP Agent - Computer Agent Runner configuration",
+        "version": "1.0.0",
+        "service_type": "ComputerAgentRunner"
+      }
+    }
+  },
+  "context_servers": {
+    "chrome-devtools": {
+      "source": "custom",
+      "enabled": true,
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@latest"],
+      "env": {
+        "CHROME_REMOTE_DEBUGGING_PORT": "9222",
+        "CHROME_REMOTE_DEBUGGING_HOST": "127.0.0.1"
+      },
+      "metadata": {
+        "description": "Chrome DevTools MCP - Browser automation via Chrome DevTools Protocol",
+        "capabilities": ["browser_automation", "page_navigation", "dom_manipulation", "screenshot"]
+      }
+    },
+    "context7": {
+      "source": "custom",
+      "enabled": true,
+      "command": "bunx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "env": {}
+    },
+    "fetch": {
+      "source": "custom",
+      "enabled": true,
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "env": {}
+    },
+    "puppeteer": {
+      "source": "custom",
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-puppeteer"],
+      "env": {
+        "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium"
+      },
+      "metadata": {
+        "description": "Puppeteer MCP - Alternative browser automation (disabled by default)",
+        "note": "Enable this if chrome-devtools doesn't meet your needs"
+      }
+    }
+  },
+  "metadata": {
+    "config_name": "computer_agent_default",
+    "description": "Computer Agent Runner 专用配置 - 支持桌面环境和浏览器自动化",
+    "version": "1.0.0",
+    "service_type": "ComputerAgentRunner",
+    "features": {
+      "desktop_environment": "XFCE4 + noVNC",
+      "browser": "Chromium with CDP",
+      "vnc_port": 6080,
+      "cdp_port": 9222
+    }
+  }
+}

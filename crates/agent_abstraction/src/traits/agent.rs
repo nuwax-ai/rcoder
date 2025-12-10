@@ -26,6 +26,9 @@ pub struct AgentStartConfig {
     ///
     /// 可以传递任何额外的配置信息给 Agent
     pub extra_meta: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// 服务类型（用于加载对应的配置）
+    pub service_type: Option<shared_types::ServiceType>,
 }
 
 impl AgentStartConfig {
@@ -49,6 +52,12 @@ impl AgentStartConfig {
     /// 设置额外的 meta 字段
     pub fn with_extra_meta(mut self, extra_meta: serde_json::Map<String, serde_json::Value>) -> Self {
         self.extra_meta = Some(extra_meta);
+        self
+    }
+
+    /// 设置服务类型
+    pub fn with_service_type(mut self, service_type: shared_types::ServiceType) -> Self {
+        self.service_type = Some(service_type);
         self
     }
 

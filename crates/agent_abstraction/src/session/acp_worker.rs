@@ -58,7 +58,10 @@ impl<
 
         // 3. 使用 PromptConfigAssembler 组装配置
         let default_agent_id = "claude-code-acp";
-        let servers_config = AgentServersConfig::load_or_default().await;
+        // 根据请求中的 service_type 加载对应配置
+        let servers_config = AgentServersConfig::load_or_default_for_service(
+            &request.prompt_message.service_type
+        ).await;
 
         let assembler = PromptConfigAssembler::new(servers_config)
             .with_system_prompt(request.prompt_message.system_prompt_override.clone())
@@ -106,10 +109,11 @@ impl<
         let mcp_servers = convert_context_servers(&context_servers);
         debug!("🔌 转换后的 MCP 服务器数量: {}", mcp_servers.len());
 
-        // 构建 AgentStartConfig 并传递 MCP 服务器
+        // 构建 AgentStartConfig 并传递 MCP 服务器和 service_type
         let start_config = AgentStartConfig::new()
             .with_system_prompt(system_prompt)
-            .with_mcp_servers(mcp_servers);
+            .with_mcp_servers(mcp_servers)
+            .with_service_type(request.prompt_message.service_type.clone());
 
         // 4. 创建 Client 实例
         let client = C::default();
