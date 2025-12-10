@@ -17,6 +17,8 @@ services:
       - ./config.yml:/app/config.yml
       # 挂载项目工作目录 - 这是关键的挂载！
       - ./project_workspace:/app/project_workspace
+      # 挂载 computer 项目工作目录
+      - ./computer-project-workspace:/app/computer-project-workspace
       # 挂载工作目录
       - ./logs/:/app/logs
       # 挂载启动脚本
