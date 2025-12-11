@@ -22,7 +22,7 @@
       },
       "installation": {
         "package_manager": "npm",
-        "package_name": "@anthropics/claude-code-acp",
+        "package_name": "@zed-industries/claude-code-acp",
         "version": "latest"
       },
       "enabled": true,
@@ -37,14 +37,19 @@
       "source": "custom",
       "enabled": true,
       "command": "bunx",
-      "args": ["-y", "@upstash/context7-mcp"],
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ],
       "env": {}
     },
     "fetch": {
       "source": "custom",
       "enabled": true,
       "command": "uvx",
-      "args": ["mcp-server-fetch"],
+      "args": [
+        "mcp-server-fetch"
+      ],
       "env": {}
     }
   }
