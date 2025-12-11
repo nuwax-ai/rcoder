@@ -23,11 +23,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
 
-use crate::{
-    router::AppState,
-    service::ComputerContainerManager,
-    AppError, HttpResult,
-};
+use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 use docker_manager::ContainerBasicInfo;
 use shared_types::Attachment;
 
@@ -208,7 +204,7 @@ pub async fn handle_computer_chat(
     )
     .await;
 
-    // 7. 更新会话映射（复用现有的 session_to_container_id）
+    // 7. 更新会话映射（填充所有三个映射表，保持一致性）
     if let Ok(http_result) = &result {
         if let Some(chat_response) = &http_result.data {
             let session_id = chat_response.session_id.clone();
@@ -219,13 +215,35 @@ pub async fn handle_computer_chat(
                 session_id, container_id, user_id, project_id
             );
 
-            // 使用现有的会话映射
+            // 创建 ProjectAndContainerInfo
+            let mut project_info = shared_types::ProjectAndContainerInfo::new(project_id.clone());
+
+            // 更新会话ID
+            project_info.update_session(session_id.clone());
+
+            // 更新扩展信息（容器、模型配置等）
+            project_info.update_extended_from_request(
+                Some(container_info.clone()),
+                request.model_provider.clone(),
+                request.request_id.clone(),
+                Some(shared_types::ServiceType::ComputerAgentRunner),
+            );
+
+            let project_info_arc = Arc::new(project_info);
+
+            // 填充所有三个映射表，确保状态一致性
             state
                 .session_to_container_id
                 .insert(session_id.clone(), container_id);
+            state
+                .sessions
+                .insert(session_id.clone(), project_info_arc.clone());
+            state
+                .project_and_agent_map
+                .insert(project_id.clone(), project_info_arc);
 
             info!(
-                "✅ [COMPUTER_CHAT] 请求处理完成: user_id={}, project_id={}, session_id={}",
+                "✅ [COMPUTER_CHAT] 请求处理完成: user_id={}, project_id={}, session_id={} (所有映射表已更新)",
                 user_id, project_id, session_id
             );
         }
@@ -255,7 +273,8 @@ async fn forward_computer_request_to_container(
     );
 
     // 从 service_url 提取 gRPC 地址
-    let grpc_addr = extract_grpc_addr(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?;
+    let grpc_addr =
+        extract_grpc_addr(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?;
 
     debug!(
         "📡 [COMPUTER_FORWARD] gRPC 地址: {}, prompt_len={}, attachments={}",
@@ -319,10 +338,7 @@ async fn forward_computer_request_to_container(
                     last_error = Some(e);
                     continue;
                 } else if !should_retry {
-                    error!(
-                        "❌ [COMPUTER_FORWARD] 检测到不可重试错误，停止重试: {}",
-                        e
-                    );
+                    error!("❌ [COMPUTER_FORWARD] 检测到不可重试错误，停止重试: {}", e);
                     last_error = Some(e);
                     break;
                 }

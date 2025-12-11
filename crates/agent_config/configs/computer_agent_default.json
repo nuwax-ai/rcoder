@@ -22,7 +22,7 @@
       },
       "installation": {
         "package_manager": "npm",
-        "package_name": "@anthropics/claude-code-acp",
+        "package_name": "@zed-industries/claude-code-acp",
         "version": "latest"
       },
       "enabled": true,
@@ -38,35 +38,51 @@
       "source": "custom",
       "enabled": true,
       "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp@latest"],
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest"
+      ],
       "env": {
         "CHROME_REMOTE_DEBUGGING_PORT": "9222",
         "CHROME_REMOTE_DEBUGGING_HOST": "127.0.0.1"
       },
       "metadata": {
         "description": "Chrome DevTools MCP - Browser automation via Chrome DevTools Protocol",
-        "capabilities": ["browser_automation", "page_navigation", "dom_manipulation", "screenshot"]
+        "capabilities": [
+          "browser_automation",
+          "page_navigation",
+          "dom_manipulation",
+          "screenshot"
+        ]
       }
     },
     "context7": {
       "source": "custom",
       "enabled": true,
       "command": "bunx",
-      "args": ["-y", "@upstash/context7-mcp"],
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ],
       "env": {}
     },
     "fetch": {
       "source": "custom",
       "enabled": true,
       "command": "uvx",
-      "args": ["mcp-server-fetch"],
+      "args": [
+        "mcp-server-fetch"
+      ],
       "env": {}
     },
     "puppeteer": {
       "source": "custom",
       "enabled": false,
       "command": "npx",
-      "args": ["-y", "@anthropic/mcp-server-puppeteer"],
+      "args": [
+        "-y",
+        "@anthropic/mcp-server-puppeteer"
+      ],
       "env": {
         "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium"
       },

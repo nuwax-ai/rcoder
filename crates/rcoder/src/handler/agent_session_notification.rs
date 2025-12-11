@@ -108,7 +108,10 @@ pub async fn agent_session_notification(
     let container_id = match state.session_to_container_id.get(session_id) {
         Some(cid) => cid.value().clone(),
         None => {
-            warn!("❌ [SSE_PROXY] 在 session_to_container_id 映射中未找到会话: session_id={}", session_id);
+            warn!(
+                "❌ [SSE_PROXY] 在 session_to_container_id 映射中未找到会话: session_id={}",
+                session_id
+            );
             return Err(create_error_response(
                 StatusCode::NOT_FOUND,
                 "SESSION_NOT_FOUND",
@@ -132,7 +135,10 @@ pub async fn agent_session_notification(
 
     match docker_manager.is_container_running(&container_id).await {
         Ok(true) => {
-            info!("✅ [SSE_PROXY] 容器检查通过: container_id={}, 状态=运行中", container_id);
+            info!(
+                "✅ [SSE_PROXY] 容器检查通过: container_id={}, 状态=运行中",
+                container_id
+            );
             // 容器正在运行，继续执行
         }
         Ok(false) => {
@@ -146,7 +152,10 @@ pub async fn agent_session_notification(
             ));
         }
         Err(e) => {
-            error!("❌ [SSE_PROXY] 检查容器状态失败: container_id={}, error={}", container_id, e);
+            error!(
+                "❌ [SSE_PROXY] 检查容器状态失败: container_id={}, error={}",
+                container_id, e
+            );
             return Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -156,19 +165,22 @@ pub async fn agent_session_notification(
     };
 
     // 容器验证通过后，继续后续逻辑
-    // 注意：这里的 'find_container_by_session_id' 逻辑现在是多余的，我们直接使用已验证的信息
     match find_container_by_session_id(&state, &session_id) {
-        Some((project_id, _agent_info)) => {
+        Some((project_id, agent_info)) => {
             info!(
                 "✅ [SSE_PROXY] 找到项目: session_id={}, project_id={}",
                 session_id, project_id
             );
 
-            // 🎯 使用 gRPC 替代 HTTP SSE 代理
-            match crate::grpc::get_container_grpc_addr(&project_id, shared_types::GRPC_DEFAULT_PORT)
-                .await
-            {
-                Ok(grpc_addr) => {
+            // 🎯 直接从 agent_info 中获取容器 IP 构建 gRPC 地址
+            // 对于 Computer Agent，容器信息已经在 ProjectAndContainerInfo 中
+            match agent_info.container() {
+                Some(container) => {
+                    let grpc_addr = format!(
+                        "{}:{}",
+                        container.container_ip,
+                        shared_types::GRPC_DEFAULT_PORT
+                    );
                     info!("🚀 [gRPC_SSE] 建立 gRPC SSE 代理连接: {}", grpc_addr);
 
                     // 创建 gRPC SSE 流
@@ -185,23 +197,26 @@ pub async fn agent_session_notification(
                             .text("keep-alive"),
                     ))
                 }
-                Err(e) => {
+                None => {
                     error!(
-                        "❌ [gRPC_SSE] 获取容器 gRPC 地址失败: session_id={}, error={}",
-                        session_id, e
+                        "❌ [gRPC_SSE] ProjectAndContainerInfo 中没有容器信息: session_id={}, project_id={}",
+                        session_id, project_id
                     );
 
                     Err(create_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "GRPC_CONNECTION_ERROR",
-                        &format!("无法连接到容器的 gRPC 端点: {}", e),
+                        "会话中缺少容器信息，请重新发起请求。",
                     ))
                 }
             }
         }
         None => {
             // 理论上在预检后不应该发生，但作为保障
-            error!("❌ [SSE_PROXY] 状态不一致：预检通过但在 project_and_agent_map 中未找到: session_id={}", session_id);
+            error!(
+                "❌ [SSE_PROXY] 状态不一致：预检通过但在 project_and_agent_map 中未找到: session_id={}",
+                session_id
+            );
 
             Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -441,10 +456,14 @@ async fn get_container_sse_url(
         })?;
 
     // 使用高级 API 获取容器信息
-    if let Some(info) = docker_manager.get_agent_info(project_id).await.map_err(|e| {
-        error!("❌ [CONTAINER] 获取容器信息失败: {}", e);
-        AppError::internal_server_error(&format!("获取容器信息失败: {}", e))
-    })? {
+    if let Some(info) = docker_manager
+        .get_agent_info(project_id)
+        .await
+        .map_err(|e| {
+            error!("❌ [CONTAINER] 获取容器信息失败: {}", e);
+            AppError::internal_server_error(&format!("获取容器信息失败: {}", e))
+        })?
+    {
         // 构建 SSE 端点 URL
         // info.service_url 格式为 http://ip:8086
         let sse_url = format!("{}/agent/progress/{}", info.service_url, session_id);
