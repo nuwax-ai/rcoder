@@ -73,16 +73,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // Computer Agent Runner 路由
     let computer_routes = Router::new()
         .route("/computer/chat", post(handler::handle_computer_chat))
-        .route(
-            "/computer/agent/stop",
-            post(handler::computer_agent_stop),
-        )
+        .route("/computer/agent/stop", post(handler::computer_agent_stop))
         // 进度流复用现有的 agent_session_notification
         .route(
             "/computer/progress/{session_id}",
             get(handler::agent_session_notification),
         )
-        // VNC 桌面访问
+        // VNC 桌面访问说明接口
         .route(
             "/computer/desktop/{user_id}/{project_id}",
             get(handler::computer_desktop_vnc),
@@ -94,12 +91,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/proxy/status", get(handler::proxy_status))
         .route("/proxy/stats", get(handler::proxy_stats))
         .route("/proxy/config", get(handler::proxy_config))
-        .route("/proxy", get(handler::proxy_with_query_params))
-        .route("/proxy/{port}", get(handler::proxy_to_port))
-        .route(
-            "/proxy/{port}/{*path}",
-            get(handler::proxy_to_port_with_path),
-        )
         .with_state(state.clone());
 
     Router::new()
@@ -119,6 +110,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::agent_session_cancel,
         handler::agent_stop,
         handler::agent_status,
+        handler::handle_computer_chat,
+        handler::computer_agent_stop,
+        handler::computer_progress_notification_doc,
+        handler::computer_desktop_vnc,
+        handler::computer_desktop_proxy,
         // Pingora 代理接口
         handler::proxy_status,
         handler::proxy_stats,
@@ -134,6 +130,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::ChatRequest,
             shared_types::ChatResponse,
             handler::StopAgentResponse,
+            handler::CancelResponse,
             // 移除 SessionUpdateEvent，因为现在使用 ProxyRedirectResponse
             handler::ProxyErrorResponse,
             // 模型配置相关结构体
@@ -143,6 +140,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             // Agent状态相关结构体
             shared_types::AgentStatusResponse,
             shared_types::AgentStatus,
+            handler::SessionNotificationParams,
             // 附件相关结构体
             shared_types::Attachment,
             shared_types::AttachmentSource,
@@ -154,6 +152,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             // 会话消息相关结构体
             shared_types::UnifiedSessionMessage,
             shared_types::SessionMessageType,
+            // Computer Agent 相关结构体
+            handler::ComputerChatRequest,
+            handler::ComputerAgentStopRequest,
+            handler::ComputerAgentStopResponse,
+            handler::DesktopPathParams,
+            handler::VncProxyPathParams,
+            handler::DesktopAccessResponse,
+            handler::DesktopErrorResponse,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,
@@ -172,6 +178,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         (name = "system", description = "系统健康检查和状态监控接口"),
         (name = "chat", description = "AI 聊天对话接口，支持多媒体内容"),
         (name = "agent", description = "AI 代理会话管理和实时通知接口"),
+        (name = "computer", description = "Computer Agent 桌面与聊天接口"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
     ),
     info(
@@ -198,7 +205,11 @@ RCoder AI 服务 API
 
 ## Pingora 代理功能
 
-- **端口路由**: `/proxy/{port}/{path}` - 动态路由到任意端口的后端服务
+- **VNC 代理**: `/computer/vnc/{user_id}/{project_id}/{*path}` - 代理到容器的 noVNC 服务（端口 6080）
+  - 路径示例：`/computer/vnc/user_123/proj_456/vnc.html` - VNC 桌面页面
+  - WebSocket：`/computer/vnc/user_123/proj_456/websockify` - VNC 连接
+- **端口路由**: `/proxy/{port}/{*path}` - 动态路由到任意端口的后端服务
+  - 支持两种方式：直接访问 Pingora 端口 或 通过 API 重定向
 - **负载均衡**: 支持 Round Robin 算法和健康检查
 - **动态发现**: 自动发现和添加后端服务，无需预配置
 - **高性能**: 基于 Rust 异步 I/O 的高性能代理
@@ -208,14 +219,14 @@ RCoder AI 服务 API
 1. 调用 `/chat` 接口发送对话请求
 2. 通过 `/agent/progress/{session_id}` 建立 SSE 连接接收实时更新
 3. 可随时通过 `/agent/session/cancel` 取消正在执行的任务
-4. 使用 `/proxy/{port}/{path}` 代理请求到任意后端服务
+4. 直接访问 Pingora 代理路径或使用管理接口
 
 ## 代理接口示例
 
 - `GET /proxy/status` - 查看代理服务状态
-- `GET /proxy/3000/api/users` - 代理到端口 3000 的服务
-- `GET /proxy/8080/health` - 代理到端口 8080 的健康检查
 - `GET /proxy/stats` - 查看代理统计信息
+- `GET /proxy/config` - 查看代理配置信息
+- 直接访问 `http://{host}:{pingora_port}/proxy/{port}/{path}` - 使用 Pingora 代理服务
 "#,
         title = "RCoder AI API",
         version = "1.0.0",
@@ -227,7 +238,7 @@ RCoder AI 服务 API
         )
     ),
     servers(
-        (url = "http://localhost:3000", description = "本地开发环境"),
+        (url = "http://localhost:8087", description = "本地开发环境"),
         (url = "https://api.rcoder.com", description = "生产环境"),
         (url = "https://staging-api.rcoder.com", description = "测试环境")
     )

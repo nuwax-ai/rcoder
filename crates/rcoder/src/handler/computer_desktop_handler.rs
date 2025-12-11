@@ -30,7 +30,7 @@ use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 use utoipa::ToSchema;
 
-use crate::{router::AppState, service::ComputerContainerManager, AppError, HttpResult};
+use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 
 /// VNC 桌面路径参数
 #[derive(Debug, Deserialize, ToSchema)]
@@ -183,10 +183,7 @@ pub async fn computer_desktop_vnc(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!(
-                "⚠️ [DESKTOP_VNC] 找不到用户容器: user_id={}",
-                user_id
-            );
+            warn!("⚠️ [DESKTOP_VNC] 找不到用户容器: user_id={}", user_id);
             return Ok(HttpResult::error(
                 "NOT_FOUND",
                 &format!("找不到用户 {} 的容器，请先发送聊天请求创建容器", user_id),
@@ -221,7 +218,8 @@ pub async fn computer_desktop_vnc(
         container_ip: container_ip.clone(),
         user_id: user_id.clone(),
         project_id: project_id.clone(),
-        message: "请使用 proxy_vnc_url 或 proxy_websocket_url 通过 Pingora 代理访问 VNC 桌面".to_string(),
+        message: "请使用 proxy_vnc_url 或 proxy_websocket_url 通过 Pingora 代理访问 VNC 桌面"
+            .to_string(),
     };
 
     info!(
@@ -232,38 +230,134 @@ pub async fn computer_desktop_vnc(
     Ok(HttpResult::success(response))
 }
 
-/// VNC 桌面代理（WebSocket）
+/// VNC 桌面代理路径参数（用于 Pingora 代理）
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VncProxyPathParams {
+    /// 用户 ID
+    #[schema(example = "user_123")]
+    pub user_id: String,
+    /// 项目 ID
+    #[schema(example = "proj_456")]
+    pub project_id: String,
+    /// 剩余路径（可选）
+    #[schema(example = "vnc.html", nullable = true)]
+    pub path: Option<String>,
+}
+
+/// VNC 桌面代理路径（通过 Pingora 代理）
 ///
-/// 这是一个占位实现。
+/// 这是一个占位实现，用于生成 OpenAPI 文档。
+/// 实际的 VNC 代理请求会通过 Pingora 透明代理到容器的 noVNC 服务。
+///
+/// ## 路径说明
+/// - `GET /computer/vnc/{user_id}/{project_id}/vnc.html` - VNC 桌面页面
+/// - `GET /computer/vnc/{user_id}/{project_id}/websockify` - VNC WebSocket 连接
+/// - `GET /computer/vnc/{user_id}/{project_id}/{*path}` - 其他 noVNC 资源
+///
+/// ## 实现说明
 /// 完整的 WebSocket 代理需要：
 /// 1. HTTP Upgrade 处理
 /// 2. 双向 WebSocket 帧转发
 /// 3. 连接生命周期管理
 ///
-/// 建议方案：
-/// - 使用 Pingora 的 WebSocket 支持（如果有）
-/// - 或在 rcoder 前面部署 Nginx 作为 VNC 代理
+/// 当前实现使用 Pingora 透明代理，客户端请求会直接代理到容器内部服务。
+#[utoipa::path(
+    get,
+    path = "/computer/vnc/{user_id}/{project_id}/{*path}",
+    params(
+        ("user_id" = String, Path, description = "用户 ID"),
+        ("project_id" = String, Path, description = "项目 ID"),
+        ("path" = Option<String>, Path, description = "剩余路径，如 vnc.html, websockify 等")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "成功访问 VNC 资源",
+            body = String,
+            example = "<!DOCTYPE html>\\n<html>\\n<head><title>noVNC</title></head>\\n<body>noVNC Client</body>\\n</html>"
+        ),
+        (
+            status = 101,
+            description = "WebSocket 升级响应",
+            body = String
+        ),
+        (
+            status = 404,
+            description = "找不到用户容器或资源不存在",
+            body = HttpResult<DesktopErrorResponse>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "code": "PROXY_REDIRECT",
+                "message": "请使用 Pingora 代理路径访问 VNC 桌面，路径: /computer/vnc/user_123/proj_456/vnc.html",
+                "tid": null
+            })
+        )
+    ),
+    tag = "computer",
+    operation_id = "computer_vnc_proxy",
+    summary = "VNC 桌面代理",
+    description = r#"
+通过 Pingora 代理访问容器的 VNC 桌面服务。
+
+## 访问方式
+
+### VNC 桌面页面
+```
+GET /computer/vnc/{user_id}/{project_id}/vnc.html
+```
+
+### WebSocket 连接
+```
+GET /computer/vnc/{user_id}/{project_id}/websockify
+```
+
+### 其他资源
+```
+GET /computer/vnc/{user_id}/{project_id}/{*path}
+```
+
+## 工作原理
+
+1. 客户端请求到达 RCoder 服务
+2. Axum 路由器匹配到 VNC 代理路径
+3. 请求转发给 Pingora 代理服务
+4. Pingora 根据 user_id 查找容器 IP
+5. Pingora 透明代理请求到容器的 noVNC 服务（端口 6080）
+6. 响应返回给客户端
+
+## 使用示例
+
+```javascript
+// 访问 VNC 桌面页面
+window.open('/computer/vnc/user_123/proj_456/vnc.html', '_blank');
+
+// 或在 iframe 中嵌入
+<iframe src="/computer/vnc/user_123/proj_456/vnc.html" width="100%" height="600"></iframe>
+```
+"#
+)]
 #[allow(dead_code)]
 pub async fn computer_desktop_proxy(
     State(_state): State<Arc<AppState>>,
-    Path(params): Path<DesktopPathParams>,
+    Path((user_id, project_id, path)): Path<(String, String, Option<String>)>,
 ) -> impl IntoResponse {
-    // TODO: 实现 WebSocket 代理
-    // 1. HTTP Upgrade 检测
-    // 2. 建立到容器 6080 端口的 WebSocket 连接
-    // 3. 双向帧转发
+    // 占位实现：实际代理由 Pingora 处理
+    // 这里返回 501 是为了表明这个端点应该由 Pingora 代理
 
     let error_response = DesktopErrorResponse {
-        error: "NOT_IMPLEMENTED".to_string(),
-        message: "WebSocket 代理功能尚未实现，请使用 GET /computer/desktop/{user_id}/{project_id} 获取直接访问 URL".to_string(),
-        user_id: params.user_id,
-        project_id: params.project_id,
+        error: "PROXY_REDIRECT".to_string(),
+        message: format!(
+            "请使用 Pingora 代理路径访问 VNC 桌面，路径: /computer/vnc/{}/{}/{}",
+            user_id,
+            project_id,
+            path.as_deref().unwrap_or("vnc.html")
+        ),
+        user_id,
+        project_id,
     };
 
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(error_response),
-    )
+    (StatusCode::NOT_IMPLEMENTED, Json(error_response))
 }
 
 // ============================================================================

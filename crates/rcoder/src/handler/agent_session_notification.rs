@@ -18,10 +18,10 @@ use shared_types::ProjectAndContainerInfo;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
-use utoipa::IntoParams;
+use utoipa::{IntoParams, ToSchema};
 
 /// 会话通知路径参数
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct SessionNotificationParams {
     /// 会话ID，用于标识特定的会话连接
     #[param(example = "session456")]
@@ -210,6 +210,61 @@ pub async fn agent_session_notification(
             ))
         }
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/computer/progress/{session_id}",
+    params(
+        SessionNotificationParams
+    ),
+    responses(
+        (
+            status = 200,
+            description = "成功建立 SSE 连接，开始接收实时消息",
+            content_type = "text/event-stream",
+            headers(
+                ("Cache-Control" = String, description = "no-cache"),
+                ("Connection" = String, description = "keep-alive"),
+            )
+        ),
+        (
+            status = 404,
+            description = "未找到对应的容器",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "CONTAINER_NOT_FOUND",
+                    "message": "未找到 session_id 对应的活跃容器"
+                }
+            })
+        ),
+        (
+            status = 500,
+            description = "建立 SSE 连接失败",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "SSE_CONNECTION_ERROR",
+                    "message": "无法连接到容器的 SSE 端点"
+                }
+            })
+        )
+    ),
+    tag = "computer",
+    operation_id = "computer_progress_notification",
+    summary = "Computer Agent 会话 SSE 通知流",
+    description = "为 Computer Agent 建立 SSE 连接，实时接收执行进度和状态更新。"
+)]
+pub async fn computer_progress_notification_doc(
+    Path(_params): Path<SessionNotificationParams>,
+    State(_state): State<Arc<crate::router::AppState>>,
+) -> Result<(), AppError> {
+    Ok(())
 }
 
 /// 创建 SSE 代理流

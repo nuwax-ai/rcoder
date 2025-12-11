@@ -1,4 +1,4 @@
-.PHONY: help build docker-build install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag
+.PHONY: help build docker-build docker-build-master docker-build-agent-runner install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag
 
 # 默认目标：显示帮助信息
 help:
@@ -11,8 +11,10 @@ help:
 	@echo "  make uninstall      - 卸载所有二进制"
 	@echo ""
 	@echo "🐳 Docker 镜像构建："
-	@echo "  make docker-build   - 仅构建 Docker 镜像"
-	@echo "  make dev-build      - 本地编译 + 构建 Docker 镜像（一键完成）"
+	@echo "  make docker-build                 - 构建所有 Docker 镜像"
+	@echo "  make docker-build-master          - 仅构建 master-rcoder 镜像"
+	@echo "  make docker-build-agent-runner    - 仅构建 rcoder-agent-runner 镜像"
+	@echo "  make dev-build                    - 本地编译 + 构建 Docker 镜像（一键完成）"
 	@echo "  make update-image-tag - 根据系统架构更新镜像标签 (arm64/amd64 -> latest)"
 	@echo ""
 	@echo "🔧 开发模式命令："
@@ -22,7 +24,7 @@ help:
 	@echo "  make dev-logs       - 查看开发模式容器日志"
 	@echo ""
 	@echo "开发模式工作流程："
-	@echo "  1. make dev-build    # 首次：构建 Docker 镜像（容器内编译）"
+	@echo "  1. make dev-build    # 首次：构建所有 Docker 镜像（容器内编译）"
 	@echo "  2. make dev-up       # 启动容器"
 	@echo "  3. 修改代码后: make dev-restart  # 重新构建镜像+重启容器"
 	@echo ""
@@ -39,15 +41,41 @@ build:
 	@echo "可执行文件: ./target/release/rcoder"
 
 # Docker 镜像构建（仅构建镜像，不编译）
-docker-build:
-	@echo "🐳 构建 Docker 镜像..."
-	@echo "📍 镜像名称: master-rcoder:latest"
-	@echo "📦 使用 Dockerfile 多阶段构建（会在镜像内编译）..."
-	@docker build -f docker/rcoder-master/Dockerfile -t master-rcoder:latest .
-	@echo "✅ Docker 镜像构建完成！"
+docker-build: docker-build-master docker-build-agent-runner
+	@echo "✅ 所有 Docker 镜像构建完成！"
+	@echo "  ✓ master-rcoder:latest"
+	@echo "  ✓ rcoder-agent-runner:latest"
 	@echo ""
 	@echo "🎯 使用方式："
 	@echo "  docker run -d -p 8087:8087 master-rcoder:latest"
+
+# 构建主服务镜像
+docker-build-master:
+	@echo "🐳 构建 master-rcoder 镜像..."
+	@echo "📍 镜像名称: master-rcoder:latest"
+	@echo "📦 使用 Dockerfile 多阶段构建（会在镜像内编译）..."
+	@docker build -f docker/rcoder-master/Dockerfile -t master-rcoder:latest .
+	@echo "✅ master-rcoder 镜像构建完成！"
+
+# 构建 agent-runner 镜像
+docker-build-agent-runner:
+	@echo "🐳 构建 rcoder-agent-runner 镜像..."
+	@echo "📍 镜像名称: rcoder-agent-runner:latest"
+	@echo "📦 步骤1: 构建 agent_runner 二进制文件..."
+	@# 创建临时容器来构建 agent_runner
+	@docker build -f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build .
+	@echo "📦 步骤2: 复制二进制文件到 agent-runner 目录..."
+	@# 创建容器并复制 agent_runner 二进制文件
+	@mkdir -p docker/rcoder-agent-runner/bin
+	@docker create --name build-container rcoder-agent-runner-build
+	@docker cp build-container:/build/target/release/agent_runner docker/rcoder-agent-runner/bin/
+	@docker rm build-container
+	@docker rmi rcoder-agent-runner-build
+	@echo "📦 步骤3: 构建最终的 agent-runner 镜像..."
+	@# 使用原本的 Dockerfile 和复制过来的二进制文件构建最终镜像
+	@cd docker/rcoder-agent-runner && \
+		docker build -f Dockerfile -t rcoder-agent-runner:latest .
+	@echo "✅ rcoder-agent-runner 镜像构建完成！"
 
 # 安装 codex-acp-agent
 install-agent:
@@ -72,12 +100,11 @@ uninstall:
 	@echo "✅ 卸载完成"
 
 # 开发模式：Docker 镜像构建（在容器内编译，避免 glibc 版本不匹配）
-dev-build:
-	@echo "🐳 构建 Docker 镜像（容器内编译）..."
-	@docker build -f docker/rcoder-master/Dockerfile -t master-rcoder:latest .
+dev-build: docker-build
 	@echo ""
 	@echo "🎉 构建完成！"
 	@echo "  ✓ Docker 镜像: master-rcoder:latest"
+	@echo "  ✓ Docker 镜像: rcoder-agent-runner:latest"
 	@echo ""
 	@echo "💡 下一步: make dev-up 启动容器"
 
