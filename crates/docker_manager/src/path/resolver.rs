@@ -39,9 +39,7 @@ impl HostPathResolver {
     ///
     /// # Returns
     /// * `DockerResult<Self>` - 路径解析器或错误
-    pub async fn new_with_docker_socket(
-        docker_socket_path: Option<String>,
-    ) -> DockerResult<Self> {
+    pub async fn new_with_docker_socket(docker_socket_path: Option<String>) -> DockerResult<Self> {
         debug!("开始创建 HostPathResolver");
 
         // 创建容器自检器
@@ -52,11 +50,15 @@ impl HostPathResolver {
         let inspector = Arc::new(
             ContainerSelfInspector::new(socket_path)
                 .await
-                .map_err(|e| DockerError::ConfigurationError(format!("创建容器自检器失败: {}", e)))?,
+                .map_err(|e| {
+                    DockerError::ConfigurationError(format!("创建容器自检器失败: {}", e))
+                })?,
         );
 
         // 获取第一个有效的挂载点信息
-        let mounts = inspector.get_all_mounts().await
+        let mounts = inspector
+            .get_all_mounts()
+            .await
             .map_err(|e| DockerError::ConfigurationError(format!("获取挂载点失败: {}", e)))?;
 
         if mounts.is_empty() {
@@ -68,20 +70,50 @@ impl HostPathResolver {
             });
         }
 
-        // 优先查找包含 "project_workspace" 的挂载点
+        // 🔍 改进的挂载点匹配逻辑，避免模糊匹配导致的错误
         // mounts 格式: Vec<(container_path, host_path)>
+        debug!(
+            "🔍 路径解析调试: 可用挂载点={:?}",
+            mounts
+                .iter()
+                .map(|(cp, hs)| format!("{}→{}", cp, hs))
+                .collect::<Vec<_>>()
+        );
+
+        // 优先查找最具体的匹配：computer-project-workspace > project_workspace
         let mount_info = mounts
             .iter()
             .find(|(container_path, _)| {
-                container_path.contains("project_workspace")
+                // 优先匹配 computer-project-workspace
+                container_path.contains("computer-project-workspace")
             })
-            .or_else(|| mounts.first());
+            .or_else(|| {
+                // 回退：匹配 project_workspace
+                debug!("🔍 未找到 computer-project-workspace 匹配，尝试 project_workspace...");
+                mounts
+                    .iter()
+                    .find(|(container_path, _)| container_path.contains("project_workspace"))
+            });
 
+        // 🚨 关键修复：不回退到第一个挂载点，而是报错！
         let mount_info = mount_info.ok_or_else(|| {
-            DockerError::ConfigurationError("无法找到有效的挂载点信息".to_string())
+            let available_mounts = mounts
+                .iter()
+                .map(|(cp, hs)| format!("{} -> {}", cp, hs))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            DockerError::ConfigurationError(format!(
+                "无法找到匹配的挂载点信息。可用的挂载点: {}. 请检查 docker-compose.yml 中的挂载配置。",
+                available_mounts
+            ))
         })?;
 
         let (container_workspace, host_workspace) = mount_info;
+        debug!(
+            "✅ 路径解析结果: {} (container) -> {} (host)",
+            container_workspace, host_workspace
+        );
         let host_workspace = PathBuf::from(host_workspace);
         let container_workspace = PathBuf::from(container_workspace);
 
@@ -121,10 +153,7 @@ impl HostPathResolver {
     /// # }
     /// ```
     pub fn resolve_to_host_path(&self, container_path: &Path) -> DockerResult<PathBuf> {
-        debug!(
-            "解析容器路径到宿主机路径: {}",
-            container_path.display()
-        );
+        debug!("解析容器路径到宿主机路径: {}", container_path.display());
 
         // 如果路径是相对路径，先转换为绝对路径（相对于容器工作空间）
         let container_path = if container_path.is_relative() {
@@ -146,9 +175,7 @@ impl HostPathResolver {
         // 计算相对路径
         let relative_path = container_path
             .strip_prefix(&self.container_project_workspace)
-            .map_err(|e| {
-                DockerError::ConfigurationError(format!("路径解析失败: {}", e))
-            })?;
+            .map_err(|e| DockerError::ConfigurationError(format!("路径解析失败: {}", e)))?;
 
         // 拼接到宿主机工作空间
         let host_path = self.host_project_workspace.join(relative_path);
@@ -310,10 +337,7 @@ mod tests {
             inspector: None,
         };
 
-        assert_eq!(
-            resolver.host_workspace_base(),
-            Path::new("/host/projects")
-        );
+        assert_eq!(resolver.host_workspace_base(), Path::new("/host/projects"));
         assert_eq!(
             resolver.container_workspace_base(),
             Path::new("/app/project_workspace")

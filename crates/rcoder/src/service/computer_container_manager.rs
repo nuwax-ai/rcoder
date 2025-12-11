@@ -87,8 +87,13 @@ impl ComputerContainerManager {
         docker_manager: &std::sync::Arc<docker_manager::DockerManager>,
         resource_limits: Option<ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
-        // 1. 准备用户级工作目录
+        // 1. 准备用户级工作目录（在容器内创建，通过绑定挂载自动同步到宿主机）
         let user_workspace = Self::get_user_workspace(user_id).await?;
+        debug!(
+            "🔍 [COMPUTER_CONTAINER] 用户工作区路径: {:?}",
+            user_workspace
+        );
+        // 在容器内创建目录，绑定挂载会自动同步到宿主机
         Self::create_user_workspace(user_id).await?;
 
         // 2. 解析宿主机路径
@@ -110,7 +115,8 @@ impl ComputerContainerManager {
         // 容器命名会自动根据 ServiceType::ComputerAgentRunner 生成为 computer-agent-runner-{user_id}
         let container_info = docker_manager
             .start_agent_container(
-                user_id, // 使用 user_id 作为容器标识
+                Some(user_id), // 用于清理旧容器的标识符
+                Some(user_id), // Computer Agent Runner 的 user_id 参数
                 &host_path.to_string_lossy(),
                 ServiceType::ComputerAgentRunner,
                 resource_limits,
@@ -150,10 +156,7 @@ impl ComputerContainerManager {
         tokio::fs::create_dir_all(&workspace_dir)
             .await
             .map_err(|e| {
-                error!(
-                    "❌ [COMPUTER_CONTAINER] 创建 workspace 目录失败: {:?}",
-                    e
-                );
+                error!("❌ [COMPUTER_CONTAINER] 创建 workspace 目录失败: {:?}", e);
                 AppError::internal_server_error(&format!("创建 workspace 目录失败: {}", e))
             })?;
 
@@ -164,10 +167,7 @@ impl ComputerContainerManager {
             AppError::internal_server_error(&format!("创建用户目录失败: {}", e))
         })?;
 
-        debug!(
-            "📁 [COMPUTER_CONTAINER] 用户工作区创建成功: {:?}",
-            user_dir
-        );
+        debug!("📁 [COMPUTER_CONTAINER] 用户工作区创建成功: {:?}", user_dir);
 
         Ok(user_dir)
     }
@@ -175,13 +175,8 @@ impl ComputerContainerManager {
     /// 获取容器信息
     ///
     /// 通过 user_id 查询容器是否存在
-    pub async fn get_container_info(
-        user_id: &str,
-    ) -> Result<Option<ContainerBasicInfo>, AppError> {
-        debug!(
-            "[COMPUTER_CONTAINER] 获取容器信息: user_id={}",
-            user_id
-        );
+    pub async fn get_container_info(user_id: &str) -> Result<Option<ContainerBasicInfo>, AppError> {
+        debug!("[COMPUTER_CONTAINER] 获取容器信息: user_id={}", user_id);
 
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
@@ -190,13 +185,10 @@ impl ComputerContainerManager {
                 AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
             })?;
 
-        docker_manager
-            .get_agent_info(user_id)
-            .await
-            .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 查询容器信息失败: {}", e);
-                AppError::internal_server_error(&format!("查询容器信息失败: {}", e))
-            })
+        docker_manager.get_agent_info(user_id).await.map_err(|e| {
+            error!("❌ [COMPUTER_CONTAINER] 查询容器信息失败: {}", e);
+            AppError::internal_server_error(&format!("查询容器信息失败: {}", e))
+        })
     }
 }
 

@@ -11,6 +11,11 @@ fn default_container_path_template() -> String {
     "/app/project_workspace/{project_id}".to_string()
 }
 
+/// Computer Agent Runner 容器路径模板的默认值
+fn default_computer_agent_runner_container_path_template() -> String {
+    "/app/computer-project-workspace/{user_id}/{project_id}".to_string()
+}
+
 /// 服务镜像配置
 ///
 /// 定义了每个服务类型的详细配置，包括镜像选择、环境变量和挂载点。
@@ -433,7 +438,7 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         resource_limits,
         work_dir: "/app".to_string(),
         network_mode: "bridge".to_string(),
-        container_path_template: default_container_path_template(),
+        container_path_template: default_computer_agent_runner_container_path_template(),
     }
 }
 
