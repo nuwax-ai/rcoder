@@ -1,31 +1,5 @@
-# 第一阶段：构建 Rust 项目
-FROM rust:1.90 AS rust-builder
-
-# 设置环境变量避免交互式提示
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=Asia/Shanghai
-
-# 设置 ARG TARGETARCH
-ARG TARGETARCH
-ARG RCODER_SRC_PATH=./code/rcoder
-
-# 设置工作目录
-WORKDIR /build
-
-# 安装构建依赖（包括cmake和protoc）
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    cmake \
-    pkg-config \
-    protobuf-compiler \
-    libprotobuf-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# 复制 rcoder 源代码
-COPY ${RCODER_SRC_PATH} .
-
-# 构建 agent_runner 二进制文件
-RUN cargo build --release --bin agent_runner
+# 第一阶段：使用预构建的 Rust 二进制
+# 我们已经通过 Dockerfile.build 构建了二进制文件，并放在 bin/ 目录下
 
 # 第二阶段：运行环境
 FROM debian:12
@@ -582,8 +556,8 @@ RUN echo '[install]' > /root/.bunfig.toml && \
 
 
 
-# 复制 rcoder 构建的 agent_runner 可执行文件
-COPY --from=rust-builder /build/target/release/agent_runner /usr/local/bin/agent_runner
+# 复制预构建的 agent_runner 二进制文件
+COPY bin/agent_runner /usr/local/bin/agent_runner
 RUN chmod +x /usr/local/bin/agent_runner
 
 # 暴露 agent_runner 端口

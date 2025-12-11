@@ -1,0 +1,21 @@
+# 独立的构建 Dockerfile - 仅用于构建 agent_runner 二进制
+
+FROM rust:1.90
+
+# 设置工作目录
+WORKDIR /build
+
+# 安装构建依赖
+RUN apt-get update && apt-get install -y \
+    cmake \
+    pkg-config \
+    protobuf-compiler \
+    libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制 Cargo.toml 和 Cargo.lock（利用 Docker 缓存）
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# 构建 agent_runner 二进制
+RUN cargo build --release --bin agent_runner
