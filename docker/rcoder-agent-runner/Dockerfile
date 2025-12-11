@@ -1,7 +1,7 @@
-# 第一阶段：使用预构建的 Rust 二进制
-# 我们已经通过 Dockerfile.build 构建了二进制文件，并放在 bin/ 目录下
+# 独立构建 Dockerfile - 运行环境
+# agent_runner 二进制文件通过 Dockerfile.build 在 debian:12 环境中编译
+# 确保 GLIBC 版本与此镜像一致（都是 debian:12 / GLIBC 2.36）
 
-# 第二阶段：运行环境
 FROM debian:12
 
 # Base image with desktop environment and applications
@@ -556,7 +556,7 @@ RUN echo '[install]' > /root/.bunfig.toml && \
 
 
 
-# 复制预构建的 agent_runner 二进制文件
+# 复制预构建的 agent_runner 二进制文件（由 Dockerfile.build 在 debian:12 中编译）
 COPY bin/agent_runner /usr/local/bin/agent_runner
 RUN chmod +x /usr/local/bin/agent_runner
 

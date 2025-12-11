@@ -124,7 +124,8 @@ async fn create_container_for_request(
     // 3. 调用 DockerManager 启动容器
     let container_info = docker_manager
         .start_agent_container(
-            project_id,
+            Some(project_id), // 用于清理旧容器的标识符
+            None,             // 标准 RCoder 服务不需要 user_id
             &host_path.to_string_lossy(),
             service_type.clone(),
             request_resource_limits,

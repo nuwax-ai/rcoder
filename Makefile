@@ -61,8 +61,8 @@ docker-build-master:
 docker-build-agent-runner:
 	@echo "🐳 构建 rcoder-agent-runner 镜像..."
 	@echo "📍 镜像名称: rcoder-agent-runner:latest"
-	@echo "📦 步骤1: 构建 agent_runner 二进制文件..."
-	@# 创建临时容器来构建 agent_runner
+	@echo "📦 步骤1: 在 debian:12 环境中构建 agent_runner 二进制（确保 GLIBC 版本兼容）..."
+	@# 使用 debian:12 + Rust 1.90 构建，GLIBC 版本与运行环境一致
 	@docker build -f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build .
 	@echo "📦 步骤2: 复制二进制文件到 agent-runner 目录..."
 	@# 创建容器并复制 agent_runner 二进制文件
@@ -75,7 +75,7 @@ docker-build-agent-runner:
 	@# 使用原本的 Dockerfile 和复制过来的二进制文件构建最终镜像
 	@cd docker/rcoder-agent-runner && \
 		docker build -f Dockerfile -t rcoder-agent-runner:latest .
-	@echo "✅ rcoder-agent-runner 镜像构建完成！"
+	@echo "✅ rcoder-agent-runner 镜像构建完成！（GLIBC 2.36 兼容）"
 
 # 安装 codex-acp-agent
 install-agent:

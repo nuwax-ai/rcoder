@@ -3,6 +3,7 @@ use super::{
     DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
     RCODER_NETWORK_BASE_NAME,
 };
+use anyhow::{Context, Result, anyhow};
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
     LogsOptions, RemoveContainerOptions, RestartContainerOptions, StartContainerOptions,
@@ -505,20 +506,29 @@ impl DockerManager {
     /// 替代 rcoder 层的复杂编排逻辑
     pub async fn start_agent_container(
         &self,
-        project_id: &str,
+        project_id: Option<&str>, // 容器标识符（project_id），用于清理旧容器，可选
+        user_id: Option<&str>,    // Computer Agent Runner 中使用，其他情况为 None
         host_workspace_path: &str,
         service_type: shared_types::ServiceType,
         request_resource_limits: Option<shared_types::ServiceResourceLimits>,
     ) -> DockerResult<ContainerBasicInfo> {
         info!(
-            "启动 Agent 容器: project_id={}, type={:?}, host_path={}",
-            project_id, service_type, host_workspace_path
+            "启动 Agent 容器: project_id={:?}, user_id={:?}, type={:?}, host_path={}",
+            project_id, user_id, service_type, host_workspace_path
         );
 
-        // 1. 清理旧容器
-        if let Some(existing) = self.get_container_info(project_id) {
-            warn!("发现旧容器 {}，正在停止...", existing.container_name);
-            self.stop_container(project_id).await?;
+        // 1. 在宿主机上预创建工作目录
+        // 1. 检查工作目录是否已存在（通过绑定挂载，容器内创建会自动同步）
+        debug!("🔍 [DOCKER_MGR] 检查工作目录: {}", host_workspace_path);
+        // 绑定挂载机制：容器内创建目录会自动同步到宿主机
+        // 所以这里不需要额外创建目录
+
+        // 2. 清理旧容器（如果提供了 project_id）
+        if let Some(id) = project_id {
+            if let Some(existing) = self.get_container_info(id) {
+                warn!("发现旧容器 {}，正在停止...", existing.container_name);
+                self.stop_container(id).await?;
+            }
         }
 
         // 2. 获取配置和镜像
@@ -528,14 +538,35 @@ impl DockerManager {
         // 3. 准备配置
         use crate::container_builder::ContainerConfigBuilder;
 
+        // 确定用于构建容器配置的主 ID
+        // 标准 RCoder 使用 project_id，Computer Agent Runner 使用 user_id
+        let container_id = if let Some(uid) = user_id {
+            // Computer Agent Runner 使用 user_id
+            uid
+        } else if let Some(pid) = project_id {
+            // 标准 RCoder 使用 project_id
+            pid
+        } else {
+            // 错误：至少需要提供 project_id 或 user_id 其中一个
+            return Err(DockerError::ConfigurationError(
+                "必须提供 project_id 或 user_id 中的至少一个".to_string(),
+            ));
+        };
+
         // 解析容器内工作目录路径
         let mut variables = std::collections::HashMap::new();
-        variables.insert("project_id".to_string(), project_id.to_string());
+        // 根据服务类型设置相应的变量
+        if let Some(pid) = project_id {
+            variables.insert("project_id".to_string(), pid.to_string());
+        }
+        if let Some(uid) = user_id {
+            variables.insert("user_id".to_string(), uid.to_string());
+        }
         variables.insert("service_type".to_string(), service_type.to_string());
         let container_work_path = service_config.resolve_container_path(&variables);
 
         // 构建基础配置
-        let mut builder = ContainerConfigBuilder::new(project_id)
+        let mut builder = ContainerConfigBuilder::new(container_id)
             .image(image)
             .name_prefix(service_type.container_prefix())
             .host_path(host_workspace_path.to_string())
@@ -568,9 +599,23 @@ impl DockerManager {
         });
 
         // 添加环境变量
-        builder = builder.env("PROJECT_ID", project_id);
+        // 根据服务类型设置相应的环境变量
+        if let Some(pid) = project_id {
+            builder = builder.env("PROJECT_ID", pid);
+        }
+        if let Some(uid) = user_id {
+            builder = builder.env("USER_ID", uid);
+        }
+        // 处理其他环境变量中的模板
         for (key, value) in &service_config.environment {
-            builder = builder.env(key, value.replace("{project_id}", project_id));
+            let mut processed_value = value.clone();
+            if let Some(pid) = project_id {
+                processed_value = processed_value.replace("{project_id}", pid);
+            }
+            if let Some(uid) = user_id {
+                processed_value = processed_value.replace("{user_id}", uid);
+            }
+            builder = builder.env(key, &processed_value);
         }
 
         // 设置网络
@@ -591,7 +636,7 @@ impl DockerManager {
         self.create_container(config).await?;
 
         // 5. 等待就绪并返回信息
-        let info = self.get_agent_info(project_id).await?.ok_or_else(|| {
+        let info = self.get_agent_info(container_id).await?.ok_or_else(|| {
             DockerError::ContainerStartError("容器启动后无法获取信息".to_string())
         })?;
 
