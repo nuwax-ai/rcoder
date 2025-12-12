@@ -41,14 +41,18 @@
       "args": [
         "-y",
         "chrome-devtools-mcp@latest",
-        "--executablePath=/usr/bin/chromium"
+        "--executablePath=/usr/bin/chromium",
+        "--chromeArg=--no-sandbox",
+        "--chromeArg=--disable-dev-shm-usage",
+        "--chromeArg=--disable-gpu",
+        "--chromeArg=--remote-debugging-port=9222"
       ],
       "env": {
         "DISPLAY": ":0"
       },
       "metadata": {
         "description": "Chrome DevTools MCP - Browser automation via Chrome DevTools Protocol",
-        "note": "MCP will launch and manage Chromium automatically",
+        "note": "MCP will launch and manage Chromium automatically with container-friendly settings",
         "capabilities": [
           "browser_automation",
           "page_navigation",
