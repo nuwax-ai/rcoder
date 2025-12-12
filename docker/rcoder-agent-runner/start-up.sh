@@ -28,7 +28,7 @@ function start_vnc_services() {
 		nohup x11vnc -bg -display :0 -forever -wait 50 -shared -rfbport 5900 -nopw 2>/tmp/x11vnc_stderr.log >/dev/null &
 	" &
 	
-	# 等待x11vnc启动
+	# 等待x11vnc启computer-agent-runner-user_123动
 	sleep 3
 	
 	# 启动noVNC代理 (后台运行)

@@ -55,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
     info!("使用 Docker socket: {}", docker_socket_path);
 
     let _path_resolver =
-        match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone())).await {
+        match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone()))
+            .await
+        {
             Ok(resolver) => {
                 info!("✅ 宿主机路径解析器初始化成功");
                 info!(
@@ -136,7 +138,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!("🔍 检查并清理上次可能遗留的容器（所有启用的服务）...");
-    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config).await {
+    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
+        .await
+    {
         Ok(result) => {
             let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
             if result.successfully_removed > 0 {
@@ -185,6 +189,15 @@ async fn main() -> anyhow::Result<()> {
             config.port
         );
 
+        // 添加调试日志
+        info!("🔧 [Pingora] 开始初始化 Pingora 配置...");
+        info!("🔧 [Pingora] 监听端口: {}", proxy_config.listen_port);
+        info!(
+            "🔧 [Pingora] 默认后端端口: {}",
+            proxy_config.default_backend_port
+        );
+        info!("🔧 [Pingora] 后端主机: {}", proxy_config.backend_host);
+
         let pingora_config = ProxyConfig {
             listen_port: proxy_config.listen_port,
             default_backend_port: proxy_config.default_backend_port,
@@ -194,25 +207,42 @@ async fn main() -> anyhow::Result<()> {
             verbose: false,
         };
 
+        info!("✅ [Pingora] Pingora 配置创建成功");
+
         // 创建 Pingora 服务器管理器，并提取服务引用用于指标读取
+        info!("🔧 [Pingora] 创建 PingoraServerManager...");
         let mut server_manager = PingoraServerManager::new(pingora_config);
         let pingora_service = server_manager.service();
+        info!("✅ [Pingora] PingoraServerManager 创建成功");
+
         // 启动健康检查循环（按配置）
         if config.proxy_config.as_ref().unwrap().health_check.enabled {
             let hc = &config.proxy_config.as_ref().unwrap().health_check;
+            info!(
+                "🔧 [Pingora] 启动健康检查循环: interval={}s, timeout={}s",
+                hc.interval_seconds, hc.timeout_seconds
+            );
             pingora_service
                 .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
+            info!("✅ [Pingora] 健康检查循环已启动");
         }
 
         // 在后台任务中启动 Pingora 服务器
+        info!("🚀 [Pingora] 在后台任务中启动 Pingora 服务器...");
         let handle = tokio::spawn(async move {
+            info!("📍 [Pingora] 后台任务已创建，正在调用 server_manager.start()...");
             if let Err(e) = server_manager.start().await {
-                error!("Pingora 代理服务器启动失败: {}", e);
+                error!("❌ [Pingora] Pingora 代理服务器启动失败: {:?}", e);
+            } else {
+                info!("✅ [Pingora] Pingora 服务器正常退出");
             }
         });
 
+        info!("✅ [Pingora] 后台任务已启动，handle created");
+
         (Some(handle), Some(pingora_service))
     } else {
+        info!("⚠️  [Pingora] proxy_config 未配置，跳过 Pingora 启动");
         (None, None)
     };
 
@@ -441,7 +471,9 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
     let multi_image_config = shared_types::create_default_multi_image_config();
 
     // 使用启动清理策略（服务关闭时也使用相同策略）
-    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config).await {
+    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
+        .await
+    {
         Ok(result) => {
             if result.successfully_removed > 0 {
                 info!(
