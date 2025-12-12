@@ -163,30 +163,80 @@ impl HostPathResolver {
         };
 
         // 检查路径是否在容器工作空间内
-        if !container_path.starts_with(&self.container_project_workspace) {
-            warn!(
-                "容器路径 {} 不在工作空间 {} 内，尝试直接返回",
+        if container_path.starts_with(&self.container_project_workspace) {
+            // 计算相对路径
+            let relative_path = container_path
+                .strip_prefix(&self.container_project_workspace)
+                .map_err(|e| DockerError::ConfigurationError(format!("路径解析失败: {}", e)))?;
+
+            // 拼接到宿主机工作空间
+            let host_path = self.host_project_workspace.join(relative_path);
+
+            debug!(
+                "✅ 解析结果: {} (container) -> {} (host)",
                 container_path.display(),
-                self.container_project_workspace.display()
+                host_path.display()
             );
-            return Ok(container_path);
+
+            return Ok(host_path);
         }
 
-        // 计算相对路径
-        let relative_path = container_path
-            .strip_prefix(&self.container_project_workspace)
-            .map_err(|e| DockerError::ConfigurationError(format!("路径解析失败: {}", e)))?;
-
-        // 拼接到宿主机工作空间
-        let host_path = self.host_project_workspace.join(relative_path);
-
+        // 路径不在工作空间内，尝试从所有挂载点中查找匹配
         debug!(
-            "✅ 解析结果: {} (container) -> {} (host)",
+            "容器路径 {} 不在工作空间 {} 内，尝试从挂载点查找",
             container_path.display(),
-            host_path.display()
+            self.container_project_workspace.display()
         );
 
-        Ok(host_path)
+        // 使用 inspector 获取所有挂载点并查找匹配
+        if let Some(inspector) = &self.inspector {
+            // 注意：这里需要阻塞调用，因为 resolve_to_host_path 不是 async
+            // 改为使用缓存的挂载点信息
+            // TODO: 后续可以改为在创建时缓存所有挂载点
+            if let Ok(mounts) = std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async { inspector.get_all_mounts().await })
+                })
+                .join()
+                .unwrap()
+            }) {
+                // 查找匹配的挂载点
+                for (mount_container_path, mount_host_path) in &mounts {
+                    let mount_container = Path::new(mount_container_path);
+                    if container_path.starts_with(mount_container) {
+                        // 找到匹配的挂载点
+                        let relative_path = container_path
+                            .strip_prefix(mount_container)
+                            .unwrap_or(Path::new(""));
+                        let host_path = PathBuf::from(mount_host_path).join(relative_path);
+
+                        info!(
+                            "✅ 从挂载点解析: {} -> {} (mount: {} -> {})",
+                            container_path.display(),
+                            host_path.display(),
+                            mount_container_path,
+                            mount_host_path
+                        );
+
+                        return Ok(host_path);
+                    }
+                }
+            }
+        }
+
+        // 没有找到匹配的挂载点，返回错误
+        warn!(
+            "⚠️ 无法解析路径 {}: 不在工作空间内且未找到匹配的挂载点",
+            container_path.display()
+        );
+        Err(DockerError::ConfigurationError(format!(
+            "无法解析容器路径 '{}': 不在工作空间内且未找到匹配的挂载点",
+            container_path.display()
+        )))
     }
 
     /// 获取宿主机工作空间根目录
@@ -301,10 +351,10 @@ mod tests {
         };
 
         let container_path = Path::new("/etc/passwd");
-        let host_path = resolver.resolve_to_host_path(container_path).unwrap();
+        let result = resolver.resolve_to_host_path(container_path);
 
-        // 不在工作空间内的路径直接返回
-        assert_eq!(host_path, PathBuf::from("/etc/passwd"));
+        // 不在工作空间内且没有 inspector，应该返回错误
+        assert!(result.is_err());
     }
 
     #[test]

@@ -628,6 +628,143 @@ impl DockerManager {
             builder = builder.entrypoint(entry);
         }
 
+        // 🎯 处理配置文件中的挂载点 (service_config.mounts)
+        let container_name = format!("{}-{}", service_type.container_prefix(), container_id);
+        let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+        let log_dir_name = format!("{}-{}", container_name, timestamp);
+
+        // 基础变量集
+        let mut base_variables = variables.clone();
+        base_variables.insert("container_name".to_string(), container_name.clone());
+        base_variables.insert("timestamp".to_string(), timestamp.clone());
+        base_variables.insert("log_dir_name".to_string(), log_dir_name.clone());
+
+        // 缓存已解析的路径，避免重复解析
+        let mut resolved_paths_cache: std::collections::HashMap<String, std::path::PathBuf> =
+            std::collections::HashMap::new();
+
+        // 添加配置文件中定义的挂载点
+        for mount_config in &service_config.mounts {
+            let mut mount_variables = base_variables.clone();
+
+            // 如果配置了 resolve_from，解析动态路径
+            if let Some(ref resolve_from_path) = mount_config.resolve_from {
+                // 检查缓存（只缓存基础路径解析结果）
+                let resolved_base =
+                    if let Some(cached) = resolved_paths_cache.get(resolve_from_path) {
+                        Some(cached.clone())
+                    } else {
+                        // 解析 resolve_from 路径到宿主机基础路径
+                        match crate::path::resolve_container_path_to_host(std::path::Path::new(
+                            resolve_from_path,
+                        ))
+                        .await
+                        {
+                            Ok(host_base_path) => {
+                                info!(
+                                    "📁 [DOCKER_MGR] 从 {} 解析到宿主机路径: {}",
+                                    resolve_from_path,
+                                    host_base_path.display()
+                                );
+                                // 缓存基础路径解析结果
+                                resolved_paths_cache
+                                    .insert(resolve_from_path.clone(), host_base_path.clone());
+                                Some(host_base_path)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "⚠️ [DOCKER_MGR] 无法解析路径 (resolve_from: {}): {}",
+                                    resolve_from_path, e
+                                );
+                                None
+                            }
+                        }
+                    };
+
+                // 添加解析后的基础路径变量
+                if let Some(resolved_path) = resolved_base {
+                    mount_variables.insert(
+                        "resolved_path".to_string(),
+                        resolved_path.to_string_lossy().to_string(),
+                    );
+                } else {
+                    // 如果解析失败，跳过此挂载点
+                    warn!(
+                        "⚠️ [DOCKER_MGR] 跳过挂载点 (无法解析 resolve_from): {}",
+                        mount_config.container_path
+                    );
+                    continue;
+                }
+            }
+
+            // 解析宿主机路径中的变量
+            let resolved_host_path = mount_config.resolve_host_path(&mount_variables);
+
+            // 检查是否还有未替换的变量（如 {logs_host_path} 等）
+            if resolved_host_path.contains('{') && resolved_host_path.contains('}') {
+                warn!(
+                    "⚠️ [DOCKER_MGR] 跳过挂载点 (host_path 包含未解析的变量): {}",
+                    resolved_host_path
+                );
+                continue;
+            }
+
+            // 使用 PathBuf 规范化路径（消除多余的斜杠）
+            let resolved_host_path = std::path::PathBuf::from(&resolved_host_path)
+                .components()
+                .collect::<std::path::PathBuf>()
+                .to_string_lossy()
+                .to_string();
+
+            // 解析容器路径中的变量
+            let mut resolved_container_path = mount_config.container_path.clone();
+            for (key, value) in &mount_variables {
+                resolved_container_path =
+                    resolved_container_path.replace(&format!("{{{}}}", key), value);
+            }
+
+            info!(
+                "📁 [DOCKER_MGR] 添加挂载点: {} -> {} (read_only: {})",
+                resolved_host_path, resolved_container_path, mount_config.read_only
+            );
+
+            // 确保目录存在（仅对非只读挂载创建目录）
+            // 注意：在容器内运行时，需要使用容器内的路径创建目录
+            if !mount_config.read_only {
+                // 如果配置了 resolve_from，使用容器内路径创建目录
+                let create_path = if let Some(ref resolve_from) = mount_config.resolve_from {
+                    // 在容器内创建：resolve_from + log_dir_name
+                    let container_dir = std::path::PathBuf::from(resolve_from).join(&log_dir_name);
+                    info!(
+                        "📁 [DOCKER_MGR] 在容器内创建目录: {}",
+                        container_dir.display()
+                    );
+                    container_dir.to_string_lossy().to_string()
+                } else {
+                    // 静态挂载，尝试直接创建宿主机路径
+                    resolved_host_path.clone()
+                };
+
+                if let Err(e) = std::fs::create_dir_all(&create_path) {
+                    warn!("⚠️ [DOCKER_MGR] 创建挂载目录失败: {} - {}", create_path, e);
+                } else {
+                    info!("✅ [DOCKER_MGR] 目录创建成功: {}", create_path);
+                }
+            }
+
+            builder = builder.add_mount(crate::MountPoint {
+                host_path: resolved_host_path,
+                container_path: resolved_container_path,
+                read_only: mount_config.read_only,
+            });
+
+            // 如果是日志挂载，添加环境变量
+            if mount_config.container_path.contains("container-logs") {
+                builder = builder.env("CONTAINER_LOGS_DIR", &mount_config.container_path);
+                builder = builder.env("CONTAINER_LOG_NAME", &log_dir_name);
+            }
+        }
+
         // 4. 创建并启动
         let config = builder
             .build()
