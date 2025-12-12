@@ -58,7 +58,6 @@ impl AppState {
 /// 创建 Axum 路由
 pub fn create_router(state: Arc<AppState>) -> Router {
     let api_routes = Router::new()
-        .route("/health", get(handler::health_check))
         .route("/chat", post(handler::handle_chat))
         // Axum SSE 代理处理器，直接返回 SSE 流
         .route(
@@ -93,7 +92,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/proxy/config", get(handler::proxy_config))
         .with_state(state.clone());
 
+    // 健康检查路由
+    let health_routes = Router::new()
+        .route("/health", get(handler::health_check))
+        .with_state(state.clone());
+
     Router::new()
+        .merge(health_routes)
         .merge(api_routes)
         .merge(computer_routes)
         .merge(proxy_api_routes)

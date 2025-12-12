@@ -4,6 +4,7 @@ services:
     image: ${RCODER_IMAGE:-master-rcoder:latest}
     ports:
       - "${RCODER_PORT:-8087}:${RCODER_PORT:-8087}"
+      - "8088:8088"  # Pingora 反向代理端口（VNC 代理、健康检查等）
     environment:
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8087}

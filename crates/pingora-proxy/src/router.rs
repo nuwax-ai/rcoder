@@ -54,6 +54,16 @@ pub enum RouteType {
     /// - `/proxy/8080/api/status`
     /// - `/proxy/3000/`
     PortProxy,
+
+    /// 健康检查: `/health`
+    ///
+    /// **功能**: 返回 Pingora 代理服务的健康状态
+    ///
+    /// **响应**: JSON 格式的健康状态信息
+    ///
+    /// **示例**:
+    /// - `/health` → `{"status":"ok","service":"pingora-proxy"}`
+    HealthCheck,
 }
 
 /// 创建路由表
@@ -140,19 +150,21 @@ pub fn create_router() -> Router<RouteType> {
         .expect("Failed to insert port proxy route");
 
     // ========================================================================
-    // 未来扩展路由示例（已注释）
+    // 健康检查路由
     // ========================================================================
     //
-    // 可以在这里添加更多路由，例如：
+    // 路径格式: /health
     //
-    // // 静态文件服务
-    // router.insert("/static/{*path}", RouteType::StaticFiles)?;
+    // 功能: 返回 Pingora 代理服务的健康状态，用于验证服务是否正常运行
     //
-    // // API 网关
-    // router.insert("/api/{version}/{*path}", RouteType::ApiGateway)?;
+    // 返回: JSON 格式的健康状态
     //
-    // // 健康检查
-    // router.insert("/health", RouteType::HealthCheck)?;
+    // 示例:
+    // - /health → {"status":"ok","service":"pingora-proxy","timestamp":1234567890}
+    //
+    router
+        .insert("/health", RouteType::HealthCheck)
+        .expect("Failed to insert health check route");
 
     router
 }
@@ -171,6 +183,11 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
             "/proxy/{port}/{*path}".to_string(),
             "端口反向代理".to_string(),
             "动态路由到指定端口的后端服务".to_string(),
+        ),
+        (
+            "/health".to_string(),
+            "健康检查".to_string(),
+            "返回 Pingora 代理服务的健康状态".to_string(),
         ),
     ]
 }

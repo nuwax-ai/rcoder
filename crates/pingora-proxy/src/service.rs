@@ -169,7 +169,9 @@ impl ProxyMetrics {
         }
         // 写入创建
         let mut w = self.port_map.write().await;
-        let entry = w.entry(port).or_insert_with(|| Arc::new(PerPortMetrics::new()));
+        let entry = w
+            .entry(port)
+            .or_insert_with(|| Arc::new(PerPortMetrics::new()));
         entry.clone()
     }
 
@@ -272,7 +274,9 @@ pub struct PortProxy {
 impl ProxyHttp for PortProxy {
     type CTX = TrackingCtx;
 
-    fn new_ctx(&self) -> Self::CTX { TrackingCtx::new() }
+    fn new_ctx(&self) -> Self::CTX {
+        TrackingCtx::new()
+    }
 
     /// 过滤请求头和路径
     async fn upstream_request_filter(
@@ -300,6 +304,21 @@ impl ProxyHttp for PortProxy {
                 self.handle_port_proxy_request(upstream_request, &original_uri, matched.params)
                     .await?;
             }
+            RouteType::HealthCheck => {
+                // 健康检查：代理到 Axum 的 /health 端点
+                // 这样既能验证 Pingora 正常运行，又能验证 Axum 正常运行
+                info!(
+                    "🏥 健康检查请求: {} - 代理到 Axum ({})",
+                    path, self.default_backend_port
+                );
+
+                // 修改请求路径为 /health
+                let health_uri = http::Uri::from_static("/health");
+                upstream_request.set_uri(health_uri);
+
+                // 设置目标端口为默认后端端口 (Axum)
+                ctx.target_port = Some(self.default_backend_port);
+            }
         }
 
         Ok(())
@@ -321,11 +340,25 @@ impl ProxyHttp for PortProxy {
         })?;
 
         match matched.value {
-            RouteType::VncProxy => {
-                self.handle_vnc_upstream(ctx, matched.params).await
-            }
-            RouteType::PortProxy => {
-                self.handle_port_proxy_upstream(ctx, matched.params).await
+            RouteType::VncProxy => self.handle_vnc_upstream(ctx, matched.params).await,
+            RouteType::PortProxy => self.handle_port_proxy_upstream(ctx, matched.params).await,
+            RouteType::HealthCheck => {
+                // 健康检查已在 upstream_request_filter 中设置 target_port
+                // 这里返回对应的后端 peer
+                let target_port = ctx.target_port.unwrap_or(self.default_backend_port);
+
+                // 记录指标
+                self.metrics.record_request();
+                self.metrics.inc_active();
+
+                // 返回 Axum 服务的 peer
+                let peer = Box::new(HttpPeer::new(
+                    ("127.0.0.1", target_port),
+                    false,
+                    "".to_string(),
+                ));
+
+                Ok(peer)
             }
         }
     }
@@ -355,7 +388,10 @@ impl ProxyHttp for PortProxy {
 
         // 日志记录
         if ctx.vnc_target_ip.is_some() {
-            debug!("VNC 响应: {} (耗时: {:?})", upstream_response.status, duration);
+            debug!(
+                "VNC 响应: {} (耗时: {:?})",
+                upstream_response.status, duration
+            );
         } else {
             debug!("收到上游响应: {}", upstream_response.status);
         }
@@ -366,10 +402,7 @@ impl ProxyHttp for PortProxy {
 
 impl PortProxy {
     /// 统一的 URI 重写方法，消除重复代码
-    fn rewrite_uri(
-        original_uri: &http::Uri,
-        target_path: String,
-    ) -> PingoraResult<http::Uri> {
+    fn rewrite_uri(original_uri: &http::Uri, target_path: String) -> PingoraResult<http::Uri> {
         let new_uri_str = if let Some(query) = original_uri.query() {
             format!("{}?{}", target_path, query)
         } else {
@@ -519,15 +552,20 @@ impl PortProxy {
 
         let project_id = params.get("project_id").unwrap_or("");
 
-        debug!("VNC 代理请求: user_id={}, project_id={}", user_id, project_id);
+        debug!(
+            "VNC 代理请求: user_id={}, project_id={}",
+            user_id, project_id
+        );
 
         // 查找用户容器 IP
         let container_ip = match self.vnc_backends.get(user_id) {
             Some(ip_ref) => ip_ref.value().clone(),
             None => {
                 warn!("找不到用户 {} 的 VNC 后端", user_id);
-                return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                    .more_context(format!("找不到用户 {} 的 VNC 后端，请先创建容器", user_id)));
+                return Err(
+                    pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+                        .more_context(format!("找不到用户 {} 的 VNC 后端，请先创建容器", user_id)),
+                );
             }
         };
 
@@ -600,7 +638,6 @@ impl PortProxy {
 
         Ok(peer)
     }
-
 }
 
 impl PingoraProxyService {
@@ -805,8 +842,12 @@ impl PingoraProxyService {
     ///
     /// 当创建 ComputerAgentRunner 容器时调用，注册 user_id 到 container_ip 的映射
     pub fn add_vnc_backend(&self, user_id: &str, container_ip: &str) {
-        self.vnc_backends.insert(user_id.to_string(), container_ip.to_string());
-        info!("添加 VNC 后端: user_id={} -> container_ip={}", user_id, container_ip);
+        self.vnc_backends
+            .insert(user_id.to_string(), container_ip.to_string());
+        info!(
+            "添加 VNC 后端: user_id={} -> container_ip={}",
+            user_id, container_ip
+        );
     }
 
     /// 移除 VNC 后端映射
@@ -832,7 +873,8 @@ impl PingoraProxyService {
 
     /// 获取所有 VNC 后端映射
     pub fn list_vnc_backends(&self) -> HashMap<String, String> {
-        self.vnc_backends.iter()
+        self.vnc_backends
+            .iter()
             .map(|r| (r.key().clone(), r.value().clone()))
             .collect()
     }
@@ -994,7 +1036,9 @@ mod tests {
         eprintln!("\n=== matchit 0.8 语法验证 ===");
 
         let mut router: Router<&str> = Router::new();
-        router.insert("/computer/vnc/{user_id}/{project_id}/{*path}", "VNC").unwrap();
+        router
+            .insert("/computer/vnc/{user_id}/{project_id}/{*path}", "VNC")
+            .unwrap();
 
         // 测试匹配
         let path = "/computer/vnc/user_123/proj_456/vnc.html";
@@ -1015,25 +1059,34 @@ mod tests {
     fn test_router_vnc_route() {
         let mut router = Router::new();
         router
-            .insert("/computer/vnc/{user_id}/{project_id}/{*path}", RouteType::VncProxy)
+            .insert(
+                "/computer/vnc/{user_id}/{project_id}/{*path}",
+                RouteType::VncProxy,
+            )
             .unwrap();
 
         // 测试完整路径
-        let matched = router.at("/computer/vnc/user_123/proj_456/vnc.html").unwrap();
+        let matched = router
+            .at("/computer/vnc/user_123/proj_456/vnc.html")
+            .unwrap();
         assert_eq!(*matched.value, RouteType::VncProxy);
         assert_eq!(matched.params.get("user_id"), Some("user_123"));
         assert_eq!(matched.params.get("project_id"), Some("proj_456"));
         assert_eq!(matched.params.get("path"), Some("vnc.html"));
 
         // 测试 WebSocket 路径
-        let matched = router.at("/computer/vnc/user_123/proj_456/websockify").unwrap();
+        let matched = router
+            .at("/computer/vnc/user_123/proj_456/websockify")
+            .unwrap();
         assert_eq!(*matched.value, RouteType::VncProxy);
         assert_eq!(matched.params.get("user_id"), Some("user_123"));
         assert_eq!(matched.params.get("project_id"), Some("proj_456"));
         assert_eq!(matched.params.get("path"), Some("websockify"));
 
         // 测试多级子路径
-        let matched = router.at("/computer/vnc/user_123/proj_456/api/v1/status").unwrap();
+        let matched = router
+            .at("/computer/vnc/user_123/proj_456/api/v1/status")
+            .unwrap();
         assert_eq!(*matched.value, RouteType::VncProxy);
         assert_eq!(matched.params.get("path"), Some("api/v1/status"));
     }
@@ -1062,7 +1115,10 @@ mod tests {
     fn test_router_no_match() {
         let mut router = Router::new();
         router
-            .insert("/computer/vnc/{user_id}/{project_id}/{*path}", RouteType::VncProxy)
+            .insert(
+                "/computer/vnc/{user_id}/{project_id}/{*path}",
+                RouteType::VncProxy,
+            )
             .unwrap();
         router
             .insert("/proxy/{port}/{*path}", RouteType::PortProxy)
@@ -1078,10 +1134,15 @@ mod tests {
     fn test_router_parameter_extraction() {
         let mut router = Router::new();
         router
-            .insert("/computer/vnc/{user_id}/{project_id}/{*path}", RouteType::VncProxy)
+            .insert(
+                "/computer/vnc/{user_id}/{project_id}/{*path}",
+                RouteType::VncProxy,
+            )
             .unwrap();
 
-        let matched = router.at("/computer/vnc/alice_2024/myproj_456/index.html").unwrap();
+        let matched = router
+            .at("/computer/vnc/alice_2024/myproj_456/index.html")
+            .unwrap();
 
         // 验证参数提取
         assert_eq!(matched.params.get("user_id"), Some("alice_2024"));
@@ -1096,11 +1157,16 @@ mod tests {
             .insert("/proxy/{port}/{*path}", RouteType::PortProxy)
             .unwrap();
         router
-            .insert("/computer/vnc/{user_id}/{project_id}/{*path}", RouteType::VncProxy)
+            .insert(
+                "/computer/vnc/{user_id}/{project_id}/{*path}",
+                RouteType::VncProxy,
+            )
             .unwrap();
 
         // VNC 路由应该匹配
-        let matched = router.at("/computer/vnc/user_123/proj_456/vnc.html").unwrap();
+        let matched = router
+            .at("/computer/vnc/user_123/proj_456/vnc.html")
+            .unwrap();
         assert_eq!(*matched.value, RouteType::VncProxy);
 
         // 端口代理路由应该匹配
@@ -1170,11 +1236,13 @@ mod tests {
 
         // 验证克隆共享相同的 vnc_backends
         assert!(cloned.has_vnc_backend("user_123"));
-        assert_eq!(cloned.get_vnc_backend("user_123"), Some("172.17.0.5".to_string()));
+        assert_eq!(
+            cloned.get_vnc_backend("user_123"),
+            Some("172.17.0.5".to_string())
+        );
 
         // 通过克隆添加后端，原始服务也能看到
         cloned.add_vnc_backend("user_456", "172.17.0.6");
         assert!(service.has_vnc_backend("user_456"));
     }
-
 }
