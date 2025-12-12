@@ -62,11 +62,8 @@ docker_config:
         work_dir: "/app"
         network_mode: "bridge"
 
-        mounts:
-          - container_path: "/app/specs"
-            host_path: "/app/specs"
-            read_only: false
-            mount_type: "bind"
+        # mounts 是必需字段，设为空数组表示无额外挂载
+        mounts: []
 
       # ComputerAgentRunner 服务配置
       computer-agent-runner:
@@ -98,10 +95,15 @@ docker_config:
         network_mode: "bridge"
 
         mounts:
-          - container_path: "/app/specs"
-            host_path: "/app/specs"
+          # 动态挂载：日志目录 (使用变量替换)
+          # resolve_from: 指定从哪个容器内路径解析宿主机基础路径
+          # {resolved_path}: 解析后的宿主机基础路径
+          # {log_dir_name}: 日志目录名（container_name-timestamp）
+          - container_path: "/app/container-logs"
+            host_path: "{resolved_path}/{log_dir_name}"
             read_only: false
             mount_type: "bind"
+            resolve_from: "/app/logs"
 
     # 镜像选择策略
     selection_strategy: "ServiceOnly"

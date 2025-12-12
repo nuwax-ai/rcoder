@@ -63,11 +63,25 @@ pub struct ServiceMountConfig {
     /// 容器内路径
     pub container_path: String,
     /// 宿主机路径（支持变量替换）
+    /// 可使用的变量：
+    /// - {resolved_path}: 从 resolve_from 解析后的宿主机基础路径
+    /// - {project_id}: 项目 ID
+    /// - {user_id}: 用户 ID
+    /// - {container_name}: 容器名称
+    /// - {timestamp}: 时间戳（YYYYMMDDHHMMSS 格式）
+    /// - {log_dir_name}: 日志目录名（container_name-timestamp）
+    ///
+    /// 示例: "{resolved_path}/{log_dir_name}" => "/host/logs/computer-agent-runner-user_123-20241212160000"
     pub host_path: String,
     /// 是否只读
     pub read_only: bool,
     /// 挂载类型（bind/volume）
     pub mount_type: String,
+    /// 动态路径解析源（可选）
+    /// 当 host_path 包含 {resolved_path} 变量时，指定从哪个容器内路径解析宿主机基础路径
+    /// 例如：resolve_from: "/app/logs" 会将容器内的 /app/logs 解析为宿主机绝对路径
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolve_from: Option<String>,
 }
 
 /// 服务资源限制配置
@@ -430,7 +444,7 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
             "registry.yichamao.com/rcoder-computer-agent-runner:latest".to_string(),
         ),
         image_tag_prefix: Some("rcoder-computer-agent-runner".to_string()),
-        enabled: false, // 默认禁用，等待新功能开发
+        enabled: true, // 当前启用
         environment,
         mounts,
         command,
@@ -497,6 +511,7 @@ mod tests {
                 host_path: "/host/workspace".to_string(),
                 read_only: false,
                 mount_type: "bind".to_string(),
+                resolve_from: None,
             }],
             command: vec![],
             entrypoint: None,
@@ -534,6 +549,7 @@ mod tests {
             host_path: "{workspace_dir}/projects/{project_id}".to_string(),
             read_only: false,
             mount_type: "bind".to_string(),
+            resolve_from: None,
         };
 
         let resolved = mount.resolve_host_path(&variables);

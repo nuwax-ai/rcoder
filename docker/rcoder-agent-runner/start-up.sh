@@ -1,5 +1,45 @@
 #!/bin/bash
 
+# ============================================================================
+# 🎯 容器日志持久化设置
+# 将日志输出到挂载的持久化目录，即使容器崩溃也能保留日志
+# ============================================================================
+CONTAINER_LOGS_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}"
+CONTAINER_LOG_NAME="${CONTAINER_LOG_NAME:-unknown}"
+
+# 检查日志目录是否可用（由主容器挂载）
+if [ -d "$CONTAINER_LOGS_DIR" ] && [ -w "$CONTAINER_LOGS_DIR" ]; then
+    # 创建日志文件
+    STARTUP_LOG="$CONTAINER_LOGS_DIR/startup.log"
+    ERROR_LOG="$CONTAINER_LOGS_DIR/error.log"
+    AGENT_LOG="$CONTAINER_LOGS_DIR/agent.log"
+    
+    # 记录容器启动信息
+    echo "============================================" >> "$STARTUP_LOG"
+    echo "Container startup at $(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$STARTUP_LOG"
+    echo "Container hostname: $(hostname)" >> "$STARTUP_LOG"
+    echo "Log directory name: $CONTAINER_LOG_NAME" >> "$STARTUP_LOG"
+    echo "USER_ID: ${USER_ID:-not set}" >> "$STARTUP_LOG"
+    echo "PROJECT_ID: ${PROJECT_ID:-not set}" >> "$STARTUP_LOG"
+    echo "============================================" >> "$STARTUP_LOG"
+    
+    # 将标准输出和错误输出同时发送到终端和日志文件
+    # stdout -> tee -> STARTUP_LOG
+    # stderr -> tee -> ERROR_LOG
+    exec > >(tee -a "$STARTUP_LOG") 2> >(tee -a "$ERROR_LOG" >&2)
+    
+    echo "📁 容器日志持久化已启用: $CONTAINER_LOGS_DIR"
+    echo "   - startup.log: 启动日志"
+    echo "   - error.log: 错误日志"
+    echo "   - agent.log: Agent 运行日志 (如有)"
+    
+    # 导出日志路径供其他进程使用
+    export CONTAINER_STARTUP_LOG="$STARTUP_LOG"
+    export CONTAINER_ERROR_LOG="$ERROR_LOG"
+    export CONTAINER_AGENT_LOG="$AGENT_LOG"
+else
+    echo "⚠️  容器日志目录不可用，使用默认输出"
+fi
 function start_vnc_services() {
 	echo "Starting VNC services..."
 	
