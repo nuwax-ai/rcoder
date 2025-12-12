@@ -78,6 +78,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/computer/progress/{session_id}",
             get(handler::agent_session_notification),
         )
+        // computer agent 专用进度流接口（使用与 agent_session_notification 相同的逻辑）
+        .route(
+            "/computer/agent/progress/{session_id}",
+            get(handler::computer_agent_progress_notification),
+        )
         // VNC 桌面访问说明接口
         .route(
             "/computer/desktop/{user_id}/{project_id}",
@@ -117,7 +122,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::agent_status,
         handler::handle_computer_chat,
         handler::computer_agent_stop,
-        handler::computer_progress_notification_doc,
+        handler::computer_agent_progress_notification,
         handler::computer_desktop_vnc,
         handler::computer_desktop_proxy,
         // Pingora 代理接口
