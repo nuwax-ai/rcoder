@@ -28,6 +28,167 @@ pub struct SessionNotificationParams {
     pub session_id: String,
 }
 
+/// 核心验证函数：验证会话并获取容器信息
+///
+/// 这个函数被 SSE 通知处理器和文档生成器共同使用
+/// 执行所有必要的验证和查找逻辑，但不执行实际的消息流创建
+async fn validate_and_get_session_context(
+    state: Arc<crate::router::AppState>,
+    session_id: &str,
+) -> Result<(String, Arc<shared_types::ProjectAndContainerInfo>, String), Response> {
+    // 阶段 2.3: 容器存在性预检
+    let container_id = match state.session_to_container_id.get(session_id) {
+        Some(cid) => cid.value().clone(),
+        None => {
+            warn!(
+                "❌ [SSE_PROXY] 在 session_to_container_id 映射中未找到会话: session_id={}",
+                session_id
+            );
+            return Err(create_error_response(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                "会话不存在或已过期。请重新发起请求。",
+            ));
+        }
+    };
+
+    // 检查容器是否仍在运行
+    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+        Ok(dm) => dm,
+        Err(e) => {
+            error!("❌ [SSE_PROXY] 获取全局 DockerManager 失败: {}", e);
+            return Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "无法访问 Docker 服务，请联系管理员。",
+            ));
+        }
+    };
+
+    match docker_manager.is_container_running(&container_id).await {
+        Ok(true) => {
+            info!(
+                "✅ [SSE_PROXY] 容器检查通过: container_id={}, 状态=运行中",
+                container_id
+            );
+            // 容器正在运行，继续执行
+        }
+        Ok(false) => {
+            error!("❌ [SSE_PROXY] 容器已停止: container_id={}", container_id);
+            // 清理陈旧的会话条目
+            state.session_to_container_id.remove(session_id);
+            return Err(create_error_response(
+                StatusCode::NOT_FOUND,
+                "SESSION_EXPIRED",
+                "会话因不活动已被清理。请重新发起请求。",
+            ));
+        }
+        Err(e) => {
+            error!(
+                "❌ [SSE_PROXY] 检查容器状态失败: container_id={}, error={}",
+                container_id, e
+            );
+            return Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "检查会话状态时出错，请稍后重试。",
+            ));
+        }
+    };
+
+    // 容器验证通过后，查找对应的项目和代理信息
+    match find_container_by_session_id(&state, &session_id) {
+        Some((project_id, agent_info)) => {
+            info!(
+                "✅ [SSE_PROXY] 找到项目: session_id={}, project_id={}",
+                session_id, project_id
+            );
+
+            // 🎯 直接从 agent_info 中获取容器 IP 构建 gRPC 地址
+            // 对于 Computer Agent，容器信息已经在 ProjectAndContainerInfo 中
+            match agent_info.container() {
+                Some(_) => {
+                    // 验证通过，返回上下文信息
+                    Ok((project_id, agent_info, container_id))
+                }
+                None => {
+                    error!(
+                        "❌ [gRPC_SSE] ProjectAndContainerInfo 中没有容器信息: session_id={}, project_id={}",
+                        session_id, project_id
+                    );
+
+                    Err(create_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "GRPC_CONNECTION_ERROR",
+                        "会话中缺少容器信息，请重新发起请求。",
+                    ))
+                }
+            }
+        }
+        None => {
+            // 理论上在预检后不应该发生，但作为保障
+            error!(
+                "❌ [SSE_PROXY] 状态不一致：预检通过但在 project_and_agent_map 中未找到: session_id={}",
+                session_id
+            );
+
+            Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INCONSISTENT_STATE",
+                "会话状态不一致，请重新发起请求。",
+            ))
+        }
+    }
+}
+
+/// 创建 SSE 响应流
+///
+/// 这个函数被 agent_session_notification 和 computer_agent_progress_notification 共同使用
+/// 负责从代理信息中创建 gRPC SSE 流
+async fn build_sse_stream_from_agent_info(
+    agent_info: Arc<shared_types::ProjectAndContainerInfo>,
+    session_id: String,
+    grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    // 🎯 直接从 agent_info 中获取容器 IP 构建 gRPC 地址
+    match agent_info.container() {
+        Some(container) => {
+            let grpc_addr = format!(
+                "{}:{}",
+                container.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            );
+            info!(
+                "🚀 [gRPC_SSE] 建立 {} gRPC SSE 代理连接: {}",
+                agent_type, grpc_addr
+            );
+
+            // 创建 gRPC SSE 流
+            let stream = crate::grpc::create_grpc_sse_stream(
+                grpc_addr,
+                session_id.clone(),
+                grpc_pool.clone(),
+            )
+            .await;
+
+            Ok(Sse::new(stream).keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(15))
+                    .text("keep-alive"),
+            ))
+        }
+        None => {
+            // 理论上在 validate_and_get_session_context 中已经验证过
+            Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRPC_CONNECTION_ERROR",
+                "会话中缺少容器信息，请重新发起请求。",
+            ))
+        }
+    }
+}
+
 /// Agent 会话 SSE 通知处理器
 ///
 /// 此接口直接返回 SSE 流，实现从容器到客户端的实时消息转发
@@ -104,132 +265,23 @@ pub async fn agent_session_notification(
         session_id
     );
 
-    // 阶段 2.3: 容器存在性预检
-    let container_id = match state.session_to_container_id.get(session_id) {
-        Some(cid) => cid.value().clone(),
-        None => {
-            warn!(
-                "❌ [SSE_PROXY] 在 session_to_container_id 映射中未找到会话: session_id={}",
-                session_id
-            );
-            return Err(create_error_response(
-                StatusCode::NOT_FOUND,
-                "SESSION_NOT_FOUND",
-                "会话不存在或已过期。请重新发起请求。",
-            ));
-        }
-    };
+    // 使用核心验证函数获取上下文
+    let (_project_id, agent_info, _container_id) =
+        validate_and_get_session_context(state.clone(), session_id).await?;
 
-    // 检查容器是否仍在运行
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(dm) => dm,
-        Err(e) => {
-            error!("❌ [SSE_PROXY] 获取全局 DockerManager 失败: {}", e);
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "无法访问 Docker 服务，请联系管理员。",
-            ));
-        }
-    };
-
-    match docker_manager.is_container_running(&container_id).await {
-        Ok(true) => {
-            info!(
-                "✅ [SSE_PROXY] 容器检查通过: container_id={}, 状态=运行中",
-                container_id
-            );
-            // 容器正在运行，继续执行
-        }
-        Ok(false) => {
-            error!("❌ [SSE_PROXY] 容器已停止: container_id={}", container_id);
-            // 清理陈旧的会话条目
-            state.session_to_container_id.remove(session_id);
-            return Err(create_error_response(
-                StatusCode::NOT_FOUND,
-                "SESSION_EXPIRED",
-                "会话因不活动已被清理。请重新发起请求。",
-            ));
-        }
-        Err(e) => {
-            error!(
-                "❌ [SSE_PROXY] 检查容器状态失败: container_id={}, error={}",
-                container_id, e
-            );
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "检查会话状态时出错，请稍后重试。",
-            ));
-        }
-    };
-
-    // 容器验证通过后，继续后续逻辑
-    match find_container_by_session_id(&state, &session_id) {
-        Some((project_id, agent_info)) => {
-            info!(
-                "✅ [SSE_PROXY] 找到项目: session_id={}, project_id={}",
-                session_id, project_id
-            );
-
-            // 🎯 直接从 agent_info 中获取容器 IP 构建 gRPC 地址
-            // 对于 Computer Agent，容器信息已经在 ProjectAndContainerInfo 中
-            match agent_info.container() {
-                Some(container) => {
-                    let grpc_addr = format!(
-                        "{}:{}",
-                        container.container_ip,
-                        shared_types::GRPC_DEFAULT_PORT
-                    );
-                    info!("🚀 [gRPC_SSE] 建立 gRPC SSE 代理连接: {}", grpc_addr);
-
-                    // 创建 gRPC SSE 流
-                    let stream = crate::grpc::create_grpc_sse_stream(
-                        grpc_addr,
-                        session_id.clone(),
-                        state.grpc_pool.clone(),
-                    )
-                    .await;
-
-                    Ok(Sse::new(stream).keep_alive(
-                        KeepAlive::new()
-                            .interval(Duration::from_secs(15))
-                            .text("keep-alive"),
-                    ))
-                }
-                None => {
-                    error!(
-                        "❌ [gRPC_SSE] ProjectAndContainerInfo 中没有容器信息: session_id={}, project_id={}",
-                        session_id, project_id
-                    );
-
-                    Err(create_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "GRPC_CONNECTION_ERROR",
-                        "会话中缺少容器信息，请重新发起请求。",
-                    ))
-                }
-            }
-        }
-        None => {
-            // 理论上在预检后不应该发生，但作为保障
-            error!(
-                "❌ [SSE_PROXY] 状态不一致：预检通过但在 project_and_agent_map 中未找到: session_id={}",
-                session_id
-            );
-
-            Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INCONSISTENT_STATE",
-                "会话状态不一致，请重新发起请求。",
-            ))
-        }
-    }
+    // 使用通用函数创建 SSE 响应流
+    build_sse_stream_from_agent_info(
+        agent_info,
+        session_id.to_string(),
+        state.grpc_pool.clone(),
+        "Agent",
+    )
+    .await
 }
 
 #[utoipa::path(
     get,
-    path = "/computer/progress/{session_id}",
+    path = "/computer/agent/progress/{session_id}",
     params(
         SessionNotificationParams
     ),
@@ -271,15 +323,32 @@ pub async fn agent_session_notification(
         )
     ),
     tag = "computer",
-    operation_id = "computer_progress_notification",
-    summary = "Computer Agent 会话 SSE 通知流",
-    description = "为 Computer Agent 建立 SSE 连接，实时接收执行进度和状态更新。"
+    operation_id = "computer_agent_progress_notification",
+    summary = "Computer Agent 专用会话 SSE 通知流",
+    description = "为 Computer Agent 专用的进度流接口，建立 SSE 连接实时接收执行进度和状态更新。此接口与 `/computer/progress/{session_id}` 功能相同，提供更明确的路径结构。\n\n## 🔄 核心逻辑\n\n该接口与 `agent_session_notification` 使用相同的数据验证和查找逻辑：\n\n1. 验证会话ID对应的容器是否存在\n2. 检查容器是否正在运行\n3. 查找对应的项目和代理信息\n4. 建立 gRPC SSE 连接\n\n所有验证逻辑都通过 `validate_and_get_session_context` 函数统一处理。"
 )]
-pub async fn computer_progress_notification_doc(
-    Path(_params): Path<SessionNotificationParams>,
-    State(_state): State<Arc<crate::router::AppState>>,
-) -> Result<(), AppError> {
-    Ok(())
+pub async fn computer_agent_progress_notification(
+    Path(params): Path<SessionNotificationParams>,
+    State(state): State<Arc<crate::router::AppState>>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    let session_id = &params.session_id;
+    info!(
+        "🔍 [SSE_PROXY] 收到 Computer Agent SSE连接请求: session_id={:?}",
+        session_id
+    );
+
+    // 使用与 agent_session_notification 相同的验证逻辑
+    let (_project_id, agent_info, _container_id) =
+        validate_and_get_session_context(state.clone(), session_id).await?;
+
+    // 使用通用函数创建 SSE 响应流
+    build_sse_stream_from_agent_info(
+        agent_info,
+        session_id.to_string(),
+        state.grpc_pool.clone(),
+        "Computer Agent",
+    )
+    .await
 }
 
 /// 创建 SSE 代理流

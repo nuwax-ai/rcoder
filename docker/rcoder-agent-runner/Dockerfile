@@ -535,6 +535,15 @@ RUN curl -fsSL https://bun.sh/install | bash && \
 RUN mkdir -p /root/.claude && \
     echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"}}}' > /root/.claude/settings.json
 
+# 安装额外的命令工具（强制更新到最新版本）
+RUN npm install -g @zed-industries/claude-code-acp@latest
+
+# 安装 Claude CLI 工具（强制更新到最新版本）
+RUN npm install -g @anthropic-ai/claude-code@latest
+
+# 预安装 chrome-devtools-mcp（加速 MCP 工具启动）
+RUN npm install -g chrome-devtools-mcp@latest
+
 # 安装 uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
@@ -543,6 +552,11 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 # 设置 uv 镜像加速地址
 ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+
+
+# 预安装 MCP 工具到 uv 缓存中
+RUN uv tool install mcp-server-fetch
+
 
 # 安装 Bun
 RUN curl -fsSL https://bun.sh/install | bash
@@ -554,6 +568,12 @@ ENV PATH="/root/.bun/bin:${PATH}"
 RUN echo '[install]' > /root/.bunfig.toml && \
     echo 'registry = "https://registry.npmmirror.com"' >> /root/.bunfig.toml
 
+# 预安装 context7 MCP 工具到 bun 全局缓存
+RUN bun add -g @upstash/context7-mcp
+
+# 创建 Claude Code 配置目录并禁用 webfetch 功能，添加 MCP 工具
+RUN mkdir -p /root/.claude && \
+    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}}}}' > /root/.claude/settings.json
 
 
 # 复制预构建的 agent_runner 二进制文件（由 Dockerfile.build 在 debian:12 中编译）

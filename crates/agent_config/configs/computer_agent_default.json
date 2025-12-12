@@ -40,14 +40,15 @@
       "command": "npx",
       "args": [
         "-y",
-        "chrome-devtools-mcp@latest"
+        "chrome-devtools-mcp@latest",
+        "--executablePath=/usr/bin/chromium"
       ],
       "env": {
-        "CHROME_REMOTE_DEBUGGING_PORT": "9222",
-        "CHROME_REMOTE_DEBUGGING_HOST": "127.0.0.1"
+        "DISPLAY": ":0"
       },
       "metadata": {
         "description": "Chrome DevTools MCP - Browser automation via Chrome DevTools Protocol",
+        "note": "MCP will launch and manage Chromium automatically",
         "capabilities": [
           "browser_automation",
           "page_navigation",
