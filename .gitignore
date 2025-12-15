@@ -13,3 +13,4 @@ project_workspace
 docker/rcoder
 .vscode
 docker/rcoder-agent-runner/bin/agent_runner
+docker/computer-project_workspace

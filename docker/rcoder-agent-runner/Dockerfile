@@ -344,13 +344,7 @@ RUN mkdir -p /home/user && \
     chmod 777 -R /home/user && \
     chmod 777 -R /usr/local
 
-# 安装 Jupyter (with cleanup)
-COPY ./requirements.txt requirements.txt
-RUN pip install --break-system-packages --upgrade pip && \
-    pip install --break-system-packages --no-cache-dir -r requirements.txt && \
-    ipython kernel install --name "python3" --user && \
-    # Clean up pip cache
-    rm -rf /root/.cache
+# Python/Jupyter components removed
 
 # JavaScript/TypeScript 使用 Deno kernel (不需要安装 ijavascript)
 # Deno kernel 在上面已经安装并配置完成
@@ -363,11 +357,7 @@ RUN chmod +x /usr/bin/deno && \
     rm -rf /root/.cache/deno
 COPY ./deno.json /root/.local/share/jupyter/kernels/deno/kernel.json
 
-# Bash Kernel (with cleanup)
-RUN pip install --break-system-packages bash_kernel && \
-    python -m bash_kernel.install && \
-    # Clean up pip cache
-    rm -rf /root/.cache
+# Bash Kernel (Python-based) removed
 
 # R Kernel
 # RUN R -e "install.packages('IRkernel', repos='https://cloud.r-project.org'); IRkernel::installspec(user = FALSE, name = 'r', displayname = 'R')"
@@ -431,13 +421,7 @@ RUN echo '[Service]\n\
     ExecStart=-/sbin/agetty --noissue --autologin root %I 115200,38400,9600 vt102' \
     > /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
 
-# 创建虚拟环境并安装服务器依赖 (with cleanup)
-RUN python -m venv $SERVER_PATH/.venv
-COPY ./server/requirements.txt $SERVER_PATH
-RUN $SERVER_PATH/.venv/bin/pip install --no-cache-dir -r $SERVER_PATH/requirements.txt && \
-    # Clean up pip cache in virtual environment
-    rm -rf $SERVER_PATH/.venv/pip-cache $SERVER_PATH/.venv/lib/python*/site-packages/pip/_vendor/distlib/*.whl
-COPY ./server $SERVER_PATH
+# Python server components removed
 
 # 复制配置文件
 COPY matplotlibrc /root/.config/matplotlib/.matplotlibrc
