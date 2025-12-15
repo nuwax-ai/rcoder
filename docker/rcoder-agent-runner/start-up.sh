@@ -13,7 +13,7 @@ if [ -d "$CONTAINER_LOGS_DIR" ] && [ -w "$CONTAINER_LOGS_DIR" ]; then
     STARTUP_LOG="$CONTAINER_LOGS_DIR/startup.log"
     ERROR_LOG="$CONTAINER_LOGS_DIR/error.log"
     AGENT_LOG="$CONTAINER_LOGS_DIR/agent.log"
-    
+
     # 记录容器启动信息
     echo "============================================" >> "$STARTUP_LOG"
     echo "Container startup at $(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$STARTUP_LOG"
@@ -22,17 +22,17 @@ if [ -d "$CONTAINER_LOGS_DIR" ] && [ -w "$CONTAINER_LOGS_DIR" ]; then
     echo "USER_ID: ${USER_ID:-not set}" >> "$STARTUP_LOG"
     echo "PROJECT_ID: ${PROJECT_ID:-not set}" >> "$STARTUP_LOG"
     echo "============================================" >> "$STARTUP_LOG"
-    
+
     # 将标准输出和错误输出同时发送到终端和日志文件
     # stdout -> tee -> STARTUP_LOG
     # stderr -> tee -> ERROR_LOG
     exec > >(tee -a "$STARTUP_LOG") 2> >(tee -a "$ERROR_LOG" >&2)
-    
+
     echo "📁 容器日志持久化已启用: $CONTAINER_LOGS_DIR"
     echo "   - startup.log: 启动日志"
     echo "   - error.log: 错误日志"
     echo "   - agent.log: Agent 运行日志 (如有)"
-    
+
     # 导出日志路径供其他进程使用
     export CONTAINER_STARTUP_LOG="$STARTUP_LOG"
     export CONTAINER_ERROR_LOG="$ERROR_LOG"
@@ -42,7 +42,7 @@ else
 fi
 function start_vnc_services() {
 	echo "Starting VNC services..."
-	
+
 	# 等待X11服务完全启动
 	counter=0
 	while ! su - user -c "DISPLAY=:0 xdpyinfo" >/dev/null 2>&1; do
@@ -53,38 +53,38 @@ function start_vnc_services() {
 			return 1
 		fi
 	done
-	
+
 	echo "X11 is ready, starting VNC..."
-	
+
 	# 停止可能存在的VNC服务
 	su - user -c "pkill x11vnc || true" 2>/dev/null
-	
+
 	# 等待进程完全停止
 	sleep 2
-	
+
 	# 启动x11vnc服务器 (后台运行)
 	su - user -c "
 		export DISPLAY=:0
 		nohup x11vnc -bg -display :0 -forever -wait 50 -shared -rfbport 5900 -nopw 2>/tmp/x11vnc_stderr.log >/dev/null &
 	" &
-	
+
 	# 等待x11vnc启computer-agent-runner-user_123动
 	sleep 3
-	
+
 	# 启动noVNC代理 (后台运行)
 	su - user -c "
 		export DISPLAY=:0
 		cd /opt/noVNC/utils
 		nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
 	" &
-	
+
 	# 等待noVNC启动
 	sleep 3
-	
+
 	# 检查VNC服务状态
 	vnc_running=false
 	novnc_running=false
-	
+
 	# 检查x11vnc进程
 	if su - user -c "pgrep -x x11vnc" >/dev/null 2>&1; then
 		vnc_running=true
@@ -94,7 +94,7 @@ function start_vnc_services() {
 		echo "Error log:"
 		su - user -c "cat /tmp/x11vnc_stderr.log 2>/dev/null || echo 'No error log found'"
 	fi
-	
+
 	# 检查noVNC端口
 	if netstat -tuln 2>/dev/null | grep -q ":6080 "; then
 		novnc_running=true
@@ -105,7 +105,7 @@ function start_vnc_services() {
 		echo "Error log:"
 		su - user -c "cat /tmp/novnc.log 2>/dev/null || echo 'No error log found'"
 	fi
-	
+
 	if [ "$vnc_running" = true ] && [ "$novnc_running" = true ]; then
 		echo "✓ VNC services started successfully!"
 		return 0
@@ -135,7 +135,7 @@ function start_display_and_desktop() {
 	echo "Starting D-Bus session as user..."
 	su - user -c "dbus-launch --sh-syntax > /tmp/dbus-session-env"
 	sleep 2
-	
+
 	# 导出 D-Bus 会话地址供后续使用
 	if [ -f /tmp/dbus-session-env ]; then
 		source /tmp/dbus-session-env
@@ -181,10 +181,10 @@ function start_display_and_desktop() {
 		export XDG_RUNTIME_DIR=/run/user/${USER_ID}
 		export GNOME_KEYRING_CONTROL=/run/user/${USER_ID}/keyring
 		export GTK_MODULES=gnome-keyring-pkcs11
-		
+
 		# 导入 D-Bus 会话地址
 		export DBUS_SESSION_BUS_ADDRESS='$DBUS_SESSION_BUS_ADDRESS'
-		
+
 		# 设置输入法环境变量（纯 fcitx5）
 		export GTK_IM_MODULE=fcitx5
 		export QT_IM_MODULE=fcitx5
@@ -192,7 +192,7 @@ function start_display_and_desktop() {
 		export INPUT_METHOD=fcitx5
 		export SDL_IM_MODULE=fcitx5
 		export GLFW_IM_MODULE=fcitx5
-		
+
 		echo \"Environment variables set:\"
 		echo \"  GTK_IM_MODULE=\$GTK_IM_MODULE\"
 		echo \"  DBUS_SESSION_BUS_ADDRESS=\$DBUS_SESSION_BUS_ADDRESS\"
@@ -205,7 +205,7 @@ function start_display_and_desktop() {
 
 		# 等待守护进程启动
 		sleep 2
-		
+
 		# 输入法框架（fcitx5）将由 XFCE 自启动项自动启动
 		echo 'Fcitx5 will be started by XFCE autostart'
 
@@ -234,36 +234,20 @@ function check_vnc_health() {
             echo "⚠️  x11vnc process not running, attempting restart..."
             return 1
         fi
-        
+
         # 检查noVNC端口
         if ! netstat -tuln 2>/dev/null | grep -q ":6080 "; then
             echo "⚠️  noVNC proxy not listening on port 6080, attempting restart..."
             return 1
         fi
-        
+
         echo "✓ VNC services are healthy"
         return 0
     fi
     return 0
 }
 
-function start_jupyter_server() {
-	counter=0
-	response=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8888/api/status")
-	while [[ ${response} -ne 200 ]]; do
-		let counter++
-		if ((counter % 20 == 0)); then
-			echo "Waiting for Jupyter Server to start..."
-			sleep 0.1
-		fi
-
-		response=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8888/api/status")
-	done
-
-	cd /root/.server/
-	# 在后台启动 uvicorn 服务
-	/root/.server/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 49999 --workers 1 --no-access-log --no-use-colors --timeout-keep-alive 640 &
-}
+# Jupyter server function removed
 
 echo "Starting Code Interpreter server..."
 
@@ -280,12 +264,7 @@ echo "DISPLAY=:0" >> /etc/environment
 # 启动envd和其他服务
 /bin/bash -l -c "DISPLAY=:0 /usr/bin/envd" &
 
-# 启动 Jupyter 服务器（后台等待）
-start_jupyter_server &
-
-# 启动 Jupyter 主服务（后台运行）
-echo "Starting Jupyter server..."
-MATPLOTLIBRC=/root/.config/matplotlib/.matplotlibrc jupyter server --IdentityProvider.token="" &
+# Jupyter services removed
 
 # 启动 VNC 服务（在后台运行，等待X11就绪）
 echo "Starting VNC services in background..."
@@ -301,14 +280,14 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
             exit 1
         fi
     done
-    
+
     echo "X11 is ready, starting VNC services..."
     start_vnc_services
-    
+
     echo "✓ VNC services started successfully!"
     echo "✓ VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
     echo "✓ Direct VNC port: 5900"
-    
+
     # VNC服务监控循环
     while true; do
         sleep 30
