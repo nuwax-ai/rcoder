@@ -186,7 +186,16 @@ pub async fn handle_computer_chat(
         user_id, container_info.container_id, container_info.container_ip
     );
 
-    // 5. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
+    // 5. 创建项目工作目录（在用户容器内）
+    // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
+    ensure_project_workspace_exists(&user_id, &project_id, &container_info.container_ip)
+        .await
+        .map_err(|e| {
+            error!("❌ [COMPUTER_CHAT] 创建项目工作目录失败: {}", e);
+            AppError::internal_server_error(&format!("创建项目工作目录失败: {}", e))
+        })?;
+
+    // 6. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
     if let Some(ref pingora_service) = state.pingora_service {
         pingora_service.add_vnc_backend(&user_id, &container_info.container_ip);
         debug!(
@@ -283,6 +292,15 @@ async fn forward_computer_request_to_container(
         request.attachments.len()
     );
 
+    // Computer Agent Runner 的工作目录路径
+    // 在容器内：/app/computer-project-workspace/{user_id}/{project_id}
+    let project_workspace = format!(
+        "/app/computer-project-workspace/{}/{}/",
+        request.user_id, project_id
+    );
+
+    debug!("📁 [COMPUTER_FORWARD] 项目工作目录: {}", project_workspace);
+
     // gRPC 调用（带重试机制）
     let max_retries = 2;
     let mut last_error = None;
@@ -362,6 +380,46 @@ async fn forward_computer_request_to_container(
     } else {
         Err(AppError::internal_server_error("未知重试错误"))
     }
+}
+
+/// 确保 project_id 对应的工作目录存在
+///
+/// Computer Agent Runner 的目录结构：
+/// /app/computer-project-workspace/{user_id}/{project_id}/
+///
+/// 注意：这个目录已经在 docker-compose.yml 中挂载，可以直接在 rcoder 容器内创建
+async fn ensure_project_workspace_exists(
+    user_id: &str,
+    project_id: &str,
+    _container_ip: &str,
+) -> Result<(), AppError> {
+    // 项目工作目录路径
+    let project_workspace_path = std::path::PathBuf::from("/app/computer-project-workspace")
+        .join(user_id)
+        .join(project_id);
+
+    debug!(
+        "📁 [COMPUTER_CHAT] 确保项目工作目录存在: {:?}",
+        project_workspace_path
+    );
+
+    // 直接在 rcoder 容器内创建目录
+    tokio::fs::create_dir_all(&project_workspace_path)
+        .await
+        .map_err(|e| {
+            error!(
+                "❌ [COMPUTER_CHAT] 创建项目工作目录失败: path={:?}, error={}",
+                project_workspace_path, e
+            );
+            AppError::internal_server_error(&format!("创建项目工作目录失败: {}", e))
+        })?;
+
+    info!(
+        "✅ [COMPUTER_CHAT] 项目工作目录已创建: user_id={}, project_id={}, path={:?}",
+        user_id, project_id, project_workspace_path
+    );
+
+    Ok(())
 }
 
 /// 从 service_url 提取 gRPC 地址

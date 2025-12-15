@@ -286,7 +286,7 @@ COPY firefox.cfg /usr/lib/firefox-esr/firefox.cfg
 
 
 # Code interpretor environment setup
-# 系统依赖和Python 3.12安装 (merged for smaller image size)
+# 系统依赖和Python 3安装 (merged for smaller image size)
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential curl git util-linux jq sudo fonts-noto-cjk \
@@ -295,7 +295,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     # 使用 Debian 12 默认的 Python 3.11 (更稳定)
     apt-get install -y python3 python3-dev python3-venv python3-pip && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
-    # curl -sS https://bootstrap.pypa.io/get-pip.py | python && \
+    # Python/Jupyter services and kernels removed, but Python3 environment kept
     # Clean up package cache to reduce image size:
     apt-get autoremove -y && \
     apt-get autoclean && \
@@ -322,13 +322,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # 环境变量设置
-ENV PIP_DEFAULT_TIMEOUT=100 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    JUPYTER_CONFIG_PATH="/root/.jupyter" \
-    IPYTHON_CONFIG_PATH="/root/.ipython" \
-    SERVER_PATH="/root/.server" \
-    R_VERSION=4.4.2
+ENV R_VERSION=4.4.2
 
 ENV R_HOME=/opt/R/${R_VERSION} \
     JAVA_HOME=/opt/java/openjdk
@@ -349,13 +343,12 @@ RUN mkdir -p /home/user && \
 # JavaScript/TypeScript 使用 Deno kernel (不需要安装 ijavascript)
 # Deno kernel 在上面已经安装并配置完成
 
-# Deno Kernel (upgraded to latest 2.5.6)
+# Deno runtime (for JavaScript/TypeScript support)
 COPY --from=denoland/deno:bin-2.5.6 /deno /usr/bin/deno
 RUN chmod +x /usr/bin/deno && \
-    deno jupyter --unstable --install && \
     # Clean up deno cache
     rm -rf /root/.cache/deno
-COPY ./deno.json /root/.local/share/jupyter/kernels/deno/kernel.json
+# Note: deno.json not copied as Jupyter is removed
 
 # Bash Kernel (Python-based) removed
 
@@ -404,15 +397,10 @@ RUN echo '[Service]\n\
 
 RUN systemctl enable chrony
 
-# Java 配置 (with cleanup)
+# Java 配置 (without Jupyter integration)
 COPY --from=eclipse-temurin:17-jdk $JAVA_HOME $JAVA_HOME
 RUN rm -f /usr/bin/java && \
-    ln -s ${JAVA_HOME}/bin/java /usr/bin/java && \
-    wget https://github.com/SpencerPark/IJava/releases/download/v1.3.0/ijava-1.3.0.zip && \
-    unzip ijava-1.3.0.zip && \
-    python install.py --sys-prefix && \
-    # Clean up installation files
-    rm -rf ijava-1.3.0.zip install.py java/
+    ln -s ${JAVA_HOME}/bin/java /usr/bin/java
 
 # 配置自动登录
 RUN mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
@@ -423,21 +411,16 @@ RUN echo '[Service]\n\
 
 # Python server components removed
 
-# 复制配置文件
-COPY matplotlibrc /root/.config/matplotlib/.matplotlibrc
-COPY ./start-up.sh $JUPYTER_CONFIG_PATH/
-RUN chmod +x $JUPYTER_CONFIG_PATH/start-up.sh
-COPY ./jupyter_server_config.py $JUPYTER_CONFIG_PATH/
+# 复制启动脚本
+COPY ./start-up.sh /root/
+RUN chmod +x /root/start-up.sh
 
 # 复制中文输入法修复脚本（容器内运行 fix-ime 命令）
 COPY ./fix-chrome-ime-final.sh /usr/local/bin/fix-ime
 RUN chmod +x /usr/local/bin/fix-ime
 
 
-RUN mkdir -p $IPYTHON_CONFIG_PATH/profile_default
-COPY ipython_kernel_config.py $IPYTHON_CONFIG_PATH/profile_default/
-RUN mkdir -p $IPYTHON_CONFIG_PATH/profile_default/startup
-COPY startup_scripts/* $IPYTHON_CONFIG_PATH/profile_default/startup
+# IPython/Jupyter config files removed
 
 ENV DISPLAY=:0
 
@@ -481,6 +464,12 @@ RUN rm -f /etc/nginx/sites-enabled/default && \
 
 # 配置 npm 使用国内镜像源
 RUN npm config set registry https://registry.npmmirror.com
+
+# 创建 pnpm 全局存储目录
+RUN mkdir -p /app/computer-project-workspace/.pnpm-store
+# 配置 pnpm 使用新的存储路径
+RUN pnpm config set store-dir /app/computer-project-workspace/.pnpm-store
+
 
 # 配置 Bun 使用国内镜像源
 ENV BUN_CONFIG_REGISTRY="https://registry.npmmirror.com" \
@@ -571,4 +560,4 @@ EXPOSE 8086
 ENV AGENT_RUNNER_PORT=8086
 
 
-ENTRYPOINT $JUPYTER_CONFIG_PATH/start-up.sh
+ENTRYPOINT ["/root/start-up.sh"]
