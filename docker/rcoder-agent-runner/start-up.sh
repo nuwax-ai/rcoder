@@ -68,7 +68,7 @@ function start_vnc_services() {
 		nohup x11vnc -bg -display :0 -forever -wait 50 -shared -rfbport 5900 -nopw 2>/tmp/x11vnc_stderr.log >/dev/null &
 	" &
 
-	# 等待x11vnc启computer-agent-runner-user_123动
+	# 等待x11vnc启动
 	sleep 3
 
 	# 启动noVNC代理 (后台运行)
@@ -216,9 +216,9 @@ function start_display_and_desktop() {
 			XDG_SESSION_DESKTOP=xfce \
 			XDG_RUNTIME_DIR=/run/user/${USER_ID} \
 			DBUS_SESSION_BUS_ADDRESS=\"\$DBUS_SESSION_BUS_ADDRESS\" \
-			GTK_IM_MODULE=ibus \
-			QT_IM_MODULE=ibus \
-			XMODIFIERS=@im=ibus \
+			GTK_IM_MODULE=fcitx5 \
+			QT_IM_MODULE=fcitx5 \
+			XMODIFIERS=@im=fcitx5 \
 			INPUT_METHOD=fcitx5 \
 			xfce4-session
 	" &
