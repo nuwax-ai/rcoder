@@ -4,7 +4,7 @@ services:
     image: ${RCODER_IMAGE:-master-rcoder:latest}
     ports:
       - "${RCODER_PORT:-8087}:${RCODER_PORT:-8087}"
-      - "8088:8088"  # Pingora 反向代理端口（VNC 代理、健康检查等）
+      - "8088:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）
     environment:
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8087}
@@ -24,6 +24,8 @@ services:
       - ./logs/:/app/logs
       # 挂载启动脚本
       - ./start-rcoder.sh:/app/start-rcoder.sh
+      # 专门用于npm,pnpm,bun,uvx 缓存使用的目录
+      - ./computer-cache:/root/.cache
     command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8087/health"]

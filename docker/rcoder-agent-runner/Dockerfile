@@ -471,38 +471,34 @@ RUN mkdir -p /app/computer-project-workspace/.pnpm-store
 RUN pnpm config set store-dir /app/computer-project-workspace/.pnpm-store
 
 
+
 # 配置 Bun 使用国内镜像源
 ENV BUN_CONFIG_REGISTRY="https://registry.npmmirror.com" \
-    BUN_CONFIG_INSTALL_CACHE_DIR="/tmp/bun-cache" \
-    BUN_CONFIG_GLOBAL_CACHE_DIR="/tmp/bun-global-cache" \
+    BUN_CONFIG_INSTALL_CACHE_DIR="/root/.cache/bun/install" \
+    BUN_CONFIG_GLOBAL_CACHE_DIR="/root/.cache/bun/global" \
     BUN_INSTALL="/root/.bun" \
     PATH="/root/.bun/bin:$PATH"
 
-# 安装 Bun 并配置国内镜像
+# 安装 Bun
 RUN curl -fsSL https://bun.sh/install | bash && \
     # 创建 Bun 配置目录和缓存目录
-    mkdir -p /root/.bun /tmp/bun-cache /tmp/bun-global-cache && \
-    # 创建 Bun 配置文件，配置国内镜像源
-    echo '[install]' > /root/.bun/bunfig.toml && \
-    echo 'cacheDir = "/tmp/bun-cache"' >> /root/.bun/bunfig.toml && \
-    echo 'globalCacheDir = "/tmp/bun-global-cache"' >> /root/.bun/bunfig.toml && \
-    echo 'registry = "https://registry.npmmirror.com"' >> /root/.bun/bunfig.toml && \
-    echo '' >> /root/.bun/bunfig.toml && \
-    echo '[install.scopes]' >> /root/.bun/bunfig.toml && \
-    echo '"@types" = "https://registry.npmmirror.com"' >> /root/.bun/bunfig.toml && \
-    echo '"@vue" = "https://registry.npmmirror.com"' >> /root/.bun/bunfig.toml && \
-    echo '"@react" = "https://registry.npmmirror.com"' >> /root/.bun/bunfig.toml && \
-    echo '' >> /root/.bun/bunfig.toml && \
-    echo '[run]' >> /root/.bun/bunfig.toml && \
-    echo 'bun = true' >> /root/.bun/bunfig.toml && \
-    echo '' >> /root/.bun/bunfig.toml && \
-    echo '[test]' >> /root/.bun/bunfig.toml && \
-    echo 'coverage = true' >> /root/.bun/bunfig.toml && \
+    mkdir -p /root/.bun /root/.cache/bun/install /root/.cache/bun/global && \
     # 设置权限
-    chmod -R 777 /tmp/bun-cache /tmp/bun-global-cache && \
-    # 验证安装和配置
-    /root/.bun/bin/bun --version && \
-    echo "Bun configured with Chinese mirror: https://registry.npmmirror.com"
+    chmod -R 777 /root/.cache/bun && \
+    # 验证安装
+    /root/.bun/bin/bun --version
+
+# 配置 Bun 国内镜像源和缓存目录（根据官方文档）
+RUN echo '[install]' > /root/.bunfig.toml && \
+    echo 'registry = "https://registry.npmmirror.com"' >> /root/.bunfig.toml && \
+    echo '' >> /root/.bunfig.toml && \
+    echo '[install.cache]' >> /root/.bunfig.toml && \
+    echo 'dir = "/root/.cache/bun"' >> /root/.bunfig.toml && \
+    # 创建缓存目录
+    mkdir -p /root/.cache/bun && \
+    # 验证配置
+    cat /root/.bunfig.toml && \
+    echo "Bun configured with Chinese mirror and cache dir: /root/.cache/bun"
 
 # 创建 Claude Code 配置目录并禁用 webfetch 功能，添加 mcp-fetch MCP 工具
 RUN mkdir -p /root/.claude && \
