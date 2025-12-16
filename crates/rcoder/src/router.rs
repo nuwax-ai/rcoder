@@ -153,6 +153,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             shared_types::AgentStatusResponse,
             shared_types::AgentStatus,
             handler::SessionNotificationParams,
+            // SSE 进度事件结构体（用于文档）
+            handler::ProgressEventDoc,
+            handler::SseErrorEvent,
             // 附件相关结构体
             shared_types::Attachment,
             shared_types::AttachmentSource,

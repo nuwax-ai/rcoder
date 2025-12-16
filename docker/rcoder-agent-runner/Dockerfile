@@ -527,19 +527,10 @@ ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 RUN uv tool install mcp-server-fetch
 
 
-# 安装 Bun
-RUN curl -fsSL https://bun.sh/install | bash
 
-# 添加 Bun 到 PATH
-ENV PATH="/root/.bun/bin:${PATH}"
-
-# 配置 Bun 使用国内镜像
-RUN echo '[install]' > /root/.bunfig.toml && \
-    echo 'registry = "https://registry.npmmirror.com"' >> /root/.bunfig.toml
 
 # 预安装 context7 MCP 工具到 bun 全局缓存
-RUN bun add -g @upstash/context7-mcp
-
+RUN bun add -g --registry=https://registry.npmmirror.com @upstash/context7-mcp
 # 创建 Claude Code 配置目录并禁用 webfetch 功能，添加 MCP 工具
 RUN mkdir -p /root/.claude && \
     echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}}}}' > /root/.claude/settings.json
