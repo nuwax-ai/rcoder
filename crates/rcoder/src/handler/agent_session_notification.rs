@@ -30,17 +30,18 @@ pub struct SessionNotificationParams {
 
 /// SSE 进度事件（用于 OpenAPI 文档）
 ///
-/// 这是通过 SSE 流推送的实际事件结构，遵循标准 SSE 格式：
+/// 这是通过 SSE 流推送的实际事件结构，遵循标准 SSE 格式。
+/// SSE 的 `data` 字段使用 `UnifiedSessionMessage` 结构体，包含完整的会话上下文信息：
 ///
 /// ```text
 /// event: agent_message_chunk
-/// data: {"content":{"type":"text","text":"Hello"},"index":0}
+/// data: {"session_id":"session456","message_type":"AgentSessionUpdate","sub_type":"agent_message_chunk","data":{"content":{"type":"text","text":"Hello"},"index":0},"timestamp":"2024-12-16T10:30:00Z"}
 ///
 /// event: tool_call
-/// data: {"tool_name":"read_file","tool_input":{"path":"test.rs"},"status":"started"}
+/// data: {"session_id":"session456","message_type":"AgentSessionUpdate","sub_type":"tool_call","data":{"tool_name":"read_file","tool_input":{"path":"test.rs"},"status":"started"},"timestamp":"2024-12-16T10:30:01Z"}
 ///
 /// event: end_turn
-/// data: {"reason":"EndTurn","description":"正常结束"}
+/// data: {"session_id":"session456","message_type":"AgentSessionUpdate","sub_type":"end_turn","data":{"reason":"EndTurn","description":"正常结束"},"timestamp":"2024-12-16T10:30:05Z"}
 /// ```
 ///
 /// ---
