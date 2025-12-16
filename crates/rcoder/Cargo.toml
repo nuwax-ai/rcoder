@@ -16,7 +16,6 @@ default = []
 # Internal crates
 shared_types = { path = "../shared_types" }
 acp-adapter = { path = "../acp_adapter" }
-claude-code-agent = { path = "../claude-code-agent" }
 pingora-proxy = { path = "../pingora-proxy" }
 docker_manager = { path = "../docker_manager" }
 
