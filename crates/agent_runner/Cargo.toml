@@ -18,7 +18,6 @@ shared_types = { path = "../shared_types" }
 agent_config = { path = "../agent_config" }
 agent_abstraction = { path = "../agent_abstraction" }
 acp-adapter = { path = "../acp_adapter" }
-claude-code-agent = { path = "../claude-code-agent" }
 pingora-proxy = { path = "../pingora-proxy" }
 
 clap = { workspace = true }
