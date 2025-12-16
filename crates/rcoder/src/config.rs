@@ -46,6 +46,9 @@ pub struct AppConfig {
     pub proxy_config: Option<ProxyConfig>,
     /// Docker 配置
     pub docker_config: Option<DockerConfig>,
+    /// 容器清理配置
+    #[serde(default)]
+    pub cleanup_config: CleanupConfigSettings,
 }
 
 fn default_agent_id() -> String {
@@ -82,6 +85,42 @@ pub struct ProxyConfig {
     pub health_check: HealthCheckConfig,
 }
 
+/// 容器清理配置（配置文件格式，使用秒作为单位）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupConfigSettings {
+    /// 闲置超时时间（秒），默认600秒（10分钟）
+    #[serde(default = "default_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+    /// 清理检查间隔（秒），默认300秒（5分钟）
+    #[serde(default = "default_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
+    /// Docker容器停止超时时间（秒），默认30秒
+    #[serde(default = "default_docker_stop_timeout_seconds")]
+    pub docker_stop_timeout_seconds: u64,
+}
+
+fn default_idle_timeout_seconds() -> u64 {
+    600 // 10分钟
+}
+
+fn default_cleanup_interval_seconds() -> u64 {
+    300 // 5分钟
+}
+
+fn default_docker_stop_timeout_seconds() -> u64 {
+    30
+}
+
+impl Default for CleanupConfigSettings {
+    fn default() -> Self {
+        Self {
+            idle_timeout_seconds: default_idle_timeout_seconds(),
+            cleanup_interval_seconds: default_cleanup_interval_seconds(),
+            docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),
+        }
+    }
+}
+
 /// Docker 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -108,6 +147,7 @@ impl Default for AppConfig {
             port: 8087,
             proxy_config: Some(ProxyConfig::default()),
             docker_config: Some(DockerConfig::default()),
+            cleanup_config: CleanupConfigSettings::default(),
         }
     }
 }

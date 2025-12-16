@@ -191,17 +191,6 @@ impl AgentCleaner {
         }
     }
 
-    /// 检查agent是否闲置超时
-    fn is_agent_idle_timeout(
-        &self,
-        last_activity: DateTime<Utc>,
-        current_time: DateTime<Utc>,
-    ) -> bool {
-        let duration = current_time.signed_duration_since(last_activity);
-        duration.num_seconds() > 0
-            && duration.num_seconds() as u64 > self.config.idle_timeout.as_secs()
-    }
-
     /// 🛡️ 通用容器保护时间检查函数
     ///
     /// 统一的保护逻辑，避免新创建的容器被误清理：
@@ -228,44 +217,6 @@ impl AgentCleaner {
         }
 
         false
-    }
-
-    /// 🆕 改进的超时判断函数，包含创建时间保护
-    ///
-    /// 这个函数解决了新创建容器被立即清理的问题：
-    /// 1. 检查last_activity超时
-    /// 2. 确保容器存在最小保护时间
-    /// 3. 避免时间计算误差导致的误清理
-    fn is_agent_idle_timeout_with_protection(
-        &self,
-        agent_info: &impl AgentInfoAccess,
-        current_time: DateTime<Utc>,
-    ) -> bool {
-        // 1. 检查创建时间保护期（使用统一的保护逻辑）
-        if self
-            .should_skip_cleanup_due_to_protection(agent_info.created_at(), agent_info.project_id())
-        {
-            return false;
-        }
-
-        // 2. 检查闲置超时（添加1秒的缓冲时间避免时间误差）
-        let last_activity = agent_info.last_activity();
-        let idle_duration = current_time.signed_duration_since(last_activity);
-        let idle_timeout_with_buffer = self.config.idle_timeout.as_secs() + 1;
-
-        let is_timeout = idle_duration.num_seconds() > 0
-            && idle_duration.num_seconds() as u64 > idle_timeout_with_buffer;
-
-        debug!(
-            "🕒 [cleanup] 闲置检查: project_id={}, 最后活动={}, 闲置时长={}秒, 超时阈值={}秒, 是否超时={}",
-            agent_info.project_id(),
-            last_activity,
-            idle_duration.num_seconds(),
-            idle_timeout_with_buffer,
-            is_timeout
-        );
-
-        is_timeout
     }
 
     /// 清理孤立的SSE消息数据
@@ -1087,10 +1038,6 @@ impl AgentCleaner {
         }
     }
 
-    /// 获取统计信息
-    pub fn get_stats(&self) -> &CleanupStats {
-        &self.stats
-    }
 }
 
 /// 启动清理任务 - 普通异步版本

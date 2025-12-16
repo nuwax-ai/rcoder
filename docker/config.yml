@@ -10,6 +10,18 @@ projects_dir: "/app/project_workspace"
 # 主服务端口
 port: 8087
 
+# 容器清理配置
+cleanup_config:
+  # 闲置超时时间（秒），超过此时间未活动的容器将被清理
+  # 默认值: 600 (10分钟)
+  idle_timeout_seconds: 600
+  # 清理任务执行间隔（秒）
+  # 默认值: 300 (5分钟)
+  cleanup_interval_seconds: 300
+  # Docker 容器停止超时时间（秒）
+  # 默认值: 30
+  docker_stop_timeout_seconds: 30
+
 # Pingora 反向代理配置
 proxy_config:
   listen_port: 8088

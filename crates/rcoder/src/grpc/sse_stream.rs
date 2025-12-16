@@ -3,7 +3,9 @@
 //! 通过 gRPC SubscribeProgress 接收 agent_runner 的进度事件，
 //! 并转换为 SSE 事件返回给客户端
 
+use chrono::{DateTime, Utc};
 use shared_types::grpc::ProgressRequest;
+use shared_types::{SessionMessageType, UnifiedSessionMessage};
 use tracing::{debug, error, info, warn};
 
 /// 创建基于 gRPC 的 SSE 代理流
@@ -67,8 +69,8 @@ pub async fn create_grpc_sse_stream(
                             session_id_clone, progress_event.timestamp
                         );
 
-                        // 将 ProgressEvent 转换为 SSE Event
-                        let sse_event = progress_event_to_sse(&progress_event);
+                        // 将 ProgressEvent 转换为 SSE Event（传入 session_id 以重建完整消息结构）
+                        let sse_event = progress_event_to_sse(&progress_event, &session_id_clone);
 
                         if tx.send(Ok(sse_event)).await.is_err() {
                             warn!(
@@ -120,14 +122,63 @@ pub async fn create_grpc_sse_stream(
 
 /// 将 gRPC ProgressEvent 转换为 SSE Event
 ///
-/// 简化版：直接透传 ACP JSON 载荷
+/// 使用 UnifiedSessionMessage 结构体重建完整消息，包含 sessionId、messageType、subType、data、timestamp
 /// 使用 sub_type 作为 SSE 事件名，前端通过 eventSource.addEventListener(sub_type, ...) 监听
-fn progress_event_to_sse(event: &shared_types::grpc::ProgressEvent) -> axum::response::sse::Event {
+fn progress_event_to_sse(
+    event: &shared_types::grpc::ProgressEvent,
+    session_id: &str,
+) -> axum::response::sse::Event {
+    // 解析 payload 为 data 字段
+    let data: serde_json::Value =
+        serde_json::from_str(&event.payload).unwrap_or(serde_json::Value::Null);
+
+    // 将 gRPC 时间戳（毫秒）转换为 DateTime<Utc>
+    let timestamp = DateTime::<Utc>::from_timestamp_millis(event.timestamp).unwrap_or_else(Utc::now);
+
+    // 将 message_type 字符串转换为 SessionMessageType 枚举
+    let message_type = parse_message_type(&event.message_type);
+
+    // 使用 UnifiedSessionMessage 结构体构建完整消息
+    let unified_message = UnifiedSessionMessage {
+        session_id: session_id.to_string(),
+        message_type,
+        sub_type: event.sub_type.clone(),
+        data,
+        timestamp,
+    };
+
+    // 序列化为 JSON
+    let json_data = serde_json::to_string(&unified_message).unwrap_or_else(|_| "{}".to_string());
+
     // 使用 sub_type 作为 SSE 事件名
     // 前端通过 eventSource.addEventListener('agent_message_chunk', ...) 等方式监听
     axum::response::sse::Event::default()
         .event(&event.sub_type)
-        .data(event.payload.clone())  // 直接透传 ACP JSON
+        .data(json_data)
+}
+
+/// 将 message_type 字符串解析为 SessionMessageType 枚举
+///
+/// 支持的格式：
+/// - "SessionPromptStart" -> SessionMessageType::SessionPromptStart
+/// - "SessionPromptEnd" -> SessionMessageType::SessionPromptEnd
+/// - "AgentSessionUpdate" -> SessionMessageType::AgentSessionUpdate
+/// - "Heartbeat" -> SessionMessageType::Heartbeat
+fn parse_message_type(message_type: &str) -> SessionMessageType {
+    match message_type {
+        "SessionPromptStart" => SessionMessageType::SessionPromptStart,
+        "SessionPromptEnd" => SessionMessageType::SessionPromptEnd,
+        "AgentSessionUpdate" => SessionMessageType::AgentSessionUpdate,
+        "Heartbeat" => SessionMessageType::Heartbeat,
+        // 默认作为 AgentSessionUpdate 处理
+        _ => {
+            debug!(
+                "⚠️ [gRPC_SSE] 未知的 message_type: {}, 使用 AgentSessionUpdate 作为默认值",
+                message_type
+            );
+            SessionMessageType::AgentSessionUpdate
+        }
+    }
 }
 
 /// 获取容器的 gRPC 地址
