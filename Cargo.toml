@@ -32,7 +32,7 @@ publish = false
 
 [workspace.dependencies]
 # ACP Protocol
-agent-client-protocol = "0.9"
+agent-client-protocol = { version = "0.9", features = ["unstable"] }
 
 piper = "0.2"
 
