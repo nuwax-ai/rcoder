@@ -73,6 +73,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let computer_routes = Router::new()
         .route("/computer/chat", post(handler::handle_computer_chat))
         .route("/computer/agent/stop", post(handler::computer_agent_stop))
+        .route("/computer/agent/session/cancel", post(handler::computer_agent_session_cancel))
         // 进度流复用现有的 agent_session_notification
         .route(
             "/computer/progress/{session_id}",
@@ -122,6 +123,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::agent_status,
         handler::handle_computer_chat,
         handler::computer_agent_stop,
+        handler::computer_agent_session_cancel,
         handler::computer_agent_progress_notification,
         handler::computer_desktop_vnc,
         handler::computer_desktop_proxy,
