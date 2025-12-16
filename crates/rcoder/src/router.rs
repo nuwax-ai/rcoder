@@ -89,6 +89,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/computer/desktop/{user_id}/{project_id}",
             get(handler::computer_desktop_vnc),
         )
+        // Pod 容器管理接口
+        .route("/computer/pod/count", get(handler::pod_count))
+        .route("/computer/pod/ensure", post(handler::pod_ensure))
+        .route("/computer/pod/keepalive", post(handler::pod_keepalive))
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）
@@ -127,6 +131,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::computer_agent_progress_notification,
         handler::computer_desktop_vnc,
         handler::computer_desktop_proxy,
+        // Pod 容器管理接口
+        handler::pod_count,
+        handler::pod_ensure,
+        handler::pod_keepalive,
         // Pingora 代理接口
         handler::proxy_status,
         handler::proxy_stats,
@@ -175,6 +183,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::VncProxyPathParams,
             handler::DesktopAccessResponse,
             handler::DesktopErrorResponse,
+            // Pod 容器管理相关结构体
+            handler::PodCountResponse,
+            handler::PodCountByServiceType,
+            handler::EnsurePodRequest,
+            handler::PodResourceLimits,
+            handler::EnsurePodResponse,
+            handler::PodContainerInfo,
+            handler::KeepalivePodRequest,
+            handler::KeepalivePodResponse,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,
@@ -194,6 +211,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         (name = "chat", description = "AI 聊天对话接口，支持多媒体内容"),
         (name = "agent", description = "AI 代理会话管理和实时通知接口"),
         (name = "computer", description = "Computer Agent 桌面与聊天接口"),
+        (name = "pod", description = "Pod 容器管理接口，支持容器监控、启动和保活"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
     ),
     info(

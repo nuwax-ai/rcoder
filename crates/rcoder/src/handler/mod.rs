@@ -8,6 +8,7 @@ mod computer_agent_stop_handler;
 mod computer_chat_handler;
 mod computer_desktop_handler;
 mod health_handler;
+mod pod_handler;
 pub mod proxy_api;
 pub mod proxy_handler_api;
 
@@ -20,5 +21,6 @@ pub use computer_agent_stop_handler::*;
 pub use computer_chat_handler::*;
 pub use computer_desktop_handler::*;
 pub use health_handler::*;
+pub use pod_handler::*;
 pub use proxy_api::*;
 pub use proxy_handler_api::*;

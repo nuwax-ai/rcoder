@@ -93,62 +93,87 @@ pub struct SessionNotificationParams {
 /// | `AgentSessionUpdate` | `available_commands_update` | 可用命令列表更新 |
 /// | `AgentSessionUpdate` | `current_mode_update` | 当前模式更新 |
 /// | `Heartbeat` | `ping` | 心跳保活消息 |
+///
+/// ## 📦 完整 SSE 消息示例
+///
+/// ```json
+/// {
+///   "sessionId": "019b262c-e6d2-75d8-a374-2aa08bd93afd",
+///   "messageType": "agentSessionUpdate",
+///   "subType": "agent_message_chunk",
+///   "data": {
+///     "content": {"text": "你好，我来帮你...", "type": "text"},
+///     "request_id": "d633d7b0ba9d4505ae6d87a5b274c580"
+///   },
+///   "timestamp": "2025-12-16T08:00:39.766Z"
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProgressEventDoc {
+    /// 会话ID
+    ///
+    /// 与 URL 路径中的 `session_id` 参数一致，用于标识当前会话。
+    #[schema(example = "019b262c-e6d2-75d8-a374-2aa08bd93afd")]
+    pub session_id: String,
+
     /// 消息主类型
     ///
     /// 用于区分消息的生命周期阶段，便于前端进行状态管理。
     ///
     /// ## 可能的值
     ///
-    /// | 值 | 说明 | 对应 sub_type |
-    /// |----|------|---------------|
-    /// | `SessionPromptStart` | 会话开始，Agent 开始处理用户请求 | `prompt_start` |
-    /// | `SessionPromptEnd` | 会话结束，Agent 完成或终止处理 | `end_turn`, `max_tokens`, `cancelled`, `error` 等 |
-    /// | `AgentSessionUpdate` | 执行过程中的实时更新 | `agent_message_chunk`, `tool_call`, `plan` 等 |
-    /// | `Heartbeat` | 心跳消息，用于保持 SSE 连接 | `ping` |
+    /// | 值 | 说明 | 对应 subType |
+    /// |----|------|--------------|
+    /// | `sessionPromptStart` | 会话开始，Agent 开始处理用户请求 | `prompt_start` |
+    /// | `sessionPromptEnd` | 会话结束，Agent 完成或终止处理 | `end_turn`, `max_tokens`, `cancelled`, `error` 等 |
+    /// | `agentSessionUpdate` | 执行过程中的实时更新 | `agent_message_chunk`, `tool_call`, `plan` 等 |
+    /// | `heartbeat` | 心跳消息，用于保持 SSE 连接 | `ping` |
     ///
     /// ## 前端状态机示例
     ///
     /// ```javascript
-    /// switch (message_type) {
-    ///   case 'SessionPromptStart':
-    ///     setStatus('processing');
-    ///     break;
-    ///   case 'AgentSessionUpdate':
-    ///     handleUpdate(sub_type, payload);
-    ///     break;
-    ///   case 'SessionPromptEnd':
-    ///     setStatus('completed');
-    ///     break;
-    ///   case 'Heartbeat':
-    ///     // 忽略或更新最后活跃时间
-    ///     break;
-    /// }
+    /// eventSource.addEventListener('agent_message_chunk', (event) => {
+    ///   const msg = JSON.parse(event.data);
+    ///   switch (msg.messageType) {
+    ///     case 'sessionPromptStart':
+    ///       setStatus('processing');
+    ///       break;
+    ///     case 'agentSessionUpdate':
+    ///       handleUpdate(msg.subType, msg.data);
+    ///       break;
+    ///     case 'sessionPromptEnd':
+    ///       setStatus('completed');
+    ///       break;
+    ///     case 'heartbeat':
+    ///       // 忽略或更新最后活跃时间
+    ///       break;
+    ///   }
+    /// });
     /// ```
-    #[schema(example = "AgentSessionUpdate")]
+    #[schema(example = "agentSessionUpdate")]
     pub message_type: String,
 
     /// 消息子类型（作为 SSE 的 event 字段）
     ///
-    /// 这是 SSE 事件的核心标识，前端应根据此字段决定如何处理 `payload`。
+    /// 这是 SSE 事件的核心标识，前端应根据此字段决定如何处理 `data`。
     ///
-    /// ## 完整的 sub_type 列表
+    /// ## 完整的 subType 列表
     ///
     /// ### 会话生命周期事件
-    /// | sub_type | message_type | 说明 |
-    /// |----------|--------------|------|
-    /// | `prompt_start` | SessionPromptStart | 会话开始 |
-    /// | `end_turn` | SessionPromptEnd | 正常结束 |
-    /// | `max_tokens` | SessionPromptEnd | token 限制 |
-    /// | `max_turn_requests` | SessionPromptEnd | 请求数限制 |
-    /// | `refusal` | SessionPromptEnd | Agent 拒绝 |
-    /// | `cancelled` | SessionPromptEnd | 用户取消 |
-    /// | `error` | SessionPromptEnd | 执行错误 |
+    /// | subType | messageType | 说明 |
+    /// |---------|-------------|------|
+    /// | `prompt_start` | sessionPromptStart | 会话开始 |
+    /// | `end_turn` | sessionPromptEnd | 正常结束 |
+    /// | `max_tokens` | sessionPromptEnd | token 限制 |
+    /// | `max_turn_requests` | sessionPromptEnd | 请求数限制 |
+    /// | `refusal` | sessionPromptEnd | Agent 拒绝 |
+    /// | `cancelled` | sessionPromptEnd | 用户取消 |
+    /// | `error` | sessionPromptEnd | 执行错误 |
     ///
     /// ### Agent 执行过程事件
-    /// | sub_type | 说明 | 典型用途 |
-    /// |----------|------|----------|
+    /// | subType | 说明 | 典型用途 |
+    /// |---------|------|----------|
     /// | `agent_message_chunk` | AI 响应文本片段 | 流式显示 AI 回复 |
     /// | `agent_thought_chunk` | AI 思考过程片段 | 显示推理过程（可折叠） |
     /// | `user_message_chunk` | 用户消息片段 | 回显用户输入 |
@@ -159,8 +184,8 @@ pub struct ProgressEventDoc {
     /// | `current_mode_update` | 模式更新 | 显示当前工作模式 |
     ///
     /// ### 系统事件
-    /// | sub_type | 说明 |
-    /// |----------|------|
+    /// | subType | 说明 |
+    /// |---------|------|
     /// | `ping` | 心跳保活 |
     ///
     /// ## 前端监听示例
@@ -176,16 +201,14 @@ pub struct ProgressEventDoc {
     #[schema(example = "agent_message_chunk")]
     pub sub_type: String,
 
-    /// ACP 消息的完整 JSON 载荷（作为 SSE 的 data 字段）
+    /// ACP 消息的完整 JSON 载荷
     ///
     /// 这是一个 JSON 对象，包含完整的 ACP (Agent Client Protocol) 消息数据。
-    /// 具体结构取决于 `sub_type`，前端应根据 `sub_type` 解析此 JSON。
-    ///
-    /// **注意**: `session_id` 不在此载荷中，而是通过 URL 路径传递 (`/agent/progress/{session_id}`)
+    /// 具体结构取决于 `subType`，前端应根据 `subType` 解析此 JSON。
     ///
     /// ---
     ///
-    /// ## 📋 各 sub_type 对应的 payload 结构
+    /// ## 📋 各 subType 对应的 data 结构
     ///
     /// ### 1. `prompt_start` - 会话开始
     /// ```json
@@ -230,7 +253,6 @@ pub struct ProgressEventDoc {
     ///     "type": "text",              // 内容类型
     ///     "text": "你好，我来帮你..."   // 文本内容
     ///   },
-    ///   "index": 0,                    // 消息片段索引
     ///   "request_id": "req_123"        // 可选
     /// }
     /// ```
@@ -302,65 +324,23 @@ pub struct ProgressEventDoc {
                 "type": "text",
                 "text": "正在分析您的请求..."
             },
-            "index": 0,
             "request_id": "req_123"
         })
     )]
-    pub payload: serde_json::Value,
+    pub data: serde_json::Value,
 
-    /// 可选的请求 ID，用于关联请求和响应
-    ///
-    /// ## 用途
-    ///
-    /// - **请求追踪**: 关联用户发起的 `/chat` 请求与后续的 SSE 事件
-    /// - **并发场景**: 当同一 session 有多个并发请求时，区分事件归属
-    /// - **日志关联**: 便于前后端日志的关联分析
-    ///
-    /// ## 说明
-    ///
-    /// - 此字段在 gRPC `ProgressEvent` 层面传输
-    /// - 同时也会出现在 `payload` 的 JSON 中（`payload.request_id`）
-    /// - 如果 `/chat` 请求未提供 `request_id`，此字段为 `null`
-    ///
-    /// ## 示例
-    ///
-    /// ```javascript
-    /// // 发起请求时生成 request_id
-    /// const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    ///
-    /// // 发送 chat 请求
-    /// const response = await fetch('/chat', {
-    ///   method: 'POST',
-    ///   body: JSON.stringify({
-    ///     prompt: '帮我写一个函数',
-    ///     request_id: requestId,
-    ///     // ...
-    ///   })
-    /// });
-    ///
-    /// // SSE 事件会包含相同的 request_id
-    /// eventSource.addEventListener('agent_message_chunk', (event) => {
-    ///   const data = JSON.parse(event.data);
-    ///   if (data.request_id === requestId) {
-    ///     // 这是我们请求的响应
-    ///   }
-    /// });
-    /// ```
-    #[schema(example = "req_1703001234567_abc123")]
-    pub request_id: Option<String>,
-
-    /// 事件时间戳（Unix 毫秒时间戳）
+    /// 事件时间戳（ISO 8601 格式）
     ///
     /// ## 格式
     ///
-    /// - **类型**: 64 位整数
-    /// - **单位**: 毫秒 (milliseconds)
-    /// - **时区**: UTC
+    /// - **类型**: ISO 8601 字符串
+    /// - **时区**: UTC（以 `Z` 结尾）
+    /// - **精度**: 毫秒
     ///
     /// ## 用途
     ///
     /// - **事件排序**: 确保事件按正确的时间顺序处理
-    /// - **延迟计算**: 前端可计算网络延迟 (`Date.now() - timestamp`)
+    /// - **延迟计算**: 前端可计算网络延迟
     /// - **超时检测**: 检测是否有事件丢失或延迟过大
     /// - **日志记录**: 记录精确的事件发生时间
     ///
@@ -368,13 +348,13 @@ pub struct ProgressEventDoc {
     ///
     /// ```javascript
     /// eventSource.addEventListener('agent_message_chunk', (event) => {
-    ///   const data = JSON.parse(event.data);
+    ///   const msg = JSON.parse(event.data);
     ///
-    ///   // 转换为 JavaScript Date 对象
-    ///   const eventTime = new Date(timestamp);
+    ///   // 直接解析 ISO 8601 字符串
+    ///   const eventTime = new Date(msg.timestamp);
     ///
     ///   // 计算网络延迟
-    ///   const latency = Date.now() - timestamp;
+    ///   const latency = Date.now() - eventTime.getTime();
     ///   console.log(`事件延迟: ${latency}ms`);
     ///
     ///   // 格式化显示
@@ -386,9 +366,8 @@ pub struct ProgressEventDoc {
     ///
     /// - 时间戳在 `agent_runner` 端生成，反映事件的实际发生时间
     /// - 由于网络传输，前端收到事件时可能有几十到几百毫秒的延迟
-    /// - JavaScript 的 `Date.now()` 返回的也是毫秒时间戳，可直接比较
-    #[schema(example = 1703001234567_i64)]
-    pub timestamp: i64,
+    #[schema(example = "2025-12-16T08:00:39.766Z")]
+    pub timestamp: String,
 }
 
 /// SSE 错误事件（用于 OpenAPI 文档）

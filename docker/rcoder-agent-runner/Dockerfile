@@ -536,6 +536,13 @@ RUN mkdir -p /root/.claude && \
     echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}}}}' > /root/.claude/settings.json
 
 
+# 安装 OpenSSL 开发包和构建依赖（mcp-stdio-proxy 需要）
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    pkg-config \
+    build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
 # 安装 Rust (用于安装 mcp-stdio-proxy)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
     export PATH="$HOME/.cargo/bin:$PATH" && \

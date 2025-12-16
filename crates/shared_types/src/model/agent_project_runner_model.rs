@@ -35,6 +35,10 @@ pub struct ContainerBasicInfo {
 pub struct ProjectCoreState {
     /// 项目ID
     pub project_id: String,
+    /// 用户ID（ComputerAgentRunner 模式专用）
+    /// - RCoder 模式：None（使用 project_id 作为容器唯一标识）
+    /// - ComputerAgentRunner 模式：Some(user_id)（使用 user_id 作为容器唯一标识）
+    pub user_id: Option<String>,
     /// 会话ID，agent 服务启动时会创建一个会话ID
     pub session_id: Option<String>,
     /// 最后活动时间
@@ -48,6 +52,19 @@ impl ProjectCoreState {
         let now = Utc::now();
         Self {
             project_id,
+            user_id: None,
+            session_id: None,
+            last_activity: now,
+            created_at: now,
+        }
+    }
+
+    /// 创建带 user_id 的核心状态（ComputerAgentRunner 模式）
+    pub fn new_with_user_id(project_id: String, user_id: String) -> Self {
+        let now = Utc::now();
+        Self {
+            project_id,
+            user_id: Some(user_id),
             session_id: None,
             last_activity: now,
             created_at: now,
@@ -216,6 +233,25 @@ impl ProjectAndContainerInfo {
         self.state.project_id()
     }
 
+    /// 获取用户ID（ComputerAgentRunner 模式专用）
+    pub fn user_id(&self) -> Option<&str> {
+        self.state.core.user_id.as_deref()
+    }
+
+    /// 获取容器唯一标识
+    ///
+    /// 根据 service_type 返回不同的标识符：
+    /// - RCoder 模式：返回 project_id
+    /// - ComputerAgentRunner 模式：返回 user_id（如果存在），否则回退到 project_id
+    pub fn container_key(&self) -> &str {
+        match self.service_type() {
+            Some(ServiceType::ComputerAgentRunner) => {
+                self.user_id().unwrap_or_else(|| self.project_id())
+            }
+            _ => self.project_id(),
+        }
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.state.session_id()
     }
@@ -254,6 +290,13 @@ impl ProjectAndContainerInfo {
         if let Some(session_id) = session_id {
             self.update_session(session_id);
         }
+    }
+
+    /// 设置用户ID（ComputerAgentRunner 模式专用）
+    pub fn set_user_id(&mut self, user_id: Option<String>) {
+        self.state.update_core(|core| {
+            core.user_id = user_id;
+        });
     }
 
     pub fn set_model_provider(&mut self, model_provider: Option<ModelProviderConfig>) {

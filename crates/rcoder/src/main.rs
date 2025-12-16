@@ -169,12 +169,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 创建清理配置
+    // 从配置文件读取清理配置
     let cleanup_config = CleanupConfig {
-        idle_timeout: Duration::from_secs(10 * 60),
-        cleanup_interval: Duration::from_secs(5 * 60), // 5分钟间隔，平衡性能和资源清理
-        docker_stop_timeout: Duration::from_secs(30),  // 30秒Docker停止超时
+        idle_timeout: Duration::from_secs(config.cleanup_config.idle_timeout_seconds),
+        cleanup_interval: Duration::from_secs(config.cleanup_config.cleanup_interval_seconds),
+        docker_stop_timeout: Duration::from_secs(config.cleanup_config.docker_stop_timeout_seconds),
     };
+    info!(
+        "🧹 清理配置: 闲置超时={}秒, 清理间隔={}秒, Docker停止超时={}秒",
+        config.cleanup_config.idle_timeout_seconds,
+        config.cleanup_config.cleanup_interval_seconds,
+        config.cleanup_config.docker_stop_timeout_seconds
+    );
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
