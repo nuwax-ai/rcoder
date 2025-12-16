@@ -29,6 +29,12 @@ pub struct AgentStartConfig {
 
     /// 服务类型（用于加载对应的配置）
     pub service_type: Option<shared_types::ServiceType>,
+
+    /// 用于恢复会话的 session_id
+    ///
+    /// 当需要恢复之前的会话时，传入之前的 session_id，
+    /// 这将通过 `_meta.claudeCode.options.resume` 传递给 Agent。
+    pub resume_session_id: Option<String>,
 }
 
 impl AgentStartConfig {
@@ -50,7 +56,10 @@ impl AgentStartConfig {
     }
 
     /// 设置额外的 meta 字段
-    pub fn with_extra_meta(mut self, extra_meta: serde_json::Map<String, serde_json::Value>) -> Self {
+    pub fn with_extra_meta(
+        mut self,
+        extra_meta: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
         self.extra_meta = Some(extra_meta);
         self
     }
@@ -58,6 +67,12 @@ impl AgentStartConfig {
     /// 设置服务类型
     pub fn with_service_type(mut self, service_type: shared_types::ServiceType) -> Self {
         self.service_type = Some(service_type);
+        self
+    }
+
+    /// 设置用于恢复会话的 session_id
+    pub fn with_resume_session_id(mut self, session_id: String) -> Self {
+        self.resume_session_id = Some(session_id);
         self
     }
 
@@ -81,6 +96,26 @@ impl AgentStartConfig {
             meta.insert(
                 "systemPrompt".to_string(),
                 serde_json::Value::Object(system_prompt_obj),
+            );
+        }
+
+        // 添加 session_id 到 resume，用于恢复会话
+        // 参考 agent 端的 TypeScript 代码:
+        // resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume
+        if let Some(ref session_id) = self.resume_session_id {
+            // 构建 claudeCode.options.resume 结构
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "resume".to_string(),
+                serde_json::Value::String(session_id.clone()),
+            );
+
+            let mut claude_code = serde_json::Map::new();
+            claude_code.insert("options".to_string(), serde_json::Value::Object(options));
+
+            meta.insert(
+                "claudeCode".to_string(),
+                serde_json::Value::Object(claude_code),
             );
         }
 
@@ -139,7 +174,6 @@ pub struct PromptMessage {
     pub service_type: shared_types::ServiceType,
 
     // === 新增字段 (v2) ===
-
     /// 系统提示词覆盖
     ///
     /// 如果提供，将覆盖默认的系统提示词配置
