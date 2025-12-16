@@ -536,6 +536,15 @@ RUN mkdir -p /root/.claude && \
     echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}}}}' > /root/.claude/settings.json
 
 
+# 安装 Rust (用于安装 mcp-stdio-proxy)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    export PATH="$HOME/.cargo/bin:$PATH" && \
+    # 安装
+    cargo install mcp-stdio-proxy
+
+# 添加 cargo bin 到 PATH
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 # 复制预构建的 agent_runner 二进制文件（由 Dockerfile.build 在 debian:12 中编译）
 COPY bin/agent_runner /usr/local/bin/agent_runner
 RUN chmod +x /usr/local/bin/agent_runner
