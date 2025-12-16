@@ -543,14 +543,14 @@ RUN apt-get update && apt-get install -y \
     build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# 安装 Rust (用于安装 mcp-stdio-proxy)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    export PATH="$HOME/.cargo/bin:$PATH" && \
-    # 安装
-    cargo install mcp-stdio-proxy
+# 第一步: 安装 Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 # 添加 cargo bin 到 PATH
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 第二步: 使用 Rust 安装 mcp-stdio-proxy
+RUN cargo install mcp-stdio-proxy
 
 # 复制预构建的 agent_runner 二进制文件（由 Dockerfile.build 在 debian:12 中编译）
 COPY bin/agent_runner /usr/local/bin/agent_runner
