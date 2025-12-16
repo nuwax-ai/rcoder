@@ -210,6 +210,65 @@ async fn forward_cancel_request_via_http(
 }
 
 
+/// 内部核心处理函数：处理会话取消请求（供多个接口复用）
+///
+/// 该函数封装了取消会话的核心逻辑，可被不同的 API 接口调用
+async fn handle_session_cancel_internal(
+    project_id: &str,
+    session_id: Option<String>,
+    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
+) -> Result<HttpResult<CancelResponse>, AppError> {
+    let session_id_display = session_id
+        .as_deref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "None".to_string());
+    info!(
+        "🛑 [CANCEL_FORWARD] 收到取消任务请求: session_id={}, project_id={}",
+        session_id_display, project_id
+    );
+
+    // 第一步：获取容器（不创建）
+    let container_info = get_container_for_cancel(project_id).await?;
+
+    // 如果容器不存在，说明任务已经结束或从未启动，直接返回成功
+    let Some(container_info) = container_info else {
+        info!(
+            "✅ [CANCEL_FORWARD] 容器不存在，取消目标已达成: project_id={}",
+            project_id
+        );
+        return Ok(HttpResult::success(CancelResponse {
+            success: true,
+            session_id: session_id.unwrap_or_else(|| "all".to_string()),
+        }));
+    };
+
+    // 第二步：转发取消请求到容器服务（使用全局连接池）
+    let result = forward_cancel_request_to_container_service(
+        project_id,
+        session_id.as_deref(),
+        &container_info,
+        grpc_pool,
+    )
+    .await;
+
+    match &result {
+        Ok(_) => {
+            info!(
+                "✅ [CANCEL_FORWARD] 取消请求处理成功: project_id={}",
+                project_id
+            );
+        }
+        Err(e) => {
+            error!(
+                "❌ [CANCEL_FORWARD] 取消请求处理失败: project_id={}, error={}",
+                project_id, e
+            );
+        }
+    }
+
+    result
+}
+
 /// 处理agent任务取消请求
 ///
 /// 转发取消请求到容器内的 agent_runner 服务（使用 gRPC）
@@ -283,54 +342,81 @@ pub async fn agent_session_cancel(
     State(state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
-    let session_id_display = query
-        .session_id
-        .as_deref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "None".to_string());
-    info!(
-        "🛑 [CANCEL_FORWARD] 收到取消任务请求: session_id={}, project_id={}",
-        session_id_display, query.project_id
-    );
+    handle_session_cancel_internal(&query.project_id, query.session_id, &state.grpc_pool).await
+}
 
-    // 第一步：获取容器（不创建）
-    let container_info = get_container_for_cancel(&query.project_id).await?;
-
-    // 如果容器不存在，说明任务已经结束或从未启动，直接返回成功
-    let Some(container_info) = container_info else {
-        info!(
-            "✅ [CANCEL_FORWARD] 容器不存在，取消目标已达成: project_id={}",
-            query.project_id
-        );
-        return Ok(HttpResult::success(CancelResponse {
-            success: true,
-            session_id: query.session_id.unwrap_or_else(|| "all".to_string()),
-        }));
-    };
-
-    // 第二步：转发取消请求到容器服务（使用全局连接池）
-    let result = forward_cancel_request_to_container_service(
-        &query.project_id,
-        query.session_id.as_deref(),
-        &container_info,
-        &state.grpc_pool,
-    )
-    .await;
-
-    match &result {
-        Ok(_) => {
-            info!(
-                "✅ [CANCEL_FORWARD] 取消请求处理成功: project_id={}",
-                query.project_id
-            );
-        }
-        Err(e) => {
-            error!(
-                "❌ [CANCEL_FORWARD] 取消请求处理失败: project_id={}, error={}",
-                query.project_id, e
-            );
-        }
-    }
-
-    result
+/// 处理 Computer Agent 任务取消请求
+///
+/// 转发取消请求到容器内的 agent_runner 服务（使用 gRPC）
+#[utoipa::path(
+    post,
+    path = "/computer/agent/session/cancel",
+    params(
+        CancelQuery
+    ),
+    responses(
+        (
+            status = 200,
+            description = "成功转发取消请求到容器",
+            body = HttpResult<CancelResponse>,
+            example = json!({
+                "success": true,
+                "data": {
+                    "success": true,
+                    "session_id": "session456"
+                },
+                "error": null
+            })
+        ),
+        (
+            status = 400,
+            description = "请求参数错误",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "INVALID_PARAMS",
+                    "message": "Invalid project_id or session_id"
+                }
+            })
+        ),
+        (
+            status = 404,
+            description = "未找到对应的项目或会话",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "PROJECT_NOT_FOUND",
+                    "message": "Project or session not found"
+                }
+            })
+        ),
+        (
+            status = 500,
+            description = "转发取消请求失败",
+            body = HttpResult<String>,
+            example = json!({
+                "success": false,
+                "data": null,
+                "error": {
+                    "code": "CANCEL_FAILED",
+                    "message": "Failed to forward cancel request to container"
+                }
+            })
+        )
+    ),
+    tag = "computer",
+    operation_id = "computer_agent_session_cancel",
+    summary = "转发 Computer Agent 任务取消请求（gRPC）",
+    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务"
+)]
+#[instrument(skip(state))]
+pub async fn computer_agent_session_cancel(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CancelQuery>,
+) -> Result<HttpResult<CancelResponse>, AppError> {
+    handle_session_cancel_internal(&query.project_id, query.session_id, &state.grpc_pool).await
 }
