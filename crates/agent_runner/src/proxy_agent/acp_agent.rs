@@ -93,6 +93,7 @@ pub async fn agent_worker(
                     let _ = request.chat_prompt_tx.send(ChatPromptResponse {
                         project_id: project_id.clone(),
                         session_id: String::new(),
+                        code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
                         error: Some(format!("附件处理失败: {:?}", e)),
                         request_id: Some(request_id),
                         service_type: request.prompt_message.service_type.clone(),
@@ -119,6 +120,7 @@ pub async fn agent_worker(
                 let _ = request.chat_prompt_tx.send(ChatPromptResponse {
                     project_id: project_id.clone(),
                     session_id: String::new(),
+                    code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
                     error: Some(format!("处理失败: {:?}", e)),
                     request_id: Some(request_id.clone()),
                     service_type: request.prompt_message.service_type.clone(),
@@ -168,6 +170,11 @@ pub async fn agent_worker(
         let chat_prompt_response = ChatPromptResponse {
             project_id: worker_response.project_id,
             session_id: worker_response.session_id,
+            code: if worker_response.error.is_none() {
+                shared_types::error_codes::SUCCESS.to_string()
+            } else {
+                shared_types::error_codes::ERR_AGENT_ERROR.to_string()
+            },
             error: worker_response.error,
             request_id: worker_response.request_id,
             service_type: worker_response.service_type,

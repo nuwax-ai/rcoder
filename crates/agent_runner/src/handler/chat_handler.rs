@@ -190,23 +190,23 @@ pub async fn handle_chat(
 
     info!(
         "🚀 [DEBUG] handle_chat 开始处理请求: project_id={:?}, session_id={:?}, service_type={}, prompt={}",
-        request.project_id,
-        request.session_id,
-        service_type,
-        request.prompt
+        request.project_id, request.session_id, service_type, request.prompt
     );
 
     // 检查是否需要生成项目ID
-    let project_id = if request.project_id.is_some() {
-        debug!("📝 [DEBUG] 使用请求中的项目ID: {:?}", request.project_id);
-        request.project_id.clone().unwrap()
-    } else {
-        let new_project_id = generate_project_id();
-        debug!("🆕 [DEBUG] 生成新的项目ID: {}", new_project_id);
+    let project_id = match request.project_id.clone() {
+        Some(id) => {
+            debug!("📝 [DEBUG] 使用请求中的项目ID: {:?}", id);
+            id
+        }
+        None => {
+            let new_project_id = generate_project_id();
+            debug!("🆕 [DEBUG] 生成新的项目ID: {}", new_project_id);
 
-        // 创建项目工作目录
-        create_project_workspace(&new_project_id).await?;
-        new_project_id
+            // 创建项目工作目录
+            create_project_workspace(&new_project_id).await?;
+            new_project_id
+        }
     };
 
     // 🚦 检查 Agent 状态，禁止并发请求（使用统一 Registry）
@@ -218,7 +218,7 @@ pub async fn handle_chat(
             project_id, agent_info.status
         );
         return Ok(crate::model::HttpResult::error(
-            "9010",
+            shared_types::error_codes::ERR_AGENT_BUSY,
             "Agent正在执行任务，请等待当前任务完成后再发送新请求",
         ));
     }
@@ -294,7 +294,8 @@ pub async fn handle_chat(
                     "❌ Agent 处理失败: project_id={}, session_id={}, error={}",
                     chat_prompt_response.project_id, chat_prompt_response.session_id, error_msg
                 );
-                crate::model::HttpResult::error("PROMPT001", &error_msg)
+                // 🎯 使用响应中的 code 字段，而不是硬编码错误码
+                crate::model::HttpResult::error(&chat_prompt_response.code, &error_msg)
             } else {
                 info!(
                     "✅ 收到 agent 执行结果: project_id={}, session_id={}",

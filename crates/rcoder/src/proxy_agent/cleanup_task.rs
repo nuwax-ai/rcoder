@@ -508,7 +508,10 @@ impl AgentCleaner {
                 continue;
             }
 
-            let service_type = service_type.unwrap();
+            let service_type = match service_type {
+                Some(st) => st,
+                None => continue, // 已在上面检查，不会到达这里
+            };
 
             // 🚀 优化1: 使用更快的容器列表查询，只获取基本信息
             let containers = match docker_manager.list_containers_with_pattern(pattern).await {
@@ -547,9 +550,9 @@ impl AgentCleaner {
                             // 检查 MAP 中是否有对应记录
                             if !self.state.project_and_agent_map.contains_key(&project_id) {
                                 // 🚀 优化3: 使用容器的创建时间而不是查询详细信息
-                                let created_time = container.created.and_then(|ts| {
-                                    DateTime::from_timestamp(ts, 0)
-                                });
+                                let created_time = container
+                                    .created
+                                    .and_then(|ts| DateTime::from_timestamp(ts, 0));
 
                                 if let Some(created_at) = created_time {
                                     if self.should_skip_cleanup_due_to_protection(
@@ -733,9 +736,7 @@ impl AgentCleaner {
     /// # Returns
     ///
     /// 如果成功解析返回 `Some((id, ServiceType))`，否则返回 `None`
-    #[deprecated(
-        note = "使用 infer_service_type_from_pattern 和 OrphanedContainerInfo 替代"
-    )]
+    #[deprecated(note = "使用 infer_service_type_from_pattern 和 OrphanedContainerInfo 替代")]
     #[allow(dead_code)]
     fn extract_id_and_service_type_from_container_name(
         container_name: &str,
@@ -808,10 +809,7 @@ impl AgentCleaner {
                         info.id, removed_ip
                     );
                 } else {
-                    debug!(
-                        "📭 [VNC] VNC 后端映射不存在，跳过清理: user_id={}",
-                        info.id
-                    );
+                    debug!("📭 [VNC] VNC 后端映射不存在，跳过清理: user_id={}", info.id);
                 }
             }
         }
@@ -992,10 +990,7 @@ impl AgentCleaner {
                             user_id, removed_ip
                         );
                     } else {
-                        debug!(
-                            "📭 [VNC] VNC 后端映射不存在，跳过清理: user_id={}",
-                            user_id
-                        );
+                        debug!("📭 [VNC] VNC 后端映射不存在，跳过清理: user_id={}", user_id);
                     }
                 }
             }
@@ -1037,7 +1032,6 @@ impl AgentCleaner {
             }
         }
     }
-
 }
 
 /// 启动清理任务 - 普通异步版本

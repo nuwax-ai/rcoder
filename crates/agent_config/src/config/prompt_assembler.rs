@@ -168,9 +168,13 @@ impl PromptConfigAssembler {
 
     /// 获取最终的 MCP 服务器配置
     ///
-    /// 逻辑：入参有配置则使用入参，否则使用默认配置
+    /// 逻辑：
+    /// 1. 如果入参明确提供了非空的 context_servers，使用入参
+    /// 2. 否则使用默认配置
+    ///
+    /// 注意：即使提供了 agent_config，但 context_servers 为空时，仍使用默认配置
     pub fn get_context_servers(&self) -> HashMap<String, ContextServerConfig> {
-        // 入参有 MCP 配置，使用入参
+        // 入参有非空的 MCP 配置，使用入参
         if let Some(ref config) = self.agent_config {
             if config.has_context_servers() {
                 return config
@@ -190,7 +194,7 @@ impl PromptConfigAssembler {
             }
         }
 
-        // 使用默认配置
+        // context_servers 为空或未提供，使用默认配置
         self.default_config.context_servers.clone()
     }
 
@@ -208,9 +212,7 @@ impl PromptConfigAssembler {
 
     /// 检查是否有系统提示词覆盖
     pub fn has_system_prompt_override(&self) -> bool {
-        self.system_prompt
-            .as_ref()
-            .is_some_and(|s| !s.is_empty())
+        self.system_prompt.as_ref().is_some_and(|s| !s.is_empty())
     }
 
     /// 检查是否有用户提示词模板覆盖
@@ -257,8 +259,7 @@ mod tests {
     #[test]
     fn test_system_prompt_empty_override() {
         let config = create_test_default_config();
-        let assembler =
-            PromptConfigAssembler::new(config).with_system_prompt(Some("".to_string()));
+        let assembler = PromptConfigAssembler::new(config).with_system_prompt(Some("".to_string()));
 
         let result = assembler.get_system_prompt("claude-code-acp");
         // 空字符串应该回退到默认值
@@ -306,12 +307,14 @@ mod tests {
             resource_limits: None,
         };
 
-        let assembler =
-            PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
+        let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
 
         let result = assembler.get_context_servers();
         assert!(result.contains_key("my-mcp"));
-        assert_eq!(result.get("my-mcp").unwrap().command, Some("bunx".to_string()));
+        assert_eq!(
+            result.get("my-mcp").unwrap().command,
+            Some("bunx".to_string())
+        );
     }
 
     #[test]
@@ -339,8 +342,7 @@ mod tests {
             resource_limits: None,
         };
 
-        let assembler =
-            PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
+        let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
 
         let result = assembler.get_agent_id("claude-code-acp");
         assert_eq!(result, "custom-agent");
@@ -373,8 +375,7 @@ mod tests {
             resource_limits: None,
         };
 
-        let assembler =
-            PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
+        let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
 
         let result = assembler.get_agent_server_config("claude-code-acp");
         assert!(result.env.contains_key("NEW_VAR"));

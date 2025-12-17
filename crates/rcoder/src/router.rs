@@ -73,7 +73,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let computer_routes = Router::new()
         .route("/computer/chat", post(handler::handle_computer_chat))
         .route("/computer/agent/stop", post(handler::computer_agent_stop))
-        .route("/computer/agent/session/cancel", post(handler::computer_agent_session_cancel))
+        .route(
+            "/computer/agent/session/cancel",
+            post(handler::computer_agent_session_cancel),
+        )
         // 进度流复用现有的 agent_session_notification
         .route(
             "/computer/progress/{session_id}",
@@ -93,6 +96,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/computer/pod/count", get(handler::pod_count))
         .route("/computer/pod/ensure", post(handler::pod_ensure))
         .route("/computer/pod/keepalive", post(handler::pod_keepalive))
+        .route("/computer/pod/restart", post(handler::pod_restart))
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）
@@ -135,6 +139,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::pod_count,
         handler::pod_ensure,
         handler::pod_keepalive,
+        handler::pod_restart,
         // Pingora 代理接口
         handler::proxy_status,
         handler::proxy_stats,
@@ -192,6 +197,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::PodContainerInfo,
             handler::KeepalivePodRequest,
             handler::KeepalivePodResponse,
+            handler::RestartPodRequest,
+            handler::RestartPodResponse,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,

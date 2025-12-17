@@ -164,12 +164,12 @@ pub async fn computer_desktop_vnc(
     // 1. 验证参数
     if user_id.trim().is_empty() {
         error!("❌ [DESKTOP_VNC] user_id 不能为空");
-        return Err(AppError::validation_error("user_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
     }
 
     if project_id.trim().is_empty() {
         error!("❌ [DESKTOP_VNC] project_id 不能为空");
-        return Err(AppError::validation_error("project_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
     }
 
     info!(

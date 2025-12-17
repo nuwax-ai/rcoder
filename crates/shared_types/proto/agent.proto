@@ -19,6 +19,10 @@ service AgentService {
   // 停止特定 project_id 的 Agent (Unary)
   // 用于 ComputerAgentRunner 模式：停止单个项目的 Agent，不销毁容器
   rpc StopAgent (StopAgentRequest) returns (StopAgentResponse);
+
+  // 查询容器状态 (Unary)
+  // 专门用于容器生命周期管理，返回容器活跃状态和任务信息
+  rpc GetContainerStatus (GetContainerStatusRequest) returns (GetContainerStatusResponse);
 }
 
 // === ChatRequest/Response ===
@@ -43,6 +47,8 @@ message ChatRequest {
   optional string user_prompt = 9;
   // Agent 运行时配置（可选，包含 Agent 服务器和 MCP 服务器配置）
   optional ChatAgentConfig agent_config = 10;
+  // 服务类型（可选，"RCoder" 或 "ComputerAgentRunner"，默认 "RCoder"）
+  optional string service_type = 11;
 }
 
 message ChatResponse {
@@ -51,6 +57,7 @@ message ChatResponse {
   bool success = 3;
   optional string error = 4;
   optional string request_id = 5;
+  optional string error_code = 6;  // 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
 }
 
 // === Progress Streaming ===
@@ -247,4 +254,30 @@ message ChatContextServerConfig {
   repeated string args = 4;
   // 环境变量
   map<string, string> env = 5;
+}
+
+// === Get Container Status ===
+
+// 容器状态查询请求
+message GetContainerStatusRequest {
+  // 用户ID
+  string user_id = 1;
+  // 项目ID
+  string project_id = 2;
+}
+
+// 容器状态响应
+message GetContainerStatusResponse {
+  // 容器是否活跃（有活跃任务）
+  bool is_active = 1;
+  // 活跃任务数
+  int32 active_tasks = 2;
+  // 容器运行时长（秒）
+  int64 uptime_seconds = 3;
+  // 状态描述：Active, Idle, Processing
+  string status = 4;
+  // 可选：CPU 使用率（百分比，0-100）
+  optional double cpu_percent = 5;
+  // 可选：内存使用（MB）
+  optional int64 memory_mb = 6;
 }

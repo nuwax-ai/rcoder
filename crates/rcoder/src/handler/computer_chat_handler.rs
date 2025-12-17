@@ -139,7 +139,7 @@ pub async fn handle_computer_chat(
     // 1. 验证 user_id
     if request.user_id.trim().is_empty() {
         error!("❌ [COMPUTER_CHAT] user_id 不能为空");
-        return Err(AppError::validation_error("user_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
     }
 
     let user_id = request.user_id.clone();
@@ -165,21 +165,32 @@ pub async fn handle_computer_chat(
     // 3. 验证资源限制配置
     if let Some(ref agent_config) = request.agent_config {
         if let Some(ref resource_limits) = agent_config.resource_limits {
-            resource_limits.validate().map_err(|e| {
-                AppError::validation_error(&format!("Invalid resource limits: {}", e))
-            })?;
+            if let Err(e) = resource_limits.validate() {
+                error!("❌ [COMPUTER_CHAT] 资源限制验证失败: {}", e);
+                return Ok(HttpResult::error(
+                    shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
+                    &format!("Invalid resource limits: {}", e),
+                ));
+            }
         }
     }
 
     // 4. 获取或创建用户容器
-    let container_info = ComputerContainerManager::get_or_create_container_for_user(
+    let container_info = match ComputerContainerManager::get_or_create_container_for_user(
         &user_id,
         request
             .agent_config
             .as_ref()
             .and_then(|c| c.resource_limits.clone()),
     )
-    .await?;
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            error!("❌ [COMPUTER_CHAT] 获取或创建容器失败: {}", e);
+            return Ok(HttpResult::error(shared_types::error_codes::ERR_CONTAINER_ERROR, &format!("获取或创建容器失败: {}", e)));
+        }
+    };
 
     info!(
         "✅ [COMPUTER_CHAT] 容器就绪: user_id={}, container_id={}, ip={}",
@@ -188,12 +199,12 @@ pub async fn handle_computer_chat(
 
     // 5. 创建项目工作目录（在用户容器内）
     // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
-    ensure_project_workspace_exists(&user_id, &project_id, &container_info.container_ip)
-        .await
-        .map_err(|e| {
-            error!("❌ [COMPUTER_CHAT] 创建项目工作目录失败: {}", e);
-            AppError::internal_server_error(&format!("创建项目工作目录失败: {}", e))
-        })?;
+    if let Err(e) =
+        ensure_project_workspace_exists(&user_id, &project_id, &container_info.container_ip).await
+    {
+        error!("❌ [COMPUTER_CHAT] 创建项目工作目录失败: {}", e);
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_WORKSPACE_ERROR, &format!("创建项目工作目录失败: {}", e)));
+    }
 
     // 6. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
     if let Some(ref pingora_service) = state.pingora_service {
@@ -214,8 +225,9 @@ pub async fn handle_computer_chat(
     .await;
 
     // 7. 更新会话映射（填充所有三个映射表，保持一致性）
-    if let Ok(http_result) = &result {
-        if let Some(chat_response) = &http_result.data {
+    // 只有在成功时才更新映射表
+    if result.is_success() {
+        if let Some(chat_response) = &result.data {
             let session_id = chat_response.session_id.clone();
             let container_id = container_info.container_id.clone();
 
@@ -258,12 +270,12 @@ pub async fn handle_computer_chat(
         }
     } else {
         error!(
-            "❌ [COMPUTER_CHAT] 容器服务返回错误: user_id={}, project_id={}",
-            user_id, project_id
+            "❌ [COMPUTER_CHAT] 容器服务返回错误: user_id={}, project_id={}, code={}, message={}",
+            user_id, project_id, result.code, result.message
         );
     }
 
-    result
+    Ok(result)
 }
 
 /// 转发请求到容器内的 agent_runner 服务（仅使用 gRPC）
@@ -275,7 +287,7 @@ async fn forward_computer_request_to_container(
     project_id: &str,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
-) -> Result<HttpResult<ChatResponse>, AppError> {
+) -> HttpResult<ChatResponse> {
     info!(
         "📤 [COMPUTER_FORWARD] 转发请求到容器 (gRPC): user_id={}, project_id={}, container_id={}",
         request.user_id, project_id, container_info.container_id
@@ -283,7 +295,13 @@ async fn forward_computer_request_to_container(
 
     // 从 service_url 提取 gRPC 地址
     let grpc_addr =
-        extract_grpc_addr(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?;
+        match extract_grpc_addr(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT) {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!("❌ [COMPUTER_FORWARD] 提取 gRPC 地址失败: {}", e);
+                return HttpResult::error(shared_types::error_codes::ERR_GRPC_ADDR_ERROR, &format!("提取 gRPC 地址失败: {}", e));
+            }
+        };
 
     debug!(
         "📡 [COMPUTER_FORWARD] gRPC 地址: {}, prompt_len={}, attachments={}",
@@ -320,6 +338,7 @@ async fn forward_computer_request_to_container(
             request.system_prompt.clone(),
             request.user_prompt.clone(),
             request.agent_config.clone(),
+            Some(shared_types::ServiceType::ComputerAgentRunner), // ✅ 传递正确的 ServiceType
         )
         .await
         {
@@ -330,13 +349,17 @@ async fn forward_computer_request_to_container(
                         "✅ [COMPUTER_FORWARD] gRPC 响应成功: project_id={}, session_id={}",
                         chat_response.project_id, chat_response.session_id
                     );
-                    return Ok(HttpResult::success(chat_response));
+                    return HttpResult::success(chat_response);
                 } else {
                     let error_msg = grpc_response
                         .error
                         .unwrap_or_else(|| "未知错误".to_string());
-                    error!("❌ [COMPUTER_FORWARD] gRPC 响应错误: {}", error_msg);
-                    return Ok(HttpResult::error("AGENT_ERROR", &error_msg));
+                    // 🎯 从 gRPC 响应中提取错误码（完整透传）
+                    let error_code = grpc_response
+                        .error_code
+                        .unwrap_or_else(|| shared_types::error_codes::ERR_AGENT_ERROR.to_string());
+                    error!("❌ [COMPUTER_FORWARD] gRPC 响应错误: code={}, message={}", error_code, error_msg);
+                    return HttpResult::error(&error_code, &error_msg);
                 }
             }
             Err(e) => {
@@ -373,12 +396,9 @@ async fn forward_computer_request_to_container(
             e, request.user_id, project_id
         );
         // Computer Agent Runner 不使用 HTTP 回退
-        Err(AppError::internal_server_error(&format!(
-            "容器通信失败: {}",
-            e
-        )))
+        HttpResult::error(shared_types::error_codes::ERR_GRPC_ERROR, &format!("容器通信失败: {}", e))
     } else {
-        Err(AppError::internal_server_error("未知重试错误"))
+        HttpResult::error(shared_types::error_codes::ERR_UNKNOWN, "未知重试错误")
     }
 }
 

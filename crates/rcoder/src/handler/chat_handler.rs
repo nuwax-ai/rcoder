@@ -373,7 +373,8 @@ async fn forward_request_to_container_service(
         id.clone()
     } else {
         error!("[FORWARD]会话 project_id 不能为空");
-        return Err(crate::AppError::internal_server_error(
+        return Ok(crate::HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
             "project_id 不能为空",
         ));
     };
@@ -415,6 +416,7 @@ async fn forward_request_to_container_service(
             request.system_prompt.clone(),
             request.user_prompt.clone(),
             request.agent_config.clone(),
+            Some(shared_types::ServiceType::RCoder), // ✅ RCoder 模式使用 RCoder ServiceType
         )
         .await
         {
@@ -431,8 +433,12 @@ async fn forward_request_to_container_service(
                     let error_msg = grpc_response
                         .error
                         .unwrap_or_else(|| "未知错误".to_string());
-                    error!("❌ [FORWARD] gRPC 响应错误: {}", error_msg);
-                    return Ok(crate::HttpResult::error("AGENT_ERROR", &error_msg));
+                    // 🎯 从 gRPC 响应中提取错误码（完整透传）
+                    let error_code = grpc_response
+                        .error_code
+                        .unwrap_or_else(|| shared_types::error_codes::ERR_AGENT_ERROR.to_string());
+                    error!("❌ [FORWARD] gRPC 响应错误: code={}, message={}", error_code, error_msg);
+                    return Ok(crate::HttpResult::error(&error_code, &error_msg));
                 }
             }
             Err(e) => {
@@ -471,10 +477,23 @@ async fn forward_request_to_container_service(
         error!("❌ [FORWARD] gRPC 最终调用失败: {}", e);
         // 尝试回退到 HTTP（可选）
         warn!("⚠️ [FORWARD] gRPC 失败，尝试 HTTP 回退");
-        forward_request_via_http(request, container_info).await
+        match forward_request_via_http(request, container_info).await {
+            Ok(result) => Ok(result),
+            Err(http_err) => {
+                // HTTP 回退也失败，返回 HTTP 200 + 错误码
+                error!("❌ [FORWARD] HTTP 回退也失败: {}", http_err);
+                Ok(HttpResult::error(
+                    shared_types::error_codes::ERR_GRPC_ERROR,
+                    &format!("容器通信失败: gRPC={}, HTTP={}", e, http_err)
+                ))
+            }
+        }
     } else {
         // 理论上不会走到这里，除非 max_retries < 1
-        Err(crate::AppError::internal_server_error("未知重试错误"))
+        Ok(HttpResult::error(
+            shared_types::error_codes::ERR_GRPC_ERROR,
+            "未知重试错误"
+        ))
     }
 }
 
@@ -544,6 +563,6 @@ async fn forward_request_via_http(
         }
     } else {
         let error_text = format!("容器返回错误状态: {}", status);
-        Ok(crate::HttpResult::error("CONTAINER_ERROR", &error_text))
+        Ok(crate::HttpResult::error(shared_types::error_codes::ERR_CONTAINER_ERROR, &error_text))
     }
 }

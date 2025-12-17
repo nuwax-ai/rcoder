@@ -14,6 +14,9 @@ pub mod service_type;
 pub mod constants;
 pub use constants::*;
 
+// 错误码定义模块
+pub mod error_codes;
+
 // gRPC 模块
 pub mod grpc {
     // 包含生成的代码，路径相对于当前文件

@@ -7,8 +7,8 @@
 //! - `POST /computer/pod/ensure` - 启动/确保容器存在（幂等）
 //! - `POST /computer/pod/keepalive` - 容器保活（刷新活动时间）
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -173,6 +173,43 @@ pub struct KeepalivePodResponse {
 }
 
 // ============================================================================
+// 接口四：重启容器
+// ============================================================================
+
+/// 重启容器请求
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RestartPodRequest {
+    /// 用户唯一标识符 (必填)
+    #[schema(example = "user_123")]
+    pub user_id: String,
+
+    /// 项目唯一标识符 (必填)
+    #[schema(example = "proj_456")]
+    pub project_id: String,
+
+    /// 可选的资源限制配置
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<PodResourceLimits>,
+}
+
+/// 重启容器响应
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RestartPodResponse {
+    /// 容器是否为新创建 (之前不存在时为 true)
+    pub was_existing: bool,
+
+    /// 容器是否已重启
+    pub restarted: bool,
+
+    /// 容器基本信息
+    pub container_info: PodContainerInfo,
+
+    /// 提示消息
+    #[schema(example = "容器已重启，可通过 VNC 访问虚拟桌面")]
+    pub message: String,
+}
+
+// ============================================================================
 // Handler 函数
 // ============================================================================
 
@@ -215,7 +252,10 @@ pub async fn pod_count(
     for container in &containers {
         if container.container_name.starts_with("rcoder-agent-") {
             rcoder_count += 1;
-        } else if container.container_name.starts_with("computer-agent-runner-") {
+        } else if container
+            .container_name
+            .starts_with("computer-agent-runner-")
+        {
             computer_count += 1;
         }
     }
@@ -267,11 +307,11 @@ pub async fn pod_ensure(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("❌ [POD_ENSURE] user_id 不能为空");
-        return Err(AppError::validation_error("user_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
     }
     if request.project_id.trim().is_empty() {
         error!("❌ [POD_ENSURE] project_id 不能为空");
-        return Err(AppError::validation_error("project_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
     }
 
     info!(
@@ -377,11 +417,11 @@ pub async fn pod_keepalive(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("❌ [POD_KEEPALIVE] user_id 不能为空");
-        return Err(AppError::validation_error("user_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
     }
     if request.project_id.trim().is_empty() {
         error!("❌ [POD_KEEPALIVE] project_id 不能为空");
-        return Err(AppError::validation_error("project_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
     }
 
     info!(
@@ -424,20 +464,18 @@ pub async fn pod_keepalive(
                 match state.project_and_agent_map.entry(request.user_id.clone()) {
                     Entry::Occupied(_) => {
                         // 其他线程已经插入，直接使用已有记录
-                        info!(
-                            "📦 [POD_KEEPALIVE] 容器已存在（Docker），AppState 已被其他线程更新"
-                        );
+                        info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），AppState 已被其他线程更新");
                     }
                     Entry::Vacant(vacant) => {
                         // 原子性插入新记录
-                        let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
+                        let mut project_info =
+                            ProjectAndContainerInfo::new(request.project_id.clone());
                         project_info.set_user_id(Some(request.user_id.clone()));
-                        project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+                        project_info
+                            .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                         project_info.set_container(Some(info.clone()));
                         vacant.insert(Arc::new(project_info));
-                        info!(
-                            "📦 [POD_KEEPALIVE] 容器已存在（Docker），已原子性添加到 AppState"
-                        );
+                        info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），已原子性添加到 AppState");
                     }
                 }
                 (info, false)
@@ -448,9 +486,11 @@ pub async fn pod_keepalive(
                     "🏗️ [POD_KEEPALIVE] 容器不存在，自动创建: user_id={}",
                     request.user_id
                 );
-                let info =
-                    ComputerContainerManager::get_or_create_container_for_user(&request.user_id, None)
-                        .await?;
+                let info = ComputerContainerManager::get_or_create_container_for_user(
+                    &request.user_id,
+                    None,
+                )
+                .await?;
 
                 // 使用 Entry API 原子性地插入到 AppState
                 // 双重检查：其他线程可能已经在 async 操作期间插入了记录
@@ -465,9 +505,11 @@ pub async fn pod_keepalive(
                     }
                     Entry::Vacant(vacant) => {
                         // 原子性插入新记录
-                        let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
+                        let mut project_info =
+                            ProjectAndContainerInfo::new(request.project_id.clone());
                         project_info.set_user_id(Some(request.user_id.clone()));
-                        project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+                        project_info
+                            .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                         project_info.set_container(Some(info.clone()));
                         vacant.insert(Arc::new(project_info));
                         info!(
@@ -524,6 +566,161 @@ pub async fn pod_keepalive(
     info!(
         "✅ [POD_KEEPALIVE] 保活完成: existed={}, created={}, time_until_cleanup={}s",
         !created, created, CLEANUP_TIMEOUT_SECONDS
+    );
+
+    Ok(HttpResult::success(response))
+}
+
+/// 重启容器（销毁后重建）
+///
+/// 根据 user_id 和 project_id 重启容器。
+/// 如果容器存在，先销毁再创建新容器；如果不存在，直接创建。
+#[utoipa::path(
+    post,
+    path = "/computer/pod/restart",
+    request_body(content = RestartPodRequest, description = "重启容器请求"),
+    responses(
+        (status = 200, description = "成功重启容器", body = HttpResult<RestartPodResponse>),
+        (status = 400, description = "请求参数无效", body = HttpResult<String>),
+        (status = 500, description = "服务器内部错误", body = HttpResult<String>)
+    ),
+    tag = "pod",
+    operation_id = "pod_restart",
+    summary = "重启容器（销毁后重建）",
+    description = "根据 user_id 和 project_id 重启容器。如果容器存在，先销毁再创建新容器；如果不存在，直接创建。"
+)]
+#[axum::debug_handler]
+#[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
+pub async fn pod_restart(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RestartPodRequest>,
+) -> Result<HttpResult<RestartPodResponse>, AppError> {
+    // 1. 验证参数
+    if request.user_id.trim().is_empty() {
+        error!("❌ [POD_RESTART] user_id 不能为空");
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
+    }
+    if request.project_id.trim().is_empty() {
+        error!("❌ [POD_RESTART] project_id 不能为空");
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
+    }
+
+    info!(
+        "🔄 [POD_RESTART] 重启容器: user_id={}, project_id={}",
+        request.user_id, request.project_id
+    );
+
+    // 2. 检查容器是否存在
+    let existing_container = ComputerContainerManager::get_container_info(&request.user_id).await?;
+    let was_existing = existing_container.is_some();
+
+    // 3. 如果容器存在，先销毁
+    if let Some(container_info) = existing_container {
+        info!(
+            "🗑️ [POD_RESTART] 销毁现有容器: container_id={}",
+            container_info.container_id
+        );
+
+        // 从 AppState 中移除记录
+        state.project_and_agent_map.remove(&request.user_id);
+
+        // 获取 DockerManager 并停止容器
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| {
+                error!("❌ [POD_RESTART] 获取 DockerManager 失败: {}", e);
+                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            })?;
+
+        // 使用 container_stop 模块的运行时清理策略
+        if let Err(e) = docker_manager::container_stop::runtime_cleanup_container(
+            &docker_manager,
+            &container_info.container_id,
+        )
+        .await
+        {
+            // 记录错误但继续尝试创建新容器
+            error!(
+                "⚠️ [POD_RESTART] 停止容器失败（继续创建新容器）: container_id={}, error={}",
+                container_info.container_id, e
+            );
+        } else {
+            info!(
+                "✅ [POD_RESTART] 容器已销毁: container_id={}",
+                container_info.container_id
+            );
+        }
+
+        // 等待一小段时间确保容器资源释放
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    // 4. 创建新容器
+    info!("🏗️ [POD_RESTART] 创建新容器: user_id={}", request.user_id);
+
+    // 转换资源限制
+    let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
+        memory_limit: limits.memory,
+        cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
+        swap_limit: None,
+    });
+
+    let container_info = ComputerContainerManager::get_or_create_container_for_user(
+        &request.user_id,
+        resource_limits,
+    )
+    .await?;
+
+    info!(
+        "✅ [POD_RESTART] 新容器创建成功: container_id={}",
+        container_info.container_id
+    );
+
+    // 5. 在 AppState 中记录容器信息（使用 Entry API 原子性操作）
+    {
+        use dashmap::mapref::entry::Entry;
+        let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
+        project_info.set_user_id(Some(request.user_id.clone()));
+        project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        project_info.set_container(Some(container_info.clone()));
+
+        match state.project_and_agent_map.entry(request.user_id.clone()) {
+            Entry::Occupied(mut occupied) => {
+                // 已存在记录，更新为新容器信息
+                occupied.insert(Arc::new(project_info));
+            }
+            Entry::Vacant(vacant) => {
+                // 不存在记录，插入新记录
+                vacant.insert(Arc::new(project_info));
+            }
+        }
+    }
+
+    // 6. 构建响应
+    let pod_container_info = PodContainerInfo {
+        container_id: container_info.container_id.clone(),
+        container_name: container_info.container_name.clone(),
+        container_ip: container_info.container_ip.clone(),
+        service_url: container_info.service_url.clone(),
+        status: container_info.status.clone(),
+    };
+
+    let message = if was_existing {
+        "容器已重启，可通过 VNC 访问虚拟桌面（Agent 服务未启动）".to_string()
+    } else {
+        "容器创建成功（之前不存在），可通过 VNC 访问虚拟桌面（Agent 服务未启动）".to_string()
+    };
+
+    let response = RestartPodResponse {
+        was_existing,
+        restarted: true,
+        container_info: pod_container_info,
+        message,
+    };
+
+    info!(
+        "✅ [POD_RESTART] 完成: was_existing={}, container_id={}",
+        was_existing, container_info.container_id
     );
 
     Ok(HttpResult::success(response))

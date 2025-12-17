@@ -183,6 +183,36 @@ pub fn get_default_agent_config(
 
 /// 将配置中的 Context 服务器转换为 ACP 协议的 McpServer
 pub fn convert_context_servers(configs: &HashMap<String, ContextServerConfig>) -> Vec<McpServer> {
+    // 🔧 关键修复：从系统环境或 /tmp/dbus-session-env 文件读取 D-Bus 会话地址
+    // 这对于容器内的输入法支持（fcitx5）至关重要
+    let dbus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().or_else(|| {
+        // 尝试从文件读取
+        std::fs::read_to_string("/tmp/dbus-session-env")
+            .ok()
+            .and_then(|content| {
+                // 解析格式：DBUS_SESSION_BUS_ADDRESS='unix:path=...';
+                content
+                    .lines()
+                    .find(|line| line.starts_with("DBUS_SESSION_BUS_ADDRESS="))
+                    .and_then(|line| {
+                        line.split_once('=').map(|(_, val)| {
+                            // 正确的清理顺序：先 trim 空格，再去分号，最后去引号
+                            val.trim()
+                                .trim_end_matches(';')
+                                .trim_matches('\'')
+                                .trim_matches('"')
+                                .to_string()
+                        })
+                    })
+            })
+    });
+
+    if let Some(ref addr) = dbus_address {
+        tracing::debug!("✓ MCP 服务器将使用 D-Bus 会话地址: {}", addr);
+    } else {
+        tracing::warn!("⚠️  未找到 DBUS_SESSION_BUS_ADDRESS，输入法可能无法工作");
+    }
+
     configs
         .iter()
         .filter(|(_, c)| c.enabled)
@@ -196,11 +226,29 @@ pub fn convert_context_servers(configs: &HashMap<String, ContextServerConfig>) -
             }
 
             // 添加环境变量
-            if let Some(env) = &c.env {
-                let env_vars: Vec<agent_client_protocol::EnvVariable> = env
-                    .iter()
+            let mut env_vars: Vec<agent_client_protocol::EnvVariable> = if let Some(env) = &c.env {
+                env.iter()
                     .map(|(k, v)| agent_client_protocol::EnvVariable::new(k.clone(), v.clone()))
-                    .collect();
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // 🔧 关键修复：自动注入 DBUS_SESSION_BUS_ADDRESS（如果尚未设置）
+            if let Some(ref addr) = dbus_address {
+                if !env_vars
+                    .iter()
+                    .any(|e| e.name == "DBUS_SESSION_BUS_ADDRESS")
+                {
+                    env_vars.push(agent_client_protocol::EnvVariable::new(
+                        "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                        addr.clone(),
+                    ));
+                    tracing::debug!("✓ 为 MCP 服务器 '{}' 注入 DBUS_SESSION_BUS_ADDRESS", name);
+                }
+            }
+
+            if !env_vars.is_empty() {
                 server = server.env(env_vars);
             }
 

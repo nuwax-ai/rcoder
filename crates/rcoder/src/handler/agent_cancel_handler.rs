@@ -120,7 +120,7 @@ async fn forward_cancel_request_to_container_service(
                     .message
                     .unwrap_or_else(|| "未知错误".to_string());
                 error!("❌ [CANCEL_FORWARD] gRPC 取消失败: {}", error_msg);
-                Ok(HttpResult::error("CANCEL001", &error_msg))
+                Ok(HttpResult::error(shared_types::error_codes::ERR_CANCEL_FAILED, &error_msg))
             }
         }
         Err(e) => {
@@ -203,7 +203,7 @@ async fn forward_cancel_request_via_http(
         );
 
         Ok(HttpResult::error(
-            "CANCEL001",
+            shared_types::error_codes::ERR_CANCEL_FAILED,
             &format!("容器取消请求失败: {}", status),
         ))
     }

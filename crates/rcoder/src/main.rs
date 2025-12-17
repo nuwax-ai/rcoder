@@ -22,6 +22,7 @@ use config::{CliArgs, load_config_with_args};
 use pingora_proxy::{PingoraServerManager, ProxyConfig};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
+use service::{start_container_status_checker, ContainerStatusCheckerConfig};
 
 // 导入统一的容器停止模块
 use docker_manager::container_stop;
@@ -222,8 +223,8 @@ async fn main() -> anyhow::Result<()> {
         info!("✅ [Pingora] PingoraServerManager 创建成功");
 
         // 启动健康检查循环（按配置）
-        if config.proxy_config.as_ref().unwrap().health_check.enabled {
-            let hc = &config.proxy_config.as_ref().unwrap().health_check;
+        if proxy_config.health_check.enabled {
+            let hc = &proxy_config.health_check;
             info!(
                 "🔧 [Pingora] 启动健康检查循环: interval={}s, timeout={}s",
                 hc.interval_seconds, hc.timeout_seconds
@@ -261,13 +262,24 @@ async fn main() -> anyhow::Result<()> {
     // 在主异步运行时中启动清理任务
     let _cleanup_handle = start_cleanup_task(cleanup_config.clone(), state.clone());
 
+    // 启动容器状态检查任务（防止长时间任务的容器被误杀）
+    let status_checker_config = ContainerStatusCheckerConfig {
+        check_interval: Duration::from_secs(30), // 每 30 秒检查一次
+        query_timeout: Duration::from_secs(5),   // 查询超时 5 秒
+    };
+    let _status_checker_handle = start_container_status_checker(
+        status_checker_config,
+        state.clone(),
+    );
+    info!("🔍 容器状态检查任务已启动（间隔: 30 秒）");
+
     // 创建路由
     let app = router::create_router(state.clone());
 
     // 启动 HTTP 服务器
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
         .await
-        .unwrap();
+        .map_err(|e| anyhow::anyhow!("HTTP 服务器绑定端口 {} 失败: {}", config.port, e))?;
 
     info!("Server starting on port {}", config.port);
     info!("API endpoints:");
@@ -276,30 +288,23 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET  /health - Health check");
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
-    if config.proxy_config.is_some() {
+    if let Some(proxy_config) = &config.proxy_config {
         info!("🚀 Pingora 反向代理服务已启用");
-        info!(
-            "📡 监听端口: {}",
-            config.proxy_config.as_ref().unwrap().listen_port
-        );
+        info!("📡 监听端口: {}", proxy_config.listen_port);
         info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
         info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
         info!("💡 示例:");
         info!(
             "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
-            config.proxy_config.as_ref().unwrap().listen_port,
-            config.port,
-            config.port
+            proxy_config.listen_port, config.port, config.port
         );
         info!(
             "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
-            config.proxy_config.as_ref().unwrap().listen_port,
-            config.port,
-            config.port
+            proxy_config.listen_port, config.port, config.port
         );
         info!(
             "   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (动态发现)",
-            config.proxy_config.as_ref().unwrap().listen_port
+            proxy_config.listen_port
         );
     }
 
@@ -409,8 +414,10 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
 
         let shutdown_tx_clone = shutdown_tx.clone();
         tokio::spawn(async move {
-            let mut sigint = signal(SignalKind::interrupt()).unwrap();
-            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("SIGINT signal handler registration failed");
+            let mut sigterm = signal(SignalKind::terminate())
+                .expect("SIGTERM signal handler registration failed");
 
             tokio::select! {
                 _ = sigint.recv() => {

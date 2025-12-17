@@ -752,8 +752,9 @@ impl PlanEntry {
     /// 标记为进行中
     pub fn mark_in_progress(&mut self) {
         self.status = PlanEntryStatus::InProgress;
-        self.started_at = Some(std::time::SystemTime::now());
-        self.updated_at = self.started_at.unwrap();
+        let now = std::time::SystemTime::now();
+        self.started_at = Some(now);
+        self.updated_at = now;
         self.progress = Some(0);
     }
 
