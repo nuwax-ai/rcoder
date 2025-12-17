@@ -816,17 +816,37 @@ impl DockerManager {
         &self,
         project_id: &str,
     ) -> DockerResult<Option<ContainerBasicInfo>> {
-        // 1. 查找容器信息
+        // 1. 查找容器信息（内存映射）
         let container_info = match self.get_container_info(project_id) {
             Some(info) => info,
             None => return Ok(None),
         };
 
         // 2. 获取容器 IP (优先使用主网络)
+        // 注意：如果容器已被外部删除（如手动 docker rm），此处会出错
         let network_name = self.get_main_network_name().await;
-        let network_ips = self
+        let network_ips = match self
             .get_container_network_info(&container_info.container_id)
-            .await?;
+            .await
+        {
+            Ok(ips) => ips,
+            Err(e) => {
+                // 检查是否是容器不存在的错误
+                let error_str = e.to_string();
+                if error_str.contains("No such container") || error_str.contains("404") {
+                    // 容器已被外部删除，清理内存映射并返回 None
+                    // 这样上层调用者可以重新创建容器
+                    warn!(
+                        "⚠️ [GET_AGENT_INFO] 容器已被外部删除，清理内存映射: project_id={}, container_id={}",
+                        project_id, container_info.container_id
+                    );
+                    self.containers.remove(project_id);
+                    return Ok(None);
+                }
+                // 其他错误正常传播
+                return Err(e);
+            }
+        };
 
         let container_ip = network_ips
             .get(&network_name)
@@ -1131,6 +1151,10 @@ impl DockerManager {
     }
 
     /// 获取容器网络信息
+    ///
+    /// # 返回
+    /// - `Ok(HashMap)`: 网络名称到 IP 地址的映射
+    /// - `Err(ConnectionError)`: 容器不存在或无法获取网络信息
     pub async fn get_container_network_info(
         &self,
         container_id: &str,
@@ -1141,11 +1165,11 @@ impl DockerManager {
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)));
+            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))?;
 
         let mut network_ips = HashMap::new();
 
-        if let Some(network_settings) = inspect.unwrap().network_settings
+        if let Some(network_settings) = inspect.network_settings
             && let Some(networks) = network_settings.networks
         {
             for (network_name, network_info) in networks {
@@ -1399,7 +1423,11 @@ impl DockerManager {
         timeout_seconds: u64,
     ) -> DockerResult<()> {
         let stop_options = Some(StopContainerOptions {
-            t: Some((timeout_seconds as i32).try_into().unwrap()),
+            t: Some(
+                (timeout_seconds as i32)
+                    .try_into()
+                    .expect("timeout should be within valid range"),
+            ),
             signal: None::<String>,
         });
 

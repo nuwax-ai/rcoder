@@ -198,11 +198,11 @@ impl HostPathResolver {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .unwrap();
+                        .expect("failed to create tokio runtime for mount resolution");
                     rt.block_on(async { inspector.get_all_mounts().await })
                 })
                 .join()
-                .unwrap()
+                .expect("mount resolution thread panicked")
             }) {
                 // 查找匹配的挂载点
                 for (mount_container_path, mount_host_path) in &mounts {

@@ -8,10 +8,7 @@ use std::sync::Arc;
 use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{
-    AppError, HttpResult,
-    router::AppState,
-};
+use crate::{AppError, HttpResult, router::AppState};
 
 /// 停止Agent请求参数
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -43,12 +40,16 @@ async fn destroy_container_for_project(
     info!("🔥 [STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
 
     // 使用全局 DockerManager
-    let docker_manager = docker_manager::global::get_global_docker_manager()
-        .await
-        .map_err(|e| {
+    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+        Ok(manager) => manager,
+        Err(e) => {
             error!("❌ [STOP_DESTROY] 获取全局 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
-        })?;
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                &format!("获取全局 DockerManager 失败: {}", e)
+            ));
+        }
+    };
 
     // 尝试通过多种方式查找容器
     // 1. 先通过 project_id 查找
@@ -82,7 +83,7 @@ async fn destroy_container_for_project(
         if let Err(e) = stop_result {
             error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
             return Ok(HttpResult::error(
-                "STOP001",
+                shared_types::error_codes::ERR_STOP_FAILED,
                 &format!("停止容器失败: {}", e),
             ));
         }
@@ -124,7 +125,6 @@ async fn destroy_container_for_project(
         Ok(HttpResult::success(response))
     }
 }
-
 
 /// 停止指定项目的Agent服务
 ///
@@ -207,7 +207,7 @@ pub async fn agent_stop(
 
     if project_id.is_empty() {
         return Ok(HttpResult::error(
-            "INVALID_PARAMS",
+            shared_types::error_codes::ERR_INVALID_PARAMS,
             "project_id cannot be empty",
         ));
     }
@@ -222,10 +222,14 @@ pub async fn agent_stop(
 
     match &result {
         Ok(response) => {
-            if response.data.as_ref().unwrap().success {
-                info!("✅ [STOP_DESTROY] 容器销毁成功: project_id={}", project_id);
+            if let Some(data) = response.data.as_ref() {
+                if data.success {
+                    info!("✅ [STOP_DESTROY] 容器销毁成功: project_id={}", project_id);
+                } else {
+                    error!("❌ [STOP_DESTROY] 容器销毁失败: project_id={}", project_id);
+                }
             } else {
-                error!("❌ [STOP_DESTROY] 容器销毁失败: project_id={}", project_id);
+                error!("❌ [STOP_DESTROY] 响应数据为空: project_id={}", project_id);
             }
         }
         Err(e) => {

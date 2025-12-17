@@ -191,7 +191,9 @@ RUN apt-get update && \
     chmod 777 /home/user && \
     chmod 700 /run/user/$(id -u user) && \
     # Create Chromium wrapper script with fcitx5 support
-    printf '#!/bin/bash\n# 加载 D-Bus 地址\nif [ -f /tmp/dbus-session-env ]; then\n    source /tmp/dbus-session-env\nfi\n\n# 设置输入法环境变量\nexport DISPLAY=:0\nexport GTK_IM_MODULE=fcitx5\nexport QT_IM_MODULE=fcitx5\nexport XMODIFIERS=@im=fcitx5\nexport INPUT_METHOD=fcitx5\n\n# 启动 Chromium（禁用密码管理）\nexec /usr/bin/chromium \\\n  --user-data-dir=/home/user/chromium-data \\\n  --no-sandbox \\\n  --disable-dev-shm-usage \\\n  --remote-debugging-port=9222 \\\n  --remote-debugging-address=0.0.0.0 \\\n  --no-first-run \\\n  --no-default-browser-check \\\n  --password-store=basic \\\n  --use-mock-keychain "$@"\n' > /usr/bin/chromium-browser-launcher && \
+    # 注意：GTK immodule cache 中 fcitx5 注册了两个名称："fcitx" (兼容别名) 和 "fcitx5" (正式名称)
+    # 推荐使用 fcitx5 以保持语义清晰并与系统配置一致
+    printf '#!/bin/bash\n# 加载 D-Bus 地址\nif [ -f /tmp/dbus-session-env ]; then\n    source /tmp/dbus-session-env\nfi\n\n# 加载 Chromium 环境变量（持久化数据目录）\nif [ -f /etc/profile.d/chromium-env.sh ]; then\n    source /etc/profile.d/chromium-env.sh\nfi\n\n# 设置输入法环境变量（使用 fcitx5）\nexport DISPLAY=:0\nexport GTK_IM_MODULE=fcitx5\nexport QT_IM_MODULE=fcitx5\nexport XMODIFIERS=@im=fcitx5\nexport INPUT_METHOD=fcitx5\nexport SDL_IM_MODULE=fcitx5\nexport GLFW_IM_MODULE=fcitx5\nexport LANG=C.UTF-8\nexport LC_ALL=C.UTF-8\nexport LC_CTYPE=C.UTF-8\n\n# 使用环境变量或回退到默认路径\nCHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/chromium-data}"\n\n# 启动 Chromium（禁用密码管理 + 解决 profile 锁定问题）\nexec /usr/bin/chromium \\\n  --user-data-dir="$CHROMIUM_DATA_DIR" \\\n  --no-sandbox \\\n  --disable-dev-shm-usage \\\n  --remote-debugging-port=9222 \\\n  --remote-debugging-address=0.0.0.0 \\\n  --no-first-run \\\n  --no-default-browser-check \\\n  --password-store=basic \\\n  --use-mock-keychain \\\n  --disable-session-crashed-bubble \\\n  --disable-infobars \\\n  --no-process-singleton-dialog \\\n  --force-color-profile=srgb "$@"\n' > /usr/bin/chromium-browser-launcher && \
     chmod 755 /usr/bin/chromium-browser-launcher && \
     # Add Chromium aliases
     echo 'alias chromium="/usr/local/bin/chromium"' >> /home/user/.bashrc && \
@@ -205,8 +207,12 @@ RUN apt-get update && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
+# Copy MCP-specific Chromium wrapper script (runs as user to connect to fcitx5)
+COPY chromium-for-mcp.sh /usr/local/bin/chromium-for-mcp
+RUN chmod 755 /usr/local/bin/chromium-for-mcp
+
 # Create Chromium launcher with fcitx5 support
-RUN printf '#!/bin/bash\n# 加载 D-Bus 地址\nif [ -f /tmp/dbus-session-env ]; then\n    source /tmp/dbus-session-env\nfi\n\n# 设置输入法环境变量\nexport DISPLAY=:0\nexport GTK_IM_MODULE=fcitx5\nexport QT_IM_MODULE=fcitx5\nexport XMODIFIERS=@im=fcitx5\nexport INPUT_METHOD=fcitx5\n\n# 以 user 用户身份运行 Chromium（禁用密码管理）\nsu - user -c "export DISPLAY=:0; export DBUS_SESSION_BUS_ADDRESS=\\\"$DBUS_SESSION_BUS_ADDRESS\\\"; export GTK_IM_MODULE=fcitx5; export QT_IM_MODULE=fcitx5; export XMODIFIERS=@im=fcitx5; export INPUT_METHOD=fcitx5; /usr/bin/chromium --user-data-dir=/home/user/chromium-data --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --no-first-run --no-default-browser-check --password-store=basic --use-mock-keychain"\n' > /usr/local/bin/chromium && \
+RUN printf '#!/bin/bash\n# 加载 D-Bus 地址\nif [ -f /tmp/dbus-session-env ]; then\n    source /tmp/dbus-session-env\nfi\n\n# 加载 Chromium 环境变量（持久化数据目录）\nif [ -f /etc/profile.d/chromium-env.sh ]; then\n    source /etc/profile.d/chromium-env.sh\nfi\n\n# 设置输入法环境变量\nexport DISPLAY=:0\nexport GTK_IM_MODULE=fcitx5\nexport QT_IM_MODULE=fcitx5\nexport XMODIFIERS=@im=fcitx5\nexport INPUT_METHOD=fcitx5\n\n# 使用环境变量或回退到默认路径\nCHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/chromium-data}"\n\n# 以 user 用户身份运行 Chromium（禁用密码管理）\nsu - user -c "export DISPLAY=:0; export DBUS_SESSION_BUS_ADDRESS=\\\"$DBUS_SESSION_BUS_ADDRESS\\\"; export GTK_IM_MODULE=fcitx5; export QT_IM_MODULE=fcitx5; export XMODIFIERS=@im=fcitx5; export INPUT_METHOD=fcitx5; export CHROMIUM_USER_DATA_DIR=\\\"${CHROMIUM_DATA_DIR}\\\"; /usr/bin/chromium --user-data-dir=\\\"${CHROMIUM_DATA_DIR}\\\" --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --no-first-run --no-default-browser-check --password-store=basic --use-mock-keychain"\n' > /usr/local/bin/chromium && \
     chmod +x /usr/local/bin/chromium
 
 # Create a socat service with supervisor to ensure port forwarding is always running
@@ -435,6 +441,7 @@ ENV GTK_IM_MODULE=fcitx5 \
 # 配置 D-Bus 和 PolicyKit（已在前面安装 dbus-x11）
 RUN mkdir -p /etc/dbus-1/session.d && \
     printf '<!-- Session bus for user -->\n<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">\n<busconfig>\n  <policy user="user">\n    <allow own="*"/>\n    <allow own_prefix="*"/>\n    <allow send_destination="*"/>\n    <allow receive_sender="*"/>\n  </policy>\n</busconfig>' > /etc/dbus-1/session.d/user-session.conf && \
+    printf '<!-- Allow root to access user session bus for fcitx5 input method -->\n<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">\n<busconfig>\n  <policy user="root">\n    <allow own="*"/>\n    <allow own_prefix="*"/>\n    <allow send_destination="*"/>\n    <allow receive_sender="*"/>\n    <allow eavesdrop="true"/>\n  </policy>\n</busconfig>' > /etc/dbus-1/session.d/allow-root.conf && \
     # Set proper permissions
     chown -R root:root /etc/polkit-1 /etc/dbus-1 && \
     chmod 755 /etc/polkit-1/localauthority/50-local.d /etc/dbus-1/session.d && \

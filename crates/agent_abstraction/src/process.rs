@@ -42,37 +42,37 @@ impl AgentProcess {
 
     /// Wait for the process to complete
     pub async fn wait(&self) -> tokio::io::Result<std::process::ExitStatus> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().expect("child process mutex poisoned");
         child.wait().await
     }
 
     /// Kill the process
     pub async fn kill(&self) -> tokio::io::Result<()> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().expect("child process mutex poisoned");
         child.kill().await
     }
 
     /// Try to wait for the process without blocking
     pub fn try_wait(&self) -> tokio::io::Result<Option<std::process::ExitStatus>> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().expect("child process mutex poisoned");
         child.try_wait()
     }
 
     /// Get stdin for the process
     pub fn stdin(&mut self) -> Option<tokio::process::ChildStdin> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().expect("child process mutex poisoned");
         child.stdin.take()
     }
 
     /// Get stdout for the process
     pub fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().expect("child process mutex poisoned");
         child.stdout.take()
     }
 
     /// Get stderr for the process
     pub fn stderr(&mut self) -> Option<tokio::process::ChildStderr> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().expect("child process mutex poisoned");
         child.stderr.take()
     }
 

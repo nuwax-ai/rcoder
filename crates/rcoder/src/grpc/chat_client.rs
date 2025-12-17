@@ -26,6 +26,7 @@ pub async fn grpc_chat_with_pool(
     system_prompt: Option<String>,
     user_prompt: Option<String>,
     agent_config: Option<ChatAgentConfig>,
+    service_type: Option<shared_types::ServiceType>,
 ) -> anyhow::Result<GrpcChatResponse> {
     info!(
         "🚀 [gRPC_CHAT] 发送 Chat 请求 (连接池): addr={}, project_id={}",
@@ -51,6 +52,7 @@ pub async fn grpc_chat_with_pool(
         system_prompt,
         user_prompt,
         agent_config: agent_config.map(super::converters::to_grpc_chat_agent_config),
+        service_type: service_type.map(|st| format!("{:?}", st)),
     };
 
     debug!("📤 [gRPC_CHAT] 发送请求: {:?}", grpc_request);

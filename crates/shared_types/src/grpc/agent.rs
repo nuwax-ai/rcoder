@@ -31,6 +31,9 @@ pub struct ChatRequest {
     /// Agent 运行时配置（可选，包含 Agent 服务器和 MCP 服务器配置）
     #[prost(message, optional, tag = "10")]
     pub agent_config: ::core::option::Option<ChatAgentConfig>,
+    /// 服务类型（可选，"RCoder" 或 "ComputerAgentRunner"，默认 "RCoder"）
+    #[prost(string, optional, tag = "11")]
+    pub service_type: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {
@@ -44,6 +47,9 @@ pub struct ChatResponse {
     pub error: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "5")]
     pub request_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
+    #[prost(string, optional, tag = "6")]
+    pub error_code: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProgressRequest {
@@ -322,6 +328,38 @@ pub struct ChatContextServerConfig {
         ::prost::alloc::string::String,
     >,
 }
+/// 容器状态查询请求
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetContainerStatusRequest {
+    /// 用户ID
+    #[prost(string, tag = "1")]
+    pub user_id: ::prost::alloc::string::String,
+    /// 项目ID
+    #[prost(string, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+}
+/// 容器状态响应
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetContainerStatusResponse {
+    /// 容器是否活跃（有活跃任务）
+    #[prost(bool, tag = "1")]
+    pub is_active: bool,
+    /// 活跃任务数
+    #[prost(int32, tag = "2")]
+    pub active_tasks: i32,
+    /// 容器运行时长（秒）
+    #[prost(int64, tag = "3")]
+    pub uptime_seconds: i64,
+    /// 状态描述：Active, Idle, Processing
+    #[prost(string, tag = "4")]
+    pub status: ::prost::alloc::string::String,
+    /// 可选：CPU 使用率（百分比，0-100）
+    #[prost(double, optional, tag = "5")]
+    pub cpu_percent: ::core::option::Option<f64>,
+    /// 可选：内存使用（MB）
+    #[prost(int64, optional, tag = "6")]
+    pub memory_mb: ::core::option::Option<i64>,
+}
 /// 取消结果类型（对应 Rust CancelResult）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -565,6 +603,32 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("agent.AgentService", "StopAgent"));
             self.inner.unary(req, path, codec).await
         }
+        /// 查询容器状态 (Unary)
+        /// 专门用于容器生命周期管理，返回容器活跃状态和任务信息
+        pub async fn get_container_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetContainerStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetContainerStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentService/GetContainerStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentService", "GetContainerStatus"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -620,6 +684,15 @@ pub mod agent_service_server {
             request: tonic::Request<super::StopAgentRequest>,
         ) -> std::result::Result<
             tonic::Response<super::StopAgentResponse>,
+            tonic::Status,
+        >;
+        /// 查询容器状态 (Unary)
+        /// 专门用于容器生命周期管理，返回容器活跃状态和任务信息
+        async fn get_container_status(
+            &self,
+            request: tonic::Request<super::GetContainerStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetContainerStatusResponse>,
             tonic::Status,
         >;
     }
@@ -910,6 +983,52 @@ pub mod agent_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = StopAgentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentService/GetContainerStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetContainerStatusSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::GetContainerStatusRequest>
+                    for GetContainerStatusSvc<T> {
+                        type Response = super::GetContainerStatusResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetContainerStatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::get_container_status(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetContainerStatusSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

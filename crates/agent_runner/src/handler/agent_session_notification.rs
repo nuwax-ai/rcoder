@@ -366,7 +366,10 @@ pub async fn agent_session_notification(
     let cache_start = std::time::Instant::now();
     let session_data = crate::service::SessionData::new(1000);
     SESSION_CACHE.insert(session_id.clone(), session_data.clone());
-    info!("⏱️ [SSE] 创建并插入新SessionData耗时: {:?}", cache_start.elapsed());
+    info!(
+        "⏱️ [SSE] 创建并插入新SessionData耗时: {:?}",
+        cache_start.elapsed()
+    );
 
     // 创建新连接
     let connection_start = std::time::Instant::now();
@@ -374,7 +377,10 @@ pub async fn agent_session_notification(
         .create_new_connection(1000)
         .await
         .map_err(AppError::from)?;
-    info!("⏱️ [SSE] create_new_connection耗时: {:?}", connection_start.elapsed());
+    info!(
+        "⏱️ [SSE] create_new_connection耗时: {:?}",
+        connection_start.elapsed()
+    );
 
     info!("⏱️ [SSE] 总SSE连接建立耗时: {:?}", sse_start.elapsed());
 
@@ -432,7 +438,16 @@ pub async fn agent_session_notification(
                                         session_id_for_stream,
                                         msg.data.get("reason")
                                     );
-                                    "prompt_end"
+                                    // 发送 prompt_end 事件后主动终止 SSE 连接
+                                    let event: Event = Event::default()
+                                        .event("prompt_end")
+                                        .data(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string()));
+                                    yield Ok(event);
+                                    info!(
+                                        "🔌 SessionPromptEnd 已发送，主动终止 SSE 连接: session_id={}",
+                                        session_id_for_stream
+                                    );
+                                    break;
                                 }
                                 crate::model::SessionMessageType::AgentSessionUpdate => {
                                     debug!(

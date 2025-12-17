@@ -162,11 +162,8 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                 unhealthy_threshold: 3,
             },
         };
+        info!("启用反向代理，监听端口: {}", proxy_config.listen_port);
         config.proxy_config = Some(proxy_config);
-        info!(
-            "启用反向代理，监听端口: {}",
-            config.proxy_config.as_ref().unwrap().listen_port
-        );
     }
 
     // 5. 命令行参数覆盖配置（优先级最高）
@@ -216,6 +213,9 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
 
 /// 创建默认配置文件
 fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
+    // 获取 proxy_config，如果不存在则使用默认值
+    let proxy_config = config.proxy_config.as_ref().cloned().unwrap_or_default();
+
     // 手动构建带注释的 YAML 内容
     let content_with_comments = format!(
         r#"# rcoder 配置文件
@@ -251,15 +251,15 @@ proxy_config:
         config.default_agent_id,
         config.projects_dir.display(),
         config.port,
-        config.proxy_config.as_ref().unwrap().listen_port,
-        config.proxy_config.as_ref().unwrap().default_backend_port,
-        config.proxy_config.as_ref().unwrap().backend_host,
-        config.proxy_config.as_ref().unwrap().port_param,
-        config.proxy_config.as_ref().unwrap().health_check.enabled,
-        config.proxy_config.as_ref().unwrap().health_check.interval_seconds,
-        config.proxy_config.as_ref().unwrap().health_check.timeout_seconds,
-        config.proxy_config.as_ref().unwrap().health_check.healthy_threshold,
-        config.proxy_config.as_ref().unwrap().health_check.unhealthy_threshold
+        proxy_config.listen_port,
+        proxy_config.default_backend_port,
+        proxy_config.backend_host,
+        proxy_config.port_param,
+        proxy_config.health_check.enabled,
+        proxy_config.health_check.interval_seconds,
+        proxy_config.health_check.timeout_seconds,
+        proxy_config.health_check.healthy_threshold,
+        proxy_config.health_check.unhealthy_threshold
     );
 
     fs::write(CONFIG_FILE, content_with_comments)

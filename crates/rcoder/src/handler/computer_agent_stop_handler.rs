@@ -102,12 +102,12 @@ pub async fn computer_agent_stop(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("❌ [COMPUTER_STOP] user_id 不能为空");
-        return Err(AppError::validation_error("user_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
     }
 
     if request.project_id.trim().is_empty() {
         error!("❌ [COMPUTER_STOP] project_id 不能为空");
-        return Err(AppError::validation_error("project_id 不能为空"));
+        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
     }
 
     let user_id = request.user_id.clone();

@@ -13,14 +13,15 @@ use shared_types::grpc::{
     ChatAgentServerConfig as GrpcChatAgentServerConfig,
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, GetStatusRequest, GetStatusResponse,
+    GetContainerStatusRequest, GetContainerStatusResponse,
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent, ProgressRequest,
     agent_service_server::AgentService, attachment, attachment_source,
 };
-use shared_types::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
 use shared_types::{
     Attachment, AttachmentSource, AudioAttachment, DocumentAttachment, ImageAttachment,
     ImageDimensions, TextAttachment,
 };
+use shared_types::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
@@ -177,6 +178,39 @@ impl AgentServiceImpl {
     pub fn new(app_state: Arc<AppState>) -> Self {
         Self { app_state }
     }
+
+    /// 获取活跃任务数
+    ///
+    /// 查询 AGENT_REGISTRY 中状态为 Active 的 Agent 数量
+    fn get_active_tasks_count(&self) -> i32 {
+        let count = AGENT_REGISTRY
+            .iter_agents()
+            .filter(|entry| entry.value().status == AgentStatus::Active)
+            .count();
+
+        count as i32
+    }
+
+    /// 获取容器运行时长（秒）
+    ///
+    /// 从进程启动时间计算到现在的时长
+    fn get_uptime_seconds(&self) -> i64 {
+        use std::time::SystemTime;
+
+        // 使用进程启动时间作为容器启动时间的近似值
+        // 注意：这是一个简化实现，实际的容器启动时间应该更早
+        static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+
+        let start = START_TIME.get_or_init(|| SystemTime::now());
+
+        match SystemTime::now().duration_since(*start) {
+            Ok(duration) => duration.as_secs() as i64,
+            Err(_) => {
+                warn!("⚠️ [GET_CONTAINER_STATUS] 计算运行时长失败，返回 0");
+                0
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -245,6 +279,22 @@ impl AgentService for AgentServiceImpl {
         // 转换新增的配置字段 (v2)
         let agent_config_override = req.agent_config.map(convert_agent_config);
 
+        // 解析 service_type（默认为 RCoder）
+        let service_type = req
+            .service_type
+            .as_ref()
+            .and_then(|st| match st.as_str() {
+                "ComputerAgentRunner" => Some(shared_types::ServiceType::ComputerAgentRunner),
+                "RCoder" => Some(shared_types::ServiceType::RCoder),
+                _ => {
+                    warn!("⚠️ [gRPC] 无效的 service_type: {}, 使用默认 RCoder", st);
+                    None
+                }
+            })
+            .unwrap_or(shared_types::ServiceType::RCoder);
+
+        debug!("🔧 [gRPC] 使用 service_type: {:?}", service_type);
+
         // 构建 ChatPrompt（包含新增的 override 字段）
         let chat_prompt = ChatPromptBuilder::default()
             .project_id(project_id.clone())
@@ -253,7 +303,7 @@ impl AgentService for AgentServiceImpl {
             .prompt(req.prompt)
             .attachments(convert_attachments(req.attachments))
             .data_source_attachments(req.data_source_attachments)
-            .service_type(shared_types::ServiceType::RCoder)
+            .service_type(service_type) // ✅ 使用从请求中解析的 service_type
             .request_id(request_id.clone())
             // 新增字段 (v2)
             .system_prompt_override(req.system_prompt)
@@ -293,6 +343,11 @@ impl AgentService for AgentServiceImpl {
                     session_id: response.session_id,
                     success: response.error.is_none(),
                     error: response.error,
+                    error_code: if response.code != shared_types::error_codes::SUCCESS {
+                        Some(response.code)
+                    } else {
+                        None
+                    },
                     request_id: Some(request_id),
                 };
                 info!("✅ [gRPC] Chat 完成: success={}", grpc_response.success);
@@ -618,7 +673,10 @@ impl AgentService for AgentServiceImpl {
         let req = request.into_inner();
         let project_id = req.project_id.clone();
         let force = req.force;
-        let reason = req.reason.clone().unwrap_or_else(|| "用户请求停止".to_string());
+        let reason = req
+            .reason
+            .clone()
+            .unwrap_or_else(|| "用户请求停止".to_string());
 
         info!(
             "🛑 [gRPC] StopAgent: project_id={}, force={}, reason={}",
@@ -641,10 +699,7 @@ impl AgentService for AgentServiceImpl {
 
         // 如果 Agent 已经在 Terminating 状态，返回 already_stopped
         if agent_info.status == AgentStatus::Terminating {
-            info!(
-                "ℹ️ [gRPC] Agent 已经在停止中: project_id={}",
-                project_id
-            );
+            info!("ℹ️ [gRPC] Agent 已经在停止中: project_id={}", project_id);
             return Ok(Response::new(StopAgentResponse {
                 success: true,
                 result: "already_stopped".to_string(),
@@ -669,10 +724,7 @@ impl AgentService for AgentServiceImpl {
                     session_data.close_current_connection();
                 }
                 if SESSION_CACHE.remove(&session_id).is_some() {
-                    info!(
-                        "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
-                        session_id
-                    );
+                    info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
                 }
             }
 
@@ -745,10 +797,7 @@ impl AgentService for AgentServiceImpl {
                             session_data.close_current_connection();
                         }
                         if SESSION_CACHE.remove(&session_id).is_some() {
-                            info!(
-                                "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
-                                session_id
-                            );
+                            info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
                         }
 
                         // 从 AGENT_REGISTRY 移除
@@ -798,10 +847,7 @@ impl AgentService for AgentServiceImpl {
                     }));
                 }
                 Err(_) => {
-                    warn!(
-                        "⏰ [gRPC] 等待取消响应超时: project_id={}",
-                        project_id
-                    );
+                    warn!("⏰ [gRPC] 等待取消响应超时: project_id={}", project_id);
                     return Ok(Response::new(StopAgentResponse {
                         success: false,
                         result: "error".to_string(),
@@ -813,13 +859,65 @@ impl AgentService for AgentServiceImpl {
         }
 
         // 理论上不会走到这里
-        warn!("⚠️ [gRPC] StopAgent 走到了意外分支: project_id={}", project_id);
+        warn!(
+            "⚠️ [gRPC] StopAgent 走到了意外分支: project_id={}",
+            project_id
+        );
         Ok(Response::new(StopAgentResponse {
             success: false,
             result: "error".to_string(),
             message: Some("意外的代码分支".to_string()),
             project_id,
         }))
+    }
+
+    /// 查询容器状态（用于容器生命周期管理）
+    ///
+    /// 返回容器的活跃状态、活跃任务数、运行时长等信息。
+    /// RCoder 定期调用此接口来判断容器是否应该被保活。
+    #[instrument(skip(self))]
+    async fn get_container_status(
+        &self,
+        request: Request<GetContainerStatusRequest>,
+    ) -> Result<Response<GetContainerStatusResponse>, Status> {
+        let req = request.into_inner();
+
+        info!(
+            "🔍 [GET_CONTAINER_STATUS] 收到容器状态查询: user_id={}, project_id={}",
+            req.user_id, req.project_id
+        );
+
+        // 查询当前活跃任务数
+        let active_tasks = self.get_active_tasks_count();
+
+        // 计算容器运行时长（秒）
+        let uptime_seconds = self.get_uptime_seconds();
+
+        // 判断容器是否活跃：有活跃任务则认为容器活跃
+        let is_active = active_tasks > 0;
+
+        // 状态描述
+        let status = if active_tasks > 0 {
+            "Processing".to_string()
+        } else {
+            "Idle".to_string()
+        };
+
+        let response = GetContainerStatusResponse {
+            is_active,
+            active_tasks,
+            uptime_seconds,
+            status: status.clone(),
+            cpu_percent: None,    // 可选，未来实现
+            memory_mb: None,      // 可选，未来实现
+        };
+
+        debug!(
+            "✅ [GET_CONTAINER_STATUS] 返回容器状态: is_active={}, active_tasks={}, status={}, uptime={}s",
+            response.is_active, response.active_tasks, response.status, response.uptime_seconds
+        );
+
+        Ok(Response::new(response))
     }
 }
 

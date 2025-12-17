@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use chrono::{Utc, DateTime};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -43,7 +43,17 @@ pub async fn proxy_status(
         ));
     }
 
-    let svc = state.pingora_service.as_ref().unwrap();
+    let svc = state.pingora_service.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
+                message: "Pingora 代理服务实例不可用".to_string(),
+                target_port: 0,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        )
+    })?;
     let conf = svc.config().clone();
 
     // 收集后端列表
@@ -81,7 +91,11 @@ pub async fn proxy_status(
         default_backend_host: conf.backend_host.clone(),
         backends,
         load_balancer: LoadBalancerInfo {
-            algorithm: if svc.use_round_robin { "round-robin".to_string() } else { "ketama".to_string() },
+            algorithm: if svc.use_round_robin {
+                "round-robin".to_string()
+            } else {
+                "ketama".to_string()
+            },
             health_check_enabled: true,
             backend_count,
         },
@@ -123,7 +137,17 @@ pub async fn proxy_stats(
         ));
     }
 
-    let svc = state.pingora_service.as_ref().unwrap();
+    let svc = state.pingora_service.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
+                message: "Pingora 代理服务实例不可用".to_string(),
+                target_port: 0,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        )
+    })?;
     let m = &svc.metrics;
 
     let total_requests = m.total_requests.load(Ordering::Relaxed);
@@ -167,7 +191,10 @@ pub async fn proxy_stats(
 
     info!(
         "查询代理统计: 总请求 {}, 成功 {}, 失败 {}, 平均耗时 {:.2}ms",
-        stats.total_requests, stats.successful_requests, stats.failed_requests, stats.avg_response_time_ms
+        stats.total_requests,
+        stats.successful_requests,
+        stats.failed_requests,
+        stats.avg_response_time_ms
     );
 
     Ok(Json(stats))
@@ -200,16 +227,44 @@ pub async fn proxy_config(
         ));
     }
 
-    let svc = state.pingora_service.as_ref().unwrap();
+    let svc = state.pingora_service.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
+                message: "Pingora 代理服务实例不可用".to_string(),
+                target_port: 0,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        )
+    })?;
     let conf = svc.config();
     let app_conf = &state.config;
-    let hc_conf = &app_conf.proxy_config.as_ref().unwrap().health_check;
+    let hc_conf = &app_conf
+        .proxy_config
+        .as_ref()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProxyErrorResponse {
+                    error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
+                    message: "Pingora 代理配置不可用".to_string(),
+                    target_port: 0,
+                    timestamp: Utc::now().to_rfc3339(),
+                }),
+            )
+        })?
+        .health_check;
 
     let config = ProxyConfig {
         listen_port: conf.listen_port,
         default_backend_port: conf.default_backend_port,
         default_backend_host: conf.backend_host.clone(),
-        load_balancing_algorithm: if svc.use_round_robin { "round-robin".to_string() } else { "ketama".to_string() },
+        load_balancing_algorithm: if svc.use_round_robin {
+            "round-robin".to_string()
+        } else {
+            "ketama".to_string()
+        },
         health_check: HealthCheckConfig {
             enabled: hc_conf.enabled,
             interval_seconds: hc_conf.interval_seconds as u32,
@@ -221,7 +276,10 @@ pub async fn proxy_config(
 
     info!(
         "查询代理配置: 监听端口 {}, 默认后端: {}:{}，LB算法: {}",
-        config.listen_port, config.default_backend_host, config.default_backend_port, config.load_balancing_algorithm
+        config.listen_port,
+        config.default_backend_host,
+        config.default_backend_port,
+        config.load_balancing_algorithm
     );
 
     Ok(Json(config))
@@ -259,7 +317,17 @@ pub async fn proxy_to_port(
         ));
     }
 
-    let proxy_config = state.config.proxy_config.as_ref().unwrap();
+    let proxy_config = state.config.proxy_config.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
+                message: "Pingora 代理配置不可用".to_string(),
+                target_port: port,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        )
+    })?;
     let listen_port = proxy_config.listen_port;
 
     // 重定向到 Pingora 真实代理端口
@@ -269,7 +337,17 @@ pub async fn proxy_to_port(
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(axum::http::header::LOCATION, location)
         .body(axum::body::Body::empty())
-        .unwrap();
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProxyErrorResponse {
+                    error: "RESPONSE_BUILD_ERROR".to_string(),
+                    message: format!("构建响应失败: {}", e),
+                    target_port: port,
+                    timestamp: Utc::now().to_rfc3339(),
+                }),
+            )
+        })?;
 
     Ok(resp)
 }
@@ -307,7 +385,17 @@ pub async fn proxy_to_port_with_path(
         ));
     }
 
-    let proxy_config = state.config.proxy_config.as_ref().unwrap();
+    let proxy_config = state.config.proxy_config.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
+                message: "Pingora 代理配置不可用".to_string(),
+                target_port: port,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        )
+    })?;
     let listen_port = proxy_config.listen_port;
 
     let target_path = if path.is_empty() || path == "/" {
@@ -326,7 +414,17 @@ pub async fn proxy_to_port_with_path(
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(axum::http::header::LOCATION, location)
         .body(axum::body::Body::empty())
-        .unwrap();
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProxyErrorResponse {
+                    error: "RESPONSE_BUILD_ERROR".to_string(),
+                    message: format!("构建响应失败: {}", e),
+                    target_port: port,
+                    timestamp: Utc::now().to_rfc3339(),
+                }),
+            )
+        })?;
 
     Ok(resp)
 }
@@ -349,7 +447,17 @@ async fn proxy_request_handler(
         ));
     }
 
-    let proxy_config = state.config.proxy_config.as_ref().unwrap();
+    let proxy_config = state.config.proxy_config.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
+                message: "Pingora 代理配置不可用".to_string(),
+                target_port: port,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        )
+    })?;
     let target_host = &proxy_config.backend_host;
     let target_path = path.unwrap_or_else(|| "/".to_string());
     let target_url = format!("http://{}:{}{}", target_host, port, target_path);

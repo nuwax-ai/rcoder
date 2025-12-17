@@ -77,10 +77,7 @@ pub async fn tracing_middleware_handler(
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    // 尝试从请求头中提取 trace_id，如果没有则生成新的
-    let trace_id = extract_trace_id_from_headers(&headers)
-        .or_else(|| Some(generate_trace_id()))
-        .unwrap();
+    let trace_id = extract_trace_id_from_headers(&headers).unwrap_or_else(generate_trace_id);
 
     // 创建请求 span，包含 trace_id 信息
     let span = info_span!(

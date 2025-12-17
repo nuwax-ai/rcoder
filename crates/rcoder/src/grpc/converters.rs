@@ -32,6 +32,7 @@ pub fn to_grpc_chat_request(
     system_prompt: Option<String>,
     user_prompt: Option<String>,
     agent_config: Option<ChatAgentConfig>,
+    service_type: Option<shared_types::ServiceType>,
 ) -> GrpcChatRequest {
     GrpcChatRequest {
         project_id,
@@ -45,6 +46,7 @@ pub fn to_grpc_chat_request(
         system_prompt,
         user_prompt,
         agent_config: agent_config.map(to_grpc_chat_agent_config),
+        service_type: service_type.map(|st| format!("{:?}", st)),
     }
 }
 
@@ -80,14 +82,12 @@ fn to_grpc_attachment_source(source: AttachmentSource) -> Option<GrpcAttachmentS
 /// 完整实现：根据 Attachment 类型正确填充 gRPC 的 oneof 字段
 pub fn to_grpc_attachment(attachment: Attachment) -> GrpcAttachment {
     let attachment_type = match attachment {
-        Attachment::Text(text) => {
-            attachment::AttachmentType::Text(GrpcTextAttachment {
-                id: text.id,
-                source: to_grpc_attachment_source(text.source),
-                filename: text.filename,
-                description: text.description,
-            })
-        }
+        Attachment::Text(text) => attachment::AttachmentType::Text(GrpcTextAttachment {
+            id: text.id,
+            source: to_grpc_attachment_source(text.source),
+            filename: text.filename,
+            description: text.description,
+        }),
         Attachment::Image(image) => attachment::AttachmentType::Image(GrpcImageAttachment {
             id: image.id,
             source: to_grpc_attachment_source(image.source),

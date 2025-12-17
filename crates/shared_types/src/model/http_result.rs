@@ -56,6 +56,11 @@ impl<T> HttpResult<T> {
     pub fn internal_error(message: &str) -> Self {
         Self::error("5000", message)
     }
+
+    /// 检查操作是否成功
+    pub fn is_success(&self) -> bool {
+        self.success
+    }
 }
 
 impl<T: Serialize> Serialize for HttpResult<T> {

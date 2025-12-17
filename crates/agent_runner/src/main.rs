@@ -102,8 +102,8 @@ async fn main() -> anyhow::Result<()> {
         let mut server_manager = PingoraServerManager::new(pingora_config);
         let pingora_service = server_manager.service();
         // 启动健康检查循环（按配置）
-        if config.proxy_config.as_ref().unwrap().health_check.enabled {
-            let hc = &config.proxy_config.as_ref().unwrap().health_check;
+        if proxy_config.health_check.enabled {
+            let hc = &proxy_config.health_check;
             pingora_service
                 .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
         }
@@ -132,7 +132,9 @@ async fn main() -> anyhow::Result<()> {
 
     // 启动 gRPC 服务器
     let grpc_port = shared_types::GRPC_DEFAULT_PORT;
-    let grpc_addr = format!("[::]:{}", grpc_port).parse().unwrap();
+    let grpc_addr = format!("[::]:{}", grpc_port)
+        .parse()
+        .map_err(|e| anyhow::anyhow!("gRPC 地址解析失败: {}", e))?;
     let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
         grpc::AgentServiceImpl::new(state.clone()),
     );
@@ -151,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
     // 启动 HTTP 服务器
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
         .await
-        .unwrap();
+        .map_err(|e| anyhow::anyhow!("HTTP 服务器绑定端口 {} 失败: {}", config.port, e))?;
 
     info!("Server starting on port {}", config.port);
     info!("API endpoints:");
@@ -164,30 +166,23 @@ async fn main() -> anyhow::Result<()> {
     info!("  agent.AgentService/CancelSession - gRPC cancel");
     info!("  agent.AgentService/GetStatus - gRPC status");
 
-    if config.proxy_config.is_some() {
+    if let Some(proxy_config) = &config.proxy_config {
         info!("🚀 Pingora 反向代理服务已启用");
-        info!(
-            "📡 监听端口: {}",
-            config.proxy_config.as_ref().unwrap().listen_port
-        );
+        info!("📡 监听端口: {}", proxy_config.listen_port);
         info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
         info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
         info!("💡 示例:");
         info!(
             "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
-            config.proxy_config.as_ref().unwrap().listen_port,
-            config.port,
-            config.port
+            proxy_config.listen_port, config.port, config.port
         );
         info!(
             "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
-            config.proxy_config.as_ref().unwrap().listen_port,
-            config.port,
-            config.port
+            proxy_config.listen_port, config.port, config.port
         );
         info!(
             "   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (动态发现)",
-            config.proxy_config.as_ref().unwrap().listen_port
+            proxy_config.listen_port
         );
     }
 
