@@ -40,10 +40,6 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
-    // 创建项目工作目录
-    tokio::fs::create_dir_all(&config.projects_dir).await?;
-    info!("Projects directory: {:?}", config.projects_dir);
-
     // 创建本地任务通道
     let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
 

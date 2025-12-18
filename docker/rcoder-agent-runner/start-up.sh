@@ -40,6 +40,7 @@ if [ -d "$CONTAINER_LOGS_DIR" ] && [ -w "$CONTAINER_LOGS_DIR" ]; then
 else
     echo "⚠️  容器日志目录不可用，使用默认输出"
 fi
+
 function start_vnc_services() {
 	echo "Starting VNC services..."
 
@@ -133,20 +134,10 @@ function start_display_and_desktop() {
 	pkill -9 -f "chromium" || true
 	pkill -9 -f "chrome" || true
 
-	# 2. 设置持久化的 Chromium 数据目录路径（基于 USER_ID）
-	# 优先级：环境变量 > 默认持久化路径 > 回退到临时目录
-	if [ -n "${USER_ID}" ] && [ -d "/app/computer-project-workspace/${USER_ID}" ]; then
-		CHROMIUM_USER_DATA_DIR="/app/computer-project-workspace/${USER_ID}/.chromium-data"
-		echo "✅ 使用持久化 Chromium 数据目录: $CHROMIUM_USER_DATA_DIR (user_id=${USER_ID})"
-	elif [ -d "/app/computer-project-workspace" ]; then
-		# 回退：如果没有 USER_ID，使用共享目录（不推荐，但保证兼容性）
-		CHROMIUM_USER_DATA_DIR="/app/computer-project-workspace/.chromium-data-shared"
-		echo "⚠️  USER_ID 未设置，使用共享 Chromium 数据目录: $CHROMIUM_USER_DATA_DIR"
-	else
-		# 最终回退：使用容器内临时目录
-		CHROMIUM_USER_DATA_DIR="/home/user/chromium-data"
-		echo "⚠️  持久化目录不可用，使用临时 Chromium 数据目录: $CHROMIUM_USER_DATA_DIR"
-	fi
+	# 2. 设置持久化的 Chromium 数据目录路径
+	# 使用用户主目录的标准配置路径（自动持久化）
+	CHROMIUM_USER_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"
+	echo "✅ 使用 Chromium 数据目录: $CHROMIUM_USER_DATA_DIR (自动持久化)"
 
 	# 3. 创建 Chromium 数据目录（如果不存在）
 	mkdir -p "$CHROMIUM_USER_DATA_DIR"
@@ -338,6 +329,53 @@ function start_display_and_desktop() {
 	echo "X11 display and XFCE4 desktop started successfully"
 }
 
+# ============================================================================
+# 🎯 XFCE 壁纸设置（在 XFCE 启动后动态设置）
+# XFCE 会根据显示器动态生成 xfce4-desktop.xml，需要在运行时设置壁纸
+# 其他配置（screensaver, power-manager, panel）已在 /etc/xdg/xfce4 系统目录中
+# ============================================================================
+function apply_xfce_wallpaper() {
+    echo "🎨 Applying XFCE wallpaper..."
+    
+    # 等待 XFCE 桌面完全启动
+    local counter=0
+    while ! su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -l" >/dev/null 2>&1; do
+        sleep 1
+        let counter++
+        if ((counter > 30)); then
+            echo "⚠️  Timeout waiting for XFCE desktop, skipping wallpaper"
+            return 1
+        fi
+    done
+    
+    local WALLPAPER_PATH="/usr/share/backgrounds/xfce/wallpaper.png"
+    if [ ! -f "$WALLPAPER_PATH" ]; then
+        echo "⚠️  Wallpaper not found: $WALLPAPER_PATH"
+        return 1
+    fi
+    
+    echo "  ✓ Setting wallpaper: $WALLPAPER_PATH"
+    
+    # 获取当前的 monitor 配置（XFCE 可能使用不同的名称）
+    local monitors=$(su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image'" | head -5)
+    
+    if [ -n "$monitors" ]; then
+        # 对于每个找到的 monitor 配置设置壁纸
+        echo "$monitors" | while read monitor_path; do
+            su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p '$monitor_path' -s '$WALLPAPER_PATH'" 2>/dev/null || true
+        done
+    else
+        # 直接设置常用的 monitor 路径
+        su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/last-image -n -t string -s '$WALLPAPER_PATH'" 2>/dev/null || true
+        su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/workspace0/last-image -n -t string -s '$WALLPAPER_PATH'" 2>/dev/null || true
+    fi
+    
+    # 设置壁纸样式（5 = 缩放）
+    su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5" 2>/dev/null || true
+    
+    echo "✅ XFCE wallpaper applied successfully"
+}
+
 function check_vnc_health() {
     # 检查VNC服务健康状态
     if [ "$VNC_AUTO_START" = "true" ]; then
@@ -399,6 +437,9 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
     echo "✓ VNC services started successfully!"
     echo "✓ VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
     echo "✓ Direct VNC port: 5900"
+
+    # 应用 XFCE 壁纸
+    apply_xfce_wallpaper
 
     # VNC服务监控循环
     while true; do

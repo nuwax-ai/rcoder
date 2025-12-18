@@ -9,7 +9,8 @@
 //! |------|--------|---------------------|
 //! | 容器标识 | `project_id` | `user_id` |
 //! | 容器命名 | `rcoder-agent-{project_id}` | `computer-agent-runner-{user_id}` |
-//! | 工作目录 | `/app/project_workspace/{project_id}` | `/app/computer-project-workspace/{user_id}` |
+//! | 工作目录 | `/app/project_workspace/{project_id}` | `/home/user` (通过 mounts 配置挂载) |
+//! | 挂载配置 | 硬编码 | config.yml mounts (配置化) |
 //! | Agent 实例 | 1 个 | 多个（按 project_id 区分） |
 
 use crate::AppError;
@@ -87,37 +88,22 @@ impl ComputerContainerManager {
         docker_manager: &std::sync::Arc<docker_manager::DockerManager>,
         resource_limits: Option<ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
-        // 1. 准备用户级工作目录（在容器内创建，通过绑定挂载自动同步到宿主机）
-        let user_workspace = Self::get_user_workspace(user_id).await?;
-        debug!(
-            "🔍 [COMPUTER_CONTAINER] 用户工作区路径: {:?}",
-            user_workspace
-        );
+        // 1. 准备用户级工作目录（仍需在 rcoder 容器内创建）
         // 在容器内创建目录，绑定挂载会自动同步到宿主机
         Self::create_user_workspace(user_id).await?;
 
-        // 2. 解析宿主机路径
-        // rcoder 运行在容器内，需要知道其挂载卷在宿主机上的真实路径
-        let host_path = crate::utils::resolve_container_path_to_host(&user_workspace)
-            .await
-            .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 路径解析失败: {}", e);
-                AppError::internal_server_error(&format!("路径解析失败: {}", e))
-            })?;
-
         info!(
-            "📁 [COMPUTER_CONTAINER] 用户工作区路径映射: 容器内={:?}, 宿主机={:?}",
-            user_workspace, host_path
+            "📁 [COMPUTER_CONTAINER] 用户工作区已准备: /app/computer-project-workspace/{}",
+            user_id
         );
 
-        // 3. 调用 DockerManager 启动容器
-        // 注意: 使用 user_id 作为 project_id 传递给 Docker Manager
-        // 容器命名会自动根据 ServiceType::ComputerAgentRunner 生成为 computer-agent-runner-{user_id}
+        // 2. 调用 DockerManager 启动容器
+        // 注意：不再传递 host_path，挂载由 config.yml 的 mounts 配置管理
         let container_info = docker_manager
             .start_agent_container(
                 Some(user_id), // 用于清理旧容器的标识符
                 Some(user_id), // Computer Agent Runner 的 user_id 参数
-                &host_path.to_string_lossy(),
+                "",            // ✅ 空字符串，表示不使用硬编码挂载，完全依赖 mounts 配置
                 ServiceType::ComputerAgentRunner,
                 resource_limits,
             )

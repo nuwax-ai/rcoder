@@ -10,10 +10,13 @@
 //! 1. 验证 user_id
 //! 2. 生成 project_id（若未提供）
 //! 3. get_or_create_container_for_user(user_id)
-//! 4. 创建/更新项目和会话信息
-//! 5. gRPC Chat RPC → agent_runner (带 project_id)
-//! 6. 更新会话映射
-//! 7. 返回 ChatResponse
+//!    - 挂载配置: config.yml mounts (配置化管理)
+//!    - 宿主机: /computer-project-workspace/{user_id} → 容器: /home/user
+//! 4. 创建项目工作目录: /home/user/{project_id} (通过挂载自动同步)
+//! 5. 创建/更新项目和会话信息
+//! 6. gRPC Chat RPC → agent_runner (带 project_id)
+//! 7. 更新会话映射
+//! 8. 返回 ChatResponse
 //! ```
 
 use axum::{Json, extract::State};
@@ -139,7 +142,10 @@ pub async fn handle_computer_chat(
     // 1. 验证 user_id
     if request.user_id.trim().is_empty() {
         error!("❌ [COMPUTER_CHAT] user_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "user_id 不能为空",
+        ));
     }
 
     let user_id = request.user_id.clone();
@@ -188,7 +194,10 @@ pub async fn handle_computer_chat(
         Ok(info) => info,
         Err(e) => {
             error!("❌ [COMPUTER_CHAT] 获取或创建容器失败: {}", e);
-            return Ok(HttpResult::error(shared_types::error_codes::ERR_CONTAINER_ERROR, &format!("获取或创建容器失败: {}", e)));
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                &format!("获取或创建容器失败: {}", e),
+            ));
         }
     };
 
@@ -203,7 +212,10 @@ pub async fn handle_computer_chat(
         ensure_project_workspace_exists(&user_id, &project_id, &container_info.container_ip).await
     {
         error!("❌ [COMPUTER_CHAT] 创建项目工作目录失败: {}", e);
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_WORKSPACE_ERROR, &format!("创建项目工作目录失败: {}", e)));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_WORKSPACE_ERROR,
+            &format!("创建项目工作目录失败: {}", e),
+        ));
     }
 
     // 6. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
@@ -236,32 +248,78 @@ pub async fn handle_computer_chat(
                 session_id, container_id, user_id, project_id
             );
 
-            // 创建 ProjectAndContainerInfo
-            let mut project_info = shared_types::ProjectAndContainerInfo::new(project_id.clone());
+            // 🔧 ComputerAgentRunner 模式：使用 user_id 作为容器标识（一个用户一个容器）
+            // 检查是否已存在该 user_id 的记录，如果存在则更新 last_activity
+            let map_key = user_id.clone();
 
-            // 更新会话ID
-            project_info.update_session(session_id.clone());
+            // 使用 Entry API 实现原子性更新或插入
+            use dashmap::mapref::entry::Entry;
+            match state.project_and_agent_map.entry(map_key.clone()) {
+                Entry::Occupied(mut occupied) => {
+                    // ✅ 已存在：更新 last_activity 和 session_id（写时复制）
+                    let old_info = occupied.get();
+                    let mut updated_info = (*old_info).as_ref().clone();
 
-            // 更新扩展信息（容器、模型配置等）
-            project_info.update_extended_from_request(
-                Some(container_info.clone()),
-                request.model_provider.clone(),
-                request.request_id.clone(),
-                Some(shared_types::ServiceType::ComputerAgentRunner),
-            );
+                    // 更新活动时间（关键修复点！）
+                    updated_info.update_activity();
+                    updated_info.update_session(session_id.clone());
 
-            let project_info_arc = Arc::new(project_info);
+                    // 更新扩展信息
+                    updated_info.update_extended_from_request(
+                        Some(container_info.clone()),
+                        request.model_provider.clone(),
+                        request.request_id.clone(),
+                        Some(shared_types::ServiceType::ComputerAgentRunner),
+                    );
 
-            // 填充所有三个映射表，确保状态一致性
-            state
-                .session_to_container_id
-                .insert(session_id.clone(), container_id);
-            state
-                .sessions
-                .insert(session_id.clone(), project_info_arc.clone());
-            state
-                .project_and_agent_map
-                .insert(project_id.clone(), project_info_arc);
+                    let updated_arc = Arc::new(updated_info);
+                    occupied.insert(updated_arc.clone());
+
+                    // 更新其他映射表
+                    state
+                        .session_to_container_id
+                        .insert(session_id.clone(), container_id);
+                    state.sessions.insert(session_id.clone(), updated_arc);
+
+                    info!(
+                        "🔄 [COMPUTER_CHAT] 已更新现有容器映射: user_id={}, project_id={}, session_id={} (last_activity 已刷新)",
+                        user_id, project_id, session_id
+                    );
+                }
+                Entry::Vacant(vacant) => {
+                    // 🆕 不存在：创建新的 ProjectAndContainerInfo
+                    let mut project_info =
+                        shared_types::ProjectAndContainerInfo::new(map_key.clone());
+
+                    // 设置 user_id（ComputerAgentRunner 模式）
+                    project_info.set_user_id(Some(user_id.clone()));
+
+                    // 更新会话ID
+                    project_info.update_session(session_id.clone());
+
+                    // 更新扩展信息（容器、模型配置等）
+                    project_info.update_extended_from_request(
+                        Some(container_info.clone()),
+                        request.model_provider.clone(),
+                        request.request_id.clone(),
+                        Some(shared_types::ServiceType::ComputerAgentRunner),
+                    );
+
+                    let project_info_arc = Arc::new(project_info);
+                    vacant.insert(project_info_arc.clone());
+
+                    // 填充其他映射表
+                    state
+                        .session_to_container_id
+                        .insert(session_id.clone(), container_id);
+                    state.sessions.insert(session_id.clone(), project_info_arc);
+
+                    info!(
+                        "🆕 [COMPUTER_CHAT] 已创建新容器映射: user_id={}, project_id={}, session_id={}",
+                        user_id, project_id, session_id
+                    );
+                }
+            }
 
             info!(
                 "✅ [COMPUTER_CHAT] 请求处理完成: user_id={}, project_id={}, session_id={} (所有映射表已更新)",
@@ -299,7 +357,10 @@ async fn forward_computer_request_to_container(
             Ok(addr) => addr,
             Err(e) => {
                 error!("❌ [COMPUTER_FORWARD] 提取 gRPC 地址失败: {}", e);
-                return HttpResult::error(shared_types::error_codes::ERR_GRPC_ADDR_ERROR, &format!("提取 gRPC 地址失败: {}", e));
+                return HttpResult::error(
+                    shared_types::error_codes::ERR_GRPC_ADDR_ERROR,
+                    &format!("提取 gRPC 地址失败: {}", e),
+                );
             }
         };
 
@@ -358,7 +419,10 @@ async fn forward_computer_request_to_container(
                     let error_code = grpc_response
                         .error_code
                         .unwrap_or_else(|| shared_types::error_codes::ERR_AGENT_ERROR.to_string());
-                    error!("❌ [COMPUTER_FORWARD] gRPC 响应错误: code={}, message={}", error_code, error_msg);
+                    error!(
+                        "❌ [COMPUTER_FORWARD] gRPC 响应错误: code={}, message={}",
+                        error_code, error_msg
+                    );
                     return HttpResult::error(&error_code, &error_msg);
                 }
             }
@@ -396,7 +460,10 @@ async fn forward_computer_request_to_container(
             e, request.user_id, project_id
         );
         // Computer Agent Runner 不使用 HTTP 回退
-        HttpResult::error(shared_types::error_codes::ERR_GRPC_ERROR, &format!("容器通信失败: {}", e))
+        HttpResult::error(
+            shared_types::error_codes::ERR_GRPC_ERROR,
+            &format!("容器通信失败: {}", e),
+        )
     } else {
         HttpResult::error(shared_types::error_codes::ERR_UNKNOWN, "未知重试错误")
     }

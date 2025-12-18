@@ -101,32 +101,23 @@ async fn create_container_for_request(
     docker_manager: &std::sync::Arc<DockerManager>,
     request_resource_limits: Option<shared_types::ServiceResourceLimits>,
 ) -> Result<ContainerBasicInfo, AppError> {
-    // 1. 准备工作目录
-    let project_workspace = get_project_workspace(project_id).await?;
+    // 1. 准备工作目录（仍需在 rcoder 容器内创建）
     create_project_workspace(project_id)
         .await
         .map_err(|e| AppError::internal_server_error(&format!("创建工作目录失败: {}", e)))?;
 
-    // 2. 解析宿主机路径
-    // rcoder 运行在容器内，需要知道其挂载卷在宿主机上的真实路径
-    let host_path = crate::utils::resolve_container_path_to_host(&project_workspace)
-        .await
-        .map_err(|e| {
-            error!("❌ [CONTAINER_MGR] 路径解析失败: {}", e);
-            AppError::internal_server_error("自动检测宿主机路径失败")
-        })?;
-
     info!(
-        "📁 [CONTAINER_MGR] 路径映射: 容器内 {:?} -> 宿主机 {:?}",
-        project_workspace, host_path
+        "📁 [CONTAINER_MGR] 项目工作区已准备: /app/project_workspace/{}",
+        project_id
     );
 
-    // 3. 调用 DockerManager 启动容器
+    // 2. 调用 DockerManager 启动容器
+    // 注意：不再传递 host_path，挂载由 config.yml 的 mounts 配置管理
     let container_info = docker_manager
         .start_agent_container(
-            Some(project_id), // 用于清理旧容器的标识符
-            None,             // 标准 RCoder 服务不需要 user_id
-            &host_path.to_string_lossy(),
+            Some(project_id), // 用于清理旧容器和变量替换
+            None,             // RCoder 不需要 user_id
+            "",               // 空字符串，表示不使用硬编码挂载，完全依赖 mounts 配置
             service_type.clone(),
             request_resource_limits,
         )
@@ -135,6 +126,11 @@ async fn create_container_for_request(
             error!("❌ [CONTAINER_MGR] 启动容器失败: {}", e);
             AppError::internal_server_error(&format!("启动容器失败: {}", e))
         })?;
+
+    info!(
+        "🚀 [CONTAINER_MGR] 容器创建成功: project_id={}, container_id={}, ip={}",
+        project_id, container_info.container_id, container_info.container_ip
+    );
 
     Ok(container_info)
 }

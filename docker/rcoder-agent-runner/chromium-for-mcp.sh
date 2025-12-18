@@ -12,8 +12,8 @@ if [ -f /etc/profile.d/chromium-env.sh ]; then
     source /etc/profile.d/chromium-env.sh
 fi
 
-# 使用共享的数据目录（与手动打开的 Chromium 相同）
-CHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/app/computer-project-workspace/.chromium-data-shared}"
+# 使用用户主目录的 Chromium 配置（持久化）
+CHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"
 
 # 以 user 用户身份运行 Chromium
 # 所有参数通过 $@ 传递（来自 chrome-devtools-mcp）

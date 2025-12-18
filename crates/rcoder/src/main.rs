@@ -22,7 +22,7 @@ use config::{CliArgs, load_config_with_args};
 use pingora_proxy::{PingoraServerManager, ProxyConfig};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
-use service::{start_container_status_checker, ContainerStatusCheckerConfig};
+use service::{ContainerStatusCheckerConfig, start_container_status_checker};
 
 // 导入统一的容器停止模块
 use docker_manager::container_stop;
@@ -263,15 +263,17 @@ async fn main() -> anyhow::Result<()> {
     let _cleanup_handle = start_cleanup_task(cleanup_config.clone(), state.clone());
 
     // 启动容器状态检查任务（防止长时间任务的容器被误杀）
+    // 🆕 使用增强的配置，包含失败计数器和智能跳过机制
     let status_checker_config = ContainerStatusCheckerConfig {
         check_interval: Duration::from_secs(30), // 每 30 秒检查一次
         query_timeout: Duration::from_secs(5),   // 查询超时 5 秒
+        failure_threshold: 3,                    // 连续失败 3 次后跳过
+        skip_duration: Duration::from_secs(5 * 60), // 跳过 5 分钟
+        health_reset_interval: Duration::from_secs(30 * 60), // 30 分钟清理一次
     };
-    let _status_checker_handle = start_container_status_checker(
-        status_checker_config,
-        state.clone(),
-    );
-    info!("🔍 容器状态检查任务已启动（间隔: 30 秒）");
+    let _status_checker_handle =
+        start_container_status_checker(status_checker_config, state.clone());
+    info!("🔍 容器状态检查任务已启动（间隔: 30 秒，启用 Docker 主动查询和失败计数器）");
 
     // 创建路由
     let app = router::create_router(state.clone());
