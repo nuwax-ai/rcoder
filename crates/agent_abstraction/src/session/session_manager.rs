@@ -35,7 +35,7 @@ pub struct AcpSessionManager<N: SessionNotifier, C: Client + 'static> {
     _client_marker: std::marker::PhantomData<C>,
 }
 
-impl<N: SessionNotifier, C: Client + 'static> AcpSessionManager<N, C> {
+impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> {
     /// 创建新的会话管理器
     pub fn new(notifier: Arc<N>) -> Self {
         Self {
@@ -199,17 +199,66 @@ impl<N: SessionNotifier, C: Client + 'static> AcpSessionManager<N, C> {
         // 创建启动器
         let launcher = ClaudeCodeLauncher::new(self.notifier.clone());
 
-        // 启动 Agent
-        let connection_info = launcher
+        // 记录是否使用了 resume
+        let has_resume = start_config.resume_session_id.is_some();
+
+        // 第一次尝试：使用原始配置（可能包含 --resume）
+        let result = launcher
             .launch(
                 project_id.clone(),
-                project_path,
-                session_id_hint,
+                project_path.clone(),
+                session_id_hint.clone(),
                 model_provider.clone(),
-                start_config,
+                start_config.clone(),
                 client,
             )
-            .await?;
+            .await;
+
+        // 简单重试机制：如果启动失败且使用了 --resume，去掉 --resume 重试
+        let connection_info = match result {
+            Ok(info) => info,
+            Err(e) => {
+                let error_msg = format!("{:?}", e);
+
+                // 检查是否因为 resume 导致的失败
+                if has_resume
+                    && (error_msg.contains("No conversation found")
+                        || error_msg.contains("session")
+                        || error_msg.contains("exited with code 1"))
+                {
+                    tracing::warn!(
+                        "⚠️ Agent 启动失败（可能因 --resume），重试不使用 --resume: error={}",
+                        error_msg
+                    );
+
+                    // 创建新的 config，不包含 resume_session_id
+                    let retry_config = AgentStartConfig {
+                        system_prompt: start_config.system_prompt,
+                        mcp_servers: start_config.mcp_servers,
+                        extra_meta: start_config.extra_meta,
+                        service_type: start_config.service_type,
+                        resume_session_id: None, // ✅ 去掉 resume
+                    };
+
+                    tracing::info!("🔄 重试启动 Agent（不使用 --resume）");
+
+                    // 重试启动（创建新的 client 实例）
+                    launcher
+                        .launch(
+                            project_id.clone(),
+                            project_path,
+                            session_id_hint,
+                            model_provider.clone(),
+                            retry_config,
+                            C::default(), // 创建新的 client 实例
+                        )
+                        .await?
+                } else {
+                    // 其他错误，直接返回
+                    return Err(e);
+                }
+            }
+        };
 
         info!(
             "✅ Agent 会话创建成功，会话 ID: {}",
@@ -325,7 +374,7 @@ impl<N: SessionNotifier, C: Client + 'static> AcpSessionManager<N, C> {
     }
 }
 
-impl<N: SessionNotifier, C: Client + 'static> std::fmt::Debug for AcpSessionManager<N, C> {
+impl<N: SessionNotifier, C: Client + Default + 'static> std::fmt::Debug for AcpSessionManager<N, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpSessionManager")
             .field("session_count", &self.sessions.len())

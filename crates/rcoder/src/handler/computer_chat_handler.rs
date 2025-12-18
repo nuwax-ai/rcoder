@@ -400,6 +400,7 @@ async fn forward_computer_request_to_container(
             request.user_prompt.clone(),
             request.agent_config.clone(),
             Some(shared_types::ServiceType::ComputerAgentRunner), // ✅ 传递正确的 ServiceType
+            Some(request.user_id.clone()), // ✅ 传递 user_id（ComputerAgentRunner 必需）
         )
         .await
         {

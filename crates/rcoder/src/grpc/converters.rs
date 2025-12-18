@@ -33,6 +33,7 @@ pub fn to_grpc_chat_request(
     user_prompt: Option<String>,
     agent_config: Option<ChatAgentConfig>,
     service_type: Option<shared_types::ServiceType>,
+    user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
 ) -> GrpcChatRequest {
     GrpcChatRequest {
         project_id,
@@ -47,6 +48,7 @@ pub fn to_grpc_chat_request(
         user_prompt,
         agent_config: agent_config.map(to_grpc_chat_agent_config),
         service_type: service_type.map(|st| format!("{:?}", st)),
+        user_id, // 传递 user_id
     }
 }
 

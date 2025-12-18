@@ -461,6 +461,8 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
                                         "load_session 失败或未实现，回退创建新会话[new_session]: {:?}",
                                         e
                                     );
+                                    // 注意：即使 load_session 失败，仍然会创建 new_session
+                                    // resume_session_id 会通过 meta.claudeCode.options.resume 传递
                                     let new_session_request =
                                         NewSessionRequest::new(project_path_for_closure.clone())
                                             .mcp_servers(mcp_servers.clone())

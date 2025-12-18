@@ -115,11 +115,69 @@ impl<
             .with_mcp_servers(mcp_servers)
             .with_service_type(request.prompt_message.service_type.clone());
 
-        // 如果提供了 session_id，则设置会话恢复配置
-        // 这将通过 ACP 协议的 _meta.claudeCode.options.resume 传递给 Agent
+        // TODO: 改进会话恢复策略
+        //
+        // 当前实现问题：
+        // - 仅依赖内存中的 session_manager 判断会话是否存在
+        // - 但 Claude Code 的会话是持久化到磁盘的（在 .claude/conversations/ 目录）
+        // - 服务重启后，内存中会话信息丢失，但磁盘上的会话文件仍然存在
+        // - 导致无法恢复磁盘上已有的对话历史
+        //
+        // 更好的设计（重试机制）：
+        // 1. 如果提供了 session_id，先尝试使用 --resume 启动
+        // 2. 如果 Claude Code 报错 "No conversation found"（会话不存在）
+        // 3. 捕获错误，重试启动，这次不使用 --resume
+        // 4. 这样既能恢复磁盘上的会话，又能避免首次创建时的崩溃
+        //
+        // 实现要点：
+        // - 需要在 launcher 层捕获进程启动错误
+        // - 解析 stderr 判断是否是 "No conversation found" 错误
+        // - 实现重试逻辑（最多重试一次）
+        // - 考虑性能影响（增加一次启动尝试）
+        //
+        // 优势：
+        // - ✅ 服务重启后能恢复磁盘上的会话
+        // - ✅ 不依赖内存状态，更健壮
+        // - ✅ 自动降级（有会话就恢复，没有就创建）
+        // - ✅ 用户体验更好（无需手动管理会话状态）
+
+        // TODO: 改进会话恢复策略
+        //
+        // 当前实现（保守策略）：
+        // - 仅当内存中存在会话且 session_id 匹配时，才使用 --resume
+        // - 避免用户传入不存在的 session_id 导致 agent 恢复失败
+        //
+        // 后续优化（重试机制）：
+        // - 先尝试使用 --resume 启动
+        // - 如果 Claude Code 报错（会话不存在等），自动去掉 --resume 重试
+        // - 这样可以自动恢复磁盘上的持久化会话（服务重启后）
+        //
+        // 当前暂不实现重试机制的原因：
+        // - 错误发生在 new_session 成功之后（发送 prompt 时子进程才启动）
+        // - launcher.launch() 已经返回成功，无法在 session_manager 层捕获错误
+        // - 需要更复杂的架构改动来支持
         if let Some(ref session_id) = request.prompt_message.session_id {
-            debug!("🔄 设置会话恢复配置: session_id={}", session_id);
-            start_config = start_config.with_resume_session_id(session_id.clone());
+            // 检查内存中是否存在这个 project 的会话，且 session_id 匹配
+            if let Some(existing_session) = self.session_manager.get_session(&project_id) {
+                let existing_session_id: &str = &existing_session.session_id.0;
+                if existing_session_id == session_id {
+                    debug!(
+                        "✅ 会话存在且 session_id 匹配，使用 --resume: session_id={}",
+                        session_id
+                    );
+                    start_config = start_config.with_resume_session_id(session_id.clone());
+                } else {
+                    debug!(
+                        "⚠️ 会话存在但 session_id 不匹配（请求: {}, 已存在: {}），将创建新会话",
+                        session_id, existing_session_id
+                    );
+                }
+            } else {
+                debug!(
+                    "ℹ️ 会话不存在（内存），将创建新会话（不使用 --resume）: 请求的 session_id={}",
+                    session_id
+                );
+            }
         }
 
         // 4. 创建 Client 实例
