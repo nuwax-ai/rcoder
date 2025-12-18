@@ -80,23 +80,34 @@ fn generate_request_id() -> String {
 
 /// 获取 project_id 的 workspace_path
 async fn get_project_workspace(project_id: &str) -> Result<PathBuf> {
-    let workspace_dir = PathBuf::from("./project_workspace");
+    // RCoder 容器的项目工作目录固定在 /app/project_workspace
+    // 对应 docker/config.yml 中的 projects_dir 配置
+    let workspace_base = "/app/project_workspace";
+
+    let workspace_dir = PathBuf::from(workspace_base);
     let project_dir = workspace_dir.join(project_id);
     Ok(project_dir)
 }
 
 /// 创建项目工作目录
 async fn create_project_workspace(project_id: &str) -> Result<PathBuf> {
-    let workspace_dir = PathBuf::from("./project_workspace");
+    // RCoder 容器的项目工作目录固定在 /app/project_workspace
+    // 对应 docker/config.yml 中的 projects_dir 配置
+    let workspace_base = "/app/project_workspace";
 
-    // 创建 project_workspace 目录（如果不存在）
+    let workspace_dir = PathBuf::from(workspace_base);
+
+    // 创建基础目录（如果不存在）
     tokio::fs::create_dir_all(&workspace_dir).await?;
 
     // 创建项目目录
     let project_dir = workspace_dir.join(project_id);
     tokio::fs::create_dir_all(&project_dir).await?;
 
-    info!("📁 创建项目工作目录: {:?}", project_dir);
+    info!(
+        "📁 创建项目工作目录: {:?} (base: {})",
+        project_dir, workspace_base
+    );
     Ok(project_dir)
 }
 

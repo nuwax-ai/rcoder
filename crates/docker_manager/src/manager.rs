@@ -108,13 +108,25 @@ impl DockerManager {
         self.ensure_image_exists(&config.image).await?;
 
         // 创建挂载点
-        let mut mounts = vec![Mount {
-            target: Some(config.container_path.clone()),
-            source: Some(config.host_path.clone()),
-            typ: Some(bollard::models::MountTypeEnum::BIND),
-            read_only: Some(false),
-            ..Default::default()
-        }];
+        let mut mounts = Vec::new();
+
+        // 只在 host_path 非空时添加主挂载点
+        // 如果为空，表示完全依赖 extra_mounts（例如 ComputerAgentRunner）
+        if !config.host_path.is_empty() {
+            mounts.push(Mount {
+                target: Some(config.container_path.clone()),
+                source: Some(config.host_path.clone()),
+                typ: Some(bollard::models::MountTypeEnum::BIND),
+                read_only: Some(false),
+                ..Default::default()
+            });
+            debug!(
+                "📌 [DOCKER_MGR] 添加主挂载: {} -> {}",
+                config.host_path, config.container_path
+            );
+        } else {
+            debug!("📌 [DOCKER_MGR] 跳过主挂载，使用 extra_mounts 配置");
+        }
 
         // 添加额外的挂载点
         for extra_mount in &config.extra_mounts {
@@ -569,11 +581,24 @@ impl DockerManager {
         let mut builder = ContainerConfigBuilder::new(container_id)
             .image(image)
             .name_prefix(service_type.container_prefix())
-            .host_path(host_workspace_path.to_string())
-            .container_path(container_work_path)
             .work_dir(service_config.work_dir.clone())
             .network_mode(service_config.network_mode.clone())
             .auto_remove(true);
+
+        // 只在 host_workspace_path 非空时添加主挂载点
+        // 如果为空，表示完全依赖 mounts 配置（例如 ComputerAgentRunner）
+        if !host_workspace_path.is_empty() {
+            builder = builder
+                .host_path(host_workspace_path.to_string())
+                .container_path(container_work_path.clone());
+
+            debug!(
+                "📌 [DOCKER_MANAGER] 主挂载: {} -> {}",
+                host_workspace_path, container_work_path
+            );
+        } else {
+            debug!("📌 [DOCKER_MANAGER] 跳过主挂载，使用 mounts 配置管理所有挂载点");
+        }
 
         // 应用资源限制
         let limits = service_config.resource_limits;

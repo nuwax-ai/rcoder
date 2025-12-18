@@ -60,7 +60,7 @@ docker_config:
           RUST_LOG: "debug"
           SERVICE_MODE: "full"
           API_PORT: "8086"
-
+          PROJECT_WORKSPACE_BASE: "/app/project_workspace"
         command:
           - "/app/bin/agent_runner"
           - "--port"
@@ -74,8 +74,14 @@ docker_config:
         work_dir: "/app"
         network_mode: "bridge"
 
-        # mounts 是必需字段，设为空数组表示无额外挂载
-        mounts: []
+        # 🎯 主挂载：项目工作目录
+        # 宿主机: /project_workspace/{project_id} → 容器: /app/project_workspace/{project_id}
+        mounts:
+          - container_path: "/app/project_workspace/{project_id}"
+            host_path: "{resolved_path}/{project_id}"
+            read_only: false
+            mount_type: "bind"
+            resolve_from: "/app/project_workspace"
 
       # ComputerAgentRunner 服务配置
       computer-agent-runner:
@@ -92,6 +98,7 @@ docker_config:
           RUST_LOG: "debug"
           SERVICE_MODE: "agent-only"
           AGENT_PORT: "8086"
+          PROJECT_WORKSPACE_BASE: "/home/user"
 
         command:
           - "/app/bin/agent_runner"
@@ -107,6 +114,13 @@ docker_config:
         network_mode: "bridge"
 
         mounts:
+          # 🎯 主挂载：用户主目录（持久化 VNC 桌面数据）
+          # 宿主机: /computer-project-workspace/{user_id} → 容器: /home/user
+          - container_path: "/home/user"
+            host_path: "{resolved_path}/{user_id}"
+            read_only: false
+            mount_type: "bind"
+            resolve_from: "/app/computer-project-workspace"
           # 动态挂载：日志目录 (使用变量替换)
           # resolve_from: 指定从哪个容器内路径解析宿主机基础路径
           # {resolved_path}: 解析后的宿主机基础路径
