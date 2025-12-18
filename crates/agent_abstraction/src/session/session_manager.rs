@@ -16,9 +16,9 @@ use shared_types::{AgentLifecycle, AgentStatus, ModelProviderConfig};
 use tracing::{debug, error, info};
 
 use super::SessionInfo;
+use crate::PromptMessage;
 use crate::compat::ClaudeCodeLauncher;
 use crate::traits::{AgentStartConfig, SessionNotifier};
-use crate::PromptMessage;
 
 /// ACP 会话管理器
 ///
@@ -114,10 +114,12 @@ impl<N: SessionNotifier, C: Client + 'static> AcpSessionManager<N, C> {
     ) -> Result<PromptRequest> {
         // 构建纯用户提示词
         let final_prompt = if prompt.data_source_attachments.is_empty() {
-            PromptBuilder::new().build_user_prompt(&prompt.content)
+            PromptBuilder::build_user_prompt(&prompt.content)
         } else {
-            PromptBuilder::new()
-                .build_user_prompt_with_data_sources(&prompt.content, &prompt.data_source_attachments)
+            PromptBuilder::build_user_prompt_with_data_sources(
+                &prompt.content,
+                &prompt.data_source_attachments,
+            )
         };
 
         // 创建文本内容块
@@ -151,10 +153,12 @@ impl<N: SessionNotifier, C: Client + 'static> AcpSessionManager<N, C> {
     ) -> Result<PromptRequest> {
         // 构建纯用户提示词
         let final_prompt = if prompt.data_source_attachments.is_empty() {
-            PromptBuilder::new().build_user_prompt(&prompt.content)
+            PromptBuilder::build_user_prompt(&prompt.content)
         } else {
-            PromptBuilder::new()
-                .build_user_prompt_with_data_sources(&prompt.content, &prompt.data_source_attachments)
+            PromptBuilder::build_user_prompt_with_data_sources(
+                &prompt.content,
+                &prompt.data_source_attachments,
+            )
         };
 
         // 创建文本内容块
@@ -213,7 +217,8 @@ impl<N: SessionNotifier, C: Client + 'static> AcpSessionManager<N, C> {
         );
 
         // 创建 SessionInfo
-        let lifecycle_handle = Some(connection_info.lifecycle_guard.clone() as Arc<dyn AgentLifecycle>);
+        let lifecycle_handle =
+            Some(connection_info.lifecycle_guard.clone() as Arc<dyn AgentLifecycle>);
         let session_info = Arc::new(SessionInfo::new(
             project_id.clone(),
             connection_info.session_id,
@@ -284,17 +289,12 @@ impl<N: SessionNotifier, C: Client + 'static> AcpSessionManager<N, C> {
     }
 
     /// 发送 Prompt 到指定会话（仅文本）
-    pub fn send_text_prompt(
-        &self,
-        project_id: &str,
-        prompt: &PromptMessage,
-    ) -> Result<()> {
+    pub fn send_text_prompt(&self, project_id: &str, prompt: &PromptMessage) -> Result<()> {
         let session = self
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
-        let prompt_request =
-            Self::build_text_prompt_request(prompt, session.session_id.clone())?;
+        let prompt_request = Self::build_text_prompt_request(prompt, session.session_id.clone())?;
 
         session.prompt_tx.send(prompt_request).map_err(|e| {
             error!("发送 Prompt 请求失败: {:?}", e);

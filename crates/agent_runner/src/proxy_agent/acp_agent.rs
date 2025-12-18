@@ -16,7 +16,7 @@ use tracing::{debug, error, info};
 use crate::{
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
-    service::{StateAwareNotifier, AGENT_REGISTRY},
+    service::{AGENT_REGISTRY, StateAwareNotifier},
     utils::ContentBuilder,
 };
 
@@ -192,52 +192,4 @@ pub async fn agent_worker(
 
     info!("🛑 agent_worker 停止");
     Ok(())
-}
-
-/// 构建 Prompt 请求
-///
-/// 使用 ACP 协议分离模式：
-/// - 系统提示词已在 NewSessionRequest._meta.systemPrompt 中传递
-/// - 这里只构建纯用户提示词和附件
-pub async fn build_prompt_to_acp_agent(
-    prompt: agent_abstraction::PromptMessage,
-    session_id: SessionId,
-) -> Result<PromptRequest> {
-    use agent_client_protocol::{ContentBlock, TextContent};
-    use agent_config::PromptBuilder;
-
-    // 构建纯用户提示词
-    let final_prompt = if prompt.data_source_attachments.is_empty() {
-        PromptBuilder::new().build_user_prompt(&prompt.content)
-    } else {
-        PromptBuilder::new()
-            .build_user_prompt_with_data_sources(&prompt.content, &prompt.data_source_attachments)
-    };
-
-    // 创建文本内容块
-    let text_block = ContentBlock::Text(TextContent::new(final_prompt));
-    let mut content_blocks = vec![text_block];
-
-    // 如果有附件，转换为内容块
-    if !prompt.attachments.is_empty() {
-        let attachment_blocks = ContentBuilder::attachments_to_content_blocks(
-            &prompt.attachments,
-            &prompt.project_path,
-        )
-        .await?;
-        content_blocks.extend(attachment_blocks);
-    }
-
-    // 将 request_id 放入 meta 字段
-    debug!(
-        "🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta",
-        prompt.request_id
-    );
-    let mut meta = serde_json::Map::new();
-    meta.insert(
-        "request_id".to_string(),
-        serde_json::Value::String(prompt.request_id),
-    );
-
-    Ok(PromptRequest::new(session_id, content_blocks).meta(meta))
 }
