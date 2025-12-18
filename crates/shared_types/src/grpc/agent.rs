@@ -34,6 +34,9 @@ pub struct ChatRequest {
     /// 服务类型（可选，"RCoder" 或 "ComputerAgentRunner"，默认 "RCoder"）
     #[prost(string, optional, tag = "11")]
     pub service_type: ::core::option::Option<::prost::alloc::string::String>,
+    /// 用户ID（可选，ComputerAgentRunner 模式必填）
+    #[prost(string, optional, tag = "12")]
+    pub user_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {

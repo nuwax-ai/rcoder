@@ -69,11 +69,18 @@ impl AgentLauncher for SubprocessLauncher {
         &self,
         info: crate::traits::agent::ProcessLaunchInfo,
     ) -> Result<LaunchedProcess, Box<dyn std::error::Error + Send + Sync>> {
-        info!(
-            "启动 Agent 进程: {} {:?}, 工作目录: {}",
+        // 构建完整的命令字符串用于日志输出
+        let cmd_string = format!(
+            "{} {}",
             info.command,
-            info.args,
-            info.working_dir.display()
+            info.args.join(" ")
+        );
+
+        info!(
+            "🚀 [AGENT_LAUNCH] 启动 Agent 进程\n  命令: {}\n  工作目录: {}\n  环境变量: {:?}",
+            cmd_string,
+            info.working_dir.display(),
+            info.env
         );
 
         // Build command
@@ -92,7 +99,7 @@ impl AgentLauncher for SubprocessLauncher {
             .map_err(|e| format!("无法启动 Agent 进程 '{}': {}", info.command, e))?;
 
         let pid = child.id().unwrap_or(0);
-        info!("Agent 进程已启动, PID: {}", pid);
+        info!("✅ [AGENT_LAUNCH] Agent 进程已启动, PID: {}, 命令: {}", pid, cmd_string);
 
         // Take stdio handles
         let stdin = child

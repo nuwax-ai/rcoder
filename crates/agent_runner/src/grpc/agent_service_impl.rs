@@ -12,10 +12,10 @@ use shared_types::grpc::{
     CancelRequest, CancelResponse, CancelResultType, ChatAgentConfig as GrpcChatAgentConfig,
     ChatAgentServerConfig as GrpcChatAgentServerConfig,
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
-    ChatResponse as GrpcChatResponse, GetStatusRequest, GetStatusResponse,
-    GetContainerStatusRequest, GetContainerStatusResponse,
-    ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent, ProgressRequest,
-    agent_service_server::AgentService, attachment, attachment_source,
+    ChatResponse as GrpcChatResponse, GetContainerStatusRequest, GetContainerStatusResponse,
+    GetStatusRequest, GetStatusResponse, ModelProviderConfig as GrpcModelProviderConfig,
+    ProgressEvent, ProgressRequest, agent_service_server::AgentService, attachment,
+    attachment_source,
 };
 use shared_types::{
     Attachment, AttachmentSource, AudioAttachment, DocumentAttachment, ImageAttachment,
@@ -261,24 +261,6 @@ impl AgentService for AgentServiceImpl {
             }
         }
 
-        // 获取或创建项目工作目录
-        let workspace_dir = std::path::PathBuf::from("./project_workspace");
-        let project_dir = workspace_dir.join(&project_id);
-        if !project_dir.exists() {
-            tokio::fs::create_dir_all(&project_dir)
-                .await
-                .map_err(|e| Status::internal(format!("创建项目目录失败: {}", e)))?;
-        }
-
-        // 生成 request_id
-        let request_id = req
-            .request_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace("-", ""));
-
-        // 转换新增的配置字段 (v2)
-        let agent_config_override = req.agent_config.map(convert_agent_config);
-
         // 解析 service_type（默认为 RCoder）
         let service_type = req
             .service_type
@@ -294,6 +276,47 @@ impl AgentService for AgentServiceImpl {
             .unwrap_or(shared_types::ServiceType::RCoder);
 
         debug!("🔧 [gRPC] 使用 service_type: {:?}", service_type);
+
+        // 获取或创建项目工作目录（根据 service_type 使用不同路径）
+        let project_dir = match service_type {
+            shared_types::ServiceType::ComputerAgentRunner => {
+                // ComputerAgentRunner 模式：/home/user/{project_id}
+                // 注意：/home/user 是宿主机 computer-project-workspace/{user_id} 的挂载点
+                let workspace_path = std::path::PathBuf::from("/home/user").join(&project_id);
+
+                info!(
+                    "📁 [gRPC] ComputerAgentRunner 工作目录: {:?}",
+                    workspace_path
+                );
+
+                workspace_path
+            }
+            shared_types::ServiceType::RCoder => {
+                // RCoder 模式：./project_workspace/{project_id}
+                let workspace_path =
+                    std::path::PathBuf::from("./project_workspace").join(&project_id);
+
+                info!("📁 [gRPC] RCoder 工作目录: {:?}", workspace_path);
+
+                workspace_path
+            }
+        };
+
+        // 确保目录存在
+        if !project_dir.exists() {
+            tokio::fs::create_dir_all(&project_dir)
+                .await
+                .map_err(|e| Status::internal(format!("创建项目目录失败: {}", e)))?;
+        }
+
+        // 生成 request_id
+        let request_id = req
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace("-", ""));
+
+        // 转换新增的配置字段 (v2)
+        let agent_config_override = req.agent_config.map(convert_agent_config);
 
         // 构建 ChatPrompt（包含新增的 override 字段）
         let chat_prompt = ChatPromptBuilder::default()
@@ -908,8 +931,8 @@ impl AgentService for AgentServiceImpl {
             active_tasks,
             uptime_seconds,
             status: status.clone(),
-            cpu_percent: None,    // 可选，未来实现
-            memory_mb: None,      // 可选，未来实现
+            cpu_percent: None, // 可选，未来实现
+            memory_mb: None,   // 可选，未来实现
         };
 
         debug!(

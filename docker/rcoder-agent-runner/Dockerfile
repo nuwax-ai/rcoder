@@ -272,6 +272,19 @@ RUN mkdir -p /home/user/Desktop /usr/share/applications && \
     ln -sf /usr/share/applications/chromium-browser.desktop /home/user/Desktop/chromium.desktop && \
     chown -R user:user /home/user/Desktop
 
+# ========== 创建骨架目录 /etc/skel-user-desktop ==========
+# 将 /home/user 下的关键配置备份到此目录
+# 启动时，如果检测到 /home/user 是空的（被挂载覆盖），则从这里恢复
+# 这样可以解决：
+#   1. 挂载空目录到 /home/user 导致桌面图标消失
+#   2. 挂载空目录到 /home/user 导致 VNC 花屏（缺少关键缓存目录）
+RUN mkdir -p /etc/skel-user-desktop && \
+    # 复制整个 /home/user 目录结构到骨架目录
+    cp -a /home/user/. /etc/skel-user-desktop/ && \
+    # 确保骨架目录只读（防止意外修改）
+    chmod 755 /etc/skel-user-desktop && \
+    echo "✅ Skeleton directory created at /etc/skel-user-desktop"
+
 # Copy firefox policies
 COPY firefox-policies.json /usr/lib/firefox-esr/distribution/policies.json
 COPY firefox-autoconfig.js /usr/lib/firefox-esr/defaults/pref/autoconfig.js

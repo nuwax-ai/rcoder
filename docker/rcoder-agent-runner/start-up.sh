@@ -41,6 +41,86 @@ else
     echo "⚠️  容器日志目录不可用，使用默认输出"
 fi
 
+# ============================================================================
+# 🎯 用户主目录初始化（解决挂载空目录导致的花屏和图标消失问题）
+# 当宿主机目录挂载到 /home/user 时，镜像中预置的配置会被覆盖
+# 此函数从骨架目录 /etc/skel-user-desktop 恢复必要的配置文件
+# ============================================================================
+function initialize_user_home() {
+    echo "🏠 Initializing user home directory..."
+    
+    local SKEL_DIR="/etc/skel-user-desktop"
+    local USER_HOME="/home/user"
+    
+    # 检查骨架目录是否存在
+    if [ ! -d "$SKEL_DIR" ]; then
+        echo "⚠️  Skeleton directory not found: $SKEL_DIR"
+        return 1
+    fi
+    
+    # 检查 /home/user 是否被外部挂载覆盖（通过检查关键目录是否存在）
+    local need_restore=false
+    
+    # 检查关键目录/文件是否存在
+    if [ ! -d "$USER_HOME/Desktop" ] || [ ! -f "$USER_HOME/.bashrc" ]; then
+        need_restore=true
+        echo "📁 Detected empty or incomplete user home directory (likely mounted)"
+    fi
+    
+    if [ "$need_restore" = true ]; then
+        echo "📦 Restoring user configuration from skeleton directory..."
+        
+        # 创建必要的目录结构
+        mkdir -p "$USER_HOME/.config" "$USER_HOME/.local/share" "$USER_HOME/.cache"
+        mkdir -p "$USER_HOME/Desktop"
+        
+        # 从骨架目录复制配置（使用 cp -n 不覆盖已存在的文件，保留用户数据）
+        # Desktop 目录 - 恢复桌面图标
+        if [ -d "$SKEL_DIR/Desktop" ]; then
+            cp -an "$SKEL_DIR/Desktop/." "$USER_HOME/Desktop/" 2>/dev/null || true
+            echo "  ✓ Desktop icons restored"
+        fi
+        
+        # .bashrc - 恢复别名配置
+        if [ ! -f "$USER_HOME/.bashrc" ] && [ -f "$SKEL_DIR/.bashrc" ]; then
+            cp -a "$SKEL_DIR/.bashrc" "$USER_HOME/.bashrc"
+            echo "  ✓ .bashrc restored"
+        fi
+        
+        # .config 目录 - 恢复应用配置（Chromium 等）
+        if [ -d "$SKEL_DIR/.config" ]; then
+            cp -an "$SKEL_DIR/.config/." "$USER_HOME/.config/" 2>/dev/null || true
+            echo "  ✓ .config directory restored"
+        fi
+        
+        # .local 目录 - 恢复本地数据（keyrings 等）
+        if [ -d "$SKEL_DIR/.local" ]; then
+            cp -an "$SKEL_DIR/.local/." "$USER_HOME/.local/" 2>/dev/null || true
+            echo "  ✓ .local directory restored"
+        fi
+        
+        # 设置正确的权限
+        chown -R user:user "$USER_HOME"
+        chmod 755 "$USER_HOME"
+        
+        echo "✅ User home directory initialized from skeleton"
+    else
+        echo "✅ User home directory already initialized"
+    fi
+    
+    # ========== 设置渲染相关环境变量（防止花屏）==========
+    # 将 Mesa 着色器缓存移到 /tmp（不受 /home/user 挂载影响）
+    export MESA_SHADER_CACHE_DIR="/tmp/mesa_shader_cache"
+    export MESA_GLSL_CACHE_DIR="/tmp/mesa_shader_cache"
+    mkdir -p /tmp/mesa_shader_cache
+    chmod 777 /tmp/mesa_shader_cache
+    
+    # 将 X 认证文件移到 /tmp
+    export XAUTHORITY="/tmp/.Xauthority"
+    
+    echo "✅ Mesa shader cache configured: /tmp/mesa_shader_cache"
+}
+
 function start_vnc_services() {
 	echo "Starting VNC services..."
 
@@ -224,8 +304,9 @@ function start_display_and_desktop() {
 	/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
 	sleep 2
 
-	# 以user用户启动Xvfb
-	su - user -c "Xvfb :0 -ac -screen 0 1280x800x16 -retro -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1" &
+	# 以user用户启动Xvfb（设置 XAUTHORITY 和 Mesa 缓存环境变量）
+	# 色深使用 24 位，避免某些 Linux 内核上出现花屏
+	su - user -c "XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1280x800x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1" &
 
 	# 等待Xvfb启动
 	counter=0
@@ -403,6 +484,10 @@ echo "Starting Code Interpreter server..."
 
 # 设置VNC自动启动标志
 export VNC_AUTO_START=true
+
+# ========== 关键：在启动 X11 之前初始化用户主目录 ==========
+# 从骨架目录恢复配置（解决挂载空目录导致的花屏和图标消失）
+initialize_user_home
 
 # 首先启动显示服务和桌面环境
 start_display_and_desktop &
