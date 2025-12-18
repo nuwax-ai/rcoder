@@ -4,41 +4,20 @@
 //! 默认系统提示词在编译时从外部文件嵌入，支持运行时通过配置覆盖。
 
 /// 编译时嵌入的默认系统提示词
-pub const DEFAULT_SYSTEM_PROMPT: &str =
-    include_str!("../../configs/prompts/frontend_expert.txt");
+pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../configs/prompts/frontend_expert.txt");
 
 /// 提示词构建器（为了兼容性保留，推荐直接使用 SystemPromptConfig::get_prompt()）
 #[derive(Debug, Clone)]
-#[deprecated(
-    since = "0.2.0",
-    note = "Use SystemPromptConfig::get_prompt() from prompt_config module instead"
-)]
-pub struct PromptBuilder {
-    system_prompt: String,
-}
+pub struct PromptBuilder;
 
-#[allow(deprecated)]
 impl PromptBuilder {
-    /// 创建新的构建器
-    pub fn new() -> Self {
-        Self {
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-        }
-    }
-
-    /// 获取系统提示词
-    pub fn get_system_prompt(&self) -> String {
-        self.system_prompt.clone()
-    }
-
     /// 构建用户提示词（不包含系统提示词）
-    pub fn build_user_prompt(&self, user_prompt: &str) -> String {
+    pub fn build_user_prompt(user_prompt: &str) -> String {
         user_prompt.to_string()
     }
 
     /// 构建带数据源的用户提示词
     pub fn build_user_prompt_with_data_sources(
-        &self,
         user_prompt: &str,
         data_sources: &[String],
     ) -> String {
@@ -58,13 +37,6 @@ impl PromptBuilder {
             </DATA_SOURCES>",
             user_prompt, data_sources_section
         )
-    }
-}
-
-#[allow(deprecated)]
-impl Default for PromptBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -115,16 +87,6 @@ mod tests {
         assert!(!DEFAULT_SYSTEM_PROMPT.is_empty());
         assert!(DEFAULT_SYSTEM_PROMPT.contains("<SYSTEM_INSTRUCTIONS>"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("</SYSTEM_INSTRUCTIONS>"));
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn test_prompt_builder_compatibility() {
-        let builder = PromptBuilder::new();
-        let system_prompt = builder.get_system_prompt();
-
-        assert!(system_prompt.contains("<SYSTEM_INSTRUCTIONS>"));
-        assert!(system_prompt.contains("<ROLE_DEFINITION>"));
     }
 
     #[test]
