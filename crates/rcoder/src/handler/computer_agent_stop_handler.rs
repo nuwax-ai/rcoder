@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 use utoipa::ToSchema;
 
-use crate::{router::AppState, AppError, HttpResult};
+use crate::{AppError, HttpResult, router::AppState};
 
 /// Computer Agent 停止请求
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -102,12 +102,18 @@ pub async fn computer_agent_stop(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("❌ [COMPUTER_STOP] user_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "user_id 不能为空",
+        ));
     }
 
     if request.project_id.trim().is_empty() {
         error!("❌ [COMPUTER_STOP] project_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "project_id 不能为空",
+        ));
     }
 
     let user_id = request.user_id.clone();
@@ -125,10 +131,7 @@ pub async fn computer_agent_stop(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!(
-                "⚠️ [COMPUTER_STOP] 找不到用户容器: user_id={}",
-                user_id
-            );
+            warn!("⚠️ [COMPUTER_STOP] 找不到用户容器: user_id={}", user_id);
             return Ok(HttpResult::error(
                 "NOT_FOUND",
                 &format!("找不到用户 {} 的容器", user_id),
@@ -144,10 +147,7 @@ pub async fn computer_agent_stop(
     // 3. 通过 gRPC 调用 StopAgent RPC（如果实现了）
     // 目前先通过 CancelSession 来停止 Agent
     if let Some(session_id) = &request.session_id {
-        info!(
-            "🔄 [COMPUTER_STOP] 尝试取消会话: session_id={}",
-            session_id
-        );
+        info!("🔄 [COMPUTER_STOP] 尝试取消会话: session_id={}", session_id);
 
         // 提取 gRPC 地址
         let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
@@ -158,16 +158,13 @@ pub async fn computer_agent_stop(
             &grpc_addr,
             session_id.clone(),
             "User requested stop".to_string(), // reason
-            project_id.clone(),                 // project_id
+            project_id.clone(),                // project_id
         )
         .await
         {
             Ok(response) => {
                 if response.success {
-                    info!(
-                        "✅ [COMPUTER_STOP] 会话取消成功: session_id={}",
-                        session_id
-                    );
+                    info!("✅ [COMPUTER_STOP] 会话取消成功: session_id={}", session_id);
                 } else {
                     warn!(
                         "⚠️ [COMPUTER_STOP] 会话取消返回失败: session_id={}, message={}",
@@ -177,11 +174,12 @@ pub async fn computer_agent_stop(
                 }
             }
             Err(e) => {
-                warn!(
-                    "⚠️ [COMPUTER_STOP] 调用 CancelSession 失败: {}, session_id={}",
+                error!(
+                    "❌ [COMPUTER_STOP] 调用 CancelSession 失败: {}, session_id={}",
                     e, session_id
                 );
-                // 不中断流程，继续清理本地状态
+                // gRPC 通信失败，继续清理本地状态
+                // 注：业务错误码现在由 agent_runner 通过 grpc_response 返回
             }
         }
 

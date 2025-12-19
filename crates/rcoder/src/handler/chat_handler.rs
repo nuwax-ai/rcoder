@@ -4,7 +4,6 @@
 
 use anyhow::Result;
 use axum::{Json, extract::State};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shared_types::{ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
@@ -417,7 +416,7 @@ async fn forward_request_to_container_service(
             request.user_prompt.clone(),
             request.agent_config.clone(),
             Some(shared_types::ServiceType::RCoder), // ✅ RCoder 模式使用 RCoder ServiceType
-            None, // RCoder 模式不需要 user_id
+            None,                                    // RCoder 模式不需要 user_id
         )
         .await
         {
@@ -438,7 +437,10 @@ async fn forward_request_to_container_service(
                     let error_code = grpc_response
                         .error_code
                         .unwrap_or_else(|| shared_types::error_codes::ERR_AGENT_ERROR.to_string());
-                    error!("❌ [FORWARD] gRPC 响应错误: code={}, message={}", error_code, error_msg);
+                    error!(
+                        "❌ [FORWARD] gRPC 响应错误: code={}, message={}",
+                        error_code, error_msg
+                    );
                     return Ok(crate::HttpResult::error(&error_code, &error_msg));
                 }
             }
@@ -476,24 +478,19 @@ async fn forward_request_to_container_service(
     // 如果所有重试都失败
     if let Some(e) = last_error {
         error!("❌ [FORWARD] gRPC 最终调用失败: {}", e);
-        // 尝试回退到 HTTP（可选）
-        warn!("⚠️ [FORWARD] gRPC 失败，尝试 HTTP 回退");
-        match forward_request_via_http(request, container_info).await {
-            Ok(result) => Ok(result),
-            Err(http_err) => {
-                // HTTP 回退也失败，返回 HTTP 200 + 错误码
-                error!("❌ [FORWARD] HTTP 回退也失败: {}", http_err);
-                Ok(HttpResult::error(
-                    shared_types::error_codes::ERR_GRPC_ERROR,
-                    &format!("容器通信失败: gRPC={}, HTTP={}", e, http_err)
-                ))
-            }
-        }
+
+        // gRPC 通信失败，直接返回错误
+        // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
+        // 这里只处理真正的 gRPC 通信层错误
+        Ok(HttpResult::error(
+            shared_types::error_codes::ERR_GRPC_ERROR,
+            &format!("gRPC 调用失败: {}", e),
+        ))
     } else {
         // 理论上不会走到这里，除非 max_retries < 1
         Ok(HttpResult::error(
             shared_types::error_codes::ERR_GRPC_ERROR,
-            "未知重试错误"
+            "未知重试错误",
         ))
     }
 }
@@ -509,61 +506,4 @@ fn extract_grpc_addr(service_url: &str, grpc_port: u16) -> Result<String, crate:
         .ok_or_else(|| crate::AppError::internal_server_error("无效的 service_url"))?;
 
     Ok(format!("{}:{}", host, grpc_port))
-}
-
-/// HTTP 回退方案（当 gRPC 不可用时）
-async fn forward_request_via_http(
-    request: &ChatRequest,
-    container_info: &ContainerBasicInfo,
-) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
-    let client = Client::new();
-    let chat_url = format!("{}/chat", container_info.service_url);
-
-    debug!("📡 [HTTP_FALLBACK] 发送 HTTP 请求到: {}", chat_url);
-
-    let response = client
-        .post(&chat_url)
-        .json(request)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("❌ [HTTP_FALLBACK] HTTP 请求失败: {}", e);
-            crate::AppError::internal_server_error(&format!("转发请求到容器失败: {}", e))
-        })?;
-
-    let status = response.status();
-    if status.is_success() {
-        let response_text = response.text().await.map_err(|e| {
-            crate::AppError::internal_server_error(&format!("读取容器响应失败: {}", e))
-        })?;
-
-        let container_http_result: shared_types::HttpResult<ChatResponse> =
-            serde_json::from_str(&response_text).map_err(|e| {
-                crate::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
-            })?;
-
-        if container_http_result.code == "0000" {
-            match container_http_result.data {
-                Some(container_response) => {
-                    info!(
-                        "✅ [HTTP_FALLBACK] 响应成功: session_id={}",
-                        container_response.session_id
-                    );
-                    Ok(crate::HttpResult::success(container_response))
-                }
-                None => Ok(crate::HttpResult::error(
-                    "CONTAINER_ERROR",
-                    "成功响应但缺少 data 字段",
-                )),
-            }
-        } else {
-            Ok(crate::HttpResult::error(
-                &container_http_result.code,
-                &container_http_result.message,
-            ))
-        }
-    } else {
-        let error_text = format!("容器返回错误状态: {}", status);
-        Ok(crate::HttpResult::error(shared_types::error_codes::ERR_CONTAINER_ERROR, &error_text))
-    }
 }
