@@ -300,8 +300,8 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
             // 检查模型配置是否变化
             if existing.is_model_config_changed(&model_provider) {
                 info!(
-                    "检测到模型配置变化，重启 Agent 会话，项目 ID: {}",
-                    project_id
+                    "检测到模型配置变化，重启 Agent 会话，项目 ID: {}, 旧配置: {:?}, 新配置: {:?}",
+                    project_id, existing.model_provider, model_provider
                 );
                 // 移除旧会话
                 self.remove_session(project_id);
@@ -374,7 +374,9 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
     }
 }
 
-impl<N: SessionNotifier, C: Client + Default + 'static> std::fmt::Debug for AcpSessionManager<N, C> {
+impl<N: SessionNotifier, C: Client + Default + 'static> std::fmt::Debug
+    for AcpSessionManager<N, C>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpSessionManager")
             .field("session_count", &self.sessions.len())

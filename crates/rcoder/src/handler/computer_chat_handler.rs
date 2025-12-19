@@ -161,11 +161,12 @@ pub async fn handle_computer_chat(
     };
 
     info!(
-        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, prompt_len={}, attachments={}",
+        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, prompt_len={}, attachments={}, model_provider={:?}",
         user_id,
         project_id,
         request.prompt.len(),
-        request.attachments.len()
+        request.attachments.len(),
+        request.model_provider
     );
 
     // 3. 验证资源限制配置
