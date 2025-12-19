@@ -460,7 +460,9 @@ async fn forward_computer_request_to_container(
             "❌ [COMPUTER_FORWARD] gRPC 最终调用失败: {}, user_id={}, project_id={}",
             e, request.user_id, project_id
         );
-        // Computer Agent Runner 不使用 HTTP 回退
+
+        // gRPC 通信失败，直接返回错误
+        // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
         HttpResult::error(
             shared_types::error_codes::ERR_GRPC_ERROR,
             &format!("容器通信失败: {}", e),

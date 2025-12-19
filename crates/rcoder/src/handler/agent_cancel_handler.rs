@@ -3,10 +3,9 @@
 //! 转发取消请求到容器内的 agent_runner 服务
 
 use axum::extract::{Query, State};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::router::AppState;
@@ -40,15 +39,11 @@ pub struct CancelResponse {
 async fn get_container_for_cancel(
     project_id: &str,
 ) -> Result<Option<ContainerBasicInfo>, AppError> {
-    info!(
-        "🔍 [CANCEL_CONTAINER] 查找容器: project_id={}",
-        project_id
-    );
+    info!("🔍 [CANCEL_CONTAINER] 查找容器: project_id={}", project_id);
 
     // 只获取容器，不创建
     let container_info =
-        crate::service::container_manager::ContainerManager::get_container_info(project_id)
-            .await?;
+        crate::service::container_manager::ContainerManager::get_container_info(project_id).await?;
 
     if let Some(ref info) = container_info {
         info!(
@@ -86,7 +81,7 @@ async fn forward_cancel_request_to_container_service(
     // 从 service_url 提取 gRPC 地址
     let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
 
-    debug!(
+    info!(
         "📡 [CANCEL_FORWARD] 发送 gRPC 取消请求到: {}, session_id={}",
         grpc_addr, session_id_display
     );
@@ -120,14 +115,33 @@ async fn forward_cancel_request_to_container_service(
                     .message
                     .unwrap_or_else(|| "未知错误".to_string());
                 error!("❌ [CANCEL_FORWARD] gRPC 取消失败: {}", error_msg);
-                Ok(HttpResult::error(shared_types::error_codes::ERR_CANCEL_FAILED, &error_msg))
+                Ok(HttpResult::error(
+                    shared_types::error_codes::ERR_CANCEL_FAILED,
+                    &error_msg,
+                ))
             }
         }
         Err(e) => {
             error!("❌ [CANCEL_FORWARD] gRPC 调用失败: {}", e);
-            // 尝试回退到 HTTP（可选）
-            warn!("⚠️ [CANCEL_FORWARD] gRPC 失败，尝试 HTTP 回退");
-            forward_cancel_request_via_http(project_id, session_id, container_info).await
+
+            // 只保留 NotFound 的特殊处理（幂等设计）
+            // 注：业务错误码现在由 agent_runner 通过 grpc_response 返回
+            if let Some(status) = crate::grpc::extract_grpc_status(&e) {
+                use tonic::Code;
+                if status.code() == Code::NotFound {
+                    // 会话或 Agent 不存在，返回成功（幂等设计）
+                    return Ok(HttpResult::success(CancelResponse {
+                        success: true,
+                        session_id: session_id.unwrap_or("").to_string(),
+                    }));
+                }
+            }
+
+            // gRPC 通信失败
+            Ok(HttpResult::error(
+                shared_types::error_codes::ERR_GRPC_ERROR,
+                &format!("gRPC 调用失败: {}", e),
+            ))
         }
     }
 }
@@ -144,71 +158,6 @@ fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
 
     Ok(format!("{}:{}", host, shared_types::GRPC_DEFAULT_PORT))
 }
-
-/// HTTP 回退方案（当 gRPC 不可用时）
-async fn forward_cancel_request_via_http(
-    project_id: &str,
-    session_id: Option<&str>,
-    container_info: &ContainerBasicInfo,
-) -> Result<HttpResult<CancelResponse>, AppError> {
-    let client = Client::new();
-    let cancel_url = if let Some(sid) = session_id {
-        format!(
-            "{}/agent/session/cancel?project_id={}&session_id={}",
-            container_info.service_url, project_id, sid
-        )
-    } else {
-        format!(
-            "{}/agent/session/cancel?project_id={}",
-            container_info.service_url, project_id
-        )
-    };
-
-    debug!("📡 [HTTP_FALLBACK] 发送 HTTP 取消请求到: {}", cancel_url);
-
-    let response = client.post(&cancel_url).send().await.map_err(|e| {
-        error!("❌ [HTTP_FALLBACK] HTTP 请求失败: {}", e);
-        AppError::internal_server_error(&format!("转发取消请求到容器失败: {}", e))
-    })?;
-
-    let status = response.status();
-    debug!("📥 [HTTP_FALLBACK] 容器响应状态: {}", status);
-
-    if status.is_success() {
-        // 解析容器返回的 HttpResult<CancelResponse> 格式
-        let container_http_result: shared_types::HttpResult<CancelResponse> =
-            response.json().await.map_err(|e| {
-                error!("❌ [HTTP_FALLBACK] 解析容器响应失败: {}", e);
-                AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
-            })?;
-
-        // 提取 data 字段中的 CancelResponse
-        let container_response = container_http_result.data.ok_or_else(|| {
-            error!("❌ [HTTP_FALLBACK] 容器响应缺少 data 字段");
-            AppError::internal_server_error("容器响应缺少 data 字段")
-        })?;
-
-        info!(
-            "✅ [HTTP_FALLBACK] 容器取消响应成功: session_id={}, success={}",
-            container_response.session_id, container_response.success
-        );
-
-        Ok(HttpResult::success(container_response))
-    } else {
-        let error_text = format!("容器返回错误状态: {}", status);
-        let response_body = response.text().await.unwrap_or_default();
-        error!(
-            "❌ [HTTP_FALLBACK] {}, 响应内容: {}",
-            error_text, response_body
-        );
-
-        Ok(HttpResult::error(
-            shared_types::error_codes::ERR_CANCEL_FAILED,
-            &format!("容器取消请求失败: {}", status),
-        ))
-    }
-}
-
 
 /// 内部核心处理函数：处理会话取消请求（供多个接口复用）
 ///

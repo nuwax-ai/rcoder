@@ -248,9 +248,16 @@ impl AgentService for AgentServiceImpl {
         // 检查 Agent 状态，禁止并发请求（使用统一 Registry）
         if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id) {
             if agent_info.status == AgentStatus::Active {
-                return Err(Status::failed_precondition(
-                    "Agent正在执行任务，请等待当前任务完成后再发送新请求",
-                ));
+                // 🎯 使用业务响应返回错误码，而非 gRPC Status 错误
+                // 这样 rcoder 可以直接从 error_code 字段读取错误码
+                return Ok(Response::new(GrpcChatResponse {
+                    project_id: project_id.clone(),
+                    session_id: session_id.unwrap_or_default(),
+                    success: false,
+                    error: Some("Agent正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
+                    error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
+                    request_id: req.request_id.clone(),
+                }));
             }
         }
 

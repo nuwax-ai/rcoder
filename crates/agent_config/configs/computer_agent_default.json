@@ -41,6 +41,7 @@
       "args": [
         "-y",
         "chrome-devtools-mcp@latest",
+        "--userDataDir=/home/user/.config/chromium",
         "--executablePath=/usr/local/bin/chromium-for-mcp",
         "--chromeArg=--no-sandbox",
         "--chromeArg=--no-zygote",
@@ -49,6 +50,7 @@
         "--chromeArg=--remote-debugging-port=9222"
       ],
       "env": {
+        "CHROMIUM_USER_DATA_DIR": "/home/user/.config/chromium",
         "DISPLAY": ":0",
         "GTK_IM_MODULE": "fcitx5",
         "QT_IM_MODULE": "fcitx5",
