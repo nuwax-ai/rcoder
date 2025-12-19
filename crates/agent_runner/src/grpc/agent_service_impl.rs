@@ -38,13 +38,13 @@ use shared_types::ChatPromptBuilder;
 /// 将 gRPC ModelProviderConfig 转换为内部 ModelProviderConfig
 fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProviderConfig {
     ModelProviderConfig {
-        id: uuid::Uuid::new_v4().to_string(), // 生成唯一 ID
+        id: grpc_config.id, // 保留原始 ID，用于会话复用判断
         name: grpc_config.provider,
         base_url: grpc_config.api_base.unwrap_or_default(),
         api_key: grpc_config.api_key.unwrap_or_default(),
-        requires_openai_auth: true, // 默认值
+        requires_openai_auth: grpc_config.requires_openai_auth.unwrap_or(true),
         default_model: grpc_config.model,
-        api_protocol: None, // 从 provider 名称推断
+        api_protocol: grpc_config.api_protocol,
     }
 }
 
