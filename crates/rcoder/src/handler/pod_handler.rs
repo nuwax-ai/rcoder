@@ -11,7 +11,7 @@ use axum::Json;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info, instrument};
+use tracing::{debug, error, info, instrument};
 use utoipa::ToSchema;
 
 use crate::router::AppState;
@@ -232,7 +232,7 @@ pub struct RestartPodResponse {
 pub async fn pod_count(
     State(_state): State<Arc<AppState>>,
 ) -> Result<HttpResult<PodCountResponse>, AppError> {
-    info!("📊 [POD_COUNT] 获取容器数量统计");
+    debug!("📊 [POD_COUNT] 获取容器数量统计");
 
     // 获取全局 DockerManager
     let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -307,11 +307,17 @@ pub async fn pod_ensure(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("❌ [POD_ENSURE] user_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "user_id 不能为空",
+        ));
     }
     if request.project_id.trim().is_empty() {
         error!("❌ [POD_ENSURE] project_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "project_id 不能为空",
+        ));
     }
 
     info!(
@@ -417,11 +423,17 @@ pub async fn pod_keepalive(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("❌ [POD_KEEPALIVE] user_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "user_id 不能为空",
+        ));
     }
     if request.project_id.trim().is_empty() {
         error!("❌ [POD_KEEPALIVE] project_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "project_id 不能为空",
+        ));
     }
 
     info!(
@@ -598,11 +610,17 @@ pub async fn pod_restart(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("❌ [POD_RESTART] user_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "user_id 不能为空",
+        ));
     }
     if request.project_id.trim().is_empty() {
         error!("❌ [POD_RESTART] project_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "project_id 不能为空",
+        ));
     }
 
     info!(
