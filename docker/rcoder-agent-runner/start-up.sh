@@ -48,76 +48,86 @@ fi
 # ============================================================================
 function initialize_user_home() {
     echo "🏠 Initializing user home directory..."
-    
+
     local SKEL_DIR="/etc/skel-user-desktop"
     local USER_HOME="/home/user"
-    
+
     # 检查骨架目录是否存在
     if [ ! -d "$SKEL_DIR" ]; then
         echo "⚠️  Skeleton directory not found: $SKEL_DIR"
         return 1
     fi
-    
+
     # 检查 /home/user 是否被外部挂载覆盖（通过检查关键目录是否存在）
     local need_restore=false
-    
+
     # 检查关键目录/文件是否存在
     if [ ! -d "$USER_HOME/Desktop" ] || [ ! -f "$USER_HOME/.bashrc" ]; then
         need_restore=true
         echo "📁 Detected empty or incomplete user home directory (likely mounted)"
     fi
-    
+
     if [ "$need_restore" = true ]; then
         echo "📦 Restoring user configuration from skeleton directory..."
-        
+
         # 创建必要的目录结构
         mkdir -p "$USER_HOME/.config" "$USER_HOME/.local/share" "$USER_HOME/.cache"
         mkdir -p "$USER_HOME/Desktop"
-        
+
         # 从骨架目录复制配置（使用 cp -n 不覆盖已存在的文件，保留用户数据）
         # Desktop 目录 - 恢复桌面图标
         if [ -d "$SKEL_DIR/Desktop" ]; then
             cp -an "$SKEL_DIR/Desktop/." "$USER_HOME/Desktop/" 2>/dev/null || true
             echo "  ✓ Desktop icons restored"
         fi
-        
+
         # .bashrc - 恢复别名配置
         if [ ! -f "$USER_HOME/.bashrc" ] && [ -f "$SKEL_DIR/.bashrc" ]; then
             cp -a "$SKEL_DIR/.bashrc" "$USER_HOME/.bashrc"
             echo "  ✓ .bashrc restored"
         fi
-        
+
         # .config 目录 - 恢复应用配置（Chromium 等）
         if [ -d "$SKEL_DIR/.config" ]; then
             cp -an "$SKEL_DIR/.config/." "$USER_HOME/.config/" 2>/dev/null || true
             echo "  ✓ .config directory restored"
         fi
-        
+
         # .local 目录 - 恢复本地数据（keyrings 等）
         if [ -d "$SKEL_DIR/.local" ]; then
             cp -an "$SKEL_DIR/.local/." "$USER_HOME/.local/" 2>/dev/null || true
             echo "  ✓ .local directory restored"
         fi
-        
-        # 设置正确的权限
-        chown -R user:user "$USER_HOME"
-        chmod 755 "$USER_HOME"
-        
+
         echo "✅ User home directory initialized from skeleton"
     else
         echo "✅ User home directory already initialized"
     fi
-    
+
+    # ========== 关键修复：强制修复所有挂载目录的权限（解决 UID 不匹配） ==========
+    echo "🔧 Fixing permissions for mounted directories..."
+
+    # 修复整个 /home/user 的所有者（处理宿主机 UID 不匹配问题）
+    chown -R user:user "$USER_HOME" 2>/dev/null || true
+
+    # 修复目录权限：确保 user 可以读取、写入、执行目录
+    find "$USER_HOME" -type d -exec chmod u+rwx {} \; 2>/dev/null || true
+
+    # 修复文件权限：确保 user 可以读取和写入文件
+    find "$USER_HOME" -type f -exec chmod u+rw {} \; 2>/dev/null || true
+
+    echo "✅ Permissions fixed for user home directory"
+
     # ========== 设置渲染相关环境变量（防止花屏）==========
     # 将 Mesa 着色器缓存移到 /tmp（不受 /home/user 挂载影响）
     export MESA_SHADER_CACHE_DIR="/tmp/mesa_shader_cache"
     export MESA_GLSL_CACHE_DIR="/tmp/mesa_shader_cache"
     mkdir -p /tmp/mesa_shader_cache
     chmod 777 /tmp/mesa_shader_cache
-    
+
     # 将 X 认证文件移到 /tmp
     export XAUTHORITY="/tmp/.Xauthority"
-    
+
     echo "✅ Mesa shader cache configured: /tmp/mesa_shader_cache"
 }
 
@@ -221,8 +231,8 @@ function start_display_and_desktop() {
 
 	# 3. 创建 Chromium 数据目录（如果不存在）
 	mkdir -p "$CHROMIUM_USER_DATA_DIR"
-	chown -R user:user "$CHROMIUM_USER_DATA_DIR"
-	chmod -R 777 "$CHROMIUM_USER_DATA_DIR"
+	# 修复权限（已在 initialize_user_home() 中统一处理，此处确保目录存在即可）
+	# 避免 chmod -R 777 造成安全风险
 
 	# 4. 导出环境变量供后续进程使用
 	export CHROMIUM_USER_DATA_DIR
@@ -417,7 +427,7 @@ function start_display_and_desktop() {
 # ============================================================================
 function apply_xfce_wallpaper() {
     echo "🎨 Applying XFCE wallpaper..."
-    
+
     # 等待 XFCE 桌面完全启动
     local counter=0
     while ! su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -l" >/dev/null 2>&1; do
@@ -428,18 +438,18 @@ function apply_xfce_wallpaper() {
             return 1
         fi
     done
-    
+
     local WALLPAPER_PATH="/usr/share/backgrounds/xfce/wallpaper.png"
     if [ ! -f "$WALLPAPER_PATH" ]; then
         echo "⚠️  Wallpaper not found: $WALLPAPER_PATH"
         return 1
     fi
-    
+
     echo "  ✓ Setting wallpaper: $WALLPAPER_PATH"
-    
+
     # 获取当前的 monitor 配置（XFCE 可能使用不同的名称）
     local monitors=$(su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image'" | head -5)
-    
+
     if [ -n "$monitors" ]; then
         # 对于每个找到的 monitor 配置设置壁纸
         echo "$monitors" | while read monitor_path; do
@@ -450,10 +460,10 @@ function apply_xfce_wallpaper() {
         su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/last-image -n -t string -s '$WALLPAPER_PATH'" 2>/dev/null || true
         su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/workspace0/last-image -n -t string -s '$WALLPAPER_PATH'" 2>/dev/null || true
     fi
-    
+
     # 设置壁纸样式（5 = 缩放）
     su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5" 2>/dev/null || true
-    
+
     echo "✅ XFCE wallpaper applied successfully"
 }
 
