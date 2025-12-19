@@ -169,9 +169,9 @@ RUN apt-get update && \
     chmod 600 /home/user/.local/share/keyrings/default && \
     # 创建基本的用户 .bashrc (只包含别名，不包含输入法配置)
     printf '# User aliases\nalias chromium="/usr/local/bin/chromium"\nalias chrome="/usr/local/bin/chromium"\nalias code="code --no-sandbox"\n' > /home/user/.bashrc && \
-    # 设置权限
+    # 设置权限（安全配置：755 允许读取和执行，所有者可写）
     chown -R user:user /home/user /run/user/$(id -u user) && \
-    chmod 777 /home/user && \
+    chmod 755 /home/user && \
     chmod 700 /run/user/$(id -u user) && \
     # Create Chromium wrapper script with fcitx5 support
     printf '#!/bin/bash\n# Source fcitx5 environment\nif [ -f /etc/profile.d/fcitx5-env.sh ]; then\n    source /etc/profile.d/fcitx5-env.sh\nfi\n# Load D-Bus address\nif [ -f /tmp/dbus-session-env ]; then\n    source /tmp/dbus-session-env\nfi\n# Load Chromium environment\nif [ -f /etc/profile.d/chromium-env.sh ]; then\n    source /etc/profile.d/chromium-env.sh\nfi\nexport DISPLAY=:0\nexport LANG=C.UTF-8\nexport LC_ALL=C.UTF-8\nexport LC_CTYPE=C.UTF-8\n# Use standard Chromium config directory\nCHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"\n# Launch Chromium\nexec /usr/bin/chromium \\\n  --user-data-dir="$CHROMIUM_DATA_DIR" \\\n  --no-sandbox \\\n  --disable-dev-shm-usage \\\n  --remote-debugging-port=9222 \\\n  --remote-debugging-address=0.0.0.0 \\\n  --no-first-run \\\n  --no-default-browser-check \\\n  --password-store=basic \\\n  --use-mock-keychain \\\n  --disable-session-crashed-bubble \\\n  --disable-infobars \\\n  --no-process-singleton-dialog \\\n  --force-color-profile=srgb "$@"\n' > /usr/bin/chromium-browser-launcher && \
@@ -339,10 +339,11 @@ ENV R_HOME=/opt/R/${R_VERSION} \
 #     passwd -d user && \
 #     echo "user ALL=(ALL:ALL) NOPASSWD: ALL" >>/etc/sudoers
 
-# 设置目录权限
+# 设置目录权限（安全配置）
 RUN mkdir -p /home/user && \
-    chmod 777 -R /home/user && \
-    chmod 777 -R /usr/local
+    chown -R user:user /home/user && \
+    chmod 755 /home/user && \
+    chmod 755 /usr/local
 
 # Python/Jupyter components removed
 
