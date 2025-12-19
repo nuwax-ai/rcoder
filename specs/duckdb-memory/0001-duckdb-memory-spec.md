@@ -1726,46 +1726,58 @@ impl ProjectAdapter {
 
     /// 模拟 DashMap.contains_key() 操作
     pub fn contains_key(&self, key: &str) -> bool;
+
+    // === Session 相关方法（合并到 ProjectAdapter）===
+
+    /// 根据 session_id 获取项目信息（替代原 sessions DashMap）
+    pub fn get_by_session_id(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.storage.get_project_info_by_session(session_id)
+            .ok()
+            .flatten()
+            .map(|info| Arc::new(self.build_project_and_container_info(info)))
+    }
+
+    /// 根据 session_id 获取 container_id（替代原 session_to_container_id DashMap）
+    pub fn get_container_id_by_session(&self, session_id: &str) -> Option<String> {
+        self.storage.projects().get_container_id_by_session(session_id).ok().flatten()
+    }
+
+    /// 更新项目的 session 信息
+    pub fn update_session(&self, project_id: &str, session_id: &str) -> Result<(), StorageError> {
+        self.storage.projects().update_session(project_id, Some(session_id), Some(Utc::now()))
+    }
 }
 ```
 
-#### 6.2.3 会话适配器
-
-```rust
-/// 会话映射适配器
-///
-/// 模拟 sessions 和 session_to_container_id DashMap 的行为
-pub struct SessionAdapter {
-    storage: Arc<dyn UnifiedStorage>,
-}
-
-impl SessionAdapter {
-    /// 模拟 sessions DashMap
-    pub fn get_project(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>>;
-
-    /// 模拟 session_to_container_id DashMap
-    pub fn get_container_id(&self, session_id: &str) -> Option<String>;
-}
-```
-
-#### 6.2.4 AppState 适配器
+#### 6.2.3 AppState 适配器（简化版）
 
 ```rust
 /// 适配后的 AppState
+///
+/// 通过统一的 ProjectAdapter 替代原来的 3 个 DashMap：
+/// - project_and_agent_map → projects.get() / projects.insert()
+/// - sessions → projects.get_by_session_id()
+/// - session_to_container_id → projects.get_container_id_by_session()
 pub struct AdaptedAppState {
-    /// 统一项目映射适配器（替代原来的 project_and_agent_map）
+    /// 统一项目适配器（包含项目和会话的所有操作）
     pub projects: ProjectAdapter,
-
-    /// 会话映射适配器
-    pub sessions: SessionAdapter,
-
-    /// 会话到容器ID映射适配器
-    pub session_to_container_id: SessionAdapter,
 
     /// 其他原有字段保持不变
     pub config: AppConfig,
     pub pingora_service: Option<Arc<PingoraProxyService>>,
-    pub grpc_pool: Arc<GrpcChannelPool>,
+    pub grpc_pool: Arc<GrpcChannelPool>,  // gRPC 连接池保持使用 DashMap
+}
+
+impl AdaptedAppState {
+    /// 兼容原 sessions DashMap 的访问方式
+    pub fn get_project_by_session(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.projects.get_by_session_id(session_id)
+    }
+
+    /// 兼容原 session_to_container_id DashMap 的访问方式
+    pub fn get_container_id_by_session(&self, session_id: &str) -> Option<String> {
+        self.projects.get_container_id_by_session(session_id)
+    }
 }
 ```
 
