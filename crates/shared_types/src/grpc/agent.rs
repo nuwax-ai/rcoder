@@ -144,14 +144,27 @@ pub struct StopAgentResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ModelProviderConfig {
+    /// 模型配置唯一标识（必须保留原始值，用于会话复用判断）
     #[prost(string, tag = "1")]
-    pub provider: ::prost::alloc::string::String,
+    pub id: ::prost::alloc::string::String,
+    /// 提供商名称 (如: glm, anthropic, openai, qwen)
     #[prost(string, tag = "2")]
+    pub provider: ::prost::alloc::string::String,
+    /// 默认模型名称
+    #[prost(string, tag = "3")]
     pub model: ::prost::alloc::string::String,
-    #[prost(string, optional, tag = "3")]
-    pub api_key: ::core::option::Option<::prost::alloc::string::String>,
+    /// API 密钥
     #[prost(string, optional, tag = "4")]
+    pub api_key: ::core::option::Option<::prost::alloc::string::String>,
+    /// API 基础 URL
+    #[prost(string, optional, tag = "5")]
     pub api_base: ::core::option::Option<::prost::alloc::string::String>,
+    /// 是否需要 OpenAI 兼容的认证
+    #[prost(bool, optional, tag = "6")]
+    pub requires_openai_auth: ::core::option::Option<bool>,
+    /// 模型接口协议类型 (anthropic/openai)
+    #[prost(string, optional, tag = "7")]
+    pub api_protocol: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// 附件数据源
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

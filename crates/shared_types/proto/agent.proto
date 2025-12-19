@@ -144,10 +144,20 @@ message StopAgentResponse {
 // === Model Provider Config ===
 
 message ModelProviderConfig {
-  string provider = 1;
-  string model = 2;
-  optional string api_key = 3;
-  optional string api_base = 4;
+  // 模型配置唯一标识（必须保留原始值，用于会话复用判断）
+  string id = 1;
+  // 提供商名称 (如: glm, anthropic, openai, qwen)
+  string provider = 2;
+  // 默认模型名称
+  string model = 3;
+  // API 密钥
+  optional string api_key = 4;
+  // API 基础 URL
+  optional string api_base = 5;
+  // 是否需要 OpenAI 兼容的认证
+  optional bool requires_openai_auth = 6;
+  // 模型接口协议类型 (anthropic/openai)
+  optional string api_protocol = 7;
 }
 
 // === Attachment 相关定义 ===

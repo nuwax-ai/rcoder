@@ -55,10 +55,13 @@ pub fn to_grpc_chat_request(
 /// 将 ModelProviderConfig 转换为 gRPC 格式
 pub fn to_grpc_model_config(config: ModelProviderConfig) -> GrpcModelProviderConfig {
     GrpcModelProviderConfig {
+        id: config.id, // 保留原始 ID，用于会话复用判断
         provider: config.name,
         model: config.default_model,
         api_key: Some(config.api_key),
         api_base: Some(config.base_url),
+        requires_openai_auth: Some(config.requires_openai_auth),
+        api_protocol: config.api_protocol,
     }
 }
 
