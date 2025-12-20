@@ -2,7 +2,7 @@
 //!
 //! 基于AgentLifecycleGuard的RAII原则，简化清理逻辑：
 //! 1. 定时扫描识别闲置的agent
-//! 2. 从state.project_and_agent_map中移除
+//! 2. 从 DuckDB 存储中移除
 //! 3. AgentLifecycleGuard自动drop并清理资源
 //!
 //! ## 支持的服务类型
@@ -220,47 +220,16 @@ impl AgentCleaner {
     }
 
     /// 清理孤立的SSE消息数据
-    /// 清理没有在 project_and_agent_map 中对应session_id的条目
+    /// 清理没有在 projects 中对应session_id的条目
+    /// 注意：使用 DuckDB 后，session 数据已合并到 projects 表，此方法主要用于兼容
     async fn cleanup_orphaned_sse_sessions(&mut self) -> (u64, u64) {
-        let mut orphaned_count = 0;
-        let mut messages_cleared = 0;
+        let orphaned_count = 0;
+        let messages_cleared = 0;
 
-        // 收集所有活跃的session_id（从 project_and_agent_map 中获取）
-        let active_session_ids: std::collections::HashSet<String> = self
-            .state
-            .project_and_agent_map
-            .iter()
-            .filter_map(|entry| entry.value().session_id().map(|s| s.to_string()))
-            .collect();
-
-        // 检查sessions中的所有session
-        let mut sessions_to_remove = Vec::new();
-
-        let session_ids: Vec<String> = self
-            .state
-            .sessions
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for session_id in session_ids {
-            // 如果session_id不在活跃映射中，则为孤立session
-            if !active_session_ids.contains(&session_id) {
-                info!("发现孤立session: session_id={}", session_id);
-
-                // 清理这个session
-                if self.state.sessions.remove(&session_id).is_some() {
-                    orphaned_count += 1;
-                    messages_cleared += 1;
-                }
-
-                sessions_to_remove.push(session_id.clone());
-            }
-        }
-
-        if orphaned_count > 0 {
-            info!("清理孤立SSE session完成: session数量={}", orphaned_count);
-        }
+        // 使用 DuckDB 存储后，session 数据已合并到 projects 表
+        // 孤立 session 会在项目删除时自动清理
+        // 这里只记录日志用于监控
+        debug!("🔍 [cleanup] 孤立会话检查完成（DuckDB 模式）");
 
         (orphaned_count, messages_cleared)
     }
@@ -274,8 +243,8 @@ impl AgentCleaner {
         let mut success_count = 0;
         let mut failed_count = 0;
 
-        // 统计当前活动的agent数量
-        let total_agents = self.state.project_and_agent_map.len();
+        // 统计当前活动的agent数量（使用 DuckDB 存储）
+        let total_agents = self.state.projects.len();
 
         info!(
             "开始清理闲置agent和SSE消息，当前时间: {}，当前活动agent数量: {}",
@@ -295,21 +264,21 @@ impl AgentCleaner {
 
         info!(
             "🔍 [cleanup] 开始扫描所有agent，总数: {}",
-            self.state.project_and_agent_map.len()
+            self.state.projects.len()
         );
 
         // 🔒 使用原子性操作收集需要清理的agent，避免长时间持有读锁
         let mut agents_to_evaluate = Vec::new();
 
-        // 先快速收集所有项目ID，避免长时间迭代
-        for entry in self.state.project_and_agent_map.iter() {
-            agents_to_evaluate.push(entry.key().clone());
+        // 先快速收集所有项目ID，避免长时间迭代（使用 DuckDB 存储）
+        for (project_id, _) in self.state.projects.iter() {
+            agents_to_evaluate.push(project_id);
         }
 
         // 现在逐个检查每个agent，使用原子性操作
         for project_id in agents_to_evaluate {
-            // 使用 Entry API 原子性地检查和标记待清理的agent
-            if let Some(agent_ref) = self.state.project_and_agent_map.get(&project_id) {
+            // 使用 ProjectAdapter 获取 agent 信息
+            if let Some(agent_ref) = self.state.get_project(&project_id) {
                 let status = agent_ref.status();
                 let last_activity = agent_ref.last_activity();
                 let created_at = agent_ref.created_at();
@@ -387,7 +356,7 @@ impl AgentCleaner {
 
         info!(
             "📊 [cleanup] 扫描完成: 总数={}, 待清理={}, 保护期内={}, 活跃状态={}, 未超时={}",
-            self.state.project_and_agent_map.len(),
+            self.state.projects.len(),
             agents_to_remove.len(),
             protected_agents,
             active_agents,
@@ -420,9 +389,10 @@ impl AgentCleaner {
         self.stats.sse_messages_cleaned += sse_messages;
         self.stats.last_cleanup = Some(current_time);
 
-        // 清理完成后的统计
-        let remaining_agents = self.state.project_and_agent_map.len();
-        let active_sessions = self.state.sessions.len();
+        // 清理完成后的统计（使用 DuckDB 存储）
+        // 注意：session 数据已合并到 projects 表，active_sessions 等于 remaining_agents
+        let remaining_agents = self.state.projects.len();
+        let active_sessions = remaining_agents;
 
         let duration = start_time.elapsed();
         info!(
@@ -547,8 +517,8 @@ impl AgentCleaner {
                         if let Some(project_id) =
                             Self::extract_project_id_from_container_name(clean_name)
                         {
-                            // 检查 MAP 中是否有对应记录
-                            if !self.state.project_and_agent_map.contains_key(&project_id) {
+                            // 检查 DuckDB 存储中是否有对应记录
+                            if !self.state.contains_project(&project_id) {
                                 // 🚀 优化3: 使用容器的创建时间而不是查询详细信息
                                 let created_time = container
                                     .created
@@ -819,7 +789,7 @@ impl AgentCleaner {
     }
 
     /// 基于RAII的简化清理方法
-    /// 先销毁Docker容器，再从MAP中移除agent，AgentLifecycleGuard会自动清理其他资源
+    /// 先销毁Docker容器，再从存储中移除agent，AgentLifecycleGuard会自动清理其他资源
     async fn cleanup_agent_raii(&self, project_id: &str) -> Result<()> {
         info!("🚀 [cleanup_agent_raii] 开始RAII清理agent: {}", project_id);
 
@@ -836,60 +806,43 @@ impl AgentCleaner {
                     info!("✅ [cleanup_agent_raii] Docker容器销毁完成: {}", project_id);
                 }
 
-                info!("📋 [cleanup_agent_raii] 步骤2: 开始清理MAP映射: {}", project_id);
+                info!("📋 [cleanup_agent_raii] 步骤2: 开始清理存储映射: {}", project_id);
 
-                // 🔒 使用 Entry API 实现原子性操作，避免读写锁竞争
-                info!("🔍 [cleanup_agent_raii] 尝试原子性地移除agent: {}", project_id);
-                let session_id_to_remove = match self.state.project_and_agent_map.entry(project_id.to_string()) {
-                    dashmap::mapref::entry::Entry::Occupied(entry) => {
-                        info!("✅ [cleanup_agent_raii] 找到agent，提取session_id并原子性移除: {}", project_id);
-                        let session_id = entry.get().session_id().map(|s| s.to_string());
-                        info!("📝 [cleanup_agent_raii] 提取session_id: {:?}, project_id: {}", session_id, project_id);
+                // 🔒 使用 DuckDB 存储进行清理
+                info!("🔍 [cleanup_agent_raii] 尝试从存储中移除agent: {}", project_id);
 
-                        // 原子性地移除条目，触发 AgentLifecycleGuard 的 Drop
-                        entry.remove_entry();
-                        info!("✅ [cleanup_agent_raii] 成功原子性移除agent: {}", project_id);
-                        session_id
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(_) => {
-                        info!("📭 [cleanup_agent_raii] Agent不存在于MAP中，无需清理: {}", project_id);
-                        return Ok(());
-                    }
+                // 获取 session_id 用于后续清理（如果有的话）
+                let session_id_to_remove = if let Some(agent_info) = self.state.get_project(project_id) {
+                    info!("✅ [cleanup_agent_raii] 找到agent，提取session_id: {}", project_id);
+                    let session_id = agent_info.session_id().map(|s| s.to_string());
+                    info!("📝 [cleanup_agent_raii] 提取session_id: {:?}, project_id: {}", session_id, project_id);
+                    session_id
+                } else {
+                    info!("📭 [cleanup_agent_raii] Agent不存在于存储中，无需清理: {}", project_id);
+                    return Ok(());
                 };
 
-                // 🗑️ 使用 Entry API 原子性地清理 sessions 映射关系
-                if let Some(ref session_id) = session_id_to_remove {
-                    info!("🗑️ [cleanup_agent_raii] 尝试原子性清理sessions映射: session_id={}, project_id={}", session_id, project_id);
-
-                    // 清理 state.sessions
-                    match self.state.sessions.entry(session_id.clone()) {
-                        dashmap::mapref::entry::Entry::Occupied(entry) => {
-                            let removed_session_info = entry.get().clone();
-                            entry.remove_entry();
-                            info!(
-                                "✅ [cleanup_agent_raii] 已原子性清理sessions映射: session_id={}, project_id={}",
-                                session_id,
-                                removed_session_info.project_id()
-                            );
-                        }
-                        dashmap::mapref::entry::Entry::Vacant(_) => {
-                            info!("📭 [cleanup_agent_raii] sessions映射不存在（可能已被清理）: session_id={}", session_id);
-                        }
-                    }
-
-                    // 阶段 2.4: 清理 session_to_container_id 映射
-                    if self.state.session_to_container_id.remove(session_id).is_some() {
-                        info!("✅ [cleanup_agent_raii] 已清理 session_to_container_id 映射: session_id={}", session_id);
-                    } else {
-                        warn!("⚠️ [cleanup_agent_raii] session_to_container_id 映射中未找到: session_id={}", session_id);
-                    }
-
+                // 从 DuckDB 存储中移除项目（这会同时清理 session 关联）
+                if let Some(removed_info) = self.state.remove_project(project_id) {
+                    info!(
+                        "✅ [cleanup_agent_raii] 成功从存储中移除agent: {}, session_id={:?}",
+                        project_id,
+                        removed_info.session_id()
+                    );
                 } else {
-                    info!("📭 [cleanup_agent_raii] 无session_id，跳过sessions清理: {}", project_id);
+                    info!("📭 [cleanup_agent_raii] Agent已被其他线程移除: {}", project_id);
                 }
 
-                info!("✅ [cleanup_agent_raii] MAP清理完成，AgentLifecycleGuard将自动清理资源: {}", project_id);
+                // 注意：使用 DuckDB 后，session 数据已合并到 projects 表
+                // 删除项目时，相关的 session 映射会自动清理，无需手动清理 sessions 和 session_to_container_id
+                if let Some(ref session_id) = session_id_to_remove {
+                    info!(
+                        "📝 [cleanup_agent_raii] Session {} 的映射已随项目一起清理",
+                        session_id
+                    );
+                }
 
+                info!("✅ [cleanup_agent_raii] 存储清理完成: {}", project_id);
                 info!("🎯 [cleanup_agent_raii] 所有清理步骤完成: {}", project_id);
                 Ok::<(), anyhow::Error>(())
             }
@@ -930,8 +883,8 @@ impl AgentCleaner {
             .await
             .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
 
-        // 获取 ServiceType，如果未找到则默认为 RCoder
-        let service_type = if let Some(info) = self.state.project_and_agent_map.get(project_id) {
+        // 获取 ServiceType，如果未找到则默认为 RCoder（使用 DuckDB 存储）
+        let service_type = if let Some(info) = self.state.get_project(project_id) {
             info.service_type()
                 .unwrap_or(shared_types::ServiceType::RCoder)
         } else {

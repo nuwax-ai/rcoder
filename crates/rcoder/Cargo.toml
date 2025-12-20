@@ -18,6 +18,7 @@ shared_types = { path = "../shared_types" }
 acp-adapter = { path = "../acp_adapter" }
 pingora-proxy = { path = "../pingora-proxy" }
 docker_manager = { path = "../docker_manager" }
+duckdb_manager = { path = "../duckdb_manager" }
 
 clap = { workspace = true }
 # ACP Protocol

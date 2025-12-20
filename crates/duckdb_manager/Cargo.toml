@@ -1,0 +1,39 @@
+[package]
+name = "duckdb_manager"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DuckDB in-memory storage manager for RCoder"
+
+[features]
+default = []
+
+[dependencies]
+# DuckDB
+duckdb = { workspace = true }
+
+# Shared types
+shared_types = { path = "../shared_types" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
+tempfile.workspace = true

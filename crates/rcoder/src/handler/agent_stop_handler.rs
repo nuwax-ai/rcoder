@@ -88,11 +88,9 @@ async fn destroy_container_for_project(
             ));
         }
 
-        // 从 Agent 映射中移除（如果 project_id 不是 "unknown"）
+        // 从 DuckDB 存储中移除项目（如果 project_id 不是 "unknown"）
         if container_info.project_id != "unknown" {
-            state
-                .project_and_agent_map
-                .remove(&container_info.project_id);
+            state.remove_project(&container_info.project_id);
         }
 
         info!(

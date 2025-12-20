@@ -8,10 +8,12 @@ mod handler;
 mod proxy_agent;
 mod router;
 mod service;
+pub mod storage;
 mod utils;
 
 // 重新导出主要的类型和函数
 pub use proxy_agent::*;
+pub use storage::{DataBridge, ProjectAdapter};
 pub use utils::*;
 
 // 重新导出 shared_types 中的类型

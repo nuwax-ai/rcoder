@@ -88,8 +88,8 @@ pub async fn agent_status(
         project_id
     );
 
-    // 从MAP中获取Agent container 信息, state.project_and_agent_map.get(project_id)
-    if let Some(agent_info) = state.project_and_agent_map.get(project_id) {
+    // 从 DuckDB 存储中获取 Agent 信息
+    if let Some(agent_info) = state.get_project(project_id) {
         let response = AgentStatusResponse {
             project_id: agent_info.project_id().to_string(),
             is_alive: true,
