@@ -105,12 +105,11 @@ impl ContainerStatusChecker {
 
     /// 检查所有容器的状态
     async fn check_all_containers(&self) -> anyhow::Result<()> {
-        // 收集所有需要检查的容器（创建快照）
+        // 收集所有需要检查的容器（创建快照，使用 DuckDB 存储）
         let containers: Vec<(String, Arc<shared_types::ProjectAndContainerInfo>)> = self
             .state
-            .project_and_agent_map
+            .projects
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
 
         if containers.is_empty() {
@@ -240,7 +239,7 @@ impl ContainerStatusChecker {
                     );
                     self.health_states.remove(lookup_key);
                     self.state.grpc_pool.remove(&grpc_addr);
-                    // 注意：不移除 project_and_agent_map，由清理任务统一处理
+                    // 注意：不移除 DuckDB 存储中的项目记录，由清理任务统一处理
                     return Err(e);
                 }
 
@@ -420,13 +419,13 @@ impl ContainerStatusChecker {
                 let health = entry.value();
 
                 // 移除条件：
-                // 1. 容器已不在 project_and_agent_map 中
+                // 1. 容器已不在 DuckDB 存储中
                 // 2. 最后检查时间超过健康重置周期
-                let not_in_map = !self.state.project_and_agent_map.contains_key(lookup_key);
+                let not_in_storage = !self.state.contains_project(lookup_key);
                 let elapsed = now.signed_duration_since(health.last_check_time);
                 let is_stale = elapsed > retention_duration;
 
-                if not_in_map || is_stale {
+                if not_in_storage || is_stale {
                     Some(lookup_key.clone())
                 } else {
                     None
@@ -528,20 +527,9 @@ async fn query_container_status(
 
 /// 更新容器活动时间
 ///
-/// 使用写时复制模式更新 last_activity
+/// 使用 DuckDB 存储更新 last_activity
 async fn update_container_activity(lookup_key: &str, state: &Arc<AppState>) -> anyhow::Result<()> {
-    use dashmap::mapref::entry::Entry;
-
-    match state.project_and_agent_map.entry(lookup_key.to_string()) {
-        Entry::Occupied(mut occupied) => {
-            // 写时复制模式更新
-            let mut new_info = (**occupied.get()).clone();
-            new_info.update_activity();
-            occupied.insert(Arc::new(new_info));
-            Ok(())
-        }
-        Entry::Vacant(_) => {
-            anyhow::bail!("容器记录不存在: {}", lookup_key);
-        }
-    }
+    // 使用 ProjectAdapter 的 update_activity 方法
+    state.update_activity(lookup_key);
+    Ok(())
 }

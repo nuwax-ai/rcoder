@@ -390,12 +390,12 @@ async fn validate_and_get_session_context(
     state: Arc<crate::router::AppState>,
     session_id: &str,
 ) -> Result<(String, Arc<shared_types::ProjectAndContainerInfo>, String), Response> {
-    // 阶段 2.3: 容器存在性预检
-    let container_id = match state.session_to_container_id.get(session_id) {
-        Some(cid) => cid.value().clone(),
+    // 阶段 2.3: 容器存在性预检 - 使用新的 DuckDB 存储 API
+    let container_id = match state.get_container_id_by_session(session_id) {
+        Some(cid) => cid,
         None => {
             warn!(
-                "❌ [SSE_PROXY] 在 session_to_container_id 映射中未找到会话: session_id={}",
+                "❌ [SSE_PROXY] 会话对应的容器未找到: session_id={}",
                 session_id
             );
             return Err(create_error_response(
@@ -429,8 +429,8 @@ async fn validate_and_get_session_context(
         }
         Ok(false) => {
             error!("❌ [SSE_PROXY] 容器已停止: container_id={}", container_id);
-            // 清理陈旧的会话条目
-            state.session_to_container_id.remove(session_id);
+            // 注意：DuckDB 存储中不需要手动清理会话映射，
+            // cleanup_task 会在后台清理不活跃的容器和相关数据
             return Err(create_error_response(
                 StatusCode::NOT_FOUND,
                 "SESSION_EXPIRED",
@@ -451,7 +451,7 @@ async fn validate_and_get_session_context(
     };
 
     // 容器验证通过后，查找对应的项目和代理信息
-    match find_container_by_session_id(&state, &session_id) {
+    match find_container_by_session_id(&state, session_id) {
         Some((project_id, agent_info)) => {
             info!(
                 "✅ [SSE_PROXY] 找到项目: session_id={}, project_id={}",
@@ -482,7 +482,7 @@ async fn validate_and_get_session_context(
         None => {
             // 理论上在预检后不应该发生，但作为保障
             error!(
-                "❌ [SSE_PROXY] 状态不一致：预检通过但在 project_and_agent_map 中未找到: session_id={}",
+                "❌ [SSE_PROXY] 状态不一致：预检通过但未找到项目信息: session_id={}",
                 session_id
             );
 
@@ -1038,18 +1038,17 @@ fn find_container_by_session_id(
     state: &Arc<crate::router::AppState>,
     session_id: &str,
 ) -> Option<(String, std::sync::Arc<ProjectAndContainerInfo>)> {
-    // 首先尝试从 sessions 映射中查找（通过 session_id 直接查找）
-    if let Some(project_info) = state.sessions.get(session_id) {
-        return Some((project_info.project_id().to_string(), project_info.clone()));
+    // 使用 DuckDB 存储的 get_by_session 方法查找
+    if let Some(project_info) = state.get_by_session(session_id) {
+        return Some((project_info.project_id().to_string(), project_info));
     }
 
-    // 如果 sessions 中没找到，遍历 project_and_agent_map 查找
-    for entry in state.project_and_agent_map.iter() {
-        let agent_info = entry.value();
+    // 如果没找到，遍历所有项目查找（兼容旧逻辑）
+    for (project_id, agent_info) in state.projects.iter() {
         if let Some(agent_session_id) = agent_info.session_id()
             && agent_session_id == session_id
         {
-            return Some((entry.key().clone(), agent_info.clone()));
+            return Some((project_id, agent_info));
         }
     }
     None

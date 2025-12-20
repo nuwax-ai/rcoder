@@ -360,16 +360,14 @@ pub async fn pod_ensure(
         }
     };
 
-    // 3. 在 AppState 中记录容器信息（用于后续保活）
-    if !state.project_and_agent_map.contains_key(&request.user_id) {
+    // 3. 在 DuckDB 存储中记录容器信息（用于后续保活）
+    if !state.contains_project(&request.user_id) {
         // ComputerAgentRunner 模式：使用 project_id 创建，同时设置 user_id
         let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
         project_info.set_user_id(Some(request.user_id.clone()));
         project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
         project_info.set_container(Some(container_info.clone()));
-        state
-            .project_and_agent_map
-            .insert(request.user_id.clone(), Arc::new(project_info));
+        state.insert_project(request.user_id.clone(), Arc::new(project_info));
     }
 
     // 4. 构建响应
@@ -444,51 +442,38 @@ pub async fn pod_keepalive(
     let current_time = chrono::Utc::now();
     let current_time_millis = current_time.timestamp_millis() as u64;
 
-    // 2. 检查 AppState 中是否有记录，并更新活动时间
-    // 使用 Entry API 进行原子性操作，与 cleanup_task.rs 保持一致
+    // 2. 检查 DuckDB 存储中是否有记录，并更新活动时间
     let (previous_activity_time, existed) = {
-        use dashmap::mapref::entry::Entry;
-        match state.project_and_agent_map.entry(request.user_id.clone()) {
-            Entry::Occupied(mut occupied) => {
-                let prev = occupied.get().last_activity().timestamp_millis() as u64;
-                // 克隆并更新，然后替换整个 Arc（避免 Arc::make_mut 的潜在问题）
-                let mut new_info = (**occupied.get()).clone();
-                new_info.update_activity();
-                occupied.insert(Arc::new(new_info));
-                (prev, true)
-            }
-            Entry::Vacant(_) => (0u64, false),
+        if let Some(existing_info) = state.get_project(&request.user_id) {
+            let prev = existing_info.last_activity().timestamp_millis() as u64;
+            // 更新活动时间
+            state.update_activity(&request.user_id);
+            (prev, true)
+        } else {
+            (0u64, false)
         }
     };
 
     // 3. 获取或创建容器
-    // 使用双重检查模式避免 TOCTOU 竞态条件
     let (container_info, created) = if !existed {
-        // AppState 中没有记录，检查 Docker 中是否有容器
+        // DuckDB 存储中没有记录，检查 Docker 中是否有容器
         let existing_container =
             ComputerContainerManager::get_container_info(&request.user_id).await?;
 
         match existing_container {
             Some(info) => {
-                // Docker 中有容器，使用 Entry API 原子性地插入到 AppState
-                // 双重检查：其他线程可能已经在 async 操作期间插入了记录
-                use dashmap::mapref::entry::Entry;
-                match state.project_and_agent_map.entry(request.user_id.clone()) {
-                    Entry::Occupied(_) => {
-                        // 其他线程已经插入，直接使用已有记录
-                        info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），AppState 已被其他线程更新");
-                    }
-                    Entry::Vacant(vacant) => {
-                        // 原子性插入新记录
-                        let mut project_info =
-                            ProjectAndContainerInfo::new(request.project_id.clone());
-                        project_info.set_user_id(Some(request.user_id.clone()));
-                        project_info
-                            .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
-                        project_info.set_container(Some(info.clone()));
-                        vacant.insert(Arc::new(project_info));
-                        info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），已原子性添加到 AppState");
-                    }
+                // Docker 中有容器，检查并插入到 DuckDB 存储
+                if !state.contains_project(&request.user_id) {
+                    let mut project_info =
+                        ProjectAndContainerInfo::new(request.project_id.clone());
+                    project_info.set_user_id(Some(request.user_id.clone()));
+                    project_info
+                        .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+                    project_info.set_container(Some(info.clone()));
+                    state.insert_project(request.user_id.clone(), Arc::new(project_info));
+                    info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），已添加到 DuckDB 存储");
+                } else {
+                    info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），DuckDB 已有记录");
                 }
                 (info, false)
             }
@@ -504,41 +489,34 @@ pub async fn pod_keepalive(
                 )
                 .await?;
 
-                // 使用 Entry API 原子性地插入到 AppState
-                // 双重检查：其他线程可能已经在 async 操作期间插入了记录
-                use dashmap::mapref::entry::Entry;
-                match state.project_and_agent_map.entry(request.user_id.clone()) {
-                    Entry::Occupied(_) => {
-                        // 其他线程已经插入，直接使用已有记录
-                        info!(
-                            "✅ [POD_KEEPALIVE] 容器创建成功，AppState 已被其他线程更新: container_id={}",
-                            info.container_id
-                        );
-                    }
-                    Entry::Vacant(vacant) => {
-                        // 原子性插入新记录
-                        let mut project_info =
-                            ProjectAndContainerInfo::new(request.project_id.clone());
-                        project_info.set_user_id(Some(request.user_id.clone()));
-                        project_info
-                            .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
-                        project_info.set_container(Some(info.clone()));
-                        vacant.insert(Arc::new(project_info));
-                        info!(
-                            "✅ [POD_KEEPALIVE] 容器创建成功，已原子性添加到 AppState: container_id={}",
-                            info.container_id
-                        );
-                    }
+                // 添加到 DuckDB 存储
+                if !state.contains_project(&request.user_id) {
+                    let mut project_info =
+                        ProjectAndContainerInfo::new(request.project_id.clone());
+                    project_info.set_user_id(Some(request.user_id.clone()));
+                    project_info
+                        .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+                    project_info.set_container(Some(info.clone()));
+                    state.insert_project(request.user_id.clone(), Arc::new(project_info));
+                    info!(
+                        "✅ [POD_KEEPALIVE] 容器创建成功，已添加到 DuckDB 存储: container_id={}",
+                        info.container_id
+                    );
+                } else {
+                    info!(
+                        "✅ [POD_KEEPALIVE] 容器创建成功，DuckDB 已有记录: container_id={}",
+                        info.container_id
+                    );
                 }
                 (info, true)
             }
         }
     } else {
-        // AppState 中有记录，直接获取容器信息
+        // DuckDB 存储中有记录，直接获取容器信息
         let info = ComputerContainerManager::get_container_info(&request.user_id)
             .await?
             .ok_or_else(|| {
-                error!("❌ [POD_KEEPALIVE] 容器状态异常：AppState 有记录但 Docker 中找不到容器");
+                error!("❌ [POD_KEEPALIVE] 容器状态异常：DuckDB 有记录但 Docker 中找不到容器");
                 AppError::internal_server_error("容器状态异常")
             })?;
         (info, false)
@@ -639,8 +617,8 @@ pub async fn pod_restart(
             container_info.container_id
         );
 
-        // 从 AppState 中移除记录
-        state.project_and_agent_map.remove(&request.user_id);
+        // 从 DuckDB 存储中移除记录
+        state.remove_project(&request.user_id);
 
         // 获取 DockerManager 并停止容器
         let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -694,24 +672,13 @@ pub async fn pod_restart(
         container_info.container_id
     );
 
-    // 5. 在 AppState 中记录容器信息（使用 Entry API 原子性操作）
+    // 5. 在 DuckDB 存储中记录容器信息
     {
-        use dashmap::mapref::entry::Entry;
         let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
         project_info.set_user_id(Some(request.user_id.clone()));
         project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
         project_info.set_container(Some(container_info.clone()));
-
-        match state.project_and_agent_map.entry(request.user_id.clone()) {
-            Entry::Occupied(mut occupied) => {
-                // 已存在记录，更新为新容器信息
-                occupied.insert(Arc::new(project_info));
-            }
-            Entry::Vacant(vacant) => {
-                // 不存在记录，插入新记录
-                vacant.insert(Arc::new(project_info));
-            }
-        }
+        state.insert_project(request.user_id.clone(), Arc::new(project_info));
     }
 
     // 6. 构建响应

@@ -4,11 +4,10 @@ use axum::{
     Router,
     routing::{get, post},
 };
-use dashmap::DashMap;
 use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
-use crate::{config::AppConfig, handler};
+use crate::{config::AppConfig, handler, storage::ProjectAdapter};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -27,12 +26,8 @@ pub struct SessionInfo {
 pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
-    /// 活跃的会话映射, session_id -> ProjectAndContainerInfo,方便sse消息长连接,获取对应的agent所在容器服务
-    pub sessions: DashMap<String, Arc<ProjectAndContainerInfo>>,
-    /// 活跃的项目和容器映射, project_id -> ProjectAndContainerInfo
-    pub project_and_agent_map: DashMap<String, Arc<ProjectAndContainerInfo>>,
-    /// 会话到容器ID的映射, session_id -> container_id
-    pub session_to_container_id: DashMap<String, String>,
+    /// 项目适配器 - 统一管理项目、会话和容器数据（替代原有的 3 个 DashMap）
+    pub projects: ProjectAdapter,
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<pingora_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
@@ -46,12 +41,70 @@ impl AppState {
     ) -> Self {
         Self {
             config,
-            sessions: DashMap::new(),
-            project_and_agent_map: DashMap::new(),
-            session_to_container_id: DashMap::new(),
+            projects: ProjectAdapter::new().expect("初始化 ProjectAdapter 失败"),
             pingora_service: pingora,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
         }
+    }
+
+    // ========== 向后兼容的便捷方法 ==========
+
+    /// 获取项目信息（替代 project_and_agent_map.get）
+    #[inline]
+    pub fn get_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.projects.get(project_id)
+    }
+
+    /// 插入项目信息（替代 project_and_agent_map.insert）
+    #[inline]
+    pub fn insert_project(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) {
+        if let Err(e) = self.projects.insert(project_id.clone(), info) {
+            tracing::error!("插入项目 {} 失败: {}", project_id, e);
+        }
+    }
+
+    /// 删除项目（替代 project_and_agent_map.remove）
+    #[inline]
+    pub fn remove_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.projects.remove(project_id)
+    }
+
+    /// 检查项目是否存在（替代 project_and_agent_map.contains_key）
+    #[inline]
+    pub fn contains_project(&self, project_id: &str) -> bool {
+        self.projects.contains_key(project_id)
+    }
+
+    /// 通过会话ID获取项目信息（替代 sessions.get）
+    #[inline]
+    pub fn get_by_session(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.projects.get_by_session_id(session_id)
+    }
+
+    /// 通过会话ID获取容器ID（替代 session_to_container_id.get）
+    #[inline]
+    pub fn get_container_id_by_session(&self, session_id: &str) -> Option<String> {
+        self.projects.get_container_id_by_session(session_id)
+    }
+
+    /// 更新会话信息
+    #[inline]
+    pub fn update_session(&self, project_id: &str, session_id: &str) {
+        if let Err(e) = self.projects.update_session(project_id, session_id) {
+            tracing::error!("更新会话失败: project_id={}, session_id={}, error={}", project_id, session_id, e);
+        }
+    }
+
+    /// 更新项目活动时间
+    #[inline]
+    pub fn update_activity(&self, project_id: &str) {
+        self.projects.update_activity(project_id);
+    }
+
+    /// 更新会话活动时间
+    #[inline]
+    pub fn update_session_activity(&self, session_id: &str) {
+        self.projects.update_session_activity(session_id);
     }
 }
 

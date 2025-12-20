@@ -183,10 +183,10 @@ pub async fn computer_agent_stop(
             }
         }
 
-        // 清理本地会话映射
-        state.session_to_container_id.remove(session_id);
+        // 注意：DuckDB 存储中的会话数据会由 cleanup_task 统一清理
+        // 不再需要手动清理 session_to_container_id 映射
         info!(
-            "🧹 [COMPUTER_STOP] 已清理会话映射: session_id={}",
+            "🧹 [COMPUTER_STOP] 会话 {} 将由 cleanup_task 清理",
             session_id
         );
     }

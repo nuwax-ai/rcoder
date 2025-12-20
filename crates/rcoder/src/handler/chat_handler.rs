@@ -175,80 +175,66 @@ pub async fn handle_chat(
         )
         .await?;
 
-    // 第二步：获取或创建 ProjectAndContainerInfo - 使用新的高效状态管理
+    // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
     let _ = {
         info!("🔍 [CHAT] 开始获取/创建项目信息: project_id={}", project_id);
 
-        // 使用 entry API 一次性处理获取和创建，避免多次锁获取
-        let entry = state.project_and_agent_map.entry(project_id.clone());
+        // 检查项目是否存在
+        if let Some(existing_info) = state.get_project(&project_id) {
+            info!("📋 [CHAT] 更新现有项目信息: project_id={}", project_id);
 
-        match entry {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
-                info!("📋 [CHAT] 更新现有项目信息: project_id={}", project_id);
+            // 检查是否需要更新扩展状态
+            let needs_extended_update = existing_info.container().is_none()
+                || existing_info.model_provider().is_none()
+                || existing_info.request_id().is_none();
 
-                // 获取现有信息的可变引用，使用新的高效更新方法
-                let existing_info = occupied_entry.get();
-
-                // 检查是否需要更新扩展状态（避免不必要的写时复制）
-                let needs_extended_update = existing_info.container().is_none()
-                    || existing_info.model_provider().is_none()
-                    || existing_info.request_id().is_none();
-
-                if needs_extended_update {
-                    // 使用新的批量更新方法，减少 Arc::make_mut 调用次数
-                    let mut mutable_info = (**existing_info).clone();
-                    mutable_info.update_extended_from_request(
-                        Some(container_info.clone()),
-                        request.model_provider.clone(),
-                        request.request_id.clone(),
-                        Some(service_type.clone()),
-                    );
-                    mutable_info.update_activity(); // 更新活动时间
-
-                    let arc_info = Arc::new(mutable_info);
-                    occupied_entry.insert(arc_info.clone());
-
-                    info!(
-                        "✅ [CHAT] 项目信息完整更新完成: project_id={}, container_id={}",
-                        project_id, container_info.container_id
-                    );
-
-                    arc_info
-                } else {
-                    // 只需要更新活动时间
-                    let mut mutable_info = (**existing_info).clone();
-                    mutable_info.update_activity();
-
-                    let arc_info = Arc::new(mutable_info);
-                    occupied_entry.insert(arc_info.clone());
-
-                    info!("✅ [CHAT] 项目活动时间更新完成: project_id={}", project_id);
-
-                    arc_info
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(vacant_entry) => {
-                info!("🆕 [CHAT] 创建新项目信息: project_id={}", project_id);
-
-                // 创建新的 ProjectAndContainerInfo，使用新的初始化方法
-                let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
-                new_info.update_extended_from_request(
+            if needs_extended_update {
+                // 创建更新后的信息
+                let mut mutable_info = (*existing_info).clone();
+                mutable_info.update_extended_from_request(
                     Some(container_info.clone()),
                     request.model_provider.clone(),
                     request.request_id.clone(),
                     Some(service_type.clone()),
                 );
+                mutable_info.update_activity();
 
-                let arc_info = Arc::new(new_info);
-                vacant_entry.insert(arc_info.clone());
+                let arc_info = Arc::new(mutable_info);
+                state.insert_project(project_id.clone(), arc_info.clone());
 
                 info!(
-                    "✅ [CHAT] 项目信息创建完成: project_id={}, container_id={}",
+                    "✅ [CHAT] 项目信息完整更新完成: project_id={}, container_id={}",
                     project_id, container_info.container_id
                 );
 
                 arc_info
+            } else {
+                // 只需要更新活动时间
+                state.update_activity(&project_id);
+                info!("✅ [CHAT] 项目活动时间更新完成: project_id={}", project_id);
+                existing_info
             }
+        } else {
+            info!("🆕 [CHAT] 创建新项目信息: project_id={}", project_id);
+
+            // 创建新的 ProjectAndContainerInfo
+            let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
+            new_info.update_extended_from_request(
+                Some(container_info.clone()),
+                request.model_provider.clone(),
+                request.request_id.clone(),
+                Some(service_type.clone()),
+            );
+
+            let arc_info = Arc::new(new_info);
+            state.insert_project(project_id.clone(), arc_info.clone());
+
+            info!(
+                "✅ [CHAT] 项目信息创建完成: project_id={}, container_id={}",
+                project_id, container_info.container_id
+            );
+
+            arc_info
         }
     };
 
@@ -258,7 +244,7 @@ pub async fn handle_chat(
         forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
     info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
 
-    // 响应后状态更新 - 使用新的高效会话更新方法
+    // 响应后状态更新 - 使用 DuckDB 存储
     if let Ok(http_result) = &result {
         if let Some(chat_response) = &http_result.data {
             info!(
@@ -266,86 +252,17 @@ pub async fn handle_chat(
                 chat_response.session_id
             );
 
-            // 收集会话信息
             let session_id = chat_response.session_id.clone();
-            let container_id = container_info.container_id.clone();
 
-            // 🔗 阶段 2.2: 填充 session_id -> container_id 的映射
+            // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
             info!(
-                "🔗 [SESSION_MAP] 关联 session_id {} 到 container_id {}",
-                session_id, container_id
+                "🔗 [SESSION_MAP] 关联 session_id {} 到 project_id {}",
+                session_id, project_id
             );
-            state
-                .session_to_container_id
-                .insert(session_id.clone(), container_id);
+            state.update_session(&project_id, &session_id);
 
-            // 使用新的高效更新方法进行原子性状态更新
-            info!("🔄 [CHAT] 开始更新项目会话状态: project_id={}", project_id);
-
-            let updated_arc_info = {
-                let entry = state.project_and_agent_map.entry(project_id.clone());
-                match entry {
-                    dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
-                        // 使用新的会话更新方法，自动处理写时复制
-                        let existing_info = occupied_entry.get();
-
-                        // 检查是否真的需要更新会话信息
-                        if existing_info.session_id() != Some(&session_id) {
-                            // 创建可变副本并更新会话信息
-                            let mut mutable_info = (**existing_info).clone();
-                            mutable_info.update_session(session_id.clone());
-
-                            let arc_info = Arc::new(mutable_info);
-                            occupied_entry.insert(arc_info.clone());
-
-                            info!(
-                                "✅ [CHAT] 项目会话状态更新完成: project_id={}, session_id={}",
-                                project_id, session_id
-                            );
-
-                            arc_info
-                        } else {
-                            // 只需更新活动时间
-                            let mut mutable_info = (**existing_info).clone();
-                            mutable_info.update_activity();
-
-                            let arc_info = Arc::new(mutable_info);
-                            occupied_entry.insert(arc_info.clone());
-
-                            info!(
-                                "✅ [CHAT] 项目活动时间更新完成: project_id={}, session_id={}",
-                                project_id, session_id
-                            );
-
-                            arc_info
-                        }
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(vacant_entry) => {
-                        warn!(
-                            "⚠️ [CHAT] 项目信息不存在，创建新条目: project_id={}",
-                            project_id
-                        );
-                        let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
-                        new_info.update_session(session_id.clone());
-
-                        let arc_info = Arc::new(new_info);
-                        vacant_entry.insert(arc_info.clone());
-
-                        info!(
-                            "✅ [CHAT] 新项目会话状态创建完成: project_id={}, session_id={}",
-                            project_id, session_id
-                        );
-
-                        arc_info
-                    }
-                }
-            };
-
-            // 更新 sessions 映射 - 使用轻量级索引
-            info!("🔄 [CHAT] 更新会话索引映射: session_id={}", session_id);
-            state
-                .sessions
-                .insert(session_id.clone(), updated_arc_info.clone());
+            // 更新项目活动时间
+            state.update_activity(&project_id);
 
             info!(
                 "🎯 [CHAT] 所有状态更新完成: project_id={}, session_id={}",

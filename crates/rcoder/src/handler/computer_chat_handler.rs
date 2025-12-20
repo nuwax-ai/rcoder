@@ -242,84 +242,70 @@ pub async fn handle_computer_chat(
     if result.is_success() {
         if let Some(chat_response) = &result.data {
             let session_id = chat_response.session_id.clone();
-            let container_id = container_info.container_id.clone();
 
             info!(
-                "🔗 [COMPUTER_CHAT] 关联会话: session_id={} -> container_id={}, user_id={}, project_id={}",
-                session_id, container_id, user_id, project_id
+                "🔗 [COMPUTER_CHAT] 关联会话: session_id={} -> user_id={}, project_id={}",
+                session_id, user_id, project_id
             );
 
             // 🔧 ComputerAgentRunner 模式：使用 user_id 作为容器标识（一个用户一个容器）
-            // 检查是否已存在该 user_id 的记录，如果存在则更新 last_activity
+            // 使用 DuckDB 存储替代 DashMap
             let map_key = user_id.clone();
 
-            // 使用 Entry API 实现原子性更新或插入
-            use dashmap::mapref::entry::Entry;
-            match state.project_and_agent_map.entry(map_key.clone()) {
-                Entry::Occupied(mut occupied) => {
-                    // ✅ 已存在：更新 last_activity 和 session_id（写时复制）
-                    let old_info = occupied.get();
-                    let mut updated_info = (*old_info).as_ref().clone();
+            // 检查是否已存在该 user_id 的记录
+            if let Some(existing_info) = state.get_project(&map_key) {
+                // ✅ 已存在：更新信息
+                let mut updated_info = (*existing_info).clone();
 
-                    // 更新活动时间（关键修复点！）
-                    updated_info.update_activity();
-                    updated_info.update_session(session_id.clone());
+                // 更新活动时间
+                updated_info.update_activity();
+                updated_info.update_session(session_id.clone());
 
-                    // 更新扩展信息
-                    updated_info.update_extended_from_request(
-                        Some(container_info.clone()),
-                        request.model_provider.clone(),
-                        request.request_id.clone(),
-                        Some(shared_types::ServiceType::ComputerAgentRunner),
-                    );
+                // 更新扩展信息
+                updated_info.update_extended_from_request(
+                    Some(container_info.clone()),
+                    request.model_provider.clone(),
+                    request.request_id.clone(),
+                    Some(shared_types::ServiceType::ComputerAgentRunner),
+                );
 
-                    let updated_arc = Arc::new(updated_info);
-                    occupied.insert(updated_arc.clone());
+                state.insert_project(map_key.clone(), Arc::new(updated_info));
 
-                    // 更新其他映射表
-                    state
-                        .session_to_container_id
-                        .insert(session_id.clone(), container_id);
-                    state.sessions.insert(session_id.clone(), updated_arc);
+                // 更新会话映射
+                state.update_session(&map_key, &session_id);
 
-                    info!(
-                        "🔄 [COMPUTER_CHAT] 已更新现有容器映射: user_id={}, project_id={}, session_id={} (last_activity 已刷新)",
-                        user_id, project_id, session_id
-                    );
-                }
-                Entry::Vacant(vacant) => {
-                    // 🆕 不存在：创建新的 ProjectAndContainerInfo
-                    let mut project_info =
-                        shared_types::ProjectAndContainerInfo::new(map_key.clone());
+                info!(
+                    "🔄 [COMPUTER_CHAT] 已更新现有容器映射: user_id={}, project_id={}, session_id={} (last_activity 已刷新)",
+                    user_id, project_id, session_id
+                );
+            } else {
+                // 🆕 不存在：创建新的 ProjectAndContainerInfo
+                let mut project_info =
+                    shared_types::ProjectAndContainerInfo::new(map_key.clone());
 
-                    // 设置 user_id（ComputerAgentRunner 模式）
-                    project_info.set_user_id(Some(user_id.clone()));
+                // 设置 user_id（ComputerAgentRunner 模式）
+                project_info.set_user_id(Some(user_id.clone()));
 
-                    // 更新会话ID
-                    project_info.update_session(session_id.clone());
+                // 更新会话ID
+                project_info.update_session(session_id.clone());
 
-                    // 更新扩展信息（容器、模型配置等）
-                    project_info.update_extended_from_request(
-                        Some(container_info.clone()),
-                        request.model_provider.clone(),
-                        request.request_id.clone(),
-                        Some(shared_types::ServiceType::ComputerAgentRunner),
-                    );
+                // 更新扩展信息（容器、模型配置等）
+                project_info.update_extended_from_request(
+                    Some(container_info.clone()),
+                    request.model_provider.clone(),
+                    request.request_id.clone(),
+                    Some(shared_types::ServiceType::ComputerAgentRunner),
+                );
 
-                    let project_info_arc = Arc::new(project_info);
-                    vacant.insert(project_info_arc.clone());
+                state.insert_project(map_key.clone(), Arc::new(project_info));
 
-                    // 填充其他映射表
-                    state
-                        .session_to_container_id
-                        .insert(session_id.clone(), container_id);
-                    state.sessions.insert(session_id.clone(), project_info_arc);
+                // 更新会话映射
+                state.update_session(&map_key, &session_id);
 
-                    info!(
-                        "🆕 [COMPUTER_CHAT] 已创建新容器映射: user_id={}, project_id={}, session_id={}",
-                        user_id, project_id, session_id
-                    );
-                }
+                info!(
+                    "🆕 [COMPUTER_CHAT] 已创建新容器映射: user_id={}, project_id={}, session_id={}",
+                    user_id, project_id, session_id
+                );
             }
 
             info!(

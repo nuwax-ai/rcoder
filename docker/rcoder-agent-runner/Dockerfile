@@ -213,7 +213,13 @@ RUN case "$TARGETARCH" in \
     "arm64") VS_ARCH="arm64" ;; \
     *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
     esac && \
-    wget -O /tmp/vscode.deb "https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-${VS_ARCH}" && \
+    echo "🔍 Downloading VS Code for ${TARGETARCH} (${VS_ARCH}) from multiple mirrors..." && \
+    # Try multiple mirrors for VS Code download
+    (wget --tries=2 -O /tmp/vscode.deb "https://vscode.cdn.azure.cn/stable/latest" || \
+     wget --tries=2 -O /tmp/vscode.deb "https://mirrors.tuna.tsinghua.edu.cn/vscode/stable/latest" || \
+     wget --tries=2 -O /tmp/vscode.deb "https://mirrors.ustc.edu.cn/vscode/stable/latest" || \
+     wget --tries=2 -O /tmp/vscode.deb "https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-${VS_ARCH}") && \
+    echo "📦 Installing VS Code..." && \
     dpkg -i /tmp/vscode.deb || true && \
     apt-get update && \
     apt-get install -f -y && \
@@ -221,6 +227,21 @@ RUN case "$TARGETARCH" in \
     apt-get autoremove -y && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# 验证关键软件安装是否成功
+RUN echo "🔍 Verifying installations..." && \
+    # VS Code
+    if [ ! -x /usr/bin/code ]; then \
+        echo "❌ VS Code installation failed! /usr/bin/code not found" && exit 1; \
+    fi && \
+    echo "✅ VS Code: $(/usr/bin/code --version 2>/dev/null | head -1 || echo 'installed')" && \
+    # Chromium
+    if [ ! -x /usr/bin/chromium ]; then \
+        echo "❌ Chromium installation failed!" && exit 1; \
+    fi && \
+    echo "✅ Chromium: $(/usr/bin/chromium --version 2>/dev/null || echo 'installed')" && \
+    echo "🎉 All critical software verified!"
+
 RUN mkdir -p /home/user/.config/Code/User
 COPY ./settings.json /home/user/.config/Code/User/settings.json
 
