@@ -147,6 +147,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Pod 容器管理接口
         .route("/computer/pod/count", get(handler::pod_count))
+        .route("/computer/pod/list", get(handler::pod_list))
         .route("/computer/pod/ensure", post(handler::pod_ensure))
         .route("/computer/pod/keepalive", post(handler::pod_keepalive))
         .route("/computer/pod/restart", post(handler::pod_restart))
@@ -190,6 +191,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::computer_desktop_proxy,
         // Pod 容器管理接口
         handler::pod_count,
+        handler::pod_list,
         handler::pod_ensure,
         handler::pod_keepalive,
         handler::pod_restart,
@@ -244,6 +246,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             // Pod 容器管理相关结构体
             handler::PodCountResponse,
             handler::PodCountByServiceType,
+            handler::PodListQuery,
+            handler::PodListResponse,
+            handler::PodDetailInfo,
             handler::EnsurePodRequest,
             handler::PodResourceLimits,
             handler::EnsurePodResponse,

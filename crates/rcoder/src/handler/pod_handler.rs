@@ -4,15 +4,16 @@
 //!
 //! ## 接口列表
 //! - `GET /computer/pod/count` - 获取容器数量统计
+//! - `GET /computer/pod/list` - 获取所有容器信息（支持分页）
 //! - `POST /computer/pod/ensure` - 启动/确保容器存在（幂等）
 //! - `POST /computer/pod/keepalive` - 容器保活（刷新活动时间）
 
-use axum::Json;
+use axum::{extract::Query, Json};
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
@@ -55,6 +56,99 @@ pub struct PodCountByServiceType {
     /// ComputerAgentRunner 类型容器数量
     #[schema(example = 3)]
     pub computer_agent_runner: u32,
+}
+
+// ============================================================================
+// 接口二：获取所有容器信息
+// ============================================================================
+
+/// 获取容器列表的查询参数
+#[derive(Debug, Clone, Deserialize, IntoParams, ToSchema)]
+pub struct PodListQuery {
+    /// 分页大小（默认100，不传则返回所有）
+    #[param(example = 100)]
+    #[schema(example = 100)]
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// 容器详细信息
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PodDetailInfo {
+    /// 容器 ID
+    #[schema(example = "abc123def456")]
+    pub container_id: String,
+
+    /// 容器名称
+    #[schema(example = "computer-agent-runner-user_123")]
+    pub container_name: String,
+
+    /// 容器 IP 地址 (内部网络)
+    #[schema(example = "172.17.0.5")]
+    pub container_ip: String,
+
+    /// 服务 URL
+    #[schema(example = "http://172.17.0.5:8086")]
+    pub service_url: String,
+
+    /// 容器状态
+    #[schema(example = "running")]
+    pub status: String,
+
+    /// 服务类型
+    #[schema(example = "ComputerAgentRunner")]
+    pub service_type: String,
+
+    /// 项目 ID（如果有）
+    #[schema(example = "proj_456")]
+    pub project_id: Option<String>,
+
+    /// 用户 ID（如果有）
+    #[schema(example = "user_123")]
+    pub user_id: Option<String>,
+
+    /// 创建时间 (Unix 毫秒时间戳)
+    #[schema(example = 1702700000000_u64)]
+    pub created_at: u64,
+
+    /// 最后活动时间 (Unix 毫秒时间戳)
+    #[schema(example = 1702700600000_u64)]
+    pub last_activity: Option<u64>,
+
+    /// 镜像名称
+    #[schema(example = "rcoder-agent-runner:latest")]
+    pub image: Option<String>,
+
+    /// 内部端口
+    #[schema(example = 8086)]
+    pub internal_port: Option<u16>,
+
+    /// 外部端口
+    #[schema(example = 30001)]
+    pub external_port: Option<u16>,
+}
+
+/// 获取容器列表响应
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PodListResponse {
+    /// 容器列表
+    pub containers: Vec<PodDetailInfo>,
+
+    /// 总数量
+    #[schema(example = 5)]
+    pub total: u32,
+
+    /// 返回数量
+    #[schema(example = 5)]
+    pub returned: u32,
+
+    /// 是否已分页
+    #[schema(example = false)]
+    pub paginated: bool,
+
+    /// 查询时间戳 (Unix 毫秒)
+    #[schema(example = 1702700000000_u64)]
+    pub timestamp: u64,
 }
 
 // ============================================================================
@@ -280,6 +374,201 @@ pub async fn pod_count(
     Ok(HttpResult::success(response))
 }
 
+/// 获取所有容器信息
+///
+/// 获取所有容器的详细信息，支持可选的分页查询（默认100条）。
+/// 如果不传 limit 参数，则返回所有容器。
+#[utoipa::path(
+    get,
+    path = "/computer/pod/list",
+    params(
+        PodListQuery
+    ),
+    responses(
+        (status = 200, description = "成功获取容器列表", body = HttpResult<PodListResponse>),
+        (status = 500, description = "服务器内部错误", body = HttpResult<String>)
+    ),
+    tag = "pod",
+    operation_id = "pod_list",
+    summary = "获取所有容器信息",
+    description = "获取所有容器的详细信息，支持可选的分页查询（默认100条）。如果不传 limit 参数，则返回所有容器。"
+)]
+#[axum::debug_handler]
+#[instrument(skip(state))]
+pub async fn pod_list(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PodListQuery>,
+) -> Result<HttpResult<PodListResponse>, AppError> {
+    debug!("📋 [POD_LIST] 获取容器列表: limit={:?}", params.limit);
+
+    // 1. 获取 Docker 容器列表
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [POD_LIST] 获取 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+        })?;
+
+    let docker_containers = docker_manager.list_containers();
+
+    // 2. 获取 DuckDB 存储中的容器记录
+    let duckdb_containers = state
+        .projects
+        .get_all_container_records()
+        .map_err(|e| {
+            error!("❌ [POD_LIST] 获取 DuckDB 容器列表失败: {}", e);
+            AppError::internal_server_error(&format!("获取 DuckDB 容器列表失败: {}", e))
+        })?;
+
+    // 3. 创建容器ID到DuckDB记录的映射
+    let mut duckdb_map: std::collections::HashMap<String, &duckdb_manager::ContainerRecord> =
+        std::collections::HashMap::new();
+    for record in &duckdb_containers {
+        duckdb_map.insert(record.container_id.clone(), record);
+    }
+
+    // 4. 合并数据，构建容器详细信息列表
+    let mut containers: Vec<PodDetailInfo> = Vec::new();
+
+    for docker_container in &docker_containers {
+        let duckdb_record = duckdb_map.get(&docker_container.container_id);
+
+        // 确定服务类型
+        let service_type = if docker_container.container_name.starts_with("rcoder-agent-") {
+            "RCoder"
+        } else if docker_container
+            .container_name
+            .starts_with("computer-agent-runner-")
+        {
+            "ComputerAgentRunner"
+        } else {
+            "Unknown"
+        };
+
+        // 从容器名称提取 user_id（如果是 computer-agent-runner-{user_id}）
+        let user_id = if docker_container
+            .container_name
+            .starts_with("computer-agent-runner-")
+        {
+            docker_container
+                .container_name
+                .strip_prefix("computer-agent-runner-")
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        // 获取项目ID和用户ID（从DuckDB或Docker容器信息）
+        let project_id = duckdb_record
+            .and_then(|r| {
+                // 尝试从DuckDB关联的项目中获取project_id
+                state
+                    .projects
+                    .get_projects_by_container_id(&r.container_id)
+                    .ok()
+                    .and_then(|projects| projects.first().map(|p| p.project_id.clone()))
+            })
+            .or_else(|| {
+                // 如果DuckDB中没有，使用Docker容器中的project_id
+                if !docker_container.project_id.is_empty()
+                    && docker_container.project_id != "unknown"
+                {
+                    Some(docker_container.project_id.clone())
+                } else {
+                    None
+                }
+            });
+
+        let final_user_id = user_id.or_else(|| {
+            duckdb_record.and_then(|r| {
+                state
+                    .projects
+                    .get_projects_by_container_id(&r.container_id)
+                    .ok()
+                    .and_then(|projects| {
+                        projects
+                            .first()
+                            .and_then(|p| p.user_id.as_ref().map(|s| s.clone()))
+                    })
+            })
+        });
+
+        // 构建容器详细信息
+        let container_info = PodDetailInfo {
+            container_id: docker_container.container_id.clone(),
+            container_name: docker_container.container_name.clone(),
+            container_ip: duckdb_record
+                .map(|r| r.container_ip.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            service_url: duckdb_record
+                .map(|r| r.service_url.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "http://{}:{}",
+                        docker_container.assigned_port,
+                        docker_container.internal_port
+                    )
+                }),
+            status: match &docker_container.status {
+                docker_manager::ContainerStatus::Running => "running".to_string(),
+                docker_manager::ContainerStatus::Stopped => "stopped".to_string(),
+                docker_manager::ContainerStatus::Creating => "creating".to_string(),
+                docker_manager::ContainerStatus::Paused => "paused".to_string(),
+                docker_manager::ContainerStatus::Restarting => "restarting".to_string(),
+                docker_manager::ContainerStatus::Removing => "removing".to_string(),
+                docker_manager::ContainerStatus::Exited => "exited".to_string(),
+                docker_manager::ContainerStatus::Dead => "dead".to_string(),
+                docker_manager::ContainerStatus::Unknown(s) => format!("unknown:{}", s),
+            },
+            service_type: service_type.to_string(),
+            project_id,
+            user_id: final_user_id,
+            created_at: docker_container.created_at.timestamp_millis() as u64,
+            last_activity: duckdb_record.map(|r| r.last_activity.timestamp_millis() as u64),
+            image: Some(docker_container.image.clone()),
+            internal_port: Some(docker_container.internal_port),
+            external_port: if docker_container.assigned_port > 0 {
+                Some(docker_container.assigned_port)
+            } else {
+                duckdb_record.map(|r| r.external_port)
+            },
+        };
+
+        containers.push(container_info);
+    }
+
+    // 5. 按创建时间倒序排序（最新的在前）
+    containers.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    // 6. 应用分页
+    let total = containers.len() as u32;
+    let limit = params.limit.unwrap_or(0);
+    let paginated = limit > 0;
+    let returned = if paginated {
+        containers.truncate(limit as usize);
+        limit.min(total)
+    } else {
+        total
+    };
+
+    let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+    let response = PodListResponse {
+        containers,
+        total,
+        returned,
+        paginated,
+        timestamp,
+    };
+
+    info!(
+        "✅ [POD_LIST] 容器列表获取完成: total={}, returned={}, paginated={}",
+        total, returned, paginated
+    );
+
+    Ok(HttpResult::success(response))
+}
+
 /// 启动/确保容器存在（幂等）
 ///
 /// 根据 user_id 和 project_id 启动或获取已存在的容器。
@@ -410,7 +699,7 @@ pub async fn pod_ensure(
     tag = "pod",
     operation_id = "pod_keepalive",
     summary = "容器保活（刷新活动时间）",
-    description = "刷新容器的最后活动时间，防止被定时清理任务销毁。如果容器不存在会自动创建。"
+    description = "刷新容器的最后活动时间，防止被定时清理任务销毁。如果容器不存在会返回错误。"
 )]
 #[axum::debug_handler]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
@@ -478,37 +767,15 @@ pub async fn pod_keepalive(
                 (info, false)
             }
             None => {
-                // Docker 中也没有容器，创建新容器
-                info!(
-                    "🏗️ [POD_KEEPALIVE] 容器不存在，自动创建: user_id={}",
+                // Docker 中也没有容器，返回错误而不是创建新容器
+                error!(
+                    "❌ [POD_KEEPALIVE] 容器不存在: user_id={}",
                     request.user_id
                 );
-                let info = ComputerContainerManager::get_or_create_container_for_user(
-                    &request.user_id,
-                    None,
-                )
-                .await?;
-
-                // 添加到 DuckDB 存储
-                if !state.contains_project(&request.user_id) {
-                    let mut project_info =
-                        ProjectAndContainerInfo::new(request.project_id.clone());
-                    project_info.set_user_id(Some(request.user_id.clone()));
-                    project_info
-                        .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
-                    project_info.set_container(Some(info.clone()));
-                    state.insert_project(request.user_id.clone(), Arc::new(project_info));
-                    info!(
-                        "✅ [POD_KEEPALIVE] 容器创建成功，已添加到 DuckDB 存储: container_id={}",
-                        info.container_id
-                    );
-                } else {
-                    info!(
-                        "✅ [POD_KEEPALIVE] 容器创建成功，DuckDB 已有记录: container_id={}",
-                        info.container_id
-                    );
-                }
-                (info, true)
+                return Ok(HttpResult::error(
+                    shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                    &format!("找不到用户 {} 的容器，请先发送聊天请求创建容器", request.user_id),
+                ));
             }
         }
     } else {
