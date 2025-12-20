@@ -9,7 +9,7 @@ use duckdb_manager::{
     ContainerRecord, DuckDbStorage, ProjectRecord, StorageStats, UnifiedStorage,
 };
 use shared_types::{
-    ContainerBasicInfo, ModelProviderConfig, ProjectAndContainerInfo, ServiceType,
+    ContainerBasicInfo, ProjectAndContainerInfo, ServiceType,
 };
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -252,6 +252,16 @@ impl ProjectAdapter {
                 Vec::new()
             }
         }
+    }
+
+    /// 获取所有容器记录
+    pub fn get_all_container_records(&self) -> Result<Vec<ContainerRecord>, duckdb_manager::DuckDbError> {
+        self.storage.get_all_containers()
+    }
+
+    /// 根据容器ID获取关联的项目列表
+    pub fn get_projects_by_container_id(&self, container_id: &str) -> Result<Vec<ProjectRecord>, duckdb_manager::DuckDbError> {
+        self.storage.get_projects_by_container(container_id)
     }
 
     // ========== 清理相关方法 ==========

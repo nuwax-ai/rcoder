@@ -60,6 +60,9 @@ pub const ERR_SESSION_NOT_FOUND: &str = "SESSION_NOT_FOUND";
 /// Agent 不存在或已停止
 pub const ERR_AGENT_NOT_FOUND: &str = "AGENT_NOT_FOUND";
 
+/// 容器不存在
+pub const ERR_CONTAINER_NOT_FOUND: &str = "CONTAINER_NOT_FOUND";
+
 /// HTTP 回退失败
 pub const ERR_HTTP_FALLBACK_FAILED: &str = "HTTP_FALLBACK_FAILED";
 
@@ -85,6 +88,7 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_PROXY_SERVICE_UNAVAILABLE => "代理服务不可用",
         ERR_SESSION_NOT_FOUND => "会话不存在或已完成",
         ERR_AGENT_NOT_FOUND => "Agent 不存在或已停止",
+        ERR_CONTAINER_NOT_FOUND => "容器不存在",
         ERR_HTTP_FALLBACK_FAILED => "HTTP 回退失败",
         ERR_INTERNAL_SERVER_ERROR => "内部服务器错误",
         ERR_UNKNOWN => "未知错误",
