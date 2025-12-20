@@ -21,13 +21,6 @@ use crate::{AppError, HttpResult};
 use shared_types::{ProjectAndContainerInfo, ServiceResourceLimits};
 
 // ============================================================================
-// 常量定义
-// ============================================================================
-
-/// 默认清理超时时间（30分钟 = 1800秒）
-const CLEANUP_TIMEOUT_SECONDS: u64 = 1800;
-
-// ============================================================================
 // 接口一：获取容器数量
 // ============================================================================
 
@@ -798,15 +791,18 @@ pub async fn pod_keepalive(
         status: container_info.status.clone(),
     };
 
+    // 从配置中获取清理超时时间
+    let idle_timeout_seconds = state.config.cleanup_config.idle_timeout_seconds;
+
     let message = if created {
         format!(
             "容器已自动创建，距离自动清理还有 {} 分钟",
-            CLEANUP_TIMEOUT_SECONDS / 60
+            idle_timeout_seconds / 60
         )
     } else {
         format!(
             "容器活动时间已刷新，距离自动清理还有 {} 分钟",
-            CLEANUP_TIMEOUT_SECONDS / 60
+            idle_timeout_seconds / 60
         )
     };
 
@@ -816,13 +812,13 @@ pub async fn pod_keepalive(
         container_info: pod_container_info,
         previous_activity_time,
         current_activity_time: current_time_millis,
-        time_until_cleanup: CLEANUP_TIMEOUT_SECONDS,
+        time_until_cleanup: idle_timeout_seconds,
         message,
     };
 
     info!(
         "✅ [POD_KEEPALIVE] 保活完成: existed={}, created={}, time_until_cleanup={}s",
-        !created, created, CLEANUP_TIMEOUT_SECONDS
+        !created, created, idle_timeout_seconds
     );
 
     Ok(HttpResult::success(response))
