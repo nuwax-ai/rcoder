@@ -4,7 +4,9 @@
 
 use crate::connection::DuckDbConnection;
 use crate::error::DuckDbResult;
-use crate::models::{CleanupResult, ContainerRecord, IdleContainerInfo, ProjectRecord, StorageStats};
+use crate::models::{
+    CleanupResult, ContainerRecord, IdleContainerInfo, ProjectRecord, StorageStats,
+};
 use crate::repositories::{ContainerRepository, ProjectRepository};
 use crate::schema::SchemaInitializer;
 use shared_types::ServiceType;
@@ -35,10 +37,17 @@ pub trait UnifiedStorage: Send + Sync {
     fn get_all_containers(&self) -> DuckDbResult<Vec<ContainerRecord>>;
 
     /// 按服务类型获取容器
-    fn get_containers_by_service_type(&self, service_type: ServiceType) -> DuckDbResult<Vec<ContainerRecord>>;
+    fn get_containers_by_service_type(
+        &self,
+        service_type: ServiceType,
+    ) -> DuckDbResult<Vec<ContainerRecord>>;
 
     /// 查找闲置容器
-    fn find_idle_containers(&self, idle_minutes: i64, protection_minutes: i64) -> DuckDbResult<Vec<IdleContainerInfo>>;
+    fn find_idle_containers(
+        &self,
+        idle_minutes: i64,
+        protection_minutes: i64,
+    ) -> DuckDbResult<Vec<IdleContainerInfo>>;
 
     // ========== 项目操作 ==========
 
@@ -60,6 +69,9 @@ pub trait UnifiedStorage: Send + Sync {
     /// 获取所有项目
     fn get_all_projects(&self) -> DuckDbResult<Vec<ProjectRecord>>;
 
+    /// 根据用户ID获取项目（ComputerAgentRunner模式）
+    fn find_by_user_id(&self, user_id: &str) -> DuckDbResult<Option<ProjectRecord>>;
+
     // ========== 会话操作 ==========
 
     /// 根据会话ID获取项目
@@ -77,7 +89,12 @@ pub trait UnifiedStorage: Send + Sync {
     // ========== 状态操作 ==========
 
     /// 原子更新 Agent 状态
-    fn update_agent_status(&self, project_id: &str, status_code: i32, status_name: &str) -> DuckDbResult<bool>;
+    fn update_agent_status(
+        &self,
+        project_id: &str,
+        status_code: i32,
+        status_name: &str,
+    ) -> DuckDbResult<bool>;
 
     // ========== 关联操作 ==========
 
@@ -158,12 +175,21 @@ impl UnifiedStorage for DuckDbStorage {
         self.containers()?.find_all()
     }
 
-    fn get_containers_by_service_type(&self, service_type: ServiceType) -> DuckDbResult<Vec<ContainerRecord>> {
+    fn get_containers_by_service_type(
+        &self,
+        service_type: ServiceType,
+    ) -> DuckDbResult<Vec<ContainerRecord>> {
         self.containers()?.find_by_service_type(service_type)
     }
 
-    fn find_idle_containers(&self, idle_minutes: i64, protection_minutes: i64) -> DuckDbResult<Vec<IdleContainerInfo>> {
-        let mut idle_containers = self.containers()?.find_idle_containers(idle_minutes, protection_minutes)?;
+    fn find_idle_containers(
+        &self,
+        idle_minutes: i64,
+        protection_minutes: i64,
+    ) -> DuckDbResult<Vec<IdleContainerInfo>> {
+        let mut idle_containers = self
+            .containers()?
+            .find_idle_containers(idle_minutes, protection_minutes)?;
 
         // 为每个闲置容器填充关联的项目ID
         let projects_repo = self.projects()?;
@@ -201,6 +227,10 @@ impl UnifiedStorage for DuckDbStorage {
         self.projects()?.find_all()
     }
 
+    fn find_by_user_id(&self, user_id: &str) -> DuckDbResult<Option<ProjectRecord>> {
+        self.projects()?.find_by_user_id(user_id)
+    }
+
     // ========== 会话操作 ==========
 
     fn get_project_by_session(&self, session_id: &str) -> DuckDbResult<Option<ProjectRecord>> {
@@ -221,8 +251,14 @@ impl UnifiedStorage for DuckDbStorage {
 
     // ========== 状态操作 ==========
 
-    fn update_agent_status(&self, project_id: &str, status_code: i32, status_name: &str) -> DuckDbResult<bool> {
-        self.projects()?.update_status_atomic(project_id, status_code, status_name)
+    fn update_agent_status(
+        &self,
+        project_id: &str,
+        status_code: i32,
+        status_name: &str,
+    ) -> DuckDbResult<bool> {
+        self.projects()?
+            .update_status_atomic(project_id, status_code, status_name)
     }
 
     // ========== 关联操作 ==========
@@ -259,10 +295,7 @@ impl UnifiedStorage for DuckDbStorage {
                     result.cleaned_projects += projects_deleted;
                 }
                 Err(e) => {
-                    result.add_error(format!(
-                        "删除容器 {} 失败: {}",
-                        container.container_id, e
-                    ));
+                    result.add_error(format!("删除容器 {} 失败: {}", container.container_id, e));
                 }
             }
         }
@@ -369,11 +402,7 @@ mod tests {
     fn test_project_crud() {
         let storage = create_test_storage();
 
-        let record = ProjectRecord::new(
-            "p1".to_string(),
-            ServiceType::RCoder,
-            "c1".to_string(),
-        );
+        let record = ProjectRecord::new("p1".to_string(), ServiceType::RCoder, "c1".to_string());
 
         // Create
         storage.save_project(&record).unwrap();
@@ -395,11 +424,7 @@ mod tests {
         let storage = create_test_storage();
 
         // 创建项目
-        let record = ProjectRecord::new(
-            "p1".to_string(),
-            ServiceType::RCoder,
-            "c1".to_string(),
-        );
+        let record = ProjectRecord::new("p1".to_string(), ServiceType::RCoder, "c1".to_string());
         storage.save_project(&record).unwrap();
 
         // 更新会话
@@ -434,16 +459,14 @@ mod tests {
 
         // 创建多个关联项目
         for i in 1..=3 {
-            let project = ProjectRecord::new(
-                format!("p{}", i),
-                ServiceType::RCoder,
-                "c1".to_string(),
-            );
+            let project =
+                ProjectRecord::new(format!("p{}", i), ServiceType::RCoder, "c1".to_string());
             storage.save_project(&project).unwrap();
         }
 
         // 删除容器及关联项目
-        let (container_deleted, projects_deleted) = storage.delete_container_with_projects("c1").unwrap();
+        let (container_deleted, projects_deleted) =
+            storage.delete_container_with_projects("c1").unwrap();
 
         assert!(container_deleted);
         assert_eq!(projects_deleted, 3);
@@ -471,11 +494,7 @@ mod tests {
         storage.save_container(&container).unwrap();
 
         // 添加项目
-        let project = ProjectRecord::new(
-            "p1".to_string(),
-            ServiceType::RCoder,
-            "c1".to_string(),
-        );
+        let project = ProjectRecord::new("p1".to_string(), ServiceType::RCoder, "c1".to_string());
         storage.save_project(&project).unwrap();
 
         // 添加会话

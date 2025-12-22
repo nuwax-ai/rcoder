@@ -11,6 +11,8 @@ ENV \
     # Avoid system prompts: \
     DEBIAN_FRONTEND=noninteractive \
     DEBIAN_PRIORITY=high \
+    # Timezone: \
+    TZ=Asia/Shanghai \
     # Pip settings: \
     PIP_DEFAULT_TIMEOUT=100 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -173,9 +175,45 @@ RUN apt-get update && \
     chown -R user:user /home/user /run/user/$(id -u user) && \
     chmod 755 /home/user && \
     chmod 700 /run/user/$(id -u user) && \
-    # Create Chromium wrapper script with fcitx5 support
-    printf '#!/bin/bash\n# Source fcitx5 environment\nif [ -f /etc/profile.d/fcitx5-env.sh ]; then\n    source /etc/profile.d/fcitx5-env.sh\nfi\n# Load D-Bus address\nif [ -f /tmp/dbus-session-env ]; then\n    source /tmp/dbus-session-env\nfi\n# Load Chromium environment\nif [ -f /etc/profile.d/chromium-env.sh ]; then\n    source /etc/profile.d/chromium-env.sh\nfi\nexport DISPLAY=:0\nexport LANG=C.UTF-8\nexport LC_ALL=C.UTF-8\nexport LC_CTYPE=C.UTF-8\n# Use standard Chromium config directory\nCHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"\n# Launch Chromium\nexec /usr/bin/chromium \\\n  --user-data-dir="$CHROMIUM_DATA_DIR" \\\n  --no-sandbox \\\n  --disable-dev-shm-usage \\\n  --remote-debugging-port=9222 \\\n  --remote-debugging-address=0.0.0.0 \\\n  --no-first-run \\\n  --no-default-browser-check \\\n  --password-store=basic \\\n  --use-mock-keychain \\\n  --disable-session-crashed-bubble \\\n  --disable-infobars \\\n  --no-process-singleton-dialog \\\n  --force-color-profile=srgb "$@"\n' > /usr/bin/chromium-browser-launcher && \
+    # Create Chromium wrapper script with fcitx support
+    printf '#!/bin/bash\n\
+    # 加载环境配置\n\
+    [ -f /etc/profile.d/fcitx5-env.sh ] && source /etc/profile.d/fcitx5-env.sh\n\
+    [ -f /tmp/dbus-session-env ] && source /tmp/dbus-session-env\n\
+    [ -f /etc/profile.d/chromium-env.sh ] && source /etc/profile.d/chromium-env.sh\n\
+    [ -f /etc/profile.d/ime-env.sh ] && source /etc/profile.d/ime-env.sh\n\
+    \n\
+    export DISPLAY=:0\n\
+    # 使用 @im=fcitx 保持一致性\n\
+    export GTK_IM_MODULE=fcitx\n\
+    export QT_IM_MODULE=fcitx\n\
+    export XMODIFIERS=@im=fcitx\n\
+    export INPUT_METHOD=fcitx\n\
+    \n\
+    CHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"\n\
+    \n\
+    RUN_CMD="/usr/bin/chromium \\\n\
+    --user-data-dir=\"$CHROMIUM_DATA_DIR\" \\\n\
+    --no-sandbox \\\n\
+    --disable-dev-shm-usage \\\n\
+    --remote-debugging-port=9222 \\\n\
+    --remote-debugging-address=0.0.0.0 \\\n\
+    --no-first-run \\\n\
+    --no-default-browser-check \\\n\
+    --password-store=basic \\\n\
+    --use-mock-keychain \\\n\
+    --disable-session-crashed-bubble \\\n\
+    --disable-infobars \\\n\
+    --no-process-singleton-dialog \\\n\
+    --force-color-profile=srgb \"\$@\""\n\
+    \n\
+    if [ "$(id -u)" = "0" ]; then\n\
+    exec su - user -c "$RUN_CMD" -- "$@"\n\
+    else\n\
+    exec /bin/bash -c "$RUN_CMD" -- "$@"\n\
+    fi\n' > /usr/bin/chromium-browser-launcher && \
     chmod 755 /usr/bin/chromium-browser-launcher && \
+    ln -sf /usr/bin/chromium-browser-launcher /usr/local/bin/chromium && \
     chown -R 1000:1000 /home/user/.config && \
     chown -R 1000:1000 /home/user/.local && \
     # Clean up package cache
@@ -186,10 +224,6 @@ RUN apt-get update && \
 # Copy MCP-specific Chromium wrapper script (runs as user to connect to fcitx5)
 COPY chromium-for-mcp.sh /usr/local/bin/chromium-for-mcp
 RUN chmod 755 /usr/local/bin/chromium-for-mcp
-
-# Create Chromium launcher with fcitx5 support
-RUN printf '#!/bin/bash\n# 加载 D-Bus 地址\nif [ -f /tmp/dbus-session-env ]; then\n    source /tmp/dbus-session-env\nfi\n\n# 加载 Chromium 环境变量（持久化数据目录）\nif [ -f /etc/profile.d/chromium-env.sh ]; then\n    source /etc/profile.d/chromium-env.sh\nfi\n\n# 设置输入法环境变量\nexport DISPLAY=:0\nexport GTK_IM_MODULE=fcitx5\nexport QT_IM_MODULE=fcitx5\nexport XMODIFIERS=@im=fcitx5\nexport INPUT_METHOD=fcitx5\n\n# 使用标准 Chromium 配置目录（由 start-up.sh 设置）\nCHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"\n\n# 以 user 用户身份运行 Chromium（禁用密码管理）\nsu - user -c "export DISPLAY=:0; export DBUS_SESSION_BUS_ADDRESS=\\\"$DBUS_SESSION_BUS_ADDRESS\\\"; export GTK_IM_MODULE=fcitx5; export QT_IM_MODULE=fcitx5; export XMODIFIERS=@im=fcitx5; export INPUT_METHOD=fcitx5; export CHROMIUM_USER_DATA_DIR=\\\"${CHROMIUM_DATA_DIR}\\\"; /usr/bin/chromium --user-data-dir=\\\"${CHROMIUM_DATA_DIR}\\\" --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --no-first-run --no-default-browser-check --password-store=basic --use-mock-keychain"\n' > /usr/local/bin/chromium && \
-    chmod +x /usr/local/bin/chromium
 
 # Create a socat service with supervisor to ensure port forwarding is always running
 # RUN mkdir -p /etc/supervisor/conf.d && \
@@ -216,9 +250,9 @@ RUN case "$TARGETARCH" in \
     echo "🔍 Downloading VS Code for ${TARGETARCH} (${VS_ARCH}) from multiple mirrors..." && \
     # Try multiple mirrors for VS Code download
     (wget --tries=2 -O /tmp/vscode.deb "https://vscode.cdn.azure.cn/stable/latest" || \
-     wget --tries=2 -O /tmp/vscode.deb "https://mirrors.tuna.tsinghua.edu.cn/vscode/stable/latest" || \
-     wget --tries=2 -O /tmp/vscode.deb "https://mirrors.ustc.edu.cn/vscode/stable/latest" || \
-     wget --tries=2 -O /tmp/vscode.deb "https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-${VS_ARCH}") && \
+    wget --tries=2 -O /tmp/vscode.deb "https://mirrors.tuna.tsinghua.edu.cn/vscode/stable/latest" || \
+    wget --tries=2 -O /tmp/vscode.deb "https://mirrors.ustc.edu.cn/vscode/stable/latest" || \
+    wget --tries=2 -O /tmp/vscode.deb "https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-${VS_ARCH}") && \
     echo "📦 Installing VS Code..." && \
     dpkg -i /tmp/vscode.deb || true && \
     apt-get update && \
@@ -232,12 +266,12 @@ RUN case "$TARGETARCH" in \
 RUN echo "🔍 Verifying installations..." && \
     # VS Code
     if [ ! -x /usr/bin/code ]; then \
-        echo "❌ VS Code installation failed! /usr/bin/code not found" && exit 1; \
+    echo "❌ VS Code installation failed! /usr/bin/code not found" && exit 1; \
     fi && \
     echo "✅ VS Code: $(/usr/bin/code --version 2>/dev/null | head -1 || echo 'installed')" && \
     # Chromium
     if [ ! -x /usr/bin/chromium ]; then \
-        echo "❌ Chromium installation failed!" && exit 1; \
+    echo "❌ Chromium installation failed!" && exit 1; \
     fi && \
     echo "✅ Chromium: $(/usr/bin/chromium --version 2>/dev/null || echo 'installed')" && \
     echo "🎉 All critical software verified!"
@@ -452,13 +486,13 @@ RUN chmod +x /usr/local/bin/fix-ime
 
 ENV DISPLAY=:0
 
-# 设置全局输入法环境变量（容器级别 - 纯 fcitx5）
-ENV GTK_IM_MODULE=fcitx5 \
-    QT_IM_MODULE=fcitx5 \
-    XMODIFIERS=@im=fcitx5 \
-    INPUT_METHOD=fcitx5 \
-    SDL_IM_MODULE=fcitx5 \
-    GLFW_IM_MODULE=fcitx5
+# 设置全局输入法环境变量（容器级别 - 纯 fcitx）
+ENV GTK_IM_MODULE=fcitx \
+    QT_IM_MODULE=fcitx \
+    XMODIFIERS=@im=fcitx \
+    INPUT_METHOD=fcitx \
+    SDL_IM_MODULE=fcitx \
+    GLFW_IM_MODULE=ibus
 
 # 配置 D-Bus 和 PolicyKit（已在前面安装 dbus-x11）
 RUN mkdir -p /etc/dbus-1/session.d && \
@@ -486,6 +520,10 @@ RUN apt-get update && apt-get install -y \
     nginx \
     && rm -rf /var/lib/apt/lists/*
 
+# 设置系统时区为东八区（Asia/Shanghai）
+RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone
+
 # 清理默认nginx配置以避免冲突
 RUN rm -f /etc/nginx/sites-enabled/default && \
     rm -f /etc/nginx/conf.d/default.conf
@@ -494,76 +532,24 @@ RUN rm -f /etc/nginx/sites-enabled/default && \
 # 配置 npm 使用国内镜像源
 RUN npm config set registry https://registry.npmmirror.com
 
-# 创建 pnpm 全局存储目录
-RUN mkdir -p /app/computer-project-workspace/.pnpm-store
-# 配置 pnpm 使用新的存储路径
-RUN pnpm config set store-dir /app/computer-project-workspace/.pnpm-store
+# 设置工作目录并确保权限
+RUN mkdir -p /app/computer-project-workspace /home/user/.cache && \
+    chown -R user:user /app /home/user
 
-
-
-# 配置 Bun 使用国内镜像源
+# 安装 Bun 到全局路径（需要 root）
 ENV BUN_CONFIG_REGISTRY="https://registry.npmmirror.com" \
-    BUN_CONFIG_INSTALL_CACHE_DIR="/root/.cache/bun/install" \
-    BUN_CONFIG_GLOBAL_CACHE_DIR="/root/.cache/bun/global" \
-    BUN_INSTALL="/root/.bun" \
-    PATH="/root/.bun/bin:$PATH"
+    BUN_CONFIG_INSTALL_CACHE_DIR="/home/user/.cache/bun/install" \
+    BUN_CONFIG_GLOBAL_CACHE_DIR="/home/user/.cache/bun/global" \
+    BUN_INSTALL="/usr/local" \
+    PATH="/usr/local/bin:$PATH"
 
-# 安装 Bun
 RUN curl -fsSL https://bun.sh/install | bash && \
-    # 创建 Bun 配置目录和缓存目录
-    mkdir -p /root/.bun /root/.cache/bun/install /root/.cache/bun/global && \
-    # 设置权限
-    chmod -R 777 /root/.cache/bun && \
-    # 验证安装
-    /root/.bun/bin/bun --version
+    /usr/local/bin/bun --version
 
-# 配置 Bun 国内镜像源和缓存目录（根据官方文档）
-RUN echo '[install]' > /root/.bunfig.toml && \
-    echo 'registry = "https://registry.npmmirror.com"' >> /root/.bunfig.toml && \
-    echo '' >> /root/.bunfig.toml && \
-    echo '[install.cache]' >> /root/.bunfig.toml && \
-    echo 'dir = "/root/.cache/bun"' >> /root/.bunfig.toml && \
-    # 创建缓存目录
-    mkdir -p /root/.cache/bun && \
-    # 验证配置
-    cat /root/.bunfig.toml && \
-    echo "Bun configured with Chinese mirror and cache dir: /root/.cache/bun"
-
-# 创建 Claude Code 配置目录并禁用 webfetch 功能，添加 mcp-fetch MCP 工具
-RUN mkdir -p /root/.claude && \
-    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"}}}' > /root/.claude/settings.json
-
-# 安装额外的命令工具（强制更新到最新版本）
-RUN npm install -g @zed-industries/claude-code-acp@latest
-
-# 安装 Claude CLI 工具（强制更新到最新版本）
-RUN npm install -g @anthropic-ai/claude-code@latest
-
-# 预安装 chrome-devtools-mcp（加速 MCP 工具启动）
-RUN npm install -g chrome-devtools-mcp@latest
-
-# 安装 uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 添加uv到PATH
-ENV PATH="/root/.local/bin:${PATH}"
-
-# 设置 uv 镜像加速地址
-ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
-
-
-# 预安装 MCP 工具到 uv 缓存中
-RUN uv tool install mcp-server-fetch
-
-
-
-
-# 预安装 context7 MCP 工具到 bun 全局缓存
-RUN bun add -g --registry=https://registry.npmmirror.com @upstash/context7-mcp
-# 创建 Claude Code 配置目录并禁用 webfetch 功能，添加 MCP 工具
-RUN mkdir -p /root/.claude && \
-    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}}}}' > /root/.claude/settings.json
-
+# 安装全局 npm 包（需要 root，因为安装到 /usr/lib/node_modules）
+RUN npm install -g @zed-industries/claude-code-acp@latest && \
+    npm install -g @anthropic-ai/claude-code@latest && \
+    npm install -g chrome-devtools-mcp@latest
 
 # 安装 OpenSSL 开发包和构建依赖（mcp-stdio-proxy 需要）
 RUN apt-get update && apt-get install -y \
@@ -572,17 +558,72 @@ RUN apt-get update && apt-get install -y \
     build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# 第一步: 安装 Rust toolchain 并安装 mcp-stdio-proxy
+# 安装 Rust toolchain 并安装 mcp-stdio-proxy（需要 root）
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH="/opt/cargo/bin:$PATH"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    . /root/.cargo/env && \
-    cargo install mcp-stdio-proxy
+    chmod -R 755 /opt/rustup /opt/cargo && \
+    . /opt/cargo/env && \
+    cargo install mcp-stdio-proxy && \
+    # 确保 user 可以使用 cargo
+    chmod -R o+rX /opt/cargo /opt/rustup
 
-# 添加 cargo bin 和 uv 到 PATH（用于后续容器运行时）
-ENV PATH="/root/.cargo/bin:/root/.local/bin:${PATH}"
+# 安装 uv 到全局路径（需要 root）
+ENV UV_INSTALL_DIR=/usr/local/bin \
+    UV_CACHE_DIR=/home/user/.cache/uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    echo 'export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple' >> /etc/profile.d/uv-env.sh && \
+    echo 'export UV_CACHE_DIR=/home/user/.cache/uv' >> /etc/profile.d/uv-env.sh
 
-# 复制预构建的 agent_runner 二进制文件（由 Dockerfile.build 在 debian:12 中编译）
+# 添加 cargo bin 和 uv 到 PATH
+ENV PATH="/opt/cargo/bin:/usr/local/bin:${PATH}"
+
+# 复制预构建的 agent_runner 二进制文件（需要 root）
 COPY bin/agent_runner /usr/local/bin/agent_runner
 RUN chmod +x /usr/local/bin/agent_runner
+
+# ============================================================================
+# 🎯 切换到普通用户 - 后续操作以 user 身份执行
+# ============================================================================
+USER user
+WORKDIR /home/user
+
+# 配置 pnpm（用户级配置）
+RUN pnpm config set registry https://registry.npmmirror.com && \
+    pnpm config set store-dir /home/user/.cache/pnpm
+
+# 配置 Bun 用户配置文件
+RUN mkdir -p /home/user/.cache/bun/install /home/user/.cache/bun/global && \
+    echo '[install]' > /home/user/.bunfig.toml && \
+    echo 'registry = "https://registry.npmmirror.com"' >> /home/user/.bunfig.toml && \
+    echo '' >> /home/user/.bunfig.toml && \
+    echo '[install.cache]' >> /home/user/.bunfig.toml && \
+    echo 'dir = "/home/user/.cache/bun"' >> /home/user/.bunfig.toml && \
+    cat /home/user/.bunfig.toml && \
+    echo "✅ Bun configured for user"
+
+# 预安装 context7 MCP 工具（以 user 身份，缓存在用户目录）
+RUN bun add -g @upstash/context7-mcp || echo "⚠️ bun add -g failed, will retry at runtime"
+
+# 创建 Claude Code 配置目录
+RUN mkdir -p /home/user/.claude && \
+    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]}}' > /home/user/.claude/settings.json
+
+# 预安装 MCP 工具到 uv 缓存中（以 user 身份）
+RUN mkdir -p /home/user/.cache/uv && \
+    UV_CACHE_DIR=/home/user/.cache/uv uv tool install mcp-server-fetch || echo "⚠️ uv tool install failed, will retry at runtime"
+
+# ============================================================================
+# 🎯 切回 root - 复制启动脚本 & 更新骨架目录
+# ============================================================================
+USER root
+
+# 更新骨架目录（包含 user 阶段创建的配置）
+# 这样当宿主机挂载空目录到 /home/user 时，start-up.sh 可以从这里恢复
+RUN echo "📦 Updating skeleton directory with user configs..." && \
+    cp -a /home/user/. /etc/skel-user-desktop/ && \
+    echo "✅ Skeleton directory updated at /etc/skel-user-desktop"
 
 # 暴露 agent_runner 端口
 EXPOSE 8086

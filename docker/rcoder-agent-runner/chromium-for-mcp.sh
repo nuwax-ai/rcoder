@@ -15,19 +15,24 @@ fi
 # 使用用户主目录的 Chromium 配置（持久化）
 CHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"
 
-# 以 user 用户身份运行 Chromium
-# 所有参数通过 $@ 传递（来自 chrome-devtools-mcp）
-# 关键：使用与手动 Chromium 相同的方式，通过 su - user 运行
-exec su - user -c "
-    export DISPLAY=:0
-    export DBUS_SESSION_BUS_ADDRESS='${DBUS_SESSION_BUS_ADDRESS}'
-    export GTK_IM_MODULE=fcitx5
-    export QT_IM_MODULE=fcitx5
-    export XMODIFIERS=@im=fcitx5
-    export INPUT_METHOD=fcitx5
-    export SDL_IM_MODULE=fcitx5
-    export GLFW_IM_MODULE=fcitx5
-    export LANG=C.UTF-8
-    export LC_ALL=C.UTF-8
-    exec /usr/bin/chromium --user-data-dir='${CHROMIUM_DATA_DIR}' \$@
-" -- "$@"
+# 以当前用户身份运行 Chromium（如果当前是 user 则直接运行，如果是 root 则切换到 user）
+# 关键：确保使用与 start-up.sh 一致的 fcitx 输入法模块名称
+RUN_CMD="export DISPLAY=:0; \
+    export DBUS_SESSION_BUS_ADDRESS='${DBUS_SESSION_BUS_ADDRESS}'; \
+    export GTK_IM_MODULE=fcitx; \
+    export QT_IM_MODULE=fcitx; \
+    export XMODIFIERS=@im=fcitx; \
+    export INPUT_METHOD=fcitx; \
+    export SDL_IM_MODULE=fcitx; \
+    export GLFW_IM_MODULE=ibus; \
+    export LANG=C.UTF-8; \
+    export LC_ALL=C.UTF-8; \
+    export CHROMIUM_USER_DATA_DIR='${CHROMIUM_DATA_DIR}'; \
+    exec /usr/bin/chromium --user-data-dir='${CHROMIUM_DATA_DIR}' --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --no-first-run --no-default-browser-check --password-store=basic --use-mock-keychain \"\$@\""
+
+if [ "$(id -u)" = "0" ]; then
+    exec su - user -c "$RUN_CMD" -- "$@"
+else
+    # 已经是 user 用户，直接 eval/exec
+    eval "$RUN_CMD"
+fi
