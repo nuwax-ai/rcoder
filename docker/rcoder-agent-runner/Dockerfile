@@ -242,38 +242,47 @@ RUN echo '#!/bin/bash\n# 启动supervisord服务\nsudo /usr/bin/supervisord -c /
     echo "[Desktop Entry]\nType=Application\nName=Supervisord\nExec=/usr/local/bin/start-supervisord.sh\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /etc/xdg/autostart/supervisord.desktop && \
     chmod 644 /etc/xdg/autostart/supervisord.desktop
 
-# Install VS Code (optimized single layer)
-ARG TARGETARCH
-RUN case "$TARGETARCH" in \
-    "amd64") VS_ARCH="x64" ;; \
-    "arm64") VS_ARCH="arm64" ;; \
-    *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
-    esac && \
-    echo "🔍 Downloading VS Code for ${TARGETARCH} (${VS_ARCH}) from multiple mirrors..." && \
-    # Try multiple mirrors for VS Code download
-    (wget --tries=2 -O /tmp/vscode.deb "https://vscode.cdn.azure.cn/stable/latest" || \
-    wget --tries=2 -O /tmp/vscode.deb "https://mirrors.tuna.tsinghua.edu.cn/vscode/stable/latest" || \
-    wget --tries=2 -O /tmp/vscode.deb "https://mirrors.ustc.edu.cn/vscode/stable/latest" || \
-    wget --tries=2 -O /tmp/vscode.deb "https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-${VS_ARCH}") && \
-    echo "📦 Installing VS Code..." && \
-    dpkg -i /tmp/vscode.deb || true && \
+# Install VS Code - 使用 apt 仓库方式（比直接下载 deb 更可靠）
+RUN echo "📦 Adding Microsoft VS Code repository..." && \
+    # 添加微软 GPG 密钥
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-archive-keyring.gpg && \
+    # 添加 apt 仓库
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/microsoft-archive-keyring.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list && \
+    echo "📥 Installing VS Code via apt..." && \
     apt-get update && \
-    apt-get install -f -y && \
-    # Clean up package cache to reduce image size:
+    apt-get install -y code && \
+    echo "🔍 Checking installed VS Code..." && \
+    which code && \
+    ls -la /usr/bin/code && \
+    echo "✅ VS Code installed via apt!" && \
+    # Cleanup
     apt-get autoremove -y && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # 验证关键软件安装是否成功
 RUN echo "🔍 Verifying installations..." && \
-    # VS Code
-    if [ ! -x /usr/bin/code ]; then \
-    echo "❌ VS Code installation failed! /usr/bin/code not found" && exit 1; \
+    # VS Code - 检查多个可能的路径
+    CODE_PATH="" && \
+    if [ -x /usr/bin/code ]; then CODE_PATH="/usr/bin/code"; \
+    elif [ -x /usr/share/code/bin/code ]; then CODE_PATH="/usr/share/code/bin/code"; \
+    elif command -v code >/dev/null 2>&1; then CODE_PATH="$(command -v code)"; \
     fi && \
-    echo "✅ VS Code: $(/usr/bin/code --version 2>/dev/null | head -1 || echo 'installed')" && \
+    if [ -z "$CODE_PATH" ]; then \
+        echo "❌ VS Code installation failed! No 'code' binary found" && \
+        echo "📂 Searching for code binary..." && \
+        find /usr -name "code" -type f 2>/dev/null | head -10 && \
+        exit 1; \
+    fi && \
+    echo "✅ VS Code found at: $CODE_PATH" && \
+    # 如果 /usr/bin/code 不存在，创建软链接
+    if [ ! -x /usr/bin/code ] && [ -n "$CODE_PATH" ]; then \
+        ln -sf "$CODE_PATH" /usr/bin/code && \
+        echo "🔗 Created symlink: /usr/bin/code -> $CODE_PATH"; \
+    fi && \
     # Chromium
     if [ ! -x /usr/bin/chromium ]; then \
-    echo "❌ Chromium installation failed!" && exit 1; \
+        echo "❌ Chromium installation failed!" && exit 1; \
     fi && \
     echo "✅ Chromium: $(/usr/bin/chromium --version 2>/dev/null || echo 'installed')" && \
     echo "🎉 All critical software verified!"

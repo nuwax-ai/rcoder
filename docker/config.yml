@@ -62,7 +62,7 @@ docker_config:
           API_PORT: "8086"
           PROJECT_WORKSPACE_BASE: "/app/project_workspace"
         command:
-          - "/usr/local/bin/agent_runner"
+          - "/app/bin/agent_runner"
           - "--port"
           - "8086"
 
