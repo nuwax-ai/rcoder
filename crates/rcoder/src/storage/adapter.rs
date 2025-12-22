@@ -5,12 +5,8 @@
 //! - sessions: DashMap<String, Arc<ProjectAndContainerInfo>>
 //! - session_to_container_id: DashMap<String, String>
 
-use duckdb_manager::{
-    ContainerRecord, DuckDbStorage, ProjectRecord, StorageStats, UnifiedStorage,
-};
-use shared_types::{
-    ContainerBasicInfo, ProjectAndContainerInfo, ServiceType,
-};
+use duckdb_manager::{ContainerRecord, DuckDbStorage, ProjectRecord, StorageStats, UnifiedStorage};
+use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -46,7 +42,9 @@ impl ProjectAdapter {
             Ok(Some(record)) => {
                 // 获取关联的容器信息
                 let container = self.get_container_for_project(&record);
-                Some(Arc::new(DataBridge::project_record_to_info(&record, container)))
+                Some(Arc::new(DataBridge::project_record_to_info(
+                    &record, container,
+                )))
             }
             Ok(None) => None,
             Err(e) => {
@@ -64,7 +62,8 @@ impl ProjectAdapter {
     ) -> Result<(), duckdb_manager::DuckDbError> {
         // 如果有容器信息，先保存容器
         if let Some(container) = info.container() {
-            let container_record = DataBridge::container_info_to_record(container, info.service_type());
+            let container_record =
+                DataBridge::container_info_to_record(container, info.service_type());
             self.storage.save_container(&container_record)?;
         }
 
@@ -132,7 +131,9 @@ impl ProjectAdapter {
         match self.storage.get_project_by_session(session_id) {
             Ok(Some(record)) => {
                 let container = self.get_container_for_project(&record);
-                Some(Arc::new(DataBridge::project_record_to_info(&record, container)))
+                Some(Arc::new(DataBridge::project_record_to_info(
+                    &record, container,
+                )))
             }
             Ok(None) => None,
             Err(e) => {
@@ -149,7 +150,10 @@ impl ProjectAdapter {
         session_id: &str,
     ) -> Result<(), duckdb_manager::DuckDbError> {
         self.storage.update_session(project_id, session_id)?;
-        debug!("更新会话: project_id={}, session_id={}", project_id, session_id);
+        debug!(
+            "更新会话: project_id={}, session_id={}",
+            project_id, session_id
+        );
         Ok(())
     }
 
@@ -215,13 +219,18 @@ impl ProjectAdapter {
         status_code: i32,
         status_name: &str,
     ) -> Result<bool, duckdb_manager::DuckDbError> {
-        self.storage.update_agent_status(project_id, status_code, status_name)
+        self.storage
+            .update_agent_status(project_id, status_code, status_name)
     }
 
     // ========== 容器相关方法 ==========
 
     /// 保存容器信息
-    pub fn save_container(&self, container: &ContainerBasicInfo, service_type: Option<ServiceType>) -> Result<(), duckdb_manager::DuckDbError> {
+    pub fn save_container(
+        &self,
+        container: &ContainerBasicInfo,
+        service_type: Option<ServiceType>,
+    ) -> Result<(), duckdb_manager::DuckDbError> {
         let record = DataBridge::container_info_to_record(container, service_type);
         self.storage.save_container(&record)
     }
@@ -239,14 +248,23 @@ impl ProjectAdapter {
     }
 
     /// 删除容器及其关联的项目
-    pub fn delete_container_with_projects(&self, container_id: &str) -> Result<(bool, usize), duckdb_manager::DuckDbError> {
+    pub fn delete_container_with_projects(
+        &self,
+        container_id: &str,
+    ) -> Result<(bool, usize), duckdb_manager::DuckDbError> {
         self.storage.delete_container_with_projects(container_id)
     }
 
     /// 按服务类型获取所有容器
-    pub fn get_containers_by_service_type(&self, service_type: ServiceType) -> Vec<ContainerBasicInfo> {
+    pub fn get_containers_by_service_type(
+        &self,
+        service_type: ServiceType,
+    ) -> Vec<ContainerBasicInfo> {
         match self.storage.get_containers_by_service_type(service_type) {
-            Ok(records) => records.iter().map(DataBridge::container_record_to_info).collect(),
+            Ok(records) => records
+                .iter()
+                .map(DataBridge::container_record_to_info)
+                .collect(),
             Err(e) => {
                 warn!("按服务类型获取容器失败: {}", e);
                 Vec::new()
@@ -255,13 +273,41 @@ impl ProjectAdapter {
     }
 
     /// 获取所有容器记录
-    pub fn get_all_container_records(&self) -> Result<Vec<ContainerRecord>, duckdb_manager::DuckDbError> {
+    pub fn get_all_container_records(
+        &self,
+    ) -> Result<Vec<ContainerRecord>, duckdb_manager::DuckDbError> {
         self.storage.get_all_containers()
     }
 
     /// 根据容器ID获取关联的项目列表
-    pub fn get_projects_by_container_id(&self, container_id: &str) -> Result<Vec<ProjectRecord>, duckdb_manager::DuckDbError> {
+    pub fn get_projects_by_container_id(
+        &self,
+        container_id: &str,
+    ) -> Result<Vec<ProjectRecord>, duckdb_manager::DuckDbError> {
         self.storage.get_projects_by_container(container_id)
+    }
+
+    // ========== ComputerAgentRunner 模式专用方法 ==========
+
+    /// 通过用户ID获取容器信息（ComputerAgentRunner模式）
+    ///
+    /// 在 ComputerAgentRunner 模式中，一个用户对应一个容器
+    /// 这个方法通过 user_id 查找对应的项目记录，然后获取关联的容器信息
+    pub fn get_container_by_user_id(&self, user_id: &str) -> Option<ContainerBasicInfo> {
+        match self.storage.find_by_user_id(user_id) {
+            Ok(Some(project_record)) => {
+                // 通过项目记录中的 container_id 获取容器信息
+                self.get_container(&project_record.container_id)
+            }
+            Ok(None) => {
+                debug!("未找到用户 {} 的项目记录", user_id);
+                None
+            }
+            Err(e) => {
+                warn!("通过用户ID {} 查找项目失败: {}", user_id, e);
+                None
+            }
+        }
     }
 
     // ========== 清理相关方法 ==========
@@ -272,7 +318,10 @@ impl ProjectAdapter {
         idle_minutes: i64,
         protection_minutes: i64,
     ) -> Vec<duckdb_manager::IdleContainerInfo> {
-        match self.storage.find_idle_containers(idle_minutes, protection_minutes) {
+        match self
+            .storage
+            .find_idle_containers(idle_minutes, protection_minutes)
+        {
             Ok(containers) => containers,
             Err(e) => {
                 warn!("查找闲置容器失败: {}", e);
@@ -335,7 +384,9 @@ mod tests {
         let info = Arc::new(create_test_info(project_id));
 
         // 插入
-        adapter.insert(project_id.to_string(), info.clone()).unwrap();
+        adapter
+            .insert(project_id.to_string(), info.clone())
+            .unwrap();
         assert!(adapter.contains_key(project_id));
 
         // 获取
@@ -369,7 +420,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             service_url: "http://localhost:8080".to_string(),
         }));
-        adapter.insert(project_id.to_string(), Arc::new(info)).unwrap();
+        adapter
+            .insert(project_id.to_string(), Arc::new(info))
+            .unwrap();
 
         // 更新会话
         adapter.update_session(project_id, session_id).unwrap();

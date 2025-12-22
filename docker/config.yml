@@ -62,7 +62,7 @@ docker_config:
           API_PORT: "8086"
           PROJECT_WORKSPACE_BASE: "/app/project_workspace"
         command:
-          - "/app/bin/agent_runner"
+          - "/usr/local/bin/agent_runner"
           - "--port"
           - "8086"
 
@@ -101,7 +101,7 @@ docker_config:
           PROJECT_WORKSPACE_BASE: "/home/user"
 
         command:
-          - "/app/bin/agent_runner"
+          - "/usr/local/bin/agent_runner"
           - "--port"
           - "8086"
 
@@ -130,12 +130,6 @@ docker_config:
             read_only: false
             mount_type: "bind"
             resolve_from: "/app/logs"
-          # 命令pnpm，bun,npm 的缓存目录，避免动态创建的子容器，重复从网络下载依赖
-          - container_path: "/root/.cache"
-            host_path: "{resolved_path}"
-            read_only: false
-            mount_type: "bind"
-            resolve_from: "/root/.cache"
 
     # 镜像选择策略
     selection_strategy: "ServiceOnly"

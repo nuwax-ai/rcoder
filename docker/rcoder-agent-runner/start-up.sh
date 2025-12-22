@@ -61,10 +61,14 @@ function initialize_user_home() {
     # 检查 /home/user 是否被外部挂载覆盖（通过检查关键目录是否存在）
     local need_restore=false
 
-    # 检查关键目录/文件是否存在
-    if [ ! -d "$USER_HOME/Desktop" ] || [ ! -f "$USER_HOME/.bashrc" ]; then
+    # 检查关键目录/文件是否存在（任一不存在则需要恢复）
+    if [ ! -d "$USER_HOME/Desktop" ] || \
+       [ ! -f "$USER_HOME/.bashrc" ] || \
+       [ ! -f "$USER_HOME/.bunfig.toml" ] || \
+       [ ! -d "$USER_HOME/.claude" ]; then
         need_restore=true
         echo "📁 Detected empty or incomplete user home directory (likely mounted)"
+        echo "   Missing: $([ ! -d "$USER_HOME/Desktop" ] && echo 'Desktop ')$([ ! -f "$USER_HOME/.bashrc" ] && echo '.bashrc ')$([ ! -f "$USER_HOME/.bunfig.toml" ] && echo '.bunfig.toml ')$([ ! -d "$USER_HOME/.claude" ] && echo '.claude ')"
     fi
 
     if [ "$need_restore" = true ]; then
@@ -99,24 +103,61 @@ function initialize_user_home() {
             echo "  ✓ .local directory restored"
         fi
 
+        # .bunfig.toml - 恢复 Bun 配置
+        if [ ! -f "$USER_HOME/.bunfig.toml" ] && [ -f "$SKEL_DIR/.bunfig.toml" ]; then
+            cp -a "$SKEL_DIR/.bunfig.toml" "$USER_HOME/.bunfig.toml"
+            echo "  ✓ .bunfig.toml restored"
+        fi
+
+        # .claude 目录 - 恢复 Claude 配置
+        if [ -d "$SKEL_DIR/.claude" ]; then
+            mkdir -p "$USER_HOME/.claude"
+            cp -an "$SKEL_DIR/.claude/." "$USER_HOME/.claude/" 2>/dev/null || true
+            echo "  ✓ .claude directory restored"
+        fi
+
+        # .cache 目录 - 恢复工具缓存配置（bun, uv, pnpm）
+        if [ -d "$SKEL_DIR/.cache" ]; then
+            mkdir -p "$USER_HOME/.cache"
+            # 只复制目录结构，不复制实际缓存内容（避免大量复制）
+            for cache_subdir in bun uv pnpm; do
+                if [ -d "$SKEL_DIR/.cache/$cache_subdir" ] && [ ! -d "$USER_HOME/.cache/$cache_subdir" ]; then
+                    mkdir -p "$USER_HOME/.cache/$cache_subdir"
+                    echo "  ✓ .cache/$cache_subdir directory created"
+                fi
+            done
+        fi
+
         echo "✅ User home directory initialized from skeleton"
     else
         echo "✅ User home directory already initialized"
     fi
 
-    # ========== 关键修复：强制修复所有挂载目录的权限（解决 UID 不匹配） ==========
+    # ========== 修复挂载目录的权限（解决宿主机 UID 不匹配） ==========
+    # 注意：由于 Dockerfile 中用户配置已经以 user 身份创建，
+    # 这里只需要处理可能被宿主机挂载覆盖的目录
     echo "🔧 Fixing permissions for mounted directories..."
 
-    # 修复整个 /home/user 的所有者（处理宿主机 UID 不匹配问题）
+    # 确保必要目录存在
+    mkdir -p "$USER_HOME/.cache" /app /tmp/mesa_shader_cache "${CONTAINER_LOGS_DIR:-/app/container-logs}"
+
+    # 修复 /home/user 目录的所有者（重要：当宿主机挂载空目录时）
+    echo "👤 Fixing ownership for /home/user and mounted directories..."
     chown -R user:user "$USER_HOME" 2>/dev/null || true
+    chown -R user:user /app "${CONTAINER_LOGS_DIR:-/app/container-logs}" 2>/dev/null || true
+    chown -R user:user /tmp/mesa_shader_cache 2>/dev/null || true
 
-    # 修复目录权限：确保 user 可以读取、写入、执行目录
-    find "$USER_HOME" -type d -exec chmod u+rwx {} \; 2>/dev/null || true
-
-    # 修复文件权限：确保 user 可以读取和写入文件
-    find "$USER_HOME" -type f -exec chmod u+rw {} \; 2>/dev/null || true
-
-    echo "✅ Permissions fixed for user home directory"
+    # 修复权限
+    echo "🔐 Fixing permissions..."
+    chmod -R u+rwX /app "$USER_HOME/.cache" 2>/dev/null || true
+    
+    # 对于可能无法 chown 的挂载目录，尝试添加 other 权限
+    chmod -R o+rX /app 2>/dev/null || true
+    
+    # 确保 bin 目录下的文件可执行
+    [ -d /app/bin ] && chmod -R a+x /app/bin 2>/dev/null || true
+    
+    echo "✅ Permissions fixed"
 
     # ========== 设置渲染相关环境变量（防止花屏）==========
     # 将 Mesa 着色器缓存移到 /tmp（不受 /home/user 挂载影响）
@@ -210,12 +251,17 @@ function start_display_and_desktop() {
 	echo "Starting X11 display server and XFCE4 desktop..."
 
 	# 清理可能存在的X11锁文件和进程
-	rm -f /tmp/.X0-lock
-	rm -rf /tmp/.X11-unix/X0
+	rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 /tmp/.Xauthority /tmp/dbus-session-env
 	pkill -f "Xvfb :0" || true
 	pkill -f "xfce4-session" || true
 	pkill -f "dbus-daemon" || true
 	pkill -f "fcitx5" || true
+    
+    # 确保 /tmp 权限正确且 XAUTHORITY 可写
+    touch /tmp/.Xauthority
+    chmod 666 /tmp/.Xauthority
+    touch /tmp/dbus-session-env
+    chmod 666 /tmp/dbus-session-env
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
 	echo "🧹 Cleaning up stale Chromium processes and lock files..."
@@ -610,5 +656,50 @@ EOF
 
 echo "✓ Input method environment variables written to /etc/environment"
 
-# agent_runner 在前台运行，作为主进程保持容器运行
-exec /usr/local/bin/agent_runner -p ${PORT:-8086}
+# ============================================================================
+# 🎯 启动 agent_runner
+# ============================================================================
+
+# 切换到用户主目录
+cd /home/user
+
+# 关键修复：显式设置 HOME 环境变量为 /home/user
+# 否则 runuser/sudo 可能会继承 root 的 HOME=/root，导致权限错误 (os error 13)
+export HOME=/home/user
+
+# 确保所有输入法环境变量已导出
+source /etc/profile.d/ime-env.sh 2>/dev/null || true
+
+# 等待 D-Bus 会话文件创建（可能在后台线程中）
+sleep 2
+
+# 加载 D-Bus 会话环境
+if [ -f /tmp/dbus-session-env ]; then
+    source /tmp/dbus-session-env
+    echo "✓ Loaded D-Bus session: $DBUS_SESSION_BUS_ADDRESS"
+fi
+
+# 构建环境变量导出命令
+ENV_EXPORTS="export HOME=/home/user; \
+export DISPLAY=:0; \
+export DBUS_SESSION_BUS_ADDRESS='${DBUS_SESSION_BUS_ADDRESS:-}'; \
+export GTK_IM_MODULE=fcitx; \
+export QT_IM_MODULE=fcitx; \
+export XMODIFIERS=@im=fcitx; \
+export INPUT_METHOD=fcitx; \
+export LANG=C.UTF-8; \
+export LC_ALL=C.UTF-8; \
+export PATH=/usr/local/bin:/opt/cargo/bin:\$PATH"
+
+# 如果命令行传递了参数，则执行该参数（作为 user 用户）
+# 否则执行默认的 agent_runner
+if [ $# -gt 0 ]; then
+    echo "🚀 Running custom command as user: $*"
+    # 使用 runuser 切换用户，构建完整的命令字符串
+    CMD="$*"
+    exec runuser -u user -- /bin/bash -c "$ENV_EXPORTS; exec $CMD"
+else
+    # 默认启动 agent_runner
+    echo "🚀 Launching agent_runner as user on port ${PORT:-8086}..."
+    exec runuser -u user -- /bin/bash -c "$ENV_EXPORTS; exec /usr/local/bin/agent_runner -p ${PORT:-8086}"
+fi
