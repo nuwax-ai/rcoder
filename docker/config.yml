@@ -129,7 +129,7 @@ docker_config:
             host_path: "{resolved_path}/{log_dir_name}"
             read_only: false
             mount_type: "bind"
-            resolve_from: "/app/logs"
+            resolve_from: "/app/logs/container"
 
     # 镜像选择策略
     selection_strategy: "ServiceOnly"
