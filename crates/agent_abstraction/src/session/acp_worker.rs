@@ -110,10 +110,9 @@ impl<
         debug!("🔌 转换后的 MCP 服务器数量: {}", mcp_servers.len());
 
         // 构建 AgentStartConfig 并传递 MCP 服务器和 service_type
-        let mut start_config = AgentStartConfig::new()
+        let mut start_config = AgentStartConfig::new(request.prompt_message.service_type.clone())
             .with_system_prompt(system_prompt)
-            .with_mcp_servers(mcp_servers)
-            .with_service_type(request.prompt_message.service_type.clone());
+            .with_mcp_servers(mcp_servers);
 
         // TODO: 改进会话恢复策略
         //

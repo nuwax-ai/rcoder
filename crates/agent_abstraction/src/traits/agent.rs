@@ -11,7 +11,7 @@ use async_trait::async_trait;
 ///
 /// 包含启动 Agent 所需的额外配置信息，如系统提示词、MCP 服务器配置等。
 /// 这些配置通过 ACP 协议的 NewSessionRequest 传递给 Agent。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AgentStartConfig {
     /// 系统提示词（通过 meta.systemPrompt.append 传递）
     ///
@@ -27,8 +27,8 @@ pub struct AgentStartConfig {
     /// 可以传递任何额外的配置信息给 Agent
     pub extra_meta: Option<serde_json::Map<String, serde_json::Value>>,
 
-    /// 服务类型（用于加载对应的配置）
-    pub service_type: Option<shared_types::ServiceType>,
+    /// 服务类型（用于加载对应的配置，必填）
+    pub service_type: shared_types::ServiceType,
 
     /// 用于恢复会话的 session_id
     ///
@@ -39,8 +39,17 @@ pub struct AgentStartConfig {
 
 impl AgentStartConfig {
     /// 创建新的 AgentStartConfig
-    pub fn new() -> Self {
-        Self::default()
+    ///
+    /// # 参数
+    /// - `service_type`: 服务类型（必填）
+    pub fn new(service_type: shared_types::ServiceType) -> Self {
+        Self {
+            system_prompt: None,
+            mcp_servers: Vec::new(),
+            extra_meta: None,
+            service_type,
+            resume_session_id: None,
+        }
     }
 
     /// 设置系统提示词
@@ -66,7 +75,7 @@ impl AgentStartConfig {
 
     /// 设置服务类型
     pub fn with_service_type(mut self, service_type: shared_types::ServiceType) -> Self {
-        self.service_type = Some(service_type);
+        self.service_type = service_type;
         self
     }
 

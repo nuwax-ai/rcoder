@@ -84,15 +84,10 @@ pub struct LauncherConnectionInfoComplete {
 /// 同时检查并自动安装 agent（如果需要）
 pub async fn load_agent_config(
     model_provider: Option<&ModelProviderConfig>,
-    service_type: Option<&shared_types::ServiceType>,
+    service_type: &shared_types::ServiceType,
 ) -> Result<AgentLaunchConfig> {
     // 根据服务类型加载对应的配置
-    let config = if let Some(st) = service_type {
-        AgentServersConfig::load_or_default_for_service(st).await
-    } else {
-        // 回退到默认配置（保持向后兼容）
-        AgentServersConfig::load_or_default().await
-    };
+    let config = AgentServersConfig::load_or_default_for_service(service_type).await;
 
     // 获取 claude-code-acp 配置
     if let Some(agent_config) = config.get_agent("claude-code-acp") {
@@ -149,7 +144,7 @@ pub async fn load_agent_config(
 /// 获取默认的 Agent 配置（后备方案）
 pub fn get_default_agent_config(
     model_provider: Option<&ModelProviderConfig>,
-    service_type: Option<&shared_types::ServiceType>,
+    service_type: &shared_types::ServiceType,
 ) -> Result<AgentLaunchConfig> {
     let env = if let Some(provider) = model_provider {
         let mut env = HashMap::new();
@@ -303,8 +298,7 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
         client: C,
     ) -> Result<LauncherConnectionInfoComplete> {
         // 从配置加载 Agent 参数（传递 service_type）
-        let service_type_ref = start_config.service_type.as_ref();
-        let agent_config = load_agent_config(model_provider.as_ref(), service_type_ref).await?;
+        let agent_config = load_agent_config(model_provider.as_ref(), &start_config.service_type).await?;
         let command_path = &agent_config.command;
         let command_args = &agent_config.args;
         info!("Claude Code ACP 命令: {} {:?}", command_path, command_args);
