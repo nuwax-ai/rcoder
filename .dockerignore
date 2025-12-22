@@ -24,6 +24,8 @@ docker/project_workspace/
 docker/logs/
 docker/specs/
 docker/rcoder-agent-runner/
+docker/computer-cache/
+docker/computer-project-workspace/
 
 # 测试文件
 tests/
