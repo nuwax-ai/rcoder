@@ -418,33 +418,7 @@ RUN chmod +x /usr/bin/deno && \
 # RUN R -e "install.packages('IRkernel', repos='https://cloud.r-project.org'); IRkernel::installspec(user = FALSE, name = 'r', displayname = 'R')"
 
 
-# 配置 envd 服务
-ARG TARGETARCH
-RUN mkdir -p /etc/systemd/system/multi-user.target.wants
-# 复制所有 envd 二进制文件
-COPY ./bin/ /tmp/envd-bin/
-# 根据目标架构选择对应的 envd 二进制文件
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-    cp /tmp/envd-bin/envd-arm64 /usr/bin/envd; \
-    else \
-    cp /tmp/envd-bin/envd /usr/bin/envd; \
-    fi && \
-    chmod +x /usr/bin/envd && \
-    rm -rf /tmp/envd-bin
-RUN echo '[Unit]\n\
-    Description=Env Daemon Service\n\
-    \n\
-    [Service]\n\
-    Type=simple\n\
-    Restart=always\n\
-    User=root\n\
-    Group=root\n\
-    ExecStart=/bin/bash -l -c /usr/bin/envd\n\
-    \n\
-    [Install]\n\
-    WantedBy=multi-user.target' > /etc/systemd/system/envd.service
-
-RUN ln -s /etc/systemd/system/envd.service /etc/systemd/system/multi-user.target.wants/envd.service
+# envd 服务已删除 - 不再需要环境守护进程
 
 # 配置 chrony
 RUN mkdir -p /etc/chrony

@@ -150,13 +150,13 @@ function initialize_user_home() {
     # 修复权限
     echo "🔐 Fixing permissions..."
     chmod -R u+rwX /app "$USER_HOME/.cache" 2>/dev/null || true
-    
+
     # 对于可能无法 chown 的挂载目录，尝试添加 other 权限
     chmod -R o+rX /app 2>/dev/null || true
-    
+
     # 确保 bin 目录下的文件可执行
     [ -d /app/bin ] && chmod -R a+x /app/bin 2>/dev/null || true
-    
+
     echo "✅ Permissions fixed"
 
     # ========== 设置渲染相关环境变量（防止花屏）==========
@@ -256,7 +256,7 @@ function start_display_and_desktop() {
 	pkill -f "xfce4-session" || true
 	pkill -f "dbus-daemon" || true
 	pkill -f "fcitx5" || true
-    
+
     # 确保 /tmp 权限正确且 XAUTHORITY 可写
     touch /tmp/.Xauthority
     chmod 666 /tmp/.Xauthority
@@ -552,8 +552,7 @@ start_display_and_desktop &
 export DISPLAY=:0
 echo "DISPLAY=:0" >> /etc/environment
 
-# 启动envd和其他服务
-/bin/bash -l -c "DISPLAY=:0 /usr/bin/envd" &
+# envd 服务已删除 - 不再启动环境守护进程
 
 # Jupyter services removed
 
