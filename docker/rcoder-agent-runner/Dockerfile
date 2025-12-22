@@ -52,8 +52,10 @@ RUN apt-get update && \
     ln -sf /usr/bin/xfce4-terminal.wrapper /etc/alternatives/x-terminal-emulator && \
     # Install Python packages:
     # apt-get install -y python3-numpy && \
-    # Clone NoVNC and websockify:
-    git clone -b e2b-desktop https://github.com/e2b-dev/noVNC.git /opt/noVNC && \
+    # Clone official noVNC v1.6.0 (latest stable, with full toolbar & clipboard support):
+    git clone https://github.com/novnc/noVNC.git /opt/noVNC && \
+    cd /opt/noVNC && \
+    git checkout v1.6.0 && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
     git clone -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify && \
     # Clean up package cache and temporary files to reduce image size:

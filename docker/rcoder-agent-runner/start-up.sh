@@ -42,6 +42,38 @@ else
 fi
 
 # ============================================================================
+# 🎯 动态时区设置（支持通过 TZ 环境变量自定义时区）
+# 默认时区为 Asia/Shanghai（在 Dockerfile 中配置）
+# 启动时如果检测到 TZ 环境变量，则更新系统时区
+# 使用方式: docker run -e TZ=America/New_York your-image
+# ============================================================================
+function initialize_timezone() {
+    # 如果 TZ 环境变量未设置或为空，保持默认时区（Asia/Shanghai）
+    if [ -z "$TZ" ]; then
+        echo "🕐 Using default timezone: Asia/Shanghai"
+        return 0
+    fi
+
+    echo "🕐 Setting timezone to: $TZ"
+
+    # 检查时区文件是否存在
+    if [ -f "/usr/share/zoneinfo/$TZ" ]; then
+        # 更新 /etc/localtime 软链接
+        ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
+        # 更新 /etc/timezone 文件
+        echo "$TZ" > /etc/timezone
+        echo "✅ Timezone set to $TZ"
+    else
+        echo "⚠️  Invalid timezone: $TZ (file /usr/share/zoneinfo/$TZ not found)"
+        echo "   Available timezones can be found in /usr/share/zoneinfo/"
+        echo "   Keeping default timezone: Asia/Shanghai"
+    fi
+}
+
+# 初始化时区（在日志设置之后、用户目录初始化之前）
+initialize_timezone
+
+# ============================================================================
 # 🎯 用户主目录初始化（解决挂载空目录导致的花屏和图标消失问题）
 # 当宿主机目录挂载到 /home/user 时，镜像中预置的配置会被覆盖
 # 此函数从骨架目录 /etc/skel-user-desktop 恢复必要的配置文件
