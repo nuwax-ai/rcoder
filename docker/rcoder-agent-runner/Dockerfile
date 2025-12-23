@@ -103,7 +103,7 @@ RUN apt-get update && \
 
 # Configure Chromium to skip first-run experience and enable CDP
 RUN mkdir -p /etc/chromium/policies/managed/ && \
-    echo '{"AllowInsecureLocalConnections": true, "RemoteDebuggingAllowed": true, "RemoteDebuggingPort": "9222", "RemoteDebuggingAddress":"0.0.0.0", "AutoplayAllowed": true, "MetricsReportingEnabled": false, "BrowserSignin": 0, "SyncDisabled": true, "PromotionalTabsEnabled": false, "DefaultBrowserSettingEnabled": false, "DefaultSearchProviderEnabled": false, "HideWebStoreIcon": true, "PasswordManagerEnabled": false, "PromptForDownloadLocation": false, "SafeBrowsingEnabled": false, "SafeBrowsingExtendedReportingEnabled": false, "UrlKeyedAnonymizedDataCollectionEnabled": false, "CloudPrintSubmitEnabled": false, "CloudManagementEnrollmentToken": "", "SpellcheckEnabled": false}' > /etc/chromium/policies/managed/policies.json
+    echo '{"CommandLineFlagSecurityWarningsEnabled": false, "AllowInsecureLocalConnections": true, "RemoteDebuggingAllowed": true, "RemoteDebuggingPort": "9222", "RemoteDebuggingAddress":"0.0.0.0", "AutoplayAllowed": true, "MetricsReportingEnabled": false, "BrowserSignin": 0, "SyncDisabled": true, "PromotionalTabsEnabled": false, "DefaultBrowserSettingEnabled": false, "DefaultSearchProviderEnabled": false, "HideWebStoreIcon": true, "PasswordManagerEnabled": false, "PromptForDownloadLocation": false, "SafeBrowsingEnabled": false, "SafeBrowsingExtendedReportingEnabled": false, "UrlKeyedAnonymizedDataCollectionEnabled": false, "CloudPrintSubmitEnabled": false, "CloudManagementEnrollmentToken": "", "SpellcheckEnabled": false}' > /etc/chromium/policies/managed/policies.json
 
 # Create user and configure Chrome (merged for smaller image size)
 RUN apt-get update && \
@@ -269,20 +269,20 @@ RUN echo "🔍 Verifying installations..." && \
     elif command -v code >/dev/null 2>&1; then CODE_PATH="$(command -v code)"; \
     fi && \
     if [ -z "$CODE_PATH" ]; then \
-        echo "❌ VS Code installation failed! No 'code' binary found" && \
-        echo "📂 Searching for code binary..." && \
-        find /usr -name "code" -type f 2>/dev/null | head -10 && \
-        exit 1; \
+    echo "❌ VS Code installation failed! No 'code' binary found" && \
+    echo "📂 Searching for code binary..." && \
+    find /usr -name "code" -type f 2>/dev/null | head -10 && \
+    exit 1; \
     fi && \
     echo "✅ VS Code found at: $CODE_PATH" && \
     # 如果 /usr/bin/code 不存在，创建软链接
     if [ ! -x /usr/bin/code ] && [ -n "$CODE_PATH" ]; then \
-        ln -sf "$CODE_PATH" /usr/bin/code && \
-        echo "🔗 Created symlink: /usr/bin/code -> $CODE_PATH"; \
+    ln -sf "$CODE_PATH" /usr/bin/code && \
+    echo "🔗 Created symlink: /usr/bin/code -> $CODE_PATH"; \
     fi && \
     # Chromium
     if [ ! -x /usr/bin/chromium ]; then \
-        echo "❌ Chromium installation failed!" && exit 1; \
+    echo "❌ Chromium installation failed!" && exit 1; \
     fi && \
     echo "✅ Chromium: $(/usr/bin/chromium --version 2>/dev/null || echo 'installed')" && \
     echo "🎉 All critical software verified!"
