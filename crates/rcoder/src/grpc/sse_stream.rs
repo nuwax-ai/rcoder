@@ -4,7 +4,7 @@
 //! 并转换为 SSE 事件返回给客户端
 
 use chrono::{DateTime, Utc};
-use shared_types::grpc::ProgressRequest;
+use shared_types::grpc::{GetStatusRequest, ProgressRequest};
 use shared_types::{SessionMessageType, UnifiedSessionMessage};
 use tracing::{debug, error, info, warn};
 
@@ -12,11 +12,13 @@ use tracing::{debug, error, info, warn};
 ///
 /// 通过 gRPC `SubscribeProgress` 方法订阅 agent_runner 的进度事件，
 /// 并将事件转换为 SSE 格式返回
-/// 
+///
 /// 🚀 优化：使用连接池 + 智能重试机制
+/// 🆕 新增：在建立流之前检查 Agent 状态，如果 Agent 闲置则直接发送 SessionPromptEnd 并关闭
 pub async fn create_grpc_sse_stream(
     grpc_addr: String,
     session_id: String,
+    project_id: String,
     pool: std::sync::Arc<crate::grpc::GrpcChannelPool>,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
@@ -26,8 +28,8 @@ pub async fn create_grpc_sse_stream(
     // 在后台任务中处理 gRPC 流
     tokio::spawn(async move {
         info!(
-            "🔗 [gRPC_SSE] 开始连接 agent_runner gRPC: addr={}, session_id={}",
-            grpc_addr, session_id_clone
+            "🔗 [gRPC_SSE] 开始连接 agent_runner gRPC: addr={}, session_id={}, project_id={}",
+            grpc_addr, session_id_clone, project_id
         );
 
         let max_retries = 2;
@@ -48,7 +50,39 @@ pub async fn create_grpc_sse_stream(
                 }
             };
 
-            // 2. 发送 SubscribeProgress 请求
+            // 🆕 2. 先检查 Agent 状态
+            let status_request = tonic::Request::new(GetStatusRequest {
+                project_id: project_id.clone(),
+            });
+
+            match client.get_status(status_request).await {
+                Ok(response) => {
+                    let status = response.into_inner().status;
+                    if status == "idle" {
+                        // Agent 闲置，发送 SessionPromptEnd 并关闭连接
+                        info!(
+                            "💤 [gRPC_SSE] Agent 处于闲置状态，发送 SessionPromptEnd 并关闭: session_id={}, project_id={}",
+                            session_id_clone, project_id
+                        );
+                        let end_event = create_session_prompt_end_event(&session_id_clone);
+                        let _ = tx.send(Ok(end_event)).await;
+                        return; // 直接结束，不建立流
+                    }
+                    info!(
+                        "🔄 [gRPC_SSE] Agent 状态为 {}, 继续建立流: session_id={}",
+                        status, session_id_clone
+                    );
+                }
+                Err(e) => {
+                    // 状态检查失败，记录警告但继续尝试建立流
+                    warn!(
+                        "⚠️ [gRPC_SSE] Agent 状态检查失败: {}, 继续尝试建立流: session_id={}",
+                        e, session_id_clone
+                    );
+                }
+            }
+
+            // 3. 发送 SubscribeProgress 请求
             let request = tonic::Request::new(ProgressRequest {
                 session_id: session_id_clone.clone(),
             });
@@ -91,15 +125,18 @@ pub async fn create_grpc_sse_stream(
                         "⚠️ [gRPC_SSE] SubscribeProgress 调用失败 (尝试 {}/{}): {}",
                         attempt, max_retries, e
                     );
-                    
+
                     // 如果不是最后一次尝试，清理连接池并重试
                     if attempt < max_retries {
-                        info!("🔌 [gRPC_SSE] 可能是连接已断开，从连接池移除 {} 并重试...", grpc_addr);
+                        info!(
+                            "🔌 [gRPC_SSE] 可能是连接已断开，从连接池移除 {} 并重试...",
+                            grpc_addr
+                        );
                         pool.remove(&grpc_addr);
                         last_error_msg = format!("流订阅失败: {}", e);
                         continue;
                     }
-                    
+
                     last_error_msg = format!("流订阅最终失败: {}", e);
                 }
             }
@@ -120,6 +157,28 @@ pub async fn create_grpc_sse_stream(
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
+/// 创建 Agent 闲置时的 SessionPromptEnd SSE 事件
+///
+/// 当 Agent 处于闲置状态时，发送此事件通知前端没有正在执行的任务
+fn create_session_prompt_end_event(session_id: &str) -> axum::response::sse::Event {
+    let unified_message = UnifiedSessionMessage {
+        session_id: session_id.to_string(),
+        message_type: SessionMessageType::SessionPromptEnd,
+        sub_type: "end_turn".to_string(),
+        data: serde_json::json!({
+            "reason": "EndTurn",
+            "description": "Agent 当前无任务执行"
+        }),
+        timestamp: Utc::now(),
+    };
+
+    let json_data = serde_json::to_string(&unified_message).unwrap_or_else(|_| "{}".to_string());
+
+    axum::response::sse::Event::default()
+        .event("prompt_end")
+        .data(json_data)
+}
+
 /// 将 gRPC ProgressEvent 转换为 SSE Event
 ///
 /// 使用 UnifiedSessionMessage 结构体重建完整消息，包含 sessionId、messageType、subType、data、timestamp
@@ -133,7 +192,8 @@ fn progress_event_to_sse(
         serde_json::from_str(&event.payload).unwrap_or(serde_json::Value::Null);
 
     // 将 gRPC 时间戳（毫秒）转换为 DateTime<Utc>
-    let timestamp = DateTime::<Utc>::from_timestamp_millis(event.timestamp).unwrap_or_else(Utc::now);
+    let timestamp =
+        DateTime::<Utc>::from_timestamp_millis(event.timestamp).unwrap_or_else(Utc::now);
 
     // 将 message_type 字符串转换为 SessionMessageType 枚举
     let message_type = parse_message_type(&event.message_type);

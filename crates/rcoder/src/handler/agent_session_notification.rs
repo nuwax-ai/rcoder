@@ -502,6 +502,7 @@ async fn validate_and_get_session_context(
 async fn build_sse_stream_from_agent_info(
     agent_info: Arc<shared_types::ProjectAndContainerInfo>,
     session_id: String,
+    project_id: String,
     grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
@@ -514,14 +515,15 @@ async fn build_sse_stream_from_agent_info(
                 shared_types::GRPC_DEFAULT_PORT
             );
             info!(
-                "🚀 [gRPC_SSE] 建立 {} gRPC SSE 代理连接: {}",
-                agent_type, grpc_addr
+                "🚀 [gRPC_SSE] 建立 {} gRPC SSE 代理连接: {}, project_id={}",
+                agent_type, grpc_addr, project_id
             );
 
             // 创建 gRPC SSE 流
             let stream = crate::grpc::create_grpc_sse_stream(
                 grpc_addr,
                 session_id.clone(),
+                project_id,
                 grpc_pool.clone(),
             )
             .await;
@@ -725,13 +727,14 @@ pub async fn agent_session_notification(
     );
 
     // 使用核心验证函数获取上下文
-    let (_project_id, agent_info, _container_id) =
+    let (project_id, agent_info, _container_id) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
     // 使用通用函数创建 SSE 响应流
     build_sse_stream_from_agent_info(
         agent_info,
         session_id.to_string(),
+        project_id,
         state.grpc_pool.clone(),
         "Agent",
     )
@@ -827,13 +830,14 @@ pub async fn computer_agent_progress_notification(
     );
 
     // 使用与 agent_session_notification 相同的验证逻辑
-    let (_project_id, agent_info, _container_id) =
+    let (project_id, agent_info, _container_id) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
     // 使用通用函数创建 SSE 响应流
     build_sse_stream_from_agent_info(
         agent_info,
         session_id.to_string(),
+        project_id,
         state.grpc_pool.clone(),
         "Computer Agent",
     )

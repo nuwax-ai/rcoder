@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::ServiceType;
 use super::{AgentStatus, ModelProviderConfig};
+use crate::ServiceType;
 
 /// 容器基本信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +328,21 @@ impl ProjectAndContainerInfo {
             if let Some(st) = service_type {
                 extended.service_type = Some(st);
             }
+        });
+    }
+
+    /// 设置时间戳（用于从持久化存储恢复数据）
+    ///
+    /// 当从 DuckDB 等持久化存储读取数据时，需要恢复原始的时间戳，
+    /// 而不是使用 `new()` 中设置的当前时间。
+    ///
+    /// # Arguments
+    /// * `created_at` - 创建时间
+    /// * `last_activity` - 最后活动时间
+    pub fn set_timestamps(&mut self, created_at: DateTime<Utc>, last_activity: DateTime<Utc>) {
+        self.state.update_core(|core| {
+            core.created_at = created_at;
+            core.last_activity = last_activity;
         });
     }
 }
