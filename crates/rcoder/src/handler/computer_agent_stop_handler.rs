@@ -144,71 +144,106 @@ pub async fn computer_agent_stop(
         container_info.container_id, container_info.container_ip
     );
 
-    // 3. 通过 gRPC 调用 StopAgent RPC（如果实现了）
-    // 目前先通过 CancelSession 来停止 Agent
-    if let Some(session_id) = &request.session_id {
-        info!("🔄 [COMPUTER_STOP] 尝试取消会话: session_id={}", session_id);
-
-        // 提取 gRPC 地址
-        let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
-
-        // 调用 CancelSession RPC
-        match crate::grpc::grpc_cancel_session_with_pool(
-            &state.grpc_pool,
-            &grpc_addr,
-            session_id.clone(),
-            "User requested stop".to_string(), // reason
-            project_id.clone(),                // project_id
-        )
-        .await
-        {
-            Ok(response) => {
-                if response.success {
-                    info!("✅ [COMPUTER_STOP] 会话取消成功: session_id={}", session_id);
-                } else {
-                    warn!(
-                        "⚠️ [COMPUTER_STOP] 会话取消返回失败: session_id={}, message={}",
-                        session_id,
-                        response.message.unwrap_or_default()
-                    );
-                }
-            }
-            Err(e) => {
-                error!(
-                    "❌ [COMPUTER_STOP] 调用 CancelSession 失败: {}, session_id={}",
-                    e, session_id
-                );
-                // gRPC 通信失败，继续清理本地状态
-                // 注：业务错误码现在由 agent_runner 通过 grpc_response 返回
-            }
-        }
-
-        // 注意：DuckDB 存储中的会话数据会由 cleanup_task 统一清理
-        // 不再需要手动清理 session_to_container_id 映射
-        info!(
-            "🧹 [COMPUTER_STOP] 会话 {} 将由 cleanup_task 清理",
-            session_id
-        );
-    }
-
-    // 4. 返回成功响应
-    // 注意：容器不会被销毁，继续运行其他 project_id 的 Agent
-    let response = ComputerAgentStopResponse {
-        success: true,
-        message: format!(
-            "Agent {} 已停止，容器 {} 继续运行",
-            project_id, container_info.container_id
-        ),
-        user_id,
-        project_id,
-    };
-
+    // 3. 通过 gRPC 调用 StopAgent RPC
     info!(
-        "✅ [COMPUTER_STOP] Agent 停止完成: user_id={}, project_id={}",
-        request.user_id, request.project_id
+        "🔄 [COMPUTER_STOP] 准备调用 StopAgent RPC: project_id={}",
+        project_id
     );
 
-    Ok(HttpResult::success(response))
+    // 提取 gRPC 地址
+    let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
+    info!("🌐 [COMPUTER_STOP] gRPC 地址: {}", grpc_addr);
+
+    // 调用 StopAgent RPC
+    match crate::grpc::grpc_stop_agent_with_pool(
+        &state.grpc_pool,
+        &grpc_addr,
+        project_id.clone(),
+        request
+            .session_id
+            .clone()
+            .or_else(|| Some("用户请求停止".to_string())),
+        false, // force=false，优雅停止
+    )
+    .await
+    {
+        Ok(response) => {
+            info!(
+                "📥 [COMPUTER_STOP] 收到 StopAgent 响应: result={}, success={}",
+                response.result, response.success
+            );
+
+            if response.success {
+                let message = format!(
+                    "Agent {} 已成功停止，容器 {} 继续运行",
+                    project_id, container_info.container_id
+                );
+
+                let stop_response = ComputerAgentStopResponse {
+                    success: true,
+                    message,
+                    user_id: user_id.clone(),
+                    project_id: project_id.clone(),
+                };
+
+                info!(
+                    "✅ [COMPUTER_STOP] Agent 停止完成: user_id={}, project_id={}",
+                    user_id, project_id
+                );
+                return Ok(HttpResult::success(stop_response));
+            } else {
+                // Agent 停止失败或已经停止
+                match response.result.as_str() {
+                    "not_found" => {
+                        warn!("⚠️ [COMPUTER_STOP] Agent 未找到: project_id={}", project_id);
+                        return Ok(HttpResult::error(
+                            "NOT_FOUND",
+                            &format!("找不到项目 {} 的 Agent", project_id),
+                        ));
+                    }
+                    "already_stopped" => {
+                        info!(
+                            "ℹ️ [COMPUTER_STOP] Agent 已经处于停止状态: project_id={}",
+                            project_id
+                        );
+                        let message = format!(
+                            "Agent {} 已经处于停止状态，容器 {} 继续运行",
+                            project_id, container_info.container_id
+                        );
+                        let stop_response = ComputerAgentStopResponse {
+                            success: true,
+                            message,
+                            user_id: user_id.clone(),
+                            project_id: project_id.clone(),
+                        };
+                        return Ok(HttpResult::success(stop_response));
+                    }
+                    "error" => {
+                        let err_msg = response.message.unwrap_or_else(|| "未知错误".to_string());
+                        error!("❌ [COMPUTER_STOP] Agent 停止失败: {}", err_msg);
+                        return Ok(HttpResult::error("STOP_FAILED", &err_msg));
+                    }
+                    _ => {
+                        warn!("⚠️ [COMPUTER_STOP] 未知的响应结果: {}", response.result);
+                        return Ok(HttpResult::error(
+                            "UNKNOWN_RESULT",
+                            &format!("未知的响应结果: {}", response.result),
+                        ));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                "❌ [COMPUTER_STOP] 调用 StopAgent RPC 失败: {}, project_id={}",
+                e, project_id
+            );
+            return Ok(HttpResult::error(
+                "GRPC_ERROR",
+                &format!("调用 StopAgent RPC 失败: {}", e),
+            ));
+        }
+    }
 }
 
 /// 从 service_url 提取 gRPC 地址

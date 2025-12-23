@@ -10,9 +10,8 @@ use std::{
 use agent_client_protocol::{Client, ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
-use chrono::Utc;
 use dashmap::DashMap;
-use shared_types::{AgentLifecycle, AgentStatus, ModelProviderConfig};
+use shared_types::{AgentLifecycle, ModelProviderConfig};
 use tracing::{debug, error, info};
 
 use super::SessionInfo;
@@ -28,7 +27,8 @@ use crate::traits::{AgentStartConfig, SessionNotifier};
 /// - 会话生命周期管理
 pub struct AcpSessionManager<N: SessionNotifier, C: Client + 'static> {
     /// project_id -> SessionInfo 映射
-    sessions: DashMap<String, Arc<SessionInfo>>,
+    /// 使用 Arc 包装以便传递给 launcher 进行降级时的更新
+    sessions: Arc<DashMap<String, Arc<SessionInfo>>>,
     /// 会话通知器
     notifier: Arc<N>,
     /// Client 类型标记（phantom data）
@@ -39,7 +39,7 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
     /// 创建新的会话管理器
     pub fn new(notifier: Arc<N>) -> Self {
         Self {
-            sessions: DashMap::new(),
+            sessions: Arc::new(DashMap::new()),
             notifier,
             _client_marker: std::marker::PhantomData,
         }
@@ -189,7 +189,7 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
         &self,
         project_id: String,
         project_path: PathBuf,
-        session_id_hint: Option<String>,
+        _session_id_hint: Option<String>,
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
@@ -207,10 +207,10 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
             .launch(
                 project_id.clone(),
                 project_path.clone(),
-                session_id_hint.clone(),
                 model_provider.clone(),
                 start_config.clone(),
                 client,
+                self.sessions.clone(),
             )
             .await;
 
@@ -220,41 +220,37 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
             Err(e) => {
                 let error_msg = format!("{:?}", e);
 
-                // 检查是否因为 resume 导致的失败
-                if has_resume
-                    && (error_msg.contains("No conversation found")
-                        || error_msg.contains("session")
-                        || error_msg.contains("exited with code 1"))
-                {
+                // 只要带 resume 且启动失败，就降级重试（不判断具体错误原因）
+                if has_resume {
                     tracing::warn!(
-                        "⚠️ Agent 启动失败（可能因 --resume），重试不使用 --resume: error={}",
+                        "⚠️ Agent 启动失败（带 resume），降级为不使用 resume 重试: error={}",
                         error_msg
                     );
 
                     // 创建新的 config，不包含 resume_session_id
                     let retry_config = AgentStartConfig {
-                        system_prompt: start_config.system_prompt,
-                        mcp_servers: start_config.mcp_servers,
-                        extra_meta: start_config.extra_meta,
-                        service_type: start_config.service_type,
+                        system_prompt: start_config.system_prompt.clone(),
+                        mcp_servers: start_config.mcp_servers.clone(),
+                        extra_meta: start_config.extra_meta.clone(),
+                        service_type: start_config.service_type.clone(),
                         resume_session_id: None, // ✅ 去掉 resume
                     };
 
-                    tracing::info!("🔄 重试启动 Agent（不使用 --resume）");
+                    tracing::info!("🔄 重试启动 Agent（不使用 resume）");
 
                     // 重试启动（创建新的 client 实例）
                     launcher
                         .launch(
                             project_id.clone(),
-                            project_path,
-                            session_id_hint,
+                            project_path.clone(),
                             model_provider.clone(),
                             retry_config,
                             C::default(), // 创建新的 client 实例
+                            self.sessions.clone(),
                         )
                         .await?
                 } else {
-                    // 其他错误，直接返回
+                    // 不带 resume 的失败，直接返回错误
                     return Err(e);
                 }
             }
@@ -273,12 +269,16 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
             connection_info.session_id,
             connection_info.prompt_tx,
             connection_info.cancel_tx,
-            model_provider,
+            model_provider.clone(),
             lifecycle_handle,
         ));
 
         // 存储会话信息
-        self.sessions.insert(project_id, session_info.clone());
+        self.sessions.insert(project_id.clone(), session_info.clone());
+
+        // 注意：降级处理已移至 launch() 的 spawn_local 块内
+        // 通过 tokio::select! 在 LocalSet 中直接处理降级，避免跨线程问题
+        // 详见 crates/agent_abstraction/src/compat/claude_code_launcher.rs
 
         Ok(session_info)
     }

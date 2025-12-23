@@ -3,9 +3,9 @@
 //! 统一管理 project_id、session_id 和 AgentInfo 之间的映射关系
 //! 所有映射操作都通过此结构体的方法进行，确保数据一致性
 
+use dashmap::DashMap;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
-use dashmap::DashMap;
 use shared_types::ProjectAndAgentInfo;
 use std::sync::LazyLock;
 use tracing::{debug, info};
@@ -49,12 +49,7 @@ impl AgentSessionRegistry {
     /// 注册新的 Agent Session（同时更新所有映射）
     ///
     /// 如果 project_id 已存在旧的 session，会自动清理旧的反向映射
-    pub fn register(
-        &self,
-        project_id: &str,
-        session_id: &str,
-        agent_info: ProjectAndAgentInfo,
-    ) {
+    pub fn register(&self, project_id: &str, session_id: &str, agent_info: ProjectAndAgentInfo) {
         use dashmap::mapref::entry::Entry;
 
         // 🎯 原子性地更新 project_to_session 并获取旧 session_id
@@ -185,7 +180,13 @@ impl AgentSessionRegistry {
     pub fn remove_by_project(&self, project_id: &str) -> Option<ProjectAndAgentInfo> {
         use dashmap::mapref::entry::Entry;
 
+        info!(
+            "🔍 [Registry] remove_by_project 开始: project_id={}",
+            project_id
+        );
+
         // 🎯 原子性地移除 project_to_session 并获取 session_id
+        info!("🔍 [Registry] 移除 project_to_session 映射");
         let session_id = match self.project_to_session.entry(project_id.to_string()) {
             Entry::Occupied(entry) => {
                 let (_, session_id) = entry.remove_entry(); // 原子性移除
@@ -193,14 +194,22 @@ impl AgentSessionRegistry {
             }
             Entry::Vacant(_) => None,
         };
+        info!("🔍 [Registry] project_to_session 移除完成");
 
         // 移除反向映射
         if let Some(ref sid) = session_id {
+            info!("🔍 [Registry] 移除 session_to_project 映射");
             self.session_to_project.remove(sid);
+            info!("🔍 [Registry] session_to_project 移除完成");
         }
 
         // 移除 agent_info
+        info!("🔍 [Registry] 移除 agent_info_map");
         let removed = self.agent_info_map.remove(project_id).map(|(_, v)| v);
+        info!(
+            "🔍 [Registry] agent_info_map 移除完成, removed={}",
+            removed.is_some()
+        );
 
         if removed.is_some() {
             info!(
@@ -209,6 +218,10 @@ impl AgentSessionRegistry {
             );
         }
 
+        info!(
+            "🔍 [Registry] remove_by_project 完成: project_id={}",
+            project_id
+        );
         removed
     }
 

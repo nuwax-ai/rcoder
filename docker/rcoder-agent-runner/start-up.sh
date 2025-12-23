@@ -118,42 +118,62 @@ function initialize_user_home() {
         mkdir -p "$USER_HOME/.config" "$USER_HOME/.local/share" "$USER_HOME/.cache"
         mkdir -p "$USER_HOME/Desktop"
 
-        # 从骨架目录复制配置（使用 cp -n 不覆盖已存在的文件，保留用户数据）
-        # Desktop 目录 - 恢复桌面图标
+        # ========== Desktop 目录 - 强制覆盖桌面图标（防止坏软链接）==========
         if [ -d "$SKEL_DIR/Desktop" ]; then
-            cp -an "$SKEL_DIR/Desktop/." "$USER_HOME/Desktop/" 2>/dev/null || true
-            echo "  ✓ Desktop icons restored"
+            # 先删除现有的 .desktop 文件（可能是损坏的软链接）
+            rm -f "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
+            # 强制复制桌面图标
+            cp -a "$SKEL_DIR/Desktop/"*.desktop "$USER_HOME/Desktop/" 2>/dev/null || true
+            # 设置可执行权限
+            chmod +x "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
+            echo "  ✓ Desktop icons restored (forced overwrite)"
         fi
 
-        # .bashrc - 恢复别名配置
-        if [ ! -f "$USER_HOME/.bashrc" ] && [ -f "$SKEL_DIR/.bashrc" ]; then
+        # ========== .bashrc - 强制覆盖 ==========
+        if [ -f "$SKEL_DIR/.bashrc" ]; then
             cp -a "$SKEL_DIR/.bashrc" "$USER_HOME/.bashrc"
-            echo "  ✓ .bashrc restored"
+            echo "  ✓ .bashrc restored (forced overwrite)"
         fi
 
-        # .config 目录 - 恢复应用配置（Chromium 等）
+        # ========== .config 目录 - 强制覆盖（保留 Chromium 用户数据）==========
         if [ -d "$SKEL_DIR/.config" ]; then
-            cp -an "$SKEL_DIR/.config/." "$USER_HOME/.config/" 2>/dev/null || true
-            echo "  ✓ .config directory restored"
+            # 1. 备份现有的 Chromium 用户数据（书签、历史记录等）
+            local chromium_backup=""
+            if [ -d "$USER_HOME/.config/chromium" ]; then
+                chromium_backup=$(mktemp -d)
+                cp -a "$USER_HOME/.config/chromium" "$chromium_backup/" 2>/dev/null || true
+                echo "  ✓ Chromium user data backed up"
+            fi
+            
+            # 2. 强制覆盖整个 .config 目录
+            cp -a "$SKEL_DIR/.config/." "$USER_HOME/.config/" 2>/dev/null || true
+            echo "  ✓ .config directory restored (forced overwrite)"
+            
+            # 3. 还原 Chromium 用户数据（覆盖骨架目录的默认配置）
+            if [ -n "$chromium_backup" ] && [ -d "$chromium_backup/chromium" ]; then
+                cp -a "$chromium_backup/chromium/." "$USER_HOME/.config/chromium/" 2>/dev/null || true
+                rm -rf "$chromium_backup"
+                echo "  ✓ Chromium user data restored"
+            fi
         fi
 
-        # .local 目录 - 恢复本地数据（keyrings 等）
+        # ========== .local 目录 - 强制覆盖 ==========
         if [ -d "$SKEL_DIR/.local" ]; then
-            cp -an "$SKEL_DIR/.local/." "$USER_HOME/.local/" 2>/dev/null || true
-            echo "  ✓ .local directory restored"
+            cp -a "$SKEL_DIR/.local/." "$USER_HOME/.local/" 2>/dev/null || true
+            echo "  ✓ .local directory restored (forced overwrite)"
         fi
 
-        # .bunfig.toml - 恢复 Bun 配置
-        if [ ! -f "$USER_HOME/.bunfig.toml" ] && [ -f "$SKEL_DIR/.bunfig.toml" ]; then
+        # ========== .bunfig.toml - 强制覆盖 ==========
+        if [ -f "$SKEL_DIR/.bunfig.toml" ]; then
             cp -a "$SKEL_DIR/.bunfig.toml" "$USER_HOME/.bunfig.toml"
-            echo "  ✓ .bunfig.toml restored"
+            echo "  ✓ .bunfig.toml restored (forced overwrite)"
         fi
 
-        # .claude 目录 - 恢复 Claude 配置
+        # ========== .claude 目录 - 不覆盖（保留用户配置）==========
         if [ -d "$SKEL_DIR/.claude" ]; then
             mkdir -p "$USER_HOME/.claude"
             cp -an "$SKEL_DIR/.claude/." "$USER_HOME/.claude/" 2>/dev/null || true
-            echo "  ✓ .claude directory restored"
+            echo "  ✓ .claude directory restored (preserve existing)"
         fi
 
         # .cache 目录 - 恢复工具缓存配置（bun, uv, pnpm）
@@ -177,11 +197,15 @@ function initialize_user_home() {
     # 同时配置 /root 和 /home/user，因为：
     # - 以 root 用户运行时，某些进程可能读取 /root/.config
     # - 设置 HOME=/home/user 后，大部分进程读取 /home/user/.config
-    local GTK_CSS_CONTENT='/* Hide Thunar root warning */
-.thunar-window infobar.warning { min-height: 0; padding: 0; margin: 0; opacity: 0; }
-.thunar-window infobar.warning * { min-height: 0; padding: 0; margin: 0; opacity: 0; }
-infobar.warning { min-height: 0; padding: 0; margin: 0; opacity: 0; }
-infobar.warning * { min-height: 0; padding: 0; margin: 0; opacity: 0; }
+    local GTK_CSS_CONTENT='/* Hide Thunar root warnings completely */
+.thunar-window infobar.warning { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
+.thunar-window infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
+.thunar-window infobar.warning button { min-height: 0; min-width: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
+infobar.warning { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
+infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
+/* Hide XFCE root warning */
+.root-warning { display: none !important; opacity: 0 !important; }
+.root-warning * { display: none !important; opacity: 0 !important; }
 '
     # 为 /root 创建配置
     mkdir -p /root/.config/gtk-3.0
@@ -193,6 +217,42 @@ infobar.warning * { min-height: 0; padding: 0; margin: 0; opacity: 0; }
     echo "$GTK_CSS_CONTENT" > "$USER_HOME/.config/gtk-3.0/gtk.css"
     echo "  ✓ GTK CSS created for $USER_HOME"
 
+    # ========== 设置 Chromium 为默认浏览器（解决 xdg-open 无法打开浏览器问题）==========
+    echo "🌐 Configuring Chromium as default web browser..."
+    
+    # 创建用户级 mimeapps.list（强制覆盖，确保默认浏览器设置正确）
+    mkdir -p "$USER_HOME/.config" "$USER_HOME/.local/share/applications"
+    
+    cat > "$USER_HOME/.config/mimeapps.list" <<'EOF'
+[Default Applications]
+text/html=chromium.desktop
+text/xml=chromium.desktop
+application/xhtml+xml=chromium.desktop
+application/xml=chromium.desktop
+application/rss+xml=chromium.desktop
+application/rdf+xml=chromium.desktop
+x-scheme-handler/http=chromium.desktop
+x-scheme-handler/https=chromium.desktop
+x-scheme-handler/ftp=chromium.desktop
+x-scheme-handler/chrome=chromium.desktop
+x-scheme-handler/about=chromium.desktop
+x-scheme-handler/unknown=chromium.desktop
+
+[Added Associations]
+text/html=chromium.desktop;
+x-scheme-handler/http=chromium.desktop;
+x-scheme-handler/https=chromium.desktop;
+EOF
+    
+    # 同时创建 ~/.local/share/applications/mimeapps.list（某些 xdg 工具读取这个位置）
+    cp "$USER_HOME/.config/mimeapps.list" "$USER_HOME/.local/share/applications/mimeapps.list"
+    
+    # 使用 xdg-settings 设置默认浏览器（需要在 X11 环境启动后才能完全生效）
+    # 这里先创建配置文件，xdg-settings 会在 DISPLAY 环境变量存在时使用
+    export BROWSER="/usr/bin/chromium-browser-launcher"
+    
+    echo "  ✓ Chromium set as default web browser (mimeapps.list)"
+    echo "  ✓ BROWSER env set to: $BROWSER"
 
     # ========== 修复挂载目录的权限（解决宿主机 UID 不匹配） ==========
     # 注意：由于 Dockerfile 中用户配置已经以 user 身份创建，
@@ -736,6 +796,7 @@ export XMODIFIERS=@im=fcitx; \
 export INPUT_METHOD=fcitx; \
 export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
+export BROWSER=/usr/bin/chromium-browser-launcher; \
 export PATH=/usr/local/bin:/opt/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
