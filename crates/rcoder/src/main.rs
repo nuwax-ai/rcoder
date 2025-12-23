@@ -22,7 +22,10 @@ use config::{CliArgs, load_config_with_args};
 use pingora_proxy::{PingoraServerManager, ProxyConfig};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
-use service::{ContainerStatusCheckerConfig, start_container_status_checker};
+use service::{
+    ContainerStatusCheckerConfig, ContainerSyncConfig, start_container_status_checker,
+    start_container_sync_task,
+};
 
 // 导入统一的容器停止模块
 use docker_manager::container_stop;
@@ -274,6 +277,13 @@ async fn main() -> anyhow::Result<()> {
     let _status_checker_handle =
         start_container_status_checker(status_checker_config, state.clone());
     info!("🔍 容器状态检查任务已启动（间隔: 30 秒，启用 Docker 主动查询和失败计数器）");
+
+    // 启动容器状态同步任务（定期检测被外部删除的容器）
+    let container_sync_config = ContainerSyncConfig {
+        sync_interval: Duration::from_secs(60), // 每 60 秒同步一次
+    };
+    let _container_sync_handle = start_container_sync_task(container_sync_config);
+    info!("🔄 容器状态同步任务已启动（间隔: 60 秒，检测外部删除的容器）");
 
     // 创建路由
     let app = router::create_router(state.clone());

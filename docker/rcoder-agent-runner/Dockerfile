@@ -159,6 +159,19 @@ RUN apt-get update && \
     # ========== 系统级 GTK 配置 ==========
     mkdir -p /etc/gtk-3.0 && \
     printf '[Settings]\ngtk-im-module=fcitx5' > /etc/gtk-3.0/settings.ini && \
+    # ========== 隐藏 root 用户警告 ==========
+    # 为 root 用户创建 GTK CSS 配置，隐藏各种 root 警告
+    mkdir -p /root/.config/gtk-3.0 && \
+    printf '/* Hide root warnings */\n.thunar-window infobar.warning { min-height: 0; padding: 0; margin: 0; }\n.thunar-window infobar.warning * { min-height: 0; padding: 0; margin: 0; }\n.thunar-window infobar.warning button { min-height: 0; min-width: 0; padding: 0; margin: 0; }\n/* Hide XFCE root warning */\n.root-warning { display: none !important; }\n.root-warning * { display: none !important; }\n' > /root/.config/gtk-3.0/gtk.css && \
+    # 同时为 /home/user 添加配置（因为 HOME=/home/user）
+    mkdir -p /home/user/.config/gtk-3.0 && \
+    cp /root/.config/gtk-3.0/gtk.css /home/user/.config/gtk-3.0/gtk.css && \
+    # 禁用 XFCE 会话的 root 警告（系统级配置）
+    mkdir -p /root/.config/xfce4/xfconf/xfce-perchannel-xml && \
+    echo '<?xml version="1.0" encoding="UTF-8"?>\n<channel name="xfce4-session" version="1.0">\n  <property name="general" type="empty">\n    <property name="ShowRootWarning" type="bool" value="false"/>\n  </property>\n</channel>' > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml && \
+    # 同时为 user 配置
+    mkdir -p /home/user/.config/xfce4/xfconf/xfce-perchannel-xml && \
+    cp /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml /home/user/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml && \
     # ========== 系统级 im-config ==========
     echo 'fcitx5' > /etc/X11/xinit/xinputrc 2>/dev/null || true && \
     # ========== 用户目录 - 只保留需要持久化的配置 ==========
@@ -177,43 +190,8 @@ RUN apt-get update && \
     chown -R user:user /home/user /run/user/$(id -u user) && \
     chmod 755 /home/user && \
     chmod 700 /run/user/$(id -u user) && \
-    # Create Chromium wrapper script with fcitx support
-    printf '#!/bin/bash\n\
-    # 加载环境配置\n\
-    [ -f /etc/profile.d/fcitx5-env.sh ] && source /etc/profile.d/fcitx5-env.sh\n\
-    [ -f /tmp/dbus-session-env ] && source /tmp/dbus-session-env\n\
-    [ -f /etc/profile.d/chromium-env.sh ] && source /etc/profile.d/chromium-env.sh\n\
-    [ -f /etc/profile.d/ime-env.sh ] && source /etc/profile.d/ime-env.sh\n\
-    \n\
-    export DISPLAY=:0\n\
-    # 使用 @im=fcitx 保持一致性\n\
-    export GTK_IM_MODULE=fcitx\n\
-    export QT_IM_MODULE=fcitx\n\
-    export XMODIFIERS=@im=fcitx\n\
-    export INPUT_METHOD=fcitx\n\
-    \n\
-    CHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"\n\
-    \n\
-    RUN_CMD="/usr/bin/chromium \\\n\
-    --user-data-dir=\"$CHROMIUM_DATA_DIR\" \\\n\
-    --no-sandbox \\\n\
-    --disable-dev-shm-usage \\\n\
-    --remote-debugging-port=9222 \\\n\
-    --remote-debugging-address=0.0.0.0 \\\n\
-    --no-first-run \\\n\
-    --no-default-browser-check \\\n\
-    --password-store=basic \\\n\
-    --use-mock-keychain \\\n\
-    --disable-session-crashed-bubble \\\n\
-    --disable-infobars \\\n\
-    --no-process-singleton-dialog \\\n\
-    --force-color-profile=srgb \"\$@\""\n\
-    \n\
-    if [ "$(id -u)" = "0" ]; then\n\
-    exec su - user -c "$RUN_CMD" -- "$@"\n\
-    else\n\
-    exec /bin/bash -c "$RUN_CMD" -- "$@"\n\
-    fi\n' > /usr/bin/chromium-browser-launcher && \
+    # Create Chromium wrapper script with fcitx support (runs as root, HOME=/home/user)
+    printf '#!/bin/bash\\\n\\\n    # 加载环境配置\\\n\\\n    [ -f /etc/profile.d/fcitx5-env.sh ] && source /etc/profile.d/fcitx5-env.sh\\\n\\\n    [ -f /tmp/dbus-session-env ] && source /tmp/dbus-session-env\\\n\\\n    [ -f /etc/profile.d/chromium-env.sh ] && source /etc/profile.d/chromium-env.sh\\\n\\\n    [ -f /etc/profile.d/ime-env.sh ] && source /etc/profile.d/ime-env.sh\\\n\\\n    \\\n\\\n    export DISPLAY=:0\\\n\\\n    export HOME=/home/user\\\n\\\n    # 使用 @im=fcitx 保持一致性\\\n\\\n    export GTK_IM_MODULE=fcitx\\\n\\\n    export QT_IM_MODULE=fcitx\\\n\\\n    export XMODIFIERS=@im=fcitx\\\n\\\n    export INPUT_METHOD=fcitx\\\n\\\n    \\\n\\\n    CHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"\\\n\\\n    \\\n\\\n    # 直接以 root 运行 (HOME=/home/user)\\\n\\\n    exec /usr/bin/chromium \\\\\\n\\\n    --user-data-dir="$CHROMIUM_DATA_DIR" \\\\\\n\\\n    --no-sandbox \\\\\\n\\\n    --disable-dev-shm-usage \\\\\\n\\\n    --remote-debugging-port=9222 \\\\\\n\\\n    --remote-debugging-address=0.0.0.0 \\\\\\n\\\n    --no-first-run \\\\\\n\\\n    --no-default-browser-check \\\\\\n\\\n    --password-store=basic \\\\\\n\\\n    --use-mock-keychain \\\\\\n\\\n    --disable-session-crashed-bubble \\\\\\n\\\n    --disable-infobars \\\\\\n\\\n    --no-process-singleton-dialog \\\\\\n\\\n    --force-color-profile=srgb "$@"\\\n' > /usr/bin/chromium-browser-launcher && \
     chmod 755 /usr/bin/chromium-browser-launcher && \
     ln -sf /usr/bin/chromium-browser-launcher /usr/local/bin/chromium && \
     chown -R 1000:1000 /home/user/.config && \
