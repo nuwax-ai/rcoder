@@ -9,12 +9,13 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use agent_client_protocol::{
-    Agent, Client, ClientSideConnection, Implementation, InitializeRequest, LoadSessionRequest,
-    McpServer, McpServerStdio, NewSessionRequest, PromptRequest, SessionId,
+    Agent, Client, ClientSideConnection, Implementation, InitializeRequest, McpServer,
+    McpServerStdio, NewSessionRequest, PromptRequest, SessionId,
 };
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
-use shared_types::ModelProviderConfig;
+use dashmap::DashMap;
+use shared_types::{AgentLifecycle, ModelProviderConfig};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -22,11 +23,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::acp::CancelNotificationRequestWrapper;
+use crate::session::SessionInfo;
 use crate::traits::AgentStartConfig;
 use crate::traits::session_notifier::SessionNotifier;
 
 // 导入生命周期管理
 use super::agent_lifecycle::AgentLifecycleGuard;
+use super::channel_utils::PromptHandlerConfig;
 
 /// 使用默认版本
 const VERSION: agent_client_protocol::ProtocolVersion =
@@ -66,6 +69,9 @@ pub struct LauncherConnectionInfo {
 ///
 /// 这是推荐使用的返回类型，包含了封装好的 AgentLifecycleGuard，
 /// 提供 RAII 自动资源清理机制。
+///
+/// 注意：降级处理已移至 launch() 的 spawn_local 块内，
+/// 通过 tokio::select! 在 LocalSet 中直接处理，避免跨线程问题。
 #[derive(Debug)]
 pub struct LauncherConnectionInfoComplete {
     /// 会话 ID
@@ -281,10 +287,15 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
     /// # 参数
     /// - `project_id`: 项目 ID
     /// - `project_path`: 项目工作目录
-    /// - `session_id`: 可选的会话 ID（用于恢复会话）
     /// - `model_provider`: 模型提供商配置
-    /// - `start_config`: Agent 启动配置（包含系统提示词等）
+    /// - `start_config`: Agent 启动配置（包含系统提示词、resume_session_id 等）
     /// - `client`: ACP 客户端实现
+    /// - `sessions`: 会话映射（用于降级时更新）
+    ///
+    /// # Resume 机制
+    /// 如果需要恢复会话，通过 `start_config.resume_session_id` 传递 session_id，
+    /// 会自动构建 `_meta.claudeCode.options.resume` 结构传递给 Agent。
+    /// 当 resume 失败时，会在 Prompt 处理器内部自动降级并更新 sessions 映射。
     ///
     /// # 返回值
     /// 返回 LauncherConnectionInfoComplete，包含会话信息和生命周期守卫
@@ -292,10 +303,10 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
         &self,
         project_id: String,
         project_path: PathBuf,
-        session_id: Option<String>,
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
+        sessions: Arc<DashMap<String, Arc<SessionInfo>>>,
     ) -> Result<LauncherConnectionInfoComplete> {
         // 从配置加载 Agent 参数（传递 service_type）
         let agent_config = load_agent_config(model_provider.as_ref(), &start_config.service_type).await?;
@@ -308,13 +319,15 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
         let (session_id_tx, session_id_rx) = tokio::sync::oneshot::channel::<SessionId>();
 
+        // 检查是否是 resume 会话
+        let is_resume_session = start_config.resume_session_id.is_some();
+
         // 创建 CancellationToken
         let cancel_token = CancellationToken::new();
 
         // 克隆用于闭包
         let project_path_for_closure = project_path.clone();
         let project_id_for_child = project_id.clone();
-        let session_id_for_closure = session_id.clone();
         let cancel_token_for_closure = cancel_token.clone();
         let notifier = self.notifier.clone();
 
@@ -386,6 +399,11 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
 
         let client_conn = Arc::new(client_conn);
 
+        // 克隆用于 Prompt 处理器的降级配置
+        let sessions_for_handler = sessions.clone();
+        let cancel_tx_for_handler = cancel_tx.clone();
+        let model_provider_for_handler = model_provider.clone();
+
         // 启动后台任务来管理 ACP 连接
         tokio::task::spawn_local(async move {
             let local_set = LocalSet::new();
@@ -434,50 +452,25 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
                         );
                     }
 
-                    // 创建会话
-                    let session_id = match session_id_for_closure {
-                        Some(sid) => {
-                            debug!("尝试加载 ACP 会话[load_session]");
-                            let given_session_id = SessionId::new(sid);
-                            match client_conn
-                                .load_session(LoadSessionRequest::new(
-                                    given_session_id.clone(),
-                                    project_path_for_closure.clone(),
-                                ))
-                                .await
-                            {
-                                Ok(resp) => {
-                                    debug!("ACP 会话加载成功[load_session],{:?}", resp);
-                                    given_session_id
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "load_session 失败或未实现，回退创建新会话[new_session]: {:?}",
-                                        e
-                                    );
-                                    // 注意：即使 load_session 失败，仍然会创建 new_session
-                                    // resume_session_id 会通过 meta.claudeCode.options.resume 传递
-                                    let new_session_request =
-                                        NewSessionRequest::new(project_path_for_closure.clone())
-                                            .mcp_servers(mcp_servers.clone())
-                                            .meta(system_prompt_meta.clone());
-                                    let resp = client_conn.new_session(new_session_request).await?;
-                                    debug!("ACP 会话创建成功[new_session],{:?}", resp);
-                                    resp.session_id
-                                }
-                            }
-                        }
-                        None => {
-                            debug!("创建 ACP 会话[new_session]");
-                            let new_session_request =
-                                NewSessionRequest::new(project_path_for_closure.clone())
-                                    .mcp_servers(mcp_servers)
-                                    .meta(system_prompt_meta);
-                            let resp = client_conn.new_session(new_session_request).await?;
-                            debug!("ACP 会话创建成功[new_session],{:?}", resp);
-                            resp.session_id
-                        }
-                    };
+                    // 创建会话（统一使用 new_session，resume 通过 meta 传递）
+                    // 如果 start_config.resume_session_id 有值，build_meta() 会自动构建
+                    // _meta.claudeCode.options.resume 结构
+                    debug!("创建 ACP 会话[new_session]");
+                    let new_session_request =
+                        NewSessionRequest::new(project_path_for_closure.clone())
+                            .mcp_servers(mcp_servers.clone())
+                            .meta(system_prompt_meta);
+
+                    let resp = client_conn
+                        .new_session(new_session_request)
+                        .await
+                        .context("ACP 会话创建失败")?;
+
+                    debug!(
+                        "ACP 会话创建成功[new_session], session_id={}",
+                        resp.session_id.0
+                    );
+                    let session_id = resp.session_id;
 
                     // 发送会话 ID
                     if session_id_tx.send(session_id.clone()).is_err() {
@@ -485,21 +478,36 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
                         return Err(anyhow::anyhow!("无法发送会话 ID"));
                     }
 
+                    // 创建生命周期句柄（在 spawn_local 外部创建，这里只是引用）
+                    // 注意：lifecycle_handle 将在 launch() 返回后由 session_manager 保存
+                    let lifecycle_handle_for_handler: Option<Arc<dyn AgentLifecycle>> = None;
+
                     // 启动通道处理器
                     super::channel_utils::spawn_cancel_handler_for_agent(
                         client_conn.clone(),
                         cancel_rx,
                         &project_id_for_child,
                     );
+
+                    // 启动 Prompt 处理器（包含降级逻辑）
                     super::channel_utils::spawn_prompt_handler_for_agent(
                         client_conn.clone(),
                         prompt_rx,
                         session_id.clone(),
                         &project_id_for_child,
-                        notifier,
+                        PromptHandlerConfig {
+                            is_resume_session,
+                            project_path: project_path_for_closure.clone(),
+                            mcp_servers: mcp_servers.clone(),
+                            sessions: sessions_for_handler,
+                            cancel_tx: cancel_tx_for_handler,
+                            lifecycle_handle: lifecycle_handle_for_handler,
+                            model_provider: model_provider_for_handler,
+                            notifier: notifier.clone(),
+                        },
                     );
 
-                    // 等待取消信号
+                    // 等待取消信号（降级逻辑已移至 Prompt 处理器内部）
                     cancel_token_for_closure.cancelled().await;
                     info!("Claude Code ACP Agent 收到取消信号，将清理资源并退出");
                     Ok(())

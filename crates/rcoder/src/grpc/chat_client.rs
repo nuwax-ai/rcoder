@@ -149,3 +149,47 @@ pub async fn grpc_cancel_session(
     let pool = Arc::new(GrpcChannelPool::new());
     grpc_cancel_session_with_pool(&pool, grpc_addr, session_id, reason, project_id).await
 }
+
+/// 通过 gRPC 停止 Agent（使用连接池）
+pub async fn grpc_stop_agent_with_pool(
+    pool: &Arc<GrpcChannelPool>,
+    grpc_addr: &str,
+    project_id: String,
+    reason: Option<String>,
+    force: bool,
+) -> anyhow::Result<shared_types::grpc::StopAgentResponse> {
+    info!(
+        "🔄 [gRPC_STOP_AGENT] 发送停止 Agent 请求 (连接池): addr={}, project_id={}, force={}",
+        grpc_addr, project_id, force
+    );
+
+    // 使用连接池获取客户端
+    let mut client = pool.get_client(grpc_addr).await?;
+
+    // 构建 gRPC 请求
+    let grpc_request = shared_types::grpc::StopAgentRequest {
+        project_id: project_id.clone(),
+        reason,
+        force,
+    };
+
+    debug!("📤 [gRPC_STOP_AGENT] 发送请求: {:?}", grpc_request);
+
+    // 发送请求
+    let response = client
+        .stop_agent(tonic::Request::new(grpc_request))
+        .await
+        .map_err(|e| {
+            error!("❌ [gRPC_STOP_AGENT] StopAgent RPC 调用失败: {}", e);
+            anyhow::anyhow!("gRPC StopAgent 调用失败: {}", e)
+        })?;
+
+    let stop_response = response.into_inner();
+
+    info!(
+        "✅ [gRPC_STOP_AGENT] 收到响应: result={}, success={}, message={:?}",
+        stop_response.result, stop_response.success, stop_response.message
+    );
+
+    Ok(stop_response)
+}

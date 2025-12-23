@@ -160,9 +160,9 @@ RUN apt-get update && \
     mkdir -p /etc/gtk-3.0 && \
     printf '[Settings]\ngtk-im-module=fcitx5' > /etc/gtk-3.0/settings.ini && \
     # ========== 隐藏 root 用户警告 ==========
-    # 为 root 用户创建 GTK CSS 配置，隐藏各种 root 警告
+    # 为 root 用户创建 GTK CSS 配置，彻底隐藏 Thunar 和 XFCE 的各种 root 警告
     mkdir -p /root/.config/gtk-3.0 && \
-    printf '/* Hide root warnings */\n.thunar-window infobar.warning { min-height: 0; padding: 0; margin: 0; }\n.thunar-window infobar.warning * { min-height: 0; padding: 0; margin: 0; }\n.thunar-window infobar.warning button { min-height: 0; min-width: 0; padding: 0; margin: 0; }\n/* Hide XFCE root warning */\n.root-warning { display: none !important; }\n.root-warning * { display: none !important; }\n' > /root/.config/gtk-3.0/gtk.css && \
+    printf '/* Hide Thunar root warnings completely */\n.thunar-window infobar.warning { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }\n.thunar-window infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }\n.thunar-window infobar.warning button { min-height: 0; min-width: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }\ninfobar.warning { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }\ninfobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }\n/* Hide XFCE root warning */\n.root-warning { display: none !important; opacity: 0 !important; }\n.root-warning * { display: none !important; opacity: 0 !important; }\n' > /root/.config/gtk-3.0/gtk.css && \
     # 同时为 /home/user 添加配置（因为 HOME=/home/user）
     mkdir -p /home/user/.config/gtk-3.0 && \
     cp /root/.config/gtk-3.0/gtk.css /home/user/.config/gtk-3.0/gtk.css && \
@@ -190,16 +190,22 @@ RUN apt-get update && \
     chown -R user:user /home/user /run/user/$(id -u user) && \
     chmod 755 /home/user && \
     chmod 700 /run/user/$(id -u user) && \
-    # Create Chromium wrapper script with fcitx support (runs as root, HOME=/home/user)
-    printf '#!/bin/bash\\\n\\\n    # 加载环境配置\\\n\\\n    [ -f /etc/profile.d/fcitx5-env.sh ] && source /etc/profile.d/fcitx5-env.sh\\\n\\\n    [ -f /tmp/dbus-session-env ] && source /tmp/dbus-session-env\\\n\\\n    [ -f /etc/profile.d/chromium-env.sh ] && source /etc/profile.d/chromium-env.sh\\\n\\\n    [ -f /etc/profile.d/ime-env.sh ] && source /etc/profile.d/ime-env.sh\\\n\\\n    \\\n\\\n    export DISPLAY=:0\\\n\\\n    export HOME=/home/user\\\n\\\n    # 使用 @im=fcitx 保持一致性\\\n\\\n    export GTK_IM_MODULE=fcitx\\\n\\\n    export QT_IM_MODULE=fcitx\\\n\\\n    export XMODIFIERS=@im=fcitx\\\n\\\n    export INPUT_METHOD=fcitx\\\n\\\n    \\\n\\\n    CHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"\\\n\\\n    \\\n\\\n    # 直接以 root 运行 (HOME=/home/user)\\\n\\\n    exec /usr/bin/chromium \\\\\\n\\\n    --user-data-dir="$CHROMIUM_DATA_DIR" \\\\\\n\\\n    --no-sandbox \\\\\\n\\\n    --disable-dev-shm-usage \\\\\\n\\\n    --remote-debugging-port=9222 \\\\\\n\\\n    --remote-debugging-address=0.0.0.0 \\\\\\n\\\n    --no-first-run \\\\\\n\\\n    --no-default-browser-check \\\\\\n\\\n    --password-store=basic \\\\\\n\\\n    --use-mock-keychain \\\\\\n\\\n    --disable-session-crashed-bubble \\\\\\n\\\n    --disable-infobars \\\\\\n\\\n    --no-process-singleton-dialog \\\\\\n\\\n    --force-color-profile=srgb "$@"\\\n' > /usr/bin/chromium-browser-launcher && \
-    chmod 755 /usr/bin/chromium-browser-launcher && \
-    ln -sf /usr/bin/chromium-browser-launcher /usr/local/bin/chromium && \
     chown -R 1000:1000 /home/user/.config && \
     chown -R 1000:1000 /home/user/.local && \
     # Clean up package cache
     apt-get autoremove -y && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Copy Chromium browser launcher script with fcitx support (runs as root, HOME=/home/user)
+# IMPORTANT: Replace /usr/bin/chromium with our launcher so XFCE's exo-open uses it
+COPY chromium-browser-launcher.sh /usr/bin/chromium-browser-launcher
+RUN chmod 755 /usr/bin/chromium-browser-launcher && \
+    # Backup original chromium wrapper
+    mv /usr/bin/chromium /usr/bin/chromium-bin && \
+    # Replace /usr/bin/chromium with our launcher (XFCE uses this path)
+    cp /usr/bin/chromium-browser-launcher /usr/bin/chromium && \
+    ln -sf /usr/bin/chromium-browser-launcher /usr/local/bin/chromium
 
 # Copy MCP-specific Chromium wrapper script (runs as user to connect to fcitx5)
 COPY chromium-for-mcp.sh /usr/local/bin/chromium-for-mcp
