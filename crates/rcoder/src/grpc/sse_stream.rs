@@ -50,9 +50,10 @@ pub async fn create_grpc_sse_stream(
                 }
             };
 
-            // 🆕 2. 先检查 Agent 状态
+            // 🆕 2. 先检查 Agent 状态（使用 session_id 查询）
             let status_request = tonic::Request::new(GetStatusRequest {
-                project_id: project_id.clone(),
+                project_id: String::new(),            // 不使用 project_id
+                session_id: session_id_clone.clone(), // 使用 session_id 查询
             });
 
             match client.get_status(status_request).await {
@@ -61,8 +62,8 @@ pub async fn create_grpc_sse_stream(
                     if status == "idle" {
                         // Agent 闲置，发送 SessionPromptEnd 并关闭连接
                         info!(
-                            "💤 [gRPC_SSE] Agent 处于闲置状态，发送 SessionPromptEnd 并关闭: session_id={}, project_id={}",
-                            session_id_clone, project_id
+                            "💤 [gRPC_SSE] Agent 处于闲置状态，发送 SessionPromptEnd 并关闭: session_id={}",
+                            session_id_clone
                         );
                         let end_event = create_session_prompt_end_event(&session_id_clone);
                         let _ = tx.send(Ok(end_event)).await;
@@ -99,8 +100,8 @@ pub async fn create_grpc_sse_stream(
                     // 持续接收 gRPC 流中的事件
                     while let Ok(Some(progress_event)) = stream.message().await {
                         debug!(
-                            "📨 [gRPC_SSE] 收到进度事件: session_id={}, timestamp={}",
-                            session_id_clone, progress_event.timestamp
+                            "📨 [gRPC_SSE] 收到进度事件: session_id={}, message_type={}, sub_type={}",
+                            session_id_clone, progress_event.message_type, progress_event.sub_type
                         );
 
                         // 将 ProgressEvent 转换为 SSE Event（传入 session_id 以重建完整消息结构）
@@ -167,7 +168,7 @@ fn create_session_prompt_end_event(session_id: &str) -> axum::response::sse::Eve
         sub_type: "end_turn".to_string(),
         data: serde_json::json!({
             "reason": "EndTurn",
-            "description": "Agent 当前无任务执行"
+            "description": "Agent 当前无在执行任务"
         }),
         timestamp: Utc::now(),
     };

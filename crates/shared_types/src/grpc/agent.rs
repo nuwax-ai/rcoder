@@ -109,6 +109,9 @@ pub struct CancelResponse {
 pub struct GetStatusRequest {
     #[prost(string, tag = "1")]
     pub project_id: ::prost::alloc::string::String,
+    /// 新增：支持通过 session_id 查询
+    #[prost(string, tag = "2")]
+    pub session_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetStatusResponse {
