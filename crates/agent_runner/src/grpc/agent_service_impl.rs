@@ -836,47 +836,52 @@ impl AgentService for AgentServiceImpl {
                 }
             }
 
-            // 从 AGENT_REGISTRY 移除（会 drop sender，但此时 receiver 已退出）
-            let removed_agent_info = AGENT_REGISTRY.remove_by_project(&project_id);
-
-            if removed_agent_info.is_some() {
+            // 🎯 关键修复：在后台任务中异步移除,避免同步 Drop 阻塞 gRPC 响应
+            let pid_for_bg = project_id.clone();
+            tokio::spawn(async move {
                 info!(
-                    "✅ [gRPC] Agent 已从 Registry 移除: project_id={}",
-                    project_id
+                    "🔄 [gRPC] 后台任务开始移除 Agent: project_id={}",
+                    pid_for_bg
                 );
 
-                // 克隆 project_id 用于响应消息
-                let response_message = format!("项目 {} 的 Agent 已成功停止", project_id);
+                // 在后台任务中执行 remove_by_project
+                let removed_agent_info = AGENT_REGISTRY.remove_by_project(&pid_for_bg);
 
-                // 🚀 在后台任务中异步 drop AgentLifecycleGuard，避免阻塞响应
-                let pid_for_spawn = project_id.clone();
-                tokio::spawn(async move {
-                    drop(removed_agent_info);
+                if let Some(agent_info) = removed_agent_info {
                     info!(
-                        "🧹 [gRPC] Agent 资源已异步清理完成: project_id={}",
-                        pid_for_spawn
+                        "✅ [gRPC] Agent 已从 Registry 移除: project_id={}",
+                        pid_for_bg
                     );
-                });
 
-                // 立即返回响应
-                return Ok(Response::new(StopAgentResponse {
-                    success: true,
-                    result: "stopped".to_string(),
-                    message: Some(response_message),
-                    project_id,
-                }));
-            } else {
-                warn!(
-                    "⚠️ [gRPC] 从 Registry 移除 Agent 失败: project_id={}",
-                    project_id
-                );
-                return Ok(Response::new(StopAgentResponse {
-                    success: false,
-                    result: "error".to_string(),
-                    message: Some("移除 Agent 失败".to_string()),
-                    project_id,
-                }));
-            }
+                    // 异步 drop（让它在后台慢慢 drop）
+                    tokio::task::spawn_blocking(move || {
+                        drop(agent_info);
+                        info!(
+                            "🧹 [gRPC] Agent 资源已彻底清理完成: project_id={}",
+                            pid_for_bg
+                        );
+                    });
+                } else {
+                    warn!(
+                        "⚠️ [gRPC] 从 Registry 移除 Agent 失败: project_id={}",
+                        pid_for_bg
+                    );
+                }
+            });
+
+            // 🚀 立即返回成功响应,不等待后台清理完成
+            info!(
+                "✅ [gRPC] StopAgent 立即返回成功,后台清理中: project_id={}",
+                project_id
+            );
+            let response_message = format!("项目 {} 的 Agent 正在停止（后台清理中）", project_id);
+
+            return Ok(Response::new(StopAgentResponse {
+                success: true,
+                result: "stopped".to_string(),
+                message: Some(response_message),
+                project_id,
+            }));
         }
 
         // 如果 force=false 且 Agent 正在执行任务（Active），需要先取消会话
