@@ -643,6 +643,8 @@ impl DockerManager {
             builder = builder.env(key, &processed_value);
         }
 
+        // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
+
         // 设置网络
         let network_name = self.get_main_network_name().await;
         builder = builder.network_name(network_name);
@@ -960,16 +962,69 @@ impl DockerManager {
                     Ok(Some(ContainerStatus::Unknown("no state".to_string())))
                 }
             }
-            Err(e) => {
-                if e.to_string().contains("No such container") {
-                    // 容器不存在，从映射中移除
-                    self.containers.remove(project_id);
-                    Ok(None)
-                } else {
-                    Err(DockerError::BollardError(e))
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // 容器不存在（HTTP 404），从映射中移除
+                self.containers.remove(project_id);
+                Ok(None)
+            }
+            Err(e) => Err(DockerError::BollardError(e)),
+        }
+    }
+
+    /// 同步所有缓存容器的状态
+    ///
+    /// 遍历缓存中的所有容器，调用 Docker API 检查其真实状态。
+    /// 如果容器已被外部删除（如手动 `docker stop`），则从缓存中移除。
+    ///
+    /// # Returns
+    /// 返回元组 (已检查数量, 已移除数量)
+    pub async fn sync_all_container_states(&self) -> DockerResult<(u32, u32)> {
+        // 获取所有 project_id 的快照
+        let project_ids: Vec<String> = self
+            .containers
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        if project_ids.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let total = project_ids.len() as u32;
+        let mut removed_count = 0u32;
+
+        for project_id in project_ids {
+            match self.update_container_status(&project_id).await {
+                Ok(None) => {
+                    // 容器不存在，已从缓存中移除
+                    removed_count += 1;
+                    info!(
+                        "🧹 [SYNC] 容器已从缓存移除（Docker 中不存在）: project_id={}",
+                        project_id
+                    );
+                }
+                Ok(Some(_status)) => {
+                    // 容器存在，状态已更新
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [SYNC] 检查容器状态失败: project_id={}, error={}",
+                        project_id, e
+                    );
                 }
             }
         }
+
+        if removed_count > 0 {
+            info!(
+                "🔄 [SYNC] 容器状态同步完成: 检查={}, 移除={}",
+                total, removed_count
+            );
+        }
+
+        Ok((total, removed_count))
     }
 
     /// 清理所有容器

@@ -74,6 +74,14 @@ function initialize_timezone() {
 initialize_timezone
 
 # ============================================================================
+# 🎯 注意：所有服务均以 root 用户运行
+# ============================================================================
+# 不再需要 UID/GID 匹配，因为 root 用户拥有所有权限
+# HOME 环境变量设置为 /home/user，缓存和配置仍存放在该目录
+# ============================================================================
+
+
+# ============================================================================
 # 🎯 用户主目录初始化（解决挂载空目录导致的花屏和图标消失问题）
 # 当宿主机目录挂载到 /home/user 时，镜像中预置的配置会被覆盖
 # 此函数从骨架目录 /etc/skel-user-desktop 恢复必要的配置文件
@@ -165,6 +173,27 @@ function initialize_user_home() {
         echo "✅ User home directory already initialized"
     fi
 
+    # ========== 确保 GTK CSS 配置存在（隐藏 Thunar root 警告） ==========
+    # 同时配置 /root 和 /home/user，因为：
+    # - 以 root 用户运行时，某些进程可能读取 /root/.config
+    # - 设置 HOME=/home/user 后，大部分进程读取 /home/user/.config
+    local GTK_CSS_CONTENT='/* Hide Thunar root warning */
+.thunar-window infobar.warning { min-height: 0; padding: 0; margin: 0; opacity: 0; }
+.thunar-window infobar.warning * { min-height: 0; padding: 0; margin: 0; opacity: 0; }
+infobar.warning { min-height: 0; padding: 0; margin: 0; opacity: 0; }
+infobar.warning * { min-height: 0; padding: 0; margin: 0; opacity: 0; }
+'
+    # 为 /root 创建配置
+    mkdir -p /root/.config/gtk-3.0
+    echo "$GTK_CSS_CONTENT" > /root/.config/gtk-3.0/gtk.css
+    echo "  ✓ GTK CSS created for /root"
+
+    # 为 /home/user 创建配置
+    mkdir -p "$USER_HOME/.config/gtk-3.0"
+    echo "$GTK_CSS_CONTENT" > "$USER_HOME/.config/gtk-3.0/gtk.css"
+    echo "  ✓ GTK CSS created for $USER_HOME"
+
+
     # ========== 修复挂载目录的权限（解决宿主机 UID 不匹配） ==========
     # 注意：由于 Dockerfile 中用户配置已经以 user 身份创建，
     # 这里只需要处理可能被宿主机挂载覆盖的目录
@@ -205,11 +234,11 @@ function initialize_user_home() {
 }
 
 function start_vnc_services() {
-	echo "Starting VNC services..."
+	echo "Starting VNC services (as root)..."
 
 	# 等待X11服务完全启动
 	counter=0
-	while ! su - user -c "DISPLAY=:0 xdpyinfo" >/dev/null 2>&1; do
+	while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
 		sleep 0.5
 		let counter++
 		if ((counter > 30)); then
@@ -221,26 +250,22 @@ function start_vnc_services() {
 	echo "X11 is ready, starting VNC..."
 
 	# 停止可能存在的VNC服务
-	su - user -c "pkill x11vnc || true" 2>/dev/null
+	pkill x11vnc || true
 
 	# 等待进程完全停止
 	sleep 2
 
-	# 启动x11vnc服务器 (后台运行)
-	su - user -c "
-		export DISPLAY=:0
-		nohup x11vnc -bg -display :0 -forever -wait 50 -shared -rfbport 5900 -nopw 2>/tmp/x11vnc_stderr.log >/dev/null &
-	" &
+	# 启动x11vnc服务器 (后台运行，以 root 身份)
+	export DISPLAY=:0
+	nohup x11vnc -bg -display :0 -forever -wait 50 -shared -rfbport 5900 -nopw 2>/tmp/x11vnc_stderr.log >/dev/null &
 
 	# 等待x11vnc启动
 	sleep 3
 
-	# 启动noVNC代理 (后台运行)
-	su - user -c "
-		export DISPLAY=:0
-		cd /opt/noVNC/utils
-		nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
-	" &
+	# 启动noVNC代理 (后台运行，以 root 身份)
+	cd /opt/noVNC/utils
+	nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
+	cd -
 
 	# 等待noVNC启动
 	sleep 3
@@ -250,13 +275,13 @@ function start_vnc_services() {
 	novnc_running=false
 
 	# 检查x11vnc进程
-	if su - user -c "pgrep -x x11vnc" >/dev/null 2>&1; then
+	if pgrep -x x11vnc >/dev/null 2>&1; then
 		vnc_running=true
 		echo "✓ x11vnc server started on port 5900"
 	else
 		echo "✗ x11vnc server failed to start"
 		echo "Error log:"
-		su - user -c "cat /tmp/x11vnc_stderr.log 2>/dev/null || echo 'No error log found'"
+		cat /tmp/x11vnc_stderr.log 2>/dev/null || echo 'No error log found'
 	fi
 
 	# 检查noVNC端口
@@ -267,7 +292,7 @@ function start_vnc_services() {
 	else
 		echo "✗ noVNC proxy failed to start"
 		echo "Error log:"
-		su - user -c "cat /tmp/novnc.log 2>/dev/null || echo 'No error log found'"
+		cat /tmp/novnc.log 2>/dev/null || echo 'No error log found'
 	fi
 
 	if [ "$vnc_running" = true ] && [ "$novnc_running" = true ]; then
@@ -356,9 +381,9 @@ function start_display_and_desktop() {
 	export LC_ALL=C.UTF-8
 	export LC_CTYPE=C.UTF-8
 
-	# 启动 D-Bus 会话 (以 user 用户启动，并保存地址)
-	echo "Starting D-Bus session as user..."
-	su - user -c "dbus-launch --sh-syntax > /tmp/dbus-session-env"
+	# 启动 D-Bus 会话 (以 root 启动，但 HOME 设置为 /home/user)
+	echo "Starting D-Bus session as root (HOME=/home/user)..."
+	HOME=/home/user dbus-launch --sh-syntax > /tmp/dbus-session-env
 	sleep 2
 
 	# 导出 D-Bus 会话地址供后续使用
@@ -392,13 +417,13 @@ function start_display_and_desktop() {
 	/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
 	sleep 2
 
-	# 以user用户启动Xvfb（设置 XAUTHORITY 和 Mesa 缓存环境变量）
+	# 以 root 启动 Xvfb（设置 XAUTHORITY 和 Mesa 缓存环境变量）
 	# 色深使用 24 位，避免某些 Linux 内核上出现花屏
-	su - user -c "XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1280x800x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1" &
+	HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1280x800x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1 &
 
 	# 等待Xvfb启动
 	counter=0
-	while ! su - user -c "DISPLAY=:0 xdpyinfo" >/dev/null 2>&1; do
+	while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
 		sleep 0.1
 		let counter++
 		if ((counter > 100)); then
@@ -408,21 +433,20 @@ function start_display_and_desktop() {
 	done
 
 	# ========== 关键修复：手动启动 fcitx5，确保环境变量正确 ==========
-	# 不再依赖 XFCE autostart，直接用正确的环境变量启动
-	echo "Starting fcitx5 input method..."
-	su - user -c "
-		export DISPLAY=:0
-		export DBUS_SESSION_BUS_ADDRESS='${DBUS_ADDR}'
-		export LANG=C.UTF-8
-		export LC_ALL=C.UTF-8
-		export LC_CTYPE=C.UTF-8
-		# 使用 @im=fcitx 与 GTK immodule cache 兼容（cache 中注册的名称是 fcitx）
-		export GTK_IM_MODULE=fcitx
-		export QT_IM_MODULE=fcitx
-		export XMODIFIERS=@im=fcitx
-		export INPUT_METHOD=fcitx
-		fcitx5 -d --replace >/tmp/fcitx5-startup.log 2>&1
-	" &
+	# 不再依赖 XFCE autostart，直接用正确的环境变量启动 (as root, HOME=/home/user)
+	echo "Starting fcitx5 input method (as root)..."
+	env \
+		HOME=/home/user \
+		DISPLAY=:0 \
+		DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+		LANG=C.UTF-8 \
+		LC_ALL=C.UTF-8 \
+		LC_CTYPE=C.UTF-8 \
+		GTK_IM_MODULE=fcitx \
+		QT_IM_MODULE=fcitx \
+		XMODIFIERS=@im=fcitx \
+		INPUT_METHOD=fcitx \
+		fcitx5 -d --replace >/tmp/fcitx5-startup.log 2>&1 &
 	sleep 3
 
 	# 验证 fcitx5 启动成功
@@ -432,70 +456,62 @@ function start_display_and_desktop() {
 		echo "✗ fcitx5 failed to start, check /tmp/fcitx5-startup.log"
 	fi
 
-	# 以user用户启动XFCE4会话
+	# 以 root 用户启动 XFCE4 会话（但 HOME 设置为 /home/user）
 	# 注意：使用 @im=fcitx 与系统 immodule 兼容
-	su - user -c "
-		export DISPLAY=:0
-		export XDG_CURRENT_DESKTOP=XFCE
-		export XDG_SESSION_DESKTOP=xfce
-		export XDG_RUNTIME_DIR=/run/user/${USER_ID}
-		export GNOME_KEYRING_CONTROL=/run/user/${USER_ID}/keyring
-		export GTK_MODULES=gnome-keyring-pkcs11
+	export DISPLAY=:0
+	export HOME=/home/user
+	export XDG_CURRENT_DESKTOP=XFCE
+	export XDG_SESSION_DESKTOP=xfce
+	export XDG_RUNTIME_DIR=/run/user/0
+	export GNOME_KEYRING_CONTROL=/run/user/0/keyring
+	export GTK_MODULES=gnome-keyring-pkcs11
+	export DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}"
+	export LANG=C.UTF-8
+	export LC_ALL=C.UTF-8
+	export LC_CTYPE=C.UTF-8
+	export GTK_IM_MODULE=fcitx
+	export QT_IM_MODULE=fcitx
+	export XMODIFIERS=@im=fcitx
+	export INPUT_METHOD=fcitx
+	export SDL_IM_MODULE=fcitx
+	export GLFW_IM_MODULE=ibus
 
-		# ========== 关键修复：使用双引号确保变量展开 ==========
-		export DBUS_SESSION_BUS_ADDRESS=\"${DBUS_ADDR}\"
+	echo "Environment variables set:"
+	echo "  HOME=$HOME"
+	echo "  GTK_IM_MODULE=$GTK_IM_MODULE"
+	echo "  XMODIFIERS=$XMODIFIERS"
+	echo "  DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+	echo "  LANG=$LANG"
 
-		# ========== 关键修复：设置 UTF-8 locale ==========
-		export LANG=C.UTF-8
-		export LC_ALL=C.UTF-8
-		export LC_CTYPE=C.UTF-8
+	# 启动 gnome-keyring-daemon
+	gnome-keyring-daemon --start --components=secrets,ssh,pkcs11 >/dev/null 2>&1 &
 
-		# ========== 关键修复：使用 @im=fcitx 与 GTK immodule 兼容 ==========
-		# fcitx5 的 GTK immodule 在系统 cache 中注册的名称是 'fcitx'，不是 'fcitx5'
-		export GTK_IM_MODULE=fcitx
-		export QT_IM_MODULE=fcitx
-		export XMODIFIERS=@im=fcitx
-		export INPUT_METHOD=fcitx
-		export SDL_IM_MODULE=fcitx
-		export GLFW_IM_MODULE=ibus
+	# 启动 PolicyKit 认证代理
+	/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1 >/var/log/polkit-agent.log 2>&1 &
 
-		echo \"Environment variables set:\"
-		echo \"  GTK_IM_MODULE=\$GTK_IM_MODULE\"
-		echo \"  XMODIFIERS=\$XMODIFIERS\"
-		echo \"  DBUS_SESSION_BUS_ADDRESS=\$DBUS_SESSION_BUS_ADDRESS\"
-		echo \"  LANG=\$LANG\"
+	# 等待守护进程启动
+	sleep 2
 
-		# 启动 gnome-keyring-daemon
-		gnome-keyring-daemon --start --components=secrets,ssh,pkcs11 >/dev/null 2>&1 &
+	echo 'Fcitx5 already started manually'
 
-		# 启动 PolicyKit 认证代理
-		/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1 >/var/log/polkit-agent.log 2>&1 &
+	# 以 root 身份启动 XFCE4，但 HOME 设置为 /home/user
+	env \
+		DISPLAY=:0 \
+		HOME=/home/user \
+		XDG_CURRENT_DESKTOP=XFCE \
+		XDG_SESSION_DESKTOP=xfce \
+		XDG_RUNTIME_DIR=/run/user/0 \
+		DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+		LANG=C.UTF-8 \
+		LC_ALL=C.UTF-8 \
+		LC_CTYPE=C.UTF-8 \
+		GTK_IM_MODULE=fcitx \
+		QT_IM_MODULE=fcitx \
+		XMODIFIERS=@im=fcitx \
+		INPUT_METHOD=fcitx \
+		xfce4-session &
 
-		# 等待守护进程启动
-		sleep 2
-
-		# fcitx5 已经在前面手动启动，不再依赖 XFCE autostart
-		echo 'Fcitx5 already started manually'
-
-		# 使用 env 明确传递环境变量启动 XFCE4
-		# 不再使用 --exit-with-session，避免 xfce4-session 创建新的 D-Bus session
-		exec env \
-			DISPLAY=:0 \
-			XDG_CURRENT_DESKTOP=XFCE \
-			XDG_SESSION_DESKTOP=xfce \
-			XDG_RUNTIME_DIR=/run/user/${USER_ID} \
-			DBUS_SESSION_BUS_ADDRESS=\"${DBUS_ADDR}\" \
-			LANG=C.UTF-8 \
-			LC_ALL=C.UTF-8 \
-			LC_CTYPE=C.UTF-8 \
-			GTK_IM_MODULE=fcitx \
-			QT_IM_MODULE=fcitx \
-			XMODIFIERS=@im=fcitx \
-			INPUT_METHOD=fcitx \
-			xfce4-session
-	" &
-
-	echo "X11 display and XFCE4 desktop started successfully"
+	echo "X11 display and XFCE4 desktop started successfully (as root, HOME=/home/user)"
 }
 
 # ============================================================================
@@ -504,11 +520,11 @@ function start_display_and_desktop() {
 # 其他配置（screensaver, power-manager, panel）已在 /etc/xdg/xfce4 系统目录中
 # ============================================================================
 function apply_xfce_wallpaper() {
-    echo "🎨 Applying XFCE wallpaper..."
+    echo "🎨 Applying XFCE wallpaper (as root)..."
 
     # 等待 XFCE 桌面完全启动
     local counter=0
-    while ! su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -l" >/dev/null 2>&1; do
+    while ! DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l >/dev/null 2>&1; do
         sleep 1
         let counter++
         if ((counter > 30)); then
@@ -526,30 +542,30 @@ function apply_xfce_wallpaper() {
     echo "  ✓ Setting wallpaper: $WALLPAPER_PATH"
 
     # 获取当前的 monitor 配置（XFCE 可能使用不同的名称）
-    local monitors=$(su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image'" | head -5)
+    local monitors=$(DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image' | head -5)
 
     if [ -n "$monitors" ]; then
         # 对于每个找到的 monitor 配置设置壁纸
         echo "$monitors" | while read monitor_path; do
-            su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p '$monitor_path' -s '$WALLPAPER_PATH'" 2>/dev/null || true
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$monitor_path" -s "$WALLPAPER_PATH" 2>/dev/null || true
         done
     else
         # 直接设置常用的 monitor 路径
-        su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/last-image -n -t string -s '$WALLPAPER_PATH'" 2>/dev/null || true
-        su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/workspace0/last-image -n -t string -s '$WALLPAPER_PATH'" 2>/dev/null || true
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
     fi
 
     # 设置壁纸样式（5 = 缩放）
-    su - user -c "DISPLAY=:0 xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5" 2>/dev/null || true
+    DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5 2>/dev/null || true
 
     echo "✅ XFCE wallpaper applied successfully"
 }
 
 function check_vnc_health() {
-    # 检查VNC服务健康状态
+    # 检查VNC服务健康状态 (as root)
     if [ "$VNC_AUTO_START" = "true" ]; then
         # 检查x11vnc进程
-        if ! su - user -c "pgrep -x x11vnc" >/dev/null 2>&1; then
+        if ! pgrep -x x11vnc >/dev/null 2>&1; then
             echo "⚠️  x11vnc process not running, attempting restart..."
             return 1
         fi
@@ -589,12 +605,12 @@ echo "DISPLAY=:0" >> /etc/environment
 # Jupyter services removed
 
 # 启动 VNC 服务（在后台运行，等待X11就绪）
-echo "Starting VNC services in background..."
+echo "Starting VNC services in background (as root)..."
 echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
 (
     # 等待X11服务就绪
     counter=0
-    while ! su - user -c "DISPLAY=:0 xdpyinfo" >/dev/null 2>&1; do
+    while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
         sleep 1
         let counter++
         if ((counter > 60)); then
@@ -613,14 +629,14 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
     # 应用 XFCE 壁纸
     apply_xfce_wallpaper
 
-    # VNC服务监控循环
+    # VNC服务监控循环 (as root)
     while true; do
         sleep 30
         if ! check_vnc_health; then
             echo "VNC服务异常，正在重启..."
             # 停止现有服务
-            su - user -c "pkill x11vnc || true"
-            su - user -c "pkill -f novnc_proxy || true"
+            pkill x11vnc || true
+            pkill -f novnc_proxy || true
             sleep 2
             # 重新启动VNC服务
             start_vnc_services
@@ -694,8 +710,8 @@ echo "✓ Input method environment variables written to /etc/environment"
 # 切换到用户主目录
 cd /home/user
 
-# 关键修复：显式设置 HOME 环境变量为 /home/user
-# 否则 runuser/sudo 可能会继承 root 的 HOME=/root，导致权限错误 (os error 13)
+# 关键：显式设置 HOME 环境变量为 /home/user
+# 虽然以 root 运行，但缓存和配置文件仍使用 /home/user 目录（挂载目录）
 export HOME=/home/user
 
 # 确保所有输入法环境变量已导出
@@ -722,15 +738,13 @@ export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
 export PATH=/usr/local/bin:/opt/cargo/bin:\$PATH"
 
-# 如果命令行传递了参数，则执行该参数（作为 user 用户）
+# 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
 # 否则执行默认的 agent_runner
 if [ $# -gt 0 ]; then
-    echo "🚀 Running custom command as user: $*"
-    # 使用 runuser 切换用户，构建完整的命令字符串
-    CMD="$*"
-    exec runuser -u user -- /bin/bash -c "$ENV_EXPORTS; exec $CMD"
+    echo "🚀 Running custom command as root (HOME=/home/user): $*"
+    exec /bin/bash -c "$ENV_EXPORTS; exec $*"
 else
-    # 默认启动 agent_runner
-    echo "🚀 Launching agent_runner as user on port ${PORT:-8086}..."
-    exec runuser -u user -- /bin/bash -c "$ENV_EXPORTS; exec /usr/local/bin/agent_runner -p ${PORT:-8086}"
+    # 默认启动 agent_runner (以 root 身份，但 HOME=/home/user)
+    echo "🚀 Launching agent_runner as root (HOME=/home/user) on port ${PORT:-8086}..."
+    exec /bin/bash -c "$ENV_EXPORTS; exec /usr/local/bin/agent_runner -p ${PORT:-8086}"
 fi
