@@ -4,25 +4,25 @@ package agent;
 // Agent 核心服务
 service AgentService {
   // 聊天对话接口 (Unary)
-  rpc Chat (ChatRequest) returns (ChatResponse);
+  rpc Chat(ChatRequest) returns (ChatResponse);
 
   // 订阅会话进度流 (Server Streaming)
   // 替代原有的 /agent/progress/{session_id} SSE 接口
-  rpc SubscribeProgress (ProgressRequest) returns (stream ProgressEvent);
+  rpc SubscribeProgress(ProgressRequest) returns (stream ProgressEvent);
 
   // 取消会话任务 (Unary)
-  rpc CancelSession (CancelRequest) returns (CancelResponse);
+  rpc CancelSession(CancelRequest) returns (CancelResponse);
 
   // 获取 Agent 状态 (Unary)
-  rpc GetStatus (GetStatusRequest) returns (GetStatusResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 
   // 停止特定 project_id 的 Agent (Unary)
   // 用于 ComputerAgentRunner 模式：停止单个项目的 Agent，不销毁容器
-  rpc StopAgent (StopAgentRequest) returns (StopAgentResponse);
+  rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
 
   // 查询容器状态 (Unary)
   // 专门用于容器生命周期管理，返回容器活跃状态和任务信息
-  rpc GetContainerStatus (GetContainerStatusRequest) returns (GetContainerStatusResponse);
+  rpc GetContainerStatus(GetContainerStatusRequest) returns (GetContainerStatusResponse);
 }
 
 // === ChatRequest/Response ===
@@ -59,7 +59,7 @@ message ChatResponse {
   bool success = 3;
   optional string error = 4;
   optional string request_id = 5;
-  optional string error_code = 6;  // 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
+  optional string error_code = 6; // 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
 }
 
 // === Progress Streaming ===
@@ -91,9 +91,9 @@ message ProgressEvent {
 // === Cancel Session ===
 
 message CancelRequest {
-  string session_id = 1;      // 可选，为空时使用 project_id 查找
+  string session_id = 1; // 可选，为空时使用 project_id 查找
   string reason = 2;
-  string project_id = 3;      // 用于按项目取消（当 session_id 为空时）
+  string project_id = 3; // 用于按项目取消（当 session_id 为空时）
 }
 
 // 取消结果类型（对应 Rust CancelResult）
@@ -114,6 +114,7 @@ message CancelResponse {
 
 message GetStatusRequest {
   string project_id = 1;
+  string session_id = 2; // 新增：支持通过 session_id 查询
 }
 
 message GetStatusResponse {
@@ -165,9 +166,9 @@ message ModelProviderConfig {
 // 附件数据源
 message AttachmentSource {
   oneof source {
-    string file_path = 1;    // 文件路径
-    Base64Data base64 = 2;   // Base64 编码数据
-    string url = 3;          // URL 链接
+    string file_path = 1; // 文件路径
+    Base64Data base64 = 2; // Base64 编码数据
+    string url = 3; // URL 链接
   }
 }
 
@@ -207,7 +208,7 @@ message AudioAttachment {
   string mime_type = 3;
   optional string filename = 4;
   optional string description = 5;
-  optional double duration = 6;  // 时长（秒）
+  optional double duration = 6; // 时长（秒）
 }
 
 // 文档附件
@@ -217,7 +218,7 @@ message DocumentAttachment {
   string mime_type = 3;
   optional string filename = 4;
   optional string description = 5;
-  optional uint64 size = 6;  // 文件大小（字节）
+  optional uint64 size = 6; // 文件大小（字节）
 }
 
 // 附件枚举（使用 oneof 区分类型）

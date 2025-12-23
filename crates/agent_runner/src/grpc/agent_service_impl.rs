@@ -450,14 +450,39 @@ impl AgentService for AgentServiceImpl {
                             msg = message_rx.recv() => {
                                 match msg {
                                     Some(unified_message) => {
+                                        // 🎯 检查是否为终止消息（SessionPromptEnd）
+                                        let is_terminal_message = matches!(
+                                            unified_message.message_type,
+                                            crate::model::SessionMessageType::SessionPromptEnd
+                                        );
+
                                         let event = unified_message_to_progress_event(&unified_message);
                                         if tx.send(Ok(event)).await.is_err() {
                                             debug!("📡 [gRPC] 客户端已断开连接");
                                             break;
                                         }
+
+                                        // 🚀 收到终止消息后，主动关闭 gRPC 流
+                                        // 不再等待 channel 关闭或心跳超时
+                                        if is_terminal_message {
+                                            info!(
+                                                "🔚 [gRPC] 收到 SessionPromptEnd，主动关闭流: session_id={}, sub_type={}",
+                                                session_id_clone, unified_message.sub_type
+                                            );
+                                            break;
+                                        }
                                     }
                                     None => {
-                                        debug!("📡 [gRPC] Session 消息通道已关闭");
+                                        debug!("📡 [gRPC] Session 消息通道已关闭，发送 SessionPromptEnd 事件");
+                                        // Agent 执行完毕，发送 SessionPromptEnd 事件通知客户端（兜底逻辑）
+                                        let end_event = ProgressEvent {
+                                            message_type: "SessionPromptEnd".to_string(),
+                                            sub_type: "end_turn".to_string(),
+                                            payload: r#"{"reason":"EndTurn","description":"Agent 当前无在执行任务"}"#.to_string(),
+                                            request_id: None,
+                                            timestamp: chrono::Utc::now().timestamp_millis(),
+                                        };
+                                        let _ = tx.send(Ok(end_event)).await;
                                         break;
                                     }
                                 }
@@ -661,30 +686,59 @@ impl AgentService for AgentServiceImpl {
     }
 
     /// 获取 Agent 状态
+    ///
+    /// 支持通过 `project_id` 或 `session_id` 查询 Agent 状态
     #[instrument(skip(self, request))]
     async fn get_status(
         &self,
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
         let req = request.into_inner();
-        info!("📊 [gRPC] GetStatus: project_id={}", req.project_id);
+        info!(
+            "📊 [gRPC] GetStatus: project_id={}, session_id={}",
+            req.project_id, req.session_id
+        );
 
-        // 使用统一 Registry 获取 Agent 状态
-        let status = if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&req.project_id) {
-            match agent_info.status {
-                AgentStatus::Active => "busy",
-                AgentStatus::Idle => "idle",
-                AgentStatus::Terminating => "busy",
+        // 优先使用 session_id 查询 project_id
+        let project_id = if !req.session_id.is_empty() {
+            // 通过 session_id 反查 project_id
+            AGENT_REGISTRY.get_project_by_session(&req.session_id)
+        } else if !req.project_id.is_empty() {
+            // 使用提供的 project_id
+            Some(req.project_id)
+        } else {
+            // 两者都为空，返回 idle
+            info!("📊 [gRPC] GetStatus: project_id 和 session_id 都为空，返回 idle");
+            return Ok(Response::new(GetStatusResponse {
+                status: "idle".to_string(),
+            }));
+        };
+
+        // 查询 Agent 状态
+        let status = if let Some(ref pid) = project_id {
+            if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid) {
+                match agent_info.status {
+                    AgentStatus::Active => "busy",
+                    AgentStatus::Idle => "idle",
+                    AgentStatus::Terminating => "busy",
+                }
+            } else {
+                // project_id 不存在，说明 Agent 已完成/未注册
+                "idle"
             }
         } else {
+            // session_id 没有对应的 project_id，说明 session 不存在或已完成
             "idle"
         };
 
-        let response = GetStatusResponse {
-            status: status.to_string(),
-        };
+        info!(
+            "📊 [gRPC] GetStatus 结果: status={}, project_id={:?}",
+            status, project_id
+        );
 
-        Ok(Response::new(response))
+        Ok(Response::new(GetStatusResponse {
+            status: status.to_string(),
+        }))
     }
 
     /// 停止 Agent（用于 ComputerAgentRunner 模式）
