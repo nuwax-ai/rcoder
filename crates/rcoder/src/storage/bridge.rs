@@ -45,6 +45,10 @@ impl DataBridge {
             }
         }
 
+        // 🔧 关键修复：从 record 恢复原始的时间戳
+        // 否则 created_at 会被 new() 设置为当前时间，导致清理任务一直认为容器"刚创建"
+        info.set_timestamps(record.created_at, record.last_activity);
+
         info
     }
 
@@ -59,11 +63,7 @@ impl DataBridge {
             .map(|c| c.container_id.clone())
             .unwrap_or_default();
 
-        let mut record = ProjectRecord::new(
-            project_id.to_string(),
-            service_type,
-            container_id,
-        );
+        let mut record = ProjectRecord::new(project_id.to_string(), service_type, container_id);
 
         // 设置会话信息
         record.session_id = info.session_id().map(|s| s.to_string());
