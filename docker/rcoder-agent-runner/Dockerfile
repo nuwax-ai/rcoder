@@ -75,7 +75,7 @@ RUN case "$TARGETARCH" in \
     "arm64") LO_ARCH2="aarch64" ;; \
     *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
     esac && \
-    wget -O /tmp/libreoffice.tar.gz "https://mirrors.ustc.edu.cn/tdf/libreoffice/stable/25.8.1/deb/${LO_ARCH}/LibreOffice_25.8.1_Linux_${LO_ARCH2}_deb.tar.gz" && \
+    wget -O /tmp/libreoffice.tar.gz "https://mirrors.ustc.edu.cn/tdf/libreoffice/stable/25.8.4/deb/${LO_ARCH}/LibreOffice_25.8.4_Linux_${LO_ARCH2}_deb.tar.gz" && \
     cd /tmp && \
     tar -xzf libreoffice.tar.gz && \
     cd LibreOffice_*/DEBS && \
