@@ -146,9 +146,7 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
             if req.session_id.0 != current_session_id.0 {
                 warn!(
                     "项目[{}]收到Prompt的session_id({})与当前agent会话({})不一致，强制覆盖为当前会话",
-                    project_id,
-                    req.session_id.0,
-                    current_session_id.0
+                    project_id, req.session_id.0, current_session_id.0
                 );
                 req.session_id = current_session_id.clone();
             }
@@ -211,65 +209,71 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
                     let error_message = e.message.clone();
                     error!("项目[{}]发送Prompt失败: {:?}", project_id, error_message);
 
-                    // Resume 降级逻辑：
-                    // 如果是 resume 会话的第一个 Prompt 失败，直接在内部完成降级
+                    // 🆕 Resume 降级逻辑重构：
+                    // 检测到 Resume 会话首次 Prompt 失败时，不在此处降级
+                    // 而是通过 gRPC 响应返回降级标识，让 rcoder 层处理降级
                     let should_fallback = is_first_prompt && is_resume_session && !has_fallback;
 
                     if should_fallback {
                         warn!(
-                            "⚠️ 项目[{}] Resume 会话首次 Prompt 失败，开始内部降级: {}",
+                            "⚠️ 项目[{}] Resume 会话首次 Prompt 失败，需要降级: {}",
                             project_id, error_message
                         );
+                        warn!(
+                            "⚠️ 项目[{}] 不在内部降级，发送错误通知，标记需要降级",
+                            project_id
+                        );
 
-                        // 在内部完成降级
-                        match handle_fallback_internal(
-                            &client_conn,
-                            &project_id,
-                            &project_path,
-                            &mcp_servers,
-                            &registry,
-                            &cancel_tx,
-                            lifecycle_handle.clone(),
-                            model_provider.clone(),
-                            &notifier,
-                            req,
-                            request_id.clone(),
-                        )
-                        .await
+                        // 🆕 发送错误通知（包含降级标识）
+                        // 注意：降级标识通过 agent_service_impl.rs 中的 gRPC 响应返回
+                        if let Err(notify_err) = notifier
+                            .notify_prompt_error(
+                                &project_id,
+                                &session_id_str,
+                                e.clone(),
+                                request_id.clone(),
+                            )
+                            .await
                         {
-                            Ok(new_session_id) => {
-                                info!(
-                                    "✅ 项目[{}] 降级成功，新会话 ID: {}",
-                                    project_id, new_session_id.0
-                                );
-                                // 更新当前 session_id
-                                current_session_id = new_session_id;
-                                session_id_str = current_session_id.0.clone();
-                                has_fallback = true;
-                                is_first_prompt = false;
-                                // 继续处理后续 Prompt，不退出
-                                continue;
-                            }
-                            Err(fallback_err) => {
-                                error!(
-                                    "❌ 项目[{}] 降级失败: {:?}",
-                                    project_id, fallback_err
-                                );
-                                has_fallback = true;
-                                // 降级失败，继续走正常错误处理流程
-                            }
+                            error!(
+                                "项目[{}]发送SessionPromptError失败: {:?}",
+                                project_id, notify_err
+                            );
                         }
+
+                        // 🆕 发送 SessionPromptEnd 通知
+                        if let Err(notify_err) = notifier
+                            .notify_prompt_end(
+                                &project_id,
+                                &session_id_str,
+                                agent_client_protocol::StopReason::Cancelled,
+                                Some(error_message.clone()),
+                                request_id.clone(),
+                            )
+                            .await
+                        {
+                            error!(
+                                "项目[{}]发送SessionPromptEnd失败: {:?}",
+                                project_id, notify_err
+                            );
+                        }
+
+                        // 🆕 标记已降级，防止重复检测
+                        has_fallback = true;
+
+                        // ✅ 不要 break！继续处理下一个 Prompt
+                        // 这样当 rcoder 重试时（不带 Resume），可以正常处理
+                        info!(
+                            "⚠️ 项目[{}] Resume 失败已通知，继续等待 rcoder 重试",
+                            project_id
+                        );
+                        continue;
                     }
 
                     // 正常错误处理流程
                     // 发送 SessionPromptError 通知
                     if let Err(notify_err) = notifier
-                        .notify_prompt_error(
-                            &project_id,
-                            &session_id_str,
-                            e,
-                            request_id.clone(),
-                        )
+                        .notify_prompt_error(&project_id, &session_id_str, e, request_id.clone())
                         .await
                     {
                         error!(
@@ -303,158 +307,4 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
 
         info!("项目[{}]Prompt处理任务结束", project_id);
     });
-}
-
-/// 内部降级处理
-///
-/// 在 Prompt 处理器内部完成降级：
-/// 1. 创建新会话（不带 resume）
-/// 2. 更新 registry 中的会话信息
-/// 3. 重试 Prompt
-async fn handle_fallback_internal<N: SessionNotifier, R: SessionRegistry>(
-    client_conn: &Arc<ClientSideConnection>,
-    project_id: &str,
-    project_path: &PathBuf,
-    mcp_servers: &[McpServer],
-    registry: &Arc<R>,
-    cancel_tx: &mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
-    lifecycle_handle: Option<Arc<dyn AgentLifecycle>>,
-    model_provider: Option<ModelProviderConfig>,
-    notifier: &Arc<N>,
-    failed_prompt: PromptRequest,
-    request_id: Option<String>,
-) -> anyhow::Result<SessionId>
-where
-    R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
-{
-    info!("⚠️ 项目[{}] 开始 Resume 降级重建", project_id);
-
-    // 1. 创建新会话（不带 resume meta）
-    let new_session_request = NewSessionRequest::new(project_path.clone())
-        .mcp_servers(mcp_servers.to_vec());
-
-    let resp = client_conn
-        .new_session(new_session_request)
-        .await
-        .map_err(|e| anyhow::anyhow!("降级创建新会话失败: {:?}", e))?;
-
-    let new_session_id = resp.session_id;
-    info!(
-        "✅ 项目[{}] 降级新会话创建成功: {}",
-        project_id, new_session_id.0
-    );
-
-    // 2. 创建新的 prompt channel（因为原来的 rx 在当前任务中）
-    let (new_prompt_tx, _new_prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
-
-    // 3. 创建 ProjectAndAgentInfo 并更新 registry
-    let now = Utc::now();
-    let new_agent_info = ProjectAndAgentInfo {
-        project_id: project_id.to_string(),
-        session_id: new_session_id.clone(),
-        prompt_tx: new_prompt_tx,
-        cancel_tx: cancel_tx.clone(),
-        model_provider,
-        request_id: None,
-        status: AgentStatus::Idle,
-        last_activity: now,
-        created_at: now,
-        stop_handle: lifecycle_handle,
-    };
-
-    // 通过 registry 更新会话信息
-    let session_id_str_for_registry = new_session_id.0.to_string();
-    registry.insert(project_id, &session_id_str_for_registry, new_agent_info.into());
-    info!(
-        "✅ 项目[{}] 已更新 registry，新 session_id: {}",
-        project_id, new_session_id.0
-    );
-
-    // 4. 重试 Prompt
-    let mut retry_prompt = failed_prompt;
-    retry_prompt.session_id = new_session_id.clone();
-
-    let session_id_str = new_session_id.0.clone();
-
-    // 发送 SessionPromptStart 通知（降级重试）
-    if let Err(e) = notifier
-        .notify_prompt_start(project_id, &session_id_str, request_id.clone())
-        .await
-    {
-        error!(
-            "项目[{}] 降级重试发送 SessionPromptStart 失败: {:?}",
-            project_id, e
-        );
-    }
-
-    // 直接调用 prompt 发送
-    match client_conn.prompt(retry_prompt).await {
-        Ok(resp) => {
-            info!(
-                "✅ 项目[{}] 降级重试 Prompt 发送成功, stop_reason={:?}",
-                project_id, resp.stop_reason
-            );
-
-            // 发送 SessionPromptEnd 通知
-            if let Err(e) = notifier
-                .notify_prompt_end(
-                    project_id,
-                    &session_id_str,
-                    resp.stop_reason,
-                    None,
-                    request_id,
-                )
-                .await
-            {
-                error!(
-                    "项目[{}] 降级重试发送 SessionPromptEnd 失败: {:?}",
-                    project_id, e
-                );
-            }
-        }
-        Err(e) => {
-            let error_message = e.message.clone();
-            error!(
-                "❌ 项目[{}] 降级重试 Prompt 发送失败: {:?}",
-                project_id, error_message
-            );
-
-            // 发送错误通知
-            if let Err(notify_err) = notifier
-                .notify_prompt_error(project_id, &session_id_str, e, request_id.clone())
-                .await
-            {
-                error!(
-                    "项目[{}] 降级重试发送 SessionPromptError 失败: {:?}",
-                    project_id, notify_err
-                );
-            }
-
-            // 发送 SessionPromptEnd 通知
-            if let Err(notify_err) = notifier
-                .notify_prompt_end(
-                    project_id,
-                    &session_id_str,
-                    agent_client_protocol::StopReason::Cancelled,
-                    Some(error_message.clone()),
-                    request_id,
-                )
-                .await
-            {
-                error!(
-                    "项目[{}] 降级重试发送 SessionPromptEnd 失败: {:?}",
-                    project_id, notify_err
-                );
-            }
-
-            // 降级重试也失败，返回错误
-            return Err(anyhow::anyhow!(
-                "降级重试 Prompt 失败: {}",
-                error_message
-            ));
-        }
-    }
-
-    info!("✅ 项目[{}] 降级重建完成", project_id);
-    Ok(new_session_id)
 }

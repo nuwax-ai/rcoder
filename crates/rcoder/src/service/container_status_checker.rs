@@ -207,7 +207,7 @@ impl ContainerStatusChecker {
                 self.record_success(lookup_key);
 
                 if is_active {
-                    // 容器有活跃任务，更新活动时间
+                    // 容器有活跃任务，更新活动时间和状态
                     if let Err(e) = update_container_activity(lookup_key, &self.state).await {
                         warn!(
                             "⚠️ [STATUS_CHECKER] 更新活动时间失败: {}, {}",
@@ -215,13 +215,25 @@ impl ContainerStatusChecker {
                         );
                         return Ok(false);
                     }
+                    // 🆕 同步更新 agent 状态为 Active
+                    let _ = self.state.projects.update_agent_status(
+                        lookup_key,
+                        1, // Active
+                        "active",
+                    );
                     debug!(
-                        "✅ [STATUS_CHECKER] 容器活跃，已更新活动时间: {}",
+                        "✅ [STATUS_CHECKER] 容器活跃，已更新活动时间和状态: {}",
                         lookup_key
                     );
                     Ok(true)
                 } else {
-                    debug!("📭 [STATUS_CHECKER] 容器空闲: {}", lookup_key);
+                    // 🆕 同步更新 agent 状态为 Idle
+                    let _ = self.state.projects.update_agent_status(
+                        lookup_key,
+                        0, // Idle
+                        "idle",
+                    );
+                    debug!("📭 [STATUS_CHECKER] 容器空闲，已更新状态为 Idle: {}", lookup_key);
                     Ok(false)
                 }
             }

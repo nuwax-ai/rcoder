@@ -33,7 +33,19 @@ use crate::proxy_agent::LocalSetAgentRequest;
 use crate::router::AppState;
 use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
+use dashmap::DashSet;
 use shared_types::ChatPromptBuilder;
+use std::sync::LazyLock;
+
+/// 🆕 全局 Session 首次 Prompt 成功标记
+///
+/// 用于跟踪哪些 session 已经成功执行过至少一次 Prompt
+/// - 如果 session_id 在集合中 → 已成功执行过
+/// - 如果不在集合中 → 未执行过（首次）
+///
+/// 使用 DashSet 比 DashMap<String, bool> 更轻量，因为只需要判断存在性
+pub(crate) static SESSION_FIRST_PROMPT_SUCCESS: LazyLock<DashSet<String>> =
+    LazyLock::new(|| DashSet::new());
 
 /// 将 gRPC ModelProviderConfig 转换为内部 ModelProviderConfig
 fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProviderConfig {
@@ -257,6 +269,9 @@ impl AgentService for AgentServiceImpl {
                     error: Some("Agent正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
                     error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
                     request_id: req.request_id.clone(),
+                    // 🆕 Agent Busy 不需要降级
+                    need_fallback: false,
+                    fallback_reason: None,
                 }));
             }
         }
@@ -368,6 +383,45 @@ impl AgentService for AgentServiceImpl {
         // 等待响应
         match chat_prompt_rx.await {
             Ok(response) => {
+                // 🆕 检测是否需要降级（Resume 失败）
+                // 判断逻辑：
+                // 1. 是 Resume 会话（session_id 不为空）
+                // 2. Prompt 执行失败（有错误）
+                // 3. 是首次 Prompt（SESSION_FIRST_PROMPT_SUCCESS 中没有该 session_id）
+                let is_resume_session = session_id.is_some();
+                let has_error = response.error.is_some();
+
+                let (need_fallback, fallback_reason) = if is_resume_session && has_error {
+                    let session_id_str = session_id.as_ref().unwrap();
+                    let is_first_prompt = !SESSION_FIRST_PROMPT_SUCCESS.contains(session_id_str);
+
+                    if is_first_prompt {
+                        warn!(
+                            "⚠️ [gRPC] 检测到 Resume 会话首次 Prompt 失败，需要降级: project_id={}, session_id={}, error={}",
+                            response.project_id,
+                            session_id_str,
+                            response.error.as_ref().unwrap()
+                        );
+                        (true, Some("resume_first_prompt_failed".to_string()))
+                    } else {
+                        // 不是首次 Prompt，正常错误处理
+                        (false, None)
+                    }
+                } else {
+                    (false, None)
+                };
+
+                // 🆕 如果 Prompt 执行成功，标记该 session 已成功执行过 Prompt
+                if !has_error {
+                    if let Some(ref session_id_str) = session_id {
+                        SESSION_FIRST_PROMPT_SUCCESS.insert(session_id_str.clone());
+                        debug!(
+                            "✅ [gRPC] 标记 session 首次 Prompt 成功: session_id={}",
+                            session_id_str
+                        );
+                    }
+                }
+
                 let grpc_response = GrpcChatResponse {
                     project_id: response.project_id,
                     session_id: response.session_id,
@@ -379,8 +433,20 @@ impl AgentService for AgentServiceImpl {
                         None
                     },
                     request_id: Some(request_id),
+                    // 🆕 添加降级标识字段
+                    need_fallback,
+                    fallback_reason,
                 };
-                info!("✅ [gRPC] Chat 完成: success={}", grpc_response.success);
+
+                if need_fallback {
+                    info!(
+                        "✅ [gRPC] Chat 完成 (需要降级): success={}, need_fallback={}",
+                        grpc_response.success, grpc_response.need_fallback
+                    );
+                } else {
+                    info!("✅ [gRPC] Chat 完成: success={}", grpc_response.success);
+                }
+
                 Ok(Response::new(grpc_response))
             }
             Err(e) => {
@@ -636,6 +702,30 @@ impl AgentService for AgentServiceImpl {
                 );
 
                 if is_success {
+                    // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端任务已取消
+                    use crate::service::push_session_update_with_project;
+                    use agent_client_protocol::StopReason;
+                    use shared_types::{SessionNotify, SessionPromptEnd};
+
+                    let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                        session_id: actual_session_id.clone(),
+                        stop_reason: StopReason::Cancelled,
+                        error_message: None,
+                        request_id: None,
+                    });
+
+                    if let Err(e) =
+                        push_session_update_with_project(&project_id, &actual_session_id, notify)
+                            .await
+                    {
+                        warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                    } else {
+                        info!(
+                            "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
+                            actual_session_id
+                        );
+                    }
+
                     // 清理 SESSION_CACHE
                     if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
                         session_data.close_current_connection();
@@ -802,6 +892,31 @@ impl AgentService for AgentServiceImpl {
                 project_id
             );
 
+            // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端 Agent 已停止
+            if !session_id.is_empty() {
+                use crate::service::push_session_update_with_project;
+                use agent_client_protocol::StopReason;
+                use shared_types::{SessionNotify, SessionPromptEnd};
+
+                let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                    session_id: session_id.clone(),
+                    stop_reason: StopReason::Cancelled,
+                    error_message: None,
+                    request_id: None,
+                });
+
+                if let Err(e) =
+                    push_session_update_with_project(&project_id, &session_id, notify).await
+                {
+                    warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                } else {
+                    info!(
+                        "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
+                        session_id
+                    );
+                }
+            }
+
             // 清理 SESSION_CACHE
             if !session_id.is_empty() {
                 if let Some(session_data) = SESSION_CACHE.get(&session_id) {
@@ -924,6 +1039,32 @@ impl AgentService for AgentServiceImpl {
                             "✅ [gRPC] 会话取消成功，继续停止 Agent: project_id={}",
                             project_id
                         );
+
+                        // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端 Agent 已停止
+                        {
+                            use crate::service::push_session_update_with_project;
+                            use agent_client_protocol::StopReason;
+                            use shared_types::{SessionNotify, SessionPromptEnd};
+
+                            let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                                session_id: session_id.clone(),
+                                stop_reason: StopReason::Cancelled,
+                                error_message: None,
+                                request_id: None,
+                            });
+
+                            if let Err(e) =
+                                push_session_update_with_project(&project_id, &session_id, notify)
+                                    .await
+                            {
+                                warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                            } else {
+                                info!(
+                                    "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
+                                    session_id
+                                );
+                            }
+                        }
 
                         // 清理 SESSION_CACHE
                         if let Some(session_data) = SESSION_CACHE.get(&session_id) {

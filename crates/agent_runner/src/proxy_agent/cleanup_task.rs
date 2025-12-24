@@ -140,6 +140,15 @@ impl AgentCleaner {
             if let Some((_, _)) = SESSION_CACHE.remove(&session_id) {
                 debug!("移除空session: {}", session_id);
             }
+
+            // 🆕 同时清理 SESSION_FIRST_PROMPT_SUCCESS 中的记录
+            // 避免内存泄漏
+            if crate::grpc::agent_service_impl::SESSION_FIRST_PROMPT_SUCCESS
+                .remove(&session_id)
+                .is_some()
+            {
+                debug!("清理 SESSION_FIRST_PROMPT_SUCCESS: {}", session_id);
+            }
         }
 
         if orphaned_count > 0 {
@@ -227,8 +236,13 @@ impl AgentCleaner {
 
         info!(
             "清理完成: agent(总共={}, 成功={}, 失败={}, 剩余={}) | session(活跃={}, 缓存={}) | SSE消息(清理={})",
-            cleaned_count, success_count, failed_count, remaining_agents,
-            active_sessions, cached_sessions, sse_messages
+            cleaned_count,
+            success_count,
+            failed_count,
+            remaining_agents,
+            active_sessions,
+            cached_sessions,
+            sse_messages
         );
 
         Ok(CleanupStats {
@@ -256,7 +270,10 @@ impl AgentCleaner {
 
             // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
             crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
-            debug!("🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}", project_id);
+            debug!(
+                "🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
+                project_id
+            );
 
             if removed.is_some() {
                 info!(

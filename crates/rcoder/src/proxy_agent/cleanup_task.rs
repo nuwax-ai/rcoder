@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::AgentStatus;
 use crate::router::AppState;
+use shared_types::grpc::GetContainerStatusRequest;
 use shared_types::ProjectAndContainerInfo;
 
 /// 🆕 Agent信息访问trait，用于统一不同类型的agent信息访问接口
@@ -26,6 +27,8 @@ trait AgentInfoAccess {
     fn last_activity(&self) -> DateTime<Utc>;
     fn created_at(&self) -> DateTime<Utc>;
     fn status(&self) -> Option<AgentStatus>;
+    fn user_id(&self) -> Option<String>;
+    fn service_type(&self) -> Option<shared_types::ServiceType>;
 }
 
 /// 为ProjectAndContainerInfo实现AgentInfoAccess trait
@@ -47,6 +50,14 @@ impl AgentInfoAccess for ProjectAndContainerInfo {
         // AgentStatus实现了Copy，可以直接解引用
         ProjectAndContainerInfo::status(self).copied()
     }
+
+    fn user_id(&self) -> Option<String> {
+        ProjectAndContainerInfo::user_id(self).map(|s| s.to_string())
+    }
+
+    fn service_type(&self) -> Option<shared_types::ServiceType> {
+        ProjectAndContainerInfo::service_type(self)
+    }
 }
 
 /// 为Arc<ProjectAndContainerInfo>实现AgentInfoAccess trait
@@ -65,6 +76,14 @@ impl AgentInfoAccess for Arc<ProjectAndContainerInfo> {
 
     fn status(&self) -> Option<AgentStatus> {
         ProjectAndContainerInfo::status(self).copied()
+    }
+
+    fn user_id(&self) -> Option<String> {
+        ProjectAndContainerInfo::user_id(self).map(|s| s.to_string())
+    }
+
+    fn service_type(&self) -> Option<shared_types::ServiceType> {
+        ProjectAndContainerInfo::service_type(self)
     }
 }
 
@@ -282,6 +301,10 @@ impl AgentCleaner {
                 let status = agent_ref.status();
                 let last_activity = agent_ref.last_activity();
                 let created_at = agent_ref.created_at();
+                // 🆕 获取 user_id 和 service_type 用于更清晰的日志
+                let user_id = agent_ref.user_id();
+                let service_type = agent_ref.service_type();
+                let container = agent_ref.container().cloned();
 
                 // 立即释放引用，避免长时间持有
                 drop(agent_ref);
@@ -290,30 +313,47 @@ impl AgentCleaner {
                 let should_clean_by_status = match status {
                     Some(AgentStatus::Idle) => {
                         debug!(
-                            "✅ [cleanup] 状态检查通过: project_id={}, 状态=Idle",
-                            project_id
+                            "✅ [cleanup] 状态检查通过: lookup_key={}, user_id={}, 状态=Idle",
+                            project_id,
+                            user_id.as_deref().unwrap_or("None")
                         );
                         true
                     }
                     None => {
-                        debug!(
-                            "✅ [cleanup] 状态检查通过: project_id={}, 状态=None(新创建)",
-                            project_id
-                        );
-                        true // 新创建的容器状态为None，也应该被检查
+                        // 🆕 修复3: 状态未知，检查是否在保护期内（创建时间 < 5分钟）
+                        let age = current_time - created_at;
+                        if age.num_seconds() < 300 {
+                            // 5 分钟保护期
+                            debug!(
+                                "⏸️ [cleanup] 状态为 None 且在保护期内，跳过: lookup_key={}, user_id={}, 创建时长={}秒",
+                                project_id,
+                                user_id.as_deref().unwrap_or("None"),
+                                age.num_seconds()
+                            );
+                            false
+                        } else {
+                            debug!(
+                                "⚠️ [cleanup] 状态为 None 但已超过保护期，将检查超时: lookup_key={}, user_id={}",
+                                project_id,
+                                user_id.as_deref().unwrap_or("None")
+                            );
+                            true
+                        }
                     }
                     Some(AgentStatus::Active) => {
                         debug!(
-                            "⏸️ [cleanup] 跳过Active状态agent: project_id={}",
-                            project_id
+                            "⏸️ [cleanup] 跳过Active状态agent: lookup_key={}, user_id={}",
+                            project_id,
+                            user_id.as_deref().unwrap_or("None")
                         );
                         active_agents += 1;
                         false
                     }
                     Some(AgentStatus::Terminating) => {
                         debug!(
-                            "🔄 [cleanup] 跳过Terminating状态agent: project_id={}",
-                            project_id
+                            "🔄 [cleanup] 跳过Terminating状态agent: lookup_key={}, user_id={}",
+                            project_id,
+                            user_id.as_deref().unwrap_or("None")
                         );
                         false
                     }
@@ -330,12 +370,32 @@ impl AgentCleaner {
                         self.should_skip_cleanup_due_to_protection(created_at, &project_id);
 
                     if is_timeout && !is_protected {
+                        // 🆕 修复5: 二次确认 - 通过 gRPC 查询容器内 agent 的真实状态
+                        if let Some(ref container_info) = container {
+                            let user_id_str = user_id.as_deref().unwrap_or(&project_id);
+                            if self
+                                .is_container_active(container_info, user_id_str, &project_id)
+                                .await
+                            {
+                                info!(
+                                    "🛡️ [cleanup] 容器内 agent 正在执行任务，跳过清理: lookup_key={}, user_id={}",
+                                    project_id,
+                                    user_id.as_deref().unwrap_or("None")
+                                );
+                                active_agents += 1;
+                                continue; // 跳过此容器
+                            }
+                        }
+
                         let idle_duration_secs = idle_duration.num_seconds();
                         let age_secs = age.num_seconds();
 
+                        // 🆕 修复4: 改进日志格式，显示 lookup_key、user_id、service_type
                         info!(
-                            "🎯 [cleanup] 发现待清理agent: project_id={}, 状态={:?}, 最后活动={}, 闲置时长={}秒, 创建时长={}秒, 创建时间={}",
+                            "🎯 [cleanup] 发现待清理agent: lookup_key={}, user_id={}, service_type={:?}, 状态={:?}, 最后活动={}, 闲置时长={}秒, 创建时长={}秒, 创建时间={}",
                             project_id,
+                            user_id.as_deref().unwrap_or("None"),
+                            service_type,
                             status,
                             last_activity,
                             idle_duration_secs,
@@ -346,8 +406,9 @@ impl AgentCleaner {
                     } else {
                         non_timeout_agents += 1;
                         debug!(
-                            "⏰ [cleanup] Agent未超时或在保护期，跳过清理: project_id={}",
-                            project_id
+                            "⏰ [cleanup] Agent未超时或在保护期，跳过清理: lookup_key={}, user_id={}",
+                            project_id,
+                            user_id.as_deref().unwrap_or("None")
                         );
                     }
                 }
@@ -954,6 +1015,80 @@ impl AgentCleaner {
         }
 
         Ok(())
+    }
+
+    /// 🆕 查询容器内 agent 的真实状态
+    ///
+    /// 返回 true 表示容器内 agent 正在执行任务（不应清理）
+    async fn is_container_active(
+        &self,
+        container_info: &shared_types::ContainerBasicInfo,
+        user_id: &str,
+        project_id: &str,
+    ) -> bool {
+        let grpc_addr = format!(
+            "{}:{}",
+            container_info.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
+        );
+
+        // 使用短超时（3秒），避免阻塞清理任务
+        let timeout_duration = Duration::from_secs(3);
+
+        match timeout(
+            timeout_duration,
+            self.query_container_status(&grpc_addr, user_id, project_id),
+        )
+        .await
+        {
+            Ok(Ok(is_active)) => {
+                if is_active {
+                    info!(
+                        "🛡️ [cleanup] 容器内 agent 正在执行任务: user_id={}, project_id={}",
+                        user_id, project_id
+                    );
+                }
+                is_active
+            }
+            Ok(Err(e)) => {
+                // gRPC 查询失败，可能容器已经不健康，允许清理
+                debug!(
+                    "⚠️ [cleanup] gRPC 查询失败，允许清理: {} - {}",
+                    project_id, e
+                );
+                false
+            }
+            Err(_) => {
+                // 超时，可能容器已经不健康，允许清理
+                debug!("⚠️ [cleanup] gRPC 查询超时，允许清理: {}", project_id);
+                false
+            }
+        }
+    }
+
+    /// 🆕 调用 gRPC GetContainerStatus
+    async fn query_container_status(
+        &self,
+        grpc_addr: &str,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<bool> {
+        let mut client = self.state.grpc_pool.get_client(grpc_addr).await?;
+
+        let request = tonic::Request::new(GetContainerStatusRequest {
+            user_id: user_id.to_string(),
+            project_id: project_id.to_string(),
+        });
+
+        let response = client.get_container_status(request).await?;
+        let status = response.into_inner();
+
+        debug!(
+            "📊 [cleanup] gRPC 查询容器状态: user_id={}, is_active={}, active_tasks={}, status={}",
+            user_id, status.is_active, status.active_tasks, status.status
+        );
+
+        Ok(status.is_active || status.active_tasks > 0)
     }
 
     /// 运行清理任务 - 简化版，只做定时清理

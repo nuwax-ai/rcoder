@@ -233,23 +233,24 @@ impl ProjectRepository {
     }
 
     /// 原子更新 Agent 状态（使用事务）
+    ///
+    /// 注意：此方法不会更新 last_activity，只更新状态字段
+    /// 这是为了避免每 30 秒的状态检查刷新活动时间，导致闲置容器永远不会被清理
     pub fn update_status_atomic(
         &self,
         project_id: &str,
         status_code: i32,
         status_name: &str,
     ) -> DuckDbResult<bool> {
-        let now_str = Utc::now().to_rfc3339();
         self.conn.transaction(|c| {
             let affected = c.execute(
                 r#"
                 UPDATE projects
                 SET agent_status_code = ?,
-                    agent_status_name = ?,
-                    last_activity = ?
+                    agent_status_name = ?
                 WHERE project_id = ?
                 "#,
-                params![status_code, status_name, now_str, project_id],
+                params![status_code, status_name, project_id],
             )?;
             Ok(affected > 0)
         })

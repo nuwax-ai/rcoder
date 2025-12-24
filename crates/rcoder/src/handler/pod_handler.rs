@@ -21,6 +21,34 @@ use crate::{AppError, HttpResult};
 use shared_types::{ProjectAndContainerInfo, ServiceResourceLimits};
 
 // ============================================================================
+// 辅助函数
+// ============================================================================
+
+/// 将 Unix 毫秒时间戳转换为东八区（UTC+8）时间字符串
+///
+/// # 参数
+/// * `timestamp_millis` - Unix 毫秒时间戳
+///
+/// # 返回
+/// 格式为 "YYYY-MM-DD HH:MM:SS" 的时间字符串
+fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
+    use chrono::{DateTime, FixedOffset};
+
+    // 直接从毫秒时间戳创建 DateTime<Utc>
+    let datetime = DateTime::from_timestamp_millis(timestamp_millis as i64)
+        .unwrap_or_else(|| DateTime::UNIX_EPOCH);
+
+    // 创建东八区时区偏移 (UTC+8)
+    let utc8_offset = FixedOffset::east_opt(8 * 3600).expect("有效的 UTC+8 偏移");
+
+    // 转换为东八区时间并格式化
+    datetime
+        .with_timezone(&utc8_offset)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+// ============================================================================
 // 接口一：获取容器数量
 // ============================================================================
 
@@ -237,6 +265,14 @@ pub struct KeepalivePodResponse {
     /// 当前活动时间 (Unix 毫秒时间戳, 更新后)
     #[schema(example = 1702700600000_u64)]
     pub current_activity_time: u64,
+
+    /// 上次活动时间 (东八区时间字符串)
+    #[schema(example = "2023-12-16 10:00:00")]
+    pub previous_activity_time_str: String,
+
+    /// 当前活动时间 (东八区时间字符串)
+    #[schema(example = "2023-12-16 10:10:00")]
+    pub current_activity_time_str: String,
 
     /// 距离下次清理的剩余时间 (秒)
     #[schema(example = 1800)]
@@ -786,12 +822,18 @@ pub async fn pod_keepalive(
         )
     };
 
+    // 转换时间戳为东八区时间字符串
+    let previous_activity_time_str = timestamp_to_utc8_string(previous_activity_time);
+    let current_activity_time_str = timestamp_to_utc8_string(current_activity_time);
+
     let response = KeepalivePodResponse {
         existed: !created,
         created,
         container_info: pod_container_info,
         previous_activity_time,
         current_activity_time, // 使用实际数据库更新的时间
+        previous_activity_time_str,
+        current_activity_time_str,
         time_until_cleanup: idle_timeout_seconds,
         message,
     };
