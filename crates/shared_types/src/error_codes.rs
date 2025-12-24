@@ -69,6 +69,12 @@ pub const ERR_HTTP_FALLBACK_FAILED: &str = "HTTP_FALLBACK_FAILED";
 /// 内部服务器错误
 pub const ERR_INTERNAL_SERVER_ERROR: &str = "INTERNAL_SERVER_ERROR";
 
+/// Resume 会话失败，已自动降级重试
+pub const ERR_RESUME_FAILED: &str = "8001";
+
+/// 降级重试次数耗尽
+pub const ERR_RETRY_EXHAUSTED: &str = "8002";
+
 /// 获取错误码的默认描述
 pub fn get_error_description(code: &str) -> &'static str {
     match code {
@@ -91,6 +97,8 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_CONTAINER_NOT_FOUND => "容器不存在",
         ERR_HTTP_FALLBACK_FAILED => "HTTP 回退失败",
         ERR_INTERNAL_SERVER_ERROR => "内部服务器错误",
+        ERR_RESUME_FAILED => "Resume 会话失败",
+        ERR_RETRY_EXHAUSTED => "降级重试次数耗尽",
         ERR_UNKNOWN => "未知错误",
         _ => "未定义的错误码",
     }

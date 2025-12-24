@@ -156,125 +156,215 @@ pub async fn handle_chat(
             .unwrap_or_else(|| "None".to_string())
     );
 
-    // 直接转发原始请求到容器内的 agent_runner 服务
-    // agent_runner 会处理所有业务逻辑，包括：
-    // - project_id 和 session_id 的生成
-    // - 会话管理
-    // - AI 处理
+    // 🆕 实现 rcoder 层降级重试逻辑（最多 2 次尝试）
+    // 与 /computer/chat 保持一致的降级处理策略
+    const MAX_ATTEMPTS: usize = 2;
 
-    // 第一步：获取或创建容器，默认使用 ServiceType::RCoder
-    let service_type = shared_types::ServiceType::RCoder;
-    let container_info =
-        crate::service::container_manager::ContainerManager::get_or_create_container(
-            &project_id,
-            &service_type,
-            request
-                .agent_config
-                .as_ref()
-                .and_then(|c| c.resource_limits.clone()),
-        )
-        .await?;
+    for attempt in 0..MAX_ATTEMPTS {
+        info!(
+            "🔄 [CHAT] 尝试 #{}/{}: project_id={}, has_session_id={}",
+            attempt + 1,
+            MAX_ATTEMPTS,
+            project_id,
+            request.session_id.is_some()
+        );
 
-    // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
-    let _ = {
-        info!("🔍 [CHAT] 开始获取/创建项目信息: project_id={}", project_id);
+        // 🆕 降级后，清除 session_id（不使用 Resume）
+        if attempt > 0 {
+            request.session_id = None;
+            info!("⚠️ [CHAT] 降级重试，不使用 Resume");
+        }
 
-        // 检查项目是否存在
-        if let Some(existing_info) = state.get_project(&project_id) {
-            info!("📋 [CHAT] 更新现有项目信息: project_id={}", project_id);
+        // 第一步：获取或创建容器，默认使用 ServiceType::RCoder
+        let service_type = shared_types::ServiceType::RCoder;
+        let container_info =
+            crate::service::container_manager::ContainerManager::get_or_create_container(
+                &project_id,
+                &service_type,
+                request
+                    .agent_config
+                    .as_ref()
+                    .and_then(|c| c.resource_limits.clone()),
+            )
+            .await?;
 
-            // 检查是否需要更新扩展状态
-            let needs_extended_update = existing_info.container().is_none()
-                || existing_info.model_provider().is_none()
-                || existing_info.request_id().is_none();
+        // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
+        let _ = {
+            info!("🔍 [CHAT] 开始获取/创建项目信息: project_id={}", project_id);
 
-            if needs_extended_update {
-                // 创建更新后的信息
-                let mut mutable_info = (*existing_info).clone();
-                mutable_info.update_extended_from_request(
+            // 检查项目是否存在
+            if let Some(existing_info) = state.get_project(&project_id) {
+                info!("📋 [CHAT] 更新现有项目信息: project_id={}", project_id);
+
+                // 检查是否需要更新扩展状态
+                let needs_extended_update = existing_info.container().is_none()
+                    || existing_info.model_provider().is_none()
+                    || existing_info.request_id().is_none();
+
+                if needs_extended_update {
+                    // 创建更新后的信息
+                    let mut mutable_info = (*existing_info).clone();
+                    mutable_info.update_extended_from_request(
+                        Some(container_info.clone()),
+                        request.model_provider.clone(),
+                        request.request_id.clone(),
+                        Some(service_type.clone()),
+                    );
+                    mutable_info.update_activity();
+
+                    let arc_info = Arc::new(mutable_info);
+                    state.insert_project(project_id.clone(), arc_info.clone());
+
+                    info!(
+                        "✅ [CHAT] 项目信息完整更新完成: project_id={}, container_id={}",
+                        project_id, container_info.container_id
+                    );
+
+                    arc_info
+                } else {
+                    // 只需要更新活动时间
+                    state.update_activity(&project_id);
+                    info!("✅ [CHAT] 项目活动时间更新完成: project_id={}", project_id);
+                    existing_info
+                }
+            } else {
+                info!("🆕 [CHAT] 创建新项目信息: project_id={}", project_id);
+
+                // 创建新的 ProjectAndContainerInfo
+                let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
+                new_info.update_extended_from_request(
                     Some(container_info.clone()),
                     request.model_provider.clone(),
                     request.request_id.clone(),
                     Some(service_type.clone()),
                 );
-                mutable_info.update_activity();
 
-                let arc_info = Arc::new(mutable_info);
+                let arc_info = Arc::new(new_info);
                 state.insert_project(project_id.clone(), arc_info.clone());
 
                 info!(
-                    "✅ [CHAT] 项目信息完整更新完成: project_id={}, container_id={}",
+                    "✅ [CHAT] 项目信息创建完成: project_id={}, container_id={}",
                     project_id, container_info.container_id
                 );
 
                 arc_info
-            } else {
-                // 只需要更新活动时间
+            }
+        };
+
+        // 🆕 请求到达时立即更新活动时间（不等待请求执行结果）
+        // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
+        state.update_activity(&project_id);
+        debug!("🔄 [CHAT] 已更新活动时间: project_id={}", project_id);
+
+        // 第三步：转发请求到容器服务（使用全局连接池）
+        info!("🚀 [CHAT] 开始转发请求到容器服务");
+        let result =
+            forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
+        info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
+
+        // 🆕 检查是否需要降级
+        if let Ok(ref http_result) = result {
+            if let Some(ref response_data) = http_result.data {
+                if response_data.need_fallback.unwrap_or(false) {
+                    warn!(
+                        "⚠️ [CHAT] 检测到需要降级: reason={}, attempt={}/{}",
+                        response_data
+                            .fallback_reason
+                            .as_deref()
+                            .unwrap_or("unknown"),
+                        attempt + 1,
+                        MAX_ATTEMPTS
+                    );
+
+                    // 检查是否还有重试机会
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        info!("🔄 [CHAT] 开始降级重试");
+
+                        // 🆕 主动停止旧 agent，释放资源
+                        // 这会触发 AgentLifecycleGuard 的 RAII 清理机制
+                        info!("🛑 [CHAT] 停止旧 agent: project_id={}", project_id);
+
+                        // 从 service_url 提取 gRPC 地址
+                        let grpc_addr = format!(
+                            "{}:{}",
+                            container_info
+                                .service_url
+                                .trim_start_matches("http://")
+                                .trim_start_matches("https://")
+                                .split(':')
+                                .next()
+                                .unwrap_or(&container_info.service_url),
+                            shared_types::GRPC_DEFAULT_PORT
+                        );
+
+                        if let Err(e) = crate::grpc::chat_client::grpc_stop_agent_with_pool(
+                            &state.grpc_pool,
+                            &grpc_addr,
+                            project_id.clone(),
+                            Some("Resume 失败，降级重启".to_string()),
+                            false, // graceful stop
+                        )
+                        .await
+                        {
+                            warn!("⚠️ [CHAT] 停止旧 agent 失败（可能已退出）: {}", e);
+                        }
+
+                        // 等待资源释放
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                        continue; // 🆕 重试
+                    } else {
+                        // 没有重试机会了
+                        warn!("❌ [CHAT] 降级重试次数耗尽");
+                        return Ok(HttpResult::error(
+                            shared_types::error_codes::ERR_RETRY_EXHAUSTED,
+                            "Resume failed and retry exhausted",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 响应后状态更新 - 使用 DuckDB 存储
+        if let Ok(http_result) = &result {
+            if let Some(chat_response) = &http_result.data {
+                info!(
+                    "📊 [CHAT] 收到聊天响应，开始状态更新: session_id={}",
+                    chat_response.session_id
+                );
+
+                let session_id = chat_response.session_id.clone();
+
+                // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
+                info!(
+                    "🔗 [SESSION_MAP] 关联 session_id {} 到 project_id {}",
+                    session_id, project_id
+                );
+                state.update_session(&project_id, &session_id);
+
+                // 更新项目活动时间
                 state.update_activity(&project_id);
-                info!("✅ [CHAT] 项目活动时间更新完成: project_id={}", project_id);
-                existing_info
+
+                info!(
+                    "🎯 [CHAT] 所有状态更新完成: project_id={}, session_id={}",
+                    project_id, session_id
+                );
             }
         } else {
-            info!("🆕 [CHAT] 创建新项目信息: project_id={}", project_id);
-
-            // 创建新的 ProjectAndContainerInfo
-            let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
-            new_info.update_extended_from_request(
-                Some(container_info.clone()),
-                request.model_provider.clone(),
-                request.request_id.clone(),
-                Some(service_type.clone()),
-            );
-
-            let arc_info = Arc::new(new_info);
-            state.insert_project(project_id.clone(), arc_info.clone());
-
-            info!(
-                "✅ [CHAT] 项目信息创建完成: project_id={}, container_id={}",
-                project_id, container_info.container_id
-            );
-
-            arc_info
+            error!("❌ [CHAT] 容器服务返回错误: {:?}", result);
         }
-    };
 
-    // 第三步：转发请求到容器服务（使用全局连接池）
-    info!("🚀 [CHAT] 开始转发请求到容器服务");
-    let result =
-        forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
-    info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
+        info!("🏁 [CHAT] 准备返回最终结果: project_id={}", project_id);
 
-    // 响应后状态更新 - 使用 DuckDB 存储
-    if let Ok(http_result) = &result {
-        if let Some(chat_response) = &http_result.data {
-            info!(
-                "📊 [CHAT] 收到聊天响应，开始状态更新: session_id={}",
-                chat_response.session_id
-            );
+        // 🆕 成功或其他错误，退出重试循环并返回结果
+        return result;
+    } // 🆕 重试循环结束
 
-            let session_id = chat_response.session_id.clone();
-
-            // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
-            info!(
-                "🔗 [SESSION_MAP] 关联 session_id {} 到 project_id {}",
-                session_id, project_id
-            );
-            state.update_session(&project_id, &session_id);
-
-            // 更新项目活动时间
-            state.update_activity(&project_id);
-
-            info!(
-                "🎯 [CHAT] 所有状态更新完成: project_id={}, session_id={}",
-                project_id, session_id
-            );
-        }
-    } else {
-        error!("❌ [CHAT] 容器服务返回错误: {:?}", result);
-    }
-
-    info!("🏁 [CHAT] 准备返回最终结果: project_id={}", project_id);
-    result
+    // 🆕 理论上不应该到这里（所有路径都应该在循环内返回）
+    Ok(HttpResult::error(
+        shared_types::error_codes::ERR_UNKNOWN,
+        "Unexpected error: retry loop exhausted without return",
+    ))
 }
 
 /// 转发请求到容器内的 agent_runner 服务

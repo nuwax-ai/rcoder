@@ -60,6 +60,10 @@ message ChatResponse {
   optional string error = 4;
   optional string request_id = 5;
   optional string error_code = 6; // 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
+
+  // 🆕 Resume 失败标识 (用于 rcoder 层降级处理)
+  bool need_fallback = 7; // true 表示需要降级重试
+  optional string fallback_reason = 8; // 降级原因：如 "session_not_found"
 }
 
 // === Progress Streaming ===

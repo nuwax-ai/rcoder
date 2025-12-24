@@ -53,6 +53,14 @@ pub struct ChatResponse {
     /// 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
     #[prost(string, optional, tag = "6")]
     pub error_code: ::core::option::Option<::prost::alloc::string::String>,
+    /// 🆕 Resume 失败标识 (用于 rcoder 层降级处理)
+    ///
+    /// true 表示需要降级重试
+    #[prost(bool, tag = "7")]
+    pub need_fallback: bool,
+    /// 降级原因：如 "session_not_found"
+    #[prost(string, optional, tag = "8")]
+    pub fallback_reason: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProgressRequest {
