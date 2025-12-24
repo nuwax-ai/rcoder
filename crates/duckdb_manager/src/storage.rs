@@ -33,6 +33,13 @@ pub trait UnifiedStorage: Send + Sync {
     /// 更新容器活动时间
     fn update_container_activity(&self, container_id: &str) -> DuckDbResult<bool>;
 
+    /// 使用指定时间更新容器活动时间（用于保持项目和容器时间一致）
+    fn update_container_activity_with_time(
+        &self,
+        container_id: &str,
+        time: chrono::DateTime<chrono::Utc>,
+    ) -> DuckDbResult<bool>;
+
     /// 获取所有容器
     fn get_all_containers(&self) -> DuckDbResult<Vec<ContainerRecord>>;
 
@@ -63,8 +70,11 @@ pub trait UnifiedStorage: Send + Sync {
     /// 检查项目是否存在
     fn project_exists(&self, project_id: &str) -> DuckDbResult<bool>;
 
-    /// 更新项目活动时间
-    fn update_project_activity(&self, project_id: &str) -> DuckDbResult<bool>;
+    /// 更新项目活动时间，返回实际更新使用的时间戳
+    fn update_project_activity(
+        &self,
+        project_id: &str,
+    ) -> DuckDbResult<Option<chrono::DateTime<chrono::Utc>>>;
 
     /// 获取所有项目
     fn get_all_projects(&self) -> DuckDbResult<Vec<ProjectRecord>>;
@@ -171,6 +181,15 @@ impl UnifiedStorage for DuckDbStorage {
         self.containers()?.update_activity(container_id)
     }
 
+    fn update_container_activity_with_time(
+        &self,
+        container_id: &str,
+        time: chrono::DateTime<chrono::Utc>,
+    ) -> DuckDbResult<bool> {
+        self.containers()?
+            .update_activity_with_time(container_id, time)
+    }
+
     fn get_all_containers(&self) -> DuckDbResult<Vec<ContainerRecord>> {
         self.containers()?.find_all()
     }
@@ -219,7 +238,10 @@ impl UnifiedStorage for DuckDbStorage {
         self.projects()?.exists(project_id)
     }
 
-    fn update_project_activity(&self, project_id: &str) -> DuckDbResult<bool> {
+    fn update_project_activity(
+        &self,
+        project_id: &str,
+    ) -> DuckDbResult<Option<chrono::DateTime<chrono::Utc>>> {
         self.projects()?.update_activity(project_id)
     }
 

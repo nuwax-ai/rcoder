@@ -8,8 +8,8 @@
 //! - `POST /computer/pod/ensure` - 启动/确保容器存在（幂等）
 //! - `POST /computer/pod/keepalive` - 容器保活（刷新活动时间）
 
-use axum::{extract::Query, Json};
 use axum::extract::State;
+use axum::{Json, extract::Query};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument};
@@ -190,24 +190,12 @@ pub struct EnsurePodResponse {
     pub message: String,
 }
 
-/// 容器基本信息
+/// 容器基本信息（对外接口）
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PodContainerInfo {
     /// 容器 ID
     #[schema(example = "abc123def456")]
     pub container_id: String,
-
-    /// 容器名称
-    #[schema(example = "computer-agent-runner-user_123")]
-    pub container_name: String,
-
-    /// 容器 IP 地址 (内部网络)
-    #[schema(example = "172.17.0.5")]
-    pub container_ip: String,
-
-    /// 服务 URL
-    #[schema(example = "http://172.17.0.5:8086")]
-    pub service_url: String,
 
     /// 容器状态
     #[schema(example = "running")]
@@ -405,13 +393,10 @@ pub async fn pod_list(
     let docker_containers = docker_manager.list_containers();
 
     // 2. 获取 DuckDB 存储中的容器记录
-    let duckdb_containers = state
-        .projects
-        .get_all_container_records()
-        .map_err(|e| {
-            error!("❌ [POD_LIST] 获取 DuckDB 容器列表失败: {}", e);
-            AppError::internal_server_error(&format!("获取 DuckDB 容器列表失败: {}", e))
-        })?;
+    let duckdb_containers = state.projects.get_all_container_records().map_err(|e| {
+        error!("❌ [POD_LIST] 获取 DuckDB 容器列表失败: {}", e);
+        AppError::internal_server_error(&format!("获取 DuckDB 容器列表失败: {}", e))
+    })?;
 
     // 3. 创建容器ID到DuckDB记录的映射
     let mut duckdb_map: std::collections::HashMap<String, &duckdb_manager::ContainerRecord> =
@@ -498,8 +483,7 @@ pub async fn pod_list(
                 .unwrap_or_else(|| {
                     format!(
                         "http://{}:{}",
-                        docker_container.assigned_port,
-                        docker_container.internal_port
+                        docker_container.assigned_port, docker_container.internal_port
                     )
                 }),
             status: match &docker_container.status {
@@ -655,9 +639,6 @@ pub async fn pod_ensure(
     // 4. 构建响应
     let pod_container_info = PodContainerInfo {
         container_id: container_info.container_id.clone(),
-        container_name: container_info.container_name.clone(),
-        container_ip: container_info.container_ip.clone(),
-        service_url: container_info.service_url.clone(),
         status: container_info.status.clone(),
     };
 
@@ -721,18 +702,21 @@ pub async fn pod_keepalive(
         request.user_id, request.project_id
     );
 
-    let current_time = chrono::Utc::now();
-    let current_time_millis = current_time.timestamp_millis() as u64;
-
     // 2. 检查 DuckDB 存储中是否有记录，并更新活动时间
-    let (previous_activity_time, existed) = {
+    let (previous_activity_time, current_activity_time, existed) = {
         if let Some(existing_info) = state.get_project(&request.user_id) {
             let prev = existing_info.last_activity().timestamp_millis() as u64;
-            // 更新活动时间
-            state.update_activity(&request.user_id);
-            (prev, true)
+
+            // 获取实际更新的时间
+            let updated_time = state.update_activity(&request.user_id);
+            let current = updated_time
+                .map(|t| t.timestamp_millis() as u64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+
+            (prev, current, true)
         } else {
-            (0u64, false)
+            let now = chrono::Utc::now().timestamp_millis() as u64;
+            (0u64, now, false)
         }
     };
 
@@ -746,8 +730,7 @@ pub async fn pod_keepalive(
             Some(info) => {
                 // Docker 中有容器，检查并插入到 DuckDB 存储
                 if !state.contains_project(&request.user_id) {
-                    let mut project_info =
-                        ProjectAndContainerInfo::new(request.project_id.clone());
+                    let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
                     project_info.set_user_id(Some(request.user_id.clone()));
                     project_info
                         .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
@@ -761,13 +744,13 @@ pub async fn pod_keepalive(
             }
             None => {
                 // Docker 中也没有容器，返回错误而不是创建新容器
-                error!(
-                    "❌ [POD_KEEPALIVE] 容器不存在: user_id={}",
-                    request.user_id
-                );
+                info!("❌ [POD_KEEPALIVE] 容器不存在: user_id={}", request.user_id);
                 return Ok(HttpResult::error(
                     shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-                    &format!("找不到用户 {} 的容器，请先发送聊天请求创建容器", request.user_id),
+                    &format!(
+                        "找不到用户 {} 的容器，请先发送聊天请求创建容器",
+                        request.user_id
+                    ),
                 ));
             }
         }
@@ -785,9 +768,6 @@ pub async fn pod_keepalive(
     // 4. 构建响应
     let pod_container_info = PodContainerInfo {
         container_id: container_info.container_id.clone(),
-        container_name: container_info.container_name.clone(),
-        container_ip: container_info.container_ip.clone(),
-        service_url: container_info.service_url.clone(),
         status: container_info.status.clone(),
     };
 
@@ -811,7 +791,7 @@ pub async fn pod_keepalive(
         created,
         container_info: pod_container_info,
         previous_activity_time,
-        current_activity_time: current_time_millis,
+        current_activity_time, // 使用实际数据库更新的时间
         time_until_cleanup: idle_timeout_seconds,
         message,
     };
@@ -947,9 +927,6 @@ pub async fn pod_restart(
     // 6. 构建响应
     let pod_container_info = PodContainerInfo {
         container_id: container_info.container_id.clone(),
-        container_name: container_info.container_name.clone(),
-        container_ip: container_info.container_ip.clone(),
-        service_url: container_info.service_url.clone(),
         status: container_info.status.clone(),
     };
 
@@ -1009,9 +986,6 @@ mod tests {
             created: true,
             container_info: PodContainerInfo {
                 container_id: "abc123".to_string(),
-                container_name: "computer-agent-runner-user_123".to_string(),
-                container_ip: "172.17.0.5".to_string(),
-                service_url: "http://172.17.0.5:8086".to_string(),
                 status: "running".to_string(),
             },
             message: "容器创建成功".to_string(),
