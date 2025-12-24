@@ -16,6 +16,40 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;
 
+// ============================================================================
+// SessionEntry Trait - 会话条目抽象
+// ============================================================================
+
+/// 会话条目 trait
+///
+/// 抽象会话条目的数据访问接口，允许不同的结构体实现此 trait。
+/// 用于消除 `SessionInfo` 和 `ProjectAndAgentInfo` 的重复。
+pub trait SessionEntry: Clone + Send + Sync + 'static {
+    /// 获取项目 ID
+    fn project_id(&self) -> &str;
+
+    /// 获取会话 ID
+    fn session_id(&self) -> &SessionId;
+
+    /// 获取 Prompt 发送通道
+    fn prompt_tx(&self) -> &mpsc::UnboundedSender<PromptRequest>;
+
+    /// 获取取消通知发送通道
+    fn cancel_tx(&self) -> &mpsc::UnboundedSender<CancelNotificationRequestWrapper>;
+
+    /// 获取模型配置
+    fn model_provider(&self) -> Option<&ModelProviderConfig>;
+
+    /// 获取生命周期管理句柄
+    fn lifecycle_handle(&self) -> Option<&Arc<dyn AgentLifecycle>>;
+
+    /// 检查 channel 是否已关闭（Agent 进程已退出）
+    fn is_channel_closed(&self) -> bool;
+
+    /// 检查模型配置是否与给定配置不同
+    fn is_model_config_changed(&self, new_config: &Option<ModelProviderConfig>) -> bool;
+}
+
 /// 取消操作结果（新类型）
 ///
 /// 用于统一取消操作的返回结果
@@ -134,6 +168,48 @@ pub struct ProjectAndAgentInfo {
     pub created_at: DateTime<Utc>,
     /// Agent生命周期管理句柄
     pub stop_handle: Option<Arc<dyn AgentLifecycle>>,
+}
+
+// ============================================================================
+// ProjectAndAgentInfo 实现 SessionEntry trait
+// ============================================================================
+
+impl SessionEntry for ProjectAndAgentInfo {
+    fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    fn prompt_tx(&self) -> &mpsc::UnboundedSender<PromptRequest> {
+        &self.prompt_tx
+    }
+
+    fn cancel_tx(&self) -> &mpsc::UnboundedSender<CancelNotificationRequestWrapper> {
+        &self.cancel_tx
+    }
+
+    fn model_provider(&self) -> Option<&ModelProviderConfig> {
+        self.model_provider.as_ref()
+    }
+
+    fn lifecycle_handle(&self) -> Option<&Arc<dyn AgentLifecycle>> {
+        self.stop_handle.as_ref()
+    }
+
+    fn is_channel_closed(&self) -> bool {
+        self.prompt_tx.is_closed()
+    }
+
+    fn is_model_config_changed(&self, new_config: &Option<ModelProviderConfig>) -> bool {
+        match (&self.model_provider, new_config) {
+            (None, None) => false,
+            (Some(_), None) | (None, Some(_)) => true,
+            (Some(existing), Some(new)) => existing.id != new.id,
+        }
+    }
 }
 
 /// Agent 状态查询响应

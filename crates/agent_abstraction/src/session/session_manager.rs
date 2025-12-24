@@ -1,23 +1,33 @@
 //! ACP Session Manager
 //!
 //! 基于 project_id 管理 ACP 会话的核心模块
+//!
+//! ## 架构说明
+//!
+//! 使用依赖注入的 `SessionRegistry` 进行会话存储，消除了之前的重复数据结构：
+//! - 之前：`AcpSessionManager.sessions` 和 `AGENT_REGISTRY` 各自维护一份会话数据
+//! - 现在：统一使用注入的 `SessionRegistry`（通常是 `AGENT_REGISTRY`）
+//!
+//! 这样确保了：
+//! - 当 Agent 被停止时（通过 `stop_agent` 调用 `AGENT_REGISTRY.remove`），
+//!   `AcpSessionManager` 自然就看不到该会话了
+//! - 不再需要手动同步两个存储
 
-use std::{
-    path::{Component, PathBuf},
-    sync::Arc,
-};
+use std::path::{Component, PathBuf};
+use std::sync::Arc;
 
 use agent_client_protocol::{Client, ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
-use dashmap::DashMap;
-use shared_types::{AgentLifecycle, ModelProviderConfig};
+use chrono::Utc;
+use shared_types::{
+    AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
+};
 use tracing::{debug, error, info};
 
-use super::SessionInfo;
 use crate::PromptMessage;
 use crate::compat::ClaudeCodeLauncher;
-use crate::traits::{AgentStartConfig, SessionNotifier};
+use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 
 /// ACP 会话管理器
 ///
@@ -25,54 +35,70 @@ use crate::traits::{AgentStartConfig, SessionNotifier};
 /// - 会话创建和复用
 /// - 模型配置变化检测
 /// - 会话生命周期管理
-pub struct AcpSessionManager<N: SessionNotifier, C: Client + 'static> {
-    /// project_id -> SessionInfo 映射
-    /// 使用 Arc 包装以便传递给 launcher 进行降级时的更新
-    sessions: Arc<DashMap<String, Arc<SessionInfo>>>,
+///
+/// ## 泛型参数
+/// - `N`: SessionNotifier 实现，用于推送 SSE 消息
+/// - `C`: ACP Client 实现
+/// - `R`: SessionRegistry 实现，用于存储会话数据（通常是 AGENT_REGISTRY）
+pub struct AcpSessionManager<N: SessionNotifier, C: Client + 'static, R: SessionRegistry> {
+    /// 会话注册表（注入的 SessionRegistry）
+    registry: Arc<R>,
     /// 会话通知器
     notifier: Arc<N>,
     /// Client 类型标记（phantom data）
     _client_marker: std::marker::PhantomData<C>,
 }
 
-impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> {
+impl<N: SessionNotifier, C: Client + Default + 'static, R: SessionRegistry> AcpSessionManager<N, C, R>
+where
+    R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
+{
     /// 创建新的会话管理器
-    pub fn new(notifier: Arc<N>) -> Self {
+    ///
+    /// # 参数
+    /// - `notifier`: 会话通知器
+    /// - `registry`: 会话注册表（通常注入 AGENT_REGISTRY）
+    pub fn new(notifier: Arc<N>, registry: Arc<R>) -> Self {
         Self {
-            sessions: Arc::new(DashMap::new()),
+            registry,
             notifier,
             _client_marker: std::marker::PhantomData,
         }
     }
 
     /// 获取会话信息
-    pub fn get_session(&self, project_id: &str) -> Option<Arc<SessionInfo>> {
-        self.sessions.get(project_id).map(|r| r.clone())
+    pub fn get_session(&self, project_id: &str) -> Option<R::Entry> {
+        self.registry.get(project_id)
     }
 
     /// 检查会话是否存在
     pub fn contains_session(&self, project_id: &str) -> bool {
-        self.sessions.contains_key(project_id)
+        self.registry.contains(project_id)
     }
 
     /// 移除会话
-    pub fn remove_session(&self, project_id: &str) -> Option<Arc<SessionInfo>> {
-        self.sessions.remove(project_id).map(|(_, v)| v)
-    }
-
-    /// 插入会话信息
-    pub fn insert_session(&self, project_id: String, session_info: Arc<SessionInfo>) {
-        self.sessions.insert(project_id, session_info);
+    pub fn remove_session(&self, project_id: &str) -> Option<R::Entry> {
+        self.registry.remove(project_id)
     }
 
     /// 获取所有会话的 project_id 列表
     pub fn list_sessions(&self) -> Vec<String> {
-        self.sessions.iter().map(|r| r.key().clone()).collect()
+        self.registry.list_project_ids()
     }
 
     /// 获取会话数量
     pub fn session_count(&self) -> usize {
-        self.sessions.len()
+        self.registry.count()
+    }
+
+    /// 获取 registry 的 Arc 引用
+    pub fn registry(&self) -> Arc<R> {
+        self.registry.clone()
+    }
+
+    /// 获取 notifier 的 Arc 引用
+    pub fn notifier(&self) -> Arc<N> {
+        self.notifier.clone()
     }
 
     /// 规范化项目路径
@@ -193,7 +219,7 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
-    ) -> Result<Arc<SessionInfo>> {
+    ) -> Result<R::Entry> {
         info!("开始创建新的 Agent 会话，项目 ID: {}", project_id);
 
         // 创建启动器
@@ -210,7 +236,7 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
                 model_provider.clone(),
                 start_config.clone(),
                 client,
-                self.sessions.clone(),
+                self.registry.clone(),
             )
             .await;
 
@@ -246,7 +272,7 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
                             model_provider.clone(),
                             retry_config,
                             C::default(), // 创建新的 client 实例
-                            self.sessions.clone(),
+                            self.registry.clone(),
                         )
                         .await?
                 } else {
@@ -261,26 +287,34 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
             connection_info.session_id.0
         );
 
-        // 创建 SessionInfo
+        // 创建 ProjectAndAgentInfo
         let lifecycle_handle =
             Some(connection_info.lifecycle_guard.clone() as Arc<dyn AgentLifecycle>);
-        let session_info = Arc::new(SessionInfo::new(
-            project_id.clone(),
-            connection_info.session_id,
-            connection_info.prompt_tx,
-            connection_info.cancel_tx,
-            model_provider.clone(),
-            lifecycle_handle,
-        ));
+        let now = Utc::now();
+        let agent_info = ProjectAndAgentInfo {
+            project_id: project_id.clone(),
+            session_id: connection_info.session_id.clone(),
+            prompt_tx: connection_info.prompt_tx,
+            cancel_tx: connection_info.cancel_tx,
+            model_provider: model_provider.clone(),
+            request_id: None,
+            status: AgentStatus::Idle,
+            last_activity: now,
+            created_at: now,
+            stop_handle: lifecycle_handle,
+        };
 
-        // 存储会话信息
-        self.sessions.insert(project_id.clone(), session_info.clone());
+        // 存储会话信息到 registry
+        let session_id_str = connection_info.session_id.0.to_string();
+        self.registry
+            .insert(&project_id, &session_id_str, agent_info.clone().into());
 
         // 注意：降级处理已移至 launch() 的 spawn_local 块内
         // 通过 tokio::select! 在 LocalSet 中直接处理降级，避免跨线程问题
         // 详见 crates/agent_abstraction/src/compat/claude_code_launcher.rs
 
-        Ok(session_info)
+        // 返回刚插入的条目
+        Ok(agent_info.into())
     }
 
     /// 获取或创建会话
@@ -294,14 +328,39 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
-    ) -> Result<(Arc<SessionInfo>, bool)> {
+    ) -> Result<(R::Entry, bool)> {
         // 检查是否存在
         if let Some(existing) = self.get_session(project_id) {
+            // 🔧 关键检查：检查 channel 是否仍然有效（Agent 进程是否还在运行）
+            // 如果 prompt_tx.is_closed() 为 true，说明 rx 端已被 drop（Agent 进程已退出）
+            if existing.is_channel_closed() {
+                info!(
+                    "⚠️ 检测到会话 channel 已关闭（Agent 进程已退出），移除失效会话并重建，项目 ID: {}",
+                    project_id
+                );
+                // 移除失效会话
+                self.remove_session(project_id);
+                // 创建新会话
+                let new_session = self
+                    .create_session(
+                        project_id.to_string(),
+                        project_path,
+                        session_id_hint,
+                        model_provider,
+                        start_config,
+                        client,
+                    )
+                    .await?;
+                return Ok((new_session, true)); // true = 新创建
+            }
+
             // 检查模型配置是否变化
             if existing.is_model_config_changed(&model_provider) {
                 info!(
                     "检测到模型配置变化，重启 Agent 会话，项目 ID: {}, 旧配置: {:?}, 新配置: {:?}",
-                    project_id, existing.model_provider, model_provider
+                    project_id,
+                    existing.model_provider(),
+                    model_provider
                 );
                 // 移除旧会话
                 self.remove_session(project_id);
@@ -343,9 +402,10 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
-        let prompt_request = Self::build_text_prompt_request(prompt, session.session_id.clone())?;
+        let prompt_request =
+            Self::build_text_prompt_request(prompt, session.session_id().clone())?;
 
-        session.prompt_tx.send(prompt_request).map_err(|e| {
+        session.prompt_tx().send(prompt_request).map_err(|e| {
             error!("发送 Prompt 请求失败: {:?}", e);
             anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
         })?;
@@ -364,7 +424,7 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
-        session.prompt_tx.send(prompt_request).map_err(|e| {
+        session.prompt_tx().send(prompt_request).map_err(|e| {
             error!("发送 Prompt 请求失败: {:?}", e);
             anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
         })?;
@@ -374,12 +434,12 @@ impl<N: SessionNotifier, C: Client + Default + 'static> AcpSessionManager<N, C> 
     }
 }
 
-impl<N: SessionNotifier, C: Client + Default + 'static> std::fmt::Debug
-    for AcpSessionManager<N, C>
+impl<N: SessionNotifier, C: Client + Default + 'static, R: SessionRegistry> std::fmt::Debug
+    for AcpSessionManager<N, C, R>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpSessionManager")
-            .field("session_count", &self.sessions.len())
+            .field("session_count", &self.registry.count())
             .finish()
     }
 }

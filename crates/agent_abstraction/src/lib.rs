@@ -41,8 +41,9 @@ pub use mcp::{
 pub use process::AgentProcess;
 pub use registry::{AgentRegistry, AgentSpec};
 pub use session::{
-    AcpAgentWorker, AcpSessionManager, AgentWorker, SessionHandles, SessionInfo, WorkerRequest,
+    AcpAgentWorker, AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest,
     WorkerResponse,
 };
 pub use traits::agent::{Agent, AgentStartConfig, ProcessLaunchInfo, PromptMessage};
 pub use traits::session_notifier::{NoOpSessionNotifier, SessionNotifier};
+pub use traits::session_registry::SessionRegistry;

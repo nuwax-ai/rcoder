@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use agent_abstraction::session::AcpSessionManager;
-use agent_client_protocol::{PromptRequest, SessionId};
 use anyhow::Result;
 use chrono::Utc;
 use shared_types::ModelProviderConfig;
@@ -16,7 +15,7 @@ use tracing::{debug, error, info};
 use crate::{
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
-    service::{AGENT_REGISTRY, StateAwareNotifier},
+    service::{AgentSessionRegistry, AGENT_REGISTRY, StateAwareNotifier},
     utils::ContentBuilder,
 };
 
@@ -60,11 +59,12 @@ pub async fn agent_worker(
 
     info!("🚀 agent_worker 启动（简化版），开始监听请求...");
 
-    // 创建 AcpSessionManager
+    // 创建 AcpSessionManager，注入 AGENT_REGISTRY 作为 SessionRegistry
     let session_manager = Arc::new(
-        AcpSessionManager::<StateAwareNotifier, AcpAgentClient>::new(Arc::new(
-            StateAwareNotifier::new(),
-        )),
+        AcpSessionManager::<StateAwareNotifier, AcpAgentClient, AgentSessionRegistry>::new(
+            Arc::new(StateAwareNotifier::new()),
+            AGENT_REGISTRY.clone(),
+        ),
     );
 
     // 创建 AcpAgentWorker
