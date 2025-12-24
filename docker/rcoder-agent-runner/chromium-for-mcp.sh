@@ -46,4 +46,5 @@ exec /usr/bin/chromium \
     --no-default-browser-check \
     --password-store=basic \
     --use-mock-keychain \
+    --start-maximized \
     "$@"

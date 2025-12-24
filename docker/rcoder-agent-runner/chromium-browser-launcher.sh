@@ -33,4 +33,6 @@ exec /usr/bin/chromium-bin \
     --disable-session-crashed-bubble \
     --disable-infobars \
     --no-process-singleton-dialog \
-    --force-color-profile=srgb "$@"
+    --force-color-profile=srgb \
+    --start-maximized \
+    "$@"
