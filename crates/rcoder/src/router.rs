@@ -91,14 +91,19 @@ impl AppState {
     #[inline]
     pub fn update_session(&self, project_id: &str, session_id: &str) {
         if let Err(e) = self.projects.update_session(project_id, session_id) {
-            tracing::error!("更新会话失败: project_id={}, session_id={}, error={}", project_id, session_id, e);
+            tracing::error!(
+                "更新会话失败: project_id={}, session_id={}, error={}",
+                project_id,
+                session_id,
+                e
+            );
         }
     }
 
-    /// 更新项目活动时间
+    /// 更新项目活动时间，返回实际更新使用的时间戳
     #[inline]
-    pub fn update_activity(&self, project_id: &str) {
-        self.projects.update_activity(project_id);
+    pub fn update_activity(&self, project_id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.projects.update_activity(project_id)
     }
 
     /// 更新会话活动时间

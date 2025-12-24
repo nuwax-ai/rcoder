@@ -5,6 +5,7 @@
 //! - sessions: DashMap<String, Arc<ProjectAndContainerInfo>>
 //! - session_to_container_id: DashMap<String, String>
 
+use chrono::{DateTime, Utc};
 use duckdb_manager::{ContainerRecord, DuckDbStorage, ProjectRecord, StorageStats, UnifiedStorage};
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 use std::sync::Arc;
@@ -172,21 +173,22 @@ impl ProjectAdapter {
 
     // ========== 活动时间更新方法 ==========
 
-    /// 更新项目活动时间
-    pub fn update_activity(&self, project_id: &str) -> bool {
+    /// 更新项目活动时间，返回实际更新使用的时间戳
+    pub fn update_activity(&self, project_id: &str) -> Option<DateTime<Utc>> {
         match self.storage.update_project_activity(project_id) {
-            Ok(updated) => {
-                if updated {
-                    // 同时更新关联容器的活动时间
-                    if let Ok(Some(record)) = self.storage.get_project(project_id) {
-                        let _ = self.storage.update_container_activity(&record.container_id);
-                    }
+            Ok(Some(updated_time)) => {
+                // 使用相同的时间更新关联容器的活动时间
+                if let Ok(Some(record)) = self.storage.get_project(project_id) {
+                    let _ = self
+                        .storage
+                        .update_container_activity_with_time(&record.container_id, updated_time);
                 }
-                updated
+                Some(updated_time)
             }
+            Ok(None) => None,
             Err(e) => {
                 warn!("更新项目 {} 活动时间失败: {}", project_id, e);
-                false
+                None
             }
         }
     }

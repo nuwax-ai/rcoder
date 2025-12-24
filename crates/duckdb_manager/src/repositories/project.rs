@@ -177,23 +177,22 @@ impl ProjectRepository {
     /// 检查项目是否存在
     pub fn exists(&self, project_id: &str) -> DuckDbResult<bool> {
         self.conn.with_connection(|c| {
-            let mut stmt = c.prepare(
-                "SELECT 1 FROM projects WHERE project_id = ? LIMIT 1",
-            )?;
+            let mut stmt = c.prepare("SELECT 1 FROM projects WHERE project_id = ? LIMIT 1")?;
             let mut rows = stmt.query(params![project_id])?;
             Ok(rows.next()?.is_some())
         })
     }
 
-    /// 更新项目最后活动时间
-    pub fn update_activity(&self, project_id: &str) -> DuckDbResult<bool> {
-        let now_str = Utc::now().to_rfc3339();
+    /// 更新项目最后活动时间，返回实际更新使用的时间戳
+    pub fn update_activity(&self, project_id: &str) -> DuckDbResult<Option<DateTime<Utc>>> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
         self.conn.with_connection(|c| {
             let affected = c.execute(
                 "UPDATE projects SET last_activity = ? WHERE project_id = ?",
                 params![now_str, project_id],
             )?;
-            Ok(affected > 0)
+            Ok(if affected > 0 { Some(now) } else { None })
         })
     }
 
@@ -259,9 +258,7 @@ impl ProjectRepository {
     /// 根据会话ID获取容器ID
     pub fn get_container_id_by_session(&self, session_id: &str) -> DuckDbResult<Option<String>> {
         self.conn.with_connection(|c| {
-            let mut stmt = c.prepare(
-                "SELECT container_id FROM projects WHERE session_id = ?",
-            )?;
+            let mut stmt = c.prepare("SELECT container_id FROM projects WHERE session_id = ?")?;
             let mut rows = stmt.query(params![session_id])?;
 
             match rows.next()? {
@@ -325,7 +322,10 @@ impl ProjectRepository {
     }
 
     /// 按服务类型查找项目
-    pub fn find_by_service_type(&self, service_type: ServiceType) -> DuckDbResult<Vec<ProjectRecord>> {
+    pub fn find_by_service_type(
+        &self,
+        service_type: ServiceType,
+    ) -> DuckDbResult<Vec<ProjectRecord>> {
         let service_type_str = service_type.to_string();
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare(
@@ -356,9 +356,9 @@ impl ProjectRepository {
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare("SELECT COUNT(*) FROM projects")?;
             let mut rows = stmt.query([])?;
-            let row = rows.next()?.ok_or_else(|| {
-                DuckDbError::InternalError("无法获取项目数量".to_string())
-            })?;
+            let row = rows
+                .next()?
+                .ok_or_else(|| DuckDbError::InternalError("无法获取项目数量".to_string()))?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
         })
@@ -367,24 +367,24 @@ impl ProjectRepository {
     /// 获取活跃会话数量
     pub fn count_active_sessions(&self) -> DuckDbResult<usize> {
         self.conn.with_connection(|c| {
-            let mut stmt = c.prepare(
-                "SELECT COUNT(*) FROM projects WHERE session_id IS NOT NULL",
-            )?;
+            let mut stmt =
+                c.prepare("SELECT COUNT(*) FROM projects WHERE session_id IS NOT NULL")?;
             let mut rows = stmt.query([])?;
-            let row = rows.next()?.ok_or_else(|| {
-                DuckDbError::InternalError("无法获取会话数量".to_string())
-            })?;
+            let row = rows
+                .next()?
+                .ok_or_else(|| DuckDbError::InternalError("无法获取会话数量".to_string()))?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
         })
     }
 
     /// 按服务类型统计项目数量
-    pub fn count_by_service_type(&self) -> DuckDbResult<std::collections::HashMap<ServiceType, usize>> {
+    pub fn count_by_service_type(
+        &self,
+    ) -> DuckDbResult<std::collections::HashMap<ServiceType, usize>> {
         self.conn.with_connection(|c| {
-            let mut stmt = c.prepare(
-                "SELECT service_type, COUNT(*) FROM projects GROUP BY service_type",
-            )?;
+            let mut stmt =
+                c.prepare("SELECT service_type, COUNT(*) FROM projects GROUP BY service_type")?;
             let mut rows = stmt.query([])?;
             let mut counts = std::collections::HashMap::new();
 
@@ -423,7 +423,11 @@ impl ProjectRepository {
     }
 
     /// 更新请求ID
-    pub fn update_request_id(&self, project_id: &str, request_id: Option<&str>) -> DuckDbResult<bool> {
+    pub fn update_request_id(
+        &self,
+        project_id: &str,
+        request_id: Option<&str>,
+    ) -> DuckDbResult<bool> {
         let now_str = Utc::now().to_rfc3339();
         self.conn.with_connection(|c| {
             let affected = c.execute(
@@ -457,7 +461,8 @@ impl ProjectRepository {
         let session_created_at = Self::get_optional_timestamp_from_row(row, 11)?;
         let session_last_activity = Self::get_optional_timestamp_from_row(row, 12)?;
 
-        let service_type = service_type_str.parse::<ServiceType>()
+        let service_type = service_type_str
+            .parse::<ServiceType>()
             .map_err(|e| DuckDbError::InternalError(format!("解析服务类型失败: {}", e)))?;
 
         Ok(ProjectRecord {
@@ -500,7 +505,10 @@ impl ProjectRepository {
     }
 
     /// 从行中获取可选时间戳
-    fn get_optional_timestamp_from_row(row: &duckdb::Row<'_>, idx: usize) -> DuckDbResult<Option<DateTime<Utc>>> {
+    fn get_optional_timestamp_from_row(
+        row: &duckdb::Row<'_>,
+        idx: usize,
+    ) -> DuckDbResult<Option<DateTime<Utc>>> {
         use duckdb::types::ValueRef;
 
         let value_ref = row.get_ref(idx)?;
@@ -509,7 +517,9 @@ impl ProjectRepository {
             ValueRef::Timestamp(_, micros) => {
                 let secs = micros / 1_000_000;
                 let nsecs = ((micros % 1_000_000) * 1000) as u32;
-                Ok(Some(DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now)))
+                Ok(Some(
+                    DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now),
+                ))
             }
             ValueRef::Text(bytes) => {
                 let s = std::str::from_utf8(bytes)

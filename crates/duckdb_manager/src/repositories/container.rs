@@ -88,9 +88,7 @@ impl ContainerRepository {
     /// 检查容器是否存在
     pub fn exists(&self, container_id: &str) -> DuckDbResult<bool> {
         self.conn.with_connection(|c| {
-            let mut stmt = c.prepare(
-                "SELECT 1 FROM containers WHERE container_id = ? LIMIT 1",
-            )?;
+            let mut stmt = c.prepare("SELECT 1 FROM containers WHERE container_id = ? LIMIT 1")?;
             let mut rows = stmt.query(params![container_id])?;
             Ok(rows.next()?.is_some())
         })
@@ -103,6 +101,22 @@ impl ContainerRepository {
             let affected = c.execute(
                 "UPDATE containers SET last_activity = ? WHERE container_id = ?",
                 params![now_str, container_id],
+            )?;
+            Ok(affected > 0)
+        })
+    }
+
+    /// 使用指定时间更新容器最后活动时间（用于保持项目和容器时间一致）
+    pub fn update_activity_with_time(
+        &self,
+        container_id: &str,
+        time: DateTime<Utc>,
+    ) -> DuckDbResult<bool> {
+        let time_str = time.to_rfc3339();
+        self.conn.with_connection(|c| {
+            let affected = c.execute(
+                "UPDATE containers SET last_activity = ? WHERE container_id = ?",
+                params![time_str, container_id],
             )?;
             Ok(affected > 0)
         })
@@ -145,7 +159,10 @@ impl ContainerRepository {
     }
 
     /// 按服务类型查找容器
-    pub fn find_by_service_type(&self, service_type: ServiceType) -> DuckDbResult<Vec<ContainerRecord>> {
+    pub fn find_by_service_type(
+        &self,
+        service_type: ServiceType,
+    ) -> DuckDbResult<Vec<ContainerRecord>> {
         let service_type_str = service_type.to_string();
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare(
@@ -198,7 +215,8 @@ impl ContainerRepository {
                 let service_type_str: String = row.get(2)?;
                 let idle_mins: i64 = row.get(3)?;
 
-                let service_type = service_type_str.parse::<ServiceType>()
+                let service_type = service_type_str
+                    .parse::<ServiceType>()
                     .map_err(|e| DuckDbError::InternalError(format!("解析服务类型失败: {}", e)))?;
 
                 results.push(IdleContainerInfo {
@@ -217,7 +235,10 @@ impl ContainerRepository {
     /// 查找孤立容器（存在于 Docker 但不在数据库中）
     ///
     /// 此方法用于与外部容器列表进行比对
-    pub fn find_orphan_containers(&self, docker_container_ids: &[String]) -> DuckDbResult<Vec<String>> {
+    pub fn find_orphan_containers(
+        &self,
+        docker_container_ids: &[String],
+    ) -> DuckDbResult<Vec<String>> {
         if docker_container_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -249,20 +270,21 @@ impl ContainerRepository {
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare("SELECT COUNT(*) FROM containers")?;
             let mut rows = stmt.query([])?;
-            let row = rows.next()?.ok_or_else(|| {
-                DuckDbError::InternalError("无法获取容器数量".to_string())
-            })?;
+            let row = rows
+                .next()?
+                .ok_or_else(|| DuckDbError::InternalError("无法获取容器数量".to_string()))?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
         })
     }
 
     /// 按服务类型统计容器数量
-    pub fn count_by_service_type(&self) -> DuckDbResult<std::collections::HashMap<ServiceType, usize>> {
+    pub fn count_by_service_type(
+        &self,
+    ) -> DuckDbResult<std::collections::HashMap<ServiceType, usize>> {
         self.conn.with_connection(|c| {
-            let mut stmt = c.prepare(
-                "SELECT service_type, COUNT(*) FROM containers GROUP BY service_type",
-            )?;
+            let mut stmt =
+                c.prepare("SELECT service_type, COUNT(*) FROM containers GROUP BY service_type")?;
             let mut rows = stmt.query([])?;
             let mut counts = std::collections::HashMap::new();
 
@@ -294,7 +316,8 @@ impl ContainerRepository {
         let created_at = Self::get_timestamp_from_row(row, 8)?;
         let last_activity = Self::get_timestamp_from_row(row, 9)?;
 
-        let service_type = service_type_str.parse::<ServiceType>()
+        let service_type = service_type_str
+            .parse::<ServiceType>()
             .map_err(|e| DuckDbError::InternalError(format!("解析服务类型失败: {}", e)))?;
 
         Ok(ContainerRecord {
