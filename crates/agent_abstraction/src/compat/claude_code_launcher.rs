@@ -14,8 +14,7 @@ use agent_client_protocol::{
 };
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
-use dashmap::DashMap;
-use shared_types::{AgentLifecycle, ModelProviderConfig};
+use shared_types::{AgentLifecycle, ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -23,9 +22,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::acp::CancelNotificationRequestWrapper;
-use crate::session::SessionInfo;
 use crate::traits::AgentStartConfig;
 use crate::traits::session_notifier::SessionNotifier;
+use crate::traits::session_registry::SessionRegistry;
 
 // 导入生命周期管理
 use super::agent_lifecycle::AgentLifecycleGuard;
@@ -265,20 +264,16 @@ pub fn convert_context_servers(configs: &HashMap<String, ContextServerConfig>) -
 ///
 /// # 类型参数
 /// - `N`: SessionNotifier 实现，用于推送 SSE 消息
-/// - `C`: Client 实现，用于处理 ACP 协议回调
-pub struct ClaudeCodeLauncher<N: SessionNotifier, C: Client + 'static> {
+pub struct ClaudeCodeLauncher<N: SessionNotifier> {
     /// 会话通知器
     notifier: Arc<N>,
-    /// Client 类型标记
-    _client_marker: std::marker::PhantomData<C>,
 }
 
-impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C> {
+impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
     /// 创建新的启动器
     pub fn new(notifier: Arc<N>) -> Self {
         Self {
             notifier,
-            _client_marker: std::marker::PhantomData,
         }
     }
 
@@ -290,24 +285,27 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
     /// - `model_provider`: 模型提供商配置
     /// - `start_config`: Agent 启动配置（包含系统提示词、resume_session_id 等）
     /// - `client`: ACP 客户端实现
-    /// - `sessions`: 会话映射（用于降级时更新）
+    /// - `registry`: 会话注册表（用于降级时更新）
     ///
     /// # Resume 机制
     /// 如果需要恢复会话，通过 `start_config.resume_session_id` 传递 session_id，
     /// 会自动构建 `_meta.claudeCode.options.resume` 结构传递给 Agent。
-    /// 当 resume 失败时，会在 Prompt 处理器内部自动降级并更新 sessions 映射。
+    /// 当 resume 失败时，会在 Prompt 处理器内部自动降级并更新 registry。
     ///
     /// # 返回值
     /// 返回 LauncherConnectionInfoComplete，包含会话信息和生命周期守卫
-    pub async fn launch(
+    pub async fn launch<C: Client + 'static, R: SessionRegistry + 'static>(
         &self,
         project_id: String,
         project_path: PathBuf,
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
-        sessions: Arc<DashMap<String, Arc<SessionInfo>>>,
-    ) -> Result<LauncherConnectionInfoComplete> {
+        registry: Arc<R>,
+    ) -> Result<LauncherConnectionInfoComplete>
+    where
+        R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
+    {
         // 从配置加载 Agent 参数（传递 service_type）
         let agent_config = load_agent_config(model_provider.as_ref(), &start_config.service_type).await?;
         let command_path = &agent_config.command;
@@ -400,7 +398,7 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
         let client_conn = Arc::new(client_conn);
 
         // 克隆用于 Prompt 处理器的降级配置
-        let sessions_for_handler = sessions.clone();
+        let registry_for_handler = registry.clone();
         let cancel_tx_for_handler = cancel_tx.clone();
         let model_provider_for_handler = model_provider.clone();
 
@@ -499,7 +497,7 @@ impl<N: SessionNotifier + 'static, C: Client + 'static> ClaudeCodeLauncher<N, C>
                             is_resume_session,
                             project_path: project_path_for_closure.clone(),
                             mcp_servers: mcp_servers.clone(),
-                            sessions: sessions_for_handler,
+                            registry: registry_for_handler,
                             cancel_tx: cancel_tx_for_handler,
                             lifecycle_handle: lifecycle_handle_for_handler,
                             model_provider: model_provider_for_handler,

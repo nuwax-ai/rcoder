@@ -3,34 +3,34 @@
 //! 提供代理通信所需的通道处理工具函数
 
 use crate::acp::{CancelNotificationRequestWrapper, CancelResult};
-use crate::session::SessionInfo;
-use crate::traits::SessionNotifier;
+use crate::traits::{SessionNotifier, SessionRegistry};
 use agent_client_protocol::{
     Agent, ClientSideConnection, McpServer, NewSessionRequest, PromptRequest, SessionId,
 };
-use dashmap::DashMap;
-use shared_types::{AgentLifecycle, ModelProviderConfig};
+use chrono::Utc;
+use shared_types::{AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Prompt 处理器配置
-#[derive(Clone)]
-pub struct PromptHandlerConfig<N: SessionNotifier> {
+///
+/// 使用泛型 `R: SessionRegistry` 替代直接依赖 DashMap，支持依赖注入
+pub struct PromptHandlerConfig<N: SessionNotifier, R: SessionRegistry> {
     /// 是否是 resume 会话
     pub is_resume_session: bool,
     /// 项目路径（用于降级时创建新会话）
     pub project_path: PathBuf,
     /// MCP 服务器配置（用于降级时创建新会话）
     pub mcp_servers: Vec<McpServer>,
-    /// 会话映射（用于降级时更新）
-    pub sessions: Arc<DashMap<String, Arc<SessionInfo>>>,
-    /// Cancel 通道（用于降级时创建新 SessionInfo）
+    /// 会话注册表（用于降级时更新）
+    pub registry: Arc<R>,
+    /// Cancel 通道（用于降级时创建新会话条目）
     pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
-    /// 生命周期句柄（用于降级时创建新 SessionInfo）
+    /// 生命周期句柄（用于降级时创建新会话条目）
     pub lifecycle_handle: Option<Arc<dyn AgentLifecycle>>,
-    /// 模型配置（用于降级时创建新 SessionInfo）
+    /// 模型配置（用于降级时创建新会话条目）
     pub model_provider: Option<ModelProviderConfig>,
     /// 通知器
     pub notifier: Arc<N>,
@@ -102,16 +102,18 @@ pub fn spawn_cancel_handler_for_agent(
 /// # 降级机制
 /// 当 resume 会话的首次 Prompt 失败时，会在内部完成降级：
 /// 1. 创建新会话（不带 resume）
-/// 2. 更新 sessions 映射
+/// 2. 更新 registry 中的会话信息
 /// 3. 重试 Prompt
 /// 4. 继续处理后续 Prompt
-pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static>(
+pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRegistry + 'static>(
     client_conn: Arc<ClientSideConnection>,
     mut prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
     session_id: SessionId,
     project_id: &str,
-    config: PromptHandlerConfig<N>,
-) {
+    config: PromptHandlerConfig<N, R>,
+) where
+    R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
+{
     let project_id = project_id.to_string();
     let mut current_session_id = session_id;
     let mut session_id_str = current_session_id.0.clone();
@@ -120,7 +122,7 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static>(
     let is_resume_session = config.is_resume_session;
     let project_path = config.project_path;
     let mcp_servers = config.mcp_servers;
-    let sessions = config.sessions;
+    let registry = config.registry;
     let cancel_tx = config.cancel_tx;
     let lifecycle_handle = config.lifecycle_handle;
     let model_provider = config.model_provider;
@@ -225,7 +227,7 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static>(
                             &project_id,
                             &project_path,
                             &mcp_servers,
-                            &sessions,
+                            &registry,
                             &cancel_tx,
                             lifecycle_handle.clone(),
                             model_provider.clone(),
@@ -307,21 +309,24 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static>(
 ///
 /// 在 Prompt 处理器内部完成降级：
 /// 1. 创建新会话（不带 resume）
-/// 2. 更新 sessions 映射
+/// 2. 更新 registry 中的会话信息
 /// 3. 重试 Prompt
-async fn handle_fallback_internal<N: SessionNotifier>(
+async fn handle_fallback_internal<N: SessionNotifier, R: SessionRegistry>(
     client_conn: &Arc<ClientSideConnection>,
     project_id: &str,
     project_path: &PathBuf,
     mcp_servers: &[McpServer],
-    sessions: &Arc<DashMap<String, Arc<SessionInfo>>>,
+    registry: &Arc<R>,
     cancel_tx: &mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
     lifecycle_handle: Option<Arc<dyn AgentLifecycle>>,
     model_provider: Option<ModelProviderConfig>,
     notifier: &Arc<N>,
     failed_prompt: PromptRequest,
     request_id: Option<String>,
-) -> anyhow::Result<SessionId> {
+) -> anyhow::Result<SessionId>
+where
+    R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
+{
     info!("⚠️ 项目[{}] 开始 Resume 降级重建", project_id);
 
     // 1. 创建新会话（不带 resume meta）
@@ -342,18 +347,26 @@ async fn handle_fallback_internal<N: SessionNotifier>(
     // 2. 创建新的 prompt channel（因为原来的 rx 在当前任务中）
     let (new_prompt_tx, _new_prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
 
-    // 3. 更新 sessions 映射
-    let new_session_info = Arc::new(SessionInfo::new(
-        project_id.to_string(),
-        new_session_id.clone(),
-        new_prompt_tx,
-        cancel_tx.clone(),
+    // 3. 创建 ProjectAndAgentInfo 并更新 registry
+    let now = Utc::now();
+    let new_agent_info = ProjectAndAgentInfo {
+        project_id: project_id.to_string(),
+        session_id: new_session_id.clone(),
+        prompt_tx: new_prompt_tx,
+        cancel_tx: cancel_tx.clone(),
         model_provider,
-        lifecycle_handle,
-    ));
-    sessions.insert(project_id.to_string(), new_session_info);
+        request_id: None,
+        status: AgentStatus::Idle,
+        last_activity: now,
+        created_at: now,
+        stop_handle: lifecycle_handle,
+    };
+
+    // 通过 registry 更新会话信息
+    let session_id_str_for_registry = new_session_id.0.to_string();
+    registry.insert(project_id, &session_id_str_for_registry, new_agent_info.into());
     info!(
-        "✅ 项目[{}] 已更新 sessions 映射，新 session_id: {}",
+        "✅ 项目[{}] 已更新 registry，新 session_id: {}",
         project_id, new_session_id.0
     );
 

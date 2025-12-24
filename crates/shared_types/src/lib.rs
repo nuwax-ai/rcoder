@@ -57,6 +57,8 @@ pub use model::{
     ModelProviderSafeInfo,
     ProjectAndAgentInfo,
     ProjectAndContainerInfo,
+    // Session trait
+    SessionEntry,
     SessionMessageType,
     SessionNotify,
     SessionPromptEnd,

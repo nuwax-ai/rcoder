@@ -3,16 +3,17 @@
 //! 统一管理 project_id、session_id 和 AgentInfo 之间的映射关系
 //! 所有映射操作都通过此结构体的方法进行，确保数据一致性
 
+use agent_abstraction::traits::SessionRegistry;
 use dashmap::DashMap;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
 use shared_types::ProjectAndAgentInfo;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
 
-/// 全局 Agent 会话注册表
-pub static AGENT_REGISTRY: LazyLock<AgentSessionRegistry> =
-    LazyLock::new(AgentSessionRegistry::new);
+/// 全局 Agent 会话注册表（Arc 包装版本，用于 AcpSessionManager 注入）
+pub static AGENT_REGISTRY: LazyLock<Arc<AgentSessionRegistry>> =
+    LazyLock::new(|| Arc::new(AgentSessionRegistry::new()));
 
 /// 注册表统计信息
 #[derive(Debug, Clone)]
@@ -279,6 +280,38 @@ impl AgentSessionRegistry {
             agent_count: self.agent_info_map.len(),
             session_count: self.project_to_session.len(),
         }
+    }
+}
+
+// ============================================================================
+// 实现 SessionRegistry trait（用于 AcpSessionManager 依赖注入）
+// ============================================================================
+
+impl SessionRegistry for AgentSessionRegistry {
+    type Entry = ProjectAndAgentInfo;
+
+    fn get(&self, project_id: &str) -> Option<Self::Entry> {
+        self.agent_info_map.get(project_id).map(|r| r.clone())
+    }
+
+    fn insert(&self, project_id: &str, session_id: &str, entry: Self::Entry) {
+        self.register(project_id, session_id, entry);
+    }
+
+    fn remove(&self, project_id: &str) -> Option<Self::Entry> {
+        self.remove_by_project(project_id)
+    }
+
+    fn contains(&self, project_id: &str) -> bool {
+        self.contains_project(project_id)
+    }
+
+    fn list_project_ids(&self) -> Vec<String> {
+        self.all_project_ids()
+    }
+
+    fn count(&self) -> usize {
+        self.agent_info_map.len()
     }
 }
 
