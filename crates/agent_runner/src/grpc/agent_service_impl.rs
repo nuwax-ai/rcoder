@@ -899,9 +899,17 @@ impl AgentService for AgentServiceImpl {
             project_id, force, reason
         );
 
-        // 检查 Agent 是否存在
-        let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
-            Some(info) => info,
+        // 检查 Agent 是否存在，并提取需要的数据后立即释放读锁
+        // ⚠️ 重要：必须在任何 .await 之前 drop 掉 Ref，否则会导致死锁
+        let (agent_status, session_id, cancel_tx) = match AGENT_REGISTRY.get_agent_info(&project_id)
+        {
+            Some(info) => {
+                let status = info.status.clone();
+                let session_id = info.session_id.to_string();
+                let cancel_tx = info.cancel_tx.clone();
+                // info（Ref）在这里被 drop，释放读锁
+                (status, session_id, cancel_tx)
+            }
             None => {
                 info!("📭 [gRPC] Agent 不存在: project_id={}", project_id);
                 return Ok(Response::new(StopAgentResponse {
@@ -914,11 +922,10 @@ impl AgentService for AgentServiceImpl {
         };
 
         // 如果 Agent 已经在 Terminating 状态，返回 already_stopped
-        if agent_info.status == AgentStatus::Terminating {
+        if agent_status == AgentStatus::Terminating {
             info!("ℹ️ [gRPC] Agent 已经在停止中: project_id={}", project_id);
 
             // 🆕 即使已在停止中，也要发送 SessionPromptEnd 确保前端收到结束消息
-            let session_id = agent_info.session_id.to_string();
             if !session_id.is_empty() {
                 use crate::service::push_session_update_with_project;
                 use agent_client_protocol::StopReason;
@@ -951,11 +958,8 @@ impl AgentService for AgentServiceImpl {
             }));
         }
 
-        // 获取当前 session_id（如果有活动会话）
-        let session_id = agent_info.session_id.to_string();
-
         // 如果 force=true 或者 Agent 处于 Idle 状态，直接停止
-        if force || agent_info.status == AgentStatus::Idle {
+        if force || agent_status == AgentStatus::Idle {
             info!(
                 "🔥 [gRPC] 强制停止或 Idle 状态，直接清理: project_id={}",
                 project_id
@@ -1070,7 +1074,7 @@ impl AgentService for AgentServiceImpl {
         }
 
         // 如果 force=false 且 Agent 正在执行任务（Active），需要先取消会话
-        if agent_info.status == AgentStatus::Active {
+        if agent_status == AgentStatus::Active {
             info!(
                 "📡 [gRPC] Agent 正在执行任务，先取消会话: project_id={}, session_id={}",
                 project_id, session_id
@@ -1087,8 +1091,8 @@ impl AgentService for AgentServiceImpl {
                 result_tx,
             };
 
-            // 发送取消通知
-            if let Err(e) = agent_info.cancel_tx.send(cancel_request) {
+            // 发送取消通知（使用之前提取的 cancel_tx）
+            if let Err(e) = cancel_tx.send(cancel_request) {
                 error!(
                     "❌ [gRPC] 发送取消通知失败: project_id={}, error={}",
                     project_id, e
