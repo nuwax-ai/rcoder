@@ -10,6 +10,7 @@ mod router;
 mod service;
 pub mod storage;
 mod utils;
+pub mod vnc;
 
 // 重新导出主要的类型和函数
 pub use proxy_agent::*;

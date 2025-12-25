@@ -510,7 +510,24 @@ impl AgentService for AgentServiceImpl {
                     loop {
                         tokio::select! {
                             _ = cancellation_token.cancelled() => {
-                                debug!("📡 [gRPC] Session 连接被取消: {}", session_id_clone);
+                                info!("📡 [gRPC] Session 连接被取消，发送 SessionPromptEnd: session_id={}", session_id_clone);
+
+                                // ✅ 在断开连接之前，主动发送 SessionPromptEnd 消息
+                                use agent_client_protocol::StopReason;
+                                use shared_types::{SessionNotify, SessionPromptEnd};
+
+                                let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                                    session_id: session_id_clone.clone(),
+                                    stop_reason: StopReason::Cancelled,
+                                    error_message: Some("用户主动取消任务".to_string()),
+                                    request_id: None,
+                                });
+                                let unified_message = notify.to_unified_message();
+                                let end_event = unified_message_to_progress_event(&unified_message);
+
+                                // 发送结束事件（忽略错误，因为客户端可能已经断开）
+                                let _ = tx.send(Ok(end_event)).await;
+
                                 break;
                             }
                             msg = message_rx.recv() => {
@@ -743,6 +760,7 @@ impl AgentService for AgentServiceImpl {
                         message: Some("取消成功".to_string()),
                     }))
                 } else {
+                    // 取消失败，Agent 可能还在运行，不发送 SessionPromptEnd
                     Ok(Response::new(CancelResponse {
                         success: false,
                         result: CancelResultType::CancelResultFailed as i32,
@@ -755,6 +773,30 @@ impl AgentService for AgentServiceImpl {
                     "❌ [gRPC] 等待 Agent 取消响应通道关闭: session_id={}, error={:?}",
                     actual_session_id, e
                 );
+
+                // 通道关闭说明 Agent 处理线程已崩溃或退出，发送 SessionPromptEnd
+                use crate::service::push_session_update_with_project;
+                use agent_client_protocol::StopReason;
+                use shared_types::{SessionNotify, SessionPromptEnd};
+
+                let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                    session_id: actual_session_id.clone(),
+                    stop_reason: StopReason::Cancelled,
+                    error_message: Some(format!("Agent 响应通道关闭: {}", e)),
+                    request_id: None,
+                });
+
+                if let Err(notify_err) =
+                    push_session_update_with_project(&project_id, &actual_session_id, notify).await
+                {
+                    warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", notify_err);
+                }
+
+                // 清理连接
+                if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
+                    session_data.close_current_connection();
+                }
+
                 Ok(Response::new(CancelResponse {
                     success: false,
                     result: CancelResultType::CancelResultFailed as i32,
@@ -874,6 +916,33 @@ impl AgentService for AgentServiceImpl {
         // 如果 Agent 已经在 Terminating 状态，返回 already_stopped
         if agent_info.status == AgentStatus::Terminating {
             info!("ℹ️ [gRPC] Agent 已经在停止中: project_id={}", project_id);
+
+            // 🆕 即使已在停止中，也要发送 SessionPromptEnd 确保前端收到结束消息
+            let session_id = agent_info.session_id.to_string();
+            if !session_id.is_empty() {
+                use crate::service::push_session_update_with_project;
+                use agent_client_protocol::StopReason;
+                use shared_types::{SessionNotify, SessionPromptEnd};
+
+                let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                    session_id: session_id.clone(),
+                    stop_reason: StopReason::Cancelled,
+                    error_message: Some("Agent 已在停止中".to_string()),
+                    request_id: None,
+                });
+
+                if let Err(e) =
+                    push_session_update_with_project(&project_id, &session_id, notify).await
+                {
+                    warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                }
+
+                // 清理连接
+                if let Some(session_data) = SESSION_CACHE.get(&session_id) {
+                    session_data.close_current_connection();
+                }
+            }
+
             return Ok(Response::new(StopAgentResponse {
                 success: true,
                 result: "already_stopped".to_string(),
@@ -1144,6 +1213,9 @@ impl AgentService for AgentServiceImpl {
                             "⚠️ [gRPC] 会话取消失败，Agent 停止失败: project_id={}",
                             project_id
                         );
+
+                        // ⚠️ 取消失败，Agent 可能还在运行，不发送 SessionPromptEnd
+
                         return Ok(Response::new(StopAgentResponse {
                             success: false,
                             result: "error".to_string(),
@@ -1157,6 +1229,32 @@ impl AgentService for AgentServiceImpl {
                         "❌ [gRPC] 等待取消响应通道关闭: project_id={}, error={:?}",
                         project_id, e
                     );
+
+                    // 通道关闭说明 Agent 处理线程已崩溃或退出，发送 SessionPromptEnd
+                    {
+                        use crate::service::push_session_update_with_project;
+                        use agent_client_protocol::StopReason;
+                        use shared_types::{SessionNotify, SessionPromptEnd};
+
+                        let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                            session_id: session_id.clone(),
+                            stop_reason: StopReason::Cancelled,
+                            error_message: Some(format!("Agent 响应通道关闭: {}", e)),
+                            request_id: None,
+                        });
+
+                        if let Err(notify_err) =
+                            push_session_update_with_project(&project_id, &session_id, notify).await
+                        {
+                            warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", notify_err);
+                        }
+
+                        // 清理连接
+                        if let Some(session_data) = SESSION_CACHE.get(&session_id) {
+                            session_data.close_current_connection();
+                        }
+                    }
+
                     return Ok(Response::new(StopAgentResponse {
                         success: false,
                         result: "error".to_string(),
@@ -1166,6 +1264,9 @@ impl AgentService for AgentServiceImpl {
                 }
                 Err(_) => {
                     warn!("⏰ [gRPC] 等待取消响应超时: project_id={}", project_id);
+
+                    // ⚠️ 超时但 Agent 可能还在运行，不发送 SessionPromptEnd
+
                     return Ok(Response::new(StopAgentResponse {
                         success: false,
                         result: "error".to_string(),

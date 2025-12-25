@@ -282,6 +282,8 @@ impl DockerManager {
             container_id: container_id.clone(),
             container_name: container_name.clone(),
             project_id: config.project_id.clone(),
+            user_id: None,      // 将由调用方在 start_agent_container 中设置
+            service_type: None, // 将由调用方在 start_agent_container 中设置
             image: config.image.clone(),
             status: ContainerStatus::Running,
             created_at: Utc::now(),
@@ -454,6 +456,8 @@ impl DockerManager {
                                 container_id,
                                 container_name: clean_name.to_string(),
                                 project_id: "unknown".to_string(), // 我们无法直接知道 project_id
+                                user_id: None,
+                                service_type: None,
                                 image: container.image.unwrap_or_default(),
                                 status: ContainerStatus::Unknown(
                                     "found_via_docker_api".to_string(),
@@ -798,6 +802,16 @@ impl DockerManager {
             .map_err(|e| DockerError::ContainerCreationError(e.to_string()))?;
 
         self.create_container(config).await?;
+
+        // 🆕 更新容器映射中的 user_id 和 service_type
+        if let Some(mut entry) = self.containers.get_mut(container_id) {
+            entry.user_id = user_id.map(|s| s.to_string());
+            entry.service_type = Some(service_type.clone());
+            debug!(
+                "📝 [DOCKER_MGR] 更新容器元数据: container_id={}, user_id={:?}, service_type={:?}",
+                container_id, entry.user_id, entry.service_type
+            );
+        }
 
         // 5. 等待就绪并返回信息
         let info = self.get_agent_info(container_id).await?.ok_or_else(|| {

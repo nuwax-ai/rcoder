@@ -197,3 +197,6 @@ matchit = "0.9"
 structopt = "0.3"
 
 bollard = { version = "0.19" }
+
+# Cache library
+moka = { version = "0.12", features = ["future"] }

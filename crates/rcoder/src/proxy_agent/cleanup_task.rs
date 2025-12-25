@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::AgentStatus;
 use crate::router::AppState;
-use shared_types::grpc::GetContainerStatusRequest;
 use shared_types::ProjectAndContainerInfo;
+use shared_types::grpc::GetContainerStatusRequest;
 
 /// 🆕 Agent信息访问trait，用于统一不同类型的agent信息访问接口
 trait AgentInfoAccess {
@@ -858,30 +858,52 @@ impl AgentCleaner {
         let cleanup_result = tokio::time::timeout(
             Duration::from_secs(60), // 60秒总超时
             async {
-                info!("📋 [cleanup_agent_raii] 步骤1: 开始销毁Docker容器: {}", project_id);
+                info!(
+                    "📋 [cleanup_agent_raii] 步骤1: 开始销毁Docker容器: {}",
+                    project_id
+                );
 
                 // 首先销毁Docker容器（如果存在）
                 if let Err(e) = self.destroy_docker_container(project_id).await {
-                    warn!("⚠️ [cleanup_agent_raii] 销毁Docker容器失败: {} - {}", project_id, e);
+                    warn!(
+                        "⚠️ [cleanup_agent_raii] 销毁Docker容器失败: {} - {}",
+                        project_id, e
+                    );
                 } else {
                     info!("✅ [cleanup_agent_raii] Docker容器销毁完成: {}", project_id);
                 }
 
-                info!("📋 [cleanup_agent_raii] 步骤2: 开始清理存储映射: {}", project_id);
+                info!(
+                    "📋 [cleanup_agent_raii] 步骤2: 开始清理存储映射: {}",
+                    project_id
+                );
 
                 // 🔒 使用 DuckDB 存储进行清理
-                info!("🔍 [cleanup_agent_raii] 尝试从存储中移除agent: {}", project_id);
+                info!(
+                    "🔍 [cleanup_agent_raii] 尝试从存储中移除agent: {}",
+                    project_id
+                );
 
                 // 获取 session_id 用于后续清理（如果有的话）
-                let session_id_to_remove = if let Some(agent_info) = self.state.get_project(project_id) {
-                    info!("✅ [cleanup_agent_raii] 找到agent，提取session_id: {}", project_id);
-                    let session_id = agent_info.session_id().map(|s| s.to_string());
-                    info!("📝 [cleanup_agent_raii] 提取session_id: {:?}, project_id: {}", session_id, project_id);
-                    session_id
-                } else {
-                    info!("📭 [cleanup_agent_raii] Agent不存在于存储中，无需清理: {}", project_id);
-                    return Ok(());
-                };
+                let session_id_to_remove =
+                    if let Some(agent_info) = self.state.get_project(project_id) {
+                        info!(
+                            "✅ [cleanup_agent_raii] 找到agent，提取session_id: {}",
+                            project_id
+                        );
+                        let session_id = agent_info.session_id().map(|s| s.to_string());
+                        info!(
+                            "📝 [cleanup_agent_raii] 提取session_id: {:?}, project_id: {}",
+                            session_id, project_id
+                        );
+                        session_id
+                    } else {
+                        info!(
+                            "📭 [cleanup_agent_raii] Agent不存在于存储中，无需清理: {}",
+                            project_id
+                        );
+                        return Ok(());
+                    };
 
                 // 从 DuckDB 存储中移除项目（这会同时清理 session 关联）
                 if let Some(removed_info) = self.state.remove_project(project_id) {
@@ -891,7 +913,10 @@ impl AgentCleaner {
                         removed_info.session_id()
                     );
                 } else {
-                    info!("📭 [cleanup_agent_raii] Agent已被其他线程移除: {}", project_id);
+                    info!(
+                        "📭 [cleanup_agent_raii] Agent已被其他线程移除: {}",
+                        project_id
+                    );
                 }
 
                 // 注意：使用 DuckDB 后，session 数据已合并到 projects 表
@@ -906,8 +931,9 @@ impl AgentCleaner {
                 info!("✅ [cleanup_agent_raii] 存储清理完成: {}", project_id);
                 info!("🎯 [cleanup_agent_raii] 所有清理步骤完成: {}", project_id);
                 Ok::<(), anyhow::Error>(())
-            }
-        ).await;
+            },
+        )
+        .await;
 
         match cleanup_result {
             Ok(Ok(())) => {
@@ -936,8 +962,11 @@ impl AgentCleaner {
     /// 使用统一的运行时清理策略
     /// 🚀 重构：使用 DockerManager 的高级 API，移除底层查找和解析逻辑
     /// 🆕 支持 ComputerAgentRunner 容器的 VNC 后端清理
-    async fn destroy_docker_container(&self, project_id: &str) -> Result<()> {
-        info!("🔥 [cleanup] 开始销毁Docker容器: project_id={}", project_id);
+    ///
+    /// # 参数
+    /// * `lookup_key` - 容器查找键（RCoder 模式为 project_id，ComputerAgentRunner 模式为 user_id）
+    async fn destroy_docker_container(&self, lookup_key: &str) -> Result<()> {
+        info!("🔥 [cleanup] 开始销毁Docker容器: lookup_key={}", lookup_key);
 
         // 使用全局 DockerManager
         let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -945,7 +974,7 @@ impl AgentCleaner {
             .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
 
         // 获取 ServiceType，如果未找到则默认为 RCoder（使用 DuckDB 存储）
-        let service_type = if let Some(info) = self.state.get_project(project_id) {
+        let service_type = if let Some(info) = self.state.get_project(lookup_key) {
             info.service_type()
                 .unwrap_or(shared_types::ServiceType::RCoder)
         } else {
@@ -954,12 +983,12 @@ impl AgentCleaner {
 
         // 1. 查找容器 (使用新 API)
         if let Some(container_info) = docker_manager
-            .find_agent_container(project_id, &service_type)
+            .find_agent_container(lookup_key, &service_type)
             .await
         {
             info!(
-                "🎯 [cleanup] 找到容器: project_id={}, container_id={}",
-                project_id, container_info.container_id
+                "🎯 [cleanup] 找到容器: lookup_key={}, container_id={}",
+                lookup_key, container_info.container_id
             );
 
             // 2. 获取连接信息 (使用新 API)
@@ -976,12 +1005,12 @@ impl AgentCleaner {
                     } else {
                         warn!(
                             "⚠️ [gRPC Cleanup] 无法获取容器 IP，无法从连接池中清理: {}",
-                            project_id
+                            lookup_key
                         );
                     }
                 }
                 Err(e) => {
-                    warn!("⚠️ [cleanup] 获取容器连接信息失败: {} - {}", project_id, e);
+                    warn!("⚠️ [cleanup] 获取容器连接信息失败: {} - {}", lookup_key, e);
                 }
             }
 
@@ -994,24 +1023,26 @@ impl AgentCleaner {
             .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
 
             // 🆕 5. 对于 ComputerAgentRunner 容器，清理 Pingora VNC 后端映射
+            // lookup_key 在 ComputerAgentRunner 模式下就是 user_id
             if service_type == shared_types::ServiceType::ComputerAgentRunner {
                 if let Some(ref pingora_service) = self.state.pingora_service {
-                    // 对于 ComputerAgentRunner，project_id 实际上是 user_id
-                    let user_id = project_id;
-                    if let Some(removed_ip) = pingora_service.remove_vnc_backend(user_id) {
+                    if let Some(removed_ip) = pingora_service.remove_vnc_backend(lookup_key) {
                         info!(
                             "🧹 [VNC] 已清理 VNC 后端映射: user_id={} -> {}",
-                            user_id, removed_ip
+                            lookup_key, removed_ip
                         );
                     } else {
-                        debug!("📭 [VNC] VNC 后端映射不存在，跳过清理: user_id={}", user_id);
+                        debug!(
+                            "📭 [VNC] VNC 后端映射不存在，跳过清理: user_id={}",
+                            lookup_key
+                        );
                     }
                 }
             }
 
-            info!("✅ [cleanup] Docker容器销毁完成: project_id={}", project_id);
+            info!("✅ [cleanup] Docker容器销毁完成: lookup_key={}", lookup_key);
         } else {
-            info!("📭 [cleanup] Docker容器不存在: project_id={}", project_id);
+            info!("📭 [cleanup] Docker容器不存在: lookup_key={}", lookup_key);
         }
 
         Ok(())

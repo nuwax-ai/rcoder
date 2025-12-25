@@ -87,3 +87,6 @@ ringbuf = { workspace = true }
 # Random and hashing
 rand = "0.8"
 md5 = "0.7"
+
+# Cache
+moka = { workspace = true }
