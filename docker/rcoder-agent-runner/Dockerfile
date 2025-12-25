@@ -52,10 +52,9 @@ RUN apt-get update && \
     ln -sf /usr/bin/xfce4-terminal.wrapper /etc/alternatives/x-terminal-emulator && \
     # Install Python packages:
     # apt-get install -y python3-numpy && \
-    # Clone official noVNC v1.6.0 (latest stable, with full toolbar & clipboard support):
-    git clone https://github.com/novnc/noVNC.git /opt/noVNC && \
+    # Clone noVNC from nuwax-ai fork (based on official v1.6.0, with customized vnc.html):
+    git clone -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
     cd /opt/noVNC && \
-    git checkout v1.6.0 && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
     git clone -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify && \
     # Clean up package cache and temporary files to reduce image size:
@@ -314,7 +313,7 @@ RUN mkdir -p /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ && \
 RUN mkdir -p /home/user/Desktop /usr/share/applications && \
     # Create safe desktop files in system directory (not in user's home)
     printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Terminal\nComment=Terminal Emulator\nExec=xfce4-terminal\nIcon=utilities-terminal\nTerminal=false\nCategories=System;TerminalEmulator;" > /usr/share/applications/user-terminal.desktop && \
-    printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Visual Studio Code\nComment=Code Editor\nExec=/usr/bin/code --no-sandbox\nIcon=vscode\nTerminal=false\nCategories=Development;IDE;" > /usr/share/applications/user-vscode.desktop && \
+    printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Visual Studio Code\nComment=Code Editor\nExec=/usr/bin/code --no-sandbox --user-data-dir=/home/user/.config/Code\nIcon=vscode\nTerminal=false\nCategories=Development;IDE;" > /usr/share/applications/user-vscode.desktop && \
     chmod 644 /usr/share/applications/user-terminal.desktop /usr/share/applications/user-vscode.desktop && \
     # Create symbolic links from Desktop to system apps (安全软链接)
     ln -sf /usr/share/applications/user-terminal.desktop /home/user/Desktop/terminal.desktop && \
