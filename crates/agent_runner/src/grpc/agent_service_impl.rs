@@ -996,15 +996,26 @@ impl AgentService for AgentServiceImpl {
                 }
             }
 
-            // 🎯 关键修复：先主动杀死 Agent 子进程，避免 channel drop 死锁
-            if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id) {
+            // 🎯 使用 remove 原子性地获取 AgentInfo 所有权，避免读锁/写锁竞争
+            // 先移除再清理，确保不会有锁竞争问题
+            let removed_agent_info = AGENT_REGISTRY.remove_by_project(&project_id);
+
+            if let Some(agent_info) = removed_agent_info {
+                info!(
+                    "✅ [gRPC] Agent 已从 Registry 移除: project_id={}",
+                    project_id
+                );
+
+                // 获取 stop_handle 并在后台执行清理
                 if let Some(ref stop_handle) = agent_info.stop_handle {
                     info!("🔪 [gRPC] 主动停止 Agent 子进程: project_id={}", project_id);
 
-                    // 调用 graceful_stop 杀死子进程
                     let stop_handle_clone = Arc::clone(stop_handle);
                     let pid_clone = project_id.clone();
+
+                    // 在后台执行 graceful_stop 和资源清理
                     tokio::spawn(async move {
+                        // 先停止子进程
                         if let Err(e) = stop_handle_clone.graceful_stop().await {
                             warn!(
                                 "⚠️ [gRPC] graceful_stop 失败: {}, project_id={}",
@@ -1013,45 +1024,35 @@ impl AgentService for AgentServiceImpl {
                         } else {
                             info!("✅ [gRPC] Agent 子进程已停止: project_id={}", pid_clone);
                         }
-                    });
 
-                    // 给进程一点时间退出，让 channel receiver 关闭
-                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                }
-            }
-
-            // 🎯 关键修复：在后台任务中异步移除,避免同步 Drop 阻塞 gRPC 响应
-            let pid_for_bg = project_id.clone();
-            tokio::spawn(async move {
-                info!(
-                    "🔄 [gRPC] 后台任务开始移除 Agent: project_id={}",
-                    pid_for_bg
-                );
-
-                // 在后台任务中执行 remove_by_project
-                let removed_agent_info = AGENT_REGISTRY.remove_by_project(&pid_for_bg);
-
-                if let Some(agent_info) = removed_agent_info {
-                    info!(
-                        "✅ [gRPC] Agent 已从 Registry 移除: project_id={}",
-                        pid_for_bg
-                    );
-
-                    // 异步 drop（让它在后台慢慢 drop）
-                    tokio::task::spawn_blocking(move || {
-                        drop(agent_info);
-                        info!(
-                            "🧹 [gRPC] Agent 资源已彻底清理完成: project_id={}",
-                            pid_for_bg
-                        );
+                        // 异步 drop AgentInfo（让它在后台慢慢 drop）
+                        tokio::task::spawn_blocking(move || {
+                            drop(agent_info);
+                            info!(
+                                "🧹 [gRPC] Agent 资源已彻底清理完成: project_id={}",
+                                pid_clone
+                            );
+                        });
                     });
                 } else {
-                    warn!(
-                        "⚠️ [gRPC] 从 Registry 移除 Agent 失败: project_id={}",
-                        pid_for_bg
-                    );
+                    // 没有 stop_handle，直接在后台 drop
+                    let pid_clone = project_id.clone();
+                    tokio::spawn(async move {
+                        tokio::task::spawn_blocking(move || {
+                            drop(agent_info);
+                            info!(
+                                "🧹 [gRPC] Agent 资源已彻底清理完成: project_id={}",
+                                pid_clone
+                            );
+                        });
+                    });
                 }
-            });
+            } else {
+                warn!(
+                    "⚠️ [gRPC] Agent 不在 Registry 中: project_id={}",
+                    project_id
+                );
+            }
 
             // 🚀 立即返回成功响应,不等待后台清理完成
             info!(
@@ -1143,13 +1144,26 @@ impl AgentService for AgentServiceImpl {
                             info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
                         }
 
-                        // 🎯 关键修复：先主动杀死 Agent 子进程
-                        if let Some(agent_info_inner) = AGENT_REGISTRY.get_agent_info(&project_id) {
-                            if let Some(ref stop_handle) = agent_info_inner.stop_handle {
+                        // 🎯 使用 remove 原子性地获取 AgentInfo 所有权，避免读锁/写锁竞争
+                        let removed_agent_info = AGENT_REGISTRY.remove_by_project(&project_id);
+
+                        if let Some(agent_info) = removed_agent_info {
+                            info!(
+                                "✅ [gRPC] Agent 已从 Registry 移除: project_id={}",
+                                project_id
+                            );
+
+                            let response_message =
+                                format!("项目 {} 的 Agent 已成功停止", project_id);
+
+                            // 获取 stop_handle 并在后台执行清理
+                            if let Some(ref stop_handle) = agent_info.stop_handle {
                                 info!("🔪 [gRPC] 主动停止 Agent 子进程: project_id={}", project_id);
 
                                 let stop_handle_clone = Arc::clone(stop_handle);
                                 let pid_clone = project_id.clone();
+
+                                // 在后台执行 graceful_stop 和资源清理
                                 tokio::spawn(async move {
                                     if let Err(e) = stop_handle_clone.graceful_stop().await {
                                         warn!(
@@ -1162,33 +1176,29 @@ impl AgentService for AgentServiceImpl {
                                             pid_clone
                                         );
                                     }
+
+                                    // 异步 drop AgentInfo
+                                    tokio::task::spawn_blocking(move || {
+                                        drop(agent_info);
+                                        info!(
+                                            "🧹 [gRPC] Agent 资源已异步清理完成: project_id={}",
+                                            pid_clone
+                                        );
+                                    });
                                 });
-
-                                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            } else {
+                                // 没有 stop_handle，直接在后台 drop
+                                let pid_clone = project_id.clone();
+                                tokio::spawn(async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        drop(agent_info);
+                                        info!(
+                                            "🧹 [gRPC] Agent 资源已异步清理完成: project_id={}",
+                                            pid_clone
+                                        );
+                                    });
+                                });
                             }
-                        }
-
-                        // 从 AGENT_REGISTRY 移除
-                        let removed_agent_info = AGENT_REGISTRY.remove_by_project(&project_id);
-
-                        if removed_agent_info.is_some() {
-                            info!(
-                                "✅ [gRPC] Agent 已从 Registry 移除: project_id={}",
-                                project_id
-                            );
-
-                            let response_message =
-                                format!("项目 {} 的 Agent 已成功停止", project_id);
-
-                            // 后台异步 drop
-                            let pid_for_spawn = project_id.clone();
-                            tokio::spawn(async move {
-                                drop(removed_agent_info);
-                                info!(
-                                    "🧹 [gRPC] Agent 资源已异步清理完成: project_id={}",
-                                    pid_for_spawn
-                                );
-                            });
 
                             return Ok(Response::new(StopAgentResponse {
                                 success: true,
