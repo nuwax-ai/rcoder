@@ -17,6 +17,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
+use crate::service::vnc_sync::sync_single_vnc_backend;
 use crate::{AppError, HttpResult};
 use shared_types::{ProjectAndContainerInfo, ServiceResourceLimits};
 
@@ -662,7 +663,24 @@ pub async fn pod_ensure(
         }
     };
 
-    // 3. 在 DuckDB 存储中记录容器信息（用于后续保活）
+    // 3. 🆕 如果是新创建的容器，立即同步 VNC 后端映射
+    // 这消除了等待定时同步任务（最多 5 秒）的空窗期
+    if created {
+        if let Some(ref pingora_service) = state.pingora_service {
+            sync_single_vnc_backend(
+                pingora_service,
+                &request.user_id,
+                &container_info.container_ip,
+            )
+            .await;
+            info!(
+                "🔄 [POD_ENSURE] VNC 后端映射已同步: user_id={} -> {}",
+                request.user_id, container_info.container_ip
+            );
+        }
+    }
+
+    // 4. 在 DuckDB 存储中记录容器信息（用于后续保活）
     if !state.contains_project(&request.user_id) {
         // ComputerAgentRunner 模式：使用 project_id 创建，同时设置 user_id
         let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
@@ -672,7 +690,7 @@ pub async fn pod_ensure(
         state.insert_project(request.user_id.clone(), Arc::new(project_info));
     }
 
-    // 4. 构建响应
+    // 5. 构建响应
     let pod_container_info = PodContainerInfo {
         container_id: container_info.container_id.clone(),
         status: container_info.status.clone(),
@@ -957,7 +975,22 @@ pub async fn pod_restart(
         container_info.container_id
     );
 
-    // 5. 在 DuckDB 存储中记录容器信息
+    // 5. 🆕 立即同步 VNC 后端映射
+    // 这消除了等待定时同步任务（最多 5 秒）的空窗期
+    if let Some(ref pingora_service) = state.pingora_service {
+        sync_single_vnc_backend(
+            pingora_service,
+            &request.user_id,
+            &container_info.container_ip,
+        )
+        .await;
+        info!(
+            "🔄 [POD_RESTART] VNC 后端映射已同步: user_id={} -> {}",
+            request.user_id, container_info.container_ip
+        );
+    }
+
+    // 6. 在 DuckDB 存储中记录容器信息
     {
         let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
         project_info.set_user_id(Some(request.user_id.clone()));
@@ -966,7 +999,7 @@ pub async fn pod_restart(
         state.insert_project(request.user_id.clone(), Arc::new(project_info));
     }
 
-    // 6. 构建响应
+    // 7. 构建响应
     let pod_container_info = PodContainerInfo {
         container_id: container_info.container_id.clone(),
         status: container_info.status.clone(),

@@ -170,8 +170,16 @@ impl Clone for AgentLifecycleGuard {
 
 impl Drop for AgentLifecycleGuard {
     fn drop(&mut self) {
+        let strong_count = Arc::strong_count(&self.inner);
+        let is_stopped = self.inner.stopped.load(Ordering::SeqCst);
+
+        info!(
+            "[Claude] AgentLifecycleGuard::drop 开始: project_id={}, strong_count={}, is_stopped={}",
+            self.inner.project_id, strong_count, is_stopped
+        );
+
         // 只有最后一个引用被drop时才执行清理
-        if Arc::strong_count(&self.inner) == 1 && !self.inner.stopped.load(Ordering::SeqCst) {
+        if strong_count == 1 && !is_stopped {
             info!(
                 "[Claude] AgentLifecycleGuard被drop，清理资源: {}",
                 self.inner.project_id
@@ -183,16 +191,32 @@ impl Drop for AgentLifecycleGuard {
             // 同步清理关键资源
             match &self.inner.resources {
                 AgentResources::Claude { child_process, .. } => {
+                    info!(
+                        "[Claude] 尝试获取 child_process 锁: {}",
+                        self.inner.project_id
+                    );
                     if let Ok(mut child_guard) = child_process.try_lock()
                         && let Some(mut child) = child_guard.take()
                     {
+                        info!("[Claude] 开始 kill 子进程: {}", self.inner.project_id);
                         let _ = child.start_kill();
+                        info!("[Claude] kill 子进程完成: {}", self.inner.project_id);
+                    } else {
+                        info!(
+                            "[Claude] 无法获取 child_process 锁或子进程不存在: {}",
+                            self.inner.project_id
+                        );
                     }
                 }
             }
 
             self.inner.stopped.store(true, Ordering::SeqCst);
         }
+
+        info!(
+            "[Claude] AgentLifecycleGuard::drop 完成: project_id={}",
+            self.inner.project_id
+        );
     }
 }
 

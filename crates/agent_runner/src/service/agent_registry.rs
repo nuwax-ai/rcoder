@@ -205,11 +205,26 @@ impl AgentSessionRegistry {
         }
 
         // 移除 agent_info
-        info!("🔍 [Registry] 移除 agent_info_map");
+        info!(
+            "🔍 [Registry] 准备移除 agent_info_map, project_id={}, 当前 map 长度={}",
+            project_id,
+            self.agent_info_map.len()
+        );
+
+        // 检查 key 是否存在
+        let key_exists = self.agent_info_map.contains_key(project_id);
+        info!(
+            "🔍 [Registry] agent_info_map key 存在检查: project_id={}, exists={}",
+            project_id, key_exists
+        );
+
+        // 执行 remove 操作
+        info!("🔍 [Registry] 开始执行 agent_info_map.remove()...");
         let removed = self.agent_info_map.remove(project_id).map(|(_, v)| v);
         info!(
-            "🔍 [Registry] agent_info_map 移除完成, removed={}",
-            removed.is_some()
+            "🔍 [Registry] agent_info_map.remove() 完成, removed={}, 剩余长度={}",
+            removed.is_some(),
+            self.agent_info_map.len()
         );
 
         if removed.is_some() {
