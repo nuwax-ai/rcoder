@@ -557,8 +557,9 @@ RUN chmod +x /usr/local/bin/agent_runner
 # 🔊 pcmflux 音频流服务安装
 # ============================================================================
 # 安装 pcmflux Python 包（需要 root，用于编译 C++ 扩展）
-RUN pip3 install websockets && \
-    pip3 install git+https://github.com/linuxserver/pcmflux.git && \
+# 使用 --break-system-packages 绕过 Debian 12 的 PEP 668 限制
+RUN pip3 install --break-system-packages websockets && \
+    pip3 install --break-system-packages git+https://github.com/linuxserver/pcmflux.git && \
     echo "✅ pcmflux audio streaming installed"
 
 # 复制音频服务脚本和静态文件
