@@ -9,7 +9,7 @@ use agent_config::{AgentServersConfig, PromptConfigAssembler};
 use anyhow::Result;
 use async_trait::async_trait;
 use shared_types::{ProjectAndAgentInfo, SessionEntry};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
 use crate::compat::convert_context_servers;
@@ -136,10 +136,7 @@ where
         // - 不依赖内存状态，更健壮
         // - 自动降级（有会话就恢复，没有就创建）
         if let Some(ref session_id) = request.prompt_message.session_id {
-            info!(
-                "🔄 用户传入 session_id，尝试 resume: {}",
-                session_id
-            );
+            info!("🔄 用户传入 session_id，尝试 resume: {}", session_id);
             start_config = start_config.with_resume_session_id(session_id.clone());
         }
 
@@ -151,14 +148,14 @@ where
         prompt_message.content = final_user_prompt;
 
         // 6. 获取或创建会话
-        let (session_entry, is_new) = self
+        let (session_entry, is_new, first_prompt_result_rx) = self
             .session_manager
             .get_or_create_session(
                 &project_id,
                 normalized_path,
                 prompt_message.session_id.clone(),
                 request.model_provider.clone(),
-                start_config,
+                start_config.clone(),
                 client,
             )
             .await
@@ -170,7 +167,8 @@ where
         // 使用 SessionEntry trait 方法访问会话信息
         info!(
             "✅ 会话已准备，session_id: {}, is_new: {}",
-            session_entry.session_id().0, is_new
+            session_entry.session_id().0,
+            is_new
         );
 
         // 7. 构建 Prompt 请求
@@ -198,6 +196,50 @@ where
             })?;
 
         info!("✅ Prompt 请求已发送，project_id: {}", project_id);
+
+        // 🆕 8.5. 如果是新会话且是 resume 会话，等待首次 Prompt 结果
+        // 这样可以在 gRPC 响应返回前检测到 resume 失败
+        //
+        // ⏱️ 超时时间说明：
+        // - Resume 失败检测通常在 1~2 秒内完成（Claude Code 报告 "No conversation found"）
+        // - 设置 5 秒超时：足够检测 resume 失败，同时避免阻塞过长
+        // - 如果超时，说明 Prompt 正在正常执行（长任务），继续返回成功
+        let is_resume_session = start_config.resume_session_id.is_some();
+        if is_new && is_resume_session {
+            if let Some(rx) = first_prompt_result_rx {
+                info!("⏳ 等待首次 Prompt 结果（Resume 会话，超时 5 秒）...");
+
+                // 设置 5 秒超时
+                match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                    Ok(Ok(result)) => {
+                        if result.need_fallback {
+                            // Resume 失败，返回错误让调用方处理降级
+                            error!(
+                                "❌ Resume 会话首次 Prompt 失败，需要降级: {:?}",
+                                result.error
+                            );
+                            return Ok(WorkerResponse::error(
+                                project_id,
+                                session_entry.session_id().0.to_string(),
+                                result.error.unwrap_or_else(|| "Resume failed".to_string()),
+                                Some(request.request_id().to_string()),
+                                prompt_message.service_type.clone(),
+                            ));
+                        } else {
+                            info!("✅ 首次 Prompt 成功，Resume 有效");
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        // channel 关闭，可能是 Agent 崩溃
+                        warn!("⚠️ 首次 Prompt 结果通道关闭，继续处理");
+                    }
+                    Err(_) => {
+                        // 超时，可能是长时间执行的 Prompt
+                        warn!("⚠️ 等待首次 Prompt 结果超时，继续处理");
+                    }
+                }
+            }
+        }
 
         // 9. 构建响应
         if is_new {

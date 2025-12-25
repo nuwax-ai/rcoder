@@ -71,7 +71,6 @@ pub struct LauncherConnectionInfo {
 ///
 /// 注意：降级处理已移至 launch() 的 spawn_local 块内，
 /// 通过 tokio::select! 在 LocalSet 中直接处理，避免跨线程问题。
-#[derive(Debug)]
 pub struct LauncherConnectionInfoComplete {
     /// 会话 ID
     pub session_id: SessionId,
@@ -81,6 +80,9 @@ pub struct LauncherConnectionInfoComplete {
     pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
     /// 生命周期守卫（自动清理资源）
     pub lifecycle_guard: Arc<AgentLifecycleGuard>,
+    /// 🆕 首次 Prompt 结果接收器（用于等待首次 Prompt 执行结果）
+    pub first_prompt_result_rx:
+        tokio::sync::oneshot::Receiver<super::channel_utils::FirstPromptResult>,
 }
 
 /// 从配置文件加载 Agent 配置
@@ -315,6 +317,9 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequestWrapper>();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
         let (session_id_tx, session_id_rx) = tokio::sync::oneshot::channel::<SessionId>();
+        // 🆕 创建首次 Prompt 结果通道
+        let (first_prompt_result_tx, first_prompt_result_rx) =
+            tokio::sync::oneshot::channel::<super::channel_utils::FirstPromptResult>();
 
         // 检查是否是 resume 会话
         let is_resume_session = start_config.resume_session_id.is_some();
@@ -511,6 +516,8 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                             lifecycle_handle: lifecycle_handle_for_handler,
                             model_provider: model_provider_for_handler,
                             notifier: notifier.clone(),
+                            // 🆕 传递首次 Prompt 结果发送器
+                            first_prompt_result_tx: Some(first_prompt_result_tx),
                         },
                     );
 
@@ -584,6 +591,8 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
             prompt_tx,
             cancel_tx,
             lifecycle_guard: Arc::new(lifecycle_guard),
+            // 🆕 返回首次 Prompt 结果接收器
+            first_prompt_result_rx,
         })
     }
 }

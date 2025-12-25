@@ -11,8 +11,21 @@ use chrono::Utc;
 use shared_types::{AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
+
+/// 首次 Prompt 执行结果
+///
+/// 用于向调用方同步首次 Prompt 的执行结果
+#[derive(Debug, Clone)]
+pub struct FirstPromptResult {
+    /// 是否成功
+    pub success: bool,
+    /// 错误信息（如果失败）
+    pub error: Option<String>,
+    /// 是否需要降级（仅在 resume 会话首次 Prompt 失败时为 true）
+    pub need_fallback: bool,
+}
 
 /// Prompt 处理器配置
 ///
@@ -34,6 +47,8 @@ pub struct PromptHandlerConfig<N: SessionNotifier, R: SessionRegistry> {
     pub model_provider: Option<ModelProviderConfig>,
     /// 通知器
     pub notifier: Arc<N>,
+    /// 🆕 首次 Prompt 结果发送器（用于同步返回首次 Prompt 执行结果）
+    pub first_prompt_result_tx: Option<oneshot::Sender<FirstPromptResult>>,
 }
 
 /// 为 Agent 启动取消处理器
@@ -127,12 +142,17 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
     let lifecycle_handle = config.lifecycle_handle;
     let model_provider = config.model_provider;
     let notifier = config.notifier;
+    // 🆕 首次 Prompt 结果发送器
+    let first_prompt_result_tx = config.first_prompt_result_tx;
 
     tokio::task::spawn_local(async move {
         info!(
             "🚀 项目[{}]Prompt处理任务已启动，开始监听消息... (is_resume={})",
             project_id, is_resume_session
         );
+
+        // 🆕 用于发送首次 Prompt 结果（只发送一次）
+        let mut first_prompt_result_tx = first_prompt_result_tx;
 
         // 追踪是否是第一个 Prompt（用于 resume 降级检测）
         let mut is_first_prompt = true;
@@ -202,6 +222,25 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
                         error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
                     }
 
+                    // 🆕 首次 Prompt 成功，发送成功结果
+                    if is_first_prompt {
+                        if let Some(tx) = first_prompt_result_tx.take() {
+                            let result = FirstPromptResult {
+                                success: true,
+                                error: None,
+                                need_fallback: false,
+                            };
+                            if let Err(_) = tx.send(result) {
+                                warn!(
+                                    "项目[{}]发送首次Prompt成功结果失败（接收方已关闭）",
+                                    project_id
+                                );
+                            } else {
+                                info!("✅ 项目[{}]首次Prompt成功，已通知调用方", project_id);
+                            }
+                        }
+                    }
+
                     // 第一个 Prompt 成功，说明 resume 有效
                     is_first_prompt = false;
                 }
@@ -223,6 +262,26 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
                             "⚠️ 项目[{}] 不在内部降级，发送错误通知，标记需要降级",
                             project_id
                         );
+
+                        // 🆕 发送首次 Prompt 失败结果（需要降级）
+                        if let Some(tx) = first_prompt_result_tx.take() {
+                            let result = FirstPromptResult {
+                                success: false,
+                                error: Some(error_message.clone()),
+                                need_fallback: true,
+                            };
+                            if let Err(_) = tx.send(result) {
+                                warn!(
+                                    "项目[{}]发送首次Prompt失败结果失败（接收方已关闭）",
+                                    project_id
+                                );
+                            } else {
+                                info!(
+                                    "⚠️ 项目[{}]首次Prompt失败（需要降级），已通知调用方",
+                                    project_id
+                                );
+                            }
+                        }
 
                         // 🆕 发送错误通知（包含降级标识）
                         // 注意：降级标识通过 agent_service_impl.rs 中的 gRPC 响应返回

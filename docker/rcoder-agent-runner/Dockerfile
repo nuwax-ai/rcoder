@@ -144,15 +144,15 @@ RUN apt-get update && \
     # ========== 系统级 fcitx5 输入法配置 ==========
     mkdir -p /etc/xdg/fcitx5/conf && \
     # fcitx5 全局配置
-    printf '[Hotkey]\nEnumerateWithTriggerKeys=True\nAltTriggerKeys=\nEnumerateForwardKeys=\nEnumerateBackwardKeys=\nEnumerateSkipFirst=False\n\n[Hotkey/TriggerKeys]\n0=Control+space\n1=Shift+Control+space\n\n[Hotkey/EnumerateGroupForwardKeys]\n0=Super+space\n\n[Hotkey/EnumerateGroupBackwardKeys]\n0=Shift+Super+space\n\n[Hotkey/ActivateKeys]\n0=Hangul_Hanja\n\n[Hotkey/DeactivateKeys]\n0=Hangul_Romaja\n\n[Hotkey/PrevPage]\n0=Up\n\n[Hotkey/NextPage]\n0=Down\n\n[Hotkey/PrevCandidate]\n0=Shift+Tab\n\n[Hotkey/NextCandidate]\n0=Tab\n\n[Hotkey/TogglePreedit]\n0=Control+Alt+P\n\n[Behavior]\nActiveByDefault=True\nShareInputState=No\nPreloadInputMethod=True\nShowInputMethodInformation=True\nShowInputMethodInformationWhenFocusIn=False\nCompactInputMethodInformation=True\nShowFirstInputMethodInformation=True\nDefaultPageSize=5\nOverrideXkbOption=False\nCustomXkbOption=\nEnabledAddons=\nDisabledAddons=\nPreeditEnabledByDefault=True' > /etc/xdg/fcitx5/config && \
+    printf '[Hotkey]\nEnumerateWithTriggerKeys=True\nAltTriggerKeys=\nEnumerateForwardKeys=\nEnumerateBackwardKeys=\nEnumerateSkipFirst=False\n\n[Hotkey/TriggerKeys]\n0=Control+space\n1=Shift+Control+space\n\n[Hotkey/EnumerateGroupForwardKeys]\n0=Super+space\n\n[Hotkey/EnumerateGroupBackwardKeys]\n0=Shift+Super+space\n\n[Hotkey/ActivateKeys]\n0=Hangul_Hanja\n\n[Hotkey/DeactivateKeys]\n0=Hangul_Romaja\n\n[Hotkey/PrevPage]\n0=Up\n\n[Hotkey/NextPage]\n0=Down\n\n[Hotkey/PrevCandidate]\n0=Shift+Tab\n\n[Hotkey/NextCandidate]\n0=Tab\n\n[Hotkey/TogglePreedit]\n0=Control+Alt+P\n\n[Behavior]\nActiveByDefault=False\nShareInputState=No\nPreloadInputMethod=True\nShowInputMethodInformation=True\nShowInputMethodInformationWhenFocusIn=False\nCompactInputMethodInformation=True\nShowFirstInputMethodInformation=True\nDefaultPageSize=5\nOverrideXkbOption=False\nCustomXkbOption=\nEnabledAddons=\nDisabledAddons=\nPreeditEnabledByDefault=True' > /etc/xdg/fcitx5/config && \
     # 拼音配置
     printf '[Addon]\nEnabled=True\n\n[Behavior]\nPreeditInApplication=False\n\n[PinyinEngine]\nShuangpinProfile=Ziranma\nShowActualPinyinInHint=False\nPredictionEnabled=True\nPredictionSize=10\nCloudPinyinEnabled=False\nCloudPinyinIndex=2' > /etc/xdg/fcitx5/conf/pinyin.conf && \
     # 禁用云拼音提示
     printf '[Addon]\nEnabled=False\n\n[Behavior]\nShowNotification=False' > /etc/xdg/fcitx5/conf/cloudpinyin.conf && \
     # 禁用通知
     printf '[Addon]\nEnabled=False\n\n[Behavior]\nHiddenNotifications=' > /etc/xdg/fcitx5/conf/notifications.conf && \
-    # fcitx5 profile (系统默认)
-    printf '[Groups/0]\nName=Default\nDefault Layout=us\nDefaultIM=pinyin\n\n[Groups/0/Items/0]\nName=keyboard-us\nLayout=\n\n[Groups/0/Items/1]\nName=pinyin\nLayout=\n\n[GroupOrder]\n0=Default\n\n[Behavior]\nActiveByDefault=True\nShareInputState=No' > /etc/xdg/fcitx5/profile && \
+    # fcitx5 profile (系统默认: 英文键盘，用户可通过 Ctrl+Space 切换到中文拼音)
+    printf '[Groups/0]\nName=Default\nDefault Layout=us\nDefaultIM=keyboard-us\n\n[Groups/0/Items/0]\nName=keyboard-us\nLayout=\n\n[Groups/0/Items/1]\nName=pinyin\nLayout=\n\n[GroupOrder]\n0=Default\n\n[Behavior]\nActiveByDefault=False\nShareInputState=No' > /etc/xdg/fcitx5/profile && \
     # ========== 系统级环境变量配置 (替代 .bashrc/.xprofile) ==========
     mkdir -p /etc/profile.d && \
     printf '#!/bin/sh\n# Fcitx5 Input Method Environment Variables\nexport GTK_IM_MODULE=fcitx5\nexport QT_IM_MODULE=fcitx5\nexport XMODIFIERS=@im=fcitx5\nexport INPUT_METHOD=fcitx5\nexport SDL_IM_MODULE=fcitx5\nexport GLFW_IM_MODULE=fcitx5\n' > /etc/profile.d/fcitx5-env.sh && \
@@ -569,6 +569,31 @@ RUN chmod +x /usr/local/bin/audio_server.py
 
 # 暴露音频流 HTTP 端口
 EXPOSE 6090
+
+# ============================================================================
+# 🔌 MCP Proxy 配置文件
+# ============================================================================
+# 复制 MCP 配置文件（用于容器启动时的共享 MCP 代理服务）
+COPY mcp /etc/mcp
+
+# ============================================================================
+# ⌨️ IME 本地输入法透传服务
+# ============================================================================
+# 复制 IME 服务脚本（允许用户使用宿主机输入法输入到远程桌面）
+COPY ime_server.py /usr/local/bin/ime_server.py
+RUN chmod +x /usr/local/bin/ime_server.py
+
+# 复制 IME 前端脚本到 noVNC 目录，并注入到 vnc.html
+COPY ime_passthrough.js /opt/noVNC/ime_passthrough.js
+RUN if ! grep -q 'ime_passthrough.js' /opt/noVNC/vnc.html; then \
+    sed -i 's|</body>|<script src="ime_passthrough.js"></script>\n</body>|' /opt/noVNC/vnc.html && \
+    echo "✅ IME passthrough script injected into vnc.html"; \
+    else \
+    echo "✓ IME passthrough script already in vnc.html"; \
+    fi
+
+# 暴露 IME 服务端口
+EXPOSE 6091
 
 # ============================================================================
 # 🎯 切换到普通用户 - 后续操作以 user 身份执行

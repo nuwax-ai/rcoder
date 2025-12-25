@@ -770,6 +770,131 @@ function start_audio_services() {
     echo "✅ Audio streaming services initialized"
 }
 
+# ============================================================================
+# 🔌 MCP Proxy 服务 (chrome-devtools-mcp 共享代理)
+# 将 stdio 协议的 MCP 服务代理为 HTTP 服务，供多个 agent 复用
+# ============================================================================
+function start_mcp_proxy_services() {
+    echo "🔌 Starting MCP Proxy services (chrome-devtools shared)..."
+
+    # 创建 MCP 日志目录（持久化到挂载的 /app/container-logs）
+    local MCP_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/mcp"
+    mkdir -p "$MCP_LOG_DIR"
+    chmod 755 "$MCP_LOG_DIR"
+    echo "  ✓ MCP log directory: $MCP_LOG_DIR"
+
+    # MCP 配置文件路径（由 Dockerfile 复制到 /etc/mcp）
+    local MCP_CONFIG_FILE="/etc/mcp/mcp-proxy-config.json"
+    if [ ! -f "$MCP_CONFIG_FILE" ]; then
+        echo "  ⚠ MCP config file not found: $MCP_CONFIG_FILE"
+        echo "  ⚠ MCP Proxy services will not start"
+        return 1
+    fi
+    echo "  ✓ MCP config file: $MCP_CONFIG_FILE"
+
+    # 获取 D-Bus 地址
+    local DBUS_ADDR=""
+    if [ -f /tmp/dbus-session-env ]; then
+        source /tmp/dbus-session-env
+        DBUS_ADDR="$DBUS_SESSION_BUS_ADDRESS"
+    fi
+
+    # 启动 mcp-proxy proxy 服务
+    # 需要传递正确的环境变量（DISPLAY, D-Bus, 输入法等）
+    echo "  Starting mcp-proxy proxy on port 18099..."
+    env \
+        HOME=/home/user \
+        DISPLAY=:0 \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        CHROMIUM_USER_DATA_DIR=/home/user/.config/chromium \
+        GTK_IM_MODULE=fcitx \
+        QT_IM_MODULE=fcitx \
+        XMODIFIERS=@im=fcitx \
+        INPUT_METHOD=fcitx \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        LC_CTYPE=C.UTF-8 \
+        PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
+        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" \
+        > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
+
+    local MCP_PID=$!
+    sleep 3
+
+    # 验证服务是否启动
+    if kill -0 $MCP_PID 2>/dev/null; then
+        echo "  ✓ MCP Proxy started (PID: $MCP_PID)"
+        echo "  ✓ MCP Proxy URL: http://127.0.0.1:18099"
+        echo "  ✓ Agent 可使用: mcp-proxy convert http://127.0.0.1:18099"
+    else
+        echo "  ⚠ MCP Proxy failed to start, check log: $MCP_LOG_DIR/mcp-proxy.log"
+        cat "$MCP_LOG_DIR/mcp-proxy.log" 2>/dev/null | tail -20 || true
+    fi
+
+    echo "✅ MCP Proxy services initialized"
+}
+
+# ============================================================================
+# ⌨️ IME 本地输入法透传服务
+# 允许用户使用宿主机的输入法（如搜狗输入法）直接输入到远程桌面
+# ============================================================================
+function start_ime_services() {
+    echo "⌨️ Starting IME passthrough services..."
+
+    # 检查是否启用（可通过环境变量禁用）
+    if [ "${ENABLE_IME_PASSTHROUGH:-true}" = "false" ]; then
+        echo "  ⚠ IME passthrough is disabled (ENABLE_IME_PASSTHROUGH=false)"
+        return 0
+    fi
+
+    # 创建 IME 日志目录（持久化到挂载的 /app/container-logs）
+    local IME_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/ime"
+    mkdir -p "$IME_LOG_DIR"
+    chmod 755 "$IME_LOG_DIR"
+    echo "  ✓ IME log directory: $IME_LOG_DIR"
+
+    # 检查 IME 服务脚本是否存在
+    local IME_SCRIPT="/usr/local/bin/ime_server.py"
+    if [ ! -f "$IME_SCRIPT" ]; then
+        echo "  ⚠ IME server script not found: $IME_SCRIPT"
+        echo "  ⚠ IME passthrough services will not start"
+        return 1
+    fi
+
+    # 获取 D-Bus 地址
+    local DBUS_ADDR=""
+    if [ -f /tmp/dbus-session-env ]; then
+        source /tmp/dbus-session-env
+        DBUS_ADDR="$DBUS_SESSION_BUS_ADDRESS"
+    fi
+
+    # 启动 IME 服务
+    echo "  Starting IME server on port 6091..."
+    env \
+        HOME=/home/user \
+        DISPLAY=:0 \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        IME_PORT=6091 \
+        IME_HOST=0.0.0.0 \
+        nohup python3 "$IME_SCRIPT" \
+        > "$IME_LOG_DIR/ime_server.log" 2>&1 &
+
+    local IME_PID=$!
+    sleep 2
+
+    # 验证服务是否启动
+    if kill -0 $IME_PID 2>/dev/null; then
+        echo "  ✓ IME server started (PID: $IME_PID)"
+        echo "  ✓ IME WebSocket: ws://0.0.0.0:6091"
+        echo "  ✓ 用户可使用宿主机输入法输入到远程桌面"
+    else
+        echo "  ⚠ IME server failed to start, check log: $IME_LOG_DIR/ime_server.log"
+        cat "$IME_LOG_DIR/ime_server.log" 2>/dev/null | tail -20 || true
+    fi
+
+    echo "✅ IME passthrough services initialized"
+}
+
 echo "Starting Code Interpreter server..."
 
 # 设置VNC自动启动标志
@@ -817,6 +942,12 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
 
     # 启动音频流服务 (pcmflux)
     start_audio_services
+
+    # 启动 MCP Proxy 服务 (chrome-devtools 共享代理)
+    start_mcp_proxy_services
+
+    # 启动 IME 本地输入法透传服务
+    start_ime_services
 
     # VNC服务监控循环 (as root)
     while true; do
