@@ -931,6 +931,11 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
     done
 
     echo "X11 is ready, starting VNC services..."
+    
+    # ========== 优先启动 MCP Proxy 服务 ==========
+    # MCP Proxy 需要尽早启动，因为 agent_runner 启动后可能立即使用
+    start_mcp_proxy_services
+    
     start_vnc_services
 
     echo "✓ VNC services started successfully!"
@@ -942,9 +947,6 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
 
     # 启动音频流服务 (pcmflux)
     start_audio_services
-
-    # 启动 MCP Proxy 服务 (chrome-devtools 共享代理)
-    start_mcp_proxy_services
 
     # 启动 IME 本地输入法透传服务
     start_ime_services
@@ -1039,6 +1041,22 @@ source /etc/profile.d/ime-env.sh 2>/dev/null || true
 
 # 等待 D-Bus 会话文件创建（可能在后台线程中）
 sleep 2
+
+# ========== 快速检查 MCP Proxy 服务状态（非阻塞） ==========
+# 只等待 5 秒，无论是否就绪都继续启动 agent_runner
+# MCP Proxy 会在后台继续启动，agent 首次使用时可能需要重试
+echo "⏳ Quick check for MCP Proxy service..."
+MCP_PROXY_PORT=18099
+for i in 1 2; do
+    if nc -z 127.0.0.1 $MCP_PROXY_PORT 2>/dev/null; then
+        echo "✓ MCP Proxy is ready on port $MCP_PROXY_PORT"
+        break
+    fi
+    sleep 1
+done
+if ! nc -z 127.0.0.1 $MCP_PROXY_PORT 2>/dev/null; then
+    echo "⚠️  MCP Proxy not yet ready, agent_runner will start anyway (MCP will be available shortly)"
+fi
 
 # 加载 D-Bus 会话环境
 if [ -f /tmp/dbus-session-env ]; then
