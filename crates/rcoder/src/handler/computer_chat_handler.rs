@@ -262,51 +262,68 @@ pub async fn handle_computer_chat(
         )
         .await;
 
-        // 🆕 检查是否需要降级
-        if let Some(ref response_data) = result.data {
-            if response_data.need_fallback.unwrap_or(false) {
-                warn!(
-                    "⚠️ [COMPUTER_CHAT] 检测到需要降级: reason={}, attempt={}/{}",
-                    response_data
-                        .fallback_reason
-                        .as_deref()
-                        .unwrap_or("unknown"),
-                    attempt + 1,
-                    MAX_ATTEMPTS
-                );
+        // 🆕 增强降级检测逻辑
+        // 情况 1: 响应中明确标识 need_fallback=true
+        // 情况 2: 请求失败（有 session_id 的首次请求），可能是 resume 失败
+        let should_fallback = if let Some(ref response_data) = result.data {
+            // 优先检查明确的 need_fallback 标识
+            response_data.need_fallback.unwrap_or(false)
+        } else if !result.is_success() && request.session_id.is_some() && attempt == 0 {
+            // 请求失败，且是带 session_id 的首次请求，认为可能是 resume 失败
+            warn!(
+                "⚠️ [COMPUTER_CHAT] 带 session_id 的请求失败，尝试降级: code={}, message={}",
+                result.code, result.message
+            );
+            true
+        } else {
+            false
+        };
 
-                // 检查是否还有重试机会
-                if attempt + 1 < MAX_ATTEMPTS {
-                    info!("🔄 [COMPUTER_CHAT] 开始降级重试");
+        if should_fallback {
+            let fallback_reason = result
+                .data
+                .as_ref()
+                .and_then(|d| d.fallback_reason.as_deref())
+                .unwrap_or("request_failed_with_session_id");
 
-                    // 🆕 主动停止旧 agent，释放资源
-                    // 这会触发 AgentLifecycleGuard 的 RAII 清理机制
-                    info!("🛑 [COMPUTER_CHAT] 停止旧 agent: project_id={}", project_id);
-                    if let Err(e) = crate::grpc::chat_client::grpc_stop_agent_with_pool(
-                        &state.grpc_pool,
-                        &format!("{}:50051", container_info.container_ip),
-                        project_id.clone(),
-                        Some("Resume 失败，降级重启".to_string()),
-                        false, // graceful stop
-                    )
-                    .await
-                    {
-                        warn!("⚠️ [COMPUTER_CHAT] 停止旧 agent 失败（可能已退出）: {}", e);
-                        // 继续降级流程，不阻塞
-                    }
+            warn!(
+                "⚠️ [COMPUTER_CHAT] 检测到需要降级: reason={}, attempt={}/{}",
+                fallback_reason,
+                attempt + 1,
+                MAX_ATTEMPTS
+            );
 
-                    // 短暂等待，确保资源释放
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // 检查是否还有重试机会
+            if attempt + 1 < MAX_ATTEMPTS {
+                info!("🔄 [COMPUTER_CHAT] 开始降级重试");
 
-                    continue; // 🆕 重试
-                } else {
-                    // 没有重试机会了
-                    warn!("❌ [COMPUTER_CHAT] 降级重试次数耗尽");
-                    return Ok(HttpResult::error(
-                        shared_types::error_codes::ERR_RETRY_EXHAUSTED,
-                        "Resume failed and retry exhausted",
-                    ));
+                // 🆕 主动停止旧 agent，释放资源
+                // 这会触发 AgentLifecycleGuard 的 RAII 清理机制
+                info!("🛑 [COMPUTER_CHAT] 停止旧 agent: project_id={}", project_id);
+                if let Err(e) = crate::grpc::chat_client::grpc_stop_agent_with_pool(
+                    &state.grpc_pool,
+                    &format!("{}:50051", container_info.container_ip),
+                    project_id.clone(),
+                    Some("Resume 失败，降级重启".to_string()),
+                    false, // graceful stop
+                )
+                .await
+                {
+                    warn!("⚠️ [COMPUTER_CHAT] 停止旧 agent 失败（可能已退出）: {}", e);
+                    // 继续降级流程，不阻塞
                 }
+
+                // 短暂等待，确保资源释放
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                continue; // 🆕 重试
+            } else {
+                // 没有重试机会了
+                warn!("❌ [COMPUTER_CHAT] 降级重试次数耗尽");
+                return Ok(HttpResult::error(
+                    shared_types::error_codes::ERR_RETRY_EXHAUSTED,
+                    "Resume failed and retry exhausted",
+                ));
             }
         }
 

@@ -49,7 +49,8 @@ pub struct AcpSessionManager<N: SessionNotifier, C: Client + 'static, R: Session
     _client_marker: std::marker::PhantomData<C>,
 }
 
-impl<N: SessionNotifier, C: Client + Default + 'static, R: SessionRegistry> AcpSessionManager<N, C, R>
+impl<N: SessionNotifier, C: Client + Default + 'static, R: SessionRegistry>
+    AcpSessionManager<N, C, R>
 where
     R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
 {
@@ -225,11 +226,18 @@ where
         // 创建启动器
         let launcher = ClaudeCodeLauncher::new(self.notifier.clone());
 
-        // 记录是否使用了 resume
+        // 记录是否使用了 resume（仅用于日志）
         let has_resume = start_config.resume_session_id.is_some();
+        if has_resume {
+            info!(
+                "📌 使用 resume 启动 Agent: session_id={:?}",
+                start_config.resume_session_id
+            );
+        }
 
-        // 第一次尝试：使用原始配置（可能包含 --resume）
-        let result = launcher
+        // 启动 Agent，不再内部降级
+        // 如果 resume 失败，直接返回错误，让上层（rcoder）决定是否降级重试
+        let connection_info = launcher
             .launch(
                 project_id.clone(),
                 project_path.clone(),
@@ -238,49 +246,7 @@ where
                 client,
                 self.registry.clone(),
             )
-            .await;
-
-        // 简单重试机制：如果启动失败且使用了 --resume，去掉 --resume 重试
-        let connection_info = match result {
-            Ok(info) => info,
-            Err(e) => {
-                let error_msg = format!("{:?}", e);
-
-                // 只要带 resume 且启动失败，就降级重试（不判断具体错误原因）
-                if has_resume {
-                    tracing::warn!(
-                        "⚠️ Agent 启动失败（带 resume），降级为不使用 resume 重试: error={}",
-                        error_msg
-                    );
-
-                    // 创建新的 config，不包含 resume_session_id
-                    let retry_config = AgentStartConfig {
-                        system_prompt: start_config.system_prompt.clone(),
-                        mcp_servers: start_config.mcp_servers.clone(),
-                        extra_meta: start_config.extra_meta.clone(),
-                        service_type: start_config.service_type.clone(),
-                        resume_session_id: None, // ✅ 去掉 resume
-                    };
-
-                    tracing::info!("🔄 重试启动 Agent（不使用 resume）");
-
-                    // 重试启动（创建新的 client 实例）
-                    launcher
-                        .launch(
-                            project_id.clone(),
-                            project_path.clone(),
-                            model_provider.clone(),
-                            retry_config,
-                            C::default(), // 创建新的 client 实例
-                            self.registry.clone(),
-                        )
-                        .await?
-                } else {
-                    // 不带 resume 的失败，直接返回错误
-                    return Err(e);
-                }
-            }
-        };
+            .await?;
 
         info!(
             "✅ Agent 会话创建成功，会话 ID: {}",
@@ -402,8 +368,7 @@ where
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
-        let prompt_request =
-            Self::build_text_prompt_request(prompt, session.session_id().clone())?;
+        let prompt_request = Self::build_text_prompt_request(prompt, session.session_id().clone())?;
 
         session.prompt_tx().send(prompt_request).map_err(|e| {
             error!("发送 Prompt 请求失败: {:?}", e);
