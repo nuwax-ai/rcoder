@@ -23,8 +23,8 @@ use pingora_proxy::{PingoraServerManager, ProxyConfig};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
 use service::{
-    ContainerStatusCheckerConfig, ContainerSyncConfig, start_container_status_checker,
-    start_container_sync_task,
+    ContainerStatusCheckerConfig, ContainerSyncConfig, VncSyncConfig,
+    start_container_status_checker, start_container_sync_task, start_vnc_sync_task,
 };
 
 // 导入统一的容器停止模块
@@ -284,6 +284,15 @@ async fn main() -> anyhow::Result<()> {
     };
     let _container_sync_handle = start_container_sync_task(container_sync_config);
     info!("🔄 容器状态同步任务已启动（间隔: 60 秒，检测外部删除的容器）");
+
+    // 🆕 启动 VNC 后端同步任务（定期从 Docker 同步容器 IP 到 Pingora）
+    if let Some(ref pingora_service) = state.pingora_service {
+        let vnc_sync_config = VncSyncConfig {
+            sync_interval: Duration::from_secs(5), // 每 5 秒同步一次
+        };
+        let _vnc_sync_handle = start_vnc_sync_task(pingora_service.clone(), vnc_sync_config);
+        info!("🔗 VNC 后端同步任务已启动（间隔: 5 秒，从 Docker 同步容器 IP）");
+    }
 
     // 创建路由
     let app = router::create_router(state.clone());

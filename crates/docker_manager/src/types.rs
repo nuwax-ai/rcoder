@@ -119,8 +119,14 @@ pub struct DockerContainerInfo {
     pub container_id: String,
     /// 容器名称
     pub container_name: String,
-    /// 项目 ID
+    /// 项目 ID（RCoder 模式的主键）
     pub project_id: String,
+    /// 用户 ID（ComputerAgentRunner 模式的主键，可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// 服务类型（RCoder 或 ComputerAgentRunner）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<shared_types::ServiceType>,
     /// 镜像名称
     pub image: String,
     /// 状态
@@ -143,6 +149,41 @@ pub struct DockerContainerInfo {
     pub internal_port: u16,
     /// 网络名称
     pub network_name: String,
+}
+
+impl DockerContainerInfo {
+    /// 获取容器的业务主键
+    ///
+    /// 根据 `service_type` 返回正确的标识符：
+    /// - **RCoder**: 返回 `project_id`
+    /// - **ComputerAgentRunner**: 返回 `user_id`（如果有），否则回退到 `project_id`
+    ///
+    /// # Returns
+    /// 容器的业务标识符
+    pub fn container_key(&self) -> &str {
+        match self.service_type {
+            Some(shared_types::ServiceType::ComputerAgentRunner) => {
+                // ComputerAgentRunner 模式优先使用 user_id
+                self.user_id.as_deref().unwrap_or(&self.project_id)
+            }
+            Some(shared_types::ServiceType::RCoder) => {
+                // RCoder 模式使用 project_id
+                &self.project_id
+            }
+            _ => {
+                // 未知类型使用 project_id
+                &self.project_id
+            }
+        }
+    }
+
+    /// 判断是否为 ComputerAgentRunner 容器
+    pub fn is_computer_agent(&self) -> bool {
+        matches!(
+            self.service_type,
+            Some(shared_types::ServiceType::ComputerAgentRunner)
+        )
+    }
 }
 
 /// 容器基本信息（使用shared_types中的定义）

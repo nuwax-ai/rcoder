@@ -62,6 +62,7 @@ pub mod pingora_server;
 pub mod router;
 pub mod server;
 pub mod service;
+pub mod vnc_resolver;
 
 // 重新导出公共接口
 pub use config::ProxyConfig;
@@ -69,6 +70,9 @@ pub use pingora_server::PingoraServerManager;
 pub use router::{create_router, get_routes_documentation, RouteType};
 pub use server::{PingoraServerRunner, ProxyServer, ProxyServerBuilder};
 pub use service::{PingoraProxyService, PortProxyService}; // PortProxyService 是别名
+pub use vnc_resolver::{
+    DynVncBackendResolver, VncBackendInfo, VncBackendResolver, VncResolveError,
+};
 
 // 库级别的常量和类型
 pub const DEFAULT_PORT: u16 = 8080;
