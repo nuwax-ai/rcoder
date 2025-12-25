@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Audio Player - noVNC Remote Desktop</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            color: white;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            max-width: 500px;
+        }
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            opacity: 0.9;
+        }
+        .status-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 1.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        #status {
+            font-size: 1.1rem;
+            margin-bottom: 1rem;
+        }
+        .status-connected {
+            color: #4ade80;
+        }
+        .status-playing {
+            color: #60a5fa;
+        }
+        .status-error {
+            color: #f87171;
+        }
+        .dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #ffffff;
+            margin: 0 3px;
+            animation: blink 1.4s infinite both;
+        }
+        .dot.one { animation-delay: 0.0s; }
+        .dot.two { animation-delay: 0.2s; }
+        .dot.three { animation-delay: 0.4s; }
+        @keyframes blink {
+            0% { opacity: .2; }
+            20% { opacity: 1; }
+            100% { opacity: .2; }
+        }
+        .start-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 1rem 2rem;
+            font-size: 1.1rem;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: none;
+        }
+        .start-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+        .start-btn.show {
+            display: inline-block;
+        }
+        .info {
+            font-size: 0.85rem;
+            opacity: 0.7;
+            margin-top: 1rem;
+        }
+        .volume-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.8; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔊 Remote Desktop Audio</h1>
+        <div class="status-card">
+            <div class="volume-icon" id="volumeIcon">🔇</div>
+            <div id="status">
+                Connecting...
+                <div><span class="dot one"></span><span class="dot two"></span><span class="dot three"></span></div>
+            </div>
+            <button class="start-btn" id="startBtn" onclick="initAudio()">
+                🎵 Enable Audio
+            </button>
+        </div>
+        <p class="info">
+            Audio from the remote desktop will play here.<br>
+            Keep this tab open while using noVNC.
+        </p>
+    </div>
+
+    <script>
+        // --- Configuration ---
+        // WebSocket URL - uses same host as HTTP, different port
+        const WS_PORT = 6089;
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const WEBSOCKET_URL = `${wsProtocol}//${window.location.hostname}:${WS_PORT}`;
+
+        const statusDiv = document.getElementById('status');
+        const startBtn = document.getElementById('startBtn');
+        const volumeIcon = document.getElementById('volumeIcon');
+
+        let audioContext;
+        let audioDecoder;
+        let audioWorkletNode;
+        let workletBufferLength = 0;
+        let websocket;
+
+        function updateStatus(text, className = '') {
+            statusDiv.textContent = text;
+            statusDiv.className = className;
+        }
+
+        function connectWebSocket() {
+            websocket = new WebSocket(WEBSOCKET_URL);
+            websocket.binaryType = 'arraybuffer';
+
+            websocket.onopen = () => {
+                console.log("[WS] WebSocket connected.");
+                updateStatus("Connected. Click to enable audio.", "status-connected");
+                startBtn.classList.add('show');
+                volumeIcon.textContent = '🔈';
+            };
+
+            websocket.onmessage = (event) => {
+                if (!audioDecoder || audioDecoder.state !== "configured") return;
+
+                if (audioContext && audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+                updateStatus("🎵 Receiving audio...", "status-playing");
+                volumeIcon.textContent = '🔊';
+                volumeIcon.classList.add('pulse');
+
+                const dataView = new DataView(event.data);
+                const dataType = dataView.getUint8(0);
+
+                if (dataType === 0x01) {
+                    const opusData = event.data.slice(1);
+
+                    if (audioDecoder.decodeQueueSize > 10) {
+                        return;
+                    }
+
+                    const chunk = new EncodedAudioChunk({
+                        type: 'key',
+                        timestamp: audioContext.currentTime * 1000000,
+                        data: opusData
+                    });
+
+                    try {
+                        audioDecoder.decode(chunk);
+                    } catch (e) {
+                        console.error("[Decoder] Error:", e);
+                    }
+                }
+            };
+
+            websocket.onclose = () => {
+                console.log("[WS] WebSocket disconnected.");
+                updateStatus("Disconnected. Reconnecting...", "status-error");
+                volumeIcon.textContent = '🔇';
+                volumeIcon.classList.remove('pulse');
+                startBtn.classList.remove('show');
+                // Reconnect after 3 seconds
+                setTimeout(connectWebSocket, 3000);
+            };
+
+            websocket.onerror = (err) => {
+                console.error("[WS] WebSocket error:", err);
+                updateStatus("Connection error", "status-error");
+            };
+        }
+
+        async function initAudio() {
+            if (audioContext) return;
+
+            try {
+                startBtn.classList.remove('show');
+                updateStatus("Initializing audio...");
+
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 48000,
+                    latencyHint: 'interactive'
+                });
+
+                const decoderConfig = { codec: 'opus', sampleRate: 48000, numberOfChannels: 2 };
+                const support = await AudioDecoder.isConfigSupported(decoderConfig);
+                if (!support.supported) {
+                    throw new Error("Opus not supported by this browser.");
+                }
+
+                audioDecoder = new AudioDecoder({
+                    output: (audioData) => {
+                        const bufferSizeInBytes = audioData.allocationSize({ planeIndex: 0 });
+                        const pcmData = new Float32Array(bufferSizeInBytes / Float32Array.BYTES_PER_ELEMENT);
+                        audioData.copyTo(pcmData, { planeIndex: 0 });
+                        audioData.close();
+
+                        if (audioWorkletNode) {
+                            audioWorkletNode.port.postMessage(pcmData.buffer, [pcmData.buffer]);
+                        }
+                    },
+                    error: (e) => console.error("[Decoder] Error:", e)
+                });
+                audioDecoder.configure(decoderConfig);
+
+                const workletCode = `
+                    class PlaybackProcessor extends AudioWorkletProcessor {
+                        constructor() {
+                            super();
+                            this.queue = [];
+                            this.currentBuffer = null;
+                            this.bufferOffset = 0;
+                            this.port.onmessage = (event) => {
+                                this.queue.push(new Float32Array(event.data));
+                            };
+                        }
+                        process(inputs, outputs, parameters) {
+                            const output = outputs[0];
+                            const leftChannel = output[0];
+                            const rightChannel = output[1];
+                            const bufferSize = leftChannel.length;
+                            let outputPos = 0;
+                            while (outputPos < bufferSize) {
+                                if (!this.currentBuffer || this.bufferOffset >= this.currentBuffer.length) {
+                                    if (this.queue.length > 0) {
+                                        this.currentBuffer = this.queue.shift();
+                                        this.bufferOffset = 0;
+                                    } else {
+                                        leftChannel.fill(0, outputPos);
+                                        rightChannel.fill(0, outputPos);
+                                        return true;
+                                    }
+                                }
+                                const samplesLeftInBuffer = (this.currentBuffer.length - this.bufferOffset) / 2;
+                                const samplesToCopy = Math.min(bufferSize - outputPos, samplesLeftInBuffer);
+                                for (let i = 0; i < samplesToCopy; i++) {
+                                    leftChannel[outputPos + i] = this.currentBuffer[this.bufferOffset++];
+                                    rightChannel[outputPos + i] = this.currentBuffer[this.bufferOffset++];
+                                }
+                                outputPos += samplesToCopy;
+                            }
+                            return true;
+                        }
+                    }
+                    registerProcessor('playback-processor', PlaybackProcessor);
+                `;
+
+                const workletBlob = new Blob([workletCode], { type: 'application/javascript' });
+                const workletURL = URL.createObjectURL(workletBlob);
+                await audioContext.audioWorklet.addModule(workletURL);
+
+                audioWorkletNode = new AudioWorkletNode(audioContext, 'playback-processor', {
+                    outputChannelCount: [2]
+                });
+                audioWorkletNode.connect(audioContext.destination);
+
+                updateStatus("Audio ready. Waiting for stream...", "status-connected");
+                console.log("[Audio] Pipeline initialized successfully.");
+
+            } catch (err) {
+                console.error("[Audio] Init failed:", err);
+                updateStatus("Error: " + err.message, "status-error");
+                startBtn.classList.add('show');
+            }
+        }
+
+        // Start connection
+        connectWebSocket();
+    </script>
+</body>
+</html>
