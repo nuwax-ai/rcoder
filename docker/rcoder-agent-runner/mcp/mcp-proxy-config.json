@@ -1,0 +1,18 @@
+{
+    "mcpServers": {
+        "chrome-devtools": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "chrome-devtools-mcp@latest",
+                "--userDataDir=/home/user/.config/chromium",
+                "--executablePath=/usr/local/bin/chromium-for-mcp",
+                "--chromeArg=--no-sandbox",
+                "--chromeArg=--no-zygote",
+                "--chromeArg=--disable-dev-shm-usage",
+                "--chromeArg=--disable-gpu",
+                "--chromeArg=--remote-debugging-port=9222"
+            ]
+        }
+    }
+}
