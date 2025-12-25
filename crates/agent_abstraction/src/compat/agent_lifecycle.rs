@@ -74,6 +74,8 @@ impl AgentLifecycleGuard {
     }
 
     /// 优雅停止agent
+    ///
+    /// 带超时机制（5秒），超时后强制 kill 子进程
     pub async fn graceful_stop(&self) -> Result<()> {
         if self.inner.stopped.load(Ordering::SeqCst) {
             info!("Agent already stopped, skipping graceful stop");
@@ -85,18 +87,53 @@ impl AgentLifecycleGuard {
             self.inner.project_id
         );
 
-        // 发送取消信号
+        // 1. 发送取消信号
         self.inner.cancel_token.cancel();
 
-        // 根据资源类型执行相应的清理操作
+        // 2. 根据资源类型执行相应的清理操作
         match &self.inner.resources {
             AgentResources::Claude { child_process, .. } => {
                 let mut child_guard = child_process.lock().await;
                 if let Some(mut child) = child_guard.take() {
                     info!("Stopping Claude child process");
-                    match child.wait().await {
-                        Ok(status) => info!("Claude process exited with status: {}", status),
-                        Err(e) => warn!("Failed to wait for Claude process: {}", e),
+
+                    // 设置超时时间：5 秒
+                    let timeout_duration = tokio::time::Duration::from_secs(5);
+
+                    // 使用 timeout 包装 wait，避免无限等待
+                    match tokio::time::timeout(timeout_duration, child.wait()).await {
+                        Ok(Ok(status)) => {
+                            info!(
+                                "✅ Claude process exited gracefully with status: {} (project: {})",
+                                status, self.inner.project_id
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                "⚠️ Failed to wait for Claude process (project: {}): {}",
+                                self.inner.project_id, e
+                            );
+                        }
+                        Err(_) => {
+                            // 超时后强制 kill
+                            warn!(
+                                "⏰ Claude process didn't exit within {}s, force killing (project: {})",
+                                timeout_duration.as_secs(),
+                                self.inner.project_id
+                            );
+
+                            if let Err(e) = child.kill().await {
+                                warn!(
+                                    "⚠️ Failed to kill Claude process (project: {}): {}",
+                                    self.inner.project_id, e
+                                );
+                            } else {
+                                info!(
+                                    "💀 Claude process force killed (project: {})",
+                                    self.inner.project_id
+                                );
+                            }
+                        }
                     }
                 }
             }
