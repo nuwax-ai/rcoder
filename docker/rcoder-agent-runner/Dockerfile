@@ -37,6 +37,8 @@ RUN apt-get update && \
     xdotool scrot ffmpeg \
     # VNC and streaming:
     x11vnc net-tools netcat-openbsd \
+    # Audio streaming (PulseAudio + pcmflux dependencies):
+    pulseaudio pulseaudio-utils libpulse-dev libopus-dev \
     # Standard applications:
     x11-apps xpdf gedit xpaint tint2 galculator pcmanfm \
     # Dependencies for later installations:
@@ -550,6 +552,22 @@ ENV PATH="/opt/cargo/bin:/usr/local/bin:${PATH}"
 # 复制预构建的 agent_runner 二进制文件（需要 root）
 COPY bin/agent_runner /usr/local/bin/agent_runner
 RUN chmod +x /usr/local/bin/agent_runner
+
+# ============================================================================
+# 🔊 pcmflux 音频流服务安装
+# ============================================================================
+# 安装 pcmflux Python 包（需要 root，用于编译 C++ 扩展）
+RUN pip3 install websockets && \
+    pip3 install git+https://github.com/linuxserver/pcmflux.git && \
+    echo "✅ pcmflux audio streaming installed"
+
+# 复制音频服务脚本和静态文件
+COPY audio_server.py /usr/local/bin/audio_server.py
+COPY audio_static /usr/local/share/audio_static
+RUN chmod +x /usr/local/bin/audio_server.py
+
+# 暴露音频流 HTTP 端口
+EXPOSE 6090
 
 # ============================================================================
 # 🎯 切换到普通用户 - 后续操作以 user 身份执行

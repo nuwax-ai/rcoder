@@ -699,6 +699,77 @@ function check_vnc_health() {
 
 # Jupyter server function removed
 
+# ============================================================================
+# 🔊 音频流服务 (pcmflux)
+# 使用 PulseAudio 虚拟声卡捕获音频，通过 WebSocket 流到浏览器
+# ============================================================================
+function start_audio_services() {
+    echo "🔊 Starting audio streaming services (pcmflux)..."
+
+    # 1. 启动 PulseAudio 守护进程
+    echo "  Starting PulseAudio daemon..."
+    
+    # 确保 PulseAudio 目录存在
+    mkdir -p /home/user/.config/pulse
+    mkdir -p /var/run/pulse
+    chmod 777 /var/run/pulse
+    
+    # 启动 PulseAudio（非系统模式，允许运行为 root）
+    HOME=/home/user pulseaudio --start --exit-idle-time=-1 --log-level=warning 2>/tmp/pulseaudio.log || true
+    sleep 2
+
+    # 检查 PulseAudio 是否启动
+    if pgrep -x pulseaudio >/dev/null 2>&1; then
+        echo "  ✓ PulseAudio daemon started"
+    else
+        echo "  ⚠ PulseAudio failed to start, checking log..."
+        cat /tmp/pulseaudio.log 2>/dev/null || true
+        # 尝试用 --system 模式启动
+        pulseaudio --system --disallow-exit --disallow-module-loading=0 &
+        sleep 2
+    fi
+
+    # 2. 创建虚拟声卡 (null sink) 作为音频输出目标
+    echo "  Creating virtual audio sink..."
+    pactl load-module module-null-sink sink_name=virtual_speaker \
+          sink_properties=device.description="Virtual_Speaker" 2>/dev/null || true
+    
+    # 设置虚拟声卡为默认输出
+    pactl set-default-sink virtual_speaker 2>/dev/null || true
+    
+    # 验证虚拟声卡
+    if pactl list sinks short 2>/dev/null | grep -q "virtual_speaker"; then
+        echo "  ✓ Virtual speaker sink created"
+    else
+        echo "  ⚠ Failed to create virtual speaker sink"
+    fi
+
+    # 3. 启动 pcmflux 音频流服务
+    echo "  Starting pcmflux audio streaming service..."
+    
+    # 设置音频设备环境变量
+    export AUDIO_DEVICE="virtual_speaker.monitor"
+    export AUDIO_HTTP_PORT=6090
+    export AUDIO_WS_PORT=6089
+    
+    # 后台启动音频服务器
+    nohup python3 /usr/local/bin/audio_server.py > /tmp/audio_server.log 2>&1 &
+    sleep 2
+
+    # 检查音频服务是否启动
+    if pgrep -f "audio_server.py" >/dev/null 2>&1; then
+        echo "  ✓ pcmflux audio server started"
+        echo "  ✓ Audio HTTP: http://localhost:6090"
+        echo "  ✓ Audio WebSocket: ws://localhost:6089"
+    else
+        echo "  ⚠ pcmflux audio server failed to start"
+        echo "  Error log:"
+        cat /tmp/audio_server.log 2>/dev/null | tail -20 || true
+    fi
+
+    echo "✅ Audio streaming services initialized"
+}
+
 echo "Starting Code Interpreter server..."
 
 # 设置VNC自动启动标志
@@ -743,6 +814,9 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
 
     # 应用 XFCE 壁纸
     apply_xfce_wallpaper
+
+    # 启动音频流服务 (pcmflux)
+    start_audio_services
 
     # VNC服务监控循环 (as root)
     while true; do
