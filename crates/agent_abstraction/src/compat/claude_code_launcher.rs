@@ -272,9 +272,7 @@ pub struct ClaudeCodeLauncher<N: SessionNotifier> {
 impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
     /// 创建新的启动器
     pub fn new(notifier: Arc<N>) -> Self {
-        Self {
-            notifier,
-        }
+        Self { notifier }
     }
 
     /// 启动 Claude Code ACP Agent 服务
@@ -307,7 +305,8 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
         // 从配置加载 Agent 参数（传递 service_type）
-        let agent_config = load_agent_config(model_provider.as_ref(), &start_config.service_type).await?;
+        let agent_config =
+            load_agent_config(model_provider.as_ref(), &start_config.service_type).await?;
         let command_path = &agent_config.command;
         let command_args = &agent_config.args;
         info!("Claude Code ACP 命令: {} {:?}", command_path, command_args);
@@ -353,7 +352,14 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
 
         // 启动子进程
         let spawn_args = command_args.clone();
-        let merged_envs = agent_config.env.clone();
+        let mut merged_envs = agent_config.env.clone();
+        // 添加工作目录环境变量，方便 agent 获取当前项目路径
+        merged_envs.insert(
+            "AGENT_WORKING_DIR".to_string(),
+            project_path_for_closure.to_string_lossy().to_string(),
+        );
+        // 添加项目 ID 环境变量
+        merged_envs.insert("AGENT_PROJECT_ID".to_string(), project_id.clone());
         let mut child = tokio::process::Command::new(command_path)
             .args(&spawn_args)
             .stdin(Stdio::piped())
@@ -415,8 +421,11 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                     let init_result = client_conn
                         .initialize(
                             InitializeRequest::new(VERSION).client_info(
-                                Implementation::new("rcoder-agent-runner", env!("CARGO_PKG_VERSION"))
-                                    .title("RCoder Agent Runner"),
+                                Implementation::new(
+                                    "rcoder-agent-runner",
+                                    env!("CARGO_PKG_VERSION"),
+                                )
+                                .title("RCoder Agent Runner"),
                             ),
                         )
                         .await;
