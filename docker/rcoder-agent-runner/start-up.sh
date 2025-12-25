@@ -28,7 +28,7 @@ if [ -d "$CONTAINER_LOGS_DIR" ] && [ -w "$CONTAINER_LOGS_DIR" ]; then
     # stderr -> tee -> ERROR_LOG
     exec > >(tee -a "$STARTUP_LOG") 2> >(tee -a "$ERROR_LOG" >&2)
 
-    echo "📁 容器日志持久化已启用: $CONTAINER_LOGS_DIR"
+    log "容器日志持久化已启用: $CONTAINER_LOGS_DIR"
     echo "   - startup.log: 启动日志"
     echo "   - error.log: 错误日志"
     echo "   - agent.log: Agent 运行日志 (如有)"
@@ -38,8 +38,32 @@ if [ -d "$CONTAINER_LOGS_DIR" ] && [ -w "$CONTAINER_LOGS_DIR" ]; then
     export CONTAINER_ERROR_LOG="$ERROR_LOG"
     export CONTAINER_AGENT_LOG="$AGENT_LOG"
 else
-    echo "⚠️  容器日志目录不可用，使用默认输出"
+    log_warn " 容器日志目录不可用，使用默认输出"
 fi
+
+# ============================================================================
+# 📝 带时间戳的日志函数
+# 所有日志输出都会自动添加时间前缀，格式：[YYYY-MM-DD HH:MM:SS]
+# ============================================================================
+function log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+function log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ℹ️  $*"
+}
+
+function log_success() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✓ $*"
+}
+
+function log_warn() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  $*"
+}
+
+function log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ $*"
+}
 
 # ============================================================================
 # 🎯 动态时区设置（支持通过 TZ 环境变量自定义时区）
@@ -50,11 +74,11 @@ fi
 function initialize_timezone() {
     # 如果 TZ 环境变量未设置或为空，保持默认时区（Asia/Shanghai）
     if [ -z "$TZ" ]; then
-        echo "🕐 Using default timezone: Asia/Shanghai"
+        log "Using default timezone: Asia/Shanghai"
         return 0
     fi
 
-    echo "🕐 Setting timezone to: $TZ"
+    log "Setting timezone to: $TZ"
 
     # 检查时区文件是否存在
     if [ -f "/usr/share/zoneinfo/$TZ" ]; then
@@ -62,9 +86,9 @@ function initialize_timezone() {
         ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
         # 更新 /etc/timezone 文件
         echo "$TZ" > /etc/timezone
-        echo "✅ Timezone set to $TZ"
+        log_success "Timezone set to $TZ"
     else
-        echo "⚠️  Invalid timezone: $TZ (file /usr/share/zoneinfo/$TZ not found)"
+        log_warn " Invalid timezone: $TZ (file /usr/share/zoneinfo/$TZ not found)"
         echo "   Available timezones can be found in /usr/share/zoneinfo/"
         echo "   Keeping default timezone: Asia/Shanghai"
     fi
@@ -87,14 +111,14 @@ initialize_timezone
 # 此函数从骨架目录 /etc/skel-user-desktop 恢复必要的配置文件
 # ============================================================================
 function initialize_user_home() {
-    echo "🏠 Initializing user home directory..."
+    log "Initializing user home directory..."
 
     local SKEL_DIR="/etc/skel-user-desktop"
     local USER_HOME="/home/user"
 
     # 检查骨架目录是否存在
     if [ ! -d "$SKEL_DIR" ]; then
-        echo "⚠️  Skeleton directory not found: $SKEL_DIR"
+        log_warn " Skeleton directory not found: $SKEL_DIR"
         return 1
     fi
 
@@ -109,12 +133,12 @@ function initialize_user_home() {
        [ ! -d "$USER_HOME/.claude" ] || \
        [ ! -d "$USER_HOME/.config/xfce4" ]; then
         need_restore=true
-        echo "📁 Detected empty or incomplete user home directory (likely mounted)"
+        log "Detected empty or incomplete user home directory (likely mounted)"
         echo "   Missing: $([ ! -d "$USER_HOME/Desktop" ] && echo 'Desktop ')$([ ! -f "$USER_HOME/.bashrc" ] && echo '.bashrc ')$([ ! -f "$USER_HOME/.bunfig.toml" ] && echo '.bunfig.toml ')$([ ! -d "$USER_HOME/.claude" ] && echo '.claude ')$([ ! -d "$USER_HOME/.config/xfce4" ] && echo '.config/xfce4 ')"
     fi
 
     if [ "$need_restore" = true ]; then
-        echo "📦 Restoring user configuration from skeleton directory..."
+        log "Restoring user configuration from skeleton directory..."
 
         # 创建必要的目录结构
         mkdir -p "$USER_HOME/.config" "$USER_HOME/.local/share" "$USER_HOME/.cache"
@@ -128,13 +152,13 @@ function initialize_user_home() {
             cp -a "$SKEL_DIR/Desktop/"*.desktop "$USER_HOME/Desktop/" 2>/dev/null || true
             # 设置可执行权限
             chmod +x "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
-            echo "  ✓ Desktop icons restored (forced overwrite)"
+            log_success "  Desktop icons restored (forced overwrite)"
         fi
 
         # ========== .bashrc - 强制覆盖 ==========
         if [ -f "$SKEL_DIR/.bashrc" ]; then
             cp -a "$SKEL_DIR/.bashrc" "$USER_HOME/.bashrc"
-            echo "  ✓ .bashrc restored (forced overwrite)"
+            log_success "  .bashrc restored (forced overwrite)"
         fi
 
         # ========== .config 目录 - 强制覆盖（保留 Chromium 用户数据）==========
@@ -144,38 +168,38 @@ function initialize_user_home() {
             if [ -d "$USER_HOME/.config/chromium" ]; then
                 chromium_backup=$(mktemp -d)
                 cp -a "$USER_HOME/.config/chromium" "$chromium_backup/" 2>/dev/null || true
-                echo "  ✓ Chromium user data backed up"
+                log_success "  Chromium user data backed up"
             fi
             
             # 2. 强制覆盖整个 .config 目录
             cp -a "$SKEL_DIR/.config/." "$USER_HOME/.config/" 2>/dev/null || true
-            echo "  ✓ .config directory restored (forced overwrite)"
+            log_success "  .config directory restored (forced overwrite)"
             
             # 3. 还原 Chromium 用户数据（覆盖骨架目录的默认配置）
             if [ -n "$chromium_backup" ] && [ -d "$chromium_backup/chromium" ]; then
                 cp -a "$chromium_backup/chromium/." "$USER_HOME/.config/chromium/" 2>/dev/null || true
                 rm -rf "$chromium_backup"
-                echo "  ✓ Chromium user data restored"
+                log_success "  Chromium user data restored"
             fi
         fi
 
         # ========== .local 目录 - 强制覆盖 ==========
         if [ -d "$SKEL_DIR/.local" ]; then
             cp -a "$SKEL_DIR/.local/." "$USER_HOME/.local/" 2>/dev/null || true
-            echo "  ✓ .local directory restored (forced overwrite)"
+            log_success "  .local directory restored (forced overwrite)"
         fi
 
         # ========== .bunfig.toml - 强制覆盖 ==========
         if [ -f "$SKEL_DIR/.bunfig.toml" ]; then
             cp -a "$SKEL_DIR/.bunfig.toml" "$USER_HOME/.bunfig.toml"
-            echo "  ✓ .bunfig.toml restored (forced overwrite)"
+            log_success "  .bunfig.toml restored (forced overwrite)"
         fi
 
         # ========== .claude 目录 - 不覆盖（保留用户配置）==========
         if [ -d "$SKEL_DIR/.claude" ]; then
             mkdir -p "$USER_HOME/.claude"
             cp -an "$SKEL_DIR/.claude/." "$USER_HOME/.claude/" 2>/dev/null || true
-            echo "  ✓ .claude directory restored (preserve existing)"
+            log_success "  .claude directory restored (preserve existing)"
         fi
 
         # .cache 目录 - 恢复工具缓存配置（bun, uv, pnpm）
@@ -185,14 +209,14 @@ function initialize_user_home() {
             for cache_subdir in bun uv pnpm; do
                 if [ -d "$SKEL_DIR/.cache/$cache_subdir" ] && [ ! -d "$USER_HOME/.cache/$cache_subdir" ]; then
                     mkdir -p "$USER_HOME/.cache/$cache_subdir"
-                    echo "  ✓ .cache/$cache_subdir directory created"
+                    log_success "  .cache/$cache_subdir directory created"
                 fi
             done
         fi
 
-        echo "✅ User home directory initialized from skeleton"
+        log_success "User home directory initialized from skeleton"
     else
-        echo "✅ User home directory already initialized"
+        log_success "User home directory already initialized"
     fi
 
     # ========== 额外保护：确保 XFCE Panel 配置始终有效 ==========
@@ -206,30 +230,30 @@ function initialize_user_home() {
     # 检查 panel.xml 是否存在且有效
     if [ ! -f "$XFCE_PANEL_XML" ] || [ ! -s "$XFCE_PANEL_XML" ]; then
         panel_corrupted=true
-        echo "🔧 XFCE Panel config missing or empty"
+        log "XFCE Panel config missing or empty"
     elif ! grep -q 'value="launcher"' "$XFCE_PANEL_XML" 2>/dev/null; then
         # 检查 panel.xml 是否包含有效的 launcher 定义
         # 如果 plugin-17 等不是 type="string" value="launcher"，说明配置被 XFCE 重写损坏了
         panel_corrupted=true
-        echo "🔧 XFCE Panel config corrupted (launcher definitions missing)"
+        log "XFCE Panel config corrupted (launcher definitions missing)"
     elif ! grep -q 'xfce4-terminal-emulator.desktop' "$XFCE_PANEL_XML" 2>/dev/null; then
         # 检查是否包含 launcher items（.desktop 文件引用）
         panel_corrupted=true
-        echo "🔧 XFCE Panel config corrupted (launcher items empty)"
+        log "XFCE Panel config corrupted (launcher items empty)"
     fi
     
     if [ "$panel_corrupted" = true ]; then
-        echo "📦 Restoring XFCE Panel config from system..."
+        log "Restoring XFCE Panel config from system..."
         mkdir -p "$(dirname "$XFCE_PANEL_XML")"
         if [ -f "$XFCE_PANEL_SYSTEM" ]; then
             cp -f "$XFCE_PANEL_SYSTEM" "$XFCE_PANEL_XML"
-            echo "  ✓ xfce4-panel.xml restored from system config (forced overwrite)"
+            log_success "  xfce4-panel.xml restored from system config (forced overwrite)"
         elif [ -f "$SKEL_DIR/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" ]; then
             cp -f "$SKEL_DIR/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" "$XFCE_PANEL_XML"
-            echo "  ✓ xfce4-panel.xml restored from skeleton (forced overwrite)"
+            log_success "  xfce4-panel.xml restored from skeleton (forced overwrite)"
         fi
     else
-        echo "✅ XFCE Panel config is valid"
+        log_success "XFCE Panel config is valid"
     fi
     
     # 确保 Panel launcher 目录存在且内容完整（强制恢复）
@@ -243,7 +267,7 @@ function initialize_user_home() {
             if [ ! -d "$launcher_dir" ] || [ -z "$(ls -A "$launcher_dir" 2>/dev/null)" ]; then
                 mkdir -p "$launcher_dir"
                 cp -f "$system_launcher/"* "$launcher_dir/" 2>/dev/null || true
-                echo "  ✓ launcher-$launcher_id restored (forced)"
+                log_success "  launcher-$launcher_id restored (forced)"
             fi
         fi
     done
@@ -265,15 +289,15 @@ infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity
     # 为 /root 创建配置
     mkdir -p /root/.config/gtk-3.0
     echo "$GTK_CSS_CONTENT" > /root/.config/gtk-3.0/gtk.css
-    echo "  ✓ GTK CSS created for /root"
+    log_success "  GTK CSS created for /root"
 
     # 为 /home/user 创建配置
     mkdir -p "$USER_HOME/.config/gtk-3.0"
     echo "$GTK_CSS_CONTENT" > "$USER_HOME/.config/gtk-3.0/gtk.css"
-    echo "  ✓ GTK CSS created for $USER_HOME"
+    log_success "  GTK CSS created for $USER_HOME"
 
     # ========== 设置 Chromium 为默认浏览器（解决 xdg-open 无法打开浏览器问题）==========
-    echo "🌐 Configuring Chromium as default web browser..."
+    log "Configuring Chromium as default web browser..."
     
     # 创建用户级 mimeapps.list（强制覆盖，确保默认浏览器设置正确）
     mkdir -p "$USER_HOME/.config" "$USER_HOME/.local/share/applications"
@@ -306,25 +330,25 @@ EOF
     # 这里先创建配置文件，xdg-settings 会在 DISPLAY 环境变量存在时使用
     export BROWSER="/usr/bin/chromium-browser-launcher"
     
-    echo "  ✓ Chromium set as default web browser (mimeapps.list)"
-    echo "  ✓ BROWSER env set to: $BROWSER"
+    log_success "  Chromium set as default web browser (mimeapps.list)"
+    log_success "  BROWSER env set to: $BROWSER"
 
     # ========== 修复挂载目录的权限（解决宿主机 UID 不匹配） ==========
     # 注意：由于 Dockerfile 中用户配置已经以 user 身份创建，
     # 这里只需要处理可能被宿主机挂载覆盖的目录
-    echo "🔧 Fixing permissions for mounted directories..."
+    log "Fixing permissions for mounted directories..."
 
     # 确保必要目录存在
     mkdir -p "$USER_HOME/.cache" /app /tmp/mesa_shader_cache "${CONTAINER_LOGS_DIR:-/app/container-logs}"
 
     # 修复 /home/user 目录的所有者（重要：当宿主机挂载空目录时）
-    echo "👤 Fixing ownership for /home/user and mounted directories..."
+    log "Fixing ownership for /home/user and mounted directories..."
     chown -R user:user "$USER_HOME" 2>/dev/null || true
     chown -R user:user /app "${CONTAINER_LOGS_DIR:-/app/container-logs}" 2>/dev/null || true
     chown -R user:user /tmp/mesa_shader_cache 2>/dev/null || true
 
     # 修复权限
-    echo "🔐 Fixing permissions..."
+    log "Fixing permissions..."
     chmod -R u+rwX /app "$USER_HOME/.cache" 2>/dev/null || true
 
     # 对于可能无法 chown 的挂载目录，尝试添加 other 权限
@@ -333,7 +357,7 @@ EOF
     # 确保 bin 目录下的文件可执行
     [ -d /app/bin ] && chmod -R a+x /app/bin 2>/dev/null || true
 
-    echo "✅ Permissions fixed"
+    log_success "Permissions fixed"
 
     # ========== 设置渲染相关环境变量（防止花屏）==========
     # 将 Mesa 着色器缓存移到 /tmp（不受 /home/user 挂载影响）
@@ -345,11 +369,11 @@ EOF
     # 将 X 认证文件移到 /tmp
     export XAUTHORITY="/tmp/.Xauthority"
 
-    echo "✅ Mesa shader cache configured: /tmp/mesa_shader_cache"
+    log_success "Mesa shader cache configured: /tmp/mesa_shader_cache"
 }
 
 function start_vnc_services() {
-	echo "Starting VNC services (as root)..."
+    log "Starting VNC services (as root)..."
 
 	# 等待X11服务完全启动
 	counter=0
@@ -357,12 +381,12 @@ function start_vnc_services() {
 		sleep 0.5
 		let counter++
 		if ((counter > 30)); then
-			echo "X11 not ready, skipping VNC startup"
+			log "X11 not ready, skipping VNC startup"
 			return 1
 		fi
 	done
 
-	echo "X11 is ready, starting VNC..."
+	log "X11 is ready, starting VNC..."
 
 	# 停止可能存在的VNC服务
 	pkill x11vnc || true
@@ -392,7 +416,7 @@ function start_vnc_services() {
 	# 检查x11vnc进程
 	if pgrep -x x11vnc >/dev/null 2>&1; then
 		vnc_running=true
-		echo "✓ x11vnc server started on port 5900"
+		log_success "x11vnc server started on port 5900"
 	else
 		echo "✗ x11vnc server failed to start"
 		echo "Error log:"
@@ -402,7 +426,7 @@ function start_vnc_services() {
 	# 检查noVNC端口
 	if netstat -tuln 2>/dev/null | grep -q ":6080 "; then
 		novnc_running=true
-		echo "✓ noVNC proxy started on port 6080"
+		log_success "noVNC proxy started on port 6080"
 		echo "  VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
 	else
 		echo "✗ noVNC proxy failed to start"
@@ -411,7 +435,7 @@ function start_vnc_services() {
 	fi
 
 	if [ "$vnc_running" = true ] && [ "$novnc_running" = true ]; then
-		echo "✓ VNC services started successfully!"
+		log_success "VNC services started successfully!"
 		return 0
 	else
 		echo "✗ VNC services failed to start properly"
@@ -420,7 +444,7 @@ function start_vnc_services() {
 }
 
 function start_display_and_desktop() {
-	echo "Starting X11 display server and XFCE4 desktop..."
+    log "Starting X11 display server and XFCE4 desktop..."
 
 	# 清理可能存在的X11锁文件和进程
 	rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 /tmp/.Xauthority /tmp/dbus-session-env
@@ -436,7 +460,7 @@ function start_display_and_desktop() {
     chmod 666 /tmp/dbus-session-env
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
-	echo "🧹 Cleaning up stale Chromium processes and lock files..."
+	log "Cleaning up stale Chromium processes and lock files..."
 
 	# 1. 强制终止所有遗留的 Chromium 进程
 	pkill -9 -f "chromium" || true
@@ -445,7 +469,7 @@ function start_display_and_desktop() {
 	# 2. 设置持久化的 Chromium 数据目录路径
 	# 使用用户主目录的标准配置路径（自动持久化）
 	CHROMIUM_USER_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"
-	echo "✅ 使用 Chromium 数据目录: $CHROMIUM_USER_DATA_DIR (自动持久化)"
+	log_success "使用 Chromium 数据目录: $CHROMIUM_USER_DATA_DIR (自动持久化)"
 
 	# 3. 创建 Chromium 数据目录（如果不存在）
 	mkdir -p "$CHROMIUM_USER_DATA_DIR"
@@ -472,7 +496,7 @@ function start_display_and_desktop() {
 		find "$CHROMIUM_USER_DATA_DIR" -name "*.lock" -type f -delete 2>/dev/null || true
 		find "$CHROMIUM_USER_DATA_DIR" -name "lockfile" -type f -delete 2>/dev/null || true
 
-		echo "✅ Chromium lock files cleaned from: $CHROMIUM_USER_DATA_DIR"
+		log_success "Chromium lock files cleaned from: $CHROMIUM_USER_DATA_DIR"
 	fi
 
 	# 6. 清理 /tmp 中的 Chromium 临时文件
@@ -482,7 +506,7 @@ function start_display_and_desktop() {
 	# 7. 清理 /dev/shm 中的 Chromium 共享内存
 	rm -rf /dev/shm/.org.chromium.Chromium.* || true
 
-	echo "✅ Chromium cleanup completed (data dir: $CHROMIUM_USER_DATA_DIR)"
+	log_success "Chromium cleanup completed (data dir: $CHROMIUM_USER_DATA_DIR)"
 
 	# 创建用户运行时目录并设置权限
 	USER_ID=$(id -u user)
@@ -497,7 +521,7 @@ function start_display_and_desktop() {
 	export LC_CTYPE=C.UTF-8
 
 	# 启动 D-Bus 会话 (以 root 启动，但 HOME 设置为 /home/user)
-	echo "Starting D-Bus session as root (HOME=/home/user)..."
+    log "Starting D-Bus session as root (HOME=/home/user)..."
 	HOME=/home/user dbus-launch --sh-syntax > /tmp/dbus-session-env
 	sleep 2
 
@@ -513,22 +537,22 @@ function start_display_and_desktop() {
 		echo "DBUS_SESSION_BUS_ADDRESS=\"${DBUS_ADDR}\"" >> /etc/environment
 		# 同时导出到当前 shell 环境
 		export DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}"
-		echo "✓ D-Bus address exported to global environment"
+		log_success "D-Bus address exported to global environment"
 
 		# ========== 关键修复：允许 root 访问 user 的 D-Bus socket ==========
 		# 修改 D-Bus socket 文件权限，允许 root 用户连接（用于 MCP chromium 中文输入）
 		chmod 777 /tmp/dbus-* 2>/dev/null || true
-		echo "✓ D-Bus socket permissions updated for root access"
+		log_success "D-Bus socket permissions updated for root access"
 	fi
 
 	# 启动 D-Bus 系统总线
-	echo "Starting D-Bus system bus..."
+    log "Starting D-Bus system bus..."
 	mkdir -p /var/run/dbus
 	dbus-daemon --system --fork
 	sleep 1
 
 	# 启动 PolicyKit 守护进程（配置为不需要认证）
-	echo "Starting PolicyKit daemon..."
+    log "Starting PolicyKit daemon..."
 	/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
 	sleep 2
 
@@ -549,7 +573,7 @@ function start_display_and_desktop() {
 
 	# ========== 关键修复：手动启动 fcitx5，确保环境变量正确 ==========
 	# 不再依赖 XFCE autostart，直接用正确的环境变量启动 (as root, HOME=/home/user)
-	echo "Starting fcitx5 input method (as root)..."
+    log "Starting fcitx5 input method (as root)..."
 	env \
 		HOME=/home/user \
 		DISPLAY=:0 \
@@ -566,7 +590,7 @@ function start_display_and_desktop() {
 
 	# 验证 fcitx5 启动成功
 	if pgrep -x fcitx5 >/dev/null 2>&1; then
-		echo "✓ fcitx5 started successfully"
+		log_success "fcitx5 started successfully"
 	else
 		echo "✗ fcitx5 failed to start, check /tmp/fcitx5-startup.log"
 	fi
@@ -591,7 +615,7 @@ function start_display_and_desktop() {
 	export SDL_IM_MODULE=fcitx
 	export GLFW_IM_MODULE=ibus
 
-	echo "Environment variables set:"
+	log "Environment variables set:"
 	echo "  HOME=$HOME"
 	echo "  GTK_IM_MODULE=$GTK_IM_MODULE"
 	echo "  XMODIFIERS=$XMODIFIERS"
@@ -626,7 +650,7 @@ function start_display_and_desktop() {
 		INPUT_METHOD=fcitx \
 		xfce4-session &
 
-	echo "X11 display and XFCE4 desktop started successfully (as root, HOME=/home/user)"
+	log "X11 display and XFCE4 desktop started successfully (as root, HOME=/home/user)"
 }
 
 # ============================================================================
@@ -635,7 +659,7 @@ function start_display_and_desktop() {
 # 其他配置（screensaver, power-manager, panel）已在 /etc/xdg/xfce4 系统目录中
 # ============================================================================
 function apply_xfce_wallpaper() {
-    echo "🎨 Applying XFCE wallpaper (as root)..."
+    log "Applying XFCE wallpaper (as root)..."
 
     # 等待 XFCE 桌面完全启动
     local counter=0
@@ -643,18 +667,18 @@ function apply_xfce_wallpaper() {
         sleep 1
         let counter++
         if ((counter > 30)); then
-            echo "⚠️  Timeout waiting for XFCE desktop, skipping wallpaper"
+            log_warn " Timeout waiting for XFCE desktop, skipping wallpaper"
             return 1
         fi
     done
 
     local WALLPAPER_PATH="/usr/share/backgrounds/xfce/wallpaper.png"
     if [ ! -f "$WALLPAPER_PATH" ]; then
-        echo "⚠️  Wallpaper not found: $WALLPAPER_PATH"
+        log_warn " Wallpaper not found: $WALLPAPER_PATH"
         return 1
     fi
 
-    echo "  ✓ Setting wallpaper: $WALLPAPER_PATH"
+    log_success "  Setting wallpaper: $WALLPAPER_PATH"
 
     # 获取当前的 monitor 配置（XFCE 可能使用不同的名称）
     local monitors=$(DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image' | head -5)
@@ -673,7 +697,7 @@ function apply_xfce_wallpaper() {
     # 设置壁纸样式（5 = 缩放）
     DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5 2>/dev/null || true
 
-    echo "✅ XFCE wallpaper applied successfully"
+    log_success "XFCE wallpaper applied successfully"
 }
 
 function check_vnc_health() {
@@ -681,17 +705,17 @@ function check_vnc_health() {
     if [ "$VNC_AUTO_START" = "true" ]; then
         # 检查x11vnc进程
         if ! pgrep -x x11vnc >/dev/null 2>&1; then
-            echo "⚠️  x11vnc process not running, attempting restart..."
+            log_warn " x11vnc process not running, attempting restart..."
             return 1
         fi
 
         # 检查noVNC端口
         if ! netstat -tuln 2>/dev/null | grep -q ":6080 "; then
-            echo "⚠️  noVNC proxy not listening on port 6080, attempting restart..."
+            log_warn " noVNC proxy not listening on port 6080, attempting restart..."
             return 1
         fi
 
-        echo "✓ VNC services are healthy"
+        log_success "VNC services are healthy"
         return 0
     fi
     return 0
@@ -704,7 +728,7 @@ function check_vnc_health() {
 # 使用 PulseAudio 虚拟声卡捕获音频，通过 WebSocket 流到浏览器
 # ============================================================================
 function start_audio_services() {
-    echo "🔊 Starting audio streaming services (pcmflux)..."
+    log "Starting audio streaming services (pcmflux)..."
 
     # 1. 启动 PulseAudio 守护进程
     echo "  Starting PulseAudio daemon..."
@@ -720,9 +744,9 @@ function start_audio_services() {
 
     # 检查 PulseAudio 是否启动
     if pgrep -x pulseaudio >/dev/null 2>&1; then
-        echo "  ✓ PulseAudio daemon started"
+        log_success "  PulseAudio daemon started"
     else
-        echo "  ⚠ PulseAudio failed to start, checking log..."
+        log_warn "  PulseAudio failed to start, checking log..."
         cat /tmp/pulseaudio.log 2>/dev/null || true
         # 尝试用 --system 模式启动
         pulseaudio --system --disallow-exit --disallow-module-loading=0 &
@@ -739,9 +763,9 @@ function start_audio_services() {
     
     # 验证虚拟声卡
     if pactl list sinks short 2>/dev/null | grep -q "virtual_speaker"; then
-        echo "  ✓ Virtual speaker sink created"
+        log_success "  Virtual speaker sink created"
     else
-        echo "  ⚠ Failed to create virtual speaker sink"
+        log_warn "  Failed to create virtual speaker sink"
     fi
 
     # 3. 启动 pcmflux 音频流服务
@@ -758,16 +782,16 @@ function start_audio_services() {
 
     # 检查音频服务是否启动
     if pgrep -f "audio_server.py" >/dev/null 2>&1; then
-        echo "  ✓ pcmflux audio server started"
-        echo "  ✓ Audio HTTP: http://localhost:6090"
-        echo "  ✓ Audio WebSocket: ws://localhost:6089"
+        log_success "  pcmflux audio server started"
+        log_success "  Audio HTTP: http://localhost:6090"
+        log_success "  Audio WebSocket: ws://localhost:6089"
     else
-        echo "  ⚠ pcmflux audio server failed to start"
+        log_warn "  pcmflux audio server failed to start"
         echo "  Error log:"
         cat /tmp/audio_server.log 2>/dev/null | tail -20 || true
     fi
 
-    echo "✅ Audio streaming services initialized"
+    log_success "Audio streaming services initialized"
 }
 
 # ============================================================================
@@ -775,22 +799,22 @@ function start_audio_services() {
 # 将 stdio 协议的 MCP 服务代理为 HTTP 服务，供多个 agent 复用
 # ============================================================================
 function start_mcp_proxy_services() {
-    echo "🔌 Starting MCP Proxy services (chrome-devtools shared)..."
+    log "Starting MCP Proxy services (chrome-devtools shared)..."
 
     # 创建 MCP 日志目录（持久化到挂载的 /app/container-logs）
     local MCP_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/mcp"
     mkdir -p "$MCP_LOG_DIR"
     chmod 755 "$MCP_LOG_DIR"
-    echo "  ✓ MCP log directory: $MCP_LOG_DIR"
+    log_success "  MCP log directory: $MCP_LOG_DIR"
 
     # MCP 配置文件路径（由 Dockerfile 复制到 /etc/mcp）
     local MCP_CONFIG_FILE="/etc/mcp/mcp-proxy-config.json"
     if [ ! -f "$MCP_CONFIG_FILE" ]; then
-        echo "  ⚠ MCP config file not found: $MCP_CONFIG_FILE"
-        echo "  ⚠ MCP Proxy services will not start"
+        log_warn "  MCP config file not found: $MCP_CONFIG_FILE"
+        log_warn "  MCP Proxy services will not start"
         return 1
     fi
-    echo "  ✓ MCP config file: $MCP_CONFIG_FILE"
+    log_success "  MCP config file: $MCP_CONFIG_FILE"
 
     # 获取 D-Bus 地址
     local DBUS_ADDR=""
@@ -823,15 +847,15 @@ function start_mcp_proxy_services() {
 
     # 验证服务是否启动
     if kill -0 $MCP_PID 2>/dev/null; then
-        echo "  ✓ MCP Proxy started (PID: $MCP_PID)"
-        echo "  ✓ MCP Proxy URL: http://127.0.0.1:18099"
-        echo "  ✓ Agent 可使用: mcp-proxy convert http://127.0.0.1:18099"
+        log_success "  MCP Proxy started (PID: $MCP_PID)"
+        log_success "  MCP Proxy URL: http://127.0.0.1:18099"
+        log_success "  Agent 可使用: mcp-proxy convert http://127.0.0.1:18099"
     else
-        echo "  ⚠ MCP Proxy failed to start, check log: $MCP_LOG_DIR/mcp-proxy.log"
+        log_warn "  MCP Proxy failed to start, check log: $MCP_LOG_DIR/mcp-proxy.log"
         cat "$MCP_LOG_DIR/mcp-proxy.log" 2>/dev/null | tail -20 || true
     fi
 
-    echo "✅ MCP Proxy services initialized"
+    log_success "MCP Proxy services initialized"
 }
 
 # ============================================================================
@@ -839,11 +863,11 @@ function start_mcp_proxy_services() {
 # 允许用户使用宿主机的输入法（如搜狗输入法）直接输入到远程桌面
 # ============================================================================
 function start_ime_services() {
-    echo "⌨️ Starting IME passthrough services..."
+    log "Starting IME passthrough services..."
 
     # 检查是否启用（可通过环境变量禁用）
     if [ "${ENABLE_IME_PASSTHROUGH:-true}" = "false" ]; then
-        echo "  ⚠ IME passthrough is disabled (ENABLE_IME_PASSTHROUGH=false)"
+        log_warn "  IME passthrough is disabled (ENABLE_IME_PASSTHROUGH=false)"
         return 0
     fi
 
@@ -851,13 +875,13 @@ function start_ime_services() {
     local IME_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/ime"
     mkdir -p "$IME_LOG_DIR"
     chmod 755 "$IME_LOG_DIR"
-    echo "  ✓ IME log directory: $IME_LOG_DIR"
+    log_success "  IME log directory: $IME_LOG_DIR"
 
     # 检查 IME 服务脚本是否存在
     local IME_SCRIPT="/usr/local/bin/ime_server.py"
     if [ ! -f "$IME_SCRIPT" ]; then
-        echo "  ⚠ IME server script not found: $IME_SCRIPT"
-        echo "  ⚠ IME passthrough services will not start"
+        log_warn "  IME server script not found: $IME_SCRIPT"
+        log_warn "  IME passthrough services will not start"
         return 1
     fi
 
@@ -884,18 +908,18 @@ function start_ime_services() {
 
     # 验证服务是否启动
     if kill -0 $IME_PID 2>/dev/null; then
-        echo "  ✓ IME server started (PID: $IME_PID)"
-        echo "  ✓ IME WebSocket: ws://0.0.0.0:6091"
-        echo "  ✓ 用户可使用宿主机输入法输入到远程桌面"
+        log_success "  IME server started (PID: $IME_PID)"
+        log_success "  IME WebSocket: ws://0.0.0.0:6091"
+        log_success "  用户可使用宿主机输入法输入到远程桌面"
     else
-        echo "  ⚠ IME server failed to start, check log: $IME_LOG_DIR/ime_server.log"
+        log_warn "  IME server failed to start, check log: $IME_LOG_DIR/ime_server.log"
         cat "$IME_LOG_DIR/ime_server.log" 2>/dev/null | tail -20 || true
     fi
 
-    echo "✅ IME passthrough services initialized"
+    log_success "IME passthrough services initialized"
 }
 
-echo "Starting Code Interpreter server..."
+    log "Starting Code Interpreter server..."
 
 # 设置VNC自动启动标志
 export VNC_AUTO_START=true
@@ -916,8 +940,8 @@ echo "DISPLAY=:0" >> /etc/environment
 # Jupyter services removed
 
 # 启动 VNC 服务（在后台运行，等待X11就绪）
-echo "Starting VNC services in background (as root)..."
-echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
+    log "Starting VNC services in background (as root)..."
+log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
 (
     # 等待X11服务就绪
     counter=0
@@ -930,7 +954,7 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
         fi
     done
 
-    echo "X11 is ready, starting VNC services..."
+    log "X11 is ready, starting VNC services..."
     
     # ========== 优先启动 MCP Proxy 服务 ==========
     # MCP Proxy 需要尽早启动，因为 agent_runner 启动后可能立即使用
@@ -938,9 +962,9 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
     
     start_vnc_services
 
-    echo "✓ VNC services started successfully!"
-    echo "✓ VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
-    echo "✓ Direct VNC port: 5900"
+    log_success "VNC services started successfully!"
+    log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
+    log_success "Direct VNC port: 5900"
 
     # 应用 XFCE 壁纸
     apply_xfce_wallpaper
@@ -967,14 +991,14 @@ echo "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&
 ) &
 
 # 启动 agent_runner 服务，支持从环境变量读取端口
-echo "Starting agent_runner service on port ${PORT:-8086}..."
+log "Starting agent_runner service on port ${PORT:-8086}..."
 
 # ========== 关键修复：确保 agent_runner 及其子进程继承输入法环境 ==========
 # 从 /tmp/dbus-session-env 加载 D-Bus 地址
 if [ -f /tmp/dbus-session-env ]; then
     source /tmp/dbus-session-env
     export DBUS_SESSION_BUS_ADDRESS
-    echo "✓ agent_runner will use D-Bus: $DBUS_SESSION_BUS_ADDRESS"
+    log_success "agent_runner will use D-Bus: $DBUS_SESSION_BUS_ADDRESS"
 
     # ========== 新增：将 D-Bus 地址写入全局环境 ==========
     # 确保所有子进程（包括 chrome-devtools-mcp 启动的 Chromium）都能访问
@@ -1008,7 +1032,7 @@ export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export LC_CTYPE=C.UTF-8
 
-echo "✓ Input method environment variables exported globally (/etc/profile.d/ime-env.sh)"
+log_success "Input method environment variables exported globally (/etc/profile.d/ime-env.sh)"
 
 # ========== 新增：将环境变量写入 /etc/environment（systemd 使用）==========
 # 确保通过 systemd 启动的服务也能继承
@@ -1023,7 +1047,7 @@ LC_ALL=C.UTF-8
 LC_CTYPE=C.UTF-8
 EOF
 
-echo "✓ Input method environment variables written to /etc/environment"
+log_success "Input method environment variables written to /etc/environment"
 
 # ============================================================================
 # 🎯 启动 agent_runner
@@ -1045,23 +1069,23 @@ sleep 2
 # ========== 快速检查 MCP Proxy 服务状态（非阻塞） ==========
 # 只等待 5 秒，无论是否就绪都继续启动 agent_runner
 # MCP Proxy 会在后台继续启动，agent 首次使用时可能需要重试
-echo "⏳ Quick check for MCP Proxy service..."
+log "Quick check for MCP Proxy service..."
 MCP_PROXY_PORT=18099
-for i in 1 2; do
+for i in 1 2 3 4 5; do
     if nc -z 127.0.0.1 $MCP_PROXY_PORT 2>/dev/null; then
-        echo "✓ MCP Proxy is ready on port $MCP_PROXY_PORT"
+        log_success "MCP Proxy is ready on port $MCP_PROXY_PORT"
         break
     fi
     sleep 1
 done
 if ! nc -z 127.0.0.1 $MCP_PROXY_PORT 2>/dev/null; then
-    echo "⚠️  MCP Proxy not yet ready, agent_runner will start anyway (MCP will be available shortly)"
+    log_warn " MCP Proxy not yet ready, agent_runner will start anyway (MCP will be available shortly)"
 fi
 
 # 加载 D-Bus 会话环境
 if [ -f /tmp/dbus-session-env ]; then
     source /tmp/dbus-session-env
-    echo "✓ Loaded D-Bus session: $DBUS_SESSION_BUS_ADDRESS"
+    log_success "Loaded D-Bus session: $DBUS_SESSION_BUS_ADDRESS"
 fi
 
 # 构建环境变量导出命令
@@ -1080,10 +1104,10 @@ export PATH=/usr/local/bin:/opt/cargo/bin:\$PATH"
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
 # 否则执行默认的 agent_runner
 if [ $# -gt 0 ]; then
-    echo "🚀 Running custom command as root (HOME=/home/user): $*"
+    log "Running custom command as root (HOME=/home/user): $*"
     exec /bin/bash -c "$ENV_EXPORTS; exec $*"
 else
     # 默认启动 agent_runner (以 root 身份，但 HOME=/home/user)
-    echo "🚀 Launching agent_runner as root (HOME=/home/user) on port ${PORT:-8086}..."
+    log "Launching agent_runner as root (HOME=/home/user) on port ${PORT:-8086}..."
     exec /bin/bash -c "$ENV_EXPORTS; exec /usr/local/bin/agent_runner -p ${PORT:-8086}"
 fi
