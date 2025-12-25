@@ -621,7 +621,9 @@ RUN mkdir -p /home/user/.cache/bun/install /home/user/.cache/bun/global && \
     echo "✅ Bun configured for user"
 
 # 预安装 context7 MCP 工具（以 user 身份，缓存在用户目录）
-RUN bun add -g @upstash/context7-mcp || echo "⚠️ bun add -g failed, will retry at runtime"
+# 注意：由于 bun 与 npmmirror 的 tarball 下载存在兼容性问题（参考：https://github.com/oven-sh/bun/issues/21493），
+# 此处使用官方 npm 源进行安装
+RUN bun add -g @upstash/context7-mcp --registry https://registry.npmjs.org
 
 # 创建 Claude Code 配置目录
 RUN mkdir -p /home/user/.claude && \
