@@ -52,17 +52,22 @@ RUN apt-get update && \
     sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config && \
     # Set the default terminal
     ln -sf /usr/bin/xfce4-terminal.wrapper /etc/alternatives/x-terminal-emulator && \
-    # Install Python packages:
-    # apt-get install -y python3-numpy && \
-    # Clone noVNC from nuwax-ai fork (based on official v1.6.0, with customized vnc.html):
-    git clone -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
-    cd /opt/noVNC && \
-    ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
-    git clone -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify && \
     # Clean up package cache and temporary files to reduce image size:
     apt-get autoremove -y && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.cache
+
+# ============================================================================
+# 📺 noVNC 远程桌面客户端(based on official v1.6.0, with customized vnc.html):
+# ============================================================================
+# CACHEBUST_NOVNC: 传入时间戳强制重新克隆 noVNC
+# 用法: docker build --build-arg CACHEBUST_NOVNC=$(date +%s) ...
+ARG CACHEBUST_NOVNC=0
+RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
+    git clone -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
+    cd /opt/noVNC && \
+    ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
+    git clone -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
 
 # Install LibreOffice from official website
 ARG TARGETARCH

@@ -73,8 +73,9 @@ docker-build-agent-runner:
 	@docker rmi rcoder-agent-runner-build
 	@echo "📦 步骤3: 构建最终的 agent-runner 镜像..."
 	@# 使用原本的 Dockerfile 和复制过来的二进制文件构建最终镜像
+	@# CACHEBUST_NOVNC: 传入时间戳强制每次重新克隆 noVNC
 	@cd docker/rcoder-agent-runner && \
-		docker build -f Dockerfile -t rcoder-agent-runner:latest .
+		docker build --build-arg CACHEBUST_NOVNC=$$(date +%s) -f Dockerfile -t rcoder-agent-runner:latest .
 	@echo "✅ rcoder-agent-runner 镜像构建完成！（GLIBC 2.36 兼容）"
 
 # 安装 codex-acp-agent
