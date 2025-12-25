@@ -102,13 +102,15 @@ function initialize_user_home() {
     local need_restore=false
 
     # 检查关键目录/文件是否存在（任一不存在则需要恢复）
+    # 注意：.config/xfce4 包含 XFCE Panel 配置，缺失会导致底部 Dock 栏图标消失
     if [ ! -d "$USER_HOME/Desktop" ] || \
        [ ! -f "$USER_HOME/.bashrc" ] || \
        [ ! -f "$USER_HOME/.bunfig.toml" ] || \
-       [ ! -d "$USER_HOME/.claude" ]; then
+       [ ! -d "$USER_HOME/.claude" ] || \
+       [ ! -d "$USER_HOME/.config/xfce4" ]; then
         need_restore=true
         echo "📁 Detected empty or incomplete user home directory (likely mounted)"
-        echo "   Missing: $([ ! -d "$USER_HOME/Desktop" ] && echo 'Desktop ')$([ ! -f "$USER_HOME/.bashrc" ] && echo '.bashrc ')$([ ! -f "$USER_HOME/.bunfig.toml" ] && echo '.bunfig.toml ')$([ ! -d "$USER_HOME/.claude" ] && echo '.claude ')"
+        echo "   Missing: $([ ! -d "$USER_HOME/Desktop" ] && echo 'Desktop ')$([ ! -f "$USER_HOME/.bashrc" ] && echo '.bashrc ')$([ ! -f "$USER_HOME/.bunfig.toml" ] && echo '.bunfig.toml ')$([ ! -d "$USER_HOME/.claude" ] && echo '.claude ')$([ ! -d "$USER_HOME/.config/xfce4" ] && echo '.config/xfce4 ')"
     fi
 
     if [ "$need_restore" = true ]; then
@@ -192,6 +194,59 @@ function initialize_user_home() {
     else
         echo "✅ User home directory already initialized"
     fi
+
+    # ========== 额外保护：确保 XFCE Panel 配置始终有效 ==========
+    # 即使上面的恢复逻辑没有触发，也检查 Panel 配置是否完整
+    # 关键修复：XFCE 会在运行时重写 panel.xml，可能保存损坏的配置
+    # 因此必须检查内容有效性，而不仅仅是文件是否存在
+    local XFCE_PANEL_XML="$USER_HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+    local XFCE_PANEL_SYSTEM="/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+    local panel_corrupted=false
+    
+    # 检查 panel.xml 是否存在且有效
+    if [ ! -f "$XFCE_PANEL_XML" ] || [ ! -s "$XFCE_PANEL_XML" ]; then
+        panel_corrupted=true
+        echo "🔧 XFCE Panel config missing or empty"
+    elif ! grep -q 'value="launcher"' "$XFCE_PANEL_XML" 2>/dev/null; then
+        # 检查 panel.xml 是否包含有效的 launcher 定义
+        # 如果 plugin-17 等不是 type="string" value="launcher"，说明配置被 XFCE 重写损坏了
+        panel_corrupted=true
+        echo "🔧 XFCE Panel config corrupted (launcher definitions missing)"
+    elif ! grep -q 'xfce4-terminal-emulator.desktop' "$XFCE_PANEL_XML" 2>/dev/null; then
+        # 检查是否包含 launcher items（.desktop 文件引用）
+        panel_corrupted=true
+        echo "🔧 XFCE Panel config corrupted (launcher items empty)"
+    fi
+    
+    if [ "$panel_corrupted" = true ]; then
+        echo "📦 Restoring XFCE Panel config from system..."
+        mkdir -p "$(dirname "$XFCE_PANEL_XML")"
+        if [ -f "$XFCE_PANEL_SYSTEM" ]; then
+            cp -f "$XFCE_PANEL_SYSTEM" "$XFCE_PANEL_XML"
+            echo "  ✓ xfce4-panel.xml restored from system config (forced overwrite)"
+        elif [ -f "$SKEL_DIR/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" ]; then
+            cp -f "$SKEL_DIR/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" "$XFCE_PANEL_XML"
+            echo "  ✓ xfce4-panel.xml restored from skeleton (forced overwrite)"
+        fi
+    else
+        echo "✅ XFCE Panel config is valid"
+    fi
+    
+    # 确保 Panel launcher 目录存在且内容完整（强制恢复）
+    # 注意：每次启动都检查并恢复，防止用户删除后 XFCE 保存损坏状态
+    local XFCE_PANEL_DIR="$USER_HOME/.config/xfce4/panel"
+    for launcher_id in 17 18 19 20; do
+        local launcher_dir="$XFCE_PANEL_DIR/launcher-$launcher_id"
+        local system_launcher="/etc/xdg/xfce4/panel/launcher-$launcher_id"
+        if [ -d "$system_launcher" ]; then
+            # 检查 launcher 目录是否存在且包含 .desktop 文件
+            if [ ! -d "$launcher_dir" ] || [ -z "$(ls -A "$launcher_dir" 2>/dev/null)" ]; then
+                mkdir -p "$launcher_dir"
+                cp -f "$system_launcher/"* "$launcher_dir/" 2>/dev/null || true
+                echo "  ✓ launcher-$launcher_id restored (forced)"
+            fi
+        fi
+    done
 
     # ========== 确保 GTK CSS 配置存在（隐藏 Thunar root 警告） ==========
     # 同时配置 /root 和 /home/user，因为：
