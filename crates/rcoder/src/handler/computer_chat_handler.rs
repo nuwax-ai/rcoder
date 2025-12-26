@@ -334,14 +334,19 @@ pub async fn handle_computer_chat(
         }
 
         // 7. 更新会话映射（填充所有三个映射表，保持一致性）
-        // 只有在成功时才更新映射表
-        if result.is_success() {
-            if let Some(chat_response) = &result.data {
-                let session_id = chat_response.session_id.clone();
+        // 🆕 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
+        // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
+        if let Some(chat_response) = &result.data {
+            let session_id = chat_response.session_id.clone();
 
+            // 只有当 session_id 非空时才更新映射
+            if !session_id.is_empty() {
                 info!(
-                    "🔗 [COMPUTER_CHAT] 关联会话: session_id={} -> user_id={}, project_id={}",
-                    session_id, user_id, project_id
+                    "🔗 [COMPUTER_CHAT] 关联会话: session_id={} -> user_id={}, project_id={}, success={}",
+                    session_id,
+                    user_id,
+                    project_id,
+                    result.is_success()
                 );
 
                 // 🔧 ComputerAgentRunner 模式：使用 user_id 作为容器标识（一个用户一个容器）
@@ -404,14 +409,28 @@ pub async fn handle_computer_chat(
                     );
                 }
 
-                info!(
-                    "✅ [COMPUTER_CHAT] 请求处理完成: user_id={}, project_id={}, session_id={} (所有映射表已更新)",
-                    user_id, project_id, session_id
-                );
+                if result.is_success() {
+                    info!(
+                        "✅ [COMPUTER_CHAT] 请求处理完成: user_id={}, project_id={}, session_id={} (所有映射表已更新)",
+                        user_id, project_id, session_id
+                    );
+                } else {
+                    warn!(
+                        "⚠️ [COMPUTER_CHAT] 请求失败但已保存会话映射: user_id={}, project_id={}, session_id={}, code={}, message={}",
+                        user_id, project_id, session_id, result.code, result.message
+                    );
+                }
             }
-        } else {
+        }
+
+        if !result.is_success()
+            && result
+                .data
+                .as_ref()
+                .map_or(true, |d| d.session_id.is_empty())
+        {
             error!(
-                "❌ [COMPUTER_CHAT] 容器服务返回错误: user_id={}, project_id={}, code={}, message={}",
+                "❌ [COMPUTER_CHAT] 容器服务返回错误（无 session_id）: user_id={}, project_id={}, code={}, message={}",
                 user_id, project_id, result.code, result.message
             );
         }

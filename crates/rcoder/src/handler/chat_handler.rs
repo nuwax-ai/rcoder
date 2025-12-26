@@ -359,31 +359,48 @@ pub async fn handle_chat(
         }
 
         // 响应后状态更新 - 使用 DuckDB 存储
+        // 🆕 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
+        // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
         if let Ok(http_result) = &result {
             if let Some(chat_response) = &http_result.data {
-                info!(
-                    "📊 [CHAT] 收到聊天响应，开始状态更新: session_id={}",
-                    chat_response.session_id
-                );
-
                 let session_id = chat_response.session_id.clone();
 
-                // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
-                info!(
-                    "🔗 [SESSION_MAP] 关联 session_id {} 到 project_id {}",
-                    session_id, project_id
-                );
-                state.update_session(&project_id, &session_id);
+                // 只有当 session_id 非空时才更新映射
+                if !session_id.is_empty() {
+                    info!(
+                        "📊 [CHAT] 收到聊天响应，开始状态更新: session_id={}, success={}",
+                        session_id,
+                        http_result.is_success()
+                    );
 
-                // 更新项目活动时间
-                state.update_activity(&project_id);
+                    // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
+                    info!(
+                        "🔗 [SESSION_MAP] 关联 session_id {} 到 project_id {}",
+                        session_id, project_id
+                    );
+                    state.update_session(&project_id, &session_id);
 
-                info!(
-                    "🎯 [CHAT] 所有状态更新完成: project_id={}, session_id={}",
-                    project_id, session_id
-                );
+                    // 更新项目活动时间
+                    state.update_activity(&project_id);
+
+                    if http_result.is_success() {
+                        info!(
+                            "🎯 [CHAT] 所有状态更新完成: project_id={}, session_id={}",
+                            project_id, session_id
+                        );
+                    } else {
+                        warn!(
+                            "⚠️ [CHAT] 请求失败但已保存会话映射: project_id={}, session_id={}, code={}, message={}",
+                            project_id, session_id, http_result.code, http_result.message
+                        );
+                    }
+                }
             }
-        } else {
+        }
+
+        if result.as_ref().map_or(true, |r| {
+            !r.is_success() && r.data.as_ref().map_or(true, |d| d.session_id.is_empty())
+        }) {
             error!("❌ [CHAT] 容器服务返回错误: {:?}", result);
         }
 
