@@ -612,14 +612,14 @@ COPY mcp /etc/mcp
 COPY ime_server.py /usr/local/bin/ime_server.py
 RUN chmod +x /usr/local/bin/ime_server.py
 
-# 复制 IME 前端脚本到 noVNC 目录，并注入到 vnc.html
-COPY ime_passthrough.js /opt/noVNC/ime_passthrough.js
-RUN if ! grep -q 'ime_passthrough.js' /opt/noVNC/vnc.html; then \
-    sed -i 's|</body>|<script src="ime_passthrough.js"></script>\n</body>|' /opt/noVNC/vnc.html && \
-    echo "✅ IME passthrough script injected into vnc.html"; \
-    else \
-    echo "✓ IME passthrough script already in vnc.html"; \
-    fi
+# # 复制 IME 前端脚本到 noVNC 目录，并注入到 vnc.html
+# COPY ime_passthrough.js /opt/noVNC/ime_passthrough.js
+# RUN if ! grep -q 'ime_passthrough.js' /opt/noVNC/vnc.html; then \
+#     sed -i 's|</body>|<script src="ime_passthrough.js"></script>\n</body>|' /opt/noVNC/vnc.html && \
+#     echo "✅ IME passthrough script injected into vnc.html"; \
+#     else \
+#     echo "✓ IME passthrough script already in vnc.html"; \
+#     fi
 
 # 暴露 IME 服务端口
 EXPOSE 6091
