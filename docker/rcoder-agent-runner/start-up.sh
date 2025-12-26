@@ -934,6 +934,12 @@ export VNC_AUTO_START=true
 # 从骨架目录恢复配置（解决挂载空目录导致的花屏和图标消失）
 initialize_user_home
 
+# ========== 尽早启动 MCP Proxy 服务 ==========
+# MCP Proxy 不依赖 X11，可以在显示服务启动前就初始化
+# 这样在 agent_runner 启动时 MCP Proxy 已经就绪
+log "Starting MCP Proxy services early..."
+start_mcp_proxy_services
+
 # 首先启动显示服务和桌面环境
 start_display_and_desktop &
 
@@ -961,10 +967,6 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     done
 
     log "X11 is ready, starting VNC services..."
-
-    # ========== 优先启动 MCP Proxy 服务 ==========
-    # MCP Proxy 需要尽早启动，因为 agent_runner 启动后可能立即使用
-    start_mcp_proxy_services
 
     start_vnc_services
 
@@ -1071,6 +1073,7 @@ source /etc/profile.d/ime-env.sh 2>/dev/null || true
 
 # 等待 D-Bus 会话文件创建（可能在后台线程中）
 sleep 2
+
 
 # ========== 快速检查 MCP Proxy 服务状态（非阻塞） ==========
 # 只等待 5 秒，无论是否就绪都继续启动 agent_runner

@@ -565,7 +565,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
 
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
-ENV UV_INSTALL_DIR=/usr/local/bin
+ENV UV_INSTALL_DIR=/usr/local/bin \
+    UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     # 创建 uv 环境配置脚本（用户通过终端使用时会加载）
     echo '#!/bin/sh' > /etc/profile.d/uv-env.sh && \
@@ -576,7 +577,14 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     chmod +x /etc/profile.d/uv-env.sh
 
 # 添加 cargo bin 和 uv 到 PATH
-ENV PATH="/opt/cargo/bin:/usr/local/bin:${PATH}"
+# 添加所有工具安装路径到 PATH:
+# - /root/.local/bin: root 用户使用 uv tool install 时的可执行文件位置
+# - /home/user/.local/bin: user 用户使用 uv tool install 时的可执行文件位置
+# - /home/user/.local/share/pnpm: pnpm 全局安装的工具位置
+# - /opt/cargo/bin: Rust cargo 安装的工具
+# - /usr/local/bin: 系统级工具（bun, uv 等）
+ENV PNPM_HOME="/home/user/.local/share/pnpm" \
+    PATH="/root/.local/bin:/home/user/.local/bin:/home/user/.local/share/pnpm:/opt/cargo/bin:/usr/local/bin:${PATH}"
 
 # 复制预构建的 agent_runner 二进制文件（需要 root）
 COPY bin/agent_runner /usr/local/bin/agent_runner
