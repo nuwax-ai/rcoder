@@ -13,10 +13,13 @@ use tracing::{debug, info, warn};
 /// 支持容器嵌套场景（容器内运行容器）
 #[derive(Clone)]
 pub struct HostPathResolver {
-    /// 宿主机的项目工作空间根目录
+    /// 宿主机的项目工作空间根目录（默认工作空间，用于相对路径解析）
     host_project_workspace: PathBuf,
-    /// 容器内的项目工作空间根目录
+    /// 容器内的项目工作空间根目录（默认工作空间，用于相对路径解析）
     container_project_workspace: PathBuf,
+    /// 所有挂载点缓存，按路径长度降序排列（最具体的路径优先匹配）
+    /// 格式: Vec<(container_path, host_path)>
+    all_mounts: Vec<(PathBuf, PathBuf)>,
     /// 容器自检器（用于自动检测路径映射）
     inspector: Option<Arc<ContainerSelfInspector>>,
 }
@@ -55,70 +58,51 @@ impl HostPathResolver {
                 })?,
         );
 
-        // 获取第一个有效的挂载点信息
+        // 获取所有挂载点信息
         let mounts = inspector
             .get_all_mounts()
             .await
             .map_err(|e| DockerError::ConfigurationError(format!("获取挂载点失败: {}", e)))?;
 
         if mounts.is_empty() {
-            warn!("未检测到任何挂载点，将使用容器内路径作为宿主机路径");
-            return Ok(Self {
-                host_project_workspace: PathBuf::from("/app"),
-                container_project_workspace: PathBuf::from("/app"),
-                inspector: Some(inspector),
-            });
+            return Err(DockerError::ConfigurationError(
+                "未检测到任何挂载点，请检查是否在容器内运行，并确保 docker-compose.yml 中配置了 volume 挂载".to_string()
+            ));
         }
 
-        // 🔍 改进的挂载点匹配逻辑，避免模糊匹配导致的错误
-        // mounts 格式: Vec<(container_path, host_path)>
-        debug!(
-            "🔍 路径解析调试: 可用挂载点={:?}",
-            mounts
-                .iter()
-                .map(|(cp, hs)| format!("{}→{}", cp, hs))
-                .collect::<Vec<_>>()
-        );
-
-        // 优先查找最具体的匹配：computer-project-workspace > project_workspace
-        let mount_info = mounts
+        // 🔍 缓存所有挂载点，按路径长度降序排列（最具体的路径优先匹配）
+        let mut all_mounts: Vec<(PathBuf, PathBuf)> = mounts
             .iter()
-            .find(|(container_path, _)| {
-                // 优先匹配 computer-project-workspace
-                container_path.contains("computer-project-workspace")
-            })
-            .or_else(|| {
-                // 回退：匹配 project_workspace
-                debug!("🔍 未找到 computer-project-workspace 匹配，尝试 project_workspace...");
-                mounts
-                    .iter()
-                    .find(|(container_path, _)| container_path.contains("project_workspace"))
-            });
-
-        // 🚨 关键修复：不回退到第一个挂载点，而是报错！
-        let mount_info = mount_info.ok_or_else(|| {
-            let available_mounts = mounts
-                .iter()
-                .map(|(cp, hs)| format!("{} -> {}", cp, hs))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            DockerError::ConfigurationError(format!(
-                "无法找到匹配的挂载点信息。可用的挂载点: {}. 请检查 docker-compose.yml 中的挂载配置。",
-                available_mounts
-            ))
-        })?;
-
-        let (container_workspace, host_workspace) = mount_info;
-        debug!(
-            "✅ 路径解析结果: {} (container) -> {} (host)",
-            container_workspace, host_workspace
-        );
-        let host_workspace = PathBuf::from(host_workspace);
-        let container_workspace = PathBuf::from(container_workspace);
+            .map(|(cp, hp)| (PathBuf::from(cp), PathBuf::from(hp)))
+            .collect();
+        // 按容器路径长度降序排列，确保最具体的路径优先匹配
+        all_mounts.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
 
         info!(
-            "✅ 检测到路径映射: {} (host) -> {} (container)",
+            "📁 [HostPathResolver] 缓存 {} 个挂载点（按路径长度降序）:",
+            all_mounts.len()
+        );
+        for (idx, (cp, hp)) in all_mounts.iter().enumerate() {
+            debug!("  {}. {} -> {}", idx + 1, cp.display(), hp.display());
+        }
+
+        // 选择默认工作空间（用于相对路径解析）
+        // 优先选择 project_workspace 相关的挂载点
+        let default_workspace = all_mounts
+            .iter()
+            .find(|(container_path, _)| {
+                let path_str = container_path.to_string_lossy();
+                path_str.contains("computer-project-workspace")
+                    || path_str.contains("project_workspace")
+            })
+            .or_else(|| all_mounts.first())
+            // all_mounts 不为空（前面已检查），所以这里一定有值
+            .expect("all_mounts is not empty, checked above");
+
+        let (container_workspace, host_workspace) = default_workspace.clone();
+
+        info!(
+            "✅ [HostPathResolver] 默认工作空间: {} (host) -> {} (container)",
             host_workspace.display(),
             container_workspace.display()
         );
@@ -126,6 +110,7 @@ impl HostPathResolver {
         Ok(Self {
             host_project_workspace: host_workspace,
             container_project_workspace: container_workspace,
+            all_mounts,
             inspector: Some(inspector),
         })
     }
@@ -162,80 +147,40 @@ impl HostPathResolver {
             container_path.to_path_buf()
         };
 
-        // 检查路径是否在容器工作空间内
-        if container_path.starts_with(&self.container_project_workspace) {
-            // 计算相对路径
-            let relative_path = container_path
-                .strip_prefix(&self.container_project_workspace)
-                .map_err(|e| DockerError::ConfigurationError(format!("路径解析失败: {}", e)))?;
+        // 🆕 从缓存的挂载点中查找最具体的匹配
+        // all_mounts 已按路径长度降序排列，所以第一个匹配就是最具体的
+        for (mount_container, mount_host) in &self.all_mounts {
+            if container_path.starts_with(mount_container) {
+                // 找到匹配的挂载点
+                let relative_path = container_path
+                    .strip_prefix(mount_container)
+                    .unwrap_or(Path::new(""));
+                let host_path = mount_host.join(relative_path);
 
-            // 拼接到宿主机工作空间
-            let host_path = self.host_project_workspace.join(relative_path);
+                debug!(
+                    "✅ 从挂载点解析: {} -> {} (mount: {} -> {})",
+                    container_path.display(),
+                    host_path.display(),
+                    mount_container.display(),
+                    mount_host.display()
+                );
 
-            debug!(
-                "✅ 解析结果: {} (container) -> {} (host)",
-                container_path.display(),
-                host_path.display()
-            );
-
-            return Ok(host_path);
-        }
-
-        // 路径不在工作空间内，尝试从所有挂载点中查找匹配
-        debug!(
-            "容器路径 {} 不在工作空间 {} 内，尝试从挂载点查找",
-            container_path.display(),
-            self.container_project_workspace.display()
-        );
-
-        // 使用 inspector 获取所有挂载点并查找匹配
-        if let Some(inspector) = &self.inspector {
-            // 注意：这里需要阻塞调用，因为 resolve_to_host_path 不是 async
-            // 改为使用缓存的挂载点信息
-            // TODO: 后续可以改为在创建时缓存所有挂载点
-            if let Ok(mounts) = std::thread::scope(|s| {
-                s.spawn(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("failed to create tokio runtime for mount resolution");
-                    rt.block_on(async { inspector.get_all_mounts().await })
-                })
-                .join()
-                .expect("mount resolution thread panicked")
-            }) {
-                // 查找匹配的挂载点
-                for (mount_container_path, mount_host_path) in &mounts {
-                    let mount_container = Path::new(mount_container_path);
-                    if container_path.starts_with(mount_container) {
-                        // 找到匹配的挂载点
-                        let relative_path = container_path
-                            .strip_prefix(mount_container)
-                            .unwrap_or(Path::new(""));
-                        let host_path = PathBuf::from(mount_host_path).join(relative_path);
-
-                        info!(
-                            "✅ 从挂载点解析: {} -> {} (mount: {} -> {})",
-                            container_path.display(),
-                            host_path.display(),
-                            mount_container_path,
-                            mount_host_path
-                        );
-
-                        return Ok(host_path);
-                    }
-                }
+                return Ok(host_path);
             }
         }
 
         // 没有找到匹配的挂载点，返回错误
         warn!(
-            "⚠️ 无法解析路径 {}: 不在工作空间内且未找到匹配的挂载点",
+            "⚠️ 无法解析路径 {}: 未找到匹配的挂载点",
             container_path.display()
         );
         Err(DockerError::ConfigurationError(format!(
-            "无法解析容器路径 '{}': 不在工作空间内且未找到匹配的挂载点",
-            container_path.display()
+            "无法解析容器路径 '{}': 未找到匹配的挂载点。可用挂载点: {:?}",
+            container_path.display(),
+            self.all_mounts
+                .iter()
+                .map(|(c, h)| format!("{} -> {}", c.display(), h.display()))
+                .collect::<Vec<_>>()
         )))
     }
 
@@ -275,10 +220,15 @@ impl HostPathResolver {
             "HostPathResolver {{\n  \
              host_workspace: {},\n  \
              container_workspace: {},\n  \
+             all_mounts: {:?},\n  \
              inspector: {}\n\
              }}",
             self.host_project_workspace.display(),
             self.container_project_workspace.display(),
+            self.all_mounts
+                .iter()
+                .map(|(c, h)| format!("{} -> {}", c.display(), h.display()))
+                .collect::<Vec<_>>(),
             if self.inspector.is_some() {
                 "enabled"
             } else {
@@ -308,13 +258,26 @@ impl HostPathResolver {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_resolve_relative_path() {
-        let resolver = HostPathResolver {
+    fn create_test_resolver() -> HostPathResolver {
+        HostPathResolver {
             host_project_workspace: PathBuf::from("/host/projects"),
             container_project_workspace: PathBuf::from("/app/project_workspace"),
+            all_mounts: vec![
+                // 按路径长度降序排列
+                (
+                    PathBuf::from("/app/project_workspace"),
+                    PathBuf::from("/host/projects"),
+                ),
+                (PathBuf::from("/app/logs"), PathBuf::from("/host/logs")),
+                (PathBuf::from("/app"), PathBuf::from("/host/app")),
+            ],
             inspector: None,
-        };
+        }
+    }
+
+    #[test]
+    fn test_resolve_relative_path() {
+        let resolver = create_test_resolver();
 
         let container_path = Path::new("project-123/src/main.rs");
         let host_path = resolver.resolve_to_host_path(container_path).unwrap();
@@ -327,11 +290,7 @@ mod tests {
 
     #[test]
     fn test_resolve_absolute_path() {
-        let resolver = HostPathResolver {
-            host_project_workspace: PathBuf::from("/host/projects"),
-            container_project_workspace: PathBuf::from("/app/project_workspace"),
-            inspector: None,
-        };
+        let resolver = create_test_resolver();
 
         let container_path = Path::new("/app/project_workspace/project-123/src/main.rs");
         let host_path = resolver.resolve_to_host_path(container_path).unwrap();
@@ -343,28 +302,44 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_outside_workspace() {
-        let resolver = HostPathResolver {
-            host_project_workspace: PathBuf::from("/host/projects"),
-            container_project_workspace: PathBuf::from("/app/project_workspace"),
-            inspector: None,
-        };
+    fn test_resolve_logs_path() {
+        // 🆕 测试 /app/logs 路径解析（这是本次修复的关键测试）
+        let resolver = create_test_resolver();
+
+        let container_path = Path::new("/app/logs/container");
+        let host_path = resolver.resolve_to_host_path(container_path).unwrap();
+
+        assert_eq!(host_path, PathBuf::from("/host/logs/container"));
+    }
+
+    #[test]
+    fn test_resolve_logs_with_subdir() {
+        // 🆕 测试 /app/logs/container/subdir 路径解析
+        let resolver = create_test_resolver();
+
+        let container_path = Path::new("/app/logs/container/agent-runner-xxx-20251226");
+        let host_path = resolver.resolve_to_host_path(container_path).unwrap();
+
+        assert_eq!(
+            host_path,
+            PathBuf::from("/host/logs/container/agent-runner-xxx-20251226")
+        );
+    }
+
+    #[test]
+    fn test_resolve_outside_all_mounts() {
+        let resolver = create_test_resolver();
 
         let container_path = Path::new("/etc/passwd");
         let result = resolver.resolve_to_host_path(container_path);
 
-        // 不在工作空间内且没有 inspector，应该返回错误
+        // 不在任何挂载点内，应该返回错误
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_success() {
-        let resolver = HostPathResolver {
-            host_project_workspace: PathBuf::from("/host/projects"),
-            container_project_workspace: PathBuf::from("/app/project_workspace"),
-            inspector: None,
-        };
-
+        let resolver = create_test_resolver();
         assert!(resolver.validate().is_ok());
     }
 
@@ -373,6 +348,10 @@ mod tests {
         let resolver = HostPathResolver {
             host_project_workspace: PathBuf::from("host/projects"), // 相对路径
             container_project_workspace: PathBuf::from("/app/project_workspace"),
+            all_mounts: vec![(
+                PathBuf::from("/app/project_workspace"),
+                PathBuf::from("host/projects"),
+            )],
             inspector: None,
         };
 
@@ -381,17 +360,45 @@ mod tests {
 
     #[test]
     fn test_workspace_base_accessors() {
-        let resolver = HostPathResolver {
-            host_project_workspace: PathBuf::from("/host/projects"),
-            container_project_workspace: PathBuf::from("/app/project_workspace"),
-            inspector: None,
-        };
+        let resolver = create_test_resolver();
 
         assert_eq!(resolver.host_workspace_base(), Path::new("/host/projects"));
         assert_eq!(
             resolver.container_workspace_base(),
             Path::new("/app/project_workspace")
         );
+    }
+
+    #[test]
+    fn test_mount_order_priority() {
+        // 🆕 测试挂载点优先级：更具体的路径应该优先匹配
+        let resolver = HostPathResolver {
+            host_project_workspace: PathBuf::from("/host/projects"),
+            container_project_workspace: PathBuf::from("/app/project_workspace"),
+            all_mounts: vec![
+                // 最长路径优先
+                (
+                    PathBuf::from("/app/project_workspace/special"),
+                    PathBuf::from("/host/special"),
+                ),
+                (
+                    PathBuf::from("/app/project_workspace"),
+                    PathBuf::from("/host/projects"),
+                ),
+                (PathBuf::from("/app"), PathBuf::from("/host/app")),
+            ],
+            inspector: None,
+        };
+
+        // /app/project_workspace/special/file 应该匹配第一个挂载点
+        let path1 = Path::new("/app/project_workspace/special/file.txt");
+        let result1 = resolver.resolve_to_host_path(path1).unwrap();
+        assert_eq!(result1, PathBuf::from("/host/special/file.txt"));
+
+        // /app/project_workspace/other/file 应该匹配第二个挂载点
+        let path2 = Path::new("/app/project_workspace/other/file.txt");
+        let result2 = resolver.resolve_to_host_path(path2).unwrap();
+        assert_eq!(result2, PathBuf::from("/host/projects/other/file.txt"));
     }
 
     // 注意：以下测试需要在 Docker 容器环境中运行

@@ -60,15 +60,13 @@ RUN apt-get update && \
 # ============================================================================
 # 📺 noVNC 远程桌面客户端(based on official v1.6.0, with customized vnc.html):
 # ============================================================================
-# CACHEBUST_NOVNC: 传入时间戳强制重新克隆 noVNC
-# 用法: docker build --build-arg CACHEBUST_NOVNC=$(date +%s) ...
-ARG CACHEBUST_NOVNC=0
-RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
-    git clone -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
+# 自动生成时间戳强制重新克隆 noVNC，每次构建都会获取最新版本
+RUN CACHEBUST_NOVNC=$(date +%s) && \
+    echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
+    git clone --depth 1 -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
     cd /opt/noVNC && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
-    git clone -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
-
+    git clone --depth 1 -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
 # Install LibreOffice from official website
 ARG TARGETARCH
 RUN case "$TARGETARCH" in \

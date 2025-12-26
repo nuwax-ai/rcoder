@@ -262,66 +262,99 @@ pub async fn handle_chat(
             forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
         info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
 
-        // 🆕 检查是否需要降级
-        if let Ok(ref http_result) = result {
+        // 🆕 检查是否需要降级（与 /computer/chat 保持一致）
+        // 情况 1: 响应中明确标识 need_fallback=true
+        // 情况 2: 请求失败（有 session_id 的首次请求），可能是 resume 失败
+        // 🚫 排除情况: 9010 AGENT_BUSY 错误应直接返回给用户，不触发降级
+        let is_agent_busy_error = if let Ok(ref http_result) = result {
+            http_result.code == shared_types::error_codes::ERR_AGENT_BUSY
+        } else {
+            false
+        };
+
+        let should_fallback = if is_agent_busy_error {
+            // 🆕 9010 错误直接返回给用户，不触发降级重试
+            false
+        } else if let Ok(ref http_result) = result {
             if let Some(ref response_data) = http_result.data {
-                if response_data.need_fallback.unwrap_or(false) {
-                    warn!(
-                        "⚠️ [CHAT] 检测到需要降级: reason={}, attempt={}/{}",
-                        response_data
-                            .fallback_reason
-                            .as_deref()
-                            .unwrap_or("unknown"),
-                        attempt + 1,
-                        MAX_ATTEMPTS
-                    );
+                // 优先检查明确的 need_fallback 标识
+                response_data.need_fallback.unwrap_or(false)
+            } else if !http_result.is_success() && request.session_id.is_some() && attempt == 0 {
+                // 请求失败，且是带 session_id 的首次请求，认为可能是 resume 失败
+                warn!(
+                    "⚠️ [CHAT] 带 session_id 的请求失败，尝试降级: code={}, message={}",
+                    http_result.code, http_result.message
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
-                    // 检查是否还有重试机会
-                    if attempt + 1 < MAX_ATTEMPTS {
-                        info!("🔄 [CHAT] 开始降级重试");
+        if should_fallback {
+            let fallback_reason = if let Ok(ref http_result) = result {
+                http_result
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.fallback_reason.as_deref())
+                    .unwrap_or("request_failed_with_session_id")
+            } else {
+                "unknown"
+            };
 
-                        // 🆕 主动停止旧 agent，释放资源
-                        // 这会触发 AgentLifecycleGuard 的 RAII 清理机制
-                        info!("🛑 [CHAT] 停止旧 agent: project_id={}", project_id);
+            warn!(
+                "⚠️ [CHAT] 检测到需要降级: reason={}, attempt={}/{}",
+                fallback_reason,
+                attempt + 1,
+                MAX_ATTEMPTS
+            );
 
-                        // 从 service_url 提取 gRPC 地址
-                        let grpc_addr = format!(
-                            "{}:{}",
-                            container_info
-                                .service_url
-                                .trim_start_matches("http://")
-                                .trim_start_matches("https://")
-                                .split(':')
-                                .next()
-                                .unwrap_or(&container_info.service_url),
-                            shared_types::GRPC_DEFAULT_PORT
-                        );
+            // 检查是否还有重试机会
+            if attempt + 1 < MAX_ATTEMPTS {
+                info!("🔄 [CHAT] 开始降级重试");
 
-                        if let Err(e) = crate::grpc::chat_client::grpc_stop_agent_with_pool(
-                            &state.grpc_pool,
-                            &grpc_addr,
-                            project_id.clone(),
-                            Some("Resume 失败，降级重启".to_string()),
-                            false, // graceful stop
-                        )
-                        .await
-                        {
-                            warn!("⚠️ [CHAT] 停止旧 agent 失败（可能已退出）: {}", e);
-                        }
+                // 🆕 主动停止旧 agent，释放资源
+                // 这会触发 AgentLifecycleGuard 的 RAII 清理机制
+                info!("🛑 [CHAT] 停止旧 agent: project_id={}", project_id);
 
-                        // 等待资源释放
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                // 从 service_url 提取 gRPC 地址
+                let grpc_addr = format!(
+                    "{}:{}",
+                    container_info
+                        .service_url
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .split(':')
+                        .next()
+                        .unwrap_or(&container_info.service_url),
+                    shared_types::GRPC_DEFAULT_PORT
+                );
 
-                        continue; // 🆕 重试
-                    } else {
-                        // 没有重试机会了
-                        warn!("❌ [CHAT] 降级重试次数耗尽");
-                        return Ok(HttpResult::error(
-                            shared_types::error_codes::ERR_RETRY_EXHAUSTED,
-                            "Resume failed and retry exhausted",
-                        ));
-                    }
+                if let Err(e) = crate::grpc::chat_client::grpc_stop_agent_with_pool(
+                    &state.grpc_pool,
+                    &grpc_addr,
+                    project_id.clone(),
+                    Some("Resume 失败，降级重启".to_string()),
+                    false, // graceful stop
+                )
+                .await
+                {
+                    warn!("⚠️ [CHAT] 停止旧 agent 失败（可能已退出）: {}", e);
                 }
+
+                // 等待资源释放
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                continue; // 🆕 重试
+            } else {
+                // 没有重试机会了
+                warn!("❌ [CHAT] 降级重试次数耗尽");
+                return Ok(HttpResult::error(
+                    shared_types::error_codes::ERR_RETRY_EXHAUSTED,
+                    "Resume failed and retry exhausted",
+                ));
             }
         }
 

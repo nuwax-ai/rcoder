@@ -760,26 +760,55 @@ impl DockerManager {
             );
 
             // 确保目录存在（仅对非只读挂载创建目录）
-            // 注意：在容器内运行时，需要使用容器内的路径创建目录
+            // 重要：Docker bind mount 要求宿主机路径必须存在
+            //
+            // 由于代码运行在容器内，无法直接访问宿主机路径（如 /Volumes/soddygo/...）
+            // 必须使用容器内通过 volume 挂载可访问的路径来创建目录
+            //
+            // 策略：必须配置 resolve_from 才能正确创建目录
+            // 使用 resolve_from + 相对路径 来创建目录
             if !mount_config.read_only {
-                // 如果配置了 resolve_from，使用容器内路径创建目录
-                let create_path = if let Some(ref resolve_from) = mount_config.resolve_from {
-                    // 在容器内创建：resolve_from + log_dir_name
-                    let container_dir = std::path::PathBuf::from(resolve_from).join(&log_dir_name);
-                    info!(
-                        "📁 [DOCKER_MGR] 在容器内创建目录: {}",
-                        container_dir.display()
-                    );
-                    container_dir.to_string_lossy().to_string()
-                } else {
-                    // 静态挂载，尝试直接创建宿主机路径
-                    resolved_host_path.clone()
-                };
+                if let Some(ref resolve_from_path) = mount_config.resolve_from {
+                    // 从 host_path 模板中提取相对路径部分
+                    // host_path 格式通常是 "{resolved_path}/{variable}"
+                    // 我们需要取 {resolved_path} 之后的部分，并拼接到 resolve_from 上
+                    let host_path_template = &mount_config.host_path;
+                    let relative_part = if host_path_template.starts_with("{resolved_path}") {
+                        // 提取 {resolved_path} 之后的模板部分并替换变量
+                        let suffix = host_path_template
+                            .strip_prefix("{resolved_path}")
+                            .unwrap_or("");
+                        let mut resolved_suffix = suffix.to_string();
+                        for (key, value) in &mount_variables {
+                            resolved_suffix =
+                                resolved_suffix.replace(&format!("{{{}}}", key), value);
+                        }
+                        resolved_suffix
+                    } else {
+                        // 如果不是以 {resolved_path} 开头，尝试计算相对路径
+                        // 这种情况不太常见，使用空字符串作为后备
+                        String::new()
+                    };
 
-                if let Err(e) = std::fs::create_dir_all(&create_path) {
-                    warn!("⚠️ [DOCKER_MGR] 创建挂载目录失败: {} - {}", create_path, e);
+                    // 构建容器内可访问的路径
+                    let create_path = format!("{}{}", resolve_from_path, relative_part);
+                    debug!(
+                        "📁 [DOCKER_MGR] 使用容器内路径创建目录: {} (resolve_from: {}, relative: {})",
+                        create_path, resolve_from_path, relative_part
+                    );
+
+                    if let Err(e) = std::fs::create_dir_all(&create_path) {
+                        warn!("⚠️ [DOCKER_MGR] 创建挂载目录失败: {} - {}", create_path, e);
+                    } else {
+                        info!("✅ [DOCKER_MGR] 目录创建成功: {}", create_path);
+                    }
                 } else {
-                    info!("✅ [DOCKER_MGR] 目录创建成功: {}", create_path);
+                    // 没有配置 resolve_from，无法在容器内创建宿主机路径
+                    // 假设目录已存在，跳过创建
+                    info!(
+                        "📁 [DOCKER_MGR] 跳过目录创建 (未配置 resolve_from): {}",
+                        resolved_host_path
+                    );
                 }
             }
 
