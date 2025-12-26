@@ -265,7 +265,13 @@ pub async fn handle_computer_chat(
         // 🆕 增强降级检测逻辑
         // 情况 1: 响应中明确标识 need_fallback=true
         // 情况 2: 请求失败（有 session_id 的首次请求），可能是 resume 失败
-        let should_fallback = if let Some(ref response_data) = result.data {
+        // 🚫 排除情况: 9010 AGENT_BUSY 错误应直接返回给用户，不触发降级
+        let is_agent_busy_error = result.code == shared_types::error_codes::ERR_AGENT_BUSY;
+
+        let should_fallback = if is_agent_busy_error {
+            // 🆕 9010 错误直接返回给用户，不触发降级重试
+            false
+        } else if let Some(ref response_data) = result.data {
             // 优先检查明确的 need_fallback 标识
             response_data.need_fallback.unwrap_or(false)
         } else if !result.is_success() && request.session_id.is_some() && attempt == 0 {

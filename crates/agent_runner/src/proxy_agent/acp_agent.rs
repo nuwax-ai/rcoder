@@ -15,7 +15,7 @@ use tracing::{debug, error, info};
 use crate::{
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
-    service::{AgentSessionRegistry, AGENT_REGISTRY, StateAwareNotifier},
+    service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
     utils::ContentBuilder,
 };
 
@@ -60,12 +60,14 @@ pub async fn agent_worker(
     info!("🚀 agent_worker 启动（简化版），开始监听请求...");
 
     // 创建 AcpSessionManager，注入 AGENT_REGISTRY 作为 SessionRegistry
-    let session_manager = Arc::new(
-        AcpSessionManager::<StateAwareNotifier, AcpAgentClient, AgentSessionRegistry>::new(
-            Arc::new(StateAwareNotifier::new()),
-            AGENT_REGISTRY.clone(),
-        ),
-    );
+    let session_manager = Arc::new(AcpSessionManager::<
+        StateAwareNotifier,
+        AcpAgentClient,
+        AgentSessionRegistry,
+    >::new(
+        Arc::new(StateAwareNotifier::new()),
+        AGENT_REGISTRY.clone(),
+    ));
 
     // 创建 AcpAgentWorker
     let worker = AcpAgentWorker::new(session_manager);
@@ -141,7 +143,7 @@ pub async fn agent_worker(
                     cancel_tx: handles.cancel_tx.clone(),
                     model_provider: request.model_provider.clone(),
                     request_id: Some(request_id.clone()),
-                    status: AgentStatus::Idle,
+                    status: AgentStatus::Active, // 🆕 修复：Worker 处理中应为 Active，而非 Idle
                     last_activity: Utc::now(),
                     created_at: Utc::now(),
                     stop_handle: handles.lifecycle_handle.clone(),

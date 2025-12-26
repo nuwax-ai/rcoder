@@ -264,6 +264,10 @@ impl AgentService for AgentServiceImpl {
             {
                 // 🎯 使用业务响应返回错误码，而非 gRPC Status 错误
                 // 这样 rcoder 可以直接从 error_code 字段读取错误码
+                info!(
+                    "🚫 [gRPC] Agent Busy 返回 9010 错误: project_id={}, status={:?}",
+                    project_id, agent_info.status
+                );
                 return Ok(Response::new(GrpcChatResponse {
                     project_id: project_id.clone(),
                     session_id: session_id.unwrap_or_default(),
