@@ -258,8 +258,10 @@ impl AgentService for AgentServiceImpl {
         };
 
         // 检查 Agent 状态，禁止并发请求（使用统一 Registry）
+        // 🆕 检查 Active 和 Pending 两种状态
         if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id) {
-            if agent_info.status == AgentStatus::Active {
+            if agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending
+            {
                 // 🎯 使用业务响应返回错误码，而非 gRPC Status 错误
                 // 这样 rcoder 可以直接从 error_code 字段读取错误码
                 return Ok(Response::new(GrpcChatResponse {
@@ -275,6 +277,11 @@ impl AgentService for AgentServiceImpl {
                 }));
             }
         }
+
+        // 🆕 预注册：在发送任务到队列前，立即将 project 标记为 Pending
+        // 这样并发请求会被上面的忙碌检查拦截
+        AGENT_REGISTRY.set_pending(&project_id);
+        info!("📌 [gRPC] 预注册 Pending 状态: project_id={}", project_id);
 
         // 清理旧 session
         if let Some(ref sid) = session_id {
@@ -451,6 +458,8 @@ impl AgentService for AgentServiceImpl {
             }
             Err(e) => {
                 error!("❌ [gRPC] Chat 失败: {}", e);
+                // 🆕 清理 Pending 状态，避免死锁
+                AGENT_REGISTRY.clear_pending_if_exists(&project_id);
                 Err(Status::internal(format!("处理请求失败: {}", e)))
             }
         }
@@ -850,6 +859,7 @@ impl AgentService for AgentServiceImpl {
         let status = if let Some(ref pid) = project_id {
             if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid) {
                 match agent_info.status {
+                    AgentStatus::Pending => "busy",
                     AgentStatus::Active => "busy",
                     AgentStatus::Idle => "idle",
                     AgentStatus::Terminating => "busy",

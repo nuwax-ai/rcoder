@@ -24,6 +24,7 @@ pub enum AgentStatus {
 impl From<shared_types::AgentStatus> for AgentStatus {
     fn from(status: shared_types::AgentStatus) -> Self {
         match status {
+            shared_types::AgentStatus::Pending => AgentStatus::Starting,
             shared_types::AgentStatus::Idle => AgentStatus::Running,
             shared_types::AgentStatus::Active => AgentStatus::Running,
             shared_types::AgentStatus::Terminating => AgentStatus::Stopping,
