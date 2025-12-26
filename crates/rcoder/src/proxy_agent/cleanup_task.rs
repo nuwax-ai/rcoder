@@ -340,6 +340,15 @@ impl AgentCleaner {
                             true
                         }
                     }
+                    Some(AgentStatus::Pending) => {
+                        debug!(
+                            "⏸️ [cleanup] 跳过Pending状态agent: lookup_key={}, user_id={}",
+                            project_id,
+                            user_id.as_deref().unwrap_or("None")
+                        );
+                        active_agents += 1;
+                        false
+                    }
                     Some(AgentStatus::Active) => {
                         debug!(
                             "⏸️ [cleanup] 跳过Active状态agent: lookup_key={}, user_id={}",

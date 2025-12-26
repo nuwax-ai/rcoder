@@ -140,6 +140,7 @@ impl DataBridge {
     /// 将 AgentStatus 转换为状态码和名称
     pub fn agent_status_to_code(status: &AgentStatus) -> (i32, String) {
         match status {
+            AgentStatus::Pending => (3, "pending".to_string()),
             AgentStatus::Idle => (0, "idle".to_string()),
             AgentStatus::Active => (1, "active".to_string()),
             AgentStatus::Terminating => (2, "terminating".to_string()),
@@ -152,6 +153,7 @@ impl DataBridge {
             0 => AgentStatus::Idle,
             1 => AgentStatus::Active,
             2 => AgentStatus::Terminating,
+            3 => AgentStatus::Pending,
             _ => AgentStatus::Idle, // 默认
         }
     }

@@ -156,6 +156,57 @@ impl DuckDbStorage {
         let conn = self.conn.try_clone()?;
         Ok(ProjectRepository::new(conn))
     }
+
+    /// 执行原始 SQL 查询（仅用于调试）
+    ///
+    /// ⚠️ 此方法仅用于开发和调试目的
+    pub fn execute_raw_query(
+        &self,
+        sql: &str,
+    ) -> DuckDbResult<(Vec<String>, Vec<serde_json::Value>)> {
+        self.conn.with_connection(|c| {
+            let mut stmt = c.prepare(sql)?;
+            let column_count = stmt.column_count();
+
+            // 获取列名
+            let columns: Vec<String> = (0..column_count)
+                .map(|i| {
+                    stmt.column_name(i)
+                        .map_or("?".to_string(), |v| v.to_string())
+                })
+                .collect();
+
+            // 执行查询并收集结果
+            let mut rows: Vec<serde_json::Value> = Vec::new();
+            let mut result_rows = stmt.query([])?;
+
+            while let Some(row) = result_rows.next()? {
+                let mut row_obj = serde_json::Map::new();
+                for (i, col_name) in columns.iter().enumerate() {
+                    // 尝试以字符串形式获取值
+                    let value: serde_json::Value = if let Ok(v) = row.get::<_, String>(i) {
+                        serde_json::Value::String(v)
+                    } else if let Ok(v) = row.get::<_, i64>(i) {
+                        serde_json::Value::Number(v.into())
+                    } else if let Ok(v) = row.get::<_, f64>(i) {
+                        if let Some(n) = serde_json::Number::from_f64(v) {
+                            serde_json::Value::Number(n)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    } else if let Ok(v) = row.get::<_, bool>(i) {
+                        serde_json::Value::Bool(v)
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    row_obj.insert(col_name.clone(), value);
+                }
+                rows.push(serde_json::Value::Object(row_obj));
+            }
+
+            Ok((columns, rows))
+        })
+    }
 }
 
 impl UnifiedStorage for DuckDbStorage {

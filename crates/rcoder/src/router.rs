@@ -165,6 +165,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/proxy/config", get(handler::proxy_config))
         .with_state(state.clone());
 
+    // 调试路由（仅用于开发和问题排查）
+    let debug_routes = Router::new()
+        .route("/debug/sql", post(handler::debug_sql_query))
+        .route("/debug/projects", get(handler::debug_list_projects))
+        .route("/debug/containers", get(handler::debug_list_containers))
+        .route("/debug/storage/stats", get(handler::debug_storage_stats))
+        .with_state(state.clone());
+
     // 健康检查路由
     let health_routes = Router::new()
         .route("/health", get(handler::health_check))
@@ -175,6 +183,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(api_routes)
         .merge(computer_routes)
         .merge(proxy_api_routes)
+        .merge(debug_routes) // 添加调试路由
         .merge(create_swagger_ui())
 }
 

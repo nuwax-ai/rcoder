@@ -142,6 +142,66 @@ impl AgentSessionRegistry {
         debug!("[Registry] 更新 agent_info: project={}", project_id);
     }
 
+    /// 设置项目为 Pending 状态（用于预占位，防止并发请求）
+    ///
+    /// 如果项目不存在，则创建一个占位记录
+    /// 如果项目已存在且为 Idle 状态，则更新为 Pending
+    pub fn set_pending(&self, project_id: &str) {
+        use agent_client_protocol::SessionId;
+        use chrono::Utc;
+        use shared_types::AgentStatus;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        match self.agent_info_map.entry(project_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                // 已存在：仅当 Idle 时更新为 Pending
+                let info = entry.get_mut();
+                if info.status == AgentStatus::Idle {
+                    info.status = AgentStatus::Pending;
+                    info.last_activity = Utc::now();
+                    debug!("📌 [Registry] 项目 {} 状态: Idle → Pending", project_id);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // 不存在：创建占位记录
+                let (prompt_tx, _) = mpsc::unbounded_channel();
+                let (cancel_tx, _) = mpsc::unbounded_channel();
+
+                let placeholder = ProjectAndAgentInfo {
+                    project_id: project_id.to_string(),
+                    session_id: SessionId::new(Arc::from("pending")),
+                    prompt_tx,
+                    cancel_tx,
+                    model_provider: None,
+                    request_id: None,
+                    status: AgentStatus::Pending,
+                    last_activity: Utc::now(),
+                    created_at: Utc::now(),
+                    stop_handle: None,
+                };
+
+                entry.insert(placeholder);
+                info!("📌 [Registry] 创建 Pending 占位: project_id={}", project_id);
+            }
+        }
+    }
+
+    /// 清理 Pending 状态（仅当当前状态为 Pending 时移除）
+    ///
+    /// 用于在任务失败时清理预占位，避免死锁
+    pub fn clear_pending_if_exists(&self, project_id: &str) {
+        use shared_types::AgentStatus;
+
+        if let Some(info) = self.agent_info_map.get(project_id) {
+            if info.status == AgentStatus::Pending {
+                drop(info);
+                self.remove_by_project(project_id);
+                info!("🗑️ [Registry] 清理 Pending 占位: project_id={}", project_id);
+            }
+        }
+    }
+
     // ========== 查询操作 ==========
 
     /// 通过 session_id 获取 project_id（O(1) 复杂度）

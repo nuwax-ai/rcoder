@@ -63,13 +63,23 @@ impl ProjectAdapter {
     ) -> Result<(), duckdb_manager::DuckDbError> {
         // 如果有容器信息，先保存容器
         if let Some(container) = info.container() {
+            debug!(
+                "插入项目容器信息: project_id={}, container_id={}, container_ip={}",
+                project_id, container.container_id, container.container_ip
+            );
             let container_record =
                 DataBridge::container_info_to_record(container, info.service_type());
             self.storage.save_container(&container_record)?;
+        } else {
+            debug!("插入项目但无容器信息: project_id={}", project_id);
         }
 
         // 保存项目记录
         let record = DataBridge::info_to_project_record(&info, &project_id);
+        debug!(
+            "保存项目记录: project_id={}, session_id={:?}, container_id={}",
+            record.project_id, record.session_id, record.container_id
+        );
         self.storage.save_project(&record)?;
 
         debug!("插入项目: {}", project_id);
@@ -163,7 +173,13 @@ impl ProjectAdapter {
     /// 通过会话ID获取容器ID（替代 session_to_container_id.get）
     pub fn get_container_id_by_session(&self, session_id: &str) -> Option<String> {
         match self.storage.get_container_id_by_session(session_id) {
-            Ok(container_id) => container_id,
+            Ok(container_id) => {
+                debug!(
+                    "通过会话ID获取容器ID: session_id={}, container_id={:?}",
+                    session_id, container_id
+                );
+                container_id
+            }
             Err(e) => {
                 warn!("通过会话ID {} 获取容器ID失败: {}", session_id, e);
                 None
@@ -341,6 +357,20 @@ impl ProjectAdapter {
                 StorageStats::default()
             }
         }
+    }
+
+    // ========== 调试方法 ==========
+
+    /// 执行原始 SQL 查询（仅用于调试）
+    ///
+    /// ⚠️ 此方法仅用于开发和调试目的
+    pub fn execute_raw_query(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<String>, Vec<serde_json::Value>), String> {
+        self.storage
+            .execute_raw_query(sql)
+            .map_err(|e| format!("查询执行失败: {}", e))
     }
 
     // ========== 内部辅助方法 ==========

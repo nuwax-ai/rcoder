@@ -135,6 +135,8 @@ impl From<CancelResult> for CancelNotificationResponse {
 /// Agent 服务状态
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, ToSchema)]
 pub enum AgentStatus {
+    /// 等待处理 - 任务已提交到队列，等待 Worker 开始处理
+    Pending,
     /// 活跃状态 - 正在处理请求
     Active,
     /// 空闲状态 - 等待新请求
@@ -309,10 +311,7 @@ impl AgentLifecycleGuard {
         // 3. 强制清理资源
         self.force_cleanup().await?;
 
-        info!(
-            "[Claude] agent优雅停止完成: {}",
-            self.inner.project_id
-        );
+        info!("[Claude] agent优雅停止完成: {}", self.inner.project_id);
 
         Ok(())
     }
