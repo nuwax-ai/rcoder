@@ -170,11 +170,11 @@ function initialize_user_home() {
                 cp -a "$USER_HOME/.config/chromium" "$chromium_backup/" 2>/dev/null || true
                 log_success "  Chromium user data backed up"
             fi
-            
+
             # 2. 强制覆盖整个 .config 目录
             cp -a "$SKEL_DIR/.config/." "$USER_HOME/.config/" 2>/dev/null || true
             log_success "  .config directory restored (forced overwrite)"
-            
+
             # 3. 还原 Chromium 用户数据（覆盖骨架目录的默认配置）
             if [ -n "$chromium_backup" ] && [ -d "$chromium_backup/chromium" ]; then
                 cp -a "$chromium_backup/chromium/." "$USER_HOME/.config/chromium/" 2>/dev/null || true
@@ -193,6 +193,12 @@ function initialize_user_home() {
         if [ -f "$SKEL_DIR/.bunfig.toml" ]; then
             cp -a "$SKEL_DIR/.bunfig.toml" "$USER_HOME/.bunfig.toml"
             log_success "  .bunfig.toml restored (forced overwrite)"
+        fi
+
+        # ========== .npmrc - 强制覆盖（pnpm 配置）==========
+        if [ -f "$SKEL_DIR/.npmrc" ]; then
+            cp -a "$SKEL_DIR/.npmrc" "$USER_HOME/.npmrc"
+            log_success "  .npmrc restored (forced overwrite)"
         fi
 
         # ========== .claude 目录 - 不覆盖（保留用户配置）==========
@@ -226,7 +232,7 @@ function initialize_user_home() {
     local XFCE_PANEL_XML="$USER_HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
     local XFCE_PANEL_SYSTEM="/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
     local panel_corrupted=false
-    
+
     # 检查 panel.xml 是否存在且有效
     if [ ! -f "$XFCE_PANEL_XML" ] || [ ! -s "$XFCE_PANEL_XML" ]; then
         panel_corrupted=true
@@ -241,7 +247,7 @@ function initialize_user_home() {
         panel_corrupted=true
         log "XFCE Panel config corrupted (launcher items empty)"
     fi
-    
+
     if [ "$panel_corrupted" = true ]; then
         log "Restoring XFCE Panel config from system..."
         mkdir -p "$(dirname "$XFCE_PANEL_XML")"
@@ -255,7 +261,7 @@ function initialize_user_home() {
     else
         log_success "XFCE Panel config is valid"
     fi
-    
+
     # 确保 Panel launcher 目录存在且内容完整（强制恢复）
     # 注意：每次启动都检查并恢复，防止用户删除后 XFCE 保存损坏状态
     local XFCE_PANEL_DIR="$USER_HOME/.config/xfce4/panel"
@@ -298,10 +304,10 @@ infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity
 
     # ========== 设置 Chromium 为默认浏览器（解决 xdg-open 无法打开浏览器问题）==========
     log "Configuring Chromium as default web browser..."
-    
+
     # 创建用户级 mimeapps.list（强制覆盖，确保默认浏览器设置正确）
     mkdir -p "$USER_HOME/.config" "$USER_HOME/.local/share/applications"
-    
+
     cat > "$USER_HOME/.config/mimeapps.list" <<'EOF'
 [Default Applications]
 text/html=chromium.desktop
@@ -322,14 +328,14 @@ text/html=chromium.desktop;
 x-scheme-handler/http=chromium.desktop;
 x-scheme-handler/https=chromium.desktop;
 EOF
-    
+
     # 同时创建 ~/.local/share/applications/mimeapps.list（某些 xdg 工具读取这个位置）
     cp "$USER_HOME/.config/mimeapps.list" "$USER_HOME/.local/share/applications/mimeapps.list"
-    
+
     # 使用 xdg-settings 设置默认浏览器（需要在 X11 环境启动后才能完全生效）
     # 这里先创建配置文件，xdg-settings 会在 DISPLAY 环境变量存在时使用
     export BROWSER="/usr/bin/chromium-browser-launcher"
-    
+
     log_success "  Chromium set as default web browser (mimeapps.list)"
     log_success "  BROWSER env set to: $BROWSER"
 
@@ -732,12 +738,12 @@ function start_audio_services() {
 
     # 1. 启动 PulseAudio 守护进程
     echo "  Starting PulseAudio daemon..."
-    
+
     # 确保 PulseAudio 目录存在
     mkdir -p /home/user/.config/pulse
     mkdir -p /var/run/pulse
     chmod 777 /var/run/pulse
-    
+
     # 启动 PulseAudio（非系统模式，允许运行为 root）
     HOME=/home/user pulseaudio --start --exit-idle-time=-1 --log-level=warning 2>/tmp/pulseaudio.log || true
     sleep 2
@@ -757,10 +763,10 @@ function start_audio_services() {
     echo "  Creating virtual audio sink..."
     pactl load-module module-null-sink sink_name=virtual_speaker \
           sink_properties=device.description="Virtual_Speaker" 2>/dev/null || true
-    
+
     # 设置虚拟声卡为默认输出
     pactl set-default-sink virtual_speaker 2>/dev/null || true
-    
+
     # 验证虚拟声卡
     if pactl list sinks short 2>/dev/null | grep -q "virtual_speaker"; then
         log_success "  Virtual speaker sink created"
@@ -770,12 +776,12 @@ function start_audio_services() {
 
     # 3. 启动 pcmflux 音频流服务
     echo "  Starting pcmflux audio streaming service..."
-    
+
     # 设置音频设备环境变量
     export AUDIO_DEVICE="virtual_speaker.monitor"
     export AUDIO_HTTP_PORT=6090
     export AUDIO_WS_PORT=6089
-    
+
     # 后台启动音频服务器
     nohup python3 /usr/local/bin/audio_server.py > /tmp/audio_server.log 2>&1 &
     sleep 2
@@ -955,11 +961,11 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     done
 
     log "X11 is ready, starting VNC services..."
-    
+
     # ========== 优先启动 MCP Proxy 服务 ==========
     # MCP Proxy 需要尽早启动，因为 agent_runner 启动后可能立即使用
     start_mcp_proxy_services
-    
+
     start_vnc_services
 
     log_success "VNC services started successfully!"

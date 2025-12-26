@@ -375,6 +375,12 @@ RUN apt-get update && \
     # 配置 pnpm
     corepack enable && \
     corepack prepare pnpm@latest --activate && \
+    # 创建 pnpm 环境配置脚本（用户通过终端使用时会加载）
+    echo '#!/bin/sh' > /etc/profile.d/pnpm-env.sh && \
+    echo '# PNPM environment configuration' >> /etc/profile.d/pnpm-env.sh && \
+    echo 'export PNPM_HOME="/home/user/.local/share/pnpm"' >> /etc/profile.d/pnpm-env.sh && \
+    echo 'export npm_config_registry="https://registry.npmmirror.com"' >> /etc/profile.d/pnpm-env.sh && \
+    chmod +x /etc/profile.d/pnpm-env.sh && \
     echo "Node.js version: $(node -v)" && \
     echo "npm version: $(npm -v)" && \
     echo "pnpm version: $(pnpm -v)" && \
@@ -504,8 +510,13 @@ RUN rm -f /etc/nginx/sites-enabled/default && \
     rm -f /etc/nginx/conf.d/default.conf
 
 
-# 配置 npm 使用国内镜像源
-RUN npm config set registry https://registry.npmmirror.com
+# 配置 npm 使用国内镜像源（系统级配置）
+RUN npm config set registry https://registry.npmmirror.com && \
+    # 创建 npm 环境配置脚本（用户通过终端使用时会加载）
+    echo '#!/bin/sh' > /etc/profile.d/npm-env.sh && \
+    echo '# NPM environment configuration' >> /etc/profile.d/npm-env.sh && \
+    echo 'export npm_config_registry=https://registry.npmmirror.com' >> /etc/profile.d/npm-env.sh && \
+    chmod +x /etc/profile.d/npm-env.sh
 
 # 设置工作目录并确保权限
 RUN mkdir -p /app/computer-project-workspace /home/user/.cache && \
@@ -519,7 +530,15 @@ ENV BUN_CONFIG_REGISTRY="https://registry.npmmirror.com" \
     PATH="/usr/local/bin:$PATH"
 
 RUN curl -fsSL https://bun.sh/install | bash && \
-    /usr/local/bin/bun --version
+    /usr/local/bin/bun --version && \
+    # 创建 bun 环境配置脚本（用户通过终端使用时会加载）
+    echo '#!/bin/sh' > /etc/profile.d/bun-env.sh && \
+    echo '# Bun environment configuration' >> /etc/profile.d/bun-env.sh && \
+    echo 'export BUN_CONFIG_REGISTRY="https://registry.npmmirror.com"' >> /etc/profile.d/bun-env.sh && \
+    echo 'export BUN_CONFIG_INSTALL_CACHE_DIR="/home/user/.cache/bun/install"' >> /etc/profile.d/bun-env.sh && \
+    echo 'export BUN_CONFIG_GLOBAL_CACHE_DIR="/home/user/.cache/bun/global"' >> /etc/profile.d/bun-env.sh && \
+    echo 'export BUN_INSTALL="/usr/local"' >> /etc/profile.d/bun-env.sh && \
+    chmod +x /etc/profile.d/bun-env.sh
 
 # 安装全局 npm 包（需要 root，因为安装到 /usr/lib/node_modules）
 RUN npm install -g @zed-industries/claude-code-acp@latest && \
@@ -545,11 +564,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
     chmod -R o+rX /opt/cargo /opt/rustup
 
 # 安装 uv 到全局路径（需要 root）
-ENV UV_INSTALL_DIR=/usr/local/bin \
-    UV_CACHE_DIR=/home/user/.cache/uv
+# 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
+ENV UV_INSTALL_DIR=/usr/local/bin
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    # 创建 uv 环境配置脚本（用户通过终端使用时会加载）
+    echo '#!/bin/sh' > /etc/profile.d/uv-env.sh && \
+    echo '# UV environment configuration' >> /etc/profile.d/uv-env.sh && \
     echo 'export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple' >> /etc/profile.d/uv-env.sh && \
-    echo 'export UV_CACHE_DIR=/home/user/.cache/uv' >> /etc/profile.d/uv-env.sh
+    echo 'export UV_TOOL_DIR=/home/user/.local/share/uv/tools' >> /etc/profile.d/uv-env.sh && \
+    echo 'export UV_CACHE_DIR=/home/user/.cache/uv' >> /etc/profile.d/uv-env.sh && \
+    chmod +x /etc/profile.d/uv-env.sh
 
 # 添加 cargo bin 和 uv 到 PATH
 ENV PATH="/opt/cargo/bin:/usr/local/bin:${PATH}"
@@ -601,6 +625,21 @@ RUN if ! grep -q 'ime_passthrough.js' /opt/noVNC/vnc.html; then \
 EXPOSE 6091
 
 # ============================================================================
+# 预安装全局工具（root 模式）- 系统级别，不受 /home/user 挂载影响
+# ============================================================================
+# 预安装 context7 MCP 工具（Bun 全局安装）
+# 注意：由于 bun 与 npmmirror 的 tarball 下载存在兼容性问题（参考：https://github.com/oven-sh/bun/issues/21493），
+# 此处使用官方 npm 源进行安装
+RUN bun add -g @upstash/context7-mcp --registry https://registry.npmjs.org
+
+# 预安装 mcp-server-fetch（UV 全局安装到系统目录）
+ENV UV_TOOL_DIR=/usr/local/share/uv/tools \
+    UV_CACHE_DIR=/var/cache/uv
+RUN mkdir -p "$UV_TOOL_DIR" "$UV_CACHE_DIR" && \
+    uv tool install mcp-server-fetch && \
+    echo "✅ mcp-server-fetch installed to $UV_TOOL_DIR"
+
+# ============================================================================
 # 🎯 切换到普通用户 - 后续操作以 user 身份执行
 # ============================================================================
 USER user
@@ -620,18 +659,15 @@ RUN mkdir -p /home/user/.cache/bun/install /home/user/.cache/bun/global && \
     cat /home/user/.bunfig.toml && \
     echo "✅ Bun configured for user"
 
-# 预安装 context7 MCP 工具（以 user 身份，缓存在用户目录）
-# 注意：由于 bun 与 npmmirror 的 tarball 下载存在兼容性问题（参考：https://github.com/oven-sh/bun/issues/21493），
-# 此处使用官方 npm 源进行安装
-RUN bun add -g @upstash/context7-mcp --registry https://registry.npmjs.org
+# 配置 UV 用户环境（用户自己安装的工具会保存在这里，挂载后保留）
+ENV UV_TOOL_DIR=/home/user/.local/share/uv/tools \
+    UV_CACHE_DIR=/home/user/.cache/uv
+RUN mkdir -p "$UV_TOOL_DIR" "$UV_CACHE_DIR" && \
+    echo "✅ UV configured for user: tools in $UV_TOOL_DIR, cache in $UV_CACHE_DIR"
 
 # 创建 Claude Code 配置目录
 RUN mkdir -p /home/user/.claude && \
     echo '{"permissions":{"deny":["WebFetch", "WebSearch"]}}' > /home/user/.claude/settings.json
-
-# 预安装 MCP 工具到 uv 缓存中（以 user 身份）
-RUN mkdir -p /home/user/.cache/uv && \
-    UV_CACHE_DIR=/home/user/.cache/uv uv tool install mcp-server-fetch || echo "⚠️ uv tool install failed, will retry at runtime"
 
 # ============================================================================
 # 🎯 切回 root - 复制启动脚本 & 更新骨架目录
