@@ -1,6 +1,32 @@
 #!/bin/bash
 
 # ============================================================================
+# 📝 带时间戳的日志函数
+# 所有日志输出都会自动添加 UTC 时间前缀，格式与 agent_runner 一致
+# 格式：YYYY-MM-DDTHH:MM:SS.ffffffZ（ISO 8601 UTC）
+# 注意：日志函数必须在脚本最开头定义，因为后面的代码会立即使用它们
+# ============================================================================
+function log() {
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO $*"
+}
+
+function log_info() {
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO ℹ️  $*"
+}
+
+function log_success() {
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO ✓ $*"
+}
+
+function log_warn() {
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  WARN ⚠️  $*"
+}
+
+function log_error() {
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ') ERROR ❌ $*"
+}
+
+# ============================================================================
 # 🎯 容器日志持久化设置
 # 将日志输出到挂载的持久化目录，即使容器崩溃也能保留日志
 # ============================================================================
@@ -41,30 +67,6 @@ else
     log_warn " 容器日志目录不可用，使用默认输出"
 fi
 
-# ============================================================================
-# 📝 带时间戳的日志函数
-# 所有日志输出都会自动添加 UTC 时间前缀，格式与 agent_runner 一致
-# 格式：YYYY-MM-DDTHH:MM:SS.ffffffZ（ISO 8601 UTC）
-# ============================================================================
-function log() {
-    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO $*"
-}
-
-function log_info() {
-    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO ℹ️  $*"
-}
-
-function log_success() {
-    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO ✓ $*"
-}
-
-function log_warn() {
-    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  WARN ⚠️  $*"
-}
-
-function log_error() {
-    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ') ERROR ❌ $*"
-}
 
 # ============================================================================
 # 🎯 动态时区设置（支持通过 TZ 环境变量自定义时区）
@@ -93,6 +95,108 @@ function initialize_timezone() {
         echo "   Available timezones can be found in /usr/share/zoneinfo/"
         echo "   Keeping default timezone: Asia/Shanghai"
     fi
+}
+
+# ============================================================================
+# 🔧 通用等待 Helper 函数（用于替代固定 sleep 阻塞）
+# 使用轮询机制，可提前返回，大幅减少启动时间
+# 注意：使用纯 bash 整数运算，无需依赖 bc 命令
+# ============================================================================
+
+# 等待进程启动，最长等待 $2 秒（默认 10 秒）
+# 用法: wait_for_process "process_name" [timeout_seconds]
+function wait_for_process() {
+    local process_name="$1"
+    local timeout="${2:-10}"
+    local interval_ms=200  # 200ms 间隔
+    local max_iterations=$((timeout * 1000 / interval_ms))
+    local i=0
+    
+    while ! pgrep -x "$process_name" >/dev/null 2>&1; do
+        sleep 0.2
+        i=$((i + 1))
+        if [ $i -ge $max_iterations ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# 等待进程启动（支持模式匹配），最长等待 $2 秒（默认 10 秒）
+# 用法: wait_for_process_pattern "pattern" [timeout_seconds]
+function wait_for_process_pattern() {
+    local pattern="$1"
+    local timeout="${2:-10}"
+    local interval_ms=200
+    local max_iterations=$((timeout * 1000 / interval_ms))
+    local i=0
+    
+    while ! pgrep -f "$pattern" >/dev/null 2>&1; do
+        sleep 0.2
+        i=$((i + 1))
+        if [ $i -ge $max_iterations ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# 等待端口可用，最长等待 $3 秒（默认 10 秒）
+# 用法: wait_for_port host port [timeout_seconds]
+function wait_for_port() {
+    local host="$1"
+    local port="$2"
+    local timeout="${3:-10}"
+    local interval_ms=300  # 300ms 间隔
+    local max_iterations=$((timeout * 1000 / interval_ms))
+    local i=0
+    
+    while ! nc -z "$host" "$port" 2>/dev/null; do
+        sleep 0.3
+        i=$((i + 1))
+        if [ $i -ge $max_iterations ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# 等待文件存在，最长等待 $2 秒（默认 5 秒）
+# 用法: wait_for_file "filepath" [timeout_seconds]
+function wait_for_file() {
+    local filepath="$1"
+    local timeout="${2:-5}"
+    local interval_ms=200
+    local max_iterations=$((timeout * 1000 / interval_ms))
+    local i=0
+    
+    while [ ! -f "$filepath" ]; do
+        sleep 0.2
+        i=$((i + 1))
+        if [ $i -ge $max_iterations ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# 等待进程终止，最长等待 $2 秒（默认 5 秒）
+# 用法: wait_for_process_exit "process_name" [timeout_seconds]
+function wait_for_process_exit() {
+    local process_name="$1"
+    local timeout="${2:-5}"
+    local interval_ms=200
+    local max_iterations=$((timeout * 1000 / interval_ms))
+    local i=0
+    
+    while pgrep -x "$process_name" >/dev/null 2>&1; do
+        sleep 0.2
+        i=$((i + 1))
+        if [ $i -ge $max_iterations ]; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 # 初始化时区（在日志设置之后、用户目录初始化之前）
@@ -398,23 +502,31 @@ function start_vnc_services() {
 	# 停止可能存在的VNC服务
 	pkill x11vnc || true
 
-	# 等待进程完全停止
-	sleep 2
+	# 等待进程完全停止（智能等待，最长 3 秒）
+	wait_for_process_exit "x11vnc" 3 || log_warn "x11vnc 进程终止超时"
 
 	# 启动x11vnc服务器 (后台运行，以 root 身份)
 	export DISPLAY=:0
 	nohup x11vnc -bg -display :0 -forever -wait 50 -shared -rfbport 5900 -nopw 2>/tmp/x11vnc_stderr.log >/dev/null &
 
-	# 等待x11vnc启动
-	sleep 3
+	# 等待 x11vnc 端口就绪（智能等待，最长 5 秒）
+	if wait_for_port localhost 5900 5; then
+		log_success "x11vnc port 5900 is ready"
+	else
+		log_warn "x11vnc port 5900 not ready within timeout"
+	fi
 
 	# 启动noVNC代理 (后台运行，以 root 身份)
 	cd /opt/noVNC/utils
 	nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
 	cd -
 
-	# 等待noVNC启动
-	sleep 3
+	# 等待 noVNC 端口就绪（智能等待，最长 5 秒）
+	if wait_for_port localhost 6080 5; then
+		log_success "noVNC port 6080 is ready"
+	else
+		log_warn "noVNC port 6080 not ready within timeout"
+	fi
 
 	# 检查VNC服务状态
 	vnc_running=false
@@ -465,6 +577,13 @@ function start_display_and_desktop() {
     chmod 666 /tmp/.Xauthority
     touch /tmp/dbus-session-env
     chmod 666 /tmp/dbus-session-env
+
+    # ========== 优化：尽早启动 Xvfb (后台) ==========
+    # Xvfb 启动需要时间，将其提前到 Cleanup/DBus 之前，利用这段时间进行初始化
+    # 色深使用 24 位，避免某些 Linux 内核上出现花屏
+    log "Starting Xvfb :0 (background initialization)..."
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1280x800x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1 &
+
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
 	log "Cleaning up stale Chromium processes and lock files..."
@@ -530,7 +649,9 @@ function start_display_and_desktop() {
 	# 启动 D-Bus 会话 (以 root 启动，但 HOME 设置为 /home/user)
     log "Starting D-Bus session as root (HOME=/home/user)..."
 	HOME=/home/user dbus-launch --sh-syntax > /tmp/dbus-session-env
-	sleep 2
+	
+	# 等待 D-Bus 会话文件生成（智能等待，最长 3 秒）
+	wait_for_file /tmp/dbus-session-env 3 || log_warn "D-Bus session file not created"
 
 	# 导出 D-Bus 会话地址供后续使用
 	DBUS_ADDR=""
@@ -556,27 +677,28 @@ function start_display_and_desktop() {
     log "Starting D-Bus system bus..."
 	mkdir -p /var/run/dbus
 	dbus-daemon --system --fork
-	sleep 1
+	
+	# 等待 D-Bus 系统总线 socket 就绪（智能等待，最长 2 秒）
+	wait_for_file /var/run/dbus/system_bus_socket 2 || log_warn "D-Bus system bus socket not ready"
 
 	# 启动 PolicyKit 守护进程（配置为不需要认证）
     log "Starting PolicyKit daemon..."
 	/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
-	sleep 2
+	
+	# 等待 PolicyKit 进程启动（智能等待，最长 3 秒）
+	wait_for_process "polkitd" 3 || log_warn "PolicyKit daemon not started"
 
-	# 以 root 启动 Xvfb（设置 XAUTHORITY 和 Mesa 缓存环境变量）
-	# 色深使用 24 位，避免某些 Linux 内核上出现花屏
-	HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1280x800x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1 &
-
-	# 等待Xvfb启动
-	counter=0
-	while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
-		sleep 0.1
-		let counter++
-		if ((counter > 100)); then
-			echo "Failed to start Xvfb"
-			return 1
-		fi
-	done
+    # 等待Xvfb启动（此时应该已经差不多就绪了）
+    log "Waiting for X11 to be ready..."
+    counter=0
+    while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
+        sleep 0.1
+        let counter++
+        if ((counter > 100)); then
+            echo "Failed to start Xvfb"
+            return 1
+        fi
+    done
 
 	# ========== 关键修复：手动启动 fcitx5，确保环境变量正确 ==========
 	# 不再依赖 XFCE autostart，直接用正确的环境变量启动 (as root, HOME=/home/user)
@@ -593,13 +715,12 @@ function start_display_and_desktop() {
 		XMODIFIERS=@im=fcitx \
 		INPUT_METHOD=fcitx \
 		fcitx5 -d --replace >/tmp/fcitx5-startup.log 2>&1 &
-	sleep 3
-
-	# 验证 fcitx5 启动成功
-	if pgrep -x fcitx5 >/dev/null 2>&1; then
+	
+	# 等待 fcitx5 进程启动（智能等待，最长 5 秒）
+	if wait_for_process "fcitx5" 5; then
 		log_success "fcitx5 started successfully"
 	else
-		echo "✗ fcitx5 failed to start, check /tmp/fcitx5-startup.log"
+		log_warn "fcitx5 failed to start, check /tmp/fcitx5-startup.log"
 	fi
 
 	# 以 root 用户启动 XFCE4 会话（但 HOME 设置为 /home/user）
@@ -635,8 +756,8 @@ function start_display_and_desktop() {
 	# 启动 PolicyKit 认证代理
 	/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1 >/var/log/polkit-agent.log 2>&1 &
 
-	# 等待守护进程启动
-	sleep 2
+	# 等待 gnome-keyring-daemon 启动（智能等待，最长 2 秒）
+	wait_for_process_pattern "gnome-keyring-daemon" 2 || true
 
 	echo 'Fcitx5 already started manually'
 
@@ -747,17 +868,16 @@ function start_audio_services() {
 
     # 启动 PulseAudio（非系统模式，允许运行为 root）
     HOME=/home/user pulseaudio --start --exit-idle-time=-1 --log-level=warning 2>/tmp/pulseaudio.log || true
-    sleep 2
-
-    # 检查 PulseAudio 是否启动
-    if pgrep -x pulseaudio >/dev/null 2>&1; then
+    
+    # 等待 PulseAudio 进程启动（智能等待，最长 3 秒）
+    if wait_for_process "pulseaudio" 3; then
         log_success "  PulseAudio daemon started"
     else
         log_warn "  PulseAudio failed to start, checking log..."
         cat /tmp/pulseaudio.log 2>/dev/null || true
         # 尝试用 --system 模式启动
         pulseaudio --system --disallow-exit --disallow-module-loading=0 &
-        sleep 2
+        wait_for_process "pulseaudio" 3 || log_warn "  PulseAudio system mode also failed"
     fi
 
     # 2. 创建虚拟声卡 (null sink) 作为音频输出目标
@@ -785,10 +905,9 @@ function start_audio_services() {
 
     # 后台启动音频服务器
     nohup python3 /usr/local/bin/audio_server.py > /tmp/audio_server.log 2>&1 &
-    sleep 2
-
-    # 检查音频服务是否启动
-    if pgrep -f "audio_server.py" >/dev/null 2>&1; then
+    
+    # 等待音频服务进程启动或端口就绪（智能等待，最长 5 秒）
+    if wait_for_process_pattern "audio_server.py" 3 && wait_for_port localhost 6090 3; then
         log_success "  pcmflux audio server started"
         log_success "  Audio HTTP: http://localhost:6090"
         log_success "  Audio WebSocket: ws://localhost:6089"
@@ -850,10 +969,9 @@ function start_mcp_proxy_services() {
         > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
 
     local MCP_PID=$!
-    sleep 3
-
-    # 验证服务是否启动
-    if kill -0 $MCP_PID 2>/dev/null; then
+    
+    # 等待 MCP Proxy 端口就绪（智能等待，最长 10 秒）
+    if wait_for_port 127.0.0.1 18099 10 && kill -0 $MCP_PID 2>/dev/null; then
         log_success "  MCP Proxy started (PID: $MCP_PID)"
         log_success "  MCP Proxy URL: http://127.0.0.1:18099"
         log_success "  Agent 可使用: mcp-proxy convert http://127.0.0.1:18099"
@@ -911,10 +1029,9 @@ function start_ime_services() {
         > "$IME_LOG_DIR/ime_server.log" 2>&1 &
 
     local IME_PID=$!
-    sleep 2
-
-    # 验证服务是否启动
-    if kill -0 $IME_PID 2>/dev/null; then
+    
+    # 等待 IME 服务端口就绪（智能等待，最长 5 秒）
+    if wait_for_port 127.0.0.1 6091 5 && kill -0 $IME_PID 2>/dev/null; then
         log_success "  IME server started (PID: $IME_PID)"
         log_success "  IME WebSocket: ws://0.0.0.0:6091"
         log_success "  用户可使用宿主机输入法输入到远程桌面"
@@ -925,9 +1042,6 @@ function start_ime_services() {
 
     log_success "IME passthrough services initialized"
 }
-
-    log "Starting Code Interpreter server..."
-
 # 设置VNC自动启动标志
 export VNC_AUTO_START=true
 
@@ -952,7 +1066,7 @@ echo "DISPLAY=:0" >> /etc/environment
 # Jupyter services removed
 
 # 启动 VNC 服务（在后台运行，等待X11就绪）
-    log "Starting VNC services in background (as root)..."
+log "Starting VNC services in background (as root)..."
 log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
 (
     # 等待X11服务就绪
@@ -966,27 +1080,49 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
         fi
     done
 
-    log "X11 is ready, starting VNC services..."
+    log "X11 is ready, starting services in parallel..."
 
-    start_vnc_services
+    # ========== 并行启动所有依赖 X11 的服务 ==========
+    # 这些服务互不依赖，可以同时启动以缩短整体启动时间
+    
+    # 1. VNC 服务（后台）
+    (
+        start_vnc_services
+        log_success "VNC services started successfully!"
+        log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
+        log_success "Direct VNC port: 5900"
+    ) &
+    vnc_pid=$!
 
-    log_success "VNC services started successfully!"
-    log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
-    log_success "Direct VNC port: 5900"
+    # 2. MCP Proxy 服务（后台）- 需要 X11 来启动 Chromium
+    (
+        log "Starting MCP Proxy services..."
+        start_mcp_proxy_services
+    ) &
+    mcp_pid=$!
 
-    # 应用 XFCE 壁纸
-    apply_xfce_wallpaper
+    # 3. 音频流服务 (pcmflux)（后台）
+    (
+        start_audio_services
+    ) &
+    audio_pid=$!
 
-    # ========== MCP Proxy 服务（需要 X11 就绪）==========
-    # chrome-devtools-mcp 会启动 Chromium 浏览器，需要 DISPLAY 环境变量
-    log "X11 ready, now starting MCP Proxy services..."
-    start_mcp_proxy_services
+    # 4. IME 本地输入法透传服务（后台）
+    (
+        start_ime_services
+    ) &
+    ime_pid=$!
 
-    # 启动音频流服务 (pcmflux)
-    start_audio_services
+    # 5. 应用 XFCE 壁纸（后台）
+    (
+        apply_xfce_wallpaper
+    ) &
+    wallpaper_pid=$!
 
-    # 启动 IME 本地输入法透传服务
-    start_ime_services
+    # 等待所有并行服务启动完成
+    log "Waiting for all services to start..."
+    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $wallpaper_pid 2>/dev/null || true
+    log_success "All X11-dependent services started!"
 
     # VNC服务监控循环 (as root)
     while true; do
@@ -996,7 +1132,8 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             # 停止现有服务
             pkill x11vnc || true
             pkill -f novnc_proxy || true
-            sleep 2
+            # 等待进程终止（智能等待，最长 3 秒）
+            wait_for_process_exit "x11vnc" 3 || true
             # 重新启动VNC服务
             start_vnc_services
         fi
@@ -1008,17 +1145,7 @@ log "Starting agent_runner service on port ${PORT:-8086}..."
 
 # ========== 关键修复：确保 agent_runner 及其子进程继承输入法环境 ==========
 # 从 /tmp/dbus-session-env 加载 D-Bus 地址
-if [ -f /tmp/dbus-session-env ]; then
-    source /tmp/dbus-session-env
-    export DBUS_SESSION_BUS_ADDRESS
-    log_success "agent_runner will use D-Bus: $DBUS_SESSION_BUS_ADDRESS"
-
-    # ========== 新增：将 D-Bus 地址写入全局环境 ==========
-    # 确保所有子进程（包括 chrome-devtools-mcp 启动的 Chromium）都能访问
-    echo "export DBUS_SESSION_BUS_ADDRESS='${DBUS_SESSION_BUS_ADDRESS}'" >> /etc/profile.d/ime-env.sh
-fi
-
-# ========== 新增：创建全局输入法环境配置文件 ==========
+# ========== 创建全局输入法环境配置文件 ==========
 # 所有进程（包括 agent_runner、chrome-devtools-mcp、Chromium）都会继承这些环境变量
 cat > /etc/profile.d/ime-env.sh <<'EOF'
 # Fcitx5 中文输入法环境变量
@@ -1031,6 +1158,16 @@ export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export LC_CTYPE=C.UTF-8
 EOF
+
+# 加载 D-Bus 会话地址并追加到环境配置文件
+if [ -f /tmp/dbus-session-env ]; then
+    source /tmp/dbus-session-env
+    export DBUS_SESSION_BUS_ADDRESS
+    log_success "agent_runner will use D-Bus: $DBUS_SESSION_BUS_ADDRESS"
+
+    # 将 D-Bus 地址追加到全局环境配置（注意：用 >> 追加，不是覆盖）
+    echo "export DBUS_SESSION_BUS_ADDRESS='${DBUS_SESSION_BUS_ADDRESS}'" >> /etc/profile.d/ime-env.sh
+fi
 
 # 立即加载环境配置
 source /etc/profile.d/ime-env.sh
@@ -1076,43 +1213,31 @@ export HOME=/home/user
 # 确保所有输入法环境变量已导出
 source /etc/profile.d/ime-env.sh 2>/dev/null || true
 
-# 等待 D-Bus 会话文件创建（可能在后台线程中）
-sleep 2
+# 等待 D-Bus 会话文件创建（智能等待，最长 5 秒）
+wait_for_file /tmp/dbus-session-env 5 || log_warn "D-Bus session file not ready"
 
 
 # ========== 等待 MCP Proxy 服务就绪 ==========
-# MCP Proxy 依赖 X11（chrome-devtools-mcp 需要启动浏览器）
-# 必须等待 MCP Proxy 完全就绪后才能启动 agent_runner
+# MCP Proxy 已在后台并行启动，这里只需等待端口就绪
+# 由于是并行启动，通常很快就会就绪
 log "Waiting for MCP Proxy service to be ready..."
 MCP_PROXY_PORT=18099
-MCP_PROXY_TIMEOUT=60  # 最长等待 60 秒
+MCP_PROXY_TIMEOUT=30  # 并行启动后，超时时间从 60s 降至 30s
 
-mcp_counter=0
-while [ $mcp_counter -lt $MCP_PROXY_TIMEOUT ]; do
-    if nc -z 127.0.0.1 $MCP_PROXY_PORT 2>/dev/null; then
-        # 端口已开放，进一步验证 MCP 服务是否真正就绪
-        # 通过发送 initialize 请求检测服务是否可用
-        MCP_TEST_RESULT=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}' | \
-            timeout 5 mcp-proxy convert http://127.0.0.1:$MCP_PROXY_PORT --quiet 2>/dev/null | head -1)
+# 使用 wait_for_port 智能等待端口就绪
+if wait_for_port 127.0.0.1 $MCP_PROXY_PORT $MCP_PROXY_TIMEOUT; then
+    # 端口就绪后，进一步验证 MCP 服务是否真正可用（可选）
+    MCP_TEST_RESULT=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}' | \
+        timeout 5 mcp-proxy convert http://127.0.0.1:$MCP_PROXY_PORT --quiet 2>/dev/null | head -1)
 
-        if echo "$MCP_TEST_RESULT" | grep -q '"result"'; then
-            log_success "MCP Proxy is fully ready on port $MCP_PROXY_PORT (waited ${mcp_counter}s)"
-            break
-        fi
+    if echo "$MCP_TEST_RESULT" | grep -q '"result"'; then
+        log_success "MCP Proxy is fully ready on port $MCP_PROXY_PORT"
+    else
+        log_warn "MCP Proxy port is open but service not fully initialized, continuing anyway"
     fi
-
-    mcp_counter=$((mcp_counter + 1))
-    if [ $((mcp_counter % 10)) -eq 0 ]; then
-        log "  Still waiting for MCP Proxy... (${mcp_counter}s/${MCP_PROXY_TIMEOUT}s)"
-    fi
-    sleep 1
-done
-
-if [ $mcp_counter -ge $MCP_PROXY_TIMEOUT ]; then
+else
     log_warn "MCP Proxy not ready after ${MCP_PROXY_TIMEOUT}s, starting agent_runner anyway"
     log_warn "Agent may need to retry MCP connections on first use"
-else
-    log_success "MCP Proxy ready, proceeding to start agent_runner"
 fi
 
 # 加载 D-Bus 会话环境
