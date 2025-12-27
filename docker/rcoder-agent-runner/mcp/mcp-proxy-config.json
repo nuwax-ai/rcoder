@@ -1,18 +1,16 @@
 {
-    "mcpServers": {
-        "chrome-devtools": {
-            "command": "npx",
-            "args": [
-                "-y",
-                "chrome-devtools-mcp@latest",
-                "--userDataDir=/home/user/.config/chromium",
-                "--executablePath=/usr/local/bin/chromium-for-mcp",
-                "--chrome-arg=--no-sandbox",
-                "--chrome-arg=--no-zygote",
-                "--chrome-arg=--disable-dev-shm-usage",
-                "--chrome-arg=--disable-gpu",
-                "--chrome-arg=--remote-debugging-port=9222"
-            ]
-        }
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "chrome-devtools-mcp",
+      "args": [
+        "--userDataDir=/home/user/.config/chromium",
+        "--executablePath=/usr/local/bin/chromium-for-mcp",
+        "--chrome-arg=--no-sandbox",
+        "--chrome-arg=--no-zygote",
+        "--chrome-arg=--disable-dev-shm-usage",
+        "--chrome-arg=--disable-gpu",
+        "--chrome-arg=--remote-debugging-port=9222"
+      ]
     }
+  }
 }

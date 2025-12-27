@@ -9,10 +9,10 @@ pub mod types;
 pub mod utils;
 
 // 新增模块
-pub mod network;
-pub mod health;
-pub mod path;
 pub mod container_builder;
+pub mod health;
+pub mod network;
+pub mod path;
 
 pub use container_self_inspector::*;
 pub use manager::*;
@@ -20,12 +20,14 @@ pub use types::*;
 pub use utils::*;
 
 // 公共导出新模块
-pub use network::{build_network_name, parse_project_from_network, NetworkDetector};
-pub use health::{wait_for_service_ready, HttpHealthChecker};
-pub use path::{
-    get_host_path_resolver, normalize_path, resolve_container_path_to_host, HostPathResolver,
-};
 pub use container_builder::{ContainerConfigBuilder, MountProcessor};
+pub use health::{
+    HttpHealthChecker, ServiceHealthChecker, ServiceHealthStatus, wait_for_service_ready,
+};
+pub use network::{NetworkDetector, build_network_name, parse_project_from_network};
+pub use path::{
+    HostPathResolver, get_host_path_resolver, normalize_path, resolve_container_path_to_host,
+};
 
 /// Docker 管理器错误类型
 #[derive(Error, Debug)]
