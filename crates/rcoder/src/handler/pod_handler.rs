@@ -1137,63 +1137,75 @@ pub async fn pod_status(
         unreachable!()
     };
 
-    // 4. 通过 DockerManager 查询容器状态（使用内存缓存，最多 1 分钟延迟）
-    if let Some(docker_info) = docker_manager
-        .find_container_by_identifier(&identifier)
-        .await
-    {
-        let is_running = matches!(docker_info.status, docker_manager::ContainerStatus::Running);
-        let status = if is_running { "running" } else { "stopped" };
-        let message = if is_running {
-            "容器正在运行中".to_string()
-        } else {
-            format!("容器存在但状态为: {:?}", docker_info.status)
-        };
+    // 4. 🆕 通过 DockerManager 实时查询容器状态（直接查询 Docker API，无缓存延迟）
+    match docker_manager.find_container_realtime(&identifier).await {
+        Ok(Some((container_id, container_name, status, is_running))) => {
+            let status_str = if is_running { "running" } else { "stopped" };
+            let message = if is_running {
+                "容器正在运行中".to_string()
+            } else {
+                format!("容器存在但状态为: {:?}", status)
+            };
 
-        info!(
-            "✅ [POD_STATUS] 容器状态: alive={}, status={}, container_id={}",
-            is_running, status, docker_info.container_id
-        );
+            info!(
+                "✅ [POD_STATUS] 容器状态: alive={}, status={}, container_id={}",
+                is_running, status_str, container_id
+            );
 
-        return Ok(HttpResult::success(PodStatusResponse {
-            alive: is_running,
-            status: status.to_string(),
-            container_id: Some(docker_info.container_id),
-            container_name: Some(docker_info.container_name),
-            timestamp,
-            message,
-        }));
+            return Ok(HttpResult::success(PodStatusResponse {
+                alive: is_running,
+                status: status_str.to_string(),
+                container_id: Some(container_id),
+                container_name: Some(container_name),
+                timestamp,
+                message,
+            }));
+        }
+        Ok(None) => {
+            // 容器不存在，继续尝试 project_id
+        }
+        Err(e) => {
+            error!("❌ [POD_STATUS] 查询容器状态失败: {}", e);
+            return Err(AppError::internal_server_error(&format!(
+                "查询容器状态失败: {}",
+                e
+            )));
+        }
     }
 
     // 5. 如果用 user_id 没找到，且同时提供了 project_id，再试 project_id
     if params.user_id.is_some() {
         if let Some(ref project_id) = params.project_id {
-            if let Some(docker_info) = docker_manager
-                .find_container_by_identifier(project_id)
-                .await
-            {
-                let is_running =
-                    matches!(docker_info.status, docker_manager::ContainerStatus::Running);
-                let status = if is_running { "running" } else { "stopped" };
-                let message = if is_running {
-                    "容器正在运行中".to_string()
-                } else {
-                    format!("容器存在但状态为: {:?}", docker_info.status)
-                };
+            match docker_manager.find_container_realtime(project_id).await {
+                Ok(Some((container_id, container_name, status, is_running))) => {
+                    let status_str = if is_running { "running" } else { "stopped" };
+                    let message = if is_running {
+                        "容器正在运行中".to_string()
+                    } else {
+                        format!("容器存在但状态为: {:?}", status)
+                    };
 
-                info!(
-                    "✅ [POD_STATUS] 通过 project_id 找到容器: alive={}, container_id={}",
-                    is_running, docker_info.container_id
-                );
+                    info!(
+                        "✅ [POD_STATUS] 通过 project_id 找到容器: alive={}, container_id={}",
+                        is_running, container_id
+                    );
 
-                return Ok(HttpResult::success(PodStatusResponse {
-                    alive: is_running,
-                    status: status.to_string(),
-                    container_id: Some(docker_info.container_id),
-                    container_name: Some(docker_info.container_name),
-                    timestamp,
-                    message,
-                }));
+                    return Ok(HttpResult::success(PodStatusResponse {
+                        alive: is_running,
+                        status: status_str.to_string(),
+                        container_id: Some(container_id),
+                        container_name: Some(container_name),
+                        timestamp,
+                        message,
+                    }));
+                }
+                Ok(None) => {
+                    // 容器不存在
+                }
+                Err(e) => {
+                    error!("❌ [POD_STATUS] 通过 project_id 查询失败: {}", e);
+                    // 继续返回 not_found 而不是错误
+                }
             }
         }
     }

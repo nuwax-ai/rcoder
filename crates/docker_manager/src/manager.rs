@@ -293,6 +293,7 @@ impl DockerManager {
             port_bindings: config.port_bindings.clone(),
             assigned_port: 3000, // TODO: 使用动态分配的端口
             health_status: None,
+            service_health: None,                         // 初始无健康检查结果
             internal_port: 8080,                          // 默认内部端口
             network_name: container_network_name.clone(), // 记录使用的网络名称
         };
@@ -469,6 +470,7 @@ impl DockerManager {
                                 port_bindings: std::collections::HashMap::new(),
                                 assigned_port: 0,
                                 health_status: None,
+                                service_health: None,
                                 internal_port: 0,
                                 network_name: "unknown".to_string(), // 临时容器信息，网络名称未知
                             });
@@ -512,6 +514,73 @@ impl DockerManager {
             }
             Err(e) => {
                 // 其他类型的错误，作为错误返回
+                Err(DockerError::BollardError(e))
+            }
+        }
+    }
+
+    /// 实时查询容器状态（直接查询 Docker API，不使用缓存）
+    ///
+    /// 与 `find_container_by_identifier` 不同，此方法跳过内存缓存，
+    /// 直接查询 Docker API 获取最新的容器状态。
+    ///
+    /// # 参数
+    /// * `identifier` - 容器名称或容器 ID
+    ///
+    /// # 返回
+    /// * 如果找到容器，返回 `Some((container_id, container_name, status, is_running))`
+    /// * 如果容器不存在，返回 `None`
+    pub async fn find_container_realtime(
+        &self,
+        identifier: &str,
+    ) -> DockerResult<Option<(String, String, ContainerStatus, bool)>> {
+        debug!("🔍 [REALTIME] 实时查询容器状态: identifier={}", identifier);
+
+        match self
+            .docker
+            .inspect_container(identifier, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(details) => {
+                let container_id = details.id.unwrap_or_default();
+                let container_name = details
+                    .name
+                    .map(|n| n.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| identifier.to_string());
+
+                let (status, is_running) = if let Some(state) = details.state {
+                    if let Some(state_status) = state.status {
+                        let is_running =
+                            state_status == bollard::models::ContainerStateStatusEnum::RUNNING;
+                        let status = ContainerStatus::from(state_status.to_string());
+                        (status, is_running)
+                    } else {
+                        (ContainerStatus::Unknown("no status".to_string()), false)
+                    }
+                } else {
+                    (ContainerStatus::Unknown("no state".to_string()), false)
+                };
+
+                info!(
+                    "✅ [REALTIME] 容器状态查询成功: id={}, name={}, status={:?}, running={}",
+                    container_id, container_name, status, is_running
+                );
+
+                Ok(Some((container_id, container_name, status, is_running)))
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // 容器不存在
+                debug!("📭 [REALTIME] 容器不存在: identifier={}", identifier);
+                Ok(None)
+            }
+            Err(e) => {
+                // 其他类型的错误
+                error!(
+                    "❌ [REALTIME] 查询容器状态失败: identifier={}, error={}",
+                    identifier, e
+                );
                 Err(DockerError::BollardError(e))
             }
         }
@@ -1020,6 +1089,7 @@ impl DockerManager {
     ///
     /// 遍历缓存中的所有容器，调用 Docker API 检查其真实状态。
     /// 如果容器已被外部删除（如手动 `docker stop`），则从缓存中移除。
+    /// 🆕 对运行中的容器执行服务健康检查（HTTP + gRPC）
     ///
     /// # Returns
     /// 返回元组 (已检查数量, 已移除数量)
@@ -1037,6 +1107,10 @@ impl DockerManager {
 
         let total = project_ids.len() as u32;
         let mut removed_count = 0u32;
+        let mut health_checked_count = 0u32;
+
+        // 创建健康检查器（复用同一个实例）
+        let health_checker = crate::health::ServiceHealthChecker::new();
 
         for project_id in project_ids {
             match self.update_container_status(&project_id).await {
@@ -1048,8 +1122,55 @@ impl DockerManager {
                         project_id
                     );
                 }
-                Ok(Some(_status)) => {
-                    // 容器存在，状态已更新
+                Ok(Some(status)) => {
+                    // 🆕 对运行中的容器执行服务健康检查
+                    if matches!(status, ContainerStatus::Running) {
+                        if let Some(container_info) = self.containers.get(&project_id) {
+                            // 获取容器 IP
+                            if let Ok(network_ips) = self
+                                .get_container_network_info(&container_info.container_id)
+                                .await
+                            {
+                                // 优先使用主网络 IP，否则使用第一个可用 IP
+                                let network_name = self.get_main_network_name().await;
+                                let container_ip = network_ips
+                                    .get(&network_name)
+                                    .or_else(|| network_ips.values().next());
+
+                                if let Some(ip) = container_ip {
+                                    // 获取之前的失败次数
+                                    let previous_failures = container_info
+                                        .service_health
+                                        .as_ref()
+                                        .map(|h| h.consecutive_failures)
+                                        .unwrap_or(0);
+
+                                    // 执行健康检查
+                                    let health_status =
+                                        health_checker.check_service(ip, previous_failures).await;
+
+                                    // 更新缓存
+                                    let mut updated_info = container_info.clone();
+                                    updated_info.service_health = Some(health_status.clone());
+                                    self.containers.insert(project_id.clone(), updated_info);
+
+                                    health_checked_count += 1;
+
+                                    if health_status.is_fully_healthy() {
+                                        debug!("✅ [SYNC] 服务健康: project_id={}", project_id);
+                                    } else {
+                                        warn!(
+                                            "⚠️ [SYNC] 服务不健康: project_id={}, http={}, grpc={}, failures={}",
+                                            project_id,
+                                            health_status.http_healthy,
+                                            health_status.grpc_healthy,
+                                            health_status.consecutive_failures
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -1060,10 +1181,10 @@ impl DockerManager {
             }
         }
 
-        if removed_count > 0 {
+        if removed_count > 0 || health_checked_count > 0 {
             info!(
-                "🔄 [SYNC] 容器状态同步完成: 检查={}, 移除={}",
-                total, removed_count
+                "🔄 [SYNC] 容器状态同步完成: 检查={}, 移除={}, 健康检查={}",
+                total, removed_count, health_checked_count
             );
         }
 

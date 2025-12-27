@@ -145,6 +145,9 @@ pub struct DockerContainerInfo {
     pub assigned_port: u16,
     /// 健康检查状态
     pub health_status: Option<String>,
+    /// 🆕 服务层健康状态（gRPC/HTTP 检查结果）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_health: Option<crate::health::ServiceHealthStatus>,
     /// 内部服务端口
     pub internal_port: u16,
     /// 网络名称
