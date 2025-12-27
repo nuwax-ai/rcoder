@@ -66,30 +66,26 @@ impl SchemaInitializer {
     pub fn initialize(conn: &DuckDbConnection) -> DuckDbResult<()> {
         conn.with_connection(|c| {
             // 创建表
-            c.execute(CREATE_CONTAINERS_TABLE, [])
-                .map_err(|e| DuckDbError::InitializationError(
-                    format!("创建 containers 表失败: {}", e)
-                ))?;
+            c.execute(CREATE_CONTAINERS_TABLE, []).map_err(|e| {
+                DuckDbError::InitializationError(format!("创建 containers 表失败: {}", e))
+            })?;
 
-            c.execute(CREATE_PROJECTS_TABLE, [])
-                .map_err(|e| DuckDbError::InitializationError(
-                    format!("创建 projects 表失败: {}", e)
-                ))?;
+            c.execute(CREATE_PROJECTS_TABLE, []).map_err(|e| {
+                DuckDbError::InitializationError(format!("创建 projects 表失败: {}", e))
+            })?;
 
             // 创建容器表索引
             for sql in CREATE_CONTAINERS_INDEXES {
-                c.execute(sql, [])
-                    .map_err(|e| DuckDbError::InitializationError(
-                        format!("创建容器表索引失败: {}", e)
-                    ))?;
+                c.execute(sql, []).map_err(|e| {
+                    DuckDbError::InitializationError(format!("创建容器表索引失败: {}", e))
+                })?;
             }
 
             // 创建项目表索引
             for sql in CREATE_PROJECTS_INDEXES {
-                c.execute(sql, [])
-                    .map_err(|e| DuckDbError::InitializationError(
-                        format!("创建项目表索引失败: {}", e)
-                    ))?;
+                c.execute(sql, []).map_err(|e| {
+                    DuckDbError::InitializationError(format!("创建项目表索引失败: {}", e))
+                })?;
             }
 
             tracing::info!("DuckDB Schema 初始化完成");
@@ -118,21 +114,21 @@ impl SchemaInitializer {
                     "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'containers'"
                 )?;
                 let mut rows = stmt.query([])?;
-                let row = rows.next()?.ok_or_else(|| {
-                    DuckDbError::InternalError("无法查询表信息".to_string())
-                })?;
+                let row = rows
+                    .next()?
+                    .ok_or_else(|| DuckDbError::InternalError("无法查询表信息".to_string()))?;
                 row.get(0)?
             };
 
             // 检查 projects 表
             let projects_exists: i32 = {
                 let mut stmt = c.prepare(
-                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'projects'"
+                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'projects'",
                 )?;
                 let mut rows = stmt.query([])?;
-                let row = rows.next()?.ok_or_else(|| {
-                    DuckDbError::InternalError("无法查询表信息".to_string())
-                })?;
+                let row = rows
+                    .next()?
+                    .ok_or_else(|| DuckDbError::InternalError("无法查询表信息".to_string()))?;
                 row.get(0)?
             };
 
@@ -179,12 +175,14 @@ mod tests {
         SchemaInitializer::reset(&conn).unwrap();
 
         // 验证数据已清空
-        let count: i32 = conn.with_connection(|c| {
-            let mut stmt = c.prepare("SELECT COUNT(*) FROM containers")?;
-            let mut rows = stmt.query([])?;
-            let row = rows.next()?.unwrap();
-            Ok(row.get(0)?)
-        }).unwrap();
+        let count: i32 = conn
+            .with_connection(|c| {
+                let mut stmt = c.prepare("SELECT COUNT(*) FROM containers")?;
+                let mut rows = stmt.query([])?;
+                let row = rows.next()?.unwrap();
+                Ok(row.get(0)?)
+            })
+            .unwrap();
 
         assert_eq!(count, 0);
     }

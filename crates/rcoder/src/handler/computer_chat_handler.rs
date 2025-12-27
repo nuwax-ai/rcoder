@@ -261,11 +261,11 @@ pub async fn handle_computer_chat(
                 result.is_success()
             );
 
-            // ComputerAgentRunner 模式：使用 user_id 作为容器标识（一个用户一个容器）
-            // 使用 DuckDB 存储替代 DashMap
-            let map_key = user_id.clone();
+            // ComputerAgentRunner 模式：每个 project 独立记录
+            // 使用真正的 project_id 作为 map_key，user_id 存储在数据字段中
+            let map_key = project_id.clone();
 
-            // 检查是否已存在该 user_id 的记录
+            // 检查是否已存在该 project_id 的记录
             if let Some(existing_info) = state.get_project(&map_key) {
                 // 已存在：更新信息
                 let mut updated_info = (*existing_info).clone();
