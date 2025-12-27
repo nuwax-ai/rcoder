@@ -1027,6 +1027,158 @@ pub async fn pod_restart(
 }
 
 // ============================================================================
+// 接口五：查询容器状态（是否存活）
+// ============================================================================
+
+/// 查询容器状态请求
+#[derive(Debug, Clone, Deserialize, IntoParams, ToSchema)]
+pub struct PodStatusQuery {
+    /// 项目唯一标识符 (必填)
+    #[param(example = "proj_456")]
+    #[schema(example = "proj_456")]
+    pub project_id: String,
+
+    /// 用户唯一标识符 (可选)
+    #[param(example = "user_123")]
+    #[schema(example = "user_123")]
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+/// 查询容器状态响应
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PodStatusResponse {
+    /// 容器是否存活 (true=存在且运行中，false=不存在或未运行)
+    #[schema(example = true)]
+    pub alive: bool,
+
+    /// 容器状态描述 (running/stopped/not_found)
+    #[schema(example = "running")]
+    pub status: String,
+
+    /// 容器 ID (如果存在)
+    #[schema(example = "abc123def456")]
+    pub container_id: Option<String>,
+
+    /// 容器名称 (如果存在)
+    #[schema(example = "computer-agent-runner-user_123")]
+    pub container_name: Option<String>,
+
+    /// 查询时间戳 (Unix 毫秒)
+    #[schema(example = 1702700000000_u64)]
+    pub timestamp: u64,
+
+    /// 提示消息
+    #[schema(example = "容器正在运行中")]
+    pub message: String,
+}
+
+/// 查询容器状态（是否存活）
+///
+/// 根据 project_id (必填) 和 user_id (可选) 查询对应容器是否存活。
+/// 如果提供了 user_id，则直接查询 `computer-agent-runner-{user_id}` 容器；
+/// 否则通过 project_id 在存储中查找关联的容器。
+#[utoipa::path(
+    get,
+    path = "/computer/pod/status",
+    params(
+        PodStatusQuery
+    ),
+    responses(
+        (status = 200, description = "成功查询容器状态", body = HttpResult<PodStatusResponse>),
+        (status = 400, description = "请求参数无效", body = HttpResult<String>),
+        (status = 500, description = "服务器内部错误", body = HttpResult<String>)
+    ),
+    tag = "pod",
+    operation_id = "pod_status",
+    summary = "查询容器状态（是否存活）",
+    description = "根据 project_id (必填) 和 user_id (可选) 查询对应容器是否存活"
+)]
+#[axum::debug_handler]
+#[instrument(skip(_state), fields(project_id = %params.project_id, user_id = ?params.user_id))]
+pub async fn pod_status(
+    State(_state): State<Arc<AppState>>,
+    Query(params): Query<PodStatusQuery>,
+) -> Result<HttpResult<PodStatusResponse>, AppError> {
+    // 1. 验证参数
+    if params.project_id.trim().is_empty() {
+        error!("❌ [POD_STATUS] project_id 不能为空");
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "project_id 不能为空",
+        ));
+    }
+
+    info!(
+        "🔍 [POD_STATUS] 查询容器状态: project_id={}, user_id={:?}",
+        params.project_id, params.user_id
+    );
+
+    let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+    // 2. 获取 DockerManager
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [POD_STATUS] 获取 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+        })?;
+
+    // 3. 确定查询标识符：优先使用 user_id 构造容器名，否则使用 project_id
+    // ComputerAgentRunner 容器名格式: {container_prefix}-{user_id}
+    let identifier = if let Some(ref user_id) = params.user_id {
+        let prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
+        format!("{}-{}", prefix, user_id)
+    } else {
+        params.project_id.clone()
+    };
+
+    // 4. 直接通过 DockerManager 查询容器实时状态（避免 DuckDB 缓存滞后）
+    // find_container_by_identifier 可以匹配 project_id、容器名称，或直接调用 Docker API
+    if let Some(docker_info) = docker_manager
+        .find_container_by_identifier(&identifier)
+        .await
+    {
+        let is_running = matches!(docker_info.status, docker_manager::ContainerStatus::Running);
+        let status = if is_running { "running" } else { "stopped" };
+        let message = if is_running {
+            "容器正在运行中".to_string()
+        } else {
+            format!("容器存在但状态为: {:?}", docker_info.status)
+        };
+
+        info!(
+            "✅ [POD_STATUS] 容器状态: alive={}, status={}, container_id={}",
+            is_running, status, docker_info.container_id
+        );
+
+        return Ok(HttpResult::success(PodStatusResponse {
+            alive: is_running,
+            status: status.to_string(),
+            container_id: Some(docker_info.container_id),
+            container_name: Some(docker_info.container_name),
+            timestamp,
+            message,
+        }));
+    }
+
+    // 5. 未找到容器
+    info!(
+        "📭 [POD_STATUS] 未找到 identifier={} 对应的容器",
+        identifier
+    );
+
+    Ok(HttpResult::success(PodStatusResponse {
+        alive: false,
+        status: "not_found".to_string(),
+        container_id: None,
+        container_name: None,
+        timestamp,
+        message: format!("未找到对应的容器 (identifier={})", identifier),
+    }))
+}
+
+// ============================================================================
 // 单元测试
 // ============================================================================
 

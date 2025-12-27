@@ -156,6 +156,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/computer/pod/ensure", post(handler::pod_ensure))
         .route("/computer/pod/keepalive", post(handler::pod_keepalive))
         .route("/computer/pod/restart", post(handler::pod_restart))
+        .route("/computer/pod/status", get(handler::pod_status))
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）
@@ -209,6 +210,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::pod_ensure,
         handler::pod_keepalive,
         handler::pod_restart,
+        handler::pod_status,
         // Pingora 代理接口
         handler::proxy_status,
         handler::proxy_stats,
@@ -271,6 +273,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::KeepalivePodResponse,
             handler::RestartPodRequest,
             handler::RestartPodResponse,
+            handler::PodStatusQuery,
+            handler::PodStatusResponse,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,
