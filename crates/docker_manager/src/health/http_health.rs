@@ -29,9 +29,10 @@ impl HttpHealthChecker {
         }
     }
 
-    /// 默认配置的健康检查器(30次，每次1秒)
+    /// 默认配置的健康检查器(60次，每次2秒，总计约180秒)
+    /// 容器启动包含 MCP Proxy 等服务，可能需要 60-90 秒
     pub fn default_checker() -> Self {
-        Self::new(30, 1)
+        Self::new(60, 2)
     }
 
     /// 等待服务就绪
@@ -89,6 +90,15 @@ impl HttpHealthChecker {
                         self.max_attempts
                     );
                 }
+            }
+
+            // 每 10 次尝试输出一次 info 日志
+            if (attempt + 1) % 10 == 0 {
+                info!(
+                    "仍在等待服务启动... ({}/{})",
+                    attempt + 1,
+                    self.max_attempts
+                );
             }
 
             tokio::time::sleep(Duration::from_secs(1)).await;
