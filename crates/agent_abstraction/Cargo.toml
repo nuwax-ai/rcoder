@@ -28,6 +28,12 @@ dashmap = { workspace = true }
 # 缓存
 moka = { workspace = true }
 
+# 目录操作
+dirs = { workspace = true }
+
+# 文件系统监听
+notify = { workspace = true }
+
 # 日期时间
 chrono = { workspace = true, features = ["serde"] }
 

@@ -83,9 +83,19 @@ RUN case "$TARGETARCH" in \
     cd /tmp && \
     tar -xzf libreoffice.tar.gz && \
     cd LibreOffice_*/DEBS && \
-    dpkg -i *.deb || true && \
+    dpkg -i *.deb && \
     apt-get update && \
     apt-get install -f -y && \
+    # Create symlinks for LibreOffice executables (they are installed in /opt/libreofficeXX.X/program/)
+    LIBREOFFICE_BIN=$(find /opt -name "soffice" -path "*/program/*" 2>/dev/null | head -1) && \
+    if [ -n "$LIBREOFFICE_BIN" ]; then \
+    LIBREOFFICE_DIR=$(dirname "$LIBREOFFICE_BIN") && \
+    ln -sf "$LIBREOFFICE_BIN" /usr/bin/soffice && \
+    ln -sf "$LIBREOFFICE_DIR/libreoffice" /usr/bin/libreoffice 2>/dev/null || true && \
+    echo "✅ LibreOffice linked: $LIBREOFFICE_BIN -> /usr/bin/soffice"; \
+    else \
+    echo "⚠️ LibreOffice soffice binary not found in /opt"; \
+    fi && \
     # Clean up
     rm -rf /tmp/LibreOffice_* /tmp/libreoffice.tar.gz && \
     apt-get autoremove -y && \

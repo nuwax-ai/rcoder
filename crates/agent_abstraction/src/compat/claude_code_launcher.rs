@@ -457,42 +457,64 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
 
                     // 🆕 Resume 会话预检查：使用 list_sessions API 验证会话是否存在
                     // 返回 (system_prompt_meta, actual_is_resume_session)
-                    let (system_prompt_meta, actual_is_resume_session) =
-                        if let Some(ref resume_session_id) = start_config.resume_session_id {
-                            // 调用 list_sessions API 检查会话是否存在（带缓存）
-                            match crate::session::check_session_exists_via_api(
-                                &client_conn,
-                                resume_session_id,
-                                &project_path_for_closure.to_string_lossy(),
-                            )
-                            .await
-                            {
-                                Ok(true) => {
-                                    info!("✅ 目标会话存在，将使用 resume: {}", resume_session_id);
-                                    // 会话存在，使用包含 resume 的 meta
-                                    (start_config.build_meta(), true)
-                                }
-                                Ok(false) => {
-                                    warn!(
-                                        "⚠️ 目标会话不存在，跳过 resume，创建新会话: {}",
+                    let (system_prompt_meta, actual_is_resume_session) = if let Some(
+                        ref resume_session_id,
+                    ) =
+                        start_config.resume_session_id
+                    {
+                        // 调用 list_sessions API 检查会话是否存在（带缓存）
+                        match crate::session::check_session_exists_via_api(
+                            &client_conn,
+                            resume_session_id,
+                            &project_path_for_closure.to_string_lossy(),
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                info!("✅ 目标会话存在，将使用 resume: {}", resume_session_id);
+                                // 会话存在，使用包含 resume 的 meta
+                                (start_config.build_meta(), true)
+                            }
+                            Ok(false) => {
+                                warn!(
+                                    "⚠️ 目标会话不存在，跳过 resume，创建新会话: {}",
+                                    resume_session_id
+                                );
+                                // 会话不存在，使用不包含 resume 的 meta，且标记为非 resume 会话
+                                (start_config.build_meta_without_resume(), false)
+                            }
+                            Err(e) => {
+                                // API 失败，降级到文件扫描验证
+                                info!(
+                                    "ℹ️ list_sessions API 失败，降级到文件扫描: {} (error: {:?})",
+                                    resume_session_id, e
+                                );
+
+                                let exists = crate::session::check_session_file_exists(
+                                    resume_session_id,
+                                    &project_path_for_closure.to_string_lossy(),
+                                )
+                                .await;
+
+                                if exists {
+                                    info!(
+                                        "✅ [文件扫描] 会话存在，使用 resume: {}",
                                         resume_session_id
                                     );
-                                    // 会话不存在，使用不包含 resume 的 meta，且标记为非 resume 会话
-                                    (start_config.build_meta_without_resume(), false)
-                                }
-                                Err(e) => {
-                                    // list_sessions API 调用失败（可能 Agent 不支持），安全降级：不使用 resume
+                                    (start_config.build_meta(), true)
+                                } else {
                                     warn!(
-                                        "⚠️ list_sessions API 调用失败，安全降级：创建新会话（不使用 resume）: {:?}",
-                                        e
+                                        "⚠️ [文件扫描] 会话不存在，创建新会话: {}",
+                                        resume_session_id
                                     );
                                     (start_config.build_meta_without_resume(), false)
                                 }
                             }
-                        } else {
-                            // 没有 resume_session_id，正常创建新会话
-                            (start_config.build_meta(), false)
-                        };
+                        }
+                    } else {
+                        // 没有 resume_session_id，正常创建新会话
+                        (start_config.build_meta(), false)
+                    };
 
                     // 创建会话（统一使用 new_session，resume 通过 meta 传递）
                     debug!("创建 ACP 会话[new_session]");
