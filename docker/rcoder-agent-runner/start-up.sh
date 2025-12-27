@@ -43,26 +43,27 @@ fi
 
 # ============================================================================
 # 📝 带时间戳的日志函数
-# 所有日志输出都会自动添加时间前缀，格式：[YYYY-MM-DD HH:MM:SS]
+# 所有日志输出都会自动添加 UTC 时间前缀，格式与 agent_runner 一致
+# 格式：YYYY-MM-DDTHH:MM:SS.ffffffZ（ISO 8601 UTC）
 # ============================================================================
 function log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO $*"
 }
 
 function log_info() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ℹ️  $*"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO ℹ️  $*"
 }
 
 function log_success() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✓ $*"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  INFO ✓ $*"
 }
 
 function log_warn() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  $*"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')  WARN ⚠️  $*"
 }
 
 function log_error() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ $*"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ') ERROR ❌ $*"
 }
 
 # ============================================================================
@@ -934,11 +935,10 @@ export VNC_AUTO_START=true
 # 从骨架目录恢复配置（解决挂载空目录导致的花屏和图标消失）
 initialize_user_home
 
-# ========== 尽早启动 MCP Proxy 服务 ==========
-# MCP Proxy 不依赖 X11，可以在显示服务启动前就初始化
-# 这样在 agent_runner 启动时 MCP Proxy 已经就绪
-log "Starting MCP Proxy services early..."
-start_mcp_proxy_services
+# ========== MCP Proxy 服务在 X11 就绪后启动 ==========
+# 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
+# 因此必须等待 Xvfb 启动后才能启动 MCP Proxy
+# MCP Proxy 的启动已移动到下方的 VNC 后台任务中（X11 就绪后）
 
 # 首先启动显示服务和桌面环境
 start_display_and_desktop &
@@ -976,6 +976,11 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 
     # 应用 XFCE 壁纸
     apply_xfce_wallpaper
+
+    # ========== MCP Proxy 服务（需要 X11 就绪）==========
+    # chrome-devtools-mcp 会启动 Chromium 浏览器，需要 DISPLAY 环境变量
+    log "X11 ready, now starting MCP Proxy services..."
+    start_mcp_proxy_services
 
     # 启动音频流服务 (pcmflux)
     start_audio_services
@@ -1075,20 +1080,39 @@ source /etc/profile.d/ime-env.sh 2>/dev/null || true
 sleep 2
 
 
-# ========== 快速检查 MCP Proxy 服务状态（非阻塞） ==========
-# 只等待 5 秒，无论是否就绪都继续启动 agent_runner
-# MCP Proxy 会在后台继续启动，agent 首次使用时可能需要重试
-log "Quick check for MCP Proxy service..."
+# ========== 等待 MCP Proxy 服务就绪 ==========
+# MCP Proxy 依赖 X11（chrome-devtools-mcp 需要启动浏览器）
+# 必须等待 MCP Proxy 完全就绪后才能启动 agent_runner
+log "Waiting for MCP Proxy service to be ready..."
 MCP_PROXY_PORT=18099
-for i in 1 2 3 4 5; do
+MCP_PROXY_TIMEOUT=60  # 最长等待 60 秒
+
+mcp_counter=0
+while [ $mcp_counter -lt $MCP_PROXY_TIMEOUT ]; do
     if nc -z 127.0.0.1 $MCP_PROXY_PORT 2>/dev/null; then
-        log_success "MCP Proxy is ready on port $MCP_PROXY_PORT"
-        break
+        # 端口已开放，进一步验证 MCP 服务是否真正就绪
+        # 通过发送 initialize 请求检测服务是否可用
+        MCP_TEST_RESULT=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}' | \
+            timeout 5 mcp-proxy convert http://127.0.0.1:$MCP_PROXY_PORT --quiet 2>/dev/null | head -1)
+
+        if echo "$MCP_TEST_RESULT" | grep -q '"result"'; then
+            log_success "MCP Proxy is fully ready on port $MCP_PROXY_PORT (waited ${mcp_counter}s)"
+            break
+        fi
+    fi
+
+    mcp_counter=$((mcp_counter + 1))
+    if [ $((mcp_counter % 10)) -eq 0 ]; then
+        log "  Still waiting for MCP Proxy... (${mcp_counter}s/${MCP_PROXY_TIMEOUT}s)"
     fi
     sleep 1
 done
-if ! nc -z 127.0.0.1 $MCP_PROXY_PORT 2>/dev/null; then
-    log_warn " MCP Proxy not yet ready, agent_runner will start anyway (MCP will be available shortly)"
+
+if [ $mcp_counter -ge $MCP_PROXY_TIMEOUT ]; then
+    log_warn "MCP Proxy not ready after ${MCP_PROXY_TIMEOUT}s, starting agent_runner anyway"
+    log_warn "Agent may need to retry MCP connections on first use"
+else
+    log_success "MCP Proxy ready, proceeding to start agent_runner"
 fi
 
 # 加载 D-Bus 会话环境

@@ -321,9 +321,6 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
         let (first_prompt_result_tx, first_prompt_result_rx) =
             tokio::sync::oneshot::channel::<super::channel_utils::FirstPromptResult>();
 
-        // 检查是否是 resume 会话
-        let is_resume_session = start_config.resume_session_id.is_some();
-
         // 创建 CancellationToken
         let cancel_token = CancellationToken::new();
 
@@ -352,8 +349,8 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
             Vec::new()
         };
 
-        // 构建系统提示词 meta
-        let system_prompt_meta = start_config.build_meta();
+        // 🆕 不在这里构建 system_prompt_meta，而是在 initialize() 成功后根据 list_sessions 检查结果动态构建
+        // 需要将 start_config 传递到闭包内部
 
         // 启动子进程
         let spawn_args = command_args.clone();
@@ -464,9 +461,45 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                         );
                     }
 
+                    // 🆕 Resume 会话预检查：使用 list_sessions API 验证会话是否存在
+                    // 返回 (system_prompt_meta, actual_is_resume_session)
+                    let (system_prompt_meta, actual_is_resume_session) =
+                        if let Some(ref resume_session_id) = start_config.resume_session_id {
+                            // 调用 list_sessions API 检查会话是否存在
+                            match crate::session::check_session_exists_via_api(
+                                &client_conn,
+                                resume_session_id,
+                            )
+                            .await
+                            {
+                                Ok(true) => {
+                                    info!("✅ 目标会话存在，将使用 resume: {}", resume_session_id);
+                                    // 会话存在，使用包含 resume 的 meta
+                                    (start_config.build_meta(), true)
+                                }
+                                Ok(false) => {
+                                    warn!(
+                                        "⚠️ 目标会话不存在，跳过 resume，创建新会话: {}",
+                                        resume_session_id
+                                    );
+                                    // 会话不存在，使用不包含 resume 的 meta，且标记为非 resume 会话
+                                    (start_config.build_meta_without_resume(), false)
+                                }
+                                Err(e) => {
+                                    // list_sessions API 调用失败（可能 Agent 不支持），回退到原逻辑
+                                    warn!(
+                                        "⚠️ list_sessions API 调用失败，继续尝试 resume: {:?}",
+                                        e
+                                    );
+                                    (start_config.build_meta(), true)
+                                }
+                            }
+                        } else {
+                            // 没有 resume_session_id，正常创建新会话
+                            (start_config.build_meta(), false)
+                        };
+
                     // 创建会话（统一使用 new_session，resume 通过 meta 传递）
-                    // 如果 start_config.resume_session_id 有值，build_meta() 会自动构建
-                    // _meta.claudeCode.options.resume 结构
                     debug!("创建 ACP 会话[new_session]");
                     let new_session_request =
                         NewSessionRequest::new(project_path_for_closure.clone())
@@ -508,7 +541,7 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                         session_id.clone(),
                         &project_id_for_child,
                         PromptHandlerConfig {
-                            is_resume_session,
+                            is_resume_session: actual_is_resume_session,
                             project_path: project_path_for_closure.clone(),
                             mcp_servers: mcp_servers.clone(),
                             registry: registry_for_handler,

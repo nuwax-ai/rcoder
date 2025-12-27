@@ -150,6 +150,42 @@ impl AgentStartConfig {
     pub fn has_mcp_servers(&self) -> bool {
         !self.mcp_servers.is_empty()
     }
+
+    /// 构建不包含 resume 参数的 meta
+    ///
+    /// 当 list_sessions 检查发现会话不存在时使用。
+    /// 与 build_meta() 类似，但不包含 claudeCode.options.resume 字段。
+    ///
+    /// # 使用场景
+    /// - 用户传入了 session_id，但通过 list_sessions API 验证发现该会话不存在
+    /// - 此时创建新会话，但保留其他配置（系统提示词、extra_meta 等）
+    pub fn build_meta_without_resume(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut meta = serde_json::Map::new();
+
+        // 只添加系统提示词（使用 append 模式，与 build_meta 保持一致）
+        if let Some(ref system_prompt) = self.system_prompt {
+            let mut system_prompt_obj = serde_json::Map::new();
+            system_prompt_obj.insert(
+                "append".to_string(),
+                serde_json::Value::String(system_prompt.clone()),
+            );
+            meta.insert(
+                "systemPrompt".to_string(),
+                serde_json::Value::Object(system_prompt_obj),
+            );
+        }
+
+        // 合并额外的 meta 字段（不覆盖已存在的键）
+        if let Some(ref extra) = self.extra_meta {
+            for (key, value) in extra {
+                if !meta.contains_key(key) {
+                    meta.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        meta
+    }
 }
 
 /// Agent 通用的 Prompt 消息

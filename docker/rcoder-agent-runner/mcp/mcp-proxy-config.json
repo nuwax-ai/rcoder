@@ -7,11 +7,11 @@
                 "chrome-devtools-mcp@latest",
                 "--userDataDir=/home/user/.config/chromium",
                 "--executablePath=/usr/local/bin/chromium-for-mcp",
-                "--chromeArg=--no-sandbox",
-                "--chromeArg=--no-zygote",
-                "--chromeArg=--disable-dev-shm-usage",
-                "--chromeArg=--disable-gpu",
-                "--chromeArg=--remote-debugging-port=9222"
+                "--chrome-arg=--no-sandbox",
+                "--chrome-arg=--no-zygote",
+                "--chrome-arg=--disable-dev-shm-usage",
+                "--chrome-arg=--disable-gpu",
+                "--chrome-arg=--remote-debugging-port=9222"
             ]
         }
     }

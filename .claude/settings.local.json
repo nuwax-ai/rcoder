@@ -24,7 +24,8 @@
       "WebFetch(domain:deepwiki.com)",
       "Bash(tree:*)",
       "Bash(grep:*)",
-      "mcp__sequential-thinking__sequentialthinking"
+      "mcp__sequential-thinking__sequentialthinking",
+      "Bash(docker exec:*)"
     ],
     "deny": [],
     "ask": []
