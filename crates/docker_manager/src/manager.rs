@@ -1125,48 +1125,52 @@ impl DockerManager {
                 Ok(Some(status)) => {
                     // 🆕 对运行中的容器执行服务健康检查
                     if matches!(status, ContainerStatus::Running) {
-                        if let Some(container_info) = self.containers.get(&project_id) {
-                            // 获取容器 IP
-                            if let Ok(network_ips) = self
-                                .get_container_network_info(&container_info.container_id)
-                                .await
-                            {
-                                // 优先使用主网络 IP，否则使用第一个可用 IP
-                                let network_name = self.get_main_network_name().await;
-                                let container_ip = network_ips
-                                    .get(&network_name)
-                                    .or_else(|| network_ips.values().next());
+                        // ⚠️ 关键修复：立即 clone 释放 DashMap 锁，避免跨 await 持有锁导致死锁
+                        let container_info = self.containers.get(&project_id).map(|r| r.clone());
+                        let Some(container_info) = container_info else {
+                            continue;
+                        };
 
-                                if let Some(ip) = container_ip {
-                                    // 获取之前的失败次数
-                                    let previous_failures = container_info
-                                        .service_health
-                                        .as_ref()
-                                        .map(|h| h.consecutive_failures)
-                                        .unwrap_or(0);
+                        // 获取容器 IP（锁已释放，可以安全 await）
+                        if let Ok(network_ips) = self
+                            .get_container_network_info(&container_info.container_id)
+                            .await
+                        {
+                            // 优先使用主网络 IP，否则使用第一个可用 IP
+                            let network_name = self.get_main_network_name().await;
+                            let container_ip = network_ips
+                                .get(&network_name)
+                                .or_else(|| network_ips.values().next());
 
-                                    // 执行健康检查
-                                    let health_status =
-                                        health_checker.check_service(ip, previous_failures).await;
+                            if let Some(ip) = container_ip {
+                                // 获取之前的失败次数
+                                let previous_failures = container_info
+                                    .service_health
+                                    .as_ref()
+                                    .map(|h| h.consecutive_failures)
+                                    .unwrap_or(0);
 
-                                    // 更新缓存
-                                    let mut updated_info = container_info.clone();
-                                    updated_info.service_health = Some(health_status.clone());
-                                    self.containers.insert(project_id.clone(), updated_info);
+                                // 执行健康检查
+                                let health_status =
+                                    health_checker.check_service(ip, previous_failures).await;
 
-                                    health_checked_count += 1;
+                                // 更新缓存（这里获取新的写锁，不会死锁）
+                                let mut updated_info = container_info.clone();
+                                updated_info.service_health = Some(health_status.clone());
+                                self.containers.insert(project_id.clone(), updated_info);
 
-                                    if health_status.is_fully_healthy() {
-                                        debug!("✅ [SYNC] 服务健康: project_id={}", project_id);
-                                    } else {
-                                        warn!(
-                                            "⚠️ [SYNC] 服务不健康: project_id={}, http={}, grpc={}, failures={}",
-                                            project_id,
-                                            health_status.http_healthy,
-                                            health_status.grpc_healthy,
-                                            health_status.consecutive_failures
-                                        );
-                                    }
+                                health_checked_count += 1;
+
+                                if health_status.is_fully_healthy() {
+                                    debug!("✅ [SYNC] 服务健康: project_id={}", project_id);
+                                } else {
+                                    warn!(
+                                        "⚠️ [SYNC] 服务不健康: project_id={}, http={}, grpc={}, failures={}",
+                                        project_id,
+                                        health_status.http_healthy,
+                                        health_status.grpc_healthy,
+                                        health_status.consecutive_failures
+                                    );
                                 }
                             }
                         }
