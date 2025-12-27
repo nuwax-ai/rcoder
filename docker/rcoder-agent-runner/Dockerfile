@@ -349,7 +349,7 @@ COPY firefox.cfg /usr/lib/firefox-esr/firefox.cfg
 # 系统依赖和Python 3安装 (merged for smaller image size)
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential curl git util-linux jq sudo fonts-noto-cjk \
+    build-essential curl git util-linux jq sudo fonts-noto-cjk fonts-noto-color-emoji \
     systemd ca-certificates chrony r-base software-properties-common \
     libzmq3-dev libzmq5 pkg-config && \
     # 使用 Debian 12 默认的 Python 3.11 (更稳定)
