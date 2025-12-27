@@ -12,6 +12,8 @@ use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;
 use shared_types::{AppError, HttpResult};
 
+use super::utils::extract_grpc_addr;
+
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct CancelQuery {
@@ -216,19 +218,6 @@ async fn forward_cancel_request_to_container_service(
             ))
         }
     }
-}
-
-/// 从 service_url 提取 gRPC 地址
-fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
-    // service_url 格式: http://192.168.1.100:8086
-    let host = service_url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(':')
-        .next()
-        .ok_or_else(|| AppError::internal_server_error("无效的 service_url"))?;
-
-    Ok(format!("{}:{}", host, shared_types::GRPC_DEFAULT_PORT))
 }
 
 /// 内部核心处理函数：处理会话取消请求（供多个接口复用）

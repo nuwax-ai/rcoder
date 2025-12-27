@@ -25,6 +25,9 @@ anyhow = { workspace = true }
 # 并发集合
 dashmap = { workspace = true }
 
+# 缓存
+moka = { workspace = true }
+
 # 日期时间
 chrono = { workspace = true, features = ["serde"] }
 

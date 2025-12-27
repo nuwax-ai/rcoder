@@ -215,7 +215,6 @@ where
     ///
     /// # 返回值
     /// - `R::Entry`: 会话条目
-    /// - `Option<oneshot::Receiver<FirstPromptResult>>`: 首次 Prompt 结果接收器（仅新会话时有值）
     pub async fn create_session(
         &self,
         project_id: String,
@@ -224,10 +223,7 @@ where
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
-    ) -> Result<(
-        R::Entry,
-        Option<tokio::sync::oneshot::Receiver<crate::compat::FirstPromptResult>>,
-    )> {
+    ) -> Result<R::Entry> {
         info!("开始创建新的 Agent 会话，项目 ID: {}", project_id);
 
         // 创建启动器
@@ -286,11 +282,8 @@ where
         // 通过 tokio::select! 在 LocalSet 中直接处理降级，避免跨线程问题
         // 详见 crates/agent_abstraction/src/compat/claude_code_launcher.rs
 
-        // 返回刚插入的条目和首次 Prompt 结果接收器
-        Ok((
-            agent_info.into(),
-            Some(connection_info.first_prompt_result_rx),
-        ))
+        // 返回刚插入的条目
+        Ok(agent_info.into())
     }
 
     /// 获取或创建会话
@@ -300,7 +293,6 @@ where
     /// # 返回值
     /// - `R::Entry`: 会话条目
     /// - `bool`: 是否是新创建的会话
-    /// - `Option<oneshot::Receiver<FirstPromptResult>>`: 首次 Prompt 结果接收器（仅新会话时有值）
     pub async fn get_or_create_session(
         &self,
         project_id: &str,
@@ -309,11 +301,7 @@ where
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
-    ) -> Result<(
-        R::Entry,
-        bool,
-        Option<tokio::sync::oneshot::Receiver<crate::compat::FirstPromptResult>>,
-    )> {
+    ) -> Result<(R::Entry, bool)> {
         // 检查是否存在
         if let Some(existing) = self.get_session(project_id) {
             // 🔧 关键检查：检查 channel 是否仍然有效（Agent 进程是否还在运行）
@@ -326,7 +314,7 @@ where
                 // 移除失效会话
                 self.remove_session(project_id);
                 // 创建新会话
-                let (new_session, first_prompt_rx) = self
+                let new_session = self
                     .create_session(
                         project_id.to_string(),
                         project_path,
@@ -336,7 +324,7 @@ where
                         client,
                     )
                     .await?;
-                return Ok((new_session, true, first_prompt_rx)); // true = 新创建
+                return Ok((new_session, true)); // true = 新创建
             }
 
             // 检查模型配置是否变化
@@ -350,7 +338,7 @@ where
                 // 移除旧会话
                 self.remove_session(project_id);
                 // 创建新会话
-                let (new_session, first_prompt_rx) = self
+                let new_session = self
                     .create_session(
                         project_id.to_string(),
                         project_path,
@@ -360,15 +348,15 @@ where
                         client,
                     )
                     .await?;
-                return Ok((new_session, true, first_prompt_rx)); // true = 新创建
+                return Ok((new_session, true)); // true = 新创建
             }
 
             info!("复用现有 Agent 会话，项目 ID: {}", project_id);
-            return Ok((existing, false, None)); // false = 复用, 无需等待首次 Prompt
+            return Ok((existing, false)); // false = 复用
         }
 
         // 创建新会话
-        let (new_session, first_prompt_rx) = self
+        let new_session = self
             .create_session(
                 project_id.to_string(),
                 project_path,
@@ -378,7 +366,7 @@ where
                 client,
             )
             .await?;
-        Ok((new_session, true, first_prompt_rx))
+        Ok((new_session, true))
     }
 
     /// 发送 Prompt 到指定会话（仅文本）

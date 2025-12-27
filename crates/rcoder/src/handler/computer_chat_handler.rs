@@ -18,6 +18,8 @@
 //! 7. 更新会话映射
 //! 8. 返回 ChatResponse
 //! ```
+//!
+//! 注意：Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,8 @@ use utoipa::ToSchema;
 use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 use docker_manager::ContainerBasicInfo;
 use shared_types::Attachment;
+
+use super::utils::{extract_grpc_addr_with_port, project_dir};
 
 /// Computer Agent 聊天请求
 ///
@@ -93,6 +97,7 @@ pub struct ComputerChatRequest {
 /// - user_id 是必填的，用于标识用户的容器
 /// - project_id 可选，若未提供则自动生成
 /// - 一个用户容器内可以运行多个 project_id 的 Agent 实例
+/// - Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 #[utoipa::path(
     post,
     path = "/computer/chat",
@@ -182,268 +187,166 @@ pub async fn handle_computer_chat(
         }
     }
 
-    // 🆕 实现 rcoder 层降级重试逻辑（最多 2 次尝试）
-    const MAX_ATTEMPTS: usize = 2;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        info!(
-            "🔄 [COMPUTER_CHAT] 尝试 #{}/{}: user_id={}, project_id={}, has_session_id={}",
-            attempt + 1,
-            MAX_ATTEMPTS,
-            user_id,
-            project_id,
-            request.session_id.is_some()
-        );
-
-        // 🆕 降级后，清除 session_id（不使用 Resume）
-        if attempt > 0 {
-            request.session_id = None;
-            info!("⚠️ [COMPUTER_CHAT] 降级重试，不使用 Resume");
-        }
-
-        // 4. 获取或创建用户容器
-        let container_info = match ComputerContainerManager::get_or_create_container_for_user(
-            &user_id,
-            request
-                .agent_config
-                .as_ref()
-                .and_then(|c| c.resource_limits.clone()),
-        )
-        .await
-        {
-            Ok(info) => info,
-            Err(e) => {
-                error!("❌ [COMPUTER_CHAT] 获取或创建容器失败: {}", e);
-                return Ok(HttpResult::error(
-                    shared_types::error_codes::ERR_CONTAINER_ERROR,
-                    &format!("获取或创建容器失败: {}", e),
-                ));
-            }
-        };
-
-        info!(
-            "✅ [COMPUTER_CHAT] 容器就绪: user_id={}, container_id={}, ip={}",
-            user_id, container_info.container_id, container_info.container_ip
-        );
-
-        // 🆕 请求到达时立即更新活动时间（不等待请求执行结果）
-        // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
-        state.update_activity(&user_id);
-        debug!("🔄 [COMPUTER_CHAT] 已更新活动时间: user_id={}", user_id);
-
-        // 5. 创建项目工作目录（在用户容器内）
-        // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
-        if let Err(e) =
-            ensure_project_workspace_exists(&user_id, &project_id, &container_info.container_ip)
-                .await
-        {
-            error!("❌ [COMPUTER_CHAT] 创建项目工作目录失败: {}", e);
+    // 4. 获取或创建用户容器
+    let container_info = match ComputerContainerManager::get_or_create_container_for_user(
+        &user_id,
+        request
+            .agent_config
+            .as_ref()
+            .and_then(|c| c.resource_limits.clone()),
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            error!("❌ [COMPUTER_CHAT] 获取或创建容器失败: {}", e);
             return Ok(HttpResult::error(
-                shared_types::error_codes::ERR_WORKSPACE_ERROR,
-                &format!("创建项目工作目录失败: {}", e),
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                &format!("获取或创建容器失败: {}", e),
             ));
         }
+    };
 
-        // 6. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
-        if let Some(ref pingora_service) = state.pingora_service {
-            pingora_service.add_vnc_backend(&user_id, &container_info.container_ip);
-            debug!(
-                "🔗 [COMPUTER_CHAT] VNC 后端已注册: user_id={} -> {}",
-                user_id, container_info.container_ip
-            );
-        }
+    info!(
+        "✅ [COMPUTER_CHAT] 容器就绪: user_id={}, container_id={}, ip={}",
+        user_id, container_info.container_id, container_info.container_ip
+    );
 
-        // 6. 转发请求到容器服务（使用 gRPC）
-        let result = forward_computer_request_to_container(
-            &request,
-            &project_id,
-            &container_info,
-            &state.grpc_pool,
-        )
-        .await;
+    // 请求到达时立即更新活动时间（不等待请求执行结果）
+    // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
+    state.update_activity(&user_id);
+    debug!("🔄 [COMPUTER_CHAT] 已更新活动时间: user_id={}", user_id);
 
-        // 🆕 增强降级检测逻辑
-        // 情况 1: 响应中明确标识 need_fallback=true
-        // 情况 2: 请求失败（有 session_id 的首次请求），可能是 resume 失败
-        // 🚫 排除情况: 9010 AGENT_BUSY 错误应直接返回给用户，不触发降级
-        let is_agent_busy_error = result.code == shared_types::error_codes::ERR_AGENT_BUSY;
-
-        let should_fallback = if is_agent_busy_error {
-            // 🆕 9010 错误直接返回给用户，不触发降级重试
-            false
-        } else if let Some(ref response_data) = result.data {
-            // 优先检查明确的 need_fallback 标识
-            response_data.need_fallback.unwrap_or(false)
-        } else if !result.is_success() && request.session_id.is_some() && attempt == 0 {
-            // 请求失败，且是带 session_id 的首次请求，认为可能是 resume 失败
-            warn!(
-                "⚠️ [COMPUTER_CHAT] 带 session_id 的请求失败，尝试降级: code={}, message={}",
-                result.code, result.message
-            );
-            true
-        } else {
-            false
-        };
-
-        if should_fallback {
-            let fallback_reason = result
-                .data
-                .as_ref()
-                .and_then(|d| d.fallback_reason.as_deref())
-                .unwrap_or("request_failed_with_session_id");
-
-            warn!(
-                "⚠️ [COMPUTER_CHAT] 检测到需要降级: reason={}, attempt={}/{}",
-                fallback_reason,
-                attempt + 1,
-                MAX_ATTEMPTS
-            );
-
-            // 检查是否还有重试机会
-            if attempt + 1 < MAX_ATTEMPTS {
-                info!("🔄 [COMPUTER_CHAT] 开始降级重试");
-
-                // 🆕 主动停止旧 agent，释放资源
-                // 这会触发 AgentLifecycleGuard 的 RAII 清理机制
-                info!("🛑 [COMPUTER_CHAT] 停止旧 agent: project_id={}", project_id);
-                if let Err(e) = crate::grpc::chat_client::grpc_stop_agent_with_pool(
-                    &state.grpc_pool,
-                    &format!("{}:50051", container_info.container_ip),
-                    project_id.clone(),
-                    Some("Resume 失败，降级重启".to_string()),
-                    false, // graceful stop
-                )
-                .await
-                {
-                    warn!("⚠️ [COMPUTER_CHAT] 停止旧 agent 失败（可能已退出）: {}", e);
-                    // 继续降级流程，不阻塞
-                }
-
-                // 短暂等待，确保资源释放
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                continue; // 🆕 重试
-            } else {
-                // 没有重试机会了
-                warn!("❌ [COMPUTER_CHAT] 降级重试次数耗尽");
-                return Ok(HttpResult::error(
-                    shared_types::error_codes::ERR_RETRY_EXHAUSTED,
-                    "Resume failed and retry exhausted",
-                ));
-            }
-        }
-
-        // 7. 更新会话映射（填充所有三个映射表，保持一致性）
-        // 🆕 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
-        // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
-        if let Some(chat_response) = &result.data {
-            let session_id = chat_response.session_id.clone();
-
-            // 只有当 session_id 非空时才更新映射
-            if !session_id.is_empty() {
-                info!(
-                    "🔗 [COMPUTER_CHAT] 关联会话: session_id={} -> user_id={}, project_id={}, success={}",
-                    session_id,
-                    user_id,
-                    project_id,
-                    result.is_success()
-                );
-
-                // 🔧 ComputerAgentRunner 模式：使用 user_id 作为容器标识（一个用户一个容器）
-                // 使用 DuckDB 存储替代 DashMap
-                let map_key = user_id.clone();
-
-                // 检查是否已存在该 user_id 的记录
-                if let Some(existing_info) = state.get_project(&map_key) {
-                    // ✅ 已存在：更新信息
-                    let mut updated_info = (*existing_info).clone();
-
-                    // 更新活动时间
-                    updated_info.update_activity();
-                    updated_info.update_session(session_id.clone());
-
-                    // 更新扩展信息
-                    updated_info.update_extended_from_request(
-                        Some(container_info.clone()),
-                        request.model_provider.clone(),
-                        request.request_id.clone(),
-                        Some(shared_types::ServiceType::ComputerAgentRunner),
-                    );
-
-                    state.insert_project(map_key.clone(), Arc::new(updated_info));
-
-                    // 更新会话映射
-                    state.update_session(&map_key, &session_id);
-
-                    info!(
-                        "🔄 [COMPUTER_CHAT] 已更新现有容器映射: user_id={}, project_id={}, session_id={} (last_activity 已刷新)",
-                        user_id, project_id, session_id
-                    );
-                } else {
-                    // 🆕 不存在：创建新的 ProjectAndContainerInfo
-                    let mut project_info =
-                        shared_types::ProjectAndContainerInfo::new(map_key.clone());
-
-                    // 设置 user_id（ComputerAgentRunner 模式）
-                    project_info.set_user_id(Some(user_id.clone()));
-
-                    // 更新会话ID
-                    project_info.update_session(session_id.clone());
-
-                    // 更新扩展信息（容器、模型配置等）
-                    project_info.update_extended_from_request(
-                        Some(container_info.clone()),
-                        request.model_provider.clone(),
-                        request.request_id.clone(),
-                        Some(shared_types::ServiceType::ComputerAgentRunner),
-                    );
-
-                    state.insert_project(map_key.clone(), Arc::new(project_info));
-
-                    // 更新会话映射
-                    state.update_session(&map_key, &session_id);
-
-                    info!(
-                        "🆕 [COMPUTER_CHAT] 已创建新容器映射: user_id={}, project_id={}, session_id={}",
-                        user_id, project_id, session_id
-                    );
-                }
-
-                if result.is_success() {
-                    info!(
-                        "✅ [COMPUTER_CHAT] 请求处理完成: user_id={}, project_id={}, session_id={} (所有映射表已更新)",
-                        user_id, project_id, session_id
-                    );
-                } else {
-                    warn!(
-                        "⚠️ [COMPUTER_CHAT] 请求失败但已保存会话映射: user_id={}, project_id={}, session_id={}, code={}, message={}",
-                        user_id, project_id, session_id, result.code, result.message
-                    );
-                }
-            }
-        }
-
-        if !result.is_success()
-            && result
-                .data
-                .as_ref()
-                .map_or(true, |d| d.session_id.is_empty())
-        {
-            error!(
-                "❌ [COMPUTER_CHAT] 容器服务返回错误（无 session_id）: user_id={}, project_id={}, code={}, message={}",
-                user_id, project_id, result.code, result.message
-            );
-        }
-
-        // 🆕 成功或其他错误（非降级错误），直接返回结果
-        return Ok(result);
+    // 5. 创建项目工作目录（在用户容器内）
+    // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
+    if let Err(e) = ensure_project_workspace_exists(&user_id, &project_id).await {
+        error!("❌ [COMPUTER_CHAT] 创建项目工作目录失败: {}", e);
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_WORKSPACE_ERROR,
+            &format!("创建项目工作目录失败: {}", e),
+        ));
     }
 
-    // 🆕 不应该到这里（循环耗尽）
-    Ok(HttpResult::error(
-        shared_types::error_codes::ERR_UNKNOWN,
-        "Unexpected error: retry loop exhausted",
-    ))
+    // 6. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
+    if let Some(ref pingora_service) = state.pingora_service {
+        pingora_service.add_vnc_backend(&user_id, &container_info.container_ip);
+        debug!(
+            "🔗 [COMPUTER_CHAT] VNC 后端已注册: user_id={} -> {}",
+            user_id, container_info.container_ip
+        );
+    }
+
+    // 7. 转发请求到容器服务（使用 gRPC）
+    let result = forward_computer_request_to_container(
+        &request,
+        &project_id,
+        &container_info,
+        &state.grpc_pool,
+    )
+    .await;
+
+    // 8. 更新会话映射（填充所有三个映射表，保持一致性）
+    // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
+    // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
+    if let Some(chat_response) = &result.data {
+        let session_id = chat_response.session_id.clone();
+
+        // 只有当 session_id 非空时才更新映射
+        if !session_id.is_empty() {
+            info!(
+                "🔗 [COMPUTER_CHAT] 关联会话: session_id={} -> user_id={}, project_id={}, success={}",
+                session_id,
+                user_id,
+                project_id,
+                result.is_success()
+            );
+
+            // ComputerAgentRunner 模式：使用 user_id 作为容器标识（一个用户一个容器）
+            // 使用 DuckDB 存储替代 DashMap
+            let map_key = user_id.clone();
+
+            // 检查是否已存在该 user_id 的记录
+            if let Some(existing_info) = state.get_project(&map_key) {
+                // 已存在：更新信息
+                let mut updated_info = (*existing_info).clone();
+
+                // 更新活动时间
+                updated_info.update_activity();
+                updated_info.update_session(session_id.clone());
+
+                // 更新扩展信息
+                updated_info.update_extended_from_request(
+                    Some(container_info.clone()),
+                    request.model_provider.clone(),
+                    request.request_id.clone(),
+                    Some(shared_types::ServiceType::ComputerAgentRunner),
+                );
+
+                state.insert_project(map_key.clone(), Arc::new(updated_info));
+
+                // 更新会话映射
+                state.update_session(&map_key, &session_id);
+
+                info!(
+                    "🔄 [COMPUTER_CHAT] 已更新现有容器映射: user_id={}, project_id={}, session_id={} (last_activity 已刷新)",
+                    user_id, project_id, session_id
+                );
+            } else {
+                // 不存在：创建新的 ProjectAndContainerInfo
+                let mut project_info = shared_types::ProjectAndContainerInfo::new(map_key.clone());
+
+                // 设置 user_id（ComputerAgentRunner 模式）
+                project_info.set_user_id(Some(user_id.clone()));
+
+                // 更新会话ID
+                project_info.update_session(session_id.clone());
+
+                // 更新扩展信息（容器、模型配置等）
+                project_info.update_extended_from_request(
+                    Some(container_info.clone()),
+                    request.model_provider.clone(),
+                    request.request_id.clone(),
+                    Some(shared_types::ServiceType::ComputerAgentRunner),
+                );
+
+                state.insert_project(map_key.clone(), Arc::new(project_info));
+
+                // 更新会话映射
+                state.update_session(&map_key, &session_id);
+
+                info!(
+                    "🆕 [COMPUTER_CHAT] 已创建新容器映射: user_id={}, project_id={}, session_id={}",
+                    user_id, project_id, session_id
+                );
+            }
+
+            if result.is_success() {
+                info!(
+                    "✅ [COMPUTER_CHAT] 请求处理完成: user_id={}, project_id={}, session_id={} (所有映射表已更新)",
+                    user_id, project_id, session_id
+                );
+            } else {
+                warn!(
+                    "⚠️ [COMPUTER_CHAT] 请求失败但已保存会话映射: user_id={}, project_id={}, session_id={}, code={}, message={}",
+                    user_id, project_id, session_id, result.code, result.message
+                );
+            }
+        }
+    }
+
+    if !result.is_success()
+        && result
+            .data
+            .as_ref()
+            .map_or(true, |d| d.session_id.is_empty())
+    {
+        error!(
+            "❌ [COMPUTER_CHAT] 容器服务返回错误（无 session_id）: user_id={}, project_id={}, code={}, message={}",
+            user_id, project_id, result.code, result.message
+        );
+    }
+
+    Ok(result)
 }
 
 /// 转发请求到容器内的 agent_runner 服务（仅使用 gRPC）
@@ -462,17 +365,19 @@ async fn forward_computer_request_to_container(
     );
 
     // 从 service_url 提取 gRPC 地址
-    let grpc_addr =
-        match extract_grpc_addr(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT) {
-            Ok(addr) => addr,
-            Err(e) => {
-                error!("❌ [COMPUTER_FORWARD] 提取 gRPC 地址失败: {}", e);
-                return HttpResult::error(
-                    shared_types::error_codes::ERR_GRPC_ADDR_ERROR,
-                    &format!("提取 gRPC 地址失败: {}", e),
-                );
-            }
-        };
+    let grpc_addr = match extract_grpc_addr_with_port(
+        &container_info.service_url,
+        shared_types::GRPC_DEFAULT_PORT,
+    ) {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!("❌ [COMPUTER_FORWARD] 提取 gRPC 地址失败: {}", e);
+            return HttpResult::error(
+                shared_types::error_codes::ERR_GRPC_ADDR_ERROR,
+                &format!("提取 gRPC 地址失败: {}", e),
+            );
+        }
+    };
 
     debug!(
         "📡 [COMPUTER_FORWARD] gRPC 地址: {}, prompt_len={}, attachments={}",
@@ -483,10 +388,7 @@ async fn forward_computer_request_to_container(
 
     // Computer Agent Runner 的工作目录路径
     // 在容器内：/app/computer-project-workspace/{user_id}/{project_id}
-    let project_workspace = format!(
-        "/app/computer-project-workspace/{}/{}/",
-        request.user_id, project_id
-    );
+    let project_workspace = format!("{}/", project_dir(&request.user_id, &project_id));
 
     debug!("📁 [COMPUTER_FORWARD] 项目工作目录: {}", project_workspace);
 
@@ -588,15 +490,9 @@ async fn forward_computer_request_to_container(
 /// /app/computer-project-workspace/{user_id}/{project_id}/
 ///
 /// 注意：这个目录已经在 docker-compose.yml 中挂载，可以直接在 rcoder 容器内创建
-async fn ensure_project_workspace_exists(
-    user_id: &str,
-    project_id: &str,
-    _container_ip: &str,
-) -> Result<(), AppError> {
+async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Result<(), AppError> {
     // 项目工作目录路径
-    let project_workspace_path = std::path::PathBuf::from("/app/computer-project-workspace")
-        .join(user_id)
-        .join(project_id);
+    let project_workspace_path = std::path::PathBuf::from(project_dir(user_id, project_id));
 
     debug!(
         "📁 [COMPUTER_CHAT] 确保项目工作目录存在: {:?}",
@@ -620,18 +516,6 @@ async fn ensure_project_workspace_exists(
     );
 
     Ok(())
-}
-
-/// 从 service_url 提取 gRPC 地址
-fn extract_grpc_addr(service_url: &str, grpc_port: u16) -> Result<String, AppError> {
-    let host = service_url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(':')
-        .next()
-        .ok_or_else(|| AppError::internal_server_error("无效的 service_url"))?;
-
-    Ok(format!("{}:{}", host, grpc_port))
 }
 
 // ============================================================================

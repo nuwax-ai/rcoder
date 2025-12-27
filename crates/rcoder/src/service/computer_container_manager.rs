@@ -14,6 +14,7 @@
 //! | Agent 实例 | 1 个 | 多个（按 project_id 区分） |
 
 use crate::AppError;
+use crate::handler::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
 use docker_manager::ContainerBasicInfo;
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
@@ -127,19 +128,17 @@ impl ComputerContainerManager {
     ///
     /// 注意：project_id 作为子目录由容器内的 agent 自己管理
     pub async fn get_user_workspace(user_id: &str) -> Result<PathBuf, AppError> {
-        let workspace_dir = PathBuf::from("/app/computer-project-workspace");
-        let user_dir = workspace_dir.join(user_id);
-        Ok(user_dir)
+        Ok(PathBuf::from(user_dir(user_id)))
     }
 
     /// 创建用户工作区目录
     ///
     /// 创建 `/app/computer-project-workspace/{user_id}` 目录
     pub async fn create_user_workspace(user_id: &str) -> Result<PathBuf, AppError> {
-        let workspace_dir = PathBuf::from("/app/computer-project-workspace");
+        let workspace_root = PathBuf::from(COMPUTER_WORKSPACE_ROOT);
 
         // 确保根目录存在
-        tokio::fs::create_dir_all(&workspace_dir)
+        tokio::fs::create_dir_all(&workspace_root)
             .await
             .map_err(|e| {
                 error!("❌ [COMPUTER_CONTAINER] 创建 workspace 目录失败: {:?}", e);
@@ -147,15 +146,20 @@ impl ComputerContainerManager {
             })?;
 
         // 创建用户目录
-        let user_dir = workspace_dir.join(user_id);
-        tokio::fs::create_dir_all(&user_dir).await.map_err(|e| {
-            error!("❌ [COMPUTER_CONTAINER] 创建用户目录失败: {:?}", e);
-            AppError::internal_server_error(&format!("创建用户目录失败: {}", e))
-        })?;
+        let user_workspace = PathBuf::from(user_dir(user_id));
+        tokio::fs::create_dir_all(&user_workspace)
+            .await
+            .map_err(|e| {
+                error!("❌ [COMPUTER_CONTAINER] 创建用户目录失败: {:?}", e);
+                AppError::internal_server_error(&format!("创建用户目录失败: {}", e))
+            })?;
 
-        debug!("📁 [COMPUTER_CONTAINER] 用户工作区创建成功: {:?}", user_dir);
+        debug!(
+            "📁 [COMPUTER_CONTAINER] 用户工作区创建成功: {:?}",
+            user_workspace
+        );
 
-        Ok(user_dir)
+        Ok(user_workspace)
     }
 
     /// 获取容器信息
