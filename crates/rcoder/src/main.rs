@@ -7,6 +7,10 @@ use tracing::{error, info, warn};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
+
 mod config;
 mod handler;
 mod proxy_agent;
@@ -330,9 +334,76 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 启动服务器，支持优雅关闭
-    let _server_handle = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
-        .await;
+    // 使用自定义 Hyper 配置增加请求头大小限制（默认 8KB -> 128KB）
+    info!("🔧 配置 HTTP 服务器：max_buf_size = 128KB（解决 HTTP 431 错误）");
+
+    let app = app.into_make_service();
+    let mut shutdown_rx_clone = shutdown_tx.subscribe();
+
+    // 启动自定义 HTTP 服务器
+    let server_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // 等待关闭信号
+                _ = shutdown_rx_clone.recv() => {
+                    info!("🛑 HTTP 服务器收到关闭信号");
+                    break;
+                }
+                // 接受新连接
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, addr)) => {
+                            let mut app_clone = app.clone();
+
+                            tokio::spawn(async move {
+                                // 配置 HTTP1，增加 header 大小限制
+                                let mut http_builder = http1::Builder::new();
+                                http_builder
+                                    .max_buf_size(128 * 1024)  // 128KB buffer（默认约 8KB）
+                                    .preserve_header_case(true)
+                                    .title_case_headers(false);
+
+                                let io = TokioIo::new(stream);
+
+                                // 使用 tower::Service 调用 MakeService
+                                use tower::Service;
+                                match std::future::poll_fn(|cx| {
+                                    Service::<std::net::SocketAddr>::poll_ready(&mut app_clone, cx)
+                                }).await {
+                                    Ok(()) => {
+                                        match Service::<std::net::SocketAddr>::call(&mut app_clone, addr).await {
+                                            Ok(service) => {
+                                                let hyper_service = TowerToHyperService::new(service);
+                                                if let Err(e) = http_builder.serve_connection(io, hyper_service).await {
+                                                    if !e.to_string().contains("connection closed")
+                                                       && !e.to_string().contains("early eof") {
+                                                        tracing::debug!("HTTP 连接错误 ({}): {}", addr, e);
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                // Infallible 类型，不会发生
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("服务未就绪: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("接受连接失败: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 等待服务器关闭
+    let _ = shutdown_signal(shutdown_rx).await;
+    server_handle.abort();
 
     // 等待代理服务完成
     if let Some(handle) = proxy_handle {

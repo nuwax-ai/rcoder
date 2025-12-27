@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use serde::Serialize;
@@ -186,6 +187,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(proxy_api_routes)
         .merge(debug_routes) // 添加调试路由
         .merge(create_swagger_ui())
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
 }
 
 /// OpenAPI 文档结构
