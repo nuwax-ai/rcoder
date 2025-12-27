@@ -18,7 +18,7 @@ use crate::handler::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
 use docker_manager::ContainerBasicInfo;
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Computer Agent Runner 容器管理服务
 ///
@@ -66,14 +66,46 @@ impl ComputerContainerManager {
         // 1. 尝试获取现有容器
         // 使用 user_id 作为容器标识进行查询
         if let Ok(Some(info)) = docker_manager.get_agent_info(user_id).await {
-            info!(
-                "✅ [COMPUTER_CONTAINER] 用户容器已存在: user_id={}, container_id={}",
-                user_id, info.container_id
-            );
-            return Ok(info);
+            // ✅ 关键修复: 验证容器是否真的在运行
+            match docker_manager
+                .is_container_running(&info.container_id)
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        "✅ [COMPUTER_CONTAINER] 用户容器已存在且运行中: user_id={}, container_id={}",
+                        user_id, info.container_id
+                    );
+                    return Ok(info);
+                }
+                Ok(false) => {
+                    warn!(
+                        "⚠️ [COMPUTER_CONTAINER] 用户容器存在但已停止: user_id={}, container_id={}, 将删除并重建",
+                        user_id, info.container_id
+                    );
+                    // 删除已停止的旧容器
+                    if let Err(e) = docker_manager
+                        .stop_container_by_id(&info.container_id)
+                        .await
+                    {
+                        warn!(
+                            "⚠️ [COMPUTER_CONTAINER] 删除旧容器失败 (继续创建新容器): {}",
+                            e
+                        );
+                    }
+                    // 继续创建新容器
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [COMPUTER_CONTAINER] 检查容器状态失败: user_id={}, error={}, 将尝试创建新容器",
+                        user_id, e
+                    );
+                    // 继续创建新容器
+                }
+            }
         }
 
-        // 2. 容器不存在，创建新容器
+        // 2. 容器不存在或已停止，创建新容器
         info!(
             "🏗️ [COMPUTER_CONTAINER] 创建新用户容器: user_id={}",
             user_id

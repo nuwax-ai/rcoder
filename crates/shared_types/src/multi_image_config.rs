@@ -127,8 +127,7 @@ impl MultiImageConfig {
             if service_config.service_type.to_string() != *service_key {
                 return Err(ConfigError::ValidationError(format!(
                     "服务键 '{}'与服务类型 '{}' 不匹配",
-                    service_key,
-                    service_config.service_type
+                    service_key, service_config.service_type
                 )));
             }
 
@@ -212,9 +211,7 @@ impl MultiImageConfig {
             config.enabled = enabled;
             Ok(())
         } else {
-            Err(ConfigError::ServiceNotFound(
-                service_type.to_string(),
-            ))
+            Err(ConfigError::ServiceNotFound(service_type.to_string()))
         }
     }
 
@@ -472,11 +469,11 @@ mod tests {
         ));
         assert_eq!(config.services.len(), 2); // rcoder + computer-agent-runner
         assert!(config.is_service_enabled(&ServiceType::RCoder));
-        assert!(!config.is_service_enabled(&ServiceType::ComputerAgentRunner)); // 默认禁用
+        assert!(config.is_service_enabled(&ServiceType::ComputerAgentRunner)); // 默认启用
 
         // 验证配置摘要
         let summary = config.get_summary();
-        assert!(summary.contains("1/2")); // 1个启用，总共2个
+        assert!(summary.contains("2/2")); // 2个启用，总共2个
     }
 
     #[test]

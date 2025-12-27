@@ -12,7 +12,7 @@ use axum::extract::State;
 use axum::{Json, extract::Query};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::router::AppState;
@@ -355,7 +355,7 @@ pub async fn pod_count(
         })?;
 
     // 获取所有容器列表
-    let containers = docker_manager.list_containers();
+    let containers = docker_manager.list_containers().await;
 
     // 按服务类型统计
     let mut rcoder_count = 0u32;
@@ -384,7 +384,7 @@ pub async fn pod_count(
         timestamp,
     };
 
-    info!(
+    debug!(
         "✅ [POD_COUNT] 容器统计完成: total={}, rcoder={}, computer_agent_runner={}",
         total_count, rcoder_count, computer_count
     );
@@ -427,7 +427,7 @@ pub async fn pod_list(
             AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
         })?;
 
-    let docker_containers = docker_manager.list_containers();
+    let docker_containers = docker_manager.list_containers().await;
 
     // 2. 获取 DuckDB 存储中的容器记录
     let duckdb_containers = state.projects.get_all_container_records().map_err(|e| {
@@ -628,42 +628,154 @@ pub async fn pod_ensure(
         request.user_id, request.project_id
     );
 
-    // 2. 检查容器是否存在
-    let existing_container = ComputerContainerManager::get_container_info(&request.user_id).await?;
+    // 2. 🔍 实时查询 Docker API 检查容器是否存在（不依赖缓存）
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [POD_ENSURE] 获取 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+        })?;
 
-    let (container_info, created) = match existing_container {
-        Some(info) => {
+    // 构造容器名称
+    let container_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
+    let expected_container_name = format!("{}-{}", container_prefix, request.user_id);
+
+    // 实时查询 Docker API
+    let existing_container = docker_manager
+        .find_container_realtime(&expected_container_name)
+        .await
+        .map_err(|e| {
+            error!("❌ [POD_ENSURE] 查询容器状态失败: {}", e);
+            AppError::internal_server_error(&format!("查询容器状态失败: {}", e))
+        })?;
+
+    // 判断是否需要创建新容器
+    let need_create = match existing_container {
+        Some((container_id, _container_name, status, is_running)) if is_running => {
+            // 容器存在且正在运行，无需创建
             info!(
-                "📦 [POD_ENSURE] 容器已存在: container_id={}",
-                info.container_id
+                "📦 [POD_ENSURE] 容器已存在且运行中: container_id={}, status={:?}",
+                container_id, status
             );
-            (info, false)
+            false
+        }
+        Some((container_id, _container_name, status, _is_running)) => {
+            // 容器存在但未运行（Exited 等状态），需要删除并重建
+            warn!(
+                "⚠️ [POD_ENSURE] 容器存在但未运行: container_id={}, status={:?}, 将删除并重建",
+                container_id, status
+            );
+
+            // 删除旧容器
+            // 如果删除失败（包括容器不存在等情况），返回错误让调用者知道
+            docker_manager
+                .stop_container_by_id(&container_id)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [POD_ENSURE] 删除旧容器失败: container_id={}, error={}",
+                        container_id, e
+                    );
+                    AppError::internal_server_error(&format!("删除旧容器失败: {}", e))
+                })?;
+
+            info!(
+                "✅ [POD_ENSURE] 旧容器已删除: container_id={}",
+                container_id
+            );
+
+            // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
+            // Docker 删除是异步操作，立即创建同名容器可能导致资源冲突
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            debug!("⏱️ [POD_ENSURE] 已等待容器资源释放");
+
+            true
         }
         None => {
-            info!("🏗️ [POD_ENSURE] 创建新容器: user_id={}", request.user_id);
-
-            // 转换资源限制
-            let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
-                memory_limit: limits.memory,
-                cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
-                swap_limit: None,
-            });
-
-            let info = ComputerContainerManager::get_or_create_container_for_user(
-                &request.user_id,
-                resource_limits,
-            )
-            .await?;
-
-            info!(
-                "✅ [POD_ENSURE] 容器创建成功: container_id={}",
-                info.container_id
-            );
-            (info, true)
+            // 容器不存在，需要创建
+            info!("🏗️ [POD_ENSURE] 容器不存在，将创建新容器");
+            true
         }
     };
 
-    // 3. 🆕 如果是新创建的容器，立即同步 VNC 后端映射
+    // 3. 获取或创建容器（带重试机制）
+    let (container_info, created) = if need_create {
+        // 创建新容器，最多重试 3 次
+        let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
+            memory_limit: limits.memory,
+            cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
+            swap_limit: None,
+        });
+
+        let mut last_error = None;
+        let mut result = None;
+        let max_attempts = 3;
+
+        for attempt in 1..=max_attempts {
+            match ComputerContainerManager::get_or_create_container_for_user(
+                &request.user_id,
+                resource_limits.clone(),
+            )
+            .await
+            {
+                Ok(info) => {
+                    if attempt > 1 {
+                        info!(
+                            "✅ [POD_ENSURE] 容器创建成功（第 {} 次尝试）: container_id={}",
+                            attempt, info.container_id
+                        );
+                    } else {
+                        info!(
+                            "✅ [POD_ENSURE] 容器创建成功: container_id={}",
+                            info.container_id
+                        );
+                    }
+                    result = Some(info);
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < max_attempts {
+                        warn!(
+                            "⚠️ [POD_ENSURE] 容器创建失败（第 {} 次尝试），将重试: {}",
+                            attempt,
+                            last_error.as_ref().unwrap()
+                        );
+                        // 等待一段时间后重试（指数退避）
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            200 * attempt as u64,
+                        ))
+                        .await;
+                    } else {
+                        error!("❌ [POD_ENSURE] 容器创建失败（已重试 {} 次）", max_attempts);
+                    }
+                }
+            }
+        }
+
+        // 返回结果或错误
+        match result {
+            Some(info) => (info, true),
+            None => return Err(last_error.unwrap()),
+        }
+    } else {
+        // 获取现有容器的完整信息
+        let info = docker_manager
+            .get_agent_info(&request.user_id)
+            .await
+            .map_err(|e| {
+                error!("❌ [POD_ENSURE] 获取容器完整信息失败: {}", e);
+                AppError::internal_server_error(&format!("获取容器完整信息失败: {}", e))
+            })?
+            .ok_or_else(|| {
+                error!("❌ [POD_ENSURE] 容器信息不完整");
+                AppError::internal_server_error("容器信息不完整")
+            })?;
+
+        (info, false)
+    };
+
+    // 4. 🆕 如果是新创建的容器，立即同步 VNC 后端映射
     // 这消除了等待定时同步任务（最多 5 秒）的空窗期
     if created {
         if let Some(ref pingora_service) = state.pingora_service {
@@ -680,17 +792,29 @@ pub async fn pod_ensure(
         }
     }
 
-    // 4. 在 DuckDB 存储中记录容器信息（用于后续保活）
-    if !state.contains_project(&request.user_id) {
-        // ComputerAgentRunner 模式：使用 project_id 创建，同时设置 user_id
-        let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
-        project_info.set_user_id(Some(request.user_id.clone()));
-        project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
-        project_info.set_container(Some(container_info.clone()));
-        state.insert_project(request.user_id.clone(), Arc::new(project_info));
-    }
+    // 5. 更新 DuckDB 存储中的容器信息（用于后续保活）
+    // 无论容器是新建还是已存在，都要确保 DuckDB 记录是最新的
+    let mut project_info = if let Some(existing) = state.get_project(&request.user_id) {
+        // 如果已存在记录，更新容器信息
+        let mut info = (*existing).clone();
+        info.set_container(Some(container_info.clone()));
+        info
+    } else {
+        // 如果不存在记录，创建新记录
+        let mut info = ProjectAndContainerInfo::new(request.project_id.clone());
+        info.set_user_id(Some(request.user_id.clone()));
+        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_container(Some(container_info.clone()));
+        info
+    };
 
-    // 5. 构建响应
+    state.insert_project(request.user_id.clone(), Arc::new(project_info));
+    debug!(
+        "📝 [POD_ENSURE] DuckDB 记录已更新: user_id={}, container_id={}",
+        request.user_id, container_info.container_id
+    );
+
+    // 6. 构建响应
     let pod_container_info = PodContainerInfo {
         container_id: container_info.container_id.clone(),
         status: container_info.status.clone(),

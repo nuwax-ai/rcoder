@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn test_get_routes_documentation() {
         let docs = get_routes_documentation();
-        assert_eq!(docs.len(), 2);
+        assert_eq!(docs.len(), 3);
 
         // 验证 VNC 路由文档
         assert!(docs[0].0.contains("vnc"));
@@ -270,6 +270,10 @@ mod tests {
         // 验证端口代理路由文档
         assert!(docs[1].0.contains("proxy"));
         assert!(docs[1].1.contains("端口"));
+
+        // 验证健康检查路由文档
+        assert!(docs[2].0.contains("health"));
+        assert!(docs[2].1.contains("健康"));
     }
 
     #[test]

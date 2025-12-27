@@ -1,7 +1,7 @@
 use thiserror::Error;
-use tracing::error;
 
 pub mod container_self_inspector;
+pub mod container_state_actor;
 pub mod container_stop;
 pub mod image_selector;
 pub mod manager;
@@ -15,6 +15,7 @@ pub mod network;
 pub mod path;
 
 pub use container_self_inspector::*;
+pub use container_state_actor::*;
 pub use manager::*;
 pub use types::*;
 pub use utils::*;
