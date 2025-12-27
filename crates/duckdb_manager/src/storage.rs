@@ -79,8 +79,16 @@ pub trait UnifiedStorage: Send + Sync {
     /// 获取所有项目
     fn get_all_projects(&self) -> DuckDbResult<Vec<ProjectRecord>>;
 
-    /// 根据用户ID获取项目（ComputerAgentRunner模式）
-    fn find_by_user_id(&self, user_id: &str) -> DuckDbResult<Option<ProjectRecord>>;
+    /// 根据用户ID查找所有项目（ComputerAgentRunner模式）
+    ///
+    /// 返回该用户的所有项目记录，按最后活动时间倒序排列
+    fn find_projects_by_user_id(&self, user_id: &str) -> DuckDbResult<Vec<ProjectRecord>>;
+
+    /// 获取用户最新活跃项目的容器ID（ComputerAgentRunner核心用例）
+    ///
+    /// 在 ComputerAgentRunner 模式下，一个用户对应一个容器，
+    /// 此方法返回该用户最近活跃项目关联的容器ID
+    fn get_latest_container_id_by_user_id(&self, user_id: &str) -> DuckDbResult<Option<String>>;
 
     // ========== 会话操作 ==========
 
@@ -300,8 +308,12 @@ impl UnifiedStorage for DuckDbStorage {
         self.projects()?.find_all()
     }
 
-    fn find_by_user_id(&self, user_id: &str) -> DuckDbResult<Option<ProjectRecord>> {
-        self.projects()?.find_by_user_id(user_id)
+    fn find_projects_by_user_id(&self, user_id: &str) -> DuckDbResult<Vec<ProjectRecord>> {
+        self.projects()?.find_projects_by_user_id(user_id)
+    }
+
+    fn get_latest_container_id_by_user_id(&self, user_id: &str) -> DuckDbResult<Option<String>> {
+        self.projects()?.get_latest_container_id_by_user_id(user_id)
     }
 
     // ========== 会话操作 ==========
