@@ -46,14 +46,14 @@ async fn destroy_container_for_project(
             error!("❌ [STOP_DESTROY] 获取全局 DockerManager 失败: {}", e);
             return Ok(HttpResult::error(
                 shared_types::error_codes::ERR_CONTAINER_ERROR,
-                &format!("获取全局 DockerManager 失败: {}", e)
+                &format!("获取全局 DockerManager 失败: {}", e),
             ));
         }
     };
 
     // 尝试通过多种方式查找容器
     // 1. 先通过 project_id 查找
-    let mut container_info = docker_manager.get_container_info(project_id);
+    let mut container_info = docker_manager.get_container_info(project_id).await;
 
     // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
     if container_info.is_none() {

@@ -67,7 +67,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
     };
 
     // 获取所有容器（DockerManager 已经管理了所有容器的元数据）
-    let containers = docker_manager.list_containers();
+    let containers = docker_manager.list_containers().await;
     if containers.is_empty() {
         debug!("🔍 [VNC_SYNC] 没有找到任何容器");
         return;

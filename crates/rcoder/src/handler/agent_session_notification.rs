@@ -392,7 +392,13 @@ async fn validate_and_get_session_context(
 ) -> Result<(String, Arc<shared_types::ProjectAndContainerInfo>, String), Response> {
     // 阶段 2.3: 容器存在性预检 - 使用新的 DuckDB 存储 API
     let container_id = match state.get_container_id_by_session(session_id) {
-        Some(cid) => cid,
+        Some(cid) => {
+            debug!(
+                "🔍 [SSE_PROXY] 从 DuckDB 获取容器ID: session_id={}, container_id={}",
+                session_id, cid
+            );
+            cid
+        }
         None => {
             warn!(
                 "❌ [SSE_PROXY] 会话对应的容器未找到: session_id={}",

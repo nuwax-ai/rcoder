@@ -3,7 +3,8 @@ use super::{
     DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
     RCODER_NETWORK_BASE_NAME,
 };
-use anyhow::{Context, Result, anyhow};
+use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
+use anyhow::Result;
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
     LogsOptions, RemoveContainerOptions, RestartContainerOptions, StartContainerOptions,
@@ -16,7 +17,6 @@ use bollard::{
     },
 };
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use shared_types::ContainerBasicInfo;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -28,8 +28,8 @@ pub struct DockerManager {
     docker: Docker,
     /// 管理器配置
     config: DockerManagerConfig,
-    /// 容器映射: project_id -> container_info
-    containers: DashMap<String, DockerContainerInfo>,
+    /// 容器状态句柄（Actor 模式，无锁并发安全）
+    containers: ContainerStateHandle,
     /// 主网络名称（动态检测或使用默认值）
     main_network_name: std::sync::Arc<tokio::sync::RwLock<String>>,
 }
@@ -62,10 +62,15 @@ impl DockerManager {
             }
         };
 
+        // 🆕 创建容器状态 Actor 并启动
+        let (actor, containers) = ContainerStateActor::new();
+        tokio::spawn(actor.run());
+        info!("✅ ContainerStateActor 已启动");
+
         let manager = Self {
             docker,
             config,
-            containers: DashMap::new(),
+            containers,
             main_network_name: std::sync::Arc::new(tokio::sync::RwLock::new(main_network_name)),
         };
 
@@ -93,15 +98,36 @@ impl DockerManager {
             &config.project_id,
         );
 
-        // 检查是否已存在该项目的容器
-        if let Some(existing) = self.containers.get(&config.project_id) {
+        // 🔍 先检查 Docker API 中是否存在同名容器（无论运行状态）
+        // 这是必要的，因为容器可能被外部 stop 但未删除，导致 409 Conflict
+        if let Ok(Some((existing_container_id, existing_name, status, is_running))) =
+            self.find_container_realtime(&container_name).await
+        {
             warn!(
-                "项目 {} 已存在容器 {}，将先停止并删除",
+                "🔍 [CREATE] 发现同名容器: name={}, id={}, status={:?}, running={}",
+                existing_name, existing_container_id, status, is_running
+            );
+
+            // 无论容器是运行还是停止状态，都先删除
+            info!(
+                "🗑️ [CREATE] 删除旧容器 {} ({})",
+                existing_name, existing_container_id
+            );
+            if let Err(e) = self.stop_container_by_id(&existing_container_id).await {
+                error!("❌ [CREATE] 删除旧容器失败: {}", e);
+                // 继续尝试创建，Docker 会返回 409 错误
+            } else {
+                info!("✅ [CREATE] 旧容器删除成功");
+            }
+        }
+
+        // 检查内存缓存并清理
+        if let Some(existing) = self.containers.get(&config.project_id).await {
+            warn!(
+                "🧹 [CREATE] 清理内存缓存中的容器记录: project_id={}, container_name={}",
                 config.project_id, existing.container_name
             );
-            if let Err(e) = self.stop_container(&config.project_id).await {
-                error!("停止现有容器失败: {}", e);
-            }
+            self.containers.remove(&config.project_id).await;
         }
 
         // 拉取镜像（如果本地不存在）
@@ -300,7 +326,8 @@ impl DockerManager {
 
         // 保存到容器映射
         self.containers
-            .insert(config.project_id.clone(), container_info.clone());
+            .insert(config.project_id.clone(), container_info.clone())
+            .await;
 
         info!(
             "✅ 容器创建并启动成功: {} (ID: {}) - 已连接到网络 {}",
@@ -336,33 +363,25 @@ impl DockerManager {
             link: false,
         });
 
-        match self
-            .docker
+        // 不容忍任何错误，直接返回让调用者处理
+        // 这样可以避免掩盖潜在问题（如 404 可能有多种含义，409 的字符串匹配不可靠）
+        self.docker
             .remove_container(container_id, remove_options)
             .await
-        {
-            Ok(_) => {
-                info!("✅ 容器销毁成功: {}", container_id);
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                // 忽略容器不存在或已在删除中的错误
-                if error_msg.contains("No such container") {
-                    debug!("容器 {} 不存在，跳过删除", container_id);
-                } else if error_msg.contains("removal of container")
-                    && error_msg.contains("is already in progress")
-                {
-                    debug!("容器 {} 已在删除中，跳过", container_id);
-                } else {
-                    warn!("删除容器 {} 失败: {}", container_id, error_msg);
-                    return Err(DockerError::ContainerRemoveError(error_msg));
-                }
+            .map_err(|e| {
+                warn!("删除容器 {} 失败: {}", container_id, e);
+                DockerError::BollardError(e)
+            })?;
+
+        info!("✅ 容器销毁成功: {}", container_id);
+
+        // 从映射中移除（如果存在）- 通过遍历查找 project_id
+        for info in self.containers.list().await {
+            if info.container_id == container_id {
+                self.containers.remove(&info.project_id).await;
+                break;
             }
         }
-
-        // 从映射中移除（如果存在）
-        self.containers
-            .retain(|_, info| info.container_id != container_id);
 
         Ok(())
     }
@@ -371,8 +390,8 @@ impl DockerManager {
     pub async fn stop_container(&self, project_id: &str) -> DockerResult<()> {
         info!("停止容器，项目ID: {}", project_id);
 
-        let container_info = if let Some(info) = self.containers.get(project_id) {
-            info.clone()
+        let container_info = if let Some(info) = self.containers.get(project_id).await {
+            info
         } else {
             warn!("项目 {} 没有找到对应的容器", project_id);
             return Ok(());
@@ -383,14 +402,14 @@ impl DockerManager {
             .await?;
 
         // 从映射中移除
-        self.containers.remove(project_id);
+        self.containers.remove(project_id).await;
 
         Ok(())
     }
 
     /// 获取容器信息
-    pub fn get_container_info(&self, project_id: &str) -> Option<DockerContainerInfo> {
-        self.containers.get(project_id).map(|info| info.clone())
+    pub async fn get_container_info(&self, project_id: &str) -> Option<DockerContainerInfo> {
+        self.containers.get(project_id).await
     }
 
     /// 通过多种方式查找容器：project_id 或容器名称
@@ -399,15 +418,14 @@ impl DockerManager {
         identifier: &str,
     ) -> Option<DockerContainerInfo> {
         // 1. 首先尝试通过 project_id 查找
-        if let Some(info) = self.containers.get(identifier) {
-            return Some(info.clone());
+        if let Some(info) = self.containers.get(identifier).await {
+            return Some(info);
         }
 
         // 2. 如果没找到，尝试通过容器名称查找
-        for entry in self.containers.iter() {
-            let info = entry.value();
+        for info in self.containers.list().await {
             if info.container_name == identifier {
-                return Some(info.clone());
+                return Some(info);
             }
         }
 
@@ -484,11 +502,8 @@ impl DockerManager {
     }
 
     /// 获取所有容器信息
-    pub fn list_containers(&self) -> Vec<DockerContainerInfo> {
-        self.containers
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect()
+    pub async fn list_containers(&self) -> Vec<DockerContainerInfo> {
+        self.containers.list().await
     }
 
     /// 检查指定ID的容器是否正在运行
@@ -610,7 +625,7 @@ impl DockerManager {
 
         // 2. 清理旧容器（如果提供了 project_id）
         if let Some(id) = project_id {
-            if let Some(existing) = self.get_container_info(id) {
+            if let Some(existing) = self.get_container_info(id).await {
                 warn!("发现旧容器 {}，正在停止...", existing.container_name);
                 self.stop_container(id).await?;
             }
@@ -902,13 +917,14 @@ impl DockerManager {
         self.create_container(config).await?;
 
         // 🆕 更新容器映射中的 user_id 和 service_type
-        if let Some(mut entry) = self.containers.get_mut(container_id) {
-            entry.user_id = user_id.map(|s| s.to_string());
-            entry.service_type = Some(service_type.clone());
+        if let Some(mut info) = self.containers.get(container_id).await {
+            info.user_id = user_id.map(|s| s.to_string());
+            info.service_type = Some(service_type.clone());
             debug!(
                 "📝 [DOCKER_MGR] 更新容器元数据: container_id={}, user_id={:?}, service_type={:?}",
-                container_id, entry.user_id, entry.service_type
+                container_id, info.user_id, info.service_type
             );
+            self.containers.insert(container_id.to_string(), info).await;
         }
 
         // 5. 等待就绪并返回信息
@@ -936,8 +952,8 @@ impl DockerManager {
         service_type: &shared_types::ServiceType,
     ) -> Option<DockerContainerInfo> {
         // 1. 查 Map
-        if let Some(info) = self.containers.get(project_id) {
-            return Some(info.clone());
+        if let Some(info) = self.containers.get(project_id).await {
+            return Some(info);
         }
 
         // 2. 查 Docker API (构造名称)
@@ -956,7 +972,7 @@ impl DockerManager {
         project_id: &str,
     ) -> DockerResult<Option<ContainerBasicInfo>> {
         // 1. 查找容器信息（内存映射）
-        let container_info = match self.get_container_info(project_id) {
+        let container_info = match self.get_container_info(project_id).await {
             Some(info) => info,
             None => return Ok(None),
         };
@@ -979,7 +995,7 @@ impl DockerManager {
                         "⚠️ [GET_AGENT_INFO] 容器已被外部删除，清理内存映射: project_id={}, container_id={}",
                         project_id, container_info.container_id
                     );
-                    self.containers.remove(project_id);
+                    self.containers.remove(project_id).await;
                     return Ok(None);
                 }
                 // 其他错误正常传播
@@ -1040,8 +1056,8 @@ impl DockerManager {
         &self,
         project_id: &str,
     ) -> DockerResult<Option<ContainerStatus>> {
-        let container_info = if let Some(info) = self.containers.get(project_id) {
-            info.clone()
+        let container_info = if let Some(info) = self.containers.get(project_id).await {
+            info
         } else {
             return Ok(None);
         };
@@ -1067,7 +1083,7 @@ impl DockerManager {
                     info.status = status.clone();
                     info.health_status = state.health.and_then(|h| h.status.map(|s| s.to_string()));
 
-                    self.containers.insert(project_id.to_string(), info);
+                    self.containers.insert(project_id.to_string(), info).await;
 
                     Ok(Some(status))
                 } else {
@@ -1078,7 +1094,7 @@ impl DockerManager {
                 status_code: 404, ..
             }) => {
                 // 容器不存在（HTTP 404），从映射中移除
-                self.containers.remove(project_id);
+                self.containers.remove(project_id).await;
                 Ok(None)
             }
             Err(e) => Err(DockerError::BollardError(e)),
@@ -1095,11 +1111,7 @@ impl DockerManager {
     /// 返回元组 (已检查数量, 已移除数量)
     pub async fn sync_all_container_states(&self) -> DockerResult<(u32, u32)> {
         // 获取所有 project_id 的快照
-        let project_ids: Vec<String> = self
-            .containers
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
+        let project_ids: Vec<String> = self.containers.keys().await;
 
         if project_ids.is_empty() {
             return Ok((0, 0));
@@ -1125,8 +1137,8 @@ impl DockerManager {
                 Ok(Some(status)) => {
                     // 🆕 对运行中的容器执行服务健康检查
                     if matches!(status, ContainerStatus::Running) {
-                        // ⚠️ 关键修复：立即 clone 释放 DashMap 锁，避免跨 await 持有锁导致死锁
-                        let container_info = self.containers.get(&project_id).map(|r| r.clone());
+                        // Actor 模式：直接异步获取，无锁
+                        let container_info = self.containers.get(&project_id).await;
                         let Some(container_info) = container_info else {
                             continue;
                         };
@@ -1157,7 +1169,9 @@ impl DockerManager {
                                 // 更新缓存（这里获取新的写锁，不会死锁）
                                 let mut updated_info = container_info.clone();
                                 updated_info.service_health = Some(health_status.clone());
-                                self.containers.insert(project_id.clone(), updated_info);
+                                self.containers
+                                    .insert(project_id.clone(), updated_info)
+                                    .await;
 
                                 health_checked_count += 1;
 
@@ -1199,11 +1213,7 @@ impl DockerManager {
     pub async fn cleanup_all_containers(&self) -> DockerResult<()> {
         info!("开始清理所有容器");
 
-        let project_ids: Vec<String> = self
-            .containers
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
+        let project_ids: Vec<String> = self.containers.keys().await;
 
         for project_id in project_ids {
             if let Err(e) = self.stop_container(&project_id).await {
@@ -1259,8 +1269,8 @@ impl DockerManager {
 
     /// 获取容器日志
     pub async fn get_container_logs(&self, project_id: &str, lines: i64) -> DockerResult<String> {
-        let container_info = if let Some(info) = self.containers.get(project_id) {
-            info.clone()
+        let container_info = if let Some(info) = self.containers.get(project_id).await {
+            info
         } else {
             return Err(DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1299,8 +1309,8 @@ impl DockerManager {
     pub async fn restart_container(&self, project_id: &str) -> DockerResult<()> {
         info!("重启容器，项目ID: {}", project_id);
 
-        let container_info = if let Some(info) = self.containers.get(project_id) {
-            info.clone()
+        let container_info = if let Some(info) = self.containers.get(project_id).await {
+            info
         } else {
             return Err(DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1763,21 +1773,22 @@ impl DockerManager {
         for container in removed_containers {
             if let Some(container_id) = &container.id {
                 // 从内存映射中查找并移除
-                let mut keys_to_remove = Vec::new();
-
-                for entry in self.containers.iter() {
-                    let (project_id, container_info) = entry.pair();
-                    if container_info.container_id == *container_id {
-                        keys_to_remove.push(project_id.clone());
+                // 从内存映射中查找并安全移除
+                for info in self.containers.list().await {
+                    if info.container_id == *container_id {
+                        // 使用安全移除，只有 container_id 匹配时才移除 (防止误删重启后的新容器)
+                        if self
+                            .containers
+                            .remove_if_container_id(&info.project_id, container_id)
+                            .await
+                            .is_some()
+                        {
+                            info!(
+                                "🧹 从内部映射中移除: project_id={}, container_id={}",
+                                info.project_id, container_id
+                            );
+                        }
                     }
-                }
-
-                for project_id in keys_to_remove {
-                    self.containers.remove(&project_id);
-                    info!(
-                        "🧹 从内部映射中移除: project_id={}, container_id={}",
-                        project_id, container_id
-                    );
                 }
             }
         }
@@ -1855,7 +1866,7 @@ impl DockerManager {
 impl std::fmt::Debug for DockerManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DockerManager")
-            .field("containers_count", &self.containers.len())
+            .field("containers", &"ContainerStateHandle (async)")
             .field("config", &self.config)
             .finish()
     }

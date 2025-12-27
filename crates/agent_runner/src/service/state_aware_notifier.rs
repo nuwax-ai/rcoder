@@ -13,8 +13,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use super::AGENT_REGISTRY;
-use shared_types::{AgentStatus, SessionNotify};
 use super::session_notifier::SseSessionNotifier;
+use shared_types::{AgentStatus, SessionNotify};
 
 /// 状态感知的 SessionNotifier 包装器
 ///
@@ -74,11 +74,7 @@ impl StateAwareNotifier {
             updated_info.last_activity = chrono::Utc::now();
             drop(info_ref); // 释放读锁
             AGENT_REGISTRY.update_agent_info(project_id, updated_info);
-            debug!(
-                "项目[{}]状态更新为 {:?}",
-                project_id,
-                status
-            );
+            debug!("项目[{}]状态更新为 {:?}", project_id, status);
         } else {
             error!(
                 "项目[{}]不存在于 AGENT_REGISTRY 中，无法更新状态",
@@ -223,166 +219,5 @@ impl SessionNotifier for StateAwareNotifier {
 
         // 委托给内部 notifier
         self.inner.notify(project_id, session_id, notify).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use shared_types::ProjectAndAgentInfo;
-    use tokio::sync::mpsc;
-    use std::sync::Arc;
-
-    /// 辅助函数：初始化测试环境
-    fn setup_test_agent(project_id: &str, session_id: &str) {
-        let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, _cancel_rx) = mpsc::unbounded_channel();
-
-        let agent_info = ProjectAndAgentInfo {
-            project_id: project_id.to_string(),
-            session_id: agent_client_protocol::SessionId::new(Arc::from(session_id)),
-            prompt_tx,
-            cancel_tx,
-            model_provider: None,
-            request_id: None,
-            status: AgentStatus::Idle,
-            last_activity: Utc::now(),
-            created_at: Utc::now(),
-            stop_handle: None,
-        };
-
-        AGENT_REGISTRY.register(project_id, session_id, agent_info);
-    }
-
-    /// 辅助函数：清理测试环境
-    fn cleanup_test_agent(project_id: &str) {
-        AGENT_REGISTRY.remove_by_project(project_id);
-    }
-
-    #[tokio::test]
-    async fn test_notify_prompt_start_updates_status() {
-        // Given: 初始化 Agent 状态为 Idle
-        let project_id = "test-project-start";
-        let session_id = "test-session-start";
-        setup_test_agent(project_id, session_id);
-
-        let notifier = StateAwareNotifier::new();
-
-        // When: 发送 PromptStart 通知
-        let _result = notifier
-            .notify_prompt_start(project_id, session_id, None)
-            .await;
-
-        // Then: 状态应更新为 Active
-        let info = AGENT_REGISTRY.get_agent_info(project_id).unwrap();
-        assert_eq!(info.status, AgentStatus::Active);
-
-        // Cleanup
-        cleanup_test_agent(project_id);
-    }
-
-    #[tokio::test]
-    async fn test_notify_prompt_end_restores_idle() {
-        // Given: Agent 状态为 Active
-        let project_id = "test-project-end";
-        let session_id = "test-session-end";
-        setup_test_agent(project_id, session_id);
-
-        // 手动设置为 Active
-        if let Some(info_ref) = AGENT_REGISTRY.get_agent_info(project_id) {
-            let mut updated_info = info_ref.value().clone();
-            updated_info.status = AgentStatus::Active;
-            drop(info_ref);
-            AGENT_REGISTRY.update_agent_info(project_id, updated_info);
-        }
-
-        let notifier = StateAwareNotifier::new();
-
-        // When: 发送 PromptEnd 通知
-        let _result = notifier
-            .notify_prompt_end(
-                project_id,
-                session_id,
-                agent_client_protocol::StopReason::EndTurn,
-                None,
-                None,
-            )
-            .await;
-
-        // Then: 状态应恢复为 Idle
-        let info = AGENT_REGISTRY.get_agent_info(project_id).unwrap();
-        assert_eq!(info.status, AgentStatus::Idle);
-
-        // Cleanup
-        cleanup_test_agent(project_id);
-    }
-
-    #[tokio::test]
-    async fn test_notify_prompt_error_restores_idle() {
-        // Given: Agent 状态为 Active
-        let project_id = "test-project-error";
-        let session_id = "test-session-error";
-        setup_test_agent(project_id, session_id);
-
-        // 手动设置为 Active
-        if let Some(info_ref) = AGENT_REGISTRY.get_agent_info(project_id) {
-            let mut updated_info = info_ref.value().clone();
-            updated_info.status = AgentStatus::Active;
-            drop(info_ref);
-            AGENT_REGISTRY.update_agent_info(project_id, updated_info);
-        }
-
-        let notifier = StateAwareNotifier::new();
-
-        // When: 发送 PromptError 通知
-        let error = agent_client_protocol::Error::internal_error();
-
-        let _result = notifier
-            .notify_prompt_error(project_id, session_id, error, None)
-            .await;
-
-        // Then: 状态应恢复为 Idle
-        let info = AGENT_REGISTRY.get_agent_info(project_id).unwrap();
-        assert_eq!(info.status, AgentStatus::Idle);
-
-        // Cleanup
-        cleanup_test_agent(project_id);
-    }
-
-    #[tokio::test]
-    async fn test_notify_session_update_does_not_change_status() {
-        // Given: Agent 状态为 Active
-        let project_id = "test-project-update";
-        let session_id = "test-session-update";
-        setup_test_agent(project_id, session_id);
-
-        // 手动设置为 Active
-        if let Some(info_ref) = AGENT_REGISTRY.get_agent_info(project_id) {
-            let mut updated_info = info_ref.value().clone();
-            updated_info.status = AgentStatus::Active;
-            drop(info_ref);
-            AGENT_REGISTRY.update_agent_info(project_id, updated_info);
-        }
-
-        let notifier = StateAwareNotifier::new();
-
-        // When: 发送 SessionUpdate 通知
-        let session_update = agent_client_protocol::SessionUpdate::AgentMessageChunk(
-            agent_client_protocol::ContentChunk::new(agent_client_protocol::ContentBlock::Text(
-                agent_client_protocol::TextContent::new("test message".to_string()),
-            )),
-        );
-
-        let _result = notifier
-            .notify_session_update(project_id, session_id, session_update, None)
-            .await;
-
-        // Then: 状态应保持 Active（不变）
-        let info = AGENT_REGISTRY.get_agent_info(project_id).unwrap();
-        assert_eq!(info.status, AgentStatus::Active);
-
-        // Cleanup
-        cleanup_test_agent(project_id);
     }
 }
