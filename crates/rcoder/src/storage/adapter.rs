@@ -310,20 +310,36 @@ impl ProjectAdapter {
     /// 通过用户ID获取容器信息（ComputerAgentRunner模式）
     ///
     /// 在 ComputerAgentRunner 模式中，一个用户对应一个容器
-    /// 这个方法通过 user_id 查找对应的项目记录，然后获取关联的容器信息
+    /// 此方法返回该用户最近活跃项目关联的容器信息
     pub fn get_container_by_user_id(&self, user_id: &str) -> Option<ContainerBasicInfo> {
-        match self.storage.find_by_user_id(user_id) {
-            Ok(Some(project_record)) => {
-                // 通过项目记录中的 container_id 获取容器信息
-                self.get_container(&project_record.container_id)
+        match self.storage.get_latest_container_id_by_user_id(user_id) {
+            Ok(Some(container_id)) => {
+                // 通过容器ID获取容器信息
+                self.get_container(&container_id)
             }
             Ok(None) => {
                 debug!("未找到用户 {} 的项目记录", user_id);
                 None
             }
             Err(e) => {
-                warn!("通过用户ID {} 查找项目失败: {}", user_id, e);
+                warn!("通过用户ID {} 查找容器失败: {}", user_id, e);
                 None
+            }
+        }
+    }
+
+    /// 通过用户ID查找所有项目（ComputerAgentRunner模式）
+    ///
+    /// 返回该用户的所有项目记录，按最后活动时间倒序排列
+    pub fn find_projects_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> Vec<duckdb_manager::models::ProjectRecord> {
+        match self.storage.find_projects_by_user_id(user_id) {
+            Ok(projects) => projects,
+            Err(e) => {
+                warn!("通过用户ID {} 查找项目失败: {}", user_id, e);
+                Vec::new()
             }
         }
     }

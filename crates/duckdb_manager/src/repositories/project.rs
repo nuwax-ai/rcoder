@@ -104,8 +104,10 @@ impl ProjectRepository {
         })
     }
 
-    /// 根据用户ID查找项目 (ComputerAgentRunner 模式)
-    pub fn find_by_user_id(&self, user_id: &str) -> DuckDbResult<Option<ProjectRecord>> {
+    /// 根据用户ID查找所有项目 (ComputerAgentRunner 模式)
+    ///
+    /// 返回该用户的所有项目记录，按最后活动时间倒序排列
+    pub fn find_projects_by_user_id(&self, user_id: &str) -> DuckDbResult<Vec<ProjectRecord>> {
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare(
                 r#"
@@ -115,13 +117,47 @@ impl ProjectRepository {
                        session_created_at, session_last_activity
                 FROM projects
                 WHERE user_id = ?
+                ORDER BY last_activity DESC
+                "#,
+            )?;
+
+            let mut rows = stmt.query(params![user_id])?;
+            let mut records = Vec::new();
+
+            while let Some(row) = rows.next()? {
+                records.push(Self::row_to_record(row)?);
+            }
+
+            Ok(records)
+        })
+    }
+
+    /// 获取用户最新活跃项目的容器ID (ComputerAgentRunner 核心用例)
+    ///
+    /// 在 ComputerAgentRunner 模式下，一个用户对应一个容器，
+    /// 此方法返回该用户最近活跃项目关联的容器ID
+    pub fn get_latest_container_id_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> DuckDbResult<Option<String>> {
+        self.conn.with_connection(|c| {
+            let mut stmt = c.prepare(
+                r#"
+                SELECT container_id
+                FROM projects
+                WHERE user_id = ?
+                ORDER BY last_activity DESC
+                LIMIT 1
                 "#,
             )?;
 
             let mut rows = stmt.query(params![user_id])?;
 
             match rows.next()? {
-                Some(row) => Ok(Some(Self::row_to_record(row)?)),
+                Some(row) => {
+                    let container_id: String = row.get(0)?;
+                    Ok(Some(container_id))
+                }
                 None => Ok(None),
             }
         })
@@ -670,20 +706,54 @@ mod tests {
     }
 
     #[test]
-    fn test_find_by_user_id() {
+    fn test_find_projects_by_user_id() {
         let repo = setup_test_db();
 
-        let record = ProjectRecord::new_with_user_id(
+        let record1 = ProjectRecord::new_with_user_id(
             "p1".to_string(),
             "user-1".to_string(),
             ServiceType::ComputerAgentRunner,
             "c1".to_string(),
         );
 
+        let record2 = ProjectRecord::new_with_user_id(
+            "p2".to_string(),
+            "user-1".to_string(),
+            ServiceType::ComputerAgentRunner,
+            "c1".to_string(),
+        );
+
+        repo.upsert(&record1).unwrap();
+        repo.upsert(&record2).unwrap();
+
+        let found = repo.find_projects_by_user_id("user-1").unwrap();
+        assert_eq!(found.len(), 2);
+
+        // 验证按 last_activity 倒序排列
+        let project_ids: Vec<&str> = found.iter().map(|r| r.project_id.as_str()).collect();
+        assert!(project_ids.contains(&"p1"));
+        assert!(project_ids.contains(&"p2"));
+    }
+
+    #[test]
+    fn test_get_latest_container_id_by_user_id() {
+        let repo = setup_test_db();
+
+        // 用户没有项目时返回 None
+        let container_id = repo.get_latest_container_id_by_user_id("user-1").unwrap();
+        assert!(container_id.is_none());
+
+        // 创建项目
+        let record = ProjectRecord::new_with_user_id(
+            "p1".to_string(),
+            "user-1".to_string(),
+            ServiceType::ComputerAgentRunner,
+            "c1".to_string(),
+        );
         repo.upsert(&record).unwrap();
 
-        let found = repo.find_by_user_id("user-1").unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().project_id, "p1");
+        // 现在应该返回容器ID
+        let container_id = repo.get_latest_container_id_by_user_id("user-1").unwrap();
+        assert_eq!(container_id, Some("c1".to_string()));
     }
 }
