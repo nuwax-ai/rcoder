@@ -12,6 +12,7 @@ mod health_handler;
 mod pod_handler;
 pub mod proxy_api;
 pub mod proxy_handler_api;
+pub mod utils;
 
 pub use agent_cancel_handler::*;
 pub use agent_session_notification::*;
@@ -26,4 +27,3 @@ pub use health_handler::*;
 pub use pod_handler::*;
 pub use proxy_api::*;
 pub use proxy_handler_api::*;
-

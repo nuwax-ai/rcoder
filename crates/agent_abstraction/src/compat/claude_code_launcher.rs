@@ -80,9 +80,6 @@ pub struct LauncherConnectionInfoComplete {
     pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
     /// 生命周期守卫（自动清理资源）
     pub lifecycle_guard: Arc<AgentLifecycleGuard>,
-    /// 🆕 首次 Prompt 结果接收器（用于等待首次 Prompt 执行结果）
-    pub first_prompt_result_rx:
-        tokio::sync::oneshot::Receiver<super::channel_utils::FirstPromptResult>,
 }
 
 /// 从配置文件加载 Agent 配置
@@ -317,9 +314,6 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequestWrapper>();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
         let (session_id_tx, session_id_rx) = tokio::sync::oneshot::channel::<SessionId>();
-        // 🆕 创建首次 Prompt 结果通道
-        let (first_prompt_result_tx, first_prompt_result_rx) =
-            tokio::sync::oneshot::channel::<super::channel_utils::FirstPromptResult>();
 
         // 创建 CancellationToken
         let cancel_token = CancellationToken::new();
@@ -465,10 +459,11 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                     // 返回 (system_prompt_meta, actual_is_resume_session)
                     let (system_prompt_meta, actual_is_resume_session) =
                         if let Some(ref resume_session_id) = start_config.resume_session_id {
-                            // 调用 list_sessions API 检查会话是否存在
+                            // 调用 list_sessions API 检查会话是否存在（带缓存）
                             match crate::session::check_session_exists_via_api(
                                 &client_conn,
                                 resume_session_id,
+                                &project_path_for_closure.to_string_lossy(),
                             )
                             .await
                             {
@@ -486,12 +481,12 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                                     (start_config.build_meta_without_resume(), false)
                                 }
                                 Err(e) => {
-                                    // list_sessions API 调用失败（可能 Agent 不支持），回退到原逻辑
+                                    // list_sessions API 调用失败（可能 Agent 不支持），安全降级：不使用 resume
                                     warn!(
-                                        "⚠️ list_sessions API 调用失败，继续尝试 resume: {:?}",
+                                        "⚠️ list_sessions API 调用失败，安全降级：创建新会话（不使用 resume）: {:?}",
                                         e
                                     );
-                                    (start_config.build_meta(), true)
+                                    (start_config.build_meta_without_resume(), false)
                                 }
                             }
                         } else {
@@ -549,8 +544,6 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                             lifecycle_handle: lifecycle_handle_for_handler,
                             model_provider: model_provider_for_handler,
                             notifier: notifier.clone(),
-                            // 🆕 传递首次 Prompt 结果发送器
-                            first_prompt_result_tx: Some(first_prompt_result_tx),
                         },
                     );
 
@@ -624,8 +617,6 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
             prompt_tx,
             cancel_tx,
             lifecycle_guard: Arc::new(lifecycle_guard),
-            // 🆕 返回首次 Prompt 结果接收器
-            first_prompt_result_rx,
         })
     }
 }

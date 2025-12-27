@@ -9,8 +9,7 @@ mod claude_code_launcher;
 
 pub use agent_lifecycle::{AgentLifecycleGuard, AgentStopGuard, AgentStopHandleArc};
 pub use channel_utils::{
-    FirstPromptResult, PromptHandlerConfig, spawn_cancel_handler_for_agent,
-    spawn_prompt_handler_for_agent,
+    PromptHandlerConfig, spawn_cancel_handler_for_agent, spawn_prompt_handler_for_agent,
 };
 pub use claude_code_launcher::{
     AgentLaunchConfig, ClaudeCodeLauncher, LauncherConnectionInfo, LauncherConnectionInfoComplete,

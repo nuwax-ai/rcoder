@@ -12,6 +12,8 @@ use utoipa::ToSchema;
 
 use crate::{AppError, HttpResult, router::AppState};
 
+use super::utils::extract_grpc_addr;
+
 /// Computer Agent 停止请求
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
 pub struct ComputerAgentStopRequest {
@@ -244,16 +246,4 @@ pub async fn computer_agent_stop(
             ));
         }
     }
-}
-
-/// 从 service_url 提取 gRPC 地址
-fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
-    let host = service_url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(':')
-        .next()
-        .ok_or_else(|| AppError::internal_server_error("无效的 service_url"))?;
-
-    Ok(format!("{}:{}", host, shared_types::GRPC_DEFAULT_PORT))
 }
