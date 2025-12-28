@@ -597,12 +597,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
 # 使用阿里云 PyPI 镜像源（与 pip 保持一致，稳定可靠，无限流限制）
 ENV UV_INSTALL_DIR=/usr/local/bin \
-    UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+    UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     # 创建 uv 环境配置脚本（用户通过终端使用时会加载）
     echo '#!/bin/sh' > /etc/profile.d/uv-env.sh && \
     echo '# UV environment configuration' >> /etc/profile.d/uv-env.sh && \
-    echo 'export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/' >> /etc/profile.d/uv-env.sh && \
+    echo 'export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple' >> /etc/profile.d/uv-env.sh && \
     echo 'export UV_TOOL_DIR=/home/user/.local/share/uv/tools' >> /etc/profile.d/uv-env.sh && \
     echo 'export UV_CACHE_DIR=/home/user/.cache/uv' >> /etc/profile.d/uv-env.sh && \
     chmod +x /etc/profile.d/uv-env.sh
