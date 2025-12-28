@@ -33,6 +33,8 @@ RUN apt-get update && \
     util-linux sudo curl git \
     # Python pip:
     python3-pip \
+    # Network analysis tools:
+    iputils-ping traceroute dnsutils tcpdump mtr-tiny nmap iperf3 httping telnet \
     # Desktop SDK tools:
     xdotool scrot ffmpeg \
     # VNC and streaming:
@@ -56,6 +58,26 @@ RUN apt-get update && \
     apt-get autoremove -y && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.cache
+
+# ============================================================================
+# 🐍 配置 pip 镜像源 (系统级配置，所有用户共享)
+# ============================================================================
+# 使用阿里云 PyPI 镜像源（稳定可靠，无限流限制）
+RUN mkdir -p /etc/pip && \
+    printf '[global]\n\
+    index-url = https://mirrors.aliyun.com/pypi/simple/\n\
+    trusted-host = mirrors.aliyun.com\n\
+    timeout = 120\n\
+    \n\
+    [install]\n\
+    trusted-host = mirrors.aliyun.com\n' > /etc/pip/pip.conf && \
+    # 同时为 root 用户创建配置（备用）
+    mkdir -p /root/.config/pip && \
+    cp /etc/pip/pip.conf /root/.config/pip/pip.conf && \
+    # 为 user 用户创建配置目录（后续会设置权限）
+    mkdir -p /home/user/.config/pip && \
+    cp /etc/pip/pip.conf /home/user/.config/pip/pip.conf && \
+    echo "✅ pip 镜像源配置完成: https://mirrors.aliyun.com/pypi/simple/"
 
 # ============================================================================
 # 📺 noVNC 远程桌面客户端(based on official v1.6.0, with customized vnc.html):
@@ -573,13 +595,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
 
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
+# 使用阿里云 PyPI 镜像源（与 pip 保持一致，稳定可靠，无限流限制）
 ENV UV_INSTALL_DIR=/usr/local/bin \
-    UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+    UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     # 创建 uv 环境配置脚本（用户通过终端使用时会加载）
     echo '#!/bin/sh' > /etc/profile.d/uv-env.sh && \
     echo '# UV environment configuration' >> /etc/profile.d/uv-env.sh && \
-    echo 'export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple' >> /etc/profile.d/uv-env.sh && \
+    echo 'export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/' >> /etc/profile.d/uv-env.sh && \
     echo 'export UV_TOOL_DIR=/home/user/.local/share/uv/tools' >> /etc/profile.d/uv-env.sh && \
     echo 'export UV_CACHE_DIR=/home/user/.cache/uv' >> /etc/profile.d/uv-env.sh && \
     chmod +x /etc/profile.d/uv-env.sh
