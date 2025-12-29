@@ -340,7 +340,6 @@ pub struct RestartPodResponse {
     summary = "获取当前容器数量",
     description = "获取当前运行的容器总数及按服务类型分类的统计"
 )]
-#[axum::debug_handler]
 pub async fn pod_count(
     State(_state): State<Arc<AppState>>,
 ) -> Result<HttpResult<PodCountResponse>, AppError> {
@@ -411,7 +410,6 @@ pub async fn pod_count(
     summary = "获取所有容器信息",
     description = "获取所有容器的详细信息，支持可选的分页查询（默认100条）。如果不传 limit 参数，则返回所有容器。"
 )]
-#[axum::debug_handler]
 #[instrument(skip(state))]
 pub async fn pod_list(
     State(state): State<Arc<AppState>>,
@@ -601,7 +599,6 @@ pub async fn pod_list(
     summary = "启动/确保容器存在（幂等）",
     description = "根据 user_id 和 project_id 启动或获取已存在的容器，仅启动容器不启动 Agent 服务"
 )]
-#[axum::debug_handler]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_ensure(
     State(state): State<Arc<AppState>>,
@@ -853,7 +850,6 @@ pub async fn pod_ensure(
     summary = "容器保活（刷新活动时间）",
     description = "刷新容器的最后活动时间，防止被定时清理任务销毁。如果容器不存在会返回错误。"
 )]
-#[axum::debug_handler]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_keepalive(
     State(state): State<Arc<AppState>>,
@@ -1006,7 +1002,6 @@ pub async fn pod_keepalive(
     summary = "重启容器（销毁后重建）",
     description = "根据 user_id 和 project_id 重启容器。如果容器存在，先销毁再创建新容器；如果不存在，直接创建。"
 )]
-#[axum::debug_handler]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_restart(
     State(state): State<Arc<AppState>>,
@@ -1221,7 +1216,6 @@ pub struct PodStatusResponse {
     summary = "查询容器状态（是否存活）",
     description = "根据 user_id 或 project_id 查询对应容器是否存活"
 )]
-#[axum::debug_handler]
 #[instrument(skip(_state), fields(project_id = ?params.project_id, user_id = ?params.user_id))]
 pub async fn pod_status(
     State(_state): State<Arc<AppState>>,

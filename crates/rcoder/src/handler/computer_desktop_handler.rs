@@ -152,7 +152,6 @@ const NOVNC_PORT: u16 = 6080;
     summary = "获取 VNC 桌面访问信息",
     description = "返回 VNC 桌面的访问 URL，推荐使用 Pingora 代理路径访问"
 )]
-#[axum::debug_handler]
 #[instrument(skip(_state), fields(user_id = %params.user_id, project_id = %params.project_id))]
 pub async fn computer_desktop_vnc(
     State(_state): State<Arc<AppState>>,
@@ -164,12 +163,18 @@ pub async fn computer_desktop_vnc(
     // 1. 验证参数
     if user_id.trim().is_empty() {
         error!("❌ [DESKTOP_VNC] user_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "user_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "user_id 不能为空",
+        ));
     }
 
     if project_id.trim().is_empty() {
         error!("❌ [DESKTOP_VNC] project_id 不能为空");
-        return Ok(HttpResult::error(shared_types::error_codes::ERR_VALIDATION, "project_id 不能为空"));
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "project_id 不能为空",
+        ));
     }
 
     info!(

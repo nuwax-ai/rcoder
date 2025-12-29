@@ -122,7 +122,6 @@ pub struct ChatRequest {
     summary = "转发聊天消息到容器化 AI 服务",
     description = "根据 project_id 动态管理容器（默认使用 ServiceType::RCoder），将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
 )]
-#[axum::debug_handler]
 #[instrument(skip(state,request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
@@ -157,6 +156,12 @@ pub async fn handle_chat(
             .as_ref()
             .map(|p| p.to_string())
             .unwrap_or_else(|| "None".to_string())
+    );
+
+    // 打印 agent_config 配置信息（debug 级别）
+    debug!(
+        "🔧 [CHAT] agent_config 配置: project_id={}, agent_config={:?}",
+        project_id, request.agent_config
     );
 
     // 第一步：获取或创建容器，默认使用 ServiceType::RCoder

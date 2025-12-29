@@ -138,7 +138,6 @@ pub struct ComputerChatRequest {
     summary = "发送聊天消息到 Computer Agent",
     description = "根据 user_id 动态管理容器，一个用户对应一个带桌面环境的容器"
 )]
-#[axum::debug_handler]
 #[instrument(skip(state, request), fields(user_id = %request.user_id, project_id = ?request.project_id))]
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
@@ -172,6 +171,12 @@ pub async fn handle_computer_chat(
         request.prompt.len(),
         request.attachments.len(),
         request.model_provider
+    );
+
+    // 打印 agent_config 配置信息（debug 级别）
+    info!(
+        "🔧 [COMPUTER_CHAT] agent_config 配置: user_id={}, project_id={}, agent_config={:?}",
+        user_id, project_id, request.agent_config
     );
 
     // 3. 验证资源限制配置

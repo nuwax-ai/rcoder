@@ -95,7 +95,6 @@ pub struct ComputerAgentStopResponse {
     summary = "停止 Computer Agent",
     description = "停止特定 project_id 的 Agent，不销毁容器"
 )]
-#[axum::debug_handler]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn computer_agent_stop(
     State(state): State<Arc<AppState>>,

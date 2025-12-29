@@ -111,7 +111,7 @@ function wait_for_process() {
     local interval_ms=200  # 200ms 间隔
     local max_iterations=$((timeout * 1000 / interval_ms))
     local i=0
-    
+
     while ! pgrep -x "$process_name" >/dev/null 2>&1; do
         sleep 0.2
         i=$((i + 1))
@@ -130,7 +130,7 @@ function wait_for_process_pattern() {
     local interval_ms=200
     local max_iterations=$((timeout * 1000 / interval_ms))
     local i=0
-    
+
     while ! pgrep -f "$pattern" >/dev/null 2>&1; do
         sleep 0.2
         i=$((i + 1))
@@ -150,7 +150,7 @@ function wait_for_port() {
     local interval_ms=300  # 300ms 间隔
     local max_iterations=$((timeout * 1000 / interval_ms))
     local i=0
-    
+
     while ! nc -z "$host" "$port" 2>/dev/null; do
         sleep 0.3
         i=$((i + 1))
@@ -169,7 +169,7 @@ function wait_for_file() {
     local interval_ms=200
     local max_iterations=$((timeout * 1000 / interval_ms))
     local i=0
-    
+
     while [ ! -f "$filepath" ]; do
         sleep 0.2
         i=$((i + 1))
@@ -188,7 +188,7 @@ function wait_for_process_exit() {
     local interval_ms=200
     local max_iterations=$((timeout * 1000 / interval_ms))
     local i=0
-    
+
     while pgrep -x "$process_name" >/dev/null 2>&1; do
         sleep 0.2
         i=$((i + 1))
@@ -582,7 +582,7 @@ function start_display_and_desktop() {
     # Xvfb 启动需要时间，将其提前到 Cleanup/DBus 之前，利用这段时间进行初始化
     # 色深使用 24 位，避免某些 Linux 内核上出现花屏
     log "Starting Xvfb :0 (background initialization)..."
-    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1280x800x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1 &
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1920x1080x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1 &
 
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
@@ -649,7 +649,7 @@ function start_display_and_desktop() {
 	# 启动 D-Bus 会话 (以 root 启动，但 HOME 设置为 /home/user)
     log "Starting D-Bus session as root (HOME=/home/user)..."
 	HOME=/home/user dbus-launch --sh-syntax > /tmp/dbus-session-env
-	
+
 	# 等待 D-Bus 会话文件生成（智能等待，最长 3 秒）
 	wait_for_file /tmp/dbus-session-env 3 || log_warn "D-Bus session file not created"
 
@@ -677,14 +677,14 @@ function start_display_and_desktop() {
     log "Starting D-Bus system bus..."
 	mkdir -p /var/run/dbus
 	dbus-daemon --system --fork
-	
+
 	# 等待 D-Bus 系统总线 socket 就绪（智能等待，最长 2 秒）
 	wait_for_file /var/run/dbus/system_bus_socket 2 || log_warn "D-Bus system bus socket not ready"
 
 	# 启动 PolicyKit 守护进程（配置为不需要认证）
     log "Starting PolicyKit daemon..."
 	/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
-	
+
 	# 等待 PolicyKit 进程启动（智能等待，最长 3 秒）
 	wait_for_process "polkitd" 3 || log_warn "PolicyKit daemon not started"
 
@@ -715,7 +715,7 @@ function start_display_and_desktop() {
 		XMODIFIERS=@im=fcitx \
 		INPUT_METHOD=fcitx \
 		fcitx5 -d --replace >/tmp/fcitx5-startup.log 2>&1 &
-	
+
 	# 等待 fcitx5 进程启动（智能等待，最长 5 秒）
 	if wait_for_process "fcitx5" 5; then
 		log_success "fcitx5 started successfully"
@@ -868,7 +868,7 @@ function start_audio_services() {
 
     # 启动 PulseAudio（非系统模式，允许运行为 root）
     HOME=/home/user pulseaudio --start --exit-idle-time=-1 --log-level=warning 2>/tmp/pulseaudio.log || true
-    
+
     # 等待 PulseAudio 进程启动（智能等待，最长 3 秒）
     if wait_for_process "pulseaudio" 3; then
         log_success "  PulseAudio daemon started"
@@ -905,7 +905,7 @@ function start_audio_services() {
 
     # 后台启动音频服务器
     nohup python3 /usr/local/bin/audio_server.py > /tmp/audio_server.log 2>&1 &
-    
+
     # 等待音频服务进程启动或端口就绪（智能等待，最长 5 秒）
     if wait_for_process_pattern "audio_server.py" 3 && wait_for_port localhost 6090 3; then
         log_success "  pcmflux audio server started"
@@ -969,7 +969,7 @@ function start_mcp_proxy_services() {
         > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
 
     local MCP_PID=$!
-    
+
     # 等待 MCP Proxy 端口就绪（智能等待，最长 10 秒）
     if wait_for_port 127.0.0.1 18099 10 && kill -0 $MCP_PID 2>/dev/null; then
         log_success "  MCP Proxy started (PID: $MCP_PID)"
@@ -1029,7 +1029,7 @@ function start_ime_services() {
         > "$IME_LOG_DIR/ime_server.log" 2>&1 &
 
     local IME_PID=$!
-    
+
     # 等待 IME 服务端口就绪（智能等待，最长 5 秒）
     if wait_for_port 127.0.0.1 6091 5 && kill -0 $IME_PID 2>/dev/null; then
         log_success "  IME server started (PID: $IME_PID)"
@@ -1084,7 +1084,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 
     # ========== 并行启动所有依赖 X11 的服务 ==========
     # 这些服务互不依赖，可以同时启动以缩短整体启动时间
-    
+
     # 1. VNC 服务（后台）
     (
         start_vnc_services
