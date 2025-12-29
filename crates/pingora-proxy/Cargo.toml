@@ -30,3 +30,6 @@ async-trait = { workspace = true }
 
 # HTTP client for fallback
 reqwest = { workspace = true }
+
+# Shared types for API config
+shared_types = { path = "../shared_types" }

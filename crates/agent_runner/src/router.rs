@@ -35,6 +35,17 @@ pub struct AppState {
 
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<pingora_proxy::PingoraProxyService>>,
+
+    /// 🔒 API 密钥管理器（用于 Pingora 代理注入真实密钥）
+    /// 注意：此现在是 shared_api_key_manager 的包装器
+    pub api_key_manager: Arc<crate::api_key_manager::ApiKeyManager>,
+
+    /// 🔒 共享的 API 密钥 DashMap（直接与 Pingora 共享）
+    /// 存储格式：<UUID> -> ModelProviderConfig
+    pub shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
+
+    /// 🔒 project_id -> service_uuid 映射（用于清理时查找对应的配置）
+    pub project_uuid_map: Arc<DashMap<String, String>>,
 }
 
 /// 创建 Axum 路由

@@ -292,8 +292,41 @@ pub async fn handle_chat(
     // 转换为 PromptMessage（Agent 抽象层）
     let prompt_message = agent_abstraction::PromptMessage::from(chat_prompt);
 
+    // 🔥 生成唯一的 service UUID（用于 API 密钥管理）
+    let service_uuid = if request.model_provider.is_some() {
+        Some(uuid::Uuid::new_v4().to_string())
+    } else {
+        None
+    };
+
+    // 🔒 存储 API 配置到共享 DashMap（使用 UUID 作为 key）
+    if let Some(ref provider) = request.model_provider {
+        if let Some(ref uuid) = service_uuid {
+            state
+                .shared_api_key_manager
+                .insert(uuid.clone(), provider.clone());
+
+            // 🔒 存储 project_id -> UUID 映射（使用独立的 DashMap）
+            // key 使用 project_id 便于清理时查找
+            state
+                .project_uuid_map
+                .insert(project_id.clone(), uuid.clone());
+
+            // ✅ ApiKeyManager 现在是包装器，不需要单独写入
+
+            info!(
+                "🔑 [HTTP] 已存储 API 配置: service_uuid={}, provider_name={}",
+                uuid, provider.name
+            );
+        }
+    }
+
+    // 创建请求并设置 UUID 和密钥管理器
     let (local_task_request, chat_prompt_rx) =
         LocalSetAgentRequest::new(prompt_message, request.model_provider.clone());
+    let local_task_request = local_task_request
+        .with_service_uuid(service_uuid)
+        .with_key_manager(Some(state.shared_api_key_manager.clone()));
     state.local_task_sender.send(local_task_request)?;
 
     let result = match chat_prompt_rx.await {

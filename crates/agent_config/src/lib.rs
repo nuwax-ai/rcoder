@@ -4,13 +4,11 @@
 
 pub mod config;
 pub mod installer;
-pub mod resolver;
 pub mod types;
 
 // Re-export main types
 pub use config::prompt_assembler::PromptConfigAssembler;
 pub use config::servers_config::AgentServersConfig;
-pub use resolver::env_resolver::EnvironmentVariableResolver;
 pub use types::agent_config::AgentConfig;
 pub use types::agent_spec::AgentSpec;
 pub use types::error::{AgentConfigError, ConfigError, Result};

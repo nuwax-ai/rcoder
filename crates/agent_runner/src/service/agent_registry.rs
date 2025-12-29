@@ -50,6 +50,12 @@ impl AgentSessionRegistry {
     /// 注册新的 Agent Session（同时更新所有映射）
     ///
     /// 如果 project_id 已存在旧的 session，会自动清理旧的反向映射
+    ///
+    /// ## 并发安全性
+    ///
+    /// 使用 DashMap entry API 的原子操作，避免 remove/insert 之间的竞态窗口：
+    /// - 所有 insert/remove 操作都是独立的原子操作
+    /// - 采用"先插入后删除"策略，确保任何时刻至少有一个有效映射
     pub fn register(&self, project_id: &str, session_id: &str, agent_info: ProjectAndAgentInfo) {
         use dashmap::mapref::entry::Entry;
 
@@ -66,20 +72,39 @@ impl AgentSessionRegistry {
             }
         };
 
-        // 清理旧的反向映射
-        if let Some(old_sid) = old_session_id {
-            self.session_to_project.remove(&old_sid);
-            debug!(
-                "🔄 [Registry] 清理旧 session 映射: project={}, old_session={}",
-                project_id, old_sid
-            );
-        }
+        // 🔒 使用 entry API 原子性地更新 session_to_project
+        // 这样避免了 insert + remove 分离操作带来的竞态窗口
+        let should_clean_old = match self.session_to_project.entry(session_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                // key 已存在，原子性地替换值
+                let old_project_id = entry.get().clone();
+                entry.insert(project_id.to_string());
+                // 如果 session_id 对应的 project_id 发生变化，需要清理旧映射
+                Some(old_project_id != project_id)
+            }
+            Entry::Vacant(entry) => {
+                // key 不存在，直接插入
+                entry.insert(project_id.to_string());
+                None
+            }
+        };
 
-        // 更新反向映射和 agent_info
-        self.session_to_project
-            .insert(session_id.to_string(), project_id.to_string());
+        // 更新 agent_info（原子操作）
         self.agent_info_map
             .insert(project_id.to_string(), agent_info);
+
+        // ✅ 清理旧的 session_to_project 映射（如果需要）
+        // 只有当 session 真正变化时才清理旧值
+        if let Some(old_sid) = old_session_id {
+            if old_sid != session_id {
+                // remove 本身是原子操作，此时新映射已插入，不会影响查询
+                self.session_to_project.remove(&old_sid);
+                debug!(
+                    "🔄 [Registry] 清理旧 session 映射: project={}, old_session={}",
+                    project_id, old_sid
+                );
+            }
+        }
 
         info!(
             "✅ [Registry] 注册 Agent: project={}, session={}",
@@ -90,6 +115,10 @@ impl AgentSessionRegistry {
     /// 更新 session_id（当 session 变化时）
     ///
     /// 返回旧的 session_id（如果存在）
+    ///
+    /// ## 并发安全性
+    ///
+    /// 使用 DashMap entry API 的原子操作，与 register() 方法保持一致
     pub fn update_session(&self, project_id: &str, new_session_id: &str) -> Option<String> {
         use dashmap::mapref::entry::Entry;
 
@@ -111,14 +140,28 @@ impl AgentSessionRegistry {
             }
         };
 
-        // 清理旧的反向映射
-        if let Some(ref old_sid) = old_session_id {
-            self.session_to_project.remove(old_sid);
-        }
+        // 🔒 使用 entry API 原子性地更新 session_to_project
+        let _should_clean_old = match self.session_to_project.entry(new_session_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                // key 已存在，原子性地替换值
+                let old_project_id = entry.get().clone();
+                entry.insert(project_id.to_string());
+                Some(old_project_id != project_id)
+            }
+            Entry::Vacant(entry) => {
+                // key 不存在，直接插入
+                entry.insert(project_id.to_string());
+                None
+            }
+        };
 
-        // 插入新的反向映射
-        self.session_to_project
-            .insert(new_session_id.to_string(), project_id.to_string());
+        // ✅ 清理旧的 session_to_project 映射（原子操作）
+        if let Some(ref old_sid) = old_session_id {
+            if old_sid != new_session_id {
+                // remove 本身是原子操作
+                self.session_to_project.remove(old_sid);
+            }
+        }
 
         if let Some(ref old_sid) = old_session_id {
             info!(

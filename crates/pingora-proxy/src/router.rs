@@ -64,6 +64,24 @@ pub enum RouteType {
     /// **示例**:
     /// - `/health` → `{"status":"ok","service":"pingora-proxy"}`
     HealthCheck,
+
+    /// 🔒 API 密钥代理: `/api/{service_name}/{*path}`
+    ///
+    /// **功能**: 拦截 AI API 请求，注入真实 API 密钥后转发到真实 API 端点
+    ///
+    /// **参数**:
+    /// - `service_name`: 服务名称（如 `anthropic`, `openai`），用于查找密钥配置
+    /// - `path`: API 路径（如 `v1/messages`）
+    ///
+    /// **安全特性**:
+    /// - 移除客户端传入的占位密钥
+    /// - 从 ApiKeyManager 读取真实密钥并注入请求头
+    /// - 重写 URI 到真实 API 端点
+    ///
+    /// **示例**:
+    /// - `/api/anthropic/v1/messages` → `https://api.anthropic.com/v1/messages` (带真实密钥)
+    /// - `/api/openai/v1/chat/completions` → `https://api.openai.com/v1/chat/completions`
+    ApiProxy,
 }
 
 /// 创建路由表
@@ -166,6 +184,32 @@ pub fn create_router() -> Router<RouteType> {
         .insert("/health", RouteType::HealthCheck)
         .expect("Failed to insert health check route");
 
+    // ========================================================================
+    // 🔒 API 密钥代理路由
+    // ========================================================================
+    //
+    // 路径格式: /api/{service_name}/{*path}
+    //
+    // 功能: 拦截 AI API 请求，注入真实 API 密钥后转发
+    //
+    // 安全机制:
+    // 1. 客户端使用占位密钥 (sk-placeholder) 发送请求到本地代理
+    // 2. Pingora 从 ApiKeyManager 读取真实密钥
+    // 3. 移除占位密钥，注入真实密钥到请求头
+    // 4. 重写 URI 到真实 API 端点
+    //
+    // 参数:
+    // - service_name: 服务名称（anthropic, openai 等）
+    // - path: API 路径（v1/messages, v1/chat/completions 等）
+    //
+    // 示例:
+    // - /api/anthropic/v1/messages -> https://api.anthropic.com/v1/messages (注入真实 x-api-key)
+    // - /api/openai/v1/chat/completions -> https://api.openai.com/v1/chat/completions (注入真实 Authorization)
+    //
+    router
+        .insert("/api/{service_name}/{*path}", RouteType::ApiProxy)
+        .expect("Failed to insert API proxy route");
+
     router
 }
 
@@ -188,6 +232,11 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
             "/health".to_string(),
             "健康检查".to_string(),
             "返回 Pingora 代理服务的健康状态".to_string(),
+        ),
+        (
+            "/api/{service_name}/{*path}".to_string(),
+            "🔒 API 密钥代理".to_string(),
+            "拦截 AI API 请求，注入真实密钥后转发到真实 API 端点".to_string(),
         ),
     ]
 }
@@ -253,15 +302,40 @@ mod tests {
         let router = create_router();
 
         // 不匹配的路径应该返回错误
-        assert!(router.at("/api/v1/users").is_err());
         assert!(router.at("/unknown/path").is_err());
         assert!(router.at("/computer/desktop").is_err());
+        // 注意：/api/xxx/yyy 现在会匹配到 ApiProxy 路由
+    }
+
+    #[test]
+    fn test_api_proxy_route() {
+        let router = create_router();
+
+        // 测试 Anthropic API 路由
+        let matched = router.at("/api/anthropic/v1/messages").unwrap();
+        assert_eq!(*matched.value, RouteType::ApiProxy);
+        assert_eq!(matched.params.get("service_name"), Some("anthropic"));
+        assert_eq!(matched.params.get("path"), Some("v1/messages"));
+
+        // 测试 OpenAI API 路由
+        let matched = router
+            .at("/api/openai/v1/chat/completions")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::ApiProxy);
+        assert_eq!(matched.params.get("service_name"), Some("openai"));
+        assert_eq!(matched.params.get("path"), Some("v1/chat/completions"));
+
+        // 测试多级路径
+        let matched = router.at("/api/custom/v2/org/project/messages").unwrap();
+        assert_eq!(*matched.value, RouteType::ApiProxy);
+        assert_eq!(matched.params.get("service_name"), Some("custom"));
+        assert_eq!(matched.params.get("path"), Some("v2/org/project/messages"));
     }
 
     #[test]
     fn test_get_routes_documentation() {
         let docs = get_routes_documentation();
-        assert_eq!(docs.len(), 3);
+        assert_eq!(docs.len(), 4);
 
         // 验证 VNC 路由文档
         assert!(docs[0].0.contains("vnc"));
@@ -274,24 +348,37 @@ mod tests {
         // 验证健康检查路由文档
         assert!(docs[2].0.contains("health"));
         assert!(docs[2].1.contains("健康"));
+
+        // 验证 API 代理路由文档
+        assert!(docs[3].0.contains("api"));
+        assert!(docs[3].1.contains("API"));
     }
 
     #[test]
     fn test_route_type_equality() {
         assert_eq!(RouteType::VncProxy, RouteType::VncProxy);
         assert_eq!(RouteType::PortProxy, RouteType::PortProxy);
+        assert_eq!(RouteType::ApiProxy, RouteType::ApiProxy);
+        assert_eq!(RouteType::HealthCheck, RouteType::HealthCheck);
         assert_ne!(RouteType::VncProxy, RouteType::PortProxy);
+        assert_ne!(RouteType::ApiProxy, RouteType::PortProxy);
     }
 
     #[test]
     fn test_route_type_debug() {
         let vnc = RouteType::VncProxy;
         let port = RouteType::PortProxy;
+        let api = RouteType::ApiProxy;
+        let health = RouteType::HealthCheck;
 
         let vnc_str = format!("{:?}", vnc);
         let port_str = format!("{:?}", port);
+        let api_str = format!("{:?}", api);
+        let health_str = format!("{:?}", health);
 
         assert!(vnc_str.contains("VncProxy"));
         assert!(port_str.contains("PortProxy"));
+        assert!(api_str.contains("ApiProxy"));
+        assert!(health_str.contains("HealthCheck"));
     }
 }

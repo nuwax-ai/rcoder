@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
 use agent_client_protocol::{
     Agent, Client, ClientSideConnection, Implementation, InitializeRequest, McpServer,
     McpServerStdio, NewSessionRequest, PromptRequest, SessionId,
@@ -123,14 +125,51 @@ pub async fn load_agent_config(
 
         if let Some(provider) = model_provider {
             // 解析占位符
-            for (_key, value) in resolved_env.iter_mut() {
+            for (key, value) in resolved_env.iter_mut() {
+                // ⚠️ 关键安全机制：ANTHROPIC_API_KEY 和 ANTHROPIC_BASE_URL 使用占位符值
+                //
+                // Agent 应该使用占位符密钥和代理 URL，真实密钥由 Pingora 注入：
+                // - ANTHROPIC_API_KEY: sk-placeholder
+                // - ANTHROPIC_BASE_URL: http://localhost:8088/api/{SERVICE_UUID}
+                //
+                // 这两个变量不进行替换，保持为占位符或代理URL
+                // 其他变量正常替换 MODEL_PROVIDER_* 占位符
+                if key == "ANTHROPIC_API_KEY" || key == "ANTHROPIC_BASE_URL" {
+                    // 保持原值不处理，后面会单独处理这两个变量
+                    continue;
+                }
+
+                // 其他环境变量正常替换
                 *value = value
                     .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
                     .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
                     .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
                     .replace("{MODEL_PROVIDER_NAME}", &provider.name);
             }
+
+            // 单独处理 ANTHROPIC_API_KEY 和 ANTHROPIC_BASE_URL
+            // 检查并设置占位符值
+            for (key, value) in resolved_env.iter_mut() {
+                if key == "ANTHROPIC_API_KEY" {
+                    if value.contains("{MODEL_PROVIDER_API_KEY}") || value.is_empty() {
+                        *value = "sk-placeholder".to_string();
+                        debug!("🔒 设置 ANTHROPIC_API_KEY 为占位符密钥");
+                    }
+                } else if key == "ANTHROPIC_BASE_URL" {
+                    if value.contains("{MODEL_PROVIDER_BASE_URL}") || value.is_empty() {
+                        *value = "http://localhost:8088/api/{SERVICE_UUID}".to_string();
+                        debug!("🔒 设置 ANTHROPIC_BASE_URL 为代理 URL");
+                    }
+                }
+            }
         }
+
+        // 🔒 禁用 Claude Code 非必要网络请求（遥测等）
+        resolved_env.insert(
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+            "1".to_string(),
+        );
+        debug!("🔒 已禁用 Claude Code 遥测功能");
 
         Ok(AgentLaunchConfig {
             command: agent_config.command.clone(),
@@ -152,11 +191,16 @@ pub fn get_default_agent_config(
 ) -> Result<AgentLaunchConfig> {
     let env = if let Some(provider) = model_provider {
         let mut env = HashMap::new();
+        // ⚠️ 关键：使用占位符密钥和代理URL，而不是真实值
+        // Agent 应该使用占位符，真实密钥由 Pingora 代理注入
         if !provider.api_key.is_empty() {
-            env.insert("ANTHROPIC_API_KEY".to_string(), provider.api_key.clone());
+            env.insert("ANTHROPIC_API_KEY".to_string(), "sk-placeholder".to_string());
         }
         if !provider.base_url.is_empty() {
-            env.insert("ANTHROPIC_BASE_URL".to_string(), provider.base_url.clone());
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://localhost:8088/api/{SERVICE_UUID}".to_string(),
+            );
         }
         if !provider.default_model.is_empty() {
             env.insert(
@@ -165,10 +209,20 @@ pub fn get_default_agent_config(
             );
         }
         env.insert("RUST_LOG".to_string(), "info".to_string());
+        // 🔒 禁用 Claude Code 非必要网络请求（遥测等）
+        env.insert(
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+            "1".to_string(),
+        );
         env
     } else {
         let mut env = HashMap::new();
         env.insert("RUST_LOG".to_string(), "info".to_string());
+        // 🔒 禁用 Claude Code 非必要网络请求（遥测等）
+        env.insert(
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+            "1".to_string(),
+        );
         env
     };
 
@@ -283,6 +337,9 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
     /// - `start_config`: Agent 启动配置（包含系统提示词、resume_session_id 等）
     /// - `client`: ACP 客户端实现
     /// - `registry`: 会话注册表（用于降级时更新）
+    /// - `shared_api_key_manager`: 共享的 API 密钥管理器（用于自动清理）
+    /// - `project_uuid_map`: project_id -> service_uuid 映射（用于清理时查找）
+    /// - `service_uuid`: 与此 Agent 关联的唯一 UUID
     ///
     /// # Resume 机制
     /// 如果需要恢复会话，通过 `start_config.resume_session_id` 传递 session_id，
@@ -299,6 +356,9 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
         start_config: AgentStartConfig,
         client: C,
         registry: Arc<R>,
+        shared_api_key_manager: Option<Arc<DashMap<String, shared_types::ModelProviderConfig>>>,
+        project_uuid_map: Option<Arc<DashMap<String, String>>>,
+        service_uuid: Option<String>,
     ) -> Result<LauncherConnectionInfoComplete>
     where
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
@@ -356,6 +416,15 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
         );
         // 添加项目 ID 环境变量
         merged_envs.insert("AGENT_PROJECT_ID".to_string(), project_id.clone());
+
+        // 🔥 将 UUID 注入到环境变量中（替换 {SERVICE_UUID} 占位符）
+        // 注意：agent_config.env 已经包含 {SERVICE_UUID} 占位符（来自 docker_manager）
+        // 这里直接替换占位符为实际 UUID 值
+        if let Some(ref uuid) = service_uuid {
+            for (_key, value) in merged_envs.iter_mut() {
+                *value = value.replace("{SERVICE_UUID}", uuid);
+            }
+        }
         let mut child = tokio::process::Command::new(command_path)
             .args(&spawn_args)
             .stdin(Stdio::piped())
@@ -625,13 +694,16 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
             }
         });
 
-        // 创建生命周期守卫
-        let lifecycle_guard = AgentLifecycleGuard::new_claude(
+        // 创建生命周期守卫（传入密钥管理器、UUID 映射和 UUID）
+        let lifecycle_guard = AgentLifecycleGuard::new_claude_with_key_manager(
             project_id.clone(),
             session_id.clone(),
             child,
             stderr_task,
             cancel_token.clone(),
+            shared_api_key_manager,
+            project_uuid_map,
+            service_uuid,
         );
 
         Ok(LauncherConnectionInfoComplete {

@@ -3,6 +3,7 @@
 //! 基于RAII原则的简洁生命周期管理设计
 
 use anyhow::Result;
+use dashmap::DashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -13,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use agent_client_protocol::SessionId;
-use shared_types::AgentLifecycle;
+use shared_types::{AgentLifecycle, ModelProviderConfig};
 
 /// Agent生命周期守卫
 ///
@@ -38,6 +39,12 @@ struct AgentLifecycleInner {
     cancel_token: CancellationToken,
     resources: AgentResources,
     stopped: AtomicBool,
+    /// 🔥 共享的 API 密钥管理器引用（用于自动清理）
+    shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    /// 🔥 project_id -> service_uuid 映射（用于清理时查找 UUID）
+    project_uuid_map: Option<Arc<DashMap<String, String>>>,
+    /// 🔥 关联的 service_uuid（用于清理时定位配置）
+    service_uuid: Option<String>,
 }
 
 /// Agent资源管理枚举
@@ -49,13 +56,45 @@ enum AgentResources {
 }
 
 impl AgentLifecycleGuard {
-    /// 为Claude Agent创建生命周期守卫
+    /// 为Claude Agent创建生命周期守卫（兼容旧代码，默认无密钥管理器）
     pub fn new_claude(
         project_id: String,
         session_id: SessionId,
         child_process: tokio::process::Child,
         stderr_task: JoinHandle<()>,
         cancel_token: CancellationToken,
+    ) -> Self {
+        Self::new_claude_with_key_manager(
+            project_id,
+            session_id,
+            child_process,
+            stderr_task,
+            cancel_token,
+            None,  // 默认无密钥管理器
+            None,  // 默认无 project_uuid_map
+            None,  // 默认无 service_uuid
+        )
+    }
+
+    /// 🔥 新增：带密钥管理器的构造函数
+    ///
+    /// 创建生命周期守卫时传入共享的 API 密钥管理器和 service_uuid，
+    /// 当 Agent 停止时（Drop）会自动清理对应的 API 密钥配置。
+    ///
+    /// # 参数
+    ///
+    /// * `shared_api_key_manager` - 共享的 DashMap，用于清理 API 密钥配置
+    /// * `project_uuid_map` - project_id -> service_uuid 映射，用于查找 UUID
+    /// * `service_uuid` - 与此 Agent 关联的 service UUID
+    pub fn new_claude_with_key_manager(
+        project_id: String,
+        session_id: SessionId,
+        child_process: tokio::process::Child,
+        stderr_task: JoinHandle<()>,
+        cancel_token: CancellationToken,
+        shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+        project_uuid_map: Option<Arc<DashMap<String, String>>>,
+        service_uuid: Option<String>,
     ) -> Self {
         let resources = AgentResources::Claude {
             child_process: Arc::new(Mutex::new(Some(child_process))),
@@ -68,6 +107,9 @@ impl AgentLifecycleGuard {
             cancel_token,
             resources,
             stopped: AtomicBool::new(false),
+            shared_api_key_manager,
+            project_uuid_map,
+            service_uuid,
         });
 
         Self { inner }
@@ -187,6 +229,13 @@ impl Drop for AgentLifecycleGuard {
 
             // 发送取消信号
             self.inner.cancel_token.cancel();
+
+            // 注意：API 密钥配置的清理由 agent_runner 层的 stop_agent 方法统一负责
+            // 包括：
+            // - shared_api_key_manager 中的配置
+            // - project_uuid_map 中的映射
+            //
+            // 这样避免双重清理，确保资源只被清理一次
 
             // 同步清理关键资源
             match &self.inner.resources {

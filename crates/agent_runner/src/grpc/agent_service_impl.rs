@@ -374,17 +374,49 @@ impl AgentService for AgentServiceImpl {
         // 转换 model_provider
         let model_provider = req.model_config.map(convert_model_provider);
 
+        // 🔥 生成唯一的 service UUID（用于 API 密钥管理）
+        let service_uuid = if model_provider.is_some() {
+            Some(uuid::Uuid::new_v4().to_string())
+        } else {
+            None
+        };
+
         if let Some(ref provider) = model_provider {
+            let service_uuid_ref = service_uuid.as_ref().unwrap();
+
             debug!(
-                "📝 [gRPC] 使用模型配置: provider={}, model={}, base_url={}",
-                provider.name, provider.default_model, provider.base_url
+                "📝 [gRPC] 使用模型配置: provider={}, model={}, base_url={}, api_protocol={:?}, requires_openai_auth={}, service_uuid={}",
+                provider.name, provider.default_model, provider.base_url, provider.api_protocol, provider.requires_openai_auth, service_uuid_ref
+            );
+
+            // 🔒 存储 ModelProviderConfig 到共享 DashMap（使用 UUID 作为 key）
+            // key: UUID, value: ModelProviderConfig
+            self.app_state
+                .shared_api_key_manager
+                .insert(service_uuid_ref.clone(), provider.clone());
+
+            // 🔒 存储 project_id -> UUID 映射（用于后续清理时查找）
+            // 使用独立的 DashMap，类型清晰，key 使用 project_id 便于清理时查找
+            self.app_state
+                .project_uuid_map
+                .insert(project_id.clone(), service_uuid_ref.clone());
+
+            // ✅ ApiKeyManager 现在是 shared_api_key_manager 的包装器，不需要单独写入
+
+            info!(
+                "🔑 [gRPC] 已存储 API 配置: service_uuid={}, provider_name={}, base_url={}",
+                service_uuid_ref, provider.name, provider.base_url
             );
         } else {
             warn!("⚠️ [gRPC] 未提供模型配置，将使用环境变量或默认配置");
         }
 
+        // 创建请求并设置 UUID 和密钥管理器
         let (local_task_request, chat_prompt_rx) =
             LocalSetAgentRequest::new(prompt_message, model_provider);
+        let local_task_request = local_task_request
+            .with_service_uuid(service_uuid)
+            .with_key_manager(Some(self.app_state.shared_api_key_manager.clone()));
 
         self.app_state
             .local_task_sender
@@ -1012,6 +1044,30 @@ impl AgentService for AgentServiceImpl {
                 if SESSION_CACHE.remove(&session_id).is_some() {
                     info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
                 }
+            }
+
+            // 🔒 清理 API 密钥配置（通过 project_id 查找 uuid）
+            // 1. 先从 project_uuid_map 获取 uuid
+            if let Some((_, uuid)) = self.app_state.project_uuid_map.remove(&project_id)
+            {
+                // 2. 清理 shared_api_key_manager 中的配置
+                if let Some((key, config)) =
+                    self.app_state.shared_api_key_manager.remove(&uuid)
+                {
+                    info!(
+                        "🗑️ [gRPC] 已清理 API 密钥配置: uuid={}, provider_name={}",
+                        key, config.name
+                    );
+                }
+                info!(
+                    "🗑️ [gRPC] 已清理 project UUID 映射: project_id={}, uuid={}",
+                    project_id, uuid
+                );
+            } else {
+                debug!(
+                    "🔍 [gRPC] 未找到 project UUID 映射: project_id={}",
+                    project_id
+                );
             }
 
             // 🎯 使用 remove 原子性地获取 AgentInfo 所有权，避免读锁/写锁竞争

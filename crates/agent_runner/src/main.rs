@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod api_key_manager;
 mod config;
 mod grpc;
 mod handler;
@@ -74,6 +75,11 @@ async fn main() -> anyhow::Result<()> {
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
+    // 🔒 创建共享的 API 密钥 DashMap（在 Pingora 服务之前创建）
+    // 这个 DashMap 将在 agent_runner 和 Pingora 之间共享
+    let shared_api_key_manager = Arc::new(dashmap::DashMap::<String, shared_types::ModelProviderConfig>::new());
+    info!("🔑 [MAIN] 共享 API 密钥 DashMap 已创建");
+
     // 启动代理服务（如果启用）
     let (proxy_handle, pingora_service_opt) = if let Some(proxy_config) = &config.proxy_config {
         info!(
@@ -94,8 +100,10 @@ async fn main() -> anyhow::Result<()> {
             verbose: false,
         };
 
-        // 创建 Pingora 服务器管理器，并提取服务引用用于指标读取
-        let mut server_manager = PingoraServerManager::new(pingora_config);
+        // 创建 Pingora 服务器管理器，并传入共享的 API 密钥管理器
+        let mut server_manager = PingoraServerManager::new(pingora_config)
+            .with_api_key_manager(shared_api_key_manager.clone());
+
         let pingora_service = server_manager.service();
         // 启动健康检查循环（按配置）
         if proxy_config.health_check.enabled {
@@ -116,11 +124,22 @@ async fn main() -> anyhow::Result<()> {
         (None, None)
     };
 
+    // 🔥 创建 ApiKeyManager 包装器（包装共享 DashMap，消除双重存储）
+    let api_key_manager = Arc::new(api_key_manager::ApiKeyManager::from_shared(
+        shared_api_key_manager.clone()
+    ));
+
+    // 🔒 project_id -> service_uuid 映射
+    let project_uuid_map = Arc::new(DashMap::new());
+
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
         local_task_sender,
         pingora_service: pingora_service_opt,
+        api_key_manager,  // 现在包装 shared_api_key_manager
+        shared_api_key_manager,
+        project_uuid_map,
     });
 
     // 创建路由

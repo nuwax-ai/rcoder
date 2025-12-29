@@ -16,6 +16,8 @@
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
 use agent_client_protocol::{Client, ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
@@ -213,6 +215,10 @@ where
     ///
     /// 启动 Agent 进程并建立 ACP 连接
     ///
+    /// # 参数
+    /// - `shared_api_key_manager`: 共享的 API 密钥管理器（用于自动清理）
+    /// - `service_uuid`: 与此 Agent 关联的唯一 UUID
+    ///
     /// # 返回值
     /// - `R::Entry`: 会话条目
     pub async fn create_session(
@@ -223,6 +229,8 @@ where
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
+        shared_api_key_manager: Option<Arc<DashMap<String, shared_types::ModelProviderConfig>>>,
+        service_uuid: Option<String>,
     ) -> Result<R::Entry> {
         info!("开始创建新的 Agent 会话，项目 ID: {}", project_id);
 
@@ -248,6 +256,9 @@ where
                 start_config.clone(),
                 client,
                 self.registry.clone(),
+                shared_api_key_manager,
+                None,  // project_uuid_map 清理由 agent_runner 层负责
+                service_uuid,
             )
             .await?;
 
@@ -290,6 +301,10 @@ where
     ///
     /// 如果会话已存在且模型配置未变化，则复用；否则创建新会话
     ///
+    /// # 参数
+    /// - `shared_api_key_manager`: 共享的 API 密钥管理器（用于自动清理）
+    /// - `service_uuid`: 与此 Agent 关联的唯一 UUID
+    ///
     /// # 返回值
     /// - `R::Entry`: 会话条目
     /// - `bool`: 是否是新创建的会话
@@ -301,6 +316,8 @@ where
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         client: C,
+        shared_api_key_manager: Option<Arc<DashMap<String, shared_types::ModelProviderConfig>>>,
+        service_uuid: Option<String>,
     ) -> Result<(R::Entry, bool)> {
         // 检查是否存在
         if let Some(existing) = self.get_session(project_id) {
@@ -322,6 +339,8 @@ where
                         model_provider,
                         start_config,
                         client,
+                        shared_api_key_manager.clone(),
+                        service_uuid.clone(),
                     )
                     .await?;
                 return Ok((new_session, true)); // true = 新创建
@@ -346,6 +365,8 @@ where
                         model_provider,
                         start_config,
                         client,
+                        shared_api_key_manager.clone(),
+                        service_uuid.clone(),
                     )
                     .await?;
                 return Ok((new_session, true)); // true = 新创建
@@ -364,6 +385,8 @@ where
                 model_provider,
                 start_config,
                 client,
+                shared_api_key_manager,
+                service_uuid,
             )
             .await?;
         Ok((new_session, true))

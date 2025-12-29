@@ -3,6 +3,7 @@
 //! 提供基于 Pingora 库的完整反向代理服务器启动功能，支持 HTTP/1.1 和 HTTP/2。
 
 use anyhow::Result;
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -15,6 +16,7 @@ use pingora_core::Result as PingoraResult;
 
 use crate::config::ProxyConfig;
 use crate::service::{PingoraProxyService, PortProxy};
+use shared_types::ModelProviderConfig;
 
 /// Pingora 服务器管理器
 pub struct PingoraServerManager {
@@ -32,6 +34,27 @@ impl PingoraServerManager {
             service,
             shutdown_tx: None,
         }
+    }
+
+    /// 设置共享的 API 密钥管理器
+    ///
+    /// 这个方法允许从外部传入一个共享的 DashMap，使 agent_runner 和 Pingora
+    /// 能够共享 API 密钥配置。
+    ///
+    /// # 参数
+    ///
+    /// * `api_key_manager` - 共享的 DashMap<String, ModelProviderConfig>
+    pub fn with_api_key_manager(
+        mut self,
+        api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
+    ) -> Self {
+        // 由于 Arc 需要先解包再重新包装，使用 Arc::try_unwrap 或创建新的 service
+        // 简单起见，我们创建新的 PingoraProxyService
+        let new_service = (*self.service)
+            .clone()
+            .with_api_key_manager(api_key_manager);
+        self.service = Arc::new(new_service);
+        self
     }
 
     /// 启动 Pingora 服务器
