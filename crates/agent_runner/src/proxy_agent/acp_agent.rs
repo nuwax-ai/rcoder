@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
 use agent_abstraction::session::AcpSessionManager;
 use anyhow::Result;
 use chrono::Utc;
@@ -28,6 +30,10 @@ pub struct LocalSetAgentRequest {
     chat_prompt_tx: oneshot::Sender<ChatPromptResponse>,
     /// 模型提供商配置
     model_provider: Option<ModelProviderConfig>,
+    /// 🔥 关联的 service UUID（用于 API 密钥管理）
+    service_uuid: Option<String>,
+    /// 🔥 共享的 API 密钥管理器（用于自动清理）
+    shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
 }
 
 impl LocalSetAgentRequest {
@@ -41,9 +47,23 @@ impl LocalSetAgentRequest {
                 prompt_message,
                 chat_prompt_tx,
                 model_provider,
+                service_uuid: None,
+                shared_api_key_manager: None,
             },
             chat_prompt_rx,
         )
+    }
+
+    /// 设置 service_uuid
+    pub fn with_service_uuid(mut self, service_uuid: Option<String>) -> Self {
+        self.service_uuid = service_uuid;
+        self
+    }
+
+    /// 设置 shared_api_key_manager
+    pub fn with_key_manager(mut self, key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>) -> Self {
+        self.shared_api_key_manager = key_manager;
+        self
     }
 }
 
@@ -112,6 +132,8 @@ pub async fn agent_worker(
             prompt_message: request.prompt_message.clone(),
             model_provider: request.model_provider.clone(),
             attachment_blocks,
+            service_uuid: request.service_uuid.clone(),
+            shared_api_key_manager: request.shared_api_key_manager.clone(),
         };
 
         // 3. 调用 AcpAgentWorker 处理（核心业务逻辑）

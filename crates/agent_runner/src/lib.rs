@@ -2,6 +2,7 @@
 //!
 //! 提供 ACP 协议集成和 AI 代理管理功能
 
+pub mod api_key_manager;
 mod config;
 pub mod grpc;
 mod handler;

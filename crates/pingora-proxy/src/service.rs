@@ -17,8 +17,11 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+// 导入 shared_types 以使用 ModelProviderConfig
+use shared_types::ModelProviderConfig;
+
 // Pingora 相关导入
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::upstreams::peer::{HttpPeer, ALPN};
 use pingora_core::Result as PingoraResult;
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_load_balancing::{health_check, selection::RoundRobin, LoadBalancer};
@@ -252,6 +255,9 @@ pub struct PingoraProxyService {
     /// VNC 后端映射: user_id -> container_ip
     /// 用于 /computer/vnc/{user_id}/{project_id} 路由
     pub vnc_backends: Arc<DashMap<String, String>>,
+    /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
+    /// 用于 /api/{service_name}/{*path} 路由
+    pub api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
 }
 
 /// Pingora 代理实现
@@ -268,6 +274,8 @@ pub struct PortProxy {
     vnc_backends: Arc<DashMap<String, String>>,
     /// 路由表
     router: Router<RouteType>,
+    /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
+    api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
 }
 
 #[async_trait]
@@ -319,6 +327,11 @@ impl ProxyHttp for PortProxy {
                 // 设置目标端口为默认后端端口 (Axum)
                 ctx.target_port = Some(self.default_backend_port);
             }
+            RouteType::ApiProxy => {
+                // 🔒 API 密钥代理：注入真实密钥后转发到真实 API
+                self.handle_api_proxy_request(upstream_request, &original_uri, matched.params)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -359,6 +372,10 @@ impl ProxyHttp for PortProxy {
                 ));
 
                 Ok(peer)
+            }
+            RouteType::ApiProxy => {
+                // 🔒 API 代理：返回真实 API 端点的 peer
+                self.handle_api_proxy_upstream(matched.params).await
             }
         }
     }
@@ -521,6 +538,203 @@ impl PortProxy {
         Ok(())
     }
 
+    // ========================================================================
+    // 🔒 API 密钥代理方法
+    // ========================================================================
+
+    /// 处理 API 密钥代理请求
+    ///
+    /// 路径格式: /api/{service_name}/{*path}
+    /// 例如: /api/anthropic/v1/messages
+    ///
+    /// 安全机制：
+    /// 1. 从 ApiKeyManager 读取真实 API 密钥配置
+    /// 2. 移除客户端传入的占位密钥
+    /// 3. 注入真实 API 密钥到请求头
+    /// 4. 重写 URI 到真实 API 端点
+    async fn handle_api_proxy_request(
+        &self,
+        upstream_request: &mut RequestHeader,
+        original_uri: &http::Uri,
+        params: Params<'_, '_>,
+    ) -> PingoraResult<()> {
+        // 1. 提取服务名称（如 "anthropic", "openai"）
+        let service_name = params.get("service_name").ok_or_else(|| {
+            error!("API 代理路由缺少 service_name 参数");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        // 2. 提取 API 路径（如 "v1/messages"）
+        let api_path = params.get("path").unwrap_or("");
+
+        debug!(
+            "🔒 API 代理请求: service_name={}, api_path={}",
+            service_name, api_path
+        );
+
+        // 3. 从 ApiKeyManager 查询 API 密钥配置
+        let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
+            warn!("找不到服务 {} 的 API 密钥配置", service_name);
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+                format!(
+                    "找不到服务 {} 的 API 密钥配置，请确保已正确配置",
+                    service_name
+                ),
+            )
+        })?;
+
+        let config = api_config.value();
+        let base_url = config.base_url.trim_end_matches('/');
+
+        // 4. 移除客户端传入的占位密钥（安全措施）
+        upstream_request.remove_header("x-api-key");
+        upstream_request.remove_header("authorization");
+        upstream_request.remove_header("x-api-version"); // 移除可能的版本标识
+
+        // 5. 注入真实 API 密钥
+        // Anthropic 协议使用 x-api-key，OpenAI 协议使用 Authorization: Bearer
+        // 🔧 优先根据 api_protocol 判断，而不是 requires_openai_auth
+
+        // 添加调试日志
+        debug!(
+            "🔑 [API_PROXY] 认证配置: api_protocol={:?}, requires_openai_auth={}, base_url={}",
+            config.api_protocol, config.requires_openai_auth, base_url
+        );
+
+        // 判断使用哪种认证格式
+        let use_anthropic_auth = config
+            .api_protocol
+            .as_ref()
+            .map(|p| {
+                let protocol = p.to_lowercase();
+                protocol != "openai"  // 不是 openai 就用 Anthropic 格式
+            })
+            .unwrap_or(!config.requires_openai_auth);
+
+        if use_anthropic_auth {
+            upstream_request.insert_header("x-api-key", &config.api_key)?;
+            debug!("🔑 已注入 Anthropic 格式的 x-api-key (api_protocol={:?})", config.api_protocol);
+        } else {
+            upstream_request
+                .insert_header("authorization", &format!("Bearer {}", config.api_key))?;
+            debug!("🔑 已注入 OpenAI 格式的 Authorization Bearer token (api_protocol={:?})", config.api_protocol);
+        }
+
+        // 6. 重写 URI 到真实 API 端点
+        let new_uri_str = if api_path.is_empty() {
+            format!("{}/", base_url)
+        } else {
+            format!("{}/{}", base_url, api_path)
+        };
+
+        // 保留查询参数
+        let new_uri_str = if let Some(query) = original_uri.query() {
+            format!("{}?{}", new_uri_str, query)
+        } else {
+            new_uri_str
+        };
+
+        let new_uri = new_uri_str.parse::<http::Uri>().map_err(|e| {
+            error!("URI 解析失败: {} - {}", new_uri_str, e);
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        upstream_request.set_uri(new_uri);
+
+        // 8. 设置 Host 头（从 base_url 提取）
+        if let Some(host) = base_url
+            .strip_prefix("https://")
+            .or_else(|| base_url.strip_prefix("http://"))
+            .and_then(|s: &str| s.split('/').next())
+        {
+            upstream_request.insert_header("Host", host)?;
+            debug!("🔑 已设置 Host: {}", host);
+        }
+
+        // 9. 设置通用代理头
+        Self::set_common_headers(upstream_request)?;
+        upstream_request.insert_header("X-API-Proxy", "pingora-proxy")?;
+        upstream_request.insert_header("X-Service-Name", service_name)?;
+
+        info!("✅ [API_PROXY] {} 请求已重写到: {}", service_name, base_url);
+
+        Ok(())
+    }
+
+    /// 处理 API 密钥代理的上游选择
+    ///
+    /// 返回真实 API 端点的 HttpPeer
+    async fn handle_api_proxy_upstream(
+        &self,
+        params: Params<'_, '_>,
+    ) -> PingoraResult<Box<HttpPeer>> {
+        // 1. 提取服务名称
+        let service_name = params.get("service_name").ok_or_else(|| {
+            error!("API 代理路由缺少 service_name 参数");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        // 2. 从 ApiKeyManager 查询 API 配置
+        let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
+            warn!("找不到服务 {} 的 API 密钥配置", service_name);
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+                .more_context(format!("找不到服务 {} 的 API 密钥配置", service_name))
+        })?;
+
+        let config = api_config.value();
+        let base_url = &config.base_url;
+
+        // 3. 解析真实 API 端点的 host 和 port
+        // 支持 https://api.anthropic.com 和 https://api.openai.com:443 格式
+        let (host, port, use_tls) = if let Some(https_url) = base_url.strip_prefix("https://") {
+            let host_part = https_url.split('/').next().unwrap_or(https_url);
+            if let Some(port_str) = host_part.split(':').nth(1) {
+                let port = port_str.parse::<u16>().unwrap_or(443);
+                let host = host_part.split(':').next().unwrap_or(host_part);
+                (host, port, true)
+            } else {
+                (host_part, 443, true)
+            }
+        } else if let Some(http_url) = base_url.strip_prefix("http://") {
+            let host_part = http_url.split('/').next().unwrap_or(http_url);
+            if let Some(port_str) = host_part.split(':').nth(1) {
+                let port = port_str.parse::<u16>().unwrap_or(80);
+                let host = host_part.split(':').next().unwrap_or(host_part);
+                (host, port, false)
+            } else {
+                (host_part, 80, false)
+            }
+        } else {
+            return Err(
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+                    .more_context(format!("无效的 base_url 格式: {}", base_url)),
+            );
+        };
+
+        // 4. 记录指标
+        self.metrics.record_request();
+        self.metrics.inc_active();
+
+        info!(
+            "🔗 [API_PROXY] {} -> {}:{} (TLS: {})",
+            service_name, host, port, use_tls
+        );
+
+        // 5. 创建真实 API 端点的 HttpPeer
+        // 注意：SNI 必须设置为目标主机名，否则 TLS 握手会失败
+        // 同时需要启用 HTTP/2 支持，因为很多 API 服务（如 open.bigmodel.cn）强制使用 HTTP/2
+        let mut peer = HttpPeer::new(
+            (host, port),
+            use_tls,           // 根据协议决定是否使用 TLS
+            host.to_string(),  // SNI 必须设置为目标主机名
+        );
+        // 启用 HTTP/2 支持，优先 H2，兼容 H1
+        peer.options.alpn = ALPN::H2H1;
+        let peer = Box::new(peer);
+
+        Ok(peer)
+    }
+
     /// 获取后端主机地址
     async fn get_backend_host(&self, port: u16) -> PingoraResult<String> {
         let backends = self.backends.read().await;
@@ -576,7 +790,7 @@ impl PortProxy {
         // 保存 VNC 目标 IP 到上下文（用于响应过滤）
         ctx.vnc_target_ip = Some(container_ip.clone());
 
-        info!(
+        debug!(
             "VNC 代理: user_id={}, project_id={} -> {}:{}",
             user_id, project_id, container_ip, NOVNC_PORT
         );
@@ -654,12 +868,25 @@ impl PingoraProxyService {
             metrics: Arc::new(ProxyMetrics::default()),
             health_map: Arc::new(RwLock::new(HashMap::new())),
             vnc_backends: Arc::new(DashMap::new()),
+            api_key_manager: Arc::new(DashMap::new()),
         }
     }
 
     /// 设置负载均衡算法
     pub fn with_load_balancing(mut self, use_round_robin: bool) -> Self {
         self.use_round_robin = use_round_robin;
+        self
+    }
+
+    /// 设置共享的 API 密钥管理器
+    ///
+    /// 这个方法允许从外部传入一个共享的 DashMap，使 agent_runner 和 Pingora
+    /// 能够共享 API 密钥配置。
+    pub fn with_api_key_manager(
+        mut self,
+        api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
+    ) -> Self {
+        self.api_key_manager = api_key_manager;
         self
     }
 
@@ -676,6 +903,7 @@ impl PingoraProxyService {
             metrics: self.metrics.clone(),
             vnc_backends: self.vnc_backends.clone(),
             router,
+            api_key_manager: self.api_key_manager.clone(),
         }
     }
 
@@ -883,6 +1111,29 @@ impl PingoraProxyService {
     pub fn vnc_backend_count(&self) -> usize {
         self.vnc_backends.len()
     }
+
+    // ========================================================================
+    // 🔒 API 密钥管理方法
+    // ========================================================================
+
+    /// 设置 API 密钥管理器（用于共享 DashMap）
+    ///
+    /// 这个方法允许从外部传入一个共享的 DashMap，使 agent_runner 和 Pingora
+    /// 能够共享 API 密钥配置。
+    pub fn set_api_key_manager(&self, api_key_manager: Arc<DashMap<String, ModelProviderConfig>>) {
+        // 由于 DashMap 使用 Arc，我们可以通过修改内部实现来替换
+        // 注意：这里需要使用 unsafe 或者重新设计架构
+        // 简单起见，我们直接插入所有现有配置到新的 DashMap
+        for entry in self.api_key_manager.iter() {
+            let (key, value) = (entry.key().clone(), entry.value().clone());
+            api_key_manager.insert(key, value);
+        }
+    }
+
+    /// 获取 API 密钥管理器的引用（用于共享）
+    pub fn get_api_key_manager(&self) -> Arc<DashMap<String, ModelProviderConfig>> {
+        self.api_key_manager.clone()
+    }
 }
 
 impl Clone for PingoraProxyService {
@@ -894,6 +1145,7 @@ impl Clone for PingoraProxyService {
             metrics: self.metrics.clone(),
             health_map: self.health_map.clone(),
             vnc_backends: self.vnc_backends.clone(),
+            api_key_manager: self.api_key_manager.clone(),
         }
     }
 }

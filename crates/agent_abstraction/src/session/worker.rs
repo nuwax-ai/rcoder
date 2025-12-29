@@ -7,6 +7,7 @@ use std::{path::PathBuf, sync::Arc};
 use agent_client_protocol::{ContentBlock, PromptRequest};
 use anyhow::Result;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use shared_types::{AgentLifecycle, CancelNotificationRequestWrapper, ModelProviderConfig, ServiceType};
 use tokio::sync::mpsc;
 
@@ -22,6 +23,10 @@ pub struct WorkerRequest {
     /// 预处理的附件内容块
     /// 由 agent_runner 使用 ContentBuilder 预处理
     pub attachment_blocks: Option<Vec<ContentBlock>>,
+    /// 🔥 关联的 service UUID（用于 API 密钥管理）
+    pub service_uuid: Option<String>,
+    /// 🔥 共享的 API 密钥管理器（用于自动清理）
+    pub shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
 }
 
 impl WorkerRequest {
@@ -31,7 +36,21 @@ impl WorkerRequest {
             prompt_message,
             model_provider,
             attachment_blocks: None,
+            service_uuid: None,
+            shared_api_key_manager: None,
         }
+    }
+
+    /// 设置 service_uuid
+    pub fn with_service_uuid(mut self, service_uuid: Option<String>) -> Self {
+        self.service_uuid = service_uuid;
+        self
+    }
+
+    /// 设置 shared_api_key_manager
+    pub fn with_key_manager(mut self, key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>) -> Self {
+        self.shared_api_key_manager = key_manager;
+        self
     }
 
     /// 获取项目 ID

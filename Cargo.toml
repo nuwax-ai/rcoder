@@ -188,11 +188,11 @@ ringbuf = "0.4.8"
 
 diffy = { version = "0.4.2" }
 
-pingora = { version = "0.6", features = ["lb"] }
-pingora-core = "0.6"
+pingora = { version = "0.6", features = ["lb", "rustls"] }
+pingora-core = { version = "0.6", features = ["rustls"] }
 pingora-http = "0.6"
-pingora-proxy = "0.6"
-pingora-load-balancing = "0.6"
+pingora-proxy = { version = "0.6", features = ["rustls"] }
+pingora-load-balancing = { version = "0.6", features = ["rustls"] }
 matchit = "0.9"
 structopt = "0.3"
 

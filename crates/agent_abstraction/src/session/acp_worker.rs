@@ -156,6 +156,8 @@ where
                 request.model_provider.clone(),
                 start_config.clone(),
                 client,
+                request.shared_api_key_manager.clone(),
+                request.service_uuid.clone(),
             )
             .await
             .map_err(|e| {
