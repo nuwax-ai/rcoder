@@ -80,11 +80,33 @@ RUN mkdir -p /etc/pip && \
     echo "✅ pip 镜像源配置完成: https://mirrors.aliyun.com/pypi/simple/"
 
 # ============================================================================
+# 📦 安装常用 Python 数据科学库 (系统级，所有用户可用)
+# ============================================================================
+# 使用 --break-system-packages 绕过 Debian 12 的 PEP 668 限制
+RUN pip3 install --break-system-packages \
+    numpy \
+    pandas \
+    scipy \
+    matplotlib \
+    openpyxl \
+    python-docx \
+    PyMuPDF \
+    xlrd \
+    xlwt \
+    seaborn \
+    requests \
+    BeautifulSoup4 \
+    lxml && \
+    echo "✅ Python 数据科学库安装完成" && \
+    echo "已安装的包:" && \
+    pip3 list | grep -E '(numpy|pandas|scipy|matplotlib|openpyxl|python-docx|PyMuPDF|xlrd|xlwt|seaborn|requests|BeautifulSoup|lxml)'
+
+# ============================================================================
 # 📺 noVNC 远程桌面客户端(based on official v1.6.0, with customized vnc.html):
 # ============================================================================
-# 自动生成时间戳强制重新克隆 noVNC，每次构建都会获取最新版本
-RUN CACHEBUST_NOVNC=$(date +%s) && \
-    echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
+# 使用 SOURCE_DATE_EPOCH 强制打破缓存
+# 每次构建都会重新克隆 noVNC（时间戳不同）
+RUN echo "noVNC cache bust: ${SOURCE_DATE_EPOCH}" && \
     git clone --depth 1 -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
     cd /opt/noVNC && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
@@ -311,7 +333,7 @@ RUN mkdir -p /home/user/.config/Code/User
 COPY ./settings.json /home/user/.config/Code/User/settings.json
 
 # Copy desktop background for XFCE
-COPY ./wallpaper.png /usr/share/backgrounds/xfce/wallpaper.png
+COPY ./wallpaper.jpeg /usr/share/backgrounds/xfce/wallpaper.jpeg
 # Copy xfce4-desktop.xml to system-level config
 RUN mkdir -p /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/
 COPY ./xfce4-desktop.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml

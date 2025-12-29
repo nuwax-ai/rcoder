@@ -800,7 +800,7 @@ function apply_xfce_wallpaper() {
         fi
     done
 
-    local WALLPAPER_PATH="/usr/share/backgrounds/xfce/wallpaper.png"
+    local WALLPAPER_PATH="/usr/share/backgrounds/xfce/wallpaper.jpeg"
     if [ ! -f "$WALLPAPER_PATH" ]; then
         log_warn " Wallpaper not found: $WALLPAPER_PATH"
         return 1
