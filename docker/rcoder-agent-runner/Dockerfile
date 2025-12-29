@@ -104,9 +104,9 @@ RUN pip3 install --break-system-packages \
 # ============================================================================
 # 📺 noVNC 远程桌面客户端(based on official v1.6.0, with customized vnc.html):
 # ============================================================================
-# 使用 SOURCE_DATE_EPOCH 强制打破缓存
-# 每次构建都会重新克隆 noVNC（时间戳不同）
-RUN echo "noVNC cache bust: ${SOURCE_DATE_EPOCH}" && \
+# 添加构建参数以强制打破缓存（每次构建时传入不同的 CACHEBUST_NOVNC）
+ARG CACHEBUST_NOVNC=1
+RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
     git clone --depth 1 -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
     cd /opt/noVNC && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
