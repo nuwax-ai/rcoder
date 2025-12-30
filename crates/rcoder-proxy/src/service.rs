@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use shared_types::ModelProviderConfig;
 
 // Pingora 相关导入
+use pingora_core::protocols::Digest;
 use pingora_core::protocols::TcpKeepalive;
 use pingora_core::upstreams::peer::{HttpPeer, ALPN};
 use pingora_core::Result as PingoraResult;
@@ -284,6 +285,14 @@ pub struct TrackingCtx {
     pub target_port: Option<u16>,
     /// VNC 目标 IP（用于 VNC WebSocket 代理）
     pub vnc_target_ip: Option<String>,
+    /// 上游目标主机（用于日志）
+    pub upstream_host: Option<String>,
+    /// 是否使用 TLS
+    pub use_tls: bool,
+    /// 连接协议（HTTP/1.1 或 HTTP/2）
+    pub http_version: Option<String>,
+    /// 连接是否被重用
+    pub connection_reused: bool,
 }
 
 impl Default for TrackingCtx {
@@ -298,6 +307,10 @@ impl TrackingCtx {
             start: std::time::Instant::now(),
             target_port: None,
             vnc_target_ip: None,
+            upstream_host: None,
+            use_tls: false,
+            http_version: None,
+            connection_reused: false,
         }
     }
 }
@@ -438,9 +451,51 @@ impl ProxyHttp for PortProxy {
             }
             RouteType::ApiProxy => {
                 // 🔒 API 代理：返回真实 API 端点的 peer
-                self.handle_api_proxy_upstream(matched.params).await
+                self.handle_api_proxy_upstream(ctx, matched.params).await
             }
         }
+    }
+
+    /// 连接到上游后的回调
+    ///
+    /// 用于记录连接协议信息（HTTP/1.1 或 HTTP/2）
+    /// 注意: http_version 显示的是 ALPN 配置偏好，实际协商结果可在 Pingora 底层日志查看
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        reused: bool,
+        peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        digest: Option<&Digest>,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<()> {
+        // 记录连接是否被重用
+        ctx.connection_reused = reused;
+
+        // 根据 peer 的 ALPN 配置推断协议
+        let alpn_str = match peer.options.alpn {
+            ALPN::H2 => "HTTP/2 (H2)",
+            ALPN::H2H1 => "HTTP/2 优先 (H2H1)",
+            ALPN::H1 => "HTTP/1.1 (H1)",
+        };
+        ctx.http_version = Some(alpn_str.to_string());
+
+        // 获取 TLS 版本信息
+        let tls_info = digest
+            .and_then(|d| d.ssl_digest.as_ref())
+            .map(|ssl| format!("TLS {}", ssl.version))
+            .unwrap_or_else(|| "无 TLS".to_string());
+
+        // 只在 API 代理场景打印详细日志
+        if ctx.upstream_host.is_some() {
+            debug!(
+                "🔌 [API_PROXY] 连接建立: ALPN={}, {}, 复用={}",
+                alpn_str, tls_info, reused
+            );
+        }
+
+        Ok(())
     }
 
     /// 处理上游响应
@@ -471,6 +526,19 @@ impl ProxyHttp for PortProxy {
             debug!(
                 "VNC 响应: {} (耗时: {:?})",
                 upstream_response.status, duration
+            );
+        } else if let Some(upstream_host) = &ctx.upstream_host {
+            // 🔗 API 代理响应: 打印协议版本
+            let http_ver = ctx.http_version.as_deref().unwrap_or("unknown");
+            let reused = if ctx.connection_reused { "是" } else { "否" };
+            debug!(
+                "📡 [API_PROXY] 上游响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
+                upstream_host,
+                upstream_response.status,
+                http_ver,
+                ctx.use_tls,
+                reused,
+                duration
             );
         } else {
             debug!("收到上游响应: {}", upstream_response.status);
@@ -742,6 +810,7 @@ impl PortProxy {
     /// 返回真实 API 端点的 HttpPeer
     async fn handle_api_proxy_upstream(
         &self,
+        ctx: &mut TrackingCtx,
         params: Params<'_, '_>,
     ) -> PingoraResult<Box<HttpPeer>> {
         // 1. 提取服务名称
@@ -791,8 +860,12 @@ impl PortProxy {
         self.metrics.record_request();
         self.metrics.inc_active();
 
+        // 4.1 记录上游信息到 ctx（用于 response_filter 打印协议）
+        ctx.upstream_host = Some(format!("{}:{}", host, port));
+        ctx.use_tls = use_tls;
+
         info!(
-            "🔗 [API_PROXY] {} -> {}:{} (TLS: {})",
+            "🔗 [API_PROXY] {} -> {}:{} (TLS: {}, ALPN: H2H1)",
             service_name, host, port, use_tls
         );
 

@@ -5,10 +5,10 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
+use pingora_core::protocols::Digest;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -137,7 +137,7 @@ struct ProxyServiceWrapper {
 impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
     type CTX = crate::service::TrackingCtx;
 
-    fn new_ctx(&self) -> Self::CTX { crate::service::TrackingCtx { start: Instant::now(), target_port: None, vnc_target_ip: None } }
+    fn new_ctx(&self) -> Self::CTX { crate::service::TrackingCtx::new() }
 
     async fn upstream_peer(
         &self,
@@ -157,6 +157,32 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
         // 委托给内部的 PortProxy 实现
         self.inner
             .upstream_request_filter(session, upstream_request, ctx)
+            .await
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        session: &mut pingora_proxy::Session,
+        reused: bool,
+        peer: &HttpPeer,
+        #[cfg(unix)] fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] sock: std::os::windows::io::RawSocket,
+        digest: Option<&Digest>,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<()> {
+        // 委托给内部的 PortProxy 实现
+        self.inner
+            .connected_to_upstream(
+                session,
+                reused,
+                peer,
+                #[cfg(unix)]
+                fd,
+                #[cfg(windows)]
+                sock,
+                digest,
+                ctx,
+            )
             .await
     }
 
