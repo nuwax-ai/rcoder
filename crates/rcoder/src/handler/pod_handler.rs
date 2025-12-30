@@ -758,19 +758,57 @@ pub async fn pod_ensure(
         }
     } else {
         // 获取现有容器的完整信息
-        let info = docker_manager
-            .get_agent_info(&request.user_id)
-            .await
-            .map_err(|e| {
-                error!("❌ [POD_ENSURE] 获取容器完整信息失败: {}", e);
-                AppError::internal_server_error(&format!("获取容器完整信息失败: {}", e))
-            })?
-            .ok_or_else(|| {
-                error!("❌ [POD_ENSURE] 容器信息不完整");
-                AppError::internal_server_error("容器信息不完整")
-            })?;
+        match docker_manager.get_agent_info(&request.user_id).await {
+            Ok(Some(info)) => {
+                // 容器信息正常获取
+                (info, false)
+            }
+            Ok(None) => {
+                // 容器信息不存在（可能被外部删除），尝试重新创建
+                warn!(
+                    "⚠️ [POD_ENSURE] 容器信息丢失，尝试重新创建: user_id={}",
+                    request.user_id
+                );
 
-        (info, false)
+                let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
+                    memory_limit: limits.memory,
+                    cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
+                    swap_limit: None,
+                });
+
+                match ComputerContainerManager::get_or_create_container_for_user(
+                    &request.user_id,
+                    resource_limits,
+                )
+                .await
+                {
+                    Ok(info) => {
+                        info!(
+                            "✅ [POD_ENSURE] 容器重新创建成功: container_id={}",
+                            info.container_id
+                        );
+                        (info, true)
+                    }
+                    Err(e) => {
+                        error!(
+                            "❌ [POD_ENSURE] 容器重新创建失败: user_id={}, error={}",
+                            request.user_id, e
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "❌ [POD_ENSURE] 获取容器完整信息失败: user_id={}, error={}",
+                    request.user_id, e
+                );
+                return Err(AppError::internal_server_error(&format!(
+                    "获取容器完整信息失败: {}",
+                    e
+                )));
+            }
+        }
     };
 
     // 4. 🆕 如果是新创建的容器，立即同步 VNC 后端映射
