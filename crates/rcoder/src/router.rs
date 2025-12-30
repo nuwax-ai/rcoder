@@ -30,7 +30,7 @@ pub struct AppState {
     /// 项目适配器 - 统一管理项目、会话和容器数据（替代原有的 3 个 DashMap）
     pub projects: ProjectAdapter,
     /// Pingora 代理服务引用（用于读取真实指标）
-    pub pingora_service: Option<Arc<pingora_proxy::PingoraProxyService>>,
+    pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
 }
@@ -38,7 +38,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         config: AppConfig,
-        pingora: Option<Arc<pingora_proxy::PingoraProxyService>>,
+        pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     ) -> Self {
         Self {
             config,

@@ -1131,6 +1131,102 @@ impl AgentCleaner {
         Ok(status.is_active || status.active_tasks > 0)
     }
 
+    /// 🧹 清理旧的容器日志目录
+    ///
+    /// 清理 /app/logs/container/ 下超过 7 天的时间戳目录
+    /// 每个目录格式为: {container_name}-{timestamp}
+    async fn cleanup_old_log_directories(&self) -> u64 {
+        let log_base_dir = std::path::Path::new("/app/logs/container");
+
+        if !log_base_dir.exists() {
+            debug!(
+                "📭 [log-cleanup] 日志目录不存在，跳过清理: {:?}",
+                log_base_dir
+            );
+            return 0;
+        }
+
+        info!(
+            "🧹 [log-cleanup] 开始清理旧的容器日志目录: {:?}",
+            log_base_dir
+        );
+
+        let retention_days = 7;
+        let cutoff_time =
+            std::time::SystemTime::now() - Duration::from_secs(retention_days * 24 * 60 * 60);
+        let mut cleaned_count = 0;
+
+        // 读取目录
+        let entries = match std::fs::read_dir(log_base_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    "⚠️ [log-cleanup] 无法读取日志目录: {:?} - {}",
+                    log_base_dir, e
+                );
+                return 0;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("⚠️ [log-cleanup] 读取目录项失败: {}", e);
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            // 只处理目录
+            if !path.is_dir() {
+                continue;
+            }
+
+            // 检查目录的修改时间
+            let metadata = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("⚠️ [log-cleanup] 无法读取元数据: {:?} - {}", path, e);
+                    continue;
+                }
+            };
+
+            let modified_time = match metadata.modified() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("⚠️ [log-cleanup] 无法读取修改时间: {:?} - {}", path, e);
+                    continue;
+                }
+            };
+
+            // 如果目录超过保留天数，删除它
+            if modified_time < cutoff_time {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(_) => {
+                        info!("🗑️ [log-cleanup] 已删除旧日志目录: {:?}", path);
+                        cleaned_count += 1;
+                    }
+                    Err(e) => {
+                        warn!("❌ [log-cleanup] 删除日志目录失败: {:?} - {}", path, e);
+                    }
+                }
+            }
+        }
+
+        if cleaned_count > 0 {
+            info!(
+                "✅ [log-cleanup] 日志目录清理完成: 删除 {} 个目录",
+                cleaned_count
+            );
+        } else {
+            debug!("✅ [log-cleanup] 没有发现需要清理的旧日志目录");
+        }
+
+        cleaned_count
+    }
+
     /// 运行清理任务 - 简化版，只做定时清理
     pub async fn run(&mut self) {
         info!("清理任务已启动，配置: {:?}", self.config);
@@ -1155,6 +1251,22 @@ impl AgentCleaner {
                     warn!(
                         "定时清理超时，耗时超过{}秒，强制结束",
                         cleanup_timeout.as_secs()
+                    );
+                }
+            }
+
+            // 🧹 清理旧的容器日志目录（固定保留 7 天）
+            let log_cleanup_timeout = Duration::from_secs(30); // 30秒超时
+            match timeout(log_cleanup_timeout, self.cleanup_old_log_directories()).await {
+                Ok(cleaned_count) => {
+                    if cleaned_count > 0 {
+                        info!("🧹 [log-cleanup] 清理了 {} 个旧日志目录", cleaned_count);
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        "⏰ [log-cleanup] 日志目录清理超时，耗时超过 {} 秒",
+                        log_cleanup_timeout.as_secs()
                     );
                 }
             }

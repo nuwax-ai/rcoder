@@ -1,10 +1,10 @@
 [package]
-name = "pingora-proxy"
+name = "rcoder-proxy"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
-name = "pingora_proxy"
+name = "rcoder_proxy"
 path = "src/lib.rs"
 
 [dependencies]
@@ -30,6 +30,9 @@ async-trait = { workspace = true }
 
 # HTTP client for fallback
 reqwest = { workspace = true }
+
+# URL parsing for masking
+url = { workspace = true }
 
 # Shared types for API config
 shared_types = { path = "../shared_types" }

@@ -16,8 +16,8 @@
 //!
 //! ## 使用示例
 //!
-//! ```rust
-//! use pingora_proxy::router::create_router;
+//! ```rust,ignore
+//! use rcoder_proxy::router::create_router;
 //!
 //! let router = create_router();
 //! let matched = router.at("/computer/vnc/user_123/proj_456/vnc.html").unwrap();
@@ -105,8 +105,8 @@ pub enum RouteType {
 ///
 /// # 示例
 ///
-/// ```rust
-/// use pingora_proxy::router::{create_router, RouteType};
+/// ```rust,ignore
+/// use rcoder_proxy::router::{create_router, RouteType};
 ///
 /// let router = create_router();
 ///

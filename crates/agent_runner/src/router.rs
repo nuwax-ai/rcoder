@@ -34,7 +34,7 @@ pub struct AppState {
     pub local_task_sender: mpsc::UnboundedSender<LocalSetAgentRequest>,
 
     /// Pingora 代理服务引用（用于读取真实指标）
-    pub pingora_service: Option<Arc<pingora_proxy::PingoraProxyService>>,
+    pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
 
     /// 🔒 API 密钥管理器（用于 Pingora 代理注入真实密钥）
     /// 注意：此现在是 shared_api_key_manager 的包装器

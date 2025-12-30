@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use shared_types::ModelProviderConfig;
 
 // Pingora 相关导入
+use pingora_core::protocols::TcpKeepalive;
 use pingora_core::upstreams::peer::{HttpPeer, ALPN};
 use pingora_core::Result as PingoraResult;
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -64,6 +65,68 @@ pub struct PortSnapshot {
     pub successes: u64,
     pub failures: u64,
     pub total_response_time_ns: u64,
+}
+
+/// 对 URL 进行脱敏处理，隐藏域名中间部分
+///
+/// # 示例
+/// - `https://anthropic-code-api.nuwax.com/api/...` -> `https://ant***ax.com/api/...`
+/// - `https://api.openai.com/v1/chat` -> `https://api***ai.com/v1/chat`
+fn mask_url(url: &str) -> String {
+    // 尝试解析 URL
+    if let Ok(parsed_url) = url::Url::parse(url) {
+        if let Some(host) = parsed_url.host_str() {
+            let masked_host = mask_domain(host);
+            // 重新构建 URL，保留协议、端口、路径等
+            let scheme = parsed_url.scheme();
+            let port = parsed_url
+                .port()
+                .map(|p| format!(":{}", p))
+                .unwrap_or_default();
+            let path = parsed_url.path();
+            let query = parsed_url
+                .query()
+                .map(|q| format!("?{}", q))
+                .unwrap_or_default();
+            return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
+        }
+    }
+
+    // 如果解析失败，直接返回原始 URL（不应该发生）
+    url.to_string()
+}
+
+/// 对域名进行脱敏处理
+///
+/// # 规则
+/// - 保留前 3 个字符和后 6 个字符（包括顶级域名）
+/// - 中间部分用 `***` 替代
+///
+/// # 示例
+/// - `anthropic-code-api.nuwax.com` -> `ant***ax.com`
+/// - `api.openai.com` -> `api***ai.com`
+/// - `localhost` -> `loc***ost` (短域名)
+fn mask_domain(domain: &str) -> String {
+    // 使用字符而非字节处理，避免 Unicode 边界问题
+    let chars: Vec<char> = domain.chars().collect();
+    let len = chars.len();
+
+    // 如果域名太短（小于等于 6 个字符），不脱敏
+    if len <= 6 {
+        return domain.to_string();
+    }
+
+    // 如果域名较短（小于等于 10 个字符），保留首尾各 3 个字符
+    if len <= 10 {
+        let prefix: String = chars[..3].iter().collect();
+        let suffix: String = chars[len - 3..].iter().collect();
+        return format!("{}***{}", prefix, suffix);
+    }
+
+    // 正常情况：保留前 3 个字符和后 6 个字符
+    let prefix: String = chars[..3].iter().collect();
+    let suffix: String = chars[len - 6..].iter().collect();
+    format!("{}***{}", prefix, suffix)
 }
 
 pub struct ProxyMetrics {
@@ -595,10 +658,12 @@ impl PortProxy {
         // Anthropic 协议使用 x-api-key，OpenAI 协议使用 Authorization: Bearer
         // 🔧 优先根据 api_protocol 判断，而不是 requires_openai_auth
 
-        // 添加调试日志
+        // 添加调试日志（脱敏 URL）
         debug!(
             "🔑 [API_PROXY] 认证配置: api_protocol={:?}, requires_openai_auth={}, base_url={}",
-            config.api_protocol, config.requires_openai_auth, base_url
+            config.api_protocol,
+            config.requires_openai_auth,
+            mask_url(base_url)
         );
 
         // 判断使用哪种认证格式
@@ -607,17 +672,23 @@ impl PortProxy {
             .as_ref()
             .map(|p| {
                 let protocol = p.to_lowercase();
-                protocol != "openai"  // 不是 openai 就用 Anthropic 格式
+                protocol != "openai" // 不是 openai 就用 Anthropic 格式
             })
             .unwrap_or(!config.requires_openai_auth);
 
         if use_anthropic_auth {
             upstream_request.insert_header("x-api-key", &config.api_key)?;
-            debug!("🔑 已注入 Anthropic 格式的 x-api-key (api_protocol={:?})", config.api_protocol);
+            debug!(
+                "🔑 已注入 Anthropic 格式的 x-api-key (api_protocol={:?})",
+                config.api_protocol
+            );
         } else {
             upstream_request
                 .insert_header("authorization", &format!("Bearer {}", config.api_key))?;
-            debug!("🔑 已注入 OpenAI 格式的 Authorization Bearer token (api_protocol={:?})", config.api_protocol);
+            debug!(
+                "🔑 已注入 OpenAI 格式的 Authorization Bearer token (api_protocol={:?})",
+                config.api_protocol
+            );
         }
 
         // 6. 重写 URI 到真实 API 端点
@@ -656,7 +727,12 @@ impl PortProxy {
         upstream_request.insert_header("X-API-Proxy", "pingora-proxy")?;
         upstream_request.insert_header("X-Service-Name", service_name)?;
 
-        info!("✅ [API_PROXY] {} 请求已重写到: {}", service_name, base_url);
+        // 对 URL 进行脱敏处理后输出日志
+        let masked_url = mask_url(base_url);
+        info!(
+            "✅ [API_PROXY] {} 请求已重写到: {}",
+            service_name, masked_url
+        );
 
         Ok(())
     }
@@ -725,11 +801,29 @@ impl PortProxy {
         // 同时需要启用 HTTP/2 支持，因为很多 API 服务（如 open.bigmodel.cn）强制使用 HTTP/2
         let mut peer = HttpPeer::new(
             (host, port),
-            use_tls,           // 根据协议决定是否使用 TLS
-            host.to_string(),  // SNI 必须设置为目标主机名
+            use_tls,          // 根据协议决定是否使用 TLS
+            host.to_string(), // SNI 必须设置为目标主机名
         );
         // 启用 HTTP/2 支持，优先 H2，兼容 H1
         peer.options.alpn = ALPN::H2H1;
+
+        // 🔧 上游连接健康检测配置
+        // HTTP/2 PING 心跳: 每 30 秒发送 PING 帧检测上游连接健康
+        peer.options.h2_ping_interval = Some(Duration::from_secs(30));
+        // TCP Keepalive: 操作系统级别的连接保活，适用于 HTTP/1.1 后备
+        peer.options.tcp_keepalive = Some(TcpKeepalive {
+            idle: Duration::from_secs(60),    // 60 秒无数据后开始探测
+            interval: Duration::from_secs(5), // 每 5 秒探测一次
+            count: 5,                         // 5 次失败后认为断开
+            #[cfg(target_os = "linux")]
+            user_timeout: Duration::from_secs(85), // Linux: 数据未确认的最大时间
+        });
+        // 连接超时配置
+        peer.options.connection_timeout = Some(Duration::from_secs(10)); // 连接建立超时
+        peer.options.total_connection_timeout = Some(Duration::from_secs(30)); // 含 TLS 握手的总超时
+                                                                               // read_timeout: 不设置，默认 None，适合 AI API 长时间推理
+        peer.options.idle_timeout = Some(Duration::from_secs(90)); // 连接池空闲超时
+
         let peer = Box::new(peer);
 
         Ok(peer)
@@ -1496,5 +1590,55 @@ mod tests {
         // 通过克隆添加后端，原始服务也能看到
         cloned.add_vnc_backend("user_456", "172.17.0.6");
         assert!(service.has_vnc_backend("user_456"));
+    }
+
+    // ========================================================================
+    // URL 脱敏测试
+    // ========================================================================
+
+    #[test]
+    fn test_mask_domain_normal() {
+        // 正常长度域名：保留前 3 后 6 字符
+        assert_eq!(mask_domain("anthropic-code-api.nuwax.com"), "ant***ax.com");
+        assert_eq!(mask_domain("api.openai.com"), "api***ai.com");
+        assert_eq!(mask_domain("open.bigmodel.cn"), "ope***del.cn");
+    }
+
+    #[test]
+    fn test_mask_domain_short() {
+        // 短域名（7-10 字符）：保留前 3 后 3 字符
+        assert_eq!(mask_domain("localhost"), "loc***ost"); // 9 字符
+        assert_eq!(mask_domain("test.com"), "tes***com"); // 8 字符
+    }
+
+    #[test]
+    fn test_mask_domain_very_short() {
+        // 非常短的域名（<=6 字符）：不脱敏
+        assert_eq!(mask_domain("a.com"), "a.com"); // 5 字符
+        assert_eq!(mask_domain("ab.com"), "ab.com"); // 6 字符
+    }
+
+    #[test]
+    fn test_mask_url_https() {
+        let result = mask_url("https://api.openai.com/v1/chat/completions");
+        assert_eq!(result, "https://api***ai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_mask_url_with_port() {
+        let result = mask_url("https://api.example.com:8443/api/v1");
+        assert_eq!(result, "https://api***le.com:8443/api/v1");
+    }
+
+    #[test]
+    fn test_mask_url_with_query() {
+        let result = mask_url("https://api.openai.com/v1/models?key=value");
+        assert_eq!(result, "https://api***ai.com/v1/models?key=value");
+    }
+
+    #[test]
+    fn test_mask_url_http() {
+        let result = mask_url("http://localhost:8080/api");
+        assert_eq!(result, "http://loc***ost:8080/api");
     }
 }

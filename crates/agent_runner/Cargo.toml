@@ -18,7 +18,7 @@ shared_types = { path = "../shared_types" }
 agent_config = { path = "../agent_config" }
 agent_abstraction = { path = "../agent_abstraction" }
 acp-adapter = { path = "../acp_adapter" }
-pingora-proxy = { path = "../pingora-proxy" }
+rcoder-proxy = { path = "../rcoder-proxy" }
 
 clap = { workspace = true }
 # ACP Protocol
