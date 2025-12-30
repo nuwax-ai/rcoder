@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::{IntoParams, ToSchema};
 
+use super::utils::extract_grpc_addr_with_port;
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::vnc_sync::sync_single_vnc_backend;
@@ -1345,6 +1346,234 @@ pub async fn pod_status(
             params.user_id, params.project_id
         ),
     }))
+}
+
+// ============================================================================
+// 接口：VNC 状态查询
+// ============================================================================
+
+/// VNC 状态查询参数
+#[derive(Debug, Clone, Deserialize, IntoParams, ToSchema)]
+pub struct VncStatusQuery {
+    /// 用户唯一标识符（可选，与 project_id 至少填一个）
+    #[param(example = "user_123")]
+    #[schema(example = "user_123")]
+    pub user_id: Option<String>,
+
+    /// 项目唯一标识符（可选，与 user_id 至少填一个）
+    #[param(example = "proj_456")]
+    #[schema(example = "proj_456")]
+    pub project_id: Option<String>,
+}
+
+/// VNC 状态响应
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct VncStatusResponse {
+    /// VNC 是否已就绪
+    #[schema(example = true)]
+    pub vnc_ready: bool,
+
+    /// noVNC 是否已就绪
+    #[schema(example = true)]
+    pub novnc_ready: bool,
+
+    /// 状态描述消息
+    #[schema(example = "VNC 服务已就绪")]
+    pub message: String,
+
+    /// 容器启动时长（秒）
+    #[schema(example = 120)]
+    pub uptime_seconds: i64,
+
+    /// 容器 ID
+    #[schema(example = "abc123def456")]
+    pub container_id: String,
+}
+
+/// 查询容器 VNC 服务状态
+///
+/// 根据 user_id 或 project_id 定位容器，查询 VNC/noVNC 服务是否已启动就绪。
+#[utoipa::path(
+    get,
+    path = "/computer/pod/vnc-status",
+    params(VncStatusQuery),
+    responses(
+        (status = 200, description = "成功获取 VNC 状态", body = HttpResult<VncStatusResponse>),
+        (status = 400, description = "参数无效", body = HttpResult<String>),
+        (status = 404, description = "容器不存在", body = HttpResult<String>),
+        (status = 500, description = "服务器内部错误", body = HttpResult<String>)
+    ),
+    tag = "pod",
+    operation_id = "pod_vnc_status",
+    summary = "查询容器 VNC 服务状态",
+    description = "根据 user_id 或 project_id 定位子容器，查询 VNC/noVNC 服务是否已启动就绪"
+)]
+#[instrument(skip(state))]
+pub async fn pod_vnc_status(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<VncStatusQuery>,
+) -> Result<HttpResult<VncStatusResponse>, AppError> {
+    // 1. 参数验证：user_id 和 project_id 不能同时为空
+    let user_id = params.user_id.as_deref().filter(|s| !s.trim().is_empty());
+    let project_id = params
+        .project_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
+
+    if user_id.is_none() && project_id.is_none() {
+        warn!("⚠️ [POD_VNC_STATUS] user_id 和 project_id 不能同时为空");
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "user_id 和 project_id 不能同时为空",
+        ));
+    }
+
+    info!(
+        "🖥️ [POD_VNC_STATUS] 查询 VNC 状态: user_id={:?}, project_id={:?}",
+        user_id, project_id
+    );
+
+    // 2. 获取 DockerManager
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [POD_VNC_STATUS] 获取 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+        })?;
+
+    // 3. 定位容器
+    // 优先使用 user_id 查找（ComputerAgentRunner 按 user_id 命名）
+    let (lookup_user_id, container_info) = if let Some(uid) = user_id {
+        let container_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
+        let expected_name = format!("{}-{}", container_prefix, uid);
+        (
+            uid,
+            docker_manager.find_container_realtime(&expected_name).await,
+        )
+    } else if let Some(pid) = project_id {
+        // 如果只有 project_id，通过 DuckDB 查找关联的容器
+        if let Some(container_info) = state.projects.get_container_by_user_id(pid) {
+            // project_id 可能实际上是 user_id
+            (
+                pid,
+                docker_manager
+                    .find_container_realtime(&container_info.container_name)
+                    .await,
+            )
+        } else {
+            (pid, Ok(None))
+        }
+    } else {
+        ("", Ok(None))
+    };
+
+    let container_info = container_info.map_err(|e| {
+        error!("❌ [POD_VNC_STATUS] 查询容器失败: {}", e);
+        AppError::internal_server_error(&format!("查询容器失败: {}", e))
+    })?;
+
+    // 4. 检查容器是否存在
+    let (container_id, _container_name, _status, is_running) = match container_info {
+        Some(info) => info,
+        None => {
+            info!(
+                "📭 [POD_VNC_STATUS] 容器不存在: user_id={:?}, project_id={:?}",
+                user_id, project_id
+            );
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                &format!(
+                    "容器不存在: user_id={:?}, project_id={:?}",
+                    user_id, project_id
+                ),
+            ));
+        }
+    };
+
+    // 5. 检查容器是否正在运行
+    if !is_running {
+        info!(
+            "⚠️ [POD_VNC_STATUS] 容器未运行: container_id={}",
+            container_id
+        );
+        return Ok(HttpResult::success(VncStatusResponse {
+            vnc_ready: false,
+            novnc_ready: false,
+            message: "容器未运行".to_string(),
+            uptime_seconds: 0,
+            container_id,
+        }));
+    }
+
+    // 6. 通过 gRPC 调用容器内的 agent_runner 获取 VNC 状态
+    // 使用 get_agent_info 获取服务 URL
+    let agent_info = docker_manager.get_agent_info(lookup_user_id).await;
+
+    let service_url = match agent_info {
+        Ok(Some(info)) => info.service_url,
+        _ => {
+            // 如果无法获取 agent_info，返回错误
+            error!(
+                "❌ [POD_VNC_STATUS] 无法获取容器服务信息: container_id={}",
+                container_id
+            );
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
+                "无法获取容器服务地址",
+            ));
+        }
+    };
+
+    // 7. 建立 gRPC 连接并调用 GetVncStatus
+    // 使用工具函数安全提取 gRPC 地址（自动处理协议前缀和端口）
+    let grpc_addr = extract_grpc_addr_with_port(&service_url, shared_types::GRPC_DEFAULT_PORT)
+        .map_err(|e| {
+            error!("❌ [POD_VNC_STATUS] 提取 gRPC 地址失败: {}", e);
+            AppError::internal_server_error(&format!("提取 gRPC 地址失败: {}", e))
+        })?;
+
+    info!("📡 [POD_VNC_STATUS] 建立 gRPC 连接: addr={}", grpc_addr);
+
+    match state.grpc_pool.get_client(&grpc_addr).await {
+        Ok(mut client) => {
+            let grpc_request = shared_types::grpc::GetVncStatusRequest {
+                user_id: user_id.map(String::from),
+                project_id: project_id.map(String::from),
+            };
+
+            match client.get_vnc_status(grpc_request).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    info!(
+                        "✅ [POD_VNC_STATUS] gRPC 调用成功: vnc_ready={}, novnc_ready={}",
+                        resp.vnc_ready, resp.novnc_ready
+                    );
+
+                    Ok(HttpResult::success(VncStatusResponse {
+                        vnc_ready: resp.vnc_ready,
+                        novnc_ready: resp.novnc_ready,
+                        message: resp.message,
+                        uptime_seconds: resp.uptime_seconds,
+                        container_id,
+                    }))
+                }
+                Err(e) => {
+                    error!("❌ [POD_VNC_STATUS] gRPC 调用失败: {}", e);
+                    Ok(HttpResult::error(
+                        shared_types::error_codes::ERR_GRPC_ERROR,
+                        &format!("gRPC 调用失败: {}", e),
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            error!("❌ [POD_VNC_STATUS] 建立 gRPC 连接失败: {}", e);
+            Ok(HttpResult::error(
+                shared_types::error_codes::ERR_GRPC_ERROR,
+                &format!("建立 gRPC 连接失败: {}", e),
+            ))
+        }
+    }
 }
 
 // ============================================================================

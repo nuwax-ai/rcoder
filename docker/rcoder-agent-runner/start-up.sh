@@ -203,6 +203,13 @@ function wait_for_process_exit() {
 initialize_timezone
 
 # ============================================================================
+# 🧹 清理旧的 VNC 就绪标记文件（容器重启时可能残留）
+# 确保 VNC 状态查询 API 返回准确的状态
+# ============================================================================
+rm -f /tmp/vnc_ready
+log "Cleaned up stale VNC ready marker (if any)"
+
+# ============================================================================
 # 🎯 注意：所有服务均以 root 用户运行
 # ============================================================================
 # 不再需要 UID/GID 匹配，因为 root 用户拥有所有权限
@@ -481,6 +488,37 @@ EOF
     export XAUTHORITY="/tmp/.Xauthority"
 
     log_success "Mesa shader cache configured: /tmp/mesa_shader_cache"
+
+    # ========== 🖼️ 自定义壁纸替换（管理员配置）==========
+    # 该目录由主容器挂载，用户无法直接修改，只有管理员可控制
+    # 使用方法：在 docker-compose.yml 中挂载 - ./assets:/app/assets:ro
+    # 将 wallpaper.jpeg 同时应用到：
+    #   1. XFCE 桌面壁纸: /usr/share/backgrounds/xfce/wallpaper.jpeg
+    #   2. noVNC 网页背景: /opt/noVNC/app/images/bg.jpg
+
+    local CUSTOM_WALLPAPER="/app/assets/wallpaper.jpeg"
+    local XFCE_WALLPAPER="/usr/share/backgrounds/xfce/wallpaper.jpeg"
+    local NOVNC_BG="/opt/noVNC/app/images/bg.jpg"
+
+    if [ -f "$CUSTOM_WALLPAPER" ]; then
+        log "Found custom wallpaper at $CUSTOM_WALLPAPER, applying to XFCE and noVNC..."
+        
+        # 1. 应用到 XFCE 桌面
+        if [ ! -f "${XFCE_WALLPAPER}.original" ]; then
+            cp "$XFCE_WALLPAPER" "${XFCE_WALLPAPER}.original" 2>/dev/null || true
+        fi
+        cp "$CUSTOM_WALLPAPER" "$XFCE_WALLPAPER"
+        log_success "XFCE wallpaper applied: $CUSTOM_WALLPAPER -> $XFCE_WALLPAPER"
+        
+        # 2. 应用到 noVNC 网页背景（同一图片，不同文件名）
+        if [ ! -f "${NOVNC_BG}.original" ]; then
+            cp "$NOVNC_BG" "${NOVNC_BG}.original" 2>/dev/null || true
+        fi
+        cp "$CUSTOM_WALLPAPER" "$NOVNC_BG"
+        log_success "noVNC background applied: $CUSTOM_WALLPAPER -> $NOVNC_BG"
+    else
+        log "No custom wallpaper found at $CUSTOM_WALLPAPER (using defaults)"
+    fi
 }
 
 function start_vnc_services() {
@@ -555,6 +593,9 @@ function start_vnc_services() {
 
 	if [ "$vnc_running" = true ] && [ "$novnc_running" = true ]; then
 		log_success "VNC services started successfully!"
+		# 🆕 写入 VNC 就绪标记（包含启动时间戳），供 VNC 状态查询 API 使用
+		echo "$(date +%s)" > /tmp/vnc_ready
+		log_success "VNC ready marker written to /tmp/vnc_ready"
 		return 0
 	else
 		echo "✗ VNC services failed to start properly"
@@ -1226,14 +1267,18 @@ MCP_PROXY_TIMEOUT=30  # 并行启动后，超时时间从 60s 降至 30s
 
 # 使用 wait_for_port 智能等待端口就绪
 if wait_for_port 127.0.0.1 $MCP_PROXY_PORT $MCP_PROXY_TIMEOUT; then
-    # 端口就绪后，进一步验证 MCP 服务是否真正可用（可选）
-    MCP_TEST_RESULT=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}' | \
-        timeout 5 mcp-proxy convert http://127.0.0.1:$MCP_PROXY_PORT --quiet 2>/dev/null | head -1)
+    # 端口就绪后，使用 curl 发送 JSON-RPC 请求验证 MCP 服务是否真正可用
+    # 注意：mcp-proxy convert 是持续运行的进程会导致 5 秒超时，改用 curl 直接测试 HTTP 端点
+    MCP_TEST_RESULT=$(curl -s --max-time 3 -X POST "http://127.0.0.1:$MCP_PROXY_PORT" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json, text/event-stream" \
+        -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null)
 
-    if echo "$MCP_TEST_RESULT" | grep -q '"result"'; then
+    if echo "$MCP_TEST_RESULT" | grep -q '"tools"'; then
         log_success "MCP Proxy is fully ready on port $MCP_PROXY_PORT"
     else
         log_warn "MCP Proxy port is open but service not fully initialized, continuing anyway"
+        log_warn "Response: $MCP_TEST_RESULT"
     fi
 else
     log_warn "MCP Proxy not ready after ${MCP_PROXY_TIMEOUT}s, starting agent_runner anyway"

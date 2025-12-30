@@ -23,6 +23,10 @@ service AgentService {
   // 查询容器状态 (Unary)
   // 专门用于容器生命周期管理，返回容器活跃状态和任务信息
   rpc GetContainerStatus(GetContainerStatusRequest) returns (GetContainerStatusResponse);
+
+  // 查询 VNC 服务状态 (Unary)
+  // 用于检测容器内 VNC/noVNC 服务是否已启动就绪
+  rpc GetVncStatus(GetVncStatusRequest) returns (GetVncStatusResponse);
 }
 
 // === ChatRequest/Response ===
@@ -297,4 +301,26 @@ message GetContainerStatusResponse {
   optional double cpu_percent = 5;
   // 可选：内存使用（MB）
   optional int64 memory_mb = 6;
+}
+
+// === Get VNC Status ===
+
+// VNC 状态查询请求
+message GetVncStatusRequest {
+  // 用户ID（可选，用于日志记录）
+  optional string user_id = 1;
+  // 项目ID（可选，用于日志记录）
+  optional string project_id = 2;
+}
+
+// VNC 状态响应
+message GetVncStatusResponse {
+  // VNC 是否已就绪（x11vnc 进程 + 5900 端口）
+  bool vnc_ready = 1;
+  // noVNC 是否已就绪（6080 端口）
+  bool novnc_ready = 2;
+  // 状态描述消息
+  string message = 3;
+  // 容器启动时间（秒）
+  int64 uptime_seconds = 4;
 }
