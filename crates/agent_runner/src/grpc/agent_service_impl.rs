@@ -13,9 +13,9 @@ use shared_types::grpc::{
     ChatAgentServerConfig as GrpcChatAgentServerConfig,
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, GetContainerStatusRequest, GetContainerStatusResponse,
-    GetStatusRequest, GetStatusResponse, ModelProviderConfig as GrpcModelProviderConfig,
-    ProgressEvent, ProgressRequest, agent_service_server::AgentService, attachment,
-    attachment_source,
+    GetStatusRequest, GetStatusResponse, GetVncStatusRequest, GetVncStatusResponse,
+    ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent, ProgressRequest,
+    agent_service_server::AgentService, attachment, attachment_source,
 };
 use shared_types::{
     Attachment, AttachmentSource, AudioAttachment, DocumentAttachment, ImageAttachment,
@@ -386,7 +386,12 @@ impl AgentService for AgentServiceImpl {
 
             debug!(
                 "📝 [gRPC] 使用模型配置: provider={}, model={}, base_url={}, api_protocol={:?}, requires_openai_auth={}, service_uuid={}",
-                provider.name, provider.default_model, provider.base_url, provider.api_protocol, provider.requires_openai_auth, service_uuid_ref
+                provider.name,
+                provider.default_model,
+                provider.base_url,
+                provider.api_protocol,
+                provider.requires_openai_auth,
+                service_uuid_ref
             );
 
             // 🔒 存储 ModelProviderConfig 到共享 DashMap（使用 UUID 作为 key）
@@ -1048,12 +1053,9 @@ impl AgentService for AgentServiceImpl {
 
             // 🔒 清理 API 密钥配置（通过 project_id 查找 uuid）
             // 1. 先从 project_uuid_map 获取 uuid
-            if let Some((_, uuid)) = self.app_state.project_uuid_map.remove(&project_id)
-            {
+            if let Some((_, uuid)) = self.app_state.project_uuid_map.remove(&project_id) {
                 // 2. 清理 shared_api_key_manager 中的配置
-                if let Some((key, config)) =
-                    self.app_state.shared_api_key_manager.remove(&uuid)
-                {
+                if let Some((key, config)) = self.app_state.shared_api_key_manager.remove(&uuid) {
                     info!(
                         "🗑️ [gRPC] 已清理 API 密钥配置: uuid={}, provider_name={}",
                         key, config.name
@@ -1422,6 +1424,63 @@ impl AgentService for AgentServiceImpl {
 
         Ok(Response::new(response))
     }
+
+    /// 查询 VNC 服务状态
+    ///
+    /// 检测容器内 VNC/noVNC 服务是否已启动就绪。
+    /// 使用状态标记文件 + 端口检测的双重验证机制。
+    #[instrument(skip(self))]
+    async fn get_vnc_status(
+        &self,
+        request: Request<GetVncStatusRequest>,
+    ) -> Result<Response<GetVncStatusResponse>, Status> {
+        let req = request.into_inner();
+
+        info!(
+            "🖥️ [GET_VNC_STATUS] 收到 VNC 状态查询: user_id={:?}, project_id={:?}",
+            req.user_id, req.project_id
+        );
+
+        // 1. 检查 VNC 就绪标记文件
+        let vnc_ready_file = std::path::Path::new("/tmp/vnc_ready");
+        let file_exists = vnc_ready_file.exists();
+
+        // 2. 检测端口状态（使用 tokio 异步检测）
+        let vnc_port_ready = check_port_available(5900).await;
+        let novnc_port_ready = check_port_available(6080).await;
+
+        // 3. 综合判断：标记文件存在 + 端口可达
+        let vnc_ready = file_exists && vnc_port_ready;
+        let novnc_ready = file_exists && novnc_port_ready;
+
+        // 4. 生成状态消息
+        let message = if vnc_ready && novnc_ready {
+            "VNC 服务已就绪".to_string()
+        } else if file_exists {
+            format!(
+                "VNC 标记存在，但端口检测异常: vnc={}, novnc={}",
+                vnc_port_ready, novnc_port_ready
+            )
+        } else {
+            "VNC 服务未就绪（启动中或启动失败）".to_string()
+        };
+
+        let uptime_seconds = self.get_uptime_seconds();
+
+        let response = GetVncStatusResponse {
+            vnc_ready,
+            novnc_ready,
+            message: message.clone(),
+            uptime_seconds,
+        };
+
+        info!(
+            "✅ [GET_VNC_STATUS] 返回状态: vnc_ready={}, novnc_ready={}, message={}, uptime={}s",
+            response.vnc_ready, response.novnc_ready, response.message, response.uptime_seconds
+        );
+
+        Ok(Response::new(response))
+    }
 }
 
 /// 将 UnifiedSessionMessage 转换为 gRPC ProgressEvent
@@ -1448,5 +1507,22 @@ fn unified_message_to_progress_event(
             .and_then(|v| v.as_str())
             .map(String::from),
         timestamp,
+    }
+}
+
+/// 异步检测端口是否可连接
+///
+/// 使用 tokio TcpStream 尝试连接指定端口，500ms 超时
+async fn check_port_available(port: u16) -> bool {
+    use tokio::net::TcpStream;
+
+    match tokio::time::timeout(
+        Duration::from_millis(500),
+        TcpStream::connect(format!("127.0.0.1:{}", port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        _ => false,
     }
 }

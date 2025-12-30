@@ -387,6 +387,32 @@ pub struct GetContainerStatusResponse {
     #[prost(int64, optional, tag = "6")]
     pub memory_mb: ::core::option::Option<i64>,
 }
+/// VNC 状态查询请求
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetVncStatusRequest {
+    /// 用户ID（可选，用于日志记录）
+    #[prost(string, optional, tag = "1")]
+    pub user_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 项目ID（可选，用于日志记录）
+    #[prost(string, optional, tag = "2")]
+    pub project_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// VNC 状态响应
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetVncStatusResponse {
+    /// VNC 是否已就绪（x11vnc 进程 + 5900 端口）
+    #[prost(bool, tag = "1")]
+    pub vnc_ready: bool,
+    /// noVNC 是否已就绪（6080 端口）
+    #[prost(bool, tag = "2")]
+    pub novnc_ready: bool,
+    /// 状态描述消息
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+    /// 容器启动时间（秒）
+    #[prost(int64, tag = "4")]
+    pub uptime_seconds: i64,
+}
 /// 取消结果类型（对应 Rust CancelResult）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -656,6 +682,32 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("agent.AgentService", "GetContainerStatus"));
             self.inner.unary(req, path, codec).await
         }
+        /// 查询 VNC 服务状态 (Unary)
+        /// 用于检测容器内 VNC/noVNC 服务是否已启动就绪
+        pub async fn get_vnc_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetVncStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetVncStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentService/GetVncStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentService", "GetVncStatus"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -720,6 +772,15 @@ pub mod agent_service_server {
             request: tonic::Request<super::GetContainerStatusRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetContainerStatusResponse>,
+            tonic::Status,
+        >;
+        /// 查询 VNC 服务状态 (Unary)
+        /// 用于检测容器内 VNC/noVNC 服务是否已启动就绪
+        async fn get_vnc_status(
+            &self,
+            request: tonic::Request<super::GetVncStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetVncStatusResponse>,
             tonic::Status,
         >;
     }
@@ -1056,6 +1117,51 @@ pub mod agent_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetContainerStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentService/GetVncStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetVncStatusSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::GetVncStatusRequest>
+                    for GetVncStatusSvc<T> {
+                        type Response = super::GetVncStatusResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetVncStatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::get_vnc_status(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetVncStatusSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

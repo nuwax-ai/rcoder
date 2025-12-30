@@ -158,6 +158,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/computer/pod/keepalive", post(handler::pod_keepalive))
         .route("/computer/pod/restart", post(handler::pod_restart))
         .route("/computer/pod/status", get(handler::pod_status))
+        .route("/computer/pod/vnc-status", get(handler::pod_vnc_status))
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）
@@ -206,13 +207,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::computer_agent_progress_notification,
         handler::computer_desktop_vnc,
         handler::computer_desktop_proxy,
-        // Pod 容器管理接口
         handler::pod_count,
         handler::pod_list,
         handler::pod_ensure,
         handler::pod_keepalive,
         handler::pod_restart,
         handler::pod_status,
+        handler::pod_vnc_status,
         // Pingora 代理接口
         handler::proxy_status,
         handler::proxy_stats,
@@ -277,6 +278,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::RestartPodResponse,
             handler::PodStatusQuery,
             handler::PodStatusResponse,
+            handler::VncStatusQuery,
+            handler::VncStatusResponse,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,
