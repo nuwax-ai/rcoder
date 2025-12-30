@@ -9,7 +9,7 @@ default-members = [
     "crates/shared_types",
     "crates/docker_manager",
     "crates/acp_adapter",
-    "crates/pingora-proxy",
+    "crates/rcoder-proxy",
     "crates/duckdb_manager",
 ]
 

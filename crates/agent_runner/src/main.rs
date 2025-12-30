@@ -22,7 +22,7 @@ mod utils;
 use model::*;
 
 use config::{CliArgs, load_config_with_args};
-use pingora_proxy::{PingoraServerManager, ProxyConfig};
+use rcoder_proxy::{PingoraServerManager, ProxyConfig};
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
 

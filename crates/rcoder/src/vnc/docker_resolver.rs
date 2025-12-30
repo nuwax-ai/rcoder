@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use moka::future::Cache;
-use pingora_proxy::{VncBackendInfo, VncBackendResolver, VncResolveError};
+use rcoder_proxy::{VncBackendInfo, VncBackendResolver, VncResolveError};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 

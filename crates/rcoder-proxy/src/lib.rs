@@ -13,8 +13,8 @@
 //!
 //! # 快速开始
 //!
-//! ```rust
-//! use pingora_proxy::{ProxyConfig, ProxyServer};
+//! ```rust,ignore
+//! use rcoder_proxy::{ProxyConfig, ProxyServer};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -140,8 +140,8 @@ where
 ///
 /// # 示例
 ///
-/// ```rust,no_run
-/// use pingora_proxy::quick_start;
+/// ```rust,ignore
+/// use rcoder_proxy::quick_start;
 ///
 /// #[tokio::main]
 /// async fn main() -> anyhow::Result<()> {

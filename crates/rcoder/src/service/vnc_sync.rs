@@ -6,7 +6,7 @@
 //! - ComputerAgentRunner 模式: 使用 `user_id`
 //! 解决服务重启后 VNC 映射丢失的问题，并支持容器重启后自动更新 IP。
 
-use pingora_proxy::PingoraProxyService;
+use rcoder_proxy::PingoraProxyService;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
