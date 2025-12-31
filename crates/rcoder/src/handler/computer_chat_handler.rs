@@ -265,6 +265,41 @@ pub async fn handle_computer_chat(
                 result.is_success()
             );
 
+            // 🆕 关键修复：实时从 Docker API 获取容器的最新网络信息
+            // 这确保即使内存映射中的信息过时，也能获取到正确的 container_ip
+            let docker_manager = docker_manager::global::get_global_docker_manager()
+                .await
+                .map_err(|e| {
+                    error!("❌ [COMPUTER_CHAT] 获取 DockerManager 失败: {}", e);
+                    AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                })?;
+
+            let container_info = match docker_manager.get_agent_info(&user_id).await {
+                Ok(Some(info)) => {
+                    info!(
+                        "🔄 [COMPUTER_CHAT] 从 Docker API 获取最新容器信息: user_id={}, container_id={}, container_ip={}",
+                        user_id, info.container_id, info.container_ip
+                    );
+                    info
+                }
+                Ok(None) => {
+                    warn!(
+                        "⚠️ [COMPUTER_CHAT] Docker API 未找到容器: user_id={}, 使用缓存的容器信息",
+                        user_id
+                    );
+                    // 使用之前获取的容器信息
+                    container_info.clone()
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [COMPUTER_CHAT] 从 Docker API 获取容器信息失败: user_id={}, error={}, 使用缓存的容器信息",
+                        user_id, e
+                    );
+                    // 使用之前获取的容器信息
+                    container_info.clone()
+                }
+            };
+
             // ComputerAgentRunner 模式：每个 project 独立记录
             // 使用真正的 project_id 作为 map_key，user_id 存储在数据字段中
             let map_key = project_id.clone();

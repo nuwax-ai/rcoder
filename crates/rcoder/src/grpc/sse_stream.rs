@@ -190,8 +190,11 @@ fn create_session_prompt_end_event(session_id: &str) -> axum::response::sse::Eve
                 "⚠️ [gRPC_SSE] 序列化 SessionPromptEnd 消息失败: {}, error={}",
                 session_id, e
             );
-            // 返回最小可用结构，而不是空对象
-            r#"{"session_id":""} "#.to_string()
+            // 返回包含 session_id 的最小可用结构
+            format!(
+                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"end_turn","data":null}}"#,
+                session_id
+            )
         }
     };
 
@@ -244,8 +247,11 @@ fn progress_event_to_sse(
                 "⚠️ [gRPC_SSE] 序列化 ProgressEvent 消息失败: session_id={}, message_type={}, error={}",
                 session_id, event.message_type, e
             );
-            // 返回最小可用结构
-            r#"{"session_id":"","message_type":"Unknown","data":null}"#.to_string()
+            // 返回包含 session_id 的最小可用结构
+            format!(
+                r#"{{"session_id":"{}","message_type":"Unknown","sub_type":"{}","data":null}}"#,
+                session_id, event.sub_type
+            )
         }
     };
 

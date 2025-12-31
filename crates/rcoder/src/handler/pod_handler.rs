@@ -758,7 +758,10 @@ pub async fn pod_ensure(
         }
     } else {
         // 获取现有容器的完整信息
-        match docker_manager.get_agent_info(&request.user_id).await {
+        match docker_manager
+            .get_user_container_info(&request.user_id)
+            .await
+        {
             Ok(Some(info)) => {
                 // 容器信息正常获取
                 (info, false)
@@ -1562,8 +1565,8 @@ pub async fn pod_vnc_status(
     }
 
     // 6. 通过 gRPC 调用容器内的 agent_runner 获取 VNC 状态
-    // 使用 get_agent_info 获取服务 URL
-    let agent_info = docker_manager.get_agent_info(lookup_user_id).await;
+    // 使用 get_user_container_info 获取服务 URL
+    let agent_info = docker_manager.get_user_container_info(lookup_user_id).await;
 
     let service_url = match agent_info {
         Ok(Some(info)) => info.service_url,

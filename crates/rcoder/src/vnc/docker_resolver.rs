@@ -78,9 +78,9 @@ impl CachedDockerResolver {
                 VncResolveError::QueryFailed(format!("获取 DockerManager 失败: {}", e))
             })?;
 
-        // ComputerAgentRunner 模式：user_id 即 project_id（容器标识）
+        // ComputerAgentRunner 模式：使用 user_id 作为容器标识
         let container_info = docker_manager
-            .get_agent_info(user_id)
+            .get_user_container_info(user_id)
             .await
             .map_err(|e| {
                 warn!(

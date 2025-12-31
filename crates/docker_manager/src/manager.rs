@@ -734,7 +734,10 @@ impl DockerManager {
         // 🔒 安全配置：将 API 地址指向本地 Pingora 代理
         // 使用 {SERVICE_UUID} 占位符，UUID 将由 agent_runner 动态注入
         // 这样 Agent 看到的是本地地址，真实密钥由 Pingora 注入
-        builder = builder.env("MODEL_PROVIDER_BASE_URL", "http://localhost:8088/api/{SERVICE_UUID}");
+        builder = builder.env(
+            "MODEL_PROVIDER_BASE_URL",
+            "http://localhost:8088/api/{SERVICE_UUID}",
+        );
         builder = builder.env("MODEL_PROVIDER_API_KEY", "sk-placeholder");
 
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
@@ -1057,6 +1060,88 @@ impl DockerManager {
         Ok(ip_addr)
     }
 
+    // ========================================================================
+    // ComputerAgentRunner 专用接口
+    // ========================================================================
+    //
+    // ComputerAgentRunner 模式与 RCoder 模式不同：
+    // - 容器命名：computer-agent-runner-{user_id}（而非 project_id）
+    // - 一个 user_id 对应一个容器
+    // - 容器内可以运行多个 project_id 的 Agent 实例
+    //
+    // 以下接口专门用于 ComputerAgentRunner 模式，参数名更清晰，
+    // 避免与 RCoder 模式的 project_id 参数混淆。
+
+    /// 获取用户容器信息（ComputerAgentRunner 模式专用）
+    ///
+    /// # Arguments
+    /// * `user_id` - 用户 ID，用作容器标识符
+    ///
+    /// # 说明
+    /// - ComputerAgentRunner 模式下，一个用户对应一个容器
+    /// - 容器命名规则：`computer-agent-runner-{user_id}`
+    /// - 容器内可以运行多个 project_id 的 Agent 实例
+    ///
+    /// # 返回
+    /// 容器信息（如果存在），否则返回 None
+    pub async fn get_user_container_info(
+        &self,
+        user_id: &str,
+    ) -> DockerResult<Option<ContainerBasicInfo>> {
+        // 内部调用 get_agent_info，但参数名更清晰
+        self.get_agent_info(user_id).await
+    }
+
+    /// 查找用户容器（ComputerAgentRunner 模式专用）
+    ///
+    /// # Arguments
+    /// * `user_id` - 用户 ID
+    /// * `service_type` - 服务类型（应该是 ComputerAgentRunner）
+    ///
+    /// # 返回
+    /// 容器信息（如果存在），否则返回 None
+    pub async fn find_user_container(
+        &self,
+        user_id: &str,
+        service_type: &shared_types::ServiceType,
+    ) -> Option<DockerContainerInfo> {
+        // 内部调用 find_agent_container，但参数名更准确
+        self.find_agent_container(user_id, service_type).await
+    }
+
+    /// 通过用户 ID 获取容器 ID（ComputerAgentRunner 模式专用）
+    ///
+    /// # Arguments
+    /// * `user_id` - 用户 ID
+    ///
+    /// # 返回
+    /// 容器 ID（如果存在），否则返回 None
+    pub async fn get_user_container_id(&self, user_id: &str) -> DockerResult<Option<String>> {
+        // 从容器信息中获取 container_id
+        Ok(self
+            .get_container_info(user_id)
+            .await
+            .map(|info| info.container_id))
+    }
+
+    /// 检查用户容器是否存在（ComputerAgentRunner 模式专用）
+    ///
+    /// # Arguments
+    /// * `user_id` - 用户 ID
+    ///
+    /// # 返回
+    /// true 如果容器存在且运行中，否则返回 false
+    pub async fn is_user_container_running(&self, user_id: &str) -> bool {
+        if let Some(container) = self
+            .find_user_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .await
+        {
+            matches!(container.status, ContainerStatus::Running)
+        } else {
+            false
+        }
+    }
+
     /// 检查并更新容器状态
     pub async fn update_container_status(
         &self,
@@ -1182,11 +1267,15 @@ impl DockerManager {
                                 health_checked_count += 1;
 
                                 if health_status.is_fully_healthy() {
-                                    debug!("✅ [SYNC] 服务健康: project_id={}", project_id);
+                                    debug!(
+                                        "✅ [SYNC] 服务健康: container_id={}, service_type={:?}",
+                                        project_id, container_info.service_type
+                                    );
                                 } else {
                                     warn!(
-                                        "⚠️ [SYNC] 服务不健康: project_id={}, http={}, grpc={}, failures={}",
+                                        "⚠️ [SYNC] 服务不健康: container_id={}, service_type={:?}, http={}, grpc={}, failures={}",
                                         project_id,
+                                        container_info.service_type,
                                         health_status.http_healthy,
                                         health_status.grpc_healthy,
                                         health_status.consecutive_failures
