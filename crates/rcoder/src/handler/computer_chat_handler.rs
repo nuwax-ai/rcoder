@@ -658,12 +658,25 @@ fn ensure_project_mapping_in_state(
     request: &ComputerChatRequest,
 ) -> Result<(), AppError> {
     // 检查是否已存在该 project_id 的记录
-    if state.get_project(project_id).is_some() {
-        debug!(
-            "🔄 [COMPUTER_CHAT] DuckDB 记录已存在: project_id={}",
-            project_id
-        );
-        return Ok(());
+    if let Some(existing_project) = state.get_project(project_id) {
+        // 如果记录存在，检查容器ID是否变更
+        if let Some(existing_container) = existing_project.container() {
+            if existing_container.container_id != container_info.container_id {
+                info!(
+                    "🔄 [COMPUTER_CHAT] 检测到容器变更: project_id={}, old_cid={}, new_cid={}",
+                    project_id, existing_container.container_id, container_info.container_id
+                );
+                // 容器变更，继续执行后续的插入/更新逻辑（insert_project 会执行 upsert）
+            } else {
+                debug!(
+                    "🔄 [COMPUTER_CHAT] DuckDB 记录已存在且容器未变: project_id={}",
+                    project_id
+                );
+                return Ok(());
+            }
+        } else {
+            // 现有记录没有容器信息，继续更新
+        }
     }
 
     // 创建新的 ProjectAndContainerInfo
