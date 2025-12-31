@@ -32,7 +32,9 @@ use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerMa
 use docker_manager::ContainerBasicInfo;
 use shared_types::Attachment;
 
-use super::utils::{extract_grpc_addr_with_port, project_dir};
+use super::utils::{
+    extract_grpc_addr_with_port, get_realtime_container_ip_with_cache, project_dir,
+};
 
 /// Computer Agent 聊天请求
 ///
@@ -249,12 +251,61 @@ pub async fn handle_computer_chat(
         );
     }
 
+    // 6.5. 🆕 主动查询 Agent 状态 (User Request)
+    // 在转发请求前，主动查询 Agent 状态，确保状态是最新的。
+    // 这有助于在容器重启后，确认 Agent 是否真正处于空闲状态。
+    {
+        // 💫 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期的问题
+        let grpc_addr_result = async {
+            let container_ip = get_realtime_container_ip_with_cache(
+                &container_info.container_name,
+                &state.container_ip_cache,
+                &container_info.container_ip,
+            )
+            .await
+            .map_err(|e| format!("IP resolution error: {}", e))?;
+
+            Ok::<_, String>(format!(
+                "{}:{}",
+                container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            ))
+        }
+        .await;
+
+        if let Ok(grpc_addr) = grpc_addr_result {
+            debug!("🔍 [COMPUTER_CHAT] 主动查询 Agent 状态: {}", grpc_addr);
+            if let Ok(mut client) = state.grpc_pool.get_client(&grpc_addr).await {
+                let status_req = shared_types::grpc::GetStatusRequest {
+                    project_id: project_id.clone(),
+                    session_id: "".to_string(), // 我们只关心 project 级别的状态
+                };
+
+                match client.get_status(status_req).await {
+                    Ok(resp) => {
+                        let status = resp.into_inner().status;
+                        info!(
+                            "📊 [COMPUTER_CHAT] Agent 当前状态: project_id={}, status={}",
+                            project_id, status
+                        );
+                        // 如果状态是 idle，我们可以更有信心地继续
+                    }
+                    Err(e) => {
+                        warn!("⚠️ [COMPUTER_CHAT] 主动查询 Agent 状态失败: {}", e);
+                        // 查询失败不阻止请求继续，可能是网络波动，让后续的 Chat 请求去处理
+                    }
+                }
+            }
+        }
+    }
+
     // 7. 转发请求到容器服务（使用 gRPC）
     let result = forward_computer_request_to_container(
         &request,
         &project_id,
         &container_info,
         &state.grpc_pool,
+        &state.container_ip_cache,
     )
     .await;
 
@@ -406,6 +457,7 @@ async fn forward_computer_request_to_container(
     project_id: &str,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
+    container_ip_cache: &Arc<crate::grpc::ContainerIpCache>,
 ) -> HttpResult<ChatResponse> {
     info!(
         "📤 [COMPUTER_FORWARD] 转发请求到容器 (gRPC): user_id={}, project_id={}, container_id={}",
@@ -413,17 +465,34 @@ async fn forward_computer_request_to_container(
     );
 
     // 从 service_url 提取 gRPC 地址
-    let grpc_addr = match extract_grpc_addr_with_port(
-        &container_info.service_url,
-        shared_types::GRPC_DEFAULT_PORT,
-    ) {
-        Ok(addr) => addr,
+    // 从 service_url 提取 gRPC 地址
+    // 🆕 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期的问题
+    let grpc_addr = match get_realtime_container_ip_with_cache(
+        &container_info.container_name,
+        container_ip_cache,
+        &container_info.container_ip,
+    )
+    .await
+    {
+        Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
         Err(e) => {
-            error!("❌ [COMPUTER_FORWARD] 提取 gRPC 地址失败: {}", e);
-            return HttpResult::error(
-                shared_types::error_codes::ERR_GRPC_ADDR_ERROR,
-                &format!("提取 gRPC 地址失败: {}", e),
+            warn!(
+                "⚠️ [COMPUTER_FORWARD] 实时 IP 解析失败: {}, 尝试从 service_url 提取",
+                e
             );
+            match extract_grpc_addr_with_port(
+                &container_info.service_url,
+                shared_types::GRPC_DEFAULT_PORT,
+            ) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    error!("❌ [COMPUTER_FORWARD] 提取 gRPC 地址失败: {}", e);
+                    return HttpResult::error(
+                        shared_types::error_codes::ERR_GRPC_ADDR_ERROR,
+                        &format!("提取 gRPC 地址失败: {}", e),
+                    );
+                }
+            }
         }
     };
 

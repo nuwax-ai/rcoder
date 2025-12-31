@@ -4,9 +4,10 @@ pub mod cleanup_task;
 use crate::CancelNotificationRequestWrapper;
 use crate::{
     model::{AgentSessionUpdate, SessionNotify},
-    service::{push_session_update, AGENT_REGISTRY},
+    service::{AGENT_REGISTRY, push_session_update},
 };
-pub use acp_agent::{LocalSetAgentRequest, agent_worker};
+// 导出 agent_worker 相关类型和函数
+pub use acp_agent::{LocalSetAgentRequest, agent_worker, agent_worker_with_heartbeat};
 use agent_abstraction::compat::AgentStopHandleArc;
 use agent_client_protocol::{Client, PermissionOptionKind, PromptRequest, SessionId};
 use dashmap::DashMap;

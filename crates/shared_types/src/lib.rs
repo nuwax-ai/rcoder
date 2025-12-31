@@ -23,6 +23,14 @@ pub mod grpc {
     include!("grpc/agent.rs");
 }
 
+// 导出 URL 脱敏工具函数
+pub mod grpc_mask;
+pub use grpc_mask::mask_url;
+
+// 导出 gRPC 脱敏包装器
+pub mod grpc_wrapper;
+pub use grpc_wrapper::MaskedModelConfig;
+
 pub use model::{
     AgentLifecycle,
     AgentLifecycleGuard,

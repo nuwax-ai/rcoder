@@ -113,6 +113,29 @@ impl ComputerContainerManager {
         Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
     }
 
+    /// 强制为用户创建新容器（跳过检查）
+    ///
+    /// 直接调用内部创建逻辑，用于重启等需要强制重建的场景。
+    /// 调用前应确保旧容器已被移除。
+    pub async fn force_create_container_for_user(
+        user_id: &str,
+        resource_limits: Option<ServiceResourceLimits>,
+    ) -> Result<ContainerBasicInfo, AppError> {
+        info!(
+            "🏗️ [COMPUTER_CONTAINER] 强制创建新用户容器: user_id={}",
+            user_id
+        );
+
+        let docker_manager = docker_manager::global::get_global_docker_manager()
+            .await
+            .map_err(|e| {
+                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
+                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            })?;
+
+        Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
+    }
+
     /// 为用户创建容器
     ///
     /// 内部方法，负责实际的容器创建逻辑。

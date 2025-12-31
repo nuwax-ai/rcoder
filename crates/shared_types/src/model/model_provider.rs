@@ -100,16 +100,19 @@ impl ModelProviderConfig {
     }
 }
 
-/// 实现 Display trait，方便日志打印（自动对 API Key 进行脱敏）
+/// 实现 Display trait，方便日志打印（自动对 API Key 和 URL 进行脱敏）
 impl fmt::Display for ModelProviderConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 对 base_url 进行脱敏（使用 grpc_mask::mask_url）
+        let masked_base_url = crate::grpc_mask::mask_url(&self.base_url);
+
         write!(
             f,
             "{{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}}}",
             self.id,
             self.name,
             self.default_model,
-            self.base_url,
+            masked_base_url,
             self.mask_api_key(),
             self.requires_openai_auth,
             self.api_protocol.as_deref().unwrap_or("None")
@@ -120,6 +123,9 @@ impl fmt::Display for ModelProviderConfig {
 /// 自定义 Debug trait，脱敏敏感信息（与 Display 保持一致的输出格式）
 impl fmt::Debug for ModelProviderConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 对 base_url 进行脱敏
+        let masked_base_url = crate::grpc_mask::mask_url(&self.base_url);
+
         // 使用与 Display 相同的脱敏格式
         write!(
             f,
@@ -127,7 +133,7 @@ impl fmt::Debug for ModelProviderConfig {
             self.id,
             self.name,
             self.default_model,
-            self.base_url,
+            masked_base_url,
             self.mask_api_key(),
             self.requires_openai_auth,
             self.api_protocol.as_deref().unwrap_or("None")
