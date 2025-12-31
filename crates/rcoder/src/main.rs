@@ -13,8 +13,8 @@ use hyper_util::service::TowerToHyperService;
 
 mod config;
 mod handler;
-mod proxy_agent;
 
+mod cleanup_task;
 mod middleware;
 mod router;
 mod service;
@@ -24,7 +24,6 @@ use rcoder::*;
 
 use config::{CliArgs, load_config_with_args};
 use rcoder_proxy::{PingoraServerManager, ProxyConfig};
-use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
 use service::{
     ContainerStatusCheckerConfig, ContainerSyncConfig, VncSyncConfig,
@@ -178,10 +177,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 从配置文件读取清理配置
-    let cleanup_config = CleanupConfig {
+    let cleanup_config = cleanup_task::CleanupConfig {
         idle_timeout: Duration::from_secs(config.cleanup_config.idle_timeout_seconds),
         cleanup_interval: Duration::from_secs(config.cleanup_config.cleanup_interval_seconds),
         docker_stop_timeout: Duration::from_secs(config.cleanup_config.docker_stop_timeout_seconds),
+        container_protection_duration: Duration::from_secs(5 * 60),
+        active_window: Duration::from_secs(5 * 60),
     };
     info!(
         "🧹 清理配置: 闲置超时={}秒, 清理间隔={}秒, Docker停止超时={}秒",
@@ -267,7 +268,12 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState::new(config.clone(), pingora_service_opt));
 
     // 在主异步运行时中启动清理任务
-    let _cleanup_handle = start_cleanup_task(cleanup_config.clone(), state.clone());
+    let cleanup_config_clone = cleanup_config.clone();
+    let state_for_cleanup = state.clone();
+    let _cleanup_handle = tokio::spawn(async move {
+        // 直接使用本地 cleanup_task 模块，避免类型不匹配
+        cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup).await
+    });
 
     // 启动容器状态检查任务（防止长时间任务的容器被误杀）
     // 🆕 使用增强的配置，包含失败计数器和智能跳过机制
