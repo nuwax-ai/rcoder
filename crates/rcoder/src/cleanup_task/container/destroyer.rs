@@ -1,0 +1,65 @@
+//! 容器销毁器
+//!
+//! 销毁容器并清理相关资源（gRPC 连接池、Pingora VNC 后端）
+
+use anyhow::Result;
+use shared_types::ServiceType;
+use std::sync::Arc;
+use tracing::info;
+
+/// 容器销毁器
+pub struct ContainerDestroyer {
+    pub docker_manager: Arc<docker_manager::DockerManager>,
+    pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+}
+
+impl ContainerDestroyer {
+    pub fn new(
+        docker_manager: Arc<docker_manager::DockerManager>,
+        grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+        pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+    ) -> Self {
+        Self {
+            docker_manager,
+            grpc_pool,
+            pingora_service,
+        }
+    }
+
+    /// 销毁容器并清理相关资源
+    ///
+    /// # 参数
+    /// * `container_id` - 容器 ID
+    /// * `service_type` - 服务类型（用于决定是否清理 VNC 后端）
+    /// * `container_identifier` - 容器标识符（project_id 或 user_id）
+    pub async fn destroy(
+        &self,
+        container_id: &str,
+        service_type: &ServiceType,
+        container_identifier: &str,
+    ) -> Result<()> {
+        info!(
+            "🔥 [destroyer] 开始销毁容器: container_id={}, service_type={:?}, identifier={}",
+            container_id, service_type, container_identifier
+        );
+
+        // 1. 执行物理销毁（这会自动清理 gRPC 连接池中的连接）
+        docker_manager::container_stop::runtime_cleanup_container(
+            &self.docker_manager,
+            container_id,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
+
+        // 2. 对于 ComputerAgentRunner，清理 Pingora VNC 后端
+        if *service_type == ServiceType::ComputerAgentRunner {
+            if let Some(ref pingora_service) = self.pingora_service {
+                let _: Option<String> = pingora_service.remove_vnc_backend(container_identifier);
+            }
+        }
+
+        info!("✅ [destroyer] 容器销毁完成: {}", container_id);
+        Ok(())
+    }
+}

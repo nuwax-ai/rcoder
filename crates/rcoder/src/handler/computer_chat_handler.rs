@@ -219,8 +219,12 @@ pub async fn handle_computer_chat(
 
     // 请求到达时立即更新活动时间（不等待请求执行结果）
     // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
-    state.update_activity(&user_id);
-    debug!("🔄 [COMPUTER_CHAT] 已更新活动时间: user_id={}", user_id);
+    // 注意：这里使用 project_id 而不是 user_id，因为 DuckDB 的 key 是 project_id
+    state.update_activity(&project_id);
+    debug!(
+        "🔄 [COMPUTER_CHAT] 已更新活动时间: project_id={}",
+        project_id
+    );
 
     // 5. 创建项目工作目录（在用户容器内）
     // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录

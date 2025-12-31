@@ -830,7 +830,7 @@ pub async fn pod_ensure(
 
     // 5. 更新 DuckDB 存储中的容器信息（用于后续保活）
     // 无论容器是新建还是已存在，都要确保 DuckDB 记录是最新的
-    let mut project_info = if let Some(existing) = state.get_project(&request.user_id) {
+    let mut project_info = if let Some(existing) = state.get_project(&request.project_id) {
         // 如果已存在记录，更新容器信息
         let mut info = (*existing).clone();
         info.set_container(Some(container_info.clone()));
@@ -844,10 +844,10 @@ pub async fn pod_ensure(
         info
     };
 
-    state.insert_project(request.user_id.clone(), Arc::new(project_info));
+    state.insert_project(request.project_id.clone(), Arc::new(project_info));
     debug!(
-        "📝 [POD_ENSURE] DuckDB 记录已更新: user_id={}, container_id={}",
-        request.user_id, container_info.container_id
+        "📝 [POD_ENSURE] DuckDB 记录已更新: project_id={}, user_id={}, container_id={}",
+        request.project_id, request.user_id, container_info.container_id
     );
 
     // 6. 构建响应
@@ -917,11 +917,11 @@ pub async fn pod_keepalive(
 
     // 2. 检查 DuckDB 存储中是否有记录，并更新活动时间
     let (previous_activity_time, current_activity_time, existed) = {
-        if let Some(existing_info) = state.get_project(&request.user_id) {
+        if let Some(existing_info) = state.get_project(&request.project_id) {
             let prev = existing_info.last_activity().timestamp_millis() as u64;
 
             // 获取实际更新的时间
-            let updated_time = state.update_activity(&request.user_id);
+            let updated_time = state.update_activity(&request.project_id);
             let current = updated_time
                 .map(|t| t.timestamp_millis() as u64)
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
@@ -942,13 +942,13 @@ pub async fn pod_keepalive(
         match existing_container {
             Some(info) => {
                 // Docker 中有容器，检查并插入到 DuckDB 存储
-                if !state.contains_project(&request.user_id) {
+                if !state.contains_project(&request.project_id) {
                     let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
                     project_info.set_user_id(Some(request.user_id.clone()));
                     project_info
                         .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                     project_info.set_container(Some(info.clone()));
-                    state.insert_project(request.user_id.clone(), Arc::new(project_info));
+                    state.insert_project(request.project_id.clone(), Arc::new(project_info));
                     info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），已添加到 DuckDB 存储");
                 } else {
                     info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），DuckDB 已有记录");
@@ -1078,8 +1078,26 @@ pub async fn pod_restart(
             container_info.container_id
         );
 
-        // 从 DuckDB 存储中移除记录
-        state.remove_project(&request.user_id);
+        // 从 DuckDB 存储中彻底移除旧容器及其所有关联记录
+        // 使用 container_id 删除,确保清理该容器关联的所有 project_id
+        match state
+            .projects
+            .delete_container_with_projects(&container_info.container_id)
+        {
+            Ok((container_deleted, deleted_projects)) => {
+                info!(
+                    "🧹 [POD_RESTART] 已清理旧容器记录: container_id={}, container_deleted={}, deleted_projects={}",
+                    container_info.container_id, container_deleted, deleted_projects
+                );
+            }
+            Err(e) => {
+                // 记录错误但继续执行(不阻塞容器创建)
+                error!(
+                    "⚠️ [POD_RESTART] 清理旧容器记录失败（继续创建）: container_id={}, error={}",
+                    container_info.container_id, e
+                );
+            }
+        }
 
         // 获取 DockerManager 并停止容器
         let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -1154,7 +1172,7 @@ pub async fn pod_restart(
         project_info.set_user_id(Some(request.user_id.clone()));
         project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
         project_info.set_container(Some(container_info.clone()));
-        state.insert_project(request.user_id.clone(), Arc::new(project_info));
+        state.insert_project(request.project_id.clone(), Arc::new(project_info));
     }
 
     // 7. 构建响应

@@ -2,18 +2,17 @@
 //!
 //! 提供 ACP 协议集成和 AI 代理管理功能
 
+pub mod cleanup_task;
 mod config;
 pub mod grpc;
 mod handler;
-mod proxy_agent;
-mod router;
+pub mod router;
 mod service;
 pub mod storage;
 mod utils;
 pub mod vnc;
 
 // 重新导出主要的类型和函数
-pub use proxy_agent::*;
 pub use storage::{DataBridge, ProjectAdapter};
 pub use utils::*;
 
