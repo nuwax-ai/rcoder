@@ -106,6 +106,24 @@ impl ContainerRepository {
         })
     }
 
+    /// 根据会话ID更新关联容器的最后活动时间
+    pub fn update_activity_by_session(&self, session_id: &str) -> DuckDbResult<bool> {
+        let now_str = Utc::now().to_rfc3339();
+        self.conn.with_connection(|c| {
+            let affected = c.execute(
+                r#"
+                UPDATE containers
+                SET last_activity = ?
+                WHERE container_id IN (
+                    SELECT container_id FROM projects WHERE session_id = ?
+                )
+                "#,
+                params![now_str, session_id],
+            )?;
+            Ok(affected > 0)
+        })
+    }
+
     /// 使用指定时间更新容器最后活动时间（用于保持项目和容器时间一致）
     pub fn update_activity_with_time(
         &self,

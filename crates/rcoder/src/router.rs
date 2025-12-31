@@ -84,10 +84,13 @@ impl AppState {
         self.projects.get_by_session_id(session_id)
     }
 
-    /// 通过会话ID获取容器ID（替代 session_to_container_id.get）
+    /// 通过会话ID获取容器名称（用于容器重启后的容器查询）
+    ///
+    /// 与 `get_container_id_by_session` 不同，返回稳定的 `container_name`。
+    /// 即使容器被重建，container_name 保持不变，可直接通过 Docker API 查询容器状态。
     #[inline]
-    pub fn get_container_id_by_session(&self, session_id: &str) -> Option<String> {
-        self.projects.get_container_id_by_session(session_id)
+    pub fn get_container_name_by_session(&self, session_id: &str) -> Option<String> {
+        self.projects.get_container_name_by_session(session_id)
     }
 
     /// 更新会话信息

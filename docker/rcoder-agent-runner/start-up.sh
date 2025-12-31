@@ -502,14 +502,14 @@ EOF
 
     if [ -f "$CUSTOM_WALLPAPER" ]; then
         log "Found custom wallpaper at $CUSTOM_WALLPAPER, applying to XFCE and noVNC..."
-        
+
         # 1. 应用到 XFCE 桌面
         if [ ! -f "${XFCE_WALLPAPER}.original" ]; then
             cp "$XFCE_WALLPAPER" "${XFCE_WALLPAPER}.original" 2>/dev/null || true
         fi
         cp "$CUSTOM_WALLPAPER" "$XFCE_WALLPAPER"
         log_success "XFCE wallpaper applied: $CUSTOM_WALLPAPER -> $XFCE_WALLPAPER"
-        
+
         # 2. 应用到 noVNC 网页背景（同一图片，不同文件名）
         if [ ! -f "${NOVNC_BG}.original" ]; then
             cp "$NOVNC_BG" "${NOVNC_BG}.original" 2>/dev/null || true
@@ -719,15 +719,23 @@ function start_display_and_desktop() {
 	mkdir -p /var/run/dbus
 	dbus-daemon --system --fork
 
-	# 等待 D-Bus 系统总线 socket 就绪（智能等待，最长 2 秒）
-	wait_for_file /var/run/dbus/system_bus_socket 2 || log_warn "D-Bus system bus socket not ready"
+	# 等待 D-Bus 系统总线 socket 就绪（智能等待，最长 5 秒）
+	if wait_for_file /var/run/dbus/system_bus_socket 5; then
+		log_success "D-Bus system bus socket ready"
+	else
+		log_warn "D-Bus system bus socket not ready"
+	fi
 
 	# 启动 PolicyKit 守护进程（配置为不需要认证）
     log "Starting PolicyKit daemon..."
 	/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
 
-	# 等待 PolicyKit 进程启动（智能等待，最长 3 秒）
-	wait_for_process "polkitd" 3 || log_warn "PolicyKit daemon not started"
+	# 等待 PolicyKit 进程启动（智能等待，最长 5 秒）
+	if wait_for_process "polkitd" 5; then
+		log_success "PolicyKit daemon started"
+	else
+		log_warn "PolicyKit daemon not started"
+	fi
 
     # 等待Xvfb启动（此时应该已经差不多就绪了）
     log "Waiting for X11 to be ready..."
@@ -899,66 +907,101 @@ function check_vnc_health() {
 function start_audio_services() {
     log "Starting audio streaming services (pcmflux)..."
 
-    # 1. 启动 PulseAudio 守护进程
-    echo "  Starting PulseAudio daemon..."
-
-    # 确保 PulseAudio 目录存在
+    # 1. 确保 PulseAudio 目录存在且有正确权限
     mkdir -p /home/user/.config/pulse
     mkdir -p /var/run/pulse
+    chmod 755 /home/user/.config/pulse
     chmod 777 /var/run/pulse
 
-    # 启动 PulseAudio（非系统模式，允许运行为 root）
-    HOME=/home/user pulseaudio --start --exit-idle-time=-1 --log-level=warning 2>/tmp/pulseaudio.log || true
+    # 2. 创建 PulseAudio 客户端配置文件（允许 root 连接）
+    cat > /home/user/.config/pulse/client.conf <<'EOF'
+# 允许 root 用户连接
+allow-pubkey-authentication=no
+default-server=unix:/var/run/pulse/native
+EOF
 
-    # 等待 PulseAudio 进程启动（智能等待，最长 3 秒）
-    if wait_for_process "pulseaudio" 3; then
-        log_success "  PulseAudio daemon started"
+    # 3. 创建 PulseAudio 守护进程配置（禁用自动启动锁）
+    cat > /home/user/.config/pulse/daemon.conf <<'EOF'
+# 禁用自动启动锁
+autospawn = no
+exit-idle-time = -1
+log-level = warning
+EOF
+
+    # 4. 修复 /home/user 目录权限（如果被挂载覆盖）
+    chown -R user:user /home/user/.config/pulse 2>/dev/null || true
+
+    # 5. 使用 --system 模式启动 PulseAudio（容器环境）
+    # --disallow-exit: 防止 PulseAudio 自动退出
+    # --disable-shm: 禁用共享内存（容器环境兼容性）
+    log "  Starting PulseAudio in system mode..."
+    pulseaudio --system \
+        --disallow-exit \
+        --disable-shm \
+        --no-cpu-limit \
+        --log-level=warning \
+        --daemonize=no \
+        2>/tmp/pulseaudio.log &
+
+    # 等待 PulseAudio 进程启动
+    if wait_for_process "pulseaudio" 5; then
+        log_success "  PulseAudio daemon started (system mode)"
     else
         log_warn "  PulseAudio failed to start, checking log..."
         cat /tmp/pulseaudio.log 2>/dev/null || true
-        # 尝试用 --system 模式启动
-        pulseaudio --system --disallow-exit --disallow-module-loading=0 &
-        wait_for_process "pulseaudio" 3 || log_warn "  PulseAudio system mode also failed"
+        return 1
     fi
 
-    # 2. 创建虚拟声卡 (null sink) 作为音频输出目标
-    echo "  Creating virtual audio sink..."
-    pactl load-module module-null-sink sink_name=virtual_speaker \
-          sink_properties=device.description="Virtual_Speaker" 2>/dev/null || true
+    # 6. 等待 PulseAudio socket 就绪
+    local pulse_socket="/var/run/pulse/native"
+    local counter=0
+    while [ ! -S "$pulse_socket" ]; do
+        sleep 0.2
+        let counter++
+        if ((counter > 25)); then
+            log_warn "  PulseAudio socket not ready: $pulse_socket"
+            return 1
+        fi
+    done
+    log_success "  PulseAudio socket ready: $pulse_socket"
 
-    # 设置虚拟声卡为默认输出
-    pactl set-default-sink virtual_speaker 2>/dev/null || true
+    # 7. 设置 PULSE_SERVER 环境变量
+    export PULSE_SERVER="unix:/var/run/pulse/native"
+    echo "export PULSE_SERVER='unix:/var/run/pulse/native'" >> /etc/profile.d/pulse-env.sh
 
-    # 验证虚拟声卡
-    if pactl list sinks short 2>/dev/null | grep -q "virtual_speaker"; then
+    # 8. 创建虚拟声卡
+    log "  Creating virtual audio sink..."
+    if pactl load-module module-null-sink sink_name=virtual_speaker \
+          sink_properties=device.description="Virtual_Speaker" 2>/dev/null; then
         log_success "  Virtual speaker sink created"
     else
         log_warn "  Failed to create virtual speaker sink"
+        return 1
     fi
 
-    # 3. 启动 pcmflux 音频流服务
-    echo "  Starting pcmflux audio streaming service..."
+    # 9. 设置虚拟声卡为默认输出
+    pactl set-default-sink virtual_speaker 2>/dev/null || true
 
-    # 设置音频设备环境变量
+    # 10. 启动 pcmflux 音频流服务
+    log "  Starting pcmflux audio streaming service..."
     export AUDIO_DEVICE="virtual_speaker.monitor"
     export AUDIO_HTTP_PORT=6090
     export AUDIO_WS_PORT=6089
 
-    # 后台启动音频服务器
     nohup python3 /usr/local/bin/audio_server.py > /tmp/audio_server.log 2>&1 &
 
-    # 等待音频服务进程启动或端口就绪（智能等待，最长 5 秒）
     if wait_for_process_pattern "audio_server.py" 3 && wait_for_port localhost 6090 3; then
         log_success "  pcmflux audio server started"
         log_success "  Audio HTTP: http://localhost:6090"
         log_success "  Audio WebSocket: ws://localhost:6089"
     else
         log_warn "  pcmflux audio server failed to start"
-        echo "  Error log:"
         cat /tmp/audio_server.log 2>/dev/null | tail -20 || true
+        return 1
     fi
 
     log_success "Audio streaming services initialized"
+    return 0
 }
 
 # ============================================================================

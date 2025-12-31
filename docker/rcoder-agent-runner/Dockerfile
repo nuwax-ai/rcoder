@@ -60,6 +60,31 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.cache
 
 # ============================================================================
+# 🔊 配置 PulseAudio 系统模式（容器环境优化）
+# ============================================================================
+# 配置 PulseAudio 系统模式，支持以 root 身份运行
+RUN mkdir -p /etc/pulse && \
+    # 创建系统模式配置
+    printf '[General]\n\
+    default-sample-format = s16le\n\
+    default-sample-rate = 48000\n\
+    default-sample-channels = 2\n\
+    default-fragments = 2\n\
+    default-fragment-size-msec = 125\n' > /etc/pulse/daemon.conf && \
+    # 允许所有用户连接系统模式 PulseAudio
+    printf '[General]\n\
+    allow-autospawn-for-root = yes\n\
+    default-server = unix:/var/run/pulse/native\n' > /etc/pulse/client.conf && \
+    # 创建系统模式 pulse 用户组
+    groupadd -r pulse-access 2>/dev/null || true && \
+    usermod -aG pulse-access root 2>/dev/null || true && \
+    usermod -aG pulse-access user 2>/dev/null || true && \
+    # 创建 PulseAudio 运行时目录
+    mkdir -p /var/run/pulse && \
+    chmod 1777 /var/run/pulse && \
+    echo "✅ PulseAudio system mode configured"
+
+# ============================================================================
 # 🐍 配置 pip 镜像源 (系统级配置，所有用户共享)
 # ============================================================================
 # 使用阿里云 PyPI 镜像源（稳定可靠，无限流限制）
