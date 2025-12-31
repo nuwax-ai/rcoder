@@ -111,6 +111,12 @@ async fn main() -> anyhow::Result<()> {
             default_config.container_ttl_seconds = Some(ttl);
         }
 
+        // 应用网络基础名称配置
+        if let Some(ref network_base_name) = docker_config.network_base_name {
+            info!("✅ 使用配置中的网络基础名称: {}", network_base_name);
+            default_config.network_base_name = network_base_name.clone();
+        }
+
         default_config
     } else {
         info!("⚠️  应用中无 Docker 配置，使用默认配置");

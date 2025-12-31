@@ -98,6 +98,10 @@ impl DockerUtils {
             }
         }
 
+        if let Ok(network_base_name) = std::env::var("DOCKER_NETWORK_BASE_NAME") {
+            config.network_base_name = network_base_name;
+        }
+
         config
     }
 }
