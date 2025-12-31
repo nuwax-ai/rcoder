@@ -90,7 +90,19 @@ impl OrphanedContainerCleaner {
                         for name in names {
                             let clean_name = name.trim_start_matches('/');
                             if let Some(id) = Self::extract_id_from_container_name(clean_name) {
-                                if !self.state.projects.contains_key(&id) {
+                                // 🔧 根据 service_type 使用不同的查询方式
+                                let is_orphaned = match service_type {
+                                    ServiceType::RCoder => {
+                                        // RCoder: id 是 project_id，直接查询
+                                        !self.state.projects.contains_key(&id)
+                                    }
+                                    ServiceType::ComputerAgentRunner => {
+                                        // ComputerAgentRunner: id 是 user_id，检查是否有任何项目使用该 user_id
+                                        self.state.projects.find_projects_by_user_id(&id).is_empty()
+                                    }
+                                };
+
+                                if is_orphaned {
                                     let created_time = container
                                         .created
                                         .and_then(|ts| DateTime::from_timestamp(ts, 0));

@@ -65,7 +65,7 @@ impl ComputerContainerManager {
 
         // 1. 尝试获取现有容器
         // 使用 user_id 作为容器标识进行查询
-        if let Ok(Some(info)) = docker_manager.get_agent_info(user_id).await {
+        if let Ok(Some(info)) = docker_manager.get_user_container_info(user_id).await {
             // ✅ 关键修复: 验证容器是否真的在运行
             match docker_manager
                 .is_container_running(&info.container_id)
@@ -207,10 +207,13 @@ impl ComputerContainerManager {
                 AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
             })?;
 
-        docker_manager.get_agent_info(user_id).await.map_err(|e| {
-            error!("❌ [COMPUTER_CONTAINER] 查询容器信息失败: {}", e);
-            AppError::internal_server_error(&format!("查询容器信息失败: {}", e))
-        })
+        docker_manager
+            .get_user_container_info(user_id)
+            .await
+            .map_err(|e| {
+                error!("❌ [COMPUTER_CONTAINER] 查询容器信息失败: {}", e);
+                AppError::internal_server_error(&format!("查询容器信息失败: {}", e))
+            })
     }
 }
 
