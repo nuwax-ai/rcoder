@@ -95,8 +95,11 @@ pub trait UnifiedStorage: Send + Sync {
     /// 根据会话ID获取项目
     fn get_project_by_session(&self, session_id: &str) -> DuckDbResult<Option<ProjectRecord>>;
 
-    /// 根据会话ID获取容器ID
-    fn get_container_id_by_session(&self, session_id: &str) -> DuckDbResult<Option<String>>;
+    /// 根据会话ID获取容器名称
+    ///
+    /// 与 `get_container_id_by_session` 不同，返回稳定的 `container_name`。
+    /// 即使容器被重建，container_name 保持不变，可用于通过 Docker API 查询容器状态。
+    fn get_container_name_by_session(&self, session_id: &str) -> DuckDbResult<Option<String>>;
 
     /// 更新会话
     fn update_session(&self, project_id: &str, session_id: &str) -> DuckDbResult<bool>;
@@ -322,16 +325,25 @@ impl UnifiedStorage for DuckDbStorage {
         self.projects()?.find_by_session_id(session_id)
     }
 
-    fn get_container_id_by_session(&self, session_id: &str) -> DuckDbResult<Option<String>> {
-        self.projects()?.get_container_id_by_session(session_id)
+    fn get_container_name_by_session(&self, session_id: &str) -> DuckDbResult<Option<String>> {
+        self.projects()?.get_container_name_by_session(session_id)
     }
 
     fn update_session(&self, project_id: &str, session_id: &str) -> DuckDbResult<bool> {
         self.projects()?.update_session(project_id, session_id)
     }
 
+    /// 更新会话活动时间（同时也更新关联容器的活动时间）
     fn update_session_activity(&self, session_id: &str) -> DuckDbResult<bool> {
-        self.projects()?.update_session_activity(session_id)
+        let updated = self.projects()?.update_session_activity(session_id)?;
+
+        // 如果会话活跃，同时也更新关联容器的活跃状态
+        if updated {
+            // 使用新方法直接通过 session_id 更新容器活动时间，无需获取 container_id
+            let _ = self.containers()?.update_activity_by_session(session_id);
+        }
+
+        Ok(updated)
     }
 
     // ========== 状态操作 ==========
@@ -521,8 +533,10 @@ mod tests {
         assert_eq!(project.unwrap().project_id, "p1");
 
         // 获取容器ID
-        let container_id = storage.get_container_id_by_session("session-1").unwrap();
-        assert_eq!(container_id, Some("c1".to_string()));
+        // 注意：get_container_id_by_session 已被移除，改为测试 get_container_name_by_session
+        // 但这里为了验证会话关联，我们主要关注 get_container_name_by_session 返回正常
+        let container_name = storage.get_container_name_by_session("session-1").unwrap();
+        assert_eq!(container_name, Some("container-1".to_string()));
     }
 
     #[test]

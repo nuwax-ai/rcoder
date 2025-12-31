@@ -292,16 +292,30 @@ impl ProjectRepository {
         })
     }
 
-    /// 根据会话ID获取容器ID
-    pub fn get_container_id_by_session(&self, session_id: &str) -> DuckDbResult<Option<String>> {
+    /// 根据会话ID获取容器名称
+    ///
+    /// 与 `get_container_id_by_session` 不同，此方法返回 `container_name` 而不是 `container_id`。
+    /// 容器名称是稳定的（如 `computer-agent-runner-user_123`），即使容器被重建，
+    /// 可以通过 Docker API 查询到新容器。而 container_id 在容器重建后会改变。
+    ///
+    /// # 用途
+    /// 用于 SSE 连接验证时，通过 container_name 实时查询 Docker API 获取容器状态。
+    pub fn get_container_name_by_session(&self, session_id: &str) -> DuckDbResult<Option<String>> {
         self.conn.with_connection(|c| {
-            let mut stmt = c.prepare("SELECT container_id FROM projects WHERE session_id = ?")?;
+            let mut stmt = c.prepare(
+                r#"
+                SELECT c.container_name
+                FROM projects p
+                JOIN containers c ON p.container_id = c.container_id
+                WHERE p.session_id = ?
+                "#,
+            )?;
             let mut rows = stmt.query(params![session_id])?;
 
             match rows.next()? {
                 Some(row) => {
-                    let container_id: String = row.get(0)?;
-                    Ok(Some(container_id))
+                    let container_name: String = row.get(0)?;
+                    Ok(Some(container_name))
                 }
                 None => Ok(None),
             }
@@ -627,18 +641,6 @@ mod tests {
         let found = repo.find_by_session_id("session-1").unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().project_id, "p1");
-    }
-
-    #[test]
-    fn test_get_container_id_by_session() {
-        let repo = setup_test_db();
-        let record = create_test_record("p1");
-
-        repo.upsert(&record).unwrap();
-        repo.update_session("p1", "session-1").unwrap();
-
-        let container_id = repo.get_container_id_by_session("session-1").unwrap();
-        assert_eq!(container_id, Some("container-p1".to_string()));
     }
 
     #[test]

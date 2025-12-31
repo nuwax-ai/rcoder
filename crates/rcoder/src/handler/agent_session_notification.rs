@@ -387,18 +387,23 @@ pub struct SseErrorEvent {
 ///
 /// 这个函数被 SSE 通知处理器和文档生成器共同使用
 /// 执行所有必要的验证和查找逻辑，但不执行实际的消息流创建
+///
+/// 🔧 关键修复：使用稳定的 container_name 替代 container_id 查询容器状态
+/// 当容器被重启后，container_id 会变化，但 container_name 保持稳定。
 async fn validate_and_get_session_context(
     state: Arc<crate::router::AppState>,
     session_id: &str,
 ) -> Result<(String, Arc<shared_types::ProjectAndContainerInfo>, String), Response> {
-    // 阶段 2.3: 容器存在性预检 - 使用新的 DuckDB 存储 API
-    let container_id = match state.get_container_id_by_session(session_id) {
-        Some(cid) => {
+    // 阶段 2.3: 获取稳定的 container_name（不是 container_id）
+    // 🔧 关键修复：container_name 在容器重建后保持不变（如 computer-agent-runner-user_123）
+    // 而 container_id 在每次容器重建后都会变化
+    let container_name = match state.get_container_name_by_session(session_id) {
+        Some(name) => {
             debug!(
-                "🔍 [SSE_PROXY] 从 DuckDB 获取容器ID: session_id={}, container_id={}",
-                session_id, cid
+                "🔍 [SSE_PROXY] 从 DuckDB 获取容器名称: session_id={}, container_name={}",
+                session_id, name
             );
-            cid
+            name
         }
         None => {
             warn!(
@@ -426,28 +431,46 @@ async fn validate_and_get_session_context(
         }
     };
 
-    match docker_manager.is_container_running(&container_id).await {
-        Ok(true) => {
-            info!(
-                "✅ [SSE_PROXY] 容器检查通过: container_id={}, 状态=运行中",
-                container_id
-            );
-            // 容器正在运行，继续执行
+    // 🔧 使用 find_container_realtime 通过 container_name 实时查询 Docker API
+    // 这样即使容器被重建（container_id 变化），也能通过稳定的 container_name 找到容器
+    match docker_manager
+        .find_container_realtime(&container_name)
+        .await
+    {
+        Ok(Some((real_container_id, _, _status, is_running))) => {
+            if is_running {
+                info!(
+                    "✅ [SSE_PROXY] 容器检查通过: container_name={}, container_id={}, 状态=运行中",
+                    container_name, real_container_id
+                );
+                // 容器正在运行，继续执行
+            } else {
+                error!(
+                    "❌ [SSE_PROXY] 容器已停止: container_name={}, container_id={}",
+                    container_name, real_container_id
+                );
+                return Err(create_error_response(
+                    StatusCode::NOT_FOUND,
+                    "SESSION_EXPIRED",
+                    "会话因不活动已被清理。请重新发起请求。",
+                ));
+            }
         }
-        Ok(false) => {
-            error!("❌ [SSE_PROXY] 容器已停止: container_id={}", container_id);
-            // 注意：DuckDB 存储中不需要手动清理会话映射，
-            // cleanup_task 会在后台清理不活跃的容器和相关数据
+        Ok(None) => {
+            error!(
+                "❌ [SSE_PROXY] 容器不存在: container_name={}",
+                container_name
+            );
             return Err(create_error_response(
                 StatusCode::NOT_FOUND,
                 "SESSION_EXPIRED",
-                "会话因不活动已被清理。请重新发起请求。",
+                "容器不存在。请重新发起请求。",
             ));
         }
         Err(e) => {
             error!(
-                "❌ [SSE_PROXY] 检查容器状态失败: container_id={}, error={}",
-                container_id, e
+                "❌ [SSE_PROXY] 检查容器状态失败: container_name={}, error={}",
+                container_name, e
             );
             return Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -469,8 +492,8 @@ async fn validate_and_get_session_context(
             // 对于 Computer Agent，容器信息已经在 ProjectAndContainerInfo 中
             match agent_info.container() {
                 Some(_) => {
-                    // 验证通过，返回上下文信息
-                    Ok((project_id, agent_info, container_id))
+                    // 验证通过，返回上下文信息（container_name 用于后续查询）
+                    Ok((project_id, agent_info, container_name))
                 }
                 None => {
                     error!(

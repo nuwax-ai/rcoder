@@ -170,18 +170,21 @@ impl ProjectAdapter {
 
     // ========== session_to_container_id 替代方法 ==========
 
-    /// 通过会话ID获取容器ID（替代 session_to_container_id.get）
-    pub fn get_container_id_by_session(&self, session_id: &str) -> Option<String> {
-        match self.storage.get_container_id_by_session(session_id) {
-            Ok(container_id) => {
+    /// 通过会话ID获取容器名称（用于容器重启后的容器查询）
+    ///
+    /// 与 `get_container_id_by_session` 不同，返回稳定的 `container_name`（如 `computer-agent-runner-user_123`）。
+    /// 即使容器被重建，container_name 保持不变，可直接通过 Docker API 查询容器状态。
+    pub fn get_container_name_by_session(&self, session_id: &str) -> Option<String> {
+        match self.storage.get_container_name_by_session(session_id) {
+            Ok(container_name) => {
                 debug!(
-                    "通过会话ID获取容器ID: session_id={}, container_id={:?}",
-                    session_id, container_id
+                    "通过会话ID获取容器名称: session_id={}, container_name={:?}",
+                    session_id, container_name
                 );
-                container_id
+                container_name
             }
             Err(e) => {
-                warn!("通过会话ID {} 获取容器ID失败: {}", session_id, e);
+                warn!("通过会话ID {} 获取容器名称失败: {}", session_id, e);
                 None
             }
         }
@@ -214,15 +217,8 @@ impl ProjectAdapter {
         match self.storage.update_session_activity(session_id) {
             Ok(updated) => {
                 if updated {
-                    // 同时更新关联容器的活动时间
-                    if let Some(container_id) = self.get_container_id_by_session(session_id) {
-                        if let Err(e) = self.storage.update_container_activity(&container_id) {
-                            warn!(
-                                "⚠️ [STORAGE] 更新容器活动时间失败: container_id={}, error={}",
-                                container_id, e
-                            );
-                        }
-                    }
+                    // 底层 storage.update_session_activity 现在会自动更新关联容器的活动时间
+                    // 无需在此处手动调用，避免了使用不可靠的 container_id
                 }
                 updated
             }
@@ -485,9 +481,9 @@ mod tests {
         assert!(by_session.is_some());
         assert_eq!(by_session.unwrap().project_id(), project_id);
 
-        // 获取容器ID
-        let container_id = adapter.get_container_id_by_session(session_id);
-        assert_eq!(container_id, Some("c1".to_string()));
+        // 获取容器名称
+        let container_name = adapter.get_container_name_by_session(session_id);
+        assert_eq!(container_name, Some("container-1".to_string()));
     }
 
     #[test]
