@@ -24,7 +24,6 @@ pub struct AgentCleaner {
     container_destroyer: super::container::ContainerDestroyer,
     orphaned_cleaner: super::container::OrphanedContainerCleaner,
     agent_scanner: super::agent::AgentScanner,
-    _status_checker: super::agent::AgentStatusChecker,
 }
 
 impl AgentCleaner {
@@ -60,8 +59,10 @@ impl AgentCleaner {
                 container_patterns,
                 config_arc,
             ),
-            agent_scanner: super::agent::AgentScanner::new(state.clone(), config_clone),
-            _status_checker: super::agent::AgentStatusChecker::new(state.grpc_pool.clone()),
+            agent_scanner: {
+                use crate::cleanup_task::agent::AgentScanner;
+                AgentScanner::new(state.clone(), config_clone)
+            },
         }
     }
 

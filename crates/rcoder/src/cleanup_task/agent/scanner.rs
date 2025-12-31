@@ -12,6 +12,7 @@ use tracing::{debug, info};
 pub struct AgentScanner {
     pub state: Arc<crate::router::AppState>,
     pub config: crate::cleanup_task::config::CleanupConfig,
+    pub status_checker: super::AgentStatusChecker,
 }
 
 impl AgentScanner {
@@ -19,7 +20,13 @@ impl AgentScanner {
         state: Arc<crate::router::AppState>,
         config: crate::cleanup_task::config::CleanupConfig,
     ) -> Self {
-        Self { state, config }
+        use crate::cleanup_task::agent::AgentStatusChecker;
+        let status_checker = AgentStatusChecker::new(state.grpc_pool.clone());
+        Self {
+            state,
+            config,
+            status_checker,
+        }
     }
 
     /// 扫描需要清理的 agent
@@ -89,8 +96,56 @@ impl AgentScanner {
             return false;
         }
 
-        // TODO: gRPC 二次确认（调用 status_checker）
-        // 如果有容器信息，可以进行 gRPC 查询
+        // 🆕 gRPC 二次确认：查询容器内 agent 的真实状态
+        if let Some(container) = agent.container() {
+            // 从 service_url 提取 gRPC 地址
+            let grpc_addr = match crate::handler::utils::extract_grpc_addr_with_port(
+                &container.service_url,
+                shared_types::GRPC_DEFAULT_PORT,
+            ) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    debug!(
+                        "⚠️ [scanner] 解析 gRPC 地址失败: project_id={}, error={}",
+                        agent.project_id(),
+                        e
+                    );
+                    return true; // 解析失败，允许清理
+                }
+            };
+
+            let project_id = agent.project_id();
+            // 根据 service_type 获取正确的容器标识符
+            // - RCoder: 使用 project_id
+            // - ComputerAgentRunner: 使用 user_id（如果存在），否则使用 project_id
+            let user_id = agent.user_id().unwrap_or(project_id);
+
+            match self
+                .status_checker
+                .is_container_active(&grpc_addr, user_id, project_id)
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        "🔄 [scanner] gRPC 二次确认: 容器内 agent 仍在活跃，跳过清理: project_id={}, user_id={}",
+                        project_id, user_id
+                    );
+                    return false;
+                }
+                Ok(false) => {
+                    debug!(
+                        "💤 [scanner] gRPC 二次确认: 容器内 agent 确认空闲，可以清理: project_id={}, user_id={}",
+                        project_id, user_id
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        "⚠️ [scanner] gRPC 二次确认失败，允许清理: project_id={}, user_id={}, error={}",
+                        project_id, user_id, e
+                    );
+                }
+            }
+        }
 
         true
     }
