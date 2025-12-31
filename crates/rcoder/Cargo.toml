@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [features]
 default = []
 
+# 调试功能：启用 /debug/* 路由，用于开发和问题排查
+# 生产环境默认不启用，需要显式添加 --features debug
+debug = []
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
@@ -65,9 +69,9 @@ dashmap = { workspace = true }
 bytes = "1.0"
 futures-util = { workspace = true }
 piper = "0.2"
-base64 = "0.22"
-reqwest = { version = "0.12", features = ["json", "stream"] }
-url = "2.4"
+base64 = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
 bollard = "0.19"
 
 # OpenTelemetry

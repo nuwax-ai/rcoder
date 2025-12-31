@@ -5,5 +5,7 @@
 mod grpc_addr;
 mod paths;
 
-pub use grpc_addr::{extract_grpc_addr, extract_grpc_addr_with_port};
+pub use grpc_addr::{
+    extract_grpc_addr, extract_grpc_addr_with_port, get_realtime_container_ip_with_cache,
+};
 pub use paths::{COMPUTER_WORKSPACE_ROOT, project_dir, user_dir};

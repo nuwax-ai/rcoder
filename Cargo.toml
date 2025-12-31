@@ -69,10 +69,10 @@ duckdb = { version = "1.4", features = ["bundled"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = "1.0.148"
 serde_json_lenient = "0.2"
-schemars = { version = "1.0", features = ["derive"] }
-config = "0.14"
+schemars = { version = "1.2", features = ["derive"] }
+config = "0.15"
 
 # Error handling
 anyhow = "1.0"
@@ -108,7 +108,7 @@ dashmap = "6.0"
 futures = "0.3"
 futures-util = "0.3"
 itertools = "0.14"
-bytes = "1.10"
+bytes = "1.11"
 # collections = "0.2"  # 这个包不存在
 
 
@@ -140,18 +140,18 @@ tree-sitter-rust = "0.24"                                          # 使用 crat
 sha2 = "0.10"
 hex = "0.4"
 walkdir = "2.5"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # 项目依赖 - 保留核心功能
 aho-corasick = "1.0"
 # askpass = "0.1"  # 这个包不存在
 base64 = "0.22"
 circular-buffer = "1.2"
-fancy-regex = "0.16"
+fancy-regex = "0.17"
 fuzzy = "0.0.1"
 globset = "0.4"
 image = "0.25"
-indexmap = "2.11"
+indexmap = "2.12"
 pathdiff = "0.2"
 postage = "0.5"
 regex = "1.0"
@@ -165,9 +165,9 @@ which = "8.0"
 
 
 # Dev dependencies for testing
-ctor = "0.5"
+ctor = "0.6"
 pretty_assertions = "1.4"
-tempfile = "3.8"
+tempfile = "3.24"
 rand = "0.9"
 tokio-test = "0.4"
 
@@ -177,7 +177,7 @@ dirs = "6.0"
 # Archive utilities
 flate2 = "1.0"
 tar = "0.4"
-zip = "6.0"
+zip = "7.0"
 
 utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
@@ -193,10 +193,10 @@ pingora-core = { version = "0.6", features = ["rustls"] }
 pingora-http = "0.6"
 pingora-proxy = { version = "0.6", features = ["rustls"] }
 pingora-load-balancing = { version = "0.6", features = ["rustls"] }
-matchit = "0.9"
+matchit = "0.9.1"
 structopt = "0.3"
 
-bollard = { version = "0.19" }
+bollard = { version = "0.19.4" }
 
 # Cache library
 moka = { version = "0.12", features = ["future"] }

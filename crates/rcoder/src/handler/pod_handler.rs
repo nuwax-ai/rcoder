@@ -1134,21 +1134,64 @@ pub async fn pod_restart(
             .container_ip_cache
             .invalidate(&container_info.container_name);
 
-        // 等待一小段时间确保容器资源释放
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // 🆕 增强逻辑: 验证容器是否真正移除，防止 "Name already in use"
+        let container_name = container_info.container_name.clone();
+        let mut deletion_confirmed = false;
+
+        for i in 0..10 {
+            // 最多等待 5 秒 (10 * 500ms)
+            match docker_manager
+                .find_container_realtime(&container_name)
+                .await
+            {
+                Ok(Some(_)) => {
+                    if i == 0 {
+                        info!(
+                            "⏳ [POD_RESTART] 容器仍在 Docker 中，等待清理: name={}",
+                            container_name
+                        );
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                Ok(None) => {
+                    info!(
+                        "✅ [POD_RESTART] 确认容器已从 Docker 移除: name={}",
+                        container_name
+                    );
+                    deletion_confirmed = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!("⚠️ [POD_RESTART] 检查容器移除状态出错: {}, 假定已移除", e);
+                    // 如果是其他错误，也可能意味着容器状态异常，尝试继续
+                    deletion_confirmed = true;
+                    break;
+                }
+            }
+        }
+
+        if !deletion_confirmed {
+            warn!(
+                "⚠️ [POD_RESTART] 等待容器移除超时，后续创建可能会失败: name={}",
+                container_name
+            );
+        }
     }
 
-    // 4. 创建新容器
-    info!("🏗️ [POD_RESTART] 创建新容器: user_id={}", request.user_id);
-
-    // 转换资源限制
+    // 4. 定义资源限制
     let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
         memory_limit: limits.memory,
         cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
         swap_limit: None,
     });
 
-    let container_info = ComputerContainerManager::get_or_create_container_for_user(
+    // 5. 强制创建新容器
+    info!(
+        "🏗️ [POD_RESTART] 强制创建新容器: user_id={}",
+        request.user_id
+    );
+
+    let container_info = ComputerContainerManager::force_create_container_for_user(
         &request.user_id,
         resource_limits,
     )

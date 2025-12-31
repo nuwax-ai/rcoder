@@ -63,8 +63,8 @@ dashmap = { workspace = true }
 bytes = "1.0"
 futures-util = { workspace = true }
 piper = "0.2"
-base64 = "0.22"
-reqwest = { version = "0.12", features = ["json"] }
+base64 = { workspace = true }
+reqwest = { workspace = true }
 
 # OpenTelemetry
 opentelemetry = { workspace = true }
@@ -81,3 +81,6 @@ utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 
 ringbuf = { workspace = true }
+
+# Atomic swap for sender replacement
+arc-swap = "1.8"

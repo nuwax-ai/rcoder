@@ -235,12 +235,18 @@ impl AgentService for AgentServiceImpl {
     ) -> Result<Response<GrpcChatResponse>, Status> {
         let req = request.into_inner();
 
+        // 使用脱敏包装器格式化 model_config
+        let model_config_debug = req
+            .model_config
+            .as_ref()
+            .map(|cfg| shared_types::MaskedModelConfig(cfg));
+
         info!(
             "🚀 [gRPC] Chat 请求: project_id={}, session_id={}, prompt_len={}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
             req.project_id,
             req.session_id,
             req.prompt.len(),
-            req.model_config,
+            model_config_debug,
             req.service_type,
             req.user_id,
             !req.attachments.is_empty(),
@@ -417,7 +423,9 @@ impl AgentService for AgentServiceImpl {
 
             info!(
                 "🔑 [gRPC] 已存储 API 配置: service_uuid={}, provider_name={}, base_url={}",
-                service_uuid_ref, provider.name, provider.base_url
+                service_uuid_ref,
+                provider.name,
+                shared_types::mask_url(&provider.base_url)
             );
         } else {
             warn!("⚠️ [gRPC] 未提供模型配置，将使用环境变量或默认配置");
@@ -430,9 +438,28 @@ impl AgentService for AgentServiceImpl {
             .with_service_uuid(service_uuid)
             .with_key_manager(Some(self.app_state.shared_api_key_manager.clone()));
 
+        // 🆕 检查 worker 状态
+        use crate::agent_worker_manager::WorkerState;
+        match self.app_state.agent_worker_manager.state() {
+            WorkerState::Running => {
+                // 正常运行，继续处理
+            }
+            WorkerState::Starting => {
+                warn!("⚠️ [gRPC] Agent Worker 正在启动，请求可能被延迟处理");
+            }
+            WorkerState::Stopping | WorkerState::Stopped => {
+                // Worker 不可用
+                return Err(Status::unavailable(
+                    "Agent Worker 不可用，正在重启中。请稍后重试",
+                ));
+            }
+        }
+
+        // 🆕 使用 manager 发送（带状态检查）
         self.app_state
-            .local_task_sender
-            .send(local_task_request)
+            .agent_worker_manager
+            .try_send(local_task_request)
+            .await
             .map_err(|e| Status::internal(format!("发送任务失败: {}", e)))?;
 
         // 等待响应
@@ -812,7 +839,7 @@ impl AgentService for AgentServiceImpl {
 
                     // 清理 SESSION_CACHE
                     if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
-                        session_data.close_current_connection();
+                        session_data.close_current_connection().await;
                     }
                     if SESSION_CACHE.remove(&actual_session_id).is_some() {
                         info!(
@@ -861,7 +888,7 @@ impl AgentService for AgentServiceImpl {
 
                 // 清理连接
                 if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
-                    session_data.close_current_connection();
+                    session_data.close_current_connection().await;
                 }
 
                 Ok(Response::new(CancelResponse {
@@ -1014,7 +1041,7 @@ impl AgentService for AgentServiceImpl {
 
                 // 清理连接
                 if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                    session_data.close_current_connection();
+                    session_data.close_current_connection().await;
                 }
             }
 
@@ -1026,11 +1053,12 @@ impl AgentService for AgentServiceImpl {
             }));
         }
 
-        // 如果 force=true 或者 Agent 处于 Idle 状态，直接停止
-        if force || agent_status == AgentStatus::Idle {
+        // 如果 force=true 或者 Agent 处于 Idle/Pending 状态，直接停止
+        // Pending 状态的 Agent 还没有启动 Worker，无法接收取消信号，所以直接清理
+        if force || agent_status == AgentStatus::Idle || agent_status == AgentStatus::Pending {
             info!(
-                "🔥 [gRPC] 强制停止或 Idle 状态，直接清理: project_id={}",
-                project_id
+                "🔥 [gRPC] 强制停止/Idle/Pending 状态，直接清理: project_id={}, status={:?}",
+                project_id, agent_status
             );
 
             // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端 Agent 已停止
@@ -1061,7 +1089,7 @@ impl AgentService for AgentServiceImpl {
             // 清理 SESSION_CACHE
             if !session_id.is_empty() {
                 if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                    session_data.close_current_connection();
+                    session_data.close_current_connection().await;
                 }
                 if SESSION_CACHE.remove(&session_id).is_some() {
                     info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
@@ -1231,7 +1259,7 @@ impl AgentService for AgentServiceImpl {
 
                         // 清理 SESSION_CACHE
                         if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                            session_data.close_current_connection();
+                            session_data.close_current_connection().await;
                         }
                         if SESSION_CACHE.remove(&session_id).is_some() {
                             info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
@@ -1354,7 +1382,7 @@ impl AgentService for AgentServiceImpl {
 
                         // 清理连接
                         if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                            session_data.close_current_connection();
+                            session_data.close_current_connection().await;
                         }
                     }
 

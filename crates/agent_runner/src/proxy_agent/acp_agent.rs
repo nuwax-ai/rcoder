@@ -12,9 +12,10 @@ use anyhow::Result;
 use chrono::Utc;
 use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
+    agent_worker_manager::{Heartbeat, WorkerHandle, WorkerReady},
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
     service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
@@ -220,6 +221,196 @@ pub async fn agent_worker(
             );
         }
     }
+
+    info!("🛑 agent_worker 停止");
+    Ok(())
+}
+
+/// 🔥 新增：带心跳的 agent_worker
+///
+/// 这是新的入口点，支持心跳和自动重启监控
+/// 保留原 `agent_worker` 函数以兼容现有代码
+pub async fn agent_worker_with_heartbeat(
+    mut request_rx: mpsc::UnboundedReceiver<LocalSetAgentRequest>,
+    mut handle: WorkerHandle,
+) -> Result<()> {
+    info!("🚀 agent_worker 启动（带心跳支持），开始监听请求...");
+
+    use agent_abstraction::session::{AcpAgentWorker, AgentWorker, WorkerRequest};
+    use agent_client_protocol::SessionId;
+    use tokio::time::{Duration, interval};
+
+    // 创建 AcpSessionManager，注入 AGENT_REGISTRY 作为 SessionRegistry
+    let session_manager = Arc::new(AcpSessionManager::<
+        StateAwareNotifier,
+        AcpAgentClient,
+        AgentSessionRegistry,
+    >::new(
+        Arc::new(StateAwareNotifier::new()),
+        AGENT_REGISTRY.clone(),
+    ));
+
+    // 创建 AcpAgentWorker
+    let worker = AcpAgentWorker::new(session_manager);
+
+    // 🆕 发送 Worker 就绪信号（仅在启动时发送一次，oneshot）
+    if let Some(ready_tx) = handle.ready_tx.take() {
+        let ready_signal = WorkerReady {
+            timestamp: Utc::now(),
+        };
+        if let Err(_e) = ready_tx.send(ready_signal) {
+            warn!("⚠️ [Worker] Ready 信号发送失败（接收端已关闭）");
+        } else {
+            info!("✅ [Worker] Ready 信号已发送，LocalSet 初始化完成");
+        }
+    }
+
+    // 🔥 启动心跳任务（在 LocalSet 中运行）
+    let heartbeat_tx = handle.heartbeat_tx.clone();
+    let heartbeat_task = tokio::task::spawn_local(async move {
+        let mut heartbeat_interval = interval(Duration::from_secs(5));
+        loop {
+            heartbeat_interval.tick().await;
+            let heartbeat = Heartbeat {
+                timestamp: Utc::now(),
+            };
+
+            if let Err(e) = heartbeat_tx.try_send(heartbeat) {
+                warn!("⚠️ [Worker] 心跳发送失败: {}", e);
+                // 如果监控任务已关闭，worker 也应该退出
+                break;
+            }
+        }
+    });
+
+    // 主处理循环
+    while let Some(request) = request_rx.recv().await {
+        let project_id = request.prompt_message.project_id.clone();
+        let request_id = request.prompt_message.request_id.clone();
+
+        info!(
+            "📨 接收到请求，project_id: {}, request_id: {}",
+            project_id, request_id
+        );
+
+        // 1. 预处理附件（agent_runner 特有逻辑）
+        let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
+            match ContentBuilder::attachments_to_content_blocks(
+                &request.prompt_message.attachments,
+                &request.prompt_message.project_path,
+            )
+            .await
+            {
+                Ok(blocks) => Some(blocks),
+                Err(e) => {
+                    error!("❌ 附件处理失败: {:?}", e);
+                    if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                        project_id: project_id.clone(),
+                        session_id: String::new(),
+                        code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
+                        error: Some(format!("附件处理失败: {:?}", e)),
+                        request_id: Some(request_id),
+                        service_type: request.prompt_message.service_type.clone(),
+                    }) {
+                        error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        // 2. 创建 WorkerRequest
+        let worker_request = WorkerRequest {
+            prompt_message: request.prompt_message.clone(),
+            model_provider: request.model_provider.clone(),
+            attachment_blocks,
+            service_uuid: request.service_uuid.clone(),
+            shared_api_key_manager: request.shared_api_key_manager.clone(),
+        };
+
+        // 3. 调用 AcpAgentWorker 处理（核心业务逻辑）
+        let worker_response = match worker.process_request(worker_request).await {
+            Ok(response) => response,
+            Err(e) => {
+                error!("❌ Worker 处理失败: {:?}", e);
+                if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                    project_id: project_id.clone(),
+                    session_id: String::new(),
+                    code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
+                    error: Some(format!("处理失败: {:?}", e)),
+                    request_id: Some(request_id.clone()),
+                    service_type: request.prompt_message.service_type.clone(),
+                }) {
+                    error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                }
+                continue;
+            }
+        };
+
+        // 4. 更新全局状态（使用统一的 AGENT_REGISTRY）
+        if worker_response.is_new_session {
+            if let Some(handles) = &worker_response.session_handles {
+                debug!("🆕 新会话，注册到 AGENT_REGISTRY");
+
+                let project_and_agent_info = ProjectAndAgentInfo {
+                    project_id: project_id.clone(),
+                    session_id: SessionId::new(Arc::from(worker_response.session_id.as_str())),
+                    prompt_tx: handles.prompt_tx.clone(),
+                    cancel_tx: handles.cancel_tx.clone(),
+                    model_provider: request.model_provider.clone(),
+                    request_id: Some(request_id.clone()),
+                    status: AgentStatus::Active,
+                    last_activity: Utc::now(),
+                    created_at: Utc::now(),
+                    stop_handle: handles.lifecycle_handle.clone(),
+                };
+
+                AGENT_REGISTRY.register(
+                    &project_id,
+                    &worker_response.session_id,
+                    project_and_agent_info,
+                );
+
+                info!(
+                    "🔗 Agent 已注册到 AGENT_REGISTRY: project_id={}, session_id={}",
+                    project_id, worker_response.session_id
+                );
+            }
+        } else {
+            debug!("♻️ 复用会话，无需更新全局 Registry");
+        }
+
+        // 5. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
+        SESSION_REQUEST_CONTEXT.insert(project_id, request_id.clone());
+
+        // 6. 转换并发送回执
+        let chat_prompt_response = ChatPromptResponse {
+            project_id: worker_response.project_id,
+            session_id: worker_response.session_id,
+            code: if worker_response.error.is_none() {
+                shared_types::error_codes::SUCCESS.to_string()
+            } else {
+                shared_types::error_codes::ERR_AGENT_ERROR.to_string()
+            },
+            error: worker_response.error,
+            request_id: worker_response.request_id,
+            service_type: worker_response.service_type,
+        };
+
+        if let Err(e) = request.chat_prompt_tx.send(chat_prompt_response) {
+            error!("❌ 发送回执失败: {:?}", e);
+        } else {
+            info!(
+                "✅ 回执已发送，project_id: {}",
+                request.prompt_message.project_id
+            );
+        }
+    }
+
+    // 清理心跳任务
+    heartbeat_task.abort();
 
     info!("🛑 agent_worker 停止");
     Ok(())

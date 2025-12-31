@@ -170,7 +170,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/proxy/config", get(handler::proxy_config))
         .with_state(state.clone());
 
-    // 调试路由（仅用于开发和问题排查）
+    // 调试路由（仅用于开发和问题排查，需要 feature flag "debug" 启用）
+    #[cfg(feature = "debug")]
     let debug_routes = Router::new()
         .route("/debug/sql", post(handler::debug_sql_query))
         .route("/debug/projects", get(handler::debug_list_projects))
@@ -183,12 +184,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handler::health_check))
         .with_state(state.clone());
 
-    Router::new()
+    let router = Router::new()
         .merge(health_routes)
         .merge(api_routes)
         .merge(computer_routes)
-        .merge(proxy_api_routes)
-        .merge(debug_routes) // 添加调试路由
+        .merge(proxy_api_routes);
+
+    // 仅在启用 debug feature 时添加调试路由
+    #[cfg(feature = "debug")]
+    let router = router.merge(debug_routes);
+
+    router
         .merge(create_swagger_ui())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
 }

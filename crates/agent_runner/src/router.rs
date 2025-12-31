@@ -5,6 +5,7 @@ use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
+use crate::agent_worker_manager::AgentWorkerManager;
 use crate::{config::AppConfig, handler, proxy_agent::LocalSetAgentRequest};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -27,8 +28,19 @@ pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
 
-    /// 本地任务发送器
+    /// ⚠️ 本地任务发送器（已弃用，保留仅用于兼容性）
+    ///
+    /// **重要**: 请使用 `agent_worker_manager.try_send()` 发送任务
+    /// 直接使用此字段会导致重启后发送到错误的通道
     pub local_task_sender: mpsc::UnboundedSender<LocalSetAgentRequest>,
+
+    /// 🆕 Agent Worker 管理器（用于监控和自动重启）
+    ///
+    /// **推荐**: 始终使用 `agent_worker_manager.try_send()` 发送任务
+    /// - 支持自动重启后的 sender 更新
+    /// - 提供健康状态检查
+    /// - 线程安全的原子操作
+    pub agent_worker_manager: Arc<AgentWorkerManager>,
 
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,

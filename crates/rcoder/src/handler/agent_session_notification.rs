@@ -2,6 +2,7 @@
 //!
 //! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
 
+use super::utils::get_realtime_container_ip_with_cache;
 use crate::{AppError, HttpResult};
 use axum::{
     extract::{Path, State},
@@ -571,45 +572,6 @@ async fn build_sse_stream_from_agent_info(
                 "GRPC_CONNECTION_ERROR",
                 "会话中缺少容器信息，请重新发起请求。",
             ))
-        }
-    }
-}
-
-/// 从 Docker API 实时获取容器 IP（带 5 秒缓存）
-///
-/// 使用容器名称（如 `computer-agent-runner-user_123`）查询，
-/// 因为 container_id 在容器重启后会改变，但 container_name 是稳定的。
-///
-/// 查询顺序：缓存 → Docker API → 回退到 fallback_ip
-async fn get_realtime_container_ip_with_cache(
-    container_name: &str,
-    cache: &crate::grpc::ContainerIpCache,
-    fallback_ip: &str,
-) -> Result<String, String> {
-    // 1. 先查缓存
-    if let Some(cached_ip) = cache.get(container_name) {
-        return Ok(cached_ip);
-    }
-
-    // 2. 缓存未命中，查询 Docker API
-    let docker_manager = docker_manager::global::get_global_docker_manager()
-        .await
-        .map_err(|e| format!("获取 DockerManager 失败: {}", e))?;
-
-    let network_ips = docker_manager
-        .get_container_network_info(container_name)
-        .await
-        .map_err(|e| format!("获取容器网络信息失败: {}", e))?;
-
-    // 3. 优先使用第一个可用的 IP，并写入缓存
-    match network_ips.values().next().cloned() {
-        Some(ip) => {
-            cache.insert(container_name.to_string(), ip.clone());
-            Ok(ip)
-        }
-        None => {
-            // 如果无法获取 IP，使用 fallback
-            Ok(fallback_ip.to_string())
         }
     }
 }

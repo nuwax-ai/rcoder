@@ -595,7 +595,13 @@ RUN curl -fsSL https://bun.sh/install | bash && \
 # 安装全局 npm 包（需要 root，因为安装到 /usr/lib/node_modules）
 RUN npm install -g @zed-industries/claude-code-acp@latest && \
     npm install -g @anthropic-ai/claude-code@latest && \
-    npm install -g chrome-devtools-mcp@latest
+    npm install -g chrome-devtools-mcp@latest && \
+    # 安装 Playwright（使用系统已安装的 Chromium，无需重复下载）
+    npx playwright install chromium && \
+    echo "✅ Playwright installed (using system Chromium)" && \
+    # 安装 pptxgenjs 和 sharp（全局安装，不受 /home/user 挂载影响）
+    npm install -g pptxgenjs sharp && \
+    echo "✅ pptxgenjs and sharp installed globally"
 
 # 安装 OpenSSL 开发包和构建依赖（mcp-stdio-proxy 需要）
 RUN apt-get update && apt-get install -y \
