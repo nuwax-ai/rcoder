@@ -510,14 +510,21 @@ async fn build_sse_stream_from_agent_info(
     session_id: String,
     project_id: String,
     grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     match agent_info.container() {
         Some(container) => {
-            // 🆕 关键修复：从 Docker API 实时获取容器的最新 IP 地址
+            // 🆕 关键修复：从 Docker API 实时获取容器的最新 IP 地址（带缓存）
             // 使用 container_name（如 computer-agent-runner-user_123）而非 container_id
             // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
-            let container_ip = match get_realtime_container_ip(&container.container_name).await {
+            let container_ip = match get_realtime_container_ip_with_cache(
+                &container.container_name,
+                &container_ip_cache,
+                &container.container_ip,
+            )
+            .await
+            {
                 Ok(ip) => {
                     if ip != container.container_ip {
                         info!(
@@ -568,11 +575,23 @@ async fn build_sse_stream_from_agent_info(
     }
 }
 
-/// 从 Docker API 实时获取容器 IP
+/// 从 Docker API 实时获取容器 IP（带 5 秒缓存）
 ///
 /// 使用容器名称（如 `computer-agent-runner-user_123`）查询，
 /// 因为 container_id 在容器重启后会改变，但 container_name 是稳定的。
-async fn get_realtime_container_ip(container_name: &str) -> Result<String, String> {
+///
+/// 查询顺序：缓存 → Docker API → 回退到 fallback_ip
+async fn get_realtime_container_ip_with_cache(
+    container_name: &str,
+    cache: &crate::grpc::ContainerIpCache,
+    fallback_ip: &str,
+) -> Result<String, String> {
+    // 1. 先查缓存
+    if let Some(cached_ip) = cache.get(container_name) {
+        return Ok(cached_ip);
+    }
+
+    // 2. 缓存未命中，查询 Docker API
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| format!("获取 DockerManager 失败: {}", e))?;
@@ -582,12 +601,17 @@ async fn get_realtime_container_ip(container_name: &str) -> Result<String, Strin
         .await
         .map_err(|e| format!("获取容器网络信息失败: {}", e))?;
 
-    // 优先使用第一个可用的 IP
-    network_ips
-        .values()
-        .next()
-        .cloned()
-        .ok_or_else(|| "容器未分配 IP 地址".to_string())
+    // 3. 优先使用第一个可用的 IP，并写入缓存
+    match network_ips.values().next().cloned() {
+        Some(ip) => {
+            cache.insert(container_name.to_string(), ip.clone());
+            Ok(ip)
+        }
+        None => {
+            // 如果无法获取 IP，使用 fallback
+            Ok(fallback_ip.to_string())
+        }
+    }
 }
 
 /// Agent 会话 SSE 通知处理器
@@ -782,6 +806,7 @@ pub async fn agent_session_notification(
         session_id.to_string(),
         project_id,
         state.grpc_pool.clone(),
+        state.container_ip_cache.clone(),
         "Agent",
     )
     .await
@@ -885,6 +910,7 @@ pub async fn computer_agent_progress_notification(
         session_id.to_string(),
         project_id,
         state.grpc_pool.clone(),
+        state.container_ip_cache.clone(),
         "Computer Agent",
     )
     .await

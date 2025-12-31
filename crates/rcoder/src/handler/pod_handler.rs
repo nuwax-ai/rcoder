@@ -1129,6 +1129,11 @@ pub async fn pod_restart(
             );
         }
 
+        // 🆕 使容器 IP 缓存失效（容器名称是稳定的）
+        state
+            .container_ip_cache
+            .invalidate(&container_info.container_name);
+
         // 等待一小段时间确保容器资源释放
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }

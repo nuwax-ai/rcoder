@@ -33,18 +33,20 @@ pub struct AppState {
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    /// 容器 IP 缓存（5秒 TTL，避免频繁调用 Docker API）
+    pub container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
 }
 
 impl AppState {
-    pub fn new(
-        config: AppConfig,
-        pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
-    ) -> Self {
+    pub fn new(config: AppConfig, pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>) -> Self {
         Self {
             config,
             projects: ProjectAdapter::new().expect("初始化 ProjectAdapter 失败"),
             pingora_service: pingora,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
+            container_ip_cache: Arc::new(crate::grpc::ContainerIpCache::new(
+                crate::grpc::DEFAULT_CACHE_TTL_SECONDS,
+            )),
         }
     }
 
