@@ -165,18 +165,13 @@ pub async fn handle_computer_chat(
     };
 
     info!(
-        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, prompt_len={}, attachments={}, model_provider={:?}",
+        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, prompt_len={}, attachments={}, model_provider={:?}, agent_config={:?}",
         user_id,
         project_id,
         request.prompt.len(),
         request.attachments.len(),
-        request.model_provider
-    );
-
-    // 打印 agent_config 配置信息（debug 级别）
-    info!(
-        "🔧 [COMPUTER_CHAT] agent_config 配置: user_id={}, project_id={}, agent_config={:?}",
-        user_id, project_id, request.agent_config
+        request.model_provider,
+        request.agent_config
     );
 
     // 3. 验证资源限制配置

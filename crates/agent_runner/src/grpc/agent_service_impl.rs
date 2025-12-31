@@ -236,8 +236,15 @@ impl AgentService for AgentServiceImpl {
         let req = request.into_inner();
 
         info!(
-            "🚀 [gRPC] Chat 请求: project_id={}, session_id={}, prompt={}",
-            req.project_id, req.session_id, req.prompt
+            "🚀 [gRPC] Chat 请求: project_id={}, session_id={}, prompt_len={}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
+            req.project_id,
+            req.session_id,
+            req.prompt.len(),
+            req.model_config,
+            req.service_type,
+            req.user_id,
+            !req.attachments.is_empty(),
+            !req.data_source_attachments.is_empty()
         );
 
         // 验证 prompt 不能为空
@@ -576,7 +583,9 @@ impl AgentService for AgentServiceImpl {
                                 let end_event = unified_message_to_progress_event(&unified_message);
 
                                 // 发送结束事件（忽略错误，因为客户端可能已经断开）
-                                let _ = tx.send(Ok(end_event)).await;
+                                if let Err(e) = tx.send(Ok(end_event)).await {
+                                    warn!("📡 [gRPC] 发送 SessionPromptEnd 事件失败: session_id={}, error={}", session_id_clone, e);
+                                }
 
                                 break;
                             }
@@ -615,7 +624,9 @@ impl AgentService for AgentServiceImpl {
                                             request_id: None,
                                             timestamp: chrono::Utc::now().timestamp_millis(),
                                         };
-                                        let _ = tx.send(Ok(end_event)).await;
+                                        if let Err(e) = tx.send(Ok(end_event)).await {
+                                            warn!("📡 [gRPC] 发送 SessionPromptEnd 事件失败: session_id={}, error={}", session_id_clone, e);
+                                        }
                                         break;
                                     }
                                 }
@@ -640,9 +651,15 @@ impl AgentService for AgentServiceImpl {
                 }
                 Err(e) => {
                     warn!("⚠️ [gRPC] 创建 session 连接失败: {}", e);
-                    let _ = tx
+                    if let Err(send_err) = tx
                         .send(Err(Status::internal(format!("创建连接失败: {}", e))))
-                        .await;
+                        .await
+                    {
+                        warn!(
+                            "📡 [gRPC] 发送错误状态失败: session_id={}, error={}",
+                            session_id_clone, send_err
+                        );
+                    }
                 }
             }
         });

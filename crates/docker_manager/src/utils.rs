@@ -86,7 +86,16 @@ impl DockerUtils {
         }
 
         if let Ok(ttl) = std::env::var("DOCKER_CONTAINER_TTL") {
-            config.container_ttl_seconds = ttl.parse().ok();
+            match ttl.parse() {
+                Ok(seconds) => config.container_ttl_seconds = Some(seconds),
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ [DOCKER] 无法解析 DOCKER_CONTAINER_TTL '{}': {}, 使用默认值",
+                        ttl,
+                        e
+                    );
+                }
+            }
         }
 
         config

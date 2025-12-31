@@ -141,9 +141,18 @@ pub fn from_grpc_progress_event(
 ) -> Option<UnifiedSessionMessage> {
     use chrono::Utc;
     use shared_types::SessionMessageType;
+    use tracing::warn;
 
-    let timestamp =
-        chrono::DateTime::from_timestamp_millis(event.timestamp).unwrap_or_else(|| Utc::now());
+    let timestamp = match chrono::DateTime::from_timestamp_millis(event.timestamp) {
+        Some(ts) => ts,
+        None => {
+            warn!(
+                "⚠️ [CONVERTER] 无效的时间戳: session_id={}, timestamp={}, 使用当前时间",
+                session_id, event.timestamp
+            );
+            Utc::now()
+        }
+    };
 
     // 从 message_type 字符串解析枚举
     let message_type = match event.message_type.as_str() {
@@ -154,8 +163,23 @@ pub fn from_grpc_progress_event(
         _ => SessionMessageType::AgentSessionUpdate, // 默认为 AgentSessionUpdate
     };
 
-    // 直接解析 payload JSON
-    let data = serde_json::from_str(&event.payload).unwrap_or_else(|_| serde_json::json!({}));
+    // 解析 payload JSON
+    let data = match serde_json::from_str(&event.payload) {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(
+                "⚠️ [CONVERTER] 解析 gRPC payload 失败: session_id={}, payload_preview={}, error={}",
+                session_id,
+                event.payload.chars().take(100).collect::<String>(),
+                e
+            );
+            // 返回包含原始 payload 的错误对象
+            serde_json::json!({
+                "_parse_error": e.to_string(),
+                "_original_payload": event.payload
+            })
+        }
+    };
 
     Some(UnifiedSessionMessage {
         session_id: session_id.to_string(),

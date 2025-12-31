@@ -41,7 +41,7 @@ impl ToString for ModelApiProtocol {
 }
 
 /// 模型提供商配置
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelProviderConfig {
     /// 模型id,确保唯一性
     #[schema(example = "id")]
@@ -89,7 +89,11 @@ impl ModelProviderConfig {
     /// 获取脱敏后的 API Key（只显示前4位和后4位）
     fn mask_api_key(&self) -> String {
         if self.api_key.len() > 8 {
-            format!("{}***{}", &self.api_key[..4], &self.api_key[self.api_key.len()-4..])
+            format!(
+                "{}***{}",
+                &self.api_key[..4],
+                &self.api_key[self.api_key.len() - 4..]
+            )
         } else {
             "***".to_string()
         }
@@ -102,6 +106,24 @@ impl fmt::Display for ModelProviderConfig {
         write!(
             f,
             "{{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}}}",
+            self.id,
+            self.name,
+            self.default_model,
+            self.base_url,
+            self.mask_api_key(),
+            self.requires_openai_auth,
+            self.api_protocol.as_deref().unwrap_or("None")
+        )
+    }
+}
+
+/// 自定义 Debug trait，脱敏敏感信息（与 Display 保持一致的输出格式）
+impl fmt::Debug for ModelProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 使用与 Display 相同的脱敏格式
+        write!(
+            f,
+            "ModelProviderConfig {{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}}}",
             self.id,
             self.name,
             self.default_model,

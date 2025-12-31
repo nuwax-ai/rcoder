@@ -242,18 +242,18 @@ async fn main() -> anyhow::Result<()> {
             info!("✅ [Pingora] 健康检查循环已启动");
         }
 
-        // 在后台任务中启动 Pingora 服务器
-        info!("🚀 [Pingora] 在后台任务中启动 Pingora 服务器...");
+        // 启动 Pingora 服务器（如果启动失败，直接退出程序）
+        info!("🚀 [Pingora] 启动 Pingora 服务器...");
         let handle = tokio::spawn(async move {
-            info!("📍 [Pingora] 后台任务已创建，正在调用 server_manager.start()...");
+            info!("📍 [Pingora] 正在调用 server_manager.start()...");
             if let Err(e) = server_manager.start().await {
-                error!("❌ [Pingora] Pingora 代理服务器启动失败: {:?}", e);
-            } else {
-                info!("✅ [Pingora] Pingora 服务器正常退出");
+                error!("❌ [Pingora] Pingora 代理服务器启动失败，程序退出: {:?}", e);
+                std::process::exit(1);
             }
+            info!("✅ [Pingora] Pingora 服务器正常退出");
         });
 
-        info!("✅ [Pingora] 后台任务已启动，handle created");
+        info!("✅ [Pingora] 后台任务已启动");
 
         (Some(handle), Some(pingora_service))
     } else {

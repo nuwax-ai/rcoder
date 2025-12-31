@@ -120,7 +120,7 @@ pub enum RouteType {
 /// assert_eq!(*matched.value, RouteType::PortProxy);
 /// assert_eq!(matched.params.get("port"), Some("8080"));
 /// ```
-pub fn create_router() -> Router<RouteType> {
+pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
     let mut router = Router::new();
 
     // ========================================================================
@@ -145,7 +145,10 @@ pub fn create_router() -> Router<RouteType> {
             "/computer/vnc/{user_id}/{project_id}/{*path}",
             RouteType::VncProxy,
         )
-        .expect("Failed to insert VNC proxy route");
+        .map_err(|e| {
+            tracing::error!("❌ [ROUTER] VNC 路由插入失败: {}", e);
+            anyhow::anyhow!("VNC route configuration error: {}", e)
+        })?;
 
     // ========================================================================
     // 端口反向代理路由
@@ -165,7 +168,10 @@ pub fn create_router() -> Router<RouteType> {
     //
     router
         .insert("/proxy/{port}/{*path}", RouteType::PortProxy)
-        .expect("Failed to insert port proxy route");
+        .map_err(|e| {
+            tracing::error!("❌ [ROUTER] 端口代理路由插入失败: {}", e);
+            anyhow::anyhow!("Port proxy route configuration error: {}", e)
+        })?;
 
     // ========================================================================
     // 健康检查路由
@@ -182,7 +188,10 @@ pub fn create_router() -> Router<RouteType> {
     //
     router
         .insert("/health", RouteType::HealthCheck)
-        .expect("Failed to insert health check route");
+        .map_err(|e| {
+            tracing::error!("❌ [ROUTER] 健康检查路由插入失败: {}", e);
+            anyhow::anyhow!("Health check route configuration error: {}", e)
+        })?;
 
     // ========================================================================
     // 🔒 API 密钥代理路由
@@ -208,9 +217,12 @@ pub fn create_router() -> Router<RouteType> {
     //
     router
         .insert("/api/{service_name}/{*path}", RouteType::ApiProxy)
-        .expect("Failed to insert API proxy route");
+        .map_err(|e| {
+            tracing::error!("❌ [ROUTER] API 代理路由插入失败: {}", e);
+            anyhow::anyhow!("API proxy route configuration error: {}", e)
+        })?;
 
-    router
+    Ok(router)
 }
 
 /// 获取所有路由的文档信息
@@ -318,9 +330,7 @@ mod tests {
         assert_eq!(matched.params.get("path"), Some("v1/messages"));
 
         // 测试 OpenAI API 路由
-        let matched = router
-            .at("/api/openai/v1/chat/completions")
-            .unwrap();
+        let matched = router.at("/api/openai/v1/chat/completions").unwrap();
         assert_eq!(*matched.value, RouteType::ApiProxy);
         assert_eq!(matched.params.get("service_name"), Some("openai"));
         assert_eq!(matched.params.get("path"), Some("v1/chat/completions"));

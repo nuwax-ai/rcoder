@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::config::ProxyConfig;
 use crate::service::PingoraProxyService;
@@ -39,7 +39,10 @@ impl ProxyServer {
 
         // 注意：这是一个库，实际的 Pingora 服务器需要由调用者启动
         // 这里只是准备服务实例
-        let pingora_proxy = self.service.create_pingora_proxy();
+        let pingora_proxy = self.service.create_pingora_proxy().map_err(|e| {
+            error!("❌ [SERVER] 创建 Pingora 代理实例失败: {}", e);
+            e
+        })?;
         info!("Pingora 代理服务已准备就绪");
         info!(
             "负载均衡算法: {}",
@@ -259,7 +262,7 @@ impl PingoraServerRunner {
     }
 
     /// 获取 Pingora 代理实例
-    pub fn create_pingora_proxy(&self) -> crate::service::PortProxy {
+    pub fn create_pingora_proxy(&self) -> anyhow::Result<crate::service::PortProxy> {
         self.service.create_pingora_proxy()
     }
 }

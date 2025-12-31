@@ -392,7 +392,13 @@ impl Drop for AgentLifecycleGuard {
                     if let Ok(mut child_guard) = child_process.try_lock()
                         && let Some(mut child) = child_guard.take()
                     {
-                        let _ = child.start_kill();
+                        if let Err(e) = child.start_kill() {
+                            tracing::warn!(
+                                "⚠️ [AGENT] start_kill 失败: project_id={}, error={}",
+                                self.inner.project_id,
+                                e
+                            );
+                        }
                     }
                 }
             }
