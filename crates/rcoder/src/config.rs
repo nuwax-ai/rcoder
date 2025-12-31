@@ -97,6 +97,9 @@ pub struct CleanupConfigSettings {
     /// Docker容器停止超时时间（秒），默认30秒
     #[serde(default = "default_docker_stop_timeout_seconds")]
     pub docker_stop_timeout_seconds: u64,
+    /// 容器最小保护时间（秒），默认300秒（5分钟）
+    #[serde(default = "default_container_protection_seconds")]
+    pub container_protection_seconds: u64,
 }
 
 fn default_idle_timeout_seconds() -> u64 {
@@ -111,12 +114,17 @@ fn default_docker_stop_timeout_seconds() -> u64 {
     30
 }
 
+fn default_container_protection_seconds() -> u64 {
+    300 // 5分钟
+}
+
 impl Default for CleanupConfigSettings {
     fn default() -> Self {
         Self {
             idle_timeout_seconds: default_idle_timeout_seconds(),
             cleanup_interval_seconds: default_cleanup_interval_seconds(),
             docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),
+            container_protection_seconds: default_container_protection_seconds(),
         }
     }
 }

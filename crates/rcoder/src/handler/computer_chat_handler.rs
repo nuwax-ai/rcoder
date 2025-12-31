@@ -212,6 +212,15 @@ pub async fn handle_computer_chat(
         user_id, container_info.container_id, container_info.container_ip
     );
 
+    // 🛡️ 关键修复：容器创建成功后立即插入 DuckDB 记录
+    // 这样可以防止孤立容器清理器误判并清理刚创建的容器
+    //
+    // 必须在 gRPC 请求之前就插入记录，因为：
+    // 1. 孤立容器清理器会检查 DuckDB 中是否存在该 user_id 的记录
+    // 2. 如果记录不存在，容器会被判定为孤立并清理
+    // 3. gRPC 请求是异步的，可能需要较长时间才能返回
+    ensure_project_mapping_in_state(&state, &user_id, &project_id, &container_info, &request)?;
+
     // 请求到达时立即更新活动时间（不等待请求执行结果）
     // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
     // 注意：这里使用 project_id 而不是 user_id，因为 DuckDB 的 key 是 project_id
@@ -552,6 +561,62 @@ async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Res
     info!(
         "✅ [COMPUTER_CHAT] 项目工作目录已创建: user_id={}, project_id={}, path={:?}",
         user_id, project_id, project_workspace_path
+    );
+
+    Ok(())
+}
+
+/// 确保 DuckDB 中存在 project_id 到容器的映射
+///
+/// 🛡️ 关键修复：容器创建成功后立即插入 DuckDB 记录
+///
+/// 这样可以防止孤立容器清理器误判并清理刚创建的容器，因为：
+/// 1. 孤立容器清理器会检查 DuckDB 中是否存在该 user_id 关联的记录
+/// 2. 如果记录不存在，容器会被判定为孤立并清理
+/// 3. gRPC 请求是异步的，可能需要较长时间才能返回
+///
+/// # Arguments
+/// * `state` - 应用状态
+/// * `user_id` - 用户 ID
+/// * `project_id` - 项目 ID
+/// * `container_info` - 容器信息
+/// * `request` - 聊天请求
+fn ensure_project_mapping_in_state(
+    state: &Arc<crate::router::AppState>,
+    user_id: &str,
+    project_id: &str,
+    container_info: &ContainerBasicInfo,
+    request: &ComputerChatRequest,
+) -> Result<(), AppError> {
+    // 检查是否已存在该 project_id 的记录
+    if state.get_project(project_id).is_some() {
+        debug!(
+            "🔄 [COMPUTER_CHAT] DuckDB 记录已存在: project_id={}",
+            project_id
+        );
+        return Ok(());
+    }
+
+    // 创建新的 ProjectAndContainerInfo
+    let mut project_info = shared_types::ProjectAndContainerInfo::new(project_id.to_string());
+
+    // 设置 user_id（ComputerAgentRunner 模式）
+    project_info.set_user_id(Some(user_id.to_string()));
+
+    // 更新容器信息
+    project_info.update_extended_from_request(
+        Some(container_info.clone()),
+        request.model_provider.clone(),
+        request.request_id.clone(),
+        Some(shared_types::ServiceType::ComputerAgentRunner),
+    );
+
+    // 立即插入到 DuckDB
+    state.insert_project(project_id.to_string(), Arc::new(project_info));
+
+    info!(
+        "🆕 [COMPUTER_CHAT] 已插入 DuckDB 记录（容器创建后立即）: user_id={}, project_id={}, container_id={}",
+        user_id, project_id, container_info.container_id
     );
 
     Ok(())
