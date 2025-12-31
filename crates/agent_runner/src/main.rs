@@ -326,45 +326,59 @@ fn run_agent_worker_thread(
 ///
 /// 监听心跳信号，检测 worker 是否崩溃，并自动重启
 ///
-/// 🆕 优化：增加 ready_rx 参数，等待 Worker 发送就绪信号后才设置 Running 状态
+/// 🆕 优化：
+/// - 增加 ready_rx 参数，等待 Worker 发送就绪信号后才设置 Running 状态
+/// - 添加重试逻辑，restart_worker 失败时不会导致监控任务退出
+/// - 添加连续失败计数、指数退避和冷却时间
 async fn monitor_worker_health(
     worker_manager: Arc<AgentWorkerManager>,
     mut heartbeat_rx: tokio::sync::mpsc::Receiver<agent_worker_manager::Heartbeat>,
     ready_rx: tokio::sync::oneshot::Receiver<agent_worker_manager::WorkerReady>,
 ) -> anyhow::Result<()> {
-    use tokio::time::{Duration, interval, timeout};
+    use tokio::time::{Duration, interval, sleep, timeout};
+
+    const MAX_RESTART_ATTEMPTS: u32 = 5; // 最大连续重启次数
+    const RESTART_COOLDOWN_SECS: u64 = 60; // 冷却时间（秒）
+    const RESTART_BACKOFF_BASE_SECS: u64 = 2; // 指数退避基数（秒）
+
+    let mut consecutive_failures: u32 = 0;
+    let mut last_successful_start = std::time::Instant::now();
 
     info!("🔍 [WorkerMonitor] 健康监控任务已启动，等待 Worker 就绪...");
 
-    // 🆕 等待 Worker 发送就绪信号（带 30 秒超时，oneshot）
-    let mut initial_ready_failed = false;
+    // 🆕 等待初始 Worker 就绪信号（带 30 秒超时）
     match timeout(Duration::from_secs(30), ready_rx).await {
         Ok(Ok(_ready)) => {
             worker_manager.update_state(agent_worker_manager::WorkerState::Running);
+            last_successful_start = std::time::Instant::now();
             info!("✅ [WorkerMonitor] Worker 就绪，状态已更新为 Running");
         }
         Ok(Err(_)) => {
+            consecutive_failures += 1;
             error!("❌ [WorkerMonitor] Ready 通道意外关闭，将触发重启");
-            initial_ready_failed = true;
+            // 尝试重启
+            if let Ok((new_hb_rx, new_ready_rx)) = restart_worker(worker_manager.clone()).await {
+                heartbeat_rx = new_hb_rx;
+                if let Ok(Ok(_)) = timeout(Duration::from_secs(30), new_ready_rx).await {
+                    worker_manager.update_state(agent_worker_manager::WorkerState::Running);
+                    consecutive_failures = 0;
+                    last_successful_start = std::time::Instant::now();
+                    info!("✅ [WorkerMonitor] 重启后 Worker 就绪");
+                }
+            }
         }
         Err(_) => {
+            consecutive_failures += 1;
             error!("❌ [WorkerMonitor] Worker 启动超时（30 秒未收到就绪信号），将触发重启");
-            initial_ready_failed = true;
-        }
-    }
-
-    // 🆕 如果初始 Ready 失败，立即触发重启
-    if initial_ready_failed {
-        let (new_hb_rx, new_ready_rx) = restart_worker(worker_manager.clone()).await?;
-        heartbeat_rx = new_hb_rx;
-        // 等待重启后的 Ready 信号
-        match timeout(Duration::from_secs(30), new_ready_rx).await {
-            Ok(Ok(_ready)) => {
-                worker_manager.update_state(agent_worker_manager::WorkerState::Running);
-                info!("✅ [WorkerMonitor] 重启后 Worker 就绪，状态已更新为 Running");
-            }
-            _ => {
-                error!("❌ [WorkerMonitor] 重启后 Worker 仍未就绪，继续监控...");
+            // 尝试重启
+            if let Ok((new_hb_rx, new_ready_rx)) = restart_worker(worker_manager.clone()).await {
+                heartbeat_rx = new_hb_rx;
+                if let Ok(Ok(_)) = timeout(Duration::from_secs(30), new_ready_rx).await {
+                    worker_manager.update_state(agent_worker_manager::WorkerState::Running);
+                    consecutive_failures = 0;
+                    last_successful_start = std::time::Instant::now();
+                    info!("✅ [WorkerMonitor] 重启后 Worker 就绪");
+                }
             }
         }
     }
@@ -388,18 +402,56 @@ async fn monitor_worker_health(
             _ = heartbeat_check.tick() => {
                 if worker_manager.check_heartbeat_timeout() {
                     error!("❌ [WorkerMonitor] 心跳超时，agent_worker 可能已崩溃");
-                    // 重启并获取新的通道
-                    let (new_heartbeat_rx, new_ready_rx) = restart_worker(worker_manager.clone()).await?;
-                    heartbeat_rx = new_heartbeat_rx;
 
-                    // 🆕 等待重启后的 Worker 发送就绪信号（oneshot）
-                    match timeout(Duration::from_secs(30), new_ready_rx).await {
-                        Ok(Ok(_ready)) => {
-                            worker_manager.update_state(agent_worker_manager::WorkerState::Running);
-                            info!("✅ [WorkerMonitor] 重启后 Worker 就绪，状态已更新为 Running");
+                    // 🆕 检查是否需要冷却
+                    if consecutive_failures >= MAX_RESTART_ATTEMPTS {
+                        let elapsed = last_successful_start.elapsed();
+                        if elapsed < Duration::from_secs(RESTART_COOLDOWN_SECS) {
+                            let remaining = RESTART_COOLDOWN_SECS - elapsed.as_secs();
+                            warn!(
+                                "⏳ [WorkerMonitor] 连续重启失败 {} 次，进入冷却期（剩余 {} 秒）",
+                                consecutive_failures, remaining
+                            );
+                            continue; // 跳过本次重启，等待冷却期
+                        } else {
+                            // 冷却期结束，重置计数
+                            info!("🔄 [WorkerMonitor] 冷却期结束，重置失败计数");
+                            consecutive_failures = 0;
                         }
-                        _ => {
-                            error!("❌ [WorkerMonitor] 重启后 Worker 启动超时");
+                    }
+
+                    // 🆕 指数退避等待
+                    if consecutive_failures > 0 {
+                        let backoff = RESTART_BACKOFF_BASE_SECS.pow(consecutive_failures);
+                        let backoff = backoff.min(30); // 最大 30 秒
+                        warn!(
+                            "⏳ [WorkerMonitor] 等待 {} 秒后重试（第 {} 次重试）",
+                            backoff, consecutive_failures + 1
+                        );
+                        sleep(Duration::from_secs(backoff)).await;
+                    }
+
+                    // 尝试重启
+                    match restart_worker(worker_manager.clone()).await {
+                        Ok((new_hb_rx, new_ready_rx)) => {
+                            heartbeat_rx = new_hb_rx;
+                            // 等待 Ready 信号
+                            match timeout(Duration::from_secs(30), new_ready_rx).await {
+                                Ok(Ok(_ready)) => {
+                                    worker_manager.update_state(agent_worker_manager::WorkerState::Running);
+                                    consecutive_failures = 0;
+                                    last_successful_start = std::time::Instant::now();
+                                    info!("✅ [WorkerMonitor] 重启后 Worker 就绪，状态已更新为 Running");
+                                }
+                                _ => {
+                                    consecutive_failures += 1;
+                                    error!("❌ [WorkerMonitor] 重启后 Worker 启动超时（第 {} 次失败）", consecutive_failures);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            error!("❌ [WorkerMonitor] restart_worker 失败（第 {} 次）: {}", consecutive_failures, e);
                         }
                     }
                 }
@@ -433,23 +485,23 @@ async fn restart_worker(
     // 3. 创建新的心跳通道
     let (new_heartbeat_tx, new_heartbeat_rx) = tokio::sync::mpsc::channel(100);
 
-    // 3. 创建新的就绪信号通道（oneshot）
+    // 4. 创建新的就绪信号通道（oneshot）
     let (new_ready_tx, new_ready_rx) = tokio::sync::oneshot::channel();
 
-    // 4. 创建新的任务通道
+    // 5. 创建新的任务通道
     let (new_sender, new_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    // 5. 创建新的 worker handle（包含心跳和就绪通道）
+    // 6. 创建新的 worker handle（包含心跳和就绪通道）
     let worker_handle = worker_manager.create_handle(new_heartbeat_tx, new_ready_tx);
 
-    // 6. 启动新的 worker 线程
+    // 7. 启动新的 worker 线程
     std::thread::spawn(move || {
         if let Err(e) = run_agent_worker_thread(new_receiver, worker_handle) {
             error!("❌ [WorkerThread] 重启的 agent_worker 崩溃: {}", e);
         }
     });
 
-    // 7. 原子替换 sender
+    // 8. 原子替换 sender
     worker_manager.replace_sender(new_sender);
 
     // 🆕 不再立即设置 Running 状态，等待 Ready 信号后由 monitor_worker_health 设置
