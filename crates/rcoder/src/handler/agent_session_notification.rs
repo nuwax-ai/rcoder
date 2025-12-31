@@ -512,14 +512,31 @@ async fn build_sse_stream_from_agent_info(
     grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
-    // 🎯 直接从 agent_info 中获取容器 IP 构建 gRPC 地址
     match agent_info.container() {
         Some(container) => {
-            let grpc_addr = format!(
-                "{}:{}",
-                container.container_ip,
-                shared_types::GRPC_DEFAULT_PORT
-            );
+            // 🆕 关键修复：从 Docker API 实时获取容器的最新 IP 地址
+            // 使用 container_name（如 computer-agent-runner-user_123）而非 container_id
+            // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
+            let container_ip = match get_realtime_container_ip(&container.container_name).await {
+                Ok(ip) => {
+                    if ip != container.container_ip {
+                        info!(
+                            "🔄 [gRPC_SSE] 检测到容器 IP 变化: container_name={}, 缓存IP={}, 实时IP={}",
+                            container.container_name, container.container_ip, ip
+                        );
+                    }
+                    ip
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [gRPC_SSE] 获取实时 IP 失败: {}, 回退使用缓存 IP: {}",
+                        e, container.container_ip
+                    );
+                    container.container_ip.clone()
+                }
+            };
+
+            let grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
             info!(
                 "🚀 [gRPC_SSE] 建立 {} gRPC SSE 代理连接: {}, project_id={}",
                 agent_type, grpc_addr, project_id
@@ -551,7 +568,30 @@ async fn build_sse_stream_from_agent_info(
     }
 }
 
+/// 从 Docker API 实时获取容器 IP
+///
+/// 使用容器名称（如 `computer-agent-runner-user_123`）查询，
+/// 因为 container_id 在容器重启后会改变，但 container_name 是稳定的。
+async fn get_realtime_container_ip(container_name: &str) -> Result<String, String> {
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| format!("获取 DockerManager 失败: {}", e))?;
+
+    let network_ips = docker_manager
+        .get_container_network_info(container_name)
+        .await
+        .map_err(|e| format!("获取容器网络信息失败: {}", e))?;
+
+    // 优先使用第一个可用的 IP
+    network_ips
+        .values()
+        .next()
+        .cloned()
+        .ok_or_else(|| "容器未分配 IP 地址".to_string())
+}
+
 /// Agent 会话 SSE 通知处理器
+
 ///
 /// 此接口直接返回 SSE 流，实现从容器到客户端的实时消息转发
 ///

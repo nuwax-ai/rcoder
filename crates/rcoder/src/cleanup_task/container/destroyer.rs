@@ -5,7 +5,9 @@
 use anyhow::Result;
 use shared_types::ServiceType;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
+
+use crate::cleanup_task::strategies::DestroyReason;
 
 /// 容器销毁器
 pub struct ContainerDestroyer {
@@ -27,22 +29,30 @@ impl ContainerDestroyer {
         }
     }
 
-    /// 销毁容器并清理相关资源
+    /// 销毁容器并清理相关资源（带原因）
     ///
     /// # 参数
     /// * `container_id` - 容器 ID
     /// * `service_type` - 服务类型（用于决定是否清理 VNC 后端）
     /// * `container_identifier` - 容器标识符（project_id 或 user_id）
-    pub async fn destroy(
+    /// * `reason` - 销毁原因
+    pub async fn destroy_with_reason(
         &self,
         container_id: &str,
         service_type: &ServiceType,
         container_identifier: &str,
+        reason: &DestroyReason,
     ) -> Result<()> {
         info!(
-            "🔥 [destroyer] 开始销毁容器: container_id={}, service_type={:?}, identifier={}",
-            container_id, service_type, container_identifier
+            "🔥 [destroyer] 开始销毁容器: container_id={}, service_type={:?}, identifier={}, 原因={}",
+            container_id,
+            service_type,
+            container_identifier,
+            reason.as_str()
         );
+
+        // 输出详细原因
+        debug!("📋 [destroyer] 销毁详情: {}", reason.description());
 
         // 1. 执行物理销毁（这会自动清理 gRPC 连接池中的连接）
         docker_manager::container_stop::runtime_cleanup_container(
@@ -59,7 +69,31 @@ impl ContainerDestroyer {
             }
         }
 
-        info!("✅ [destroyer] 容器销毁完成: {}", container_id);
+        info!(
+            "✅ [destroyer] 容器销毁完成: container_id={}, 原因={}",
+            container_id,
+            reason.as_str()
+        );
         Ok(())
+    }
+
+    /// 销毁容器并清理相关资源（兼容旧接口）
+    ///
+    /// # 参数
+    /// * `container_id` - 容器 ID
+    /// * `service_type` - 服务类型（用于决定是否清理 VNC 后端）
+    /// * `container_identifier` - 容器标识符（project_id 或 user_id）
+    pub async fn destroy(
+        &self,
+        container_id: &str,
+        service_type: &ServiceType,
+        container_identifier: &str,
+    ) -> Result<()> {
+        // 使用默认原因
+        let reason = DestroyReason::ManualStop {
+            source: "unknown".to_string(),
+        };
+        self.destroy_with_reason(container_id, service_type, container_identifier, &reason)
+            .await
     }
 }
