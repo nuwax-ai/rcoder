@@ -66,7 +66,12 @@ pub async fn create_grpc_sse_stream(
                             session_id_clone
                         );
                         let end_event = create_session_prompt_end_event(&session_id_clone);
-                        let _ = tx.send(Ok(end_event)).await;
+                        if let Err(e) = tx.send(Ok(end_event)).await {
+                            warn!(
+                                "⚠️ [gRPC_SSE] 发送 SessionPromptEnd 事件失败: session_id={}, error={}",
+                                session_id_clone, e
+                            );
+                        }
                         return; // 直接结束，不建立流
                     }
                     info!(
@@ -152,7 +157,12 @@ pub async fn create_grpc_sse_stream(
         let error_event = axum::response::sse::Event::default()
             .event("error")
             .data(format!("gRPC 连接失败: {}", last_error_msg));
-        let _ = tx.send(Ok(error_event)).await;
+        if let Err(e) = tx.send(Ok(error_event)).await {
+            warn!(
+                "⚠️ [gRPC_SSE] 发送错误事件失败: session_id={}, error={}",
+                session_id_clone, e
+            );
+        }
     });
 
     tokio_stream::wrappers::ReceiverStream::new(rx)
@@ -173,7 +183,17 @@ fn create_session_prompt_end_event(session_id: &str) -> axum::response::sse::Eve
         timestamp: Utc::now(),
     };
 
-    let json_data = serde_json::to_string(&unified_message).unwrap_or_else(|_| "{}".to_string());
+    let json_data = match serde_json::to_string(&unified_message) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(
+                "⚠️ [gRPC_SSE] 序列化 SessionPromptEnd 消息失败: {}, error={}",
+                session_id, e
+            );
+            // 返回最小可用结构，而不是空对象
+            r#"{"session_id":""} "#.to_string()
+        }
+    };
 
     axum::response::sse::Event::default()
         .event("prompt_end")
@@ -193,8 +213,16 @@ fn progress_event_to_sse(
         serde_json::from_str(&event.payload).unwrap_or(serde_json::Value::Null);
 
     // 将 gRPC 时间戳（毫秒）转换为 DateTime<Utc>
-    let timestamp =
-        DateTime::<Utc>::from_timestamp_millis(event.timestamp).unwrap_or_else(Utc::now);
+    let timestamp = match DateTime::<Utc>::from_timestamp_millis(event.timestamp) {
+        Some(ts) => ts,
+        None => {
+            warn!(
+                "⚠️ [gRPC_SSE] 无效的时间戳: session_id={}, timestamp={}, 使用当前时间",
+                session_id, event.timestamp
+            );
+            Utc::now()
+        }
+    };
 
     // 将 message_type 字符串转换为 SessionMessageType 枚举
     let message_type = parse_message_type(&event.message_type);
@@ -209,7 +237,17 @@ fn progress_event_to_sse(
     };
 
     // 序列化为 JSON
-    let json_data = serde_json::to_string(&unified_message).unwrap_or_else(|_| "{}".to_string());
+    let json_data = match serde_json::to_string(&unified_message) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(
+                "⚠️ [gRPC_SSE] 序列化 ProgressEvent 消息失败: session_id={}, message_type={}, error={}",
+                session_id, event.message_type, e
+            );
+            // 返回最小可用结构
+            r#"{"session_id":"","message_type":"Unknown","data":null}"#.to_string()
+        }
+    };
 
     // 使用 sub_type 作为 SSE 事件名
     // 前端通过 eventSource.addEventListener('agent_message_chunk', ...) 等方式监听

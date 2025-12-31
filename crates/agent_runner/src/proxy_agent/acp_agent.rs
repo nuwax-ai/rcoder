@@ -61,7 +61,10 @@ impl LocalSetAgentRequest {
     }
 
     /// 设置 shared_api_key_manager
-    pub fn with_key_manager(mut self, key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>) -> Self {
+    pub fn with_key_manager(
+        mut self,
+        key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    ) -> Self {
         self.shared_api_key_manager = key_manager;
         self
     }
@@ -112,14 +115,16 @@ pub async fn agent_worker(
                 Ok(blocks) => Some(blocks),
                 Err(e) => {
                     error!("❌ 附件处理失败: {:?}", e);
-                    let _ = request.chat_prompt_tx.send(ChatPromptResponse {
+                    if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                         project_id: project_id.clone(),
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
                         error: Some(format!("附件处理失败: {:?}", e)),
                         request_id: Some(request_id),
                         service_type: request.prompt_message.service_type.clone(),
-                    });
+                    }) {
+                        error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                    }
                     continue;
                 }
             }
@@ -141,14 +146,16 @@ pub async fn agent_worker(
             Ok(response) => response,
             Err(e) => {
                 error!("❌ Worker 处理失败: {:?}", e);
-                let _ = request.chat_prompt_tx.send(ChatPromptResponse {
+                if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                     project_id: project_id.clone(),
                     session_id: String::new(),
                     code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
                     error: Some(format!("处理失败: {:?}", e)),
                     request_id: Some(request_id.clone()),
                     service_type: request.prompt_message.service_type.clone(),
-                });
+                }) {
+                    error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                }
                 continue;
             }
         };

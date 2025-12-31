@@ -106,11 +106,8 @@ impl ContainerStatusChecker {
     /// 检查所有容器的状态
     async fn check_all_containers(&self) -> anyhow::Result<()> {
         // 收集所有需要检查的容器（创建快照，使用 DuckDB 存储）
-        let containers: Vec<(String, Arc<shared_types::ProjectAndContainerInfo>)> = self
-            .state
-            .projects
-            .iter()
-            .collect();
+        let containers: Vec<(String, Arc<shared_types::ProjectAndContainerInfo>)> =
+            self.state.projects.iter().collect();
 
         if containers.is_empty() {
             debug!("📭 [STATUS_CHECKER] 没有需要检查的容器");
@@ -216,11 +213,15 @@ impl ContainerStatusChecker {
                         return Ok(false);
                     }
                     // 🆕 同步更新 agent 状态为 Active
-                    let _ = self.state.projects.update_agent_status(
-                        lookup_key,
-                        1, // Active
+                    if let Err(e) = self.state.projects.update_agent_status(
+                        lookup_key, 1, // Active
                         "active",
-                    );
+                    ) {
+                        warn!(
+                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Active 失败: {}, error={}",
+                            lookup_key, e
+                        );
+                    }
                     debug!(
                         "✅ [STATUS_CHECKER] 容器活跃，已更新活动时间和状态: {}",
                         lookup_key
@@ -228,12 +229,19 @@ impl ContainerStatusChecker {
                     Ok(true)
                 } else {
                     // 🆕 同步更新 agent 状态为 Idle
-                    let _ = self.state.projects.update_agent_status(
-                        lookup_key,
-                        0, // Idle
+                    if let Err(e) = self.state.projects.update_agent_status(
+                        lookup_key, 0, // Idle
                         "idle",
+                    ) {
+                        warn!(
+                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Idle 失败: {}, error={}",
+                            lookup_key, e
+                        );
+                    }
+                    debug!(
+                        "📭 [STATUS_CHECKER] 容器空闲，已更新状态为 Idle: {}",
+                        lookup_key
                     );
-                    debug!("📭 [STATUS_CHECKER] 容器空闲，已更新状态为 Idle: {}", lookup_key);
                     Ok(false)
                 }
             }

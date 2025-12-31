@@ -216,7 +216,12 @@ impl ProjectAdapter {
                 if updated {
                     // 同时更新关联容器的活动时间
                     if let Some(container_id) = self.get_container_id_by_session(session_id) {
-                        let _ = self.storage.update_container_activity(&container_id);
+                        if let Err(e) = self.storage.update_container_activity(&container_id) {
+                            warn!(
+                                "⚠️ [STORAGE] 更新容器活动时间失败: container_id={}, error={}",
+                                container_id, e
+                            );
+                        }
                     }
                 }
                 updated

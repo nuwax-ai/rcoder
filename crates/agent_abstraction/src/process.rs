@@ -86,7 +86,13 @@ impl Drop for AgentProcess {
     fn drop(&mut self) {
         // Try to kill the process if it's still running
         if let Ok(mut child) = self.child.try_lock() {
-            let _ = child.start_kill();
+            if let Err(e) = child.start_kill() {
+                tracing::warn!(
+                    "⚠️ [PROCESS] start_kill 失败（进程可能已结束）: id={}, error={}",
+                    self.id,
+                    e
+                );
+            }
         }
     }
 }

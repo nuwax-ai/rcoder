@@ -275,7 +275,16 @@ impl DockerConfig {
         // 应用容器存活时间
         if let Ok(val) = std::env::var("RCODER_CONTAINER_TTL") {
             info!("应用环境变量 RCODER_CONTAINER_TTL");
-            self.container_ttl_seconds = val.parse().ok();
+            match val.parse() {
+                Ok(seconds) => self.container_ttl_seconds = Some(seconds),
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ [CONFIG] 无法解析 RCODER_CONTAINER_TTL '{}': {}, 使用默认值",
+                        val,
+                        e
+                    );
+                }
+            }
         }
 
         Ok(())

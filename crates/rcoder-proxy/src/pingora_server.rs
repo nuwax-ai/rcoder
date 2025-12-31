@@ -8,11 +8,11 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
-use pingora_core::protocols::Digest;
-use pingora_core::server::configuration::Opt;
-use pingora_core::server::Server;
-use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result as PingoraResult;
+use pingora_core::protocols::Digest;
+use pingora_core::server::Server;
+use pingora_core::server::configuration::Opt;
+use pingora_core::upstreams::peer::HttpPeer;
 
 use crate::config::ProxyConfig;
 use crate::service::{PingoraProxyService, PortProxy};
@@ -71,7 +71,10 @@ impl PingoraServerManager {
         my_server.bootstrap();
 
         // 创建代理服务实例
-        let proxy_service = self.service.create_pingora_proxy();
+        let proxy_service = self.service.create_pingora_proxy().map_err(|e| {
+            error!("❌ [PINGORA] 创建代理服务实例失败: {}", e);
+            e
+        })?;
         let proxy_service = Arc::new(proxy_service);
         // 创建 HTTP 代理服务
         let mut http_proxy = pingora_proxy::http_proxy_service(
@@ -117,7 +120,9 @@ impl PingoraServerManager {
     /// 停止 Pingora 服务器
     pub async fn stop(&mut self) -> Result<()> {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+            if let Err(_) = shutdown_tx.send(()) {
+                error!("⚠️ [PINGORA] 发送关闭信号失败（接收端已关闭）");
+            }
         }
         Ok(())
     }
@@ -137,7 +142,9 @@ struct ProxyServiceWrapper {
 impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
     type CTX = crate::service::TrackingCtx;
 
-    fn new_ctx(&self) -> Self::CTX { crate::service::TrackingCtx::new() }
+    fn new_ctx(&self) -> Self::CTX {
+        crate::service::TrackingCtx::new()
+    }
 
     async fn upstream_peer(
         &self,

@@ -7,7 +7,7 @@
 //! 支持 `/computer/vnc/{user_id}/{project_id}` 路径的 WebSocket 透明代理，
 //! 将请求路由到对应用户容器的 noVNC 服务（端口 6080）。
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use matchit::{Params, Router};
@@ -21,16 +21,16 @@ use tracing::{debug, error, info, warn};
 use shared_types::ModelProviderConfig;
 
 // Pingora 相关导入
+use pingora_core::Result as PingoraResult;
 use pingora_core::protocols::Digest;
 use pingora_core::protocols::TcpKeepalive;
-use pingora_core::upstreams::peer::{HttpPeer, ALPN};
-use pingora_core::Result as PingoraResult;
+use pingora_core::upstreams::peer::{ALPN, HttpPeer};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_load_balancing::{health_check, selection::RoundRobin, LoadBalancer};
+use pingora_load_balancing::{LoadBalancer, health_check, selection::RoundRobin};
 use pingora_proxy::{ProxyHttp, Session};
 
 use crate::config::ProxyConfig;
-use crate::router::{create_router, RouteType};
+use crate::router::{RouteType, create_router};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::net::TcpStream;
@@ -533,12 +533,7 @@ impl ProxyHttp for PortProxy {
             let reused = if ctx.connection_reused { "是" } else { "否" };
             debug!(
                 "📡 [API_PROXY] 上游响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
-                upstream_host,
-                upstream_response.status,
-                http_ver,
-                ctx.use_tls,
-                reused,
-                duration
+                upstream_host, upstream_response.status, http_ver, ctx.use_tls, reused, duration
             );
         } else {
             debug!("收到上游响应: {}", upstream_response.status);
@@ -864,11 +859,6 @@ impl PortProxy {
         ctx.upstream_host = Some(format!("{}:{}", host, port));
         ctx.use_tls = use_tls;
 
-        info!(
-            "🔗 [API_PROXY] {} -> {}:{} (TLS: {}, ALPN: H2H1)",
-            service_name, host, port, use_tls
-        );
-
         // 5. 创建真实 API 端点的 HttpPeer
         // 注意：SNI 必须设置为目标主机名，否则 TLS 握手会失败
         // 同时需要启用 HTTP/2 支持，因为很多 API 服务（如 open.bigmodel.cn）强制使用 HTTP/2
@@ -879,6 +869,21 @@ impl PortProxy {
         );
         // 启用 HTTP/2 支持，优先 H2，兼容 H1
         peer.options.alpn = ALPN::H2H1;
+
+        // 5.1 打印代理连接信息（在 ALPN 设置之后，确保日志准确性）
+        let alpn_str = match peer.options.alpn {
+            ALPN::H2 => "H2",
+            ALPN::H2H1 => "H2H1",
+            ALPN::H1 => "H1",
+        };
+        info!(
+            "🔗 [API_PROXY] {} -> {}:{} (TLS: {}, ALPN: {})",
+            service_name,
+            mask_domain(host),
+            port,
+            use_tls,
+            alpn_str
+        );
 
         // 🔧 上游连接健康检测配置
         // HTTP/2 PING 心跳: 每 30 秒发送 PING 帧检测上游连接健康
@@ -894,7 +899,7 @@ impl PortProxy {
         // 连接超时配置
         peer.options.connection_timeout = Some(Duration::from_secs(10)); // 连接建立超时
         peer.options.total_connection_timeout = Some(Duration::from_secs(30)); // 含 TLS 握手的总超时
-                                                                               // read_timeout: 不设置，默认 None，适合 AI API 长时间推理
+        // read_timeout: 不设置，默认 None，适合 AI API 长时间推理
         peer.options.idle_timeout = Some(Duration::from_secs(90)); // 连接池空闲超时
 
         let peer = Box::new(peer);
@@ -1058,11 +1063,14 @@ impl PingoraProxyService {
     }
 
     /// 创建 Pingora 代理服务实例
-    pub fn create_pingora_proxy(&self) -> PortProxy {
+    pub fn create_pingora_proxy(&self) -> anyhow::Result<PortProxy> {
         // 使用统一的路由配置
-        let router = create_router();
+        let router = create_router().map_err(|e| {
+            tracing::error!("❌ [PROXY] 创建路由表失败: {}", e);
+            e
+        })?;
 
-        PortProxy {
+        Ok(PortProxy {
             backends: self.backends.clone(),
             default_backend_port: self.config.default_backend_port,
             backend_host: self.config.backend_host.clone(),
@@ -1071,7 +1079,7 @@ impl PingoraProxyService {
             vnc_backends: self.vnc_backends.clone(),
             router,
             api_key_manager: self.api_key_manager.clone(),
-        }
+        })
     }
 
     /// 添加或更新后端服务
@@ -1184,7 +1192,9 @@ impl PingoraProxyService {
     ) -> Result<axum::response::Response> {
         // 这个方法提供兼容性，但实际的代理由 Pingora 服务器处理
         // 在实际部署中，请求会直接发送到 Pingora 监听的端口
-        Err(anyhow!("此方法仅用于兼容性。实际的代理功能由 Pingora 服务器处理，请直接请求 Pingora 监听的端口"))
+        Err(anyhow!(
+            "此方法仅用于兼容性。实际的代理功能由 Pingora 服务器处理，请直接请求 Pingora 监听的端口"
+        ))
     }
 
     /// 更新一次所有后端的健康状态
@@ -1412,7 +1422,7 @@ mod tests {
         let config = create_test_config();
         let service = PingoraProxyService::new(config);
 
-        let pingora_proxy = service.create_pingora_proxy();
+        let pingora_proxy = service.create_pingora_proxy().unwrap();
         assert_eq!(pingora_proxy.default_backend_port, 3000);
         assert_eq!(pingora_proxy.backend_host, "127.0.0.1");
         assert!(pingora_proxy.use_round_robin);

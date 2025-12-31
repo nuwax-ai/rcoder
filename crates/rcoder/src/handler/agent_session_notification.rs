@@ -937,7 +937,12 @@ async fn create_sse_proxy_stream(
                     let error_event = Event::default()
                         .event("error")
                         .data(format!("容器连接失败: {}", response.status()));
-                    let _ = tx.send(Ok(error_event)).await;
+                    if let Err(send_err) = tx.send(Ok(error_event)).await {
+                        warn!(
+                            "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
+                            session_id, send_err
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -950,7 +955,12 @@ async fn create_sse_proxy_stream(
                 let error_event = Event::default()
                     .event("error")
                     .data(format!("连接错误: {}", e));
-                let _ = tx.send(Ok(error_event)).await;
+                if let Err(send_err) = tx.send(Ok(error_event)).await {
+                    warn!(
+                        "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
+                        session_id, send_err
+                    );
+                }
             }
         }
 
