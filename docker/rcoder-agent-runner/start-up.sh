@@ -374,6 +374,18 @@ function initialize_user_home() {
         log_success "XFCE Panel config is valid"
     fi
 
+    # ========== 修复：预加载 XFCE 桌面壁纸配置（防止启动黑屏） ==========
+    # 确保 xfce4-desktop.xml 存在，这样 xfdesktop 启动时能立即加载壁纸
+    # 而不需要等待 apply_xfce_wallpaper 脚本
+    local XFCE_DESKTOP_XML="$USER_HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
+    local XFCE_DESKTOP_SYSTEM="/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
+    
+    if [ ! -f "$XFCE_DESKTOP_XML" ] && [ -f "$XFCE_DESKTOP_SYSTEM" ]; then
+        mkdir -p "$(dirname "$XFCE_DESKTOP_XML")"
+        cp -f "$XFCE_DESKTOP_SYSTEM" "$XFCE_DESKTOP_XML"
+        log_success "  xfce4-desktop.xml pre-configured from system (fixes black wallpaper)"
+    fi
+
     # 确保 Panel launcher 目录存在且内容完整（强制恢复）
     # 注意：每次启动都检查并恢复，防止用户删除后 XFCE 保存损坏状态
     local XFCE_PANEL_DIR="$USER_HOME/.config/xfce4/panel"
@@ -748,6 +760,11 @@ function start_display_and_desktop() {
             return 1
         fi
     done
+
+    # ========== 优化：设置初始背景色（避免纯黑死屏） ==========
+    # 在壁纸加载前，将 X root 窗口设置为深灰色，提供视觉反馈
+    DISPLAY=:0 xsetroot -solid "#1e1e1e" 2>/dev/null || true
+    log_success "X root window color set to dark grey"
 
 	# ========== 关键修复：手动启动 fcitx5，确保环境变量正确 ==========
 	# 不再依赖 XFCE autostart，直接用正确的环境变量启动 (as root, HOME=/home/user)
