@@ -267,6 +267,11 @@ pub struct DockerManagerConfig {
 
     /// 多镜像配置（从 rcoder 配置传递，始终有值）
     pub multi_image_config: shared_types::MultiImageConfig,
+
+    /// 网络基础名称（不含 project name 前缀）
+    /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
+    /// 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
+    pub network_base_name: String,
 }
 
 /// Docker 配置（从 rcoder 配置传递）
@@ -302,6 +307,7 @@ impl Default for DockerManagerConfig {
             container_ttl_seconds: Some(3600), // 1小时
 
             multi_image_config: shared_types::create_default_multi_image_config(), // 默认多镜像配置
+            network_base_name: crate::RCODER_NETWORK_BASE_NAME.to_string(), // 默认网络基础名称
         }
     }
 }

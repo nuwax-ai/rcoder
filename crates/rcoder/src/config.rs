@@ -143,6 +143,10 @@ pub struct DockerConfig {
     pub auto_cleanup: Option<bool>,
     /// 容器存活时间（秒）
     pub container_ttl_seconds: Option<u64>,
+    /// 网络基础名称（不含 project name 前缀）
+    /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
+    /// 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
+    pub network_base_name: Option<String>,
 }
 
 const CONFIG_FILE: &str = "config.yml";
@@ -192,6 +196,7 @@ impl Default for DockerConfig {
             work_dir: Some("/app".to_string()),
             auto_cleanup: Some(true),
             container_ttl_seconds: Some(3600),
+            network_base_name: Some("agent-network".to_string()),
         }
     }
 }
@@ -268,6 +273,12 @@ impl DockerConfig {
             self.network_mode = Some(val);
         }
 
+        // 应用网络基础名称
+        if let Ok(val) = std::env::var("RCODER_NETWORK_BASE_NAME") {
+            info!("应用环境变量 RCODER_NETWORK_BASE_NAME: {}", val);
+            self.network_base_name = Some(val);
+        }
+
         // 应用工作目录
         if let Ok(val) = std::env::var("RCODER_WORK_DIR") {
             info!("应用环境变量 RCODER_WORK_DIR");
@@ -301,8 +312,9 @@ impl DockerConfig {
     /// 获取配置摘要信息
     pub fn get_summary(&self) -> String {
         format!(
-            "Docker配置: 网络模式={}, 工作目录={}, 自动清理={}, 容器TTL={}",
+            "Docker配置: 网络模式={}, 网络基础名称={}, 工作目录={}, 自动清理={}, 容器TTL={}",
             self.network_mode.as_deref().unwrap_or("默认"),
+            self.network_base_name.as_deref().unwrap_or("agent-network"),
             self.work_dir.as_deref().unwrap_or("/app"),
             self.auto_cleanup.unwrap_or(true),
             self.container_ttl_seconds.unwrap_or(3600)

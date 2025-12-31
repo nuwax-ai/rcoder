@@ -169,6 +169,11 @@ docker_config:
       max_entries: 50
 
   # 其他 Docker 配置
+  # 网络基础名称（不含 project name 前缀）
+  # Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
+  # 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
+  network_base_name: "agent-network"
+
   # 默认网络模式
   network_mode: "bridge"
 

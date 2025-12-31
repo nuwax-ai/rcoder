@@ -1,7 +1,6 @@
 use super::{
     CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerStatus,
     DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
-    RCODER_NETWORK_BASE_NAME,
 };
 use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
 use anyhow::Result;
@@ -51,16 +50,17 @@ impl DockerManager {
         info!("Docker 管理器初始化成功");
 
         // 🔍 动态检测主网络名称（必须成功）
-        let main_network_name = match Self::detect_main_network_name_static(&docker).await {
-            Ok(network_name) => {
-                info!("✅ 检测到主网络名称: {}", network_name);
-                network_name
-            }
-            Err(e) => {
-                error!("❌ 无法检测主网络名称: {}", e);
-                return Err(e);
-            }
-        };
+        let main_network_name =
+            match Self::detect_main_network_name_static(&docker, &config.network_base_name).await {
+                Ok(network_name) => {
+                    info!("✅ 检测到主网络名称: {}", network_name);
+                    network_name
+                }
+                Err(e) => {
+                    error!("❌ 无法检测主网络名称: {}", e);
+                    return Err(e);
+                }
+            };
 
         // 🆕 创建容器状态 Actor 并启动
         let (actor, containers) = ContainerStateActor::new();
@@ -1898,7 +1898,10 @@ impl DockerManager {
     ///
     /// 通过检查当前容器（运行 DockerManager 的容器）所连接的网络来确定主网络名称
     /// 这样可以适应不同的 Docker Compose project name
-    async fn detect_main_network_name_static(docker: &Docker) -> DockerResult<String> {
+    async fn detect_main_network_name_static(
+        docker: &Docker,
+        network_base_name: &str,
+    ) -> DockerResult<String> {
         use bollard::query_parameters::InspectContainerOptions;
 
         // 🎯 优化：直接通过 HOSTNAME 环境变量 inspect 当前容器，无需列出所有容器
@@ -1924,21 +1927,21 @@ impl DockerManager {
         // 获取网络配置
         if let Some(network_settings) = inspect.network_settings {
             if let Some(networks) = network_settings.networks {
-                // 查找包含 "agent-network" 的网络
+                // 查找包含指定网络基础名称的网络
                 for (network_name, _) in &networks {
-                    if network_name.contains(RCODER_NETWORK_BASE_NAME) {
+                    if network_name.contains(network_base_name) {
                         info!("✅ 动态检测到主网络: {}", network_name);
                         return Ok(network_name.clone());
                     }
                 }
 
-                // 如果没找到包含 "agent-network" 的，返回错误
+                // 如果没找到包含指定基础名称的，返回错误
                 let available_networks: Vec<String> = networks.keys().cloned().collect();
                 return Err(DockerError::ConnectionError(format!(
                     "当前容器未连接到包含 '{}' 的网络。\n\
                      可用网络: {:?}\n\
                      请检查 Docker Compose 配置中的网络设置。",
-                    RCODER_NETWORK_BASE_NAME, available_networks
+                    network_base_name, available_networks
                 )));
             }
         }
@@ -1954,7 +1957,7 @@ impl DockerManager {
     /// 通过检查当前容器（运行 DockerManager 的容器）所连接的网络来确定主网络名称
     /// 这样可以适应不同的 Docker Compose project name
     pub async fn detect_main_network_name(&self) -> DockerResult<String> {
-        Self::detect_main_network_name_static(&self.docker).await
+        Self::detect_main_network_name_static(&self.docker, &self.config.network_base_name).await
     }
 }
 
