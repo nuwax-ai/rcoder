@@ -2,6 +2,7 @@
 //!
 //! 清理 DuckDB 中没有对应记录的孤立容器
 
+use crate::cleanup_task::config::CleanupConfig;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use shared_types::ServiceType;
@@ -28,6 +29,8 @@ pub struct OrphanedContainerCleaner {
     pub docker_manager: Arc<docker_manager::DockerManager>,
     pub state: Arc<crate::router::AppState>,
     pub container_patterns: Vec<String>,
+    /// 清理配置
+    pub config: Arc<CleanupConfig>,
 }
 
 impl OrphanedContainerCleaner {
@@ -35,11 +38,13 @@ impl OrphanedContainerCleaner {
         docker_manager: Arc<docker_manager::DockerManager>,
         state: Arc<crate::router::AppState>,
         container_patterns: Vec<String>,
+        config: Arc<CleanupConfig>,
     ) -> Self {
         Self {
             docker_manager,
             state,
             container_patterns,
+            config,
         }
     }
 
@@ -103,9 +108,28 @@ impl OrphanedContainerCleaner {
                                 };
 
                                 if is_orphaned {
-                                    let created_time = container
-                                        .created
-                                        .and_then(|ts| DateTime::from_timestamp(ts, 0));
+                                    // 🔧 修复时间戳解析：Docker 返回毫秒时间戳
+                                    let created_time = container.created.and_then(|ts| {
+                                        DateTime::from_timestamp(
+                                            ts / 1000,
+                                            (ts % 1000) as u32 * 1_000_000,
+                                        )
+                                    });
+
+                                    // 🛡️ 保护期检查：刚启动的容器不应该被清理
+                                    if let Some(created) = created_time {
+                                        let age = Utc::now().signed_duration_since(created);
+
+                                        if age.num_milliseconds() < self.config.container_protection_duration.as_millis() as i64 {
+                                            info!(
+                                                "🛡️ [orphaned] 容器在保护期内，跳过清理: {}, 创建时长={}秒",
+                                                clean_name,
+                                                age.num_seconds()
+                                            );
+                                            continue; // 跳过此容器，不清理
+                                        }
+                                    }
+
                                     return Some(OrphanedContainerInfo {
                                         id,
                                         container_name: clean_name.to_string(),
@@ -145,11 +169,27 @@ impl OrphanedContainerCleaner {
             info.container_name, info.id, info.service_type
         );
 
+        // 🛡️ 二次保护期检查：在实际销毁前再次确认容器是否在保护期内
+        // 这是为了防止从收集孤立容器列表到实际销毁之间的时间差
         if let Some(container_info) = self
             .docker_manager
             .find_container_by_identifier(&info.container_name)
             .await
         {
+            // 检查容器创建时间（created_at 是 DateTime<Utc> 类型）
+            let created_time = container_info.created_at;
+            let age = Utc::now().signed_duration_since(created_time);
+
+            if age.num_milliseconds() < self.config.container_protection_duration.as_millis() as i64
+            {
+                info!(
+                    "🛡️ [orphaned] 二次检查：容器在保护期内，跳过销毁: {}, 创建时长={}秒",
+                    info.container_name,
+                    age.num_seconds()
+                );
+                return Ok(());
+            }
+
             docker_manager::container_stop::runtime_cleanup_container(
                 &self.docker_manager,
                 &container_info.container_id,
@@ -160,7 +200,14 @@ impl OrphanedContainerCleaner {
             // 对于 ComputerAgentRunner，清理 VNC 后端
             if info.service_type == ServiceType::ComputerAgentRunner {
                 if let Some(ref pingora_service) = self.state.pingora_service {
-                    let _removed: Option<String> = pingora_service.remove_vnc_backend(&info.id);
+                    match pingora_service.remove_vnc_backend(&info.id) {
+                        Some(removed) => {
+                            info!("✅ [orphaned] VNC 后端已清理: backend_id={}", removed);
+                        }
+                        None => {
+                            debug!("⚠️ [orphaned] VNC 后端未找到: identifier={}", info.id);
+                        }
+                    }
                 }
             }
 

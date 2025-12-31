@@ -36,6 +36,7 @@ impl AgentCleaner {
         container_patterns: Vec<String>,
     ) -> Self {
         let config_clone = config.clone();
+        let config_arc = Arc::new(config_clone.clone());
         let state_clone = state.clone();
         let state_clone2 = state.clone();
         let grpc_pool = state.grpc_pool.clone();
@@ -56,6 +57,7 @@ impl AgentCleaner {
                 docker_manager,
                 state_clone2,
                 container_patterns,
+                config_arc,
             ),
             agent_scanner: super::agent::AgentScanner::new(state.clone(), config_clone),
             _status_checker: super::agent::AgentStatusChecker::new(state.grpc_pool.clone()),

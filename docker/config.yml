@@ -17,10 +17,13 @@ cleanup_config:
   idle_timeout_seconds: 120
   # 清理任务执行间隔（秒）
   # 默认值: 300 (5分钟)
-  cleanup_interval_seconds: 10
+  cleanup_interval_seconds: 3
   # Docker 容器停止超时时间（秒）
   # 默认值: 30
   docker_stop_timeout_seconds: 6
+  # 容器最小保护时间（秒），刚启动的容器在此时间内不会被清理
+  # 默认值: 300 (5分钟)
+  container_protection_seconds: 40
 
 # Pingora 反向代理配置
 proxy_config:
