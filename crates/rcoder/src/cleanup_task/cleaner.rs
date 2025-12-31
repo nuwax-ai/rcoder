@@ -52,7 +52,8 @@ impl AgentCleaner {
                 docker_manager.clone(),
                 grpc_pool,
                 pingora_service,
-            ),
+            )
+            .with_ip_cache(state.container_ip_cache.clone()),
             orphaned_cleaner: super::container::OrphanedContainerCleaner::new(
                 docker_manager,
                 state_clone2,

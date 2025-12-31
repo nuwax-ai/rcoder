@@ -1,6 +1,6 @@
 //! 容器销毁器
 //!
-//! 销毁容器并清理相关资源（gRPC 连接池、Pingora VNC 后端）
+//! 销毁容器并清理相关资源（gRPC 连接池、Pingora VNC 后端、容器 IP 缓存）
 
 use anyhow::Result;
 use shared_types::ServiceType;
@@ -14,6 +14,8 @@ pub struct ContainerDestroyer {
     pub docker_manager: Arc<docker_manager::DockerManager>,
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+    /// 容器 IP 缓存（用于销毁时失效）
+    pub container_ip_cache: Option<Arc<crate::grpc::ContainerIpCache>>,
 }
 
 impl ContainerDestroyer {
@@ -26,7 +28,14 @@ impl ContainerDestroyer {
             docker_manager,
             grpc_pool,
             pingora_service,
+            container_ip_cache: None,
         }
+    }
+
+    /// 设置容器 IP 缓存引用
+    pub fn with_ip_cache(mut self, cache: Arc<crate::grpc::ContainerIpCache>) -> Self {
+        self.container_ip_cache = Some(cache);
+        self
     }
 
     /// 销毁容器并清理相关资源（带原因）
@@ -66,6 +75,26 @@ impl ContainerDestroyer {
         if *service_type == ServiceType::ComputerAgentRunner {
             if let Some(ref pingora_service) = self.pingora_service {
                 let _: Option<String> = pingora_service.remove_vnc_backend(container_identifier);
+            }
+
+            // 🆕 使容器 IP 缓存失效（容器名称格式: computer-agent-runner-{user_id}）
+            if let Some(ref cache) = self.container_ip_cache {
+                let container_name = format!(
+                    "{}-{}",
+                    ServiceType::ComputerAgentRunner.container_prefix(),
+                    container_identifier
+                );
+                cache.invalidate(&container_name);
+            }
+        } else {
+            // RCoder 模式：容器名称格式: rcoder-agent-{project_id}
+            if let Some(ref cache) = self.container_ip_cache {
+                let container_name = format!(
+                    "{}-{}",
+                    ServiceType::RCoder.container_prefix(),
+                    container_identifier
+                );
+                cache.invalidate(&container_name);
             }
         }
 

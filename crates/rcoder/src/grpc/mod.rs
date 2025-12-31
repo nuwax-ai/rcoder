@@ -4,12 +4,14 @@
 
 pub mod channel_pool;
 pub mod chat_client;
+pub mod container_ip_cache;
 pub mod converters;
 pub mod error;
 pub mod sse_stream;
 
 pub use channel_pool::GrpcChannelPool;
 pub use chat_client::*;
+pub use container_ip_cache::{ContainerIpCache, DEFAULT_CACHE_TTL_SECONDS};
 pub use converters::*;
 pub use error::*;
 pub use sse_stream::*;

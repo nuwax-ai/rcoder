@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_create_router() {
-        let router = create_router();
+        let router = create_router().unwrap();
 
         // 测试 VNC 路由
         let matched = router
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_vnc_route_variations() {
-        let router = create_router();
+        let router = create_router().unwrap();
 
         // WebSocket 路径
         let matched = router
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_port_proxy_route_variations() {
-        let router = create_router();
+        let router = create_router().unwrap();
 
         // 不同端口
         for port in [3000, 8080, 9000, 5173] {
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_route_not_found() {
-        let router = create_router();
+        let router = create_router().unwrap();
 
         // 不匹配的路径应该返回错误
         assert!(router.at("/unknown/path").is_err());
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_api_proxy_route() {
-        let router = create_router();
+        let router = create_router().unwrap();
 
         // 测试 Anthropic API 路由
         let matched = router.at("/api/anthropic/v1/messages").unwrap();
