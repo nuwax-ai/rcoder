@@ -3,6 +3,7 @@
 //! 清理 DuckDB 中没有对应记录的孤立容器
 
 use crate::cleanup_task::config::CleanupConfig;
+use crate::cleanup_task::strategies::DestroyReason;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use shared_types::ServiceType;
@@ -22,6 +23,8 @@ struct OrphanedContainerInfo {
     service_type: ServiceType,
     /// 容器创建时间
     created_at: Option<DateTime<Utc>>,
+    /// 销毁原因
+    reason: DestroyReason,
 }
 
 /// 孤立容器清理器
@@ -135,6 +138,10 @@ impl OrphanedContainerCleaner {
                                         container_name: clean_name.to_string(),
                                         service_type: service_type.clone(),
                                         created_at: created_time,
+                                        reason: DestroyReason::Orphaned {
+                                            created_at: created_time.unwrap_or_else(|| Utc::now()),
+                                            was_protected: false,
+                                        },
                                     });
                                 }
                             }
@@ -165,9 +172,13 @@ impl OrphanedContainerCleaner {
 
     async fn cleanup_single(&self, info: &OrphanedContainerInfo) -> Result<()> {
         info!(
-            "🔥 [orphaned] 开始清理孤立容器: {} (id={}, type={:?})",
-            info.container_name, info.id, info.service_type
+            "🔥 [orphaned] 开始清理孤立容器: {} (id={}, type={:?}, 原因={})",
+            info.container_name,
+            info.id,
+            info.service_type,
+            info.reason.as_str()
         );
+        debug!("📋 [orphaned] 销毁详情: {}", info.reason.description());
 
         // 🛡️ 二次保护期检查：在实际销毁前再次确认容器是否在保护期内
         // 这是为了防止从收集孤立容器列表到实际销毁之间的时间差
@@ -211,7 +222,11 @@ impl OrphanedContainerCleaner {
                 }
             }
 
-            info!("✅ [orphaned] 容器清理成功: {}", info.container_name);
+            info!(
+                "✅ [orphaned] 容器清理成功: {}, 原因={}",
+                info.container_name,
+                info.reason.as_str()
+            );
         } else {
             info!("📭 [orphaned] 容器不存在: {}", info.container_name);
         }

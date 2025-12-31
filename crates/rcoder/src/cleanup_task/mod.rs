@@ -17,6 +17,7 @@ mod integration_tests;
 
 pub use cleaner::AgentCleaner;
 pub use config::{CleanupConfig, CleanupStats};
+pub use strategies::DestroyReason;
 
 /// 启动清理任务
 pub async fn start_cleanup_task(

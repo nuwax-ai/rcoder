@@ -112,18 +112,18 @@ impl AgentCleaner {
             ServiceType::ComputerAgentRunner => &self.computer_runner_strategy,
         };
 
-        // 3. 检查是否需要销毁容器
+        // 3. 检查是否需要销毁容器，并获取销毁原因
         let context = super::strategies::CleanupContext {
             state: self.state.clone(),
             config: self.config.clone(),
         };
 
-        let should_destroy = strategy
+        let destroy_reason = strategy
             .should_destroy_container(project_id, &context)
             .await?;
 
         // 4. 如果需要销毁容器
-        if should_destroy {
+        if let Some(reason) = destroy_reason {
             if let Some(container_info) = agent_info.container() {
                 let project_info = super::strategies::ProjectInfo {
                     project_id: agent_info.project_id().to_string(),
@@ -136,10 +136,11 @@ impl AgentCleaner {
                 let container_identifier = strategy.get_container_identifier(&project_info)?;
 
                 self.container_destroyer
-                    .destroy(
+                    .destroy_with_reason(
                         &container_info.container_id,
                         &service_type,
                         &container_identifier,
+                        &reason,
                     )
                     .await?;
             }

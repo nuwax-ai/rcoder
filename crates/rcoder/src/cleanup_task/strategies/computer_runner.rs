@@ -4,7 +4,7 @@
 //!
 //! 核心修复：只有当容器的所有项目都闲置时才销毁容器
 
-use super::{CleanupContext, CleanupStrategy, ProjectInfo};
+use super::{CleanupContext, CleanupStrategy, DestroyReason, ProjectInfo};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -29,7 +29,7 @@ impl CleanupStrategy for ComputerRunnerStrategy {
         &self,
         project_id: &str,
         context: &CleanupContext,
-    ) -> Result<bool> {
+    ) -> Result<Option<DestroyReason>> {
         // 获取 user_id
         let user_id = context
             .state
@@ -46,17 +46,32 @@ impl CleanupStrategy for ComputerRunnerStrategy {
             .any(|p| p.project_id != project_id && is_project_active(p, &context.config));
 
         if has_active_refs {
+            // 还有其他活跃项目，不销毁容器
             info!(
                 "🛡️ [cleanup] 容器还被其他项目使用，只删除项目记录: project_id={}, user_id={}",
                 project_id, user_id
             );
-            Ok(false) // 不销毁容器
+            Ok(None)
         } else {
+            // 所有项目都闲置，计算最大闲置时间
+            let now = Utc::now();
+            let max_idle_duration = related_projects
+                .iter()
+                .map(|p| (now - p.last_activity).num_seconds())
+                .max()
+                .unwrap_or(0);
+
+            let timeout_secs = context.config.idle_timeout.as_secs();
+
             info!(
                 "🔥 [cleanup] 容器所有项目都已闲置，可以销毁: project_id={}, user_id={}",
                 project_id, user_id
             );
-            Ok(true) // 销毁容器
+
+            Ok(Some(DestroyReason::IdleTimeout {
+                idle_duration_secs: max_idle_duration,
+                timeout_secs,
+            }))
         }
     }
 

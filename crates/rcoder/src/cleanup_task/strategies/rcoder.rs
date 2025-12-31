@@ -2,9 +2,10 @@
 //!
 //! RCoder 模式: 1容器 = 1项目，直接销毁
 
-use super::{CleanupContext, CleanupStrategy, ProjectInfo};
+use super::{CleanupContext, CleanupStrategy, DestroyReason, ProjectInfo};
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::Utc;
 
 /// RCoder 清理策略
 ///
@@ -16,11 +17,23 @@ pub struct RCoderStrategy;
 impl CleanupStrategy for RCoderStrategy {
     async fn should_destroy_container(
         &self,
-        _project_id: &str,
-        _context: &CleanupContext,
-    ) -> Result<bool> {
+        project_id: &str,
+        context: &CleanupContext,
+    ) -> Result<Option<DestroyReason>> {
         // RCoder: 1容器=1项目，始终销毁容器
-        Ok(true)
+        let project = context
+            .state
+            .get_project(project_id)
+            .ok_or_else(|| anyhow::anyhow!("项目不存在: {}", project_id))?;
+
+        let now = Utc::now();
+        let idle_duration = (now - project.last_activity()).num_seconds();
+        let timeout_secs = context.config.idle_timeout.as_secs();
+
+        Ok(Some(DestroyReason::IdleTimeout {
+            idle_duration_secs: idle_duration,
+            timeout_secs,
+        }))
     }
 
     fn get_container_identifier(&self, project_info: &ProjectInfo) -> Result<String> {
