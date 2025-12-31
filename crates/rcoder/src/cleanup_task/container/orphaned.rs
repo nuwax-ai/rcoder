@@ -91,6 +91,27 @@ impl OrphanedContainerCleaner {
                 }
             };
 
+            // 🆕 预先收集所有容器 ID，用于后续批量检查 DockerManager
+            let container_ids: Vec<String> = containers
+                .iter()
+                .filter_map(|container| {
+                    container.names.as_ref().and_then(|names| {
+                        names.iter().find_map(|name| {
+                            Self::extract_id_from_container_name(name.trim_start_matches('/'))
+                        })
+                    })
+                })
+                .collect();
+
+            // 🆕 批量检查 DockerManager 中是否存在这些容器
+            let mut docker_manager_has_container = std::collections::HashMap::new();
+            for id in &container_ids {
+                docker_manager_has_container.insert(
+                    id.clone(),
+                    self.docker_manager.get_container_info(id).await.is_some(),
+                );
+            }
+
             let orphaned_containers: Vec<OrphanedContainerInfo> = containers
                 .iter()
                 .filter_map(|container| {
@@ -99,38 +120,61 @@ impl OrphanedContainerCleaner {
                             let clean_name = name.trim_start_matches('/');
                             if let Some(id) = Self::extract_id_from_container_name(clean_name) {
                                 // 🔧 根据 service_type 使用不同的查询方式
-                                let is_orphaned = match service_type {
+                                // 🛡️ 关键修复：同时检查 DockerManager.containers，刚创建的容器可能还没插入 DuckDB
+                                let duckdb_has_record = match service_type {
                                     ServiceType::RCoder => {
                                         // RCoder: id 是 project_id，直接查询
-                                        !self.state.projects.contains_key(&id)
+                                        self.state.projects.contains_key(&id)
                                     }
                                     ServiceType::ComputerAgentRunner => {
                                         // ComputerAgentRunner: id 是 user_id，检查是否有任何项目使用该 user_id
-                                        self.state.projects.find_projects_by_user_id(&id).is_empty()
+                                        !self.state.projects.find_projects_by_user_id(&id).is_empty()
                                     }
                                 };
 
+                                // 🆕 检查 DockerManager 的内存缓存，如果存在说明容器最近创建
+                                let docker_manager_has_record = docker_manager_has_container.get(&id).copied().unwrap_or(false);
+
+                                // 只有当 DuckDB 和 DockerManager 都没有记录时，才判定为孤立
+                                let is_orphaned = !duckdb_has_record && !docker_manager_has_record;
+
                                 if is_orphaned {
-                                    // 🔧 修复时间戳解析：Docker 返回毫秒时间戳
+                                    // 🔧 修复时间戳解析：Docker API 返回的 created 是 Unix 秒时间戳（不是毫秒）
                                     let created_time = container.created.and_then(|ts| {
-                                        DateTime::from_timestamp(
-                                            ts / 1000,
-                                            (ts % 1000) as u32 * 1_000_000,
-                                        )
+                                        debug!(
+                                            "🕐 [orphaned] 容器原始时间戳(秒): {}, container={}",
+                                            ts, clean_name
+                                        );
+                                        // created 是秒级时间戳，直接使用
+                                        DateTime::from_timestamp(ts, 0)
                                     });
 
                                     // 🛡️ 保护期检查：刚启动的容器不应该被清理
                                     if let Some(created) = created_time {
                                         let age = Utc::now().signed_duration_since(created);
+                                        let age_seconds = age.num_seconds();
+                                        let protection_seconds = self.config.container_protection_duration.as_secs() as i64;
 
-                                        if age.num_milliseconds() < self.config.container_protection_duration.as_millis() as i64 {
+                                        debug!(
+                                            "🕐 [orphaned] 容器年龄检查: {}, age={}秒, protection={}秒",
+                                            clean_name, age_seconds, protection_seconds
+                                        );
+
+                                        if age_seconds < protection_seconds {
                                             info!(
                                                 "🛡️ [orphaned] 容器在保护期内，跳过清理: {}, 创建时长={}秒",
                                                 clean_name,
-                                                age.num_seconds()
+                                                age_seconds
                                             );
                                             continue; // 跳过此容器，不清理
                                         }
+                                    } else {
+                                        warn!(
+                                            "⚠️ [orphaned] 容器时间戳解析失败: {}, created={:?}",
+                                            clean_name, container.created
+                                        );
+                                        // 时间戳解析失败，跳过此容器以避免误删
+                                        continue;
                                     }
 
                                     return Some(OrphanedContainerInfo {
