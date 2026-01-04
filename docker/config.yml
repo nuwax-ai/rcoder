@@ -43,7 +43,7 @@ docker_config:
   # 网络基础名称（不含 project name 前缀）
   # Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
   # 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
-  network_base_name: "agent-network"
+  network_base_name: "local-agent-network"
 
   # 多镜像配置系统
   multi_image_config:
