@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use axum::{Router, routing::get};
+use axum::{Router, routing::get, response::IntoResponse};
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::agent_worker_manager::AgentWorkerManager;
 use crate::{config::AppConfig, handler, proxy_agent::LocalSetAgentRequest};
+use rcoder_telemetry::{TelemetryGuard, HttpMetricsLayer};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -58,12 +59,43 @@ pub struct AppState {
 }
 
 /// 创建 Axum 路由
-pub fn create_router(state: Arc<AppState>) -> Router {
+pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>>) -> Router {
     let api_routes = Router::new()
         .route("/health", get(handler::health_check))
         .with_state(state.clone());
 
-    Router::new().merge(api_routes).merge(create_swagger_ui())
+    let mut router = Router::new().merge(api_routes).merge(create_swagger_ui());
+
+    // 添加 /metrics 端点（如果启用了 Prometheus）
+    if let Some(ref guard) = telemetry {
+        let guard_clone = Arc::clone(guard);
+        router = router.route(
+            "/metrics",
+            get(move || {
+                let guard = Arc::clone(&guard_clone);
+                async move { metrics_handler(guard).await }
+            }),
+        );
+    }
+
+    // 应用 HTTP 指标中间件
+    router.layer(HttpMetricsLayer::new())
+}
+
+/// Prometheus 指标处理器
+async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
+    match telemetry.render_metrics() {
+        Some(metrics) => (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            metrics,
+        ),
+        None => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "Prometheus metrics not enabled".to_string(),
+        ),
+    }
 }
 
 /// OpenAPI 文档结构

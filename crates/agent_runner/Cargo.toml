@@ -26,6 +26,7 @@ agent_config = { path = "../agent_config" }
 agent_abstraction = { path = "../agent_abstraction" }
 acp-adapter = { path = "../acp_adapter" }
 rcoder-proxy = { path = "../rcoder-proxy" }
+rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
 # ACP Protocol

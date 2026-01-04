@@ -3,12 +3,14 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    response::IntoResponse,
     routing::{get, post},
 };
 use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
 use crate::{config::AppConfig, handler, storage::ProjectAdapter};
+use rcoder_telemetry::{TelemetryGuard, HttpMetricsLayer};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -120,7 +122,7 @@ impl AppState {
 }
 
 /// 创建 Axum 路由
-pub fn create_router(state: Arc<AppState>) -> Router {
+pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>>) -> Router {
     let api_routes = Router::new()
         .route("/chat", post(handler::handle_chat))
         // Axum SSE 代理处理器，直接返回 SSE 流
@@ -187,7 +189,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handler::health_check))
         .with_state(state.clone());
 
-    let router = Router::new()
+    let mut router = Router::new()
         .merge(health_routes)
         .merge(api_routes)
         .merge(computer_routes)
@@ -195,11 +197,42 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]
-    let router = router.merge(debug_routes);
+    {
+        router = router.merge(debug_routes);
+    }
+
+    // 添加 /metrics 端点（如果启用了 Prometheus）
+    if let Some(ref guard) = telemetry {
+        let guard_clone = Arc::clone(guard);
+        router = router.route(
+            "/metrics",
+            get(move || {
+                let guard = Arc::clone(&guard_clone);
+                async move { metrics_handler(guard).await }
+            }),
+        );
+    }
 
     router
         .merge(create_swagger_ui())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
+        .layer(HttpMetricsLayer::new()) // 🆕 HTTP 指标中间件
+}
+
+/// Prometheus 指标处理器
+async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
+    match telemetry.render_metrics() {
+        Some(metrics) => (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            metrics,
+        ),
+        None => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "Prometheus metrics not enabled".to_string(),
+        ),
+    }
 }
 
 /// OpenAPI 文档结构
