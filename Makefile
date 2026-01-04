@@ -1,4 +1,4 @@
-.PHONY: help build docker-build docker-build-master docker-build-agent-runner install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag
+.PHONY: help build docker-build docker-build-master docker-build-agent-runner install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag test test-unit test-integration test-all test-blocking
 
 # 默认目标：显示帮助信息
 help:
@@ -22,6 +22,13 @@ help:
 	@echo "  make dev-restart    - 重启开发模式容器（重新构建镜像并启动）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
+	@echo ""
+	@echo "🧪 测试命令："
+	@echo "  make test           - 运行所有测试"
+	@echo "  make test-unit      - 运行单元测试"
+	@echo "  make test-integration - 运行集成测试"
+	@echo "  make test-blocking  - 运行极端场景测试（包含阻塞）"
+	@echo "  make test-all       - 运行完整测试套件（所有 features）"
 	@echo ""
 	@echo "开发模式工作流程："
 	@echo "  1. make dev-build    # 首次：构建所有 Docker 镜像（容器内编译）"
@@ -147,3 +154,30 @@ dev-restart: dev-build
 	@echo ""
 	@echo "🎉 完整重启完成！"
 	@echo "💡 代码更改已生效，因为重新构建了镜像！"
+
+# ==================== 测试命令 ====================
+
+# 运行所有测试
+test:
+	@echo "🧪 运行所有测试..."
+	@cargo test --workspace
+
+# 运行单元测试
+test-unit:
+	@echo "🧪 运行单元测试..."
+	@cargo test --workspace --lib
+
+# 运行集成测试
+test-integration:
+	@echo "🧪 运行集成测试..."
+	@cargo test --workspace --test '*'
+
+# 运行极端场景测试（包含阻塞）
+test-blocking:
+	@echo "🧪 运行极端场景测试（包含阻塞）..."
+	@cargo test --workspace --features testing --test '*_blocking*' -- --test-threads=1
+
+# 运行完整测试套件
+test-all:
+	@echo "🧪 运行完整测试套件..."
+	@cargo test --workspace --all-features

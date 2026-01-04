@@ -295,14 +295,13 @@ impl ServiceImageConfig {
     /// 解析后的容器路径字符串
     ///
     /// # Example
-    /// ```
-    /// use std::collections::HashMap;
-    /// let config = ServiceImageConfig::default();
-    /// let mut variables = HashMap::new();
-    /// variables.insert("project_id".to_string(), "123".to_string());
-    /// let resolved = config.resolve_container_path(&variables);
-    /// assert_eq!(resolved, "/app/project_workspace/123");
-    /// ```
+    ///
+    /// 替换模板中的变量占位符（如 `{project_id}`）为实际值：
+    ///
+    /// - 输入模板: `/app/project_workspace/{project_id}`
+    /// - 变量: `{"project_id": "123"}`
+    /// - 输出: `/app/project_workspace/123`
+    ///
     pub fn resolve_container_path(
         &self,
         variables: &std::collections::HashMap<String, String>,

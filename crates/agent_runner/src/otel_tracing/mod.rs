@@ -1,0 +1,395 @@
+//! OpenTelemetry 追踪模块
+//!
+//! 提供分布式追踪功能，使用 `tracing-opentelemetry` 的 `OpenTelemetrySpanExt`
+//! 实现灵活的动态属性设置。
+
+use opentelemetry::trace::Status;
+use tracing::{Level, Span, error, info, span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// OpenTelemetry 追踪配置
+#[derive(Debug, Clone)]
+pub struct TraceConfig {
+    /// 是否启用追踪
+    pub enabled: bool,
+    /// 采样率 (0.0 - 1.0)
+    pub sample_rate: f64,
+    /// 导出端点（如 Jaeger、OTLP）
+    pub exporter_endpoint: Option<String>,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_rate: 1.0,        // 100% 采样
+            exporter_endpoint: None, // 默认使用 console 导出器
+        }
+    }
+}
+
+/// 初始化 OpenTelemetry 追踪（简化版本）
+///
+/// 当前使用 tracing 原生 span，后续可扩展为完整的 OpenTelemetry 导出
+///
+/// # Arguments
+///
+/// * `config` - 追踪配置
+pub fn init_tracing(config: TraceConfig) -> anyhow::Result<()> {
+    if !config.enabled {
+        info!("📍 [OTel] 追踪已禁用");
+        return Ok(());
+    }
+
+    info!(
+        "📍 [OTel] 追踪已启用 (采样率: {}%)",
+        config.sample_rate * 100.0
+    );
+
+    // TODO: 后续集成完整的 OpenTelemetry SDK
+    // - 添加 OTLP 导出器
+    // - 集成 Jaeger/Zipkin
+    // - 配置 Span Processor
+
+    Ok(())
+}
+
+/// 请求追踪 Guard（自动管理 span 生命周期）
+///
+/// 使用 `OpenTelemetrySpanExt` 支持动态属性设置
+pub struct RequestSpan {
+    /// 底层 tracing span（用于 OpenTelemetrySpanExt 方法）
+    span: Span,
+    /// span 的 guard（自动关闭）
+    _guard: Option<span::EnteredSpan>,
+}
+
+impl RequestSpan {
+    /// 创建新的请求 span
+    ///
+    /// # Arguments
+    ///
+    /// * `project_id` - 项目 ID
+    /// * `request_id` - 请求 ID
+    /// * `operation` - 操作名称（如 "process_prompt"）
+    pub fn new(project_id: &str, request_id: &str, operation: &str) -> Self {
+        let span = span!(
+            Level::INFO,
+            "agent_request",
+            project_id = %project_id,
+            request_id = %request_id,
+            operation = %operation,
+        );
+
+        let guard = span.clone().entered();
+
+        info!(
+            "📍 [OTel] Span 已创建: project_id={}, request_id={}, operation={}",
+            project_id, request_id, operation
+        );
+
+        Self {
+            span,
+            _guard: Some(guard),
+        }
+    }
+
+    /// 设置动态属性（使用 OpenTelemetrySpanExt）
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - 属性键
+    /// * `value` - 属性值
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use agent_runner::RequestSpan;
+    ///
+    /// let span = RequestSpan::new("proj", "req", "op");
+    /// span.set_attribute("http.status_code", 200);
+    /// span.set_attribute("user.id", "user-123");
+    /// ```
+    pub fn set_attribute<K, V>(&self, key: K, value: V)
+    where
+        K: Into<opentelemetry::Key>,
+        V: Into<opentelemetry::Value>,
+    {
+        self.span.set_attribute(key, value);
+    }
+
+    /// 批量设置动态属性
+    ///
+    /// # Arguments
+    ///
+    /// * `attributes` - 属性列表 (key, value)
+    pub fn set_attributes(&self, attributes: &[(&str, &str)]) {
+        for (key, value) in attributes {
+            // 需要转换为 String 以满足 'static 生命周期要求
+            self.span.set_attribute(key.to_string(), value.to_string());
+        }
+    }
+
+    /// 设置 span 状态为成功
+    pub fn set_ok(&self) {
+        self.span.set_status(Status::Ok);
+    }
+
+    /// 设置 span 状态为错误
+    ///
+    /// # Arguments
+    ///
+    /// * `description` - 错误描述
+    pub fn set_error(&self, description: impl Into<std::borrow::Cow<'static, str>>) {
+        self.span.set_status(Status::error(description));
+    }
+
+    /// 添加事件到当前 span（使用 OpenTelemetrySpanExt）
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 事件名称
+    /// * `attributes` - 事件属性
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use agent_runner::RequestSpan;
+    /// use opentelemetry::KeyValue;
+    ///
+    /// let span = RequestSpan::new("proj", "req", "op");
+    /// span.add_event("cache_hit", vec![
+    ///     KeyValue::new("cache.key", "user:123"),
+    ///     KeyValue::new("cache.ttl", 300),
+    /// ]);
+    /// ```
+    pub fn add_event(&self, name: impl Into<std::borrow::Cow<'static, str>>, attributes: Vec<opentelemetry::KeyValue>) {
+        self.span.add_event(name, attributes);
+    }
+
+    /// 记录事件（简化版本，兼容旧 API）
+    pub fn event(&self, name: &str, attributes: &[(&str, String)]) {
+        // 转换为 String 以满足 'static 生命周期要求
+        let kv_attrs: Vec<opentelemetry::KeyValue> = attributes
+            .iter()
+            .map(|(k, v)| opentelemetry::KeyValue::new(k.to_string(), v.clone()))
+            .collect();
+
+        self.span.add_event(name.to_string(), kv_attrs);
+
+        info!(
+            "📍 [OTel] 事件: {}, 属性: {:?}",
+            name,
+            attributes
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    /// 记录错误到当前 span
+    pub fn error(&self, err: &anyhow::Error) {
+        self.set_error(err.to_string());
+        error!(
+            error = %err,
+            "📍 [OTel] 请求错误"
+        );
+    }
+
+    /// 获取 OpenTelemetry 上下文（用于跨服务传播）
+    pub fn context(&self) -> opentelemetry::Context {
+        self.span.context()
+    }
+
+    /// 完成 span（手动关闭，也可等待 Drop 自动关闭）
+    pub fn finish(mut self) {
+        self.set_ok();
+        if let Some(guard) = self._guard.take() {
+            drop(guard);
+        }
+    }
+}
+
+impl Drop for RequestSpan {
+    fn drop(&mut self) {
+        if self._guard.is_some() {
+            info!("📍 [OTel] Span 已自动关闭");
+        }
+    }
+}
+
+/// 创建子 span（用于追踪子操作）
+///
+/// # Arguments
+///
+/// * `_parent` - 父 span 的引用（子 span 会自动继承父 span 的上下文）
+/// * `name` - 子 span 名称
+/// * `attributes` - 附加属性
+///
+/// # Example
+///
+/// ```rust
+/// use agent_runner::{RequestSpan, child_span};
+///
+/// let parent = RequestSpan::new("proj", "req", "parent_op");
+/// let child = child_span(&parent, "child_op", &[("key", "value".to_string())]);
+/// child.finish();
+/// parent.finish();
+/// ```
+pub fn child_span(_parent: &RequestSpan, name: &str, attributes: &[(&str, String)]) -> RequestSpan {
+    let span = span!(
+        Level::INFO,
+        "child_operation",
+        otel.name = %name,
+    );
+
+    // 使用 OpenTelemetrySpanExt 设置动态属性
+    // 需要转换为 String 以满足 'static 生命周期要求
+    for (key, value) in attributes {
+        span.set_attribute(key.to_string(), value.clone());
+    }
+
+    let guard = span.clone().entered();
+
+    info!("📍 [OTel] 子 Span 已创建: {}", name);
+
+    RequestSpan {
+        span,
+        _guard: Some(guard),
+    }
+}
+
+/// 从上下文中提取当前 span（用于跨线程传递）
+pub fn current_span() -> RequestSpan {
+    let span = Span::current();
+    let guard = span.clone().entered();
+
+    RequestSpan {
+        span,
+        _guard: Some(guard),
+    }
+}
+
+/// 创建带属性的 span
+///
+/// # Example
+///
+/// ```rust
+/// use agent_runner::otel_tracing::span_with_attributes;
+///
+/// let span = span_with_attributes(
+///     "process_attachment",
+///     &[
+///         ("file_name", "test.pdf".to_string()),
+///         ("file_size", "1024".to_string()),
+///     ]
+/// );
+/// ```
+pub fn span_with_attributes(name: &str, attributes: &[(&str, String)]) -> RequestSpan {
+    let span = span!(
+        Level::INFO,
+        "custom_operation",
+        otel.name = %name,
+    );
+
+    // 使用 OpenTelemetrySpanExt 设置动态属性
+    // 需要转换为 String 以满足 'static 生命周期要求
+    for (key, value) in attributes {
+        span.set_attribute(key.to_string(), value.clone());
+    }
+
+    let guard = span.clone().entered();
+
+    RequestSpan {
+        span,
+        _guard: Some(guard),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trace_config_default() {
+        let config = TraceConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.sample_rate, 1.0);
+        assert!(config.exporter_endpoint.is_none());
+    }
+
+    #[test]
+    fn test_request_span_creation() {
+        let span = RequestSpan::new("test_project", "test_request", "test_operation");
+        span.event("test_event", &[("key", "value".to_string())]);
+        span.finish();
+    }
+
+    #[test]
+    fn test_request_span_with_attributes() {
+        let span = RequestSpan::new("test_project", "test_request", "test_operation");
+
+        // 使用 OpenTelemetrySpanExt 设置动态属性
+        span.set_attribute("http.method", "GET");
+        span.set_attribute("http.status_code", 200i64);
+        span.set_attribute("user.id", "user-123");
+
+        span.set_ok();
+        span.finish();
+    }
+
+    #[test]
+    fn test_request_span_with_error() {
+        let span = RequestSpan::new("test_project", "test_request", "test_operation");
+        span.set_error("Connection timeout");
+        // span 会在 drop 时自动关闭
+    }
+
+    #[test]
+    fn test_request_span_auto_drop() {
+        let _span = RequestSpan::new("test_project", "test_request", "test_operation");
+        // Span 会在 drop 时自动关闭
+    }
+
+    #[test]
+    fn test_child_span() {
+        let parent = RequestSpan::new("test_project", "test_request", "parent_operation");
+        let child = child_span(&parent, "child_operation", &[("attr", "value".to_string())]);
+        child.finish();
+        parent.finish();
+    }
+
+    #[test]
+    fn test_span_with_attributes() {
+        let span = span_with_attributes(
+            "custom_op",
+            &[
+                ("file_name", "test.pdf".to_string()),
+                ("file_size", "1024".to_string()),
+            ],
+        );
+        span.finish();
+    }
+
+    #[test]
+    fn test_add_event() {
+        let span = RequestSpan::new("test_project", "test_request", "test_operation");
+
+        span.add_event(
+            "cache_hit",
+            vec![
+                opentelemetry::KeyValue::new("cache.key", "user:123"),
+                opentelemetry::KeyValue::new("cache.ttl", 300i64),
+            ],
+        );
+
+        span.finish();
+    }
+
+    #[test]
+    fn test_init_tracing() {
+        let config = TraceConfig::default();
+        assert!(init_tracing(config).is_ok());
+    }
+}

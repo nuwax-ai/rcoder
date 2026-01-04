@@ -179,6 +179,8 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
             }
 
             // 调用 Agent 处理 prompt
+            // ⚠️ 注意：不设置超时，因为 Agent 任务可能执行很长时间（代码生成、文件操作等）
+            // 超时保护由 Worker 级别的心跳监控来处理
             match client_conn.prompt(req.clone()).await {
                 Ok(resp) => {
                     info!(
@@ -204,6 +206,7 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
                     is_first_prompt = false;
                 }
                 Err(e) => {
+                    // Agent 返回错误
                     let error_message = e.message.clone();
                     error!("项目[{}]发送Prompt失败: {:?}", project_id, error_message);
 

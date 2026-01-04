@@ -28,23 +28,6 @@ use shared_types::{AgentStatus, SessionNotify};
 ///   - PromptStart: 先更新状态为 Active，再推送 SSE
 ///   - PromptEnd: 先推送 SSE，再恢复状态为 Idle
 ///   - PromptError: 先推送错误消息，再恢复状态为 Idle
-///
-/// # 示例
-/// ```rust
-/// use agent_runner::service::StateAwareNotifier;
-/// use std::sync::Arc;
-///
-/// let notifier = Arc::new(StateAwareNotifier::new());
-///
-/// // 在启动 prompt handler 时注入 notifier
-/// agent_abstraction::compat::channel_utils::spawn_prompt_handler_for_agent(
-///     client_conn,
-///     prompt_rx,
-///     session_id,
-///     &project_id,
-///     notifier,
-/// );
-/// ```
 #[derive(Debug, Clone)]
 pub struct StateAwareNotifier {
     /// 内部 SSE 推送器

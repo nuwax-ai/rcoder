@@ -15,12 +15,106 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    agent_worker_manager::{Heartbeat, WorkerHandle, WorkerReady},
+    agent_worker_manager::{Heartbeat, WorkerHandle, WorkerReady, MAX_ACTIVE_REQUESTS},
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
     service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
     utils::ContentBuilder,
 };
+
+// 🔥 OpenTelemetry 追踪
+#[cfg(feature = "otel")]
+use crate::otel_tracing::RequestSpan;
+
+// 🔥 简化版本：如果没有 OpenTelemetry，使用空的 span
+#[cfg(not(feature = "otel"))]
+struct RequestSpan;
+
+#[cfg(not(feature = "otel"))]
+impl RequestSpan {
+    fn new(_project_id: &str, _request_id: &str, _operation: &str) -> Self {
+        Self
+    }
+}
+
+/// 🆕 RAII Guard 用于自动清理请求追踪
+///
+/// 确保无论请求如何结束（成功、失败、panic），追踪都会被正确清理
+struct RequestTracker<'a> {
+    active_requests: Option<
+        &'a Arc<std::sync::Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>>,
+    >,
+    request_id: String,
+    project_id: String,
+    /// 🔥 是否被 DoS 防护拒绝
+    rejected: bool,
+}
+
+impl<'a> RequestTracker<'a> {
+    fn new(
+        active_requests: Option<
+            &'a Arc<
+                std::sync::Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
+            >,
+        >,
+        request_id: String,
+        project_id: String,
+    ) -> Self {
+        // 在创建时立即注册追踪（带 DoS 防护）
+        if let Some(ref active) = active_requests {
+            let mut requests = active.lock().unwrap();
+
+            // 🔥 DoS 防护: 使用统一的 MAX_ACTIVE_REQUESTS 常量
+            if requests.len() >= MAX_ACTIVE_REQUESTS {
+                error!(
+                    "❌ [REQ_REJECTED] 达到活跃请求上限 ({}), 拒绝新请求: project_id={}, request_id={}",
+                    MAX_ACTIVE_REQUESTS, project_id, request_id
+                );
+                // 注意: 这里不插入追踪记录，Drop 时也不会尝试删除
+                return Self {
+                    active_requests: None, // 设置为 None，避免清理时误删
+                    request_id,
+                    project_id,
+                    rejected: true, // 标记为被拒绝
+                };
+            }
+
+            requests.insert(request_id.clone(), Utc::now());
+            debug!(
+                "📍 [REQ_START] project_id={}, request_id={}, 活跃数: {}",
+                project_id,
+                request_id,
+                requests.len()
+            );
+        }
+
+        Self {
+            active_requests,
+            request_id,
+            project_id,
+            rejected: false,
+        }
+    }
+
+    /// 检查请求是否被 DoS 防护拒绝
+    fn is_rejected(&self) -> bool {
+        self.rejected
+    }
+}
+
+impl<'a> Drop for RequestTracker<'a> {
+    fn drop(&mut self) {
+        // 在 guard 销毁时自动清理追踪
+        if let Some(ref active) = self.active_requests {
+            let mut requests = active.lock().unwrap();
+            requests.remove(&self.request_id);
+            debug!(
+                "📍 [REQ_CLEANUP] project_id={}, request_id={}",
+                self.project_id, self.request_id
+            );
+        }
+    }
+}
 
 /// LocalSet 中运行的 Agent 请求
 #[derive(Debug)]
@@ -116,6 +210,7 @@ pub async fn agent_worker(
                 Ok(blocks) => Some(blocks),
                 Err(e) => {
                     error!("❌ 附件处理失败: {:?}", e);
+
                     if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                         project_id: project_id.clone(),
                         session_id: String::new(),
@@ -147,6 +242,7 @@ pub async fn agent_worker(
             Ok(response) => response,
             Err(e) => {
                 error!("❌ Worker 处理失败: {:?}", e);
+
                 if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                     project_id: project_id.clone(),
                     session_id: String::new(),
@@ -214,11 +310,6 @@ pub async fn agent_worker(
 
         if let Err(e) = request.chat_prompt_tx.send(chat_prompt_response) {
             error!("❌ 发送回执失败: {:?}", e);
-        } else {
-            info!(
-                "✅ 回执已发送，project_id: {}",
-                request.prompt_message.project_id
-            );
         }
     }
 
@@ -292,6 +383,38 @@ pub async fn agent_worker_with_heartbeat(
             "📨 接收到请求，project_id: {}, request_id: {}",
             project_id, request_id
         );
+
+        // 🔥 OpenTelemetry 追踪: 创建请求 span
+        let _otel_span = RequestSpan::new(&project_id, &request_id, "process_agent_request");
+
+        // 📍 请求追踪: 使用 RAII Guard 自动管理追踪生命周期（兼容旧监控）
+        let tracker = RequestTracker::new(
+            handle.active_requests.as_ref(),
+            request_id.clone(),
+            project_id.clone(),
+        );
+
+        // 🔥 DoS 防护: 检查请求是否被拒绝
+        if tracker.is_rejected() {
+            warn!(
+                "🛡️ [DoS防护] 请求被拒绝, project_id={}, request_id={}",
+                project_id, request_id
+            );
+            if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                project_id: project_id.clone(),
+                session_id: String::new(),
+                code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
+                error: Some(format!(
+                    "服务器繁忙，活跃请求数已达上限 ({})，请稍后重试",
+                    MAX_ACTIVE_REQUESTS
+                )),
+                request_id: Some(request_id),
+                service_type: request.prompt_message.service_type.clone(),
+            }) {
+                error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
+            }
+            continue;
+        }
 
         // 1. 预处理附件（agent_runner 特有逻辑）
         let attachment_blocks = if !request.prompt_message.attachments.is_empty() {

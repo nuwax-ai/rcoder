@@ -28,10 +28,10 @@ pub enum GrpcErrorCategory {
 /// # Examples
 /// ```
 /// use tonic::{Code, Status};
-/// use crate::grpc::error::categorize_grpc_error;
+/// use rcoder::grpc::GrpcErrorCategory;
 ///
 /// let status = Status::unavailable("服务不可用");
-/// let category = categorize_grpc_error(&status);
+/// let category = rcoder::grpc::categorize_grpc_error(&status);
 /// assert_eq!(category, GrpcErrorCategory::Retryable);
 /// ```
 pub fn categorize_grpc_error(status: &Status) -> GrpcErrorCategory {

@@ -194,7 +194,10 @@ pub fn get_default_agent_config(
         // ⚠️ 关键：使用占位符密钥和代理URL，而不是真实值
         // Agent 应该使用占位符，真实密钥由 Pingora 代理注入
         if !provider.api_key.is_empty() {
-            env.insert("ANTHROPIC_API_KEY".to_string(), "sk-placeholder".to_string());
+            env.insert(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-placeholder".to_string(),
+            );
         }
         if !provider.base_url.is_empty() {
             env.insert(
@@ -473,177 +476,222 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
         let cancel_tx_for_handler = cancel_tx.clone();
         let model_provider_for_handler = model_provider.clone();
 
-        // 启动后台任务来管理 ACP 连接
+        // ⚠️ 重要: 启动后台任务来管理 ACP 连接
+        //
+        // 调用链说明:
+        //   main.rs:301 (LocalSet::new())
+        //     → local_set.run_until(async move {
+        //         → agent_worker_with_heartbeat() (acp_agent.rs:233)
+        //           → worker.process_request()
+        //             → launcher.launch() (此处)
+        //       })
+        //
+        // 因此此函数已经在 LocalSet 上下文中,可以直接使用 spawn_local
+        // 不需要创建嵌套的 LocalSet
         tokio::task::spawn_local(async move {
-            let local_set = LocalSet::new();
+            let result = async move {
+                let client_conn = client_conn.clone();
 
-            let result = local_set
-                .run_until(async {
-                    let client_conn = client_conn.clone();
+                // 初始化连接
+                debug!("初始化 ACP 连接[initialize]");
+                let init_result = client_conn
+                    .initialize(
+                        InitializeRequest::new(VERSION).client_info(
+                            Implementation::new(
+                                "rcoder-agent-runner",
+                                env!("CARGO_PKG_VERSION"),
+                            )
+                            .title("RCoder Agent Runner"),
+                        ),
+                    )
+                    .await;
 
-                    // 初始化连接
-                    debug!("初始化 ACP 连接[initialize]");
-                    let init_result = client_conn
-                        .initialize(
-                            InitializeRequest::new(VERSION).client_info(
-                                Implementation::new(
-                                    "rcoder-agent-runner",
-                                    env!("CARGO_PKG_VERSION"),
-                                )
-                                .title("RCoder Agent Runner"),
-                            ),
-                        )
-                        .await;
+                match init_result {
+                    Ok(_) => {
+                        info!("ACP 连接初始化成功");
+                    }
+                    Err(e) => {
+                        error!("ACP 连接初始化失败: {:?}", e);
+                        return Err(anyhow::anyhow!(
+                            "Failed to initialize ACP connection: {:?}",
+                            e
+                        ));
+                    }
+                }
 
-                    match init_result {
-                        Ok(_) => {
-                            info!("ACP 连接初始化成功");
+                if !mcp_servers.is_empty() {
+                    info!(
+                        "🔧 [ACP] 配置了 {} 个 MCP 服务器: {}",
+                        mcp_servers.len(),
+                        mcp_servers
+                            .iter()
+                            .map(|s| match s {
+                                agent_client_protocol::McpServer::Stdio(server) =>
+                                    server.name.clone(),
+                                _ => "unknown".to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    // 🆕 添加警告: MCP 服务器可能导致启动延迟
+                    warn!(
+                        "⚠️ [ACP] 已配置 {} 个 MCP 服务器,可能导致 new_session 延迟,已启用 100 秒超时保护",
+                        mcp_servers.len()
+                    );
+                }
+
+                // 🆕 Resume 会话预检查：使用 list_sessions API 验证会话是否存在
+                // 返回 (system_prompt_meta, actual_is_resume_session)
+                let (system_prompt_meta, actual_is_resume_session) = if let Some(
+                    ref resume_session_id,
+                ) =
+                    start_config.resume_session_id
+                {
+                    // 调用 list_sessions API 检查会话是否存在（带缓存）
+                    match crate::session::check_session_exists_via_api(
+                        &client_conn,
+                        resume_session_id,
+                        &project_path_for_closure.to_string_lossy(),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            info!("✅ 目标会话存在，将使用 resume: {}", resume_session_id);
+                            // 会话存在，使用包含 resume 的 meta
+                            (start_config.build_meta(), true)
+                        }
+                        Ok(false) => {
+                            warn!(
+                                "⚠️ 目标会话不存在，跳过 resume，创建新会话: {}",
+                                resume_session_id
+                            );
+                            // 会话不存在，使用不包含 resume 的 meta，且标记为非 resume 会话
+                            (start_config.build_meta_without_resume(), false)
                         }
                         Err(e) => {
-                            error!("ACP 连接初始化失败: {:?}", e);
-                            return Err(anyhow::anyhow!(
-                                "Failed to initialize ACP connection: {:?}",
-                                e
-                            ));
-                        }
-                    }
+                            // API 失败，降级到文件扫描验证
+                            info!(
+                                "ℹ️ list_sessions API 失败，降级到文件扫描: {} (error: {:?})",
+                                resume_session_id, e
+                            );
 
-                    if !mcp_servers.is_empty() {
-                        info!(
-                            "🔧 配置了 {} 个 MCP 服务器: {}",
-                            mcp_servers.len(),
-                            mcp_servers
-                                .iter()
-                                .map(|s| match s {
-                                    agent_client_protocol::McpServer::Stdio(server) =>
-                                        server.name.clone(),
-                                    _ => "unknown".to_string(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
+                            let exists = crate::session::check_session_file_exists(
+                                resume_session_id,
+                                &project_path_for_closure.to_string_lossy(),
+                            )
+                            .await;
 
-                    // 🆕 Resume 会话预检查：使用 list_sessions API 验证会话是否存在
-                    // 返回 (system_prompt_meta, actual_is_resume_session)
-                    let (system_prompt_meta, actual_is_resume_session) = if let Some(
-                        ref resume_session_id,
-                    ) =
-                        start_config.resume_session_id
-                    {
-                        // 调用 list_sessions API 检查会话是否存在（带缓存）
-                        match crate::session::check_session_exists_via_api(
-                            &client_conn,
-                            resume_session_id,
-                            &project_path_for_closure.to_string_lossy(),
-                        )
-                        .await
-                        {
-                            Ok(true) => {
-                                info!("✅ 目标会话存在，将使用 resume: {}", resume_session_id);
-                                // 会话存在，使用包含 resume 的 meta
-                                (start_config.build_meta(), true)
-                            }
-                            Ok(false) => {
-                                warn!(
-                                    "⚠️ 目标会话不存在，跳过 resume，创建新会话: {}",
+                            if exists {
+                                info!(
+                                    "✅ [文件扫描] 会话存在，使用 resume: {}",
                                     resume_session_id
                                 );
-                                // 会话不存在，使用不包含 resume 的 meta，且标记为非 resume 会话
+                                (start_config.build_meta(), true)
+                            } else {
+                                warn!(
+                                    "⚠️ [文件扫描] 会话不存在，创建新会话: {}",
+                                    resume_session_id
+                                );
                                 (start_config.build_meta_without_resume(), false)
                             }
-                            Err(e) => {
-                                // API 失败，降级到文件扫描验证
-                                info!(
-                                    "ℹ️ list_sessions API 失败，降级到文件扫描: {} (error: {:?})",
-                                    resume_session_id, e
-                                );
-
-                                let exists = crate::session::check_session_file_exists(
-                                    resume_session_id,
-                                    &project_path_for_closure.to_string_lossy(),
-                                )
-                                .await;
-
-                                if exists {
-                                    info!(
-                                        "✅ [文件扫描] 会话存在，使用 resume: {}",
-                                        resume_session_id
-                                    );
-                                    (start_config.build_meta(), true)
-                                } else {
-                                    warn!(
-                                        "⚠️ [文件扫描] 会话不存在，创建新会话: {}",
-                                        resume_session_id
-                                    );
-                                    (start_config.build_meta_without_resume(), false)
-                                }
-                            }
                         }
-                    } else {
-                        // 没有 resume_session_id，正常创建新会话
-                        (start_config.build_meta(), false)
-                    };
-
-                    // 创建会话（统一使用 new_session，resume 通过 meta 传递）
-                    debug!("创建 ACP 会话[new_session]");
-                    let new_session_request =
-                        NewSessionRequest::new(project_path_for_closure.clone())
-                            .mcp_servers(mcp_servers.clone())
-                            .meta(system_prompt_meta);
-
-                    let resp = client_conn
-                        .new_session(new_session_request)
-                        .await
-                        .context("ACP 会话创建失败")?;
-
-                    debug!(
-                        "ACP 会话创建成功[new_session], session_id={}",
-                        resp.session_id.0
-                    );
-                    let session_id = resp.session_id;
-
-                    // 发送会话 ID
-                    if session_id_tx.send(session_id.clone()).is_err() {
-                        error!("无法发送会话 ID：接收方已关闭");
-                        return Err(anyhow::anyhow!("无法发送会话 ID"));
                     }
+                } else {
+                    // 没有 resume_session_id，正常创建新会话
+                    (start_config.build_meta(), false)
+                };
 
-                    // 创建生命周期句柄（在 spawn_local 外部创建，这里只是引用）
-                    // 注意：lifecycle_handle 将在 launch() 返回后由 session_manager 保存
-                    let lifecycle_handle_for_handler: Option<Arc<dyn AgentLifecycle>> = None;
+                // 创建会话（统一使用 new_session，resume 通过 meta 传递）
+                let start = std::time::Instant::now();
+                debug!("🔵 [ACP] 开始创建 ACP 会话[new_session]");
 
-                    // 启动通道处理器
-                    super::channel_utils::spawn_cancel_handler_for_agent(
-                        client_conn.clone(),
-                        cancel_rx,
-                        &project_id_for_child,
+                let new_session_request =
+                    NewSessionRequest::new(project_path_for_closure.clone())
+                        .mcp_servers(mcp_servers.clone())
+                        .meta(system_prompt_meta);
+
+                // 添加 100 秒超时保护 (MCP 工具较多时启动较慢)
+                let resp = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(100),
+                    client_conn.new_session(new_session_request),
+                )
+                .await
+                .map_err(|_| {
+                    let elapsed = start.elapsed();
+                    error!(
+                        "⏰ [ACP] new_session 超时 (100s)! 耗时: {:?}, MCP 服务器: {:?}, 项目: {}",
+                        elapsed, mcp_servers, project_id_for_child
                     );
+                    anyhow::anyhow!(
+                        "ACP 会话创建超时 (100s) - Agent 子进程可能卡在 MCP 服务器连接或处理大量工具"
+                    )
+                })?
+                .context("ACP 会话创建失败")?;
 
-                    // 启动 Prompt 处理器（包含降级逻辑）
-                    super::channel_utils::spawn_prompt_handler_for_agent(
-                        client_conn.clone(),
-                        prompt_rx,
-                        session_id.clone(),
-                        &project_id_for_child,
-                        PromptHandlerConfig {
-                            is_resume_session: actual_is_resume_session,
-                            project_path: project_path_for_closure.clone(),
-                            mcp_servers: mcp_servers.clone(),
-                            registry: registry_for_handler,
-                            cancel_tx: cancel_tx_for_handler,
-                            lifecycle_handle: lifecycle_handle_for_handler,
-                            model_provider: model_provider_for_handler,
-                            notifier: notifier.clone(),
-                        },
+                let elapsed = start.elapsed();
+                debug!(
+                    "✅ [ACP] ACP 会话创建成功[new_session], session_id={}, 耗时: {:?}",
+                    resp.session_id.0, elapsed
+                );
+
+                // 🆕 如果耗时较长,发出警告
+                if elapsed.as_secs() > 10 {
+                    warn!(
+                        "⚠️ [ACP] new_session 耗时较长: {:?} (MCP 服务器数量: {})",
+                        elapsed,
+                        mcp_servers.len()
                     );
+                }
 
-                    // 等待取消信号（降级逻辑已移至 Prompt 处理器内部）
-                    cancel_token_for_closure.cancelled().await;
-                    info!("Claude Code ACP Agent 收到取消信号，将清理资源并退出");
-                    Ok(())
-                })
-                .await;
+                let session_id = resp.session_id;
+
+                // 发送会话 ID
+                if session_id_tx.send(session_id.clone()).is_err() {
+                    error!("无法发送会话 ID：接收方已关闭");
+                    return Err(anyhow::anyhow!("无法发送会话 ID"));
+                }
+
+                // 创建生命周期句柄（在 spawn_local 外部创建，这里只是引用）
+                // 注意：lifecycle_handle 将在 launch() 返回后由 session_manager 保存
+                let lifecycle_handle_for_handler: Option<Arc<dyn AgentLifecycle>> = None;
+
+                // 启动通道处理器
+                super::channel_utils::spawn_cancel_handler_for_agent(
+                    client_conn.clone(),
+                    cancel_rx,
+                    &project_id_for_child,
+                );
+
+                // 启动 Prompt 处理器（包含降级逻辑）
+                super::channel_utils::spawn_prompt_handler_for_agent(
+                    client_conn.clone(),
+                    prompt_rx,
+                    session_id.clone(),
+                    &project_id_for_child,
+                    PromptHandlerConfig {
+                        is_resume_session: actual_is_resume_session,
+                        project_path: project_path_for_closure.clone(),
+                        mcp_servers: mcp_servers.clone(),
+                        registry: registry_for_handler,
+                        cancel_tx: cancel_tx_for_handler,
+                        lifecycle_handle: lifecycle_handle_for_handler,
+                        model_provider: model_provider_for_handler,
+                        notifier: notifier.clone(),
+                    },
+                );
+
+                // 使用 tokio::select! 正确处理取消信号
+                // Prompt 处理器已经在后台 spawn_local 任务中运行
+                // 这里只需要等待取消信号即可
+                tokio::select! {
+                    _ = cancel_token_for_closure.cancelled() => {
+                        info!("Claude Code ACP Agent 收到取消信号，将清理资源并退出");
+                        Ok(())
+                    }
+                    // 注意: 不需要其他分支,因为 Prompt 处理器已经在后台运行
+                    // select! 会一直等待直到取消信号到来
+                }
+            }.await;
 
             if let Err(e) = result {
                 error!("Claude Code ACP Agent 后台任务失败: {}", e);
