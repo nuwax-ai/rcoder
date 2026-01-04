@@ -197,8 +197,8 @@ impl ProjectInfo {
     pub fn is_idle(&self, idle_timeout: Duration) -> bool {
         let now = Utc::now();
         let idle_duration = now - self.last_activity;
-        let is_timeout = idle_duration
-            > ChronoDuration::from_std(idle_timeout).unwrap_or(ChronoDuration::MAX);
+        let is_timeout =
+            idle_duration > ChronoDuration::from_std(idle_timeout).unwrap_or(ChronoDuration::MAX);
 
         let is_idle_status = matches!(self.status, Some(AgentStatus::Idle) | None);
         is_idle_status && is_timeout
@@ -400,8 +400,8 @@ impl UnifiedContainerInfo {
     pub fn is_fully_idle(&self, idle_timeout: Duration) -> bool {
         let now = Utc::now();
         let idle_duration = now - self.last_activity;
-        let is_timeout = idle_duration
-            > ChronoDuration::from_std(idle_timeout).unwrap_or(ChronoDuration::MAX);
+        let is_timeout =
+            idle_duration > ChronoDuration::from_std(idle_timeout).unwrap_or(ChronoDuration::MAX);
 
         match self.service_type {
             ServiceType::RCoder => {
@@ -524,11 +524,14 @@ mod tests {
         // 设置为 Idle 状态
         project.status = Some(AgentStatus::Idle);
 
-        // 短超时时间内不闲置
-        assert!(!project.is_idle(Duration::from_secs(3600)));
+        // 短超时时间内不闲置 (1秒内不算闲置)
+        assert!(!project.is_idle(Duration::from_secs(1)));
 
-        // 超长超时时间（0秒）应该闲置
-        assert!(project.is_idle(Duration::from_secs(0)));
+        // 设置 last_activity 为过去的时间 (超过超时阈值)
+        project.last_activity = Utc::now() - ChronoDuration::seconds(10);
+
+        // 现在应该被判定为闲置 (超过 5 秒阈值)
+        assert!(project.is_idle(Duration::from_secs(5)));
     }
 
     #[test]
@@ -607,8 +610,14 @@ mod tests {
         // 设置为 Idle 状态
         info.status = Some(AgentStatus::Idle);
 
-        // 超长超时时间（0秒）应该闲置
-        assert!(info.is_fully_idle(Duration::from_secs(0)));
+        // 短超时时间内不闲置（1秒内不算闲置）
+        assert!(!info.is_fully_idle(Duration::from_secs(1)));
+
+        // 设置 last_activity 为过去的时间（超过超时阈值）
+        info.last_activity = Utc::now() - ChronoDuration::seconds(10);
+
+        // 现在应该被判定为闲置（超过 5 秒阈值）
+        assert!(info.is_fully_idle(Duration::from_secs(5)));
     }
 
     #[test]

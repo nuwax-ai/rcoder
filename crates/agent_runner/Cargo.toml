@@ -12,6 +12,13 @@ path = "src/lib.rs"
 [features]
 default = []
 
+# 测试相关 features
+testing = ["test-blocking"]
+test-blocking = []  # 启用测试用阻塞注入 (用于极端场景测试)
+
+# OpenTelemetry 追踪 feature
+otel = []  # 启用 OpenTelemetry 追踪功能
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }

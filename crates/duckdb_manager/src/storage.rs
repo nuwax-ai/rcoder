@@ -520,6 +520,19 @@ mod tests {
     fn test_session_operations() {
         let storage = create_test_storage();
 
+        // 创建容器 (必须先创建容器,因为项目关联到容器)
+        let container = ContainerRecord::new(
+            "c1".to_string(),
+            "container-1".to_string(),
+            "127.0.0.1".to_string(),
+            8080,
+            8080,
+            ServiceType::RCoder,
+            "running".to_string(),
+            "http://localhost:8080".to_string(),
+        );
+        storage.save_container(&container).unwrap();
+
         // 创建项目
         let record = ProjectRecord::new("p1".to_string(), ServiceType::RCoder, "c1".to_string());
         storage.save_project(&record).unwrap();
@@ -532,9 +545,7 @@ mod tests {
         assert!(project.is_some());
         assert_eq!(project.unwrap().project_id, "p1");
 
-        // 获取容器ID
-        // 注意：get_container_id_by_session 已被移除，改为测试 get_container_name_by_session
-        // 但这里为了验证会话关联，我们主要关注 get_container_name_by_session 返回正常
+        // 获取容器名称
         let container_name = storage.get_container_name_by_session("session-1").unwrap();
         assert_eq!(container_name, Some("container-1".to_string()));
     }

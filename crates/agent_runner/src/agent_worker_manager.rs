@@ -7,9 +7,10 @@
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::proxy_agent::LocalSetAgentRequest;
 
@@ -42,6 +43,26 @@ pub struct WorkerReady {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// 活跃请求统计信息
+///
+/// 用于监控任务，避免克隆整个 HashMap
+#[derive(Debug, Clone, Default)]
+pub struct ActiveRequestsSummary {
+    /// 活跃请求数量
+    pub count: usize,
+    /// 最大持续时间（秒）
+    pub max_duration_secs: i64,
+    /// 超过 60 秒的请求数
+    pub timeout_count_60: usize,
+    /// 超过 120 秒的请求数
+    pub timeout_count_120: usize,
+}
+
+/// 🔥 DoS 防护配置
+///
+/// 限制活跃请求追踪的最大数量，防止恶意攻击导致内存耗尽
+pub const MAX_ACTIVE_REQUESTS: usize = 10_000;
+
 /// Worker 句柄（传递给 worker 线程）
 ///
 /// Worker 线程通过此句柄发送心跳信号和就绪信号
@@ -50,6 +71,8 @@ pub struct WorkerHandle {
     pub heartbeat_tx: mpsc::Sender<Heartbeat>,
     /// 用于发送就绪信号（一次性，使用 oneshot）
     pub ready_tx: Option<oneshot::Sender<WorkerReady>>,
+    /// 🆕 用于追踪请求的 Arc 引用 (可选,用于请求超时检测)
+    pub active_requests: Option<Arc<std::sync::Mutex<HashMap<String, chrono::DateTime<Utc>>>>>,
 }
 
 /// Agent Worker 管理器
@@ -67,6 +90,9 @@ pub struct AgentWorkerManager {
 
     /// 上次状态变化时间（用于首次启动超时检测）
     last_state_change: Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+
+    /// 🆕 活跃请求追踪: request_id -> 开始时间
+    active_requests: Arc<std::sync::Mutex<HashMap<String, chrono::DateTime<Utc>>>>,
 }
 
 impl AgentWorkerManager {
@@ -101,6 +127,7 @@ impl AgentWorkerManager {
             state_tx,
             last_heartbeat: Arc::new(std::sync::Mutex::new(None)),
             last_state_change: Arc::new(std::sync::Mutex::new(now)),
+            active_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         (manager, heartbeat_rx, ready_rx, heartbeat_tx, ready_tx)
@@ -120,6 +147,7 @@ impl AgentWorkerManager {
         WorkerHandle {
             heartbeat_tx,
             ready_tx: Some(ready_tx),
+            active_requests: Some(self.active_requests.clone()),
         }
     }
 
@@ -235,6 +263,112 @@ impl AgentWorkerManager {
             .expect("AgentWorkerManager::last_heartbeat mutex poisoned");
         *last = None;
         debug!("🔄 [AgentWorkerManager] 心跳时间已重置");
+    }
+
+    /// 🆕 追踪请求开始
+    ///
+    /// 在发送请求到 Worker 时调用,记录请求开始时间
+    ///
+    /// # 返回
+    /// - `Ok(())` - 请求追踪成功
+    /// - `Err(reason)` - 请求被拒绝（DoS 防护触发）
+    ///
+    /// # DoS 防护
+    /// 当活跃请求数超过 `MAX_ACTIVE_REQUESTS` 时，拒绝新请求
+    pub fn track_request_start(&self, request_id: String) -> Result<(), String> {
+        let mut requests = self
+            .active_requests
+            .lock()
+            .expect("AgentWorkerManager::active_requests mutex poisoned");
+
+        // 🔥 DoS 防护检查
+        if requests.len() >= MAX_ACTIVE_REQUESTS {
+            warn!(
+                "🛡️ [DoS防护] 活跃请求数已达上限 ({})，拒绝新请求: {}",
+                MAX_ACTIVE_REQUESTS, request_id
+            );
+            return Err(format!(
+                "活跃请求数已达上限 ({})，请稍后重试",
+                MAX_ACTIVE_REQUESTS
+            ));
+        }
+
+        requests.insert(request_id, Utc::now());
+        debug!(
+            "📍 [WorkerMonitor] 追踪请求开始, 活跃请求数: {}",
+            requests.len()
+        );
+        Ok(())
+    }
+
+    /// 🆕 追踪请求完成
+    ///
+    /// 在收到响应时调用,移除请求追踪
+    pub fn track_request_complete(&self, request_id: &str) {
+        let mut requests = self
+            .active_requests
+            .lock()
+            .expect("AgentWorkerManager::active_requests mutex poisoned");
+        requests.remove(request_id);
+        debug!(
+            "📍 [WorkerMonitor] 请求完成, 活跃请求数: {}",
+            requests.len()
+        );
+    }
+
+    /// 🆕 获取活跃请求统计信息（性能优化版本）
+    ///
+    /// 避免克隆整个 HashMap，只返回统计信息用于监控
+    pub fn get_active_requests_summary(&self) -> ActiveRequestsSummary {
+        let requests = self
+            .active_requests
+            .lock()
+            .expect("AgentWorkerManager::active_requests mutex poisoned");
+        let now = Utc::now();
+        let mut max_duration = 0;
+        let mut timeout_count_60 = 0;
+        let mut timeout_count_120 = 0;
+
+        for (_req_id, start_time) in requests.iter() {
+            let duration = (now - *start_time).num_seconds();
+            max_duration = max_duration.max(duration);
+            if duration > 120 {
+                timeout_count_120 += 1;
+            } else if duration > 60 {
+                timeout_count_60 += 1;
+            }
+        }
+
+        ActiveRequestsSummary {
+            count: requests.len(),
+            max_duration_secs: max_duration,
+            timeout_count_60,
+            timeout_count_120,
+        }
+    }
+
+    /// 🆕 获取所有活跃请求（仅用于调试，不建议高频调用）
+    ///
+    /// ⚠️ 性能警告：此方法会克隆整个 HashMap
+    pub fn get_active_requests(&self) -> HashMap<String, chrono::DateTime<Utc>> {
+        let requests = self
+            .active_requests
+            .lock()
+            .expect("AgentWorkerManager::active_requests mutex poisoned");
+        requests.clone()
+    }
+
+    /// 🆕 清除所有活跃请求（用于重启时）
+    ///
+    /// 当 Worker 重启时,清除所有旧的请求追踪
+    pub fn clear_active_requests(&self) {
+        let mut requests = self
+            .active_requests
+            .lock()
+            .expect("AgentWorkerManager::active_requests mutex poisoned");
+        let count = requests.len();
+        requests.clear();
+        debug!("🔄 [WorkerMonitor] 已清除 {} 个活跃请求", count);
     }
 }
 

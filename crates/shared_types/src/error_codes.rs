@@ -75,6 +75,9 @@ pub const ERR_RESUME_FAILED: &str = "8001";
 /// 降级重试次数耗尽
 pub const ERR_RETRY_EXHAUSTED: &str = "8002";
 
+/// 请求过多（DoS 防护触发）
+pub const ERR_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
+
 /// 获取错误码的默认描述
 pub fn get_error_description(code: &str) -> &'static str {
     match code {
@@ -99,6 +102,7 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_INTERNAL_SERVER_ERROR => "内部服务器错误",
         ERR_RESUME_FAILED => "Resume 会话失败",
         ERR_RETRY_EXHAUSTED => "降级重试次数耗尽",
+        ERR_TOO_MANY_REQUESTS => "请求过多",
         ERR_UNKNOWN => "未知错误",
         _ => "未定义的错误码",
     }

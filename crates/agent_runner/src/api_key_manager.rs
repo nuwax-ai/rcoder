@@ -13,10 +13,13 @@
 //!
 //! // 存储 API 配置
 //! let config = ModelProviderConfig {
+//!     id: "anthropic-prov".to_string(),
 //!     name: "anthropic".to_string(),
 //!     api_key: "sk-ant-xxx".to_string(),
 //!     base_url: "https://api.anthropic.com".to_string(),
-//!     // ... 其他字段
+//!     requires_openai_auth: false,
+//!     default_model: "claude-3-5-sonnet-20241022".to_string(),
+//!     api_protocol: Some("anthropic".to_string()),
 //! };
 //! manager.store_config("anthropic", config);
 //!
@@ -108,15 +111,21 @@ impl ApiKeyManager {
     /// # use shared_types::ModelProviderConfig;
     /// let manager = ApiKeyManager::new();
     /// let config = ModelProviderConfig {
+    ///     id: "anthropic-prov".to_string(),
     ///     name: "anthropic".to_string(),
     ///     api_key: "sk-ant-xxx".to_string(),
     ///     base_url: "https://api.anthropic.com".to_string(),
-    ///     ..Default::default()
+    ///     requires_openai_auth: false,
+    ///     default_model: "claude-3-5-sonnet-20241022".to_string(),
+    ///     api_protocol: Some("anthropic".to_string()),
     /// };
     /// manager.store_config("svc-uuid-123", config);
     /// ```
     pub fn store_config(&self, service_name: &str, config: ModelProviderConfig) {
-        debug!("🔑 [API_KEY_MANAGER] 存储配置: service_name={}", service_name);
+        debug!(
+            "🔑 [API_KEY_MANAGER] 存储配置: service_name={}",
+            service_name
+        );
         self.shared.insert(service_name.to_string(), config);
     }
 
@@ -173,7 +182,10 @@ impl ApiKeyManager {
     ///
     /// 如果找到并移除了配置则返回 `Some(ModelProviderConfig)`，否则返回 `None`。
     pub fn remove(&self, service_name: &str) -> Option<ModelProviderConfig> {
-        debug!("🔑 [API_KEY_MANAGER] 移除配置: service_name={}", service_name);
+        debug!(
+            "🔑 [API_KEY_MANAGER] 移除配置: service_name={}",
+            service_name
+        );
         self.shared.remove(service_name).map(|(_, v)| v)
     }
 
