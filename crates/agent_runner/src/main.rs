@@ -1,11 +1,11 @@
 use clap::Parser;
 use dashmap::DashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
-use tracing_appender::rolling::Rotation;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+// 🆕 使用共享的遥测模块
+use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
 mod agent_worker_manager;
 mod api_key_manager;
@@ -15,7 +15,8 @@ mod handler;
 mod model;
 mod proxy_agent;
 
-// 🔥 OpenTelemetry 追踪模块
+// 🔥 OpenTelemetry 追踪模块（可选：保留用于向后兼容）
+#[allow(dead_code)]
 mod otel_tracing;
 
 mod middleware;
@@ -34,8 +35,11 @@ use router::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 初始化 OpenTelemetry
-    init_telemetry()?;
+    // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
+    let telemetry_config = TelemetryConfig::from_env("agent_runner")
+        .with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
+    let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
+    let telemetry = Arc::new(telemetry);
 
     info!("Starting rcoder - AI-powered development platform");
 
@@ -154,8 +158,8 @@ async fn main() -> anyhow::Result<()> {
         project_uuid_map,
     });
 
-    // 创建路由
-    let app = router::create_router(state.clone());
+    // 创建路由（传入遥测 guard 用于 /metrics 端点）
+    let app = router::create_router(state.clone(), Some(telemetry.clone()));
 
     // 启动 gRPC 服务器
     let grpc_port = shared_types::GRPC_DEFAULT_PORT;
@@ -229,56 +233,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = proxy_handle {
         handle.await?;
     }
-
-    Ok(())
-}
-
-/// 初始化遥测系统
-fn init_telemetry() -> anyhow::Result<()> {
-    // 创建 logs 目录（如果不存在）
-    let logs_dir = Path::new("logs");
-    if !logs_dir.exists() {
-        std::fs::create_dir_all(logs_dir)?;
-        info!("创建日志目录: {:?}", logs_dir);
-    }
-
-    // 设置按天滚动的文件 appender，保留最近5天的日志
-    let file_appender = tracing_appender::rolling::Builder::new()
-        .rotation(Rotation::DAILY)
-        .filename_prefix("agent-runner")
-        .max_log_files(5) // 保留最近5个日志文件
-        .build(logs_dir)?;
-
-    // 创建文件日志层 - JSON 格式，便于后续分析
-    let file_layer = fmt::layer()
-        .json()
-        .with_writer(file_appender)
-        .with_ansi(false)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_thread_names(true);
-
-    // 创建控制台日志层 - 简洁格式
-    let console_layer = fmt::layer().with_target(false).with_ansi(true);
-
-    // 设置全局文本传播器（用于 trace context 传播）
-    opentelemetry::global::set_text_map_propagator(
-        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-    );
-
-    // 初始化 tracing subscriber，同时输出到文件和控制台
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "rcoder=debug,tower_http=debug,axum_tracing_opentelemetry=info".into()
-            }),
-        )
-        .with(file_layer)
-        .with(console_layer)
-        .init();
-
-    info!("✓ Tracing 初始化成功，支持 trace_id 生成和传播");
-    info!("✓ 日志文件将按天滚动保存在 {:?} 目录", logs_dir);
 
     Ok(())
 }

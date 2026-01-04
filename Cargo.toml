@@ -57,6 +57,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tonic = { version = "0.14.2", features = ["tls-native-roots"] }
 http = "1.0"
+http-body = "1.0"
+http-body-util = "0.1"
 
 # Database
 sqlx = { version = "0.8", features = [
@@ -84,11 +86,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"
 env_logger = "0.11"
 
-# OpenTelemetry
+# OpenTelemetry (统一使用 0.30 以兼容 tracing-opentelemetry)
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "http-proto"] }
 tracing-opentelemetry = "0.31"
 axum-tracing-opentelemetry = "0.30"
+
+# Prometheus Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
 
 # UUID
 uuid = { version = "1.0", features = ["serde", "v4", "v7"] }
@@ -200,3 +207,6 @@ bollard = { version = "0.19.4" }
 
 # Cache library
 moka = { version = "0.12", features = ["future"] }
+
+# Internal crates
+rcoder-telemetry = { path = "crates/rcoder-telemetry" }

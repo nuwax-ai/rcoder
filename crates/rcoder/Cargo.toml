@@ -23,6 +23,7 @@ acp-adapter = { path = "../acp_adapter" }
 rcoder-proxy = { path = "../rcoder-proxy" }
 docker_manager = { path = "../docker_manager" }
 duckdb_manager = { path = "../duckdb_manager" }
+rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
 # ACP Protocol
