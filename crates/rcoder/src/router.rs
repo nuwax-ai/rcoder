@@ -10,7 +10,7 @@ use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
 use crate::{config::AppConfig, handler, storage::ProjectAdapter};
-use rcoder_telemetry::{TelemetryGuard, HttpMetricsLayer};
+use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -140,6 +140,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/computer/chat", post(handler::handle_computer_chat))
         .route("/computer/agent/stop", post(handler::computer_agent_stop))
         .route(
+            "/computer/agent/status",
+            post(handler::computer_agent_status),
+        ) // 🆕 新增
+        .route(
             "/computer/agent/session/cancel",
             post(handler::computer_agent_session_cancel),
         )
@@ -224,12 +228,18 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
     match telemetry.render_metrics() {
         Some(metrics) => (
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             metrics,
         ),
         None => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             "Prometheus metrics not enabled".to_string(),
         ),
     }
@@ -247,6 +257,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::agent_status,
         handler::handle_computer_chat,
         handler::computer_agent_stop,
+        handler::computer_agent_status, // 🆕 新增
         handler::computer_agent_session_cancel,
         handler::computer_agent_progress_notification,
         handler::computer_desktop_vnc,
@@ -302,6 +313,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::ComputerChatRequest,
             handler::ComputerAgentStopRequest,
             handler::ComputerAgentStopResponse,
+            handler::ComputerAgentStatusRequest,  // 🆕 新增
+            handler::ComputerAgentStatusResponse, // 🆕 新增
             handler::DesktopPathParams,
             handler::VncProxyPathParams,
             handler::DesktopAccessResponse,
