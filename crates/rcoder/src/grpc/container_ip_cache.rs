@@ -78,28 +78,6 @@ impl ContainerIpCache {
             container_name
         );
     }
-
-    /// 清理所有过期条目
-    ///
-    /// 注意：moka 会自动清理过期条目，通常不需要手动调用
-    #[allow(dead_code)]
-    pub fn cleanup_expired(&self) {
-        // moka 会在后台自动清理，这里强制触发一次同步清理
-        self.cache.run_pending_tasks();
-        debug!("🧹 [IP_CACHE] 触发过期条目清理");
-    }
-
-    /// 获取当前缓存条目数量
-    #[allow(dead_code)]
-    pub fn len(&self) -> u64 {
-        self.cache.entry_count()
-    }
-
-    /// 检查缓存是否为空
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.cache.entry_count() == 0
-    }
 }
 
 /// 默认缓存 TTL（5秒）
