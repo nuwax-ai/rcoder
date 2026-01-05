@@ -41,7 +41,11 @@ fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
         .unwrap_or_else(|| DateTime::UNIX_EPOCH);
 
     // 创建东八区时区偏移 (UTC+8)
-    let utc8_offset = FixedOffset::east_opt(8 * 3600).expect("有效的 UTC+8 偏移");
+    // 注意: east_opt 在参数有效时总是返回 Some，这里使用 unwrap_or 仅作为安全保障
+    let utc8_offset = FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| {
+        tracing::warn!("⚠️ 创建 UTC+8 时区偏移失败，使用 UTC+0");
+        FixedOffset::east_opt(0).unwrap_or(FixedOffset::east_opt(0).unwrap())
+    });
 
     // 转换为东八区时间并格式化
     datetime
@@ -737,7 +741,10 @@ pub async fn pod_ensure(
                         warn!(
                             "⚠️ [POD_ENSURE] 容器创建失败（第 {} 次尝试），将重试: {}",
                             attempt,
-                            last_error.as_ref().unwrap()
+                            last_error
+                                .as_ref()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "未知错误".to_string())
                         );
                         // 等待一段时间后重试（指数退避）
                         tokio::time::sleep(tokio::time::Duration::from_millis(
@@ -754,7 +761,13 @@ pub async fn pod_ensure(
         // 返回结果或错误
         match result {
             Some(info) => (info, true),
-            None => return Err(last_error.unwrap()),
+            None => {
+                let error_msg = last_error
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "容器创建失败但未捕获到错误信息".to_string());
+                return Err(AppError::internal_server_error(&error_msg));
+            }
         }
     } else {
         // 获取现有容器的完整信息

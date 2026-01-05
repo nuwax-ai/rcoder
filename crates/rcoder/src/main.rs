@@ -1,6 +1,6 @@
 use clap::Parser;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -12,6 +12,7 @@ use hyper_util::service::TowerToHyperService;
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
 mod config;
+mod config_watcher;
 mod handler;
 
 mod cleanup_task;
@@ -38,8 +39,7 @@ use docker_manager::container_stop;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
-    let telemetry_config = TelemetryConfig::from_env("rcoder")
-        .with_file_log("rcoder"); // 启用文件日志，前缀为 rcoder
+    let telemetry_config = TelemetryConfig::from_env("rcoder").with_file_log("rcoder"); // 启用文件日志，前缀为 rcoder
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
 
@@ -286,15 +286,36 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_tx = setup_signal_handlers();
     let shutdown_rx = shutdown_tx.subscribe();
 
-    let state = Arc::new(AppState::new(config.clone(), pingora_service_opt));
+    // 🆕 创建 API Key 配置的共享引用（用于热更新）
+    let api_key_config = Arc::new(RwLock::new(config.api_key_auth.clone()));
+
+    // 🆕 启动配置文件监控（支持 API Key 热更新）
+    // 保持 watcher 的所有权，防止被提前 drop
+    let config_path = std::path::PathBuf::from(crate::config::CONFIG_FILE);
+    let _config_watcher =
+        match crate::config_watcher::ConfigWatcher::new(config_path, Arc::clone(&api_key_config)) {
+            Ok(watcher) => {
+                info!("🔄 配置文件监控已启动，支持 API Key 热更新");
+                Some(watcher)
+            }
+            Err(e) => {
+                warn!("⚠️  配置文件监控启动失败: {}，API Key 热更新将不可用", e);
+                None
+            }
+        };
+
+    let state = Arc::new(AppState::new(
+        config.clone(),
+        pingora_service_opt,
+        api_key_config,
+    )?);
 
     // 在主异步运行时中启动清理任务
     let cleanup_config_clone = cleanup_config.clone();
     let state_for_cleanup = state.clone();
-    let _cleanup_handle = tokio::spawn(async move {
-        // 直接使用本地 cleanup_task 模块，避免类型不匹配
-        cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup).await
-    });
+    let _cleanup_handle = cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup)
+        .await
+        .map_err(|e| anyhow::anyhow!("清理任务启动失败: {}", e))?;
 
     // 启动容器状态检查任务（防止长时间任务的容器被误杀）
     // 🆕 使用增强的配置，包含失败计数器和智能跳过机制
@@ -485,23 +506,30 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
 
         let shutdown_tx_clone = shutdown_tx.clone();
         tokio::spawn(async move {
-            let mut sigint =
-                signal(SignalKind::interrupt()).expect("SIGINT signal handler registration failed");
-            let mut sigterm = signal(SignalKind::terminate())
-                .expect("SIGTERM signal handler registration failed");
+            // 注册信号处理器，如果失败则记录警告并优雅降级
+            let sigint_result = signal(SignalKind::interrupt());
+            let sigterm_result = signal(SignalKind::terminate());
 
-            tokio::select! {
-                _ = sigint.recv() => {
-                    if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
-                        info!("收到 SIGINT (Ctrl+C) 信号，开始优雅关闭...");
-                        let _ = shutdown_tx_clone.send(());
+            match (sigint_result, sigterm_result) {
+                (Ok(mut sigint), Ok(mut sigterm)) => {
+                    tokio::select! {
+                        _ = sigint.recv() => {
+                            if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
+                                info!("收到 SIGINT (Ctrl+C) 信号，开始优雅关闭...");
+                                let _ = shutdown_tx_clone.send(());
+                            }
+                        }
+                        _ = sigterm.recv() => {
+                            if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
+                                info!("收到 SIGTERM 信号，开始优雅关闭...");
+                                let _ = shutdown_tx_clone.send(());
+                            }
+                        }
                     }
                 }
-                _ = sigterm.recv() => {
-                    if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
-                        info!("收到 SIGTERM 信号，开始优雅关闭...");
-                        let _ = shutdown_tx_clone.send(());
-                    }
+                (Err(e), _) | (_, Err(e)) => {
+                    warn!("⚠️  Unix 信号处理器注册失败: {}，将依赖其他关闭机制", e);
+                    // 注册失败不影响程序运行，仍可通过其他方式关闭（如 tokio::signal::ctrl_c）
                 }
             }
         });

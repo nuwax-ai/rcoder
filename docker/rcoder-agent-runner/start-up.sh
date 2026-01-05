@@ -605,9 +605,10 @@ function start_vnc_services() {
 
 	if [ "$vnc_running" = true ] && [ "$novnc_running" = true ]; then
 		log_success "VNC services started successfully!"
-		# 🆕 写入 VNC 就绪标记（包含启动时间戳），供 VNC 状态查询 API 使用
-		echo "$(date +%s)" > /tmp/vnc_ready
-		log_success "VNC ready marker written to /tmp/vnc_ready"
+		# 🆕 写入 noVNC 端口就绪标记（不是最终的 VNC 就绪标记）
+		# 最终的 /tmp/vnc_ready 由 wait_and_write_vnc_ready_marker() 在壁纸也就绪后写入
+		echo "$(date +%s)" > /tmp/novnc_port_ready
+		log_success "noVNC port ready marker written to /tmp/novnc_port_ready"
 		return 0
 	else
 		echo "✗ VNC services failed to start properly"
@@ -892,6 +893,10 @@ function apply_xfce_wallpaper() {
     DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5 2>/dev/null || true
 
     log_success "XFCE wallpaper applied successfully"
+
+    # 🆕 写入壁纸就绪标记，供 VNC 就绪检查使用
+    echo "$(date +%s)" > /tmp/wallpaper_ready
+    log_success "Wallpaper ready marker written to /tmp/wallpaper_ready"
 }
 
 function check_vnc_health() {
@@ -913,6 +918,50 @@ function check_vnc_health() {
         return 0
     fi
     return 0
+}
+
+# ============================================================================
+# 🎯 VNC 就绪标记轮询任务
+# 同时等待 noVNC 端口和桌面壁纸都就绪后，才写入最终的 VNC 就绪标记
+# 这样前端打开 VNC 远程桌面时，桌面一定是正常显示的
+# ============================================================================
+function wait_and_write_vnc_ready_marker() {
+    log "Starting VNC ready marker polling task (no timeout, will wait indefinitely)..."
+
+    local interval=1    # 每秒检查一次
+    local elapsed=0
+
+    while true; do
+        local novnc_ready=false
+        local wallpaper_ready=false
+
+        # 检查 noVNC 端口就绪标记
+        if [ -f /tmp/novnc_port_ready ]; then
+            novnc_ready=true
+        fi
+
+        # 检查壁纸就绪标记
+        if [ -f /tmp/wallpaper_ready ]; then
+            wallpaper_ready=true
+        fi
+
+        # 两者都就绪时，写入最终的 VNC 就绪标记
+        if [ "$novnc_ready" = true ] && [ "$wallpaper_ready" = true ]; then
+            echo "$(date +%s)" > /tmp/vnc_ready
+            log_success "VNC ready marker written to /tmp/vnc_ready (noVNC + wallpaper both ready, took ${elapsed}s)"
+            log_success "  noVNC port ready at: $(cat /tmp/novnc_port_ready)"
+            log_success "  Wallpaper ready at: $(cat /tmp/wallpaper_ready)"
+            return 0
+        fi
+
+        # 日志输出当前状态（每 30 秒输出一次，减少日志量）
+        if ((elapsed % 30 == 0)) && ((elapsed > 0)); then
+            log "Waiting for VNC ready... noVNC=$novnc_ready, wallpaper=$wallpaper_ready (${elapsed}s elapsed)"
+        fi
+
+        sleep $interval
+        ((elapsed += interval))
+    done
 }
 
 # Jupyter server function removed
@@ -1224,6 +1273,14 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     log "Waiting for all services to start..."
     wait $vnc_pid $mcp_pid $audio_pid $ime_pid $wallpaper_pid 2>/dev/null || true
     log_success "All X11-dependent services started!"
+
+    # 🆕 启动 VNC 就绪标记轮询任务（后台）
+    # 等待 noVNC 端口和壁纸都就绪后，才写入最终的 /tmp/vnc_ready 标记
+    (
+        wait_and_write_vnc_ready_marker
+    ) &
+    vnc_ready_marker_pid=$!
+    log "VNC ready marker polling task started (pid: $vnc_ready_marker_pid)"
 
     # VNC服务监控循环 (as root)
     while true; do

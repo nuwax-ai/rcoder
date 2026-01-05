@@ -20,13 +20,22 @@ pub use config::{CleanupConfig, CleanupStats};
 pub use strategies::DestroyReason;
 
 /// 启动清理任务
+///
+/// # Errors
+/// 如果获取 DockerManager 失败，返回错误而不是静默失败
 pub async fn start_cleanup_task(
     config: CleanupConfig,
     state: Arc<crate::router::AppState>,
-) -> tokio::task::JoinHandle<()> {
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
-        .expect("获取 DockerManager 失败");
+        .map_err(|e| {
+            tracing::error!(
+                "🚨 [CLEANUP_TASK] 获取 DockerManager 失败: {}，清理任务无法启动",
+                e
+            );
+            anyhow::anyhow!("获取 DockerManager 失败: {}", e)
+        })?;
 
     let multi_image_config = state
         .config
@@ -50,7 +59,7 @@ pub async fn start_cleanup_task(
         container_patterns,
     );
 
-    tokio::task::spawn(async move {
+    Ok(tokio::task::spawn(async move {
         cleaner.run().await;
-    })
+    }))
 }

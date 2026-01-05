@@ -78,6 +78,9 @@ pub const ERR_RETRY_EXHAUSTED: &str = "8002";
 /// 请求过多（DoS 防护触发）
 pub const ERR_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
 
+/// API Key 鉴权失败
+pub const ERR_API_KEY_AUTH_FAILED: &str = "4010";
+
 /// 获取错误码的默认描述
 pub fn get_error_description(code: &str) -> &'static str {
     match code {
@@ -103,6 +106,7 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_RESUME_FAILED => "Resume 会话失败",
         ERR_RETRY_EXHAUSTED => "降级重试次数耗尽",
         ERR_TOO_MANY_REQUESTS => "请求过多",
+        ERR_API_KEY_AUTH_FAILED => "API Key 鉴权失败",
         ERR_UNKNOWN => "未知错误",
         _ => "未定义的错误码",
     }

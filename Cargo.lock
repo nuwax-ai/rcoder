@@ -4056,6 +4056,7 @@ dependencies = [
  "hyper-util",
  "md5",
  "moka",
+ "notify",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
