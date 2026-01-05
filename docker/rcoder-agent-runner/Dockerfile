@@ -14,6 +14,9 @@ FROM ${BASE_IMAGE}
 # 📦 复制业务代码和配置文件
 # ============================================================================
 
+# 安装 mcp-stdio-proxy（频繁更新的工具，放在最终镜像以加快构建）
+RUN . /opt/cargo/env && cargo install mcp-stdio-proxy
+
 # 复制预构建的 agent_runner 二进制文件
 COPY bin/agent_runner /usr/local/bin/agent_runner
 RUN chmod +x /usr/local/bin/agent_runner
