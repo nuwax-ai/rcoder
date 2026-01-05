@@ -196,6 +196,7 @@ dev-restart: dev-build
 	fi
 	@echo ""
 	@echo "🎉 完整重启完成！"
+	@echo "🎉 如需构建基础镜像,可以执行: make docker-build-base"
 	@echo "💡 代码更改已生效，因为重新构建了镜像！"
 
 # ==================== 测试命令 ====================
