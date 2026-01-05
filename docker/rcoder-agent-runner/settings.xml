@@ -1,7 +1,9 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
-          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd">
+<?xml version="1.0" encoding="UTF-8" ?>
+<settings
+    xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd"
+>
     <!-- 指定本地仓库路径 -->
     <localRepository>/home/user/.m2/repository</localRepository>
 
@@ -12,7 +14,6 @@
             <mirrorOf>*</mirrorOf>
             <name>阿里云公共仓库</name>
             <url>https://maven.aliyun.com/repository/public</url>
-            <!-- <url>http://192.168.194.165:8081/repository/maven-public/</url> -->
         </mirror>
         <!-- Maven 中央仓库 -->
         <mirror>
@@ -75,4 +76,4 @@
     <activeProfiles>
         <activeProfile>spring</activeProfile>
     </activeProfiles>
-</settings> 
+</settings>
