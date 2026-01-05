@@ -648,14 +648,13 @@ RUN apt-get update && apt-get install -y \
     build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# 安装 Rust toolchain 并安装 mcp-stdio-proxy（需要 root）
+# 安装 Rust toolchain（需要 root）
+# 注意：mcp-stdio-proxy 的安装已移至 Dockerfile，以便频繁更新时无需重建基础镜像
 ENV RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
     PATH="/opt/cargo/bin:$PATH"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
     chmod -R 755 /opt/rustup /opt/cargo && \
-    . /opt/cargo/env && \
-    cargo install mcp-stdio-proxy && \
     # 确保 user 可以使用 cargo
     chmod -R o+rX /opt/cargo /opt/rustup
 
@@ -766,4 +765,3 @@ ENV AGENT_RUNNER_PORT=8086
 
 # 设置默认工作目录
 WORKDIR /home/user
-
