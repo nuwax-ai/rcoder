@@ -98,8 +98,10 @@ RUN bun add -g @upstash/context7-mcp
 RUN mkdir -p /root/.claude && \
     echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}}}}' > /root/.claude/settings.json
 
-# 将 bin 目录添加到 PATH
-ENV PATH="/app/bin:${PATH}"
+# 添加所有工具安装路径到 PATH
+ENV PNPM_HOME="/home/user/.local/share/pnpm" \
+    PATH="/app/bin:/root/.local/bin:/home/user/.local/bin:/home/user/.local/share/pnpm:/opt/cargo/bin:/usr/local/bin:${PATH}"
+
 
 # 清理默认nginx配置以避免冲突
 RUN rm -f /etc/nginx/sites-enabled/default && \
