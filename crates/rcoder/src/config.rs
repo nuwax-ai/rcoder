@@ -32,6 +32,24 @@ pub struct CliArgs {
     pub default_backend_port: Option<u16>,
 }
 
+/// API Key 鉴权配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyAuthConfig {
+    /// 是否启用 API Key 鉴权
+    pub enabled: bool,
+    /// API Key 值（用于验证请求）
+    pub api_key: String,
+}
+
+impl Default for ApiKeyAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: generate_random_api_key(),
+        }
+    }
+}
+
 /// 应用程序配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -49,10 +67,21 @@ pub struct AppConfig {
     /// 容器清理配置
     #[serde(default)]
     pub cleanup_config: CleanupConfigSettings,
+    /// API Key 鉴权配置
+    #[serde(default)]
+    pub api_key_auth: ApiKeyAuthConfig,
 }
 
 fn default_agent_id() -> String {
     "claude-code-acp".to_string()
+}
+
+/// 生成随机 API Key
+/// 使用 UUID v4 生成随机密钥，格式：sk-{uuid}
+fn generate_random_api_key() -> String {
+    use uuid::Uuid;
+    let uuid = Uuid::new_v4();
+    format!("sk-{}", uuid.simple())
 }
 
 /// 健康检查配置
@@ -149,7 +178,7 @@ pub struct DockerConfig {
     pub network_base_name: Option<String>,
 }
 
-const CONFIG_FILE: &str = "config.yml";
+pub const CONFIG_FILE: &str = "config.yml";
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -160,6 +189,7 @@ impl Default for AppConfig {
             proxy_config: Some(ProxyConfig::default()),
             docker_config: Some(DockerConfig::default()),
             cleanup_config: CleanupConfigSettings::default(),
+            api_key_auth: ApiKeyAuthConfig::default(),
         }
     }
 }
@@ -385,6 +415,28 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         docker_config.apply_env_overrides()?;
     }
 
+    // 应用 API Key 配置的环境变量覆盖
+    if let Ok(val) = std::env::var("RCODER_API_KEY_ENABLED") {
+        if let Ok(enabled) = val.parse::<bool>() {
+            config.api_key_auth.enabled = enabled;
+            info!("应用环境变量 RCODER_API_KEY_ENABLED: {}", enabled);
+        } else {
+            warn!("无效的 RCODER_API_KEY_ENABLED 环境变量值: {}", val);
+        }
+    }
+
+    if let Ok(val) = std::env::var("RCODER_API_KEY") {
+        config.api_key_auth.api_key = val.clone();
+        info!("应用环境变量 RCODER_API_KEY");
+    }
+
+    // 验证 API Key 配置
+    if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "API Key 鉴权已启用但 API Key 为空,请检查配置文件或环境变量"
+        ));
+    }
+
     // 配置验证
     if let Some(docker_config) = &config.docker_config {
         if let Err(e) = docker_config.validate_multi_image_config() {
@@ -451,6 +503,23 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
+/// 从配置文件中仅加载 API Key 配置（用于热更新）
+///
+/// 此函数由 config_watcher 模块调用,用于配置热重载。
+/// 编译器可能误报为未使用,因为是跨模块调用。
+#[allow(dead_code)]
+pub fn load_api_key_config_from_file(
+    config_path: &std::path::Path,
+) -> anyhow::Result<ApiKeyAuthConfig> {
+    let config_content =
+        fs::read_to_string(config_path).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
+
+    let config: AppConfig = serde_yaml::from_str(&config_content)
+        .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
+
+    Ok(config.api_key_auth)
+}
+
 /// 创建默认配置文件
 fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
     // 检查配置文件是否已存在
@@ -466,9 +535,14 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
     // 使用嵌入式配置文件
     let default_config = include_str!("rcoder_default.yml");
 
-    fs::write(CONFIG_FILE, default_config)
+    // 🆕 生成随机 API Key 并替换模板占位符
+    let generated_api_key = generate_random_api_key();
+    let config_content = default_config.replace("{{GENERATED_API_KEY}}", &generated_api_key);
+
+    fs::write(CONFIG_FILE, config_content)
         .map_err(|e| anyhow::anyhow!("写入默认配置文件失败: {}", e))?;
 
     info!("已创建默认配置文件: {}", CONFIG_FILE);
+    info!("🔑 已生成随机 API Key（当前未启用鉴权）");
     Ok(())
 }

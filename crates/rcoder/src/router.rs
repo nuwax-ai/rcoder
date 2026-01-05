@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     Router,
@@ -9,7 +9,11 @@ use axum::{
 use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
-use crate::{config::AppConfig, handler, storage::ProjectAdapter};
+use crate::{
+    config::{ApiKeyAuthConfig, AppConfig},
+    handler,
+    storage::ProjectAdapter,
+};
 use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -37,19 +41,29 @@ pub struct AppState {
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     /// 容器 IP 缓存（5秒 TTL，避免频繁调用 Docker API）
     pub container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
+    /// 🆕 可热更新的 API Key 配置
+    pub api_key_config: Arc<RwLock<ApiKeyAuthConfig>>,
 }
 
 impl AppState {
-    pub fn new(config: AppConfig, pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>) -> Self {
-        Self {
+    pub fn new(
+        config: AppConfig,
+        pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+        api_key_config: Arc<RwLock<ApiKeyAuthConfig>>,
+    ) -> anyhow::Result<Self> {
+        let projects = ProjectAdapter::new()
+            .map_err(|e| anyhow::anyhow!("初始化 ProjectAdapter 失败: {}", e))?;
+
+        Ok(Self {
             config,
-            projects: ProjectAdapter::new().expect("初始化 ProjectAdapter 失败"),
+            projects,
             pingora_service: pingora,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
             container_ip_cache: Arc::new(crate::grpc::ContainerIpCache::new(
                 crate::grpc::DEFAULT_CACHE_TTL_SECONDS,
             )),
-        }
+            api_key_config,
+        })
     }
 
     // ========== 向后兼容的便捷方法 ==========
@@ -217,10 +231,21 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         );
     }
 
+    // 🆕 克隆共享的 API Key 配置用于中间件
+    let api_key_config = Arc::clone(&state.api_key_config);
+
     router
         .merge(create_swagger_ui())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
         .layer(HttpMetricsLayer::new()) // 🆕 HTTP 指标中间件
+        // 🆕 添加 API Key 鉴权中间件（支持热更新）
+        .layer(axum::middleware::from_fn(move |req, next| {
+            crate::middleware::api_key_middleware::api_key_middleware_handler(
+                Arc::clone(&api_key_config),
+                req,
+                next,
+            )
+        }))
 }
 
 /// Prometheus 指标处理器

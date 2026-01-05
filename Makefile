@@ -51,7 +51,13 @@ build:
 	@echo "可执行文件: ./target/release/rcoder"
 
 # Docker 镜像构建（仅构建镜像，不编译）
-docker-build: docker-build-master docker-build-agent-runner
+# 使用 & 并行构建独立的镜像，提升构建速度
+docker-build:
+	@echo "🚀 开始并行构建 Docker 镜像..."
+	@$(MAKE) docker-build-master & \
+	$(MAKE) docker-build-agent-runner & \
+	wait
+	@echo ""
 	@echo "✅ 所有 Docker 镜像构建完成！"
 	@echo "  ✓ master-rcoder:latest"
 	@echo "  ✓ rcoder-agent-runner:latest"
@@ -60,7 +66,13 @@ docker-build: docker-build-master docker-build-agent-runner
 	@echo "  docker run -d -p 8087:8087 master-rcoder:latest"
 
 # 构建所有基础镜像（很少需要，只有修改系统依赖时才需要）
-docker-build-base: docker-build-master-base docker-build-agent-base
+# 使用 & 并行构建独立的基础镜像
+docker-build-base:
+	@echo "🚀 开始并行构建基础镜像..."
+	@$(MAKE) docker-build-master-base & \
+	$(MAKE) docker-build-agent-base & \
+	wait
+	@echo ""
 	@echo "✅ 所有基础镜像构建完成！"
 	@echo "  ✓ master-rcoder-base:latest"
 	@echo "  ✓ rcoder-agent-base:latest"

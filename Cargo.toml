@@ -89,7 +89,10 @@ env_logger = "0.11"
 # OpenTelemetry (统一使用 0.30 以兼容 tracing-opentelemetry)
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "http-proto"] }
+opentelemetry-otlp = { version = "0.30", features = [
+    "grpc-tonic",
+    "http-proto",
+] }
 tracing-opentelemetry = "0.31"
 axum-tracing-opentelemetry = "0.30"
 
@@ -206,7 +209,7 @@ structopt = "0.3"
 bollard = { version = "0.19.4" }
 
 # Cache library
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
