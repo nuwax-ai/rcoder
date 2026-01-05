@@ -1,4 +1,4 @@
-.PHONY: help build docker-build docker-build-master docker-build-agent-runner install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag test test-unit test-integration test-all test-blocking
+.PHONY: help build docker-build docker-build-base docker-build-master docker-build-master-base docker-build-agent-runner docker-build-agent-base install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag test test-unit test-integration test-all test-blocking
 
 # 默认目标：显示帮助信息
 help:
@@ -12,8 +12,11 @@ help:
 	@echo ""
 	@echo "🐳 Docker 镜像构建："
 	@echo "  make docker-build                 - 构建所有 Docker 镜像"
-	@echo "  make docker-build-master          - 仅构建 master-rcoder 镜像"
-	@echo "  make docker-build-agent-runner    - 仅构建 rcoder-agent-runner 镜像"
+	@echo "  make docker-build-base            - 构建所有基础镜像（很少需要）"
+	@echo "  make docker-build-master          - 仅构建 master-rcoder 镜像（需要基础镜像）"
+	@echo "  make docker-build-master-base     - 仅构建 master-rcoder-base 基础镜像"
+	@echo "  make docker-build-agent-runner    - 仅构建 rcoder-agent-runner 镜像（需要基础镜像）"
+	@echo "  make docker-build-agent-base      - 仅构建 rcoder-agent-base 基础镜像"
 	@echo "  make dev-build                    - 本地编译 + 构建 Docker 镜像（一键完成）"
 	@echo "  make update-image-tag - 根据系统架构更新镜像标签 (arm64/amd64 -> latest)"
 	@echo ""
@@ -56,18 +59,49 @@ docker-build: docker-build-master docker-build-agent-runner
 	@echo "🎯 使用方式："
 	@echo "  docker run -d -p 8087:8087 master-rcoder:latest"
 
-# 构建主服务镜像
+# 构建所有基础镜像（很少需要，只有修改系统依赖时才需要）
+docker-build-base: docker-build-master-base docker-build-agent-base
+	@echo "✅ 所有基础镜像构建完成！"
+	@echo "  ✓ master-rcoder-base:latest"
+	@echo "  ✓ rcoder-agent-base:latest"
+	@echo ""
+	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
+
+# 构建主服务镜像（基于基础镜像，快速构建）
 docker-build-master:
 	@echo "🐳 构建 master-rcoder 镜像..."
 	@echo "📍 镜像名称: master-rcoder:latest"
-	@echo "📦 使用 Dockerfile 多阶段构建（会在镜像内编译）..."
+	@# 检查基础镜像是否存在
+	@if ! docker image inspect master-rcoder-base:latest >/dev/null 2>&1; then \
+		echo "⚠️  基础镜像 master-rcoder-base:latest 不存在，先构建基础镜像..."; \
+		$(MAKE) docker-build-master-base; \
+	else \
+		echo "✓ 基础镜像 master-rcoder-base:latest 已存在"; \
+	fi
+	@echo "📦 使用 Dockerfile 多阶段构建（基于基础镜像）..."
 	@docker build -f docker/rcoder-master/Dockerfile -t master-rcoder:latest .
 	@echo "✅ master-rcoder 镜像构建完成！"
 
-# 构建 agent-runner 镜像
+# 构建 master-base 基础镜像（包含所有运行时依赖，很少需要重新构建）
+docker-build-master-base:
+	@echo "🐳 构建 master-rcoder-base 基础镜像..."
+	@echo "📍 镜像名称: master-rcoder-base:latest"
+	@echo "⏳ 这可能需要较长时间（包含所有运行时依赖安装）..."
+	@docker build -f docker/rcoder-master/Dockerfile.base -t master-rcoder-base:latest .
+	@echo "✅ master-rcoder-base 基础镜像构建完成！"
+	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
+
+# 构建 agent-runner 镜像（基于基础镜像，快速构建）
 docker-build-agent-runner:
 	@echo "🐳 构建 rcoder-agent-runner 镜像..."
 	@echo "📍 镜像名称: rcoder-agent-runner:latest"
+	@# 检查基础镜像是否存在
+	@if ! docker image inspect rcoder-agent-base:latest >/dev/null 2>&1; then \
+		echo "⚠️  基础镜像 rcoder-agent-base:latest 不存在，先构建基础镜像..."; \
+		$(MAKE) docker-build-agent-base; \
+	else \
+		echo "✓ 基础镜像 rcoder-agent-base:latest 已存在"; \
+	fi
 	@echo "📦 步骤1: 在 debian:12 环境中构建 agent_runner 二进制（确保 GLIBC 版本兼容）..."
 	@# 使用 debian:12 + Rust 1.90 构建，GLIBC 版本与运行环境一致
 	@docker build -f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build .
@@ -78,12 +112,21 @@ docker-build-agent-runner:
 	@docker cp build-container:/build/target/release/agent_runner docker/rcoder-agent-runner/bin/
 	@docker rm build-container
 	@docker rmi rcoder-agent-runner-build
-	@echo "📦 步骤3: 构建最终的 agent-runner 镜像..."
-	@# 使用原本的 Dockerfile 和复制过来的二进制文件构建最终镜像
+	@echo "📦 步骤3: 构建最终的 agent-runner 镜像（基于基础镜像，快速）..."
+	@cd docker/rcoder-agent-runner && \
+		docker build -f Dockerfile -t rcoder-agent-runner:latest .
+	@echo "✅ rcoder-agent-runner 镜像构建完成！"
+
+# 构建 agent-base 基础镜像（包含所有系统依赖，很少需要重新构建）
+docker-build-agent-base:
+	@echo "🐳 构建 rcoder-agent-base 基础镜像..."
+	@echo "📍 镜像名称: rcoder-agent-base:latest"
+	@echo "⏳ 这可能需要较长时间（包含所有系统依赖安装）..."
 	@# CACHEBUST_NOVNC: 传入时间戳强制每次重新克隆 noVNC
 	@cd docker/rcoder-agent-runner && \
-		docker build --build-arg CACHEBUST_NOVNC=$$(date +%s) -f Dockerfile -t rcoder-agent-runner:latest .
-	@echo "✅ rcoder-agent-runner 镜像构建完成！（GLIBC 2.36 兼容）"
+		docker build --build-arg CACHEBUST_NOVNC=$$(date +%s) -f Dockerfile.base -t rcoder-agent-base:latest .
+	@echo "✅ rcoder-agent-base 基础镜像构建完成！"
+	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
 
 # 安装 codex-acp-agent
 install-agent:
