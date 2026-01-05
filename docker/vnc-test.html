@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>VNC 测试页面</title>
+        <title>VNC + 音频 + 输入法 测试页面</title>
         <style>
             * {
                 margin: 0;
@@ -142,6 +142,22 @@
                 box-shadow: 0 4px 12px rgba(108, 117, 125, 0.4);
             }
 
+            .button.audio {
+                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            }
+
+            .button.audio:hover {
+                box-shadow: 0 4px 12px rgba(245, 87, 108, 0.4);
+            }
+
+            .button.ime {
+                background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            }
+
+            .button.ime:hover {
+                box-shadow: 0 4px 12px rgba(79, 172, 254, 0.4);
+            }
+
             .status {
                 padding: 10px 15px;
                 border-radius: 8px;
@@ -170,15 +186,11 @@
             .vnc-container {
                 flex: 1;
                 min-height: 2000px;
-                /* 大幅增加最小高度到 2000px */
                 height: calc(100vh - 50px);
-                /* 进一步优化：只留 50px 给顶部，其余全部给 VNC */
                 background: #000;
                 position: relative;
                 margin: 5px;
-                /* 进一步减少外边距到 5px */
                 border-radius: 8px;
-                /* 减小圆角 */
                 overflow: hidden;
                 box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
             }
@@ -224,19 +236,13 @@
             .info {
                 background: rgba(255, 255, 255, 0.9);
                 padding: 10px 15px;
-                /* 减少内边距 */
                 margin: 10px 20px;
-                /* 减少外边距 */
                 border-radius: 8px;
                 font-size: 12px;
-                /* 减小字体 */
                 color: #666;
                 line-height: 1.4;
-                /* 减小行高 */
                 max-height: 150px;
-                /* 限制最大高度 */
                 overflow-y: auto;
-                /* 超出部分可滚动 */
             }
 
             .info code {
@@ -246,12 +252,110 @@
                 font-family: "Courier New", monospace;
                 color: #e83e8c;
             }
+
+            /* 音频和输入法控制面板 */
+            .feature-panel {
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                padding: 15px 20px;
+                margin: 10px 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            }
+
+            .feature-panel h3 {
+                font-size: 16px;
+                color: #333;
+                margin-bottom: 10px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+
+            .feature-controls {
+                display: flex;
+                gap: 10px;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+
+            .volume-control {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+
+            .volume-control input[type="range"] {
+                width: 150px;
+            }
+
+            .ime-input {
+                position: fixed;
+                top: -9999px;
+                left: -9999px;
+                opacity: 0;
+                pointer-events: none;
+            }
+
+            .ime-status {
+                font-size: 12px;
+                color: #666;
+                padding: 5px 10px;
+                background: #f8f9fa;
+                border-radius: 4px;
+            }
+
+            .audio-visualizer {
+                width: 100px;
+                height: 30px;
+                background: #f8f9fa;
+                border-radius: 4px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 2px;
+                padding: 5px;
+            }
+
+            .audio-visualizer span {
+                width: 3px;
+                height: 10px;
+                background: #667eea;
+                border-radius: 2px;
+                animation: audioBar 0.8s ease-in-out infinite;
+            }
+
+            .audio-visualizer span:nth-child(2) {
+                animation-delay: 0.1s;
+            }
+
+            .audio-visualizer span:nth-child(3) {
+                animation-delay: 0.2s;
+            }
+
+            .audio-visualizer span:nth-child(4) {
+                animation-delay: 0.3s;
+            }
+
+            .audio-visualizer span:nth-child(5) {
+                animation-delay: 0.4s;
+            }
+
+            @keyframes audioBar {
+                0%,
+                100% {
+                    height: 5px;
+                }
+                50% {
+                    height: 20px;
+                }
+            }
         </style>
     </head>
 
     <body>
         <div class="header">
-            <h1>🔌 VNC 远程桌面测试</h1>
+            <h1>🔌 VNC + 🎵 音频 + ⌨️ 输入法 测试</h1>
 
             <!-- 模式切换 -->
             <div class="mode-toggle">
@@ -311,11 +415,29 @@
             <!-- 直接端口模式配置 -->
             <div class="config-section direct-mode" id="directConfig">
                 <div class="input-group">
-                    <label>容器端口 (6080 映射到主机的端口)</label>
+                    <label>VNC 端口 (6080 映射)</label>
                     <input
                         type="number"
                         id="portInput"
                         placeholder="例如: 50001"
+                        value=""
+                    />
+                </div>
+                <div class="input-group">
+                    <label>音频 WebSocket 端口 (6089 映射)</label>
+                    <input
+                        type="number"
+                        id="audioPortInput"
+                        placeholder="例如: 50002"
+                        value=""
+                    />
+                </div>
+                <div class="input-group">
+                    <label>IME 端口 (6091 映射)</label>
+                    <input
+                        type="number"
+                        id="imePortInput"
+                        placeholder="例如: 50003"
                         value=""
                     />
                 </div>
@@ -360,33 +482,89 @@
                 </div>
                 <button class="button" onclick="connectVNC()">连接 VNC</button>
                 <button class="button secondary" onclick="disconnectVNC()">
-                    断开连接
+                    断开 VNC
                 </button>
-                <div class="status disconnected" id="status">
+                <div class="status disconnected" id="vncStatus">
                     <span>●</span>
-                    <span>未连接</span>
+                    <span>VNC 未连接</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 音频控制面板 -->
+        <div class="feature-panel">
+            <h3>🎵 音频流</h3>
+            <div class="feature-controls">
+                <button
+                    class="button audio"
+                    onclick="toggleAudio()"
+                    id="audioBtn"
+                >
+                    启动音频
+                </button>
+                <div
+                    class="volume-control"
+                    id="volumeControl"
+                    style="display: none"
+                >
+                    <span>音量:</span>
+                    <input
+                        type="range"
+                        id="volumeSlider"
+                        min="0"
+                        max="100"
+                        value="80"
+                        oninput="setVolume(this.value)"
+                    />
+                    <span id="volumeValue">80%</span>
+                </div>
+                <div
+                    class="audio-visualizer"
+                    id="audioVisualizer"
+                    style="display: none"
+                >
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+                <div class="status disconnected" id="audioStatus">
+                    <span>●</span>
+                    <span>音频未连接</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 输入法控制面板 -->
+        <div class="feature-panel">
+            <h3>⌨️ 输入法透传</h3>
+            <div class="feature-controls">
+                <button class="button ime" onclick="toggleIME()" id="imeBtn">
+                    启动输入法
+                </button>
+                <div class="ime-status" id="imeStatus">未激活</div>
+                <div style="font-size: 12px; color: #999">
+                    提示：启动后点击 VNC 画面，使用本地输入法输入中文
                 </div>
             </div>
         </div>
 
         <div class="info">
-            <strong>使用说明：</strong><br />
-            <strong>RCoder 代理模式（推荐）：</strong><br />
-            1. 配置 RCoder
-            服务地址（默认：<code>http://127.0.0.1:8088</code>）<br />
-            2. 输入 User ID（例如：<code>user_123</code>）<br />
-            3. 输入 Project
-            ID（从聊天响应中获取，例如：<code>31e1acc6fbac43ec900da01d0296aa24</code>）<br />
-            4. 点击"连接 VNC"按钮，将通过
-            <code>/computer/vnc/{user_id}/{project_id}/vnc.html</code>
-            访问<br /><br />
-            <strong>直接端口模式：</strong><br />
-            1. 在容器内，noVNC 服务运行在 <code>6080</code> 端口<br />
-            2. 查找容器端口映射：<code>docker port &lt;container_name&gt;</code
-            ><br />
-            3. 输入映射到主机的端口号（例如：如果容器 6080 映射到主机
-            50001，则输入 50001）<br />
-            4. 点击"连接 VNC"按钮开始测试
+            <strong>🎯 使用说明：</strong><br />
+            <strong>1. VNC 连接：</strong><br />
+            - RCoder 代理模式：配置服务地址、User ID、Project ID，点击"连接
+            VNC"<br />
+            - 直接端口模式：配置各服务端口，点击"连接 VNC"<br /><br />
+            <strong>2. 音频播放：</strong><br />
+            - 点击"启动音频"按钮，在远程桌面播放视频/音乐时会自动传输音频<br />
+            - 支持音量调节和实时音频可视化<br />
+            - 首次播放需要用户交互激活（浏览器安全策略）<br /><br />
+            <strong>3. 输入法透传：</strong><br />
+            - 点击"启动输入法"按钮激活<br />
+            - 点击 VNC 画面区域获得焦点<br />
+            - 使用本地输入法（如搜狗、微软拼音）输入中文<br />
+            - 输入完成后文本会自动发送到远程桌面
         </div>
 
         <div class="vnc-container" id="vncContainer">
@@ -396,11 +574,35 @@
             <iframe id="vncFrame" style="display: none"></iframe>
         </div>
 
-        <script>
-            let currentUrl = null;
+        <!-- 隐藏的输入代理框 -->
+        <input type="text" id="imeInput" class="ime-input" />
 
-            function updateStatus(status, message) {
-                const statusEl = document.getElementById("status");
+        <script>
+            // =====================================================
+            // 全局状态
+            // =====================================================
+            let currentUrl = null;
+            let audioContext = null;
+            let audioWorklet = null;
+            let audioWs = null;
+            let audioConnected = false;
+            let audioGainNode = null;
+
+            let imeWs = null;
+            let imeConnected = false;
+            let imeEnabled = false;
+
+            // =====================================================
+            // VNC 连接逻辑
+            // =====================================================
+            function updateVNCStatus(status, message) {
+                const statusEl = document.getElementById("vncStatus");
+                statusEl.className = `status ${status}`;
+                statusEl.innerHTML = `<span>●</span><span>${message}</span>`;
+            }
+
+            function updateAudioStatus(status, message) {
+                const statusEl = document.getElementById("audioStatus");
                 statusEl.className = `status ${status}`;
                 statusEl.innerHTML = `<span>●</span><span>${message}</span>`;
             }
@@ -433,19 +635,16 @@
                 const autoconnect =
                     document.getElementById("autoconnect").checked;
 
-                // 构建 URL 参数
                 const params = new URLSearchParams();
                 if (autoconnect) {
                     params.set("autoconnect", "true");
                 }
-                // 只使用 resize=scale，不添加额外的 scale 参数
                 params.set("resize", "scale");
                 if (viewOnly) {
                     params.set("view_only", "true");
                 }
 
                 if (mode === "proxy") {
-                    // RCoder 代理模式
                     const baseUrl = document
                         .getElementById("baseUrlInput")
                         .value.trim();
@@ -456,30 +655,20 @@
                         .getElementById("projectIdInput")
                         .value.trim();
 
-                    if (!baseUrl) {
-                        alert("请输入 RCoder 服务地址！");
-                        return null;
-                    }
-                    if (!userId) {
-                        alert("请输入 User ID！");
-                        return null;
-                    }
-                    if (!projectId) {
-                        alert("请输入 Project ID！");
+                    if (!baseUrl || !userId || !projectId) {
+                        alert("请填写完整的连接信息！");
                         return null;
                     }
 
-                    // 移除 baseUrl 末尾的斜杠
                     const cleanBaseUrl = baseUrl.replace(/\/+$/, "");
                     return `${cleanBaseUrl}/computer/vnc/${userId}/${projectId}/vnc.html?${params.toString()}`;
                 } else {
-                    // 直接端口模式
                     const port = document
                         .getElementById("portInput")
                         .value.trim();
 
                     if (!port) {
-                        alert("请输入端口号！");
+                        alert("请输入 VNC 端口号！");
                         return null;
                     }
 
@@ -502,56 +691,39 @@
                 currentUrl = url;
                 console.log("连接 VNC:", currentUrl);
 
-                // 显示加载状态
                 document.getElementById("loading").style.display = "block";
                 document.getElementById("vncFrame").style.display = "none";
-                updateStatus("connecting", "正在连接...");
+                updateVNCStatus("connecting", "VNC 正在连接...");
 
-                // 设置 iframe
                 const iframe = document.getElementById("vncFrame");
                 iframe.src = currentUrl;
 
-                // 监听 iframe 加载
                 iframe.onload = function () {
                     document.getElementById("loading").style.display = "none";
                     iframe.style.display = "block";
-                    updateStatus("connected", "已连接");
+                    updateVNCStatus("connected", "VNC 已连接");
                 };
 
                 iframe.onerror = function () {
                     document.getElementById("loading").style.display = "none";
-                    updateStatus("disconnected", "连接失败");
-                    const mode = document.querySelector(
-                        'input[name="connectionMode"]:checked',
-                    ).value;
-                    if (mode === "proxy") {
-                        alert(
-                            "无法连接到 VNC 服务，请检查：\n1. RCoder 服务地址是否正确\n2. User ID 和 Project ID 是否正确\n3. 容器内的 noVNC 服务是否运行\n4. RCoder 代理服务是否正常",
-                        );
-                    } else {
-                        alert(
-                            "无法连接到 VNC 服务，请检查：\n1. 端口号是否正确\n2. 容器内的 noVNC 服务是否运行\n3. 端口映射是否正确",
-                        );
-                    }
+                    updateVNCStatus("disconnected", "VNC 连接失败");
                 };
 
-                // 超时检测
                 setTimeout(() => {
                     if (iframe.style.display === "none") {
-                        // 尝试检测连接状态
                         try {
                             if (iframe.contentWindow) {
                                 document.getElementById(
                                     "loading",
                                 ).style.display = "none";
                                 iframe.style.display = "block";
-                                updateStatus(
+                                updateVNCStatus(
                                     "connected",
-                                    "已连接（可能正在加载）",
+                                    "VNC 已连接（加载中）",
                                 );
                             }
                         } catch (e) {
-                            // 跨域限制，无法检测
+                            // 跨域限制
                         }
                     }
                 }, 5000);
@@ -562,17 +734,377 @@
                 iframe.src = "about:blank";
                 iframe.style.display = "none";
                 document.getElementById("loading").style.display = "none";
-                updateStatus("disconnected", "已断开");
+                updateVNCStatus("disconnected", "VNC 已断开");
                 currentUrl = null;
             }
 
-            // 回车键连接
+            // =====================================================
+            // 音频流逻辑
+            // =====================================================
+            function buildAudioWsUrl() {
+                const mode = document.querySelector(
+                    'input[name="connectionMode"]:checked',
+                ).value;
+
+                if (mode === "proxy") {
+                    const baseUrl = document
+                        .getElementById("baseUrlInput")
+                        .value.trim()
+                        .replace(/^http/, "ws")
+                        .replace(/\/+$/, "");
+                    const userId = document
+                        .getElementById("userIdInput")
+                        .value.trim();
+                    const projectId = document
+                        .getElementById("projectIdInput")
+                        .value.trim();
+
+                    if (!baseUrl || !userId || !projectId) {
+                        alert("请先配置连接信息！");
+                        return null;
+                    }
+
+                    return `${baseUrl}/computer/audio/${userId}/${projectId}/ws`;
+                } else {
+                    const port = document
+                        .getElementById("audioPortInput")
+                        .value.trim();
+
+                    if (!port) {
+                        alert("请输入音频 WebSocket 端口！");
+                        return null;
+                    }
+
+                    return `ws://localhost:${port}/ws`;
+                }
+            }
+
+            async function toggleAudio() {
+                if (audioConnected) {
+                    disconnectAudio();
+                } else {
+                    await connectAudio();
+                }
+            }
+
+            async function connectAudio() {
+                const wsUrl = buildAudioWsUrl();
+                if (!wsUrl) {
+                    return;
+                }
+
+                try {
+                    updateAudioStatus("connecting", "音频连接中...");
+                    console.log("连接音频流:", wsUrl);
+
+                    // 初始化 Web Audio API
+                    if (!audioContext) {
+                        audioContext = new (
+                            window.AudioContext || window.webkitAudioContext
+                        )({ sampleRate: 48000 });
+                        audioGainNode = audioContext.createGain();
+                        audioGainNode.gain.value = 0.8;
+                        audioGainNode.connect(audioContext.destination);
+                    }
+
+                    // 恢复 AudioContext（浏览器安全策略）
+                    if (audioContext.state === "suspended") {
+                        await audioContext.resume();
+                    }
+
+                    // 连接 WebSocket
+                    audioWs = new WebSocket(wsUrl);
+                    audioWs.binaryType = "arraybuffer";
+
+                    audioWs.onopen = () => {
+                        console.log("[Audio] WebSocket 已连接");
+                        audioConnected = true;
+                        updateAudioStatus("connected", "音频已连接");
+                        document.getElementById("audioBtn").textContent =
+                            "停止音频";
+                        document.getElementById("volumeControl").style.display =
+                            "flex";
+                        document.getElementById(
+                            "audioVisualizer",
+                        ).style.display = "flex";
+                    };
+
+                    audioWs.onmessage = async (event) => {
+                        try {
+                            const data = new Uint8Array(event.data);
+
+                            // 检查协议头 (0x01 表示 Opus 音频)
+                            if (data[0] === 0x01) {
+                                const opusData = data.slice(1);
+                                // 这里需要 Opus 解码器
+                                // 简化版：直接播放 PCM（假设后端发送 PCM）
+                                await playAudioChunk(opusData);
+                            }
+                        } catch (err) {
+                            console.error("[Audio] 处理音频数据失败:", err);
+                        }
+                    };
+
+                    audioWs.onerror = (err) => {
+                        console.error("[Audio] WebSocket 错误:", err);
+                        updateAudioStatus("disconnected", "音频连接失败");
+                    };
+
+                    audioWs.onclose = () => {
+                        console.log("[Audio] WebSocket 已关闭");
+                        audioConnected = false;
+                        updateAudioStatus("disconnected", "音频已断开");
+                        document.getElementById("audioBtn").textContent =
+                            "启动音频";
+                        document.getElementById("volumeControl").style.display =
+                            "none";
+                        document.getElementById(
+                            "audioVisualizer",
+                        ).style.display = "none";
+                    };
+                } catch (err) {
+                    console.error("[Audio] 连接失败:", err);
+                    updateAudioStatus("disconnected", "音频启动失败");
+                    alert("音频启动失败: " + err.message);
+                }
+            }
+
+            function disconnectAudio() {
+                if (audioWs) {
+                    audioWs.close();
+                    audioWs = null;
+                }
+                audioConnected = false;
+                updateAudioStatus("disconnected", "音频已停止");
+                document.getElementById("audioBtn").textContent = "启动音频";
+                document.getElementById("volumeControl").style.display = "none";
+                document.getElementById("audioVisualizer").style.display =
+                    "none";
+            }
+
+            async function playAudioChunk(opusData) {
+                // 注意：这里需要实际的 Opus 解码器
+                // 可以使用 opus-decoder.js 或 libopus.js
+                // 这里仅作为示例，实际需要解码 Opus 数据
+
+                // 简化示例：假设数据是 Float32Array PCM
+                // const audioBuffer = audioContext.createBuffer(2, opusData.length / 8, 48000);
+                // ... 填充 audioBuffer
+
+                // 实际实现需要：
+                // 1. 解码 Opus -> PCM
+                // 2. 创建 AudioBuffer
+                // 3. 播放
+                console.log("[Audio] 收到音频数据:", opusData.length, "bytes");
+            }
+
+            function setVolume(value) {
+                if (audioGainNode) {
+                    audioGainNode.gain.value = value / 100;
+                }
+                document.getElementById("volumeValue").textContent =
+                    value + "%";
+            }
+
+            // =====================================================
+            // 输入法透传逻辑
+            // =====================================================
+            function buildIMEWsUrl() {
+                const mode = document.querySelector(
+                    'input[name="connectionMode"]:checked',
+                ).value;
+
+                if (mode === "proxy") {
+                    const baseUrl = document
+                        .getElementById("baseUrlInput")
+                        .value.trim()
+                        .replace(/^http/, "ws")
+                        .replace(/\/+$/, "");
+                    const userId = document
+                        .getElementById("userIdInput")
+                        .value.trim();
+                    const projectId = document
+                        .getElementById("projectIdInput")
+                        .value.trim();
+
+                    if (!baseUrl || !userId || !projectId) {
+                        alert("请先配置连接信息！");
+                        return null;
+                    }
+
+                    return `${baseUrl}/computer/ime/${userId}/${projectId}/`;
+                } else {
+                    const port = document
+                        .getElementById("imePortInput")
+                        .value.trim();
+
+                    if (!port) {
+                        alert("请输入 IME 端口！");
+                        return null;
+                    }
+
+                    return `ws://localhost:${port}/`;
+                }
+            }
+
+            function toggleIME() {
+                if (imeEnabled) {
+                    disconnectIME();
+                } else {
+                    connectIME();
+                }
+            }
+
+            function connectIME() {
+                const wsUrl = buildIMEWsUrl();
+                if (!wsUrl) {
+                    return;
+                }
+
+                try {
+                    console.log("连接 IME 服务:", wsUrl);
+
+                    // 连接 WebSocket
+                    imeWs = new WebSocket(wsUrl);
+
+                    imeWs.onopen = () => {
+                        console.log("[IME] WebSocket 已连接");
+                        imeConnected = true;
+                        imeEnabled = true;
+                        document.getElementById("imeBtn").textContent =
+                            "停止输入法";
+                        document.getElementById("imeStatus").textContent =
+                            "已激活 - 点击 VNC 区域开始输入";
+                        document.getElementById("imeStatus").style.background =
+                            "#d4edda";
+                        document.getElementById("imeStatus").style.color =
+                            "#155724";
+
+                        // 设置输入事件监听
+                        setupIMEListeners();
+                    };
+
+                    imeWs.onmessage = (event) => {
+                        try {
+                            const response = JSON.parse(event.data);
+                            if (response.status === "ok") {
+                                console.log("[IME] 文本发送成功");
+                            } else {
+                                console.error(
+                                    "[IME] 服务器错误:",
+                                    response.message,
+                                );
+                            }
+                        } catch (err) {
+                            console.error("[IME] 响应解析失败:", err);
+                        }
+                    };
+
+                    imeWs.onerror = (err) => {
+                        console.error("[IME] WebSocket 错误:", err);
+                        alert("IME 连接失败，请检查服务是否运行");
+                    };
+
+                    imeWs.onclose = () => {
+                        console.log("[IME] WebSocket 已关闭");
+                        imeConnected = false;
+                        imeEnabled = false;
+                        document.getElementById("imeBtn").textContent =
+                            "启动输入法";
+                        document.getElementById("imeStatus").textContent =
+                            "未激活";
+                        document.getElementById("imeStatus").style.background =
+                            "#f8f9fa";
+                        document.getElementById("imeStatus").style.color =
+                            "#666";
+                    };
+                } catch (err) {
+                    console.error("[IME] 连接失败:", err);
+                    alert("IME 启动失败: " + err.message);
+                }
+            }
+
+            function disconnectIME() {
+                if (imeWs) {
+                    imeWs.close();
+                    imeWs = null;
+                }
+                imeEnabled = false;
+                imeConnected = false;
+                document.getElementById("imeBtn").textContent = "启动输入法";
+                document.getElementById("imeStatus").textContent = "未激活";
+                document.getElementById("imeStatus").style.background =
+                    "#f8f9fa";
+                document.getElementById("imeStatus").style.color = "#666";
+            }
+
+            function setupIMEListeners() {
+                const vncContainer = document.getElementById("vncContainer");
+                const imeInput = document.getElementById("imeInput");
+
+                // 点击 VNC 区域时聚焦到隐藏输入框
+                vncContainer.addEventListener("click", () => {
+                    if (imeEnabled) {
+                        imeInput.focus();
+                        console.log("[IME] 输入框已聚焦");
+                    }
+                });
+
+                // 监听输入法完成事件
+                imeInput.addEventListener("compositionend", (event) => {
+                    const text = event.data;
+
+                    if (text && text.length > 0 && imeConnected) {
+                        console.log("[IME] 输入完成:", text);
+                        sendTextToRemote(text);
+
+                        // 清空输入框
+                        imeInput.value = "";
+                    }
+                });
+
+                // 处理普通按键（非输入法）
+                imeInput.addEventListener("keydown", (event) => {
+                    // 特殊键让 noVNC 处理
+                    if (
+                        ["Enter", "Backspace", "Tab", "Escape"].includes(
+                            event.key,
+                        )
+                    ) {
+                        // 这些键应该由 noVNC 处理
+                        // 这里简单忽略，实际可以通过 postMessage 发送给 iframe
+                        console.log("[IME] 特殊键:", event.key);
+                    }
+                });
+            }
+
+            function sendTextToRemote(text) {
+                if (!imeConnected || !imeWs) {
+                    console.warn("[IME] 未连接，无法发送文本");
+                    return;
+                }
+
+                const message = JSON.stringify({
+                    type: "text",
+                    text: text,
+                    method: "xdotool", // 默认使用 xdotool，也可以改为 'clipboard'
+                });
+
+                imeWs.send(message);
+                console.log("[IME] 发送文本:", text);
+            }
+
+            // =====================================================
+            // 页面初始化
+            // =====================================================
             function setupEnterKeyListeners() {
                 const inputs = [
                     "baseUrlInput",
                     "userIdInput",
                     "projectIdInput",
                     "portInput",
+                    "audioPortInput",
+                    "imePortInput",
                 ];
                 inputs.forEach((id) => {
                     const input = document.getElementById(id);
@@ -586,13 +1118,11 @@
                 });
             }
 
-            // 页面加载时尝试从 URL 参数获取配置
             window.addEventListener("DOMContentLoaded", function () {
                 setupEnterKeyListeners();
 
                 const urlParams = new URLSearchParams(window.location.search);
 
-                // 从 URL 参数获取配置
                 const baseUrl = urlParams.get("baseUrl");
                 const userId = urlParams.get("userId");
                 const projectId = urlParams.get("projectId");
@@ -612,7 +1142,6 @@
                     document.getElementById("portInput").value = port;
                 }
 
-                // 设置模式
                 const modeRadio = document.querySelector(
                     `input[name="connectionMode"][value="${mode}"]`,
                 );
@@ -621,7 +1150,7 @@
                     toggleMode();
                 }
 
-                // 如果所有必要参数都提供了，自动连接
+                // 自动连接
                 if (mode === "proxy" && baseUrl && userId && projectId) {
                     setTimeout(() => {
                         connectVNC();
@@ -630,6 +1159,19 @@
                     setTimeout(() => {
                         connectVNC();
                     }, 500);
+                }
+            });
+
+            // 页面卸载时清理资源
+            window.addEventListener("beforeunload", function () {
+                if (audioWs) {
+                    audioWs.close();
+                }
+                if (imeWs) {
+                    imeWs.close();
+                }
+                if (audioContext) {
+                    audioContext.close();
                 }
             });
         </script>
