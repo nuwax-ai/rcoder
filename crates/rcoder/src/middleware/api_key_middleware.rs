@@ -1,10 +1,11 @@
 use arc_swap::ArcSwap;
 use axum::{
     extract::Request,
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use shared_types::{ApiKeyAuthConfig, ApiKeyValidator, HttpResult, error_codes};
+use shared_types::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -25,32 +26,22 @@ pub async fn api_key_middleware_handler(
     // 使用共享验证逻辑（无锁，同步）
     match ApiKeyValidator::validate(&api_key_config, path, api_key) {
         Ok(()) => next.run(req).await,
-        Err("invalid") => {
-            warn!(
-                "🔒 [API_KEY_AUTH] Invalid API key provided for path: {}",
-                path
-            );
-            HttpResult::<()>::error(error_codes::ERR_API_KEY_AUTH_FAILED, "Invalid API key")
-                .into_response()
-        }
-        Err("missing") => {
-            warn!(
-                "🔒 [API_KEY_AUTH] Missing x-api-key header for path: {}",
-                path
-            );
-            HttpResult::<()>::error(
-                error_codes::ERR_API_KEY_AUTH_FAILED,
-                "Missing x-api-key header",
-            )
-            .into_response()
-        }
-        Err(_) => {
-            tracing::error!("🔒 [API_KEY_AUTH] Configuration error");
-            HttpResult::<()>::error(
-                error_codes::ERR_INTERNAL_SERVER_ERROR,
-                "Configuration error",
-            )
-            .into_response()
+
+        Err(err) => {
+            // 根据错误类型确定 HTTP 状态码
+            let status_code = match err {
+                ApiKeyAuthError::Invalid | ApiKeyAuthError::Missing => {
+                    warn!("🔒 [API_KEY_AUTH] {} for path: {}", err, path);
+                    StatusCode::UNAUTHORIZED
+                }
+                ApiKeyAuthError::ConfigError => {
+                    tracing::error!("🔒 [API_KEY_AUTH] {}", err);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+
+            // 返回标准 HTTP 错误响应
+            (status_code, err.to_string()).into_response()
         }
     }
 }

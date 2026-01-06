@@ -1,5 +1,29 @@
 use arc_swap::ArcSwap;
+use std::fmt;
 use std::sync::Arc;
+
+/// API Key 鉴权错误类型（类型安全）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeyAuthError {
+    /// 缺少 x-api-key header
+    Missing,
+    /// API Key 无效
+    Invalid,
+    /// 配置读取错误
+    ConfigError,
+}
+
+impl fmt::Display for ApiKeyAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApiKeyAuthError::Missing => write!(f, "Missing x-api-key header"),
+            ApiKeyAuthError::Invalid => write!(f, "Invalid API key"),
+            ApiKeyAuthError::ConfigError => write!(f, "Configuration error"),
+        }
+    }
+}
+
+impl std::error::Error for ApiKeyAuthError {}
 
 /// API Key 鉴权配置
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -51,13 +75,13 @@ impl ApiKeyValidator {
     ///
     /// 返回:
     /// - Ok(()) - 验证通过
-    /// - Err("missing") - 缺少 API Key
-    /// - Err("invalid") - API Key 无效
+    /// - Err(ApiKeyAuthError::Missing) - 缺少 API Key
+    /// - Err(ApiKeyAuthError::Invalid) - API Key 无效
     pub fn validate(
         api_key_config: &Arc<ArcSwap<ApiKeyAuthConfig>>,
         path: &str,
         api_key: Option<&str>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), ApiKeyAuthError> {
         // 🚀 无锁读取配置（原子操作，极快）
         let config = api_key_config.load();
 
@@ -74,8 +98,8 @@ impl ApiKeyValidator {
         // 验证 API Key（直接比较，无需 clone）
         match api_key {
             Some(key) if key == config.api_key.as_str() => Ok(()),
-            Some(_) => Err("invalid"),
-            None => Err("missing"),
+            Some(_) => Err(ApiKeyAuthError::Invalid),
+            None => Err(ApiKeyAuthError::Missing),
         }
     }
 }
@@ -106,20 +130,34 @@ mod tests {
         // 正确的 API Key
         assert!(ApiKeyValidator::validate(&config, "/chat", Some("test-key-123")).is_ok());
 
-        // 错误的 API Key
+        // 错误的 API Key - ✅ 现在是类型安全的
         assert_eq!(
             ApiKeyValidator::validate(&config, "/chat", Some("wrong-key")),
-            Err("invalid")
+            Err(ApiKeyAuthError::Invalid)
         );
 
-        // 缺少 API Key
+        // 缺少 API Key - ✅ 现在是类型安全的
         assert_eq!(
             ApiKeyValidator::validate(&config, "/chat", None),
-            Err("missing")
+            Err(ApiKeyAuthError::Missing)
         );
 
         // 豁免路径
         assert!(ApiKeyValidator::validate(&config, "/health", None).is_ok());
+    }
+
+    #[test]
+    fn test_error_display() {
+        // 测试错误消息的 Display 实现
+        assert_eq!(ApiKeyAuthError::Invalid.to_string(), "Invalid API key");
+        assert_eq!(
+            ApiKeyAuthError::Missing.to_string(),
+            "Missing x-api-key header"
+        );
+        assert_eq!(
+            ApiKeyAuthError::ConfigError.to_string(),
+            "Configuration error"
+        );
     }
 
     #[test]
@@ -146,7 +184,7 @@ mod tests {
         assert!(ApiKeyValidator::validate(&config, "/chat", Some("old-key")).is_ok());
         assert_eq!(
             ApiKeyValidator::validate(&config, "/chat", Some("new-key")),
-            Err("invalid")
+            Err(ApiKeyAuthError::Invalid)
         );
 
         // 🔄 热更新配置
@@ -159,7 +197,7 @@ mod tests {
         assert!(ApiKeyValidator::validate(&config, "/chat", Some("new-key")).is_ok());
         assert_eq!(
             ApiKeyValidator::validate(&config, "/chat", Some("old-key")),
-            Err("invalid")
+            Err(ApiKeyAuthError::Invalid)
         );
     }
 }
