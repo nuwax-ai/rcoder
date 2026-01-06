@@ -50,6 +50,9 @@ opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 axum-tracing-opentelemetry = { workspace = true }
 
+# 🚀 无锁配置热更新
+arc-swap = "1.8"
+
 
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }

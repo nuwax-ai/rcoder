@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use arc_swap::ArcSwap;
+use std::sync::Arc;
 
 use axum::{
     Router,
@@ -41,15 +42,15 @@ pub struct AppState {
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     /// 容器 IP 缓存（5秒 TTL，避免频繁调用 Docker API）
     pub container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
-    /// 🆕 可热更新的 API Key 配置
-    pub api_key_config: Arc<RwLock<ApiKeyAuthConfig>>,
+    /// 🆕 可热更新的 API Key 配置（使用 ArcSwap 实现无锁读取）
+    pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
 }
 
 impl AppState {
     pub fn new(
         config: AppConfig,
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
-        api_key_config: Arc<RwLock<ApiKeyAuthConfig>>,
+        api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     ) -> anyhow::Result<Self> {
         let projects = ProjectAdapter::new()
             .map_err(|e| anyhow::anyhow!("初始化 ProjectAdapter 失败: {}", e))?;
@@ -184,6 +185,16 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/computer/pod/restart", post(handler::pod_restart))
         .route("/computer/pod/status", get(handler::pod_status))
         .route("/computer/pod/vnc-status", get(handler::pod_vnc_status))
+        // 🆕 音频代理路由（用于 OpenAPI 文档）
+        .route(
+            "/computer/audio/{user_id}/{project_id}/{*path}",
+            get(handler::computer_audio_proxy),
+        )
+        // 🆕 IME 代理路由（用于 OpenAPI 文档）
+        .route(
+            "/computer/ime/{user_id}/{project_id}/{*path}",
+            get(handler::computer_ime_proxy),
+        )
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）
@@ -287,6 +298,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::computer_agent_progress_notification,
         handler::computer_desktop_vnc,
         handler::computer_desktop_proxy,
+        handler::computer_audio_proxy,
+        handler::computer_ime_proxy,
         handler::pod_count,
         handler::pod_list,
         handler::pod_ensure,
@@ -342,6 +355,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::ComputerAgentStatusResponse, // 🆕 新增
             handler::DesktopPathParams,
             handler::VncProxyPathParams,
+            handler::AudioProxyPathParams,
+            handler::ImeProxyPathParams,
             handler::DesktopAccessResponse,
             handler::DesktopErrorResponse,
             // Pod 容器管理相关结构体

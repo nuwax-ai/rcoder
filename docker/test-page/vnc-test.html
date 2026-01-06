@@ -297,6 +297,28 @@
                 pointer-events: none;
             }
 
+            .ime-input-visible {
+                width: 100%;
+                padding: 8px 12px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                font-size: 14px;
+                background: white;
+                transition: all 0.3s;
+            }
+
+            .ime-input-visible:focus {
+                outline: none;
+                border-color: #667eea;
+                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+            }
+
+            .ime-input-visible:disabled {
+                background: #f5f5f5;
+                cursor: not-allowed;
+                opacity: 0.6;
+            }
+
             .ime-status {
                 font-size: 12px;
                 color: #666;
@@ -351,6 +373,32 @@
                 }
             }
         </style>
+        <!-- 引入 Opus 解码器库 -->
+        <!-- 优先加载同目录的本地文件，CDN 作为 fallback -->
+        <script src="./opus-decoder.min.js"></script>
+        <script src="https://unpkg.com/opus-decoder@0.7.9/dist/opus-decoder.min.js"></script>
+        <script>
+            // 延迟到页面加载完成后检查，确保脚本已执行
+            // opus-decoder 库使用 UMD 模式，导出为 window["opus-decoder"].OpusDecoder
+            document.addEventListener('DOMContentLoaded', function() {
+                // 检查两种可能的全局变量位置
+                const opusDecoderLib = window["opus-decoder"];
+                window.OpusDecoder = opusDecoderLib ? opusDecoderLib.OpusDecoder : undefined;
+                window.OpusDecoderLoaded = (typeof window.OpusDecoder !== 'undefined');
+
+                if (window.OpusDecoderLoaded) {
+                    console.log('[Audio] ✅ OpusDecoder 加载成功');
+                    console.log('[Audio] OpusDecoder:', window.OpusDecoder);
+                } else {
+                    console.error('[Audio] ❌ OpusDecoder 加载失败，音频功能可能无法使用');
+                    console.error('[Audio] 请确保 opus-decoder.min.js 文件与 vnc-test.html 在同一目录');
+                    console.error('[Audio] 全局对象调试:', {
+                        "window['opus-decoder']": window["opus-decoder"],
+                        "window.OpusDecoder": window.OpusDecoder
+                    });
+                }
+            });
+        </script>
     </head>
 
     <body>
@@ -541,14 +589,33 @@
             <h3>⌨️ 输入法透传</h3>
             <div class="feature-controls">
                 <button class="button ime" onclick="toggleIME()" id="imeBtn">
-                    启动输入法
+                    连接 IME 服务
                 </button>
-                <div class="ime-status" id="imeStatus">未激活</div>
-                <div style="font-size: 12px; color: #999">
-                    提示：启动后点击 VNC 画面，使用本地输入法输入中文
+                <div class="ime-status" id="imeStatus">未连接</div>
+            </div>
+            <div style="margin-top: 10px;">
+                <div style="font-size: 12px; color: #666; margin-bottom: 8px;">
+                    <strong>使用方法：</strong><br>
+                    1. 点击"连接 IME 服务"按钮<br>
+                    2. 在下方输入框中切换到中文输入法<br>
+                    3. 输入中文（会显示候选词窗口）<br>
+                    4. 选择中文后自动发送到远程桌面
+                </div>
+                <input
+                    type="text"
+                    id="imeInputVisible"
+                    class="ime-input-visible"
+                    placeholder="在此处使用中文输入法输入..."
+                    disabled
+                />
+                <div id="imeInputHint" style="font-size: 11px; color: #999; margin-top: 4px;">
+                    请先连接 IME 服务
                 </div>
             </div>
         </div>
+
+        <!-- 隐藏的输入框（用于捕获输入法事件） -->
+        <input type="text" id="imeInput" class="ime-input" />
 
         <div class="info">
             <strong>🎯 使用说明：</strong><br />
@@ -587,6 +654,7 @@
             let audioWs = null;
             let audioConnected = false;
             let audioGainNode = null;
+            let audioDecoder = null;  // Opus 解码器实例（复用）
 
             let imeWs = null;
             let imeConnected = false;
@@ -741,6 +809,13 @@
             // =====================================================
             // 音频流逻辑
             // =====================================================
+
+            // 音频队列管理
+            let audioQueue = [];
+            let nextPlayTime = 0;
+            let isPlaying = false;
+            const BUFFER_DURATION = 0.02; // 20ms 每个音频片
+
             function buildAudioWsUrl() {
                 const mode = document.querySelector(
                     'input[name="connectionMode"]:checked',
@@ -801,10 +876,11 @@
                     if (!audioContext) {
                         audioContext = new (
                             window.AudioContext || window.webkitAudioContext
-                        )({ sampleRate: 48000 });
+                        )({ sampleRate: 48000, latencyHint: 'interactive' });
                         audioGainNode = audioContext.createGain();
                         audioGainNode.gain.value = 0.8;
                         audioGainNode.connect(audioContext.destination);
+                        nextPlayTime = audioContext.currentTime + 0.1; // 初始延迟
                     }
 
                     // 恢复 AudioContext（浏览器安全策略）
@@ -875,6 +951,10 @@
                     audioWs = null;
                 }
                 audioConnected = false;
+
+                // 重置播放调度
+                nextPlayTime = 0;
+
                 updateAudioStatus("disconnected", "音频已停止");
                 document.getElementById("audioBtn").textContent = "启动音频";
                 document.getElementById("volumeControl").style.display = "none";
@@ -883,19 +963,112 @@
             }
 
             async function playAudioChunk(opusData) {
-                // 注意：这里需要实际的 Opus 解码器
-                // 可以使用 opus-decoder.js 或 libopus.js
-                // 这里仅作为示例，实际需要解码 Opus 数据
+                try {
+                    // 0. 检查 OpusDecoder 是否已加载
+                    if (!window.OpusDecoderLoaded) {
+                        console.error('[Audio] ❌ OpusDecoder 未加载，无法播放音频');
+                        console.error('[Audio] 请确保 opus-decoder.min.js 文件与 vnc-test.html 在同一目录');
+                        return;
+                    }
 
-                // 简化示例：假设数据是 Float32Array PCM
-                // const audioBuffer = audioContext.createBuffer(2, opusData.length / 8, 48000);
-                // ... 填充 audioBuffer
+                    // 1. 初始化或复用 Opus 解码器
+                    if (!audioDecoder) {
+                        console.log('[Audio] 初始化 OpusDecoder...');
+                        audioDecoder = new OpusDecoder({
+                            sampleRate: 48000,
+                            channels: 2
+                        });
+                        await audioDecoder.ready;
+                        console.log('[Audio] OpusDecoder 初始化完成');
+                    }
 
-                // 实际实现需要：
-                // 1. 解码 Opus -> PCM
-                // 2. 创建 AudioBuffer
-                // 3. 播放
-                console.log("[Audio] 收到音频数据:", opusData.length, "bytes");
+                    // 2. 解码 Opus 数据
+                    const decoded = audioDecoder.decodeFrame(opusData);
+                    const channels = decoded.channelData;
+                    const samplesDecoded = decoded.samplesDecoded;
+
+                    if (!channels || channels.length < 2) {
+                        console.error('[Audio] 输出声道数据无效:', channels);
+                        return;
+                    }
+
+                    const leftChannelData = channels[0];
+                    const rightChannelData = channels[1];
+
+                    // 3. 创建 AudioBuffer
+                    const audioBuffer = audioContext.createBuffer(
+                        2, samplesDecoded, 48000
+                    );
+
+                    // 4. 填充声道数据
+                    const leftChannel = audioBuffer.getChannelData(0);
+                    const rightChannel = audioBuffer.getChannelData(1);
+                    leftChannel.set(leftChannelData);
+                    rightChannel.set(rightChannelData);
+
+                    // 5. 调度播放（关键修复：确保连续性）
+                    const source = audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(audioGainNode);
+
+                    // 计算播放时间
+                    const currentTime = audioContext.currentTime;
+
+                    // 如果 nextPlayTime 已经过期，重新开始
+                    if (nextPlayTime < currentTime) {
+                        nextPlayTime = currentTime + 0.05; // 50ms 缓冲
+                        console.log('[Audio] 重置播放时间，nextPlayTime =', nextPlayTime);
+                    }
+
+                    // 调度播放
+                    source.start(nextPlayTime);
+
+                    // 计算下一个播放时间点（连续播放）
+                    const duration = samplesDecoded / 48000;
+                    nextPlayTime += duration;
+
+                    // 6. 清理已播放的源
+                    source.onended = () => {
+                        // 自动垃圾回收
+                    };
+
+                    // 7. 可视化音频（节流，避免频繁更新）
+                    if (Math.random() < 0.1) { // 只更新 10% 的时间
+                        const mergedPcm = new Float32Array(leftChannelData.length + rightChannelData.length);
+                        for (let i = 0; i < leftChannelData.length; i++) {
+                            mergedPcm[i * 2] = leftChannelData[i];
+                            mergedPcm[i * 2 + 1] = rightChannelData[i];
+                        }
+                        updateAudioVisualizer(mergedPcm);
+                    }
+
+                } catch (err) {
+                    console.error("[Audio] 解码或播放失败:", err);
+                    // 解码失败时重置解码器实例
+                    if (audioDecoder) {
+                        audioDecoder.free();
+                        audioDecoder = null;
+                    }
+                }
+            }
+
+            function updateAudioVisualizer(pcmData) {
+                const visualizer = document.getElementById('audioVisualizer');
+                if (!visualizer || visualizer.style.display === 'none') return;
+
+                // 计算 RMS 音量
+                let sum = 0;
+                for (let i = 0; i < pcmData.length; i++) {
+                    sum += pcmData[i] * pcmData[i];
+                }
+                const rms = Math.sqrt(sum / pcmData.length);
+
+                // 更新可视化条高度
+                const bars = visualizer.querySelectorAll('span');
+                bars.forEach((bar, index) => {
+                    const height = 5 + (rms * 20 * (1 + index * 0.2));
+                    bar.style.height = `${Math.min(height, 20)}px`;
+                });
             }
 
             function setVolume(value) {
@@ -932,7 +1105,7 @@
                         return null;
                     }
 
-                    return `${baseUrl}/computer/ime/${userId}/${projectId}/`;
+                    return `${baseUrl}/computer/ime/${userId}/${projectId}/connect`;
                 } else {
                     const port = document
                         .getElementById("imePortInput")
@@ -957,6 +1130,7 @@
 
             function connectIME() {
                 const wsUrl = buildIMEWsUrl();
+                console.log("[IME] 连接 IME 服务:", wsUrl);
                 if (!wsUrl) {
                     return;
                 }
@@ -972,16 +1146,16 @@
                         imeConnected = true;
                         imeEnabled = true;
                         document.getElementById("imeBtn").textContent =
-                            "停止输入法";
+                            "断开 IME 服务";
                         document.getElementById("imeStatus").textContent =
-                            "已激活 - 点击 VNC 区域开始输入";
+                            "已连接";
                         document.getElementById("imeStatus").style.background =
                             "#d4edda";
                         document.getElementById("imeStatus").style.color =
                             "#155724";
 
-                        // 设置输入事件监听
-                        setupIMEListeners();
+                        // 启用可见输入框
+                        updateIMEInputState(true);
                     };
 
                     imeWs.onmessage = (event) => {
@@ -1002,7 +1176,16 @@
 
                     imeWs.onerror = (err) => {
                         console.error("[IME] WebSocket 错误:", err);
-                        alert("IME 连接失败，请检查服务是否运行");
+                        alert(
+                            "IME 连接失败！\n\n" +
+                            "可能原因：\n" +
+                            "1. 容器未启动 - 请先发送聊天请求创建容器\n" +
+                            "2. IME 服务未运行 - 请检查容器状态\n" +
+                            "3. 网络连接问题 - 请检查 Pingora 代理是否运行\n\n" +
+                            "调试信息：\n" +
+                            "- WebSocket URL: " + wsUrl + "\n" +
+                            "- 错误详情: " + JSON.stringify(err)
+                        );
                     };
 
                     imeWs.onclose = () => {
@@ -1010,13 +1193,16 @@
                         imeConnected = false;
                         imeEnabled = false;
                         document.getElementById("imeBtn").textContent =
-                            "启动输入法";
+                            "连接 IME 服务";
                         document.getElementById("imeStatus").textContent =
-                            "未激活";
+                            "未连接";
                         document.getElementById("imeStatus").style.background =
                             "#f8f9fa";
                         document.getElementById("imeStatus").style.color =
                             "#666";
+
+                        // 禁用可见输入框
+                        updateIMEInputState(false);
                     };
                 } catch (err) {
                     console.error("[IME] 连接失败:", err);
@@ -1039,18 +1225,11 @@
             }
 
             function setupIMEListeners() {
-                const vncContainer = document.getElementById("vncContainer");
                 const imeInput = document.getElementById("imeInput");
+                const imeInputVisible = document.getElementById("imeInputVisible");
+                const imeInputHint = document.getElementById("imeInputHint");
 
-                // 点击 VNC 区域时聚焦到隐藏输入框
-                vncContainer.addEventListener("click", () => {
-                    if (imeEnabled) {
-                        imeInput.focus();
-                        console.log("[IME] 输入框已聚焦");
-                    }
-                });
-
-                // 监听输入法完成事件
+                // 监听隐藏输入框的输入法完成事件
                 imeInput.addEventListener("compositionend", (event) => {
                     const text = event.data;
 
@@ -1063,19 +1242,45 @@
                     }
                 });
 
-                // 处理普通按键（非输入法）
-                imeInput.addEventListener("keydown", (event) => {
-                    // 特殊键让 noVNC 处理
-                    if (
-                        ["Enter", "Backspace", "Tab", "Escape"].includes(
-                            event.key,
-                        )
-                    ) {
-                        // 这些键应该由 noVNC 处理
-                        // 这里简单忽略，实际可以通过 postMessage 发送给 iframe
-                        console.log("[IME] 特殊键:", event.key);
+                // 监听可见输入框的输入法完成事件
+                imeInputVisible.addEventListener("compositionend", (event) => {
+                    const text = event.data;
+
+                    if (text && text.length > 0 && imeConnected) {
+                        console.log("[IME] 输入完成:", text);
+                        sendTextToRemote(text);
+
+                        // 清空输入框
+                        imeInputVisible.value = "";
                     }
                 });
+
+                // 监听可见输入框的 input 事件（处理非输入法的直接输入）
+                imeInputVisible.addEventListener("input", (event) => {
+                    // 如果不是输入法输入，直接发送
+                    const text = event.target.value;
+                    if (text && text.length > 0 && imeConnected && !event.isComposing) {
+                        console.log("[IME] 直接输入:", text);
+                        sendTextToRemote(text);
+                        event.target.value = "";
+                    }
+                });
+            }
+
+            function updateIMEInputState(connected) {
+                const imeInputVisible = document.getElementById("imeInputVisible");
+                const imeInputHint = document.getElementById("imeInputHint");
+
+                if (connected) {
+                    imeInputVisible.disabled = false;
+                    imeInputHint.textContent = "请切换到中文输入法，然后在此处输入";
+                    imeInputVisible.focus();
+                    console.log("[IME] 输入框已启用");
+                } else {
+                    imeInputVisible.disabled = true;
+                    imeInputHint.textContent = "请先连接 IME 服务";
+                    imeInputVisible.value = "";
+                }
             }
 
             function sendTextToRemote(text) {
@@ -1120,6 +1325,7 @@
 
             window.addEventListener("DOMContentLoaded", function () {
                 setupEnterKeyListeners();
+                setupIMEListeners(); // 初始化 IME 监听器
 
                 const urlParams = new URLSearchParams(window.location.search);
 
