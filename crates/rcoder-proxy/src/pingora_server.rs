@@ -3,6 +3,7 @@
 //! 提供基于 Pingora 库的完整反向代理服务器启动功能，支持 HTTP/1.1 和 HTTP/2。
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -53,6 +54,23 @@ impl PingoraServerManager {
         let new_service = (*self.service)
             .clone()
             .with_api_key_manager(api_key_manager);
+        self.service = Arc::new(new_service);
+        self
+    }
+
+    /// 设置 API Key 鉴权配置
+    ///
+    /// 传入共享的 API Key 配置，使 Pingora 层也能进行 API Key 验证。
+    /// 使用 ArcSwap 实现无锁读取，提升并发性能。
+    ///
+    /// # 参数
+    ///
+    /// * `config` - 共享的 Arc<ArcSwap<ApiKeyAuthConfig>>
+    pub fn with_api_key_config(
+        mut self,
+        config: Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>,
+    ) -> Self {
+        let new_service = (*self.service).clone().with_api_key_config(config);
         self.service = Arc::new(new_service);
         self
     }

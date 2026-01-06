@@ -34,6 +34,36 @@ def log(level: str, message: str):
     print(f"[{timestamp}] [{level}] [IME] {message}", flush=True)
 
 
+def sanitize_text(text: str) -> str:
+    """
+    清理文本，防止命令注入和异常字符
+
+    安全检查:
+    1. 长度限制 (1000 字符)
+    2. 过滤危险控制字符 (NULL, ESC)
+    3. 使用 -- 参数分隔符防止注入
+
+    Args:
+        text: 待验证的文本
+
+    Returns:
+        清理后的文本
+
+    Raises:
+        ValueError: 如果文本包含危险内容
+    """
+    # 1. 长度限制
+    if len(text) > 1000:
+        raise ValueError("Text too long (max 1000 chars)")
+
+    # 2. 过滤危险控制字符
+    dangerous_chars = ['\x00', '\x1b']  # NULL 和 ESC
+    if any(c in text for c in dangerous_chars):
+        raise ValueError("Text contains dangerous control characters")
+
+    return text
+
+
 def type_text_xdotool(text: str) -> tuple[bool, str]:
     """
     使用 xdotool 输入文本
@@ -132,14 +162,25 @@ async def handle_client(websocket):
                 if msg_type == 'text':
                     text = data.get('text', '')
                     method = data.get('method', 'xdotool')  # 默认使用 xdotool
-                    
+
                     if not text:
                         await websocket.send(json.dumps({
                             'status': 'error',
                             'message': 'Empty text'
                         }))
                         continue
-                    
+
+                    # 安全验证
+                    try:
+                        text = sanitize_text(text)
+                    except ValueError as e:
+                        log("WARN", f"Text validation failed: {e}")
+                        await websocket.send(json.dumps({
+                            'status': 'error',
+                            'message': str(e)
+                        }))
+                        continue
+
                     # 根据方法选择输入方式
                     if method == 'clipboard':
                         success, error = type_text_clipboard(text)

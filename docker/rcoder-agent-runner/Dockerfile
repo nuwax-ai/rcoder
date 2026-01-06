@@ -47,8 +47,9 @@ RUN chmod +x /usr/local/bin/ime_server.py
 # 暴露 agent_runner 端口
 EXPOSE 8086
 
-# 暴露音频流 HTTP 端口
+# 暴露音频流端口
 EXPOSE 6090
+EXPOSE 6089
 
 # 暴露 IME 服务端口
 EXPOSE 6091

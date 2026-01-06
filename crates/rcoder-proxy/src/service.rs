@@ -8,6 +8,7 @@
 //! 将请求路由到对应用户容器的 noVNC 服务（端口 6080）。
 
 use anyhow::{Result, anyhow};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use matchit::{Params, Router};
@@ -318,6 +319,13 @@ impl TrackingCtx {
 /// noVNC 默认端口
 pub const NOVNC_PORT: u16 = 6080;
 
+/// 音频服务端口
+pub const AUDIO_HTTP_PORT: u16 = 6090; // 音频静态文件服务
+pub const AUDIO_WS_PORT: u16 = 6089; // 音频 WebSocket 流
+
+/// IME 输入法服务端口
+pub const IME_PORT: u16 = 6091;
+
 /// 基于 Pingora 的端口反向代理服务
 pub struct PingoraProxyService {
     config: ProxyConfig,
@@ -334,6 +342,8 @@ pub struct PingoraProxyService {
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
     /// 用于 /api/{service_name}/{*path} 路由
     pub api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
+    /// 🔒 API Key 鉴权配置（可选，用于 VNC 等路由的鉴权，使用 ArcSwap 实现无锁读取）
+    pub api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
 }
 
 /// Pingora 代理实现
@@ -352,6 +362,8 @@ pub struct PortProxy {
     router: Router<RouteType>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
     api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
+    /// 🔒 API Key 鉴权配置（可选，用于 VNC 等路由的鉴权，使用 ArcSwap 实现无锁读取）
+    api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
 }
 
 #[async_trait]
@@ -365,10 +377,58 @@ impl ProxyHttp for PortProxy {
     /// 过滤请求头和路径
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
+        // ========================================
+        // 🆕 API Key 验证（在所有路由处理之前）
+        // ========================================
+        if let Some(ref api_key_config) = self.api_key_config {
+            let path = upstream_request.uri.path();
+
+            // 提取 x-api-key header
+            let api_key = session
+                .req_header()
+                .headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok());
+
+            // 🚀 验证 API Key（无锁同步验证）
+            match shared_types::ApiKeyValidator::validate(api_key_config, path, api_key) {
+                Ok(()) => {
+                    // 验证通过，继续处理
+                }
+                Err("invalid") => {
+                    tracing::warn!("🔒 [PINGORA_AUTH] Invalid API key for path: {}", path);
+                    return Err(Box::new(pingora_core::Error::new(
+                        pingora_core::ErrorType::HTTPStatus(401),
+                    ))
+                    .more_context("Invalid API key".to_string()));
+                }
+                Err("missing") => {
+                    tracing::warn!(
+                        "🔒 [PINGORA_AUTH] Missing x-api-key header for path: {}",
+                        path
+                    );
+                    return Err(Box::new(pingora_core::Error::new(
+                        pingora_core::ErrorType::HTTPStatus(401),
+                    ))
+                    .more_context("Missing x-api-key header".to_string()));
+                }
+                Err(err) => {
+                    tracing::error!("🔒 [PINGORA_AUTH] Configuration error: {}", err);
+                    return Err(Box::new(pingora_core::Error::new(
+                        pingora_core::ErrorType::HTTPStatus(500),
+                    ))
+                    .more_context("Internal configuration error".to_string()));
+                }
+            }
+        }
+
+        // ========================================
+        // 原有路由处理逻辑
+        // ========================================
         let original_uri = upstream_request.uri.clone();
         let path = original_uri.path();
 
@@ -406,6 +466,16 @@ impl ProxyHttp for PortProxy {
             RouteType::ApiProxy => {
                 // 🔒 API 密钥代理：注入真实密钥后转发到真实 API
                 self.handle_api_proxy_request(upstream_request, &original_uri, matched.params)
+                    .await?;
+            }
+            RouteType::AudioProxy => {
+                // 🎵 音频流代理：根据路径路由到 HTTP 或 WebSocket 端口
+                self.handle_audio_request(upstream_request, &original_uri, matched.params, ctx)
+                    .await?;
+            }
+            RouteType::ImeProxy => {
+                // ⌨️ IME 输入法代理：路由到 IME WebSocket 服务
+                self.handle_ime_request(upstream_request, &original_uri, matched.params, ctx)
                     .await?;
             }
         }
@@ -452,6 +522,14 @@ impl ProxyHttp for PortProxy {
             RouteType::ApiProxy => {
                 // 🔒 API 代理：返回真实 API 端点的 peer
                 self.handle_api_proxy_upstream(ctx, matched.params).await
+            }
+            RouteType::AudioProxy => {
+                // 🎵 音频流代理：返回音频服务的 peer
+                self.handle_audio_upstream(ctx, matched.params).await
+            }
+            RouteType::ImeProxy => {
+                // ⌨️ IME 输入法代理：返回 IME 服务的 peer
+                self.handle_ime_upstream(ctx, matched.params).await
             }
         }
     }
@@ -660,6 +738,159 @@ impl PortProxy {
                 "ketama"
             },
         )?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // 🎵 音频流代理方法
+    // ========================================================================
+
+    /// 根据路径判断音频服务端口和目标路径
+    ///
+    /// # 端口判断逻辑
+    /// - `path == "ws"` 或 `path.starts_with("ws/")` → WebSocket 端口 6089
+    /// - 其他(包括空路径) → HTTP 端口 6090
+    ///
+    /// # 返回
+    /// (目标端口, 标准化后的目标路径)
+    fn determine_audio_port_and_path(path: &str) -> (u16, String) {
+        if path == "ws" || path.starts_with("ws/") {
+            (AUDIO_WS_PORT, format!("/{}", path))
+        } else {
+            let normalized = if path.is_empty() { "/" } else { path };
+            (
+                AUDIO_HTTP_PORT,
+                format!("/{}", normalized.trim_start_matches('/')),
+            )
+        }
+    }
+
+    /// 处理音频流代理请求
+    ///
+    /// 路径格式: /computer/audio/{user_id}/{project_id}/{*path}
+    ///
+    /// 端口判断逻辑：
+    /// - `path == "ws"` 或 `path.starts_with("ws/")` → WebSocket 端口 6089
+    /// - 其他(包括空路径) → HTTP 端口 6090
+    async fn handle_audio_request(
+        &self,
+        upstream_request: &mut RequestHeader,
+        original_uri: &http::Uri,
+        params: Params<'_, '_>,
+        ctx: &mut TrackingCtx,
+    ) -> PingoraResult<()> {
+        // 提取参数
+        let user_id = params.get("user_id").ok_or_else(|| {
+            error!("音频路由缺少 user_id 参数");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        let project_id = params.get("project_id").ok_or_else(|| {
+            error!("音频路由缺少 project_id 参数");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        // 标准化路径
+        let remaining_path = match params.get("path") {
+            Some(p) if !p.is_empty() => p,
+            _ => "",
+        };
+
+        // 判断目标端口和路径（使用辅助函数）
+        let (target_port, target_path) = Self::determine_audio_port_and_path(remaining_path);
+
+        // 获取容器 IP (复用 VNC 的容器 IP 解析机制)
+        let container_ip = self
+            .vnc_backends
+            .get(user_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| {
+                warn!("❌ [AUDIO] 用户容器不存在: user_id={}", user_id);
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+                    .more_context(format!("找不到用户 {} 的音频后端，请先创建容器", user_id))
+            })?;
+
+        // 记录上下文
+        ctx.target_port = Some(target_port);
+        ctx.upstream_host = Some(format!("{}:{}", container_ip, target_port));
+
+        info!(
+            "🎵 [AUDIO] 音频代理: user_id={}, project_id={}, path={}, target={}:{}",
+            user_id, project_id, remaining_path, container_ip, target_port
+        );
+
+        // 设置 Host 头
+        upstream_request.insert_header("Host", &container_ip)?;
+
+        // 重写 URI
+        let new_uri = Self::rewrite_uri(original_uri, target_path)?;
+        upstream_request.set_uri(new_uri);
+
+        // 设置代理标识头
+        Self::set_common_headers(upstream_request)?;
+        upstream_request.insert_header("X-Audio-Proxy", "pingora")?;
+        upstream_request.insert_header("X-Audio-User-Id", user_id)?;
+        upstream_request.insert_header("X-Audio-Project-Id", project_id)?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // ⌨️ IME 输入法代理方法
+    // ========================================================================
+
+    /// 处理 IME 输入法代理请求
+    ///
+    /// 路径格式: /computer/ime/{user_id}/{project_id}/{*path}
+    async fn handle_ime_request(
+        &self,
+        upstream_request: &mut RequestHeader,
+        original_uri: &http::Uri,
+        params: Params<'_, '_>,
+        ctx: &mut TrackingCtx,
+    ) -> PingoraResult<()> {
+        let user_id = params.get("user_id").ok_or_else(|| {
+            error!("IME 路由缺少 user_id 参数");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        let project_id = params.get("project_id").ok_or_else(|| {
+            error!("IME 路由缺少 project_id 参数");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        let remaining_path = params.get("path").unwrap_or("");
+        let target_path = format!("/{}", remaining_path.trim_start_matches('/'));
+
+        // 获取容器 IP
+        let container_ip = self
+            .vnc_backends
+            .get(user_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| {
+                warn!("❌ [IME] 用户容器不存在: user_id={}", user_id);
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+                    .more_context(format!("找不到用户 {} 的 IME 后端，请先创建容器", user_id))
+            })?;
+
+        ctx.target_port = Some(IME_PORT);
+        ctx.upstream_host = Some(format!("{}:{}", container_ip, IME_PORT));
+
+        info!(
+            "⌨️ [IME] 输入法代理: user_id={}, project_id={}, path={}, target={}:{}",
+            user_id, project_id, remaining_path, container_ip, IME_PORT
+        );
+
+        upstream_request.insert_header("Host", &container_ip)?;
+
+        let new_uri = Self::rewrite_uri(original_uri, target_path)?;
+        upstream_request.set_uri(new_uri);
+
+        Self::set_common_headers(upstream_request)?;
+        upstream_request.insert_header("X-IME-Proxy", "pingora")?;
+        upstream_request.insert_header("X-IME-User-Id", user_id)?;
+        upstream_request.insert_header("X-IME-Project-Id", project_id)?;
 
         Ok(())
     }
@@ -978,6 +1209,95 @@ impl PortProxy {
         Ok(peer)
     }
 
+    /// 处理音频流的上游连接
+    async fn handle_audio_upstream(
+        &self,
+        _ctx: &mut TrackingCtx,
+        params: Params<'_, '_>,
+    ) -> PingoraResult<Box<HttpPeer>> {
+        let user_id = params.get("user_id").ok_or_else(|| {
+            error!("音频路由缺少 user_id 参数");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        let remaining_path = match params.get("path") {
+            Some(p) if !p.is_empty() => p,
+            _ => "",
+        };
+
+        // 判断目标端口（使用辅助函数与 request 阶段保持一致）
+        let (target_port, _) = Self::determine_audio_port_and_path(remaining_path);
+
+        let container_ip = self
+            .vnc_backends
+            .get(user_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| {
+                warn!("❌ [AUDIO] 容器不存在: user_id={}", user_id);
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+                    .more_context(format!("找不到用户 {} 的音频后端", user_id))
+            })?;
+
+        // 记录指标
+        self.metrics.record_request();
+        self.metrics.record_request_port(target_port).await;
+        self.metrics.inc_active();
+
+        let peer_addr = format!("{}:{}", container_ip, target_port);
+        let mut peer = Box::new(HttpPeer::new(peer_addr.clone(), false, "".to_string()));
+
+        // WebSocket 长连接优化配置
+        peer.options.connection_timeout = Some(Duration::from_secs(10));
+        peer.options.read_timeout = None; // 无限等待(音频流可能持续数小时)
+        peer.options.write_timeout = Some(Duration::from_secs(30));
+        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+        peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1 小时空闲超时
+
+        debug!("🎵 [AUDIO] 连接到音频后端: {}", peer_addr);
+
+        Ok(peer)
+    }
+
+    /// 处理 IME 输入法的上游连接
+    async fn handle_ime_upstream(
+        &self,
+        _ctx: &mut TrackingCtx,
+        params: Params<'_, '_>,
+    ) -> PingoraResult<Box<HttpPeer>> {
+        let user_id = params.get("user_id").ok_or_else(|| {
+            error!("IME 路由缺少 user_id 参数");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        let container_ip = self
+            .vnc_backends
+            .get(user_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| {
+                warn!("❌ [IME] 容器不存在: user_id={}", user_id);
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+                    .more_context(format!("找不到用户 {} 的 IME 后端", user_id))
+            })?;
+
+        self.metrics.record_request();
+        self.metrics.record_request_port(IME_PORT).await;
+        self.metrics.inc_active();
+
+        let peer_addr = format!("{}:{}", container_ip, IME_PORT);
+        let mut peer = Box::new(HttpPeer::new(peer_addr.clone(), false, "".to_string()));
+
+        // IME 长连接优化 (与音频流相同配置)
+        peer.options.connection_timeout = Some(Duration::from_secs(10));
+        peer.options.read_timeout = None; // 无限等待
+        peer.options.write_timeout = Some(Duration::from_secs(30));
+        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+        peer.options.idle_timeout = Some(Duration::from_secs(3600));
+
+        debug!("⌨️ [IME] 连接到 IME 后端: {}", peer_addr);
+
+        Ok(peer)
+    }
+
     /// 处理端口代理的上游选择
     async fn handle_port_proxy_upstream(
         &self,
@@ -1041,6 +1361,7 @@ impl PingoraProxyService {
             health_map: Arc::new(RwLock::new(HashMap::new())),
             vnc_backends: Arc::new(DashMap::new()),
             api_key_manager: Arc::new(DashMap::new()),
+            api_key_config: None, // 默认不启用 API Key 鉴权
         }
     }
 
@@ -1062,6 +1383,19 @@ impl PingoraProxyService {
         self
     }
 
+    /// 设置 API Key 鉴权配置（builder 模式）
+    ///
+    /// 传入共享的 API Key 配置，使 Pingora 层也能进行 API Key 验证。
+    /// 配置将被传递给 PortProxy，用于在 upstream_request_filter 中验证请求。
+    /// 使用 ArcSwap 实现无锁读取，提升并发性能。
+    pub fn with_api_key_config(
+        mut self,
+        config: Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>,
+    ) -> Self {
+        self.api_key_config = Some(config);
+        self
+    }
+
     /// 创建 Pingora 代理服务实例
     pub fn create_pingora_proxy(&self) -> anyhow::Result<PortProxy> {
         // 使用统一的路由配置
@@ -1079,6 +1413,7 @@ impl PingoraProxyService {
             vnc_backends: self.vnc_backends.clone(),
             router,
             api_key_manager: self.api_key_manager.clone(),
+            api_key_config: self.api_key_config.clone(), // 传递 API Key 配置
         })
     }
 
@@ -1323,6 +1658,7 @@ impl Clone for PingoraProxyService {
             health_map: self.health_map.clone(),
             vnc_backends: self.vnc_backends.clone(),
             api_key_manager: self.api_key_manager.clone(),
+            api_key_config: self.api_key_config.clone(),
         }
     }
 }

@@ -5,6 +5,10 @@ mod model;
 mod chat_agent_config;
 pub use chat_agent_config::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
 
+// API Key 验证器模块
+pub mod api_key_validator;
+pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyValidator};
+
 // 新增多镜像配置相关模块
 pub mod multi_image_config;
 pub mod service_config;

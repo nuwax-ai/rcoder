@@ -4037,6 +4037,7 @@ dependencies = [
  "acp-adapter",
  "agent-client-protocol",
  "anyhow",
+ "arc-swap",
  "async-stream",
  "async-trait",
  "axum",
@@ -4095,6 +4096,7 @@ name = "rcoder-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "bytes 1.11.0",
@@ -4917,6 +4919,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "arc-swap",
  "async-stream",
  "axum",
  "axum-tracing-opentelemetry",

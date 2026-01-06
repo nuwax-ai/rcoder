@@ -82,6 +82,47 @@ pub enum RouteType {
     /// - `/api/anthropic/v1/messages` → `https://api.anthropic.com/v1/messages` (带真实密钥)
     /// - `/api/openai/v1/chat/completions` → `https://api.openai.com/v1/chat/completions`
     ApiProxy,
+
+    /// 🎵 音频流代理: `/computer/audio/{user_id}/{project_id}/{*path}`
+    ///
+    /// **功能**: 代理到用户容器的音频流服务
+    ///
+    /// **参数**:
+    /// - `user_id`: 用户标识符，用于查找对应的容器 IP
+    /// - `project_id`: 项目标识符（用于日志和追踪）
+    /// - `path`: 剩余路径
+    ///   - `ws` 或 `ws/*`: WebSocket 音频流（端口 6089）
+    ///   - 其他: HTTP 静态文件（端口 6090）
+    ///
+    /// **目标**: 容器内的音频流服务
+    /// - HTTP 端口 6090: 静态文件/播放器页面
+    /// - WebSocket 端口 6089: Opus 音频流
+    ///
+    /// **限制**: matchit 的 `{*path}` 通配符要求至少一个字符，尾斜杠路径不匹配
+    ///
+    /// **示例**:
+    /// - `/computer/audio/user_123/proj_456/index.html` → 容器IP:6090/index.html
+    /// - `/computer/audio/user_123/proj_456/ws` → 容器IP:6089/ws
+    /// - ❌ `/computer/audio/user_123/proj_456/` → 404 (尾斜杠不匹配)
+    AudioProxy,
+
+    /// ⌨️ IME 输入法代理: `/computer/ime/{user_id}/{project_id}/{*path}`
+    ///
+    /// **功能**: 代理到用户容器的 IME 输入法透传服务
+    ///
+    /// **参数**:
+    /// - `user_id`: 用户标识符，用于查找对应的容器 IP
+    /// - `project_id`: 项目标识符（用于日志和追踪）
+    /// - `path`: 剩余路径（通常为空）
+    ///
+    /// **目标**: 容器内的 IME 输入法服务（WebSocket 端口 6091）
+    ///
+    /// **限制**: matchit 的 `{*path}` 通配符要求至少一个字符
+    ///
+    /// **示例**:
+    /// - `/computer/ime/user_123/proj_456/connect` → 容器IP:6091/connect
+    /// - ❌ `/computer/ime/user_123/proj_456/` → 404 (尾斜杠不匹配)
+    ImeProxy,
 }
 
 /// 创建路由表
@@ -222,6 +263,61 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
             anyhow::anyhow!("API proxy route configuration error: {}", e)
         })?;
 
+    // ========================================================================
+    // 🎵 音频流代理路由
+    // ========================================================================
+    //
+    // 路径格式: /computer/audio/{user_id}/{project_id}/{*path}
+    //
+    // 功能: 将 HTTP 和 WebSocket 请求代理到用户容器的音频流服务
+    //
+    // 参数:
+    // - user_id: 用户标识符，用于查找对应的容器 IP
+    // - project_id: 项目标识符（用于日志和追踪）
+    // - path: 剩余路径
+    //   - "ws" 或 "ws/*": WebSocket 音频流（端口 6089）
+    //   - 其他（包括空路径）: HTTP 静态文件（端口 6090）
+    //
+    // 示例:
+    // - /computer/audio/user_123/proj_456/ -> 容器IP:6090/ (播放器页面)
+    // - /computer/audio/user_123/proj_456/ws -> 容器IP:6089/ws (音频流)
+    //
+    router
+        .insert(
+            "/computer/audio/{user_id}/{project_id}/{*path}",
+            RouteType::AudioProxy,
+        )
+        .map_err(|e| {
+            tracing::error!("❌ [ROUTER] 音频代理路由插入失败: {}", e);
+            anyhow::anyhow!("Audio proxy route configuration error: {}", e)
+        })?;
+
+    // ========================================================================
+    // ⌨️ IME 输入法代理路由
+    // ========================================================================
+    //
+    // 路径格式: /computer/ime/{user_id}/{project_id}/{*path}
+    //
+    // 功能: 将 WebSocket 请求代理到用户容器的 IME 输入法服务
+    //
+    // 参数:
+    // - user_id: 用户标识符，用于查找对应的容器 IP
+    // - project_id: 项目标识符（用于日志和追踪）
+    // - path: 剩余路径（通常为空）
+    //
+    // 示例:
+    // - /computer/ime/user_123/proj_456/ -> 容器IP:6091/ (WebSocket)
+    //
+    router
+        .insert(
+            "/computer/ime/{user_id}/{project_id}/{*path}",
+            RouteType::ImeProxy,
+        )
+        .map_err(|e| {
+            tracing::error!("❌ [ROUTER] IME 代理路由插入失败: {}", e);
+            anyhow::anyhow!("IME proxy route configuration error: {}", e)
+        })?;
+
     Ok(router)
 }
 
@@ -249,6 +345,16 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
             "/api/{service_name}/{*path}".to_string(),
             "🔒 API 密钥代理".to_string(),
             "拦截 AI API 请求，注入真实密钥后转发到真实 API 端点".to_string(),
+        ),
+        (
+            "/computer/audio/{user_id}/{project_id}/{*path}".to_string(),
+            "🎵 音频流代理".to_string(),
+            "代理到用户容器的音频流服务（HTTP 6090 / WebSocket 6089）".to_string(),
+        ),
+        (
+            "/computer/ime/{user_id}/{project_id}/{*path}".to_string(),
+            "⌨️ 输入法代理".to_string(),
+            "代理到用户容器的 IME 输入法服务（WebSocket 6091）".to_string(),
         ),
     ]
 }
@@ -345,7 +451,7 @@ mod tests {
     #[test]
     fn test_get_routes_documentation() {
         let docs = get_routes_documentation();
-        assert_eq!(docs.len(), 4);
+        assert_eq!(docs.len(), 6);
 
         // 验证 VNC 路由文档
         assert!(docs[0].0.contains("vnc"));
@@ -362,6 +468,14 @@ mod tests {
         // 验证 API 代理路由文档
         assert!(docs[3].0.contains("api"));
         assert!(docs[3].1.contains("API"));
+
+        // 验证音频代理路由文档
+        assert!(docs[4].0.contains("audio"));
+        assert!(docs[4].1.contains("音频"));
+
+        // 验证 IME 代理路由文档
+        assert!(docs[5].0.contains("ime"));
+        assert!(docs[5].1.contains("输入"));
     }
 
     #[test]
@@ -370,8 +484,11 @@ mod tests {
         assert_eq!(RouteType::PortProxy, RouteType::PortProxy);
         assert_eq!(RouteType::ApiProxy, RouteType::ApiProxy);
         assert_eq!(RouteType::HealthCheck, RouteType::HealthCheck);
+        assert_eq!(RouteType::AudioProxy, RouteType::AudioProxy);
+        assert_eq!(RouteType::ImeProxy, RouteType::ImeProxy);
         assert_ne!(RouteType::VncProxy, RouteType::PortProxy);
         assert_ne!(RouteType::ApiProxy, RouteType::PortProxy);
+        assert_ne!(RouteType::AudioProxy, RouteType::ImeProxy);
     }
 
     #[test]
@@ -380,15 +497,89 @@ mod tests {
         let port = RouteType::PortProxy;
         let api = RouteType::ApiProxy;
         let health = RouteType::HealthCheck;
+        let audio = RouteType::AudioProxy;
+        let ime = RouteType::ImeProxy;
 
         let vnc_str = format!("{:?}", vnc);
         let port_str = format!("{:?}", port);
         let api_str = format!("{:?}", api);
         let health_str = format!("{:?}", health);
+        let audio_str = format!("{:?}", audio);
+        let ime_str = format!("{:?}", ime);
 
         assert!(vnc_str.contains("VncProxy"));
         assert!(port_str.contains("PortProxy"));
         assert!(api_str.contains("ApiProxy"));
         assert!(health_str.contains("HealthCheck"));
+        assert!(audio_str.contains("AudioProxy"));
+        assert!(ime_str.contains("ImeProxy"));
+    }
+
+    #[test]
+    fn test_audio_route_matching() {
+        let router = create_router().unwrap();
+
+        // 测试音频 WebSocket 路由
+        let matched = router
+            .at("/computer/audio/user_123/proj_456/ws")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::AudioProxy);
+        assert_eq!(matched.params.get("user_id"), Some("user_123"));
+        assert_eq!(matched.params.get("project_id"), Some("proj_456"));
+        assert_eq!(matched.params.get("path"), Some("ws"));
+
+        // 测试音频 HTTP 路由 (带文件名)
+        let matched = router
+            .at("/computer/audio/user_123/proj_456/index.html")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::AudioProxy);
+        assert_eq!(matched.params.get("path"), Some("index.html"));
+
+        // 测试带子路径的 WebSocket
+        let matched = router
+            .at("/computer/audio/user_123/proj_456/ws/token")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::AudioProxy);
+        assert_eq!(matched.params.get("path"), Some("ws/token"));
+
+        // 注意：尾斜杠路径 (如 "/computer/audio/user_123/proj_456/") 不匹配 {*path} 通配符
+        // 这是 matchit 的限制，{*path} 需要至少一个字符
+        // 实际场景中客户端通常不会发送尾斜杠到这些路径
+    }
+
+    #[test]
+    fn test_ime_route_matching() {
+        let router = create_router().unwrap();
+
+        // 测试带子路径的 IME 路由
+        let matched = router
+            .at("/computer/ime/alice/myproject/connect")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::ImeProxy);
+        assert_eq!(matched.params.get("user_id"), Some("alice"));
+        assert_eq!(matched.params.get("project_id"), Some("myproject"));
+        assert_eq!(matched.params.get("path"), Some("connect"));
+
+        // 注意：尾斜杠路径不匹配 {*path} 通配符，需要至少一个字符
+    }
+
+    #[test]
+    fn test_audio_and_ime_route_not_conflict() {
+        let router = create_router().unwrap();
+
+        // 确保音频和 IME 路由不会互相干扰
+        let audio_matched = router
+            .at("/computer/audio/user_123/proj_456/ws")
+            .unwrap();
+        assert_eq!(*audio_matched.value, RouteType::AudioProxy);
+
+        let ime_matched = router
+            .at("/computer/ime/user_123/proj_456/connect")
+            .unwrap();
+        assert_eq!(*ime_matched.value, RouteType::ImeProxy);
+
+        // 确保不同的路径参数被正确解析
+        assert_eq!(audio_matched.params.get("path"), Some("ws"));
+        assert_eq!(ime_matched.params.get("path"), Some("connect"));
     }
 }

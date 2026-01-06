@@ -1,6 +1,7 @@
+use arc_swap::ArcSwap;
 use clap::Parser;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -214,6 +215,10 @@ async fn main() -> anyhow::Result<()> {
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
+    // 🆕 创建 API Key 配置的共享引用（用于热更新）
+    // 使用 ArcSwap 实现无锁读取，提升并发性能
+    let api_key_config = Arc::new(ArcSwap::from_pointee(config.api_key_auth.clone()));
+
     // 启动代理服务（如果启用）
     let (proxy_handle, pingora_service_opt) = if let Some(proxy_config) = &config.proxy_config {
         info!(
@@ -247,9 +252,11 @@ async fn main() -> anyhow::Result<()> {
 
         // 创建 Pingora 服务器管理器，并提取服务引用用于指标读取
         info!("🔧 [Pingora] 创建 PingoraServerManager...");
-        let mut server_manager = PingoraServerManager::new(pingora_config);
+        let mut server_manager = PingoraServerManager::new(pingora_config)
+            .with_api_key_config(Arc::clone(&api_key_config)); // 🆕 传递 API Key 配置
         let pingora_service = server_manager.service();
         info!("✅ [Pingora] PingoraServerManager 创建成功");
+        info!("🔒 [Pingora] API Key 鉴权配置已注入（支持热更新）");
 
         // 启动健康检查循环（按配置）
         if proxy_config.health_check.enabled {
@@ -285,9 +292,6 @@ async fn main() -> anyhow::Result<()> {
     // 设置 Ctrl+C 信号处理
     let shutdown_tx = setup_signal_handlers();
     let shutdown_rx = shutdown_tx.subscribe();
-
-    // 🆕 创建 API Key 配置的共享引用（用于热更新）
-    let api_key_config = Arc::new(RwLock::new(config.api_key_auth.clone()));
 
     // 🆕 启动配置文件监控（支持 API Key 热更新）
     // 保持 watcher 的所有权，防止被提前 drop

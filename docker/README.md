@@ -91,3 +91,141 @@ make dev-logs
 # 检查挂载点
 docker inspect <container_id> | grep Mounts -A 20
 ```
+
+## 🧪 测试页面
+
+`test-page/` 目录包含 VNC、音频和输入法透传功能的集成测试页面。
+
+### 文件说明
+
+| 文件 | 说明 |
+|------|------|
+| `vnc-test.html` | 集成测试页面（VNC + 音频 + IME） |
+| `opus-decoder.min.js` | Opus 音频解码库（86KB） |
+
+### 功能测试
+
+测试页面支持以下功能：
+- **VNC 远程桌面**: 通过 WebSocket 连接到容器的 noVNC 服务
+- **音频流播放**: 接收并播放容器的音频输出（Opus 编码）
+- **输入法透传**: 使用本地输入法（如中文输入法）输入到远程桌面
+
+### 使用方法
+
+#### 1. 启动本地 HTTP 服务器
+
+```bash
+# 进入测试页面目录
+cd /Volumes/soddygo/git_work/rcoder/docker/test-page
+
+# 使用 Python 3 启动 HTTP 服务器
+python3 -m http.server 8000
+```
+
+#### 2. 访问测试页面
+
+在浏览器中打开：
+```
+http://127.0.0.1:8000/vnc-test.html
+```
+
+#### 3. 配置连接参数
+
+页面加载后，填写以下信息：
+
+**RCoder 代理模式**（推荐）:
+- RCoder 服务地址: `http://127.0.0.1:8088`
+- User ID: `user_123`
+- Project ID: 留空或填写实际项目 ID
+
+**直接端口模式**（开发调试）:
+- 填写容器端口映射（需要先手动映射端口）
+
+#### 4. 创建测试容器
+
+如果使用代理模式，需要先创建一个 Computer Agent 容器：
+
+```bash
+# 发送聊天请求，自动创建容器
+curl -X POST http://127.0.0.1:8088/computer/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "user_123",
+    "prompt": "hello"
+  }'
+```
+
+或者通过测试页面的"发送聊天消息"按钮创建。
+
+#### 5. 测试功能
+
+| 功能 | 操作 |
+|------|------|
+| **VNC 桌面** | 点击"打开 VNC 桌面"按钮 |
+| **音频流** | 确保控制台显示"✅ OpusDecoder 加载成功"，然后启动音频 |
+| **输入法** | 点击"连接 IME 服务"，在输入框中使用本地输入法 |
+
+### 预期控制台输出
+
+正常加载时应该看到：
+```
+[Audio] ✅ OpusDecoder 加载成功
+[Audio] OpusDecoder: [class OpusDecoder]
+[IME] 连接 IME 服务: ws://127.0.0.1:8088/computer/ime/user_123/xxx/connect
+[IME] WebSocket 已连接
+```
+
+### 故障排查
+
+#### OpusDecoder 加载失败
+```
+[Audio] ❌ OpusDecoder 加载失败
+```
+**解决方法**: 确保 `opus-decoder.min.js` 与 `vnc-test.html` 在同一目录
+
+#### IME 连接失败
+```
+[IME] WebSocket 连接失败
+```
+**可能原因**:
+1. 容器未创建 - 先发送聊天请求创建容器
+2. IME 服务未运行 - 检查容器日志
+3. 网络连接问题 - 检查 Pingora 代理是否运行
+
+#### VNC 无法连接
+```
+[VNC] WebSocket 连接失败
+```
+**可能原因**:
+1. 容器未创建或未运行
+2. VNC 服务未启动 - 等待容器完全启动
+3. 端口配置错误 - 检查 User ID 和 Project ID
+
+### 技术细节
+
+#### 音频编解码
+- **编码**: Opus (48kHz, 双声道)
+- **传输**: WebSocket 二进制帧
+- **解码**: opus-decoder 库 (WebAssembly)
+
+#### IME 透传协议
+```json
+// 客户端 → 容器
+{
+  "type": "text",
+  "text": "你好，世界",
+  "method": "xdotool"
+}
+
+// 容器 → 客户端
+{
+  "status": "success",
+  "message": "文本已输入"
+}
+```
+
+#### VNC 连接
+- **协议**: WebSocket (noVNC)
+- **容器端口**: 6080
+- **代理路径**: `/computer/vnc/{user_id}/{project_id}/vnc.html`
+

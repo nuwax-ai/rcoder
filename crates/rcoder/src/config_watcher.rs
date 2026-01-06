@@ -19,7 +19,7 @@
 //! # use crate::config::ApiKeyAuthConfig;
 //! # use crate::config_watcher::ConfigWatcher;
 //!
-//! let api_key_config = Arc::new(RwLock::new(ApiKeyAuthConfig::default()));
+//! let api_key_config = Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig::default()));
 //! let config_path = PathBuf::from("config.yml");
 //!
 //! match ConfigWatcher::new(config_path, api_key_config) {
@@ -34,10 +34,11 @@
 //! ```
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -62,14 +63,14 @@ pub struct ConfigWatcher {
     config_path: PathBuf,
     /// API Key 配置的共享引用(未直接访问,但被闭包捕获)
     #[allow(dead_code)]
-    api_key_config: Arc<RwLock<ApiKeyAuthConfig>>,
+    api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
 }
 
 impl ConfigWatcher {
     /// 创建新的配置监控器
     pub fn new(
         config_path: PathBuf,
-        api_key_config: Arc<RwLock<ApiKeyAuthConfig>>,
+        api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     ) -> Result<Self> {
         let (tx, mut rx) = mpsc::channel(100);
 
@@ -116,10 +117,10 @@ impl ConfigWatcher {
         })
     }
 
-    /// 重新加载配置
+    /// 重新加载配置（使用 ArcSwap 无锁更新）
     async fn reload_config(
         config_path: &Path,
-        api_key_config: Arc<RwLock<ApiKeyAuthConfig>>,
+        api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     ) -> Result<()> {
         match load_api_key_config_from_file(config_path) {
             Ok(new_config) => {
@@ -129,25 +130,22 @@ impl ConfigWatcher {
                     return Err(anyhow::anyhow!("API Key 不能为空字符串"));
                 }
 
-                // 获取写锁并更新配置
-                let (old_enabled, key_changed) = match api_key_config.write() {
-                    Ok(mut config) => {
-                        let old_enabled = config.enabled;
-                        let key_changed = config.api_key != new_config.api_key;
-                        *config = new_config.clone();
-                        (old_enabled, key_changed)
-                    }
-                    Err(e) => {
-                        error!("❌ [CONFIG_WATCHER] 获取写锁失败(锁被毒化): {}", e);
-                        return Err(anyhow::anyhow!("获取写锁失败: {}", e));
-                    }
-                };
+                // 🚀 使用 ArcSwap 原子更新配置（无锁，不阻塞读取）
+                let old_config = api_key_config.load();
+                let old_enabled = old_config.enabled;
+                let key_changed = old_config.api_key != new_config.api_key;
+
+                // 提前保存新配置状态（用于日志）
+                let new_enabled = new_config.enabled;
+
+                // 原子替换配置（移动所有权，避免 clone）
+                api_key_config.store(Arc::new(new_config));
 
                 // 记录配置变更
-                if old_enabled != new_config.enabled {
+                if old_enabled != new_enabled {
                     info!(
                         "🔄 [CONFIG_WATCHER] API Key 鉴权状态已更新: {} -> {}",
-                        old_enabled, new_config.enabled
+                        old_enabled, new_enabled
                     );
                 }
 
@@ -155,7 +153,7 @@ impl ConfigWatcher {
                     info!("🔄 [CONFIG_WATCHER] API Key 已更新");
                 }
 
-                if !old_enabled && !new_config.enabled && !key_changed {
+                if !old_enabled && !new_enabled && !key_changed {
                     // 配置未实际变化，不记录日志
                     return Ok(());
                 }
@@ -193,7 +191,7 @@ api_key_auth:
         )
         .unwrap();
 
-        let api_key_config = Arc::new(RwLock::new(ApiKeyAuthConfig {
+        let api_key_config = Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig {
             enabled: false,
             api_key: "sk-test123".to_string(),
         }));

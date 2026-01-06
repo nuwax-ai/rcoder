@@ -32,23 +32,8 @@ pub struct CliArgs {
     pub default_backend_port: Option<u16>,
 }
 
-/// API Key 鉴权配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKeyAuthConfig {
-    /// 是否启用 API Key 鉴权
-    pub enabled: bool,
-    /// API Key 值（用于验证请求）
-    pub api_key: String,
-}
-
-impl Default for ApiKeyAuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: generate_random_api_key(),
-        }
-    }
-}
+// 从 shared_types 导入 API Key 鉴权配置
+pub use shared_types::ApiKeyAuthConfig;
 
 /// 应用程序配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,7 +174,10 @@ impl Default for AppConfig {
             proxy_config: Some(ProxyConfig::default()),
             docker_config: Some(DockerConfig::default()),
             cleanup_config: CleanupConfigSettings::default(),
-            api_key_auth: ApiKeyAuthConfig::default(),
+            api_key_auth: ApiKeyAuthConfig {
+                enabled: false,
+                api_key: generate_random_api_key(),
+            },
         }
     }
 }

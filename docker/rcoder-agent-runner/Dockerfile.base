@@ -691,8 +691,9 @@ RUN pip3 install --break-system-packages websockets && \
     pip3 install --break-system-packages git+https://github.com/linuxserver/pcmflux.git && \
     echo "✅ pcmflux audio streaming installed"
 
-# 暴露音频流 HTTP 端口
+# 暴露音频流端口
 EXPOSE 6090
+EXPOSE 6089
 
 # 暴露 IME 服务端口
 EXPOSE 6091
