@@ -137,6 +137,11 @@ const NOVNC_PORT: u16 = 6080;
             })
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 404,
             description = "找不到用户容器",
             body = HttpResult<DesktopErrorResponse>

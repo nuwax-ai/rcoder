@@ -80,6 +80,11 @@ pub struct ComputerAgentStopResponse {
             body = HttpResult<String>
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 404,
             description = "找不到指定的容器或 Agent",
             body = HttpResult<String>

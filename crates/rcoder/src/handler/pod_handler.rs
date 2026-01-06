@@ -338,6 +338,7 @@ pub struct RestartPodResponse {
     path = "/computer/pod/count",
     responses(
         (status = 200, description = "成功获取容器数量", body = HttpResult<PodCountResponse>),
+        (status = 401, description = "API Key 鉴权失败", body = String),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -408,6 +409,7 @@ pub async fn pod_count(
     ),
     responses(
         (status = 200, description = "成功获取容器列表", body = HttpResult<PodListResponse>),
+        (status = 401, description = "API Key 鉴权失败", body = String),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -597,6 +599,7 @@ pub async fn pod_list(
     responses(
         (status = 200, description = "成功启动/获取容器", body = HttpResult<EnsurePodResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
+        (status = 401, description = "API Key 鉴权失败", body = String),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -898,6 +901,7 @@ pub async fn pod_ensure(
     responses(
         (status = 200, description = "成功刷新活动时间", body = HttpResult<KeepalivePodResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
+        (status = 401, description = "API Key 鉴权失败", body = String),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -1050,6 +1054,7 @@ pub async fn pod_keepalive(
     responses(
         (status = 200, description = "成功重启容器", body = HttpResult<RestartPodResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
+        (status = 401, description = "API Key 鉴权失败", body = String),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -1330,6 +1335,7 @@ pub struct PodStatusResponse {
     responses(
         (status = 200, description = "成功查询容器状态", body = HttpResult<PodStatusResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
+        (status = 401, description = "API Key 鉴权失败", body = String),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -1520,6 +1526,7 @@ pub struct VncStatusResponse {
     responses(
         (status = 200, description = "成功获取 VNC 状态", body = HttpResult<VncStatusResponse>),
         (status = 400, description = "参数无效", body = HttpResult<String>),
+        (status = 401, description = "API Key 鉴权失败", body = String),
         (status = 404, description = "容器不存在", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),

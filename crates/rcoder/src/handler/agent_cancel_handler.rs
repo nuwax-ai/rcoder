@@ -382,6 +382,11 @@ async fn handle_session_cancel_internal_v2(
             })
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 404,
             description = "未找到对应的项目或会话",
             body = HttpResult<String>,
@@ -464,6 +469,11 @@ pub async fn agent_session_cancel(
                     "message": "user_id 或 project_id 不能为空"
                 }
             })
+        ),
+        (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
         ),
         (
             status = 404,

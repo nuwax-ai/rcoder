@@ -178,6 +178,11 @@ async fn destroy_container_for_project(
             })
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 500,
             description = "销毁容器失败",
             body = HttpResult<String>,

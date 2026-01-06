@@ -719,6 +719,11 @@ eventSource.onerror = (error) => {
             )
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 404,
             description = "未找到对应的容器",
             body = HttpResult<String>,

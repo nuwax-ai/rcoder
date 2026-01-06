@@ -104,6 +104,11 @@ pub struct ChatRequest {
             })
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 500,
             description = "服务器内部错误或容器服务异常",
             body = HttpResult<String>,
