@@ -828,7 +828,25 @@ function start_display_and_desktop() {
 
 	echo 'Fcitx5 already started manually'
 
-	# 以 root 身份启动 XFCE4，但 HOME 设置为 /home/user
+	# ========== 优化：预启动 xfdesktop（壁纸渲染进程）==========
+	# xfdesktop 负责渲染桌面壁纸，默认在 xfce4-session 串行启动序列的后面
+	# 手动预启动可以让壁纸渲染提前开始，减少 VNC 打开时的黑屏时间
+	log "Pre-starting xfdesktop for faster wallpaper rendering..."
+	env \
+		DISPLAY=:0 \
+		HOME=/home/user \
+		XDG_CURRENT_DESKTOP=XFCE \
+		DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+		xfdesktop &
+
+	# 智能等待 xfdesktop 进程启动（最长 5 秒，每 200ms 检测一次）
+	if wait_for_process "xfdesktop" 5; then
+		log_success "xfdesktop pre-started successfully"
+	else
+		log_warn "xfdesktop pre-start not detected, xfce4-session will start it"
+	fi
+
+	# 以 root 身份启动 XFCE4 会话（xfce4-session 会检测到 xfdesktop 已在运行，不会重复启动）
 	env \
 		DISPLAY=:0 \
 		HOME=/home/user \
@@ -856,13 +874,23 @@ function start_display_and_desktop() {
 function apply_xfce_wallpaper() {
     log "Applying XFCE wallpaper (as root)..."
 
-    # 等待 XFCE 桌面完全启动
+    # ========== 1. 等待 xfdesktop 进程启动 ==========
+    # xfdesktop 已在 start_display_and_desktop() 中预启动
+    # 这里只需要短暂等待确认它已运行（最多 30 秒，兼容慢速云服务器）
+    log "Waiting for xfdesktop process..."
+    if wait_for_process "xfdesktop" 30; then
+        log_success "xfdesktop process is running"
+    else
+        log_warn "xfdesktop not detected after 30s, continuing anyway (xfce4-session may start it)"
+    fi
+
+    # ========== 2. 等待 xfconf-query 可用 ==========
     local counter=0
     while ! DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l >/dev/null 2>&1; do
         sleep 1
-        let counter++
+        ((counter++))
         if ((counter > 30)); then
-            log_warn " Timeout waiting for XFCE desktop, skipping wallpaper"
+            log_warn " Timeout waiting for XFCE desktop xfconf, skipping wallpaper"
             return 1
         fi
     done
@@ -892,7 +920,61 @@ function apply_xfce_wallpaper() {
     # 设置壁纸样式（5 = 缩放）
     DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5 2>/dev/null || true
 
-    log_success "XFCE wallpaper applied successfully"
+    log_success "XFCE wallpaper config applied"
+
+    # ========== 3. 等待壁纸实际渲染完成 ==========
+    # xfdesktop 需要时间读取配置、加载图片、渲染到 X11 根窗口
+    # 使用 xprop 检测桌面窗口的 _XROOTPMAP_ID 属性（表示背景图已设置）
+    log "Waiting for wallpaper to render..."
+    local render_counter=0
+    local render_detected=false
+    
+    while ((render_counter < 60)); do  # 最长等待 30 秒
+        # 检测根窗口是否已设置背景图 (xfdesktop 设置壁纸后会更新这个属性)
+        if DISPLAY=:0 xprop -root _XROOTPMAP_ID 2>/dev/null | grep -q "pixmap id"; then
+            render_detected=true
+            log_success "Wallpaper rendering detected via _XROOTPMAP_ID"
+            break
+        fi
+        
+        # 备选检测：检查 xfdesktop 窗口是否存在并可见
+        if DISPLAY=:0 xdotool search --class xfdesktop 2>/dev/null | head -1 | grep -q .; then
+            # xfdesktop 窗口已存在，继续轮询 _XROOTPMAP_ID 最多 2 秒，确认壁纸已渲染
+            local pixmap_wait=0
+            while ((pixmap_wait < 4)); do
+                if DISPLAY=:0 xprop -root _XROOTPMAP_ID 2>/dev/null | grep -q "pixmap id"; then
+                    render_detected=true
+                    log_success "Wallpaper rendering detected via _XROOTPMAP_ID (after xfdesktop window found)"
+                    break 2  # 跳出两层循环
+                fi
+                sleep 0.5
+                ((pixmap_wait++))
+            done
+            # 如果轮询后仍未检测到 pixmap，但 xfdesktop 窗口存在，也认为渲染完成
+            render_detected=true
+            log_success "Wallpaper rendering assumed complete (xfdesktop window exists)"
+            break
+        fi
+        
+        sleep 0.5
+        ((render_counter++))
+    done
+    
+    if [ "$render_detected" = false ]; then
+        log_warn "Wallpaper render detection timed out, using fallback polling"
+        # 降级方案：继续轮询 _XROOTPMAP_ID，每 0.5 秒检测一次，最多 3 秒
+        local fallback_wait=0
+        while ((fallback_wait < 6)); do
+            if DISPLAY=:0 xprop -root _XROOTPMAP_ID 2>/dev/null | grep -q "pixmap id"; then
+                log_success "Wallpaper rendering detected via fallback polling"
+                break
+            fi
+            sleep 0.5
+            ((fallback_wait++))
+        done
+    fi
+
+    log_success "XFCE wallpaper applied and rendered successfully"
 
     # 🆕 写入壁纸就绪标记，供 VNC 就绪检查使用
     echo "$(date +%s)" > /tmp/wallpaper_ready
