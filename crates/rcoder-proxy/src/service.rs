@@ -399,14 +399,14 @@ impl ProxyHttp for PortProxy {
                 Ok(()) => {
                     // 验证通过，继续处理
                 }
-                Err("invalid") => {
+                Err(shared_types::ApiKeyAuthError::Invalid) => {
                     tracing::warn!("🔒 [PINGORA_AUTH] Invalid API key for path: {}", path);
                     return Err(Box::new(pingora_core::Error::new(
                         pingora_core::ErrorType::HTTPStatus(401),
                     ))
                     .more_context("Invalid API key".to_string()));
                 }
-                Err("missing") => {
+                Err(shared_types::ApiKeyAuthError::Missing) => {
                     tracing::warn!(
                         "🔒 [PINGORA_AUTH] Missing x-api-key header for path: {}",
                         path
@@ -416,8 +416,8 @@ impl ProxyHttp for PortProxy {
                     ))
                     .more_context("Missing x-api-key header".to_string()));
                 }
-                Err(err) => {
-                    tracing::error!("🔒 [PINGORA_AUTH] Configuration error: {}", err);
+                Err(shared_types::ApiKeyAuthError::ConfigError) => {
+                    tracing::error!("🔒 [PINGORA_AUTH] Configuration error");
                     return Err(Box::new(pingora_core::Error::new(
                         pingora_core::ErrorType::HTTPStatus(500),
                     ))

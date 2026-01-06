@@ -161,3 +161,16 @@ docker_config:
   work_dir: "/app"
   auto_cleanup: true
   container_ttl_seconds: 3600
+
+# API Key 鉴权配置（可选）
+api_key_auth:
+  # 是否启用 API Key 鉴权（默认关闭）
+  # 启用后，所有 HTTP 请求必须携带正确的 x-api-key header
+  # 豁免端点：/health, /metrics, /api/docs, /proxy/status, /proxy/stats
+  enabled: false
+
+  # API Key 值（首次生成时自动创建随机密钥）
+  # 格式：sk-{32位十六进制字符串}
+  # 示例：sk-a1b2c3d4e5f6789012345678abcdef01
+  # 可以通过环境变量 RCODER_API_KEY 覆盖此配置
+  api_key: "sk-a1b2c3d4e5f6789012345678abcdef01"

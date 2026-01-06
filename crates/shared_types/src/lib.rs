@@ -7,7 +7,7 @@ pub use chat_agent_config::{ChatAgentConfig, ChatAgentServerConfig, ChatContextS
 
 // API Key 验证器模块
 pub mod api_key_validator;
-pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyValidator};
+pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 
 // 新增多镜像配置相关模块
 pub mod multi_image_config;
