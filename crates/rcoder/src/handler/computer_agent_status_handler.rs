@@ -139,6 +139,11 @@ impl ComputerAgentStatusResponse {
             body = HttpResult<String>
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 500,
             description = "服务器内部错误",
             body = HttpResult<String>

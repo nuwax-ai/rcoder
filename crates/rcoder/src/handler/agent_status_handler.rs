@@ -2,10 +2,7 @@ use axum::extract::{Path, State};
 use std::sync::Arc;
 use tracing::{info, instrument};
 
-use crate::{
-    AgentStatusResponse, AppError, HttpResult,
-    router::AppState,
-};
+use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 
 /// 查询Agent状态
 ///
@@ -62,6 +59,11 @@ use crate::{
                     "message": "project_id cannot be empty"
                 }
             })
+        ),
+        (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
         )
     ),
     tag = "agent",
