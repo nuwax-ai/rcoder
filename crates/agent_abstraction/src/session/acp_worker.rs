@@ -11,7 +11,7 @@ use shared_types::{ProjectAndAgentInfo, SessionEntry};
 use tracing::{debug, error, info};
 
 use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
-use crate::compat::convert_context_servers;
+use crate::launcher::convert_context_servers;
 use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 
 /// ACP Agent Worker

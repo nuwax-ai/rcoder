@@ -28,7 +28,7 @@ use shared_types::{
 use tracing::{debug, error, info};
 
 use crate::PromptMessage;
-use crate::compat::ClaudeCodeLauncher;
+use crate::launcher::ClaudeCodeLauncher;
 use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 
 /// ACP 会话管理器
@@ -291,7 +291,7 @@ where
 
         // 注意：降级处理已移至 launch() 的 spawn_local 块内
         // 通过 tokio::select! 在 LocalSet 中直接处理降级，避免跨线程问题
-        // 详见 crates/agent_abstraction/src/compat/claude_code_launcher.rs
+        // 详见 crates/agent_abstraction/src/launcher/claude_code.rs
 
         // 返回刚插入的条目
         Ok(agent_info.into())

@@ -29,8 +29,8 @@ use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::session_registry::SessionRegistry;
 
 // 导入生命周期管理
-use super::agent_lifecycle::AgentLifecycleGuard;
-use super::channel_utils::PromptHandlerConfig;
+use super::lifecycle::AgentLifecycleGuard;
+use super::channel::PromptHandlerConfig;
 
 /// 使用默认版本
 const VERSION: agent_client_protocol::ProtocolVersion =
@@ -656,14 +656,14 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                 let lifecycle_handle_for_handler: Option<Arc<dyn AgentLifecycle>> = None;
 
                 // 启动通道处理器
-                super::channel_utils::spawn_cancel_handler_for_agent(
+                super::channel::spawn_cancel_handler_for_agent(
                     client_conn.clone(),
                     cancel_rx,
                     &project_id_for_child,
                 );
 
                 // 启动 Prompt 处理器（包含降级逻辑）
-                super::channel_utils::spawn_prompt_handler_for_agent(
+                super::channel::spawn_prompt_handler_for_agent(
                     client_conn.clone(),
                     prompt_rx,
                     session_id.clone(),
