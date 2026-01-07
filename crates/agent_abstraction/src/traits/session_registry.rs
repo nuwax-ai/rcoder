@@ -1,7 +1,58 @@
-//! Session Registry Trait
+//! # Session Registry Trait
 //!
-//! 定义会话注册表的抽象接口，允许 AcpSessionManager 使用不同的存储实现。
-//! 通过依赖注入避免 agent_abstraction 和 agent_runner 之间的循环依赖。
+//! 定义会话注册表的抽象接口，允许 `AcpSessionManager` 使用不同的存储实现。
+//! 通过依赖注入避免 `agent_abstraction` 和 `agent_runner` 之间的循环依赖。
+//!
+//! ## 预期实现
+//!
+//! 此 trait 预期在 `agent_runner` 中实现：
+//!
+//! - **实现类**: `agent_runner::service::AgentSessionRegistry`
+//! - **全局单例**: `agent_runner::service::AGENT_REGISTRY`
+//!
+//! ## 架构说明
+//!
+//! ```text
+//! agent_abstraction                    agent_runner
+//! ┌─────────────────┐                 ┌─────────────────────┐
+//! │ SessionRegistry │◄────────────────│ AgentSessionRegistry│
+//! │ (trait)         │   implements    │ (struct)            │
+//! └────────┬────────┘                 └──────────┬──────────┘
+//!          │                                     │
+//!          │                                     │
+//! ┌────────▼────────┐                 ┌──────────▼──────────┐
+//! │AcpSessionManager│◄────────────────│ AGENT_REGISTRY      │
+//! │ registry: R     │   injects       │ (static LazyLock)   │
+//! └─────────────────┘                 └─────────────────────┘
+//! ```
+//!
+//! ## 与 AGENT_REGISTRY 的关系
+//!
+//! - **AGENT_REGISTRY**: `agent_runner` 中的全局单例，实现了此 trait
+//! - **何时直接访问 AGENT_REGISTRY**: 在 `agent_runner` 内部进行状态查询、清理任务
+//! - **何时通过 trait 访问**: 在 `agent_abstraction` 内部，通过泛型参数 `R: SessionRegistry`
+//!
+//! ## 使用示例
+//!
+//! ```ignore
+//! // 在 agent_runner 中定义实现
+//! pub struct AgentSessionRegistry {
+//!     agent_info_map: DashMap<String, ProjectAndAgentInfo>,
+//!     project_to_session: DashMap<String, String>,
+//!     session_to_project: DashMap<String, String>,
+//! }
+//!
+//! impl SessionRegistry for AgentSessionRegistry {
+//!     type Entry = ProjectAndAgentInfo;
+//!     // ...
+//! }
+//!
+//! // 创建全局单例
+//! pub static AGENT_REGISTRY: LazyLock<Arc<AgentSessionRegistry>> = ...;
+//!
+//! // 注入到 AcpSessionManager
+//! let session_manager = AcpSessionManager::new(notifier, AGENT_REGISTRY.clone());
+//! ```
 
 use std::sync::Arc;
 

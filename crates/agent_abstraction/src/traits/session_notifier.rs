@@ -1,7 +1,58 @@
-//! Session notification trait for SSE message pushing.
+//! # Session Notifier Trait
 //!
 //! 定义会话通知的抽象接口，用于推送 SSE 消息到前端。
-//! agent_runner 模块实现此 trait 来完成实际的消息推送。
+//! `agent_runner` 模块实现此 trait 来完成实际的消息推送。
+//!
+//! ## 预期实现
+//!
+//! 此 trait 预期在 `agent_runner` 中实现：
+//!
+//! - **实现类**: `agent_runner::service::SseSessionNotifier`
+//! - **包装类**: `agent_runner::service::StateAwareNotifier`（注入 project_id）
+//!
+//! ## 架构说明
+//!
+//! ```text
+//! agent_abstraction                    agent_runner
+//! ┌─────────────────┐                 ┌─────────────────────┐
+//! │ SessionNotifier │◄────────────────│ SseSessionNotifier  │
+//! │ (trait)         │   implements    │ (struct)            │
+//! └────────┬────────┘                 └──────────┬──────────┘
+//!          │                                     │
+//!          │                          ┌──────────▼──────────┐
+//! ┌────────▼────────┐                 │ StateAwareNotifier  │
+//! │AcpSessionManager│◄────────────────│ (wrapper, 注入     │
+//! │ notifier: N     │   injects       │  project_id)        │
+//! └─────────────────┘                 └─────────────────────┘
+//! ```
+//!
+//! ## 方法使用场景
+//!
+//! | 方法 | 触发时机 | 推送内容 |
+//! |------|---------|---------|
+//! | `notify_prompt_start` | Agent 开始处理请求 | 会话开始通知 |
+//! | `notify_prompt_end` | Agent 完成处理 | 会话结束通知（含停止原因）|
+//! | `notify_prompt_error` | Agent 处理出错 | 错误通知 |
+//! | `notify_session_update` | Agent 输出内容 | 内容块更新（文本、工具调用等）|
+//! | `notify` | 通用通知 | 任意 SessionNotify 类型 |
+//!
+//! ## 使用示例
+//!
+//! ```ignore
+//! // 在 agent_runner 中定义实现
+//! pub struct SseSessionNotifier;
+//!
+//! #[async_trait]
+//! impl SessionNotifier for SseSessionNotifier {
+//!     async fn notify_prompt_start(...) -> Result<...> {
+//!         // 推送到 SESSION_CACHE，由 SSE handler 分发
+//!     }
+//! }
+//!
+//! // 使用 StateAwareNotifier 包装，自动注入 project_id
+//! let notifier = StateAwareNotifier::new(project_id.clone());
+//! let session_manager = AcpSessionManager::new(Arc::new(notifier), registry);
+//! ```
 
 use async_trait::async_trait;
 use shared_types::SessionNotify;

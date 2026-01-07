@@ -1,6 +1,23 @@
-//! ACP Session Manager
+//! # ACP Session Manager
 //!
-//! 基于 project_id 管理 ACP 会话的核心模块
+//! 基于 project_id 管理 ACP 会话的核心模块。
+//!
+//! ## 职责范围
+//!
+//! 1. **会话生命周期管理**
+//!    - 创建新会话 (`create_session`)
+//!    - 获取或复用会话 (`get_or_create_session`)
+//!    - 移除会话 (`remove_session`)
+//!    - 检测会话健康状态（channel 是否关闭）
+//!
+//! 2. **Prompt 构建**
+//!    - 构建纯文本 Prompt (`build_text_prompt_request`)
+//!    - 构建带附件的 Prompt (`build_prompt_request_with_attachments`)
+//!    - 将 request_id 放入 meta 字段
+//!
+//! 3. **路径处理**
+//!    - 路径规范化 (`normalize_path`)
+//!    - 确保项目目录存在 (`ensure_project_dir`)
 //!
 //! ## 架构说明
 //!
@@ -8,10 +25,32 @@
 //! - 之前：`AcpSessionManager.sessions` 和 `AGENT_REGISTRY` 各自维护一份会话数据
 //! - 现在：统一使用注入的 `SessionRegistry`（通常是 `AGENT_REGISTRY`）
 //!
-//! 这样确保了：
-//! - 当 Agent 被停止时（通过 `stop_agent` 调用 `AGENT_REGISTRY.remove`），
-//!   `AcpSessionManager` 自然就看不到该会话了
-//! - 不再需要手动同步两个存储
+//! ## 与 Worker 的协作
+//!
+//! ```text
+//! AcpAgentWorker (acp_worker.rs)
+//!       │
+//!       │ 1. 调用 get_or_create_session()
+//!       ▼
+//! AcpSessionManager
+//!       │
+//!       │ 2. 通过 SessionRegistry 获取/创建会话
+//!       │ 3. 通过 ClaudeCodeLauncher 启动 Agent
+//!       ▼
+//! SessionRegistry (注入的 AGENT_REGISTRY)
+//! ```
+//!
+//! ## 模型配置变化检测
+//!
+//! 当检测到模型配置变化时，会自动重启 Agent 会话：
+//! - 比较 `model_provider.id` 是否变化
+//! - 变化时移除旧会话，创建新会话
+//!
+//! ## 会话健康检查
+//!
+//! 复用会话前会检查 `prompt_tx.is_closed()`：
+//! - 如果 channel 已关闭，说明 Agent 进程已退出
+//! - 此时会移除失效会话并重新创建
 
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
