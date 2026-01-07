@@ -1,8 +1,8 @@
 //! Content Builder 工具
 //!
-//! 将 Attachment 转换为 ACP 协议的 ContentBlock
+//! 将 Attachment 转换为 SACP 协议的 ContentBlock
 
-use agent_client_protocol::{
+use sacp::schema::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, ResourceLink, TextContent, TextResourceContents,
 };

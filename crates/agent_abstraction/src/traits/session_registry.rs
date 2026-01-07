@@ -1,6 +1,6 @@
 //! # Session Registry Trait
 //!
-//! 定义会话注册表的抽象接口，允许 `AcpSessionManager` 使用不同的存储实现。
+//! 定义会话注册表的抽象接口，允许 `SacpSessionManager` 使用不同的存储实现。
 //! 通过依赖注入避免 `agent_abstraction` 和 `agent_runner` 之间的循环依赖。
 //!
 //! ## 预期实现
@@ -21,7 +21,7 @@
 //!          │                                     │
 //!          │                                     │
 //! ┌────────▼────────┐                 ┌──────────▼──────────┐
-//! │AcpSessionManager│◄────────────────│ AGENT_REGISTRY      │
+//! │SacpSessionManager◄────────────────│ AGENT_REGISTRY      │
 //! │ registry: R     │   injects       │ (static LazyLock)   │
 //! └─────────────────┘                 └─────────────────────┘
 //! ```
@@ -50,8 +50,8 @@
 //! // 创建全局单例
 //! pub static AGENT_REGISTRY: LazyLock<Arc<AgentSessionRegistry>> = ...;
 //!
-//! // 注入到 AcpSessionManager
-//! let session_manager = AcpSessionManager::new(notifier, AGENT_REGISTRY.clone());
+//! // 注入到 SacpSessionManager
+//! let session_manager = SacpSessionManager::new(notifier, AGENT_REGISTRY.clone());
 //! ```
 
 use std::sync::Arc;
@@ -65,7 +65,7 @@ use shared_types::SessionEntry;
 /// # 设计说明
 /// - `SessionEntry` trait 定义在 `shared_types`，描述单个会话条目的数据访问
 /// - `SessionRegistry` trait 定义在 `agent_abstraction`，描述会话存储的 CRUD 操作
-/// - `agent_runner` 为 `AGENT_REGISTRY` 实现 `SessionRegistry`，并注入到 `AcpSessionManager`
+/// - `agent_runner` 为 `AGENT_REGISTRY` 实现 `SessionRegistry`，并注入到 `SacpSessionManager`
 ///
 /// # 使用示例
 /// ```ignore
@@ -75,8 +75,8 @@ use shared_types::SessionEntry;
 ///     // ...
 /// }
 ///
-/// // 注入到 AcpSessionManager
-/// let session_manager = AcpSessionManager::new(notifier, Arc::new(registry));
+/// // 注入到 SacpSessionManager
+/// let session_manager = SacpSessionManager::new(notifier, Arc::new(registry));
 /// ```
 pub trait SessionRegistry: Send + Sync + 'static {
     /// 会话条目类型

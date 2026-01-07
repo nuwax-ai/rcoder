@@ -1,47 +1,28 @@
+//! 路由和应用状态
+//!
+//! SACP 模式下的简化架构，无需 LocalSet 和 AgentWorkerManager。
+
 use std::sync::Arc;
 
 use axum::{Router, routing::get, response::IntoResponse};
 use dashmap::DashMap;
-use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::agent_worker_manager::AgentWorkerManager;
-use crate::{config::AppConfig, handler, proxy_agent::LocalSetAgentRequest};
+use crate::{config::AppConfig, handler, proxy_agent::SacpAgentRequest};
 use rcoder_telemetry::{TelemetryGuard, HttpMetricsLayer};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-/// 会话信息结构
-#[derive(Debug, Clone, Serialize)]
-pub struct SessionInfo {
-    pub session_id: String,
-    pub user_id: String,
-    pub project_id: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub last_activity: chrono::DateTime<chrono::Utc>,
-}
-
-/// 应用状态
+/// 应用状态（SACP 模式）
 #[derive(Clone)]
 pub struct AppState {
-    /// 活跃的会话映射, project_id -> SessionInfo
-    pub sessions: Arc<DashMap<String, SessionInfo>>,
     /// 应用配置
     pub config: AppConfig,
 
-    /// ⚠️ 本地任务发送器（已弃用，保留仅用于兼容性）
+    /// SACP 任务发送器
     ///
-    /// **重要**: 请使用 `agent_worker_manager.try_send()` 发送任务
-    /// 直接使用此字段会导致重启后发送到错误的通道
-    pub local_task_sender: mpsc::UnboundedSender<LocalSetAgentRequest>,
-
-    /// 🆕 Agent Worker 管理器（用于监控和自动重启）
-    ///
-    /// **推荐**: 始终使用 `agent_worker_manager.try_send()` 发送任务
-    /// - 支持自动重启后的 sender 更新
-    /// - 提供健康状态检查
-    /// - 线程安全的原子操作
-    pub agent_worker_manager: Arc<AgentWorkerManager>,
+    /// 使用 symposium-acp 库，支持标准 tokio::spawn（无需 LocalSet）
+    pub sacp_sender: mpsc::UnboundedSender<SacpAgentRequest>,
 
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
@@ -117,7 +98,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         description = r#"
 RCoder AI 服务 API
 
-基于 ACP (Agent Client Protocol) 的 AI 驱动开发平台，提供完整的 AI 代理集成解决方案。
+基于 SACP (symposium-acp) 的 AI 驱动开发平台，提供完整的 AI 代理集成解决方案。
 
 ## 主要功能
 
@@ -128,7 +109,7 @@ RCoder AI 服务 API
 
 ## 技术架构
 
-- **协议**: ACP (Agent Client Protocol) v0.4
+- **协议**: SACP (symposium-acp)
 - **gRPC 通信**: rcoder 通过 gRPC 与 agent_runner 通信
 - **健康检查**: 提供服务健康状态查询
 

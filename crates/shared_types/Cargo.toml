@@ -14,7 +14,8 @@ serde.workspace = true
 serde_json.workspace = true
 dashmap = { workspace = true }
 uuid.workspace = true
-agent-client-protocol.workspace = true
+# 使用 SACP 替代 agent-client-protocol (sacp::schema 模块重新导出所有类型)
+sacp.workspace = true
 chrono.workspace = true
 
 # OpenAPI documentation

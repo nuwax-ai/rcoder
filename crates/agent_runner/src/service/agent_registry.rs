@@ -11,7 +11,7 @@ use shared_types::ProjectAndAgentInfo;
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
 
-/// 全局 Agent 会话注册表（Arc 包装版本，用于 AcpSessionManager 注入）
+/// 全局 Agent 会话注册表（Arc 包装版本，用于 SacpSessionManager 注入）
 pub static AGENT_REGISTRY: LazyLock<Arc<AgentSessionRegistry>> =
     LazyLock::new(|| Arc::new(AgentSessionRegistry::new()));
 
@@ -190,7 +190,7 @@ impl AgentSessionRegistry {
     /// 如果项目不存在，则创建一个占位记录
     /// 如果项目已存在且为 Idle 状态，则更新为 Pending
     pub fn set_pending(&self, project_id: &str) {
-        use agent_client_protocol::SessionId;
+        use sacp::schema::SessionId;
         use chrono::Utc;
         use shared_types::AgentStatus;
         use std::sync::Arc;
@@ -402,7 +402,7 @@ impl AgentSessionRegistry {
 }
 
 // ============================================================================
-// 实现 SessionRegistry trait（用于 AcpSessionManager 依赖注入）
+// 实现 SessionRegistry trait（用于 SacpSessionManager 依赖注入）
 // ============================================================================
 
 impl SessionRegistry for AgentSessionRegistry {
@@ -442,7 +442,7 @@ impl Default for AgentSessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::SessionId;
+    use sacp::schema::SessionId;
     use chrono::Utc;
     use shared_types::AgentStatus;
     use std::sync::Arc;

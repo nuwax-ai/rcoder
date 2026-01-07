@@ -7,7 +7,8 @@ description.workspace = true
 license.workspace = true
 
 [dependencies]
-agent-client-protocol.workspace = true
+# 使用 SACP (sacp::schema 模块重新导出所有协议类型)
+sacp.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true

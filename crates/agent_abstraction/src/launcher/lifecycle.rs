@@ -3,7 +3,6 @@
 //! 基于RAII原则的简洁生命周期管理设计
 
 use anyhow::Result;
-use dashmap::DashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -13,8 +12,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use agent_client_protocol::SessionId;
-use shared_types::{AgentLifecycle, ModelProviderConfig};
+use sacp::schema::SessionId;
+use shared_types::AgentLifecycle;
 
 /// Agent生命周期守卫
 ///
@@ -39,62 +38,26 @@ struct AgentLifecycleInner {
     cancel_token: CancellationToken,
     resources: AgentResources,
     stopped: AtomicBool,
-    /// 🔥 共享的 API 密钥管理器引用（用于自动清理）
-    shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
-    /// 🔥 project_id -> service_uuid 映射（用于清理时查找 UUID）
-    project_uuid_map: Option<Arc<DashMap<String, String>>>,
-    /// 🔥 关联的 service_uuid（用于清理时定位配置）
-    service_uuid: Option<String>,
 }
 
 /// Agent资源管理枚举
 enum AgentResources {
     Claude {
         child_process: Arc<Mutex<Option<tokio::process::Child>>>,
+        /// stderr 任务 handle（保持任务生命周期）
+        #[allow(dead_code)]
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     },
 }
 
 impl AgentLifecycleGuard {
-    /// 为Claude Agent创建生命周期守卫（兼容旧代码，默认无密钥管理器）
+    /// 为 Claude Agent 创建生命周期守卫
     pub fn new_claude(
         project_id: String,
         session_id: SessionId,
         child_process: tokio::process::Child,
         stderr_task: JoinHandle<()>,
         cancel_token: CancellationToken,
-    ) -> Self {
-        Self::new_claude_with_key_manager(
-            project_id,
-            session_id,
-            child_process,
-            stderr_task,
-            cancel_token,
-            None,  // 默认无密钥管理器
-            None,  // 默认无 project_uuid_map
-            None,  // 默认无 service_uuid
-        )
-    }
-
-    /// 🔥 新增：带密钥管理器的构造函数
-    ///
-    /// 创建生命周期守卫时传入共享的 API 密钥管理器和 service_uuid，
-    /// 当 Agent 停止时（Drop）会自动清理对应的 API 密钥配置。
-    ///
-    /// # 参数
-    ///
-    /// * `shared_api_key_manager` - 共享的 DashMap，用于清理 API 密钥配置
-    /// * `project_uuid_map` - project_id -> service_uuid 映射，用于查找 UUID
-    /// * `service_uuid` - 与此 Agent 关联的 service UUID
-    pub fn new_claude_with_key_manager(
-        project_id: String,
-        session_id: SessionId,
-        child_process: tokio::process::Child,
-        stderr_task: JoinHandle<()>,
-        cancel_token: CancellationToken,
-        shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
-        project_uuid_map: Option<Arc<DashMap<String, String>>>,
-        service_uuid: Option<String>,
     ) -> Self {
         let resources = AgentResources::Claude {
             child_process: Arc::new(Mutex::new(Some(child_process))),
@@ -107,9 +70,6 @@ impl AgentLifecycleGuard {
             cancel_token,
             resources,
             stopped: AtomicBool::new(false),
-            shared_api_key_manager,
-            project_uuid_map,
-            service_uuid,
         });
 
         Self { inner }
@@ -293,3 +253,227 @@ impl AgentLifecycle for AgentLifecycleGuard {
 // 类型别名
 pub type AgentStopGuard = AgentLifecycleGuard;
 pub type AgentStopHandleArc = Arc<AgentLifecycleGuard>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_types::AgentLifecycle;
+    use std::process::Stdio;
+
+    /// 创建一个简单的测试进程（sleep 命令）用于生命周期测试
+    async fn create_test_process() -> (tokio::process::Child, JoinHandle<()>) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60") // sleep 60 秒，测试会在此之前终止它
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Failed to spawn test process");
+
+        // 创建一个 dummy stderr 任务
+        let stderr_task = tokio::spawn(async {
+            // 简单的 dummy 任务
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+        });
+
+        (child, stderr_task)
+    }
+
+    #[test]
+    fn test_lifecycle_guard_debug() {
+        // 使用 tokio runtime 创建 guard
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (child, stderr_task) = create_test_process().await;
+            let cancel_token = CancellationToken::new();
+            let session_id = sacp::schema::SessionId::new(Arc::from("test-session"));
+
+            let guard = AgentLifecycleGuard::new_claude(
+                "test-project".to_string(),
+                session_id,
+                child,
+                stderr_task,
+                cancel_token,
+            );
+
+            let debug_str = format!("{:?}", guard);
+            assert!(debug_str.contains("AgentLifecycleGuard"));
+            assert!(debug_str.contains("test-project"));
+            assert!(debug_str.contains("stopped"));
+
+            // 清理
+            guard.cancel();
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_guard_initial_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (child, stderr_task) = create_test_process().await;
+            let cancel_token = CancellationToken::new();
+            let session_id = sacp::schema::SessionId::new(Arc::from("test-session"));
+
+            let guard = AgentLifecycleGuard::new_claude(
+                "test-project".to_string(),
+                session_id,
+                child,
+                stderr_task,
+                cancel_token,
+            );
+
+            // 初始状态应该是未停止
+            assert!(!guard.is_stopped());
+            assert!(!guard.cancellation_token().is_cancelled());
+
+            // 清理
+            guard.cancel();
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_guard_cancel() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (child, stderr_task) = create_test_process().await;
+            let cancel_token = CancellationToken::new();
+            let session_id = sacp::schema::SessionId::new(Arc::from("test-session"));
+
+            let guard = AgentLifecycleGuard::new_claude(
+                "test-project".to_string(),
+                session_id,
+                child,
+                stderr_task,
+                cancel_token,
+            );
+
+            // 取消前
+            assert!(!guard.cancellation_token().is_cancelled());
+
+            // 发送取消信号
+            guard.cancel();
+
+            // 取消后
+            assert!(guard.cancellation_token().is_cancelled());
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_guard_clone() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (child, stderr_task) = create_test_process().await;
+            let cancel_token = CancellationToken::new();
+            let session_id = sacp::schema::SessionId::new(Arc::from("test-session"));
+
+            let guard1 = AgentLifecycleGuard::new_claude(
+                "test-project".to_string(),
+                session_id,
+                child,
+                stderr_task,
+                cancel_token,
+            );
+
+            // Clone
+            let guard2 = guard1.clone();
+
+            // 两个 guard 应该共享相同的状态
+            assert!(!guard1.is_stopped());
+            assert!(!guard2.is_stopped());
+
+            // 通过其中一个 guard 取消
+            guard1.cancel();
+
+            // 两者都应该看到取消状态
+            assert!(guard1.cancellation_token().is_cancelled());
+            assert!(guard2.cancellation_token().is_cancelled());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_guard_graceful_stop() {
+        let (child, stderr_task) = create_test_process().await;
+        let cancel_token = CancellationToken::new();
+        let session_id = sacp::schema::SessionId::new(Arc::from("test-session"));
+
+        let guard = AgentLifecycleGuard::new_claude(
+            "test-project".to_string(),
+            session_id,
+            child,
+            stderr_task,
+            cancel_token,
+        );
+
+        // 执行优雅停止
+        let result = guard.graceful_stop().await;
+        assert!(result.is_ok());
+
+        // 停止后应该标记为已停止
+        assert!(guard.is_stopped());
+        assert!(guard.cancellation_token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_guard_graceful_stop_idempotent() {
+        let (child, stderr_task) = create_test_process().await;
+        let cancel_token = CancellationToken::new();
+        let session_id = sacp::schema::SessionId::new(Arc::from("test-session"));
+
+        let guard = AgentLifecycleGuard::new_claude(
+            "test-project".to_string(),
+            session_id,
+            child,
+            stderr_task,
+            cancel_token,
+        );
+
+        // 第一次停止
+        let result1 = guard.graceful_stop().await;
+        assert!(result1.is_ok());
+        assert!(guard.is_stopped());
+
+        // 第二次停止应该是幂等的（不会报错）
+        let result2 = guard.graceful_stop().await;
+        assert!(result2.is_ok());
+        assert!(guard.is_stopped());
+    }
+
+    #[tokio::test]
+    async fn test_agent_lifecycle_trait() {
+        let (child, stderr_task) = create_test_process().await;
+        let cancel_token = CancellationToken::new();
+        let session_id = sacp::schema::SessionId::new(Arc::from("test-session"));
+
+        let guard = AgentLifecycleGuard::new_claude(
+            "test-project".to_string(),
+            session_id,
+            child,
+            stderr_task,
+            cancel_token,
+        );
+
+        // 通过 trait 方法调用
+        let lifecycle: &dyn AgentLifecycle = &guard;
+
+        assert!(!lifecycle.is_stopped());
+        assert!(!lifecycle.cancellation_token().is_cancelled());
+
+        lifecycle.cancel();
+        assert!(lifecycle.cancellation_token().is_cancelled());
+
+        // 停止
+        let result = lifecycle.graceful_stop().await;
+        assert!(result.is_ok());
+        assert!(lifecycle.is_stopped());
+    }
+
+    #[test]
+    fn test_type_aliases() {
+        // 验证类型别名正确
+        fn _accepts_stop_guard(_: AgentStopGuard) {}
+        fn _accepts_arc(_: AgentStopHandleArc) {}
+
+        // 如果编译通过，说明类型别名正确
+    }
+}

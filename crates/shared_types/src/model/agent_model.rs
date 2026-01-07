@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{ModelProviderConfig, ModelProviderSafeInfo};
-use agent_client_protocol::{CancelNotification, PromptRequest, SessionId};
+use sacp::schema::{CancelNotification, PromptRequest, SessionId};
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;
@@ -474,7 +474,3 @@ impl AgentLifecycle for AgentLifecycleGuard {
         self.cancellation_token()
     }
 }
-
-// 类型别名
-pub type AgentStopGuard = AgentLifecycleGuard;
-pub type AgentStopHandleArc = Arc<AgentLifecycleGuard>;

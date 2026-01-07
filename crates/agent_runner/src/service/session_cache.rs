@@ -2,7 +2,7 @@
 //!
 //! 使用LazyLock初始化全局DashMap，按session_id分组缓存统一会话消息到ringbuf循环缓冲区
 
-use crate::{SessionNotify, UnifiedSessionMessage};
+use shared_types::{SessionMessageType, SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
@@ -219,7 +219,7 @@ impl SessionWorker {
                 SessionCommand::Push { message } => {
                     let should_buffer = !matches!(
                         message.message_type,
-                        crate::model::SessionMessageType::Heartbeat
+                        SessionMessageType::Heartbeat
                     );
 
                     if should_buffer {

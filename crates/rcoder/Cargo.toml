@@ -29,8 +29,8 @@ duckdb_manager = { path = "../duckdb_manager" }
 rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
-# ACP Protocol
-agent-client-protocol = { workspace = true }
+# SACP Protocol (sacp::schema 模块重新导出所有协议类型)
+sacp = { workspace = true }
 async-trait = "0.1"
 parking_lot = "0.12"
 tempfile = { workspace = true }

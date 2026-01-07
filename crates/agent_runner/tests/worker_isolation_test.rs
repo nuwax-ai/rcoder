@@ -277,37 +277,3 @@ async fn test_request_cleanup_correctness() {
     }
     assert_eq!(storage.lock().unwrap().len(), 0);
 }
-
-/// 测试使用 AgentWorkerManager 的 Worker 隔离
-#[tokio::test]
-async fn test_worker_manager_isolation() {
-    use agent_runner::agent_worker_manager::AgentWorkerManager;
-
-    // 创建两个独立的 Worker Manager
-    let (manager1, _, _, _, _) = AgentWorkerManager::new();
-    let (manager2, _, _, _, _) = AgentWorkerManager::new();
-
-    // Worker 1 添加请求
-    manager1.track_request_start("worker1-req".to_string()).unwrap();
-
-    // Worker 2 添加请求
-    manager2.track_request_start("worker2-req".to_string()).unwrap();
-
-    // 验证独立性
-    let summary1 = manager1.get_active_requests_summary();
-    let summary2 = manager2.get_active_requests_summary();
-
-    assert_eq!(summary1.count, 1);
-    assert_eq!(summary2.count, 1);
-
-    // 清除 Worker 1
-    manager1.clear_active_requests();
-
-    // Worker 1 被清空
-    let summary1 = manager1.get_active_requests_summary();
-    assert_eq!(summary1.count, 0);
-
-    // Worker 2 不受影响
-    let summary2 = manager2.get_active_requests_summary();
-    assert_eq!(summary2.count, 1);
-}

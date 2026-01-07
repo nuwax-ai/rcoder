@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::{CancelNotification, SessionId};
+use sacp::schema::{CancelNotification, PromptRequest, SessionId};
 use tokio::sync::{mpsc, oneshot};
 
 // 重新导出 shared_types 中的统一类型
@@ -27,7 +27,7 @@ pub struct AgentConnection {
     pub session_id: Option<SessionId>,
 
     /// Prompt sender channel
-    pub prompt_tx: Arc<mpsc::UnboundedSender<agent_client_protocol::PromptRequest>>,
+    pub prompt_tx: Arc<mpsc::UnboundedSender<PromptRequest>>,
     /// Cancel sender channel - wrapped in Arc to avoid Debug requirement
     pub cancel_tx: Arc<mpsc::UnboundedSender<CancelNotificationRequestWrapper>>,
 }
@@ -45,7 +45,7 @@ impl AgentConnection {
         project_id: String,
         service_type: shared_types::ServiceType,
         session_id: Option<SessionId>,
-        prompt_tx: Arc<mpsc::UnboundedSender<agent_client_protocol::PromptRequest>>,
+        prompt_tx: Arc<mpsc::UnboundedSender<PromptRequest>>,
         cancel_tx: Arc<mpsc::UnboundedSender<CancelNotificationRequestWrapper>>,
     ) -> Self {
         Self {
@@ -80,17 +80,11 @@ impl AgentConnection {
 
     /// Send prompt
     ///
-    /// 通过 channel 发送 prompt 到 LocalSet 中运行的 agent
+    /// 通过 channel 发送 prompt 到 Agent
     /// session_id 由服务端自动管理，调用方无需关心
-    ///
-    /// 设计说明：
-    /// - agent 必须在 LocalSet 中运行（不能跨线程）
-    /// - 使用 MPSC channel 解耦调用方和 agent 运行环境
-    /// - newSession 在 agent 启动后自动执行
-    /// - prompt handler 会自动处理 session_id 的覆盖
     pub async fn send_prompt(
         &self,
-        prompt: agent_client_protocol::PromptRequest,
+        prompt: PromptRequest,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.prompt_tx.send(prompt).map_err(|e| {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
@@ -100,7 +94,7 @@ impl AgentConnection {
 
     /// Send cancel
     ///
-    /// 通过 channel 发送取消请求到 LocalSet 中运行的 agent
+    /// 通过 channel 发送取消请求到 Agent
     /// 返回一个 receiver，调用方可以通过它等待取消结果
     ///
     /// # Returns

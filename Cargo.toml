@@ -11,6 +11,9 @@ default-members = [
     "crates/acp_adapter",
     "crates/rcoder-proxy",
     "crates/duckdb_manager",
+    "crates/agent_abstraction",
+    "crates/agent_config",
+    "crates/rcoder-telemetry",
 ]
 
 
@@ -31,8 +34,12 @@ description = "Rust-based AI agent framework"
 publish = false
 
 [workspace.dependencies]
-# ACP Protocol
-agent-client-protocol = { version = "0.9.2", features = ["unstable"] }
+# SACP Protocol (使用 sacp::schema 模块重新导出所有协议类型)
+sacp = "10.1.0"
+sacp-tokio = "10.1.0"
+sacp-conductor = "10.0.1"
+sacp-proxy = "3.0.0"
+sacp-cookbook = "10.0.1"
 
 piper = "0.2"
 

@@ -86,18 +86,6 @@ impl DuckDbConnection {
         }
     }
 
-    /// 获取连接的克隆（用于需要独立连接的场景）
-    ///
-    /// 注意：DuckDB 的 try_clone 在内存模式下共享相同的数据库实例
-    pub fn try_clone(&self) -> DuckDbResult<Self> {
-        let conn = self.inner.lock();
-        let cloned = conn.try_clone()
-            .map_err(|e| DuckDbError::ConnectionError(format!("克隆连接失败: {}", e)))?;
-
-        Ok(Self {
-            inner: Arc::new(Mutex::new(cloned)),
-        })
-    }
 }
 
 impl std::fmt::Debug for DuckDbConnection {
@@ -183,29 +171,5 @@ mod tests {
 
         assert_eq!(count, 0);
     }
-
-    #[test]
-    fn test_try_clone() {
-        let conn = DuckDbConnection::open_in_memory().unwrap();
-
-        // 创建测试表
-        conn.with_connection(|c| {
-            c.execute("CREATE TABLE test (id INTEGER)", [])?;
-            c.execute("INSERT INTO test VALUES (42)", [])?;
-            Ok(())
-        }).unwrap();
-
-        // 克隆连接
-        let cloned = conn.try_clone().unwrap();
-
-        // 通过克隆的连接读取数据
-        let value: i32 = cloned.with_connection(|c| {
-            let mut stmt = c.prepare("SELECT id FROM test")?;
-            let mut rows = stmt.query([])?;
-            let row = rows.next()?.unwrap();
-            Ok(row.get(0)?)
-        }).unwrap();
-
-        assert_eq!(value, 42);
-    }
 }
+

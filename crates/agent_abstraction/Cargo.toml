@@ -7,6 +7,12 @@ license = "MIT OR Apache-2.0"
 description = "Agent abstraction layer for RCoder"
 publish = false
 
+[features]
+# 🔥 SACP 现在是默认启用（完全迁移，移除 LocalSet 架构）
+default = ["sacp"]
+# SACP 协议（使用 symposium-acp 库，支持标准 tokio::spawn）
+sacp = []
+
 [dependencies]
 # 依赖其他 crate
 agent_config = { path = "../agent_config" }
@@ -49,8 +55,9 @@ tracing = { workspace = true }
 # 兼容性
 tokio-util = { workspace = true }
 
-# ACP 协议 - 使用工作空间依赖
-agent-client-protocol = { workspace = true }
+# SACP 协议 (symposium-acp 库)
+sacp = { workspace = true }
+sacp-tokio = { workspace = true }
 
 # MCP 协议 - rmcp 官方库: https://github.com/modelcontextprotocol/rust-sdk
 rmcp = {  version = "0.10", features = [

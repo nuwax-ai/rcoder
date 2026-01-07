@@ -1,10 +1,10 @@
 //! ACP 适配器的通用类型定义
 //!
-//! 基于 agent_client_protocol crate 的类型重新导出和扩展
+//! 基于 SACP 协议 (sacp::schema) 的类型重新导出和扩展
 
-use agent_client_protocol::{
+use sacp::schema::{
     ContentBlock, PermissionOption, PermissionOptionId, SessionId, SessionModeId, StopReason,
-    ToolCall, ToolCallStatus,
+    ToolCall, ToolCallId as SacpToolCallId, ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -111,8 +111,8 @@ impl std::fmt::Display for ToolCallId {
     }
 }
 
-impl From<agent_client_protocol::ToolCallId> for ToolCallId {
-    fn from(protocol_id: agent_client_protocol::ToolCallId) -> Self {
+impl From<SacpToolCallId> for ToolCallId {
+    fn from(protocol_id: SacpToolCallId) -> Self {
         Self(format!("{}", protocol_id.0).into())
     }
 }

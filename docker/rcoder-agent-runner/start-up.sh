@@ -1476,15 +1476,18 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             start_vnc_services
         fi
 
-        # 检查 MCP Proxy 服务健康状态
-        if ! check_mcp_proxy_health; then
-            echo "MCP Proxy 服务异常，正在重启..."
-            if ! restart_mcp_proxy; then
-                # 首次重启失败，等待 5 秒后重试一次
-                sleep 5
-                restart_mcp_proxy || log_warn "MCP Proxy restart failed after retry"
-            fi
-        fi
+        # ========== MCP Proxy 健康检查已禁用 ==========
+        # 原因：Streamable HTTP 协议的健康检查需要发送 initialize 请求，
+        #       每次检查会创建新 session，可能导致资源浪费。
+        # 暂时只依赖进程存活检查，后续可以优化为更轻量的健康检查方式。
+        # if ! check_mcp_proxy_health; then
+        #     echo "MCP Proxy 服务异常，正在重启..."
+        #     if ! restart_mcp_proxy; then
+        #         # 首次重启失败，等待 5 秒后重试一次
+        #         sleep 5
+        #         restart_mcp_proxy || log_warn "MCP Proxy restart failed after retry"
+        #     fi
+        # fi
     done
 ) &
 

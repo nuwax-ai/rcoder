@@ -2,7 +2,7 @@
 //!
 //! 提供测试用的构造器和辅助工具
 
-use crate::proxy_agent::LocalSetAgentRequest;
+use crate::proxy_agent::SacpAgentRequest;
 use agent_abstraction::PromptMessage;
 use shared_types::{Attachment, ServiceType};
 use std::path::PathBuf;
@@ -110,11 +110,11 @@ impl TestRequestBuilder {
     pub fn build(
         self,
     ) -> (
-        LocalSetAgentRequest,
+        SacpAgentRequest,
         tokio::sync::oneshot::Receiver<crate::model::ChatPromptResponse>,
     ) {
         let prompt_message = self.build_prompt_message();
-        LocalSetAgentRequest::new(prompt_message, None)
+        SacpAgentRequest::new(prompt_message, None)
     }
 }
 
