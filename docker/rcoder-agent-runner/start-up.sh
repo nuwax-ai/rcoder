@@ -379,7 +379,7 @@ function initialize_user_home() {
     # 而不需要等待 apply_xfce_wallpaper 脚本
     local XFCE_DESKTOP_XML="$USER_HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
     local XFCE_DESKTOP_SYSTEM="/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
-    
+
     if [ ! -f "$XFCE_DESKTOP_XML" ] && [ -f "$XFCE_DESKTOP_SYSTEM" ]; then
         mkdir -p "$(dirname "$XFCE_DESKTOP_XML")"
         cp -f "$XFCE_DESKTOP_SYSTEM" "$XFCE_DESKTOP_XML"
@@ -928,7 +928,7 @@ function apply_xfce_wallpaper() {
     log "Waiting for wallpaper to render..."
     local render_counter=0
     local render_detected=false
-    
+
     while ((render_counter < 60)); do  # 最长等待 30 秒
         # 检测根窗口是否已设置背景图 (xfdesktop 设置壁纸后会更新这个属性)
         if DISPLAY=:0 xprop -root _XROOTPMAP_ID 2>/dev/null | grep -q "pixmap id"; then
@@ -936,7 +936,7 @@ function apply_xfce_wallpaper() {
             log_success "Wallpaper rendering detected via _XROOTPMAP_ID"
             break
         fi
-        
+
         # 备选检测：检查 xfdesktop 窗口是否存在并可见
         if DISPLAY=:0 xdotool search --class xfdesktop 2>/dev/null | head -1 | grep -q .; then
             # xfdesktop 窗口已存在，继续轮询 _XROOTPMAP_ID 最多 2 秒，确认壁纸已渲染
@@ -955,11 +955,11 @@ function apply_xfce_wallpaper() {
             log_success "Wallpaper rendering assumed complete (xfdesktop window exists)"
             break
         fi
-        
+
         sleep 0.5
         ((render_counter++))
     done
-    
+
     if [ "$render_detected" = false ]; then
         log_warn "Wallpaper render detection timed out, using fallback polling"
         # 降级方案：继续轮询 _XROOTPMAP_ID，每 0.5 秒检测一次，最多 3 秒
@@ -1000,6 +1000,102 @@ function check_vnc_health() {
         return 0
     fi
     return 0
+}
+
+function check_mcp_proxy_health() {
+    # 检查 MCP Proxy 服务健康状态
+    # MCP Proxy 运行在 127.0.0.1:18099，提供 chrome-devtools MCP 服务
+
+    local MCP_PROXY_PORT=18099
+
+    # 1. 检查 mcp-proxy 进程是否存在
+    if ! pgrep -f "mcp-proxy proxy" >/dev/null 2>&1; then
+        log_warn "MCP Proxy process not running, attempting restart..."
+        return 1
+    fi
+
+    # 2. 检查端口是否监听（使用更健壮的正则匹配）
+    if ! netstat -tuln 2>/dev/null | grep -qE ":${MCP_PROXY_PORT}(\s|$)"; then
+        log_warn "MCP Proxy not listening on port ${MCP_PROXY_PORT}, attempting restart..."
+        return 1
+    fi
+
+    # 3. 发送 JSON-RPC 请求验证服务是否响应（快速超时）
+    local MCP_TEST_RESULT
+    MCP_TEST_RESULT=$(curl -s --max-time 5 -X POST "http://127.0.0.1:${MCP_PROXY_PORT}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json, text/event-stream" \
+        -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null)
+
+    if echo "$MCP_TEST_RESULT" | grep -q '"tools"'; then
+        # 健康检查成功，不输出日志以减少日志量
+        return 0
+    else
+        log_warn "MCP Proxy not responding correctly on port ${MCP_PROXY_PORT}"
+        log_warn "Response: ${MCP_TEST_RESULT:-<empty>}"
+        return 1
+    fi
+}
+
+function restart_mcp_proxy() {
+    # 重启 MCP Proxy 服务
+    log "Restarting MCP Proxy service..."
+
+    local MCP_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/mcp"
+    local MCP_CONFIG_FILE="/etc/mcp/mcp-proxy-config.json"
+
+    # 确保日志目录存在
+    mkdir -p "$MCP_LOG_DIR" 2>/dev/null || true
+
+    # 1. 停止现有进程
+    pkill -f "mcp-proxy proxy" || true
+    sleep 1
+
+    # 强制杀死残留进程
+    pkill -9 -f "mcp-proxy proxy" 2>/dev/null || true
+    sleep 1
+
+    # 2. 检查配置文件
+    if [ ! -f "$MCP_CONFIG_FILE" ]; then
+        log_warn "MCP config file not found: $MCP_CONFIG_FILE, cannot restart"
+        return 1
+    fi
+
+    # 3. 获取 D-Bus 地址
+    local DBUS_ADDR=""
+    if [ -f /tmp/dbus-session-env ]; then
+        source /tmp/dbus-session-env
+        DBUS_ADDR="$DBUS_SESSION_BUS_ADDRESS"
+    fi
+
+    # 4. 重新启动 mcp-proxy proxy 服务
+    env \
+        HOME=/home/user \
+        DISPLAY=:0 \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        CHROMIUM_USER_DATA_DIR=/home/user/.config/chromium \
+        GTK_IM_MODULE=fcitx \
+        QT_IM_MODULE=fcitx \
+        XMODIFIERS=@im=fcitx \
+        INPUT_METHOD=fcitx \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        LC_CTYPE=C.UTF-8 \
+        PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
+        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" \
+        > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
+
+    local MCP_PID=$!
+
+    # 5. 等待端口就绪（最长 15 秒）
+    if wait_for_port 127.0.0.1 18099 15 && kill -0 $MCP_PID 2>/dev/null; then
+        log_success "MCP Proxy restarted successfully (PID: $MCP_PID)"
+        return 0
+    else
+        log_warn "MCP Proxy restart failed, check log: $MCP_LOG_DIR/mcp-proxy.log"
+        tail -20 "$MCP_LOG_DIR/mcp-proxy.log" 2>/dev/null || true
+        return 1
+    fi
 }
 
 # ============================================================================
@@ -1364,9 +1460,11 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     vnc_ready_marker_pid=$!
     log "VNC ready marker polling task started (pid: $vnc_ready_marker_pid)"
 
-    # VNC服务监控循环 (as root)
+    # VNC 和 MCP Proxy 服务监控循环 (as root)
     while true; do
         sleep 30
+
+        # 检查 VNC 服务健康状态
         if ! check_vnc_health; then
             echo "VNC服务异常，正在重启..."
             # 停止现有服务
@@ -1376,6 +1474,16 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             wait_for_process_exit "x11vnc" 3 || true
             # 重新启动VNC服务
             start_vnc_services
+        fi
+
+        # 检查 MCP Proxy 服务健康状态
+        if ! check_mcp_proxy_health; then
+            echo "MCP Proxy 服务异常，正在重启..."
+            if ! restart_mcp_proxy; then
+                # 首次重启失败，等待 5 秒后重试一次
+                sleep 5
+                restart_mcp_proxy || log_warn "MCP Proxy restart failed after retry"
+            fi
         fi
     done
 ) &
