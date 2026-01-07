@@ -264,7 +264,7 @@ pub async fn computer_agent_status(
     );
 
     // 调用 gRPC GetStatus（带超时和重试）
-    let grpc_status = match call_grpc_get_status_with_retry(
+    let grpc_response = match call_grpc_get_status_with_retry(
         &state.grpc_pool,
         &grpc_addr,
         &request.project_id,
@@ -272,7 +272,7 @@ pub async fn computer_agent_status(
     )
     .await
     {
-        Ok(status) => status,
+        Ok(response) => response,
         Err(e) => {
             warn!(
                 "⚠️ [COMPUTER_AGENT_STATUS] gRPC GetStatus 调用失败: user_id={}, project_id={}, error={}",
@@ -287,13 +287,13 @@ pub async fn computer_agent_status(
         }
     };
 
-    // 5. 解析 gRPC 响应，判断 Agent 是否存活（使用白名单模式）
-    let is_alive = ALIVE_STATUSES.contains(&grpc_status.as_str());
+    // 5. 使用 is_found 字段判断 Agent 是否存活
+    let is_alive = grpc_response.is_found;
 
     if !is_alive {
         info!(
-            "📭 [COMPUTER_AGENT_STATUS] Agent 未启动: user_id={}, project_id={}, grpc_status={}",
-            request.user_id, request.project_id, grpc_status
+            "📭 [COMPUTER_AGENT_STATUS] Agent 未启动: user_id={}, project_id={}, is_found={}",
+            request.user_id, request.project_id, grpc_response.is_found
         );
         return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
             request.user_id,
@@ -308,7 +308,7 @@ pub async fn computer_agent_status(
             project_id: request.project_id.clone(),
             is_alive: true,
             session_id: project_info.session_id().map(|s| s.to_string()),
-            status: Some(grpc_status.clone()),
+            status: Some(grpc_response.status.clone()),
             last_activity: Some(project_info.last_activity()),
             created_at: Some(project_info.created_at()),
         }
@@ -323,7 +323,7 @@ pub async fn computer_agent_status(
             project_id: request.project_id.clone(),
             is_alive: true,
             session_id: None,
-            status: Some(grpc_status.clone()),
+            status: Some(grpc_response.status.clone()),
             last_activity: None,
             created_at: None,
         }
@@ -361,7 +361,7 @@ async fn call_grpc_get_status_with_retry(
     grpc_addr: &str,
     project_id: &str,
     max_retries: u32,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<shared_types::grpc::GetStatusResponse> {
     let mut last_error = None;
 
     for attempt in 1..=max_retries {
@@ -379,12 +379,12 @@ async fn call_grpc_get_status_with_retry(
 
                 match client.get_status(tonic_request).await {
                     Ok(response) => {
-                        let status = response.into_inner().status;
+                        let grpc_response = response.into_inner();
                         debug!(
-                            "✅ [GRPC_GET_STATUS] 第 {} 次尝试成功: project_id={}, status={}",
-                            attempt, project_id, status
+                            "✅ [GRPC_GET_STATUS] 第 {} 次尝试成功: project_id={}, status={}, is_found={}",
+                            attempt, project_id, grpc_response.status, grpc_response.is_found
                         );
-                        return Ok(status);
+                        return Ok(grpc_response);
                     }
                     Err(e) => {
                         // 直接判断原始 tonic::Status，避免信息丢失

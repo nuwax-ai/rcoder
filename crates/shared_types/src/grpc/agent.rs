@@ -126,6 +126,9 @@ pub struct GetStatusResponse {
     /// "idle", "busy", "error"
     #[prost(string, tag = "1")]
     pub status: ::prost::alloc::string::String,
+    /// Agent 是否存在于 Registry
+    #[prost(bool, tag = "2")]
+    pub is_found: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopAgentRequest {

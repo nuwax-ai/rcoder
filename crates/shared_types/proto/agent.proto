@@ -127,6 +127,7 @@ message GetStatusRequest {
 
 message GetStatusResponse {
   string status = 1; // "idle", "busy", "error"
+  bool is_found = 2; // Agent 是否存在于 Registry
 }
 
 // === Stop Agent ===
