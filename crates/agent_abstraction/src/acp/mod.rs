@@ -1,15 +1,11 @@
 //! ACP connection management module.
 
 mod connection;
-mod connection_builder;
-mod manager;
 
 pub use connection::{
     AgentConnection, AgentStatus, CancelNotificationRequestWrapper, CancelResult, ConnectionStats,
     ConnectionStatus,
 };
-pub use connection_builder::{AcpAgentClient, AcpConnectionBuilder, EstablishedConnection};
-pub use manager::AcpConnectionManager;
 
 /// Legacy type alias for backward compatibility
 pub type Connection = AgentConnection;

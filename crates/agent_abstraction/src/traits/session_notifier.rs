@@ -4,9 +4,7 @@
 //! agent_runner 模块实现此 trait 来完成实际的消息推送。
 
 use async_trait::async_trait;
-use shared_types::{
-    AgentSessionUpdate, SessionNotify, SessionPromptEnd, SessionPromptError, SessionPromptStart,
-};
+use shared_types::SessionNotify;
 
 /// 会话通知器 trait
 ///
@@ -61,60 +59,4 @@ pub trait SessionNotifier: Send + Sync + 'static {
         session_id: &str,
         notify: SessionNotify,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-}
-
-/// 空实现的 SessionNotifier，用于测试或不需要推送的场景
-#[derive(Debug, Clone, Default)]
-pub struct NoOpSessionNotifier;
-
-#[async_trait]
-impl SessionNotifier for NoOpSessionNotifier {
-    async fn notify_prompt_start(
-        &self,
-        _project_id: &str,
-        _session_id: &str,
-        _request_id: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    async fn notify_prompt_end(
-        &self,
-        _project_id: &str,
-        _session_id: &str,
-        _stop_reason: agent_client_protocol::StopReason,
-        _error_message: Option<String>,
-        _request_id: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    async fn notify_prompt_error(
-        &self,
-        _project_id: &str,
-        _session_id: &str,
-        _error: agent_client_protocol::Error,
-        _request_id: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    async fn notify_session_update(
-        &self,
-        _project_id: &str,
-        _session_id: &str,
-        _session_update: agent_client_protocol::SessionUpdate,
-        _request_id: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    async fn notify(
-        &self,
-        _project_id: &str,
-        _session_id: &str,
-        _notify: SessionNotify,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
 }

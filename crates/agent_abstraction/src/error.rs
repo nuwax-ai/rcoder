@@ -5,9 +5,6 @@ use thiserror::Error;
 /// Agent 抽象层错误
 #[derive(Error, Debug)]
 pub enum AgentAbstractionError {
-    #[error("生命周期管理错误: {0}")]
-    Lifecycle(#[from] crate::lifecycle::AgentLifecycleError),
-
     #[error("连接错误: {0}")]
     Connection(String),
 
@@ -16,9 +13,6 @@ pub enum AgentAbstractionError {
 
     #[error("进程错误: {0}")]
     Process(String),
-
-    #[error("MCP 服务器错误: {0}")]
-    McpServer(String),
 
     #[error("其他错误: {0}")]
     Other(String),

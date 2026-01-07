@@ -1,11 +1,6 @@
 //! Agent trait definition.
 
-use crate::AgentConnection;
-use crate::AgentStatus;
-use crate::error::AgentAbstractionError;
-use agent_client_protocol::{McpServer, SessionId};
-use agent_config::AgentConfig;
-use async_trait::async_trait;
+use agent_client_protocol::McpServer;
 
 /// Agent 启动配置
 ///
@@ -321,51 +316,4 @@ impl From<shared_types::ChatPrompt> for PromptMessage {
             agent_config_override: chat_prompt.agent_config_override,
         }
     }
-}
-
-/// Process launch information
-#[derive(Debug, Clone)]
-pub struct ProcessLaunchInfo {
-    /// Agent ID
-    pub id: String,
-    /// Agent name
-    pub name: String,
-    /// Command to execute
-    pub command: String,
-    /// Command arguments
-    pub args: Vec<String>,
-    /// Working directory
-    pub working_dir: std::path::PathBuf,
-    /// Environment variables
-    pub env: std::collections::HashMap<String, String>,
-    /// Agent configuration
-    pub config: agent_config::AgentConfig,
-}
-
-/// Agent trait for abstracting different agent types
-#[async_trait(?Send)]
-pub trait Agent: Send + Sync {
-    /// Get the agent ID
-    fn id(&self) -> &str;
-
-    /// Get the agent name
-    fn name(&self) -> &str;
-
-    /// Get the agent configuration
-    ///
-    /// Returns the current agent configuration if available.
-    /// This is useful for introspection and debugging.
-    fn config(&self) -> Option<&AgentConfig>;
-
-    /// Start the agent with a prompt
-    async fn start(&self, prompt: PromptMessage) -> Result<AgentConnection, AgentAbstractionError>;
-
-    /// Stop the agent by session ID
-    async fn stop(&self, session_id: &SessionId) -> Result<(), AgentAbstractionError>;
-
-    /// Get agent status by session ID
-    async fn get_status(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<AgentStatus, AgentAbstractionError>;
 }

@@ -8,7 +8,7 @@ use crate::{
 };
 // 导出 agent_worker 相关类型和函数
 pub use acp_agent::{LocalSetAgentRequest, agent_worker, agent_worker_with_heartbeat};
-use agent_abstraction::compat::AgentStopHandleArc;
+use agent_abstraction::launcher::AgentStopHandleArc;
 use agent_client_protocol::{Client, PermissionOptionKind, PromptRequest, SessionId};
 use dashmap::DashMap;
 use std::sync::LazyLock;
