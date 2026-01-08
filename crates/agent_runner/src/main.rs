@@ -408,64 +408,6 @@ async fn monitor_worker_health(
                         }
                     }
                 }
-
-                // 🆕 检查请求超时（使用性能优化的统计方法）
-                let summary = worker_manager.get_active_requests_summary();
-                let has_any_requests = summary.count > 0;
-
-                // 📍 打印活跃请求统计
-                if has_any_requests {
-                    info!(
-                        "🔍 [WorkerMonitor] 活跃请求数: {}, 最大持续: {}秒",
-                        summary.count, summary.max_duration_secs
-                    );
-                }
-
-                // 分级警告统计
-                if summary.timeout_count_120 > 0 {
-                    error!(
-                        "⚠️ [WorkerMonitor] {} 个请求超时 (>120秒), 可能需要关注",
-                        summary.timeout_count_120
-                    );
-                }
-                if summary.timeout_count_60 > 0 {
-                    warn!(
-                        "🟡 [WorkerMonitor] {} 个请求较慢 (>60秒), 继续监控",
-                        summary.timeout_count_60
-                    );
-                }
-
-                // 🆕 只有在所有请求都严重超时 (> 180秒) 时才重启 Worker
-                // 这样避免因为一个慢请求就中断其他正常请求
-                if summary.max_duration_secs > 180 && has_any_requests {
-                    warn!(
-                        "🔴 [WorkerMonitor] 所有请求严重超时 (最大{}秒)，触发 Worker 重启",
-                        summary.max_duration_secs
-                    );
-                    match restart_worker(worker_manager.clone()).await {
-                        Ok((new_hb_rx, new_ready_rx)) => {
-                            heartbeat_rx = new_hb_rx;
-                            worker_manager.clear_active_requests();
-                            if let Ok(Ok(_ready)) =
-                                timeout(Duration::from_secs(30), new_ready_rx).await
-                            {
-                                worker_manager
-                                    .update_state(agent_worker_manager::WorkerState::Running);
-                                info!(
-                                    "✅ [WorkerMonitor] 因请求严重超时重启后 Worker 就绪"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!("❌ [WorkerMonitor] 因请求超时重启失败: {}", e);
-                        }
-                    }
-                } else if summary.timeout_count_120 > 0 || summary.timeout_count_60 > 0 {
-                    debug!(
-                        "⏰ [WorkerMonitor] 有请求超时但未达重启阈值, 当前活跃: {} (60s+: {}, 120s+: {})",
-                        summary.count, summary.timeout_count_60, summary.timeout_count_120
-                    );
-                }
             }
         }
     }
