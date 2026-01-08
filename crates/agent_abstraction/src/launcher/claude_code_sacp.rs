@@ -165,7 +165,10 @@ pub fn get_default_sacp_agent_config(
             );
         }
         if !provider.default_model.is_empty() {
-            env.insert(ENV_ANTHROPIC_MODEL.to_string(), provider.default_model.clone());
+            env.insert(
+                ENV_ANTHROPIC_MODEL.to_string(),
+                provider.default_model.clone(),
+            );
         }
     }
 
@@ -206,7 +209,9 @@ fn get_dbus_session_address() -> Option<String> {
 }
 
 /// 将配置中的 Context 服务器转换为 SACP 协议的 McpServer
-pub fn convert_context_servers_sacp(configs: &HashMap<String, ContextServerConfig>) -> Vec<McpServer> {
+pub fn convert_context_servers_sacp(
+    configs: &HashMap<String, ContextServerConfig>,
+) -> Vec<McpServer> {
     let dbus_address = get_dbus_session_address();
 
     configs
@@ -355,10 +360,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 创建 CancellationToken
         let cancel_token = CancellationToken::new();
 
-        info!(
-            "[SACP] 项目工作目录: {}",
-            &project_path.to_string_lossy()
-        );
+        info!("[SACP] 项目工作目录: {}", &project_path.to_string_lossy());
 
         // 准备 MCP 服务器
         let mcp_servers = if start_config.has_mcp_servers() {
@@ -653,6 +655,25 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                 .and_then(|meta| meta.get("request_id"))
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
+
+                            // 🎯 关键修复：通知状态管理器 Agent 开始处理 prompt
+                            // 此时状态从 Pending -> Active，确保状态与 agent 实际执行同步
+                            let session_id_str = session_id.to_string();
+                            if let Err(e) = notifier_for_prompt
+                                .notify_prompt_start(
+                                    &project_id_for_prompt,
+                                    &session_id_str,
+                                    request_id.clone(),
+                                )
+                                .await
+                            {
+                                error!("[SACP] 发送 PromptStart 通知失败: {:?}", e);
+                            } else {
+                                info!(
+                                    "[SACP] PromptStart 通知已发送: session_id={}, request_id={:?}",
+                                    session_id_str, request_id
+                                );
+                            }
 
                             // 创建 Prompt 响应的 Future，使用 pin! 来固定它
                             let prompt_future = cx.send_request(prompt_request).block_task();
@@ -960,7 +981,11 @@ mod tests {
                 source: "local".to_string(),
                 enabled: true,
                 command: Some("node".to_string()),
-                args: Some(vec!["server.js".to_string(), "--port".to_string(), "3000".to_string()]),
+                args: Some(vec![
+                    "server.js".to_string(),
+                    "--port".to_string(),
+                    "3000".to_string(),
+                ]),
                 env: Some({
                     let mut env = HashMap::new();
                     env.insert("NODE_ENV".to_string(), "production".to_string());

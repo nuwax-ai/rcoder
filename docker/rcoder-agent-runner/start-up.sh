@@ -1072,7 +1072,7 @@ function restart_mcp_proxy() {
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
         PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
-        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" \
+        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" --log-dir /app/logs --diagnostic \
         > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
 
     local MCP_PID=$!

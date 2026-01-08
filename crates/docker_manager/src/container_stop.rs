@@ -42,7 +42,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 /// 启动清理超时时间（秒）
-/// 
+///
 /// 启动时使用较短的超时时间，快速清理遗留容器
 const STARTUP_CLEANUP_TIMEOUT_SECONDS: u64 = 5;
 
@@ -102,7 +102,7 @@ pub async fn startup_cleanup_containers(
 
     // 查找匹配模式的容器
     let matched_containers = docker_manager.list_containers_with_pattern(pattern).await?;
-    
+
     let total_found = matched_containers.len();
     info!("🔍 [STARTUP_CLEANUP] 找到 {} 个匹配的容器", total_found);
 
@@ -137,13 +137,14 @@ pub async fn startup_cleanup_containers(
             let docker_manager_clone = Arc::clone(docker_manager);
             let container_id_clone = container_id.clone();
             let task = tokio::spawn(async move {
-                let result = stop_container_startup_mode(&docker_manager_clone, &container_id_clone).await;
+                let result =
+                    stop_container_startup_mode(&docker_manager_clone, &container_id_clone).await;
                 (container_id_clone, container_name, result)
             });
             tasks.push(task);
         }
     }
-    
+
     // 等待所有任务完成
     for task in tasks {
         if let Ok((container_id, container_name, result)) = task.await {
@@ -151,21 +152,27 @@ pub async fn startup_cleanup_containers(
                 Ok(_) => {
                     successfully_removed += 1;
                     removed_container_ids.push(container_id.clone());
-                    info!("✅ [STARTUP_CLEANUP] 容器清理成功: container_id={}, name={}", 
-                          container_id, container_name);
+                    info!(
+                        "✅ [STARTUP_CLEANUP] 容器清理成功: container_id={}, name={}",
+                        container_id, container_name
+                    );
                 }
                 Err(e) => {
                     // 检查是否为409冲突错误
                     if is_409_conflict_error(&e) {
-                        info!("🔄 [STARTUP_CLEANUP] 容器已在删除中，跳过: container_id={}, name={}", 
-                              container_id, container_name);
+                        info!(
+                            "🔄 [STARTUP_CLEANUP] 容器已在删除中，跳过: container_id={}, name={}",
+                            container_id, container_name
+                        );
                         // 409错误不计入失败统计
                         successfully_removed += 1;
                         removed_container_ids.push(container_id);
                     } else {
                         failed_removals += 1;
-                        warn!("⚠️ [STARTUP_CLEANUP] 容器清理失败: container_id={}, name={}, error={}", 
-                              container_id, container_name, e);
+                        warn!(
+                            "⚠️ [STARTUP_CLEANUP] 容器清理失败: container_id={}, name={}, error={}",
+                            container_id, container_name, e
+                        );
                         failed_removals_details.push(ContainerRemovalFailure {
                             container_id,
                             container_name,
@@ -178,7 +185,7 @@ pub async fn startup_cleanup_containers(
     }
 
     let duration_ms = start_time.elapsed().as_millis() as u64;
-    
+
     info!(
         "🎯 [STARTUP_CLEANUP] 清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
         total_found, successfully_removed, failed_removals, duration_ms
@@ -237,6 +244,36 @@ fn is_409_conflict_error(error: &DockerError) -> bool {
     error_str.contains("409") && error_str.contains("already in progress")
 }
 
+/// 检查容器是否存在
+///
+/// 通过调用 Docker inspect API 实时检查容器是否存在。
+/// 支持通过容器名称或容器 ID 查询。
+/// 用于在清理失败时判断是否需要重试。
+///
+/// # Arguments
+///
+/// * `docker_manager` - Docker管理器实例
+/// * `container_identifier` - 容器名称或容器 ID
+///
+/// # Returns
+///
+/// 如果容器存在返回 `true`，否则返回 `false`
+async fn check_container_exists(
+    docker_manager: &Arc<DockerManager>,
+    container_identifier: &str,
+) -> bool {
+    // 🎯 使用 find_container_realtime 直接查询 Docker API
+    // 这是最可靠的方式，绕过内存缓存，直接检查容器是否真的存在
+    match docker_manager
+        .find_container_realtime(container_identifier)
+        .await
+    {
+        Ok(Some(_)) => true, // 容器存在
+        Ok(None) => false,   // 容器不存在
+        Err(_) => false,     // 查询失败，假设容器不存在
+    }
+}
+
 /// 运行时容器清理策略（单个容器）
 ///
 /// 用于运行时快速清理单个容器。此函数会：
@@ -274,16 +311,33 @@ pub async fn runtime_cleanup_container(
     docker_manager: &Arc<DockerManager>,
     container_id: &str,
 ) -> DockerResult<()> {
-    info!("🔥 [RUNTIME_CLEANUP] 开始停止容器: container_id={}", container_id);
+    info!(
+        "🔥 [RUNTIME_CLEANUP] 开始停止容器: container_id={}",
+        container_id
+    );
 
     match stop_container_runtime_mode(docker_manager, container_id).await {
         Ok(_) => {
-            info!("✅ [RUNTIME_CLEANUP] 容器停止成功: container_id={}", container_id);
+            info!(
+                "✅ [RUNTIME_CLEANUP] 容器停止成功: container_id={}",
+                container_id
+            );
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ [RUNTIME_CLEANUP] 容器停止失败: container_id={}, error={}", 
-                  container_id, e);
+            // 🆕 优化：停止失败时主动检查容器是否存在
+            // 如果容器不存在（已被外部删除），视为清理成功并清理内部状态
+            if !check_container_exists(docker_manager, container_id).await {
+                info!(
+                    "✅ [RUNTIME_CLEANUP] 容器已不存在，视为清理成功: container_id={}",
+                    container_id
+                );
+                return Ok(());
+            }
+            warn!(
+                "⚠️ [RUNTIME_CLEANUP] 容器停止失败: container_id={}, error={}",
+                container_id, e
+            );
             Err(e)
         }
     }
@@ -328,7 +382,10 @@ pub async fn runtime_cleanup_containers(
     docker_manager: &Arc<DockerManager>,
     container_ids: Vec<String>,
 ) -> DockerResult<CleanupResult> {
-    info!("🔥 [RUNTIME_CLEANUP] 开始批量清理容器: 数量={}", container_ids.len());
+    info!(
+        "🔥 [RUNTIME_CLEANUP] 开始批量清理容器: 数量={}",
+        container_ids.len()
+    );
     let start_time = Instant::now();
 
     let total_found = container_ids.len();
@@ -343,12 +400,13 @@ pub async fn runtime_cleanup_containers(
         let docker_manager_clone = Arc::clone(docker_manager);
         let container_id_clone = container_id.clone();
         let task = tokio::spawn(async move {
-            let result = stop_container_runtime_mode(&docker_manager_clone, &container_id_clone).await;
+            let result =
+                stop_container_runtime_mode(&docker_manager_clone, &container_id_clone).await;
             (container_id_clone, result)
         });
         tasks.push(task);
     }
-    
+
     // 等待所有任务完成
     for task in tasks {
         if let Ok((container_id, result)) = task.await {
@@ -356,12 +414,20 @@ pub async fn runtime_cleanup_containers(
                 Ok(_) => {
                     successfully_removed += 1;
                     removed_container_ids.push(container_id.clone());
-                    info!("✅ [RUNTIME_CLEANUP] 容器清理成功: container_id={}", container_id);
+                    info!(
+                        "✅ [RUNTIME_CLEANUP] 容器清理成功: container_id={}",
+                        container_id
+                    );
                 }
                 Err(e) => {
+                    // 清理失败，记录错误
+                    // 注意：如果需要处理容器不存在的情况，应使用 runtime_cleanup_container（单个容器版本）
+                    // 它会自动检查容器是否存在并做相应处理
                     failed_removals += 1;
-                    warn!("⚠️ [RUNTIME_CLEANUP] 容器清理失败: container_id={}, error={}", 
-                          container_id, e);
+                    warn!(
+                        "⚠️ [RUNTIME_CLEANUP] 容器清理失败: container_id={}, error={}",
+                        container_id, e
+                    );
                     failed_removals_details.push(ContainerRemovalFailure {
                         container_id: container_id.clone(),
                         container_name: container_id.clone(), // 批量清理时可能不知道名称
@@ -373,7 +439,7 @@ pub async fn runtime_cleanup_containers(
     }
 
     let duration_ms = start_time.elapsed().as_millis() as u64;
-    
+
     info!(
         "🎯 [RUNTIME_CLEANUP] 批量清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
         total_found, successfully_removed, failed_removals, duration_ms
@@ -446,9 +512,7 @@ pub fn get_container_patterns_for_enabled_services(
         .filter_map(|service_name| {
             // 使用 parse() 并处理错误
             match service_name.parse::<shared_types::ServiceType>() {
-                Ok(service_type) => {
-                    Some(format!("{}-*", service_type.container_prefix()))
-                }
+                Ok(service_type) => Some(format!("{}-*", service_type.container_prefix())),
                 Err(e) => {
                     tracing::warn!(
                         "解析服务类型失败: {} - {:?}，跳过生成容器模式",
@@ -535,8 +599,12 @@ pub async fn startup_cleanup_all_enabled_services(
                 aggregated_result.successfully_removed += result.successfully_removed;
                 aggregated_result.failed_removals += result.failed_removals;
                 aggregated_result.skipped_running += result.skipped_running;
-                aggregated_result.removed_container_ids.extend(result.removed_container_ids);
-                aggregated_result.failed_removals_details.extend(result.failed_removals_details);
+                aggregated_result
+                    .removed_container_ids
+                    .extend(result.removed_container_ids);
+                aggregated_result
+                    .failed_removals_details
+                    .extend(result.failed_removals_details);
             }
             Ok(Err(e)) => {
                 warn!("清理服务容器失败: {}", e);

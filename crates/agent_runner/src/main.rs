@@ -31,8 +31,7 @@ use router::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
-    let telemetry_config = TelemetryConfig::from_env("agent_runner")
-        .with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
+    let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
 

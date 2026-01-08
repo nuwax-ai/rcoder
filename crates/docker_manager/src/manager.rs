@@ -413,92 +413,115 @@ impl DockerManager {
     }
 
     /// 通过多种方式查找容器：project_id 或容器名称
+    ///
+    /// 🆕 优化：内部使用 `find_container_realtime` 确认容器真的存在
+    /// 如果内存缓存中的容器已被外部删除，会自动清理缓存并返回 None
     pub async fn find_container_by_identifier(
         &self,
         identifier: &str,
     ) -> Option<DockerContainerInfo> {
-        // 1. 首先尝试通过 project_id 查找
+        // 1. 首先尝试通过 project_id 查找内存缓存
         if let Some(info) = self.containers.get(identifier).await {
-            return Some(info);
-        }
-
-        // 2. 如果没找到，尝试通过容器名称查找
-        for info in self.containers.list().await {
-            if info.container_name == identifier {
-                return Some(info);
+            // 🎯 使用 find_container_realtime 验证容器是否真的存在
+            match self.find_container_realtime(&info.container_id).await {
+                Ok(Some((_, _, status, _))) => {
+                    // 容器存在，更新状态后返回
+                    let mut updated_info = info;
+                    updated_info.status = status;
+                    return Some(updated_info);
+                }
+                Ok(None) => {
+                    // 容器不存在，清理内存缓存
+                    info!(
+                        "🧹 [FIND] 容器已被外部删除，清理缓存: identifier={}, container_id={}",
+                        identifier, info.container_id
+                    );
+                    self.containers.remove(identifier).await;
+                    return None;
+                }
+                Err(e) => {
+                    // 查询出错，保守起见返回缓存数据
+                    warn!(
+                        "⚠️ [FIND] 验证容器存在性失败，使用缓存数据: identifier={}, error={}",
+                        identifier, e
+                    );
+                    return Some(info);
+                }
             }
         }
 
-        // 3. 如果还没找到，尝试通过 Docker API 直接查找容器（适用于容器存在但映射缺失的情况）
-        let options = Some(ListContainersOptions {
-            all: true,
-            ..Default::default()
-        });
-
-        if let Ok(containers) = self.docker.list_containers(options).await {
-            for container in containers {
-                if let Some(names) = container.names {
-                    for name in names {
-                        // Docker 容器名称通常以 '/' 开头，需要去掉
-                        let clean_name = name.trim_start_matches('/');
-                        if clean_name == identifier {
-                            let container_id = container.id.clone().unwrap_or_default();
-                            info!(
-                                "通过 Docker API 找到容器: {} (ID: {})",
-                                identifier, container_id
-                            );
-
-                            // 🛡️ 尝试从容器信息中获取真实的创建时间
-                            let created_at = if let Some(created_timestamp) = container.created {
-                                // Docker API 返回的时间戳通常是 i64 类型
-                                DateTime::from_timestamp(
-                                    created_timestamp / 1000,
-                                    (created_timestamp % 1000) as u32 * 1_000_000,
-                                )
-                                .unwrap_or_else(|| {
-                                    warn!(
-                                        "无法解析容器创建时间，使用当前时间: timestamp={}",
-                                        created_timestamp
-                                    );
-                                    Utc::now()
-                                })
-                            } else {
-                                warn!(
-                                    "容器缺少创建时间信息，使用当前时间作为备用: container_id={}",
-                                    container_id
-                                );
-                                Utc::now()
-                            };
-
-                            // 创建一个临时的容器信息，用于销毁
-                            return Some(DockerContainerInfo {
-                                container_id,
-                                container_name: clean_name.to_string(),
-                                project_id: "unknown".to_string(), // 我们无法直接知道 project_id
-                                user_id: None,
-                                service_type: None,
-                                image: container.image.unwrap_or_default(),
-                                status: ContainerStatus::Unknown(
-                                    "found_via_docker_api".to_string(),
-                                ),
-                                created_at,
-                                started_at: None,
-                                host_path: String::new(),
-                                container_path: String::new(),
-                                port_bindings: std::collections::HashMap::new(),
-                                assigned_port: 0,
-                                health_status: None,
-                                service_health: None,
-                                internal_port: 0,
-                                network_name: "unknown".to_string(), // 临时容器信息，网络名称未知
-                            });
-                        }
+        // 2. 如果没找到，尝试通过容器名称查找内存缓存
+        for info in self.containers.list().await {
+            if info.container_name == identifier {
+                // 🎯 同样验证容器是否真的存在
+                match self.find_container_realtime(&info.container_id).await {
+                    Ok(Some((_, _, status, _))) => {
+                        let mut updated_info = info;
+                        updated_info.status = status;
+                        return Some(updated_info);
+                    }
+                    Ok(None) => {
+                        info!(
+                            "🧹 [FIND] 容器已被外部删除，清理缓存: container_name={}",
+                            identifier
+                        );
+                        self.containers.remove(&info.project_id).await;
+                        return None;
+                    }
+                    Err(_) => {
+                        return Some(info);
                     }
                 }
             }
         }
 
-        None
+        // 3. 内存缓存都没找到，直接用 find_container_realtime 查询 Docker
+        // 如果找到，构建临时的容器信息
+        match self.find_container_realtime(identifier).await {
+            Ok(Some((container_id, container_name, status, _))) => {
+                info!(
+                    "🔍 [FIND] 通过 Docker API 实时查询找到容器: identifier={}, container_id={}",
+                    identifier, container_id
+                );
+
+                // 获取更详细的创建时间（通过 inspect）
+                let created_at = match self
+                    .docker
+                    .inspect_container(&container_id, None::<InspectContainerOptions>)
+                    .await
+                {
+                    Ok(details) => details
+                        .created
+                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(Utc::now),
+                    Err(_) => Utc::now(),
+                };
+
+                // 创建一个临时的容器信息
+                Some(DockerContainerInfo {
+                    container_id,
+                    container_name,
+                    project_id: "unknown".to_string(), // 无法直接知道 project_id
+                    user_id: None,
+                    service_type: None,
+                    image: String::new(),
+                    status,
+                    created_at,
+                    started_at: None,
+                    host_path: String::new(),
+                    container_path: String::new(),
+                    port_bindings: std::collections::HashMap::new(),
+                    assigned_port: 0,
+                    health_status: None,
+                    service_health: None,
+                    internal_port: 0,
+                    network_name: "unknown".to_string(),
+                })
+            }
+            Ok(None) => None,
+            Err(_) => None,
+        }
     }
 
     /// 获取所有容器信息

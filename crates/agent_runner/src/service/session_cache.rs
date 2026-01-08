@@ -2,12 +2,12 @@
 //!
 //! 使用LazyLock初始化全局DashMap，按session_id分组缓存统一会话消息到ringbuf循环缓冲区
 
-use shared_types::{SessionMessageType, SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use shared_types::{SessionMessageType, SessionNotify, UnifiedSessionMessage};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -111,7 +111,9 @@ impl SessionData {
         // 🎯 无锁优化：使用 ArcSwap 原子替换，无需 await
         {
             // 原子替换取消令牌，获取旧值并取消
-            let old_cancel = self.current_cancel.swap(Arc::new(Some(cancellation_token.clone())));
+            let old_cancel = self
+                .current_cancel
+                .swap(Arc::new(Some(cancellation_token.clone())));
             if let Some(token) = (*old_cancel).clone() {
                 info!("🔌 [create_new_connection] 取消旧连接的 CancellationToken");
                 token.cancel();
@@ -216,10 +218,8 @@ impl SessionWorker {
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
                 SessionCommand::Push { message } => {
-                    let should_buffer = !matches!(
-                        message.message_type,
-                        SessionMessageType::Heartbeat
-                    );
+                    let should_buffer =
+                        !matches!(message.message_type, SessionMessageType::Heartbeat);
 
                     if should_buffer {
                         if producer.is_full() {
