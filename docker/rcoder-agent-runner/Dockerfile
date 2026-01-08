@@ -18,11 +18,15 @@ WORKDIR /home/user
 # 📦 复制业务代码和配置文件
 # ============================================================================
 
+# 使用构建参数破坏缓存（每次构建都获取最新版本的工具）
+ARG CACHEBUST=1
+
 # 安装 mcp-stdio-proxy（频繁更新的工具，放在最终镜像以加快构建）
-RUN . /opt/cargo/env && cargo install mcp-stdio-proxy
+# 使用 CACHEBUST 变量触发缓存失效
+RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-stdio-proxy
 
 # 安装 claude-code-acp-rs CLI 工具
-RUN . /opt/cargo/env && cargo install claude-code-acp-rs
+RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs
 
 
 # 复制预构建的 agent_runner 二进制文件

@@ -129,7 +129,7 @@ docker-build-agent-runner:
 	@docker rmi rcoder-agent-runner-build
 	@echo "📦 步骤3: 构建最终的 agent-runner 镜像（基于基础镜像，快速）..."
 	@cd docker/rcoder-agent-runner && \
-		docker build -f Dockerfile -t rcoder-agent-runner:latest .
+		docker build --build-arg CACHEBUST=$$(date +%s) -f Dockerfile -t rcoder-agent-runner:latest .
 	@echo "✅ rcoder-agent-runner 镜像构建完成！"
 
 # 构建 agent-base 基础镜像（包含所有系统依赖，很少需要重新构建）
