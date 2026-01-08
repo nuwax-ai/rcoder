@@ -394,10 +394,24 @@ impl AgentSessionRegistry {
     }
 
     /// 获取统计信息
+    ///
+    /// ⚠️ 注意：此方法会调用 DashMap::len()，该操作会遍历所有分片。
+    /// 在高并发场景下，应立即使用返回值，避免长时间持有结果导致的潜在阻塞。
+    ///
+    /// 推荐用法：
+    /// ```rust
+    /// let count = AGENT_REGISTRY.stats().agent_count;  // 立即提取数值
+    /// // 使用 count，而不是持有整个 RegistryStats
+    /// ```
     pub fn stats(&self) -> RegistryStats {
+        // DashMap::len() 会遍历所有分片，在高并发下可能有性能开销
+        // 但由于立即返回基本类型（usize），不会持有锁
+        let agent_count = self.agent_info_map.len();
+        let session_count = self.project_to_session.len();
+
         RegistryStats {
-            agent_count: self.agent_info_map.len(),
-            session_count: self.project_to_session.len(),
+            agent_count,
+            session_count,
         }
     }
 }

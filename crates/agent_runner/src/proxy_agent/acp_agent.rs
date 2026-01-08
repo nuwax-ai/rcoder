@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    agent_worker_manager::{Heartbeat, WorkerHandle, WorkerReady, MAX_ACTIVE_REQUESTS},
+    agent_worker_manager::{Heartbeat, WorkerHandle, WorkerReady, MAX_ACTIVE_REQUESTS, WORKER_THREAD_POOL_SIZE},
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
     service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
@@ -410,26 +410,22 @@ pub async fn agent_worker_with_heartbeat(
                 // 🔥 OpenTelemetry 追踪: 创建请求 span
                 let _otel_span = RequestSpan::new(&project_id, &request_id, "process_agent_request");
 
-                // 📍 请求追踪: 使用 RAII Guard 自动管理追踪生命周期（兼容旧监控）
-                let tracker = RequestTracker::new(
-                    handle_clone.active_requests.as_ref(),
-                    request_id.clone(),
-                    project_id.clone(),
-                );
+                // 🔥 并发控制: 检查活跃 Agent 会话数（基于 AGENT_REGISTRY）
+                let active_sessions_count = AGENT_REGISTRY.stats().agent_count;
 
-                // 🔥 DoS 防护: 检查请求是否被拒绝
-                if tracker.is_rejected() {
-                    warn!(
-                        "🛡️ [DoS防护] 请求被拒绝, project_id={}, request_id={}",
-                        project_id, request_id
+                // 🛡️ 并发限制: 会话数达到工作线程池上限时直接拒绝
+                if active_sessions_count >= WORKER_THREAD_POOL_SIZE {
+                    error!(
+                        "🛡️ [并发限制] Agent 会话数已达上限 ({}/{}), 拒绝新请求 - project_id={}, request_id={}",
+                        active_sessions_count, WORKER_THREAD_POOL_SIZE, project_id, request_id
                     );
                     if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                         project_id: project_id.clone(),
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
                         error: Some(format!(
-                            "服务器繁忙，活跃请求数已达上限 ({})，请稍后重试",
-                            MAX_ACTIVE_REQUESTS
+                            "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
+                            WORKER_THREAD_POOL_SIZE
                         )),
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
@@ -438,6 +434,12 @@ pub async fn agent_worker_with_heartbeat(
                     }
                     return; // 退出当前 LocalSet
                 }
+
+                // 📊 日志: 记录当前会话数（低于上限时）
+                debug!(
+                    "✅ [并发检查通过] 当前活跃会话数: {}/{}, project_id={}, request_id={}",
+                    active_sessions_count, WORKER_THREAD_POOL_SIZE, project_id, request_id
+                );
 
                 // 1. 预处理附件（agent_runner 特有逻辑）
                 let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
