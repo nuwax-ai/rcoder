@@ -319,6 +319,38 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     }
                 }
 
+                // 🔧 关键修复：替换自定义环境变量中的模板变量
+                // 用户可能传入 {MODEL_PROVIDER_API_KEY} 等模板，需要替换为实际值
+                if let Some(ref provider) = model_provider {
+                    for (key, value) in env.iter_mut() {
+                        // 对于 API_KEY 和 BASE_URL 使用占位符（通过代理注入）
+                        match key.as_str() {
+                            ENV_ANTHROPIC_API_KEY => {
+                                if value.contains("{MODEL_PROVIDER_API_KEY}") || value.is_empty() {
+                                    *value = API_KEY_PLACEHOLDER.to_string();
+                                }
+                            }
+                            ENV_ANTHROPIC_BASE_URL => {
+                                if value.contains("{MODEL_PROVIDER_BASE_URL}") || value.is_empty() {
+                                    *value = DEFAULT_PROXY_BASE_URL.to_string();
+                                }
+                            }
+                            _ => {
+                                // 其他变量进行模板替换
+                                *value = value
+                                    .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
+                                    .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
+                                    .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
+                                    .replace("{MODEL_PROVIDER_NAME}", &provider.name);
+                            }
+                        }
+                    }
+                    debug!(
+                        "🔧 [SACP] 已替换自定义环境变量模板, model={}",
+                        provider.default_model
+                    );
+                }
+
                 info!(
                     "🎯 [SACP] 使用自定义 Agent: agent_id={}, command={} {:?}",
                     agent_server_override.get_agent_id(),
