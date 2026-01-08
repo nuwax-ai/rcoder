@@ -157,15 +157,19 @@ impl DuckDbStorage {
     }
 
     /// 获取容器 Repository
+    ///
+    /// 注意：返回的 Repository 共享同一个 `Arc<Mutex<Connection>>`，
+    /// 确保并发访问时的线程安全。
     fn containers(&self) -> DuckDbResult<ContainerRepository> {
-        let conn = self.conn.try_clone()?;
-        Ok(ContainerRepository::new(conn))
+        Ok(ContainerRepository::new(self.conn.clone()))
     }
 
     /// 获取项目 Repository
+    ///
+    /// 注意：返回的 Repository 共享同一个 `Arc<Mutex<Connection>>`，
+    /// 确保并发访问时的线程安全。
     fn projects(&self) -> DuckDbResult<ProjectRepository> {
-        let conn = self.conn.try_clone()?;
-        Ok(ProjectRepository::new(conn))
+        Ok(ProjectRepository::new(self.conn.clone()))
     }
 
     /// 执行原始 SQL 查询（仅用于调试）
