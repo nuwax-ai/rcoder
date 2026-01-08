@@ -43,6 +43,18 @@ const VERSION: ProtocolVersion = ProtocolVersion::LATEST;
 /// API 密钥占位符（实际密钥由 Pingora 代理注入）
 const API_KEY_PLACEHOLDER: &str = "PROXY_MANAGED_KEY";
 
+/// 环境变量键名常量
+const ENV_ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
+const ENV_ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
+const ENV_ANTHROPIC_MODEL: &str = "ANTHROPIC_MODEL";
+const ENV_DISABLE_NONESSENTIAL: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+const ENV_RUST_LOG: &str = "RUST_LOG";
+const ENV_AGENT_WORKING_DIR: &str = "AGENT_WORKING_DIR";
+const ENV_AGENT_PROJECT_ID: &str = "AGENT_PROJECT_ID";
+
+/// 默认代理 Base URL（包含 UUID 占位符）
+const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
+
 /// Agent 配置参数 (与旧版兼容)
 #[derive(Debug, Clone)]
 pub struct SacpAgentLaunchConfig {
@@ -106,37 +118,32 @@ pub async fn load_sacp_agent_config(
         let mut resolved_env = agent_config.env.clone();
 
         if let Some(provider) = model_provider {
+            // 合并为一次遍历：替换模板变量 + 设置占位符
             for (key, value) in resolved_env.iter_mut() {
-                if key == "ANTHROPIC_API_KEY" || key == "ANTHROPIC_BASE_URL" {
-                    continue;
-                }
-
-                *value = value
-                    .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
-                    .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
-                    .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
-                    .replace("{MODEL_PROVIDER_NAME}", &provider.name);
-            }
-
-            // 设置占位符值
-            for (key, value) in resolved_env.iter_mut() {
-                if key == "ANTHROPIC_API_KEY" {
-                    if value.contains("{MODEL_PROVIDER_API_KEY}") || value.is_empty() {
-                        *value = API_KEY_PLACEHOLDER.to_string();
+                match key.as_str() {
+                    ENV_ANTHROPIC_API_KEY => {
+                        if value.contains("{MODEL_PROVIDER_API_KEY}") || value.is_empty() {
+                            *value = API_KEY_PLACEHOLDER.to_string();
+                        }
                     }
-                } else if key == "ANTHROPIC_BASE_URL" {
-                    if value.contains("{MODEL_PROVIDER_BASE_URL}") || value.is_empty() {
-                        *value = "http://localhost:8088/api/{SERVICE_UUID}".to_string();
+                    ENV_ANTHROPIC_BASE_URL => {
+                        if value.contains("{MODEL_PROVIDER_BASE_URL}") || value.is_empty() {
+                            *value = DEFAULT_PROXY_BASE_URL.to_string();
+                        }
+                    }
+                    _ => {
+                        *value = value
+                            .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
+                            .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
+                            .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
+                            .replace("{MODEL_PROVIDER_NAME}", &provider.name);
                     }
                 }
             }
         }
 
         // 禁用 Claude Code 非必要网络请求
-        resolved_env.insert(
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
-            "1".to_string(),
-        );
+        resolved_env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
 
         Ok(SacpAgentLaunchConfig {
             command: agent_config.command.clone(),
@@ -160,29 +167,23 @@ pub fn get_default_sacp_agent_config(
     if let Some(provider) = model_provider {
         if !provider.api_key.is_empty() {
             env.insert(
-                "ANTHROPIC_API_KEY".to_string(),
+                ENV_ANTHROPIC_API_KEY.to_string(),
                 API_KEY_PLACEHOLDER.to_string(),
             );
         }
         if !provider.base_url.is_empty() {
             env.insert(
-                "ANTHROPIC_BASE_URL".to_string(),
-                "http://localhost:8088/api/{SERVICE_UUID}".to_string(),
+                ENV_ANTHROPIC_BASE_URL.to_string(),
+                DEFAULT_PROXY_BASE_URL.to_string(),
             );
         }
         if !provider.default_model.is_empty() {
-            env.insert(
-                "ANTHROPIC_MODEL".to_string(),
-                provider.default_model.clone(),
-            );
+            env.insert(ENV_ANTHROPIC_MODEL.to_string(), provider.default_model.clone());
         }
     }
 
-    env.insert("RUST_LOG".to_string(), "info".to_string());
-    env.insert(
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
-        "1".to_string(),
-    );
+    env.insert(ENV_RUST_LOG.to_string(), "info".to_string());
+    env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
 
     Ok(SacpAgentLaunchConfig {
         command: "claude-code-acp".to_string(),
@@ -192,27 +193,34 @@ pub fn get_default_sacp_agent_config(
     })
 }
 
-/// 将配置中的 Context 服务器转换为 SACP 协议的 McpServer
-pub fn convert_context_servers_sacp(configs: &HashMap<String, ContextServerConfig>) -> Vec<McpServer> {
-    // 读取 D-Bus 会话地址
-    let dbus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().or_else(|| {
+/// 从文件内容中解析 D-Bus 会话地址
+fn parse_dbus_address_from_content(content: &str) -> Option<String> {
+    content
+        .lines()
+        .find(|line| line.starts_with("DBUS_SESSION_BUS_ADDRESS="))
+        .and_then(|line| line.split_once('='))
+        .map(|(_, val)| {
+            val.trim()
+                .trim_end_matches(';')
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_string()
+        })
+}
+
+/// 获取 D-Bus 会话地址
+/// 优先从环境变量读取，否则从文件读取
+fn get_dbus_session_address() -> Option<String> {
+    std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().or_else(|| {
         std::fs::read_to_string("/tmp/dbus-session-env")
             .ok()
-            .and_then(|content| {
-                content
-                    .lines()
-                    .find(|line| line.starts_with("DBUS_SESSION_BUS_ADDRESS="))
-                    .and_then(|line| {
-                        line.split_once('=').map(|(_, val)| {
-                            val.trim()
-                                .trim_end_matches(';')
-                                .trim_matches('\'')
-                                .trim_matches('"')
-                                .to_string()
-                        })
-                    })
-            })
-    });
+            .and_then(|content| parse_dbus_address_from_content(&content))
+    })
+}
+
+/// 将配置中的 Context 服务器转换为 SACP 协议的 McpServer
+pub fn convert_context_servers_sacp(configs: &HashMap<String, ContextServerConfig>) -> Vec<McpServer> {
+    let dbus_address = get_dbus_session_address();
 
     configs
         .iter()
@@ -319,10 +327,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 准备环境变量
         let mut merged_envs = agent_config.env.clone();
         merged_envs.insert(
-            "AGENT_WORKING_DIR".to_string(),
+            ENV_AGENT_WORKING_DIR.to_string(),
             project_path.to_string_lossy().to_string(),
         );
-        merged_envs.insert("AGENT_PROJECT_ID".to_string(), project_id.clone());
+        merged_envs.insert(ENV_AGENT_PROJECT_ID.to_string(), project_id.clone());
 
         // 替换 UUID 占位符
         if let Some(ref uuid) = service_uuid {
@@ -347,18 +355,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         info!("[SACP] Claude Code ACP 子进程已启动，PID: {}", child_pid);
 
         // 获取 stdio 句柄
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("[SACP] 无法获取子进程 stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("[SACP] 无法获取子进程 stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("[SACP] 无法获取子进程 stderr"))?;
+        let stdin = take_stdio(&mut child.stdin, "stdin")?;
+        let stdout = take_stdio(&mut child.stdout, "stdout")?;
+        let stderr = take_stdio(&mut child.stderr, "stderr")?;
 
         // 创建 SACP transport
         let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());
@@ -371,19 +370,18 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // 🔥 使用标准 tokio::spawn（无需 LocalSet！）
         tokio::spawn(async move {
-            let result = run_sacp_connection(
-                transport,
-                project_path_clone,
-                project_id_clone,
+            let params = SacpConnectionParams {
+                project_path: project_path_clone,
+                project_id: project_id_clone,
                 mcp_servers,
                 start_config,
                 session_id_tx,
                 prompt_rx,
                 cancel_rx,
-                cancel_token_clone,
-                notifier_clone,
-            )
-            .await;
+                cancel_token: cancel_token_clone,
+                notifier: notifier_clone,
+            };
+            let result = run_sacp_connection(transport, params).await;
 
             if let Err(e) = result {
                 error!("[SACP] Claude Code ACP Agent 连接失败: {}", e);
@@ -404,26 +402,29 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 创建 stderr 任务
         let cancel_token_for_stderr = cancel_token.clone();
         let stderr_task = tokio::spawn(async move {
-            use tokio::io::AsyncBufReadExt;
-            let mut stderr_reader = tokio::io::BufReader::new(stderr);
-            let mut stderr_buffer = String::new();
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
 
             loop {
-                if cancel_token_for_stderr.is_cancelled() {
-                    break;
-                }
+                tokio::select! {
+                    biased; // 优先检查取消信号
 
-                match stderr_reader.read_line(&mut stderr_buffer).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if !stderr_buffer.trim().is_empty() {
-                            warn!("[SACP] Claude Code Agent stderr: {}", stderr_buffer.trim());
-                        }
-                        stderr_buffer.clear();
-                    }
-                    Err(e) => {
-                        error!("[SACP] 读取 stderr 失败: {}", e);
+                    _ = cancel_token_for_stderr.cancelled() => {
+                        debug!("[SACP] stderr 读取任务收到取消信号");
                         break;
+                    }
+                    result = lines.next_line() => {
+                        match result {
+                            Ok(Some(line)) if !line.trim().is_empty() => {
+                                warn!("[SACP] Claude Code Agent stderr: {}", line.trim());
+                            }
+                            Ok(Some(_)) => {} // 空行，忽略
+                            Ok(None) => break, // EOF
+                            Err(e) => {
+                                error!("[SACP] 读取 stderr 失败: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -447,6 +448,25 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
     }
 }
 
+/// 从 Option 中取出 stdio 句柄，失败时返回错误
+fn take_stdio<T>(opt: &mut Option<T>, name: &str) -> Result<T> {
+    opt.take()
+        .ok_or_else(|| anyhow::anyhow!("[SACP] 无法获取子进程 {}", name))
+}
+
+/// SACP 连接参数（封装 run_sacp_connection 的参数）
+struct SacpConnectionParams<N: SessionNotifier> {
+    project_path: PathBuf,
+    project_id: String,
+    mcp_servers: Vec<McpServer>,
+    start_config: AgentStartConfig,
+    session_id_tx: tokio::sync::oneshot::Sender<SessionId>,
+    prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
+    cancel_rx: mpsc::UnboundedReceiver<CancelNotificationRequestWrapper>,
+    cancel_token: CancellationToken,
+    notifier: Arc<N>,
+}
+
 /// 运行 SACP 连接
 ///
 /// 使用 SACP 的 Builder 模式建立连接并处理消息
@@ -455,16 +475,21 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
         tokio_util::compat::Compat<tokio::process::ChildStdin>,
         tokio_util::compat::Compat<tokio::process::ChildStdout>,
     >,
-    project_path: PathBuf,
-    project_id: String,
-    mcp_servers: Vec<McpServer>,
-    start_config: AgentStartConfig,
-    session_id_tx: tokio::sync::oneshot::Sender<SessionId>,
-    mut prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
-    mut cancel_rx: mpsc::UnboundedReceiver<CancelNotificationRequestWrapper>,
-    cancel_token: CancellationToken,
-    notifier: Arc<N>,
+    params: SacpConnectionParams<N>,
 ) -> Result<()> {
+    // 解构参数
+    let SacpConnectionParams {
+        project_path,
+        project_id,
+        mcp_servers,
+        start_config,
+        session_id_tx,
+        mut prompt_rx,
+        mut cancel_rx,
+        cancel_token,
+        notifier,
+    } = params;
+
     // 克隆 project_id 供通知回调使用
     let project_id_for_notification = project_id.clone();
 
@@ -495,7 +520,6 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
         // 主连接逻辑
         .run_until(transport, move |cx: JrConnectionCx<ClientToAgent>| {
             let project_path = project_path.clone();
-            let _project_id = project_id.clone();
             let mcp_servers = mcp_servers.clone();
             let start_config = start_config.clone();
 
