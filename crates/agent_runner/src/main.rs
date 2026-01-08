@@ -239,42 +239,37 @@ async fn main() -> anyhow::Result<()> {
 
 /// 🔥 新增：agent_worker 线程启动函数
 ///
-/// 在独立的 OS 线程中运行单线程 tokio 运行时 + LocalSet
-/// 因为 ACP 连接不是 Send，必须在 LocalSet 中运行
+/// 🆕 改进：使用多线程运行时 + 每个请求独立的 LocalSet
+/// 支持并发处理多个 Agent 请求，避免单线程阻塞
+/// 因为 ACP 连接不是 Send，每个请求在独立的 LocalSet 中运行
 fn run_agent_worker_thread(
     receiver: tokio::sync::mpsc::UnboundedReceiver<proxy_agent::LocalSetAgentRequest>,
     handle: agent_worker_manager::WorkerHandle,
 ) -> anyhow::Result<()> {
-    info!("🚀 [agent_worker_thread] 线程启动，开始创建 LocalSet 运行时...");
+    info!("🚀 [agent_worker_thread] 线程启动，创建多线程运行时以支持并发 Agent...");
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(10)  // 使用 10 个工作线程，支持更高并发处理多个 Agent
+        .thread_name("agent-worker")
         .enable_all()
         .build()
-        .expect("Failed to build single-thread runtime for LocalSet agents");
+        .expect("Failed to build multi-thread runtime for LocalSet agents");
 
     rt.block_on(async move {
-        info!("🚀 [agent_worker_thread] 开始运行 LocalSet...");
+        info!("🚀 [agent_worker_thread] 多线程运行时已启动，准备并发处理 Agent 请求...");
 
-        let local_set = tokio::task::LocalSet::new();
-        local_set
-            .run_until(async move {
-                info!("🚀 [agent_worker_thread] LocalSet 已启动，开始监听任务...");
+        // 🆕 不再使用全局 LocalSet，改为每个请求创建独立的 LocalSet
+        // 直接调用 agent_worker_with_heartbeat，它会为每个请求 spawn 独立任务
+        match proxy_agent::agent_worker_with_heartbeat(receiver, handle).await {
+            Ok(_) => {
+                info!("✅ [agent_worker_thread] Agent worker 正常退出");
+            }
+            Err(e) => {
+                error!("❌ [agent_worker_thread] Agent worker 失败: {}", e);
+            }
+        }
 
-                // 🆕 使用带心跳的 agent_worker
-                match proxy_agent::agent_worker_with_heartbeat(receiver, handle).await {
-                    Ok(_) => {
-                        info!("✅ [agent_worker_thread] Agent worker 正常退出");
-                    }
-                    Err(e) => {
-                        error!("❌ [agent_worker_thread] Agent worker 失败: {}", e);
-                    }
-                }
-
-                warn!("⚠️ [agent_worker_thread] Agent worker stopped");
-            })
-            .await;
-
-        info!("🔚 [agent_worker_thread] LocalSet 已停止");
+        warn!("⚠️ [agent_worker_thread] Agent worker stopped");
         Ok::<(), anyhow::Error>(())
     })
 }

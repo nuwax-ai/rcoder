@@ -137,9 +137,12 @@ impl AgentCleaner {
 
                 let container_identifier = strategy.get_container_identifier(&project_info)?;
 
+                // 🔧 使用容器名称而不是 container_id 来销毁容器
+                // 容器名称更稳定，不会因为容器重启而改变
+                // Docker API 的 remove_container 既接受 ID 也接受名称
                 self.container_destroyer
                     .destroy_with_reason(
-                        &container_info.container_id,
+                        &container_info.container_name,
                         &service_type,
                         &container_identifier,
                         &reason,

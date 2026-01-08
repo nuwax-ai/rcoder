@@ -356,9 +356,9 @@ pub async fn agent_worker_with_heartbeat(
         }
     }
 
-    // 🔥 启动心跳任务（在 LocalSet 中运行）
+    // 🔥 启动心跳任务（独立 spawn，不在 LocalSet 中）
     let heartbeat_tx = handle.heartbeat_tx.clone();
-    let heartbeat_task = tokio::task::spawn_local(async move {
+    let heartbeat_task = tokio::spawn(async move {
         let mut heartbeat_interval = interval(Duration::from_secs(5));
         loop {
             heartbeat_interval.tick().await;
@@ -374,162 +374,195 @@ pub async fn agent_worker_with_heartbeat(
         }
     });
 
-    // 主处理循环
+    // 🆕 主处理循环 - 改为并发处理，每个请求在独立的 spawn_blocking 中运行
     while let Some(request) = request_rx.recv().await {
         let project_id = request.prompt_message.project_id.clone();
         let request_id = request.prompt_message.request_id.clone();
 
         info!(
-            "📨 接收到请求，project_id: {}, request_id: {}",
+            "📨 接收到请求，project_id: {}, request_id: {} - 准备并发处理",
             project_id, request_id
         );
 
-        // 🔥 OpenTelemetry 追踪: 创建请求 span
-        let _otel_span = RequestSpan::new(&project_id, &request_id, "process_agent_request");
+        // 克隆需要的变量，用于 spawn 任务
+        let worker_clone = worker.clone();
+        let handle_clone = handle.clone();
 
-        // 📍 请求追踪: 使用 RAII Guard 自动管理追踪生命周期（兼容旧监控）
-        let tracker = RequestTracker::new(
-            handle.active_requests.as_ref(),
-            request_id.clone(),
-            project_id.clone(),
-        );
+        // 🚀 使用 spawn_blocking 为每个请求创建独立的阻塞任务
+        // 因为 LocalSet 不是 Send，需要在专用的 blocking 线程中运行
+        tokio::task::spawn_blocking(move || {
+            // 在 blocking 线程中创建一个单线程运行时
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for request");
 
-        // 🔥 DoS 防护: 检查请求是否被拒绝
-        if tracker.is_rejected() {
-            warn!(
-                "🛡️ [DoS防护] 请求被拒绝, project_id={}, request_id={}",
-                project_id, request_id
-            );
-            if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
-                project_id: project_id.clone(),
-                session_id: String::new(),
-                code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
-                error: Some(format!(
-                    "服务器繁忙，活跃请求数已达上限 ({})，请稍后重试",
-                    MAX_ACTIVE_REQUESTS
-                )),
-                request_id: Some(request_id),
-                service_type: request.prompt_message.service_type.clone(),
-            }) {
-                error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
-            }
-            continue;
-        }
+            rt.block_on(async move {
+                // 创建独立的 LocalSet，用于运行 !Send 的 ACP 连接
+                let local_set = tokio::task::LocalSet::new();
 
-        // 1. 预处理附件（agent_runner 特有逻辑）
-        let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
-            match ContentBuilder::attachments_to_content_blocks(
-                &request.prompt_message.attachments,
-                &request.prompt_message.project_path,
-            )
-            .await
-            {
-                Ok(blocks) => Some(blocks),
-                Err(e) => {
-                    error!("❌ 附件处理失败: {:?}", e);
+                local_set.run_until(async move {
+                info!(
+                    "🔵 [LocalSet] 开始处理请求 project_id={}, request_id={}",
+                    project_id, request_id
+                );
+
+                // 🔥 OpenTelemetry 追踪: 创建请求 span
+                let _otel_span = RequestSpan::new(&project_id, &request_id, "process_agent_request");
+
+                // 📍 请求追踪: 使用 RAII Guard 自动管理追踪生命周期（兼容旧监控）
+                let tracker = RequestTracker::new(
+                    handle_clone.active_requests.as_ref(),
+                    request_id.clone(),
+                    project_id.clone(),
+                );
+
+                // 🔥 DoS 防护: 检查请求是否被拒绝
+                if tracker.is_rejected() {
+                    warn!(
+                        "🛡️ [DoS防护] 请求被拒绝, project_id={}, request_id={}",
+                        project_id, request_id
+                    );
                     if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                         project_id: project_id.clone(),
                         session_id: String::new(),
-                        code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                        error: Some(format!("附件处理失败: {:?}", e)),
-                        request_id: Some(request_id),
+                        code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
+                        error: Some(format!(
+                            "服务器繁忙，活跃请求数已达上限 ({})，请稍后重试",
+                            MAX_ACTIVE_REQUESTS
+                        )),
+                        request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
-                        error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                        error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
                     }
-                    continue;
+                    return; // 退出当前 LocalSet
                 }
-            }
-        } else {
-            None
-        };
 
-        // 2. 创建 WorkerRequest
-        let worker_request = WorkerRequest {
-            prompt_message: request.prompt_message.clone(),
-            model_provider: request.model_provider.clone(),
-            attachment_blocks,
-            service_uuid: request.service_uuid.clone(),
-            shared_api_key_manager: request.shared_api_key_manager.clone(),
-        };
-
-        // 3. 调用 AcpAgentWorker 处理（核心业务逻辑）
-        let worker_response = match worker.process_request(worker_request).await {
-            Ok(response) => response,
-            Err(e) => {
-                error!("❌ Worker 处理失败: {:?}", e);
-                if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
-                    project_id: project_id.clone(),
-                    session_id: String::new(),
-                    code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                    error: Some(format!("处理失败: {:?}", e)),
-                    request_id: Some(request_id.clone()),
-                    service_type: request.prompt_message.service_type.clone(),
-                }) {
-                    error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
-                }
-                continue;
-            }
-        };
-
-        // 4. 更新全局状态（使用统一的 AGENT_REGISTRY）
-        if worker_response.is_new_session {
-            if let Some(handles) = &worker_response.session_handles {
-                debug!("🆕 新会话，注册到 AGENT_REGISTRY");
-
-                let project_and_agent_info = ProjectAndAgentInfo {
-                    project_id: project_id.clone(),
-                    session_id: SessionId::new(Arc::from(worker_response.session_id.as_str())),
-                    prompt_tx: handles.prompt_tx.clone(),
-                    cancel_tx: handles.cancel_tx.clone(),
-                    model_provider: request.model_provider.clone(),
-                    request_id: Some(request_id.clone()),
-                    status: AgentStatus::Active,
-                    last_activity: Utc::now(),
-                    created_at: Utc::now(),
-                    stop_handle: handles.lifecycle_handle.clone(),
+                // 1. 预处理附件（agent_runner 特有逻辑）
+                let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
+                    match ContentBuilder::attachments_to_content_blocks(
+                        &request.prompt_message.attachments,
+                        &request.prompt_message.project_path,
+                    )
+                    .await
+                    {
+                        Ok(blocks) => Some(blocks),
+                        Err(e) => {
+                            error!("❌ 附件处理失败: {:?}", e);
+                            if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                                project_id: project_id.clone(),
+                                session_id: String::new(),
+                                code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
+                                error: Some(format!("附件处理失败: {:?}", e)),
+                                request_id: Some(request_id.clone()),
+                                service_type: request.prompt_message.service_type.clone(),
+                            }) {
+                                error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                            }
+                            return; // 退出当前 LocalSet
+                        }
+                    }
+                } else {
+                    None
                 };
 
-                AGENT_REGISTRY.register(
-                    &project_id,
-                    &worker_response.session_id,
-                    project_and_agent_info,
-                );
+                // 2. 创建 WorkerRequest
+                let worker_request = WorkerRequest {
+                    prompt_message: request.prompt_message.clone(),
+                    model_provider: request.model_provider.clone(),
+                    attachment_blocks,
+                    service_uuid: request.service_uuid.clone(),
+                    shared_api_key_manager: request.shared_api_key_manager.clone(),
+                };
+
+                // 3. 调用 AcpAgentWorker 处理（核心业务逻辑）
+                let worker_response = match worker_clone.process_request(worker_request).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        error!("❌ Worker 处理失败: {:?}", e);
+                        if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                            project_id: project_id.clone(),
+                            session_id: String::new(),
+                            code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
+                            error: Some(format!("处理失败: {:?}", e)),
+                            request_id: Some(request_id.clone()),
+                            service_type: request.prompt_message.service_type.clone(),
+                        }) {
+                            error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                        }
+                        return; // 退出当前 LocalSet
+                    }
+                };
+
+                // 4. 更新全局状态（使用统一的 AGENT_REGISTRY）
+                if worker_response.is_new_session {
+                    if let Some(handles) = &worker_response.session_handles {
+                        debug!("🆕 新会话，注册到 AGENT_REGISTRY");
+
+                        let project_and_agent_info = ProjectAndAgentInfo {
+                            project_id: project_id.clone(),
+                            session_id: SessionId::new(Arc::from(worker_response.session_id.as_str())),
+                            prompt_tx: handles.prompt_tx.clone(),
+                            cancel_tx: handles.cancel_tx.clone(),
+                            model_provider: request.model_provider.clone(),
+                            request_id: Some(request_id.clone()),
+                            status: AgentStatus::Active,
+                            last_activity: Utc::now(),
+                            created_at: Utc::now(),
+                            stop_handle: handles.lifecycle_handle.clone(),
+                        };
+
+                        AGENT_REGISTRY.register(
+                            &project_id,
+                            &worker_response.session_id,
+                            project_and_agent_info,
+                        );
+
+                        info!(
+                            "🔗 Agent 已注册到 AGENT_REGISTRY: project_id={}, session_id={}",
+                            project_id, worker_response.session_id
+                        );
+                    }
+                } else {
+                    debug!("♻️ 复用会话，无需更新全局 Registry");
+                }
+
+                // 5. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
+                SESSION_REQUEST_CONTEXT.insert(project_id.clone(), request_id.clone());
+
+                // 6. 转换并发送回执
+                let chat_prompt_response = ChatPromptResponse {
+                    project_id: worker_response.project_id,
+                    session_id: worker_response.session_id,
+                    code: if worker_response.error.is_none() {
+                        shared_types::error_codes::SUCCESS.to_string()
+                    } else {
+                        shared_types::error_codes::ERR_AGENT_ERROR.to_string()
+                    },
+                    error: worker_response.error,
+                    request_id: worker_response.request_id,
+                    service_type: worker_response.service_type,
+                };
+
+                if let Err(e) = request.chat_prompt_tx.send(chat_prompt_response) {
+                    error!("❌ 发送回执失败: {:?}", e);
+                } else {
+                    info!(
+                        "✅ 回执已发送，project_id: {}",
+                        request.prompt_message.project_id
+                    );
+                }
 
                 info!(
-                    "🔗 Agent 已注册到 AGENT_REGISTRY: project_id={}, session_id={}",
-                    project_id, worker_response.session_id
+                    "🔵 [LocalSet] 请求处理完成 project_id={}, request_id={}",
+                    project_id, request_id
                 );
-            }
-        } else {
-            debug!("♻️ 复用会话，无需更新全局 Registry");
-        }
+                }).await;
+            })
+        });
 
-        // 5. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
-        SESSION_REQUEST_CONTEXT.insert(project_id, request_id.clone());
-
-        // 6. 转换并发送回执
-        let chat_prompt_response = ChatPromptResponse {
-            project_id: worker_response.project_id,
-            session_id: worker_response.session_id,
-            code: if worker_response.error.is_none() {
-                shared_types::error_codes::SUCCESS.to_string()
-            } else {
-                shared_types::error_codes::ERR_AGENT_ERROR.to_string()
-            },
-            error: worker_response.error,
-            request_id: worker_response.request_id,
-            service_type: worker_response.service_type,
-        };
-
-        if let Err(e) = request.chat_prompt_tx.send(chat_prompt_response) {
-            error!("❌ 发送回执失败: {:?}", e);
-        } else {
-            info!(
-                "✅ 回执已发送，project_id: {}",
-                request.prompt_message.project_id
-            );
-        }
+        // 立即继续循环，接收下一个请求 - 不等待上面的 spawn_blocking 完成
     }
 
     // 清理心跳任务
