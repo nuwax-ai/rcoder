@@ -116,7 +116,10 @@ docker-build-agent-runner:
 	fi
 	@echo "📦 步骤1: 在 debian:12 环境中构建 agent_runner 二进制（确保 GLIBC 版本兼容）..."
 	@# 使用 debian:12 + Rust 1.90 构建，GLIBC 版本与运行环境一致
-	@docker build -f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build .
+	@# 计算业务代码哈希，只有代码变化时才重新编译（系统依赖和 Rust 安装保持缓存）
+	$(eval CRATES_HASH := $(shell find crates Cargo.toml Cargo.lock -name "*.rs" -o -name "Cargo.toml" -o -name "Cargo.lock" 2>/dev/null | sort | xargs cat 2>/dev/null | md5sum | cut -d' ' -f1))
+	@echo "🔑 业务代码哈希: $(CRATES_HASH)"
+	@docker build --build-arg CRATES_HASH=$(CRATES_HASH) -f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build .
 	@echo "📦 步骤2: 复制二进制文件到 agent-runner 目录..."
 	@# 创建容器并复制 agent_runner 二进制文件
 	@mkdir -p docker/rcoder-agent-runner/bin
