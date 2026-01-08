@@ -22,6 +22,7 @@ use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 /// - `N`: SessionNotifier 实现，用于推送 SSE 消息
 /// - `C`: Client 实现，用于处理 ACP 协议回调
 /// - `R`: SessionRegistry 实现，用于存储会话数据
+#[derive(Clone)]
 pub struct AcpAgentWorker<N: SessionNotifier, C: Client + 'static, R: SessionRegistry> {
     session_manager: Arc<AcpSessionManager<N, C, R>>,
 }

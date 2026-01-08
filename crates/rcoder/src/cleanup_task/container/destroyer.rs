@@ -41,20 +41,20 @@ impl ContainerDestroyer {
     /// 销毁容器并清理相关资源（带原因）
     ///
     /// # 参数
-    /// * `container_id` - 容器 ID
+    /// * `container_name` - 容器名称（稳定不变，优先使用）
     /// * `service_type` - 服务类型（用于决定是否清理 VNC 后端）
     /// * `container_identifier` - 容器标识符（project_id 或 user_id）
     /// * `reason` - 销毁原因
     pub async fn destroy_with_reason(
         &self,
-        container_id: &str,
+        container_name: &str,
         service_type: &ServiceType,
         container_identifier: &str,
         reason: &DestroyReason,
     ) -> Result<()> {
         info!(
-            "🔥 [destroyer] 开始销毁容器: container_id={}, service_type={:?}, identifier={}, 原因={}",
-            container_id,
+            "🔥 [destroyer] 开始销毁容器: container_name={}, service_type={:?}, identifier={}, 原因={}",
+            container_name,
             service_type,
             container_identifier,
             reason.as_str()
@@ -63,44 +63,67 @@ impl ContainerDestroyer {
         // 输出详细原因
         debug!("📋 [destroyer] 销毁详情: {}", reason.description());
 
-        // 1. 执行物理销毁（这会自动清理 gRPC 连接池中的连接）
+        // 1. 🔍 通过容器名称实时查询最新的容器信息
+        // 这样可以获取最新的 container_id，避免使用缓存中过期的 ID
+        let actual_container_id = match self
+            .docker_manager
+            .find_container_realtime(container_name)
+            .await
+        {
+            Ok(Some((container_id, _, _, _))) => {
+                debug!(
+                    "✅ [destroyer] 找到容器: name={}, id={}",
+                    container_name, container_id
+                );
+                container_id
+            }
+            Ok(None) => {
+                // 容器不存在，可能已经被删除了，这不是错误
+                info!(
+                    "⚠️ [destroyer] 容器不存在，可能已被删除: name={}",
+                    container_name
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // 查询出错，返回错误
+                return Err(anyhow::anyhow!(
+                    "查询容器信息失败: name={}, error={}",
+                    container_name,
+                    e
+                ));
+            }
+        };
+
+        // 2. 执行物理销毁（使用最新的 container_id）
         docker_manager::container_stop::runtime_cleanup_container(
             &self.docker_manager,
-            container_id,
+            &actual_container_id,
         )
         .await
         .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
 
-        // 2. 对于 ComputerAgentRunner，清理 Pingora VNC 后端
+        // 3. 对于 ComputerAgentRunner，清理 Pingora VNC 后端
         if *service_type == ServiceType::ComputerAgentRunner {
             if let Some(ref pingora_service) = self.pingora_service {
                 let _: Option<String> = pingora_service.remove_vnc_backend(container_identifier);
             }
 
-            // 🆕 使容器 IP 缓存失效（容器名称格式: computer-agent-runner-{user_id}）
+            // 🆕 使容器 IP 缓存失效
             if let Some(ref cache) = self.container_ip_cache {
-                let container_name = format!(
-                    "{}-{}",
-                    ServiceType::ComputerAgentRunner.container_prefix(),
-                    container_identifier
-                );
-                cache.invalidate(&container_name);
+                cache.invalidate(container_name);
             }
         } else {
-            // RCoder 模式：容器名称格式: rcoder-agent-{project_id}
+            // RCoder 模式：使容器 IP 缓存失效
             if let Some(ref cache) = self.container_ip_cache {
-                let container_name = format!(
-                    "{}-{}",
-                    ServiceType::RCoder.container_prefix(),
-                    container_identifier
-                );
-                cache.invalidate(&container_name);
+                cache.invalidate(container_name);
             }
         }
 
         info!(
-            "✅ [destroyer] 容器销毁完成: container_id={}, 原因={}",
-            container_id,
+            "✅ [destroyer] 容器销毁完成: container_name={}, actual_id={}, 原因={}",
+            container_name,
+            actual_container_id,
             reason.as_str()
         );
         Ok(())
@@ -109,12 +132,12 @@ impl ContainerDestroyer {
     /// 销毁容器并清理相关资源（兼容旧接口）
     ///
     /// # 参数
-    /// * `container_id` - 容器 ID
+    /// * `container_name` - 容器名称
     /// * `service_type` - 服务类型（用于决定是否清理 VNC 后端）
     /// * `container_identifier` - 容器标识符（project_id 或 user_id）
     pub async fn destroy(
         &self,
-        container_id: &str,
+        container_name: &str,
         service_type: &ServiceType,
         container_identifier: &str,
     ) -> Result<()> {
@@ -122,7 +145,7 @@ impl ContainerDestroyer {
         let reason = DestroyReason::ManualStop {
             source: "unknown".to_string(),
         };
-        self.destroy_with_reason(container_id, service_type, container_identifier, &reason)
+        self.destroy_with_reason(container_name, service_type, container_identifier, &reason)
             .await
     }
 }

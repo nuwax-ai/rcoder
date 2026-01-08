@@ -70,9 +70,21 @@ pub struct WorkerHandle {
     /// 用于发送心跳
     pub heartbeat_tx: mpsc::Sender<Heartbeat>,
     /// 用于发送就绪信号（一次性，使用 oneshot）
+    /// 注意：不支持 Clone，因为是一次性通道
     pub ready_tx: Option<oneshot::Sender<WorkerReady>>,
     /// 🆕 用于追踪请求的 Arc 引用 (可选,用于请求超时检测)
     pub active_requests: Option<Arc<std::sync::Mutex<HashMap<String, chrono::DateTime<Utc>>>>>,
+}
+
+// 手动实现 Clone，跳过 ready_tx 字段（因为它是一次性的）
+impl Clone for WorkerHandle {
+    fn clone(&self) -> Self {
+        Self {
+            heartbeat_tx: self.heartbeat_tx.clone(),
+            ready_tx: None, // 一次性通道不能克隆
+            active_requests: self.active_requests.clone(),
+        }
+    }
 }
 
 /// Agent Worker 管理器

@@ -224,56 +224,83 @@ impl OrphanedContainerCleaner {
         );
         debug!("📋 [orphaned] 销毁详情: {}", info.reason.description());
 
-        // 🛡️ 二次保护期检查：在实际销毁前再次确认容器是否在保护期内
+        // 🛡️ 二次保护期检查：在实际销毁前再次确认容器是否存在且在保护期内
         // 这是为了防止从收集孤立容器列表到实际销毁之间的时间差
-        if let Some(container_info) = self
+        // 🔍 使用 find_container_realtime 获取最新的容器信息和 ID
+        let actual_container_id = match self
             .docker_manager
-            .find_container_by_identifier(&info.container_name)
+            .find_container_realtime(&info.container_name)
             .await
         {
-            // 检查容器创建时间（created_at 是 DateTime<Utc> 类型）
-            let created_time = container_info.created_at;
-            let age = Utc::now().signed_duration_since(created_time);
+            Ok(Some((container_id, _, _, _))) => {
+                // 容器存在，检查保护期
+                // 注意：find_container_realtime 不返回 created_at，需要从缓存获取
+                if let Some(container_info) = self
+                    .docker_manager
+                    .find_container_by_identifier(&info.container_name)
+                    .await
+                {
+                    let created_time = container_info.created_at;
+                    let age = Utc::now().signed_duration_since(created_time);
 
-            if age.num_milliseconds() < self.config.container_protection_duration.as_millis() as i64
-            {
+                    if age.num_milliseconds()
+                        < self.config.container_protection_duration.as_millis() as i64
+                    {
+                        info!(
+                            "🛡️ [orphaned] 二次检查：容器在保护期内，跳过销毁: {}, 创建时长={}秒",
+                            info.container_name,
+                            age.num_seconds()
+                        );
+                        return Ok(());
+                    }
+                }
+                container_id
+            }
+            Ok(None) => {
+                // 容器已不存在，可能已被删除
                 info!(
-                    "🛡️ [orphaned] 二次检查：容器在保护期内，跳过销毁: {}, 创建时长={}秒",
-                    info.container_name,
-                    age.num_seconds()
+                    "⚠️ [orphaned] 容器不存在，可能已被删除: name={}",
+                    info.container_name
                 );
                 return Ok(());
             }
+            Err(e) => {
+                // 查询出错
+                return Err(anyhow::anyhow!(
+                    "查询容器信息失败: name={}, error={}",
+                    info.container_name,
+                    e
+                ));
+            }
+        };
 
-            docker_manager::container_stop::runtime_cleanup_container(
-                &self.docker_manager,
-                &container_info.container_id,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("清理容器失败: {}", e))?;
+        // 使用最新的 container_id 执行销毁
+        docker_manager::container_stop::runtime_cleanup_container(
+            &self.docker_manager,
+            &actual_container_id,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("清理容器失败: {}", e))?;
 
-            // 对于 ComputerAgentRunner，清理 VNC 后端
-            if info.service_type == ServiceType::ComputerAgentRunner {
-                if let Some(ref pingora_service) = self.state.pingora_service {
-                    match pingora_service.remove_vnc_backend(&info.id) {
-                        Some(removed) => {
-                            info!("✅ [orphaned] VNC 后端已清理: backend_id={}", removed);
-                        }
-                        None => {
-                            debug!("⚠️ [orphaned] VNC 后端未找到: identifier={}", info.id);
-                        }
+        // 对于 ComputerAgentRunner，清理 VNC 后端
+        if info.service_type == ServiceType::ComputerAgentRunner {
+            if let Some(ref pingora_service) = self.state.pingora_service {
+                match pingora_service.remove_vnc_backend(&info.id) {
+                    Some(removed) => {
+                        info!("✅ [orphaned] VNC 后端已清理: backend_id={}", removed);
+                    }
+                    None => {
+                        debug!("⚠️ [orphaned] VNC 后端未找到: identifier={}", info.id);
                     }
                 }
             }
-
-            info!(
-                "✅ [orphaned] 容器清理成功: {}, 原因={}",
-                info.container_name,
-                info.reason.as_str()
-            );
-        } else {
-            info!("📭 [orphaned] 容器不存在: {}", info.container_name);
         }
+
+        info!(
+            "✅ [orphaned] 容器清理成功: {}, 原因={}",
+            info.container_name,
+            info.reason.as_str()
+        );
 
         Ok(())
     }

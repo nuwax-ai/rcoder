@@ -700,8 +700,8 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
 
         // 等待会话 ID
         let session_id = session_id_rx.await.map_err(|e| {
-            error!("等待会话 ID 失败: {}", e);
-            anyhow::anyhow!("等待会话 ID 失败: {}", e)
+            error!("智能体初始化超时: {}", e);
+            anyhow::anyhow!("智能体初始化超时，请重试（过多的MCP可能导致超时）。如果持续失败请重启智能体电脑（点击PC端右上图标展开后，在...里点击重启智能体电脑）")
         })?;
 
         info!(

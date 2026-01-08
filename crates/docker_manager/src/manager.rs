@@ -413,6 +413,36 @@ impl DockerManager {
     }
 
     /// 通过多种方式查找容器：project_id 或容器名称
+    ///
+    /// # ⚠️ 已废弃
+    ///
+    /// 此方法返回的容器信息可能包含过期的 `container_id`。
+    ///
+    /// **推荐使用**：
+    /// - [`find_container_realtime`](Self::find_container_realtime) - 实时查询 Docker API，获取最新的容器信息和 ID
+    ///
+    /// **问题**：
+    /// - 返回的 `container_id` 可能是缓存中的旧值
+    /// - 容器重启后 ID 会变化，导致使用旧 ID 操作失败（404 错误）
+    ///
+    /// **迁移指南**：
+    /// ```rust,no_run
+    /// // ❌ 旧方式（可能使用过期的 container_id）
+    /// if let Some(info) = docker_manager.find_container_by_identifier("container_name").await {
+    ///     docker_manager.stop_container_by_id(&info.container_id).await?;
+    /// }
+    ///
+    /// // ✅ 新方式（获取最新的 container_id）
+    /// if let Ok(Some((container_id, _, _, _))) =
+    ///     docker_manager.find_container_realtime("container_name").await
+    /// {
+    ///     docker_manager.stop_container_by_id(&container_id).await?;
+    /// }
+    /// ```
+    #[deprecated(
+        since = "0.1.0",
+        note = "返回的 container_id 可能过期。请使用 find_container_realtime() 获取最新的容器信息"
+    )]
     pub async fn find_container_by_identifier(
         &self,
         identifier: &str,

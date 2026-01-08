@@ -26,6 +26,7 @@ pub struct RegistryStats {
 ///
 /// 统一管理 project_id、session_id 和 AgentInfo 之间的映射关系
 /// 所有映射操作都通过此结构体的方法进行，确保数据一致性
+#[derive(Clone)]
 pub struct AgentSessionRegistry {
     /// project_id → ProjectAndAgentInfo
     agent_info_map: DashMap<String, ProjectAndAgentInfo>,
