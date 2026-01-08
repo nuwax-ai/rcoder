@@ -418,14 +418,20 @@ pub async fn agent_worker_with_heartbeat(
                     }
                 };
 
-                // 4. 更新全局状态（使用统一的 AGENT_REGISTRY）
-                if worker_response.is_new_session {
-                    if let Some(handles) = &worker_response.session_handles {
+                // 4. 提取 session_handles（在移动 worker_response 之前）
+                // 🔥 关键：需要保存 lifecycle_handle 用于后续等待会话结束
+                let session_handles = worker_response.session_handles.clone();
+                let is_new_session = worker_response.is_new_session;
+                let response_session_id = worker_response.session_id.clone();
+
+                // 5. 更新全局状态（使用统一的 AGENT_REGISTRY）
+                if is_new_session {
+                    if let Some(ref handles) = session_handles {
                         debug!("🆕 新会话，注册到 AGENT_REGISTRY");
 
                         let project_and_agent_info = ProjectAndAgentInfo {
                             project_id: project_id.clone(),
-                            session_id: SessionId::new(Arc::from(worker_response.session_id.as_str())),
+                            session_id: SessionId::new(Arc::from(response_session_id.as_str())),
                             prompt_tx: handles.prompt_tx.clone(),
                             cancel_tx: handles.cancel_tx.clone(),
                             model_provider: request.model_provider.clone(),
@@ -438,23 +444,23 @@ pub async fn agent_worker_with_heartbeat(
 
                         AGENT_REGISTRY.register(
                             &project_id,
-                            &worker_response.session_id,
+                            &response_session_id,
                             project_and_agent_info,
                         );
 
                         info!(
                             "🔗 Agent 已注册到 AGENT_REGISTRY: project_id={}, session_id={}",
-                            project_id, worker_response.session_id
+                            project_id, response_session_id
                         );
                     }
                 } else {
                     debug!("♻️ 复用会话，无需更新全局 Registry");
                 }
 
-                // 5. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
+                // 6. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
                 SESSION_REQUEST_CONTEXT.insert(project_id.clone(), request_id.clone());
 
-                // 6. 转换并发送回执
+                // 7. 转换并发送回执
                 let chat_prompt_response = ChatPromptResponse {
                     project_id: worker_response.project_id,
                     session_id: worker_response.session_id,
@@ -477,10 +483,47 @@ pub async fn agent_worker_with_heartbeat(
                     );
                 }
 
-                info!(
-                    "🔵 [LocalSet] 请求处理完成 project_id={}, request_id={}",
-                    project_id, request_id
-                );
+                // 🔥🔥🔥 关键修复：对于新会话，保持 LocalSet 存活直到会话结束 🔥🔥🔥
+                //
+                // 问题背景：
+                // - launch() 中使用 spawn_local() 创建了 Prompt 处理器
+                // - spawn_local 任务依赖 LocalSet 存活才能运行
+                // - 如果 run_until 在 process_request() 完成后立即退出，LocalSet 会被销毁
+                // - 导致 Prompt 处理器被终止，无法接收和处理消息
+                //
+                // 解决方案：
+                // - 对于新会话，等待 cancel_token 被取消后才退出 run_until
+                // - 这样 LocalSet 会一直存活，Prompt 处理器可以持续工作
+                // - 对于复用会话，原会话的 LocalSet 仍在运行，无需额外等待
+                if is_new_session {
+                    if let Some(ref handles) = session_handles {
+                        if let Some(ref lifecycle) = handles.lifecycle_handle {
+                            info!(
+                                "🔄 [LocalSet] 新会话已启动，保持 LocalSet 存活等待会话结束 - project_id={}, session_id={}",
+                                project_id, response_session_id
+                            );
+
+                            // 等待 Agent 会话结束（通过 cancellation_token）
+                            // 当用户取消会话、会话超时或 Agent 完成工作时，cancellation_token 会被触发
+                            lifecycle.cancellation_token().cancelled().await;
+
+                            info!(
+                                "🛑 [LocalSet] Agent 会话已结束，LocalSet 即将退出 - project_id={}, session_id={}",
+                                project_id, response_session_id
+                            );
+                        } else {
+                            warn!(
+                                "⚠️ [LocalSet] 新会话缺少 lifecycle_handle，无法等待会话结束 - project_id={}",
+                                project_id
+                            );
+                        }
+                    }
+                } else {
+                    info!(
+                        "🔵 [LocalSet] 复用会话请求处理完成，LocalSet 退出 - project_id={}, request_id={}",
+                        project_id, request_id
+                    );
+                }
                 }).await;
             })
         });
