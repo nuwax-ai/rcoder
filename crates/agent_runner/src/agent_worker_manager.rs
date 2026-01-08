@@ -58,9 +58,13 @@ pub struct ActiveRequestsSummary {
     pub timeout_count_120: usize,
 }
 
-/// 🔥 DoS 防护配置
+/// 🔥 并发控制配置
 ///
-/// 限制活跃请求追踪的最大数量，防止恶意攻击导致内存耗尽
+/// 工作线程池大小 - 决定可以并发处理的 Agent 会话数量
+/// 注意：此值应与 main.rs 中的 worker_threads 设置保持一致
+pub const WORKER_THREAD_POOL_SIZE: usize = 10;
+
+/// DoS 防护配置 - 设置为10_000
 pub const MAX_ACTIVE_REQUESTS: usize = 10_000;
 
 /// Worker 句柄（传递给 worker 线程）
