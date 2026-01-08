@@ -1005,34 +1005,24 @@ function check_vnc_health() {
 function check_mcp_proxy_health() {
     # 检查 MCP Proxy 服务健康状态
     # MCP Proxy 运行在 127.0.0.1:18099，提供 chrome-devtools MCP 服务
+    # 使用 mcp-proxy health 命令进行健康检查，支持 Streamable HTTP 协议
 
     local MCP_PROXY_PORT=18099
 
-    # 1. 检查 mcp-proxy 进程是否存在
+    # 1. 快速检查 mcp-proxy 进程是否存在
     if ! pgrep -f "mcp-proxy proxy" >/dev/null 2>&1; then
-        log_warn "MCP Proxy process not running, attempting restart..."
+        log_warn "MCP Proxy process not running"
         return 1
     fi
 
-    # 2. 检查端口是否监听（使用更健壮的正则匹配）
-    if ! netstat -tuln 2>/dev/null | grep -qE ":${MCP_PROXY_PORT}(\s|$)"; then
-        log_warn "MCP Proxy not listening on port ${MCP_PROXY_PORT}, attempting restart..."
-        return 1
-    fi
-
-    # 3. 发送 JSON-RPC 请求验证服务是否响应（快速超时）
-    local MCP_TEST_RESULT
-    MCP_TEST_RESULT=$(curl -s --max-time 5 -X POST "http://127.0.0.1:${MCP_PROXY_PORT}" \
-        -H "Content-Type: application/json" \
-        -H "Accept: application/json, text/event-stream" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null)
-
-    if echo "$MCP_TEST_RESULT" | grep -q '"tools"'; then
+    # 2. 使用 mcp-proxy health 命令检查服务健康状态
+    #    -q: 静默模式，只返回退出码（0=健康，1=不健康）
+    #    --timeout 5: 超时 5 秒
+    if mcp-proxy health "http://127.0.0.1:${MCP_PROXY_PORT}" -q --timeout 5; then
         # 健康检查成功，不输出日志以减少日志量
         return 0
     else
-        log_warn "MCP Proxy not responding correctly on port ${MCP_PROXY_PORT}"
-        log_warn "Response: ${MCP_TEST_RESULT:-<empty>}"
+        log_warn "MCP Proxy health check failed on port ${MCP_PROXY_PORT}"
         return 1
     fi
 }
@@ -1082,7 +1072,7 @@ function restart_mcp_proxy() {
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
         PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
-        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" --log-dir /app/logs -v \
+        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" \
         > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
 
     local MCP_PID=$!
@@ -1293,7 +1283,7 @@ function start_mcp_proxy_services() {
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
         PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
-        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" \
+        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" --log-dir /app/logs -v \
         > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
 
     local MCP_PID=$!
@@ -1476,7 +1466,8 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             start_vnc_services
         fi
 
-        # 检查 MCP Proxy 服务健康状态
+        # ========== MCP Proxy 健康检查（使用 mcp-proxy health 工具）==========
+        # 使用 mcp-proxy health 命令进行健康检查，正确处理 Streamable HTTP 协议
         if ! check_mcp_proxy_health; then
             echo "MCP Proxy 服务异常，正在重启..."
             if ! restart_mcp_proxy; then
