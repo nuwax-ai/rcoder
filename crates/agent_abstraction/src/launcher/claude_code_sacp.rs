@@ -118,27 +118,14 @@ pub async fn load_sacp_agent_config(
         let mut resolved_env = agent_config.env.clone();
 
         if let Some(provider) = model_provider {
-            // 合并为一次遍历：替换模板变量 + 设置占位符
-            for (key, value) in resolved_env.iter_mut() {
-                match key.as_str() {
-                    ENV_ANTHROPIC_API_KEY => {
-                        if value.contains("{MODEL_PROVIDER_API_KEY}") || value.is_empty() {
-                            *value = API_KEY_PLACEHOLDER.to_string();
-                        }
-                    }
-                    ENV_ANTHROPIC_BASE_URL => {
-                        if value.contains("{MODEL_PROVIDER_BASE_URL}") || value.is_empty() {
-                            *value = DEFAULT_PROXY_BASE_URL.to_string();
-                        }
-                    }
-                    _ => {
-                        *value = value
-                            .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
-                            .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
-                            .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
-                            .replace("{MODEL_PROVIDER_NAME}", &provider.name);
-                    }
-                }
+            // 统一替换所有环境变量中的模板
+            // API_KEY 和 BASE_URL 必须使用占位符/代理URL，由 Pingora 代理注入真实值
+            for (_key, value) in resolved_env.iter_mut() {
+                *value = value
+                    .replace("{MODEL_PROVIDER_API_KEY}", API_KEY_PLACEHOLDER)
+                    .replace("{MODEL_PROVIDER_BASE_URL}", DEFAULT_PROXY_BASE_URL)
+                    .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
+                    .replace("{MODEL_PROVIDER_NAME}", &provider.name);
             }
         }
 
@@ -321,29 +308,18 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
                 // 🔧 关键修复：替换自定义环境变量中的模板变量
                 // 用户可能传入 {MODEL_PROVIDER_API_KEY} 等模板，需要替换为实际值
+                // 注意：API_KEY 和 BASE_URL 必须使用占位符/代理URL，由 Pingora 代理注入真实值
                 if let Some(ref provider) = model_provider {
-                    for (key, value) in env.iter_mut() {
-                        // 对于 API_KEY 和 BASE_URL 使用占位符（通过代理注入）
-                        match key.as_str() {
-                            ENV_ANTHROPIC_API_KEY => {
-                                if value.contains("{MODEL_PROVIDER_API_KEY}") || value.is_empty() {
-                                    *value = API_KEY_PLACEHOLDER.to_string();
-                                }
-                            }
-                            ENV_ANTHROPIC_BASE_URL => {
-                                if value.contains("{MODEL_PROVIDER_BASE_URL}") || value.is_empty() {
-                                    *value = DEFAULT_PROXY_BASE_URL.to_string();
-                                }
-                            }
-                            _ => {
-                                // 其他变量进行模板替换
-                                *value = value
-                                    .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
-                                    .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
-                                    .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
-                                    .replace("{MODEL_PROVIDER_NAME}", &provider.name);
-                            }
-                        }
+                    for (_key, value) in env.iter_mut() {
+                        // 所有变量统一替换：
+                        // - API_KEY 模板 → 占位符（Pingora 代理注入）
+                        // - BASE_URL 模板 → 代理 URL（Pingora 代理转发）
+                        // - MODEL 和 NAME 模板 → 真实值
+                        *value = value
+                            .replace("{MODEL_PROVIDER_API_KEY}", API_KEY_PLACEHOLDER)
+                            .replace("{MODEL_PROVIDER_BASE_URL}", DEFAULT_PROXY_BASE_URL)
+                            .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
+                            .replace("{MODEL_PROVIDER_NAME}", &provider.name);
                     }
                     debug!(
                         "🔧 [SACP] 已替换自定义环境变量模板, model={}",
