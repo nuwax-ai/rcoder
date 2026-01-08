@@ -92,7 +92,7 @@ pub async fn load_sacp_agent_config(
     let config = AgentServersConfig::load_or_default_for_service(service_type).await;
 
     if let Some(agent_config) = config.get_agent("claude-code-acp") {
-        info!("📋 [SACP] 从配置加载 Agent 参数: {}", agent_config.agent_id);
+        debug!("📋 [SACP] 加载默认 Agent 配置: {}", agent_config.agent_id);
 
         // 检查并安装 agent
         if agent_config.installation.package_name.is_some() {
@@ -299,11 +299,6 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 🎯 关键：检查是否有自定义 agent_server 配置覆盖
         let (command_path, command_args, base_env) =
             if let Some(ref agent_server_override) = start_config.agent_server_override {
-                info!(
-                    "🎯 [SACP] 使用自定义 Agent 配置: agent_id={}",
-                    agent_server_override.get_agent_id()
-                );
-
                 // 使用自定义 command（如果提供），否则用默认
                 let cmd = agent_server_override
                     .command
@@ -325,14 +320,16 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 }
 
                 info!(
-                    "[SACP] 自定义 Agent 命令: {} {:?}",
-                    cmd, args
+                    "🎯 [SACP] 使用自定义 Agent: agent_id={}, command={} {:?}",
+                    agent_server_override.get_agent_id(),
+                    cmd,
+                    args
                 );
                 (cmd, args, env)
             } else {
                 // 使用默认配置
                 info!(
-                    "[SACP] 使用默认 Agent 命令: {} {:?}",
+                    "📋 [SACP] 使用默认 Agent: {} {:?}",
                     default_agent_config.command, default_agent_config.args
                 );
                 (
@@ -657,8 +654,6 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             let cancel_timeout = tokio::time::sleep(std::time::Duration::from_secs(3600)); // 初始设置一个很长的超时
                             tokio::pin!(cancel_timeout);
                             let mut is_cancelled = false;
-                            // 🎯 支持多个取消请求：使用 Vec 存储所有 result_tx，避免覆盖
-                            let mut pending_cancel_results: Vec<tokio::sync::oneshot::Sender<shared_types::CancelResult>> = Vec::new();
 
                             // 在等待 Prompt 响应时也监听取消请求
                             let prompt_result = loop {
@@ -668,18 +663,14 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     _ = &mut cancel_timeout, if is_cancelled => {
                                         // 取消后超时，强制返回错误
                                         warn!("[SACP] 取消后等待 Prompt 响应超时 (10s)，强制返回");
-                                        // 🎯 超时时返回取消成功给所有等待者（因为通知已发送，Agent 可能正在处理）
-                                        for tx in pending_cancel_results.drain(..) {
-                                            let _ = tx.send(shared_types::CancelResult::Success);
-                                        }
                                         break Err(sacp::Error::new(-32001, "取消后等待响应超时"));
                                     }
                                     // 检查取消请求（无论是否已取消都要接收，避免调用方超时）
                                     Some(cancel_request) = cancel_rx.recv() => {
                                         if is_cancelled {
-                                            // 🎯 已经在取消中，直接保存到 Vec 等待返回
-                                            info!("[SACP] 已有取消请求在处理中，保存后续请求等待一起返回");
-                                            pending_cancel_results.push(cancel_request.result_tx);
+                                            // 🎯 已经在取消中，直接返回成功（通知已发送）
+                                            info!("[SACP] 已有取消请求在处理中，直接返回成功");
+                                            let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
                                         } else {
                                             let session_id_str = cancel_request.cancel_notification.session_id.0.to_string();
                                             info!("[SACP] 在 Prompt 处理中收到取消请求: session_id={}", session_id_str);
@@ -693,11 +684,11 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                                     format!("发送取消通知失败: {:?}", e)
                                                 ));
                                             } else {
-                                                info!("[SACP] 取消通知已发送，等待 Agent 停止...");
-                                                // 🎯 同步返回：保存 result_tx 到 Vec，等待 Prompt 完成后再返回
-                                                pending_cancel_results.push(cancel_request.result_tx);
+                                                info!("[SACP] 取消通知已发送");
+                                                // 🎯 立即返回成功，不阻塞调用方
+                                                let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
                                                 is_cancelled = true;
-                                                // 设置超时保护：取消后最多等待 10 秒
+                                                // 设置超时保护：取消后最多等待 10 秒让 prompt 完成
                                                 cancel_timeout.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
                                             }
                                         }
@@ -705,23 +696,12 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     }
                                     result = &mut prompt_future => {
                                         // Prompt 响应完成
-                                        // 🎯 如果有待返回的取消结果，现在返回成功给所有等待者
-                                        if !pending_cancel_results.is_empty() {
-                                            info!("[SACP] Agent 已停止，返回取消成功给 {} 个等待者", pending_cancel_results.len());
-                                            for tx in pending_cancel_results.drain(..) {
-                                                let _ = tx.send(shared_types::CancelResult::Success);
-                                            }
-                                        }
                                         break result;
                                     }
                                 }
                             };
 
                             // 处理 Prompt 响应结果
-                            // 如果是因为取消超时而失败，记录特殊日志
-                            if is_cancelled {
-                                debug!("[SACP] Prompt 响应（已取消）: is_ok={}", prompt_result.is_ok());
-                            }
                             match prompt_result {
                                 Ok(response) => {
                                     debug!("[SACP] Prompt 响应: stop_reason={:?}", response.stop_reason);
@@ -745,18 +725,36 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     }
                                 }
                                 Err(e) => {
-                                    error!("[SACP] Prompt 请求失败: {:?}", e);
-                                    // 发送 PromptError 通知
-                                    if let Err(notify_err) = notifier_for_prompt
-                                        .notify_prompt_error(
-                                            &project_id_for_prompt,
-                                            &session_id.to_string(),
-                                            e,
-                                            request_id.clone(),
-                                        )
-                                        .await
-                                    {
-                                        error!("[SACP] 发送 PromptError 通知失败: {:?}", notify_err);
+                                    // 🎯 区分"取消超时"和"真正的错误"
+                                    if is_cancelled {
+                                        // 取消超时：发送 PromptEnd (Cancelled) 而非 PromptError
+                                        info!("[SACP] 取消超时，发送 PromptEnd (Cancelled): session_id={}", session_id);
+                                        if let Err(notify_err) = notifier_for_prompt
+                                            .notify_prompt_end(
+                                                &project_id_for_prompt,
+                                                &session_id.to_string(),
+                                                sacp::schema::StopReason::Cancelled,
+                                                Some("用户取消任务（Agent 响应超时）".to_string()),
+                                                request_id.clone(),
+                                            )
+                                            .await
+                                        {
+                                            error!("[SACP] 发送 PromptEnd (Cancelled) 通知失败: {:?}", notify_err);
+                                        }
+                                    } else {
+                                        // 真正的错误：发送 PromptError
+                                        error!("[SACP] Prompt 请求失败: {:?}", e);
+                                        if let Err(notify_err) = notifier_for_prompt
+                                            .notify_prompt_error(
+                                                &project_id_for_prompt,
+                                                &session_id.to_string(),
+                                                e,
+                                                request_id.clone(),
+                                            )
+                                            .await
+                                        {
+                                            error!("[SACP] 发送 PromptError 通知失败: {:?}", notify_err);
+                                        }
                                     }
                                 }
                             }

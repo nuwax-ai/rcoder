@@ -190,8 +190,8 @@ impl AgentSessionRegistry {
     /// 如果项目不存在，则创建一个占位记录
     /// 如果项目已存在且为 Idle 状态，则更新为 Pending
     pub fn set_pending(&self, project_id: &str) {
-        use sacp::schema::SessionId;
         use chrono::Utc;
+        use sacp::schema::SessionId;
         use shared_types::AgentStatus;
         use std::sync::Arc;
         use tokio::sync::mpsc;
@@ -222,6 +222,7 @@ impl AgentSessionRegistry {
                     last_activity: Utc::now(),
                     created_at: Utc::now(),
                     stop_handle: None,
+                    agent_server_config: None,
                 };
 
                 entry.insert(placeholder);
@@ -252,7 +253,10 @@ impl AgentSessionRegistry {
                         // Idle 状态可以设置为 Pending
                         info.status = AgentStatus::Pending;
                         info.last_activity = Utc::now();
-                        debug!("📌 [Registry] 原子操作: 项目 {} 状态 Idle → Pending", project_id);
+                        debug!(
+                            "📌 [Registry] 原子操作: 项目 {} 状态 Idle → Pending",
+                            project_id
+                        );
                         Ok(())
                     }
                     AgentStatus::Active | AgentStatus::Pending | AgentStatus::Terminating => {
@@ -282,10 +286,14 @@ impl AgentSessionRegistry {
                     last_activity: Utc::now(),
                     created_at: Utc::now(),
                     stop_handle: None,
+                    agent_server_config: None,
                 };
 
                 entry.insert(placeholder);
-                info!("📌 [Registry] 原子操作: 创建 Pending 占位 project_id={}", project_id);
+                info!(
+                    "📌 [Registry] 原子操作: 创建 Pending 占位 project_id={}",
+                    project_id
+                );
                 Ok(())
             }
         }
@@ -296,8 +304,8 @@ impl AgentSessionRegistry {
     /// 用于在任务失败时清理预占位，避免死锁
     /// 🎯 优化：使用 entry API 确保原子性，避免 TOCTOU 竞态
     pub fn clear_pending_if_exists(&self, project_id: &str) -> bool {
-        use shared_types::AgentStatus;
         use dashmap::mapref::entry::Entry;
+        use shared_types::AgentStatus;
 
         let should_log = match self.agent_info_map.entry(project_id.to_string()) {
             Entry::Occupied(entry) => {
@@ -332,7 +340,7 @@ impl AgentSessionRegistry {
         let old_status = {
             // 在作用域内持有锁，修改完成后立即释放
             if let Some(mut info) = self.agent_info_map.get_mut(project_id) {
-                let old = info.status;  // AgentStatus 是 Copy
+                let old = info.status; // AgentStatus 是 Copy
                 info.status = AgentStatus::Idle;
                 info.last_activity = Utc::now();
                 Some(old)
@@ -344,16 +352,10 @@ impl AgentSessionRegistry {
         // 不持有锁时记录日志，避免阻塞其他线程
         match old_status {
             Some(old) => {
-                info!(
-                    "🔄 [Registry] 项目 {} 状态: {:?} → Idle",
-                    project_id, old
-                );
+                info!("🔄 [Registry] 项目 {} 状态: {:?} → Idle", project_id, old);
             }
             None => {
-                debug!(
-                    "⚠️ [Registry] set_idle: project_id={} 不存在",
-                    project_id
-                );
+                debug!("⚠️ [Registry] set_idle: project_id={} 不存在", project_id);
             }
         }
     }
@@ -555,8 +557,8 @@ impl Default for AgentSessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sacp::schema::SessionId;
     use chrono::Utc;
+    use sacp::schema::SessionId;
     use shared_types::AgentStatus;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -576,6 +578,7 @@ mod tests {
             last_activity: Utc::now(),
             created_at: Utc::now(),
             stop_handle: None,
+            agent_server_config: None,
         }
     }
 

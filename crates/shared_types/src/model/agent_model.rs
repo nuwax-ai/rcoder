@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{ModelProviderConfig, ModelProviderSafeInfo};
-use sacp::schema::{CancelNotification, PromptRequest, SessionId};
+use crate::ChatAgentServerConfig;
 use chrono::{DateTime, Utc};
+use sacp::schema::{CancelNotification, PromptRequest, SessionId};
 use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;
 
@@ -48,6 +49,12 @@ pub trait SessionEntry: Clone + Send + Sync + 'static {
 
     /// 检查模型配置是否与给定配置不同
     fn is_model_config_changed(&self, new_config: &Option<ModelProviderConfig>) -> bool;
+
+    /// 获取当前会话使用的 agent server 配置
+    fn agent_server_config(&self) -> Option<&ChatAgentServerConfig>;
+
+    /// 检查 agent server 配置是否与给定配置不同
+    fn is_agent_server_config_changed(&self, new_config: &Option<ChatAgentServerConfig>) -> bool;
 }
 
 /// 取消操作结果（新类型）
@@ -170,6 +177,8 @@ pub struct ProjectAndAgentInfo {
     pub created_at: DateTime<Utc>,
     /// Agent生命周期管理句柄
     pub stop_handle: Option<Arc<dyn AgentLifecycle>>,
+    /// 当前会话使用的 Agent Server 配置（用于比较是否需要重建会话）
+    pub agent_server_config: Option<ChatAgentServerConfig>,
 }
 
 // ============================================================================
@@ -210,6 +219,21 @@ impl SessionEntry for ProjectAndAgentInfo {
             (None, None) => false,
             (Some(_), None) | (None, Some(_)) => true,
             (Some(existing), Some(new)) => existing.id != new.id,
+        }
+    }
+
+    fn agent_server_config(&self) -> Option<&ChatAgentServerConfig> {
+        self.agent_server_config.as_ref()
+    }
+
+    fn is_agent_server_config_changed(&self, new_config: &Option<ChatAgentServerConfig>) -> bool {
+        match (&self.agent_server_config, new_config) {
+            // 都没有配置 -> 无变化
+            (None, None) => false,
+            // 其中一个有配置 -> 有变化
+            (Some(_), None) | (None, Some(_)) => true,
+            // 都有配置 -> 比较 agent_id
+            (Some(existing), Some(new)) => existing.get_agent_id() != new.get_agent_id(),
         }
     }
 }

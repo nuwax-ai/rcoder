@@ -14,10 +14,10 @@
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
-use sacp::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;
+use sacp::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use shared_types::{
     AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
 };
@@ -218,9 +218,8 @@ where
         let now = Utc::now();
 
         // 使用 sacp::schema::SessionId
-        let sacp_session_id = SessionId::new(Arc::from(
-            connection_info.session_id.to_string().as_str()
-        ));
+        let sacp_session_id =
+            SessionId::new(Arc::from(connection_info.session_id.to_string().as_str()));
 
         let agent_info = ProjectAndAgentInfo {
             project_id: project_id.clone(),
@@ -233,6 +232,7 @@ where
             last_activity: now,
             created_at: now,
             stop_handle: lifecycle_handle,
+            agent_server_config: start_config.agent_server_override.clone(),
         };
 
         // 存储会话信息到 registry
@@ -295,11 +295,16 @@ where
                 return Ok((new_session, true));
             }
 
-            // 🎯 检查是否有自定义 agent_server 配置（需要重建会话以使用新 agent）
-            if start_config.has_agent_server_override() {
+            // 🎯 检查是否有自定义 agent_server 配置且配置发生变化
+            if existing.is_agent_server_config_changed(&start_config.agent_server_override) {
                 info!(
-                    "[SACP] 检测到自定义 Agent 配置，重启会话以使用新 Agent，项目 ID: {}",
-                    project_id
+                    "[SACP] 检测到 Agent 配置变化，重启会话以使用新 Agent，项目 ID: {}, 旧配置: {:?}, 新配置: {:?}",
+                    project_id,
+                    existing.agent_server_config().map(|c| c.get_agent_id()),
+                    start_config
+                        .agent_server_override
+                        .as_ref()
+                        .map(|c| c.get_agent_id())
                 );
                 self.remove_session(project_id);
                 let new_session = self
@@ -353,7 +358,9 @@ where
     }
 }
 
-impl<N: SessionNotifier + 'static, R: SessionRegistry> std::fmt::Debug for SacpSessionManager<N, R> {
+impl<N: SessionNotifier + 'static, R: SessionRegistry> std::fmt::Debug
+    for SacpSessionManager<N, R>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SacpSessionManager")
             .field("session_count", &self.registry.count())
@@ -461,10 +468,7 @@ mod tests {
         }
 
         fn remove(&self, project_id: &str) -> Option<Self::Entry> {
-            self.project_to_session
-                .lock()
-                .unwrap()
-                .remove(project_id);
+            self.project_to_session.lock().unwrap().remove(project_id);
             self.entries.lock().unwrap().remove(project_id)
         }
 
@@ -497,6 +501,7 @@ mod tests {
             last_activity: chrono::Utc::now(),
             created_at: chrono::Utc::now(),
             stop_handle: None,
+            agent_server_config: None,
         }
     }
 
@@ -572,10 +577,9 @@ mod tests {
 
         let session_id = SessionId::new(Arc::from("session-1"));
 
-        let result =
-            SacpSessionManager::<MockNotifier, MockRegistry>::build_text_prompt_request(
-                &prompt, session_id,
-            );
+        let result = SacpSessionManager::<MockNotifier, MockRegistry>::build_text_prompt_request(
+            &prompt, session_id,
+        );
 
         assert!(result.is_ok());
         let request = result.unwrap();
@@ -607,11 +611,12 @@ mod tests {
             "Attachment content".to_string(),
         ))];
 
-        let result = SacpSessionManager::<MockNotifier, MockRegistry>::build_prompt_request_with_attachments(
-            &prompt,
-            session_id,
-            attachment_blocks,
-        );
+        let result =
+            SacpSessionManager::<MockNotifier, MockRegistry>::build_prompt_request_with_attachments(
+                &prompt,
+                session_id,
+                attachment_blocks,
+            );
 
         assert!(result.is_ok());
         let request = result.unwrap();

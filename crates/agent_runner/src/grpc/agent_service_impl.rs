@@ -743,9 +743,9 @@ impl AgentService for AgentServiceImpl {
             }
         };
 
-        // 2. 获取 agent_info
-        let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
-            Some(info) => info,
+        // 2. 获取 agent_info 的 cancel_tx（立即释放 DashMap 读锁，避免死锁）
+        let cancel_tx = match AGENT_REGISTRY.get_agent_info(&project_id) {
+            Some(info) => info.cancel_tx.clone(), // 克隆 channel，立即释放 Ref<> 读锁
             None => {
                 return Ok(Response::new(CancelResponse {
                     success: true,
@@ -754,6 +754,7 @@ impl AgentService for AgentServiceImpl {
                 }));
             }
         };
+        // 🎯 Ref<> 读锁在这里已释放，set_idle 可以获取写锁
 
         // 3. 创建 SessionId 和 CancelNotification
         let session_id_obj = SessionId::new(Arc::from(actual_session_id.as_str()));
@@ -767,7 +768,7 @@ impl AgentService for AgentServiceImpl {
         };
 
         // 5. 发送取消通知
-        if let Err(e) = agent_info.cancel_tx.send(cancel_request) {
+        if let Err(e) = cancel_tx.send(cancel_request) {
             error!("❌ [gRPC] 发送取消通知失败: {}", e);
             return Ok(Response::new(CancelResponse {
                 success: false,
