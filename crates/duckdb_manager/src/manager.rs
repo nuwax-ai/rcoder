@@ -52,15 +52,19 @@ impl DuckDbManager {
     }
 
     /// 获取容器 Repository
+    ///
+    /// 注意：返回的 Repository 共享同一个 `Arc<Mutex<Connection>>`，
+    /// 确保并发访问时的线程安全。
     pub fn containers(&self) -> DuckDbResult<ContainerRepository> {
-        let conn = self.conn.try_clone()?;
-        Ok(ContainerRepository::new(conn))
+        Ok(ContainerRepository::new(self.conn.clone()))
     }
 
     /// 获取项目 Repository
+    ///
+    /// 注意：返回的 Repository 共享同一个 `Arc<Mutex<Connection>>`，
+    /// 确保并发访问时的线程安全。
     pub fn projects(&self) -> DuckDbResult<ProjectRepository> {
-        let conn = self.conn.try_clone()?;
-        Ok(ProjectRepository::new(conn))
+        Ok(ProjectRepository::new(self.conn.clone()))
     }
 
     /// 获取存储统计信息
@@ -106,11 +110,6 @@ impl DuckDbManager {
     /// 获取原始连接（用于高级操作）
     pub fn connection(&self) -> &DuckDbConnection {
         &self.conn
-    }
-
-    /// 克隆连接（用于并行操作）
-    pub fn clone_connection(&self) -> DuckDbResult<DuckDbConnection> {
-        self.conn.try_clone()
     }
 
     /// 执行自定义 SQL 查询（用于复杂查询）
