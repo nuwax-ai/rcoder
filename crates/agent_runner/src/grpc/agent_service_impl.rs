@@ -272,35 +272,26 @@ impl AgentService for AgentServiceImpl {
             Some(req.session_id.clone())
         };
 
-        // 检查 Agent 状态，禁止并发请求（使用统一 Registry）
-        // 🆕 检查 Active 和 Pending 两种状态
-        if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id) {
-            if agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending
-            {
-                // 🎯 使用业务响应返回错误码，而非 gRPC Status 错误
-                // 这样 rcoder 可以直接从 error_code 字段读取错误码
-                info!(
-                    "🚫 [gRPC] Agent Busy 返回 9010 错误: project_id={}, status={:?}",
-                    project_id, agent_info.status
-                );
-                return Ok(Response::new(GrpcChatResponse {
-                    project_id: project_id.clone(),
-                    session_id: session_id.unwrap_or_default(),
-                    success: false,
-                    error: Some("Agent正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
-                    error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
-                    request_id: req.request_id.clone(),
-                    // 🆕 Agent Busy 不需要降级
-                    need_fallback: false,
-                    fallback_reason: None,
-                }));
-            }
+        // 🎯 原子操作：检查状态并设置 Pending（解决竞态条件）
+        // 使用 try_set_pending 替代旧的"检查+设置"两步操作
+        if let Err(current_status) = AGENT_REGISTRY.try_set_pending(&project_id) {
+            // 已经 Busy (Active 或 Pending)，返回 9010 错误
+            info!(
+                "🚫 [gRPC] Agent Busy 返回 9010 错误: project_id={}, status={:?}",
+                project_id, current_status
+            );
+            return Ok(Response::new(GrpcChatResponse {
+                project_id: project_id.clone(),
+                session_id: session_id.unwrap_or_default(),
+                success: false,
+                error: Some("Agent正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
+                error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
+                request_id: req.request_id.clone(),
+                need_fallback: false,
+                fallback_reason: None,
+            }));
         }
-
-        // 🆕 预注册：在发送任务到队列前，立即将 project 标记为 Pending
-        // 这样并发请求会被上面的忙碌检查拦截
-        AGENT_REGISTRY.set_pending(&project_id);
-        info!("📌 [gRPC] 预注册 Pending 状态: project_id={}", project_id);
+        info!("📌 [gRPC] 原子预注册 Pending 状态成功: project_id={}", project_id);
 
         // 清理旧 session
         if let Some(ref sid) = session_id {
@@ -800,32 +791,26 @@ impl AgentService for AgentServiceImpl {
                 );
 
                 if is_success {
-                    // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端任务已取消
-                    use crate::service::push_session_update_with_project;
-                    use shared_types::{SessionNotify, SessionPromptEnd};
+                    // 🆕 重置 Agent 状态为 Idle，允许新的请求进入
+                    debug!("🔧 [gRPC] 开始重置 Agent 状态...");
+                    AGENT_REGISTRY.set_idle(&project_id);
+                    debug!("🔧 [gRPC] Agent 状态已重置为 Idle");
 
-                    let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
-                        session_id: actual_session_id.clone(),
-                        stop_reason: StopReason::Cancelled,
-                        error_message: None,
-                        request_id: None,
-                    });
-
-                    if let Err(e) =
-                        push_session_update_with_project(&project_id, &actual_session_id, notify)
-                            .await
-                    {
-                        warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
-                    } else {
-                        info!(
-                            "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
-                            actual_session_id
-                        );
-                    }
+                    // 📝 SessionPromptEnd 由 SACP 层（claude_code_sacp.rs）负责发送
+                    // 这里不再重复发送，避免 SSE 客户端收到重复消息
+                    info!(
+                        "✅ [gRPC] 取消成功，SessionPromptEnd 由 SACP 层发送: session_id={}",
+                        actual_session_id
+                    );
 
                     // 清理 SESSION_CACHE
+                    debug!("🔧 [gRPC] 开始清理 SESSION_CACHE...");
                     if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
-                        session_data.close_current_connection().await;
+                        debug!("🔧 [gRPC] 找到 session_data，开始关闭连接...");
+                        session_data.close_current_connection();
+                        debug!("🔧 [gRPC] 连接已关闭");
+                    } else {
+                        debug!("🔧 [gRPC] session_data 不存在，跳过关闭连接");
                     }
                     if SESSION_CACHE.remove(&actual_session_id).is_some() {
                         info!(
@@ -833,6 +818,7 @@ impl AgentService for AgentServiceImpl {
                             actual_session_id
                         );
                     }
+                    debug!("🔧 [gRPC] 准备返回 CancelResponse...");
 
                     Ok(Response::new(CancelResponse {
                         success: true,
@@ -854,7 +840,15 @@ impl AgentService for AgentServiceImpl {
                     actual_session_id, e
                 );
 
-                // 通道关闭说明 Agent 处理线程已崩溃或退出，发送 SessionPromptEnd
+                // 🆕 通道关闭说明 Agent 处理线程已崩溃或退出
+                // 必须重置状态为 Idle，否则后续请求会被永久拒绝（9010 错误）
+                AGENT_REGISTRY.set_idle(&project_id);
+                info!(
+                    "🔄 [gRPC] Agent 通道关闭，已重置状态为 Idle: project_id={}",
+                    project_id
+                );
+
+                // 发送 SessionPromptEnd 通知客户端
                 use crate::service::push_session_update_with_project;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
@@ -873,7 +867,7 @@ impl AgentService for AgentServiceImpl {
 
                 // 清理连接
                 if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
-                    session_data.close_current_connection().await;
+                    session_data.close_current_connection();
                 }
 
                 Ok(Response::new(CancelResponse {
@@ -887,6 +881,10 @@ impl AgentService for AgentServiceImpl {
                     "⚠️ [gRPC] 等待 Agent 取消响应超时: session_id={}",
                     actual_session_id
                 );
+
+                // ⚠️ 取消超时，保持 Active 状态，允许用户重试取消
+                // 不调用 set_idle，因为 Agent 可能还在运行
+
                 Ok(Response::new(CancelResponse {
                     success: false,
                     result: CancelResultType::CancelResultTimeout as i32,
@@ -1029,7 +1027,7 @@ impl AgentService for AgentServiceImpl {
 
                 // 清理连接
                 if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                    session_data.close_current_connection().await;
+                    session_data.close_current_connection();
                 }
             }
 
@@ -1076,7 +1074,7 @@ impl AgentService for AgentServiceImpl {
             // 清理 SESSION_CACHE
             if !session_id.is_empty() {
                 if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                    session_data.close_current_connection().await;
+                    session_data.close_current_connection();
                 }
                 if SESSION_CACHE.remove(&session_id).is_some() {
                     info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
@@ -1245,7 +1243,7 @@ impl AgentService for AgentServiceImpl {
 
                         // 清理 SESSION_CACHE
                         if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                            session_data.close_current_connection().await;
+                            session_data.close_current_connection();
                         }
                         if SESSION_CACHE.remove(&session_id).is_some() {
                             info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
@@ -1367,7 +1365,7 @@ impl AgentService for AgentServiceImpl {
 
                         // 清理连接
                         if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                            session_data.close_current_connection().await;
+                            session_data.close_current_connection();
                         }
                     }
 

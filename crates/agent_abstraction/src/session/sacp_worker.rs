@@ -110,6 +110,18 @@ where
             .with_system_prompt(system_prompt)
             .with_mcp_servers(mcp_servers);
 
+        // 🎯 添加 agent_server 配置覆盖
+        if let Some(ref agent_config) = request.prompt_message.agent_config_override {
+            if agent_config.agent_server.is_some() {
+                debug!(
+                    "[SACP] 使用自定义 Agent 服务器配置: agent_id={:?}",
+                    agent_config.agent_server.as_ref().map(|s| s.get_agent_id())
+                );
+                start_config =
+                    start_config.with_agent_server_override(agent_config.agent_server.clone());
+            }
+        }
+
         // Resume 策略
         if let Some(ref session_id) = request.prompt_message.session_id {
             info!("[SACP] 用户传入 session_id，尝试 resume: {}", session_id);

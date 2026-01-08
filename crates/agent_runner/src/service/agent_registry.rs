@@ -7,7 +7,7 @@ use agent_abstraction::traits::SessionRegistry;
 use dashmap::DashMap;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
-use shared_types::ProjectAndAgentInfo;
+use shared_types::{AgentStatus, ProjectAndAgentInfo};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
 
@@ -230,17 +230,130 @@ impl AgentSessionRegistry {
         }
     }
 
+    /// 原子操作：尝试设置项目为 Pending 状态
+    ///
+    /// 如果项目不存在或状态为 Idle，则设置为 Pending 并返回 Ok(())
+    /// 如果项目已存在且状态为 Active 或 Pending，则返回 Err(当前状态)
+    ///
+    /// ## 并发安全性
+    ///
+    /// 使用 DashMap entry API 确保检查和设置是原子操作，避免竞态条件
+    pub fn try_set_pending(&self, project_id: &str) -> Result<(), AgentStatus> {
+        use chrono::Utc;
+        use sacp::schema::SessionId;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        match self.agent_info_map.entry(project_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let info = entry.get_mut();
+                match info.status {
+                    AgentStatus::Idle => {
+                        // Idle 状态可以设置为 Pending
+                        info.status = AgentStatus::Pending;
+                        info.last_activity = Utc::now();
+                        debug!("📌 [Registry] 原子操作: 项目 {} 状态 Idle → Pending", project_id);
+                        Ok(())
+                    }
+                    AgentStatus::Active | AgentStatus::Pending | AgentStatus::Terminating => {
+                        // 已经 Busy 或正在终止，返回当前状态
+                        let current_status = info.status;
+                        debug!(
+                            "🚫 [Registry] 原子操作: 项目 {} 已 Busy (status={:?})",
+                            project_id, current_status
+                        );
+                        Err(current_status)
+                    }
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // 不存在：创建占位记录
+                let (prompt_tx, _) = mpsc::unbounded_channel();
+                let (cancel_tx, _) = mpsc::unbounded_channel();
+
+                let placeholder = ProjectAndAgentInfo {
+                    project_id: project_id.to_string(),
+                    session_id: SessionId::new(Arc::from("pending")),
+                    prompt_tx,
+                    cancel_tx,
+                    model_provider: None,
+                    request_id: None,
+                    status: AgentStatus::Pending,
+                    last_activity: Utc::now(),
+                    created_at: Utc::now(),
+                    stop_handle: None,
+                };
+
+                entry.insert(placeholder);
+                info!("📌 [Registry] 原子操作: 创建 Pending 占位 project_id={}", project_id);
+                Ok(())
+            }
+        }
+    }
+
     /// 清理 Pending 状态（仅当当前状态为 Pending 时移除）
     ///
     /// 用于在任务失败时清理预占位，避免死锁
-    pub fn clear_pending_if_exists(&self, project_id: &str) {
+    /// 🎯 优化：使用 entry API 确保原子性，避免 TOCTOU 竞态
+    pub fn clear_pending_if_exists(&self, project_id: &str) -> bool {
         use shared_types::AgentStatus;
+        use dashmap::mapref::entry::Entry;
 
-        if let Some(info) = self.agent_info_map.get(project_id) {
-            if info.status == AgentStatus::Pending {
-                drop(info);
-                self.remove_by_project(project_id);
-                info!("🗑️ [Registry] 清理 Pending 占位: project_id={}", project_id);
+        let should_log = match self.agent_info_map.entry(project_id.to_string()) {
+            Entry::Occupied(entry) => {
+                if entry.get().status == AgentStatus::Pending {
+                    let info = entry.remove();
+                    // 清理相关映射
+                    let session_id = info.session_id.0.to_string();
+                    self.session_to_project.remove(&session_id);
+                    self.project_to_session.remove(project_id);
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(_) => false,
+        };
+
+        // 锁外记录日志
+        if should_log {
+            info!("🗑️ [Registry] 清理 Pending 占位: project_id={}", project_id);
+        }
+        should_log
+    }
+
+    /// 将 Agent 状态设置为 Idle（任务完成或取消后）
+    ///
+    /// 用于在任务完成或取消后重置状态，允许新的请求进入
+    /// 🎯 优化：在锁外记录日志，避免阻塞 gRPC 响应
+    pub fn set_idle(&self, project_id: &str) {
+        use chrono::Utc;
+
+        let old_status = {
+            // 在作用域内持有锁，修改完成后立即释放
+            if let Some(mut info) = self.agent_info_map.get_mut(project_id) {
+                let old = info.status;  // AgentStatus 是 Copy
+                info.status = AgentStatus::Idle;
+                info.last_activity = Utc::now();
+                Some(old)
+            } else {
+                None
+            }
+        }; // 锁在这里释放
+
+        // 不持有锁时记录日志，避免阻塞其他线程
+        match old_status {
+            Some(old) => {
+                info!(
+                    "🔄 [Registry] 项目 {} 状态: {:?} → Idle",
+                    project_id, old
+                );
+            }
+            None => {
+                debug!(
+                    "⚠️ [Registry] set_idle: project_id={} 不存在",
+                    project_id
+                );
             }
         }
     }

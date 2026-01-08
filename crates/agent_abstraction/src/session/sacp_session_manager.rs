@@ -295,6 +295,26 @@ where
                 return Ok((new_session, true));
             }
 
+            // 🎯 检查是否有自定义 agent_server 配置（需要重建会话以使用新 agent）
+            if start_config.has_agent_server_override() {
+                info!(
+                    "[SACP] 检测到自定义 Agent 配置，重启会话以使用新 Agent，项目 ID: {}",
+                    project_id
+                );
+                self.remove_session(project_id);
+                let new_session = self
+                    .create_session(
+                        project_id.to_string(),
+                        project_path,
+                        session_id_hint,
+                        model_provider,
+                        start_config,
+                        service_uuid,
+                    )
+                    .await?;
+                return Ok((new_session, true));
+            }
+
             info!("[SACP] 复用现有 Agent 会话，项目 ID: {}", project_id);
             return Ok((existing, false));
         }

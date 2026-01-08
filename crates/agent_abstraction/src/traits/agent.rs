@@ -30,6 +30,12 @@ pub struct AgentStartConfig {
     /// 当需要恢复之前的会话时，传入之前的 session_id，
     /// 这将通过 `_meta.claudeCode.options.resume` 传递给 Agent。
     pub resume_session_id: Option<String>,
+
+    /// Agent 服务器配置覆盖（用于自定义 agent 命令、参数、环境变量）
+    ///
+    /// 如果提供，将使用此配置覆盖默认的 Agent 配置。
+    /// 支持覆盖 agent_id、command、args、env 等字段。
+    pub agent_server_override: Option<shared_types::ChatAgentServerConfig>,
 }
 
 impl AgentStartConfig {
@@ -44,6 +50,7 @@ impl AgentStartConfig {
             extra_meta: None,
             service_type,
             resume_session_id: None,
+            agent_server_override: None,
         }
     }
 
@@ -78,6 +85,20 @@ impl AgentStartConfig {
     pub fn with_resume_session_id(mut self, session_id: String) -> Self {
         self.resume_session_id = Some(session_id);
         self
+    }
+
+    /// 设置 Agent 服务器配置覆盖
+    pub fn with_agent_server_override(
+        mut self,
+        agent_server: Option<shared_types::ChatAgentServerConfig>,
+    ) -> Self {
+        self.agent_server_override = agent_server;
+        self
+    }
+
+    /// 检查是否有 Agent 服务器配置覆盖
+    pub fn has_agent_server_override(&self) -> bool {
+        self.agent_server_override.is_some()
     }
 
     /// 构建 NewSessionRequest 的 meta 字段

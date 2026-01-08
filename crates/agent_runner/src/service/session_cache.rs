@@ -4,6 +4,7 @@
 
 use shared_types::{SessionMessageType, SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
@@ -19,11 +20,12 @@ use super::AGENT_REGISTRY;
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
 
 /// Session数据包装 - 极简版本，专注消息传输
+/// 🎯 使用 ArcSwap 实现无锁化设计，消除所有锁竞争
 pub struct SessionData {
     command_tx: mpsc::UnboundedSender<SessionCommand>,
-    // 🎯 极简优化：直接存储当前连接，无需命令传递
-    current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
-    current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+    // 🎯 无锁优化：使用 ArcSwap 原子替换，读取无锁，写入不需要 await
+    current_sender: Arc<ArcSwap<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+    current_cancel: Arc<ArcSwap<Option<CancellationToken>>>,
 }
 
 impl SessionData {
@@ -41,8 +43,8 @@ impl SessionData {
         let arc_start = std::time::Instant::now();
         let session = Arc::new(SessionData {
             command_tx,
-            current_sender: Arc::new(tokio::sync::Mutex::new(None)),
-            current_cancel: Arc::new(tokio::sync::Mutex::new(None)),
+            current_sender: Arc::new(ArcSwap::from_pointee(None)),
+            current_cancel: Arc::new(ArcSwap::from_pointee(None)),
         });
         debug!(
             "⏱️ [SessionData::new] Arc创建耗时: {:?}",
@@ -106,20 +108,17 @@ impl SessionData {
         );
 
         let setup_start = std::time::Instant::now();
-        // 🛡️ 关键修复：使用 lock() 而非 try_lock()，确保连接一定被设置
-        // try_lock() 可能失败导致 current_sender 未设置，造成消息丢失
+        // 🎯 无锁优化：使用 ArcSwap 原子替换，无需 await
         {
-            // 取消之前的连接
-            let mut current_cancel_guard = self.current_cancel.lock().await;
-            if let Some(token) = current_cancel_guard.take() {
+            // 原子替换取消令牌，获取旧值并取消
+            let old_cancel = self.current_cancel.swap(Arc::new(Some(cancellation_token.clone())));
+            if let Some(token) = (*old_cancel).clone() {
+                info!("🔌 [create_new_connection] 取消旧连接的 CancellationToken");
                 token.cancel();
             }
-            // 设置新的取消令牌
-            *current_cancel_guard = Some(cancellation_token.clone());
 
-            // 设置新的发送器
-            let mut current_sender_guard = self.current_sender.lock().await;
-            *current_sender_guard = Some(tx);
+            // 原子替换发送器
+            self.current_sender.store(Arc::new(Some(tx)));
         }
         debug!(
             "⏱️ [create_new_connection] 连接状态设置耗时: {:?}",
@@ -151,21 +150,20 @@ impl SessionData {
     /// 1. 触发 CancellationToken，让 SSE 流立即退出循环
     /// 2. 显式关闭 channel 发送端，让 rx.recv() 立即返回 None
     /// 3. 清空连接状态，防止新的消息被发送
-    pub async fn close_current_connection(&self) {
-        // 🎯 主动触发取消令牌，关闭 SSE 连接
-        let mut current_cancel_guard = self.current_cancel.lock().await;
-        if let Some(token) = current_cancel_guard.take() {
+    ///
+    /// 🎯 无锁优化：使用 ArcSwap 原子替换，永不阻塞
+    pub fn close_current_connection(&self) {
+        // 🎯 原子替换取消令牌，获取旧值并触发取消
+        let old_cancel = self.current_cancel.swap(Arc::new(None));
+        if let Some(token) = (*old_cancel).clone() {
             info!("🔌 [SessionData] 主动触发CancellationToken，关闭SSE连接");
             token.cancel();
         }
-        drop(current_cancel_guard);
 
-        // 🎯 显式关闭 channel 发送端，让接收端立即感知到连接关闭
-        let mut current_sender_guard = self.current_sender.lock().await;
-        if current_sender_guard.take().is_some() {
+        // 🎯 原子替换发送器，显式关闭 channel
+        let old_sender = self.current_sender.swap(Arc::new(None));
+        if old_sender.is_some() {
             info!("🔌 [SessionData] 显式关闭channel发送端，让接收端立即断开");
-            // 当 Sender 被 drop 时，Receiver 的 recv() 会返回 None
-            // 这里通过 take() 将 sender 从 Option 中移除，触发 drop
         }
     }
 }
@@ -173,17 +171,18 @@ impl SessionData {
 struct SessionWorker {
     max_size: usize,
     command_rx: mpsc::UnboundedReceiver<SessionCommand>,
-    // 🎯 极简优化：直接共享连接状态，无需命令传递
-    current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
-    current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+    // 🎯 无锁优化：直接共享 ArcSwap 连接状态
+    current_sender: Arc<ArcSwap<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+    #[allow(dead_code)]
+    current_cancel: Arc<ArcSwap<Option<CancellationToken>>>,
 }
 
 impl SessionWorker {
     fn spawn(
         max_size: usize,
         command_rx: mpsc::UnboundedReceiver<SessionCommand>,
-        current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
-        current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+        current_sender: Arc<ArcSwap<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+        current_cancel: Arc<ArcSwap<Option<CancellationToken>>>,
     ) {
         let start_time = std::time::Instant::now();
         debug!(
@@ -234,14 +233,14 @@ impl SessionWorker {
                         }
                     }
 
-                    // 🛡️ 关键修复：使用 lock().await 确保消息一定被发送
-                    // try_lock() 可能失败导致消息丢失，造成 SSE 卡死
-                    let mut current_sender_guard = self.current_sender.lock().await;
-                    if let Some(sender) = current_sender_guard.as_mut() {
+                    // 🎯 无锁优化：使用 ArcSwap 读取，永不阻塞
+                    // load() 返回 Arc，可以安全地 clone 出 Option<Sender>
+                    let sender_opt = (**self.current_sender.load()).clone();
+                    if let Some(sender) = sender_opt {
                         if sender.try_send(message.clone()).is_err() {
                             // 如果发送失败，可能是缓冲区满了或连接已关闭
                             warn!("⚠️ SSE sender 发送失败，关闭实时推送");
-                            *current_sender_guard = None;
+                            self.current_sender.store(Arc::new(None));
                         }
                     } else {
                         // 连接不存在，跳过实时推送（记录为 info 级别，便于排查问题）
