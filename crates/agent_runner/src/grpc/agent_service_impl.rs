@@ -772,24 +772,38 @@ impl AgentService for AgentServiceImpl {
             }
         };
 
-        // 2. 获取 agent_info
-        let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
-            Some(info) => info,
-            None => {
-                info!(
-                    "ℹ️ [gRPC] project_id={} 无活动会话，取消目标已达成（幂等）",
-                    project_id
-                );
-                return Ok(Response::new(CancelResponse {
-                    success: true,
-                    result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("项目无活动会话".to_string()),
-                }));
-            }
+        // 2. 获取 agent_info 并提取需要的数据
+        // 🔥 关键修复：使用代码块限制读锁生命周期，避免在 .await 时持有读锁导致死锁
+        let (status, cancel_tx) = {
+            let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
+                Some(info) => info,
+                None => {
+                    info!(
+                        "ℹ️ [gRPC] project_id={} 无活动会话，取消目标已达成（幂等）",
+                        project_id
+                    );
+                    return Ok(Response::new(CancelResponse {
+                        success: true,
+                        result: CancelResultType::CancelResultSuccess as i32,
+                        message: Some("项目无活动会话".to_string()),
+                    }));
+                }
+            };
+
+            // ✅ 主动 clone 数据，然后显式 drop 读锁
+            // status 是 Copy 类型，直接复制
+            // cancel_tx 是 UnboundedSender，clone 成本很低（内部只是 Arc 引用计数+1）
+            let status = agent_info.status;
+            let cancel_tx = agent_info.cancel_tx.clone();
+
+            // 🔥 显式释放读锁，确保在代码块结束前就释放
+            drop(agent_info);
+
+            (status, cancel_tx)
         };
 
         // 🆕 ===== 幂等性检查与通道有效性验证 =====
-        match agent_info.status {
+        match status {
             AgentStatus::Idle => {
                 // 已经是 Idle 状态，无需取消（幂等返回）
                 info!(
@@ -818,14 +832,14 @@ impl AgentService for AgentServiceImpl {
                 // 正常流程：继续执行取消
                 debug!(
                     "🔄 [gRPC] Agent 状态为 {:?}，执行取消操作: project_id={}, session_id={}",
-                    agent_info.status, project_id, actual_session_id
+                    status, project_id, actual_session_id
                 );
             }
         }
 
         // 🆕 验证 cancel_tx 通道是否仍然有效
         // 避免：LocalSet 已退出导致 cancel_tx 失效，但 send 时才发现的问题
-        if agent_info.cancel_tx.is_closed() {
+        if cancel_tx.is_closed() {
             error!(
                 "❌ [gRPC] cancel_tx 通道已关闭，LocalSet 可能已意外退出: project_id={}, session_id={}",
                 project_id, actual_session_id
@@ -848,8 +862,8 @@ impl AgentService for AgentServiceImpl {
             result_tx,
         };
 
-        // 5. 发送取消通知
-        if let Err(e) = agent_info.cancel_tx.send(cancel_request) {
+        // 5. 发送取消通知（使用已提取的 cancel_tx）
+        if let Err(e) = cancel_tx.send(cancel_request) {
             error!("❌ [gRPC] 发送取消通知失败: {}", e);
             return Ok(Response::new(CancelResponse {
                 success: false,
