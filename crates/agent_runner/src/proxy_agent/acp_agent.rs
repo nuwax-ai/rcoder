@@ -283,9 +283,23 @@ pub async fn agent_worker_with_heartbeat(
         let mut heartbeat_interval = interval(Duration::from_secs(5));
         loop {
             heartbeat_interval.tick().await;
+
+            // 📊 获取当前活跃 Worker 数量
+            let active_count = AGENT_REGISTRY.stats().agent_count;
+            let total_count = WORKER_THREAD_POOL_SIZE;
+
             let heartbeat = Heartbeat {
                 timestamp: Utc::now(),
             };
+
+            // 📊 打印当前 Worker 占用情况
+            info!(
+                "💓 [Worker] 心跳 - 当前活跃: {}/{}, 可用: {}, 时间: {}",
+                active_count,
+                total_count,
+                total_count.saturating_sub(active_count),
+                heartbeat.timestamp.format("%Y-%m-%d %H:%M:%S")
+            );
 
             if let Err(e) = heartbeat_tx.try_send(heartbeat) {
                 warn!("⚠️ [Worker] 心跳发送失败: {}", e);
