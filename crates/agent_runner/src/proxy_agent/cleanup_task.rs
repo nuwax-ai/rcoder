@@ -28,8 +28,8 @@ pub struct CleanupConfig {
 impl Default for CleanupConfig {
     fn default() -> Self {
         Self {
-            idle_timeout: Duration::from_secs(30 * 60),
-            cleanup_interval: Duration::from_secs(5 * 60),
+            idle_timeout: Duration::from_secs(3 * 60), // 🆕 默认3分钟
+            cleanup_interval: Duration::from_secs(30), // 默认30秒
         }
     }
 }
