@@ -1580,13 +1580,13 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 
         # ========== 🔥 定期清理僵尸进程任务（每 30 秒执行一次）==========
         # 防止 chrome-headless 僵尸进程累积
-        local zombie_count=$(ps aux | grep -c '<defunct>' || echo "0")
+        zombie_count=$(ps aux | grep -c '<defunct>' || echo "0")
         if [ "$zombie_count" -gt 10 ]; then
             log "  🔧 检测到 $zombie_count 个僵尸进程，开始清理..."
 
             # 🔧 修复：使用更兼容的方式，避免 xargs -r
             # 清理 chrome-headless 僵尸进程
-            local zombie_pids=$(ps aux | grep -E '[c]hrome-headless.*<defunct>' | awk '{print $2}')
+            zombie_pids=$(ps aux | grep -E '[c]hrome-headless.*<defunct>' | awk '{print $2}')
             if [ -n "$zombie_pids" ]; then
                 echo "$zombie_pids" | xargs kill -9 2>/dev/null || true
             fi
@@ -1601,7 +1601,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             # 注意：只清理明确属于 chrome/chromium 的僵尸进程
             # 其他僵尸进程应该由其父进程负责回收
 
-            local remaining_zombies=$(ps aux | grep -c '<defunct>' || echo "0")
+            remaining_zombies=$(ps aux | grep -c '<defunct>' || echo "0")
             if [ "$remaining_zombies" -lt "$zombie_count" ]; then
                 log_success "  ✅ 清理了 $((zombie_count - remaining_zombies)) 个僵尸进程"
             fi
