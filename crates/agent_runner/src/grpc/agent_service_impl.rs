@@ -776,13 +776,66 @@ impl AgentService for AgentServiceImpl {
         let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
             Some(info) => info,
             None => {
+                info!(
+                    "ℹ️ [gRPC] project_id={} 无活动会话，取消目标已达成（幂等）",
+                    project_id
+                );
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("Agent 已停止".to_string()),
+                    message: Some("项目无活动会话".to_string()),
                 }));
             }
         };
+
+        // 🆕 ===== 幂等性检查与通道有效性验证 =====
+        match agent_info.status {
+            AgentStatus::Idle => {
+                // 已经是 Idle 状态，无需取消（幂等返回）
+                info!(
+                    "✅ [gRPC] Agent 已经是 Idle 状态，取消请求幂等成功: project_id={}, session_id={}",
+                    project_id, actual_session_id
+                );
+                return Ok(Response::new(CancelResponse {
+                    success: true,
+                    result: CancelResultType::CancelResultSuccess as i32,
+                    message: Some("Agent 已经是空闲状态".to_string()),
+                }));
+            }
+            AgentStatus::Terminating => {
+                // 正在停止中，无需重复取消（幂等返回）
+                info!(
+                    "✅ [gRPC] Agent 正在停止中，取消请求幂等成功: project_id={}, session_id={}",
+                    project_id, actual_session_id
+                );
+                return Ok(Response::new(CancelResponse {
+                    success: true,
+                    result: CancelResultType::CancelResultSuccess as i32,
+                    message: Some("Agent 正在停止中".to_string()),
+                }));
+            }
+            AgentStatus::Active | AgentStatus::Pending => {
+                // 正常流程：继续执行取消
+                debug!(
+                    "🔄 [gRPC] Agent 状态为 {:?}，执行取消操作: project_id={}, session_id={}",
+                    agent_info.status, project_id, actual_session_id
+                );
+            }
+        }
+
+        // 🆕 验证 cancel_tx 通道是否仍然有效
+        // 避免：LocalSet 已退出导致 cancel_tx 失效，但 send 时才发现的问题
+        if agent_info.cancel_tx.is_closed() {
+            error!(
+                "❌ [gRPC] cancel_tx 通道已关闭，LocalSet 可能已意外退出: project_id={}, session_id={}",
+                project_id, actual_session_id
+            );
+            return Ok(Response::new(CancelResponse {
+                success: false,
+                result: CancelResultType::CancelResultFailed as i32,
+                message: Some("取消通道已关闭，Agent 可能已停止".to_string()),
+            }));
+        }
 
         // 3. 创建 SessionId 和 CancelNotification
         let session_id_obj = SessionId::new(Arc::from(actual_session_id.as_str()));
@@ -856,28 +909,30 @@ impl AgentService for AgentServiceImpl {
                     }
 
                     // 🔥 关键修复：清理 AGENT_REGISTRY，将状态更新为 Idle
-                    // 这样后续请求才能通过 Busy 检查
-                    if let Some(agent_info_ref) = AGENT_REGISTRY.get_agent_info(&project_id) {
-                        use chrono::Utc;
-                        use shared_types::AgentStatus;
+                    // 使用原子性操作避免竞态条件
+                    use chrono::Utc;
+                    use shared_types::AgentStatus;
 
-                        // 🎯 使用 CoW 模式更新状态
-                        let mut info_clone = agent_info_ref.value().clone();
-                        info_clone.status = AgentStatus::Idle;
-                        info_clone.last_activity = Utc::now();
-                        drop(agent_info_ref); // 释放读锁
+                    let updated = AGENT_REGISTRY.try_update_agent_info(&project_id, |info| {
+                        // 只在 Active/Pending 状态时更新
+                        if matches!(info.status, AgentStatus::Active | AgentStatus::Pending) {
+                            info.status = AgentStatus::Idle;
+                            info.last_activity = Utc::now();
+                            true
+                        } else {
+                            false
+                        }
+                    });
 
-                        // 🔒 原子性地更新 AGENT_REGISTRY
-                        AGENT_REGISTRY.update_agent_info(&project_id, info_clone);
-
+                    if updated {
                         info!(
-                            "✅ [gRPC] Agent 状态已更新为 Idle: project_id={}, session_id={}",
+                            "✅ [gRPC] Agent 状态已原子性更新为 Idle: project_id={}, session_id={}",
                             project_id, actual_session_id
                         );
                     } else {
-                        warn!(
-                            "⚠️ [gRPC] Agent 不在 Registry 中，无法更新状态: project_id={}",
-                            project_id
+                        debug!(
+                            "🔍 [gRPC] Agent 状态无需更新（可能已是 Idle 或其他状态）: project_id={}, session_id={}",
+                            project_id, actual_session_id
                         );
                     }
 
@@ -932,9 +987,73 @@ impl AgentService for AgentServiceImpl {
             }
             Err(_) => {
                 warn!(
-                    "⚠️ [gRPC] 等待 Agent 取消响应超时: session_id={}",
+                    "⚠️ [gRPC] 等待 Agent 取消响应超时: session_id={}, 主动清理资源",
                     actual_session_id
                 );
+
+                // 🆕 超时时主动清理资源，确保一致性
+                use crate::service::push_session_update_with_project;
+                use agent_client_protocol::StopReason;
+                use shared_types::{SessionNotify, SessionPromptEnd};
+
+                // 1. 发送 SessionPromptEnd 通知
+                let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                    session_id: actual_session_id.clone(),
+                    stop_reason: StopReason::Cancelled,
+                    error_message: Some("取消请求超时，主动清理资源".to_string()),
+                    request_id: None,
+                });
+
+                if let Err(e) =
+                    push_session_update_with_project(&project_id, &actual_session_id, notify).await
+                {
+                    warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                } else {
+                    info!(
+                        "📤 [gRPC] 已发送 SessionPromptEnd (Timeout) 通知: session_id={}",
+                        actual_session_id
+                    );
+                }
+
+                // 2. 清理 SESSION_CACHE
+                if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
+                    session_data.close_current_connection().await;
+                }
+                if SESSION_CACHE.remove(&actual_session_id).is_some() {
+                    info!(
+                        "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
+                        actual_session_id
+                    );
+                }
+
+                // 3. 🆕 使用 DashMap entry API 原子性地更新 Agent 状态为 Idle
+                // 避免：读锁释放 → 时间窗口 → 写锁更新 的竞态条件
+                use chrono::Utc;
+                use shared_types::AgentStatus;
+
+                let updated = AGENT_REGISTRY.try_update_agent_info(&project_id, |info| {
+                    // 只在 Active 状态时更新，避免覆盖其他状态
+                    if info.status == AgentStatus::Active {
+                        info.status = AgentStatus::Idle;
+                        info.last_activity = Utc::now();
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+                if updated {
+                    info!(
+                        "✅ [gRPC] 超时后 Agent 状态已原子性更新为 Idle: project_id={}, session_id={}",
+                        project_id, actual_session_id
+                    );
+                } else {
+                    debug!(
+                        "🔍 [gRPC] Agent 状态无需更新（非 Active 状态）: project_id={}, session_id={}",
+                        project_id, actual_session_id
+                    );
+                }
+
                 Ok(Response::new(CancelResponse {
                     success: false,
                     result: CancelResultType::CancelResultTimeout as i32,

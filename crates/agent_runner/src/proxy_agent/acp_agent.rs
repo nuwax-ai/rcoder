@@ -509,45 +509,46 @@ pub async fn agent_worker_with_heartbeat(
                     );
                 }
 
-                // 🔥🔥🔥 关键修复：对于新会话，保持 LocalSet 存活直到会话结束 🔥🔥🔥
+                // 🔥🔥🔥 关键修复：LocalSet 生命周期管理策略 🔥🔥🔥
                 //
-                // 问题背景：
-                // - launch() 中使用 spawn_local() 创建了 Prompt 处理器
-                // - spawn_local 任务依赖 LocalSet 存活才能运行
-                // - 如果 run_until 在 process_request() 完成后立即退出，LocalSet 会被销毁
-                // - 导致 Prompt 处理器被终止，无法接收和处理消息
+                // 架构设计：
+                // - 每个请求在独立的 spawn_blocking 线程中运行
+                // - 新会话：LocalSet 保持存活，负责维护 Agent 的生命周期
+                // - 复用会话：LocalSet 立即退出，释放线程
                 //
-                // 解决方案：
-                // - 对于新会话，等待 cancel_token 被取消后才退出 run_until
-                // - 这样 LocalSet 会一直存活，Prompt 处理器可以持续工作
-                // - 对于复用会话，原会话的 LocalSet 仍在运行，无需额外等待
+                // 为什么复用会话不等待？
+                // - Agent 的生命周期由创建它的 LocalSet 维护
+                // - 复用会话的 LocalSet 不需要等待，避免线程泄漏
+                // - cancel_session 不触发 cancellation_token，不影响 Agent 生命周期
                 if is_new_session {
                     if let Some(ref handles) = session_handles {
                         if let Some(ref lifecycle) = handles.lifecycle_handle {
                             info!(
-                                "🔄 [LocalSet] 新会话已启动，保持 LocalSet 存活等待会话结束 - project_id={}, session_id={}",
+                                "🔄 [LocalSet] 新会话：保持 LocalSet 存活维护 Agent 生命周期 - project_id={}, session_id={}",
                                 project_id, response_session_id
                             );
 
-                            // 等待 Agent 会话结束（通过 cancellation_token）
-                            // 当用户取消会话、会话超时或 Agent 完成工作时，cancellation_token 会被触发
+                            // 等待以下任一事件：
+                            // 1. 用户调用 stop_agent → lifecycle.cancel()
+                            // 2. 清理任务停止闲置 Agent（5分钟）→ lifecycle.graceful_stop()
+                            // 3. Agent 进程异常退出
                             lifecycle.cancellation_token().cancelled().await;
 
                             info!(
-                                "🛑 [LocalSet] Agent 会话已结束，LocalSet 即将退出 - project_id={}, session_id={}",
+                                "🛑 [LocalSet] Agent 生命周期结束，LocalSet 退出 - project_id={}, session_id={}",
                                 project_id, response_session_id
                             );
                         } else {
                             warn!(
-                                "⚠️ [LocalSet] 新会话缺少 lifecycle_handle，无法等待会话结束 - project_id={}",
+                                "⚠️ [LocalSet] 新会话缺少 lifecycle_handle，LocalSet 将立即退出 - project_id={}",
                                 project_id
                             );
                         }
                     }
                 } else {
                     info!(
-                        "🔵 [LocalSet] 复用会话请求处理完成，LocalSet 退出 - project_id={}, request_id={}",
-                        project_id, request_id
+                        "🔵 [LocalSet] 复用会话：请求处理完成，LocalSet 立即退出 - project_id={}, session_id={}",
+                        project_id, response_session_id
                     );
                 }
                 }).await;
