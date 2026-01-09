@@ -911,9 +911,12 @@ impl AgentService for AgentServiceImpl {
                         );
                     }
 
-                    // 清理 SESSION_CACHE
-                    if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
-                        session_data.close_current_connection().await;
+                    // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
+                    // 避免：持有 SESSION_CACHE 读锁时调用 .await 导致死锁
+                    if let Some(session_data_ref) = SESSION_CACHE.get(&actual_session_id) {
+                        let session_data = session_data_ref.clone();
+                        drop(session_data_ref); // 显式释放读锁
+                        session_data.close_current_connection().await; // ✅ 安全：已无读锁
                     }
                     if SESSION_CACHE.remove(&actual_session_id).is_some() {
                         info!(
@@ -989,8 +992,11 @@ impl AgentService for AgentServiceImpl {
                 }
 
                 // 清理连接
-                if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
-                    session_data.close_current_connection().await;
+                // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
+                if let Some(session_data_ref) = SESSION_CACHE.get(&actual_session_id) {
+                    let session_data = session_data_ref.clone();
+                    drop(session_data_ref); // 显式释放读锁
+                    session_data.close_current_connection().await; // ✅ 安全：已无读锁
                 }
 
                 Ok(Response::new(CancelResponse {
@@ -1030,8 +1036,11 @@ impl AgentService for AgentServiceImpl {
                 }
 
                 // 2. 清理 SESSION_CACHE
-                if let Some(session_data) = SESSION_CACHE.get(&actual_session_id) {
-                    session_data.close_current_connection().await;
+                // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
+                if let Some(session_data_ref) = SESSION_CACHE.get(&actual_session_id) {
+                    let session_data = session_data_ref.clone();
+                    drop(session_data_ref); // 显式释放读锁
+                    session_data.close_current_connection().await; // ✅ 安全：已无读锁
                 }
                 if SESSION_CACHE.remove(&actual_session_id).is_some() {
                     info!(
@@ -1210,8 +1219,11 @@ impl AgentService for AgentServiceImpl {
                 }
 
                 // 清理连接
-                if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                    session_data.close_current_connection().await;
+                // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
+                if let Some(session_data_ref) = SESSION_CACHE.get(&session_id) {
+                    let session_data = session_data_ref.clone();
+                    drop(session_data_ref); // 显式释放读锁
+                    session_data.close_current_connection().await; // ✅ 安全：已无读锁
                 }
             }
 
@@ -1258,8 +1270,11 @@ impl AgentService for AgentServiceImpl {
 
             // 清理 SESSION_CACHE
             if !session_id.is_empty() {
-                if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                    session_data.close_current_connection().await;
+                // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
+                if let Some(session_data_ref) = SESSION_CACHE.get(&session_id) {
+                    let session_data = session_data_ref.clone();
+                    drop(session_data_ref); // 显式释放读锁
+                    session_data.close_current_connection().await; // ✅ 安全：已无读锁
                 }
                 if SESSION_CACHE.remove(&session_id).is_some() {
                     info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
@@ -1428,8 +1443,11 @@ impl AgentService for AgentServiceImpl {
                         }
 
                         // 清理 SESSION_CACHE
-                        if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                            session_data.close_current_connection().await;
+                        // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
+                        if let Some(session_data_ref) = SESSION_CACHE.get(&session_id) {
+                            let session_data = session_data_ref.clone();
+                            drop(session_data_ref); // 显式释放读锁
+                            session_data.close_current_connection().await; // ✅ 安全：已无读锁
                         }
                         if SESSION_CACHE.remove(&session_id).is_some() {
                             info!("🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}", session_id);
@@ -1551,8 +1569,11 @@ impl AgentService for AgentServiceImpl {
                         }
 
                         // 清理连接
-                        if let Some(session_data) = SESSION_CACHE.get(&session_id) {
-                            session_data.close_current_connection().await;
+                        // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
+                        if let Some(session_data_ref) = SESSION_CACHE.get(&session_id) {
+                            let session_data = session_data_ref.clone();
+                            drop(session_data_ref); // 显式释放读锁
+                            session_data.close_current_connection().await; // ✅ 安全：已无读锁
                         }
                     }
 
