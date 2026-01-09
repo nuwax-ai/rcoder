@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    agent_worker_manager::{Heartbeat, WorkerHandle, WorkerReady, WORKER_THREAD_POOL_SIZE},
+    agent_worker_manager::{Heartbeat, WORKER_THREAD_POOL_SIZE, WorkerHandle, WorkerReady},
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
     service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
@@ -340,6 +340,10 @@ pub async fn agent_worker_with_heartbeat(
                         "🛡️ [并发限制] Agent 会话数已达上限 ({}/{}), 拒绝新请求 - project_id={}, request_id={}",
                         active_sessions_count, WORKER_THREAD_POOL_SIZE, project_id, request_id
                     );
+
+                    // 🔥 关键修复：清理 Pending 状态，避免状态泄漏
+                    AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+
                     if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                         project_id: project_id.clone(),
                         session_id: String::new(),
@@ -373,6 +377,10 @@ pub async fn agent_worker_with_heartbeat(
                         Ok(blocks) => Some(blocks),
                         Err(e) => {
                             error!("❌ 附件处理失败: {:?}", e);
+
+                            // 🔥 关键修复：清理 Pending 状态，避免状态泄漏
+                            AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+
                             if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                                 project_id: project_id.clone(),
                                 session_id: String::new(),
@@ -404,6 +412,10 @@ pub async fn agent_worker_with_heartbeat(
                     Ok(response) => response,
                     Err(e) => {
                         error!("❌ Worker 处理失败: {:?}", e);
+
+                        // 🔥 关键修复：清理 Pending 状态，避免状态泄漏
+                        AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+
                         if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                             project_id: project_id.clone(),
                             session_id: String::new(),
