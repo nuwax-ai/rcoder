@@ -1037,7 +1037,8 @@ function restart_mcp_proxy() {
     # 确保日志目录存在
     mkdir -p "$MCP_LOG_DIR" 2>/dev/null || true
 
-    # 1. 停止现有进程
+    # ========== 1. 停止现有 MCP Proxy 进程 ==========
+    log "  Stopping existing MCP Proxy processes..."
     pkill -f "mcp-proxy proxy" || true
     sleep 1
 
@@ -1045,20 +1046,86 @@ function restart_mcp_proxy() {
     pkill -9 -f "mcp-proxy proxy" 2>/dev/null || true
     sleep 1
 
-    # 2. 检查配置文件
+    # ========== 2. 🔥 关键修复：清理所有 chrome-headless 子进程（解决僵尸进程问题）==========
+    log "  Cleaning up chrome-headless and chromium processes..."
+
+    # 2.1 清理 chrome-headless 进程（包括僵尸进程）
+    local chrome_count=$(ps aux | grep -E '[c]hrome-headless' | wc -l)
+    if [ "$chrome_count" -gt 0 ]; then
+        log "  Found $chrome_count chrome-headless processes, terminating..."
+        # 优雅终止
+        pkill -TERM -f "chrome-headless" 2>/dev/null || true
+        sleep 2
+        # 强制杀死残留进程
+        pkill -9 -f "chrome-headless" 2>/dev/null || true
+    fi
+
+    # 2.2 清理 chromium-for-mcp 进程
+    local chromium_count=$(ps aux | grep -E '[c]hromium-for-mcp' | wc -l)
+    if [ "$chromium_count" -gt 0 ]; then
+        log "  Found $chromium_count chromium-for-mcp processes, terminating..."
+        pkill -TERM -f "chromium-for-mcp" 2>/dev/null || true
+        sleep 2
+        pkill -9 -f "chromium-for-mcp" 2>/dev/null || true
+    fi
+
+    # 2.3 清理所有 chromium 相关的僵尸进程
+    # 🔧 修复：使用更兼容的方式，避免 xargs -r
+    local zombie_pids=$(ps aux | grep -E '[c]hrome.*<defunct>|[c]hromium.*<defunct>' | awk '{print $2}')
+    if [ -n "$zombie_pids" ]; then
+        echo "$zombie_pids" | xargs kill -9 2>/dev/null || true
+    fi
+
+    # 2.4 清理 chrome-devtools-mcp 进程
+    pkill -9 -f "chrome-devtools-mcp" 2>/dev/null || true
+
+    # 2.5 清理 Chromium 相关的锁文件和临时文件
+    local CHROMIUM_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/home/user/.config/chromium}"
+    if [ -d "$CHROMIUM_DATA_DIR" ]; then
+        log "  Cleaning Chromium lock files in $CHROMIUM_DATA_DIR..."
+        # 删除 SingletonLock 文件
+        rm -f "$CHROMIUM_DATA_DIR/SingletonLock" 2>/dev/null || true
+        rm -f "$CHROMIUM_DATA_DIR/SingletonSocket" 2>/dev/null || true
+        rm -f "$CHROMIUM_DATA_DIR/SingletonCookie" 2>/dev/null || true
+        # 清理所有锁文件
+        find "$CHROMIUM_DATA_DIR" -name "*.lock" -type f -delete 2>/dev/null || true
+        find "$CHROMIUM_DATA_DIR" -name "lockfile" -type f -delete 2>/dev/null || true
+    fi
+
+    # 2.6 清理 /tmp 中的 Chromium 临时文件
+    rm -rf /tmp/.org.chromium.Chromium.* 2>/dev/null || true
+    rm -rf /tmp/chrome_* 2>/dev/null || true
+
+    # 2.7 清理 /dev/shm 中的 Chromium 共享内存
+    rm -rf /dev/shm/.org.chromium.Chromium.* 2>/dev/null || true
+
+    sleep 2
+
+    # 2.8 统计清理后的进程数
+    local remaining_chrome=$(ps aux | grep -E '[c]hrome-headless|[c]hromium-for-mcp' | grep -v grep | wc -l)
+    if [ "$remaining_chrome" -gt 0 ]; then
+        log_warn "  ⚠️  Still have $remaining_chrome chrome processes (may be from other containers)"
+    else
+        log_success "  ✅ All chrome-headless and chromium processes cleaned"
+    fi
+
+    # ========== 3. 检查配置文件 ==========
     if [ ! -f "$MCP_CONFIG_FILE" ]; then
         log_warn "MCP config file not found: $MCP_CONFIG_FILE, cannot restart"
         return 1
     fi
 
-    # 3. 获取 D-Bus 地址
+    # ========== 4. 获取 D-Bus 地址 ==========
     local DBUS_ADDR=""
     if [ -f /tmp/dbus-session-env ]; then
         source /tmp/dbus-session-env
         DBUS_ADDR="$DBUS_SESSION_BUS_ADDRESS"
     fi
 
-    # 4. 重新启动 mcp-proxy proxy 服务
+    # ========== 5. 🔥 关键修复：使用进程组启动 mcp-proxy proxy 服务 ==========
+    log "  Starting mcp-proxy proxy with process group management..."
+
+    # 使用 setsid 创建新的会话和进程组，便于后续清理
     env \
         HOME=/home/user \
         DISPLAY=:0 \
@@ -1072,14 +1139,30 @@ function restart_mcp_proxy() {
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
         PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
-        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" --log-dir /app/container-logs -v \
-        > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
+        setsid bash -c "
+            exec mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file '$MCP_CONFIG_FILE' --log-dir /app/container-logs -v \
+            > '$MCP_LOG_DIR/mcp-proxy.log' 2>&1
+        " &
 
     local MCP_PID=$!
+    # 🔧 修复：使用更兼容的方式获取 PGID
+    local MCP_PGID=$(ps -p $MCP_PID -o pgid= 2>/dev/null | tr -d '[:space:]')
 
-    # 5. 等待端口就绪（最长 15 秒）
+    # 保存 PID 和 PGID 到文件，便于后续清理
+    # 🔧 修复：添加错误处理，回退到持久化目录
+    if ! echo "$MCP_PID" > /var/run/mcp-proxy.pid 2>/dev/null; then
+        mkdir -p /app/container-logs
+        echo "$MCP_PID" > /app/container-logs/mcp-proxy.pid
+    fi
+
+    if ! echo "$MCP_PGID" > /var/run/mcp-proxy.pgid 2>/dev/null; then
+        mkdir -p /app/container-logs
+        echo "$MCP_PGID" > /app/container-logs/mcp-proxy.pgid
+    fi
+
+    # ========== 6. 等待端口就绪（最长 15 秒）==========
     if wait_for_port 127.0.0.1 18099 15 && kill -0 $MCP_PID 2>/dev/null; then
-        log_success "MCP Proxy restarted successfully (PID: $MCP_PID)"
+        log_success "MCP Proxy restarted successfully (PID: $MCP_PID, PGID: $MCP_PGID)"
         return 0
     else
         log_warn "MCP Proxy restart failed, check log: $MCP_LOG_DIR/mcp-proxy.log"
@@ -1267,9 +1350,11 @@ function start_mcp_proxy_services() {
         DBUS_ADDR="$DBUS_SESSION_BUS_ADDRESS"
     fi
 
-    # 启动 mcp-proxy proxy 服务
+    # ========== 🔥 关键修复：使用进程组启动 mcp-proxy proxy 服务 ==========
     # 需要传递正确的环境变量（DISPLAY, D-Bus, 输入法等）
-    echo "  Starting mcp-proxy proxy on port 18099..."
+    echo "  Starting mcp-proxy proxy on port 18099 (with process group)..."
+
+    # 使用 setsid 创建新的会话和进程组，便于后续清理所有子进程
     env \
         HOME=/home/user \
         DISPLAY=:0 \
@@ -1283,14 +1368,30 @@ function start_mcp_proxy_services() {
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
         PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
-        nohup mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file "$MCP_CONFIG_FILE" --log-dir /app/container-logs -v \
-        > "$MCP_LOG_DIR/mcp-proxy.log" 2>&1 &
+        setsid bash -c "
+            exec mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file '$MCP_CONFIG_FILE' --log-dir /app/container-logs -v \
+            > '$MCP_LOG_DIR/mcp-proxy.log' 2>&1
+        " &
 
     local MCP_PID=$!
+    # 🔧 修复：使用更兼容的方式获取 PGID
+    local MCP_PGID=$(ps -p $MCP_PID -o pgid= 2>/dev/null | tr -d '[:space:]')
+
+    # 保存 PID 和 PGID 到文件，便于后续清理
+    # 🔧 修复：添加错误处理，回退到持久化目录
+    if ! echo "$MCP_PID" > /var/run/mcp-proxy.pid 2>/dev/null; then
+        mkdir -p /app/container-logs
+        echo "$MCP_PID" > /app/container-logs/mcp-proxy.pid
+    fi
+
+    if ! echo "$MCP_PGID" > /var/run/mcp-proxy.pgid 2>/dev/null; then
+        mkdir -p /app/container-logs
+        echo "$MCP_PGID" > /app/container-logs/mcp-proxy.pgid
+    fi
 
     # 等待 MCP Proxy 端口就绪（智能等待，最长 10 秒）
     if wait_for_port 127.0.0.1 18099 10 && kill -0 $MCP_PID 2>/dev/null; then
-        log_success "  MCP Proxy started (PID: $MCP_PID)"
+        log_success "  MCP Proxy started (PID: $MCP_PID, PGID: $MCP_PGID)"
         log_success "  MCP Proxy URL: http://127.0.0.1:18099"
         log_success "  Agent 可使用: mcp-proxy convert http://127.0.0.1:18099"
     else
@@ -1474,6 +1575,35 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
                 # 首次重启失败，等待 5 秒后重试一次
                 sleep 5
                 restart_mcp_proxy || log_warn "MCP Proxy restart failed after retry"
+            fi
+        fi
+
+        # ========== 🔥 定期清理僵尸进程任务（每 30 秒执行一次）==========
+        # 防止 chrome-headless 僵尸进程累积
+        local zombie_count=$(ps aux | grep -c '<defunct>' || echo "0")
+        if [ "$zombie_count" -gt 10 ]; then
+            log "  🔧 检测到 $zombie_count 个僵尸进程，开始清理..."
+
+            # 🔧 修复：使用更兼容的方式，避免 xargs -r
+            # 清理 chrome-headless 僵尸进程
+            local zombie_pids=$(ps aux | grep -E '[c]hrome-headless.*<defunct>' | awk '{print $2}')
+            if [ -n "$zombie_pids" ]; then
+                echo "$zombie_pids" | xargs kill -9 2>/dev/null || true
+            fi
+
+            # 清理 chromium 僵尸进程
+            zombie_pids=$(ps aux | grep -E '[c]hromium.*<defunct>' | awk '{print $2}')
+            if [ -n "$zombie_pids" ]; then
+                echo "$zombie_pids" | xargs kill -9 2>/dev/null || true
+            fi
+
+            # 清理其他僵尸进程（谨慎操作）
+            # 注意：只清理明确属于 chrome/chromium 的僵尸进程
+            # 其他僵尸进程应该由其父进程负责回收
+
+            local remaining_zombies=$(ps aux | grep -c '<defunct>' || echo "0")
+            if [ "$remaining_zombies" -lt "$zombie_count" ]; then
+                log_success "  ✅ 清理了 $((zombie_count - remaining_zombies)) 个僵尸进程"
             fi
         fi
     done
