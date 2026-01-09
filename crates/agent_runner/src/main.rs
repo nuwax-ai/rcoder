@@ -36,8 +36,7 @@ use router::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
-    let telemetry_config = TelemetryConfig::from_env("agent_runner")
-        .with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
+    let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
 
@@ -78,11 +77,17 @@ async fn main() -> anyhow::Result<()> {
     });
     info!("🔍 [MAIN] Worker 监控任务已启动");
 
-    // 创建清理配置
+    // 🆕 从配置中获取 Agent 清理配置，或使用默认值
+    let agent_cleanup_config = config.agent_cleanup.clone().unwrap_or_default();
     let cleanup_config = CleanupConfig {
-        idle_timeout: Duration::from_secs(3600),
-        cleanup_interval: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(agent_cleanup_config.idle_timeout_secs),
+        cleanup_interval: Duration::from_secs(agent_cleanup_config.cleanup_interval_secs),
     };
+
+    info!(
+        "🧹 [MAIN] Agent 清理配置: idle_timeout={}秒, cleanup_interval={}秒",
+        agent_cleanup_config.idle_timeout_secs, agent_cleanup_config.cleanup_interval_secs
+    );
 
     // 在主异步运行时中启动清理任务
     let _cleanup_handle = start_cleanup_task(cleanup_config.clone());
@@ -249,7 +254,7 @@ fn run_agent_worker_thread(
     info!("🚀 [agent_worker_thread] 线程启动，创建多线程运行时以支持并发 Agent...");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(10)  // 使用 10 个工作线程，支持更高并发处理多个 Agent
+        .worker_threads(10) // 使用 10 个工作线程，支持更高并发处理多个 Agent
         .thread_name("agent-worker")
         .enable_all()
         .build()
