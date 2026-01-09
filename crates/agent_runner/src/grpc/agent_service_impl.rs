@@ -448,6 +448,8 @@ impl AgentService for AgentServiceImpl {
                 warn!("⚠️ [gRPC] Agent Worker 正在启动，请求可能被延迟处理");
             }
             WorkerState::Stopping | WorkerState::Stopped => {
+                // 🔥 关键修复：清理 Pending 状态
+                AGENT_REGISTRY.clear_pending_if_exists(&project_id);
                 // Worker 不可用
                 return Err(Status::unavailable(
                     "Agent Worker 不可用，正在重启中。请稍后重试",
@@ -456,11 +458,16 @@ impl AgentService for AgentServiceImpl {
         }
 
         // 🆕 使用 manager 发送（带状态检查）
-        self.app_state
+        if let Err(e) = self
+            .app_state
             .agent_worker_manager
             .try_send(local_task_request)
             .await
-            .map_err(|e| Status::internal(format!("发送任务失败: {}", e)))?;
+        {
+            // 🔥 关键修复：发送失败时清理 Pending 状态
+            AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+            return Err(Status::internal(format!("发送任务失败: {}", e)));
+        }
 
         // 等待响应
         match chat_prompt_rx.await {
@@ -845,6 +852,32 @@ impl AgentService for AgentServiceImpl {
                         info!(
                             "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
                             actual_session_id
+                        );
+                    }
+
+                    // 🔥 关键修复：清理 AGENT_REGISTRY，将状态更新为 Idle
+                    // 这样后续请求才能通过 Busy 检查
+                    if let Some(agent_info_ref) = AGENT_REGISTRY.get_agent_info(&project_id) {
+                        use chrono::Utc;
+                        use shared_types::AgentStatus;
+
+                        // 🎯 使用 CoW 模式更新状态
+                        let mut info_clone = agent_info_ref.value().clone();
+                        info_clone.status = AgentStatus::Idle;
+                        info_clone.last_activity = Utc::now();
+                        drop(agent_info_ref); // 释放读锁
+
+                        // 🔒 原子性地更新 AGENT_REGISTRY
+                        AGENT_REGISTRY.update_agent_info(&project_id, info_clone);
+
+                        info!(
+                            "✅ [gRPC] Agent 状态已更新为 Idle: project_id={}, session_id={}",
+                            project_id, actual_session_id
+                        );
+                    } else {
+                        warn!(
+                            "⚠️ [gRPC] Agent 不在 Registry 中，无法更新状态: project_id={}",
+                            project_id
                         );
                     }
 
