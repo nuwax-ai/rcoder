@@ -186,6 +186,62 @@ impl AgentSessionRegistry {
         debug!("[Registry] 更新 agent_info: project={}", project_id);
     }
 
+    /// 🆕 尝试原子性地更新 agent_info
+    ///
+    /// 使用 DashMap 的 entry API 进行原子性条件更新，避免竞态条件
+    ///
+    /// # 参数
+    /// - `project_id`: 项目 ID
+    /// - `f`: 更新函数，返回 true 表示更新成功，false 表示无需更新
+    ///
+    /// # 返回
+    /// - true: 更新成功
+    /// - false: Agent 不存在或条件不满足（未更新）
+    ///
+    /// # 示例
+    /// ```rust
+    /// registry.try_update_agent_info("project-123", |info| {
+    ///     if info.status == AgentStatus::Active {
+    ///         info.status = AgentStatus::Idle;
+    ///         true  // 更新成功
+    ///     } else {
+    ///         false  // 无需更新
+    ///     }
+    /// });
+    /// ```
+    pub fn try_update_agent_info<F>(&self, project_id: &str, mut f: F) -> bool
+    where
+        F: FnMut(&mut ProjectAndAgentInfo) -> bool,
+    {
+        use dashmap::mapref::entry::Entry;
+
+        match self.agent_info_map.entry(project_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let info = entry.get_mut();
+                if f(info) {
+                    debug!(
+                        "[Registry] 原子性更新 agent_info 成功: project={}",
+                        project_id
+                    );
+                    true
+                } else {
+                    debug!(
+                        "[Registry] agent_info 无需更新（条件不满足）: project={}",
+                        project_id
+                    );
+                    false
+                }
+            }
+            Entry::Vacant(_) => {
+                debug!(
+                    "[Registry] agent_info 不存在，无法更新: project={}",
+                    project_id
+                );
+                false
+            }
+        }
+    }
+
     /// 设置项目为 Pending 状态（用于预占位，防止并发请求）
     ///
     /// 如果项目不存在，则创建一个占位记录

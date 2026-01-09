@@ -1178,7 +1178,7 @@ impl PortProxy {
         let container_ip = match self.vnc_backends.get(user_id) {
             Some(ip_ref) => ip_ref.value().clone(),
             None => {
-                warn!("找不到用户 {} 的 VNC 后端", user_id);
+                info!("找不到用户 {} 的 VNC 后端", user_id);
                 return Err(
                     pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
                         .more_context(format!("找不到用户 {} 的 VNC 后端，请先创建容器", user_id)),
