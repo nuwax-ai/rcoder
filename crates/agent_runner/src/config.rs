@@ -129,7 +129,7 @@ impl AgentCleanupConfig {
 }
 
 fn default_idle_timeout() -> u64 {
-    180 // 3 分钟
+    300 // 5 分钟
 }
 
 fn default_cleanup_interval() -> u64 {
@@ -399,7 +399,7 @@ proxy_config:
 
 # Agent 清理配置
 # 如果省略此配置块，将使用以下默认值：
-#   - idle_timeout_secs: 180 (3分钟)
+#   - idle_timeout_secs: 300 (5分钟)
 #   - cleanup_interval_secs: 30 (30秒)
 agent_cleanup:
   # Agent 闲置超时时间（秒）
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn test_agent_cleanup_default_values() {
         let config = AgentCleanupConfig::default();
-        assert_eq!(config.idle_timeout_secs, 180);
+        assert_eq!(config.idle_timeout_secs, 300);
         assert_eq!(config.cleanup_interval_secs, 30);
     }
 
