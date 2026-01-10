@@ -29,8 +29,8 @@ use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::session_registry::SessionRegistry;
 
 // 导入生命周期管理
-use super::lifecycle::AgentLifecycleGuard;
 use super::channel::PromptHandlerConfig;
+use super::lifecycle::AgentLifecycleGuard;
 
 /// 使用默认版本
 const VERSION: agent_client_protocol::ProtocolVersion =
@@ -367,11 +367,50 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
         // 从配置加载 Agent 参数（传递 service_type）
-        let agent_config =
+        let default_agent_config =
             load_agent_config(model_provider.as_ref(), &start_config.service_type).await?;
-        let command_path = &agent_config.command;
-        let command_args = &agent_config.args;
-        info!("Claude Code ACP 命令: {} {:?}", command_path, command_args);
+
+        // 🆕 检查是否有自定义 agent_server 配置覆盖
+        let (command_path, command_args, agent_config) =
+            if let Some(ref agent_server_override) = start_config.agent_server_override {
+                info!(
+                    "🎯 使用用户指定的 Agent 服务器配置: command={:?}, args={:?}",
+                    agent_server_override.command, agent_server_override.args
+                );
+
+                // 使用自定义 command（如果提供），否则用默认
+                let cmd = agent_server_override
+                    .command
+                    .clone()
+                    .unwrap_or_else(|| default_agent_config.command.clone());
+
+                // 使用自定义 args（如果提供），否则用默认
+                let args = agent_server_override
+                    .args
+                    .clone()
+                    .unwrap_or_else(|| default_agent_config.args.clone());
+
+                // 合并环境变量：默认配置 + 自定义配置（自定义覆盖默认）
+                let mut merged_config = default_agent_config.clone();
+                if let Some(ref custom_env) = agent_server_override.env {
+                    for (k, v) in custom_env {
+                        merged_config.env.insert(k.clone(), v.clone());
+                    }
+                }
+
+                info!("Claude Code ACP 命令（自定义）: {} {:?}", cmd, args);
+                (cmd, args, merged_config)
+            } else {
+                info!(
+                    "Claude Code ACP 命令（默认）: {} {:?}",
+                    default_agent_config.command, default_agent_config.args
+                );
+                (
+                    default_agent_config.command.clone(),
+                    default_agent_config.args.clone(),
+                    default_agent_config,
+                )
+            };
 
         // 创建通道
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequestWrapper>();
