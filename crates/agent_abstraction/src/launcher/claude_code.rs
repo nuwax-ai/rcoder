@@ -390,10 +390,17 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                     .clone()
                     .unwrap_or_else(|| default_agent_config.args.clone());
 
-                // 合并环境变量：默认配置 + 自定义配置（自定义覆盖默认）
+                // 合并环境变量：默认配置 + 自定义配置
+                // 🔒 安全机制：保留关键环境变量，防止自定义配置覆盖
                 let mut merged_config = default_agent_config.clone();
                 if let Some(ref custom_env) = agent_server_override.env {
                     for (k, v) in custom_env {
+                        // ⚠️ 关键安全检查：不允许覆盖 ANTHROPIC_API_KEY 和 ANTHROPIC_BASE_URL
+                        // 这些变量由系统管理，确保使用代理和占位符密钥
+                        if k == "ANTHROPIC_API_KEY" || k == "ANTHROPIC_BASE_URL" {
+                            debug!("⚠️ 忽略自定义环境变量 {}: {} (系统管理)", k, v);
+                            continue;
+                        }
                         merged_config.env.insert(k.clone(), v.clone());
                     }
                 }
