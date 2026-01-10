@@ -67,6 +67,7 @@ where
 
         // 3. 使用 PromptConfigAssembler 组装配置
         let default_agent_id = "claude-code-acp";
+
         // 根据请求中的 service_type 加载对应配置
         let servers_config =
             AgentServersConfig::load_or_default_for_service(&request.prompt_message.service_type)
@@ -77,11 +78,17 @@ where
             .with_user_prompt_template(request.prompt_message.user_prompt_template_override.clone())
             .with_agent_config(request.prompt_message.agent_config_override.clone());
 
+        // 🆕 获取用户指定的 agent_id（如果有）
+        let agent_id = assembler.get_agent_id(default_agent_id);
+        debug!("🎯 使用的 Agent ID: {}", agent_id);
+
         // 获取最终的系统提示词（入参有值则使用入参，否则使用默认配置）
-        let system_prompt = assembler.get_system_prompt(default_agent_id);
+        // 🆕 使用实际 agent_id 而不是 default_agent_id
+        let system_prompt = assembler.get_system_prompt(&agent_id);
         // 应用用户提示词模板（如果有）
+        // 🆕 使用实际 agent_id 而不是 default_agent_id
         let final_user_prompt =
-            assembler.apply_user_prompt(default_agent_id, &request.prompt_message.content);
+            assembler.apply_user_prompt(&agent_id, &request.prompt_message.content);
 
         info!(
             "📝 提示词处理 - 系统提示词: has_override={}, length={} | 用户提示词: has_template={}, original_len={}, final_len={}",
@@ -118,10 +125,22 @@ where
         let mcp_servers = convert_context_servers(&context_servers);
         debug!("🔌 转换后的 MCP 服务器数量: {}", mcp_servers.len());
 
-        // 构建 AgentStartConfig 并传递 MCP 服务器和 service_type
+        // 构建 AgentStartConfig 并传递 MCP 服务器、service_type
         let mut start_config = AgentStartConfig::new(request.prompt_message.service_type.clone())
             .with_system_prompt(system_prompt)
             .with_mcp_servers(mcp_servers);
+
+        // 🆕 如果用户指定了 agent_server 配置，添加到 start_config
+        // 注意：这里直接使用用户传入的配置，由 launcher 层负责与默认配置合并
+        if let Some(ref override_config) = request.prompt_message.agent_config_override {
+            if let Some(ref agent_server) = override_config.agent_server {
+                debug!(
+                    "📝 使用用户指定的 Agent 服务器配置: command={:?}, args={:?}",
+                    agent_server.command, agent_server.args
+                );
+                start_config = start_config.with_agent_server_override(agent_server.clone());
+            }
+        }
 
         // Resume 策略：只要用户传入 session_id，就尝试 resume
         //
