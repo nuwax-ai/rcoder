@@ -19,6 +19,9 @@ test-blocking = []  # 启用测试用阻塞注入 (用于极端场景测试)
 # OpenTelemetry 追踪 feature
 otel = []  # 启用 OpenTelemetry 追踪功能
 
+# Pyroscope 连续性能分析
+pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
@@ -73,6 +76,7 @@ futures-util = { workspace = true }
 piper = "0.2"
 base64 = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 
 # OpenTelemetry
 opentelemetry = { workspace = true }
@@ -92,3 +96,7 @@ ringbuf = { workspace = true }
 
 # Atomic swap for sender replacement
 arc-swap = "1.8"
+
+# Pyroscope Continuous Profiling
+pyroscope = { workspace = true, optional = true }
+pyroscope_pprofrs = { workspace = true, optional = true }

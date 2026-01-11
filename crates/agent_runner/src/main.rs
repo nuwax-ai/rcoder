@@ -15,6 +15,10 @@ mod handler;
 mod model;
 mod proxy_agent;
 
+// 🔥 Pyroscope Profiler 模块（可选：需要 pyroscope feature）
+#[cfg(feature = "pyroscope")]
+mod profiler;
+
 // 🔥 OpenTelemetry 追踪模块（可选：保留用于向后兼容）
 #[allow(dead_code)]
 mod otel_tracing;
@@ -35,10 +39,35 @@ use router::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // ✅ 初始化 Rustls CryptoProvider（必须在最前面，在任何可能使用 TLS 的代码之前）
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
+
+    // 🆕 Pyroscope Profiler 初始化（可选：需要 pyroscope feature）
+    #[cfg(feature = "pyroscope")]
+    let _pyroscope_guard: Option<profiler::ProfilerGuard> = {
+        info!("Pyroscope profiling feature enabled");
+        match profiler::init_pyroscope_profiler_default() {
+            Ok(guard) => {
+                info!("Pyroscope profiler initialized successfully");
+                Some(guard)
+            }
+            Err(e) => {
+                warn!("Failed to initialize Pyroscope profiler: {}", e);
+                warn!("Continuing without Pyroscope profiling");
+                None
+            }
+        }
+    };
+
+    #[cfg(not(feature = "pyroscope"))]
+    let _pyroscope_guard: Option<()> = None;
 
     info!("Starting rcoder - AI-powered development platform");
 

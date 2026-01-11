@@ -40,8 +40,10 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # 复制整个项目源代码（通过 .dockerignore 排除不需要的文件）
 COPY . .
 
-# 构建所有二进制文件（包括 rcoder 和 agent_runner）
-RUN cargo build --release --bin rcoder --bin agent_runner
+# 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
+ARG CARGO_FLAGS=""
+RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
+    cargo build --release --bin rcoder --bin agent_runner ${CARGO_FLAGS}
 
 # ============================================================================
 # 第二阶段：运行阶段（基于基础镜像）

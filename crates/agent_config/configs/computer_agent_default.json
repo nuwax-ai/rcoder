@@ -36,12 +36,9 @@
   "context_servers": {
     "chrome-devtools": {
       "source": "custom",
-      "enabled": true,
+      "enabled": false,
       "command": "mcp-proxy",
-      "args": [
-        "convert",
-        "http://127.0.0.1:18099"
-      ],
+      "args": ["convert", "http://127.0.0.1:18099"],
       "env": {},
       "metadata": {
         "description": "Chrome DevTools MCP - 通过共享的 MCP Proxy 服务连接浏览器自动化",
@@ -58,22 +55,16 @@
     },
     "context7": {
       "source": "custom",
-      "enabled": true,
+      "enabled": false,
       "command": "bunx",
-      "args": [
-        "-y",
-        "@upstash/context7-mcp"
-      ],
+      "args": ["-y", "@upstash/context7-mcp"],
       "env": {}
     },
     "puppeteer": {
       "source": "custom",
       "enabled": false,
       "command": "npx",
-      "args": [
-        "-y",
-        "@anthropic/mcp-server-puppeteer"
-      ],
+      "args": ["-y", "@anthropic/mcp-server-puppeteer"],
       "env": {
         "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium"
       },

@@ -473,8 +473,7 @@ RUN apt-get update && \
 # 环境变量设置
 ENV R_VERSION=4.4.2
 
-ENV R_HOME=/opt/R/${R_VERSION} \
-    JAVA_HOME=/opt/java/openjdk
+ENV R_HOME=/opt/R/${R_VERSION}
 
 # # 创建默认用户
 # RUN useradd -ms /bin/bash user && \
@@ -521,10 +520,17 @@ RUN echo '[Service]\n\
 
 RUN systemctl enable chrony
 
-# Java 配置 (without Jupyter integration)
-COPY --from=eclipse-temurin:17-jdk $JAVA_HOME $JAVA_HOME
-RUN rm -f /usr/bin/java && \
-    ln -s ${JAVA_HOME}/bin/java /usr/bin/java
+# Java 配置 (完整 JDK 工具集)
+RUN apt-get update && \
+    apt-get install -y openjdk-17-jdk && \
+    # 验证安装
+    java -version && \
+    javac -version && \
+    echo "✅ OpenJDK 17 installed with full toolset" && \
+    # 清理缓存
+    apt-get autoremove -y && \
+    apt-get autoclean && \
+    rm -rf /var/lib/apt/lists/*
 
 # ============================================================================
 # 📦 Maven 配置（使用阿里云镜像加速）

@@ -39,6 +39,11 @@ use docker_manager::container_stop;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // ✅ 初始化 Rustls CryptoProvider（必须在最前面，在任何可能使用 TLS 的代码之前）
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("rcoder").with_file_log("rcoder"); // 启用文件日志，前缀为 rcoder
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;

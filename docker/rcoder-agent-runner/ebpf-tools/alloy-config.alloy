@@ -1,0 +1,221 @@
+// ============================================================================
+// Grafana Alloy 配置文件 - 用于监控 agent_runner 进程
+// ============================================================================
+// 此配置文件实现：
+// 1. 自动发现 agent_runner 及其子进程
+// 2. 使用 eBPF 进行 CPU 性能剖析
+// 3. 将性能数据发送到 Pyroscope Server
+//
+// 进程阻塞分析方案：
+// - Alloy (eBPF): 持续采集 CPU 性能数据，发送到 Pyroscope Web UI
+// - offcputime-bpfcc: 定期生成 Off-CPU 阻塞火焰图（SVG 文件）
+// ============================================================================
+
+// ============================================================================
+// 进程发现 - 发现所有运行中的进程
+// ============================================================================
+discovery.process "all" {
+}
+
+// ============================================================================
+// 进程过滤 - 只保留 agent_runner 相关进程
+// ============================================================================
+discovery.relabel "agent_runner_filter" {
+    targets = discovery.process.all.targets
+
+    // 规则 1: 保留 agent_runner 主进程及其所有子进程
+    // 匹配条件：进程名是 agent_runner 或者父进程 PID 是 1
+    rule {
+        source_labels = ["__meta_process_exe", "__meta_process_ppid"]
+        regex   = ".*/agent_runner|;1"
+        action  = "keep"
+    }
+
+    // 规则 2: 添加进程 PID 标签（用于区分不同进程实例）
+    rule {
+        source_labels = ["__meta_process_pid"]
+        target_label  = "process_pid"
+    }
+
+    // 规则 3: 添加进程名称标签（短名称，如 agent_runner）
+    rule {
+        source_labels = ["__meta_process_comm"]
+        target_label  = "process_name"
+    }
+
+    // 规则 4: 添加完整执行路径标签
+    rule {
+        source_labels = ["__meta_process_exe"]
+        target_label  = "process_exe"
+    }
+
+    // 规则 5: 添加父进程 PID 标签（用于识别进程层级）
+    rule {
+        source_labels = ["__meta_process_ppid"]
+        target_label  = "parent_pid"
+    }
+
+    // 规则 6: 添加命令行参数标签（用于区分不同的启动参数）
+    rule {
+        source_labels = ["__meta_process_cmdline"]
+        target_label  = "process_cmdline"
+    }
+
+    // 规则 7: 添加项目 ID 标签
+    rule {
+        target_label = "project_id"
+        replacement  = env("PROJECT_ID")
+    }
+
+    // 规则 8: 添加环境标签
+    rule {
+        target_label = "env"
+        replacement  = env("ENV")
+    }
+
+    // 规则 9: 添加容器 ID 标签
+    rule {
+        target_label = "container_id"
+        replacement  = env("HOSTNAME")
+    }
+
+    // 规则 10: 添加应用名称标签（用于 Pyroscope UI 分组）
+    rule {
+        target_label = "job"
+        replacement  = "agent_runner"
+    }
+
+    // 规则 11: 添加实例标签（区分不同容器实例）
+    rule {
+        target_label = "instance"
+        replacement  = env("HOSTNAME", "localhost")
+    }
+}
+
+// ============================================================================
+// eBPF 性能分析组件
+// ============================================================================
+pyroscope.ebpf "agent_runner" {
+    // 将采集的数据转发到 Pyroscope 写入端点
+    forward_to = [pyroscope.write.remote.receiver]
+
+    // 监控的进程目标
+    targets = discovery.relabel.agent_runner_filter.output
+
+    // 采集配置
+    sample_rate = 97                      // 每秒采样次数（默认 97 Hz）
+    collect_interval = "15s"              // 采集频率
+
+    // 性能数据类型
+    collect_user_profile   = true        // 采集用户空间性能数据
+    collect_kernel_profile = false       // 不采集内核空间（减少开销）
+
+    // Python 支持（子进程可能是 Python）
+    python_enabled = true
+
+    // 外部标签（附加到所有性能数据）
+    external_labels = {
+        "cluster"    = "rcoder",
+        "datacenter" = "local",
+    }
+}
+
+// ============================================================================
+// 写入 Pyroscope Server
+// ============================================================================
+pyroscope.write "remote" {
+    // Pyroscope Server 端点配置
+    endpoint {
+        // 从环境变量 PYROSCOPE_URL 读取，默认 http://pyroscope:4040
+        url = env("PYROSCOPE_URL", "http://pyroscope:4040")
+    }
+
+    // 外部标签（全局，附加到此客户端发送的所有数据）
+    external_labels = {
+        "env"        = env("ENV", "dev"),
+        "datacenter" = "local",
+        "cluster"    = "rcoder",
+    }
+
+    // 用于在 Pyroscope UI 中分组数据的租户 ID
+    tenant_id = "1"
+}
+
+// ============================================================================
+// Prometheus 进程指标导出
+// ============================================================================
+prometheus.exporter.process "agent_runner" {
+    // 使用与 eBPF 相同的进程发现
+    targets = discovery.relabel.agent_runner_filter.output
+}
+
+// 附加进程元数据标签
+prometheus.relabel "process_metrics_labels" {
+    targets = prometheus.exporter.process.agent_runner.targets
+
+    // 添加项目 ID 标签
+    rule {
+        target_label = "project_id"
+        replacement  = env("PROJECT_ID")
+    }
+
+    // 添加环境标签
+    rule {
+        target_label = "env"
+        replacement  = env("ENV", "dev")
+    }
+
+    // 添加容器 ID 标签
+    rule {
+        target_label = "container_id"
+        replacement  = env("HOSTNAME")
+    }
+
+    // 添加应用名称标签
+    rule {
+        target_label = "app"
+        replacement  = "agent_runner"
+    }
+
+    // 添加实例标签
+    rule {
+        target_label = "instance"
+        replacement  = env("HOSTNAME", "localhost")
+    }
+}
+
+// ============================================================================
+// Prometheus Remote Write
+// ============================================================================
+prometheus.remote_write "metrics" {
+    endpoint {
+        url = env("PROMETHEUS_URL", "http://prometheus:9090/api/v1/write")
+    }
+
+    // 外部标签
+    external_labels = {
+        "env"        = env("ENV", "dev"),
+        "datacenter" = "local",
+        "cluster"    = "rcoder",
+    }
+
+    // 数据写入队列
+    queued_send {
+        capacity = 10000
+        min_shards = 1
+        max_shards = 10
+        min_backoff = "100ms"
+        max_backoff = "10s"
+    }
+}
+
+// ============================================================================
+// Scrape Prometheus 进程指标
+// ============================================================================
+prometheus.scrape "process_metrics" {
+    targets    = prometheus.relabel.process_metrics_labels.output
+    forward_to = [prometheus.remote_write.metrics.receiver]
+
+    scrape_interval = "15s"
+    scrape_timeout  = "10s"
+}

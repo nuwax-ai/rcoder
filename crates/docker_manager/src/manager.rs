@@ -166,11 +166,36 @@ impl DockerManager {
         }
 
         // 构建环境变量
-        let env_vars: Vec<String> = config
+        let mut env_vars: Vec<String> = config
             .env_vars
             .into_iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
+
+        // 🔧 eBPF 调试模式：启用自动火焰图生成、Grafana Alloy 持续剖析和 Off-CPU 阻塞分析
+        #[cfg(feature = "ebpf-debug")]
+        {
+            // 通用监控配置（共享）
+            env_vars.push("SAMPLE_DURATION=30".to_string());      // 采样时长（秒）
+            env_vars.push("GENERATE_INTERVAL=60".to_string());    // 生成间隔（秒）
+            env_vars.push("MAX_FLAMEFILES=50".to_string());        // 最大火焰图文件数
+            env_vars.push("MAX_OFFCPU_FILES=50".to_string());     // 最大 Off-CPU 文件数
+
+            // 自动火焰图生成
+            env_vars.push("ENABLE_EBPF_AUTO_FLAMEGRAPH=true".to_string());
+
+            // Grafana Alloy 配置（替代已废弃的 Pyroscope Agent）
+            env_vars.push("ENABLE_ALLOY=true".to_string());
+            env_vars.push("PYROSCOPE_URL=http://pyroscope:4040".to_string());
+
+            // Off-CPU 阻塞分析配置
+            env_vars.push("ENABLE_OFFCPUTIME=true".to_string());
+            env_vars.push("OFFCPU_DURATION=30".to_string());      // Off-CPU 采样时长
+            env_vars.push("OFFCPU_INTERVAL=60".to_string());      // Off-CPU 生成间隔（60秒，与系统调用监控一致）
+
+            // 系统调用监控配置
+            env_vars.push("ENABLE_SYSCALL_MONITOR=true".to_string());
+        }
 
         // 构建端口映射
         let mut port_bindings_map = HashMap::new();
@@ -189,18 +214,30 @@ impl DockerManager {
             mounts: Some(mounts),
             port_bindings: Some(port_bindings_map),
             auto_remove: Some(config.auto_remove),
-            // 🔒 容器网络安全配置
-            // ⚠️ 重要：这些配置只能提供基础防护，无法完全阻止容器通过 IP 地址访问内网
-            // 如需完全隔离，必须在宿主机配置 iptables 规则（但会影响整个网络的所有容器）
-            //
-            // 当前配置的作用：
-            // 1. 移除 NET_RAW 和 NET_ADMIN 能力 - 防止网络嗅探和路由劫持
-            cap_drop: Some(vec![
-                "NET_RAW".to_string(),   // 禁止原始套接字（防止 ping、traceroute 等）
-                "NET_ADMIN".to_string(), // 禁止网络管理（防止修改路由表）
-            ]),
-            // 禁用特权模式
+
+            // 🔧 容器权限配置：根据 feature 控制特权模式
+            #[cfg(feature = "ebpf-debug")]
+            // 调试模式：启用容器特权，允许使用 eBPF 工具
+            // 通过 make dev-restart 启用此模式
+            privileged: Some(true),
+
+            #[cfg(not(feature = "ebpf-debug"))]
+            // 生产模式：限制容器权限，提升安全性
             privileged: Some(false),
+
+            #[cfg(feature = "ebpf-debug")]
+            cap_add: Some(vec![
+                "SYS_ADMIN".to_string(),    // eBPF 需要
+                "NET_ADMIN".to_string(),    // 网络监控
+                "SYS_PTRACE".to_string(),   // ptrace 追踪
+            ]),
+
+            #[cfg(not(feature = "ebpf-debug"))]
+            cap_drop: Some(vec![
+                "NET_RAW".to_string(),      // 禁止原始套接字（防止 ping、traceroute 等）
+                "NET_ADMIN".to_string(),    // 禁止网络管理（防止修改路由表）
+            ]),
+
             ..Default::default()
         };
 

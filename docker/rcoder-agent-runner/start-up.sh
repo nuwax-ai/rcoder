@@ -1612,6 +1612,148 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 # 启动 agent_runner 服务，支持从环境变量读取端口
 log "Starting agent_runner service on port ${PORT:-8086}..."
 
+# 🔧 如果启用 eBPF 调试模式，启动自动火焰图生成
+if [ "${ENABLE_EBPF_AUTO_FLAMEGRAPH:-false}" = "true" ]; then
+    log "🔧 启动 eBPF 自动火焰图生成..."
+    /usr/local/bin/ebpf-tools/auto-flamegraph.sh start &
+    AUTO_FLAME_PID=$!
+    log "✅ eBPF 自动火焰图生成已启动 (PID: $AUTO_FLAME_PID)"
+    log "📋 火焰图将每 ${GENERATE_INTERVAL:-60} 秒生成一次"
+    log "💡 火焰图保存到: ${DIAG_OUTPUT_DIR:-/app/container-logs/diag}/flamegraph-*.svg"
+fi
+
+# ============================================================================
+# 📊 Grafana Alloy - 持续性能数据采集（替代已废弃的 Pyroscope Agent）
+# ============================================================================
+if [ "${ENABLE_ALLOY:-false}" = "true" ]; then
+    log "🔧 启动 Grafana Alloy (eBPF Profiling)..."
+
+    # Pyroscope Server 地址
+    PYROSCOPE_URL="${PYROSCOPE_URL:-http://pyroscope:4040}"
+
+    # 设置环境变量（用于 Alloy 配置文件）
+    export PYROSCOPE_URL
+    export PROJECT_ID="${PROJECT_ID:-default}"
+    export ENV="${ENV:-dev}"
+    export HOSTNAME="${HOSTNAME:-$(hostname)}"
+
+    # 显示环境变量（用于调试）
+    log "  环境变量:"
+    log "    PYROSCOPE_URL=$PYROSCOPE_URL"
+    log "    PROJECT_ID=$PROJECT_ID"
+    log "    ENV=$ENV"
+    log "    HOSTNAME=$HOSTNAME"
+
+    # 等待 Pyroscope Server 就绪
+    log "  等待 Pyroscope Server 就绪: $PYROSCOPE_URL"
+    local pyro_ready=false
+    local counter=0
+    while [ $counter -lt 60 ]; do
+        if curl -s -o /dev/null -w "%{http_code}" "$PYROSCOPE_URL" 2>/dev/null | grep -q "200\|404"; then
+            pyro_ready=true
+            break
+        fi
+        sleep 0.5
+        counter=$((counter + 1))
+    done
+
+    if [ "$pyro_ready" = false ]; then
+        log_warn "  Pyroscope Server 未就绪，跳过 Alloy 启动"
+    else
+        log_success "  Pyroscope Server 已就绪"
+
+        # 创建日志目录
+        mkdir -p "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag"
+
+        # 检查 Alloy 是否安装
+        if ! command -v alloy >/dev/null 2>&1; then
+            log_warn "  Alloy 未安装，跳过启动"
+        else
+            # 验证 Alloy 配置文件
+            log "  验证 Alloy 配置文件..."
+            if alloy validate /etc/alloy/config.alloy 2>&1 | tee -a "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log"; then
+                log_success "  Alloy 配置文件验证通过"
+            else
+                log_warn "  Alloy 配置文件验证失败，但仍将尝试启动"
+            fi
+
+            # 后台启动 Grafana Alloy
+            # 注意：eBPF 需要 root 权限，容器已通过 privileged 运行
+            log "  启动 Alloy 进程..."
+            nohup alloy run /etc/alloy/config.alloy \
+                > "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log" 2>&1 &
+
+            local alloy_pid=$!
+            log_success "  Grafana Alloy 已启动 (PID: $alloy_pid)"
+            log "  📊 性能数据发送到: $PYROSCOPE_URL"
+            log "  💡 Web UI: http://localhost:4040"
+            log "  🔍 监控进程: agent_runner 及其子进程"
+            log "  📝 日志文件: ${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log"
+
+            # 等待 3 秒后检查 Alloy 进程状态
+            sleep 3
+            if ps -p "$alloy_pid" > /dev/null 2>&1; then
+                log_success "  Alloy 进程运行中"
+                # 显示最近的日志（用于调试）
+                log "  最近的 Alloy 日志:"
+                tail -n 5 "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log" 2>/dev/null | while IFS= read -r line; do
+                    log "    $line"
+                done
+            else
+                log_warn "  Alloy 进程已退出，请检查日志"
+                log "  错误日志:"
+                tail -n 10 "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log" 2>/dev/null | while IFS= read -r line; do
+                    log "    $line"
+                done
+            fi
+        fi
+    fi
+fi
+
+# ============================================================================
+# 🔍 Off-CPU 阻塞监控 (offcputime-bpfcc)
+# ============================================================================
+if [ "${ENABLE_OFFCPUTIME:-false}" = "true" ]; then
+    log "🔧 启动 Off-CPU 阻塞监控..."
+
+    # 检查 offcputime-bpfcc 是否可用
+    if ! command -v offcputime-bpfcc &> /dev/null; then
+        log_warn "  offcputime-bpfcc 未安装，跳过 Off-CPU 监控"
+    else
+        # 创建 offcpu-monitor.sh 脚本（如果不存在）
+        if [ ! -f "/usr/local/bin/ebpf-tools/offcpu-monitor.sh" ]; then
+            log_warn "  offcpu-monitor.sh 未找到，跳过 Off-CPU 监控"
+        else
+            # 启动 Off-CPU 监控
+            /usr/local/bin/ebpf-tools/offcpu-monitor.sh start &
+            local offcpu_monitor_pid=$!
+            log_success "  Off-CPU 监控已启动 (PID: $offcpu_monitor_pid)"
+            log "  📊 阻塞火焰图将每 ${OFFCPU_INTERVAL:-300} 秒生成一次"
+            log "  💡 阻塞火焰图保存到: ${DIAG_OUTPUT_DIR:-/app/container-logs/diag}/offcpu-*.svg"
+        fi
+    fi
+fi
+
+# ============================================================================
+# 🔍 系统调用监控 (syscalls)
+# ============================================================================
+if [ "${ENABLE_SYSCALL_MONITOR:-false}" = "true" ]; then
+    log "🔧 启动系统调用监控..."
+
+    # 检查 syscount-bpfcc 是否可用
+    if ! command -v syscount-bpfcc &> /dev/null; then
+        log_warn "  syscount-bpfcc 未安装，跳过系统调用监控"
+    else
+        # 启动系统调用监控
+        /usr/local/bin/ebpf-tools/syscall-monitor.sh start &
+        local syscall_monitor_pid=$!
+        log_success "  系统调用监控已启动 (PID: $syscall_monitor_pid)"
+        log "  📊 系统调用统计将每 ${GENERATE_INTERVAL:-60} 秒生成一次"
+        log "  📝 日志文件: ${DIAG_OUTPUT_DIR:-/app/container-logs/diag}/syscall-monitor.log"
+        log "  💡 统计结果保存到: ${DIAG_OUTPUT_DIR:-/app/container-logs/diag}/syscall-count-*.txt"
+    fi
+fi
+
 # ========== 关键修复：确保 agent_runner 及其子进程继承输入法环境 ==========
 # 从 /tmp/dbus-session-env 加载 D-Bus 地址
 # ========== 创建全局输入法环境配置文件 ==========
