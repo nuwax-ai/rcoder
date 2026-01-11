@@ -84,6 +84,69 @@ pub struct LauncherConnectionInfoComplete {
     pub lifecycle_guard: Arc<AgentLifecycleGuard>,
 }
 
+/// 替换环境变量中的 MODEL_PROVIDER_* 占位符
+///
+/// # 参数
+/// * `env` - 环境变量 HashMap 的可变引用
+/// * `provider` - 模型提供者配置
+///
+/// # 占位符说明
+/// - `{MODEL_PROVIDER_API_KEY}` -> provider.api_key
+/// - `{MODEL_PROVIDER_BASE_URL}` -> provider.base_url
+/// - `{MODEL_PROVIDER_DEFAULT_MODEL}` -> provider.default_model
+/// - `{MODEL_PROVIDER_NAME}` -> provider.name
+///
+/// # 注意
+/// 此函数**跳过** `ANTHROPIC_API_KEY` 和 `ANTHROPIC_BASE_URL`，这两个变量由系统单独管理
+fn replace_env_placeholders(
+    env: &mut HashMap<String, String>,
+    provider: &ModelProviderConfig,
+) {
+    for (key, value) in env.iter_mut() {
+        // 跳过系统管理的环境变量
+        if key == "ANTHROPIC_API_KEY" || key == "ANTHROPIC_BASE_URL" {
+            continue;
+        }
+
+        let original = value.clone();
+        *value = value
+            .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
+            .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
+            .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
+            .replace("{MODEL_PROVIDER_NAME}", &provider.name);
+
+        // 只有值发生变化时才记录日志
+        if *value != original {
+            debug!("🔄 替换环境变量占位符: {} = {} -> {}", key, original, *value);
+        }
+    }
+}
+
+/// 设置系统管理的环境变量占位符
+///
+/// # 参数
+/// * `env` - 环境变量 HashMap 的可变引用
+///
+/// # 功能
+/// 将 `ANTHROPIC_API_KEY` 和 `ANTHROPIC_BASE_URL` 设置为特定的占位符值：
+/// - `ANTHROPIC_API_KEY`: sk-placeholder
+/// - `ANTHROPIC_BASE_URL`: http://localhost:8088/api/{SERVICE_UUID}
+fn set_system_managed_placeholders(env: &mut HashMap<String, String>) {
+    for (key, value) in env.iter_mut() {
+        if key == "ANTHROPIC_API_KEY" {
+            if value.contains("{MODEL_PROVIDER_API_KEY}") || value.is_empty() {
+                *value = "sk-placeholder".to_string();
+                debug!("🔒 设置 ANTHROPIC_API_KEY 为占位符密钥");
+            }
+        } else if key == "ANTHROPIC_BASE_URL" {
+            if value.contains("{MODEL_PROVIDER_BASE_URL}") || value.is_empty() {
+                *value = "http://localhost:8088/api/{SERVICE_UUID}".to_string();
+                debug!("🔒 设置 ANTHROPIC_BASE_URL 为代理 URL");
+            }
+        }
+    }
+}
+
 /// 从配置文件加载 Agent 配置
 ///
 /// 优先加载嵌入的JSON配置文件，如果加载失败则使用默认配置
@@ -124,44 +187,10 @@ pub async fn load_agent_config(
         let mut resolved_env = agent_config.env.clone();
 
         if let Some(provider) = model_provider {
-            // 解析占位符
-            for (key, value) in resolved_env.iter_mut() {
-                // ⚠️ 关键安全机制：ANTHROPIC_API_KEY 和 ANTHROPIC_BASE_URL 使用占位符值
-                //
-                // Agent 应该使用占位符密钥和代理 URL，真实密钥由 Pingora 注入：
-                // - ANTHROPIC_API_KEY: sk-placeholder
-                // - ANTHROPIC_BASE_URL: http://localhost:8088/api/{SERVICE_UUID}
-                //
-                // 这两个变量不进行替换，保持为占位符或代理URL
-                // 其他变量正常替换 MODEL_PROVIDER_* 占位符
-                if key == "ANTHROPIC_API_KEY" || key == "ANTHROPIC_BASE_URL" {
-                    // 保持原值不处理，后面会单独处理这两个变量
-                    continue;
-                }
-
-                // 其他环境变量正常替换
-                *value = value
-                    .replace("{MODEL_PROVIDER_API_KEY}", &provider.api_key)
-                    .replace("{MODEL_PROVIDER_BASE_URL}", &provider.base_url)
-                    .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
-                    .replace("{MODEL_PROVIDER_NAME}", &provider.name);
-            }
-
-            // 单独处理 ANTHROPIC_API_KEY 和 ANTHROPIC_BASE_URL
-            // 检查并设置占位符值
-            for (key, value) in resolved_env.iter_mut() {
-                if key == "ANTHROPIC_API_KEY" {
-                    if value.contains("{MODEL_PROVIDER_API_KEY}") || value.is_empty() {
-                        *value = "sk-placeholder".to_string();
-                        debug!("🔒 设置 ANTHROPIC_API_KEY 为占位符密钥");
-                    }
-                } else if key == "ANTHROPIC_BASE_URL" {
-                    if value.contains("{MODEL_PROVIDER_BASE_URL}") || value.is_empty() {
-                        *value = "http://localhost:8088/api/{SERVICE_UUID}".to_string();
-                        debug!("🔒 设置 ANTHROPIC_BASE_URL 为代理 URL");
-                    }
-                }
-            }
+            // 🔧 替换 MODEL_PROVIDER_* 占位符（跳过系统管理的变量）
+            replace_env_placeholders(&mut resolved_env, provider);
+            // 🔒 设置系统管理的环境变量占位符
+            set_system_managed_placeholders(&mut resolved_env);
         }
 
         // 🔒 禁用 Claude Code 非必要网络请求（遥测等）
@@ -403,6 +432,12 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                         }
                         merged_config.env.insert(k.clone(), v.clone());
                     }
+                }
+
+                // 🔧 合并后，对环境变量再次进行占位符替换
+                // 这样用户可以在自定义 env 中使用占位符，如 {MODEL_PROVIDER_DEFAULT_MODEL}
+                if let Some(ref provider) = model_provider {
+                    replace_env_placeholders(&mut merged_config.env, provider);
                 }
 
                 info!("Claude Code ACP 命令（自定义）: {} {:?}", cmd, args);
