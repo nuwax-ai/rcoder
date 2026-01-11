@@ -21,12 +21,22 @@ WORKDIR /home/user
 # 使用构建参数破坏缓存（每次构建都获取最新版本的工具）
 ARG CACHEBUST=1
 
-# 安装 mcp-stdio-proxy（频繁更新的工具，放在最终镜像以加快构建）
-# 使用 CACHEBUST 变量触发缓存失效
+# 强制将 uv 缓存放在 /root 下，避免被 /home/user 挂载覆盖
+ENV UV_CACHE_DIR=/root/.cache/uv
+# 强制将 npm 缓存放在 /root 下
+ENV npm_config_cache=/root/.npm
+
+# 安装 mcp-stdio-proxy
 RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-stdio-proxy
 
 # 安装 claude-code-acp-rs CLI 工具
 RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs
+
+# 预安装 mcp-server-time (uvx)
+RUN uvx mcp-server-time --help || echo "mcp-server-time pre-cached"
+
+# 预安装 chrome-devtools-mcp (npm)
+RUN npm install -g chrome-devtools-mcp@latest
 
 
 # 复制预构建的 agent_runner 二进制文件

@@ -36,7 +36,7 @@
   "context_servers": {
     "chrome-devtools": {
       "source": "custom",
-      "enabled": true,
+      "enabled": false,
       "command": "mcp-proxy",
       "args": [
         "convert",
@@ -58,7 +58,7 @@
     },
     "context7": {
       "source": "custom",
-      "enabled": true,
+      "enabled": false,
       "command": "bunx",
       "args": [
         "-y",
