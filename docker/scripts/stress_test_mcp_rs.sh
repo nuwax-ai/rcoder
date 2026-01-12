@@ -1,6 +1,6 @@
 #!/bin/bash
-# 带 MCP 配置的压力测试脚本 (默认配置)
-# 用法: TEST_API_KEY=xxx ./stress_test_mcp.sh [并发数] [轮次]
+# 带 MCP 配置的压力测试脚本 (RS Agent 版本)
+# 用法: TEST_API_KEY=xxx ./stress_test_mcp_rs.sh [并发数] [轮次]
 
 CONCURRENT=${1:-15}
 ROUNDS=${2:-1}
@@ -19,7 +19,7 @@ docker ps -a --filter "name=computer-agent" -q | xargs -r docker rm -f 2>/dev/nu
 echo "✅ 容器已清理"
 echo ""
 
-echo "🔥 MCP 压力测试 (默认配置): ${CONCURRENT} 并发 × ${ROUNDS} 轮"
+echo "🔥 MCP 压力测试 (RS Agent): ${CONCURRENT} 并发 × ${ROUNDS} 轮"
 echo "================================================"
 
 for round in $(seq 1 $ROUNDS); do
@@ -35,8 +35,8 @@ for round in $(seq 1 $ROUNDS); do
         --location --request POST "$API_URL" \
         --header 'Content-Type: application/json' \
         --data-raw '{
-          "user_id": "mcp_r'$round'_u'$i'",
-          "prompt": "MCP压测'$round'-'$i'",
+          "user_id": "mcp_rs_r'$round'_u'$i'",
+          "prompt": "MCP压测(RS)'$round'-'$i'",
           "model_provider": {
             "id": "zhipu-glm-4.6",
             "name": "zhipu-glm-4.6",
@@ -48,9 +48,15 @@ for round in $(seq 1 $ROUNDS); do
           },
           "agent_config": {
             "agent_server": {
-              "agent_id": "claude-code-acp",
-              "command": "claude-code-acp",
-              "args": ["--debug"]
+              "agent_id": "claude-code-acp-rs",
+              "command": "claude-code-acp-rs",
+              "args": [
+                "-d",
+                "--acp",
+                "--log-dir",
+                "/app/container-logs",
+                "-v"
+              ]
             },
             "context_servers": {
               "trends-hub": {
@@ -88,4 +94,4 @@ done
 
 echo ""
 echo "================================================"
-echo "🏁 MCP 压力测试完成"
+echo "🏁 MCP 压力测试 (RS Agent) 完成"
