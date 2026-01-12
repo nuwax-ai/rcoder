@@ -8,10 +8,33 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   source "$SCRIPT_DIR/.env"
 fi
 
-REMOTE_HOST="${REMOTE_HOST:-192.168.1.34}"
-REMOTE_USER="${REMOTE_USER:-swufe}"
-REMOTE_PASS="${REMOTE_PASS:-Swufe@2024}"
+# 远程服务器配置（必须通过环境变量或 .env 文件设置，不设置默认值避免泄露信息）
+REMOTE_HOST="${REMOTE_HOST}"
+REMOTE_USER="${REMOTE_USER}"
+REMOTE_PASS="${REMOTE_PASS}"
 REMOTE_MAIN_CONTAINER="${REMOTE_MAIN_CONTAINER:-d5cf116c863a}"
+
+# 检查必需的环境变量
+if [ -z "$REMOTE_HOST" ]; then
+  echo "❌ 请先设置 REMOTE_HOST 环境变量"
+  echo "   例如: export REMOTE_HOST=192.168.1.34"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
+
+if [ -z "$REMOTE_USER" ]; then
+  echo "❌ 请先设置 REMOTE_USER 环境变量"
+  echo "   例如: export REMOTE_USER=your_username"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
+
+if [ -z "$REMOTE_PASS" ]; then
+  echo "❌ 请先设置 REMOTE_PASS 环境变量"
+  echo "   例如: export REMOTE_PASS=your_password"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
 
 echo "🔄 远程重启主服务"
 echo "================================================"
@@ -25,7 +48,6 @@ if ! command -v sshpass &> /dev/null; then
     echo ""
     echo "或手动执行:"
     echo "   ssh ${REMOTE_USER}@${REMOTE_HOST}"
-    echo "   密码: ${REMOTE_PASS}"
     echo "   docker restart ${REMOTE_MAIN_CONTAINER}"
     exit 0
 fi

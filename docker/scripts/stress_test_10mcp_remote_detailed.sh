@@ -11,19 +11,50 @@ fi
 CONCURRENT=${1:-10}
 ROUNDS=${2:-4}
 OUTPUT_FILE=${3:-""}
-REMOTE_HOST="${REMOTE_HOST:-192.168.1.34}"
-REMOTE_USER="${REMOTE_USER:-swufe}"
-REMOTE_PASS="${REMOTE_PASS:-Swufe@2024}"
-REMOTE_API_PORT="${REMOTE_API_PORT:-8086}"
-API_URL="http://${REMOTE_HOST}:${REMOTE_API_PORT}/computer/chat"
+# 远程服务器配置（必须通过环境变量或 .env 文件设置，不设置默认值避免泄露信息）
+REMOTE_HOST="${REMOTE_HOST}"
+REMOTE_USER="${REMOTE_USER}"
+REMOTE_PASS="${REMOTE_PASS}"
+REMOTE_API_PORT="${REMOTE_API_PORT}"
 API_KEY="${TEST_API_KEY:-}"
 BATCH_ID="b$(date +%s)"  # 唯一批次 ID，防止容器复用
 
+# 检查必需的环境变量
 if [ -z "$API_KEY" ]; then
   echo "❌ 请先设置 TEST_API_KEY 环境变量"
   echo "   例如: export TEST_API_KEY=your_api_key"
   exit 1
 fi
+
+if [ -z "$REMOTE_HOST" ]; then
+  echo "❌ 请先设置 REMOTE_HOST 环境变量"
+  echo "   例如: export REMOTE_HOST=192.168.1.34"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
+
+if [ -z "$REMOTE_USER" ]; then
+  echo "❌ 请先设置 REMOTE_USER 环境变量"
+  echo "   例如: export REMOTE_USER=your_username"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
+
+if [ -z "$REMOTE_PASS" ]; then
+  echo "❌ 请先设置 REMOTE_PASS 环境变量"
+  echo "   例如: export REMOTE_PASS=your_password"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
+
+if [ -z "$REMOTE_API_PORT" ]; then
+  echo "❌ 请先设置 REMOTE_API_PORT 环境变量"
+  echo "   例如: export REMOTE_API_PORT=8086"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
+
+API_URL="http://${REMOTE_HOST}:${REMOTE_API_PORT}/computer/chat"
 
 # 创建输出文件
 if [ -n "$OUTPUT_FILE" ]; then

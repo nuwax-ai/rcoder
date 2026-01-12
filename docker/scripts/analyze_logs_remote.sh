@@ -8,13 +8,35 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   source "$SCRIPT_DIR/.env"
 fi
 
-REMOTE_HOST="${REMOTE_HOST:-192.168.1.34}"
-REMOTE_USER="${REMOTE_USER:-swufe}"
-REMOTE_PASS="${REMOTE_PASS:-Swufe@2024}"
+# 远程服务器配置（必须通过环境变量或 .env 文件设置，不设置默认值避免泄露信息）
+REMOTE_HOST="${REMOTE_HOST}"
+REMOTE_USER="${REMOTE_USER}"
+REMOTE_PASS="${REMOTE_PASS}"
+# 日志路径（从环境变量读取，提供默认值）
+MAIN_LOG_PATH="${MAIN_LOG_PATH}"
+CONTAINER_LOG_DIR="${CONTAINER_LOG_DIR}"
 
-# 日志路径配置
-MAIN_LOG_PATH="/home/swufe/nuwax/docker/logs/rcoder/rcoder.log"
-CONTAINER_LOG_DIR="/home/swufe/nuwax/docker/logs/rcoder/container"
+# 检查必需的环境变量
+if [ -z "$REMOTE_HOST" ]; then
+  echo "❌ 请先设置 REMOTE_HOST 环境变量"
+  echo "   例如: export REMOTE_HOST=192.168.1.34"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
+
+if [ -z "$REMOTE_USER" ]; then
+  echo "❌ 请先设置 REMOTE_USER 环境变量"
+  echo "   例如: export REMOTE_USER=your_username"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
+
+if [ -z "$REMOTE_PASS" ]; then
+  echo "❌ 请先设置 REMOTE_PASS 环境变量"
+  echo "   例如: export REMOTE_PASS=your_password"
+  echo "   或在 $SCRIPT_DIR/.env 文件中设置"
+  exit 1
+fi
 
 echo "🌐 远程日志分析报告"
 echo "================================================"
@@ -30,7 +52,6 @@ if ! command -v sshpass &> /dev/null; then
     echo ""
     echo "或手动连接服务器查看日志:"
     echo "   ssh ${REMOTE_USER}@${REMOTE_HOST}"
-    echo "   密码: ${REMOTE_PASS}"
     echo ""
     echo "常用日志命令:"
     echo "   # 查看主服务日志"
@@ -107,7 +128,6 @@ echo "  3. 检查子容器启动日志中的 MCP 初始化状态"
 echo ""
 echo "📋 手动查看命令:"
 echo "   ssh ${REMOTE_USER}@${REMOTE_HOST}"
-echo "   密码: ${REMOTE_PASS}"
 echo ""
 echo "   # 主服务日志"
 echo "   tail -f ${MAIN_LOG_PATH}"

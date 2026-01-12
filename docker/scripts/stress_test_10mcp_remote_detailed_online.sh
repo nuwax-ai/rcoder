@@ -1,6 +1,6 @@
 #!/bin/bash
-# 10 个 MCP 工具压力测试脚本 (真实服务器版本)
-# 用法: ./stress_test_10mcp_remote.sh [并发数] [轮次]
+# 10 个 MCP 工具压力测试脚本 (详细版本 - 支持请求粒度记录)
+# 用法: ./stress_test_10mcp_remote_detailed.sh [并发数] [轮次] [输出文件]
 
 # 加载环境变量
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,8 +8,9 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   source "$SCRIPT_DIR/.env"
 fi
 
-CONCURRENT=${1:-15}
-ROUNDS=${2:-1}
+CONCURRENT=${1:-10}
+ROUNDS=${2:-3}
+OUTPUT_FILE=${3:-""}
 # 远程服务器配置（必须通过环境变量或 .env 文件设置，不设置默认值避免泄露信息）
 REMOTE_HOST="${REMOTE_HOST}"
 REMOTE_USER="${REMOTE_USER}"
@@ -54,27 +55,27 @@ if [ -z "$REMOTE_API_PORT" ]; then
 fi
 
 API_URL="http://${REMOTE_HOST}:${REMOTE_API_PORT}/computer/chat"
-echo "🆔 本次测试 Batch ID: $BATCH_ID"
 
-# 注意: 连接真实服务器，不清理本地容器
+# 创建输出文件
+if [ -n "$OUTPUT_FILE" ]; then
+  echo "📝 详细日志将保存到: $OUTPUT_FILE"
+  echo "BATCH_ID=$BATCH_ID" > "$OUTPUT_FILE"
+  echo "CONCURRENT=$CONCURRENT" >> "$OUTPUT_FILE"
+  echo "ROUNDS=$ROUNDS" >> "$OUTPUT_FILE"
+  echo "START_TIME=$(date +%s)" >> "$OUTPUT_FILE"
+  echo "" >> "$OUTPUT_FILE"
+  echo "=== 请求详情 ===" >> "$OUTPUT_FILE"
+fi
+
+echo "🆔 本次测试 Batch ID: $BATCH_ID"
 echo "🌐 连接到真实服务器: ${REMOTE_HOST}:${REMOTE_API_PORT}"
-echo "📋 查看日志: ssh ${REMOTE_USER}@${REMOTE_HOST}"
 echo ""
 
 echo "🔥 10 个 MCP 工具压力测试: ${CONCURRENT} 并发 × ${ROUNDS} 轮"
 echo "================================================"
-echo "MCP 工具列表:"
-echo "  1. chrome-devtools (浏览器自动化) ★默认"
-echo "  2. mcp-server-time (时间)"
-echo "  3. mcp-server-fetch (HTTP)"
-echo "  4. mcp-server-memory (内存KV)"
-echo "  5. mcp-server-filesystem (文件系统)"
-echo "  6. mcp-server-git (Git)"
-echo "  7. mcp-server-github (GitHub)"
-echo "  8. mcp-server-sqlite (SQLite)"
-echo "  9. mcp-server-brave-search (搜索)"
-echo " 10. mcp-server-sequential-thinking (思维链)"
-echo "================================================"
+
+# 请求结果数组
+declare -a REQUEST_RESULTS
 
 for round in $(seq 1 $ROUNDS); do
   echo ""
@@ -186,10 +187,27 @@ for round in $(seq 1 $ROUNDS); do
       DURATION=$(echo "$END_TIME - $START_TIME" | bc 2>/dev/null || echo "?")
       HTTP_CODE=$(echo "$RESPONSE" | tail -1)
       
+      # 判断是否超时
+      IS_TIMEOUT="false"
+      if (( $(echo "$DURATION >= 100" | bc -l 2>/dev/null || echo 0) )); then
+        IS_TIMEOUT="true"
+      fi
+      
+      # 记录结果
+      RESULT_STR="R${round}-${i}: ${DURATION}s HTTP=${HTTP_CODE}"
       if [ "$HTTP_CODE" = "200" ]; then
-        echo "✅ R${round}-${i}: ${DURATION}s"
+        if [ "$IS_TIMEOUT" = "true" ]; then
+          echo "⚠️  $RESULT_STR (超时)"
+        else
+          echo "✅ $RESULT_STR"
+        fi
       else
-        echo "❌ R${round}-${i}: HTTP=${HTTP_CODE} ${DURATION}s"
+        echo "❌ $RESULT_STR"
+      fi
+      
+      # 保存到输出文件
+      if [ -n "$OUTPUT_FILE" ]; then
+        echo "REQ:${REQ_ID}:ROUND:${round}:USER:${i}:DURATION:${DURATION}:HTTP:${HTTP_CODE}:TIMEOUT:${IS_TIMEOUT}:START:${START_TIME}:END:${END_TIME}" >> "$OUTPUT_FILE"
       fi
     ) &
     
@@ -205,9 +223,12 @@ for round in $(seq 1 $ROUNDS); do
   fi
 done
 
+if [ -n "$OUTPUT_FILE" ]; then
+  echo "END_TIME=$(date +%s)" >> "$OUTPUT_FILE"
+fi
+
 echo ""
 echo "================================================"
 echo "🏁 10 个 MCP 工具压力测试完成 (远程服务器)"
 echo "🏷️  Batch ID: $BATCH_ID"
 echo "👉 请运行: ./diagnose_remote_system.sh $BATCH_ID 进行详细分析"
-
