@@ -219,6 +219,25 @@ pub async fn handle_computer_chat(
         user_id, container_info.container_id, container_info.container_ip
     );
 
+    // 🔍 检测 user_id 变化：同一个 project_id 被不同的 user_id 请求
+    // 这通常意味着负载测试脚本使用了多个不同的 user_id，会导致创建多个容器浪费资源
+    if let Some(existing_info) = state.get_project(&project_id) {
+        if let Some(existing_user_id) = existing_info.user_id() {
+            if existing_user_id != user_id {
+                warn!(
+                    "⚠️ [USER_ID_MISMATCH] 检测到 project_id 对应的 user_id 发生变化: \
+                     project_id={}, 原有 user_id={}, 新 user_id={}, 时间={}, \
+                     原因可能是负载测试脚本使用了多个不同的 user_id，这会导致创建多个容器浪费资源。 \
+                     建议检查测试脚本确保同一 project_id 使用相同的 user_id。",
+                    project_id,
+                    existing_user_id,
+                    user_id,
+                    chrono::Utc::now().to_rfc3339()
+                );
+            }
+        }
+    }
+
     // 🛡️ 关键修复：容器创建成功后立即插入 DuckDB 记录
     // 这样可以防止孤立容器清理器误判并清理刚创建的容器
     //
