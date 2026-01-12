@@ -449,6 +449,14 @@ impl DockerManager {
         self.containers.get(project_id).await
     }
 
+    /// 清理容器缓存
+    ///
+    /// 从 DockerManager 的内存缓存中移除容器信息。
+    /// 通常在容器被销毁后调用，以保持缓存与实际状态同步。
+    pub async fn remove_container_cache(&self, project_id: &str) -> Option<DockerContainerInfo> {
+        self.containers.remove(project_id).await
+    }
+
     /// 通过多种方式查找容器：project_id 或容器名称
     ///
     /// # ⚠️ 已废弃

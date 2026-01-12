@@ -18,6 +18,27 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, info, warn};
 
+/// 格式化日期时间为标准格式（如：2026-01-12 15:04:30）
+fn format_datetime(dt: DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// 格式化相对时间（如：5分钟前）
+fn format_relative_time(dt: DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let duration = now.signed_duration_since(dt);
+
+    if duration.num_seconds() < 60 {
+        format!("{}秒前", duration.num_seconds())
+    } else if duration.num_minutes() < 60 {
+        format!("{}分钟前", duration.num_minutes())
+    } else if duration.num_hours() < 24 {
+        format!("{}小时前", duration.num_hours())
+    } else {
+        format!("{}天前", duration.num_days())
+    }
+}
+
 use crate::grpc::GrpcChannelPool;
 use crate::router::AppState;
 use shared_types::grpc::GetContainerStatusRequest;
@@ -174,6 +195,11 @@ impl ContainerStatusChecker {
             }
         };
 
+        // 获取最后激活时间用于日志显示
+        let last_activity = container_info.last_activity();
+        let last_activity_str = format_datetime(last_activity);
+        let relative_time_str = format_relative_time(last_activity);
+
         // 构建 gRPC 地址
         let grpc_addr = format!(
             "{}:{}",
@@ -196,6 +222,8 @@ impl ContainerStatusChecker {
             &project_id,
             &self.state.grpc_pool,
             &self.config,
+            last_activity_str,
+            relative_time_str,
         )
         .await
         {
@@ -520,6 +548,8 @@ async fn query_container_status(
     project_id: &str,
     grpc_pool: &Arc<GrpcChannelPool>,
     config: &ContainerStatusCheckerConfig,
+    last_activity_str: String,
+    relative_time_str: String,
 ) -> anyhow::Result<bool> {
     // 获取 gRPC 客户端
     let mut client = grpc_pool.get_client(grpc_addr).await?;
@@ -537,8 +567,8 @@ async fn query_container_status(
     let status_response = response.into_inner();
 
     debug!(
-        "📊 [STATUS_CHECKER] 容器状态: user_id={}, is_active={}, active_tasks={}, status={}",
-        user_id, status_response.is_active, status_response.active_tasks, status_response.status
+        "📊 [STATUS_CHECKER] 容器状态: user_id={}, is_active={}, active_tasks={}, status={}, last_activity={} ({})",
+        user_id, status_response.is_active, status_response.active_tasks, status_response.status, last_activity_str, relative_time_str
     );
 
     // 如果容器有活跃任务，则认为容器活跃

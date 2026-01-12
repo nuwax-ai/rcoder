@@ -747,7 +747,7 @@ RUN mkdir -p "$UV_TOOL_DIR" "$UV_CACHE_DIR" && \
 
 # 创建 Claude Code 配置目录
 RUN mkdir -p /home/user/.claude && \
-    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"alwaysThinkingEnabled":true}' > /home/user/.claude/settings.json
+    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]}}' > /home/user/.claude/settings.json
 
 # ============================================================================
 # 🎯 切回 root - 更新骨架目录

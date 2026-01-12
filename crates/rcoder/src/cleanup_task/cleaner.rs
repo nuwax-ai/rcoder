@@ -80,8 +80,8 @@ impl AgentCleaner {
             }
         }
 
-        // 3. 清理孤立容器
-        let orphaned_count = self.orphaned_cleaner.cleanup(5).await?;
+        // 3. 清理孤立容器（无上限，一次性清理所有）
+        let orphaned_count = self.orphaned_cleaner.cleanup().await?;
 
         // 4. 更新统计
         self.stats.last_cleanup = Some(Utc::now());

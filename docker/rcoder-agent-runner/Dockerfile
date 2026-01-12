@@ -28,6 +28,15 @@ RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-std
 # 安装 claude-code-acp-rs CLI 工具
 RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs
 
+# 安装 opencode - AI 驱动的代码导航工具
+# 注意：npm 包不支持 ARM64，使用官方安装脚本
+RUN echo "📦 安装 opencode..." && \
+    curl -fsSL https://opencode.ai/install | bash && \
+    ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode && \
+    echo "验证 opencode 安装..." && \
+    opencode --version && \
+    echo "✅ opencode 安装成功（已创建符号链接到 /usr/local/bin）"
+
 # ============================================================================
 # 🔧 eBPF 诊断工具安装
 # 注意：这些工具会增加镜像大小 (~500MB)
@@ -36,29 +45,29 @@ RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-
 ARG INSTALL_EBPF_TOOLS=true
 
 RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
-        echo "🔧 开始安装 eBPF 诊断工具..."; \
-        apt-get update && \
-        echo "📦 安装 bpftrace（核心 eBPF 诊断工具）..."; \
-        apt-get install -y bpftrace && \
-        echo "📦 安装 strace（系统调用追踪）..."; \
-        apt-get install -y strace && \
-        echo "📦 安装 sysstat（性能监控：iostat, mpstat 等）..."; \
-        apt-get install -y sysstat && \
-        echo "📦 安装 jq（JSON 处理）..."; \
-        apt-get install -y jq && \
-        rm -rf /var/lib/apt/lists/*; \
-        echo "✅ eBPF 诊断工具安装完成"; \
-        which bpftrace && bpftrace --version || echo "❌ bpftrace 未安装"; \
+    echo "🔧 开始安装 eBPF 诊断工具..."; \
+    apt-get update && \
+    echo "📦 安装 bpftrace（核心 eBPF 诊断工具）..."; \
+    apt-get install -y bpftrace && \
+    echo "📦 安装 strace（系统调用追踪）..."; \
+    apt-get install -y strace && \
+    echo "📦 安装 sysstat（性能监控：iostat, mpstat 等）..."; \
+    apt-get install -y sysstat && \
+    echo "📦 安装 jq（JSON 处理）..."; \
+    apt-get install -y jq && \
+    rm -rf /var/lib/apt/lists/*; \
+    echo "✅ eBPF 诊断工具安装完成"; \
+    which bpftrace && bpftrace --version || echo "❌ bpftrace 未安装"; \
     else \
-        echo "⚠️  eBPF 工具未安装（生产模式）"; \
+    echo "⚠️  eBPF 工具未安装（生产模式）"; \
     fi
 
 # 安装 FlameGraph 工具
 RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
-        git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph \
-        && cp /tmp/FlameGraph/*.pl /usr/local/bin/ \
-        && rm -rf /tmp/FlameGraph \
-        && echo "✅ FlameGraph 工具已安装"; \
+    git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph \
+    && cp /tmp/FlameGraph/*.pl /usr/local/bin/ \
+    && rm -rf /tmp/FlameGraph \
+    && echo "✅ FlameGraph 工具已安装"; \
     fi
 
 # ============================================================================
@@ -66,20 +75,20 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
 # ============================================================================
 ARG INSTALL_PYROSCOPE=true
 RUN if [ "$INSTALL_PYROSCOPE" = "true" ]; then \
-        echo "📦 安装 Pyroscope Agent..."; \
-        apt-get update && \
-        apt-get install -y curl ca-certificates && \
-        echo "下载 Pyroscope Agent (v1.17.0)..." && \
-        curl -fsSL "https://github.com/grafana/pyroscope/releases/download/v1.17.0/pyroscope_1.17.0_linux_arm64.tar.gz" \
-            -o /tmp/pyroscope.tar.gz && \
-        echo "解压 Pyroscope Agent..." && \
-        tar -xzf /tmp/pyroscope.tar.gz -C /usr/local/bin/ && \
-        rm /tmp/pyroscope.tar.gz && \
-        chmod +x /usr/local/bin/pyroscope && \
-        echo "验证 Pyroscope Agent..." && \
-        pyroscope --version || echo "⚠️  Pyroscope 安装失败"; \
+    echo "📦 安装 Pyroscope Agent..."; \
+    apt-get update && \
+    apt-get install -y curl ca-certificates && \
+    echo "下载 Pyroscope Agent (v1.17.0)..." && \
+    curl -fsSL "https://github.com/grafana/pyroscope/releases/download/v1.17.0/pyroscope_1.17.0_linux_arm64.tar.gz" \
+    -o /tmp/pyroscope.tar.gz && \
+    echo "解压 Pyroscope Agent..." && \
+    tar -xzf /tmp/pyroscope.tar.gz -C /usr/local/bin/ && \
+    rm /tmp/pyroscope.tar.gz && \
+    chmod +x /usr/local/bin/pyroscope && \
+    echo "验证 Pyroscope Agent..." && \
+    pyroscope --version || echo "⚠️  Pyroscope 安装失败"; \
     else \
-        echo "⚠️  Pyroscope 未安装"; \
+    echo "⚠️  Pyroscope 未安装"; \
     fi
 
 # ============================================================================
@@ -88,36 +97,36 @@ RUN if [ "$INSTALL_PYROSCOPE" = "true" ]; then \
 ARG INSTALL_ALLOY=true
 ARG ALLOY_VERSION=v1.12.2
 RUN if [ "$INSTALL_ALLOY" = "true" ]; then \
-        echo "📦 安装 Grafana Alloy ${ALLOY_VERSION}..."; \
-        apt-get update && \
-        apt-get install -y wget ca-certificates && \
-        echo "检测系统架构..."; \
-        ARCH=$(dpkg --print-architecture); \
-        echo "系统架构: ${ARCH}"; \
-        ALLOY_VER=${ALLOY_VERSION}; \
-        ALLOY_VER_NUM=${ALLOY_VER#v}; \
-        echo "下载 Alloy deb 包 (${ARCH})..."; \
-        wget -qO- "https://github.com/grafana/alloy/releases/download/${ALLOY_VER}/alloy-${ALLOY_VER_NUM}-1.${ARCH}.deb" > /tmp/alloy.deb && \
-        echo "下载完成，文件大小: $(ls -lh /tmp/alloy.deb | awk '{print $5}')"; \
-        echo "安装 Alloy..."; \
-        dpkg -i /tmp/alloy.deb && \
-        apt-get install -y -f && \
-        rm /tmp/alloy.deb && \
-        echo "验证 Alloy 安装..."; \
-        alloy --version; \
+    echo "📦 安装 Grafana Alloy ${ALLOY_VERSION}..."; \
+    apt-get update && \
+    apt-get install -y wget ca-certificates && \
+    echo "检测系统架构..."; \
+    ARCH=$(dpkg --print-architecture); \
+    echo "系统架构: ${ARCH}"; \
+    ALLOY_VER=${ALLOY_VERSION}; \
+    ALLOY_VER_NUM=${ALLOY_VER#v}; \
+    echo "下载 Alloy deb 包 (${ARCH})..."; \
+    wget -qO- "https://github.com/grafana/alloy/releases/download/${ALLOY_VER}/alloy-${ALLOY_VER_NUM}-1.${ARCH}.deb" > /tmp/alloy.deb && \
+    echo "下载完成，文件大小: $(ls -lh /tmp/alloy.deb | awk '{print $5}')"; \
+    echo "安装 Alloy..."; \
+    dpkg -i /tmp/alloy.deb && \
+    apt-get install -y -f && \
+    rm /tmp/alloy.deb && \
+    echo "验证 Alloy 安装..."; \
+    alloy --version; \
     else \
-        echo "⚠️  Alloy 未安装"; \
+    echo "⚠️  Alloy 未安装"; \
     fi
 
 # ============================================================================
 # 🔍 bpfcc-tools - Off-CPU 阻塞分析工具
 # ============================================================================
 RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
-        echo "📦 安装 bpfcc-tools (包含 offcputime)..."; \
-        apt-get update && \
-        apt-get install -y bpfcc-tools && \
-        rm -rf /var/lib/apt/lists/* && \
-        which offcputime-bpfcc && offcputime-bpfcc --help | head -3 || echo "⚠️  offcputime-bpfcc 安装失败"; \
+    echo "📦 安装 bpfcc-tools (包含 offcputime)..."; \
+    apt-get update && \
+    apt-get install -y bpfcc-tools && \
+    rm -rf /var/lib/apt/lists/* && \
+    which offcputime-bpfcc && offcputime-bpfcc --help | head -3 || echo "⚠️  offcputime-bpfcc 安装失败"; \
     fi
 
 
@@ -177,10 +186,10 @@ COPY ebpf-tools/alloy-config.alloy /etc/alloy/config.alloy
 
 # 验证 Alloy 配置文件语法
 RUN if command -v alloy >/dev/null 2>&1; then \
-        echo "验证 Alloy 配置文件..." && \
-        alloy validate /etc/alloy/config.alloy || echo "⚠️  Alloy 配置验证失败"; \
+    echo "验证 Alloy 配置文件..." && \
+    alloy validate /etc/alloy/config.alloy || echo "⚠️  Alloy 配置验证失败"; \
     else \
-        echo "⚠️  Alloy 未安装，跳过配置验证"; \
+    echo "⚠️  Alloy 未安装，跳过配置验证"; \
     fi
 
 # ============================================================================
