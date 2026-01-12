@@ -42,7 +42,7 @@ RUN echo "📦 安装 opencode..." && \
 # 注意：这些工具会增加镜像大小 (~500MB)
 # 通过 make dev-restart 默认启用
 # ============================================================================
-ARG INSTALL_EBPF_TOOLS=true
+ARG INSTALL_EBPF_TOOLS=false
 
 RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
     echo "🔧 开始安装 eBPF 诊断工具..."; \
@@ -73,7 +73,7 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
 # ============================================================================
 # 📊 Pyroscope Agent - 持续剖析（已废弃，保留用于兼容性）
 # ============================================================================
-ARG INSTALL_PYROSCOPE=true
+ARG INSTALL_PYROSCOPE=false
 RUN if [ "$INSTALL_PYROSCOPE" = "true" ]; then \
     echo "📦 安装 Pyroscope Agent..."; \
     apt-get update && \
@@ -94,7 +94,7 @@ RUN if [ "$INSTALL_PYROSCOPE" = "true" ]; then \
 # ============================================================================
 # 📊 Grafana Alloy - 持续性能数据采集（替代已废弃的 Pyroscope Agent）
 # ============================================================================
-ARG INSTALL_ALLOY=true
+ARG INSTALL_ALLOY=false
 ARG ALLOY_VERSION=v1.12.2
 RUN if [ "$INSTALL_ALLOY" = "true" ]; then \
     echo "📦 安装 Grafana Alloy ${ALLOY_VERSION}..."; \
