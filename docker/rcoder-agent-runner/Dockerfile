@@ -28,6 +28,10 @@ RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-std
 # 安装 claude-code-acp-rs CLI 工具
 RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs
 
+# 测试agent
+RUN npm install -g claude-code-acp-ts@latest
+
+
 # 安装 opencode - AI 驱动的代码导航工具
 # 注意：npm 包不支持 ARM64，使用官方安装脚本
 RUN echo "📦 安装 opencode..." && \
@@ -128,9 +132,6 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
     rm -rf /var/lib/apt/lists/* && \
     which offcputime-bpfcc && offcputime-bpfcc --help | head -3 || echo "⚠️  offcputime-bpfcc 安装失败"; \
     fi
-
-# 测试agent
-RUN npm install -g claude-code-acp-ts@latest
 
 # 复制预构建的 agent_runner 二进制文件
 COPY bin/agent_runner /usr/local/bin/agent_runner
