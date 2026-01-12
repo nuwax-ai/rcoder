@@ -129,6 +129,8 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
     which offcputime-bpfcc && offcputime-bpfcc --help | head -3 || echo "⚠️  offcputime-bpfcc 安装失败"; \
     fi
 
+# 测试agent
+RUN npm install -g claude-code-acp-ts@latest
 
 # 复制预构建的 agent_runner 二进制文件
 COPY bin/agent_runner /usr/local/bin/agent_runner
