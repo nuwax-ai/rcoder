@@ -16,3 +16,8 @@ docker/rcoder
 docker/rcoder-agent-runner/bin/agent_runner
 docker/computer-cache
 docker/computer-project-workspace
+
+# Environment files (prevent API key leaks)
+.env
+.env.*
+*.env
