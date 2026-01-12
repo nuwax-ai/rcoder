@@ -527,9 +527,10 @@ RUN apt-get update && \
     java -version && \
     javac -version && \
     echo "✅ OpenJDK 17 installed with full toolset" && \
-    # 清理缓存
-    apt-get autoremove -y && \
-    apt-get autoclean && \
+    # 确认 javac 存在
+    which javac && \
+    ls -la /usr/lib/jvm/java-17-openjdk-*/bin/javac && \
+    # 清理缓存（但不 autoremove，避免删除 JDK 依赖）
     rm -rf /var/lib/apt/lists/*
 
 # ============================================================================
