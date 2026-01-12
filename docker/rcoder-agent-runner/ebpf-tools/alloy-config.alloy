@@ -64,19 +64,19 @@ discovery.relabel "agent_runner_filter" {
     // 规则 7: 添加项目 ID 标签
     rule {
         target_label = "project_id"
-        replacement  = env("PROJECT_ID")
+        replacement  = std.getenv("PROJECT_ID", "")
     }
 
     // 规则 8: 添加环境标签
     rule {
         target_label = "env"
-        replacement  = env("ENV")
+        replacement  = std.getenv("ENV", "dev")
     }
 
     // 规则 9: 添加容器 ID 标签
     rule {
         target_label = "container_id"
-        replacement  = env("HOSTNAME")
+        replacement  = std.getenv("HOSTNAME", "localhost")
     }
 
     // 规则 10: 添加应用名称标签（用于 Pyroscope UI 分组）
@@ -88,7 +88,7 @@ discovery.relabel "agent_runner_filter" {
     // 规则 11: 添加实例标签（区分不同容器实例）
     rule {
         target_label = "instance"
-        replacement  = env("HOSTNAME", "localhost")
+        replacement  = std.getenv("HOSTNAME", "localhost")
     }
 }
 
@@ -127,18 +127,15 @@ pyroscope.write "remote" {
     // Pyroscope Server 端点配置
     endpoint {
         // 从环境变量 PYROSCOPE_URL 读取，默认 http://pyroscope:4040
-        url = env("PYROSCOPE_URL", "http://pyroscope:4040")
+        url = std.getenv("PYROSCOPE_URL", "http://pyroscope:4040")
     }
 
     // 外部标签（全局，附加到此客户端发送的所有数据）
     external_labels = {
-        "env"        = env("ENV", "dev"),
+        "env"        = std.getenv("ENV", "dev"),
         "datacenter" = "local",
         "cluster"    = "rcoder",
     }
-
-    // 用于在 Pyroscope UI 中分组数据的租户 ID
-    tenant_id = "1"
 }
 
 // ============================================================================
@@ -156,19 +153,19 @@ prometheus.relabel "process_metrics_labels" {
     // 添加项目 ID 标签
     rule {
         target_label = "project_id"
-        replacement  = env("PROJECT_ID")
+        replacement  = std.getenv("PROJECT_ID", "")
     }
 
     // 添加环境标签
     rule {
         target_label = "env"
-        replacement  = env("ENV", "dev")
+        replacement  = std.getenv("ENV", "dev")
     }
 
     // 添加容器 ID 标签
     rule {
         target_label = "container_id"
-        replacement  = env("HOSTNAME")
+        replacement  = std.getenv("HOSTNAME", "localhost")
     }
 
     // 添加应用名称标签
@@ -180,7 +177,7 @@ prometheus.relabel "process_metrics_labels" {
     // 添加实例标签
     rule {
         target_label = "instance"
-        replacement  = env("HOSTNAME", "localhost")
+        replacement  = std.getenv("HOSTNAME", "localhost")
     }
 }
 
@@ -189,12 +186,12 @@ prometheus.relabel "process_metrics_labels" {
 // ============================================================================
 prometheus.remote_write "metrics" {
     endpoint {
-        url = env("PROMETHEUS_URL", "http://prometheus:9090/api/v1/write")
+        url = std.getenv("PROMETHEUS_URL", "http://prometheus:9090/api/v1/write")
     }
 
     // 外部标签
     external_labels = {
-        "env"        = env("ENV", "dev"),
+        "env"        = std.getenv("ENV", "dev"),
         "datacenter" = "local",
         "cluster"    = "rcoder",
     }

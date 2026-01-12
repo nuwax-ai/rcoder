@@ -1624,6 +1624,7 @@ fi
 
 # ============================================================================
 # 📊 Grafana Alloy - 持续性能数据采集（替代已废弃的 Pyroscope Agent）
+# 默认禁用，通过环境变量 ENABLE_ALLOY=true 启用
 # ============================================================================
 if [ "${ENABLE_ALLOY:-false}" = "true" ]; then
     log "🔧 启动 Grafana Alloy (eBPF Profiling)..."
@@ -1708,6 +1709,8 @@ if [ "${ENABLE_ALLOY:-false}" = "true" ]; then
             fi
         fi
     fi
+else
+    log "📊 Grafana Alloy 已禁用 (设置 ENABLE_ALLOY=true 启用)"
 fi
 
 # ============================================================================

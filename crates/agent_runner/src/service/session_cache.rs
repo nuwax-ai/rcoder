@@ -283,9 +283,10 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
     let session_data = if let Some(session_data_ref) = SESSION_CACHE.get(session_id) {
         session_data_ref.clone()
     } else {
+        let unified_message = notify.to_unified_message();
         debug!(
-            "🚫 [push_session_update] session={} 不存在于 SESSION_CACHE 中，可能是 SSE 连接未建立",
-            session_id
+            "🚫 [push_session_update] session={} 不存在于 SESSION_CACHE 中，可能是 SSE 连接未建立，消息内容: message_type={:?}, sub_type={}",
+            session_id, unified_message.message_type, unified_message.sub_type
         );
         return Ok(());
     };
