@@ -13,6 +13,7 @@ mod config;
 mod grpc;
 mod handler;
 mod model;
+mod process_reaper;
 mod proxy_agent;
 
 // 🔥 Pyroscope Profiler 模块（可选：需要 pyroscope feature）
@@ -105,6 +106,10 @@ async fn main() -> anyhow::Result<()> {
         let _ = monitor_worker_health(worker_manager_for_monitor, heartbeat_rx, ready_rx).await;
     });
     info!("🔍 [MAIN] Worker 监控任务已启动");
+
+    // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
+    let _reaper_handle = process_reaper::start_process_reaper();
+    info!("🧹 [MAIN] 僵尸进程回收器已启动 (PID 1 模式)");
 
     // 🆕 从配置中获取 Agent 清理配置，或使用默认值
     let agent_cleanup_config = config.agent_cleanup.clone().unwrap_or_default();

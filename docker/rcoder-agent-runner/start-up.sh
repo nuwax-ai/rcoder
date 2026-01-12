@@ -1578,34 +1578,8 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             fi
         fi
 
-        # ========== 🔥 定期清理僵尸进程任务（每 30 秒执行一次）==========
-        # 防止 chrome-headless 僵尸进程累积
-        zombie_count=$(ps aux | grep -c '<defunct>' || echo "0")
-        if [ "$zombie_count" -gt 10 ]; then
-            log "  🔧 检测到 $zombie_count 个僵尸进程，开始清理..."
-
-            # 🔧 修复：使用更兼容的方式，避免 xargs -r
-            # 清理 chrome-headless 僵尸进程
-            zombie_pids=$(ps aux | grep -E '[c]hrome-headless.*<defunct>' | awk '{print $2}')
-            if [ -n "$zombie_pids" ]; then
-                echo "$zombie_pids" | xargs kill -9 2>/dev/null || true
-            fi
-
-            # 清理 chromium 僵尸进程
-            zombie_pids=$(ps aux | grep -E '[c]hromium.*<defunct>' | awk '{print $2}')
-            if [ -n "$zombie_pids" ]; then
-                echo "$zombie_pids" | xargs kill -9 2>/dev/null || true
-            fi
-
-            # 清理其他僵尸进程（谨慎操作）
-            # 注意：只清理明确属于 chrome/chromium 的僵尸进程
-            # 其他僵尸进程应该由其父进程负责回收
-
-            remaining_zombies=$(ps aux | grep -c '<defunct>' || echo "0")
-            if [ "$remaining_zombies" -lt "$zombie_count" ]; then
-                log_success "  ✅ 清理了 $((zombie_count - remaining_zombies)) 个僵尸进程"
-            fi
-        fi
+        # 🔥 注意：僵尸进程回收已由 agent_runner 的 process_reaper 模块处理
+        # agent_runner 作为 PID 1 会自动回收所有孤儿进程，无需脚本额外清理
     done
 ) &
 
