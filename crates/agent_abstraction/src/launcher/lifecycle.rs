@@ -1,6 +1,30 @@
 //! Agent生命周期管理
 //!
 //! 基于RAII原则的简洁生命周期管理设计
+//!
+//! ## 僵尸进程问题解决方案
+//!
+//! 核心问题：Drop trait 是同步的，无法 await child.wait()
+//!
+//! 解决方案：
+//! 1. **后台回收任务**：立即启动后台任务 wait() 子进程
+//! 2. **进程组终止**：使用 nix::kill 发送信号到进程组
+//! 3. **三重保障**：PID 1 的 process_reaper 模块兜底
+//!
+//! ## 进程组说明
+//!
+//! 当前实现使用子进程 PID 作为 PGID（伪进程组）：
+//! - 终止时发送 `kill(-pgid, SIGKILL)` 到进程组
+//! - 如果子进程创建了真正的进程组（如通过 setsid），会杀死整个进程树
+//! - 如果子进程没有创建进程组，只会杀死子进程本身
+//!
+//! ## 未来改进
+//!
+//! 可以使用 `process-wrap` 库创建真正的进程组：
+//! ```ignore
+//! use process_wrap::tokio::{CommandWrap, ProcessGroup};
+//! let cmd_wrap = CommandWrap::from(cmd).wrap(ProcessGroup::leader());
+//! ```
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -11,7 +35,7 @@ use std::sync::{
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 use agent_client_protocol::SessionId;
 use shared_types::{AgentLifecycle, ModelProviderConfig};
@@ -19,6 +43,18 @@ use shared_types::{AgentLifecycle, ModelProviderConfig};
 /// Agent生命周期守卫
 ///
 /// 遵循RAII原则，当守卫被drop时自动清理agent资源
+///
+/// ## 僵尸进程避免机制
+///
+/// 1. **后台回收任务**：构造时立即启动 tokio::spawn 等待子进程
+/// 2. **进程组终止**：Drop 时发送信号到进程组（使用 nix::kill）
+/// 3. **PID 1 兜底**：process_reaper 模块自动回收所有孤儿进程
+///
+/// ## 进程组信号
+///
+/// 在 Unix 上，使用负的进程组 ID 发送信号：
+/// - `kill(-pgid, SIGKILL)` 杀死整个进程组
+/// - 这会终止子进程及其所有后代（如果子进程创建了真正的进程组）
 pub struct AgentLifecycleGuard {
     inner: Arc<AgentLifecycleInner>,
 }
@@ -28,6 +64,7 @@ impl std::fmt::Debug for AgentLifecycleGuard {
         f.debug_struct("AgentLifecycleGuard")
             .field("project_id", &self.inner.project_id)
             .field("session_id", &self.inner.session_id)
+            .field("pgid", &self.inner.pgid)
             .field("stopped", &self.inner.stopped.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
@@ -36,6 +73,13 @@ impl std::fmt::Debug for AgentLifecycleGuard {
 struct AgentLifecycleInner {
     project_id: String,
     session_id: SessionId,
+    /// 🔥 进程组 ID（当前实现：使用 child.pid 作为伪进程组）
+    ///
+    /// 注意：当前实现使用子进程的 PID 作为 PGID。
+    /// - 如果子进程通过 setsid() 创建了真正的进程组，kill(-pgid) 会杀死整个进程树
+    /// - 如果子进程没有创建进程组，kill(-pgid) 只会杀死子进程本身
+    /// - 未来可以使用 process-wrap 库创建真正的进程组
+    pgid: u32,
     cancel_token: CancellationToken,
     resources: AgentResources,
     stopped: AtomicBool,
@@ -48,15 +92,31 @@ struct AgentLifecycleInner {
 }
 
 /// Agent资源管理枚举
+///
+/// ## 后台回收版本
+///
+/// 存储后台任务句柄，确保子进程被 wait() 回收
 enum AgentResources {
     Claude {
-        child_process: Arc<Mutex<Option<tokio::process::Child>>>,
+        /// stderr 任务句柄
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+        /// 后台回收任务（已启动，会 wait() 子进程）
+        _reaper_task: JoinHandle<()>,
     },
 }
 
 impl AgentLifecycleGuard {
     /// 为Claude Agent创建生命周期守卫（兼容旧代码，默认无密钥管理器）
+    ///
+    /// # 参数
+    ///
+    /// * `child_process` - 已启动的子进程（必须是进程组组长）
+    /// * `stderr_task` - stderr 读取任务
+    /// * `cancel_token` - 取消令牌
+    ///
+    /// # 僵尸进程避免
+    ///
+    /// 此函数会立即启动后台任务等待子进程，确保子进程退出时被回收。
     pub fn new_claude(
         project_id: String,
         session_id: SessionId,
@@ -81,29 +141,68 @@ impl AgentLifecycleGuard {
     /// 创建生命周期守卫时传入共享的 API 密钥管理器和 service_uuid，
     /// 当 Agent 停止时（Drop）会自动清理对应的 API 密钥配置。
     ///
+    /// # 进程组管理
+    ///
+    /// 当前实现使用子进程的 PID 作为 PGID：
+    /// - `pgid = child_pid`（使用子进程 PID 作为进程组 ID）
+    /// - 终止时发送 `kill(-pgid, SIGKILL)` 到进程组
+    /// - 如果子进程创建了真正的进程组，所有孙进程都会被终止
+    /// - 如果子进程没有创建进程组，只会终止子进程本身
+    ///
     /// # 参数
     ///
     /// * `shared_api_key_manager` - 共享的 DashMap，用于清理 API 密钥配置
     /// * `project_uuid_map` - project_id -> service_uuid 映射，用于查找 UUID
     /// * `service_uuid` - 与此 Agent 关联的 service UUID
+    #[allow(clippy::too_many_arguments)]
     pub fn new_claude_with_key_manager(
         project_id: String,
         session_id: SessionId,
-        child_process: tokio::process::Child,
+        mut child_process: tokio::process::Child,
         stderr_task: JoinHandle<()>,
         cancel_token: CancellationToken,
         shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
         project_uuid_map: Option<Arc<DashMap<String, String>>>,
         service_uuid: Option<String>,
     ) -> Self {
+        let pid = child_process.id().unwrap_or(0);
+        let project_id_clone = project_id.clone();
+        let session_id_str = session_id.0.to_string();
+
+        // 🔥 关键：立即启动后台回收任务
+        // 这个任务会等待子进程退出，确保不会产生僵尸进程
+        let reaper_task = tokio::spawn(async move {
+            match child_process.wait().await {
+                Ok(status) => {
+                    debug!(
+                        "[ProcessReaper] 子进程已回收: pid={}, status={:?}",
+                        pid, status
+                    );
+                }
+                Err(e) => {
+                    // 进程可能已经被其他方式回收
+                    debug!(
+                        "[ProcessReaper] 子进程 wait() 失败（可能已回收）: pid={}, error={}",
+                        pid, e
+                    );
+                }
+            }
+        });
+
+        // 🔥 进程组 ID 等于子进程 PID
+        // 当前实现使用子进程 PID 作为 PGID（伪进程组）
+        // 注意：这不是真正的进程组，除非子进程通过 setsid() 创建了进程组
+        let pgid = pid;
+
         let resources = AgentResources::Claude {
-            child_process: Arc::new(Mutex::new(Some(child_process))),
             stderr_task: Arc::new(Mutex::new(Some(stderr_task))),
+            _reaper_task: reaper_task,
         };
 
         let inner = Arc::new(AgentLifecycleInner {
-            project_id,
+            project_id: project_id_clone,
             session_id,
+            pgid,
             cancel_token,
             resources,
             stopped: AtomicBool::new(false),
@@ -112,74 +211,39 @@ impl AgentLifecycleGuard {
             service_uuid,
         });
 
+        info!(
+            "[LifecycleGuard] 创建 Claude Agent 守卫: project_id={}, pgid={}, session_id={}",
+            project_id, pgid, session_id_str
+        );
+
         Self { inner }
     }
 
     /// 优雅停止agent
     ///
-    /// 带超时机制（5秒），超时后强制 kill 子进程
+    /// 带超时机制（5秒），超时后强制 kill 进程组
+    ///
+    /// ## 进程组终止
+    ///
+    /// 发送信号到 `-pgid`（负的进程组 ID），这会终止：
+    /// - 子进程（进程组组长）
+    /// - 所有孙进程（同一进程组中的进程）
     pub async fn graceful_stop(&self) -> Result<()> {
         if self.inner.stopped.load(Ordering::SeqCst) {
-            info!("Agent already stopped, skipping graceful stop");
+            debug!("Agent already stopped, skipping graceful stop");
             return Ok(());
         }
 
         info!(
-            "Gracefully stopping Claude agent for project: {}",
-            self.inner.project_id
+            "Gracefully stopping Claude agent for project: {}, pgid={}",
+            self.inner.project_id, self.inner.pgid
         );
 
         // 1. 发送取消信号
         self.inner.cancel_token.cancel();
 
-        // 2. 根据资源类型执行相应的清理操作
-        match &self.inner.resources {
-            AgentResources::Claude { child_process, .. } => {
-                let mut child_guard = child_process.lock().await;
-                if let Some(mut child) = child_guard.take() {
-                    info!("Stopping Claude child process");
-
-                    // 设置超时时间：5 秒
-                    let timeout_duration = tokio::time::Duration::from_secs(5);
-
-                    // 使用 timeout 包装 wait，避免无限等待
-                    match tokio::time::timeout(timeout_duration, child.wait()).await {
-                        Ok(Ok(status)) => {
-                            info!(
-                                "✅ Claude process exited gracefully with status: {} (project: {})",
-                                status, self.inner.project_id
-                            );
-                        }
-                        Ok(Err(e)) => {
-                            warn!(
-                                "⚠️ Failed to wait for Claude process (project: {}): {}",
-                                self.inner.project_id, e
-                            );
-                        }
-                        Err(_) => {
-                            // 超时后强制 kill
-                            warn!(
-                                "⏰ Claude process didn't exit within {}s, force killing (project: {})",
-                                timeout_duration.as_secs(),
-                                self.inner.project_id
-                            );
-
-                            if let Err(e) = child.kill().await {
-                                warn!(
-                                    "⚠️ Failed to kill Claude process (project: {}): {}",
-                                    self.inner.project_id, e
-                                );
-                            } else {
-                                info!(
-                                    "💀 Claude process force killed (project: {})",
-                                    self.inner.project_id
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // 2. 终止进程组
+        self.kill_process_group(false).await?;
 
         self.inner.stopped.store(true, Ordering::SeqCst);
         Ok(())
@@ -187,7 +251,7 @@ impl AgentLifecycleGuard {
 
     /// 发送取消信号（非阻塞）
     pub fn cancel(&self) {
-        info!("Sending cancel signal to agent: {}", self.inner.project_id);
+        debug!("Sending cancel signal to agent: {}", self.inner.project_id);
         self.inner.cancel_token.cancel();
     }
 
@@ -199,6 +263,72 @@ impl AgentLifecycleGuard {
     /// 获取取消令牌
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.inner.cancel_token
+    }
+
+    /// 🔥 终止进程组
+    ///
+    /// 向 `-pgid` 发送信号，杀死整个进程组
+    ///
+    /// # Unix 信号语义
+    ///
+    /// - `kill(pgid, SIGTERM)` - 发送给单个进程
+    /// - `kill(-pgid, SIGTERM)` - 发送给整个进程组
+    ///
+    /// # 参数
+    ///
+    /// * `force` - 是否强制使用 SIGKILL（否则使用 SIGTERM）
+    async fn kill_process_group(&self, force: bool) -> Result<()> {
+        let pgid = self.inner.pgid;
+
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+
+            // 🔥 关键：使用负的进程组 ID
+            // -pgid 表示发送信号到整个进程组，而不仅仅是进程组组长
+            let target = Pid::from_raw(-(pgid as i32));
+
+            let signal = if force {
+                Signal::SIGKILL
+            } else {
+                Signal::SIGTERM
+            };
+
+            match kill(target, signal) {
+                Ok(_) => {
+                    debug!(
+                        "已发送信号到进程组: pgid={}, signal={:?}",
+                        pgid, signal
+                    );
+
+                    // 如果是 SIGTERM，等待一段时间让进程优雅退出
+                    if !force {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                        // 强制杀死进程组
+                        let _ = kill(target, Signal::SIGKILL);
+                        debug!("已强制终止进程组: pgid={}", pgid);
+                    }
+                }
+                Err(e) => {
+                    // 进程组可能已经退出
+                    debug!(
+                        "终止进程组失败（可能已退出）: pgid={}, error={}",
+                        pgid, e
+                    );
+                }
+            }
+
+            info!("✅ Claude process group stopped: pgid={}", pgid);
+        }
+
+        #[cfg(not(unix))]
+        {
+            debug!("非 Unix 平台，跳过进程组终止");
+        }
+
+        Ok(())
     }
 }
 
@@ -215,14 +345,14 @@ impl Drop for AgentLifecycleGuard {
         let strong_count = Arc::strong_count(&self.inner);
         let is_stopped = self.inner.stopped.load(Ordering::SeqCst);
 
-        info!(
-            "[Claude] AgentLifecycleGuard::drop 开始: project_id={}, strong_count={}, is_stopped={}",
-            self.inner.project_id, strong_count, is_stopped
+        debug!(
+            "[Claude] AgentLifecycleGuard::drop 开始: project_id={}, pgid={}, strong_count={}, is_stopped={}",
+            self.inner.project_id, self.inner.pgid, strong_count, is_stopped
         );
 
         // 只有最后一个引用被drop时才执行清理
         if strong_count == 1 && !is_stopped {
-            info!(
+            debug!(
                 "[Claude] AgentLifecycleGuard被drop，清理资源: {}",
                 self.inner.project_id
             );
@@ -237,32 +367,41 @@ impl Drop for AgentLifecycleGuard {
             //
             // 这样避免双重清理，确保资源只被清理一次
 
-            // 同步清理关键资源
-            match &self.inner.resources {
-                AgentResources::Claude { child_process, .. } => {
-                    info!(
-                        "[Claude] 尝试获取 child_process 锁: {}",
-                        self.inner.project_id
+            // 🔥 同步终止进程组
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+
+                let pgid = self.inner.pgid;
+                let target = Pid::from_raw(-(pgid as i32));
+
+                if let Err(e) = kill(target, Signal::SIGKILL) {
+                    // 进程可能已经退出，这是正常的
+                    debug!(
+                        "[Claude] 终止进程组失败（可能已退出）: pgid={}, error={}",
+                        pgid, e
                     );
-                    if let Ok(mut child_guard) = child_process.try_lock()
-                        && let Some(mut child) = child_guard.take()
-                    {
-                        info!("[Claude] 开始 kill 子进程: {}", self.inner.project_id);
-                        let _ = child.start_kill();
-                        info!("[Claude] kill 子进程完成: {}", self.inner.project_id);
-                    } else {
-                        info!(
-                            "[Claude] 无法获取 child_process 锁或子进程不存在: {}",
-                            self.inner.project_id
-                        );
-                    }
+                } else {
+                    debug!(
+                        "[Claude] 进程组已终止: pgid={}, project_id={}",
+                        pgid, self.inner.project_id
+                    );
                 }
             }
+
+            #[cfg(not(unix))]
+            {
+                debug!("[Claude] 非 Unix 平台，跳过进程组终止");
+            }
+
+            // 注意：后台回收任务 (reaper_task) 会自动完成
+            // 不需要在这里等待或取消
 
             self.inner.stopped.store(true, Ordering::SeqCst);
         }
 
-        info!(
+        debug!(
             "[Claude] AgentLifecycleGuard::drop 完成: project_id={}",
             self.inner.project_id
         );

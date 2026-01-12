@@ -61,5 +61,8 @@ rmcp = {  version = "0.10", features = [
 # 序列化
 serde = { workspace = true }
 
+# Unix 信号处理
+nix = { workspace = true, features = ["signal"] }
+
 [dev-dependencies]
 tempfile = "3.8"

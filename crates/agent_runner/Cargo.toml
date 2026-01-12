@@ -100,3 +100,6 @@ arc-swap = "1.8"
 # Pyroscope Continuous Profiling
 pyroscope = { workspace = true, optional = true }
 pyroscope_pprofrs = { workspace = true, optional = true }
+
+# Unix 信号处理（用于僵尸进程回收）
+nix = { workspace = true, features = ["signal", "process"] }
