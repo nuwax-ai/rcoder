@@ -147,35 +147,6 @@ impl ContainerSelfInspector {
         }
     }
 
-    /// 解析容器路径到宿主机路径（支持 PathBuf）
-    ///
-    /// # Arguments
-    /// * `container_path` - 容器内路径
-    ///
-    /// # Returns
-    /// * `Option<PathBuf>` - 宿主机路径，如果无法解析则返回 None
-    pub fn resolve_container_path_to_host(
-        &self,
-        container_path: &std::path::Path,
-    ) -> Option<std::path::PathBuf> {
-        let container_path_str = container_path.to_string_lossy();
-
-        // 这里需要异步调用，但由于我们在同步方法中，我们无法直接调用异步方法
-        // 作为临时解决方案，我们尝试从缓存的环境变量或预设的映射中解析
-        // 对于 /app/specs，我们使用已知的主容器挂载映射
-
-        if container_path_str.starts_with("/app/specs") {
-            // 这是一个已知的挂载点，返回相应的宿主机路径
-            // 注意：这里硬编码了路径，在实际部署中可能需要更灵活的解决方案
-            return Some(std::path::PathBuf::from(
-                "/Volumes/soddygo/git_work/rcoder/docker/specs",
-            ));
-        }
-
-        // 如果不是已知路径，返回 None 让其他逻辑处理
-        None
-    }
-
     /// 获取当前容器ID
     ///
     /// 通过读取 `/proc/self/cgroup` 文件解析容器ID

@@ -25,7 +25,7 @@ rust.allow_leading_underscore = "warn"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["soddy <soddygo@qq.com>"]
 license = "MIT OR Apache-2.0"
 description = "Rust-based AI agent framework"
 publish = false
