@@ -1,0 +1,64 @@
+{
+  "agent_servers": {
+    "claude-code-acp": {
+      "agent_id": "claude-code-acp",
+      "agent_type": "claude",
+      "command": "claude-code-acp",
+      "args": [],
+      "env": {
+        "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}",
+        "ANTHROPIC_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
+        "ANTHROPIC_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
+        "RUST_LOG": "info"
+      },
+      "installation": {
+        "package_manager": "npm",
+        "package_name": "@zed-industries/claude-code-acp",
+        "version": "latest"
+      },
+      "enabled": true,
+      "metadata": {
+        "description": "Claude Code ACP Agent",
+        "version": "1.0.0"
+      }
+    },
+    "react-developer": {
+      "agent_id": "react-developer",
+      "agent_type": "claude",
+      "command": "claude-code-acp",
+      "args": [],
+      "env": {
+        "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}"
+      },
+      "system_prompt": {
+        "template": "你是一个专业的 React 开发助手",
+        "enabled": true
+      },
+      "user_prompt": {
+        "template": "作为 React 专家，请帮我解决以下问题：{user_prompt}。请提供现代、可维护的代码示例。",
+        "enabled": true
+      },
+      "enabled": false,
+      "metadata": {
+        "description": "React 专项开发助手"
+      }
+    }
+  },
+  "context_servers": {
+    "fetch": {
+      "source": "custom",
+      "enabled": true,
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+    "context7": {
+      "source": "custom",
+      "enabled": true,
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "env": {
+        "NODE_ENV": "production"
+      }
+    }
+  }
+}

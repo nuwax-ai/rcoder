@@ -1,0 +1,19 @@
+# 快速测试 Alloy 安装
+FROM debian:12
+ARG INSTALL_ALLOY=true
+ARG ALLOY_VERSION=v1.12.2
+
+RUN apt-get update && \
+    apt-get install -y wget ca-certificates && \
+    ARCH=$(dpkg --print-architecture) && \
+    echo "=== Architecture: $ARCH ===" && \
+    if [ "$ARCH" = "arm64" ]; then \
+        wget -O /tmp/alloy.deb https://github.com/grafana/alloy/releases/download/v1.12.2/alloy-1.12.2-1.arm64.deb && \
+        ls -lh /tmp/alloy.deb && \
+        dpkg -i /tmp/alloy.deb && \
+        apt-get install -y -f && \
+        which alloy && \
+        alloy --version; \
+    fi
+
+CMD ["/bin/bash"]

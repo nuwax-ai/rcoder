@@ -2,17 +2,13 @@
 //!
 //! 转发停止请求到容器内的 agent_runner 服务
 
-use axum::extract::{Path, Query, State};
-use reqwest::Client;
+use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument};
+use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{
-    AgentStatusResponse, AppError, HttpResult, proxy_agent::docker_container_agent,
-    router::AppState,
-};
+use crate::{AppError, HttpResult, router::AppState};
 
 /// 停止Agent请求参数
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -44,16 +40,20 @@ async fn destroy_container_for_project(
     info!("🔥 [STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
 
     // 使用全局 DockerManager
-    let docker_manager = docker_manager::global::get_global_docker_manager()
-        .await
-        .map_err(|e| {
+    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+        Ok(manager) => manager,
+        Err(e) => {
             error!("❌ [STOP_DESTROY] 获取全局 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
-        })?;
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                &format!("获取全局 DockerManager 失败: {}", e),
+            ));
+        }
+    };
 
     // 尝试通过多种方式查找容器
     // 1. 先通过 project_id 查找
-    let mut container_info = docker_manager.get_container_info(project_id);
+    let mut container_info = docker_manager.get_container_info(project_id).await;
 
     // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
     if container_info.is_none() {
@@ -83,16 +83,14 @@ async fn destroy_container_for_project(
         if let Err(e) = stop_result {
             error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
             return Ok(HttpResult::error(
-                "STOP001",
+                shared_types::error_codes::ERR_STOP_FAILED,
                 &format!("停止容器失败: {}", e),
             ));
         }
 
-        // 从 Agent 映射中移除（如果 project_id 不是 "unknown"）
+        // 从 DuckDB 存储中移除项目（如果 project_id 不是 "unknown"）
         if container_info.project_id != "unknown" {
-            state
-                .project_and_agent_map
-                .remove(&container_info.project_id);
+            state.remove_project(&container_info.project_id);
         }
 
         info!(
@@ -103,7 +101,7 @@ async fn destroy_container_for_project(
         let response = StopAgentResponse {
             success: true,
             project_id: project_id.to_string(),
-            session_id: Some(container_info.session_id),
+            session_id: None,
             message: "容器已成功销毁".to_string(),
         };
 
@@ -125,7 +123,6 @@ async fn destroy_container_for_project(
         Ok(HttpResult::success(response))
     }
 }
-
 
 /// 停止指定项目的Agent服务
 ///
@@ -181,6 +178,11 @@ async fn destroy_container_for_project(
             })
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 500,
             description = "销毁容器失败",
             body = HttpResult<String>,
@@ -208,7 +210,7 @@ pub async fn agent_stop(
 
     if project_id.is_empty() {
         return Ok(HttpResult::error(
-            "INVALID_PARAMS",
+            shared_types::error_codes::ERR_INVALID_PARAMS,
             "project_id cannot be empty",
         ));
     }
@@ -223,10 +225,14 @@ pub async fn agent_stop(
 
     match &result {
         Ok(response) => {
-            if response.data.as_ref().unwrap().success {
-                info!("✅ [STOP_DESTROY] 容器销毁成功: project_id={}", project_id);
+            if let Some(data) = response.data.as_ref() {
+                if data.success {
+                    info!("✅ [STOP_DESTROY] 容器销毁成功: project_id={}", project_id);
+                } else {
+                    error!("❌ [STOP_DESTROY] 容器销毁失败: project_id={}", project_id);
+                }
             } else {
-                error!("❌ [STOP_DESTROY] 容器销毁失败: project_id={}", project_id);
+                error!("❌ [STOP_DESTROY] 响应数据为空: project_id={}", project_id);
             }
         }
         Err(e) => {

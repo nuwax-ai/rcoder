@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
 
 /// Docker 容器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,12 +59,36 @@ pub struct ResourceLimits {
     pub swap_limit: Option<i64>,
 }
 
-impl Default for DockerContainerConfig {
-    fn default() -> Self {
+impl DockerContainerConfig {
+    /// 为指定服务类型创建配置
+    ///
+    /// 使用服务类型动态获取容器名称前缀，避免硬编码
+    ///
+    /// # Arguments
+    ///
+    /// * `service_type` - 服务类型（RCoder 或 ComputerAgentRunner）
+    ///
+    /// # Returns
+    ///
+    /// 返回配置了正确容器前缀的 DockerContainerConfig
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use docker_manager::DockerContainerConfig;
+    /// use shared_types::ServiceType;
+    ///
+    /// let config = DockerContainerConfig::new_for_service(ServiceType::RCoder);
+    /// assert_eq!(config.name_prefix, "rcoder-agent");
+    ///
+    /// let config = DockerContainerConfig::new_for_service(ServiceType::ComputerAgentRunner);
+    /// assert_eq!(config.name_prefix, "computer-agent-runner");
+    /// ```
+    pub fn new_for_service(service_type: shared_types::ServiceType) -> Self {
         Self {
             project_id: String::new(),
             image: crate::default_docker_image(),
-            name_prefix: "rcoder-agent".to_string(),
+            name_prefix: service_type.container_prefix().to_string(), // 🔧 动态获取
             host_path: String::new(),
             container_path: crate::DEFAULT_WORK_DIR.to_string(),
             work_dir: crate::DEFAULT_WORK_DIR.to_string(),
@@ -82,6 +105,13 @@ impl Default for DockerContainerConfig {
     }
 }
 
+impl Default for DockerContainerConfig {
+    fn default() -> Self {
+        // 默认使用 RCoder 服务
+        Self::new_for_service(shared_types::ServiceType::RCoder)
+    }
+}
+
 /// Docker 容器信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerContainerInfo {
@@ -89,8 +119,14 @@ pub struct DockerContainerInfo {
     pub container_id: String,
     /// 容器名称
     pub container_name: String,
-    /// 项目 ID
+    /// 项目 ID（RCoder 模式的主键）
     pub project_id: String,
+    /// 用户 ID（ComputerAgentRunner 模式的主键，可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// 服务类型（RCoder 或 ComputerAgentRunner）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<shared_types::ServiceType>,
     /// 镜像名称
     pub image: String,
     /// 状态
@@ -109,38 +145,52 @@ pub struct DockerContainerInfo {
     pub assigned_port: u16,
     /// 健康检查状态
     pub health_status: Option<String>,
+    /// 🆕 服务层健康状态（gRPC/HTTP 检查结果）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_health: Option<crate::health::ServiceHealthStatus>,
     /// 内部服务端口
     pub internal_port: u16,
-    /// 会话ID
-    pub session_id: String,
     /// 网络名称
     pub network_name: String,
 }
 
-/// 容器基本信息（用于 API 响应）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContainerBasicInfo {
-    /// 容器唯一标识ID
-    pub container_id: String,
-    /// 容器名称
-    pub container_name: String,
-    /// 容器IP地址
-    pub container_ip: String,
-    /// 容器内部服务端口
-    pub internal_port: u16,
-    /// 容器外部映射端口
-    pub external_port: u16,
-    /// 项目ID
-    pub project_id: String,
-    /// 会话ID
-    pub session_id: String,
-    /// 容器状态
-    pub status: String,
-    /// 创建时间
-    pub created_at: DateTime<Utc>,
-    /// 服务URL
-    pub service_url: String,
+impl DockerContainerInfo {
+    /// 获取容器的业务主键
+    ///
+    /// 根据 `service_type` 返回正确的标识符：
+    /// - **RCoder**: 返回 `project_id`
+    /// - **ComputerAgentRunner**: 返回 `user_id`（如果有），否则回退到 `project_id`
+    ///
+    /// # Returns
+    /// 容器的业务标识符
+    pub fn container_key(&self) -> &str {
+        match self.service_type {
+            Some(shared_types::ServiceType::ComputerAgentRunner) => {
+                // ComputerAgentRunner 模式优先使用 user_id
+                self.user_id.as_deref().unwrap_or(&self.project_id)
+            }
+            Some(shared_types::ServiceType::RCoder) => {
+                // RCoder 模式使用 project_id
+                &self.project_id
+            }
+            _ => {
+                // 未知类型使用 project_id
+                &self.project_id
+            }
+        }
+    }
+
+    /// 判断是否为 ComputerAgentRunner 容器
+    pub fn is_computer_agent(&self) -> bool {
+        matches!(
+            self.service_type,
+            Some(shared_types::ServiceType::ComputerAgentRunner)
+        )
+    }
 }
+
+/// 容器基本信息（使用shared_types中的定义）
+pub type ContainerBasicInfo = shared_types::ContainerBasicInfo;
 
 /// 容器状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -214,19 +264,14 @@ pub struct DockerManagerConfig {
     pub auto_cleanup: bool,
     /// 容器存活时间 (秒)
     pub container_ttl_seconds: Option<u64>,
-    /// Docker 镜像配置（从 rcoder 配置传递）
-    pub image_config: Option<DockerImageConfig>,
-}
 
-/// Docker 镜像配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DockerImageConfig {
-    /// Docker 镜像名称（根据架构自动选择）
-    pub default_image: Option<String>,
-    /// ARM64 架构的 Docker 镜像
-    pub arm64_image: Option<String>,
-    /// AMD64 架构的 Docker 镜像
-    pub amd64_image: Option<String>,
+    /// 多镜像配置（从 rcoder 配置传递，始终有值）
+    pub multi_image_config: shared_types::MultiImageConfig,
+
+    /// 网络基础名称（不含 project name 前缀）
+    /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
+    /// 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
+    pub network_base_name: String,
 }
 
 /// Docker 配置（从 rcoder 配置传递）
@@ -238,6 +283,8 @@ pub struct DockerConfig {
     pub arm64_image: Option<String>,
     /// AMD64 架构的 Docker 镜像
     pub amd64_image: Option<String>,
+    /// 默认回退镜像（当无法检测架构或架构不匹配时使用）
+    pub default_image: Option<String>,
     /// 默认网络模式
     pub network_mode: Option<String>,
     /// 默认工作目录
@@ -258,13 +305,15 @@ impl Default for DockerManagerConfig {
             default_work_dir: crate::DEFAULT_WORK_DIR.to_string(),
             auto_cleanup: true,
             container_ttl_seconds: Some(3600), // 1小时
-            image_config: None,                // 使用默认镜像
+
+            multi_image_config: shared_types::create_default_multi_image_config(), // 默认多镜像配置
+            network_base_name: crate::RCODER_NETWORK_BASE_NAME.to_string(), // 默认网络基础名称
         }
     }
 }
 
 /// 容器清理结果统计
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CleanupResult {
     /// 找到的容器数量
     pub total_found: usize,
@@ -280,20 +329,6 @@ pub struct CleanupResult {
     pub failed_removals_details: Vec<ContainerRemovalFailure>,
     /// 清理操作耗时（毫秒）
     pub duration_ms: u64,
-}
-
-impl Default for CleanupResult {
-    fn default() -> Self {
-        Self {
-            total_found: 0,
-            successfully_removed: 0,
-            failed_removals: 0,
-            skipped_running: 0,
-            removed_container_ids: Vec::new(),
-            failed_removals_details: Vec::new(),
-            duration_ms: 0,
-        }
-    }
 }
 
 impl CleanupResult {
@@ -396,7 +431,6 @@ impl ContainerFilter {
                         bollard::models::ContainerSummaryStateEnum::REMOVING => "removing",
                         bollard::models::ContainerSummaryStateEnum::DEAD => "dead",
                         bollard::models::ContainerSummaryStateEnum::EMPTY => "unknown",
-                        _ => "unknown",
                     };
                     statuses.iter().any(|s| s.to_string() == state_str)
                 } else {
@@ -405,7 +439,7 @@ impl ContainerFilter {
             }
             ContainerFilter::Label(key, value) => {
                 if let Some(labels) = &container.labels {
-                    labels.get(key.as_str()).map_or(false, |v| v == value)
+                    labels.get(key.as_str()) == Some(value)
                 } else {
                     false
                 }

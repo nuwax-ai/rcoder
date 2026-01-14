@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'rcoder'
+    environment: 'dev'
+
+# ============================================================================
+# Scrape 配置
+# ============================================================================
+# 注意: Alloy 使用 prometheus.remote_write 直接写入数据，不需要 scrape
+# 这里只配置 Prometheus 自身和 Grafana 的监控
+scrape_configs:
+  # Prometheus 自身监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Grafana 监控 (可选)
+  - job_name: 'grafana'
+    static_configs:
+      - targets: ['grafana:3000']

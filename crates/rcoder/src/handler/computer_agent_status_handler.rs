@@ -1,0 +1,445 @@
+//! Computer Agent Status Handler
+//!
+//! 查询 Computer Agent 的运行状态（通过 gRPC GetStatus 主动确认）
+
+use axum::Json;
+use axum::extract::State;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tracing::{debug, error, info, instrument, warn};
+use utoipa::ToSchema;
+
+use super::utils::get_realtime_container_ip_with_cache;
+use crate::router::AppState;
+use crate::{AppError, HttpResult};
+
+/// gRPC GetStatus 最大重试次数
+const GRPC_MAX_RETRIES: u32 = 3;
+
+/// gRPC GetStatus 请求超时时间（秒）
+const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// Agent 存活状态列表（白名单）
+const ALIVE_STATUSES: &[&str] = &["idle", "busy"];
+
+/// Computer Agent 状态查询请求
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ComputerAgentStatusRequest {
+    /// 用户 ID（必填）
+    #[schema(example = "user_123")]
+    pub user_id: String,
+
+    /// 项目 ID（必填）
+    #[schema(example = "proj_456")]
+    pub project_id: String,
+}
+
+/// Computer Agent 状态查询响应
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerAgentStatusResponse {
+    /// 用户 ID
+    #[schema(example = "user_123")]
+    pub user_id: String,
+
+    /// 项目 ID
+    #[schema(example = "proj_456")]
+    pub project_id: String,
+
+    /// Agent 是否已启动（容器运行中且 Agent 存在）
+    #[schema(example = true)]
+    pub is_alive: bool,
+
+    /// 会话 ID（仅当 is_alive 为 true 时存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "session_abc123")]
+    pub session_id: Option<String>,
+
+    /// Agent 状态（仅当 is_alive 为 true 时存在）
+    /// 可能的值："idle", "busy"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "idle")]
+    pub status: Option<String>,
+
+    /// 最后活动时间（仅当 is_alive 为 true 时存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "2024-01-01T12:00:00Z")]
+    pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// 创建时间（仅当 is_alive 为 true 时存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "2024-01-01T10:00:00Z")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ComputerAgentStatusResponse {
+    /// 创建 Agent 未启动的响应
+    fn not_alive(user_id: String, project_id: String) -> Self {
+        Self {
+            user_id,
+            project_id,
+            is_alive: false,
+            session_id: None,
+            status: None,
+            last_activity: None,
+            created_at: None,
+        }
+    }
+}
+
+/// 处理 Computer Agent 状态查询
+///
+/// 核心流程：
+/// 1. 验证 user_id 和 project_id
+/// 2. 查询容器是否存在且运行中
+/// 3. 主动调用 gRPC GetStatus 确认 Agent 真实状态
+/// 4. 返回综合状态信息
+#[utoipa::path(
+    post,
+    path = "/computer/agent/status",
+    request_body(
+        content = ComputerAgentStatusRequest,
+        description = "Computer Agent 状态查询请求",
+        content_type = "application/json"
+    ),
+    responses(
+        (
+            status = 200,
+            description = "成功获取 Agent 状态",
+            body = HttpResult<ComputerAgentStatusResponse>,
+            examples(
+                ("Agent 已启动" = (value = json!({
+                    "success": true,
+                    "code": "0000",
+                    "message": "Success",
+                    "data": {
+                        "user_id": "user_123",
+                        "project_id": "proj_456",
+                        "is_alive": true,
+                        "session_id": "session_abc123",
+                        "status": "idle",
+                        "last_activity": "2024-01-01T12:00:00Z",
+                        "created_at": "2024-01-01T10:00:00Z"
+                    }
+                }))),
+                ("Agent 未启动" = (value = json!({
+                    "success": true,
+                    "code": "0000",
+                    "message": "Success",
+                    "data": {
+                        "user_id": "user_123",
+                        "project_id": "proj_456",
+                        "is_alive": false
+                    }
+                })))
+            )
+        ),
+        (
+            status = 400,
+            description = "请求参数错误",
+            body = HttpResult<String>
+        ),
+        (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
+            status = 500,
+            description = "服务器内部错误",
+            body = HttpResult<String>
+        )
+    ),
+    tag = "computer",
+    operation_id = "computer_agent_status",
+    summary = "查询 Computer Agent 状态",
+    description = "查询指定 user_id + project_id 对应的 Computer Agent 是否已启动。通过主动调用子容器的 gRPC GetStatus 接口确认 Agent 真实状态。"
+)]
+#[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
+pub async fn computer_agent_status(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ComputerAgentStatusRequest>,
+) -> Result<HttpResult<ComputerAgentStatusResponse>, AppError> {
+    // 1. 参数验证
+    if request.user_id.trim().is_empty() {
+        error!("❌ [COMPUTER_AGENT_STATUS] user_id 不能为空");
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "user_id 不能为空",
+        ));
+    }
+    if request.project_id.trim().is_empty() {
+        error!("❌ [COMPUTER_AGENT_STATUS] project_id 不能为空");
+        return Ok(HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
+            "project_id 不能为空",
+        ));
+    }
+
+    info!(
+        "🔍 [COMPUTER_AGENT_STATUS] 查询 Agent 状态: user_id={}, project_id={}",
+        request.user_id, request.project_id
+    );
+
+    // 2. 查询容器信息（通过 DockerManager）
+    let docker_manager = docker_manager::global::get_global_docker_manager()
+        .await
+        .map_err(|e| {
+            error!("❌ [COMPUTER_AGENT_STATUS] 获取 DockerManager 失败: {}", e);
+            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+        })?;
+
+    // 获取容器信息（ComputerAgentRunner 使用 user_id 作为容器标识）
+    let container_info = match docker_manager
+        .get_user_container_info(&request.user_id)
+        .await
+    {
+        Ok(Some(info)) => info,
+        Ok(None) => {
+            info!(
+                "📭 [COMPUTER_AGENT_STATUS] 容器不存在: user_id={}",
+                request.user_id
+            );
+            // Early return: 直接 move request 的字段
+            return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
+                request.user_id,
+                request.project_id,
+            )));
+        }
+        Err(e) => {
+            error!(
+                "❌ [COMPUTER_AGENT_STATUS] 查询容器信息失败: user_id={}, error={}",
+                request.user_id, e
+            );
+            return Err(AppError::internal_server_error(&format!(
+                "查询容器信息失败: {}",
+                e
+            )));
+        }
+    };
+
+    // 3. 检查容器是否运行中
+    if container_info.status != "running" {
+        info!(
+            "⚠️ [COMPUTER_AGENT_STATUS] 容器未运行: user_id={}, status={}",
+            request.user_id, container_info.status
+        );
+        // Early return: 直接 move request 的字段
+        return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
+            request.user_id,
+            request.project_id,
+        )));
+    }
+
+    info!(
+        "✅ [COMPUTER_AGENT_STATUS] 容器运行中: container_id={}, container_ip={}",
+        container_info.container_id, container_info.container_ip
+    );
+
+    // 4. 主动调用 gRPC GetStatus 确认 Agent 真实状态
+    // 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期
+    let grpc_addr = match get_realtime_container_ip_with_cache(
+        &container_info.container_name,
+        &state.container_ip_cache,
+        &container_info.container_ip,
+    )
+    .await
+    {
+        Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
+        Err(e) => {
+            error!(
+                "❌ [COMPUTER_AGENT_STATUS] 获取容器 IP 失败: user_id={}, error={}",
+                request.user_id, e
+            );
+            // Early return: 直接 move request 的字段
+            return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
+                request.user_id,
+                request.project_id,
+            )));
+        }
+    };
+
+    debug!(
+        "📡 [COMPUTER_AGENT_STATUS] gRPC 地址: {}, project_id={}",
+        grpc_addr, request.project_id
+    );
+
+    // 调用 gRPC GetStatus（带超时和重试）
+    let grpc_response = match call_grpc_get_status_with_retry(
+        &state.grpc_pool,
+        &grpc_addr,
+        &request.project_id,
+        GRPC_MAX_RETRIES,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            warn!(
+                "⚠️ [COMPUTER_AGENT_STATUS] gRPC GetStatus 调用失败: user_id={}, project_id={}, error={}",
+                request.user_id, request.project_id, e
+            );
+            // gRPC 调用失败视为 Agent 不存在
+            // Early return: 直接 move request 的字段
+            return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
+                request.user_id,
+                request.project_id,
+            )));
+        }
+    };
+
+    // 5. 使用 is_found 字段判断 Agent 是否存活
+    let is_alive = grpc_response.is_found;
+
+    if !is_alive {
+        info!(
+            "📭 [COMPUTER_AGENT_STATUS] Agent 未启动: user_id={}, project_id={}, is_found={}",
+            request.user_id, request.project_id, grpc_response.is_found
+        );
+        return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
+            request.user_id,
+            request.project_id,
+        )));
+    }
+
+    // 6. Agent 存活，从 DuckDB 获取完整信息
+    let response = if let Some(project_info) = state.get_project(&request.project_id) {
+        ComputerAgentStatusResponse {
+            user_id: request.user_id.clone(),
+            project_id: request.project_id.clone(),
+            is_alive: true,
+            session_id: project_info.session_id().map(|s| s.to_string()),
+            status: Some(grpc_response.status.clone()),
+            last_activity: Some(project_info.last_activity()),
+            created_at: Some(project_info.created_at()),
+        }
+    } else {
+        // DuckDB 中无记录，但 gRPC 确认 Agent 存在
+        warn!(
+            "⚠️ [COMPUTER_AGENT_STATUS] Agent 存在但 DuckDB 无记录: user_id={}, project_id={}",
+            request.user_id, request.project_id
+        );
+        ComputerAgentStatusResponse {
+            user_id: request.user_id.clone(),
+            project_id: request.project_id.clone(),
+            is_alive: true,
+            session_id: None,
+            status: Some(grpc_response.status.clone()),
+            last_activity: None,
+            created_at: None,
+        }
+    };
+
+    info!(
+        "✅ [COMPUTER_AGENT_STATUS] Agent 状态查询完成: user_id={}, project_id={}, is_alive={}, status={}",
+        request.user_id,
+        request.project_id,
+        response.is_alive,
+        response.status.as_deref().unwrap_or("unknown")
+    );
+
+    Ok(HttpResult::success(response))
+}
+
+/// 调用 gRPC GetStatus（带重试机制）
+///
+/// # 参数
+/// - `pool`: gRPC 连接池
+/// - `grpc_addr`: gRPC 服务地址
+/// - `project_id`: 项目 ID
+/// - `max_retries`: 最大重试次数
+///
+/// # 返回
+/// - `Ok(status)`: 从 Agent 返回的状态字符串（可能的值取决于 Agent 实现，通常为 "idle", "busy", "error", "not_found" 等）
+/// - `Err(e)`: gRPC 调用失败（网络错误、超时、连接失败等）
+///
+/// # 重试策略
+/// - 仅对可重试的错误进行重试：Unavailable, DeadlineExceeded, Unknown, Internal
+/// - 使用指数退避：100ms, 200ms, 400ms
+/// - 失败后自动从连接池移除失败的连接
+async fn call_grpc_get_status_with_retry(
+    pool: &Arc<crate::grpc::GrpcChannelPool>,
+    grpc_addr: &str,
+    project_id: &str,
+    max_retries: u32,
+) -> anyhow::Result<shared_types::grpc::GetStatusResponse> {
+    let mut last_error = None;
+
+    for attempt in 1..=max_retries {
+        match pool.get_client(grpc_addr).await {
+            Ok(mut client) => {
+                let request = shared_types::grpc::GetStatusRequest {
+                    project_id: project_id.to_string(),
+                    session_id: String::new(), // 查询项目级别状态
+                };
+
+                // 设置超时
+                let mut tonic_request = tonic::Request::new(request);
+                tonic_request
+                    .set_timeout(std::time::Duration::from_secs(GRPC_REQUEST_TIMEOUT_SECS));
+
+                match client.get_status(tonic_request).await {
+                    Ok(response) => {
+                        let grpc_response = response.into_inner();
+                        debug!(
+                            "✅ [GRPC_GET_STATUS] 第 {} 次尝试成功: project_id={}, status={}, is_found={}",
+                            attempt, project_id, grpc_response.status, grpc_response.is_found
+                        );
+                        return Ok(grpc_response);
+                    }
+                    Err(e) => {
+                        // 直接判断原始 tonic::Status，避免信息丢失
+                        let should_retry = matches!(
+                            e.code(),
+                            tonic::Code::Unavailable
+                                | tonic::Code::DeadlineExceeded
+                                | tonic::Code::Unknown
+                                | tonic::Code::Internal
+                        );
+
+                        if should_retry && attempt < max_retries {
+                            warn!(
+                                "⚠️ [GRPC_GET_STATUS] 第 {} 次尝试失败（可重试）: project_id={}, code={:?}, error={}",
+                                attempt,
+                                project_id,
+                                e.code(),
+                                e
+                            );
+                            // 从连接池移除失败的连接
+                            pool.remove(grpc_addr);
+                            last_error = Some(anyhow::anyhow!("gRPC 调用失败: {}", e));
+
+                            // 指数退避: 100ms, 200ms, 400ms
+                            let delay_ms = 100 * (1 << (attempt - 1));
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                            continue;
+                        } else {
+                            error!(
+                                "❌ [GRPC_GET_STATUS] 第 {} 次尝试失败（不可重试或已达最大重试次数）: project_id={}, code={:?}, error={}",
+                                attempt,
+                                project_id,
+                                e.code(),
+                                e
+                            );
+                            return Err(anyhow::anyhow!("gRPC 调用失败: {}", e));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️ [GRPC_GET_STATUS] 第 {} 次获取 gRPC 客户端失败: error={}",
+                    attempt, e
+                );
+                last_error = Some(e);
+                if attempt < max_retries {
+                    // 指数退避: 100ms, 200ms, 400ms
+                    let delay_ms = 100 * (1 << (attempt - 1));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("未知错误")))
+}

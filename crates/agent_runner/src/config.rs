@@ -6,8 +6,6 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::AgentType;
-
 /// 命令行参数
 #[derive(Parser, Debug)]
 #[command(name = "rcoder")]
@@ -38,14 +36,22 @@ pub struct CliArgs {
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// 默认使用的 AI 代理类型
-    pub default_agent: AgentType,
+    /// 默认使用的 Agent ID
+    #[serde(default = "default_agent_id")]
+    pub default_agent_id: String,
     /// 项目工作的根目录,根据启动命令的当前目录来确定
     pub projects_dir: PathBuf,
     /// 服务端口
     pub port: u16,
     /// 代理配置
     pub proxy_config: Option<ProxyConfig>,
+    /// Agent 清理配置
+    #[serde(default)]
+    pub agent_cleanup: Option<AgentCleanupConfig>,
+}
+
+fn default_agent_id() -> String {
+    "claude-code-acp".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,16 +78,84 @@ pub struct ProxyConfig {
     pub health_check: HealthCheckConfig,
 }
 
+/// Agent 清理配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCleanupConfig {
+    /// 闲置超时时间（秒），默认 180 秒（3 分钟）
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+    /// 清理检查间隔（秒），默认 30 秒
+    #[serde(default = "default_cleanup_interval")]
+    pub cleanup_interval_secs: u64,
+}
+
+/// Agent 清理配置常量
+impl AgentCleanupConfig {
+    /// 最小闲置超时时间（10 秒）
+    pub const MIN_IDLE_TIMEOUT: u64 = 10;
+    /// 最大闲置超时时间（24 小时）
+    pub const MAX_IDLE_TIMEOUT: u64 = 24 * 60 * 60;
+    /// 最小清理检查间隔（5 秒）
+    pub const MIN_CLEANUP_INTERVAL: u64 = 5;
+    /// 最大清理检查间隔（1 小时）
+    pub const MAX_CLEANUP_INTERVAL: u64 = 60 * 60;
+
+    /// 验证配置值是否在有效范围内
+    pub fn validate(&self) -> Result<(), String> {
+        if self.idle_timeout_secs < Self::MIN_IDLE_TIMEOUT
+            || self.idle_timeout_secs > Self::MAX_IDLE_TIMEOUT
+        {
+            return Err(format!(
+                "idle_timeout_secs 必须在 {} 到 {} 之间，当前值: {}",
+                Self::MIN_IDLE_TIMEOUT,
+                Self::MAX_IDLE_TIMEOUT,
+                self.idle_timeout_secs
+            ));
+        }
+
+        if self.cleanup_interval_secs < Self::MIN_CLEANUP_INTERVAL
+            || self.cleanup_interval_secs > Self::MAX_CLEANUP_INTERVAL
+        {
+            return Err(format!(
+                "cleanup_interval_secs 必须在 {} 到 {} 之间，当前值: {}",
+                Self::MIN_CLEANUP_INTERVAL,
+                Self::MAX_CLEANUP_INTERVAL,
+                self.cleanup_interval_secs
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+fn default_idle_timeout() -> u64 {
+    300 // 5 分钟
+}
+
+fn default_cleanup_interval() -> u64 {
+    30 // 30 秒
+}
+
+impl Default for AgentCleanupConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: default_idle_timeout(),
+            cleanup_interval_secs: default_cleanup_interval(),
+        }
+    }
+}
+
 /// 配置文件路径
 const CONFIG_FILE: &str = "config.yml";
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            default_agent: AgentType::Codex,
+            default_agent_id: default_agent_id(),
             projects_dir: PathBuf::from("./project_workspace"),
             port: 8086,
             proxy_config: Some(ProxyConfig::default()),
+            agent_cleanup: Some(AgentCleanupConfig::default()),
         }
     }
 }
@@ -144,6 +218,81 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         }
     }
 
+    // 🆕 Agent 清理配置：支持环境变量覆盖
+    if let Ok(idle_timeout) = env::var("RCODER_AGENT_IDLE_TIMEOUT_SECS") {
+        match idle_timeout.parse::<u64>() {
+            Ok(timeout) => {
+                // 🔒 验证范围
+                if timeout >= AgentCleanupConfig::MIN_IDLE_TIMEOUT
+                    && timeout <= AgentCleanupConfig::MAX_IDLE_TIMEOUT
+                {
+                    config
+                        .agent_cleanup
+                        .get_or_insert_with(Default::default)
+                        .idle_timeout_secs = timeout;
+                    info!(
+                        "使用环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 设置闲置超时: {} 秒",
+                        timeout
+                    );
+                } else {
+                    warn!(
+                        "环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 值无效: {} 秒，超出范围 [{}, {}]，使用配置文件中的值",
+                        timeout,
+                        AgentCleanupConfig::MIN_IDLE_TIMEOUT,
+                        AgentCleanupConfig::MAX_IDLE_TIMEOUT
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 值格式无效: {}，使用配置文件中的值",
+                    idle_timeout
+                );
+            }
+        }
+    }
+
+    if let Ok(cleanup_interval) = env::var("RCODER_AGENT_CLEANUP_INTERVAL_SECS") {
+        match cleanup_interval.parse::<u64>() {
+            Ok(interval) => {
+                // 🔒 验证范围
+                if interval >= AgentCleanupConfig::MIN_CLEANUP_INTERVAL
+                    && interval <= AgentCleanupConfig::MAX_CLEANUP_INTERVAL
+                {
+                    config
+                        .agent_cleanup
+                        .get_or_insert_with(Default::default)
+                        .cleanup_interval_secs = interval;
+                    info!(
+                        "使用环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 设置清理间隔: {} 秒",
+                        interval
+                    );
+                } else {
+                    warn!(
+                        "环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 值无效: {} 秒，超出范围 [{}, {}]，使用配置文件中的值",
+                        interval,
+                        AgentCleanupConfig::MIN_CLEANUP_INTERVAL,
+                        AgentCleanupConfig::MAX_CLEANUP_INTERVAL
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 值格式无效: {}，使用配置文件中的值",
+                    cleanup_interval
+                );
+            }
+        }
+    }
+
+    // 🆕 验证最终配置的有效性
+    if let Some(ref cleanup_config) = config.agent_cleanup {
+        if let Err(e) = cleanup_config.validate() {
+            warn!("Agent 清理配置验证失败: {}，使用默认配置", e);
+            config.agent_cleanup = Some(AgentCleanupConfig::default());
+        }
+    }
+
     // 4. 处理代理配置
     if cli_args.enable_proxy {
         let proxy_config = ProxyConfig {
@@ -159,11 +308,8 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                 unhealthy_threshold: 3,
             },
         };
+        info!("启用反向代理，监听端口: {}", proxy_config.listen_port);
         config.proxy_config = Some(proxy_config);
-        info!(
-            "启用反向代理，监听端口: {}",
-            config.proxy_config.as_ref().unwrap().listen_port
-        );
     }
 
     // 5. 命令行参数覆盖配置（优先级最高）
@@ -178,10 +324,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     }
 
     info!(
-        "最终配置: port={}, projects_dir={:?}, default_agent={:?}, proxy_enabled={}",
+        "最终配置: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
         config.port,
         config.projects_dir,
-        config.default_agent,
+        config.default_agent_id,
         config.proxy_config.is_some()
     );
 
@@ -213,13 +359,19 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
 
 /// 创建默认配置文件
 fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
+    // 获取 proxy_config，如果不存在则使用默认值
+    let proxy_config = config.proxy_config.as_ref().cloned().unwrap_or_default();
+
+    // 获取 agent_cleanup 配置，如果不存在则使用默认值
+    let agent_cleanup = config.agent_cleanup.as_ref().cloned().unwrap_or_default();
+
     // 手动构建带注释的 YAML 内容
     let content_with_comments = format!(
         r#"# rcoder 配置文件
 # 该文件在首次启动时自动生成
 
-# 默认使用的 AI 代理类型 (Codex/Claude/Proxy)
-default_agent: {}
+# 默认使用的 Agent ID
+default_agent_id: {}
 
 # 项目工作目录
 projects_dir: {}
@@ -244,23 +396,138 @@ proxy_config:
     timeout_seconds: {}
     healthy_threshold: {}
     unhealthy_threshold: {}
+
+# Agent 清理配置
+# 如果省略此配置块，将使用以下默认值：
+#   - idle_timeout_secs: 300 (5分钟)
+#   - cleanup_interval_secs: 30 (30秒)
+agent_cleanup:
+  # Agent 闲置超时时间（秒）
+  # Agent 在闲置超过此时间后会被自动清理以释放资源
+  # 有效范围: 10 - 86400 秒（10秒 - 24小时）
+  # 可通过环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 覆盖
+  idle_timeout_secs: {}
+  # 清理检查间隔（秒）
+  # 系统每隔此时间检查一次是否有闲置的 Agent 需要清理
+  # 有效范围: 5 - 3600 秒（5秒 - 1小时）
+  # 可通过环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 覆盖
+  cleanup_interval_secs: {}
 "#,
-        format!("{:?}", config.default_agent),
+        config.default_agent_id,
         config.projects_dir.display(),
         config.port,
-        config.proxy_config.as_ref().unwrap().listen_port,
-        config.proxy_config.as_ref().unwrap().default_backend_port,
-        config.proxy_config.as_ref().unwrap().backend_host,
-        config.proxy_config.as_ref().unwrap().port_param,
-        config.proxy_config.as_ref().unwrap().health_check.enabled,
-        config.proxy_config.as_ref().unwrap().health_check.interval_seconds,
-        config.proxy_config.as_ref().unwrap().health_check.timeout_seconds,
-        config.proxy_config.as_ref().unwrap().health_check.healthy_threshold,
-        config.proxy_config.as_ref().unwrap().health_check.unhealthy_threshold
+        proxy_config.listen_port,
+        proxy_config.default_backend_port,
+        proxy_config.backend_host,
+        proxy_config.port_param,
+        proxy_config.health_check.enabled,
+        proxy_config.health_check.interval_seconds,
+        proxy_config.health_check.timeout_seconds,
+        proxy_config.health_check.healthy_threshold,
+        proxy_config.health_check.unhealthy_threshold,
+        agent_cleanup.idle_timeout_secs,
+        agent_cleanup.cleanup_interval_secs
     );
 
     fs::write(CONFIG_FILE, content_with_comments)
         .map_err(|e| anyhow::anyhow!("写入配置文件失败: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_cleanup_default_values() {
+        let config = AgentCleanupConfig::default();
+        assert_eq!(config.idle_timeout_secs, 300);
+        assert_eq!(config.cleanup_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_agent_cleanup_validate_valid_range() {
+        let config = AgentCleanupConfig {
+            idle_timeout_secs: 600,    // 10 分钟
+            cleanup_interval_secs: 60, // 1 分钟
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_cleanup_validate_min_boundaries() {
+        // 测试最小边界值
+        let config = AgentCleanupConfig {
+            idle_timeout_secs: AgentCleanupConfig::MIN_IDLE_TIMEOUT,
+            cleanup_interval_secs: AgentCleanupConfig::MIN_CLEANUP_INTERVAL,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_cleanup_validate_max_boundaries() {
+        // 测试最大边界值
+        let config = AgentCleanupConfig {
+            idle_timeout_secs: AgentCleanupConfig::MAX_IDLE_TIMEOUT,
+            cleanup_interval_secs: AgentCleanupConfig::MAX_CLEANUP_INTERVAL,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_cleanup_validate_idle_timeout_too_small() {
+        let config = AgentCleanupConfig {
+            idle_timeout_secs: 5, // 小于最小值 10
+            cleanup_interval_secs: 30,
+        };
+        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("idle_timeout_secs"));
+    }
+
+    #[test]
+    fn test_agent_cleanup_validate_idle_timeout_too_large() {
+        let config = AgentCleanupConfig {
+            idle_timeout_secs: 100000, // 大于最大值 86400
+            cleanup_interval_secs: 30,
+        };
+        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("idle_timeout_secs"));
+    }
+
+    #[test]
+    fn test_agent_cleanup_validate_cleanup_interval_too_small() {
+        let config = AgentCleanupConfig {
+            idle_timeout_secs: 180,
+            cleanup_interval_secs: 2, // 小于最小值 5
+        };
+        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("cleanup_interval_secs"));
+    }
+
+    #[test]
+    fn test_agent_cleanup_validate_cleanup_interval_too_large() {
+        let config = AgentCleanupConfig {
+            idle_timeout_secs: 180,
+            cleanup_interval_secs: 5000, // 大于最大值 3600
+        };
+        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("cleanup_interval_secs"));
+    }
+
+    #[test]
+    fn test_agent_cleanup_validate_both_invalid() {
+        let config = AgentCleanupConfig {
+            idle_timeout_secs: 0,
+            cleanup_interval_secs: 0,
+        };
+        assert!(config.validate().is_err());
+        // 应该先检测到 idle_timeout_secs 的错误
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("idle_timeout_secs"));
+    }
 }

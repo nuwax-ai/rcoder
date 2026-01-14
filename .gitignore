@@ -1,5 +1,6 @@
 /target
 /tmp
+/temp
 /other
 .idea
 
@@ -11,3 +12,7 @@ project_workspace
 .checkstyle_suppressions.xml
 .DS_Store
 docker/rcoder
+.vscode
+docker/rcoder-agent-runner/bin/agent_runner
+docker/computer-cache
+docker/computer-project-workspace

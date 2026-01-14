@@ -1,4 +1,4 @@
-use agent_client_protocol::{SessionUpdate, StopReason};
+use agent_client_protocol::{Error, SessionUpdate, StopReason};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -30,6 +30,7 @@ pub struct UnifiedSessionMessage {
 }
 
 /// chat 对话的 prompt 开始
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPromptStart {
     pub session_id: String,
     /// 可选的请求ID，用于标识对应的用户请求
@@ -37,6 +38,7 @@ pub struct SessionPromptStart {
 }
 
 /// chat 对话的 prompt 结束
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPromptEnd {
     pub session_id: String,
     pub stop_reason: StopReason,
@@ -45,8 +47,17 @@ pub struct SessionPromptEnd {
     /// 可选的请求ID，用于标识对应的用户请求
     pub request_id: Option<String>,
 }
+///agent 执行任务报错的消息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPromptError {
+    pub session_id: String,
+    pub error: Error,
+    /// 可选的请求ID，用于标识对应的用户请求
+    pub request_id: Option<String>,
+}
 
 /// agent 的 session 更新
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionUpdate {
     pub session_id: String,
     pub session_update: SessionUpdate,
@@ -55,10 +66,12 @@ pub struct AgentSessionUpdate {
 }
 
 /// 需要发给前端的消息通知类型
+#[derive(Debug, Clone, Serialize)]
 pub enum SessionNotify {
     AgentSessionUpdate(AgentSessionUpdate),
     SessionPromptStart(SessionPromptStart),
     SessionPromptEnd(SessionPromptEnd),
+    SessionPromptError(SessionPromptError),
 }
 
 impl SessionNotify {
@@ -123,6 +136,28 @@ impl SessionNotify {
                     timestamp,
                 }
             }
+            SessionNotify::SessionPromptError(error) => {
+                // 将 Error 直接序列化为 JSON，保持其原有结构（包含 code 和 message）
+                let mut data = serde_json::to_value(&error.error).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "code": -1,
+                        "message": error.error.to_string()
+                    })
+                });
+
+                // 如果有 request_id，添加到 data 中
+                if let Some(request_id) = &error.request_id {
+                    data["request_id"] = serde_json::Value::String(request_id.clone());
+                }
+
+                UnifiedSessionMessage {
+                    session_id: error.session_id,
+                    message_type: SessionMessageType::SessionPromptEnd,
+                    sub_type: "error".to_string(),
+                    data,
+                    timestamp,
+                }
+            }
         }
     }
 }
@@ -152,6 +187,8 @@ fn stop_reason_to_string(reason: &StopReason) -> String {
         StopReason::MaxTurnRequests => "max_turn_requests".to_string(),
         StopReason::Refusal => "refusal".to_string(),
         StopReason::Cancelled => "cancelled".to_string(),
+        // 处理未来可能添加的新停止原因
+        _ => "unknown".to_string(),
     }
 }
 
@@ -163,20 +200,22 @@ fn stop_reason_to_description(reason: &StopReason) -> &'static str {
         StopReason::MaxTurnRequests => "达到最大请求数限制",
         StopReason::Refusal => "代理拒绝继续",
         StopReason::Cancelled => "用户取消",
+        // 处理未来可能添加的新停止原因
+        _ => "unknown",
     }
 }
 
 /// 将 SessionUpdate 转换为 (sub_type, data) 元组
 fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value) {
     match update {
-        SessionUpdate::UserMessageChunk { content } => {
+        SessionUpdate::UserMessageChunk(content) => {
             ("user_message_chunk".to_string(), serde_json::json!(content))
         }
-        SessionUpdate::AgentMessageChunk { content } => (
+        SessionUpdate::AgentMessageChunk(content) => (
             "agent_message_chunk".to_string(),
             serde_json::json!(content),
         ),
-        SessionUpdate::AgentThoughtChunk { content } => (
+        SessionUpdate::AgentThoughtChunk(content) => (
             "agent_thought_chunk".to_string(),
             serde_json::json!(content),
         ),
@@ -188,25 +227,27 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
             serde_json::json!(tool_call_update),
         ),
         SessionUpdate::Plan(plan) => ("plan".to_string(), serde_json::json!(plan)),
-        SessionUpdate::AvailableCommandsUpdate { available_commands } => (
+        SessionUpdate::AvailableCommandsUpdate(available_commands) => (
             "available_commands_update".to_string(),
             serde_json::json!({
                 "available_commands": available_commands
             }),
         ),
-        SessionUpdate::CurrentModeUpdate { current_mode_id } => (
+        SessionUpdate::CurrentModeUpdate(current_mode_id) => (
             "current_mode_update".to_string(),
             serde_json::json!({
                 "current_mode_id": current_mode_id
             }),
         ),
+        // 处理未来可能添加的新更新类型
+        _ => ("unknown_update".to_string(), serde_json::json!({})),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::{ContentBlock, TextContent};
+    use agent_client_protocol::ContentChunk;
 
     #[test]
     fn test_session_prompt_start_to_unified() {
@@ -321,13 +362,9 @@ mod tests {
 
     #[test]
     fn test_agent_session_update_to_unified() {
-        let content = ContentBlock::Text(TextContent {
-            text: "Hello, World!".to_string(),
-            annotations: None,
-            meta: None,
-        });
+        let content = ContentChunk::new("Hello, World!".into());
 
-        let update = SessionUpdate::AgentMessageChunk { content };
+        let update = SessionUpdate::AgentMessageChunk(content);
         let notify = SessionNotify::AgentSessionUpdate(AgentSessionUpdate {
             session_id: "test_session".to_string(),
             session_update: update,
@@ -342,20 +379,19 @@ mod tests {
             true
         );
         assert_eq!(unified.sub_type, "agent_message_chunk");
-        assert_eq!(unified.data["type"], "text");
-        assert_eq!(unified.data["text"], "Hello, World!");
+
+        // ACP 0.8 中 ContentChunk 的格式：{"content": {"text": "...", "type": "text"}}
+        assert_eq!(unified.data["content"]["text"], "Hello, World!");
+        assert_eq!(unified.data["content"]["type"], "text");
+
         assert!(!unified.data.as_object().unwrap().contains_key("request_id"));
     }
 
     #[test]
     fn test_agent_session_update_with_request_id_to_unified() {
-        let content = ContentBlock::Text(TextContent {
-            text: "Hello, World!".to_string(),
-            annotations: None,
-            meta: None,
-        });
+        let content = ContentChunk::new("Hello, World!".into());
 
-        let update = SessionUpdate::AgentMessageChunk { content };
+        let update = SessionUpdate::AgentMessageChunk(content);
         let notify = SessionNotify::AgentSessionUpdate(AgentSessionUpdate {
             session_id: "test_session".to_string(),
             session_update: update,
@@ -370,8 +406,57 @@ mod tests {
             true
         );
         assert_eq!(unified.sub_type, "agent_message_chunk");
-        assert_eq!(unified.data["type"], "text");
-        assert_eq!(unified.data["text"], "Hello, World!");
+        // ACP 0.8 中 ContentChunk 的格式：{"content": {"text": "...", "type": "text"}}
+        assert_eq!(unified.data["content"]["text"], "Hello, World!");
+        assert_eq!(unified.data["content"]["type"], "text");
+        assert_eq!(unified.data["request_id"], "req_123456789");
+    }
+
+    #[test]
+    fn test_session_prompt_error_to_unified() {
+        let notify = SessionNotify::SessionPromptError(SessionPromptError {
+            session_id: "test_session".to_string(),
+            error: Error::internal_error(),
+            request_id: None,
+        });
+
+        let unified = notify.to_unified_message();
+
+        assert_eq!(unified.session_id, "test_session");
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
+            true
+        );
+        assert_eq!(unified.sub_type, "error");
+
+        // 验证 data 直接包含 code 和 message 字段
+        let data_obj = unified.data.as_object().unwrap();
+        assert!(data_obj.contains_key("code"));
+        assert!(data_obj.contains_key("message"));
+        assert!(!data_obj.contains_key("request_id"));
+    }
+
+    #[test]
+    fn test_session_prompt_error_with_request_id_to_unified() {
+        let notify = SessionNotify::SessionPromptError(SessionPromptError {
+            session_id: "test_session".to_string(),
+            error: Error::method_not_found(),
+            request_id: Some("req_123456789".to_string()),
+        });
+
+        let unified = notify.to_unified_message();
+
+        assert_eq!(unified.session_id, "test_session");
+        assert_eq!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
+            true
+        );
+        assert_eq!(unified.sub_type, "error");
+
+        // 验证 data 直接包含 code 和 message 字段
+        let data_obj = unified.data.as_object().unwrap();
+        assert!(data_obj.contains_key("code"));
+        assert!(data_obj.contains_key("message"));
         assert_eq!(unified.data["request_id"], "req_123456789");
     }
 }

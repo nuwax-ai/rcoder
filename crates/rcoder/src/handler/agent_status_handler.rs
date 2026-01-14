@@ -1,14 +1,8 @@
-use axum::extract::{Path, Query, State};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use axum::extract::{Path, State};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument};
-use utoipa::{IntoParams, ToSchema};
+use tracing::{info, instrument};
 
-use crate::{
-    AgentStatusResponse, AppError, HttpResult, proxy_agent::docker_container_agent,
-    router::AppState,
-};
+use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 
 /// 查询Agent状态
 ///
@@ -65,6 +59,11 @@ use crate::{
                     "message": "project_id cannot be empty"
                 }
             })
+        ),
+        (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
         )
     ),
     tag = "agent",
@@ -91,8 +90,8 @@ pub async fn agent_status(
         project_id
     );
 
-    // 从MAP中获取Agent container 信息, state.project_and_agent_map.get(project_id)
-    if let Some(agent_info) = state.project_and_agent_map.get(project_id) {
+    // 从 DuckDB 存储中获取 Agent 信息
+    if let Some(agent_info) = state.get_project(project_id) {
         let response = AgentStatusResponse {
             project_id: agent_info.project_id().to_string(),
             is_alive: true,

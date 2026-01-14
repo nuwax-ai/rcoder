@@ -1,5 +1,4 @@
-use serde::{Serialize, Deserialize};
-use utoipa::ToSchema;
+use serde::{Deserialize, Serialize};
 
 /// 聊天响应结构
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
@@ -16,4 +15,10 @@ pub struct ChatResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "req_123456789")]
     pub request_id: Option<String>,
+    /// 是否需要降级重试（用于 rcoder 层处理 Resume 失败）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub need_fallback: Option<bool>,
+    /// 降级原因（如 "session_not_found"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }

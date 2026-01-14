@@ -1,0 +1,77 @@
+# ============================================================================
+# 最终镜像 Dockerfile - master-rcoder
+# ============================================================================
+# 此 Dockerfile 使用多阶段构建：
+# 1. 第一阶段：在 node:22 中构建 Rust 项目
+# 2. 第二阶段：基于 master-rcoder-base 基础镜像运行
+# ============================================================================
+
+# 全局 ARG 声明（必须在第一个 FROM 之前，才能在后续 FROM 中使用）
+ARG BASE_IMAGE=master-rcoder-base:latest
+
+# ============================================================================
+# 第一阶段：构建 Rust 项目
+# ============================================================================
+FROM node:22 AS rust-builder
+
+# 设置环境变量避免交互式提示
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+
+# 设置 ARG TARGETARCH
+ARG TARGETARCH
+
+# 设置工作目录
+WORKDIR /build
+
+# 安装构建依赖（包括cmake和protoc）
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    pkg-config \
+    protobuf-compiler \
+    libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 复制整个项目源代码（通过 .dockerignore 排除不需要的文件）
+COPY . .
+
+# 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
+ARG CARGO_FLAGS=""
+RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
+    cargo build --release --bin rcoder --bin agent_runner ${CARGO_FLAGS}
+
+# ============================================================================
+# 第二阶段：运行阶段（基于基础镜像）
+# ============================================================================
+# 重新声明 ARG（FROM 之后需要重新声明才能使用）
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制 .npmrc 文件
+COPY docker/rcoder-master/.npmrc /root/.npmrc
+
+# 创建 bin 目录并复制构建产物
+RUN mkdir -p /app/bin
+COPY --from=rust-builder /build/target/release/rcoder /app/bin/rcoder
+COPY --from=rust-builder /build/target/release/agent_runner /app/bin/agent_runner
+
+# 只有在二进制文件存在时才复制（避免feature构建时的错误）
+RUN if [ -f /build/target/release/codex-acp-agent ]; then \
+    cp /build/target/release/codex-acp-agent /app/bin/codex-acp-agent; \
+    fi
+
+# 设置执行权限
+RUN chmod +x /app/bin/rcoder /app/bin/agent_runner
+
+# 暴露端口
+EXPOSE 8086
+EXPOSE 60000
+EXPOSE 80

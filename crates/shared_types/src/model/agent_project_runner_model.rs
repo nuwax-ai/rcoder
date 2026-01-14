@@ -1,9 +1,32 @@
-use agent_client_protocol::SessionId;
 use chrono::{DateTime, Utc};
-use docker_manager::ContainerBasicInfo;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::{AgentStatus, ModelProviderConfig};
+use crate::ServiceType;
+
+/// 容器基本信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerBasicInfo {
+    /// 容器ID
+    pub container_id: String,
+    /// 容器名称
+    pub container_name: String,
+    /// 容器IP地址
+    pub container_ip: String,
+    /// 内部端口
+    pub internal_port: u16,
+    /// 外部端口
+    pub external_port: u16,
+    /// 项目ID
+    pub project_id: String,
+    /// 容器状态
+    pub status: String,
+    /// 创建时间
+    pub created_at: DateTime<Utc>,
+    /// 服务URL
+    pub service_url: String,
+}
 
 /// 项目核心状态 - 包含频繁变更的小字段
 ///
@@ -12,6 +35,10 @@ use super::{AgentStatus, ModelProviderConfig};
 pub struct ProjectCoreState {
     /// 项目ID
     pub project_id: String,
+    /// 用户ID（ComputerAgentRunner 模式专用）
+    /// - RCoder 模式：None（使用 project_id 作为容器唯一标识）
+    /// - ComputerAgentRunner 模式：Some(user_id)（使用 user_id 作为容器唯一标识）
+    pub user_id: Option<String>,
     /// 会话ID，agent 服务启动时会创建一个会话ID
     pub session_id: Option<String>,
     /// 最后活动时间
@@ -25,6 +52,19 @@ impl ProjectCoreState {
         let now = Utc::now();
         Self {
             project_id,
+            user_id: None,
+            session_id: None,
+            last_activity: now,
+            created_at: now,
+        }
+    }
+
+    /// 创建带 user_id 的核心状态（ComputerAgentRunner 模式）
+    pub fn new_with_user_id(project_id: String, user_id: String) -> Self {
+        let now = Utc::now();
+        Self {
+            project_id,
+            user_id: Some(user_id),
             session_id: None,
             last_activity: now,
             created_at: now,
@@ -56,6 +96,8 @@ pub struct ProjectExtendedState {
     pub request_id: Option<String>,
     /// Agent 服务状态
     pub status: Option<AgentStatus>,
+    /// 服务类型
+    pub service_type: Option<ServiceType>,
 }
 
 impl ProjectExtendedState {
@@ -65,6 +107,7 @@ impl ProjectExtendedState {
             container: None,
             request_id: None,
             status: None,
+            service_type: None,
         }
     }
 
@@ -74,10 +117,14 @@ impl ProjectExtendedState {
         container: Option<ContainerBasicInfo>,
         model_provider: Option<ModelProviderConfig>,
         request_id: Option<String>,
+        service_type: Option<ServiceType>,
     ) {
         self.container = container;
         self.model_provider = model_provider;
         self.request_id = request_id;
+        if let Some(st) = service_type {
+            self.service_type = Some(st);
+        }
     }
 }
 
@@ -172,9 +219,10 @@ impl ProjectAndContainerInfo {
         container: Option<ContainerBasicInfo>,
         model_provider: Option<ModelProviderConfig>,
         request_id: Option<String>,
+        service_type: Option<ServiceType>,
     ) {
         self.state.update_extended(|extended| {
-            extended.update_from_request(container, model_provider, request_id);
+            extended.update_from_request(container, model_provider, request_id, service_type);
         });
     }
 }
@@ -183,6 +231,25 @@ impl ProjectAndContainerInfo {
 impl ProjectAndContainerInfo {
     pub fn project_id(&self) -> &str {
         self.state.project_id()
+    }
+
+    /// 获取用户ID（ComputerAgentRunner 模式专用）
+    pub fn user_id(&self) -> Option<&str> {
+        self.state.core.user_id.as_deref()
+    }
+
+    /// 获取容器唯一标识
+    ///
+    /// 根据 service_type 返回不同的标识符：
+    /// - RCoder 模式：返回 project_id
+    /// - ComputerAgentRunner 模式：返回 user_id（如果存在），否则回退到 project_id
+    pub fn container_key(&self) -> &str {
+        match self.service_type() {
+            Some(ServiceType::ComputerAgentRunner) => {
+                self.user_id().unwrap_or_else(|| self.project_id())
+            }
+            _ => self.project_id(),
+        }
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -213,12 +280,23 @@ impl ProjectAndContainerInfo {
         self.state.extended.status.as_ref()
     }
 
+    pub fn service_type(&self) -> Option<ServiceType> {
+        self.state.extended.service_type.clone()
+    }
+
     // ========== 可变访问器（会触发写时复制） ==========
 
     pub fn set_session_id(&mut self, session_id: Option<String>) {
         if let Some(session_id) = session_id {
             self.update_session(session_id);
         }
+    }
+
+    /// 设置用户ID（ComputerAgentRunner 模式专用）
+    pub fn set_user_id(&mut self, user_id: Option<String>) {
+        self.state.update_core(|core| {
+            core.user_id = user_id;
+        });
     }
 
     pub fn set_model_provider(&mut self, model_provider: Option<ModelProviderConfig>) {
@@ -242,6 +320,29 @@ impl ProjectAndContainerInfo {
     pub fn set_status(&mut self, status: Option<AgentStatus>) {
         self.state.update_extended(|extended| {
             extended.status = status;
+        });
+    }
+
+    pub fn set_service_type(&mut self, service_type: Option<ServiceType>) {
+        self.state.update_extended(|extended| {
+            if let Some(st) = service_type {
+                extended.service_type = Some(st);
+            }
+        });
+    }
+
+    /// 设置时间戳（用于从持久化存储恢复数据）
+    ///
+    /// 当从 DuckDB 等持久化存储读取数据时，需要恢复原始的时间戳，
+    /// 而不是使用 `new()` 中设置的当前时间。
+    ///
+    /// # Arguments
+    /// * `created_at` - 创建时间
+    /// * `last_activity` - 最后活动时间
+    pub fn set_timestamps(&mut self, created_at: DateTime<Utc>, last_activity: DateTime<Utc>) {
+        self.state.update_core(|core| {
+            core.created_at = created_at;
+            core.last_activity = last_activity;
         });
     }
 }

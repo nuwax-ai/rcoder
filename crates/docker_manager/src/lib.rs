@@ -1,30 +1,34 @@
-use std::collections::HashMap;
-use std::path::Path;
-
-use bollard::{
-    API_DEFAULT_VERSION, Docker,
-    container::{
-        Config, CreateContainerOptions, LogsOptions, StartContainerOptions, StopContainerOptions,
-    },
-    image::CreateImageOptions,
-    models::{ContainerCreateResponse, HostConfig, Mount, PortBinding},
-};
-use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 pub mod container_self_inspector;
+pub mod container_state_actor;
+pub mod container_stop;
+pub mod image_selector;
 pub mod manager;
 pub mod types;
 pub mod utils;
 
+// 新增模块
+pub mod container_builder;
+pub mod health;
+pub mod network;
+pub mod path;
+
 pub use container_self_inspector::*;
+pub use container_state_actor::*;
 pub use manager::*;
 pub use types::*;
 pub use utils::*;
+
+// 公共导出新模块
+pub use container_builder::{ContainerConfigBuilder, MountProcessor};
+pub use health::{
+    HttpHealthChecker, ServiceHealthChecker, ServiceHealthStatus, wait_for_service_ready,
+};
+pub use network::{NetworkDetector, build_network_name, parse_project_from_network};
+pub use path::{
+    HostPathResolver, get_host_path_resolver, normalize_path, resolve_container_path_to_host,
+};
 
 /// Docker 管理器错误类型
 #[derive(Error, Debug)]
@@ -47,6 +51,9 @@ pub enum DockerError {
     #[error("镜像拉取失败: {0}")]
     ImagePullError(String),
 
+    #[error("配置错误: {0}")]
+    ConfigurationError(String),
+
     #[error("IO 错误: {0}")]
     IoError(#[from] std::io::Error),
 
@@ -60,38 +67,75 @@ pub enum DockerError {
 /// Docker 管理器结果类型
 pub type DockerResult<T> = Result<T, DockerError>;
 
+/// 默认的 Docker 镜像配置常量
+pub mod default_images {
+    /// ARM64 架构的默认镜像
+    pub const ARM64: &str = "registry.yichamao.com/agent-runner:latest-arm64";
+
+    /// AMD64 架构的默认镜像
+    pub const AMD64: &str = "registry.yichamao.com/agent-runner:latest-amd64";
+
+    /// 默认回退镜像（当无法检测架构或架构不匹配时使用）
+    pub const DEFAULT: &str = "registry.yichamao.com/agent-runner:latest";
+}
+
 /// 默认的 Docker 镜像（根据架构自动选择）
+///
+/// 注意：此函数使用硬编码的默认值，建议使用 `get_docker_image_from_config()`
+/// 从配置中读取镜像地址
 pub fn default_docker_image() -> String {
     let platform = crate::utils::DockerUtils::auto_detect_platform();
     match platform.as_str() {
-        "linux/arm64" => "registry.yichamao.com/rcoder:latest-arm64".to_string(),
-        "linux/amd64" => "registry.yichamao.com/rcoder:latest-amd64".to_string(),
-        _ => "registry.yichamao.com/rcoder:latest".to_string(), // 默认回退
+        "linux/arm64" => default_images::ARM64.to_string(),
+        "linux/amd64" => default_images::AMD64.to_string(),
+        _ => default_images::DEFAULT.to_string(), // 默认回退
     }
 }
 
+/// 获取默认的 ARM64 镜像
+pub fn default_arm64_image() -> String {
+    default_images::ARM64.to_string()
+}
+
+/// 获取默认的 AMD64 镜像
+pub fn default_amd64_image() -> String {
+    default_images::AMD64.to_string()
+}
+
+/// 获取默认的回退镜像
+pub fn default_fallback_image() -> String {
+    default_images::DEFAULT.to_string()
+}
+
 /// 从 rcoder 配置获取 Docker 镜像
+///
+/// # 参数
+/// * `image` - 通用镜像（优先使用，如果指定则忽略架构特定镜像）
+/// * `arm64_image` - ARM64 架构专用镜像
+/// * `amd64_image` - AMD64 架构专用镜像
+/// * `default_image` - 默认回退镜像（当无法检测架构或架构不匹配时使用）
 pub fn get_docker_image_from_config(
-    default_image: Option<String>,
+    image: Option<String>,
     arm64_image: Option<String>,
     amd64_image: Option<String>,
+    default_image: Option<String>,
 ) -> String {
     let platform = crate::utils::DockerUtils::auto_detect_platform();
 
     // 优先使用通用镜像
-    if let Some(image) = default_image {
-        return image;
+    if let Some(img) = image {
+        return img;
     }
 
     // 根据架构使用特定镜像
     match platform.as_str() {
-        "linux/arm64" => {
-            arm64_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest-arm64".to_string())
-        }
-        "linux/amd64" => {
-            amd64_image.unwrap_or_else(|| "registry.yichamao.com/rcoder:latest-amd64".to_string())
-        }
-        _ => "registry.yichamao.com/rcoder:latest".to_string(), // 默认回退
+        "linux/arm64" => arm64_image.unwrap_or_else(|| {
+            default_image.unwrap_or_else(|| default_images::DEFAULT.to_string())
+        }),
+        "linux/amd64" => amd64_image.unwrap_or_else(|| {
+            default_image.unwrap_or_else(|| default_images::DEFAULT.to_string())
+        }),
+        _ => default_image.unwrap_or_else(|| default_images::DEFAULT.to_string()),
     }
 }
 
@@ -106,15 +150,19 @@ pub const DEFAULT_WORK_DIR: &str = "/app";
 /// 默认的网络模式
 pub const DEFAULT_NETWORK_MODE: &str = "bridge";
 
-/// RCoder 专用网络名称
-pub const RCODER_NETWORK_NAME: &str = "agent-network";
+/// RCoder 专用网络名称（基础名称，不含 project name 前缀）
+/// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_name}
+/// 例如: rcoder_agent-network, myapp_agent-network
+///
+/// ⚠️ 注意：实际使用时必须动态检测主容器所在的网络，不能硬编码
+pub const RCODER_NETWORK_BASE_NAME: &str = "agent-network";
 
 /// 全局 Docker 管理器实例
 pub mod global {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::OnceCell;
-    use tracing::{debug, error, info};
+    use tracing::{debug, info};
 
     /// 全局 DockerManager 单例
     static GLOBAL_DOCKER_MANAGER: OnceCell<Arc<DockerManager>> = OnceCell::const_new();

@@ -1,110 +1,183 @@
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
-
-use crate::AgentType;
+use tracing::{info, warn};
 
 /// 命令行参数
 #[derive(Parser, Debug)]
 #[command(name = "rcoder")]
-#[command(about = "AI-powered development platform")]
+#[command(about = "RCoder - Rust-based AI Agent Framework")]
 #[command(version)]
 pub struct CliArgs {
-    /// 服务端口
-    #[arg(short, long, help = "服务端口")]
+    /// 主服务端口
+    #[arg(short = 'p', long)]
     pub port: Option<u16>,
 
     /// 项目工作目录
-    #[arg(short = 'd', long, help = "项目工作的根目录")]
-    pub projects_dir: Option<PathBuf>,
+    #[arg(short = 'd', long, default_value = "./project_workspace")]
+    pub projects_dir: Option<String>,
 
     /// 启用反向代理
-    #[arg(long, help = "启用基于端口的反向代理")]
+    #[arg(short, long)]
     pub enable_proxy: bool,
 
-    /// 代理监听端口
-    #[arg(long, help = "代理服务监听端口")]
+    /// 代理服务端口
+    #[arg(long = "proxy-port")]
     pub proxy_port: Option<u16>,
 
-    /// 默认后端端口
-    #[arg(long, help = "默认后端服务端口")]
+    /// 默认后端服务端口
+    #[arg(long = "backend-port")]
     pub default_backend_port: Option<u16>,
 }
 
-/// 应用配置
+// 从 shared_types 导入 API Key 鉴权配置
+pub use shared_types::ApiKeyAuthConfig;
+
+/// 应用程序配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// 默认使用的 AI 代理类型
-    pub default_agent: AgentType,
-    /// 项目工作的根目录,根据启动命令的当前目录来确定
+    /// 默认使用的 Agent ID
+    #[serde(default = "default_agent_id")]
+    pub default_agent_id: String,
+    /// 项目工作目录
     pub projects_dir: PathBuf,
-    /// 服务端口
+    /// 主服务端口
     pub port: u16,
-    /// 代理配置
+    /// 反向代理配置
     pub proxy_config: Option<ProxyConfig>,
     /// Docker 配置
     pub docker_config: Option<DockerConfig>,
+    /// 容器清理配置
+    #[serde(default)]
+    pub cleanup_config: CleanupConfigSettings,
+    /// API Key 鉴权配置
+    #[serde(default)]
+    pub api_key_auth: ApiKeyAuthConfig,
 }
 
+fn default_agent_id() -> String {
+    "claude-code-acp".to_string()
+}
+
+/// 生成随机 API Key
+/// 使用 UUID v4 生成随机密钥，格式：sk-{uuid}
+fn generate_random_api_key() -> String {
+    use uuid::Uuid;
+    let uuid = Uuid::new_v4();
+    format!("sk-{}", uuid.simple())
+}
+
+/// 健康检查配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
+    /// 是否启用健康检查
     pub enabled: bool,
+    /// 检查间隔（秒）
     pub interval_seconds: u64,
+    /// 超时时间（秒）
     pub timeout_seconds: u64,
+    /// 健康阈值
     pub healthy_threshold: u32,
+    /// 不健康阈值
     pub unhealthy_threshold: u32,
 }
 
-/// 代理配置
+/// 反向代理配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
-    /// 代理监听端口
+    /// 代理服务监听端口
     pub listen_port: u16,
-    /// 默认后端端口
+    /// 默认后端服务端口
     pub default_backend_port: u16,
-    /// 后端服务主机
+    /// 后端服务主机地址
     pub backend_host: String,
-    /// URL 中端口参数的名称
+    /// 端口参数名称
     pub port_param: String,
     /// 健康检查配置
     pub health_check: HealthCheckConfig,
 }
 
+/// 容器清理配置（配置文件格式，使用秒作为单位）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupConfigSettings {
+    /// 闲置超时时间（秒），默认600秒（10分钟）
+    #[serde(default = "default_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+    /// 清理检查间隔（秒），默认300秒（5分钟）
+    #[serde(default = "default_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
+    /// Docker容器停止超时时间（秒），默认30秒
+    #[serde(default = "default_docker_stop_timeout_seconds")]
+    pub docker_stop_timeout_seconds: u64,
+    /// 容器最小保护时间（秒），默认300秒（5分钟）
+    #[serde(default = "default_container_protection_seconds")]
+    pub container_protection_seconds: u64,
+}
+
+fn default_idle_timeout_seconds() -> u64 {
+    600 // 10分钟
+}
+
+fn default_cleanup_interval_seconds() -> u64 {
+    300 // 5分钟
+}
+
+fn default_docker_stop_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_container_protection_seconds() -> u64 {
+    300 // 5分钟
+}
+
+impl Default for CleanupConfigSettings {
+    fn default() -> Self {
+        Self {
+            idle_timeout_seconds: default_idle_timeout_seconds(),
+            cleanup_interval_seconds: default_cleanup_interval_seconds(),
+            docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),
+            container_protection_seconds: default_container_protection_seconds(),
+        }
+    }
+}
+
 /// Docker 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DockerConfig {
-    /// Docker 镜像名称（根据架构自动选择）
-    /// 如果不指定，将使用默认的 registry.yichamao.com/rcoder:latest
-    pub image: Option<String>,
-    /// ARM64 架构的 Docker 镜像
-    pub arm64_image: Option<String>,
-    /// AMD64 架构的 Docker 镜像
-    pub amd64_image: Option<String>,
-    /// 默认网络模式
+    /// 多镜像配置
+    pub multi_image_config: Option<shared_types::MultiImageConfig>,
+    /// 网络模式
     pub network_mode: Option<String>,
-    /// 默认工作目录
+    /// 工作目录
     pub work_dir: Option<String>,
-    /// 是否启用自动清理
+    /// 自动清理
     pub auto_cleanup: Option<bool>,
     /// 容器存活时间（秒）
     pub container_ttl_seconds: Option<u64>,
+    /// 网络基础名称（不含 project name 前缀）
+    /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
+    /// 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
+    pub network_base_name: Option<String>,
 }
 
-/// 配置文件路径
-const CONFIG_FILE: &str = "config.yml";
+pub const CONFIG_FILE: &str = "config.yml";
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            default_agent: AgentType::default(),
+            default_agent_id: default_agent_id(),
             projects_dir: PathBuf::from("./project_workspace"),
-            port: 8086,
+            port: 8087,
             proxy_config: Some(ProxyConfig::default()),
             docker_config: Some(DockerConfig::default()),
+            cleanup_config: CleanupConfigSettings::default(),
+            api_key_auth: ApiKeyAuthConfig {
+                enabled: false,
+                api_key: generate_random_api_key(),
+            },
         }
     }
 }
@@ -116,13 +189,19 @@ impl Default for ProxyConfig {
             default_backend_port: 8086,
             backend_host: "127.0.0.1".to_string(),
             port_param: "port".to_string(),
-            health_check: HealthCheckConfig {
-                enabled: true,
-                interval_seconds: 5,
-                timeout_seconds: 1,
-                healthy_threshold: 2,
-                unhealthy_threshold: 3,
-            },
+            health_check: HealthCheckConfig::default(),
+        }
+    }
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 5,
+            timeout_seconds: 1,
+            healthy_threshold: 2,
+            unhealthy_threshold: 3,
         }
     }
 }
@@ -130,160 +209,242 @@ impl Default for ProxyConfig {
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
-            image: None, // 使用默认镜像
-            // 如果需要本地容器测试,可以改为: master-rcoder:latest,用 make dev-restart 启动容器测试
-            arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
-            amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
+            multi_image_config: Some(shared_types::create_default_multi_image_config()),
             network_mode: Some("bridge".to_string()),
             work_dir: Some("/app".to_string()),
             auto_cleanup: Some(true),
-            container_ttl_seconds: Some(3600), // 1小时
+            container_ttl_seconds: Some(3600),
+            network_base_name: Some("agent-network".to_string()),
         }
     }
 }
 
-// 为 DockerConfig 实现 DockerConfigTrait，以便与 docker_manager 兼容
-impl docker_manager::utils::DockerConfigTrait for DockerConfig {
-    fn image(&self) -> &Option<String> {
-        &self.image
-    }
-
-    fn arm64_image(&self) -> &Option<String> {
-        &self.arm64_image
-    }
-
-    fn amd64_image(&self) -> &Option<String> {
-        &self.amd64_image
-    }
-
-    fn network_mode(&self) -> &Option<String> {
-        &self.network_mode
-    }
-
-    fn work_dir(&self) -> &Option<String> {
-        &self.work_dir
-    }
-
-    fn auto_cleanup(&self) -> &Option<bool> {
-        &self.auto_cleanup
-    }
-
-    fn container_ttl_seconds(&self) -> &Option<u64> {
-        &self.container_ttl_seconds
-    }
-}
-
-/// 加载配置
-/// 配置优先级：命令行参数 > 环境变量 > 配置文件 > 默认配置
-pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
-    // 1. 首先加载默认配置
-    let mut config = AppConfig::default();
-
-    // 2. 尝试从当前目录读取配置文件
-    match load_config_from_file() {
-        Ok(file_config) => {
-            config = file_config;
-            info!("成功从 {} 加载配置", CONFIG_FILE);
-        }
-        Err(e) => {
-            warn!("无法读取配置文件 {}: {}, 使用默认配置", CONFIG_FILE, e);
-
-            // 创建默认配置文件
-            if let Err(create_err) = create_default_config_file(&config) {
-                error!("创建默认配置文件失败: {}", create_err);
-            } else {
-                info!("已创建默认配置文件: {}", CONFIG_FILE);
-            }
+impl DockerConfig {
+    /// 获取多镜像配置，如果没有配置多镜像配置，会从传统配置自动转换
+    pub fn get_multi_image_config(&self) -> shared_types::MultiImageConfig {
+        if let Some(ref multi_config) = self.multi_image_config {
+            multi_config.clone()
+        } else {
+            // 从传统配置创建多镜像配置
+            self.create_legacy_multi_config()
         }
     }
 
-    // 3. 环境变量覆盖配置
-    if let Ok(port) = env::var("RCODER_PORT") {
-        match port.parse::<u16>() {
-            Ok(p) => {
-                config.port = p;
-                info!("使用环境变量 RCODER_PORT 设置端口: {}", p);
-            }
-            Err(_) => {
-                warn!(
-                    "环境变量 RCODER_PORT 值无效: {}, 使用配置文件中的端口: {}",
-                    port, config.port
-                );
-            }
-        }
-    }
+    /// 从传统配置创建多镜像配置
+    fn create_legacy_multi_config(&self) -> shared_types::MultiImageConfig {
+        info!("从传统配置创建多镜像配置");
 
-    // Docker 镜像环境变量支持
-    if let Ok(docker_image) = env::var("RCODER_DOCKER_IMAGE") {
-        if config.docker_config.is_none() {
-            config.docker_config = Some(DockerConfig::default());
-        }
-        config.docker_config.as_mut().unwrap().image = Some(docker_image);
-        info!("使用环境变量 RCODER_DOCKER_IMAGE 设置 Docker 镜像");
-    }
+        // 创建基于传统配置的多镜像配置
+        let mut services = std::collections::HashMap::new();
 
-    if let Ok(docker_arm64_image) = env::var("RCODER_DOCKER_IMAGE_ARM64") {
-        if config.docker_config.is_none() {
-            config.docker_config = Some(DockerConfig::default());
-        }
-        config.docker_config.as_mut().unwrap().arm64_image = Some(docker_arm64_image);
-        info!("使用环境变量 RCODER_DOCKER_IMAGE_ARM64 设置 ARM64 镜像");
-    }
-
-    if let Ok(docker_amd64_image) = env::var("RCODER_DOCKER_IMAGE_AMD64") {
-        if config.docker_config.is_none() {
-            config.docker_config = Some(DockerConfig::default());
-        }
-        config.docker_config.as_mut().unwrap().amd64_image = Some(docker_amd64_image);
-        info!("使用环境变量 RCODER_DOCKER_IMAGE_AMD64 设置 AMD64 镜像");
-    }
-
-    // 4. 处理代理配置
-    if cli_args.enable_proxy {
-        let proxy_config = ProxyConfig {
-            listen_port: cli_args.proxy_port.unwrap_or(8080),
-            default_backend_port: cli_args.default_backend_port.unwrap_or(config.port),
-            backend_host: "127.0.0.1".to_string(),
-            port_param: "port".to_string(),
-            health_check: HealthCheckConfig {
-                enabled: true,
-                interval_seconds: 5,
-                timeout_seconds: 1,
-                healthy_threshold: 2,
-                unhealthy_threshold: 3,
-            },
+        // 为 RCoder 服务使用默认配置
+        let rcoder_service = {
+            info!("使用默认镜像配置");
+            shared_types::service_config::default_rcoder_service_config()
         };
-        config.proxy_config = Some(proxy_config);
-        info!(
-            "启用反向代理，监听端口: {}",
-            config.proxy_config.as_ref().unwrap().listen_port
+
+        services.insert("rcoder".to_string(), rcoder_service);
+
+        // 为 AgentRunner 服务使用默认配置
+        services.insert(
+            "agent-runner".to_string(),
+            shared_types::service_config::default_agent_runner_service_config(),
         );
+
+        shared_types::MultiImageConfig {
+            services,
+            global_defaults: shared_types::GlobalImageDefaults {
+                image: None,
+                arm64_image: None,
+                amd64_image: None,
+                default_image: None,
+                registry_prefix: None,
+            },
+            selection_strategy: shared_types::ImageSelectionStrategy::ServiceOnly,
+            cache_config: shared_types::ImageCacheConfig {
+                enabled: true,
+                ttl_seconds: 3600,
+                max_entries: 100,
+            },
+        }
     }
 
-    // 5. 命令行参数覆盖配置（优先级最高）
+    /// 验证多镜像配置
+    pub fn validate_multi_image_config(&self) -> Result<(), String> {
+        let multi_config = self.get_multi_image_config();
+        match multi_config.validate() {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// 检查是否使用多镜像配置
+    pub fn is_using_multi_image_config(&self) -> bool {
+        self.multi_image_config.is_some()
+    }
+
+    /// 应用环境变量覆盖
+    pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        // 应用网络模式
+        if let Ok(val) = std::env::var("RCODER_NETWORK_MODE") {
+            info!("应用环境变量 RCODER_NETWORK_MODE");
+            self.network_mode = Some(val);
+        }
+
+        // 应用网络基础名称
+        if let Ok(val) = std::env::var("RCODER_NETWORK_BASE_NAME") {
+            info!("应用环境变量 RCODER_NETWORK_BASE_NAME: {}", val);
+            self.network_base_name = Some(val);
+        }
+
+        // 应用工作目录
+        if let Ok(val) = std::env::var("RCODER_WORK_DIR") {
+            info!("应用环境变量 RCODER_WORK_DIR");
+            self.work_dir = Some(val);
+        }
+
+        // 应用自动清理
+        if let Ok(val) = std::env::var("RCODER_AUTO_CLEANUP") {
+            info!("应用环境变量 RCODER_AUTO_CLEANUP");
+            self.auto_cleanup = Some(val.parse().unwrap_or(true));
+        }
+
+        // 应用容器存活时间
+        if let Ok(val) = std::env::var("RCODER_CONTAINER_TTL") {
+            info!("应用环境变量 RCODER_CONTAINER_TTL");
+            match val.parse() {
+                Ok(seconds) => self.container_ttl_seconds = Some(seconds),
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ [CONFIG] 无法解析 RCODER_CONTAINER_TTL '{}': {}, 使用默认值",
+                        val,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 获取配置摘要信息
+    pub fn get_summary(&self) -> String {
+        format!(
+            "Docker配置: 网络模式={}, 网络基础名称={}, 工作目录={}, 自动清理={}, 容器TTL={}",
+            self.network_mode.as_deref().unwrap_or("默认"),
+            self.network_base_name.as_deref().unwrap_or("agent-network"),
+            self.work_dir.as_deref().unwrap_or("/app"),
+            self.auto_cleanup.unwrap_or(true),
+            self.container_ttl_seconds.unwrap_or(3600)
+        )
+    }
+}
+
+/// 加载配置（命令行参数 + 配置文件 + 环境变量）
+pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
+    let mut config = if std::path::Path::new(CONFIG_FILE).exists() {
+        // 尝试从文件加载配置
+        match load_config_from_file() {
+            Ok(file_config) => {
+                info!("已从配置文件加载: {}", CONFIG_FILE);
+                file_config
+            }
+            Err(e) => {
+                warn!("加载配置文件失败，使用默认配置: {}", e);
+                AppConfig::default()
+            }
+        }
+    } else {
+        info!("配置文件不存在，创建默认配置文件: {}", CONFIG_FILE);
+        let default_config = AppConfig::default();
+        create_default_config_file(&default_config)?;
+        default_config
+    };
+
+    // 命令行参数覆盖配置文件
     if let Some(port) = cli_args.port {
         config.port = port;
-        info!("使用命令行参数设置端口: {}", port);
     }
 
     if let Some(projects_dir) = cli_args.projects_dir {
-        config.projects_dir = projects_dir.clone();
-        info!("使用命令行参数设置项目目录: {:?}", projects_dir);
+        config.projects_dir = PathBuf::from(projects_dir);
+    }
+
+    // 环境变量覆盖所有配置
+    if let Ok(port) = std::env::var("RCODER_PORT") {
+        if let Ok(port) = port.parse::<u16>() {
+            config.port = port;
+        } else {
+            warn!("无效的 RCODER_PORT 环境变量值: {}", port);
+        }
+    }
+
+    if let Ok(projects_dir) = std::env::var("RCODER_PROJECTS_DIR") {
+        config.projects_dir = PathBuf::from(projects_dir);
+    }
+
+    // 如果启用了代理，配置代理相关参数
+    if cli_args.enable_proxy {
+        let mut proxy_config = ProxyConfig::default();
+
+        if let Some(proxy_port) = cli_args.proxy_port {
+            proxy_config.listen_port = proxy_port;
+        }
+
+        if let Some(default_backend_port) = cli_args.default_backend_port {
+            proxy_config.default_backend_port = default_backend_port;
+        }
+
+        config.proxy_config = Some(proxy_config);
+    }
+
+    // 应用 Docker 配置的环境变量覆盖
+    if let Some(docker_config) = &mut config.docker_config {
+        docker_config.apply_env_overrides()?;
+    }
+
+    // 应用 API Key 配置的环境变量覆盖
+    if let Ok(val) = std::env::var("RCODER_API_KEY_ENABLED") {
+        if let Ok(enabled) = val.parse::<bool>() {
+            config.api_key_auth.enabled = enabled;
+            info!("应用环境变量 RCODER_API_KEY_ENABLED: {}", enabled);
+        } else {
+            warn!("无效的 RCODER_API_KEY_ENABLED 环境变量值: {}", val);
+        }
+    }
+
+    if let Ok(val) = std::env::var("RCODER_API_KEY") {
+        config.api_key_auth.api_key = val.clone();
+        info!("应用环境变量 RCODER_API_KEY");
+    }
+
+    // 验证 API Key 配置
+    if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "API Key 鉴权已启用但 API Key 为空,请检查配置文件或环境变量"
+        ));
+    }
+
+    // 配置验证
+    if let Some(docker_config) = &config.docker_config {
+        if let Err(e) = docker_config.validate_multi_image_config() {
+            return Err(anyhow::anyhow!("Docker 配置验证失败: {}", e));
+        }
     }
 
     info!(
-        "最终配置: port={}, projects_dir={:?}, default_agent={:?}, proxy_enabled={}",
+        "最终配置: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
         config.port,
         config.projects_dir,
-        config.default_agent,
+        config.default_agent_id,
         config.proxy_config.is_some()
     );
 
-    config
+    Ok(config)
 }
 
 /// 加载配置（保留旧接口以保持兼容性）
-pub fn load_config() -> AppConfig {
+pub fn load_config() -> anyhow::Result<AppConfig> {
     let cli_args = CliArgs {
         port: None,
         projects_dir: None,
@@ -299,154 +460,77 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
     let config_content =
         fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
 
+    tracing::debug!("配置文件内容: {}", config_content);
+
     let config: AppConfig = serde_yaml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
+
+    // 调试：打印解析后的多镜像配置
+    if let Some(ref docker_config) = config.docker_config {
+        if let Some(ref multi_config) = docker_config.multi_image_config {
+            tracing::debug!("解析后的多镜像配置:");
+            for (service_key, service_config) in &multi_config.services {
+                tracing::debug!(
+                    "  服务 '{}' 挂载配置 (共 {} 个):",
+                    service_key,
+                    service_config.mounts.len()
+                );
+                for (i, mount) in service_config.mounts.iter().enumerate() {
+                    tracing::debug!(
+                        "    [{}]: {} -> {} ({})",
+                        i,
+                        mount.container_path,
+                        mount.host_path,
+                        mount.mount_type
+                    );
+                }
+            }
+        }
+    }
 
     Ok(config)
 }
 
+/// 从配置文件中仅加载 API Key 配置（用于热更新）
+///
+/// 此函数由 config_watcher 模块调用,用于配置热重载。
+/// 编译器可能误报为未使用,因为是跨模块调用。
+#[allow(dead_code)]
+pub fn load_api_key_config_from_file(
+    config_path: &std::path::Path,
+) -> anyhow::Result<ApiKeyAuthConfig> {
+    let config_content =
+        fs::read_to_string(config_path).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
+
+    let config: AppConfig = serde_yaml::from_str(&config_content)
+        .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
+
+    Ok(config.api_key_auth)
+}
+
 /// 创建默认配置文件
-fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
-    // 手动构建带注释的 YAML 内容
-    let content_with_comments = format!(
-        r#"# rcoder 配置文件
-# 该文件在首次启动时自动生成
+fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
+    // 检查配置文件是否已存在
+    if std::path::Path::new(CONFIG_FILE).exists() {
+        return Ok(());
+    }
 
-# 默认使用的 AI 代理类型 (Codex/Claude)
-default_agent: {}
+    // 创建配置文件目录（如果不存在）
+    if let Some(parent) = std::path::Path::new(CONFIG_FILE).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("创建配置目录失败: {}", e))?;
+    }
 
-# 项目工作目录
-projects_dir: {}
+    // 使用嵌入式配置文件
+    let default_config = include_str!("rcoder_default.yml");
 
-# 主服务端口
-port: {}
+    // 🆕 生成随机 API Key 并替换模板占位符
+    let generated_api_key = generate_random_api_key();
+    let config_content = default_config.replace("{{GENERATED_API_KEY}}", &generated_api_key);
 
-# Pingora 反向代理配置
-proxy_config:
-  # 代理服务监听端口 (用于接收外部请求)
-  listen_port: {}
-  # 默认后端服务端口 (当请求未指定端口时使用)
-  default_backend_port: {}
-  # 后端服务主机地址
-  backend_host: "{}"
-  # URL 中端口参数的名称 (用于从路径中提取端口号)
-  port_param: "{}"
-  # 健康检查配置
-  health_check:
-    enabled: {}
-    interval_seconds: {}
-    timeout_seconds: {}
-    healthy_threshold: {}
-    unhealthy_threshold: {}
+    fs::write(CONFIG_FILE, config_content)
+        .map_err(|e| anyhow::anyhow!("写入默认配置文件失败: {}", e))?;
 
-# Docker 配置
-docker_config:
-  # Docker 镜像名称 (留空使用默认镜像)
-  # 如果指定了此字段，将优先使用该镜像，忽略架构特定镜像
-  image: {}
-
-  # ARM64 架构专用镜像
-  arm64_image: {}
-
-  # AMD64 架构专用镜像
-  amd64_image: {}
-
-  # 默认网络模式
-  network_mode: {}
-
-  # 默认工作目录
-  work_dir: {}
-
-  # 是否启用自动清理
-  auto_cleanup: {}
-
-  # 容器存活时间（秒）
-  container_ttl_seconds: {}
-"#,
-        format!("{:?}", config.default_agent),
-        config.projects_dir.display(),
-        config.port,
-        config.proxy_config.as_ref().unwrap().listen_port,
-        config.proxy_config.as_ref().unwrap().default_backend_port,
-        config.proxy_config.as_ref().unwrap().backend_host,
-        config.proxy_config.as_ref().unwrap().port_param,
-        config.proxy_config.as_ref().unwrap().health_check.enabled,
-        config
-            .proxy_config
-            .as_ref()
-            .unwrap()
-            .health_check
-            .interval_seconds,
-        config
-            .proxy_config
-            .as_ref()
-            .unwrap()
-            .health_check
-            .timeout_seconds,
-        config
-            .proxy_config
-            .as_ref()
-            .unwrap()
-            .health_check
-            .healthy_threshold,
-        config
-            .proxy_config
-            .as_ref()
-            .unwrap()
-            .health_check
-            .unhealthy_threshold,
-        // Docker 配置部分
-        config
-            .docker_config
-            .as_ref()
-            .unwrap()
-            .image
-            .as_ref()
-            .map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        config
-            .docker_config
-            .as_ref()
-            .unwrap()
-            .arm64_image
-            .as_ref()
-            .map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        config
-            .docker_config
-            .as_ref()
-            .unwrap()
-            .amd64_image
-            .as_ref()
-            .map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        config
-            .docker_config
-            .as_ref()
-            .unwrap()
-            .network_mode
-            .as_ref()
-            .map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        config
-            .docker_config
-            .as_ref()
-            .unwrap()
-            .work_dir
-            .as_ref()
-            .map_or("null".to_string(), |s| format!("\"{}\"", s)),
-        config
-            .docker_config
-            .as_ref()
-            .unwrap()
-            .auto_cleanup
-            .map_or("null".to_string(), |b| b.to_string()),
-        config
-            .docker_config
-            .as_ref()
-            .unwrap()
-            .container_ttl_seconds
-            .map_or("null".to_string(), |s| s.to_string())
-    );
-
-    fs::write(CONFIG_FILE, content_with_comments)
-        .map_err(|e| anyhow::anyhow!("写入配置文件失败: {}", e))?;
-
+    info!("已创建默认配置文件: {}", CONFIG_FILE);
+    info!("🔑 已生成随机 API Key（当前未启用鉴权）");
     Ok(())
 }
