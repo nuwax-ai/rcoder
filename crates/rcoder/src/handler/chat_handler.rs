@@ -4,16 +4,16 @@
 
 use anyhow::Result;
 use axum::{Json, extract::State};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use shared_types::{ModelProviderConfig, ProjectAndContainerInfo};
+use shared_types::{ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
-use uuid::Uuid;
 
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
+
+use super::utils::extract_grpc_addr_with_port;
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -51,17 +51,34 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "req_123456789")]
     pub request_id: Option<String>,
-}
 
+    // === 新增字段 (v2) ===
+    /// 可选的系统提示词，覆盖默认配置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "你是一个专业的 Rust 开发者")]
+    pub system_prompt: Option<String>,
+
+    /// 可选的用户提示词模板，支持 {user_prompt} 变量替换
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "请用 Rust 完成：{user_prompt}")]
+    pub user_prompt: Option<String>,
+
+    /// 可选的 Agent 运行时配置（Agent 服务器 + MCP 服务器）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_config: Option<ChatAgentConfig>,
+}
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
 ///
-/// 1. 根据 project_id 检查或动态创建对应的容器
+/// 1. 根据 project_id 检查或动态创建对应的容器（默认使用 ServiceType::RCoder）
 /// 2. 将原始聊天请求直接转发到容器内的 agent_runner 服务
 /// 3. 获取并返回 agent_runner 的处理结果
 ///
-/// 注意：所有参数处理（如 project_id、session_id 生成）都由 agent_runner 处理
-/// RCoder 只负责容器管理和请求转发
+/// 注意：
+/// - 所有参数处理（如 project_id、session_id 生成）都由 agent_runner 处理
+/// - RCoder 只负责容器管理和请求转发
+/// - 当前默认使用 ServiceType::RCoder，AgentRunner 模式正在开发中
+/// - Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 #[utoipa::path(
     post,
     path = "/chat",
@@ -87,6 +104,11 @@ pub struct ChatRequest {
             })
         ),
         (
+            status = 401,
+            description = "API Key 鉴权失败",
+            body = String
+        ),
+        (
             status = 500,
             description = "服务器内部错误或容器服务异常",
             body = HttpResult<String>,
@@ -103,9 +125,8 @@ pub struct ChatRequest {
     tag = "chat",
     operation_id = "handle_chat",
     summary = "转发聊天消息到容器化 AI 服务",
-    description = "根据 project_id 动态管理容器，将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
+    description = "根据 project_id 动态管理容器（默认使用 ServiceType::RCoder），将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
 )]
-#[axum::debug_handler]
 #[instrument(skip(state,request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
@@ -120,295 +141,303 @@ pub async fn handle_chat(
         }
     };
 
+    // 验证资源限制配置
+    if let Some(ref agent_config) = request.agent_config {
+        if let Some(ref resource_limits) = agent_config.resource_limits {
+            resource_limits.validate().map_err(|e| {
+                AppError::validation_error(&format!("Invalid resource limits: {}", e))
+            })?;
+        }
+    }
+
     info!(
         "🚀 [CHAT] 开始处理聊天请求: project_id={}, session_id={:?}, prompt_length={}, attachments_count={}, model_provider={}",
         project_id,
         request.session_id,
         request.prompt.len(),
         request.attachments.len(),
-        request.model_provider.as_ref()
+        request
+            .model_provider
+            .as_ref()
             .map(|p| p.to_string())
             .unwrap_or_else(|| "None".to_string())
     );
 
-    // 直接转发原始请求到容器内的 agent_runner 服务
-    // agent_runner 会处理所有业务逻辑，包括：
-    // - project_id 和 session_id 的生成
-    // - 会话管理
-    // - AI 处理
+    // 打印 agent_config 配置信息（debug 级别）
+    debug!(
+        "🔧 [CHAT] agent_config 配置: project_id={}, agent_config={:?}",
+        project_id, request.agent_config
+    );
 
-    // 第一步：获取或创建容器
+    // 第一步：获取或创建容器，默认使用 ServiceType::RCoder
+    let service_type = shared_types::ServiceType::RCoder;
     let container_info =
-        crate::service::container_manager::ContainerManager::get_or_create_container(&project_id)
-            .await?;
+        crate::service::container_manager::ContainerManager::get_or_create_container(
+            &project_id,
+            &service_type,
+            request
+                .agent_config
+                .as_ref()
+                .and_then(|c| c.resource_limits.clone()),
+        )
+        .await?;
 
-    // 第二步：获取或创建 ProjectAndContainerInfo - 使用新的高效状态管理
+    // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
     let _ = {
         info!("🔍 [CHAT] 开始获取/创建项目信息: project_id={}", project_id);
 
-        // 使用 entry API 一次性处理获取和创建，避免多次锁获取
-        let entry = state.project_and_agent_map.entry(project_id.clone());
+        // 检查项目是否存在
+        if let Some(existing_info) = state.get_project(&project_id) {
+            info!("📋 [CHAT] 更新现有项目信息: project_id={}", project_id);
 
-        match entry {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
-                info!("📋 [CHAT] 更新现有项目信息: project_id={}", project_id);
+            // 检查是否需要更新扩展状态
+            let needs_extended_update = existing_info.container().is_none()
+                || existing_info.model_provider().is_none()
+                || existing_info.request_id().is_none();
 
-                // 获取现有信息的可变引用，使用新的高效更新方法
-                let existing_info = occupied_entry.get();
-
-                // 检查是否需要更新扩展状态（避免不必要的写时复制）
-                let needs_extended_update = existing_info.container().is_none()
-                    || existing_info.model_provider().is_none()
-                    || existing_info.request_id().is_none();
-
-                if needs_extended_update {
-                    // 使用新的批量更新方法，减少 Arc::make_mut 调用次数
-                    let mut mutable_info = (**existing_info).clone();
-                    mutable_info.update_extended_from_request(
-                        Some(container_info.clone()),
-                        request.model_provider.clone(),
-                        request.request_id.clone(),
-                    );
-                    mutable_info.update_activity(); // 更新活动时间
-
-                    let arc_info = Arc::new(mutable_info);
-                    occupied_entry.insert(arc_info.clone());
-
-                    info!(
-                        "✅ [CHAT] 项目信息完整更新完成: project_id={}, container_id={}",
-                        project_id, container_info.container_id
-                    );
-
-                    arc_info
-                } else {
-                    // 只需要更新活动时间
-                    let mut mutable_info = (**existing_info).clone();
-                    mutable_info.update_activity();
-
-                    let arc_info = Arc::new(mutable_info);
-                    occupied_entry.insert(arc_info.clone());
-
-                    info!("✅ [CHAT] 项目活动时间更新完成: project_id={}", project_id);
-
-                    arc_info
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(vacant_entry) => {
-                info!("🆕 [CHAT] 创建新项目信息: project_id={}", project_id);
-
-                // 创建新的 ProjectAndContainerInfo，使用新的初始化方法
-                let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
-                new_info.update_extended_from_request(
+            if needs_extended_update {
+                // 创建更新后的信息
+                let mut mutable_info = (*existing_info).clone();
+                mutable_info.update_extended_from_request(
                     Some(container_info.clone()),
                     request.model_provider.clone(),
                     request.request_id.clone(),
+                    Some(service_type.clone()),
                 );
+                mutable_info.update_activity();
 
-                let arc_info = Arc::new(new_info);
-                vacant_entry.insert(arc_info.clone());
+                let arc_info = Arc::new(mutable_info);
+                state.insert_project(project_id.clone(), arc_info.clone());
 
                 info!(
-                    "✅ [CHAT] 项目信息创建完成: project_id={}, container_id={}",
+                    "✅ [CHAT] 项目信息完整更新完成: project_id={}, container_id={}",
                     project_id, container_info.container_id
                 );
 
                 arc_info
+            } else {
+                // 只需要更新活动时间
+                state.update_activity(&project_id);
+                info!("✅ [CHAT] 项目活动时间更新完成: project_id={}", project_id);
+                existing_info
             }
+        } else {
+            info!("🆕 [CHAT] 创建新项目信息: project_id={}", project_id);
+
+            // 创建新的 ProjectAndContainerInfo
+            let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
+            new_info.update_extended_from_request(
+                Some(container_info.clone()),
+                request.model_provider.clone(),
+                request.request_id.clone(),
+                Some(service_type.clone()),
+            );
+
+            let arc_info = Arc::new(new_info);
+            state.insert_project(project_id.clone(), arc_info.clone());
+
+            info!(
+                "✅ [CHAT] 项目信息创建完成: project_id={}, container_id={}",
+                project_id, container_info.container_id
+            );
+
+            arc_info
         }
     };
 
-    // 第三步：转发请求到容器服务
+    // 请求到达时立即更新活动时间（不等待请求执行结果）
+    // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
+    state.update_activity(&project_id);
+    debug!("🔄 [CHAT] 已更新活动时间: project_id={}", project_id);
+
+    // 第三步：转发请求到容器服务（使用全局连接池）
     info!("🚀 [CHAT] 开始转发请求到容器服务");
-    let result = forward_request_to_container_service(&request, &container_info).await;
+    let result =
+        forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
     info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
 
-    // 响应后状态更新 - 使用新的高效会话更新方法
+    // 响应后状态更新 - 使用 DuckDB 存储
+    // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
+    // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
     if let Ok(http_result) = &result {
         if let Some(chat_response) = &http_result.data {
-            info!(
-                "📊 [CHAT] 收到聊天响应，开始状态更新: session_id={}",
-                chat_response.session_id
-            );
-
-            // 收集会话信息
             let session_id = chat_response.session_id.clone();
 
-            // 使用新的高效更新方法进行原子性状态更新
-            info!("🔄 [CHAT] 开始更新项目会话状态: project_id={}", project_id);
+            // 只有当 session_id 非空时才更新映射
+            if !session_id.is_empty() {
+                info!(
+                    "📊 [CHAT] 收到聊天响应，开始状态更新: session_id={}, success={}",
+                    session_id,
+                    http_result.is_success()
+                );
 
-            let updated_arc_info = {
-                let entry = state.project_and_agent_map.entry(project_id.clone());
-                match entry {
-                    dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
-                        // 使用新的会话更新方法，自动处理写时复制
-                        let existing_info = occupied_entry.get();
+                // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
+                info!(
+                    "🔗 [SESSION_MAP] 关联 session_id {} 到 project_id {}",
+                    session_id, project_id
+                );
+                state.update_session(&project_id, &session_id);
 
-                        // 检查是否真的需要更新会话信息
-                        if existing_info.session_id() != Some(&session_id) {
-                            // 创建可变副本并更新会话信息
-                            let mut mutable_info = (**existing_info).clone();
-                            mutable_info.update_session(session_id.clone());
+                // 更新项目活动时间
+                state.update_activity(&project_id);
 
-                            let arc_info = Arc::new(mutable_info);
-                            occupied_entry.insert(arc_info.clone());
-
-                            info!(
-                                "✅ [CHAT] 项目会话状态更新完成: project_id={}, session_id={}",
-                                project_id, session_id
-                            );
-
-                            arc_info
-                        } else {
-                            // 只需更新活动时间
-                            let mut mutable_info = (**existing_info).clone();
-                            mutable_info.update_activity();
-
-                            let arc_info = Arc::new(mutable_info);
-                            occupied_entry.insert(arc_info.clone());
-
-                            info!(
-                                "✅ [CHAT] 项目活动时间更新完成: project_id={}, session_id={}",
-                                project_id, session_id
-                            );
-
-                            arc_info
-                        }
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(vacant_entry) => {
-                        warn!(
-                            "⚠️ [CHAT] 项目信息不存在，创建新条目: project_id={}",
-                            project_id
-                        );
-                        let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
-                        new_info.update_session(session_id.clone());
-
-                        let arc_info = Arc::new(new_info);
-                        vacant_entry.insert(arc_info.clone());
-
-                        info!(
-                            "✅ [CHAT] 新项目会话状态创建完成: project_id={}, session_id={}",
-                            project_id, session_id
-                        );
-
-                        arc_info
-                    }
+                if http_result.is_success() {
+                    info!(
+                        "🎯 [CHAT] 所有状态更新完成: project_id={}, session_id={}",
+                        project_id, session_id
+                    );
+                } else {
+                    warn!(
+                        "⚠️ [CHAT] 请求失败但已保存会话映射: project_id={}, session_id={}, code={}, message={}",
+                        project_id, session_id, http_result.code, http_result.message
+                    );
                 }
-            };
-
-            // 更新 sessions 映射 - 使用轻量级索引
-            info!("🔄 [CHAT] 更新会话索引映射: session_id={}", session_id);
-            state
-                .sessions
-                .insert(session_id.clone(), updated_arc_info.clone());
-
-            info!(
-                "🎯 [CHAT] 所有状态更新完成: project_id={}, session_id={}",
-                project_id, session_id
-            );
+            }
         }
-    } else {
+    }
+
+    if result.as_ref().map_or(true, |r| {
+        !r.is_success() && r.data.as_ref().map_or(true, |d| d.session_id.is_empty())
+    }) {
         error!("❌ [CHAT] 容器服务返回错误: {:?}", result);
     }
 
     info!("🏁 [CHAT] 准备返回最终结果: project_id={}", project_id);
+
     result
 }
 
-
-
 /// 转发请求到容器内的 agent_runner 服务
 ///
-/// 将原始聊天请求直接转发到指定的容器服务，获取并返回处理结果
+/// 🎯 使用 gRPC Chat RPC 替代 HTTP 转发（使用全局连接池）
 async fn forward_request_to_container_service(
     request: &ChatRequest,
     container_info: &ContainerBasicInfo,
+    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
 ) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
     let project_id = if let Some(id) = &request.project_id {
         id.clone()
     } else {
         error!("[FORWARD]会话 project_id 不能为空");
-        return Err(crate::AppError::internal_server_error(
+        return Ok(crate::HttpResult::error(
+            shared_types::error_codes::ERR_VALIDATION,
             "project_id 不能为空",
         ));
     };
 
     info!(
-        "📤 [FORWARD] 转发请求到容器: project_id={}, container_id={}, service_url={}",
+        "📤 [FORWARD] 转发请求到容器 (gRPC): project_id={}, container_id={}, service_url={}",
         project_id, container_info.container_id, container_info.service_url
     );
 
-    // 直接转发原始 JSON 请求到容器内的 agent_runner
-    // 不做任何参数修改，让 agent_runner 处理所有业务逻辑
-    let client = Client::new();
-    let chat_url = format!("{}/chat", container_info.service_url);
+    // 🎯 使用 gRPC 替代 HTTP
+    // 从 service_url 提取主机名
+    let grpc_addr =
+        extract_grpc_addr_with_port(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?;
 
     debug!(
-        "📡 [FORWARD] 发送HTTP请求到: {}, body: prompt_length={}, attachments_count={}",
-        chat_url,
+        "📡 [FORWARD] 发送 gRPC 请求到: {}, prompt_length={}, attachments_count={}",
+        grpc_addr,
         request.prompt.len(),
         request.attachments.len()
     );
 
-    let response = client
-        .post(&chat_url)
-        .json(request) // 直接转发原始请求
-        .send()
+    // 调用 gRPC Chat（使用全局连接池，带重试和被动驱逐机制）
+    let max_retries = 2;
+    let mut last_error = None;
+
+    for attempt in 1..=max_retries {
+        match crate::grpc::grpc_chat_with_pool(
+            grpc_pool,
+            &grpc_addr,
+            project_id.clone(),
+            request.session_id.clone(),
+            request.prompt.clone(),
+            request.attachments.clone(),
+            request.data_source_attachments.clone(),
+            request.model_provider.clone(),
+            request.request_id.clone(),
+            None, // ✅ 使用连接级别默认超时，未来可根据需要设置
+            // 新增参数 (v2)
+            request.system_prompt.clone(),
+            request.user_prompt.clone(),
+            request.agent_config.clone(),
+            Some(shared_types::ServiceType::RCoder), // ✅ RCoder 模式使用 RCoder ServiceType
+            None,                                    // RCoder 模式不需要 user_id
+        )
         .await
-        .map_err(|e| {
-            error!("❌ [FORWARD] HTTP请求失败: {}", e);
-            crate::AppError::internal_server_error(&format!("转发请求到容器失败: {}", e))
-        })?;
-
-    let status = response.status();
-    debug!("📥 [FORWARD] 容器响应状态: {}", status);
-
-    if status.is_success() {
-        // 先获取响应文本用于调试
-        let response_text = response.text().await.map_err(|e| {
-            error!("❌ [FORWARD] 读取容器响应文本失败: {}", e);
-            crate::AppError::internal_server_error(&format!("读取容器响应失败: {}", e))
-        })?;
-
-        debug!("📥 [FORWARD] 容器响应原始内容: {}", response_text);
-
-        // 解析容器的 HttpResult<ChatResponse> 响应
-        let container_http_result: shared_types::HttpResult<ChatResponse> =
-            serde_json::from_str(&response_text).map_err(|e| {
-                error!("❌ [FORWARD] 解析容器响应失败: {}, 响应内容: {}", e, response_text);
-                crate::AppError::internal_server_error(&format!("解析容器响应失败: {}", e))
-            })?;
-
-        debug!("📊 [FORWARD] 解析后的容器响应: {:?}", container_http_result);
-
-        // 检查容器响应是否成功 - 优先检查 code 字段，因为这是业务逻辑标准
-        if container_http_result.code == "0000" {
-            // 成功情况：提取 data 字段中的 ChatResponse
-            match container_http_result.data {
-                Some(container_response) => {
+        {
+            Ok(grpc_response) => {
+                if grpc_response.success {
+                    // 转换为内部 ChatResponse
+                    let chat_response = crate::grpc::grpc_response_to_chat_response(grpc_response);
                     info!(
-                        "✅ [FORWARD] 容器响应成功: project_id={}, session_id={}",
-                        container_response.project_id, container_response.session_id
+                        "✅ [FORWARD] gRPC 响应成功: project_id={}, session_id={}",
+                        chat_response.project_id, chat_response.session_id
                     );
-                    Ok(crate::HttpResult::success(container_response))
-                }
-                None => {
-                    error!("❌ [FORWARD] 成功响应但缺少 data 字段, 完整响应: {:?}", container_http_result);
-                    Ok(crate::HttpResult::error("CONTAINER_ERROR", "成功响应但缺少 data 字段"))
+                    return Ok(crate::HttpResult::success(chat_response));
+                } else {
+                    let error_msg = grpc_response
+                        .error
+                        .unwrap_or_else(|| "未知错误".to_string());
+                    // 🎯 从 gRPC 响应中提取错误码（完整透传）
+                    let error_code = grpc_response
+                        .error_code
+                        .unwrap_or_else(|| shared_types::error_codes::ERR_AGENT_ERROR.to_string());
+                    error!(
+                        "❌ [FORWARD] gRPC 响应错误: code={}, message={}",
+                        error_code, error_msg
+                    );
+                    return Ok(crate::HttpResult::error(&error_code, &error_msg));
                 }
             }
-        } else {
-            // 错误情况：容器返回了错误响应
-            let error_message = format!(
-                "容器服务错误: code={}, message={}",
-                container_http_result.code, container_http_result.message
-            );
-            error!("❌ [FORWARD] {}", error_message);
-            Ok(crate::HttpResult::error(&container_http_result.code, &error_message))
+            Err(e) => {
+                warn!(
+                    "⚠️ [FORWARD] gRPC 调用失败 (第 {}/{} 次): {}",
+                    attempt, max_retries, e
+                );
+
+                // ✅ 使用错误分类判断是否应该重试
+                let should_retry = crate::grpc::should_retry_error(&e);
+
+                if should_retry && attempt < max_retries {
+                    // 可重试错误：清理连接池并重试
+                    info!(
+                        "🔄 [FORWARD] 检测到可重试错误，从连接池移除 {} 并重试...",
+                        grpc_addr
+                    );
+                    grpc_pool.remove(&grpc_addr);
+                    last_error = Some(e);
+                    continue;
+                } else if !should_retry {
+                    // 不可重试错误：直接返回
+                    error!("❌ [FORWARD] 检测到不可重试错误，停止重试: {}", e);
+                    last_error = Some(e);
+                    break;
+                }
+
+                // 最后一次尝试失败
+                last_error = Some(e);
+            }
         }
+    }
+
+    // 如果所有重试都失败
+    if let Some(e) = last_error {
+        error!("❌ [FORWARD] gRPC 最终调用失败: {}", e);
+
+        // gRPC 通信失败，直接返回错误
+        // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
+        // 这里只处理真正的 gRPC 通信层错误
+        Ok(HttpResult::error(
+            shared_types::error_codes::ERR_GRPC_ERROR,
+            &format!("gRPC 调用失败: {}", e),
+        ))
     } else {
-        let error_text = format!("容器返回错误状态: {}", status);
-        let response_body = response.text().await.unwrap_or_default();
-        error!("❌ [FORWARD] {}, 响应内容: {}", error_text, response_body);
-        Ok(crate::HttpResult::error("CONTAINER_ERROR", &error_text))
+        // 理论上不会走到这里，除非 max_retries < 1
+        Ok(HttpResult::error(
+            shared_types::error_codes::ERR_GRPC_ERROR,
+            "未知重试错误",
+        ))
     }
 }

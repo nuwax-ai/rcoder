@@ -1,5 +1,6 @@
 /target
 /tmp
+/temp
 /other
 .idea
 
@@ -12,3 +13,6 @@ project_workspace
 .DS_Store
 docker/rcoder
 .vscode
+docker/rcoder-agent-runner/bin/agent_runner
+docker/computer-cache
+docker/computer-project-workspace

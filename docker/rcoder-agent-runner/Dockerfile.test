@@ -1,0 +1,41 @@
+# ============================================================================
+# 测试 Dockerfile - 快速验证 eBPF 工具安装逻辑
+# ============================================================================
+FROM debian:12
+
+# 设置工作目录
+WORKDIR /test
+
+# ============================================================================
+# 测试 eBPF 工具安装逻辑（从 Dockerfile 复制的核心逻辑）
+# ============================================================================
+ARG INSTALL_EBPF_TOOLS=true
+
+RUN echo "🔍 INSTALL_EBPF_TOOLS = [$INSTALL_EBPF_TOOLS]"
+
+RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
+        echo "✅ 条件满足，开始安装 eBPF 工具..."; \
+        apt-get update && \
+        echo "📦 安装 bpftrace（核心诊断工具）..."; \
+        apt-get install -y bpftrace && \
+        echo "📦 安装 strace（系统调用追踪）..."; \
+        apt-get install -y strace && \
+        echo "📦 安装 sysstat（性能监控）..."; \
+        apt-get install -y sysstat && \
+        echo "📦 安装 jq（JSON 处理）..."; \
+        apt-get install -y jq && \
+        rm -rf /var/lib/apt/lists/*; \
+        echo "✅ eBPF 工具安装完成"; \
+        which bpftrace && bpftrace --version && echo "✅ bpftrace 已安装" || echo "❌ bpftrace 未找到"; \
+        which strace && echo "✅ strace 已安装" || echo "❌ strace 未找到"; \
+    else \
+        echo "⚠️  条件不满足，跳过 eBPF 工具安装"; \
+        echo "INSTALL_EBPF_TOOLS=[$INSTALL_EBPF_TOOLS]"; \
+    fi
+
+# 最终验证
+RUN echo "=== 最终验证 ===" && \
+    which bpftrace && echo "✅ bpftrace 已安装" || echo "❌ bpftrace 未安装" && \
+    which strace && echo "✅ strace 已安装" || echo "❌ strace 未安装"
+
+CMD ["/bin/bash"]

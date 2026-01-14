@@ -1,0 +1,41 @@
+[package]
+name = "rcoder-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rcoder_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+# Core dependencies
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+structopt = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+matchit = { workspace = true }
+
+# Pingora dependencies - 真正的 Pingora 库
+pingora = { workspace = true }
+pingora-core = { workspace = true }
+pingora-http = { workspace = true }
+pingora-proxy = { workspace = true }
+pingora-load-balancing = { workspace = true }
+async-trait = { workspace = true }
+
+# HTTP client for fallback
+reqwest = { workspace = true }
+
+# URL parsing for masking
+url = { workspace = true }
+
+# Shared types for API config
+shared_types = { path = "../shared_types" }
+
+# 🚀 无锁配置热更新
+arc-swap = "1.8"

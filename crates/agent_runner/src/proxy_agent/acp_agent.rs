@@ -1,383 +1,566 @@
-use std::{
-    path::{Component, PathBuf},
-    sync::{Arc, LazyLock},
-};
+//! ACP Agent Worker 模块
+//!
+//! 负责处理 Agent 请求队列，管理 Agent 会话的创建和复用。
+//! 使用 AcpSessionManager 进行会话管理。
 
-use agent_client_protocol::{ContentBlock, PromptRequest, SessionId, TextContent}; // bring trait into scope for session_notification
+use std::sync::Arc;
 
-use chrono::Utc;
 use dashmap::DashMap;
+
+use agent_abstraction::session::AcpSessionManager;
+use anyhow::Result;
+use chrono::Utc;
 use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
-    model::{AgentStatus, ChatPrompt, ChatPromptResponse, ProjectAndAgentInfo},
-    proxy_agent::agent_service::AcpAgentService,
-    utils::{ContentBuilder, PromptBuilder},
+    agent_worker_manager::{Heartbeat, WORKER_THREAD_POOL_SIZE, WorkerHandle, WorkerReady},
+    model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
+    proxy_agent::{AcpAgentClient, SESSION_REQUEST_CONTEXT},
+    service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
+    utils::ContentBuilder,
 };
 
-use anyhow::Result;
+// 🔥 OpenTelemetry 追踪
+#[cfg(feature = "otel")]
+use crate::otel_tracing::RequestSpan;
 
-/// 使用 OnceLock 和 DashMap 管理 ProjectAndAgentInfo
-pub static PROJECT_AND_AGENT_INFO_MAP: LazyLock<DashMap<String, ProjectAndAgentInfo>> =
-    LazyLock::new(DashMap::new);
+// 🔥 简化版本：如果没有 OpenTelemetry，使用空的 span
+#[cfg(not(feature = "otel"))]
+struct RequestSpan;
 
-/// 检查模型配置是否发生变化
-fn check_model_config_changed(
-    existing_config: &Option<ModelProviderConfig>,
-    new_config: &Option<ModelProviderConfig>,
-) -> bool {
-    match (existing_config, new_config) {
-        (None, None) => false,
-        (Some(_), None) | (None, Some(_)) => true,
-        (Some(existing), Some(new)) => {
-            // 比较模型配置的id字段，如果不同则认为模型配置发生了变化
-            existing.id != new.id
-        }
+#[cfg(not(feature = "otel"))]
+impl RequestSpan {
+    fn new(_project_id: &str, _request_id: &str, _operation: &str) -> Self {
+        Self
     }
 }
 
-/// 创建新的Agent服务
-async fn create_new_agent_service(
-    request: LocalSetAgentRequest,
-    chat_prompt: ChatPrompt,
-    project_id: String,
-) {
-    info!("开始创建新的Agent服务，项目ID: {}", project_id);
-
-    // 根据 chat_prompt.agent_type 自动判断使用 codex 还是 claude code
-    let start_agent_result = chat_prompt
-        .agent_type
-        .start_agent_service(chat_prompt.clone(), request.model_provider.clone())
-        .await;
-
-    // 创建 agent 服务
-    match start_agent_result {
-        Ok(conn_info) => {
-            // 使用现有的AgentStopHandle作为dyn AgentLifecycle
-            let stop_handle = conn_info.stop_handle.as_ref().map(|guard| {
-                guard.clone() as Arc<dyn shared_types::AgentLifecycle>
-            });
-
-            let project_and_agent_info = ProjectAndAgentInfo {
-                project_id: project_id.clone(),
-                session_id: conn_info.session_id.clone(),
-                prompt_tx: conn_info.prompt_tx.clone(),
-                cancel_tx: conn_info.cancel_tx.clone(),
-                model_provider: request.model_provider.clone(),
-                request_id: request.chat_prompt.request_id.clone(),
-                status: AgentStatus::Idle,
-                last_activity: Utc::now(),
-                created_at: Utc::now(),
-                stop_handle,
-            };
-
-            // 记录项目project_id和 agent 服务信息的映射,一个project_id对应一个 agent 服务,方便复用agent 服务
-            PROJECT_AND_AGENT_INFO_MAP.insert(project_id.clone(), project_and_agent_info.clone());
-
-            let session_id_str = conn_info.session_id.to_string();
-
-            // 建立 project_id -> session_id 映射，确保 cleanup 任务能正确识别活跃 session
-            let cleared_old =
-                crate::service::ensure_project_session(&project_id, &session_id_str).await;
-            if cleared_old > 0 {
-                info!(
-                    "🧹 Project session 映射更新，已清理旧消息: project_id={}, cleared_count={}",
-                    project_id, cleared_old
-                );
-            } else {
-                info!(
-                    "🔗 Project session 映射已同步: project_id={}, session_id={}",
-                    project_id, session_id_str
-                );
-            }
-
-            let response =
-                match build_prompt_to_acp_agent(chat_prompt, conn_info.session_id.clone()).await {
-                    Ok(prompt_request) => {
-                        if let Err(e) = conn_info.prompt_tx.send(prompt_request) {
-                            error!("发送prompt请求失败: {:?}", e);
-                            ChatPromptResponse {
-                                project_id: project_id.clone(),
-                                session_id: conn_info.session_id.to_string(),
-                                error: Some(format!("发送prompt请求失败: {:?}", e)),
-                            }
-                        } else {
-                            info!("Prompt 请求已发送，项目ID: {}", project_id);
-                            ChatPromptResponse {
-                                project_id: project_id.clone(),
-                                session_id: conn_info.session_id.to_string(),
-                                error: None,
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "❌ 构建prompt请求失败，项目ID: {}，错误详情: {:?}",
-                            project_id, e
-                        );
-                        ChatPromptResponse {
-                            project_id: project_id.clone(),
-                            session_id: conn_info.session_id.to_string(),
-                            error: Some(format!("构建prompt请求失败: {:?}", e)),
-                        }
-                    }
-                };
-
-            // 发送回执消息
-            if let Err(e) = request.chat_prompt_tx.send(response) {
-                error!("发送chat prompt响应失败: {:?}", e);
-            }
-        }
-        Err(e) => {
-            error!("启动ACP Agent服务失败，项目ID: {}, 错误: {}", project_id, e);
-
-            // 发送失败回执给前端
-            let error_response = ChatPromptResponse {
-                project_id: project_id.clone(),
-                session_id: "".to_string(), // 启动失败时没有 session_id
-                error: Some(format!("启动ACP Agent服务失败: {}", e)),
-            };
-
-            if let Err(send_err) = request.chat_prompt_tx.send(error_response) {
-                error!(
-                    "发送启动失败回执失败，项目ID: {}, 错误: {:?}",
-                    project_id, send_err
-                );
-            }
-        }
-    }
-}
-
-/// 在 LocalSet 中运行的实际 Agent 请求
+/// LocalSet 中运行的 Agent 请求
 #[derive(Debug)]
 pub struct LocalSetAgentRequest {
-    /// 用户端发送的 prompt 请求
-    chat_prompt: ChatPrompt,
-    /// 发送 agent 通知执行prompt 完毕的回执消息
+    /// Agent 抽象层的 prompt 消息
+    prompt_message: agent_abstraction::PromptMessage,
+    /// 发送回执消息的通道
     chat_prompt_tx: oneshot::Sender<ChatPromptResponse>,
     /// 模型提供商配置
     model_provider: Option<ModelProviderConfig>,
+    /// 🔥 关联的 service UUID（用于 API 密钥管理）
+    service_uuid: Option<String>,
+    /// 🔥 共享的 API 密钥管理器（用于自动清理）
+    shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
 }
 
 impl LocalSetAgentRequest {
     pub fn new(
-        chat_prompt: ChatPrompt,
+        prompt_message: agent_abstraction::PromptMessage,
         model_provider: Option<ModelProviderConfig>,
     ) -> (Self, oneshot::Receiver<ChatPromptResponse>) {
         let (chat_prompt_tx, chat_prompt_rx) = oneshot::channel();
-
         (
             Self {
-                chat_prompt,
+                prompt_message,
                 chat_prompt_tx,
                 model_provider,
+                service_uuid: None,
+                shared_api_key_manager: None,
             },
             chat_prompt_rx,
         )
     }
+
+    /// 设置 service_uuid
+    pub fn with_service_uuid(mut self, service_uuid: Option<String>) -> Self {
+        self.service_uuid = service_uuid;
+        self
+    }
+
+    /// 设置 shared_api_key_manager
+    pub fn with_key_manager(
+        mut self,
+        key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    ) -> Self {
+        self.shared_api_key_manager = key_manager;
+        self
+    }
 }
 
-/// AgentSideConnection , ClientSideConnection 没实现 Send trait ,需要在 LocalSet 中运行,另外 agent服务数量是动态的,和 project_id 是一一对应的,一个 project_id 对应一个 agent服务
-
-/// Agent worker 任务，在本地线程中运行 Agent
+/// Agent Worker 任务（简化版）
+///
+/// 在本地线程中运行，处理 Agent 请求队列。
+/// 使用 AcpAgentWorker 处理核心业务逻辑。
 pub async fn agent_worker(
     mut request_rx: mpsc::UnboundedReceiver<LocalSetAgentRequest>,
 ) -> Result<()> {
-    info!("🚀 agent_worker 启动，开始监听请求...");
+    use agent_abstraction::session::{AcpAgentWorker, AgentWorker, WorkerRequest};
+    use agent_client_protocol::SessionId;
+
+    info!("🚀 agent_worker 启动（简化版），开始监听请求...");
+
+    // 创建 AcpSessionManager，注入 AGENT_REGISTRY 作为 SessionRegistry
+    let session_manager = Arc::new(AcpSessionManager::<
+        StateAwareNotifier,
+        AcpAgentClient,
+        AgentSessionRegistry,
+    >::new(
+        Arc::new(StateAwareNotifier::new()),
+        AGENT_REGISTRY.clone(),
+    ));
+
+    // 创建 AcpAgentWorker
+    let worker = AcpAgentWorker::new(session_manager);
+
     while let Some(request) = request_rx.recv().await {
+        let project_id = request.prompt_message.project_id.clone();
+        let request_id = request.prompt_message.request_id.clone();
+
         info!(
-            "📨 agent_worker 接收到新请求，project_id: {}",
-            request.chat_prompt.project_id
+            "📨 接收到请求，project_id: {}, request_id: {}",
+            project_id, request_id
         );
-        let mut chat_prompt = request.chat_prompt.clone();
 
-        let original_path = chat_prompt.project_path;
-        // 规范化路径：
-        // - 如果是相对路径，先与当前目录拼接
-        // - 去除路径中的 "./"（CurDir 组件），不依赖文件系统
-        let joined_path = if original_path.is_absolute() {
-            original_path
+        // 1. 预处理附件（agent_runner 特有逻辑）
+        let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
+            match ContentBuilder::attachments_to_content_blocks(
+                &request.prompt_message.attachments,
+                &request.prompt_message.project_path,
+            )
+            .await
+            {
+                Ok(blocks) => Some(blocks),
+                Err(e) => {
+                    error!("❌ 附件处理失败: {:?}", e);
+
+                    if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                        project_id: project_id.clone(),
+                        session_id: String::new(),
+                        code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
+                        error: Some(format!("附件处理失败: {:?}", e)),
+                        request_id: Some(request_id),
+                        service_type: request.prompt_message.service_type.clone(),
+                    }) {
+                        error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                    }
+                    continue;
+                }
+            }
         } else {
-            std::env::current_dir().unwrap().join(original_path)
+            None
         };
-        let project_path: PathBuf = joined_path
-            .components()
-            .filter(|c| !matches!(c, Component::CurDir))
-            .collect();
-        // 将规范化后的路径写回，确保后续使用统一
-        chat_prompt.project_path = project_path.clone();
 
-        // 创建项目目录
-        if !project_path.exists() {
-            info!(
-                "Project path does not exist,project_id={}",
-                request.chat_prompt.project_id
-            );
-            //自动创建目录
-            if let Err(e) = tokio::fs::create_dir_all(&project_path).await {
-                error!("Failed to create project directory: {:?}", e);
+        // 2. 创建 WorkerRequest
+        let worker_request = WorkerRequest {
+            prompt_message: request.prompt_message.clone(),
+            model_provider: request.model_provider.clone(),
+            attachment_blocks,
+            service_uuid: request.service_uuid.clone(),
+            shared_api_key_manager: request.shared_api_key_manager.clone(),
+        };
+
+        // 3. 调用 AcpAgentWorker 处理（核心业务逻辑）
+        let worker_response = match worker.process_request(worker_request).await {
+            Ok(response) => response,
+            Err(e) => {
+                error!("❌ Worker 处理失败: {:?}", e);
+
+                if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                    project_id: project_id.clone(),
+                    session_id: String::new(),
+                    code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
+                    error: Some(format!("处理失败: {:?}", e)),
+                    request_id: Some(request_id.clone()),
+                    service_type: request.prompt_message.service_type.clone(),
+                }) {
+                    error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                }
                 continue;
             }
-        }
-
-        info!(
-            "🔍 处理完路径，准备查找Agent，project_id: {}",
-            request.chat_prompt.project_id
-        );
-
-        // 检查 project_id 有对应的agent 服务,没有则创建
-        let project_id = request.chat_prompt.project_id.clone();
-        
-        // 先检查是否存在Agent并提取必要信息，然后立即释放锁
-        let agent_exists = PROJECT_AND_AGENT_INFO_MAP.contains_key(&project_id);
-        
-        if agent_exists {
-            info!("✅ 找到现有Agent，project_id: {}", project_id);
-        } else {
-            info!(
-                "❌ 未找到现有Agent，将创建新Agent，project_id: {}",
-                project_id
-            );
-        }
-
-        // 检查是否需要因模型配置变化而重启Agent服务
-        let need_restart_agent = if agent_exists {
-            let agent_info = PROJECT_AND_AGENT_INFO_MAP.get(&project_id);
-            if let Some(ref info) = agent_info {
-                check_model_config_changed(&info.model_provider, &request.model_provider)
-            } else {
-                false
-            }
-            // agent_info 在这里自动释放，读锁被释放
-        } else {
-            false
         };
 
-        if agent_exists && need_restart_agent {
-            // 模型配置发生变化，需要重启Agent服务
-            info!("检测到模型配置变化，重启Agent服务，项目ID: {}", project_id);
+        // 4. 更新全局状态（使用统一的 AGENT_REGISTRY）
+        if worker_response.is_new_session {
+            if let Some(handles) = &worker_response.session_handles {
+                debug!("🆕 新会话，注册到 AGENT_REGISTRY");
 
-            // ⚠️ 此时不持有任何锁，可以安全地获取写锁并 remove
-            PROJECT_AND_AGENT_INFO_MAP.remove(&project_id);
-
-            // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
-            crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(&project_id);
-            debug!(
-                "🧼 [acp_agent] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
-                project_id
-            );
-
-            // 创建新的Agent服务
-            create_new_agent_service(request, chat_prompt, project_id).await;
-        } else if agent_exists {
-            // 模型配置未变化，复用现有Agent服务
-            info!("复用现有Agent服务，项目ID: {}", project_id);
-
-            // 重新获取agent_info（短暂持有读锁）
-            if let Some(agent_info) = PROJECT_AND_AGENT_INFO_MAP.get(&project_id) {
-                let session_id = agent_info.session_id.clone();
-                let prompt_tx = agent_info.prompt_tx.clone();
-                // 读锁在此处自动释放
-
-                debug!("复用Agent - session_id: {}, prompt_tx可用", session_id.0);
-
-                // 注意：不在这里更新 request_id，因为 get_mut 会需要写锁，
-                // 可能与正在执行的 Prompt 处理任务产生锁冲突。
-                // 直接将 request_id 包含在 ChatPrompt 中，在构建 PromptRequest 时使用。
-                debug!("使用请求中的request_id: {:?}", chat_prompt.request_id);
-
-                debug!("开始构建Prompt请求，项目ID: {}", project_id);
-                match build_prompt_to_acp_agent(chat_prompt, session_id.clone()).await {
-                    Ok(prompt_request) => {
-                        info!(
-                            "Prompt请求构建成功，准备发送到channel，项目ID: {}",
-                            project_id
-                        );
-                        if let Err(e) = prompt_tx.send(prompt_request) {
-                            error!("❌ 发送Prompt请求到channel失败: {:?}", e);
-                        } else {
-                            info!("✅ Prompt请求已成功发送到channel，项目ID: {}", project_id);
-                        }
-                    }
-                    Err(e) => {
-                        error!("❌ 构建Prompt请求失败: {}", e);
-                    }
-                }
-
-                // 发送回执消息
-                debug!("准备发送回执消息，项目ID: {}", project_id);
-                if let Err(e) = request.chat_prompt_tx.send(ChatPromptResponse {
+                let project_and_agent_info = ProjectAndAgentInfo {
                     project_id: project_id.clone(),
-                    session_id: session_id.to_string(),
-                    error: None,
-                }) {
-                    error!("发送回执消息失败: {:?}", e);
-                } else {
-                    info!("✅ 回执消息发送成功，项目ID: {}", project_id);
-                }
+                    session_id: SessionId::new(Arc::from(worker_response.session_id.as_str())),
+                    prompt_tx: handles.prompt_tx.clone(),
+                    cancel_tx: handles.cancel_tx.clone(),
+                    model_provider: request.model_provider.clone(),
+                    request_id: Some(request_id.clone()),
+                    status: AgentStatus::Active, // 🆕 修复：Worker 处理中应为 Active，而非 Idle
+                    last_activity: Utc::now(),
+                    created_at: Utc::now(),
+                    stop_handle: handles.lifecycle_handle.clone(),
+                };
+
+                // 使用统一的 AGENT_REGISTRY 注册（自动处理所有映射）
+                AGENT_REGISTRY.register(
+                    &project_id,
+                    &worker_response.session_id,
+                    project_and_agent_info,
+                );
+
+                info!(
+                    "🔗 Agent 已注册到 AGENT_REGISTRY: project_id={}, session_id={}",
+                    project_id, worker_response.session_id
+                );
             }
         } else {
-            // 创建新的Agent服务
-            create_new_agent_service(request, chat_prompt, project_id).await;
+            debug!("♻️ 复用会话，无需更新全局 Registry");
+        }
+
+        // 5. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
+        SESSION_REQUEST_CONTEXT.insert(project_id, request_id.clone());
+
+        // 6. 转换并发送回执
+        let chat_prompt_response = ChatPromptResponse {
+            project_id: worker_response.project_id,
+            session_id: worker_response.session_id,
+            code: if worker_response.error.is_none() {
+                shared_types::error_codes::SUCCESS.to_string()
+            } else {
+                shared_types::error_codes::ERR_AGENT_ERROR.to_string()
+            },
+            error: worker_response.error,
+            request_id: worker_response.request_id,
+            service_type: worker_response.service_type,
+        };
+
+        if let Err(e) = request.chat_prompt_tx.send(chat_prompt_response) {
+            error!("❌ 发送回执失败: {:?}", e);
         }
     }
-    debug!("Agent worker finished");
+
+    info!("🛑 agent_worker 停止");
     Ok(())
 }
 
-/// 构建 Prompt 请求
-pub async fn build_prompt_to_acp_agent(
-    prompt: ChatPrompt,
-    session_id: SessionId,
-) -> Result<PromptRequest> {
-    // 构建最终提示词（包含系统提示词、用户输入和数据源信息）
-    let final_prompt = if prompt.data_source_attachments.is_empty() {
-        PromptBuilder::new().build(&prompt.prompt)
-    } else {
-        PromptBuilder::new()
-            .build_with_data_sources(&prompt.prompt, &prompt.data_source_attachments)
-    };
+/// 🔥 新增：带心跳的 agent_worker
+///
+/// 这是新的入口点，支持心跳和自动重启监控
+/// 保留原 `agent_worker` 函数以兼容现有代码
+pub async fn agent_worker_with_heartbeat(
+    mut request_rx: mpsc::UnboundedReceiver<LocalSetAgentRequest>,
+    mut handle: WorkerHandle,
+) -> Result<()> {
+    info!("🚀 agent_worker 启动（带心跳支持），开始监听请求...");
 
-    // 创建文本内容块
-    let text_block = ContentBlock::Text(TextContent {
-        text: final_prompt,
-        annotations: None,
-        meta: None,
-    });
+    use agent_abstraction::session::{AcpAgentWorker, AgentWorker, WorkerRequest};
+    use agent_client_protocol::SessionId;
+    use tokio::time::{Duration, interval};
 
-    // 创建内容块列表，以文本开始
-    let mut content_blocks = vec![text_block];
+    // 创建 AcpSessionManager，注入 AGENT_REGISTRY 作为 SessionRegistry
+    let session_manager = Arc::new(AcpSessionManager::<
+        StateAwareNotifier,
+        AcpAgentClient,
+        AgentSessionRegistry,
+    >::new(
+        Arc::new(StateAwareNotifier::new()),
+        AGENT_REGISTRY.clone(),
+    ));
 
-    // 如果有附件，转换为内容块
-    if !prompt.attachments.is_empty() {
-        let attachment_blocks = ContentBuilder::attachments_to_content_blocks(
-            &prompt.attachments,
-            &prompt.project_path,
-        )
-        .await?;
+    // 创建 AcpAgentWorker
+    let worker = AcpAgentWorker::new(session_manager);
 
-        content_blocks.extend(attachment_blocks);
+    // 🆕 发送 Worker 就绪信号（仅在启动时发送一次，oneshot）
+    if let Some(ready_tx) = handle.ready_tx.take() {
+        let ready_signal = WorkerReady {
+            timestamp: Utc::now(),
+        };
+        if let Err(_e) = ready_tx.send(ready_signal) {
+            warn!("⚠️ [Worker] Ready 信号发送失败（接收端已关闭）");
+        } else {
+            info!("✅ [Worker] Ready 信号已发送，LocalSet 初始化完成");
+        }
     }
 
-    // 将 request_id 放入 meta 字段，以便 channel_utils 可以提取并更新到 MAP
-    let meta = if let Some(request_id) = prompt.request_id {
-        debug!(
-            "🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta",
-            request_id
-        );
-        Some(serde_json::json!({
-            "request_id": request_id
-        }))
-    } else {
-        debug!("⚠️ [build_prompt] prompt.request_id 为空，meta 设为 None");
-        None
-    };
+    // 🔥 启动心跳任务（独立 spawn，不在 LocalSet 中）
+    let heartbeat_tx = handle.heartbeat_tx.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut heartbeat_interval = interval(Duration::from_secs(5));
+        loop {
+            heartbeat_interval.tick().await;
 
-    Ok(PromptRequest {
-        session_id,
-        prompt: content_blocks,
-        meta,
-    })
+            // 📊 获取当前活跃 Worker 数量
+            let active_count = AGENT_REGISTRY.stats().agent_count;
+            let total_count = WORKER_THREAD_POOL_SIZE;
+
+            let heartbeat = Heartbeat {
+                timestamp: Utc::now(),
+            };
+
+            // 📊 打印当前 Worker 占用情况
+            info!(
+                "💓 [Worker] 心跳 - 当前活跃: {}/{}, 可用: {}, 时间: {}",
+                active_count,
+                total_count,
+                total_count.saturating_sub(active_count),
+                heartbeat.timestamp.format("%Y-%m-%d %H:%M:%S")
+            );
+
+            if let Err(e) = heartbeat_tx.try_send(heartbeat) {
+                warn!("⚠️ [Worker] 心跳发送失败: {}", e);
+                // 如果监控任务已关闭，worker 也应该退出
+                break;
+            }
+        }
+    });
+
+    // 🆕 主处理循环 - 改为并发处理，每个请求在独立的 spawn_blocking 中运行
+    while let Some(request) = request_rx.recv().await {
+        let project_id = request.prompt_message.project_id.clone();
+        let request_id = request.prompt_message.request_id.clone();
+
+        info!(
+            "📨 接收到请求，project_id: {}, request_id: {} - 准备并发处理",
+            project_id, request_id
+        );
+
+        // 克隆需要的变量，用于 spawn 任务
+        let worker_clone = worker.clone();
+        let handle_clone = handle.clone();
+
+        // 🚀 使用 spawn_blocking 为每个请求创建独立的阻塞任务
+        // 因为 LocalSet 不是 Send，需要在专用的 blocking 线程中运行
+        tokio::task::spawn_blocking(move || {
+            // 在 blocking 线程中创建一个单线程运行时
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for request");
+
+            rt.block_on(async move {
+                // 创建独立的 LocalSet，用于运行 !Send 的 ACP 连接
+                let local_set = tokio::task::LocalSet::new();
+
+                local_set.run_until(async move {
+                info!(
+                    "🔵 [LocalSet] 开始处理请求 project_id={}, request_id={}",
+                    project_id, request_id
+                );
+
+                // 🔥 OpenTelemetry 追踪: 创建请求 span
+                let _otel_span = RequestSpan::new(&project_id, &request_id, "process_agent_request");
+
+                // 🔥 并发控制: 检查活跃 Agent 会话数（基于 AGENT_REGISTRY）
+                let active_sessions_count = AGENT_REGISTRY.stats().agent_count;
+
+                // 🛡️ 并发限制: 会话数达到工作线程池上限时直接拒绝
+                if active_sessions_count >= WORKER_THREAD_POOL_SIZE {
+                    error!(
+                        "🛡️ [并发限制] Agent 会话数已达上限 ({}/{}), 拒绝新请求 - project_id={}, request_id={}",
+                        active_sessions_count, WORKER_THREAD_POOL_SIZE, project_id, request_id
+                    );
+
+                    // 🔥 关键修复：清理 Pending 状态，避免状态泄漏
+                    AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+
+                    if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                        project_id: project_id.clone(),
+                        session_id: String::new(),
+                        code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
+                        error: Some(format!(
+                            "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
+                            WORKER_THREAD_POOL_SIZE
+                        )),
+                        request_id: Some(request_id.clone()),
+                        service_type: request.prompt_message.service_type.clone(),
+                    }) {
+                        error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
+                    }
+                    return; // 退出当前 LocalSet
+                }
+
+                // 📊 日志: 记录当前会话数（低于上限时）
+                debug!(
+                    "✅ [并发检查通过] 当前活跃会话数: {}/{}, project_id={}, request_id={}",
+                    active_sessions_count, WORKER_THREAD_POOL_SIZE, project_id, request_id
+                );
+
+                // 1. 预处理附件（agent_runner 特有逻辑）
+                let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
+                    match ContentBuilder::attachments_to_content_blocks(
+                        &request.prompt_message.attachments,
+                        &request.prompt_message.project_path,
+                    )
+                    .await
+                    {
+                        Ok(blocks) => Some(blocks),
+                        Err(e) => {
+                            error!("❌ 附件处理失败: {:?}", e);
+
+                            // 🔥 关键修复：清理 Pending 状态，避免状态泄漏
+                            AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+
+                            if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                                project_id: project_id.clone(),
+                                session_id: String::new(),
+                                code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
+                                error: Some(format!("附件处理失败: {:?}", e)),
+                                request_id: Some(request_id.clone()),
+                                service_type: request.prompt_message.service_type.clone(),
+                            }) {
+                                error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                            }
+                            return; // 退出当前 LocalSet
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // 2. 创建 WorkerRequest
+                let worker_request = WorkerRequest {
+                    prompt_message: request.prompt_message.clone(),
+                    model_provider: request.model_provider.clone(),
+                    attachment_blocks,
+                    service_uuid: request.service_uuid.clone(),
+                    shared_api_key_manager: request.shared_api_key_manager.clone(),
+                };
+
+                // 3. 调用 AcpAgentWorker 处理（核心业务逻辑）
+                let worker_response = match worker_clone.process_request(worker_request).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        error!("❌ Worker 处理失败: {:?}", e);
+
+                        // 🔥 关键修复：清理 Pending 状态，避免状态泄漏
+                        AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+
+                        if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                            project_id: project_id.clone(),
+                            session_id: String::new(),
+                            code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
+                            error: Some(format!("处理失败: {:?}", e)),
+                            request_id: Some(request_id.clone()),
+                            service_type: request.prompt_message.service_type.clone(),
+                        }) {
+                            error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                        }
+                        return; // 退出当前 LocalSet
+                    }
+                };
+
+                // 4. 提取 session_handles（在移动 worker_response 之前）
+                // 🔥 关键：需要保存 lifecycle_handle 用于后续等待会话结束
+                let session_handles = worker_response.session_handles.clone();
+                let is_new_session = worker_response.is_new_session;
+                let response_session_id = worker_response.session_id.clone();
+
+                // 5. 更新全局状态（使用统一的 AGENT_REGISTRY）
+                if is_new_session {
+                    if let Some(ref handles) = session_handles {
+                        debug!("🆕 新会话，注册到 AGENT_REGISTRY");
+
+                        let project_and_agent_info = ProjectAndAgentInfo {
+                            project_id: project_id.clone(),
+                            session_id: SessionId::new(Arc::from(response_session_id.as_str())),
+                            prompt_tx: handles.prompt_tx.clone(),
+                            cancel_tx: handles.cancel_tx.clone(),
+                            model_provider: request.model_provider.clone(),
+                            request_id: Some(request_id.clone()),
+                            status: AgentStatus::Active,
+                            last_activity: Utc::now(),
+                            created_at: Utc::now(),
+                            stop_handle: handles.lifecycle_handle.clone(),
+                        };
+
+                        AGENT_REGISTRY.register(
+                            &project_id,
+                            &response_session_id,
+                            project_and_agent_info,
+                        );
+
+                        info!(
+                            "🔗 Agent 已注册到 AGENT_REGISTRY: project_id={}, session_id={}",
+                            project_id, response_session_id
+                        );
+                    }
+                } else {
+                    debug!("♻️ 复用会话，无需更新全局 Registry");
+                }
+
+                // 6. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
+                SESSION_REQUEST_CONTEXT.insert(project_id.clone(), request_id.clone());
+
+                // 7. 转换并发送回执
+                let chat_prompt_response = ChatPromptResponse {
+                    project_id: worker_response.project_id,
+                    session_id: worker_response.session_id,
+                    code: if worker_response.error.is_none() {
+                        shared_types::error_codes::SUCCESS.to_string()
+                    } else {
+                        shared_types::error_codes::ERR_AGENT_ERROR.to_string()
+                    },
+                    error: worker_response.error,
+                    request_id: worker_response.request_id,
+                    service_type: worker_response.service_type,
+                };
+
+                if let Err(e) = request.chat_prompt_tx.send(chat_prompt_response) {
+                    error!("❌ 发送回执失败: {:?}", e);
+                } else {
+                    info!(
+                        "✅ 回执已发送，project_id: {}",
+                        request.prompt_message.project_id
+                    );
+                }
+
+                // 🔥🔥🔥 关键修复：LocalSet 生命周期管理策略 🔥🔥🔥
+                //
+                // 架构设计：
+                // - 每个请求在独立的 spawn_blocking 线程中运行
+                // - 新会话：LocalSet 保持存活，负责维护 Agent 的生命周期
+                // - 复用会话：LocalSet 立即退出，释放线程
+                //
+                // 为什么复用会话不等待？
+                // - Agent 的生命周期由创建它的 LocalSet 维护
+                // - 复用会话的 LocalSet 不需要等待，避免线程泄漏
+                // - cancel_session 不触发 cancellation_token，不影响 Agent 生命周期
+                if is_new_session {
+                    if let Some(ref handles) = session_handles {
+                        if let Some(ref lifecycle) = handles.lifecycle_handle {
+                            info!(
+                                "🔄 [LocalSet] 新会话：保持 LocalSet 存活维护 Agent 生命周期 - project_id={}, session_id={}",
+                                project_id, response_session_id
+                            );
+
+                            // 等待以下任一事件：
+                            // 1. 用户调用 stop_agent → lifecycle.cancel()
+                            // 2. 清理任务停止闲置 Agent（5分钟）→ lifecycle.graceful_stop()
+                            // 3. Agent 进程异常退出
+                            lifecycle.cancellation_token().cancelled().await;
+
+                            info!(
+                                "🛑 [LocalSet] Agent 生命周期结束，LocalSet 退出 - project_id={}, session_id={}",
+                                project_id, response_session_id
+                            );
+                        } else {
+                            warn!(
+                                "⚠️ [LocalSet] 新会话缺少 lifecycle_handle，LocalSet 将立即退出 - project_id={}",
+                                project_id
+                            );
+                        }
+                    }
+                } else {
+                    info!(
+                        "🔵 [LocalSet] 复用会话：请求处理完成，LocalSet 立即退出 - project_id={}, session_id={}",
+                        project_id, response_session_id
+                    );
+                }
+                }).await;
+            })
+        });
+
+        // 立即继续循环，接收下一个请求 - 不等待上面的 spawn_blocking 完成
+    }
+
+    // 清理心跳任务
+    heartbeat_task.abort();
+
+    info!("🛑 agent_worker 停止");
+    Ok(())
 }

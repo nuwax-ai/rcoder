@@ -11,8 +11,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::model::AgentStatus;
-use crate::proxy_agent::PROJECT_AND_AGENT_INFO_MAP;
-use crate::service::{SESSION_CACHE, PROJECT_SESSION_MAP};
+use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
 
 /// 清理配置
 #[derive(Debug, Clone)]
@@ -29,8 +28,8 @@ pub struct CleanupConfig {
 impl Default for CleanupConfig {
     fn default() -> Self {
         Self {
-            idle_timeout: Duration::from_secs(30 * 60),
-            cleanup_interval: Duration::from_secs(5 * 60),
+            idle_timeout: Duration::from_secs(3 * 60), // 🆕 默认3分钟
+            cleanup_interval: Duration::from_secs(30), // 默认30秒
         }
     }
 }
@@ -84,10 +83,10 @@ impl AgentCleaner {
         let mut orphaned_count = 0;
         let mut messages_cleared = 0;
 
-        // 收集所有活跃的session_id（从PROJECT_SESSION_MAP中获取）
-        let active_session_ids: std::collections::HashSet<String> = PROJECT_SESSION_MAP
-            .iter()
-            .map(|entry| entry.value().clone())
+        // 使用统一 Registry 收集所有活跃的 session_id
+        let active_session_ids: std::collections::HashSet<String> = AGENT_REGISTRY
+            .iter_agents()
+            .map(|entry| entry.value().session_id.to_string())
             .collect();
 
         // 检查SESSION_CACHE中的所有session
@@ -141,6 +140,15 @@ impl AgentCleaner {
             if let Some((_, _)) = SESSION_CACHE.remove(&session_id) {
                 debug!("移除空session: {}", session_id);
             }
+
+            // 🆕 同时清理 SESSION_FIRST_PROMPT_SUCCESS 中的记录
+            // 避免内存泄漏
+            if crate::grpc::agent_service_impl::SESSION_FIRST_PROMPT_SUCCESS
+                .remove(&session_id)
+                .is_some()
+            {
+                debug!("清理 SESSION_FIRST_PROMPT_SUCCESS: {}", session_id);
+            }
         }
 
         if orphaned_count > 0 {
@@ -161,8 +169,9 @@ impl AgentCleaner {
         let mut success_count = 0;
         let mut failed_count = 0;
 
-        // 统计当前活动的agent数量
-        let total_agents = PROJECT_AND_AGENT_INFO_MAP.len();
+        // 使用统一 Registry 获取统计信息
+        let registry_stats = AGENT_REGISTRY.stats();
+        let total_agents = registry_stats.agent_count;
 
         info!(
             "开始清理闲置agent和SSE消息，当前时间: {}，当前活动agent数量: {}",
@@ -172,10 +181,10 @@ impl AgentCleaner {
         // 先清理孤立的SSE消息数据
         let (orphaned_sessions, sse_messages) = self.cleanup_orphaned_sse_sessions().await;
 
-        // 收集需要清理的agent ID
+        // 收集需要清理的agent ID（使用统一 Registry 遍历）
         let mut agents_to_remove = Vec::new();
 
-        for entry in PROJECT_AND_AGENT_INFO_MAP.iter() {
+        for entry in AGENT_REGISTRY.iter_agents() {
             let project_id = entry.key();
             let agent_info = entry.value();
 
@@ -219,15 +228,21 @@ impl AgentCleaner {
         self.stats.sse_messages_cleaned += sse_messages;
         self.stats.last_cleanup = Some(current_time);
 
-        // 清理完成后的统计
-        let remaining_agents = PROJECT_AND_AGENT_INFO_MAP.len();
-        let active_sessions = PROJECT_SESSION_MAP.len();
+        // 清理完成后的统计（使用统一 Registry）
+        let final_stats = AGENT_REGISTRY.stats();
+        let remaining_agents = final_stats.agent_count;
+        let active_sessions = final_stats.session_count;
         let cached_sessions = SESSION_CACHE.len();
 
         info!(
             "清理完成: agent(总共={}, 成功={}, 失败={}, 剩余={}) | session(活跃={}, 缓存={}) | SSE消息(清理={})",
-            cleaned_count, success_count, failed_count, remaining_agents,
-            active_sessions, cached_sessions, sse_messages
+            cleaned_count,
+            success_count,
+            failed_count,
+            remaining_agents,
+            active_sessions,
+            cached_sessions,
+            sse_messages
         );
 
         Ok(CleanupStats {
@@ -245,31 +260,31 @@ impl AgentCleaner {
     fn cleanup_agent_raii(&self, project_id: &str) -> Result<()> {
         debug!("开始RAII清理agent: {}", project_id);
 
-        // 检查agent是否存在
-        if PROJECT_AND_AGENT_INFO_MAP.contains_key(project_id) {
-            // 直接从MAP中移除，触发AgentLifecycleGuard的Drop
-            let removed = PROJECT_AND_AGENT_INFO_MAP.remove(project_id);
+        // 使用统一 Registry 检查并移除（内部自动同步清理所有映射）
+        if AGENT_REGISTRY.contains_project(project_id) {
+            // 通过统一 Registry 移除，自动清理：
+            // - agent_info_map
+            // - project_to_session 映射
+            // - session_to_project 反向映射
+            let removed = AGENT_REGISTRY.remove_by_project(project_id);
 
             // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
             crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
-            debug!("🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}", project_id);
-
-            // 清理 PROJECT_SESSION_MAP 中的映射关系
-            if let Some((_, removed_session_id)) = PROJECT_SESSION_MAP.remove(project_id) {
-                debug!("🧼 [cleanup] 已清理 PROJECT_SESSION_MAP 映射: project_id={}, session_id={}",
-                       project_id, removed_session_id);
-            }
+            debug!(
+                "🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
+                project_id
+            );
 
             if removed.is_some() {
                 info!(
-                    "Agent已从MAP中移除，AgentLifecycleGuard将自动清理资源: {}",
+                    "Agent已从Registry中移除，AgentLifecycleGuard将自动清理资源: {}",
                     project_id
                 );
             } else {
                 warn!("尝试移除agent但未找到: {}", project_id);
             }
         } else {
-            warn!("Agent不存在于MAP中: {}", project_id);
+            warn!("Agent不存在于Registry中: {}", project_id);
         }
 
         Ok(())

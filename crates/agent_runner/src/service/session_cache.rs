@@ -7,19 +7,16 @@ use anyhow::Result;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use std::sync::{Arc, LazyLock};
+
+use super::AGENT_REGISTRY;
 
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
-
-/// Project到当前活跃Session的映射 - 用于确保一个project_id只对应一个session_id
-/// 当project_id对应的session_id发生变化时，会自动清理旧session的数据
-pub static PROJECT_SESSION_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
-
 
 /// Session数据包装 - 极简版本，专注消息传输
 pub struct SessionData {
@@ -36,7 +33,10 @@ impl SessionData {
 
         let channel_start = std::time::Instant::now();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        debug!("⏱️ [SessionData::new] channel创建耗时: {:?}", channel_start.elapsed());
+        debug!(
+            "⏱️ [SessionData::new] channel创建耗时: {:?}",
+            channel_start.elapsed()
+        );
 
         let arc_start = std::time::Instant::now();
         let session = Arc::new(SessionData {
@@ -44,20 +44,37 @@ impl SessionData {
             current_sender: Arc::new(tokio::sync::Mutex::new(None)),
             current_cancel: Arc::new(tokio::sync::Mutex::new(None)),
         });
-        debug!("⏱️ [SessionData::new] Arc创建耗时: {:?}", arc_start.elapsed());
+        debug!(
+            "⏱️ [SessionData::new] Arc创建耗时: {:?}",
+            arc_start.elapsed()
+        );
 
         let spawn_start = std::time::Instant::now();
-        SessionWorker::spawn(max_size, command_rx, session.current_sender.clone(), session.current_cancel.clone());
-        debug!("⏱️ [SessionData::new] SessionWorker::spawn耗时: {:?}", spawn_start.elapsed());
+        SessionWorker::spawn(
+            max_size,
+            command_rx,
+            session.current_sender.clone(),
+            session.current_cancel.clone(),
+        );
+        debug!(
+            "⏱️ [SessionData::new] SessionWorker::spawn耗时: {:?}",
+            spawn_start.elapsed()
+        );
 
-        debug!("⏱️ [SessionData::new] 总创建耗时: {:?}", start_time.elapsed());
+        debug!(
+            "⏱️ [SessionData::new] 总创建耗时: {:?}",
+            start_time.elapsed()
+        );
         session
     }
 
-  
     pub async fn message_count(&self) -> usize {
         let (tx, rx) = oneshot::channel();
-        if self.command_tx.send(SessionCommand::MessageCount { ack: tx }).is_err() {
+        if self
+            .command_tx
+            .send(SessionCommand::MessageCount { ack: tx })
+            .is_err()
+        {
             warn!("⚠️ message_count 指令发送失败，worker 已退出");
             return 0;
         }
@@ -69,36 +86,50 @@ impl SessionData {
         buffer_size: usize,
     ) -> Result<(mpsc::Receiver<UnifiedSessionMessage>, CancellationToken)> {
         let start_time = std::time::Instant::now();
-        debug!("⏱️ [create_new_connection] 开始创建连接，buffer_size={}", buffer_size);
+        debug!(
+            "⏱️ [create_new_connection] 开始创建连接，buffer_size={}",
+            buffer_size
+        );
 
         let token_start = std::time::Instant::now();
         let cancellation_token = CancellationToken::new();
-        debug!("⏱️ [create_new_connection] CancellationToken创建耗时: {:?}", token_start.elapsed());
+        debug!(
+            "⏱️ [create_new_connection] CancellationToken创建耗时: {:?}",
+            token_start.elapsed()
+        );
 
         let channel_start = std::time::Instant::now();
         let (tx, rx) = mpsc::channel(buffer_size);
-        debug!("⏱️ [create_new_connection] mpsc channel创建耗时: {:?}", channel_start.elapsed());
+        debug!(
+            "⏱️ [create_new_connection] mpsc channel创建耗时: {:?}",
+            channel_start.elapsed()
+        );
 
         let setup_start = std::time::Instant::now();
-        // 🎯 极简优化：直接设置连接状态，无需命令传递
+        // 🛡️ 关键修复：使用 lock() 而非 try_lock()，确保连接一定被设置
+        // try_lock() 可能失败导致 current_sender 未设置，造成消息丢失
         {
             // 取消之前的连接
-            if let Ok(mut current_cancel_guard) = self.current_cancel.try_lock() {
-                if let Some(token) = current_cancel_guard.take() {
-                    token.cancel();
-                }
-                // 设置新的取消令牌
-                *current_cancel_guard = Some(cancellation_token.clone());
+            let mut current_cancel_guard = self.current_cancel.lock().await;
+            if let Some(token) = current_cancel_guard.take() {
+                token.cancel();
             }
+            // 设置新的取消令牌
+            *current_cancel_guard = Some(cancellation_token.clone());
 
             // 设置新的发送器
-            if let Ok(mut current_sender_guard) = self.current_sender.try_lock() {
-                *current_sender_guard = Some(tx.clone());
-            }
+            let mut current_sender_guard = self.current_sender.lock().await;
+            *current_sender_guard = Some(tx);
         }
-        debug!("⏱️ [create_new_connection] 连接状态设置耗时: {:?}", setup_start.elapsed());
+        debug!(
+            "⏱️ [create_new_connection] 连接状态设置耗时: {:?}",
+            setup_start.elapsed()
+        );
 
-        debug!("⏱️ [create_new_connection] 总连接创建耗时: {:?}", start_time.elapsed());
+        debug!(
+            "⏱️ [create_new_connection] 总连接创建耗时: {:?}",
+            start_time.elapsed()
+        );
         Ok((rx, cancellation_token))
     }
 
@@ -120,24 +151,24 @@ impl SessionData {
     /// 1. 触发 CancellationToken，让 SSE 流立即退出循环
     /// 2. 显式关闭 channel 发送端，让 rx.recv() 立即返回 None
     /// 3. 清空连接状态，防止新的消息被发送
-    pub fn close_current_connection(&self) {
+    pub async fn close_current_connection(&self) {
         // 🎯 主动触发取消令牌，关闭 SSE 连接
-        if let Ok(mut current_cancel_guard) = self.current_cancel.try_lock()
-            && let Some(token) = current_cancel_guard.take() {
-                info!("🔌 [SessionData] 主动触发CancellationToken，关闭SSE连接");
-                token.cancel();
-            }
+        let mut current_cancel_guard = self.current_cancel.lock().await;
+        if let Some(token) = current_cancel_guard.take() {
+            info!("🔌 [SessionData] 主动触发CancellationToken，关闭SSE连接");
+            token.cancel();
+        }
+        drop(current_cancel_guard);
 
         // 🎯 显式关闭 channel 发送端，让接收端立即感知到连接关闭
-        if let Ok(mut current_sender_guard) = self.current_sender.try_lock()
-            && let Some(_sender) = current_sender_guard.take() {
-                info!("🔌 [SessionData] 显式关闭channel发送端，让接收端立即断开");
-                // 当 Sender 被 drop 时，Receiver 的 recv() 会返回 None
-                // 这里通过 take() 将 sender 从 Option 中移除，触发 drop
-            }
+        let mut current_sender_guard = self.current_sender.lock().await;
+        if current_sender_guard.take().is_some() {
+            info!("🔌 [SessionData] 显式关闭channel发送端，让接收端立即断开");
+            // 当 Sender 被 drop 时，Receiver 的 recv() 会返回 None
+            // 这里通过 take() 将 sender 从 Option 中移除，触发 drop
+        }
     }
-
-    }
+}
 
 struct SessionWorker {
     max_size: usize,
@@ -155,7 +186,10 @@ impl SessionWorker {
         current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
     ) {
         let start_time = std::time::Instant::now();
-        debug!("⏱️ [SessionWorker::spawn] 开始创建SessionWorker，max_size={}", max_size);
+        debug!(
+            "⏱️ [SessionWorker::spawn] 开始创建SessionWorker，max_size={}",
+            max_size
+        );
 
         let worker = SessionWorker {
             max_size,
@@ -166,8 +200,14 @@ impl SessionWorker {
 
         let spawn_start = std::time::Instant::now();
         tokio::spawn(worker.run());
-        debug!("⏱️ [SessionWorker::spawn] tokio::spawn耗时: {:?}", spawn_start.elapsed());
-        debug!("⏱️ [SessionWorker::spawn] 总spawn耗时: {:?}", start_time.elapsed());
+        debug!(
+            "⏱️ [SessionWorker::spawn] tokio::spawn耗时: {:?}",
+            spawn_start.elapsed()
+        );
+        debug!(
+            "⏱️ [SessionWorker::spawn] 总spawn耗时: {:?}",
+            start_time.elapsed()
+        );
     }
 
     async fn run(mut self) {
@@ -194,14 +234,22 @@ impl SessionWorker {
                         }
                     }
 
-                    // 🚀 极简优化：直接从共享状态获取当前连接
-                    if let Ok(mut current_sender_guard) = self.current_sender.try_lock()
-                        && let Some(sender) = current_sender_guard.as_mut()
-                            && sender.try_send(message.clone()).is_err() {
-                                // 如果发送失败，可能是缓冲区满了或连接已关闭
-                                warn!("⚠️ SSE sender 发送失败，关闭实时推送");
-                                *current_sender_guard = None;
-                            }
+                    // 🛡️ 关键修复：使用 lock().await 确保消息一定被发送
+                    // try_lock() 可能失败导致消息丢失，造成 SSE 卡死
+                    let mut current_sender_guard = self.current_sender.lock().await;
+                    if let Some(sender) = current_sender_guard.as_mut() {
+                        if sender.try_send(message.clone()).is_err() {
+                            // 如果发送失败，可能是缓冲区满了或连接已关闭
+                            warn!("⚠️ SSE sender 发送失败，关闭实时推送");
+                            *current_sender_guard = None;
+                        }
+                    } else {
+                        // 连接不存在，跳过实时推送（记录为 info 级别，便于排查问题）
+                        info!(
+                            "📭 SSE sender 不存在，跳过实时推送（消息已缓存到 ring buffer）: message_type={:?}, sub_type={}",
+                            message.message_type, message.sub_type
+                        );
+                    }
                 }
                 SessionCommand::Clear { ack } => {
                     let mut cleared = 0usize;
@@ -235,9 +283,10 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
     let session_data = if let Some(session_data_ref) = SESSION_CACHE.get(session_id) {
         session_data_ref.clone()
     } else {
+        let unified_message = notify.to_unified_message();
         debug!(
-            "🚫 [push_session_update] session={} 不存在于 SESSION_CACHE 中，可能是 SSE 连接未建立",
-            session_id
+            "🚫 [push_session_update] session={} 不存在于 SESSION_CACHE 中，可能是 SSE 连接未建立，消息内容: message_type={:?}, sub_type={}",
+            session_id, unified_message.message_type, unified_message.sub_type
         );
         return Ok(());
     };
@@ -246,9 +295,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
 
     debug!(
         "📥 推送消息到缓存: session_id={}, message_type={:?}, sub_type={}",
-        session_id,
-        unified_message.message_type,
-        unified_message.sub_type
+        session_id, unified_message.message_type, unified_message.sub_type
     );
 
     session_data.push_message(unified_message);
@@ -262,7 +309,11 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
 ///
 /// 这个函数会自动确保project_id只对应一个活跃的session_id
 /// 当检测到session_id变化时，会自动清理旧session的数据
-pub async fn push_session_update_with_project(project_id: &str, session_id: &str, notify: SessionNotify) -> Result<()> {
+pub async fn push_session_update_with_project(
+    project_id: &str,
+    session_id: &str,
+    notify: SessionNotify,
+) -> Result<()> {
     // 确保project_id对应正确的session_id，如果变化则清理旧数据
     let cleared_count = ensure_project_session(project_id, session_id).await;
 
@@ -277,10 +328,9 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
     push_session_update(session_id, notify).await
 }
 
-
-
 /// 确保project_id对应正确的session_id
 ///
+/// 使用统一的 AGENT_REGISTRY 管理 project-session 映射
 /// 如果project_id对应的session_id发生变化，会自动清理旧session的数据
 /// 如果session_id相同，则不做任何操作
 ///
@@ -290,65 +340,58 @@ pub async fn push_session_update_with_project(project_id: &str, session_id: &str
 ///
 /// 返回值: 如果清理了旧数据则返回清理的消息数量，否则返回0
 pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize {
-    // 检查当前映射
-    let mapped_session_id = if let Some(entry) = PROJECT_SESSION_MAP.get(project_id) {
-        let mapped_session_id = entry.value().clone();
-        
-        // 如果session_id相同，不需要做任何操作
-        if mapped_session_id == session_id {
+    // 使用统一 Registry 检查当前映射
+    let mapped_session_id = AGENT_REGISTRY.get_session_by_project(project_id);
+
+    match mapped_session_id {
+        Some(mapped_sid) if mapped_sid == session_id => {
+            // session_id 相同，不需要做任何操作
             debug!(
                 "📋 Project session映射未变化: project_id={}, session_id={}",
                 project_id, session_id
             );
-            return 0;
+            0
         }
-        
-        // ⚠️ 关键修复：显式 drop entry，释放读锁，避免后续 insert 时的读写锁冲突
-        drop(entry);
-        
-        Some(mapped_session_id)
-    } else {
-        None
-    };
-    
-    // 如果有旧映射，处理 session 变化
-    if let Some(mapped_session_id) = mapped_session_id {
-        // session_id发生变化，需要清理旧session的数据
-        info!(
-            "🔄 检测到Project session变化: project_id={}, old_session_id={}, new_session_id={}",
-            project_id, mapped_session_id, session_id
-        );
-
-        // 清理旧session的数据 - 直接移除条目
-        let cleared_count = if SESSION_CACHE.remove(&mapped_session_id).is_some() {
-            1 // 移除了1个session
-        } else {
-            0 // session不存在
-        };
-
-        // 更新映射关系（现在可以安全获取写锁）
-        PROJECT_SESSION_MAP.insert(project_id.to_string(), session_id.to_string());
-
-        if cleared_count > 0 {
+        Some(old_session_id) => {
+            // session_id 发生变化，需要清理旧 session 的数据
             info!(
-                "🧹 已清理旧session数据并更新映射: project_id={}, old_session_id={}, new_session_id={}, cleared_count={}",
-                project_id, mapped_session_id, session_id, cleared_count
+                "🔄 检测到Project session变化: project_id={}, old_session_id={}, new_session_id={}",
+                project_id, old_session_id, session_id
             );
-        } else {
-            info!(
-                "📝 已更新Project session映射: project_id={}, old_session_id={}, new_session_id={}",
-                project_id, mapped_session_id, session_id
-            );
+
+            // 清理旧 session 的 SSE 数据
+            let cleared_count = if SESSION_CACHE.remove(&old_session_id).is_some() {
+                1 // 移除了1个session
+            } else {
+                0 // session不存在
+            };
+
+            // 更新 AGENT_REGISTRY 中的映射关系
+            let _ = AGENT_REGISTRY.update_session(project_id, session_id);
+
+            if cleared_count > 0 {
+                info!(
+                    "🧹 已清理旧session数据并更新映射: project_id={}, old_session_id={}, new_session_id={}, cleared_count={}",
+                    project_id, old_session_id, session_id, cleared_count
+                );
+            } else {
+                info!(
+                    "📝 已更新Project session映射: project_id={}, old_session_id={}, new_session_id={}",
+                    project_id, old_session_id, session_id
+                );
+            }
+
+            cleared_count
         }
-
-        cleared_count
-    } else {
-        // 第一次建立映射关系（无旧映射）
-        info!(
-            "🆕 建立新的Project session映射: project_id={}, session_id={}",
-            project_id, session_id
-        );
-        PROJECT_SESSION_MAP.insert(project_id.to_string(), session_id.to_string());
-        0
+        None => {
+            // 第一次建立映射关系（无旧映射）
+            // 注意：此时 AGENT_REGISTRY 中可能还没有这个 project 的记录
+            // 这种情况下不需要调用 update_session，因为 agent 注册时会调用 register
+            info!(
+                "🆕 Project session 首次出现: project_id={}, session_id={}",
+                project_id, session_id
+            );
+            0
+        }
     }
 }

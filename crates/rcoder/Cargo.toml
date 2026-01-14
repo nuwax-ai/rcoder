@@ -11,18 +11,27 @@ path = "src/lib.rs"
 
 [features]
 default = []
-codex = ["shared_types/codex", "dep:codex-acp-agent"]
+
+# 调试功能：启用 /debug/* 路由，用于开发和问题排查
+# 生产环境默认不启用，需要显式添加 --features debug
+debug = []
+
+# 🔧 eBPF 调试模式：启用容器特权，允许使用 eBPF 诊断工具
+# 警告：仅在开发调试时使用，生产环境请勿启用
+# 此 feature 会传递给 docker_manager crate
+ebpf-debug = ["docker_manager/ebpf-debug"]
 
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
 acp-adapter = { path = "../acp_adapter" }
-codex-acp-agent = { path = "../codex-acp-agent", optional = true }
-claude-code-agent = { path = "../claude-code-agent" }
-pingora-proxy = { path = "../pingora-proxy" }
-docker_manager = { path = "../docker_manager" }
+rcoder-proxy = { path = "../rcoder-proxy" }
 
-# codex-acp = { git = "https://github.com/soddygo/codex-acp-agent.git", branch = "feat-export-lib"}
+# 🚀 无锁配置热更新
+arc-swap = "1.8"
+docker_manager = { path = "../docker_manager" }
+duckdb_manager = { path = "../duckdb_manager" }
+rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
 # ACP Protocol
@@ -35,14 +44,19 @@ tempfile = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
+hyper = { version = "1.8", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 futures = { workspace = true }
 tokio-stream = "0.1"
 async-stream = "0.3"
 
+# gRPC Client
+tonic = { workspace = true }
+
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
+serde_yaml = "=0.9.33"
 
 derive_builder = { workspace = true }
 
@@ -61,13 +75,15 @@ tracing-appender = "0.2"
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }
+notify = { workspace = true }
 bytes = "1.0"
 futures-util = { workspace = true }
 piper = "0.2"
-base64 = "0.21"
-reqwest = { version = "0.11", features = ["json", "stream"] }
-url = "2.4"
+base64 = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
 bollard = "0.19"
+rustls = { workspace = true }
 
 # OpenTelemetry
 opentelemetry = { workspace = true }
@@ -86,5 +102,8 @@ utoipa-swagger-ui = { workspace = true }
 ringbuf = { workspace = true }
 
 # Random and hashing
-rand = "0.8"
-md5 = "0.7"
+rand = "0.9"
+md5 = "0.8"
+
+# Cache
+moka = { workspace = true }

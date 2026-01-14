@@ -1,19 +1,17 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["tmp/*", "crates/ai-agents"]
+exclude = ["tmp/*", "crates/ai-agents", "crates/codex-acp-agent"]
 resolver = "2"
 
-# 默认不编译 codex-acp-agent，只在启用 codex feature 时编译
 default-members = [
     "crates/rcoder",
     "crates/agent_runner",
     "crates/shared_types",
     "crates/docker_manager",
     "crates/acp_adapter",
-    "crates/claude-code-agent",
-    "crates/pingora-proxy",
+    "crates/rcoder-proxy",
+    "crates/duckdb_manager",
 ]
-
 
 
 [workspace.lints]
@@ -27,28 +25,18 @@ rust.allow_leading_underscore = "warn"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["soddy <soddygo@qq.com>"]
 license = "MIT OR Apache-2.0"
 description = "Rust-based AI agent framework"
 publish = false
 
 [workspace.dependencies]
 # ACP Protocol
-agent-client-protocol = "0.6"
+agent-client-protocol = { version = "0.9.3", features = ["unstable"] }
 
-# Codex dependencies (optional, enable with --features codex)
-codex-acp = { git = "https://github.com/soddygo/codex-acp.git", branch = "feat-add-args" }
-codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
-codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-
-# 如果上面的版本有问题，可以尝试使用 main 分支或指定 rev
-# codex-core = { git = "https://github.com/zed-industries/codex", branch = "main", optional = true }
-# codex-common = { git = "https://github.com/zed-industries/codex", branch = "main", features = ["cli"], optional = true }
-# codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "main", optional = true }
 piper = "0.2"
 
-clap= { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 
 # Async runtime
 tokio = { version = "1.48", features = ["full"] }
@@ -67,7 +55,10 @@ axum = { version = "0.8", features = [
 ] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+tonic = { version = "0.14.2", features = ["tls-native-roots"] }
 http = "1.0"
+http-body = "1.0"
+http-body-util = "0.1"
 
 # Database
 sqlx = { version = "0.8", features = [
@@ -76,12 +67,14 @@ sqlx = { version = "0.8", features = [
     "chrono",
     "uuid",
 ] }
+duckdb = { version = "1.4", features = ["bundled"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = "1.0.148"
 serde_json_lenient = "0.2"
-schemars = { version = "1.0", features = ["derive"] }
+schemars = { version = "1.2", features = ["derive"] }
+config = "0.15"
 
 # Error handling
 anyhow = "1.0"
@@ -93,11 +86,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"
 env_logger = "0.11"
 
-# OpenTelemetry
+# OpenTelemetry (统一使用 0.30 以兼容 tracing-opentelemetry)
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", features = [
+    "grpc-tonic",
+    "http-proto",
+] }
 tracing-opentelemetry = "0.31"
 axum-tracing-opentelemetry = "0.30"
+
+# Prometheus Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
 
 # UUID
 uuid = { version = "1.0", features = ["serde", "v4", "v7"] }
@@ -117,12 +118,14 @@ dashmap = "6.0"
 futures = "0.3"
 futures-util = "0.3"
 itertools = "0.14"
-bytes = "1.10"
+bytes = "1.11"
 # collections = "0.2"  # 这个包不存在
 
 
 url = "2.5" # 使用 crates.io 版本
 
+# TLS/Crypto
+rustls = { version = "0.23", features = ["ring"] }
 
 # Additional utilities
 indoc = "2.0"
@@ -132,15 +135,13 @@ handlebars = { version = "6.3", features = ["rust-embed"] }
 rust-embed = "8.0"
 zstd = "0.13"
 
-# acp 协议
-agent_client_protocol = "0.4"
 
 # 构建工具
 derive_builder = "0.20"
 
 # Zed 核心功能依赖
 libc = "0.2"
-nix = { version = "0.30.1", features = ["fs", "process", "term"] }
+nix = { version = "0.30.1", features = ["fs", "process", "term", "signal"] }
 unindent = "0.2"                                                   # 使用 crates.io 版本
 open = "5.0"                                                       # 使用 crates.io 版本
 git2 = "0.20.1"
@@ -151,18 +152,18 @@ tree-sitter-rust = "0.24"                                          # 使用 crat
 sha2 = "0.10"
 hex = "0.4"
 walkdir = "2.5"
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # 项目依赖 - 保留核心功能
 aho-corasick = "1.0"
 # askpass = "0.1"  # 这个包不存在
 base64 = "0.22"
 circular-buffer = "1.2"
-fancy-regex = "0.16"
+fancy-regex = "0.17"
 fuzzy = "0.0.1"
 globset = "0.4"
 image = "0.25"
-indexmap = "2.11"
+indexmap = "2.12"
 pathdiff = "0.2"
 postage = "0.5"
 regex = "1.0"
@@ -176,9 +177,9 @@ which = "8.0"
 
 
 # Dev dependencies for testing
-ctor = "0.5"
+ctor = "0.6"
 pretty_assertions = "1.4"
-tempfile = "3.8"
+tempfile = "3.24"
 rand = "0.9"
 tokio-test = "0.4"
 
@@ -188,7 +189,7 @@ dirs = "6.0"
 # Archive utilities
 flate2 = "1.0"
 tar = "0.4"
-zip = "6.0"
+zip = "7.0"
 
 utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
@@ -199,10 +200,22 @@ ringbuf = "0.4.8"
 
 diffy = { version = "0.4.2" }
 
-pingora = { version = "0.6", features = ["lb"] }
+pingora = { version = "0.6", features = ["lb", "rustls"] }
+pingora-core = { version = "0.6", features = ["rustls"] }
+pingora-http = "0.6"
+pingora-proxy = { version = "0.6", features = ["rustls"] }
+pingora-load-balancing = { version = "0.6", features = ["rustls"] }
+matchit = "0.9.1"
 structopt = "0.3"
 
-bollard={version = "0.19"}
+bollard = { version = "0.19.4" }
 
+# Cache library
+moka = { version = "0.12", features = ["future", "sync"] }
 
+# Internal crates
+rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 
+# Pyroscope Continuous Profiling
+pyroscope = "0.5"
+pyroscope_pprofrs = "0.2"

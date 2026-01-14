@@ -1,14 +1,21 @@
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
+    response::IntoResponse,
     routing::{get, post},
 };
-use dashmap::DashMap;
 use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
-use crate::{config::AppConfig, handler};
+use crate::{
+    config::{ApiKeyAuthConfig, AppConfig},
+    handler,
+    storage::ProjectAdapter,
+};
+use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -27,32 +34,111 @@ pub struct SessionInfo {
 pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
-    /// 活跃的会话映射, session_id -> ProjectAndContainerInfo,方便sse消息长连接,获取对应的agent所在容器服务
-    pub sessions: DashMap<String, Arc<ProjectAndContainerInfo>>,
-    /// 活跃的项目和容器映射, project_id -> ProjectAndContainerInfo
-    pub project_and_agent_map: DashMap<String, Arc<ProjectAndContainerInfo>>,
+    /// 项目适配器 - 统一管理项目、会话和容器数据（替代原有的 3 个 DashMap）
+    pub projects: ProjectAdapter,
     /// Pingora 代理服务引用（用于读取真实指标）
-    pub pingora_service: Option<Arc<pingora_proxy::PingoraProxyService>>,
+    pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+    /// gRPC 连接池（用于与 agent_runner 通信）
+    pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    /// 容器 IP 缓存（5秒 TTL，避免频繁调用 Docker API）
+    pub container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
+    /// 🆕 可热更新的 API Key 配置（使用 ArcSwap 实现无锁读取）
+    pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
 }
 
 impl AppState {
     pub fn new(
         config: AppConfig,
-        pingora: Option<Arc<pingora_proxy::PingoraProxyService>>,
-    ) -> Self {
-        Self {
+        pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+        api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
+    ) -> anyhow::Result<Self> {
+        let projects = ProjectAdapter::new()
+            .map_err(|e| anyhow::anyhow!("初始化 ProjectAdapter 失败: {}", e))?;
+
+        Ok(Self {
             config,
-            sessions: DashMap::new(),
-            project_and_agent_map: DashMap::new(),
+            projects,
             pingora_service: pingora,
+            grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
+            container_ip_cache: Arc::new(crate::grpc::ContainerIpCache::new(
+                crate::grpc::DEFAULT_CACHE_TTL_SECONDS,
+            )),
+            api_key_config,
+        })
+    }
+
+    // ========== 向后兼容的便捷方法 ==========
+
+    /// 获取项目信息（替代 project_and_agent_map.get）
+    #[inline]
+    pub fn get_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.projects.get(project_id)
+    }
+
+    /// 插入项目信息（替代 project_and_agent_map.insert）
+    #[inline]
+    pub fn insert_project(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) {
+        if let Err(e) = self.projects.insert(project_id.clone(), info) {
+            tracing::error!("插入项目 {} 失败: {}", project_id, e);
         }
+    }
+
+    /// 删除项目（替代 project_and_agent_map.remove）
+    #[inline]
+    pub fn remove_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.projects.remove(project_id)
+    }
+
+    /// 检查项目是否存在（替代 project_and_agent_map.contains_key）
+    #[inline]
+    pub fn contains_project(&self, project_id: &str) -> bool {
+        self.projects.contains_key(project_id)
+    }
+
+    /// 通过会话ID获取项目信息（替代 sessions.get）
+    #[inline]
+    pub fn get_by_session(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.projects.get_by_session_id(session_id)
+    }
+
+    /// 通过会话ID获取容器名称（用于容器重启后的容器查询）
+    ///
+    /// 与 `get_container_id_by_session` 不同，返回稳定的 `container_name`。
+    /// 即使容器被重建，container_name 保持不变，可直接通过 Docker API 查询容器状态。
+    #[inline]
+    pub fn get_container_name_by_session(&self, session_id: &str) -> Option<String> {
+        self.projects.get_container_name_by_session(session_id)
+    }
+
+    /// 更新会话信息
+    #[inline]
+    pub fn update_session(&self, project_id: &str, session_id: &str) {
+        if let Err(e) = self.projects.update_session(project_id, session_id) {
+            tracing::error!(
+                "更新会话失败: project_id={}, session_id={}, error={}",
+                project_id,
+                session_id,
+                e
+            );
+        }
+    }
+
+    /// 更新项目活动时间，返回实际更新使用的时间戳
+    #[inline]
+    pub fn update_activity(&self, project_id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.projects.update_activity(project_id)
+    }
+
+    /// 更新会话活动时间
+    #[inline]
+    pub fn update_session_activity(&self, session_id: &str) {
+        self.projects.update_session_activity(session_id);
     }
 }
 
 /// 创建 Axum 路由
-pub fn create_router(state: Arc<AppState>) -> Router {
+pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>>) -> Router {
     let api_routes = Router::new()
-        .route("/health", get(handler::health_check))
         .route("/chat", post(handler::handle_chat))
         // Axum SSE 代理处理器，直接返回 SSE 流
         .route(
@@ -64,23 +150,135 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/agent/status/{project_id}", get(handler::agent_status))
         .with_state(state.clone());
 
+    // Computer Agent Runner 路由
+    let computer_routes = Router::new()
+        .route("/computer/chat", post(handler::handle_computer_chat))
+        .route("/computer/agent/stop", post(handler::computer_agent_stop))
+        .route(
+            "/computer/agent/status",
+            post(handler::computer_agent_status),
+        ) // 🆕 新增
+        .route(
+            "/computer/agent/session/cancel",
+            post(handler::computer_agent_session_cancel),
+        )
+        // 进度流复用现有的 agent_session_notification
+        .route(
+            "/computer/progress/{session_id}",
+            get(handler::agent_session_notification),
+        )
+        // computer agent 专用进度流接口（使用与 agent_session_notification 相同的逻辑）
+        .route(
+            "/computer/agent/progress/{session_id}",
+            get(handler::computer_agent_progress_notification),
+        )
+        // VNC 桌面访问说明接口
+        .route(
+            "/computer/desktop/{user_id}/{project_id}",
+            get(handler::computer_desktop_vnc),
+        )
+        // Pod 容器管理接口
+        .route("/computer/pod/count", get(handler::pod_count))
+        .route("/computer/pod/list", get(handler::pod_list))
+        .route("/computer/pod/ensure", post(handler::pod_ensure))
+        .route("/computer/pod/keepalive", post(handler::pod_keepalive))
+        .route("/computer/pod/restart", post(handler::pod_restart))
+        .route("/computer/pod/status", get(handler::pod_status))
+        .route("/computer/pod/vnc-status", get(handler::pod_vnc_status))
+        // 🆕 音频代理路由（用于 OpenAPI 文档）
+        .route(
+            "/computer/audio/{user_id}/{project_id}/{*path}",
+            get(handler::computer_audio_proxy),
+        )
+        // 🆕 IME 代理路由（用于 OpenAPI 文档）
+        .route(
+            "/computer/ime/{user_id}/{project_id}/{*path}",
+            get(handler::computer_ime_proxy),
+        )
+        .with_state(state.clone());
+
     // Pingora 代理 API 路由（用于文档和状态查询）
     let proxy_api_routes = Router::new()
         .route("/proxy/status", get(handler::proxy_status))
         .route("/proxy/stats", get(handler::proxy_stats))
         .route("/proxy/config", get(handler::proxy_config))
-        .route("/proxy", get(handler::proxy_with_query_params))
-        .route("/proxy/{port}", get(handler::proxy_to_port))
-        .route(
-            "/proxy/{port}/{*path}",
-            get(handler::proxy_to_port_with_path),
-        )
         .with_state(state.clone());
 
-    Router::new()
+    // 调试路由（仅用于开发和问题排查，需要 feature flag "debug" 启用）
+    #[cfg(feature = "debug")]
+    let debug_routes = Router::new()
+        .route("/debug/sql", post(handler::debug_sql_query))
+        .route("/debug/projects", get(handler::debug_list_projects))
+        .route("/debug/containers", get(handler::debug_list_containers))
+        .route("/debug/storage/stats", get(handler::debug_storage_stats))
+        .with_state(state.clone());
+
+    // 健康检查路由
+    let health_routes = Router::new()
+        .route("/health", get(handler::health_check))
+        .with_state(state.clone());
+
+    let mut router = Router::new()
+        .merge(health_routes)
         .merge(api_routes)
-        .merge(proxy_api_routes)
+        .merge(computer_routes)
+        .merge(proxy_api_routes);
+
+    // 仅在启用 debug feature 时添加调试路由
+    #[cfg(feature = "debug")]
+    {
+        router = router.merge(debug_routes);
+    }
+
+    // 添加 /metrics 端点（如果启用了 Prometheus）
+    if let Some(ref guard) = telemetry {
+        let guard_clone = Arc::clone(guard);
+        router = router.route(
+            "/metrics",
+            get(move || {
+                let guard = Arc::clone(&guard_clone);
+                async move { metrics_handler(guard).await }
+            }),
+        );
+    }
+
+    // 🆕 克隆共享的 API Key 配置用于中间件
+    let api_key_config = Arc::clone(&state.api_key_config);
+
+    router
         .merge(create_swagger_ui())
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
+        .layer(HttpMetricsLayer::new()) // 🆕 HTTP 指标中间件
+        // 🆕 添加 API Key 鉴权中间件（支持热更新）
+        .layer(axum::middleware::from_fn(move |req, next| {
+            crate::middleware::api_key_middleware::api_key_middleware_handler(
+                Arc::clone(&api_key_config),
+                req,
+                next,
+            )
+        }))
+}
+
+/// Prometheus 指标处理器
+async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
+    match telemetry.render_metrics() {
+        Some(metrics) => (
+            axum::http::StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            metrics,
+        ),
+        None => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            "Prometheus metrics not enabled".to_string(),
+        ),
+    }
 }
 
 /// OpenAPI 文档结构
@@ -93,6 +291,22 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         handler::agent_session_cancel,
         handler::agent_stop,
         handler::agent_status,
+        handler::handle_computer_chat,
+        handler::computer_agent_stop,
+        handler::computer_agent_status, // 🆕 新增
+        handler::computer_agent_session_cancel,
+        handler::computer_agent_progress_notification,
+        handler::computer_desktop_vnc,
+        handler::computer_desktop_proxy,
+        handler::computer_audio_proxy,
+        handler::computer_ime_proxy,
+        handler::pod_count,
+        handler::pod_list,
+        handler::pod_ensure,
+        handler::pod_keepalive,
+        handler::pod_restart,
+        handler::pod_status,
+        handler::pod_vnc_status,
         // Pingora 代理接口
         handler::proxy_status,
         handler::proxy_stats,
@@ -108,6 +322,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             handler::ChatRequest,
             shared_types::ChatResponse,
             handler::StopAgentResponse,
+            handler::CancelResponse,
             // 移除 SessionUpdateEvent，因为现在使用 ProxyRedirectResponse
             handler::ProxyErrorResponse,
             // 模型配置相关结构体
@@ -117,6 +332,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             // Agent状态相关结构体
             shared_types::AgentStatusResponse,
             shared_types::AgentStatus,
+            handler::SessionNotificationParams,
+            // SSE 进度事件结构体（用于文档）
+            handler::ProgressEventDoc,
+            handler::SseErrorEvent,
             // 附件相关结构体
             shared_types::Attachment,
             shared_types::AttachmentSource,
@@ -128,6 +347,36 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             // 会话消息相关结构体
             shared_types::UnifiedSessionMessage,
             shared_types::SessionMessageType,
+            // Computer Agent 相关结构体
+            handler::ComputerChatRequest,
+            handler::ComputerAgentStopRequest,
+            handler::ComputerAgentStopResponse,
+            handler::ComputerAgentStatusRequest,  // 🆕 新增
+            handler::ComputerAgentStatusResponse, // 🆕 新增
+            handler::DesktopPathParams,
+            handler::VncProxyPathParams,
+            handler::AudioProxyPathParams,
+            handler::ImeProxyPathParams,
+            handler::DesktopAccessResponse,
+            handler::DesktopErrorResponse,
+            // Pod 容器管理相关结构体
+            handler::PodCountResponse,
+            handler::PodCountByServiceType,
+            handler::PodListQuery,
+            handler::PodListResponse,
+            handler::PodDetailInfo,
+            handler::EnsurePodRequest,
+            handler::PodResourceLimits,
+            handler::EnsurePodResponse,
+            handler::PodContainerInfo,
+            handler::KeepalivePodRequest,
+            handler::KeepalivePodResponse,
+            handler::RestartPodRequest,
+            handler::RestartPodResponse,
+            handler::PodStatusQuery,
+            handler::PodStatusResponse,
+            handler::VncStatusQuery,
+            handler::VncStatusResponse,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,
@@ -146,6 +395,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         (name = "system", description = "系统健康检查和状态监控接口"),
         (name = "chat", description = "AI 聊天对话接口，支持多媒体内容"),
         (name = "agent", description = "AI 代理会话管理和实时通知接口"),
+        (name = "computer", description = "Computer Agent 桌面与聊天接口"),
+        (name = "pod", description = "Pod 容器管理接口，支持容器监控、启动和保活"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
     ),
     info(
@@ -172,7 +423,11 @@ RCoder AI 服务 API
 
 ## Pingora 代理功能
 
-- **端口路由**: `/proxy/{port}/{path}` - 动态路由到任意端口的后端服务
+- **VNC 代理**: `/computer/vnc/{user_id}/{project_id}/{*path}` - 代理到容器的 noVNC 服务（端口 6080）
+  - 路径示例：`/computer/vnc/user_123/proj_456/vnc.html` - VNC 桌面页面
+  - WebSocket：`/computer/vnc/user_123/proj_456/websockify` - VNC 连接
+- **端口路由**: `/proxy/{port}/{*path}` - 动态路由到任意端口的后端服务
+  - 支持两种方式：直接访问 Pingora 端口 或 通过 API 重定向
 - **负载均衡**: 支持 Round Robin 算法和健康检查
 - **动态发现**: 自动发现和添加后端服务，无需预配置
 - **高性能**: 基于 Rust 异步 I/O 的高性能代理
@@ -182,14 +437,14 @@ RCoder AI 服务 API
 1. 调用 `/chat` 接口发送对话请求
 2. 通过 `/agent/progress/{session_id}` 建立 SSE 连接接收实时更新
 3. 可随时通过 `/agent/session/cancel` 取消正在执行的任务
-4. 使用 `/proxy/{port}/{path}` 代理请求到任意后端服务
+4. 直接访问 Pingora 代理路径或使用管理接口
 
 ## 代理接口示例
 
 - `GET /proxy/status` - 查看代理服务状态
-- `GET /proxy/3000/api/users` - 代理到端口 3000 的服务
-- `GET /proxy/8080/health` - 代理到端口 8080 的健康检查
 - `GET /proxy/stats` - 查看代理统计信息
+- `GET /proxy/config` - 查看代理配置信息
+- 直接访问 `http://{host}:{pingora_port}/proxy/{port}/{path}` - 使用 Pingora 代理服务
 "#,
         title = "RCoder AI API",
         version = "1.0.0",
@@ -201,7 +456,7 @@ RCoder AI 服务 API
         )
     ),
     servers(
-        (url = "http://localhost:3000", description = "本地开发环境"),
+        (url = "http://localhost:8087", description = "本地开发环境"),
         (url = "https://api.rcoder.com", description = "生产环境"),
         (url = "https://staging-api.rcoder.com", description = "测试环境")
     )

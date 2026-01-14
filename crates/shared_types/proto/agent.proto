@@ -1,0 +1,327 @@
+syntax = "proto3";
+package agent;
+
+// Agent 核心服务
+service AgentService {
+  // 聊天对话接口 (Unary)
+  rpc Chat(ChatRequest) returns (ChatResponse);
+
+  // 订阅会话进度流 (Server Streaming)
+  // 替代原有的 /agent/progress/{session_id} SSE 接口
+  rpc SubscribeProgress(ProgressRequest) returns (stream ProgressEvent);
+
+  // 取消会话任务 (Unary)
+  rpc CancelSession(CancelRequest) returns (CancelResponse);
+
+  // 获取 Agent 状态 (Unary)
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // 停止特定 project_id 的 Agent (Unary)
+  // 用于 ComputerAgentRunner 模式：停止单个项目的 Agent，不销毁容器
+  rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
+
+  // 查询容器状态 (Unary)
+  // 专门用于容器生命周期管理，返回容器活跃状态和任务信息
+  rpc GetContainerStatus(GetContainerStatusRequest) returns (GetContainerStatusResponse);
+
+  // 查询 VNC 服务状态 (Unary)
+  // 用于检测容器内 VNC/noVNC 服务是否已启动就绪
+  rpc GetVncStatus(GetVncStatusRequest) returns (GetVncStatusResponse);
+}
+
+// === ChatRequest/Response ===
+
+message ChatRequest {
+  string project_id = 1;
+  string session_id = 2;
+  string prompt = 3;
+  // 模型配置
+  optional ModelProviderConfig model_config = 4;
+  // 附件列表
+  repeated Attachment attachments = 5;
+  // 请求ID
+  optional string request_id = 6;
+  // 数据源附件 (JSON 字符串数组)
+  repeated string data_source_attachments = 7;
+
+  // === 新增字段 (v2) ===
+  // 系统提示词（可选，覆盖默认配置）
+  optional string system_prompt = 8;
+  // 用户提示词模板（可选，支持 {user_prompt} 变量替换）
+  optional string user_prompt = 9;
+  // Agent 运行时配置（可选，包含 Agent 服务器和 MCP 服务器配置）
+  optional ChatAgentConfig agent_config = 10;
+  // 服务类型（可选，"RCoder" 或 "ComputerAgentRunner"，默认 "RCoder"）
+  optional string service_type = 11;
+  // 用户ID（可选，ComputerAgentRunner 模式必填）
+  optional string user_id = 12;
+}
+
+message ChatResponse {
+  string project_id = 1;
+  string session_id = 2;
+  bool success = 3;
+  optional string error = 4;
+  optional string request_id = 5;
+  optional string error_code = 6; // 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
+
+  // 🆕 Resume 失败标识 (用于 rcoder 层降级处理)
+  bool need_fallback = 7; // true 表示需要降级重试
+  optional string fallback_reason = 8; // 降级原因：如 "session_not_found"
+}
+
+// === Progress Streaming ===
+
+message ProgressRequest {
+  string session_id = 1;
+}
+
+// ProgressEvent 进度事件（简化版：完全透传 ACP JSON）
+//
+// 设计理念：不再尝试映射 ACP 到固定的事件类型，而是直接透传 ACP 消息的 JSON
+// 优势：
+// 1. 零字段丢失：完整保留 ACP 结构
+// 2. 零维护成本：ACP 协议更新时后端无需修改
+// 3. 前端灵活性：前端可按需解析任意字段
+message ProgressEvent {
+  // 消息主类型：SessionPromptStart, SessionPromptEnd, AgentSessionUpdate, Heartbeat
+  string message_type = 1;
+  // 消息子类型：agent_message_chunk, tool_call, plan, end_turn 等
+  string sub_type = 2;
+  // ACP 消息的完整 JSON 载荷
+  string payload = 3;
+  // 可选的请求 ID，用于关联请求和响应
+  optional string request_id = 4;
+  // 时间戳 (使用 Unix timestamp，单位：毫秒)
+  int64 timestamp = 11;
+}
+
+// === Cancel Session ===
+
+message CancelRequest {
+  string session_id = 1; // 可选，为空时使用 project_id 查找
+  string reason = 2;
+  string project_id = 3; // 用于按项目取消（当 session_id 为空时）
+}
+
+// 取消结果类型（对应 Rust CancelResult）
+enum CancelResultType {
+  CANCEL_RESULT_UNSPECIFIED = 0;
+  CANCEL_RESULT_SUCCESS = 1;
+  CANCEL_RESULT_FAILED = 2;
+  CANCEL_RESULT_TIMEOUT = 3;
+}
+
+message CancelResponse {
+  bool success = 1;
+  CancelResultType result = 2;
+  optional string message = 3;
+}
+
+// === Get Status ===
+
+message GetStatusRequest {
+  string project_id = 1;
+  string session_id = 2; // 新增：支持通过 session_id 查询
+}
+
+message GetStatusResponse {
+  string status = 1; // "idle", "busy", "error"
+  bool is_found = 2; // Agent 是否存在于 Registry
+}
+
+// === Stop Agent ===
+
+message StopAgentRequest {
+  // 项目 ID (必填)
+  string project_id = 1;
+  // 可选的停止原因
+  optional string reason = 2;
+  // 是否强制停止（不等待当前任务完成）
+  bool force = 3;
+}
+
+message StopAgentResponse {
+  bool success = 1;
+  // 停止结果：stopped, not_found, already_stopped, error
+  string result = 2;
+  // 可选的详细消息
+  optional string message = 3;
+  // 被停止的 Agent 的项目 ID
+  string project_id = 4;
+}
+
+// === Model Provider Config ===
+
+message ModelProviderConfig {
+  // 模型配置唯一标识（必须保留原始值，用于会话复用判断）
+  string id = 1;
+  // 提供商名称 (如: glm, anthropic, openai, qwen)
+  string provider = 2;
+  // 默认模型名称
+  string model = 3;
+  // API 密钥
+  optional string api_key = 4;
+  // API 基础 URL
+  optional string api_base = 5;
+  // 是否需要 OpenAI 兼容的认证
+  optional bool requires_openai_auth = 6;
+  // 模型接口协议类型 (anthropic/openai)
+  optional string api_protocol = 7;
+}
+
+// === Attachment 相关定义 ===
+
+// 附件数据源
+message AttachmentSource {
+  oneof source {
+    string file_path = 1; // 文件路径
+    Base64Data base64 = 2; // Base64 编码数据
+    string url = 3; // URL 链接
+  }
+}
+
+message Base64Data {
+  string data = 1;
+  string mime_type = 2;
+}
+
+// 图像尺寸
+message ImageDimensions {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+// 文本附件
+message TextAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  optional string filename = 3;
+  optional string description = 4;
+}
+
+// 图像附件
+message ImageAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional ImageDimensions dimensions = 6;
+}
+
+// 音频附件
+message AudioAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional double duration = 6; // 时长（秒）
+}
+
+// 文档附件
+message DocumentAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional uint64 size = 6; // 文件大小（字节）
+}
+
+// 附件枚举（使用 oneof 区分类型）
+message Attachment {
+  oneof attachment_type {
+    TextAttachment text = 1;
+    ImageAttachment image = 2;
+    AudioAttachment audio = 3;
+    DocumentAttachment document = 4;
+  }
+}
+
+// === Chat Agent 配置 (v2) ===
+
+// Agent 运行时配置
+message ChatAgentConfig {
+  // 单个 Agent 服务器配置（可选）
+  optional ChatAgentServerConfig agent_server = 1;
+  // MCP 服务器配置（多个）
+  map<string, ChatContextServerConfig> context_servers = 2;
+}
+
+// 单个 Agent 服务器配置
+message ChatAgentServerConfig {
+  // Agent 标识符（可选，默认 "claude-code-acp"）
+  optional string agent_id = 1;
+  // 执行命令
+  optional string command = 2;
+  // 命令参数
+  repeated string args = 3;
+  // 环境变量
+  map<string, string> env = 4;
+  // 元数据
+  map<string, string> metadata = 5;
+}
+
+// MCP 服务器配置
+message ChatContextServerConfig {
+  // 服务器来源类型: "custom" 或 "local"
+  string source = 1;
+  // 是否启用
+  bool enabled = 2;
+  // 执行命令 (如 "bunx", "uvx", "npx")
+  optional string command = 3;
+  // 命令参数
+  repeated string args = 4;
+  // 环境变量
+  map<string, string> env = 5;
+}
+
+// === Get Container Status ===
+
+// 容器状态查询请求
+message GetContainerStatusRequest {
+  // 用户ID
+  string user_id = 1;
+  // 项目ID
+  string project_id = 2;
+}
+
+// 容器状态响应
+message GetContainerStatusResponse {
+  // 容器是否活跃（有活跃任务）
+  bool is_active = 1;
+  // 活跃任务数
+  int32 active_tasks = 2;
+  // 容器运行时长（秒）
+  int64 uptime_seconds = 3;
+  // 状态描述：Active, Idle, Processing
+  string status = 4;
+  // 可选：CPU 使用率（百分比，0-100）
+  optional double cpu_percent = 5;
+  // 可选：内存使用（MB）
+  optional int64 memory_mb = 6;
+}
+
+// === Get VNC Status ===
+
+// VNC 状态查询请求
+message GetVncStatusRequest {
+  // 用户ID（可选，用于日志记录）
+  optional string user_id = 1;
+  // 项目ID（可选，用于日志记录）
+  optional string project_id = 2;
+}
+
+// VNC 状态响应
+message GetVncStatusResponse {
+  // VNC 是否已就绪（x11vnc 进程 + 5900 端口）
+  bool vnc_ready = 1;
+  // noVNC 是否已就绪（6080 端口）
+  bool novnc_ready = 2;
+  // 状态描述消息
+  string message = 3;
+  // 容器启动时间（秒）
+  int64 uptime_seconds = 4;
+}

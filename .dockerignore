@@ -19,6 +19,14 @@ project_workspace/
 logs/
 *.log
 
+# Docker 相关（排除其他 Dockerfile 和运行时文件）
+docker/project_workspace/
+docker/logs/
+docker/specs/
+docker/rcoder-agent-runner/
+docker/computer-cache/
+docker/computer-project-workspace/
+
 # 测试文件
 tests/
 test_*.sh

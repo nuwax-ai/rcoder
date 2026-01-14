@@ -1,26 +1,20 @@
 mod acp_agent;
-pub mod agent_service;
-pub mod agent_stop_handle;
-mod channel_utils;
-mod claude_code_agent;
 pub mod cleanup_task;
-#[cfg(feature = "codex")]
-mod codex_agent;
 
-use crate::CancelNotificationRequest;
+use crate::CancelNotificationRequestWrapper;
 use crate::{
     model::{AgentSessionUpdate, SessionNotify},
-    service::push_session_update,
+    service::{AGENT_REGISTRY, push_session_update},
 };
-pub use acp_agent::{LocalSetAgentRequest, PROJECT_AND_AGENT_INFO_MAP, agent_worker};
+// 导出 agent_worker 相关类型和函数
+pub use acp_agent::{LocalSetAgentRequest, agent_worker, agent_worker_with_heartbeat};
+use agent_abstraction::launcher::AgentStopHandleArc;
 use agent_client_protocol::{Client, PermissionOptionKind, PromptRequest, SessionId};
 use dashmap::DashMap;
 use std::sync::LazyLock;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
-
-use crate::proxy_agent::agent_stop_handle::AgentStopHandleArc;
 
 /// 会话级别的 request_id 上下文映射（project_id -> request_id）
 /// 用于在 session_notification 回调中获取当前请求的 request_id
@@ -34,13 +28,14 @@ pub struct AcpConnectionInfo {
     pub session_id: SessionId,
     /// 用于发送 Prompt 的通道
     pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    /// 用于发送取消通知的通道
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequest>,
+    /// 用于发送取消通知的通道（使用新类型）
+    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
     /// Agent停止句柄（将被包装为守卫并放入 ProjectAndAgentInfo）
     pub stop_handle: Option<AgentStopHandleArc>,
 }
 
-/// ACP 客户端实现[derive(Clone)]
+/// ACP 客户端实现
+#[derive(Clone, Default)]
 pub struct AcpAgentClient;
 
 #[async_trait::async_trait(?Send)]
@@ -63,18 +58,16 @@ impl Client for AcpAgentClient {
             })
             .or_else(|| args.options.first());
         if let Some(option) = selected {
-            return Ok(agent_client_protocol::RequestPermissionResponse {
-                outcome: agent_client_protocol::RequestPermissionOutcome::Selected {
-                    option_id: option.id.clone(),
-                },
-                meta: None,
-            });
+            return Ok(agent_client_protocol::RequestPermissionResponse::new(
+                agent_client_protocol::RequestPermissionOutcome::Selected(
+                    agent_client_protocol::SelectedPermissionOutcome::new(option.option_id.clone()),
+                ),
+            ));
         }
         // 无可选项则取消
-        Ok(agent_client_protocol::RequestPermissionResponse {
-            outcome: agent_client_protocol::RequestPermissionOutcome::Cancelled,
-            meta: None,
-        })
+        Ok(agent_client_protocol::RequestPermissionResponse::new(
+            agent_client_protocol::RequestPermissionOutcome::Cancelled,
+        ))
     }
 
     async fn write_text_file(
@@ -96,7 +89,7 @@ impl Client for AcpAgentClient {
             error!("写入文件失败: {}", e);
             agent_client_protocol::Error::internal_error()
         })?;
-        Ok(agent_client_protocol::WriteTextFileResponse { meta: None })
+        Ok(agent_client_protocol::WriteTextFileResponse::new())
     }
 
     async fn read_text_file(
@@ -108,10 +101,7 @@ impl Client for AcpAgentClient {
             error!("读取文件失败: {}", e);
             agent_client_protocol::Error::internal_error()
         })?;
-        Ok(agent_client_protocol::ReadTextFileResponse {
-            content,
-            meta: None,
-        })
+        Ok(agent_client_protocol::ReadTextFileResponse::new(content))
     }
 
     async fn create_terminal(
@@ -174,12 +164,10 @@ impl Client for AcpAgentClient {
 
         // 如果 SessionNotification.meta 中没有 request_id，则通过 session_id 查找 project_id，再从 SESSION_REQUEST_CONTEXT 获取
         let request_id = request_id_from_notification.or_else(|| {
-            // 从 PROJECT_AND_AGENT_INFO_MAP 中找到对应的 project_id
-            PROJECT_AND_AGENT_INFO_MAP
-                .iter()
-                .find(|entry| entry.value().session_id.to_string() == session_id_str)
-                .and_then(|entry| {
-                    let project_id = entry.key().clone();
+            // 使用统一 Registry 的 O(1) 反向查询（替代旧的 O(n) 遍历）
+            AGENT_REGISTRY
+                .get_project_by_session(&session_id_str)
+                .and_then(|project_id| {
                     // 使用 project_id 从 SESSION_REQUEST_CONTEXT 获取 request_id
                     SESSION_REQUEST_CONTEXT.get(&project_id).map(|entry| {
                         let req_id = entry.value().clone();
@@ -225,6 +213,8 @@ impl Client for AcpAgentClient {
                         resource_link.uri.clone()
                     }
                     agent_client_protocol::ContentBlock::Resource(_) => "<resource>".into(),
+                    // 处理未来可能添加的新内容类型
+                    _ => "<unknown>".into(),
                 };
                 info!(
                     "📥 Agent message cached [session:{}]: {}",

@@ -4,6 +4,7 @@ services:
     image: ${RCODER_IMAGE:-master-rcoder:latest}
     ports:
       - "${RCODER_PORT:-8087}:${RCODER_PORT:-8087}"
+      - "8088:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）
     environment:
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8087}
@@ -13,12 +14,18 @@ services:
     volumes:
       # 挂载 Docker socket
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+      # 🎯 挂载本地测试配置文件（使用与主容器相同的镜像）
+      - ./config.yml:/app/config.yml
       # 挂载项目工作目录 - 这是关键的挂载！
       - ./project_workspace:/app/project_workspace
+      # 挂载 computer 项目工作目录
+      - ./computer-project-workspace:/app/computer-project-workspace
       # 挂载工作目录
       - ./logs/:/app/logs
       # 挂载启动脚本
       - ./start-rcoder.sh:/app/start-rcoder.sh
+      # 专门用于npm,pnpm,bun,uvx 缓存使用的目录
+      - ./computer-cache:/root/.cache
     command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8087/health"]
@@ -28,8 +35,70 @@ services:
       start_period: 60s
     restart: always
     networks:
-      - agent-network
+      - local-agent-network
+
+  # Pyroscope Server - 持续剖析数据存储和可视化
+  pyroscope:
+    image: grafana/pyroscope:latest
+    container_name: rcoder-pyroscope
+    ports:
+      - "4040:4040"  # Web UI
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - pyroscope-data:/data
+    command:
+      - server
+    restart: unless-stopped
+    networks:
+      - local-agent-network
+
+  # Prometheus Server - 时序数据库，存储常规指标
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rcoder-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9091:9090"  # 宿主机 9091 → 容器 9090（避免端口冲突）
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - local-agent-network
+    restart: unless-stopped
+
+  # Grafana - 可视化平台
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rcoder-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - TZ=Asia/Shanghai
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - local-agent-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  pyroscope-data:
+  prometheus-data:
+  grafana-data:
 
 networks:
-  agent-network:
+  local-agent-network:
     driver: bridge

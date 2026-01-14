@@ -2,7 +2,12 @@
 
 pub use shared_types::{
     // Agent model exports
-    AgentType, AgentStatus, AgentStatusResponse, ProjectAndAgentInfo, CancelNotificationRequest, CancelNotificationResponse,
+    AgentStatus, AgentStatusResponse, ProjectAndAgentInfo,
+    // 取消相关类型（新类型优先）
+    CancelNotificationRequestWrapper, CancelResult,
+    // 旧类型保留兼容性（deprecated）
+    CancelNotificationRequest,
+    CancelNotificationResponse,
     // Session and message exports
     Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
     ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,

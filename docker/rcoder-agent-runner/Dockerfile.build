@@ -1,0 +1,36 @@
+# 独立的构建 Dockerfile - 仅用于构建 agent_runner 二进制
+# 使用 debian:12 作为基础镜像，确保 GLIBC 版本与运行环境一致
+
+FROM debian:12
+
+# 设置工作目录
+WORKDIR /build
+
+# 安装系统依赖和 Rust 工具链（这些层会被缓存）
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    cmake \
+    pkg-config \
+    protobuf-compiler \
+    libprotobuf-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Rust 1.90（这一层会被缓存）
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.90.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 🎯 代码哈希标记：只有当 CRATES_HASH 变化时，以下步骤才会重新执行
+# 这样可以缓存上面的系统依赖和 Rust 安装
+ARG CRATES_HASH=unknown
+RUN echo "Code hash: ${CRATES_HASH}"
+
+# 复制 Cargo.toml 和 Cargo.lock
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
+ARG CARGO_FLAGS=""
+RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
+    cargo build --release --bin agent_runner ${CARGO_FLAGS}

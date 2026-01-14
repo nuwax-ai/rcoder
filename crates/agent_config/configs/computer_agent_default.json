@@ -1,0 +1,89 @@
+{
+  "agent_servers": {
+    "claude-code-acp": {
+      "agent_id": "claude-code-acp",
+      "agent_type": "claude",
+      "command": "claude-code-acp",
+      "args": [],
+      "env": {
+        "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}",
+        "ANTHROPIC_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
+        "ANTHROPIC_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
+        "RUST_LOG": "info"
+      },
+      "system_prompt": {
+        "source": "embedded",
+        "template": "",
+        "enabled": true
+      },
+      "user_prompt": {
+        "template": "{user_prompt}",
+        "enabled": false
+      },
+      "installation": {
+        "package_manager": "npm",
+        "package_name": "@zed-industries/claude-code-acp",
+        "version": "latest"
+      },
+      "enabled": true,
+      "metadata": {
+        "description": "Claude Code ACP Agent - Computer Agent Runner configuration",
+        "version": "1.0.0",
+        "service_type": "ComputerAgentRunner"
+      }
+    }
+  },
+  "context_servers": {
+    "chrome-devtools": {
+      "source": "custom",
+      "enabled": false,
+      "command": "mcp-proxy",
+      "args": ["convert", "http://127.0.0.1:18099"],
+      "env": {},
+      "metadata": {
+        "description": "Chrome DevTools MCP - 通过共享的 MCP Proxy 服务连接浏览器自动化",
+        "note": "使用 mcp-proxy convert 连接容器启动时自动运行的共享 chrome-devtools-mcp 服务，多个 agent 复用同一个浏览器实例，加快启动速度",
+        "proxy_url": "http://127.0.0.1:18099",
+        "capabilities": [
+          "browser_automation",
+          "page_navigation",
+          "dom_manipulation",
+          "screenshot",
+          "chinese_input_method"
+        ]
+      }
+    },
+    "context7": {
+      "source": "custom",
+      "enabled": false,
+      "command": "bunx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "env": {}
+    },
+    "puppeteer": {
+      "source": "custom",
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-puppeteer"],
+      "env": {
+        "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium"
+      },
+      "metadata": {
+        "description": "Puppeteer MCP - Alternative browser automation (disabled by default)",
+        "note": "Enable this if chrome-devtools doesn't meet your needs"
+      }
+    }
+  },
+  "metadata": {
+    "config_name": "computer_agent_default",
+    "description": "Computer Agent Runner 专用配置 - 支持桌面环境和浏览器自动化",
+    "version": "1.0.0",
+    "service_type": "ComputerAgentRunner",
+    "features": {
+      "desktop_environment": "XFCE4 + noVNC",
+      "browser": "Chromium with CDP",
+      "vnc_port": 6080,
+      "cdp_port": 9222
+    }
+  }
+}

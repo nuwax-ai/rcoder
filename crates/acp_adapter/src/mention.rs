@@ -305,7 +305,8 @@ impl ResourceUri {
                 let mut url = if let Some(path) = path {
                     Url::from_file_path(path).expect("path should be absolute")
                 } else {
-                    let mut url = Url::parse("rcoder:///").unwrap();
+                    let mut url =
+                        Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                     url.set_path("/untitled-buffer");
                     url
                 };
@@ -317,13 +318,15 @@ impl ResourceUri {
                 url
             }
             ResourceUri::Thread { name, id } => {
-                let mut url = Url::parse("rcoder:///").unwrap();
+                let mut url =
+                    Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                 url.set_path(&format!("/thread/{}", id));
                 url.query_pairs_mut().append_pair("name", name);
                 url
             }
             ResourceUri::TextThread { path, name } => {
-                let mut url = Url::parse("rcoder:///").unwrap();
+                let mut url =
+                    Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                 url.set_path(&format!(
                     "/text-thread/{}",
                     path.to_string_lossy().trim_start_matches('/')
@@ -336,7 +339,8 @@ impl ResourceUri {
                 tool_name,
                 status,
             } => {
-                let mut url = Url::parse("rcoder:///").unwrap();
+                let mut url =
+                    Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                 url.set_path(&format!("/tool-call/{}", id));
                 url.query_pairs_mut().append_pair("tool_name", tool_name);
                 url.query_pairs_mut().append_pair("status", status);
@@ -347,7 +351,8 @@ impl ResourceUri {
                 command,
                 status,
             } => {
-                let mut url = Url::parse("rcoder:///").unwrap();
+                let mut url =
+                    Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                 url.set_path(&format!("/terminal/{}", id));
                 url.query_pairs_mut().append_pair("command", command);
                 url.query_pairs_mut().append_pair("status", status);
@@ -355,12 +360,14 @@ impl ResourceUri {
             }
             ResourceUri::Web { url } => url.clone(),
             ResourceUri::PastedImage { id } => {
-                let mut url = Url::parse("rcoder:///").unwrap();
+                let mut url =
+                    Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                 url.set_path(&format!("/pasted-image/{}", id));
                 url
             }
             ResourceUri::Buffer { id, name, language } => {
-                let mut url = Url::parse("rcoder:///").unwrap();
+                let mut url =
+                    Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                 url.set_path(&format!("/buffer/{}", id));
                 url.query_pairs_mut().append_pair("name", name);
                 if let Some(lang) = language {
@@ -369,7 +376,8 @@ impl ResourceUri {
                 url
             }
             ResourceUri::Rule { id, name, category } => {
-                let mut url = Url::parse("rcoder:///").unwrap();
+                let mut url =
+                    Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                 url.set_path(&format!("/rule/{}", id));
                 url.query_pairs_mut().append_pair("name", name);
                 if let Some(cat) = category {
@@ -381,7 +389,8 @@ impl ResourceUri {
                 repo_path,
                 resource_type,
             } => {
-                let mut url = Url::parse("rcoder:///").unwrap();
+                let mut url =
+                    Url::parse("rcoder:///").expect("static rcoder URL should always parse");
                 url.set_path(&format!("/git/{}", repo_path.to_string_lossy()));
                 match resource_type {
                     GitResourceType::Commit { hash } => {

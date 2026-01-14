@@ -1,0 +1,56 @@
+# ============================================================================
+# 快速测试 Dockerfile - 验证 Alloy 安装逻辑
+# ============================================================================
+FROM debian:12
+
+WORKDIR /test
+
+# ============================================================================
+# 测试参数传递
+# ============================================================================
+ARG INSTALL_ALLOY=true
+ARG ALLOY_VERSION=v1.12.2
+
+RUN echo "🔍 INSTALL_ALLOY = [$INSTALL_ALLOY]"
+RUN echo "🔍 ALLOY_VERSION = [$ALLOY_VERSION]"
+
+# ============================================================================
+# 测试 Grafana Alloy 安装（与主 Dockerfile 相同的逻辑）
+# ============================================================================
+RUN if [ "$INSTALL_ALLOY" = "true" ]; then \
+        echo "📦 安装 Grafana Alloy ${ALLOY_VERSION}..."; \
+        apt-get update && \
+        apt-get install -y wget ca-certificates && \
+        echo "检测系统架构..."; \
+        ARCH=$(dpkg --print-architecture); \
+        echo "系统架构: $${ARCH}"; \
+        ALLOY_VER=${ALLOY_VERSION}; \
+        ALLOY_VER_NUM=$${ALLOY_VER#v}; \
+        echo "Alloy 版本: $${ALLOY_VER}"; \
+        echo "Alloy 版本号: $${ALLOY_VER_NUM}"; \
+        if [ "$${ARCH}" = "amd64" ] || [ "$${ARCH}" = "arm64" ]; then \
+            echo "下载 Alloy deb 包 ($${ARCH})..."; \
+            wget -qO- "https://github.com/grafana/alloy/releases/download/$${ALLOY_VER}/alloy-$${ALLOY_VER_NUM}-1.$${ARCH}.deb" > /tmp/alloy.deb && \
+            echo "下载完成，文件大小: $$(ls -lh /tmp/alloy.deb | awk '{print $5}')"; \
+        else \
+            echo "❌ 不支持的架构: $${ARCH}"; \
+            exit 1; \
+        fi && \
+        echo "安装 Alloy..."; \
+        dpkg -i /tmp/alloy.deb; \
+        echo "修复依赖..."; \
+        apt-get install -y -f; \
+        rm /tmp/alloy.deb && \
+        echo "验证 Alloy 安装..."; \
+        alloy --version; \
+    else \
+        echo "⚠️  Alloy 未安装"; \
+    fi
+
+# ============================================================================
+# 最终验证
+# ============================================================================
+RUN echo "=== 最终验证 ===" && \
+    which alloy && echo "✅ alloy 已安装" || echo "❌ alloy 未安装"
+
+CMD ["/bin/bash"]
