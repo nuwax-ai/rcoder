@@ -234,6 +234,11 @@ impl ReaperState {
                         debug!("[ProcessReaper] ptrace 系统调用: PID={}", pid);
                         continue;
                     }
+                    // 非Linux平台忽略 ptrace 相关状态（macOS 上 WaitStatus 包含这些变体但不会实际触发）
+                    Ok(_) => {
+                        debug!("[ProcessReaper] 忽略的 waitpid 状态");
+                        continue;
+                    }
                     Err(nix::errno::Errno::ECHILD) => {
                         // 没有子进程
                         break;
