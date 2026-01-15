@@ -2,6 +2,13 @@
 //!
 //! 基于 project_id 管理 ACP 会话的核心模块。
 //!
+//! ## SACP 迁移说明
+//!
+//! 本模块已迁移至 SACP 实现：
+//! - 移除了 `Client` trait 泛型参数（SACP 内部处理）
+//! - 简化了 `create_session` 参数（不再需要 client 和 shared_api_key_manager）
+//! - 使用标准 tokio::spawn（无需 LocalSet）
+//!
 //! ## 职责范围
 //!
 //! 1. **会话生命周期管理**
@@ -21,9 +28,8 @@
 //!
 //! ## 架构说明
 //!
-//! 使用依赖注入的 `SessionRegistry` 进行会话存储，消除了之前的重复数据结构：
-//! - 之前：`AcpSessionManager.sessions` 和 `AGENT_REGISTRY` 各自维护一份会话数据
-//! - 现在：统一使用注入的 `SessionRegistry`（通常是 `AGENT_REGISTRY`）
+//! 使用依赖注入的 `SessionRegistry` 进行会话存储：
+//! - 统一使用注入的 `SessionRegistry`（通常是 `AGENT_REGISTRY`）
 //!
 //! ## 与 Worker 的协作
 //!
@@ -35,29 +41,16 @@
 //! AcpSessionManager
 //!       │
 //!       │ 2. 通过 SessionRegistry 获取/创建会话
-//!       │ 3. 通过 ClaudeCodeLauncher 启动 Agent
+//!       │ 3. 通过 SacpClaudeCodeLauncher 启动 Agent
 //!       ▼
 //! SessionRegistry (注入的 AGENT_REGISTRY)
 //! ```
-//!
-//! ## 模型配置变化检测
-//!
-//! 当检测到模型配置变化时，会自动重启 Agent 会话：
-//! - 比较 `model_provider.id` 是否变化
-//! - 变化时移除旧会话，创建新会话
-//!
-//! ## 会话健康检查
-//!
-//! 复用会话前会检查 `prompt_tx.is_closed()`：
-//! - 如果 channel 已关闭，说明 Agent 进程已退出
-//! - 此时会移除失效会话并重新创建
 
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
-use dashmap::DashMap;
-
-use agent_client_protocol::{Client, ContentBlock, PromptRequest, SessionId, TextContent};
+// 使用 SACP 类型
+use sacp::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;
@@ -70,7 +63,7 @@ use crate::PromptMessage;
 use crate::launcher::ClaudeCodeLauncher;
 use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 
-/// ACP 会话管理器
+/// ACP 会话管理器 (SACP 版本)
 ///
 /// 管理所有活跃的 ACP 会话，提供：
 /// - 会话创建和复用
@@ -79,19 +72,15 @@ use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 ///
 /// ## 泛型参数
 /// - `N`: SessionNotifier 实现，用于推送 SSE 消息
-/// - `C`: ACP Client 实现
 /// - `R`: SessionRegistry 实现，用于存储会话数据（通常是 AGENT_REGISTRY）
-pub struct AcpSessionManager<N: SessionNotifier, C: Client + 'static, R: SessionRegistry> {
+pub struct AcpSessionManager<N: SessionNotifier, R: SessionRegistry> {
     /// 会话注册表（注入的 SessionRegistry）
     registry: Arc<R>,
     /// 会话通知器
     notifier: Arc<N>,
-    /// Client 类型标记（phantom data）
-    _client_marker: std::marker::PhantomData<C>,
 }
 
-impl<N: SessionNotifier, C: Client + Default + 'static, R: SessionRegistry>
-    AcpSessionManager<N, C, R>
+impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpSessionManager<N, R>
 where
     R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
 {
@@ -104,7 +93,6 @@ where
         Self {
             registry,
             notifier,
-            _client_marker: std::marker::PhantomData,
         }
     }
 
@@ -250,12 +238,15 @@ where
         Ok(PromptRequest::new(session_id, content_blocks).meta(meta))
     }
 
-    /// 创建新的 Agent 会话
+    /// 创建新的 Agent 会话 (SACP 版本)
     ///
-    /// 启动 Agent 进程并建立 ACP 连接
+    /// 启动 Agent 进程并建立 SACP 连接
     ///
     /// # 参数
-    /// - `shared_api_key_manager`: 共享的 API 密钥管理器（用于自动清理）
+    /// - `project_id`: 项目 ID
+    /// - `project_path`: 项目路径
+    /// - `model_provider`: 模型提供者配置
+    /// - `start_config`: Agent 启动配置
     /// - `service_uuid`: 与此 Agent 关联的唯一 UUID
     ///
     /// # 返回值
@@ -267,13 +258,11 @@ where
         _session_id_hint: Option<String>,
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
-        client: C,
-        shared_api_key_manager: Option<Arc<DashMap<String, shared_types::ModelProviderConfig>>>,
         service_uuid: Option<String>,
     ) -> Result<R::Entry> {
         info!("开始创建新的 Agent 会话，项目 ID: {}", project_id);
 
-        // 创建启动器
+        // 创建 SACP 启动器
         let launcher = ClaudeCodeLauncher::new(self.notifier.clone());
 
         // 记录是否使用了 resume（仅用于日志）
@@ -285,7 +274,7 @@ where
             );
         }
 
-        // 启动 Agent，不再内部降级
+        // 启动 Agent (SACP 版本)
         // 如果 resume 失败，直接返回错误，让上层（rcoder）决定是否降级重试
         let connection_info = launcher
             .launch(
@@ -293,17 +282,14 @@ where
                 project_path.clone(),
                 model_provider.clone(),
                 start_config.clone(),
-                client,
                 self.registry.clone(),
-                shared_api_key_manager,
-                None,  // project_uuid_map 清理由 agent_runner 层负责
                 service_uuid,
             )
             .await?;
 
         info!(
             "✅ Agent 会话创建成功，会话 ID: {}",
-            connection_info.session_id.0
+            connection_info.session_id
         );
 
         // 创建 ProjectAndAgentInfo
@@ -324,24 +310,23 @@ where
         };
 
         // 存储会话信息到 registry
-        let session_id_str = connection_info.session_id.0.to_string();
+        let session_id_str = connection_info.session_id.to_string();
         self.registry
             .insert(&project_id, &session_id_str, agent_info.clone().into());
-
-        // 注意：降级处理已移至 launch() 的 spawn_local 块内
-        // 通过 tokio::select! 在 LocalSet 中直接处理降级，避免跨线程问题
-        // 详见 crates/agent_abstraction/src/launcher/claude_code.rs
 
         // 返回刚插入的条目
         Ok(agent_info.into())
     }
 
-    /// 获取或创建会话
+    /// 获取或创建会话 (SACP 版本)
     ///
     /// 如果会话已存在且模型配置未变化，则复用；否则创建新会话
     ///
     /// # 参数
-    /// - `shared_api_key_manager`: 共享的 API 密钥管理器（用于自动清理）
+    /// - `project_id`: 项目 ID
+    /// - `project_path`: 项目路径
+    /// - `model_provider`: 模型提供者配置
+    /// - `start_config`: Agent 启动配置
     /// - `service_uuid`: 与此 Agent 关联的唯一 UUID
     ///
     /// # 返回值
@@ -354,8 +339,6 @@ where
         session_id_hint: Option<String>,
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
-        client: C,
-        shared_api_key_manager: Option<Arc<DashMap<String, shared_types::ModelProviderConfig>>>,
         service_uuid: Option<String>,
     ) -> Result<(R::Entry, bool)> {
         // 检查是否存在
@@ -377,9 +360,7 @@ where
                         session_id_hint,
                         model_provider,
                         start_config,
-                        client,
-                        shared_api_key_manager.clone(),
-                        service_uuid.clone(),
+                        service_uuid,
                     )
                     .await?;
                 return Ok((new_session, true)); // true = 新创建
@@ -403,9 +384,7 @@ where
                         session_id_hint,
                         model_provider,
                         start_config,
-                        client,
-                        shared_api_key_manager.clone(),
-                        service_uuid.clone(),
+                        service_uuid,
                     )
                     .await?;
                 return Ok((new_session, true)); // true = 新创建
@@ -423,8 +402,6 @@ where
                 session_id_hint,
                 model_provider,
                 start_config,
-                client,
-                shared_api_key_manager,
                 service_uuid,
             )
             .await?;
@@ -468,8 +445,8 @@ where
     }
 }
 
-impl<N: SessionNotifier, C: Client + Default + 'static, R: SessionRegistry> std::fmt::Debug
-    for AcpSessionManager<N, C, R>
+impl<N: SessionNotifier + 'static, R: SessionRegistry> std::fmt::Debug
+    for AcpSessionManager<N, R>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpSessionManager")

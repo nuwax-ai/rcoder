@@ -1,6 +1,13 @@
-//! # Agent Abstraction Layer
+//! # Agent Abstraction Layer (SACP 版本)
 //!
 //! 此 crate 提供 Agent 管理的抽象接口，是 RCoder 架构的中间层。
+//!
+//! ## SACP 迁移说明
+//!
+//! 本模块已迁移至 SACP (Symposium ACP) 实现：
+//! - **移除 Client trait**: `AcpSessionManager<N, R>` 不再需要 `Client` 泛型参数
+//! - **支持 Send trait**: 可使用标准 `tokio::spawn`，无需 `LocalSet`
+//! - **简化架构**: 移除了 channel handler，SACP 内部使用回调处理
 //!
 //! ## 架构位置
 //!
@@ -18,7 +25,7 @@
 //! |------|------|---------|
 //! | [`traits`] | 核心抽象接口定义 | `SessionRegistry`, `SessionNotifier` |
 //! | [`session`] | 会话管理和 Worker 抽象 | `AcpSessionManager`, `AcpAgentWorker` |
-//! | [`launcher`] | Agent 启动和生命周期管理 | `ClaudeCodeLauncher` |
+//! | [`launcher`] | Agent 启动和生命周期管理 | `SacpClaudeCodeLauncher` |
 //! | [`acp`] | ACP 协议连接抽象 | `CancelResult` |
 //!
 //! ## Trait 实现指南
@@ -28,14 +35,14 @@
 //! - [`SessionRegistry`] → `agent_runner::service::AgentSessionRegistry` (全局 `AGENT_REGISTRY`)
 //! - [`SessionNotifier`] → `agent_runner::service::SseSessionNotifier`
 //!
-//! ### 使用模式
+//! ### 使用模式 (SACP)
 //!
 //! ```ignore
 //! // 在 agent_runner 中：
 //! // 1. 实现 SessionRegistry trait
 //! impl SessionRegistry for AgentSessionRegistry { ... }
 //!
-//! // 2. 通过依赖注入传入 AcpSessionManager
+//! // 2. 通过依赖注入传入 AcpSessionManager（不再需要 Client 类型参数）
 //! let session_manager = AcpSessionManager::new(
 //!     Arc::new(notifier),      // SessionNotifier 实现
 //!     AGENT_REGISTRY.clone(),  // SessionRegistry 实现
@@ -45,7 +52,7 @@
 //! ## 设计模式
 //!
 //! - **依赖反转（DIP）**: Trait 在此定义，实现在上层 crate
-//! - **泛型参数**: `AcpSessionManager<N, C, R>` 支持可插拔实现
+//! - **泛型参数**: `AcpSessionManager<N, R>` 支持可插拔实现
 //! - **RAII**: 通过 `AgentLifecycleGuard` 管理 Agent 资源生命周期
 //!
 //! ## 与 AGENT_REGISTRY 的关系

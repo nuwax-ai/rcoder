@@ -1,6 +1,7 @@
 //! Agent trait definition.
 
-use agent_client_protocol::McpServer;
+// SACP 类型导入
+use sacp::schema::McpServer;
 
 /// Agent 启动配置
 ///

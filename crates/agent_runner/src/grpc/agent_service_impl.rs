@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::{CancelNotification, SessionId};
+use sacp::schema::{CancelNotification, SessionId};
 use shared_types::ModelProviderConfig;
 use shared_types::grpc::{
     CancelRequest, CancelResponse, CancelResultType, ChatAgentConfig as GrpcChatAgentConfig,
@@ -29,7 +29,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::model::AgentStatus;
-use crate::proxy_agent::LocalSetAgentRequest;
+use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
 use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
@@ -433,7 +433,7 @@ impl AgentService for AgentServiceImpl {
 
         // 创建请求并设置 UUID 和密钥管理器
         let (local_task_request, chat_prompt_rx) =
-            LocalSetAgentRequest::new(prompt_message, model_provider);
+            AgentRequest::new(prompt_message, model_provider);
         let local_task_request = local_task_request
             .with_service_uuid(service_uuid)
             .with_key_manager(Some(self.app_state.shared_api_key_manager.clone()));
@@ -604,7 +604,7 @@ impl AgentService for AgentServiceImpl {
                                 info!("📡 [gRPC] Session 连接被取消，发送 SessionPromptEnd: session_id={}", session_id_clone);
 
                                 // ✅ 在断开连接之前，主动发送 SessionPromptEnd 消息
-                                use agent_client_protocol::StopReason;
+                                use sacp::schema::StopReason;
                                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -889,7 +889,7 @@ impl AgentService for AgentServiceImpl {
                 if is_success {
                     // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端任务已取消
                     use crate::service::push_session_update_with_project;
-                    use agent_client_protocol::StopReason;
+                    use sacp::schema::StopReason;
                     use shared_types::{SessionNotify, SessionPromptEnd};
 
                     let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -975,7 +975,7 @@ impl AgentService for AgentServiceImpl {
 
                 // 通道关闭说明 Agent 处理线程已崩溃或退出，发送 SessionPromptEnd
                 use crate::service::push_session_update_with_project;
-                use agent_client_protocol::StopReason;
+                use sacp::schema::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -1013,7 +1013,7 @@ impl AgentService for AgentServiceImpl {
 
                 // 🆕 超时时主动清理资源，确保一致性
                 use crate::service::push_session_update_with_project;
-                use agent_client_protocol::StopReason;
+                use sacp::schema::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 // 1. 发送 SessionPromptEnd 通知
@@ -1202,7 +1202,7 @@ impl AgentService for AgentServiceImpl {
             // 🆕 即使已在停止中，也要发送 SessionPromptEnd 确保前端收到结束消息
             if !session_id.is_empty() {
                 use crate::service::push_session_update_with_project;
-                use agent_client_protocol::StopReason;
+                use sacp::schema::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -1246,7 +1246,7 @@ impl AgentService for AgentServiceImpl {
             // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端 Agent 已停止
             if !session_id.is_empty() {
                 use crate::service::push_session_update_with_project;
-                use agent_client_protocol::StopReason;
+                use sacp::schema::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -1419,7 +1419,7 @@ impl AgentService for AgentServiceImpl {
                         // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端 Agent 已停止
                         {
                             use crate::service::push_session_update_with_project;
-                            use agent_client_protocol::StopReason;
+                            use sacp::schema::StopReason;
                             use shared_types::{SessionNotify, SessionPromptEnd};
 
                             let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -1552,7 +1552,7 @@ impl AgentService for AgentServiceImpl {
                     // 通道关闭说明 Agent 处理线程已崩溃或退出，发送 SessionPromptEnd
                     {
                         use crate::service::push_session_update_with_project;
-                        use agent_client_protocol::StopReason;
+                        use sacp::schema::StopReason;
                         use shared_types::{SessionNotify, SessionPromptEnd};
 
                         let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {

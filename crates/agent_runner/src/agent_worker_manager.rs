@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
-use crate::proxy_agent::LocalSetAgentRequest;
+use crate::proxy_agent::AgentRequest;
 
 /// Worker 状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub struct Heartbeat {
 
 /// Worker 就绪信号
 ///
-/// Worker 在 LocalSet 初始化完成后发送此信号
+/// Worker 在初始化完成后发送此信号
 #[derive(Clone, Debug)]
 pub struct WorkerReady {
     /// 就绪时间戳
@@ -78,7 +78,7 @@ impl Clone for WorkerHandle {
 /// 负责管理 sender 的状态和心跳检测
 pub struct AgentWorkerManager {
     /// 当前任务发送器（使用 ArcSwap 支持无锁原子替换）
-    sender: ArcSwap<Option<mpsc::UnboundedSender<LocalSetAgentRequest>>>,
+    sender: ArcSwap<Option<mpsc::UnboundedSender<AgentRequest>>>,
 
     /// 状态广播通道
     state_tx: watch::Sender<WorkerState>,
@@ -112,7 +112,7 @@ impl AgentWorkerManager {
         oneshot::Sender<WorkerReady>,
     ) {
         // 创建初始的 sender（None，表示尚未设置）
-        let sender: ArcSwap<Option<mpsc::UnboundedSender<LocalSetAgentRequest>>> =
+        let sender: ArcSwap<Option<mpsc::UnboundedSender<AgentRequest>>> =
             ArcSwap::from_pointee(None);
 
         let (state_tx, _state_rx) = watch::channel(WorkerState::Starting);
@@ -132,7 +132,7 @@ impl AgentWorkerManager {
     }
 
     /// 获取当前 sender 的克隆
-    pub fn get_sender(&self) -> Option<mpsc::UnboundedSender<LocalSetAgentRequest>> {
+    pub fn get_sender(&self) -> Option<mpsc::UnboundedSender<AgentRequest>> {
         self.sender.load().as_ref().clone()
     }
 
@@ -163,14 +163,14 @@ impl AgentWorkerManager {
     }
 
     /// 设置初始 sender（由 main.rs 调用）
-    pub fn set_sender(&self, sender: &mpsc::UnboundedSender<LocalSetAgentRequest>) {
+    pub fn set_sender(&self, sender: &mpsc::UnboundedSender<AgentRequest>) {
         self.sender.store(Arc::new(Some(sender.clone())));
     }
 
     /// 尝试发送任务
     ///
     /// 增加通道关闭检查，避免 worker 崩溃后发送失败卡住
-    pub async fn try_send(&self, request: LocalSetAgentRequest) -> anyhow::Result<()> {
+    pub async fn try_send(&self, request: AgentRequest) -> anyhow::Result<()> {
         let sender = self
             .get_sender()
             .ok_or_else(|| anyhow::anyhow!("Worker sender 不可用"))?;
@@ -232,7 +232,7 @@ impl AgentWorkerManager {
     /// 🔥 替换 sender（用于重启 worker）
     ///
     /// 当 worker 崩溃重启时，需要替换为新的通道 sender
-    pub fn replace_sender(&self, new_sender: mpsc::UnboundedSender<LocalSetAgentRequest>) {
+    pub fn replace_sender(&self, new_sender: mpsc::UnboundedSender<AgentRequest>) {
         self.sender.store(Arc::new(Some(new_sender)));
         info!("🔄 [AgentWorkerManager] Sender 已替换");
     }

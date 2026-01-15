@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 设置初始 sender 到 worker_manager（传递引用）
     worker_manager.set_sender(&local_task_sender);
 
-    // 🔥 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
+    // 🔥 在独立 OS 线程中启动多线程 tokio 运行时，驻留运行 agent_worker
     let _worker_thread = std::thread::spawn(move || {
         let _ = run_agent_worker_thread(local_task_receiver, worker_handle);
     });
@@ -278,11 +278,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// 🔥 新增：agent_worker 线程启动函数
 ///
-/// 🆕 改进：使用多线程运行时 + 每个请求独立的 LocalSet
-/// 支持并发处理多个 Agent 请求，避免单线程阻塞
-/// 因为 ACP 连接不是 Send，每个请求在独立的 LocalSet 中运行
+/// 🆕 改进：使用多线程运行时支持并发处理多个 Agent 请求
+/// SACP 版本支持 Send trait，可直接在 tokio::spawn 中运行
 fn run_agent_worker_thread(
-    receiver: tokio::sync::mpsc::UnboundedReceiver<proxy_agent::LocalSetAgentRequest>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<proxy_agent::AgentRequest>,
     handle: agent_worker_manager::WorkerHandle,
 ) -> anyhow::Result<()> {
     info!("🚀 [agent_worker_thread] 线程启动，创建多线程运行时以支持并发 Agent...");
@@ -292,12 +291,12 @@ fn run_agent_worker_thread(
         .thread_name("agent-worker")
         .enable_all()
         .build()
-        .expect("Failed to build multi-thread runtime for LocalSet agents");
+        .expect("Failed to build multi-thread runtime for agents");
 
     rt.block_on(async move {
         info!("🚀 [agent_worker_thread] 多线程运行时已启动，准备并发处理 Agent 请求...");
 
-        // 🆕 不再使用全局 LocalSet，改为每个请求创建独立的 LocalSet
+        // 🆕 SACP 版本支持 Send trait，可直接使用 tokio::spawn 处理请求
         // 直接调用 agent_worker_with_heartbeat，它会为每个请求 spawn 独立任务
         match proxy_agent::agent_worker_with_heartbeat(receiver, handle).await {
             Ok(_) => {

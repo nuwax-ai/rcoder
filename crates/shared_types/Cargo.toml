@@ -14,6 +14,9 @@ serde.workspace = true
 serde_json.workspace = true
 dashmap = { workspace = true }
 uuid.workspace = true
+# ACP Protocol - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
+sacp = { workspace = true }
+# ACP Protocol - 官方库（迁移过程中保留）
 agent-client-protocol.workspace = true
 chrono.workspace = true
 

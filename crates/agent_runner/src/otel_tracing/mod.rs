@@ -57,11 +57,11 @@ pub fn init_tracing(config: TraceConfig) -> anyhow::Result<()> {
 /// 请求追踪 Guard（自动管理 span 生命周期）
 ///
 /// 使用 `OpenTelemetrySpanExt` 支持动态属性设置
+///
+/// 注意：此结构体实现 Send + Sync，可在 tokio::spawn 中安全使用
 pub struct RequestSpan {
     /// 底层 tracing span（用于 OpenTelemetrySpanExt 方法）
     span: Span,
-    /// span 的 guard（自动关闭）
-    _guard: Option<span::EnteredSpan>,
 }
 
 impl RequestSpan {
@@ -81,8 +81,6 @@ impl RequestSpan {
             operation = %operation,
         );
 
-        let guard = span.clone().entered();
-
         info!(
             "📍 [OTel] Span 已创建: project_id={}, request_id={}, operation={}",
             project_id, request_id, operation
@@ -90,7 +88,6 @@ impl RequestSpan {
 
         Self {
             span,
-            _guard: Some(guard),
         }
     }
 
@@ -202,20 +199,16 @@ impl RequestSpan {
         self.span.context()
     }
 
-    /// 完成 span（手动关闭，也可等待 Drop 自动关闭）
-    pub fn finish(mut self) {
+    /// 完成 span（手动关闭）
+    pub fn finish(self) {
         self.set_ok();
-        if let Some(guard) = self._guard.take() {
-            drop(guard);
-        }
+        // span 在 drop 时会自动关闭
     }
 }
 
 impl Drop for RequestSpan {
     fn drop(&mut self) {
-        if self._guard.is_some() {
-            info!("📍 [OTel] Span 已自动关闭");
-        }
+        info!("📍 [OTel] Span 已关闭");
     }
 }
 
@@ -250,24 +243,19 @@ pub fn child_span(_parent: &RequestSpan, name: &str, attributes: &[(&str, String
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    let guard = span.clone().entered();
-
     info!("📍 [OTel] 子 Span 已创建: {}", name);
 
     RequestSpan {
         span,
-        _guard: Some(guard),
     }
 }
 
 /// 从上下文中提取当前 span（用于跨线程传递）
 pub fn current_span() -> RequestSpan {
     let span = Span::current();
-    let guard = span.clone().entered();
 
     RequestSpan {
         span,
-        _guard: Some(guard),
     }
 }
 
@@ -299,11 +287,8 @@ pub fn span_with_attributes(name: &str, attributes: &[(&str, String)]) -> Reques
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    let guard = span.clone().entered();
-
     RequestSpan {
         span,
-        _guard: Some(guard),
     }
 }
 
