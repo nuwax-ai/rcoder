@@ -8,14 +8,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use dashmap::DashMap;
-
 use agent_client_protocol::{
     Agent, Client, ClientSideConnection, Implementation, InitializeRequest, McpServer,
     McpServerStdio, NewSessionRequest, PromptRequest, SessionId,
 };
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
+use process_wrap::tokio::{CommandWrap, ProcessGroup};
+use dashmap::DashMap;
 use shared_types::{AgentLifecycle, ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
@@ -509,31 +509,34 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                 *value = value.replace("{SERVICE_UUID}", uuid);
             }
         }
-        let mut child = tokio::process::Command::new(command_path)
-            .args(&spawn_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .current_dir(&project_path_for_closure)
-            .envs(merged_envs)
-            .spawn()
-            .context("无法启动 claude-code-acp 子进程")?;
+        // 启动子进程（使用 process group 来管理整个进程树）
+        // 使用 ProcessGroup::leader() 创建真正的进程组，确保能够清理所有孙进程
+        let mut child = CommandWrap::with_new(&command_path, |cmd| {
+            cmd.args(&spawn_args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .current_dir(&project_path_for_closure);
+            cmd.envs(&merged_envs);
+        })
+        .wrap(ProcessGroup::leader())
+        .spawn()
+        .context("无法启动 claude-code-acp 子进程")?;
 
         let child_pid = child.id().unwrap_or(0);
         info!("Claude Code ACP 子进程已启动，PID: {}", child_pid);
 
-        // 获取 stdio 句柄
+        // 获取 stdio 句柄（process_wrap 使用方法访问 stdio）
         let stdin = child
-            .stdin
+            .stdin()
             .take()
             .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdin"))?;
         let stdout = child
-            .stdout
+            .stdout()
             .take()
             .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stdout"))?;
         let stderr = child
-            .stderr
+            .stderr()
             .take()
             .ok_or_else(|| anyhow::anyhow!("无法获取子进程 stderr"))?;
 

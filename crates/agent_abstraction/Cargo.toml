@@ -63,5 +63,8 @@ serde = { workspace = true }
 # Unix 信号处理
 nix = { workspace = true, features = ["signal"] }
 
+# 进程组管理（用于清理整个进程树）
+process-wrap = { version = "9.0", features = ["tokio1", "process-group"] }
+
 [dev-dependencies]
 tempfile = "3.8"

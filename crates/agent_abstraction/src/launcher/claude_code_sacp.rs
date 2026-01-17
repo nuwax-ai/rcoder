@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
+use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -389,25 +390,27 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         }
 
-        // 启动子进程
-        let mut child = tokio::process::Command::new(&command_path)
-            .args(&command_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .current_dir(&project_path)
-            .envs(merged_envs)
-            .spawn()
-            .context("[SACP] 无法启动 claude-code-acp 子进程")?;
+        // 启动子进程（使用 process group 来管理整个进程树）
+        // 使用 ProcessGroup::leader() 创建真正的进程组，确保能够清理所有孙进程
+        let mut child = CommandWrap::with_new(&command_path, |cmd| {
+            cmd.args(&command_args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .current_dir(&project_path);
+            cmd.envs(&merged_envs);
+        })
+        .wrap(ProcessGroup::leader())
+        .spawn()
+        .context("[SACP] 无法启动 claude-code-acp 子进程")?;
 
         let child_pid = child.id().unwrap_or(0);
         info!("[SACP] Claude Code ACP 子进程已启动，PID: {}", child_pid);
 
-        // 获取 stdio 句柄
-        let stdin = take_stdio(&mut child.stdin, "stdin")?;
-        let stdout = take_stdio(&mut child.stdout, "stdout")?;
-        let stderr = take_stdio(&mut child.stderr, "stderr")?;
+        // 获取 stdio 句柄（process_wrap 使用方法访问 stdio）
+        let stdin = take_stdio(&mut child.stdin(), "stdin")?;
+        let stdout = take_stdio(&mut child.stdout(), "stdout")?;
+        let stderr = take_stdio(&mut child.stderr(), "stderr")?;
 
         // 创建 SACP transport
         let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());

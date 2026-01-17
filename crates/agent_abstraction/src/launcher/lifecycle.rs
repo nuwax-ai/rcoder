@@ -13,20 +13,13 @@
 //!
 //! ## 进程组说明
 //!
-//! 当前实现使用子进程 PID 作为 PGID（伪进程组）：
-//! - 终止时发送 `kill(-pgid, SIGKILL)` 到进程组
-//! - 如果子进程创建了真正的进程组（如通过 setsid），会杀死整个进程树
-//! - 如果子进程没有创建进程组，只会杀死子进程本身
-//!
-//! ## 未来改进
-//!
-//! 可以使用 `process-wrap` 库创建真正的进程组：
-//! ```ignore
-//! use process_wrap::tokio::{CommandWrap, ProcessGroup};
-//! let cmd_wrap = CommandWrap::from(cmd).wrap(ProcessGroup::leader());
-//! ```
+//! 使用 `process-wrap` crate 创建真正的进程组：
+//! - 启动时使用 `ProcessGroup::leader()` 创建进程组
+//! - 终止时发送 `kill(-pgid, SIGKILL)` 到整个进程组
+//! - 能够正确清理子进程及其所有孙进程
 
 use anyhow::Result;
+use process_wrap::tokio::ChildWrapper;
 use dashmap::DashMap;
 use std::sync::{
     Arc,
@@ -35,7 +28,7 @@ use std::sync::{
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // SACP 类型导入
 use sacp::schema::SessionId;
@@ -121,7 +114,7 @@ impl AgentLifecycleGuard {
     pub fn new_claude(
         project_id: String,
         session_id: SessionId,
-        child_process: tokio::process::Child,
+        child_process: Box<dyn ChildWrapper>,
         stderr_task: JoinHandle<()>,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -147,26 +140,50 @@ impl AgentLifecycleGuard {
     /// 当前实现使用子进程的 PID 作为 PGID：
     /// - `pgid = child_pid`（使用子进程 PID 作为进程组 ID）
     /// - 终止时发送 `kill(-pgid, SIGKILL)` 到进程组
-    /// - 如果子进程创建了真正的进程组，所有孙进程都会被终止
-    /// - 如果子进程没有创建进程组，只会终止子进程本身
+    /// - 使用 `process-wrap` 创建真正的进程组，能正确清理所有孙进程
     ///
     /// # 参数
     ///
     /// * `shared_api_key_manager` - 共享的 DashMap，用于清理 API 密钥配置
     /// * `project_uuid_map` - project_id -> service_uuid 映射，用于查找 UUID
     /// * `service_uuid` - 与此 Agent 关联的 service UUID
+    ///
+    /// # Panics
+    ///
+    /// 如果子进程 PID 无效（为 0 或 None），此函数会 panic，因为这意味着进程启动失败。
     #[allow(clippy::too_many_arguments)]
     pub fn new_claude_with_key_manager(
         project_id: String,
         session_id: SessionId,
-        mut child_process: tokio::process::Child,
+        mut child_process: Box<dyn ChildWrapper>,
         stderr_task: JoinHandle<()>,
         cancel_token: CancellationToken,
         shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
         project_uuid_map: Option<Arc<DashMap<String, String>>>,
         service_uuid: Option<String>,
     ) -> Self {
-        let pid = child_process.id().unwrap_or(0);
+        // 🔥 关键：PID 有效性检查
+        // ChildWrapper 的 id() 返回 Option<u32>，当进程已终止或无效时返回 None
+        // 如果 PID 无效，这是一个严重的初始化错误，应该 panic
+        let pid = child_process.id().unwrap_or_else(|| {
+            panic!(
+                "[LifecycleGuard] 子进程 PID 无效（None），进程可能已终止: project_id={}",
+                project_id
+            )
+        });
+
+        // 🔥 额外检查：PID 不应该为 0
+        // 虽然 id() 返回 Some(0) 理论上可能，但实际上 PID 0 是内核保留的
+        if pid == 0 {
+            panic!(
+                "[LifecycleGuard] 子进程 PID 为 0，这是无效的 PID: project_id={}",
+                project_id
+            );
+        }
+
+        // 🔥 进程组 ID 等于组长进程的 PID
+        // process-wrap 的 ProcessGroup 使用 setpgid(0, 0) 创建新进程组，使进程成为组长
+        let pgid = pid;
         let project_id_clone = project_id.clone();
         let session_id_str = session_id.0.to_string();
 
@@ -176,24 +193,19 @@ impl AgentLifecycleGuard {
             match child_process.wait().await {
                 Ok(status) => {
                     debug!(
-                        "[ProcessReaper] 子进程已回收: pid={}, status={:?}",
-                        pid, status
+                        "[ProcessReaper] 子进程已回收: pid={}, pgid={}, status={:?}",
+                        pid, pgid, status
                     );
                 }
                 Err(e) => {
                     // 进程可能已经被其他方式回收
                     debug!(
-                        "[ProcessReaper] 子进程 wait() 失败（可能已回收）: pid={}, error={}",
-                        pid, e
+                        "[ProcessReaper] 子进程 wait() 失败（可能已回收）: pid={}, pgid={}, error={}",
+                        pid, pgid, e
                     );
                 }
             }
         });
-
-        // 🔥 进程组 ID 等于子进程 PID
-        // 当前实现使用子进程 PID 作为 PGID（伪进程组）
-        // 注意：这不是真正的进程组，除非子进程通过 setsid() 创建了进程组
-        let pgid = pid;
 
         let resources = AgentResources::Claude {
             stderr_task: Arc::new(Mutex::new(Some(stderr_task))),
@@ -226,7 +238,7 @@ impl AgentLifecycleGuard {
     ///
     /// ## 进程组终止
     ///
-    /// 发送信号到 `-pgid`（负的进程组 ID），这会终止：
+    /// 使用 `process-wrap` 创建真正的进程组，发送信号到 `-pgid` 会终止：
     /// - 子进程（进程组组长）
     /// - 所有孙进程（同一进程组中的进程）
     pub async fn graceful_stop(&self) -> Result<()> {
@@ -274,6 +286,7 @@ impl AgentLifecycleGuard {
     ///
     /// - `kill(pgid, SIGTERM)` - 发送给单个进程
     /// - `kill(-pgid, SIGTERM)` - 发送给整个进程组
+    /// - `kill(0, SIGTERM)` - 发送给调用者自己的进程组（危险！）
     ///
     /// # 参数
     ///
@@ -283,10 +296,21 @@ impl AgentLifecycleGuard {
 
         #[cfg(unix)]
         {
+            use nix::errno::Errno;
             use nix::sys::signal::{kill, Signal};
             use nix::unistd::Pid;
 
-            // 🔥 关键：使用负的进程组 ID
+            // 🔥 关键防御性检查：pgid 不能为 0
+            // kill(0, SIGKILL) 会杀死调用者自己的进程组，这是危险的
+            if pgid == 0 {
+                warn!(
+                    "[LifecycleGuard] 进程组 ID 为 0，跳过进程组终止（可能是初始化失败）: project_id={}",
+                    self.inner.project_id
+                );
+                return Ok(());
+            }
+
+            // 🔥 关键：使用负的进程组 ID（真实的进程组 ID）
             // -pgid 表示发送信号到整个进程组，而不仅仅是进程组组长
             let target = Pid::from_raw(-(pgid as i32));
 
@@ -312,10 +336,21 @@ impl AgentLifecycleGuard {
                         debug!("已强制终止进程组: pgid={}", pgid);
                     }
                 }
+                Err(Errno::ESRCH) => {
+                    // 进程组已退出，这是正常的
+                    debug!("进程组已退出: pgid={}", pgid);
+                }
+                Err(Errno::EPERM) => {
+                    // 权限不足，无法终止进程组
+                    warn!(
+                        "[LifecycleGuard] 权限不足，无法终止进程组: pgid={}, project_id={}",
+                        pgid, self.inner.project_id
+                    );
+                }
                 Err(e) => {
-                    // 进程组可能已经退出
+                    // 其他错误（如 EINVAL、EFAULT 等）
                     debug!(
-                        "终止进程组失败（可能已退出）: pgid={}, error={}",
+                        "终止进程组失败: pgid={}, error={:?}",
                         pgid, e
                     );
                 }
@@ -375,19 +410,29 @@ impl Drop for AgentLifecycleGuard {
                 use nix::unistd::Pid;
 
                 let pgid = self.inner.pgid;
-                let target = Pid::from_raw(-(pgid as i32));
 
-                if let Err(e) = kill(target, Signal::SIGKILL) {
-                    // 进程可能已经退出，这是正常的
+                // 🔥 关键防御性检查：pgid 不能为 0
+                // kill(0, SIGKILL) 会杀死调用者自己的进程组，这是危险的
+                if pgid == 0 {
                     debug!(
-                        "[Claude] 终止进程组失败（可能已退出）: pgid={}, error={}",
-                        pgid, e
+                        "[Claude] 进程组 ID 为 0，跳过进程组终止: project_id={}",
+                        self.inner.project_id
                     );
                 } else {
-                    debug!(
-                        "[Claude] 进程组已终止: pgid={}, project_id={}",
-                        pgid, self.inner.project_id
-                    );
+                    let target = Pid::from_raw(-(pgid as i32));
+
+                    if let Err(e) = kill(target, Signal::SIGKILL) {
+                        // 进程可能已经退出，这是正常的
+                        debug!(
+                            "[Claude] 终止进程组失败（可能已退出）: pgid={}, error={}",
+                            pgid, e
+                        );
+                    } else {
+                        debug!(
+                            "[Claude] 进程组已终止: pgid={}, project_id={}",
+                            pgid, self.inner.project_id
+                        );
+                    }
                 }
             }
 
