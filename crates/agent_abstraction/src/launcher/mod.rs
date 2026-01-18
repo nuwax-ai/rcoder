@@ -39,10 +39,8 @@
 //! ## 与 shared_types::AgentLifecycleGuard 的关系
 //!
 //! `AgentLifecycleGuard` 的核心实现定义在 `shared_types::model::agent_model`。
-//! 本模块的 `lifecycle.rs` 提供：
-//!
-//! - **类型别名**: `AgentStopGuard`, `AgentStopHandleArc`
-//! - **Re-export**: 方便从 `agent_abstraction::launcher` 统一导入
+//! 本模块的 `lifecycle.rs` 提供 Re-export，
+//! 方便从 `agent_abstraction::launcher` 统一导入。
 //!
 //! ## 生命周期管理 (RAII)
 //!
@@ -66,7 +64,7 @@ mod channel;
 // SACP 类型导出（推荐使用）
 // ============================================================================
 
-pub use lifecycle::{AgentLifecycleGuard, AgentStopGuard, AgentStopHandleArc};
+pub use lifecycle::AgentLifecycleGuard;
 
 // 直接导出 SACP 类型
 pub use claude_code_sacp::{

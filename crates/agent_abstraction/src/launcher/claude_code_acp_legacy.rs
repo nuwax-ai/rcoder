@@ -744,6 +744,7 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
                     client_conn.clone(),
                     cancel_rx,
                     &project_id_for_child,
+                    start_config.agent_cancel_timeout_secs,
                 );
 
                 // 启动 Prompt 处理器（包含降级逻辑）

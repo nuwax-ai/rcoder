@@ -605,13 +605,20 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     .mcp_servers(mcp_servers.clone())
                     .meta(system_prompt_meta);
 
+                // 从配置获取超时值，默认 100 秒
+                let timeout_secs = start_config
+                    .acp_session_create_timeout_secs
+                    .unwrap_or(100);
                 let session_response = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(100),
+                    tokio::time::Duration::from_secs(timeout_secs),
                     cx.send_request(new_session_request).block_task(),
                 )
                 .await
                 .map_err(|_| {
-                    sacp::Error::new(-32000, "[SACP] new_session 超时 (100s)")
+                    sacp::Error::new(
+                        -32000,
+                        format!("[SACP] new_session 超时 ({}s)", timeout_secs)
+                    )
                 })??;
 
                 let session_id = session_response.session_id;

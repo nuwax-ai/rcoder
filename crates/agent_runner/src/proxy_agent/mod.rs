@@ -6,11 +6,11 @@ use crate::CancelNotificationRequestWrapper;
 // AgentRequest 是 SACP 版本的新类型，LocalSetAgentRequest 是向后兼容别名
 #[allow(deprecated)]
 pub use acp_agent::{AgentRequest, LocalSetAgentRequest, agent_worker_with_heartbeat};
-use agent_abstraction::launcher::AgentStopHandleArc;
+use shared_types::AgentLifecycleGuard;
 // SACP 类型导入
 use sacp::schema::{PromptRequest, SessionId};
 use dashmap::DashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 
 /// 会话级别的 request_id 上下文映射（project_id -> request_id）
@@ -28,5 +28,5 @@ pub struct AcpConnectionInfo {
     /// 用于发送取消通知的通道（使用新类型）
     pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
     /// Agent停止句柄（将被包装为守卫并放入 ProjectAndAgentInfo）
-    pub stop_handle: Option<AgentStopHandleArc>,
+    pub stop_handle: Option<Arc<AgentLifecycleGuard>>,
 }

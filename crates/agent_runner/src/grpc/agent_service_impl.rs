@@ -33,24 +33,12 @@ use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
 use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
-use dashmap::DashSet;
 use shared_types::ChatPromptBuilder;
-use std::sync::LazyLock;
 
-/// 🆕 全局 Session 首次 Prompt 成功标记
-///
-/// 用于跟踪哪些 session 已经成功执行过至少一次 Prompt
-/// - 如果 session_id 在集合中 → 已成功执行过
-/// - 如果不在集合中 → 未执行过（首次）
-///
-/// 使用 DashSet 比 DashMap<String, bool> 更轻量，因为只需要判断存在性
-pub(crate) static SESSION_FIRST_PROMPT_SUCCESS: LazyLock<DashSet<String>> =
-    LazyLock::new(|| DashSet::new());
-
-/// 将 gRPC ModelProviderConfig 转换为内部 ModelProviderConfig
+/// Convert gRPC ModelProviderConfig to internal ModelProviderConfig
 fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProviderConfig {
     ModelProviderConfig {
-        id: grpc_config.id, // 保留原始 ID，用于会话复用判断
+        id: grpc_config.id, // Keep original ID for session reuse determination
         name: grpc_config.provider,
         base_url: grpc_config.api_base.unwrap_or_default(),
         api_key: grpc_config.api_key.unwrap_or_default(),
@@ -60,7 +48,7 @@ fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProvider
     }
 }
 
-/// 将 gRPC ChatAgentConfig 转换为内部 ChatAgentConfig
+/// Convert gRPC ChatAgentConfig to internal ChatAgentConfig
 fn convert_agent_config(grpc_config: GrpcChatAgentConfig) -> ChatAgentConfig {
     ChatAgentConfig {
         agent_server: grpc_config.agent_server.map(convert_agent_server_config),
@@ -69,11 +57,11 @@ fn convert_agent_config(grpc_config: GrpcChatAgentConfig) -> ChatAgentConfig {
             .into_iter()
             .map(|(k, v)| (k, convert_context_server_config(v)))
             .collect(),
-        resource_limits: None, // gRPC 消息中暂时不传递 resource_limits
+        resource_limits: None, // resource_limits not temporarily passed in gRPC messages
     }
 }
 
-/// 将 gRPC ChatAgentServerConfig 转换为内部 ChatAgentServerConfig
+/// Convert gRPC ChatAgentServerConfig to internal ChatAgentServerConfig
 fn convert_agent_server_config(grpc_config: GrpcChatAgentServerConfig) -> ChatAgentServerConfig {
     ChatAgentServerConfig {
         agent_id: grpc_config.agent_id,
@@ -117,7 +105,7 @@ fn convert_context_server_config(
     }
 }
 
-/// 将 gRPC AttachmentSource 转换为内部 AttachmentSource
+/// Convert gRPC AttachmentSource to internal AttachmentSource
 fn convert_attachment_source(
     grpc_source: Option<shared_types::grpc::AttachmentSource>,
 ) -> Option<AttachmentSource> {
@@ -132,7 +120,7 @@ fn convert_attachment_source(
     })
 }
 
-/// 将 gRPC Attachment 转换为内部 Attachment
+/// Convert gRPC Attachment to internal Attachment
 fn convert_attachment(grpc_attachment: shared_types::grpc::Attachment) -> Option<Attachment> {
     let attachment_type = grpc_attachment.attachment_type?;
 
@@ -173,7 +161,7 @@ fn convert_attachment(grpc_attachment: shared_types::grpc::Attachment) -> Option
     })
 }
 
-/// 批量转换附件列表
+/// Batch convert attachment list
 fn convert_attachments(grpc_attachments: Vec<shared_types::grpc::Attachment>) -> Vec<Attachment> {
     grpc_attachments
         .into_iter()
@@ -181,7 +169,7 @@ fn convert_attachments(grpc_attachments: Vec<shared_types::grpc::Attachment>) ->
         .collect()
 }
 
-/// gRPC AgentService 实现
+/// gRPC AgentService implementation
 pub struct AgentServiceImpl {
     app_state: Arc<AppState>,
 }
@@ -191,9 +179,9 @@ impl AgentServiceImpl {
         Self { app_state }
     }
 
-    /// 获取活跃任务数
+    /// Get active task count
     ///
-    /// 查询 AGENT_REGISTRY 中状态为 Active 的 Agent 数量
+    /// Query the number of Agents with Active status in AGENT_REGISTRY
     fn get_active_tasks_count(&self) -> i32 {
         let count = AGENT_REGISTRY
             .iter_agents()
@@ -203,14 +191,14 @@ impl AgentServiceImpl {
         count as i32
     }
 
-    /// 获取容器运行时长（秒）
+    /// Get container uptime (seconds)
     ///
-    /// 从进程启动时间计算到现在的时长
+    /// Calculate duration from process start time to now
     fn get_uptime_seconds(&self) -> i64 {
         use std::time::SystemTime;
 
-        // 使用进程启动时间作为容器启动时间的近似值
-        // 注意：这是一个简化实现，实际的容器启动时间应该更早
+        // Use process start time as an approximation for container start time
+        // Note: This is a simplified implementation, actual container start time should be earlier
         static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
         let start = START_TIME.get_or_init(|| SystemTime::now());
@@ -218,7 +206,7 @@ impl AgentServiceImpl {
         match SystemTime::now().duration_since(*start) {
             Ok(duration) => duration.as_secs() as i64,
             Err(_) => {
-                warn!("⚠️ [GET_CONTAINER_STATUS] 计算运行时长失败，返回 0");
+                warn!("⚠️ [GET_CONTAINER_STATUS] failed to calculate uptime, returning 0");
                 0
             }
         }
@@ -227,7 +215,7 @@ impl AgentServiceImpl {
 
 #[tonic::async_trait]
 impl AgentService for AgentServiceImpl {
-    /// 聊天对话接口 - 复用现有 handle_chat 核心逻辑
+    /// Chat interface - reuse existing handle_chat core logic
     #[instrument(skip(self, request))]
     async fn chat(
         &self,
@@ -253,9 +241,9 @@ impl AgentService for AgentServiceImpl {
             !req.data_source_attachments.is_empty()
         );
 
-        // 验证 prompt 不能为空
+        // Validate prompt cannot be empty
         if req.prompt.trim().is_empty() {
-            return Err(Status::invalid_argument("prompt 字段不能为空"));
+            return Err(Status::invalid_argument("prompt field cannot be empty"));
         }
 
         let project_id = if req.project_id.is_empty() {
@@ -270,40 +258,40 @@ impl AgentService for AgentServiceImpl {
             Some(req.session_id.clone())
         };
 
-        // 检查 Agent 状态，禁止并发请求（使用统一 Registry）
-        // 🆕 检查 Active 和 Pending 两种状态
+        // Check Agent status, prohibit concurrent requests (using unified Registry)
+        // 🆕 Check both Active and Pending states
         if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id) {
             if agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending
             {
-                // 🎯 使用业务响应返回错误码，而非 gRPC Status 错误
-                // 这样 rcoder 可以直接从 error_code 字段读取错误码
+                // 🎯 Use business response to return error code instead of gRPC Status error
+                // This allows rcoder to directly read error code from error_code field
                 info!(
-                    "🚫 [gRPC] Agent Busy 返回 9010 错误: project_id={}, status={:?}",
+                    "🚫 [gRPC] Agent Busy returning 9010 error: project_id={}, status={:?}",
                     project_id, agent_info.status
                 );
                 return Ok(Response::new(GrpcChatResponse {
                     project_id: project_id.clone(),
                     session_id: session_id.unwrap_or_default(),
                     success: false,
-                    error: Some("Agent正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
+                    error: Some("Agent is executing a task, please wait for the current task to complete before sending a new request".to_string()),
                     error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
                     request_id: req.request_id.clone(),
-                    // 🆕 Agent Busy 不需要降级
+                    // 🆕 Agent Busy does not need degradation
                     need_fallback: false,
                     fallback_reason: None,
                 }));
             }
         }
 
-        // 🆕 预注册：在发送任务到队列前，立即将 project 标记为 Pending
-        // 这样并发请求会被上面的忙碌检查拦截
+        // 🆕 Pre-registration: Immediately mark project as Pending before sending task to queue
+        // This way concurrent requests will be blocked by the busy check above
         AGENT_REGISTRY.set_pending(&project_id);
-        info!("📌 [gRPC] 预注册 Pending 状态: project_id={}", project_id);
+        info!("📌 [gRPC] pre-registered Pending status: project_id={}", project_id);
 
-        // 清理旧 session
+        // Clean up old session
         if let Some(ref sid) = session_id {
             if SESSION_CACHE.remove(sid).is_some() {
-                info!("🗑️ [gRPC] 移除旧session: session_id={}", sid);
+                info!("🗑️ [gRPC] removed old session: session_id={}", sid);
             }
         }
 
@@ -438,79 +426,40 @@ impl AgentService for AgentServiceImpl {
             .with_service_uuid(service_uuid)
             .with_key_manager(Some(self.app_state.shared_api_key_manager.clone()));
 
-        // 🆕 检查 worker 状态
+        // 🆕 Check worker state
         use crate::agent_worker_manager::WorkerState;
         match self.app_state.agent_worker_manager.state() {
             WorkerState::Running => {
-                // 正常运行，继续处理
+                // Normal operation, continue processing
             }
             WorkerState::Starting => {
-                warn!("⚠️ [gRPC] Agent Worker 正在启动，请求可能被延迟处理");
+                warn!("⚠️ [gRPC] Agent Worker is starting, requests may be delayed");
             }
             WorkerState::Stopping | WorkerState::Stopped => {
-                // 🔥 关键修复：清理 Pending 状态
+                // 🔥 Critical fix: clean up Pending status
                 AGENT_REGISTRY.clear_pending_if_exists(&project_id);
-                // Worker 不可用
+                // Worker not available
                 return Err(Status::unavailable(
-                    "Agent Worker 不可用，正在重启中。请稍后重试",
+                    "Agent Worker is not available, restarting. Please try again later",
                 ));
             }
         }
 
-        // 🆕 使用 manager 发送（带状态检查）
+        // 🆕 Use manager to send (with state check)
         if let Err(e) = self
             .app_state
             .agent_worker_manager
             .try_send(local_task_request)
             .await
         {
-            // 🔥 关键修复：发送失败时清理 Pending 状态
+            // 🔥 Critical fix: clean up Pending status on send failure
             AGENT_REGISTRY.clear_pending_if_exists(&project_id);
-            return Err(Status::internal(format!("发送任务失败: {}", e)));
+            return Err(Status::internal(format!("Failed to send task: {}", e)));
         }
 
-        // 等待响应
+        // Wait for response
         match chat_prompt_rx.await {
             Ok(response) => {
-                // 🆕 检测是否需要降级（Resume 失败）
-                // 判断逻辑：
-                // 1. 是 Resume 会话（session_id 不为空）
-                // 2. Prompt 执行失败（有错误）
-                // 3. 是首次 Prompt（SESSION_FIRST_PROMPT_SUCCESS 中没有该 session_id）
-                let is_resume_session = session_id.is_some();
-                let has_error = response.error.is_some();
-
-                let (need_fallback, fallback_reason) = if is_resume_session && has_error {
-                    let session_id_str = session_id.as_ref().unwrap();
-                    let is_first_prompt = !SESSION_FIRST_PROMPT_SUCCESS.contains(session_id_str);
-
-                    if is_first_prompt {
-                        warn!(
-                            "⚠️ [gRPC] 检测到 Resume 会话首次 Prompt 失败，需要降级: project_id={}, session_id={}, error={}",
-                            response.project_id,
-                            session_id_str,
-                            response.error.as_ref().unwrap()
-                        );
-                        (true, Some("resume_first_prompt_failed".to_string()))
-                    } else {
-                        // 不是首次 Prompt，正常错误处理
-                        (false, None)
-                    }
-                } else {
-                    (false, None)
-                };
-
-                // 🆕 如果 Prompt 执行成功，标记该 session 已成功执行过 Prompt
-                if !has_error {
-                    if let Some(ref session_id_str) = session_id {
-                        SESSION_FIRST_PROMPT_SUCCESS.insert(session_id_str.clone());
-                        debug!(
-                            "✅ [gRPC] 标记 session 首次 Prompt 成功: session_id={}",
-                            session_id_str
-                        );
-                    }
-                }
-
                 let grpc_response = GrpcChatResponse {
                     project_id: response.project_id,
                     session_id: response.session_id,
@@ -522,27 +471,19 @@ impl AgentService for AgentServiceImpl {
                         None
                     },
                     request_id: Some(request_id),
-                    // 🆕 添加降级标识字段
-                    need_fallback,
-                    fallback_reason,
+                    need_fallback: false,
+                    fallback_reason: None,
                 };
 
-                if need_fallback {
-                    info!(
-                        "✅ [gRPC] Chat 完成 (需要降级): success={}, need_fallback={}",
-                        grpc_response.success, grpc_response.need_fallback
-                    );
-                } else {
-                    info!("✅ [gRPC] Chat 完成: success={}", grpc_response.success);
-                }
+                info!("✅ [gRPC] Chat completed: success={}", grpc_response.success);
 
                 Ok(Response::new(grpc_response))
             }
             Err(e) => {
-                error!("❌ [gRPC] Chat 失败: {}", e);
-                // 🆕 清理 Pending 状态，避免死锁
+                error!("❌ [gRPC] Chat failed: {}", e);
+                // Clean up Pending status to avoid deadlock
                 AGENT_REGISTRY.clear_pending_if_exists(&project_id);
-                Err(Status::internal(format!("处理请求失败: {}", e)))
+                Err(Status::internal(format!("Failed to process request: {}", e)))
             }
         }
     }
@@ -704,7 +645,7 @@ impl AgentService for AgentServiceImpl {
         ))
     }
 
-    /// 取消会话任务
+    /// Cancel session task
     #[instrument(skip(self, request))]
     async fn cancel_session(
         &self,
@@ -716,11 +657,11 @@ impl AgentService for AgentServiceImpl {
             req.session_id, req.project_id, req.reason
         );
 
-        // 🔧 确定实际的 session_id
-        // 当 session_id 为空时，根据 project_id 查找
+        // 🔧 Determine actual session_id
+        // When session_id is empty, look up by project_id
         let actual_session_id = if req.session_id.is_empty() {
             info!(
-                "📝 [gRPC] session_id 为空，根据 project_id={} 查找",
+                "📝 [gRPC] session_id is empty, looking up by project_id={}",
                 req.project_id
             );
 
@@ -728,20 +669,20 @@ impl AgentService for AgentServiceImpl {
                 Some(info) => {
                     let sid = info.session_id.to_string();
                     info!(
-                        "✅ [gRPC] 从 project_id={} 获取到 session_id={}",
+                        "✅ [gRPC] got session_id={} from project_id={}",
                         req.project_id, sid
                     );
                     sid
                 }
                 None => {
                     info!(
-                        "ℹ️ [gRPC] project_id={} 无活动会话，取消目标已达成",
+                        "ℹ️ [gRPC] project_id={} has no active session, cancel target achieved",
                         req.project_id
                     );
                     return Ok(Response::new(CancelResponse {
                         success: true,
                         result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some("项目无活动会话".to_string()),
+                        message: Some("Project has no active session".to_string()),
                     }));
                 }
             }
@@ -749,145 +690,152 @@ impl AgentService for AgentServiceImpl {
             req.session_id.clone()
         };
 
-        // 1. 通过统一 Registry 的 O(1) 反向查询获取 project_id
+        // 1. Get project_id via unified Registry O(1) reverse query
         let project_id = match AGENT_REGISTRY.get_project_by_session(&actual_session_id) {
             Some(pid) => {
                 debug!(
-                    "✅ [gRPC] 找到 session_id={} 对应的 project_id={}",
+                    "✅ [gRPC] found project_id={} for session_id={}",
                     actual_session_id, pid
                 );
                 pid
             }
             None => {
                 warn!(
-                    "⚠️ [gRPC] 未找到 session_id={} 对应的 project",
+                    "⚠️ [gRPC] found no project for session_id={}",
                     actual_session_id
                 );
-                // 会话不存在或已完成，返回成功（幂等设计）
+                // Session doesn't exist or already completed, return success (idempotent design)
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("会话不存在或已完成".to_string()),
+                    message: Some("Session does not exist or already completed".to_string()),
                 }));
             }
         };
 
-        // 2. 获取 agent_info 并提取需要的数据
-        // 🔥 关键修复：使用代码块限制读锁生命周期，避免在 .await 时持有读锁导致死锁
+        // 2. Get agent_info and extract needed data
+        // 🔥 Critical fix: use code block to limit read lock lifetime, avoid deadlock when holding read lock across .await
         let (status, cancel_tx) = {
             let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
                 Some(info) => info,
                 None => {
                     info!(
-                        "ℹ️ [gRPC] project_id={} 无活动会话，取消目标已达成（幂等）",
+                        "ℹ️ [gRPC] project_id={} has no active session, cancel target achieved (idempotent)",
                         project_id
                     );
                     return Ok(Response::new(CancelResponse {
                         success: true,
                         result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some("项目无活动会话".to_string()),
+                        message: Some("Project has no active session".to_string()),
                     }));
                 }
             };
 
-            // ✅ 主动 clone 数据，然后显式 drop 读锁
-            // status 是 Copy 类型，直接复制
-            // cancel_tx 是 UnboundedSender，clone 成本很低（内部只是 Arc 引用计数+1）
+            // ✅ Proactively clone data, then explicitly drop read lock
+            // status is Copy type, directly copied
+            // cancel_tx is UnboundedSender, very cheap to clone (internal Arc ref count +1 only)
             let status = agent_info.status;
             let cancel_tx = agent_info.cancel_tx.clone();
 
-            // 🔥 显式释放读锁，确保在代码块结束前就释放
+            // 🔥 Explicitly release read lock, ensure released before code block ends
             drop(agent_info);
 
             (status, cancel_tx)
         };
 
-        // 🆕 ===== 幂等性检查与通道有效性验证 =====
+        // 🆕 ===== Idempotency check and channel validity verification =====
         match status {
             AgentStatus::Idle => {
-                // 已经是 Idle 状态，无需取消（幂等返回）
+                // Already Idle status, no need to cancel (idempotent return)
                 info!(
-                    "✅ [gRPC] Agent 已经是 Idle 状态，取消请求幂等成功: project_id={}, session_id={}",
+                    "✅ [gRPC] Agent already in Idle status, cancel request idempotent success: project_id={}, session_id={}",
                     project_id, actual_session_id
                 );
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("Agent 已经是空闲状态".to_string()),
+                    message: Some("Agent already in idle status".to_string()),
                 }));
             }
             AgentStatus::Terminating => {
-                // 正在停止中，无需重复取消（幂等返回）
+                // Already stopping, no need to cancel again (idempotent return)
                 info!(
-                    "✅ [gRPC] Agent 正在停止中，取消请求幂等成功: project_id={}, session_id={}",
+                    "✅ [gRPC] Agent already stopping, cancel request idempotent success: project_id={}, session_id={}",
                     project_id, actual_session_id
                 );
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("Agent 正在停止中".to_string()),
+                    message: Some("Agent is already stopping".to_string()),
                 }));
             }
             AgentStatus::Active | AgentStatus::Pending => {
-                // 正常流程：继续执行取消
+                // Normal flow: continue with cancellation
                 debug!(
-                    "🔄 [gRPC] Agent 状态为 {:?}，执行取消操作: project_id={}, session_id={}",
+                    "🔄 [gRPC] Agent status is {:?}, executing cancel: project_id={}, session_id={}",
                     status, project_id, actual_session_id
                 );
             }
         }
 
-        // 🆕 验证 cancel_tx 通道是否仍然有效
-        // 避免：LocalSet 已退出导致 cancel_tx 失效，但 send 时才发现的问题
+        // 🆕 Verify cancel_tx channel is still valid
+        // Avoid: LocalSet exited causing cancel_tx to be invalid, but only discovered at send time
         if cancel_tx.is_closed() {
             error!(
-                "❌ [gRPC] cancel_tx 通道已关闭，LocalSet 可能已意外退出: project_id={}, session_id={}",
+                "❌ [gRPC] cancel_tx channel closed, LocalSet may have unexpectedly exited: project_id={}, session_id={}",
                 project_id, actual_session_id
             );
             return Ok(Response::new(CancelResponse {
                 success: false,
                 result: CancelResultType::CancelResultFailed as i32,
-                message: Some("取消通道已关闭，Agent 可能已停止".to_string()),
+                message: Some("Cancel channel closed, Agent may have stopped".to_string()),
             }));
         }
 
-        // 3. 创建 SessionId 和 CancelNotification
+        // 3. Create SessionId and CancelNotification
         let session_id_obj = SessionId::new(Arc::from(actual_session_id.as_str()));
         let cancel_notification = CancelNotification::new(session_id_obj);
 
-        // 4. 创建 oneshot channel 等待取消结果
+        // 4. Create oneshot channel to wait for cancel result
         let (result_tx, result_rx) = oneshot::channel::<CancelResult>();
         let cancel_request = CancelNotificationRequestWrapper {
             cancel_notification,
             result_tx,
         };
 
-        // 5. 发送取消通知（使用已提取的 cancel_tx）
+        // 5. Send cancel notification (using already extracted cancel_tx)
         if let Err(e) = cancel_tx.send(cancel_request) {
-            error!("❌ [gRPC] 发送取消通知失败: {}", e);
+            error!("❌ [gRPC] failed to send cancel notification: {}", e);
             return Ok(Response::new(CancelResponse {
                 success: false,
                 result: CancelResultType::CancelResultFailed as i32,
-                message: Some(format!("发送取消通知失败: {}", e)),
+                message: Some(format!("Failed to send cancel notification: {}", e)),
             }));
         }
 
         info!(
-            "📡 [gRPC] 等待 Agent 取消响应: session_id={}",
+            "📡 [gRPC] waiting for Agent cancel response: session_id={}",
             actual_session_id
         );
 
-        // 6. 等待取消响应（带超时）
-        match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
+        // 6. Wait for cancel response (with timeout)
+        let cancel_timeout_secs = self
+            .app_state
+            .config
+            .grpc_timeouts
+            .as_ref()
+            .map(|t| t.cancel_session_timeout_secs)
+            .unwrap_or(30); // Default 30 seconds
+        match tokio::time::timeout(Duration::from_secs(cancel_timeout_secs), result_rx).await {
             Ok(Ok(cancel_result)) => {
                 let is_success = cancel_result.is_success();
-                info!(
-                    "✅ [gRPC] 收到 Agent 取消响应: session_id={}, success={}",
+                debug!(
+                    "✅ [gRPC] received Agent cancel response: session_id={}, success={}",
                     actual_session_id, is_success
                 );
 
                 if is_success {
-                    // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端任务已取消
+                    // 🆕 Proactively send SessionPromptEnd message to notify SSE client task was canceled
                     use crate::service::push_session_update_with_project;
                     use sacp::schema::StopReason;
                     use shared_types::{SessionNotify, SessionPromptEnd};
@@ -1408,7 +1356,14 @@ impl AgentService for AgentServiceImpl {
             }
 
             // 等待取消响应（带超时）
-            match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
+            let cancel_timeout_secs = self
+                .app_state
+                .config
+                .grpc_timeouts
+                .as_ref()
+                .map(|t| t.cancel_session_timeout_secs)
+                .unwrap_or(30); // 默认 30 秒
+            match tokio::time::timeout(Duration::from_secs(cancel_timeout_secs), result_rx).await {
                 Ok(Ok(cancel_result)) => {
                     if cancel_result.is_success() {
                         info!(
@@ -1682,8 +1637,15 @@ impl AgentService for AgentServiceImpl {
         let file_exists = vnc_ready_file.exists();
 
         // 2. 检测端口状态（使用 tokio 异步检测）
-        let vnc_port_ready = check_port_available(5900).await;
-        let novnc_port_ready = check_port_available(6080).await;
+        let port_check_timeout = self
+            .app_state
+            .config
+            .grpc_timeouts
+            .as_ref()
+            .map(|t| t.port_check_timeout_millis)
+            .unwrap_or(500); // 默认 500 毫秒
+        let vnc_port_ready = check_port_available(5900, port_check_timeout).await;
+        let novnc_port_ready = check_port_available(6080, port_check_timeout).await;
 
         // 3. 综合判断：标记文件存在 + 端口可达
         let vnc_ready = file_exists && vnc_port_ready;
@@ -1748,12 +1710,12 @@ fn unified_message_to_progress_event(
 
 /// 异步检测端口是否可连接
 ///
-/// 使用 tokio TcpStream 尝试连接指定端口，500ms 超时
-async fn check_port_available(port: u16) -> bool {
+/// 使用 tokio TcpStream 尝试连接指定端口
+async fn check_port_available(port: u16, timeout_millis: u64) -> bool {
     use tokio::net::TcpStream;
 
     match tokio::time::timeout(
-        Duration::from_millis(500),
+        Duration::from_millis(timeout_millis),
         TcpStream::connect(format!("127.0.0.1:{}", port)),
     )
     .await

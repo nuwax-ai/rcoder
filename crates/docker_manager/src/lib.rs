@@ -5,6 +5,7 @@ pub mod container_state_actor;
 pub mod container_stop;
 pub mod image_selector;
 pub mod manager;
+pub mod path;
 pub mod types;
 pub mod utils;
 
@@ -12,7 +13,6 @@ pub mod utils;
 pub mod container_builder;
 pub mod health;
 pub mod network;
-pub mod path;
 
 pub use container_self_inspector::*;
 pub use container_state_actor::*;

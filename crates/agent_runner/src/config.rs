@@ -48,6 +48,9 @@ pub struct AppConfig {
     /// Agent 清理配置
     #[serde(default)]
     pub agent_cleanup: Option<AgentCleanupConfig>,
+    /// gRPC 超时配置
+    #[serde(default)]
+    pub grpc_timeouts: Option<GrpcTimeoutConfig>,
 }
 
 fn default_agent_id() -> String {
@@ -78,15 +81,104 @@ pub struct ProxyConfig {
     pub health_check: HealthCheckConfig,
 }
 
-/// Agent 清理配置
+/// Agent cleanup configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCleanupConfig {
-    /// 闲置超时时间（秒），默认 180 秒（3 分钟）
+    /// Idle timeout (seconds), default 300 (5 minutes)
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
-    /// 清理检查间隔（秒），默认 30 秒
+    /// Cleanup check interval (seconds), default 30
     #[serde(default = "default_cleanup_interval")]
     pub cleanup_interval_secs: u64,
+}
+
+/// gRPC timeout configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrpcTimeoutConfig {
+    /// Cancel session timeout (seconds), default 30
+    #[serde(default = "default_cancel_timeout")]
+    pub cancel_session_timeout_secs: u64,
+
+    /// ACP session creation timeout (seconds), default 100
+    #[serde(default = "default_acp_session_timeout")]
+    pub acp_session_create_timeout_secs: u64,
+
+    /// Agent cancel call timeout (seconds), default 10
+    #[serde(default = "default_agent_cancel_timeout")]
+    pub agent_cancel_timeout_secs: u64,
+
+    /// Port check timeout (milliseconds), default 500
+    #[serde(default = "default_port_check_timeout")]
+    pub port_check_timeout_millis: u64,
+}
+
+/// gRPC timeout configuration constants
+impl GrpcTimeoutConfig {
+    /// Minimum cancel session timeout (5 seconds)
+    pub const MIN_CANCEL_TIMEOUT: u64 = 5;
+    /// Maximum cancel session timeout (300 seconds = 5 minutes)
+    pub const MAX_CANCEL_TIMEOUT: u64 = 300;
+    /// Minimum ACP session creation timeout (10 seconds)
+    pub const MIN_ACP_SESSION_TIMEOUT: u64 = 10;
+    /// Maximum ACP session creation timeout (300 seconds = 5 minutes)
+    pub const MAX_ACP_SESSION_TIMEOUT: u64 = 300;
+    /// Minimum Agent cancel call timeout (5 seconds)
+    pub const MIN_AGENT_CANCEL_TIMEOUT: u64 = 5;
+    /// Maximum Agent cancel call timeout (60 seconds)
+    pub const MAX_AGENT_CANCEL_TIMEOUT: u64 = 60;
+    /// Minimum port check timeout (100 milliseconds)
+    pub const MIN_PORT_CHECK_TIMEOUT: u64 = 100;
+    /// Maximum port check timeout (10000 milliseconds = 10 seconds)
+    pub const MAX_PORT_CHECK_TIMEOUT: u64 = 10000;
+
+    /// Validate that configuration values are within valid ranges
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cancel_session_timeout_secs < Self::MIN_CANCEL_TIMEOUT
+            || self.cancel_session_timeout_secs > Self::MAX_CANCEL_TIMEOUT
+        {
+            return Err(format!(
+                "cancel_session_timeout_secs must be between {} and {}, current: {}",
+                Self::MIN_CANCEL_TIMEOUT,
+                Self::MAX_CANCEL_TIMEOUT,
+                self.cancel_session_timeout_secs
+            ));
+        }
+
+        if self.acp_session_create_timeout_secs < Self::MIN_ACP_SESSION_TIMEOUT
+            || self.acp_session_create_timeout_secs > Self::MAX_ACP_SESSION_TIMEOUT
+        {
+            return Err(format!(
+                "acp_session_create_timeout_secs must be between {} and {}, current: {}",
+                Self::MIN_ACP_SESSION_TIMEOUT,
+                Self::MAX_ACP_SESSION_TIMEOUT,
+                self.acp_session_create_timeout_secs
+            ));
+        }
+
+        if self.agent_cancel_timeout_secs < Self::MIN_AGENT_CANCEL_TIMEOUT
+            || self.agent_cancel_timeout_secs > Self::MAX_AGENT_CANCEL_TIMEOUT
+        {
+            return Err(format!(
+                "agent_cancel_timeout_secs must be between {} and {}, current: {}",
+                Self::MIN_AGENT_CANCEL_TIMEOUT,
+                Self::MAX_AGENT_CANCEL_TIMEOUT,
+                self.agent_cancel_timeout_secs
+            ));
+        }
+
+        if self.port_check_timeout_millis < Self::MIN_PORT_CHECK_TIMEOUT
+            || self.port_check_timeout_millis > Self::MAX_PORT_CHECK_TIMEOUT
+        {
+            return Err(format!(
+                "port_check_timeout_millis must be between {} and {}, current: {}",
+                Self::MIN_PORT_CHECK_TIMEOUT,
+                Self::MAX_PORT_CHECK_TIMEOUT,
+                self.port_check_timeout_millis
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Agent 清理配置常量
@@ -136,11 +228,38 @@ fn default_cleanup_interval() -> u64 {
     30 // 30 秒
 }
 
+fn default_cancel_timeout() -> u64 {
+    30 // 30 秒
+}
+
+fn default_acp_session_timeout() -> u64 {
+    100 // 100 秒
+}
+
+fn default_agent_cancel_timeout() -> u64 {
+    10 // 10 秒
+}
+
+fn default_port_check_timeout() -> u64 {
+    500 // 500 毫秒
+}
+
 impl Default for AgentCleanupConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: default_idle_timeout(),
             cleanup_interval_secs: default_cleanup_interval(),
+        }
+    }
+}
+
+impl Default for GrpcTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            cancel_session_timeout_secs: default_cancel_timeout(),
+            acp_session_create_timeout_secs: default_acp_session_timeout(),
+            agent_cancel_timeout_secs: default_agent_cancel_timeout(),
+            port_check_timeout_millis: default_port_check_timeout(),
         }
     }
 }
@@ -156,6 +275,7 @@ impl Default for AppConfig {
             port: 8086,
             proxy_config: Some(ProxyConfig::default()),
             agent_cleanup: Some(AgentCleanupConfig::default()),
+            grpc_timeouts: Some(GrpcTimeoutConfig::default()),
         }
     }
 }
@@ -285,6 +405,135 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         }
     }
 
+    // 🆕 gRPC 超时配置：支持环境变量覆盖
+    if let Ok(cancel_timeout) = env::var("RCODER_CANCEL_SESSION_TIMEOUT_SECS") {
+        match cancel_timeout.parse::<u64>() {
+            Ok(timeout) => {
+                if timeout >= GrpcTimeoutConfig::MIN_CANCEL_TIMEOUT
+                    && timeout <= GrpcTimeoutConfig::MAX_CANCEL_TIMEOUT
+                {
+                    config
+                        .grpc_timeouts
+                        .get_or_insert_with(Default::default)
+                        .cancel_session_timeout_secs = timeout;
+                    info!(
+                        "使用环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 设置取消会话超时: {} 秒",
+                        timeout
+                    );
+                } else {
+                    warn!(
+                        "环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 值无效: {} 秒，超出范围 [{}, {}]",
+                        timeout,
+                        GrpcTimeoutConfig::MIN_CANCEL_TIMEOUT,
+                        GrpcTimeoutConfig::MAX_CANCEL_TIMEOUT
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 值格式无效: {}",
+                    cancel_timeout
+                );
+            }
+        }
+    }
+
+    if let Ok(acp_timeout) = env::var("RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS") {
+        match acp_timeout.parse::<u64>() {
+            Ok(timeout) => {
+                if timeout >= GrpcTimeoutConfig::MIN_ACP_SESSION_TIMEOUT
+                    && timeout <= GrpcTimeoutConfig::MAX_ACP_SESSION_TIMEOUT
+                {
+                    config
+                        .grpc_timeouts
+                        .get_or_insert_with(Default::default)
+                        .acp_session_create_timeout_secs = timeout;
+                    info!(
+                        "使用环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 设置 ACP 会话创建超时: {} 秒",
+                        timeout
+                    );
+                } else {
+                    warn!(
+                        "环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 值无效: {} 秒，超出范围 [{}, {}]",
+                        timeout,
+                        GrpcTimeoutConfig::MIN_ACP_SESSION_TIMEOUT,
+                        GrpcTimeoutConfig::MAX_ACP_SESSION_TIMEOUT
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 值格式无效: {}",
+                    acp_timeout
+                );
+            }
+        }
+    }
+
+    if let Ok(agent_cancel_timeout) = env::var("RCODER_AGENT_CANCEL_TIMEOUT_SECS") {
+        match agent_cancel_timeout.parse::<u64>() {
+            Ok(timeout) => {
+                if timeout >= GrpcTimeoutConfig::MIN_AGENT_CANCEL_TIMEOUT
+                    && timeout <= GrpcTimeoutConfig::MAX_AGENT_CANCEL_TIMEOUT
+                {
+                    config
+                        .grpc_timeouts
+                        .get_or_insert_with(Default::default)
+                        .agent_cancel_timeout_secs = timeout;
+                    info!(
+                        "使用环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 设置 Agent 取消调用超时: {} 秒",
+                        timeout
+                    );
+                } else {
+                    warn!(
+                        "环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 值无效: {} 秒，超出范围 [{}, {}]",
+                        timeout,
+                        GrpcTimeoutConfig::MIN_AGENT_CANCEL_TIMEOUT,
+                        GrpcTimeoutConfig::MAX_AGENT_CANCEL_TIMEOUT
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 值格式无效: {}",
+                    agent_cancel_timeout
+                );
+            }
+        }
+    }
+
+    if let Ok(port_check_timeout) = env::var("RCODER_PORT_CHECK_TIMEOUT_MILLIS") {
+        match port_check_timeout.parse::<u64>() {
+            Ok(timeout) => {
+                if timeout >= GrpcTimeoutConfig::MIN_PORT_CHECK_TIMEOUT
+                    && timeout <= GrpcTimeoutConfig::MAX_PORT_CHECK_TIMEOUT
+                {
+                    config
+                        .grpc_timeouts
+                        .get_or_insert_with(Default::default)
+                        .port_check_timeout_millis = timeout;
+                    info!(
+                        "使用环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 设置端口检查超时: {} 毫秒",
+                        timeout
+                    );
+                } else {
+                    warn!(
+                        "环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 值无效: {} 毫秒，超出范围 [{}, {}]",
+                        timeout,
+                        GrpcTimeoutConfig::MIN_PORT_CHECK_TIMEOUT,
+                        GrpcTimeoutConfig::MAX_PORT_CHECK_TIMEOUT
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 值格式无效: {}",
+                    port_check_timeout
+                );
+            }
+        }
+    }
+
     // 🆕 验证最终配置的有效性
     if let Some(ref cleanup_config) = config.agent_cleanup {
         if let Err(e) = cleanup_config.validate() {
@@ -331,6 +580,17 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         config.proxy_config.is_some()
     );
 
+    // 🆕 验证 gRPC 超时配置的有效性
+    if let Some(ref grpc_timeouts) = config.grpc_timeouts {
+        if let Err(e) = grpc_timeouts.validate() {
+            warn!(
+                "gRPC 超时配置验证失败: {}，使用默认配置",
+                e
+            );
+            config.grpc_timeouts = Some(GrpcTimeoutConfig::default());
+        }
+    }
+
     config
 }
 
@@ -364,6 +624,9 @@ fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
 
     // 获取 agent_cleanup 配置，如果不存在则使用默认值
     let agent_cleanup = config.agent_cleanup.as_ref().cloned().unwrap_or_default();
+
+    // 获取 grpc_timeouts 配置，如果不存在则使用默认值
+    let grpc_timeouts = config.grpc_timeouts.as_ref().cloned().unwrap_or_default();
 
     // 手动构建带注释的 YAML 内容
     let content_with_comments = format!(
@@ -412,6 +675,34 @@ agent_cleanup:
   # 有效范围: 5 - 3600 秒（5秒 - 1小时）
   # 可通过环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 覆盖
   cleanup_interval_secs: {}
+
+# gRPC 超时配置
+# 如果省略此配置块，将使用以下默认值：
+#   - cancel_session_timeout_secs: 30 (30秒)
+#   - acp_session_create_timeout_secs: 100 (100秒)
+#   - agent_cancel_timeout_secs: 10 (10秒)
+#   - port_check_timeout_millis: 500 (500毫秒)
+grpc_timeouts:
+  # 取消会话超时（秒）
+  # gRPC 取消会话请求的最大等待时间
+  # 有效范围: 5 - 300 秒
+  # 可通过环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 覆盖
+  cancel_session_timeout_secs: {}
+  # ACP 会话创建超时（秒）
+  # Agent 创建新会话的最大等待时间（MCP 工具较多时可能需要更长时间）
+  # 有效范围: 10 - 300 秒
+  # 可通过环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 覆盖
+  acp_session_create_timeout_secs: {}
+  # Agent 取消调用超时（秒）
+  # Agent 内部取消操作的最大等待时间
+  # 有效范围: 5 - 60 秒
+  # 可通过环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 覆盖
+  agent_cancel_timeout_secs: {}
+  # 端口检查超时（毫秒）
+  # 检查端口可用性的最大等待时间
+  # 有效范围: 100 - 10000 毫秒
+  # 可通过环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 覆盖
+  port_check_timeout_millis: {}
 "#,
         config.default_agent_id,
         config.projects_dir.display(),
@@ -426,7 +717,11 @@ agent_cleanup:
         proxy_config.health_check.healthy_threshold,
         proxy_config.health_check.unhealthy_threshold,
         agent_cleanup.idle_timeout_secs,
-        agent_cleanup.cleanup_interval_secs
+        agent_cleanup.cleanup_interval_secs,
+        grpc_timeouts.cancel_session_timeout_secs,
+        grpc_timeouts.acp_session_create_timeout_secs,
+        grpc_timeouts.agent_cancel_timeout_secs,
+        grpc_timeouts.port_check_timeout_millis
     );
 
     fs::write(CONFIG_FILE, content_with_comments)

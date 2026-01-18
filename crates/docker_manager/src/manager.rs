@@ -341,6 +341,8 @@ impl DockerManager {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
         // 创建容器信息
+        // 注意：由于容器间通过 Docker 内部网络通信，assigned_port 设为 0
+        // 实际通信使用 container_ip:internal_port
         let container_info = DockerContainerInfo {
             container_id: container_id.clone(),
             container_name: container_name.clone(),
@@ -354,7 +356,7 @@ impl DockerManager {
             host_path: config.host_path.clone(),
             container_path: config.container_path.clone(),
             port_bindings: config.port_bindings.clone(),
-            assigned_port: 3000, // TODO: 使用动态分配的端口
+            assigned_port: 0, // 内部网络通信，不需要宿主机端口
             health_status: None,
             service_health: None,                         // 初始无健康检查结果
             internal_port: 8080,                          // 默认内部端口
@@ -471,7 +473,7 @@ impl DockerManager {
     /// - 容器重启后 ID 会变化，导致使用旧 ID 操作失败（404 错误）
     ///
     /// **迁移指南**：
-    /// ```rust,no_run
+    /// ```text
     /// // ❌ 旧方式（可能使用过期的 container_id）
     /// if let Some(info) = docker_manager.find_container_by_identifier("container_name").await {
     ///     docker_manager.stop_container_by_id(&info.container_id).await?;

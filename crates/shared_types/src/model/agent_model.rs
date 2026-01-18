@@ -475,7 +475,3 @@ impl AgentLifecycle for AgentLifecycleGuard {
         self.cancellation_token()
     }
 }
-
-// 类型别名
-pub type AgentStopGuard = AgentLifecycleGuard;
-pub type AgentStopHandleArc = Arc<AgentLifecycleGuard>;

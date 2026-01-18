@@ -72,7 +72,7 @@ pub mod traits;
 // Re-export types from submodules
 pub use acp::{CancelNotificationRequestWrapper, CancelResult};
 pub use launcher::{
-    AgentLaunchConfig, AgentLifecycleGuard, AgentStopGuard, AgentStopHandleArc,
+    AgentLaunchConfig, AgentLifecycleGuard,
     ClaudeCodeLauncher, LauncherConnectionInfo, LauncherConnectionInfoComplete,
     convert_context_servers, get_default_agent_config, load_agent_config,
     spawn_cancel_handler_for_agent, spawn_prompt_handler_for_agent,

@@ -1,6 +1,6 @@
-//! 通道工具模块
+//! Channel utility module
 //!
-//! 提供代理通信所需的通道处理工具函数
+//! Provides channel handling utility functions required for agent communication
 
 use crate::acp::{CancelNotificationRequestWrapper, CancelResult};
 use crate::traits::{SessionNotifier, SessionRegistry};
@@ -11,97 +11,99 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// Prompt 处理器配置
+/// Prompt handler configuration
 ///
-/// 使用泛型 `R: SessionRegistry` 替代直接依赖 DashMap，支持依赖注入
+/// Uses generic `R: SessionRegistry` instead of directly depending on DashMap, supporting dependency injection
 pub struct PromptHandlerConfig<N: SessionNotifier, R: SessionRegistry> {
-    /// 是否是 resume 会话
+    /// Whether this is a resume session
     pub is_resume_session: bool,
-    /// 项目路径（用于降级时创建新会话）
+    /// Project path (for creating new session during degradation)
     pub project_path: PathBuf,
-    /// MCP 服务器配置（用于降级时创建新会话）
+    /// MCP server configuration (for creating new session during degradation)
     pub mcp_servers: Vec<McpServer>,
-    /// 会话注册表（用于降级时更新）
+    /// Session registry (for updating during degradation)
     pub registry: Arc<R>,
-    /// Cancel 通道（用于降级时创建新会话条目）
+    /// Cancel channel (for creating new session entry during degradation)
     pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
-    /// 生命周期句柄（用于降级时创建新会话条目）
+    /// Lifecycle handle (for creating new session entry during degradation)
     pub lifecycle_handle: Option<Arc<dyn AgentLifecycle>>,
-    /// 模型配置（用于降级时创建新会话条目）
+    /// Model configuration (for creating new session entry during degradation)
     pub model_provider: Option<ModelProviderConfig>,
-    /// 通知器
+    /// Notifier
     pub notifier: Arc<N>,
 }
 
-/// 为 Agent 启动取消处理器
+/// Spawn cancel handler for Agent
 ///
-/// 处理取消请求并通过 oneshot channel 返回结果给调用方
+/// Handles cancel requests and returns results to caller via oneshot channel
 pub fn spawn_cancel_handler_for_agent(
     client_conn: Arc<ClientSideConnection>,
     mut cancel_rx: mpsc::UnboundedReceiver<CancelNotificationRequestWrapper>,
     project_id: &str,
+    cancel_timeout_secs: Option<u64>,
 ) {
     let project_id = project_id.to_string();
+    let timeout_secs = cancel_timeout_secs.unwrap_or(10); // Default 10 seconds
     tokio::task::spawn_local(async move {
         while let Some(cancel_request_wrapper) = cancel_rx.recv().await {
-            info!("项目[{}]收到取消请求", project_id);
+            info!("Project[{}] received cancel request", project_id);
 
-            // 直接从包装器中提取 CancelNotification 和结果通道
+            // Extract CancelNotification and result channel directly from wrapper
             let cancel_notification = cancel_request_wrapper.cancel_notification;
             let result_tx = cancel_request_wrapper.result_tx;
 
-            // 添加超时保护，防止 Agent cancel 调用阻塞
+            // Add timeout protection to prevent Agent cancel call from blocking
             let cancel_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(10),
+                tokio::time::Duration::from_secs(timeout_secs),
                 client_conn.cancel(cancel_notification),
             )
             .await;
 
-            // 根据结果发送响应
+            // Send response based on result
             let result = match cancel_result {
                 Ok(Ok(_)) => {
-                    info!("项目[{}]Agent取消成功", project_id);
+                    info!("Project[{}] Agent cancel succeeded", project_id);
                     CancelResult::Success
                 }
                 Ok(Err(e)) => {
                     let error_msg = format!("{:?}", e);
-                    error!("项目[{}]发送Cancel失败: {}", project_id, error_msg);
+                    error!("Project[{}] send Cancel failed: {}", project_id, error_msg);
                     CancelResult::Failed(error_msg)
                 }
                 Err(_timeout_err) => {
-                    warn!("项目[{}]Agent取消超时", project_id);
+                    warn!("Project[{}] Agent cancel timeout", project_id);
                     CancelResult::Timeout
                 }
             };
 
-            // 通过 oneshot channel 返回结果
+            // Return result via oneshot channel
             if let Err(e) = result_tx.send(result) {
                 error!(
-                    "项目[{}]发送取消结果失败（接收方已关闭）: {:?}",
+                    "Project[{}] failed to send cancel result (receiver closed): {:?}",
                     project_id, e
                 );
             }
         }
 
-        info!("项目[{}]Cancel处理任务结束", project_id);
+        info!("Project[{}] cancel handler task ended", project_id);
     });
 }
 
-/// 为 Agent 启动提示处理器
+/// Spawn prompt handler for Agent
 ///
-/// # 参数
-/// - `client_conn`: ACP 客户端连接
-/// - `prompt_rx`: Prompt 消息接收通道
-/// - `session_id`: 当前会话 ID
-/// - `project_id`: 项目 ID
-/// - `config`: Prompt 处理器配置（包含降级所需的所有信息）
+/// # Arguments
+/// - `client_conn`: ACP client connection
+/// - `prompt_rx`: Prompt message receive channel
+/// - `session_id`: Current session ID
+/// - `project_id`: Project ID
+/// - `config`: Prompt handler configuration (contains all information needed for degradation)
 ///
-/// # 降级机制
-/// 当 resume 会话的首次 Prompt 失败时，会在内部完成降级：
-/// 1. 创建新会话（不带 resume）
-/// 2. 更新 registry 中的会话信息
-/// 3. 重试 Prompt
-/// 4. 继续处理后续 Prompt
+/// # Degradation Mechanism
+/// When the first Prompt of a resume session fails, degradation is completed internally:
+/// 1. Create new session (without resume)
+/// 2. Update session info in registry
+/// 3. Retry Prompt
+/// 4. Continue processing subsequent Prompts
 pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRegistry + 'static>(
     client_conn: Arc<ClientSideConnection>,
     mut prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
@@ -115,9 +117,9 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
     let current_session_id = session_id;
     let session_id_str = current_session_id.0.clone();
 
-    // 提取配置
+    // Extract configuration
     let is_resume_session = config.is_resume_session;
-    // 以下变量预留给未来的降级重建逻辑
+    // Variables reserved for future degradation rebuild logic
     let _project_path = config.project_path;
     let _mcp_servers = config.mcp_servers;
     let _registry = config.registry;
@@ -128,67 +130,67 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
 
     tokio::task::spawn_local(async move {
         info!(
-            "🚀 项目[{}]Prompt处理任务已启动，开始监听消息... (is_resume={})",
+            "🚀 Project[{}] Prompt handler task started, listening for messages... (is_resume={})",
             project_id, is_resume_session
         );
 
-        // 追踪是否是第一个 Prompt（用于 resume 降级检测）
+        // Track if this is the first Prompt (for resume degradation detection)
         let mut is_first_prompt = true;
-        // 追踪是否已经降级过（每个会话只降级一次）
+        // Track if already degraded (only degrade once per session)
         let mut has_fallback = false;
 
         while let Some(mut req) = prompt_rx.recv().await {
-            info!("📨 项目[{}]从prompt_rx接收到Prompt消息", project_id);
+            info!("📨 Project[{}] received Prompt message from prompt_rx", project_id);
 
-            // 如果收到的 session_id 与当前不一致，强制覆盖
+            // If received session_id differs from current, force override
             if req.session_id.0 != current_session_id.0 {
                 warn!(
-                    "项目[{}]收到Prompt的session_id({})与当前agent会话({})不一致，强制覆盖为当前会话",
+                    "Project[{}] received Prompt session_id({}) differs from current agent session({}), forcing override to current session",
                     project_id, req.session_id.0, current_session_id.0
                 );
                 req.session_id = current_session_id.clone();
             }
 
             info!(
-                "项目[{}]收到Prompt消息, session_id={}",
+                "Project[{}] received Prompt message, session_id={}",
                 project_id, req.session_id.0
             );
 
-            // 从 PromptRequest.meta 中提取 request_id
+            // Extract request_id from PromptRequest.meta
             let request_id = if let Some(ref meta) = req.meta {
                 let req_id = meta
                     .get("request_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 debug!(
-                    "🔍 项目[{}] 从 PromptRequest.meta 提取 request_id={:?}",
+                    "🔍 Project[{}] extracted request_id={:?} from PromptRequest.meta",
                     project_id, req_id
                 );
                 req_id
             } else {
-                debug!("⚠️ 项目[{}] PromptRequest.meta 为空", project_id);
+                debug!("⚠️ Project[{}] PromptRequest.meta is empty", project_id);
                 None
             };
 
-            // 发送 SessionPromptStart 通知
+            // Send SessionPromptStart notification
             if let Err(e) = notifier
                 .notify_prompt_start(&project_id, &session_id_str, request_id.clone())
                 .await
             {
-                error!("项目[{}]发送SessionPromptStart失败: {:?}", project_id, e);
+                error!("Project[{}] failed to send SessionPromptStart: {:?}", project_id, e);
             }
 
-            // 调用 Agent 处理 prompt
-            // ⚠️ 注意：不设置超时，因为 Agent 任务可能执行很长时间（代码生成、文件操作等）
-            // 超时保护由 Worker 级别的心跳监控来处理
+            // Call Agent to handle prompt
+            // ⚠️ Note: No timeout set, as Agent tasks may take a long time (code generation, file operations, etc.)
+            // Timeout protection is handled by Worker-level heartbeat monitoring
             match client_conn.prompt(req.clone()).await {
                 Ok(resp) => {
                     info!(
-                        "项目[{}]Prompt发送成功, stop_reason={:?}",
+                        "Project[{}] Prompt sent successfully, stop_reason={:?}",
                         project_id, resp.stop_reason
                     );
 
-                    // 发送 SessionPromptEnd 通知
+                    // Send SessionPromptEnd notification
                     if let Err(e) = notifier
                         .notify_prompt_end(
                             &project_id,
@@ -199,29 +201,29 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
                         )
                         .await
                     {
-                        error!("项目[{}]发送SessionPromptEnd失败: {:?}", project_id, e);
+                        error!("Project[{}] failed to send SessionPromptEnd: {:?}", project_id, e);
                     }
 
-                    // 第一个 Prompt 成功，说明 resume 有效
+                    // First Prompt succeeded, resume is valid
                     is_first_prompt = false;
                 }
                 Err(e) => {
-                    // Agent 返回错误
+                    // Agent returned error
                     let error_message = e.message.clone();
-                    error!("项目[{}]发送Prompt失败: {:?}", project_id, error_message);
+                    error!("Project[{}] failed to send Prompt: {:?}", project_id, error_message);
 
-                    // 🆕 Resume 降级逻辑重构：
-                    // 检测到 Resume 会话首次 Prompt 失败时，不在此处降级
-                    // 而是通过 gRPC 响应返回降级标识，让 rcoder 层处理降级
+                    // 🆕 Resume degradation logic refactored:
+                    // When Resume session first Prompt failure is detected, don't degrade here
+                    // Instead return degradation identifier via gRPC response, letting rcoder layer handle degradation
                     let should_fallback = is_first_prompt && is_resume_session && !has_fallback;
 
                     if should_fallback {
                         warn!(
-                            "⚠️ 项目[{}] Resume 会话首次 Prompt 失败，需要降级: {}",
+                            "⚠️ Project[{}] Resume session first Prompt failed, needs degradation: {}",
                             project_id, error_message
                         );
 
-                        // 发送错误通知
+                        // Send error notification
                         if let Err(notify_err) = notifier
                             .notify_prompt_error(
                                 &project_id,
@@ -232,12 +234,12 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
                             .await
                         {
                             error!(
-                                "项目[{}]发送SessionPromptError失败: {:?}",
+                                "Project[{}] failed to send SessionPromptError: {:?}",
                                 project_id, notify_err
                             );
                         }
 
-                        // 发送 SessionPromptEnd 通知
+                        // Send SessionPromptEnd notification
                         if let Err(notify_err) = notifier
                             .notify_prompt_end(
                                 &project_id,
@@ -249,32 +251,32 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
                             .await
                         {
                             error!(
-                                "项目[{}]发送SessionPromptEnd失败: {:?}",
+                                "Project[{}] failed to send SessionPromptEnd: {:?}",
                                 project_id, notify_err
                             );
                         }
 
-                        // 标记已降级，防止重复检测
+                        // Mark as degraded to prevent repeated detection
                         has_fallback = true;
 
-                        // 继续处理下一个 Prompt
-                        info!("⚠️ 项目[{}] Resume 失败已通知，继续等待重试", project_id);
+                        // Continue processing next Prompt
+                        info!("⚠️ Project[{}] Resume failure notified, continuing to wait for retry", project_id);
                         continue;
                     }
 
-                    // 正常错误处理流程
-                    // 发送 SessionPromptError 通知
+                    // Normal error handling flow
+                    // Send SessionPromptError notification
                     if let Err(notify_err) = notifier
                         .notify_prompt_error(&project_id, &session_id_str, e, request_id.clone())
                         .await
                     {
                         error!(
-                            "项目[{}]发送SessionPromptError失败: {:?}",
+                            "Project[{}] failed to send SessionPromptError: {:?}",
                             project_id, notify_err
                         );
                     }
 
-                    // 发送 SessionPromptEnd 通知，标记会话结束
+                    // Send SessionPromptEnd notification, marking session end
                     if let Err(notify_err) = notifier
                         .notify_prompt_end(
                             &project_id,
@@ -286,17 +288,17 @@ pub fn spawn_prompt_handler_for_agent<N: SessionNotifier + 'static, R: SessionRe
                         .await
                     {
                         error!(
-                            "项目[{}]发送SessionPromptEnd失败: {:?}",
+                            "Project[{}] failed to send SessionPromptEnd: {:?}",
                             project_id, notify_err
                         );
                     }
 
-                    // 第一个 Prompt 处理完毕（无论成功失败）
+                    // First Prompt processing complete (whether success or failure)
                     is_first_prompt = false;
                 }
             }
         }
 
-        info!("项目[{}]Prompt处理任务结束", project_id);
+        info!("Project[{}] Prompt handler task ended", project_id);
     });
 }

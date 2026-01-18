@@ -199,7 +199,7 @@ impl AgentSessionRegistry {
     /// - false: Agent 不存在或条件不满足（未更新）
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,ignore
     /// registry.try_update_agent_info("project-123", |info| {
     ///     if info.status == AgentStatus::Active {
     ///         info.status = AgentStatus::Idle;
@@ -455,7 +455,7 @@ impl AgentSessionRegistry {
     /// 在高并发场景下，应立即使用返回值，避免长时间持有结果导致的潜在阻塞。
     ///
     /// 推荐用法：
-    /// ```rust
+    /// ```rust,ignore
     /// let count = AGENT_REGISTRY.stats().agent_count;  // 立即提取数值
     /// // 使用 count，而不是持有整个 RegistryStats
     /// ```

@@ -1,49 +1,61 @@
 //! Agent trait definition.
 
-// SACP 类型导入
+// SACP type imports
 use sacp::schema::McpServer;
 
-/// Agent 启动配置
+/// Agent startup configuration
 ///
-/// 包含启动 Agent 所需的额外配置信息，如系统提示词、MCP 服务器配置等。
-/// 这些配置通过 ACP 协议的 NewSessionRequest 传递给 Agent。
+/// Contains additional configuration information required to start an Agent,
+/// such as system prompts, MCP server configurations, etc.
+/// These configurations are passed to the Agent via ACP protocol's NewSessionRequest.
 #[derive(Debug, Clone)]
 pub struct AgentStartConfig {
-    /// 系统提示词（通过 meta.systemPrompt.append 传递）
+    /// System prompt (passed via meta.systemPrompt.append)
     ///
-    /// 使用 ACP 协议的 `_meta.systemPrompt.append` 模式，保留 claude_code preset 的基础能力，
-    /// 同时追加自定义的系统提示词。
+    /// Uses the `_meta.systemPrompt.append` mode of the ACP protocol to preserve
+    /// the base capabilities of the claude_code preset while appending custom system prompts.
     pub system_prompt: Option<String>,
 
-    /// MCP 服务器配置
+    /// MCP server configuration
     pub mcp_servers: Vec<McpServer>,
 
-    /// 额外的 meta 字段
+    /// Additional meta fields
     ///
-    /// 可以传递任何额外的配置信息给 Agent
+    /// Can pass any additional configuration information to the Agent
     pub extra_meta: Option<serde_json::Map<String, serde_json::Value>>,
 
-    /// 服务类型（用于加载对应的配置，必填）
+    /// Service type (for loading corresponding config, required)
     pub service_type: shared_types::ServiceType,
 
-    /// 用于恢复会话的 session_id
+    /// Session ID for resuming sessions
     ///
-    /// 当需要恢复之前的会话时，传入之前的 session_id，
-    /// 这将通过 `_meta.claudeCode.options.resume` 传递给 Agent。
+    /// When resuming a previous session, pass the previous session_id,
+    /// which will be passed to the Agent via `_meta.claudeCode.options.resume`.
     pub resume_session_id: Option<String>,
 
-    /// 🆕 Agent 服务器配置覆盖（用于自定义 Agent 启动命令）
+    /// 🆕 Agent server config override (for custom Agent startup command)
     ///
-    /// 当用户请求中指定了 agent_server 配置时，使用该配置覆盖默认配置。
-    /// 包含 command、args、env 等字段。
+    /// When the user request specifies agent_server config, use this config
+    /// to override the default config. Includes command, args, env, etc.
     pub agent_server_override: Option<shared_types::ChatAgentServerConfig>,
+
+    /// 🆕 ACP session creation timeout (seconds), default 100
+    ///
+    /// Maximum wait time for Agent to create a new session
+    /// (may require more time when there are many MCP tools)
+    pub acp_session_create_timeout_secs: Option<u64>,
+
+    /// 🆕 Agent cancel call timeout (seconds), default 10
+    ///
+    /// Maximum wait time for Agent internal cancel operations
+    pub agent_cancel_timeout_secs: Option<u64>,
 }
 
 impl AgentStartConfig {
-    /// 创建新的 AgentStartConfig
+    /// Create a new AgentStartConfig
     ///
-    /// # 参数
-    /// - `service_type`: 服务类型（必填）
+    /// # Arguments
+    /// - `service_type`: Service type (required)
     pub fn new(service_type: shared_types::ServiceType) -> Self {
         Self {
             system_prompt: None,
@@ -52,22 +64,24 @@ impl AgentStartConfig {
             service_type,
             resume_session_id: None,
             agent_server_override: None,
+            acp_session_create_timeout_secs: None,
+            agent_cancel_timeout_secs: None,
         }
     }
 
-    /// 设置系统提示词
+    /// Set system prompt
     pub fn with_system_prompt(mut self, system_prompt: String) -> Self {
         self.system_prompt = Some(system_prompt);
         self
     }
 
-    /// 设置 MCP 服务器配置
+    /// Set MCP server configuration
     pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
         self.mcp_servers = mcp_servers;
         self
     }
 
-    /// 设置额外的 meta 字段
+    /// Set additional meta fields
     pub fn with_extra_meta(
         mut self,
         extra_meta: serde_json::Map<String, serde_json::Value>,
@@ -76,19 +90,19 @@ impl AgentStartConfig {
         self
     }
 
-    /// 设置服务类型
+    /// Set service type
     pub fn with_service_type(mut self, service_type: shared_types::ServiceType) -> Self {
         self.service_type = service_type;
         self
     }
 
-    /// 设置用于恢复会话的 session_id
+    /// Set session ID for resuming sessions
     pub fn with_resume_session_id(mut self, session_id: String) -> Self {
         self.resume_session_id = Some(session_id);
         self
     }
 
-    /// 🆕 设置 Agent 服务器配置覆盖
+    /// 🆕 Set Agent server config override
     pub fn with_agent_server_override(
         mut self,
         agent_server: shared_types::ChatAgentServerConfig,
@@ -97,17 +111,29 @@ impl AgentStartConfig {
         self
     }
 
-    /// 构建 NewSessionRequest 的 meta 字段
+    /// 🆕 Set ACP session creation timeout
+    pub fn with_acp_session_create_timeout(mut self, timeout_secs: u64) -> Self {
+        self.acp_session_create_timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    /// 🆕 Set Agent cancel call timeout
+    pub fn with_agent_cancel_timeout(mut self, timeout_secs: u64) -> Self {
+        self.agent_cancel_timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    /// Build the meta field for NewSessionRequest
     ///
-    /// 将系统提示词和额外的 meta 字段合并为一个 JSON Map，
-    /// 用于传递给 ACP 协议的 NewSessionRequest。
+    /// Merges the system prompt and additional meta fields into a JSON Map
+    /// for passing to the ACP protocol's NewSessionRequest.
     ///
-    /// # 返回值
-    /// 返回包含 `systemPrompt: { append: "..." }` 的 Meta 对象
+    /// # Returns
+    /// Returns a Meta object containing `systemPrompt: { append: "..." }`
     pub fn build_meta(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut meta = serde_json::Map::new();
 
-        // 添加系统提示词（使用 append 模式）
+        // Add system prompt (using append mode)
         if let Some(ref system_prompt) = self.system_prompt {
             let mut system_prompt_obj = serde_json::Map::new();
             system_prompt_obj.insert(
@@ -120,11 +146,11 @@ impl AgentStartConfig {
             );
         }
 
-        // 添加 session_id 到 resume，用于恢复会话
-        // 参考 agent 端的 TypeScript 代码:
+        // Add session_id to resume, for resuming sessions
+        // Refer to the TypeScript code on the Agent side:
         // resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume
         if let Some(ref session_id) = self.resume_session_id {
-            // 构建 claudeCode.options.resume 结构
+            // Build claudeCode.options.resume structure
             let mut options = serde_json::Map::new();
             options.insert(
                 "resume".to_string(),
@@ -140,10 +166,10 @@ impl AgentStartConfig {
             );
         }
 
-        // 合并额外的 meta 字段
+        // Merge additional meta fields
         if let Some(ref extra) = self.extra_meta {
             for (key, value) in extra {
-                // 如果键已存在（如 systemPrompt），不覆盖
+                // Don't overwrite if key already exists (e.g., systemPrompt)
                 if !meta.contains_key(key) {
                     meta.insert(key.clone(), value.clone());
                 }
@@ -153,28 +179,28 @@ impl AgentStartConfig {
         meta
     }
 
-    /// 检查是否有系统提示词
+    /// Check if there is a system prompt
     pub fn has_system_prompt(&self) -> bool {
         self.system_prompt.is_some()
     }
 
-    /// 检查是否有 MCP 服务器配置
+    /// Check if there are MCP server configurations
     pub fn has_mcp_servers(&self) -> bool {
         !self.mcp_servers.is_empty()
     }
 
-    /// 构建不包含 resume 参数的 meta
+    /// Build meta without resume parameter
     ///
-    /// 当 list_sessions 检查发现会话不存在时使用。
-    /// 与 build_meta() 类似，但不包含 claudeCode.options.resume 字段。
+    /// Used when the list_sessions check finds the session does not exist.
+    /// Similar to build_meta(), but without the claudeCode.options.resume field.
     ///
-    /// # 使用场景
-    /// - 用户传入了 session_id，但通过 list_sessions API 验证发现该会话不存在
-    /// - 此时创建新会话，但保留其他配置（系统提示词、extra_meta 等）
+    /// # Use Cases
+    /// - User passed a session_id, but verification via list_sessions API found it doesn't exist
+    /// - Create a new session while preserving other configs (system prompt, extra_meta, etc.)
     pub fn build_meta_without_resume(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut meta = serde_json::Map::new();
 
-        // 只添加系统提示词（使用 append 模式，与 build_meta 保持一致）
+        // Only add system prompt (using append mode, consistent with build_meta)
         if let Some(ref system_prompt) = self.system_prompt {
             let mut system_prompt_obj = serde_json::Map::new();
             system_prompt_obj.insert(
@@ -187,7 +213,7 @@ impl AgentStartConfig {
             );
         }
 
-        // 合并额外的 meta 字段（不覆盖已存在的键）
+        // Merge additional meta fields (don't overwrite existing keys)
         if let Some(ref extra) = self.extra_meta {
             for (key, value) in extra {
                 if !meta.contains_key(key) {
@@ -200,55 +226,56 @@ impl AgentStartConfig {
     }
 }
 
-/// Agent 通用的 Prompt 消息
+/// Agent common Prompt message
 ///
-/// 这是 Agent 抽象层的核心数据结构，只包含 Agent 执行任务所需的核心信息。
-/// 不包含业务层配置（如 model_provider、mcp 配置等）。
+/// This is the core data structure of the Agent abstraction layer, containing only
+/// the core information needed for the Agent to execute tasks.
+/// Does not contain business layer configurations (such as model_provider, mcp configs, etc.).
 #[derive(Debug, Clone)]
 pub struct PromptMessage {
-    /// 用户输入的主要 prompt 文本
+    /// Main prompt text entered by the user
     pub content: String,
 
-    /// 项目 ID
+    /// Project ID
     pub project_id: String,
 
-    /// 项目工作目录路径
+    /// Project working directory path
     pub project_path: std::path::PathBuf,
 
-    /// 会话 ID（可选，如果为 None 则 Agent 会创建新会话）
+    /// Session ID (optional, if None the Agent will create a new session)
     pub session_id: Option<String>,
 
-    /// 请求追踪 ID
+    /// Request tracking ID
     pub request_id: String,
 
-    /// 附件列表（支持文本、图像、音频、文档等）
+    /// Attachment list (supports text, images, audio, documents, etc.)
     pub attachments: Vec<shared_types::Attachment>,
 
-    /// 数据源附件（JSON 字符串数组）
+    /// Data source attachments (JSON string array)
     pub data_source_attachments: Vec<String>,
 
-    /// 服务类型
+    /// Service type
     pub service_type: shared_types::ServiceType,
 
-    // === 新增字段 (v2) ===
-    /// 系统提示词覆盖
+    // === New fields (v2) ===
+    /// System prompt override
     ///
-    /// 如果提供，将覆盖默认的系统提示词配置
+    /// If provided, will override the default system prompt configuration
     pub system_prompt_override: Option<String>,
 
-    /// 用户提示词模板覆盖
+    /// User prompt template override
     ///
-    /// 如果提供，将使用此模板替换 `{user_prompt}` 变量
+    /// If provided, will use this template to replace the `{user_prompt}` variable
     pub user_prompt_template_override: Option<String>,
 
-    /// Agent 运行时配置覆盖（MCP 服务器等）
+    /// Agent runtime config override (MCP servers, etc.)
     ///
-    /// 包含 Agent 服务器配置和 MCP 服务器配置
+    /// Contains Agent server configuration and MCP server configuration
     pub agent_config_override: Option<shared_types::ChatAgentConfig>,
 }
 
 impl PromptMessage {
-    /// 创建新的 PromptMessage
+    /// Create a new PromptMessage
     pub fn new(
         content: String,
         project_id: String,
@@ -265,44 +292,44 @@ impl PromptMessage {
             attachments: Vec::new(),
             data_source_attachments: Vec::new(),
             service_type,
-            // 新增字段默认为 None
+            // New fields default to None
             system_prompt_override: None,
             user_prompt_template_override: None,
             agent_config_override: None,
         }
     }
 
-    /// 设置会话 ID
+    /// Set session ID
     pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id;
         self
     }
 
-    /// 设置附件列表
+    /// Set attachment list
     pub fn with_attachments(mut self, attachments: Vec<shared_types::Attachment>) -> Self {
         self.attachments = attachments;
         self
     }
 
-    /// 设置数据源附件
+    /// Set data source attachments
     pub fn with_data_source_attachments(mut self, data_source_attachments: Vec<String>) -> Self {
         self.data_source_attachments = data_source_attachments;
         self
     }
 
-    /// 设置系统提示词覆盖
+    /// Set system prompt override
     pub fn with_system_prompt_override(mut self, system_prompt: Option<String>) -> Self {
         self.system_prompt_override = system_prompt;
         self
     }
 
-    /// 设置用户提示词模板覆盖
+    /// Set user prompt template override
     pub fn with_user_prompt_template_override(mut self, template: Option<String>) -> Self {
         self.user_prompt_template_override = template;
         self
     }
 
-    /// 设置 Agent 配置覆盖
+    /// Set Agent config override
     pub fn with_agent_config_override(
         mut self,
         config: Option<shared_types::ChatAgentConfig>,
@@ -312,7 +339,7 @@ impl PromptMessage {
     }
 }
 
-/// 从 ChatPrompt 转换为 PromptMessage
+/// Convert from ChatPrompt to PromptMessage
 impl From<shared_types::ChatPrompt> for PromptMessage {
     fn from(chat_prompt: shared_types::ChatPrompt) -> Self {
         Self {
@@ -321,13 +348,13 @@ impl From<shared_types::ChatPrompt> for PromptMessage {
             project_path: chat_prompt.project_path,
             session_id: chat_prompt.session_id,
             request_id: chat_prompt.request_id.unwrap_or_else(|| {
-                // 如果 ChatPrompt 中没有 request_id，生成一个
+                // Generate one if ChatPrompt doesn't have request_id
                 uuid::Uuid::new_v4().to_string().replace("-", "")
             }),
             attachments: chat_prompt.attachments,
             data_source_attachments: chat_prompt.data_source_attachments,
             service_type: chat_prompt.service_type,
-            // 新增字段映射
+            // Map new fields
             system_prompt_override: chat_prompt.system_prompt_override,
             user_prompt_template_override: chat_prompt.user_prompt_template_override,
             agent_config_override: chat_prompt.agent_config_override,

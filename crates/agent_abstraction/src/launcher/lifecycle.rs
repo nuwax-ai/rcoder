@@ -474,7 +474,3 @@ impl AgentLifecycle for AgentLifecycleGuard {
         AgentLifecycleGuard::cancellation_token(self)
     }
 }
-
-// 类型别名
-pub type AgentStopGuard = AgentLifecycleGuard;
-pub type AgentStopHandleArc = Arc<AgentLifecycleGuard>;

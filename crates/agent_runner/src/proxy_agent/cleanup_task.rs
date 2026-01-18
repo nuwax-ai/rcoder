@@ -140,15 +140,6 @@ impl AgentCleaner {
             if let Some((_, _)) = SESSION_CACHE.remove(&session_id) {
                 debug!("移除空session: {}", session_id);
             }
-
-            // 🆕 同时清理 SESSION_FIRST_PROMPT_SUCCESS 中的记录
-            // 避免内存泄漏
-            if crate::grpc::agent_service_impl::SESSION_FIRST_PROMPT_SUCCESS
-                .remove(&session_id)
-                .is_some()
-            {
-                debug!("清理 SESSION_FIRST_PROMPT_SUCCESS: {}", session_id);
-            }
         }
 
         if orphaned_count > 0 {
