@@ -32,6 +32,29 @@ RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-
 RUN npm install -g claude-code-acp-ts@latest
 
 
+# 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
+# 使用 CACHEBUST 变量触发缓存失效
+# RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest --registry=https://registry.npmjs.org/
+
+# 临时从源码安装 nuwaxcode
+RUN echo "Cache bust: ${CACHEBUST}" && \
+    echo "📦 从源码安装 nuwaxcode..." && \
+    git clone -b feat/nuwaxcode https://github.com/dongdada29/opencode.git /tmp/opencode && \
+    cd /tmp/opencode && \
+    echo "🔨 构建 nuwaxcode..." && \
+    bun build && \
+    echo "📦 全局安装 nuwaxcode..." && \
+    npm install -g . && \
+    echo "验证 nuwaxcode 安装..." && \
+    nuwaxcode -v && \
+    cd / && rm -rf /tmp/opencode && \
+    echo "✅ nuwaxcode 安装成功"
+
+# 配置 nuwaxcode - 禁用 websearch 和 webfetch 权限
+RUN mkdir -p /root/.config/opencode && \
+    echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
+
+
 # 安装 opencode - AI 驱动的代码导航工具
 # 注意：npm 包不支持 ARM64，使用官方安装脚本
 RUN echo "📦 安装 opencode..." && \

@@ -55,6 +55,11 @@ FROM ${BASE_IMAGE}
 # 设置工作目录
 WORKDIR /app
 
+# 安装 git（用于 nuwaxcode 源码安装）
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
 # 复制 .npmrc 文件
 COPY docker/rcoder-master/.npmrc /root/.npmrc
 
