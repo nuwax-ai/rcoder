@@ -58,19 +58,17 @@ RUN echo "Cache bust: ${CACHEBUST}" && \
         exit 1; \
     fi && \
     echo "选择二进制目录: ${BINARY_DIR}" && \
+    echo "进入 dist 目录..." && \
+    cd dist && \
+    echo "当前目录内容:" && \
     ls -la && \
     if [ -d "${BINARY_DIR}" ]; then \
         echo "找到构建产物目录: ${BINARY_DIR}" && \
         ls -la "${BINARY_DIR}/" && \
         cp "${BINARY_DIR}/nuwaxcode" /usr/local/bin/nuwaxcode && \
         chmod +x /usr/local/bin/nuwaxcode; \
-    elif [ -d "bin" ]; then \
-        echo "使用 bin 目录（可能是 Mac 风格构建）" && \
-        ls -la bin/ && \
-        cp bin/nuwaxcode /usr/local/bin/nuwaxcode && \
-        chmod +x /usr/local/bin/nuwaxcode; \
     else \
-        echo "❌ 未找到构建产物，列出当前目录:" && \
+        echo "❌ 未找到构建产物 ${BINARY_DIR}，列出当前目录:" && \
         ls -la && \
         exit 1; \
     fi && \
