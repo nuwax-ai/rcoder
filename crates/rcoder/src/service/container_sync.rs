@@ -3,9 +3,8 @@
 //! 定期从 Docker 同步容器状态到内存缓存。
 //! 主要用于检测被外部手动停止/删除的容器，并从缓存中清理。
 
-use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// 容器状态同步配置
 #[derive(Debug, Clone)]

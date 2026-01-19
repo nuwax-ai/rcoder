@@ -56,6 +56,7 @@
 
 use std::sync::Arc;
 
+use dashmap::mapref::entry::Entry;
 use shared_types::SessionEntry;
 
 /// 会话注册表 trait
@@ -119,6 +120,34 @@ pub trait SessionRegistry: Send + Sync + 'static {
 
     /// 获取会话数量
     fn count(&self) -> usize;
+
+    /// 获取 DashMap entry（用于原子性操作）
+    ///
+    /// # Arguments
+    /// * `project_id` - 项目 ID
+    ///
+    /// # Returns
+    /// DashMap Entry，支持原子性的 get/insert/update 操作
+    ///
+    /// # 使用示例
+    /// ```ignore
+    /// use dashmap::mapref::entry::Entry;
+    ///
+    /// match registry.entry(project_id.to_string()) {
+    ///     Entry::Occupied(mut occupied) => {
+    ///         // 已存在，可以检查和更新
+    ///         let existing = occupied.get();
+    ///         if needs_rebuild {
+    ///             occupied.insert(new_value);
+    ///         }
+    ///     }
+    ///     Entry::Vacant(vacant) => {
+    ///         // 不存在，可以插入
+    ///         vacant.insert(new_value);
+    ///     }
+    /// }
+    /// ```
+    fn entry(&self, project_id: String) -> Entry<'_, String, Self::Entry>;
 }
 
 /// SessionRegistry 的 Arc 包装器实现
@@ -149,5 +178,9 @@ impl<R: SessionRegistry> SessionRegistry for Arc<R> {
 
     fn count(&self) -> usize {
         (**self).count()
+    }
+
+    fn entry(&self, project_id: String) -> Entry<'_, String, Self::Entry> {
+        (**self).entry(project_id)
     }
 }

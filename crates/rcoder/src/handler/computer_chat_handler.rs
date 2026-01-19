@@ -732,11 +732,3 @@ fn ensure_project_mapping_in_state(
 // SSE 进度流处理器（复用现有的 agent_session_notification）
 // ============================================================================
 
-/// Computer Agent 进度通知 SSE 处理器
-///
-/// 复用现有的 agent_session_notification 处理器，
-/// 因为 session_id 到容器的映射已经在 handle_computer_chat 中建立。
-///
-/// 客户端可以直接使用 `/agent/progress/{session_id}` 接口，
-/// 或者使用 `/computer/progress/{session_id}` 作为别名。
-pub use super::agent_session_notification::agent_session_notification as computer_session_notification;

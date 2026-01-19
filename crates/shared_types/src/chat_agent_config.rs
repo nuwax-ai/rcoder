@@ -40,6 +40,7 @@ pub struct ChatAgentConfig {
 ///
 /// 对应内部 AgentConfig 的简化版本，只暴露必要的运行时配置。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Default)]
 pub struct ChatAgentServerConfig {
     /// Agent 标识符（可选，默认使用 "claude-code-acp"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,17 +95,6 @@ fn default_true() -> bool {
     true
 }
 
-impl Default for ChatAgentServerConfig {
-    fn default() -> Self {
-        Self {
-            agent_id: None,
-            command: None,
-            args: None,
-            env: None,
-            metadata: None,
-        }
-    }
-}
 
 impl Default for ChatContextServerConfig {
     fn default() -> Self {

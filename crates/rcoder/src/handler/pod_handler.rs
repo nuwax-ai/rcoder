@@ -849,7 +849,7 @@ pub async fn pod_ensure(
 
     // 5. 更新 DuckDB 存储中的容器信息（用于后续保活）
     // 无论容器是新建还是已存在，都要确保 DuckDB 记录是最新的
-    let mut project_info = if let Some(existing) = state.get_project(&request.project_id) {
+    let project_info = if let Some(existing) = state.get_project(&request.project_id) {
         // 如果已存在记录，更新容器信息
         let mut info = (*existing).clone();
         info.set_container(Some(container_info.clone()));

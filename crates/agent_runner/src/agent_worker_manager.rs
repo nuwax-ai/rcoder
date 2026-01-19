@@ -10,7 +10,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::proxy_agent::AgentRequest;
 
@@ -156,10 +156,9 @@ impl AgentWorkerManager {
 
     /// 获取最后心跳时间
     pub fn last_heartbeat_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.last_heartbeat
+        *self.last_heartbeat
             .lock()
             .expect("AgentWorkerManager::last_heartbeat mutex poisoned")
-            .clone()
     }
 
     /// 设置初始 sender（由 main.rs 调用）

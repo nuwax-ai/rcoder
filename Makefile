@@ -99,6 +99,7 @@ docker-build-master:
 	fi; \
 	docker build \
 		--build-arg CARGO_FLAGS="$$MASTER_CARGO_FLAGS" \
+		--build-arg CACHEBUST=$$(date +%s) \
 		-f docker/rcoder-master/Dockerfile -t master-rcoder:latest .;)
 	@echo "✅ master-rcoder 镜像构建完成！"
 

@@ -38,3 +38,20 @@ pub const SESSION_WAIT_TIMEOUT_SECS: u64 = 30;
 
 /// Session 消息缓冲区大小
 pub const SESSION_MESSAGE_BUFFER_SIZE: usize = 100;
+
+// === Agent 通道配置 ===
+
+/// Agent Prompt 通道容量
+///
+/// 控制 Agent Prompt 请求队列的大小，提供背压保护
+/// - 足够处理突发请求（100 个）
+/// - 通道满时异步等待，防止 OOM
+/// - 可通过环境变量 AGENT_PROMPT_CHANNEL_CAPACITY 覆盖
+pub const AGENT_PROMPT_CHANNEL_CAPACITY: usize = 100;
+
+/// Agent 取消通道容量
+///
+/// 控制 Agent 取消请求队列的大小
+/// - 取消请求通常较少，使用相同容量保持一致性
+/// - 可通过环境变量 AGENT_CANCEL_CHANNEL_CAPACITY 覆盖
+pub const AGENT_CANCEL_CHANNEL_CAPACITY: usize = 100;

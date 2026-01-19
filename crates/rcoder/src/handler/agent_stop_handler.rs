@@ -53,20 +53,54 @@ async fn destroy_container_for_project(
 
     // 尝试通过多种方式查找容器
     // 1. 先通过 project_id 查找
-    let mut container_info = docker_manager.get_container_info(project_id).await;
+    let container_info = docker_manager.get_container_info(project_id).await;
 
-    // 2. 如果没找到，尝试通过容器名称查找 (rcoder-agent-{project_id})
+    // 2. 如果没找到，尝试通过容器名称实时查找并直接停止
     if container_info.is_none() {
         let expected_container_name = format!("rcoder-agent-{}", project_id);
         info!(
-            "🔍 [STOP_DESTROY] 通过 project_id 未找到，尝试通过容器名称查找: {}",
+            "🔍 [STOP_DESTROY] 通过 project_id 未找到缓存，尝试实时查找容器: {}",
             expected_container_name
         );
 
-        // 使用新的查找函数
-        container_info = docker_manager
-            .find_container_by_identifier(&expected_container_name)
-            .await;
+        // 使用 find_container_realtime 获取最新的容器信息
+        if let Ok(Some((container_id, found_container_name, status, is_running))) = docker_manager
+            .find_container_realtime(&expected_container_name)
+            .await
+        {
+            info!(
+                "🎯 [STOP_DESTROY] 实时查找到容器: container_id={}, name={}, status={:?}, running={}",
+                container_id, found_container_name, status, is_running
+            );
+
+            // 直接使用 container_id 停止容器（无需再查缓存）
+            let stop_result = docker_manager.stop_container_by_id(&container_id).await;
+
+            if let Err(e) = stop_result {
+                error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
+                return Ok(HttpResult::error(
+                    shared_types::error_codes::ERR_STOP_FAILED,
+                    &format!("停止容器失败: {}", e),
+                ));
+            }
+
+            // 从 DuckDB 存储中移除项目
+            state.remove_project(project_id);
+
+            info!(
+                "✅ [STOP_DESTROY] 容器销毁成功（实时查找）: project_id={}, container_id={}",
+                project_id, container_id
+            );
+
+            let response = StopAgentResponse {
+                success: true,
+                project_id: project_id.to_string(),
+                session_id: None,
+                message: "容器已成功销毁".to_string(),
+            };
+
+            return Ok(HttpResult::success(response));
+        }
     }
 
     if let Some(container_info) = container_info {

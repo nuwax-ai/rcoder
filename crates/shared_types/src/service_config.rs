@@ -119,11 +119,10 @@ impl ServiceResourceLimits {
         }
 
         // Swap 应该 >= 内存
-        if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit) {
-            if swap < memory {
+        if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit)
+            && swap < memory {
                 return Err("swap_limit should be >= memory_limit".to_string());
             }
-        }
 
         Ok(())
     }
@@ -326,8 +325,8 @@ impl ServiceMountConfig {
         }
 
         // 验证路径格式
-        if self.container_path.starts_with('/') {
-            if !self
+        if self.container_path.starts_with('/')
+            && !self
                 .container_path
                 .chars()
                 .all(|c: char| c.is_alphanumeric() || "/-_.".contains(c))
@@ -337,7 +336,6 @@ impl ServiceMountConfig {
                     self.container_path
                 ));
             }
-        }
 
         if self.mount_type != "bind" && self.mount_type != "volume" {
             return ConfigValidationResult::Error(format!(

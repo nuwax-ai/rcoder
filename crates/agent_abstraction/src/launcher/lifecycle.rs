@@ -189,20 +189,38 @@ impl AgentLifecycleGuard {
 
         // 🔥 关键：立即启动后台回收任务
         // 这个任务会等待子进程退出，确保不会产生僵尸进程
+        // 同时监听取消信号，确保可以及时退出
+        let cancel_token_for_reaper = cancel_token.clone();
         let reaper_task = tokio::spawn(async move {
-            match child_process.wait().await {
-                Ok(status) => {
+            tokio::select! {
+                biased;
+
+                // 优先响应取消信号
+                _ = cancel_token_for_reaper.cancelled() => {
                     debug!(
-                        "[ProcessReaper] 子进程已回收: pid={}, pgid={}, status={:?}",
-                        pid, pgid, status
+                        "[ProcessReaper] 收到取消信号，退出: pid={}, pgid={}",
+                        pid, pgid
                     );
+                    return;
                 }
-                Err(e) => {
-                    // 进程可能已经被其他方式回收
-                    debug!(
-                        "[ProcessReaper] 子进程 wait() 失败（可能已回收）: pid={}, pgid={}, error={}",
-                        pid, pgid, e
-                    );
+
+                // 等待子进程退出
+                result = child_process.wait() => {
+                    match result {
+                        Ok(status) => {
+                            debug!(
+                                "[ProcessReaper] 子进程已回收: pid={}, pgid={}, status={:?}",
+                                pid, pgid, status
+                            );
+                        }
+                        Err(e) => {
+                            // 进程可能已经被其他方式回收
+                            debug!(
+                                "[ProcessReaper] 子进程 wait() 失败（可能已回收）: pid={}, pgid={}, error={}",
+                                pid, pgid, e
+                            );
+                        }
+                    }
                 }
             }
         });

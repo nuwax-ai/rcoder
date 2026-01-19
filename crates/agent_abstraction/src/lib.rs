@@ -73,9 +73,8 @@ pub mod traits;
 pub use acp::{CancelNotificationRequestWrapper, CancelResult};
 pub use launcher::{
     AgentLaunchConfig, AgentLifecycleGuard,
-    ClaudeCodeLauncher, LauncherConnectionInfo, LauncherConnectionInfoComplete,
+    ClaudeCodeLauncher, LauncherConnectionInfoComplete,
     convert_context_servers, get_default_agent_config, load_agent_config,
-    spawn_cancel_handler_for_agent, spawn_prompt_handler_for_agent,
 };
 pub use error::AgentAbstractionError;
 pub use session::{

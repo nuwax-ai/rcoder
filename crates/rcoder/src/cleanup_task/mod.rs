@@ -16,8 +16,9 @@ pub mod strategies;
 mod integration_tests;
 
 pub use cleaner::AgentCleaner;
-pub use config::{CleanupConfig, CleanupStats};
-pub use strategies::DestroyReason;
+pub use config::CleanupConfig;
+#[allow(unused_imports)] // CleanupStats 用于类型导出
+pub use config::CleanupStats;
 
 /// 启动清理任务
 ///

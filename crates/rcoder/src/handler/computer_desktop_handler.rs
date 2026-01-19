@@ -34,6 +34,7 @@ use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerMa
 
 /// VNC 桌面路径参数
 #[derive(Debug, Deserialize, ToSchema)]
+#[allow(dead_code)] // 字段由 axum 框架自动提取使用
 pub struct DesktopPathParams {
     /// 用户 ID
     #[schema(example = "user_123")]
@@ -242,6 +243,7 @@ pub async fn computer_desktop_vnc(
 
 /// VNC 桌面代理路径参数（用于 Pingora 代理）
 #[derive(Debug, Deserialize, ToSchema)]
+#[allow(dead_code)] // 字段由 axum 框架自动提取使用
 pub struct VncProxyPathParams {
     /// 用户 ID
     #[schema(example = "user_123")]
@@ -372,6 +374,7 @@ pub async fn computer_desktop_proxy(
 
 /// 音频代理路径参数
 #[derive(Debug, Deserialize, ToSchema)]
+#[allow(dead_code)] // 字段由 axum 框架自动提取使用
 pub struct AudioProxyPathParams {
     /// 用户 ID
     #[schema(example = "user_123")]
@@ -517,6 +520,7 @@ pub async fn computer_audio_proxy(
 
 /// IME 输入法代理路径参数
 #[derive(Debug, Deserialize, ToSchema)]
+#[allow(dead_code)] // 字段由 axum 框架自动提取使用
 pub struct ImeProxyPathParams {
     /// 用户 ID
     #[schema(example = "user_123")]

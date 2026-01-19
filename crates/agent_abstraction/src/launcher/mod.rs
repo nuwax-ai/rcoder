@@ -54,12 +54,6 @@
 pub mod lifecycle;
 mod claude_code_sacp;
 
-// Legacy ACP 实现（保留用于参考和过渡期兼容）
-#[allow(dead_code)]
-mod claude_code_acp_legacy;
-#[allow(dead_code)]
-mod channel;
-
 // ============================================================================
 // SACP 类型导出（推荐使用）
 // ============================================================================
@@ -80,7 +74,6 @@ pub use claude_code_sacp::{
 // 兼容性类型别名（向后兼容旧代码）
 // ============================================================================
 
-use crate::traits::SessionNotifier;
 
 /// 兼容性别名：ClaudeCodeLauncher -> SacpClaudeCodeLauncher
 pub type ClaudeCodeLauncher<N> = SacpClaudeCodeLauncher<N>;
@@ -99,21 +92,3 @@ pub use claude_code_sacp::get_default_sacp_agent_config as get_default_agent_con
 
 /// 兼容性别名：convert_context_servers -> convert_context_servers_sacp
 pub use claude_code_sacp::convert_context_servers_sacp as convert_context_servers;
-
-// ============================================================================
-// Legacy 类型（仅用于过渡期，将在后续版本移除）
-// ============================================================================
-
-// 旧版 channel 工具函数（SACP 版本不再需要，但保留用于兼容）
-// 注意：SACP 使用内置的回调机制处理 prompt 和 cancel，不需要单独的 channel handler
-#[allow(deprecated)]
-pub use channel::{
-    PromptHandlerConfig,
-    spawn_cancel_handler_for_agent,
-    spawn_prompt_handler_for_agent,
-};
-
-// Legacy LauncherConnectionInfo（旧版，不包含 lifecycle_guard）
-// SACP 版本总是包含 lifecycle_guard，推荐使用 LauncherConnectionInfoComplete
-#[allow(dead_code)]
-pub use claude_code_acp_legacy::LauncherConnectionInfo;

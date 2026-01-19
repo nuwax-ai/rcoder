@@ -57,12 +57,12 @@ pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetr
         info!("📍 [OTel] 追踪已禁用");
         // 即使追踪禁用，仍然初始化 Prometheus（如果启用）
         if config.prometheus_enabled {
-            return Ok(rcoder_telemetry::init_prometheus_only(&config.service_name)?);
+            return rcoder_telemetry::init_prometheus_only(&config.service_name);
         }
         // 创建一个空的 guard（仅保留服务名称，用于后续渲染指标）
         // 使用空的 telemetry_config 创建一个没有任何功能的 guard
         let telemetry_config = rcoder_telemetry::TelemetryConfig::new(&config.service_name);
-        return Ok(rcoder_telemetry::init(telemetry_config).await?);
+        return rcoder_telemetry::init(telemetry_config).await;
     }
 
     // 使用 from_env 从环境变量读取配置，然后覆盖必要字段

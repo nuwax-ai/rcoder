@@ -137,11 +137,10 @@ impl PingoraServerManager {
 
     /// 停止 Pingora 服务器
     pub async fn stop(&mut self) -> Result<()> {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            if let Err(_) = shutdown_tx.send(()) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take()
+            && shutdown_tx.send(()).is_err() {
                 error!("⚠️ [PINGORA] 发送关闭信号失败（接收端已关闭）");
             }
-        }
         Ok(())
     }
 

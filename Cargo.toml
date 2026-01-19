@@ -8,7 +8,6 @@ default-members = [
     "crates/agent_runner",
     "crates/shared_types",
     "crates/docker_manager",
-    "crates/acp_adapter",
     "crates/rcoder-proxy",
     "crates/duckdb_manager",
 ]
@@ -34,9 +33,7 @@ publish = false
 # ACP Protocol - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
 sacp = "10.1.0"
 sacp-derive = "10.0.0"
-# 官方 ACP 协议（迁移过程中保留，后续移除）
-agent-client-protocol = { version = "0.9.3", features = ["unstable"] }
-# SACP 所需的 schema 依赖
+# SACP 所需的 schema 依赖（共享类型定义）
 agent-client-protocol-schema = "0.10.7"
 
 # SACP 所需的额外依赖

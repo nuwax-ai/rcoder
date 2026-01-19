@@ -50,9 +50,7 @@ pub use model::{
     AttachmentError,
     AttachmentSource,
     AudioAttachment,
-    // 旧类型保留兼容性（deprecated）
-    CancelNotificationRequest,
-    // 取消相关类型（新类型优先）
+    // 取消相关类型
     CancelNotificationRequestWrapper,
     CancelNotificationResponse,
     CancelResult,

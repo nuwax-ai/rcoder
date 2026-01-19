@@ -16,7 +16,6 @@ pub mod container_sync;
 pub mod vnc_sync;
 
 pub use computer_container_manager::ComputerContainerManager;
-pub use container_manager::*;
 pub use container_status_checker::{ContainerStatusCheckerConfig, start_container_status_checker};
 pub use container_sync::{ContainerSyncConfig, start_container_sync_task};
-pub use vnc_sync::{VncSyncConfig, start_vnc_sync_task, sync_single_vnc_backend};
+pub use vnc_sync::{VncSyncConfig, start_vnc_sync_task};

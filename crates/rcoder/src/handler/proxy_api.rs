@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 
 /// Pingora 代理路径参数
 #[derive(Debug, Deserialize, ToSchema)]
+#[allow(dead_code)] // 字段由 axum 框架自动提取使用
 pub struct ProxyPathParams {
     /// 目标端口号
     #[schema(example = 3000)]
@@ -15,6 +16,7 @@ pub struct ProxyPathParams {
 
 /// Pingora 代理路径和尾部参数
 #[derive(Debug, Deserialize, ToSchema)]
+#[allow(dead_code)] // 字段由 axum 框架自动提取使用
 pub struct ProxyPathWithTailParams {
     /// 目标端口号
     #[schema(example = 3000)]

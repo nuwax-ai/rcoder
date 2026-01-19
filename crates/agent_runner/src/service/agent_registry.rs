@@ -5,6 +5,7 @@
 
 use agent_abstraction::traits::SessionRegistry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
 use shared_types::ProjectAndAgentInfo;
@@ -75,7 +76,7 @@ impl AgentSessionRegistry {
 
         // 🔒 使用 entry API 原子性地更新 session_to_project
         // 这样避免了 insert + remove 分离操作带来的竞态窗口
-        let should_clean_old = match self.session_to_project.entry(session_id.to_string()) {
+        let _should_clean_old = match self.session_to_project.entry(session_id.to_string()) {
             Entry::Occupied(mut entry) => {
                 // key 已存在，原子性地替换值
                 let old_project_id = entry.get().clone();
@@ -96,8 +97,8 @@ impl AgentSessionRegistry {
 
         // ✅ 清理旧的 session_to_project 映射（如果需要）
         // 只有当 session 真正变化时才清理旧值
-        if let Some(old_sid) = old_session_id {
-            if old_sid != session_id {
+        if let Some(old_sid) = old_session_id
+            && old_sid != session_id {
                 // remove 本身是原子操作，此时新映射已插入，不会影响查询
                 self.session_to_project.remove(&old_sid);
                 debug!(
@@ -105,7 +106,6 @@ impl AgentSessionRegistry {
                     project_id, old_sid
                 );
             }
-        }
 
         info!(
             "✅ [Registry] 注册 Agent: project={}, session={}",
@@ -157,12 +157,11 @@ impl AgentSessionRegistry {
         };
 
         // ✅ 清理旧的 session_to_project 映射（原子操作）
-        if let Some(ref old_sid) = old_session_id {
-            if old_sid != new_session_id {
+        if let Some(ref old_sid) = old_session_id
+            && old_sid != new_session_id {
                 // remove 本身是原子操作
                 self.session_to_project.remove(old_sid);
             }
-        }
 
         if let Some(ref old_sid) = old_session_id {
             info!(
@@ -264,9 +263,9 @@ impl AgentSessionRegistry {
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                // 不存在：创建占位记录
-                let (prompt_tx, _) = mpsc::unbounded_channel();
-                let (cancel_tx, _) = mpsc::unbounded_channel();
+                // 不存在：创建占位记录（使用有界通道，容量由常量定义）
+                let (prompt_tx, _) = mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY);
+                let (cancel_tx, _) = mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY);
 
                 let placeholder = ProjectAndAgentInfo {
                     project_id: project_id.to_string(),
@@ -293,13 +292,12 @@ impl AgentSessionRegistry {
     pub fn clear_pending_if_exists(&self, project_id: &str) {
         use shared_types::AgentStatus;
 
-        if let Some(info) = self.agent_info_map.get(project_id) {
-            if info.status == AgentStatus::Pending {
+        if let Some(info) = self.agent_info_map.get(project_id)
+            && info.status == AgentStatus::Pending {
                 drop(info);
                 self.remove_by_project(project_id);
                 info!("🗑️ [Registry] 清理 Pending 占位: project_id={}", project_id);
             }
-        }
     }
 
     // ========== 查询操作 ==========
@@ -319,7 +317,7 @@ impl AgentSessionRegistry {
     }
 
     /// 通过 project_id 获取 agent_info 引用
-    pub fn get_agent_info(&self, project_id: &str) -> Option<Ref<String, ProjectAndAgentInfo>> {
+    pub fn get_agent_info(&self, project_id: &str) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
         self.agent_info_map.get(project_id)
     }
 
@@ -437,7 +435,7 @@ impl AgentSessionRegistry {
     // ========== 遍历操作 ==========
 
     /// 遍历所有 agent_info（用于清理任务等）
-    pub fn iter_agents(&self) -> impl Iterator<Item = RefMulti<String, ProjectAndAgentInfo>> {
+    pub fn iter_agents(&self) -> impl Iterator<Item = RefMulti<'_, String, ProjectAndAgentInfo>> {
         self.agent_info_map.iter()
     }
 
@@ -502,6 +500,10 @@ impl SessionRegistry for AgentSessionRegistry {
     fn count(&self) -> usize {
         self.agent_info_map.len()
     }
+
+    fn entry(&self, project_id: String) -> Entry<'_, String, Self::Entry> {
+        self.agent_info_map.entry(project_id)
+    }
 }
 
 impl Default for AgentSessionRegistry {
@@ -520,8 +522,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn create_test_agent_info(project_id: &str, session_id: &str) -> ProjectAndAgentInfo {
-        let (prompt_tx, _) = mpsc::unbounded_channel();
-        let (cancel_tx, _) = mpsc::unbounded_channel();
+        let (prompt_tx, _) = mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY);
+        let (cancel_tx, _) = mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY);
 
         ProjectAndAgentInfo {
             project_id: project_id.to_string(),

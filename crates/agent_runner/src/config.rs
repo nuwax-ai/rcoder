@@ -343,8 +343,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         match idle_timeout.parse::<u64>() {
             Ok(timeout) => {
                 // 🔒 验证范围
-                if timeout >= AgentCleanupConfig::MIN_IDLE_TIMEOUT
-                    && timeout <= AgentCleanupConfig::MAX_IDLE_TIMEOUT
+                if (AgentCleanupConfig::MIN_IDLE_TIMEOUT..=AgentCleanupConfig::MAX_IDLE_TIMEOUT).contains(&timeout)
                 {
                     config
                         .agent_cleanup
@@ -376,8 +375,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         match cleanup_interval.parse::<u64>() {
             Ok(interval) => {
                 // 🔒 验证范围
-                if interval >= AgentCleanupConfig::MIN_CLEANUP_INTERVAL
-                    && interval <= AgentCleanupConfig::MAX_CLEANUP_INTERVAL
+                if (AgentCleanupConfig::MIN_CLEANUP_INTERVAL..=AgentCleanupConfig::MAX_CLEANUP_INTERVAL).contains(&interval)
                 {
                     config
                         .agent_cleanup
@@ -409,8 +407,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Ok(cancel_timeout) = env::var("RCODER_CANCEL_SESSION_TIMEOUT_SECS") {
         match cancel_timeout.parse::<u64>() {
             Ok(timeout) => {
-                if timeout >= GrpcTimeoutConfig::MIN_CANCEL_TIMEOUT
-                    && timeout <= GrpcTimeoutConfig::MAX_CANCEL_TIMEOUT
+                if (GrpcTimeoutConfig::MIN_CANCEL_TIMEOUT..=GrpcTimeoutConfig::MAX_CANCEL_TIMEOUT).contains(&timeout)
                 {
                     config
                         .grpc_timeouts
@@ -441,8 +438,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Ok(acp_timeout) = env::var("RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS") {
         match acp_timeout.parse::<u64>() {
             Ok(timeout) => {
-                if timeout >= GrpcTimeoutConfig::MIN_ACP_SESSION_TIMEOUT
-                    && timeout <= GrpcTimeoutConfig::MAX_ACP_SESSION_TIMEOUT
+                if (GrpcTimeoutConfig::MIN_ACP_SESSION_TIMEOUT..=GrpcTimeoutConfig::MAX_ACP_SESSION_TIMEOUT).contains(&timeout)
                 {
                     config
                         .grpc_timeouts
@@ -473,8 +469,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Ok(agent_cancel_timeout) = env::var("RCODER_AGENT_CANCEL_TIMEOUT_SECS") {
         match agent_cancel_timeout.parse::<u64>() {
             Ok(timeout) => {
-                if timeout >= GrpcTimeoutConfig::MIN_AGENT_CANCEL_TIMEOUT
-                    && timeout <= GrpcTimeoutConfig::MAX_AGENT_CANCEL_TIMEOUT
+                if (GrpcTimeoutConfig::MIN_AGENT_CANCEL_TIMEOUT..=GrpcTimeoutConfig::MAX_AGENT_CANCEL_TIMEOUT).contains(&timeout)
                 {
                     config
                         .grpc_timeouts
@@ -505,8 +500,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Ok(port_check_timeout) = env::var("RCODER_PORT_CHECK_TIMEOUT_MILLIS") {
         match port_check_timeout.parse::<u64>() {
             Ok(timeout) => {
-                if timeout >= GrpcTimeoutConfig::MIN_PORT_CHECK_TIMEOUT
-                    && timeout <= GrpcTimeoutConfig::MAX_PORT_CHECK_TIMEOUT
+                if (GrpcTimeoutConfig::MIN_PORT_CHECK_TIMEOUT..=GrpcTimeoutConfig::MAX_PORT_CHECK_TIMEOUT).contains(&timeout)
                 {
                     config
                         .grpc_timeouts
@@ -535,12 +529,11 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     }
 
     // 🆕 验证最终配置的有效性
-    if let Some(ref cleanup_config) = config.agent_cleanup {
-        if let Err(e) = cleanup_config.validate() {
+    if let Some(ref cleanup_config) = config.agent_cleanup
+        && let Err(e) = cleanup_config.validate() {
             warn!("Agent 清理配置验证失败: {}，使用默认配置", e);
             config.agent_cleanup = Some(AgentCleanupConfig::default());
         }
-    }
 
     // 4. 处理代理配置
     if cli_args.enable_proxy {
@@ -581,15 +574,14 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     );
 
     // 🆕 验证 gRPC 超时配置的有效性
-    if let Some(ref grpc_timeouts) = config.grpc_timeouts {
-        if let Err(e) = grpc_timeouts.validate() {
+    if let Some(ref grpc_timeouts) = config.grpc_timeouts
+        && let Err(e) = grpc_timeouts.validate() {
             warn!(
                 "gRPC 超时配置验证失败: {}，使用默认配置",
                 e
             );
             config.grpc_timeouts = Some(GrpcTimeoutConfig::default());
         }
-    }
 
     config
 }

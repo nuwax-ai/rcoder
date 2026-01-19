@@ -12,7 +12,7 @@ use std::sync::Arc;
 use agent_config::{AgentServersConfig, PromptConfigAssembler};
 use anyhow::Result;
 use shared_types::{ProjectAndAgentInfo, SessionEntry};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
 use crate::launcher::convert_context_servers;
@@ -144,21 +144,35 @@ where
             }
         }
 
-        // Resume 策略：只要用户传入 session_id，就尝试 resume
+        // Resume 策略：验证 session 文件是否存在，再决定是否 resume
         //
         // 工作原理：
-        // 1. 用户传入 session_id → 设置 resume_session_id
-        // 2. session_manager 会通过 _meta.claudeCode.options.resume 传递给 Agent
-        // 3. 如果 session_id 有效（磁盘上存在会话）→ 恢复上下文
-        // 4. 如果 session_id 无效 → Agent 启动失败 → 降级机制触发 → 创建新会话
+        // 1. 用户传入 session_id → 检查磁盘上是否存在 session 文件
+        // 2. 如果存在 → 设置 resume_session_id → Agent 恢复上下文
+        // 3. 如果不存在 → 不设置 resume → Agent 创建新会话
+        //
+        // Session 文件路径: ~/.claude/projects/{encoded_path}/{session_id}.jsonl
         //
         // 优势：
-        // - 服务重启后能恢复磁盘上的会话（Claude Code 会话持久化在 .claude/conversations/）
+        // - 提前验证，避免传入无效 session_id 导致 Agent 启动失败
+        // - 服务重启后能恢复磁盘上的会话
         // - 不依赖内存状态，更健壮
         // - 自动降级（有会话就恢复，没有就创建）
         if let Some(ref session_id) = request.prompt_message.session_id {
-            info!("🔄 用户传入 session_id，尝试 resume: {}", session_id);
-            start_config = start_config.with_resume_session_id(session_id.clone());
+            // 检查 session 文件是否存在（使用文件系统扫描 + 缓存）
+            let project_path_str = normalized_path.to_string_lossy().to_string();
+            let session_exists = super::check_session_file_exists(session_id, &project_path_str).await;
+
+            if session_exists {
+                info!("✅ Session 文件存在，尝试 resume: {}", session_id);
+                start_config = start_config.with_resume_session_id(session_id.clone());
+            } else {
+                warn!(
+                    "⚠️ Session 文件不存在，跳过 resume，将创建新会话: session_id={}",
+                    session_id
+                );
+                // 不设置 resume_session_id，Agent 将创建新会话
+            }
         }
 
         // 4. 更新 prompt_message 的 content 为处理后的用户提示词
@@ -205,9 +219,10 @@ where
             )?
         };
 
-        // 7. 发送 Prompt
+        // 7. 发送 Prompt（异步，支持背压）
         self.session_manager
             .send_prompt_request(&project_id, prompt_request)
+            .await
             .map_err(|e| {
                 error!("❌ 发送 Prompt 请求失败: {:?}", e);
                 e

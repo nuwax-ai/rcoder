@@ -143,13 +143,11 @@ impl ReaperState {
                     if let Ok(pid) = name.to_string_lossy().parse::<u32>() {
                         // 读取 /proc/[pid]/stat 文件
                         let stat_path = entry.path().join("stat");
-                        if let Ok(content) = fs::read_to_string(&stat_path) {
-                            if let Some(info) = parse_stat_file(pid, &content) {
-                                if info.state == 'Z' {
+                        if let Ok(content) = fs::read_to_string(&stat_path)
+                            && let Some(info) = parse_stat_file(pid, &content)
+                                && info.state == 'Z' {
                                     zombies.push(info);
                                 }
-                            }
-                        }
                     }
                 }
             }
@@ -289,7 +287,7 @@ fn parse_stat_file(pid: u32, content: &str) -> Option<ZombieProcessInfo> {
         return None;
     }
 
-    let state = parts.get(0)?.chars().next()?;
+    let state = parts.first()?.chars().next()?;
     let ppid: u32 = parts.get(1)?.parse().ok()?;
 
     Some(ZombieProcessInfo {
@@ -334,7 +332,7 @@ async fn run_reaper(config: ReaperConfig) {
     }
 
     // 创建 SIGCHLD 信号监听器
-    let mut sigchld = match signal(SignalKind::child()) {
+    let sigchld = match signal(SignalKind::child()) {
         Ok(sig) => sig,
         Err(e) => {
             error!("[ProcessReaper] 无法注册 SIGCHLD 信号处理器: {}", e);
@@ -346,7 +344,7 @@ async fn run_reaper(config: ReaperConfig) {
         }
     };
 
-    let mut state = ReaperState::new(config.clone());
+    let state = ReaperState::new(config.clone());
 
     // 启动定期轮询任务（作为信号机制的补充）
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -435,7 +433,7 @@ async fn run_reaper_without_detection(
 async fn run_reaper_polling(config: ReaperConfig) {
     info!("[ProcessReaper] 使用轮询模式回收僵尸进程");
 
-    let mut state = ReaperState::new(config.clone());
+    let state = ReaperState::new(config.clone());
 
     // 根据配置决定是否启用僵尸进程检测
     if config.enable_zombie_detection {
@@ -507,13 +505,11 @@ impl ProcessReaperHandle {
                     let name = entry.file_name();
                     if let Ok(pid) = name.to_string_lossy().parse::<u32>() {
                         let stat_path = entry.path().join("stat");
-                        if let Ok(content) = fs::read_to_string(&stat_path) {
-                            if let Some(info) = parse_stat_file(pid, &content) {
-                                if info.state == 'Z' {
+                        if let Ok(content) = fs::read_to_string(&stat_path)
+                            && let Some(info) = parse_stat_file(pid, &content)
+                                && info.state == 'Z' {
                                     zombies.push(info);
                                 }
-                            }
-                        }
                     }
                 }
             }
@@ -545,7 +541,7 @@ impl Default for ProcessReaperHandle {
 mod tests {
     use super::*;
     use std::process::Stdio;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::Duration;
 
     #[tokio::test]
     async fn test_reaper_state() {

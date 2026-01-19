@@ -76,8 +76,8 @@ pub struct PortSnapshot {
 /// - `https://api.openai.com/v1/chat` -> `https://api***ai.com/v1/chat`
 fn mask_url(url: &str) -> String {
     // 尝试解析 URL
-    if let Ok(parsed_url) = url::Url::parse(url) {
-        if let Some(host) = parsed_url.host_str() {
+    if let Ok(parsed_url) = url::Url::parse(url)
+        && let Some(host) = parsed_url.host_str() {
             let masked_host = mask_domain(host);
             // 重新构建 URL，保留协议、端口、路径等
             let scheme = parsed_url.scheme();
@@ -92,7 +92,6 @@ fn mask_url(url: &str) -> String {
                 .unwrap_or_default();
             return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
         }
-    }
 
     // 如果解析失败，直接返回原始 URL（不应该发生）
     url.to_string()
@@ -729,7 +728,7 @@ impl PortProxy {
         // 设置代理标识头
         Self::set_common_headers(upstream_request)?;
         upstream_request.insert_header("X-Port-Proxy", "pingora-proxy")?;
-        upstream_request.insert_header("X-Target-Port", &port.to_string())?;
+        upstream_request.insert_header("X-Target-Port", port.to_string())?;
         upstream_request.insert_header(
             "X-Load-Balancer",
             if self.use_round_robin {
@@ -978,7 +977,7 @@ impl PortProxy {
             );
         } else {
             upstream_request
-                .insert_header("authorization", &format!("Bearer {}", config.api_key))?;
+                .insert_header("authorization", format!("Bearer {}", config.api_key))?;
             debug!(
                 "🔑 已注入 OpenAI 格式的 Authorization Bearer token (api_protocol={:?})",
                 config.api_protocol
@@ -1457,25 +1456,22 @@ impl PingoraProxyService {
         let path = req.uri().path();
         if path.starts_with("/proxy/") {
             let parts: Vec<&str> = path.split('/').collect();
-            if parts.len() >= 3 {
-                if let Ok(port) = parts[2].parse::<u16>() {
+            if parts.len() >= 3
+                && let Ok(port) = parts[2].parse::<u16>() {
                     debug!("从路径中提取端口: {}", port);
                     return Ok(port);
                 }
-            }
         }
 
         // 2. 然后尝试从 URL 查询参数中获取端口 (向后兼容)
         if let Some(query) = req.uri().query() {
             for param in query.split('&') {
-                if let Some((key, value)) = param.split_once('=') {
-                    if key == self.config.port_param {
-                        if let Ok(port) = value.parse::<u16>() {
+                if let Some((key, value)) = param.split_once('=')
+                    && key == self.config.port_param
+                        && let Ok(port) = value.parse::<u16>() {
                             debug!("从 URL 参数中提取端口: {}", port);
                             return Ok(port);
                         }
-                    }
-                }
             }
         }
 

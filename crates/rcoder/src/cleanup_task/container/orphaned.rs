@@ -215,7 +215,7 @@ impl OrphanedContainerCleaner {
                 // 注意：find_container_realtime 不返回 created_at，需要从缓存获取
                 if let Some(container_info) = self
                     .docker_manager
-                    .find_container_by_identifier(&info.container_name)
+                    .get_container_info(&info.id)
                     .await
                 {
                     let created_time = container_info.created_at;

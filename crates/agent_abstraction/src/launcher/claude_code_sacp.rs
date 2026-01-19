@@ -73,10 +73,10 @@ pub struct SacpAgentLaunchConfig {
 pub struct SacpLauncherConnectionInfo {
     /// 会话 ID
     pub session_id: SessionId,
-    /// 发送 Prompt 消息的通道
-    pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    /// 发送取消请求的通道
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
+    /// 发送 Prompt 消息的通道（有界通道，提供背压保护）
+    pub prompt_tx: mpsc::Sender<PromptRequest>,
+    /// 发送取消请求的通道（有界通道，提供背压保护）
+    pub cancel_tx: mpsc::Sender<CancelNotificationRequestWrapper>,
     /// 生命周期守卫（自动清理资源）
     pub lifecycle_guard: Arc<AgentLifecycleGuard>,
 }
@@ -306,10 +306,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
                 // 合并环境变量：默认配置 + 自定义配置（自定义覆盖默认）
                 let mut env = default_agent_config.env.clone();
-                if let Some(ref custom_env) = agent_server_override.env {
-                    for (k, v) in custom_env {
-                        env.insert(k.clone(), v.clone());
-                    }
+                if let Some(custom_env) = &agent_server_override.env {
+                    // 使用 extend 替代循环，更高效
+                    env.extend(custom_env.iter().map(|(k, v)| (k.clone(), v.clone())));
                 }
 
                 // 🔧 关键修复：替换自定义环境变量中的模板变量
@@ -353,9 +352,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 )
             };
 
-        // 创建通道
-        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequestWrapper>();
-        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
+        // 创建通道（使用有界通道防止 OOM）
+        // 容量由常量定义，足够处理突发请求，同时提供背压保护
+        let (cancel_tx, cancel_rx) = mpsc::channel::<CancelNotificationRequestWrapper>(
+            shared_types::AGENT_CANCEL_CHANNEL_CAPACITY,
+        );
+        let (prompt_tx, prompt_rx) =
+            mpsc::channel::<PromptRequest>(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY);
         let (session_id_tx, session_id_rx) = tokio::sync::oneshot::channel::<SessionId>();
 
         // 创建 CancellationToken
@@ -514,8 +517,8 @@ struct SacpConnectionParams<N: SessionNotifier> {
     mcp_servers: Vec<McpServer>,
     start_config: AgentStartConfig,
     session_id_tx: tokio::sync::oneshot::Sender<SessionId>,
-    prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
-    cancel_rx: mpsc::UnboundedReceiver<CancelNotificationRequestWrapper>,
+    prompt_rx: mpsc::Receiver<PromptRequest>,
+    cancel_rx: mpsc::Receiver<CancelNotificationRequestWrapper>,
     cancel_token: CancellationToken,
     notifier: Arc<N>,
 }

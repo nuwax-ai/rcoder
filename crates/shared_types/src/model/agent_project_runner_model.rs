@@ -60,6 +60,7 @@ impl ProjectCoreState {
     }
 
     /// 创建带 user_id 的核心状态（ComputerAgentRunner 模式）
+    #[allow(dead_code)]
     pub fn new_with_user_id(project_id: String, user_id: String) -> Self {
         let now = Utc::now();
         Self {

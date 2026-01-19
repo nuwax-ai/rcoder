@@ -68,7 +68,7 @@ pub struct AgentSessionUpdate {
 /// 需要发给前端的消息通知类型
 #[derive(Debug, Clone, Serialize)]
 pub enum SessionNotify {
-    AgentSessionUpdate(AgentSessionUpdate),
+    AgentSessionUpdate(Box<AgentSessionUpdate>),
     SessionPromptStart(SessionPromptStart),
     SessionPromptEnd(SessionPromptEnd),
     SessionPromptError(SessionPromptError),
@@ -365,11 +365,11 @@ mod tests {
         let content = ContentChunk::new("Hello, World!".into());
 
         let update = SessionUpdate::AgentMessageChunk(content);
-        let notify = SessionNotify::AgentSessionUpdate(AgentSessionUpdate {
+        let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
             session_id: "test_session".to_string(),
             session_update: update,
             request_id: None,
-        });
+        }));
 
         let unified = notify.to_unified_message();
 
@@ -392,11 +392,11 @@ mod tests {
         let content = ContentChunk::new("Hello, World!".into());
 
         let update = SessionUpdate::AgentMessageChunk(content);
-        let notify = SessionNotify::AgentSessionUpdate(AgentSessionUpdate {
+        let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
             session_id: "test_session".to_string(),
             session_update: update,
             request_id: Some("req_123456789".to_string()),
-        });
+        }));
 
         let unified = notify.to_unified_message();
 

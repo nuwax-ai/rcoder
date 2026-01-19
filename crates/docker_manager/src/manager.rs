@@ -166,6 +166,7 @@ impl DockerManager {
         }
 
         // 构建环境变量
+        #[allow(unused_mut)]
         let mut env_vars: Vec<String> = config
             .env_vars
             .into_iter()
@@ -591,11 +592,10 @@ impl DockerManager {
             .await
         {
             Ok(details) => {
-                if let Some(state) = details.state {
-                    if let Some(status) = state.status {
+                if let Some(state) = details.state
+                    && let Some(status) = state.status {
                         return Ok(status == bollard::models::ContainerStateStatusEnum::RUNNING);
                     }
-                }
                 Ok(false)
             }
             Err(bollard::errors::Error::DockerResponseServerError {
@@ -701,12 +701,11 @@ impl DockerManager {
         // 所以这里不需要额外创建目录
 
         // 2. 清理旧容器（如果提供了 project_id）
-        if let Some(id) = project_id {
-            if let Some(existing) = self.get_container_info(id).await {
+        if let Some(id) = project_id
+            && let Some(existing) = self.get_container_info(id).await {
                 warn!("发现旧容器 {}，正在停止...", existing.container_name);
                 self.stop_container(id).await?;
             }
-        }
 
         // 2. 获取配置和镜像
         let service_config = self.get_service_config(&service_type).await?;
@@ -1032,6 +1031,7 @@ impl DockerManager {
     /// 策略：
     /// 1. 查找内部 Map (project_id)
     /// 2. 构造默认名称查找 ({prefix}-{project_id})
+    #[allow(deprecated)]
     pub async fn find_agent_container(
         &self,
         project_id: &str,
@@ -2002,10 +2002,10 @@ impl DockerManager {
             })?;
 
         // 获取网络配置
-        if let Some(network_settings) = inspect.network_settings {
-            if let Some(networks) = network_settings.networks {
+        if let Some(network_settings) = inspect.network_settings
+            && let Some(networks) = network_settings.networks {
                 // 查找包含指定网络基础名称的网络
-                for (network_name, _) in &networks {
+                for network_name in networks.keys() {
                     if network_name.contains(network_base_name) {
                         info!("✅ 动态检测到主网络: {}", network_name);
                         return Ok(network_name.clone());
@@ -2021,7 +2021,6 @@ impl DockerManager {
                     network_base_name, available_networks
                 )));
             }
-        }
 
         Err(DockerError::ConnectionError(format!(
             "当前容器 (hostname: {}) 没有网络配置信息",

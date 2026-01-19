@@ -201,7 +201,7 @@ impl AgentServiceImpl {
         // Note: This is a simplified implementation, actual container start time should be earlier
         static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
-        let start = START_TIME.get_or_init(|| SystemTime::now());
+        let start = START_TIME.get_or_init(SystemTime::now);
 
         match SystemTime::now().duration_since(*start) {
             Ok(duration) => duration.as_secs() as i64,
@@ -227,7 +227,7 @@ impl AgentService for AgentServiceImpl {
         let model_config_debug = req
             .model_config
             .as_ref()
-            .map(|cfg| shared_types::MaskedModelConfig(cfg));
+            .map(shared_types::MaskedModelConfig);
 
         info!(
             "🚀 [gRPC] Chat 请求: project_id={}, session_id={}, prompt_len={}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
@@ -260,8 +260,8 @@ impl AgentService for AgentServiceImpl {
 
         // Check Agent status, prohibit concurrent requests (using unified Registry)
         // 🆕 Check both Active and Pending states
-        if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id) {
-            if agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending
+        if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id)
+            && (agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending)
             {
                 // 🎯 Use business response to return error code instead of gRPC Status error
                 // This allows rcoder to directly read error code from error_code field
@@ -281,7 +281,6 @@ impl AgentService for AgentServiceImpl {
                     fallback_reason: None,
                 }));
             }
-        }
 
         // 🆕 Pre-registration: Immediately mark project as Pending before sending task to queue
         // This way concurrent requests will be blocked by the busy check above
@@ -289,11 +288,10 @@ impl AgentService for AgentServiceImpl {
         info!("📌 [gRPC] pre-registered Pending status: project_id={}", project_id);
 
         // Clean up old session
-        if let Some(ref sid) = session_id {
-            if SESSION_CACHE.remove(sid).is_some() {
+        if let Some(ref sid) = session_id
+            && SESSION_CACHE.remove(sid).is_some() {
                 info!("🗑️ [gRPC] removed old session: session_id={}", sid);
             }
-        }
 
         // 解析 service_type（默认为 RCoder）
         let service_type = req
@@ -803,8 +801,8 @@ impl AgentService for AgentServiceImpl {
             result_tx,
         };
 
-        // 5. Send cancel notification (using already extracted cancel_tx)
-        if let Err(e) = cancel_tx.send(cancel_request) {
+        // 5. Send cancel notification (using already extracted cancel_tx, with backpressure)
+        if let Err(e) = cancel_tx.send(cancel_request).await {
             error!("❌ [gRPC] failed to send cancel notification: {}", e);
             return Ok(Response::new(CancelResponse {
                 success: false,
@@ -1126,7 +1124,7 @@ impl AgentService for AgentServiceImpl {
         let (agent_status, session_id, cancel_tx) = match AGENT_REGISTRY.get_agent_info(&project_id)
         {
             Some(info) => {
-                let status = info.status.clone();
+                let status = info.status;
                 let session_id = info.session_id.to_string();
                 let cancel_tx = info.cancel_tx.clone();
                 // info（Ref）在这里被 drop，释放读锁
@@ -1341,8 +1339,8 @@ impl AgentService for AgentServiceImpl {
                 result_tx,
             };
 
-            // 发送取消通知（使用之前提取的 cancel_tx）
-            if let Err(e) = cancel_tx.send(cancel_request) {
+            // 发送取消通知（使用之前提取的 cancel_tx，支持背压）
+            if let Err(e) = cancel_tx.send(cancel_request).await {
                 error!(
                     "❌ [gRPC] 发送取消通知失败: project_id={}, error={}",
                     project_id, e

@@ -5,7 +5,7 @@
 use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::router::AppState;

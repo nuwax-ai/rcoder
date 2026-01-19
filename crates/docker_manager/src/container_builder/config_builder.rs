@@ -178,9 +178,9 @@ impl ContainerConfigBuilder {
         debug!("构建容器配置，项目ID: {}", self.project_id);
 
         // 使用默认值或提供的值
-        let image = self.image.unwrap_or_else(|| crate::default_docker_image());
+        let image = self.image.unwrap_or_else(crate::default_docker_image);
         let name_prefix = self.name_prefix.unwrap_or_else(|| "rcoder-agent".to_string());
-        let host_path = self.host_path.unwrap_or_else(String::new);
+        let host_path = self.host_path.unwrap_or_default();
         let container_path = self.container_path.unwrap_or_else(|| crate::DEFAULT_WORK_DIR.to_string());
         let work_dir = self.work_dir.unwrap_or_else(|| crate::DEFAULT_WORK_DIR.to_string());
         let network_mode = self.network_mode.unwrap_or_else(|| crate::DEFAULT_NETWORK_MODE.to_string());

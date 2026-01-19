@@ -20,7 +20,7 @@ pub use utils::*;
 // 重新导出 shared_types 中的类型
 pub use shared_types::{
     AgentSessionUpdate, AgentStatus, AgentStatusResponse, AppError, Attachment, AttachmentError,
-    AttachmentSource, AudioAttachment, CancelNotificationRequest, CancelNotificationResponse,
+    AttachmentSource, AudioAttachment, CancelNotificationResponse,
     ChatPrompt, ChatPromptResponse, ChatResponse, DocumentAttachment, HttpResult, ImageAttachment,
     ImageDimensions, ModelProviderConfig, ModelProviderSafeInfo, ProjectAndAgentInfo,
     SessionMessageType, SessionNotify, SessionPromptEnd, SessionPromptStart, TextAttachment,

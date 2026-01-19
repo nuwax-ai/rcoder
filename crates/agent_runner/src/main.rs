@@ -2,7 +2,7 @@ use clap::Parser;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
@@ -24,7 +24,6 @@ mod profiler;
 #[allow(dead_code)]
 mod otel_tracing;
 
-mod middleware;
 mod router;
 mod service;
 mod utils;
@@ -163,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
         if proxy_config.health_check.enabled {
             let hc = &proxy_config.health_check;
             pingora_service
-                .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
+                .start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000 );
         }
 
         // 在后台任务中启动 Pingora 服务器

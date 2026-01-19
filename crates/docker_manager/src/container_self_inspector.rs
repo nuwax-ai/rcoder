@@ -186,7 +186,7 @@ impl ContainerSelfInspector {
                         }
                     } else if cgroup_path.contains(".scope") {
                         // 格式: /system.slice/docker-abc123def456...scope
-                        let scope_name = cgroup_path.split('/').last().unwrap_or("");
+                        let scope_name = cgroup_path.split('/').next_back().unwrap_or("");
                         if scope_name.starts_with("docker-") && scope_name.ends_with(".scope") {
                             // 移除 "docker-" 前缀和 ".scope" 后缀
                             let id = &scope_name[7..scope_name.len() - 6];
@@ -281,7 +281,7 @@ impl ContainerSelfInspector {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[tokio::test]
     async fn test_container_id_parsing() {

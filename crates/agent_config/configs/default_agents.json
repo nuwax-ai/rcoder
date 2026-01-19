@@ -43,9 +43,21 @@
       ],
       "env": {}
     },
-    "fetch": {
+    "chrome-devtools": {
       "source": "custom",
       "enabled": true,
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--headless",
+        "--isolated"
+      ],
+      "env": {}
+    },
+    "fetch": {
+      "source": "custom",
+      "enabled": false,
       "command": "uvx",
       "args": [
         "mcp-server-fetch"

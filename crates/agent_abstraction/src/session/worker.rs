@@ -75,8 +75,8 @@ impl WorkerRequest {
 /// 用于传递会话句柄给 agent_runner 更新全局 MAP
 #[derive(Clone)]
 pub struct SessionHandles {
-    pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
+    pub prompt_tx: mpsc::Sender<PromptRequest>,
+    pub cancel_tx: mpsc::Sender<CancelNotificationRequestWrapper>,
     pub lifecycle_handle: Option<Arc<dyn AgentLifecycle>>,
 }
 
@@ -84,8 +84,8 @@ pub struct SessionHandles {
 impl std::fmt::Debug for SessionHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionHandles")
-            .field("prompt_tx", &"UnboundedSender<PromptRequest>")
-            .field("cancel_tx", &"UnboundedSender<CancelNotificationRequestWrapper>")
+            .field("prompt_tx", &"Sender<PromptRequest>")
+            .field("cancel_tx", &"Sender<CancelNotificationRequestWrapper>")
             .field("lifecycle_handle", &self.lifecycle_handle.as_ref().map(|_| "Some(AgentLifecycle)"))
             .finish()
     }

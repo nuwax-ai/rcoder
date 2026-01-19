@@ -260,6 +260,35 @@ where
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
     ) -> Result<R::Entry> {
+        let agent_info = self
+            .create_session_internal(
+                project_id.clone(),
+                project_path,
+                model_provider,
+                start_config,
+                service_uuid,
+            )
+            .await?;
+
+        // 存储会话信息到 registry
+        let session_id_str = agent_info.session_id().to_string();
+        self.registry
+            .insert(&project_id, &session_id_str, agent_info.clone());
+
+        Ok(agent_info)
+    }
+
+    /// 内部方法：创建 Agent 会话但不插入到 registry
+    ///
+    /// 用于 entry API 优化，避免重复插入
+    async fn create_session_internal(
+        &self,
+        project_id: String,
+        project_path: PathBuf,
+        model_provider: Option<ModelProviderConfig>,
+        start_config: AgentStartConfig,
+        service_uuid: Option<String>,
+    ) -> Result<R::Entry> {
         info!("开始创建新的 Agent 会话，项目 ID: {}", project_id);
 
         // 创建 SACP 启动器
@@ -309,12 +338,7 @@ where
             stop_handle: lifecycle_handle,
         };
 
-        // 存储会话信息到 registry
-        let session_id_str = connection_info.session_id.to_string();
-        self.registry
-            .insert(&project_id, &session_id_str, agent_info.clone().into());
-
-        // 返回刚插入的条目
+        // 返回 agent_info（不插入 registry，由调用方处理）
         Ok(agent_info.into())
     }
 
@@ -322,9 +346,13 @@ where
     ///
     /// 如果会话已存在且模型配置未变化，则复用；否则创建新会话
     ///
+    /// # 优化说明
+    /// 使用 DashMap 的 entry API 进行原子性操作，将 DashMap 访问次数从 3-4 次减少到 1 次
+    ///
     /// # 参数
     /// - `project_id`: 项目 ID
     /// - `project_path`: 项目路径
+    /// - `session_id_hint`: 会话 ID 提示（用于恢复）
     /// - `model_provider`: 模型提供者配置
     /// - `start_config`: Agent 启动配置
     /// - `service_uuid`: 与此 Agent 关联的唯一 UUID
@@ -336,97 +364,119 @@ where
         &self,
         project_id: &str,
         project_path: PathBuf,
-        session_id_hint: Option<String>,
+        _session_id_hint: Option<String>, // 保留用于未来扩展（resume 逻辑在上层处理）
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
     ) -> Result<(R::Entry, bool)> {
-        // 检查是否存在
-        if let Some(existing) = self.get_session(project_id) {
-            // 🔧 关键检查：检查 channel 是否仍然有效（Agent 进程是否还在运行）
-            // 如果 prompt_tx.is_closed() 为 true，说明 rx 端已被 drop（Agent 进程已退出）
-            if existing.is_channel_closed() {
-                info!(
-                    "⚠️ 检测到会话 channel 已关闭（Agent 进程已退出），移除失效会话并重建，项目 ID: {}",
-                    project_id
-                );
-                // 移除失效会话
-                self.remove_session(project_id);
-                // 创建新会话
+        use dashmap::mapref::entry::Entry;
+
+        // 🔥 使用 entry API 进行原子性操作（一次 DashMap 访问）
+        match self.registry.entry(project_id.to_string()) {
+            Entry::Occupied(mut occupied_entry) => {
+                let existing = occupied_entry.get();
+
+                // 🔧 关键检查 1：检查 channel 是否仍然有效（Agent 进程是否还在运行）
+                let channel_closed = existing.is_channel_closed();
+                // 🔧 关键检查 2：检查模型配置是否变化
+                let model_changed = existing.is_model_config_changed(&model_provider);
+
+                let needs_rebuild = channel_closed || model_changed;
+
+                if needs_rebuild {
+                    if channel_closed {
+                        info!(
+                            "⚠️ 检测到会话 channel 已关闭（Agent 进程已退出），重建会话，项目 ID: {}",
+                            project_id
+                        );
+                    }
+                    if model_changed {
+                        info!(
+                            "检测到模型配置变化，重启 Agent 会话，项目 ID: {}, 旧配置: {:?}, 新配置: {:?}",
+                            project_id,
+                            existing.model_provider(),
+                            model_provider
+                        );
+                    }
+
+                    // 创建新会话（不插入 registry）
+                    let new_session = self
+                        .create_session_internal(
+                            project_id.to_string(),
+                            project_path,
+                            model_provider,
+                            start_config,
+                            service_uuid,
+                        )
+                        .await?;
+
+                    // 直接在原地更新（无需额外查找）
+                    let session_id_str = new_session.session_id().to_string();
+                    occupied_entry.insert(new_session.clone());
+                    info!(
+                        "✅ 已重建会话，项目 ID: {}, session_id: {}",
+                        project_id, session_id_str
+                    );
+
+                    Ok((new_session, true)) // true = 新创建
+                } else {
+                    info!("复用现有 Agent 会话，项目 ID: {}", project_id);
+                    Ok((existing.clone(), false)) // false = 复用
+                }
+            }
+            Entry::Vacant(vacant_entry) => {
+                info!("会话不存在，创建新会话，项目 ID: {}", project_id);
+
+                // 创建新会话（不插入 registry）
                 let new_session = self
-                    .create_session(
+                    .create_session_internal(
                         project_id.to_string(),
                         project_path,
-                        session_id_hint,
                         model_provider,
                         start_config,
                         service_uuid,
                     )
                     .await?;
-                return Ok((new_session, true)); // true = 新创建
-            }
 
-            // 检查模型配置是否变化
-            if existing.is_model_config_changed(&model_provider) {
+                // 直接插入到 vacant entry
+                let session_id_str = new_session.session_id().to_string();
+                vacant_entry.insert(new_session.clone());
                 info!(
-                    "检测到模型配置变化，重启 Agent 会话，项目 ID: {}, 旧配置: {:?}, 新配置: {:?}",
-                    project_id,
-                    existing.model_provider(),
-                    model_provider
+                    "✅ 新会话创建完成，项目 ID: {}, session_id: {}",
+                    project_id, session_id_str
                 );
-                // 移除旧会话
-                self.remove_session(project_id);
-                // 创建新会话
-                let new_session = self
-                    .create_session(
-                        project_id.to_string(),
-                        project_path,
-                        session_id_hint,
-                        model_provider,
-                        start_config,
-                        service_uuid,
-                    )
-                    .await?;
-                return Ok((new_session, true)); // true = 新创建
-            }
 
-            info!("复用现有 Agent 会话，项目 ID: {}", project_id);
-            return Ok((existing, false)); // false = 复用
+                Ok((new_session, true)) // true = 新创建
+            }
         }
-
-        // 创建新会话
-        let new_session = self
-            .create_session(
-                project_id.to_string(),
-                project_path,
-                session_id_hint,
-                model_provider,
-                start_config,
-                service_uuid,
-            )
-            .await?;
-        Ok((new_session, true))
     }
 
     /// 发送 Prompt 到指定会话（仅文本）
-    pub fn send_text_prompt(&self, project_id: &str, prompt: &PromptMessage) -> Result<()> {
+    ///
+    /// 使用有界通道，提供背压保护。如果通道已满，会异步等待直到有空间。
+    pub async fn send_text_prompt(&self, project_id: &str, prompt: &PromptMessage) -> Result<()> {
         let session = self
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
         let prompt_request = Self::build_text_prompt_request(prompt, session.session_id().clone())?;
 
-        session.prompt_tx().send(prompt_request).map_err(|e| {
-            error!("发送 Prompt 请求失败: {:?}", e);
-            anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
-        })?;
+        session.prompt_tx()
+            .send(prompt_request)
+            .await
+            .map_err(|e| {
+                error!("发送 Prompt 请求失败: {:?}", e);
+                anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
+            })?;
 
         info!("✅ Prompt 请求已发送，项目 ID: {}", project_id);
         Ok(())
     }
 
     /// 发送 Prompt 请求到指定会话
-    pub fn send_prompt_request(
+    ///
+    /// 使用有界通道，提供背压保护。如果通道已满，会异步等待直到有空间。
+    pub async fn send_prompt_request(
         &self,
         project_id: &str,
         prompt_request: PromptRequest,
@@ -435,10 +485,13 @@ where
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
-        session.prompt_tx().send(prompt_request).map_err(|e| {
-            error!("发送 Prompt 请求失败: {:?}", e);
-            anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
-        })?;
+        session.prompt_tx()
+            .send(prompt_request)
+            .await
+            .map_err(|e| {
+                error!("发送 Prompt 请求失败: {:?}", e);
+                anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
+            })?;
 
         info!("✅ Prompt 请求已发送，项目 ID: {}", project_id);
         Ok(())

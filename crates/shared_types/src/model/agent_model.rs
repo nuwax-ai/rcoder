@@ -32,11 +32,11 @@ pub trait SessionEntry: Clone + Send + Sync + 'static {
     /// 获取会话 ID
     fn session_id(&self) -> &SessionId;
 
-    /// 获取 Prompt 发送通道
-    fn prompt_tx(&self) -> &mpsc::UnboundedSender<PromptRequest>;
+    /// 获取 Prompt 发送通道（有界通道）
+    fn prompt_tx(&self) -> &mpsc::Sender<PromptRequest>;
 
-    /// 获取取消通知发送通道
-    fn cancel_tx(&self) -> &mpsc::UnboundedSender<CancelNotificationRequestWrapper>;
+    /// 获取取消通知发送通道（有界通道）
+    fn cancel_tx(&self) -> &mpsc::Sender<CancelNotificationRequestWrapper>;
 
     /// 获取模型配置
     fn model_provider(&self) -> Option<&ModelProviderConfig>;
@@ -102,6 +102,7 @@ impl std::fmt::Debug for CancelNotificationRequestWrapper {
 
 /// 取消通知请求（旧类型，保留兼容性）
 #[deprecated(note = "Use CancelNotificationRequestWrapper instead")]
+#[allow(dead_code)]
 pub struct CancelNotificationRequest {
     pub cancel_notification: CancelNotification,
     pub tx: oneshot::Sender<CancelNotificationResponse>,
@@ -155,10 +156,10 @@ pub struct ProjectAndAgentInfo {
     pub project_id: String,
     /// 会话ID，agent 服务启动时会创建一个会话ID
     pub session_id: SessionId,
-    /// 用于发送 Prompt 的通道
-    pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    /// 用于发送取消通知的通道（使用新类型）
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
+    /// 用于发送 Prompt 的通道（有界通道，提供背压保护）
+    pub prompt_tx: mpsc::Sender<PromptRequest>,
+    /// 用于发送取消通知的通道（有界通道，提供背压保护）
+    pub cancel_tx: mpsc::Sender<CancelNotificationRequestWrapper>,
     /// 模型提供商配置
     pub model_provider: Option<ModelProviderConfig>,
     /// 当前活跃的请求ID，用于标识用户请求
@@ -186,11 +187,11 @@ impl SessionEntry for ProjectAndAgentInfo {
         &self.session_id
     }
 
-    fn prompt_tx(&self) -> &mpsc::UnboundedSender<PromptRequest> {
+    fn prompt_tx(&self) -> &mpsc::Sender<PromptRequest> {
         &self.prompt_tx
     }
 
-    fn cancel_tx(&self) -> &mpsc::UnboundedSender<CancelNotificationRequestWrapper> {
+    fn cancel_tx(&self) -> &mpsc::Sender<CancelNotificationRequestWrapper> {
         &self.cancel_tx
     }
 
@@ -392,15 +393,13 @@ impl Drop for AgentLifecycleGuard {
                 AgentResources::Claude { child_process, .. } => {
                     if let Ok(mut child_guard) = child_process.try_lock()
                         && let Some(mut child) = child_guard.take()
-                    {
-                        if let Err(e) = child.start_kill() {
+                        && let Err(e) = child.start_kill() {
                             tracing::warn!(
                                 "⚠️ [AGENT] start_kill 失败: project_id={}, error={}",
                                 self.inner.project_id,
                                 e
                             );
                         }
-                    }
                 }
             }
 
