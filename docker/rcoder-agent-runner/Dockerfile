@@ -44,8 +44,7 @@ RUN echo "Cache bust: ${CACHEBUST}" && \
     echo "📦 安装项目依赖..." && \
     bun install && \
     echo "🔨 构建 nuwaxcode..." && \
-    cd packages/opencode && \
-    bun run build && \
+    bun run --cwd packages/opencode build && \
     echo "检测系统架构..." && \
     ARCH=$(uname -m) && \
     echo "系统架构: ${ARCH}" && \
@@ -59,7 +58,7 @@ RUN echo "Cache bust: ${CACHEBUST}" && \
     fi && \
     echo "选择二进制目录: ${BINARY_DIR}" && \
     echo "进入 dist 目录..." && \
-    cd dist && \
+    cd packages/opencode/dist && \
     echo "当前目录内容:" && \
     ls -la && \
     if [ -d "${BINARY_DIR}" ]; then \
