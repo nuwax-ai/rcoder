@@ -50,12 +50,12 @@ RUN echo "Cache bust: ${CACHEBUST}" && \
     ARCH=$(uname -m) && \
     echo "系统架构: ${ARCH}" && \
     if [ "${ARCH}" = "aarch64" ] || [ "${ARCH}" = "arm64" ]; then \
-        BINARY_DIR="nuwaxcode-linux-arm64"; \
+    BINARY_DIR="nuwaxcode-linux-arm64"; \
     elif [ "${ARCH}" = "x86_64" ]; then \
-        BINARY_DIR="nuwaxcode-linux-x64"; \
+    BINARY_DIR="nuwaxcode-linux-x64"; \
     else \
-        echo "❌ 不支持的架构: ${ARCH}"; \
-        exit 1; \
+    echo "❌ 不支持的架构: ${ARCH}"; \
+    exit 1; \
     fi && \
     echo "选择二进制目录: ${BINARY_DIR}" && \
     echo "进入 dist 目录..." && \
@@ -63,14 +63,14 @@ RUN echo "Cache bust: ${CACHEBUST}" && \
     echo "当前目录内容:" && \
     ls -la && \
     if [ -d "${BINARY_DIR}" ]; then \
-        echo "找到构建产物目录: ${BINARY_DIR}" && \
-        ls -la "${BINARY_DIR}/" && \
-        cp "${BINARY_DIR}/nuwaxcode" /usr/local/bin/nuwaxcode && \
-        chmod +x /usr/local/bin/nuwaxcode; \
+    echo "找到构建产物目录: ${BINARY_DIR}" && \
+    ls -la "${BINARY_DIR}/" && \
+    cp "${BINARY_DIR}/bin/nuwaxcode" /usr/local/bin/nuwaxcode && \
+    chmod +x /usr/local/bin/nuwaxcode; \
     else \
-        echo "❌ 未找到构建产物 ${BINARY_DIR}，列出当前目录:" && \
-        ls -la && \
-        exit 1; \
+    echo "❌ 未找到构建产物 ${BINARY_DIR}，列出当前目录:" && \
+    ls -la && \
+    exit 1; \
     fi && \
     echo "验证 nuwaxcode 安装..." && \
     which nuwaxcode && \
