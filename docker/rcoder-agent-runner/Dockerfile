@@ -41,11 +41,41 @@ RUN echo "Cache bust: ${CACHEBUST}" && \
     echo "📦 从源码安装 nuwaxcode..." && \
     git clone -b feat/nuwaxcode https://github.com/dongdada29/opencode.git /tmp/opencode && \
     cd /tmp/opencode && \
+    echo "📦 安装项目依赖..." && \
+    bun install && \
     echo "🔨 构建 nuwaxcode..." && \
-    bun build && \
-    echo "📦 全局安装 nuwaxcode..." && \
-    npm install -g . && \
+    cd packages/opencode && \
+    bun run build && \
+    echo "检测系统架构..." && \
+    ARCH=$(uname -m) && \
+    echo "系统架构: ${ARCH}" && \
+    if [ "${ARCH}" = "aarch64" ] || [ "${ARCH}" = "arm64" ]; then \
+        BINARY_DIR="nuwaxcode-linux-arm64"; \
+    elif [ "${ARCH}" = "x86_64" ]; then \
+        BINARY_DIR="nuwaxcode-linux-x64"; \
+    else \
+        echo "❌ 不支持的架构: ${ARCH}"; \
+        exit 1; \
+    fi && \
+    echo "选择二进制目录: ${BINARY_DIR}" && \
+    ls -la && \
+    if [ -d "${BINARY_DIR}" ]; then \
+        echo "找到构建产物目录: ${BINARY_DIR}" && \
+        ls -la "${BINARY_DIR}/" && \
+        cp "${BINARY_DIR}/nuwaxcode" /usr/local/bin/nuwaxcode && \
+        chmod +x /usr/local/bin/nuwaxcode; \
+    elif [ -d "bin" ]; then \
+        echo "使用 bin 目录（可能是 Mac 风格构建）" && \
+        ls -la bin/ && \
+        cp bin/nuwaxcode /usr/local/bin/nuwaxcode && \
+        chmod +x /usr/local/bin/nuwaxcode; \
+    else \
+        echo "❌ 未找到构建产物，列出当前目录:" && \
+        ls -la && \
+        exit 1; \
+    fi && \
     echo "验证 nuwaxcode 安装..." && \
+    which nuwaxcode && \
     nuwaxcode -v && \
     cd / && rm -rf /tmp/opencode && \
     echo "✅ nuwaxcode 安装成功"
