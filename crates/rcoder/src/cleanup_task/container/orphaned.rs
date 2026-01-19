@@ -204,7 +204,7 @@ impl OrphanedContainerCleaner {
 
         // 🛡️ 二次保护期检查：在实际销毁前再次确认容器是否存在且在保护期内
         // 这是为了防止从收集孤立容器列表到实际销毁之间的时间差
-        // 🔍 使用 find_container_realtime 获取最新的容器信息和 ID
+        // 🔍 使用 find_container_realtime 获取最新的容器 ID
         let (actual_container_id, cache_key) = match self
             .docker_manager
             .find_container_realtime(&info.container_name)
@@ -212,30 +212,47 @@ impl OrphanedContainerCleaner {
         {
             Ok(Some((container_id, _, _, _))) => {
                 // 容器存在，检查保护期
-                // 注意：find_container_realtime 不返回 created_at，需要从缓存获取
-                if let Some(container_info) = self
+                // 🔧 关键修复：使用 DockerManager 封装的方法获取创建时间
+                // 使用容器 name 查询，容器重启后 name 不变，但 ID 会变
+                match self
                     .docker_manager
-                    .get_container_info(&info.id)
+                    .get_container_creation_time_by_name(&info.container_name)
                     .await
                 {
-                    let created_time = container_info.created_at;
-                    let age = Utc::now().signed_duration_since(created_time);
-                    let protection_seconds = self.config.container_protection_duration.as_secs() as i64;
+                    Ok(Some(created_time_utc)) => {
+                        let age = Utc::now().signed_duration_since(created_time_utc);
+                        let protection_seconds =
+                            self.config.container_protection_duration.as_secs() as i64;
 
-                    if age.num_seconds() < protection_seconds {
+                        if age.num_seconds() < protection_seconds {
+                            info!(
+                                "🛡️ [orphaned] 二次检查：容器在保护期内，跳过销毁: {}, age={}秒, protection={}秒",
+                                info.container_name,
+                                age.num_seconds(),
+                                protection_seconds
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Ok(None) => {
+                        // 容器不存在或创建时间为空
                         info!(
-                            "🛡️ [orphaned] 二次检查：容器在保护期内，跳过销毁: {}, age={}秒, protection={}秒",
-                            info.container_name,
-                            age.num_seconds(),
-                            protection_seconds
+                            "⚠️ [orphaned] 容器不存在或创建时间为空，可能已被删除: name={}",
+                            info.container_name
                         );
                         return Ok(());
                     }
-                    // 🔧 返回 project_id 作为缓存 key（DockerManager 缓存使用 project_id）
-                    (container_id, container_info.project_id.clone())
-                } else {
-                    (container_id, info.id.clone())
+                    Err(e) => {
+                        warn!(
+                            "⚠️ [orphaned] 获取容器创建时间失败: {}, error={}",
+                            info.container_name, e
+                        );
+                        // 获取时间失败时，为了安全起见，跳过清理
+                        return Ok(());
+                    }
                 }
+                // 使用 info.id (project_id) 作为缓存 key
+                (container_id, info.id.clone())
             }
             Ok(None) => {
                 // 容器已不存在，可能已被删除

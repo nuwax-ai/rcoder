@@ -60,6 +60,9 @@ pub enum DockerError {
     #[error("序列化错误: {0}")]
     SerializationError(#[from] serde_json::Error),
 
+    #[error("时间戳解析失败: {0}")]
+    InvalidTimestamp(String),
+
     #[error("Bollard Docker 错误: {0}")]
     BollardError(#[from] bollard::errors::Error),
 }
