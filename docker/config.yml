@@ -115,8 +115,8 @@ docker_config:
 
         resource_limits:
           memory_limit: 4294967296 # 4GB
-          cpu_limit: 3.0
-          swap_limit: 8589934592 # 8GB
+          cpu_limit: 2.0
+          swap_limit: 6442450944 # 6GB (实际 swap = 2GB)
 
         work_dir: "/app"
         network_mode: "bridge"

@@ -26,6 +26,50 @@ use shared_types::{ProjectAndContainerInfo, ServiceResourceLimits};
 // 辅助函数
 // ============================================================================
 
+/// 验证 Pod 资源限制配置
+///
+/// # 参数
+/// * `limits` - 资源限制配置
+///
+/// # 返回
+/// Ok(()) 验证通过，Err(String) 返回错误信息
+fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
+    // 验证 CPU 限制
+    if let Some(cpu) = limits.cpu {
+        if cpu <= 0.0 {
+            return Err("cpu must be greater than 0".to_string());
+        }
+        if cpu > 128.0 {
+            return Err("cpu cannot exceed 128 cores".to_string());
+        }
+    }
+
+    // 验证内存限制
+    if let Some(memory) = limits.memory {
+        if memory < 512 * 1024 * 1024 {
+            return Err("memory must be at least 512MB".to_string());
+        }
+        if memory > 128 * 1024 * 1024 * 1024 {
+            return Err("memory cannot exceed 128GB".to_string());
+        }
+    }
+
+    // 验证 swap 限制
+    if let Some(swap) = limits.swap {
+        if swap < 512 * 1024 * 1024 {
+            return Err("swap must be at least 512MB".to_string());
+        }
+        // swap 必须 >= memory（如果两者都设置了）
+        if let (Some(memory), Some(swap_val)) = (limits.memory, limits.swap) {
+            if swap_val < memory {
+                return Err("swap should be >= memory".to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// 将 Unix 毫秒时间戳转换为东八区（UTC+8）时间字符串
 ///
 /// # 参数
@@ -205,9 +249,13 @@ pub struct PodResourceLimits {
     #[schema(example = 4294967296_u64)]
     pub memory: Option<u64>,
 
-    /// CPU 份额 (1024 = 1 核)
-    #[schema(example = 2048)]
-    pub cpu_shares: Option<u64>,
+    /// CPU 限制（核心数）, 例如 1.5 表示 1.5 核
+    #[schema(example = 2.0)]
+    pub cpu: Option<f64>,
+
+    /// 交换空间限制 (bytes), 例如 2GB = 2147483648
+    #[schema(example = 2147483648_u64)]
+    pub swap: Option<u64>,
 }
 
 /// 启动容器响应
@@ -628,6 +676,17 @@ pub async fn pod_ensure(
         ));
     }
 
+    // 1.1 验证资源限制
+    if let Some(ref limits) = request.resource_limits {
+        if let Err(e) = validate_resource_limits(limits) {
+            error!("❌ [POD_ENSURE] 资源限制验证失败: {}", e);
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
+                &format!("Invalid resource_limits: {}", e),
+            ));
+        }
+    }
+
     info!(
         "🚀 [POD_ENSURE] 确保容器存在: user_id={}, project_id={}",
         request.user_id, request.project_id
@@ -708,8 +767,8 @@ pub async fn pod_ensure(
         // 创建新容器，最多重试 3 次
         let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
             memory_limit: limits.memory,
-            cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
-            swap_limit: None,
+            cpu_limit: limits.cpu,
+            swap_limit: limits.swap,
         });
 
         let mut last_error = None;
@@ -791,8 +850,8 @@ pub async fn pod_ensure(
 
                 let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
                     memory_limit: limits.memory,
-                    cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
-                    swap_limit: None,
+                    cpu_limit: limits.cpu,
+                    swap_limit: limits.swap,
                 });
 
                 match ComputerContainerManager::get_or_create_container_for_user(
@@ -1083,6 +1142,17 @@ pub async fn pod_restart(
         ));
     }
 
+    // 1.1 验证资源限制
+    if let Some(ref limits) = request.resource_limits {
+        if let Err(e) = validate_resource_limits(limits) {
+            error!("❌ [POD_RESTART] 资源限制验证失败: {}", e);
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
+                &format!("Invalid resource_limits: {}", e),
+            ));
+        }
+    }
+
     info!(
         "🔄 [POD_RESTART] 重启容器: user_id={}, project_id={}",
         request.user_id, request.project_id
@@ -1199,8 +1269,8 @@ pub async fn pod_restart(
     // 4. 定义资源限制
     let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
         memory_limit: limits.memory,
-        cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
-        swap_limit: None,
+        cpu_limit: limits.cpu,
+        swap_limit: limits.swap,
     });
 
     // 5. 强制创建新容器
@@ -1724,12 +1794,14 @@ mod tests {
     fn test_pod_resource_limits_serialization() {
         let limits = PodResourceLimits {
             memory: Some(4294967296),
-            cpu_shares: Some(2048),
+            cpu: Some(2.0),
+            swap: Some(6442450944),
         };
 
         let json = serde_json::to_string(&limits).unwrap();
         assert!(json.contains("4294967296"));
-        assert!(json.contains("2048"));
+        assert!(json.contains("2.0"));
+        assert!(json.contains("6442450944"));
     }
 
     #[test]
@@ -1747,5 +1819,114 @@ mod tests {
         assert!(json.contains("created"));
         assert!(json.contains("container_info"));
         assert!(json.contains("message"));
+    }
+
+    #[test]
+    fn test_validate_resource_limits_valid() {
+        let limits = PodResourceLimits {
+            memory: Some(4294967296), // 4GB
+            cpu: Some(2.0),
+            swap: Some(6442450944), // 6GB
+        };
+        assert!(validate_resource_limits(&limits).is_ok());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_none_values() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: None,
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_ok());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_cpu_zero() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(0.0),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_cpu_negative() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(-1.0),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_cpu_too_large() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(200.0),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_memory_too_small() {
+        let limits = PodResourceLimits {
+            memory: Some(256 * 1024 * 1024), // 256MB
+            cpu: None,
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_memory_too_large() {
+        let limits = PodResourceLimits {
+            memory: Some(256 * 1024 * 1024 * 1024), // 256GB
+            cpu: None,
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_swap_less_than_memory() {
+        let limits = PodResourceLimits {
+            memory: Some(8589934592), // 8GB
+            cpu: None,
+            swap: Some(4294967296), // 4GB
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_swap_too_small() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: None,
+            swap: Some(256 * 1024 * 1024), // 256MB
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_cpu_boundary() {
+        // 测试边界值：0.1 应该失败（小于等于 0）
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(0.1),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_ok());
+
+        // 测试边界值：0.01 应该通过
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(0.01),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_ok());
     }
 }
