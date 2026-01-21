@@ -608,6 +608,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     .mcp_servers(mcp_servers.clone())
                     .meta(system_prompt_meta);
 
+                debug!("new_session_request: {:?}", new_session_request);
+
                 // 从配置获取超时值，默认 100 秒
                 let timeout_secs = start_config
                     .acp_session_create_timeout_secs

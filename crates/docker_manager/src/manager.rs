@@ -1,6 +1,7 @@
 use super::{
-    CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerStatus,
-    DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
+    CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerQueryResult,
+    ContainerStatus, DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig,
+    DockerResult,
 };
 use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
 use anyhow::Result;
@@ -1374,27 +1375,50 @@ impl DockerManager {
         Ok(info)
     }
 
-    /// 智能查找 Agent 容器
+    /// 查找项目容器（RCoder 模式专用）
     ///
-    /// 策略：
+    /// 根据 project_id 和 service_type 查找容器：
+    /// - 容器命名规则：`{prefix}-{project_id}`
+    /// - RCoder 模式前缀：`rcoder-agent`
+    ///
+    /// # 策略
     /// 1. 查找内部 Map (project_id)
-    /// 2. 构造默认名称查找 ({prefix}-{project_id})
-    #[allow(deprecated)] // 内部调用 find_container_by_identifier
-    pub async fn find_agent_container(
+    /// 2. 实时查询 Docker API (构造容器名称)
+    ///
+    /// # 返回
+    /// * `Ok(Some(ContainerQueryResult))` - 容器存在
+    /// * `Ok(None)` - 容器不存在
+    /// * `Err(...)` - 查询出错
+    pub async fn find_project_container(
         &self,
         project_id: &str,
         service_type: &shared_types::ServiceType,
-    ) -> Option<DockerContainerInfo> {
-        // 1. 查 Map
+    ) -> DockerResult<Option<ContainerQueryResult>> {
+        // 1. 查 Map (如果存在且运行中，直接返回)
         if let Some(info) = self.containers.get(project_id).await {
-            return Some(info);
+            return Ok(Some(ContainerQueryResult::new(
+                info.container_id.clone(),
+                info.container_name.clone(),
+                info.status.clone(),
+                matches!(info.status, ContainerStatus::Running),
+            )));
         }
 
-        // 2. 查 Docker API (构造名称)
+        // 2. 实时查询 Docker API (构造名称)
         let prefix = service_type.container_prefix();
         let expected_container_name = format!("{}-{}", prefix, project_id);
-        self.find_container_by_identifier(&expected_container_name)
-            .await
+
+        match self.find_container_realtime(&expected_container_name).await? {
+            Some((container_id, container_name, status, is_running)) => {
+                Ok(Some(ContainerQueryResult::new(
+                    container_id,
+                    container_name,
+                    status,
+                    is_running,
+                )))
+            }
+            None => Ok(None),
+        }
     }
 
     /// 获取 Agent 容器的高级信息
@@ -1519,19 +1543,48 @@ impl DockerManager {
 
     /// 查找用户容器（ComputerAgentRunner 模式专用）
     ///
+    /// 根据 user_id 和 service_type 查找容器：
+    /// - 容器命名规则：`{prefix}-{user_id}`
+    /// - ComputerAgentRunner 模式前缀：`computer-agent-runner`
+    ///
     /// # Arguments
     /// * `user_id` - 用户 ID
     /// * `service_type` - 服务类型（应该是 ComputerAgentRunner）
     ///
     /// # 返回
-    /// 容器信息（如果存在），否则返回 None
+    /// * `Ok(Some(ContainerQueryResult))` - 容器存在
+    /// * `Ok(None)` - 容器不存在
+    /// * `Err(...)` - 查询出错
     pub async fn find_user_container(
         &self,
         user_id: &str,
         service_type: &shared_types::ServiceType,
-    ) -> Option<DockerContainerInfo> {
-        // 内部调用 find_agent_container，但参数名更准确
-        self.find_agent_container(user_id, service_type).await
+    ) -> DockerResult<Option<ContainerQueryResult>> {
+        // 1. 查 Map (如果存在且运行中，直接返回)
+        if let Some(info) = self.containers.get(user_id).await {
+            return Ok(Some(ContainerQueryResult::new(
+                info.container_id.clone(),
+                info.container_name.clone(),
+                info.status.clone(),
+                matches!(info.status, ContainerStatus::Running),
+            )));
+        }
+
+        // 2. 实时查询 Docker API (构造名称)
+        let prefix = service_type.container_prefix();
+        let expected_container_name = format!("{}-{}", prefix, user_id);
+
+        match self.find_container_realtime(&expected_container_name).await? {
+            Some((container_id, container_name, status, is_running)) => {
+                Ok(Some(ContainerQueryResult::new(
+                    container_id,
+                    container_name,
+                    status,
+                    is_running,
+                )))
+            }
+            None => Ok(None),
+        }
     }
 
     /// 通过用户 ID 获取容器 ID（ComputerAgentRunner 模式专用）
@@ -1557,13 +1610,12 @@ impl DockerManager {
     /// # 返回
     /// true 如果容器存在且运行中，否则返回 false
     pub async fn is_user_container_running(&self, user_id: &str) -> bool {
-        if let Some(container) = self
+        match self
             .find_user_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
             .await
         {
-            matches!(container.status, ContainerStatus::Running)
-        } else {
-            false
+            Ok(Some(result)) => result.is_running,
+            _ => false,
         }
     }
 
