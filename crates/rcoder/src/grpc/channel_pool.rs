@@ -27,39 +27,44 @@ impl GrpcChannelPool {
     /// 获取指定地址的 gRPC 客户端
     ///
     /// 如果连接不存在则创建新连接
+    ///
+    /// 使用 DashMap entry API 消除 TOCTOU (Time-Of-Check-Time-Of-Use) 竞态条件
+    /// 确保在高并发场景下不会重复创建连接
     pub async fn get_client(&self, addr: &str) -> Result<AgentServiceClient<Channel>> {
-        // 尝试获取已有连接
-        if let Some(channel) = self.channels.get(addr) {
-            debug!("📡 [gRPC] 复用现有连接: {}", addr);
-            return Ok(AgentServiceClient::new(channel.clone()));
+        // 🛡️ 使用 entry API 进行原子性检查和插入，消除 TOCTOU 竞态条件
+        match self.channels.entry(addr.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                debug!("📡 [gRPC] 复用现有连接: {}", addr);
+                Ok(AgentServiceClient::new(entry.get().clone()))
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // 创建新连接
+                info!("🔌 [gRPC] 创建新连接: {}", addr);
+                let endpoint = format!("http://{}", addr);
+                let channel = Channel::from_shared(endpoint)
+                    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
+                    .connect_timeout(std::time::Duration::from_secs(
+                        shared_types::GRPC_CONNECT_TIMEOUT_SECS,
+                    ))
+                    .timeout(std::time::Duration::from_secs(
+                        shared_types::GRPC_REQUEST_TIMEOUT_SECS,
+                    ))
+                    // HTTP/2 Keepalive 配置
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                    .keep_alive_timeout(std::time::Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
+                    // TCP Keepalive 配置
+                    .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+                    .tcp_nodelay(true)
+                    .connect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
+
+                // 🛡️ 原子性插入连接，确保其他并发线程能看到这个连接
+                let channel_ref = entry.insert(channel);
+                Ok(AgentServiceClient::new(channel_ref.clone()))
+            }
         }
-
-        // 创建新连接
-        info!("🔌 [gRPC] 创建新连接: {}", addr);
-        let endpoint = format!("http://{}", addr);
-        let channel = Channel::from_shared(endpoint)
-            .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
-            .connect_timeout(std::time::Duration::from_secs(
-                shared_types::GRPC_CONNECT_TIMEOUT_SECS,
-            ))
-            .timeout(std::time::Duration::from_secs(
-                shared_types::GRPC_REQUEST_TIMEOUT_SECS,
-            ))
-            // ✅ 新增：HTTP/2 Keepalive 配置（基于 Tonic 原生 API）
-            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-            .keep_alive_timeout(std::time::Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            // ✅ 新增：TCP Keepalive 配置
-            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
-            .tcp_nodelay(true)
-            .connect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
-
-        // 缓存连接
-        self.channels.insert(addr.to_string(), channel.clone());
-
-        Ok(AgentServiceClient::new(channel))
     }
 
     /// 获取指定容器端口的 gRPC 客户端
