@@ -5,8 +5,8 @@ use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::agent_worker_manager::AgentWorkerManager;
-use crate::{config::AppConfig, handler, proxy_agent::LocalSetAgentRequest};
+use crate::agent_runtime::AgentRuntime;
+use crate::{config::AppConfig, handler, proxy_agent::AgentRequest};
 use rcoder_telemetry::{TelemetryGuard, HttpMetricsLayer};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -29,19 +29,16 @@ pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
 
-    /// ⚠️ 本地任务发送器（已弃用，保留仅用于兼容性）
+    /// 🆕 Agent Runtime（新架构）
     ///
-    /// **重要**: 请使用 `agent_worker_manager.try_send()` 发送任务
-    /// 直接使用此字段会导致重启后发送到错误的通道
-    pub local_task_sender: mpsc::UnboundedSender<LocalSetAgentRequest>,
-
-    /// 🆕 Agent Worker 管理器（用于监控和自动重启）
-    ///
-    /// **推荐**: 始终使用 `agent_worker_manager.try_send()` 发送任务
-    /// - 支持自动重启后的 sender 更新
+    /// **推荐**: 使用 `agent_runtime.send().await` 发送任务
+    /// - 支持自动重启
     /// - 提供健康状态检查
     /// - 线程安全的原子操作
-    pub agent_worker_manager: Arc<AgentWorkerManager>,
+    pub local_task_sender: Arc<AgentRuntime>,
+
+    /// 🆕 Agent Runtime（用于健康检查和状态监控）
+    pub agent_runtime: Arc<AgentRuntime>,
 
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,

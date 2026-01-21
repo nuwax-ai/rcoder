@@ -425,8 +425,8 @@ impl AgentService for AgentServiceImpl {
             .with_key_manager(Some(self.app_state.shared_api_key_manager.clone()));
 
         // 🆕 Check worker state
-        use crate::agent_worker_manager::WorkerState;
-        match self.app_state.agent_worker_manager.state() {
+        use crate::agent_runtime::WorkerState;
+        match self.app_state.agent_runtime.state() {
             WorkerState::Running => {
                 // Normal operation, continue processing
             }
@@ -443,11 +443,11 @@ impl AgentService for AgentServiceImpl {
             }
         }
 
-        // 🆕 Use manager to send (with state check)
+        // 🆕 Use runtime to send (with state check)
         if let Err(e) = self
             .app_state
-            .agent_worker_manager
-            .try_send(local_task_request)
+            .agent_runtime
+            .send(local_task_request)
             .await
         {
             // 🔥 Critical fix: clean up Pending status on send failure

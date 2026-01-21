@@ -9,6 +9,7 @@
 //! - 使用标准 `tokio::spawn` 进行并发处理
 //! - 简化了并发模型，提高性能
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -24,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use sacp::schema::SessionId;
 
 use crate::{
-    agent_worker_manager::{Heartbeat, WORKER_THREAD_POOL_SIZE, WorkerHandle, WorkerReady},
+    agent_runtime::WORKER_THREAD_POOL_SIZE,
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::SESSION_REQUEST_CONTEXT,
     service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
@@ -253,13 +254,22 @@ pub async fn agent_worker(
     Ok(())
 }
 
-/// 带心跳的 Agent Worker (SACP 版本)
+/// 带心跳的 Agent Worker (SACP 版本) - 新架构
 ///
 /// 使用标准 tokio::spawn 进行并发处理（无需 LocalSet）
 /// SACP 的 Component<L> trait 要求 Send + 'static，因此可以安全地在多线程环境中使用
+///
+/// ## 参数变化
+///
+/// - `request_rx`: 使用有界 channel 代替 unbounded
+/// - `state`: 使用 `Arc<AtomicState>` 代替 `WorkerHandle`
+/// - `last_heartbeat`: 直接更新，无需通过 channel
+/// - `active_requests`: 直接访问，用于请求追踪
 pub async fn agent_worker_with_heartbeat(
-    mut request_rx: mpsc::UnboundedReceiver<AgentRequest>,
-    mut handle: WorkerHandle,
+    mut request_rx: mpsc::Receiver<AgentRequest>,
+    state: Arc<crate::agent_runtime::AtomicState>,
+    last_heartbeat: Arc<tokio::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    active_requests: Arc<tokio::sync::Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 ) -> Result<()> {
     info!("🚀 agent_worker 启动（SACP 版本，带心跳支持），开始监听请求...");
 
@@ -279,20 +289,12 @@ pub async fn agent_worker_with_heartbeat(
     // 创建 AcpAgentWorker
     let worker = AcpAgentWorker::new(session_manager);
 
-    // 发送 Worker 就绪信号（仅在启动时发送一次，oneshot）
-    if let Some(ready_tx) = handle.ready_tx.take() {
-        let ready_signal = WorkerReady {
-            timestamp: Utc::now(),
-        };
-        if let Err(_e) = ready_tx.send(ready_signal) {
-            warn!("⚠️ [Worker] Ready 信号发送失败（接收端已关闭）");
-        } else {
-            info!("✅ [Worker] Ready 信号已发送，SACP Worker 初始化完成");
-        }
-    }
+    // 设置状态为 Running（就绪信号）
+    state.set(crate::agent_runtime::WorkerState::Running);
+    info!("✅ [Worker] SACP Worker 初始化完成，状态设置为 Running");
 
-    // 启动心跳任务
-    let heartbeat_tx = handle.heartbeat_tx.clone();
+    // 启动心跳任务 - 直接更新 last_heartbeat
+    let last_heartbeat_clone = last_heartbeat.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut heartbeat_interval = interval(Duration::from_secs(5));
         loop {
@@ -302,9 +304,7 @@ pub async fn agent_worker_with_heartbeat(
             let active_count = AGENT_REGISTRY.stats().agent_count;
             let total_count = WORKER_THREAD_POOL_SIZE;
 
-            let heartbeat = Heartbeat {
-                timestamp: Utc::now(),
-            };
+            let timestamp = Utc::now();
 
             // 📊 打印当前 Worker 占用情况
             info!(
@@ -312,14 +312,11 @@ pub async fn agent_worker_with_heartbeat(
                 active_count,
                 total_count,
                 total_count.saturating_sub(active_count),
-                heartbeat.timestamp.format("%Y-%m-%d %H:%M:%S")
+                timestamp.format("%Y-%m-%d %H:%M:%S")
             );
 
-            if let Err(e) = heartbeat_tx.try_send(heartbeat) {
-                warn!("⚠️ [Worker] 心跳发送失败: {}", e);
-                // 如果监控任务已关闭，worker 也应该退出
-                break;
-            }
+            // 直接更新 last_heartbeat
+            *last_heartbeat_clone.lock().await = Some(timestamp);
         }
     });
 
