@@ -87,12 +87,12 @@ pub struct ServiceMountConfig {
 /// 服务资源限制配置
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceResourceLimits {
-    /// 内存限制（字节）
-    pub memory_limit: Option<u64>,
+    /// 内存限制（字节，支持浮点数输入）
+    pub memory_limit: Option<f64>,
     /// CPU 限制（核心数）
     pub cpu_limit: Option<f64>,
-    /// 交换空间限制（字节）
-    pub swap_limit: Option<u64>,
+    /// 交换空间限制（字节，支持浮点数输入）
+    pub swap_limit: Option<f64>,
 }
 
 impl ServiceResourceLimits {
@@ -100,10 +100,10 @@ impl ServiceResourceLimits {
     pub fn validate(&self) -> Result<(), String> {
         // 内存限制：512MB ~ 64GB
         if let Some(memory) = self.memory_limit {
-            if memory < 512 * 1024 * 1024 {
+            if memory < 512_000_000.0 {
                 return Err("memory_limit must be at least 512MB".to_string());
             }
-            if memory > 64 * 1024 * 1024 * 1024 {
+            if memory > 64_000_000_000.0 {
                 return Err("memory_limit cannot exceed 64GB".to_string());
             }
         }
@@ -381,9 +381,9 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
 
     // 默认资源限制
     let resource_limits = ServiceResourceLimits {
-        memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB
-        cpu_limit: Some(2.0),                       // 2 核
-        swap_limit: Some(4 * 1024 * 1024 * 1024),   // 4GB
+        memory_limit: Some(2_000_000_000.0), // 2GB
+        cpu_limit: Some(2.0),                // 2 核
+        swap_limit: Some(4_000_000_000.0),   // 4GB
     };
 
     ServiceImageConfig {
@@ -423,9 +423,9 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
 
     // 默认资源限制（ComputerAgentRunner 可能需要更多资源）
     let resource_limits = ServiceResourceLimits {
-        memory_limit: Some(4 * 1024 * 1024 * 1024), // 4GB
-        cpu_limit: Some(3.0),                       // 3 核
-        swap_limit: Some(8 * 1024 * 1024 * 1024),   // 8GB
+        memory_limit: Some(4_000_000_000.0), // 4GB
+        cpu_limit: Some(3.0),                // 3 核
+        swap_limit: Some(8_000_000_000.0),   // 8GB
     };
 
     ServiceImageConfig {

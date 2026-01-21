@@ -46,17 +46,17 @@ fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
 
     // 验证内存限制
     if let Some(memory) = limits.memory {
-        if memory < 512 * 1024 * 1024 {
+        if memory < 512_000_000.0 {
             return Err("memory must be at least 512MB".to_string());
         }
-        if memory > 128 * 1024 * 1024 * 1024 {
+        if memory > 128_000_000_000.0 {
             return Err("memory cannot exceed 128GB".to_string());
         }
     }
 
     // 验证 swap 限制
     if let Some(swap) = limits.swap {
-        if swap < 512 * 1024 * 1024 {
+        if swap < 512_000_000.0 {
             return Err("swap must be at least 512MB".to_string());
         }
         // swap 必须 >= memory（如果两者都设置了）
@@ -245,17 +245,17 @@ pub struct EnsurePodRequest {
 /// Pod 资源限制配置
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct PodResourceLimits {
-    /// 内存限制 (bytes), 例如 4GB = 4294967296
-    #[schema(example = 4294967296_u64)]
-    pub memory: Option<u64>,
+    /// 内存限制 (bytes), 例如 4GB = 4294967296，支持浮点数输入
+    #[schema(example = 4294967296.0)]
+    pub memory: Option<f64>,
 
     /// CPU 限制（核心数）, 例如 1.5 表示 1.5 核
     #[schema(example = 2.0)]
     pub cpu: Option<f64>,
 
-    /// 交换空间限制 (bytes), 例如 2GB = 2147483648
-    #[schema(example = 2147483648_u64)]
-    pub swap: Option<u64>,
+    /// 交换空间限制 (bytes), 例如 2GB = 2147483648，支持浮点数输入
+    #[schema(example = 2147483648.0)]
+    pub swap: Option<f64>,
 }
 
 /// 启动容器响应
@@ -1793,9 +1793,9 @@ mod tests {
     #[test]
     fn test_pod_resource_limits_serialization() {
         let limits = PodResourceLimits {
-            memory: Some(4294967296),
+            memory: Some(4294967296.0),
             cpu: Some(2.0),
-            swap: Some(6442450944),
+            swap: Some(6442450944.0),
         };
 
         let json = serde_json::to_string(&limits).unwrap();
@@ -1824,9 +1824,9 @@ mod tests {
     #[test]
     fn test_validate_resource_limits_valid() {
         let limits = PodResourceLimits {
-            memory: Some(4294967296), // 4GB
+            memory: Some(4294967296.0), // 4GB
             cpu: Some(2.0),
-            swap: Some(6442450944), // 6GB
+            swap: Some(6442450944.0), // 6GB
         };
         assert!(validate_resource_limits(&limits).is_ok());
     }
@@ -1874,7 +1874,7 @@ mod tests {
     #[test]
     fn test_validate_resource_limits_memory_too_small() {
         let limits = PodResourceLimits {
-            memory: Some(256 * 1024 * 1024), // 256MB
+            memory: Some(256_000_000.0), // 256MB
             cpu: None,
             swap: None,
         };
@@ -1884,7 +1884,7 @@ mod tests {
     #[test]
     fn test_validate_resource_limits_memory_too_large() {
         let limits = PodResourceLimits {
-            memory: Some(256 * 1024 * 1024 * 1024), // 256GB
+            memory: Some(256_000_000_000.0), // 256GB
             cpu: None,
             swap: None,
         };
@@ -1894,9 +1894,9 @@ mod tests {
     #[test]
     fn test_validate_resource_limits_swap_less_than_memory() {
         let limits = PodResourceLimits {
-            memory: Some(8589934592), // 8GB
+            memory: Some(8_589_934_592.0), // 8GB
             cpu: None,
-            swap: Some(4294967296), // 4GB
+            swap: Some(4_294_967_296.0), // 4GB
         };
         assert!(validate_resource_limits(&limits).is_err());
     }
@@ -1906,7 +1906,7 @@ mod tests {
         let limits = PodResourceLimits {
             memory: None,
             cpu: None,
-            swap: Some(256 * 1024 * 1024), // 256MB
+            swap: Some(256_000_000.0), // 256MB
         };
         assert!(validate_resource_limits(&limits).is_err());
     }

@@ -51,12 +51,12 @@ pub struct MountPoint {
 /// 资源限制配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceLimits {
-    /// 内存限制 (字节)
-    pub memory_limit: Option<i64>,
+    /// 内存限制 (字节，支持浮点数)
+    pub memory_limit: Option<f64>,
     /// CPU 限制
     pub cpu_limit: Option<f64>,
-    /// 交换空间限制 (字节)
-    pub swap_limit: Option<i64>,
+    /// 交换空间限制 (字节，支持浮点数)
+    pub swap_limit: Option<f64>,
 }
 
 impl DockerContainerConfig {

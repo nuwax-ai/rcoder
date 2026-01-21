@@ -244,8 +244,8 @@ impl DockerManager {
 
         // 应用资源限制
         if let Some(ref limits) = config.resource_limits {
-            host_config.memory = limits.memory_limit;
-            host_config.memory_swap = limits.swap_limit;
+            host_config.memory = limits.memory_limit.map(|v| v as i64);
+            host_config.memory_swap = limits.swap_limit.map(|v| v as i64);
             // CPU 限制需要通过 nano_cpus 设置 (1 CPU = 1e9 nano CPUs)
             if let Some(cpu_limit) = limits.cpu_limit {
                 host_config.nano_cpus = Some((cpu_limit * 1e9) as i64);
@@ -1130,9 +1130,9 @@ impl DockerManager {
         };
 
         builder = builder.resource_limits(crate::types::ResourceLimits {
-            memory_limit: final_resource_limits.memory_limit.map(|v| v as i64),
+            memory_limit: final_resource_limits.memory_limit,
             cpu_limit: final_resource_limits.cpu_limit,
-            swap_limit: final_resource_limits.swap_limit.map(|v| v as i64),
+            swap_limit: final_resource_limits.swap_limit,
         });
 
         // 添加环境变量
