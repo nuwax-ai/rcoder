@@ -34,7 +34,7 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
 # 使用 CACHEBUST 变量触发缓存失效
-RUN echo "Cache bust: ${CACHEBUST}" && npm i -g @xagi/nuwaxcode@latest --registry=https://registry.npmjs.org/
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g xagi/nuwaxcode@lates --registry=https://registry.npmjs.org/
 
 
 # 配置 nuwaxcode - 禁用 websearch 和 webfetch 权限
