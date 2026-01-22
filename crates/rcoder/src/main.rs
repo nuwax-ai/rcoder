@@ -44,18 +44,27 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
-    let telemetry_config = TelemetryConfig::from_env("rcoder").with_file_log("rcoder"); // 启用文件日志，前缀为 rcoder
-    let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
-    let telemetry = Arc::new(telemetry);
-
-    info!("Starting rcoder - AI-powered development platform");
-
-    // 解析命令行参数
+    // 解析命令行参数（移到最前面，以便尽早加载配置）
     let cli_args = CliArgs::parse();
 
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args)?;
+
+    // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
+    // 使用配置文件中的日志保留天数，与容器日志清理保持一致
+    let file_log_config = rcoder_telemetry::FileLogConfig::new("logs", "rcoder")
+        .with_max_files(config.cleanup_config.log_cleanup.log_retention_days as usize);
+
+    let telemetry_config =
+        TelemetryConfig::from_env("rcoder").with_file_log_config(file_log_config);
+    let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
+    let telemetry = Arc::new(telemetry);
+
+    info!("Starting rcoder - AI-powered development platform");
+    info!(
+        "📋 日志配置: 保留 {} 天的日志文件",
+        config.cleanup_config.log_cleanup.log_retention_days
+    );
 
     // 创建项目工作目录
     tokio::fs::create_dir_all(&config.projects_dir).await?;
