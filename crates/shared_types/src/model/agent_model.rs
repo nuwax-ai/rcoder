@@ -44,6 +44,9 @@ pub trait SessionEntry: Clone + Send + Sync + 'static {
     /// 获取生命周期管理句柄
     fn lifecycle_handle(&self) -> Option<&Arc<dyn AgentLifecycle>>;
 
+    /// 获取 Agent 状态
+    fn status(&self) -> &AgentStatus;
+
     /// 检查 channel 是否已关闭（Agent 进程已退出）
     fn is_channel_closed(&self) -> bool;
 
@@ -201,6 +204,10 @@ impl SessionEntry for ProjectAndAgentInfo {
 
     fn lifecycle_handle(&self) -> Option<&Arc<dyn AgentLifecycle>> {
         self.stop_handle.as_ref()
+    }
+
+    fn status(&self) -> &AgentStatus {
+        &self.status
     }
 
     fn is_channel_closed(&self) -> bool {

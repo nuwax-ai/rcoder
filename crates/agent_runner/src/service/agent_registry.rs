@@ -665,6 +665,21 @@ impl AgentSessionRegistry {
     pub fn active_sessions_count(&self) -> usize {
         self.active_sessions_count.load(Ordering::Acquire)
     }
+
+    /// 获取内部 agent_info_map 的可变引用（仅用于测试）
+    ///
+    /// ## 安全性
+    ///
+    /// 此方法仅用于测试场景，允许测试代码直接操作 DashMap 以验证原子性操作。
+    /// 生产代码不应使用此方法。
+    ///
+    /// ## 为什么不用 `#[cfg(test)]`
+    ///
+    /// 如果使用 `#[cfg(test)]`，测试 crate 将无法访问此方法（因为测试 crate 编译时不会包含 `#[cfg(test)]` 的项）。
+    /// 因此我们使用文档约束，而不是编译时条件。
+    pub fn inner_mut(&self) -> &DashMap<String, ProjectAndAgentInfo> {
+        &self.agent_info_map
+    }
 }
 
 // ============================================================================

@@ -16,7 +16,7 @@ use agent_runner::service::AgentSessionRegistry;
 use agent_runner::service::PendingGuard;
 use agent_runner::agent_runtime::WORKER_THREAD_POOL_SIZE;
 use sacp::schema::SessionId;
-use shared_types::{AgentStatus, ProjectAndAgentInfo};
+use shared_types::{AgentStatus, ProjectAndAgentInfo, SessionEntry};
 use tokio::sync::mpsc;
 
 // ============================================================================
@@ -605,5 +605,299 @@ async fn test_high_concurrency_stress() {
         "高并发压力测试: {} 成功, {} 失败",
         success, fail
     );
+}
+
+// ============================================================================
+// 8. PendingGuard 与 SessionManager 竞态条件修复测试
+// ============================================================================
+
+/// 测试场景：PendingGuard 创建的占位符应该被真实会话替换
+///
+/// 这是修复的核心场景：
+/// 1. PendingGuard 创建 pending 占位符
+/// 2. 模拟 SessionManager 检测到 pending 并创建真实会话
+/// 3. 验证 pending 占位符被正确替换
+#[tokio::test]
+async fn test_pending_placeholder_replaced_by_real_session() {
+    let registry = Arc::new(AgentSessionRegistry::new());
+    let project_id = "test-pending-replace";
+
+    // 第一阶段：创建 PendingGuard（模拟 gRPC 层的行为）
+    let guard = PendingGuard::new(&registry, project_id);
+
+    // 验证：pending 占位符已创建
+    assert!(registry.contains_project(project_id));
+    let pending_info = registry.get_agent_info(project_id).unwrap();
+    assert_eq!(format!("{:?}", pending_info.status), "Pending");
+    assert_eq!(pending_info.session_id.to_string(), "pending");
+
+    // 第二阶段：模拟 SessionManager 检测到 Pending 状态并创建真实会话
+    // 检查状态（模拟 session_manager.rs 中的逻辑）
+    let should_replace = match registry.get_agent_info(project_id) {
+        Some(info) => {
+            // 这是修复的核心：显式检查 Pending 状态
+            *info.status() == AgentStatus::Pending
+        }
+        None => false,
+    };
+    assert!(should_replace, "应该检测到 Pending 占位符");
+
+    // 创建真实会话
+    let real_session_id = "real-session-123";
+    let (prompt_tx, _prompt_rx) = mpsc::channel(100);
+    let (cancel_tx, _cancel_rx) = mpsc::channel(100);
+
+    let real_session = ProjectAndAgentInfo {
+        project_id: project_id.to_string(),
+        session_id: SessionId::new(Arc::from(real_session_id)),
+        prompt_tx,
+        cancel_tx,
+        model_provider: None,
+        request_id: None,
+        status: AgentStatus::Idle,
+        last_activity: chrono::Utc::now(),
+        created_at: chrono::Utc::now(),
+        stop_handle: None,
+    };
+
+    // 第三阶段：原子性替换（模拟 session_manager.rs 中的 Entry API 逻辑）
+    // 使用 DashMap 的 entry API 进行原子性替换
+    use dashmap::mapref::entry::Entry;
+    match registry.as_ref().inner_mut().entry(project_id.to_string()) {
+        Entry::Vacant(entry) => {
+            entry.insert(real_session.clone());
+        }
+        Entry::Occupied(mut entry) => {
+            // 检查仍然是 Pending（防止其他线程已经插入了真实会话）
+            let existing: &ProjectAndAgentInfo = entry.get();
+            if *existing.status() == AgentStatus::Pending {
+                entry.insert(real_session.clone());
+            }
+        }
+    }
+
+    // 验证：pending 占位符已被替换为真实会话
+    assert!(registry.contains_project(project_id));
+    let final_info = registry.get_agent_info(project_id).unwrap();
+    assert_eq!(format!("{:?}", final_info.status), "Idle");
+    assert_eq!(final_info.session_id.to_string(), real_session_id);
+    assert!(!final_info.prompt_tx.is_closed());
+
+    // PendingGuard 不需要 commit（因为 pending 已被替换）
+    drop(guard);
+
+    // 验证：真实会话仍然存在（没有被 PendingGuard 清理）
+    assert!(registry.contains_project(project_id));
+
+    // 清理
+    registry.remove_by_project(project_id);
+}
+
+/// 测试场景：并发创建时，只有一个真实会话被保留
+///
+/// 验证修复的并发安全性：
+/// 1. PendingGuard 创建 pending 占位符
+/// 2. 多个线程尝试替换 pending
+/// 3. 只有一个真实会话被保留
+#[tokio::test]
+async fn test_concurrent_pending_replacement() {
+    let registry = Arc::new(AgentSessionRegistry::new());
+    let project_id = "test-concurrent-replace";
+    let num_threads = 5;
+    let barrier = Arc::new(Barrier::new(num_threads));
+    let success_count = Arc::new(AtomicUsize::new(0));
+
+    // 第一阶段：创建 PendingGuard
+    let _guard = PendingGuard::new(&registry, project_id);
+
+    // 验证 pending 占位符
+    assert!(registry.contains_project(project_id));
+    let pending_info = registry.get_agent_info(project_id).unwrap();
+    assert_eq!(format!("{:?}", pending_info.status), "Pending");
+
+    // 第二阶段：多个线程并发尝试替换 pending
+    let mut handles = vec![];
+    for i in 0..num_threads {
+        let registry_clone = registry.clone();
+        let barrier_clone = barrier.clone();
+        let success_count_clone = success_count.clone();
+
+        let handle = tokio::spawn(async move {
+            // 等待所有线程就绪
+            barrier_clone.wait().await;
+
+            // 每个线程创建一个"真实会话"
+            let session_id = format!("session-{}", i);
+            let (prompt_tx, _prompt_rx) = mpsc::channel(100);
+            let (cancel_tx, _cancel_rx) = mpsc::channel(100);
+
+            let real_session = ProjectAndAgentInfo {
+                project_id: project_id.to_string(),
+                session_id: SessionId::new(Arc::from(session_id.clone())),
+                prompt_tx,
+                cancel_tx,
+                model_provider: None,
+                request_id: None,
+                status: AgentStatus::Idle,
+                last_activity: chrono::Utc::now(),
+                created_at: chrono::Utc::now(),
+                stop_handle: None,
+            };
+
+            // 尝试原子性替换
+            use dashmap::mapref::entry::Entry;
+            let replaced = match registry_clone.as_ref().inner_mut().entry(project_id.to_string()) {
+                Entry::Occupied(mut entry) => {
+                    // 只有 pending 才替换
+                    let existing: &ProjectAndAgentInfo = entry.get();
+                    if *existing.status() == AgentStatus::Pending {
+                        entry.insert(real_session.clone());
+                        success_count_clone.fetch_add(1, Ordering::Relaxed);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Entry::Vacant(_) => false,
+            };
+
+            replaced
+        });
+
+        handles.push(handle);
+    }
+
+    // 等待所有线程完成
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // 验证：只有一个线程成功替换
+    let success = success_count.load(Ordering::Relaxed);
+    assert_eq!(success, 1, "应该只有一个线程成功替换 pending");
+
+    // 验证：最终只有一个会话存在
+    assert!(registry.contains_project(project_id));
+    let final_info = registry.get_agent_info(project_id).unwrap();
+    assert_eq!(format!("{:?}", final_info.status), "Idle");
+
+    // 清理
+    registry.remove_by_project(project_id);
+}
+
+/// 测试场景：PendingGuard 提交成功后，pending 状态应该被保留
+///
+/// 验证 PendingGuard 的 commit_success 行为：
+/// 1. PendingGuard 创建 pending 占位符
+/// 2. 调用 commit_success
+/// 3. pending 状态应该被保留（直到被真实会话替换）
+#[test]
+fn test_pending_guard_commit_preserves_state() {
+    let registry = AgentSessionRegistry::new();
+    let project_id = "test-commit-success";
+
+    {
+        let guard = PendingGuard::new(&registry, project_id);
+
+        // 验证 pending 占位符
+        assert!(registry.contains_project(project_id));
+
+        // 提交成功（防止清理）
+        guard.commit_success();
+    }
+
+    // guard 已 drop，但 pending 状态应该保留
+    assert!(registry.contains_project(project_id));
+    let info = registry.get_agent_info(project_id).unwrap();
+    assert_eq!(format!("{:?}", info.status), "Pending");
+
+    // 清理
+    registry.remove_by_project(project_id);
+}
+
+/// 测试场景：模拟真实的 session_manager.rs 逻辑流程
+///
+/// 这是一个端到端测试，模拟完整的修复流程：
+/// 1. PendingGuard 创建占位符
+/// 2. 检测到 Pending 状态
+/// 3. 释放锁，创建真实会话
+/// 4. 原子性插入/替换
+#[tokio::test]
+async fn test_session_manager_pending_replacement_flow() {
+    let registry = Arc::new(AgentSessionRegistry::new());
+    let project_id = "test-e2e-flow";
+
+    // ========== 第一阶段：PendingGuard 创建占位符 ==========
+    {
+        let _guard = PendingGuard::new(&registry, project_id);
+
+        // 验证占位符
+        let info = registry.get_agent_info(project_id).unwrap();
+        assert_eq!(format!("{:?}", info.status), "Pending");
+
+        // ========== 第二阶段：模拟 SessionManager 的 get_or_create_session ==========
+
+        // 2.1 快速检查：发现 entry 存在
+        let entry_exists = registry.contains_project(project_id);
+        assert!(entry_exists);
+
+        // 2.2 显式检查 Pending 状态
+        let should_replace = match registry.get_agent_info(project_id) {
+            Some(info) => *info.status() == AgentStatus::Pending,
+            None => false,
+        };
+        assert!(should_replace, "应该检测到 Pending 状态");
+
+        // 2.3 创建真实会话（不持有锁）
+        let real_session_id = "ses_real_12345";
+        let (prompt_tx, _prompt_rx) = mpsc::channel(100);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(100);
+
+        let real_session = ProjectAndAgentInfo {
+            project_id: project_id.to_string(),
+            session_id: SessionId::new(Arc::from(real_session_id)),
+            prompt_tx,
+            cancel_tx,
+            model_provider: None,
+            request_id: None,
+            status: AgentStatus::Idle,
+            last_activity: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            stop_handle: None,
+        };
+
+        // ========== 第三阶段：原子性替换 ==========
+
+        // 使用 DashMap entry API 进行原子性操作
+        use dashmap::mapref::entry::Entry;
+        let was_pending = match registry.as_ref().inner_mut().entry(project_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let existing: &ProjectAndAgentInfo = entry.get();
+                if *existing.status() == AgentStatus::Pending {
+                    entry.insert(real_session.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(_) => false,
+        };
+
+        assert!(was_pending, "应该成功替换 pending 占位符");
+
+        // 验证：真实会话已插入
+        let final_info = registry.get_agent_info(project_id).unwrap();
+        assert_eq!(final_info.session_id.to_string(), real_session_id);
+        assert_eq!(format!("{:?}", final_info.status), "Idle");
+        assert!(!final_info.prompt_tx.is_closed());
+    }
+
+    // PendingGuard 已 drop，但真实会话应该保留
+    assert!(registry.contains_project(project_id));
+    let final_info = registry.get_agent_info(project_id).unwrap();
+    assert_eq!(format!("{:?}", final_info.status), "Idle");
+
+    // 清理
+    registry.remove_by_project(project_id);
 }
 

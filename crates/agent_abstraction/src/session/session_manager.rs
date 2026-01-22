@@ -389,6 +389,69 @@ where
         // 第一阶段：快速检查现有会话
         if let Entry::Occupied(occupied_entry) = self.registry.entry(project_id_key.clone()) {
             let existing = occupied_entry.get();
+
+            // 🔥 显式检查 Pending 状态 - PendingGuard 创建的占位符需要被替换
+            if *existing.status() == AgentStatus::Pending {
+                info!(
+                    "🔄 [SESSION] 检测到 Pending 占位符，准备替换: project_id={}",
+                    project_id
+                );
+                // 显式释放 entry 锁
+                drop(occupied_entry);
+
+                // 第二阶段：创建新会话（不持有锁）
+                let new_session = self
+                    .create_session_internal(
+                        project_id_key.clone(),
+                        project_path,
+                        model_provider,
+                        start_config,
+                        service_uuid,
+                    )
+                    .await?;
+
+                // 第三阶段：原子性替换（插入新会话，覆盖 pending 占位符）
+                match self.registry.entry(project_id_key.clone()) {
+                    Entry::Vacant(entry) => {
+                        let new_session_id = new_session.session_id().to_string();
+                        entry.insert(new_session.clone());
+                        info!(
+                            "✅ [SESSION] 插入新会话替换 pending: project_id={}, session_id={}",
+                            project_id, new_session_id
+                        );
+                        return Ok((new_session, true));
+                    }
+                    Entry::Occupied(mut entry) => {
+                        // 检查是 Pending 占位符还是其他线程创建的真实会话
+                        let current_session = entry.get();
+                        let current_status = current_session.status();
+
+                        if *current_status == AgentStatus::Pending {
+                            // 仍然是 Pending 占位符，替换它
+                            let old_session_id = current_session.session_id().to_string();
+                            let new_session_id = new_session.session_id().to_string();
+                            entry.insert(new_session.clone());
+                            info!(
+                                "✅ [SESSION] 替换 pending 占位符: project_id={}, {} → {}",
+                                project_id, old_session_id, new_session_id
+                            );
+                            return Ok((new_session, true));
+                        } else {
+                            // 其他线程已经创建了真实会话，使用已存在的（丢弃我们创建的）
+                            let existing_session = current_session.clone();
+                            let created_session_id = new_session.session_id().to_string();
+                            let existing_session_id = existing_session.session_id().to_string();
+                            info!(
+                                "🔄 [SESSION] 检测到并发创建（其他线程已创建真实会话）: project_id={}, 丢弃 session_id={}, 使用 session_id={}",
+                                project_id, created_session_id, existing_session_id
+                            );
+                            // new_session 会被 drop，AgentLifecycleGuard 会清理 Agent 进程
+                            return Ok((existing_session, false));
+                        }
+                    }
+                }
+            }
+
             let channel_closed = existing.is_channel_closed();
             let model_changed = existing.is_model_config_changed(&model_provider);
 
