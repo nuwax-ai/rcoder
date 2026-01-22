@@ -172,9 +172,10 @@ pub async fn handle_computer_chat(
     };
 
     info!(
-        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, prompt_len={}, attachments={}, model_provider={:?}, agent_config={:?}",
+        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, session_id={:?}, prompt_len={}, attachments={}, model_provider={:?}, agent_config={:?}",
         user_id,
         project_id,
+        request.session_id,
         request.prompt.len(),
         request.attachments.len(),
         request.model_provider,
@@ -323,9 +324,52 @@ pub async fn handle_computer_chat(
         }
     }
 
-    // 7. 转发请求到容器服务（使用 gRPC）
+    // 7. 🆕 自动查找 session_id 逻辑
+    // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
+    let session_id_to_use = match &request.session_id {
+        Some(sid) if !sid.is_empty() => {
+            debug!("🔍 [COMPUTER_CHAT] 使用用户传递的 session_id: {}", sid);
+            sid.clone()
+        }
+        _ => {
+            // 用户没有传递 session_id，尝试查找最新的
+            match state.get_project(&project_id) {
+                Some(project_info) => {
+                    let existing_session_id = project_info.session_id();
+                    match existing_session_id {
+                        Some(sid) if !sid.is_empty() => {
+                            info!(
+                                "🔄 [COMPUTER_CHAT] 未传递 session_id，自动使用最新会话: project_id={}, session_id={}",
+                                project_id, sid
+                            );
+                            sid.to_string()
+                        }
+                        _ => {
+                            debug!("🆕 [COMPUTER_CHAT] 项目存在但无 session_id，创建新会话");
+                            String::new()
+                        }
+                    }
+                }
+                None => {
+                    debug!("🆕 [COMPUTER_CHAT] 未找到现有项目，创建新会话");
+                    String::new()
+                }
+            }
+        }
+    };
+
+    // 克隆 request 并修改 session_id
+    let mut request_for_forward = request.clone();
+    request_for_forward.session_id = if session_id_to_use.is_empty() {
+        None
+    } else {
+        Some(session_id_to_use)
+    };
+    // 🆕 自动查找 session_id 逻辑结束
+
+    // 8. 转发请求到容器服务（使用 gRPC）
     let result = forward_computer_request_to_container(
-        &request,
+        &request_for_forward,  // 使用修改后的 request
         &project_id,
         &container_info,
         &state.grpc_pool,
@@ -733,4 +777,3 @@ fn ensure_project_mapping_in_state(
 // ============================================================================
 // SSE 进度流处理器（复用现有的 agent_session_notification）
 // ============================================================================
-
