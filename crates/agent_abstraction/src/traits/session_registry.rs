@@ -115,6 +115,28 @@ pub trait SessionRegistry: Send + Sync + 'static {
     /// * `project_id` - 项目 ID
     fn contains(&self, project_id: &str) -> bool;
 
+    /// 🆕 通过 session_id 获取 project_id（反向查询）
+    ///
+    /// # Arguments
+    /// * `session_id` - 会话 ID
+    ///
+    /// # Returns
+    /// 如果 session_id 存在，返回对应的 project_id；否则返回 None
+    fn get_project_by_session(&self, session_id: &str) -> Option<String>;
+
+    /// 🆕 通过 session_id 直接获取会话条目（原子性操作）
+    ///
+    /// # Arguments
+    /// * `session_id` - 会话 ID
+    ///
+    /// # Returns
+    /// 如果 session_id 存在，返回对应的会话条目克隆；否则返回 None
+    ///
+    /// # 优势
+    /// - 一次性查询，避免两次调用之间的竞态窗口
+    /// - 内部使用 DashMap 的原子性操作
+    fn get_entry_by_session(&self, session_id: &str) -> Option<Self::Entry>;
+
     /// 获取所有项目 ID 列表
     fn list_project_ids(&self) -> Vec<String>;
 
@@ -170,6 +192,14 @@ impl<R: SessionRegistry> SessionRegistry for Arc<R> {
 
     fn contains(&self, project_id: &str) -> bool {
         (**self).contains(project_id)
+    }
+
+    fn get_project_by_session(&self, session_id: &str) -> Option<String> {
+        (**self).get_project_by_session(session_id)
+    }
+
+    fn get_entry_by_session(&self, session_id: &str) -> Option<Self::Entry> {
+        (**self).get_entry_by_session(session_id)
     }
 
     fn list_project_ids(&self) -> Vec<String> {

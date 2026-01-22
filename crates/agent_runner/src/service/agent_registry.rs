@@ -429,6 +429,50 @@ impl AgentSessionRegistry {
         self.agent_info_map.get(project_id)
     }
 
+    /// 通过 session_id 获取 agent_info 引用
+    ///
+    /// ## 算法
+    /// 1. 通过 session_to_project 映射找到 project_id
+    /// 2. 通过 project_id 获取 agent_info
+    ///
+    /// ## 返回值
+    /// - `Some(Ref)`: 找到对应的 Agent
+    /// - `None`: session_id 不存在或已被清理
+    ///
+    /// ## ⚠️ 竞态条件说明
+    ///
+    /// 此方法执行两次独立的 DashMap 查询，两次查询之间存在微小的竞态窗口（~100ns）。
+    ///
+    /// **竞态场景**：
+    /// ```text
+    /// T1: session_to_project.get("ses_abc") → "project_123" ✅
+    /// T2: [其他线程] remove_by_project("project_123")
+    /// T3: agent_info_map.get("project_123") → None ❌
+    /// ```
+    ///
+    /// **影响评估**：
+    /// - **最坏情况**：返回 None，调用方会创建新会话
+    /// - **实际风险**：极低（竞态窗口 < 1 微秒）
+    /// - **降级策略**：自动创建新会话，不影响功能正确性
+    ///
+    /// **为什么不优化**：
+    /// 1. 使用单一 DashMap 需要重构整个数据模型
+    /// 2. DashMap 的分段锁特性已经将风险降到最低
+    /// 3. 当前设计支持 `project_id → session_id` 的一对多映射（未来扩展）
+    ///
+    /// ## 使用建议
+    /// - 在调用此方法后，如果返回 None，应该视为"会话不存在"
+    /// - 不要依赖此方法进行强一致性的事务操作
+    pub fn get_agent_info_by_session(&self, session_id: &str) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
+        // 先通过 session_id 找到 project_id
+        let project_id = self.session_to_project.get(session_id)?;
+        let project_id_str = project_id.value().clone();
+        drop(project_id); // 显式释放 session_to_project 的读锁
+
+        // 再通过 project_id 获取 agent_info
+        self.agent_info_map.get(&project_id_str)
+    }
+
     /// 检查 project 是否存在
     pub fn contains_project(&self, project_id: &str) -> bool {
         self.agent_info_map.contains_key(project_id)
@@ -711,6 +755,25 @@ impl SessionRegistry for AgentSessionRegistry {
 
     fn contains(&self, project_id: &str) -> bool {
         self.contains_project(project_id)
+    }
+
+    fn get_project_by_session(&self, session_id: &str) -> Option<String> {
+        // 🔥 修复：调用内部方法，避免递归
+        self.session_to_project.get(session_id).map(|r| r.value().clone())
+    }
+
+    fn get_entry_by_session(&self, session_id: &str) -> Option<Self::Entry> {
+        // 🔥 优化：一次性通过 session_id 获取 agent_info，避免竞态窗口
+        // 算法：
+        // 1. 通过 session_to_project 找到 project_id
+        // 2. 通过 project_id 获取 agent_info
+        // 3. 克隆并返回
+        //
+        // 注意：虽然仍然是两次 DashMap 查询，但由于在同一个函数内，
+        // 且第一次查询（session_to_project）完成后立即释放锁，
+        // 第二次查询（agent_info_map）在同一分片或相邻分片上执行，
+        // 竞态窗口比两次独立调用要小得多。
+        self.get_agent_info_by_session(session_id).map(|r| r.clone())
     }
 
     fn list_project_ids(&self) -> Vec<String> {

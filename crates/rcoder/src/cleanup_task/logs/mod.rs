@@ -83,26 +83,26 @@ impl LogCleaner {
                 }
             };
 
-            // 获取创建时间
-            let created = match metadata.created() {
+            // 获取修改时间（更可靠，所有文件系统都支持）
+            let modified = match metadata.modified() {
                 Ok(time) => time,
                 Err(e) => {
-                    debug!("📋 [log_cleaner] 获取创建时间失败: {:?} - {}", path, e);
+                    debug!("📋 [log_cleaner] 获取修改时间失败: {:?} - {}", path, e);
                     continue;
                 }
             };
 
             // 转换为 Unix 时间戳
-            let created_secs = match created.duration_since(std::time::UNIX_EPOCH) {
+            let modified_secs = match modified.duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => duration.as_secs(),
                 Err(_) => {
-                    debug!("📋 [log_cleaner] 创建时间无效，跳过: {:?}", path);
+                    debug!("📋 [log_cleaner] 修改时间无效，跳过: {:?}", path);
                     continue;
                 }
             };
 
-            // 判断是否过期
-            if created_secs < cutoff_time {
+            // 判断是否过期（基于修改时间）
+            if modified_secs < cutoff_time {
                 if metadata.is_file() {
                     // 删除过期文件
                     let file_size = metadata.len();
@@ -230,14 +230,14 @@ mod tests {
             file.write_all(content.as_bytes()).unwrap();
         }
 
-        // 设置旧文件的创建时间为 15 天前
+        // 设置旧文件的修改时间为 15 天前
         let old_time =
             std::time::SystemTime::now() - std::time::Duration::from_secs(15 * 24 * 60 * 60);
         for (filename, _) in &test_files[..2] {
             let file_path = log_dir.join(filename);
-            if let Err(e) = filetime::set_file_creation_time(&file_path, old_time.into()) {
-                // 系统不支持设置创建时间，跳过此测试
-                println!("系统不支持设置创建时间，跳过测试: {}", e);
+            if let Err(e) = filetime::set_file_mtime(&file_path, old_time.into()) {
+                // 系统不支持设置修改时间，跳过此测试
+                println!("系统不支持设置修改时间，跳过测试: {}", e);
                 return;
             }
         }

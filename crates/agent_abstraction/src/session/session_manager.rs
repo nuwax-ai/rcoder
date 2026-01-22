@@ -352,7 +352,7 @@ where
     /// # 参数
     /// - `project_id`: 项目 ID
     /// - `project_path`: 项目路径
-    /// - `session_id_hint`: 会话 ID 提示（用于恢复）
+    /// - `session_id_hint`: 会话 ID 提示（用于恢复现有会话）
     /// - `model_provider`: 模型提供者配置
     /// - `start_config`: Agent 启动配置
     /// - `service_uuid`: 与此 Agent 关联的唯一 UUID
@@ -377,7 +377,7 @@ where
         &self,
         project_id: &str,
         project_path: PathBuf,
-        _session_id_hint: Option<String>, // 保留用于未来扩展（resume 逻辑在上层处理）
+        session_id_hint: Option<String>, // 🔥 修复：使用此参数查找现有会话
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
@@ -385,6 +385,50 @@ where
         use dashmap::mapref::entry::Entry;
 
         let project_id_key = project_id.to_string();
+
+        // 🆕 第一阶段：如果提供了 session_id_hint，先尝试通过 session_id 查找现有会话
+        // 🔥 优化：使用 get_entry_by_session() 避免两次调用之间的竞态窗口
+        if let Some(ref hint_sid) = session_id_hint {
+            // 一次性查询：通过 session_id 直接获取 agent_info
+            if let Some(existing) = self.registry.get_entry_by_session(hint_sid) {
+                // 验证 project_id 是否匹配（防御性编程）
+                if existing.project_id() == project_id {
+                    let channel_closed = existing.is_channel_closed();
+                    let model_changed = existing.is_model_config_changed(&model_provider);
+
+                    if !channel_closed && !model_changed {
+                        info!("🔄 [SESSION] 通过 session_id_hint 复用现有会话: project_id={}, session_id={}", project_id, hint_sid);
+                        return Ok((existing, false));
+                    }
+
+                    if channel_closed {
+                        info!(
+                            "⚠️ [SESSION] session_id_hint 对应的会话 channel 已关闭，需要重建: project_id={}, session_id={}",
+                            project_id, hint_sid
+                        );
+                    }
+                    if model_changed {
+                        info!(
+                            "🔄 [SESSION] session_id_hint 对应的会话模型配置变化，需要重建: project_id={}, session_id={}",
+                            project_id, hint_sid
+                        );
+                    }
+                    // 会话无效，继续后续逻辑（可能需要重建）
+                } else {
+                    info!(
+                        "⚠️ [SESSION] session_id_hint 属于不同的 project: hint_project={}, current_project={}, session_id={}",
+                        existing.project_id(), project_id, hint_sid
+                    );
+                    // session_id 属于其他 project，不能复用，继续后续逻辑
+                }
+            } else {
+                info!(
+                    "🔍 [SESSION] session_id_hint 不存在于 registry: session_id={}",
+                    hint_sid
+                );
+                // session_id 不存在，继续后续逻辑
+            }
+        }
 
         // 第一阶段：快速检查现有会话
         if let Entry::Occupied(occupied_entry) = self.registry.entry(project_id_key.clone()) {

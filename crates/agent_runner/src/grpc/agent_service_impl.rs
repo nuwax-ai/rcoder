@@ -258,16 +258,39 @@ impl AgentService for AgentServiceImpl {
             Some(req.session_id.clone())
         };
 
-        // Check Agent status, prohibit concurrent requests (using unified Registry)
-        // 🆕 Check both Active and Pending states
-        if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&project_id)
+        // 🆕 Check Agent status, prohibit concurrent requests (优先通过 session_id 查找)
+        // 策略：
+        // 1. 如果提供了 session_id，先尝试通过 session_id 查找 Agent
+        // 2. 如果找不到，再通过 project_id 查找
+        // 3. 检查 Active 和 Pending 状态
+        let agent_info_ref = if let Some(ref sid) = session_id {
+            // 优先通过 session_id 查找
+            info!(
+                "🔍 [gRPC] 通过 session_id 查找 Agent: session_id={}",
+                sid
+            );
+            AGENT_REGISTRY.get_agent_info_by_session(sid)
+        } else {
+            // 通过 project_id 查找
+            None
+        };
+
+        let agent_info_ref = agent_info_ref.or_else(|| {
+            info!(
+                "🔍 [gRPC] 通过 project_id 查找 Agent: project_id={}",
+                project_id
+            );
+            AGENT_REGISTRY.get_agent_info(&project_id)
+        });
+
+        if let Some(agent_info) = agent_info_ref
             && (agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending)
             {
                 // 🎯 Use business response to return error code instead of gRPC Status error
                 // This allows rcoder to directly read error code from error_code field
                 info!(
-                    "🚫 [gRPC] Agent Busy returning 9010 error: project_id={}, status={:?}",
-                    project_id, agent_info.status
+                    "🚫 [gRPC] Agent Busy returning 9010 error: project_id={}, status={:?}, session_id={:?}",
+                    project_id, agent_info.status, session_id
                 );
                 return Ok(Response::new(GrpcChatResponse {
                     project_id: project_id.clone(),
