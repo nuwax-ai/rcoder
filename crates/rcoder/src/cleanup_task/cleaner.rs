@@ -23,6 +23,7 @@ pub struct AgentCleaner {
     container_destroyer: super::container::ContainerDestroyer,
     orphaned_cleaner: super::container::OrphanedContainerCleaner,
     agent_scanner: super::agent::AgentScanner,
+    log_cleaner: super::logs::LogCleaner,
 }
 
 impl AgentCleaner {
@@ -38,6 +39,12 @@ impl AgentCleaner {
         let state_clone = state.clone();
         let state_clone2 = state.clone();
         let grpc_pool = state.grpc_pool.clone();
+
+        // 创建日志清理器（使用配置）
+        let log_cleaner = super::logs::LogCleaner::new(
+            config.log_dir.clone(),
+            config.log_retention_duration.as_secs() / 24 / 60 / 60,
+        );
 
         Self {
             config,
@@ -61,6 +68,7 @@ impl AgentCleaner {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)
             },
+            log_cleaner,
         }
     }
 
@@ -71,11 +79,26 @@ impl AgentCleaner {
         // 重置本次清理的统计
         let mut current_stats = super::config::CleanupStats::default();
 
-        // 1. 扫描需要清理的 agent
+        // 1. 清理过期日志文件
+        match self.log_cleaner.cleanup_once().await {
+            Ok(log_stats) => {
+                if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
+                    info!(
+                        "🗑️ [cleaner] 日志清理完成: {}",
+                        log_stats.summary()
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ [cleaner] 日志清理失败: {}", e);
+            }
+        }
+
+        // 2. 扫描需要清理的 agent
         let idle_agents = self.agent_scanner.scan_idle_agents().await?;
         info!("🔍 [cleaner] 扫描到 {} 个闲置 agent", idle_agents.len());
 
-        // 2. 清理每个 agent
+        // 3. 清理每个 agent
         for project_id in idle_agents {
             current_stats.total_cleaned += 1;
 
@@ -94,7 +117,7 @@ impl AgentCleaner {
             }
         }
 
-        // 3. 清理孤立容器（无上限，一次性清理所有）
+        // 4. 清理孤立容器（无上限，一次性清理所有）
         match self.orphaned_cleaner.cleanup().await {
             Ok(orphaned_count) => {
                 current_stats.orphaned_containers_cleaned = orphaned_count;
@@ -105,7 +128,7 @@ impl AgentCleaner {
             }
         }
 
-        // 4. 更新累计统计
+        // 5. 更新累计统计
         current_stats.last_cleanup = Some(Utc::now());
         self.stats.total_cleaned += current_stats.total_cleaned;
         self.stats.success_cleaned += current_stats.success_cleaned;

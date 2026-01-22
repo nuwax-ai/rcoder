@@ -21,6 +21,14 @@ cleanup_config:
   # Docker 容器停止超时时间（秒）
   # 默认值: 30
   docker_stop_timeout_seconds: 30
+  # 日志清理配置
+  log_cleanup:
+    # 日志目录路径（容器内路径）
+    # 默认值: /app/logs/container
+    log_dir: "/app/logs/container"
+    # 日志保留天数
+    # 默认值: 7
+    log_retention_days: 7
 
 # Pingora 反向代理配置
 proxy_config:

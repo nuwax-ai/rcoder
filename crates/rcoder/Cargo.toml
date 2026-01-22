@@ -21,6 +21,9 @@ debug = []
 # 此 feature 会传递给 docker_manager crate
 ebpf-debug = ["docker_manager/ebpf-debug"]
 
+[dev-dependencies]
+filetime = "0.2"
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }

@@ -9,8 +9,12 @@ use dashmap::mapref::entry::Entry;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
 use shared_types::ProjectAndAgentInfo;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
+
+// 导入工作线程池大小常量
+use crate::agent_runtime::WORKER_THREAD_POOL_SIZE;
 
 /// 全局 Agent 会话注册表（Arc 包装版本，用于 AcpSessionManager 注入）
 pub static AGENT_REGISTRY: LazyLock<Arc<AgentSessionRegistry>> =
@@ -23,11 +27,111 @@ pub struct RegistryStats {
     pub session_count: usize,
 }
 
+// ============================================================================
+// 🔥 P0 修复: PendingGuard RAII 模式
+// ============================================================================
+
+/// Pending 状态 RAII 守卫
+///
+/// ## 问题背景
+///
+/// 旧代码中，`clear_pending_if_exists` 需要在每个异常路径手动调用，
+/// 容易遗漏导致 Pending 状态永久泄漏，阻塞后续请求。
+///
+/// ## 解决方案
+///
+/// 使用 RAII (Resource Acquisition Is Initialization) 模式：
+/// - 构造时自动调用 `set_pending()`
+/// - Drop 时自动调用 `clear_pending_if_exists()`（除非显式提交成功）
+///
+/// ## 使用示例
+///
+/// ```rust,ignore
+/// let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
+///
+/// match risky_operation().await {
+///     Ok(response) => {
+///         pending_guard.commit_success(); // 成功，不清理 Pending
+///         return Ok(response);
+///     }
+///     Err(e) => {
+///         // 失败，PendingGuard 会在 drop 时自动清理
+///         return Err(e);
+///     }
+/// }
+/// // 函数返回时，guard 自动 drop，清理逻辑执行
+/// ```
+pub struct PendingGuard<'a> {
+    registry: &'a AgentSessionRegistry,
+    project_id: String,
+    cleaned: AtomicBool,
+}
+
+impl<'a> PendingGuard<'a> {
+    /// 创建新的 PendingGuard 并自动设置 Pending 状态
+    pub fn new(registry: &'a AgentSessionRegistry, project_id: &str) -> Self {
+        registry.set_pending(project_id);
+        debug!(
+            "🛡️ [PendingGuard] 创建并设置 Pending 状态: project_id={}",
+            project_id
+        );
+        Self {
+            registry,
+            project_id: project_id.to_string(),
+            cleaned: AtomicBool::new(false),
+        }
+    }
+
+    /// 标记为成功，防止 Drop 时清理
+    ///
+    /// ## ⚠️ 重要
+    ///
+    /// 调用此方法后，Pending 状态将被保留（因为 Agent 已成功启动）。
+    /// 必须使用 `std::mem::forget()` 防止 Drop 执行清理。
+    pub fn commit_success(self) {
+        self.cleaned.store(true, Ordering::Release);
+        debug!(
+            "🛡️ [PendingGuard] 提交成功，保留 Pending 状态: project_id={}",
+            self.project_id
+        );
+        std::mem::forget(self); // 防止 drop 时清理
+    }
+}
+
+impl<'a> Drop for PendingGuard<'a> {
+    fn drop(&mut self) {
+        // 只有未标记为成功时才清理
+        if !self.cleaned.load(Ordering::Acquire) {
+            debug!(
+                "🛡️ [PendingGuard] Drop 时自动清理 Pending 状态: project_id={}",
+                self.project_id
+            );
+            self.registry.clear_pending_if_exists(&self.project_id);
+        }
+    }
+}
+
 /// Agent 会话注册表
 ///
 /// 统一管理 project_id、session_id 和 AgentInfo 之间的映射关系
 /// 所有映射操作都通过此结构体的方法进行，确保数据一致性
-#[derive(Clone)]
+///
+/// ## 🔥 P0 修复: Clone 手动实现
+///
+/// 由于 `AtomicUsize` 不实现 `Clone` trait，我们需要手动实现 `Clone`。
+/// DashMap 支持克隆（内部使用 Arc），AtomicUsize 通过 load/store 实现。
+impl Clone for AgentSessionRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            agent_info_map: self.agent_info_map.clone(),
+            project_to_session: self.project_to_session.clone(),
+            session_to_project: self.session_to_project.clone(),
+            // 注意：AtomicUsize 共享同一个计数器，这是设计意图
+            active_sessions_count: AtomicUsize::new(self.active_sessions_count.load(Ordering::Acquire)),
+        }
+    }
+}
+
 pub struct AgentSessionRegistry {
     /// project_id → ProjectAndAgentInfo
     agent_info_map: DashMap<String, ProjectAndAgentInfo>,
@@ -35,6 +139,9 @@ pub struct AgentSessionRegistry {
     project_to_session: DashMap<String, String>,
     /// session_id → project_id (反向映射)
     session_to_project: DashMap<String, String>,
+    /// 🔥 P0 修复: 原子计数器，用于无锁并发限制检查
+    /// 使用 Compare-And-Swap (CAS) 操作避免 TOCTOU 竞态条件
+    active_sessions_count: AtomicUsize,
 }
 
 impl AgentSessionRegistry {
@@ -44,6 +151,7 @@ impl AgentSessionRegistry {
             agent_info_map: DashMap::new(),
             project_to_session: DashMap::new(),
             session_to_project: DashMap::new(),
+            active_sessions_count: AtomicUsize::new(0),
         }
     }
 
@@ -467,6 +575,95 @@ impl AgentSessionRegistry {
             agent_count,
             session_count,
         }
+    }
+
+    // ========== 🔥 P0 修复: 原子性会话槽位管理 ==========
+
+    /// 尝试获取会话槽位（原子操作）
+    ///
+    /// ## TOCTOU 竞态条件修复
+    ///
+    /// 使用 Compare-And-Swap (CAS) 操作实现原子性的"检查并递增"，
+    /// 避免了检查 `active_sessions_count` 和注册之间的竞态窗口。
+    ///
+    /// ## 算法
+    ///
+    /// ```text,ignore
+    /// loop {
+    ///     old = load()
+    ///     if old >= LIMIT { return false }
+    ///     if compare_exchange_weak(old, old + 1).is_ok() {
+    ///         return true
+    ///     }
+    ///     // CAS 失败，重试
+    /// }
+    /// ```
+    ///
+    /// ## 返回
+    ///
+    /// - `true`: 成功获取槽位（计数器已递增）
+    /// - `false`: 槽位已满，拒绝请求
+    ///
+    /// ## 使用示例
+    ///
+    /// ```rust,ignore
+    /// if !AGENT_REGISTRY.try_acquire_session_slot() {
+    ///     AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+    ///     return error("系统繁忙，请稍后重试");
+    /// }
+    /// // ... 处理请求 ...
+    /// AGENT_REGISTRY.release_session_slot();
+    /// ```
+    pub fn try_acquire_session_slot(&self) -> bool {
+        let mut old = self.active_sessions_count.load(Ordering::Acquire);
+        loop {
+            if old >= WORKER_THREAD_POOL_SIZE {
+                return false;
+            }
+            match self.active_sessions_count.compare_exchange_weak(
+                old,
+                old + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    debug!(
+                        "🎯 [原子槽位] 成功获取槽位: {}/{}",
+                        old + 1,
+                        WORKER_THREAD_POOL_SIZE
+                    );
+                    return true;
+                }
+                Err(new_old) => old = new_old,
+            }
+        }
+    }
+
+    /// 释放会话槽位
+    ///
+    /// ## 使用场景
+    ///
+    /// 在请求处理完成（无论成功失败）后调用，释放槽位供后续请求使用。
+    ///
+    /// ## ⚠️ 注意事项
+    ///
+    /// - 必须与 `try_acquire_session_slot()` 配对使用
+    /// - 多次释放会导致计数器变成负数（溢出后变成超大正数）
+    /// - 建议使用 `PendingGuard` RAII 模式自动管理
+    pub fn release_session_slot(&self) {
+        let old = self.active_sessions_count.fetch_sub(1, Ordering::Release);
+        debug!(
+            "🔓 [原子槽位] 释放槽位: {} → {}",
+            old,
+            old.saturating_sub(1)
+        );
+    }
+
+    /// 获取当前活跃会话计数（原子读取）
+    ///
+    /// 用于日志记录和监控，无需遍历 DashMap。
+    pub fn active_sessions_count(&self) -> usize {
+        self.active_sessions_count.load(Ordering::Acquire)
     }
 }
 

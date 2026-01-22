@@ -4207,6 +4207,7 @@ dependencies = [
  "derive_builder",
  "docker_manager",
  "duckdb_manager",
+ "filetime",
  "futures 0.3.31",
  "futures-util",
  "hyper",

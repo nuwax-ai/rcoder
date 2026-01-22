@@ -22,7 +22,7 @@
 //! | 重启 | 替换 sender | abort + spawn |
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,8 +107,11 @@ pub struct AgentRuntime {
     /// 当前状态
     state: Arc<AtomicState>,
 
-    /// 最后心跳时间
-    last_heartbeat: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    /// 🔥 P1 修复: 最后心跳时间戳（毫秒，Unix timestamp）
+    /// 使用 AtomicI64 替代 Mutex，避免频繁的锁竞争
+    /// - 0 表示从未收到心跳
+    /// - 正数表示最后一次心跳的 timestamp_millis()
+    last_heartbeat_ts: Arc<AtomicI64>,
 
     /// 活跃请求追踪: request_id -> 开始时间
     active_requests: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
@@ -131,7 +134,7 @@ impl AgentRuntime {
             request_tx,
             worker_handle: Arc::new(Mutex::new(None)),
             state: Arc::new(AtomicState::new(WorkerState::Starting)),
-            last_heartbeat: Arc::new(Mutex::new(None)),
+            last_heartbeat_ts: Arc::new(AtomicI64::new(0)),
             active_requests: Arc::new(Mutex::new(HashMap::new())),
             heartbeat_timeout: Duration::from_secs(15),
             initial_grace_period: Duration::from_secs(30),
@@ -145,7 +148,7 @@ impl AgentRuntime {
     /// SACP 支持 Send，直接在主运行时中运行，无需独立线程
     pub async fn start(&self, receiver: mpsc::Receiver<AgentRequest>) {
         let state = self.state.clone();
-        let last_heartbeat = self.last_heartbeat.clone();
+        let last_heartbeat_ts = self.last_heartbeat_ts.clone();
         let active_requests = self.active_requests.clone();
 
         let handle = tokio::spawn(async move {
@@ -153,7 +156,7 @@ impl AgentRuntime {
             if let Err(e) = crate::proxy_agent::agent_worker_with_heartbeat(
                 receiver,
                 state.clone(),
-                last_heartbeat.clone(),
+                last_heartbeat_ts.clone(),
                 active_requests.clone(),
             )
             .await
@@ -179,7 +182,7 @@ impl AgentRuntime {
 
         // 2. 重置状态
         self.state.set(WorkerState::Starting);
-        *self.last_heartbeat.lock().await = None;
+        self.last_heartbeat_ts.store(0, Ordering::Release);
         *self.active_requests.lock().await = HashMap::new();
 
         // 3. 启动新 worker
@@ -205,11 +208,11 @@ impl AgentRuntime {
             return false;
         }
 
-        // 检查心跳
-        let last_opt = *self.last_heartbeat.lock().await;
-        if let Some(last) = last_opt {
-            let elapsed = Utc::now() - last;
-            elapsed.num_seconds() < self.heartbeat_timeout.as_secs() as i64
+        // 🔥 P1 修复: 使用原子操作检查心跳（无锁）
+        let last_ts = self.last_heartbeat_ts.load(Ordering::Acquire);
+        if last_ts > 0 {
+            let elapsed_ms = Utc::now().timestamp_millis() - last_ts;
+            elapsed_ms < self.heartbeat_timeout.as_millis() as i64
         } else {
             // 首次启动宽限期
             true
@@ -221,24 +224,40 @@ impl AgentRuntime {
         self.state.get()
     }
 
-    /// 检查心跳是否超时
-    pub async fn check_heartbeat_timeout(&self) -> bool {
-        let last_opt = *self.last_heartbeat.lock().await;
+    /// 🔥 P1 修复: 检查心跳是否超时（无锁）
+    ///
+    /// ## 返回值
+    ///
+    /// - `true`: 心跳超时（超过 15 秒未收到心跳）
+    /// - `false`: 心跳正常或在宽限期内
+    pub fn check_heartbeat_timeout(&self) -> bool {
+        let last_ts = self.last_heartbeat_ts.load(Ordering::Acquire);
 
-        if let Some(timestamp) = last_opt {
+        if last_ts > 0 {
             // 有心跳记录，检查是否超过 15 秒
-            let elapsed = Utc::now() - timestamp;
-            elapsed.num_seconds() > 15
+            let elapsed_ms = Utc::now().timestamp_millis() - last_ts;
+            elapsed_ms > 15_000
         } else {
-            // 从未收到心跳，检查首次启动宽限期
-            // 注意：这里简化处理，实际上需要记录启动时间
+            // 从未收到心跳，使用首次启动宽限期
             false
         }
     }
 
-    /// 获取最后心跳时间
-    pub async fn last_heartbeat_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        *self.last_heartbeat.lock().await
+    /// 🔥 P1 修复: 获取最后心跳时间（无锁）
+    ///
+    /// ## 返回值
+    ///
+    /// - `Some(timestamp)`: 最后心跳时间
+    /// - `None`: 从未收到心跳
+    pub fn last_heartbeat_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let last_ts = self.last_heartbeat_ts.load(Ordering::Acquire);
+        if last_ts > 0 {
+            // 将毫秒时间戳转换为 DateTime
+            use chrono::TimeZone;
+            Some(chrono::Utc.timestamp_millis_opt(last_ts).unwrap())
+        } else {
+            None
+        }
     }
 
     /// 获取活跃请求句柄
@@ -280,16 +299,14 @@ mod tests {
         let (runtime, _rx) = AgentRuntime::new(100);
 
         // 初始状态：从未收到心跳
-        assert!(!runtime.check_heartbeat_timeout().await);
+        assert!(!runtime.check_heartbeat_timeout());
 
-        // 模拟心跳超时
-        {
-            let mut last_heartbeat = runtime.last_heartbeat.lock().await;
-            *last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(20));
-        }
+        // 模拟心跳超时（设置20秒前的时间戳）
+        let timestamp_20s_ago = Utc::now().timestamp_millis() - (20 * 1000);
+        runtime.last_heartbeat_ts.store(timestamp_20s_ago, std::sync::atomic::Ordering::Release);
 
         // 心跳超过 15 秒，应检测到超时
-        assert!(runtime.check_heartbeat_timeout().await);
+        assert!(runtime.check_heartbeat_timeout());
     }
 
     #[tokio::test]

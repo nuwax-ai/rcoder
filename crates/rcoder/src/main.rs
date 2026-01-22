@@ -209,13 +209,19 @@ async fn main() -> anyhow::Result<()> {
             config.cleanup_config.container_protection_seconds,
         ),
         active_window: Duration::from_secs(5 * 60),
+        log_dir: config.cleanup_config.log_cleanup.log_dir.clone(),
+        log_retention_duration: Duration::from_secs(
+            config.cleanup_config.log_cleanup.log_retention_days * 24 * 60 * 60,
+        ),
     };
     info!(
-        "🧹 清理配置: 闲置超时={}秒, 清理间隔={}秒, Docker停止超时={}秒, 容器保护时间={}秒",
+        "🧹 清理配置: 闲置超时={}秒, 清理间隔={}秒, Docker停止超时={}秒, 容器保护时间={}秒, 日志目录={}, 日志保留={}天",
         config.cleanup_config.idle_timeout_seconds,
         config.cleanup_config.cleanup_interval_seconds,
         config.cleanup_config.docker_stop_timeout_seconds,
-        config.cleanup_config.container_protection_seconds
+        config.cleanup_config.container_protection_seconds,
+        config.cleanup_config.log_cleanup.log_dir,
+        config.cleanup_config.log_cleanup.log_retention_days
     );
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可

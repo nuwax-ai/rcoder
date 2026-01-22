@@ -44,14 +44,22 @@ pub const SESSION_MESSAGE_BUFFER_SIZE: usize = 100;
 /// Agent Prompt 通道容量
 ///
 /// 控制 Agent Prompt 请求队列的大小，提供背压保护
-/// - 足够处理突发请求（100 个）
+/// - 足够处理突发请求（1000 个）
 /// - 通道满时异步等待，防止 OOM
 /// - 可通过环境变量 AGENT_PROMPT_CHANNEL_CAPACITY 覆盖
-pub const AGENT_PROMPT_CHANNEL_CAPACITY: usize = 100;
+///
+/// ## P2 优化
+///
+/// 从 100 增加到 1000，以更好地处理高并发场景。
+pub const AGENT_PROMPT_CHANNEL_CAPACITY: usize = 1000;
 
 /// Agent 取消通道容量
 ///
 /// 控制 Agent 取消请求队列的大小
 /// - 取消请求通常较少，使用相同容量保持一致性
 /// - 可通过环境变量 AGENT_CANCEL_CHANNEL_CAPACITY 覆盖
-pub const AGENT_CANCEL_CHANNEL_CAPACITY: usize = 100;
+///
+/// ## P2 优化
+///
+/// 从 100 增加到 1000，与 Prompt 通道保持一致。
+pub const AGENT_CANCEL_CHANNEL_CAPACITY: usize = 1000;

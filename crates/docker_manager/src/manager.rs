@@ -1156,15 +1156,6 @@ impl DockerManager {
             builder = builder.env(key, &processed_value);
         }
 
-        // 🔒 安全配置：将 API 地址指向本地 Pingora 代理
-        // 使用 {SERVICE_UUID} 占位符，UUID 将由 agent_runner 动态注入
-        // 这样 Agent 看到的是本地地址，真实密钥由 Pingora 注入
-        builder = builder.env(
-            "MODEL_PROVIDER_BASE_URL",
-            "http://localhost:8088/api/{SERVICE_UUID}",
-        );
-        builder = builder.env("MODEL_PROVIDER_API_KEY", "sk-placeholder");
-
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
 
         // 设置网络

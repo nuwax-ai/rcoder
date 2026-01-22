@@ -99,6 +99,34 @@ pub struct ProxyConfig {
     pub health_check: HealthCheckConfig,
 }
 
+/// 日志清理配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogCleanupConfig {
+    /// 日志目录路径
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
+    /// 日志保留天数，默认7天
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u64,
+}
+
+fn default_log_dir() -> String {
+    "/app/logs/container".to_string()
+}
+
+fn default_log_retention_days() -> u64 {
+    7
+}
+
+impl Default for LogCleanupConfig {
+    fn default() -> Self {
+        Self {
+            log_dir: default_log_dir(),
+            log_retention_days: default_log_retention_days(),
+        }
+    }
+}
+
 /// 容器清理配置（配置文件格式，使用秒作为单位）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupConfigSettings {
@@ -114,6 +142,9 @@ pub struct CleanupConfigSettings {
     /// 容器最小保护时间（秒），默认300秒（5分钟）
     #[serde(default = "default_container_protection_seconds")]
     pub container_protection_seconds: u64,
+    /// 日志清理配置
+    #[serde(default)]
+    pub log_cleanup: LogCleanupConfig,
 }
 
 fn default_idle_timeout_seconds() -> u64 {
@@ -139,6 +170,7 @@ impl Default for CleanupConfigSettings {
             cleanup_interval_seconds: default_cleanup_interval_seconds(),
             docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),
             container_protection_seconds: default_container_protection_seconds(),
+            log_cleanup: LogCleanupConfig::default(),
         }
     }
 }

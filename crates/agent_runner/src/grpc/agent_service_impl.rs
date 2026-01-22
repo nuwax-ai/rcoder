@@ -31,7 +31,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::model::AgentStatus;
 use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
-use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, SESSION_CACHE, PendingGuard};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
 use shared_types::ChatPromptBuilder;
 
@@ -282,10 +282,10 @@ impl AgentService for AgentServiceImpl {
                 }));
             }
 
-        // 🆕 Pre-registration: Immediately mark project as Pending before sending task to queue
-        // This way concurrent requests will be blocked by the busy check above
-        AGENT_REGISTRY.set_pending(&project_id);
-        info!("📌 [gRPC] pre-registered Pending status: project_id={}", project_id);
+        // 🔥 P0 修复: 使用 PendingGuard RAII 模式管理 Pending 状态
+        // 自动在作用域结束时清理，避免状态泄漏
+        let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
+        info!("🛡️ [gRPC] 创建 PendingGuard: project_id={}", project_id);
 
         // Clean up old session
         if let Some(ref sid) = session_id
@@ -434,8 +434,7 @@ impl AgentService for AgentServiceImpl {
                 warn!("⚠️ [gRPC] Agent Worker is starting, requests may be delayed");
             }
             WorkerState::Stopping | WorkerState::Stopped => {
-                // 🔥 Critical fix: clean up Pending status
-                AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+                // 🔥 PendingGuard 自动清理（在 drop 时）
                 // Worker not available
                 return Err(Status::unavailable(
                     "Agent Worker is not available, restarting. Please try again later",
@@ -450,15 +449,14 @@ impl AgentService for AgentServiceImpl {
             .send(local_task_request)
             .await
         {
-            // 🔥 Critical fix: clean up Pending status on send failure
-            AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+            // 🔥 PendingGuard 自动清理（在 drop 时）
             return Err(Status::internal(format!("Failed to send task: {}", e)));
         }
 
         // Wait for response
-        match chat_prompt_rx.await {
+        let grpc_response = match chat_prompt_rx.await {
             Ok(response) => {
-                let grpc_response = GrpcChatResponse {
+                let grpc_resp = GrpcChatResponse {
                     project_id: response.project_id,
                     session_id: response.session_id,
                     success: response.error.is_none(),
@@ -473,17 +471,22 @@ impl AgentService for AgentServiceImpl {
                     fallback_reason: None,
                 };
 
-                info!("✅ [gRPC] Chat completed: success={}", grpc_response.success);
+                info!("✅ [gRPC] Chat completed: success={}", grpc_resp.success);
 
-                Ok(Response::new(grpc_response))
+                // 🔥 P0 修复: 请求成功，提交 PendingGuard 保留 Pending 状态
+                // Agent 已成功启动，Pending 状态将由后续操作转换为 Active
+                pending_guard.commit_success();
+
+                grpc_resp
             }
             Err(e) => {
                 error!("❌ [gRPC] Chat failed: {}", e);
-                // Clean up Pending status to avoid deadlock
-                AGENT_REGISTRY.clear_pending_if_exists(&project_id);
-                Err(Status::internal(format!("Failed to process request: {}", e)))
+                // 🔥 PendingGuard 自动清理（在 drop 时）
+                return Err(Status::internal(format!("Failed to process request: {}", e)));
             }
-        }
+        };
+
+        Ok(Response::new(grpc_response))
     }
 
     /// 订阅会话进度流 - Server Streaming RPC

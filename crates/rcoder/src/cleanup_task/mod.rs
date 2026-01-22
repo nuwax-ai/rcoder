@@ -8,6 +8,7 @@ pub mod agent;
 pub mod cleaner;
 pub mod config;
 pub mod container;
+pub mod logs;
 pub mod storage;
 pub mod strategies;
 

@@ -42,28 +42,29 @@ impl StateAwareNotifier {
         }
     }
 
-    /// 更新 Agent 状态（原子操作）
+    /// 🔥 P1 修复: 更新 Agent 状态（原子操作）
     ///
-    /// 使用统一 AGENT_REGISTRY 确保状态更新的原子性。
+    /// 使用 `try_update_agent_info` 方法实现原子性状态更新，
+    /// 避免 TOCTOU 竞态条件：读锁释放 → 时间窗口 → 写锁更新。
     ///
     /// # 参数
     /// - `project_id`: 项目 ID
     /// - `status`: 新的 Agent 状态
     fn update_agent_status(&self, project_id: &str, status: AgentStatus) {
-        if let Some(info_ref) = AGENT_REGISTRY.get_agent_info(project_id) {
-            // 由于 DashMap Ref 是不可变的，需要克隆后更新
-            let mut updated_info = info_ref.value().clone();
-            updated_info.status = status;
-            updated_info.last_activity = chrono::Utc::now();
-            drop(info_ref); // 释放读锁
-            AGENT_REGISTRY.update_agent_info(project_id, updated_info);
-            debug!("项目[{}]状态更新为 {:?}", project_id, status);
-        } else {
-            error!(
-                "项目[{}]不存在于 AGENT_REGISTRY 中，无法更新状态",
-                project_id
-            );
-        }
+        AGENT_REGISTRY.try_update_agent_info(project_id, |info| {
+            let old_status = info.status;
+            if old_status != status {
+                info.status = status;
+                info.last_activity = chrono::Utc::now();
+                debug!(
+                    "🔄 [原子状态] 项目[{}]状态: {:?} -> {:?}",
+                    project_id, old_status, status
+                );
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 

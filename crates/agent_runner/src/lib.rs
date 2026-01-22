@@ -11,7 +11,7 @@ mod model;
 pub mod otel_tracing; // 🔥 设为 public，供其他模块使用
 mod proxy_agent;
 pub mod router;
-mod service;
+pub mod service; // 🔥 设为 public，供测试使用
 mod utils;
 
 // 测试辅助模块 (仅在 testing feature 启用时编译)
@@ -23,4 +23,5 @@ pub use agent_runtime::*;
 pub use model::*;
 pub use otel_tracing::*;
 pub use proxy_agent::*;
+pub use service::*; // 重新导出 service 模块
 pub use utils::*;

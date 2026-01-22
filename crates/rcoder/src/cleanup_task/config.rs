@@ -17,6 +17,10 @@ pub struct CleanupConfig {
     pub container_protection_duration: Duration,
     /// Agent 活跃判断时间窗口（默认5分钟）
     pub active_window: Duration,
+    /// 日志目录路径
+    pub log_dir: String,
+    /// 日志保留时长
+    pub log_retention_duration: Duration,
 }
 
 impl Default for CleanupConfig {
@@ -27,6 +31,8 @@ impl Default for CleanupConfig {
             docker_stop_timeout: Duration::from_secs(30),
             container_protection_duration: Duration::from_secs(5 * 60),
             active_window: Duration::from_secs(5 * 60),
+            log_dir: "/app/logs/container".to_string(),
+            log_retention_duration: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
 }
