@@ -409,13 +409,14 @@ impl ContainerStatusChecker {
 
         match self.health_states.entry(lookup_key.to_string()) {
             Entry::Occupied(mut entry) => {
+                // 使用 get_mut 直接修改，避免克隆
                 let was_failing = entry.get().consecutive_failures > 0;
-                let mut health = entry.get().clone();
+                let health = entry.get_mut();
                 health.consecutive_failures = 0;
                 health.first_failure_time = None;
                 health.last_check_time = now;
                 health.last_success_time = Some(now);
-                entry.insert(health);
+                // 无需 insert，修改已生效
 
                 if was_failing {
                     info!("✅ [STATUS_CHECKER] 容器恢复正常: {}", lookup_key);
@@ -435,14 +436,15 @@ impl ContainerStatusChecker {
 
         let consecutive_failures = match self.health_states.entry(lookup_key.to_string()) {
             Entry::Occupied(mut entry) => {
-                let mut health = entry.get().clone();
+                // 使用 get_mut 直接修改，避免克隆
+                let health = entry.get_mut();
                 health.consecutive_failures += 1;
                 health.last_check_time = now;
                 if health.first_failure_time.is_none() {
                     health.first_failure_time = Some(now);
                 }
                 let failures = health.consecutive_failures;
-                entry.insert(health);
+                // 无需 insert，修改已生效
                 failures
             }
             Entry::Vacant(entry) => {

@@ -347,7 +347,7 @@ where
     /// 如果会话已存在且模型配置未变化，则复用；否则创建新会话
     ///
     /// # 优化说明
-    /// 使用 DashMap 的 entry API 进行原子性操作，将 DashMap 访问次数从 3-4 次减少到 1 次
+    /// 获取或创建会话
     ///
     /// # 参数
     /// - `project_id`: 项目 ID
@@ -360,6 +360,19 @@ where
     /// # 返回值
     /// - `R::Entry`: 会话条目
     /// - `bool`: 是否是新创建的会话
+    ///
+    /// # 并发安全性
+    ///
+    /// 使用"检查-创建-插入"三阶段模式避免在持有 entry 期间调用 `.await`：
+    ///
+    /// 1. **快速检查**：检查会话是否已存在且有效
+    /// 2. **创建会话**：如果需要创建，在**不持有锁**的情况下创建会话（.await）
+    /// 3. **原子性插入**：使用 entry API 原子性插入，如果其他线程已创建则使用已存在的
+    ///
+    /// 这样确保：
+    /// - 不会在持有 DashMap entry 期间跨越 await 点
+    /// - 同一 project_id 最多只会创建一个会话
+    /// - 高并发下不会阻塞其他 project_id 的访问（DashMap 分段锁特性）
     pub async fn get_or_create_session(
         &self,
         project_id: &str,
@@ -371,82 +384,111 @@ where
     ) -> Result<(R::Entry, bool)> {
         use dashmap::mapref::entry::Entry;
 
-        // 🔥 使用 entry API 进行原子性操作（一次 DashMap 访问）
-        match self.registry.entry(project_id.to_string()) {
-            Entry::Occupied(mut occupied_entry) => {
-                let existing = occupied_entry.get();
+        let project_id_key = project_id.to_string();
 
-                // 🔧 关键检查 1：检查 channel 是否仍然有效（Agent 进程是否还在运行）
-                let channel_closed = existing.is_channel_closed();
-                // 🔧 关键检查 2：检查模型配置是否变化
-                let model_changed = existing.is_model_config_changed(&model_provider);
+        // 第一阶段：快速检查现有会话
+        if let Entry::Occupied(occupied_entry) = self.registry.entry(project_id_key.clone()) {
+            let existing = occupied_entry.get();
+            let channel_closed = existing.is_channel_closed();
+            let model_changed = existing.is_model_config_changed(&model_provider);
 
-                let needs_rebuild = channel_closed || model_changed;
+            if !channel_closed && !model_changed {
+                info!("复用现有 Agent 会话，项目 ID: {}", project_id);
+                return Ok((existing.clone(), false));
+            }
 
-                if needs_rebuild {
-                    if channel_closed {
-                        info!(
-                            "⚠️ 检测到会话 channel 已关闭（Agent 进程已退出），重建会话，项目 ID: {}",
-                            project_id
-                        );
-                    }
-                    if model_changed {
-                        info!(
-                            "检测到模型配置变化，重启 Agent 会话，项目 ID: {}, 旧配置: {:?}, 新配置: {:?}",
-                            project_id,
-                            existing.model_provider(),
-                            model_provider
-                        );
-                    }
+            // 需要重建会话，先克隆必要数据并释放锁
+            let session_id_str = existing.session_id().to_string();
+            drop(occupied_entry); // 显式释放 entry 锁
 
-                    // 创建新会话（不插入 registry）
-                    let new_session = self
-                        .create_session_internal(
-                            project_id.to_string(),
-                            project_path,
-                            model_provider,
-                            start_config,
-                            service_uuid,
-                        )
-                        .await?;
+            if channel_closed {
+                info!(
+                    "⚠️ 检测到会话 channel 已关闭（Agent 进程已退出），重建会话，项目 ID: {}, 旧 session_id: {}",
+                    project_id, session_id_str
+                );
+            }
+            if model_changed {
+                info!(
+                    "检测到模型配置变化，重启 Agent 会话，项目 ID: {}, 旧 session_id: {}",
+                    project_id, session_id_str
+                );
+            }
 
-                    // 直接在原地更新（无需额外查找）
-                    let session_id_str = new_session.session_id().to_string();
-                    occupied_entry.insert(new_session.clone());
+            // 第二阶段：在不持有锁的情况下创建新会话
+            let new_session = self
+                .create_session_internal(
+                    project_id_key.clone(),
+                    project_path,
+                    model_provider,
+                    start_config,
+                    service_uuid,
+                )
+                .await?;
+
+            // 第三阶段：原子性插入（使用 entry API 防止并发创建）
+            match self.registry.entry(project_id_key.clone()) {
+                Entry::Vacant(entry) => {
+                    // 其他线程还没有创建，使用我们创建的会话
+                    let new_session_id = new_session.session_id().to_string();
+                    entry.insert(new_session.clone());
                     info!(
-                        "✅ 已重建会话，项目 ID: {}, session_id: {}",
-                        project_id, session_id_str
+                        "✅ 已重建会话，项目 ID: {}, 新 session_id: {}",
+                        project_id, new_session_id
                     );
-
-                    Ok((new_session, true)) // true = 新创建
-                } else {
-                    info!("复用现有 Agent 会话，项目 ID: {}", project_id);
-                    Ok((existing.clone(), false)) // false = 复用
+                    return Ok((new_session, true));
+                }
+                Entry::Occupied(entry) => {
+                    // 其他线程已经创建了会话，使用已存在的（丢弃我们创建的）
+                    let existing_session = entry.get().clone();
+                    let created_session_id = new_session.session_id().to_string();
+                    let existing_session_id = existing_session.session_id().to_string();
+                    info!(
+                        "🔄 [SESSION] 检测到并发创建，使用其他线程创建的会话: project_id={}, 丢弃 session_id={}, 使用 session_id={}",
+                        project_id, created_session_id, existing_session_id
+                    );
+                    // new_session 会被 drop，Session 的 Drop 实现会清理 Agent 进程
+                    return Ok((existing_session, false));
                 }
             }
-            Entry::Vacant(vacant_entry) => {
-                info!("会话不存在，创建新会话，项目 ID: {}", project_id);
+        }
 
-                // 创建新会话（不插入 registry）
-                let new_session = self
-                    .create_session_internal(
-                        project_id.to_string(),
-                        project_path,
-                        model_provider,
-                        start_config,
-                        service_uuid,
-                    )
-                    .await?;
+        // 会话不存在，需要创建新会话
+        info!("会话不存在，创建新会话，项目 ID: {}", project_id);
 
-                // 直接插入到 vacant entry
+        // 第二阶段：在不持有锁的情况下创建新会话
+        let new_session = self
+            .create_session_internal(
+                project_id_key.clone(),
+                project_path,
+                model_provider,
+                start_config,
+                service_uuid,
+            )
+            .await?;
+
+        // 第三阶段：原子性插入
+        match self.registry.entry(project_id_key.clone()) {
+            Entry::Vacant(entry) => {
+                // 其他线程还没有创建，使用我们创建的会话
                 let session_id_str = new_session.session_id().to_string();
-                vacant_entry.insert(new_session.clone());
+                entry.insert(new_session.clone());
                 info!(
                     "✅ 新会话创建完成，项目 ID: {}, session_id: {}",
                     project_id, session_id_str
                 );
-
-                Ok((new_session, true)) // true = 新创建
+                Ok((new_session, true))
+            }
+            Entry::Occupied(entry) => {
+                // 其他线程已经创建了会话，使用已存在的（丢弃我们创建的）
+                let existing_session = entry.get().clone();
+                let created_session_id = new_session.session_id().to_string();
+                let existing_session_id = existing_session.session_id().to_string();
+                info!(
+                    "🔄 [SESSION] 检测到并发创建，使用其他线程创建的会话: project_id={}, 丢弃 session_id={}, 使用 session_id={}",
+                    project_id, created_session_id, existing_session_id
+                );
+                // new_session 会被 drop，Session 的 Drop 实现会清理 Agent 进程
+                Ok((existing_session, false))
             }
         }
     }

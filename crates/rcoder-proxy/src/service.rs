@@ -136,8 +136,8 @@ pub struct ProxyMetrics {
     pub successful_responses: AtomicU64,
     pub failed_responses: AtomicU64,
     pub total_response_time_ns: AtomicU64,
-    // 每端口统计
-    port_map: RwLock<HashMap<u16, Arc<PerPortMetrics>>>,
+    // 每端口统计（使用 DashMap 避免死锁和 TOCTOU 竞态）
+    port_map: DashMap<u16, Arc<PerPortMetrics>>,
     // 活跃连接数（请求进行中）
     pub active_connections: AtomicU64,
 }
@@ -150,7 +150,7 @@ impl Default for ProxyMetrics {
             successful_responses: AtomicU64::new(0),
             failed_responses: AtomicU64::new(0),
             total_response_time_ns: AtomicU64::new(0),
-            port_map: RwLock::new(HashMap::new()),
+            port_map: DashMap::new(),
             active_connections: AtomicU64::new(0),
         }
     }
@@ -162,7 +162,7 @@ impl ProxyMetrics {
     }
 
     pub async fn record_request_port(&self, port: u16) {
-        let arc = self.get_or_create_port_metrics(port).await;
+        let arc = self.get_or_create_port_metrics(port);
         arc.requests.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -185,7 +185,7 @@ impl ProxyMetrics {
         status_text: &str,
         duration: std::time::Duration,
     ) {
-        let arc = self.get_or_create_port_metrics(port).await;
+        let arc = self.get_or_create_port_metrics(port);
         arc.total_response_time_ns
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
         let is_success = status_text.starts_with('2');
@@ -229,28 +229,30 @@ impl ProxyMetrics {
         self.active_connections.load(Ordering::Relaxed)
     }
 
-    async fn get_or_create_port_metrics(&self, port: u16) -> Arc<PerPortMetrics> {
-        // 快速读路径
-        if let Some(existing) = self.port_map.read().await.get(&port).cloned() {
-            return existing;
-        }
-        // 写入创建
-        let mut w = self.port_map.write().await;
-        let entry = w
+    /// 获取或创建端口指标
+    ///
+    /// 使用 DashMap entry API 实现，避免 TOCTOU 竞态条件
+    fn get_or_create_port_metrics(&self, port: u16) -> Arc<PerPortMetrics> {
+        self.port_map
             .entry(port)
-            .or_insert_with(|| Arc::new(PerPortMetrics::new()));
-        entry.clone()
+            .or_insert_with(|| Arc::new(PerPortMetrics::new()))
+            .clone()
     }
 
-    pub async fn port_snapshots(&self) -> Vec<PortSnapshot> {
-        let r = self.port_map.read().await;
-        r.iter()
-            .map(|(port, m)| PortSnapshot {
-                port: *port,
-                requests: m.requests.load(Ordering::Relaxed),
-                successes: m.successes.load(Ordering::Relaxed),
-                failures: m.failures.load(Ordering::Relaxed),
-                total_response_time_ns: m.total_response_time_ns.load(Ordering::Relaxed),
+    /// 获取端口指标快照
+    pub fn port_snapshots(&self) -> Vec<PortSnapshot> {
+        self.port_map
+            .iter()
+            .map(|entry| {
+                let port = *entry.key();
+                let m = entry.value();
+                PortSnapshot {
+                    port,
+                    requests: m.requests.load(Ordering::Relaxed),
+                    successes: m.successes.load(Ordering::Relaxed),
+                    failures: m.failures.load(Ordering::Relaxed),
+                    total_response_time_ns: m.total_response_time_ns.load(Ordering::Relaxed),
+                }
             })
             .collect()
     }
@@ -1529,9 +1531,21 @@ impl PingoraProxyService {
     }
 
     /// 更新一次所有后端的健康状态
+    ///
+    /// # 并发安全性
+    /// - 先克隆 backends 并快速释放锁
+    /// - 不持有锁进行网络 I/O（避免死锁）
+    /// - 批量更新 health_map（只获取一次锁）
     pub async fn update_health_once(&self, timeout_ms: u64) {
-        let backends = self.backends.read().await.clone();
-        for (port, host) in backends.into_iter() {
+        // 1. 快速克隆 backends 并释放锁（避免持有锁期间 await）
+        let backends_snapshot = {
+            let backends = self.backends.read().await;
+            backends.clone()
+        }; // 锁在此处释放
+
+        // 2. 不持有任何锁进行网络 I/O
+        let mut health_updates = Vec::with_capacity(backends_snapshot.len());
+        for (port, host) in backends_snapshot.into_iter() {
             let status = match timeout(
                 std::time::Duration::from_millis(timeout_ms),
                 TcpStream::connect((host.as_str(), port)),
@@ -1542,8 +1556,13 @@ impl PingoraProxyService {
                 Ok(Err(_)) => HealthState::Unhealthy,
                 Err(_) => HealthState::Timeout,
             };
-            let mut map = self.health_map.write().await;
-            map.insert(
+            health_updates.push((port, status));
+        }
+
+        // 3. 批量更新 health_map（只获取一次写锁）
+        let mut health_map = self.health_map.write().await;
+        for (port, status) in health_updates {
+            health_map.insert(
                 port,
                 HealthInfo {
                     status,

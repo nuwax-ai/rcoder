@@ -28,41 +28,61 @@ impl GrpcChannelPool {
     ///
     /// 如果连接不存在则创建新连接
     ///
-    /// 使用 DashMap entry API 消除 TOCTOU (Time-Of-Check-Time-Of-Use) 竞态条件
-    /// 确保在高并发场景下不会重复创建连接
+    /// # 并发安全性
+    ///
+    /// 使用三阶段模式避免在持有 entry 期间调用 `.await`：
+    ///
+    /// 1. **快速检查**：先检查连接是否已存在
+    /// 2. **创建连接**：如果不存在，在**不持有锁**的情况下创建连接（.await）
+    /// 3. **原子性插入**：使用 entry API 原子性插入，如果其他线程已创建则使用已存在的
+    ///
+    /// 这样确保：
+    /// - 不会在持有 DashMap entry 期间跨越 await 点
+    /// - 高并发下同一地址最多只有一个连接被实际使用
+    /// - 避免了 TOCTOU 竞态条件
     pub async fn get_client(&self, addr: &str) -> Result<AgentServiceClient<Channel>> {
-        // 🛡️ 使用 entry API 进行原子性检查和插入，消除 TOCTOU 竞态条件
-        match self.channels.entry(addr.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => {
-                debug!("📡 [gRPC] 复用现有连接: {}", addr);
-                Ok(AgentServiceClient::new(entry.get().clone()))
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                // 创建新连接
-                info!("🔌 [gRPC] 创建新连接: {}", addr);
-                let endpoint = format!("http://{}", addr);
-                let channel = Channel::from_shared(endpoint)
-                    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
-                    .connect_timeout(std::time::Duration::from_secs(
-                        shared_types::GRPC_CONNECT_TIMEOUT_SECS,
-                    ))
-                    .timeout(std::time::Duration::from_secs(
-                        shared_types::GRPC_REQUEST_TIMEOUT_SECS,
-                    ))
-                    // HTTP/2 Keepalive 配置
-                    .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-                    .keep_alive_timeout(std::time::Duration::from_secs(10))
-                    .keep_alive_while_idle(true)
-                    // TCP Keepalive 配置
-                    .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
-                    .tcp_nodelay(true)
-                    .connect()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
+        use dashmap::mapref::entry::Entry;
 
-                // 🛡️ 原子性插入连接，确保其他并发线程能看到这个连接
-                let channel_ref = entry.insert(channel);
-                Ok(AgentServiceClient::new(channel_ref.clone()))
+        // 第一阶段：快速检查（无锁读）
+        if let Some(entry) = self.channels.get(addr) {
+            debug!("📡 [gRPC] 复用现有连接: {}", addr);
+            return Ok(AgentServiceClient::new(entry.value().clone()));
+        }
+
+        // 第二阶段：创建连接（不持有任何锁）
+        info!("🔌 [gRPC] 创建新连接: {}", addr);
+        let endpoint = format!("http://{}", addr);
+        let channel = Channel::from_shared(endpoint)
+            .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
+            .connect_timeout(std::time::Duration::from_secs(
+                shared_types::GRPC_CONNECT_TIMEOUT_SECS,
+            ))
+            .timeout(std::time::Duration::from_secs(
+                shared_types::GRPC_REQUEST_TIMEOUT_SECS,
+            ))
+            // HTTP/2 Keepalive 配置
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .keep_alive_timeout(std::time::Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            // TCP Keepalive 配置
+            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            .connect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
+
+        // 第三阶段：原子性插入
+        match self.channels.entry(addr.to_string()) {
+            Entry::Vacant(entry) => {
+                // 其他线程还没有创建，使用我们创建的连接
+                debug!("📡 [gRPC] 新连接已注册: {}", addr);
+                entry.insert(channel.clone());
+                Ok(AgentServiceClient::new(channel))
+            }
+            Entry::Occupied(entry) => {
+                // 其他线程已经创建了连接，使用已存在的（丢弃我们创建的）
+                debug!("📡 [gRPC] 使用其他线程创建的连接: {}", addr);
+                Ok(AgentServiceClient::new(entry.get().clone()))
             }
         }
     }
