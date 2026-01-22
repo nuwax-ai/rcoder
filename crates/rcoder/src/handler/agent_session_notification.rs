@@ -496,9 +496,19 @@ async fn validate_and_get_session_context(
                 }
                 _ => {
                     // RCoder 模式：直接使用 project_info 中的容器名称
+                    //
+                    // ⚠️ 注意：project_info 从 DuckDB 读取，可能包含部分过时数据
+                    // - container_name: 稳定不变（容器重建后仍有效）
+                    // - container_id, container_ip: 可能过时（容器重建后会变化）
+                    //
+                    // 阶段 3 会通过 find_container_realtime(&container_name) 验证容器的真实存在性
+                    // 因此即使 project_info 中的其他字段过时，container_name 仍然是可靠的
                     match project_info.container() {
                         Some(container) => {
-                            info!("✅ [SSE_PROXY] 降级查询成功：从 project_info 获取容器: container_name={}", container.container_name);
+                            info!(
+                                "✅ [SSE_PROXY] 降级查询成功：从 project_info(DuckDB) 获取容器名称: container_name={} (将通过 Docker API 验证)",
+                                container.container_name
+                            );
                             container.container_name.clone()
                         }
                         None => {
@@ -573,6 +583,15 @@ async fn validate_and_get_session_context(
     // 🎯 优化：直接使用阶段 1 中已获取的 project_info，避免重复查询
     let project_id = project_info.project_id().to_string();
 
+    // 验证 project_info 结构的完整性
+    //
+    // 注意：即使 project_info.container() 为 None，阶段 3 的 find_container_realtime() 验证
+    // 已经确保容器真实存在。这个检查主要是为了：
+    // 1. 确保返回给调用者的 project_info 结构完整（包含必要的容器信息字段）
+    // 2. 避免将不完整的数据结构传递给后续处理流程
+    //
+    // 如果 project_info 缺少 container 字段但容器确实存在，这是数据一致性问题，
+    // 应该由数据层修复，而不是在这里静默处理。
     match project_info.container() {
         Some(_) => {
             info!(
@@ -584,14 +603,14 @@ async fn validate_and_get_session_context(
         }
         None => {
             error!(
-                "❌ [gRPC_SSE] ProjectAndContainerInfo 中没有容器信息: session_id={}, project_id={}",
+                "❌ [gRPC_SSE] ProjectAndContainerInfo 中没有容器信息: session_id={}, project_id={} (数据一致性问题，容器存在但 project_info 缺少 container 字段)",
                 session_id, project_id
             );
 
             Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "GRPC_CONNECTION_ERROR",
-                "会话中缺少容器信息，请重新发起请求。",
+                "会话数据不完整，请重新发起请求。",
             ))
         }
     }
@@ -859,7 +878,7 @@ pub async fn agent_session_notification(
     );
 
     // 使用核心验证函数获取上下文
-    let (project_id, agent_info, _container_id) =
+    let (project_id, agent_info, _container_name) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
     // 使用通用函数创建 SSE 响应流
@@ -963,7 +982,7 @@ pub async fn computer_agent_progress_notification(
     );
 
     // 使用与 agent_session_notification 相同的验证逻辑
-    let (project_id, agent_info, _container_id) =
+    let (project_id, agent_info, _container_name) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
     // 使用通用函数创建 SSE 响应流
