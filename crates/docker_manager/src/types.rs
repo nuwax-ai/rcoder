@@ -112,6 +112,39 @@ impl Default for DockerContainerConfig {
     }
 }
 
+/// 容器实时查询结果
+///
+/// 用于 `find_project_container` 和 `find_user_container` 的返回值，
+/// 提供容器的基本实时信息。
+#[derive(Debug, Clone)]
+pub struct ContainerQueryResult {
+    /// 容器 ID
+    pub container_id: String,
+    /// 容器名称
+    pub container_name: String,
+    /// 容器状态
+    pub status: ContainerStatus,
+    /// 是否正在运行
+    pub is_running: bool,
+}
+
+impl ContainerQueryResult {
+    /// 创建新的查询结果
+    pub fn new(
+        container_id: String,
+        container_name: String,
+        status: ContainerStatus,
+        is_running: bool,
+    ) -> Self {
+        Self {
+            container_id,
+            container_name,
+            status,
+            is_running,
+        }
+    }
+}
+
 /// Docker 容器信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerContainerInfo {

@@ -310,20 +310,54 @@ impl ContainerStatusChecker {
                     .service_type()
                     .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
 
-                let exists = docker_manager
-                    .find_agent_container(container_info.project_id(), &service_type)
-                    .await
-                    .is_some();
+                // 根据 service_type 使用不同的查找方法
+                // - RCoder 模式：使用 project_id 查找
+                // - ComputerAgentRunner 模式：使用 user_id 查找
+                let exists = match service_type {
+                    shared_types::ServiceType::ComputerAgentRunner => {
+                        // ComputerAgentRunner 模式：使用 user_id 查找容器
+                        if let Some(user_id) = container_info.user_id() {
+                            match docker_manager
+                                .find_user_container(user_id, &service_type)
+                                .await
+                            {
+                                Ok(Some(_)) => true,
+                                Ok(None) => false,
+                                Err(e) => {
+                                    debug!("⚠️ [STATUS_CHECKER] 查询容器失败: {}", e);
+                                    false
+                                }
+                            }
+                        } else {
+                            debug!("⚠️ [STATUS_CHECKER] ComputerAgentRunner 模式缺少 user_id");
+                            false
+                        }
+                    }
+                    shared_types::ServiceType::RCoder => {
+                        // RCoder 模式：使用 project_id 查找容器
+                        match docker_manager
+                            .find_project_container(container_info.project_id(), &service_type)
+                            .await
+                        {
+                            Ok(Some(_)) => true,
+                            Ok(None) => false,
+                            Err(e) => {
+                                debug!("⚠️ [STATUS_CHECKER] 查询容器失败: {}", e);
+                                false
+                            }
+                        }
+                    }
+                };
 
                 if exists {
                     debug!(
-                        "🔍 [STATUS_CHECKER] Docker 容器存在，可能是网络问题: {}",
-                        grpc_addr
+                        "🔍 [STATUS_CHECKER] Docker 容器存在，可能是网络问题: {} (service_type={:?})",
+                        grpc_addr, service_type
                     );
                 } else {
                     info!(
-                        "🔍 [STATUS_CHECKER] Docker 容器不存在（已被销毁）: {}",
-                        grpc_addr
+                        "🔍 [STATUS_CHECKER] Docker 容器不存在（已被销毁）: {} (service_type={:?})",
+                        grpc_addr, service_type
                     );
                 }
 

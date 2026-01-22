@@ -603,10 +603,12 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 let system_prompt_meta = start_config.build_meta();
 
                 // 3. 创建新会话
-                debug!("[SACP] 创建 ACP 会话...");
+                info!("[SACP] 创建 ACP 会话...");
                 let new_session_request = NewSessionRequest::new(project_path.clone())
                     .mcp_servers(mcp_servers.clone())
                     .meta(system_prompt_meta);
+
+                info!("new_session_request: {:?}", new_session_request);
 
                 // 从配置获取超时值，默认 100 秒
                 let timeout_secs = start_config
