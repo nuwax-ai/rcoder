@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use shared_types::grpc::{GetStatusRequest, ProgressRequest};
 use shared_types::{SessionMessageType, UnifiedSessionMessage};
+use tonic::Code;
 use tracing::{debug, error, info, warn};
 
 /// 创建基于 gRPC 的 SSE 代理流
@@ -103,28 +104,57 @@ pub async fn create_grpc_sse_stream(
                     let mut stream = response.into_inner();
 
                     // 持续接收 gRPC 流中的事件
-                    while let Ok(Some(progress_event)) = stream.message().await {
-                        debug!(
-                            "📨 [gRPC_SSE] 收到进度事件: session_id={}, message_type={}, sub_type={}",
-                            session_id_clone, progress_event.message_type, progress_event.sub_type
-                        );
+                    loop {
+                        match stream.message().await {
+                            Ok(Some(progress_event)) => {
+                                debug!(
+                                    "📨 [gRPC_SSE] 收到进度事件: session_id={}, message_type={}, sub_type={}",
+                                    session_id_clone, progress_event.message_type, progress_event.sub_type
+                                );
 
-                        // 将 ProgressEvent 转换为 SSE Event（传入 session_id 以重建完整消息结构）
-                        let sse_event = progress_event_to_sse(&progress_event, &session_id_clone);
+                                // 将 ProgressEvent 转换为 SSE Event（传入 session_id 以重建完整消息结构）
+                                let sse_event = progress_event_to_sse(&progress_event, &session_id_clone);
 
-                        if tx.send(Ok(sse_event)).await.is_err() {
-                            warn!(
-                                "⚠️ [gRPC_SSE] 客户端已断开连接: session_id={}",
-                                session_id_clone
-                            );
-                            // 客户端断开，直接退出任务
-                            return;
+                                if tx.send(Ok(sse_event)).await.is_err() {
+                                    warn!(
+                                        "⚠️ [gRPC_SSE] 客户端已断开连接: session_id={}",
+                                        session_id_clone
+                                    );
+                                    // 客户端断开，直接退出任务
+                                    return;
+                                }
+                            }
+                            Ok(None) => {
+                                // 流正常结束（agent_runner 主动关闭）
+                                info!(
+                                    "✅ [gRPC_SSE] gRPC 流正常结束: session_id={}",
+                                    session_id_clone
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                // 流异常结束（连接中断、超时等）
+                                error!(
+                                    "❌ [gRPC_SSE] gRPC 流异常: session_id={}, code={}, message={}",
+                                    session_id_clone, e.code(), e.message()
+                                );
+
+                                // 发送标准格式的错误消息
+                                let error_event = create_grpc_stream_error_event(
+                                    &session_id_clone,
+                                    e.code(),
+                                    e.message(),
+                                );
+                                if let Err(e) = tx.send(Ok(error_event)).await {
+                                    warn!(
+                                        "⚠️ [gRPC_SSE] 发送错误事件失败: session_id={}, error={}",
+                                        session_id_clone, e
+                                    );
+                                }
+                                return;
+                            }
                         }
                     }
-
-                    info!("🔚 [gRPC_SSE] gRPC 流结束: session_id={}", session_id_clone);
-                    // 正常结束，直接返回
-                    return;
                 }
                 Err(e) => {
                     warn!(
@@ -154,9 +184,7 @@ pub async fn create_grpc_sse_stream(
             max_retries, session_id_clone, last_error_msg
         );
 
-        let error_event = axum::response::sse::Event::default()
-            .event("error")
-            .data(format!("gRPC 连接失败: {}", last_error_msg));
+        let error_event = create_connection_error_event(&session_id_clone, &last_error_msg);
         if let Err(e) = tx.send(Ok(error_event)).await {
             warn!(
                 "⚠️ [gRPC_SSE] 发送错误事件失败: session_id={}, error={}",
@@ -311,4 +339,95 @@ pub async fn get_container_grpc_addr(project_id: &str, grpc_port: u16) -> anyhow
 
     info!("✅ [CONTAINER] 获取容器 gRPC 地址: {}", grpc_addr);
     Ok(grpc_addr)
+}
+
+/// 创建 gRPC 流异常错误事件
+///
+/// 当 gRPC 流在传输过程中异常结束时发送此事件
+fn create_grpc_stream_error_event(
+    session_id: &str,
+    code: Code,
+    message: &str,
+) -> axum::response::sse::Event {
+    // 使用项目标准的错误码映射
+    let error_code = map_tonic_code_to_error_code(code);
+
+    let unified_message = UnifiedSessionMessage {
+        session_id: session_id.to_string(),
+        message_type: SessionMessageType::SessionPromptEnd,
+        sub_type: "error".to_string(),
+        data: serde_json::json!({
+            "code": error_code,
+            "message": format!("Agent 连接中断: {}", message),
+        }),
+        timestamp: Utc::now(),
+    };
+
+    let json_data = match serde_json::to_string(&unified_message) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(
+                "⚠️ [gRPC_SSE] 序列化 gRPC 流错误事件失败: session_id={}, error={}",
+                session_id, e
+            );
+            // 返回包含基本信息的最小结构
+            format!(
+                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"error","data":{{"code":"{}","message":"Agent 连接中断"}}}}"#,
+                session_id, error_code
+            )
+        }
+    };
+
+    axum::response::sse::Event::default()
+        .event("error")
+        .data(json_data)
+}
+
+/// 创建连接失败错误事件
+///
+/// 当 gRPC 连接建立失败（重试后）时发送此事件
+fn create_connection_error_event(
+    session_id: &str,
+    message: &str,
+) -> axum::response::sse::Event {
+    let unified_message = UnifiedSessionMessage {
+        session_id: session_id.to_string(),
+        message_type: SessionMessageType::SessionPromptEnd,
+        sub_type: "error".to_string(),
+        data: serde_json::json!({
+            "code": "GRPC_CONNECTION_FAILED",
+            "message": message,
+        }),
+        timestamp: Utc::now(),
+    };
+
+    let json_data = match serde_json::to_string(&unified_message) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(
+                "⚠️ [gRPC_SSE] 序列化连接失败错误事件失败: session_id={}, error={}",
+                session_id, e
+            );
+            // 返回包含基本信息的最小结构
+            format!(
+                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"error","data":{{"code":"GRPC_CONNECTION_FAILED","message":"连接失败"}}}}"#,
+                session_id
+            )
+        }
+    };
+
+    axum::response::sse::Event::default()
+        .event("error")
+        .data(json_data)
+}
+
+/// 将 tonic::Code 映射为业务错误码
+fn map_tonic_code_to_error_code(code: Code) -> &'static str {
+    match code {
+        Code::Unavailable => "GRPC_SERVICE_UNAVAILABLE",
+        Code::Cancelled => "GRPC_CANCELLED",
+        Code::DeadlineExceeded => "GRPC_TIMEOUT",
+        Code::Unknown => "GRPC_UNKNOWN_ERROR",
+        _ => "GRPC_ERROR",
+    }
 }
