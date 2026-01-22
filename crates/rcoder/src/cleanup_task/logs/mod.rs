@@ -54,11 +54,16 @@ impl LogCleaner {
         );
 
         let mut stats = LogCleanupStats::default();
-        let cutoff_time = std::time::SystemTime::now()
+        let cutoff_time = match std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_secs()
-            .saturating_sub(self.retention_duration.as_secs());
+        {
+            Ok(duration) => duration.as_secs(),
+            Err(e) => {
+                warn!("📋 [log_cleaner] 系统时间异常，跳过清理: {}", e);
+                return Ok(LogCleanupStats::default());
+            }
+        };
+        let cutoff_time = cutoff_time.saturating_sub(self.retention_duration.as_secs());
 
         // 读取目录内容
         let mut entries = match fs::read_dir(log_path).await {
