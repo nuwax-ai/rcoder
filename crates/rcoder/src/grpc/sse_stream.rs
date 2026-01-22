@@ -358,7 +358,7 @@ fn create_grpc_stream_error_event(
         sub_type: "error".to_string(),
         data: serde_json::json!({
             "code": error_code,
-            "message": format!("Agent 连接中断: {}", message),
+            "message": "智能体电脑执行异常，请重试（消耗过多内存的任务可能导致智能体电脑进程终止）。",
         }),
         timestamp: Utc::now(),
     };
@@ -372,7 +372,7 @@ fn create_grpc_stream_error_event(
             );
             // 返回包含基本信息的最小结构
             format!(
-                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"error","data":{{"code":"{}","message":"Agent 连接中断"}}}}"#,
+                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"error","data":{{"code":"{}","message":"智能体电脑执行异常，请重试（消耗过多内存的任务可能导致智能体电脑进程终止）。"}}}}"#,
                 session_id, error_code
             )
         }
