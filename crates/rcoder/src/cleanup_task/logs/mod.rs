@@ -34,16 +34,16 @@ impl LogCleaner {
 
         // 检查目录是否存在
         if !log_path.exists() {
-            debug!("📋 [log_cleaner] 日志目录不存在，跳过清理: {}", self.log_dir);
+            debug!(
+                "📋 [log_cleaner] 日志目录不存在，跳过清理: {}",
+                self.log_dir
+            );
             return Ok(LogCleanupStats::default());
         }
 
         // 检查是否是目录
         if !log_path.is_dir() {
-            warn!(
-                "📋 [log_cleaner] 路径不是目录，跳过清理: {}",
-                self.log_dir
-            );
+            warn!("📋 [log_cleaner] 路径不是目录，跳过清理: {}", self.log_dir);
             return Ok(LogCleanupStats::default());
         }
 
@@ -54,9 +54,7 @@ impl LogCleaner {
         );
 
         let mut stats = LogCleanupStats::default();
-        let cutoff_time = match std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-        {
+        let cutoff_time = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => duration.as_secs(),
             Err(e) => {
                 warn!("📋 [log_cleaner] 系统时间异常，跳过清理: {}", e);
@@ -74,7 +72,7 @@ impl LogCleaner {
             }
         };
 
-        // 遍历目录中的文件
+        // 遍历目录中的文件和子目录
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             let metadata = match entry.metadata().await {
@@ -85,59 +83,70 @@ impl LogCleaner {
                 }
             };
 
-            // 只处理文件，跳过目录
-            if !metadata.is_file() {
-                continue;
-            }
-
-            // 获取文件修改时间
-            let modified = match metadata.modified() {
+            // 获取创建时间
+            let created = match metadata.created() {
                 Ok(time) => time,
                 Err(e) => {
-                    debug!("📋 [log_cleaner] 获取文件修改时间失败: {:?} - {}", path, e);
+                    debug!("📋 [log_cleaner] 获取创建时间失败: {:?} - {}", path, e);
                     continue;
                 }
             };
 
             // 转换为 Unix 时间戳
-            let modified_secs = match modified.duration_since(std::time::UNIX_EPOCH) {
+            let created_secs = match created.duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => duration.as_secs(),
                 Err(_) => {
-                    debug!("📋 [log_cleaner] 文件修改时间无效，跳过: {:?}", path);
+                    debug!("📋 [log_cleaner] 创建时间无效，跳过: {:?}", path);
                     continue;
                 }
             };
 
-            // 判断文件是否过期
-            if modified_secs < cutoff_time {
-                let file_size = metadata.len();
+            // 判断是否过期
+            if created_secs < cutoff_time {
+                if metadata.is_file() {
+                    // 删除过期文件
+                    let file_size = metadata.len();
 
-                match fs::remove_file(&path).await {
-                    Ok(_) => {
-                        stats.files_deleted += 1;
-                        stats.bytes_freed += file_size;
-                        debug!(
-                            "🗑️ [log_cleaner] 删除过期日志: {:?} ({:.2} MB)",
-                            path,
-                            file_size as f64 / 1024.0 / 1024.0
-                        );
+                    match fs::remove_file(&path).await {
+                        Ok(_) => {
+                            stats.files_deleted += 1;
+                            stats.bytes_freed += file_size;
+                            debug!(
+                                "🗑️ [log_cleaner] 删除过期文件: {:?} ({:.2} MB)",
+                                path,
+                                file_size as f64 / 1024.0 / 1024.0
+                            );
+                        }
+                        Err(e) => {
+                            stats.failed_deletions += 1;
+                            warn!("📋 [log_cleaner] 删除文件失败: {:?} - {}", path, e);
+                        }
                     }
-                    Err(e) => {
-                        stats.failed_deletions += 1;
-                        warn!("📋 [log_cleaner] 删除文件失败: {:?} - {}", path, e);
+                } else if metadata.is_dir() {
+                    // 删除过期目录（递归删除整个目录）
+                    match fs::remove_dir_all(&path).await {
+                        Ok(_) => {
+                            stats.dirs_deleted += 1;
+                            debug!("🗑️ [log_cleaner] 删除过期目录: {:?}", path);
+                        }
+                        Err(e) => {
+                            stats.failed_deletions += 1;
+                            warn!("📋 [log_cleaner] 删除目录失败: {:?} - {}", path, e);
+                        }
                     }
                 }
             }
         }
 
-        if stats.files_deleted > 0 {
+        if stats.files_deleted > 0 || stats.dirs_deleted > 0 {
             info!(
-                "✅ [log_cleaner] 日志清理完成: 删除 {} 个文件, 释放 {:.2} MB",
+                "✅ [log_cleaner] 日志清理完成: 删除 {} 个文件, {} 个目录, 释放 {:.2} MB",
                 stats.files_deleted,
+                stats.dirs_deleted,
                 stats.bytes_freed as f64 / 1024.0 / 1024.0
             );
         } else {
-            debug!("📋 [log_cleaner] 没有过期日志需要清理");
+            info!("📋 [log_cleaner] 没有过期日志需要清理");
         }
 
         Ok(stats)
@@ -159,16 +168,18 @@ impl LogCleaner {
 pub struct LogCleanupStats {
     /// 删除的文件数量
     pub files_deleted: u64,
+    /// 删除的目录数量
+    pub dirs_deleted: u64,
     /// 释放的字节数
     pub bytes_freed: u64,
-    /// 删除失败的文件数量
+    /// 删除失败的文件/目录数量
     pub failed_deletions: u64,
 }
 
 impl LogCleanupStats {
     /// 获取格式化的统计摘要
     pub fn summary(&self) -> String {
-        if self.files_deleted == 0 && self.failed_deletions == 0 {
+        if self.files_deleted == 0 && self.dirs_deleted == 0 && self.failed_deletions == 0 {
             "无过期日志".to_string()
         } else {
             let mut parts = Vec::new();
@@ -178,6 +189,9 @@ impl LogCleanupStats {
                     self.files_deleted,
                     self.bytes_freed as f64 / 1024.0 / 1024.0
                 ));
+            }
+            if self.dirs_deleted > 0 {
+                parts.push(format!("删除: {} 个目录", self.dirs_deleted));
             }
             if self.failed_deletions > 0 {
                 parts.push(format!("失败: {} 个", self.failed_deletions));
@@ -216,15 +230,20 @@ mod tests {
             file.write_all(content.as_bytes()).unwrap();
         }
 
-        // 设置旧文件的修改时间为 10 天前
-        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+        // 设置旧文件的创建时间为 15 天前
+        let old_time =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(15 * 24 * 60 * 60);
         for (filename, _) in &test_files[..2] {
             let file_path = log_dir.join(filename);
-            filetime::set_file_mtime(&file_path, old_time.into()).unwrap();
+            if let Err(e) = filetime::set_file_creation_time(&file_path, old_time.into()) {
+                // 系统不支持设置创建时间，跳过此测试
+                println!("系统不支持设置创建时间，跳过测试: {}", e);
+                return;
+            }
         }
 
-        // 创建日志清理器，保留 7 天
-        let cleaner = LogCleaner::new(log_dir.to_str().unwrap(), 7);
+        // 创建日志清理器，保留 10 天
+        let cleaner = LogCleaner::new(log_dir.to_str().unwrap(), 10);
 
         // 执行清理
         let stats = cleaner.cleanup_once().await.unwrap();
@@ -238,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_nonexistent_dir() {
-        let cleaner = LogCleaner::new("/nonexistent/path", 7);
+        let cleaner = LogCleaner::new("/nonexistent/path", 10);
         let stats = cleaner.cleanup_once().await.unwrap();
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.failed_deletions, 0);

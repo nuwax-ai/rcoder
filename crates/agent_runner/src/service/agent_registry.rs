@@ -498,6 +498,10 @@ impl AgentSessionRegistry {
                 "🗑️ [Registry] 移除 Agent: project={}, session={:?}",
                 project_id, session_id
             );
+
+            // 🔥 修复：移除 Agent 时释放槽位
+            self.release_session_slot();
+            info!("✅ [Registry] 已释放槽位: project_id={}", project_id);
         }
 
         info!(
@@ -532,6 +536,10 @@ impl AgentSessionRegistry {
                     "🗑️ [Registry] 通过 session 移除 Agent: session={}, project={}",
                     session_id, pid
                 );
+
+                // 🔥 修复：移除 Agent 时释放槽位（与 remove_by_project 保持一致）
+                self.release_session_slot();
+                info!("✅ [Registry] 已释放槽位: session_id={}", session_id);
             }
 
             return removed;

@@ -105,7 +105,7 @@ pub struct LogCleanupConfig {
     /// 日志目录路径
     #[serde(default = "default_log_dir")]
     pub log_dir: String,
-    /// 日志保留天数，默认7天
+    /// 日志保留天数，默认10天
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u64,
 }
@@ -115,7 +115,7 @@ fn default_log_dir() -> String {
 }
 
 fn default_log_retention_days() -> u64 {
-    7
+    10
 }
 
 impl Default for LogCleanupConfig {

@@ -287,11 +287,21 @@ impl AgentService for AgentServiceImpl {
         let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
         info!("🛡️ [gRPC] 创建 PendingGuard: project_id={}", project_id);
 
-        // Clean up old session
-        if let Some(ref sid) = session_id
-            && SESSION_CACHE.remove(sid).is_some() {
-                info!("🗑️ [gRPC] removed old session: session_id={}", sid);
+        // 🔥 修复：只在 session 不存在时才清理无效的 session_id
+        // 问题：旧代码无条件移除用户指定的 session，导致无法复用
+        // 修复后：检查 session 是否存在于 AGENT_REGISTRY 中
+        // - 如果存在 → 复用 session，不清理
+        // - 如果不存在 → 清理 SESSION_CACHE 中的无效条目
+        if let Some(ref sid) = session_id {
+            // 检查 session 是否存在于 AGENT_REGISTRY 中
+            let session_exists = AGENT_REGISTRY.contains_session(sid);
+
+            if !session_exists && SESSION_CACHE.remove(sid).is_some() {
+                info!("🗑️ [gRPC] session 不存在，移除无效 session: session_id={}", sid);
+            } else if session_exists {
+                info!("♻️ [gRPC] 复用已存在的 session: session_id={}", sid);
             }
+        }
 
         // 解析 service_type（默认为 RCoder）
         let service_type = req

@@ -27,8 +27,8 @@ cleanup_config:
     # 默认值: /app/logs/container
     log_dir: "/app/logs/container"
     # 日志保留天数
-    # 默认值: 7
-    log_retention_days: 7
+    # 默认值: 10
+    log_retention_days: 10
 
 # Pingora 反向代理配置
 proxy_config:
