@@ -273,7 +273,7 @@ impl AgentService for AgentServiceImpl {
                     project_id: project_id.clone(),
                     session_id: session_id.unwrap_or_default(),
                     success: false,
-                    error: Some("Agent is executing a task, please wait for the current task to complete before sending a new request".to_string()),
+                    error: Some("Agent 正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
                     error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
                     request_id: req.request_id.clone(),
                     // 🆕 Agent Busy does not need degradation

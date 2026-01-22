@@ -44,7 +44,18 @@
       "source": "custom",
       "enabled": true,
       "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp@latest", "--headless", "--isolated", "--executablePath=/usr/bin/chromium"],
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--headless",
+        "--isolated",
+        "--executablePath=/usr/bin/chromium",
+        "--chrome-arg=--no-sandbox",
+        "--chrome-arg=--disable-gpu",
+        "--chrome-arg=--disable-dev-shm-usage",
+        "--chrome-arg=--disable-software-rasterizer",
+        "--chrome-arg=--disable-extensions"
+      ],
       "env": {}
     },
     "fetch": {
