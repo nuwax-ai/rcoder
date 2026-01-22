@@ -215,7 +215,7 @@ mod tests {
         let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
         for (filename, _) in &test_files[..2] {
             let file_path = log_dir.join(filename);
-            filetime::set_file_mtime(&file_path, old_time).unwrap();
+            filetime::set_file_mtime(&file_path, old_time.into()).unwrap();
         }
 
         // 创建日志清理器，保留 7 天

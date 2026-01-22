@@ -194,6 +194,30 @@ docker_config:
   # 容器存活时间（秒）
   container_ttl_seconds: 3600
 
+  # 🔧 Docker API 调用超时时间（秒）
+  # 用于大多数 Docker API 调用的超时保护
+  api_timeout_seconds: 10
+
+  # 🔧 快速操作超时时间（秒）
+  # 用于状态查询等轻量级操作的超时保护
+  api_timeout_quick_seconds: 5
+
+  # 🔧 状态缓存 TTL（秒）
+  # 用于缓存容器状态信息（container_id, container_name, status, is_running）
+  # 建议值：
+  #   - 高频查询环境: 30-60
+  #   - 平衡模式: 10-15（默认）
+  #   - 实时要求高: 5-10
+  cache_status_ttl_seconds: 10
+
+  # 🔧 网络缓存 TTL（秒）
+  # 用于缓存容器网络信息（network_name -> ip_address）
+  # 建议值：
+  #   - 高频查询环境: 60-120
+  #   - 平衡模式: 15-30（默认）
+  #   - 实时要求高: 10-15
+  cache_network_ttl_seconds: 15
+
 # API Key 鉴权配置（可选）
 api_key_auth:
   # 是否启用 API Key 鉴权（默认关闭）

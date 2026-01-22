@@ -210,7 +210,7 @@ impl OrphanedContainerCleaner {
             .find_container_realtime(&info.container_name)
             .await
         {
-            Ok(Some((container_id, _, _, _))) => {
+            Ok(Some(result)) => {
                 // 容器存在，检查保护期
                 // 🔧 关键修复：使用 DockerManager 封装的方法获取创建时间
                 // 使用容器 name 查询，容器重启后 name 不变，但 ID 会变
@@ -252,7 +252,7 @@ impl OrphanedContainerCleaner {
                     }
                 }
                 // 使用 info.id (project_id) 作为缓存 key
-                (container_id, info.id.clone())
+                (result.container_id, info.id.clone())
             }
             Ok(None) => {
                 // 容器已不存在，可能已被删除

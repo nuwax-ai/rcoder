@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn test_builder_with_resource_limits() {
         let limits = ResourceLimits {
-            memory_limit: Some(512 * 1024 * 1024), // 512MB
+            memory_limit: Some((512 * 1024 * 1024) as f64), // 512MB
             cpu_limit: Some(1.0),
             swap_limit: None,
         };
@@ -291,7 +291,7 @@ mod tests {
 
         assert!(config.resource_limits.is_some());
         let resource_limits = config.resource_limits.unwrap();
-        assert_eq!(resource_limits.memory_limit, Some(512 * 1024 * 1024));
+        assert_eq!(resource_limits.memory_limit, Some((512 * 1024 * 1024) as f64));
         assert_eq!(resource_limits.cpu_limit, Some(1.0));
     }
 }

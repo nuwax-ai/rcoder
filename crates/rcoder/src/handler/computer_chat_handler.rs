@@ -488,7 +488,9 @@ async fn forward_computer_request_to_container(
         request.user_id, project_id, container_info.container_id
     );
 
-    // 从 service_url 提取 gRPC 地址
+    // 直接使用 gRPC 的健康检查机制，不额外检查容器状态
+    // gRPC 连接失败会自动返回错误，由上层处理
+
     // 从 service_url 提取 gRPC 地址
     // 🆕 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期的问题
     let grpc_addr = match get_realtime_container_ip_with_cache(

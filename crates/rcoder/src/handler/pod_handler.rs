@@ -715,37 +715,37 @@ pub async fn pod_ensure(
 
     // 判断是否需要创建新容器
     let need_create = match existing_container {
-        Some((container_id, _container_name, status, is_running)) if is_running => {
+        Some(result) if result.is_running => {
             // 容器存在且正在运行，无需创建
             info!(
                 "📦 [POD_ENSURE] 容器已存在且运行中: container_id={}, status={:?}",
-                container_id, status
+                result.container_id, result.status
             );
             false
         }
-        Some((container_id, _container_name, status, _is_running)) => {
+        Some(result) => {
             // 容器存在但未运行（Exited 等状态），需要删除并重建
             warn!(
                 "⚠️ [POD_ENSURE] 容器存在但未运行: container_id={}, status={:?}, 将删除并重建",
-                container_id, status
+                result.container_id, result.status
             );
 
             // 删除旧容器
             // 如果删除失败（包括容器不存在等情况），返回错误让调用者知道
             docker_manager
-                .stop_container_by_id(&container_id)
+                .stop_container_by_id(&result.container_id)
                 .await
                 .map_err(|e| {
                     error!(
                         "❌ [POD_ENSURE] 删除旧容器失败: container_id={}, error={}",
-                        container_id, e
+                        result.container_id, e
                     );
                     AppError::internal_server_error(&format!("删除旧容器失败: {}", e))
                 })?;
 
             info!(
                 "✅ [POD_ENSURE] 旧容器已删除: container_id={}",
-                container_id
+                result.container_id
             );
 
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
@@ -1454,24 +1454,24 @@ pub async fn pod_status(
 
     // 4. 🆕 通过 DockerManager 实时查询容器状态（直接查询 Docker API，无缓存延迟）
     match docker_manager.find_container_realtime(&identifier).await {
-        Ok(Some((container_id, container_name, status, is_running))) => {
-            let status_str = if is_running { "running" } else { "stopped" };
-            let message = if is_running {
+        Ok(Some(result)) => {
+            let status_str = if result.is_running { "running" } else { "stopped" };
+            let message = if result.is_running {
                 "容器正在运行中".to_string()
             } else {
-                format!("容器存在但状态为: {:?}", status)
+                format!("容器存在但状态为: {:?}", result.status)
             };
 
             info!(
                 "✅ [POD_STATUS] 容器状态: alive={}, status={}, container_id={}",
-                is_running, status_str, container_id
+                result.is_running, status_str, result.container_id
             );
 
             return Ok(HttpResult::success(PodStatusResponse {
-                alive: is_running,
+                alive: result.is_running,
                 status: status_str.to_string(),
-                container_id: Some(container_id),
-                container_name: Some(container_name),
+                container_id: Some(result.container_id),
+                container_name: Some(result.container_name),
                 timestamp,
                 message,
             }));
@@ -1492,24 +1492,24 @@ pub async fn pod_status(
     if params.user_id.is_some() {
         if let Some(ref project_id) = params.project_id {
             match docker_manager.find_container_realtime(project_id).await {
-                Ok(Some((container_id, container_name, status, is_running))) => {
-                    let status_str = if is_running { "running" } else { "stopped" };
-                    let message = if is_running {
+                Ok(Some(result)) => {
+                    let status_str = if result.is_running { "running" } else { "stopped" };
+                    let message = if result.is_running {
                         "容器正在运行中".to_string()
                     } else {
-                        format!("容器存在但状态为: {:?}", status)
+                        format!("容器存在但状态为: {:?}", result.status)
                     };
 
                     info!(
                         "✅ [POD_STATUS] 通过 project_id 找到容器: alive={}, container_id={}",
-                        is_running, container_id
+                        result.is_running, result.container_id
                     );
 
                     return Ok(HttpResult::success(PodStatusResponse {
-                        alive: is_running,
+                        alive: result.is_running,
                         status: status_str.to_string(),
-                        container_id: Some(container_id),
-                        container_name: Some(container_name),
+                        container_id: Some(result.container_id),
+                        container_name: Some(result.container_name),
                         timestamp,
                         message,
                     }));
@@ -1670,7 +1670,7 @@ pub async fn pod_vnc_status(
     })?;
 
     // 4. 检查容器是否存在
-    let (container_id, _container_name, _status, is_running) = match container_info {
+    let result = match container_info {
         Some(info) => info,
         None => {
             info!(
@@ -1688,17 +1688,17 @@ pub async fn pod_vnc_status(
     };
 
     // 5. 检查容器是否正在运行
-    if !is_running {
+    if !result.is_running {
         info!(
             "⚠️ [POD_VNC_STATUS] 容器未运行: container_id={}",
-            container_id
+            result.container_id
         );
         return Ok(HttpResult::success(VncStatusResponse {
             vnc_ready: false,
             novnc_ready: false,
             message: "容器未运行".to_string(),
             uptime_seconds: 0,
-            container_id,
+            container_id: result.container_id,
         }));
     }
 
@@ -1712,7 +1712,7 @@ pub async fn pod_vnc_status(
             // 如果无法获取 agent_info，返回错误
             error!(
                 "❌ [POD_VNC_STATUS] 无法获取容器服务信息: container_id={}",
-                container_id
+                result.container_id
             );
             return Ok(HttpResult::error(
                 shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
@@ -1751,7 +1751,7 @@ pub async fn pod_vnc_status(
                         novnc_ready: resp.novnc_ready,
                         message: resp.message,
                         uptime_seconds: resp.uptime_seconds,
-                        container_id,
+                        container_id: result.container_id,
                     }))
                 }
                 Err(e) => {

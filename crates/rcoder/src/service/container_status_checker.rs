@@ -146,7 +146,12 @@ impl ContainerStatusChecker {
         let mut updated = 0;
         let mut failed = 0;
 
-        for (lookup_key, container_info) in containers {
+        for (_project_id, container_info) in containers {
+            // 使用 container_key() 获取正确的容器标识符
+            // - RCoder 模式：返回 project_id
+            // - ComputerAgentRunner 模式：返回 user_id（用于匹配容器名称）
+            let lookup_key = container_info.container_key().to_string();
+
             // 🆕 检查所有类型的容器（RCoder 和 ComputerAgentRunner）
             // 两种模式都可能执行长时间任务，需要定期检查状态防止被误杀
 
@@ -233,42 +238,43 @@ impl ContainerStatusChecker {
 
                 if is_active {
                     // 容器有活跃任务，更新活动时间和状态
-                    if let Err(e) = update_container_activity(lookup_key, &self.state).await {
+                    // 注意：使用 project_id 更新 DuckDB，而不是 lookup_key
+                    if let Err(e) = update_project_activity(&project_id, &self.state).await {
                         warn!(
-                            "⚠️ [STATUS_CHECKER] 更新活动时间失败: {}, {}",
-                            lookup_key, e
+                            "⚠️ [STATUS_CHECKER] 更新活动时间失败: project_id={}, {}",
+                            project_id, e
                         );
                         return Ok(false);
                     }
                     // 🆕 同步更新 agent 状态为 Active
                     if let Err(e) = self.state.projects.update_agent_status(
-                        lookup_key, 1, // Active
+                        &project_id, 1, // Active
                         "active",
                     ) {
                         warn!(
-                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Active 失败: {}, error={}",
-                            lookup_key, e
+                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Active 失败: project_id={}, error={}",
+                            project_id, e
                         );
                     }
                     debug!(
-                        "✅ [STATUS_CHECKER] 容器活跃，已更新活动时间和状态: {}",
-                        lookup_key
+                        "✅ [STATUS_CHECKER] 容器活跃，已更新活动时间和状态: container_key={}, project_id={}",
+                        lookup_key, project_id
                     );
                     Ok(true)
                 } else {
                     // 🆕 同步更新 agent 状态为 Idle
                     if let Err(e) = self.state.projects.update_agent_status(
-                        lookup_key, 0, // Idle
+                        &project_id, 0, // Idle
                         "idle",
                     ) {
                         warn!(
-                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Idle 失败: {}, error={}",
-                            lookup_key, e
+                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Idle 失败: project_id={}, error={}",
+                            project_id, e
                         );
                     }
                     debug!(
-                        "📭 [STATUS_CHECKER] 容器空闲，已更新状态为 Idle: {}",
-                        lookup_key
+                        "📭 [STATUS_CHECKER] 容器空闲，已更新状态为 Idle: container_key={}, project_id={}",
+                        lookup_key, project_id
                     );
                     Ok(false)
                 }
@@ -609,11 +615,12 @@ async fn query_container_status(
     Ok(status_response.is_active || status_response.active_tasks > 0)
 }
 
-/// 更新容器活动时间
+/// 更新项目活动时间（并同步更新关联容器的活动时间）
 ///
-/// 使用 DuckDB 存储更新 last_activity
-async fn update_container_activity(lookup_key: &str, state: &Arc<AppState>) -> anyhow::Result<()> {
+/// 使用 DuckDB 存储更新 projects 表的 last_activity 字段
+async fn update_project_activity(project_id: &str, state: &Arc<AppState>) -> anyhow::Result<()> {
     // 使用 ProjectAdapter 的 update_activity 方法
-    state.update_activity(lookup_key);
+    // 该方法会同时更新 project 和关联 container 的 last_activity
+    state.update_activity(project_id);
     Ok(())
 }

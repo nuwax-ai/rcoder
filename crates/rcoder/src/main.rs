@@ -135,6 +135,26 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
+        // 🔧 应用超时配置
+        if let Some(timeout) = docker_config.api_timeout_seconds {
+            default_config.api_timeout_seconds = timeout;
+            info!("✅ 使用配置的 API 超时: {}秒", timeout);
+        }
+        if let Some(timeout) = docker_config.api_timeout_quick_seconds {
+            default_config.api_timeout_quick_seconds = timeout;
+            info!("✅ 使用配置的快速操作超时: {}秒", timeout);
+        }
+
+        // 🔧 应用缓存 TTL 配置
+        if let Some(ttl) = docker_config.cache_status_ttl_seconds {
+            default_config.cache_status_ttl_seconds = ttl;
+            info!("✅ 使用配置的状态缓存 TTL: {}秒", ttl);
+        }
+        if let Some(ttl) = docker_config.cache_network_ttl_seconds {
+            default_config.cache_network_ttl_seconds = ttl;
+            info!("✅ 使用配置的网络缓存 TTL: {}秒", ttl);
+        }
+
         default_config
     } else {
         info!("⚠️  应用中无 Docker 配置，使用默认配置");

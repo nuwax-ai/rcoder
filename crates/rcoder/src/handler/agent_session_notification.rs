@@ -437,17 +437,17 @@ async fn validate_and_get_session_context(
         .find_container_realtime(&container_name)
         .await
     {
-        Ok(Some((real_container_id, _, _status, is_running))) => {
-            if is_running {
+        Ok(Some(result)) => {
+            if result.is_running {
                 info!(
                     "✅ [SSE_PROXY] 容器检查通过: container_name={}, container_id={}, 状态=运行中",
-                    container_name, real_container_id
+                    container_name, result.container_id
                 );
                 // 容器正在运行，继续执行
             } else {
                 error!(
                     "❌ [SSE_PROXY] 容器已停止: container_name={}, container_id={}",
-                    container_name, real_container_id
+                    container_name, result.container_id
                 );
                 return Err(create_error_response(
                     StatusCode::NOT_FOUND,

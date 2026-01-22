@@ -1,7 +1,7 @@
 use super::{
     CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerQueryResult,
-    ContainerStatus, DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig,
-    DockerResult,
+    ContainerQueryResultArc, ContainerStatus, DockerContainerConfig, DockerContainerInfo,
+    DockerError, DockerManagerConfig, DockerResult,
 };
 use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
 use anyhow::Result;
@@ -17,10 +17,91 @@ use bollard::{
     },
 };
 use chrono::{DateTime, Utc};
+use moka::future::Cache;
 use shared_types::ContainerBasicInfo;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+/// Docker API 缓存
+///
+/// 使用 Moka 缓存库实现高性能缓存，减少 Docker API 调用次数
+/// 使用结构体包装，提高代码可读性和减少 clone 开销
+pub struct DockerApiCache {
+    /// 容器状态缓存 (identifier -> Option<ContainerQueryResultArc>)
+    /// 支持 None 值缓存，用于缓存 404 响应
+    status_cache: Cache<String, Option<ContainerQueryResultArc>>,
+
+    /// 网络信息缓存 (container_id -> Option<Arc<HashMap<network_name, ip_address>>>)
+    /// 支持 None 值缓存
+    network_cache: Cache<String, Option<Arc<HashMap<String, String>>>>,
+}
+
+impl DockerApiCache {
+    /// 创建新的缓存实例
+    ///
+    /// # 参数
+    /// * `status_ttl` - 状态缓存 TTL（秒）
+    /// * `network_ttl` - 网络缓存 TTL（秒）
+    pub fn new(status_ttl: u64, network_ttl: u64) -> Self {
+        info!(
+            "🗄️ [API_CACHE] 初始化 Docker API 缓存: status_ttl={}秒, network_ttl={}秒",
+            status_ttl, network_ttl
+        );
+
+        Self {
+            status_cache: Cache::builder()
+                .max_capacity(1000)
+                .time_to_live(Duration::from_secs(status_ttl))
+                .build(),
+            network_cache: Cache::builder()
+                .max_capacity(1000)
+                .time_to_live(Duration::from_secs(network_ttl))
+                .build(),
+        }
+    }
+
+    /// 使用默认配置创建缓存实例
+    #[allow(dead_code)]
+    pub fn with_defaults() -> Self {
+        Self::new(10, 15)
+    }
+
+    /// 获取状态缓存
+    pub async fn get_status(&self, identifier: &str) -> Option<Option<ContainerQueryResultArc>> {
+        self.status_cache.get(identifier).await
+    }
+
+    /// 写入状态缓存（支持 None 值）
+    pub async fn insert_status(&self, identifier: String, value: Option<ContainerQueryResultArc>) {
+        self.status_cache.insert(identifier, value).await;
+    }
+
+    /// 获取网络缓存
+    pub async fn get_network(&self, container_id: &str) -> Option<Option<Arc<HashMap<String, String>>>> {
+        self.network_cache.get(container_id).await
+    }
+
+    /// 写入网络缓存（支持 None 值）
+    pub async fn insert_network(&self, container_id: String, value: Option<Arc<HashMap<String, String>>>) {
+        self.network_cache.insert(container_id, value).await;
+    }
+
+    /// 使缓存失效
+    pub async fn invalidate(&self, identifier: &str) {
+        self.status_cache.invalidate(identifier).await;
+        self.network_cache.invalidate(identifier).await;
+    }
+
+    /// 使所有相关缓存失效（用于容器生命周期变化后）
+    pub async fn invalidate_all(&self, identifiers: &[String]) {
+        for id in identifiers {
+            self.status_cache.invalidate(id.as_str()).await;
+            self.network_cache.invalidate(id.as_str()).await;
+        }
+    }
+}
 
 /// Docker 容器管理器
 pub struct DockerManager {
@@ -32,6 +113,8 @@ pub struct DockerManager {
     containers: ContainerStateHandle,
     /// 主网络名称（动态检测或使用默认值）
     main_network_name: std::sync::Arc<tokio::sync::RwLock<String>>,
+    /// Docker API 缓存
+    api_cache: Arc<DockerApiCache>,
 }
 
 impl DockerManager {
@@ -68,11 +151,18 @@ impl DockerManager {
         tokio::spawn(actor.run());
         info!("✅ ContainerStateActor 已启动");
 
+        // 🗄️ 初始化 Docker API 缓存（使用配置的 TTL）
+        let api_cache = Arc::new(DockerApiCache::new(
+            config.cache_status_ttl_seconds,
+            config.cache_network_ttl_seconds,
+        ));
+
         let manager = Self {
             docker,
             config,
             containers,
             main_network_name: std::sync::Arc::new(tokio::sync::RwLock::new(main_network_name)),
+            api_cache,
         };
 
         // 确保 RCoder 网络存在
@@ -84,6 +174,24 @@ impl DockerManager {
     /// 使用默认配置创建 Docker 管理器
     pub async fn with_default_config() -> DockerResult<Self> {
         Self::new(DockerManagerConfig::default()).await
+    }
+
+    /// 带超时的 inspect_container 调用
+    ///
+    /// 封装 Docker API 调用，添加超时保护，防止请求阻塞
+    async fn inspect_with_timeout(
+        &self,
+        identifier: &str,
+        timeout: Duration,
+    ) -> DockerResult<bollard::models::ContainerInspectResponse> {
+        tokio::time::timeout(timeout, self.docker.inspect_container(identifier, None::<InspectContainerOptions>))
+            .await
+            .map_err(|_| DockerError::Timeout(format!(
+                "Docker API 调用超时 ({}秒): identifier={}",
+                timeout.as_secs(),
+                identifier
+            )))?
+            .map_err(DockerError::BollardError)
     }
 
     /// 创建并启动容器
@@ -101,23 +209,22 @@ impl DockerManager {
 
         // 🔍 先检查 Docker API 中是否存在同名容器（无论运行状态）
         // 这是必要的，因为容器可能被外部 stop 但未删除，导致 409 Conflict
-        if let Ok(Some((existing_container_id, existing_name, status, is_running))) =
-            self.find_container_realtime(&container_name).await
-        {
+        if let Ok(Some(result)) = self.find_container_realtime(&container_name).await {
             warn!(
                 "🔍 [CREATE] 发现同名容器: name={}, id={}, status={:?}, running={}",
-                existing_name, existing_container_id, status, is_running
+                result.container_name, result.container_id, result.status, result.is_running
             );
 
             // 无论容器是运行还是停止状态，都先删除
             info!(
                 "🗑️ [CREATE] 删除旧容器 {} ({})",
-                existing_name, existing_container_id
+                result.container_name, result.container_id
             );
-            if let Err(e) = self.stop_container_by_id(&existing_container_id).await {
+            if let Err(e) = self.stop_container_by_id(&result.container_id).await {
                 error!("❌ [CREATE] 删除旧容器失败: {}", e);
                 // 继续尝试创建，Docker 会返回 409 错误
             } else {
+                // 🔧 stop_container_by_id 已处理缓存失效
                 info!("✅ [CREATE] 旧容器删除成功");
             }
         }
@@ -420,6 +527,9 @@ impl DockerManager {
         for info in self.containers.list().await {
             if info.container_id == container_id {
                 self.containers.remove(&info.project_id).await;
+                // 🔧 使缓存失效
+                self.api_cache.invalidate(container_id).await;
+                self.api_cache.invalidate(info.container_name.as_str()).await;
                 break;
             }
         }
@@ -438,7 +548,7 @@ impl DockerManager {
             return Ok(());
         };
 
-        // 调用通过ID停止的方法
+        // 调用通过ID停止的方法（已包含缓存失效和映射移除）
         self.stop_container_by_id(&container_info.container_id)
             .await?;
 
@@ -623,29 +733,44 @@ impl DockerManager {
         }
     }
 
-    /// 实时查询容器状态（直接查询 Docker API，不使用缓存）
+    /// 实时查询容器状态（使用缓存 + 超时保护）
     ///
     /// 与 `find_container_by_identifier` 不同，此方法跳过内存缓存，
     /// 直接查询 Docker API 获取最新的容器状态。
+    ///
+    /// 🔧 优化：使用 Moka 缓存减少 Docker API 调用，使用超时保护防止阻塞
+    /// 📝 缓存策略：同时缓存 container_id 和 container_name，支持 404 响应缓存
     ///
     /// # 参数
     /// * `identifier` - 容器名称或容器 ID
     ///
     /// # 返回
-    /// * 如果找到容器，返回 `Some((container_id, container_name, status, is_running))`
+    /// * 如果找到容器，返回 `Some(ContainerQueryResult)`
     /// * 如果容器不存在，返回 `None`
     pub async fn find_container_realtime(
         &self,
         identifier: &str,
-    ) -> DockerResult<Option<(String, String, ContainerStatus, bool)>> {
+    ) -> DockerResult<Option<ContainerQueryResult>> {
         debug!("🔍 [REALTIME] 实时查询容器状态: identifier={}", identifier);
 
-        match self
-            .docker
-            .inspect_container(identifier, None::<InspectContainerOptions>)
-            .await
-        {
+        // 1. 尝试从缓存获取
+        if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
+            debug!("✅ [REALTIME] 缓存命中: identifier={}", identifier);
+            // Arc::clone 只是增加引用计数，开销很小
+            return Ok(Some((*cached).clone()));
+        }
+
+        // 1.5 检查是否缓存了 None（404 响应）
+        if let Some(None) = self.api_cache.get_status(identifier).await {
+            debug!("📭 [REALTIME] 缓存命中（404）: identifier={}", identifier);
+            return Ok(None);
+        }
+
+        // 2. 缓存未命中，调用 Docker API（带超时）
+        let timeout = Duration::from_secs(self.config.api_timeout_quick_seconds);
+        let result = match self.inspect_with_timeout(identifier, timeout).await {
             Ok(details) => {
+                // 解析结果
                 let container_id = details.id.unwrap_or_default();
                 let container_name = details
                     .name
@@ -665,29 +790,58 @@ impl DockerManager {
                     (ContainerStatus::Unknown("no state".to_string()), false)
                 };
 
+                // 🔧 使用 Arc 包装，减少 clone 开销
+                let query_result = ContainerQueryResult::new(
+                    container_id.clone(),
+                    container_name.clone(),
+                    status,
+                    is_running,
+                );
+                let result_arc = Arc::new(query_result);
+
+                // 同时用 container_id 和 container_name 作为缓存 key
+                // Arc::clone 只是增加引用计数，开销很小
+                self.api_cache.insert_status(container_id.clone(), Some(result_arc.clone())).await;
+                self.api_cache.insert_status(container_name.clone(), Some(result_arc.clone())).await;
+
                 info!(
                     "✅ [REALTIME] 容器状态查询成功: id={}, name={}, status={:?}, running={}",
-                    container_id, container_name, status, is_running
+                    container_id, container_name, result_arc.status, result_arc.is_running
                 );
 
-                Ok(Some((container_id, container_name, status, is_running)))
+                // 返回解引用后的值（因为返回类型不是 Arc）
+                Some((*result_arc).clone())
             }
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => {
-                // 容器不存在
-                debug!("📭 [REALTIME] 容器不存在: identifier={}", identifier);
-                Ok(None)
+            Err(DockerError::BollardError(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })) => {
+                // 容器不存在 - 缓存 None 值以避免重复查询
+                debug!("📭 [REALTIME] 容器不存在，缓存 404 响应: identifier={}", identifier);
+                self.api_cache.insert_status(identifier.to_string(), None).await;
+                None
+            }
+            Err(DockerError::Timeout(_)) => {
+                warn!("⚠️ [REALTIME] 查询超时，尝试从缓存获取: identifier={}", identifier);
+                // 超时时，尝试返回缓存中的旧值（如果有的话）
+                if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
+                    return Ok(Some((*cached).clone()));
+                }
+                return Err(DockerError::Timeout(format!(
+                    "容器状态查询超时且无可用缓存: identifier={}",
+                    identifier
+                )));
             }
             Err(e) => {
-                // 其他类型的错误
                 error!(
                     "❌ [REALTIME] 查询容器状态失败: identifier={}, error={}",
                     identifier, e
                 );
-                Err(DockerError::BollardError(e))
+                return Err(e);
             }
-        }
+        };
+
+        Ok(result)
     }
 
     /// 通过容器名称获取容器创建时间
@@ -1399,17 +1553,8 @@ impl DockerManager {
         let prefix = service_type.container_prefix();
         let expected_container_name = format!("{}-{}", prefix, project_id);
 
-        match self.find_container_realtime(&expected_container_name).await? {
-            Some((container_id, container_name, status, is_running)) => {
-                Ok(Some(ContainerQueryResult::new(
-                    container_id,
-                    container_name,
-                    status,
-                    is_running,
-                )))
-            }
-            None => Ok(None),
-        }
+        // 直接返回 find_container_realtime 的结果
+        self.find_container_realtime(&expected_container_name).await
     }
 
     /// 获取 Agent 容器的高级信息
@@ -1565,17 +1710,8 @@ impl DockerManager {
         let prefix = service_type.container_prefix();
         let expected_container_name = format!("{}-{}", prefix, user_id);
 
-        match self.find_container_realtime(&expected_container_name).await? {
-            Some((container_id, container_name, status, is_running)) => {
-                Ok(Some(ContainerQueryResult::new(
-                    container_id,
-                    container_name,
-                    status,
-                    is_running,
-                )))
-            }
-            None => Ok(None),
-        }
+        // 直接返回 find_container_realtime 的结果
+        self.find_container_realtime(&expected_container_name).await
     }
 
     /// 通过用户 ID 获取容器 ID（ComputerAgentRunner 模式专用）
@@ -1889,6 +2025,10 @@ impl DockerManager {
             .await
             .map_err(|e| DockerError::ContainerStartError(format!("重启容器失败: {}", e)))?;
 
+        // 🔧 使缓存失效（容器状态已变更）
+        self.api_cache.invalidate(container_info.container_id.as_str()).await;
+        self.api_cache.invalidate(container_info.container_name.as_str()).await;
+
         info!("容器重启成功: {}", container_info.container_name);
         Ok(())
     }
@@ -1971,23 +2111,59 @@ impl DockerManager {
         selector.get_service_config(service_type).await
     }
 
-    /// 获取容器网络信息
+    /// 获取容器网络信息（使用缓存 + 超时保护）
+    ///
+    /// 🔧 优化：使用 Moka 缓存减少 Docker API 调用，使用超时保护防止阻塞
+    /// 📝 缓存策略：支持 None 值缓存（容器不存在或网络信息为空时）
     ///
     /// # 返回
-    /// - `Ok(HashMap)`: 网络名称到 IP 地址的映射
+    /// - `Ok(HashMap)`: 网络名称到 IP 地址的映射（可能为空）
     /// - `Err(ConnectionError)`: 容器不存在或无法获取网络信息
     pub async fn get_container_network_info(
         &self,
         container_id: &str,
     ) -> DockerResult<HashMap<String, String>> {
-        use bollard::query_parameters::InspectContainerOptions;
+        // 1. 尝试从缓存获取
+        if let Some(Some(cached)) = self.api_cache.get_network(container_id).await {
+            debug!("✅ [NETWORK] 缓存命中: container_id={}", container_id);
+            // Arc::clone 只是增加引用计数，解引用后 clone HashMap
+            return Ok((*cached).clone());
+        }
 
-        let inspect = self
-            .docker
-            .inspect_container(container_id, None::<InspectContainerOptions>)
-            .await
-            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))?;
+        // 1.5 检查是否缓存了 None（空网络信息）
+        if let Some(None) = self.api_cache.get_network(container_id).await {
+            debug!("📭 [NETWORK] 缓存命中（空网络）: container_id={}", container_id);
+            return Ok(HashMap::new());
+        }
 
+        // 2. 缓存未命中，调用 Docker API（带超时）
+        let timeout = Duration::from_secs(self.config.api_timeout_quick_seconds);
+        let inspect = match self.inspect_with_timeout(container_id, timeout).await {
+            Ok(i) => i,
+            Err(DockerError::BollardError(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })) => {
+                // 容器不存在 - 缓存空 HashMap
+                debug!("📭 [NETWORK] 容器不存在，缓存空网络: container_id={}", container_id);
+                self.api_cache.insert_network(container_id.to_string(), None).await;
+                return Ok(HashMap::new());
+            }
+            Err(DockerError::Timeout(_)) => {
+                warn!("⚠️ [NETWORK] 查询超时，尝试从缓存获取: container_id={}", container_id);
+                // 超时时，尝试返回缓存中的旧值（如果有的话）
+                if let Some(Some(cached)) = self.api_cache.get_network(container_id).await {
+                    return Ok((*cached).clone());
+                }
+                return Err(DockerError::Timeout(format!(
+                    "容器网络信息查询超时且无可用缓存: container_id={}",
+                    container_id
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+
+        // 3. 解析网络信息
         let mut network_ips = HashMap::new();
 
         if let Some(network_settings) = inspect.network_settings
@@ -2001,6 +2177,15 @@ impl DockerManager {
                 }
             }
         }
+
+        // 4. 写入缓存（如果为空也缓存，避免重复查询）
+        let result_to_cache = if network_ips.is_empty() {
+            None
+        } else {
+            // 🔧 使用 Arc 包装，减少 clone 开销
+            Some(Arc::new(network_ips.clone()))
+        };
+        self.api_cache.insert_network(container_id.to_string(), result_to_cache).await;
 
         Ok(network_ips)
     }

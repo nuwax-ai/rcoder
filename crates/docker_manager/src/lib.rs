@@ -63,6 +63,9 @@ pub enum DockerError {
     #[error("时间戳解析失败: {0}")]
     InvalidTimestamp(String),
 
+    #[error("Docker API 调用超时: {0}")]
+    Timeout(String),
+
     #[error("Bollard Docker 错误: {0}")]
     BollardError(#[from] bollard::errors::Error),
 }

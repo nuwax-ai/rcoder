@@ -64,17 +64,17 @@ async fn destroy_container_for_project(
         );
 
         // 使用 find_container_realtime 获取最新的容器信息
-        if let Ok(Some((container_id, found_container_name, status, is_running))) = docker_manager
+        if let Ok(Some(result)) = docker_manager
             .find_container_realtime(&expected_container_name)
             .await
         {
             info!(
                 "🎯 [STOP_DESTROY] 实时查找到容器: container_id={}, name={}, status={:?}, running={}",
-                container_id, found_container_name, status, is_running
+                result.container_id, result.container_name, result.status, result.is_running
             );
 
             // 直接使用 container_id 停止容器（无需再查缓存）
-            let stop_result = docker_manager.stop_container_by_id(&container_id).await;
+            let stop_result = docker_manager.stop_container_by_id(&result.container_id).await;
 
             if let Err(e) = stop_result {
                 error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
@@ -89,7 +89,7 @@ async fn destroy_container_for_project(
 
             info!(
                 "✅ [STOP_DESTROY] 容器销毁成功（实时查找）: project_id={}, container_id={}",
-                project_id, container_id
+                project_id, result.container_id
             );
 
             let response = StopAgentResponse {

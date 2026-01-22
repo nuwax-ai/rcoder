@@ -37,31 +37,21 @@
       "source": "custom",
       "enabled": true,
       "command": "bunx",
-      "args": [
-        "-y",
-        "@upstash/context7-mcp"
-      ],
+      "args": ["-y", "@upstash/context7-mcp"],
       "env": {}
     },
     "chrome-devtools": {
       "source": "custom",
       "enabled": true,
       "command": "npx",
-      "args": [
-        "-y",
-        "chrome-devtools-mcp@latest",
-        "--headless",
-        "--isolated"
-      ],
+      "args": ["-y", "chrome-devtools-mcp@latest", "--headless", "--isolated", "--executablePath=/usr/bin/chromium"],
       "env": {}
     },
     "fetch": {
       "source": "custom",
-      "enabled": false,
+      "enabled": true,
       "command": "uvx",
-      "args": [
-        "mcp-server-fetch"
-      ],
+      "args": ["mcp-server-fetch"],
       "env": {}
     }
   }
