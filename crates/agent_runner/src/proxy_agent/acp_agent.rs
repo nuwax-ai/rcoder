@@ -21,52 +21,6 @@ use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-// ============================================================================
-// 🔥 P0 修复: DeferGuard - RAII 模式用于延迟执行清理逻辑
-// ============================================================================
-
-/// Defer 守卫 - RAII 模式确保在作用域结束时执行清理逻辑
-///
-/// ## 用途
-///
-/// 确保资源释放代码在所有退出路径（return、break、panic）上都会执行。
-///
-/// ## 使用示例
-///
-/// ```rust,ignore
-/// let _guard = DeferGuard::new(|| {
-///     AGENT_REGISTRY.release_session_slot();
-/// });
-/// // ... 任何逻辑 ...
-/// // 函数返回时，guard 自动 drop，执行清理
-/// ```
-struct DeferGuard<F: FnOnce()>
-where
-    F: Send + 'static,
-{
-    f: Option<F>,
-}
-
-impl<F: FnOnce()> DeferGuard<F>
-where
-    F: Send + 'static,
-{
-    fn new(f: F) -> Self {
-        Self { f: Some(f) }
-    }
-}
-
-impl<F: FnOnce()> Drop for DeferGuard<F>
-where
-    F: Send + 'static,
-{
-    fn drop(&mut self) {
-        if let Some(f) = self.f.take() {
-            f();
-        }
-    }
-}
-
 // SACP 类型导入
 use sacp::schema::SessionId;
 
@@ -376,45 +330,6 @@ pub async fn agent_worker_with_heartbeat(
             project_id, request_id
         );
 
-        // 🔥 P0 修复: 在接收请求时立即检查并发限制（而非 spawn 后检查）
-        // 这样才能真正拒绝超过限制的请求
-        if !AGENT_REGISTRY.try_acquire_session_slot() {
-            error!(
-                "🛡️ [原子并发限制] Agent 会话槽位已满 ({}/{}), 拒绝新请求 - project_id={}, request_id={}",
-                AGENT_REGISTRY.active_sessions_count(),
-                WORKER_THREAD_POOL_SIZE,
-                project_id,
-                request_id
-            );
-
-            // 清理 Pending 状态（如果已设置）
-            AGENT_REGISTRY.clear_pending_if_exists(&project_id);
-
-            if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
-                project_id: project_id.clone(),
-                session_id: String::new(),
-                code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
-                error: Some(format!(
-                    "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
-                    WORKER_THREAD_POOL_SIZE
-                )),
-                request_id: Some(request_id.clone()),
-                service_type: request.prompt_message.service_type.clone(),
-            }) {
-                error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
-            }
-            continue; // 继续处理下一个请求
-        }
-
-        // 📊 日志: 记录当前会话数
-        debug!(
-            "✅ [原子并发检查通过] 当前活跃会话数: {}/{}, project_id={}, request_id={}",
-            AGENT_REGISTRY.active_sessions_count(),
-            WORKER_THREAD_POOL_SIZE,
-            project_id,
-            request_id
-        );
-
         // 克隆需要的变量，用于 spawn 任务
         let worker_clone = worker.clone();
 
@@ -428,22 +343,6 @@ pub async fn agent_worker_with_heartbeat(
 
             // 🔥 OpenTelemetry 追踪: 创建请求 span
             let _otel_span = RequestSpan::new(&project_id, &request_id, "process_agent_request");
-
-            // 🔥 P0 修复: 使用 defer 确保早期返回路径释放槽位
-            // 如果进入正常流程，会在 Agent 生命周期结束时手动释放
-            let project_id_for_defer = project_id.clone();
-            let should_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let should_release_clone = should_release.clone();
-
-            let _early_return_guard = DeferGuard::new(move || {
-                if should_release_clone.load(std::sync::atomic::Ordering::Acquire) {
-                    AGENT_REGISTRY.release_session_slot();
-                    debug!(
-                        "🔓 [DeferGuard] 早期返回路径释放槽位: project_id={}",
-                        project_id_for_defer
-                    );
-                }
-            });
 
             // 1. 预处理附件（agent_runner 特有逻辑）
             let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
@@ -515,6 +414,42 @@ pub async fn agent_worker_with_heartbeat(
 
             // 5. 更新全局状态（使用统一的 AGENT_REGISTRY）
             if is_new_session {
+                // 🔥 修复：槽位对应 Agent 生命周期，只在创建新 Agent 时获取槽位
+                if !AGENT_REGISTRY.try_acquire_session_slot() {
+                    error!(
+                        "🛡️ [原子并发限制] Agent 会话槽位已满 ({}/{}), 拒绝新请求 - project_id={}, request_id={}",
+                        AGENT_REGISTRY.active_sessions_count(),
+                        WORKER_THREAD_POOL_SIZE,
+                        project_id,
+                        request_id
+                    );
+
+                    // 清理 Pending 状态（如果已设置）
+                    AGENT_REGISTRY.clear_pending_if_exists(&project_id);
+
+                    if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                        project_id: project_id.clone(),
+                        session_id: String::new(),
+                        code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
+                        error: Some(format!(
+                            "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
+                            WORKER_THREAD_POOL_SIZE
+                        )),
+                        request_id: Some(request_id.clone()),
+                        service_type: request.prompt_message.service_type.clone(),
+                    }) {
+                        error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
+                    }
+                    return;
+                }
+
+                info!(
+                    "✅ [原子槽位] 成功获取槽位: {}/{} - project_id={}",
+                    AGENT_REGISTRY.active_sessions_count(),
+                    WORKER_THREAD_POOL_SIZE,
+                    project_id
+                );
+
                 if let Some(ref handles) = session_handles {
                     debug!("🆕 新会话，注册到 AGENT_REGISTRY");
 
@@ -543,7 +478,7 @@ pub async fn agent_worker_with_heartbeat(
                     );
                 }
             } else {
-                debug!("♻️ 复用会话，无需更新全局 Registry");
+                debug!("♻️ 复用会话，无需获取新槽位（Agent 已占用槽位）");
             }
 
             // 6. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
@@ -572,16 +507,12 @@ pub async fn agent_worker_with_heartbeat(
                 );
             }
 
-            // 🔥 P0 修复: 进入正常生命周期流程，禁用早期返回守卫
-            // 槽位将在 Agent 生命周期结束时手动释放
-            should_release.store(false, std::sync::atomic::Ordering::Release);
-
             // SACP 版本：生命周期管理简化
             //
             // 架构设计：
-            // - SACP 支持 Send trait，可以直接在 tokio::spawn 中运行
-            // - 新会话：等待 Agent 生命周期结束
-            // - 复用会话：立即退出
+            // - 槽位对应 Agent 生命周期，而非每次请求
+            // - 新会话：等待 Agent 生命周期结束，然后清理
+            // - 复用会话：立即退出，不释放槽位（因为 Agent 还在运行）
             if is_new_session {
                 if let Some(ref handles) = session_handles {
                     if let Some(ref lifecycle) = handles.lifecycle_handle {
@@ -596,12 +527,14 @@ pub async fn agent_worker_with_heartbeat(
                         // 3. Agent 进程异常退出
                         lifecycle.cancellation_token().cancelled().await;
 
-                        // 🔥 P0 修复: Agent 真正结束时释放槽位
-                        // 必须在这里释放，而不是在请求处理完成时释放
-                        AGENT_REGISTRY.release_session_slot();
+                        // 🔥 关键修复：lifecycle 结束后，主动清理 Agent 并释放槽位
+                        // 这确保了槽位释放和 Registry 清理的原子性
+                        // 后续的 stop_agent 或 cleanup_task 调用 remove_by_project() 会发现 Agent 已不存在
+                        // 因此不会重复释放槽位
+                        AGENT_REGISTRY.remove_by_project(&project_id);
 
                         info!(
-                            "🛑 [SACP] Agent 生命周期结束，已释放槽位 - project_id={}, session_id={}",
+                            "🛑 [SACP] Agent 生命周期结束，已清理 Registry 并释放槽位 - project_id={}, session_id={}",
                             project_id, response_session_id
                         );
                     } else {
@@ -609,8 +542,8 @@ pub async fn agent_worker_with_heartbeat(
                             "⚠️ [SACP] 新会话缺少 lifecycle_handle - project_id={}",
                             project_id
                         );
-                        // 缺少 lifecycle_handle，立即释放槽位
-                        AGENT_REGISTRY.release_session_slot();
+                        // 缺少 lifecycle_handle，立即清理
+                        AGENT_REGISTRY.remove_by_project(&project_id);
                     }
                 }
             } else {
@@ -618,9 +551,8 @@ pub async fn agent_worker_with_heartbeat(
                     "🔵 [SACP] 复用会话：请求处理完成 - project_id={}, session_id={}",
                     project_id, response_session_id
                 );
-                // 🔥 复用会话时，槽位应该在请求处理完成后立即释放
-                // 因为 Agent 不会因为新请求而延长生命周期
-                AGENT_REGISTRY.release_session_slot();
+                // 复用会话时不释放槽位，因为槽位对应 Agent 生命周期
+                // 而不是每次请求。Agent 还在运行，槽位应保持占用状态
             }
         });
 
