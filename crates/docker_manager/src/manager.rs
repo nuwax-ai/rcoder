@@ -753,17 +753,11 @@ impl DockerManager {
     ) -> DockerResult<Option<ContainerQueryResult>> {
         debug!("🔍 [REALTIME] 实时查询容器状态: identifier={}", identifier);
 
-        // 1. 尝试从缓存获取
+        // 1. 尝试从缓存获取（只缓存成功结果，不缓存 404）
         if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
             debug!("✅ [REALTIME] 缓存命中: identifier={}", identifier);
             // Arc::clone 只是增加引用计数，开销很小
             return Ok(Some((*cached).clone()));
-        }
-
-        // 1.5 检查是否缓存了 None（404 响应）
-        if let Some(None) = self.api_cache.get_status(identifier).await {
-            debug!("📭 [REALTIME] 缓存命中（404）: identifier={}", identifier);
-            return Ok(None);
         }
 
         // 2. 缓存未命中，调用 Docker API（带超时）
@@ -816,9 +810,10 @@ impl DockerManager {
                 status_code: 404,
                 ..
             })) => {
-                // 容器不存在 - 缓存 None 值以避免重复查询
-                debug!("📭 [REALTIME] 容器不存在，缓存 404 响应: identifier={}", identifier);
-                self.api_cache.insert_status(identifier.to_string(), None).await;
+                // 🔧 修复：不再缓存 404 响应
+                // 原因：容器可能刚被创建，缓存 404 会导致 SSE 连接时序问题
+                // 容器状态变化快，404 缓存收益小但风险大
+                debug!("📭 [REALTIME] 容器不存在（不缓存 404）: identifier={}", identifier);
                 None
             }
             Err(DockerError::Timeout(_)) => {
