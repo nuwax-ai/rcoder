@@ -83,9 +83,9 @@ ARG CACHEBUST=1
 # 使用 CACHEBUST 变量触发缓存失效
 RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest --registry=https://registry.npmjs.org/
 
-# 配置 nuwaxcode - 禁用 websearch 和 webfetch 权限
+# 配置 nuwaxcode - 禁用 websearch, webfetch 和 question 权限
 RUN mkdir -p /root/.config/opencode && \
-    echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
+    echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny",\n    "question": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
 
 # 暴露端口
 EXPOSE 8086
