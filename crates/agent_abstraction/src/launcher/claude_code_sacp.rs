@@ -546,8 +546,9 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
         notifier,
     } = params;
 
-    // 克隆 project_id 供通知回调使用
-    let project_id_for_notification = project_id.clone();
+    // 克隆变量供 handlers 使用
+    let notifier_for_handlers = notifier.clone();
+    let project_id_for_handlers = project_id.clone();
     // 克隆 notifier 和 project_id 供 prompt 结束通知使用
     let notifier_for_prompt_end = notifier.clone();
     let project_id_for_prompt_end = project_id.clone();
@@ -555,17 +556,69 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
     // 使用 SACP Builder 模式
     ClientToAgent::builder()
         .name("rcoder-agent-runner-sacp")
-        // 处理 SessionNotification
-        .on_receive_notification(
-            move |notification: SessionNotification, _cx: JrConnectionCx<ClientToAgent>| {
-                let notifier = notifier.clone();
-                let project_id = project_id_for_notification.clone();
-                async move {
-                    handle_session_notification(notification, notifier, project_id).await;
-                    Ok(())
+        // 使用容错的消息处理器（处理未类型化消息，手动解析以捕获错误）
+        // 注意：必须在类型化 handlers 之前注册，以便作为 fallback
+        .on_receive_message(
+            {
+                async move |msg: sacp::MessageCx<sacp::UntypedMessage, sacp::UntypedMessage>,
+                            _cx: JrConnectionCx<ClientToAgent>| {
+                    match msg {
+                        sacp::MessageCx::Notification(untyped_notif) => {
+                            // 提前克隆需要的字段
+                            let method = untyped_notif.method.clone();
+                            let params = untyped_notif.params.clone();
+
+                            // 尝试解析为 SessionNotification
+                            let parse_result = sacp::MessageCx::Notification(untyped_notif)
+                                .into_notification::<SessionNotification>();
+
+                            match parse_result {
+                                Ok(Ok(notification)) => {
+                                    let notifier = notifier_for_handlers.clone();
+                                    let project_id = project_id_for_handlers.clone();
+                                    // 解析成功，处理通知
+                                    handle_session_notification(notification, notifier, project_id).await;
+                                    Ok(sacp::Handled::Yes)
+                                }
+                                Ok(Err(_)) => {
+                                    // 方法名不匹配，不是 session/update 通知，跳过
+                                    debug!(
+                                        method = %method,
+                                        "[SACP] 跳过非 session/update 通知"
+                                    );
+                                    // 继续传递给其他 handlers
+                                    Ok(sacp::Handled::No {
+                                        message: sacp::MessageCx::Notification(sacp::UntypedMessage {
+                                            method,
+                                            params,
+                                        }),
+                                        retry: false,
+                                    })
+                                }
+                                Err(ref err) => {
+                                    // 解析失败（如缺少 data 字段），记录警告但不断开连接
+                                    warn!(
+                                        ?err,
+                                        method = %method,
+                                        params = ?params,
+                                        "[SACP] SessionNotification 解析失败，跳过此消息但保持连接"
+                                    );
+                                    // 跳过此消息但不断开连接
+                                    Ok(sacp::Handled::Yes)
+                                }
+                            }
+                        }
+                        sacp::MessageCx::Request(request, request_cx) => {
+                            // 请求消息继续传递给 RequestPermission handler
+                            Ok(sacp::Handled::No {
+                                message: sacp::MessageCx::Request(request, request_cx),
+                                retry: false,
+                            })
+                        }
+                    }
                 }
             },
-            sacp::on_receive_notification!(),
+            sacp::on_receive_message!(),
         )
         // 处理 RequestPermission
         .on_receive_request(
