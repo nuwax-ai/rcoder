@@ -528,8 +528,8 @@ async fn forward_computer_request_to_container(
     container_ip_cache: &Arc<crate::grpc::ContainerIpCache>,
 ) -> HttpResult<ChatResponse> {
     info!(
-        "📤 [COMPUTER_FORWARD] 转发请求到容器 (gRPC): user_id={}, project_id={}, container_id={}",
-        request.user_id, project_id, container_info.container_id
+        "📤 [COMPUTER_FORWARD] 转发请求到容器 (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}",
+        request.user_id, project_id, request.session_id, container_info.container_id
     );
 
     // 直接使用 gRPC 的健康检查机制，不额外检查容器状态
