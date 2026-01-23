@@ -31,7 +31,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::model::AgentStatus;
 use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
-use crate::service::{AGENT_REGISTRY, SESSION_CACHE, PendingGuard};
+use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
 use shared_types::ChatPromptBuilder;
 
@@ -265,10 +265,7 @@ impl AgentService for AgentServiceImpl {
         // 3. 检查 Active 和 Pending 状态
         let agent_info_ref = if let Some(ref sid) = session_id {
             // 优先通过 session_id 查找
-            info!(
-                "🔍 [gRPC] 通过 session_id 查找 Agent: session_id={}",
-                sid
-            );
+            info!("🔍 [gRPC] 通过 session_id 查找 Agent: session_id={}", sid);
             AGENT_REGISTRY.get_agent_info_by_session(sid)
         } else {
             // 通过 project_id 查找
@@ -284,26 +281,27 @@ impl AgentService for AgentServiceImpl {
         });
 
         if let Some(agent_info) = agent_info_ref
-            && (agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending)
-            {
-                // 🎯 Use business response to return error code instead of gRPC Status error
-                // This allows rcoder to directly read error code from error_code field
-                info!(
-                    "🚫 [gRPC] Agent Busy returning 9010 error: project_id={}, status={:?}, session_id={:?}",
-                    project_id, agent_info.status, session_id
-                );
-                return Ok(Response::new(GrpcChatResponse {
-                    project_id: project_id.clone(),
-                    session_id: session_id.unwrap_or_default(),
-                    success: false,
-                    error: Some("Agent 正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
-                    error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
-                    request_id: req.request_id.clone(),
-                    // 🆕 Agent Busy does not need degradation
-                    need_fallback: false,
-                    fallback_reason: None,
-                }));
-            }
+            && (agent_info.status == AgentStatus::Active
+                || agent_info.status == AgentStatus::Pending)
+        {
+            // 🎯 Use business response to return error code instead of gRPC Status error
+            // This allows rcoder to directly read error code from error_code field
+            info!(
+                "🚫 [gRPC] Agent Busy returning 9010 error: project_id={}, status={:?}, session_id={:?}",
+                project_id, agent_info.status, session_id
+            );
+            return Ok(Response::new(GrpcChatResponse {
+                project_id: project_id.clone(),
+                session_id: session_id.unwrap_or_default(),
+                success: false,
+                error: Some("Agent 正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
+                error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
+                request_id: req.request_id.clone(),
+                // 🆕 Agent Busy does not need degradation
+                need_fallback: false,
+                fallback_reason: None,
+            }));
+        }
 
         // 🔥 P0 修复: 使用 PendingGuard RAII 模式管理 Pending 状态
         // 自动在作用域结束时清理，避免状态泄漏
@@ -320,7 +318,10 @@ impl AgentService for AgentServiceImpl {
             let session_exists = AGENT_REGISTRY.contains_session(sid);
 
             if !session_exists && SESSION_CACHE.remove(sid).is_some() {
-                info!("🗑️ [gRPC] session 不存在，移除无效 session: session_id={}", sid);
+                info!(
+                    "🗑️ [gRPC] session 不存在，移除无效 session: session_id={}",
+                    sid
+                );
             } else if session_exists {
                 info!("♻️ [gRPC] 复用已存在的 session: session_id={}", sid);
             }
@@ -476,12 +477,7 @@ impl AgentService for AgentServiceImpl {
         }
 
         // 🆕 Use runtime to send (with state check)
-        if let Err(e) = self
-            .app_state
-            .agent_runtime
-            .send(local_task_request)
-            .await
-        {
+        if let Err(e) = self.app_state.agent_runtime.send(local_task_request).await {
             // 🔥 PendingGuard 自动清理（在 drop 时）
             return Err(Status::internal(format!("Failed to send task: {}", e)));
         }
@@ -515,7 +511,10 @@ impl AgentService for AgentServiceImpl {
             Err(e) => {
                 error!("❌ [gRPC] Chat failed: {}", e);
                 // 🔥 PendingGuard 自动清理（在 drop 时）
-                return Err(Status::internal(format!("Failed to process request: {}", e)));
+                return Err(Status::internal(format!(
+                    "Failed to process request: {}",
+                    e
+                )));
             }
         };
 
@@ -777,6 +776,9 @@ impl AgentService for AgentServiceImpl {
             (status, cancel_tx)
         };
 
+        // 🆕 Variable to store success message if cancellation is successful (idempotent or executed)
+        let mut cancel_success_message: Option<String> = None;
+
         // 🆕 ===== Idempotency check and channel validity verification =====
         match status {
             AgentStatus::Idle => {
@@ -785,11 +787,7 @@ impl AgentService for AgentServiceImpl {
                     "✅ [gRPC] Agent already in Idle status, cancel request idempotent success: project_id={}, session_id={}",
                     project_id, actual_session_id
                 );
-                return Ok(Response::new(CancelResponse {
-                    success: true,
-                    result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("Agent already in idle status".to_string()),
-                }));
+                cancel_success_message = Some("Agent already in idle status".to_string());
             }
             AgentStatus::Terminating => {
                 // Already stopping, no need to cancel again (idempotent return)
@@ -797,11 +795,7 @@ impl AgentService for AgentServiceImpl {
                     "✅ [gRPC] Agent already stopping, cancel request idempotent success: project_id={}, session_id={}",
                     project_id, actual_session_id
                 );
-                return Ok(Response::new(CancelResponse {
-                    success: true,
-                    result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("Agent is already stopping".to_string()),
-                }));
+                cancel_success_message = Some("Agent is already stopping".to_string());
             }
             AgentStatus::Active | AgentStatus::Pending => {
                 // Normal flow: continue with cancellation
@@ -869,84 +863,14 @@ impl AgentService for AgentServiceImpl {
                 );
 
                 if is_success {
-                    // 🆕 Proactively send SessionPromptEnd message to notify SSE client task was canceled
-                    use crate::service::push_session_update_with_project;
-                    use sacp::schema::StopReason;
-                    use shared_types::{SessionNotify, SessionPromptEnd};
-
-                    let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
-                        session_id: actual_session_id.clone(),
-                        stop_reason: StopReason::Cancelled,
-                        error_message: None,
-                        request_id: None,
-                    });
-
-                    if let Err(e) =
-                        push_session_update_with_project(&project_id, &actual_session_id, notify)
-                            .await
-                    {
-                        warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
-                    } else {
-                        info!(
-                            "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
-                            actual_session_id
-                        );
-                    }
-
-                    // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
-                    // 避免：持有 SESSION_CACHE 读锁时调用 .await 导致死锁
-                    if let Some(session_data_ref) = SESSION_CACHE.get(&actual_session_id) {
-                        let session_data = session_data_ref.clone();
-                        drop(session_data_ref); // 显式释放读锁
-                        session_data.close_current_connection().await; // ✅ 安全：已无读锁
-                    }
-                    if SESSION_CACHE.remove(&actual_session_id).is_some() {
-                        info!(
-                            "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
-                            actual_session_id
-                        );
-                    }
-
-                    // 🔥 关键修复：清理 AGENT_REGISTRY，将状态更新为 Idle
-                    // 使用原子性操作避免竞态条件
-                    use chrono::Utc;
-                    use shared_types::AgentStatus;
-
-                    let updated = AGENT_REGISTRY.try_update_agent_info(&project_id, |info| {
-                        // 只在 Active/Pending 状态时更新
-                        if matches!(info.status, AgentStatus::Active | AgentStatus::Pending) {
-                            info.status = AgentStatus::Idle;
-                            info.last_activity = Utc::now();
-                            true
-                        } else {
-                            false
-                        }
-                    });
-
-                    if updated {
-                        info!(
-                            "✅ [gRPC] Agent 状态已原子性更新为 Idle: project_id={}, session_id={}",
-                            project_id, actual_session_id
-                        );
-                    } else {
-                        debug!(
-                            "🔍 [gRPC] Agent 状态无需更新（可能已是 Idle 或其他状态）: project_id={}, session_id={}",
-                            project_id, actual_session_id
-                        );
-                    }
-
-                    Ok(Response::new(CancelResponse {
-                        success: true,
-                        result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some("取消成功".to_string()),
-                    }))
+                    cancel_success_message = Some("取消成功".to_string());
                 } else {
                     // 取消失败，Agent 可能还在运行，不发送 SessionPromptEnd
-                    Ok(Response::new(CancelResponse {
+                    return Ok(Response::new(CancelResponse {
                         success: false,
                         result: CancelResultType::CancelResultFailed as i32,
                         message: Some("Agent 取消执行失败".to_string()),
-                    }))
+                    }));
                 }
             }
             Ok(Err(e)) => {
@@ -974,18 +898,17 @@ impl AgentService for AgentServiceImpl {
                 }
 
                 // 清理连接
-                // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
                 if let Some(session_data_ref) = SESSION_CACHE.get(&actual_session_id) {
                     let session_data = session_data_ref.clone();
                     drop(session_data_ref); // 显式释放读锁
-                    session_data.close_current_connection().await; // ✅ 安全：已无读锁
+                    session_data.close_current_connection().await;
                 }
 
-                Ok(Response::new(CancelResponse {
+                return Ok(Response::new(CancelResponse {
                     success: false,
                     result: CancelResultType::CancelResultFailed as i32,
                     message: Some(format!("响应通道关闭: {}", e)),
-                }))
+                }));
             }
             Err(_) => {
                 warn!(
@@ -1018,7 +941,6 @@ impl AgentService for AgentServiceImpl {
                 }
 
                 // 2. 清理 SESSION_CACHE
-                // 🔥 关键修复：先 clone 数据，释放读锁，再调用 .await
                 if let Some(session_data_ref) = SESSION_CACHE.get(&actual_session_id) {
                     let session_data = session_data_ref.clone();
                     drop(session_data_ref); // 显式释放读锁
@@ -1032,12 +954,10 @@ impl AgentService for AgentServiceImpl {
                 }
 
                 // 3. 🆕 使用 DashMap entry API 原子性地更新 Agent 状态为 Idle
-                // 避免：读锁释放 → 时间窗口 → 写锁更新 的竞态条件
                 use chrono::Utc;
                 use shared_types::AgentStatus;
 
                 let updated = AGENT_REGISTRY.try_update_agent_info(&project_id, |info| {
-                    // 只在 Active 状态时更新，避免覆盖其他状态
                     if info.status == AgentStatus::Active {
                         info.status = AgentStatus::Idle;
                         info.last_activity = Utc::now();
@@ -1052,19 +972,92 @@ impl AgentService for AgentServiceImpl {
                         "✅ [gRPC] 超时后 Agent 状态已原子性更新为 Idle: project_id={}, session_id={}",
                         project_id, actual_session_id
                     );
-                } else {
-                    debug!(
-                        "🔍 [gRPC] Agent 状态无需更新（非 Active 状态）: project_id={}, session_id={}",
-                        project_id, actual_session_id
-                    );
                 }
 
-                Ok(Response::new(CancelResponse {
+                return Ok(Response::new(CancelResponse {
                     success: false,
                     result: CancelResultType::CancelResultTimeout as i32,
                     message: Some("取消请求超时（30秒）".to_string()),
-                }))
+                }));
             }
+        }; // match tokio::time::timeout
+
+        // 🆕 Unified Success Handler: If cancellation was successful (or idempotent)
+        if let Some(message) = cancel_success_message {
+            // Proactively send SessionPromptEnd message to notify SSE client task was canceled
+            use crate::service::push_session_update_with_project;
+            use sacp::schema::StopReason;
+            use shared_types::{SessionNotify, SessionPromptEnd};
+
+            let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                session_id: actual_session_id.clone(),
+                stop_reason: StopReason::Cancelled,
+                error_message: if message.contains("idle") || message.contains("stopping") {
+                    Some(message.clone())
+                } else {
+                    None // Normal success case
+                },
+                request_id: None,
+            });
+
+            if let Err(e) =
+                push_session_update_with_project(&project_id, &actual_session_id, notify).await
+            {
+                warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+            } else {
+                info!(
+                    "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
+                    actual_session_id
+                );
+            }
+
+            // Clean up connection
+            if let Some(session_data_ref) = SESSION_CACHE.get(&actual_session_id) {
+                let session_data = session_data_ref.clone();
+                drop(session_data_ref);
+                session_data.close_current_connection().await;
+            }
+            if SESSION_CACHE.remove(&actual_session_id).is_some() {
+                info!(
+                    "🗑️ [gRPC] 已清理 SESSION_CACHE: session_id={}",
+                    actual_session_id
+                );
+            }
+
+            // Update status to Idle (if coming from Active/Pending)
+            use chrono::Utc;
+            use shared_types::AgentStatus;
+
+            let updated = AGENT_REGISTRY.try_update_agent_info(&project_id, |info| {
+                if matches!(info.status, AgentStatus::Active | AgentStatus::Pending) {
+                    info.status = AgentStatus::Idle;
+                    info.last_activity = Utc::now();
+                    true
+                } else {
+                    false
+                }
+            });
+
+            if updated {
+                info!(
+                    "✅ [gRPC] Agent 状态已原子性更新为 Idle: project_id={}",
+                    project_id
+                );
+            }
+
+            return Ok(Response::new(CancelResponse {
+                success: true,
+                result: CancelResultType::CancelResultSuccess as i32,
+                message: Some(message),
+            }));
+        } else {
+            // This branch should ideally be covered by early returns in error cases above
+            warn!("⚠️ [gRPC] Cancel flow reached end without success message or early return");
+            return Ok(Response::new(CancelResponse {
+                success: false,
+                result: CancelResultType::CancelResultFailed as i32,
+                message: Some("Unknown cancellation state".to_string()),
+            }));
         }
     }
 
