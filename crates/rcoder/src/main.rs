@@ -39,18 +39,32 @@ use docker_manager::container_stop;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
-    let telemetry_config = TelemetryConfig::from_env("rcoder").with_file_log("rcoder"); // 启用文件日志，前缀为 rcoder
-    let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
-    let telemetry = Arc::new(telemetry);
+    // ✅ 初始化 Rustls CryptoProvider（必须在最前面，在任何可能使用 TLS 的代码之前）
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
 
-    info!("Starting rcoder - AI-powered development platform");
-
-    // 解析命令行参数
+    // 解析命令行参数（移到最前面，以便尽早加载配置）
     let cli_args = CliArgs::parse();
 
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args)?;
+
+    // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
+    // 使用配置文件中的日志保留天数，与容器日志清理保持一致
+    let file_log_config = rcoder_telemetry::FileLogConfig::new("logs", "rcoder")
+        .with_max_files(config.cleanup_config.log_cleanup.log_retention_days as usize);
+
+    let telemetry_config =
+        TelemetryConfig::from_env("rcoder").with_file_log_config(file_log_config);
+    let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
+    let telemetry = Arc::new(telemetry);
+
+    info!("Starting rcoder - AI-powered development platform");
+    info!(
+        "📋 日志配置: 保留 {} 天的日志文件",
+        config.cleanup_config.log_cleanup.log_retention_days
+    );
 
     // 创建项目工作目录
     tokio::fs::create_dir_all(&config.projects_dir).await?;
@@ -130,6 +144,26 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
+        // 🔧 应用超时配置
+        if let Some(timeout) = docker_config.api_timeout_seconds {
+            default_config.api_timeout_seconds = timeout;
+            info!("✅ 使用配置的 API 超时: {}秒", timeout);
+        }
+        if let Some(timeout) = docker_config.api_timeout_quick_seconds {
+            default_config.api_timeout_quick_seconds = timeout;
+            info!("✅ 使用配置的快速操作超时: {}秒", timeout);
+        }
+
+        // 🔧 应用缓存 TTL 配置
+        if let Some(ttl) = docker_config.cache_status_ttl_seconds {
+            default_config.cache_status_ttl_seconds = ttl;
+            info!("✅ 使用配置的状态缓存 TTL: {}秒", ttl);
+        }
+        if let Some(ttl) = docker_config.cache_network_ttl_seconds {
+            default_config.cache_network_ttl_seconds = ttl;
+            info!("✅ 使用配置的网络缓存 TTL: {}秒", ttl);
+        }
+
         default_config
     } else {
         info!("⚠️  应用中无 Docker 配置，使用默认配置");
@@ -204,13 +238,19 @@ async fn main() -> anyhow::Result<()> {
             config.cleanup_config.container_protection_seconds,
         ),
         active_window: Duration::from_secs(5 * 60),
+        log_dir: config.cleanup_config.log_cleanup.log_dir.clone(),
+        log_retention_duration: Duration::from_secs(
+            config.cleanup_config.log_cleanup.log_retention_days * 24 * 60 * 60,
+        ),
     };
     info!(
-        "🧹 清理配置: 闲置超时={}秒, 清理间隔={}秒, Docker停止超时={}秒, 容器保护时间={}秒",
+        "🧹 清理配置: 闲置超时={}秒, 清理间隔={}秒, Docker停止超时={}秒, 容器保护时间={}秒, 日志目录={}, 日志保留={}天",
         config.cleanup_config.idle_timeout_seconds,
         config.cleanup_config.cleanup_interval_seconds,
         config.cleanup_config.docker_stop_timeout_seconds,
-        config.cleanup_config.container_protection_seconds
+        config.cleanup_config.container_protection_seconds,
+        config.cleanup_config.log_cleanup.log_dir,
+        config.cleanup_config.log_cleanup.log_retention_days
     );
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可

@@ -2,16 +2,9 @@
 
 pub use shared_types::{
     // Agent model exports
-    AgentStatus, AgentStatusResponse, ProjectAndAgentInfo,
-    // 取消相关类型（新类型优先）
+    AgentStatus, ProjectAndAgentInfo,
+    // 取消相关类型
     CancelNotificationRequestWrapper, CancelResult,
-    // 旧类型保留兼容性（deprecated）
-    CancelNotificationRequest,
-    CancelNotificationResponse,
     // Session and message exports
-    Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment,
-    ImageDimensions, SessionMessageType, UnifiedSessionMessage, SessionPromptStart, SessionPromptEnd,
-    SessionPromptError, AgentSessionUpdate, SessionNotify, ChatPrompt, ChatPromptResponse,
-    // Error and HTTP exports
-    AppError, HttpResult,
+    Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment, SessionMessageType, UnifiedSessionMessage, SessionNotify, ChatPromptResponse,
 };

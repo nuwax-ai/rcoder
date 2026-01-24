@@ -178,9 +178,9 @@ impl ContainerConfigBuilder {
         debug!("构建容器配置，项目ID: {}", self.project_id);
 
         // 使用默认值或提供的值
-        let image = self.image.unwrap_or_else(|| crate::default_docker_image());
+        let image = self.image.unwrap_or_else(crate::default_docker_image);
         let name_prefix = self.name_prefix.unwrap_or_else(|| "rcoder-agent".to_string());
-        let host_path = self.host_path.unwrap_or_else(String::new);
+        let host_path = self.host_path.unwrap_or_default();
         let container_path = self.container_path.unwrap_or_else(|| crate::DEFAULT_WORK_DIR.to_string());
         let work_dir = self.work_dir.unwrap_or_else(|| crate::DEFAULT_WORK_DIR.to_string());
         let network_mode = self.network_mode.unwrap_or_else(|| crate::DEFAULT_NETWORK_MODE.to_string());
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn test_builder_with_resource_limits() {
         let limits = ResourceLimits {
-            memory_limit: Some(512 * 1024 * 1024), // 512MB
+            memory_limit: Some((512 * 1024 * 1024) as f64), // 512MB
             cpu_limit: Some(1.0),
             swap_limit: None,
         };
@@ -291,7 +291,7 @@ mod tests {
 
         assert!(config.resource_limits.is_some());
         let resource_limits = config.resource_limits.unwrap();
-        assert_eq!(resource_limits.memory_limit, Some(512 * 1024 * 1024));
+        assert_eq!(resource_limits.memory_limit, Some((512 * 1024 * 1024) as f64));
         assert_eq!(resource_limits.cpu_limit, Some(1.0));
     }
 }

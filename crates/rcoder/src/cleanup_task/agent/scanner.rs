@@ -6,7 +6,7 @@ use crate::AgentStatus;
 use anyhow::Result;
 use chrono::Utc;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Agent 扫描器
 pub struct AgentScanner {
@@ -66,8 +66,10 @@ impl AgentScanner {
                 debug!("✅ [scanner] 状态=Idle: {}", agent.project_id());
             }
             Some(AgentStatus::Pending) | Some(AgentStatus::Active) => {
-                debug!("⏸️ [scanner] 跳过活跃状态: {:?}", status);
-                return false;
+                // 🔧 修复：即使是 Active/Pending 状态，也要检查是否真的活跃
+                // 如果状态卡住（比如 gRPC 服务异常），仍需要清理
+                debug!("⏸️ [scanner] 状态={:?}，需要进一步检查", status);
+                // 继续检查，不要直接返回 false
             }
             None => {
                 // 状态为 None，检查保护期
@@ -78,7 +80,24 @@ impl AgentScanner {
                 }
             }
             Some(AgentStatus::Terminating) => {
-                return false;
+                // 🔧 修复：Terminating 状态不应该持续很久（最多 30 秒）
+                // 如果长时间停留在 Terminating，说明操作卡住了，应该清理
+                let terminating_duration = current_time - agent.last_activity();
+                let terminating_stuck_secs = terminating_duration.num_seconds();
+                let max_terminating_secs = 30; // docker_stop_timeout 默认 30 秒
+
+                if terminating_stuck_secs > max_terminating_secs {
+                    warn!(
+                        "⚠️ [scanner] Terminating 状态卡住超过 {} 秒，强制清理: project_id={}, 卡住时长={}秒",
+                        max_terminating_secs,
+                        agent.project_id(),
+                        terminating_stuck_secs
+                    );
+                    // 继续检查，不要返回 false
+                } else {
+                    debug!("⏸️ [scanner] 状态=Terminating，等待中...");
+                    return false;
+                }
             }
         }
 
@@ -88,6 +107,11 @@ impl AgentScanner {
             > chrono::Duration::from_std(self.config.idle_timeout).unwrap_or_default();
 
         if !is_timeout {
+            // 未超时，但如果状态是 Active/Pending，仍需要通过 gRPC 确认
+            if matches!(status, Some(AgentStatus::Active) | Some(AgentStatus::Pending)) {
+                debug!("⏸️ [scanner] 未超时但状态活跃，跳过: {:?}", status);
+                return false;
+            }
             return false;
         }
 

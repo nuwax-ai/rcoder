@@ -99,6 +99,34 @@ pub struct ProxyConfig {
     pub health_check: HealthCheckConfig,
 }
 
+/// 日志清理配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogCleanupConfig {
+    /// 日志目录路径
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
+    /// 日志保留天数，默认10天
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u64,
+}
+
+fn default_log_dir() -> String {
+    "/app/logs/container".to_string()
+}
+
+fn default_log_retention_days() -> u64 {
+    10
+}
+
+impl Default for LogCleanupConfig {
+    fn default() -> Self {
+        Self {
+            log_dir: default_log_dir(),
+            log_retention_days: default_log_retention_days(),
+        }
+    }
+}
+
 /// 容器清理配置（配置文件格式，使用秒作为单位）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupConfigSettings {
@@ -114,6 +142,9 @@ pub struct CleanupConfigSettings {
     /// 容器最小保护时间（秒），默认300秒（5分钟）
     #[serde(default = "default_container_protection_seconds")]
     pub container_protection_seconds: u64,
+    /// 日志清理配置
+    #[serde(default)]
+    pub log_cleanup: LogCleanupConfig,
 }
 
 fn default_idle_timeout_seconds() -> u64 {
@@ -139,6 +170,7 @@ impl Default for CleanupConfigSettings {
             cleanup_interval_seconds: default_cleanup_interval_seconds(),
             docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),
             container_protection_seconds: default_container_protection_seconds(),
+            log_cleanup: LogCleanupConfig::default(),
         }
     }
 }
@@ -161,6 +193,14 @@ pub struct DockerConfig {
     /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
     /// 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
     pub network_base_name: Option<String>,
+    /// 🔧 Docker API 调用超时时间（秒）
+    pub api_timeout_seconds: Option<u64>,
+    /// 🔧 快速操作超时时间（秒）
+    pub api_timeout_quick_seconds: Option<u64>,
+    /// 🔧 状态缓存 TTL（秒）
+    pub cache_status_ttl_seconds: Option<u64>,
+    /// 🔧 网络缓存 TTL（秒）
+    pub cache_network_ttl_seconds: Option<u64>,
 }
 
 pub const CONFIG_FILE: &str = "config.yml";
@@ -215,6 +255,11 @@ impl Default for DockerConfig {
             auto_cleanup: Some(true),
             container_ttl_seconds: Some(3600),
             network_base_name: Some("agent-network".to_string()),
+            // 🔧 新增字段默认值
+            api_timeout_seconds: Some(10),
+            api_timeout_quick_seconds: Some(5),
+            cache_status_ttl_seconds: Some(10),
+            cache_network_ttl_seconds: Some(15),
         }
     }
 }
@@ -324,18 +369,82 @@ impl DockerConfig {
             }
         }
 
+        // 🔧 应用 API 超时配置
+        if let Ok(val) = std::env::var("RCODER_API_TIMEOUT_SECONDS") {
+            info!("应用环境变量 RCODER_API_TIMEOUT_SECONDS");
+            match val.parse() {
+                Ok(seconds) => self.api_timeout_seconds = Some(seconds),
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ [CONFIG] 无法解析 RCODER_API_TIMEOUT_SECONDS '{}': {}, 使用默认值",
+                        val,
+                        e
+                    );
+                }
+            }
+        }
+
+        // 🔧 应用快速操作超时配置
+        if let Ok(val) = std::env::var("RCODER_API_TIMEOUT_QUICK_SECONDS") {
+            info!("应用环境变量 RCODER_API_TIMEOUT_QUICK_SECONDS");
+            match val.parse() {
+                Ok(seconds) => self.api_timeout_quick_seconds = Some(seconds),
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ [CONFIG] 无法解析 RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, 使用默认值",
+                        val,
+                        e
+                    );
+                }
+            }
+        }
+
+        // 🔧 应用状态缓存 TTL 配置
+        if let Ok(val) = std::env::var("RCODER_CACHE_STATUS_TTL_SECONDS") {
+            info!("应用环境变量 RCODER_CACHE_STATUS_TTL_SECONDS");
+            match val.parse() {
+                Ok(seconds) => self.cache_status_ttl_seconds = Some(seconds),
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ [CONFIG] 无法解析 RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, 使用默认值",
+                        val,
+                        e
+                    );
+                }
+            }
+        }
+
+        // 🔧 应用网络缓存 TTL 配置
+        if let Ok(val) = std::env::var("RCODER_CACHE_NETWORK_TTL_SECONDS") {
+            info!("应用环境变量 RCODER_CACHE_NETWORK_TTL_SECONDS");
+            match val.parse() {
+                Ok(seconds) => self.cache_network_ttl_seconds = Some(seconds),
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ [CONFIG] 无法解析 RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, 使用默认值",
+                        val,
+                        e
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// 获取配置摘要信息
     pub fn get_summary(&self) -> String {
         format!(
-            "Docker配置: 网络模式={}, 网络基础名称={}, 工作目录={}, 自动清理={}, 容器TTL={}",
+            "Docker配置: 网络模式={}, 网络基础名称={}, 工作目录={}, 自动清理={}, 容器TTL={}, API超时={}秒, 快速超时={}秒, 状态缓存={}秒, 网络缓存={}秒",
             self.network_mode.as_deref().unwrap_or("默认"),
             self.network_base_name.as_deref().unwrap_or("agent-network"),
             self.work_dir.as_deref().unwrap_or("/app"),
             self.auto_cleanup.unwrap_or(true),
-            self.container_ttl_seconds.unwrap_or(3600)
+            self.container_ttl_seconds.unwrap_or(3600),
+            self.api_timeout_seconds.unwrap_or(10),
+            self.api_timeout_quick_seconds.unwrap_or(5),
+            self.cache_status_ttl_seconds.unwrap_or(10),
+            self.cache_network_ttl_seconds.unwrap_or(15)
         )
     }
 }

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Docker 容器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,12 +52,12 @@ pub struct MountPoint {
 /// 资源限制配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceLimits {
-    /// 内存限制 (字节)
-    pub memory_limit: Option<i64>,
+    /// 内存限制 (字节，支持浮点数)
+    pub memory_limit: Option<f64>,
     /// CPU 限制
     pub cpu_limit: Option<f64>,
-    /// 交换空间限制 (字节)
-    pub swap_limit: Option<i64>,
+    /// 交换空间限制 (字节，支持浮点数)
+    pub swap_limit: Option<f64>,
 }
 
 impl DockerContainerConfig {
@@ -109,6 +110,64 @@ impl Default for DockerContainerConfig {
     fn default() -> Self {
         // 默认使用 RCoder 服务
         Self::new_for_service(shared_types::ServiceType::RCoder)
+    }
+}
+
+/// 容器实时查询结果
+///
+/// 用于 `find_project_container` 和 `find_user_container` 的返回值，
+/// 提供容器的基本实时信息。
+#[derive(Debug, Clone)]
+pub struct ContainerQueryResult {
+    /// 容器 ID
+    pub container_id: String,
+    /// 容器名称
+    pub container_name: String,
+    /// 容器状态
+    pub status: ContainerStatus,
+    /// 是否正在运行
+    pub is_running: bool,
+}
+
+/// 容器实时查询结果的 Arc 包装（用于缓存）
+pub type ContainerQueryResultArc = Arc<ContainerQueryResult>;
+
+impl ContainerQueryResult {
+    /// 创建新的查询结果
+    pub fn new(
+        container_id: String,
+        container_name: String,
+        status: ContainerStatus,
+        is_running: bool,
+    ) -> Self {
+        Self {
+            container_id,
+            container_name,
+            status,
+            is_running,
+        }
+    }
+
+    /// 从元组创建（用于兼容旧代码）
+    pub fn from_tuple(
+        tuple: (String, String, ContainerStatus, bool),
+    ) -> Self {
+        Self {
+            container_id: tuple.0,
+            container_name: tuple.1,
+            status: tuple.2,
+            is_running: tuple.3,
+        }
+    }
+
+    /// 转换为元组（用于兼容旧代码）
+    pub fn to_tuple(&self) -> (String, String, ContainerStatus, bool) {
+        (
+            self.container_id.clone(),
+            self.container_name.clone(),
+            self.status.clone(),
+            self.is_running,
+        )
     }
 }
 
@@ -272,6 +331,46 @@ pub struct DockerManagerConfig {
     /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
     /// 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
     pub network_base_name: String,
+
+    /// 🔧 Docker API 调用超时时间（秒）
+    /// 用于大多数 Docker API 调用的超时保护
+    #[serde(default = "default_api_timeout")]
+    pub api_timeout_seconds: u64,
+
+    /// 🔧 快速操作超时时间（秒）
+    /// 用于状态查询等轻量级操作的超时保护
+    #[serde(default = "default_api_timeout_quick")]
+    pub api_timeout_quick_seconds: u64,
+
+    /// 🔧 状态缓存 TTL（秒）
+    /// 用于缓存容器状态信息（container_id, container_name, status, is_running）
+    #[serde(default = "default_cache_status_ttl")]
+    pub cache_status_ttl_seconds: u64,
+
+    /// 🔧 网络缓存 TTL（秒）
+    /// 用于缓存容器网络信息（network_name -> ip_address）
+    #[serde(default = "default_cache_network_ttl")]
+    pub cache_network_ttl_seconds: u64,
+}
+
+/// 默认 API 超时时间（10秒）
+fn default_api_timeout() -> u64 {
+    10
+}
+
+/// 默认快速操作超时时间（5秒）
+fn default_api_timeout_quick() -> u64 {
+    5
+}
+
+/// 默认状态缓存 TTL（10秒）
+fn default_cache_status_ttl() -> u64 {
+    10
+}
+
+/// 默认网络缓存 TTL（15秒）
+fn default_cache_network_ttl() -> u64 {
+    15
 }
 
 /// Docker 配置（从 rcoder 配置传递）
@@ -308,6 +407,12 @@ impl Default for DockerManagerConfig {
 
             multi_image_config: shared_types::create_default_multi_image_config(), // 默认多镜像配置
             network_base_name: crate::RCODER_NETWORK_BASE_NAME.to_string(), // 默认网络基础名称
+
+            api_timeout_seconds: default_api_timeout(), // 默认 10 秒
+            api_timeout_quick_seconds: default_api_timeout_quick(), // 默认 5 秒
+
+            cache_status_ttl_seconds: default_cache_status_ttl(), // 默认 10 秒
+            cache_network_ttl_seconds: default_cache_network_ttl(), // 默认 15 秒
         }
     }
 }

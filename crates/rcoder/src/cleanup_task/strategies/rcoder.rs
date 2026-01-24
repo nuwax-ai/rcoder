@@ -40,8 +40,4 @@ impl CleanupStrategy for RCoderStrategy {
         // RCoder: 容器标识符就是 project_id
         Ok(project_info.project_id.clone())
     }
-
-    fn name(&self) -> &str {
-        "RCoder"
-    }
 }

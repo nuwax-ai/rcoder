@@ -140,15 +140,6 @@ impl AgentCleaner {
             if let Some((_, _)) = SESSION_CACHE.remove(&session_id) {
                 debug!("移除空session: {}", session_id);
             }
-
-            // 🆕 同时清理 SESSION_FIRST_PROMPT_SUCCESS 中的记录
-            // 避免内存泄漏
-            if crate::grpc::agent_service_impl::SESSION_FIRST_PROMPT_SUCCESS
-                .remove(&session_id)
-                .is_some()
-            {
-                debug!("清理 SESSION_FIRST_PROMPT_SUCCESS: {}", session_id);
-            }
         }
 
         if orphaned_count > 0 {
@@ -177,6 +168,29 @@ impl AgentCleaner {
             "开始清理闲置agent和SSE消息，当前时间: {}，当前活动agent数量: {}",
             current_time, total_agents
         );
+
+        // 🔥 新增：槽位健康检查（防御性措施）
+        // 检测并修复槽位计数器泄漏，防止因边缘情况导致的槽位耗尽
+        let expected_count = registry_stats.agent_count;
+        let actual_count = AGENT_REGISTRY.active_sessions_count();
+
+        if actual_count > expected_count {
+            let leaked_slots = actual_count.saturating_sub(expected_count);
+            warn!(
+                "🔍 [CLEANUP] 检测到槽位泄漏: 计数器={}, 实际={}, 泄漏={}",
+                actual_count, expected_count, leaked_slots
+            );
+
+            // 修复计数器
+            for _ in 0..leaked_slots {
+                AGENT_REGISTRY.release_session_slot();
+            }
+            info!(
+                "✅ [CLEANUP] 已修复槽位计数器: {} → {}",
+                actual_count,
+                actual_count.saturating_sub(leaked_slots)
+            );
+        }
 
         // 先清理孤立的SSE消息数据
         let (orphaned_sessions, sse_messages) = self.cleanup_orphaned_sse_sessions().await;

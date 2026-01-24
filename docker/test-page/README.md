@@ -28,8 +28,8 @@ http://127.0.0.1:8000/vnc-test.html
 
 确保 RCoder 服务正在运行：
 ```bash
-# 检查服务状态
-curl http://127.0.0.1:8088/health
+# 检查服务状态（默认端口 8087）
+curl http://127.0.0.1:8087/health
 ```
 
 如果服务未运行，请先启动 RCoder：
@@ -72,7 +72,7 @@ make dev-up
 ### 连接配置
 
 **RCoder 代理模式**（推荐使用）:
-- **RCoder 服务地址**: 默认 `http://127.0.0.1:8088`
+- **RCoder 服务地址**: 默认 `http://127.0.0.1:8087`
 - **User ID**: 测试用户名，如 `user_123`
 - **Project ID**: 可选，留空则自动生成
 
@@ -110,7 +110,7 @@ make dev-up
 
 解决方法：
 ```bash
-# 查看容器列表
+# 查看容器列表（Computer Agent 容器前缀为 computer-agent-runner-）
 docker ps | grep computer-agent-runner
 
 # 查看服务日志
@@ -187,7 +187,7 @@ docker restart <container_id>
 
 ### 网络要求
 
-- 浏览器能访问 `http://127.0.0.1:8088`
+- 浏览器能访问 `http://127.0.0.1:8087`
 - WebSocket 连接正常（防火墙不阻止）
 - 建议使用有线网络或稳定的 Wi-Fi
 
@@ -220,7 +220,7 @@ docker restart <container_id>
 ## 版本信息
 
 - **测试页面版本**: v1.0
-- **最后更新**: 2026-01-06
+- **最后更新**: 2026-01-17
 - **支持的 RCoder 版本**: v1.0.0+
 
 ## 反馈与建议
@@ -230,3 +230,4 @@ docker restart <container_id>
 ---
 
 **提示**: 首次使用建议按照"使用指南"的步骤逐步操作，熟悉各个功能后再进行综合测试。
+人民大团结

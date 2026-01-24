@@ -1,7 +1,6 @@
 //! OpenTelemetry 追踪模块
 //!
-//! 提供分布式追踪功能，使用 `tracing-opentelemetry` 的 `OpenTelemetrySpanExt`
-//! 实现灵活的动态属性设置。
+//! 集成 `rcoder-telemetry` 提供完整的分布式追踪功能。
 
 use opentelemetry::trace::Status;
 use tracing::{Level, Span, error, info, span};
@@ -12,56 +11,137 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 pub struct TraceConfig {
     /// 是否启用追踪
     pub enabled: bool,
-    /// 采样率 (0.0 - 1.0)
-    pub sample_rate: f64,
-    /// 导出端点（如 Jaeger、OTLP）
+    /// OTLP 导出端点（如 Jaeger、OTLP）
     pub exporter_endpoint: Option<String>,
+    /// 是否启用 Prometheus 指标
+    pub prometheus_enabled: bool,
+    /// 服务名称
+    pub service_name: String,
 }
 
 impl Default for TraceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            sample_rate: 1.0,        // 100% 采样
-            exporter_endpoint: None, // 默认使用 console 导出器
+            exporter_endpoint: None,
+            prometheus_enabled: true,
+            service_name: "agent-runner".to_string(),
         }
     }
 }
 
-/// 初始化 OpenTelemetry 追踪（简化版本）
+/// 初始化 OpenTelemetry 追踪
 ///
-/// 当前使用 tracing 原生 span，后续可扩展为完整的 OpenTelemetry 导出
+/// 集成 `rcoder-telemetry` 提供完整的分布式追踪功能：
+/// - OTLP 导出器（支持 Jaeger、Zipkin、OTLP Collector）
+/// - Prometheus 指标
+/// - Trace context 传播
+/// - Console 日志
 ///
 /// # Arguments
 ///
 /// * `config` - 追踪配置
-pub fn init_tracing(config: TraceConfig) -> anyhow::Result<()> {
+///
+/// # Returns
+///
+/// 返回遥测系统 Guard，需要在应用运行期间保持存活
+///
+/// # Environment Variables
+///
+/// 支持以下环境变量：
+/// - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP 端点（如 http://jaeger:4317）
+/// - `OTEL_TRACES_SAMPLER_ARG`: 采样率 (0.0-1.0，默认 1.0)
+/// - `TELEMETRY_PROMETHEUS_ENABLED`: 是否启用 Prometheus（默认 true）
+pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetry::TelemetryGuard> {
     if !config.enabled {
         info!("📍 [OTel] 追踪已禁用");
-        return Ok(());
+        // 即使追踪禁用，仍然初始化 Prometheus（如果启用）
+        if config.prometheus_enabled {
+            return rcoder_telemetry::init_prometheus_only(&config.service_name);
+        }
+        // 创建一个空的 guard（仅保留服务名称，用于后续渲染指标）
+        // 使用空的 telemetry_config 创建一个没有任何功能的 guard
+        let telemetry_config = rcoder_telemetry::TelemetryConfig::new(&config.service_name);
+        return rcoder_telemetry::init(telemetry_config).await;
     }
 
+    // 使用 from_env 从环境变量读取配置，然后覆盖必要字段
+    let mut telemetry_config = rcoder_telemetry::TelemetryConfig::from_env(&config.service_name);
+
+    // 如果配置中指定了端点，覆盖环境变量中的值
+    if let Some(ref endpoint) = config.exporter_endpoint {
+        telemetry_config = telemetry_config.with_otlp_endpoint(endpoint);
+    }
+
+    // 根据配置设置 Prometheus
+    if config.prometheus_enabled {
+        telemetry_config = telemetry_config.with_prometheus();
+    } else {
+        telemetry_config = telemetry_config.without_prometheus();
+    }
+
+    // 初始化遥测系统
+    let guard = rcoder_telemetry::init(telemetry_config).await?;
+
     info!(
-        "📍 [OTel] 追踪已启用 (采样率: {}%)",
-        config.sample_rate * 100.0
+        "✅ [OTel] 追踪已初始化: OTLP={}, Prometheus={}",
+        guard.is_otlp_enabled(),
+        guard.is_prometheus_enabled()
     );
 
-    // TODO: 后续集成完整的 OpenTelemetry SDK
-    // - 添加 OTLP 导出器
-    // - 集成 Jaeger/Zipkin
-    // - 配置 Span Processor
+    Ok(guard)
+}
 
-    Ok(())
+impl TraceConfig {
+    /// 从环境变量构建配置
+    pub fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("OTEL_TRACING_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
+            exporter_endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+            prometheus_enabled: std::env::var("TELEMETRY_PROMETHEUS_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
+            service_name: "agent-runner".to_string(),
+        }
+    }
+
+    /// 设置 OTLP 端点
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.exporter_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// 禁用 Prometheus
+    pub fn without_prometheus(mut self) -> Self {
+        self.prometheus_enabled = false;
+        self
+    }
+
+    /// 禁用追踪
+    pub fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+
+    /// 设置服务名称
+    pub fn with_service_name(mut self, name: impl Into<String>) -> Self {
+        self.service_name = name.into();
+        self
+    }
 }
 
 /// 请求追踪 Guard（自动管理 span 生命周期）
 ///
 /// 使用 `OpenTelemetrySpanExt` 支持动态属性设置
+///
+/// 注意：此结构体实现 Send + Sync，可在 tokio::spawn 中安全使用
 pub struct RequestSpan {
     /// 底层 tracing span（用于 OpenTelemetrySpanExt 方法）
     span: Span,
-    /// span 的 guard（自动关闭）
-    _guard: Option<span::EnteredSpan>,
 }
 
 impl RequestSpan {
@@ -81,8 +161,6 @@ impl RequestSpan {
             operation = %operation,
         );
 
-        let guard = span.clone().entered();
-
         info!(
             "📍 [OTel] Span 已创建: project_id={}, request_id={}, operation={}",
             project_id, request_id, operation
@@ -90,7 +168,6 @@ impl RequestSpan {
 
         Self {
             span,
-            _guard: Some(guard),
         }
     }
 
@@ -202,20 +279,16 @@ impl RequestSpan {
         self.span.context()
     }
 
-    /// 完成 span（手动关闭，也可等待 Drop 自动关闭）
-    pub fn finish(mut self) {
+    /// 完成 span（手动关闭）
+    pub fn finish(self) {
         self.set_ok();
-        if let Some(guard) = self._guard.take() {
-            drop(guard);
-        }
+        // span 在 drop 时会自动关闭
     }
 }
 
 impl Drop for RequestSpan {
     fn drop(&mut self) {
-        if self._guard.is_some() {
-            info!("📍 [OTel] Span 已自动关闭");
-        }
+        info!("📍 [OTel] Span 已关闭");
     }
 }
 
@@ -250,24 +323,19 @@ pub fn child_span(_parent: &RequestSpan, name: &str, attributes: &[(&str, String
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    let guard = span.clone().entered();
-
     info!("📍 [OTel] 子 Span 已创建: {}", name);
 
     RequestSpan {
         span,
-        _guard: Some(guard),
     }
 }
 
 /// 从上下文中提取当前 span（用于跨线程传递）
 pub fn current_span() -> RequestSpan {
     let span = Span::current();
-    let guard = span.clone().entered();
 
     RequestSpan {
         span,
-        _guard: Some(guard),
     }
 }
 
@@ -299,11 +367,8 @@ pub fn span_with_attributes(name: &str, attributes: &[(&str, String)]) -> Reques
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    let guard = span.clone().entered();
-
     RequestSpan {
         span,
-        _guard: Some(guard),
     }
 }
 
@@ -315,8 +380,8 @@ mod tests {
     fn test_trace_config_default() {
         let config = TraceConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.sample_rate, 1.0);
         assert!(config.exporter_endpoint.is_none());
+        assert!(config.prometheus_enabled);
     }
 
     #[test]
@@ -387,9 +452,10 @@ mod tests {
         span.finish();
     }
 
-    #[test]
-    fn test_init_tracing() {
+    #[tokio::test]
+    async fn test_init_tracing() {
         let config = TraceConfig::default();
-        assert!(init_tracing(config).is_ok());
+        let result = init_tracing(config).await;
+        assert!(result.is_ok());
     }
 }

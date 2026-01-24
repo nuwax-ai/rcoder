@@ -172,9 +172,10 @@ pub async fn handle_computer_chat(
     };
 
     info!(
-        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, prompt_len={}, attachments={}, model_provider={:?}, agent_config={:?}",
+        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, session_id={:?}, prompt_len={}, attachments={}, model_provider={:?}, agent_config={:?}",
         user_id,
         project_id,
+        request.session_id,
         request.prompt.len(),
         request.attachments.len(),
         request.model_provider,
@@ -218,6 +219,25 @@ pub async fn handle_computer_chat(
         "✅ [COMPUTER_CHAT] 容器就绪: user_id={}, container_id={}, ip={}",
         user_id, container_info.container_id, container_info.container_ip
     );
+
+    // 🔍 检测 user_id 变化：同一个 project_id 被不同的 user_id 请求
+    // 这通常意味着负载测试脚本使用了多个不同的 user_id，会导致创建多个容器浪费资源
+    if let Some(existing_info) = state.get_project(&project_id) {
+        if let Some(existing_user_id) = existing_info.user_id() {
+            if existing_user_id != user_id {
+                warn!(
+                    "⚠️ [USER_ID_MISMATCH] 检测到 project_id 对应的 user_id 发生变化: \
+                     project_id={}, 原有 user_id={}, 新 user_id={}, 时间={}, \
+                     原因可能是负载测试脚本使用了多个不同的 user_id，这会导致创建多个容器浪费资源。 \
+                     建议检查测试脚本确保同一 project_id 使用相同的 user_id。",
+                    project_id,
+                    existing_user_id,
+                    user_id,
+                    chrono::Utc::now().to_rfc3339()
+                );
+            }
+        }
+    }
 
     // 🛡️ 关键修复：容器创建成功后立即插入 DuckDB 记录
     // 这样可以防止孤立容器清理器误判并清理刚创建的容器
@@ -304,9 +324,52 @@ pub async fn handle_computer_chat(
         }
     }
 
-    // 7. 转发请求到容器服务（使用 gRPC）
+    // 7. 🆕 自动查找 session_id 逻辑
+    // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
+    let session_id_to_use = match &request.session_id {
+        Some(sid) if !sid.is_empty() => {
+            debug!("🔍 [COMPUTER_CHAT] 使用用户传递的 session_id: {}", sid);
+            sid.clone()
+        }
+        _ => {
+            // 用户没有传递 session_id，尝试查找最新的
+            match state.get_project(&project_id) {
+                Some(project_info) => {
+                    let existing_session_id = project_info.session_id();
+                    match existing_session_id {
+                        Some(sid) if !sid.is_empty() => {
+                            info!(
+                                "🔄 [COMPUTER_CHAT] 未传递 session_id，自动使用最新会话: project_id={}, session_id={}",
+                                project_id, sid
+                            );
+                            sid.to_string()
+                        }
+                        _ => {
+                            debug!("🆕 [COMPUTER_CHAT] 项目存在但无 session_id，创建新会话");
+                            String::new()
+                        }
+                    }
+                }
+                None => {
+                    debug!("🆕 [COMPUTER_CHAT] 未找到现有项目，创建新会话");
+                    String::new()
+                }
+            }
+        }
+    };
+
+    // 克隆 request 并修改 session_id
+    let mut request_for_forward = request.clone();
+    request_for_forward.session_id = if session_id_to_use.is_empty() {
+        None
+    } else {
+        Some(session_id_to_use)
+    };
+    // 🆕 自动查找 session_id 逻辑结束
+
+    // 8. 转发请求到容器服务（使用 gRPC）
     let result = forward_computer_request_to_container(
-        &request,
+        &request_for_forward,  // 使用修改后的 request
         &project_id,
         &container_info,
         &state.grpc_pool,
@@ -465,11 +528,13 @@ async fn forward_computer_request_to_container(
     container_ip_cache: &Arc<crate::grpc::ContainerIpCache>,
 ) -> HttpResult<ChatResponse> {
     info!(
-        "📤 [COMPUTER_FORWARD] 转发请求到容器 (gRPC): user_id={}, project_id={}, container_id={}",
-        request.user_id, project_id, container_info.container_id
+        "📤 [COMPUTER_FORWARD] 转发请求到容器 (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}",
+        request.user_id, project_id, request.session_id, container_info.container_id
     );
 
-    // 从 service_url 提取 gRPC 地址
+    // 直接使用 gRPC 的健康检查机制，不额外检查容器状态
+    // gRPC 连接失败会自动返回错误，由上层处理
+
     // 从 service_url 提取 gRPC 地址
     // 🆕 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期的问题
     let grpc_addr = match get_realtime_container_ip_with_cache(
@@ -712,12 +777,3 @@ fn ensure_project_mapping_in_state(
 // ============================================================================
 // SSE 进度流处理器（复用现有的 agent_session_notification）
 // ============================================================================
-
-/// Computer Agent 进度通知 SSE 处理器
-///
-/// 复用现有的 agent_session_notification 处理器，
-/// 因为 session_id 到容器的映射已经在 handle_computer_chat 中建立。
-///
-/// 客户端可以直接使用 `/agent/progress/{session_id}` 接口，
-/// 或者使用 `/computer/progress/{session_id}` 作为别名。
-pub use super::agent_session_notification::agent_session_notification as computer_session_notification;

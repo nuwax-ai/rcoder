@@ -30,5 +30,7 @@ RUN echo "Code hash: ${CRATES_HASH}"
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# 构建 agent_runner 二进制（在 debian:12 环境中编译，GLIBC 2.36）
-RUN cargo build --release --bin agent_runner
+# 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
+ARG CARGO_FLAGS=""
+RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
+    cargo build --release --bin agent_runner ${CARGO_FLAGS}

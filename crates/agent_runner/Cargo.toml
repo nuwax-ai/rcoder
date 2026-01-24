@@ -19,18 +19,20 @@ test-blocking = []  # 启用测试用阻塞注入 (用于极端场景测试)
 # OpenTelemetry 追踪 feature
 otel = []  # 启用 OpenTelemetry 追踪功能
 
+# Pyroscope 连续性能分析
+pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
 agent_config = { path = "../agent_config" }
 agent_abstraction = { path = "../agent_abstraction" }
-acp-adapter = { path = "../acp_adapter" }
 rcoder-proxy = { path = "../rcoder-proxy" }
 rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
-# ACP Protocol
-agent-client-protocol = { workspace = true }
+# ACP Protocol - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
+sacp = { workspace = true }
 async-trait = "0.1"
 parking_lot = "0.12"
 tempfile = { workspace = true }
@@ -73,6 +75,7 @@ futures-util = { workspace = true }
 piper = "0.2"
 base64 = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 
 # OpenTelemetry
 opentelemetry = { workspace = true }
@@ -92,3 +95,10 @@ ringbuf = { workspace = true }
 
 # Atomic swap for sender replacement
 arc-swap = "1.8"
+
+# Pyroscope Continuous Profiling
+pyroscope = { workspace = true, optional = true }
+pyroscope_pprofrs = { workspace = true, optional = true }
+
+# Unix 信号处理（用于僵尸进程回收）
+nix = { workspace = true, features = ["signal", "process"] }

@@ -1,0 +1,16 @@
+apiVersion: 1
+
+datasources:
+  # Prometheus 数据源（容器内部网络）
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "15s"
+
+# 注意: Pyroscope 有独立的 Web UI (http://localhost:4040)
+# Grafana 原生不支持 Pyroscope 作为 datasource
+# 请直接访问 Pyroscope Web UI 查看性能剖析数据

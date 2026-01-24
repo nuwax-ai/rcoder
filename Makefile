@@ -1,4 +1,4 @@
-.PHONY: help build docker-build docker-build-base docker-build-master docker-build-master-base docker-build-agent-runner docker-build-agent-base install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag test test-unit test-integration test-all test-blocking
+.PHONY: help build docker-build docker-build-base docker-build-master docker-build-master-base docker-build-agent-runner docker-build-agent-base docker-build-agent-production install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag test test-unit test-integration test-all test-blocking test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu pyroscope-up pyroscope-down pyroscope-logs
 
 # 默认目标：显示帮助信息
 help:
@@ -15,16 +15,22 @@ help:
 	@echo "  make docker-build-base            - 构建所有基础镜像（很少需要）"
 	@echo "  make docker-build-master          - 仅构建 master-rcoder 镜像（需要基础镜像）"
 	@echo "  make docker-build-master-base     - 仅构建 master-rcoder-base 基础镜像"
-	@echo "  make docker-build-agent-runner    - 仅构建 rcoder-agent-runner 镜像（需要基础镜像）"
+	@echo "  make docker-build-agent-runner    - 仅构建 rcoder-agent-runner 镜像（启用 eBPF 调试）"
 	@echo "  make docker-build-agent-base      - 仅构建 rcoder-agent-base 基础镜像"
+	@echo "  make docker-build-agent-production - 构建生产镜像（无 eBPF 工具，镜像更小）"
 	@echo "  make dev-build                    - 本地编译 + 构建 Docker 镜像（一键完成）"
-	@echo "  make update-image-tag - 根据系统架构更新镜像标签 (arm64/amd64 -> latest)"
+	@echo "  make update-image-tag             - 根据系统架构更新镜像标签 (arm64/amd64 -> latest)"
 	@echo ""
 	@echo "🔧 开发模式命令："
 	@echo "  make dev-up         - 启动开发模式容器（使用镜像内编译的二进制）"
 	@echo "  make dev-restart    - 重启开发模式容器（重新构建镜像并启动）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
+	@echo ""
+	@echo "📊 Pyroscope 持续剖析："
+	@echo "  make pyroscope-up   - 启动 Pyroscope Server"
+	@echo "  make pyroscope-down - 停止 Pyroscope Server"
+	@echo "  make pyroscope-logs - 查看 Pyroscope 日志"
 	@echo ""
 	@echo "🧪 测试命令："
 	@echo "  make test           - 运行所有测试"
@@ -83,7 +89,18 @@ docker-build-master:
 		echo "✓ 基础镜像 master-rcoder-base:latest 已存在"; \
 	fi
 	@echo "📦 使用 Dockerfile 多阶段构建（基于基础镜像）..."
-	@docker build -f docker/rcoder-master/Dockerfile -t master-rcoder:latest .
+	@# 🔧 根据 CARGO_FEATURES 决定是否启用 eBPF 调试
+	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
+		MASTER_CARGO_FLAGS="$(CARGO_FEATURES)"; \
+		echo "🔧 master-rcoder 将启用 eBPF 调试模式"; \
+	else \
+		MASTER_CARGO_FLAGS=""; \
+		echo "🔒 master-rcoder 生产模式（无 eBPF 调试）"; \
+	fi; \
+	docker build \
+		--build-arg CARGO_FLAGS="$$MASTER_CARGO_FLAGS" \
+		--build-arg CACHEBUST=$$(date +%s) \
+		-f docker/rcoder-master/Dockerfile -t master-rcoder:latest .;)
 	@echo "✅ master-rcoder 镜像构建完成！"
 
 # 构建 master-base 基础镜像（包含所有运行时依赖，很少需要重新构建）
@@ -94,6 +111,24 @@ docker-build-master-base:
 	@docker build -f docker/rcoder-master/Dockerfile.base -t master-rcoder-base:latest .
 	@echo "✅ master-rcoder-base 基础镜像构建完成！"
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
+
+# ============================================================================
+# 🔧 Cargo feature 配置
+# ============================================================================
+# 开发模式：启用所有调试、监控和追踪功能
+# ⚠️  注意：添加新的调试 feature 时，必须同步更新此列表！
+#
+# 当前启用的调试 features：
+#   - ebpf-debug    (docker_manager, rcoder): eBPF 诊断工具
+#   - pyroscope     (agent_runner):         性能分析 (CPU/Memory)
+#   - otel          (agent_runner):         OpenTelemetry 追踪
+#   - debug         (rcoder):               调试路由
+#
+# 本地开发调试默认开启所有功能
+CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug
+#
+# 生产模式：禁用 eBPF 工具（通过 make docker-build-agent-production）
+# CARGO_FEATURES ?=
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
 docker-build-agent-runner:
@@ -107,11 +142,15 @@ docker-build-agent-runner:
 		echo "✓ 基础镜像 rcoder-agent-base:latest 已存在"; \
 	fi
 	@echo "📦 步骤1: 在 debian:12 环境中构建 agent_runner 二进制（确保 GLIBC 版本兼容）..."
-	@# 使用 debian:12 + Rust 1.90 构建，GLIBC 版本与运行环境一致
+	@# 🔧 调试模式：默认启用 ebpf-debug feature，允许使用 eBPF 诊断工具
+	@echo "🔧 Cargo features: $(CARGO_FEATURES)"
 	@# 计算业务代码哈希，只有代码变化时才重新编译（系统依赖和 Rust 安装保持缓存）
 	$(eval CRATES_HASH := $(shell find crates Cargo.toml Cargo.lock -name "*.rs" -o -name "Cargo.toml" -o -name "Cargo.lock" 2>/dev/null | sort | xargs cat 2>/dev/null | md5sum | cut -d' ' -f1))
 	@echo "🔑 业务代码哈希: $(CRATES_HASH)"
-	@docker build --build-arg CRATES_HASH=$(CRATES_HASH) -f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build .
+	@# 🔥 关键修改：通过 CARGO_FEATURES 变量控制
+	@docker build --build-arg CRATES_HASH=$(CRATES_HASH) \
+		--build-arg CARGO_FLAGS="$(CARGO_FEATURES)" \
+		-f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build .
 	@echo "📦 步骤2: 复制二进制文件到 agent-runner 目录..."
 	@# 创建容器并复制 agent_runner 二进制文件
 	@mkdir -p docker/rcoder-agent-runner/bin
@@ -120,9 +159,32 @@ docker-build-agent-runner:
 	@docker rm build-container
 	@docker rmi rcoder-agent-runner-build
 	@echo "📦 步骤3: 构建最终的 agent-runner 镜像（基于基础镜像，快速）..."
-	@cd docker/rcoder-agent-runner && \
-		docker build --build-arg CACHEBUST=$$(date +%s) -f Dockerfile -t rcoder-agent-runner:latest .
+	@# 🔧 根据 CARGO_FEATURES 决定是否安装 eBPF 工具
+	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
+		INSTALL_EBPF="true"; \
+		echo "🔧 将安装 eBPF 诊断工具"; \
+	else \
+		INSTALL_EBPF="false"; \
+		echo "🔒 跳过 eBPF 工具安装（生产模式）"; \
+	fi; \
+	cd docker/rcoder-agent-runner && \
+		docker build --build-arg CACHEBUST=$$(date +%s) \
+			--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
+			--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
+			--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
+			-f Dockerfile -t rcoder-agent-runner:latest .;)
 	@echo "✅ rcoder-agent-runner 镜像构建完成！"
+	@if [ "$(CARGO_FEATURES)" != "" ]; then \
+		echo "🔧 eBPF 调试模式已启用，容器将以特权模式运行"; \
+	else \
+		echo "🔒 生产模式，容器权限受限"; \
+	fi
+
+# 构建生产版本（禁用 eBPF 工具，减小镜像大小）
+docker-build-agent-production:
+	@echo "🐳 构建 rcoder-agent-runner 生产镜像（无 eBPF 工具）..."
+	@$(MAKE) docker-build-agent-runner CARGO_FEATURES=""
+	@echo "✅ 生产镜像构建完成（无 eBPF 工具，镜像更小）"
 
 # 构建 agent-base 基础镜像（包含所有系统依赖，很少需要重新构建）
 docker-build-agent-base:
@@ -232,3 +294,97 @@ test-blocking:
 test-all:
 	@echo "🧪 运行完整测试套件..."
 	@cargo test --workspace --all-features
+
+# ============================================================================
+# 🧪 eBPF 工具安装测试（快速验证 Makefile 变量传递）
+# ============================================================================
+
+# 测试 1: 模拟 Makefile 变量传递（启用 eBPF）
+test-ebpf-install:
+	@echo "🧪 测试 1: 启用 eBPF 工具安装..."
+	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
+		INSTALL_EBPF="true"; \
+		echo "✅ CARGO_FEATURES=[$(CARGO_FEATURES)], INSTALL_EBPF=$${INSTALL_EBPF}"; \
+	else \
+		INSTALL_EBPF="false"; \
+		echo "⚠️  CARGO_FEATURES=[$(CARGO_FEATURES)], INSTALL_EBPF=$${INSTALL_EBPF}"; \
+	fi; \
+	cd docker/rcoder-agent-runner && \
+		docker build --build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
+			-f Dockerfile.test -t test-ebpf-install . 2>&1 | tail -20; \
+	docker run --rm test-ebpf-install which bpftrace && echo "✅ 测试通过: bpftrace 已安装" || echo "❌ 测试失败: bpftrace 未安装")
+
+# 测试 2: 模拟生产模式（禁用 eBPF）
+test-ebpf-no-install:
+	@echo "🧪 测试 2: 禁用 eBPF 工具安装（生产模式）..."
+	@(INSTALL_EBPF="false"; \
+		echo "🔒 INSTALL_EBPF=$${INSTALL_EBPF}"; \
+		cd docker/rcoder-agent-runner && \
+		docker build --build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
+			-f Dockerfile.test -t test-ebpf-no-install . 2>&1 | tail -20; \
+		docker run --rm test-ebpf-no-install which bpftrace && echo "❌ 测试失败: 生产模式不应安装 bpftrace" || echo "✅ 测试通过: 生产模式正确跳过安装")
+
+# 测试 3: 直接测试变量传递（调试用）
+test-ebpf-debug:
+	@echo "🧪 测试 3: 变量传递调试..."
+	@echo "CARGO_FEATURES=[$(CARGO_FEATURES)]"
+	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
+		INSTALL_EBPF="true"; \
+		echo "Shell: INSTALL_EBPF=$${INSTALL_EBPF}"; \
+		echo "Docker: INSTALL_EBPF_TOOLS=\"$${INSTALL_EBPF}\""; \
+	else \
+		INSTALL_EBPF="false"; \
+		echo "Shell: INSTALL_EBPF=$${INSTALL_EBPF}"; \
+		echo "Docker: INSTALL_EBPF_TOOLS=\"$${INSTALL_EBPF}\""; \
+	fi)
+
+# 测试 4: 完整测试 Pyroscope + Off-CPU 工具
+test-pyroscope-offcpu:
+	@echo "🧪 测试 4: Pyroscope Agent + Off-CPU 工具完整测试..."
+	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
+		INSTALL_EBPF="true"; \
+		echo "✅ CARGO_FEATURES=[$(CARGO_FEATURES)], INSTALL_EBPF=$${INSTALL_EBPF}"; \
+	else \
+		INSTALL_EBPF="false"; \
+		echo "⚠️  CARGO_FEATURES=[$(CARGO_FEATURES)], INSTALL_EBPF=$${INSTALL_EBPF}"; \
+	fi; \
+	cd docker/rcoder-agent-runner && \
+		docker build --build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
+			--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
+			-f Dockerfile.test-full -t test-pyroscope-offcpu . 2>&1 | tail -30; \
+	echo "=== 验证 pyroscope ===" && \
+	docker run --rm test-pyroscope-offcpu which pyroscope && echo "✅ pyroscope 已安装" || echo "❌ pyroscope 未安装"; \
+	echo "=== 验证 offcputime-bpfcc ===" && \
+	docker run --rm test-pyroscope-offcpu which offcputime-bpfcc && echo "✅ offcputime-bpfcc 已安装" || echo "❌ offcputime-bpfcc 未安装")
+
+# ============================================================================
+# 📊 Pyroscope 持续剖析服务管理
+# ============================================================================
+
+# 启动 Pyroscope Server
+pyroscope-up:
+	@echo "🚀 启动 Pyroscope Server..."
+	@if [ ! -f "docker/docker-compose.yml" ]; then \
+		echo "❌ 错误: 未找到 docker/docker-compose.yml"; \
+		exit 1; \
+	fi
+	@docker-compose -f docker/docker-compose.yml up -d pyroscope
+	@echo ""
+	@echo "✅ Pyroscope Server 已启动！"
+	@echo "📊 Web UI: http://localhost:4040"
+	@echo "💡 提示: 等待 agent_runner 容器启动并连接到 Pyroscope"
+
+# 停止 Pyroscope Server
+pyroscope-down:
+	@echo "🛑 停止 Pyroscope Server..."
+	@if [ -f "docker/docker-compose.yml" ]; then \
+		docker-compose -f docker/docker-compose.yml stop pyroscope || true; \
+	else \
+		echo "⚠️  docker-compose.yml 未找到"; \
+	fi
+	@echo "✅ Pyroscope Server 已停止"
+
+# 查看 Pyroscope 日志
+pyroscope-logs:
+	@echo "📋 Pyroscope Server 日志:"
+	@docker logs -f rcoder-pyroscope 2>/dev/null || echo "❌ Pyroscope 容器未运行，请先执行 make pyroscope-up"

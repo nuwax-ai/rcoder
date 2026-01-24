@@ -180,8 +180,6 @@ mod tests {
         let rcoder_info = strategies::ProjectInfo {
             project_id: "project_abc".to_string(),
             user_id: Some("user_xyz".to_string()),
-            service_type: ServiceType::RCoder,
-            container_id: Some("container_rcoder".to_string()),
             last_activity: Utc::now(),
         };
 
@@ -197,8 +195,6 @@ mod tests {
         let runner_info = strategies::ProjectInfo {
             project_id: "project_def".to_string(),
             user_id: Some("user_123".to_string()),
-            service_type: ServiceType::ComputerAgentRunner,
-            container_id: Some("container_runner".to_string()),
             last_activity: Utc::now(),
         };
 
@@ -214,8 +210,6 @@ mod tests {
         let runner_info_missing_user = strategies::ProjectInfo {
             project_id: "project_ghi".to_string(),
             user_id: None,
-            service_type: ServiceType::ComputerAgentRunner,
-            container_id: Some("container_runner".to_string()),
             last_activity: Utc::now(),
         };
 

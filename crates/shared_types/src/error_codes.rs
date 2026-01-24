@@ -40,7 +40,10 @@ pub const ERR_GRPC_ADDR_ERROR: &str = "GRPC_ADDR_ERROR";
 /// gRPC 调用失败
 pub const ERR_GRPC_ERROR: &str = "GRPC_ERROR";
 
-/// Agent 内部错误（来自 agent_runner）
+/// 服务暂时不可用(如 Agent Worker 重启中)
+pub const ERR_SERVICE_UNAVAILABLE: &str = "SERVICE_UNAVAILABLE";
+
+/// Agent 内部错误(来自 agent_runner)
 pub const ERR_AGENT_ERROR: &str = "AGENT_ERROR";
 
 /// 代理服务未启用
@@ -95,6 +98,7 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_WORKSPACE_ERROR => "工作目录错误",
         ERR_GRPC_ADDR_ERROR => "gRPC 地址解析失败",
         ERR_GRPC_ERROR => "gRPC 调用失败",
+        ERR_SERVICE_UNAVAILABLE => "服务暂时不可用",
         ERR_AGENT_ERROR => "Agent 内部错误",
         ERR_PROXY_DISABLED => "代理服务未启用",
         ERR_PROXY_SERVICE_UNAVAILABLE => "代理服务不可用",

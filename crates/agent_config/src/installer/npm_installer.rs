@@ -95,7 +95,17 @@ impl AgentInstaller for NpmInstaller {
         info!("📦 使用 {} 全局安装: {}", npm_cmd, package_spec);
 
         // Run npm install -g
-        let output = self.run_command(npm_cmd, &["install", "-g", &package_spec]).await?;
+        // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
+        let output = if package_name == "nuwaxcode" {
+            info!("🌐 nuwaxcode 使用官方源: https://registry.npmjs.org/");
+            self.run_command(
+                npm_cmd,
+                &["install", "-g", &package_spec, "--registry=https://registry.npmjs.org/"],
+            )
+            .await?
+        } else {
+            self.run_command(npm_cmd, &["install", "-g", &package_spec]).await?
+        };
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -164,7 +174,17 @@ impl AgentInstaller for NpmInstaller {
         info!("🔄 更新全局包: {}", package_name);
 
         // Run npm update -g
-        let output = self.run_command(npm_cmd, &["update", "-g", package_name]).await?;
+        // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
+        let output = if package_name == "nuwaxcode" {
+            info!("🌐 nuwaxcode 使用官方源: https://registry.npmjs.org/");
+            self.run_command(
+                npm_cmd,
+                &["update", "-g", package_name, "--registry=https://registry.npmjs.org/"],
+            )
+            .await?
+        } else {
+            self.run_command(npm_cmd, &["update", "-g", package_name]).await?
+        };
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);

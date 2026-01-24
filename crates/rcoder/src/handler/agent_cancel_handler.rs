@@ -198,24 +198,99 @@ async fn forward_cancel_request_to_container_service(
         Err(e) => {
             error!("❌ [CANCEL_FORWARD] gRPC 调用失败: {}", e);
 
-            // 只保留 NotFound 的特殊处理（幂等设计）
-            // 注：业务错误码现在由 agent_runner 通过 grpc_response 返回
+            // 检查特定的 gRPC 错误码并分类处理
             if let Some(status) = crate::grpc::extract_grpc_status(&e) {
                 use tonic::Code;
-                if status.code() == Code::NotFound {
-                    // 会话或 Agent 不存在，返回成功（幂等设计）
-                    return Ok(HttpResult::success(CancelResponse {
-                        success: true,
-                        session_id: session_id.unwrap_or("").to_string(),
-                    }));
+                match status.code() {
+                    Code::NotFound => {
+                        // 会话或 Agent 不存在，返回成功（幂等设计）
+                        info!("✅ [CANCEL_FORWARD] session 不存在，幂等返回成功");
+                        return Ok(HttpResult::success(CancelResponse {
+                            success: true,
+                            session_id: session_id.unwrap_or("").to_string(),
+                        }));
+                    }
+                    Code::Unavailable => {
+                        // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
+                        // 通过 Docker API 检查容器是否真的存在
+                        let container_exists = check_container_exists_by_info(container_info).await;
+
+                        if !container_exists {
+                            // 容器已销毁，取消目标已达成（幂等设计）
+                            info!("✅ [CANCEL_FORWARD] 容器已销毁，取消目标已达成");
+                            return Ok(HttpResult::success(CancelResponse {
+                                success: true,
+                                session_id: session_id.unwrap_or("").to_string(),
+                            }));
+                        } else {
+                            // 容器存在但服务不可用（可能是临时故障），返回错误
+                            warn!("⚠️ [CANCEL_FORWARD] Agent Worker 不可用（容器存在，可能是临时故障）");
+                            return Ok(HttpResult::error(
+                                shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
+                                "Agent 服务暂时不可用，请稍后重试",
+                            ));
+                        }
+                    }
+                    other_code => {
+                        // 其他 gRPC 状态码
+                        error!("❌ [CANCEL_FORWARD] gRPC 错误码: {:?}", other_code);
+                    }
                 }
             }
 
-            // gRPC 通信失败
-            Ok(HttpResult::error(
+            // 其他 gRPC 通信失败（网络错误等）
+            return Ok(HttpResult::error(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 &format!("gRPC 调用失败: {}", e),
-            ))
+            ));
+        }
+    }
+}
+
+/// 检查容器是否真实存在（通过 Docker API）
+///
+/// 用于区分 Unavailable 错误的原因：
+/// - 容器已销毁 → 返回 false（取消目标已达成）
+/// - 容器存在但服务不可用 → 返回 true（临时故障）
+///
+/// 使用容器名称而非 ID，因为容器重启后 ID 会变，但名称不变
+async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> bool {
+    match docker_manager::global::get_global_docker_manager().await {
+        Ok(docker_manager) => {
+            // 通过容器名称查找（名称在容器重启后不变）
+            // 使用 get_container_info_by_name 获取完整的容器信息
+            match docker_manager
+                .get_container_info_by_name(&container_info.container_name)
+                .await
+            {
+                Ok(Some(info)) => {
+                    debug!(
+                        "🔍 [CANCEL_FORWARD] Docker 容器存在: name={}, id={}, status={:?}",
+                        info.container_name, info.container_id, info.status
+                    );
+                    true
+                }
+                Ok(None) => {
+                    info!(
+                        "🔍 [CANCEL_FORWARD] Docker 容器不存在（已销毁）: {}",
+                        container_info.container_name
+                    );
+                    false
+                }
+                Err(e) => {
+                    // 查询失败，保守地认为容器存在
+                    warn!(
+                        "⚠️ [CANCEL_FORWARD] 查询容器状态失败: {}，保守认为容器存在",
+                        e
+                    );
+                    true
+                }
+            }
+        }
+        Err(e) => {
+            // 无法获取 Docker Manager，保守地认为容器存在
+            warn!("⚠️ [CANCEL_FORWARD] 获取 Docker Manager 失败: {}，保守认为容器存在", e);
+            true
         }
     }
 }

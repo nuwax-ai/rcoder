@@ -52,25 +52,29 @@ impl OrphanedContainerCleaner {
     }
 
     /// 清理孤立容器
-    pub async fn cleanup(&self, max_cleanup: u64) -> Result<u64> {
+    /// 注意：无清理数量上限，一次性清理所有孤立容器
+    /// 保护机制：120秒总超时 + 异步执行
+    pub async fn cleanup(&self) -> Result<u64> {
         info!("🔍 [orphaned] 开始检查孤立容器");
 
         let total_timeout = Duration::from_secs(120);
-        let cleaned_count = timeout(total_timeout, self.cleanup_inner(max_cleanup)).await??;
+        let cleaned_count = timeout(total_timeout, self.cleanup_inner()).await??;
 
         info!("✅ [orphaned] 孤立容器清理完成: {} 个", cleaned_count);
         Ok(cleaned_count)
     }
 
-    async fn cleanup_inner(&self, max_cleanup: u64) -> Result<u64> {
+    async fn cleanup_inner(&self) -> Result<u64> {
         if self.container_patterns.is_empty() {
             warn!("⚠️ [orphaned] 没有启用的服务，跳过孤立容器清理");
             return Ok(0);
         }
 
+        // 🔧 清理所有发现的孤立容器（无上限）
         let mut total_cleaned = 0;
 
         for pattern in &self.container_patterns {
+
             let service_type = match Self::infer_service_type_from_pattern(pattern) {
                 Some(st) => st,
                 None => {
@@ -91,27 +95,6 @@ impl OrphanedContainerCleaner {
                 }
             };
 
-            // 🆕 预先收集所有容器 ID，用于后续批量检查 DockerManager
-            let container_ids: Vec<String> = containers
-                .iter()
-                .filter_map(|container| {
-                    container.names.as_ref().and_then(|names| {
-                        names.iter().find_map(|name| {
-                            Self::extract_id_from_container_name(name.trim_start_matches('/'))
-                        })
-                    })
-                })
-                .collect();
-
-            // 🆕 批量检查 DockerManager 中是否存在这些容器
-            let mut docker_manager_has_container = std::collections::HashMap::new();
-            for id in &container_ids {
-                docker_manager_has_container.insert(
-                    id.clone(),
-                    self.docker_manager.get_container_info(id).await.is_some(),
-                );
-            }
-
             let orphaned_containers: Vec<OrphanedContainerInfo> = containers
                 .iter()
                 .filter_map(|container| {
@@ -120,7 +103,8 @@ impl OrphanedContainerCleaner {
                             let clean_name = name.trim_start_matches('/');
                             if let Some(id) = Self::extract_id_from_container_name(clean_name) {
                                 // 🔧 根据 service_type 使用不同的查询方式
-                                // 🛡️ 关键修复：同时检查 DockerManager.containers，刚创建的容器可能还没插入 DuckDB
+                                // 🛡️ 关键修复：只检查 DuckDB 存储来判断是否为孤立容器
+                                // 不再依赖 DockerManager 的内存缓存，因为缓存可能不会及时清理
                                 let duckdb_has_record = match service_type {
                                     ServiceType::RCoder => {
                                         // RCoder: id 是 project_id，直接查询
@@ -132,11 +116,9 @@ impl OrphanedContainerCleaner {
                                     }
                                 };
 
-                                // 🆕 检查 DockerManager 的内存缓存，如果存在说明容器最近创建
-                                let docker_manager_has_record = docker_manager_has_container.get(&id).copied().unwrap_or(false);
-
-                                // 只有当 DuckDB 和 DockerManager 都没有记录时，才判定为孤立
-                                let is_orphaned = !duckdb_has_record && !docker_manager_has_record;
+                                // ✅ 只依赖 DuckDB 判断：DuckDB 中没有记录 = 孤立容器
+                                // Docker 容器存在 + DuckDB 无记录 = 孤立容器，需要清理
+                                let is_orphaned = !duckdb_has_record;
 
                                 if is_orphaned {
                                     // 🔧 修复时间戳解析：Docker API 返回的 created 是 Unix 秒时间戳（不是毫秒）
@@ -199,12 +181,8 @@ impl OrphanedContainerCleaner {
                 continue;
             }
 
-            let containers_to_clean: Vec<_> = orphaned_containers
-                .into_iter()
-                .take(max_cleanup as usize)
-                .collect();
-
-            for info in containers_to_clean {
+            // 🔧 清理所有发现的孤立容器（无上限）
+            for info in orphaned_containers {
                 if self.cleanup_single(&info).await.is_ok() {
                     total_cleaned += 1;
                 }
@@ -226,35 +204,55 @@ impl OrphanedContainerCleaner {
 
         // 🛡️ 二次保护期检查：在实际销毁前再次确认容器是否存在且在保护期内
         // 这是为了防止从收集孤立容器列表到实际销毁之间的时间差
-        // 🔍 使用 find_container_realtime 获取最新的容器信息和 ID
-        let actual_container_id = match self
+        // 🔍 使用 find_container_realtime 获取最新的容器 ID
+        let (actual_container_id, cache_key) = match self
             .docker_manager
             .find_container_realtime(&info.container_name)
             .await
         {
-            Ok(Some((container_id, _, _, _))) => {
+            Ok(Some(result)) => {
                 // 容器存在，检查保护期
-                // 注意：find_container_realtime 不返回 created_at，需要从缓存获取
-                if let Some(container_info) = self
+                // 🔧 关键修复：使用 DockerManager 封装的方法获取创建时间
+                // 使用容器 name 查询，容器重启后 name 不变，但 ID 会变
+                match self
                     .docker_manager
-                    .find_container_by_identifier(&info.container_name)
+                    .get_container_creation_time_by_name(&info.container_name)
                     .await
                 {
-                    let created_time = container_info.created_at;
-                    let age = Utc::now().signed_duration_since(created_time);
+                    Ok(Some(created_time_utc)) => {
+                        let age = Utc::now().signed_duration_since(created_time_utc);
+                        let protection_seconds =
+                            self.config.container_protection_duration.as_secs() as i64;
 
-                    if age.num_milliseconds()
-                        < self.config.container_protection_duration.as_millis() as i64
-                    {
+                        if age.num_seconds() < protection_seconds {
+                            info!(
+                                "🛡️ [orphaned] 二次检查：容器在保护期内，跳过销毁: {}, age={}秒, protection={}秒",
+                                info.container_name,
+                                age.num_seconds(),
+                                protection_seconds
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Ok(None) => {
+                        // 容器不存在或创建时间为空
                         info!(
-                            "🛡️ [orphaned] 二次检查：容器在保护期内，跳过销毁: {}, 创建时长={}秒",
-                            info.container_name,
-                            age.num_seconds()
+                            "⚠️ [orphaned] 容器不存在或创建时间为空，可能已被删除: name={}",
+                            info.container_name
                         );
                         return Ok(());
                     }
+                    Err(e) => {
+                        warn!(
+                            "⚠️ [orphaned] 获取容器创建时间失败: {}, error={}",
+                            info.container_name, e
+                        );
+                        // 获取时间失败时，为了安全起见，跳过清理
+                        return Ok(());
+                    }
                 }
-                container_id
+                // 使用 info.id (project_id) 作为缓存 key
+                (result.container_id, info.id.clone())
             }
             Ok(None) => {
                 // 容器已不存在，可能已被删除
@@ -281,6 +279,41 @@ impl OrphanedContainerCleaner {
         )
         .await
         .map_err(|e| anyhow::anyhow!("清理容器失败: {}", e))?;
+
+        // 清理 DockerManager 内存缓存（防止缓存残留）
+        // 🔧 对于 RCoder: cache_key = project_id; 对于 ComputerAgentRunner: 可能是 user_id 或 container_id
+        // 如果直接删除失败，尝试通过容器名称遍历查找并删除缓存
+        let mut removed = false;
+        if let Some(_) = self.docker_manager.remove_container_cache(&cache_key).await {
+            debug!("🧹 [orphaned] 已通过 identifier 清理 DockerManager 内存缓存: {}", cache_key);
+            removed = true;
+        } else {
+            // 回退方案：遍历缓存，通过容器名称匹配删除
+            // 这是为了处理 ComputerAgentRunner 容器缓存可能使用 container_id 作为 key 的情况
+            for container_entry in self.docker_manager.list_containers().await {
+                if container_entry.container_name == info.container_name {
+                    if let Some(_) = self
+                        .docker_manager
+                        .remove_container_cache(&container_entry.project_id)
+                        .await
+                    {
+                        debug!(
+                            "🧹 [orphaned] 已通过容器名称清理 DockerManager 内存缓存: name={}, project_id={}",
+                            info.container_name, container_entry.project_id
+                        );
+                        removed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !removed {
+            debug!(
+                "⚠️ [orphaned] DockerManager 内存缓存未找到或已清理: name={}, cache_key={}",
+                info.container_name, cache_key
+            );
+        }
 
         // 对于 ComputerAgentRunner，清理 VNC 后端
         if info.service_type == ServiceType::ComputerAgentRunner {

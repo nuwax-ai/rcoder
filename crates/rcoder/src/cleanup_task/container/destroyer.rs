@@ -70,12 +70,12 @@ impl ContainerDestroyer {
             .find_container_realtime(container_name)
             .await
         {
-            Ok(Some((container_id, _, _, _))) => {
+            Ok(Some(result)) => {
                 debug!(
                     "✅ [destroyer] 找到容器: name={}, id={}",
-                    container_name, container_id
+                    container_name, result.container_id
                 );
-                container_id
+                result.container_id
             }
             Ok(None) => {
                 // 容器不存在，可能已经被删除了，这不是错误
@@ -103,7 +103,14 @@ impl ContainerDestroyer {
         .await
         .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
 
-        // 3. 对于 ComputerAgentRunner，清理 Pingora VNC 后端
+        // 3. 清理 DockerManager 内存缓存（防止缓存残留导致孤立容器无法被清理）
+        let _: Option<_> = self.docker_manager.remove_container_cache(container_identifier).await;
+        debug!(
+            "🧹 [destroyer] 已清理 DockerManager 内存缓存: identifier={}",
+            container_identifier
+        );
+
+        // 4. 对于 ComputerAgentRunner，清理 Pingora VNC 后端
         if *service_type == ServiceType::ComputerAgentRunner {
             if let Some(ref pingora_service) = self.pingora_service {
                 let _: Option<String> = pingora_service.remove_vnc_backend(container_identifier);

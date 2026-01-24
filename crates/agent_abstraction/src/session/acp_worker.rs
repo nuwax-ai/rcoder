@@ -1,35 +1,38 @@
-//! ACP Agent Worker 实现
+//! ACP Agent Worker 实现 (SACP 版本)
 //!
 //! 封装 Agent 请求处理的核心业务逻辑
+//!
+//! ## SACP 迁移说明
+//!
+//! - 移除了 `Client` trait 泛型参数（SACP 内部处理）
+//! - 简化了会话创建参数
 
 use std::sync::Arc;
 
-use agent_client_protocol::Client;
 use agent_config::{AgentServersConfig, PromptConfigAssembler};
 use anyhow::Result;
 use shared_types::{ProjectAndAgentInfo, SessionEntry};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
 use crate::launcher::convert_context_servers;
 use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 
-/// ACP Agent Worker
+/// ACP Agent Worker (SACP 版本)
 ///
 /// 处理 ACP Agent 请求的核心业务逻辑实现
 ///
 /// # 类型参数
 /// - `N`: SessionNotifier 实现，用于推送 SSE 消息
-/// - `C`: Client 实现，用于处理 ACP 协议回调
 /// - `R`: SessionRegistry 实现，用于存储会话数据
 #[derive(Clone)]
-pub struct AcpAgentWorker<N: SessionNotifier, C: Client + 'static, R: SessionRegistry> {
-    session_manager: Arc<AcpSessionManager<N, C, R>>,
+pub struct AcpAgentWorker<N: SessionNotifier, R: SessionRegistry> {
+    session_manager: Arc<AcpSessionManager<N, R>>,
 }
 
-impl<N: SessionNotifier, C: Client + 'static, R: SessionRegistry> AcpAgentWorker<N, C, R> {
+impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpAgentWorker<N, R> {
     /// 创建新的 ACP Agent Worker
-    pub fn new(session_manager: Arc<AcpSessionManager<N, C, R>>) -> Self {
+    pub fn new(session_manager: Arc<AcpSessionManager<N, R>>) -> Self {
         Self { session_manager }
     }
 }
@@ -37,9 +40,8 @@ impl<N: SessionNotifier, C: Client + 'static, R: SessionRegistry> AcpAgentWorker
 #[async_trait::async_trait]
 impl<
     N: SessionNotifier + Send + Sync + 'static,
-    C: Client + Clone + Default + Send + Sync + 'static,
     R: SessionRegistry + Send + Sync + 'static,
-> AgentWorker for AcpAgentWorker<N, C, R>
+> AgentWorker for AcpAgentWorker<N, R>
 where
     R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
 {
@@ -54,11 +56,11 @@ where
         info!("📨 AcpAgentWorker 处理请求，project_id: {}", project_id);
 
         // 1. 路径规范化
-        let normalized_path = AcpSessionManager::<N, C, R>::normalize_path(&project_path);
+        let normalized_path = AcpSessionManager::<N, R>::normalize_path(&project_path);
         debug!("📂 路径规范化: {:?}", normalized_path);
 
         // 2. 确保项目目录存在
-        AcpSessionManager::<N, C, R>::ensure_project_dir(&normalized_path)
+        AcpSessionManager::<N, R>::ensure_project_dir(&normalized_path)
             .await
             .map_err(|e| {
                 error!("❌ 创建项目目录失败: {:?}", e);
@@ -142,31 +144,42 @@ where
             }
         }
 
-        // Resume 策略：只要用户传入 session_id，就尝试 resume
+        // Resume 策略：验证 session 文件是否存在，再决定是否 resume
         //
         // 工作原理：
-        // 1. 用户传入 session_id → 设置 resume_session_id
-        // 2. session_manager 会通过 _meta.claudeCode.options.resume 传递给 Agent
-        // 3. 如果 session_id 有效（磁盘上存在会话）→ 恢复上下文
-        // 4. 如果 session_id 无效 → Agent 启动失败 → 降级机制触发 → 创建新会话
+        // 1. 用户传入 session_id → 检查磁盘上是否存在 session 文件
+        // 2. 如果存在 → 设置 resume_session_id → Agent 恢复上下文
+        // 3. 如果不存在 → 不设置 resume → Agent 创建新会话
+        //
+        // Session 文件路径: ~/.claude/projects/{encoded_path}/{session_id}.jsonl
         //
         // 优势：
-        // - 服务重启后能恢复磁盘上的会话（Claude Code 会话持久化在 .claude/conversations/）
+        // - 提前验证，避免传入无效 session_id 导致 Agent 启动失败
+        // - 服务重启后能恢复磁盘上的会话
         // - 不依赖内存状态，更健壮
         // - 自动降级（有会话就恢复，没有就创建）
         if let Some(ref session_id) = request.prompt_message.session_id {
-            info!("🔄 用户传入 session_id，尝试 resume: {}", session_id);
-            start_config = start_config.with_resume_session_id(session_id.clone());
+            // 检查 session 文件是否存在（使用文件系统扫描 + 缓存）
+            let project_path_str = normalized_path.to_string_lossy().to_string();
+            let session_exists = super::check_session_file_exists(session_id, &project_path_str).await;
+
+            if session_exists {
+                info!("✅ Session 文件存在，尝试 resume: {}", session_id);
+                start_config = start_config.with_resume_session_id(session_id.clone());
+            } else {
+                warn!(
+                    "⚠️ Session 文件不存在，跳过 resume，将创建新会话: session_id={}",
+                    session_id
+                );
+                // 不设置 resume_session_id，Agent 将创建新会话
+            }
         }
 
-        // 4. 创建 Client 实例
-        let client = C::default();
-
-        // 5. 更新 prompt_message 的 content 为处理后的用户提示词
+        // 4. 更新 prompt_message 的 content 为处理后的用户提示词
         let mut prompt_message = request.prompt_message.clone();
         prompt_message.content = final_user_prompt;
 
-        // 6. 获取或创建会话
+        // 5. 获取或创建会话 (SACP 版本 - 不需要 client 和 shared_api_key_manager)
         let (session_entry, is_new) = self
             .session_manager
             .get_or_create_session(
@@ -175,8 +188,6 @@ where
                 prompt_message.session_id.clone(),
                 request.model_provider.clone(),
                 start_config.clone(),
-                client,
-                request.shared_api_key_manager.clone(),
                 request.service_uuid.clone(),
             )
             .await
@@ -188,29 +199,30 @@ where
         // 使用 SessionEntry trait 方法访问会话信息
         info!(
             "✅ 会话已准备，session_id: {}, is_new: {}",
-            session_entry.session_id().0,
+            session_entry.session_id(),
             is_new
         );
 
-        // 7. 构建 Prompt 请求
+        // 6. 构建 Prompt 请求
         let prompt_request = if let Some(ref attachment_blocks) = request.attachment_blocks {
             debug!("📎 构建带附件的 Prompt 请求");
-            AcpSessionManager::<N, C, R>::build_prompt_request_with_attachments(
+            AcpSessionManager::<N, R>::build_prompt_request_with_attachments(
                 &prompt_message,
                 session_entry.session_id().clone(),
                 attachment_blocks.clone(),
             )?
         } else {
             debug!("📝 构建纯文本 Prompt 请求");
-            AcpSessionManager::<N, C, R>::build_text_prompt_request(
+            AcpSessionManager::<N, R>::build_text_prompt_request(
                 &prompt_message,
                 session_entry.session_id().clone(),
             )?
         };
 
-        // 8. 发送 Prompt
+        // 7. 发送 Prompt（异步，支持背压）
         self.session_manager
             .send_prompt_request(&project_id, prompt_request)
+            .await
             .map_err(|e| {
                 error!("❌ 发送 Prompt 请求失败: {:?}", e);
                 e
@@ -218,11 +230,11 @@ where
 
         info!("✅ Prompt 请求已发送，project_id: {}", project_id);
 
-        // 9. 构建响应
+        // 8. 构建响应
         if is_new {
             Ok(WorkerResponse::new_session_success(
                 project_id,
-                session_entry.session_id().0.to_string(),
+                session_entry.session_id().to_string(),
                 Some(request.request_id().to_string()),
                 prompt_message.service_type.clone(),
                 SessionHandles {
@@ -234,7 +246,7 @@ where
         } else {
             Ok(WorkerResponse::reuse_session_success(
                 project_id,
-                session_entry.session_id().0.to_string(),
+                session_entry.session_id().to_string(),
                 Some(request.request_id().to_string()),
                 prompt_message.service_type.clone(),
             ))

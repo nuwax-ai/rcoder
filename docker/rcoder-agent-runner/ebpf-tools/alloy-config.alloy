@@ -1,0 +1,142 @@
+// ============================================================================
+// Grafana Alloy 配置文件 - 用于监控 agent_runner 进程
+// ============================================================================
+// 此配置文件实现：
+// 1. 自动发现 agent_runner 及其子进程
+// 2. 使用 eBPF 进行 CPU 性能剖析
+// 3. 将性能数据发送到 Pyroscope Server
+// ============================================================================
+
+// ============================================================================
+// 进程发现 - 发现所有运行中的进程
+// ============================================================================
+discovery.process "all" {
+}
+
+// ============================================================================
+// 进程过滤 - 只保留 agent_runner 相关进程
+// ============================================================================
+discovery.relabel "agent_runner_filter" {
+    targets = discovery.process.all.targets
+
+    // 规则 1: 保留 agent_runner 主进程及其所有子进程
+    // 匹配条件：进程名是 agent_runner 或者父进程 PID 是 1
+    rule {
+        source_labels = ["__meta_process_exe", "__meta_process_ppid"]
+        regex   = ".*/agent_runner|;1"
+        action  = "keep"
+    }
+
+    // 规则 2: 添加进程 PID 标签
+    rule {
+        source_labels = ["__meta_process_pid"]
+        target_label  = "process_pid"
+    }
+
+    // 规则 3: 添加进程名称标签
+    rule {
+        source_labels = ["__meta_process_comm"]
+        target_label  = "process_name"
+    }
+
+    // 规则 4: 添加完整执行路径标签
+    rule {
+        source_labels = ["__meta_process_exe"]
+        target_label  = "process_exe"
+    }
+
+    // 规则 5: 添加父进程 PID 标签
+    rule {
+        source_labels = ["__meta_process_ppid"]
+        target_label  = "parent_pid"
+    }
+
+    // 规则 6: 添加命令行参数标签
+    rule {
+        source_labels = ["__meta_process_cmdline"]
+        target_label  = "process_cmdline"
+    }
+
+    // 规则 7: 添加环境标签
+    rule {
+        target_label = "env"
+        replacement  = "dev"
+    }
+
+    // 规则 8: 添加容器 ID 标签（从环境变量动态组合）
+    rule {
+        target_label = "container_id"
+        replacement  = "agent-${env:USER_ID}"
+    }
+
+    // 规则 9: 添加应用名称标签
+    rule {
+        target_label = "job"
+        replacement  = "agent_runner"
+    }
+
+    // 规则 10: 添加实例标签（从环境变量动态组合）
+    rule {
+        target_label = "instance"
+        replacement  = "agent-${env:USER_ID}"
+    }
+
+    // 添加集群标签
+    rule {
+        target_label = "cluster"
+        replacement  = "rcoder"
+    }
+
+    // 添加数据中心标签
+    rule {
+        target_label = "datacenter"
+        replacement  = "local"
+    }
+}
+
+// ============================================================================
+// 写入 Pyroscope Server
+// ============================================================================
+pyroscope.write "remote" {
+    endpoint {
+        url = "http://pyroscope:4040"
+    }
+
+    external_labels = {
+        "env"        = "dev",
+        "datacenter" = "local",
+        "cluster"    = "rcoder",
+    }
+}
+
+// ============================================================================
+// eBPF 性能分析组件
+// ============================================================================
+pyroscope.ebpf "agent_runner" {
+    forward_to = [pyroscope.write.remote.receiver]
+
+    targets = discovery.relabel.agent_runner_filter.output
+
+    sample_rate = 97
+    collect_interval = "15s"
+
+    collect_user_profile   = true
+    collect_kernel_profile = false
+
+    python_enabled = true
+}
+
+// ============================================================================
+// Prometheus Remote Write
+// ============================================================================
+prometheus.remote_write "metrics" {
+    endpoint {
+        url = "http://prometheus:9090/api/v1/write"
+    }
+
+    external_labels = {
+        "env"        = "dev",
+        "datacenter" = "local",
+        "cluster"    = "rcoder",
+    }
+}

@@ -27,6 +27,7 @@ impl std::error::Error for ApiKeyAuthError {}
 
 /// API Key 鉴权配置
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub struct ApiKeyAuthConfig {
     /// 是否启用 API Key 鉴权
     pub enabled: bool,
@@ -34,14 +35,6 @@ pub struct ApiKeyAuthConfig {
     pub api_key: String,
 }
 
-impl Default for ApiKeyAuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: String::new(), // 默认为空，实际使用时应该生成随机密钥
-        }
-    }
-}
 
 /// API Key 验证器
 pub struct ApiKeyValidator;

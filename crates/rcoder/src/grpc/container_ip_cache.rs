@@ -80,8 +80,8 @@ impl ContainerIpCache {
     }
 }
 
-/// 默认缓存 TTL（5秒）
-pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 5;
+/// 默认缓存 TTL（15秒）
+pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 15;
 
 #[cfg(test)]
 mod tests {

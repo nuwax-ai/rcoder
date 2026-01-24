@@ -8,7 +8,6 @@ default-members = [
     "crates/agent_runner",
     "crates/shared_types",
     "crates/docker_manager",
-    "crates/acp_adapter",
     "crates/rcoder-proxy",
     "crates/duckdb_manager",
 ]
@@ -25,14 +24,25 @@ rust.allow_leading_underscore = "warn"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["soddy <soddygo@qq.com>"]
 license = "MIT OR Apache-2.0"
 description = "Rust-based AI agent framework"
 publish = false
 
 [workspace.dependencies]
-# ACP Protocol
-agent-client-protocol = { version = "0.9.2", features = ["unstable"] }
+# ACP Protocol - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
+sacp = "10.1.0"
+sacp-derive = "10.0.0"
+# SACP 所需的 schema 依赖（共享类型定义）
+agent-client-protocol-schema = "0.10.7"
+
+# SACP 所需的额外依赖
+boxfnonce = "0.1.1"
+fxhash = "0.2.1"
+jsonrpcmsg = "0.1.2"
+
+# MCP 协议 - rmcp 官方库 (升级到 0.12 以兼容 SACP)
+rmcp = { version = "0.12.0", features = ["server", "client", "transport-io", "transport-child-process", "schemars"] }
 
 piper = "0.2"
 
@@ -122,8 +132,10 @@ bytes = "1.11"
 # collections = "0.2"  # 这个包不存在
 
 
-url = "2.5" # 使用 crates.io 版本
+url = { version = "2.5", features = ["serde"] }
 
+# TLS/Crypto
+rustls = { version = "0.23", features = ["ring"] }
 
 # Additional utilities
 indoc = "2.0"
@@ -139,7 +151,7 @@ derive_builder = "0.20"
 
 # Zed 核心功能依赖
 libc = "0.2"
-nix = { version = "0.30.1", features = ["fs", "process", "term"] }
+nix = { version = "0.30.1", features = ["fs", "process", "term", "signal"] }
 unindent = "0.2"                                                   # 使用 crates.io 版本
 open = "5.0"                                                       # 使用 crates.io 版本
 git2 = "0.20.1"
@@ -180,6 +192,7 @@ pretty_assertions = "1.4"
 tempfile = "3.24"
 rand = "0.9"
 tokio-test = "0.4"
+expect-test = "1.5"
 
 # File system utilities
 dirs = "6.0"
@@ -213,3 +226,7 @@ moka = { version = "0.12", features = ["future", "sync"] }
 
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
+
+# Pyroscope Continuous Profiling
+pyroscope = "0.5"
+pyroscope_pprofrs = "0.2"

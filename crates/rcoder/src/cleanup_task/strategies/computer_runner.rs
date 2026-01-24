@@ -82,10 +82,6 @@ impl CleanupStrategy for ComputerRunnerStrategy {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("user_id 缺失"))
     }
-
-    fn name(&self) -> &str {
-        "ComputerAgentRunner"
-    }
 }
 
 /// 判断项目是否活跃
