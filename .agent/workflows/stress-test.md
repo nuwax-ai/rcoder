@@ -148,26 +148,40 @@ cd /Users/apple/workspace/rcoder/docker/scripts && ./diagnose_remote_system.sh <
 
 ## 常用测试场景
 
-### 场景 A: 基准测试（干净环境）
+### 场景 A: claude-code-acp-ts 本地压测（首选）
 
 ```bash
-// 先清理残留容器
-cd /Users/apple/workspace/rcoder/docker/scripts && ./cleanup.sh
+# 使用 claude-code-acp-ts agent 进行本地压测 (10 MCP)
+cd /Users/apple/workspace/rcoder/docker/scripts/20260124
 // turbo
-./stress_test_10mcp_remote_detailed.sh 10 4
+./stress_test_acp_ts_local.sh 10 4
 ```
 
-### 场景 B: 持续压测（测试容器累积效应）
+### 场景 B: nuwaxcode 本地压测
 
 ```bash
-# 连续运行多个批次，观察性能下降趋势
-for i in {1..3}; do
-  ./stress_test_10mcp_remote_detailed.sh 10 4 /tmp/batch${i}.log
-  sleep 30
-done
+# 使用 nuwaxcode agent 进行本地压测 (5 MCP)
+cd /Users/apple/workspace/rcoder/docker/scripts/20260124
+./stress_test_nuwaxcode_local.sh 10 4
 ```
 
-### 场景 C: 容器复用测试（相同 user_id）
+### 场景 C: claude-code-acp-ts 远程压测
+
+```bash
+# 使用 claude-code-acp-ts agent 进行远程压测
+cd /Users/apple/workspace/rcoder/docker/scripts/20260124
+./stress_test_acp_ts_remote.sh 10 4
+```
+
+### 场景 D: nuwaxcode 远程压测
+
+```bash
+# 使用 nuwaxcode agent 进行远程压测
+cd /Users/apple/workspace/rcoder/docker/scripts/20260124
+./stress_test_nuwaxcode_remote.sh 10 4
+```
+
+### 场景 E: 容器复用测试（相同 user_id）
 
 修改脚本中的 `user_id` 逻辑，使用固定值以测试容器复用性能。
 
@@ -217,7 +231,10 @@ done
 
 ## 相关文件
 
-- 压测脚本: `docker/scripts/stress_test_10mcp_remote_detailed.sh`
+- **压测脚本目录**: `docker/scripts/20260124/`
+  - `stress_test_acp_ts_local.sh` - claude-code-acp-ts 本地压测
+  - `stress_test_acp_ts_remote.sh` - claude-code-acp-ts 远程压测
+  - `stress_test_nuwaxcode_local.sh` - nuwaxcode 本地压测
+  - `stress_test_nuwaxcode_remote.sh` - nuwaxcode 远程压测
 - 诊断脚本: `docker/scripts/diagnose_remote_system.sh`
 - 环境配置: `docker/scripts/.env`
-- 历史报告: `docker/stress-test/MCP_STRESS_TEST_REPORT_*.md`
