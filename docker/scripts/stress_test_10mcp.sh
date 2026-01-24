@@ -4,6 +4,8 @@
 
 CONCURRENT=${1:-15}
 ROUNDS=${2:-1}
+# 加载环境变量
+source "$(dirname "$0")/.env"
 API_URL="http://127.0.0.1:8087/computer/chat"
 API_KEY="${TEST_API_KEY:-}"
 
@@ -60,11 +62,18 @@ for round in $(seq 1 $ROUNDS); do
           },
           "agent_config": {
             "agent_server": {
-              "agent_id": "claude-code-acp",
-              "command": "claude-code-acp",
+              "agent_id": "claude-code-acp-ts",
+              "command": "claude-code-acp-ts",
               "args": ["--debug"]
             },
             "context_servers": {
+              "chrome-devtools": {
+                "source": "custom",
+                "enabled": true,
+                "command": "mcp-proxy",
+                "args": ["convert", "http://127.0.0.1:18099"],
+                "env": {}
+              },
               "time": {
                 "source": "custom",
                 "enabled": true,
@@ -112,13 +121,6 @@ for round in $(seq 1 $ROUNDS); do
                 "enabled": true,
                 "command": "uvx",
                 "args": ["mcp-server-sqlite", "--db-path", "/tmp/test.db"],
-                "env": {}
-              },
-              "puppeteer": {
-                "source": "custom",
-                "enabled": true,
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-puppeteer"],
                 "env": {}
               },
               "brave-search": {

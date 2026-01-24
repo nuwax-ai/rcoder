@@ -102,11 +102,22 @@ for round in $(seq 1 $ROUNDS); do
             "requires_openai_auth": true,
             "api_protocol": "anthropic"
           },
+          "resource_limits": {
+            "memory_limit": 4147483648,
+            "cpu_limit": 2.0,
+            "swap_limit": 0
+          },
           "agent_config": {
             "agent_server": {
-              "agent_id": "claude-code-acp",
-              "command": "claude-code-acp",
-              "args": ["--debug"]
+              "agent_id": "claude-code-acp-rs",
+              "command": "claude-code-acp-rs",
+              "args": [
+                  "-d",
+                  "--acp",
+                  "--log-dir",
+                  "/app/container-logs",
+                  "-v"
+              ]
             },
             "context_servers": {
               "chrome-devtools": {
