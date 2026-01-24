@@ -71,10 +71,15 @@ echo "🆔 本次测试 Batch ID: $BATCH_ID"
 echo "🌐 连接到远程服务器: ${REMOTE_HOST}:${REMOTE_API_PORT}"
 echo "🤖 Agent: claude-code-acp-ts"
 echo ""
+# 自动清理环境 (远程)
+if [ -f "$SCRIPT_DIR/../cleanup.sh" ]; then
+  "$SCRIPT_DIR/../cleanup.sh" --remote
+fi
+echo ""
 
 echo "🔥 claude-code-acp-ts 远程压力测试: ${CONCURRENT} 并发 × ${ROUNDS} 轮"
 echo "================================================"
-echo "MCP 工具列表:"
+echo "MCP 工具列表 (10个):"
 echo "  1. chrome-devtools (Chrome 调试)"
 echo "  2. mcp-server-time (时间)"
 echo "  3. mcp-server-fetch (HTTP)"

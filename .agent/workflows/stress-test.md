@@ -148,37 +148,52 @@ cd /Users/apple/workspace/rcoder/docker/scripts && ./diagnose_remote_system.sh <
 
 ## 常用测试场景
 
+> [!TIP]
+> 压测脚本已集成自动清理逻辑 (`cleanup.sh`)，每次执行前会自动清理容器以保证基准一致。
+
 ### 场景 A: claude-code-acp-ts 本地压测（首选）
 
 ```bash
-# 使用 claude-code-acp-ts agent 进行本地压测 (10 MCP)
-cd /Users/apple/workspace/rcoder/docker/scripts/20260124
+# 1. 执行压测 (10 MCP) - 自动清理环境
+cd 20260124
 // turbo
-./stress_test_acp_ts_local.sh 10 4
+./stress_test_acp_ts_local.sh 10 2 /tmp/acp_ts_local.log
+
+# 2. 生成报告
+cd .. && ./generate_report.sh /tmp/acp_ts_local.log
 ```
 
 ### 场景 B: nuwaxcode 本地压测
 
 ```bash
-# 使用 nuwaxcode agent 进行本地压测 (5 MCP)
-cd /Users/apple/workspace/rcoder/docker/scripts/20260124
-./stress_test_nuwaxcode_local.sh 10 4
+# 1. 执行压测 (10 MCP) - 自动清理环境
+cd 20260124
+./stress_test_nuwaxcode_local.sh 10 2 /tmp/nuwax_local.log
+
+# 2. 生成报告
+cd .. && ./generate_report.sh /tmp/nuwax_local.log
 ```
 
 ### 场景 C: claude-code-acp-ts 远程压测
 
 ```bash
-# 使用 claude-code-acp-ts agent 进行远程压测
-cd /Users/apple/workspace/rcoder/docker/scripts/20260124
-./stress_test_acp_ts_remote.sh 10 4
+# 1. 执行压测 - 自动清理环境
+cd 20260124
+./stress_test_acp_ts_remote.sh 10 2 /tmp/acp_ts_remote.log
+
+# 2. 生成报告
+cd .. && ./generate_report.sh /tmp/acp_ts_remote.log
 ```
 
 ### 场景 D: nuwaxcode 远程压测
 
 ```bash
-# 使用 nuwaxcode agent 进行远程压测
-cd /Users/apple/workspace/rcoder/docker/scripts/20260124
-./stress_test_nuwaxcode_remote.sh 10 4
+# 1. 执行压测 - 自动清理环境
+cd 20260124
+./stress_test_nuwaxcode_remote.sh 10 2 /tmp/nuwax_remote.log
+
+# 2. 生成报告
+cd .. && ./generate_report.sh /tmp/nuwax_remote.log
 ```
 
 ### 场景 E: 容器复用测试（相同 user_id）
@@ -236,5 +251,9 @@ cd /Users/apple/workspace/rcoder/docker/scripts/20260124
   - `stress_test_acp_ts_remote.sh` - claude-code-acp-ts 远程压测
   - `stress_test_nuwaxcode_local.sh` - nuwaxcode 本地压测
   - `stress_test_nuwaxcode_remote.sh` - nuwaxcode 远程压测
+- **工具脚本**:
+  - `docker/scripts/generate_report.sh` - 压测报告生成脚本
+  - `docker/scripts/timed_dev_restart.sh` - 带耗时记录的构建脚本
+  - `docker/scripts/cleanup.sh` - 容器清理脚本
 - 诊断脚本: `docker/scripts/diagnose_remote_system.sh`
 - 环境配置: `docker/scripts/.env`

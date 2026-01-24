@@ -41,8 +41,25 @@ echo "🆔 本次测试 Batch ID: $BATCH_ID"
 echo "🖥️  连接到本地服务器: ${LOCAL_HOST}:${LOCAL_API_PORT}"
 echo "🤖 Agent: nuwaxcode"
 echo ""
+# 自动清理环境
+if [ -f "$SCRIPT_DIR/../cleanup.sh" ]; then
+  "$SCRIPT_DIR/../cleanup.sh"
+fi
+echo ""
 
 echo "🔥 nuwaxcode 本地压力测试: ${CONCURRENT} 并发 × ${ROUNDS} 轮"
+echo "================================================"
+echo "MCP 工具列表 (10个):"
+echo "  1. chrome-devtools (Chrome 调试)"
+echo "  2. mcp-server-time (时间)"
+echo "  3. mcp-server-fetch (HTTP)"
+echo "  4. mcp-server-memory (内存KV)"
+echo "  5. mcp-server-filesystem (文件系统)"
+echo "  6. mcp-server-git (Git)"
+echo "  7. mcp-server-github (GitHub)"
+echo "  8. mcp-server-sqlite (SQLite)"
+echo "  9. mcp-server-brave-search (搜索)"
+echo " 10. mcp-server-sequential-thinking (思维链)"
 echo "================================================"
 
 # 请求结果数组
@@ -91,6 +108,13 @@ for round in $(seq 1 $ROUNDS); do
               }
             },
             "context_servers": {
+              "chrome-devtools": {
+                "source": "custom",
+                "enabled": true,
+                "command": "mcp-proxy",
+                "args": ["convert", "http://127.0.0.1:18099"],
+                "env": {}
+              },
               "time": {
                 "source": "custom",
                 "enabled": true,
@@ -124,6 +148,34 @@ for round in $(seq 1 $ROUNDS); do
                 "enabled": true,
                 "command": "uvx",
                 "args": ["mcp-server-git", "--repository", "/tmp"],
+                "env": {}
+              },
+              "github": {
+                "source": "custom",
+                "enabled": true,
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "dummy"}
+              },
+              "sqlite": {
+                "source": "custom",
+                "enabled": true,
+                "command": "uvx",
+                "args": ["mcp-server-sqlite", "--db-path", "/tmp/test.db"],
+                "env": {}
+              },
+              "brave-search": {
+                "source": "custom",
+                "enabled": true,
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+                "env": {"BRAVE_API_KEY": "dummy"}
+              },
+              "sequential-thinking": {
+                "source": "custom",
+                "enabled": true,
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
                 "env": {}
               }
             }
