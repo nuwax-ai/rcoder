@@ -32,6 +32,9 @@ RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-std
 # 安装 claude-code-acp-rs CLI 工具
 RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs
 
+# 测试agent
+RUN echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
+
 # 预安装 mcp-server-time (uvx)
 RUN uvx mcp-server-time --help || echo "mcp-server-time pre-cached"
 

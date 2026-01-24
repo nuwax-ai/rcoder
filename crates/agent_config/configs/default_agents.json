@@ -30,6 +30,37 @@
         "description": "Claude Code ACP Agent - Default configuration",
         "version": "1.0.0"
       }
+    },
+    "claude-code-acp-ts": {
+      "agent_id": "claude-code-acp-ts",
+      "agent_type": "claude",
+      "command": "claude-code-acp-ts",
+      "args": [],
+      "env": {
+        "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}",
+        "ANTHROPIC_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
+        "ANTHROPIC_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
+        "RUST_LOG": "info"
+      },
+      "system_prompt": {
+        "source": "embedded",
+        "template": "",
+        "enabled": true
+      },
+      "user_prompt": {
+        "template": "{user_prompt}",
+        "enabled": false
+      },
+      "installation": {
+        "package_manager": "npm",
+        "package_name": "@zed-industries/claude-code-acp",
+        "version": "latest"
+      },
+      "enabled": true,
+      "metadata": {
+        "description": "Claude Code ACP Agent (TS Fork) - Default configuration",
+        "version": "1.0.0"
+      }
     }
   },
   "context_servers": {

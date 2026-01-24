@@ -91,12 +91,28 @@ pub struct LauncherConnectionInfoComplete {
 pub async fn load_agent_config(
     model_provider: Option<&ModelProviderConfig>,
     service_type: &shared_types::ServiceType,
+    preferred_agent_id: Option<&str>,
 ) -> Result<AgentLaunchConfig> {
     // 根据服务类型加载对应的配置
     let config = AgentServersConfig::load_or_default_for_service(service_type).await;
 
-    // 获取 claude-code-acp 配置
-    if let Some(agent_config) = config.get_agent("claude-code-acp") {
+    // 确定要加载的 agent_id
+    // 1. 如果指定了 preferred_agent_id，优先尝试加载
+    // 2. 否则使用默认的 claude-code-acp
+    let agent_id_to_load = if let Some(id) = preferred_agent_id {
+        // 检查配置中是否存在该 agent_id
+        if config.get_agent(id).is_some() {
+            id
+        } else {
+            warn!("⚠️ 配置中未找到指定的 Agent: {}，尝试回退到默认 Agent", id);
+            "claude-code-acp"
+        }
+    } else {
+        "claude-code-acp"
+    };
+
+    // 获取 agent 配置
+    if let Some(agent_config) = config.get_agent(agent_id_to_load) {
         info!("📋 从配置加载 Agent 参数: {}", agent_config.agent_id);
 
         // 检查并安装 agent（如果有 installation 配置且配置了 package_name）
@@ -179,7 +195,7 @@ pub async fn load_agent_config(
         })
     } else {
         // 配置中没有找到，使用默认值
-        warn!("⚠️ 配置中未找到 claude-code-acp，使用默认配置");
+        warn!("⚠️ 配置中未找到 {}，使用默认配置", agent_id_to_load);
         get_default_agent_config(model_provider, service_type)
     }
 }
@@ -366,9 +382,19 @@ impl<N: SessionNotifier + 'static> ClaudeCodeLauncher<N> {
     where
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
-        // 从配置加载 Agent 参数（传递 service_type）
-        let default_agent_config =
-            load_agent_config(model_provider.as_ref(), &start_config.service_type).await?;
+        // 确定 preferred_agent_id（从 agent_server_override 中提取）
+        let preferred_agent_id = start_config
+            .agent_server_override
+            .as_ref()
+            .and_then(|config| config.agent_id.as_deref());
+
+        // 从配置加载 Agent 参数（传递 service_type 和 preferred_agent_id）
+        let default_agent_config = load_agent_config(
+            model_provider.as_ref(),
+            &start_config.service_type,
+            preferred_agent_id,
+        )
+        .await?;
 
         // 🆕 检查是否有自定义 agent_server 配置覆盖
         let (command_path, command_args, agent_config) =
