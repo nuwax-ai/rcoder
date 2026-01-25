@@ -11,7 +11,7 @@ use dashmap::mapref::one::Ref;
 use shared_types::ProjectAndAgentInfo;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // 导入工作线程池大小常量
 use crate::agent_runtime::WORKER_THREAD_POOL_SIZE;
@@ -700,15 +700,39 @@ impl AgentSessionRegistry {
     /// ## ⚠️ 注意事项
     ///
     /// - 必须与 `try_acquire_session_slot()` 配对使用
-    /// - 多次释放会导致计数器变成负数（溢出后变成超大正数）
+    /// - 使用 CAS 循环防止溢出（从 0 减到 usize::MAX）
     /// - 建议使用 `PendingGuard` RAII 模式自动管理
     pub fn release_session_slot(&self) {
-        let old = self.active_sessions_count.fetch_sub(1, Ordering::Release);
-        debug!(
-            "🔓 [原子槽位] 释放槽位: {} → {}",
-            old,
-            old.saturating_sub(1)
-        );
+        // 🛡️ 使用 CAS 循环防止溢出
+        // 如果当前值为 0，不执行减操作（防止溢出到 usize::MAX）
+        loop {
+            let current = self.active_sessions_count.load(Ordering::Acquire);
+            if current == 0 {
+                warn!("⚠️ [原子槽位] 尝试释放槽位但计数器已为 0，跳过操作（防止溢出）");
+                return;
+            }
+
+            // CAS: 如果当前值仍然是 current，则减 1
+            match self.active_sessions_count.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    debug!(
+                        "🔓 [原子槽位] 释放槽位: {} → {}",
+                        current,
+                        current - 1
+                    );
+                    return;
+                }
+                Err(_) => {
+                    // 值已被其他线程修改，重试
+                    continue;
+                }
+            }
+        }
     }
 
     /// 获取当前活跃会话计数（原子读取）

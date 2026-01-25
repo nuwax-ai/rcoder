@@ -130,7 +130,40 @@ impl AgentLifecycleGuard {
         )
     }
 
-    /// 🔥 新增：带密钥管理器的构造函数
+    /// 🔥 新增：带异常退出标志的构造函数
+    ///
+    /// 创建生命周期守卫时传入共享的 `abnormal_exit_flag`，当子进程异常退出时设置此标志。
+    /// 这使得 SACP 连接层可以检测到异常退出并发送相应的通知。
+    ///
+    /// # 参数
+    ///
+    /// * `abnormal_exit_flag` - 共享的原子布尔标志，子进程异常退出时设置为 true
+    ///
+    /// # Panics
+    ///
+    /// 如果子进程 PID 无效（为 0 或 None），此函数会 panic，因为这意味着进程启动失败。
+    pub fn new_claude_with_abnormal_flag(
+        project_id: String,
+        session_id: SessionId,
+        child_process: Box<dyn ChildWrapper>,
+        stderr_task: JoinHandle<()>,
+        cancel_token: CancellationToken,
+        abnormal_exit_flag: Arc<AtomicBool>,
+    ) -> Self {
+        Self::new_claude_with_key_manager_and_abnormal_flag(
+            project_id,
+            session_id,
+            child_process,
+            stderr_task,
+            cancel_token,
+            None, // 默认无密钥管理器
+            None, // 默认无 project_uuid_map
+            None, // 默认无 service_uuid
+            Some(abnormal_exit_flag),
+        )
+    }
+
+    /// 🔥 新增：带密钥管理器和异常退出标志的构造函数
     ///
     /// 创建生命周期守卫时传入共享的 API 密钥管理器和 service_uuid，
     /// 当 Agent 停止时（Drop）会自动清理对应的 API 密钥配置。
@@ -147,6 +180,7 @@ impl AgentLifecycleGuard {
     /// * `shared_api_key_manager` - 共享的 DashMap，用于清理 API 密钥配置
     /// * `project_uuid_map` - project_id -> service_uuid 映射，用于查找 UUID
     /// * `service_uuid` - 与此 Agent 关联的 service UUID
+    /// * `abnormal_exit_flag` - 共享的原子布尔标志，子进程异常退出时设置为 true
     ///
     /// # Panics
     ///
@@ -155,12 +189,38 @@ impl AgentLifecycleGuard {
     pub fn new_claude_with_key_manager(
         project_id: String,
         session_id: SessionId,
+        child_process: Box<dyn ChildWrapper>,
+        stderr_task: JoinHandle<()>,
+        cancel_token: CancellationToken,
+        shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+        project_uuid_map: Option<Arc<DashMap<String, String>>>,
+        service_uuid: Option<String>,
+    ) -> Self {
+        Self::new_claude_with_key_manager_and_abnormal_flag(
+            project_id,
+            session_id,
+            child_process,
+            stderr_task,
+            cancel_token,
+            shared_api_key_manager,
+            project_uuid_map,
+            service_uuid,
+            None, // 默认无异常退出标志
+        )
+    }
+
+    /// 🔥 完整构造函数：带密钥管理器和异常退出标志
+    #[allow(clippy::too_many_arguments)]
+    fn new_claude_with_key_manager_and_abnormal_flag(
+        project_id: String,
+        session_id: SessionId,
         mut child_process: Box<dyn ChildWrapper>,
         stderr_task: JoinHandle<()>,
         cancel_token: CancellationToken,
         shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
         project_uuid_map: Option<Arc<DashMap<String, String>>>,
         service_uuid: Option<String>,
+        abnormal_exit_flag: Option<Arc<AtomicBool>>,
     ) -> Self {
         // 🔥 关键：PID 有效性检查
         // ChildWrapper 的 id() 返回 Option<u32>，当进程已终止或无效时返回 None
@@ -189,39 +249,82 @@ impl AgentLifecycleGuard {
 
         // 🔥 关键：立即启动后台回收任务
         // 这个任务会等待子进程退出，确保不会产生僵尸进程
-        // 同时监听取消信号，确保可以及时退出
+        // 当子进程退出时，设置 abnormal_exit_flag 并触发 cancel_token
+        // 让 SACP 连接层检测到并发送 SSE 通知
         let cancel_token_for_reaper = cancel_token.clone();
+        let abnormal_exit_flag_clone = abnormal_exit_flag.clone();
+        let project_id_for_reaper = project_id.clone();
         let reaper_task = tokio::spawn(async move {
-            tokio::select! {
-                biased;
+            info!(
+                "[ProcessReaper] 开始监控 Agent 进程: project_id={}, pid={}, pgid={}",
+                project_id_for_reaper, pid, pgid
+            );
 
-                // 优先响应取消信号
-                _ = cancel_token_for_reaper.cancelled() => {
-                    debug!(
-                        "[ProcessReaper] 收到取消信号，退出: pid={}, pgid={}",
-                        pid, pgid
-                    );
-                    return;
-                }
+            // 🔥 优先等待子进程退出，而不是响应取消信号
+            // 这确保了即使收到取消信号，也能正确检测进程是否已退出
+            let wait_result = child_process.wait().await;
 
-                // 等待子进程退出
-                result = child_process.wait() => {
-                    match result {
-                        Ok(status) => {
-                            debug!(
-                                "[ProcessReaper] 子进程已回收: pid={}, pgid={}, status={:?}",
-                                pid, pgid, status
-                            );
+            // 检查是否是外部取消（用户主动 stop）
+            let was_cancelled = cancel_token_for_reaper.is_cancelled();
+
+            match wait_result {
+                Ok(status) => {
+                    // 获取详细的退出信息
+                    let exit_code = status.code();
+                    #[cfg(unix)]
+                    let signal = {
+                        use std::os::unix::process::ExitStatusExt;
+                        status.signal()
+                    };
+                    #[cfg(not(unix))]
+                    let signal: Option<i32> = None;
+
+                    if !status.success() {
+                        // 🔥 非零退出码或被信号杀死 = 异常退出
+                        if let Some(ref flag) = abnormal_exit_flag_clone {
+                            // 只有非用户主动取消时才标记为异常
+                            if !was_cancelled {
+                                flag.store(true, Ordering::SeqCst);
+                            }
                         }
-                        Err(e) => {
-                            // 进程可能已经被其他方式回收
-                            debug!(
-                                "[ProcessReaper] 子进程 wait() 失败（可能已回收）: pid={}, pgid={}, error={}",
-                                pid, pgid, e
-                            );
-                        }
+                        warn!(
+                            "[ProcessReaper] Agent 进程异常退出: project_id={}, pid={}, pgid={}, exit_code={:?}, signal={:?}, was_cancelled={}",
+                            project_id_for_reaper, pid, pgid, exit_code, signal, was_cancelled
+                        );
+                    } else {
+                        info!(
+                            "[ProcessReaper] Agent 进程正常退出: project_id={}, pid={}, pgid={}, exit_code={:?}",
+                            project_id_for_reaper, pid, pgid, exit_code
+                        );
                     }
                 }
+                Err(e) => {
+                    // wait 失败，可能是进程已被其他方式回收
+                    if let Some(ref flag) = abnormal_exit_flag_clone {
+                        if !was_cancelled {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    warn!(
+                        "[ProcessReaper] Agent 进程 wait() 失败: project_id={}, pid={}, pgid={}, error={}, was_cancelled={}",
+                        project_id_for_reaper, pid, pgid, e, was_cancelled
+                    );
+                }
+            }
+
+            // 🔥 关键：触发 cancel_token，通知 SACP 连接层进程已退出
+            // 这会让 SACP 连接检测到并发送 SSE 错误通知，然后断开连接
+            if !was_cancelled {
+                info!(
+                    "[ProcessReaper] 触发 cancel_token，通知 SACP 连接断开: project_id={}, pid={}",
+                    project_id_for_reaper, pid
+                );
+                cancel_token_for_reaper.cancel();
+            } else {
+                debug!(
+                    "[ProcessReaper] cancel_token 已被外部取消，跳过: project_id={}, pid={}",
+                    project_id_for_reaper, pid
+                );
             }
         });
 

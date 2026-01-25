@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
@@ -418,11 +419,17 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 创建 SACP transport
         let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());
 
+        // 🔥 新增：创建共享的异常退出标志
+        // 此标志在 reaper_task 检测到子进程异常退出时设置为 true
+        // SACP 连接层可以检测此标志并发送相应的错误通知
+        let abnormal_exit_flag = Arc::new(AtomicBool::new(false));
+
         // 克隆用于闭包
         let project_path_clone = project_path.clone();
         let project_id_clone = project_id.clone();
         let cancel_token_clone = cancel_token.clone();
         let notifier_clone = self.notifier.clone();
+        let abnormal_exit_flag_clone = abnormal_exit_flag.clone();
 
         // 🔥 使用标准 tokio::spawn（无需 LocalSet！）
         tokio::spawn(async move {
@@ -436,6 +443,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 cancel_rx,
                 cancel_token: cancel_token_clone,
                 notifier: notifier_clone,
+                abnormal_exit_flag: abnormal_exit_flag_clone,
             };
             let result = run_sacp_connection(transport, params).await;
 
@@ -486,13 +494,14 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         });
 
-        // 创建生命周期守卫
-        let lifecycle_guard = AgentLifecycleGuard::new_claude(
+        // 创建生命周期守卫（带异常退出标志）
+        let lifecycle_guard = AgentLifecycleGuard::new_claude_with_abnormal_flag(
             project_id.clone(),
             session_id.clone(),
             child,
             stderr_task,
             cancel_token.clone(),
+            abnormal_exit_flag,
         );
 
         Ok(SacpLauncherConnectionInfo {
@@ -521,6 +530,8 @@ struct SacpConnectionParams<N: SessionNotifier> {
     cancel_rx: mpsc::Receiver<CancelNotificationRequestWrapper>,
     cancel_token: CancellationToken,
     notifier: Arc<N>,
+    /// 🔥 新增：共享的异常退出标志（子进程异常退出时设置为 true）
+    abnormal_exit_flag: Arc<AtomicBool>,
 }
 
 /// 运行 SACP 连接
@@ -544,6 +555,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
         mut cancel_rx,
         cancel_token,
         notifier,
+        abnormal_exit_flag,
     } = params;
 
     // 克隆变量供 handlers 使用
@@ -636,6 +648,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
             let start_config = start_config.clone();
             let notifier_for_prompt = notifier_for_prompt_end.clone();
             let project_id_for_prompt = project_id_for_prompt_end.clone();
+            let abnormal_exit_flag = abnormal_exit_flag.clone();
 
             async move {
                 // 1. 初始化连接
@@ -692,7 +705,37 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 loop {
                     tokio::select! {
                         _ = cancel_token.cancelled() => {
-                            info!("[SACP] 收到取消信号，退出");
+                            // 🔥 检测取消原因，区分"正常取消"和"Agent 进程退出"
+                            // 注意：如果在 prompt 处理中检测到取消，会在内层 loop 发送通知
+                            // 这里只处理"没有正在处理的 prompt"时的情况
+                            let is_abnormal = abnormal_exit_flag.load(Ordering::SeqCst);
+
+                            if is_abnormal {
+                                // Agent 进程异常退出，发送 SSE 错误通知
+                                warn!(
+                                    "[SACP] Agent 进程异常退出，发送 SSE 错误通知并断开连接: project_id={}, session_id={}",
+                                    project_id_for_prompt, session_id
+                                );
+                                if let Err(e) = notifier_for_prompt
+                                    .notify_prompt_error(
+                                        &project_id_for_prompt,
+                                        &session_id.to_string(),
+                                        sacp::Error::new(-32001, "Agent 进程异常退出，请重试"),
+                                        None, // request_id 可能已经不可用
+                                    )
+                                    .await
+                                {
+                                    error!("[SACP] 发送 Agent 退出错误通知失败: {:?}", e);
+                                } else {
+                                    info!("[SACP] 已发送 Agent 退出错误通知: project_id={}", project_id_for_prompt);
+                                }
+                            } else {
+                                // 正常取消信号（用户主动 stop 或 Agent 正常退出）
+                                info!(
+                                    "[SACP] 收到取消信号，断开连接: project_id={}, session_id={}",
+                                    project_id_for_prompt, session_id
+                                );
+                            }
                             break;
                         }
                         Some(cancel_request) = cancel_rx.recv() => {
@@ -756,6 +799,24 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             let prompt_result = loop {
                                 tokio::select! {
                                     biased;
+                                    // 🔥 监听 cancel_token（Agent 进程退出时会触发）
+                                    _ = cancel_token.cancelled() => {
+                                        let is_abnormal = abnormal_exit_flag.load(Ordering::SeqCst);
+                                        if is_abnormal {
+                                            warn!(
+                                                "[SACP] Prompt 处理中检测到 Agent 进程异常退出: project_id={}, session_id={}",
+                                                project_id_for_prompt, session_id
+                                            );
+                                            break Err(sacp::Error::new(-32001, "Agent 进程异常退出，请重试"));
+                                        } else {
+                                            // 正常取消（用户主动取消或 Agent 正常退出）
+                                            info!(
+                                                "[SACP] Prompt 处理中收到取消信号: project_id={}, session_id={}",
+                                                project_id_for_prompt, session_id
+                                            );
+                                            break Err(sacp::Error::new(-32002, "会话已取消"));
+                                        }
+                                    }
                                     // 取消后的超时保护（只有 is_cancelled 为 true 时才有意义）
                                     _ = &mut cancel_timeout, if is_cancelled => {
                                         // 取消后超时，强制返回错误
@@ -852,6 +913,13 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                         {
                                             error!("[SACP] 发送 PromptError 通知失败: {:?}", notify_err);
                                         }
+                                    }
+
+                                    // 🔥 关键：如果 cancel_token 已取消，直接退出外层 loop
+                                    // 避免回到外层 loop 时再次触发 cancel_token.cancelled() 导致重复发送通知
+                                    if cancel_token.is_cancelled() {
+                                        info!("[SACP] Prompt 处理完成且 cancel_token 已取消，退出");
+                                        break;
                                     }
                                 }
                             }
