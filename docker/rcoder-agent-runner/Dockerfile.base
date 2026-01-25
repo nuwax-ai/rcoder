@@ -139,22 +139,21 @@ RUN mkdir -p /etc/pip && \
 # ============================================================================
 # 📦 安装常用 Python 数据科学库 (系统级，所有用户可用)
 # ============================================================================
-# 使用 --break-system-packages 绕过 Debian 12 的 PEP 668 限制
-RUN pip3 install --break-system-packages \
-    numpy \
-    pandas \
-    scipy \
-    matplotlib \
-    openpyxl \
-    python-docx \
-    PyMuPDF \
-    xlrd \
-    xlwt \
-    seaborn \
-    requests \
-    BeautifulSoup4 \
-    lxml \
-    scikit-learn && \
+# 🎯 最佳实践：指定稳定版本，避免版本冲突
+# 1. 升级基础工具确保依赖解析正确
+# 2. 按依赖关系顺序安装（numpy -> pandas/scipy -> matplotlib -> 其他）
+# 3. 使用经过验证的稳定版本组合
+
+# 🎯 使用 requirements.txt 方式安装依赖
+# ======================================
+# 优势：版本锁定、可重现构建、便于维护
+
+# 复制 requirements.txt 文件到容器
+COPY requirements.txt /tmp/requirements.txt
+
+# 升级基础工具并安装依赖
+RUN pip3 install --break-system-packages --upgrade pip setuptools wheel && \
+    pip3 install --break-system-packages -r /tmp/requirements.txt && \
     echo "✅ Python 数据科学库安装完成" && \
     echo "已安装的包:" && \
     pip3 list | grep -E '(numpy|pandas|scipy|matplotlib|openpyxl|python-docx|PyMuPDF|xlrd|xlwt|seaborn|requests|BeautifulSoup|lxml|scikit-learn)'
