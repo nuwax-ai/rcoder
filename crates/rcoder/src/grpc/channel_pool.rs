@@ -8,6 +8,16 @@ use shared_types::grpc::agent_service_client::AgentServiceClient;
 use tonic::transport::Channel;
 use tracing::{debug, info};
 
+/// 创建配置好的 gRPC 客户端（设置消息大小限制）
+///
+/// tonic 的消息大小限制是在 AgentServiceClient 级别配置的，
+/// 无法在 Channel 或 Endpoint 级别统一配置，所以需要这个辅助函数。
+fn create_configured_client(channel: Channel) -> AgentServiceClient<Channel> {
+    AgentServiceClient::new(channel)
+        .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+}
+
 /// gRPC 连接池
 ///
 /// 为每个容器维护独立的 gRPC 连接，支持连接复用
@@ -46,7 +56,7 @@ impl GrpcChannelPool {
         // 第一阶段：快速检查（无锁读）
         if let Some(entry) = self.channels.get(addr) {
             debug!("📡 [gRPC] 复用现有连接: {}", addr);
-            return Ok(AgentServiceClient::new(entry.value().clone()));
+            return Ok(create_configured_client(entry.value().clone()));
         }
 
         // 第二阶段：创建连接（不持有任何锁）
@@ -77,12 +87,12 @@ impl GrpcChannelPool {
                 // 其他线程还没有创建，使用我们创建的连接
                 debug!("📡 [gRPC] 新连接已注册: {}", addr);
                 entry.insert(channel.clone());
-                Ok(AgentServiceClient::new(channel))
+                Ok(create_configured_client(channel))
             }
             Entry::Occupied(entry) => {
                 // 其他线程已经创建了连接，使用已存在的（丢弃我们创建的）
                 debug!("📡 [gRPC] 使用其他线程创建的连接: {}", addr);
-                Ok(AgentServiceClient::new(entry.get().clone()))
+                Ok(create_configured_client(entry.get().clone()))
             }
         }
     }

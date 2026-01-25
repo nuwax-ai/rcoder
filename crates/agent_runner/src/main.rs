@@ -188,9 +188,13 @@ async fn main() -> anyhow::Result<()> {
     let grpc_addr = format!("[::]:{}", grpc_port)
         .parse()
         .map_err(|e| anyhow::anyhow!("gRPC 地址解析失败: {}", e))?;
+
+    // gRPC 消息大小限制：使用 shared_types 统一常量
     let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
         grpc::AgentServiceImpl::new(state.clone()),
-    );
+    )
+    .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+    .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
     let grpc_handle = tokio::spawn(async move {
         info!("🚀 gRPC 服务启动，监听端口: {}", grpc_port);

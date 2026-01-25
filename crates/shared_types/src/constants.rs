@@ -19,6 +19,14 @@ pub const HTTP_DEFAULT_PORT: u16 = 8086;
 /// gRPC 连接超时（秒）
 pub const GRPC_CONNECT_TIMEOUT_SECS: u64 = 5;
 
+/// gRPC 消息大小限制（字节）
+///
+/// 设置为 128MB（tonic 默认 4MB 不够大）
+/// 用于处理大型文件传输（如截图、PDF 等）
+///
+/// 注意：客户端和服务端都需要配置此限制
+pub const GRPC_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024; // 128MB
+
 /// gRPC 请求超时（秒）
 ///
 /// Chat 等可能较慢的请求需要较长超时
