@@ -74,7 +74,6 @@ impl OrphanedContainerCleaner {
         let mut total_cleaned = 0;
 
         for pattern in &self.container_patterns {
-
             let service_type = match Self::infer_service_type_from_pattern(pattern) {
                 Some(st) => st,
                 None => {
@@ -205,7 +204,7 @@ impl OrphanedContainerCleaner {
         // 🛡️ 二次保护期检查：在实际销毁前再次确认容器是否存在且在保护期内
         // 这是为了防止从收集孤立容器列表到实际销毁之间的时间差
         // 🔍 使用 find_container_realtime 获取最新的容器 ID
-        let (actual_container_id, cache_key) = match self
+        let (container_info, cache_key) = match self
             .docker_manager
             .find_container_realtime(&info.container_name)
             .await
@@ -252,7 +251,7 @@ impl OrphanedContainerCleaner {
                     }
                 }
                 // 使用 info.id (project_id) 作为缓存 key
-                (result.container_id, info.id.clone())
+                (result, info.id.clone())
             }
             Ok(None) => {
                 // 容器已不存在，可能已被删除
@@ -272,10 +271,54 @@ impl OrphanedContainerCleaner {
             }
         };
 
+        // 🛡️ 活跃状态检查 (Active Safety Net)
+        // 防止误杀正在活跃但 DB 记录丢失的容器
+        // 如果容器还能响应 gRPC 且 report Active，则绝对不能杀
+        let grpc_addr = format!(
+            "{}:{}",
+            container_info.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
+        );
+
+        let status_checker =
+            crate::cleanup_task::agent::AgentStatusChecker::new(self.state.grpc_pool.clone());
+
+        // 构造查询 ID (对于 orphaned 容器，我们只能使用 info.id 尽力尝试)
+        // RCoder: info.id = project_id
+        // Computer: info.id = user_id
+        let (user_id, project_id) = match info.service_type {
+            ServiceType::RCoder => (info.id.clone(), info.id.clone()),
+            ServiceType::ComputerAgentRunner => (info.id.clone(), info.id.clone()),
+        };
+
+        match status_checker
+            .is_container_active(&grpc_addr, &user_id, &project_id)
+            .await
+        {
+            Ok(true) => {
+                warn!(
+                    "🚨 [orphaned] 阻止误杀：容器虽被标记为孤立（DB无记录），但在 gRPC 检查中处于活跃状态！跳过清理。name={}, ip={}",
+                    info.container_name, container_info.container_ip
+                );
+                // 可以在这里触发警报，因为 DB 和容器状态不一致
+                return Ok(());
+            }
+            Ok(false) => {
+                debug!(
+                    "✅ [orphaned] 容器确认非活跃，可以清理: {}",
+                    info.container_name
+                );
+            }
+            Err(e) => {
+                // 连接失败或超时，说明容器可能已经hung住或死掉，允许清理
+                debug!("⚠️ [orphaned] 容器 gRPC 检查失败，视为可清理: error={}", e);
+            }
+        }
+
         // 使用最新的 container_id 执行销毁
         docker_manager::container_stop::runtime_cleanup_container(
             &self.docker_manager,
-            &actual_container_id,
+            &container_info.container_id,
         )
         .await
         .map_err(|e| anyhow::anyhow!("清理容器失败: {}", e))?;
@@ -285,7 +328,10 @@ impl OrphanedContainerCleaner {
         // 如果直接删除失败，尝试通过容器名称遍历查找并删除缓存
         let mut removed = false;
         if let Some(_) = self.docker_manager.remove_container_cache(&cache_key).await {
-            debug!("🧹 [orphaned] 已通过 identifier 清理 DockerManager 内存缓存: {}", cache_key);
+            debug!(
+                "🧹 [orphaned] 已通过 identifier 清理 DockerManager 内存缓存: {}",
+                cache_key
+            );
             removed = true;
         } else {
             // 回退方案：遍历缓存，通过容器名称匹配删除
