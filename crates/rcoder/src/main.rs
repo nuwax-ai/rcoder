@@ -625,10 +625,6 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) 
 
 /// 清理所有动态创建的容器
 async fn cleanup_all_containers() -> anyhow::Result<()> {
-    // 🔥 临时禁用关闭时清理（测试用）
-    info!("🚫 关闭时容器清理已禁用（测试模式）");
-
-    /*
     info!("🧹 开始清理所有动态创建的容器...");
 
     let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -640,6 +636,7 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
     let multi_image_config = shared_types::create_default_multi_image_config();
 
     // 使用启动清理策略（服务关闭时也使用相同策略）
+    // 🔒 安全说明：只清理数据库中有记录的容器，不会影响其他 RCoder 实例
     match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
         .await
     {
@@ -659,7 +656,6 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
             warn!("查找孤立容器时出错: {}", e);
         }
     }
-    */
 
     Ok(())
 }

@@ -151,7 +151,7 @@ pub struct CleanupConfigSettings {
 }
 
 fn default_cleanup_enabled() -> bool {
-    false // 默认禁用清理（更安全，用户需主动启用）
+    true // 默认启用容器清理功能
 }
 
 fn default_idle_timeout_seconds() -> u64 {

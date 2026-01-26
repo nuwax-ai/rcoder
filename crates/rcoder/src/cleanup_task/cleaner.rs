@@ -117,7 +117,15 @@ impl AgentCleaner {
             }
         }
 
-        // 4. 清理孤立容器（无上限，一次性清理所有）
+        // 4. 清理孤立容器（已禁用运行时检测）
+        // 🔒 多实例隔离修复：不再在运行时扫描所有 Docker 容器
+        // 原因：运行时扫描会误删其他 RCoder 实例的容器
+        // 保留：启动时清理（startup_cleanup_all_enabled_services）- 只清理数据库中有记录的容器
+        //
+        // 需要手动清理时，可使用 Docker 命令：
+        //   docker ps -a --filter "name=rcoder-agent"
+        //   docker rm -f <container_id>
+        /*
         match self.orphaned_cleaner.cleanup().await {
             Ok(orphaned_count) => {
                 current_stats.orphaned_containers_cleaned = orphaned_count;
@@ -127,6 +135,7 @@ impl AgentCleaner {
                 warn!("⚠️ [cleaner] 孤立容器清理失败: {}", e);
             }
         }
+        */
 
         // 5. 更新累计统计
         current_stats.last_cleanup = Some(Utc::now());
