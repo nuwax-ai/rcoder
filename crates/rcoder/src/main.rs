@@ -198,9 +198,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!("🔍 检查并清理上次可能遗留的容器（所有启用的服务）...");
-    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
-        .await
-    {
+    if config.cleanup_config.enabled {
+        match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
+            .await
+        {
         Ok(result) => {
             let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
             if result.successfully_removed > 0 {
@@ -227,6 +228,9 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             warn!("⚠️ 启动时容器清理失败: {}，但这不影响服务启动", e);
         }
+    }
+    } else {
+        info!("🚫 启动时容器清理已禁用（cleanup_config.enabled=false）");
     }
 
     // 从配置文件读取清理配置
@@ -354,12 +358,17 @@ async fn main() -> anyhow::Result<()> {
         api_key_config,
     )?);
 
-    // 在主异步运行时中启动清理任务
-    let cleanup_config_clone = cleanup_config.clone();
-    let state_for_cleanup = state.clone();
-    let _cleanup_handle = cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup)
-        .await
-        .map_err(|e| anyhow::anyhow!("清理任务启动失败: {}", e))?;
+    // 在主异步运行时中启动清理任务（如果启用）
+    let _cleanup_handle = if config.cleanup_config.enabled {
+        let cleanup_config_clone = cleanup_config.clone();
+        let state_for_cleanup = state.clone();
+        Some(cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup)
+            .await
+            .map_err(|e| anyhow::anyhow!("清理任务启动失败: {}", e))?)
+    } else {
+        info!("🚫 容器清理功能已禁用（cleanup_config.enabled=false）");
+        None
+    };
 
     // 启动容器状态检查任务（防止长时间任务的容器被误杀）
     // 🆕 使用增强的配置，包含失败计数器和智能跳过机制
@@ -616,6 +625,10 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) 
 
 /// 清理所有动态创建的容器
 async fn cleanup_all_containers() -> anyhow::Result<()> {
+    // 🔥 临时禁用关闭时清理（测试用）
+    info!("🚫 关闭时容器清理已禁用（测试模式）");
+
+    /*
     info!("🧹 开始清理所有动态创建的容器...");
 
     let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -646,6 +659,7 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
             warn!("查找孤立容器时出错: {}", e);
         }
     }
+    */
 
     Ok(())
 }

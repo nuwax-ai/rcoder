@@ -130,6 +130,9 @@ impl Default for LogCleanupConfig {
 /// 容器清理配置（配置文件格式，使用秒作为单位）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupConfigSettings {
+    /// 是否启用容器清理功能（默认禁用，更安全）
+    #[serde(default = "default_cleanup_enabled")]
+    pub enabled: bool,
     /// 闲置超时时间（秒），默认600秒（10分钟）
     #[serde(default = "default_idle_timeout_seconds")]
     pub idle_timeout_seconds: u64,
@@ -145,6 +148,10 @@ pub struct CleanupConfigSettings {
     /// 日志清理配置
     #[serde(default)]
     pub log_cleanup: LogCleanupConfig,
+}
+
+fn default_cleanup_enabled() -> bool {
+    false // 默认禁用清理（更安全，用户需主动启用）
 }
 
 fn default_idle_timeout_seconds() -> u64 {
@@ -166,6 +173,7 @@ fn default_container_protection_seconds() -> u64 {
 impl Default for CleanupConfigSettings {
     fn default() -> Self {
         Self {
+            enabled: default_cleanup_enabled(),
             idle_timeout_seconds: default_idle_timeout_seconds(),
             cleanup_interval_seconds: default_cleanup_interval_seconds(),
             docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),
