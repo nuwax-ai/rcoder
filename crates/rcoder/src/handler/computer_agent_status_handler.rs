@@ -315,17 +315,46 @@ pub async fn computer_agent_status(
     } else {
         // DuckDB 中无记录，但 gRPC 确认 Agent 存在
         warn!(
-            "⚠️ [COMPUTER_AGENT_STATUS] Agent 存在但 DuckDB 无记录: user_id={}, project_id={}",
+            "⚠️ [COMPUTER_AGENT_STATUS] Agent 存在但 DuckDB 无记录 (可能是服务重启导致状态丢失): user_id={}, project_id={}. 正在尝试自愈(Self-Healing)...",
             request.user_id, request.project_id
         );
+
+        // 🛡️ 自愈逻辑 (Self-Healing)
+        // 自动恢复丢失的项目记录，防止容器被孤立清理器误杀
+        let mut project_info =
+            shared_types::ProjectAndContainerInfo::new(request.project_id.clone());
+        project_info.set_user_id(Some(request.user_id.clone()));
+
+        // 恢复容器信息
+        // 注意：这里我们使用查询到的 container_info
+        project_info.set_container(Some(container_info.clone()));
+        project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+
+        // 设置状态 (根据 gRPC 返回的状态)
+        // gRPC status: "idle", "busy" -> 对应 AgentStatus
+        // 简单起见，我们先恢复记录，状态会在后续的心跳或交互中更新
+
+        // 如果 gRPC 返回了 session_id（虽然 GetStatus 通常不返回 session_id），尝试恢复
+        // 但目前的 GetStatusResponse 没有 session_id 字段，所以只能置空或尝试从其他地方恢复
+        // 这里暂时置空，等下次聊天时会自动更新
+
+        // 插入到 DuckDB
+        state.insert_project(request.project_id.clone(), Arc::new(project_info.clone()));
+
+        info!(
+            "🔄 [COMPUTER_AGENT_STATUS] ✅ 状态自愈成功: 已恢复项目记录 project_id={}, user_id={}",
+            request.project_id, request.user_id
+        );
+
         ComputerAgentStatusResponse {
             user_id: request.user_id.clone(),
             project_id: request.project_id.clone(),
             is_alive: true,
-            session_id: None,
+            session_id: None, // 恢复时暂时无法获知 session_id
             status: Some(grpc_response.status.clone()),
-            last_activity: None,
-            created_at: None,
+            // 使用当前时间作为最后活动时间，避免立即被清理
+            last_activity: Some(chrono::Utc::now()),
+            created_at: Some(chrono::Utc::now()), // 使用当前时间作为创建时间（近似）
         }
     };
 
