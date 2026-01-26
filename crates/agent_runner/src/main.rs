@@ -34,15 +34,99 @@ use model::*;
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use rcoder_proxy::{PingoraServerManager, ProxyConfig};
 use router::AppState;
+use std::panic;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+
+/// 🔥 设置自定义 Panic Hook
+///
+/// 当 agent_runner panic 时，将完整的 panic 信息（包括 backtrace）写入日志文件
+/// 这样即使容器被销毁，也能通过挂载的日志目录找到崩溃原因
+fn set_panic_hook() {
+    let default_hook = panic::take_hook();
+
+    panic::set_hook(Box::new(move |panic_info| {
+        // 🔥 立即写入日志文件（不依赖 tracing，确保在 panic 时也能写入）
+        if let Err(e) = write_panic_to_file(panic_info) {
+            // 如果文件写入失败，尝试输出到 stderr
+            eprintln!("❌ [PANIC] 写入 panic 日志文件失败: {}", e);
+        }
+
+        // 🔥 同时输出到 stderr（Docker 会捕获到容器日志）
+        eprintln!("═══════════════════════════════════════════════════════════");
+        eprintln!("❌ [PANIC] agent_runner 发生致命错误！");
+        eprintln!("═══════════════════════════════════════════════════════════");
+        if let Some(location) = panic_info.location() {
+            eprintln!("panic.location: {}:{}:{}", location.file(), location.line(), location.column());
+        }
+        eprintln!("panic.payload: {}", panic_info);
+        eprintln!("═══════════════════════════════════════════════════════════");
+
+        // 调用默认 hook（会终止进程）
+        default_hook(panic_info);
+    }));
+}
+
+/// 将 panic 信息写入日志文件
+fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()> {
+    // 🔥 日志文件路径：/app/container-logs/agent_runner_panic.log（使用已有的挂载目录）
+    let log_path = PathBuf::from("/app/container-logs/agent_runner_panic.log");
+
+    // 确保目录存在
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // 打开文件（追加模式）
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    // 获取当前时间
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+
+    // 写入 panic 信息
+    writeln!(file, "═══════════════════════════════════════════════════════════")?;
+    writeln!(file, "❌ [PANIC] agent_runner 发生致命错误！")?;
+    writeln!(file, "时间: {}", now)?;
+    writeln!(file, "═══════════════════════════════════════════════════════════")?;
+    if let Some(location) = panic_info.location() {
+        writeln!(file, "panic.location: {}:{}:{}", location.file(), location.line(), location.column())?;
+    }
+    writeln!(file, "panic.payload: {}", panic_info)?;
+
+    // 写入 backtrace（如果启用）
+    #[cfg(feature = "backtrace")]
+    {
+        if let Ok(backtrace) = std::backtrace::Backtrace::capture() {
+            writeln!(file, "Backtrace:\n{}", backtrace)?;
+        }
+    }
+
+    writeln!(file, "═══════════════════════════════════════════════════════════\n")?;
+
+    // 强制刷新到磁盘
+    file.flush()?;
+
+    eprintln!("✅ Panic 信息已写入: {}", log_path.display());
+
+    Ok(())
+}
 
 // 路由创建函数已移动到 handler 模块
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 🔥 设置自定义 Panic Hook，确保 panic 信息被记录
+    set_panic_hook();
+
     // ✅ 初始化 Rustls CryptoProvider（必须在最前面，在任何可能使用 TLS 的代码之前）
+    // 🔥 如果这里失败，会导致 panic，但 panic hook 会捕获并记录
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .expect("❌ [FATAL] Rustls CryptoProvider 初始化失败，程序无法继续运行。这通常是系统环境问题。");
 
     // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner

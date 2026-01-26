@@ -61,7 +61,10 @@ impl AtomicState {
             1 => WorkerState::Running,
             2 => WorkerState::Stopping,
             3 => WorkerState::Stopped,
-            _ => unreachable!(),
+            invalid => {
+                tracing::error!("❌ [AtomicState] 无效的状态值: {}, 返回 Stopped", invalid);
+                WorkerState::Stopped
+            }
         }
     }
 
@@ -254,7 +257,14 @@ impl AgentRuntime {
         if last_ts > 0 {
             // 将毫秒时间戳转换为 DateTime
             use chrono::TimeZone;
-            Some(chrono::Utc.timestamp_millis_opt(last_ts).unwrap())
+            // timestamp_millis_opt 返回 LocalResult，使用 single() 转换为 Option
+            match chrono::Utc.timestamp_millis_opt(last_ts).single() {
+                Some(dt) => Some(dt),
+                None => {
+                    tracing::warn!("⚠️ [WorkerInfo] 无效的时间戳: {}, 使用当前时间", last_ts);
+                    Some(chrono::Utc::now())
+                }
+            }
         } else {
             None
         }

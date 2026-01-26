@@ -274,44 +274,68 @@ impl OrphanedContainerCleaner {
         // 🛡️ 活跃状态检查 (Active Safety Net)
         // 防止误杀正在活跃但 DB 记录丢失的容器
         // 如果容器还能响应 gRPC 且 report Active，则绝对不能杀
-        let grpc_addr = format!(
-            "{}:{}",
-            container_info.container_ip,
-            shared_types::GRPC_DEFAULT_PORT
-        );
-
-        let status_checker =
-            crate::cleanup_task::agent::AgentStatusChecker::new(self.state.grpc_pool.clone());
-
-        // 构造查询 ID (对于 orphaned 容器，我们只能使用 info.id 尽力尝试)
-        // RCoder: info.id = project_id
-        // Computer: info.id = user_id
-        let (user_id, project_id) = match info.service_type {
-            ServiceType::RCoder => (info.id.clone(), info.id.clone()),
-            ServiceType::ComputerAgentRunner => (info.id.clone(), info.id.clone()),
-        };
-
-        match status_checker
-            .is_container_active(&grpc_addr, &user_id, &project_id)
-            .await
-        {
-            Ok(true) => {
-                warn!(
-                    "🚨 [orphaned] 阻止误杀：容器虽被标记为孤立（DB无记录），但在 gRPC 检查中处于活跃状态！跳过清理。name={}, ip={}",
-                    info.container_name, container_info.container_ip
-                );
-                // 可以在这里触发警报，因为 DB 和容器状态不一致
-                return Ok(());
-            }
-            Ok(false) => {
+        // 🔧 通过容器名称重新获取完整的容器信息（包含 IP）
+        let container_ip: Option<String> = match self.docker_manager.get_agent_info(&info.id).await {
+            Ok(Some(agent_info)) => Some(agent_info.container_ip),
+            Ok(None) => {
+                // 无法获取容器信息，可能容器已经不存在了，允许清理
                 debug!(
-                    "✅ [orphaned] 容器确认非活跃，可以清理: {}",
+                    "⚠️ [orphaned] 无法获取容器 IP 信息，视为可清理: name={}",
                     info.container_name
                 );
+                None // 继续执行清理（没有 IP 也无法做 gRPC 检查）
             }
             Err(e) => {
-                // 连接失败或超时，说明容器可能已经hung住或死掉，允许清理
-                debug!("⚠️ [orphaned] 容器 gRPC 检查失败，视为可清理: error={}", e);
+                // 获取容器信息失败，可能是容器已经不存在，允许清理
+                debug!(
+                    "⚠️ [orphaned] 获取容器 IP 失败，视为可清理: name={}, error={}",
+                    info.container_name, e
+                );
+                None // 继续执行清理
+            }
+        };
+
+        // 如果成功获取到 IP，进行 gRPC 健康检查
+        if let Some(ip) = container_ip {
+            let grpc_addr = format!(
+                "{}:{}",
+                ip,
+                shared_types::GRPC_DEFAULT_PORT
+            );
+
+            let status_checker =
+                crate::cleanup_task::agent::AgentStatusChecker::new(self.state.grpc_pool.clone());
+
+            // 构造查询 ID (对于 orphaned 容器，我们只能使用 info.id 尽力尝试)
+            // RCoder: info.id = project_id
+            // Computer: info.id = user_id
+            let (user_id, project_id) = match info.service_type {
+                ServiceType::RCoder => (info.id.clone(), info.id.clone()),
+                ServiceType::ComputerAgentRunner => (info.id.clone(), info.id.clone()),
+            };
+
+            match status_checker
+                .is_container_active(&grpc_addr, &user_id, &project_id)
+                .await
+            {
+                Ok(true) => {
+                    warn!(
+                        "🚨 [orphaned] 阻止误杀：容器虽被标记为孤立（DB无记录），但在 gRPC 检查中处于活跃状态！跳过清理。name={}, ip={}",
+                        info.container_name, ip
+                    );
+                    // 可以在这里触发警报，因为 DB 和容器状态不一致
+                    return Ok(());
+                }
+                Ok(false) => {
+                    debug!(
+                        "✅ [orphaned] 容器确认非活跃，可以清理: {}",
+                        info.container_name
+                    );
+                }
+                Err(e) => {
+                    // 连接失败或超时，说明容器可能已经hung住或死掉，允许清理
+                    debug!("⚠️ [orphaned] 容器 gRPC 检查失败，视为可清理: error={}", e);
+                }
             }
         }
 

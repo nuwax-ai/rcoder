@@ -127,6 +127,8 @@ pub struct ContainerQueryResult {
     pub status: ContainerStatus,
     /// 是否正在运行
     pub is_running: bool,
+    /// 容器 IP 地址（用于 gRPC 健康检查）
+    pub container_ip: String,
 }
 
 /// 容器实时查询结果的 Arc 包装（用于缓存）
@@ -145,6 +147,7 @@ impl ContainerQueryResult {
             container_name,
             status,
             is_running,
+            container_ip: String::new(), // 默认为空，需要后续更新
         }
     }
 
@@ -157,6 +160,24 @@ impl ContainerQueryResult {
             container_name: tuple.1,
             status: tuple.2,
             is_running: tuple.3,
+            container_ip: String::new(), // 默认为空，需要后续更新
+        }
+    }
+
+    /// 创建带有 IP 地址的查询结果（完整构造）
+    pub fn with_ip(
+        container_id: String,
+        container_name: String,
+        status: ContainerStatus,
+        is_running: bool,
+        container_ip: String,
+    ) -> Self {
+        Self {
+            container_id,
+            container_name,
+            status,
+            is_running,
+            container_ip,
         }
     }
 

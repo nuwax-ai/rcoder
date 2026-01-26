@@ -414,9 +414,8 @@ impl AgentService for AgentServiceImpl {
             None
         };
 
-        if let Some(ref provider) = model_provider {
-            let service_uuid_ref = service_uuid.as_ref().unwrap();
-
+        // 🔥 同时解构 model_provider 和 service_uuid，避免 unwrap
+        if let (Some(ref provider), Some(ref service_uuid_ref)) = (model_provider.as_ref(), service_uuid.as_ref()) {
             debug!(
                 "📝 [gRPC] 使用模型配置: provider={}, model={}, base_url={}, api_protocol={:?}, requires_openai_auth={}, service_uuid={}",
                 provider.name,
@@ -431,13 +430,13 @@ impl AgentService for AgentServiceImpl {
             // key: UUID, value: ModelProviderConfig
             self.app_state
                 .shared_api_key_manager
-                .insert(service_uuid_ref.clone(), provider.clone());
+                .insert(service_uuid_ref.to_string(), (*provider).clone());
 
             // 🔒 存储 project_id -> UUID 映射（用于后续清理时查找）
             // 使用独立的 DashMap，类型清晰，key 使用 project_id 便于清理时查找
             self.app_state
                 .project_uuid_map
-                .insert(project_id.clone(), service_uuid_ref.clone());
+                .insert(project_id.clone(), service_uuid_ref.to_string());
 
             // ✅ ApiKeyManager 现在是 shared_api_key_manager 的包装器，不需要单独写入
 

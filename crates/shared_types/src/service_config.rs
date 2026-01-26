@@ -412,6 +412,10 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     environment.insert("SERVICE_MODE".to_string(), "agent-only".to_string());
     environment.insert("AGENT_PORT".to_string(), "8086".to_string());
 
+    // 🔥 Agent 清理配置（通过环境变量控制）
+    // 设置为 3600 秒（1小时），用户可以在 docker/config.yml 中覆盖此值
+    environment.insert("RCODER_AGENT_IDLE_TIMEOUT_SECS".to_string(), "3600".to_string()); // 1 小时
+
     let mounts = vec![];
 
     // 默认启动命令
@@ -566,9 +570,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_valid() {
         let valid = ServiceResourceLimits {
-            memory_limit: Some(1024 * 1024 * 1024), // 1GB
+            memory_limit: Some(1_000_000_000.0),  // 1GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(2 * 1024 * 1024 * 1024),
+            swap_limit: Some(2_000_000_000.0),    // 2GB
         };
         assert!(valid.validate().is_ok());
     }
@@ -576,7 +580,7 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_small() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(256 * 1024 * 1024), // 256MB - 太小
+            memory_limit: Some(256_000_000.0),  // 256MB - 太小
             cpu_limit: None,
             swap_limit: None,
         };
@@ -587,7 +591,7 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_large() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(100 * 1024 * 1024 * 1024), // 100GB - 太大
+            memory_limit: Some(100_000_000_000.0),  // 100GB - 太大
             cpu_limit: None,
             swap_limit: None,
         };
@@ -619,9 +623,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_swap_less_than_memory() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            memory_limit: Some(2_000_000_000.0),  // 2GB
             cpu_limit: None,
-            swap_limit: Some(1024 * 1024 * 1024), // swap < memory
+            swap_limit: Some(1_000_000_000.0),    // 1GB - swap < memory
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -635,29 +639,29 @@ mod tests {
     #[test]
     fn test_resource_limits_merge() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            memory_limit: Some(2_000_000_000.0),  // 2GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(4 * 1024 * 1024 * 1024),
+            swap_limit: Some(4_000_000_000.0),    // 4GB
         };
 
         let override_limits = ServiceResourceLimits {
-            memory_limit: Some(4 * 1024 * 1024 * 1024), // 覆盖
-            cpu_limit: None,                            // 不覆盖
-            swap_limit: Some(8 * 1024 * 1024 * 1024),   // 覆盖
+            memory_limit: Some(4_000_000_000.0),  // 覆盖：4GB
+            cpu_limit: None,                       // 不覆盖
+            swap_limit: Some(8_000_000_000.0),    // 覆盖：8GB
         };
 
         let merged = default_limits.merge_with(&override_limits);
-        assert_eq!(merged.memory_limit, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(merged.memory_limit, Some(4_000_000_000.0));
         assert_eq!(merged.cpu_limit, Some(2.0)); // 保留默认
-        assert_eq!(merged.swap_limit, Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(merged.swap_limit, Some(8_000_000_000.0));
     }
 
     #[test]
     fn test_resource_limits_merge_all_none() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            memory_limit: Some(2_000_000_000.0),  // 2GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(4 * 1024 * 1024 * 1024),
+            swap_limit: Some(4_000_000_000.0),    // 4GB
         };
 
         let override_limits = ServiceResourceLimits {
@@ -668,8 +672,8 @@ mod tests {
 
         let merged = default_limits.merge_with(&override_limits);
         // 所有字段都应该保留默认值
-        assert_eq!(merged.memory_limit, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(merged.memory_limit, Some(2_000_000_000.0));
         assert_eq!(merged.cpu_limit, Some(2.0));
-        assert_eq!(merged.swap_limit, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(merged.swap_limit, Some(4_000_000_000.0));
     }
 }
