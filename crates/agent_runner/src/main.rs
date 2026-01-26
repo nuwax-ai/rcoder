@@ -38,6 +38,7 @@ use std::panic;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use tokio::signal::unix::{signal, SignalKind};
 
 /// 🔥 设置自定义 Panic Hook
 ///
@@ -115,12 +116,89 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
     Ok(())
 }
 
+/// 🔥 设置优雅关闭信号处理器
+///
+/// 监听系统信号，实现优雅关闭：
+/// - SIGTERM: Docker stop 信号
+/// - SIGINT: Ctrl+C 信号
+fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // 监听 SIGTERM（Docker stop）
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ [SIGNAL] 无法注册 SIGTERM 处理器: {}", e);
+                return;
+            }
+        };
+
+        // 监听 SIGINT（Ctrl+C）
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ [SIGNAL] 无法注册 SIGINT 处理器: {}", e);
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                eprintln!("📨 [SIGNAL] 收到 SIGTERM 信号（Docker stop），开始优雅关闭...");
+                write_shutdown_log("SIGTERM");
+            }
+            _ = sigint.recv() => {
+                eprintln!("📨 [SIGNAL] 收到 SIGINT 信号（Ctrl+C），开始优雅关闭...");
+                write_shutdown_log("SIGINT");
+            }
+        }
+
+        eprintln!("🧹 [SIGNAL] 正在清理资源...");
+        // 这里可以添加更多清理逻辑，比如：
+        // - 关闭网络连接
+        // - 保存状态到磁盘
+        // - 通知客户端服务即将关闭
+
+        eprintln!("✅ [SIGNAL] 优雅关闭完成，程序退出");
+        std::process::exit(0);
+    })
+}
+
+/// 将关闭事件写入日志文件
+fn write_shutdown_log(signal: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let log_path = PathBuf::from("/app/container-logs/agent_runner_shutdown.log");
+
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+        let _ = writeln!(file, "═══════════════════════════════════════════════════════════");
+        let _ = writeln!(file, "📨 [SHUTDOWN] agent_runner 收到关闭信号");
+        let _ = writeln!(file, "信号类型: {}", signal);
+        let _ = writeln!(file, "时间: {}", now);
+        let _ = writeln!(file, "═══════════════════════════════════════════════════════════\n");
+        let _ = file.flush();
+        eprintln!("✅ 关闭信息已写入: {}", log_path.display());
+    }
+}
+
 // 路由创建函数已移动到 handler 模块
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 🔥 设置自定义 Panic Hook，确保 panic 信息被记录
     set_panic_hook();
+
+    // 🔥 设置信号处理器，实现优雅关闭（Docker stop、Ctrl+C）
+    let _shutdown_handle = setup_shutdown_handler();
 
     // ✅ 初始化 Rustls CryptoProvider（必须在最前面，在任何可能使用 TLS 的代码之前）
     // 🔥 如果这里失败，会导致 panic，但 panic hook 会捕获并记录
