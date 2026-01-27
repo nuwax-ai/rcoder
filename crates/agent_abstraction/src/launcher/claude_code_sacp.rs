@@ -54,6 +54,12 @@ const ENV_RUST_LOG: &str = "RUST_LOG";
 const ENV_AGENT_WORKING_DIR: &str = "AGENT_WORKING_DIR";
 const ENV_AGENT_PROJECT_ID: &str = "AGENT_PROJECT_ID";
 
+/// OpenAI 环境变量常量
+const ENV_OPENAI_API_KEY: &str = "OPENAI_API_KEY";
+const ENV_OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
+/// nuwaxcode 使用 OPENCODE_MODEL 而不是 OPENAI_MODEL
+const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
+
 /// 默认代理 Base URL（包含 UUID 占位符）
 const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
 
@@ -154,6 +160,7 @@ pub fn get_default_sacp_agent_config(
     let mut env = HashMap::new();
 
     if let Some(provider) = model_provider {
+        // Anthropic 环境变量
         if !provider.api_key.is_empty() {
             env.insert(
                 ENV_ANTHROPIC_API_KEY.to_string(),
@@ -169,6 +176,27 @@ pub fn get_default_sacp_agent_config(
         if !provider.default_model.is_empty() {
             env.insert(
                 ENV_ANTHROPIC_MODEL.to_string(),
+                provider.default_model.clone(),
+            );
+        }
+
+        // OpenAI 环境变量 (支持 OpenAI 兼容的 Agent)
+        if !provider.api_key.is_empty() {
+            env.insert(
+                ENV_OPENAI_API_KEY.to_string(),
+                API_KEY_PLACEHOLDER.to_string(),
+            );
+        }
+        if !provider.base_url.is_empty() {
+            env.insert(
+                ENV_OPENAI_BASE_URL.to_string(),
+                DEFAULT_PROXY_BASE_URL.to_string(),
+            );
+        }
+        if !provider.default_model.is_empty() {
+            // nuwaxcode 使用 OPENCODE_MODEL，model_name 中已包含 openai-compatible/ 前缀
+            env.insert(
+                ENV_OPENCODE_MODEL.to_string(),
                 provider.default_model.clone(),
             );
         }
@@ -392,6 +420,46 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             for (_key, value) in merged_envs.iter_mut() {
                 *value = value.replace("{SERVICE_UUID}", uuid);
             }
+        }
+
+        // 🔒 安全防护：强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
+        // 即使用户在配置中直接写了真实的 API_KEY 或 BASE_URL，也会被替换
+        if model_provider.is_some() {
+            // 强制替换 Anthropic 敏感变量
+            if merged_envs.contains_key(ENV_ANTHROPIC_API_KEY) {
+                merged_envs.insert(
+                    ENV_ANTHROPIC_API_KEY.to_string(),
+                    API_KEY_PLACEHOLDER.to_string(),
+                );
+            }
+            if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
+                merged_envs.insert(
+                    ENV_ANTHROPIC_BASE_URL.to_string(),
+                    service_uuid
+                        .as_ref()
+                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
+                );
+            }
+
+            // 强制替换 OpenAI 敏感变量
+            if merged_envs.contains_key(ENV_OPENAI_API_KEY) {
+                merged_envs.insert(
+                    ENV_OPENAI_API_KEY.to_string(),
+                    API_KEY_PLACEHOLDER.to_string(),
+                );
+            }
+            if merged_envs.contains_key(ENV_OPENAI_BASE_URL) {
+                merged_envs.insert(
+                    ENV_OPENAI_BASE_URL.to_string(),
+                    service_uuid
+                        .as_ref()
+                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
+                );
+            }
+
+            debug!("[SACP] 🔒 已强制替换敏感环境变量为占位符/代理 URL");
         }
 
         // 启动子进程（使用 process group 来管理整个进程树）
@@ -1062,6 +1130,88 @@ mod tests {
         assert_eq!(
             config.env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
             Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_default_config_with_openai_provider() {
+        let provider = ModelProviderConfig {
+            id: "test-openai".to_string(),
+            name: "openai".to_string(),
+            api_key: "sk-test-openai-key".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            default_model: "openai-compatible/gpt-4".to_string(), // model_name 已包含前缀
+            requires_openai_auth: true,
+            api_protocol: Some("openai".to_string()),
+        };
+
+        let config =
+            get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::RCoder);
+        assert!(config.is_ok());
+        let config = config.unwrap();
+
+        // 验证 OpenAI 环境变量
+        assert!(config.env.contains_key("OPENAI_API_KEY"));
+        assert_eq!(
+            config.env.get("OPENAI_API_KEY"),
+            Some(&API_KEY_PLACEHOLDER.to_string())
+        );
+
+        assert!(config.env.contains_key("OPENAI_BASE_URL"));
+        assert_eq!(
+            config.env.get("OPENAI_BASE_URL"),
+            Some(&DEFAULT_PROXY_BASE_URL.to_string())
+        );
+
+        // nuwaxcode 使用 OPENCODE_MODEL，直接使用 model_name（已包含 openai-compatible/ 前缀）
+        assert!(config.env.contains_key("OPENCODE_MODEL"));
+        assert_eq!(
+            config.env.get("OPENCODE_MODEL"),
+            Some(&"openai-compatible/gpt-4".to_string())
+        );
+
+        // 同时验证 Anthropic 环境变量也存在 (兼容性)
+        assert!(config.env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(config.env.contains_key("ANTHROPIC_BASE_URL"));
+    }
+
+    #[test]
+    fn test_sensitive_env_vars_protection() {
+        // 测试即使配置中有真实的 API_KEY，也会被 launch 函数强制替换为占位符
+        // 注意：这个测试验证的是设计意图，实际的强制替换发生在 launch 函数中
+        let provider = ModelProviderConfig {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            api_key: "sk-real-key-should-be-replaced".to_string(),
+            base_url: "https://real-url-should-be-replaced.com".to_string(),
+            default_model: "openai-compatible/gpt-4".to_string(),
+            requires_openai_auth: true,
+            api_protocol: Some("openai".to_string()),
+        };
+
+        let config =
+            get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::RCoder);
+        assert!(config.is_ok());
+        let config = config.unwrap();
+
+        // 验证默认配置中敏感变量已经是占位符
+        assert_eq!(
+            config.env.get("ANTHROPIC_API_KEY"),
+            Some(&API_KEY_PLACEHOLDER.to_string())
+        );
+        assert_eq!(
+            config.env.get("OPENAI_API_KEY"),
+            Some(&API_KEY_PLACEHOLDER.to_string())
+        );
+
+        // BASE_URL 应该是代理 URL（包含占位符）
+        assert_eq!(
+            config.env.get("ANTHROPIC_BASE_URL"),
+            Some(&DEFAULT_PROXY_BASE_URL.to_string())
+        );
+        assert_eq!(
+            config.env.get("OPENAI_BASE_URL"),
+            Some(&DEFAULT_PROXY_BASE_URL.to_string())
         );
     }
 
