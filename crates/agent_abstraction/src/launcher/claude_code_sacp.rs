@@ -462,6 +462,27 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             debug!("[SACP] 🔒 已强制替换敏感环境变量为占位符/代理 URL");
         }
 
+        // 🔍 打印传递给 Agent 的完整环境变量（用于调试）
+        // 注意：此时敏感字段已被安全替换，可以放心打印
+        debug!(
+            "[SACP] 📋 启动 Agent 命令: {} {:?}",
+            command_path, command_args
+        );
+        debug!("[SACP] 📋 工作目录: {:?}", project_path);
+        info!(
+            "[SACP] 📋 传递给 Agent 的环境变量 ({} 个):",
+            merged_envs.len()
+        );
+
+        // 按字母顺序排序并打印所有环境变量
+        let mut env_keys: Vec<_> = merged_envs.keys().collect();
+        env_keys.sort();
+
+        for key in env_keys.iter() {
+            let value = merged_envs.get(*key).unwrap();
+            info!("[SACP] 📋   {} = {}", key, value);
+        }
+
         // 启动子进程（使用 process group 来管理整个进程树）
         // 使用 ProcessGroup::leader() 创建真正的进程组，确保能够清理所有孙进程
         let mut child = CommandWrap::with_new(&command_path, |cmd| {
