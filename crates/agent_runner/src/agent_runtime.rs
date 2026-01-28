@@ -22,7 +22,7 @@
 //! | 重启 | 替换 sender | abort + spawn |
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,7 +92,21 @@ pub struct WorkerReady {
 /// 并发控制配置
 ///
 /// 工作线程池大小 - 决定可以并发处理的 Agent 会话数量
-pub const WORKER_THREAD_POOL_SIZE: usize = 10;
+/// 🔥 已改为运行时可配置的全局变量，使用 get_concurrency_limit() 获取
+
+/// 全局并发限制（运行时可配置）
+pub static WORKER_THREAD_POOL_SIZE: AtomicUsize = AtomicUsize::new(10);
+
+/// 初始化并发限制（在应用启动时调用）
+pub fn init_concurrency_limit(limit: usize) {
+    WORKER_THREAD_POOL_SIZE.store(limit, Ordering::Release);
+    info!("🔧 并发限制已初始化: {}", limit);
+}
+
+/// 获取当前并发限制
+pub fn get_concurrency_limit() -> usize {
+    WORKER_THREAD_POOL_SIZE.load(Ordering::Acquire)
+}
 
 /// Agent 运行时
 ///

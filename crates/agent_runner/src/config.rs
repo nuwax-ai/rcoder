@@ -51,6 +51,9 @@ pub struct AppConfig {
     /// gRPC 超时配置
     #[serde(default)]
     pub grpc_timeouts: Option<GrpcTimeoutConfig>,
+    /// Agent 并发配置
+    #[serde(default)]
+    pub agent_concurrency: Option<AgentConcurrencyConfig>,
 }
 
 fn default_agent_id() -> String {
@@ -90,6 +93,44 @@ pub struct AgentCleanupConfig {
     /// Cleanup check interval (seconds), default 30
     #[serde(default = "default_cleanup_interval")]
     pub cleanup_interval_secs: u64,
+}
+
+/// Agent 并发配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConcurrencyConfig {
+    /// 并发会话槽位数量，默认 10
+    #[serde(default = "default_concurrency_limit")]
+    pub concurrency_limit: usize,
+}
+
+/// Agent 并发配置常量
+impl AgentConcurrencyConfig {
+    /// 最小并发限制
+    pub const MIN_CONCURRENCY_LIMIT: usize = 1;
+
+    /// 验证配置值是否在有效范围内
+    pub fn validate(&self) -> Result<(), String> {
+        if self.concurrency_limit < Self::MIN_CONCURRENCY_LIMIT {
+            return Err(format!(
+                "concurrency_limit 必须 >= {}，当前值: {}",
+                Self::MIN_CONCURRENCY_LIMIT,
+                self.concurrency_limit
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_concurrency_limit() -> usize {
+    10
+}
+
+impl Default for AgentConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            concurrency_limit: default_concurrency_limit(),
+        }
+    }
 }
 
 /// gRPC timeout configuration
@@ -276,6 +317,7 @@ impl Default for AppConfig {
             proxy_config: Some(ProxyConfig::default()),
             agent_cleanup: Some(AgentCleanupConfig::default()),
             grpc_timeouts: Some(GrpcTimeoutConfig::default()),
+            agent_concurrency: Some(AgentConcurrencyConfig::default()),
         }
     }
 }
@@ -398,6 +440,36 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                 warn!(
                     "环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 值格式无效: {}，使用配置文件中的值",
                     cleanup_interval
+                );
+            }
+        }
+    }
+
+    // 🆕 Agent 并发配置：支持环境变量覆盖
+    if let Ok(concurrency_limit) = env::var("RCODER_AGENT_CONCURRENCY_LIMIT") {
+        match concurrency_limit.parse::<usize>() {
+            Ok(limit) => {
+                if limit >= AgentConcurrencyConfig::MIN_CONCURRENCY_LIMIT {
+                    config
+                        .agent_concurrency
+                        .get_or_insert_with(Default::default)
+                        .concurrency_limit = limit;
+                    info!(
+                        "使用环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 设置并发限制: {}",
+                        limit
+                    );
+                } else {
+                    warn!(
+                        "环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 值无效: {}, 必须 >= {}，使用配置文件中的值",
+                        limit,
+                        AgentConcurrencyConfig::MIN_CONCURRENCY_LIMIT
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 值格式无效: {}，使用配置文件中的值",
+                    concurrency_limit
                 );
             }
         }
@@ -535,6 +607,13 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             config.agent_cleanup = Some(AgentCleanupConfig::default());
         }
 
+    // 🆕 验证 Agent 并发配置的有效性
+    if let Some(ref concurrency_config) = config.agent_concurrency
+        && let Err(e) = concurrency_config.validate() {
+            warn!("Agent 并发配置验证失败: {}，使用默认配置", e);
+            config.agent_concurrency = Some(AgentConcurrencyConfig::default());
+        }
+
     // 4. 处理代理配置
     if cli_args.enable_proxy {
         let proxy_config = ProxyConfig {
@@ -620,6 +699,9 @@ fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
     // 获取 grpc_timeouts 配置，如果不存在则使用默认值
     let grpc_timeouts = config.grpc_timeouts.as_ref().cloned().unwrap_or_default();
 
+    // 获取 agent_concurrency 配置，如果不存在则使用默认值
+    let agent_concurrency = config.agent_concurrency.as_ref().cloned().unwrap_or_default();
+
     // 手动构建带注释的 YAML 内容
     let content_with_comments = format!(
         r#"# rcoder 配置文件
@@ -695,6 +777,16 @@ grpc_timeouts:
   # 有效范围: 100 - 10000 毫秒
   # 可通过环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 覆盖
   port_check_timeout_millis: {}
+
+# Agent 并发配置
+# 如果省略此配置块，将使用以下默认值：
+#   - concurrency_limit: 10 (10个并发会话)
+agent_concurrency:
+  # Agent 并发会话槽位数量
+  # 决定可以同时处理的 Agent 会话数量
+  # 有效范围: >= 1
+  # 可通过环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 覆盖
+  concurrency_limit: {}
 "#,
         config.default_agent_id,
         config.projects_dir.display(),
@@ -713,7 +805,8 @@ grpc_timeouts:
         grpc_timeouts.cancel_session_timeout_secs,
         grpc_timeouts.acp_session_create_timeout_secs,
         grpc_timeouts.agent_cancel_timeout_secs,
-        grpc_timeouts.port_check_timeout_millis
+        grpc_timeouts.port_check_timeout_millis,
+        agent_concurrency.concurrency_limit
     );
 
     fs::write(CONFIG_FILE, content_with_comments)

@@ -110,6 +110,9 @@ docker_config:
           # 🔥 Agent 清理配置（闲置超时时间，秒）
           # 默认值: 3600 (1小时)
           RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
+          # 🔥 Agent 并发会话槽位数量
+          # 默认值: 10
+          RCODER_AGENT_CONCURRENCY_LIMIT: "5"
 
         command:
           - "/usr/local/bin/agent_runner"

@@ -14,7 +14,7 @@ use tokio::sync::Barrier;
 // 重新导出必要的类型
 use agent_runner::service::AgentSessionRegistry;
 use agent_runner::service::PendingGuard;
-use agent_runner::agent_runtime::WORKER_THREAD_POOL_SIZE;
+use agent_runner::agent_runtime::{get_concurrency_limit, init_concurrency_limit};
 use sacp::schema::SessionId;
 use shared_types::{AgentStatus, ProjectAndAgentInfo, SessionEntry};
 use tokio::sync::mpsc;
@@ -85,8 +85,11 @@ fn test_pending_guard_early_return_cleanup() {
 
 #[tokio::test]
 async fn test_atomic_slot_counter_concurrent_acquisition() {
+    // 重置并发限制为默认值，防止其他测试影响
+    init_concurrency_limit(10);
     let registry = Arc::new(AgentSessionRegistry::new());
-    let num_tasks = WORKER_THREAD_POOL_SIZE * 2;
+    let limit = get_concurrency_limit();
+    let num_tasks = limit * 2;
     let barrier = Arc::new(Barrier::new(num_tasks));
     let successful_count = Arc::new(AtomicUsize::new(0));
     let failed_count = Arc::new(AtomicUsize::new(0));
@@ -126,18 +129,19 @@ async fn test_atomic_slot_counter_concurrent_acquisition() {
     // 验证: 只有 WORKER_THREAD_POOL_SIZE 个任务成功
     let successful = successful_count.load(Ordering::Relaxed);
     let failed = failed_count.load(Ordering::Relaxed);
+    let limit = get_concurrency_limit();
 
     assert_eq!(
         successful,
-        WORKER_THREAD_POOL_SIZE,
+        limit,
         "应该有 {} 个任务成功获取槽位",
-        WORKER_THREAD_POOL_SIZE
+        limit
     );
     assert_eq!(
         failed,
-        WORKER_THREAD_POOL_SIZE,
+        limit,
         "应该有 {} 个任务失败（槽位已满）",
-        WORKER_THREAD_POOL_SIZE
+        limit
     );
 
     // 验证: 计数器最终应该回到 0

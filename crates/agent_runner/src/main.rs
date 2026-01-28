@@ -239,6 +239,11 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
+    // 🔥 初始化并发限制（从配置读取）
+    if let Some(ref concurrency_config) = config.agent_concurrency {
+        agent_runtime::init_concurrency_limit(concurrency_config.concurrency_limit);
+    }
+
     // 🔥 创建 AgentRuntime（新架构）
     let (agent_runtime, task_receiver) = AgentRuntime::new(1000);
     let agent_runtime = Arc::new(agent_runtime);

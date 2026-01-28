@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use sacp::schema::SessionId;
 
 use crate::{
-    agent_runtime::WORKER_THREAD_POOL_SIZE,
+    agent_runtime::get_concurrency_limit,
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::SESSION_REQUEST_CONTEXT,
     service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
@@ -302,7 +302,7 @@ pub async fn agent_worker_with_heartbeat(
 
             // 📊 获取当前活跃 Worker 数量
             let active_count = AGENT_REGISTRY.stats().agent_count;
-            let total_count = WORKER_THREAD_POOL_SIZE;
+            let total_count = get_concurrency_limit();
 
             let timestamp = Utc::now();
 
@@ -416,10 +416,11 @@ pub async fn agent_worker_with_heartbeat(
             if is_new_session {
                 // 🔥 修复：槽位对应 Agent 生命周期，只在创建新 Agent 时获取槽位
                 if !AGENT_REGISTRY.try_acquire_session_slot() {
+                    let limit = get_concurrency_limit();
                     error!(
                         "🛡️ [原子并发限制] Agent 会话槽位已满 ({}/{}), 拒绝新请求 - project_id={}, request_id={}",
                         AGENT_REGISTRY.active_sessions_count(),
-                        WORKER_THREAD_POOL_SIZE,
+                        limit,
                         project_id,
                         request_id
                     );
@@ -433,7 +434,7 @@ pub async fn agent_worker_with_heartbeat(
                         code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
                         error: Some(format!(
                             "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
-                            WORKER_THREAD_POOL_SIZE
+                            limit
                         )),
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
@@ -446,7 +447,7 @@ pub async fn agent_worker_with_heartbeat(
                 info!(
                     "✅ [原子槽位] 成功获取槽位: {}/{} - project_id={}",
                     AGENT_REGISTRY.active_sessions_count(),
-                    WORKER_THREAD_POOL_SIZE,
+                    get_concurrency_limit(),
                     project_id
                 );
 
