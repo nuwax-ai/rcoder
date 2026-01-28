@@ -25,7 +25,9 @@
       "Bash(tree:*)",
       "Bash(grep:*)",
       "mcp__sequential-thinking__sequentialthinking",
-      "Bash(docker exec:*)"
+      "Bash(docker exec:*)",
+      "mcp__acp__Bash",
+      "mcp__acp__Edit"
     ],
     "deny": [],
     "ask": []

@@ -136,11 +136,9 @@ impl ImageSelector {
                     debug!("使用服务ARM64镜像: {}", arm64_image);
                     return Ok(arm64_image.clone());
                 }
-            } else {
-                if let Some(amd64_image) = &service_config.amd64_image {
-                    debug!("使用服务AMD64镜像: {}", amd64_image);
-                    return Ok(amd64_image.clone());
-                }
+            } else if let Some(amd64_image) = &service_config.amd64_image {
+                debug!("使用服务AMD64镜像: {}", amd64_image);
+                return Ok(amd64_image.clone());
             }
         }
 

@@ -1,6 +1,5 @@
 //! Error types for agent configuration.
 
-use std::io;
 use thiserror::Error;
 
 /// Agent configuration error

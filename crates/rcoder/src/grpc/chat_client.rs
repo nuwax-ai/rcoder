@@ -91,13 +91,8 @@ pub fn grpc_response_to_chat_response(grpc_resp: GrpcChatResponse) -> shared_typ
         session_id: grpc_resp.session_id,
         error: grpc_resp.error,
         request_id: grpc_resp.request_id,
-        // 🆕 映射降级标识字段
-        need_fallback: if grpc_resp.need_fallback {
-            Some(true)
-        } else {
-            None
-        },
-        fallback_reason: grpc_resp.fallback_reason,
+        need_fallback: None,
+        fallback_reason: None,
     }
 }
 

@@ -80,7 +80,7 @@ pub trait SessionNotifier: Send + Sync + 'static {
         &self,
         project_id: &str,
         session_id: &str,
-        stop_reason: agent_client_protocol::StopReason,
+        stop_reason: sacp::schema::StopReason,
         error_message: Option<String>,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -90,7 +90,7 @@ pub trait SessionNotifier: Send + Sync + 'static {
         &self,
         project_id: &str,
         session_id: &str,
-        error: agent_client_protocol::Error,
+        error: sacp::schema::Error,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -99,7 +99,7 @@ pub trait SessionNotifier: Send + Sync + 'static {
         &self,
         project_id: &str,
         session_id: &str,
-        session_update: agent_client_protocol::SessionUpdate,
+        session_update: sacp::schema::SessionUpdate,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

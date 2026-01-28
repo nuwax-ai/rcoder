@@ -15,11 +15,9 @@
 mod acp_worker;
 mod session_file_scanner;
 mod session_manager;
-mod session_validator;
 mod worker;
 
 pub use acp_worker::AcpAgentWorker;
 pub use session_file_scanner::check_session_file_exists;
 pub use session_manager::AcpSessionManager;
-pub use session_validator::check_session_exists_via_api;
 pub use worker::{AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};

@@ -84,8 +84,10 @@ fn extract_project_dir_from_path(file_path: &Path) -> Option<String> {
     None
 }
 
-/// 扫描项目目录，获取所有 session_id
-fn scan_project_sessions(project_path: &str) -> HashSet<String> {
+/// 扫描项目目录，获取所有 session_id（异步版本）
+///
+/// 使用 tokio::fs 异步 I/O，避免阻塞 Tokio 工作线程
+async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
     let projects_dir = get_projects_dir();
     let encoded_path = encode_project_path(project_path);
 
@@ -99,21 +101,35 @@ fn scan_project_sessions(project_path: &str) -> HashSet<String> {
         return session_ids;
     }
 
-    // 遍历所有可能匹配的项目目录
-    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-        for entry in entries.flatten() {
-            let dir_name = entry.file_name().to_string_lossy().to_string();
+    // 使用异步 I/O 遍历目录
+    let Ok(mut dir_entries) = tokio::fs::read_dir(&projects_dir).await else {
+        warn!(
+            "🔍 [文件扫描] 无法读取项目目录: {}",
+            projects_dir.display()
+        );
+        return session_ids;
+    };
 
-            // 匹配编码后的路径（精确或带哈希后缀）
-            if dir_name.starts_with(&encoded_path) {
-                if let Ok(files) = std::fs::read_dir(entry.path()) {
-                    for file in files.flatten() {
-                        let filename = file.file_name().to_string_lossy().to_string();
-                        if filename.ends_with(".jsonl") {
-                            // 提取 session_id（去掉 .jsonl 后缀）
-                            let session_id = filename.trim_end_matches(".jsonl").to_string();
-                            session_ids.insert(session_id);
-                        }
+    while let Ok(Some(entry)) = dir_entries.next_entry().await {
+        let dir_name = entry.file_name();
+
+        // 匹配编码后的路径（精确或带哈希后缀）
+        // 使用 OsStr 避免不必要的 String 分配
+        if dir_name.to_string_lossy().starts_with(encoded_path.as_str()) {
+            let Ok(mut files) = tokio::fs::read_dir(entry.path()).await else {
+                warn!(
+                    "🔍 [文件扫描] 无法读取会话目录: {}",
+                    entry.path().display()
+                );
+                continue;
+            };
+
+            while let Ok(Some(file)) = files.next_entry().await {
+                if let Some(filename) = file.file_name().to_str() {
+                    if filename.ends_with(".jsonl") {
+                        // 提取 session_id（去掉 .jsonl 后缀）
+                        let session_id = filename.trim_end_matches(".jsonl").to_string();
+                        session_ids.insert(session_id);
                     }
                 }
             }
@@ -314,7 +330,7 @@ pub async fn check_session_file_exists(session_id: &str, project_path: &str) -> 
         "🔍 [文件扫描] 缓存未命中，扫描目录: project_path={}",
         project_path
     );
-    let session_ids = scan_project_sessions(project_path);
+    let session_ids = scan_project_sessions(project_path).await;
     let exists = session_ids.contains(session_id);
 
     // 存入缓存

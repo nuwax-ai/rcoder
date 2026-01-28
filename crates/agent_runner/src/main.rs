@@ -2,12 +2,12 @@ use clap::Parser;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
-mod agent_worker_manager;
+mod agent_runtime;
 mod api_key_manager;
 mod config;
 mod grpc;
@@ -24,26 +24,187 @@ mod profiler;
 #[allow(dead_code)]
 mod otel_tracing;
 
-mod middleware;
 mod router;
 mod service;
 mod utils;
 
-use agent_worker_manager::AgentWorkerManager;
+use agent_runtime::AgentRuntime;
 use config::{CliArgs, load_config_with_args};
 use model::*;
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use rcoder_proxy::{PingoraServerManager, ProxyConfig};
 use router::AppState;
+use std::panic;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use tokio::signal::unix::{signal, SignalKind};
+
+/// 🔥 设置自定义 Panic Hook
+///
+/// 当 agent_runner panic 时，将完整的 panic 信息（包括 backtrace）写入日志文件
+/// 这样即使容器被销毁，也能通过挂载的日志目录找到崩溃原因
+fn set_panic_hook() {
+    let default_hook = panic::take_hook();
+
+    panic::set_hook(Box::new(move |panic_info| {
+        // 🔥 立即写入日志文件（不依赖 tracing，确保在 panic 时也能写入）
+        if let Err(e) = write_panic_to_file(panic_info) {
+            // 如果文件写入失败，尝试输出到 stderr
+            eprintln!("❌ [PANIC] 写入 panic 日志文件失败: {}", e);
+        }
+
+        // 🔥 同时输出到 stderr（Docker 会捕获到容器日志）
+        eprintln!("═══════════════════════════════════════════════════════════");
+        eprintln!("❌ [PANIC] agent_runner 发生致命错误！");
+        eprintln!("═══════════════════════════════════════════════════════════");
+        if let Some(location) = panic_info.location() {
+            eprintln!("panic.location: {}:{}:{}", location.file(), location.line(), location.column());
+        }
+        eprintln!("panic.payload: {}", panic_info);
+        eprintln!("═══════════════════════════════════════════════════════════");
+
+        // 调用默认 hook（会终止进程）
+        default_hook(panic_info);
+    }));
+}
+
+/// 将 panic 信息写入日志文件
+fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()> {
+    // 🔥 日志文件路径：/app/container-logs/agent_runner_panic.log（使用已有的挂载目录）
+    let log_path = PathBuf::from("/app/container-logs/agent_runner_panic.log");
+
+    // 确保目录存在
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // 打开文件（追加模式）
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    // 获取当前时间
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+
+    // 写入 panic 信息
+    writeln!(file, "═══════════════════════════════════════════════════════════")?;
+    writeln!(file, "❌ [PANIC] agent_runner 发生致命错误！")?;
+    writeln!(file, "时间: {}", now)?;
+    writeln!(file, "═══════════════════════════════════════════════════════════")?;
+    if let Some(location) = panic_info.location() {
+        writeln!(file, "panic.location: {}:{}:{}", location.file(), location.line(), location.column())?;
+    }
+    writeln!(file, "panic.payload: {}", panic_info)?;
+
+    // 写入 backtrace（如果启用）
+    #[cfg(feature = "backtrace")]
+    {
+        if let Ok(backtrace) = std::backtrace::Backtrace::capture() {
+            writeln!(file, "Backtrace:\n{}", backtrace)?;
+        }
+    }
+
+    writeln!(file, "═══════════════════════════════════════════════════════════\n")?;
+
+    // 强制刷新到磁盘
+    file.flush()?;
+
+    eprintln!("✅ Panic 信息已写入: {}", log_path.display());
+
+    Ok(())
+}
+
+/// 🔥 设置优雅关闭信号处理器
+///
+/// 监听系统信号，实现优雅关闭：
+/// - SIGTERM: Docker stop 信号
+/// - SIGINT: Ctrl+C 信号
+fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // 监听 SIGTERM（Docker stop）
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ [SIGNAL] 无法注册 SIGTERM 处理器: {}", e);
+                return;
+            }
+        };
+
+        // 监听 SIGINT（Ctrl+C）
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ [SIGNAL] 无法注册 SIGINT 处理器: {}", e);
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                eprintln!("📨 [SIGNAL] 收到 SIGTERM 信号（Docker stop），开始优雅关闭...");
+                write_shutdown_log("SIGTERM");
+            }
+            _ = sigint.recv() => {
+                eprintln!("📨 [SIGNAL] 收到 SIGINT 信号（Ctrl+C），开始优雅关闭...");
+                write_shutdown_log("SIGINT");
+            }
+        }
+
+        eprintln!("🧹 [SIGNAL] 正在清理资源...");
+        // 这里可以添加更多清理逻辑，比如：
+        // - 关闭网络连接
+        // - 保存状态到磁盘
+        // - 通知客户端服务即将关闭
+
+        eprintln!("✅ [SIGNAL] 优雅关闭完成，程序退出");
+        std::process::exit(0);
+    })
+}
+
+/// 将关闭事件写入日志文件
+fn write_shutdown_log(signal: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let log_path = PathBuf::from("/app/container-logs/agent_runner_shutdown.log");
+
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+        let _ = writeln!(file, "═══════════════════════════════════════════════════════════");
+        let _ = writeln!(file, "📨 [SHUTDOWN] agent_runner 收到关闭信号");
+        let _ = writeln!(file, "信号类型: {}", signal);
+        let _ = writeln!(file, "时间: {}", now);
+        let _ = writeln!(file, "═══════════════════════════════════════════════════════════\n");
+        let _ = file.flush();
+        eprintln!("✅ 关闭信息已写入: {}", log_path.display());
+    }
+}
 
 // 路由创建函数已移动到 handler 模块
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 🔥 设置自定义 Panic Hook，确保 panic 信息被记录
+    set_panic_hook();
+
+    // 🔥 设置信号处理器，实现优雅关闭（Docker stop、Ctrl+C）
+    let _shutdown_handle = setup_shutdown_handler();
+
     // ✅ 初始化 Rustls CryptoProvider（必须在最前面，在任何可能使用 TLS 的代码之前）
+    // 🔥 如果这里失败，会导致 panic，但 panic hook 会捕获并记录
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .expect("❌ [FATAL] Rustls CryptoProvider 初始化失败，程序无法继续运行。这通常是系统环境问题。");
 
     // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
@@ -78,34 +239,18 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
-    // 🔥 创建 AgentWorkerManager（返回 manager, heartbeat_rx, ready_rx, heartbeat_tx, ready_tx）
-    let (worker_manager, heartbeat_rx, ready_rx, heartbeat_tx, ready_tx) =
-        AgentWorkerManager::new();
-    let worker_manager = Arc::new(worker_manager);
+    // 🔥 创建 AgentRuntime（新架构）
+    let (agent_runtime, task_receiver) = AgentRuntime::new(1000);
+    let agent_runtime = Arc::new(agent_runtime);
+    info!("🔧 [MAIN] AgentRuntime 已创建");
 
-    // 创建 worker handle（包含心跳和就绪通道）
-    let worker_handle = worker_manager.create_handle(heartbeat_tx, ready_tx);
-    info!("🔧 [MAIN] AgentWorkerManager 已创建");
+    // 🔥 启动 Worker（在主运行时中，无需独立线程）
+    agent_runtime.start(task_receiver).await;
+    info!("📌 [MAIN] Agent Worker 已启动");
 
-    // 创建初始通道
-    let (local_task_sender, local_task_receiver) = tokio::sync::mpsc::unbounded_channel();
-
-    // 🔥 设置初始 sender 到 worker_manager（传递引用）
-    worker_manager.set_sender(&local_task_sender);
-
-    // 🔥 在独立 OS 线程中启动单线程 tokio 运行时 + LocalSet，驻留运行 agent_worker（!Send）
-    let _worker_thread = std::thread::spawn(move || {
-        let _ = run_agent_worker_thread(local_task_receiver, worker_handle);
-    });
-
-    info!("📌 [MAIN] agent_worker 线程已启动");
-
-    // 🔥 启动 worker 监控任务（使用 Arc 共享）
-    let worker_manager_for_monitor = worker_manager.clone();
-    tokio::spawn(async move {
-        let _ = monitor_worker_health(worker_manager_for_monitor, heartbeat_rx, ready_rx).await;
-    });
-    info!("🔍 [MAIN] Worker 监控任务已启动");
+    // 🔥 启动健康检查和重启任务
+    let health_monitor = spawn_health_monitor(agent_runtime.clone());
+    info!("🔍 [MAIN] Worker 健康监控任务已启动");
 
     // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
     let _reaper_handle = process_reaper::start_process_reaper();
@@ -163,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
         if proxy_config.health_check.enabled {
             let hc = &proxy_config.health_check;
             pingora_service
-                .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
+                .start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000 );
         }
 
         // 在后台任务中启动 Pingora 服务器
@@ -189,8 +334,8 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         sessions: Arc::new(DashMap::new()),
         config: config.clone(),
-        local_task_sender,
-        agent_worker_manager: worker_manager.clone(), // 🆕 添加 worker_manager
+        local_task_sender: agent_runtime.clone(), // 🆕 新架构：使用 AgentRuntime
+        agent_runtime: agent_runtime.clone(),
         pingora_service: pingora_service_opt,
         api_key_manager, // 现在包装 shared_api_key_manager
         shared_api_key_manager,
@@ -205,9 +350,13 @@ async fn main() -> anyhow::Result<()> {
     let grpc_addr = format!("[::]:{}", grpc_port)
         .parse()
         .map_err(|e| anyhow::anyhow!("gRPC 地址解析失败: {}", e))?;
+
+    // gRPC 消息大小限制：使用 shared_types 统一常量
     let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
         grpc::AgentServiceImpl::new(state.clone()),
-    );
+    )
+    .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+    .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
     let grpc_handle = tokio::spawn(async move {
         info!("🚀 gRPC 服务启动，监听端口: {}", grpc_port);
@@ -276,230 +425,46 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 🔥 新增：agent_worker 线程启动函数
+/// 🔥 健康监控任务 (新架构)
 ///
-/// 🆕 改进：使用多线程运行时 + 每个请求独立的 LocalSet
-/// 支持并发处理多个 Agent 请求，避免单线程阻塞
-/// 因为 ACP 连接不是 Send，每个请求在独立的 LocalSet 中运行
-fn run_agent_worker_thread(
-    receiver: tokio::sync::mpsc::UnboundedReceiver<proxy_agent::LocalSetAgentRequest>,
-    handle: agent_worker_manager::WorkerHandle,
-) -> anyhow::Result<()> {
-    info!("🚀 [agent_worker_thread] 线程启动，创建多线程运行时以支持并发 Agent...");
+/// 定期检查 Agent Worker 健康状态，自动重启不健康的 Worker
+async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut consecutive_failures: u32 = 0;
+        const MAX_RESTART_ATTEMPTS: u32 = 5;
+        const RESTART_COOLDOWN_SECS: u64 = 60;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(10) // 使用 10 个工作线程，支持更高并发处理多个 Agent
-        .thread_name("agent-worker")
-        .enable_all()
-        .build()
-        .expect("Failed to build multi-thread runtime for LocalSet agents");
+        info!("🔍 [HealthMonitor] 健康监控任务已启动");
 
-    rt.block_on(async move {
-        info!("🚀 [agent_worker_thread] 多线程运行时已启动，准备并发处理 Agent 请求...");
+        loop {
+            interval.tick().await;
 
-        // 🆕 不再使用全局 LocalSet，改为每个请求创建独立的 LocalSet
-        // 直接调用 agent_worker_with_heartbeat，它会为每个请求 spawn 独立任务
-        match proxy_agent::agent_worker_with_heartbeat(receiver, handle).await {
-            Ok(_) => {
-                info!("✅ [agent_worker_thread] Agent worker 正常退出");
-            }
-            Err(e) => {
-                error!("❌ [agent_worker_thread] Agent worker 失败: {}", e);
+            // 检查健康状态
+            if !runtime.check_health().await {
+                error!("❌ [HealthMonitor] 检测到 Worker 不健康");
+
+                // 检查冷却期
+                if consecutive_failures >= MAX_RESTART_ATTEMPTS {
+                    warn!(
+                        "⏳ [HealthMonitor] 连续重启失败 {} 次，进入冷却期",
+                        consecutive_failures
+                    );
+                    tokio::time::sleep(Duration::from_secs(RESTART_COOLDOWN_SECS)).await;
+                    consecutive_failures = 0;
+                    info!("🔄 [HealthMonitor] 冷却期结束，重置失败计数");
+                }
+
+                // 创建新的通道
+                let (new_tx, new_rx) = tokio::sync::mpsc::channel(1000);
+
+                // 重启 worker
+                runtime.restart(new_rx).await;
+                consecutive_failures += 1;
+                info!("🔄 [HealthMonitor] Worker 重启完成（第 {} 次）", consecutive_failures);
+            } else {
+                consecutive_failures = 0;
             }
         }
-
-        warn!("⚠️ [agent_worker_thread] Agent worker stopped");
-        Ok::<(), anyhow::Error>(())
     })
-}
-
-/// 🔥 新增：监控 worker 健康状态
-///
-/// 监听心跳信号，检测 worker 是否崩溃，并自动重启
-///
-/// 🆕 优化：
-/// - 增加 ready_rx 参数，等待 Worker 发送就绪信号后才设置 Running 状态
-/// - 添加重试逻辑，restart_worker 失败时不会导致监控任务退出
-/// - 添加连续失败计数、指数退避和冷却时间
-async fn monitor_worker_health(
-    worker_manager: Arc<AgentWorkerManager>,
-    mut heartbeat_rx: tokio::sync::mpsc::Receiver<agent_worker_manager::Heartbeat>,
-    ready_rx: tokio::sync::oneshot::Receiver<agent_worker_manager::WorkerReady>,
-) -> anyhow::Result<()> {
-    use tokio::time::{Duration, interval, sleep, timeout};
-
-    const MAX_RESTART_ATTEMPTS: u32 = 5; // 最大连续重启次数
-    const RESTART_COOLDOWN_SECS: u64 = 60; // 冷却时间（秒）
-    const RESTART_BACKOFF_BASE_SECS: u64 = 2; // 指数退避基数（秒）
-
-    let mut consecutive_failures: u32 = 0;
-    let mut last_successful_start = std::time::Instant::now();
-
-    info!("🔍 [WorkerMonitor] 健康监控任务已启动，等待 Worker 就绪...");
-
-    // 🆕 等待初始 Worker 就绪信号（带 30 秒超时）
-    match timeout(Duration::from_secs(30), ready_rx).await {
-        Ok(Ok(_ready)) => {
-            worker_manager.update_state(agent_worker_manager::WorkerState::Running);
-            last_successful_start = std::time::Instant::now();
-            info!("✅ [WorkerMonitor] Worker 就绪，状态已更新为 Running");
-        }
-        Ok(Err(_)) => {
-            consecutive_failures += 1;
-            error!("❌ [WorkerMonitor] Ready 通道意外关闭，将触发重启");
-            // 尝试重启
-            if let Ok((new_hb_rx, new_ready_rx)) = restart_worker(worker_manager.clone()).await {
-                heartbeat_rx = new_hb_rx;
-                if let Ok(Ok(_)) = timeout(Duration::from_secs(30), new_ready_rx).await {
-                    worker_manager.update_state(agent_worker_manager::WorkerState::Running);
-                    consecutive_failures = 0;
-                    last_successful_start = std::time::Instant::now();
-                    info!("✅ [WorkerMonitor] 重启后 Worker 就绪");
-                }
-            }
-        }
-        Err(_) => {
-            consecutive_failures += 1;
-            error!("❌ [WorkerMonitor] Worker 启动超时（30 秒未收到就绪信号），将触发重启");
-            // 尝试重启
-            if let Ok((new_hb_rx, new_ready_rx)) = restart_worker(worker_manager.clone()).await {
-                heartbeat_rx = new_hb_rx;
-                if let Ok(Ok(_)) = timeout(Duration::from_secs(30), new_ready_rx).await {
-                    worker_manager.update_state(agent_worker_manager::WorkerState::Running);
-                    consecutive_failures = 0;
-                    last_successful_start = std::time::Instant::now();
-                    info!("✅ [WorkerMonitor] 重启后 Worker 就绪");
-                }
-            }
-        }
-    }
-
-    let mut heartbeat_check = interval(Duration::from_secs(5));
-    heartbeat_check.tick().await; // 跳过第一次立即触发
-
-    loop {
-        tokio::select! {
-            // 接收心跳信号
-            heartbeat = heartbeat_rx.recv() => {
-                if let Some(hb) = heartbeat {
-                    worker_manager.update_heartbeat(hb);
-                } else {
-                    // 心跳通道关闭，可能监控任务已关闭
-                    warn!("⚠️ [WorkerMonitor] 心跳通道已关闭");
-                    break;
-                }
-            }
-            // 定期检查心跳超时和请求超时
-            _ = heartbeat_check.tick() => {
-                // 🔥 检查心跳超时
-                if worker_manager.check_heartbeat_timeout() {
-                    error!("❌ [WorkerMonitor] 心跳超时，agent_worker 可能已崩溃");
-
-                    // 🆕 检查是否需要冷却
-                    if consecutive_failures >= MAX_RESTART_ATTEMPTS {
-                        let elapsed = last_successful_start.elapsed();
-                        if elapsed < Duration::from_secs(RESTART_COOLDOWN_SECS) {
-                            let remaining = RESTART_COOLDOWN_SECS - elapsed.as_secs();
-                            warn!(
-                                "⏳ [WorkerMonitor] 连续重启失败 {} 次，进入冷却期（剩余 {} 秒）",
-                                consecutive_failures, remaining
-                            );
-                            continue; // 跳过本次重启，等待冷却期
-                        } else {
-                            // 冷却期结束，重置计数
-                            info!("🔄 [WorkerMonitor] 冷却期结束，重置失败计数");
-                            consecutive_failures = 0;
-                        }
-                    }
-
-                    // 🆕 指数退避等待
-                    if consecutive_failures > 0 {
-                        let backoff = RESTART_BACKOFF_BASE_SECS.pow(consecutive_failures);
-                        let backoff = backoff.min(30); // 最大 30 秒
-                        warn!(
-                            "⏳ [WorkerMonitor] 等待 {} 秒后重试（第 {} 次重试）",
-                            backoff, consecutive_failures + 1
-                        );
-                        sleep(Duration::from_secs(backoff)).await;
-                    }
-
-                    // 尝试重启
-                    match restart_worker(worker_manager.clone()).await {
-                        Ok((new_hb_rx, new_ready_rx)) => {
-                            heartbeat_rx = new_hb_rx;
-                            // 等待 Ready 信号
-                            match timeout(Duration::from_secs(30), new_ready_rx).await {
-                                Ok(Ok(_ready)) => {
-                                    worker_manager.update_state(agent_worker_manager::WorkerState::Running);
-                                    consecutive_failures = 0;
-                                    last_successful_start = std::time::Instant::now();
-                                    info!("✅ [WorkerMonitor] 重启后 Worker 就绪，状态已更新为 Running");
-                                }
-                                _ => {
-                                    consecutive_failures += 1;
-                                    error!("❌ [WorkerMonitor] 重启后 Worker 启动超时（第 {} 次失败）", consecutive_failures);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            error!("❌ [WorkerMonitor] restart_worker 失败（第 {} 次）: {}", consecutive_failures, e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// 🔥 重启 worker 线程
-///
-/// 创建新的通道和线程，并更新 manager 的 sender
-///
-/// 🆕 优化：返回 (heartbeat_rx, ready_rx)，状态由监控任务在收到 Ready 信号后设置
-#[allow(clippy::type_complexity)]
-async fn restart_worker(
-    worker_manager: Arc<AgentWorkerManager>,
-) -> anyhow::Result<(
-    tokio::sync::mpsc::Receiver<agent_worker_manager::Heartbeat>,
-    tokio::sync::oneshot::Receiver<agent_worker_manager::WorkerReady>,
-)> {
-    info!("🔄 [WorkerMonitor] 开始重启 agent_worker...");
-
-    // 1. 更新状态为启动中
-    worker_manager.update_state(agent_worker_manager::WorkerState::Starting);
-
-    // 🆕 2. 重置心跳时间，避免旧的过期心跳时间导致立即触发超时
-    worker_manager.reset_heartbeat();
-
-    // 3. 创建新的心跳通道
-    let (new_heartbeat_tx, new_heartbeat_rx) = tokio::sync::mpsc::channel(100);
-
-    // 4. 创建新的就绪信号通道（oneshot）
-    let (new_ready_tx, new_ready_rx) = tokio::sync::oneshot::channel();
-
-    // 5. 创建新的任务通道
-    let (new_sender, new_receiver) = tokio::sync::mpsc::unbounded_channel();
-
-    // 6. 创建新的 worker handle（包含心跳和就绪通道）
-    let worker_handle = worker_manager.create_handle(new_heartbeat_tx, new_ready_tx);
-
-    // 7. 启动新的 worker 线程
-    std::thread::spawn(move || {
-        if let Err(e) = run_agent_worker_thread(new_receiver, worker_handle) {
-            error!("❌ [WorkerThread] 重启的 agent_worker 崩溃: {}", e);
-        }
-    });
-
-    // 8. 原子替换 sender
-    worker_manager.replace_sender(new_sender);
-
-    // 🆕 不再立即设置 Running 状态，等待 Ready 信号后由 monitor_worker_health 设置
-
-    info!("🔄 [WorkerMonitor] agent_worker 线程已启动，等待就绪信号...");
-
-    // 返回新的 heartbeat_rx 和 ready_rx
-    Ok((new_heartbeat_rx, new_ready_rx))
 }

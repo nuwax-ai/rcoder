@@ -250,10 +250,57 @@ pub async fn handle_chat(
     state.update_activity(&project_id);
     debug!("🔄 [CHAT] 已更新活动时间: project_id={}", project_id);
 
+    // 🆕 自动查找 session_id 逻辑
+    // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
+    let session_id_to_use = match &request.session_id {
+        Some(sid) if !sid.is_empty() => {
+            debug!("🔍 [CHAT] 使用用户传递的 session_id: {}", sid);
+            sid.clone()
+        }
+        _ => {
+            // 用户没有传递 session_id，尝试查找最新的
+            match state.get_project(&project_id) {
+                Some(project_info) => {
+                    let existing_session_id = project_info.session_id();
+                    match existing_session_id {
+                        Some(sid) if !sid.is_empty() => {
+                            info!(
+                                "🔄 [CHAT] 未传递 session_id，自动使用最新会话: project_id={}, session_id={}",
+                                project_id, sid
+                            );
+                            sid.to_string()
+                        }
+                        _ => {
+                            debug!("🆕 [CHAT] 项目存在但无 session_id，创建新会话");
+                            String::new()
+                        }
+                    }
+                }
+                None => {
+                    debug!("🆕 [CHAT] 未找到现有项目，创建新会话");
+                    String::new()
+                }
+            }
+        }
+    };
+
+    // 克隆 request 并修改 session_id
+    let mut request_for_forward = request.clone();
+    request_for_forward.session_id = if session_id_to_use.is_empty() {
+        None
+    } else {
+        Some(session_id_to_use)
+    };
+    // 🆕 自动查找 session_id 逻辑结束
+
     // 第三步：转发请求到容器服务（使用全局连接池）
     info!("🚀 [CHAT] 开始转发请求到容器服务");
-    let result =
-        forward_request_to_container_service(&request, &container_info, &state.grpc_pool).await;
+    let result = forward_request_to_container_service(
+        &request_for_forward,
+        &container_info,
+        &state.grpc_pool,
+    )
+    .await;
     info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
 
     // 响应后状态更新 - 使用 DuckDB 存储
@@ -326,8 +373,8 @@ async fn forward_request_to_container_service(
     };
 
     info!(
-        "📤 [FORWARD] 转发请求到容器 (gRPC): project_id={}, container_id={}, service_url={}",
-        project_id, container_info.container_id, container_info.service_url
+        "📤 [FORWARD] 转发请求到容器 (gRPC): project_id={}, session_id={:?}, container_id={}, service_url={}",
+        project_id, request.session_id, container_info.container_id, container_info.service_url
     );
 
     // 🎯 使用 gRPC 替代 HTTP

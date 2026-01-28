@@ -56,6 +56,7 @@
 
 use std::sync::Arc;
 
+use dashmap::mapref::entry::Entry;
 use shared_types::SessionEntry;
 
 /// 会话注册表 trait
@@ -114,11 +115,61 @@ pub trait SessionRegistry: Send + Sync + 'static {
     /// * `project_id` - 项目 ID
     fn contains(&self, project_id: &str) -> bool;
 
+    /// 🆕 通过 session_id 获取 project_id（反向查询）
+    ///
+    /// # Arguments
+    /// * `session_id` - 会话 ID
+    ///
+    /// # Returns
+    /// 如果 session_id 存在，返回对应的 project_id；否则返回 None
+    fn get_project_by_session(&self, session_id: &str) -> Option<String>;
+
+    /// 🆕 通过 session_id 直接获取会话条目（原子性操作）
+    ///
+    /// # Arguments
+    /// * `session_id` - 会话 ID
+    ///
+    /// # Returns
+    /// 如果 session_id 存在，返回对应的会话条目克隆；否则返回 None
+    ///
+    /// # 优势
+    /// - 一次性查询，避免两次调用之间的竞态窗口
+    /// - 内部使用 DashMap 的原子性操作
+    fn get_entry_by_session(&self, session_id: &str) -> Option<Self::Entry>;
+
     /// 获取所有项目 ID 列表
     fn list_project_ids(&self) -> Vec<String>;
 
     /// 获取会话数量
     fn count(&self) -> usize;
+
+    /// 获取 DashMap entry（用于原子性操作）
+    ///
+    /// # Arguments
+    /// * `project_id` - 项目 ID
+    ///
+    /// # Returns
+    /// DashMap Entry，支持原子性的 get/insert/update 操作
+    ///
+    /// # 使用示例
+    /// ```ignore
+    /// use dashmap::mapref::entry::Entry;
+    ///
+    /// match registry.entry(project_id.to_string()) {
+    ///     Entry::Occupied(mut occupied) => {
+    ///         // 已存在，可以检查和更新
+    ///         let existing = occupied.get();
+    ///         if needs_rebuild {
+    ///             occupied.insert(new_value);
+    ///         }
+    ///     }
+    ///     Entry::Vacant(vacant) => {
+    ///         // 不存在，可以插入
+    ///         vacant.insert(new_value);
+    ///     }
+    /// }
+    /// ```
+    fn entry(&self, project_id: String) -> Entry<'_, String, Self::Entry>;
 }
 
 /// SessionRegistry 的 Arc 包装器实现
@@ -143,11 +194,23 @@ impl<R: SessionRegistry> SessionRegistry for Arc<R> {
         (**self).contains(project_id)
     }
 
+    fn get_project_by_session(&self, session_id: &str) -> Option<String> {
+        (**self).get_project_by_session(session_id)
+    }
+
+    fn get_entry_by_session(&self, session_id: &str) -> Option<Self::Entry> {
+        (**self).get_entry_by_session(session_id)
+    }
+
     fn list_project_ids(&self) -> Vec<String> {
         (**self).list_project_ids()
     }
 
     fn count(&self) -> usize {
         (**self).count()
+    }
+
+    fn entry(&self, project_id: String) -> Entry<'_, String, Self::Entry> {
+        (**self).entry(project_id)
     }
 }

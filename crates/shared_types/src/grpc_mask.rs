@@ -1,7 +1,5 @@
 // gRPC URL 脱敏工具模块
 
-use std::fmt;
-
 /// 对域名进行脱敏处理
 ///
 /// # 规则
@@ -41,8 +39,8 @@ fn mask_domain(domain: &str) -> String {
 /// - `https://api.openai.com/v1/chat/completions` -> `https://api***ai.com/v1/chat/completions`
 pub fn mask_url(url: &str) -> String {
     // 尝试解析 URL
-    if let Ok(parsed_url) = url::Url::parse(url) {
-        if let Some(host) = parsed_url.host_str() {
+    if let Ok(parsed_url) = url::Url::parse(url)
+        && let Some(host) = parsed_url.host_str() {
             let masked_host = mask_domain(host);
             // 重新构建 URL，保留协议、端口、路径等
             let scheme = parsed_url.scheme();
@@ -57,7 +55,6 @@ pub fn mask_url(url: &str) -> String {
                 .unwrap_or_default();
             return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
         }
-    }
 
     // 如果解析失败，返回脱敏提示
     "***".to_string()

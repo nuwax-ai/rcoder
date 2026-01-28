@@ -116,8 +116,8 @@ pub fn extract_method_name(uri: &str) -> String {
     // 提取 Service/Method 部分
     if let Some(pos) = uri.rfind('.') {
         uri[pos + 1..].to_string()
-    } else if uri.starts_with('/') {
-        uri[1..].to_string()
+    } else if let Some(stripped) = uri.strip_prefix('/') {
+        stripped.to_string()
     } else {
         uri.to_string()
     }

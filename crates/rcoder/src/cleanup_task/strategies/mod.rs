@@ -40,14 +40,6 @@ pub enum DestroyReason {
         /// 触发来源
         source: String,
     },
-
-    /// Agent 错误 - Agent 进程异常退出或无法恢复的错误
-    /// - gRPC 连接失败
-    /// - Agent 进程崩溃
-    AgentError {
-        /// 错误描述
-        error: String,
-    },
 }
 
 impl DestroyReason {
@@ -57,7 +49,6 @@ impl DestroyReason {
             DestroyReason::IdleTimeout { .. } => "闲置超时",
             DestroyReason::Orphaned { .. } => "孤立容器",
             DestroyReason::ManualStop { .. } => "手动停止",
-            DestroyReason::AgentError { .. } => "Agent错误",
         }
     }
 
@@ -86,9 +77,6 @@ impl DestroyReason {
             DestroyReason::ManualStop { source } => {
                 format!("手动停止 (来源:{})", source)
             }
-            DestroyReason::AgentError { error } => {
-                format!("Agent错误 ({})", error)
-            }
         }
     }
 }
@@ -115,9 +103,6 @@ pub trait CleanupStrategy: Send + Sync {
     /// RCoder 返回 project_id
     /// ComputerAgentRunner 返回 user_id
     fn get_container_identifier(&self, project_info: &ProjectInfo) -> Result<String>;
-
-    /// 策略名称
-    fn name(&self) -> &str;
 }
 
 /// 清理上下文
@@ -130,8 +115,6 @@ pub struct CleanupContext {
 pub struct ProjectInfo {
     pub project_id: String,
     pub user_id: Option<String>,
-    pub service_type: shared_types::ServiceType,
-    pub container_id: Option<String>,
     pub last_activity: DateTime<Utc>,
 }
 

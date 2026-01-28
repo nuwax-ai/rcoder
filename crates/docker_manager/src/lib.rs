@@ -5,6 +5,7 @@ pub mod container_state_actor;
 pub mod container_stop;
 pub mod image_selector;
 pub mod manager;
+pub mod path;
 pub mod types;
 pub mod utils;
 
@@ -12,7 +13,6 @@ pub mod utils;
 pub mod container_builder;
 pub mod health;
 pub mod network;
-pub mod path;
 
 pub use container_self_inspector::*;
 pub use container_state_actor::*;
@@ -59,6 +59,12 @@ pub enum DockerError {
 
     #[error("序列化错误: {0}")]
     SerializationError(#[from] serde_json::Error),
+
+    #[error("时间戳解析失败: {0}")]
+    InvalidTimestamp(String),
+
+    #[error("Docker API 调用超时: {0}")]
+    Timeout(String),
 
     #[error("Bollard Docker 错误: {0}")]
     BollardError(#[from] bollard::errors::Error),

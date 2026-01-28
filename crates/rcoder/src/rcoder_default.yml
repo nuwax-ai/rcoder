@@ -12,6 +12,11 @@ port: 8087
 
 # 容器清理配置
 cleanup_config:
+  # 是否启用容器清理功能（默认启用）
+  # 设置为 false 可以禁用自动清理闲置容器
+  # - true: 启用（默认，自动清理闲置容器）
+  # - false: 禁用
+  enabled: true
   # 闲置超时时间（秒），超过此时间未活动的容器将被清理
   # 默认值: 600 (10分钟)
   idle_timeout_seconds: 600
@@ -21,6 +26,14 @@ cleanup_config:
   # Docker 容器停止超时时间（秒）
   # 默认值: 30
   docker_stop_timeout_seconds: 30
+  # 日志清理配置
+  log_cleanup:
+    # 日志目录路径（容器内路径）
+    # 默认值: /app/logs/container
+    log_dir: "/app/logs/container"
+    # 日志保留天数
+    # 默认值: 10
+    log_retention_days: 10
 
 # Pingora 反向代理配置
 proxy_config:
@@ -185,6 +198,30 @@ docker_config:
 
   # 容器存活时间（秒）
   container_ttl_seconds: 3600
+
+  # 🔧 Docker API 调用超时时间（秒）
+  # 用于大多数 Docker API 调用的超时保护
+  api_timeout_seconds: 10
+
+  # 🔧 快速操作超时时间（秒）
+  # 用于状态查询等轻量级操作的超时保护
+  api_timeout_quick_seconds: 5
+
+  # 🔧 状态缓存 TTL（秒）
+  # 用于缓存容器状态信息（container_id, container_name, status, is_running）
+  # 建议值：
+  #   - 高频查询环境: 30-60
+  #   - 平衡模式: 10-15（默认）
+  #   - 实时要求高: 5-10
+  cache_status_ttl_seconds: 10
+
+  # 🔧 网络缓存 TTL（秒）
+  # 用于缓存容器网络信息（network_name -> ip_address）
+  # 建议值：
+  #   - 高频查询环境: 60-120
+  #   - 平衡模式: 15-30（默认）
+  #   - 实时要求高: 10-15
+  cache_network_ttl_seconds: 15
 
 # API Key 鉴权配置（可选）
 api_key_auth:
