@@ -26,6 +26,7 @@ use sacp::schema::SessionId;
 
 use crate::{
     agent_runtime::get_concurrency_limit,
+    grpc::agent_service_impl::predict_needs_new_session_sync,
     model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo},
     proxy_agent::SESSION_REQUEST_CONTEXT,
     service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
@@ -345,6 +346,15 @@ pub async fn agent_worker_with_heartbeat(
             let _otel_span = RequestSpan::new(&project_id, &request_id, "process_agent_request");
 
             // 1. 预处理附件（agent_runner 特有逻辑）
+            //
+            // 🆕 注意：并发槽位检查已迁移到 gRPC 层（最早拒绝点优化）
+            // - gRPC 层在创建 PendingGuard 后立即检查槽位
+            // - 如果槽位已满，直接拒绝，不消耗 Worker 资源
+            // - 这里只需要处理请求，无需重复检查槽位
+            //
+            // ⚠️ 重要：gRPC 层已经预留了槽位（如果需要新会话）
+            // - 如果处理失败，gRPC 层的 PendingGuard 会自动清理
+            // - 如果 gRPC 预测错误（极少见），Worker 层会处理补偿逻辑
             let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
                 match ContentBuilder::attachments_to_content_blocks(
                     &request.prompt_message.attachments,
@@ -357,6 +367,8 @@ pub async fn agent_worker_with_heartbeat(
                         error!("❌ 附件处理失败: {:?}", e);
 
                         // 🔥 DeferGuard 自动清理，无需手动调用 clear_pending_if_exists
+                        // 注意：gRPC 层的 PendingGuard 会自动清理 Pending 状态
+                        // 如果 gRPC 层预留了槽位，也会在 PendingGuard Drop 时释放
 
                         if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                             project_id: project_id.clone(),
@@ -375,7 +387,7 @@ pub async fn agent_worker_with_heartbeat(
                 None
             };
 
-            // 2. 创建 WorkerRequest
+            // 3. 创建 WorkerRequest
             let worker_request = WorkerRequest {
                 prompt_message: request.prompt_message.clone(),
                 model_provider: request.model_provider.clone(),
@@ -384,13 +396,15 @@ pub async fn agent_worker_with_heartbeat(
                 shared_api_key_manager: request.shared_api_key_manager.clone(),
             };
 
-            // 3. 调用 AcpAgentWorker 处理（核心业务逻辑）
+            // 4. 调用 AcpAgentWorker 处理（核心业务逻辑）
             let worker_response = match worker_clone.process_request(worker_request).await {
                 Ok(response) => response,
                 Err(e) => {
                     error!("❌ Worker 处理失败: {:?}", e);
 
                     // 🔥 DeferGuard 自动清理，无需手动调用 clear_pending_if_exists
+                    // 注意：gRPC 层的 PendingGuard 会自动清理 Pending 状态
+                    // 如果 gRPC 层预留了槽位，也会在 PendingGuard Drop 时释放
 
                     if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                         project_id: project_id.clone(),
@@ -406,50 +420,69 @@ pub async fn agent_worker_with_heartbeat(
                 }
             };
 
-            // 4. 提取 session_handles（在移动 worker_response 之前）
+            // 5. 提取 session_handles（在移动 worker_response 之前）
             // 关键：需要保存 lifecycle_handle 用于后续等待会话结束
             let session_handles = worker_response.session_handles.clone();
             let is_new_session = worker_response.is_new_session;
             let response_session_id = worker_response.session_id.clone();
 
-            // 5. 更新全局状态（使用统一的 AGENT_REGISTRY）
+            // 6. 验证预测并更新全局状态
+            //
+            // 🆕 注意：gRPC 层已经进行了并发槽位检查
+            // - 如果 gRPC 预测需要新会话，已经预留了槽位
+            // - 如果 gRPC 预测复用现有会话，没有预留槽位
+            //
+            // 这里只需要处理极少数的预测错误情况：
+            // - gRPC 预测复用但实际新会话：需要获取槽位
+            // - gRPC 预测新会话但实际复用：需要释放槽位（预留错误）
             if is_new_session {
-                // 🔥 修复：槽位对应 Agent 生命周期，只在创建新 Agent 时获取槽位
-                if !AGENT_REGISTRY.try_acquire_session_slot() {
-                    let limit = get_concurrency_limit();
-                    error!(
-                        "🛡️ [原子并发限制] Agent 会话槽位已满 ({}/{}), 拒绝新请求 - project_id={}, request_id={}",
-                        AGENT_REGISTRY.active_sessions_count(),
-                        limit,
-                        project_id,
-                        request_id
-                    );
-
-                    // 清理 Pending 状态（如果已设置）
-                    AGENT_REGISTRY.clear_pending_if_exists(&project_id);
-
-                    if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
-                        project_id: project_id.clone(),
-                        session_id: String::new(),
-                        code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
-                        error: Some(format!(
-                            "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
-                            limit
-                        )),
-                        request_id: Some(request_id.clone()),
-                        service_type: request.prompt_message.service_type.clone(),
-                    }) {
-                        error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
-                    }
-                    return;
-                }
-
-                info!(
-                    "✅ [原子槽位] 成功获取槽位: {}/{} - project_id={}",
-                    AGENT_REGISTRY.active_sessions_count(),
-                    get_concurrency_limit(),
-                    project_id
+                // 新会话：检查 gRPC 层是否预留了槽位
+                // gRPC 层通过 predict_needs_new_session_sync() 预测
+                let grpc_predicted_new_session = predict_needs_new_session_sync(
+                    &project_id,
+                    &request.prompt_message.session_id,
                 );
+
+                if grpc_predicted_new_session {
+                    // gRPC 预测正确，已预留槽位，直接注册
+                    info!(
+                        "✅ [原子槽位] gRPC 预测正确，使用预留槽位 - project_id={}",
+                        project_id
+                    );
+                } else {
+                    // 预测错误：gRPC 预测复用但实际创建了新会话，需要获取槽位
+                    warn!(
+                        "⚠️ [原子槽位] 预测错误（gRPC预测复用但实际新会话），尝试获取槽位 - project_id={}",
+                        project_id
+                    );
+                    if !AGENT_REGISTRY.try_acquire_session_slot() {
+                        let limit = get_concurrency_limit();
+                        error!(
+                            "🛡️ [原子并发限制] Agent 会话槽位已满 ({}/{}), 无法处理新会话 - project_id={}",
+                            AGENT_REGISTRY.active_sessions_count(),
+                            limit,
+                            project_id
+                        );
+                        // 清理 Agent（已启动但无法注册）
+                        if let Some(ref handles) = session_handles {
+                            if let Some(ref lifecycle) = handles.lifecycle_handle {
+                                lifecycle.cancel(); // 立即取消
+                            }
+                        }
+                        // 发送错误响应
+                        if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
+                            project_id: project_id.clone(),
+                            session_id: String::new(),
+                            code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
+                            error: Some(format!("系统繁忙：并发 Agent 会话数已达上限 ({} 个)", limit)),
+                            request_id: Some(request_id.clone()),
+                            service_type: request.prompt_message.service_type.clone(),
+                        }) {
+                            error!("❌ 发送拒绝响应失败: {:?}", send_err);
+                        }
+                        return;
+                    }
+                }
 
                 if let Some(ref handles) = session_handles {
                     debug!("🆕 新会话，注册到 AGENT_REGISTRY");
@@ -479,13 +512,28 @@ pub async fn agent_worker_with_heartbeat(
                     );
                 }
             } else {
+                // 复用现有会话
+                // 检查 gRPC 层是否错误地预留了槽位（极少见）
+                let grpc_predicted_new_session = predict_needs_new_session_sync(
+                    &project_id,
+                    &request.prompt_message.session_id,
+                );
+
+                if grpc_predicted_new_session {
+                    // 预测错误：gRPC 预测新会话但实际复用了现有会话，需要释放槽位
+                    warn!(
+                        "⚠️ [原子槽位] 预测错误（gRPC预测新会话但实际复用），释放预留槽位 - project_id={}",
+                        project_id
+                    );
+                    AGENT_REGISTRY.release_session_slot();
+                }
                 debug!("♻️ 复用会话，无需获取新槽位（Agent 已占用槽位）");
             }
 
-            // 6. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
+            // 7. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
             SESSION_REQUEST_CONTEXT.insert(project_id.clone(), request_id.clone());
 
-            // 7. 转换并发送回执
+            // 8. 转换并发送回执
             let chat_prompt_response = ChatPromptResponse {
                 project_id: worker_response.project_id,
                 session_id: worker_response.session_id,
@@ -546,6 +594,27 @@ pub async fn agent_worker_with_heartbeat(
                         // 缺少 lifecycle_handle，立即清理
                         AGENT_REGISTRY.remove_by_project(&project_id);
                     }
+                } else {
+                    // 🔥 边界情况：is_new_session = true 但 session_handles = None
+                    // 这种情况下 Agent 没有被注册，但可能已经预留了槽位
+                    // 检查 gRPC 层是否预留了槽位
+                    let grpc_predicted_new_session = predict_needs_new_session_sync(
+                        &project_id,
+                        &request.prompt_message.session_id,
+                    );
+
+                    if grpc_predicted_new_session {
+                        error!(
+                            "❌ [SACP] 新会话缺少 session_handles，释放预留槽位 - project_id={}, session_id={}",
+                            project_id, response_session_id
+                        );
+                        AGENT_REGISTRY.release_session_slot();
+                    } else {
+                        warn!(
+                            "⚠️ [SACP] 新会话缺少 session_handles - project_id={}, session_id={}",
+                            project_id, response_session_id
+                        );
+                    }
                 }
             } else {
                 info!(
@@ -565,4 +634,316 @@ pub async fn agent_worker_with_heartbeat(
 
     info!("🛑 agent_worker 停止");
     Ok(())
+}
+
+/// 预测是否需要创建新会话
+///
+/// 复用 session_manager 的判断逻辑，避免在启动 Agent 后才发现槽位已满
+///
+/// ## 返回值
+///
+/// - `true`: 需要创建新会话（需要预留槽位）
+/// - `false`: 可以复用现有会话（不需要槽位）
+pub(crate) async fn predict_needs_new_session(
+    prompt_message: &agent_abstraction::PromptMessage,
+    model_provider: &Option<shared_types::ModelProviderConfig>,
+) -> bool {
+    use shared_types::SessionEntry;
+
+    let project_id = &prompt_message.project_id;
+
+    // 1. 检查 session_id_hint（如果提供）
+    if let Some(ref session_id_hint) = prompt_message.session_id {
+        if let Some(existing) = AGENT_REGISTRY.get_agent_info_by_session(session_id_hint) {
+            // 验证 project_id 是否匹配
+            if existing.project_id() == project_id {
+                let channel_closed = existing.is_channel_closed();
+                let model_changed = existing.is_model_config_changed(model_provider);
+
+                if !channel_closed && !model_changed {
+                    info!(
+                        "🔄 [PREDICT] 通过 session_id_hint 可复用会话: project_id={}, session_id={}",
+                        project_id, session_id_hint
+                    );
+                    return false; // 复用现有会话
+                }
+            }
+        }
+    }
+
+    // 2. 检查 project_id 是否已有会话
+    if let Some(existing) = AGENT_REGISTRY.get_agent_info(project_id) {
+        // 🔥 关键修复：显式检查 Pending 状态
+        // Pending 状态意味着会话正在被创建中（由 PendingGuard 创建的占位符）
+        // 这种情况下应该预测需要新会话（实际上会替换占位符）
+        if *existing.status() == AgentStatus::Pending {
+            info!(
+                "🆕 [PREDICT] 检测到 Pending 占位符，预测需要新会话（将替换占位符）: project_id={}",
+                project_id
+            );
+            return true; // 需要创建新会话（实际上会替换 Pending 占位符）
+        }
+
+        let channel_closed = existing.is_channel_closed();
+        let model_changed = existing.is_model_config_changed(model_provider);
+
+        if !channel_closed && !model_changed {
+            info!(
+                "🔄 [PREDICT] 通过 project_id 可复用会话: project_id={}",
+                project_id
+            );
+            return false; // 复用现有会话
+        }
+
+        // Channel 关闭或模型变化，需要重建
+        info!(
+            "🆕 [PREDICT] 现有会话无效，需要重建: project_id={}, channel_closed={}, model_changed={}",
+            project_id, channel_closed, model_changed
+        );
+    }
+
+    // 3. 需要创建新会话
+    info!(
+        "🆕 [PREDICT] 需要创建新会话: project_id={}",
+        project_id
+    );
+    true
+}
+
+// ============================================================================
+// 单元测试：验证提前并发检查
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_abstraction::PromptMessage;
+    use shared_types::{ModelProviderConfig, ServiceType};
+
+    /// 创建测试用的 PromptMessage
+    fn create_test_prompt_message(
+        project_id: &str,
+        session_id: Option<String>,
+    ) -> PromptMessage {
+        PromptMessage {
+            project_id: project_id.to_string(),
+            project_path: std::path::PathBuf::from(format!("/tmp/{}", project_id)),
+            content: "test prompt".to_string(),
+            request_id: format!("req-{}", project_id),
+            session_id,
+            system_prompt_override: None,
+            user_prompt_template_override: None,
+            agent_config_override: None,
+            attachments: vec![],
+            data_source_attachments: vec![],
+            service_type: ServiceType::ComputerAgentRunner,
+        }
+    }
+
+    /// 创建测试用的 ProjectAndAgentInfo
+    /// 返回 (ProjectAndAgentInfo, PromptReceiver, CancelReceiver) 来确保 channel 保持打开
+    fn create_test_agent_info(project_id: &str, session_id: &str) -> (ProjectAndAgentInfo, tokio::sync::mpsc::Receiver<sacp::schema::PromptRequest>, tokio::sync::mpsc::Receiver<shared_types::CancelNotificationRequestWrapper>) {
+        use sacp::schema::PromptRequest;
+        use shared_types::CancelNotificationRequestWrapper;
+        let (prompt_tx, prompt_rx) = mpsc::channel::<PromptRequest>(100);
+        let (cancel_tx, cancel_rx) = mpsc::channel::<CancelNotificationRequestWrapper>(100);
+
+        let agent_info = ProjectAndAgentInfo {
+            project_id: project_id.to_string(),
+            session_id: SessionId::new(Arc::from(session_id)),
+            prompt_tx,
+            cancel_tx,
+            model_provider: None,
+            request_id: None,
+            status: AgentStatus::Idle,
+            last_activity: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            stop_handle: None,
+        };
+
+        (agent_info, prompt_rx, cancel_rx)
+    }
+
+    #[tokio::test]
+    async fn test_predict_needs_new_session_no_existing_session() {
+        let project_id = "test-new-session";
+
+        // 预测：无现有会话，应该返回 true（需要新会话）
+        let prompt_message = create_test_prompt_message(project_id, None);
+        let needs_new = predict_needs_new_session(&prompt_message, &None).await;
+
+        assert!(needs_new, "无现有会话时，应该预测需要新会话");
+    }
+
+    #[tokio::test]
+    async fn test_predict_reuse_via_session_id_hint() {
+        let project_id = "test-reuse-session";
+        let session_id = "session-123";
+
+        // 创建现有会话，保留 receiver 以保持 channel 打开
+        let (agent_info, _prompt_rx, _cancel_rx) = create_test_agent_info(project_id, session_id);
+        AGENT_REGISTRY.register(project_id, session_id, agent_info);
+
+        // 预测：通过 session_id_hint 可以复用
+        let prompt_message = create_test_prompt_message(project_id, Some(session_id.to_string()));
+        let needs_new = predict_needs_new_session(&prompt_message, &None).await;
+
+        assert!(!needs_new, "通过 session_id_hint 可复用时，应该预测不需要新会话");
+
+        // 清理
+        AGENT_REGISTRY.remove_by_project(project_id);
+    }
+
+    #[tokio::test]
+    async fn test_predict_reuse_via_project_id() {
+        let project_id = "test-reuse-project";
+        let session_id = "session-456";
+
+        // 创建现有会话，保留 receiver 以保持 channel 打开
+        let (agent_info, _prompt_rx, _cancel_rx) = create_test_agent_info(project_id, session_id);
+        AGENT_REGISTRY.register(project_id, session_id, agent_info);
+
+        // 预测：通过 project_id 可以复用（无 session_id_hint）
+        let prompt_message = create_test_prompt_message(project_id, None);
+        let needs_new = predict_needs_new_session(&prompt_message, &None).await;
+
+        assert!(!needs_new, "通过 project_id 可复用时，应该预测不需要新会话");
+
+        // 清理
+        AGENT_REGISTRY.remove_by_project(project_id);
+    }
+
+    #[tokio::test]
+    async fn test_predict_rebuild_when_channel_closed() {
+        let project_id = "test-rebuild-channel";
+        let session_id = "session-789";
+
+        // 创建现有会话，然后关闭 channel
+        use sacp::schema::PromptRequest;
+        use shared_types::CancelNotificationRequestWrapper;
+
+        // 创建一个 helper 函数来生成已关闭的 channel
+        fn create_closed_sender<T>() -> mpsc::Sender<T> {
+            let (tx, _) = mpsc::channel::<T>(100);
+            tx
+        }
+        // 立即 drop 它来关闭 channel
+        let _closed = create_closed_sender::<PromptRequest>();
+
+        let (cancel_tx, _) = mpsc::channel::<CancelNotificationRequestWrapper>(100);
+
+        let agent_info = ProjectAndAgentInfo {
+            project_id: project_id.to_string(),
+            session_id: SessionId::new(Arc::from(session_id)),
+            prompt_tx: create_closed_sender::<PromptRequest>(),
+            cancel_tx,
+            model_provider: None,
+            request_id: None,
+            status: AgentStatus::Idle,
+            last_activity: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            stop_handle: None,
+        };
+
+        AGENT_REGISTRY.register(project_id, session_id, agent_info);
+
+        // 预测：channel 已关闭，需要重建
+        let prompt_message = create_test_prompt_message(project_id, None);
+        let needs_new = predict_needs_new_session(&prompt_message, &None).await;
+
+        assert!(needs_new, "channel 关闭时，应该预测需要新会话");
+
+        // 清理
+        AGENT_REGISTRY.remove_by_project(project_id);
+    }
+
+    #[tokio::test]
+    async fn test_predict_rebuild_when_model_changed() {
+        let project_id = "test-rebuild-model";
+        let session_id = "session-999";
+
+        // 创建现有会话，使用模型 A，保留 receiver 以保持 channel 打开
+        let model_a = Some(ModelProviderConfig {
+            id: "model-a".to_string(),
+            name: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "sk-test-key-a".to_string(),
+            requires_openai_auth: false,
+            default_model: "claude-3-5-sonnet".to_string(),
+            api_protocol: Some("anthropic".to_string()),
+        });
+
+        let (mut agent_info, _prompt_rx, _cancel_rx) = create_test_agent_info(project_id, session_id);
+        agent_info.model_provider = model_a.clone();
+        AGENT_REGISTRY.register(project_id, session_id, agent_info);
+
+        // 预测：使用模型 B，需要重建
+        let model_b = Some(ModelProviderConfig {
+            id: "model-b".to_string(),
+            name: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "sk-test-key-b".to_string(),
+            requires_openai_auth: false,
+            default_model: "claude-3-5-opus".to_string(),
+            api_protocol: Some("anthropic".to_string()),
+        });
+
+        let prompt_message = create_test_prompt_message(project_id, None);
+        let needs_new = predict_needs_new_session(&prompt_message, &model_b).await;
+
+        assert!(needs_new, "模型配置变化时，应该预测需要新会话");
+
+        // 清理
+        AGENT_REGISTRY.remove_by_project(project_id);
+    }
+
+    #[tokio::test]
+    async fn test_predict_no_model_change() {
+        let project_id = "test-no-model-change";
+        let session_id = "session-111";
+
+        // 创建现有会话，保留 receiver 以保持 channel 打开
+        let model = Some(ModelProviderConfig {
+            id: "model-same".to_string(),
+            name: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "sk-test-key-same".to_string(),
+            requires_openai_auth: false,
+            default_model: "claude-3-5-sonnet".to_string(),
+            api_protocol: Some("anthropic".to_string()),
+        });
+
+        let (mut agent_info, _prompt_rx, _cancel_rx) = create_test_agent_info(project_id, session_id);
+        agent_info.model_provider = model.clone();
+        AGENT_REGISTRY.register(project_id, session_id, agent_info);
+
+        // 预测：使用相同的模型，可以复用
+        let prompt_message = create_test_prompt_message(project_id, None);
+        let needs_new = predict_needs_new_session(&prompt_message, &model).await;
+
+        assert!(!needs_new, "模型配置未变化时，应该预测可以复用");
+
+        // 清理
+        AGENT_REGISTRY.remove_by_project(project_id);
+    }
+
+    #[tokio::test]
+    async fn test_predict_session_id_hint_mismatched_project() {
+        let project_a = "project-a";
+        let project_b = "project-b";
+        let session_id = "session-222";
+
+        // 为 project_a 创建会话，保留 receiver 以保持 channel 打开
+        let (agent_info, _prompt_rx, _cancel_rx) = create_test_agent_info(project_a, session_id);
+        AGENT_REGISTRY.register(project_a, session_id, agent_info);
+
+        // 预测：project_b 使用 session_id_hint，但 session 属于 project_a
+        let prompt_message = create_test_prompt_message(project_b, Some(session_id.to_string()));
+        let needs_new = predict_needs_new_session(&prompt_message, &None).await;
+
+        assert!(needs_new, "session_id 属于不同 project 时，应该预测需要新会话");
+
+        // 清理
+        AGENT_REGISTRY.remove_by_project(project_a);
+    }
 }

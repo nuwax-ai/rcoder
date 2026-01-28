@@ -112,7 +112,7 @@ docker_config:
           RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
           # 🔥 Agent 并发会话槽位数量
           # 默认值: 10
-          RCODER_AGENT_CONCURRENCY_LIMIT: "5"
+          RCODER_AGENT_CONCURRENCY_LIMIT: "3"
 
         command:
           - "/usr/local/bin/agent_runner"

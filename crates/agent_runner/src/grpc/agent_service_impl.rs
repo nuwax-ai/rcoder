@@ -28,6 +28,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::agent_runtime::get_concurrency_limit;
 use crate::model::AgentStatus;
 use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
@@ -307,6 +308,51 @@ impl AgentService for AgentServiceImpl {
         // 自动在作用域结束时清理，避免状态泄漏
         let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
         info!("🛡️ [gRPC] 创建 PendingGuard: project_id={}", project_id);
+
+        // 🆕 步骤 2: gRPC 层并发槽位检查（最早拒绝点优化）
+        // 在创建 PendingGuard 之后立即进行并发检查，避免消耗不必要的资源
+        let needs_new_session = predict_needs_new_session_sync(&project_id, &session_id);
+
+        if needs_new_session {
+            let limit = get_concurrency_limit();
+            if !AGENT_REGISTRY.try_acquire_session_slot() {
+                error!(
+                    "🛡️ [gRPC] 并发槽位已满 ({}/{}), 拒绝请求 - project_id={}",
+                    AGENT_REGISTRY.active_sessions_count(),
+                    limit,
+                    project_id
+                );
+
+                // 清理 PendingGuard（RAII 自动清理）
+                drop(pending_guard);
+
+                return Ok(Response::new(GrpcChatResponse {
+                    project_id: project_id.clone(),
+                    session_id: session_id.unwrap_or_default(),
+                    success: false,
+                    error_code: Some(shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string()),
+                    error: Some(format!(
+                        "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
+                        limit
+                    )),
+                    request_id: req.request_id.clone(),
+                    need_fallback: false,
+                    fallback_reason: None,
+                }));
+            }
+
+            info!(
+                "✅ [gRPC] 成功预留并发槽位: {}/{} - project_id={}",
+                AGENT_REGISTRY.active_sessions_count(),
+                limit,
+                project_id
+            );
+        } else {
+            debug!(
+                "🔄 [gRPC] 预测复用现有会话，无需预留槽位 - project_id={}",
+                project_id
+            );
+        }
 
         // 🔥 修复：只在 session 不存在时才清理无效的 session_id
         // 问题：旧代码无条件移除用户指定的 session，导致无法复用
@@ -1749,4 +1795,75 @@ async fn check_port_available(port: u16, timeout_millis: u64) -> bool {
         Ok(Ok(_)) => true,
         _ => false,
     }
+}
+
+/// 同步预测是否需要创建新会话（gRPC 层使用）
+///
+/// 与 `predict_needs_new_session` 逻辑一致，但不使用 async
+/// 用于在 gRPC 请求处理早期进行并发槽位检查
+///
+/// ## 返回值
+///
+/// - `true`: 需要创建新会话（需要预留槽位）
+/// - `false`: 可以复用现有会话（不需要槽位）
+pub(crate) fn predict_needs_new_session_sync(
+    project_id: &str,
+    session_id: &Option<String>,
+) -> bool {
+    use shared_types::{AgentStatus, SessionEntry};
+
+    // 1. 检查 session_id_hint（如果提供）
+    if let Some(sid) = session_id {
+        if let Some(existing) = AGENT_REGISTRY.get_agent_info_by_session(sid) {
+            // 验证 project_id 是否匹配
+            if existing.project_id() == project_id {
+                let channel_closed = existing.is_channel_closed();
+                let model_changed = existing.is_model_config_changed(&None);
+
+                if !channel_closed && !model_changed {
+                    info!(
+                        "🔄 [gRPC] 通过 session_id_hint 可复用会话: project_id={}, session_id={}",
+                        project_id, sid
+                    );
+                    return false; // 复用现有会话
+                }
+            }
+        }
+    }
+
+    // 2. 检查 project_id 是否已有会话
+    if let Some(existing) = AGENT_REGISTRY.get_agent_info(project_id) {
+        // 🔥 关键修复：显式检查 Pending 状态
+        if *existing.status() == AgentStatus::Pending {
+            info!(
+                "🆕 [gRPC] 检测到 Pending 占位符，预测需要新会话（将替换占位符）: project_id={}",
+                project_id
+            );
+            return true; // 需要创建新会话（实际上会替换 Pending 占位符）
+        }
+
+        let channel_closed = existing.is_channel_closed();
+        let model_changed = existing.is_model_config_changed(&None);
+
+        if !channel_closed && !model_changed {
+            info!(
+                "🔄 [gRPC] 通过 project_id 可复用会话: project_id={}",
+                project_id
+            );
+            return false; // 复用现有会话
+        }
+
+        // Channel 关闭或需要重建
+        info!(
+            "🆕 [gRPC] 现有会话无效，需要重建: project_id={}, channel_closed={}",
+            project_id, channel_closed
+        );
+    }
+
+    // 3. 需要创建新会话
+    info!(
+        "🆕 [gRPC] 预测需要创建新会话: project_id={}",
+        project_id
+    );
+    true
 }
