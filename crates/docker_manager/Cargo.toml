@@ -37,6 +37,7 @@ chrono = { workspace = true }
 
 # Utilities
 dashmap = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
 
 # Shared types
 shared_types = { path = "../shared_types" }

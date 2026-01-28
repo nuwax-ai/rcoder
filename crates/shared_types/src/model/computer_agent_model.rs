@@ -48,6 +48,7 @@ use crate::ServiceType;
 /// let key2 = ContainerKey::from_user("user_456".to_string());
 /// assert_eq!(key2.to_string(), "user:user_456");
 /// ```
+#[allow(dead_code)]
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ContainerKey {
     /// RCoder 模式：一个 project_id 对应一个容器
@@ -69,6 +70,7 @@ impl Hash for ContainerKey {
     }
 }
 
+#[allow(dead_code)]
 impl ContainerKey {
     /// 获取容器标识符的字符串形式（用于 Docker 容器查询）
     ///
@@ -134,6 +136,7 @@ impl std::fmt::Display for ContainerKey {
 /// let mut project = ProjectInfo::new("proj_123".to_string());
 /// project.update_session("session_456".to_string());
 /// ```
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProjectInfo {
     /// 项目 ID
@@ -155,6 +158,7 @@ pub struct ProjectInfo {
     pub last_activity: DateTime<Utc>,
 }
 
+#[allow(dead_code)]
 impl ProjectInfo {
     /// 创建新的项目信息
     pub fn new(project_id: String) -> Self {
@@ -217,6 +221,7 @@ impl ProjectInfo {
 /// # 用途
 /// - SSE 进度流通过 session_id 找到对应的容器
 /// - 取消操作通过 session_id 定位到对应的 Agent
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     /// 会话 ID
@@ -234,6 +239,7 @@ pub struct SessionInfo {
     pub created_at: DateTime<Utc>,
 }
 
+#[allow(dead_code)]
 impl SessionInfo {
     /// 创建新的会话信息
     pub fn new(session_id: String, container_key: ContainerKey, project_id: String) -> Self {
@@ -268,6 +274,7 @@ impl SessionInfo {
 /// | status | 使用 | 不使用（由 ProjectInfo 管理） |
 /// | model_provider | 使用 | 不使用（由 ProjectInfo 管理） |
 /// | projects | 不使用 | 使用 |
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct UnifiedContainerInfo {
     /// 容器标识符（区分模式）
@@ -301,6 +308,7 @@ pub struct UnifiedContainerInfo {
     pub projects: Option<Arc<DashMap<String, Arc<ProjectInfo>>>>,
 }
 
+#[allow(dead_code)]
 impl UnifiedContainerInfo {
     /// 创建 RCoder 模式的容器信息
     ///
@@ -458,7 +466,7 @@ mod tests {
             project_id: project_id.to_string(),
             status: "running".to_string(),
             created_at: Utc::now(),
-            service_url: format!("http://172.17.0.2:8086"),
+            service_url: "http://172.17.0.2:8086".to_string(),
         }
     }
 

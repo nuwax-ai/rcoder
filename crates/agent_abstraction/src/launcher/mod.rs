@@ -2,28 +2,34 @@
 //!
 //! 提供 Agent 的启动、生命周期管理和通道处理功能。
 //!
+//! ## SACP 迁移说明
+//!
+//! 本模块已迁移至 SACP (Symposium ACP) 实现，主要优势：
+//! - **支持 Send trait**: 可使用标准 `tokio::spawn`，无需 `LocalSet` + `spawn_local`
+//! - **Builder 模式**: 更清晰的连接构建和配置
+//! - **回调式消息处理**: 通过 `on_receive_notification` / `on_receive_request` 宏
+//!
 //! ## 子模块职责
 //!
 //! | 子模块 | 职责 | 关键类型 |
 //! |--------|------|---------|
 //! | [`lifecycle`] | Agent 生命周期守卫（RAII 资源管理）| `AgentLifecycleGuard` |
-//! | `claude_code` | Claude Code Agent 启动器 | `ClaudeCodeLauncher` |
-//! | `channel` | Prompt/Cancel 通道处理工具 | `spawn_prompt_handler_for_agent` |
+//! | [`claude_code_sacp`] | SACP 版本的 Claude Code Agent 启动器 | `SacpClaudeCodeLauncher` |
 //!
-//! ## Agent 启动流程
+//! ## Agent 启动流程 (SACP)
 //!
 //! ```text
 //! AcpSessionManager.create_session()
 //!       │
-//!       │ 1. 创建 ClaudeCodeLauncher
+//!       │ 1. 创建 SacpClaudeCodeLauncher
 //!       ▼
-//! ClaudeCodeLauncher.launch()
+//! SacpClaudeCodeLauncher.launch()
 //!       │
 //!       │ 2. 启动 Claude Code 子进程
-//!       │ 3. 建立 ACP 连接 (stdin/stdout)
+//!       │ 3. 使用 SACP Builder 建立连接
 //!       │ 4. 创建 AgentLifecycleGuard
 //!       ▼
-//! LauncherConnectionInfo
+//! SacpLauncherConnectionInfo
 //!       │
 //!       │ 5. 返回 session_id, prompt_tx, cancel_tx, lifecycle_guard
 //!       ▼
@@ -33,10 +39,8 @@
 //! ## 与 shared_types::AgentLifecycleGuard 的关系
 //!
 //! `AgentLifecycleGuard` 的核心实现定义在 `shared_types::model::agent_model`。
-//! 本模块的 `lifecycle.rs` 提供：
-//!
-//! - **类型别名**: `AgentStopGuard`, `AgentStopHandleArc`
-//! - **Re-export**: 方便从 `agent_abstraction::launcher` 统一导入
+//! 本模块的 `lifecycle.rs` 提供 Re-export，
+//! 方便从 `agent_abstraction::launcher` 统一导入。
 //!
 //! ## 生命周期管理 (RAII)
 //!
@@ -46,22 +50,45 @@
 //! 3. 停止 stderr 任务
 //!
 //! 这确保了 Agent 资源的正确清理，即使在异常情况下也不会泄漏。
-//!
-//! ## 配置加载
-//!
-//! - `get_default_agent_config()` - 获取默认 Agent 配置
-//! - `load_agent_config()` - 从配置文件加载 Agent 配置
-//! - `convert_context_servers()` - 转换 MCP 服务器配置
 
 pub mod lifecycle;
-mod channel;
-mod claude_code;
+mod claude_code_sacp;
 
-pub use lifecycle::{AgentLifecycleGuard, AgentStopGuard, AgentStopHandleArc};
-pub use channel::{
-    PromptHandlerConfig, spawn_cancel_handler_for_agent, spawn_prompt_handler_for_agent,
+// ============================================================================
+// SACP 类型导出（推荐使用）
+// ============================================================================
+
+pub use lifecycle::AgentLifecycleGuard;
+
+// 直接导出 SACP 类型
+pub use claude_code_sacp::{
+    SacpClaudeCodeLauncher,
+    SacpLauncherConnectionInfo,
+    SacpAgentLaunchConfig,
+    load_sacp_agent_config,
+    get_default_sacp_agent_config,
+    convert_context_servers_sacp,
 };
-pub use claude_code::{
-    AgentLaunchConfig, ClaudeCodeLauncher, LauncherConnectionInfo, LauncherConnectionInfoComplete,
-    convert_context_servers, get_default_agent_config, load_agent_config,
-};
+
+// ============================================================================
+// 兼容性类型别名（向后兼容旧代码）
+// ============================================================================
+
+
+/// 兼容性别名：ClaudeCodeLauncher -> SacpClaudeCodeLauncher
+pub type ClaudeCodeLauncher<N> = SacpClaudeCodeLauncher<N>;
+
+/// 兼容性别名：LauncherConnectionInfoComplete -> SacpLauncherConnectionInfo
+pub type LauncherConnectionInfoComplete = SacpLauncherConnectionInfo;
+
+/// 兼容性别名：AgentLaunchConfig -> SacpAgentLaunchConfig
+pub type AgentLaunchConfig = SacpAgentLaunchConfig;
+
+/// 兼容性别名：load_agent_config -> load_sacp_agent_config
+pub use claude_code_sacp::load_sacp_agent_config as load_agent_config;
+
+/// 兼容性别名：get_default_agent_config -> get_default_sacp_agent_config
+pub use claude_code_sacp::get_default_sacp_agent_config as get_default_agent_config;
+
+/// 兼容性别名：convert_context_servers -> convert_context_servers_sacp
+pub use claude_code_sacp::convert_context_servers_sacp as convert_context_servers;

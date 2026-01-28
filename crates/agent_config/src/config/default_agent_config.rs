@@ -22,7 +22,7 @@ pub const CLAUDE_CODE_ACP_AGENT_ID: &str = "claude-code-acp";
 
 /// 默认配置的内部结构（用于 JSON 反序列化）
 #[derive(serde::Deserialize)]
-pub(crate) struct EmbeddedConfig {
+pub struct EmbeddedConfig {
     agent_servers: HashMap<String, AgentConfig>,
     #[serde(default)]
     context_servers: HashMap<String, ContextServerConfig>,

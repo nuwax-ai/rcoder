@@ -87,12 +87,12 @@ pub struct ServiceMountConfig {
 /// 服务资源限制配置
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceResourceLimits {
-    /// 内存限制（字节）
-    pub memory_limit: Option<u64>,
+    /// 内存限制（字节，支持浮点数输入）
+    pub memory_limit: Option<f64>,
     /// CPU 限制（核心数）
     pub cpu_limit: Option<f64>,
-    /// 交换空间限制（字节）
-    pub swap_limit: Option<u64>,
+    /// 交换空间限制（字节，支持浮点数输入）
+    pub swap_limit: Option<f64>,
 }
 
 impl ServiceResourceLimits {
@@ -100,10 +100,10 @@ impl ServiceResourceLimits {
     pub fn validate(&self) -> Result<(), String> {
         // 内存限制：512MB ~ 64GB
         if let Some(memory) = self.memory_limit {
-            if memory < 512 * 1024 * 1024 {
+            if memory < 512_000_000.0 {
                 return Err("memory_limit must be at least 512MB".to_string());
             }
-            if memory > 64 * 1024 * 1024 * 1024 {
+            if memory > 64_000_000_000.0 {
                 return Err("memory_limit cannot exceed 64GB".to_string());
             }
         }
@@ -119,11 +119,10 @@ impl ServiceResourceLimits {
         }
 
         // Swap 应该 >= 内存
-        if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit) {
-            if swap < memory {
+        if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit)
+            && swap < memory {
                 return Err("swap_limit should be >= memory_limit".to_string());
             }
-        }
 
         Ok(())
     }
@@ -326,8 +325,8 @@ impl ServiceMountConfig {
         }
 
         // 验证路径格式
-        if self.container_path.starts_with('/') {
-            if !self
+        if self.container_path.starts_with('/')
+            && !self
                 .container_path
                 .chars()
                 .all(|c: char| c.is_alphanumeric() || "/-_.".contains(c))
@@ -337,7 +336,6 @@ impl ServiceMountConfig {
                     self.container_path
                 ));
             }
-        }
 
         if self.mount_type != "bind" && self.mount_type != "volume" {
             return ConfigValidationResult::Error(format!(
@@ -383,9 +381,9 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
 
     // 默认资源限制
     let resource_limits = ServiceResourceLimits {
-        memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB
-        cpu_limit: Some(2.0),                       // 2 核
-        swap_limit: Some(4 * 1024 * 1024 * 1024),   // 4GB
+        memory_limit: Some(2_000_000_000.0), // 2GB
+        cpu_limit: Some(2.0),                // 2 核
+        swap_limit: Some(4_000_000_000.0),   // 4GB
     };
 
     ServiceImageConfig {
@@ -414,6 +412,10 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     environment.insert("SERVICE_MODE".to_string(), "agent-only".to_string());
     environment.insert("AGENT_PORT".to_string(), "8086".to_string());
 
+    // 🔥 Agent 清理配置（通过环境变量控制）
+    // 设置为 3600 秒（1小时），用户可以在 docker/config.yml 中覆盖此值
+    environment.insert("RCODER_AGENT_IDLE_TIMEOUT_SECS".to_string(), "3600".to_string()); // 1 小时
+
     let mounts = vec![];
 
     // 默认启动命令
@@ -425,9 +427,9 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
 
     // 默认资源限制（ComputerAgentRunner 可能需要更多资源）
     let resource_limits = ServiceResourceLimits {
-        memory_limit: Some(4 * 1024 * 1024 * 1024), // 4GB
-        cpu_limit: Some(3.0),                       // 3 核
-        swap_limit: Some(8 * 1024 * 1024 * 1024),   // 8GB
+        memory_limit: Some(4_000_000_000.0), // 4GB
+        cpu_limit: Some(3.0),                // 3 核
+        swap_limit: Some(8_000_000_000.0),   // 8GB
     };
 
     ServiceImageConfig {
@@ -568,9 +570,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_valid() {
         let valid = ServiceResourceLimits {
-            memory_limit: Some(1024 * 1024 * 1024), // 1GB
+            memory_limit: Some(1_000_000_000.0),  // 1GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(2 * 1024 * 1024 * 1024),
+            swap_limit: Some(2_000_000_000.0),    // 2GB
         };
         assert!(valid.validate().is_ok());
     }
@@ -578,7 +580,7 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_small() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(256 * 1024 * 1024), // 256MB - 太小
+            memory_limit: Some(256_000_000.0),  // 256MB - 太小
             cpu_limit: None,
             swap_limit: None,
         };
@@ -589,7 +591,7 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_large() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(100 * 1024 * 1024 * 1024), // 100GB - 太大
+            memory_limit: Some(100_000_000_000.0),  // 100GB - 太大
             cpu_limit: None,
             swap_limit: None,
         };
@@ -621,9 +623,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_swap_less_than_memory() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            memory_limit: Some(2_000_000_000.0),  // 2GB
             cpu_limit: None,
-            swap_limit: Some(1024 * 1024 * 1024), // swap < memory
+            swap_limit: Some(1_000_000_000.0),    // 1GB - swap < memory
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -637,29 +639,29 @@ mod tests {
     #[test]
     fn test_resource_limits_merge() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            memory_limit: Some(2_000_000_000.0),  // 2GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(4 * 1024 * 1024 * 1024),
+            swap_limit: Some(4_000_000_000.0),    // 4GB
         };
 
         let override_limits = ServiceResourceLimits {
-            memory_limit: Some(4 * 1024 * 1024 * 1024), // 覆盖
-            cpu_limit: None,                            // 不覆盖
-            swap_limit: Some(8 * 1024 * 1024 * 1024),   // 覆盖
+            memory_limit: Some(4_000_000_000.0),  // 覆盖：4GB
+            cpu_limit: None,                       // 不覆盖
+            swap_limit: Some(8_000_000_000.0),    // 覆盖：8GB
         };
 
         let merged = default_limits.merge_with(&override_limits);
-        assert_eq!(merged.memory_limit, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(merged.memory_limit, Some(4_000_000_000.0));
         assert_eq!(merged.cpu_limit, Some(2.0)); // 保留默认
-        assert_eq!(merged.swap_limit, Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(merged.swap_limit, Some(8_000_000_000.0));
     }
 
     #[test]
     fn test_resource_limits_merge_all_none() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            memory_limit: Some(2_000_000_000.0),  // 2GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(4 * 1024 * 1024 * 1024),
+            swap_limit: Some(4_000_000_000.0),    // 4GB
         };
 
         let override_limits = ServiceResourceLimits {
@@ -670,8 +672,8 @@ mod tests {
 
         let merged = default_limits.merge_with(&override_limits);
         // 所有字段都应该保留默认值
-        assert_eq!(merged.memory_limit, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(merged.memory_limit, Some(2_000_000_000.0));
         assert_eq!(merged.cpu_limit, Some(2.0));
-        assert_eq!(merged.swap_limit, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(merged.swap_limit, Some(4_000_000_000.0));
     }
 }

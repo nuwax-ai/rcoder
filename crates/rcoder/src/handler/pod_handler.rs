@@ -26,6 +26,50 @@ use shared_types::{ProjectAndContainerInfo, ServiceResourceLimits};
 // 辅助函数
 // ============================================================================
 
+/// 验证 Pod 资源限制配置
+///
+/// # 参数
+/// * `limits` - 资源限制配置
+///
+/// # 返回
+/// Ok(()) 验证通过，Err(String) 返回错误信息
+fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
+    // 验证 CPU 限制
+    if let Some(cpu) = limits.cpu {
+        if cpu <= 0.0 {
+            return Err("cpu must be greater than 0".to_string());
+        }
+        if cpu > 128.0 {
+            return Err("cpu cannot exceed 128 cores".to_string());
+        }
+    }
+
+    // 验证内存限制
+    if let Some(memory) = limits.memory {
+        if memory < 512_000_000.0 {
+            return Err("memory must be at least 512MB".to_string());
+        }
+        if memory > 128_000_000_000.0 {
+            return Err("memory cannot exceed 128GB".to_string());
+        }
+    }
+
+    // 验证 swap 限制
+    if let Some(swap) = limits.swap {
+        if swap < 512_000_000.0 {
+            return Err("swap must be at least 512MB".to_string());
+        }
+        // swap 必须 >= memory（如果两者都设置了）
+        if let (Some(memory), Some(swap_val)) = (limits.memory, limits.swap) {
+            if swap_val < memory {
+                return Err("swap should be >= memory".to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// 将 Unix 毫秒时间戳转换为东八区（UTC+8）时间字符串
 ///
 /// # 参数
@@ -201,13 +245,17 @@ pub struct EnsurePodRequest {
 /// Pod 资源限制配置
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct PodResourceLimits {
-    /// 内存限制 (bytes), 例如 4GB = 4294967296
-    #[schema(example = 4294967296_u64)]
-    pub memory: Option<u64>,
+    /// 内存限制 (bytes), 例如 4GB = 4294967296，支持浮点数输入
+    #[schema(example = 4294967296.0)]
+    pub memory: Option<f64>,
 
-    /// CPU 份额 (1024 = 1 核)
-    #[schema(example = 2048)]
-    pub cpu_shares: Option<u64>,
+    /// CPU 限制（核心数）, 例如 1.5 表示 1.5 核
+    #[schema(example = 2.0)]
+    pub cpu: Option<f64>,
+
+    /// 交换空间限制 (bytes), 例如 2GB = 2147483648，支持浮点数输入
+    #[schema(example = 2147483648.0)]
+    pub swap: Option<f64>,
 }
 
 /// 启动容器响应
@@ -628,6 +676,17 @@ pub async fn pod_ensure(
         ));
     }
 
+    // 1.1 验证资源限制
+    if let Some(ref limits) = request.resource_limits {
+        if let Err(e) = validate_resource_limits(limits) {
+            error!("❌ [POD_ENSURE] 资源限制验证失败: {}", e);
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
+                &format!("Invalid resource_limits: {}", e),
+            ));
+        }
+    }
+
     info!(
         "🚀 [POD_ENSURE] 确保容器存在: user_id={}, project_id={}",
         request.user_id, request.project_id
@@ -656,37 +715,37 @@ pub async fn pod_ensure(
 
     // 判断是否需要创建新容器
     let need_create = match existing_container {
-        Some((container_id, _container_name, status, is_running)) if is_running => {
+        Some(result) if result.is_running => {
             // 容器存在且正在运行，无需创建
             info!(
                 "📦 [POD_ENSURE] 容器已存在且运行中: container_id={}, status={:?}",
-                container_id, status
+                result.container_id, result.status
             );
             false
         }
-        Some((container_id, _container_name, status, _is_running)) => {
+        Some(result) => {
             // 容器存在但未运行（Exited 等状态），需要删除并重建
             warn!(
                 "⚠️ [POD_ENSURE] 容器存在但未运行: container_id={}, status={:?}, 将删除并重建",
-                container_id, status
+                result.container_id, result.status
             );
 
             // 删除旧容器
             // 如果删除失败（包括容器不存在等情况），返回错误让调用者知道
             docker_manager
-                .stop_container_by_id(&container_id)
+                .stop_container_by_id(&result.container_id)
                 .await
                 .map_err(|e| {
                     error!(
                         "❌ [POD_ENSURE] 删除旧容器失败: container_id={}, error={}",
-                        container_id, e
+                        result.container_id, e
                     );
                     AppError::internal_server_error(&format!("删除旧容器失败: {}", e))
                 })?;
 
             info!(
                 "✅ [POD_ENSURE] 旧容器已删除: container_id={}",
-                container_id
+                result.container_id
             );
 
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
@@ -708,8 +767,8 @@ pub async fn pod_ensure(
         // 创建新容器，最多重试 3 次
         let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
             memory_limit: limits.memory,
-            cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
-            swap_limit: None,
+            cpu_limit: limits.cpu,
+            swap_limit: limits.swap,
         });
 
         let mut last_error = None;
@@ -791,8 +850,8 @@ pub async fn pod_ensure(
 
                 let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
                     memory_limit: limits.memory,
-                    cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
-                    swap_limit: None,
+                    cpu_limit: limits.cpu,
+                    swap_limit: limits.swap,
                 });
 
                 match ComputerContainerManager::get_or_create_container_for_user(
@@ -849,7 +908,7 @@ pub async fn pod_ensure(
 
     // 5. 更新 DuckDB 存储中的容器信息（用于后续保活）
     // 无论容器是新建还是已存在，都要确保 DuckDB 记录是最新的
-    let mut project_info = if let Some(existing) = state.get_project(&request.project_id) {
+    let project_info = if let Some(existing) = state.get_project(&request.project_id) {
         // 如果已存在记录，更新容器信息
         let mut info = (*existing).clone();
         info.set_container(Some(container_info.clone()));
@@ -1083,6 +1142,17 @@ pub async fn pod_restart(
         ));
     }
 
+    // 1.1 验证资源限制
+    if let Some(ref limits) = request.resource_limits {
+        if let Err(e) = validate_resource_limits(limits) {
+            error!("❌ [POD_RESTART] 资源限制验证失败: {}", e);
+            return Ok(HttpResult::error(
+                shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
+                &format!("Invalid resource_limits: {}", e),
+            ));
+        }
+    }
+
     info!(
         "🔄 [POD_RESTART] 重启容器: user_id={}, project_id={}",
         request.user_id, request.project_id
@@ -1199,8 +1269,8 @@ pub async fn pod_restart(
     // 4. 定义资源限制
     let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
         memory_limit: limits.memory,
-        cpu_limit: limits.cpu_shares.map(|c| c as f64 / 1024.0),
-        swap_limit: None,
+        cpu_limit: limits.cpu,
+        swap_limit: limits.swap,
     });
 
     // 5. 强制创建新容器
@@ -1384,24 +1454,24 @@ pub async fn pod_status(
 
     // 4. 🆕 通过 DockerManager 实时查询容器状态（直接查询 Docker API，无缓存延迟）
     match docker_manager.find_container_realtime(&identifier).await {
-        Ok(Some((container_id, container_name, status, is_running))) => {
-            let status_str = if is_running { "running" } else { "stopped" };
-            let message = if is_running {
+        Ok(Some(result)) => {
+            let status_str = if result.is_running { "running" } else { "stopped" };
+            let message = if result.is_running {
                 "容器正在运行中".to_string()
             } else {
-                format!("容器存在但状态为: {:?}", status)
+                format!("容器存在但状态为: {:?}", result.status)
             };
 
             info!(
                 "✅ [POD_STATUS] 容器状态: alive={}, status={}, container_id={}",
-                is_running, status_str, container_id
+                result.is_running, status_str, result.container_id
             );
 
             return Ok(HttpResult::success(PodStatusResponse {
-                alive: is_running,
+                alive: result.is_running,
                 status: status_str.to_string(),
-                container_id: Some(container_id),
-                container_name: Some(container_name),
+                container_id: Some(result.container_id),
+                container_name: Some(result.container_name),
                 timestamp,
                 message,
             }));
@@ -1422,24 +1492,24 @@ pub async fn pod_status(
     if params.user_id.is_some() {
         if let Some(ref project_id) = params.project_id {
             match docker_manager.find_container_realtime(project_id).await {
-                Ok(Some((container_id, container_name, status, is_running))) => {
-                    let status_str = if is_running { "running" } else { "stopped" };
-                    let message = if is_running {
+                Ok(Some(result)) => {
+                    let status_str = if result.is_running { "running" } else { "stopped" };
+                    let message = if result.is_running {
                         "容器正在运行中".to_string()
                     } else {
-                        format!("容器存在但状态为: {:?}", status)
+                        format!("容器存在但状态为: {:?}", result.status)
                     };
 
                     info!(
                         "✅ [POD_STATUS] 通过 project_id 找到容器: alive={}, container_id={}",
-                        is_running, container_id
+                        result.is_running, result.container_id
                     );
 
                     return Ok(HttpResult::success(PodStatusResponse {
-                        alive: is_running,
+                        alive: result.is_running,
                         status: status_str.to_string(),
-                        container_id: Some(container_id),
-                        container_name: Some(container_name),
+                        container_id: Some(result.container_id),
+                        container_name: Some(result.container_name),
                         timestamp,
                         message,
                     }));
@@ -1600,7 +1670,7 @@ pub async fn pod_vnc_status(
     })?;
 
     // 4. 检查容器是否存在
-    let (container_id, _container_name, _status, is_running) = match container_info {
+    let result = match container_info {
         Some(info) => info,
         None => {
             info!(
@@ -1618,17 +1688,17 @@ pub async fn pod_vnc_status(
     };
 
     // 5. 检查容器是否正在运行
-    if !is_running {
+    if !result.is_running {
         info!(
             "⚠️ [POD_VNC_STATUS] 容器未运行: container_id={}",
-            container_id
+            result.container_id
         );
         return Ok(HttpResult::success(VncStatusResponse {
             vnc_ready: false,
             novnc_ready: false,
             message: "容器未运行".to_string(),
             uptime_seconds: 0,
-            container_id,
+            container_id: result.container_id,
         }));
     }
 
@@ -1642,7 +1712,7 @@ pub async fn pod_vnc_status(
             // 如果无法获取 agent_info，返回错误
             error!(
                 "❌ [POD_VNC_STATUS] 无法获取容器服务信息: container_id={}",
-                container_id
+                result.container_id
             );
             return Ok(HttpResult::error(
                 shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
@@ -1681,7 +1751,7 @@ pub async fn pod_vnc_status(
                         novnc_ready: resp.novnc_ready,
                         message: resp.message,
                         uptime_seconds: resp.uptime_seconds,
-                        container_id,
+                        container_id: result.container_id,
                     }))
                 }
                 Err(e) => {
@@ -1723,13 +1793,15 @@ mod tests {
     #[test]
     fn test_pod_resource_limits_serialization() {
         let limits = PodResourceLimits {
-            memory: Some(4294967296),
-            cpu_shares: Some(2048),
+            memory: Some(4294967296.0),
+            cpu: Some(2.0),
+            swap: Some(6442450944.0),
         };
 
         let json = serde_json::to_string(&limits).unwrap();
         assert!(json.contains("4294967296"));
-        assert!(json.contains("2048"));
+        assert!(json.contains("2.0"));
+        assert!(json.contains("6442450944"));
     }
 
     #[test]
@@ -1747,5 +1819,114 @@ mod tests {
         assert!(json.contains("created"));
         assert!(json.contains("container_info"));
         assert!(json.contains("message"));
+    }
+
+    #[test]
+    fn test_validate_resource_limits_valid() {
+        let limits = PodResourceLimits {
+            memory: Some(4294967296.0), // 4GB
+            cpu: Some(2.0),
+            swap: Some(6442450944.0), // 6GB
+        };
+        assert!(validate_resource_limits(&limits).is_ok());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_none_values() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: None,
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_ok());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_cpu_zero() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(0.0),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_cpu_negative() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(-1.0),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_cpu_too_large() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(200.0),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_memory_too_small() {
+        let limits = PodResourceLimits {
+            memory: Some(256_000_000.0), // 256MB
+            cpu: None,
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_memory_too_large() {
+        let limits = PodResourceLimits {
+            memory: Some(256_000_000_000.0), // 256GB
+            cpu: None,
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_swap_less_than_memory() {
+        let limits = PodResourceLimits {
+            memory: Some(8_589_934_592.0), // 8GB
+            cpu: None,
+            swap: Some(4_294_967_296.0), // 4GB
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_swap_too_small() {
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: None,
+            swap: Some(256_000_000.0), // 256MB
+        };
+        assert!(validate_resource_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_limits_cpu_boundary() {
+        // 测试边界值：0.1 应该失败（小于等于 0）
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(0.1),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_ok());
+
+        // 测试边界值：0.01 应该通过
+        let limits = PodResourceLimits {
+            memory: None,
+            cpu: Some(0.01),
+            swap: None,
+        };
+        assert!(validate_resource_limits(&limits).is_ok());
     }
 }

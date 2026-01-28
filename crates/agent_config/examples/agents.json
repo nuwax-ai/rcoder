@@ -42,6 +42,37 @@
       "metadata": {
         "description": "React 专项开发助手"
       }
+    },
+    "nuwaxcode": {
+      "agent_id": "nuwaxcode",
+      "agent_type": "openai",
+      "command": "nuwaxcode",
+      "args": ["acp"],
+      "env": {
+        "OPENAI_API_KEY": "{MODEL_PROVIDER_API_KEY}",
+        "OPENAI_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
+        "OPENCODE_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
+        "RUST_LOG": "info"
+      },
+      "system_prompt": {
+        "source": "embedded",
+        "template": "",
+        "enabled": true
+      },
+      "user_prompt": {
+        "template": "{user_prompt}",
+        "enabled": false
+      },
+      "installation": {
+        "package_manager": "npm",
+        "package_name": "nuwaxcode",
+        "version": "latest"
+      },
+      "enabled": false,
+      "metadata": {
+        "description": "NuwaxCode - OpenAI-compatible coding agent (示例配置)",
+        "version": "1.0.0"
+      }
     }
   },
   "context_servers": {

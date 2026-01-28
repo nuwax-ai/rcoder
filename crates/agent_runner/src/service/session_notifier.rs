@@ -26,8 +26,7 @@ impl SseSessionNotifier {
 
 /// 将 anyhow::Error 转换为 Box<dyn std::error::Error + Send + Sync>
 fn convert_error(e: anyhow::Error) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
+    Box::new(std::io::Error::other(
         e.to_string(),
     ))
 }
@@ -54,7 +53,7 @@ impl SessionNotifier for SseSessionNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        stop_reason: agent_client_protocol::StopReason,
+        stop_reason: sacp::schema::StopReason,
         error_message: Option<String>,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -74,7 +73,7 @@ impl SessionNotifier for SseSessionNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        error: agent_client_protocol::Error,
+        error: sacp::schema::Error,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let notify = SessionNotify::SessionPromptError(SessionPromptError {
@@ -92,14 +91,14 @@ impl SessionNotifier for SseSessionNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        session_update: agent_client_protocol::SessionUpdate,
+        session_update: sacp::schema::SessionUpdate,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let notify = SessionNotify::AgentSessionUpdate(AgentSessionUpdate {
+        let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
             session_id: session_id.to_string(),
             session_update,
             request_id,
-        });
+        }));
 
         push_session_update_with_project(project_id, session_id, notify)
             .await

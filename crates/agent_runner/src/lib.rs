@@ -2,7 +2,7 @@
 //!
 //! 提供 ACP 协议集成和 AI 代理管理功能
 
-pub mod agent_worker_manager;
+pub mod agent_runtime;
 pub mod api_key_manager;
 mod config;
 pub mod grpc;
@@ -11,7 +11,7 @@ mod model;
 pub mod otel_tracing; // 🔥 设为 public，供其他模块使用
 mod proxy_agent;
 pub mod router;
-mod service;
+pub mod service; // 🔥 设为 public，供测试使用
 mod utils;
 
 // 测试辅助模块 (仅在 testing feature 启用时编译)
@@ -19,7 +19,9 @@ mod utils;
 pub mod testing;
 
 // 重新导出主要的类型和函数
+pub use agent_runtime::*;
 pub use model::*;
 pub use otel_tracing::*;
 pub use proxy_agent::*;
+pub use service::*; // 重新导出 service 模块
 pub use utils::*;

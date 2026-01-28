@@ -70,12 +70,12 @@ impl ContainerDestroyer {
             .find_container_realtime(container_name)
             .await
         {
-            Ok(Some((container_id, _, _, _))) => {
+            Ok(Some(result)) => {
                 debug!(
                     "✅ [destroyer] 找到容器: name={}, id={}",
-                    container_name, container_id
+                    container_name, result.container_id
                 );
-                container_id
+                result.container_id
             }
             Ok(None) => {
                 // 容器不存在，可能已经被删除了，这不是错误

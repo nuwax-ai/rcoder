@@ -25,6 +25,11 @@ RUN apt-get update && apt-get install -y \
     net-tools \
     nginx \
     vim \
+    fonts-liberation \
+    lsb-release \
+    xdg-utils \
+    chromium \
+    chromium-driver \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
@@ -58,6 +63,9 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 
 # 安装 OpenAI Codex（强制更新到最新版本）
 RUN npm install -g @openai/codex@latest
+
+# 安装 Chrome DevTools MCP（强制更新到最新版本）
+RUN npm install -g chrome-devtools-mcp@latest
 
 # 安装 Bun
 RUN curl -fsSL https://bun.sh/install | bash
@@ -96,7 +104,7 @@ RUN bun add -g @upstash/context7-mcp
 
 # 创建 Claude Code 配置目录并禁用 webfetch 功能，添加 MCP 工具
 RUN mkdir -p /root/.claude && \
-    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}}}}' > /root/.claude/settings.json
+    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}},"chrome-devtools":{"command":"npx","args":["-y","chrome-devtools-mcp@latest"]}}}' > /root/.claude/settings.json
 
 # 添加所有工具安装路径到 PATH
 ENV PNPM_HOME="/home/user/.local/share/pnpm" \

@@ -14,7 +14,7 @@ port: 8087
 cleanup_config:
   # 闲置超时时间（秒），超过此时间未活动的容器将被清理
   # 默认值: 600 (10分钟)
-  idle_timeout_seconds: 300
+  idle_timeout_seconds: 30000
   # 清理任务执行间隔（秒）
   # 默认值: 300 (5分钟)
   cleanup_interval_seconds: 3
@@ -23,7 +23,7 @@ cleanup_config:
   docker_stop_timeout_seconds: 6
   # 容器最小保护时间（秒），刚启动的容器在此时间内不会被清理
   # 默认值: 300 (5分钟)
-  container_protection_seconds: 40
+  container_protection_seconds: 60
 
 # Pingora 反向代理配置
 proxy_config:
@@ -107,6 +107,9 @@ docker_config:
           SERVICE_MODE: "agent-only"
           AGENT_PORT: "8086"
           PROJECT_WORKSPACE_BASE: "/home/user"
+          # 🔥 Agent 清理配置（闲置超时时间，秒）
+          # 默认值: 3600 (1小时)
+          RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
 
         command:
           - "/usr/local/bin/agent_runner"
@@ -115,8 +118,8 @@ docker_config:
 
         resource_limits:
           memory_limit: 4294967296 # 4GB
-          cpu_limit: 3.0
-          swap_limit: 8589934592 # 8GB
+          cpu_limit: 2.0
+          swap_limit: 6442450944 # 6GB (实际 swap = 2GB)
 
         work_dir: "/app"
         network_mode: "bridge"
@@ -133,6 +136,7 @@ docker_config:
           # resolve_from: 指定从哪个容器内路径解析宿主机基础路径
           # {resolved_path}: 解析后的宿主机基础路径
           # {log_dir_name}: 日志目录名（container_name-timestamp）
+          # 🔥 panic 日志也会写入此目录 (agent_runner_panic.log)
           - container_path: "/app/container-logs"
             host_path: "{resolved_path}/{log_dir_name}"
             read_only: false

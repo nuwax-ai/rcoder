@@ -146,7 +146,12 @@ impl ContainerStatusChecker {
         let mut updated = 0;
         let mut failed = 0;
 
-        for (lookup_key, container_info) in containers {
+        for (_project_id, container_info) in containers {
+            // 使用 container_key() 获取正确的容器标识符
+            // - RCoder 模式：返回 project_id
+            // - ComputerAgentRunner 模式：返回 user_id（用于匹配容器名称）
+            let lookup_key = container_info.container_key().to_string();
+
             // 🆕 检查所有类型的容器（RCoder 和 ComputerAgentRunner）
             // 两种模式都可能执行长时间任务，需要定期检查状态防止被误杀
 
@@ -233,42 +238,43 @@ impl ContainerStatusChecker {
 
                 if is_active {
                     // 容器有活跃任务，更新活动时间和状态
-                    if let Err(e) = update_container_activity(lookup_key, &self.state).await {
+                    // 注意：使用 project_id 更新 DuckDB，而不是 lookup_key
+                    if let Err(e) = update_project_activity(&project_id, &self.state).await {
                         warn!(
-                            "⚠️ [STATUS_CHECKER] 更新活动时间失败: {}, {}",
-                            lookup_key, e
+                            "⚠️ [STATUS_CHECKER] 更新活动时间失败: project_id={}, {}",
+                            project_id, e
                         );
                         return Ok(false);
                     }
                     // 🆕 同步更新 agent 状态为 Active
                     if let Err(e) = self.state.projects.update_agent_status(
-                        lookup_key, 1, // Active
+                        &project_id, 1, // Active
                         "active",
                     ) {
                         warn!(
-                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Active 失败: {}, error={}",
-                            lookup_key, e
+                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Active 失败: project_id={}, error={}",
+                            project_id, e
                         );
                     }
                     debug!(
-                        "✅ [STATUS_CHECKER] 容器活跃，已更新活动时间和状态: {}",
-                        lookup_key
+                        "✅ [STATUS_CHECKER] 容器活跃，已更新活动时间和状态: container_key={}, project_id={}",
+                        lookup_key, project_id
                     );
                     Ok(true)
                 } else {
                     // 🆕 同步更新 agent 状态为 Idle
                     if let Err(e) = self.state.projects.update_agent_status(
-                        lookup_key, 0, // Idle
+                        &project_id, 0, // Idle
                         "idle",
                     ) {
                         warn!(
-                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Idle 失败: {}, error={}",
-                            lookup_key, e
+                            "⚠️ [STATUS_CHECKER] 更新 agent 状态为 Idle 失败: project_id={}, error={}",
+                            project_id, e
                         );
                     }
                     debug!(
-                        "📭 [STATUS_CHECKER] 容器空闲，已更新状态为 Idle: {}",
-                        lookup_key
+                        "📭 [STATUS_CHECKER] 容器空闲，已更新状态为 Idle: container_key={}, project_id={}",
+                        lookup_key, project_id
                     );
                     Ok(false)
                 }
@@ -310,20 +316,54 @@ impl ContainerStatusChecker {
                     .service_type()
                     .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
 
-                let exists = docker_manager
-                    .find_agent_container(container_info.project_id(), &service_type)
-                    .await
-                    .is_some();
+                // 根据 service_type 使用不同的查找方法
+                // - RCoder 模式：使用 project_id 查找
+                // - ComputerAgentRunner 模式：使用 user_id 查找
+                let exists = match service_type {
+                    shared_types::ServiceType::ComputerAgentRunner => {
+                        // ComputerAgentRunner 模式：使用 user_id 查找容器
+                        if let Some(user_id) = container_info.user_id() {
+                            match docker_manager
+                                .find_user_container(user_id, &service_type)
+                                .await
+                            {
+                                Ok(Some(_)) => true,
+                                Ok(None) => false,
+                                Err(e) => {
+                                    debug!("⚠️ [STATUS_CHECKER] 查询容器失败: {}", e);
+                                    false
+                                }
+                            }
+                        } else {
+                            debug!("⚠️ [STATUS_CHECKER] ComputerAgentRunner 模式缺少 user_id");
+                            false
+                        }
+                    }
+                    shared_types::ServiceType::RCoder => {
+                        // RCoder 模式：使用 project_id 查找容器
+                        match docker_manager
+                            .find_project_container(container_info.project_id(), &service_type)
+                            .await
+                        {
+                            Ok(Some(_)) => true,
+                            Ok(None) => false,
+                            Err(e) => {
+                                debug!("⚠️ [STATUS_CHECKER] 查询容器失败: {}", e);
+                                false
+                            }
+                        }
+                    }
+                };
 
                 if exists {
                     debug!(
-                        "🔍 [STATUS_CHECKER] Docker 容器存在，可能是网络问题: {}",
-                        grpc_addr
+                        "🔍 [STATUS_CHECKER] Docker 容器存在，可能是网络问题: {} (service_type={:?})",
+                        grpc_addr, service_type
                     );
                 } else {
                     info!(
-                        "🔍 [STATUS_CHECKER] Docker 容器不存在（已被销毁）: {}",
-                        grpc_addr
+                        "🔍 [STATUS_CHECKER] Docker 容器不存在（已被销毁）: {} (service_type={:?})",
+                        grpc_addr, service_type
                     );
                 }
 
@@ -369,13 +409,14 @@ impl ContainerStatusChecker {
 
         match self.health_states.entry(lookup_key.to_string()) {
             Entry::Occupied(mut entry) => {
+                // 使用 get_mut 直接修改，避免克隆
                 let was_failing = entry.get().consecutive_failures > 0;
-                let mut health = entry.get().clone();
+                let health = entry.get_mut();
                 health.consecutive_failures = 0;
                 health.first_failure_time = None;
                 health.last_check_time = now;
                 health.last_success_time = Some(now);
-                entry.insert(health);
+                // 无需 insert，修改已生效
 
                 if was_failing {
                     info!("✅ [STATUS_CHECKER] 容器恢复正常: {}", lookup_key);
@@ -395,14 +436,15 @@ impl ContainerStatusChecker {
 
         let consecutive_failures = match self.health_states.entry(lookup_key.to_string()) {
             Entry::Occupied(mut entry) => {
-                let mut health = entry.get().clone();
+                // 使用 get_mut 直接修改，避免克隆
+                let health = entry.get_mut();
                 health.consecutive_failures += 1;
                 health.last_check_time = now;
                 if health.first_failure_time.is_none() {
                     health.first_failure_time = Some(now);
                 }
                 let failures = health.consecutive_failures;
-                entry.insert(health);
+                // 无需 insert，修改已生效
                 failures
             }
             Entry::Vacant(entry) => {
@@ -575,11 +617,12 @@ async fn query_container_status(
     Ok(status_response.is_active || status_response.active_tasks > 0)
 }
 
-/// 更新容器活动时间
+/// 更新项目活动时间（并同步更新关联容器的活动时间）
 ///
-/// 使用 DuckDB 存储更新 last_activity
-async fn update_container_activity(lookup_key: &str, state: &Arc<AppState>) -> anyhow::Result<()> {
+/// 使用 DuckDB 存储更新 projects 表的 last_activity 字段
+async fn update_project_activity(project_id: &str, state: &Arc<AppState>) -> anyhow::Result<()> {
     // 使用 ProjectAdapter 的 update_activity 方法
-    state.update_activity(lookup_key);
+    // 该方法会同时更新 project 和关联 container 的 last_activity
+    state.update_activity(project_id);
     Ok(())
 }

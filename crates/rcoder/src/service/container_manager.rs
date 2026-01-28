@@ -6,7 +6,6 @@
 use crate::AppError;
 use anyhow::Result;
 use docker_manager::{ContainerBasicInfo, DockerManager};
-use std::sync::Arc;
 use tracing::{debug, error, info};
 
 /// 通用容器管理服务

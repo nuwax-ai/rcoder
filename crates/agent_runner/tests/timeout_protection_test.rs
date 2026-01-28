@@ -183,7 +183,7 @@ async fn test_multiple_requests_timeout_detection() {
     let mut yellow_count = 0;
     let mut red_count = 0;
 
-    for (_req_id, start_time) in &active_requests {
+    for start_time in active_requests.values() {
         let duration = (now - *start_time).num_seconds();
 
         if duration > 120 {

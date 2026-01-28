@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::{CancelNotification, SessionId};
+// SACP 类型导入
+use sacp::schema::{CancelNotification, PromptRequest, SessionId};
 use tokio::sync::{mpsc, oneshot};
 
 // 重新导出 shared_types 中的统一类型
@@ -27,7 +28,7 @@ pub struct AgentConnection {
     pub session_id: Option<SessionId>,
 
     /// Prompt sender channel
-    pub prompt_tx: Arc<mpsc::UnboundedSender<agent_client_protocol::PromptRequest>>,
+    pub prompt_tx: Arc<mpsc::UnboundedSender<PromptRequest>>,
     /// Cancel sender channel - wrapped in Arc to avoid Debug requirement
     pub cancel_tx: Arc<mpsc::UnboundedSender<CancelNotificationRequestWrapper>>,
 }
@@ -45,7 +46,7 @@ impl AgentConnection {
         project_id: String,
         service_type: shared_types::ServiceType,
         session_id: Option<SessionId>,
-        prompt_tx: Arc<mpsc::UnboundedSender<agent_client_protocol::PromptRequest>>,
+        prompt_tx: Arc<mpsc::UnboundedSender<PromptRequest>>,
         cancel_tx: Arc<mpsc::UnboundedSender<CancelNotificationRequestWrapper>>,
     ) -> Self {
         Self {
@@ -84,13 +85,13 @@ impl AgentConnection {
     /// session_id 由服务端自动管理，调用方无需关心
     ///
     /// 设计说明：
-    /// - agent 必须在 LocalSet 中运行（不能跨线程）
+    /// - SACP 版本支持 Send trait，可以在 tokio::spawn 中运行
     /// - 使用 MPSC channel 解耦调用方和 agent 运行环境
     /// - newSession 在 agent 启动后自动执行
     /// - prompt handler 会自动处理 session_id 的覆盖
     pub async fn send_prompt(
         &self,
-        prompt: agent_client_protocol::PromptRequest,
+        prompt: PromptRequest,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.prompt_tx.send(prompt).map_err(|e| {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))

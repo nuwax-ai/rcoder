@@ -1,6 +1,7 @@
 use super::{
-    CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerStatus,
-    DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
+    CleanupOptions, CleanupResult, ContainerFilter, ContainerRemovalFailure, ContainerQueryResult,
+    ContainerQueryResultArc, ContainerStatus, DockerContainerConfig, DockerContainerInfo,
+    DockerError, DockerManagerConfig, DockerResult,
 };
 use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
 use anyhow::Result;
@@ -16,10 +17,91 @@ use bollard::{
     },
 };
 use chrono::{DateTime, Utc};
+use moka::future::Cache;
 use shared_types::ContainerBasicInfo;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+/// Docker API 缓存
+///
+/// 使用 Moka 缓存库实现高性能缓存，减少 Docker API 调用次数
+/// 使用结构体包装，提高代码可读性和减少 clone 开销
+pub struct DockerApiCache {
+    /// 容器状态缓存 (identifier -> Option<ContainerQueryResultArc>)
+    /// 支持 None 值缓存，用于缓存 404 响应
+    status_cache: Cache<String, Option<ContainerQueryResultArc>>,
+
+    /// 网络信息缓存 (container_id -> Option<Arc<HashMap<network_name, ip_address>>>)
+    /// 支持 None 值缓存
+    network_cache: Cache<String, Option<Arc<HashMap<String, String>>>>,
+}
+
+impl DockerApiCache {
+    /// 创建新的缓存实例
+    ///
+    /// # 参数
+    /// * `status_ttl` - 状态缓存 TTL（秒）
+    /// * `network_ttl` - 网络缓存 TTL（秒）
+    pub fn new(status_ttl: u64, network_ttl: u64) -> Self {
+        info!(
+            "🗄️ [API_CACHE] 初始化 Docker API 缓存: status_ttl={}秒, network_ttl={}秒",
+            status_ttl, network_ttl
+        );
+
+        Self {
+            status_cache: Cache::builder()
+                .max_capacity(1000)
+                .time_to_live(Duration::from_secs(status_ttl))
+                .build(),
+            network_cache: Cache::builder()
+                .max_capacity(1000)
+                .time_to_live(Duration::from_secs(network_ttl))
+                .build(),
+        }
+    }
+
+    /// 使用默认配置创建缓存实例
+    #[allow(dead_code)]
+    pub fn with_defaults() -> Self {
+        Self::new(10, 15)
+    }
+
+    /// 获取状态缓存
+    pub async fn get_status(&self, identifier: &str) -> Option<Option<ContainerQueryResultArc>> {
+        self.status_cache.get(identifier).await
+    }
+
+    /// 写入状态缓存（支持 None 值）
+    pub async fn insert_status(&self, identifier: String, value: Option<ContainerQueryResultArc>) {
+        self.status_cache.insert(identifier, value).await;
+    }
+
+    /// 获取网络缓存
+    pub async fn get_network(&self, container_id: &str) -> Option<Option<Arc<HashMap<String, String>>>> {
+        self.network_cache.get(container_id).await
+    }
+
+    /// 写入网络缓存（支持 None 值）
+    pub async fn insert_network(&self, container_id: String, value: Option<Arc<HashMap<String, String>>>) {
+        self.network_cache.insert(container_id, value).await;
+    }
+
+    /// 使缓存失效
+    pub async fn invalidate(&self, identifier: &str) {
+        self.status_cache.invalidate(identifier).await;
+        self.network_cache.invalidate(identifier).await;
+    }
+
+    /// 使所有相关缓存失效（用于容器生命周期变化后）
+    pub async fn invalidate_all(&self, identifiers: &[String]) {
+        for id in identifiers {
+            self.status_cache.invalidate(id.as_str()).await;
+            self.network_cache.invalidate(id.as_str()).await;
+        }
+    }
+}
 
 /// Docker 容器管理器
 pub struct DockerManager {
@@ -31,6 +113,8 @@ pub struct DockerManager {
     containers: ContainerStateHandle,
     /// 主网络名称（动态检测或使用默认值）
     main_network_name: std::sync::Arc<tokio::sync::RwLock<String>>,
+    /// Docker API 缓存
+    api_cache: Arc<DockerApiCache>,
 }
 
 impl DockerManager {
@@ -67,11 +151,18 @@ impl DockerManager {
         tokio::spawn(actor.run());
         info!("✅ ContainerStateActor 已启动");
 
+        // 🗄️ 初始化 Docker API 缓存（使用配置的 TTL）
+        let api_cache = Arc::new(DockerApiCache::new(
+            config.cache_status_ttl_seconds,
+            config.cache_network_ttl_seconds,
+        ));
+
         let manager = Self {
             docker,
             config,
             containers,
             main_network_name: std::sync::Arc::new(tokio::sync::RwLock::new(main_network_name)),
+            api_cache,
         };
 
         // 确保 RCoder 网络存在
@@ -83,6 +174,24 @@ impl DockerManager {
     /// 使用默认配置创建 Docker 管理器
     pub async fn with_default_config() -> DockerResult<Self> {
         Self::new(DockerManagerConfig::default()).await
+    }
+
+    /// 带超时的 inspect_container 调用
+    ///
+    /// 封装 Docker API 调用，添加超时保护，防止请求阻塞
+    async fn inspect_with_timeout(
+        &self,
+        identifier: &str,
+        timeout: Duration,
+    ) -> DockerResult<bollard::models::ContainerInspectResponse> {
+        tokio::time::timeout(timeout, self.docker.inspect_container(identifier, None::<InspectContainerOptions>))
+            .await
+            .map_err(|_| DockerError::Timeout(format!(
+                "Docker API 调用超时 ({}秒): identifier={}",
+                timeout.as_secs(),
+                identifier
+            )))?
+            .map_err(DockerError::BollardError)
     }
 
     /// 创建并启动容器
@@ -100,23 +209,22 @@ impl DockerManager {
 
         // 🔍 先检查 Docker API 中是否存在同名容器（无论运行状态）
         // 这是必要的，因为容器可能被外部 stop 但未删除，导致 409 Conflict
-        if let Ok(Some((existing_container_id, existing_name, status, is_running))) =
-            self.find_container_realtime(&container_name).await
-        {
+        if let Ok(Some(result)) = self.find_container_realtime(&container_name).await {
             warn!(
                 "🔍 [CREATE] 发现同名容器: name={}, id={}, status={:?}, running={}",
-                existing_name, existing_container_id, status, is_running
+                result.container_name, result.container_id, result.status, result.is_running
             );
 
             // 无论容器是运行还是停止状态，都先删除
             info!(
                 "🗑️ [CREATE] 删除旧容器 {} ({})",
-                existing_name, existing_container_id
+                result.container_name, result.container_id
             );
-            if let Err(e) = self.stop_container_by_id(&existing_container_id).await {
+            if let Err(e) = self.stop_container_by_id(&result.container_id).await {
                 error!("❌ [CREATE] 删除旧容器失败: {}", e);
                 // 继续尝试创建，Docker 会返回 409 错误
             } else {
+                // 🔧 stop_container_by_id 已处理缓存失效
                 info!("✅ [CREATE] 旧容器删除成功");
             }
         }
@@ -166,6 +274,7 @@ impl DockerManager {
         }
 
         // 构建环境变量
+        #[allow(unused_mut)]
         let mut env_vars: Vec<String> = config
             .env_vars
             .into_iter()
@@ -243,8 +352,8 @@ impl DockerManager {
 
         // 应用资源限制
         if let Some(ref limits) = config.resource_limits {
-            host_config.memory = limits.memory_limit;
-            host_config.memory_swap = limits.swap_limit;
+            host_config.memory = limits.memory_limit.map(|v| v as i64);
+            host_config.memory_swap = limits.swap_limit.map(|v| v as i64);
             // CPU 限制需要通过 nano_cpus 设置 (1 CPU = 1e9 nano CPUs)
             if let Some(cpu_limit) = limits.cpu_limit {
                 host_config.nano_cpus = Some((cpu_limit * 1e9) as i64);
@@ -341,6 +450,8 @@ impl DockerManager {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
         // 创建容器信息
+        // 注意：由于容器间通过 Docker 内部网络通信，assigned_port 设为 0
+        // 实际通信使用 container_ip:internal_port
         let container_info = DockerContainerInfo {
             container_id: container_id.clone(),
             container_name: container_name.clone(),
@@ -354,7 +465,7 @@ impl DockerManager {
             host_path: config.host_path.clone(),
             container_path: config.container_path.clone(),
             port_bindings: config.port_bindings.clone(),
-            assigned_port: 3000, // TODO: 使用动态分配的端口
+            assigned_port: 0, // 内部网络通信，不需要宿主机端口
             health_status: None,
             service_health: None,                         // 初始无健康检查结果
             internal_port: 8080,                          // 默认内部端口
@@ -416,6 +527,9 @@ impl DockerManager {
         for info in self.containers.list().await {
             if info.container_id == container_id {
                 self.containers.remove(&info.project_id).await;
+                // 🔧 使缓存失效
+                self.api_cache.invalidate(container_id).await;
+                self.api_cache.invalidate(info.container_name.as_str()).await;
                 break;
             }
         }
@@ -434,7 +548,7 @@ impl DockerManager {
             return Ok(());
         };
 
-        // 调用通过ID停止的方法
+        // 调用通过ID停止的方法（已包含缓存失效和映射移除）
         self.stop_container_by_id(&container_info.container_id)
             .await?;
 
@@ -444,7 +558,20 @@ impl DockerManager {
         Ok(())
     }
 
-    /// 获取容器信息
+    /// 通过 project_id 从缓存中获取容器信息
+    ///
+    /// 从内存缓存中查询容器信息，速度快但可能不是最新状态。
+    ///
+    /// # 参数
+    /// * `project_id` - 项目 ID（RCoder 模式的主键）
+    ///
+    /// # 返回
+    /// * 如果缓存中存在，返回 `Some(DockerContainerInfo)`
+    /// * 如果缓存中不存在，返回 `None`
+    ///
+    /// # 注意
+    /// - 此方法从缓存查询，容器信息可能不是最新的
+    /// - 如果需要最新的容器状态，请使用 [`get_container_info_by_name`](Self::get_container_info_by_name)
     pub async fn get_container_info(&self, project_id: &str) -> Option<DockerContainerInfo> {
         self.containers.get(project_id).await
     }
@@ -471,7 +598,7 @@ impl DockerManager {
     /// - 容器重启后 ID 会变化，导致使用旧 ID 操作失败（404 错误）
     ///
     /// **迁移指南**：
-    /// ```rust,no_run
+    /// ```text
     /// // ❌ 旧方式（可能使用过期的 container_id）
     /// if let Some(info) = docker_manager.find_container_by_identifier("container_name").await {
     ///     docker_manager.stop_container_by_id(&info.container_id).await?;
@@ -523,23 +650,21 @@ impl DockerManager {
                                 identifier, container_id
                             );
 
-                            // 🛡️ 尝试从容器信息中获取真实的创建时间
+                            // 🛡️ 从容器信息中获取真实的创建时间
+                            // 使用统一的时间戳解析函数
                             let created_at = if let Some(created_timestamp) = container.created {
-                                // Docker API 返回的时间戳通常是 i64 类型
-                                DateTime::from_timestamp(
-                                    created_timestamp / 1000,
-                                    (created_timestamp % 1000) as u32 * 1_000_000,
+                                // list_containers API 返回的是 Unix 秒时间戳
+                                Self::parse_unix_timestamp(
+                                    created_timestamp,
+                                    &format!("container {}", clean_name)
                                 )
-                                .unwrap_or_else(|| {
-                                    warn!(
-                                        "无法解析容器创建时间，使用当前时间: timestamp={}",
-                                        created_timestamp
-                                    );
+                                .unwrap_or_else(|e| {
+                                    warn!("⚠️ 解析容器创建时间失败: {}, 使用当前时间", e);
                                     Utc::now()
                                 })
                             } else {
                                 warn!(
-                                    "容器缺少创建时间信息，使用当前时间作为备用: container_id={}",
+                                    "⚠️ 容器缺少创建时间信息，使用当前时间作为备用: container_id={}",
                                     container_id
                                 );
                                 Utc::now()
@@ -589,11 +714,10 @@ impl DockerManager {
             .await
         {
             Ok(details) => {
-                if let Some(state) = details.state {
-                    if let Some(status) = state.status {
+                if let Some(state) = details.state
+                    && let Some(status) = state.status {
                         return Ok(status == bollard::models::ContainerStateStatusEnum::RUNNING);
                     }
-                }
                 Ok(false)
             }
             Err(bollard::errors::Error::DockerResponseServerError {
@@ -609,29 +733,38 @@ impl DockerManager {
         }
     }
 
-    /// 实时查询容器状态（直接查询 Docker API，不使用缓存）
+    /// 实时查询容器状态（使用缓存 + 超时保护）
     ///
     /// 与 `find_container_by_identifier` 不同，此方法跳过内存缓存，
     /// 直接查询 Docker API 获取最新的容器状态。
+    ///
+    /// 🔧 优化：使用 Moka 缓存减少 Docker API 调用，使用超时保护防止阻塞
+    /// 📝 缓存策略：同时缓存 container_id 和 container_name，支持 404 响应缓存
     ///
     /// # 参数
     /// * `identifier` - 容器名称或容器 ID
     ///
     /// # 返回
-    /// * 如果找到容器，返回 `Some((container_id, container_name, status, is_running))`
+    /// * 如果找到容器，返回 `Some(ContainerQueryResult)`
     /// * 如果容器不存在，返回 `None`
     pub async fn find_container_realtime(
         &self,
         identifier: &str,
-    ) -> DockerResult<Option<(String, String, ContainerStatus, bool)>> {
+    ) -> DockerResult<Option<ContainerQueryResult>> {
         debug!("🔍 [REALTIME] 实时查询容器状态: identifier={}", identifier);
 
-        match self
-            .docker
-            .inspect_container(identifier, None::<InspectContainerOptions>)
-            .await
-        {
+        // 1. 尝试从缓存获取（只缓存成功结果，不缓存 404）
+        if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
+            debug!("✅ [REALTIME] 缓存命中: identifier={}", identifier);
+            // Arc::clone 只是增加引用计数，开销很小
+            return Ok(Some((*cached).clone()));
+        }
+
+        // 2. 缓存未命中，调用 Docker API（带超时）
+        let timeout = Duration::from_secs(self.config.api_timeout_quick_seconds);
+        let result = match self.inspect_with_timeout(identifier, timeout).await {
             Ok(details) => {
+                // 解析结果
                 let container_id = details.id.unwrap_or_default();
                 let container_name = details
                     .name
@@ -651,25 +784,392 @@ impl DockerManager {
                     (ContainerStatus::Unknown("no state".to_string()), false)
                 };
 
+                // 🔧 使用 Arc 包装，减少 clone 开销
+                let query_result = ContainerQueryResult::new(
+                    container_id.clone(),
+                    container_name.clone(),
+                    status,
+                    is_running,
+                );
+                let result_arc = Arc::new(query_result);
+
+                // 同时用 container_id 和 container_name 作为缓存 key
+                // Arc::clone 只是增加引用计数，开销很小
+                self.api_cache.insert_status(container_id.clone(), Some(result_arc.clone())).await;
+                self.api_cache.insert_status(container_name.clone(), Some(result_arc.clone())).await;
+
                 info!(
                     "✅ [REALTIME] 容器状态查询成功: id={}, name={}, status={:?}, running={}",
-                    container_id, container_name, status, is_running
+                    container_id, container_name, result_arc.status, result_arc.is_running
                 );
 
-                Ok(Some((container_id, container_name, status, is_running)))
+                // 返回解引用后的值（因为返回类型不是 Arc）
+                Some((*result_arc).clone())
+            }
+            Err(DockerError::BollardError(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })) => {
+                // 🔧 修复：不再缓存 404 响应
+                // 原因：容器可能刚被创建，缓存 404 会导致 SSE 连接时序问题
+                // 容器状态变化快，404 缓存收益小但风险大
+                debug!("📭 [REALTIME] 容器不存在（不缓存 404）: identifier={}", identifier);
+                None
+            }
+            Err(DockerError::Timeout(_)) => {
+                warn!("⚠️ [REALTIME] 查询超时，尝试从缓存获取: identifier={}", identifier);
+                // 超时时，尝试返回缓存中的旧值（如果有的话）
+                if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
+                    return Ok(Some((*cached).clone()));
+                }
+                return Err(DockerError::Timeout(format!(
+                    "容器状态查询超时且无可用缓存: identifier={}",
+                    identifier
+                )));
+            }
+            Err(e) => {
+                error!(
+                    "❌ [REALTIME] 查询容器状态失败: identifier={}, error={}",
+                    identifier, e
+                );
+                return Err(e);
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// 通过容器名称获取容器创建时间
+    ///
+    /// 直接查询 Docker API 获取容器的创建时间，不使用缓存。
+    /// 主要用于容器保护期检查，确保刚创建的容器不会被误清理。
+    ///
+    /// # 参数
+    /// * `container_name` - 容器名称
+    ///
+    /// # 返回
+    /// * 如果找到容器，返回 `Some(created_time)`
+    /// * 如果容器不存在，返回 `None`
+    /// * 如果解析时间失败，返回错误
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let created = docker_manager
+    ///     .get_container_creation_time_by_name("rcoder-agent-123")
+    ///     .await?;
+    /// if let Some(time) = created {
+    ///     let age = Utc::now().signed_duration_since(time);
+    ///     if age.num_seconds() < protection_seconds {
+    ///         // 在保护期内，跳过清理
+    ///     }
+    /// }
+    /// ```
+    pub async fn get_container_creation_time_by_name(
+        &self,
+        container_name: &str,
+    ) -> DockerResult<Option<DateTime<Utc>>> {
+        debug!(
+            "🔍 [DOCKER_MGR] 查询容器创建时间: container_name={}",
+            container_name
+        );
+
+        match self
+            .docker
+            .inspect_container(container_name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(details) => {
+                if let Some(ref created_str) = details.created {
+                    match Self::parse_rfc3339_timestamp(created_str, &format!("container {}", container_name)) {
+                        Ok(created_time_utc) => {
+                            debug!(
+                                "✅ [DOCKER_MGR] 容器创建时间: container_name={}, created={}",
+                                container_name, created_time_utc
+                            );
+                            Ok(Some(created_time_utc))
+                        }
+                        Err(e) => {
+                            error!(
+                                "❌ [DOCKER_MGR] 解析容器创建时间失败: container_name={}, error={}",
+                                container_name, e
+                            );
+                            Err(DockerError::InvalidTimestamp(e))
+                        }
+                    }
+                } else {
+                    warn!(
+                        "⚠️ [DOCKER_MGR] 容器创建时间字段为空: container_name={}",
+                        container_name
+                    );
+                    Ok(None)
+                }
             }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => {
                 // 容器不存在
-                debug!("📭 [REALTIME] 容器不存在: identifier={}", identifier);
+                debug!(
+                    "📭 [DOCKER_MGR] 容器不存在: container_name={}",
+                    container_name
+                );
                 Ok(None)
             }
             Err(e) => {
-                // 其他类型的错误
                 error!(
-                    "❌ [REALTIME] 查询容器状态失败: identifier={}, error={}",
-                    identifier, e
+                    "❌ [DOCKER_MGR] 查询容器信息失败: container_name={}, error={}",
+                    container_name, e
+                );
+                Err(DockerError::BollardError(e))
+            }
+        }
+    }
+
+    /// 解析 RFC3339 时间戳字符串
+    ///
+    /// 内部辅助函数，统一处理 Docker API 返回的 RFC3339 时间戳解析
+    ///
+    /// # 参数
+    /// * `timestamp_str` - RFC3339 格式的时间戳字符串
+    /// * `context` - 上下文描述（用于日志）
+    ///
+    /// # 返回
+    /// * `Ok(DateTime<Utc>)` - 解析成功
+    /// * `Err(String)` - 解析失败，返回错误描述
+    fn parse_rfc3339_timestamp(timestamp_str: &str, context: &str) -> Result<DateTime<Utc>, String> {
+        DateTime::parse_from_rfc3339(timestamp_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| {
+                format!(
+                    "Failed to parse RFC3339 timestamp for {}: '{}', error: {}",
+                    context, timestamp_str, e
+                )
+            })
+    }
+
+    /// 解析 Unix 秒时间戳
+    ///
+    /// 内部辅助函数，统一处理 Docker API 返回的 Unix 秒时间戳解析
+    /// 用于 `list_containers` API 返回的 created 字段
+    ///
+    /// # 参数
+    /// * `timestamp_secs` - Unix 秒时间戳
+    /// * `context` - 上下文描述（用于日志）
+    ///
+    /// # 返回
+    /// * `Ok(DateTime<Utc>)` - 解析成功
+    /// * `Err(String)` - 解析失败，返回错误描述
+    ///
+    /// # 注意
+    /// Docker 的 list_containers API 返回的是 Unix **秒**时间戳，不是毫秒
+    fn parse_unix_timestamp(timestamp_secs: i64, context: &str) -> Result<DateTime<Utc>, String> {
+        DateTime::from_timestamp(timestamp_secs, 0)
+            .ok_or_else(|| {
+                format!(
+                    "Failed to parse Unix timestamp for {}: {} (out of range)",
+                    context, timestamp_secs
+                )
+            })
+    }
+
+    /// 通过容器名称从 Docker API 获取完整容器信息
+    ///
+    /// 直接查询 Docker API 获取最新的容器信息，不使用缓存。
+    /// 返回完整的 DockerContainerInfo 结构，包含所有容器元数据。
+    ///
+    /// # 参数
+    /// * `container_name` - 容器名称
+    ///
+    /// # 返回
+    /// * 如果找到容器，返回 `Some(DockerContainerInfo)`
+    /// * 如果容器不存在，返回 `None`
+    ///
+    /// # 示例
+    /// ```ignore
+    /// if let Some(info) = docker_manager
+    ///     .get_container_info_by_name("rcoder-agent-123")
+    ///     .await?
+    /// {
+    ///     println!("容器状态: {:?}, 创建时间: {}", info.status, info.created_at);
+    /// }
+    /// ```
+    ///
+    /// # 与其他方法的对比
+    /// - [`get_container_info`](Self::get_container_info): 通过 project_id 从缓存查询（快速但可能过期）
+    /// - [`find_container_realtime`](Self::find_container_realtime): 返回简化信息（只有 id/name/status）
+    /// - **此方法**: 通过 name 查询完整信息（最新数据）
+    pub async fn get_container_info_by_name(
+        &self,
+        container_name: &str,
+    ) -> DockerResult<Option<DockerContainerInfo>> {
+        debug!(
+            "🔍 [DOCKER_MGR] 通过容器名称查询完整信息: container_name={}",
+            container_name
+        );
+
+        match self
+            .docker
+            .inspect_container(container_name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(details) => {
+                // 解析容器 ID
+                let container_id = details.id.ok_or_else(|| {
+                    DockerError::ConfigurationError("容器 ID 为空".to_string())
+                })?;
+
+                // 解析容器名称（去除前导斜杠）
+                let name = details
+                    .name
+                    .map(|n| n.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| container_name.to_string());
+
+                // 解析状态和启动时间
+                let (status, started_at) = if let Some(state) = details.state {
+                    let status_str = state
+                        .status
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    // 使用统一的时间解析函数
+                    let started = state.started_at.and_then(|s| {
+                        Self::parse_rfc3339_timestamp(&s, "started_at").ok()
+                    });
+
+                    (ContainerStatus::from(status_str), started)
+                } else {
+                    (ContainerStatus::Unknown("no state".to_string()), None)
+                };
+
+                // 解析创建时间 - 使用统一的时间解析函数
+                let created_at = details
+                    .created
+                    .ok_or_else(|| {
+                        DockerError::InvalidTimestamp("容器缺少 created 字段".to_string())
+                    })
+                    .and_then(|s| {
+                        Self::parse_rfc3339_timestamp(&s, "created")
+                            .map_err(|e| DockerError::InvalidTimestamp(e))
+                    })?;
+
+                // 解析镜像
+                let image = details.config.as_ref()
+                    .and_then(|c| c.image.clone())
+                    .unwrap_or_default();
+
+                // 解析挂载信息（查找工作目录绑定）
+                let (host_path, container_path) = details
+                    .mounts
+                    .as_ref()
+                    .and_then(|mounts| {
+                        mounts.iter().find(|m: &&bollard::secret::MountPoint| {
+                            matches!(m.typ, Some(bollard::secret::MountPointTypeEnum::BIND))
+                        })
+                    })
+                    .and_then(|mount| {
+                        let source = mount.source.clone()?;
+                        let destination = mount.destination.clone()?;
+                        Some((source, destination))
+                    })
+                    .unwrap_or_else(|| (String::new(), String::new()));
+
+                // 解析网络和端口信息
+                let (network_name, port_bindings, assigned_port) = if let Some(ref network_settings) = details.network_settings {
+                    // 解析网络名称
+                    let net_name = network_settings
+                        .networks
+                        .as_ref()
+                        .and_then(|networks| networks.keys().next().cloned())
+                        .unwrap_or_default();
+
+                    // 解析端口映射
+                    let mut ports = HashMap::new();
+                    let mut assigned = 0u16;
+
+                    if let Some(ref port_map) = network_settings.ports {
+                        for (container_port, host_bindings) in port_map {
+                            if let Some(bindings) = host_bindings {
+                                for binding in bindings {
+                                    if let Some(ref host_port) = binding.host_port {
+                                        ports.insert(
+                                            container_port.clone(),
+                                            host_port.clone(),
+                                        );
+                                        // 尝试解析为数字端口
+                                        if assigned == 0 {
+                                            if let Ok(port) = host_port.parse::<u16>() {
+                                                assigned = port;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    (net_name, ports, assigned)
+                } else {
+                    (String::new(), HashMap::new(), 0u16)
+                };
+
+                // 从 Labels 中提取 project_id, user_id, service_type
+                let labels = details.config.as_ref().and_then(|c| c.labels.as_ref());
+                let project_id = labels
+                    .and_then(|l| l.get("project_id"))
+                    .cloned()
+                    .unwrap_or_default();
+                let user_id = labels.and_then(|l| l.get("user_id")).cloned();
+                let service_type = labels
+                    .and_then(|l| l.get("service_type"))
+                    .and_then(|s| s.parse().ok()); // 使用 FromStr trait
+
+                // 内部端口（默认）
+                let internal_port = match service_type {
+                    Some(shared_types::ServiceType::RCoder) => shared_types::GRPC_DEFAULT_PORT,
+                    Some(shared_types::ServiceType::ComputerAgentRunner) => shared_types::HTTP_DEFAULT_PORT,
+                    None => shared_types::GRPC_DEFAULT_PORT,
+                };
+
+                let info = DockerContainerInfo {
+                    container_id,
+                    container_name: name,
+                    project_id,
+                    user_id,
+                    service_type,
+                    image,
+                    status,
+                    created_at,
+                    started_at,
+                    host_path,
+                    container_path,
+                    port_bindings,
+                    assigned_port,
+                    health_status: None,
+                    service_health: None,
+                    internal_port,
+                    network_name,
+                };
+
+                debug!(
+                    "✅ [DOCKER_MGR] 容器信息查询成功: name={}, id={}, status={:?}",
+                    info.container_name, info.container_id, info.status
+                );
+
+                Ok(Some(info))
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // 容器不存在
+                debug!(
+                    "📭 [DOCKER_MGR] 容器不存在: container_name={}",
+                    container_name
+                );
+                Ok(None)
+            }
+            Err(e) => {
+                error!(
+                    "❌ [DOCKER_MGR] 查询容器信息失败: container_name={}, error={}",
+                    container_name, e
                 );
                 Err(DockerError::BollardError(e))
             }
@@ -699,12 +1199,11 @@ impl DockerManager {
         // 所以这里不需要额外创建目录
 
         // 2. 清理旧容器（如果提供了 project_id）
-        if let Some(id) = project_id {
-            if let Some(existing) = self.get_container_info(id).await {
+        if let Some(id) = project_id
+            && let Some(existing) = self.get_container_info(id).await {
                 warn!("发现旧容器 {}，正在停止...", existing.container_name);
                 self.stop_container(id).await?;
             }
-        }
 
         // 2. 获取配置和镜像
         let service_config = self.get_service_config(&service_type).await?;
@@ -781,9 +1280,9 @@ impl DockerManager {
         };
 
         builder = builder.resource_limits(crate::types::ResourceLimits {
-            memory_limit: final_resource_limits.memory_limit.map(|v| v as i64),
+            memory_limit: final_resource_limits.memory_limit,
             cpu_limit: final_resource_limits.cpu_limit,
-            swap_limit: final_resource_limits.swap_limit.map(|v| v as i64),
+            swap_limit: final_resource_limits.swap_limit,
         });
 
         // 添加环境变量
@@ -805,15 +1304,6 @@ impl DockerManager {
             }
             builder = builder.env(key, &processed_value);
         }
-
-        // 🔒 安全配置：将 API 地址指向本地 Pingora 代理
-        // 使用 {SERVICE_UUID} 占位符，UUID 将由 agent_runner 动态注入
-        // 这样 Agent 看到的是本地地址，真实密钥由 Pingora 注入
-        builder = builder.env(
-            "MODEL_PROVIDER_BASE_URL",
-            "http://localhost:8088/api/{SERVICE_UUID}",
-        );
-        builder = builder.env("MODEL_PROVIDER_API_KEY", "sk-placeholder");
 
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
 
@@ -1025,26 +1515,41 @@ impl DockerManager {
         Ok(info)
     }
 
-    /// 智能查找 Agent 容器
+    /// 查找项目容器（RCoder 模式专用）
     ///
-    /// 策略：
+    /// 根据 project_id 和 service_type 查找容器：
+    /// - 容器命名规则：`{prefix}-{project_id}`
+    /// - RCoder 模式前缀：`rcoder-agent`
+    ///
+    /// # 策略
     /// 1. 查找内部 Map (project_id)
-    /// 2. 构造默认名称查找 ({prefix}-{project_id})
-    pub async fn find_agent_container(
+    /// 2. 实时查询 Docker API (构造容器名称)
+    ///
+    /// # 返回
+    /// * `Ok(Some(ContainerQueryResult))` - 容器存在
+    /// * `Ok(None)` - 容器不存在
+    /// * `Err(...)` - 查询出错
+    pub async fn find_project_container(
         &self,
         project_id: &str,
         service_type: &shared_types::ServiceType,
-    ) -> Option<DockerContainerInfo> {
-        // 1. 查 Map
+    ) -> DockerResult<Option<ContainerQueryResult>> {
+        // 1. 查 Map (如果存在且运行中，直接返回)
         if let Some(info) = self.containers.get(project_id).await {
-            return Some(info);
+            return Ok(Some(ContainerQueryResult::new(
+                info.container_id.clone(),
+                info.container_name.clone(),
+                info.status.clone(),
+                matches!(info.status, ContainerStatus::Running),
+            )));
         }
 
-        // 2. 查 Docker API (构造名称)
+        // 2. 实时查询 Docker API (构造名称)
         let prefix = service_type.container_prefix();
         let expected_container_name = format!("{}-{}", prefix, project_id);
-        self.find_container_by_identifier(&expected_container_name)
-            .await
+
+        // 直接返回 find_container_realtime 的结果
+        self.find_container_realtime(&expected_container_name).await
     }
 
     /// 获取 Agent 容器的高级信息
@@ -1169,19 +1674,39 @@ impl DockerManager {
 
     /// 查找用户容器（ComputerAgentRunner 模式专用）
     ///
+    /// 根据 user_id 和 service_type 查找容器：
+    /// - 容器命名规则：`{prefix}-{user_id}`
+    /// - ComputerAgentRunner 模式前缀：`computer-agent-runner`
+    ///
     /// # Arguments
     /// * `user_id` - 用户 ID
     /// * `service_type` - 服务类型（应该是 ComputerAgentRunner）
     ///
     /// # 返回
-    /// 容器信息（如果存在），否则返回 None
+    /// * `Ok(Some(ContainerQueryResult))` - 容器存在
+    /// * `Ok(None)` - 容器不存在
+    /// * `Err(...)` - 查询出错
     pub async fn find_user_container(
         &self,
         user_id: &str,
         service_type: &shared_types::ServiceType,
-    ) -> Option<DockerContainerInfo> {
-        // 内部调用 find_agent_container，但参数名更准确
-        self.find_agent_container(user_id, service_type).await
+    ) -> DockerResult<Option<ContainerQueryResult>> {
+        // 1. 查 Map (如果存在且运行中，直接返回)
+        if let Some(info) = self.containers.get(user_id).await {
+            return Ok(Some(ContainerQueryResult::new(
+                info.container_id.clone(),
+                info.container_name.clone(),
+                info.status.clone(),
+                matches!(info.status, ContainerStatus::Running),
+            )));
+        }
+
+        // 2. 实时查询 Docker API (构造名称)
+        let prefix = service_type.container_prefix();
+        let expected_container_name = format!("{}-{}", prefix, user_id);
+
+        // 直接返回 find_container_realtime 的结果
+        self.find_container_realtime(&expected_container_name).await
     }
 
     /// 通过用户 ID 获取容器 ID（ComputerAgentRunner 模式专用）
@@ -1207,13 +1732,12 @@ impl DockerManager {
     /// # 返回
     /// true 如果容器存在且运行中，否则返回 false
     pub async fn is_user_container_running(&self, user_id: &str) -> bool {
-        if let Some(container) = self
+        match self
             .find_user_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
             .await
         {
-            matches!(container.status, ContainerStatus::Running)
-        } else {
-            false
+            Ok(Some(result)) => result.is_running,
+            _ => false,
         }
     }
 
@@ -1496,6 +2020,10 @@ impl DockerManager {
             .await
             .map_err(|e| DockerError::ContainerStartError(format!("重启容器失败: {}", e)))?;
 
+        // 🔧 使缓存失效（容器状态已变更）
+        self.api_cache.invalidate(container_info.container_id.as_str()).await;
+        self.api_cache.invalidate(container_info.container_name.as_str()).await;
+
         info!("容器重启成功: {}", container_info.container_name);
         Ok(())
     }
@@ -1578,23 +2106,59 @@ impl DockerManager {
         selector.get_service_config(service_type).await
     }
 
-    /// 获取容器网络信息
+    /// 获取容器网络信息（使用缓存 + 超时保护）
+    ///
+    /// 🔧 优化：使用 Moka 缓存减少 Docker API 调用，使用超时保护防止阻塞
+    /// 📝 缓存策略：支持 None 值缓存（容器不存在或网络信息为空时）
     ///
     /// # 返回
-    /// - `Ok(HashMap)`: 网络名称到 IP 地址的映射
+    /// - `Ok(HashMap)`: 网络名称到 IP 地址的映射（可能为空）
     /// - `Err(ConnectionError)`: 容器不存在或无法获取网络信息
     pub async fn get_container_network_info(
         &self,
         container_id: &str,
     ) -> DockerResult<HashMap<String, String>> {
-        use bollard::query_parameters::InspectContainerOptions;
+        // 1. 尝试从缓存获取
+        if let Some(Some(cached)) = self.api_cache.get_network(container_id).await {
+            debug!("✅ [NETWORK] 缓存命中: container_id={}", container_id);
+            // Arc::clone 只是增加引用计数，解引用后 clone HashMap
+            return Ok((*cached).clone());
+        }
 
-        let inspect = self
-            .docker
-            .inspect_container(container_id, None::<InspectContainerOptions>)
-            .await
-            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))?;
+        // 1.5 检查是否缓存了 None（空网络信息）
+        if let Some(None) = self.api_cache.get_network(container_id).await {
+            debug!("📭 [NETWORK] 缓存命中（空网络）: container_id={}", container_id);
+            return Ok(HashMap::new());
+        }
 
+        // 2. 缓存未命中，调用 Docker API（带超时）
+        let timeout = Duration::from_secs(self.config.api_timeout_quick_seconds);
+        let inspect = match self.inspect_with_timeout(container_id, timeout).await {
+            Ok(i) => i,
+            Err(DockerError::BollardError(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })) => {
+                // 容器不存在 - 缓存空 HashMap
+                debug!("📭 [NETWORK] 容器不存在，缓存空网络: container_id={}", container_id);
+                self.api_cache.insert_network(container_id.to_string(), None).await;
+                return Ok(HashMap::new());
+            }
+            Err(DockerError::Timeout(_)) => {
+                warn!("⚠️ [NETWORK] 查询超时，尝试从缓存获取: container_id={}", container_id);
+                // 超时时，尝试返回缓存中的旧值（如果有的话）
+                if let Some(Some(cached)) = self.api_cache.get_network(container_id).await {
+                    return Ok((*cached).clone());
+                }
+                return Err(DockerError::Timeout(format!(
+                    "容器网络信息查询超时且无可用缓存: container_id={}",
+                    container_id
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+
+        // 3. 解析网络信息
         let mut network_ips = HashMap::new();
 
         if let Some(network_settings) = inspect.network_settings
@@ -1608,6 +2172,15 @@ impl DockerManager {
                 }
             }
         }
+
+        // 4. 写入缓存（如果为空也缓存，避免重复查询）
+        let result_to_cache = if network_ips.is_empty() {
+            None
+        } else {
+            // 🔧 使用 Arc 包装，减少 clone 开销
+            Some(Arc::new(network_ips.clone()))
+        };
+        self.api_cache.insert_network(container_id.to_string(), result_to_cache).await;
 
         Ok(network_ips)
     }
@@ -2000,10 +2573,10 @@ impl DockerManager {
             })?;
 
         // 获取网络配置
-        if let Some(network_settings) = inspect.network_settings {
-            if let Some(networks) = network_settings.networks {
+        if let Some(network_settings) = inspect.network_settings
+            && let Some(networks) = network_settings.networks {
                 // 查找包含指定网络基础名称的网络
-                for (network_name, _) in &networks {
+                for network_name in networks.keys() {
                     if network_name.contains(network_base_name) {
                         info!("✅ 动态检测到主网络: {}", network_name);
                         return Ok(network_name.clone());
@@ -2019,7 +2592,6 @@ impl DockerManager {
                     network_base_name, available_networks
                 )));
             }
-        }
 
         Err(DockerError::ConnectionError(format!(
             "当前容器 (hostname: {}) 没有网络配置信息",
@@ -2047,3 +2619,316 @@ impl std::fmt::Debug for DockerManager {
 
 /// 为了支持 futures Stream，需要导入 StreamExt trait
 use futures_util::stream::StreamExt;
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bollard::Docker;
+
+    /// 测试通过容器名称获取创建时间
+    ///
+    /// 使用真实容器 `rcoder-rcoder-1` 验证时间戳解析
+    #[tokio::test]
+    #[ignore] // 需要本地环境有 Docker 和容器，默认忽略
+    #[allow(deprecated)] // 测试代码使用 deprecated API 是可接受的
+    async fn test_get_container_creation_time_by_name_real() {
+        // 直接使用 Bollard 创建 Docker 客户端
+        let docker = Docker::connect_with_local_defaults()
+            .expect("Failed to connect to Docker");
+
+        // 测试容器名称
+        let container_name = "rcoder-rcoder-1";
+
+        println!("\n🔍 测试容器: {}", container_name);
+        println!("─────────────────────────────────────────");
+
+        // 直接调用 Docker API 获取容器信息
+        match docker
+            .inspect_container(container_name, None::<bollard::query_parameters::InspectContainerOptions>)
+            .await
+        {
+            Ok(details) => {
+                println!("✅ 成功获取容器信息");
+
+                // 获取创建时间字符串
+                if let Some(ref created_str) = details.created {
+                    println!("   Docker API 返回: {}", created_str);
+
+                    // 解析时间戳
+                    match DateTime::parse_from_rfc3339(&created_str) {
+                        Ok(created_time) => {
+                            let created_time_utc = created_time.with_timezone(&Utc);
+                            println!("   解析后的 UTC:  {}", created_time_utc);
+
+                            // 计算容器年龄
+                            let age = Utc::now().signed_duration_since(created_time_utc);
+                            println!("   容器年龄: {} 秒", age.num_seconds());
+                            println!("   容器年龄: {} 分钟", age.num_minutes());
+                            println!("   容器年龄: {} 小时", age.num_hours());
+                            println!("   容器年龄: {} 天", age.num_days());
+
+                            // 验证时间是否合理
+                            assert!(created_time_utc < Utc::now(), "创建时间应该在过去");
+                            assert!(age.num_days() < 365, "创建时间不应该超过 1 年");
+
+                            println!("\n✅ 时间戳解析验证通过！");
+                        }
+                        Err(e) => {
+                            panic!("❌ RFC3339 时间戳解析失败: {}", e);
+                        }
+                    }
+                } else {
+                    panic!("❌ 容器没有 created 字段");
+                }
+
+                // 使用 Docker CLI 对比验证
+                println!("\n🔍 使用 Docker CLI 对比验证:");
+                println!("─────────────────────────────────────────");
+
+                use std::process::Command;
+                let output = Command::new("docker")
+                    .args(&["inspect", container_name, "--format", "{{.Created}}"])
+                    .output()
+                    .expect("Failed to run docker inspect");
+
+                let docker_cli_time = String::from_utf8_lossy(&output.stdout);
+                println!("   Docker CLI 时间: {}", docker_cli_time.trim());
+
+                // 解析 Docker CLI 返回的时间
+                if let Ok(docker_time) = DateTime::parse_from_rfc3339(docker_cli_time.trim()) {
+                    let docker_time_utc = docker_time.with_timezone(&Utc);
+                    println!("   Docker CLI UTC:  {}", docker_time_utc);
+
+                    // 从 Docker API 获取的时间
+                    if let Some(ref created_str) = details.created {
+                        if let Ok(api_time) = DateTime::parse_from_rfc3339(&created_str) {
+                            let api_time_utc = api_time.with_timezone(&Utc);
+                            println!("   API 返回 UTC:    {}", api_time_utc);
+
+                            // 时间差应该为 0（应该完全一致）
+                            let diff = (docker_time_utc.timestamp() - api_time_utc.timestamp()).abs();
+                            println!("   时间差: {} 秒", diff);
+
+                            assert_eq!(diff, 0, "API 和 CLI 返回的时间应该完全一致");
+                            println!("\n✅ 与 Docker CLI 对比验证通过！");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                panic!("❌ 获取容器信息失败: {}", e);
+            }
+        }
+    }
+
+    /// 测试 Unix 时间戳解析（验证 bug 修复）
+    #[tokio::test]
+    #[ignore]
+    #[allow(deprecated)] // 测试代码使用 deprecated API 是可接受的
+    async fn test_unix_timestamp_parsing() {
+        use chrono::TimeZone;
+
+        println!("\n🔍 测试 Unix 秒时间戳解析（验证 bug 修复）");
+        println!("─────────────────────────────────────────");
+
+        // 容器实际创建时间: 2026-01-19T07:35:53Z
+        let expected_time = Utc.with_ymd_and_hms(2026, 1, 19, 7, 35, 53).unwrap();
+        let unix_timestamp = expected_time.timestamp(); // 1768808153 秒
+
+        println!("   预期时间: {}", expected_time);
+        println!("   Unix 秒时间戳: {}", unix_timestamp);
+
+        // 使用我们的解析函数
+        match DockerManager::parse_unix_timestamp(unix_timestamp, "test") {
+            Ok(parsed_time) => {
+                println!("   解析结果: {}", parsed_time);
+
+                let diff = (parsed_time.timestamp() - expected_time.timestamp()).abs();
+                println!("   时间差: {} 秒", diff);
+
+                assert_eq!(diff, 0, "时间戳解析应该完全准确");
+                println!("\n✅ Unix 时间戳解析正确！");
+            }
+            Err(e) => {
+                panic!("❌ 解析失败: {}", e);
+            }
+        }
+
+        // 验证旧代码的错误
+        println!("\n🔍 验证旧代码的 bug:");
+        let wrong_seconds = unix_timestamp / 1000; // 旧代码的错误处理
+        let wrong_time = Utc.timestamp_opt(wrong_seconds, 0).single().unwrap();
+        println!("   旧代码处理: {} (错误！)", wrong_time);
+        println!("   与正确时间相差: {} 天",
+                 (expected_time.timestamp() - wrong_time.timestamp()) / 86400);
+    }
+
+    /// 测试时间戳解析的完整流程
+    ///
+    /// 主动创建一个测试容器，同时使用 list_containers 和 inspect_container API
+    /// 验证 parse_unix_timestamp 和 parse_rfc3339_timestamp 的正确性
+    #[tokio::test]
+    #[ignore] // 需要本地 Docker 环境
+    async fn test_timestamp_parsing_with_real_container() {
+        use bollard::models::ContainerCreateBody;
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
+            ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
+        };
+        use futures_util::TryStreamExt;
+
+        // 连接 Docker
+        let docker = Docker::connect_with_local_defaults()
+            .expect("Failed to connect to Docker");
+
+        // 测试容器名称（使用时间戳避免冲突）
+        let container_name = format!("test-timestamp-{}", chrono::Utc::now().timestamp());
+
+        println!("\n🔍 测试时间戳解析");
+        println!("─────────────────────────────────────────");
+        println!("   容器名称: {}", container_name);
+
+        // 拉取 alpine 镜像（如果不存在）
+        println!("\n📥 拉取镜像: alpine:latest");
+        let create_image_options = CreateImageOptionsBuilder::default()
+            .from_image("alpine:latest")
+            .build();
+
+        let _ = docker
+            .create_image(Some(create_image_options), None, None)
+            .try_collect::<Vec<_>>()
+            .await;
+
+        // 1. 创建测试容器（使用 alpine 镜像）
+        let config = ContainerCreateBody {
+            image: Some("alpine:latest".to_string()),
+            cmd: Some(vec!["sleep".to_string(), "3600".to_string()]),
+            host_config: Some(bollard::models::HostConfig {
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let create_options = CreateContainerOptionsBuilder::default()
+            .name(&container_name)
+            .build();
+
+        let create_result = docker
+            .create_container(Some(create_options), config)
+            .await
+            .expect("Failed to create test container");
+
+        println!("✅ 容器已创建: {}", create_result.id);
+
+        // 2. 启动容器
+        docker
+            .start_container(&container_name, None::<bollard::query_parameters::StartContainerOptions>)
+            .await
+            .expect("Failed to start test container");
+
+        println!("✅ 容器已启动");
+
+        // 等待容器完全启动
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // 3. 使用 list_containers API 获取 Unix 时间戳
+        println!("\n📋 测试 list_containers API (Unix 时间戳):");
+        println!("─────────────────────────────────────────");
+
+        let mut filters = std::collections::HashMap::new();
+        filters.insert("name".to_string(), vec![container_name.clone()]);
+
+        let list_options = ListContainersOptionsBuilder::default()
+            .all(true)
+            .filters(&filters)
+            .build();
+
+        let containers = docker
+            .list_containers(Some(list_options))
+            .await
+            .expect("Failed to list containers");
+
+        assert_eq!(containers.len(), 1, "应该只找到一个测试容器");
+        let container = &containers[0];
+
+        let unix_timestamp = container.created.expect("容器应该有 created 字段");
+        println!("   原始 Unix 时间戳: {} 秒", unix_timestamp);
+
+        // 使用 parse_unix_timestamp 解析
+        let parsed_unix_time = DockerManager::parse_unix_timestamp(
+            unix_timestamp,
+            &format!("container {}", container_name),
+        )
+        .expect("parse_unix_timestamp 应该成功");
+
+        println!("   解析后时间 (UTC): {}", parsed_unix_time);
+
+        // 4. 使用 inspect_container API 获取 RFC3339 时间戳
+        println!("\n📋 测试 inspect_container API (RFC3339 时间戳):");
+        println!("─────────────────────────────────────────");
+
+        let details = docker
+            .inspect_container(&container_name, None::<InspectContainerOptions>)
+            .await
+            .expect("Failed to inspect container");
+
+        let rfc3339_str = details.created.expect("容器应该有 created 字段");
+        println!("   原始 RFC3339 字符串: {}", rfc3339_str);
+
+        // 使用 parse_rfc3339_timestamp 解析
+        let parsed_rfc3339_time = DockerManager::parse_rfc3339_timestamp(
+            &rfc3339_str,
+            &format!("container {}", container_name),
+        )
+        .expect("parse_rfc3339_timestamp 应该成功");
+
+        println!("   解析后时间 (UTC): {}", parsed_rfc3339_time);
+
+        // 5. 验证两个解析结果的一致性
+        println!("\n🔍 验证两个 API 的时间一致性:");
+        println!("─────────────────────────────────────────");
+
+        let time_diff = (parsed_unix_time.timestamp() - parsed_rfc3339_time.timestamp()).abs();
+        println!("   list_containers 时间: {}", parsed_unix_time);
+        println!("   inspect_container 时间: {}", parsed_rfc3339_time);
+        println!("   时间差: {} 秒", time_diff);
+
+        // 两个 API 应该返回相同的时间（允许 1 秒误差，因为精度不同）
+        assert!(
+            time_diff <= 1,
+            "两个 API 的时间差应该在 1 秒以内，实际差异: {} 秒",
+            time_diff
+        );
+
+        // 6. 验证时间合理性
+        println!("\n🔍 验证时间合理性:");
+        println!("─────────────────────────────────────────");
+
+        let now = Utc::now();
+        let age = now.signed_duration_since(parsed_unix_time);
+
+        println!("   当前时间: {}", now);
+        println!("   容器年龄: {} 秒", age.num_seconds());
+
+        assert!(age.num_seconds() >= 0, "容器创建时间应该在过去");
+        assert!(age.num_seconds() < 60, "容器应该是刚创建的（< 60 秒）");
+
+        println!("\n✅ 所有时间戳解析测试通过！");
+
+        // 7. 清理测试容器
+        println!("\n🧹 清理测试容器...");
+
+        let remove_options = RemoveContainerOptionsBuilder::default()
+            .force(true)
+            .build();
+
+        docker
+            .remove_container(&container_name, Some(remove_options))
+            .await
+            .expect("Failed to cleanup test container");
+
+        println!("✅ 测试容器已清理: {}", container_name);
+    }
+}

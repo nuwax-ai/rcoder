@@ -11,9 +11,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
+use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -52,6 +54,12 @@ const ENV_RUST_LOG: &str = "RUST_LOG";
 const ENV_AGENT_WORKING_DIR: &str = "AGENT_WORKING_DIR";
 const ENV_AGENT_PROJECT_ID: &str = "AGENT_PROJECT_ID";
 
+/// OpenAI 环境变量常量
+const ENV_OPENAI_API_KEY: &str = "OPENAI_API_KEY";
+const ENV_OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
+/// nuwaxcode 使用 OPENCODE_MODEL 而不是 OPENAI_MODEL
+const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
+
 /// 默认代理 Base URL（包含 UUID 占位符）
 const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
 
@@ -72,10 +80,10 @@ pub struct SacpAgentLaunchConfig {
 pub struct SacpLauncherConnectionInfo {
     /// 会话 ID
     pub session_id: SessionId,
-    /// 发送 Prompt 消息的通道
-    pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    /// 发送取消请求的通道
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
+    /// 发送 Prompt 消息的通道（有界通道，提供背压保护）
+    pub prompt_tx: mpsc::Sender<PromptRequest>,
+    /// 发送取消请求的通道（有界通道，提供背压保护）
+    pub cancel_tx: mpsc::Sender<CancelNotificationRequestWrapper>,
     /// 生命周期守卫（自动清理资源）
     pub lifecycle_guard: Arc<AgentLifecycleGuard>,
 }
@@ -152,6 +160,7 @@ pub fn get_default_sacp_agent_config(
     let mut env = HashMap::new();
 
     if let Some(provider) = model_provider {
+        // Anthropic 环境变量
         if !provider.api_key.is_empty() {
             env.insert(
                 ENV_ANTHROPIC_API_KEY.to_string(),
@@ -167,6 +176,27 @@ pub fn get_default_sacp_agent_config(
         if !provider.default_model.is_empty() {
             env.insert(
                 ENV_ANTHROPIC_MODEL.to_string(),
+                provider.default_model.clone(),
+            );
+        }
+
+        // OpenAI 环境变量 (支持 OpenAI 兼容的 Agent)
+        if !provider.api_key.is_empty() {
+            env.insert(
+                ENV_OPENAI_API_KEY.to_string(),
+                API_KEY_PLACEHOLDER.to_string(),
+            );
+        }
+        if !provider.base_url.is_empty() {
+            env.insert(
+                ENV_OPENAI_BASE_URL.to_string(),
+                DEFAULT_PROXY_BASE_URL.to_string(),
+            );
+        }
+        if !provider.default_model.is_empty() {
+            // nuwaxcode 使用 OPENCODE_MODEL，model_name 中已包含 openai-compatible/ 前缀
+            env.insert(
+                ENV_OPENCODE_MODEL.to_string(),
                 provider.default_model.clone(),
             );
         }
@@ -305,10 +335,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
                 // 合并环境变量：默认配置 + 自定义配置（自定义覆盖默认）
                 let mut env = default_agent_config.env.clone();
-                if let Some(ref custom_env) = agent_server_override.env {
-                    for (k, v) in custom_env {
-                        env.insert(k.clone(), v.clone());
-                    }
+                if let Some(custom_env) = &agent_server_override.env {
+                    // 使用 extend 替代循环，更高效
+                    env.extend(custom_env.iter().map(|(k, v)| (k.clone(), v.clone())));
                 }
 
                 // 🔧 关键修复：替换自定义环境变量中的模板变量
@@ -352,9 +381,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 )
             };
 
-        // 创建通道
-        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<CancelNotificationRequestWrapper>();
-        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptRequest>();
+        // 创建通道（使用有界通道防止 OOM）
+        // 容量由常量定义，足够处理突发请求，同时提供背压保护
+        let (cancel_tx, cancel_rx) = mpsc::channel::<CancelNotificationRequestWrapper>(
+            shared_types::AGENT_CANCEL_CHANNEL_CAPACITY,
+        );
+        let (prompt_tx, prompt_rx) =
+            mpsc::channel::<PromptRequest>(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY);
         let (session_id_tx, session_id_rx) = tokio::sync::oneshot::channel::<SessionId>();
 
         // 创建 CancellationToken
@@ -389,34 +422,103 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         }
 
-        // 启动子进程
-        let mut child = tokio::process::Command::new(&command_path)
-            .args(&command_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .current_dir(&project_path)
-            .envs(merged_envs)
-            .spawn()
-            .context("[SACP] 无法启动 claude-code-acp 子进程")?;
+        // 🔒 安全防护：强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
+        // 即使用户在配置中直接写了真实的 API_KEY 或 BASE_URL，也会被替换
+        if model_provider.is_some() {
+            // 强制替换 Anthropic 敏感变量
+            if merged_envs.contains_key(ENV_ANTHROPIC_API_KEY) {
+                merged_envs.insert(
+                    ENV_ANTHROPIC_API_KEY.to_string(),
+                    API_KEY_PLACEHOLDER.to_string(),
+                );
+            }
+            if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
+                merged_envs.insert(
+                    ENV_ANTHROPIC_BASE_URL.to_string(),
+                    service_uuid
+                        .as_ref()
+                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
+                );
+            }
+
+            // 强制替换 OpenAI 敏感变量
+            if merged_envs.contains_key(ENV_OPENAI_API_KEY) {
+                merged_envs.insert(
+                    ENV_OPENAI_API_KEY.to_string(),
+                    API_KEY_PLACEHOLDER.to_string(),
+                );
+            }
+            if merged_envs.contains_key(ENV_OPENAI_BASE_URL) {
+                merged_envs.insert(
+                    ENV_OPENAI_BASE_URL.to_string(),
+                    service_uuid
+                        .as_ref()
+                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
+                );
+            }
+
+            debug!("[SACP] 🔒 已强制替换敏感环境变量为占位符/代理 URL");
+        }
+
+        // 🔍 打印传递给 Agent 的完整环境变量（用于调试）
+        // 注意：此时敏感字段已被安全替换，可以放心打印
+        debug!(
+            "[SACP] 📋 启动 Agent 命令: {} {:?}",
+            command_path, command_args
+        );
+        debug!("[SACP] 📋 工作目录: {:?}", project_path);
+        info!(
+            "[SACP] 📋 传递给 Agent 的环境变量 ({} 个):",
+            merged_envs.len()
+        );
+
+        // 按字母顺序排序并打印所有环境变量
+        let mut env_keys: Vec<_> = merged_envs.keys().collect();
+        env_keys.sort();
+
+        for key in env_keys.iter() {
+            let value = merged_envs.get(*key).unwrap();
+            info!("[SACP] 📋   {} = {}", key, value);
+        }
+
+        // 启动子进程（使用 process group 来管理整个进程树）
+        // 使用 ProcessGroup::leader() 创建真正的进程组，确保能够清理所有孙进程
+        let mut child = CommandWrap::with_new(&command_path, |cmd| {
+            cmd.args(&command_args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .current_dir(&project_path);
+            cmd.envs(&merged_envs);
+        })
+        .wrap(ProcessGroup::leader())
+        .spawn()
+        .context("[SACP] 无法启动 claude-code-acp 子进程")?;
 
         let child_pid = child.id().unwrap_or(0);
         info!("[SACP] Claude Code ACP 子进程已启动，PID: {}", child_pid);
 
-        // 获取 stdio 句柄
-        let stdin = take_stdio(&mut child.stdin, "stdin")?;
-        let stdout = take_stdio(&mut child.stdout, "stdout")?;
-        let stderr = take_stdio(&mut child.stderr, "stderr")?;
+        // 获取 stdio 句柄（process_wrap 使用方法访问 stdio）
+        let stdin = take_stdio(&mut child.stdin(), "stdin")?;
+        let stdout = take_stdio(&mut child.stdout(), "stdout")?;
+        let stderr = take_stdio(&mut child.stderr(), "stderr")?;
 
         // 创建 SACP transport
         let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());
+
+        // 🔥 新增：创建共享的异常退出标志
+        // 此标志在 reaper_task 检测到子进程异常退出时设置为 true
+        // SACP 连接层可以检测此标志并发送相应的错误通知
+        let abnormal_exit_flag = Arc::new(AtomicBool::new(false));
 
         // 克隆用于闭包
         let project_path_clone = project_path.clone();
         let project_id_clone = project_id.clone();
         let cancel_token_clone = cancel_token.clone();
         let notifier_clone = self.notifier.clone();
+        let abnormal_exit_flag_clone = abnormal_exit_flag.clone();
 
         // 🔥 使用标准 tokio::spawn（无需 LocalSet！）
         tokio::spawn(async move {
@@ -430,6 +532,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 cancel_rx,
                 cancel_token: cancel_token_clone,
                 notifier: notifier_clone,
+                abnormal_exit_flag: abnormal_exit_flag_clone,
             };
             let result = run_sacp_connection(transport, params).await;
 
@@ -441,7 +544,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 等待会话 ID
         let session_id = session_id_rx.await.map_err(|e| {
             error!("[SACP] 智能体初始化超时: {}", e);
-            anyhow::anyhow!("智能体初始化超时，请重试（过多的MCP可能导致超时）。如果持续失败请重启智能体电脑（点击PC端右上图标展开后，在"..."里点击重启智能体电脑）")
+            anyhow::anyhow!("智能体初始化超时，请重试（过多的MCP可能导致超时）。如果持续失败请重启智能体电脑（点击PC端右上图标展开后，在[...]里点击重启智能体电脑）")
         })?;
 
         info!(
@@ -480,13 +583,14 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         });
 
-        // 创建生命周期守卫
-        let lifecycle_guard = AgentLifecycleGuard::new_claude(
+        // 创建生命周期守卫（带异常退出标志）
+        let lifecycle_guard = AgentLifecycleGuard::new_claude_with_abnormal_flag(
             project_id.clone(),
             session_id.clone(),
             child,
             stderr_task,
             cancel_token.clone(),
+            abnormal_exit_flag,
         );
 
         Ok(SacpLauncherConnectionInfo {
@@ -511,10 +615,12 @@ struct SacpConnectionParams<N: SessionNotifier> {
     mcp_servers: Vec<McpServer>,
     start_config: AgentStartConfig,
     session_id_tx: tokio::sync::oneshot::Sender<SessionId>,
-    prompt_rx: mpsc::UnboundedReceiver<PromptRequest>,
-    cancel_rx: mpsc::UnboundedReceiver<CancelNotificationRequestWrapper>,
+    prompt_rx: mpsc::Receiver<PromptRequest>,
+    cancel_rx: mpsc::Receiver<CancelNotificationRequestWrapper>,
     cancel_token: CancellationToken,
     notifier: Arc<N>,
+    /// 🔥 新增：共享的异常退出标志（子进程异常退出时设置为 true）
+    abnormal_exit_flag: Arc<AtomicBool>,
 }
 
 /// 运行 SACP 连接
@@ -538,10 +644,12 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
         mut cancel_rx,
         cancel_token,
         notifier,
+        abnormal_exit_flag,
     } = params;
 
-    // 克隆 project_id 供通知回调使用
-    let project_id_for_notification = project_id.clone();
+    // 克隆变量供 handlers 使用
+    let notifier_for_handlers = notifier.clone();
+    let project_id_for_handlers = project_id.clone();
     // 克隆 notifier 和 project_id 供 prompt 结束通知使用
     let notifier_for_prompt_end = notifier.clone();
     let project_id_for_prompt_end = project_id.clone();
@@ -549,17 +657,69 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
     // 使用 SACP Builder 模式
     ClientToAgent::builder()
         .name("rcoder-agent-runner-sacp")
-        // 处理 SessionNotification
-        .on_receive_notification(
-            move |notification: SessionNotification, _cx: JrConnectionCx<ClientToAgent>| {
-                let notifier = notifier.clone();
-                let project_id = project_id_for_notification.clone();
-                async move {
-                    handle_session_notification(notification, notifier, project_id).await;
-                    Ok(())
+        // 使用容错的消息处理器（处理未类型化消息，手动解析以捕获错误）
+        // 注意：必须在类型化 handlers 之前注册，以便作为 fallback
+        .on_receive_message(
+            {
+                async move |msg: sacp::MessageCx<sacp::UntypedMessage, sacp::UntypedMessage>,
+                            _cx: JrConnectionCx<ClientToAgent>| {
+                    match msg {
+                        sacp::MessageCx::Notification(untyped_notif) => {
+                            // 提前克隆需要的字段
+                            let method = untyped_notif.method.clone();
+                            let params = untyped_notif.params.clone();
+
+                            // 尝试解析为 SessionNotification
+                            let parse_result = sacp::MessageCx::Notification(untyped_notif)
+                                .into_notification::<SessionNotification>();
+
+                            match parse_result {
+                                Ok(Ok(notification)) => {
+                                    let notifier = notifier_for_handlers.clone();
+                                    let project_id = project_id_for_handlers.clone();
+                                    // 解析成功，处理通知
+                                    handle_session_notification(notification, notifier, project_id).await;
+                                    Ok(sacp::Handled::Yes)
+                                }
+                                Ok(Err(_)) => {
+                                    // 方法名不匹配，不是 session/update 通知，跳过
+                                    debug!(
+                                        method = %method,
+                                        "[SACP] 跳过非 session/update 通知"
+                                    );
+                                    // 继续传递给其他 handlers
+                                    Ok(sacp::Handled::No {
+                                        message: sacp::MessageCx::Notification(sacp::UntypedMessage {
+                                            method,
+                                            params,
+                                        }),
+                                        retry: false,
+                                    })
+                                }
+                                Err(ref err) => {
+                                    // 解析失败（如缺少 data 字段），记录警告但不断开连接
+                                    warn!(
+                                        ?err,
+                                        method = %method,
+                                        params = ?params,
+                                        "[SACP] SessionNotification 解析失败，跳过此消息但保持连接"
+                                    );
+                                    // 跳过此消息但不断开连接
+                                    Ok(sacp::Handled::Yes)
+                                }
+                            }
+                        }
+                        sacp::MessageCx::Request(request, request_cx) => {
+                            // 请求消息继续传递给 RequestPermission handler
+                            Ok(sacp::Handled::No {
+                                message: sacp::MessageCx::Request(request, request_cx),
+                                retry: false,
+                            })
+                        }
+                    }
                 }
             },
-            sacp::on_receive_notification!(),
+            sacp::on_receive_message!(),
         )
         // 处理 RequestPermission
         .on_receive_request(
@@ -577,6 +737,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
             let start_config = start_config.clone();
             let notifier_for_prompt = notifier_for_prompt_end.clone();
             let project_id_for_prompt = project_id_for_prompt_end.clone();
+            let abnormal_exit_flag = abnormal_exit_flag.clone();
 
             async move {
                 // 1. 初始化连接
@@ -597,18 +758,27 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 let system_prompt_meta = start_config.build_meta();
 
                 // 3. 创建新会话
-                debug!("[SACP] 创建 ACP 会话...");
+                info!("[SACP] 创建 ACP 会话...");
                 let new_session_request = NewSessionRequest::new(project_path.clone())
                     .mcp_servers(mcp_servers.clone())
                     .meta(system_prompt_meta);
 
+                info!("new_session_request: {:?}", new_session_request);
+
+                // 从配置获取超时值，默认 100 秒
+                let timeout_secs = start_config
+                    .acp_session_create_timeout_secs
+                    .unwrap_or(100);
                 let session_response = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(100),
+                    tokio::time::Duration::from_secs(timeout_secs),
                     cx.send_request(new_session_request).block_task(),
                 )
                 .await
                 .map_err(|_| {
-                    sacp::Error::new(-32000, "[SACP] new_session 超时 (100s)")
+                    sacp::Error::new(
+                        -32000,
+                        format!("[SACP] new_session 超时 ({}s)", timeout_secs)
+                    )
                 })??;
 
                 let session_id = session_response.session_id;
@@ -624,7 +794,37 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 loop {
                     tokio::select! {
                         _ = cancel_token.cancelled() => {
-                            info!("[SACP] 收到取消信号，退出");
+                            // 🔥 检测取消原因，区分"正常取消"和"Agent 进程退出"
+                            // 注意：如果在 prompt 处理中检测到取消，会在内层 loop 发送通知
+                            // 这里只处理"没有正在处理的 prompt"时的情况
+                            let is_abnormal = abnormal_exit_flag.load(Ordering::SeqCst);
+
+                            if is_abnormal {
+                                // Agent 进程异常退出，发送 SSE 错误通知
+                                warn!(
+                                    "[SACP] Agent 进程异常退出，发送 SSE 错误通知并断开连接: project_id={}, session_id={}",
+                                    project_id_for_prompt, session_id
+                                );
+                                if let Err(e) = notifier_for_prompt
+                                    .notify_prompt_error(
+                                        &project_id_for_prompt,
+                                        &session_id.to_string(),
+                                        sacp::Error::new(-32001, "Agent 进程异常退出，请重试"),
+                                        None, // request_id 可能已经不可用
+                                    )
+                                    .await
+                                {
+                                    error!("[SACP] 发送 Agent 退出错误通知失败: {:?}", e);
+                                } else {
+                                    info!("[SACP] 已发送 Agent 退出错误通知: project_id={}", project_id_for_prompt);
+                                }
+                            } else {
+                                // 正常取消信号（用户主动 stop 或 Agent 正常退出）
+                                info!(
+                                    "[SACP] 收到取消信号，断开连接: project_id={}, session_id={}",
+                                    project_id_for_prompt, session_id
+                                );
+                            }
                             break;
                         }
                         Some(cancel_request) = cancel_rx.recv() => {
@@ -688,6 +888,24 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             let prompt_result = loop {
                                 tokio::select! {
                                     biased;
+                                    // 🔥 监听 cancel_token（Agent 进程退出时会触发）
+                                    _ = cancel_token.cancelled() => {
+                                        let is_abnormal = abnormal_exit_flag.load(Ordering::SeqCst);
+                                        if is_abnormal {
+                                            warn!(
+                                                "[SACP] Prompt 处理中检测到 Agent 进程异常退出: project_id={}, session_id={}",
+                                                project_id_for_prompt, session_id
+                                            );
+                                            break Err(sacp::Error::new(-32001, "Agent 进程异常退出，请重试"));
+                                        } else {
+                                            // 正常取消（用户主动取消或 Agent 正常退出）
+                                            info!(
+                                                "[SACP] Prompt 处理中收到取消信号: project_id={}, session_id={}",
+                                                project_id_for_prompt, session_id
+                                            );
+                                            break Err(sacp::Error::new(-32002, "会话已取消"));
+                                        }
+                                    }
                                     // 取消后的超时保护（只有 is_cancelled 为 true 时才有意义）
                                     _ = &mut cancel_timeout, if is_cancelled => {
                                         // 取消后超时，强制返回错误
@@ -784,6 +1002,13 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                         {
                                             error!("[SACP] 发送 PromptError 通知失败: {:?}", notify_err);
                                         }
+                                    }
+
+                                    // 🔥 关键：如果 cancel_token 已取消，直接退出外层 loop
+                                    // 避免回到外层 loop 时再次触发 cancel_token.cancelled() 导致重复发送通知
+                                    if cancel_token.is_cancelled() {
+                                        info!("[SACP] Prompt 处理完成且 cancel_token 已取消，退出");
+                                        break;
                                     }
                                 }
                             }
@@ -926,6 +1151,88 @@ mod tests {
         assert_eq!(
             config.env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
             Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_default_config_with_openai_provider() {
+        let provider = ModelProviderConfig {
+            id: "test-openai".to_string(),
+            name: "openai".to_string(),
+            api_key: "sk-test-openai-key".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            default_model: "openai-compatible/gpt-4".to_string(), // model_name 已包含前缀
+            requires_openai_auth: true,
+            api_protocol: Some("openai".to_string()),
+        };
+
+        let config =
+            get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::RCoder);
+        assert!(config.is_ok());
+        let config = config.unwrap();
+
+        // 验证 OpenAI 环境变量
+        assert!(config.env.contains_key("OPENAI_API_KEY"));
+        assert_eq!(
+            config.env.get("OPENAI_API_KEY"),
+            Some(&API_KEY_PLACEHOLDER.to_string())
+        );
+
+        assert!(config.env.contains_key("OPENAI_BASE_URL"));
+        assert_eq!(
+            config.env.get("OPENAI_BASE_URL"),
+            Some(&DEFAULT_PROXY_BASE_URL.to_string())
+        );
+
+        // nuwaxcode 使用 OPENCODE_MODEL，直接使用 model_name（已包含 openai-compatible/ 前缀）
+        assert!(config.env.contains_key("OPENCODE_MODEL"));
+        assert_eq!(
+            config.env.get("OPENCODE_MODEL"),
+            Some(&"openai-compatible/gpt-4".to_string())
+        );
+
+        // 同时验证 Anthropic 环境变量也存在 (兼容性)
+        assert!(config.env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(config.env.contains_key("ANTHROPIC_BASE_URL"));
+    }
+
+    #[test]
+    fn test_sensitive_env_vars_protection() {
+        // 测试即使配置中有真实的 API_KEY，也会被 launch 函数强制替换为占位符
+        // 注意：这个测试验证的是设计意图，实际的强制替换发生在 launch 函数中
+        let provider = ModelProviderConfig {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            api_key: "sk-real-key-should-be-replaced".to_string(),
+            base_url: "https://real-url-should-be-replaced.com".to_string(),
+            default_model: "openai-compatible/gpt-4".to_string(),
+            requires_openai_auth: true,
+            api_protocol: Some("openai".to_string()),
+        };
+
+        let config =
+            get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::RCoder);
+        assert!(config.is_ok());
+        let config = config.unwrap();
+
+        // 验证默认配置中敏感变量已经是占位符
+        assert_eq!(
+            config.env.get("ANTHROPIC_API_KEY"),
+            Some(&API_KEY_PLACEHOLDER.to_string())
+        );
+        assert_eq!(
+            config.env.get("OPENAI_API_KEY"),
+            Some(&API_KEY_PLACEHOLDER.to_string())
+        );
+
+        // BASE_URL 应该是代理 URL（包含占位符）
+        assert_eq!(
+            config.env.get("ANTHROPIC_BASE_URL"),
+            Some(&DEFAULT_PROXY_BASE_URL.to_string())
+        );
+        assert_eq!(
+            config.env.get("OPENAI_BASE_URL"),
+            Some(&DEFAULT_PROXY_BASE_URL.to_string())
         );
     }
 

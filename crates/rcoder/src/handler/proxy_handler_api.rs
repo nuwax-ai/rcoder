@@ -156,7 +156,7 @@ pub async fn proxy_stats(
     let avg_response_time_ms = m.avg_response_time_ms();
 
     // 按端口统计
-    let snaps = m.port_snapshots().await;
+    let snaps = m.port_snapshots();
     let port_stats = snaps
         .into_iter()
         .map(|ps| {

@@ -21,10 +21,12 @@ debug = []
 # 此 feature 会传递给 docker_manager crate
 ebpf-debug = ["docker_manager/ebpf-debug"]
 
+[dev-dependencies]
+filetime = "0.2"
+
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
-acp-adapter = { path = "../acp_adapter" }
 rcoder-proxy = { path = "../rcoder-proxy" }
 
 # 🚀 无锁配置热更新
@@ -34,8 +36,6 @@ duckdb_manager = { path = "../duckdb_manager" }
 rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
-# ACP Protocol
-agent-client-protocol = { workspace = true }
 async-trait = "0.1"
 parking_lot = "0.12"
 tempfile = { workspace = true }

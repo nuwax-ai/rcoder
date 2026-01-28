@@ -11,11 +11,16 @@ pub struct CleanupConfig {
     /// 清理检查间隔（默认5分钟）
     pub cleanup_interval: Duration,
     /// Docker容器停止超时时间（默认30秒）
+    #[allow(dead_code)] // 保留用于未来的超时配置
     pub docker_stop_timeout: Duration,
     /// 容器最小保护时间（默认5分钟）
     pub container_protection_duration: Duration,
     /// Agent 活跃判断时间窗口（默认5分钟）
     pub active_window: Duration,
+    /// 日志目录路径
+    pub log_dir: String,
+    /// 日志保留时长
+    pub log_retention_duration: Duration,
 }
 
 impl Default for CleanupConfig {
@@ -26,6 +31,8 @@ impl Default for CleanupConfig {
             docker_stop_timeout: Duration::from_secs(30),
             container_protection_duration: Duration::from_secs(5 * 60),
             active_window: Duration::from_secs(5 * 60),
+            log_dir: "/app/logs/container".to_string(),
+            log_retention_duration: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
 }
@@ -45,4 +52,28 @@ pub struct CleanupStats {
     pub orphaned_containers_cleaned: u64,
     /// 最后清理时间
     pub last_cleanup: Option<DateTime<Utc>>,
+}
+
+impl CleanupStats {
+    /// 获取清理成功率
+    pub fn success_rate(&self) -> f64 {
+        if self.total_cleaned == 0 {
+            0.0
+        } else {
+            (self.success_cleaned as f64 / self.total_cleaned as f64) * 100.0
+        }
+    }
+
+    /// 获取格式化的统计摘要
+    pub fn summary(&self) -> String {
+        format!(
+            "总计清理: {}, 成功: {}, 失败: {}, 容器销毁: {}, 孤立容器: {}, 成功率: {:.1}%",
+            self.total_cleaned,
+            self.success_cleaned,
+            self.failed_cleaned,
+            self.containers_destroyed,
+            self.orphaned_containers_cleaned,
+            self.success_rate()
+        )
+    }
 }

@@ -46,10 +46,10 @@ impl<'a> NetworkDetector<'a> {
             })?;
 
         // 获取网络配置
-        if let Some(network_settings) = inspect.network_settings {
-            if let Some(networks) = network_settings.networks {
+        if let Some(network_settings) = inspect.network_settings
+            && let Some(networks) = network_settings.networks {
                 // 查找包含 "agent-network" 的网络
-                for (network_name, _) in &networks {
+                for network_name in networks.keys() {
                     if network_name.contains(RCODER_NETWORK_BASE_NAME) {
                         info!("✅ 动态检测到主网络: {}", network_name);
                         return Ok(network_name.clone());
@@ -65,7 +65,6 @@ impl<'a> NetworkDetector<'a> {
                     RCODER_NETWORK_BASE_NAME, available_networks
                 )));
             }
-        }
 
         Err(DockerError::ConnectionError(format!(
             "当前容器 (hostname: {}) 没有网络配置信息",

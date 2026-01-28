@@ -6,18 +6,15 @@ use utoipa::ToSchema;
 /// 模型接口协议类型
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ModelApiProtocol {
     /// Anthropic Claude API 协议
+    #[default]
     Anthropic,
     /// OpenAI 兼容 API 协议
     OpenAI,
 }
 
-impl Default for ModelApiProtocol {
-    fn default() -> Self {
-        Self::Anthropic
-    }
-}
 
 impl FromStr for ModelApiProtocol {
     type Err = ();
