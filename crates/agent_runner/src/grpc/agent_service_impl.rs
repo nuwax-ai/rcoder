@@ -32,7 +32,7 @@ use crate::agent_runtime::get_concurrency_limit;
 use crate::model::AgentStatus;
 use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
-use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, PendingGuard, SlotReservation, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
 use shared_types::ChatPromptBuilder;
 
@@ -309,50 +309,8 @@ impl AgentService for AgentServiceImpl {
         let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
         info!("🛡️ [gRPC] 创建 PendingGuard: project_id={}", project_id);
 
-        // 🆕 步骤 2: gRPC 层并发槽位检查（最早拒绝点优化）
-        // 在创建 PendingGuard 之后立即进行并发检查，避免消耗不必要的资源
-        let needs_new_session = predict_needs_new_session_sync(&project_id, &session_id);
-
-        if needs_new_session {
-            let limit = get_concurrency_limit();
-            if !AGENT_REGISTRY.try_acquire_session_slot() {
-                error!(
-                    "🛡️ [gRPC] 并发槽位已满 ({}/{}), 拒绝请求 - project_id={}",
-                    AGENT_REGISTRY.active_sessions_count(),
-                    limit,
-                    project_id
-                );
-
-                // 清理 PendingGuard（RAII 自动清理）
-                drop(pending_guard);
-
-                return Ok(Response::new(GrpcChatResponse {
-                    project_id: project_id.clone(),
-                    session_id: session_id.unwrap_or_default(),
-                    success: false,
-                    error_code: Some(shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string()),
-                    error: Some(format!(
-                        "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
-                        limit
-                    )),
-                    request_id: req.request_id.clone(),
-                    need_fallback: false,
-                    fallback_reason: None,
-                }));
-            }
-
-            info!(
-                "✅ [gRPC] 成功预留并发槽位: {}/{} - project_id={}",
-                AGENT_REGISTRY.active_sessions_count(),
-                limit,
-                project_id
-            );
-        } else {
-            debug!(
-                "🔄 [gRPC] 预测复用现有会话，无需预留槽位 - project_id={}",
-                project_id
-            );
-        }
+        // 🆕 并发槽位检查已移到 model_provider 构造之后（Step 5b）
+        // 这样 predict_needs_new_session_sync 可以正确传入 model_provider
 
         // 🔥 修复：只在 session 不存在时才清理无效的 session_id
         // 问题：旧代码无条件移除用户指定的 session，导致无法复用
@@ -496,12 +454,59 @@ impl AgentService for AgentServiceImpl {
             warn!("⚠️ [gRPC] 未提供模型配置，将使用环境变量或默认配置");
         }
 
-        // 创建请求并设置 UUID 和密钥管理器
+        // 🆕 步骤 2: gRPC 层并发槽位检查（model_provider 可用后进行精确预测）
+        let needs_new_session = predict_needs_new_session_sync(&project_id, &session_id, &model_provider);
+
+        let slot_reservation = if needs_new_session {
+            let limit = get_concurrency_limit();
+            if !AGENT_REGISTRY.try_acquire_session_slot() {
+                error!(
+                    "🛡️ [gRPC] 并发槽位已满 ({}/{}), 拒绝请求 - project_id={}",
+                    AGENT_REGISTRY.active_sessions_count(),
+                    limit,
+                    project_id
+                );
+
+                // 清理 PendingGuard（RAII 自动清理）
+                drop(pending_guard);
+
+                return Ok(Response::new(GrpcChatResponse {
+                    project_id: project_id.clone(),
+                    session_id: session_id.unwrap_or_default(),
+                    success: false,
+                    error_code: Some(shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string()),
+                    error: Some(format!(
+                        "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
+                        limit
+                    )),
+                    request_id: req.request_id.clone(),
+                    need_fallback: false,
+                    fallback_reason: None,
+                }));
+            }
+
+            info!(
+                "✅ [gRPC] 成功预留并发槽位: {}/{} - project_id={}",
+                AGENT_REGISTRY.active_sessions_count(),
+                limit,
+                project_id
+            );
+            Some(SlotReservation::new(AGENT_REGISTRY.clone()))
+        } else {
+            debug!(
+                "🔄 [gRPC] 预测复用现有会话，无需预留槽位 - project_id={}",
+                project_id
+            );
+            None
+        };
+
+        // 创建请求并设置 UUID、密钥管理器和槽位预留
         let (local_task_request, chat_prompt_rx) =
             AgentRequest::new(prompt_message, model_provider);
         let local_task_request = local_task_request
             .with_service_uuid(service_uuid)
-            .with_key_manager(Some(self.app_state.shared_api_key_manager.clone()));
+            .with_key_manager(Some(self.app_state.shared_api_key_manager.clone()))
+            .with_slot_reservation(slot_reservation);
 
         // 🆕 Check worker state
         use crate::agent_runtime::WorkerState;
@@ -1809,6 +1814,7 @@ async fn check_port_available(port: u16, timeout_millis: u64) -> bool {
 pub(crate) fn predict_needs_new_session_sync(
     project_id: &str,
     session_id: &Option<String>,
+    model_provider: &Option<ModelProviderConfig>,
 ) -> bool {
     use shared_types::{AgentStatus, SessionEntry};
 
@@ -1818,7 +1824,7 @@ pub(crate) fn predict_needs_new_session_sync(
             // 验证 project_id 是否匹配
             if existing.project_id() == project_id {
                 let channel_closed = existing.is_channel_closed();
-                let model_changed = existing.is_model_config_changed(&None);
+                let model_changed = existing.is_model_config_changed(model_provider);
 
                 if !channel_closed && !model_changed {
                     info!(
@@ -1843,7 +1849,7 @@ pub(crate) fn predict_needs_new_session_sync(
         }
 
         let channel_closed = existing.is_channel_closed();
-        let model_changed = existing.is_model_config_changed(&None);
+        let model_changed = existing.is_model_config_changed(model_provider);
 
         if !channel_closed && !model_changed {
             info!(

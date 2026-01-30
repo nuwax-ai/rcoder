@@ -111,6 +111,80 @@ impl<'a> Drop for PendingGuard<'a> {
     }
 }
 
+// ============================================================================
+// 🔥 SlotReservation RAII 守卫
+// ============================================================================
+
+/// 并发槽位预留 RAII 守卫
+///
+/// ## 问题背景
+///
+/// gRPC 层预测是否需要新会话并预留槽位，但在请求传递到 Worker 过程中，
+/// 如果发生异常（send 失败、panic 等），槽位可能永远不会释放。
+///
+/// ## 解决方案
+///
+/// 使用 RAII 模式：
+/// - 构造时：槽位已通过 `try_acquire_session_slot()` 获取
+/// - `confirm()`：确认使用槽位，消耗守卫但不释放（所有权转移给 Agent 生命周期）
+/// - `Drop`：如果未 confirm，自动释放槽位
+///
+/// ## 使用示例
+///
+/// ```rust,ignore
+/// // gRPC 层
+/// let slot = SlotReservation::new(Arc::clone(&AGENT_REGISTRY));
+/// let request = AgentRequest::new(...).with_slot_reservation(Some(slot));
+/// // 如果 send 失败，AgentRequest drop → SlotReservation drop → 槽位释放
+///
+/// // Worker 层
+/// if is_new_session {
+///     reservation.confirm(); // 确认使用，槽位由 Agent 生命周期管理
+/// }
+/// // 如果是复用会话，reservation drop → 槽位释放
+/// ```
+pub struct SlotReservation {
+    registry: Arc<AgentSessionRegistry>,
+    armed: AtomicBool,
+}
+
+impl std::fmt::Debug for SlotReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotReservation")
+            .field("armed", &self.armed.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl SlotReservation {
+    /// 创建新的 SlotReservation
+    ///
+    /// 调用前必须已通过 `registry.try_acquire_session_slot()` 成功获取槽位
+    pub fn new(registry: Arc<AgentSessionRegistry>) -> Self {
+        Self {
+            registry,
+            armed: AtomicBool::new(true),
+        }
+    }
+
+    /// 确认使用槽位，消耗守卫但不释放槽位
+    ///
+    /// 调用后槽位所有权转移给 Agent 生命周期（由 `remove_by_project` 释放）
+    pub fn confirm(self) {
+        self.armed.store(false, Ordering::Release);
+        std::mem::forget(self); // 防止 Drop 释放槽位
+    }
+}
+
+impl Drop for SlotReservation {
+    fn drop(&mut self) {
+        if self.armed.load(Ordering::Acquire) {
+            debug!("🔓 [SlotReservation] Drop 时自动释放未确认的槽位");
+            self.registry.release_session_slot();
+        }
+    }
+}
+
 /// Agent 会话注册表
 ///
 /// 统一管理 project_id、session_id 和 AgentInfo 之间的映射关系
@@ -917,5 +991,95 @@ mod tests {
         // 所有映射都应该被清理
         assert!(!registry.contains_project("project1"));
         assert!(!registry.contains_session("session1"));
+    }
+
+    // ========================================================================
+    // SlotReservation 单元测试
+    // ========================================================================
+
+    #[test]
+    fn test_slot_reservation_drop_releases_slot() {
+        // 创建新的 registry 用于测试
+        let registry = Arc::new(AgentSessionRegistry::new());
+
+        // 获取槽位
+        assert!(registry.try_acquire_session_slot());
+        let count_after_acquire = registry.active_sessions_count();
+        assert_eq!(count_after_acquire, 1);
+
+        // 创建 SlotReservation 并让它 drop
+        {
+            let _reservation = SlotReservation::new(Arc::clone(&registry));
+            // reservation 在这里还存在，槽位不应该释放
+            assert_eq!(registry.active_sessions_count(), 1);
+        }
+        // reservation 已 drop，槽位应该被释放
+        assert_eq!(registry.active_sessions_count(), 0);
+    }
+
+    #[test]
+    fn test_slot_reservation_confirm_does_not_release() {
+        // 创建新的 registry 用于测试
+        let registry = Arc::new(AgentSessionRegistry::new());
+
+        // 获取槽位
+        assert!(registry.try_acquire_session_slot());
+        assert_eq!(registry.active_sessions_count(), 1);
+
+        // 创建 SlotReservation 并 confirm
+        {
+            let reservation = SlotReservation::new(Arc::clone(&registry));
+            reservation.confirm();
+            // confirm 后，槽位不应该被释放
+        }
+        // 即使离开作用域，槽位也不应该被释放（因为已经 confirm 了）
+        assert_eq!(registry.active_sessions_count(), 1);
+
+        // 手动释放槽位用于清理
+        registry.release_session_slot();
+        assert_eq!(registry.active_sessions_count(), 0);
+    }
+
+    #[test]
+    fn test_slot_reservation_debug_impl() {
+        let registry = Arc::new(AgentSessionRegistry::new());
+        assert!(registry.try_acquire_session_slot());
+
+        let reservation = SlotReservation::new(Arc::clone(&registry));
+
+        // 验证 Debug 实现
+        let debug_str = format!("{:?}", reservation);
+        assert!(debug_str.contains("SlotReservation"));
+        assert!(debug_str.contains("armed"));
+        assert!(debug_str.contains("true"));
+
+        // 清理
+        drop(reservation);
+    }
+
+    #[test]
+    fn test_slot_reservation_multiple_reservations() {
+        let registry = Arc::new(AgentSessionRegistry::new());
+
+        // 获取多个槽位
+        assert!(registry.try_acquire_session_slot());
+        assert!(registry.try_acquire_session_slot());
+        assert!(registry.try_acquire_session_slot());
+        assert_eq!(registry.active_sessions_count(), 3);
+
+        // 创建多个 reservation
+        let r1 = SlotReservation::new(Arc::clone(&registry));
+        let r2 = SlotReservation::new(Arc::clone(&registry));
+        let r3 = SlotReservation::new(Arc::clone(&registry));
+
+        // confirm 一个，drop 两个
+        r1.confirm();
+        drop(r2);
+        assert_eq!(registry.active_sessions_count(), 2);
+        drop(r3);
+        assert_eq!(registry.active_sessions_count(), 1);
+
+        // 清理
+        registry.release_session_slot();
     }
 }
