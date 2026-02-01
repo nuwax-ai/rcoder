@@ -15,6 +15,39 @@ use tracing::{debug, info, warn};
 
 use super::AGENT_REGISTRY;
 
+/// 日志截取的最大长度默认值
+const MAX_LOG_TRUNCATE_LEN: usize = 50;
+
+/// 截取消息内容用于日志打印（防止日志膨胀）
+///
+/// 社区常见做法：
+/// - tracing: 通过 Subscriber 配置限制字段大小
+/// - serde: 自定义 Serialize 实现截断
+/// - 简单场景: chars().take() + 长度检查（本实现）
+fn truncate_message_for_log(data: &serde_json::Value, max_len: usize) -> String {
+    // 边界检查：max_len 为 0 时返回空，避免无效计算
+    if max_len == 0 {
+        return String::new();
+    }
+
+    // 优先提取原始字符串内容，避免 JSON 序列化后的引号包裹
+    let s = match data.as_str() {
+        Some(inner) => inner.to_string(),
+        None => data.to_string(),
+    };
+
+    // chars().count() 是一次性遍历，可以与 take() 合并优化但牺牲可读性
+    // 当前实现清晰且性能可接受（短字符串场景）
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        return s;
+    }
+
+    // 使用 chars() 安全截取 UTF-8 字符边界
+    let truncated: String = s.chars().take(max_len).collect();
+    format!("{}... (truncated)", truncated)
+}
+
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
 
@@ -240,14 +273,22 @@ impl SessionWorker {
                     if let Some(sender) = current_sender_guard.as_mut() {
                         if sender.try_send(message.clone()).is_err() {
                             // 如果发送失败，可能是缓冲区满了或连接已关闭
-                            warn!("⚠️ SSE sender 发送失败，关闭实时推送");
+                            // 注意：truncate 在锁内执行，但 50 字符开销可忽略
+                            warn!(
+                                "⚠️ SSE sender 发送失败，关闭实时推送: message_type={:?}, sub_type={}, data={}",
+                                message.message_type,
+                                message.sub_type,
+                                truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
+                            );
                             *current_sender_guard = None;
                         }
                     } else {
                         // 连接不存在，跳过实时推送（记录为 info 级别，便于排查问题）
                         info!(
-                            "📭 SSE sender 不存在，跳过实时推送（消息已缓存到 ring buffer）: message_type={:?}, sub_type={}",
-                            message.message_type, message.sub_type
+                            "📭 SSE sender 不存在，跳过实时推送（消息已缓存到 ring buffer）: message_type={:?}, sub_type={}, data={}",
+                            message.message_type,
+                            message.sub_type,
+                            truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
                         );
                     }
                 }
