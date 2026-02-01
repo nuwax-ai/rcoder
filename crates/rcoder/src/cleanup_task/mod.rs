@@ -39,27 +39,9 @@ pub async fn start_cleanup_task(
             anyhow::anyhow!("获取 DockerManager 失败: {}", e)
         })?;
 
-    let multi_image_config = state
-        .config
-        .docker_config
-        .as_ref()
-        .map(|dc| dc.get_multi_image_config())
-        .unwrap_or_else(shared_types::create_default_multi_image_config);
-
-    let container_patterns =
-        docker_manager::container_stop::get_container_patterns_for_enabled_services(
-            &multi_image_config,
-        );
-
     let pingora_service = state.pingora_service.clone();
 
-    let mut cleaner = AgentCleaner::new(
-        config,
-        state,
-        docker_manager,
-        pingora_service,
-        container_patterns,
-    );
+    let mut cleaner = AgentCleaner::new(config, state, docker_manager, pingora_service);
 
     Ok(tokio::task::spawn(async move {
         cleaner.run().await;

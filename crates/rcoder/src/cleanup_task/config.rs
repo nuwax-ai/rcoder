@@ -48,8 +48,6 @@ pub struct CleanupStats {
     pub failed_cleaned: u64,
     /// 销毁的容器数量
     pub containers_destroyed: u64,
-    /// 清理的孤立容器数量
-    pub orphaned_containers_cleaned: u64,
     /// 最后清理时间
     pub last_cleanup: Option<DateTime<Utc>>,
 }
@@ -67,12 +65,11 @@ impl CleanupStats {
     /// 获取格式化的统计摘要
     pub fn summary(&self) -> String {
         format!(
-            "总计清理: {}, 成功: {}, 失败: {}, 容器销毁: {}, 孤立容器: {}, 成功率: {:.1}%",
+            "总计清理: {}, 成功: {}, 失败: {}, 容器销毁: {}, 成功率: {:.1}%",
             self.total_cleaned,
             self.success_cleaned,
             self.failed_cleaned,
             self.containers_destroyed,
-            self.orphaned_containers_cleaned,
             self.success_rate()
         )
     }
