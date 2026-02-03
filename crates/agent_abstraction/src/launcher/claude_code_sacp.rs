@@ -819,11 +819,25 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     info!("[SACP] 已发送 Agent 退出错误通知: project_id={}", project_id_for_prompt);
                                 }
                             } else {
-                                // 正常取消信号（用户主动 stop 或 Agent 正常退出）
-                                info!(
-                                    "[SACP] 收到取消信号，断开连接: project_id={}, session_id={}",
-                                    project_id_for_prompt, session_id
-                                );
+                                // 🔥 修复：正常取消时也要发送 PromptEnd，确保状态回退 Idle
+                                // 避免 Agent 一直卡在 Active 状态无法回收
+                                if let Err(e) = notifier_for_prompt
+                                    .notify_prompt_end(
+                                        &project_id_for_prompt,
+                                        &session_id.to_string(),
+                                        sacp::schema::StopReason::Cancelled,
+                                        Some("用户取消任务".to_string()),
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    error!("[SACP] 发送 PromptEnd (Cancelled) 通知失败: {:?}", e);
+                                } else {
+                                    info!(
+                                        "[SACP] 已发送 PromptEnd (Cancelled) 通知，状态将回退 Idle: project_id={}, session_id={}",
+                                        project_id_for_prompt, session_id
+                                    );
+                                }
                             }
                             break;
                         }
