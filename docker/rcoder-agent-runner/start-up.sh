@@ -547,28 +547,22 @@ function start_vnc_services() {
 		fi
 	done
 
-	log "X11 is ready, starting VNC..."
+	log "X11 is ready, checking VNC services..."
 
-	# 停止可能存在的VNC服务
-	pkill x11vnc || true
-
-	# 等待进程完全停止（智能等待，最长 3 秒）
-	wait_for_process_exit "x11vnc" 3 || log_warn "x11vnc 进程终止超时"
-
-	# 启动x11vnc服务器 (后台运行，以 root 身份)
-	export DISPLAY=:0
-	nohup x11vnc -bg -display :0 -forever -wait 50 -shared -rfbport 5900 -nopw 2>/tmp/x11vnc_stderr.log >/dev/null &
-
-	# 等待 x11vnc 端口就绪（智能等待，最长 5 秒）
+	# 等待 Xvnc 端口 5900 就绪（智能等待，最长 5 秒）
+	# Xvnc 在 start_display_and_desktop 中启动，需要时间绑定端口
 	if wait_for_port localhost 5900 5; then
-		log_success "x11vnc port 5900 is ready"
+		log_success "Xvnc port 5900 is ready"
 	else
-		log_warn "x11vnc port 5900 not ready within timeout"
+		log_warn "Xvnc port 5900 not ready within timeout"
 	fi
 
-	# 启动noVNC代理 (后台运行，以 root 身份)
+	# 只启动noVNC代理 (后台运行，以 root 身份)
+	# noVNC 需要 Xvnc 已经监听 5900 端口
 	cd /opt/noVNC/utils
-	nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
+	if ! pgrep -f "novnc_proxy" >/dev/null 2>&1; then
+		nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
+	fi
 	cd -
 
 	# 等待 noVNC 端口就绪（智能等待，最长 5 秒）
@@ -582,14 +576,12 @@ function start_vnc_services() {
 	vnc_running=false
 	novnc_running=false
 
-	# 检查x11vnc进程
-	if pgrep -x x11vnc >/dev/null 2>&1; then
+	# 检查Xvnc进程
+	if pgrep -f "Xvnc :0" >/dev/null 2>&1; then
 		vnc_running=true
-		log_success "x11vnc server started on port 5900"
+		log_success "Xvnc server is running on port 5900"
 	else
-		echo "✗ x11vnc server failed to start"
-		echo "Error log:"
-		cat /tmp/x11vnc_stderr.log 2>/dev/null || echo 'No error log found'
+		echo "✗ Xvnc server not running"
 	fi
 
 	# 检查noVNC端口
@@ -621,7 +613,7 @@ function start_display_and_desktop() {
 
 	# 清理可能存在的X11锁文件和进程
 	rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 /tmp/.Xauthority /tmp/dbus-session-env
-	pkill -f "Xvfb :0" || true
+	pkill -f "Xvnc :0" || true
 	pkill -f "xfce4-session" || true
 	pkill -f "dbus-daemon" || true
 	pkill -f "fcitx5" || true
@@ -632,11 +624,12 @@ function start_display_and_desktop() {
     touch /tmp/dbus-session-env
     chmod 666 /tmp/dbus-session-env
 
-    # ========== 优化：尽早启动 Xvfb (后台) ==========
-    # Xvfb 启动需要时间，将其提前到 Cleanup/DBus 之前，利用这段时间进行初始化
+    # ========== 优化：尽早启动 Xvnc (后台) ==========
+    # Xvnc 是 TigerVNC 内置的 X server + VNC 服务器
+    # 使用 Xvnc 替代 Xvfb + x11vnc 的组合，简化架构
     # 色深使用 24 位，避免某些 Linux 内核上出现花屏
-    log "Starting Xvfb :0 (background initialization)..."
-    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1920x1080x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1 &
+    log "Starting Xvnc :0 (background initialization)..."
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 >/tmp/xvnc.log 2>&1 &
 
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
@@ -750,14 +743,14 @@ function start_display_and_desktop() {
 		log_warn "PolicyKit daemon not started"
 	fi
 
-    # 等待Xvfb启动（此时应该已经差不多就绪了）
+    # 等待Xvnc启动（此时应该已经差不多就绪了）
     log "Waiting for X11 to be ready..."
     counter=0
     while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
         sleep 0.1
         let counter++
         if ((counter > 100)); then
-            echo "Failed to start Xvfb"
+            echo "Failed to start Xvnc"
             return 1
         fi
     done
@@ -904,21 +897,40 @@ function apply_xfce_wallpaper() {
     log_success "  Setting wallpaper: $WALLPAPER_PATH"
 
     # 获取当前的 monitor 配置（XFCE 可能使用不同的名称）
-    local monitors=$(DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image' | head -5)
+    local monitors=$(DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image' | head -10)
 
     if [ -n "$monitors" ]; then
         # 对于每个找到的 monitor 配置设置壁纸
         echo "$monitors" | while read monitor_path; do
             DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$monitor_path" -s "$WALLPAPER_PATH" 2>/dev/null || true
+            # 同时设置 image-style (5 = 缩放)
+            local style_path=$(echo "$monitor_path" | sed 's/last-image/image-style/')
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$style_path" -n -t int -s 5 2>/dev/null || true
+        done
+
+        # 另外处理使用 image-path/image-show 的 monitor
+        for monitor_name in monitor0 monitor1; do
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-show" -n -t bool -s true 2>/dev/null || true
         done
     else
         # 直接设置常用的 monitor 路径
         DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
         DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorVNC-0/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+
+        # 处理使用 image-path/image-show 的 monitor (如 monitor0, monitor1)
+        for monitor_name in monitor0 monitor1; do
+            # 设置壁纸路径
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+            # 确保图片显示启用
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-show" -n -t bool -s true 2>/dev/null || true
+        done
     fi
 
     # 设置壁纸样式（5 = 缩放）
     DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5 2>/dev/null || true
+    DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorVNC-0/workspace0/image-style -n -t int -s 5 2>/dev/null || true
 
     log_success "XFCE wallpaper config applied"
 
@@ -984,9 +996,9 @@ function apply_xfce_wallpaper() {
 function check_vnc_health() {
     # 检查VNC服务健康状态 (as root)
     if [ "$VNC_AUTO_START" = "true" ]; then
-        # 检查x11vnc进程
-        if ! pgrep -x x11vnc >/dev/null 2>&1; then
-            log_warn " x11vnc process not running, attempting restart..."
+        # 检查Xvnc进程
+        if ! pgrep -f "Xvnc" >/dev/null 2>&1; then
+            log_warn " Xvnc process not running, attempting restart..."
             return 1
         fi
 
@@ -1470,7 +1482,7 @@ initialize_user_home
 
 # ========== MCP Proxy 服务在 X11 就绪后启动 ==========
 # 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
-# 因此必须等待 Xvfb 启动后才能启动 MCP Proxy
+# 因此必须等待 Xvnc 启动后才能启动 MCP Proxy
 # MCP Proxy 的启动已移动到下方的 VNC 后台任务中（X11 就绪后）
 
 # 首先启动显示服务和桌面环境
@@ -1558,13 +1570,12 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
         # 检查 VNC 服务健康状态
         if ! check_vnc_health; then
             echo "VNC服务异常，正在重启..."
-            # 停止现有服务
-            pkill x11vnc || true
+            # 只重启 noVNC（Xvnc 由 start_display_and_desktop 管理）
             pkill -f novnc_proxy || true
-            # 等待进程终止（智能等待，最长 3 秒）
-            wait_for_process_exit "x11vnc" 3 || true
-            # 重新启动VNC服务
-            start_vnc_services
+            # 重新启动 noVNC
+            cd /opt/noVNC/utils
+            nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
+            cd -
         fi
 
         # ========== MCP Proxy 健康检查（使用 mcp-proxy health 工具）==========
