@@ -116,7 +116,7 @@ docker_config:
           # 🖼️ 自定义壁纸配置
           # 通过挂载的 /app/assets 目录使用宿主机壁纸
           # 使用方法：在宿主机 ./wallpaper 目录放置 wallpaper.jpeg
-          CUSTOM_WALLPAPER_PATH: "/app/assets/wallpaper.jpeg"
+          # CUSTOM_WALLPAPER_PATH: "/app/assets/wallpaper.jpeg"
 
         command:
           - "/usr/local/bin/agent_runner"

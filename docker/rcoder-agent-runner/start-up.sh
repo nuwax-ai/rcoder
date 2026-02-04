@@ -924,14 +924,15 @@ function apply_xfce_wallpaper() {
 
     # 兜底：确保所有常用的 monitor 路径都设置壁纸
     # 包括根级别的 monitor 配置（如 monitor0/monitor1）
-    for monitor_path in \
-        "/backdrop/screen0/monitorscreen/workspace0/last-image" \
-        "/backdrop/screen0/monitor0/workspace0/last-image" \
-        "/backdrop/screen0/monitor0/last-image" \
-        "/backdrop/screen0/monitor1/workspace0/last-image" \
-        "/backdrop/screen0/monitor1/last-image" \
-        "/backdrop/screen0/monitorVNC-0/workspace0/last-image"; do
-        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$monitor_path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+    # 设置所有 workspace (0-3) 的壁纸
+    for workspace in 0 1 2 3; do
+        for monitor_path in \
+            "/backdrop/screen0/monitorscreen/workspace${workspace}/last-image" \
+            "/backdrop/screen0/monitor0/workspace${workspace}/last-image" \
+            "/backdrop/screen0/monitor1/workspace${workspace}/last-image" \
+            "/backdrop/screen0/monitorVNC-0/workspace${workspace}/last-image"; do
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$monitor_path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+        done
     done
 
     # 设置 image-path/image-show (某些 monitor 使用这种配置)
