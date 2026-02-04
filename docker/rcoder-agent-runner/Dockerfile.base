@@ -44,7 +44,7 @@ RUN apt-get update && \
     # FFmpeg 8 编译依赖:
     yasm nasm pkg-config libx264-dev libx265-dev libnuma-dev libvpx-dev libmp3lame-dev libopus-dev libspeex-dev libtheora-dev libtool libva-dev libvdpau-dev libvorbis-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev texinfo zlib1g-dev \
     # VNC and streaming:
-    x11vnc net-tools netcat-openbsd \
+    tigervnc-standalone-server tigervnc-xorg-extension net-tools netcat-openbsd \
     # Audio streaming (PulseAudio + pcmflux dependencies):
     pulseaudio pulseaudio-utils libpulse-dev libopus-dev \
     # Standard applications:
