@@ -889,7 +889,18 @@ function apply_xfce_wallpaper() {
     done
 
     # 壁纸路径：支持通过环境变量 CUSTOM_WALLPAPER_PATH 自定义
-    local WALLPAPER_PATH="${CUSTOM_WALLPAPER_PATH:-/usr/share/backgrounds/xfce/wallpaper.jpeg}"
+    # 如果自定义壁纸不存在，使用容器内的默认壁纸
+    local CUSTOM_WALLPAPER="${CUSTOM_WALLPAPER_PATH:-}"
+    if [ -n "$CUSTOM_WALLPAPER" ] && [ -f "$CUSTOM_WALLPAPER" ]; then
+        local WALLPAPER_PATH="$CUSTOM_WALLPAPER"
+        log "Using custom wallpaper: $WALLPAPER_PATH"
+    else
+        local WALLPAPER_PATH="/usr/share/backgrounds/xfce/wallpaper.jpeg"
+        if [ -n "$CUSTOM_WALLPAPER" ]; then
+            log_warn " Custom wallpaper not found: $CUSTOM_WALLPAPER, using default"
+        fi
+    fi
+
     if [ ! -f "$WALLPAPER_PATH" ]; then
         log_warn " Wallpaper not found: $WALLPAPER_PATH"
         return 1
@@ -898,6 +909,7 @@ function apply_xfce_wallpaper() {
     log_success "  Setting wallpaper: $WALLPAPER_PATH"
 
     # 获取当前的 monitor 配置（XFCE 可能使用不同的名称）
+    # 动态获取可能会漏掉一些配置，所以最后会兜底设置常用路径
     local monitors=$(DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image' | head -10)
 
     if [ -n "$monitors" ]; then
@@ -908,30 +920,35 @@ function apply_xfce_wallpaper() {
             local style_path=$(echo "$monitor_path" | sed 's/last-image/image-style/')
             DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$style_path" -n -t int -s 5 2>/dev/null || true
         done
-
-        # 另外处理使用 image-path/image-show 的 monitor
-        for monitor_name in monitor0 monitor1; do
-            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
-            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-show" -n -t bool -s true 2>/dev/null || true
-        done
-    else
-        # 直接设置常用的 monitor 路径
-        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
-        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
-        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorVNC-0/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
-
-        # 处理使用 image-path/image-show 的 monitor (如 monitor0, monitor1)
-        for monitor_name in monitor0 monitor1; do
-            # 设置壁纸路径
-            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
-            # 确保图片显示启用
-            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-show" -n -t bool -s true 2>/dev/null || true
-        done
     fi
 
-    # 设置壁纸样式（5 = 缩放）
-    DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5 2>/dev/null || true
-    DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorVNC-0/workspace0/image-style -n -t int -s 5 2>/dev/null || true
+    # 兜底：确保所有常用的 monitor 路径都设置壁纸
+    # 包括根级别的 monitor 配置（如 monitor0/monitor1）
+    for monitor_path in \
+        "/backdrop/screen0/monitorscreen/workspace0/last-image" \
+        "/backdrop/screen0/monitor0/workspace0/last-image" \
+        "/backdrop/screen0/monitor0/last-image" \
+        "/backdrop/screen0/monitor1/workspace0/last-image" \
+        "/backdrop/screen0/monitor1/last-image" \
+        "/backdrop/screen0/monitorVNC-0/workspace0/last-image"; do
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$monitor_path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+    done
+
+    # 设置 image-path/image-show (某些 monitor 使用这种配置)
+    for monitor_name in monitor0 monitor1; do
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-show" -n -t bool -s true 2>/dev/null || true
+    done
+
+    # 设置所有找到的 image-style
+    for style_path in \
+        "/backdrop/screen0/monitorscreen/workspace0/image-style" \
+        "/backdrop/screen0/monitorVNC-0/workspace0/image-style" \
+        "/backdrop/screen0/monitorVNC-0/workspace1/image-style" \
+        "/backdrop/screen0/monitorVNC-0/workspace2/image-style" \
+        "/backdrop/screen0/monitorVNC-0/workspace3/image-style"; do
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$style_path" -n -t int -s 5 2>/dev/null || true
+    done
 
     log_success "XFCE wallpaper config applied"
 
