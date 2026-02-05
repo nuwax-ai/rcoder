@@ -1,5 +1,7 @@
 // 重新导出 shared_types 中的模型，保持向后兼容
 
+pub use agent_abstraction::PromptMessage;
+
 pub use shared_types::{
     // Agent model exports
     AgentStatus, ProjectAndAgentInfo,
