@@ -25,3 +25,7 @@
 [submodule "temp/duckdb"]
 	path = temp/duckdb
 	url = https://github.com/duckdb/duckdb.git
+
+[submodule "vendors/symposium-acp"]
+	path = vendors/symposium-acp
+	url = https://github.com/symposium-dev/symposium-acp.git
