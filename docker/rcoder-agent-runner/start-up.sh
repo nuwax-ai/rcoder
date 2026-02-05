@@ -463,38 +463,75 @@ EOF
     log_success "  Chromium set as default web browser (mimeapps.list)"
     log_success "  BROWSER env set to: $BROWSER"
 
-    # ========== 修复挂载目录的权限（解决宿主机 UID 不匹配） ==========
-    # 注意：由于 Dockerfile 中用户配置已经以 user 身份创建，
-    # 这里只需要处理可能被宿主机挂载覆盖的目录
-    log "Fixing permissions for mounted directories..."
+    # ========== 修复挂载目录的权限（优化版 - 避免递归遍历大量文件） ==========
+    # 优化说明：
+    # 1. 容器以 root 身份运行，通过 HOME=/home/user 设置环境变量
+    # 2. root 用户可以访问任何文件，不需要递归 chown
+    # 3. 只需要确保关键目录的基本权限即可
+    log "Fixing permissions for mounted directories (optimized)..."
 
     # 确保必要目录存在
     mkdir -p "$USER_HOME/.cache" /app /tmp/mesa_shader_cache "${CONTAINER_LOGS_DIR:-/app/container-logs}"
 
-    # 修复 /home/user 目录的所有者（重要：当宿主机挂载空目录时）
-    log "Fixing ownership for /home/user and mounted directories..."
-    chown -R user:user "$USER_HOME" 2>/dev/null || true
-    chown -R user:user /app "${CONTAINER_LOGS_DIR:-/app/container-logs}" 2>/dev/null || true
-    chown -R user:user /tmp/mesa_shader_cache 2>/dev/null || true
+    # ========== 方案 1: 只修复顶层目录所有权（非递归，<0.1秒） ==========
+    log "Fixing ownership for top-level directories (non-recursive)..."
+    chown user:user "$USER_HOME" 2>/dev/null || true
+    chown user:user "$USER_HOME/.config" 2>/dev/null || true
+    chown user:user "$USER_HOME/.cache" 2>/dev/null || true
+    chown user:user "$USER_HOME/Desktop" 2>/dev/null || true
 
-    # 修复权限
-    log "Fixing permissions..."
-    chmod -R u+rwX /app "$USER_HOME/.cache" 2>/dev/null || true
+    # ========== 方案 2: 只递归修复 XFCE 配置目录（文件少，~0.1秒） ==========
+    # XFCE 配置文件需要正确的所有者才能被 xfce4-session 正确加载
+    # 同时设置 other 读权限让 root 用户也能访问（一次性完成，避免重复遍历）
+    if [ -d "$USER_HOME/.config/xfce4" ]; then
+        find "$USER_HOME/.config/xfce4" \( -type f -o -type d \) \
+            -exec chown user:user {} + \
+            -exec chmod o+rX {} + 2>/dev/null || true
+        log_success "  XFCE config ownership and permissions fixed"
+    fi
 
-    # 对于可能无法 chown 的挂载目录，尝试添加 other 权限
-    chmod -R o+rX /app 2>/dev/null || true
+    # ========== 方案 3: 通过 chmod 让 root 用户也能访问（容器内以 root 运行） ==========
+    # 由于容器以 root 运行，只需要确保 other 有读权限即可
+    # 为了安全性和性能，只对必要的目录递归处理
+    log "Setting read permissions for root access..."
 
-    # 确保 bin 目录下的文件可执行
-    [ -d /app/bin ] && chmod -R a+x /app/bin 2>/dev/null || true
+    # Desktop 目录递归处理（文件少）
+    if [ -d "$USER_HOME/Desktop" ]; then
+        chmod -R o+rX "$USER_HOME/Desktop" 2>/dev/null || true
+    fi
 
-    log_success "Permissions fixed"
+    # .cache 和 .local 可能包含大量文件，只修复顶层目录（非递归）
+    for dir in "$USER_HOME/.cache" "$USER_HOME/.local" "$USER_HOME/.config"; do
+        if [ -d "$dir" ]; then
+            chmod o+rX "$dir" 2>/dev/null || true
+        fi
+    done
+
+    # ========== 保护敏感目录（如果存在）==========
+    # 确保 SSH 私钥等敏感文件权限严格
+    if [ -d "$USER_HOME/.ssh" ]; then
+        chmod 700 "$USER_HOME/.ssh" 2>/dev/null || true
+        find "$USER_HOME/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
+        log_success "  .ssh directory protected (700/600)"
+    fi
+
+    # ========== /app 目录权限（已在 Dockerfile 中设置，无需 chown） ==========
+    # 只确保 bin 目录可执行（使用 find 避免 glob 展开问题）
+    if [ -d /app/bin ]; then
+        find /app/bin -type f -exec chmod a+x {} + 2>/dev/null || true
+        log_success "  /app/bin executables set"
+    fi
+
+    # ========== Mesa 着色器缓存（使用 755 权限，符合最小权限原则） ==========
+    chmod 755 /tmp/mesa_shader_cache 2>/dev/null || true
+
+    log_success "Permissions fixed (optimized - no recursive chown on large directories)"
 
     # ========== 设置渲染相关环境变量（防止花屏）==========
     # 将 Mesa 着色器缓存移到 /tmp（不受 /home/user 挂载影响）
     export MESA_SHADER_CACHE_DIR="/tmp/mesa_shader_cache"
     export MESA_GLSL_CACHE_DIR="/tmp/mesa_shader_cache"
-    mkdir -p /tmp/mesa_shader_cache
-    chmod 777 /tmp/mesa_shader_cache
+    # 注意：目录创建和权限设置已在上面的权限修复部分完成 (Line 473, 516)
 
     # 将 X 认证文件移到 /tmp
     export XAUTHORITY="/tmp/.Xauthority"
