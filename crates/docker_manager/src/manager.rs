@@ -1242,7 +1242,7 @@ impl DockerManager {
         // 构建基础配置
         let mut builder = ContainerConfigBuilder::new(container_id)
             .image(image)
-            .name_prefix(service_type.container_prefix())
+            .name_prefix(service_config.container_prefix())
             .work_dir(service_config.work_dir.clone())
             .network_mode(service_config.network_mode.clone())
             .auto_remove(true);
@@ -1261,6 +1261,9 @@ impl DockerManager {
         } else {
             debug!("📌 [DOCKER_MANAGER] 跳过主挂载，使用 mounts 配置管理所有挂载点");
         }
+
+        // 先获取 container_prefix，因为后续字段会被移动
+        let container_prefix = service_config.container_prefix().to_string();
 
         // 应用资源限制
         let limits = service_config.resource_limits;
@@ -1311,16 +1314,16 @@ impl DockerManager {
         let network_name = self.get_main_network_name().await;
         builder = builder.network_name(network_name);
 
-        // 设置命令
+        // 🎯 处理配置文件中的挂载点 (service_config.mounts)
+        let container_name = format!("{}-{}", container_prefix, container_id);
+        let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+        let log_dir_name = format!("{}-{}", container_name, timestamp);
+
+        // 设置命令（放在获取 container_name 之后，因为会移动 service_config.command）
         builder = builder.command(service_config.command);
         if let Some(entry) = service_config.entrypoint {
             builder = builder.entrypoint(entry);
         }
-
-        // 🎯 处理配置文件中的挂载点 (service_config.mounts)
-        let container_name = format!("{}-{}", service_type.container_prefix(), container_id);
-        let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-        let log_dir_name = format!("{}-{}", container_name, timestamp);
 
         // 基础变量集
         let mut base_variables = variables.clone();
@@ -1545,7 +1548,17 @@ impl DockerManager {
         }
 
         // 2. 实时查询 Docker API (构造名称)
-        let prefix = service_type.container_prefix();
+        // 使用 service_config.container_prefix() 获取配置的前缀
+        let prefix = match self.get_service_config(service_type).await {
+            Ok(config) => config.container_prefix().to_string(),
+            Err(e) => {
+                warn!(
+                    "⚠️ [FIND_CONTAINER] 获取服务配置失败，使用默认前缀: service_type={:?}, error={}",
+                    service_type, e
+                );
+                service_type.container_prefix().to_string()
+            }
+        };
         let expected_container_name = format!("{}-{}", prefix, project_id);
 
         // 直接返回 find_container_realtime 的结果
@@ -1702,7 +1715,17 @@ impl DockerManager {
         }
 
         // 2. 实时查询 Docker API (构造名称)
-        let prefix = service_type.container_prefix();
+        // 使用 service_config.container_prefix() 获取配置的前缀
+        let prefix = match self.get_service_config(service_type).await {
+            Ok(config) => config.container_prefix().to_string(),
+            Err(e) => {
+                warn!(
+                    "⚠️ [FIND_CONTAINER] 获取服务配置失败，使用默认前缀: service_type={:?}, error={}",
+                    service_type, e
+                );
+                service_type.container_prefix().to_string()
+            }
+        };
         let expected_container_name = format!("{}-{}", prefix, user_id);
 
         // 直接返回 find_container_realtime 的结果
@@ -2262,6 +2285,9 @@ impl DockerManager {
     ) -> DockerResult<Vec<ContainerSummary>> {
         info!("🔍 查找匹配模式的容器: pattern={}", pattern);
 
+        // 🎯 获取当前容器的 ID（用于排除自己）
+        let current_container_id = std::env::var("HOSTNAME").ok();
+
         // 使用 Docker API 列出所有容器（包括停止的）
         let options = Some(ListContainersOptions {
             all: true,
@@ -2277,15 +2303,27 @@ impl DockerManager {
         // 创建过滤器
         let filter = ContainerFilter::name_pattern(pattern);
 
-        // 过滤容器
+        // 过滤容器，排除当前容器自己
         let matched_containers: Vec<ContainerSummary> = containers
             .clone()
             .into_iter()
-            .filter(|container| filter.matches(container))
+            .filter(|container| {
+                // 排除当前容器自己
+                if let Some(ref current_id) = current_container_id {
+                    if let Some(ref container_id) = container.id {
+                        // HOSTNAME 是容器 ID 的前 12 位
+                        if container_id.starts_with(current_id) {
+                            info!("🚫 跳过当前容器自己: {}", container_id);
+                            return false;
+                        }
+                    }
+                }
+                filter.matches(container)
+            })
             .collect();
 
         info!(
-            "✅ 容器查找完成: 总数={}, 匹配数={}, pattern={}",
+            "✅ 容器查找完成: 总数={}, 匹配数={} (已排除自身), pattern={}",
             containers.len(),
             matched_containers.len(),
             pattern

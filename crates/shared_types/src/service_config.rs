@@ -280,6 +280,20 @@ impl ServiceImageConfig {
         )
     }
 
+    /// 获取容器名称前缀
+    ///
+    /// 优先使用配置的 image_tag_prefix，否则使用 service_type 的默认前缀。
+    /// 这确保了容器创建和清理时使用一致的前缀。
+    ///
+    /// # Returns
+    ///
+    /// 容器名称前缀字符串
+    pub fn container_prefix(&self) -> &str {
+        self.image_tag_prefix
+            .as_deref()
+            .unwrap_or_else(|| self.service_type.container_prefix())
+    }
+
     /// 解析容器路径模板，进行变量替换
     ///
     /// 支持的变量:
@@ -392,7 +406,7 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
         amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
         default_image: Some("registry.yichamao.com/rcoder:latest".to_string()),
-        image_tag_prefix: Some("rcoder".to_string()),
+        image_tag_prefix: Some("rcoder-agent".to_string()),
         enabled: true, // 当前启用
         environment,
         mounts,
@@ -565,6 +579,28 @@ mod tests {
         assert!(summary.contains("rcoder"));
         assert!(summary.contains("Enabled: true"));
         assert!(summary.contains("registry.yichamao.com/rcoder"));
+    }
+
+    #[test]
+    fn test_container_prefix_with_image_tag_prefix() {
+        // 测试使用 image_tag_prefix 的情况
+        let config = default_agent_runner_service_config();
+        assert_eq!(config.container_prefix(), "rcoder-computer-agent-runner");
+    }
+
+    #[test]
+    fn test_container_prefix_fallback_to_service_type() {
+        // 测试没有 image_tag_prefix 时回退到 service_type 默认值
+        let mut config = default_rcoder_service_config();
+        config.image_tag_prefix = None;
+        assert_eq!(config.container_prefix(), "rcoder-agent");
+    }
+
+    #[test]
+    fn test_container_prefix_rcoder() {
+        // RCoder 配置使用 rcoder-agent 前缀
+        let config = default_rcoder_service_config();
+        assert_eq!(config.container_prefix(), "rcoder-agent");
     }
 
     #[test]
