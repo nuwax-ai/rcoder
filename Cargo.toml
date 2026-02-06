@@ -232,3 +232,7 @@ rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 # Pyroscope Continuous Profiling
 pyroscope = "0.5"
 pyroscope_pprofrs = "0.2"
+
+# Patch: 强制 pingora-lru 使用 arrayvec 0.7，修复编译问题
+[patch.crates-io]
+arrayvec = { version = "0.7" }
