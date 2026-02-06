@@ -933,7 +933,10 @@ impl PortProxy {
 
         // 3. 从 ApiKeyManager 查询 API 密钥配置
         let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
-            warn!("找不到服务 {} 的 API 密钥配置", service_name);
+            warn!("🔑 [API_PROXY] 找不到服务 '{}' 的 API 密钥配置", service_name);
+            // 打印所有可用的 key 用于调试
+            let available_keys: Vec<_> = self.api_key_manager.iter().map(|r| r.key().clone()).collect();
+            warn!("🔑 [API_PROXY] 可用的 keys: {:?}", available_keys);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
                 format!(
                     "找不到服务 {} 的 API 密钥配置，请确保已正确配置",
