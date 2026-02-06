@@ -129,6 +129,7 @@ futures = "0.3"
 futures-util = "0.3"
 itertools = "0.14"
 bytes = "1.11"
+arrayvec = "0.7"
 # collections = "0.2"  # 这个包不存在
 
 
@@ -230,7 +231,3 @@ rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 # Pyroscope Continuous Profiling
 pyroscope = "0.5"
 pyroscope_pprofrs = "0.2"
-
-# Patch: 强制 pingora-lru 使用 arrayvec 0.7，修复编译问题
-[patch.crates-io]
-arrayvec = "0.7"
