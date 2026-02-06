@@ -406,15 +406,48 @@ function initialize_user_home() {
     # 同时配置 /root 和 /home/user，因为：
     # - 以 root 用户运行时，某些进程可能读取 /root/.config
     # - 设置 HOME=/home/user 后，大部分进程读取 /home/user/.config
-    local GTK_CSS_CONTENT='/* Hide Thunar root warnings completely */
-.thunar-window infobar.warning { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-.thunar-window infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-.thunar-window infobar.warning button { min-height: 0; min-width: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-infobar.warning { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-/* Hide XFCE root warning */
-.root-warning { display: none !important; opacity: 0 !important; }
-.root-warning * { display: none !important; opacity: 0 !important; }
+    # 注意：只使用 GTK 3.0 支持的 CSS 属性，避免解析警告
+    local GTK_CSS_CONTENT='/* Hide Thunar root warnings - GTK 3.0 compatible */
+.thunar-window infobar.warning {
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+.thunar-window infobar.warning * {
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+.thunar-window infobar.warning button {
+    min-height: 0;
+    min-width: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+infobar.warning {
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+infobar.warning * {
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+/* Hide XFCE root warning - using opacity instead of display */
+.root-warning {
+    opacity: 0 !important;
+    min-height: 0;
+}
+.root-warning * {
+    opacity: 0 !important;
+    min-height: 0;
+}
 '
     # 为 /root 创建配置
     mkdir -p /root/.config/gtk-3.0
@@ -425,6 +458,22 @@ infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity
     mkdir -p "$USER_HOME/.config/gtk-3.0"
     echo "$GTK_CSS_CONTENT" > "$USER_HOME/.config/gtk-3.0/gtk.css"
     log_success "  GTK CSS created for $USER_HOME"
+
+    # ========== 抑制 gnome-keyring 模块加载告警 ==========
+    # 容器中未安装 gnome-keyring，配置 GTK 不尝试加载该模块
+    # 创建 GTK 模块配置，禁用 gnome-keyring-pkcs11
+    mkdir -p /root/.config/gtk-3.0
+    cat > /root/.config/gtk-3.0/settings.ini <<'EOF'
+[Settings]
+gtk-modules=
+EOF
+
+    mkdir -p "$USER_HOME/.config/gtk-3.0"
+    cat > "$USER_HOME/.config/gtk-3.0/settings.ini" <<'EOF'
+[Settings]
+gtk-modules=
+EOF
+    log_success "  GTK module config created (gnome-keyring disabled)"
 
     # ========== 设置 Chromium 为默认浏览器（解决 xdg-open 无法打开浏览器问题）==========
     log "Configuring Chromium as default web browser..."
