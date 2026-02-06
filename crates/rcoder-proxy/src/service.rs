@@ -557,6 +557,7 @@ impl ProxyHttp for PortProxy {
             ALPN::H2 => "HTTP/2 (H2)",
             ALPN::H2H1 => "HTTP/2 优先 (H2H1)",
             ALPN::H1 => "HTTP/1.1 (H1)",
+            ALPN::Custom(_) => "Custom ALPN",
         };
         ctx.http_version = Some(alpn_str.to_string());
 
@@ -1107,6 +1108,7 @@ impl PortProxy {
             ALPN::H2 => "H2",
             ALPN::H2H1 => "H2H1",
             ALPN::H1 => "H1",
+            ALPN::Custom(_) => "Custom",
         };
         info!(
             "🔗 [API_PROXY] {} -> {}:{} (TLS: {}, ALPN: {})",
