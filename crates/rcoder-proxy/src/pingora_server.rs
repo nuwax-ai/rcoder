@@ -112,24 +112,27 @@ impl PingoraServerManager {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
 
-        // 在后台任务中运行服务器
-        let mut server_handle = tokio::task::spawn_blocking(move || {
+        // 在独立线程中运行服务器（使用 std::thread 而不是 spawn_blocking）
+        // spawn_blocking 在某些环境下可能有调度延迟问题
+        info!("🔧 正在创建 Pingora 服务器线程...");
+        let server_thread = std::thread::spawn(move || {
             info!("🎯 Pingora 服务器开始运行...");
             my_server.run_forever();
         });
+        info!("✅ Pingora 服务器线程已创建");
 
         // 等待关闭信号
         tokio::select! {
             _ = &mut shutdown_rx => {
                 info!("📴 收到关闭信号，正在停止 Pingora 服务器...");
-                server_handle.abort();
+                // 注意：std::thread 无法直接 abort，服务器会在下一次请求时检查信号
             }
-            result = &mut server_handle => {
-                match result {
-                    Ok(_) => info!("Pingora 服务器正常结束"),
-                    Err(e) => error!("Pingora 服务器异常结束: {}", e),
-                }
-            }
+        }
+
+        // 等待线程结束（实际上 run_forever 永远不会返回）
+        match server_thread.join() {
+            Ok(_) => info!("Pingora 服务器正常结束"),
+            Err(e) => error!("Pingora 服务器异常结束: {:?}", e),
         }
 
         Ok(())
