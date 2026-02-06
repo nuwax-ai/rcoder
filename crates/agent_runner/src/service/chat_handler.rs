@@ -29,6 +29,8 @@ use crate::AgentRuntime;
 pub struct ChatHandlerInput {
     /// 项目 ID
     pub project_id: String,
+    /// 项目工作目录（由调用方根据环境决定）
+    pub project_dir: PathBuf,
     /// 会话 ID（可选，用于复用会话）
     pub session_id: Option<String>,
     /// 用户提示词
@@ -209,24 +211,12 @@ pub async fn handle_chat_core(
         }
     }
 
-    // ========== 步骤5: 解析 service_type 和工作目录 ==========
-    let project_dir = match input.service_type {
-        ServiceType::ComputerAgentRunner => {
-            // ComputerAgentRunner 模式：/home/user/{project_id}
-            let workspace_path = PathBuf::from("/home/user").join(&project_id);
-            info!(
-                "[ChatHandler] ComputerAgentRunner 工作目录: {:?}",
-                workspace_path
-            );
-            workspace_path
-        }
-        ServiceType::RCoder => {
-            // RCoder 模式：./project_workspace/{project_id}
-            let workspace_path = PathBuf::from("./project_workspace").join(&project_id);
-            info!("[ChatHandler] RCoder 工作目录: {:?}", workspace_path);
-            workspace_path
-        }
-    };
+    // ========== 步骤5: 获取项目工作目录 ==========
+    let project_dir = input.project_dir.clone();
+    info!(
+        "[ChatHandler] 项目工作目录: {:?}, service_type={:?}",
+        project_dir, input.service_type
+    );
 
     // 确保目录存在
     if !project_dir.exists() {

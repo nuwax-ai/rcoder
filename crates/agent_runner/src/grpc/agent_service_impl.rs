@@ -276,10 +276,23 @@ impl AgentService for AgentServiceImpl {
             })
             .unwrap_or(shared_types::ServiceType::RCoder);
 
+        // 2.1 根据 service_type 计算项目目录（服务端容器内路径）
+        let project_dir = match service_type {
+            shared_types::ServiceType::ComputerAgentRunner => {
+                // ComputerAgentRunner 模式：/home/user/{project_id}
+                std::path::PathBuf::from("/home/user").join(&project_id)
+            }
+            shared_types::ServiceType::RCoder => {
+                // RCoder 模式：./project_workspace/{project_id}
+                std::path::PathBuf::from("./project_workspace").join(&project_id)
+            }
+        };
+
         // 3. 构建 ChatHandlerInput（类型转换）
         use crate::service::{handle_chat_core, ChatHandlerContext, ChatHandlerInput};
         let input = ChatHandlerInput {
             project_id,
+            project_dir,
             session_id,
             prompt: req.prompt,
             request_id,
