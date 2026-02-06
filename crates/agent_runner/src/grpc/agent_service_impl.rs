@@ -29,11 +29,9 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::model::AgentStatus;
-use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
-use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
-use shared_types::ChatPromptBuilder;
 
 /// Convert gRPC ModelProviderConfig to internal ModelProviderConfig
 fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProviderConfig {
@@ -246,6 +244,7 @@ impl AgentService for AgentServiceImpl {
             return Err(Status::invalid_argument("prompt field cannot be empty"));
         }
 
+        // 1. 准备参数
         let project_id = if req.project_id.is_empty() {
             uuid::Uuid::new_v4().to_string().replace("-", "")
         } else {
@@ -258,76 +257,12 @@ impl AgentService for AgentServiceImpl {
             Some(req.session_id.clone())
         };
 
-        // 🆕 Check Agent status, prohibit concurrent requests (优先通过 session_id 查找)
-        // 策略：
-        // 1. 如果提供了 session_id，先尝试通过 session_id 查找 Agent
-        // 2. 如果找不到，再通过 project_id 查找
-        // 3. 检查 Active 和 Pending 状态
-        let agent_info_ref = if let Some(ref sid) = session_id {
-            // 优先通过 session_id 查找
-            info!("🔍 [gRPC] 通过 session_id 查找 Agent: session_id={}", sid);
-            AGENT_REGISTRY.get_agent_info_by_session(sid)
-        } else {
-            // 通过 project_id 查找
-            None
-        };
+        let request_id = req
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace("-", ""));
 
-        let agent_info_ref = agent_info_ref.or_else(|| {
-            info!(
-                "🔍 [gRPC] 通过 project_id 查找 Agent: project_id={}",
-                project_id
-            );
-            AGENT_REGISTRY.get_agent_info(&project_id)
-        });
-
-        if let Some(agent_info) = agent_info_ref
-            && (agent_info.status == AgentStatus::Active
-                || agent_info.status == AgentStatus::Pending)
-        {
-            // 🎯 Use business response to return error code instead of gRPC Status error
-            // This allows rcoder to directly read error code from error_code field
-            info!(
-                "🚫 [gRPC] Agent Busy returning 9010 error: project_id={}, status={:?}, session_id={:?}",
-                project_id, agent_info.status, session_id
-            );
-            return Ok(Response::new(GrpcChatResponse {
-                project_id: project_id.clone(),
-                session_id: session_id.unwrap_or_default(),
-                success: false,
-                error: Some("Agent 正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
-                error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
-                request_id: req.request_id.clone(),
-                // 🆕 Agent Busy does not need degradation
-                need_fallback: false,
-                fallback_reason: None,
-            }));
-        }
-
-        // 🔥 P0 修复: 使用 PendingGuard RAII 模式管理 Pending 状态
-        // 自动在作用域结束时清理，避免状态泄漏
-        let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
-        info!("🛡️ [gRPC] 创建 PendingGuard: project_id={}", project_id);
-
-        // 🔥 修复：只在 session 不存在时才清理无效的 session_id
-        // 问题：旧代码无条件移除用户指定的 session，导致无法复用
-        // 修复后：检查 session 是否存在于 AGENT_REGISTRY 中
-        // - 如果存在 → 复用 session，不清理
-        // - 如果不存在 → 清理 SESSION_CACHE 中的无效条目
-        if let Some(ref sid) = session_id {
-            // 检查 session 是否存在于 AGENT_REGISTRY 中
-            let session_exists = AGENT_REGISTRY.contains_session(sid);
-
-            if !session_exists && SESSION_CACHE.remove(sid).is_some() {
-                info!(
-                    "🗑️ [gRPC] session 不存在，移除无效 session: session_id={}",
-                    sid
-                );
-            } else if session_exists {
-                info!("♻️ [gRPC] 复用已存在的 session: session_id={}", sid);
-            }
-        }
-
-        // 解析 service_type（默认为 RCoder）
+        // 2. 解析 service_type（默认为 RCoder）
         let service_type = req
             .service_type
             .as_ref()
@@ -341,181 +276,48 @@ impl AgentService for AgentServiceImpl {
             })
             .unwrap_or(shared_types::ServiceType::RCoder);
 
-        debug!("🔧 [gRPC] 使用 service_type: {:?}", service_type);
-
-        // 获取或创建项目工作目录（根据 service_type 使用不同路径）
-        let project_dir = match service_type {
-            shared_types::ServiceType::ComputerAgentRunner => {
-                // ComputerAgentRunner 模式：/home/user/{project_id}
-                // 注意：/home/user 是宿主机 computer-project-workspace/{user_id} 的挂载点
-                let workspace_path = std::path::PathBuf::from("/home/user").join(&project_id);
-
-                info!(
-                    "📁 [gRPC] ComputerAgentRunner 工作目录: {:?}",
-                    workspace_path
-                );
-
-                workspace_path
-            }
-            shared_types::ServiceType::RCoder => {
-                // RCoder 模式：./project_workspace/{project_id}
-                let workspace_path =
-                    std::path::PathBuf::from("./project_workspace").join(&project_id);
-
-                info!("📁 [gRPC] RCoder 工作目录: {:?}", workspace_path);
-
-                workspace_path
-            }
+        // 3. 构建 ChatHandlerInput（类型转换）
+        use crate::service::{handle_chat_core, ChatHandlerContext, ChatHandlerInput};
+        let input = ChatHandlerInput {
+            project_id,
+            session_id,
+            prompt: req.prompt,
+            request_id,
+            attachments: convert_attachments(req.attachments),
+            data_source_attachments: req.data_source_attachments,
+            model_config: req.model_config.map(convert_model_provider),
+            service_type,
+            agent_config_override: req.agent_config.map(convert_agent_config),
+            system_prompt_override: req.system_prompt,
+            user_prompt_template_override: req.user_prompt,
         };
 
-        // 确保目录存在
-        if !project_dir.exists() {
-            tokio::fs::create_dir_all(&project_dir)
-                .await
-                .map_err(|e| Status::internal(format!("创建项目目录失败: {}", e)))?;
-        }
-
-        // 生成 request_id
-        let request_id = req
-            .request_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace("-", ""));
-
-        // 转换新增的配置字段 (v2)
-        let agent_config_override = req.agent_config.map(convert_agent_config);
-
-        // 构建 ChatPrompt（包含新增的 override 字段）
-        let chat_prompt = ChatPromptBuilder::default()
-            .project_id(project_id.clone())
-            .project_path(project_dir)
-            .session_id(session_id.clone())
-            .prompt(req.prompt)
-            .attachments(convert_attachments(req.attachments))
-            .data_source_attachments(req.data_source_attachments)
-            .service_type(service_type) // ✅ 使用从请求中解析的 service_type
-            .request_id(request_id.clone())
-            // 新增字段 (v2)
-            .system_prompt_override(req.system_prompt)
-            .user_prompt_template_override(req.user_prompt)
-            .agent_config_override(agent_config_override)
-            .build()
-            .map_err(|e| Status::internal(format!("构建 ChatPrompt 失败: {}", e)))?;
-
-        // 转换为 PromptMessage
-        let prompt_message = agent_abstraction::PromptMessage::from(chat_prompt);
-
-        // 转换 model_provider
-        let model_provider = req.model_config.map(convert_model_provider);
-
-        // 🔥 生成唯一的 service UUID（用于 API 密钥管理）
-        let service_uuid = if model_provider.is_some() {
-            Some(uuid::Uuid::new_v4().to_string())
-        } else {
-            None
+        // 4. 构建 ChatHandlerContext
+        let context = ChatHandlerContext {
+            agent_runtime: self.app_state.agent_runtime.clone(),
+            shared_api_key_manager: self.app_state.shared_api_key_manager.clone(),
+            project_uuid_map: self.app_state.project_uuid_map.clone(),
         };
 
-        // 🔥 同时解构 model_provider 和 service_uuid，避免 unwrap
-        if let (Some(ref provider), Some(ref service_uuid_ref)) = (model_provider.as_ref(), service_uuid.as_ref()) {
-            debug!(
-                "📝 [gRPC] 使用模型配置: provider={}, model={}, base_url={}, api_protocol={:?}, requires_openai_auth={}, service_uuid={}",
-                provider.name,
-                provider.default_model,
-                provider.base_url,
-                provider.api_protocol,
-                provider.requires_openai_auth,
-                service_uuid_ref
-            );
+        // 5. 调用共享 handler
+        let output = handle_chat_core(input, &context).await;
 
-            // 🔒 存储 ModelProviderConfig 到共享 DashMap（使用 UUID 作为 key）
-            // key: UUID, value: ModelProviderConfig
-            self.app_state
-                .shared_api_key_manager
-                .insert(service_uuid_ref.to_string(), (*provider).clone());
-
-            // 🔒 存储 project_id -> UUID 映射（用于后续清理时查找）
-            // 使用独立的 DashMap，类型清晰，key 使用 project_id 便于清理时查找
-            self.app_state
-                .project_uuid_map
-                .insert(project_id.clone(), service_uuid_ref.to_string());
-
-            // ✅ ApiKeyManager 现在是 shared_api_key_manager 的包装器，不需要单独写入
-
-            info!(
-                "🔑 [gRPC] 已存储 API 配置: service_uuid={}, provider_name={}, base_url={}",
-                service_uuid_ref,
-                provider.name,
-                shared_types::mask_url(&provider.base_url)
-            );
-        } else {
-            warn!("⚠️ [gRPC] 未提供模型配置，将使用环境变量或默认配置");
-        }
-
-        // 创建请求并设置 UUID 和密钥管理器
-        let (local_task_request, chat_prompt_rx) =
-            AgentRequest::new(prompt_message, model_provider);
-        let local_task_request = local_task_request
-            .with_service_uuid(service_uuid)
-            .with_key_manager(Some(self.app_state.shared_api_key_manager.clone()));
-
-        // 🆕 Check worker state
-        use crate::agent_runtime::WorkerState;
-        match self.app_state.agent_runtime.state() {
-            WorkerState::Running => {
-                // Normal operation, continue processing
-            }
-            WorkerState::Starting => {
-                warn!("⚠️ [gRPC] Agent Worker is starting, requests may be delayed");
-            }
-            WorkerState::Stopping | WorkerState::Stopped => {
-                // 🔥 PendingGuard 自动清理（在 drop 时）
-                // Worker not available
-                return Err(Status::unavailable(
-                    "Agent Worker is not available, restarting. Please try again later",
-                ));
-            }
-        }
-
-        // 🆕 Use runtime to send (with state check)
-        if let Err(e) = self.app_state.agent_runtime.send(local_task_request).await {
-            // 🔥 PendingGuard 自动清理（在 drop 时）
-            return Err(Status::internal(format!("Failed to send task: {}", e)));
-        }
-
-        // Wait for response
-        let grpc_response = match chat_prompt_rx.await {
-            Ok(response) => {
-                let grpc_resp = GrpcChatResponse {
-                    project_id: response.project_id,
-                    session_id: response.session_id,
-                    success: response.error.is_none(),
-                    error: response.error,
-                    error_code: if response.code != shared_types::error_codes::SUCCESS {
-                        Some(response.code)
-                    } else {
-                        None
-                    },
-                    request_id: Some(request_id),
-                    need_fallback: false,
-                    fallback_reason: None,
-                };
-
-                info!("✅ [gRPC] Chat completed: success={}", grpc_resp.success);
-
-                // 🔥 P0 修复: 请求成功，提交 PendingGuard 保留 Pending 状态
-                // Agent 已成功启动，Pending 状态将由后续操作转换为 Active
-                pending_guard.commit_success();
-
-                grpc_resp
-            }
-            Err(e) => {
-                error!("❌ [gRPC] Chat failed: {}", e);
-                // 🔥 PendingGuard 自动清理（在 drop 时）
-                return Err(Status::internal(format!(
-                    "Failed to process request: {}",
-                    e
-                )));
-            }
+        // 6. 转换为 gRPC 响应
+        let grpc_response = GrpcChatResponse {
+            project_id: output.project_id,
+            session_id: output.session_id,
+            success: output.success,
+            error: output.error,
+            error_code: output.error_code,
+            request_id: output.request_id,
+            need_fallback: output.need_fallback,
+            fallback_reason: output.fallback_reason,
         };
+
+        info!(
+            "✅ [gRPC] Chat 完成: success={}",
+            grpc_response.success
+        );
 
         Ok(Response::new(grpc_response))
     }
