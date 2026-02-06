@@ -129,6 +129,8 @@ futures = "0.3"
 futures-util = "0.3"
 itertools = "0.14"
 bytes = "1.11"
+# 强制 arrayvec 使用 0.7 版本，修复 pingora-lru 依赖问题
+arrayvec = "0.7"
 # collections = "0.2"  # 这个包不存在
 
 
