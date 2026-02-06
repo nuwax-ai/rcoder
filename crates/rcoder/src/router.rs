@@ -165,11 +165,6 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         // 进度流复用现有的 agent_session_notification
         .route(
             "/computer/progress/{session_id}",
-            get(handler::agent_session_notification),
-        )
-        // computer agent 专用进度流接口（使用与 agent_session_notification 相同的逻辑）
-        .route(
-            "/computer/agent/progress/{session_id}",
             get(handler::computer_agent_progress_notification),
         )
         // VNC 桌面访问说明接口
