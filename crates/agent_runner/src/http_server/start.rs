@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::agent_runtime::AgentRuntime;
@@ -156,45 +155,62 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
         pingora_shutdown: pingora_shutdown.clone(),
     };
 
-    // 用于接收关闭信号
+    // 用于接收关闭信号的 Arc 引用
     let http_shutdown_flag = http_shutdown.clone();
     let pingora_shutdown_flag = pingora_shutdown.clone();
 
+    // HTTP 服务任务
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = axum::serve(listener, app) => {
-                    warn!("HTTP 服务已停止");
-                    break;
-                }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if http_shutdown_flag.load(Ordering::SeqCst) {
-                        warn!("收到 HTTP 关闭信号");
-                        break;
-                    }
-                }
+        let shutdown_rx = http_shutdown_flag.clone();
+        let shutdown_rx2 = pingora_shutdown_flag.clone();
+
+        tokio::select! {
+            _ = axum::serve(listener, app) => {
+                warn!("HTTP 服务已停止");
             }
+            _ = async {
+                // 轮询检查关闭信号
+                while !shutdown_rx.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                warn!("收到 HTTP 关闭信号");
+            } => {}
+            _ = async {
+                // 监听 Pingora 关闭信号（如果 Pingora 先关闭，HTTP 也退出）
+                while !shutdown_rx2.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                warn!("收到 Pingora 关闭信号");
+            } => {}
         }
     });
 
-    tokio::spawn(async move {
-        if let Some(result) = pingora_result {
-            loop {
-                tokio::select! {
-                    _ = result.handle => {
-                        warn!("Pingora 代理服务已停止");
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        if pingora_shutdown_flag.load(Ordering::SeqCst) {
-                            warn!("收到 Pingora 关闭信号");
-                            break;
-                        }
-                    }
+    // Pingora 服务任务
+    if let Some(result) = pingora_result {
+        let shutdown_rx = pingora_shutdown_flag.clone();
+        let http_shutdown_rx = http_shutdown_flag.clone();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = result.handle => {
+                    warn!("Pingora 代理服务已停止");
                 }
+                _ = async {
+                    while !shutdown_rx.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    warn!("收到 Pingora 关闭信号");
+                } => {}
+                _ = async {
+                    // 同时监听 HTTP 关闭信号
+                    while !http_shutdown_rx.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    warn!("收到 HTTP 关闭信号");
+                } => {}
             }
-        }
-    });
+        });
+    }
 
     Ok(handle)
 }
