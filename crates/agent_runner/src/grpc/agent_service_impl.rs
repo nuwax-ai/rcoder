@@ -29,8 +29,9 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::model::AgentStatus;
+use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
-use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
 
 /// Convert gRPC ModelProviderConfig to internal ModelProviderConfig
@@ -257,6 +258,65 @@ impl AgentService for AgentServiceImpl {
             Some(req.session_id.clone())
         };
 
+        // 🔒 Agent Busy 检查：禁止并发请求
+        // 策略：
+        // 1. 如果提供了 session_id，先尝试通过 session_id 查找 Agent
+        // 2. 如果找不到，再通过 project_id 查找
+        // 3. 检查 Active 和 Pending 状态
+        let agent_info_ref = if let Some(ref sid) = session_id {
+            info!("🔍 [gRPC] 通过 session_id 查找 Agent: session_id={}", sid);
+            AGENT_REGISTRY.get_agent_info_by_session(sid)
+        } else {
+            None
+        };
+
+        let agent_info_ref = agent_info_ref.or_else(|| {
+            info!(
+                "🔍 [gRPC] 通过 project_id 查找 Agent: project_id={}",
+                project_id
+            );
+            AGENT_REGISTRY.get_agent_info(&project_id)
+        });
+
+        if let Some(agent_info) = agent_info_ref
+            && (agent_info.status == AgentStatus::Active
+                || agent_info.status == AgentStatus::Pending)
+        {
+            info!(
+                "🚫 [gRPC] Agent Busy 返回 9010 错误: project_id={}, status={:?}, session_id={:?}",
+                project_id, agent_info.status, session_id
+            );
+            return Ok(Response::new(GrpcChatResponse {
+                project_id: project_id.clone(),
+                session_id: session_id.unwrap_or_default(),
+                success: false,
+                error: Some("Agent 正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
+                error_code: Some(shared_types::error_codes::ERR_AGENT_BUSY.to_string()),
+                request_id: req.request_id.clone(),
+                need_fallback: false,
+                fallback_reason: None,
+            }));
+        }
+
+        // 🔥 使用 PendingGuard RAII 模式管理 Pending 状态
+        // 自动在作用域结束时清理，避免状态泄漏
+        let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
+        info!("🛡️ [gRPC] 创建 PendingGuard: project_id={}", project_id);
+
+        // 🔥 session 清理：只在 session 不存在于 AGENT_REGISTRY 时清理
+        if let Some(ref sid) = session_id {
+            let session_exists = AGENT_REGISTRY.contains_session(sid);
+
+            if !session_exists && SESSION_CACHE.remove(sid).is_some() {
+                info!(
+                    "🗑️ [gRPC] session 不存在，移除无效 session: session_id={}",
+                    sid
+                );
+            } else if session_exists {
+                info!("♻️ [gRPC] 复用已存在的 session: session_id={}", sid);
+            }
+        }
+
         let request_id = req
             .request_id
             .clone()
@@ -314,6 +374,10 @@ impl AgentService for AgentServiceImpl {
 
         // 5. 调用共享 handler
         let output = handle_chat_core(input, &context).await;
+
+        // 🔥 请求成功，提交 PendingGuard 保留 Pending 状态
+        // Agent 已成功启动，Pending 状态将由后续操作转换为 Active
+        pending_guard.commit_success();
 
         // 6. 转换为 gRPC 响应
         let grpc_response = GrpcChatResponse {

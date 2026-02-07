@@ -9,6 +9,8 @@ use tracing::{error, info};
 use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
 use crate::service::chat_handler::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
+use crate::service::{SESSION_CACHE, SessionData};
+use dashmap::mapref::entry::Entry;
 use shared_types::{ChatResponse, ComputerChatRequest, HttpResult, ServiceType};
 
 /// 处理 Computer Agent Chat 请求
@@ -46,10 +48,11 @@ pub async fn handle_computer_chat(
 
     let user_id = request.user_id.clone();
 
-    // 2. 生成或使用提供的 project_id
+    // 2. 生成或使用提供的 project_id (直接用 UUID，去掉连字符，与 rcoder 保持一致)
     let project_id = request
         .project_id
-        .unwrap_or_else(|| format!("computer-{}-{}", user_id, uuid::Uuid::new_v4()));
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
 
     // 3. 自动查找现有 session_id (如果未提供)
     let session_id = request.session_id.or_else(|| {
@@ -100,6 +103,21 @@ pub async fn handle_computer_chat(
 
     // 8. 调用核心 Chat 处理逻辑
     let output = handle_chat_core(input, &context).await;
+
+    // 🔧 关键修复：将 session 写入 SESSION_CACHE（SSE 进度流需要从这里读取）
+    let session_id_str = output.session_id.clone();
+    match SESSION_CACHE.entry(session_id_str.clone()) {
+        Entry::Occupied(entry) => {
+            info!("[HTTP] SESSION_CACHE 已存在，复用: session_id={}", session_id_str);
+            entry.get().clone()
+        }
+        Entry::Vacant(entry) => {
+            let data = SessionData::new(1000);
+            info!("[HTTP] SESSION_CACHE 新建: session_id={}", session_id_str);
+            entry.insert(data.clone());
+            data
+        }
+    };
 
     // 9. 构建响应
     let response = ChatResponse {
