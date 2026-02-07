@@ -44,13 +44,15 @@ impl HttpServerHandle {
     pub async fn stop(self) {
         info!("正在停止 HTTP 服务器...");
 
-        // 发送 HTTP 关闭信号
+        // 发送 HTTP 关闭信号 (需要 clone Arc 以支持 Copy)
         if let Some(tx) = self.http_shutdown {
+            let tx = (*tx).clone();
             let _ = tx.send(());
         }
 
-        // 发送 Pingora 关闭信号
+        // 发送 Pingora 关闭信号 (需要 clone Arc 以支持 Copy)
         if let Some(tx) = self.pingora_shutdown {
+            let tx = (*tx).clone();
             let _ = tx.send(());
         }
 
