@@ -32,16 +32,31 @@ pub async fn handle_computer_chat(
     Json(request): Json<ComputerChatRequest>,
 ) -> Result<Json<HttpResult<ChatResponse>>, (StatusCode, Json<HttpResult<ChatResponse>>)> {
     info!(
-        "📨 [HTTP] 收到 Computer Chat 请求: user_id={:?}, project_id={:?}, session_id={:?}, prompt_len={}, attachments={}, has_model_config={}, has_agent_config={}",
+        "📨 [HTTP] 收到 Computer Chat 请求:\n\
+         ├─ user_id: {:?}\n\
+         ├─ project_id: {:?}\n\
+         ├─ session_id: {:?}\n\
+         ├─ request_id: {:?}\n\
+         ├─ prompt ({}字符): {:?}\n\
+         ├─ attachments: {:?}\n\
+         ├─ data_source_attachments: {:?}\n\
+         ├─ model_provider: {:#?}\n\
+         ├─ agent_config: {:#?}\n\
+         ├─ system_prompt: {:?}\n\
+         └─ user_prompt: {:?}",
         request.user_id,
         request.project_id,
         request.session_id,
+        request.request_id,
         request.prompt.len(),
-        request.attachments.len(),
-        request.model_provider.is_some(),
-        request.agent_config.is_some()
+        request.prompt,
+        request.attachments,
+        request.data_source_attachments,
+        request.model_provider,
+        request.agent_config,
+        request.system_prompt,
+        request.user_prompt
     );
-    info!("📝 [HTTP] 请求详情: prompt={:?}", request.prompt);
 
     // 1. 验证必填字段
     if request.user_id.is_empty() {
