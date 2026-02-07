@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::CancellationToken;
+use tokio_util::sync::CancellationToken;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -162,27 +162,9 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
 
     // 2. 启动 Pingora 代理服务（如果配置了）
     if let Some(proxy_config) = &config.app_config.proxy_config {
-        let mut result = start_pingora(proxy_config, config.shared_api_key_manager.clone());
-        let pingora_token = shutdown_token.child_token();
-        let pingora_handle = result.handle;
-
+        let result = start_pingora(proxy_config, config.shared_api_key_manager.clone());
         // 保存 Pingora 结果以便后续调用 stop
         *pingora_result.lock().await = Some(result);
-
-        // 启动 Pingora 监控任务
-        join_set.lock().await.spawn(async move {
-            tokio::select! {
-                result = pingora_handle => {
-                    match result {
-                        Ok(()) => info!("Pingora 服务正常退出"),
-                        Err(e) => error!("Pingora 服务错误: {:?}", e),
-                    }
-                }
-                _ = pingora_token.cancelled() => {
-                    info!("Pingora 服务收到关闭信号");
-                }
-            }
-        });
     } else {
         info!("Pingora 代理服务未配置，跳过启动");
     }
@@ -214,17 +196,19 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
 
     // 6. 启动 HTTP 服务任务
     let http_token = shutdown_token.child_token();
+    // 将 listener 和 app 移入任务中
+    let http_app = app;
+    let http_listener = listener;
     join_set.lock().await.spawn(async move {
-        tokio::select! {
-            result = axum::serve(listener, app) => {
-                match result {
-                    Ok(()) => info!("HTTP 服务正常退出"),
-                    Err(e) => error!("HTTP 服务错误: {:?}", e),
-                }
-            }
-            _ = http_token.cancelled() => {
-                info!("HTTP 服务收到关闭信号");
-            }
+        // 使用 graceful shutdown wrapper
+        let server = axum::serve(http_listener, http_app)
+            .with_graceful_shutdown(async move {
+                let _ = http_token.cancelled().await;
+            });
+
+        match server.await {
+            Ok(()) => info!("HTTP 服务正常退出"),
+            Err(e) => error!("HTTP 服务错误: {:?}", e),
         }
     });
 

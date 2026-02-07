@@ -407,9 +407,9 @@ async fn main() -> anyhow::Result<()> {
         // 等待 gRPC 服务
         let _ = grpc_handle.await;
 
-        // 等待 Pingora 服务
-        if let Some(result) = pingora_result {
-            let _ = result.handle.await;
+        // 停止 Pingora 服务
+        if let Some(mut result) = pingora_result {
+            result.stop().await;
         }
 
         Ok(())

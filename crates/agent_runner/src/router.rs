@@ -3,10 +3,8 @@ use std::sync::Arc;
 use axum::{Router, routing::get, response::IntoResponse};
 use dashmap::DashMap;
 use serde::Serialize;
-use tokio::sync::mpsc;
-
 use crate::agent_runtime::AgentRuntime;
-use crate::{config::AppConfig, handler, proxy_agent::AgentRequest};
+use crate::{config::AppConfig, handler};
 use rcoder_telemetry::{TelemetryGuard, HttpMetricsLayer};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;

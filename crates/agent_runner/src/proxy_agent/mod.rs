@@ -18,19 +18,15 @@ use crate::config::ProxyConfig;
 
 /// Pingora 启动结果
 pub struct PingoraStartResult {
-    /// Pingora 服务句柄
-    pub handle: tokio::task::JoinHandle<()>,
     /// Pingora 服务器管理器包装器（用于发送关闭信号）
-    server_manager: Option<Arc<tokio::sync::Mutex<PingoraServerManager>>>,
+    server_manager: Arc<tokio::sync::Mutex<PingoraServerManager>>,
 }
 
 impl PingoraStartResult {
     /// 停止 Pingora 服务器
     pub async fn stop(&mut self) {
-        if let Some(manager) = self.server_manager.take() {
-            let mut guard = manager.lock().await;
-            let _ = guard.stop().await;
-        }
+        let mut guard = self.server_manager.lock().await;
+        let _ = guard.stop().await;
     }
 }
 
@@ -77,7 +73,7 @@ pub fn start_pingora(
     let server_manager_for_spawn = server_manager.clone();
 
     // 在后台任务中启动 Pingora
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         // 从 Arc<Mutex<...>> 中获取锁并启动
         let mut guard = server_manager_for_spawn.lock().await;
         if let Err(e) = guard.start().await {
@@ -88,8 +84,7 @@ pub fn start_pingora(
     info!("✅ Pingora 代理服务已启动在端口 {}", proxy_config.listen_port);
 
     PingoraStartResult {
-        handle,
-        server_manager: Some(server_manager),
+        server_manager,
     }
 }
 

@@ -29,7 +29,6 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::model::AgentStatus;
-use crate::proxy_agent::AgentRequest;
 use crate::router::AppState;
 use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
@@ -654,9 +653,6 @@ impl AgentService for AgentServiceImpl {
             (status, cancel_tx)
         };
 
-        // 🆕 Variable to store success message if cancellation is successful (idempotent or executed)
-        let mut cancel_success_message: Option<String> = None;
-
         // 🆕 ===== Idempotency check and channel validity verification =====
         match status {
             AgentStatus::Idle => {
@@ -665,7 +661,11 @@ impl AgentService for AgentServiceImpl {
                     "✅ [gRPC] Agent already in Idle status, cancel request idempotent success: project_id={}, session_id={}",
                     project_id, actual_session_id
                 );
-                cancel_success_message = Some("Agent already in idle status".to_string());
+                return Ok(Response::new(CancelResponse {
+                    success: true,
+                    result: CancelResultType::CancelResultSuccess as i32,
+                    message: Some("Agent already in idle status".to_string()),
+                }));
             }
             AgentStatus::Terminating => {
                 // Already stopping, no need to cancel again (idempotent return)
@@ -673,7 +673,11 @@ impl AgentService for AgentServiceImpl {
                     "✅ [gRPC] Agent already stopping, cancel request idempotent success: project_id={}, session_id={}",
                     project_id, actual_session_id
                 );
-                cancel_success_message = Some("Agent is already stopping".to_string());
+                return Ok(Response::new(CancelResponse {
+                    success: true,
+                    result: CancelResultType::CancelResultSuccess as i32,
+                    message: Some("Agent is already stopping".to_string()),
+                }));
             }
             AgentStatus::Active | AgentStatus::Pending => {
                 // Normal flow: continue with cancellation
@@ -741,7 +745,7 @@ impl AgentService for AgentServiceImpl {
                 );
 
                 if is_success {
-                    cancel_success_message = Some("取消成功".to_string());
+                    // 取消成功，继续后续清理逻辑
                 } else {
                     // 取消失败，Agent 可能还在运行，不发送 SessionPromptEnd
                     return Ok(Response::new(CancelResponse {
@@ -860,9 +864,9 @@ impl AgentService for AgentServiceImpl {
             }
         }; // match tokio::time::timeout
 
-        // 🆕 Unified Success Handler: If cancellation was successful (or idempotent)
-        if let Some(message) = cancel_success_message {
-            // Proactively send SessionPromptEnd message to notify SSE client task was canceled
+        // 取消成功后的统一清理逻辑
+        {
+            // 主动发送 SessionPromptEnd 通知 SSE 客户端任务已取消
             use crate::service::push_session_update_with_project;
             use sacp::schema::StopReason;
             use shared_types::{SessionNotify, SessionPromptEnd};
@@ -870,11 +874,7 @@ impl AgentService for AgentServiceImpl {
             let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
                 session_id: actual_session_id.clone(),
                 stop_reason: StopReason::Cancelled,
-                error_message: if message.contains("idle") || message.contains("stopping") {
-                    Some(message.clone())
-                } else {
-                    None // Normal success case
-                },
+                error_message: None,
                 request_id: None,
             });
 
@@ -889,7 +889,7 @@ impl AgentService for AgentServiceImpl {
                 );
             }
 
-            // Clean up connection
+            // 清理连接
             if let Some(session_data_ref) = SESSION_CACHE.get(&actual_session_id) {
                 let session_data = session_data_ref.clone();
                 drop(session_data_ref);
@@ -902,7 +902,7 @@ impl AgentService for AgentServiceImpl {
                 );
             }
 
-            // Update status to Idle (if coming from Active/Pending)
+            // 更新状态为 Idle（如果当前是 Active/Pending）
             use chrono::Utc;
             use shared_types::AgentStatus;
 
@@ -926,15 +926,7 @@ impl AgentService for AgentServiceImpl {
             return Ok(Response::new(CancelResponse {
                 success: true,
                 result: CancelResultType::CancelResultSuccess as i32,
-                message: Some(message),
-            }));
-        } else {
-            // This branch should ideally be covered by early returns in error cases above
-            warn!("⚠️ [gRPC] Cancel flow reached end without success message or early return");
-            return Ok(Response::new(CancelResponse {
-                success: false,
-                result: CancelResultType::CancelResultFailed as i32,
-                message: Some("Unknown cancellation state".to_string()),
+                message: Some("取消成功".to_string()),
             }));
         }
     }
