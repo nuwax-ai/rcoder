@@ -17,22 +17,26 @@ use tracing::{error, info};
 use crate::config::ProxyConfig;
 
 /// Pingora 启动结果
+///
+/// 持有关闭信号的发送端，`stop()` 时直接发送信号，无需 Mutex 锁。
 pub struct PingoraStartResult {
-    /// Pingora 服务器管理器包装器（用于发送关闭信号）
-    server_manager: Arc<tokio::sync::Mutex<PingoraServerManager>>,
+    /// 关闭信号发送端
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl PingoraStartResult {
     /// 停止 Pingora 服务器
     pub async fn stop(&mut self) {
-        let mut guard = self.server_manager.lock().await;
-        let _ = guard.stop().await;
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
 /// 启动 Pingora 代理服务
 ///
-/// 封装 Pingora 的创建和启动逻辑，供 main.rs 和 http_server/start.rs 复用
+/// 封装 Pingora 的创建和启动逻辑，供 main.rs 和 http_server/start.rs 复用。
+/// shutdown 通道在外部创建，`stop()` 直接发送信号，不经过 Mutex，消除死锁风险。
 #[must_use]
 pub fn start_pingora(
     proxy_config: &ProxyConfig,
@@ -57,7 +61,7 @@ pub fn start_pingora(
     };
 
     // 创建 Pingora 服务器管理器
-    let server_manager = PingoraServerManager::new(pingora_config)
+    let mut server_manager = PingoraServerManager::new(pingora_config)
         .with_api_key_manager(shared_api_key_manager);
 
     let pingora_service = server_manager.service();
@@ -68,15 +72,12 @@ pub fn start_pingora(
         pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
     }
 
-    // 包装为 Arc<Mutex<...>> 以便共享
-    let server_manager = Arc::new(tokio::sync::Mutex::new(server_manager));
-    let server_manager_for_spawn = server_manager.clone();
+    // 在外部创建 shutdown 通道，避免通过 Mutex 发送信号导致死锁
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-    // 在后台任务中启动 Pingora
+    // 在后台任务中启动 Pingora（直接 move server_manager，无需 Arc<Mutex<>>）
     tokio::spawn(async move {
-        // 从 Arc<Mutex<...>> 中获取锁并启动
-        let mut guard = server_manager_for_spawn.lock().await;
-        if let Err(e) = guard.start().await {
+        if let Err(e) = server_manager.start(shutdown_rx).await {
             error!("Pingora 代理服务器启动失败: {}", e);
         }
     });
@@ -84,7 +85,7 @@ pub fn start_pingora(
     info!("✅ Pingora 代理服务已启动在端口 {}", proxy_config.listen_port);
 
     PingoraStartResult {
-        server_manager,
+        shutdown_tx: Some(shutdown_tx),
     }
 }
 

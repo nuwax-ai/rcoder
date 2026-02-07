@@ -32,9 +32,16 @@ pub async fn handle_computer_chat(
     Json(request): Json<ComputerChatRequest>,
 ) -> Result<Json<HttpResult<ChatResponse>>, (StatusCode, Json<HttpResult<ChatResponse>>)> {
     info!(
-        "📨 [HTTP] 收到 Computer Chat 请求: user_id={:?}, project_id={:?}",
-        request.user_id, request.project_id
+        "📨 [HTTP] 收到 Computer Chat 请求: user_id={:?}, project_id={:?}, session_id={:?}, prompt_len={}, attachments={}, has_model_config={}, has_agent_config={}",
+        request.user_id,
+        request.project_id,
+        request.session_id,
+        request.prompt.len(),
+        request.attachments.len(),
+        request.model_provider.is_some(),
+        request.agent_config.is_some()
     );
+    info!("📝 [HTTP] 请求详情: prompt={:?}", request.prompt);
 
     // 1. 验证必填字段
     if request.user_id.is_empty() {
@@ -108,7 +115,10 @@ pub async fn handle_computer_chat(
     let session_id_str = output.session_id.clone();
     match SESSION_CACHE.entry(session_id_str.clone()) {
         Entry::Occupied(entry) => {
-            info!("[HTTP] SESSION_CACHE 已存在，复用: session_id={}", session_id_str);
+            info!(
+                "[HTTP] SESSION_CACHE 已存在，复用: session_id={}",
+                session_id_str
+            );
             entry.get().clone()
         }
         Entry::Vacant(entry) => {
