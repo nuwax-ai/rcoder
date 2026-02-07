@@ -59,6 +59,7 @@ pub use model::{
     ChatResponse,
     ContainerBasicInfo,
     DocumentAttachment,
+    HealthResponse,
     HttpResult,
     ImageAttachment,
     ImageDimensions,

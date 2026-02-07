@@ -2,14 +2,11 @@
 //!
 //! 定义所有 HTTP 端点和路由
 
-use axum::{
-    Router,
-    routing::{get, post},
-};
+use axum::{Json, Router, routing::{get, post}};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tower_http::limit::RequestBodyLimitLayer;
-use utoipa::OpenApi;
+use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::agent_runtime::AgentRuntime;
@@ -82,8 +79,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 }
 
 /// 健康检查端点
-async fn health_check() -> &'static str {
-    "OK"
+///
+/// 检查服务的健康状态
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "服务健康状态", body = shared_types::HealthResponse)
+    ),
+    tag = "system"
+)]
+pub async fn health_check() -> Json<shared_types::HealthResponse> {
+    Json(shared_types::HealthResponse::new("agent-runner"))
 }
 
 /// 创建 Swagger UI
@@ -102,6 +109,7 @@ fn create_swagger_ui() -> SwaggerUi {
             handle_computer_stop,
             handle_computer_cancel,
             handle_computer_progress,
+            health_check,
         ),
         components(schemas(
             shared_types::ComputerChatRequest,
@@ -112,9 +120,11 @@ fn create_swagger_ui() -> SwaggerUi {
             shared_types::ComputerAgentStopResponse,
             shared_types::ComputerAgentCancelRequest,
             shared_types::ComputerAgentCancelResponse,
+            shared_types::HealthResponse,
         )),
         tags(
-            (name = "Computer Agent", description = "Computer Agent HTTP API")
+            (name = "Computer Agent", description = "Computer Agent HTTP API"),
+            (name = "System", description = "系统管理接口")
         )
     )]
     struct ApiDoc;
