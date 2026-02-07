@@ -31,11 +31,12 @@ pub struct HttpServerConfig {
 /// HTTP 服务器控制柄
 ///
 /// 用于控制 HTTP 服务器的生命周期
+#[derive(Clone)]
 pub struct HttpServerHandle {
-    /// HTTP 服务关闭发送端
-    http_shutdown: Option<oneshot::Sender<()>>,
-    /// Pingora 服务关闭发送端
-    pingora_shutdown: Option<oneshot::Sender<()>>,
+    /// HTTP 服务关闭发送端 (使用 Arc 以支持 Clone)
+    http_shutdown: Option<Arc<oneshot::Sender<()>>>,
+    /// Pingora 服务关闭发送端 (使用 Arc 以支持 Clone)
+    pingora_shutdown: Option<Arc<oneshot::Sender<()>>>,
 }
 
 impl HttpServerHandle {
@@ -154,8 +155,8 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
 
     // 6. 并行运行 HTTP 和 Pingora 服务
     let handle = HttpServerHandle {
-        http_shutdown: Some(http_shutdown_tx),
-        pingora_shutdown: Some(pingora_shutdown_tx),
+        http_shutdown: Some(Arc::new(http_shutdown_tx)),
+        pingora_shutdown: Some(Arc::new(pingora_shutdown_tx)),
     };
 
     tokio::spawn(async move {
