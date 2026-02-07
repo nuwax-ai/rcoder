@@ -6,9 +6,10 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{info, warn};
+use tokio::sync::CancellationToken;
+use tokio::task::JoinSet;
+use tracing::{error, info, warn};
 
 use crate::agent_runtime::AgentRuntime;
 use crate::config::AppConfig;
@@ -33,24 +34,59 @@ pub struct HttpServerConfig {
 /// 用于控制 HTTP 服务器的生命周期
 #[derive(Clone)]
 pub struct HttpServerHandle {
-    /// HTTP 服务关闭标志 (使用 AtomicBool 以支持 Clone)
-    http_shutdown: Arc<AtomicBool>,
-    /// Pingora 服务关闭标志 (使用 AtomicBool 以支持 Clone)
-    pingora_shutdown: Arc<AtomicBool>,
+    /// 关闭信号令牌
+    shutdown_token: CancellationToken,
+    /// 活跃任务集合
+    join_set: Arc<tokio::sync::Mutex<JoinSet<()>>>,
+    /// Pingora 结果（用于调用 stop）
+    pingora_result: Arc<tokio::sync::Mutex<Option<crate::proxy_agent::PingoraStartResult>>>,
 }
 
 impl HttpServerHandle {
-    /// 停止 HTTP 服务器
+    /// 检查是否收到关闭信号
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown_token.is_cancelled()
+    }
+
+    /// 停止 HTTP 服务器并等待所有任务完成
     pub async fn stop(&self) {
         info!("正在停止 HTTP 服务器...");
 
-        // 发送 HTTP 关闭信号
-        self.http_shutdown.store(true, Ordering::SeqCst);
+        // 1. 发送关闭信号
+        self.shutdown_token.cancel();
 
-        // 发送 Pingora 关闭信号
-        self.pingora_shutdown.store(true, Ordering::SeqCst);
+        // 2. 停止 Pingora 服务
+        {
+            let mut pingora_guard = self.pingora_result.lock().await;
+            if let Some(mut pingora) = pingora_guard.take() {
+                pingora.stop().await;
+            }
+        }
 
-        info!("HTTP 服务器停止信号已发送");
+        // 3. 等待所有任务完成（带超时）
+        let timeout = Duration::from_secs(30);
+        let mut join_set = self.join_set.lock().await;
+
+        loop {
+            match tokio::time::timeout(timeout, join_set.join_next()).await {
+                Ok(Some(Ok(()))) => {
+                    info!("任务正常结束");
+                }
+                Ok(Some(Err(e))) => {
+                    warn!("任务出错: {:?}", e);
+                }
+                Ok(None) => {
+                    // JoinSet 为空，所有任务已完成
+                    break;
+                }
+                Err(_) => {
+                    warn!("等待任务完成超时");
+                    break;
+                }
+            }
+        }
+
+        info!("HTTP 服务器已停止");
     }
 }
 
@@ -98,9 +134,10 @@ impl HttpServerHandle {
 /// }
 /// ```
 pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHandle> {
-    // 创建关闭通道
-    let http_shutdown = Arc::new(AtomicBool::new(false));
-    let pingora_shutdown = Arc::new(AtomicBool::new(false));
+    // 创建关闭信号令牌
+    let shutdown_token = CancellationToken::new();
+    let join_set = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
+    let pingora_result = Arc::new(tokio::sync::Mutex::new(None));
 
     // 1. 启动 Agent 清理任务
     let cleanup_config = CleanupConfig {
@@ -113,16 +150,42 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
                 .unwrap_or_default().cleanup_interval_secs
         ),
     };
-    let _cleanup_handle = start_cleanup_task(cleanup_config);
+    let cleanup_token = shutdown_token.child_token();
+    join_set.lock().await.spawn(async move {
+        tokio::select! {
+            _ = start_cleanup_task(cleanup_config) => {}
+            _ = cleanup_token.cancelled() => {
+                info!("清理任务收到关闭信号");
+            }
+        }
+    });
 
     // 2. 启动 Pingora 代理服务（如果配置了）
-    let pingora_result = if let Some(proxy_config) = &config.app_config.proxy_config {
-        let result = start_pingora(proxy_config, config.shared_api_key_manager.clone());
-        Some(result)
+    if let Some(proxy_config) = &config.app_config.proxy_config {
+        let mut result = start_pingora(proxy_config, config.shared_api_key_manager.clone());
+        let pingora_token = shutdown_token.child_token();
+        let pingora_handle = result.handle;
+
+        // 保存 Pingora 结果以便后续调用 stop
+        *pingora_result.lock().await = Some(result);
+
+        // 启动 Pingora 监控任务
+        join_set.lock().await.spawn(async move {
+            tokio::select! {
+                result = pingora_handle => {
+                    match result {
+                        Ok(()) => info!("Pingora 服务正常退出"),
+                        Err(e) => error!("Pingora 服务错误: {:?}", e),
+                    }
+                }
+                _ = pingora_token.cancelled() => {
+                    info!("Pingora 服务收到关闭信号");
+                }
+            }
+        });
     } else {
         info!("Pingora 代理服务未配置，跳过启动");
-        None
-    };
+    }
 
     // 3. 创建 HTTP 应用状态
     let state = Arc::new(AppState::new(
@@ -149,65 +212,28 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     info!("  GET  /health - Health check");
     info!("  GET  /api/docs - Swagger API documentation");
 
-    // 6. 并行运行 HTTP 和 Pingora 服务
-    let handle = HttpServerHandle {
-        http_shutdown: http_shutdown.clone(),
-        pingora_shutdown: pingora_shutdown.clone(),
-    };
-
-    // 为每个任务准备独立的 Arc 引用
-    let http_flag_for_http = http_shutdown.clone();
-    let pingora_flag_for_http = pingora_shutdown.clone();
-    let http_flag_for_pingora = http_shutdown.clone();
-    let pingora_flag_for_pingora = pingora_shutdown.clone();
-
-    // HTTP 服务任务
-    tokio::spawn(async move {
+    // 6. 启动 HTTP 服务任务
+    let http_token = shutdown_token.child_token();
+    join_set.lock().await.spawn(async move {
         tokio::select! {
-            _ = axum::serve(listener, app) => {
-                warn!("HTTP 服务已停止");
+            result = axum::serve(listener, app) => {
+                match result {
+                    Ok(()) => info!("HTTP 服务正常退出"),
+                    Err(e) => error!("HTTP 服务错误: {:?}", e),
+                }
             }
-            _ = async {
-                // 轮询检查 HTTP 关闭信号
-                while !http_flag_for_http.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                warn!("收到 HTTP 关闭信号");
-            } => {}
-            _ = async {
-                // 同时监听 Pingora 关闭信号
-                while !pingora_flag_for_http.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                warn!("收到 Pingora 关闭信号");
-            } => {}
+            _ = http_token.cancelled() => {
+                info!("HTTP 服务收到关闭信号");
+            }
         }
     });
 
-    // Pingora 服务任务
-    if let Some(result) = pingora_result {
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = result.handle => {
-                    warn!("Pingora 代理服务已停止");
-                }
-                _ = async {
-                    // 监听 Pingora 关闭信号
-                    while !pingora_flag_for_pingora.load(Ordering::SeqCst) {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                    warn!("收到 Pingora 关闭信号");
-                } => {}
-                _ = async {
-                    // 同时监听 HTTP 关闭信号
-                    while !http_flag_for_pingora.load(Ordering::SeqCst) {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                    warn!("收到 HTTP 关闭信号");
-                } => {}
-            }
-        });
-    }
+    // 创建 handle
+    let handle = HttpServerHandle {
+        shutdown_token,
+        join_set,
+        pingora_result,
+    };
 
     Ok(handle)
 }

@@ -20,6 +20,18 @@ use crate::config::ProxyConfig;
 pub struct PingoraStartResult {
     /// Pingora 服务句柄
     pub handle: tokio::task::JoinHandle<()>,
+    /// Pingora 服务器管理器包装器（用于发送关闭信号）
+    server_manager: Option<Arc<tokio::sync::Mutex<PingoraServerManager>>>,
+}
+
+impl PingoraStartResult {
+    /// 停止 Pingora 服务器
+    pub async fn stop(&mut self) {
+        if let Some(manager) = self.server_manager.take() {
+            let mut guard = manager.lock().await;
+            let _ = guard.stop().await;
+        }
+    }
 }
 
 /// 启动 Pingora 代理服务
@@ -49,7 +61,7 @@ pub fn start_pingora(
     };
 
     // 创建 Pingora 服务器管理器
-    let mut server_manager = PingoraServerManager::new(pingora_config)
+    let server_manager = PingoraServerManager::new(pingora_config)
         .with_api_key_manager(shared_api_key_manager);
 
     let pingora_service = server_manager.service();
@@ -60,16 +72,25 @@ pub fn start_pingora(
         pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
     }
 
+    // 包装为 Arc<Mutex<...>> 以便共享
+    let server_manager = Arc::new(tokio::sync::Mutex::new(server_manager));
+    let server_manager_for_spawn = server_manager.clone();
+
     // 在后台任务中启动 Pingora
     let handle = tokio::spawn(async move {
-        if let Err(e) = server_manager.start().await {
+        // 从 Arc<Mutex<...>> 中获取锁并启动
+        let mut guard = server_manager_for_spawn.lock().await;
+        if let Err(e) = guard.start().await {
             error!("Pingora 代理服务器启动失败: {}", e);
         }
     });
 
     info!("✅ Pingora 代理服务已启动在端口 {}", proxy_config.listen_port);
 
-    PingoraStartResult { handle }
+    PingoraStartResult {
+        handle,
+        server_manager: Some(server_manager),
+    }
 }
 
 /// 会话级别的 request_id 上下文映射（project_id -> request_id）
