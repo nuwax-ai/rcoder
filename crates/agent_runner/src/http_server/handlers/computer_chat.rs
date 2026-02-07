@@ -114,6 +114,7 @@ pub async fn handle_computer_chat(
         agent_config_override: request.agent_config,
         system_prompt_override: request.system_prompt,
         user_prompt_template_override: request.user_prompt,
+        skip_slot_limit: true, // HTTP Server 部署，跳过槽位限制
     };
 
     // 7. 构建 ChatHandlerContext

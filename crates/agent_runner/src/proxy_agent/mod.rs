@@ -5,16 +5,18 @@ use crate::CancelNotificationRequestWrapper;
 // 导出 agent_worker 相关类型和函数
 // AgentRequest 是 SACP 版本的新类型，LocalSetAgentRequest 是向后兼容别名
 #[allow(deprecated)]
-pub use acp_agent::{AgentRequest, LocalSetAgentRequest, agent_worker_with_heartbeat};
+pub use acp_agent::{
+    AgentRequest, LocalSetAgentRequest, agent_worker_with_heartbeat, set_unlimited_mode,
+};
 use shared_types::AgentLifecycleGuard;
 // SACP 类型导入
-use sacp::schema::{PromptRequest, SessionId};
+use crate::config::ProxyConfig;
 use dashmap::DashMap;
+use rcoder_proxy::{PingoraServerManager, ProxyConfig as PingoraProxyConfig};
+use sacp::schema::{PromptRequest, SessionId};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
-use rcoder_proxy::{PingoraServerManager, ProxyConfig as PingoraProxyConfig};
 use tracing::{error, info};
-use crate::config::ProxyConfig;
 
 /// Pingora 启动结果
 ///
@@ -61,8 +63,8 @@ pub fn start_pingora(
     };
 
     // 创建 Pingora 服务器管理器
-    let mut server_manager = PingoraServerManager::new(pingora_config)
-        .with_api_key_manager(shared_api_key_manager);
+    let mut server_manager =
+        PingoraServerManager::new(pingora_config).with_api_key_manager(shared_api_key_manager);
 
     let pingora_service = server_manager.service();
 
@@ -82,7 +84,10 @@ pub fn start_pingora(
         }
     });
 
-    info!("✅ Pingora 代理服务已启动在端口 {}", proxy_config.listen_port);
+    info!(
+        "✅ Pingora 代理服务已启动在端口 {}",
+        proxy_config.listen_port
+    );
 
     PingoraStartResult {
         shutdown_tx: Some(shutdown_tx),

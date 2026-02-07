@@ -348,7 +348,7 @@ impl AgentService for AgentServiceImpl {
         };
 
         // 3. 构建 ChatHandlerInput（类型转换）
-        use crate::service::{handle_chat_core, ChatHandlerContext, ChatHandlerInput};
+        use crate::service::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
         let input = ChatHandlerInput {
             project_id,
             project_dir,
@@ -362,6 +362,7 @@ impl AgentService for AgentServiceImpl {
             agent_config_override: req.agent_config.map(convert_agent_config),
             system_prompt_override: req.system_prompt,
             user_prompt_template_override: req.user_prompt,
+            skip_slot_limit: false, // gRPC 请求（Docker 容器部署），继续限制槽位
         };
 
         // 4. 构建 ChatHandlerContext
@@ -390,10 +391,7 @@ impl AgentService for AgentServiceImpl {
             fallback_reason: output.fallback_reason,
         };
 
-        info!(
-            "✅ [gRPC] Chat 完成: success={}",
-            grpc_response.success
-        );
+        info!("✅ [gRPC] Chat 完成: success={}", grpc_response.success);
 
         Ok(Response::new(grpc_response))
     }

@@ -13,14 +13,14 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use shared_types::{
-    error_codes, Attachment, ChatAgentConfig, ChatPromptBuilder, ModelProviderConfig, ServiceType,
+    Attachment, ChatAgentConfig, ChatPromptBuilder, ModelProviderConfig, ServiceType, error_codes,
 };
 use tracing::{debug, error, info, warn};
 
+use crate::AgentRuntime;
 use crate::agent_runtime::WorkerState;
 use crate::proxy_agent::AgentRequest;
-use crate::service::{PendingGuard, AGENT_REGISTRY, SESSION_CACHE};
-use crate::AgentRuntime;
+use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
 
 /// Chat Handler 输入参数
 ///
@@ -51,6 +51,8 @@ pub struct ChatHandlerInput {
     pub system_prompt_override: Option<String>,
     /// 用户提示模板覆盖（可选）
     pub user_prompt_template_override: Option<String>,
+    /// 是否跳过槽位限制（HTTP Server 宿主机部署时为 true）
+    pub skip_slot_limit: bool,
 }
 
 /// Chat Handler 输出结果
@@ -330,7 +332,8 @@ pub async fn handle_chat_core(
     let (agent_request, chat_prompt_rx) = AgentRequest::new(prompt_message, model_provider);
     let agent_request = agent_request
         .with_service_uuid(service_uuid)
-        .with_key_manager(Some(context.shared_api_key_manager.clone()));
+        .with_key_manager(Some(context.shared_api_key_manager.clone()))
+        .with_skip_slot_limit(input.skip_slot_limit);
 
     if let Err(e) = context.agent_runtime.send(agent_request).await {
         // PendingGuard 自动清理（在 drop 时）

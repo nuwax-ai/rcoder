@@ -323,8 +323,12 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "http-server")]
     {
         use http_server::{HttpServerConfig, start_http_server};
+        use proxy_agent::set_unlimited_mode;
 
         info!("ℹ️  HTTP 服务器模式：仅启动 HTTP + Pingora，不启动 gRPC");
+
+        // 设置为无限制模式（HTTP Server 部署，不限制槽位）
+        set_unlimited_mode(true);
 
         // 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {
