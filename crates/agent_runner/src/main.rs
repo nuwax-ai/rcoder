@@ -306,54 +306,10 @@ async fn main() -> anyhow::Result<()> {
 
     // proxy_manager 不需要直接访问 app_state，通过参数传递即可
 
-    // 🔒 创建共享的 API 密钥 DashMap（在 Pingora 服务之前创建）
-    // 这个 DashMap 将在 agent_runner 和 Pingora 之间共享
+    // 🔒 创建共享的 API 密钥 DashMap
     let shared_api_key_manager =
         Arc::new(dashmap::DashMap::<String, shared_types::ModelProviderConfig>::new());
     info!("🔑 [MAIN] 共享 API 密钥 DashMap 已创建");
-
-    // 启动代理服务（如果启用）
-    let (proxy_handle, pingora_service_opt) = if let Some(proxy_config) = &config.proxy_config {
-        info!(
-            "启动 Pingora 反向代理服务，监听端口: {}",
-            proxy_config.listen_port
-        );
-        info!(
-            "代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/{}/health",
-            config.port
-        );
-
-        let pingora_config = ProxyConfig {
-            listen_port: proxy_config.listen_port,
-            default_backend_port: proxy_config.default_backend_port,
-            backend_host: proxy_config.backend_host.clone(),
-            port_param: proxy_config.port_param.clone(),
-            config_file: None,
-            verbose: false,
-        };
-
-        // 创建 Pingora 服务器管理器，并传入共享的 API 密钥管理器
-        let mut server_manager = PingoraServerManager::new(pingora_config)
-            .with_api_key_manager(shared_api_key_manager.clone());
-
-        let pingora_service = server_manager.service();
-        // 启动健康检查循环（按配置）
-        if proxy_config.health_check.enabled {
-            let hc = &proxy_config.health_check;
-            pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
-        }
-
-        // 在后台任务中启动 Pingora 服务器
-        let handle = tokio::spawn(async move {
-            if let Err(e) = server_manager.start().await {
-                error!("Pingora 代理服务器启动失败: {}", e);
-            }
-        });
-
-        (Some(handle), Some(pingora_service))
-    } else {
-        (None, None)
-    };
 
     // 🔥 创建 ApiKeyManager 包装器（包装共享 DashMap，消除双重存储）
     let api_key_manager = Arc::new(api_key_manager::ApiKeyManager::from_shared(
@@ -363,35 +319,38 @@ async fn main() -> anyhow::Result<()> {
     // 🔒 project_id -> service_uuid 映射
     let project_uuid_map = Arc::new(DashMap::new());
 
-    let state = Arc::new(AppState {
-        sessions: Arc::new(DashMap::new()),
-        config: config.clone(),
-        local_task_sender: agent_runtime.clone(), // 🆕 新架构：使用 AgentRuntime
-        agent_runtime: agent_runtime.clone(),
-        pingora_service: pingora_service_opt,
-        api_key_manager, // 现在包装 shared_api_key_manager
-        shared_api_key_manager: shared_api_key_manager.clone(),
-        project_uuid_map,
-    });
-
-    // 创建路由（传入遥测 guard 用于 /metrics 端点）
-    let app = router::create_router(state.clone(), Some(telemetry.clone()));
-
-    // 启动 gRPC 服务器
+    // 启动 gRPC 服务（两种模式都需要）
     let grpc_port = shared_types::GRPC_DEFAULT_PORT;
     let grpc_addr = format!("[::]:{}", grpc_port)
         .parse()
         .map_err(|e| anyhow::anyhow!("gRPC 地址解析失败: {}", e))?;
 
-    // gRPC 消息大小限制：使用 shared_types 统一常量
+    // 为 gRPC 创建 state（两种模式都需要）
+    let grpc_state = Arc::new(AppState {
+        sessions: Arc::new(DashMap::new()),
+        config: config.clone(),
+        local_task_sender: agent_runtime.clone(),
+        agent_runtime: agent_runtime.clone(),
+        pingora_service: None, // http-server 模式下由 start_http_server 管理
+        api_key_manager: api_key_manager.clone(),
+        shared_api_key_manager: shared_api_key_manager.clone(),
+        project_uuid_map: project_uuid_map.clone(),
+    });
+
+    // gRPC 消息大小限制
     let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
-        grpc::AgentServiceImpl::new(state.clone()),
+        grpc::AgentServiceImpl::new(grpc_state.clone()),
     )
     .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
     .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
     let grpc_handle = tokio::spawn(async move {
         info!("🚀 gRPC 服务启动，监听端口: {}", grpc_port);
+        info!("gRPC endpoints (port {}):", grpc_port);
+        info!("  agent.AgentService/Chat - gRPC chat");
+        info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
+        info!("  agent.AgentService/CancelSession - gRPC cancel");
+        info!("  agent.AgentService/GetStatus - gRPC status");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(grpc_service)
             .serve(grpc_addr)
@@ -401,86 +360,60 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("gRPC endpoints (port {}):", grpc_port);
-    info!("  agent.AgentService/Chat - gRPC chat");
-    info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
-    info!("  agent.AgentService/CancelSession - gRPC cancel");
-    info!("  agent.AgentService/GetStatus - gRPC status");
-
-    // 启动 HTTP 服务器 (仅在 http-server feature 启用时)
+    // 🔥 http-server 模式：统一由 start_http_server 管理 HTTP + Pingora + gRPC
     #[cfg(feature = "http-server")]
     {
-        use http_server::router::{AppState, create_router};
-        use std::net::SocketAddr;
+        use http_server::{start_http_server, HttpServerConfig};
 
-        let state = Arc::new(AppState::new(
-            config.clone(),
-            agent_runtime.clone(),
-            shared_api_key_manager.clone(),
-        ));
+        // 创建 HttpServerConfig（包含所有配置）
+        let http_config = HttpServerConfig {
+            port: config.port,
+            app_config: config.clone(),
+            agent_runtime: agent_runtime.clone(),
+            shared_api_key_manager: shared_api_key_manager.clone(),
+        };
 
-        let app = create_router(state);
-        let http_port = config.port;
-        let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
-
-        let http_handle = tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    info!("🚀 HTTP 服务器启动在端口 {}", http_port);
-                    info!("📄 API 文档: http://localhost:{}/api/docs", http_port);
-                    if let Err(e) = axum::serve(listener, app).await {
-                        error!("❌ HTTP 服务器错误: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("❌ HTTP 服务器绑定端口 {} 失败: {}", http_port, e);
-                }
+        // 启动 HTTP 服务器（内部会启动 Pingora，HTTP 和 gRPC 并行运行）
+        let _http_proxy_handle = tokio::spawn(async move {
+            if let Err(e) = start_http_server(http_config).await {
+                error!("HTTP/Pingora 服务器错误: {}", e);
             }
         });
 
-        info!("🚀 HTTP 服务器已启动在端口 {}", config.port);
-        info!("HTTP API endpoints:");
-        info!("  POST /computer/chat - Computer Agent chat");
-        info!("  POST /computer/agent/status - Computer Agent status");
-        info!("  POST /computer/agent/stop - Computer Agent stop");
-        info!("  POST /computer/agent/session/cancel - Computer Agent cancel");
-        info!("  GET  /computer/progress/:session_id - SSE progress stream");
-        info!("  GET  /health - Health check");
-        info!("  GET  /api/docs - Swagger API documentation");
+        info!("🚀 HTTP + Pingora 服务已启动（由 http-server feature 管理）");
 
-        if let Some(proxy_config) = &config.proxy_config {
-            info!("🚀 Pingora 反向代理服务已启用");
-            info!("📡 监听端口: {}", proxy_config.listen_port);
-            info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
-            info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
-        }
+        // 等待 gRPC 服务
+        let _ = grpc_handle.await;
 
-        // 并行运行 HTTP 和 gRPC 服务
-        tokio::select! {
-            _ = http_handle => {
-                warn!("⚠️  HTTP 服务已停止");
-            }
-            _ = grpc_handle => {
-                warn!("⚠️  gRPC 服务已停止");
-            }
-        }
+        Ok(())
     }
 
+    // 🔥 non-http-server 模式：手动启动 Pingora + gRPC
     #[cfg(not(feature = "http-server"))]
     {
+        // 启动 Pingora（如有配置）- 使用抽取的 start_pingora 函数
+        use proxy_agent::start_pingora;
+
+        let pingora_result = if let Some(proxy_config) = &config.proxy_config {
+            Some(start_pingora(proxy_config, shared_api_key_manager.clone()))
+        } else {
+            info!("ℹ️  Pingora 代理服务未配置");
+            None
+        };
+
         info!("ℹ️  HTTP 服务器已禁用 (http-server feature 未启用)");
-        info!("ℹ️  仅运行 gRPC 服务");
+        info!("ℹ️  运行 gRPC + Pingora（如已配置）");
 
-        // 仅等待 gRPC 服务
+        // 等待 gRPC 服务
         let _ = grpc_handle.await;
-    }
 
-    // 等待代理服务完成
-    if let Some(handle) = proxy_handle {
-        handle.await?;
-    }
+        // 等待 Pingora 服务
+        if let Some(result) = pingora_result {
+            let _ = result.handle.await;
+        }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 /// 🔥 健康监控任务 (新架构)

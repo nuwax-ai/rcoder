@@ -12,6 +12,65 @@ use sacp::schema::{PromptRequest, SessionId};
 use dashmap::DashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
+use rcoder_proxy::{PingoraServerManager, ProxyConfig as PingoraProxyConfig};
+use tracing::{error, info};
+use crate::config::ProxyConfig;
+
+/// Pingora 启动结果
+pub struct PingoraStartResult {
+    /// Pingora 服务句柄
+    pub handle: tokio::task::JoinHandle<()>,
+}
+
+/// 启动 Pingora 代理服务
+///
+/// 封装 Pingora 的创建和启动逻辑，供 main.rs 和 http_server/start.rs 复用
+#[must_use]
+pub fn start_pingora(
+    proxy_config: &ProxyConfig,
+    shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
+) -> PingoraStartResult {
+    info!(
+        "🚀 启动 Pingora 反向代理服务，监听端口: {}",
+        proxy_config.listen_port
+    );
+    info!(
+        "🔄 代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/{}/health",
+        proxy_config.default_backend_port
+    );
+
+    let pingora_config = PingoraProxyConfig {
+        listen_port: proxy_config.listen_port,
+        default_backend_port: proxy_config.default_backend_port,
+        backend_host: proxy_config.backend_host.clone(),
+        port_param: proxy_config.port_param.clone(),
+        config_file: None,
+        verbose: false,
+    };
+
+    // 创建 Pingora 服务器管理器
+    let mut server_manager = PingoraServerManager::new(pingora_config)
+        .with_api_key_manager(shared_api_key_manager);
+
+    let pingora_service = server_manager.service();
+
+    // 启动健康检查循环（按配置）
+    if proxy_config.health_check.enabled {
+        let hc = &proxy_config.health_check;
+        pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
+    }
+
+    // 在后台任务中启动 Pingora
+    let handle = tokio::spawn(async move {
+        if let Err(e) = server_manager.start().await {
+            error!("Pingora 代理服务器启动失败: {}", e);
+        }
+    });
+
+    info!("✅ Pingora 代理服务已启动在端口 {}", proxy_config.listen_port);
+
+    PingoraStartResult { handle }
+}
 
 /// 会话级别的 request_id 上下文映射（project_id -> request_id）
 /// 用于在 session_notification 回调中获取当前请求的 request_id
