@@ -7,6 +7,7 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::agent_runtime::AgentRuntime;
@@ -25,6 +26,35 @@ pub struct HttpServerConfig {
     pub agent_runtime: Arc<AgentRuntime>,
     /// 共享 API Key Manager
     pub shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
+}
+
+/// HTTP 服务器控制柄
+///
+/// 用于控制 HTTP 服务器的生命周期
+pub struct HttpServerHandle {
+    /// HTTP 服务关闭发送端
+    http_shutdown: Option<oneshot::Sender<()>>,
+    /// Pingora 服务关闭发送端
+    pingora_shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl HttpServerHandle {
+    /// 停止 HTTP 服务器
+    pub async fn stop(self) {
+        info!("正在停止 HTTP 服务器...");
+
+        // 发送 HTTP 关闭信号
+        if let Some(tx) = self.http_shutdown {
+            let _ = tx.send(());
+        }
+
+        // 发送 Pingora 关闭信号
+        if let Some(tx) = self.pingora_shutdown {
+            let _ = tx.send(());
+        }
+
+        info!("HTTP 服务器停止信号已发送");
+    }
 }
 
 /// 启动 HTTP 服务器
@@ -64,10 +94,17 @@ pub struct HttpServerConfig {
 ///     };
 ///
 ///     // 启动 HTTP Server
-///     start_http_server(config).await.unwrap();
+///     let handle = start_http_server(config).await.unwrap();
+///
+///     // 优雅停止
+///     handle.stop().await;
 /// }
 /// ```
-pub async fn start_http_server(config: HttpServerConfig) -> Result<()> {
+pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHandle> {
+    // 创建关闭通道
+    let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel();
+    let (pingora_shutdown_tx, pingora_shutdown_rx) = oneshot::channel();
+
     // 1. 启动 Agent 清理任务
     let cleanup_config = CleanupConfig {
         idle_timeout: Duration::from_secs(
@@ -86,7 +123,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<()> {
         let result = start_pingora(proxy_config, config.shared_api_key_manager.clone());
         Some(result)
     } else {
-        info!("ℹ️  Pingora 代理服务未配置，跳过启动");
+        info!("Pingora 代理服务未配置，跳过启动");
         None
     };
 
@@ -104,8 +141,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    info!("🚀 HTTP 服务器启动在端口 {}", config.port);
-    info!("📄 API 文档: http://localhost:{}/api/docs", config.port);
+    info!("HTTP 服务器启动在端口 {}", config.port);
 
     info!("HTTP API endpoints:");
     info!("  POST /computer/chat - Computer Agent chat");
@@ -117,18 +153,34 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<()> {
     info!("  GET  /api/docs - Swagger API documentation");
 
     // 6. 并行运行 HTTP 和 Pingora 服务
-    tokio::select! {
-        _ = axum::serve(listener, app) => {
-            warn!("⚠️  HTTP 服务已停止");
-        }
-        _ = async move {
-            if let Some(result) = pingora_result {
-                result.handle.await.ok();
-            }
-        } => {
-            warn!("⚠️  Pingora 代理服务已停止");
-        }
-    }
+    let handle = HttpServerHandle {
+        http_shutdown: Some(http_shutdown_tx),
+        pingora_shutdown: Some(pingora_shutdown_tx),
+    };
 
-    Ok(())
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = axum::serve(listener, app) => {
+                warn!("HTTP 服务已停止");
+            }
+            _ = http_shutdown_rx => {
+                warn!("收到 HTTP 关闭信号");
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Some(result) = pingora_result {
+            tokio::select! {
+                _ = result.handle => {
+                    warn!("Pingora 代理服务已停止");
+                }
+                _ = pingora_shutdown_rx => {
+                    warn!("收到 Pingora 关闭信号");
+                }
+            }
+        }
+    });
+
+    Ok(handle)
 }
