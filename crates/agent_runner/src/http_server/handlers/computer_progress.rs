@@ -150,8 +150,11 @@ pub async fn handle_computer_progress(
     }
 
     // 1. 从 SESSION_CACHE 获取 session_data
+    // 🛡️ 关键修复：先 clone Arc<SessionData>，立即释放 DashMap shard 读锁
+    // 之前直接在 Ref 上调用 create_new_connection().await，导致 DashMap 读锁跨 await 持有
+    // 可能造成与 SESSION_CACHE.entry()/remove() 等写操作的死锁
     let session_data = match SESSION_CACHE.get(&session_id) {
-        Some(data) => data,
+        Some(data) => data.value().clone(),
         None => {
             warn!("⚠️  [HTTP] Session 不存在: session_id={}", session_id);
             return Err((
@@ -164,7 +167,7 @@ pub async fn handle_computer_progress(
         }
     };
 
-    // 2. 创建新的消息订阅
+    // 2. 创建新的消息订阅（DashMap 锁已释放，此处 await 安全）
     let (message_rx, _cancel_token) = match session_data.create_new_connection(1000).await {
         Ok(conn) => conn,
         Err(e) => {
