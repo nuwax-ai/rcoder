@@ -22,11 +22,9 @@
 //! 注意：Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 
 use axum::{Json, extract::State};
-use serde::{Deserialize, Serialize};
-use shared_types::{ChatAgentConfig, ChatResponse, ModelProviderConfig};
+use shared_types::{ChatResponse, ComputerChatRequest, ModelProviderConfig};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
-use utoipa::ToSchema;
 
 use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 use docker_manager::ContainerBasicInfo;
@@ -35,59 +33,6 @@ use shared_types::Attachment;
 use super::utils::{
     extract_grpc_addr_with_port, get_realtime_container_ip_with_cache, project_dir,
 };
-
-/// Computer Agent 聊天请求
-///
-/// 与标准 ChatRequest 的主要区别：
-/// - `user_id` 是必填字段（用于容器标识）
-/// - 一个 user_id 对应一个容器，容器内可以有多个 project_id 的 Agent 实例
-#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
-pub struct ComputerChatRequest {
-    /// 用户 ID (必填) - 一个用户对应一个容器
-    #[schema(example = "user_123")]
-    pub user_id: String,
-
-    /// 项目 ID (可选) - 一个容器内可以有多个项目
-    /// 若未提供，系统自动生成 UUID
-    #[schema(example = "proj_456")]
-    pub project_id: Option<String>,
-
-    /// 用户输入的 prompt
-    #[schema(example = "帮我打开浏览器访问 https://example.com")]
-    pub prompt: String,
-
-    /// 可选的会话 ID，如果不提供则创建新会话
-    #[schema(example = "session789")]
-    pub session_id: Option<String>,
-
-    /// 可选的附件列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<Attachment>,
-
-    /// 数据源附件列表 - 用于AI开发时获取外部数据源信息
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub data_source_attachments: Vec<String>,
-
-    /// 模型配置
-    pub model_provider: Option<ModelProviderConfig>,
-
-    /// 可选的请求ID
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "req_123456789")]
-    pub request_id: Option<String>,
-
-    /// 可选的系统提示词覆盖
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-
-    /// 可选的用户提示词模板
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_prompt: Option<String>,
-
-    /// Agent 运行时配置
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_config: Option<ChatAgentConfig>,
-}
 
 /// 处理 Computer Agent 聊天请求
 ///
@@ -369,7 +314,7 @@ pub async fn handle_computer_chat(
 
     // 8. 转发请求到容器服务（使用 gRPC）
     let result = forward_computer_request_to_container(
-        &request_for_forward,  // 使用修改后的 request
+        &request_for_forward, // 使用修改后的 request
         &project_id,
         &container_info,
         &state.grpc_pool,

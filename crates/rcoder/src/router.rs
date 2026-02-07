@@ -343,11 +343,11 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             shared_types::UnifiedSessionMessage,
             shared_types::SessionMessageType,
             // Computer Agent 相关结构体
-            handler::ComputerChatRequest,
-            handler::ComputerAgentStopRequest,
-            handler::ComputerAgentStopResponse,
-            handler::ComputerAgentStatusRequest,  // 🆕 新增
-            handler::ComputerAgentStatusResponse, // 🆕 新增
+            shared_types::ComputerChatRequest,
+            shared_types::ComputerAgentStopRequest,
+            shared_types::ComputerAgentStopResponse,
+            shared_types::ComputerAgentStatusRequest,
+            shared_types::ComputerAgentStatusResponse,
             handler::DesktopPathParams,
             handler::VncProxyPathParams,
             handler::AudioProxyPathParams,

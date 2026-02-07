@@ -4,14 +4,13 @@
 
 use axum::Json;
 use axum::extract::State;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
-use utoipa::ToSchema;
 
 use super::utils::get_realtime_container_ip_with_cache;
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
+use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse};
 
 /// gRPC GetStatus 最大重试次数
 const GRPC_MAX_RETRIES: u32 = 3;
@@ -21,70 +20,6 @@ const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 /// Agent 存活状态列表（白名单）
 const ALIVE_STATUSES: &[&str] = &["idle", "busy"];
-
-/// Computer Agent 状态查询请求
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct ComputerAgentStatusRequest {
-    /// 用户 ID（必填）
-    #[schema(example = "user_123")]
-    pub user_id: String,
-
-    /// 项目 ID（必填）
-    #[schema(example = "proj_456")]
-    pub project_id: String,
-}
-
-/// Computer Agent 状态查询响应
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ComputerAgentStatusResponse {
-    /// 用户 ID
-    #[schema(example = "user_123")]
-    pub user_id: String,
-
-    /// 项目 ID
-    #[schema(example = "proj_456")]
-    pub project_id: String,
-
-    /// Agent 是否已启动（容器运行中且 Agent 存在）
-    #[schema(example = true)]
-    pub is_alive: bool,
-
-    /// 会话 ID（仅当 is_alive 为 true 时存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "session_abc123")]
-    pub session_id: Option<String>,
-
-    /// Agent 状态（仅当 is_alive 为 true 时存在）
-    /// 可能的值："idle", "busy"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "idle")]
-    pub status: Option<String>,
-
-    /// 最后活动时间（仅当 is_alive 为 true 时存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "2024-01-01T12:00:00Z")]
-    pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
-
-    /// 创建时间（仅当 is_alive 为 true 时存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "2024-01-01T10:00:00Z")]
-    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-impl ComputerAgentStatusResponse {
-    /// 创建 Agent 未启动的响应
-    fn not_alive(user_id: String, project_id: String) -> Self {
-        Self {
-            user_id,
-            project_id,
-            is_alive: false,
-            session_id: None,
-            status: None,
-            last_activity: None,
-            created_at: None,
-        }
-    }
-}
 
 /// 处理 Computer Agent 状态查询
 ///

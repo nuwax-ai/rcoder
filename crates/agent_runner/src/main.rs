@@ -28,17 +28,21 @@ mod router;
 mod service;
 mod utils;
 
+// HTTP 服务器模块 (仅在 http-server feature 启用时)
+#[cfg(feature = "http-server")]
+mod http_server;
+
 use agent_runtime::AgentRuntime;
 use config::{CliArgs, load_config_with_args};
 use model::*;
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use rcoder_proxy::{PingoraServerManager, ProxyConfig};
 use router::AppState;
-use std::panic;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::panic;
 use std::path::PathBuf;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 
 /// 🔥 设置自定义 Panic Hook
 ///
@@ -59,7 +63,12 @@ fn set_panic_hook() {
         eprintln!("❌ [PANIC] agent_runner 发生致命错误！");
         eprintln!("═══════════════════════════════════════════════════════════");
         if let Some(location) = panic_info.location() {
-            eprintln!("panic.location: {}:{}:{}", location.file(), location.line(), location.column());
+            eprintln!(
+                "panic.location: {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
         }
         eprintln!("panic.payload: {}", panic_info);
         eprintln!("═══════════════════════════════════════════════════════════");
@@ -89,12 +98,24 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
 
     // 写入 panic 信息
-    writeln!(file, "═══════════════════════════════════════════════════════════")?;
+    writeln!(
+        file,
+        "═══════════════════════════════════════════════════════════"
+    )?;
     writeln!(file, "❌ [PANIC] agent_runner 发生致命错误！")?;
     writeln!(file, "时间: {}", now)?;
-    writeln!(file, "═══════════════════════════════════════════════════════════")?;
+    writeln!(
+        file,
+        "═══════════════════════════════════════════════════════════"
+    )?;
     if let Some(location) = panic_info.location() {
-        writeln!(file, "panic.location: {}:{}:{}", location.file(), location.line(), location.column())?;
+        writeln!(
+            file,
+            "panic.location: {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        )?;
     }
     writeln!(file, "panic.payload: {}", panic_info)?;
 
@@ -106,7 +127,10 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
         }
     }
 
-    writeln!(file, "═══════════════════════════════════════════════════════════\n")?;
+    writeln!(
+        file,
+        "═══════════════════════════════════════════════════════════\n"
+    )?;
 
     // 强制刷新到磁盘
     file.flush()?;
@@ -174,17 +198,19 @@ fn write_shutdown_log(signal: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-        let _ = writeln!(file, "═══════════════════════════════════════════════════════════");
+        let _ = writeln!(
+            file,
+            "═══════════════════════════════════════════════════════════"
+        );
         let _ = writeln!(file, "📨 [SHUTDOWN] agent_runner 收到关闭信号");
         let _ = writeln!(file, "信号类型: {}", signal);
         let _ = writeln!(file, "时间: {}", now);
-        let _ = writeln!(file, "═══════════════════════════════════════════════════════════\n");
+        let _ = writeln!(
+            file,
+            "═══════════════════════════════════════════════════════════\n"
+        );
         let _ = file.flush();
         eprintln!("✅ 关闭信息已写入: {}", log_path.display());
     }
@@ -204,7 +230,9 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 如果这里失败，会导致 panic，但 panic hook 会捕获并记录
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("❌ [FATAL] Rustls CryptoProvider 初始化失败，程序无法继续运行。这通常是系统环境问题。");
+        .expect(
+            "❌ [FATAL] Rustls CryptoProvider 初始化失败，程序无法继续运行。这通常是系统环境问题。",
+        );
 
     // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
@@ -312,8 +340,7 @@ async fn main() -> anyhow::Result<()> {
         // 启动健康检查循环（按配置）
         if proxy_config.health_check.enabled {
             let hc = &proxy_config.health_check;
-            pingora_service
-                .start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000 );
+            pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
         }
 
         // 在后台任务中启动 Pingora 服务器
@@ -343,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
         agent_runtime: agent_runtime.clone(),
         pingora_service: pingora_service_opt,
         api_key_manager, // 现在包装 shared_api_key_manager
-        shared_api_key_manager,
+        shared_api_key_manager: shared_api_key_manager.clone(),
         project_uuid_map,
     });
 
@@ -374,52 +401,78 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 启动 HTTP 服务器
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
-        .await
-        .map_err(|e| anyhow::anyhow!("HTTP 服务器绑定端口 {} 失败: {}", config.port, e))?;
-
-    info!("Server starting on port {}", config.port);
-    info!("API endpoints:");
-    info!("  POST /chat - Send chat message to AI agent (HTTP, legacy)");
-    info!("  GET  /progress/:session_id - SSE progress stream for AI tasks");
-    info!("  GET  /health - Health check");
     info!("gRPC endpoints (port {}):", grpc_port);
     info!("  agent.AgentService/Chat - gRPC chat");
     info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
     info!("  agent.AgentService/CancelSession - gRPC cancel");
     info!("  agent.AgentService/GetStatus - gRPC status");
 
-    if let Some(proxy_config) = &config.proxy_config {
-        info!("🚀 Pingora 反向代理服务已启用");
-        info!("📡 监听端口: {}", proxy_config.listen_port);
-        info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
-        info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
-        info!("💡 示例:");
-        info!(
-            "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
-            proxy_config.listen_port, config.port, config.port
-        );
-        info!(
-            "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
-            proxy_config.listen_port, config.port, config.port
-        );
-        info!(
-            "   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (动态发现)",
-            proxy_config.listen_port
-        );
-    }
+    // 启动 HTTP 服务器 (仅在 http-server feature 启用时)
+    #[cfg(feature = "http-server")]
+    {
+        use http_server::router::{AppState, create_router};
+        use std::net::SocketAddr;
 
-    // 并行运行 HTTP 和 gRPC 服务
-    tokio::select! {
-        result = axum::serve(listener, app) => {
-            if let Err(e) = result {
-                error!("HTTP 服务器错误: {}", e);
+        let state = Arc::new(AppState::new(
+            config.clone(),
+            agent_runtime.clone(),
+            shared_api_key_manager.clone(),
+        ));
+
+        let app = create_router(state);
+        let http_port = config.port;
+        let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
+
+        let http_handle = tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    info!("🚀 HTTP 服务器启动在端口 {}", http_port);
+                    info!("📄 API 文档: http://localhost:{}/api/docs", http_port);
+                    if let Err(e) = axum::serve(listener, app).await {
+                        error!("❌ HTTP 服务器错误: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("❌ HTTP 服务器绑定端口 {} 失败: {}", http_port, e);
+                }
+            }
+        });
+
+        info!("🚀 HTTP 服务器已启动在端口 {}", config.port);
+        info!("HTTP API endpoints:");
+        info!("  POST /computer/chat - Computer Agent chat");
+        info!("  POST /computer/agent/status - Computer Agent status");
+        info!("  POST /computer/agent/stop - Computer Agent stop");
+        info!("  POST /computer/agent/session/cancel - Computer Agent cancel");
+        info!("  GET  /computer/progress/:session_id - SSE progress stream");
+        info!("  GET  /health - Health check");
+        info!("  GET  /api/docs - Swagger API documentation");
+
+        if let Some(proxy_config) = &config.proxy_config {
+            info!("🚀 Pingora 反向代理服务已启用");
+            info!("📡 监听端口: {}", proxy_config.listen_port);
+            info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
+            info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
+        }
+
+        // 并行运行 HTTP 和 gRPC 服务
+        tokio::select! {
+            _ = http_handle => {
+                warn!("⚠️  HTTP 服务已停止");
+            }
+            _ = grpc_handle => {
+                warn!("⚠️  gRPC 服务已停止");
             }
         }
-        _ = grpc_handle => {
-            warn!("gRPC 服务已停止");
-        }
+    }
+
+    #[cfg(not(feature = "http-server"))]
+    {
+        info!("ℹ️  HTTP 服务器已禁用 (http-server feature 未启用)");
+        info!("ℹ️  仅运行 gRPC 服务");
+
+        // 仅等待 gRPC 服务
+        let _ = grpc_handle.await;
     }
 
     // 等待代理服务完成
@@ -466,7 +519,10 @@ async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHa
                 // 重启 worker
                 runtime.restart(new_rx).await;
                 consecutive_failures += 1;
-                info!("🔄 [HealthMonitor] Worker 重启完成（第 {} 次）", consecutive_failures);
+                info!(
+                    "🔄 [HealthMonitor] Worker 重启完成（第 {} 次）",
+                    consecutive_failures
+                );
             } else {
                 consecutive_failures = 0;
             }

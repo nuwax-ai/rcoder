@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [features]
 default = []
 
+# HTTP 服务器功能：启用 HTTP REST API 和 SSE 进度流
+# 禁用此 feature 后,应用将仅运行 gRPC 服务
+http-server = []
+
 # 测试相关 features
 testing = ["test-blocking"]
 test-blocking = []  # 启用测试用阻塞注入 (用于极端场景测试)
@@ -40,7 +44,7 @@ tempfile = { workspace = true }
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
-tower-http = { workspace = true, features = ["cors", "trace"] }
+tower-http = { workspace = true, features = ["cors", "trace", "limit"] }
 futures = { workspace = true }
 tokio-stream = "0.1"
 async-stream = "0.3"
