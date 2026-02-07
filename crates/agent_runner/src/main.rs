@@ -317,53 +317,14 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // 🔒 project_id -> service_uuid 映射
-    let project_uuid_map = Arc::new(DashMap::new());
+    let project_uuid_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
-    // 启动 gRPC 服务（两种模式都需要）
-    let grpc_port = shared_types::GRPC_DEFAULT_PORT;
-    let grpc_addr = format!("[::]:{}", grpc_port)
-        .parse()
-        .map_err(|e| anyhow::anyhow!("gRPC 地址解析失败: {}", e))?;
-
-    // 为 gRPC 创建 state（两种模式都需要）
-    let grpc_state = Arc::new(AppState {
-        sessions: Arc::new(DashMap::new()),
-        config: config.clone(),
-        local_task_sender: agent_runtime.clone(),
-        agent_runtime: agent_runtime.clone(),
-        pingora_service: None, // http-server 模式下由 start_http_server 管理
-        api_key_manager: api_key_manager.clone(),
-        shared_api_key_manager: shared_api_key_manager.clone(),
-        project_uuid_map: project_uuid_map.clone(),
-    });
-
-    // gRPC 消息大小限制
-    let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
-        grpc::AgentServiceImpl::new(grpc_state.clone()),
-    )
-    .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
-    .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
-
-    let grpc_handle = tokio::spawn(async move {
-        info!("🚀 gRPC 服务启动，监听端口: {}", grpc_port);
-        info!("gRPC endpoints (port {}):", grpc_port);
-        info!("  agent.AgentService/Chat - gRPC chat");
-        info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
-        info!("  agent.AgentService/CancelSession - gRPC cancel");
-        info!("  agent.AgentService/GetStatus - gRPC status");
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(grpc_service)
-            .serve(grpc_addr)
-            .await
-        {
-            error!("gRPC 服务器错误: {}", e);
-        }
-    });
-
-    // 🔥 http-server 模式：统一由 start_http_server 管理 HTTP + Pingora + gRPC
+    // 🔥 http-server 模式：只启动 HTTP + Pingora（不需要 gRPC）
     #[cfg(feature = "http-server")]
     {
-        use http_server::{start_http_server, HttpServerConfig};
+        use http_server::{HttpServerConfig, start_http_server};
+
+        info!("ℹ️  HTTP 服务器模式：仅启动 HTTP + Pingora，不启动 gRPC");
 
         // 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {
@@ -373,25 +334,67 @@ async fn main() -> anyhow::Result<()> {
             shared_api_key_manager: shared_api_key_manager.clone(),
         };
 
-        // 启动 HTTP 服务器（内部会启动 Pingora，HTTP 和 gRPC 并行运行）
-        let _http_proxy_handle = tokio::spawn(async move {
-            if let Err(e) = start_http_server(http_config).await {
-                error!("HTTP/Pingora 服务器错误: {}", e);
-            }
-        });
+        // 启动 HTTP 服务器（内部会启动 Pingora）
+        let _handle = start_http_server(http_config).await?;
 
-        info!("🚀 HTTP + Pingora 服务已启动（由 http-server feature 管理）");
+        // 永久等待（直到收到关闭信号）
+        info!("🚀 HTTP + Pingora 服务已启动，程序将持续运行直到收到关闭信号");
 
-        // 等待 gRPC 服务
-        let _ = grpc_handle.await;
+        // 等待 Ctrl+C 或 SIGTERM 信号
+        tokio::signal::ctrl_c().await?;
+
+        info!("📨 收到关闭信号，准备优雅关闭...");
 
         Ok(())
     }
 
-    // 🔥 non-http-server 模式：手动启动 Pingora + gRPC
+    // 🔥 non-http-server 模式：启动 gRPC + Pingora（用于 Docker 容器内）
     #[cfg(not(feature = "http-server"))]
     {
-        // 启动 Pingora（如有配置）- 使用抽取的 start_pingora 函数
+        info!("ℹ️  容器模式：启动 gRPC + Pingora");
+
+        // 启动 gRPC 服务
+        let grpc_port = shared_types::GRPC_DEFAULT_PORT;
+        let grpc_addr = format!("[::]:{}", grpc_port)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("gRPC 地址解析失败: {}", e))?;
+
+        // 为 gRPC 创建 state
+        let grpc_state = Arc::new(AppState {
+            sessions: Arc::new(DashMap::new()),
+            config: config.clone(),
+            local_task_sender: agent_runtime.clone(),
+            agent_runtime: agent_runtime.clone(),
+            pingora_service: None,
+            api_key_manager: api_key_manager.clone(),
+            shared_api_key_manager: shared_api_key_manager.clone(),
+            project_uuid_map: project_uuid_map.clone(),
+        });
+
+        // gRPC 消息大小限制
+        let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
+            grpc::AgentServiceImpl::new(grpc_state.clone()),
+        )
+        .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
+
+        let grpc_handle = tokio::spawn(async move {
+            info!("🚀 gRPC 服务启动，监听端口: {}", grpc_port);
+            info!("gRPC endpoints (port {}):", grpc_port);
+            info!("  agent.AgentService/Chat - gRPC chat");
+            info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
+            info!("  agent.AgentService/CancelSession - gRPC cancel");
+            info!("  agent.AgentService/GetStatus - gRPC status");
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(grpc_service)
+                .serve(grpc_addr)
+                .await
+            {
+                error!("gRPC 服务器错误: {}", e);
+            }
+        });
+
+        // 启动 Pingora（如有配置）
         use proxy_agent::start_pingora;
 
         let pingora_result = if let Some(proxy_config) = &config.proxy_config {
@@ -400,9 +403,6 @@ async fn main() -> anyhow::Result<()> {
             info!("ℹ️  Pingora 代理服务未配置");
             None
         };
-
-        info!("ℹ️  HTTP 服务器已禁用 (http-server feature 未启用)");
-        info!("ℹ️  运行 gRPC + Pingora（如已配置）");
 
         // 等待 gRPC 服务
         let _ = grpc_handle.await;
