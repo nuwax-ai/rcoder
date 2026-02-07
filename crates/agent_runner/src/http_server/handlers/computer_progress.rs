@@ -8,9 +8,10 @@ use axum::{
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::stream::{Stream, StreamExt};
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
@@ -19,6 +20,9 @@ use tracing::{error, info, warn};
 use crate::http_server::router::AppState;
 use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
 use shared_types::{AgentStatus, HttpResult, SessionMessageType, UnifiedSessionMessage};
+
+/// 统一的 SSE 流类型
+type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 /// 检查 Agent 是否处于 idle 状态
 ///
@@ -30,7 +34,7 @@ async fn is_agent_idle(session_id: &str) -> bool {
     // 通过 session_id 获取 agent_info
     if let Some(info) = AGENT_REGISTRY.get_agent_info_by_session(session_id) {
         // 检查状态是否为 Idle，或者 session_id 是否匹配
-        info.status() == AgentStatus::Idle || info.session_id().raw_id() != session_id
+        info.status == AgentStatus::Idle || info.session_id.to_string() != session_id
     } else {
         // Agent 不存在，视为 idle
         true
@@ -128,10 +132,7 @@ fn create_heartbeat_stream(
 pub async fn handle_computer_progress(
     State(_state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-) -> Result<
-    Sse<impl Stream<Item = Result<Event, Infallible>>>,
-    (StatusCode, Json<HttpResult<String>>),
-> {
+) -> Result<Sse<SseStream>, (StatusCode, Json<HttpResult<String>>)> {
     info!(
         "📡 [HTTP] Computer Agent 进度流订阅: session_id={}",
         session_id
@@ -144,7 +145,8 @@ pub async fn handle_computer_progress(
             session_id
         );
         let end_event = create_idle_end_event(&session_id);
-        return Ok(Sse::new(futures_util::stream::iter([Ok(end_event)])));
+        let stream: SseStream = Box::pin(futures_util::stream::iter([Ok(end_event)]));
+        return Ok(Sse::new(stream));
     }
 
     // 1. 从 SESSION_CACHE 获取 session_data
@@ -205,5 +207,6 @@ pub async fn handle_computer_progress(
 
     info!("✅ [HTTP] SSE 流已建立: session_id={}", session_id);
 
-    Ok(Sse::new(merged_stream).keep_alive(KeepAlive::default()))
+    let stream: SseStream = Box::pin(merged_stream);
+    Ok(Sse::new(stream))
 }
