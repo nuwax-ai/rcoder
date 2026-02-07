@@ -6,8 +6,9 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::agent_runtime::AgentRuntime;
@@ -33,28 +34,22 @@ pub struct HttpServerConfig {
 /// 用于控制 HTTP 服务器的生命周期
 #[derive(Clone)]
 pub struct HttpServerHandle {
-    /// HTTP 服务关闭发送端 (使用 Arc 以支持 Clone)
-    http_shutdown: Option<Arc<oneshot::Sender<()>>>,
-    /// Pingora 服务关闭发送端 (使用 Arc 以支持 Clone)
-    pingora_shutdown: Option<Arc<oneshot::Sender<()>>>,
+    /// HTTP 服务关闭标志 (使用 AtomicBool 以支持 Clone)
+    http_shutdown: Arc<AtomicBool>,
+    /// Pingora 服务关闭标志 (使用 AtomicBool 以支持 Clone)
+    pingora_shutdown: Arc<AtomicBool>,
 }
 
 impl HttpServerHandle {
     /// 停止 HTTP 服务器
-    pub async fn stop(self) {
+    pub async fn stop(&self) {
         info!("正在停止 HTTP 服务器...");
 
-        // 发送 HTTP 关闭信号 (需要 clone Arc 以支持 Copy)
-        if let Some(tx) = self.http_shutdown {
-            let tx = (*tx).clone();
-            let _ = tx.send(());
-        }
+        // 发送 HTTP 关闭信号
+        self.http_shutdown.store(true, Ordering::SeqCst);
 
-        // 发送 Pingora 关闭信号 (需要 clone Arc 以支持 Copy)
-        if let Some(tx) = self.pingora_shutdown {
-            let tx = (*tx).clone();
-            let _ = tx.send(());
-        }
+        // 发送 Pingora 关闭信号
+        self.pingora_shutdown.store(true, Ordering::SeqCst);
 
         info!("HTTP 服务器停止信号已发送");
     }
@@ -105,8 +100,8 @@ impl HttpServerHandle {
 /// ```
 pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHandle> {
     // 创建关闭通道
-    let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel();
-    let (pingora_shutdown_tx, pingora_shutdown_rx) = oneshot::channel();
+    let http_shutdown = Arc::new(AtomicBool::new(false));
+    let pingora_shutdown = Arc::new(AtomicBool::new(false));
 
     // 1. 启动 Agent 清理任务
     let cleanup_config = CleanupConfig {
@@ -157,29 +152,45 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
 
     // 6. 并行运行 HTTP 和 Pingora 服务
     let handle = HttpServerHandle {
-        http_shutdown: Some(Arc::new(http_shutdown_tx)),
-        pingora_shutdown: Some(Arc::new(pingora_shutdown_tx)),
+        http_shutdown: http_shutdown.clone(),
+        pingora_shutdown: pingora_shutdown.clone(),
     };
 
+    // 用于接收关闭信号
+    let http_shutdown_flag = http_shutdown.clone();
+    let pingora_shutdown_flag = pingora_shutdown.clone();
+
     tokio::spawn(async move {
-        tokio::select! {
-            _ = axum::serve(listener, app) => {
-                warn!("HTTP 服务已停止");
-            }
-            _ = http_shutdown_rx => {
-                warn!("收到 HTTP 关闭信号");
+        loop {
+            tokio::select! {
+                _ = axum::serve(listener, app) => {
+                    warn!("HTTP 服务已停止");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if http_shutdown_flag.load(Ordering::SeqCst) {
+                        warn!("收到 HTTP 关闭信号");
+                        break;
+                    }
+                }
             }
         }
     });
 
     tokio::spawn(async move {
         if let Some(result) = pingora_result {
-            tokio::select! {
-                _ = result.handle => {
-                    warn!("Pingora 代理服务已停止");
-                }
-                _ = pingora_shutdown_rx => {
-                    warn!("收到 Pingora 关闭信号");
+            loop {
+                tokio::select! {
+                    _ = result.handle => {
+                        warn!("Pingora 代理服务已停止");
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if pingora_shutdown_flag.load(Ordering::SeqCst) {
+                            warn!("收到 Pingora 关闭信号");
+                            break;
+                        }
+                    }
                 }
             }
         }
