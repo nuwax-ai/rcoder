@@ -15,6 +15,7 @@ use crate::agent_runtime::AgentRuntime;
 use crate::config::AppConfig;
 use crate::http_server::router::{AppState, create_router};
 use crate::proxy_agent::cleanup_task::{start_cleanup_task, CleanupConfig};
+use crate::proxy_agent::set_unlimited_mode;
 use crate::proxy_agent::start_pingora;
 
 /// HTTP 服务器配置
@@ -134,6 +135,9 @@ impl HttpServerHandle {
 /// }
 /// ```
 pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHandle> {
+    // 设置无限制模式（HTTP Server 部署不限制槽位）
+    set_unlimited_mode(true);
+
     // 创建关闭信号令牌
     let shutdown_token = CancellationToken::new();
     let join_set = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
