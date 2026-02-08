@@ -316,11 +316,9 @@ pub async fn agent_worker_with_heartbeat(
             let timestamp = Utc::now();
 
             // 📊 打印当前 Worker 占用情况
-            let total = AGENT_REGISTRY.active_sessions_count();
-
             if IS_UNLIMITED_MODE.load(Ordering::SeqCst) {
-                // 无限制模式（HTTP Server 部署）
-                info!("💓 [Worker] 心跳 - 活跃会话: {} (无限制)", total);
+                // 无限制模式（HTTP Server 部署）- 不显示具体数量，避免误解
+                info!("💓 [Worker] 心跳 - 活跃会话: (无限制)");
             } else {
                 // 限制模式（Docker 容器部署）
                 let active = AGENT_REGISTRY.stats().agent_count;
