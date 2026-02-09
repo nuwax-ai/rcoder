@@ -7,6 +7,12 @@ license = "MIT OR Apache-2.0"
 description = "Agent abstraction layer for RCoder"
 publish = false
 
+[features]
+default = []
+# Pingora 代理模式：API Key 和 Base URL 使用占位符，由 Pingora 代理注入真实值
+# Windows 不支持 Pingora，禁用此 feature 时直接使用真实的 API Key 和 Base URL
+proxy = []
+
 [dependencies]
 # 依赖其他 crate
 agent_config = { path = "../agent_config" }

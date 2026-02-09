@@ -16,6 +16,7 @@ use crate::config::AppConfig;
 use crate::http_server::router::{AppState, create_router};
 use crate::proxy_agent::cleanup_task::{start_cleanup_task, CleanupConfig};
 use crate::proxy_agent::set_unlimited_mode;
+#[cfg(feature = "proxy")]
 use crate::proxy_agent::start_pingora;
 
 /// HTTP 服务器配置
@@ -40,6 +41,7 @@ pub struct HttpServerHandle {
     /// 活跃任务集合
     join_set: Arc<tokio::sync::Mutex<JoinSet<()>>>,
     /// Pingora 结果（用于调用 stop）
+    #[cfg(feature = "proxy")]
     pingora_result: Arc<tokio::sync::Mutex<Option<crate::proxy_agent::PingoraStartResult>>>,
 }
 
@@ -57,6 +59,7 @@ impl HttpServerHandle {
         self.shutdown_token.cancel();
 
         // 2. 停止 Pingora 服务
+        #[cfg(feature = "proxy")]
         {
             let mut pingora_guard = self.pingora_result.lock().await;
             if let Some(mut pingora) = pingora_guard.take() {
@@ -141,6 +144,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     // 创建关闭信号令牌
     let shutdown_token = CancellationToken::new();
     let join_set = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
+    #[cfg(feature = "proxy")]
     let pingora_result = Arc::new(tokio::sync::Mutex::new(None));
 
     // 1. 启动 Agent 清理任务
@@ -164,7 +168,8 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
         }
     });
 
-    // 2. 启动 Pingora 代理服务（如果配置了）
+    // 2. 启动 Pingora 代理服务（如果配置了且启用了 proxy feature）
+    #[cfg(feature = "proxy")]
     if let Some(proxy_config) = &config.app_config.proxy_config {
         let result = start_pingora(proxy_config, config.shared_api_key_manager.clone());
         // 保存 Pingora 结果以便后续调用 stop
@@ -172,6 +177,9 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     } else {
         info!("Pingora 代理服务未配置，跳过启动");
     }
+
+    #[cfg(not(feature = "proxy"))]
+    info!("Pingora 代理服务未启用 (proxy feature 未开启)");
 
     // 3. 创建 HTTP 应用状态
     let state = Arc::new(AppState::new(
@@ -220,6 +228,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     let handle = HttpServerHandle {
         shutdown_token,
         join_set,
+        #[cfg(feature = "proxy")]
         pingora_result,
     };
 

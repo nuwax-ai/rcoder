@@ -10,22 +10,27 @@ pub use acp_agent::{
 };
 use shared_types::AgentLifecycleGuard;
 // SACP 类型导入
+#[cfg(feature = "proxy")]
 use crate::config::ProxyConfig;
 use dashmap::DashMap;
+#[cfg(feature = "proxy")]
 use rcoder_proxy::{PingoraServerManager, ProxyConfig as PingoraProxyConfig};
 use sacp::schema::{PromptRequest, SessionId};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
+#[cfg(feature = "proxy")]
 use tracing::{error, info};
 
 /// Pingora 启动结果
 ///
 /// 持有关闭信号的发送端，`stop()` 时直接发送信号，无需 Mutex 锁。
+#[cfg(feature = "proxy")]
 pub struct PingoraStartResult {
     /// 关闭信号发送端
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+#[cfg(feature = "proxy")]
 impl PingoraStartResult {
     /// 停止 Pingora 服务器
     pub async fn stop(&mut self) {
@@ -39,6 +44,7 @@ impl PingoraStartResult {
 ///
 /// 封装 Pingora 的创建和启动逻辑，供 main.rs 和 http_server/start.rs 复用。
 /// shutdown 通道在外部创建，`stop()` 直接发送信号，不经过 Mutex，消除死锁风险。
+#[cfg(feature = "proxy")]
 #[must_use]
 pub fn start_pingora(
     proxy_config: &ProxyConfig,

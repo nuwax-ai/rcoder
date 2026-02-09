@@ -36,6 +36,7 @@ use agent_runtime::AgentRuntime;
 use config::{CliArgs, load_config_with_args};
 use model::*;
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
+#[cfg(feature = "proxy")]
 use rcoder_proxy::{PingoraServerManager, ProxyConfig};
 use router::AppState;
 use std::fs::OpenOptions;
@@ -369,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
             config: config.clone(),
             local_task_sender: agent_runtime.clone(),
             agent_runtime: agent_runtime.clone(),
+            #[cfg(feature = "proxy")]
             pingora_service: None,
             api_key_manager: api_key_manager.clone(),
             shared_api_key_manager: shared_api_key_manager.clone(),
@@ -398,13 +400,55 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        // 启动 Pingora（如有配置）
-        use proxy_agent::start_pingora;
+        // 启动轻量 HTTP 健康检查服务（供 docker_manager 健康检查使用）
+        let health_port = config.port; // 默认 8086，来自 --port 参数
+        let _health_handle = tokio::spawn(async move {
+            use axum::{Json, Router, routing::get};
 
-        let pingora_result = if let Some(proxy_config) = &config.proxy_config {
-            Some(start_pingora(proxy_config, shared_api_key_manager.clone()))
-        } else {
-            info!("ℹ️  Pingora 代理服务未配置");
+            async fn health_check() -> Json<shared_types::HealthResponse> {
+                Json(shared_types::HealthResponse::new("agent-runner"))
+            }
+
+            let app = Router::new().route("/health", get(health_check));
+            let addr = format!("0.0.0.0:{}", health_port);
+
+            info!(
+                "🏥 HTTP 健康检查服务启动，监听端口: {}",
+                health_port
+            );
+
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(
+                        "❌ HTTP 健康检查服务绑定失败: {} (端口: {})",
+                        e, health_port
+                    );
+                    return;
+                }
+            };
+
+            if let Err(e) = axum::serve(listener, app).await {
+                error!("❌ HTTP 健康检查服务错误: {}", e);
+            }
+        });
+
+        // 启动 Pingora（如有配置且启用了 proxy feature）
+        #[cfg(feature = "proxy")]
+        let pingora_result = {
+            use proxy_agent::start_pingora;
+
+            if let Some(proxy_config) = &config.proxy_config {
+                Some(start_pingora(proxy_config, shared_api_key_manager.clone()))
+            } else {
+                info!("ℹ️  Pingora 代理服务未配置");
+                None
+            }
+        };
+
+        #[cfg(not(feature = "proxy"))]
+        let pingora_result: Option<()> = {
+            info!("ℹ️  Pingora 代理服务未启用 (proxy feature 未开启)");
             None
         };
 
@@ -412,9 +456,13 @@ async fn main() -> anyhow::Result<()> {
         let _ = grpc_handle.await;
 
         // 停止 Pingora 服务
+        #[cfg(feature = "proxy")]
         if let Some(mut result) = pingora_result {
             result.stop().await;
         }
+
+        #[cfg(not(feature = "proxy"))]
+        let _ = pingora_result;
 
         Ok(())
     }

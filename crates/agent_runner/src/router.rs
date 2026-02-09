@@ -39,6 +39,7 @@ pub struct AppState {
     pub agent_runtime: Arc<AgentRuntime>,
 
     /// Pingora 代理服务引用（用于读取真实指标）
+    #[cfg(feature = "proxy")]
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
 
     /// 🔒 API 密钥管理器（用于 Pingora 代理注入真实密钥）

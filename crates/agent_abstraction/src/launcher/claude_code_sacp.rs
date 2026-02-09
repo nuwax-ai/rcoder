@@ -63,6 +63,24 @@ const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
 /// 默认代理 Base URL（包含 UUID 占位符）
 const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
 
+/// 根据 proxy feature 决定使用占位符还是真实 API Key
+fn resolve_api_key(provider: &ModelProviderConfig) -> String {
+    if cfg!(feature = "proxy") {
+        API_KEY_PLACEHOLDER.to_string()
+    } else {
+        provider.api_key.clone()
+    }
+}
+
+/// 根据 proxy feature 决定使用代理 URL 还是真实 Base URL
+fn resolve_base_url(provider: &ModelProviderConfig) -> String {
+    if cfg!(feature = "proxy") {
+        DEFAULT_PROXY_BASE_URL.to_string()
+    } else {
+        provider.base_url.clone()
+    }
+}
+
 /// Agent 配置参数 (与旧版兼容)
 #[derive(Debug, Clone)]
 pub struct SacpAgentLaunchConfig {
@@ -127,11 +145,14 @@ pub async fn load_sacp_agent_config(
 
         if let Some(provider) = model_provider {
             // 统一替换所有环境变量中的模板
-            // API_KEY 和 BASE_URL 必须使用占位符/代理URL，由 Pingora 代理注入真实值
+            // proxy 模式下：API_KEY 和 BASE_URL 使用占位符/代理URL，由 Pingora 代理注入真实值
+            // 非 proxy 模式下：直接使用真实的 API Key 和 Base URL
+            let resolved_key = resolve_api_key(provider);
+            let resolved_url = resolve_base_url(provider);
             for (_key, value) in resolved_env.iter_mut() {
                 *value = value
-                    .replace("{MODEL_PROVIDER_API_KEY}", API_KEY_PLACEHOLDER)
-                    .replace("{MODEL_PROVIDER_BASE_URL}", DEFAULT_PROXY_BASE_URL)
+                    .replace("{MODEL_PROVIDER_API_KEY}", &resolved_key)
+                    .replace("{MODEL_PROVIDER_BASE_URL}", &resolved_url)
                     .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
                     .replace("{MODEL_PROVIDER_NAME}", &provider.name);
             }
@@ -160,17 +181,20 @@ pub fn get_default_sacp_agent_config(
     let mut env = HashMap::new();
 
     if let Some(provider) = model_provider {
+        let resolved_key = resolve_api_key(provider);
+        let resolved_url = resolve_base_url(provider);
+
         // Anthropic 环境变量
         if !provider.api_key.is_empty() {
             env.insert(
                 ENV_ANTHROPIC_API_KEY.to_string(),
-                API_KEY_PLACEHOLDER.to_string(),
+                resolved_key.clone(),
             );
         }
         if !provider.base_url.is_empty() {
             env.insert(
                 ENV_ANTHROPIC_BASE_URL.to_string(),
-                DEFAULT_PROXY_BASE_URL.to_string(),
+                resolved_url.clone(),
             );
         }
         if !provider.default_model.is_empty() {
@@ -184,13 +208,13 @@ pub fn get_default_sacp_agent_config(
         if !provider.api_key.is_empty() {
             env.insert(
                 ENV_OPENAI_API_KEY.to_string(),
-                API_KEY_PLACEHOLDER.to_string(),
+                resolved_key,
             );
         }
         if !provider.base_url.is_empty() {
             env.insert(
                 ENV_OPENAI_BASE_URL.to_string(),
-                DEFAULT_PROXY_BASE_URL.to_string(),
+                resolved_url,
             );
         }
         if !provider.default_model.is_empty() {
@@ -342,16 +366,15 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
                 // 🔧 关键修复：替换自定义环境变量中的模板变量
                 // 用户可能传入 {MODEL_PROVIDER_API_KEY} 等模板，需要替换为实际值
-                // 注意：API_KEY 和 BASE_URL 必须使用占位符/代理URL，由 Pingora 代理注入真实值
+                // proxy 模式下：API_KEY 和 BASE_URL 使用占位符/代理URL，由 Pingora 代理注入真实值
+                // 非 proxy 模式下：直接使用真实的 API Key 和 Base URL
                 if let Some(ref provider) = model_provider {
+                    let resolved_key = resolve_api_key(provider);
+                    let resolved_url = resolve_base_url(provider);
                     for (_key, value) in env.iter_mut() {
-                        // 所有变量统一替换：
-                        // - API_KEY 模板 → 占位符（Pingora 代理注入）
-                        // - BASE_URL 模板 → 代理 URL（Pingora 代理转发）
-                        // - MODEL 和 NAME 模板 → 真实值
                         *value = value
-                            .replace("{MODEL_PROVIDER_API_KEY}", API_KEY_PLACEHOLDER)
-                            .replace("{MODEL_PROVIDER_BASE_URL}", DEFAULT_PROXY_BASE_URL)
+                            .replace("{MODEL_PROVIDER_API_KEY}", &resolved_key)
+                            .replace("{MODEL_PROVIDER_BASE_URL}", &resolved_url)
                             .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
                             .replace("{MODEL_PROVIDER_NAME}", &provider.name);
                     }
@@ -422,48 +445,52 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         }
 
-        // 🔒 安全防护：强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
+        // 🔒 安全防护：proxy 模式下强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
         // 即使用户在配置中直接写了真实的 API_KEY 或 BASE_URL，也会被替换
-        if model_provider.is_some() {
-            // 强制替换 Anthropic 敏感变量
-            if merged_envs.contains_key(ENV_ANTHROPIC_API_KEY) {
-                merged_envs.insert(
-                    ENV_ANTHROPIC_API_KEY.to_string(),
-                    API_KEY_PLACEHOLDER.to_string(),
-                );
-            }
-            if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
-                merged_envs.insert(
-                    ENV_ANTHROPIC_BASE_URL.to_string(),
-                    service_uuid
-                        .as_ref()
-                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
-                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
-                );
-            }
+        if cfg!(feature = "proxy") {
+            if model_provider.is_some() {
+                // 强制替换 Anthropic 敏感变量
+                if merged_envs.contains_key(ENV_ANTHROPIC_API_KEY) {
+                    merged_envs.insert(
+                        ENV_ANTHROPIC_API_KEY.to_string(),
+                        API_KEY_PLACEHOLDER.to_string(),
+                    );
+                }
+                if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
+                    merged_envs.insert(
+                        ENV_ANTHROPIC_BASE_URL.to_string(),
+                        service_uuid
+                            .as_ref()
+                            .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                            .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
+                    );
+                }
 
-            // 强制替换 OpenAI 敏感变量
-            if merged_envs.contains_key(ENV_OPENAI_API_KEY) {
-                merged_envs.insert(
-                    ENV_OPENAI_API_KEY.to_string(),
-                    API_KEY_PLACEHOLDER.to_string(),
-                );
-            }
-            if merged_envs.contains_key(ENV_OPENAI_BASE_URL) {
-                merged_envs.insert(
-                    ENV_OPENAI_BASE_URL.to_string(),
-                    service_uuid
-                        .as_ref()
-                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
-                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
-                );
-            }
+                // 强制替换 OpenAI 敏感变量
+                if merged_envs.contains_key(ENV_OPENAI_API_KEY) {
+                    merged_envs.insert(
+                        ENV_OPENAI_API_KEY.to_string(),
+                        API_KEY_PLACEHOLDER.to_string(),
+                    );
+                }
+                if merged_envs.contains_key(ENV_OPENAI_BASE_URL) {
+                    merged_envs.insert(
+                        ENV_OPENAI_BASE_URL.to_string(),
+                        service_uuid
+                            .as_ref()
+                            .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                            .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
+                    );
+                }
 
-            debug!("[SACP] 🔒 已强制替换敏感环境变量为占位符/代理 URL");
+                debug!("[SACP] 🔒 已强制替换敏感环境变量为占位符/代理 URL");
+            }
+        } else {
+            debug!("[SACP] 🔓 非代理模式，使用真实 API Key 和 Base URL");
         }
 
         // 🔍 打印传递给 Agent 的完整环境变量（用于调试）
-        // 注意：此时敏感字段已被安全替换，可以放心打印
+        // 注意：敏感字段（API Key）需要脱敏处理，防止日志泄露
         debug!(
             "[SACP] 📋 启动 Agent 命令: {} {:?}",
             command_path, command_args
@@ -474,13 +501,29 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             merged_envs.len()
         );
 
+        // 需要脱敏的环境变量 key 列表
+        const SENSITIVE_ENV_KEYS: &[&str] = &[
+            ENV_ANTHROPIC_API_KEY,
+            ENV_OPENAI_API_KEY,
+        ];
+
         // 按字母顺序排序并打印所有环境变量
         let mut env_keys: Vec<_> = merged_envs.keys().collect();
         env_keys.sort();
 
         for key in env_keys.iter() {
             let value = merged_envs.get(*key).unwrap();
-            info!("[SACP] 📋   {} = {}", key, value);
+            if SENSITIVE_ENV_KEYS.contains(&key.as_str()) {
+                // 脱敏：只显示前4个字符 + ***
+                let masked = if value.len() > 4 {
+                    format!("{}***", &value[..4])
+                } else {
+                    "***".to_string()
+                };
+                info!("[SACP] 📋   {} = {}", key, masked);
+            } else {
+                info!("[SACP] 📋   {} = {}", key, value);
+            }
         }
 
         // 启动子进程（使用 process group 来管理整个进程树）
@@ -1141,12 +1184,19 @@ mod tests {
         assert!(config.is_ok());
         let config = config.unwrap();
 
-        // 应该包含 API 占位符
+        // 验证 API Key：proxy 模式下为占位符，非 proxy 模式下为真实值
         assert!(config.env.contains_key("ANTHROPIC_API_KEY"));
-        assert_eq!(
-            config.env.get("ANTHROPIC_API_KEY"),
-            Some(&API_KEY_PLACEHOLDER.to_string())
-        );
+        if cfg!(feature = "proxy") {
+            assert_eq!(
+                config.env.get("ANTHROPIC_API_KEY"),
+                Some(&API_KEY_PLACEHOLDER.to_string())
+            );
+        } else {
+            assert_eq!(
+                config.env.get("ANTHROPIC_API_KEY"),
+                Some(&"sk-test-key".to_string())
+            );
+        }
 
         // 应该包含模型设置
         assert!(config.env.contains_key("ANTHROPIC_MODEL"));
@@ -1187,16 +1237,27 @@ mod tests {
 
         // 验证 OpenAI 环境变量
         assert!(config.env.contains_key("OPENAI_API_KEY"));
-        assert_eq!(
-            config.env.get("OPENAI_API_KEY"),
-            Some(&API_KEY_PLACEHOLDER.to_string())
-        );
-
         assert!(config.env.contains_key("OPENAI_BASE_URL"));
-        assert_eq!(
-            config.env.get("OPENAI_BASE_URL"),
-            Some(&DEFAULT_PROXY_BASE_URL.to_string())
-        );
+
+        if cfg!(feature = "proxy") {
+            assert_eq!(
+                config.env.get("OPENAI_API_KEY"),
+                Some(&API_KEY_PLACEHOLDER.to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_BASE_URL"),
+                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+            );
+        } else {
+            assert_eq!(
+                config.env.get("OPENAI_API_KEY"),
+                Some(&"sk-test-openai-key".to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_BASE_URL"),
+                Some(&"https://api.openai.com/v1".to_string())
+            );
+        }
 
         // nuwaxcode 使用 OPENCODE_MODEL，直接使用 model_name（已包含 openai-compatible/ 前缀）
         assert!(config.env.contains_key("OPENCODE_MODEL"));
@@ -1212,8 +1273,9 @@ mod tests {
 
     #[test]
     fn test_sensitive_env_vars_protection() {
-        // 测试即使配置中有真实的 API_KEY，也会被 launch 函数强制替换为占位符
-        // 注意：这个测试验证的是设计意图，实际的强制替换发生在 launch 函数中
+        // 测试默认配置中的环境变量值
+        // proxy 模式下：API_KEY 和 BASE_URL 为占位符/代理 URL
+        // 非 proxy 模式下：API_KEY 和 BASE_URL 为真实值
         let provider = ModelProviderConfig {
             id: "test".to_string(),
             name: "test".to_string(),
@@ -1229,25 +1291,43 @@ mod tests {
         assert!(config.is_ok());
         let config = config.unwrap();
 
-        // 验证默认配置中敏感变量已经是占位符
-        assert_eq!(
-            config.env.get("ANTHROPIC_API_KEY"),
-            Some(&API_KEY_PLACEHOLDER.to_string())
-        );
-        assert_eq!(
-            config.env.get("OPENAI_API_KEY"),
-            Some(&API_KEY_PLACEHOLDER.to_string())
-        );
-
-        // BASE_URL 应该是代理 URL（包含占位符）
-        assert_eq!(
-            config.env.get("ANTHROPIC_BASE_URL"),
-            Some(&DEFAULT_PROXY_BASE_URL.to_string())
-        );
-        assert_eq!(
-            config.env.get("OPENAI_BASE_URL"),
-            Some(&DEFAULT_PROXY_BASE_URL.to_string())
-        );
+        if cfg!(feature = "proxy") {
+            // proxy 模式下：敏感变量应该是占位符
+            assert_eq!(
+                config.env.get("ANTHROPIC_API_KEY"),
+                Some(&API_KEY_PLACEHOLDER.to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_API_KEY"),
+                Some(&API_KEY_PLACEHOLDER.to_string())
+            );
+            assert_eq!(
+                config.env.get("ANTHROPIC_BASE_URL"),
+                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_BASE_URL"),
+                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+            );
+        } else {
+            // 非 proxy 模式下：使用真实值
+            assert_eq!(
+                config.env.get("ANTHROPIC_API_KEY"),
+                Some(&"sk-real-key-should-be-replaced".to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_API_KEY"),
+                Some(&"sk-real-key-should-be-replaced".to_string())
+            );
+            assert_eq!(
+                config.env.get("ANTHROPIC_BASE_URL"),
+                Some(&"https://real-url-should-be-replaced.com".to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_BASE_URL"),
+                Some(&"https://real-url-should-be-replaced.com".to_string())
+            );
+        }
     }
 
     #[test]
