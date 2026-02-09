@@ -68,7 +68,8 @@ impl HttpServerHandle {
         }
 
         // 3. 等待所有任务完成（带超时）
-        let timeout = Duration::from_secs(30);
+        // 使用 3 秒超时：清理任务会立即退出，axum 有 3 秒进行连接排空
+        let timeout = Duration::from_secs(3);
         let mut join_set = self.join_set.lock().await;
 
         loop {
@@ -84,7 +85,8 @@ impl HttpServerHandle {
                     break;
                 }
                 Err(_) => {
-                    warn!("等待任务完成超时");
+                    warn!("等待任务完成超时（3s），强制终止残留任务");
+                    join_set.abort_all();
                     break;
                 }
             }
