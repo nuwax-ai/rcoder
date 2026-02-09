@@ -64,11 +64,14 @@ rmcp = { workspace = true }
 # 序列化
 serde = { workspace = true }
 
+# 进程组管理（用于清理整个进程树）
+# Unix: process-group (setpgid), Windows: job-object
+# process-wrap 内部通过 #[cfg] 控制各平台类型的可用性
+process-wrap = { version = "9.0", features = ["tokio1", "process-group", "job-object"] }
+
+[target.'cfg(unix)'.dependencies]
 # Unix 信号处理
 nix = { workspace = true, features = ["signal"] }
-
-# 进程组管理（用于清理整个进程树）
-process-wrap = { version = "9.0", features = ["tokio1", "process-group"] }
 
 [dev-dependencies]
 tempfile = "3.8"

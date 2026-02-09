@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::process::Child;
 use tracing::{debug, info, warn, error};
@@ -322,6 +323,7 @@ pub fn start_process_reaper_with_config(config: ReaperConfig) -> tokio::task::Jo
 }
 
 /// 核心回收逻辑
+#[cfg(unix)]
 async fn run_reaper(config: ReaperConfig) {
     info!("[ProcessReaper] 僵尸进程回收器已启动 (PID 1 模式)");
     if config.enable_zombie_detection {
@@ -364,7 +366,14 @@ async fn run_reaper(config: ReaperConfig) {
     }
 }
 
+/// Windows 上的回收逻辑（无操作，Windows 没有僵尸进程问题）
+#[cfg(not(unix))]
+async fn run_reaper(_config: ReaperConfig) {
+    info!("[ProcessReaper] 非 Unix 平台，僵尸进程回收器不适用");
+}
+
 /// 🔍 启用僵尸进程检测的回收循环
+#[cfg(unix)]
 async fn run_reaper_with_detection(
     mut sigchld: tokio::signal::unix::Signal,
     mut poll_interval: tokio::time::Interval,
@@ -406,6 +415,7 @@ async fn run_reaper_with_detection(
 }
 
 /// 🚫 不启用僵尸进程检测的回收循环
+#[cfg(unix)]
 async fn run_reaper_without_detection(
     mut sigchld: tokio::signal::unix::Signal,
     mut poll_interval: tokio::time::Interval,
@@ -430,6 +440,7 @@ async fn run_reaper_without_detection(
 }
 
 /// 轮询模式回退（当信号机制不可用时）
+#[cfg(unix)]
 async fn run_reaper_polling(config: ReaperConfig) {
     info!("[ProcessReaper] 使用轮询模式回收僵尸进程");
 
@@ -444,6 +455,7 @@ async fn run_reaper_polling(config: ReaperConfig) {
 }
 
 /// 🔍 轮询模式 + 僵尸进程检测
+#[cfg(unix)]
 async fn run_reaper_polling_with_detection(mut state: ReaperState, detect_interval_secs: u64) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut zombie_detect_interval =
@@ -467,6 +479,7 @@ async fn run_reaper_polling_with_detection(mut state: ReaperState, detect_interv
 }
 
 /// 🚫 轮询模式（无僵尸进程检测）
+#[cfg(unix)]
 async fn run_reaper_polling_without_detection(mut state: ReaperState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
@@ -537,7 +550,7 @@ impl Default for ProcessReaperHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::process::Stdio;

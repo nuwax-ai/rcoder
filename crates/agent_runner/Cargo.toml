@@ -108,5 +108,6 @@ arc-swap = "1.8"
 pyroscope = { workspace = true, optional = true }
 pyroscope_pprofrs = { workspace = true, optional = true }
 
-# Unix 信号处理（用于僵尸进程回收）
+# Unix 信号处理（用于僵尸进程回收，仅 Unix 平台）
+[target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process"] }

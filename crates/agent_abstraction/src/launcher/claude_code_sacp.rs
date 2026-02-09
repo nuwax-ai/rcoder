@@ -15,7 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
-use process_wrap::tokio::{CommandWrap, ProcessGroup};
+use process_wrap::tokio::CommandWrap;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
 use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -526,19 +530,32 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         }
 
-        // 启动子进程（使用 process group 来管理整个进程树）
-        // 使用 ProcessGroup::leader() 创建真正的进程组，确保能够清理所有孙进程
-        let mut child = CommandWrap::with_new(&command_path, |cmd| {
+        // 启动子进程（使用进程组/Job Object 来管理整个进程树）
+        // Unix: ProcessGroup::leader() 创建进程组，确保能够清理所有孙进程
+        // Windows: JobObject 管理进程树
+        let mut cmd_wrap = CommandWrap::with_new(&command_path, |cmd| {
             cmd.args(&command_args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .current_dir(&project_path);
             cmd.envs(&merged_envs);
-        })
-        .wrap(ProcessGroup::leader())
-        .spawn()
-        .context("[SACP] 无法启动 claude-code-acp 子进程")?;
+        });
+
+        #[cfg(unix)]
+        let mut child = cmd_wrap
+            .wrap(ProcessGroup::leader())
+            .spawn()
+            .context("[SACP] 无法启动 claude-code-acp 子进程")?;
+
+        #[cfg(windows)]
+        let mut child = cmd_wrap
+            .wrap(JobObject::new())
+            .spawn()
+            .context("[SACP] 无法启动 claude-code-acp 子进程")?;
+
+        #[cfg(not(any(unix, windows)))]
+        compile_error!("仅支持 unix 和 windows 平台");
 
         let child_pid = child.id().unwrap_or(0);
         info!("[SACP] Claude Code ACP 子进程已启动，PID: {}", child_pid);

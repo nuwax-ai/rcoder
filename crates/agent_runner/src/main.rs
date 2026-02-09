@@ -43,6 +43,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic;
 use std::path::PathBuf;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
 /// 🔥 设置自定义 Panic Hook
@@ -144,48 +145,61 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
 /// 🔥 设置优雅关闭信号处理器
 ///
 /// 监听系统信号，实现优雅关闭：
-/// - SIGTERM: Docker stop 信号
-/// - SIGINT: Ctrl+C 信号
+/// - Unix: SIGTERM (Docker stop) + SIGINT (Ctrl+C)
+/// - Windows: Ctrl+C
 fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // 监听 SIGTERM（Docker stop）
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("❌ [SIGNAL] 无法注册 SIGTERM 处理器: {}", e);
-                return;
-            }
-        };
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            // 监听 SIGTERM（Docker stop）
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("❌ [SIGNAL] 无法注册 SIGTERM 处理器: {}", e);
+                    return;
+                }
+            };
 
-        // 监听 SIGINT（Ctrl+C）
-        let mut sigint = match signal(SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("❌ [SIGNAL] 无法注册 SIGINT 处理器: {}", e);
-                return;
-            }
-        };
+            // 监听 SIGINT（Ctrl+C）
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("❌ [SIGNAL] 无法注册 SIGINT 处理器: {}", e);
+                    return;
+                }
+            };
 
-        tokio::select! {
-            _ = sigterm.recv() => {
-                eprintln!("📨 [SIGNAL] 收到 SIGTERM 信号（Docker stop），开始优雅关闭...");
-                write_shutdown_log("SIGTERM");
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    eprintln!("📨 [SIGNAL] 收到 SIGTERM 信号（Docker stop），开始优雅关闭...");
+                    write_shutdown_log("SIGTERM");
+                }
+                _ = sigint.recv() => {
+                    eprintln!("📨 [SIGNAL] 收到 SIGINT 信号（Ctrl+C），开始优雅关闭...");
+                    write_shutdown_log("SIGINT");
+                }
             }
-            _ = sigint.recv() => {
-                eprintln!("📨 [SIGNAL] 收到 SIGINT 信号（Ctrl+C），开始优雅关闭...");
-                write_shutdown_log("SIGINT");
+
+            eprintln!("🧹 [SIGNAL] 正在清理资源...");
+            eprintln!("✅ [SIGNAL] 优雅关闭完成，程序退出");
+            std::process::exit(0);
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::spawn(async move {
+            // Windows: 仅监听 Ctrl+C
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                eprintln!("📨 [SIGNAL] 收到 Ctrl+C 信号，开始优雅关闭...");
+                write_shutdown_log("Ctrl+C");
             }
-        }
 
-        eprintln!("🧹 [SIGNAL] 正在清理资源...");
-        // 这里可以添加更多清理逻辑，比如：
-        // - 关闭网络连接
-        // - 保存状态到磁盘
-        // - 通知客户端服务即将关闭
-
-        eprintln!("✅ [SIGNAL] 优雅关闭完成，程序退出");
-        std::process::exit(0);
-    })
+            eprintln!("🧹 [SIGNAL] 正在清理资源...");
+            eprintln!("✅ [SIGNAL] 优雅关闭完成，程序退出");
+            std::process::exit(0);
+        })
+    }
 }
 
 /// 将关闭事件写入日志文件
