@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
 use process_wrap::tokio::CommandWrap;
-#[cfg(unix)]
-use process_wrap::tokio::ProcessGroup;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
 use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -190,16 +190,10 @@ pub fn get_default_sacp_agent_config(
 
         // Anthropic 环境变量
         if !provider.api_key.is_empty() {
-            env.insert(
-                ENV_ANTHROPIC_API_KEY.to_string(),
-                resolved_key.clone(),
-            );
+            env.insert(ENV_ANTHROPIC_API_KEY.to_string(), resolved_key.clone());
         }
         if !provider.base_url.is_empty() {
-            env.insert(
-                ENV_ANTHROPIC_BASE_URL.to_string(),
-                resolved_url.clone(),
-            );
+            env.insert(ENV_ANTHROPIC_BASE_URL.to_string(), resolved_url.clone());
         }
         if !provider.default_model.is_empty() {
             env.insert(
@@ -210,16 +204,10 @@ pub fn get_default_sacp_agent_config(
 
         // OpenAI 环境变量 (支持 OpenAI 兼容的 Agent)
         if !provider.api_key.is_empty() {
-            env.insert(
-                ENV_OPENAI_API_KEY.to_string(),
-                resolved_key,
-            );
+            env.insert(ENV_OPENAI_API_KEY.to_string(), resolved_key);
         }
         if !provider.base_url.is_empty() {
-            env.insert(
-                ENV_OPENAI_BASE_URL.to_string(),
-                resolved_url,
-            );
+            env.insert(ENV_OPENAI_BASE_URL.to_string(), resolved_url);
         }
         if !provider.default_model.is_empty() {
             // nuwaxcode 使用 OPENCODE_MODEL，model_name 中已包含 openai-compatible/ 前缀
@@ -506,10 +494,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         );
 
         // 需要脱敏的环境变量 key 列表
-        const SENSITIVE_ENV_KEYS: &[&str] = &[
-            ENV_ANTHROPIC_API_KEY,
-            ENV_OPENAI_API_KEY,
-        ];
+        const SENSITIVE_ENV_KEYS: &[&str] = &[ENV_ANTHROPIC_API_KEY, ENV_OPENAI_API_KEY];
 
         // 按字母顺序排序并打印所有环境变量
         let mut env_keys: Vec<_> = merged_envs.keys().collect();
@@ -550,7 +535,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         #[cfg(windows)]
         let mut child = cmd_wrap
-            .wrap(JobObject::new())
+            .wrap(JobObject)
             .spawn()
             .context("[SACP] 无法启动 claude-code-acp 子进程")?;
 

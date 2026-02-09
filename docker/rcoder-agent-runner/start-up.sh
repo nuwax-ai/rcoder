@@ -714,8 +714,11 @@ function start_display_and_desktop() {
     # Xvnc 是 TigerVNC 内置的 X server + VNC 服务器
     # 使用 Xvnc 替代 Xvfb + x11vnc 的组合，简化架构
     # 色深使用 24 位，避免某些 Linux 内核上出现花屏
+    # FrameRate 30: 限制每秒最大帧数 (默认60)，降低到30可减少约50%带宽，日常使用无明显差异
+    # 注意: CompressLevel/QualityLevel 是 VNC 客户端参数，不是 Xvnc 服务端参数
+    #       真正的压缩配置在 noVNC 客户端侧 (rfb.js 的 compressionLevel/qualityLevel)
     log "Starting Xvnc :0 (background initialization)..."
-    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 >/tmp/xvnc.log 2>&1 &
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 30 >/tmp/xvnc.log 2>&1 &
 
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
