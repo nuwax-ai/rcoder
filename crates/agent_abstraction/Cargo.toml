@@ -58,6 +58,9 @@ tokio-util = { workspace = true }
 # ACP 协议 - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
 sacp = { workspace = true }
 
+# 跨平台命令查找
+which = { workspace = true }
+
 # MCP 协议 - rmcp 官方库: https://github.com/modelcontextprotocol/rust-sdk
 rmcp = { workspace = true }
 

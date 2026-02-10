@@ -222,26 +222,18 @@ pub fn get_default_sacp_agent_config(
     env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
 
     // Resolve the claude-code-acp command path.
-    // Priority: CLAUDE_CODE_ACP_PATH env var > `which` lookup > bare command name.
-    // Tauri apps may not inherit the user's shell PATH, so we try `which` to get
+    // Priority: CLAUDE_CODE_ACP_PATH env var > `which` crate lookup > bare command name.
+    // Tauri apps may not inherit the user's shell PATH, so we try `which` crate to get
     // an absolute path at build/launch time.
     let command = if let Ok(path) = std::env::var("CLAUDE_CODE_ACP_PATH") {
         path
     } else {
-        match std::process::Command::new("which")
-            .arg("claude-code-acp")
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !resolved.is_empty() {
-                    tracing::info!("Resolved claude-code-acp path via `which`: {}", resolved);
-                    resolved
-                } else {
-                    "claude-code-acp".to_string()
-                }
+        match which::which("claude-code-acp") {
+            Ok(resolved_path) => {
+                tracing::info!("Resolved claude-code-acp path via `which` crate: {}", resolved_path.display());
+                resolved_path.to_string_lossy().to_string()
             }
-            _ => "claude-code-acp".to_string(),
+            Err(_) => "claude-code-acp".to_string(),
         }
     };
 
@@ -1190,7 +1182,15 @@ mod tests {
         let config = get_default_sacp_agent_config(None, &shared_types::ServiceType::RCoder);
         assert!(config.is_ok());
         let config = config.unwrap();
-        assert_eq!(config.command, "claude-code-acp");
+
+        // 命令应该是 "claude-code-acp" 或其绝对路径（如果 which crate 能找到）
+        // 两种情况都是正确的
+        let cmd = &config.command;
+        assert!(
+            cmd == "claude-code-acp" || cmd.ends_with("claude-code-acp"),
+            "Expected command to be 'claude-code-acp' or an absolute path ending with 'claude-code-acp', got: {}",
+            cmd
+        );
     }
 
     #[test]
