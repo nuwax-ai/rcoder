@@ -2,6 +2,7 @@
 
 // SACP type imports
 use sacp::schema::McpServer;
+use tracing::info;
 
 /// Agent startup configuration
 ///
@@ -146,25 +147,33 @@ impl AgentStartConfig {
             );
         }
 
-        // Add session_id to resume, for resuming sessions
+        // Build claudeCode.options structure
+        // Always set settingSources: [] to prevent loading ~/.claude/settings.json,
+        // which may override ANTHROPIC_BASE_URL and break the proxy setup.
         // Refer to the TypeScript code on the Agent side:
         // resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume
+        let mut options = serde_json::Map::new();
+
+        // Block global settings loading
+        options.insert(
+            "settingSources".to_string(),
+            serde_json::Value::Array(vec![]),
+        );
+
+        // Add resume session_id if present
         if let Some(ref session_id) = self.resume_session_id {
-            // Build claudeCode.options.resume structure
-            let mut options = serde_json::Map::new();
             options.insert(
                 "resume".to_string(),
                 serde_json::Value::String(session_id.clone()),
             );
-
-            let mut claude_code = serde_json::Map::new();
-            claude_code.insert("options".to_string(), serde_json::Value::Object(options));
-
-            meta.insert(
-                "claudeCode".to_string(),
-                serde_json::Value::Object(claude_code),
-            );
         }
+
+        let mut claude_code = serde_json::Map::new();
+        claude_code.insert("options".to_string(), serde_json::Value::Object(options));
+        meta.insert(
+            "claudeCode".to_string(),
+            serde_json::Value::Object(claude_code),
+        );
 
         // Merge additional meta fields
         if let Some(ref extra) = self.extra_meta {
@@ -212,6 +221,20 @@ impl AgentStartConfig {
                 serde_json::Value::Object(system_prompt_obj),
             );
         }
+
+        // Block global settings loading (consistent with build_meta)
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "settingSources".to_string(),
+            serde_json::Value::Array(vec![]),
+        );
+
+        let mut claude_code = serde_json::Map::new();
+        claude_code.insert("options".to_string(), serde_json::Value::Object(options));
+        meta.insert(
+            "claudeCode".to_string(),
+            serde_json::Value::Object(claude_code),
+        );
 
         // Merge additional meta fields (don't overwrite existing keys)
         if let Some(ref extra) = self.extra_meta {
@@ -342,6 +365,14 @@ impl PromptMessage {
 /// Convert from ChatPrompt to PromptMessage
 impl From<shared_types::ChatPrompt> for PromptMessage {
     fn from(chat_prompt: shared_types::ChatPrompt) -> Self {
+        info!(
+            "[agent_abstraction] Converting ChatPrompt to PromptMessage, project_id={:?}, session_id={:?}, has_model_provider={}, has_agent_config_override={}",
+            chat_prompt.project_id,
+            chat_prompt.session_id,
+            chat_prompt.model_provider.is_some(),
+            chat_prompt.agent_config_override.is_some(),
+        );
+
         Self {
             content: chat_prompt.prompt,
             project_id: chat_prompt.project_id,

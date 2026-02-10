@@ -221,8 +221,32 @@ pub fn get_default_sacp_agent_config(
     env.insert(ENV_RUST_LOG.to_string(), "info".to_string());
     env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
 
+    // Resolve the claude-code-acp command path.
+    // Priority: CLAUDE_CODE_ACP_PATH env var > `which` lookup > bare command name.
+    // Tauri apps may not inherit the user's shell PATH, so we try `which` to get
+    // an absolute path at build/launch time.
+    let command = if let Ok(path) = std::env::var("CLAUDE_CODE_ACP_PATH") {
+        path
+    } else {
+        match std::process::Command::new("which")
+            .arg("claude-code-acp")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !resolved.is_empty() {
+                    tracing::info!("Resolved claude-code-acp path via `which`: {}", resolved);
+                    resolved
+                } else {
+                    "claude-code-acp".to_string()
+                }
+            }
+            _ => "claude-code-acp".to_string(),
+        }
+    };
+
     Ok(SacpAgentLaunchConfig {
-        command: "claude-code-acp".to_string(),
+        command,
         args: Vec::new(),
         env,
         context_servers: HashMap::new(),
