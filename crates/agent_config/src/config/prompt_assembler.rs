@@ -242,7 +242,7 @@ mod tests {
         let assembler = PromptConfigAssembler::new(config)
             .with_system_prompt(Some("自定义系统提示词".to_string()));
 
-        let result = assembler.get_system_prompt("claude-code-acp");
+        let result = assembler.get_system_prompt("claude-code-acp-ts");
         assert_eq!(result, "自定义系统提示词");
     }
 
@@ -251,7 +251,7 @@ mod tests {
         let config = create_test_default_config();
         let assembler = PromptConfigAssembler::new(config);
 
-        let result = assembler.get_system_prompt("claude-code-acp");
+        let result = assembler.get_system_prompt("claude-code-acp-ts");
         // 应该返回默认系统提示词
         assert!(!result.is_empty());
     }
@@ -261,7 +261,7 @@ mod tests {
         let config = create_test_default_config();
         let assembler = PromptConfigAssembler::new(config).with_system_prompt(Some("".to_string()));
 
-        let result = assembler.get_system_prompt("claude-code-acp");
+        let result = assembler.get_system_prompt("claude-code-acp-ts");
         // 空字符串应该回退到默认值
         assert!(!result.is_empty());
     }
@@ -272,7 +272,7 @@ mod tests {
         let assembler = PromptConfigAssembler::new(config)
             .with_user_prompt_template(Some("请用 Rust 完成：{user_prompt}".to_string()));
 
-        let result = assembler.apply_user_prompt("claude-code-acp", "Hello World");
+        let result = assembler.apply_user_prompt("claude-code-acp-ts", "Hello World");
         assert_eq!(result, "请用 Rust 完成：Hello World");
     }
 
@@ -281,7 +281,7 @@ mod tests {
         let config = create_test_default_config();
         let assembler = PromptConfigAssembler::new(config);
 
-        let result = assembler.apply_user_prompt("claude-code-acp", "Hello World");
+        let result = assembler.apply_user_prompt("claude-code-acp-ts", "Hello World");
         // 没有模板时应该返回原始输入
         assert_eq!(result, "Hello World");
     }
@@ -344,7 +344,7 @@ mod tests {
 
         let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
 
-        let result = assembler.get_agent_id("claude-code-acp");
+        let result = assembler.get_agent_id("claude-code-acp-ts");
         assert_eq!(result, "custom-agent");
     }
 
@@ -353,8 +353,8 @@ mod tests {
         let config = create_test_default_config();
         let assembler = PromptConfigAssembler::new(config);
 
-        let result = assembler.get_agent_id("claude-code-acp");
-        assert_eq!(result, "claude-code-acp");
+        let result = assembler.get_agent_id("claude-code-acp-ts");
+        assert_eq!(result, "claude-code-acp-ts");
     }
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
 
         let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
 
-        let result = assembler.get_agent_server_config("claude-code-acp");
+        let result = assembler.get_agent_server_config("claude-code-acp-ts");
         assert!(result.env.contains_key("NEW_VAR"));
         assert_eq!(result.env.get("NEW_VAR"), Some(&"new_value".to_string()));
     }

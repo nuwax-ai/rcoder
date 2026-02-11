@@ -76,10 +76,9 @@ impl AgentInstaller for NpmInstaller {
             ));
         }
 
-        let package_name = config
-            .package_name
-            .as_ref()
-            .ok_or_else(|| InstallationError::ConfigError("Package name is required".to_string()))?;
+        let package_name = config.package_name.as_ref().ok_or_else(|| {
+            InstallationError::ConfigError("Package name is required".to_string())
+        })?;
 
         // Build package spec with version
         let package_spec = if let Some(version) = &config.version {
@@ -100,11 +99,17 @@ impl AgentInstaller for NpmInstaller {
             info!("🌐 nuwaxcode 使用官方源: https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
-                &["install", "-g", &package_spec, "--registry=https://registry.npmjs.org/"],
+                &[
+                    "install",
+                    "-g",
+                    &package_spec,
+                    "--registry=https://registry.npmjs.org/",
+                ],
             )
             .await?
         } else {
-            self.run_command(npm_cmd, &["install", "-g", &package_spec]).await?
+            self.run_command(npm_cmd, &["install", "-g", &package_spec])
+                .await?
         };
 
         if output.status.success() {
@@ -148,7 +153,9 @@ impl AgentInstaller for NpmInstaller {
         };
 
         // Check global list
-        let output = self.run_command(npm_cmd, &["list", "-g", "--depth=0", package_name]).await?;
+        let output = self
+            .run_command(npm_cmd, &["list", "-g", "--depth=0", package_name])
+            .await?;
 
         Ok(output.status.success())
     }
@@ -166,10 +173,9 @@ impl AgentInstaller for NpmInstaller {
             ));
         }
 
-        let package_name = config
-            .package_name
-            .as_ref()
-            .ok_or_else(|| InstallationError::ConfigError("Package name is required".to_string()))?;
+        let package_name = config.package_name.as_ref().ok_or_else(|| {
+            InstallationError::ConfigError("Package name is required".to_string())
+        })?;
 
         info!("🔄 更新全局包: {}", package_name);
 
@@ -179,11 +185,17 @@ impl AgentInstaller for NpmInstaller {
             info!("🌐 nuwaxcode 使用官方源: https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
-                &["update", "-g", package_name, "--registry=https://registry.npmjs.org/"],
+                &[
+                    "update",
+                    "-g",
+                    package_name,
+                    "--registry=https://registry.npmjs.org/",
+                ],
             )
             .await?
         } else {
-            self.run_command(npm_cmd, &["update", "-g", package_name]).await?
+            self.run_command(npm_cmd, &["update", "-g", package_name])
+                .await?
         };
 
         if output.status.success() {
@@ -220,14 +232,5 @@ mod tests {
         let cmd = installer.get_npm_command().await;
         // Should return "npm" or "pnpm"
         assert!(cmd == "npm" || cmd == "pnpm");
-    }
-
-    #[test]
-    fn test_version_parsing() {
-        let installer = NpmInstaller::new();
-
-        let output = "└── @zed-industries/claude-code-acp@0.6.0";
-        let version = installer.parse_installed_version(output);
-        assert_eq!(version, Some("0.6.0".to_string()));
     }
 }

@@ -121,7 +121,7 @@ pub async fn load_sacp_agent_config(
     // 复用旧版配置加载逻辑
     let config = AgentServersConfig::load_or_default_for_service(service_type).await;
 
-    if let Some(agent_config) = config.get_agent("claude-code-acp") {
+    if let Some(agent_config) = config.get_agent("claude-code-acp-ts") {
         debug!("📋 [SACP] 加载默认 Agent 配置: {}", agent_config.agent_id);
 
         // 检查并安装 agent
@@ -172,7 +172,7 @@ pub async fn load_sacp_agent_config(
             context_servers: config.context_servers.clone(),
         })
     } else {
-        warn!("⚠️ [SACP] 配置中未找到 claude-code-acp，使用默认配置");
+        warn!("⚠️ [SACP] 配置中未找到 claude-code-acp-ts，使用默认配置");
         get_default_sacp_agent_config(model_provider, service_type)
     }
 }
@@ -221,19 +221,19 @@ pub fn get_default_sacp_agent_config(
     env.insert(ENV_RUST_LOG.to_string(), "info".to_string());
     env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
 
-    // Resolve the claude-code-acp command path.
+    // Resolve the claude-code-acp-ts command path.
     // Priority: CLAUDE_CODE_ACP_PATH env var > `which` crate lookup > bare command name.
     // Tauri apps may not inherit the user's shell PATH, so we try `which` crate to get
     // an absolute path at build/launch time.
     let command = if let Ok(path) = std::env::var("CLAUDE_CODE_ACP_PATH") {
         path
     } else {
-        match which::which("claude-code-acp") {
+        match which::which("claude-code-acp-ts") {
             Ok(resolved_path) => {
-                tracing::info!("Resolved claude-code-acp path via `which` crate: {}", resolved_path.display());
+                tracing::info!("Resolved claude-code-acp-ts path via `which` crate: {}", resolved_path.display());
                 resolved_path.to_string_lossy().to_string()
             }
-            Err(_) => "claude-code-acp".to_string(),
+            Err(_) => "claude-code-acp-ts".to_string(),
         }
     };
 
@@ -547,13 +547,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let mut child = cmd_wrap
             .wrap(ProcessGroup::leader())
             .spawn()
-            .context("[SACP] 无法启动 claude-code-acp 子进程")?;
+            .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
 
         #[cfg(windows)]
         let mut child = cmd_wrap
             .wrap(JobObject)
             .spawn()
-            .context("[SACP] 无法启动 claude-code-acp 子进程")?;
+            .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
 
         #[cfg(not(any(unix, windows)))]
         compile_error!("仅支持 unix 和 windows 平台");
@@ -1183,12 +1183,12 @@ mod tests {
         assert!(config.is_ok());
         let config = config.unwrap();
 
-        // 命令应该是 "claude-code-acp" 或其绝对路径（如果 which crate 能找到）
+        // 命令应该是 "claude-code-acp-ts" 或其绝对路径（如果 which crate 能找到）
         // 两种情况都是正确的
         let cmd = &config.command;
         assert!(
-            cmd == "claude-code-acp" || cmd.ends_with("claude-code-acp"),
-            "Expected command to be 'claude-code-acp' or an absolute path ending with 'claude-code-acp', got: {}",
+            cmd == "claude-code-acp-ts" || cmd.ends_with("claude-code-acp-ts"),
+            "Expected command to be 'claude-code-acp-ts' or an absolute path ending with 'claude-code-acp-ts', got: {}",
             cmd
         );
     }

@@ -2,7 +2,7 @@
 # 该文件在首次启动时自动生成
 
 # 默认使用的 Agent ID
-default_agent_id: claude-code-acp
+default_agent_id: claude-code-acp-ts
 
 # 项目工作目录
 projects_dir: ./project_workspace
