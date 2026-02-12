@@ -160,6 +160,11 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
                 .unwrap_or_default().cleanup_interval_secs
         ),
     };
+    info!(
+        "🧹 [HTTP] Agent 清理配置: idle_timeout={}秒, cleanup_interval={}秒",
+        cleanup_config.idle_timeout.as_secs(),
+        cleanup_config.cleanup_interval.as_secs()
+    );
     let cleanup_token = shutdown_token.child_token();
     join_set.lock().await.spawn(async move {
         tokio::select! {
