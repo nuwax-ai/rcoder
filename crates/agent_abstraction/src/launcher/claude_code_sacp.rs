@@ -17,7 +17,7 @@ use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerCo
 use anyhow::{Context, Result};
 use process_wrap::tokio::CommandWrap;
 #[cfg(windows)]
-use process_wrap::tokio::JobObject;
+use process_wrap::tokio::{CreationFlags, JobObject};
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
 use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
@@ -42,6 +42,10 @@ use crate::traits::session_registry::SessionRegistry;
 
 // 导入生命周期管理
 use super::lifecycle::AgentLifecycleGuard;
+#[cfg(windows)]
+use super::windows_launch::{
+    CREATE_NO_WINDOW_FLAG, DETACHED_PROCESS_FLAG, resolve_windows_node_cli_command,
+};
 
 /// 使用最新协议版本
 const VERSION: ProtocolVersion = ProtocolVersion::LATEST;
@@ -438,6 +442,22 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             Vec::new()
         };
 
+        let mut command_path = command_path;
+        let mut command_args = command_args;
+
+        #[cfg(windows)]
+        if let Some((resolved_program, resolved_args)) =
+            resolve_windows_node_cli_command(&command_path, &command_args)
+        {
+            let entry = resolved_args.first().cloned().unwrap_or_default();
+            info!(
+                "[SACP] Windows 直连 node 启动: {} -> {} {}",
+                command_path, resolved_program, entry
+            );
+            command_path = resolved_program;
+            command_args = resolved_args;
+        }
+
         // 准备环境变量（在 base_env 基础上添加项目相关变量）
         let mut merged_envs = base_env;
         merged_envs.insert(
@@ -551,6 +571,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         #[cfg(windows)]
         let mut child = cmd_wrap
+            .wrap(CreationFlags(CREATE_NO_WINDOW_FLAG | DETACHED_PROCESS_FLAG))
             .wrap(JobObject)
             .spawn()
             .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
