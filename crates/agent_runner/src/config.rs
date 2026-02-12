@@ -261,8 +261,14 @@ impl AgentCleanupConfig {
     }
 }
 
+#[cfg(feature = "http-server")]
 fn default_idle_timeout() -> u64 {
-    300 // 5 分钟
+    24 * 60 * 60 // 24 小时（Tauri 客户端模式）
+}
+
+#[cfg(not(feature = "http-server"))]
+fn default_idle_timeout() -> u64 {
+    300 // 5 分钟（CLI 模式）
 }
 
 fn default_cleanup_interval() -> u64 {
