@@ -114,15 +114,15 @@ fn resolve_js_entry_from_cmd_shim(cmd_script: &std::path::Path) -> Option<PathBu
         if !line.contains("%~dp0") {
             continue;
         }
-        let lower = line.to_ascii_lowercase();
+        let clean = line.replace('"', "");
+        let clean_lower = clean.to_ascii_lowercase();
         let ext_end = [".cjs", ".mjs", ".js"]
             .iter()
-            .filter_map(|ext| lower.find(ext).map(|pos| pos + ext.len()))
+            .filter_map(|ext| clean_lower.find(ext).map(|pos| pos + ext.len()))
             .min();
         let Some(end) = ext_end else {
             continue;
         };
-        let clean = line.replace('"', "");
         let start = clean.find("%~dp0")?;
         if end <= start + 5 || end > clean.len() {
             continue;
