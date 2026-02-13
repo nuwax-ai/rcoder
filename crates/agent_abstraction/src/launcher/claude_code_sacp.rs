@@ -71,6 +71,29 @@ const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
 /// 默认代理 Base URL（包含 UUID 占位符）
 const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
 
+/// 确保子进程环境变量中包含 PATH / PATHEXT，便于解析可执行路径与 Windows .cmd 脚本
+fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String, String>) {
+    if !merged_envs.contains_key("PATH") {
+        if let Ok(path) = std::env::var("PATH") {
+            merged_envs.insert("PATH".to_string(), path);
+            info!("[SACP] 📋 已添加系统 PATH 环境变量");
+        }
+    }
+    #[cfg(windows)]
+    ensure_windows_subprocess_env(merged_envs);
+}
+
+/// Windows 专属：确保 PATHEXT 存在，以便解析 .cmd/.bat 等脚本
+#[cfg(windows)]
+fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<String, String>) {
+    if !merged_envs.contains_key("PATHEXT") {
+        if let Ok(pathext) = std::env::var("PATHEXT") {
+            merged_envs.insert("PATHEXT".to_string(), pathext);
+            info!("[SACP] 📋 已添加系统 PATHEXT 环境变量");
+        }
+    }
+}
+
 /// 根据 proxy feature 决定使用占位符还是真实 API Key
 fn resolve_api_key(provider: &ModelProviderConfig) -> String {
     if cfg!(feature = "proxy") {
@@ -465,6 +488,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             project_path.to_string_lossy().to_string(),
         );
         merged_envs.insert(ENV_AGENT_PROJECT_ID.to_string(), project_id.clone());
+
+        ensure_subprocess_path_env(&mut merged_envs);
 
         // 替换 UUID 占位符
         if let Some(ref uuid) = service_uuid {
