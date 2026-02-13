@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 pub const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
 pub const DETACHED_PROCESS_FLAG: u32 = 0x0000_0008;
@@ -9,8 +9,20 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("NUWAX_NODE_PATH") {
         let node = PathBuf::from(path);
         if node.exists() {
-            debug!(
+            info!(
                 "[SACP] Windows node 解析命中 NUWAX_NODE_PATH: {}",
+                node.display()
+            );
+            return Some(node);
+        }
+    }
+
+    // 1.5 Tauri 层设置的 NUWAX_NODE_EXE（sidecar node-runtime.exe）
+    if let Ok(path) = std::env::var("NUWAX_NODE_EXE") {
+        let node = PathBuf::from(&path);
+        if node.exists() {
+            info!(
+                "[SACP] Windows node 解析命中 NUWAX_NODE_EXE: {}",
                 node.display()
             );
             return Some(node);
@@ -27,7 +39,7 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
             }
             let node = PathBuf::from(dir).join("node.exe");
             if node.exists() {
-                debug!(
+                info!(
                     "[SACP] Windows node 解析命中 NUWAX_APP_RUNTIME_PATH: {}",
                     node.display()
                 );
@@ -36,33 +48,25 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
         }
     }
 
-    // 3. 系统 PATH 兜底
-    let output = match std::process::Command::new("where")
-        .arg("node.exe")
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("[SACP] Windows node 解析失败: where node.exe 执行错误: {}", e);
-            return None;
+    // 3. 从 APPDATA 推导默认的应用 runtime 路径（NUWAX_APP_RUNTIME_PATH 未设置时的回退）
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let default_node = PathBuf::from(&appdata)
+            .join("com.nuwax.agent-tauri-client")
+            .join("runtime")
+            .join("node")
+            .join("bin")
+            .join("node.exe");
+        if default_node.exists() {
+            info!(
+                "[SACP] Windows node 解析命中 APPDATA 默认路径: {}",
+                default_node.display()
+            );
+            return Some(default_node);
         }
-    };
-    if !output.status.success() {
-        warn!(
-            "[SACP] Windows node 解析失败: where node.exe exit={:?}",
-            output.status.code()
-        );
-        return None;
     }
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let node_path = stdout_str
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    debug!("[SACP] Windows node 解析命中 PATH: {}", node_path);
-    Some(PathBuf::from(node_path.to_string()))
+    warn!("[SACP] Windows node 解析失败: NUWAX_NODE_PATH、NUWAX_NODE_EXE、NUWAX_APP_RUNTIME_PATH 和 APPDATA 默认路径均未命中");
+    None
 }
 
 fn npm_package_entry_from_dir(package_dir: &std::path::Path, package_name: &str) -> Option<PathBuf> {
@@ -95,12 +99,39 @@ fn get_windows_cmd_script_path(path: &std::path::Path) -> Option<PathBuf> {
     match path.extension().and_then(|s| s.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("cmd") => Some(path.to_path_buf()),
         None => {
-            let candidate = path.with_extension("cmd");
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
+            // 先检查直接路径（绝对路径 or 当前目录）
+            let direct_candidate = path.with_extension("cmd");
+            if direct_candidate.exists() {
+                return Some(direct_candidate);
             }
+
+            // which 未命中时 path 为裸命令名，需要在已知目录中搜索
+            let program_name = path.file_name().and_then(|s| s.to_str())?;
+
+            // 搜索应用自管的 node_modules/.bin
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                let app_private = PathBuf::from(&appdata)
+                    .join("com.nuwax.agent-tauri-client")
+                    .join("node_modules")
+                    .join(".bin")
+                    .join(format!("{}.cmd", program_name));
+                if app_private.exists() {
+                    return Some(app_private);
+                }
+            }
+
+            // 搜索 NUWAX_APP_RUNTIME_PATH 中的每个目录
+            if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
+                for dir in runtime_path.split(';').filter(|s| !s.trim().is_empty()) {
+                    let candidate =
+                        std::path::Path::new(dir.trim()).join(format!("{}.cmd", program_name));
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+
+            None
         }
         _ => None,
     }
@@ -122,9 +153,16 @@ fn resolve_js_entry_from_cmd_shim(cmd_script: &std::path::Path) -> Option<PathBu
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
-        if !line.contains("%~dp0") {
+        // 支持多种 npm shim 格式：%~dp0（旧版）、%dp0%（新版 npm >=7）、%dp0（变体）
+        let base_token = if line.contains("%~dp0") {
+            "%~dp0"
+        } else if line.contains("%dp0%") {
+            "%dp0%"
+        } else if line.contains("%dp0") {
+            "%dp0"
+        } else {
             continue;
-        }
+        };
         let clean = line.replace('"', "");
         let clean_lower = clean.to_ascii_lowercase();
         let ext_end = [".cjs", ".mjs", ".js"]
@@ -134,11 +172,11 @@ fn resolve_js_entry_from_cmd_shim(cmd_script: &std::path::Path) -> Option<PathBu
         let Some(end) = ext_end else {
             continue;
         };
-        let start = clean.find("%~dp0")?;
-        if end <= start + 5 || end > clean.len() {
+        let start = clean.find(base_token)?;
+        if end <= start + base_token.len() || end > clean.len() {
             continue;
         }
-        let rel = clean[start + 5..end].trim_start_matches(['\\', '/']);
+        let rel = clean[start + base_token.len()..end].trim_start_matches(['\\', '/']);
         if rel.is_empty() {
             continue;
         }
@@ -165,7 +203,7 @@ fn resolve_js_entry_from_cmd_shim(cmd_script: &std::path::Path) -> Option<PathBu
 pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Option<(String, Vec<String>)> {
     let command_path = which::which(command).unwrap_or_else(|_| PathBuf::from(command));
     let path = command_path.as_path();
-    debug!(
+    info!(
         "[SACP] Windows 命令解析开始: input={}, resolved={}",
         command,
         path.display()
@@ -173,17 +211,35 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
     let cmd_script = get_windows_cmd_script_path(path);
 
     let node_exe = resolve_windows_node_exe()?;
+    info!(
+        "[SACP] Windows node.exe 已找到: {}",
+        node_exe.display()
+    );
 
     if let Some(cmd_script) = cmd_script.as_ref() {
+        info!(
+            "[SACP] 找到 cmd shim: {}",
+            cmd_script.display()
+        );
         if let Some(js_entry) = resolve_js_entry_from_cmd_shim(cmd_script) {
             let mut actual_args = Vec::with_capacity(args.len() + 1);
             actual_args.push(js_entry.to_string_lossy().to_string());
             actual_args.extend(args.iter().cloned());
+            info!(
+                "[SACP] cmd shim 解析成功: {} -> {}",
+                cmd_script.display(),
+                js_entry.display()
+            );
             return Some((node_exe.to_string_lossy().to_string(), actual_args));
         }
-        debug!(
-            "[SACP] cmd shim 存在但未解析到入口，转 package.json bin 解析: {}",
+        info!(
+            "[SACP] cmd shim 存在但未解析到 JS 入口，转 package.json bin 解析: {}",
             cmd_script.display()
+        );
+    } else {
+        info!(
+            "[SACP] 未找到 cmd shim，转 package.json bin 解析: command={}",
+            command
         );
     }
 
@@ -197,6 +253,7 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
 
     let mut package_dirs: Vec<PathBuf> = Vec::new();
 
+    // 从 which 解析到的 .bin 目录向上推导 node_modules
     if let Some(parent) = path.parent() {
         let is_npm_bin = parent
             .file_name()
@@ -209,19 +266,11 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
         }
     }
 
+    // 仅搜索应用自管的 node_modules
     if let Ok(appdata) = std::env::var("APPDATA") {
         package_dirs.push(
             PathBuf::from(appdata)
-                .join("npm")
-                .join("node_modules")
-                .join(&package_name),
-        );
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        package_dirs.push(
-            home.join(".local")
-                .join("lib")
+                .join("com.nuwax.agent-tauri-client")
                 .join("node_modules")
                 .join(&package_name),
         );
@@ -229,7 +278,7 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
 
     for package_dir in package_dirs {
         if !package_dir.exists() {
-            debug!(
+            info!(
                 "[SACP] package 目录不存在，跳过: {}",
                 package_dir.display()
             );
@@ -239,9 +288,14 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
             let mut actual_args = Vec::with_capacity(args.len() + 1);
             actual_args.push(js_entry.to_string_lossy().to_string());
             actual_args.extend(args.iter().cloned());
+            info!(
+                "[SACP] package.json bin 解析成功: {} -> {}",
+                package_name,
+                js_entry.display()
+            );
             return Some((node_exe.to_string_lossy().to_string(), actual_args));
         }
-        debug!(
+        info!(
             "[SACP] package.json bin 解析失败: package={}, dir={}",
             package_name,
             package_dir.display()

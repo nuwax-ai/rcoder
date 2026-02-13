@@ -74,9 +74,25 @@ const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
 /// 确保子进程环境变量中包含 PATH / PATHEXT，便于解析可执行路径与 Windows .cmd 脚本
 fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String, String>) {
     if !merged_envs.contains_key("PATH") {
-        if let Ok(path) = std::env::var("PATH") {
-            merged_envs.insert("PATH".to_string(), path);
-            info!("[SACP] 📋 已添加系统 PATH 环境变量");
+        // 优先从 NUWAX_APP_RUNTIME_PATH 构建 PATH
+        if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
+            let runtime_path = runtime_path.trim().to_string();
+            if !runtime_path.is_empty() {
+                merged_envs.insert("PATH".to_string(), runtime_path);
+                info!("[SACP] 📋 已从 NUWAX_APP_RUNTIME_PATH 构建 PATH 环境变量");
+            }
+        }
+
+        // 如果 NUWAX_APP_RUNTIME_PATH 未命中，从 APPDATA 推导默认路径
+        if !merged_envs.contains_key("PATH") {
+            // 使用 agent_abstraction::path_env 提供的工具函数
+            #[cfg(windows)]
+            {
+                use crate::path_env::build_rcoder_path_env;
+                if let Some(path) = build_rcoder_path_env() {
+                    merged_envs.insert("PATH".to_string(), path);
+                }
+            }
         }
     }
     #[cfg(windows)]
