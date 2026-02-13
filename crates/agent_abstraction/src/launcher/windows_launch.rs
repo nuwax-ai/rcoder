@@ -16,14 +16,19 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
         }
     }
 
+    // NODE_PATH 是 Node.js 的模块搜索路径（如 E:\Program Files\nodejs\node_modules），
+    // 不是 node.exe 的路径。尝试从其父目录推导 node.exe 位置。
     if let Ok(path) = std::env::var("NODE_PATH") {
-        let node = PathBuf::from(path);
-        if node.exists() {
-            debug!(
-                "[SACP] Windows node 解析命中 NODE_PATH: {}",
-                node.display()
-            );
-            return Some(node);
+        let module_dir = PathBuf::from(path);
+        if let Some(parent) = module_dir.parent() {
+            let node = parent.join("node.exe");
+            if node.exists() {
+                debug!(
+                    "[SACP] Windows node 解析命中 NODE_PATH 父目录: {}",
+                    node.display()
+                );
+                return Some(node);
+            }
         }
     }
 
