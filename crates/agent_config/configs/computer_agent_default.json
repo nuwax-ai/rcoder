@@ -9,7 +9,8 @@
         "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}",
         "ANTHROPIC_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
         "ANTHROPIC_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
-        "RUST_LOG": "info"
+        "RUST_LOG": "info",
+        "CLAUDE_CODE_MAX_TOKENS": "32768"
       },
       "system_prompt": {
         "source": "embedded",
