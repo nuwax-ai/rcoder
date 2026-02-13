@@ -76,5 +76,9 @@ process-wrap = { version = "9.0", features = ["tokio1", "process-group", "job-ob
 # Unix 信号处理
 nix = { workspace = true, features = ["signal"] }
 
+[target.'cfg(windows)'.dependencies]
+# process-wrap CreationFlags 需要 PROCESS_CREATION_FLAGS 类型
+windows = { version = "0.62", features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile = "3.8"

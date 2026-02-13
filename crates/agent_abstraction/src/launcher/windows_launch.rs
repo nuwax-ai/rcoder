@@ -45,13 +45,14 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
         return None;
     }
 
-    let node_path = String::from_utf8_lossy(&output.stdout)
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let node_path = stdout_str
         .lines()
         .next()
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
     debug!("[SACP] Windows node 解析命中 PATH: {}", node_path);
-    Some(PathBuf::from(node_path))
+    Some(PathBuf::from(node_path.to_string()))
 }
 
 fn npm_package_entry_from_dir(package_dir: &std::path::Path, package_name: &str) -> Option<PathBuf> {
