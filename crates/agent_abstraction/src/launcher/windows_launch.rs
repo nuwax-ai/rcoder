@@ -5,6 +5,7 @@ pub const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
 pub const DETACHED_PROCESS_FLAG: u32 = 0x0000_0008;
 
 fn resolve_windows_node_exe() -> Option<PathBuf> {
+    // 1. 显式指定的 node 可执行文件路径（最高优先级）
     if let Ok(path) = std::env::var("NUWAX_NODE_PATH") {
         let node = PathBuf::from(path);
         if node.exists() {
@@ -16,15 +17,18 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
         }
     }
 
-    // NODE_PATH 是 Node.js 的模块搜索路径（如 E:\Program Files\nodejs\node_modules），
-    // 不是 node.exe 的路径。尝试从其父目录推导 node.exe 位置。
-    if let Ok(path) = std::env::var("NODE_PATH") {
-        let module_dir = PathBuf::from(path);
-        if let Some(parent) = module_dir.parent() {
-            let node = parent.join("node.exe");
+    // 2. 应用集成的 runtime 路径（Tauri 打包后设置的 NUWAX_APP_RUNTIME_PATH，
+    //    包含 runtime\node\bin 等目录，内含集成的 node.exe）
+    if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
+        for dir in runtime_path.split(';') {
+            let dir = dir.trim();
+            if dir.is_empty() {
+                continue;
+            }
+            let node = PathBuf::from(dir).join("node.exe");
             if node.exists() {
                 debug!(
-                    "[SACP] Windows node 解析命中 NODE_PATH 父目录: {}",
+                    "[SACP] Windows node 解析命中 NUWAX_APP_RUNTIME_PATH: {}",
                     node.display()
                 );
                 return Some(node);
@@ -32,6 +36,7 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
         }
     }
 
+    // 3. 系统 PATH 兜底
     let output = match std::process::Command::new("where")
         .arg("node.exe")
         .output()
