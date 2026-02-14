@@ -43,7 +43,10 @@ use crate::traits::session_registry::SessionRegistry;
 // 导入生命周期管理
 use super::lifecycle::AgentLifecycleGuard;
 #[cfg(windows)]
-use super::windows_launch::{resolve_windows_node_cli_command, CREATE_NO_WINDOW_FLAG, DETACHED_PROCESS_FLAG};
+use super::windows_launch::{
+    normalize_windows_command_for_no_window, resolve_windows_node_cli_command, CREATE_NO_WINDOW_FLAG,
+    DETACHED_PROCESS_FLAG,
+};
 #[cfg(windows)]
 use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
@@ -591,6 +594,11 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 info!("[SACP] 📋   {} = {}", key, value);
             }
         }
+
+        // 🔧 Windows：将 .cmd/.bat 等规范化为不弹窗的 node.exe + JS 形式（逻辑在 windows_launch 中）
+        #[cfg(windows)]
+        let (command_path, command_args) =
+            normalize_windows_command_for_no_window(command_path, command_args);
 
         // 启动子进程（使用进程组/Job Object 来管理整个进程树）
         // Unix: ProcessGroup::leader() 创建进程组，确保能够清理所有孙进程

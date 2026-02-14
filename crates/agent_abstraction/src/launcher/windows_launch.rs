@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 pub const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
@@ -307,4 +307,96 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
         command
     );
     None
+}
+
+/// Windows 下将「命令 + 参数」规范化为不弹 CMD 窗口的形式。
+///
+/// 背景：Windows 上 npm 全局安装会创建 .cmd/.bat，直接执行会弹出 CMD 窗口。
+/// 本函数按扩展名检测并尽可能转换为 `node.exe + JS 入口`，避免弹窗。
+///
+/// 检查顺序（从优到劣）：
+/// 1. `.exe` → 原生二进制，直接返回（不修改）
+/// 2. `.cmd` / `.bat` → 尝试解析为 node.exe + JS，成功则返回新 (path, args)
+/// 3. 其他扩展名 → 直接返回
+/// 4. 无扩展名 → 用 `which` 解析后再按 1–3 处理
+///
+/// 仅编译于 Windows；调用方需使用 `#[cfg(windows)]`。
+#[cfg(windows)]
+pub fn normalize_windows_command_for_no_window(
+    command_path: String,
+    command_args: Vec<String>,
+) -> (String, Vec<String>) {
+    let mut path = command_path;
+    let mut args = command_args;
+
+    let path_ref = Path::new(&path);
+    let ext = path_ref
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("exe") => {
+            info!("[SACP] ✅ Windows 检测到原生 .exe: {} - 不会弹窗", path);
+        }
+        Some("cmd" | "bat") => {
+            info!("[SACP] 🔍 Windows 检测到 .cmd/.bat: {}", path);
+            info!("[SACP] 🔄 正在转换为 node.exe + JS 形式...");
+            if let Some((node_path, js_args)) = resolve_windows_node_cli_command(&path, &args) {
+                info!("[SACP] ✅ 转换成功: {} + {:?}", node_path, js_args);
+                path = node_path;
+                args = js_args;
+            } else {
+                warn!(
+                    "[SACP] ⚠️ 转换失败，将直接运行原命令 (可能会弹窗): {}",
+                    path
+                );
+            }
+        }
+        Some(other) => {
+            info!(
+                "[SACP] ℹ️ Windows 检测到其他格式 .{}: {} - 尝试直接运行",
+                other, path
+            );
+        }
+        None => {
+            info!("[SACP] 🔍 Windows 检测到无扩展名命令: {}", path);
+            if let Ok(resolved) = which::which(&path) {
+                let resolved_str = resolved.to_string_lossy().to_string();
+                info!("[SACP] 🔄 已解析为: {}", resolved_str);
+
+                let resolved_ext = resolved
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+
+                match resolved_ext.as_deref() {
+                    Some("exe") => {
+                        info!("[SACP] ✅ 解析后是原生 .exe - 不会弹窗");
+                        path = resolved_str;
+                    }
+                    Some("cmd" | "bat") => {
+                        info!("[SACP] 🔍 解析后发现是 .cmd/.bat，正在转换...");
+                        if let Some((node_path, js_args)) =
+                            resolve_windows_node_cli_command(&resolved_str, &args)
+                        {
+                            info!("[SACP] ✅ 转换成功: {} + {:?}", node_path, js_args);
+                            path = node_path;
+                            args = js_args;
+                        } else {
+                            warn!("[SACP] ⚠️ 转换失败");
+                        }
+                    }
+                    _ => {
+                        info!("[SACP] ℹ️ 解析后无扩展名或其他格式，将直接运行");
+                        path = resolved_str;
+                    }
+                }
+            } else {
+                warn!("[SACP] ⚠️ 无法解析命令路径: {}", path);
+            }
+        }
+    }
+
+    (path, args)
 }
