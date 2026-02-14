@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 pub const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
-pub const DETACHED_PROCESS_FLAG: u32 = 0x0000_0008;
 
 fn resolve_windows_node_exe() -> Option<PathBuf> {
     // 1. 显式指定的 node 可执行文件路径（最高优先级）

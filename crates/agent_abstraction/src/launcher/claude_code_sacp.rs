@@ -45,7 +45,6 @@ use super::lifecycle::AgentLifecycleGuard;
 #[cfg(windows)]
 use super::windows_launch::{
     normalize_windows_command_for_no_window, resolve_windows_node_cli_command, CREATE_NO_WINDOW_FLAG,
-    DETACHED_PROCESS_FLAG,
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
@@ -628,7 +627,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         #[cfg(windows)]
         let mut child = cmd_wrap
             .wrap(CreationFlags(PROCESS_CREATION_FLAGS(
-                CREATE_NO_WINDOW_FLAG | DETACHED_PROCESS_FLAG,
+                CREATE_NO_WINDOW_FLAG,
             )))
             .wrap(JobObject)
             .spawn()
