@@ -93,7 +93,7 @@ fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String
                         paths.push(p.to_string());
                     }
                 }
-                info!("[SACP] 📋 已从 NUWAX_APP_RUNTIME_PATH 构建 PATH 环境变量");
+                debug!("[SACP] 📋 已从 NUWAX_APP_RUNTIME_PATH 构建 PATH 环境变量");
             }
         }
 
@@ -179,7 +179,7 @@ fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<Str
     if !merged_envs.contains_key("PATHEXT") {
         if let Ok(pathext) = std::env::var("PATHEXT") {
             merged_envs.insert("PATHEXT".to_string(), pathext);
-            info!("[SACP] 📋 已添加系统 PATHEXT 环境变量");
+            debug!("[SACP] 📋 已添加系统 PATHEXT 环境变量");
         }
     }
 }
@@ -756,6 +756,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                         API_KEY_PLACEHOLDER.to_string(),
                     );
                 }
+                // ANTHROPIC_AUTH_TOKEN 也需要替换（某些场景下可能存在）
+                if merged_envs.contains_key("ANTHROPIC_AUTH_TOKEN") {
+                    merged_envs.insert(
+                        "ANTHROPIC_AUTH_TOKEN".to_string(),
+                        API_KEY_PLACEHOLDER.to_string(),
+                    );
+                }
                 if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
                     merged_envs.insert(
                         ENV_ANTHROPIC_BASE_URL.to_string(),
@@ -796,15 +803,19 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             command_path, command_args
         );
         debug!("[SACP] 📋 工作目录: {:?}", project_path);
-        info!(
+        debug!(
             "[SACP] 📋 传递给 Agent 的环境变量 ({} 个):",
             merged_envs.len()
         );
 
-        // 需要脱敏的环境变量 key 列表
-        const SENSITIVE_ENV_KEYS: &[&str] = &[ENV_ANTHROPIC_API_KEY, ENV_OPENAI_API_KEY];
+        // 需要脱敏的环境变量 key 列表（即使在 debug 日志中也不暴露完整值）
+        const SENSITIVE_ENV_KEYS: &[&str] = &[
+            ENV_ANTHROPIC_API_KEY,
+            ENV_OPENAI_API_KEY,
+            "ANTHROPIC_AUTH_TOKEN",
+        ];
 
-        // 按字母顺序排序并打印所有环境变量
+        // 按字母顺序排序并打印所有环境变量（仅在 debug 级别）
         let mut env_keys: Vec<_> = merged_envs.keys().collect();
         env_keys.sort();
 
@@ -817,9 +828,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 } else {
                     "***".to_string()
                 };
-                info!("[SACP] 📋   {} = {}", key, masked);
+                debug!("[SACP] 📋   {} = {}", key, masked);
             } else {
-                info!("[SACP] 📋   {} = {}", key, value);
+                debug!("[SACP] 📋   {} = {}", key, value);
             }
         }
 
@@ -1124,7 +1135,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     .mcp_servers(mcp_servers.clone())
                     .meta(system_prompt_meta);
 
-                info!("new_session_request: {:?}", new_session_request);
+                debug!("new_session_request: {:?}", new_session_request);
 
                 // 从配置获取超时值，默认 100 秒
                 let timeout_secs = start_config
