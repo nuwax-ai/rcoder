@@ -374,6 +374,33 @@ function initialize_user_home() {
         log_success "XFCE Panel config is valid"
     fi
 
+    # ========== 🔥 关键修复：先替换壁纸文件，再加载配置（解决壁纸竞态条件） ==========
+    # 必须在 xfce4-desktop.xml 加载之前完成壁纸文件替换！
+    # 否则 xfdesktop 启动时会读取到默认壁纸并缓存，后续设置不生效
+    local CUSTOM_WALLPAPER="/app/assets/wallpaper.jpeg"
+    local XFCE_WALLPAPER="/usr/share/backgrounds/xfce/wallpaper.jpeg"
+    local NOVNC_BG="/opt/noVNC/app/images/bg.jpg"
+
+    if [ -f "$CUSTOM_WALLPAPER" ]; then
+        log "Found custom wallpaper at $CUSTOM_WALLPAPER, applying BEFORE xfdesktop starts..."
+
+        # 1. 应用到 XFCE 桌面（备份原始文件）
+        if [ ! -f "${XFCE_WALLPAPER}.original" ]; then
+            cp "$XFCE_WALLPAPER" "${XFCE_WALLPAPER}.original" 2>/dev/null || true
+        fi
+        cp "$CUSTOM_WALLPAPER" "$XFCE_WALLPAPER"
+        log_success "  XFCE wallpaper applied EARLY: $CUSTOM_WALLPAPER -> $XFCE_WALLPAPER"
+
+        # 2. 应用到 noVNC 网页背景（同一图片，不同文件名）
+        if [ ! -f "${NOVNC_BG}.original" ]; then
+            cp "$NOVNC_BG" "${NOVNC_BG}.original" 2>/dev/null || true
+        fi
+        cp "$CUSTOM_WALLPAPER" "$NOVNC_BG"
+        log_success "  noVNC background applied EARLY: $CUSTOM_WALLPAPER -> $NOVNC_BG"
+    else
+        log "No custom wallpaper found at $CUSTOM_WALLPAPER (using defaults)"
+    fi
+
     # ========== 修复：预加载 XFCE 桌面壁纸配置（防止启动黑屏） ==========
     # 确保 xfce4-desktop.xml 存在，这样 xfdesktop 启动时能立即加载壁纸
     # 而不需要等待 apply_xfce_wallpaper 脚本
@@ -587,36 +614,9 @@ EOF
 
     log_success "Mesa shader cache configured: /tmp/mesa_shader_cache"
 
-    # ========== 🖼️ 自定义壁纸替换（管理员配置）==========
-    # 该目录由主容器挂载，用户无法直接修改，只有管理员可控制
-    # 使用方法：在 docker-compose.yml 中挂载 - ./assets:/app/assets:ro
-    # 将 wallpaper.jpeg 同时应用到：
-    #   1. XFCE 桌面壁纸: /usr/share/backgrounds/xfce/wallpaper.jpeg
-    #   2. noVNC 网页背景: /opt/noVNC/app/images/bg.jpg
-
-    local CUSTOM_WALLPAPER="/app/assets/wallpaper.jpeg"
-    local XFCE_WALLPAPER="/usr/share/backgrounds/xfce/wallpaper.jpeg"
-    local NOVNC_BG="/opt/noVNC/app/images/bg.jpg"
-
-    if [ -f "$CUSTOM_WALLPAPER" ]; then
-        log "Found custom wallpaper at $CUSTOM_WALLPAPER, applying to XFCE and noVNC..."
-
-        # 1. 应用到 XFCE 桌面
-        if [ ! -f "${XFCE_WALLPAPER}.original" ]; then
-            cp "$XFCE_WALLPAPER" "${XFCE_WALLPAPER}.original" 2>/dev/null || true
-        fi
-        cp "$CUSTOM_WALLPAPER" "$XFCE_WALLPAPER"
-        log_success "XFCE wallpaper applied: $CUSTOM_WALLPAPER -> $XFCE_WALLPAPER"
-
-        # 2. 应用到 noVNC 网页背景（同一图片，不同文件名）
-        if [ ! -f "${NOVNC_BG}.original" ]; then
-            cp "$NOVNC_BG" "${NOVNC_BG}.original" 2>/dev/null || true
-        fi
-        cp "$CUSTOM_WALLPAPER" "$NOVNC_BG"
-        log_success "noVNC background applied: $CUSTOM_WALLPAPER -> $NOVNC_BG"
-    else
-        log "No custom wallpaper found at $CUSTOM_WALLPAPER (using defaults)"
-    fi
+    # ========== 🖼️ 自定义壁纸替换已提前执行 ==========
+    # 壁纸替换逻辑已移到 xfce4-desktop.xml 加载之前执行（见本函数开头）
+    # 这样可以确保 xfdesktop 启动时就能读取到正确的壁纸文件
 }
 
 function start_vnc_services() {
