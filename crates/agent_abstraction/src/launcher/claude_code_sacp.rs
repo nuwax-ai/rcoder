@@ -125,6 +125,54 @@ fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String
     ensure_windows_subprocess_env(merged_envs);
 }
 
+/// 构建 MCP 服务器子进程所需的 PATH 环境变量
+///
+/// Claude Code SDK 在启动 MCP 服务器子进程时会用提供的 env 替换整个环境。
+/// 如果 env 中缺少 PATH，mcp-proxy convert --config 模式下的孙进程
+/// （如 uvx、npx）将因为找不到命令而静默失败。
+///
+/// 此函数与 ensure_subprocess_path_env 使用相同的逻辑构建 PATH：
+/// 1. 从 NUWAX_APP_RUNTIME_PATH 获取运行时路径
+/// 2. 追加系统基础目录
+fn build_mcp_server_path_env() -> String {
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let mut paths: Vec<String> = Vec::new();
+
+    // 1. 从 NUWAX_APP_RUNTIME_PATH 构建
+    if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
+        let runtime_path = runtime_path.trim().to_string();
+        if !runtime_path.is_empty() {
+            for p in runtime_path.split(sep) {
+                let p = p.trim();
+                if !p.is_empty() && !paths.contains(&p.to_string()) {
+                    paths.push(p.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. 追加系统基础目录
+    #[cfg(not(windows))]
+    {
+        for sys_dir in &["/bin", "/usr/bin", "/usr/local/bin"] {
+            let s = sys_dir.to_string();
+            if std::path::Path::new(sys_dir).is_dir() && !paths.contains(&s) {
+                paths.push(s);
+            }
+        }
+    }
+
+    // 3. Windows: 回退到当前进程的 PATH
+    #[cfg(windows)]
+    if paths.is_empty() {
+        if let Ok(current_path) = std::env::var("PATH") {
+            return current_path;
+        }
+    }
+
+    paths.join(sep)
+}
+
 /// Windows 专属：确保 PATHEXT 存在，以便解析 .cmd/.bat 等脚本
 #[cfg(windows)]
 fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<String, String>) {
@@ -485,6 +533,30 @@ pub fn convert_context_servers_sacp(
             for (key, val) in crate::mirror_env::collect_mirror_env_vars() {
                 if !env_vars.iter().any(|e| e.name == key) {
                     env_vars.push(sacp::schema::EnvVariable::new(key, val));
+                }
+            }
+
+            // 注入 PATH 环境变量（关键！）
+            // Claude Code SDK 用 MCP server 的 env 替换整个子进程环境。
+            // 如果 env 中没有 PATH，mcp-proxy convert --config 模式下
+            // 无法找到 uvx/npx 等命令来启动 MCP 子服务。
+            if !env_vars.iter().any(|e| e.name == "PATH") {
+                let path_value = build_mcp_server_path_env();
+                if !path_value.is_empty() {
+                    env_vars.push(sacp::schema::EnvVariable::new(
+                        "PATH".to_string(),
+                        path_value,
+                    ));
+                }
+            }
+
+            // 注入 HOME 环境变量（uvx/npx 等工具需要 HOME 来定位缓存目录）
+            if !env_vars.iter().any(|e| e.name == "HOME") {
+                if let Ok(home) = std::env::var("HOME") {
+                    env_vars.push(sacp::schema::EnvVariable::new(
+                        "HOME".to_string(),
+                        home,
+                    ));
                 }
             }
 
