@@ -74,26 +74,50 @@ const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
 const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
 
 /// 确保子进程环境变量中包含 PATH / PATHEXT，便于解析可执行路径与 Windows .cmd 脚本
+///
+/// PATH 组成（优先级从高到低）：
+/// 1. NUWAX_APP_RUNTIME_PATH — 应用自有运行时目录（node/uv/mcp-proxy 等）
+/// 2. 系统基础目录 — `/bin`, `/usr/bin` 等（uvx 生成的 Python 脚本依赖 `realpath` 等系统命令）
 fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String, String>) {
     if !merged_envs.contains_key("PATH") {
-        // 优先从 NUWAX_APP_RUNTIME_PATH 构建 PATH
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let mut paths: Vec<String> = Vec::new();
+
+        // 1. 优先从 NUWAX_APP_RUNTIME_PATH 构建 PATH
         if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
             let runtime_path = runtime_path.trim().to_string();
             if !runtime_path.is_empty() {
-                merged_envs.insert("PATH".to_string(), runtime_path);
+                for p in runtime_path.split(sep) {
+                    let p = p.trim();
+                    if !p.is_empty() && !paths.contains(&p.to_string()) {
+                        paths.push(p.to_string());
+                    }
+                }
                 info!("[SACP] 📋 已从 NUWAX_APP_RUNTIME_PATH 构建 PATH 环境变量");
             }
         }
 
-        // 如果 NUWAX_APP_RUNTIME_PATH 未命中，从 APPDATA 推导默认路径
-        if !merged_envs.contains_key("PATH") {
-            // 使用 agent_abstraction::path_env 提供的工具函数
-            #[cfg(windows)]
-            {
-                use crate::path_env::build_rcoder_path_env;
-                if let Some(path) = build_rcoder_path_env() {
-                    merged_envs.insert("PATH".to_string(), path);
+        // 2. 追加系统基础目录（uvx/pip 生成的脚本需要 realpath、sh 等系统命令）
+        #[cfg(not(windows))]
+        {
+            for sys_dir in &["/bin", "/usr/bin", "/usr/local/bin"] {
+                let s = sys_dir.to_string();
+                if std::path::Path::new(sys_dir).is_dir() && !paths.contains(&s) {
+                    paths.push(s);
                 }
+            }
+        }
+
+        if !paths.is_empty() {
+            merged_envs.insert("PATH".to_string(), paths.join(sep));
+        }
+
+        // Windows: 如果仍无 PATH，从 APPDATA 推导默认路径
+        #[cfg(windows)]
+        if !merged_envs.contains_key("PATH") {
+            use crate::path_env::build_rcoder_path_env;
+            if let Some(path) = build_rcoder_path_env() {
+                merged_envs.insert("PATH".to_string(), path);
             }
         }
     }
