@@ -551,12 +551,34 @@ pub fn convert_context_servers_sacp(
             }
 
             // 注入 HOME 环境变量（uvx/npx 等工具需要 HOME 来定位缓存目录）
+            #[cfg(not(windows))]
             if !env_vars.iter().any(|e| e.name == "HOME") {
                 if let Ok(home) = std::env::var("HOME") {
                     env_vars.push(sacp::schema::EnvVariable::new(
                         "HOME".to_string(),
                         home,
                     ));
+                }
+            }
+
+            // Windows: 注入 USERPROFILE 和 PATHEXT
+            #[cfg(windows)]
+            {
+                if !env_vars.iter().any(|e| e.name == "USERPROFILE") {
+                    if let Ok(profile) = std::env::var("USERPROFILE") {
+                        env_vars.push(sacp::schema::EnvVariable::new(
+                            "USERPROFILE".to_string(),
+                            profile,
+                        ));
+                    }
+                }
+                if !env_vars.iter().any(|e| e.name == "PATHEXT") {
+                    if let Ok(pathext) = std::env::var("PATHEXT") {
+                        env_vars.push(sacp::schema::EnvVariable::new(
+                            "PATHEXT".to_string(),
+                            pathext,
+                        ));
+                    }
                 }
             }
 
