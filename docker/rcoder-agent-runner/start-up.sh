@@ -401,16 +401,15 @@ function initialize_user_home() {
         log "No custom wallpaper found at $CUSTOM_WALLPAPER (using defaults)"
     fi
 
-    # ========== 修复：预加载 XFCE 桌面壁纸配置（防止启动黑屏） ==========
-    # 确保 xfce4-desktop.xml 存在，这样 xfdesktop 启动时能立即加载壁纸
-    # 而不需要等待 apply_xfce_wallpaper 脚本
+    # ========== 修复：预加载 XFCE 桌面壁纸配置（防止启动黑屏和缩放问题） ==========
+    # 复制系统配置到用户目录，包含所有 monitor 路径和缩放设置 (image-style=5)
     local XFCE_DESKTOP_XML="$USER_HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
     local XFCE_DESKTOP_SYSTEM="/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
 
     if [ ! -f "$XFCE_DESKTOP_XML" ] && [ -f "$XFCE_DESKTOP_SYSTEM" ]; then
         mkdir -p "$(dirname "$XFCE_DESKTOP_XML")"
         cp -f "$XFCE_DESKTOP_SYSTEM" "$XFCE_DESKTOP_XML"
-        log_success "  xfce4-desktop.xml pre-configured from system (fixes black wallpaper)"
+        log_success "  xfce4-desktop.xml pre-configured from system (fixes wallpaper scaling)"
     fi
 
     # 确保 Panel launcher 目录存在且内容完整（强制恢复）
