@@ -140,6 +140,15 @@ impl HttpServerHandle {
 /// }
 /// ```
 pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHandle> {
+    // 设置 mcp-proxy 日志目录环境变量（如果配置了的话）
+    if let Some(ref log_dir) = config.app_config.mcp_proxy_log_dir {
+        // SAFETY: 在服务启动时设置环境变量是安全的，此时尚未启动多线程任务
+        unsafe {
+            std::env::set_var("MCP_PROXY_LOG_DIR", log_dir);
+        }
+        info!("🔧 设置 MCP_PROXY_LOG_DIR={}", log_dir);
+    }
+
     // 设置无限制模式（HTTP Server 部署不限制槽位）
     set_unlimited_mode(true);
 
