@@ -148,16 +148,20 @@ impl AgentStartConfig {
         }
 
         // Build claudeCode.options structure
-        // Always set settingSources: [] to prevent loading ~/.claude/settings.json,
-        // which may override ANTHROPIC_BASE_URL and break the proxy setup.
+        // settingSources 控制 Claude Code Agent 从哪些来源加载配置和 skills。
+        // 可选值: "user"(全局 ~/.claude/), "project"(项目 .claude/), "local"
+        // 只加载 "project" 级别配置，避免全局 user 配置覆盖 ANTHROPIC_BASE_URL，
+        // 同时允许项目目录下的 .claude/skills/ 自定义技能生效。
         // Refer to the TypeScript code on the Agent side:
         // resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume
         let mut options = serde_json::Map::new();
 
-        // Block global settings loading
+        // Only load project-level settings (skills), block global settings
         options.insert(
             "settingSources".to_string(),
-            serde_json::Value::Array(vec![]),
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("project".to_string()),
+            ]),
         );
 
         // Add resume session_id if present
@@ -222,11 +226,13 @@ impl AgentStartConfig {
             );
         }
 
-        // Block global settings loading (consistent with build_meta)
+        // Only load project-level settings (consistent with build_meta)
         let mut options = serde_json::Map::new();
         options.insert(
             "settingSources".to_string(),
-            serde_json::Value::Array(vec![]),
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("project".to_string()),
+            ]),
         );
 
         let mut claude_code = serde_json::Map::new();
