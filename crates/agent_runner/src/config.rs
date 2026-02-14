@@ -54,6 +54,11 @@ pub struct AppConfig {
     /// Agent 并发配置
     #[serde(default)]
     pub agent_concurrency: Option<AgentConcurrencyConfig>,
+    /// mcp-proxy 日志目录（可选）
+    /// 当设置此值且日志级别为 debug 时，mcp-proxy convert 命令会自动追加
+    /// --diagnostic 和 --log-dir 参数
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_proxy_log_dir: Option<String>,
 }
 
 fn default_agent_id() -> String {
@@ -324,6 +329,7 @@ impl Default for AppConfig {
             agent_cleanup: Some(AgentCleanupConfig::default()),
             grpc_timeouts: Some(GrpcTimeoutConfig::default()),
             agent_concurrency: Some(AgentConcurrencyConfig::default()),
+            mcp_proxy_log_dir: None,
         }
     }
 }

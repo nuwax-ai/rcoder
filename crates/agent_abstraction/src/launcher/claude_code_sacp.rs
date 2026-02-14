@@ -315,6 +315,103 @@ fn get_dbus_session_address() -> Option<String> {
     })
 }
 
+/// mcp-proxy 日志目录环境变量名
+const ENV_MCP_PROXY_LOG_DIR: &str = "MCP_PROXY_LOG_DIR";
+
+/// 检测命令是否为 mcp-proxy（简化版，只检测命令名）
+fn is_mcp_proxy_command(command: &str) -> bool {
+    command == "mcp-proxy"
+}
+
+/// 检测参数中是否有 convert 子命令
+fn has_convert_subcommand(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "convert")
+}
+
+/// 检测当前日志级别是否为 debug
+fn is_debug_log_level() -> bool {
+    // 优先检查 RUST_LOG 环境变量
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        let log_lower = rust_log.to_lowercase();
+        return log_lower.contains("debug") || log_lower.contains("trace");
+    }
+    // 使用 tracing 的 enabled! 宏检测
+    tracing::enabled!(tracing::Level::DEBUG)
+}
+
+/// 获取 mcp-proxy 日志目录（如果配置了的话）
+fn get_mcp_proxy_log_dir() -> Option<String> {
+    std::env::var(ENV_MCP_PROXY_LOG_DIR).ok()
+}
+
+/// 检查参数中是否已有 --log-dir 或 --log-file 参数
+fn has_log_dir_arg(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--log-dir"
+            || arg.starts_with("--log-dir=")
+            || arg == "--log-file"
+            || arg.starts_with("--log-file=")
+    })
+}
+
+/// 为 mcp-proxy convert 命令追加诊断参数
+///
+/// 当检测到以下条件时，自动追加 `--diagnostic` 参数：
+/// 1. 命令是 `mcp-proxy`
+/// 2. 参数包含 `convert` 子命令
+/// 3. 当前日志级别是 debug
+///
+/// 只有配置了 `MCP_PROXY_LOG_DIR` 环境变量时才追加 `--log-dir` 参数
+///
+/// 重复检查逻辑：
+/// 1. 如果参数中已有 --diagnostic，跳过注入
+/// 2. 如果参数中已有 --log-dir 或 --log-file，不追加 --log-dir（避免覆盖用户配置）
+fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
+    // 检查是否为 mcp-proxy convert 命令
+    if !is_mcp_proxy_command(command) || !has_convert_subcommand(&args) {
+        return args;
+    }
+
+    // 检查日志级别是否为 debug
+    if !is_debug_log_level() {
+        debug!(
+            "[MCP] mcp-proxy convert 检测到，但日志级别非 debug，跳过诊断参数注入"
+        );
+        return args;
+    }
+
+    // 检查是否已有 --diagnostic 参数
+    let has_diagnostic = args.iter().any(|arg| arg == "--diagnostic");
+    if has_diagnostic {
+        debug!("[MCP] mcp-proxy convert 已有 --diagnostic 参数，跳过注入");
+        return args;
+    }
+
+    let mut enhanced_args = args;
+
+    // 追加 --diagnostic 参数
+    enhanced_args.push("--diagnostic".to_string());
+    info!("[MCP] 为 mcp-proxy convert 追加 --diagnostic 参数");
+
+    // 🔒 关键检查：如果用户已配置 --log-dir 或 --log-file，不覆盖
+    if has_log_dir_arg(&enhanced_args) {
+        debug!("[MCP] 用户已配置日志参数，跳过 --log-dir 注入");
+        return enhanced_args;
+    }
+
+    // 只有配置了 MCP_PROXY_LOG_DIR 环境变量时才追加 --log-dir 参数
+    if let Some(log_dir) = get_mcp_proxy_log_dir() {
+        enhanced_args.push("--log-dir".to_string());
+        enhanced_args.push(log_dir.clone());
+        info!(
+            "[MCP] 为 mcp-proxy convert 追加 --log-dir {} 参数",
+            log_dir
+        );
+    }
+
+    enhanced_args
+}
+
 /// 将配置中的 Context 服务器转换为 SACP 协议的 McpServer
 pub fn convert_context_servers_sacp(
     configs: &HashMap<String, ContextServerConfig>,
@@ -328,8 +425,15 @@ pub fn convert_context_servers_sacp(
             let command = c.command.as_ref()?;
             let mut server = McpServerStdio::new(name, PathBuf::from(command));
 
-            if let Some(args) = &c.args {
-                server = server.args(args.clone());
+            // 处理参数，可能需要为 mcp-proxy convert 追加诊断参数
+            let final_args = if let Some(args) = &c.args {
+                enhance_mcp_proxy_args(command, args.clone())
+            } else {
+                Vec::new()
+            };
+
+            if !final_args.is_empty() {
+                server = server.args(final_args);
             }
 
             let mut env_vars: Vec<sacp::schema::EnvVariable> = if let Some(env) = &c.env {
@@ -1581,5 +1685,238 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("SacpAgentLaunchConfig"));
         assert!(debug_str.contains("test"));
+    }
+
+    // === mcp-proxy convert 诊断参数测试 ===
+
+    #[test]
+    fn test_is_mcp_proxy_command_simple() {
+        // 简化版只检测精确的命令名
+        assert!(is_mcp_proxy_command("mcp-proxy"));
+        // 不再检测大小写变体和路径
+        assert!(!is_mcp_proxy_command("MCP-PROXY"));
+        assert!(!is_mcp_proxy_command("Mcp-Proxy"));
+    }
+
+    #[test]
+    fn test_is_mcp_proxy_command_not_mcp_proxy() {
+        assert!(!is_mcp_proxy_command("node"));
+        assert!(!is_mcp_proxy_command("bunx"));
+        assert!(!is_mcp_proxy_command("/usr/bin/uvx"));
+        assert!(!is_mcp_proxy_command("mcp-proxy-other"));
+        // 路径形式不再匹配（简化版）
+        assert!(!is_mcp_proxy_command("/usr/local/bin/mcp-proxy"));
+        assert!(!is_mcp_proxy_command("C:\\Users\\test\\mcp-proxy.exe"));
+    }
+
+    #[test]
+    fn test_has_convert_subcommand() {
+        assert!(has_convert_subcommand(&["convert".to_string()]));
+        assert!(has_convert_subcommand(&[
+            "convert".to_string(),
+            "http://example.com".to_string()
+        ]));
+        assert!(has_convert_subcommand(&[
+            "--config".to_string(),
+            "config.json".to_string(),
+            "convert".to_string()
+        ]));
+    }
+
+    #[test]
+    fn test_has_convert_subcommand_no_convert() {
+        assert!(!has_convert_subcommand(&[]));
+        assert!(!has_convert_subcommand(&["serve".to_string()]));
+        assert!(!has_convert_subcommand(&[
+            "--config".to_string(),
+            "config.json".to_string()
+        ]));
+    }
+
+    #[test]
+    fn test_enhance_mcp_proxy_args_non_mcp_proxy() {
+        // 非 mcp-proxy 命令，应该原样返回
+        let args = vec!["arg1".to_string(), "arg2".to_string()];
+        let result = enhance_mcp_proxy_args("node", args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_enhance_mcp_proxy_args_no_convert() {
+        // mcp-proxy 但没有 convert 子命令，应该原样返回
+        let args = vec!["serve".to_string()];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_enhance_mcp_proxy_args_already_has_diagnostic() {
+        // 已有 --diagnostic 参数
+        let args = vec![
+            "convert".to_string(),
+            "--diagnostic".to_string(),
+            "--log-dir".to_string(),
+            "/tmp/logs".to_string(),
+        ];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args.clone());
+        // 应该原样返回，不重复添加
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_get_mcp_proxy_log_dir_none_when_unset() {
+        // 清除环境变量以测试返回 None
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+        let log_dir = get_mcp_proxy_log_dir();
+        assert_eq!(log_dir, None);
+    }
+
+    #[test]
+    fn test_get_mcp_proxy_log_dir_from_env() {
+        let custom_dir = "/custom/mcp-proxy-logs";
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var(ENV_MCP_PROXY_LOG_DIR, custom_dir);
+        }
+        let log_dir = get_mcp_proxy_log_dir();
+        assert_eq!(log_dir, Some(custom_dir.to_string()));
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+    }
+
+    #[test]
+    fn test_has_log_dir_arg() {
+        // 检测 --log-dir 参数
+        assert!(has_log_dir_arg(&["--log-dir".to_string(), "/tmp".to_string()]));
+        assert!(has_log_dir_arg(&["--log-dir=/tmp".to_string()]));
+        assert!(has_log_dir_arg(&["convert".to_string(), "--log-dir".to_string()]));
+
+        // 检测 --log-file 参数
+        assert!(has_log_dir_arg(&["--log-file".to_string(), "/tmp/log.txt".to_string()]));
+        assert!(has_log_dir_arg(&["--log-file=/tmp/log.txt".to_string()]));
+    }
+
+    #[test]
+    fn test_has_log_dir_arg_no_log_args() {
+        assert!(!has_log_dir_arg(&[]));
+        assert!(!has_log_dir_arg(&["convert".to_string()]));
+        assert!(!has_log_dir_arg(&["--diagnostic".to_string()]));
+        assert!(!has_log_dir_arg(&["--config".to_string(), "config.json".to_string()]));
+    }
+
+    #[test]
+    fn test_enhance_args_respects_existing_log_dir() {
+        // 模拟 debug 日志级别
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+            std::env::set_var(ENV_MCP_PROXY_LOG_DIR, "/env/path");
+        }
+
+        // 用户已配置 --log-dir，不应覆盖
+        let args = vec![
+            "convert".to_string(),
+            "--log-dir".to_string(),
+            "/custom/path".to_string(),
+        ];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args);
+
+        // 应该只追加 --diagnostic，不重复追加 --log-dir
+        assert!(result.contains(&"--diagnostic".to_string()));
+        // 只应有一个 --log-dir
+        assert_eq!(result.iter().filter(|a| *a == "--log-dir").count(), 1);
+        // --log-dir 的值应该是用户配置的 /custom/path
+        let log_dir_idx = result.iter().position(|a| a == "--log-dir").unwrap();
+        assert_eq!(result.get(log_dir_idx + 1), Some(&"/custom/path".to_string()));
+
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+    }
+
+    #[test]
+    fn test_enhance_args_respects_existing_log_file() {
+        // 模拟 debug 日志级别
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+            std::env::set_var(ENV_MCP_PROXY_LOG_DIR, "/env/path");
+        }
+
+        // 用户已配置 --log-file，不应追加 --log-dir
+        let args = vec![
+            "convert".to_string(),
+            "--log-file=/custom/file.log".to_string(),
+        ];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args);
+
+        // 应该只追加 --diagnostic
+        assert!(result.contains(&"--diagnostic".to_string()));
+        // 不应有 --log-dir
+        assert!(!result.iter().any(|a| a == "--log-dir"));
+
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+    }
+
+    #[test]
+    fn test_enhance_args_adds_log_dir_when_env_set() {
+        // 模拟 debug 日志级别和配置了 MCP_PROXY_LOG_DIR
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+            std::env::set_var(ENV_MCP_PROXY_LOG_DIR, "/var/log/mcp");
+        }
+
+        let args = vec!["convert".to_string()];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args);
+
+        // 应该追加 --diagnostic 和 --log-dir
+        assert!(result.contains(&"--diagnostic".to_string()));
+        assert!(result.contains(&"--log-dir".to_string()));
+        assert!(result.contains(&"/var/log/mcp".to_string()));
+
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+    }
+
+    #[test]
+    fn test_enhance_args_no_log_dir_when_env_unset() {
+        // 模拟 debug 日志级别但没有配置 MCP_PROXY_LOG_DIR
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+
+        let args = vec!["convert".to_string()];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args);
+
+        // 应该只追加 --diagnostic，不应有 --log-dir
+        assert!(result.contains(&"--diagnostic".to_string()));
+        assert!(!result.iter().any(|a| a == "--log-dir"));
+
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+        }
     }
 }
