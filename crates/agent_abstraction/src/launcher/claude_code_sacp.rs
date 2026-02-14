@@ -354,6 +354,13 @@ pub fn convert_context_servers_sacp(
                 }
             }
 
+            // 注入镜像源环境变量（npx/bunx/uvx 子进程使用）
+            for (key, val) in crate::mirror_env::collect_mirror_env_vars() {
+                if !env_vars.iter().any(|e| e.name == key) {
+                    env_vars.push(sacp::schema::EnvVariable::new(key, val));
+                }
+            }
+
             if !env_vars.is_empty() {
                 server = server.env(env_vars);
             }

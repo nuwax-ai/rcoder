@@ -66,6 +66,7 @@
 pub mod acp;
 pub mod error;
 pub mod launcher;
+pub mod mirror_env;
 pub mod path_env;
 pub mod session;
 pub mod traits;
