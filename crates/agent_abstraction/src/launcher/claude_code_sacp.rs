@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
+#[cfg(windows)]
+use crate::path_env::TAURI_APP_DATA_DIR;
 use process_wrap::tokio::CommandWrap;
 #[cfg(windows)]
 use process_wrap::tokio::{CreationFlags, JobObject};
@@ -73,52 +75,60 @@ const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
 /// 默认代理 Base URL（包含 UUID 占位符）
 const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
 
+/// 获取各平台下常用的用户二进制目录
+///
+/// Linux/Mac:
+/// - ~/.cargo/bin (Rust cargo)
+/// - ~/.npm-global/bin (npm global)
+/// - ~/.local/bin (uv, pipx)
+/// - /opt/homebrew/bin (Homebrew on Apple Silicon)
+/// - /usr/local/bin (Homebrew on Intel Mac / 通用)
+/// - /home/linuxbrew/.linuxbrew/bin (Linuxbrew)
+///
+/// Windows:
+/// - 返回空，Windows 环境变量已包含这些路径
+///
+/// 注意：使用 $HOME 变量而非硬编码 /root，HOME 不存在时自动回退到 /root
+fn get_common_user_bins() -> Vec<&'static str> {
+    #[cfg(windows)]
+    {
+        vec![] // Windows 用户路径已在系统 PATH 中
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![
+            // Cargo (Rust)
+            "$HOME/.cargo/bin",
+            // NPM global
+            "$HOME/.npm-global/bin",
+            // UV / PIPX global
+            "$HOME/.local/bin",
+            // Homebrew (Apple Silicon)
+            "/opt/homebrew/bin",
+            // Homebrew (Intel Mac) / 通用本地安装
+            "/usr/local/bin",
+            // Linuxbrew
+            "/home/linuxbrew/.linuxbrew/bin",
+            // 系统级 cargo（某些容器环境）
+            "/opt/cargo/bin",
+        ]
+    }
+}
+
 /// 确保子进程环境变量中包含 PATH / PATHEXT，便于解析可执行路径与 Windows .cmd 脚本
 ///
 /// PATH 组成（优先级从高到低）：
 /// 1. NUWAX_APP_RUNTIME_PATH — 应用自有运行时目录（node/uv/mcp-proxy 等）
-/// 2. 系统基础目录 — `/bin`, `/usr/bin` 等（uvx 生成的 Python 脚本依赖 `realpath` 等系统命令）
+/// 2. 当前系统 PATH — 保留所有现有路径（关键改进！）
+/// 3. 常用用户目录 — cargo, npm, uv, homebrew 等
+/// 4. 系统基础目录 — `/bin`, `/usr/bin` 等（仅在 PATH 为空时）
 fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String, String>) {
     if !merged_envs.contains_key("PATH") {
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        let mut paths: Vec<String> = Vec::new();
-
-        // 1. 优先从 NUWAX_APP_RUNTIME_PATH 构建 PATH
-        if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
-            let runtime_path = runtime_path.trim().to_string();
-            if !runtime_path.is_empty() {
-                for p in runtime_path.split(sep) {
-                    let p = p.trim();
-                    if !p.is_empty() && !paths.contains(&p.to_string()) {
-                        paths.push(p.to_string());
-                    }
-                }
-                debug!("[SACP] 📋 已从 NUWAX_APP_RUNTIME_PATH 构建 PATH 环境变量");
-            }
-        }
-
-        // 2. 追加系统基础目录（uvx/pip 生成的脚本需要 realpath、sh 等系统命令）
-        #[cfg(not(windows))]
-        {
-            for sys_dir in &["/bin", "/usr/bin", "/usr/local/bin"] {
-                let s = sys_dir.to_string();
-                if std::path::Path::new(sys_dir).is_dir() && !paths.contains(&s) {
-                    paths.push(s);
-                }
-            }
-        }
-
-        if !paths.is_empty() {
-            merged_envs.insert("PATH".to_string(), paths.join(sep));
-        }
-
-        // Windows: 如果仍无 PATH，从 APPDATA 推导默认路径
-        #[cfg(windows)]
-        if !merged_envs.contains_key("PATH") {
-            use crate::path_env::build_rcoder_path_env;
-            if let Some(path) = build_rcoder_path_env() {
-                merged_envs.insert("PATH".to_string(), path);
-            }
+        let path = build_mcp_server_path_env();
+        if !path.is_empty() {
+            merged_envs.insert("PATH".to_string(), path);
+            debug!("[SACP] 📋 已构建 PATH 环境变量（包含系统 PATH 和用户目录）");
         }
     }
     #[cfg(windows)]
@@ -132,41 +142,93 @@ fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String
 /// （如 uvx、npx）将因为找不到命令而静默失败。
 ///
 /// 此函数与 ensure_subprocess_path_env 使用相同的逻辑构建 PATH：
-/// 1. 从 NUWAX_APP_RUNTIME_PATH 获取运行时路径
-/// 2. 追加系统基础目录
+/// 1. NUWAX_APP_RUNTIME_PATH — 应用自有运行时目录（优先）
+/// 2. 当前系统 PATH — 保留所有现有路径（关键改进！）
+/// 3. 平台特定目录：
+///    - Windows: APPDATA 推导的 Tauri 应用 node/npm 路径
+///    - Unix: 常用用户目录（cargo, npm, uv, homebrew 等）
+/// 4. 系统基础目录 — 仅在 PATH 为空时兜底
 fn build_mcp_server_path_env() -> String {
     let sep = if cfg!(windows) { ";" } else { ":" };
     let mut paths: Vec<String> = Vec::new();
 
-    // 1. 从 NUWAX_APP_RUNTIME_PATH 构建
+    // 1. 优先：NUWAX_APP_RUNTIME_PATH
     if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
-        let runtime_path = runtime_path.trim().to_string();
-        if !runtime_path.is_empty() {
-            for p in runtime_path.split(sep) {
-                let p = p.trim();
-                if !p.is_empty() && !paths.contains(&p.to_string()) {
-                    paths.push(p.to_string());
+        for p in runtime_path.split(sep) {
+            let p = p.trim();
+            if !p.is_empty() && !paths.contains(&p.to_string()) {
+                paths.push(p.to_string());
+            }
+        }
+    }
+
+    // 2. 追加：当前系统 PATH（关键改动！）
+    if let Ok(current_path) = std::env::var("PATH") {
+        for p in current_path.split(sep) {
+            let p = p.trim();
+            if !p.is_empty() && !paths.contains(&p.to_string()) {
+                paths.push(p.to_string());
+            }
+        }
+    }
+
+    // 3. 追加：平台特定目录
+    #[cfg(windows)]
+    {
+        // Windows: 从 APPDATA 推导 Tauri 应用的 node/npm 路径
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            use std::path::PathBuf;
+            let app_base = PathBuf::from(&appdata).join(TAURI_APP_DATA_DIR);
+
+            let node_bin = app_base.join("runtime").join("node").join("bin");
+            if node_bin.is_dir() {
+                let node_bin_str = node_bin.to_string_lossy().to_string();
+                if !paths.contains(&node_bin_str) {
+                    paths.push(node_bin_str);
+                }
+            }
+
+            let npm_bin = app_base.join("node_modules").join(".bin");
+            if npm_bin.is_dir() {
+                let npm_bin_str = npm_bin.to_string_lossy().to_string();
+                if !paths.contains(&npm_bin_str) {
+                    paths.push(npm_bin_str);
                 }
             }
         }
     }
 
-    // 2. 追加系统基础目录
     #[cfg(not(windows))]
     {
-        for sys_dir in &["/bin", "/usr/bin", "/usr/local/bin"] {
-            let s = sys_dir.to_string();
-            if std::path::Path::new(sys_dir).is_dir() && !paths.contains(&s) {
-                paths.push(s);
+        // Unix: 追加常用用户目录（自动扩展 $HOME）
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        for bin in get_common_user_bins() {
+            let expanded = bin.replace("$HOME", &home);
+            let path = std::path::Path::new(&expanded);
+            if path.is_dir() && !paths.contains(&expanded) {
+                paths.push(expanded);
             }
         }
     }
 
-    // 3. Windows: 回退到当前进程的 PATH
-    #[cfg(windows)]
+    // 4. 兜底：系统基础目录（仅在 PATH 为空时）
+    // 正常情况下不会走到这里，因为步骤 2 已经追加了当前系统 PATH
+    // 这是为了防御性编程，确保即使在极端情况下也有可用的基础命令
     if paths.is_empty() {
-        if let Ok(current_path) = std::env::var("PATH") {
-            return current_path;
+        #[cfg(not(windows))]
+        for sys_dir in &["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin"] {
+            let s = sys_dir.to_string();
+            if std::path::Path::new(sys_dir).is_dir() {
+                paths.push(s);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // Windows: 直接返回系统 PATH 作为最后手段
+            if let Ok(current_path) = std::env::var("PATH") {
+                return current_path;
+            }
         }
     }
 

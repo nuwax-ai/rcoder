@@ -4,6 +4,10 @@
 
 use std::path::PathBuf;
 
+/// Tauri 桌面客户端在 APPDATA 下的应用数据目录名
+/// Windows: %APPDATA%/{TAURI_APP_DATA_DIR}
+pub const TAURI_APP_DATA_DIR: &str = "com.nuwax.agent-tauri-client";
+
 /// 在系统 PATH 中查找可执行文件
 fn find_in_path(executable: &str) -> Option<String> {
     let output = if cfg!(windows) {
@@ -96,7 +100,7 @@ pub fn build_rcoder_path_env() -> Option<String> {
 
     // 2. 从 APPDATA 推导默认路径
     if let Ok(appdata) = std::env::var("APPDATA") {
-        let app_base = PathBuf::from(&appdata).join("com.nuwax.agent-tauri-client");
+        let app_base = PathBuf::from(&appdata).join(TAURI_APP_DATA_DIR);
         let mut paths: Vec<String> = Vec::new();
 
         let node_bin = app_base.join("runtime").join("node").join("bin");
