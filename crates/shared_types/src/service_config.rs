@@ -603,6 +603,41 @@ mod tests {
         assert_eq!(config.container_prefix(), "rcoder-agent");
     }
 
+    /// 测试 ServiceType::container_prefix() 与 ServiceConfig::container_prefix() 的差异
+    ///
+    /// 这是导致 VNC 状态查询返回 CONTAINER_NOT_FOUND 的根因：
+    /// - ServiceType::container_prefix() 返回硬编码的 "computer-agent-runner"
+    /// - ServiceConfig::container_prefix() 读取配置的 image_tag_prefix "rcoder-computer-agent-runner"
+    /// - 容器创建使用后者，而错误的查询代码使用前者，导致名称不匹配
+    #[test]
+    fn test_container_prefix_difference_causes_container_not_found() {
+        // 硬编码的 ServiceType 前缀（错误的查询方式）
+        let service_type_prefix = ServiceType::ComputerAgentRunner.container_prefix();
+        assert_eq!(service_type_prefix, "computer-agent-runner");
+
+        // 配置化的 ServiceConfig 前缀（正确的创建方式）
+        let config = default_agent_runner_service_config();
+        let config_prefix = config.container_prefix();
+        assert_eq!(config_prefix, "rcoder-computer-agent-runner");
+
+        // 明确展示差异：两者不同！
+        assert_ne!(
+            service_type_prefix, config_prefix,
+            "ServiceType::container_prefix() 与 ServiceConfig::container_prefix() 应该不同"
+        );
+
+        // 展示如果用错误的前缀构造容器名会导致什么问题
+        let user_id = "1743762321";
+        let wrong_container_name = format!("{}-{}", service_type_prefix, user_id);
+        let correct_container_name = format!("{}-{}", config_prefix, user_id);
+
+        assert_eq!(wrong_container_name, "computer-agent-runner-1743762321");
+        assert_eq!(correct_container_name, "rcoder-computer-agent-runner-1743762321");
+
+        // 如果用错误的名字去查询，当然找不到正确名字创建的容器
+        assert_ne!(wrong_container_name, correct_container_name);
+    }
+
     #[test]
     fn test_resource_limits_validation_valid() {
         let valid = ServiceResourceLimits {

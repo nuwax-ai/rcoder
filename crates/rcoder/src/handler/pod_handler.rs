@@ -700,13 +700,12 @@ pub async fn pod_ensure(
             AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
         })?;
 
-    // 构造容器名称
-    let container_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-    let expected_container_name = format!("{}-{}", container_prefix, request.user_id);
-
-    // 实时查询 Docker API
+    // 通过 find_user_container 查询容器（使用 ServiceConfig 中配置的容器前缀）
     let existing_container = docker_manager
-        .find_container_realtime(&expected_container_name)
+        .find_user_container(
+            &request.user_id,
+            &shared_types::ServiceType::ComputerAgentRunner,
+        )
         .await
         .map_err(|e| {
             error!("❌ [POD_ENSURE] 查询容器状态失败: {}", e);
@@ -1442,18 +1441,26 @@ pub async fn pod_status(
             AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
         })?;
 
-    // 3. 确定查询标识符：优先使用 user_id 构造容器名，否则使用 project_id
-    let identifier = if let Some(ref user_id) = params.user_id {
-        let prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-        format!("{}-{}", prefix, user_id)
+    // 3. 查询容器状态
+    //
+    // 两种查询路径：
+    // - user_id 路径：使用 find_user_container()，通过 ServiceConfig 获取配置化的容器前缀
+    //   （如 "rcoder-computer-agent-runner-{user_id}"），避免硬编码前缀与实际容器名不一致
+    // - project_id 路径：直接使用 find_container_realtime()，project_id 作为 DuckDB 中存储的容器标识符
+    let query_result = if let Some(ref user_id) = params.user_id {
+        // user_id 路径：通过配置化前缀查找容器
+        docker_manager
+            .find_user_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .await
     } else if let Some(ref project_id) = params.project_id {
-        project_id.clone()
+        // project_id 路径：直接按标识符查找（DuckDB 中存储的是完整容器名）
+        docker_manager.find_container_realtime(project_id).await
     } else {
         unreachable!()
     };
 
-    // 4. 🆕 通过 DockerManager 实时查询容器状态（直接查询 Docker API，无缓存延迟）
-    match docker_manager.find_container_realtime(&identifier).await {
+    // 4. 通过 DockerManager 查询容器状态
+    match query_result {
         Ok(Some(result)) => {
             let status_str = if result.is_running { "running" } else { "stopped" };
             let message = if result.is_running {
@@ -1639,13 +1646,13 @@ pub async fn pod_vnc_status(
         })?;
 
     // 3. 定位容器
-    // 优先使用 user_id 查找（ComputerAgentRunner 按 user_id 命名）
+    // 优先使用 user_id 查找（通过 find_user_container 获取配置化的容器前缀）
     let (lookup_user_id, container_info) = if let Some(uid) = user_id {
-        let container_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-        let expected_name = format!("{}-{}", container_prefix, uid);
         (
             uid,
-            docker_manager.find_container_realtime(&expected_name).await,
+            docker_manager
+                .find_user_container(uid, &shared_types::ServiceType::ComputerAgentRunner)
+                .await,
         )
     } else if let Some(pid) = project_id {
         // 如果只有 project_id，通过 DuckDB 查找关联的容器
