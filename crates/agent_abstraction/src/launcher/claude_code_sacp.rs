@@ -46,10 +46,10 @@ use crate::traits::session_registry::SessionRegistry;
 use super::lifecycle::AgentLifecycleGuard;
 #[cfg(windows)]
 use super::windows_launch::{
-    normalize_windows_command_for_no_window, resolve_windows_node_cli_command, CREATE_NO_WINDOW_FLAG,
+    normalize_windows_command_for_no_window, resolve_windows_node_cli_command,
 };
 #[cfg(windows)]
-use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
+use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_NEW_PROCESS_GROUP};
 
 /// 使用最新协议版本
 const VERSION: ProtocolVersion = ProtocolVersion::LATEST;
@@ -921,9 +921,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         #[cfg(windows)]
         let mut child = cmd_wrap
-            .wrap(CreationFlags(PROCESS_CREATION_FLAGS(
-                CREATE_NO_WINDOW_FLAG,
-            )))
+            .wrap(CreationFlags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP))
             .wrap(JobObject)
             .spawn()
             .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;

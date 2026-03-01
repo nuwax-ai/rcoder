@@ -63,9 +63,18 @@ pub trait AgentInstaller: Send + Sync {
         command: &str,
         args: &[&str],
     ) -> Result<std::process::Output, InstallationError> {
-        tokio::process::Command::new(command)
-            .args(args)
-            .output()
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args);
+
+        // Windows: 隐藏控制台窗口
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        cmd.output()
             .await
             .map_err(|e| InstallationError::CommandFailed {
                 command: format!("{} {}", command, args.join(" ")),

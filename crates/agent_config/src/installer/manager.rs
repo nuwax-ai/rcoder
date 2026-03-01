@@ -246,8 +246,18 @@ impl AgentInstallationManager {
 
         debug!("运行验证命令: {} {:?}", program, args);
 
-        let output = tokio::process::Command::new(program)
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&args);
+
+        // Windows: 隐藏控制台窗口
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd
             .output()
             .await
             .map_err(|e| InstallationError::CommandFailed {

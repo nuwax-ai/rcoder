@@ -9,29 +9,16 @@ use std::path::PathBuf;
 pub const TAURI_APP_DATA_DIR: &str = "com.nuwax.agent-tauri-client";
 
 /// 在系统 PATH 中查找可执行文件
+///
+/// 使用 `which` crate 进行跨平台查找，无需启动子进程。
+/// 相比手动调用 `where`/`which` 命令：
+/// - 跨平台一致性
+/// - 无子进程开销
+/// - 不会弹出控制台窗口
 fn find_in_path(executable: &str) -> Option<String> {
-    let output = if cfg!(windows) {
-        std::process::Command::new("where")
-            .arg(executable)
-            .output()
-    } else {
-        std::process::Command::new("which")
-            .arg(executable)
-            .output()
-    };
-
-    match output {
-        Ok(o) if o.status.success() => {
-            let binding = String::from_utf8_lossy(&o.stdout);
-            binding
-                .lines()
-                .next()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        }
-        _ => None,
-    }
+    which::which(executable)
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 /// 在系统 PATH 中查找可执行文件并返回其父目录
