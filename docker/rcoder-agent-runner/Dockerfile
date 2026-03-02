@@ -59,6 +59,47 @@ RUN echo "📦 安装 opencode..." && \
     echo "✅ opencode 安装成功（已创建符号链接到 /usr/local/bin）"
 
 # ============================================================================
+# 🖥️ Nuwax Agent Electron 客户端安装
+# ============================================================================
+# 使用构建参数支持版本自定义
+ARG NUWAX_AGENT_VERSION=electron-v0.5.22
+
+RUN echo "📦 安装 Nuwax Agent Electron 客户端 (${NUWAX_AGENT_VERSION})..." && \
+    # 检测系统架构
+    ARCH=$(dpkg --print-architecture) && \
+    echo "系统架构: ${ARCH}" && \
+    # 根据架构选择对应的 deb 包
+    if [ "$ARCH" = "arm64" ]; then \
+        DEB_NAME="Nuwax.Agent-${NUWAX_AGENT_VERSION#electron-v}-arm64.deb"; \
+    else \
+        DEB_NAME="Nuwax.Agent-${NUWAX_AGENT_VERSION#electron-v}-amd64.deb"; \
+    fi && \
+    echo "下载: ${DEB_NAME}" && \
+    # 下载 deb 包
+    curl -fsSL "https://github.com/nuwax-ai/nuwax-agent-client/releases/download/${NUWAX_AGENT_VERSION}/${DEB_NAME}" \
+        -o /tmp/nuwax-agent.deb && \
+    # 安装 deb 包
+    apt-get update && \
+    apt-get install -y /tmp/nuwax-agent.deb && \
+    rm -f /tmp/nuwax-agent.deb && \
+    rm -rf /var/lib/apt/lists/* && \
+    # 验证安装
+    echo "验证 Nuwax Agent 安装..." && \
+    ls -la "/opt/Nuwax Agent/" && \
+    echo "✅ Nuwax Agent 安装成功"
+
+# ============================================================================
+# 🔗 Chrome 软连接（重定向到 Chromium）
+# 某些 Electron 应用（如 Nuwax Agent）会查找 /opt/google/chrome/chrome
+# ============================================================================
+RUN echo "🔗 创建 Chrome -> Chromium 软连接..." && \
+    mkdir -p /opt/google/chrome && \
+    ln -sf /usr/local/bin/chromium /opt/google/chrome/chrome && \
+    # 验证软连接
+    ls -la /opt/google/chrome/chrome && \
+    echo "✅ Chrome 软连接创建成功: /opt/google/chrome/chrome -> /usr/local/bin/chromium"
+
+# ============================================================================
 # 🔧 eBPF 诊断工具安装
 # 注意：这些工具会增加镜像大小 (~500MB)
 # 通过 make dev-restart 默认启用

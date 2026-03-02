@@ -99,7 +99,7 @@ docker_config:
         arm64_image: "rcoder-agent-runner:latest"
         amd64_image: "rcoder-agent-runner:latest"
         default_image: "rcoder-agent-runner:latest"
-        image_tag_prefix: "computer-agent-runner"
+        image_tag_prefix: "rcoder-computer-agent-runner"
         enabled: true
 
         environment:
@@ -117,6 +117,9 @@ docker_config:
           # 通过挂载的 /app/assets 目录使用宿主机壁纸
           # 使用方法：在宿主机 ./wallpaper 目录放置 wallpaper.jpeg
           # CUSTOM_WALLPAPER_PATH: "/app/assets/wallpaper.jpeg"
+          # 🖥️ Nuwax Agent Electron 客户端配置
+          # 启用后会在桌面环境启动后自动启动 Nuwax Agent 客户端
+          ENABLE_NUWAX_AGENT: "true"
 
         command:
           - "/usr/local/bin/agent_runner"

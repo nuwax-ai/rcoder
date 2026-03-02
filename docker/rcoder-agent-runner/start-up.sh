@@ -1589,6 +1589,85 @@ function start_ime_services() {
 
     log_success "IME passthrough services initialized"
 }
+
+# ============================================================================
+# 🖥️ Nuwax Agent Electron 客户端启动
+# 在桌面环境启动后，以无沙箱模式启动 Electron 客户端
+# ============================================================================
+function start_nuwax_agent() {
+    log "Starting Nuwax Agent Electron client..."
+
+    # 检查是否启用（可通过环境变量禁用）
+    if [ "${ENABLE_NUWAX_AGENT:-true}" = "false" ]; then
+        log_warn "  Nuwax Agent is disabled (ENABLE_NUWAX_AGENT=false)"
+        return 0
+    fi
+
+    # Nuwax Agent 可执行文件路径
+    local NUWAX_AGENT_BIN="/opt/Nuwax Agent/@nuwaxagent-electron-client"
+
+    # 检查可执行文件是否存在
+    if [ ! -f "$NUWAX_AGENT_BIN" ]; then
+        log_warn "  Nuwax Agent not found: $NUWAX_AGENT_BIN"
+        log_warn "  Nuwax Agent will not start"
+        return 1
+    fi
+
+    # 获取 D-Bus 地址
+    local DBUS_ADDR=""
+    if [ -f /tmp/dbus-session-env ]; then
+        source /tmp/dbus-session-env
+        DBUS_ADDR="$DBUS_SESSION_BUS_ADDRESS"
+    fi
+
+    # 创建日志目录
+    local NUWAX_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/nuwax-agent"
+    mkdir -p "$NUWAX_LOG_DIR"
+    chmod 755 "$NUWAX_LOG_DIR"
+    log_success "  Nuwax Agent log directory: $NUWAX_LOG_DIR"
+
+    # 等待桌面环境完全启动（等待 xfdesktop 进程）
+    log "  Waiting for desktop environment to be ready..."
+    if wait_for_process "xfdesktop" 30; then
+        log_success "  Desktop environment is ready"
+    else
+        log_warn "  Desktop environment not ready after 30s, starting Nuwax Agent anyway"
+    fi
+
+    # 额外等待 3 秒，确保桌面环境稳定
+    sleep 3
+
+    # 以无沙箱模式启动 Nuwax Agent（Electron 应用在容器中需要 --no-sandbox）
+    log "  Starting Nuwax Agent with --no-sandbox..."
+    env \
+        HOME=/home/user \
+        DISPLAY=:0 \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        GTK_IM_MODULE=fcitx \
+        QT_IM_MODULE=fcitx \
+        XMODIFIERS=@im=fcitx \
+        INPUT_METHOD=fcitx \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        LC_CTYPE=C.UTF-8 \
+        nohup "$NUWAX_AGENT_BIN" --no-sandbox \
+        > "$NUWAX_LOG_DIR/nuwax-agent.log" 2>&1 &
+
+    local NUWAX_PID=$!
+
+    # 等待进程启动（智能等待，最长 5 秒）
+    sleep 2
+    if kill -0 $NUWAX_PID 2>/dev/null; then
+        log_success "  Nuwax Agent started (PID: $NUWAX_PID)"
+        log_success "  Nuwax Agent 正在运行，可通过 VNC 远程桌面查看"
+    else
+        log_warn "  Nuwax Agent failed to start, check log: $NUWAX_LOG_DIR/nuwax-agent.log"
+        cat "$NUWAX_LOG_DIR/nuwax-agent.log" 2>/dev/null | tail -20 || true
+        return 1
+    fi
+
+    log_success "Nuwax Agent Electron client initialized"
+}
 # 设置VNC自动启动标志
 export VNC_AUTO_START=true
 
@@ -1666,9 +1745,15 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     ) &
     wallpaper_pid=$!
 
+    # 6. Nuwax Agent Electron 客户端（后台）- 需要桌面环境
+    (
+        start_nuwax_agent
+    ) &
+    nuwax_pid=$!
+
     # 等待所有并行服务启动完成
     log "Waiting for all services to start..."
-    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $wallpaper_pid 2>/dev/null || true
+    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $wallpaper_pid $nuwax_pid 2>/dev/null || true
     log_success "All X11-dependent services started!"
 
     # 🆕 启动 VNC 就绪标记轮询任务（后台）
