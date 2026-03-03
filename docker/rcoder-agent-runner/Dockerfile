@@ -100,6 +100,54 @@ RUN echo "🔗 创建 Chrome -> Chromium 软连接..." && \
     echo "✅ Chrome 软连接创建成功: /opt/google/chrome/chrome -> /usr/local/bin/chromium"
 
 # ============================================================================
+# 🖥️ Nuwax Agent 无沙箱启动配置
+# Electron 应用在 Docker 容器中必须以 --no-sandbox 模式启动
+# 通过创建包装脚本和修改 .desktop 文件，确保从桌面图标启动也是无沙箱模式
+# ============================================================================
+RUN echo "🖥️ 配置 Nuwax Agent 无沙箱启动模式..." && \
+    # 1. 创建包装脚本（自动添加 --no-sandbox 参数）
+    echo '#!/bin/bash' > /usr/local/bin/nuwax-agent && \
+    echo '# Nuwax Agent 启动脚本 - 自动添加 --no-sandbox 参数' >> /usr/local/bin/nuwax-agent && \
+    echo '# Docker 容器中 Electron 应用必须使用无沙箱模式' >> /usr/local/bin/nuwax-agent && \
+    echo 'exec "/opt/Nuwax Agent/@nuwaxagent-electron-client" --no-sandbox "$@"' >> /usr/local/bin/nuwax-agent && \
+    chmod +x /usr/local/bin/nuwax-agent && \
+    # 2. 修改系统 .desktop 文件，使用包装脚本启动
+    DESKTOP_FILE="/usr/share/applications/@nuwaxagent-electron-client.desktop" && \
+    if [ -f "$DESKTOP_FILE" ]; then \
+        sed -i 's|^Exec=.*|Exec=/usr/local/bin/nuwax-agent %U|' "$DESKTOP_FILE" && \
+        echo "✅ 已修改系统 .desktop 文件"; \
+    fi && \
+    # 3. 在用户骨架目录创建唯一的桌面快捷方式（使用新文件名避免冲突）
+    mkdir -p /etc/skel-user-desktop/Desktop && \
+    echo '[Desktop Entry]' > /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'Version=1.0' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'Name=Nuwax Agent' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'Comment=Nuwax Agent Client' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'Exec=/usr/local/bin/nuwax-agent %U' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'Icon=@nuwaxagent-electron-client' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'Terminal=false' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'Type=Application' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'Categories=Development;Utility;' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'StartupWMClass=Nuwax Agent' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo 'StartupNotify=true' >> /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    chmod 755 /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    chown 1000:1000 /etc/skel-user-desktop/Desktop/nuwax-agent.desktop && \
+    echo "✅ 已在骨架目录创建 Nuwax Agent 桌面快捷方式 (owner: user)" && \
+    echo "✅ Nuwax Agent 无沙箱启动配置完成"
+
+# ============================================================================
+# 🖥️ Thunar 配置 - 禁用 .desktop 文件启动确认
+# 避免 "Untrusted Application" 提示
+# ============================================================================
+RUN echo "🖥️ 配置 Thunar 禁用启动确认..." && \
+    mkdir -p /etc/skel-user-desktop/.config/Thunar && \
+    echo '[Configuration]' > /etc/skel-user-desktop/.config/Thunar/thunarrc && \
+    echo 'MiscExecutableLaunchConfirm=false' >> /etc/skel-user-desktop/.config/Thunar/thunarrc && \
+    chmod 644 /etc/skel-user-desktop/.config/Thunar/thunarrc && \
+    chown -R 1000:1000 /etc/skel-user-desktop/.config && \
+    echo "✅ Thunar 配置完成 - 已禁用启动确认 (owner: user)"
+
+# ============================================================================
 # 🔧 eBPF 诊断工具安装
 # 注意：这些工具会增加镜像大小 (~500MB)
 # 通过 make dev-restart 默认启用

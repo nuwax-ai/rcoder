@@ -616,6 +616,80 @@ EOF
     # ========== 🖼️ 自定义壁纸替换已提前执行 ==========
     # 壁纸替换逻辑已移到 xfce4-desktop.xml 加载之前执行（见本函数开头）
     # 这样可以确保 xfdesktop 启动时就能读取到正确的壁纸文件
+
+    # ========== 🖥️ Nuwax Agent 桌面快捷方式配置 ==========
+    # 创建可信任的桌面快捷方式，避免 "Untrusted Application" 提示
+    setup_nuwax_agent_desktop_shortcut
+}
+
+# ============================================================================
+# 🖥️ Nuwax Agent 桌面快捷方式配置
+# 创建可信任的桌面快捷方式，避免 XFCE 的 "Untrusted Application" 提示
+# ============================================================================
+function setup_nuwax_agent_desktop_shortcut() {
+    local NUWAX_AGENT_BIN="/opt/Nuwax Agent/@nuwaxagent-electron-client"
+    local NUWAX_WRAPPER="/usr/local/bin/nuwax-agent"
+    local USER_DESKTOP="/home/user/Desktop"
+    local DESKTOP_FILE="$USER_DESKTOP/nuwax-agent.desktop"
+
+    # 检查 Nuwax Agent 是否已安装
+    if [ ! -f "$NUWAX_AGENT_BIN" ]; then
+        log "  Nuwax Agent not installed, skipping desktop shortcut setup"
+        return 0
+    fi
+
+    log "Setting up Nuwax Agent desktop shortcut..."
+
+    # 确保桌面目录存在
+    mkdir -p "$USER_DESKTOP"
+
+    # 删除旧的桌面图标（避免重复）
+    rm -f "$USER_DESKTOP/@nuwaxagent-electron-client.desktop" 2>/dev/null || true
+
+    # 创建桌面快捷方式文件
+    cat > "$DESKTOP_FILE" << 'EOF'
+[Desktop Entry]
+Version=1.0
+Name=Nuwax Agent
+Comment=Nuwax Agent Client
+Exec=/usr/local/bin/nuwax-agent %U
+Icon=@nuwaxagent-electron-client
+Terminal=false
+Type=Application
+Categories=Development;Utility;
+StartupWMClass=Nuwax Agent
+StartupNotify=true
+EOF
+
+    # 设置权限：必须是可执行的
+    chmod 755 "$DESKTOP_FILE"
+
+    # 设置所有者为 user（重要：XFCE 检查文件所有者）
+    chown user:user "$DESKTOP_FILE" 2>/dev/null || true
+
+    # 配置 Thunar 禁用启动确认（需要在 X11 运行时执行）
+    if [ -n "$DISPLAY" ]; then
+        # 方法 1: 通过 xfconf 禁用 .desktop 文件启动确认
+        if command -v xfconf-query >/dev/null 2>&1; then
+            HOME=/home/user xfconf-query -c thunar -p /misc-executable-launch-confirm -n -t bool -s false 2>/dev/null || true
+            log "  Thunar xfconf configured: disabled launch confirm"
+        fi
+
+        # 方法 2: 确保 Thunar 配置文件存在
+        local THUNAR_CONFIG_DIR="/home/user/.config/Thunar"
+        mkdir -p "$THUNAR_CONFIG_DIR"
+        if [ ! -f "$THUNAR_CONFIG_DIR/thunarrc" ]; then
+            cat > "$THUNAR_CONFIG_DIR/thunarrc" << 'THUNAREOF'
+[Configuration]
+MiscExecutableLaunchConfirm=false
+THUNAREOF
+            chown user:user "$THUNAR_CONFIG_DIR/thunarrc" 2>/dev/null || true
+            log "  Thunar config file created"
+        fi
+    fi
+
+    log_success "  Nuwax Agent desktop shortcut created: $DESKTOP_FILE"
+    log_success "  Shortcut will auto-start with --no-sandbox mode"
 }
 
 function start_vnc_services() {
@@ -1603,12 +1677,23 @@ function start_nuwax_agent() {
         return 0
     fi
 
-    # Nuwax Agent 可执行文件路径
+    # Nuwax Agent 包装脚本路径（自动添加 --no-sandbox 参数）
+    local NUWAX_AGENT_WRAPPER="/usr/local/bin/nuwax-agent"
+    # 原始可执行文件路径（备用）
     local NUWAX_AGENT_BIN="/opt/Nuwax Agent/@nuwaxagent-electron-client"
 
-    # 检查可执行文件是否存在
-    if [ ! -f "$NUWAX_AGENT_BIN" ]; then
-        log_warn "  Nuwax Agent not found: $NUWAX_AGENT_BIN"
+    # 优先使用包装脚本，如果不存在则使用原始可执行文件
+    local NUWAX_EXEC=""
+    local NUWAX_ARGS=""
+    if [ -f "$NUWAX_AGENT_WRAPPER" ] && [ -x "$NUWAX_AGENT_WRAPPER" ]; then
+        NUWAX_EXEC="$NUWAX_AGENT_WRAPPER"
+        log "  使用包装脚本: $NUWAX_EXEC (自动添加 --no-sandbox)"
+    elif [ -f "$NUWAX_AGENT_BIN" ]; then
+        NUWAX_EXEC="$NUWAX_AGENT_BIN"
+        NUWAX_ARGS="--no-sandbox"
+        log_warn "  包装脚本不存在，使用原始可执行文件 + --no-sandbox 参数"
+    else
+        log_warn "  Nuwax Agent not found: $NUWAX_AGENT_WRAPPER or $NUWAX_AGENT_BIN"
         log_warn "  Nuwax Agent will not start"
         return 1
     fi
@@ -1637,8 +1722,8 @@ function start_nuwax_agent() {
     # 额外等待 3 秒，确保桌面环境稳定
     sleep 3
 
-    # 以无沙箱模式启动 Nuwax Agent（Electron 应用在容器中需要 --no-sandbox）
-    log "  Starting Nuwax Agent with --no-sandbox..."
+    # 启动 Nuwax Agent（包装脚本已包含 --no-sandbox 参数）
+    log "  Starting Nuwax Agent..."
     env \
         HOME=/home/user \
         DISPLAY=:0 \
@@ -1650,7 +1735,7 @@ function start_nuwax_agent() {
         LANG=C.UTF-8 \
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
-        nohup "$NUWAX_AGENT_BIN" --no-sandbox \
+        nohup "$NUWAX_EXEC" $NUWAX_ARGS \
         > "$NUWAX_LOG_DIR/nuwax-agent.log" 2>&1 &
 
     local NUWAX_PID=$!
@@ -1660,6 +1745,7 @@ function start_nuwax_agent() {
     if kill -0 $NUWAX_PID 2>/dev/null; then
         log_success "  Nuwax Agent started (PID: $NUWAX_PID)"
         log_success "  Nuwax Agent 正在运行，可通过 VNC 远程桌面查看"
+        log_success "  桌面图标启动也会自动使用 --no-sandbox 模式"
     else
         log_warn "  Nuwax Agent failed to start, check log: $NUWAX_LOG_DIR/nuwax-agent.log"
         cat "$NUWAX_LOG_DIR/nuwax-agent.log" 2>/dev/null | tail -20 || true
@@ -1745,7 +1831,13 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     ) &
     wallpaper_pid=$!
 
-    # 6. Nuwax Agent Electron 客户端（后台）- 需要桌面环境
+    # 6. 设置 Nuwax Agent 桌面快捷方式（必须先于启动，确保图标可信任）
+    (
+        setup_nuwax_agent_desktop_shortcut
+    ) &
+    shortcut_pid=$!
+
+    # 7. Nuwax Agent Electron 客户端（后台）- 需要桌面环境
     (
         start_nuwax_agent
     ) &
@@ -1753,7 +1845,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 
     # 等待所有并行服务启动完成
     log "Waiting for all services to start..."
-    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $wallpaper_pid $nuwax_pid 2>/dev/null || true
+    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $wallpaper_pid $shortcut_pid $nuwax_pid 2>/dev/null || true
     log_success "All X11-dependent services started!"
 
     # 🆕 启动 VNC 就绪标记轮询任务（后台）

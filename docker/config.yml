@@ -14,7 +14,7 @@ port: 8087
 cleanup_config:
   # 闲置超时时间（秒），超过此时间未活动的容器将被清理
   # 默认值: 600 (10分钟)
-  idle_timeout_seconds: 300
+  idle_timeout_seconds: 3000
   # 清理任务执行间隔（秒）
   # 默认值: 300 (5分钟)
   cleanup_interval_seconds: 3
