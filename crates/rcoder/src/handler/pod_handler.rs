@@ -240,6 +240,11 @@ pub struct EnsurePodRequest {
     /// 可选的资源限制配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<PodResourceLimits>,
+
+    /// 是否启动 Nuwax Agent 客户端（默认 false）
+    #[serde(default)]
+    #[schema(example = false)]
+    pub enable_nuwax_agent: bool,
 }
 
 /// Pod 资源限制配置
@@ -355,6 +360,11 @@ pub struct RestartPodRequest {
     /// 可选的资源限制配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<PodResourceLimits>,
+
+    /// 是否启动 Nuwax Agent 客户端（默认 false）
+    #[serde(default)]
+    #[schema(example = false)]
+    pub enable_nuwax_agent: bool,
 }
 
 /// 重启容器响应
@@ -778,6 +788,7 @@ pub async fn pod_ensure(
             match ComputerContainerManager::get_or_create_container_for_user(
                 &request.user_id,
                 resource_limits.clone(),
+                request.enable_nuwax_agent,
             )
             .await
             {
@@ -856,6 +867,7 @@ pub async fn pod_ensure(
                 match ComputerContainerManager::get_or_create_container_for_user(
                     &request.user_id,
                     resource_limits,
+                    request.enable_nuwax_agent,
                 )
                 .await
                 {
@@ -1281,6 +1293,7 @@ pub async fn pod_restart(
     let container_info = ComputerContainerManager::force_create_container_for_user(
         &request.user_id,
         resource_limits,
+        request.enable_nuwax_agent,
     )
     .await?;
 

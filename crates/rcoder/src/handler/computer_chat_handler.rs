@@ -147,6 +147,7 @@ pub async fn handle_computer_chat(
             .agent_config
             .as_ref()
             .and_then(|c| c.resource_limits.clone()),
+        request.enable_nuwax_agent,
     )
     .await
     {

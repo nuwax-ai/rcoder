@@ -119,6 +119,7 @@ async fn create_container_for_request(
             "",               // 空字符串，表示不使用硬编码挂载，完全依赖 mounts 配置
             service_type.clone(),
             request_resource_limits,
+            None,             // RCoder 模式不需要额外环境变量覆盖
         )
         .await
         .map_err(|e| {

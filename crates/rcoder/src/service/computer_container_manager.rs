@@ -35,6 +35,7 @@ impl ComputerContainerManager {
     /// # 参数
     /// - `user_id`: 用户唯一标识符
     /// - `resource_limits`: 可选的资源限额配置
+    /// - `enable_nuwax_agent`: 是否启动 Nuwax Agent 客户端
     ///
     /// # 返回
     /// 容器基本信息，包含容器 ID、IP 地址等
@@ -44,16 +45,18 @@ impl ComputerContainerManager {
     /// let container_info = ComputerContainerManager::get_or_create_container_for_user(
     ///     "user_123",
     ///     None,
+    ///     false,
     /// ).await?;
     /// println!("Container IP: {}", container_info.container_ip);
     /// ```
     pub async fn get_or_create_container_for_user(
         user_id: &str,
         resource_limits: Option<ServiceResourceLimits>,
+        enable_nuwax_agent: bool,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
-            "🔍 [COMPUTER_CONTAINER] 获取/创建用户容器: user_id={}",
-            user_id
+            "🔍 [COMPUTER_CONTAINER] 获取/创建用户容器: user_id={}, enable_nuwax_agent={}",
+            user_id, enable_nuwax_agent
         );
 
         let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -65,6 +68,9 @@ impl ComputerContainerManager {
 
         // 1. 尝试获取现有容器
         // 使用 user_id 作为容器标识进行查询
+        //
+        // ⚠️ 注意：如果容器已存在且运行中，会直接返回，不会应用新的 enable_nuwax_agent 设置。
+        // 容器的 Nuwax Agent 配置在创建时确定。如果需要不同的配置，应使用 restart 接口重建容器。
         if let Ok(Some(info)) = docker_manager.get_user_container_info(user_id).await {
             // ✅ 关键修复: 验证容器是否真的在运行
             match docker_manager
@@ -110,7 +116,7 @@ impl ComputerContainerManager {
             "🏗️ [COMPUTER_CONTAINER] 创建新用户容器: user_id={}",
             user_id
         );
-        Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
+        Self::create_container_for_user(user_id, &docker_manager, resource_limits, enable_nuwax_agent).await
     }
 
     /// 强制为用户创建新容器（跳过检查）
@@ -120,10 +126,11 @@ impl ComputerContainerManager {
     pub async fn force_create_container_for_user(
         user_id: &str,
         resource_limits: Option<ServiceResourceLimits>,
+        enable_nuwax_agent: bool,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
-            "🏗️ [COMPUTER_CONTAINER] 强制创建新用户容器: user_id={}",
-            user_id
+            "🏗️ [COMPUTER_CONTAINER] 强制创建新用户容器: user_id={}, enable_nuwax_agent={}",
+            user_id, enable_nuwax_agent
         );
 
         let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -133,7 +140,7 @@ impl ComputerContainerManager {
                 AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
             })?;
 
-        Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
+        Self::create_container_for_user(user_id, &docker_manager, resource_limits, enable_nuwax_agent).await
     }
 
     /// 为用户创建容器
@@ -143,6 +150,7 @@ impl ComputerContainerManager {
         user_id: &str,
         docker_manager: &std::sync::Arc<docker_manager::DockerManager>,
         resource_limits: Option<ServiceResourceLimits>,
+        enable_nuwax_agent: bool,
     ) -> Result<ContainerBasicInfo, AppError> {
         // 1. 准备用户级工作目录（仍需在 rcoder 容器内创建）
         // 在容器内创建目录，绑定挂载会自动同步到宿主机
@@ -153,7 +161,16 @@ impl ComputerContainerManager {
             user_id
         );
 
-        // 2. 调用 DockerManager 启动容器
+        // 2. 构建额外环境变量（覆盖 config.yml 中的默认值）
+        let extra_env = if enable_nuwax_agent {
+            let mut env = std::collections::HashMap::new();
+            env.insert("ENABLE_NUWAX_AGENT".to_string(), "true".to_string());
+            Some(env)
+        } else {
+            None // 默认不启动，使用 config.yml 中的默认值
+        };
+
+        // 3. 调用 DockerManager 启动容器
         // 注意：不再传递 host_path，挂载由 config.yml 的 mounts 配置管理
         let container_info = docker_manager
             .start_agent_container(
@@ -162,6 +179,7 @@ impl ComputerContainerManager {
                 "",            // ✅ 空字符串，表示不使用硬编码挂载，完全依赖 mounts 配置
                 ServiceType::ComputerAgentRunner,
                 resource_limits,
+                extra_env, // ✅ 传递额外环境变量
             )
             .await
             .map_err(|e| {

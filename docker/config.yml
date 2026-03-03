@@ -119,7 +119,8 @@ docker_config:
           # CUSTOM_WALLPAPER_PATH: "/app/assets/wallpaper.jpeg"
           # 🖥️ Nuwax Agent Electron 客户端配置
           # 启用后会在桌面环境启动后自动启动 Nuwax Agent 客户端
-          ENABLE_NUWAX_AGENT: "true"
+          # 默认不启动，通过 HTTP 请求参数 enable_nuwax_agent 动态控制
+          ENABLE_NUWAX_AGENT: "false"
 
         command:
           - "/usr/local/bin/agent_runner"

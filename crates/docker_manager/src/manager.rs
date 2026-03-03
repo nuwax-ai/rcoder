@@ -1186,10 +1186,11 @@ impl DockerManager {
         host_workspace_path: &str,
         service_type: shared_types::ServiceType,
         request_resource_limits: Option<shared_types::ServiceResourceLimits>,
+        extra_env: Option<std::collections::HashMap<String, String>>, // 额外环境变量（覆盖默认值）
     ) -> DockerResult<ContainerBasicInfo> {
         info!(
-            "启动 Agent 容器: project_id={:?}, user_id={:?}, type={:?}, host_path={}",
-            project_id, user_id, service_type, host_workspace_path
+            "启动 Agent 容器: project_id={:?}, user_id={:?}, type={:?}, host_path={}, extra_env={:?}",
+            project_id, user_id, service_type, host_workspace_path, extra_env
         );
 
         // 1. 在宿主机上预创建工作目录
@@ -1306,6 +1307,14 @@ impl DockerManager {
                 processed_value = processed_value.replace("{user_id}", uid);
             }
             builder = builder.env(key, &processed_value);
+        }
+
+        // 应用额外环境变量（覆盖 config.yml 中的默认值）
+        if let Some(extra) = extra_env {
+            for (key, value) in extra {
+                debug!("🔧 [DOCKER_MGR] 覆盖环境变量: {}={}", key, value);
+                builder = builder.env(&key, &value);
+            }
         }
 
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配

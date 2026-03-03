@@ -59,6 +59,11 @@ pub struct ComputerChatRequest {
     /// Agent 运行时配置
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_config: Option<ChatAgentConfig>,
+
+    /// 是否启动 Nuwax Agent 客户端（默认 false）
+    #[serde(default)]
+    #[schema(example = false)]
+    pub enable_nuwax_agent: bool,
 }
 
 /// Computer Agent 状态查询请求
