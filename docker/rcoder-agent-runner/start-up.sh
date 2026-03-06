@@ -161,6 +161,35 @@ function wait_for_port() {
     return 0
 }
 
+# 等待 noVNC WebSocket 服务真正就绪
+# 不仅检测端口，还检测 HTTP 服务是否可响应
+# 用法: wait_for_novnc_ready [timeout_seconds]
+function wait_for_novnc_ready() {
+    local timeout="${1:-10}"
+    local interval_ms=500
+    local max_iterations=$((timeout * 1000 / interval_ms))
+    local i=0
+
+    log "Waiting for noVNC WebSocket service to be fully ready..."
+
+    while true; do
+        # 检测 HTTP 端点是否可响应（比单纯端口检测更可靠）
+        if curl -s -o /dev/null -w "%{http_code}" "http://localhost:6080/" 2>/dev/null | grep -qE "200|302"; then
+            # 额外等待一小段时间，确保 WebSocket 处理器完全就绪
+            sleep 0.5
+            log_success "noVNC WebSocket service is ready (HTTP check passed)"
+            return 0
+        fi
+
+        sleep 0.5
+        i=$((i + 1))
+        if [ $i -ge $max_iterations ]; then
+            log_warn "noVNC WebSocket service not ready within ${timeout}s timeout"
+            return 1
+        fi
+    done
+}
+
 # 等待文件存在，最长等待 $2 秒（默认 5 秒）
 # 用法: wait_for_file "filepath" [timeout_seconds]
 function wait_for_file() {
@@ -650,9 +679,15 @@ function start_vnc_services() {
 	fi
 	cd -
 
-	# 等待 noVNC 端口就绪（智能等待，最长 5 秒）
-	if wait_for_port localhost 6080 5; then
-		log_success "noVNC port 6080 is ready"
+	# 等待 noVNC 端口就绪（智能等待，最长 20 秒）
+	if wait_for_port localhost 6080 20; then
+		log_success "noVNC port 6080 is listening"
+		# 额外等待 WebSocket 服务完全就绪（最长 10 秒）
+		if wait_for_novnc_ready 10; then
+			log_success "noVNC WebSocket service is fully ready"
+		else
+			log_warn "noVNC WebSocket service may not be fully ready"
+		fi
 	else
 		log_warn "noVNC port 6080 not ready within timeout"
 	fi
