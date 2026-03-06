@@ -162,29 +162,42 @@ function wait_for_port() {
 }
 
 # 等待 noVNC WebSocket 服务真正就绪
-# 不仅检测端口，还检测 HTTP 服务是否可响应
+# 通过 curl 发送 WebSocket 升级请求，验证 /websockify 路径可用
+# 比 HTTP 检查更可靠（HTTP 200 ≠ WebSocket 代理可用）
+# 比 Python websockets 更轻量（无需启动 Python 解释器）
 # 用法: wait_for_novnc_ready [timeout_seconds]
 function wait_for_novnc_ready() {
     local timeout="${1:-10}"
-    local interval_ms=500
-    local max_iterations=$((timeout * 1000 / interval_ms))
     local i=0
 
     log "Waiting for noVNC WebSocket service to be fully ready..."
 
     while true; do
-        # 检测 HTTP 端点是否可响应（比单纯端口检测更可靠）
-        if curl -s -o /dev/null -w "%{http_code}" "http://localhost:6080/" 2>/dev/null | grep -qE "200|302"; then
-            # 额外等待一小段时间，确保 WebSocket 处理器完全就绪
-            sleep 0.5
-            log_success "noVNC WebSocket service is ready (HTTP check passed)"
+        # 发送 WebSocket 升级请求到 /websockify 路径
+        # 返回 101 Switching Protocols 说明 WebSocket 代理真正可用
+        #
+        # 注意：不要加 || echo "000"！
+        # curl 收到 101 后连接升级为 WebSocket，--max-time 超时导致退出码非零
+        # 如果加了 ||，echo 的输出会拼在 curl -w 输出后面，变成 "101000" 而非 "101"
+        # curl 本身在连接失败时 -w "%{http_code}" 已经会输出 "000"，不需要 fallback
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 2 \
+            -H "Upgrade: websocket" \
+            -H "Connection: Upgrade" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Version: 13" \
+            "http://localhost:6080/websockify" 2>/dev/null)
+
+        if [ "$http_code" = "101" ]; then
+            log_success "noVNC WebSocket service is ready (WebSocket upgrade 101)"
             return 0
         fi
 
         sleep 0.5
         i=$((i + 1))
-        if [ $i -ge $max_iterations ]; then
-            log_warn "noVNC WebSocket service not ready within ${timeout}s timeout"
+        if [ $i -ge $((timeout * 2)) ]; then
+            log_warn "noVNC WebSocket service not ready within ${timeout}s timeout (last HTTP code: $http_code)"
             return 1
         fi
     done
@@ -235,8 +248,8 @@ initialize_timezone
 # 🧹 清理旧的 VNC 就绪标记文件（容器重启时可能残留）
 # 确保 VNC 状态查询 API 返回准确的状态
 # ============================================================================
-rm -f /tmp/vnc_ready
-log "Cleaned up stale VNC ready marker (if any)"
+rm -f /tmp/vnc_ready /tmp/novnc_port_ready /tmp/wallpaper_ready
+log "Cleaned up stale VNC ready markers (if any)"
 
 # ============================================================================
 # 🎯 注意：所有服务均以 root 用户运行
@@ -650,82 +663,60 @@ EOF
 function start_vnc_services() {
     log "Starting VNC services (as root)..."
 
-	# 等待X11服务完全启动
-	counter=0
-	while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
-		sleep 0.5
-		let counter++
-		if ((counter > 30)); then
-			log "X11 not ready, skipping VNC startup"
-			return 1
-		fi
-	done
+	# 注意：调用方（主启动子 shell）已通过 xdpyinfo 确认 X11 就绪
+	# 此处不再重复等待 X11，直接检查 Xvnc 端口
 
-	log "X11 is ready, checking VNC services..."
-
-	# 等待 Xvnc 端口 5900 就绪（智能等待，最长 5 秒）
-	# Xvnc 在 start_display_and_desktop 中启动，需要时间绑定端口
+	# 1. 等待 Xvnc 端口 5900 就绪（Xvnc 在 start_display_and_desktop 中启动）
+	#    如果 5900 不可用，noVNC 代理必然连接失败，直接 fail fast
 	if wait_for_port localhost 5900 5; then
 		log_success "Xvnc port 5900 is ready"
 	else
-		log_warn "Xvnc port 5900 not ready within timeout"
-	fi
-
-	# 只启动noVNC代理 (后台运行，以 root 身份)
-	# noVNC 需要 Xvnc 已经监听 5900 端口
-	cd /opt/noVNC/utils
-	if ! pgrep -f "novnc_proxy" >/dev/null 2>&1; then
-		nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
-	fi
-	cd -
-
-	# 等待 noVNC 端口就绪（智能等待，最长 20 秒）
-	if wait_for_port localhost 6080 20; then
-		log_success "noVNC port 6080 is listening"
-		# 额外等待 WebSocket 服务完全就绪（最长 10 秒）
-		if wait_for_novnc_ready 10; then
-			log_success "noVNC WebSocket service is fully ready"
-		else
-			log_warn "noVNC WebSocket service may not be fully ready"
-		fi
-	else
-		log_warn "noVNC port 6080 not ready within timeout"
-	fi
-
-	# 检查VNC服务状态
-	vnc_running=false
-	novnc_running=false
-
-	# 检查Xvnc进程
-	if pgrep -f "Xvnc :0" >/dev/null 2>&1; then
-		vnc_running=true
-		log_success "Xvnc server is running on port 5900"
-	else
-		echo "✗ Xvnc server not running"
-	fi
-
-	# 检查noVNC端口
-	if netstat -tuln 2>/dev/null | grep -q ":6080 "; then
-		novnc_running=true
-		log_success "noVNC proxy started on port 6080"
-		echo "  VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
-	else
-		echo "✗ noVNC proxy failed to start"
-		echo "Error log:"
-		cat /tmp/novnc.log 2>/dev/null || echo 'No error log found'
-	fi
-
-	if [ "$vnc_running" = true ] && [ "$novnc_running" = true ]; then
-		log_success "VNC services started successfully!"
-		# 🆕 写入 noVNC 端口就绪标记（不是最终的 VNC 就绪标记）
-		# 最终的 /tmp/vnc_ready 由 wait_and_write_vnc_ready_marker() 在壁纸也就绪后写入
-		echo "$(date +%s)" > /tmp/novnc_port_ready
-		log_success "noVNC port ready marker written to /tmp/novnc_port_ready"
-		return 0
-	else
-		echo "✗ VNC services failed to start properly"
+		log_error "Xvnc port 5900 not ready within timeout, cannot start noVNC"
 		return 1
 	fi
+
+	# 2. 启动 noVNC 代理（使用绝对路径，避免 cd 污染日志输出）
+	if ! pgrep -f "novnc_proxy" >/dev/null 2>&1; then
+		nohup /opt/noVNC/utils/novnc_proxy \
+			--vnc localhost:5900 \
+			--listen 6080 \
+			--web /opt/noVNC \
+			> /tmp/novnc.log 2>&1 &
+	fi
+
+	# 3. 等待 noVNC 端口就绪（最长 20 秒）
+	if ! wait_for_port localhost 6080 20; then
+		log_error "noVNC port 6080 not ready within timeout"
+		log_error "noVNC error log:"
+		tail -20 /tmp/novnc.log 2>/dev/null || echo 'No error log found'
+		return 1
+	fi
+	log_success "noVNC port 6080 is listening"
+
+	# 4. 验证 WebSocket 代理真正可用（最长 10 秒）
+	#    这是写入 novnc_port_ready 标记的硬性前置条件
+	#    如果 WebSocket 升级 (101) 不通过，说明 /websockify 路径不可用
+	#    此时绝不能写入标记，否则前端会认为 novnc_ready=true 但实际连不上
+	if ! wait_for_novnc_ready 10; then
+		log_error "noVNC WebSocket service not ready, will NOT write ready marker"
+		log_error "noVNC error log:"
+		tail -20 /tmp/novnc.log 2>/dev/null || echo 'No error log found'
+		return 1
+	fi
+	log_success "noVNC WebSocket service is fully ready"
+
+	# 5. 所有检查通过，写入 noVNC 端口就绪标记
+	# 此标记仅在以下条件全部满足时写入：
+	#   - Xvnc 端口 5900 就绪 (VNC 服务器可用)
+	#   - noVNC 端口 6080 就绪 (HTTP 服务可用)
+	#   - WebSocket /websockify 升级返回 101 (浏览器可以真正连接)
+	# 最终的 /tmp/vnc_ready 由 wait_and_write_vnc_ready_marker() 在壁纸+桌面也就绪后写入
+	log_success "Xvnc server is running on port 5900"
+	log_success "noVNC proxy started on port 6080"
+	echo "  VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
+	echo "$(date +%s)" > /tmp/novnc_port_ready
+	log_success "noVNC port ready marker written to /tmp/novnc_port_ready"
+	return 0
 }
 
 function start_display_and_desktop() {
@@ -843,28 +834,29 @@ function start_display_and_desktop() {
 		log_success "D-Bus socket permissions updated for root access"
 	fi
 
-	# 启动 D-Bus 系统总线
-    log "Starting D-Bus system bus..."
-	mkdir -p /var/run/dbus
-	dbus-daemon --system --fork
+	# ========== 优化：D-Bus system bus + PolicyKit 后台启动 ==========
+	# 这两个服务不是 VNC/XFCE 的前置依赖，串行等待会浪费 ~10 秒
+	# 改为后台启动，不阻塞 Xvnc → fcitx5 → xfdesktop 的关键路径
+	(
+		log "Starting D-Bus system bus..."
+		mkdir -p /var/run/dbus
+		dbus-daemon --system --fork
 
-	# 等待 D-Bus 系统总线 socket 就绪（智能等待，最长 5 秒）
-	if wait_for_file /var/run/dbus/system_bus_socket 5; then
-		log_success "D-Bus system bus socket ready"
-	else
-		log_warn "D-Bus system bus socket not ready"
-	fi
+		if wait_for_file /var/run/dbus/system_bus_socket 5; then
+			log_success "D-Bus system bus socket ready"
+		else
+			log_warn "D-Bus system bus socket not ready"
+		fi
 
-	# 启动 PolicyKit 守护进程（配置为不需要认证）
-    log "Starting PolicyKit daemon..."
-	/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
+		log "Starting PolicyKit daemon..."
+		/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
 
-	# 等待 PolicyKit 进程启动（智能等待，最长 5 秒）
-	if wait_for_process "polkitd" 5; then
-		log_success "PolicyKit daemon started"
-	else
-		log_warn "PolicyKit daemon not started"
-	fi
+		if wait_for_process "polkitd" 5; then
+			log_success "PolicyKit daemon started"
+		else
+			log_warn "PolicyKit daemon not started"
+		fi
+	) &
 
     # 等待Xvnc启动（此时应该已经差不多就绪了）
     log "Waiting for X11 to be ready..."
@@ -1145,23 +1137,127 @@ function apply_xfce_wallpaper() {
 }
 
 function check_vnc_health() {
-    # 检查VNC服务健康状态 (as root)
+    # 检查 VNC 服务健康状态 (as root)
+    # 返回值：0=健康, 1=noVNC 异常(Xvnc 正常), 2=Xvnc 崩溃(需要重建整个显示栈)
     if [ "$VNC_AUTO_START" = "true" ]; then
-        # 检查Xvnc进程
+        # 检查 Xvnc 进程（根基：X11 server + VNC server）
         if ! pgrep -f "Xvnc" >/dev/null 2>&1; then
-            log_warn " Xvnc process not running, attempting restart..."
-            return 1
+            log_warn "Xvnc process not running (X11 display lost)"
+            return 2
         fi
 
-        # 检查noVNC端口
+        # 检查 noVNC 代理端口
         if ! netstat -tuln 2>/dev/null | grep -q ":6080 "; then
-            log_warn " noVNC proxy not listening on port 6080, attempting restart..."
+            log_warn "noVNC proxy not listening on port 6080"
             return 1
         fi
 
-        log_success "VNC services are healthy"
         return 0
     fi
+    return 0
+}
+
+# 重建整个显示栈：Xvnc + D-Bus session + fcitx5 + xfdesktop + xfce4-session + noVNC
+# 当 Xvnc 崩溃时调用，因为 Xvnc 死亡会导致所有 X11 客户端进程一起挂掉
+function restart_full_display_stack() {
+    log_error "Xvnc crashed, rebuilding full display stack..."
+
+    # 1. 清除所有就绪标记
+    rm -f /tmp/vnc_ready /tmp/novnc_port_ready /tmp/wallpaper_ready
+
+    # 2. 清理残留进程（Xvnc 死后这些都已断连，但可能变僵尸）
+    pkill -f "Xvnc :0" 2>/dev/null || true
+    pkill -f "xfce4-session" 2>/dev/null || true
+    pkill -f "xfdesktop" 2>/dev/null || true
+    pkill -f "fcitx5" 2>/dev/null || true
+    pkill -f "novnc_proxy" 2>/dev/null || true
+    pkill -f "xfce4-panel" 2>/dev/null || true
+    pkill -f "xfwm4" 2>/dev/null || true
+    pkill -f "xfsettingsd" 2>/dev/null || true
+    sleep 2
+
+    # 3. 清理 X11 锁文件
+    rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+
+    # 4. 重启 Xvnc
+    log "Restarting Xvnc :0 ..."
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache \
+        Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 \
+        >/tmp/xvnc.log 2>&1 &
+
+    # 5. 等待 X11 display 就绪
+    local counter=0
+    while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
+        sleep 0.2
+        counter=$((counter + 1))
+        if [ $counter -ge 50 ]; then
+            log_error "Xvnc restart failed: X11 display not ready after 10s"
+            return 1
+        fi
+    done
+    log_success "Xvnc restarted, X11 display :0 ready"
+
+    # 6. 设置背景色（避免纯黑）
+    DISPLAY=:0 xsetroot -solid "#1e1e1e" 2>/dev/null || true
+
+    # 7. 获取 D-Bus session 地址
+    local DBUS_ADDR=""
+    if [ -f /tmp/dbus-session-env ]; then
+        source /tmp/dbus-session-env
+        DBUS_ADDR="$DBUS_SESSION_BUS_ADDRESS"
+    fi
+
+    # 8. 重启 fcitx5 输入法
+    env HOME=/home/user DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        LANG=C.UTF-8 LC_ALL=C.UTF-8 LC_CTYPE=C.UTF-8 \
+        GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx INPUT_METHOD=fcitx \
+        fcitx5 -d --replace >/tmp/fcitx5-startup.log 2>&1 &
+
+    # 9. 重启 xfdesktop（壁纸渲染）
+    env DISPLAY=:0 HOME=/home/user XDG_CURRENT_DESKTOP=XFCE \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        xfdesktop &
+
+    # 10. 重启 xfce4-session（桌面会话管理器）
+    env DISPLAY=:0 HOME=/home/user XDG_CURRENT_DESKTOP=XFCE XDG_SESSION_DESKTOP=xfce \
+        XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        LANG=C.UTF-8 LC_ALL=C.UTF-8 LC_CTYPE=C.UTF-8 \
+        GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx INPUT_METHOD=fcitx \
+        xfce4-session &
+
+    # 11. 等待 xfdesktop 启动
+    if wait_for_process "xfdesktop" 10; then
+        log_success "xfdesktop restarted"
+    else
+        log_warn "xfdesktop not detected after restart"
+    fi
+
+    # 12. 重启 noVNC 代理
+    nohup /opt/noVNC/utils/novnc_proxy \
+        --vnc localhost:5900 --listen 6080 --web /opt/noVNC \
+        > /tmp/novnc.log 2>&1 &
+
+    # 13. 验证 noVNC 端口 + WebSocket
+    if wait_for_port localhost 6080 20 && wait_for_novnc_ready 10; then
+        echo "$(date +%s)" > /tmp/novnc_port_ready
+        log_success "noVNC proxy restarted and WebSocket verified"
+    else
+        log_error "noVNC restart failed after Xvnc recovery"
+        return 1
+    fi
+
+    # 14. 重新应用壁纸（后台，不阻塞）
+    (
+        apply_xfce_wallpaper
+    ) &
+
+    # 15. 重启 VNC 就绪标记轮询（后台）
+    # novnc_port_ready 已写入，等 wallpaper_ready + xfdesktop 进程就绪后写 vnc_ready
+    (
+        wait_and_write_vnc_ready_marker
+    ) &
+
+    log_success "Full display stack rebuilt successfully"
     return 0
 }
 
@@ -1348,6 +1444,7 @@ function wait_and_write_vnc_ready_marker() {
     while true; do
         local novnc_ready=false
         local wallpaper_ready=false
+        local desktop_ready=false
 
         # 检查 noVNC 端口就绪标记
         if [ -f /tmp/novnc_port_ready ]; then
@@ -1359,10 +1456,16 @@ function wait_and_write_vnc_ready_marker() {
             wallpaper_ready=true
         fi
 
-        # 两者都就绪时，写入最终的 VNC 就绪标记
-        if [ "$novnc_ready" = true ] && [ "$wallpaper_ready" = true ]; then
+        # 检查 xfdesktop 桌面进程是否在运行
+        # 确保桌面环境已加载，避免用户连上看到灰屏
+        if pgrep -f "xfdesktop" >/dev/null 2>&1; then
+            desktop_ready=true
+        fi
+
+        # 三者都就绪时，写入最终的 VNC 就绪标记
+        if [ "$novnc_ready" = true ] && [ "$wallpaper_ready" = true ] && [ "$desktop_ready" = true ]; then
             echo "$(date +%s)" > /tmp/vnc_ready
-            log_success "VNC ready marker written to /tmp/vnc_ready (noVNC + wallpaper both ready, took ${elapsed}s)"
+            log_success "VNC ready marker written to /tmp/vnc_ready (noVNC + wallpaper + desktop all ready, took ${elapsed}s)"
             log_success "  noVNC port ready at: $(cat /tmp/novnc_port_ready)"
             log_success "  Wallpaper ready at: $(cat /tmp/wallpaper_ready)"
             return 0
@@ -1370,7 +1473,7 @@ function wait_and_write_vnc_ready_marker() {
 
         # 日志输出当前状态（每 30 秒输出一次，减少日志量）
         if ((elapsed % 30 == 0)) && ((elapsed > 0)); then
-            log "Waiting for VNC ready... noVNC=$novnc_ready, wallpaper=$wallpaper_ready (${elapsed}s elapsed)"
+            log "Waiting for VNC ready... noVNC=$novnc_ready, wallpaper=$wallpaper_ready, desktop=$desktop_ready (${elapsed}s elapsed)"
         fi
 
         sleep $interval
@@ -1669,10 +1772,13 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 
     # 1. VNC 服务（后台）
     (
-        start_vnc_services
-        log_success "VNC services started successfully!"
-        log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
-        log_success "Direct VNC port: 5900"
+        if start_vnc_services; then
+            log_success "VNC services started successfully!"
+            log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
+            log_success "Direct VNC port: 5900"
+        else
+            log_error "VNC services failed to start, /tmp/novnc_port_ready will NOT be written"
+        fi
     ) &
     vnc_pid=$!
 
@@ -1719,14 +1825,45 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
         sleep 30
 
         # 检查 VNC 服务健康状态
-        if ! check_vnc_health; then
-            echo "VNC服务异常，正在重启..."
-            # 只重启 noVNC（Xvnc 由 start_display_and_desktop 管理）
+        # 返回值: 0=健康, 1=noVNC 异常, 2=Xvnc 崩溃
+        # 注意：此处不能用 local，因为当前在子 shell 中而非函数内
+        check_vnc_health
+        vnc_status=$?
+
+        if [ $vnc_status -eq 2 ]; then
+            # Xvnc 崩溃：整个显示栈需要重建
+            # Xvnc 是 X11 server + VNC server，它死了 = display :0 消失
+            # 所有连接到 :0 的进程（xfdesktop, xfce4-session, fcitx5 等）全部跟着死
+            # 只重启 noVNC 没用，因为 noVNC 连不上已死的 5900 端口
+            restart_full_display_stack || log_error "Full display stack restart failed"
+
+        elif [ $vnc_status -eq 1 ]; then
+            # 仅 noVNC 代理异常，Xvnc 仍在运行
+            log_warn "noVNC proxy is down, restarting..."
+            rm -f /tmp/vnc_ready /tmp/novnc_port_ready
+
             pkill -f novnc_proxy || true
-            # 重新启动 noVNC
-            cd /opt/noVNC/utils
-            nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
-            cd -
+            sleep 1
+
+            nohup /opt/noVNC/utils/novnc_proxy \
+                --vnc localhost:5900 \
+                --listen 6080 \
+                --web /opt/noVNC \
+                > /tmp/novnc.log 2>&1 &
+
+            # 等待端口 + WebSocket 就绪后，重新写入标记
+            if wait_for_port localhost 6080 20 && wait_for_novnc_ready 10; then
+                echo "$(date +%s)" > /tmp/novnc_port_ready
+                # Xvnc 仍在运行，桌面进程应该也还在
+                if [ -f /tmp/wallpaper_ready ] && pgrep -f "xfdesktop" >/dev/null 2>&1; then
+                    echo "$(date +%s)" > /tmp/vnc_ready
+                    log_success "noVNC proxy restarted and verified successfully"
+                else
+                    log_warn "noVNC restarted but desktop not ready, waiting for marker task"
+                fi
+            else
+                log_error "noVNC restart failed: WebSocket not ready"
+            fi
         fi
 
         # ========== MCP Proxy 健康检查（使用 mcp-proxy health 工具）==========
