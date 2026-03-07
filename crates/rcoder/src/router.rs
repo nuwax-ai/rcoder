@@ -1,5 +1,7 @@
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     Router,
@@ -44,6 +46,9 @@ pub struct AppState {
     pub container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
     /// 🆕 可热更新的 API Key 配置（使用 ArcSwap 实现无锁读取）
     pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
+    /// 🆕 容器创建中标记: user_id -> 创建开始时间
+    /// 用于防止并发 pod_ensure 请求互相干扰（无锁方案）
+    pub pod_creating: Arc<dashmap::DashMap<String, std::time::Instant>>,
 }
 
 impl AppState {
@@ -64,6 +69,7 @@ impl AppState {
                 crate::grpc::DEFAULT_CACHE_TTL_SECONDS,
             )),
             api_key_config,
+            pod_creating: Arc::new(DashMap::new()),
         })
     }
 

@@ -140,23 +140,94 @@ pub async fn handle_computer_chat(
         }
     }
 
-    // 4. 获取或创建用户容器
-    let container_info = match ComputerContainerManager::get_or_create_container_for_user(
-        &user_id,
-        request
-            .agent_config
-            .as_ref()
-            .and_then(|c| c.resource_limits.clone()),
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(e) => {
-            error!("❌ [COMPUTER_CHAT] 获取或创建容器失败: {}", e);
-            return Ok(HttpResult::error(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                &format!("获取或创建容器失败: {}", e),
-            ));
+    // 4. === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
+    // 使用原子标记（DashMap）避免并发请求互相干扰，无死锁风险
+    let mut waited_container_info: Option<ContainerBasicInfo> = None;
+    if let Some(creating_since) = state.pod_creating.get(&user_id) {
+        let elapsed = creating_since.elapsed();
+        drop(creating_since); // 释放 DashMap ref
+
+        // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
+        if elapsed < std::time::Duration::from_secs(60) {
+            info!(
+                "⏳ [COMPUTER_CHAT] 容器正在创建中，等待完成: user_id={}, 已等待={:?}",
+                user_id, elapsed
+            );
+
+            // 轮询等待容器就绪（最多等 30 秒，每秒检查一次）
+            for wait_sec in 1..=30 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                // 标记已被移除 = 创建完成
+                if !state.pod_creating.contains_key(&user_id) {
+                    // 尝试获取容器信息
+                    if let Ok(docker_mgr) = docker_manager::global::get_global_docker_manager().await {
+                        if let Ok(Some(info)) = docker_mgr.get_user_container_info(&user_id).await {
+                            info!(
+                                "✅ [COMPUTER_CHAT] 等待成功，容器已就绪（等待{}秒）: user_id={}, container_id={}",
+                                wait_sec, user_id, info.container_id
+                            );
+                            waited_container_info = Some(info);
+                            break;
+                        }
+                    }
+                }
+
+                if wait_sec % 5 == 0 {
+                    debug!("⏳ [COMPUTER_CHAT] 仍在等待容器创建: user_id={}, 第{}秒", user_id, wait_sec);
+                }
+            }
+
+            if waited_container_info.is_none() {
+                // 等待超时，继续正常的创建流程（此时标记可能已过期被清理）
+                warn!(
+                    "⚠️ [COMPUTER_CHAT] 等待容器创建超时（30秒），将继续尝试创建: user_id={}",
+                    user_id
+                );
+            }
+        } else {
+            // 标记过期，清理后继续
+            warn!(
+                "⚠️ [COMPUTER_CHAT] 创建标记已过期（{:?}），清理并继续",
+                elapsed
+            );
+            state.pod_creating.remove(&user_id);
+        }
+    }
+
+    // 5. 获取或创建用户容器
+    let container_info = if let Some(info) = waited_container_info {
+        // 使用等待获得的容器信息
+        info!(
+            "📦 [COMPUTER_CHAT] 使用已就绪的容器（等待其他请求创建完成）: user_id={}, container_id={}",
+            user_id, info.container_id
+        );
+        info
+    } else {
+        // 正常创建容器 - 设置标记防止并发
+        state.pod_creating.insert(user_id.clone(), std::time::Instant::now());
+
+        let result = ComputerContainerManager::get_or_create_container_for_user(
+            &user_id,
+            request
+                .agent_config
+                .as_ref()
+                .and_then(|c| c.resource_limits.clone()),
+        )
+        .await;
+
+        // 清除标记（无论成功还是失败）
+        state.pod_creating.remove(&user_id);
+
+        match result {
+            Ok(info) => info,
+            Err(e) => {
+                error!("❌ [COMPUTER_CHAT] 获取或创建容器失败: {}", e);
+                return Ok(HttpResult::error(
+                    shared_types::error_codes::ERR_CONTAINER_ERROR,
+                    &format!("获取或创建容器失败: {}", e),
+                ));
+            }
         }
     };
 
