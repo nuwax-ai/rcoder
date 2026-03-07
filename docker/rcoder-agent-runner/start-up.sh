@@ -681,6 +681,7 @@ function start_vnc_services() {
 			--vnc localhost:5900 \
 			--listen 6080 \
 			--web /opt/noVNC \
+			--heartbeat 30 \
 			> /tmp/novnc.log 2>&1 &
 	fi
 
@@ -743,7 +744,7 @@ function start_display_and_desktop() {
     # 注意: CompressLevel/QualityLevel 是 VNC 客户端参数，不是 Xvnc 服务端参数
     #       真正的压缩配置在 noVNC 客户端侧 (rfb.js 的 compressionLevel/qualityLevel)
     log "Starting Xvnc :0 (background initialization)..."
-    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 >/tmp/xvnc.log 2>&1 &
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared >/tmp/xvnc.log 2>&1 &
 
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
@@ -1182,7 +1183,7 @@ function restart_full_display_stack() {
     # 4. 重启 Xvnc
     log "Restarting Xvnc :0 ..."
     HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache \
-        Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 \
+        Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared \
         >/tmp/xvnc.log 2>&1 &
 
     # 5. 等待 X11 display 就绪
@@ -1235,6 +1236,7 @@ function restart_full_display_stack() {
     # 12. 重启 noVNC 代理
     nohup /opt/noVNC/utils/novnc_proxy \
         --vnc localhost:5900 --listen 6080 --web /opt/noVNC \
+        --heartbeat 30 \
         > /tmp/novnc.log 2>&1 &
 
     # 13. 验证 noVNC 端口 + WebSocket
@@ -1849,6 +1851,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
                 --vnc localhost:5900 \
                 --listen 6080 \
                 --web /opt/noVNC \
+                --heartbeat 30 \
                 > /tmp/novnc.log 2>&1 &
 
             # 等待端口 + WebSocket 就绪后，重新写入标记

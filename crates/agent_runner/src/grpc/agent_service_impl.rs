@@ -1451,7 +1451,11 @@ impl AgentService for AgentServiceImpl {
     /// 查询 VNC 服务状态
     ///
     /// 检测容器内 VNC/noVNC 服务是否已启动就绪。
-    /// 使用状态标记文件 + 端口检测的双重验证机制。
+    /// 使用状态标记文件 + noVNC 端口检测的双重验证机制。
+    ///
+    /// 注意：不再 TCP 探测 Xvnc 5900 端口，因为 TCP 连接会触发 TigerVNC 的
+    /// 客户端管理逻辑（DisconnectClients），可能导致正在连接的前端用户被踢掉。
+    /// /tmp/vnc_ready 标记文件本身已经包含了 5900 端口可达的验证结果。
     #[instrument(skip(self))]
     async fn get_vnc_status(
         &self,
@@ -1465,10 +1469,13 @@ impl AgentService for AgentServiceImpl {
         );
 
         // 1. 检查 VNC 就绪标记文件
+        // /tmp/vnc_ready 由 start-up.sh 的 wait_and_write_vnc_ready_marker() 写入，
+        // 写入前已验证：Xvnc 5900 可达 + noVNC 6080 可达 + WebSocket 101 + 壁纸就绪 + xfdesktop 运行
         let vnc_ready_file = std::path::Path::new("/tmp/vnc_ready");
         let file_exists = vnc_ready_file.exists();
 
-        // 2. 检测端口状态（使用 tokio 异步检测）
+        // 2. 仅检测 noVNC 6080 端口（面向前端的 WebSocket 代理端口）
+        // 不再探测 Xvnc 5900 端口，避免 TCP 连接干扰 VNC 客户端会话
         let port_check_timeout = self
             .app_state
             .config
@@ -1476,21 +1483,19 @@ impl AgentService for AgentServiceImpl {
             .as_ref()
             .map(|t| t.port_check_timeout_millis)
             .unwrap_or(500); // 默认 500 毫秒
-        let vnc_port_ready = check_port_available(5900, port_check_timeout).await;
         let novnc_port_ready = check_port_available(6080, port_check_timeout).await;
 
-        // 3. 综合判断：标记文件存在 + 端口可达
-        let vnc_ready = file_exists && vnc_port_ready;
+        // 3. 综合判断
+        // vnc_ready: 标记文件存在即可（标记写入时已验证 5900 端口）
+        // novnc_ready: 标记文件存在 + 6080 端口可达
+        let vnc_ready = file_exists;
         let novnc_ready = file_exists && novnc_port_ready;
 
         // 4. 生成状态消息
         let message = if vnc_ready && novnc_ready {
             "VNC 服务已就绪".to_string()
-        } else if file_exists {
-            format!(
-                "VNC 标记存在，但端口检测异常: vnc={}, novnc={}",
-                vnc_port_ready, novnc_port_ready
-            )
+        } else if file_exists && !novnc_port_ready {
+            "VNC 标记存在，但 noVNC 端口 6080 不可达".to_string()
         } else {
             "VNC 服务未就绪（启动中或启动失败）".to_string()
         };
