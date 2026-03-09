@@ -44,7 +44,7 @@ RUN apt-get update && \
     # FFmpeg 8 编译依赖:
     yasm nasm pkg-config libx264-dev libx265-dev libnuma-dev libvpx-dev libmp3lame-dev libopus-dev libspeex-dev libtheora-dev libtool libva-dev libvdpau-dev libvorbis-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev texinfo zlib1g-dev \
     # VNC and streaming:
-    x11vnc net-tools netcat-openbsd \
+    tigervnc-standalone-server tigervnc-xorg-extension net-tools netcat-openbsd \
     # Audio streaming (PulseAudio + pcmflux dependencies):
     pulseaudio pulseaudio-utils libpulse-dev libopus-dev \
     # Standard applications:
@@ -67,7 +67,7 @@ RUN apt-get update && \
 # Debian 12 官方仓库的 FFmpeg 版本是 5.1.8，这里从源码编译安装最新的 FFmpeg 8
 RUN echo "Building FFmpeg 8.0 from source..." && \
     cd /tmp && \
-    git clone --depth 1 --branch release/8.0 https://git.ffmpeg.org/ffmpeg.git ffmpeg-8.0 && \
+    git clone --depth 1 --branch release/8.0 https://github.com/FFmpeg/FFmpeg.git ffmpeg-8.0 && \
     cd ffmpeg-8.0 && \
     ./configure \
         --extra-version="8.0" \
@@ -180,7 +180,7 @@ RUN case "$TARGETARCH" in \
     "arm64") LO_ARCH2="aarch64" ;; \
     *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
     esac && \
-    wget -O /tmp/libreoffice.tar.gz "https://mirrors.ustc.edu.cn/tdf/libreoffice/stable/25.8.4/deb/${LO_ARCH}/LibreOffice_25.8.4_Linux_${LO_ARCH2}_deb.tar.gz" && \
+    wget -O /tmp/libreoffice.tar.gz "https://download.documentfoundation.org/libreoffice/stable/25.8.4/deb/${LO_ARCH}/LibreOffice_25.8.4_Linux_${LO_ARCH2}_deb.tar.gz" && \
     cd /tmp && \
     tar -xzf libreoffice.tar.gz && \
     cd LibreOffice_*/DEBS && \

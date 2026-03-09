@@ -15,6 +15,39 @@ use tracing::{debug, info, warn};
 
 use super::AGENT_REGISTRY;
 
+/// 日志截取的最大长度默认值
+const MAX_LOG_TRUNCATE_LEN: usize = 50;
+
+/// 截取消息内容用于日志打印（防止日志膨胀）
+///
+/// 社区常见做法：
+/// - tracing: 通过 Subscriber 配置限制字段大小
+/// - serde: 自定义 Serialize 实现截断
+/// - 简单场景: chars().take() + 长度检查（本实现）
+fn truncate_message_for_log(data: &serde_json::Value, max_len: usize) -> String {
+    // 边界检查：max_len 为 0 时返回空，避免无效计算
+    if max_len == 0 {
+        return String::new();
+    }
+
+    // 优先提取原始字符串内容，避免 JSON 序列化后的引号包裹
+    let s = match data.as_str() {
+        Some(inner) => inner.to_string(),
+        None => data.to_string(),
+    };
+
+    // chars().count() 是一次性遍历，可以与 take() 合并优化但牺牲可读性
+    // 当前实现清晰且性能可接受（短字符串场景）
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        return s;
+    }
+
+    // 使用 chars() 安全截取 UTF-8 字符边界
+    let truncated: String = s.chars().take(max_len).collect();
+    format!("{}... (truncated)", truncated)
+}
+
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
 
@@ -240,14 +273,22 @@ impl SessionWorker {
                     if let Some(sender) = current_sender_guard.as_mut() {
                         if sender.try_send(message.clone()).is_err() {
                             // 如果发送失败，可能是缓冲区满了或连接已关闭
-                            warn!("⚠️ SSE sender 发送失败，关闭实时推送");
+                            // 注意：truncate 在锁内执行，但 50 字符开销可忽略
+                            warn!(
+                                "⚠️ SSE sender 发送失败，关闭实时推送: message_type={:?}, sub_type={}, data={}",
+                                message.message_type,
+                                message.sub_type,
+                                truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
+                            );
                             *current_sender_guard = None;
                         }
                     } else {
                         // 连接不存在，跳过实时推送（记录为 info 级别，便于排查问题）
                         info!(
-                            "📭 SSE sender 不存在，跳过实时推送（消息已缓存到 ring buffer）: message_type={:?}, sub_type={}",
-                            message.message_type, message.sub_type
+                            "📭 SSE sender 不存在，跳过实时推送（消息已缓存到 ring buffer）: message_type={:?}, sub_type={}, data={}",
+                            message.message_type,
+                            message.sub_type,
+                            truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
                         );
                     }
                 }
@@ -277,18 +318,29 @@ enum SessionCommand {
 }
 
 /// 便捷函数：添加SessionNotify消息（自动转换为统一格式）
+///
+/// 如果 SESSION_CACHE 中不存在该 session_id 的条目，会自动创建。
+/// 这解决了 Agent 开始推送消息时 SESSION_CACHE 条目尚未由 HTTP 处理器创建的竞态问题。
 pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
-    // 🎯 极简设计：直接获取当前 SESSION_CACHE 中的 SessionData
-    // Agent 只能发送到最新创建的 SessionData，确保消息路由清晰
-    let session_data = if let Some(session_data_ref) = SESSION_CACHE.get(session_id) {
-        session_data_ref.clone()
-    } else {
-        let unified_message = notify.to_unified_message();
-        debug!(
-            "🚫 [push_session_update] session={} 不存在于 SESSION_CACHE 中，可能是 SSE 连接未建立，消息内容: message_type={:?}, sub_type={}",
-            session_id, unified_message.message_type, unified_message.sub_type
-        );
-        return Ok(());
+    use dashmap::mapref::entry::Entry;
+
+    // 🛡️ 关键修复：使用 entry API 原子性地获取或创建 SessionData
+    // 之前直接用 get()，如果 session 不存在就丢弃消息。
+    // 竞态场景：Agent 开始推送消息 → push_session_update 查找 SESSION_CACHE → 不存在（因为
+    // handle_chat_core 尚未返回，computer_chat.rs 还未创建条目）→ 消息被丢弃
+    let session_data = {
+        match SESSION_CACHE.entry(session_id.to_string()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let data = SessionData::new(1000);
+                info!(
+                    "📦 [push_session_update] SESSION_CACHE 自动创建: session_id={}",
+                    session_id
+                );
+                entry.insert(data.clone());
+                data
+            }
+        }
     };
 
     let unified_message = notify.to_unified_message();
@@ -359,8 +411,15 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
                 project_id, old_session_id, session_id
             );
 
-            // 清理旧 session 的 SSE 数据
-            let cleared_count = if SESSION_CACHE.remove(&old_session_id).is_some() {
+            // 🛡️ 关键修复：先主动关闭旧 session 的 SSE 连接，再移除缓存
+            // 之前直接 remove 导致旧 SSE 连接的心跳流继续发送但不再收到业务消息，
+            // 前端如果没有及时关闭旧连接，会看到孤立的心跳流
+            let cleared_count = if let Some((_, old_session_data)) = SESSION_CACHE.remove(&old_session_id) {
+                old_session_data.close_current_connection().await;
+                info!(
+                    "🔌 [ensure_project_session] 已关闭旧 session SSE 连接: old_session_id={}",
+                    old_session_id
+                );
                 1 // 移除了1个session
             } else {
                 0 // session不存在

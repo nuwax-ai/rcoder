@@ -21,7 +21,6 @@ pub struct AgentCleaner {
 
     // 组件
     container_destroyer: super::container::ContainerDestroyer,
-    orphaned_cleaner: super::container::OrphanedContainerCleaner,
     agent_scanner: super::agent::AgentScanner,
     log_cleaner: super::logs::LogCleaner,
 }
@@ -32,12 +31,9 @@ impl AgentCleaner {
         state: Arc<crate::router::AppState>,
         docker_manager: Arc<docker_manager::DockerManager>,
         pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
-        container_patterns: Vec<String>,
     ) -> Self {
         let config_clone = config.clone();
-        let config_arc = Arc::new(config_clone.clone());
         let state_clone = state.clone();
-        let state_clone2 = state.clone();
         let grpc_pool = state.grpc_pool.clone();
 
         // 创建日志清理器（使用配置）
@@ -58,12 +54,6 @@ impl AgentCleaner {
                 pingora_service,
             )
             .with_ip_cache(state.container_ip_cache.clone()),
-            orphaned_cleaner: super::container::OrphanedContainerCleaner::new(
-                docker_manager,
-                state_clone2,
-                container_patterns,
-                config_arc,
-            ),
             agent_scanner: {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)
@@ -117,33 +107,12 @@ impl AgentCleaner {
             }
         }
 
-        // 4. 清理孤立容器（已禁用运行时检测）
-        // 🔒 多实例隔离修复：不再在运行时扫描所有 Docker 容器
-        // 原因：运行时扫描会误删其他 RCoder 实例的容器
-        // 保留：启动时清理（startup_cleanup_all_enabled_services）- 只清理数据库中有记录的容器
-        //
-        // 需要手动清理时，可使用 Docker 命令：
-        //   docker ps -a --filter "name=rcoder-agent"
-        //   docker rm -f <container_id>
-        /*
-        match self.orphaned_cleaner.cleanup().await {
-            Ok(orphaned_count) => {
-                current_stats.orphaned_containers_cleaned = orphaned_count;
-                info!("🧹 [cleaner] 清理了 {} 个孤立容器", orphaned_count);
-            }
-            Err(e) => {
-                warn!("⚠️ [cleaner] 孤立容器清理失败: {}", e);
-            }
-        }
-        */
-
-        // 5. 更新累计统计
+        // 4. 更新累计统计
         current_stats.last_cleanup = Some(Utc::now());
         self.stats.total_cleaned += current_stats.total_cleaned;
         self.stats.success_cleaned += current_stats.success_cleaned;
         self.stats.failed_cleaned += current_stats.failed_cleaned;
         self.stats.containers_destroyed += current_stats.containers_destroyed;
-        self.stats.orphaned_containers_cleaned += current_stats.orphaned_containers_cleaned;
         self.stats.last_cleanup = current_stats.last_cleanup;
 
         let duration = start_time.elapsed();

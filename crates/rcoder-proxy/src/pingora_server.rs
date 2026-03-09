@@ -23,7 +23,6 @@ use shared_types::ModelProviderConfig;
 pub struct PingoraServerManager {
     config: ProxyConfig,
     service: Arc<PingoraProxyService>,
-    shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl PingoraServerManager {
@@ -33,7 +32,6 @@ impl PingoraServerManager {
         Self {
             config,
             service,
-            shutdown_tx: None,
         }
     }
 
@@ -76,7 +74,11 @@ impl PingoraServerManager {
     }
 
     /// 启动 Pingora 服务器
-    pub async fn start(&mut self) -> Result<()> {
+    ///
+    /// 接受一个 `shutdown_rx` 用于接收外部关闭信号。
+    /// 当 `shutdown_rx` 收到信号（或 sender 被 drop）时，`start()` 返回。
+    /// Pingora 服务器线程运行 `run_forever()`，由进程退出时 OS 清理。
+    pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
         info!("🚀 启动 Pingora 反向代理服务器...");
         info!("📡 监听地址: 0.0.0.0:{}", self.config.listen_port);
         info!("🔄 路由规则: /proxy/{{port}}{{/path}}");
@@ -108,39 +110,23 @@ impl PingoraServerManager {
         // 将服务添加到服务器
         my_server.add_service(http_proxy);
 
-        // 创建关闭信号通道
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-        self.shutdown_tx = Some(shutdown_tx);
-
-        // 在后台任务中运行服务器
-        let mut server_handle = tokio::task::spawn_blocking(move || {
+        // 在独立线程中运行服务器（使用 std::thread 而不是 spawn_blocking）
+        // spawn_blocking 在某些环境下可能有调度延迟问题
+        info!("🔧 正在创建 Pingora 服务器线程...");
+        let server_thread = std::thread::spawn(move || {
             info!("🎯 Pingora 服务器开始运行...");
             my_server.run_forever();
         });
+        info!("✅ Pingora 服务器线程已创建");
 
-        // 等待关闭信号
-        tokio::select! {
-            _ = &mut shutdown_rx => {
-                info!("📴 收到关闭信号，正在停止 Pingora 服务器...");
-                server_handle.abort();
-            }
-            result = &mut server_handle => {
-                match result {
-                    Ok(_) => info!("Pingora 服务器正常结束"),
-                    Err(e) => error!("Pingora 服务器异常结束: {}", e),
-                }
-            }
-        }
+        // 等待外部关闭信号（sender 被 drop 或显式发送信号都会触发）
+        let _ = shutdown_rx.await;
+        info!("📴 收到关闭信号，Pingora 服务器线程将在进程退出时由 OS 清理");
 
-        Ok(())
-    }
+        // 不再 join 线程 — run_forever() 永不返回，join() 会导致永久阻塞
+        // detach 线程，让进程退出时自动清理
+        drop(server_thread);
 
-    /// 停止 Pingora 服务器
-    pub async fn stop(&mut self) -> Result<()> {
-        if let Some(shutdown_tx) = self.shutdown_tx.take()
-            && shutdown_tx.send(()).is_err() {
-                error!("⚠️ [PINGORA] 发送关闭信号失败（接收端已关闭）");
-            }
         Ok(())
     }
 
@@ -224,9 +210,14 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
 }
 
 /// 便捷函数：快速启动 Pingora 代理服务器
+///
+/// 注意：此函数启动后会阻塞直到进程退出，因为内部创建的 shutdown 通道
+/// 的 sender 会在函数结束时立即 drop，导致 `start()` 立即返回。
+/// 如需长时间运行，请使用 `PingoraServerManager::new()` + `start(shutdown_rx)` 组合。
 pub async fn start_pingora_proxy(config: ProxyConfig) -> Result<()> {
+    let (_shutdown_tx, shutdown_rx) = oneshot::channel();
     let mut manager = PingoraServerManager::new(config);
-    manager.start().await
+    manager.start(shutdown_rx).await
 }
 
 #[cfg(test)]

@@ -56,7 +56,12 @@ impl ServiceType {
         }
     }
 
-    /// 获取容器名称前缀
+    /// 获取容器名称前缀（硬编码的降级兜底值）
+    ///
+    /// **警告**：正常情况下应通过 `DockerManager::get_service_config()` 获取
+    /// `ServiceImageConfig::container_prefix()`，该方法优先读取配置文件中的
+    /// `image_tag_prefix` 字段。本方法仅在配置获取失败时作为安全回退使用。
+    /// 直接调用本方法构造容器名可能导致与实际创建的容器名称不一致。
     pub fn container_prefix(&self) -> &str {
         match self {
             ServiceType::RCoder => "rcoder-agent",

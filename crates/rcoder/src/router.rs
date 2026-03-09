@@ -1,5 +1,7 @@
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     Router,
@@ -44,6 +46,9 @@ pub struct AppState {
     pub container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
     /// 🆕 可热更新的 API Key 配置（使用 ArcSwap 实现无锁读取）
     pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
+    /// 🆕 容器创建中标记: user_id -> 创建开始时间
+    /// 用于防止并发 pod_ensure 请求互相干扰（无锁方案）
+    pub pod_creating: Arc<dashmap::DashMap<String, std::time::Instant>>,
 }
 
 impl AppState {
@@ -64,6 +69,7 @@ impl AppState {
                 crate::grpc::DEFAULT_CACHE_TTL_SECONDS,
             )),
             api_key_config,
+            pod_creating: Arc::new(DashMap::new()),
         })
     }
 
@@ -165,11 +171,6 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         // 进度流复用现有的 agent_session_notification
         .route(
             "/computer/progress/{session_id}",
-            get(handler::agent_session_notification),
-        )
-        // computer agent 专用进度流接口（使用与 agent_session_notification 相同的逻辑）
-        .route(
-            "/computer/agent/progress/{session_id}",
             get(handler::computer_agent_progress_notification),
         )
         // VNC 桌面访问说明接口
@@ -348,11 +349,11 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             shared_types::UnifiedSessionMessage,
             shared_types::SessionMessageType,
             // Computer Agent 相关结构体
-            handler::ComputerChatRequest,
-            handler::ComputerAgentStopRequest,
-            handler::ComputerAgentStopResponse,
-            handler::ComputerAgentStatusRequest,  // 🆕 新增
-            handler::ComputerAgentStatusResponse, // 🆕 新增
+            shared_types::ComputerChatRequest,
+            shared_types::ComputerAgentStopRequest,
+            shared_types::ComputerAgentStopResponse,
+            shared_types::ComputerAgentStatusRequest,
+            shared_types::ComputerAgentStatusResponse,
             handler::DesktopPathParams,
             handler::VncProxyPathParams,
             handler::AudioProxyPathParams,

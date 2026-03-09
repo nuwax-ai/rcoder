@@ -12,6 +12,14 @@ path = "src/lib.rs"
 [features]
 default = []
 
+# HTTP 服务器功能：启用 HTTP REST API 和 SSE 进度流
+# 禁用此 feature 后,应用将仅运行 gRPC 服务
+http-server = []
+
+# Pingora 代理模式：API Key 和 Base URL 使用占位符，由 Pingora 代理注入真实值
+# Windows 不支持 Pingora，禁用此 feature 时直接使用真实的 API Key 和 Base URL
+proxy = ["agent_abstraction/proxy", "dep:rcoder-proxy"]
+
 # 测试相关 features
 testing = ["test-blocking"]
 test-blocking = []  # 启用测试用阻塞注入 (用于极端场景测试)
@@ -27,7 +35,7 @@ pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
 shared_types = { path = "../shared_types" }
 agent_config = { path = "../agent_config" }
 agent_abstraction = { path = "../agent_abstraction" }
-rcoder-proxy = { path = "../rcoder-proxy" }
+rcoder-proxy = { path = "../rcoder-proxy", optional = true }
 rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
@@ -40,7 +48,7 @@ tempfile = { workspace = true }
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
-tower-http = { workspace = true, features = ["cors", "trace"] }
+tower-http = { workspace = true, features = ["cors", "trace", "limit"] }
 futures = { workspace = true }
 tokio-stream = "0.1"
 async-stream = "0.3"
@@ -100,5 +108,6 @@ arc-swap = "1.8"
 pyroscope = { workspace = true, optional = true }
 pyroscope_pprofrs = { workspace = true, optional = true }
 
-# Unix 信号处理（用于僵尸进程回收）
+# Unix 信号处理（用于僵尸进程回收，仅 Unix 平台）
+[target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process"] }

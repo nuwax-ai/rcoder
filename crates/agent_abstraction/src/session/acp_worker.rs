@@ -38,10 +38,8 @@ impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpAgentWorker<N, R> {
 }
 
 #[async_trait::async_trait]
-impl<
-    N: SessionNotifier + Send + Sync + 'static,
-    R: SessionRegistry + Send + Sync + 'static,
-> AgentWorker for AcpAgentWorker<N, R>
+impl<N: SessionNotifier + Send + Sync + 'static, R: SessionRegistry + Send + Sync + 'static>
+    AgentWorker for AcpAgentWorker<N, R>
 where
     R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
 {
@@ -68,7 +66,7 @@ where
             })?;
 
         // 3. 使用 PromptConfigAssembler 组装配置
-        let default_agent_id = "claude-code-acp";
+        let default_agent_id = "claude-code-acp-ts";
 
         // 根据请求中的 service_type 加载对应配置
         let servers_config =
@@ -161,7 +159,8 @@ where
         if let Some(ref session_id) = request.prompt_message.session_id {
             // 检查 session 文件是否存在（使用文件系统扫描 + 缓存）
             let project_path_str = normalized_path.to_string_lossy().to_string();
-            let session_exists = super::check_session_file_exists(session_id, &project_path_str).await;
+            let session_exists =
+                super::check_session_file_exists(session_id, &project_path_str).await;
 
             if session_exists {
                 info!("✅ Session 文件存在，尝试 resume: {}", session_id);

@@ -5,6 +5,7 @@
       "args": [
         "--userDataDir=/home/user/.config/chromium",
         "--executablePath=/usr/local/bin/chromium-for-mcp",
+        "--no-usage-statistics",
         "--chrome-arg=--no-sandbox",
         "--chrome-arg=--no-zygote",
         "--chrome-arg=--disable-dev-shm-usage",

@@ -31,8 +31,8 @@ chrono = { workspace = true, features = ["serde"] }
 # 路径处理
 path-clean = { workspace = true }
 
-# 命令执行
-which = "7.0"
+# 命令执行（跨平台）
+which = { workspace = true }
 
 # 异步 trait
 async-trait = { workspace = true }

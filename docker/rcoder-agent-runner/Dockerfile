@@ -26,7 +26,7 @@ ARG CACHEBUST=1
 RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-stdio-proxy
 
 # 安装 claude-code-acp-rs CLI 工具
-RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs
+RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs --no-default-features --features otel,sacp-flush
 
 # 测试agent
 RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest

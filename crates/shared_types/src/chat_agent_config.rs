@@ -17,7 +17,7 @@ pub struct ChatAgentConfig {
     /// 单个 Agent 服务器配置（可选）
     ///
     /// 用于覆盖默认的 Agent 执行命令、参数、环境变量等。
-    /// 如果不传，使用内部默认配置 (claude-code-acp)。
+    /// 如果不传，使用内部默认配置 (claude-code-acp-ts)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_server: Option<ChatAgentServerConfig>,
 
@@ -42,11 +42,11 @@ pub struct ChatAgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[derive(Default)]
 pub struct ChatAgentServerConfig {
-    /// Agent 标识符（可选，默认使用 "claude-code-acp"）
+    /// Agent 标识符（可选，默认使用 "claude-code-acp-ts"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 
-    /// 执行命令（如 "claude-code-acp", "custom-agent"）
+    /// 执行命令（如 "claude-code-acp-ts", "custom-agent"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 
@@ -130,9 +130,9 @@ impl ChatAgentConfig {
 }
 
 impl ChatAgentServerConfig {
-    /// 获取 Agent ID，默认返回 "claude-code-acp"
+    /// 获取 Agent ID，默认返回 "claude-code-acp-ts"
     pub fn get_agent_id(&self) -> &str {
-        self.agent_id.as_deref().unwrap_or("claude-code-acp")
+        self.agent_id.as_deref().unwrap_or("claude-code-acp-ts")
     }
 }
 
@@ -169,7 +169,7 @@ mod tests {
     fn test_chat_agent_config_json_deserialize() {
         let json = r#"{
             "agent_server": {
-                "agent_id": "claude-code-acp",
+                "agent_id": "claude-code-acp-ts",
                 "env": {"RUST_LOG": "debug"}
             },
             "context_servers": {
@@ -186,14 +186,14 @@ mod tests {
         assert!(config.has_context_servers());
         assert_eq!(
             config.agent_server.as_ref().unwrap().get_agent_id(),
-            "claude-code-acp"
+            "claude-code-acp-ts"
         );
     }
 
     #[test]
     fn test_get_agent_id_default() {
         let config = ChatAgentServerConfig::default();
-        assert_eq!(config.get_agent_id(), "claude-code-acp");
+        assert_eq!(config.get_agent_id(), "claude-code-acp-ts");
     }
 
     #[test]

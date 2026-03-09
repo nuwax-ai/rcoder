@@ -14,7 +14,7 @@ port: 8087
 cleanup_config:
   # 闲置超时时间（秒），超过此时间未活动的容器将被清理
   # 默认值: 600 (10分钟)
-  idle_timeout_seconds: 30000
+  idle_timeout_seconds: 300
   # 清理任务执行间隔（秒）
   # 默认值: 300 (5分钟)
   cleanup_interval_seconds: 3
@@ -99,7 +99,7 @@ docker_config:
         arm64_image: "rcoder-agent-runner:latest"
         amd64_image: "rcoder-agent-runner:latest"
         default_image: "rcoder-agent-runner:latest"
-        image_tag_prefix: "rcoder-computer-agent-runner"
+        image_tag_prefix: "computer-agent-runner"
         enabled: true
 
         environment:
@@ -110,6 +110,13 @@ docker_config:
           # 🔥 Agent 清理配置（闲置超时时间，秒）
           # 默认值: 3600 (1小时)
           RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
+          # 🔥 Agent 并发会话槽位数量
+          # 默认值: 10
+          RCODER_AGENT_CONCURRENCY_LIMIT: "5"
+          # 🖼️ 自定义壁纸配置
+          # 通过挂载的 /app/assets 目录使用宿主机壁纸
+          # 使用方法：在宿主机 ./wallpaper 目录放置 wallpaper.jpeg
+          # CUSTOM_WALLPAPER_PATH: "/app/assets/wallpaper.jpeg"
 
         command:
           - "/usr/local/bin/agent_runner"
@@ -142,14 +149,14 @@ docker_config:
             read_only: false
             mount_type: "bind"
             resolve_from: "/app/logs/container"
-          # 🖼️ 自定义壁纸挂载（管理员配置）
-          # 将壁纸放到宿主机的 assets 目录下，子容器启动时自动替换
-          # 如需使用：取消下面注释，并在对应目录放置 wallpaper.jpeg
-          # - container_path: "/app/assets"
-          #   host_path: "{resolved_path}"
-          #   read_only: true
-          #   mount_type: "bind"
-          #   resolve_from: "/app/assets"
+          # 🖼️ 自定义壁纸挂载
+          # 将宿主机 ./wallpaper 目录挂载到容器内
+          # rcoder 主服务已将 wallpaper 挂载到 /app/assets
+          - container_path: "/app/assets"
+            host_path: "{resolved_path}"
+            read_only: true
+            mount_type: "bind"
+            resolve_from: "/app/assets"
 
     # 镜像选择策略
     selection_strategy: "ServiceOnly"

@@ -53,6 +53,8 @@
 
 pub mod lifecycle;
 mod claude_code_sacp;
+#[cfg(windows)]
+mod windows_launch;
 
 // ============================================================================
 // SACP 类型导出（推荐使用）

@@ -161,6 +161,48 @@ function wait_for_port() {
     return 0
 }
 
+# 等待 noVNC WebSocket 服务真正就绪
+# 通过 curl 发送 WebSocket 升级请求，验证 /websockify 路径可用
+# 比 HTTP 检查更可靠（HTTP 200 ≠ WebSocket 代理可用）
+# 比 Python websockets 更轻量（无需启动 Python 解释器）
+# 用法: wait_for_novnc_ready [timeout_seconds]
+function wait_for_novnc_ready() {
+    local timeout="${1:-10}"
+    local i=0
+
+    log "Waiting for noVNC WebSocket service to be fully ready..."
+
+    while true; do
+        # 发送 WebSocket 升级请求到 /websockify 路径
+        # 返回 101 Switching Protocols 说明 WebSocket 代理真正可用
+        #
+        # 注意：不要加 || echo "000"！
+        # curl 收到 101 后连接升级为 WebSocket，--max-time 超时导致退出码非零
+        # 如果加了 ||，echo 的输出会拼在 curl -w 输出后面，变成 "101000" 而非 "101"
+        # curl 本身在连接失败时 -w "%{http_code}" 已经会输出 "000"，不需要 fallback
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 2 \
+            -H "Upgrade: websocket" \
+            -H "Connection: Upgrade" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Version: 13" \
+            "http://localhost:6080/websockify" 2>/dev/null)
+
+        if [ "$http_code" = "101" ]; then
+            log_success "noVNC WebSocket service is ready (WebSocket upgrade 101)"
+            return 0
+        fi
+
+        sleep 0.5
+        i=$((i + 1))
+        if [ $i -ge $((timeout * 2)) ]; then
+            log_warn "noVNC WebSocket service not ready within ${timeout}s timeout (last HTTP code: $http_code)"
+            return 1
+        fi
+    done
+}
+
 # 等待文件存在，最长等待 $2 秒（默认 5 秒）
 # 用法: wait_for_file "filepath" [timeout_seconds]
 function wait_for_file() {
@@ -206,8 +248,8 @@ initialize_timezone
 # 🧹 清理旧的 VNC 就绪标记文件（容器重启时可能残留）
 # 确保 VNC 状态查询 API 返回准确的状态
 # ============================================================================
-rm -f /tmp/vnc_ready
-log "Cleaned up stale VNC ready marker (if any)"
+rm -f /tmp/vnc_ready /tmp/novnc_port_ready /tmp/wallpaper_ready
+log "Cleaned up stale VNC ready markers (if any)"
 
 # ============================================================================
 # 🎯 注意：所有服务均以 root 用户运行
@@ -374,16 +416,42 @@ function initialize_user_home() {
         log_success "XFCE Panel config is valid"
     fi
 
-    # ========== 修复：预加载 XFCE 桌面壁纸配置（防止启动黑屏） ==========
-    # 确保 xfce4-desktop.xml 存在，这样 xfdesktop 启动时能立即加载壁纸
-    # 而不需要等待 apply_xfce_wallpaper 脚本
+    # ========== 🔥 关键修复：先替换壁纸文件，再加载配置（解决壁纸竞态条件） ==========
+    # 必须在 xfce4-desktop.xml 加载之前完成壁纸文件替换！
+    # 否则 xfdesktop 启动时会读取到默认壁纸并缓存，后续设置不生效
+    local CUSTOM_WALLPAPER="/app/assets/wallpaper.jpeg"
+    local XFCE_WALLPAPER="/usr/share/backgrounds/xfce/wallpaper.jpeg"
+    local NOVNC_BG="/opt/noVNC/app/images/bg.jpg"
+
+    if [ -f "$CUSTOM_WALLPAPER" ]; then
+        log "Found custom wallpaper at $CUSTOM_WALLPAPER, applying BEFORE xfdesktop starts..."
+
+        # 1. 应用到 XFCE 桌面（备份原始文件）
+        if [ ! -f "${XFCE_WALLPAPER}.original" ]; then
+            cp "$XFCE_WALLPAPER" "${XFCE_WALLPAPER}.original" 2>/dev/null || true
+        fi
+        cp "$CUSTOM_WALLPAPER" "$XFCE_WALLPAPER"
+        log_success "  XFCE wallpaper applied EARLY: $CUSTOM_WALLPAPER -> $XFCE_WALLPAPER"
+
+        # 2. 应用到 noVNC 网页背景（同一图片，不同文件名）
+        if [ ! -f "${NOVNC_BG}.original" ]; then
+            cp "$NOVNC_BG" "${NOVNC_BG}.original" 2>/dev/null || true
+        fi
+        cp "$CUSTOM_WALLPAPER" "$NOVNC_BG"
+        log_success "  noVNC background applied EARLY: $CUSTOM_WALLPAPER -> $NOVNC_BG"
+    else
+        log "No custom wallpaper found at $CUSTOM_WALLPAPER (using defaults)"
+    fi
+
+    # ========== 修复：预加载 XFCE 桌面壁纸配置（防止启动黑屏和缩放问题） ==========
+    # 复制系统配置到用户目录，包含所有 monitor 路径和缩放设置 (image-style=5)
     local XFCE_DESKTOP_XML="$USER_HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
     local XFCE_DESKTOP_SYSTEM="/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
 
     if [ ! -f "$XFCE_DESKTOP_XML" ] && [ -f "$XFCE_DESKTOP_SYSTEM" ]; then
         mkdir -p "$(dirname "$XFCE_DESKTOP_XML")"
         cp -f "$XFCE_DESKTOP_SYSTEM" "$XFCE_DESKTOP_XML"
-        log_success "  xfce4-desktop.xml pre-configured from system (fixes black wallpaper)"
+        log_success "  xfce4-desktop.xml pre-configured from system (fixes wallpaper scaling)"
     fi
 
     # 确保 Panel launcher 目录存在且内容完整（强制恢复）
@@ -406,15 +474,48 @@ function initialize_user_home() {
     # 同时配置 /root 和 /home/user，因为：
     # - 以 root 用户运行时，某些进程可能读取 /root/.config
     # - 设置 HOME=/home/user 后，大部分进程读取 /home/user/.config
-    local GTK_CSS_CONTENT='/* Hide Thunar root warnings completely */
-.thunar-window infobar.warning { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-.thunar-window infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-.thunar-window infobar.warning button { min-height: 0; min-width: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-infobar.warning { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity: 0; }
-/* Hide XFCE root warning */
-.root-warning { display: none !important; opacity: 0 !important; }
-.root-warning * { display: none !important; opacity: 0 !important; }
+    # 注意：只使用 GTK 3.0 支持的 CSS 属性，避免解析警告
+    local GTK_CSS_CONTENT='/* Hide Thunar root warnings - GTK 3.0 compatible */
+.thunar-window infobar.warning {
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+.thunar-window infobar.warning * {
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+.thunar-window infobar.warning button {
+    min-height: 0;
+    min-width: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+infobar.warning {
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+infobar.warning * {
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    opacity: 0;
+}
+/* Hide XFCE root warning - using opacity instead of display */
+.root-warning {
+    opacity: 0 !important;
+    min-height: 0;
+}
+.root-warning * {
+    opacity: 0 !important;
+    min-height: 0;
+}
 '
     # 为 /root 创建配置
     mkdir -p /root/.config/gtk-3.0
@@ -425,6 +526,22 @@ infobar.warning * { min-height: 0; max-height: 0; padding: 0; margin: 0; opacity
     mkdir -p "$USER_HOME/.config/gtk-3.0"
     echo "$GTK_CSS_CONTENT" > "$USER_HOME/.config/gtk-3.0/gtk.css"
     log_success "  GTK CSS created for $USER_HOME"
+
+    # ========== 抑制 gnome-keyring 模块加载告警 ==========
+    # 容器中未安装 gnome-keyring，配置 GTK 不尝试加载该模块
+    # 创建 GTK 模块配置，禁用 gnome-keyring-pkcs11
+    mkdir -p /root/.config/gtk-3.0
+    cat > /root/.config/gtk-3.0/settings.ini <<'EOF'
+[Settings]
+gtk-modules=
+EOF
+
+    mkdir -p "$USER_HOME/.config/gtk-3.0"
+    cat > "$USER_HOME/.config/gtk-3.0/settings.ini" <<'EOF'
+[Settings]
+gtk-modules=
+EOF
+    log_success "  GTK module config created (gnome-keyring disabled)"
 
     # ========== 设置 Chromium 为默认浏览器（解决 xdg-open 无法打开浏览器问题）==========
     log "Configuring Chromium as default web browser..."
@@ -463,157 +580,144 @@ EOF
     log_success "  Chromium set as default web browser (mimeapps.list)"
     log_success "  BROWSER env set to: $BROWSER"
 
-    # ========== 修复挂载目录的权限（解决宿主机 UID 不匹配） ==========
-    # 注意：由于 Dockerfile 中用户配置已经以 user 身份创建，
-    # 这里只需要处理可能被宿主机挂载覆盖的目录
-    log "Fixing permissions for mounted directories..."
+    # ========== 修复挂载目录的权限（优化版 - 避免递归遍历大量文件） ==========
+    # 优化说明：
+    # 1. 容器以 root 身份运行，通过 HOME=/home/user 设置环境变量
+    # 2. root 用户可以访问任何文件，不需要递归 chown
+    # 3. 只需要确保关键目录的基本权限即可
+    log "Fixing permissions for mounted directories (optimized)..."
 
     # 确保必要目录存在
     mkdir -p "$USER_HOME/.cache" /app /tmp/mesa_shader_cache "${CONTAINER_LOGS_DIR:-/app/container-logs}"
 
-    # 修复 /home/user 目录的所有者（重要：当宿主机挂载空目录时）
-    log "Fixing ownership for /home/user and mounted directories..."
-    chown -R user:user "$USER_HOME" 2>/dev/null || true
-    chown -R user:user /app "${CONTAINER_LOGS_DIR:-/app/container-logs}" 2>/dev/null || true
-    chown -R user:user /tmp/mesa_shader_cache 2>/dev/null || true
+    # ========== 方案 1: 只修复顶层目录所有权（非递归，<0.1秒） ==========
+    log "Fixing ownership for top-level directories (non-recursive)..."
+    chown user:user "$USER_HOME" 2>/dev/null || true
+    chown user:user "$USER_HOME/.config" 2>/dev/null || true
+    chown user:user "$USER_HOME/.cache" 2>/dev/null || true
+    chown user:user "$USER_HOME/Desktop" 2>/dev/null || true
 
-    # 修复权限
-    log "Fixing permissions..."
-    chmod -R u+rwX /app "$USER_HOME/.cache" 2>/dev/null || true
+    # ========== 方案 2: 只递归修复 XFCE 配置目录（文件少，~0.1秒） ==========
+    # XFCE 配置文件需要正确的所有者才能被 xfce4-session 正确加载
+    # 同时设置 other 读权限让 root 用户也能访问（一次性完成，避免重复遍历）
+    if [ -d "$USER_HOME/.config/xfce4" ]; then
+        find "$USER_HOME/.config/xfce4" \( -type f -o -type d \) \
+            -exec chown user:user {} + \
+            -exec chmod o+rX {} + 2>/dev/null || true
+        log_success "  XFCE config ownership and permissions fixed"
+    fi
 
-    # 对于可能无法 chown 的挂载目录，尝试添加 other 权限
-    chmod -R o+rX /app 2>/dev/null || true
+    # ========== 方案 3: 通过 chmod 让 root 用户也能访问（容器内以 root 运行） ==========
+    # 由于容器以 root 运行，只需要确保 other 有读权限即可
+    # 为了安全性和性能，只对必要的目录递归处理
+    log "Setting read permissions for root access..."
 
-    # 确保 bin 目录下的文件可执行
-    [ -d /app/bin ] && chmod -R a+x /app/bin 2>/dev/null || true
+    # Desktop 目录递归处理（文件少）
+    if [ -d "$USER_HOME/Desktop" ]; then
+        chmod -R o+rX "$USER_HOME/Desktop" 2>/dev/null || true
+    fi
 
-    log_success "Permissions fixed"
+    # .cache 和 .local 可能包含大量文件，只修复顶层目录（非递归）
+    for dir in "$USER_HOME/.cache" "$USER_HOME/.local" "$USER_HOME/.config"; do
+        if [ -d "$dir" ]; then
+            chmod o+rX "$dir" 2>/dev/null || true
+        fi
+    done
+
+    # ========== 保护敏感目录（如果存在）==========
+    # 确保 SSH 私钥等敏感文件权限严格
+    if [ -d "$USER_HOME/.ssh" ]; then
+        chmod 700 "$USER_HOME/.ssh" 2>/dev/null || true
+        find "$USER_HOME/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
+        log_success "  .ssh directory protected (700/600)"
+    fi
+
+    # ========== /app 目录权限（已在 Dockerfile 中设置，无需 chown） ==========
+    # 只确保 bin 目录可执行（使用 find 避免 glob 展开问题）
+    if [ -d /app/bin ]; then
+        find /app/bin -type f -exec chmod a+x {} + 2>/dev/null || true
+        log_success "  /app/bin executables set"
+    fi
+
+    # ========== Mesa 着色器缓存（使用 755 权限，符合最小权限原则） ==========
+    chmod 755 /tmp/mesa_shader_cache 2>/dev/null || true
+
+    log_success "Permissions fixed (optimized - no recursive chown on large directories)"
 
     # ========== 设置渲染相关环境变量（防止花屏）==========
     # 将 Mesa 着色器缓存移到 /tmp（不受 /home/user 挂载影响）
     export MESA_SHADER_CACHE_DIR="/tmp/mesa_shader_cache"
     export MESA_GLSL_CACHE_DIR="/tmp/mesa_shader_cache"
-    mkdir -p /tmp/mesa_shader_cache
-    chmod 777 /tmp/mesa_shader_cache
+    # 注意：目录创建和权限设置已在上面的权限修复部分完成 (Line 473, 516)
 
     # 将 X 认证文件移到 /tmp
     export XAUTHORITY="/tmp/.Xauthority"
 
     log_success "Mesa shader cache configured: /tmp/mesa_shader_cache"
 
-    # ========== 🖼️ 自定义壁纸替换（管理员配置）==========
-    # 该目录由主容器挂载，用户无法直接修改，只有管理员可控制
-    # 使用方法：在 docker-compose.yml 中挂载 - ./assets:/app/assets:ro
-    # 将 wallpaper.jpeg 同时应用到：
-    #   1. XFCE 桌面壁纸: /usr/share/backgrounds/xfce/wallpaper.jpeg
-    #   2. noVNC 网页背景: /opt/noVNC/app/images/bg.jpg
-
-    local CUSTOM_WALLPAPER="/app/assets/wallpaper.jpeg"
-    local XFCE_WALLPAPER="/usr/share/backgrounds/xfce/wallpaper.jpeg"
-    local NOVNC_BG="/opt/noVNC/app/images/bg.jpg"
-
-    if [ -f "$CUSTOM_WALLPAPER" ]; then
-        log "Found custom wallpaper at $CUSTOM_WALLPAPER, applying to XFCE and noVNC..."
-
-        # 1. 应用到 XFCE 桌面
-        if [ ! -f "${XFCE_WALLPAPER}.original" ]; then
-            cp "$XFCE_WALLPAPER" "${XFCE_WALLPAPER}.original" 2>/dev/null || true
-        fi
-        cp "$CUSTOM_WALLPAPER" "$XFCE_WALLPAPER"
-        log_success "XFCE wallpaper applied: $CUSTOM_WALLPAPER -> $XFCE_WALLPAPER"
-
-        # 2. 应用到 noVNC 网页背景（同一图片，不同文件名）
-        if [ ! -f "${NOVNC_BG}.original" ]; then
-            cp "$NOVNC_BG" "${NOVNC_BG}.original" 2>/dev/null || true
-        fi
-        cp "$CUSTOM_WALLPAPER" "$NOVNC_BG"
-        log_success "noVNC background applied: $CUSTOM_WALLPAPER -> $NOVNC_BG"
-    else
-        log "No custom wallpaper found at $CUSTOM_WALLPAPER (using defaults)"
-    fi
+    # ========== 🖼️ 自定义壁纸替换已提前执行 ==========
+    # 壁纸替换逻辑已移到 xfce4-desktop.xml 加载之前执行（见本函数开头）
+    # 这样可以确保 xfdesktop 启动时就能读取到正确的壁纸文件
 }
 
 function start_vnc_services() {
     log "Starting VNC services (as root)..."
 
-	# 等待X11服务完全启动
-	counter=0
-	while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
-		sleep 0.5
-		let counter++
-		if ((counter > 30)); then
-			log "X11 not ready, skipping VNC startup"
-			return 1
-		fi
-	done
+	# 注意：调用方（主启动子 shell）已通过 xdpyinfo 确认 X11 就绪
+	# 此处不再重复等待 X11，直接检查 Xvnc 端口
 
-	log "X11 is ready, starting VNC..."
-
-	# 停止可能存在的VNC服务
-	pkill x11vnc || true
-
-	# 等待进程完全停止（智能等待，最长 3 秒）
-	wait_for_process_exit "x11vnc" 3 || log_warn "x11vnc 进程终止超时"
-
-	# 启动x11vnc服务器 (后台运行，以 root 身份)
-	export DISPLAY=:0
-	nohup x11vnc -bg -display :0 -forever -wait 50 -shared -rfbport 5900 -nopw 2>/tmp/x11vnc_stderr.log >/dev/null &
-
-	# 等待 x11vnc 端口就绪（智能等待，最长 5 秒）
+	# 1. 等待 Xvnc 端口 5900 就绪（Xvnc 在 start_display_and_desktop 中启动）
+	#    如果 5900 不可用，noVNC 代理必然连接失败，直接 fail fast
 	if wait_for_port localhost 5900 5; then
-		log_success "x11vnc port 5900 is ready"
+		log_success "Xvnc port 5900 is ready"
 	else
-		log_warn "x11vnc port 5900 not ready within timeout"
-	fi
-
-	# 启动noVNC代理 (后台运行，以 root 身份)
-	cd /opt/noVNC/utils
-	nohup ./novnc_proxy --vnc localhost:5900 --listen 6080 --web /opt/noVNC > /tmp/novnc.log 2>&1 &
-	cd -
-
-	# 等待 noVNC 端口就绪（智能等待，最长 5 秒）
-	if wait_for_port localhost 6080 5; then
-		log_success "noVNC port 6080 is ready"
-	else
-		log_warn "noVNC port 6080 not ready within timeout"
-	fi
-
-	# 检查VNC服务状态
-	vnc_running=false
-	novnc_running=false
-
-	# 检查x11vnc进程
-	if pgrep -x x11vnc >/dev/null 2>&1; then
-		vnc_running=true
-		log_success "x11vnc server started on port 5900"
-	else
-		echo "✗ x11vnc server failed to start"
-		echo "Error log:"
-		cat /tmp/x11vnc_stderr.log 2>/dev/null || echo 'No error log found'
-	fi
-
-	# 检查noVNC端口
-	if netstat -tuln 2>/dev/null | grep -q ":6080 "; then
-		novnc_running=true
-		log_success "noVNC proxy started on port 6080"
-		echo "  VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
-	else
-		echo "✗ noVNC proxy failed to start"
-		echo "Error log:"
-		cat /tmp/novnc.log 2>/dev/null || echo 'No error log found'
-	fi
-
-	if [ "$vnc_running" = true ] && [ "$novnc_running" = true ]; then
-		log_success "VNC services started successfully!"
-		# 🆕 写入 noVNC 端口就绪标记（不是最终的 VNC 就绪标记）
-		# 最终的 /tmp/vnc_ready 由 wait_and_write_vnc_ready_marker() 在壁纸也就绪后写入
-		echo "$(date +%s)" > /tmp/novnc_port_ready
-		log_success "noVNC port ready marker written to /tmp/novnc_port_ready"
-		return 0
-	else
-		echo "✗ VNC services failed to start properly"
+		log_error "Xvnc port 5900 not ready within timeout, cannot start noVNC"
 		return 1
 	fi
+
+	# 2. 启动 noVNC 代理（使用绝对路径，避免 cd 污染日志输出）
+	if ! pgrep -f "novnc_proxy" >/dev/null 2>&1; then
+		nohup /opt/noVNC/utils/novnc_proxy \
+			--vnc localhost:5900 \
+			--listen 6080 \
+			--web /opt/noVNC \
+			--heartbeat 30 \
+			> /tmp/novnc.log 2>&1 &
+	fi
+
+	# 3. 等待 noVNC 端口就绪（最长 20 秒）
+	if ! wait_for_port localhost 6080 20; then
+		log_error "noVNC port 6080 not ready within timeout"
+		log_error "noVNC error log:"
+		tail -20 /tmp/novnc.log 2>/dev/null || echo 'No error log found'
+		return 1
+	fi
+	log_success "noVNC port 6080 is listening"
+
+	# 4. 验证 WebSocket 代理真正可用（最长 10 秒）
+	#    这是写入 novnc_port_ready 标记的硬性前置条件
+	#    如果 WebSocket 升级 (101) 不通过，说明 /websockify 路径不可用
+	#    此时绝不能写入标记，否则前端会认为 novnc_ready=true 但实际连不上
+	if ! wait_for_novnc_ready 10; then
+		log_error "noVNC WebSocket service not ready, will NOT write ready marker"
+		log_error "noVNC error log:"
+		tail -20 /tmp/novnc.log 2>/dev/null || echo 'No error log found'
+		return 1
+	fi
+	log_success "noVNC WebSocket service is fully ready"
+
+	# 5. 所有检查通过，写入 noVNC 端口就绪标记
+	# 此标记仅在以下条件全部满足时写入：
+	#   - Xvnc 端口 5900 就绪 (VNC 服务器可用)
+	#   - noVNC 端口 6080 就绪 (HTTP 服务可用)
+	#   - WebSocket /websockify 升级返回 101 (浏览器可以真正连接)
+	# 最终的 /tmp/vnc_ready 由 wait_and_write_vnc_ready_marker() 在壁纸+桌面也就绪后写入
+	log_success "Xvnc server is running on port 5900"
+	log_success "noVNC proxy started on port 6080"
+	echo "  VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
+	echo "$(date +%s)" > /tmp/novnc_port_ready
+	log_success "noVNC port ready marker written to /tmp/novnc_port_ready"
+	return 0
 }
 
 function start_display_and_desktop() {
@@ -621,7 +725,7 @@ function start_display_and_desktop() {
 
 	# 清理可能存在的X11锁文件和进程
 	rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 /tmp/.Xauthority /tmp/dbus-session-env
-	pkill -f "Xvfb :0" || true
+	pkill -f "Xvnc :0" || true
 	pkill -f "xfce4-session" || true
 	pkill -f "dbus-daemon" || true
 	pkill -f "fcitx5" || true
@@ -632,11 +736,15 @@ function start_display_and_desktop() {
     touch /tmp/dbus-session-env
     chmod 666 /tmp/dbus-session-env
 
-    # ========== 优化：尽早启动 Xvfb (后台) ==========
-    # Xvfb 启动需要时间，将其提前到 Cleanup/DBus 之前，利用这段时间进行初始化
+    # ========== 优化：尽早启动 Xvnc (后台) ==========
+    # Xvnc 是 TigerVNC 内置的 X server + VNC 服务器
+    # 使用 Xvnc 替代 Xvfb + x11vnc 的组合，简化架构
     # 色深使用 24 位，避免某些 Linux 内核上出现花屏
-    log "Starting Xvfb :0 (background initialization)..."
-    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvfb :0 -ac -screen 0 1920x1080x24 -dpi 96 -nolisten tcp -nolisten unix >/dev/null 2>&1 &
+    # FrameRate 30: 限制每秒最大帧数 (默认60)，降低到30可减少约50%带宽，日常使用无明显差异
+    # 注意: CompressLevel/QualityLevel 是 VNC 客户端参数，不是 Xvnc 服务端参数
+    #       真正的压缩配置在 noVNC 客户端侧 (rfb.js 的 compressionLevel/qualityLevel)
+    log "Starting Xvnc :0 (background initialization)..."
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared >/tmp/xvnc.log 2>&1 &
 
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
@@ -727,37 +835,38 @@ function start_display_and_desktop() {
 		log_success "D-Bus socket permissions updated for root access"
 	fi
 
-	# 启动 D-Bus 系统总线
-    log "Starting D-Bus system bus..."
-	mkdir -p /var/run/dbus
-	dbus-daemon --system --fork
+	# ========== 优化：D-Bus system bus + PolicyKit 后台启动 ==========
+	# 这两个服务不是 VNC/XFCE 的前置依赖，串行等待会浪费 ~10 秒
+	# 改为后台启动，不阻塞 Xvnc → fcitx5 → xfdesktop 的关键路径
+	(
+		log "Starting D-Bus system bus..."
+		mkdir -p /var/run/dbus
+		dbus-daemon --system --fork
 
-	# 等待 D-Bus 系统总线 socket 就绪（智能等待，最长 5 秒）
-	if wait_for_file /var/run/dbus/system_bus_socket 5; then
-		log_success "D-Bus system bus socket ready"
-	else
-		log_warn "D-Bus system bus socket not ready"
-	fi
+		if wait_for_file /var/run/dbus/system_bus_socket 5; then
+			log_success "D-Bus system bus socket ready"
+		else
+			log_warn "D-Bus system bus socket not ready"
+		fi
 
-	# 启动 PolicyKit 守护进程（配置为不需要认证）
-    log "Starting PolicyKit daemon..."
-	/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
+		log "Starting PolicyKit daemon..."
+		/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
 
-	# 等待 PolicyKit 进程启动（智能等待，最长 5 秒）
-	if wait_for_process "polkitd" 5; then
-		log_success "PolicyKit daemon started"
-	else
-		log_warn "PolicyKit daemon not started"
-	fi
+		if wait_for_process "polkitd" 5; then
+			log_success "PolicyKit daemon started"
+		else
+			log_warn "PolicyKit daemon not started"
+		fi
+	) &
 
-    # 等待Xvfb启动（此时应该已经差不多就绪了）
+    # 等待Xvnc启动（此时应该已经差不多就绪了）
     log "Waiting for X11 to be ready..."
     counter=0
     while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
         sleep 0.1
         let counter++
         if ((counter > 100)); then
-            echo "Failed to start Xvfb"
+            echo "Failed to start Xvnc"
             return 1
         fi
     done
@@ -895,7 +1004,19 @@ function apply_xfce_wallpaper() {
         fi
     done
 
-    local WALLPAPER_PATH="/usr/share/backgrounds/xfce/wallpaper.jpeg"
+    # 壁纸路径：支持通过环境变量 CUSTOM_WALLPAPER_PATH 自定义
+    # 如果自定义壁纸不存在，使用容器内的默认壁纸
+    local CUSTOM_WALLPAPER="${CUSTOM_WALLPAPER_PATH:-}"
+    if [ -n "$CUSTOM_WALLPAPER" ] && [ -f "$CUSTOM_WALLPAPER" ]; then
+        local WALLPAPER_PATH="$CUSTOM_WALLPAPER"
+        log "Using custom wallpaper: $WALLPAPER_PATH"
+    else
+        local WALLPAPER_PATH="/usr/share/backgrounds/xfce/wallpaper.jpeg"
+        if [ -n "$CUSTOM_WALLPAPER" ]; then
+            log_warn " Custom wallpaper not found: $CUSTOM_WALLPAPER, using default"
+        fi
+    fi
+
     if [ ! -f "$WALLPAPER_PATH" ]; then
         log_warn " Wallpaper not found: $WALLPAPER_PATH"
         return 1
@@ -904,21 +1025,56 @@ function apply_xfce_wallpaper() {
     log_success "  Setting wallpaper: $WALLPAPER_PATH"
 
     # 获取当前的 monitor 配置（XFCE 可能使用不同的名称）
-    local monitors=$(DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image' | head -5)
+    # 动态获取可能会漏掉一些配置，所以最后会兜底设置常用路径
+    local monitors=$(DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'workspace0/last-image' | head -10)
 
     if [ -n "$monitors" ]; then
         # 对于每个找到的 monitor 配置设置壁纸
         echo "$monitors" | while read monitor_path; do
             DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$monitor_path" -s "$WALLPAPER_PATH" 2>/dev/null || true
+            # 同时设置 image-style (5 = 缩放)
+            local style_path=$(echo "$monitor_path" | sed 's/last-image/image-style/')
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$style_path" -n -t int -s 5 2>/dev/null || true
         done
-    else
-        # 直接设置常用的 monitor 路径
-        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
-        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/workspace0/last-image -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
     fi
 
-    # 设置壁纸样式（5 = 缩放）
-    DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitorscreen/workspace0/image-style -n -t int -s 5 2>/dev/null || true
+    # 兜底：确保所有常用的 monitor 路径都设置壁纸
+    # 包括根级别的 monitor 配置（如 monitor0/monitor1）
+    # 设置所有 workspace (0-3) 的壁纸
+
+    # 1. 先设置根级别的 monitor 路径（这些优先级更高）
+    for monitor_path in \
+        "/backdrop/screen0/monitor0/last-image" \
+        "/backdrop/screen0/monitor1/last-image"; do
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$monitor_path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+    done
+
+    # 2. 设置所有 workspace 级别的路径
+    for workspace in 0 1 2 3; do
+        for monitor_path in \
+            "/backdrop/screen0/monitorscreen/workspace${workspace}/last-image" \
+            "/backdrop/screen0/monitor0/workspace${workspace}/last-image" \
+            "/backdrop/screen0/monitor1/workspace${workspace}/last-image" \
+            "/backdrop/screen0/monitorVNC-0/workspace${workspace}/last-image"; do
+            DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$monitor_path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+        done
+    done
+
+    # 设置 image-path/image-show (某些 monitor 使用这种配置)
+    for monitor_name in monitor0 monitor1; do
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-path" -n -t string -s "$WALLPAPER_PATH" 2>/dev/null || true
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "/backdrop/screen0/${monitor_name}/image-show" -n -t bool -s true 2>/dev/null || true
+    done
+
+    # 设置所有找到的 image-style
+    for style_path in \
+        "/backdrop/screen0/monitorscreen/workspace0/image-style" \
+        "/backdrop/screen0/monitorVNC-0/workspace0/image-style" \
+        "/backdrop/screen0/monitorVNC-0/workspace1/image-style" \
+        "/backdrop/screen0/monitorVNC-0/workspace2/image-style" \
+        "/backdrop/screen0/monitorVNC-0/workspace3/image-style"; do
+        DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -p "$style_path" -n -t int -s 5 2>/dev/null || true
+    done
 
     log_success "XFCE wallpaper config applied"
 
@@ -982,23 +1138,128 @@ function apply_xfce_wallpaper() {
 }
 
 function check_vnc_health() {
-    # 检查VNC服务健康状态 (as root)
+    # 检查 VNC 服务健康状态 (as root)
+    # 返回值：0=健康, 1=noVNC 异常(Xvnc 正常), 2=Xvnc 崩溃(需要重建整个显示栈)
     if [ "$VNC_AUTO_START" = "true" ]; then
-        # 检查x11vnc进程
-        if ! pgrep -x x11vnc >/dev/null 2>&1; then
-            log_warn " x11vnc process not running, attempting restart..."
-            return 1
+        # 检查 Xvnc 进程（根基：X11 server + VNC server）
+        if ! pgrep -f "Xvnc" >/dev/null 2>&1; then
+            log_warn "Xvnc process not running (X11 display lost)"
+            return 2
         fi
 
-        # 检查noVNC端口
+        # 检查 noVNC 代理端口
         if ! netstat -tuln 2>/dev/null | grep -q ":6080 "; then
-            log_warn " noVNC proxy not listening on port 6080, attempting restart..."
+            log_warn "noVNC proxy not listening on port 6080"
             return 1
         fi
 
-        log_success "VNC services are healthy"
         return 0
     fi
+    return 0
+}
+
+# 重建整个显示栈：Xvnc + D-Bus session + fcitx5 + xfdesktop + xfce4-session + noVNC
+# 当 Xvnc 崩溃时调用，因为 Xvnc 死亡会导致所有 X11 客户端进程一起挂掉
+function restart_full_display_stack() {
+    log_error "Xvnc crashed, rebuilding full display stack..."
+
+    # 1. 清除所有就绪标记
+    rm -f /tmp/vnc_ready /tmp/novnc_port_ready /tmp/wallpaper_ready
+
+    # 2. 清理残留进程（Xvnc 死后这些都已断连，但可能变僵尸）
+    pkill -f "Xvnc :0" 2>/dev/null || true
+    pkill -f "xfce4-session" 2>/dev/null || true
+    pkill -f "xfdesktop" 2>/dev/null || true
+    pkill -f "fcitx5" 2>/dev/null || true
+    pkill -f "novnc_proxy" 2>/dev/null || true
+    pkill -f "xfce4-panel" 2>/dev/null || true
+    pkill -f "xfwm4" 2>/dev/null || true
+    pkill -f "xfsettingsd" 2>/dev/null || true
+    sleep 2
+
+    # 3. 清理 X11 锁文件
+    rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+
+    # 4. 重启 Xvnc
+    log "Restarting Xvnc :0 ..."
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache \
+        Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared \
+        >/tmp/xvnc.log 2>&1 &
+
+    # 5. 等待 X11 display 就绪
+    local counter=0
+    while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do
+        sleep 0.2
+        counter=$((counter + 1))
+        if [ $counter -ge 50 ]; then
+            log_error "Xvnc restart failed: X11 display not ready after 10s"
+            return 1
+        fi
+    done
+    log_success "Xvnc restarted, X11 display :0 ready"
+
+    # 6. 设置背景色（避免纯黑）
+    DISPLAY=:0 xsetroot -solid "#1e1e1e" 2>/dev/null || true
+
+    # 7. 获取 D-Bus session 地址
+    local DBUS_ADDR=""
+    if [ -f /tmp/dbus-session-env ]; then
+        source /tmp/dbus-session-env
+        DBUS_ADDR="$DBUS_SESSION_BUS_ADDRESS"
+    fi
+
+    # 8. 重启 fcitx5 输入法
+    env HOME=/home/user DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        LANG=C.UTF-8 LC_ALL=C.UTF-8 LC_CTYPE=C.UTF-8 \
+        GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx INPUT_METHOD=fcitx \
+        fcitx5 -d --replace >/tmp/fcitx5-startup.log 2>&1 &
+
+    # 9. 重启 xfdesktop（壁纸渲染）
+    env DISPLAY=:0 HOME=/home/user XDG_CURRENT_DESKTOP=XFCE \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        xfdesktop &
+
+    # 10. 重启 xfce4-session（桌面会话管理器）
+    env DISPLAY=:0 HOME=/home/user XDG_CURRENT_DESKTOP=XFCE XDG_SESSION_DESKTOP=xfce \
+        XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS="${DBUS_ADDR}" \
+        LANG=C.UTF-8 LC_ALL=C.UTF-8 LC_CTYPE=C.UTF-8 \
+        GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx INPUT_METHOD=fcitx \
+        xfce4-session &
+
+    # 11. 等待 xfdesktop 启动
+    if wait_for_process "xfdesktop" 10; then
+        log_success "xfdesktop restarted"
+    else
+        log_warn "xfdesktop not detected after restart"
+    fi
+
+    # 12. 重启 noVNC 代理
+    nohup /opt/noVNC/utils/novnc_proxy \
+        --vnc localhost:5900 --listen 6080 --web /opt/noVNC \
+        --heartbeat 30 \
+        > /tmp/novnc.log 2>&1 &
+
+    # 13. 验证 noVNC 端口 + WebSocket
+    if wait_for_port localhost 6080 20 && wait_for_novnc_ready 10; then
+        echo "$(date +%s)" > /tmp/novnc_port_ready
+        log_success "noVNC proxy restarted and WebSocket verified"
+    else
+        log_error "noVNC restart failed after Xvnc recovery"
+        return 1
+    fi
+
+    # 14. 重新应用壁纸（后台，不阻塞）
+    (
+        apply_xfce_wallpaper
+    ) &
+
+    # 15. 重启 VNC 就绪标记轮询（后台）
+    # novnc_port_ready 已写入，等 wallpaper_ready + xfdesktop 进程就绪后写 vnc_ready
+    (
+        wait_and_write_vnc_ready_marker
+    ) &
+
+    log_success "Full display stack rebuilt successfully"
     return 0
 }
 
@@ -1185,6 +1446,7 @@ function wait_and_write_vnc_ready_marker() {
     while true; do
         local novnc_ready=false
         local wallpaper_ready=false
+        local desktop_ready=false
 
         # 检查 noVNC 端口就绪标记
         if [ -f /tmp/novnc_port_ready ]; then
@@ -1196,10 +1458,16 @@ function wait_and_write_vnc_ready_marker() {
             wallpaper_ready=true
         fi
 
-        # 两者都就绪时，写入最终的 VNC 就绪标记
-        if [ "$novnc_ready" = true ] && [ "$wallpaper_ready" = true ]; then
+        # 检查 xfdesktop 桌面进程是否在运行
+        # 确保桌面环境已加载，避免用户连上看到灰屏
+        if pgrep -f "xfdesktop" >/dev/null 2>&1; then
+            desktop_ready=true
+        fi
+
+        # 三者都就绪时，写入最终的 VNC 就绪标记
+        if [ "$novnc_ready" = true ] && [ "$wallpaper_ready" = true ] && [ "$desktop_ready" = true ]; then
             echo "$(date +%s)" > /tmp/vnc_ready
-            log_success "VNC ready marker written to /tmp/vnc_ready (noVNC + wallpaper both ready, took ${elapsed}s)"
+            log_success "VNC ready marker written to /tmp/vnc_ready (noVNC + wallpaper + desktop all ready, took ${elapsed}s)"
             log_success "  noVNC port ready at: $(cat /tmp/novnc_port_ready)"
             log_success "  Wallpaper ready at: $(cat /tmp/wallpaper_ready)"
             return 0
@@ -1207,7 +1475,7 @@ function wait_and_write_vnc_ready_marker() {
 
         # 日志输出当前状态（每 30 秒输出一次，减少日志量）
         if ((elapsed % 30 == 0)) && ((elapsed > 0)); then
-            log "Waiting for VNC ready... noVNC=$novnc_ready, wallpaper=$wallpaper_ready (${elapsed}s elapsed)"
+            log "Waiting for VNC ready... noVNC=$novnc_ready, wallpaper=$wallpaper_ready, desktop=$desktop_ready (${elapsed}s elapsed)"
         fi
 
         sleep $interval
@@ -1470,7 +1738,7 @@ initialize_user_home
 
 # ========== MCP Proxy 服务在 X11 就绪后启动 ==========
 # 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
-# 因此必须等待 Xvfb 启动后才能启动 MCP Proxy
+# 因此必须等待 Xvnc 启动后才能启动 MCP Proxy
 # MCP Proxy 的启动已移动到下方的 VNC 后台任务中（X11 就绪后）
 
 # 首先启动显示服务和桌面环境
@@ -1506,10 +1774,13 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 
     # 1. VNC 服务（后台）
     (
-        start_vnc_services
-        log_success "VNC services started successfully!"
-        log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
-        log_success "Direct VNC port: 5900"
+        if start_vnc_services; then
+            log_success "VNC services started successfully!"
+            log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
+            log_success "Direct VNC port: 5900"
+        else
+            log_error "VNC services failed to start, /tmp/novnc_port_ready will NOT be written"
+        fi
     ) &
     vnc_pid=$!
 
@@ -1556,15 +1827,46 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
         sleep 30
 
         # 检查 VNC 服务健康状态
-        if ! check_vnc_health; then
-            echo "VNC服务异常，正在重启..."
-            # 停止现有服务
-            pkill x11vnc || true
+        # 返回值: 0=健康, 1=noVNC 异常, 2=Xvnc 崩溃
+        # 注意：此处不能用 local，因为当前在子 shell 中而非函数内
+        check_vnc_health
+        vnc_status=$?
+
+        if [ $vnc_status -eq 2 ]; then
+            # Xvnc 崩溃：整个显示栈需要重建
+            # Xvnc 是 X11 server + VNC server，它死了 = display :0 消失
+            # 所有连接到 :0 的进程（xfdesktop, xfce4-session, fcitx5 等）全部跟着死
+            # 只重启 noVNC 没用，因为 noVNC 连不上已死的 5900 端口
+            restart_full_display_stack || log_error "Full display stack restart failed"
+
+        elif [ $vnc_status -eq 1 ]; then
+            # 仅 noVNC 代理异常，Xvnc 仍在运行
+            log_warn "noVNC proxy is down, restarting..."
+            rm -f /tmp/vnc_ready /tmp/novnc_port_ready
+
             pkill -f novnc_proxy || true
-            # 等待进程终止（智能等待，最长 3 秒）
-            wait_for_process_exit "x11vnc" 3 || true
-            # 重新启动VNC服务
-            start_vnc_services
+            sleep 1
+
+            nohup /opt/noVNC/utils/novnc_proxy \
+                --vnc localhost:5900 \
+                --listen 6080 \
+                --web /opt/noVNC \
+                --heartbeat 30 \
+                > /tmp/novnc.log 2>&1 &
+
+            # 等待端口 + WebSocket 就绪后，重新写入标记
+            if wait_for_port localhost 6080 20 && wait_for_novnc_ready 10; then
+                echo "$(date +%s)" > /tmp/novnc_port_ready
+                # Xvnc 仍在运行，桌面进程应该也还在
+                if [ -f /tmp/wallpaper_ready ] && pgrep -f "xfdesktop" >/dev/null 2>&1; then
+                    echo "$(date +%s)" > /tmp/vnc_ready
+                    log_success "noVNC proxy restarted and verified successfully"
+                else
+                    log_warn "noVNC restarted but desktop not ready, waiting for marker task"
+                fi
+            else
+                log_error "noVNC restart failed: WebSocket not ready"
+            fi
         fi
 
         # ========== MCP Proxy 健康检查（使用 mcp-proxy health 工具）==========

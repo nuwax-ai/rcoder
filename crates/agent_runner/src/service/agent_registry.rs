@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, warn};
 
-// 导入工作线程池大小常量
-use crate::agent_runtime::WORKER_THREAD_POOL_SIZE;
+// 导入工作线程池大小相关函数
+use crate::agent_runtime::get_concurrency_limit;
 
 /// 全局 Agent 会话注册表（Arc 包装版本，用于 AcpSessionManager 注入）
 pub static AGENT_REGISTRY: LazyLock<Arc<AgentSessionRegistry>> =
@@ -668,8 +668,9 @@ impl AgentSessionRegistry {
     /// ```
     pub fn try_acquire_session_slot(&self) -> bool {
         let mut old = self.active_sessions_count.load(Ordering::Acquire);
+        let limit = get_concurrency_limit();
         loop {
-            if old >= WORKER_THREAD_POOL_SIZE {
+            if old >= limit {
                 return false;
             }
             match self.active_sessions_count.compare_exchange_weak(
@@ -682,7 +683,7 @@ impl AgentSessionRegistry {
                     debug!(
                         "🎯 [原子槽位] 成功获取槽位: {}/{}",
                         old + 1,
-                        WORKER_THREAD_POOL_SIZE
+                        limit
                     );
                     return true;
                 }

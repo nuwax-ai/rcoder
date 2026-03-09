@@ -3,6 +3,7 @@
 /temp
 /other
 .idea
+/logs
 
 .classpath
 project_workspace

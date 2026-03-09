@@ -42,7 +42,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 /// 启动清理超时时间（秒）
-/// 
+///
 /// 启动时使用较短的超时时间，快速清理遗留容器
 const STARTUP_CLEANUP_TIMEOUT_SECONDS: u64 = 5;
 
@@ -102,7 +102,7 @@ pub async fn startup_cleanup_containers(
 
     // 查找匹配模式的容器
     let matched_containers = docker_manager.list_containers_with_pattern(pattern).await?;
-    
+
     let total_found = matched_containers.len();
     info!("🔍 [STARTUP_CLEANUP] 找到 {} 个匹配的容器", total_found);
 
@@ -137,13 +137,14 @@ pub async fn startup_cleanup_containers(
             let docker_manager_clone = Arc::clone(docker_manager);
             let container_id_clone = container_id.clone();
             let task = tokio::spawn(async move {
-                let result = stop_container_startup_mode(&docker_manager_clone, &container_id_clone).await;
+                let result =
+                    stop_container_startup_mode(&docker_manager_clone, &container_id_clone).await;
                 (container_id_clone, container_name, result)
             });
             tasks.push(task);
         }
     }
-    
+
     // 等待所有任务完成
     for task in tasks {
         if let Ok((container_id, container_name, result)) = task.await {
@@ -151,21 +152,27 @@ pub async fn startup_cleanup_containers(
                 Ok(_) => {
                     successfully_removed += 1;
                     removed_container_ids.push(container_id.clone());
-                    info!("✅ [STARTUP_CLEANUP] 容器清理成功: container_id={}, name={}", 
-                          container_id, container_name);
+                    info!(
+                        "✅ [STARTUP_CLEANUP] 容器清理成功: container_id={}, name={}",
+                        container_id, container_name
+                    );
                 }
                 Err(e) => {
                     // 检查是否为409冲突错误
                     if is_409_conflict_error(&e) {
-                        info!("🔄 [STARTUP_CLEANUP] 容器已在删除中，跳过: container_id={}, name={}", 
-                              container_id, container_name);
+                        info!(
+                            "🔄 [STARTUP_CLEANUP] 容器已在删除中，跳过: container_id={}, name={}",
+                            container_id, container_name
+                        );
                         // 409错误不计入失败统计
                         successfully_removed += 1;
                         removed_container_ids.push(container_id);
                     } else {
                         failed_removals += 1;
-                        warn!("⚠️ [STARTUP_CLEANUP] 容器清理失败: container_id={}, name={}, error={}", 
-                              container_id, container_name, e);
+                        warn!(
+                            "⚠️ [STARTUP_CLEANUP] 容器清理失败: container_id={}, name={}, error={}",
+                            container_id, container_name, e
+                        );
                         failed_removals_details.push(ContainerRemovalFailure {
                             container_id,
                             container_name,
@@ -178,7 +185,7 @@ pub async fn startup_cleanup_containers(
     }
 
     let duration_ms = start_time.elapsed().as_millis() as u64;
-    
+
     info!(
         "🎯 [STARTUP_CLEANUP] 清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
         total_found, successfully_removed, failed_removals, duration_ms
@@ -274,16 +281,24 @@ pub async fn runtime_cleanup_container(
     docker_manager: &Arc<DockerManager>,
     container_id: &str,
 ) -> DockerResult<()> {
-    info!("🔥 [RUNTIME_CLEANUP] 开始停止容器: container_id={}", container_id);
+    info!(
+        "🔥 [RUNTIME_CLEANUP] 开始停止容器: container_id={}",
+        container_id
+    );
 
     match stop_container_runtime_mode(docker_manager, container_id).await {
         Ok(_) => {
-            info!("✅ [RUNTIME_CLEANUP] 容器停止成功: container_id={}", container_id);
+            info!(
+                "✅ [RUNTIME_CLEANUP] 容器停止成功: container_id={}",
+                container_id
+            );
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ [RUNTIME_CLEANUP] 容器停止失败: container_id={}, error={}", 
-                  container_id, e);
+            warn!(
+                "⚠️ [RUNTIME_CLEANUP] 容器停止失败: container_id={}, error={}",
+                container_id, e
+            );
             Err(e)
         }
     }
@@ -328,7 +343,10 @@ pub async fn runtime_cleanup_containers(
     docker_manager: &Arc<DockerManager>,
     container_ids: Vec<String>,
 ) -> DockerResult<CleanupResult> {
-    info!("🔥 [RUNTIME_CLEANUP] 开始批量清理容器: 数量={}", container_ids.len());
+    info!(
+        "🔥 [RUNTIME_CLEANUP] 开始批量清理容器: 数量={}",
+        container_ids.len()
+    );
     let start_time = Instant::now();
 
     let total_found = container_ids.len();
@@ -343,12 +361,13 @@ pub async fn runtime_cleanup_containers(
         let docker_manager_clone = Arc::clone(docker_manager);
         let container_id_clone = container_id.clone();
         let task = tokio::spawn(async move {
-            let result = stop_container_runtime_mode(&docker_manager_clone, &container_id_clone).await;
+            let result =
+                stop_container_runtime_mode(&docker_manager_clone, &container_id_clone).await;
             (container_id_clone, result)
         });
         tasks.push(task);
     }
-    
+
     // 等待所有任务完成
     for task in tasks {
         if let Ok((container_id, result)) = task.await {
@@ -356,12 +375,17 @@ pub async fn runtime_cleanup_containers(
                 Ok(_) => {
                     successfully_removed += 1;
                     removed_container_ids.push(container_id.clone());
-                    info!("✅ [RUNTIME_CLEANUP] 容器清理成功: container_id={}", container_id);
+                    info!(
+                        "✅ [RUNTIME_CLEANUP] 容器清理成功: container_id={}",
+                        container_id
+                    );
                 }
                 Err(e) => {
                     failed_removals += 1;
-                    warn!("⚠️ [RUNTIME_CLEANUP] 容器清理失败: container_id={}, error={}", 
-                          container_id, e);
+                    warn!(
+                        "⚠️ [RUNTIME_CLEANUP] 容器清理失败: container_id={}, error={}",
+                        container_id, e
+                    );
                     failed_removals_details.push(ContainerRemovalFailure {
                         container_id: container_id.clone(),
                         container_name: container_id.clone(), // 批量清理时可能不知道名称
@@ -373,7 +397,7 @@ pub async fn runtime_cleanup_containers(
     }
 
     let duration_ms = start_time.elapsed().as_millis() as u64;
-    
+
     info!(
         "🎯 [RUNTIME_CLEANUP] 批量清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
         total_found, successfully_removed, failed_removals, duration_ms
@@ -418,7 +442,8 @@ async fn stop_container_runtime_mode(
 
 /// 为所有启用的服务构建容器清理模式列表
 ///
-/// 从多镜像配置中获取所有启用的服务类型，并生成对应的容器名称模式
+/// 从多镜像配置中获取所有启用的服务类型，并生成对应的容器名称模式。
+/// 使用 ServiceImageConfig.container_prefix() 获取配置的前缀，确保与容器创建时使用的前缀一致。
 ///
 /// # Arguments
 ///
@@ -426,7 +451,7 @@ async fn stop_container_runtime_mode(
 ///
 /// # Returns
 ///
-/// 返回容器名称模式列表，如 `["rcoder-agent-*", "agent-runner-*"]`
+/// 返回容器名称模式列表，如 `["rcoder-agent-*", "rcoder-computer-agent-runner-*"]`
 ///
 /// # Examples
 ///
@@ -441,23 +466,21 @@ async fn stop_container_runtime_mode(
 pub fn get_container_patterns_for_enabled_services(
     multi_image_config: &shared_types::MultiImageConfig,
 ) -> Vec<String> {
-    shared_types::get_enabled_service_types(multi_image_config)
-        .into_iter()
-        .filter_map(|service_name| {
-            // 使用 parse() 并处理错误
-            match service_name.parse::<shared_types::ServiceType>() {
-                Ok(service_type) => {
-                    Some(format!("{}-*", service_type.container_prefix()))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "解析服务类型失败: {} - {:?}，跳过生成容器模式",
-                        service_name,
-                        e
-                    );
-                    None
-                }
-            }
+    // 直接遍历 services，获取启用的服务配置并使用其 container_prefix()
+    multi_image_config
+        .services
+        .values()
+        .filter(|config| config.enabled)
+        .map(|config| {
+            let prefix = config.container_prefix();
+            let pattern = format!("{}-*", prefix);
+            tracing::debug!(
+                "🔍 [CLEANUP_PATTERN] 服务类型: {:?}, 使用前缀: {}, 模式: {}",
+                config.service_type,
+                prefix,
+                pattern
+            );
+            pattern
         })
         .collect()
 }
@@ -535,8 +558,12 @@ pub async fn startup_cleanup_all_enabled_services(
                 aggregated_result.successfully_removed += result.successfully_removed;
                 aggregated_result.failed_removals += result.failed_removals;
                 aggregated_result.skipped_running += result.skipped_running;
-                aggregated_result.removed_container_ids.extend(result.removed_container_ids);
-                aggregated_result.failed_removals_details.extend(result.failed_removals_details);
+                aggregated_result
+                    .removed_container_ids
+                    .extend(result.removed_container_ids);
+                aggregated_result
+                    .failed_removals_details
+                    .extend(result.failed_removals_details);
             }
             Ok(Err(e)) => {
                 warn!("清理服务容器失败: {}", e);

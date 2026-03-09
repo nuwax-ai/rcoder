@@ -5,13 +5,100 @@ use crate::CancelNotificationRequestWrapper;
 // 导出 agent_worker 相关类型和函数
 // AgentRequest 是 SACP 版本的新类型，LocalSetAgentRequest 是向后兼容别名
 #[allow(deprecated)]
-pub use acp_agent::{AgentRequest, LocalSetAgentRequest, agent_worker_with_heartbeat};
+pub use acp_agent::{
+    AgentRequest, LocalSetAgentRequest, agent_worker_with_heartbeat, set_unlimited_mode,
+};
 use shared_types::AgentLifecycleGuard;
 // SACP 类型导入
-use sacp::schema::{PromptRequest, SessionId};
+#[cfg(feature = "proxy")]
+use crate::config::ProxyConfig;
 use dashmap::DashMap;
+#[cfg(feature = "proxy")]
+use rcoder_proxy::{PingoraServerManager, ProxyConfig as PingoraProxyConfig};
+use sacp::schema::{PromptRequest, SessionId};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
+#[cfg(feature = "proxy")]
+use tracing::{error, info};
+
+/// Pingora 启动结果
+///
+/// 持有关闭信号的发送端，`stop()` 时直接发送信号，无需 Mutex 锁。
+#[cfg(feature = "proxy")]
+pub struct PingoraStartResult {
+    /// 关闭信号发送端
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(feature = "proxy")]
+impl PingoraStartResult {
+    /// 停止 Pingora 服务器
+    pub async fn stop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// 启动 Pingora 代理服务
+///
+/// 封装 Pingora 的创建和启动逻辑，供 main.rs 和 http_server/start.rs 复用。
+/// shutdown 通道在外部创建，`stop()` 直接发送信号，不经过 Mutex，消除死锁风险。
+#[cfg(feature = "proxy")]
+#[must_use]
+pub fn start_pingora(
+    proxy_config: &ProxyConfig,
+    shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
+) -> PingoraStartResult {
+    info!(
+        "🚀 启动 Pingora 反向代理服务，监听端口: {}",
+        proxy_config.listen_port
+    );
+    info!(
+        "🔄 代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/{}/health",
+        proxy_config.default_backend_port
+    );
+
+    let pingora_config = PingoraProxyConfig {
+        listen_port: proxy_config.listen_port,
+        default_backend_port: proxy_config.default_backend_port,
+        backend_host: proxy_config.backend_host.clone(),
+        port_param: proxy_config.port_param.clone(),
+        config_file: None,
+        verbose: false,
+    };
+
+    // 创建 Pingora 服务器管理器
+    let mut server_manager =
+        PingoraServerManager::new(pingora_config).with_api_key_manager(shared_api_key_manager);
+
+    let pingora_service = server_manager.service();
+
+    // 启动健康检查循环（按配置）
+    if proxy_config.health_check.enabled {
+        let hc = &proxy_config.health_check;
+        pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
+    }
+
+    // 在外部创建 shutdown 通道，避免通过 Mutex 发送信号导致死锁
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+    // 在后台任务中启动 Pingora（直接 move server_manager，无需 Arc<Mutex<>>）
+    tokio::spawn(async move {
+        if let Err(e) = server_manager.start(shutdown_rx).await {
+            error!("Pingora 代理服务器启动失败: {}", e);
+        }
+    });
+
+    info!(
+        "✅ Pingora 代理服务已启动在端口 {}",
+        proxy_config.listen_port
+    );
+
+    PingoraStartResult {
+        shutdown_tx: Some(shutdown_tx),
+    }
+}
 
 /// 会话级别的 request_id 上下文映射（project_id -> request_id）
 /// 用于在 session_notification 回调中获取当前请求的 request_id
