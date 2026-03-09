@@ -264,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
     let api_key_config = Arc::new(ArcSwap::from_pointee(config.api_key_auth.clone()));
 
     // 启动代理服务（如果启用）
-    let (proxy_handle, pingora_service_opt) = if let Some(proxy_config) = &config.proxy_config {
+    let (proxy_handle, pingora_service_opt, _pingora_shutdown_tx) = if let Some(proxy_config) = &config.proxy_config {
         info!(
             "启动 Pingora 反向代理服务，监听端口: {}",
             proxy_config.listen_port
@@ -316,9 +316,10 @@ async fn main() -> anyhow::Result<()> {
 
         // 启动 Pingora 服务器（如果启动失败，直接退出程序）
         info!("🚀 [Pingora] 启动 Pingora 服务器...");
+        let (pingora_shutdown_tx, pingora_shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             info!("📍 [Pingora] 正在调用 server_manager.start()...");
-            if let Err(e) = server_manager.start().await {
+            if let Err(e) = server_manager.start(pingora_shutdown_rx).await {
                 error!("❌ [Pingora] Pingora 代理服务器启动失败，程序退出: {:?}", e);
                 std::process::exit(1);
             }
@@ -327,10 +328,10 @@ async fn main() -> anyhow::Result<()> {
 
         info!("✅ [Pingora] 后台任务已启动");
 
-        (Some(handle), Some(pingora_service))
+        (Some(handle), Some(pingora_service), Some(pingora_shutdown_tx))
     } else {
         info!("⚠️  [Pingora] proxy_config 未配置，跳过 Pingora 启动");
-        (None, None)
+        (None, None, None)
     };
 
     // 设置 Ctrl+C 信号处理

@@ -73,6 +73,14 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
         return;
     }
 
+    // 预先收集运行中容器的 user_id 集合（用于后续清理旧映射）
+    let active_user_ids: std::collections::HashSet<String> = containers
+        .iter()
+        .filter(|c| c.status.to_string().to_lowercase() == "running")
+        .map(|c| c.container_key().to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
+
     let mut synced_count = 0;
     let mut updated_count = 0;
 
@@ -159,6 +167,29 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
         );
     } else if synced_count > 0 {
         debug!("🔄 [VNC_SYNC] 同步完成: 检查={}, 无需更新", synced_count);
+    }
+
+    // === 清理已销毁容器的旧映射 ===
+    // 获取当前所有 VNC 后端映射
+    let current_backends = pingora_service.list_vnc_backends();
+
+    let mut removed_count = 0;
+    for user_id in current_backends.keys() {
+        if !active_user_ids.contains(user_id) {
+            pingora_service.remove_vnc_backend(user_id);
+            removed_count += 1;
+            debug!(
+                "🗑️ [VNC_SYNC] 清理已销毁容器的映射: user_id={}",
+                user_id
+            );
+        }
+    }
+
+    if removed_count > 0 {
+        info!(
+            "🗑️ [VNC_SYNC] 清理完成: 移除={} 个旧映射",
+            removed_count
+        );
     }
 }
 

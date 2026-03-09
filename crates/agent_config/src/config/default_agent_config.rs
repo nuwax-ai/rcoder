@@ -18,7 +18,7 @@ const DEFAULT_CONFIG_JSON: &str = include_str!("../../configs/default_agents.jso
 const COMPUTER_AGENT_CONFIG_JSON: &str = include_str!("../../configs/computer_agent_default.json");
 
 /// Claude Code ACP Agent 的默认 ID
-pub const CLAUDE_CODE_ACP_AGENT_ID: &str = "claude-code-acp";
+pub const CLAUDE_CODE_ACP_AGENT_ID: &str = "claude-code-acp-ts";
 
 /// 默认配置的内部结构（用于 JSON 反序列化）
 #[derive(serde::Deserialize)]
@@ -53,13 +53,13 @@ static COMPUTER_AGENT_CONFIG: LazyLock<EmbeddedConfig> = LazyLock::new(|| {
 /// 修改 JSON 文件后重新编译即可生效。
 ///
 /// # Panics
-/// 如果 JSON 中不存在 `claude-code-acp` 配置，会 panic。
+/// 如果 JSON 中不存在 `claude-code-acp-ts` 配置，会 panic。
 pub fn default_claude_code_agent() -> AgentConfig {
     DEFAULT_CONFIG
         .agent_servers
         .get(CLAUDE_CODE_ACP_AGENT_ID)
         .cloned()
-        .expect("claude-code-acp not found in default_agents.json")
+        .expect("claude-code-acp-ts not found in default_agents.json")
 }
 
 /// 获取默认的 Context Servers 配置
@@ -196,7 +196,7 @@ mod tests {
     fn test_default_claude_code_agent() {
         let agent = default_claude_code_agent();
         assert_eq!(agent.agent_id, CLAUDE_CODE_ACP_AGENT_ID);
-        assert_eq!(agent.command, "claude-code-acp");
+        assert_eq!(agent.command, "claude-code-acp-ts");
         assert!(agent.enabled);
         assert!(agent.env.contains_key("ANTHROPIC_API_KEY"));
     }

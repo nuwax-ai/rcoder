@@ -7,6 +7,12 @@ license = "MIT OR Apache-2.0"
 description = "Agent abstraction layer for RCoder"
 publish = false
 
+[features]
+default = []
+# Pingora 代理模式：API Key 和 Base URL 使用占位符，由 Pingora 代理注入真实值
+# Windows 不支持 Pingora，禁用此 feature 时直接使用真实的 API Key 和 Base URL
+proxy = []
+
 [dependencies]
 # 依赖其他 crate
 agent_config = { path = "../agent_config" }
@@ -52,17 +58,27 @@ tokio-util = { workspace = true }
 # ACP 协议 - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
 sacp = { workspace = true }
 
+# 跨平台命令查找
+which = { workspace = true }
+
 # MCP 协议 - rmcp 官方库: https://github.com/modelcontextprotocol/rust-sdk
 rmcp = { workspace = true }
 
 # 序列化
 serde = { workspace = true }
 
+# 进程组管理（用于清理整个进程树）
+# Unix: process-group (setpgid), Windows: job-object
+# process-wrap 内部通过 #[cfg] 控制各平台类型的可用性
+process-wrap = { version = "9.0", features = ["tokio1", "process-group", "job-object"] }
+
+[target.'cfg(unix)'.dependencies]
 # Unix 信号处理
 nix = { workspace = true, features = ["signal"] }
 
-# 进程组管理（用于清理整个进程树）
-process-wrap = { version = "9.0", features = ["tokio1", "process-group"] }
+[target.'cfg(windows)'.dependencies]
+# process-wrap CreationFlags 需要 PROCESS_CREATION_FLAGS 类型
+windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3.8"

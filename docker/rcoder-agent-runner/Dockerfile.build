@@ -18,7 +18,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 Rust 1.90（这一层会被缓存）
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.90.0
+# 安装后立即验证 cargo 可用，失败则中断构建，避免缓存不完整的层
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.90.0 \
+    && . "$HOME/.cargo/env" \
+    && cargo --version \
+    && rustc --version
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # 🎯 代码哈希标记：只有当 CRATES_HASH 变化时，以下步骤才会重新执行

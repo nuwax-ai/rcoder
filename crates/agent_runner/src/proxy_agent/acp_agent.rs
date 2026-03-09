@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 
@@ -31,6 +32,14 @@ use crate::{
     service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier},
     utils::ContentBuilder,
 };
+
+/// 🔥 配置标志：是否为无限制模式（HTTP Server 部署）
+static IS_UNLIMITED_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 设置运行模式（供 main.rs 调用）
+pub fn set_unlimited_mode(enabled: bool) {
+    IS_UNLIMITED_MODE.store(enabled, Ordering::SeqCst);
+}
 
 // 🔥 OpenTelemetry 追踪
 #[cfg(feature = "otel")]
@@ -62,6 +71,8 @@ pub struct AgentRequest {
     service_uuid: Option<String>,
     /// 🔥 共享的 API 密钥管理器（用于自动清理）
     shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    /// 是否跳过槽位限制（HTTP Server 宿主机部署时为 true）
+    skip_slot_limit: bool,
 }
 
 impl AgentRequest {
@@ -77,6 +88,7 @@ impl AgentRequest {
                 model_provider,
                 service_uuid: None,
                 shared_api_key_manager: None,
+                skip_slot_limit: false,
             },
             chat_prompt_rx,
         )
@@ -96,6 +108,12 @@ impl AgentRequest {
         self.shared_api_key_manager = key_manager;
         self
     }
+
+    /// 设置是否跳过槽位限制
+    pub fn with_skip_slot_limit(mut self, skip: bool) -> Self {
+        self.skip_slot_limit = skip;
+        self
+    }
 }
 
 // 向后兼容类型别名（SACP 迁移）
@@ -107,22 +125,19 @@ pub type LocalSetAgentRequest = AgentRequest;
 ///
 /// 使用标准 tokio::spawn 处理 Agent 请求队列。
 /// SACP 支持 Send trait，无需 LocalSet。
-pub async fn agent_worker(
-    mut request_rx: mpsc::UnboundedReceiver<AgentRequest>,
-) -> Result<()> {
+pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>) -> Result<()> {
     use agent_abstraction::session::{AcpAgentWorker, AgentWorker, WorkerRequest};
 
     info!("🚀 agent_worker 启动（SACP 版本），开始监听请求...");
 
     // 创建 AcpSessionManager，注入 AGENT_REGISTRY 作为 SessionRegistry
     // SACP 版本只需要 2 个泛型参数：N (SessionNotifier) 和 R (SessionRegistry)
-    let session_manager = Arc::new(AcpSessionManager::<
-        StateAwareNotifier,
-        AgentSessionRegistry,
-    >::new(
-        Arc::new(StateAwareNotifier::new()),
-        AGENT_REGISTRY.clone(),
-    ));
+    let session_manager = Arc::new(
+        AcpSessionManager::<StateAwareNotifier, AgentSessionRegistry>::new(
+            Arc::new(StateAwareNotifier::new()),
+            AGENT_REGISTRY.clone(),
+        ),
+    );
 
     // 创建 AcpAgentWorker
     let worker = AcpAgentWorker::new(session_manager);
@@ -278,13 +293,12 @@ pub async fn agent_worker_with_heartbeat(
 
     // 创建 AcpSessionManager，注入 AGENT_REGISTRY 作为 SessionRegistry
     // SACP 版本只需要 2 个泛型参数：N (SessionNotifier) 和 R (SessionRegistry)
-    let session_manager = Arc::new(AcpSessionManager::<
-        StateAwareNotifier,
-        AgentSessionRegistry,
-    >::new(
-        Arc::new(StateAwareNotifier::new()),
-        AGENT_REGISTRY.clone(),
-    ));
+    let session_manager = Arc::new(
+        AcpSessionManager::<StateAwareNotifier, AgentSessionRegistry>::new(
+            Arc::new(StateAwareNotifier::new()),
+            AGENT_REGISTRY.clone(),
+        ),
+    );
 
     // 创建 AcpAgentWorker
     let worker = AcpAgentWorker::new(session_manager);
@@ -299,24 +313,24 @@ pub async fn agent_worker_with_heartbeat(
         let mut heartbeat_interval = interval(Duration::from_secs(5));
         loop {
             heartbeat_interval.tick().await;
-
-            // 📊 获取当前活跃 Worker 数量
-            let active_count = AGENT_REGISTRY.stats().agent_count;
-            let total_count = get_concurrency_limit();
-
             let timestamp = Utc::now();
 
             // 📊 打印当前 Worker 占用情况
-            info!(
-                "💓 [Worker] 心跳 - 当前活跃: {}/{}, 可用: {}, 时间: {}",
-                active_count,
-                total_count,
-                total_count.saturating_sub(active_count),
-                timestamp.format("%Y-%m-%d %H:%M:%S")
-            );
+            if IS_UNLIMITED_MODE.load(Ordering::SeqCst) {
+                // 无限制模式（HTTP Server 部署）- 不显示具体数量，避免误解
+                info!("💓 [Worker] 心跳 - 活跃会话: (无限制)");
+            } else {
+                // 限制模式（Docker 容器部署）
+                let active = AGENT_REGISTRY.stats().agent_count;
+                let limit = get_concurrency_limit();
+                info!("💓 [Worker] 心跳 - 活跃会话: {}/{}", active, limit);
+            }
 
             // 🔥 P1 修复: 使用原子操作直接更新时间戳（无锁）
-            last_heartbeat_ts_clone.store(timestamp.timestamp_millis(), std::sync::atomic::Ordering::Release);
+            last_heartbeat_ts_clone.store(
+                timestamp.timestamp_millis(),
+                std::sync::atomic::Ordering::Release,
+            );
         }
     });
 
@@ -415,7 +429,13 @@ pub async fn agent_worker_with_heartbeat(
             // 5. 更新全局状态（使用统一的 AGENT_REGISTRY）
             if is_new_session {
                 // 🔥 修复：槽位对应 Agent 生命周期，只在创建新 Agent 时获取槽位
-                if !AGENT_REGISTRY.try_acquire_session_slot() {
+                // HTTP Server 部署模式跳过槽位限制
+                if request.skip_slot_limit {
+                    info!(
+                        "⏭️ [原子槽位] 跳过限制（无限制模式）: project_id={}",
+                        project_id
+                    );
+                } else if !AGENT_REGISTRY.try_acquire_session_slot() {
                     let limit = get_concurrency_limit();
                     error!(
                         "🛡️ [原子并发限制] Agent 会话槽位已满 ({}/{}), 拒绝新请求 - project_id={}, request_id={}",
@@ -442,14 +462,14 @@ pub async fn agent_worker_with_heartbeat(
                         error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
                     }
                     return;
+                } else {
+                    info!(
+                        "✅ [原子槽位] 成功获取槽位: {}/{} - project_id={}",
+                        AGENT_REGISTRY.active_sessions_count(),
+                        get_concurrency_limit(),
+                        project_id
+                    );
                 }
-
-                info!(
-                    "✅ [原子槽位] 成功获取槽位: {}/{} - project_id={}",
-                    AGENT_REGISTRY.active_sessions_count(),
-                    get_concurrency_limit(),
-                    project_id
-                );
 
                 if let Some(ref handles) = session_handles {
                     debug!("🆕 新会话，注册到 AGENT_REGISTRY");
@@ -532,10 +552,11 @@ pub async fn agent_worker_with_heartbeat(
                         // 这确保了槽位释放和 Registry 清理的原子性
                         // 后续的 stop_agent 或 cleanup_task 调用 remove_by_project() 会发现 Agent 已不存在
                         // 因此不会重复释放槽位
+
                         AGENT_REGISTRY.remove_by_project(&project_id);
 
                         info!(
-                            "🛑 [SACP] Agent 生命周期结束，已清理 Registry 并释放槽位 - project_id={}, session_id={}",
+                            "🛑 [SACP] Agent 生命周期结束，已清理 Registry - project_id={}, session_id={}",
                             project_id, response_session_id
                         );
                     } else {

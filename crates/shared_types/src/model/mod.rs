@@ -6,6 +6,7 @@ mod attachment;
 pub mod chat_prompt;
 mod chat_response;
 mod computer_agent_model;
+mod health_response;
 mod http_result;
 mod model_provider;
 
@@ -18,5 +19,6 @@ pub use chat_prompt::*;
 pub use chat_response::*;
 #[allow(unused_imports)]
 pub use computer_agent_model::*;
+pub use health_response::*;
 pub use http_result::*;
 pub use model_provider::{ModelApiProtocol, ModelProviderConfig, ModelProviderSafeInfo};

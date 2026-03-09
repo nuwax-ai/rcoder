@@ -220,7 +220,7 @@ impl AgentInstallationManager {
 
         // 使用 which 检查命令是否可用（适用于 Debian/Docker 环境）
         // which::which 是 Rust crate，不依赖系统 which 命令
-        // 注意：只检查命令是否在 PATH 中，不运行命令避免副作用（如 claude-code-acp --version 会阻塞）
+        // 注意：只检查命令是否在 PATH 中，不运行命令避免副作用（如 claude-code-acp-ts --version 会阻塞）
         if self.is_command_available(command).await {
             debug!("✅ 命令存在于 PATH 中: {}", command);
             return Ok(true);

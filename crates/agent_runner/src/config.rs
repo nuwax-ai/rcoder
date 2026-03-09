@@ -54,10 +54,15 @@ pub struct AppConfig {
     /// Agent 并发配置
     #[serde(default)]
     pub agent_concurrency: Option<AgentConcurrencyConfig>,
+    /// mcp-proxy 日志目录（可选）
+    /// 当设置此值且日志级别为 debug 时，mcp-proxy convert 命令会自动追加
+    /// --diagnostic 和 --log-dir 参数
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_proxy_log_dir: Option<String>,
 }
 
 fn default_agent_id() -> String {
-    "claude-code-acp".to_string()
+    "claude-code-acp-ts".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,8 +266,14 @@ impl AgentCleanupConfig {
     }
 }
 
+#[cfg(feature = "http-server")]
 fn default_idle_timeout() -> u64 {
-    300 // 5 分钟
+    24 * 60 * 60 // 24 小时（Tauri 客户端模式）
+}
+
+#[cfg(not(feature = "http-server"))]
+fn default_idle_timeout() -> u64 {
+    300 // 5 分钟（CLI 模式）
 }
 
 fn default_cleanup_interval() -> u64 {
@@ -318,6 +329,7 @@ impl Default for AppConfig {
             agent_cleanup: Some(AgentCleanupConfig::default()),
             grpc_timeouts: Some(GrpcTimeoutConfig::default()),
             agent_concurrency: Some(AgentConcurrencyConfig::default()),
+            mcp_proxy_log_dir: None,
         }
     }
 }
@@ -385,7 +397,8 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         match idle_timeout.parse::<u64>() {
             Ok(timeout) => {
                 // 🔒 验证范围
-                if (AgentCleanupConfig::MIN_IDLE_TIMEOUT..=AgentCleanupConfig::MAX_IDLE_TIMEOUT).contains(&timeout)
+                if (AgentCleanupConfig::MIN_IDLE_TIMEOUT..=AgentCleanupConfig::MAX_IDLE_TIMEOUT)
+                    .contains(&timeout)
                 {
                     config
                         .agent_cleanup
@@ -417,7 +430,9 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         match cleanup_interval.parse::<u64>() {
             Ok(interval) => {
                 // 🔒 验证范围
-                if (AgentCleanupConfig::MIN_CLEANUP_INTERVAL..=AgentCleanupConfig::MAX_CLEANUP_INTERVAL).contains(&interval)
+                if (AgentCleanupConfig::MIN_CLEANUP_INTERVAL
+                    ..=AgentCleanupConfig::MAX_CLEANUP_INTERVAL)
+                    .contains(&interval)
                 {
                     config
                         .agent_cleanup
@@ -479,7 +494,8 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Ok(cancel_timeout) = env::var("RCODER_CANCEL_SESSION_TIMEOUT_SECS") {
         match cancel_timeout.parse::<u64>() {
             Ok(timeout) => {
-                if (GrpcTimeoutConfig::MIN_CANCEL_TIMEOUT..=GrpcTimeoutConfig::MAX_CANCEL_TIMEOUT).contains(&timeout)
+                if (GrpcTimeoutConfig::MIN_CANCEL_TIMEOUT..=GrpcTimeoutConfig::MAX_CANCEL_TIMEOUT)
+                    .contains(&timeout)
                 {
                     config
                         .grpc_timeouts
@@ -510,7 +526,9 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Ok(acp_timeout) = env::var("RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS") {
         match acp_timeout.parse::<u64>() {
             Ok(timeout) => {
-                if (GrpcTimeoutConfig::MIN_ACP_SESSION_TIMEOUT..=GrpcTimeoutConfig::MAX_ACP_SESSION_TIMEOUT).contains(&timeout)
+                if (GrpcTimeoutConfig::MIN_ACP_SESSION_TIMEOUT
+                    ..=GrpcTimeoutConfig::MAX_ACP_SESSION_TIMEOUT)
+                    .contains(&timeout)
                 {
                     config
                         .grpc_timeouts
@@ -541,7 +559,9 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Ok(agent_cancel_timeout) = env::var("RCODER_AGENT_CANCEL_TIMEOUT_SECS") {
         match agent_cancel_timeout.parse::<u64>() {
             Ok(timeout) => {
-                if (GrpcTimeoutConfig::MIN_AGENT_CANCEL_TIMEOUT..=GrpcTimeoutConfig::MAX_AGENT_CANCEL_TIMEOUT).contains(&timeout)
+                if (GrpcTimeoutConfig::MIN_AGENT_CANCEL_TIMEOUT
+                    ..=GrpcTimeoutConfig::MAX_AGENT_CANCEL_TIMEOUT)
+                    .contains(&timeout)
                 {
                     config
                         .grpc_timeouts
@@ -572,7 +592,9 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Ok(port_check_timeout) = env::var("RCODER_PORT_CHECK_TIMEOUT_MILLIS") {
         match port_check_timeout.parse::<u64>() {
             Ok(timeout) => {
-                if (GrpcTimeoutConfig::MIN_PORT_CHECK_TIMEOUT..=GrpcTimeoutConfig::MAX_PORT_CHECK_TIMEOUT).contains(&timeout)
+                if (GrpcTimeoutConfig::MIN_PORT_CHECK_TIMEOUT
+                    ..=GrpcTimeoutConfig::MAX_PORT_CHECK_TIMEOUT)
+                    .contains(&timeout)
                 {
                     config
                         .grpc_timeouts
@@ -602,17 +624,19 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
 
     // 🆕 验证最终配置的有效性
     if let Some(ref cleanup_config) = config.agent_cleanup
-        && let Err(e) = cleanup_config.validate() {
-            warn!("Agent 清理配置验证失败: {}，使用默认配置", e);
-            config.agent_cleanup = Some(AgentCleanupConfig::default());
-        }
+        && let Err(e) = cleanup_config.validate()
+    {
+        warn!("Agent 清理配置验证失败: {}，使用默认配置", e);
+        config.agent_cleanup = Some(AgentCleanupConfig::default());
+    }
 
     // 🆕 验证 Agent 并发配置的有效性
     if let Some(ref concurrency_config) = config.agent_concurrency
-        && let Err(e) = concurrency_config.validate() {
-            warn!("Agent 并发配置验证失败: {}，使用默认配置", e);
-            config.agent_concurrency = Some(AgentConcurrencyConfig::default());
-        }
+        && let Err(e) = concurrency_config.validate()
+    {
+        warn!("Agent 并发配置验证失败: {}，使用默认配置", e);
+        config.agent_concurrency = Some(AgentConcurrencyConfig::default());
+    }
 
     // 4. 处理代理配置
     if cli_args.enable_proxy {
@@ -654,13 +678,11 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
 
     // 🆕 验证 gRPC 超时配置的有效性
     if let Some(ref grpc_timeouts) = config.grpc_timeouts
-        && let Err(e) = grpc_timeouts.validate() {
-            warn!(
-                "gRPC 超时配置验证失败: {}，使用默认配置",
-                e
-            );
-            config.grpc_timeouts = Some(GrpcTimeoutConfig::default());
-        }
+        && let Err(e) = grpc_timeouts.validate()
+    {
+        warn!("gRPC 超时配置验证失败: {}，使用默认配置", e);
+        config.grpc_timeouts = Some(GrpcTimeoutConfig::default());
+    }
 
     config
 }
@@ -700,7 +722,11 @@ fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
     let grpc_timeouts = config.grpc_timeouts.as_ref().cloned().unwrap_or_default();
 
     // 获取 agent_concurrency 配置，如果不存在则使用默认值
-    let agent_concurrency = config.agent_concurrency.as_ref().cloned().unwrap_or_default();
+    let agent_concurrency = config
+        .agent_concurrency
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
 
     // 手动构建带注释的 YAML 内容
     let content_with_comments = format!(

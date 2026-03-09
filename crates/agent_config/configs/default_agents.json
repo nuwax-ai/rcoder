@@ -1,15 +1,16 @@
 {
   "agent_servers": {
-    "claude-code-acp": {
-      "agent_id": "claude-code-acp",
+    "claude-code-acp-ts": {
+      "agent_id": "claude-code-acp-ts",
       "agent_type": "claude",
-      "command": "claude-code-acp",
+      "command": "claude-code-acp-ts",
       "args": [],
       "env": {
         "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}",
         "ANTHROPIC_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
         "ANTHROPIC_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
-        "RUST_LOG": "info"
+        "RUST_LOG": "info",
+        "CLAUDE_CODE_MAX_TOKENS": "32768"
       },
       "system_prompt": {
         "source": "embedded",
@@ -22,7 +23,7 @@
       },
       "installation": {
         "package_manager": "npm",
-        "package_name": "@zed-industries/claude-code-acp",
+        "package_name": "claude-code-acp-ts@latest",
         "version": "latest"
       },
       "enabled": true,

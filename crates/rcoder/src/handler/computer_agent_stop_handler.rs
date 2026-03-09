@@ -5,44 +5,13 @@
 //! 容器会继续运行其他 project_id 的 Agent。
 
 use axum::{Json, extract::State};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
-use utoipa::ToSchema;
 
 use crate::{AppError, HttpResult, router::AppState};
+use shared_types::{ComputerAgentStopRequest, ComputerAgentStopResponse};
 
 use super::utils::extract_grpc_addr;
-
-/// Computer Agent 停止请求
-#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
-pub struct ComputerAgentStopRequest {
-    /// 用户 ID (必填)
-    #[schema(example = "user_123")]
-    pub user_id: String,
-
-    /// 项目 ID (必填) - 只停止特定项目的 Agent
-    #[schema(example = "proj_456")]
-    pub project_id: String,
-
-    /// 可选的会话 ID
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "session789")]
-    pub session_id: Option<String>,
-}
-
-/// Computer Agent 停止响应
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ComputerAgentStopResponse {
-    /// 操作是否成功
-    pub success: bool,
-    /// 响应消息
-    pub message: String,
-    /// 用户 ID
-    pub user_id: String,
-    /// 项目 ID
-    pub project_id: String,
-}
 
 /// 停止 Computer Agent
 ///

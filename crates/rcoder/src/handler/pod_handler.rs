@@ -10,8 +10,10 @@
 
 use axum::extract::State;
 use axum::{Json, extract::Query};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::{IntoParams, ToSchema};
 
@@ -692,6 +694,107 @@ pub async fn pod_ensure(
         request.user_id, request.project_id
     );
 
+    // === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
+    // 使用原子标记（DashMap）避免并发请求互相干扰，无死锁风险
+    if let Some(creating_since) = state.pod_creating.get(&request.user_id) {
+        let elapsed = creating_since.elapsed();
+        drop(creating_since); // 释放 DashMap ref
+
+        // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
+        if elapsed < std::time::Duration::from_secs(60) {
+            info!(
+                "⏳ [POD_ENSURE] 容器正在创建中，等待完成: user_id={}, 已等待={:?}",
+                request.user_id, elapsed
+            );
+
+            // 轮询等待容器就绪（最多等 30 秒，每秒检查一次）
+            let mut waited_container_info = None;
+            for wait_sec in 1..=30 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                // 标记已被移除 = 创建完成
+                if !state.pod_creating.contains_key(&request.user_id) {
+                    // 尝试获取容器信息
+                    let docker_mgr = docker_manager::global::get_global_docker_manager()
+                        .await
+                        .ok();
+                    if let Some(mgr) = docker_mgr {
+                        if let Ok(Some(info)) = mgr.get_user_container_info(&request.user_id).await {
+                            info!(
+                                "✅ [POD_ENSURE] 等待成功，容器已就绪（等待{}秒）: user_id={}, container_id={}",
+                                wait_sec, request.user_id, info.container_id
+                            );
+                            waited_container_info = Some(info);
+                            break;
+                        }
+                    }
+                }
+
+                if wait_sec % 5 == 0 {
+                    debug!("⏳ [POD_ENSURE] 仍在等待容器创建: user_id={}, 第{}秒", request.user_id, wait_sec);
+                }
+            }
+
+            // 如果等待成功，直接使用已就绪的容器，跳过创建流程
+            if let Some(info) = waited_container_info {
+                // 同步 VNC 后端映射
+                if let Some(ref pingora_service) = state.pingora_service {
+                    sync_single_vnc_backend(
+                        pingora_service,
+                        &request.user_id,
+                        &info.container_ip,
+                    )
+                    .await;
+                    info!(
+                        "🔄 [POD_ENSURE] VNC 后端映射已同步: user_id={} -> {}",
+                        request.user_id, info.container_ip
+                    );
+                }
+
+                // 更新 DuckDB 记录
+                let project_info = if let Some(existing) = state.get_project(&request.project_id) {
+                    let mut pinfo = (*existing).clone();
+                    pinfo.set_container(Some(info.clone()));
+                    pinfo
+                } else {
+                    let mut pinfo = ProjectAndContainerInfo::new(request.project_id.clone());
+                    pinfo.set_user_id(Some(request.user_id.clone()));
+                    pinfo.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+                    pinfo.set_container(Some(info.clone()));
+                    pinfo
+                };
+                state.insert_project(request.project_id.clone(), Arc::new(project_info));
+                debug!(
+                    "📝 [POD_ENSURE] DuckDB 记录已更新: project_id={}, user_id={}, container_id={}",
+                    request.project_id, request.user_id, info.container_id
+                );
+
+                // 返回成功响应
+                let pod_container_info = PodContainerInfo {
+                    container_id: info.container_id.clone(),
+                    status: info.status.clone(),
+                };
+                return Ok(HttpResult::success(EnsurePodResponse {
+                    created: false,
+                    container_info: pod_container_info,
+                    message: format!("容器已就绪（等待其他请求创建完成）: container_id={}", info.container_id),
+                }));
+            }
+            // 等待超时，继续正常的创建流程（此时标记可能已过期被清理）
+            warn!(
+                "⚠️ [POD_ENSURE] 等待容器创建超时（30秒），将继续尝试创建: user_id={}",
+                request.user_id
+            );
+        } else {
+            // 标记过期，清理后继续
+            warn!(
+                "⚠️ [POD_ENSURE] 创建标记已过期（{:?}），清理并继续",
+                elapsed
+            );
+            state.pod_creating.remove(&request.user_id);
+        }
+    }
+
     // 2. 🔍 实时查询 Docker API 检查容器是否存在（不依赖缓存）
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
@@ -700,13 +803,12 @@ pub async fn pod_ensure(
             AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
         })?;
 
-    // 构造容器名称
-    let container_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-    let expected_container_name = format!("{}-{}", container_prefix, request.user_id);
-
-    // 实时查询 Docker API
+    // 通过 find_user_container 查询容器（使用 ServiceConfig 中配置的容器前缀）
     let existing_container = docker_manager
-        .find_container_realtime(&expected_container_name)
+        .find_user_container(
+            &request.user_id,
+            &shared_types::ServiceType::ComputerAgentRunner,
+        )
         .await
         .map_err(|e| {
             error!("❌ [POD_ENSURE] 查询容器状态失败: {}", e);
@@ -762,8 +864,11 @@ pub async fn pod_ensure(
         }
     };
 
-    // 3. 获取或创建容器（带重试机制）
+    // 3. 获取或创建容器（带重试机制 + 标记）
     let (container_info, created) = if need_create {
+        // 🆕 设置创建标记，防止并发请求重复创建
+        state.pod_creating.insert(request.user_id.clone(), Instant::now());
+
         // 创建新容器，最多重试 3 次
         let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
             memory_limit: limits.memory,
@@ -822,8 +927,14 @@ pub async fn pod_ensure(
 
         // 返回结果或错误
         match result {
-            Some(info) => (info, true),
+            Some(info) => {
+                // 创建成功，清除标记
+                state.pod_creating.remove(&request.user_id);
+                (info, true)
+            },
             None => {
+                // 创建失败，也要清除标记
+                state.pod_creating.remove(&request.user_id);
                 let error_msg = last_error
                     .as_ref()
                     .map(|e| e.to_string())
@@ -842,37 +953,74 @@ pub async fn pod_ensure(
                 (info, false)
             }
             Ok(None) => {
-                // 容器信息不存在（可能被外部删除），尝试重新创建
+                // Docker API 确认容器在运行，但内部 map 还没同步
+                // 短暂等待让内部 map 同步，而不是直接重建
                 warn!(
-                    "⚠️ [POD_ENSURE] 容器信息丢失，尝试重新创建: user_id={}",
+                    "⚠️ [POD_ENSURE] 容器运行中但内部映射未就绪，等待同步: user_id={}",
                     request.user_id
                 );
 
-                let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
-                    memory_limit: limits.memory,
-                    cpu_limit: limits.cpu,
-                    swap_limit: limits.swap,
-                });
-
-                match ComputerContainerManager::get_or_create_container_for_user(
-                    &request.user_id,
-                    resource_limits,
-                )
-                .await
-                {
-                    Ok(info) => {
-                        info!(
-                            "✅ [POD_ENSURE] 容器重新创建成功: container_id={}",
-                            info.container_id
-                        );
-                        (info, true)
+                let mut retry_info = None;
+                for retry_attempt in 1..=3 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    match docker_manager.get_user_container_info(&request.user_id).await {
+                        Ok(Some(info)) => {
+                            info!(
+                                "✅ [POD_ENSURE] 内部映射已同步（第{}次重试）: container_id={}",
+                                retry_attempt, info.container_id
+                            );
+                            retry_info = Some(info);
+                            break;
+                        }
+                        _ => {
+                            debug!("⏳ [POD_ENSURE] 内部映射仍未就绪: 第{}次", retry_attempt);
+                        }
                     }
-                    Err(e) => {
-                        error!(
-                            "❌ [POD_ENSURE] 容器重新创建失败: user_id={}, error={}",
-                            request.user_id, e
+                }
+
+                match retry_info {
+                    Some(info) => (info, false),
+                    None => {
+                        // 3次重试后仍失败，才考虑重建
+                        warn!(
+                            "⚠️ [POD_ENSURE] 等待同步超时，尝试重新创建: user_id={}",
+                            request.user_id
                         );
-                        return Err(e);
+
+                        let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
+                            memory_limit: limits.memory,
+                            cpu_limit: limits.cpu,
+                            swap_limit: limits.swap,
+                        });
+
+                        // 设置创建标记
+                        state.pod_creating.insert(request.user_id.clone(), std::time::Instant::now());
+
+                        let result = ComputerContainerManager::get_or_create_container_for_user(
+                            &request.user_id,
+                            resource_limits,
+                        )
+                        .await;
+
+                        // 清除创建标记
+                        state.pod_creating.remove(&request.user_id);
+
+                        match result {
+                            Ok(info) => {
+                                info!(
+                                    "✅ [POD_ENSURE] 容器重新创建成功: container_id={}",
+                                    info.container_id
+                                );
+                                (info, true)
+                            }
+                            Err(e) => {
+                                error!(
+                                    "❌ [POD_ENSURE] 容器重新创建失败: user_id={}, error={}",
+                                    request.user_id, e
+                                );
+                                return Err(e);
+                            }
+                        }
                     }
                 }
             }
@@ -1442,18 +1590,26 @@ pub async fn pod_status(
             AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
         })?;
 
-    // 3. 确定查询标识符：优先使用 user_id 构造容器名，否则使用 project_id
-    let identifier = if let Some(ref user_id) = params.user_id {
-        let prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-        format!("{}-{}", prefix, user_id)
+    // 3. 查询容器状态
+    //
+    // 两种查询路径：
+    // - user_id 路径：使用 find_user_container()，通过 ServiceConfig 获取配置化的容器前缀
+    //   （如 "rcoder-computer-agent-runner-{user_id}"），避免硬编码前缀与实际容器名不一致
+    // - project_id 路径：直接使用 find_container_realtime()，project_id 作为 DuckDB 中存储的容器标识符
+    let query_result = if let Some(ref user_id) = params.user_id {
+        // user_id 路径：通过配置化前缀查找容器
+        docker_manager
+            .find_user_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .await
     } else if let Some(ref project_id) = params.project_id {
-        project_id.clone()
+        // project_id 路径：直接按标识符查找（DuckDB 中存储的是完整容器名）
+        docker_manager.find_container_realtime(project_id).await
     } else {
         unreachable!()
     };
 
-    // 4. 🆕 通过 DockerManager 实时查询容器状态（直接查询 Docker API，无缓存延迟）
-    match docker_manager.find_container_realtime(&identifier).await {
+    // 4. 通过 DockerManager 查询容器状态
+    match query_result {
         Ok(Some(result)) => {
             let status_str = if result.is_running { "running" } else { "stopped" };
             let message = if result.is_running {
@@ -1639,13 +1795,13 @@ pub async fn pod_vnc_status(
         })?;
 
     // 3. 定位容器
-    // 优先使用 user_id 查找（ComputerAgentRunner 按 user_id 命名）
+    // 优先使用 user_id 查找（通过 find_user_container 获取配置化的容器前缀）
     let (lookup_user_id, container_info) = if let Some(uid) = user_id {
-        let container_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-        let expected_name = format!("{}-{}", container_prefix, uid);
         (
             uid,
-            docker_manager.find_container_realtime(&expected_name).await,
+            docker_manager
+                .find_user_container(uid, &shared_types::ServiceType::ComputerAgentRunner)
+                .await,
         )
     } else if let Some(pid) = project_id {
         // 如果只有 project_id，通过 DuckDB 查找关联的容器

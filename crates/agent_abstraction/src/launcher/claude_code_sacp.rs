@@ -15,7 +15,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
-use process_wrap::tokio::{CommandWrap, ProcessGroup};
+#[cfg(windows)]
+use crate::path_env::TAURI_APP_DATA_DIR;
+use process_wrap::tokio::CommandWrap;
+#[cfg(windows)]
+use process_wrap::tokio::{CreationFlags, JobObject};
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
 use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -38,6 +44,12 @@ use crate::traits::session_registry::SessionRegistry;
 
 // 导入生命周期管理
 use super::lifecycle::AgentLifecycleGuard;
+#[cfg(windows)]
+use super::windows_launch::{
+    normalize_windows_command_for_no_window, resolve_windows_node_cli_command, CREATE_NO_WINDOW_FLAG,
+};
+#[cfg(windows)]
+use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
 /// 使用最新协议版本
 const VERSION: ProtocolVersion = ProtocolVersion::LATEST;
@@ -62,6 +74,195 @@ const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
 
 /// 默认代理 Base URL（包含 UUID 占位符）
 const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
+
+/// 获取各平台下常用的用户二进制目录
+///
+/// Linux/Mac:
+/// - ~/.cargo/bin (Rust cargo)
+/// - ~/.npm-global/bin (npm global)
+/// - ~/.local/bin (uv, pipx)
+/// - /opt/homebrew/bin (Homebrew on Apple Silicon)
+/// - /usr/local/bin (Homebrew on Intel Mac / 通用)
+/// - /home/linuxbrew/.linuxbrew/bin (Linuxbrew)
+///
+/// Windows:
+/// - 返回空，Windows 环境变量已包含这些路径
+///
+/// 注意：使用 $HOME 变量而非硬编码 /root，HOME 不存在时自动回退到 /root
+fn get_common_user_bins() -> Vec<&'static str> {
+    #[cfg(windows)]
+    {
+        vec![] // Windows 用户路径已在系统 PATH 中
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![
+            // Cargo (Rust)
+            "$HOME/.cargo/bin",
+            // NPM global
+            "$HOME/.npm-global/bin",
+            // UV / PIPX global
+            "$HOME/.local/bin",
+            // Homebrew (Apple Silicon)
+            "/opt/homebrew/bin",
+            // Homebrew (Intel Mac) / 通用本地安装
+            "/usr/local/bin",
+            // Linuxbrew
+            "/home/linuxbrew/.linuxbrew/bin",
+            // 系统级 cargo（某些容器环境）
+            "/opt/cargo/bin",
+        ]
+    }
+}
+
+/// 确保子进程环境变量中包含 PATH / PATHEXT，便于解析可执行路径与 Windows .cmd 脚本
+///
+/// PATH 组成（优先级从高到低）：
+/// 1. NUWAX_APP_RUNTIME_PATH — 应用自有运行时目录（node/uv/mcp-proxy 等）
+/// 2. 当前系统 PATH — 保留所有现有路径（关键改进！）
+/// 3. 常用用户目录 — cargo, npm, uv, homebrew 等
+/// 4. 系统基础目录 — `/bin`, `/usr/bin` 等（仅在 PATH 为空时）
+fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String, String>) {
+    if !merged_envs.contains_key("PATH") {
+        let path = build_mcp_server_path_env();
+        if !path.is_empty() {
+            merged_envs.insert("PATH".to_string(), path);
+            debug!("[SACP] 📋 已构建 PATH 环境变量（包含系统 PATH 和用户目录）");
+        }
+    }
+    #[cfg(windows)]
+    ensure_windows_subprocess_env(merged_envs);
+}
+
+/// 构建 MCP 服务器子进程所需的 PATH 环境变量
+///
+/// Claude Code SDK 在启动 MCP 服务器子进程时会用提供的 env 替换整个环境。
+/// 如果 env 中缺少 PATH，mcp-proxy convert --config 模式下的孙进程
+/// （如 uvx、npx）将因为找不到命令而静默失败。
+///
+/// 此函数与 ensure_subprocess_path_env 使用相同的逻辑构建 PATH：
+/// 1. NUWAX_APP_RUNTIME_PATH — 应用自有运行时目录（优先）
+/// 2. 当前系统 PATH — 保留所有现有路径（关键改进！）
+/// 3. 平台特定目录：
+///    - Windows: APPDATA 推导的 Tauri 应用 node/npm 路径
+///    - Unix: 常用用户目录（cargo, npm, uv, homebrew 等）
+/// 4. 系统基础目录 — 仅在 PATH 为空时兜底
+fn build_mcp_server_path_env() -> String {
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let mut paths: Vec<String> = Vec::new();
+
+    // 1. 优先：NUWAX_APP_RUNTIME_PATH
+    if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
+        for p in runtime_path.split(sep) {
+            let p = p.trim();
+            if !p.is_empty() && !paths.contains(&p.to_string()) {
+                paths.push(p.to_string());
+            }
+        }
+    }
+
+    // 2. 追加：当前系统 PATH（关键改动！）
+    if let Ok(current_path) = std::env::var("PATH") {
+        for p in current_path.split(sep) {
+            let p = p.trim();
+            if !p.is_empty() && !paths.contains(&p.to_string()) {
+                paths.push(p.to_string());
+            }
+        }
+    }
+
+    // 3. 追加：平台特定目录
+    #[cfg(windows)]
+    {
+        // Windows: 从 APPDATA 推导 Tauri 应用的 node/npm 路径
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            use std::path::PathBuf;
+            let app_base = PathBuf::from(&appdata).join(TAURI_APP_DATA_DIR);
+
+            let node_bin = app_base.join("runtime").join("node").join("bin");
+            if node_bin.is_dir() {
+                let node_bin_str = node_bin.to_string_lossy().to_string();
+                if !paths.contains(&node_bin_str) {
+                    paths.push(node_bin_str);
+                }
+            }
+
+            let npm_bin = app_base.join("node_modules").join(".bin");
+            if npm_bin.is_dir() {
+                let npm_bin_str = npm_bin.to_string_lossy().to_string();
+                if !paths.contains(&npm_bin_str) {
+                    paths.push(npm_bin_str);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // Unix: 追加常用用户目录（自动扩展 $HOME）
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        for bin in get_common_user_bins() {
+            let expanded = bin.replace("$HOME", &home);
+            let path = std::path::Path::new(&expanded);
+            if path.is_dir() && !paths.contains(&expanded) {
+                paths.push(expanded);
+            }
+        }
+    }
+
+    // 4. 兜底：系统基础目录（仅在 PATH 为空时）
+    // 正常情况下不会走到这里，因为步骤 2 已经追加了当前系统 PATH
+    // 这是为了防御性编程，确保即使在极端情况下也有可用的基础命令
+    if paths.is_empty() {
+        #[cfg(not(windows))]
+        for sys_dir in &["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin"] {
+            let s = sys_dir.to_string();
+            if std::path::Path::new(sys_dir).is_dir() {
+                paths.push(s);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // Windows: 直接返回系统 PATH 作为最后手段
+            if let Ok(current_path) = std::env::var("PATH") {
+                return current_path;
+            }
+        }
+    }
+
+    paths.join(sep)
+}
+
+/// Windows 专属：确保 PATHEXT 存在，以便解析 .cmd/.bat 等脚本
+#[cfg(windows)]
+fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<String, String>) {
+    if !merged_envs.contains_key("PATHEXT") {
+        if let Ok(pathext) = std::env::var("PATHEXT") {
+            merged_envs.insert("PATHEXT".to_string(), pathext);
+            debug!("[SACP] 📋 已添加系统 PATHEXT 环境变量");
+        }
+    }
+}
+
+/// 根据 proxy feature 决定使用占位符还是真实 API Key
+fn resolve_api_key(provider: &ModelProviderConfig) -> String {
+    if cfg!(feature = "proxy") {
+        API_KEY_PLACEHOLDER.to_string()
+    } else {
+        provider.api_key.clone()
+    }
+}
+
+/// 根据 proxy feature 决定使用代理 URL 还是真实 Base URL
+fn resolve_base_url(provider: &ModelProviderConfig) -> String {
+    if cfg!(feature = "proxy") {
+        DEFAULT_PROXY_BASE_URL.to_string()
+    } else {
+        provider.base_url.clone()
+    }
+}
 
 /// Agent 配置参数 (与旧版兼容)
 #[derive(Debug, Clone)]
@@ -99,7 +300,7 @@ pub async fn load_sacp_agent_config(
     // 复用旧版配置加载逻辑
     let config = AgentServersConfig::load_or_default_for_service(service_type).await;
 
-    if let Some(agent_config) = config.get_agent("claude-code-acp") {
+    if let Some(agent_config) = config.get_agent("claude-code-acp-ts") {
         debug!("📋 [SACP] 加载默认 Agent 配置: {}", agent_config.agent_id);
 
         // 检查并安装 agent
@@ -127,11 +328,14 @@ pub async fn load_sacp_agent_config(
 
         if let Some(provider) = model_provider {
             // 统一替换所有环境变量中的模板
-            // API_KEY 和 BASE_URL 必须使用占位符/代理URL，由 Pingora 代理注入真实值
+            // proxy 模式下：API_KEY 和 BASE_URL 使用占位符/代理URL，由 Pingora 代理注入真实值
+            // 非 proxy 模式下：直接使用真实的 API Key 和 Base URL
+            let resolved_key = resolve_api_key(provider);
+            let resolved_url = resolve_base_url(provider);
             for (_key, value) in resolved_env.iter_mut() {
                 *value = value
-                    .replace("{MODEL_PROVIDER_API_KEY}", API_KEY_PLACEHOLDER)
-                    .replace("{MODEL_PROVIDER_BASE_URL}", DEFAULT_PROXY_BASE_URL)
+                    .replace("{MODEL_PROVIDER_API_KEY}", &resolved_key)
+                    .replace("{MODEL_PROVIDER_BASE_URL}", &resolved_url)
                     .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
                     .replace("{MODEL_PROVIDER_NAME}", &provider.name);
             }
@@ -147,7 +351,7 @@ pub async fn load_sacp_agent_config(
             context_servers: config.context_servers.clone(),
         })
     } else {
-        warn!("⚠️ [SACP] 配置中未找到 claude-code-acp，使用默认配置");
+        warn!("⚠️ [SACP] 配置中未找到 claude-code-acp-ts，使用默认配置");
         get_default_sacp_agent_config(model_provider, service_type)
     }
 }
@@ -160,18 +364,15 @@ pub fn get_default_sacp_agent_config(
     let mut env = HashMap::new();
 
     if let Some(provider) = model_provider {
+        let resolved_key = resolve_api_key(provider);
+        let resolved_url = resolve_base_url(provider);
+
         // Anthropic 环境变量
         if !provider.api_key.is_empty() {
-            env.insert(
-                ENV_ANTHROPIC_API_KEY.to_string(),
-                API_KEY_PLACEHOLDER.to_string(),
-            );
+            env.insert(ENV_ANTHROPIC_API_KEY.to_string(), resolved_key.clone());
         }
         if !provider.base_url.is_empty() {
-            env.insert(
-                ENV_ANTHROPIC_BASE_URL.to_string(),
-                DEFAULT_PROXY_BASE_URL.to_string(),
-            );
+            env.insert(ENV_ANTHROPIC_BASE_URL.to_string(), resolved_url.clone());
         }
         if !provider.default_model.is_empty() {
             env.insert(
@@ -182,16 +383,10 @@ pub fn get_default_sacp_agent_config(
 
         // OpenAI 环境变量 (支持 OpenAI 兼容的 Agent)
         if !provider.api_key.is_empty() {
-            env.insert(
-                ENV_OPENAI_API_KEY.to_string(),
-                API_KEY_PLACEHOLDER.to_string(),
-            );
+            env.insert(ENV_OPENAI_API_KEY.to_string(), resolved_key);
         }
         if !provider.base_url.is_empty() {
-            env.insert(
-                ENV_OPENAI_BASE_URL.to_string(),
-                DEFAULT_PROXY_BASE_URL.to_string(),
-            );
+            env.insert(ENV_OPENAI_BASE_URL.to_string(), resolved_url);
         }
         if !provider.default_model.is_empty() {
             // nuwaxcode 使用 OPENCODE_MODEL，model_name 中已包含 openai-compatible/ 前缀
@@ -205,8 +400,24 @@ pub fn get_default_sacp_agent_config(
     env.insert(ENV_RUST_LOG.to_string(), "info".to_string());
     env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
 
+    // Resolve the claude-code-acp-ts command path.
+    // Priority: CLAUDE_CODE_ACP_PATH env var > `which` crate lookup > bare command name.
+    // Tauri apps may not inherit the user's shell PATH, so we try `which` crate to get
+    // an absolute path at build/launch time.
+    let command = if let Ok(path) = std::env::var("CLAUDE_CODE_ACP_PATH") {
+        path
+    } else {
+        match which::which("claude-code-acp-ts") {
+            Ok(resolved_path) => {
+                tracing::info!("Resolved claude-code-acp-ts path via `which` crate: {}", resolved_path.display());
+                resolved_path.to_string_lossy().to_string()
+            }
+            Err(_) => "claude-code-acp-ts".to_string(),
+        }
+    };
+
     Ok(SacpAgentLaunchConfig {
-        command: "claude-code-acp".to_string(),
+        command,
         args: Vec::new(),
         env,
         context_servers: HashMap::new(),
@@ -238,6 +449,103 @@ fn get_dbus_session_address() -> Option<String> {
     })
 }
 
+/// mcp-proxy 日志目录环境变量名
+const ENV_MCP_PROXY_LOG_DIR: &str = "MCP_PROXY_LOG_DIR";
+
+/// 检测命令是否为 mcp-proxy（简化版，只检测命令名）
+fn is_mcp_proxy_command(command: &str) -> bool {
+    command == "mcp-proxy"
+}
+
+/// 检测参数中是否有 convert 子命令
+fn has_convert_subcommand(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "convert")
+}
+
+/// 检测当前日志级别是否为 debug
+fn is_debug_log_level() -> bool {
+    // 优先检查 RUST_LOG 环境变量
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        let log_lower = rust_log.to_lowercase();
+        return log_lower.contains("debug") || log_lower.contains("trace");
+    }
+    // 使用 tracing 的 enabled! 宏检测
+    tracing::enabled!(tracing::Level::DEBUG)
+}
+
+/// 获取 mcp-proxy 日志目录（如果配置了的话）
+fn get_mcp_proxy_log_dir() -> Option<String> {
+    std::env::var(ENV_MCP_PROXY_LOG_DIR).ok()
+}
+
+/// 检查参数中是否已有 --log-dir 或 --log-file 参数
+fn has_log_dir_arg(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--log-dir"
+            || arg.starts_with("--log-dir=")
+            || arg == "--log-file"
+            || arg.starts_with("--log-file=")
+    })
+}
+
+/// 为 mcp-proxy convert 命令追加诊断参数
+///
+/// 当检测到以下条件时，自动追加 `--diagnostic` 参数：
+/// 1. 命令是 `mcp-proxy`
+/// 2. 参数包含 `convert` 子命令
+/// 3. 当前日志级别是 debug
+///
+/// 只有配置了 `MCP_PROXY_LOG_DIR` 环境变量时才追加 `--log-dir` 参数
+///
+/// 重复检查逻辑：
+/// 1. 如果参数中已有 --diagnostic，跳过注入
+/// 2. 如果参数中已有 --log-dir 或 --log-file，不追加 --log-dir（避免覆盖用户配置）
+fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
+    // 检查是否为 mcp-proxy convert 命令
+    if !is_mcp_proxy_command(command) || !has_convert_subcommand(&args) {
+        return args;
+    }
+
+    // 检查日志级别是否为 debug
+    if !is_debug_log_level() {
+        debug!(
+            "[MCP] mcp-proxy convert 检测到，但日志级别非 debug，跳过诊断参数注入"
+        );
+        return args;
+    }
+
+    // 检查是否已有 --diagnostic 参数
+    let has_diagnostic = args.iter().any(|arg| arg == "--diagnostic");
+    if has_diagnostic {
+        debug!("[MCP] mcp-proxy convert 已有 --diagnostic 参数，跳过注入");
+        return args;
+    }
+
+    let mut enhanced_args = args;
+
+    // 追加 --diagnostic 参数
+    enhanced_args.push("--diagnostic".to_string());
+    info!("[MCP] 为 mcp-proxy convert 追加 --diagnostic 参数");
+
+    // 🔒 关键检查：如果用户已配置 --log-dir 或 --log-file，不覆盖
+    if has_log_dir_arg(&enhanced_args) {
+        debug!("[MCP] 用户已配置日志参数，跳过 --log-dir 注入");
+        return enhanced_args;
+    }
+
+    // 只有配置了 MCP_PROXY_LOG_DIR 环境变量时才追加 --log-dir 参数
+    if let Some(log_dir) = get_mcp_proxy_log_dir() {
+        enhanced_args.push("--log-dir".to_string());
+        enhanced_args.push(log_dir.clone());
+        info!(
+            "[MCP] 为 mcp-proxy convert 追加 --log-dir {} 参数",
+            log_dir
+        );
+    }
+
+    enhanced_args
+}
+
 /// 将配置中的 Context 服务器转换为 SACP 协议的 McpServer
 pub fn convert_context_servers_sacp(
     configs: &HashMap<String, ContextServerConfig>,
@@ -251,8 +559,15 @@ pub fn convert_context_servers_sacp(
             let command = c.command.as_ref()?;
             let mut server = McpServerStdio::new(name, PathBuf::from(command));
 
-            if let Some(args) = &c.args {
-                server = server.args(args.clone());
+            // 处理参数，可能需要为 mcp-proxy convert 追加诊断参数
+            let final_args = if let Some(args) = &c.args {
+                enhance_mcp_proxy_args(command, args.clone())
+            } else {
+                Vec::new()
+            };
+
+            if !final_args.is_empty() {
+                server = server.args(final_args);
             }
 
             let mut env_vars: Vec<sacp::schema::EnvVariable> = if let Some(env) = &c.env {
@@ -273,6 +588,59 @@ pub fn convert_context_servers_sacp(
                         "DBUS_SESSION_BUS_ADDRESS".to_string(),
                         addr.clone(),
                     ));
+                }
+            }
+
+            // 注入镜像源环境变量（npx/bunx/uvx 子进程使用）
+            for (key, val) in crate::mirror_env::collect_mirror_env_vars() {
+                if !env_vars.iter().any(|e| e.name == key) {
+                    env_vars.push(sacp::schema::EnvVariable::new(key, val));
+                }
+            }
+
+            // 注入 PATH 环境变量（关键！）
+            // Claude Code SDK 用 MCP server 的 env 替换整个子进程环境。
+            // 如果 env 中没有 PATH，mcp-proxy convert --config 模式下
+            // 无法找到 uvx/npx 等命令来启动 MCP 子服务。
+            if !env_vars.iter().any(|e| e.name == "PATH") {
+                let path_value = build_mcp_server_path_env();
+                if !path_value.is_empty() {
+                    env_vars.push(sacp::schema::EnvVariable::new(
+                        "PATH".to_string(),
+                        path_value,
+                    ));
+                }
+            }
+
+            // 注入 HOME 环境变量（uvx/npx 等工具需要 HOME 来定位缓存目录）
+            #[cfg(not(windows))]
+            if !env_vars.iter().any(|e| e.name == "HOME") {
+                if let Ok(home) = std::env::var("HOME") {
+                    env_vars.push(sacp::schema::EnvVariable::new(
+                        "HOME".to_string(),
+                        home,
+                    ));
+                }
+            }
+
+            // Windows: 注入 USERPROFILE 和 PATHEXT
+            #[cfg(windows)]
+            {
+                if !env_vars.iter().any(|e| e.name == "USERPROFILE") {
+                    if let Ok(profile) = std::env::var("USERPROFILE") {
+                        env_vars.push(sacp::schema::EnvVariable::new(
+                            "USERPROFILE".to_string(),
+                            profile,
+                        ));
+                    }
+                }
+                if !env_vars.iter().any(|e| e.name == "PATHEXT") {
+                    if let Ok(pathext) = std::env::var("PATHEXT") {
+                        env_vars.push(sacp::schema::EnvVariable::new(
+                            "PATHEXT".to_string(),
+                            pathext,
+                        ));
+                    }
                 }
             }
 
@@ -342,16 +710,15 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
                 // 🔧 关键修复：替换自定义环境变量中的模板变量
                 // 用户可能传入 {MODEL_PROVIDER_API_KEY} 等模板，需要替换为实际值
-                // 注意：API_KEY 和 BASE_URL 必须使用占位符/代理URL，由 Pingora 代理注入真实值
+                // proxy 模式下：API_KEY 和 BASE_URL 使用占位符/代理URL，由 Pingora 代理注入真实值
+                // 非 proxy 模式下：直接使用真实的 API Key 和 Base URL
                 if let Some(ref provider) = model_provider {
+                    let resolved_key = resolve_api_key(provider);
+                    let resolved_url = resolve_base_url(provider);
                     for (_key, value) in env.iter_mut() {
-                        // 所有变量统一替换：
-                        // - API_KEY 模板 → 占位符（Pingora 代理注入）
-                        // - BASE_URL 模板 → 代理 URL（Pingora 代理转发）
-                        // - MODEL 和 NAME 模板 → 真实值
                         *value = value
-                            .replace("{MODEL_PROVIDER_API_KEY}", API_KEY_PLACEHOLDER)
-                            .replace("{MODEL_PROVIDER_BASE_URL}", DEFAULT_PROXY_BASE_URL)
+                            .replace("{MODEL_PROVIDER_API_KEY}", &resolved_key)
+                            .replace("{MODEL_PROVIDER_BASE_URL}", &resolved_url)
                             .replace("{MODEL_PROVIDER_DEFAULT_MODEL}", &provider.default_model)
                             .replace("{MODEL_PROVIDER_NAME}", &provider.name);
                     }
@@ -407,6 +774,22 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             Vec::new()
         };
 
+        let mut command_path = command_path;
+        let mut command_args = command_args;
+
+        #[cfg(windows)]
+        if let Some((resolved_program, resolved_args)) =
+            resolve_windows_node_cli_command(&command_path, &command_args)
+        {
+            let entry = resolved_args.first().cloned().unwrap_or_default();
+            info!(
+                "[SACP] Windows 直连 node 启动: {} -> {} {}",
+                command_path, resolved_program, entry
+            );
+            command_path = resolved_program;
+            command_args = resolved_args;
+        }
+
         // 准备环境变量（在 base_env 基础上添加项目相关变量）
         let mut merged_envs = base_env;
         merged_envs.insert(
@@ -415,6 +798,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         );
         merged_envs.insert(ENV_AGENT_PROJECT_ID.to_string(), project_id.clone());
 
+        ensure_subprocess_path_env(&mut merged_envs);
+
         // 替换 UUID 占位符
         if let Some(ref uuid) = service_uuid {
             for (_key, value) in merged_envs.iter_mut() {
@@ -422,80 +807,129 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         }
 
-        // 🔒 安全防护：强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
+        // 🔒 安全防护：proxy 模式下强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
         // 即使用户在配置中直接写了真实的 API_KEY 或 BASE_URL，也会被替换
-        if model_provider.is_some() {
-            // 强制替换 Anthropic 敏感变量
-            if merged_envs.contains_key(ENV_ANTHROPIC_API_KEY) {
-                merged_envs.insert(
-                    ENV_ANTHROPIC_API_KEY.to_string(),
-                    API_KEY_PLACEHOLDER.to_string(),
-                );
-            }
-            if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
-                merged_envs.insert(
-                    ENV_ANTHROPIC_BASE_URL.to_string(),
-                    service_uuid
-                        .as_ref()
-                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
-                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
-                );
-            }
+        if cfg!(feature = "proxy") {
+            if model_provider.is_some() {
+                // 强制替换 Anthropic 敏感变量
+                if merged_envs.contains_key(ENV_ANTHROPIC_API_KEY) {
+                    merged_envs.insert(
+                        ENV_ANTHROPIC_API_KEY.to_string(),
+                        API_KEY_PLACEHOLDER.to_string(),
+                    );
+                }
+                // ANTHROPIC_AUTH_TOKEN 也需要替换（某些场景下可能存在）
+                if merged_envs.contains_key("ANTHROPIC_AUTH_TOKEN") {
+                    merged_envs.insert(
+                        "ANTHROPIC_AUTH_TOKEN".to_string(),
+                        API_KEY_PLACEHOLDER.to_string(),
+                    );
+                }
+                if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
+                    merged_envs.insert(
+                        ENV_ANTHROPIC_BASE_URL.to_string(),
+                        service_uuid
+                            .as_ref()
+                            .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                            .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
+                    );
+                }
 
-            // 强制替换 OpenAI 敏感变量
-            if merged_envs.contains_key(ENV_OPENAI_API_KEY) {
-                merged_envs.insert(
-                    ENV_OPENAI_API_KEY.to_string(),
-                    API_KEY_PLACEHOLDER.to_string(),
-                );
-            }
-            if merged_envs.contains_key(ENV_OPENAI_BASE_URL) {
-                merged_envs.insert(
-                    ENV_OPENAI_BASE_URL.to_string(),
-                    service_uuid
-                        .as_ref()
-                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
-                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
-                );
-            }
+                // 强制替换 OpenAI 敏感变量
+                if merged_envs.contains_key(ENV_OPENAI_API_KEY) {
+                    merged_envs.insert(
+                        ENV_OPENAI_API_KEY.to_string(),
+                        API_KEY_PLACEHOLDER.to_string(),
+                    );
+                }
+                if merged_envs.contains_key(ENV_OPENAI_BASE_URL) {
+                    merged_envs.insert(
+                        ENV_OPENAI_BASE_URL.to_string(),
+                        service_uuid
+                            .as_ref()
+                            .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                            .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
+                    );
+                }
 
-            debug!("[SACP] 🔒 已强制替换敏感环境变量为占位符/代理 URL");
+                debug!("[SACP] 🔒 已强制替换敏感环境变量为占位符/代理 URL");
+            }
+        } else {
+            debug!("[SACP] 🔓 非代理模式，使用真实 API Key 和 Base URL");
         }
 
         // 🔍 打印传递给 Agent 的完整环境变量（用于调试）
-        // 注意：此时敏感字段已被安全替换，可以放心打印
+        // 注意：敏感字段（API Key）需要脱敏处理，防止日志泄露
         debug!(
             "[SACP] 📋 启动 Agent 命令: {} {:?}",
             command_path, command_args
         );
         debug!("[SACP] 📋 工作目录: {:?}", project_path);
-        info!(
+        debug!(
             "[SACP] 📋 传递给 Agent 的环境变量 ({} 个):",
             merged_envs.len()
         );
 
-        // 按字母顺序排序并打印所有环境变量
+        // 需要脱敏的环境变量 key 列表（即使在 debug 日志中也不暴露完整值）
+        const SENSITIVE_ENV_KEYS: &[&str] = &[
+            ENV_ANTHROPIC_API_KEY,
+            ENV_OPENAI_API_KEY,
+            "ANTHROPIC_AUTH_TOKEN",
+        ];
+
+        // 按字母顺序排序并打印所有环境变量（仅在 debug 级别）
         let mut env_keys: Vec<_> = merged_envs.keys().collect();
         env_keys.sort();
 
         for key in env_keys.iter() {
             let value = merged_envs.get(*key).unwrap();
-            info!("[SACP] 📋   {} = {}", key, value);
+            if SENSITIVE_ENV_KEYS.contains(&key.as_str()) {
+                // 脱敏：只显示前4个字符 + ***
+                let masked = if value.len() > 4 {
+                    format!("{}***", &value[..4])
+                } else {
+                    "***".to_string()
+                };
+                debug!("[SACP] 📋   {} = {}", key, masked);
+            } else {
+                debug!("[SACP] 📋   {} = {}", key, value);
+            }
         }
 
-        // 启动子进程（使用 process group 来管理整个进程树）
-        // 使用 ProcessGroup::leader() 创建真正的进程组，确保能够清理所有孙进程
-        let mut child = CommandWrap::with_new(&command_path, |cmd| {
+        // 🔧 Windows：将 .cmd/.bat 等规范化为不弹窗的 node.exe + JS 形式（逻辑在 windows_launch 中）
+        #[cfg(windows)]
+        let (command_path, command_args) =
+            normalize_windows_command_for_no_window(command_path, command_args);
+
+        // 启动子进程（使用进程组/Job Object 来管理整个进程树）
+        // Unix: ProcessGroup::leader() 创建进程组，确保能够清理所有孙进程
+        // Windows: JobObject 管理进程树
+        let mut cmd_wrap = CommandWrap::with_new(&command_path, |cmd| {
             cmd.args(&command_args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .current_dir(&project_path);
             cmd.envs(&merged_envs);
-        })
-        .wrap(ProcessGroup::leader())
-        .spawn()
-        .context("[SACP] 无法启动 claude-code-acp 子进程")?;
+        });
+
+        #[cfg(unix)]
+        let mut child = cmd_wrap
+            .wrap(ProcessGroup::leader())
+            .spawn()
+            .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
+
+        #[cfg(windows)]
+        let mut child = cmd_wrap
+            .wrap(CreationFlags(PROCESS_CREATION_FLAGS(
+                CREATE_NO_WINDOW_FLAG,
+            )))
+            .wrap(JobObject)
+            .spawn()
+            .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
+
+        #[cfg(not(any(unix, windows)))]
+        compile_error!("仅支持 unix 和 windows 平台");
 
         let child_pid = child.id().unwrap_or(0);
         info!("[SACP] Claude Code ACP 子进程已启动，PID: {}", child_pid);
@@ -763,7 +1197,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     .mcp_servers(mcp_servers.clone())
                     .meta(system_prompt_meta);
 
-                info!("new_session_request: {:?}", new_session_request);
+                debug!("new_session_request: {:?}", new_session_request);
 
                 // 从配置获取超时值，默认 100 秒
                 let timeout_secs = start_config
@@ -1121,7 +1555,15 @@ mod tests {
         let config = get_default_sacp_agent_config(None, &shared_types::ServiceType::RCoder);
         assert!(config.is_ok());
         let config = config.unwrap();
-        assert_eq!(config.command, "claude-code-acp");
+
+        // 命令应该是 "claude-code-acp-ts" 或其绝对路径（如果 which crate 能找到）
+        // 两种情况都是正确的
+        let cmd = &config.command;
+        assert!(
+            cmd == "claude-code-acp-ts" || cmd.ends_with("claude-code-acp-ts"),
+            "Expected command to be 'claude-code-acp-ts' or an absolute path ending with 'claude-code-acp-ts', got: {}",
+            cmd
+        );
     }
 
     #[test]
@@ -1141,12 +1583,19 @@ mod tests {
         assert!(config.is_ok());
         let config = config.unwrap();
 
-        // 应该包含 API 占位符
+        // 验证 API Key：proxy 模式下为占位符，非 proxy 模式下为真实值
         assert!(config.env.contains_key("ANTHROPIC_API_KEY"));
-        assert_eq!(
-            config.env.get("ANTHROPIC_API_KEY"),
-            Some(&API_KEY_PLACEHOLDER.to_string())
-        );
+        if cfg!(feature = "proxy") {
+            assert_eq!(
+                config.env.get("ANTHROPIC_API_KEY"),
+                Some(&API_KEY_PLACEHOLDER.to_string())
+            );
+        } else {
+            assert_eq!(
+                config.env.get("ANTHROPIC_API_KEY"),
+                Some(&"sk-test-key".to_string())
+            );
+        }
 
         // 应该包含模型设置
         assert!(config.env.contains_key("ANTHROPIC_MODEL"));
@@ -1187,16 +1636,27 @@ mod tests {
 
         // 验证 OpenAI 环境变量
         assert!(config.env.contains_key("OPENAI_API_KEY"));
-        assert_eq!(
-            config.env.get("OPENAI_API_KEY"),
-            Some(&API_KEY_PLACEHOLDER.to_string())
-        );
-
         assert!(config.env.contains_key("OPENAI_BASE_URL"));
-        assert_eq!(
-            config.env.get("OPENAI_BASE_URL"),
-            Some(&DEFAULT_PROXY_BASE_URL.to_string())
-        );
+
+        if cfg!(feature = "proxy") {
+            assert_eq!(
+                config.env.get("OPENAI_API_KEY"),
+                Some(&API_KEY_PLACEHOLDER.to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_BASE_URL"),
+                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+            );
+        } else {
+            assert_eq!(
+                config.env.get("OPENAI_API_KEY"),
+                Some(&"sk-test-openai-key".to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_BASE_URL"),
+                Some(&"https://api.openai.com/v1".to_string())
+            );
+        }
 
         // nuwaxcode 使用 OPENCODE_MODEL，直接使用 model_name（已包含 openai-compatible/ 前缀）
         assert!(config.env.contains_key("OPENCODE_MODEL"));
@@ -1212,8 +1672,9 @@ mod tests {
 
     #[test]
     fn test_sensitive_env_vars_protection() {
-        // 测试即使配置中有真实的 API_KEY，也会被 launch 函数强制替换为占位符
-        // 注意：这个测试验证的是设计意图，实际的强制替换发生在 launch 函数中
+        // 测试默认配置中的环境变量值
+        // proxy 模式下：API_KEY 和 BASE_URL 为占位符/代理 URL
+        // 非 proxy 模式下：API_KEY 和 BASE_URL 为真实值
         let provider = ModelProviderConfig {
             id: "test".to_string(),
             name: "test".to_string(),
@@ -1229,25 +1690,43 @@ mod tests {
         assert!(config.is_ok());
         let config = config.unwrap();
 
-        // 验证默认配置中敏感变量已经是占位符
-        assert_eq!(
-            config.env.get("ANTHROPIC_API_KEY"),
-            Some(&API_KEY_PLACEHOLDER.to_string())
-        );
-        assert_eq!(
-            config.env.get("OPENAI_API_KEY"),
-            Some(&API_KEY_PLACEHOLDER.to_string())
-        );
-
-        // BASE_URL 应该是代理 URL（包含占位符）
-        assert_eq!(
-            config.env.get("ANTHROPIC_BASE_URL"),
-            Some(&DEFAULT_PROXY_BASE_URL.to_string())
-        );
-        assert_eq!(
-            config.env.get("OPENAI_BASE_URL"),
-            Some(&DEFAULT_PROXY_BASE_URL.to_string())
-        );
+        if cfg!(feature = "proxy") {
+            // proxy 模式下：敏感变量应该是占位符
+            assert_eq!(
+                config.env.get("ANTHROPIC_API_KEY"),
+                Some(&API_KEY_PLACEHOLDER.to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_API_KEY"),
+                Some(&API_KEY_PLACEHOLDER.to_string())
+            );
+            assert_eq!(
+                config.env.get("ANTHROPIC_BASE_URL"),
+                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_BASE_URL"),
+                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+            );
+        } else {
+            // 非 proxy 模式下：使用真实值
+            assert_eq!(
+                config.env.get("ANTHROPIC_API_KEY"),
+                Some(&"sk-real-key-should-be-replaced".to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_API_KEY"),
+                Some(&"sk-real-key-should-be-replaced".to_string())
+            );
+            assert_eq!(
+                config.env.get("ANTHROPIC_BASE_URL"),
+                Some(&"https://real-url-should-be-replaced.com".to_string())
+            );
+            assert_eq!(
+                config.env.get("OPENAI_BASE_URL"),
+                Some(&"https://real-url-should-be-replaced.com".to_string())
+            );
+        }
     }
 
     #[test]
@@ -1397,5 +1876,238 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("SacpAgentLaunchConfig"));
         assert!(debug_str.contains("test"));
+    }
+
+    // === mcp-proxy convert 诊断参数测试 ===
+
+    #[test]
+    fn test_is_mcp_proxy_command_simple() {
+        // 简化版只检测精确的命令名
+        assert!(is_mcp_proxy_command("mcp-proxy"));
+        // 不再检测大小写变体和路径
+        assert!(!is_mcp_proxy_command("MCP-PROXY"));
+        assert!(!is_mcp_proxy_command("Mcp-Proxy"));
+    }
+
+    #[test]
+    fn test_is_mcp_proxy_command_not_mcp_proxy() {
+        assert!(!is_mcp_proxy_command("node"));
+        assert!(!is_mcp_proxy_command("bunx"));
+        assert!(!is_mcp_proxy_command("/usr/bin/uvx"));
+        assert!(!is_mcp_proxy_command("mcp-proxy-other"));
+        // 路径形式不再匹配（简化版）
+        assert!(!is_mcp_proxy_command("/usr/local/bin/mcp-proxy"));
+        assert!(!is_mcp_proxy_command("C:\\Users\\test\\mcp-proxy.exe"));
+    }
+
+    #[test]
+    fn test_has_convert_subcommand() {
+        assert!(has_convert_subcommand(&["convert".to_string()]));
+        assert!(has_convert_subcommand(&[
+            "convert".to_string(),
+            "http://example.com".to_string()
+        ]));
+        assert!(has_convert_subcommand(&[
+            "--config".to_string(),
+            "config.json".to_string(),
+            "convert".to_string()
+        ]));
+    }
+
+    #[test]
+    fn test_has_convert_subcommand_no_convert() {
+        assert!(!has_convert_subcommand(&[]));
+        assert!(!has_convert_subcommand(&["serve".to_string()]));
+        assert!(!has_convert_subcommand(&[
+            "--config".to_string(),
+            "config.json".to_string()
+        ]));
+    }
+
+    #[test]
+    fn test_enhance_mcp_proxy_args_non_mcp_proxy() {
+        // 非 mcp-proxy 命令，应该原样返回
+        let args = vec!["arg1".to_string(), "arg2".to_string()];
+        let result = enhance_mcp_proxy_args("node", args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_enhance_mcp_proxy_args_no_convert() {
+        // mcp-proxy 但没有 convert 子命令，应该原样返回
+        let args = vec!["serve".to_string()];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_enhance_mcp_proxy_args_already_has_diagnostic() {
+        // 已有 --diagnostic 参数
+        let args = vec![
+            "convert".to_string(),
+            "--diagnostic".to_string(),
+            "--log-dir".to_string(),
+            "/tmp/logs".to_string(),
+        ];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args.clone());
+        // 应该原样返回，不重复添加
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_get_mcp_proxy_log_dir_none_when_unset() {
+        // 清除环境变量以测试返回 None
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+        let log_dir = get_mcp_proxy_log_dir();
+        assert_eq!(log_dir, None);
+    }
+
+    #[test]
+    fn test_get_mcp_proxy_log_dir_from_env() {
+        let custom_dir = "/custom/mcp-proxy-logs";
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var(ENV_MCP_PROXY_LOG_DIR, custom_dir);
+        }
+        let log_dir = get_mcp_proxy_log_dir();
+        assert_eq!(log_dir, Some(custom_dir.to_string()));
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+    }
+
+    #[test]
+    fn test_has_log_dir_arg() {
+        // 检测 --log-dir 参数
+        assert!(has_log_dir_arg(&["--log-dir".to_string(), "/tmp".to_string()]));
+        assert!(has_log_dir_arg(&["--log-dir=/tmp".to_string()]));
+        assert!(has_log_dir_arg(&["convert".to_string(), "--log-dir".to_string()]));
+
+        // 检测 --log-file 参数
+        assert!(has_log_dir_arg(&["--log-file".to_string(), "/tmp/log.txt".to_string()]));
+        assert!(has_log_dir_arg(&["--log-file=/tmp/log.txt".to_string()]));
+    }
+
+    #[test]
+    fn test_has_log_dir_arg_no_log_args() {
+        assert!(!has_log_dir_arg(&[]));
+        assert!(!has_log_dir_arg(&["convert".to_string()]));
+        assert!(!has_log_dir_arg(&["--diagnostic".to_string()]));
+        assert!(!has_log_dir_arg(&["--config".to_string(), "config.json".to_string()]));
+    }
+
+    #[test]
+    fn test_enhance_args_respects_existing_log_dir() {
+        // 模拟 debug 日志级别
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+            std::env::set_var(ENV_MCP_PROXY_LOG_DIR, "/env/path");
+        }
+
+        // 用户已配置 --log-dir，不应覆盖
+        let args = vec![
+            "convert".to_string(),
+            "--log-dir".to_string(),
+            "/custom/path".to_string(),
+        ];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args);
+
+        // 应该只追加 --diagnostic，不重复追加 --log-dir
+        assert!(result.contains(&"--diagnostic".to_string()));
+        // 只应有一个 --log-dir
+        assert_eq!(result.iter().filter(|a| *a == "--log-dir").count(), 1);
+        // --log-dir 的值应该是用户配置的 /custom/path
+        let log_dir_idx = result.iter().position(|a| a == "--log-dir").unwrap();
+        assert_eq!(result.get(log_dir_idx + 1), Some(&"/custom/path".to_string()));
+
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+    }
+
+    #[test]
+    fn test_enhance_args_respects_existing_log_file() {
+        // 模拟 debug 日志级别
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+            std::env::set_var(ENV_MCP_PROXY_LOG_DIR, "/env/path");
+        }
+
+        // 用户已配置 --log-file，不应追加 --log-dir
+        let args = vec![
+            "convert".to_string(),
+            "--log-file=/custom/file.log".to_string(),
+        ];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args);
+
+        // 应该只追加 --diagnostic
+        assert!(result.contains(&"--diagnostic".to_string()));
+        // 不应有 --log-dir
+        assert!(!result.iter().any(|a| a == "--log-dir"));
+
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+    }
+
+    #[test]
+    fn test_enhance_args_adds_log_dir_when_env_set() {
+        // 模拟 debug 日志级别和配置了 MCP_PROXY_LOG_DIR
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+            std::env::set_var(ENV_MCP_PROXY_LOG_DIR, "/var/log/mcp");
+        }
+
+        let args = vec!["convert".to_string()];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args);
+
+        // 应该追加 --diagnostic 和 --log-dir
+        assert!(result.contains(&"--diagnostic".to_string()));
+        assert!(result.contains(&"--log-dir".to_string()));
+        assert!(result.contains(&"/var/log/mcp".to_string()));
+
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+    }
+
+    #[test]
+    fn test_enhance_args_no_log_dir_when_env_unset() {
+        // 模拟 debug 日志级别但没有配置 MCP_PROXY_LOG_DIR
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+            std::env::remove_var(ENV_MCP_PROXY_LOG_DIR);
+        }
+
+        let args = vec!["convert".to_string()];
+        let result = enhance_mcp_proxy_args("mcp-proxy", args);
+
+        // 应该只追加 --diagnostic，不应有 --log-dir
+        assert!(result.contains(&"--diagnostic".to_string()));
+        assert!(!result.iter().any(|a| a == "--log-dir"));
+
+        // 清理环境变量
+        // SAFETY: 测试环境中修改环境变量是安全的
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+        }
     }
 }

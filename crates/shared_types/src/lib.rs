@@ -59,6 +59,7 @@ pub use model::{
     ChatResponse,
     ContainerBasicInfo,
     DocumentAttachment,
+    HealthResponse,
     HttpResult,
     ImageAttachment,
     ImageDimensions,
@@ -93,3 +94,7 @@ pub use service_type::{
 
 // 导出ChatPrompt的Builder
 pub use model::chat_prompt::ChatPromptBuilder;
+
+// Computer Agent HTTP API 类型
+pub mod computer_agent_types;
+pub use computer_agent_types::*;

@@ -29,7 +29,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::proxy_agent::AgentRequest;
 

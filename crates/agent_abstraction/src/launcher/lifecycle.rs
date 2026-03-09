@@ -363,7 +363,16 @@ impl AgentLifecycleGuard {
     /// - 子进程（进程组组长）
     /// - 所有孙进程（同一进程组中的进程）
     pub async fn graceful_stop(&self) -> Result<()> {
-        if self.inner.stopped.load(Ordering::SeqCst) {
+        // 🔥 使用原子 CAS 操作确保只执行一次清理
+        // compare_exchange 返回 Ok 表示成功将 false 改为 true，即当前线程获得清理权
+        // 返回 Err 表示已经被其他地方清理（Drop 或其他 graceful_stop 调用）
+        let should_cleanup = self
+            .inner
+            .stopped
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+
+        if !should_cleanup {
             debug!("Agent already stopped, skipping graceful stop");
             return Ok(());
         }
@@ -379,7 +388,10 @@ impl AgentLifecycleGuard {
         // 2. 终止进程组
         self.kill_process_group(false).await?;
 
-        self.inner.stopped.store(true, Ordering::SeqCst);
+        info!(
+            "Gracefully stopped Claude agent for project: {}",
+            self.inner.project_id
+        );
         Ok(())
     }
 
@@ -500,17 +512,25 @@ impl Clone for AgentLifecycleGuard {
 impl Drop for AgentLifecycleGuard {
     fn drop(&mut self) {
         let strong_count = Arc::strong_count(&self.inner);
-        let is_stopped = self.inner.stopped.load(Ordering::SeqCst);
 
         debug!(
-            "[Claude] AgentLifecycleGuard::drop 开始: project_id={}, pgid={}, strong_count={}, is_stopped={}",
-            self.inner.project_id, self.inner.pgid, strong_count, is_stopped
+            "[Claude] AgentLifecycleGuard::drop 开始: project_id={}, pgid={}, strong_count={}",
+            self.inner.project_id, self.inner.pgid, strong_count
         );
 
-        // 只有最后一个引用被drop时才执行清理
-        if strong_count == 1 && !is_stopped {
+        // 🔥 使用原子 CAS 操作确保只执行一次清理
+        // 不再依赖引用计数，因为引用计数可能因为多处 clone 而不准确
+        // compare_exchange 返回 Ok 表示成功将 false 改为 true，即当前线程获得清理权
+        // 返回 Err 表示已经被其他线程清理，当前线程无需操作
+        let should_cleanup = self
+            .inner
+            .stopped
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+
+        if should_cleanup {
             debug!(
-                "[Claude] AgentLifecycleGuard被drop，清理资源: {}",
+                "[Claude] AgentLifecycleGuard 获得清理权，开始清理资源: {}",
                 self.inner.project_id
             );
 
@@ -549,7 +569,7 @@ impl Drop for AgentLifecycleGuard {
                             pgid, e
                         );
                     } else {
-                        debug!(
+                        info!(
                             "[Claude] 进程组已终止: pgid={}, project_id={}",
                             pgid, self.inner.project_id
                         );
@@ -565,7 +585,15 @@ impl Drop for AgentLifecycleGuard {
             // 注意：后台回收任务 (reaper_task) 会自动完成
             // 不需要在这里等待或取消
 
-            self.inner.stopped.store(true, Ordering::SeqCst);
+            info!(
+                "[Claude] AgentLifecycleGuard 清理完成: project_id={}",
+                self.inner.project_id
+            );
+        } else {
+            debug!(
+                "[Claude] AgentLifecycleGuard 跳过清理（已被其他引用清理）: project_id={}",
+                self.inner.project_id
+            );
         }
 
         debug!(

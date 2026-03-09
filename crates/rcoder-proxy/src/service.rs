@@ -69,6 +69,14 @@ pub struct PortSnapshot {
     pub total_response_time_ns: u64,
 }
 
+/// 对 header value 进行脱敏，保留前 4 和后 4 个字符
+fn mask_header_value(value: &str) -> String {
+    if value.len() <= 10 {
+        return "***".to_string();
+    }
+    format!("{}***{}", &value[..4], &value[value.len() - 4..])
+}
+
 /// 对 URL 进行脱敏处理，隐藏域名中间部分
 ///
 /// # 示例
@@ -295,6 +303,12 @@ pub struct TrackingCtx {
     pub http_version: Option<String>,
     /// 连接是否被重用
     pub connection_reused: bool,
+    /// API 代理服务名称（用于错误响应体日志）
+    pub api_service_name: Option<String>,
+    /// 上游响应状态码（用于判断是否需要捕获错误响应体）
+    pub upstream_status: Option<u16>,
+    /// 错误响应体缓冲（仅在 4xx/5xx 时收集）
+    pub error_body_buf: Vec<u8>,
 }
 
 impl Default for TrackingCtx {
@@ -313,6 +327,9 @@ impl TrackingCtx {
             use_tls: false,
             http_version: None,
             connection_reused: false,
+            api_service_name: None,
+            upstream_status: None,
+            error_body_buf: Vec::new(),
         }
     }
 }
@@ -466,7 +483,7 @@ impl ProxyHttp for PortProxy {
             }
             RouteType::ApiProxy => {
                 // 🔒 API 密钥代理：注入真实密钥后转发到真实 API
-                self.handle_api_proxy_request(upstream_request, &original_uri, matched.params)
+                self.handle_api_proxy_request(upstream_request, &original_uri, matched.params, ctx)
                     .await?;
             }
             RouteType::AudioProxy => {
@@ -557,6 +574,7 @@ impl ProxyHttp for PortProxy {
             ALPN::H2 => "HTTP/2 (H2)",
             ALPN::H2H1 => "HTTP/2 优先 (H2H1)",
             ALPN::H1 => "HTTP/1.1 (H1)",
+            ALPN::Custom(_) => "Custom ALPN",
         };
         ctx.http_version = Some(alpn_str.to_string());
 
@@ -585,6 +603,7 @@ impl ProxyHttp for PortProxy {
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
         let duration = ctx.start.elapsed();
+        let status_code = upstream_response.status.as_u16();
         let status_text = format!("{}", upstream_response.status);
 
         // 记录响应指标
@@ -600,6 +619,9 @@ impl ProxyHttp for PortProxy {
         // 减少活跃连接计数
         self.metrics.dec_active();
 
+        // 记录上游状态码（用于 body filter 判断是否捕获错误响应体）
+        ctx.upstream_status = Some(status_code);
+
         // 日志记录
         if ctx.vnc_target_ip.is_some() {
             debug!(
@@ -610,15 +632,66 @@ impl ProxyHttp for PortProxy {
             // 🔗 API 代理响应: 打印协议版本
             let http_ver = ctx.http_version.as_deref().unwrap_or("unknown");
             let reused = if ctx.connection_reused { "是" } else { "否" };
-            debug!(
-                "📡 [API_PROXY] 上游响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
-                upstream_host, upstream_response.status, http_ver, ctx.use_tls, reused, duration
-            );
+
+            if status_code >= 400 {
+                // ⚠️ 错误响应：提升到 WARN 级别，打印响应 headers
+                warn!(
+                    "❌ [API_PROXY] 上游错误响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
+                    upstream_host, upstream_response.status, http_ver, ctx.use_tls, reused, duration
+                );
+                // 打印上游响应 headers
+                for (name, value) in upstream_response.headers.iter() {
+                    let val_str = value.to_str().unwrap_or("<binary>");
+                    debug!("🔍 [API_PROXY_DEBUG] 响应 Header: {} = {}", name, val_str);
+                }
+            } else {
+                info!(
+                    "📡 [API_PROXY] 上游响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
+                    upstream_host, upstream_response.status, http_ver, ctx.use_tls, reused, duration
+                );
+            }
         } else {
             debug!("收到上游响应: {}", upstream_response.status);
         }
 
         Ok(())
+    }
+
+    /// 处理上游响应体 — 捕获 4xx/5xx 错误响应体用于调试
+    fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<Option<Duration>> {
+        // 仅在 API 代理场景且上游返回 4xx/5xx 时捕获
+        if let (Some(status), Some(service_name)) =
+            (ctx.upstream_status, ctx.api_service_name.as_ref())
+        {
+            if status >= 400 {
+                // 限制捕获大小（最多 4KB，避免 OOM）
+                const MAX_ERROR_BODY: usize = 4096;
+                if let Some(b) = body.as_ref() {
+                    let remaining = MAX_ERROR_BODY.saturating_sub(ctx.error_body_buf.len());
+                    if remaining > 0 {
+                        let to_copy = b.len().min(remaining);
+                        ctx.error_body_buf.extend_from_slice(&b[..to_copy]);
+                    }
+                }
+
+                if end_of_stream && !ctx.error_body_buf.is_empty() {
+                    let body_str = String::from_utf8_lossy(&ctx.error_body_buf);
+                    warn!(
+                        "❌ [API_PROXY] 上游错误响应体 (service={}, status={}): {}",
+                        service_name, status, body_str
+                    );
+                }
+            }
+        }
+
+        // 不修改响应体，透传给客户端
+        Ok(None)
     }
 }
 
@@ -915,6 +988,7 @@ impl PortProxy {
         upstream_request: &mut RequestHeader,
         original_uri: &http::Uri,
         params: Params<'_, '_>,
+        ctx: &mut TrackingCtx,
     ) -> PingoraResult<()> {
         // 1. 提取服务名称（如 "anthropic", "openai"）
         let service_name = params.get("service_name").ok_or_else(|| {
@@ -925,14 +999,42 @@ impl PortProxy {
         // 2. 提取 API 路径（如 "v1/messages"）
         let api_path = params.get("path").unwrap_or("");
 
+        // 记录服务名到 ctx（用于错误响应体日志）
+        ctx.api_service_name = Some(service_name.to_string());
+
         debug!(
             "🔒 API 代理请求: service_name={}, api_path={}",
             service_name, api_path
         );
 
+        // 🔍 [DEBUG] 打印原始请求的所有 headers
+        {
+            let method = upstream_request.method.as_str();
+            let uri = original_uri.to_string();
+            debug!(
+                "🔍 [API_PROXY_DEBUG] ====== 原始请求 ======\n  Method: {}\n  URI: {}",
+                method, uri
+            );
+            for (name, value) in upstream_request.headers.iter() {
+                let val_str = value.to_str().unwrap_or("<binary>");
+                // 对敏感 header 做脱敏
+                if name.as_str().eq_ignore_ascii_case("x-api-key")
+                    || name.as_str().eq_ignore_ascii_case("authorization")
+                {
+                    let masked = mask_header_value(val_str);
+                    debug!("🔍 [API_PROXY_DEBUG]   Header: {} = {}", name, masked);
+                } else {
+                    debug!("🔍 [API_PROXY_DEBUG]   Header: {} = {}", name, val_str);
+                }
+            }
+        }
+
         // 3. 从 ApiKeyManager 查询 API 密钥配置
         let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
-            warn!("找不到服务 {} 的 API 密钥配置", service_name);
+            warn!("🔑 [API_PROXY] 找不到服务 '{}' 的 API 密钥配置", service_name);
+            // 打印所有可用的 key 用于调试
+            let available_keys: Vec<_> = self.api_key_manager.iter().map(|r| r.key().clone()).collect();
+            warn!("🔑 [API_PROXY] 可用的 keys: {:?}", available_keys);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
                 format!(
                     "找不到服务 {} 的 API 密钥配置，请确保已正确配置",
@@ -944,6 +1046,16 @@ impl PortProxy {
         let config = api_config.value();
         let base_url = config.base_url.trim_end_matches('/');
 
+        // 🔍 [DEBUG] 打印完整的 ModelProviderConfig（脱敏）
+        debug!(
+            "🔍 [API_PROXY_DEBUG] ====== DashMap 配置 (service={}) ======\n  base_url: {}\n  api_protocol: {:?}\n  requires_openai_auth: {}\n  api_key: {}",
+            service_name,
+            base_url,  // 不脱敏，debug 模式下需要完整 URL 排查
+            config.api_protocol,
+            config.requires_openai_auth,
+            mask_header_value(&config.api_key),
+        );
+
         // 4. 移除客户端传入的占位密钥（安全措施）
         upstream_request.remove_header("x-api-key");
         upstream_request.remove_header("authorization");
@@ -952,14 +1064,6 @@ impl PortProxy {
         // 5. 注入真实 API 密钥
         // Anthropic 协议使用 x-api-key，OpenAI 协议使用 Authorization: Bearer
         // 🔧 优先根据 api_protocol 判断，而不是 requires_openai_auth
-
-        // 添加调试日志（脱敏 URL）
-        debug!(
-            "🔑 [API_PROXY] 认证配置: api_protocol={:?}, requires_openai_auth={}, base_url={}",
-            config.api_protocol,
-            config.requires_openai_auth,
-            mask_url(base_url)
-        );
 
         // 判断使用哪种认证格式
         let use_anthropic_auth = config
@@ -973,15 +1077,17 @@ impl PortProxy {
 
         if use_anthropic_auth {
             upstream_request.insert_header("x-api-key", &config.api_key)?;
-            debug!(
-                "🔑 已注入 Anthropic 格式的 x-api-key (api_protocol={:?})",
+            info!(
+                "🔑 [API_PROXY] 已注入 Anthropic 格式 x-api-key: {} (api_protocol={:?})",
+                mask_header_value(&config.api_key),
                 config.api_protocol
             );
         } else {
             upstream_request
                 .insert_header("authorization", format!("Bearer {}", config.api_key))?;
-            debug!(
-                "🔑 已注入 OpenAI 格式的 Authorization Bearer token (api_protocol={:?})",
+            info!(
+                "🔑 [API_PROXY] 已注入 OpenAI 格式 Bearer: {} (api_protocol={:?})",
+                mask_header_value(&config.api_key),
                 config.api_protocol
             );
         }
@@ -999,6 +1105,12 @@ impl PortProxy {
         } else {
             new_uri_str
         };
+
+        // 🔍 [DEBUG] 打印完整的上游 URL（不脱敏）
+        debug!(
+            "🔍 [API_PROXY_DEBUG] 上游完整 URL: {}",
+            new_uri_str
+        );
 
         let new_uri = new_uri_str.parse::<http::Uri>().map_err(|e| {
             error!("URI 解析失败: {} - {}", new_uri_str, e);
@@ -1028,6 +1140,23 @@ impl PortProxy {
             "✅ [API_PROXY] {} 请求已重写到: {}",
             service_name, masked_url
         );
+
+        // 🔍 [DEBUG] 打印最终发送到上游的所有 headers
+        {
+            debug!("🔍 [API_PROXY_DEBUG] ====== 最终上游请求 Headers ======");
+            for (name, value) in upstream_request.headers.iter() {
+                let val_str = value.to_str().unwrap_or("<binary>");
+                if name.as_str().eq_ignore_ascii_case("x-api-key")
+                    || name.as_str().eq_ignore_ascii_case("authorization")
+                {
+                    let masked = mask_header_value(val_str);
+                    debug!("🔍 [API_PROXY_DEBUG]   {} = {}", name, masked);
+                } else {
+                    debug!("🔍 [API_PROXY_DEBUG]   {} = {}", name, val_str);
+                }
+            }
+            debug!("🔍 [API_PROXY_DEBUG] ====== Headers 结束 ======");
+        }
 
         Ok(())
     }
@@ -1107,6 +1236,7 @@ impl PortProxy {
             ALPN::H2 => "H2",
             ALPN::H2H1 => "H2H1",
             ALPN::H1 => "H1",
+            ALPN::Custom(_) => "Custom",
         };
         info!(
             "🔗 [API_PROXY] {} -> {}:{} (TLS: {}, ALPN: {})",

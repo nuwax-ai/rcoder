@@ -1,5 +1,7 @@
 // 重新导出 shared_types 中的模型，保持向后兼容
 
+pub use agent_abstraction::PromptMessage;
+
 pub use shared_types::{
     // Agent model exports
     AgentStatus, ProjectAndAgentInfo,
@@ -8,3 +10,6 @@ pub use shared_types::{
     // Session and message exports
     Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment, SessionMessageType, UnifiedSessionMessage, SessionNotify, ChatPromptResponse,
 };
+
+// 重新导出 sacp 类型，供客户端构造取消请求使用
+pub use sacp::schema::{CancelNotification, SessionId};

@@ -268,13 +268,13 @@ impl Default for MultiImageConfig {
 
         // 添加默认的 RCoder 服务配置
         services.insert(
-            "rcoder".to_string(),
+            ServiceType::RCoder.to_string(),
             crate::service_config::default_rcoder_service_config(),
         );
 
         // 添加默认的 ComputerAgentRunner 服务配置
         services.insert(
-            "computer-agent-runner".to_string(),
+            ServiceType::ComputerAgentRunner.to_string(),
             crate::service_config::default_agent_runner_service_config(),
         );
 
@@ -435,7 +435,7 @@ pub fn create_legacy_multi_image_config(
     };
 
     let mut services = HashMap::new();
-    services.insert("rcoder".to_string(), rcoder_config);
+    services.insert(ServiceType::RCoder.to_string(), rcoder_config);
 
     MultiImageConfig {
         global_defaults,

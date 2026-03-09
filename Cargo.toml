@@ -129,6 +129,7 @@ futures = "0.3"
 futures-util = "0.3"
 itertools = "0.14"
 bytes = "1.11"
+arrayvec = "0.7"
 # collections = "0.2"  # 这个包不存在
 
 
@@ -211,11 +212,11 @@ ringbuf = "0.4.8"
 
 diffy = { version = "0.4.2" }
 
-pingora = { version = "0.6", features = ["lb", "rustls"] }
-pingora-core = { version = "0.6", features = ["rustls"] }
-pingora-http = "0.6"
-pingora-proxy = { version = "0.6", features = ["rustls"] }
-pingora-load-balancing = { version = "0.6", features = ["rustls"] }
+pingora = { version = "0.7", features = ["lb", "rustls"] }
+pingora-core = { version = "0.7", features = ["rustls"] }
+pingora-http = "0.7"
+pingora-proxy = { version = "0.7", features = ["rustls"] }
+pingora-load-balancing = { version = "0.7", features = ["rustls"] }
 matchit = "0.9.1"
 structopt = "0.3"
 
