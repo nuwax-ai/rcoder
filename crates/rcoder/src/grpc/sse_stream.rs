@@ -327,17 +327,17 @@ pub async fn get_container_grpc_addr(project_id: &str, grpc_port: u16) -> anyhow
     // 获取全局 DockerManager 实例
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
-        .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to get global DockerManager: {}", e))?;
 
     // 使用高级 API 获取容器信息（包含 IP）
     let agent_info = docker_manager
         .get_agent_info(project_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("未找到容器信息: project_id={}", project_id))?;
+        .ok_or_else(|| anyhow::anyhow!("Container info not found: project_id={}", project_id))?;
 
     let grpc_addr = format!("{}:{}", agent_info.container_ip, grpc_port);
 
-    info!("✅ [CONTAINER] 获取容器 gRPC 地址: {}", grpc_addr);
+    info!("[CONTAINER] 获取容器 gRPC 地址: {}", grpc_addr);
     Ok(grpc_addr)
 }
 

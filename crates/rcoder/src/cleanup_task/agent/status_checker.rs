@@ -38,8 +38,8 @@ impl AgentStatusChecker {
         {
             Ok(Ok(is_active)) => Ok(is_active),
             Ok(Err(e)) => {
-                debug!("⚠️ [status_checker] gRPC 查询失败: {}", e);
-                Ok(false) // 查询失败，允许清理
+                debug!("⚠️ [status_checker] gRPC Query failed: {}", e);
+                Ok(false) // Query failed，允许清理
             }
             Err(_) => {
                 debug!("⏰ [status_checker] gRPC 查询超时");

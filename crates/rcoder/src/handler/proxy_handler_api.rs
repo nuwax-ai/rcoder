@@ -506,7 +506,7 @@ async fn proxy_request_handler(
     let target_path = path.unwrap_or_else(|| "/".to_string());
     let target_url = format!("http://{}:{}{}", target_host, port, target_path);
 
-    debug!("模拟代理请求: {} -> {}", port, target_url);
+    debug!("Mock proxy request: {} -> {}", port, target_url);
 
     // 这里只是用于文档展示，实际的代理由 Pingora 服务器处理
     // 如果用户访问这些接口，我们会返回信息，说明实际的代理在 Pingora 服务器端口

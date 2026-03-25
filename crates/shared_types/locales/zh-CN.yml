@@ -52,3 +52,40 @@ error.api_key_auth_failed: "API Key 鉴权失败"
 # 未知错误
 error.unknown: "未知错误"
 error.undefined: "未定义的错误码"
+
+# === 新增翻译 ===
+
+# 参数验证
+error.user_id_required: "user_id 不能为空"
+error.project_id_required: "project_id 不能为空"
+error.session_id_required: "session_id 不能为空"
+
+# Docker 相关
+error.docker_manager_failed: "获取 DockerManager 失败"
+error.container_not_found_info: "未找到容器信息"
+error.container_status_abnormal: "容器状态异常"
+error.container_start_failed: "启动容器失败"
+error.container_query_failed: "查询容器失败"
+error.container_delete_failed: "删除容器失败"
+error.container_create_failed: "创建容器失败"
+
+# 目录相关
+error.workspace_create_failed: "创建工作目录失败"
+error.project_dir_create_failed: "创建项目目录失败"
+error.user_dir_create_failed: "创建用户目录失败"
+
+# gRPC 相关
+error.grpc_addr_extract_failed: "提取 gRPC 地址失败"
+error.grpc_service_url_invalid: "无效的 service_url"
+error.grpc_service_url_missing_host: "无效的 service_url: 缺少 host"
+
+# 查询相关
+error.select_only: "只允许 SELECT 查询"
+error.query_execution_failed: "查询执行失败"
+
+# 资源相关
+error.resource_limits_invalid: "资源限制无效"
+error.resource_limits_validation_failed: "资源限制验证失败"
+
+# 未知重试
+error.unknown_retry_error: "未知重试错误"

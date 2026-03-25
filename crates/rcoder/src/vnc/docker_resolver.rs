@@ -74,8 +74,8 @@ impl CachedDockerResolver {
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                warn!("⚠️ [VNC_RESOLVER] 获取 DockerManager 失败: {}", e);
-                VncResolveError::QueryFailed(format!("获取 DockerManager 失败: {}", e))
+                warn!("[VNC_RESOLVER] Failed to get DockerManager: {}", e);
+                VncResolveError::QueryFailed(format!("Failed to get DockerManager: {}", e))
             })?;
 
         // ComputerAgentRunner 模式：使用 user_id 作为容器标识
@@ -90,7 +90,7 @@ impl CachedDockerResolver {
                 VncResolveError::QueryFailed(format!("查询容器信息失败: {}", e))
             })?
             .ok_or_else(|| {
-                debug!("🔍 [VNC_RESOLVER] 容器不存在: user_id={}", user_id);
+                debug!("[VNC_RESOLVER] 容器不存在: user_id={}", user_id);
                 VncResolveError::ContainerNotFound(user_id.to_string())
             })?;
 

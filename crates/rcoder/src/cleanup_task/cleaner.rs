@@ -80,13 +80,13 @@ impl AgentCleaner {
                 }
             }
             Err(e) => {
-                warn!("⚠️ [cleaner] 日志清理失败: {}", e);
+                warn!("[cleaner] 日志清理失败: {}", e);
             }
         }
 
         // 2. 扫描需要清理的 agent
         let idle_agents = self.agent_scanner.scan_idle_agents().await?;
-        info!("🔍 [cleaner] 扫描到 {} 个闲置 agent", idle_agents.len());
+        info!("[cleaner] 扫描到 {} 个闲置 agent", idle_agents.len());
 
         // 3. 清理每个 agent
         for project_id in idle_agents {
@@ -98,11 +98,11 @@ impl AgentCleaner {
                     if destroyed {
                         current_stats.containers_destroyed += 1;
                     }
-                    info!("✅ [cleaner] Agent 清理成功: {}", project_id);
+                    info!("[cleaner] Agent 清理成功: {}", project_id);
                 }
                 Err(e) => {
                     current_stats.failed_cleaned += 1;
-                    warn!("⚠️ [cleaner] Agent 清理失败: {} - {}", project_id, e);
+                    warn!("[cleaner] Agent 清理失败: {} - {}", project_id, e);
                 }
             }
         }
@@ -121,7 +121,7 @@ impl AgentCleaner {
             duration.as_secs_f64(),
             current_stats.summary()
         );
-        info!("📊 [cleaner] 累计统计: {}", self.stats.summary());
+        info!("[cleaner] 累计统计: {}", self.stats.summary());
 
         Ok(current_stats)
     }
@@ -129,7 +129,7 @@ impl AgentCleaner {
     /// 清理单个 agent
     /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录
     async fn cleanup_agent(&self, project_id: &str) -> Result<bool> {
-        info!("🚀 [cleaner] 开始清理 agent: {}", project_id);
+        info!("[cleaner] 开始清理 agent: {}", project_id);
 
         // 1. 获取项目信息
         let agent_info = self
@@ -185,14 +185,14 @@ impl AgentCleaner {
 
         // 5. 从存储中移除项目记录（始终执行）
         self.state.remove_project(project_id);
-        info!("✅ [cleaner] 已删除项目记录: project_id={}", project_id);
+        info!("[cleaner] 已删除项目记录: project_id={}", project_id);
 
         Ok(container_destroyed)
     }
 
     /// 运行清理任务（定时）
     pub async fn run(&mut self) {
-        info!("🚀 [cleaner] 清理任务已启动");
+        info!("[cleaner] 清理任务已启动");
 
         let mut interval = interval(self.config.cleanup_interval);
 
@@ -201,7 +201,7 @@ impl AgentCleaner {
 
             match self.cleanup_once().await {
                 Ok(_) => debug!("✅ [cleaner] 定时清理完成"),
-                Err(e) => warn!("⚠️ [cleaner] 定时清理失败: {}", e),
+                Err(e) => warn!("[cleaner] 定时清理失败: {}", e),
             }
         }
     }

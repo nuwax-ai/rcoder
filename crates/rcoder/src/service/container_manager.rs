@@ -44,8 +44,8 @@ impl ContainerManager {
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                error!("❌ [CONTAINER_MGR] 获取全局 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+                error!("[CONTAINER_MGR] Failed to get global DockerManager: {}", e);
+                AppError::internal_server_error(&format!("Failed to get global DockerManager: {}", e))
             })?;
 
         // 🚀 优化：直接调用 DockerManager 的高级 API
@@ -53,8 +53,8 @@ impl ContainerManager {
             .get_agent_info(project_id)
             .await
             .map_err(|e| {
-                error!("❌ [CONTAINER_MGR] 查询容器信息失败: {}", e);
-                AppError::internal_server_error(&format!("查询容器信息失败: {}", e))
+                error!("[CONTAINER_MGR] Failed to query container info: {}", e);
+                AppError::internal_server_error(&format!("Failed to query container info: {}", e))
             })
     }
 }
@@ -68,13 +68,13 @@ async fn ensure_container_exists(
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
-            error!("❌ [CONTAINER_MGR] 获取全局 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+            error!("[CONTAINER_MGR] Failed to get global DockerManager: {}", e);
+            AppError::internal_server_error(&format!("Failed to get global DockerManager: {}", e))
         })?;
 
     // 1. 尝试获取现有容器
     if let Ok(Some(info)) = docker_manager.get_agent_info(project_id).await {
-        info!("✅ [CONTAINER_MGR] 容器已存在: {}", info.container_id);
+        info!("[CONTAINER_MGR] 容器已存在: {}", info.container_id);
         return Ok(info);
     }
 
@@ -103,7 +103,7 @@ async fn create_container_for_request(
     // 1. 准备工作目录（仍需在 rcoder 容器内创建）
     create_project_workspace(project_id)
         .await
-        .map_err(|e| AppError::internal_server_error(&format!("创建工作目录失败: {}", e)))?;
+        .map_err(|e| AppError::internal_server_error(&format!("Failed to create workspace directory: {}", e)))?;
 
     info!(
         "📁 [CONTAINER_MGR] 项目工作区已准备: /app/project_workspace/{}",
@@ -122,8 +122,8 @@ async fn create_container_for_request(
         )
         .await
         .map_err(|e| {
-            error!("❌ [CONTAINER_MGR] 启动容器失败: {}", e);
-            AppError::internal_server_error(&format!("启动容器失败: {}", e))
+            error!("[CONTAINER_MGR] Failed to start container: {}", e);
+            AppError::internal_server_error(&format!("Failed to start container: {}", e))
         })?;
 
     info!(
@@ -153,14 +153,14 @@ pub async fn create_project_workspace(project_id: &str) -> Result<std::path::Pat
     tokio::fs::create_dir_all(&workspace_dir)
         .await
         .map_err(|e| {
-            error!("❌ [CONTAINER_MGR] 创建workspace目录失败: {:?}", e);
-            AppError::internal_server_error(&format!("创建workspace目录失败: {}", e))
+            error!("[CONTAINER_MGR] Failed to create workspace directory: {:?}", e);
+            AppError::internal_server_error(&format!("Failed to create workspace directory: {}", e))
         })?;
 
     let project_dir = workspace_dir.join(project_id);
     tokio::fs::create_dir_all(&project_dir).await.map_err(|e| {
-        error!("❌ [CONTAINER_MGR] 创建项目目录失败: {:?}", e);
-        AppError::internal_server_error(&format!("创建项目目录失败: {}", e))
+        error!("[CONTAINER_MGR] Failed to create project directory: {:?}", e);
+        AppError::internal_server_error(&format!("Failed to create project directory: {}", e))
     })?;
 
     Ok(project_dir)

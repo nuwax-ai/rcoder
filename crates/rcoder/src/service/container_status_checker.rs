@@ -330,7 +330,7 @@ impl ContainerStatusChecker {
                                 Ok(Some(_)) => true,
                                 Ok(None) => false,
                                 Err(e) => {
-                                    debug!("⚠️ [STATUS_CHECKER] 查询容器失败: {}", e);
+                                    debug!("⚠️ [STATUS_CHECKER] Failed to query container: {}", e);
                                     false
                                 }
                             }
@@ -348,7 +348,7 @@ impl ContainerStatusChecker {
                             Ok(Some(_)) => true,
                             Ok(None) => false,
                             Err(e) => {
-                                debug!("⚠️ [STATUS_CHECKER] 查询容器失败: {}", e);
+                                debug!("⚠️ [STATUS_CHECKER] Failed to query container: {}", e);
                                 false
                             }
                         }
@@ -370,7 +370,7 @@ impl ContainerStatusChecker {
                 exists
             }
             Err(e) => {
-                warn!("⚠️ [STATUS_CHECKER] 获取 Docker Manager 失败: {}", e);
+                warn!("[STATUS_CHECKER] 获取 Docker Manager 失败: {}", e);
                 // 无法确定容器状态，保守地认为容器存在
                 true
             }
@@ -419,7 +419,7 @@ impl ContainerStatusChecker {
                 // 无需 insert，修改已生效
 
                 if was_failing {
-                    info!("✅ [STATUS_CHECKER] 容器恢复正常: {}", lookup_key);
+                    info!("[STATUS_CHECKER] 容器恢复正常: {}", lookup_key);
                 }
             }
             Entry::Vacant(entry) => {
@@ -464,7 +464,7 @@ impl ContainerStatusChecker {
             1 => {
                 // 首次失败：INFO 级别
                 info!(
-                    "❌ [STATUS_CHECKER] 容器首次查询失败: {} - {}",
+                    "❌ [STATUS_CHECKER] 容器首次Query failed: {} - {}",
                     lookup_key, error
                 );
             }
@@ -568,7 +568,7 @@ pub fn start_container_status_checker(
 
             // 执行容器状态检查
             if let Err(e) = checker.check_all_containers().await {
-                warn!("⚠️ [STATUS_CHECKER] 容器状态检查失败: {}", e);
+                warn!("[STATUS_CHECKER] 容器状态检查失败: {}", e);
             }
 
             // 定期清理过期的健康状态

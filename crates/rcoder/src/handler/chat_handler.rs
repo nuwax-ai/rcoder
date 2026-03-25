@@ -184,11 +184,11 @@ pub async fn handle_chat(
 
     // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
     let _ = {
-        info!("🔍 [CHAT] 开始获取/创建项目信息: project_id={}", project_id);
+        info!("[CHAT] 开始获取/创建项目信息: project_id={}", project_id);
 
         // 检查项目是否存在
         if let Some(existing_info) = state.get_project(&project_id) {
-            info!("📋 [CHAT] 更新现有项目信息: project_id={}", project_id);
+            info!("[CHAT] 更新现有项目信息: project_id={}", project_id);
 
             // 检查是否需要更新扩展状态
             let needs_extended_update = existing_info.container().is_none()
@@ -218,11 +218,11 @@ pub async fn handle_chat(
             } else {
                 // 只需要更新活动时间
                 state.update_activity(&project_id);
-                info!("✅ [CHAT] 项目活动时间更新完成: project_id={}", project_id);
+                info!("[CHAT] 项目活动时间更新完成: project_id={}", project_id);
                 existing_info
             }
         } else {
-            info!("🆕 [CHAT] 创建新项目信息: project_id={}", project_id);
+            info!("[CHAT] 创建新项目信息: project_id={}", project_id);
 
             // 创建新的 ProjectAndContainerInfo
             let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
@@ -248,13 +248,13 @@ pub async fn handle_chat(
     // 请求到达时立即更新活动时间（不等待请求执行结果）
     // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
     state.update_activity(&project_id);
-    debug!("🔄 [CHAT] 已更新活动时间: project_id={}", project_id);
+    debug!("[CHAT] 已更新活动时间: project_id={}", project_id);
 
     // 🆕 自动查找 session_id 逻辑
     // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
     let session_id_to_use = match &request.session_id {
         Some(sid) if !sid.is_empty() => {
-            debug!("🔍 [CHAT] 使用用户传递的 session_id: {}", sid);
+            debug!("[CHAT] 使用用户传递的 session_id: {}", sid);
             sid.clone()
         }
         _ => {
@@ -271,13 +271,13 @@ pub async fn handle_chat(
                             sid.to_string()
                         }
                         _ => {
-                            debug!("🆕 [CHAT] 项目存在但无 session_id，创建新会话");
+                            debug!("[CHAT] 项目存在但无 session_id，创建新会话");
                             String::new()
                         }
                     }
                 }
                 None => {
-                    debug!("🆕 [CHAT] 未找到现有项目，创建新会话");
+                    debug!("[CHAT] 未找到现有项目，创建新会话");
                     String::new()
                 }
             }
@@ -294,14 +294,14 @@ pub async fn handle_chat(
     // 🆕 自动查找 session_id 逻辑结束
 
     // 第三步：转发请求到容器服务（使用全局连接池）
-    info!("🚀 [CHAT] 开始转发请求到容器服务");
+    info!("[CHAT] 开始转发请求到容器服务");
     let result = forward_request_to_container_service(
         &request_for_forward,
         &container_info,
         &state.grpc_pool,
     )
     .await;
-    info!("📥 [CHAT] 容器服务返回结果: success={}", result.is_ok());
+    info!("[CHAT] 容器服务返回结果: success={}", result.is_ok());
 
     // 响应后状态更新 - 使用 DuckDB 存储
     // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
@@ -346,10 +346,10 @@ pub async fn handle_chat(
     if result.as_ref().map_or(true, |r| {
         !r.is_success() && r.data.as_ref().map_or(true, |d| d.session_id.is_empty())
     }) {
-        error!("❌ [CHAT] 容器服务返回错误: {:?}", result);
+        error!("[CHAT] 容器服务返回错误: {:?}", result);
     }
 
-    info!("🏁 [CHAT] 准备返回最终结果: project_id={}", project_id);
+    info!("[CHAT] 准备返回最终结果: project_id={}", project_id);
 
     result
 }
@@ -365,10 +365,10 @@ async fn forward_request_to_container_service(
     let project_id = if let Some(id) = &request.project_id {
         id.clone()
     } else {
-        error!("[FORWARD]会话 project_id 不能为空");
+        error!("[FORWARD]会话 project_id is required");
         return Ok(crate::HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            "project_id is required",
         ));
     };
 
@@ -458,7 +458,7 @@ async fn forward_request_to_container_service(
                     continue;
                 } else if !should_retry {
                     // 不可重试错误：直接返回
-                    error!("❌ [FORWARD] 检测到不可重试错误，停止重试: {}", e);
+                    error!("[FORWARD] 检测到不可重试错误，停止重试: {}", e);
                     last_error = Some(e);
                     break;
                 }
@@ -471,7 +471,7 @@ async fn forward_request_to_container_service(
 
     // 如果所有重试都失败
     if let Some(e) = last_error {
-        error!("❌ [FORWARD] gRPC 最终调用失败: {}", e);
+        error!("[FORWARD] gRPC 最终调用失败: {}", e);
 
         // gRPC 通信失败，直接返回错误
         // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
@@ -484,7 +484,7 @@ async fn forward_request_to_container_service(
         // 理论上不会走到这里，除非 max_retries < 1
         Ok(HttpResult::error(
             shared_types::error_codes::ERR_GRPC_ERROR,
-            "未知重试错误",
+            "Unknown retry error",
         ))
     }
 }

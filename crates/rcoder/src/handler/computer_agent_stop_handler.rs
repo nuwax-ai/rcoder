@@ -76,18 +76,18 @@ pub async fn computer_agent_stop(
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
-        error!("❌ [COMPUTER_STOP] user_id 不能为空");
+        error!("[COMPUTER_STOP] user_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            "user_id is required",
         ));
     }
 
     if request.project_id.trim().is_empty() {
-        error!("❌ [COMPUTER_STOP] project_id 不能为空");
+        error!("[COMPUTER_STOP] project_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            "project_id is required",
         ));
     }
 
@@ -106,7 +106,7 @@ pub async fn computer_agent_stop(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!("⚠️ [COMPUTER_STOP] 找不到用户容器: user_id={}", user_id);
+            warn!("[COMPUTER_STOP] 找不到用户容器: user_id={}", user_id);
             return Ok(HttpResult::error(
                 "NOT_FOUND",
                 &format!("找不到用户 {} 的容器", user_id),
@@ -127,7 +127,7 @@ pub async fn computer_agent_stop(
 
     // 提取 gRPC 地址
     let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
-    info!("🌐 [COMPUTER_STOP] gRPC 地址: {}", grpc_addr);
+    info!("[COMPUTER_STOP] gRPC 地址: {}", grpc_addr);
 
     // 调用 StopAgent RPC
     match crate::grpc::grpc_stop_agent_with_pool(
@@ -170,7 +170,7 @@ pub async fn computer_agent_stop(
                 // Agent 停止失败或已经停止
                 match response.result.as_str() {
                     "not_found" => {
-                        warn!("⚠️ [COMPUTER_STOP] Agent 未找到: project_id={}", project_id);
+                        warn!("[COMPUTER_STOP] Agent 未找到: project_id={}", project_id);
                         return Ok(HttpResult::error(
                             "NOT_FOUND",
                             &format!("找不到项目 {} 的 Agent", project_id),
@@ -195,11 +195,11 @@ pub async fn computer_agent_stop(
                     }
                     "error" => {
                         let err_msg = response.message.unwrap_or_else(|| "未知错误".to_string());
-                        error!("❌ [COMPUTER_STOP] Agent 停止失败: {}", err_msg);
+                        error!("[COMPUTER_STOP] Agent 停止失败: {}", err_msg);
                         return Ok(HttpResult::error("STOP_FAILED", &err_msg));
                     }
                     _ => {
-                        warn!("⚠️ [COMPUTER_STOP] 未知的响应结果: {}", response.result);
+                        warn!("[COMPUTER_STOP] 未知的响应结果: {}", response.result);
                         return Ok(HttpResult::error(
                             "UNKNOWN_RESULT",
                             &format!("未知的响应结果: {}", response.result),

@@ -7,7 +7,7 @@ mod model;
 
 // i18n 国际化模块
 pub mod i18n;
-pub use i18n::{t, parse_accept_language, set_locale, get_locale, DEFAULT_LOCALE, SUPPORTED_LOCALES};
+pub use i18n::{t, t_default, parse_accept_language, set_locale, get_locale, DEFAULT_LOCALE, SUPPORTED_LOCALES};
 
 // Chat Agent 配置模块
 mod chat_agent_config;
@@ -28,7 +28,7 @@ pub use constants::*;
 
 // 错误码定义模块
 pub mod error_codes;
-pub use error_codes::get_error_message;
+pub use error_codes::{get_error_message, get_i18n_message, get_i18n_message_default};
 
 // gRPC 模块
 pub mod grpc {

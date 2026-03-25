@@ -59,8 +59,8 @@ impl ComputerContainerManager {
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
             })?;
 
         // 1. 尝试获取现有容器
@@ -89,7 +89,7 @@ impl ComputerContainerManager {
                         .await
                     {
                         warn!(
-                            "⚠️ [COMPUTER_CONTAINER] 删除旧容器失败 (继续创建新容器): {}",
+                            "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (继续创建新容器): {}",
                             e
                         );
                     }
@@ -129,8 +129,8 @@ impl ComputerContainerManager {
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
             })?;
 
         Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
@@ -165,8 +165,8 @@ impl ComputerContainerManager {
             )
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 启动容器失败: {}", e);
-                AppError::internal_server_error(&format!("启动容器失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to start container: {}", e);
+                AppError::internal_server_error(&format!("Failed to start container: {}", e))
             })?;
 
         info!(
@@ -196,8 +196,8 @@ impl ComputerContainerManager {
         tokio::fs::create_dir_all(&workspace_root)
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 创建 workspace 目录失败: {:?}", e);
-                AppError::internal_server_error(&format!("创建 workspace 目录失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to create workspace directory: {:?}", e);
+                AppError::internal_server_error(&format!("Failed to create workspace directory: {}", e))
             })?;
 
         // 创建用户目录
@@ -205,8 +205,8 @@ impl ComputerContainerManager {
         tokio::fs::create_dir_all(&user_workspace)
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 创建用户目录失败: {:?}", e);
-                AppError::internal_server_error(&format!("创建用户目录失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to create user directory: {:?}", e);
+                AppError::internal_server_error(&format!("Failed to create user directory: {}", e))
             })?;
 
         debug!(
@@ -226,16 +226,16 @@ impl ComputerContainerManager {
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
             })?;
 
         docker_manager
             .get_user_container_info(user_id)
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 查询容器信息失败: {}", e);
-                AppError::internal_server_error(&format!("查询容器信息失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to query container info: {}", e);
+                AppError::internal_server_error(&format!("Failed to query container info: {}", e))
             })
     }
 }

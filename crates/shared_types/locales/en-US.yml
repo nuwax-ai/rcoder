@@ -52,3 +52,40 @@ error.api_key_auth_failed: "API Key authentication failed"
 # Unknown
 error.unknown: "Unknown error"
 error.undefined: "Undefined error code"
+
+# === New i18n keys ===
+
+# Parameter validation
+error.user_id_required: "user_id is required"
+error.project_id_required: "project_id is required"
+error.session_id_required: "session_id is required"
+
+# Docker related
+error.docker_manager_failed: "Failed to get DockerManager"
+error.container_not_found_info: "Container info not found"
+error.container_status_abnormal: "Container status abnormal"
+error.container_start_failed: "Failed to start container"
+error.container_query_failed: "Failed to query container"
+error.container_delete_failed: "Failed to delete container"
+error.container_create_failed: "Failed to create container"
+
+# Directory related
+error.workspace_create_failed: "Failed to create workspace directory"
+error.project_dir_create_failed: "Failed to create project directory"
+error.user_dir_create_failed: "Failed to create user directory"
+
+# gRPC related
+error.grpc_addr_extract_failed: "Failed to extract gRPC address"
+error.grpc_service_url_invalid: "Invalid service_url"
+error.grpc_service_url_missing_host: "Invalid service_url: missing host"
+
+# Query related
+error.select_only: "Only SELECT queries are allowed"
+error.query_execution_failed: "Query execution failed"
+
+# Resource related
+error.resource_limits_invalid: "Invalid resource limits"
+error.resource_limits_validation_failed: "Resource limits validation failed"
+
+# Unknown retry
+error.unknown_retry_error: "Unknown retry error"

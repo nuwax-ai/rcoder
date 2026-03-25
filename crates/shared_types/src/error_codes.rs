@@ -131,6 +131,29 @@ pub fn get_error_message(code: &str, locale: &str) -> String {
     t(key, locale)
 }
 
+/// 通过 i18n key 直接获取多语言消息
+///
+/// # Arguments
+/// * `key` - i18n key，如 "error.user_id_required"
+/// * `locale` - 语言代码
+///
+/// # Returns
+/// 多语言消息
+pub fn get_i18n_message(key: &str, locale: &str) -> String {
+    t(key, locale)
+}
+
+/// 通过 i18n key 获取默认语言消息
+///
+/// # Arguments
+/// * `key` - i18n key，如 "error.user_id_required"
+///
+/// # Returns
+/// 默认语言的消息
+pub fn get_i18n_message_default(key: &str) -> String {
+    t(key, crate::i18n::DEFAULT_LOCALE)
+}
+
 /// 获取错误码的默认描述（向后兼容，使用默认语言）
 ///
 /// 🔴 注意：此函数保留用于向后兼容，新代码请使用 `get_error_message`

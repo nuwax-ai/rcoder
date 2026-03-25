@@ -68,7 +68,7 @@ pub struct CancelResponse {
 async fn get_container_for_cancel(
     project_id: &str,
 ) -> Result<Option<ContainerBasicInfo>, AppError> {
-    info!("🔍 [CANCEL_CONTAINER] 查找容器: project_id={}", project_id);
+    info!("[CANCEL_CONTAINER] 查找容器: project_id={}", project_id);
 
     // 只获取容器，不创建
     let container_info =
@@ -188,7 +188,7 @@ async fn forward_cancel_request_to_container_service(
                 let error_msg = grpc_response
                     .message
                     .unwrap_or_else(|| "未知错误".to_string());
-                error!("❌ [CANCEL_FORWARD] gRPC 取消失败: {}", error_msg);
+                error!("[CANCEL_FORWARD] gRPC 取消失败: {}", error_msg);
                 Ok(HttpResult::error(
                     shared_types::error_codes::ERR_CANCEL_FAILED,
                     &error_msg,
@@ -196,7 +196,7 @@ async fn forward_cancel_request_to_container_service(
             }
         }
         Err(e) => {
-            error!("❌ [CANCEL_FORWARD] gRPC 调用失败: {}", e);
+            error!("[CANCEL_FORWARD] gRPC 调用失败: {}", e);
 
             // 检查特定的 gRPC 错误码并分类处理
             if let Some(status) = crate::grpc::extract_grpc_status(&e) {
@@ -204,7 +204,7 @@ async fn forward_cancel_request_to_container_service(
                 match status.code() {
                     Code::NotFound => {
                         // 会话或 Agent 不存在，返回成功（幂等设计）
-                        info!("✅ [CANCEL_FORWARD] session 不存在，幂等返回成功");
+                        info!("[CANCEL_FORWARD] session 不存在，幂等返回成功");
                         return Ok(HttpResult::success(CancelResponse {
                             success: true,
                             session_id: session_id.unwrap_or("").to_string(),
@@ -217,14 +217,14 @@ async fn forward_cancel_request_to_container_service(
 
                         if !container_exists {
                             // 容器已销毁，取消目标已达成（幂等设计）
-                            info!("✅ [CANCEL_FORWARD] 容器已销毁，取消目标已达成");
+                            info!("[CANCEL_FORWARD] 容器已销毁，取消目标已达成");
                             return Ok(HttpResult::success(CancelResponse {
                                 success: true,
                                 session_id: session_id.unwrap_or("").to_string(),
                             }));
                         } else {
                             // 容器存在但服务不可用（可能是临时故障），返回错误
-                            warn!("⚠️ [CANCEL_FORWARD] Agent Worker 不可用（容器存在，可能是临时故障）");
+                            warn!("[CANCEL_FORWARD] Agent Worker 不可用（容器存在，可能是临时故障）");
                             return Ok(HttpResult::error(
                                 shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
                                 "Agent 服务暂时不可用，请稍后重试",
@@ -233,7 +233,7 @@ async fn forward_cancel_request_to_container_service(
                     }
                     other_code => {
                         // 其他 gRPC 状态码
-                        error!("❌ [CANCEL_FORWARD] gRPC 错误码: {:?}", other_code);
+                        error!("[CANCEL_FORWARD] gRPC 错误码: {:?}", other_code);
                     }
                 }
             }
@@ -278,9 +278,9 @@ async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> 
                     false
                 }
                 Err(e) => {
-                    // 查询失败，保守地认为容器存在
+                    // Query failed，保守地认为容器存在
                     warn!(
-                        "⚠️ [CANCEL_FORWARD] 查询容器状态失败: {}，保守认为容器存在",
+                        "⚠️ [CANCEL_FORWARD] Failed to query container status: {}，保守认为容器存在",
                         e
                     );
                     true
@@ -289,7 +289,7 @@ async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> 
         }
         Err(e) => {
             // 无法获取 Docker Manager，保守地认为容器存在
-            warn!("⚠️ [CANCEL_FORWARD] 获取 Docker Manager 失败: {}，保守认为容器存在", e);
+            warn!("[CANCEL_FORWARD] 获取 Docker Manager 失败: {}，保守认为容器存在", e);
             true
         }
     }
@@ -541,7 +541,7 @@ pub async fn agent_session_cancel(
                 "data": null,
                 "error": {
                     "code": "ERR_VALIDATION",
-                    "message": "user_id 或 project_id 不能为空"
+                    "message": "user_id 或 project_id is required"
                 }
             })
         ),
@@ -589,19 +589,19 @@ pub async fn computer_agent_session_cancel(
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     // 验证 user_id 不为空
     if query.user_id.trim().is_empty() {
-        error!("❌ [COMPUTER_CANCEL] user_id 不能为空");
+        error!("[COMPUTER_CANCEL] user_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            "user_id is required",
         ));
     }
 
     // 验证 project_id 不为空
     if query.project_id.trim().is_empty() {
-        error!("❌ [COMPUTER_CANCEL] project_id 不能为空");
+        error!("[COMPUTER_CANCEL] project_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            "project_id is required",
         ));
     }
 

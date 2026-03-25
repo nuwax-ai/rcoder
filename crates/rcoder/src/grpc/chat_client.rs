@@ -70,7 +70,7 @@ pub async fn grpc_chat_with_pool(
 
     // 发送请求
     let response = client.chat(request).await.map_err(|e| {
-        error!("❌ [gRPC_CHAT] Chat RPC 调用失败: {}", e);
+        error!("[gRPC_CHAT] Chat RPC 调用失败: {}", e);
         anyhow::anyhow!("gRPC Chat 调用失败: {}", e)
     })?;
 
@@ -126,7 +126,7 @@ pub async fn grpc_cancel_session_with_pool(
         .cancel_session(tonic::Request::new(grpc_request))
         .await
         .map_err(|e| {
-            error!("❌ [gRPC_CANCEL] CancelSession RPC 调用失败: {}", e);
+            error!("[gRPC_CANCEL] CancelSession RPC 调用失败: {}", e);
             anyhow::anyhow!("gRPC CancelSession 调用失败: {}", e)
         })?;
 
@@ -182,7 +182,7 @@ pub async fn grpc_stop_agent_with_pool(
         .stop_agent(tonic::Request::new(grpc_request))
         .await
         .map_err(|e| {
-            error!("❌ [gRPC_STOP_AGENT] StopAgent RPC 调用失败: {}", e);
+            error!("[gRPC_STOP_AGENT] StopAgent RPC 调用失败: {}", e);
             anyhow::anyhow!("gRPC StopAgent 调用失败: {}", e)
         })?;
 

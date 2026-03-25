@@ -42,7 +42,7 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
             let docker_manager = match docker_manager::global::get_global_docker_manager().await {
                 Ok(dm) => dm,
                 Err(e) => {
-                    warn!("⚠️ [CONTAINER_SYNC] 获取 DockerManager 失败: {}", e);
+                    warn!("[CONTAINER_SYNC] Failed to get DockerManager: {}", e);
                     continue;
                 }
             };
@@ -60,7 +60,7 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
                     }
                 }
                 Err(e) => {
-                    warn!("⚠️ [CONTAINER_SYNC] 同步失败: {}", e);
+                    warn!("[CONTAINER_SYNC] 同步失败: {}", e);
                 }
             }
         }

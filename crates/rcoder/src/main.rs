@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     // 🔄 初始化宿主机路径解析器（自动检测模式）
-    info!("🔍 开始自动检测宿主机挂载路径...");
+    info!("开始自动检测宿主机挂载路径...");
     let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH").unwrap_or_else(|_| {
         info!("环境变量 DOCKER_SOCKET_PATH 未设置，使用默认值: /var/run/docker.sock");
         "/var/run/docker.sock".to_string()
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         {
             Ok(resolver) => {
-                info!("✅ 宿主机路径解析器初始化成功");
+                info!("宿主机路径解析器初始化成功");
                 info!(
                     "  容器内工作目录: {:?}",
                     resolver.container_workspace_base()
@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(resolver)
             }
             Err(e) => {
-                error!("❌ 宿主机路径解析器初始化失败: {}", e);
+                error!("宿主机路径解析器初始化失败: {}", e);
                 error!("请检查以下配置:");
                 error!("  1. Docker socket 路径是否正确: {}", docker_socket_path);
                 error!("  2. Docker socket 是否已挂载到容器");
@@ -110,11 +110,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 🧹 启动时清理上次可能遗留的容器
     // 先使用正确配置初始化全局 DockerManager
-    info!("🔍 初始化 Docker Manager（使用应用配置）...");
+    info!("初始化 Docker Manager（使用应用配置）...");
 
     // 从应用配置创建 DockerManagerConfig
     let docker_manager_config = if let Some(docker_config) = &config.docker_config {
-        info!("✅ 使用应用中的 Docker 配置，合并多镜像配置");
+        info!("使用应用中的 Docker 配置，合并多镜像配置");
         let mut default_config = docker_manager::DockerManagerConfig::default();
 
         // 合并应用配置中的多镜像配置
@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
             docker_config.network_base_name
         );
         if let Some(ref network_base_name) = docker_config.network_base_name {
-            info!("✅ 使用配置中的网络基础名称: {}", network_base_name);
+            info!("使用配置中的网络基础名称: {}", network_base_name);
             default_config.network_base_name = network_base_name.clone();
         } else {
             info!(
@@ -147,21 +147,21 @@ async fn main() -> anyhow::Result<()> {
         // 🔧 应用超时配置
         if let Some(timeout) = docker_config.api_timeout_seconds {
             default_config.api_timeout_seconds = timeout;
-            info!("✅ 使用配置的 API 超时: {}秒", timeout);
+            info!("使用配置的 API 超时: {}秒", timeout);
         }
         if let Some(timeout) = docker_config.api_timeout_quick_seconds {
             default_config.api_timeout_quick_seconds = timeout;
-            info!("✅ 使用配置的快速操作超时: {}秒", timeout);
+            info!("使用配置的快速操作超时: {}秒", timeout);
         }
 
         // 🔧 应用缓存 TTL 配置
         if let Some(ttl) = docker_config.cache_status_ttl_seconds {
             default_config.cache_status_ttl_seconds = ttl;
-            info!("✅ 使用配置的状态缓存 TTL: {}秒", ttl);
+            info!("使用配置的状态缓存 TTL: {}秒", ttl);
         }
         if let Some(ttl) = docker_config.cache_network_ttl_seconds {
             default_config.cache_network_ttl_seconds = ttl;
-            info!("✅ 使用配置的网络缓存 TTL: {}秒", ttl);
+            info!("使用配置的网络缓存 TTL: {}秒", ttl);
         }
 
         default_config
@@ -174,18 +174,18 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) =
         docker_manager::global::init_global_docker_manager_with_config(docker_manager_config).await
     {
-        error!("❌ Docker Manager 初始化失败: {}", e);
+        error!("Docker Manager 初始化失败: {}", e);
         return Err(anyhow::anyhow!("Docker Manager 初始化失败: {}", e));
     }
 
     // 获取初始化后的 DockerManager
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(dm) => {
-            info!("✅ Docker Manager 初始化成功（使用应用配置）");
+            info!("Docker Manager 初始化成功（使用应用配置）");
             dm
         }
         Err(e) => {
-            error!("❌ 获取 Docker Manager 失败: {}", e);
+            error!("获取 Docker Manager 失败: {}", e);
             return Err(anyhow::anyhow!("获取 Docker Manager 失败: {}", e));
         }
     };
@@ -197,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
         shared_types::create_default_multi_image_config()
     };
 
-    info!("🔍 检查并清理上次可能遗留的容器（所有启用的服务）...");
+    info!("检查并清理上次可能遗留的容器（所有启用的服务）...");
     if config.cleanup_config.enabled {
         match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
             .await
@@ -211,12 +211,12 @@ async fn main() -> anyhow::Result<()> {
                     enabled_services.len()
                 );
             } else {
-                info!("✅ 未发现遗留容器，系统环境干净");
+                info!("未发现遗留容器，系统环境干净");
             }
 
             // 如果有失败的清理（非409错误），记录警告
             if result.failed_removals > 0 {
-                warn!("⚠️ 部分容器清理失败: 失败数量={}", result.failed_removals);
+                warn!("部分容器清理失败: 失败数量={}", result.failed_removals);
                 for failure in &result.failed_removals_details {
                     warn!(
                         "  - 容器 {} ({}): {}",
@@ -226,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Err(e) => {
-            warn!("⚠️ 启动时容器清理失败: {}，但这不影响服务启动", e);
+            warn!("启动时容器清理失败: {}，但这不影响服务启动", e);
         }
     }
     } else {
@@ -292,14 +292,14 @@ async fn main() -> anyhow::Result<()> {
             verbose: false,
         };
 
-        info!("✅ [Pingora] Pingora 配置创建成功");
+        info!("[Pingora] Pingora 配置创建成功");
 
         // 创建 Pingora 服务器管理器，并提取服务引用用于指标读取
         info!("🔧 [Pingora] 创建 PingoraServerManager...");
         let mut server_manager = PingoraServerManager::new(pingora_config)
             .with_api_key_config(Arc::clone(&api_key_config)); // 🆕 传递 API Key 配置
         let pingora_service = server_manager.service();
-        info!("✅ [Pingora] PingoraServerManager 创建成功");
+        info!("[Pingora] PingoraServerManager 创建成功");
         info!("🔒 [Pingora] API Key 鉴权配置已注入（支持热更新）");
 
         // 启动健康检查循环（按配置）
@@ -311,22 +311,22 @@ async fn main() -> anyhow::Result<()> {
             );
             pingora_service
                 .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
-            info!("✅ [Pingora] 健康检查循环已启动");
+            info!("[Pingora] 健康检查循环已启动");
         }
 
         // 启动 Pingora 服务器（如果启动失败，直接退出程序）
-        info!("🚀 [Pingora] 启动 Pingora 服务器...");
+        info!("[Pingora] 启动 Pingora 服务器...");
         let (pingora_shutdown_tx, pingora_shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             info!("📍 [Pingora] 正在调用 server_manager.start()...");
             if let Err(e) = server_manager.start(pingora_shutdown_rx).await {
-                error!("❌ [Pingora] Pingora 代理服务器启动失败，程序退出: {:?}", e);
+                error!("[Pingora] Pingora 代理服务器启动失败，程序退出: {:?}", e);
                 std::process::exit(1);
             }
-            info!("✅ [Pingora] Pingora 服务器正常退出");
+            info!("[Pingora] Pingora 服务器正常退出");
         });
 
-        info!("✅ [Pingora] 后台任务已启动");
+        info!("[Pingora] 后台任务已启动");
 
         (Some(handle), Some(pingora_service), Some(pingora_shutdown_tx))
     } else {
@@ -348,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(watcher)
             }
             Err(e) => {
-                warn!("⚠️  配置文件监控启动失败: {}，API Key 热更新将不可用", e);
+                warn!(" 配置文件监控启动失败: {}，API Key 热更新将不可用", e);
                 None
             }
         };
@@ -382,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let _status_checker_handle =
         start_container_status_checker(status_checker_config, state.clone());
-    info!("🔍 容器状态检查任务已启动（间隔: 30 秒，启用 Docker 主动查询和失败计数器）");
+    info!("容器状态检查任务已启动（间隔: 30 秒，启用 Docker 主动查询和失败计数器）");
 
     // 启动容器状态同步任务（定期检测被外部删除的容器）
     let container_sync_config = ContainerSyncConfig {
@@ -397,7 +397,7 @@ async fn main() -> anyhow::Result<()> {
             sync_interval: Duration::from_secs(5), // 每 5 秒同步一次
         };
         let _vnc_sync_handle = start_vnc_sync_task(pingora_service.clone(), vnc_sync_config);
-        info!("🔗 VNC 后端同步任务已启动（间隔: 5 秒，从 Docker 同步容器 IP）");
+        info!("VNC 后端同步任务已启动（间隔: 5 秒，从 Docker 同步容器 IP）");
     }
 
     // 创建路由（传入遥测 guard 用于 /metrics 端点）
@@ -416,10 +416,10 @@ async fn main() -> anyhow::Result<()> {
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
     if let Some(proxy_config) = &config.proxy_config {
-        info!("🚀 Pingora 反向代理服务已启用");
+        info!("Pingora 反向代理服务已启用");
         info!("📡 监听端口: {}", proxy_config.listen_port);
         info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
-        info!("🌐 动态后端: 根据请求端口自动发现和代理后端服务");
+        info!("动态后端: 根据请求端口自动发现和代理后端服务");
         info!("💡 示例:");
         info!(
             "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
@@ -582,7 +582,7 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
                     }
                 }
                 (Err(e), _) | (_, Err(e)) => {
-                    warn!("⚠️  Unix 信号处理器注册失败: {}，将依赖其他关闭机制", e);
+                    warn!(" Unix 信号处理器注册失败: {}，将依赖其他关闭机制", e);
                     // 注册失败不影响程序运行，仍可通过其他方式关闭（如 tokio::signal::ctrl_c）
                 }
             }
@@ -616,9 +616,9 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) 
 
     // 执行容器清理
     if let Err(e) = cleanup_all_containers().await {
-        error!("❌ 容器清理失败: {}", e);
+        error!("容器清理失败: {}", e);
     } else {
-        info!("✅ 容器清理完成");
+        info!("容器清理完成");
     }
 
     info!("🛑 RCoder 服务优雅关闭完成");
@@ -630,7 +630,7 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
 
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
-        .map_err(|e| anyhow::anyhow!("获取全局 DockerManager 失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to get global DockerManager: {}", e))?;
 
     // 🔧 使用默认多镜像配置
     // 注意：在关闭时使用默认配置是安全的，因为启用的服务类型在默认配置中已定义
@@ -650,7 +650,7 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
             }
 
             if result.failed_removals > 0 {
-                warn!("⚠️ 部分容器清理失败: 失败数量={}", result.failed_removals);
+                warn!("部分容器清理失败: 失败数量={}", result.failed_removals);
             }
         }
         Err(e) => {

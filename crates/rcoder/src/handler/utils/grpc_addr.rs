@@ -28,11 +28,11 @@ pub fn extract_grpc_addr_with_port(service_url: &str, grpc_port: u16) -> Result<
     };
 
     let url = url::Url::parse(&url_str)
-        .map_err(|e| AppError::internal_server_error(&format!("无效的 service_url: {}", e)))?;
+        .map_err(|e| AppError::internal_server_error(&format!("Invalid service_url: {}", e)))?;
 
     let host = url
         .host_str()
-        .ok_or_else(|| AppError::internal_server_error("无效的 service_url: 缺少 host"))?;
+        .ok_or_else(|| AppError::internal_server_error("Invalid service_url: 缺少 host"))?;
 
     Ok(format!("{}:{}", host, grpc_port))
 }
@@ -67,7 +67,7 @@ pub async fn get_realtime_container_ip_with_cache(
     // 2. 缓存未命中，查询 Docker API
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
-        .map_err(|e| format!("获取 DockerManager 失败: {}", e))?;
+        .map_err(|e| format!("Failed to get DockerManager: {}", e))?;
 
     let network_ips = docker_manager
         .get_container_network_info(container_name)

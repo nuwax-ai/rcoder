@@ -168,18 +168,18 @@ pub async fn computer_desktop_vnc(
 
     // 1. 验证参数
     if user_id.trim().is_empty() {
-        error!("❌ [DESKTOP_VNC] user_id 不能为空");
+        error!("[DESKTOP_VNC] user_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            "user_id is required",
         ));
     }
 
     if project_id.trim().is_empty() {
-        error!("❌ [DESKTOP_VNC] project_id 不能为空");
+        error!("[DESKTOP_VNC] project_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            "project_id is required",
         ));
     }
 
@@ -194,7 +194,7 @@ pub async fn computer_desktop_vnc(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!("⚠️ [DESKTOP_VNC] 找不到用户容器: user_id={}", user_id);
+            warn!("[DESKTOP_VNC] 找不到用户容器: user_id={}", user_id);
             return Ok(HttpResult::error(
                 "NOT_FOUND",
                 &format!("找不到用户 {} 的容器，请先发送聊天请求创建容器", user_id),
@@ -679,15 +679,15 @@ async fn check_vnc_available(container_ip: &str) -> bool {
 
     match timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
         Ok(Ok(_)) => {
-            info!("✅ [DESKTOP_VNC] VNC 服务可用: {}", addr);
+            info!("[DESKTOP_VNC] VNC 服务可用: {}", addr);
             true
         }
         Ok(Err(e)) => {
-            warn!("⚠️ [DESKTOP_VNC] VNC 连接失败: {} - {}", addr, e);
+            warn!("[DESKTOP_VNC] VNC 连接失败: {} - {}", addr, e);
             false
         }
         Err(_) => {
-            warn!("⚠️ [DESKTOP_VNC] VNC 连接超时: {}", addr);
+            warn!("[DESKTOP_VNC] VNC 连接超时: {}", addr);
             false
         }
     }

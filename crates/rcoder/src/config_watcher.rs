@@ -103,7 +103,7 @@ impl ConfigWatcher {
                         )
                         .await
                         {
-                            warn!("⚠️  [CONFIG_WATCHER] 配置重载失败: {}", e);
+                            warn!(" [CONFIG_WATCHER] 配置重载失败: {}", e);
                         }
                     }
                 }
@@ -126,7 +126,7 @@ impl ConfigWatcher {
             Ok(new_config) => {
                 // 验证配置有效性
                 if new_config.enabled && new_config.api_key.trim().is_empty() {
-                    error!("❌ [CONFIG_WATCHER] API Key 不能为空字符串");
+                    error!("[CONFIG_WATCHER] API Key 不能为空字符串");
                     return Err(anyhow::anyhow!("API Key 不能为空字符串"));
                 }
 
@@ -158,11 +158,11 @@ impl ConfigWatcher {
                     return Ok(());
                 }
 
-                info!("✅ [CONFIG_WATCHER] 配置热更新成功");
+                info!("[CONFIG_WATCHER] 配置热更新成功");
                 Ok(())
             }
             Err(e) => {
-                error!("❌ [CONFIG_WATCHER] 解析配置文件失败: {}", e);
+                error!("[CONFIG_WATCHER] 解析配置文件失败: {}", e);
                 Err(e)
             }
         }

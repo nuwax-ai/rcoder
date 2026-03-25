@@ -61,7 +61,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(dm) => dm,
         Err(e) => {
-            warn!("⚠️ [VNC_SYNC] 获取 DockerManager 失败: {}", e);
+            warn!("[VNC_SYNC] Failed to get DockerManager: {}", e);
             return;
         }
     };
@@ -69,7 +69,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
     // 获取所有容器（DockerManager 已经管理了所有容器的元数据）
     let containers = docker_manager.list_containers().await;
     if containers.is_empty() {
-        debug!("🔍 [VNC_SYNC] 没有找到任何容器");
+        debug!("[VNC_SYNC] 没有找到任何容器");
         return;
     }
 
@@ -166,7 +166,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
             synced_count, updated_count
         );
     } else if synced_count > 0 {
-        debug!("🔄 [VNC_SYNC] 同步完成: 检查={}, 无需更新", synced_count);
+        debug!("[VNC_SYNC] 同步完成: 检查={}, 无需更新", synced_count);
     }
 
     // === 清理已销毁容器的旧映射 ===

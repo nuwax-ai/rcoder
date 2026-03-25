@@ -146,7 +146,7 @@ impl LogCleaner {
                 stats.bytes_freed as f64 / 1024.0 / 1024.0
             );
         } else {
-            info!("📋 [log_cleaner] 没有过期日志需要清理");
+            info!("[log_cleaner] 没有过期日志需要清理");
         }
 
         Ok(stats)

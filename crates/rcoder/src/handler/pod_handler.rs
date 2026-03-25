@@ -89,7 +89,7 @@ fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
     // 创建东八区时区偏移 (UTC+8)
     // 注意: east_opt 在参数有效时总是返回 Some，这里使用 unwrap_or 仅作为安全保障
     let utc8_offset = FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| {
-        tracing::warn!("⚠️ 创建 UTC+8 时区偏移失败，使用 UTC+0");
+        tracing::warn!("创建 UTC+8 时区偏移失败，使用 UTC+0");
         FixedOffset::east_opt(0).unwrap_or(FixedOffset::east_opt(0).unwrap())
     });
 
@@ -405,8 +405,8 @@ pub async fn pod_count(
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
-            error!("❌ [POD_COUNT] 获取 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            error!("[POD_COUNT] Failed to get DockerManager: {}", e);
+            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
         })?;
 
     // 获取所有容器列表
@@ -478,16 +478,16 @@ pub async fn pod_list(
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
-            error!("❌ [POD_LIST] 获取 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            error!("[POD_LIST] Failed to get DockerManager: {}", e);
+            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
         })?;
 
     let docker_containers = docker_manager.list_containers().await;
 
     // 2. 获取 DuckDB 存储中的容器记录
     let duckdb_containers = state.projects.get_all_container_records().map_err(|e| {
-        error!("❌ [POD_LIST] 获取 DuckDB 容器列表失败: {}", e);
-        AppError::internal_server_error(&format!("获取 DuckDB 容器列表失败: {}", e))
+        error!("[POD_LIST] Failed to get DuckDB container list: {}", e);
+        AppError::internal_server_error(&format!("Failed to get DuckDB container list: {}", e))
     })?;
 
     // 3. 创建容器ID到DuckDB记录的映射
@@ -664,24 +664,24 @@ pub async fn pod_ensure(
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
-        error!("❌ [POD_ENSURE] user_id 不能为空");
+        error!("[POD_ENSURE] user_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            "user_id is required",
         ));
     }
     if request.project_id.trim().is_empty() {
-        error!("❌ [POD_ENSURE] project_id 不能为空");
+        error!("[POD_ENSURE] project_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            "project_id is required",
         ));
     }
 
     // 1.1 验证资源限制
     if let Some(ref limits) = request.resource_limits {
         if let Err(e) = validate_resource_limits(limits) {
-            error!("❌ [POD_ENSURE] 资源限制验证失败: {}", e);
+            error!("[POD_ENSURE] 资源限制验证失败: {}", e);
             return Ok(HttpResult::error(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
                 &format!("Invalid resource_limits: {}", e),
@@ -731,7 +731,7 @@ pub async fn pod_ensure(
                 }
 
                 if wait_sec % 5 == 0 {
-                    debug!("⏳ [POD_ENSURE] 仍在等待容器创建: user_id={}, 第{}秒", request.user_id, wait_sec);
+                    debug!("[POD_ENSURE] 仍在等待容器创建: user_id={}, 第{}秒", request.user_id, wait_sec);
                 }
             }
 
@@ -799,8 +799,8 @@ pub async fn pod_ensure(
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
-            error!("❌ [POD_ENSURE] 获取 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            error!("[POD_ENSURE] Failed to get DockerManager: {}", e);
+            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
         })?;
 
     // 通过 find_user_container 查询容器（使用 ServiceConfig 中配置的容器前缀）
@@ -811,8 +811,8 @@ pub async fn pod_ensure(
         )
         .await
         .map_err(|e| {
-            error!("❌ [POD_ENSURE] 查询容器状态失败: {}", e);
-            AppError::internal_server_error(&format!("查询容器状态失败: {}", e))
+            error!("[POD_ENSURE] Failed to query container status: {}", e);
+            AppError::internal_server_error(&format!("Failed to query container status: {}", e))
         })?;
 
     // 判断是否需要创建新容器
@@ -839,10 +839,10 @@ pub async fn pod_ensure(
                 .await
                 .map_err(|e| {
                     error!(
-                        "❌ [POD_ENSURE] 删除旧容器失败: container_id={}, error={}",
+                        "❌ [POD_ENSURE] Failed to delete old container: container_id={}, error={}",
                         result.container_id, e
                     );
-                    AppError::internal_server_error(&format!("删除旧容器失败: {}", e))
+                    AppError::internal_server_error(&format!("Failed to delete old container: {}", e))
                 })?;
 
             info!(
@@ -919,7 +919,7 @@ pub async fn pod_ensure(
                         ))
                         .await;
                     } else {
-                        error!("❌ [POD_ENSURE] 容器创建失败（已重试 {} 次）", max_attempts);
+                        error!("[POD_ENSURE] 容器创建失败（已重试 {} 次）", max_attempts);
                     }
                 }
             }
@@ -973,7 +973,7 @@ pub async fn pod_ensure(
                             break;
                         }
                         _ => {
-                            debug!("⏳ [POD_ENSURE] 内部映射仍未就绪: 第{}次", retry_attempt);
+                            debug!("[POD_ENSURE] 内部映射仍未就绪: 第{}次", retry_attempt);
                         }
                     }
                 }
@@ -1123,17 +1123,17 @@ pub async fn pod_keepalive(
 ) -> Result<HttpResult<KeepalivePodResponse>, AppError> {
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
-        error!("❌ [POD_KEEPALIVE] user_id 不能为空");
+        error!("[POD_KEEPALIVE] user_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            "user_id is required",
         ));
     }
     if request.project_id.trim().is_empty() {
-        error!("❌ [POD_KEEPALIVE] project_id 不能为空");
+        error!("[POD_KEEPALIVE] project_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            "project_id is required",
         ));
     }
 
@@ -1199,8 +1199,8 @@ pub async fn pod_keepalive(
         let info = ComputerContainerManager::get_container_info(&request.user_id)
             .await?
             .ok_or_else(|| {
-                error!("❌ [POD_KEEPALIVE] 容器状态异常：DuckDB 有记录但 Docker 中找不到容器");
-                AppError::internal_server_error("容器状态异常")
+                error!("[POD_KEEPALIVE] Container status abnormal：DuckDB 有记录但 Docker 中找不到容器");
+                AppError::internal_server_error("Container status abnormal")
             })?;
         (info, false)
     };
@@ -1276,24 +1276,24 @@ pub async fn pod_restart(
 ) -> Result<HttpResult<RestartPodResponse>, AppError> {
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
-        error!("❌ [POD_RESTART] user_id 不能为空");
+        error!("[POD_RESTART] user_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            "user_id is required",
         ));
     }
     if request.project_id.trim().is_empty() {
-        error!("❌ [POD_RESTART] project_id 不能为空");
+        error!("[POD_RESTART] project_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            "project_id is required",
         ));
     }
 
     // 1.1 验证资源限制
     if let Some(ref limits) = request.resource_limits {
         if let Err(e) = validate_resource_limits(limits) {
-            error!("❌ [POD_RESTART] 资源限制验证失败: {}", e);
+            error!("[POD_RESTART] 资源限制验证失败: {}", e);
             return Ok(HttpResult::error(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
                 &format!("Invalid resource_limits: {}", e),
@@ -1342,8 +1342,8 @@ pub async fn pod_restart(
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                error!("❌ [POD_RESTART] 获取 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                error!("[POD_RESTART] Failed to get DockerManager: {}", e);
+                AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
             })?;
 
         // 使用 container_stop 模块的运行时清理策略
@@ -1398,8 +1398,8 @@ pub async fn pod_restart(
                     break;
                 }
                 Err(e) => {
-                    warn!("⚠️ [POD_RESTART] 检查容器移除状态出错: {}, 假定已移除", e);
-                    // 如果是其他错误，也可能意味着容器状态异常，尝试继续
+                    warn!("[POD_RESTART] 检查容器移除状态出错: {}, 假定已移除", e);
+                    // 如果是其他错误，也可能意味着Container status abnormal，尝试继续
                     deletion_confirmed = true;
                     break;
                 }
@@ -1568,7 +1568,7 @@ pub async fn pod_status(
 ) -> Result<HttpResult<PodStatusResponse>, AppError> {
     // 1. 验证参数：至少需要 user_id 或 project_id 之一
     if params.user_id.is_none() && params.project_id.is_none() {
-        error!("❌ [POD_STATUS] user_id 和 project_id 至少需要提供一个");
+        error!("[POD_STATUS] user_id 和 project_id 至少需要提供一个");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
             "user_id 和 project_id 至少需要提供一个",
@@ -1586,8 +1586,8 @@ pub async fn pod_status(
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
-            error!("❌ [POD_STATUS] 获取 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            error!("[POD_STATUS] Failed to get DockerManager: {}", e);
+            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
         })?;
 
     // 3. 查询容器状态
@@ -1636,9 +1636,9 @@ pub async fn pod_status(
             // 容器不存在，继续尝试 project_id
         }
         Err(e) => {
-            error!("❌ [POD_STATUS] 查询容器状态失败: {}", e);
+            error!("[POD_STATUS] Failed to query container status: {}", e);
             return Err(AppError::internal_server_error(&format!(
-                "查询容器状态失败: {}",
+                "Failed to query container status: {}",
                 e
             )));
         }
@@ -1674,7 +1674,7 @@ pub async fn pod_status(
                     // 容器不存在
                 }
                 Err(e) => {
-                    error!("❌ [POD_STATUS] 通过 project_id 查询失败: {}", e);
+                    error!("[POD_STATUS] 通过 project_id Query failed: {}", e);
                     // 继续返回 not_found 而不是错误
                 }
             }
@@ -1774,7 +1774,7 @@ pub async fn pod_vnc_status(
         .filter(|s| !s.trim().is_empty());
 
     if user_id.is_none() && project_id.is_none() {
-        warn!("⚠️ [POD_VNC_STATUS] user_id 和 project_id 不能同时为空");
+        warn!("[POD_VNC_STATUS] user_id 和 project_id 不能同时为空");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
             "user_id 和 project_id 不能同时为空",
@@ -1790,8 +1790,8 @@ pub async fn pod_vnc_status(
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
-            error!("❌ [POD_VNC_STATUS] 获取 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            error!("[POD_VNC_STATUS] Failed to get DockerManager: {}", e);
+            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
         })?;
 
     // 3. 定位容器
@@ -1821,8 +1821,8 @@ pub async fn pod_vnc_status(
     };
 
     let container_info = container_info.map_err(|e| {
-        error!("❌ [POD_VNC_STATUS] 查询容器失败: {}", e);
-        AppError::internal_server_error(&format!("查询容器失败: {}", e))
+        error!("[POD_VNC_STATUS] Failed to query container: {}", e);
+        AppError::internal_server_error(&format!("Failed to query container: {}", e))
     })?;
 
     // 4. 检查容器是否存在
@@ -1881,8 +1881,8 @@ pub async fn pod_vnc_status(
     // 使用工具函数安全提取 gRPC 地址（自动处理协议前缀和端口）
     let grpc_addr = extract_grpc_addr_with_port(&service_url, shared_types::GRPC_DEFAULT_PORT)
         .map_err(|e| {
-            error!("❌ [POD_VNC_STATUS] 提取 gRPC 地址失败: {}", e);
-            AppError::internal_server_error(&format!("提取 gRPC 地址失败: {}", e))
+            error!("[POD_VNC_STATUS] Failed to extract gRPC address: {}", e);
+            AppError::internal_server_error(&format!("Failed to extract gRPC address: {}", e))
         })?;
 
     info!("📡 [POD_VNC_STATUS] 建立 gRPC 连接: addr={}", grpc_addr);
@@ -1911,7 +1911,7 @@ pub async fn pod_vnc_status(
                     }))
                 }
                 Err(e) => {
-                    error!("❌ [POD_VNC_STATUS] gRPC 调用失败: {}", e);
+                    error!("[POD_VNC_STATUS] gRPC 调用失败: {}", e);
                     Ok(HttpResult::error(
                         shared_types::error_codes::ERR_GRPC_ERROR,
                         &format!("gRPC 调用失败: {}", e),
@@ -1920,7 +1920,7 @@ pub async fn pod_vnc_status(
             }
         }
         Err(e) => {
-            error!("❌ [POD_VNC_STATUS] 建立 gRPC 连接失败: {}", e);
+            error!("[POD_VNC_STATUS] 建立 gRPC 连接失败: {}", e);
             Ok(HttpResult::error(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 &format!("建立 gRPC 连接失败: {}", e),

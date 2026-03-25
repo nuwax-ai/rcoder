@@ -424,7 +424,7 @@ async fn validate_and_get_session_context(
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(dm) => dm,
         Err(e) => {
-            error!("❌ [SSE_PROXY] 获取全局 DockerManager 失败: {}", e);
+            error!("[SSE_PROXY] Failed to get global DockerManager: {}", e);
             return Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -471,7 +471,7 @@ async fn validate_and_get_session_context(
                                 info.container_name
                             }
                             Ok(None) => {
-                                error!("❌ [SSE_PROXY] 降级查询失败：容器不存在: user_id={}", user_id);
+                                error!("[SSE_PROXY] 降级Query failed：容器不存在: user_id={}", user_id);
                                 return Err(create_error_response(
                                     StatusCode::NOT_FOUND,
                                     "CONTAINER_NOT_FOUND",
@@ -479,16 +479,16 @@ async fn validate_and_get_session_context(
                                 ));
                             }
                             Err(e) => {
-                                error!("❌ [SSE_PROXY] 降级查询失败：查询容器失败: {}", e);
+                                error!("[SSE_PROXY] 降级Query failed：Failed to query container: {}", e);
                                 return Err(create_error_response(
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     "CONTAINER_ERROR",
-                                    &format!("查询容器失败: {}", e),
+                                    &format!("Failed to query container: {}", e),
                                 ));
                             }
                         }
                     } else {
-                        error!("❌ [SSE_PROXY] ComputerAgentRunner 模式下缺少 user_id: session_id={}", session_id);
+                        error!("[SSE_PROXY] ComputerAgentRunner 模式下缺少 user_id: session_id={}", session_id);
                         return Err(create_error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "INVALID_DATA",
@@ -582,7 +582,7 @@ async fn validate_and_get_session_context(
             }
             Err(e) => {
                 error!(
-                    "❌ [SSE_PROXY] Docker API 查询失败: {}",
+                    "❌ [SSE_PROXY] Docker API Query failed: {}",
                     e
                 );
                 return Err(create_error_response(
@@ -620,7 +620,7 @@ async fn build_sse_stream_from_container_name(
     container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
-    // 从 Docker API 实时获取容器的最新 IP 地址（带缓存）
+    // Get latest container IP from Docker API in real-time（带缓存）
     // 使用 container_name（如 computer-agent-runner-user_123）查询
     // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
     let container_ip = match get_realtime_container_ip_with_cache(
@@ -1105,7 +1105,7 @@ async fn create_sse_proxy_stream(
             }
         }
 
-        info!("🔚 [SSE_PROXY] SSE代理连接结束: session_id={}", session_id);
+        info!("[SSE_PROXY] SSE代理连接结束: session_id={}", session_id);
     });
 
     ReceiverStream::new(rx)
@@ -1170,8 +1170,8 @@ async fn get_container_sse_url(
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
-            error!("❌ [CONTAINER] 获取全局 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取全局 DockerManager 失败: {}", e))
+            error!("[CONTAINER] Failed to get global DockerManager: {}", e);
+            AppError::internal_server_error(&format!("Failed to get global DockerManager: {}", e))
         })?;
 
     // 使用高级 API 获取容器信息
@@ -1179,17 +1179,17 @@ async fn get_container_sse_url(
         .get_agent_info(project_id)
         .await
         .map_err(|e| {
-            error!("❌ [CONTAINER] 获取容器信息失败: {}", e);
-            AppError::internal_server_error(&format!("获取容器信息失败: {}", e))
+            error!("[CONTAINER] Failed to get container info: {}", e);
+            AppError::internal_server_error(&format!("Failed to get container info: {}", e))
         })?
     {
         // 构建 SSE 端点 URL
         // info.service_url 格式为 http://ip:8086
         let sse_url = format!("{}/agent/progress/{}", info.service_url, session_id);
 
-        info!("✅ [CONTAINER] 获取容器SSE端点: {}", sse_url);
+        info!("[CONTAINER] 获取容器SSE端点: {}", sse_url);
         Ok(sse_url)
     } else {
-        Err(AppError::internal_server_error("未找到容器信息"))
+        Err(AppError::internal_server_error("Container info not found"))
     }
 }

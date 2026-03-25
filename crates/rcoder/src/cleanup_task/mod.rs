@@ -24,7 +24,7 @@ pub use config::CleanupStats;
 /// 启动清理任务
 ///
 /// # Errors
-/// 如果获取 DockerManager 失败，返回错误而不是静默失败
+/// 如果Failed to get DockerManager，返回错误而不是静默失败
 pub async fn start_cleanup_task(
     config: CleanupConfig,
     state: Arc<crate::router::AppState>,
@@ -33,10 +33,10 @@ pub async fn start_cleanup_task(
         .await
         .map_err(|e| {
             tracing::error!(
-                "🚨 [CLEANUP_TASK] 获取 DockerManager 失败: {}，清理任务无法启动",
+                "🚨 [CLEANUP_TASK] Failed to get DockerManager: {}，清理任务无法启动",
                 e
             );
-            anyhow::anyhow!("获取 DockerManager 失败: {}", e)
+            anyhow::anyhow!("Failed to get DockerManager: {}", e)
         })?;
 
     let pingora_service = state.pingora_service.clone();

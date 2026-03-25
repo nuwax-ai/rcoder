@@ -37,16 +37,16 @@ async fn destroy_container_for_project(
     state: &Arc<AppState>,
     project_id: &str,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
-    info!("🔥 [STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
+    info!("[STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
 
     // 使用全局 DockerManager
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(manager) => manager,
         Err(e) => {
-            error!("❌ [STOP_DESTROY] 获取全局 DockerManager 失败: {}", e);
+            error!("[STOP_DESTROY] Failed to get global DockerManager: {}", e);
             return Ok(HttpResult::error(
                 shared_types::error_codes::ERR_CONTAINER_ERROR,
-                &format!("获取全局 DockerManager 失败: {}", e),
+                &format!("Failed to get global DockerManager: {}", e),
             ));
         }
     };
@@ -77,7 +77,7 @@ async fn destroy_container_for_project(
             let stop_result = docker_manager.stop_container_by_id(&result.container_id).await;
 
             if let Err(e) = stop_result {
-                error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
+                error!("[STOP_DESTROY] 停止容器失败: {}", e);
                 return Ok(HttpResult::error(
                     shared_types::error_codes::ERR_STOP_FAILED,
                     &format!("停止容器失败: {}", e),
@@ -115,7 +115,7 @@ async fn destroy_container_for_project(
             .await;
 
         if let Err(e) = stop_result {
-            error!("❌ [STOP_DESTROY] 停止容器失败: {}", e);
+            error!("[STOP_DESTROY] 停止容器失败: {}", e);
             return Ok(HttpResult::error(
                 shared_types::error_codes::ERR_STOP_FAILED,
                 &format!("停止容器失败: {}", e),
@@ -261,12 +261,12 @@ pub async fn agent_stop(
         Ok(response) => {
             if let Some(data) = response.data.as_ref() {
                 if data.success {
-                    info!("✅ [STOP_DESTROY] 容器销毁成功: project_id={}", project_id);
+                    info!("[STOP_DESTROY] 容器销毁成功: project_id={}", project_id);
                 } else {
-                    error!("❌ [STOP_DESTROY] 容器销毁失败: project_id={}", project_id);
+                    error!("[STOP_DESTROY] 容器销毁失败: project_id={}", project_id);
                 }
             } else {
-                error!("❌ [STOP_DESTROY] 响应数据为空: project_id={}", project_id);
+                error!("[STOP_DESTROY] 响应数据为空: project_id={}", project_id);
             }
         }
         Err(e) => {

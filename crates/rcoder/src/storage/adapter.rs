@@ -387,7 +387,7 @@ impl ProjectAdapter {
     ) -> Result<(Vec<String>, Vec<serde_json::Value>), String> {
         self.storage
             .execute_raw_query(sql)
-            .map_err(|e| format!("查询执行失败: {}", e))
+            .map_err(|e| format!("Query execution failed: {}", e))
     }
 
     // ========== 内部辅助方法 ==========

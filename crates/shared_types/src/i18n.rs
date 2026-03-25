@@ -33,6 +33,17 @@ pub fn t(key: &str, locale: &str) -> String {
     _rust_i18n_translate(locale, key).to_string()
 }
 
+/// 获取默认语言的翻译消息
+///
+/// # Arguments
+/// * `key` - 翻译 key，如 "error.agent_busy"
+///
+/// # Returns
+/// 默认语言的翻译字符串
+pub fn t_default(key: &str) -> String {
+    t(key, DEFAULT_LOCALE)
+}
+
 /// 设置全局语言（用于线程本地存储）
 pub fn set_locale(locale: &str) {
     let locale = if SUPPORTED_LOCALES.contains(&locale) {

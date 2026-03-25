@@ -96,17 +96,17 @@ pub async fn computer_agent_status(
 ) -> Result<HttpResult<ComputerAgentStatusResponse>, AppError> {
     // 1. 参数验证
     if request.user_id.trim().is_empty() {
-        error!("❌ [COMPUTER_AGENT_STATUS] user_id 不能为空");
+        error!("[COMPUTER_AGENT_STATUS] user_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            "user_id is required",
         ));
     }
     if request.project_id.trim().is_empty() {
-        error!("❌ [COMPUTER_AGENT_STATUS] project_id 不能为空");
+        error!("[COMPUTER_AGENT_STATUS] project_id is required");
         return Ok(HttpResult::error(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            "project_id is required",
         ));
     }
 
@@ -119,8 +119,8 @@ pub async fn computer_agent_status(
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
         .map_err(|e| {
-            error!("❌ [COMPUTER_AGENT_STATUS] 获取 DockerManager 失败: {}", e);
-            AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+            error!("[COMPUTER_AGENT_STATUS] Failed to get DockerManager: {}", e);
+            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
         })?;
 
     // 获取容器信息（ComputerAgentRunner 使用 user_id 作为容器标识）

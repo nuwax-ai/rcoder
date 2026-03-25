@@ -34,7 +34,7 @@ impl AgentScanner {
         let mut idle_agents = Vec::new();
         let current_time = Utc::now();
 
-        info!("🔍 [scanner] 开始扫描闲置 agent");
+        info!("[scanner] 开始扫描闲置 agent");
 
         // 收集所有项目 ID
         let project_ids: Vec<String> = self.state.projects.iter().map(|(id, _)| id).collect();

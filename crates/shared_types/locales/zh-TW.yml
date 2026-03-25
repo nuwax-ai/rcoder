@@ -52,3 +52,40 @@ error.api_key_auth_failed: "API Key 驗證失敗"
 # 未知錯誤
 error.unknown: "未知錯誤"
 error.undefined: "未定義的錯誤碼"
+
+# === 新增翻譯 ===
+
+# 參數驗證
+error.user_id_required: "user_id 不能為空"
+error.project_id_required: "project_id 不能為空"
+error.session_id_required: "session_id 不能為空"
+
+# Docker 相關
+error.docker_manager_failed: "取得 DockerManager 失敗"
+error.container_not_found_info: "未找到容器資訊"
+error.container_status_abnormal: "容器狀態異常"
+error.container_start_failed: "啟動容器失敗"
+error.container_query_failed: "查詢容器失敗"
+error.container_delete_failed: "刪除容器失敗"
+error.container_create_failed: "建立容器失敗"
+
+# 目錄相關
+error.workspace_create_failed: "建立工作目錄失敗"
+error.project_dir_create_failed: "建立專案目錄失敗"
+error.user_dir_create_failed: "建立使用者目錄失敗"
+
+# gRPC 相關
+error.grpc_addr_extract_failed: "提取 gRPC 位址失敗"
+error.grpc_service_url_invalid: "無效的 service_url"
+error.grpc_service_url_missing_host: "無效的 service_url: 缺少 host"
+
+# 查詢相關
+error.select_only: "只允許 SELECT 查詢"
+error.query_execution_failed: "查詢執行失敗"
+
+# 資源相關
+error.resource_limits_invalid: "資源限制無效"
+error.resource_limits_validation_failed: "資源限制驗證失敗"
+
+# 未知重試
+error.unknown_retry_error: "未知重試錯誤"

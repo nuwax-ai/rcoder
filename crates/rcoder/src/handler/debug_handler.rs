@@ -105,13 +105,13 @@ pub async fn debug_sql_query(
 ) -> HttpResult<DebugSqlQueryResponse> {
     let start_time = std::time::Instant::now();
 
-    debug!("🔍 [DEBUG_SQL] 执行查询: {}", request.sql);
+    debug!("[DEBUG_SQL] 执行查询: {}", request.sql);
 
-    // 安全检查：只允许 SELECT 查询
+    // 安全检查：Only SELECT queries are allowed
     let sql_trimmed = request.sql.trim().to_uppercase();
     if !sql_trimmed.starts_with("SELECT") {
         warn!("❌ [DEBUG_SQL] 拒绝非 SELECT 查询: {}", request.sql);
-        return HttpResult::error("INVALID_QUERY", "只允许 SELECT 查询");
+        return HttpResult::error("INVALID_QUERY", "Only SELECT queries are allowed");
     }
 
     // 执行查询
@@ -133,8 +133,8 @@ pub async fn debug_sql_query(
             })
         }
         Err(e) => {
-            error!("❌ [DEBUG_SQL] 查询失败: {}", e);
-            HttpResult::error("QUERY_ERROR", &format!("查询执行失败: {}", e))
+            error!("[DEBUG_SQL] Query failed: {}", e);
+            HttpResult::error("QUERY_ERROR", &format!("Query execution failed: {}", e))
         }
     }
 }
@@ -202,7 +202,7 @@ pub async fn debug_list_projects(
             rows,
             execution_time_ms: start_time.elapsed().as_millis() as u64,
         }),
-        Err(e) => HttpResult::error("QUERY_ERROR", &format!("查询失败: {}", e)),
+        Err(e) => HttpResult::error("QUERY_ERROR", &format!("Query failed: {}", e)),
     }
 }
 
@@ -235,7 +235,7 @@ pub async fn debug_list_containers(
             rows,
             execution_time_ms: start_time.elapsed().as_millis() as u64,
         }),
-        Err(e) => HttpResult::error("QUERY_ERROR", &format!("查询失败: {}", e)),
+        Err(e) => HttpResult::error("QUERY_ERROR", &format!("Query failed: {}", e)),
     }
 }
 
