@@ -54,6 +54,9 @@ axum-tracing-opentelemetry = { workspace = true }
 # 🚀 无锁配置热更新
 arc-swap = "1.8"
 
+# i18n (国际化)
+rust-i18n = { workspace = true }
+
 
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }

@@ -1,0 +1,54 @@
+# 繁體中文翻譯
+# RCoder 錯誤訊息
+
+# 成功狀態
+success: "操作成功"
+
+# Agent 相關錯誤
+error.agent_busy: "Agent 正在執行任務"
+error.agent_error: "Agent 內部錯誤"
+error.agent_not_found: "Agent 不存在或已停止"
+
+# 取消/停止操作
+error.cancel_failed: "取消操作失敗"
+error.stop_failed: "停止操作失敗"
+
+# 參數驗證
+error.validation: "參數驗證失敗"
+error.invalid_params: "參數缺失或無效"
+error.invalid_resource_limits: "資源限制配置無效"
+
+# 容器相關
+error.container_error: "容器操作失敗"
+error.container_not_found: "容器不存在"
+
+# 工作目錄
+error.workspace_error: "工作目錄錯誤"
+
+# gRPC 相關
+error.grpc_addr_error: "gRPC 位址解析失敗"
+error.grpc_error: "gRPC 呼叫失敗"
+
+# 服務狀態
+error.service_unavailable: "服務暫時無法使用"
+error.http_fallback_failed: "HTTP 備援失敗"
+error.internal_server_error: "內部伺服器錯誤"
+
+# 代理服務
+error.proxy_disabled: "代理服務未啟用"
+error.proxy_service_unavailable: "代理服務無法使用"
+
+# 工作階段相關
+error.session_not_found: "工作階段不存在或已完成"
+error.resume_failed: "Resume 工作階段失敗"
+error.retry_exhausted: "降級重試次數已用盡"
+
+# 請求限制
+error.too_many_requests: "請求過多"
+
+# 驗證
+error.api_key_auth_failed: "API Key 驗證失敗"
+
+# 未知錯誤
+error.unknown: "未知錯誤"
+error.undefined: "未定義的錯誤碼"

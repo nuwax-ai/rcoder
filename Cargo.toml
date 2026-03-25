@@ -225,6 +225,9 @@ bollard = { version = "0.19.4" }
 # Cache library
 moka = { version = "0.12", features = ["future", "sync"] }
 
+# i18n (国际化)
+rust-i18n = "3"
+
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 

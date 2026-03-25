@@ -1,0 +1,54 @@
+# English translations
+# RCoder error messages
+
+# Success
+success: "Operation successful"
+
+# Agent errors
+error.agent_busy: "Agent is busy processing"
+error.agent_error: "Agent internal error"
+error.agent_not_found: "Agent not found or stopped"
+
+# Cancel/Stop operations
+error.cancel_failed: "Cancel operation failed"
+error.stop_failed: "Stop operation failed"
+
+# Validation
+error.validation: "Validation failed"
+error.invalid_params: "Invalid or missing parameters"
+error.invalid_resource_limits: "Invalid resource limits configuration"
+
+# Container
+error.container_error: "Container operation failed"
+error.container_not_found: "Container not found"
+
+# Workspace
+error.workspace_error: "Workspace error"
+
+# gRPC
+error.grpc_addr_error: "gRPC address resolution failed"
+error.grpc_error: "gRPC call failed"
+
+# Service status
+error.service_unavailable: "Service temporarily unavailable"
+error.http_fallback_failed: "HTTP fallback failed"
+error.internal_server_error: "Internal server error"
+
+# Proxy
+error.proxy_disabled: "Proxy service is disabled"
+error.proxy_service_unavailable: "Proxy service unavailable"
+
+# Session
+error.session_not_found: "Session not found or completed"
+error.resume_failed: "Resume session failed"
+error.retry_exhausted: "Retry attempts exhausted"
+
+# Rate limiting
+error.too_many_requests: "Too many requests"
+
+# Authentication
+error.api_key_auth_failed: "API Key authentication failed"
+
+# Unknown
+error.unknown: "Unknown error"
+error.undefined: "Undefined error code"

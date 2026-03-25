@@ -1,0 +1,54 @@
+# 简体中文翻译
+# RCoder 错误消息
+
+# 成功状态
+success: "操作成功"
+
+# Agent 相关错误
+error.agent_busy: "Agent 正在执行任务"
+error.agent_error: "Agent 内部错误"
+error.agent_not_found: "Agent 不存在或已停止"
+
+# 取消/停止操作
+error.cancel_failed: "取消操作失败"
+error.stop_failed: "停止操作失败"
+
+# 参数验证
+error.validation: "参数验证失败"
+error.invalid_params: "参数缺失或无效"
+error.invalid_resource_limits: "资源限制配置无效"
+
+# 容器相关
+error.container_error: "容器操作失败"
+error.container_not_found: "容器不存在"
+
+# 工作目录
+error.workspace_error: "工作目录错误"
+
+# gRPC 相关
+error.grpc_addr_error: "gRPC 地址解析失败"
+error.grpc_error: "gRPC 调用失败"
+
+# 服务状态
+error.service_unavailable: "服务暂时不可用"
+error.http_fallback_failed: "HTTP 回退失败"
+error.internal_server_error: "内部服务器错误"
+
+# 代理服务
+error.proxy_disabled: "代理服务未启用"
+error.proxy_service_unavailable: "代理服务不可用"
+
+# 会话相关
+error.session_not_found: "会话不存在或已完成"
+error.resume_failed: "Resume 会话失败"
+error.retry_exhausted: "降级重试次数耗尽"
+
+# 请求限制
+error.too_many_requests: "请求过多"
+
+# 鉴权
+error.api_key_auth_failed: "API Key 鉴权失败"
+
+# 未知错误
+error.unknown: "未知错误"
+error.undefined: "未定义的错误码"

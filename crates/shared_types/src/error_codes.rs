@@ -2,6 +2,8 @@
 //!
 //! 🔴 重要原则：保持所有现有错误码不变，与前端约定保持一致
 
+use crate::i18n::t;
+
 // ========== 成功状态码 ==========
 /// 操作成功
 pub const SUCCESS: &str = "0000";
@@ -84,7 +86,54 @@ pub const ERR_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
 /// API Key 鉴权失败
 pub const ERR_API_KEY_AUTH_FAILED: &str = "4010";
 
-/// 获取错误码的默认描述
+/// 获取错误码对应的翻译 key
+fn get_error_i18n_key(code: &str) -> &'static str {
+    match code {
+        SUCCESS => "success",
+        ERR_AGENT_BUSY => "error.agent_busy",
+        ERR_CANCEL_FAILED => "error.cancel_failed",
+        ERR_STOP_FAILED => "error.stop_failed",
+        ERR_VALIDATION => "error.validation",
+        ERR_INVALID_PARAMS => "error.invalid_params",
+        ERR_INVALID_RESOURCE_LIMITS => "error.invalid_resource_limits",
+        ERR_CONTAINER_ERROR => "error.container_error",
+        ERR_WORKSPACE_ERROR => "error.workspace_error",
+        ERR_GRPC_ADDR_ERROR => "error.grpc_addr_error",
+        ERR_GRPC_ERROR => "error.grpc_error",
+        ERR_SERVICE_UNAVAILABLE => "error.service_unavailable",
+        ERR_AGENT_ERROR => "error.agent_error",
+        ERR_PROXY_DISABLED => "error.proxy_disabled",
+        ERR_PROXY_SERVICE_UNAVAILABLE => "error.proxy_service_unavailable",
+        ERR_SESSION_NOT_FOUND => "error.session_not_found",
+        ERR_AGENT_NOT_FOUND => "error.agent_not_found",
+        ERR_CONTAINER_NOT_FOUND => "error.container_not_found",
+        ERR_HTTP_FALLBACK_FAILED => "error.http_fallback_failed",
+        ERR_INTERNAL_SERVER_ERROR => "error.internal_server_error",
+        ERR_RESUME_FAILED => "error.resume_failed",
+        ERR_RETRY_EXHAUSTED => "error.retry_exhausted",
+        ERR_TOO_MANY_REQUESTS => "error.too_many_requests",
+        ERR_API_KEY_AUTH_FAILED => "error.api_key_auth_failed",
+        ERR_UNKNOWN => "error.unknown",
+        _ => "error.undefined",
+    }
+}
+
+/// 获取错误码的多语言描述
+///
+/// # Arguments
+/// * `code` - 错误码
+/// * `locale` - 语言代码，如 "zh-CN", "en-US"
+///
+/// # Returns
+/// 多语言错误描述
+pub fn get_error_message(code: &str, locale: &str) -> String {
+    let key = get_error_i18n_key(code);
+    t(key, locale)
+}
+
+/// 获取错误码的默认描述（向后兼容，使用默认语言）
+///
+/// 🔴 注意：此函数保留用于向后兼容，新代码请使用 `get_error_message`
 pub fn get_error_description(code: &str) -> &'static str {
     match code {
         SUCCESS => "操作成功",
