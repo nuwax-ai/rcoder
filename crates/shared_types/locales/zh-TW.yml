@@ -3,6 +3,9 @@
 
 # 成功狀態
 success: "操作成功"
+success.container_destroyed: "容器已成功銷毀"
+success.container_not_exist: "容器不存在，無需操作"
+success.agent_already_stopped: "Agent 已處於停止狀態"
 
 # Agent 相關錯誤
 error.agent_busy: "Agent 正在執行任務"

@@ -1,8 +1,10 @@
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
 use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
+use super::utils::get_locale_from_headers;
 
 /// 查询Agent状态
 ///
@@ -74,14 +76,16 @@ use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 #[instrument(skip(state))]
 pub async fn agent_status(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(project_id): Path<String>,
 ) -> Result<HttpResult<AgentStatusResponse>, AppError> {
+    let locale = get_locale_from_headers(&headers);
     let project_id = project_id.trim();
 
     if project_id.is_empty() {
-        return Ok(HttpResult::error(
-            "INVALID_PARAMS",
-            "project_id cannot be empty",
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_INVALID_PARAMS,
+            locale,
         ));
     }
 

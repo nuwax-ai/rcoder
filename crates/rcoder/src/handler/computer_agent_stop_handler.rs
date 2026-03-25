@@ -5,13 +5,14 @@
 //! 容器会继续运行其他 project_id 的 Agent。
 
 use axum::{Json, extract::State};
+use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 
 use crate::{AppError, HttpResult, router::AppState};
 use shared_types::{ComputerAgentStopRequest, ComputerAgentStopResponse};
 
-use super::utils::extract_grpc_addr;
+use super::utils::{extract_grpc_addr, get_locale_from_headers};
 
 /// 停止 Computer Agent
 ///
@@ -72,22 +73,26 @@ use super::utils::extract_grpc_addr;
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn computer_agent_stop(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ComputerAgentStopRequest>,
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
+    // 获取语言设置
+    let locale = get_locale_from_headers(&headers);
+
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[COMPUTER_STOP] user_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id is required",
+            locale,
         ));
     }
 
     if request.project_id.trim().is_empty() {
         error!("[COMPUTER_STOP] project_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required",
+            locale,
         ));
     }
 
@@ -107,9 +112,9 @@ pub async fn computer_agent_stop(
         Some(info) => info,
         None => {
             warn!("[COMPUTER_STOP] 找不到用户容器: user_id={}", user_id);
-            return Ok(HttpResult::error(
-                "NOT_FOUND",
-                &format!("找不到用户 {} 的容器", user_id),
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                locale,
             ));
         }
     };
@@ -171,9 +176,9 @@ pub async fn computer_agent_stop(
                 match response.result.as_str() {
                     "not_found" => {
                         warn!("[COMPUTER_STOP] Agent 未找到: project_id={}", project_id);
-                        return Ok(HttpResult::error(
-                            "NOT_FOUND",
-                            &format!("找不到项目 {} 的 Agent", project_id),
+                        return Ok(HttpResult::error_with_locale(
+                            shared_types::error_codes::ERR_AGENT_NOT_FOUND,
+                            locale,
                         ));
                     }
                     "already_stopped" => {
@@ -181,10 +186,7 @@ pub async fn computer_agent_stop(
                             "ℹ️ [COMPUTER_STOP] Agent 已经处于停止状态: project_id={}",
                             project_id
                         );
-                        let message = format!(
-                            "Agent {} 已经处于停止状态，容器 {} 继续运行",
-                            project_id, container_info.container_id
-                        );
+                        let message = shared_types::get_i18n_message("success.agent_already_stopped", locale);
                         let stop_response = ComputerAgentStopResponse {
                             success: true,
                             message,
@@ -196,13 +198,16 @@ pub async fn computer_agent_stop(
                     "error" => {
                         let err_msg = response.message.unwrap_or_else(|| "未知错误".to_string());
                         error!("[COMPUTER_STOP] Agent 停止失败: {}", err_msg);
-                        return Ok(HttpResult::error("STOP_FAILED", &err_msg));
+                        return Ok(HttpResult::error_with_locale(
+                            shared_types::error_codes::ERR_STOP_FAILED,
+                            locale,
+                        ));
                     }
                     _ => {
                         warn!("[COMPUTER_STOP] 未知的响应结果: {}", response.result);
-                        return Ok(HttpResult::error(
-                            "UNKNOWN_RESULT",
-                            &format!("未知的响应结果: {}", response.result),
+                        return Ok(HttpResult::error_with_locale(
+                            shared_types::error_codes::ERR_UNKNOWN,
+                            locale,
                         ));
                     }
                 }
@@ -213,9 +218,9 @@ pub async fn computer_agent_stop(
                 "❌ [COMPUTER_STOP] 调用 StopAgent RPC 失败: {}, project_id={}",
                 e, project_id
             );
-            return Ok(HttpResult::error(
-                "GRPC_ERROR",
-                &format!("调用 StopAgent RPC 失败: {}", e),
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_GRPC_ERROR,
+                locale,
             ));
         }
     }

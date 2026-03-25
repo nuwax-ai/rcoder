@@ -3,6 +3,7 @@
 //! 转发取消请求到容器内的 agent_runner 服务
 
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
@@ -12,7 +13,7 @@ use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;
 use shared_types::{AppError, HttpResult};
 
-use super::utils::extract_grpc_addr;
+use super::utils::{extract_grpc_addr, get_locale_from_headers};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]
@@ -62,31 +63,6 @@ pub struct CancelResponse {
     /// 被取消的会话ID
     #[schema(example = "session456")]
     pub session_id: String,
-}
-
-/// 获取容器（用于取消请求，不创建）- 兼容旧版本
-async fn get_container_for_cancel(
-    project_id: &str,
-) -> Result<Option<ContainerBasicInfo>, AppError> {
-    info!("[CANCEL_CONTAINER] 查找容器: project_id={}", project_id);
-
-    // 只获取容器，不创建
-    let container_info =
-        crate::service::container_manager::ContainerManager::get_container_info(project_id).await?;
-
-    if let Some(ref info) = container_info {
-        info!(
-            "✅ [CANCEL_CONTAINER] 找到容器: project_id={}, container_id={}, service_url={}",
-            project_id, info.container_id, info.service_url
-        );
-    } else {
-        info!(
-            "ℹ️ [CANCEL_CONTAINER] 容器不存在: project_id={}, 无需取消",
-            project_id
-        );
-    }
-
-    Ok(container_info)
 }
 
 /// 统一的容器查询函数 - 通过 DuckDB 查询
@@ -142,6 +118,7 @@ async fn forward_cancel_request_to_container_service(
     session_id: Option<&str>,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
+    locale: &'static str,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let session_id_display = session_id
         .map(|s| s.to_string())
@@ -189,9 +166,9 @@ async fn forward_cancel_request_to_container_service(
                     .message
                     .unwrap_or_else(|| "未知错误".to_string());
                 error!("[CANCEL_FORWARD] gRPC 取消失败: {}", error_msg);
-                Ok(HttpResult::error(
+                Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CANCEL_FAILED,
-                    &error_msg,
+                    locale,
                 ))
             }
         }
@@ -225,9 +202,9 @@ async fn forward_cancel_request_to_container_service(
                         } else {
                             // 容器存在但服务不可用（可能是临时故障），返回错误
                             warn!("[CANCEL_FORWARD] Agent Worker 不可用（容器存在，可能是临时故障）");
-                            return Ok(HttpResult::error(
+                            return Ok(HttpResult::error_with_locale(
                                 shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
-                                "Agent 服务暂时不可用，请稍后重试",
+                                locale,
                             ));
                         }
                     }
@@ -239,9 +216,9 @@ async fn forward_cancel_request_to_container_service(
             }
 
             // 其他 gRPC 通信失败（网络错误等）
-            return Ok(HttpResult::error(
+            return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
-                &format!("gRPC 调用失败: {}", e),
+                locale,
             ));
         }
     }
@@ -295,65 +272,6 @@ async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> 
     }
 }
 
-/// 内部核心处理函数：处理会话取消请求（供多个接口复用）
-///
-/// 该函数封装了取消会话的核心逻辑，可被不同的 API 接口调用
-async fn handle_session_cancel_internal(
-    project_id: &str,
-    session_id: Option<String>,
-    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
-) -> Result<HttpResult<CancelResponse>, AppError> {
-    let session_id_display = session_id
-        .as_deref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "None".to_string());
-    info!(
-        "🛑 [CANCEL_FORWARD] 收到取消任务请求: session_id={}, project_id={}",
-        session_id_display, project_id
-    );
-
-    // 第一步：获取容器（不创建）
-    let container_info = get_container_for_cancel(project_id).await?;
-
-    // 如果容器不存在，说明任务已经结束或从未启动，直接返回成功
-    let Some(container_info) = container_info else {
-        info!(
-            "✅ [CANCEL_FORWARD] 容器不存在，取消目标已达成: project_id={}",
-            project_id
-        );
-        return Ok(HttpResult::success(CancelResponse {
-            success: true,
-            session_id: session_id.unwrap_or_else(|| "all".to_string()),
-        }));
-    };
-
-    // 第二步：转发取消请求到容器服务（使用全局连接池）
-    let result = forward_cancel_request_to_container_service(
-        project_id,
-        session_id.as_deref(),
-        &container_info,
-        grpc_pool,
-    )
-    .await;
-
-    match &result {
-        Ok(_) => {
-            info!(
-                "✅ [CANCEL_FORWARD] 取消请求处理成功: project_id={}",
-                project_id
-            );
-        }
-        Err(e) => {
-            error!(
-                "❌ [CANCEL_FORWARD] 取消请求处理失败: project_id={}, error={}",
-                project_id, e
-            );
-        }
-    }
-
-    result
-}
-
 /// 内部核心处理函数 v2：处理会话取消请求（支持多种服务类型）
 ///
 /// 使用 DuckDB 统一查询，支持 RCoder 和 ComputerAgentRunner 两种模式
@@ -362,6 +280,7 @@ async fn handle_session_cancel_internal_v2(
     identifier: CancelIdentifier,
     project_id: String,         // 必填：传递给 agent_runner 的项目ID
     session_id: Option<String>, // 可选：会话ID
+    locale: &'static str,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let session_id_display = session_id
         .as_deref()
@@ -399,6 +318,7 @@ async fn handle_session_cancel_internal_v2(
         session_id.as_deref(),
         &container_info,
         &state.grpc_pool,
+        locale,
     )
     .await;
 
@@ -496,8 +416,10 @@ async fn handle_session_cancel_internal_v2(
 #[instrument(skip(state), fields(project_id = %query.project_id))]
 pub async fn agent_session_cancel(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
+    let locale = get_locale_from_headers(&headers);
     // 使用新的 v2 版本，保持向后兼容
     let project_id = query.project_id.clone();
     handle_session_cancel_internal_v2(
@@ -505,6 +427,7 @@ pub async fn agent_session_cancel(
         CancelIdentifier::Project(project_id.clone()),
         project_id,
         query.session_id,
+        locale,
     )
     .await
 }
@@ -585,23 +508,26 @@ pub async fn agent_session_cancel(
 #[instrument(skip(state), fields(user_id = %query.user_id, project_id = %query.project_id))]
 pub async fn computer_agent_session_cancel(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<ComputerCancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
+    let locale = get_locale_from_headers(&headers);
+
     // 验证 user_id 不为空
     if query.user_id.trim().is_empty() {
         error!("[COMPUTER_CANCEL] user_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id is required",
+            locale,
         ));
     }
 
     // 验证 project_id 不为空
     if query.project_id.trim().is_empty() {
         error!("[COMPUTER_CANCEL] project_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required",
+            locale,
         ));
     }
 
@@ -615,6 +541,7 @@ pub async fn computer_agent_session_cancel(
         CancelIdentifier::User(query.user_id),
         query.project_id, // 必填的 project_id
         query.session_id,
+        locale,
     )
     .await
 }

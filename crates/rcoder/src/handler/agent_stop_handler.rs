@@ -3,12 +3,14 @@
 //! 转发停止请求到容器内的 agent_runner 服务
 
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{AppError, HttpResult, router::AppState};
+use super::utils::get_locale_from_headers;
 
 /// 停止Agent请求参数
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -36,6 +38,7 @@ pub struct StopAgentResponse {
 async fn destroy_container_for_project(
     state: &Arc<AppState>,
     project_id: &str,
+    locale: &'static str,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     info!("[STOP_DESTROY] 开始销毁容器: project_id={}", project_id);
 
@@ -44,9 +47,9 @@ async fn destroy_container_for_project(
         Ok(manager) => manager,
         Err(e) => {
             error!("[STOP_DESTROY] Failed to get global DockerManager: {}", e);
-            return Ok(HttpResult::error(
+            return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_ERROR,
-                &format!("Failed to get global DockerManager: {}", e),
+                locale,
             ));
         }
     };
@@ -78,9 +81,9 @@ async fn destroy_container_for_project(
 
             if let Err(e) = stop_result {
                 error!("[STOP_DESTROY] 停止容器失败: {}", e);
-                return Ok(HttpResult::error(
+                return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_STOP_FAILED,
-                    &format!("停止容器失败: {}", e),
+                    locale,
                 ));
             }
 
@@ -96,7 +99,7 @@ async fn destroy_container_for_project(
                 success: true,
                 project_id: project_id.to_string(),
                 session_id: None,
-                message: "容器已成功销毁".to_string(),
+                message: shared_types::get_i18n_message("success.container_destroyed", locale),
             };
 
             return Ok(HttpResult::success(response));
@@ -116,9 +119,9 @@ async fn destroy_container_for_project(
 
         if let Err(e) = stop_result {
             error!("[STOP_DESTROY] 停止容器失败: {}", e);
-            return Ok(HttpResult::error(
+            return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_STOP_FAILED,
-                &format!("停止容器失败: {}", e),
+                locale,
             ));
         }
 
@@ -136,7 +139,7 @@ async fn destroy_container_for_project(
             success: true,
             project_id: project_id.to_string(),
             session_id: None,
-            message: "容器已成功销毁".to_string(),
+            message: shared_types::get_i18n_message("success.container_destroyed", locale),
         };
 
         Ok(HttpResult::success(response))
@@ -151,7 +154,7 @@ async fn destroy_container_for_project(
             success: true,
             project_id: project_id.to_string(),
             session_id: None,
-            message: "容器不存在，无需销毁".to_string(),
+            message: shared_types::get_i18n_message("success.container_not_exist", locale),
         };
 
         Ok(HttpResult::success(response))
@@ -238,14 +241,16 @@ async fn destroy_container_for_project(
 #[instrument(skip(state))]
 pub async fn agent_stop(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<StopAgentQuery>,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
+    let locale = get_locale_from_headers(&headers);
     let project_id = query.project_id.trim();
 
     if project_id.is_empty() {
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_INVALID_PARAMS,
-            "project_id cannot be empty",
+            locale,
         ));
     }
 
@@ -255,7 +260,7 @@ pub async fn agent_stop(
     );
 
     // 直接销毁容器
-    let result = destroy_container_for_project(&state, project_id).await;
+    let result = destroy_container_for_project(&state, project_id, locale).await;
 
     match &result {
         Ok(response) => {

@@ -4,10 +4,11 @@
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::utils::get_realtime_container_ip_with_cache;
+use super::utils::{get_locale_from_headers, get_realtime_container_ip_with_cache};
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
 use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse};
@@ -17,9 +18,6 @@ const GRPC_MAX_RETRIES: u32 = 3;
 
 /// gRPC GetStatus 请求超时时间（秒）
 const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
-
-/// Agent 存活状态列表（白名单）
-const ALIVE_STATUSES: &[&str] = &["idle", "busy"];
 
 /// 处理 Computer Agent 状态查询
 ///
@@ -92,21 +90,25 @@ const ALIVE_STATUSES: &[&str] = &["idle", "busy"];
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn computer_agent_status(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ComputerAgentStatusRequest>,
 ) -> Result<HttpResult<ComputerAgentStatusResponse>, AppError> {
+    // 获取语言设置
+    let locale = get_locale_from_headers(&headers);
+
     // 1. 参数验证
     if request.user_id.trim().is_empty() {
         error!("[COMPUTER_AGENT_STATUS] user_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id is required",
+            locale,
         ));
     }
     if request.project_id.trim().is_empty() {
         error!("[COMPUTER_AGENT_STATUS] project_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required",
+            locale,
         ));
     }
 

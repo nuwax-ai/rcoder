@@ -3,7 +3,7 @@
 //! 将原始 HTTP 请求直接转发到容器内的 agent_runner 服务
 
 use anyhow::Result;
-use axum::{Json, extract::State};
+use axum::{Json, extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use shared_types::{ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
-use super::utils::extract_grpc_addr_with_port;
+use super::utils::{extract_grpc_addr_with_port, get_locale_from_headers};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -127,11 +127,15 @@ pub struct ChatRequest {
     summary = "转发聊天消息到容器化 AI 服务",
     description = "根据 project_id 动态管理容器（默认使用 ServiceType::RCoder），将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
 )]
-#[instrument(skip(state,request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
+#[instrument(skip(state, request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(mut request): Json<ChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
+    // 获取语言设置
+    let locale = get_locale_from_headers(&headers);
+
     let project_id = match &request.project_id {
         Some(id) => id.clone(),
         None => {
@@ -299,6 +303,7 @@ pub async fn handle_chat(
         &request_for_forward,
         &container_info,
         &state.grpc_pool,
+        locale,
     )
     .await;
     info!("[CHAT] 容器服务返回结果: success={}", result.is_ok());
@@ -361,14 +366,15 @@ async fn forward_request_to_container_service(
     request: &ChatRequest,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
+    locale: &'static str,
 ) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
     let project_id = if let Some(id) = &request.project_id {
         id.clone()
     } else {
         error!("[FORWARD]会话 project_id is required");
-        return Ok(crate::HttpResult::error(
+        return Ok(crate::HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required",
+            locale,
         ));
     };
 
@@ -476,15 +482,15 @@ async fn forward_request_to_container_service(
         // gRPC 通信失败，直接返回错误
         // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
         // 这里只处理真正的 gRPC 通信层错误
-        Ok(HttpResult::error(
+        Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_GRPC_ERROR,
-            &format!("gRPC 调用失败: {}", e),
+            locale,
         ))
     } else {
         // 理论上不会走到这里，除非 max_retries < 1
-        Ok(HttpResult::error(
+        Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_GRPC_ERROR,
-            "Unknown retry error",
+            locale,
         ))
     }
 }

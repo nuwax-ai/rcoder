@@ -21,17 +21,16 @@
 //!
 //! 注意：Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 
-use axum::{Json, extract::State};
-use shared_types::{ChatResponse, ComputerChatRequest, ModelProviderConfig, get_i18n_message_default};
+use axum::{Json, extract::State, http::HeaderMap};
+use shared_types::{ChatResponse, ComputerChatRequest};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 use docker_manager::ContainerBasicInfo;
-use shared_types::Attachment;
 
 use super::utils::{
-    extract_grpc_addr_with_port, get_realtime_container_ip_with_cache, project_dir,
+    extract_grpc_addr_with_port, get_locale_from_headers, get_realtime_container_ip_with_cache, project_dir,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -93,14 +92,18 @@ use super::utils::{
 #[instrument(skip(state, request), fields(user_id = %request.user_id, project_id = ?request.project_id))]
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(mut request): Json<ComputerChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
+    // 获取语言设置
+    let locale = get_locale_from_headers(&headers);
+
     // 1. 验证 user_id
     if request.user_id.trim().is_empty() {
         error!("[COMPUTER_CHAT] user_id is required");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            shared_types::DEFAULT_LOCALE,
+            locale,
         ));
     }
 
@@ -132,9 +135,9 @@ pub async fn handle_computer_chat(
         if let Some(ref resource_limits) = agent_config.resource_limits {
             if let Err(e) = resource_limits.validate() {
                 error!("[COMPUTER_CHAT] Resource limits validation failed: {}", e);
-                return Ok(HttpResult::error(
+                return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
-                    &format!("Invalid resource limits: {}", e),
+                    locale,
                 ));
             }
         }
@@ -223,9 +226,9 @@ pub async fn handle_computer_chat(
             Ok(info) => info,
             Err(e) => {
                 error!("[COMPUTER_CHAT] Failed to get or create container: {}", e);
-                return Ok(HttpResult::error(
+                return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CONTAINER_ERROR,
-                    &format!("Failed to get or create container: {}", e),
+                    locale,
                 ));
             }
         }
@@ -277,9 +280,9 @@ pub async fn handle_computer_chat(
     // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
     if let Err(e) = ensure_project_workspace_exists(&user_id, &project_id).await {
         error!("[COMPUTER_CHAT] Failed to create project workspace: {}", e);
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_WORKSPACE_ERROR,
-            &format!("Failed to create project workspace: {}", e),
+            locale,
         ));
     }
 
@@ -390,6 +393,7 @@ pub async fn handle_computer_chat(
         &container_info,
         &state.grpc_pool,
         &state.container_ip_cache,
+        locale,
     )
     .await;
 
@@ -542,6 +546,7 @@ async fn forward_computer_request_to_container(
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
     container_ip_cache: &Arc<crate::grpc::ContainerIpCache>,
+    locale: &'static str,
 ) -> HttpResult<ChatResponse> {
     info!(
         "📤 [COMPUTER_FORWARD] 转发请求到容器 (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}",
@@ -573,9 +578,9 @@ async fn forward_computer_request_to_container(
                 Ok(addr) => addr,
                 Err(e) => {
                     error!("[COMPUTER_FORWARD] Failed to extract gRPC address: {}", e);
-                    return HttpResult::error(
+                    return HttpResult::error_with_locale(
                         shared_types::error_codes::ERR_GRPC_ADDR_ERROR,
-                        &format!("Failed to extract gRPC address: {}", e),
+                        locale,
                     );
                 }
             }
@@ -678,12 +683,15 @@ async fn forward_computer_request_to_container(
 
         // gRPC 通信失败，直接返回错误
         // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
-        HttpResult::error(
+        HttpResult::error_with_locale(
             shared_types::error_codes::ERR_GRPC_ERROR,
-            &format!("容器通信失败: {}", e),
+            locale,
         )
     } else {
-        HttpResult::error(shared_types::error_codes::ERR_UNKNOWN, "Unknown retry error")
+        HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_UNKNOWN,
+            locale,
+        )
     }
 }
 
