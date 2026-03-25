@@ -642,7 +642,7 @@ impl ProxyHttp for PortProxy {
                 // 打印上游响应 headers
                 for (name, value) in upstream_response.headers.iter() {
                     let val_str = value.to_str().unwrap_or("<binary>");
-                    debug!("🔍 [API_PROXY_DEBUG] 响应 Header: {} = {}", name, val_str);
+                    debug!("[API_PROXY_DEBUG] 响应 Header: {} = {}", name, val_str);
                 }
             } else {
                 info!(
@@ -880,7 +880,7 @@ impl PortProxy {
             .get(user_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
-                warn!("❌ [AUDIO] 用户容器不存在: user_id={}", user_id);
+                warn!("[AUDIO] 用户容器不存在: user_id={}", user_id);
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
                     .more_context(format!("找不到用户 {} 的音频后端，请先创建容器", user_id))
             })?;
@@ -943,7 +943,7 @@ impl PortProxy {
             .get(user_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
-                warn!("❌ [IME] 用户容器不存在: user_id={}", user_id);
+                warn!("[IME] 用户容器不存在: user_id={}", user_id);
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
                     .more_context(format!("找不到用户 {} 的 IME 后端，请先创建容器", user_id))
             })?;
@@ -1022,9 +1022,9 @@ impl PortProxy {
                     || name.as_str().eq_ignore_ascii_case("authorization")
                 {
                     let masked = mask_header_value(val_str);
-                    debug!("🔍 [API_PROXY_DEBUG]   Header: {} = {}", name, masked);
+                    debug!("[API_PROXY_DEBUG]   Header: {} = {}", name, masked);
                 } else {
-                    debug!("🔍 [API_PROXY_DEBUG]   Header: {} = {}", name, val_str);
+                    debug!("[API_PROXY_DEBUG]   Header: {} = {}", name, val_str);
                 }
             }
         }
@@ -1143,19 +1143,19 @@ impl PortProxy {
 
         // 🔍 [DEBUG] 打印最终发送到上游的所有 headers
         {
-            debug!("🔍 [API_PROXY_DEBUG] ====== 最终上游请求 Headers ======");
+            debug!("[API_PROXY_DEBUG] ====== 最终上游请求 Headers ======");
             for (name, value) in upstream_request.headers.iter() {
                 let val_str = value.to_str().unwrap_or("<binary>");
                 if name.as_str().eq_ignore_ascii_case("x-api-key")
                     || name.as_str().eq_ignore_ascii_case("authorization")
                 {
                     let masked = mask_header_value(val_str);
-                    debug!("🔍 [API_PROXY_DEBUG]   {} = {}", name, masked);
+                    debug!("[API_PROXY_DEBUG]   {} = {}", name, masked);
                 } else {
-                    debug!("🔍 [API_PROXY_DEBUG]   {} = {}", name, val_str);
+                    debug!("[API_PROXY_DEBUG]   {} = {}", name, val_str);
                 }
             }
-            debug!("🔍 [API_PROXY_DEBUG] ====== Headers 结束 ======");
+            debug!("[API_PROXY_DEBUG] ====== Headers 结束 ======");
         }
 
         Ok(())
@@ -1364,7 +1364,7 @@ impl PortProxy {
             .get(user_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
-                warn!("❌ [AUDIO] 容器不存在: user_id={}", user_id);
+                warn!("[AUDIO] 容器不存在: user_id={}", user_id);
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
                     .more_context(format!("找不到用户 {} 的音频后端", user_id))
             })?;
@@ -1405,7 +1405,7 @@ impl PortProxy {
             .get(user_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
-                warn!("❌ [IME] 容器不存在: user_id={}", user_id);
+                warn!("[IME] 容器不存在: user_id={}", user_id);
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
                     .more_context(format!("找不到用户 {} 的 IME 后端", user_id))
             })?;
@@ -1531,7 +1531,7 @@ impl PingoraProxyService {
     pub fn create_pingora_proxy(&self) -> anyhow::Result<PortProxy> {
         // 使用统一的路由配置
         let router = create_router().map_err(|e| {
-            tracing::error!("❌ [PROXY] 创建路由表失败: {}", e);
+            tracing::error!("[PROXY] 创建路由表失败: {}", e);
             e
         })?;
 

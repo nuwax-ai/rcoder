@@ -150,7 +150,7 @@ impl ConfigWatcher {
                 }
 
                 if key_changed {
-                    info!("🔄 [CONFIG_WATCHER] API Key 已更新");
+                    info!("[CONFIG_WATCHER] API Key 已更新");
                 }
 
                 if !old_enabled && !new_enabled && !key_changed {
@@ -158,7 +158,7 @@ impl ConfigWatcher {
                     return Ok(());
                 }
 
-                info!("[CONFIG_WATCHER] 配置热更新成功");
+                info!("[CONFIG_WATCHER] 配置热Update succeeded");
                 Ok(())
             }
             Err(e) => {

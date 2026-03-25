@@ -50,14 +50,14 @@ impl ContainerSelfInspector {
             .await
             .context("测试 Docker 连接失败，请检查 socket 路径和权限")?;
 
-        info!("✅ Docker 连接成功");
+        info!("Docker 连接成功");
 
         // 获取当前容器ID
         let container_id = Self::get_current_container_id()
             .await
             .context("获取当前容器ID失败")?;
 
-        info!("✅ 检测到当前容器ID: {}", container_id);
+        info!("检测到当前容器ID: {}", container_id);
 
         Ok(Self {
             docker_client,
@@ -128,7 +128,7 @@ impl ContainerSelfInspector {
                         .ok_or_else(|| anyhow!("挂载点 {} 没有 source 字段", index))?
                         .clone();
 
-                    info!("✅ 找到匹配的挂载点: {} -> {}", container_path, host_path);
+                    info!("找到匹配的挂载点: {} -> {}", container_path, host_path);
                     return Ok(host_path);
                 }
             }
@@ -202,7 +202,7 @@ impl ContainerSelfInspector {
                     if container_id.len() == 64
                         && container_id.chars().all(|c| c.is_ascii_hexdigit())
                     {
-                        info!("✅ 成功解析容器ID: {}", container_id);
+                        info!("成功解析容器ID: {}", container_id);
                         return Ok(container_id);
                     } else {
                         debug!("跳过无效的容器ID: {}", container_id);
@@ -230,7 +230,7 @@ impl ContainerSelfInspector {
             debug!("检查 HOSTNAME 环境变量: {}", hostname);
             if hostname.len() == 12 && hostname.chars().all(|c| c.is_ascii_hexdigit()) {
                 // 可能是短格式的容器ID（前12位）
-                info!("✅ 从 HOSTNAME 获取到容器ID前缀: {}", hostname);
+                info!("从 HOSTNAME 获取到容器ID前缀: {}", hostname);
                 return Ok(hostname);
             }
         }
@@ -247,7 +247,7 @@ impl ContainerSelfInspector {
             .ping()
             .await
             .context("Docker socket 连接测试失败")?;
-        info!("✅ Docker socket 连接验证成功");
+        info!("Docker socket 连接验证成功");
         Ok(())
     }
 

@@ -136,7 +136,7 @@ pub enum InstallationError {
     PackageNotFound(String),
 
     /// Installation failed
-    #[error("安装失败: {0}")]
+    #[error("Installation failed: {0}")]
     InstallationFailed(String),
 
     /// Validation failed

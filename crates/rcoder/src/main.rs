@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args)?;
 
-    // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
+    // 🆕 Initializing telemetry system（使用 rcoder-telemetry，包含控制台 + 文件日志）
     // 使用配置文件中的日志保留天数，与容器日志清理保持一致
     let file_log_config = rcoder_telemetry::FileLogConfig::new("logs", "rcoder")
         .with_max_files(config.cleanup_config.log_cleanup.log_retention_days as usize);
@@ -344,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
     let _config_watcher =
         match crate::config_watcher::ConfigWatcher::new(config_path, Arc::clone(&api_key_config)) {
             Ok(watcher) => {
-                info!("🔄 配置文件监控已启动，支持 API Key 热更新");
+                info!("配置文件监控已启动，支持 API Key 热更新");
                 Some(watcher)
             }
             Err(e) => {
@@ -389,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
         sync_interval: Duration::from_secs(60), // 每 60 秒同步一次
     };
     let _container_sync_handle = start_container_sync_task(container_sync_config);
-    info!("🔄 容器状态同步任务已启动（间隔: 60 秒，检测外部删除的容器）");
+    info!("容器状态同步任务已启动（间隔: 60 秒，检测外部删除的容器）");
 
     // 🆕 启动 VNC 后端同步任务（定期从 Docker 同步容器 IP 到 Pingora）
     if let Some(ref pingora_service) = state.pingora_service {
@@ -418,7 +418,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(proxy_config) = &config.proxy_config {
         info!("Pingora 反向代理服务已启用");
         info!("📡 监听端口: {}", proxy_config.listen_port);
-        info!("🔄 路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
+        info!("路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
         info!("动态后端: 根据请求端口自动发现和代理后端服务");
         info!("💡 示例:");
         info!(
@@ -612,7 +612,7 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) 
     // 等待关闭信号
     let _ = shutdown_rx.recv().await;
 
-    info!("🔄 开始优雅关闭流程...");
+    info!("开始优雅关闭流程...");
 
     // 执行容器清理
     if let Err(e) = cleanup_all_containers().await {

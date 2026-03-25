@@ -70,7 +70,7 @@ pub async fn init_tracer_provider(
         init_http_provider(&config.endpoint, resource, sampler).await?
     };
 
-    info!("✅ [OTLP] TracerProvider 初始化完成");
+    info!("[OTLP] TracerProvider initialization completed");
 
     Ok(tracer_provider)
 }
@@ -130,7 +130,7 @@ async fn init_http_provider(
 /// 将 TracerProvider 设置为全局 provider，并获取 tracer。
 pub fn set_global_tracer_provider(provider: SdkTracerProvider) {
     opentelemetry::global::set_tracer_provider(provider);
-    info!("✅ [OTLP] 全局 TracerProvider 已设置");
+    info!("[OTLP] Global TracerProvider set");
 }
 
 /// 关闭 TracerProvider
@@ -139,7 +139,7 @@ pub fn set_global_tracer_provider(provider: SdkTracerProvider) {
 /// 注意：在 OpenTelemetry 0.31+ 中，shutdown 需要在 TracerProvider 实例上调用。
 /// 此函数仅用于日志记录，实际 shutdown 由 TelemetryGuard 的 Drop 处理。
 pub fn shutdown_tracer_provider() {
-    info!("🔚 [OTLP] TracerProvider 关闭请求已记录");
+    info!("[OTLP] TracerProvider shutdown request logged");
     // 注意：在 OpenTelemetry 0.31+ 中，全局 shutdown 函数已移除
     // TracerProvider 的 Drop 会自动处理清理
 }

@@ -169,7 +169,7 @@ async fn invalidate_project_cache(project_dir_name: &str) {
 pub fn start_file_watcher() {
     // 确保只启动一次
     if WATCHER_STARTED.swap(true, Ordering::SeqCst) {
-        debug!("🔍 [文件监听] 监听器已在运行");
+        debug!("[文件监听] 监听器已在运行");
         return;
     }
 
@@ -178,7 +178,7 @@ pub fn start_file_watcher() {
     // 创建目录（如果不存在）
     if !projects_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&projects_dir) {
-            warn!("⚠️ [文件监听] 无法创建 projects 目录: {}", e);
+            warn!("[文件监听] 无法创建 projects 目录: {}", e);
             WATCHER_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -201,7 +201,7 @@ pub fn start_file_watcher() {
                     match event.kind {
                         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
                             if let Err(e) = tx.blocking_send(event) {
-                                error!("❌ [文件监听] 发送事件失败: {}", e);
+                                error!("[文件监听] 发送事件失败: {}", e);
                             }
                         }
                         _ => {}
@@ -209,7 +209,7 @@ pub fn start_file_watcher() {
                 }
             }
             Err(e) => {
-                error!("❌ [文件监听] 监听错误: {}", e);
+                error!("[文件监听] 监听错误: {}", e);
             }
         }
     });
@@ -217,7 +217,7 @@ pub fn start_file_watcher() {
     let mut watcher = match watcher_result {
         Ok(w) => w,
         Err(e) => {
-            error!("❌ [文件监听] 创建监听器失败: {}", e);
+            error!("[文件监听] 创建监听器失败: {}", e);
             WATCHER_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -225,7 +225,7 @@ pub fn start_file_watcher() {
 
     // 开始监听目录
     if let Err(e) = watcher.watch(&projects_dir, RecursiveMode::Recursive) {
-        error!("❌ [文件监听] 监听目录失败: {}", e);
+        error!("[文件监听] 监听目录失败: {}", e);
         WATCHER_STARTED.store(false, Ordering::SeqCst);
         return;
     }
@@ -259,7 +259,7 @@ pub fn start_file_watcher() {
                             debounce_timer = Some(tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS));
                         }
                         None => {
-                            warn!("⚠️ [文件监听] 事件接收通道已关闭");
+                            warn!("[文件监听] 事件接收通道已关闭");
                             break;
                         }
                     }
@@ -289,7 +289,7 @@ pub fn start_file_watcher() {
         }
     });
 
-    info!("✅ [文件监听] 监听器启动完成");
+    info!("[文件监听] 监听器启动完成");
 }
 
 /// 停止文件系统监听器
@@ -337,9 +337,9 @@ pub async fn check_session_file_exists(session_id: &str, project_path: &str) -> 
     cache.insert(project_path.to_string(), session_ids).await;
 
     if exists {
-        info!("✅ [文件扫描] 找到 session 文件: {}", session_id);
+        info!("[文件扫描] 找到 session 文件: {}", session_id);
     } else {
-        debug!("❌ [文件扫描] 未找到 session 文件: {}", session_id);
+        debug!("[文件扫描] 未找到 session 文件: {}", session_id);
     }
 
     exists

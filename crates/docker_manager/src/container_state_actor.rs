@@ -305,7 +305,7 @@ impl ContainerStateHandle {
 
     /// 条件更新：如果 key 存在则更新
     ///
-    /// 返回 true 表示更新成功，false 表示 key 不存在
+    /// 返回 true 表示Update succeeded，false 表示 key 不存在
     pub async fn update_if_exists(&self, key: &str, info: DockerContainerInfo) -> bool {
         let (reply, rx) = oneshot::channel();
         if self

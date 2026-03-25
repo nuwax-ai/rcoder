@@ -61,7 +61,7 @@ pub async fn handle_computer_chat(
     // 1. 验证必填字段
     if request.user_id.is_empty() {
         let error_msg = "user_id is required for ComputerAgentRunner";
-        error!("❌ [HTTP] {}", error_msg);
+        error!("[HTTP] {}", error_msg);
         return Err((
             StatusCode::BAD_REQUEST,
             Json(HttpResult::error("VALIDATION_ERROR", error_msg)),
@@ -88,7 +88,7 @@ pub async fn handle_computer_chat(
 
     if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
         let error_msg = format!("Failed to create project directory: {}", e);
-        error!("❌ [HTTP] {}", error_msg);
+        error!("[HTTP] {}", error_msg);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(HttpResult::error("INTERNAL_ERROR", &error_msg)),

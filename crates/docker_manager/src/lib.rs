@@ -185,7 +185,7 @@ pub mod global {
             ))
         })?;
 
-        info!("✅ 全局 DockerManager 初始化成功");
+        info!("全局 DockerManager 初始化成功");
         Ok(())
     }
 
@@ -202,7 +202,7 @@ pub mod global {
             ))
         })?;
 
-        info!("✅ 全局 DockerManager 初始化成功（自定义配置）");
+        info!("全局 DockerManager 初始化成功（自定义配置）");
         Ok(())
     }
 

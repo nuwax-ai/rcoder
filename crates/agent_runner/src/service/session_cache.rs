@@ -108,7 +108,7 @@ impl SessionData {
             .send(SessionCommand::MessageCount { ack: tx })
             .is_err()
         {
-            warn!("⚠️ message_count 指令发送失败，worker 已退出");
+            warn!("message_count 指令发送失败，worker 已退出");
             return 0;
         }
         rx.await.unwrap_or(0)
@@ -172,7 +172,7 @@ impl SessionData {
             .send(SessionCommand::Push { message })
             .is_err()
         {
-            warn!("⚠️ 推送消息失败，worker 已退出");
+            warn!("推送消息失败，worker 已退出");
         }
     }
 
@@ -263,7 +263,7 @@ impl SessionWorker {
                         if producer.try_push(message.clone()).is_ok() {
                             buffered_len += 1;
                         } else {
-                            warn!("⚠️ ring buffer push 失败，只能实时推送");
+                            warn!("ring buffer push 失败，只能实时推送");
                         }
                     }
 

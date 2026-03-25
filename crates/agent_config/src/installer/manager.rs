@@ -140,20 +140,20 @@ impl AgentInstallationManager {
         config: &InstallationConfig,
         command: &str,
     ) -> Result<InstallResult, InstallationError> {
-        info!("🔍 检查 Agent 安装状态: {}", command);
+        info!("Checking Agent installation status: {}", command);
 
         // First, check if the command already exists
         if self.is_command_available(command).await {
             // Validate if it's working correctly
             if self.validate_installation(config, command).await? {
-                info!("✅ Agent 已安装且验证通过: {}", command);
+                info!("Agent is installed and verified: {}", command);
                 return Ok(InstallResult::already_installed(None));
             }
-            warn!("⚠️ Agent 命令存在但验证失败，尝试重新安装: {}", command);
+            warn!("Agent command exists but verification failed, trying reinstall: {}", command);
         }
 
         // Not installed or validation failed, try to install
-        info!("📦 尝试安装 Agent: {}", command);
+        info!("Trying to install Agent: {}", command);
         let result = self.install(config, None).await;
 
         match &result {
@@ -165,13 +165,13 @@ impl AgentInstallationManager {
                     );
                 } else {
                     warn!(
-                        "⚠️ Agent 安装失败: {} - {}",
+                        "⚠️ Agent Installation failed: {} - {}",
                         command, install_result.message
                     );
                 }
             }
             Err(e) => {
-                warn!("❌ Agent 安装过程出错: {} - {}", command, e);
+                warn!("Agent installation error: {} - {}", command, e);
             }
         }
 
@@ -209,7 +209,7 @@ impl AgentInstallationManager {
         config: &InstallationConfig,
         command: &str,
     ) -> Result<bool, InstallationError> {
-        debug!("🔍 验证 Agent 安装: {}", command);
+        debug!("Verifying Agent installation: {}", command);
 
         // If validate_command is specified, use it
         if let Some(validate_cmd) = &config.validate_command {
@@ -222,11 +222,11 @@ impl AgentInstallationManager {
         // which::which 是 Rust crate，不依赖系统 which 命令
         // 注意：只检查命令是否在 PATH 中，不运行命令避免副作用（如 claude-code-acp-ts --version 会阻塞）
         if self.is_command_available(command).await {
-            debug!("✅ 命令存在于 PATH 中: {}", command);
+            debug!("Command exists in PATH: {}", command);
             return Ok(true);
         }
 
-        debug!("❌ 命令不在 PATH 中: {}", command);
+        debug!("Command not in PATH: {}", command);
         Ok(false)
     }
 
@@ -244,7 +244,7 @@ impl AgentInstallationManager {
         let program = &cmd[0];
         let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
 
-        debug!("运行验证命令: {} {:?}", program, args);
+        debug!("Running verification command: {} {:?}", program, args);
 
         let output = tokio::process::Command::new(program)
             .args(&args)
@@ -270,7 +270,7 @@ impl AgentInstallationManager {
             )
         })?;
 
-        info!("🔄 更新 Agent via {}", installer.package_manager_name());
+        info!("Updating Agent via {}", installer.package_manager_name());
 
         installer.update(config, install_dir).await
     }

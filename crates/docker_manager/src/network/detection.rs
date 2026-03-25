@@ -51,7 +51,7 @@ impl<'a> NetworkDetector<'a> {
                 // 查找包含 "agent-network" 的网络
                 for network_name in networks.keys() {
                     if network_name.contains(RCODER_NETWORK_BASE_NAME) {
-                        info!("✅ 动态检测到主网络: {}", network_name);
+                        info!("动态检测到主网络: {}", network_name);
                         return Ok(network_name.clone());
                     }
                 }

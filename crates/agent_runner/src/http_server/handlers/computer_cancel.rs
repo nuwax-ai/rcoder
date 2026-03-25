@@ -114,7 +114,7 @@ pub async fn handle_computer_cancel(
             // 发送取消信号 (异步)
             match cancel_tx.send(cancel_request).await {
                 Ok(_) => {
-                    info!("✅ [HTTP] 取消信号已发送: session_id={}", session_id);
+                    info!("[HTTP] 取消信号已发送: session_id={}", session_id);
                 }
                 Err(e) => {
                     warn!(

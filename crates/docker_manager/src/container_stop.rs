@@ -104,7 +104,7 @@ pub async fn startup_cleanup_containers(
     let matched_containers = docker_manager.list_containers_with_pattern(pattern).await?;
 
     let total_found = matched_containers.len();
-    info!("🔍 [STARTUP_CLEANUP] 找到 {} 个匹配的容器", total_found);
+    info!("[STARTUP_CLEANUP] 找到 {} 个匹配的容器", total_found);
 
     if total_found == 0 {
         return Ok(CleanupResult {
@@ -530,7 +530,7 @@ pub async fn startup_cleanup_all_enabled_services(
     let patterns = get_container_patterns_for_enabled_services(multi_image_config);
 
     if patterns.is_empty() {
-        warn!("⚠️ 没有启用的服务，跳过容器清理");
+        warn!("没有启用的服务，跳过容器清理");
         return Ok(CleanupResult::default());
     }
 

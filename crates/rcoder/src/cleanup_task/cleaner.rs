@@ -200,7 +200,7 @@ impl AgentCleaner {
             interval.tick().await;
 
             match self.cleanup_once().await {
-                Ok(_) => debug!("✅ [cleaner] 定时清理完成"),
+                Ok(_) => debug!("[cleaner] 定时清理完成"),
                 Err(e) => warn!("[cleaner] 定时清理失败: {}", e),
             }
         }

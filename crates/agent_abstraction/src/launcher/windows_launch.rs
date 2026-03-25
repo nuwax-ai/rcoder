@@ -64,7 +64,7 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
         }
     }
 
-    warn!("[SACP] Windows node 解析失败: NUWAX_NODE_PATH、NUWAX_NODE_EXE、NUWAX_APP_RUNTIME_PATH 和 APPDATA 默认路径均未命中");
+    warn!("[SACP] Windows node resolution failed: NUWAX_NODE_PATH, NUWAX_NODE_EXE, NUWAX_APP_RUNTIME_PATH and APPDATA default paths all missed");
     None
 }
 
@@ -336,13 +336,13 @@ pub fn normalize_windows_command_for_no_window(
 
     match ext.as_deref() {
         Some("exe") => {
-            info!("[SACP] ✅ Windows 检测到原生 .exe: {} - 不会弹窗", path);
+            info!("[SACP] Windows detected native .exe: {} - no popup window", path);
         }
         Some("cmd" | "bat") => {
             info!("[SACP] 🔍 Windows 检测到 .cmd/.bat: {}", path);
             info!("[SACP] 🔄 正在转换为 node.exe + JS 形式...");
             if let Some((node_path, js_args)) = resolve_windows_node_cli_command(&path, &args) {
-                info!("[SACP] ✅ 转换成功: {} + {:?}", node_path, js_args);
+                info!("[SACP] 转换成功: {} + {:?}", node_path, js_args);
                 path = node_path;
                 args = js_args;
             } else {
@@ -371,7 +371,7 @@ pub fn normalize_windows_command_for_no_window(
 
                 match resolved_ext.as_deref() {
                     Some("exe") => {
-                        info!("[SACP] ✅ 解析后是原生 .exe - 不会弹窗");
+                        info!("[SACP] 解析后是原生 .exe - no popup window");
                         path = resolved_str;
                     }
                     Some("cmd" | "bat") => {
@@ -379,7 +379,7 @@ pub fn normalize_windows_command_for_no_window(
                         if let Some((node_path, js_args)) =
                             resolve_windows_node_cli_command(&resolved_str, &args)
                         {
-                            info!("[SACP] ✅ 转换成功: {} + {:?}", node_path, js_args);
+                            info!("[SACP] 转换成功: {} + {:?}", node_path, js_args);
                             path = node_path;
                             args = js_args;
                         } else {

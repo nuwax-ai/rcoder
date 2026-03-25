@@ -110,7 +110,7 @@ pub async fn debug_sql_query(
     // 安全检查：Only SELECT queries are allowed
     let sql_trimmed = request.sql.trim().to_uppercase();
     if !sql_trimmed.starts_with("SELECT") {
-        warn!("❌ [DEBUG_SQL] 拒绝非 SELECT 查询: {}", request.sql);
+        warn!("[DEBUG_SQL] 拒绝非 SELECT 查询: {}", request.sql);
         return HttpResult::error("INVALID_QUERY", "Only SELECT queries are allowed");
     }
 

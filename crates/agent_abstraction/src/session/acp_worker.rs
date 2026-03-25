@@ -61,7 +61,7 @@ where
         AcpSessionManager::<N, R>::ensure_project_dir(&normalized_path)
             .await
             .map_err(|e| {
-                error!("❌ 创建项目目录失败: {:?}", e);
+                error!("创建项目目录失败: {:?}", e);
                 e
             })?;
 
@@ -163,7 +163,7 @@ where
                 super::check_session_file_exists(session_id, &project_path_str).await;
 
             if session_exists {
-                info!("✅ Session 文件存在，尝试 resume: {}", session_id);
+                info!("Session 文件存在，尝试 resume: {}", session_id);
                 start_config = start_config.with_resume_session_id(session_id.clone());
             } else {
                 warn!(
@@ -191,7 +191,7 @@ where
             )
             .await
             .map_err(|e| {
-                error!("❌ 获取或创建会话失败: {:?}", e);
+                error!("获取或创建会话失败: {:?}", e);
                 e
             })?;
 
@@ -223,11 +223,11 @@ where
             .send_prompt_request(&project_id, prompt_request)
             .await
             .map_err(|e| {
-                error!("❌ 发送 Prompt 请求失败: {:?}", e);
+                error!("发送 Prompt 请求失败: {:?}", e);
                 e
             })?;
 
-        info!("✅ Prompt 请求已发送，project_id: {}", project_id);
+        info!("Prompt 请求已发送，project_id: {}", project_id);
 
         // 8. 构建响应
         if is_new {

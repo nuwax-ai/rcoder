@@ -96,7 +96,7 @@ fn create_heartbeat_stream(
             let json_str = match serde_json::to_string(&heartbeat_msg) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("❌ [HTTP] 心跳消息序列化失败: {}", e);
+                    error!("[HTTP] 心跳消息序列化失败: {}", e);
                     continue;
                 }
             };
@@ -156,7 +156,7 @@ pub async fn handle_computer_progress(
     let session_data = match SESSION_CACHE.get(&session_id) {
         Some(data) => data.value().clone(),
         None => {
-            warn!("⚠️  [HTTP] Session 不存在: session_id={}", session_id);
+            warn!(" [HTTP] Session 不存在: session_id={}", session_id);
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(HttpResult::error(
@@ -192,7 +192,7 @@ pub async fn handle_computer_progress(
         let json_str = match serde_json::to_string(&msg) {
             Ok(s) => s,
             Err(e) => {
-                error!("❌ [HTTP] 消息序列化失败: {}", e);
+                error!("[HTTP] 消息序列化失败: {}", e);
                 return Ok(Event::default().data("{}"));
             }
         };
@@ -208,7 +208,7 @@ pub async fn handle_computer_progress(
     // 使用 select! 合并，保持事件顺序
     let merged_stream = futures_util::stream::select(message_stream, heartbeat_stream);
 
-    info!("✅ [HTTP] SSE 流已建立: session_id={}", session_id);
+    info!("[HTTP] SSE 流已建立: session_id={}", session_id);
 
     let stream: SseStream = Box::pin(merged_stream);
     Ok(Sse::new(stream))

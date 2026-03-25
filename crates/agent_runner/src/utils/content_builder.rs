@@ -52,7 +52,7 @@ impl ContentBuilder {
                 }
                 Ok(None) => {
                     // 文件不存在或无法读取，静默忽略
-                    tracing::warn!("⚠️ 附件无法加载，已忽略: attachment_id={}", attachment.id());
+                    tracing::warn!("附件无法加载，已忽略: attachment_id={}", attachment.id());
                 }
                 Err(e) => {
                     // 其他错误（如网络错误），记录警告但继续处理
@@ -80,7 +80,7 @@ impl ContentBuilder {
 
                 // 检查文件是否存在
                 if !file_path.exists() {
-                    tracing::warn!("⚠️ 附件文件不存在，已忽略: {:?}", file_path);
+                    tracing::warn!("附件文件不存在，已忽略: {:?}", file_path);
                     return Ok(None);
                 }
 
@@ -144,7 +144,7 @@ impl ContentBuilder {
 
                 // 检查文件是否存在
                 if !file_path.exists() {
-                    tracing::warn!("⚠️ 图像文件不存在，已忽略: {:?}", file_path);
+                    tracing::warn!("图像文件不存在，已忽略: {:?}", file_path);
                     return Ok(None);
                 }
 
@@ -152,7 +152,7 @@ impl ContentBuilder {
                 let data = match tokio::fs::read(&file_path).await {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::warn!("⚠️ 无法读取图像文件，已忽略: {:?}，错误: {}", file_path, e);
+                        tracing::warn!("无法读取图像文件，已忽略: {:?}，错误: {}", file_path, e);
                         return Ok(None);
                     }
                 };
@@ -189,7 +189,7 @@ impl ContentBuilder {
 
                 // 检查文件是否存在
                 if !file_path.exists() {
-                    tracing::warn!("⚠️ 音频文件不存在，已忽略: {:?}", file_path);
+                    tracing::warn!("音频文件不存在，已忽略: {:?}", file_path);
                     return Ok(None);
                 }
 
@@ -197,7 +197,7 @@ impl ContentBuilder {
                 let data = match tokio::fs::read(&file_path).await {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::warn!("⚠️ 无法读取音频文件，已忽略: {:?}，错误: {}", file_path, e);
+                        tracing::warn!("无法读取音频文件，已忽略: {:?}，错误: {}", file_path, e);
                         return Ok(None);
                     }
                 };
@@ -230,7 +230,7 @@ impl ContentBuilder {
 
                 // 检查文件是否存在
                 if !file_path.exists() {
-                    tracing::warn!("⚠️ 文档文件不存在，已忽略: {:?}", file_path);
+                    tracing::warn!("文档文件不存在，已忽略: {:?}", file_path);
                     return Ok(None);
                 }
 

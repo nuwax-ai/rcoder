@@ -314,11 +314,11 @@ pub async fn load_sacp_agent_config(
                     if result.already_installed {
                         debug!("[SACP] Agent 已安装: {}", agent_config.command);
                     } else {
-                        info!("✅ [SACP] Agent 安装成功: {}", result.message);
+                        info!("[SACP] Agent 安装成功: {}", result.message);
                     }
                 }
                 Err(e) => {
-                    warn!("⚠️ [SACP] Agent 自动安装失败: {}，尝试继续启动", e);
+                    warn!("[SACP] Agent 自动Installation failed: {}，尝试继续启动", e);
                 }
             }
         }
@@ -351,7 +351,7 @@ pub async fn load_sacp_agent_config(
             context_servers: config.context_servers.clone(),
         })
     } else {
-        warn!("⚠️ [SACP] 配置中未找到 claude-code-acp-ts，使用默认配置");
+        warn!("[SACP] 配置中未找到 claude-code-acp-ts，使用默认配置");
         get_default_sacp_agent_config(model_provider, service_type)
     }
 }
@@ -764,10 +764,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // 准备 MCP 服务器
         let mcp_servers = if start_config.has_mcp_servers() {
-            info!("📦 [SACP] 使用 AgentStartConfig 中的 MCP 服务器");
+            info!("[SACP] 使用 AgentStartConfig 中的 MCP 服务器");
             start_config.mcp_servers.clone()
         } else if !default_agent_config.context_servers.is_empty() {
-            info!("📦 [SACP] 使用配置文件中的 MCP 服务器");
+            info!("[SACP] 使用配置文件中的 MCP 服务器");
             convert_context_servers_sacp(&default_agent_config.context_servers)
         } else {
             info!("📝 [SACP] 未配置 MCP 服务器");
@@ -1505,7 +1505,7 @@ async fn handle_session_notification<N: SessionNotifier>(
         .await
     {
         error!(
-            "[SACP] 推送会话更新失败: project_id={}, session_id={}, error={:?}",
+            "[SACP] 推送会话Update failed: project_id={}, session_id={}, error={:?}",
             project_id, session_id, e
         );
     }

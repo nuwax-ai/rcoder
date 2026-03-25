@@ -137,11 +137,11 @@ impl DockerManager {
         let main_network_name =
             match Self::detect_main_network_name_static(&docker, &config.network_base_name).await {
                 Ok(network_name) => {
-                    info!("✅ 检测到主网络名称: {}", network_name);
+                    info!("检测到主网络名称: {}", network_name);
                     network_name
                 }
                 Err(e) => {
-                    error!("❌ 无法检测主网络名称: {}", e);
+                    error!("无法检测主网络名称: {}", e);
                     return Err(e);
                 }
             };
@@ -149,7 +149,7 @@ impl DockerManager {
         // 🆕 创建容器状态 Actor 并启动
         let (actor, containers) = ContainerStateActor::new();
         tokio::spawn(actor.run());
-        info!("✅ ContainerStateActor 已启动");
+        info!("ContainerStateActor 已启动");
 
         // 🗄️ 初始化 Docker API 缓存（使用配置的 TTL）
         let api_cache = Arc::new(DockerApiCache::new(
@@ -221,11 +221,11 @@ impl DockerManager {
                 result.container_name, result.container_id
             );
             if let Err(e) = self.stop_container_by_id(&result.container_id).await {
-                error!("❌ [CREATE] 删除旧容器失败: {}", e);
+                error!("[CREATE] 删除旧容器失败: {}", e);
                 // 继续尝试创建，Docker 会返回 409 错误
             } else {
                 // 🔧 stop_container_by_id 已处理缓存失效
-                info!("✅ [CREATE] 旧容器删除成功");
+                info!("[CREATE] 旧容器删除成功");
             }
         }
 
@@ -521,7 +521,7 @@ impl DockerManager {
                 DockerError::BollardError(e)
             })?;
 
-        info!("✅ 容器销毁成功: {}", container_id);
+        info!("容器销毁成功: {}", container_id);
 
         // 从映射中移除（如果存在）- 通过遍历查找 project_id
         for info in self.containers.list().await {
@@ -659,7 +659,7 @@ impl DockerManager {
                                     &format!("container {}", clean_name)
                                 )
                                 .unwrap_or_else(|e| {
-                                    warn!("⚠️ 解析容器创建时间失败: {}, 使用当前时间", e);
+                                    warn!("解析容器创建时间失败: {}, 使用当前时间", e);
                                     Utc::now()
                                 })
                             } else {
@@ -751,11 +751,11 @@ impl DockerManager {
         &self,
         identifier: &str,
     ) -> DockerResult<Option<ContainerQueryResult>> {
-        debug!("🔍 [REALTIME] 实时查询容器状态: identifier={}", identifier);
+        debug!("[REALTIME] 实时查询容器状态: identifier={}", identifier);
 
         // 1. 尝试从缓存获取（只缓存成功结果，不缓存 404）
         if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
-            debug!("✅ [REALTIME] 缓存命中: identifier={}", identifier);
+            debug!("[REALTIME] 缓存命中: identifier={}", identifier);
             // Arc::clone 只是增加引用计数，开销很小
             return Ok(Some((*cached).clone()));
         }
@@ -817,7 +817,7 @@ impl DockerManager {
                 None
             }
             Err(DockerError::Timeout(_)) => {
-                warn!("⚠️ [REALTIME] 查询超时，尝试从缓存获取: identifier={}", identifier);
+                warn!("[REALTIME] 查询超时，尝试从缓存获取: identifier={}", identifier);
                 // 超时时，尝试返回缓存中的旧值（如果有的话）
                 if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
                     return Ok(Some((*cached).clone()));
@@ -1194,7 +1194,7 @@ impl DockerManager {
 
         // 1. 在宿主机上预创建工作目录
         // 1. 检查工作目录是否已存在（通过绑定挂载，容器内创建会自动同步）
-        debug!("🔍 [DOCKER_MGR] 检查工作目录: {}", host_workspace_path);
+        debug!("[DOCKER_MGR] 检查工作目录: {}", host_workspace_path);
         // 绑定挂载机制：容器内创建目录会自动同步到宿主机
         // 所以这里不需要额外创建目录
 
@@ -1459,9 +1459,9 @@ impl DockerManager {
                     );
 
                     if let Err(e) = std::fs::create_dir_all(&create_path) {
-                        warn!("⚠️ [DOCKER_MGR] 创建挂载目录失败: {} - {}", create_path, e);
+                        warn!("[DOCKER_MGR] 创建挂载目录失败: {} - {}", create_path, e);
                     } else {
-                        info!("✅ [DOCKER_MGR] 目录创建成功: {}", create_path);
+                        info!("[DOCKER_MGR] 目录创建成功: {}", create_path);
                     }
                 } else {
                     // 没有配置 resolve_from，无法在容器内创建宿主机路径
@@ -1514,7 +1514,7 @@ impl DockerManager {
             .await
             .map_err(|e| DockerError::ContainerStartError(format!("健康检查失败: {}", e)))?;
 
-        info!("✅ Agent 容器启动并就绪: {}", info.service_url);
+        info!("Agent 容器启动并就绪: {}", info.service_url);
         Ok(info)
     }
 
@@ -2059,13 +2059,13 @@ impl DockerManager {
         // 检查网络是否已存在
         match self.inspect_network(&main_network).await {
             Ok(_) => {
-                info!("✅ RCoder 主网络已存在: {}", main_network);
+                info!("RCoder 主网络已存在: {}", main_network);
                 Ok(())
             }
             Err(_) => {
-                warn!("⚠️ RCoder 主网络不存在: {}", main_network);
-                warn!("⚠️ 这通常意味着主容器不在预期的网络中");
-                warn!("⚠️ 请检查 Docker Compose 配置");
+                warn!("RCoder 主网络不存在: {}", main_network);
+                warn!("这通常意味着主容器不在预期的网络中");
+                warn!("请检查 Docker Compose 配置");
                 // 不创建网络，因为主网络应该由 Docker Compose 创建
                 Ok(())
             }
@@ -2143,7 +2143,7 @@ impl DockerManager {
     ) -> DockerResult<HashMap<String, String>> {
         // 1. 尝试从缓存获取
         if let Some(Some(cached)) = self.api_cache.get_network(container_id).await {
-            debug!("✅ [NETWORK] 缓存命中: container_id={}", container_id);
+            debug!("[NETWORK] 缓存命中: container_id={}", container_id);
             // Arc::clone 只是增加引用计数，解引用后 clone HashMap
             return Ok((*cached).clone());
         }
@@ -2168,7 +2168,7 @@ impl DockerManager {
                 return Ok(HashMap::new());
             }
             Err(DockerError::Timeout(_)) => {
-                warn!("⚠️ [NETWORK] 查询超时，尝试从缓存获取: container_id={}", container_id);
+                warn!("[NETWORK] 查询超时，尝试从缓存获取: container_id={}", container_id);
                 // 超时时，尝试返回缓存中的旧值（如果有的话）
                 if let Some(Some(cached)) = self.api_cache.get_network(container_id).await {
                     return Ok((*cached).clone());
@@ -2226,7 +2226,7 @@ impl DockerManager {
 
             match status {
                 Some(bollard::models::ContainerStateStatusEnum::RUNNING) => {
-                    info!("✅ 容器 {} 正在运行", container_id);
+                    info!("容器 {} 正在运行", container_id);
                     Ok(())
                 }
                 Some(bollard::models::ContainerStateStatusEnum::EXITED) => {
@@ -2241,7 +2241,7 @@ impl DockerManager {
                     )))
                 }
                 Some(bollard::models::ContainerStateStatusEnum::CREATED) => {
-                    warn!("⚠️ 容器 {} 已创建但未启动", container_id);
+                    warn!("容器 {} 已创建但未启动", container_id);
                     Err(DockerError::ContainerStartError(format!(
                         "容器已创建但未启动: {}",
                         container_id
@@ -2249,14 +2249,14 @@ impl DockerManager {
                 }
                 Some(status) => {
                     let status_str = format!("{:?}", status);
-                    error!("❌ 容器 {} 处于未知状态: {}", container_id, status_str);
+                    error!("容器 {} 处于未知状态: {}", container_id, status_str);
                     Err(DockerError::ContainerStartError(format!(
                         "容器处于未知状态: {} - {}",
                         container_id, status_str
                     )))
                 }
                 None => {
-                    error!("❌ 容器 {} 状态为空", container_id);
+                    error!("容器 {} 状态为空", container_id);
                     Err(DockerError::ContainerStartError(format!(
                         "容器状态为空: {}",
                         container_id
@@ -2264,7 +2264,7 @@ impl DockerManager {
                 }
             }
         } else {
-            error!("❌ 无法获取容器 {} 的状态信息", container_id);
+            error!("无法获取容器 {} 的状态信息", container_id);
             Err(DockerError::ContainerStartError(format!(
                 "无法获取容器状态信息: {}",
                 container_id
@@ -2283,7 +2283,7 @@ impl DockerManager {
         &self,
         pattern: &str,
     ) -> DockerResult<Vec<ContainerSummary>> {
-        info!("🔍 查找匹配模式的容器: pattern={}", pattern);
+        info!("查找匹配模式的容器: pattern={}", pattern);
 
         // 🎯 获取当前容器的 ID（用于排除自己）
         let current_container_id = std::env::var("HOSTNAME").ok();
@@ -2359,7 +2359,7 @@ impl DockerManager {
                 Ok(_) => {
                     result.successfully_removed += 1;
                     result.removed_container_ids.push(container_id.clone());
-                    info!("✅ 容器清理成功: {}", container_id);
+                    info!("容器清理成功: {}", container_id);
                 }
                 Err(e) => {
                     result.failed_removals += 1;
@@ -2370,7 +2370,7 @@ impl DockerManager {
                             container_name: container_id.clone(), // 我们可能不知道名称，使用ID
                             error_message: e.to_string(),
                         });
-                    error!("❌ 容器清理失败: {} - {}", container_id, e);
+                    error!("容器清理失败: {} - {}", container_id, e);
                 }
             }
         }
@@ -2394,7 +2394,7 @@ impl DockerManager {
         container_id: &str,
         options: &CleanupOptions,
     ) -> DockerResult<()> {
-        info!("🔄 正在清理容器: {}", container_id);
+        info!("正在清理容器: {}", container_id);
 
         // 第一步：获取容器信息
         let container_info = self.inspect_container_for_cleanup(container_id).await?;
@@ -2427,10 +2427,10 @@ impl DockerManager {
                 }
             }
             Some(_) => {
-                info!("📦 容器 {} 未运行，直接删除", container_id);
+                info!("容器 {} 未运行，直接删除", container_id);
             }
             None => {
-                warn!("⚠️ 无法获取容器 {} 状态，继续尝试删除", container_id);
+                warn!("无法获取容器 {} 状态，继续尝试删除", container_id);
             }
         }
 
@@ -2438,7 +2438,7 @@ impl DockerManager {
         self.remove_single_container(container_id, options.remove_associated_volumes)
             .await?;
 
-        info!("✅ 容器清理完成: {}", container_id);
+        info!("容器清理完成: {}", container_id);
         Ok(())
     }
 
@@ -2597,7 +2597,7 @@ impl DockerManager {
             )
         })?;
 
-        debug!("🔍 检测到容器 hostname: {}", hostname);
+        debug!("检测到容器 hostname: {}", hostname);
 
         // 直接 inspect 当前容器（hostname 通常是容器 ID 的前12位，但 Docker API 支持前缀匹配）
         let inspect = docker
@@ -2616,7 +2616,7 @@ impl DockerManager {
                 // 查找包含指定网络基础名称的网络
                 for network_name in networks.keys() {
                     if network_name.contains(network_base_name) {
-                        info!("✅ 动态检测到主网络: {}", network_name);
+                        info!("动态检测到主网络: {}", network_name);
                         return Ok(network_name.clone());
                     }
                 }

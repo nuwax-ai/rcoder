@@ -1176,9 +1176,9 @@ pub async fn pod_keepalive(
                         .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                     project_info.set_container(Some(info.clone()));
                     state.insert_project(request.project_id.clone(), Arc::new(project_info));
-                    info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），已添加到 DuckDB 存储");
+                    info!("[POD_KEEPALIVE] 容器已存在（Docker），已添加到 DuckDB 存储");
                 } else {
-                    info!("📦 [POD_KEEPALIVE] 容器已存在（Docker），DuckDB 已有记录");
+                    info!("[POD_KEEPALIVE] 容器已存在（Docker），DuckDB 已有记录");
                 }
                 (info, false)
             }

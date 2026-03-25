@@ -249,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
             "❌ [FATAL] Rustls CryptoProvider 初始化失败，程序无法继续运行。这通常是系统环境问题。",
         );
 
-    // 🆕 初始化遥测系统（使用 rcoder-telemetry，包含控制台 + 文件日志）
+    // 🆕 Initializing telemetry system（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
@@ -298,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 🔥 启动健康检查和重启任务
     let health_monitor = spawn_health_monitor(agent_runtime.clone());
-    info!("🔍 [MAIN] Worker 健康监控任务已启动");
+    info!("[MAIN] Worker 健康监控任务已启动");
 
     // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
     let _reaper_handle = process_reaper::start_process_reaper();
@@ -357,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
         let _handle = start_http_server(http_config).await?;
 
         // 永久等待（直到收到关闭信号）
-        info!("🚀 HTTP + Pingora 服务已启动，程序将持续运行直到收到关闭信号");
+        info!("HTTP + Pingora 服务已启动，程序将持续运行直到收到关闭信号");
 
         // 等待 Ctrl+C 或 SIGTERM 信号
         tokio::signal::ctrl_c().await?;
@@ -399,7 +399,7 @@ async fn main() -> anyhow::Result<()> {
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
         let grpc_handle = tokio::spawn(async move {
-            info!("🚀 gRPC 服务启动，监听端口: {}", grpc_port);
+            info!("gRPC 服务启动，监听端口: {}", grpc_port);
             info!("gRPC endpoints (port {}):", grpc_port);
             info!("  agent.AgentService/Chat - gRPC chat");
             info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
@@ -443,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             if let Err(e) = axum::serve(listener, app).await {
-                error!("❌ HTTP 健康检查服务错误: {}", e);
+                error!("HTTP 健康检查服务错误: {}", e);
             }
         });
 
@@ -492,14 +492,14 @@ async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHa
         const MAX_RESTART_ATTEMPTS: u32 = 5;
         const RESTART_COOLDOWN_SECS: u64 = 60;
 
-        info!("🔍 [HealthMonitor] 健康监控任务已启动");
+        info!("[HealthMonitor] 健康监控任务已启动");
 
         loop {
             interval.tick().await;
 
             // 检查健康状态
             if !runtime.check_health().await {
-                error!("❌ [HealthMonitor] 检测到 Worker 不健康");
+                error!("[HealthMonitor] 检测到 Worker 不健康");
 
                 // 检查冷却期
                 if consecutive_failures >= MAX_RESTART_ATTEMPTS {
@@ -509,7 +509,7 @@ async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHa
                     );
                     tokio::time::sleep(Duration::from_secs(RESTART_COOLDOWN_SECS)).await;
                     consecutive_failures = 0;
-                    info!("🔄 [HealthMonitor] 冷却期结束，重置失败计数");
+                    info!("[HealthMonitor] 冷却期结束，重置失败计数");
                 }
 
                 // 创建新的通道

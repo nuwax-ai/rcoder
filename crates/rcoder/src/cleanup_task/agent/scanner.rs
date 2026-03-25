@@ -63,7 +63,7 @@ impl AgentScanner {
         let status = agent.status();
         match status {
             Some(AgentStatus::Idle) => {
-                debug!("✅ [scanner] 状态=Idle: {}", agent.project_id());
+                debug!("[scanner] 状态=Idle: {}", agent.project_id());
             }
             Some(AgentStatus::Pending) | Some(AgentStatus::Active) => {
                 // 🔧 修复：即使是 Active/Pending 状态，也要检查是否真的活跃

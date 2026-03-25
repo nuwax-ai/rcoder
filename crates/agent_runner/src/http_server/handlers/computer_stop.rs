@@ -76,7 +76,7 @@ pub async fn handle_computer_stop(
 
             match cancel_tx.send(cancel_request).await {
                 Ok(_) => {
-                    info!("✅ [HTTP] 取消信号已发送: session_id={}", session_id);
+                    info!("[HTTP] 取消信号已发送: session_id={}", session_id);
                 }
                 Err(e) => {
                     warn!(
@@ -93,7 +93,7 @@ pub async fn handle_computer_stop(
             .is_some();
 
         if removed {
-            info!("✅ [HTTP] Agent 已停止: project_id={}", request.project_id);
+            info!("[HTTP] Agent 已停止: project_id={}", request.project_id);
             (true, "Agent stopped successfully".to_string())
         } else {
             // 可能在取消期间已被清理

@@ -204,7 +204,7 @@ impl AgentServiceImpl {
         match SystemTime::now().duration_since(*start) {
             Ok(duration) => duration.as_secs() as i64,
             Err(_) => {
-                warn!("⚠️ [GET_CONTAINER_STATUS] failed to calculate uptime, returning 0");
+                warn!("[GET_CONTAINER_STATUS] failed to calculate uptime, returning 0");
                 0
             }
         }
@@ -270,7 +270,7 @@ impl AgentService for AgentServiceImpl {
                 "ComputerAgentRunner" => Some(shared_types::ServiceType::ComputerAgentRunner),
                 "RCoder" => Some(shared_types::ServiceType::RCoder),
                 _ => {
-                    warn!("⚠️ [gRPC] 无效的 service_type: {}, 使用默认 RCoder", st);
+                    warn!("[gRPC] 无效的 service_type: {}, 使用默认 RCoder", st);
                     None
                 }
             })
@@ -328,7 +328,7 @@ impl AgentService for AgentServiceImpl {
             fallback_reason: output.fallback_reason,
         };
 
-        info!("✅ [gRPC] Chat 完成: success={}", grpc_response.success);
+        info!("[gRPC] Chat 完成: success={}", grpc_response.success);
 
         Ok(Response::new(grpc_response))
     }
@@ -470,7 +470,7 @@ impl AgentService for AgentServiceImpl {
                     }
                 }
                 Err(e) => {
-                    warn!("⚠️ [gRPC] 创建 session 连接失败: {}", e);
+                    warn!("[gRPC] 创建 session 连接失败: {}", e);
                     if let Err(send_err) = tx
                         .send(Err(Status::internal(format!("创建连接失败: {}", e))))
                         .await
@@ -650,7 +650,7 @@ impl AgentService for AgentServiceImpl {
 
         // 5. Send cancel notification (using already extracted cancel_tx, with backpressure)
         if let Err(e) = cancel_tx.send(cancel_request).await {
-            error!("❌ [gRPC] failed to send cancel notification: {}", e);
+            error!("[gRPC] failed to send cancel notification: {}", e);
             return Ok(Response::new(CancelResponse {
                 success: false,
                 result: CancelResultType::CancelResultFailed as i32,
@@ -711,7 +711,7 @@ impl AgentService for AgentServiceImpl {
                 if let Err(notify_err) =
                     push_session_update_with_project(&project_id, &actual_session_id, notify).await
                 {
-                    warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", notify_err);
+                    warn!("[gRPC] 发送 SessionPromptEnd 通知失败: {}", notify_err);
                 }
 
                 // 清理连接
@@ -749,7 +749,7 @@ impl AgentService for AgentServiceImpl {
                 if let Err(e) =
                     push_session_update_with_project(&project_id, &actual_session_id, notify).await
                 {
-                    warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                    warn!("[gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
                 } else {
                     info!(
                         "📤 [gRPC] 已发送 SessionPromptEnd (Timeout) 通知: session_id={}",
@@ -816,7 +816,7 @@ impl AgentService for AgentServiceImpl {
             if let Err(e) =
                 push_session_update_with_project(&project_id, &actual_session_id, notify).await
             {
-                warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                warn!("[gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
             } else {
                 info!(
                     "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
@@ -995,7 +995,7 @@ impl AgentService for AgentServiceImpl {
                 if let Err(e) =
                     push_session_update_with_project(&project_id, &session_id, notify).await
                 {
-                    warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                    warn!("[gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
                 }
 
                 // 清理连接
@@ -1039,7 +1039,7 @@ impl AgentService for AgentServiceImpl {
                 if let Err(e) =
                     push_session_update_with_project(&project_id, &session_id, notify).await
                 {
-                    warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                    warn!("[gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
                 } else {
                     info!(
                         "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
@@ -1108,7 +1108,7 @@ impl AgentService for AgentServiceImpl {
                                 e, pid_clone
                             );
                         } else {
-                            info!("✅ [gRPC] Agent 子进程已停止: project_id={}", pid_clone);
+                            info!("[gRPC] Agent 子进程已停止: project_id={}", pid_clone);
                         }
 
                         // 异步 drop AgentInfo（让它在后台慢慢 drop）
@@ -1220,7 +1220,7 @@ impl AgentService for AgentServiceImpl {
                                 push_session_update_with_project(&project_id, &session_id, notify)
                                     .await
                             {
-                                warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
+                                warn!("[gRPC] 发送 SessionPromptEnd 通知失败: {}", e);
                             } else {
                                 info!(
                                     "📤 [gRPC] 已发送 SessionPromptEnd (Cancelled) 通知: session_id={}",
@@ -1352,7 +1352,7 @@ impl AgentService for AgentServiceImpl {
                         if let Err(notify_err) =
                             push_session_update_with_project(&project_id, &session_id, notify).await
                         {
-                            warn!("⚠️ [gRPC] 发送 SessionPromptEnd 通知失败: {}", notify_err);
+                            warn!("[gRPC] 发送 SessionPromptEnd 通知失败: {}", notify_err);
                         }
 
                         // 清理连接

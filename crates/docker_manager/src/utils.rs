@@ -69,7 +69,7 @@ impl DockerUtils {
         config.default_platform = Self::get_optimal_platform();
 
         // 🔍 调试日志：打印自动检测结果
-        debug!("🔍 DockerUtils::config_from_env 自动检测结果:");
+        debug!("DockerUtils::config_from_env 自动检测结果:");
         debug!("  - default_platform: {}", config.default_platform);
         debug!("  - default_image: {}", config.default_image);
 

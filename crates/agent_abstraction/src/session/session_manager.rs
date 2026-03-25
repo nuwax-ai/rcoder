@@ -397,7 +397,7 @@ where
                     let model_changed = existing.is_model_config_changed(&model_provider);
 
                     if !channel_closed && !model_changed {
-                        info!("🔄 [SESSION] 通过 session_id_hint 复用现有会话: project_id={}, session_id={}", project_id, hint_sid);
+                        info!("[SESSION] 通过 session_id_hint 复用现有会话: project_id={}, session_id={}", project_id, hint_sid);
                         return Ok((existing, false));
                     }
 
@@ -618,7 +618,7 @@ where
                 anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
             })?;
 
-        info!("✅ Prompt 请求已发送，项目 ID: {}", project_id);
+        info!("Prompt 请求已发送，项目 ID: {}", project_id);
         Ok(())
     }
 
@@ -642,7 +642,7 @@ where
                 anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
             })?;
 
-        info!("✅ Prompt 请求已发送，项目 ID: {}", project_id);
+        info!("Prompt 请求已发送，项目 ID: {}", project_id);
         Ok(())
     }
 }

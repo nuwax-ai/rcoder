@@ -121,7 +121,7 @@ impl MountProcessor {
             .collect();
 
         let processed = processed?;
-        info!("✅ 批量挂载点处理完成: {} 个", processed.len());
+        info!("批量挂载点处理完成: {} 个", processed.len());
 
         Ok(processed)
     }

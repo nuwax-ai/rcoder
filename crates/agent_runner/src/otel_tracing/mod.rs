@@ -55,7 +55,7 @@ impl Default for TraceConfig {
 pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetry::TelemetryGuard> {
     if !config.enabled {
         info!("📍 [OTel] 追踪已禁用");
-        // 即使追踪禁用，仍然初始化 Prometheus（如果启用）
+        // 即使追踪禁用，仍然Initializing Prometheus（如果启用）
         if config.prometheus_enabled {
             return rcoder_telemetry::init_prometheus_only(&config.service_name);
         }
@@ -80,7 +80,7 @@ pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetr
         telemetry_config = telemetry_config.without_prometheus();
     }
 
-    // 初始化遥测系统
+    // Initializing telemetry system
     let guard = rcoder_telemetry::init(telemetry_config).await?;
 
     info!(

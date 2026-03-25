@@ -29,7 +29,7 @@ pub const AGENT_ACTIVE_TASKS: &str = "agent_active_tasks";
 
 // ============= 初始化 =============
 
-/// 初始化 Prometheus 指标系统
+/// Initializing Prometheus 指标系统
 ///
 /// 安装 Prometheus recorder 并返回 handle，用于渲染指标。
 ///
@@ -56,7 +56,7 @@ pub fn init_prometheus() -> anyhow::Result<PrometheusHandle> {
     // 注册指标描述
     register_metric_descriptions();
 
-    info!("✅ [Prometheus] 指标系统初始化完成");
+    info!("[Prometheus] Metrics system initialization completed");
 
     Ok(handle)
 }

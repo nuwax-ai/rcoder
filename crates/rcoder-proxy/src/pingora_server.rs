@@ -79,9 +79,9 @@ impl PingoraServerManager {
     /// 当 `shutdown_rx` 收到信号（或 sender 被 drop）时，`start()` 返回。
     /// Pingora 服务器线程运行 `run_forever()`，由进程退出时 OS 清理。
     pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
-        info!("🚀 启动 Pingora 反向代理服务器...");
+        info!("启动 Pingora 反向代理服务器...");
         info!("📡 监听地址: 0.0.0.0:{}", self.config.listen_port);
-        info!("🔄 路由规则: /proxy/{{port}}{{/path}}");
+        info!("路由规则: /proxy/{{port}}{{/path}}");
 
         // 创建 Pingora 服务器配置
         let opt = Opt::default();
@@ -92,7 +92,7 @@ impl PingoraServerManager {
 
         // 创建代理服务实例
         let proxy_service = self.service.create_pingora_proxy().map_err(|e| {
-            error!("❌ [PINGORA] 创建代理服务实例失败: {}", e);
+            error!("[PINGORA] 创建代理服务实例失败: {}", e);
             e
         })?;
         let proxy_service = Arc::new(proxy_service);
@@ -117,7 +117,7 @@ impl PingoraServerManager {
             info!("🎯 Pingora 服务器开始运行...");
             my_server.run_forever();
         });
-        info!("✅ Pingora 服务器线程已创建");
+        info!("Pingora 服务器线程已创建");
 
         // 等待外部关闭信号（sender 被 drop 或显式发送信号都会触发）
         let _ = shutdown_rx.await;

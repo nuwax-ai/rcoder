@@ -62,7 +62,7 @@ impl AtomicState {
             2 => WorkerState::Stopping,
             3 => WorkerState::Stopped,
             invalid => {
-                tracing::error!("❌ [AtomicState] 无效的状态值: {}, 返回 Stopped", invalid);
+                tracing::error!("[AtomicState] 无效的状态值: {}, 返回 Stopped", invalid);
                 WorkerState::Stopped
             }
         }
@@ -275,7 +275,7 @@ impl AgentRuntime {
             match chrono::Utc.timestamp_millis_opt(last_ts).single() {
                 Some(dt) => Some(dt),
                 None => {
-                    tracing::warn!("⚠️ [WorkerInfo] 无效的时间戳: {}, 使用当前时间", last_ts);
+                    tracing::warn!("[WorkerInfo] 无效的时间戳: {}, 使用当前时间", last_ts);
                     Some(chrono::Utc::now())
                 }
             }

@@ -299,10 +299,10 @@ impl AgentSessionRegistry {
     ///
     /// # 参数
     /// - `project_id`: 项目 ID
-    /// - `f`: 更新函数，返回 true 表示更新成功，false 表示无需更新
+    /// - `f`: 更新函数，返回 true 表示Update succeeded，false 表示无需更新
     ///
     /// # 返回
-    /// - true: 更新成功
+    /// - true: Update succeeded
     /// - false: Agent 不存在或条件不满足（未更新）
     ///
     /// # 示例
@@ -310,7 +310,7 @@ impl AgentSessionRegistry {
     /// registry.try_update_agent_info("project-123", |info| {
     ///     if info.status == AgentStatus::Active {
     ///         info.status = AgentStatus::Idle;
-    ///         true  // 更新成功
+    ///         true  // Update succeeded
     ///     } else {
     ///         false  // 无需更新
     ///     }
@@ -497,7 +497,7 @@ impl AgentSessionRegistry {
         );
 
         // 🎯 原子性地移除 project_to_session 并获取 session_id
-        info!("🔍 [Registry] 移除 project_to_session 映射");
+        info!("[Registry] 移除 project_to_session 映射");
         let session_id = match self.project_to_session.entry(project_id.to_string()) {
             Entry::Occupied(entry) => {
                 let (_, session_id) = entry.remove_entry(); // 原子性移除
@@ -505,13 +505,13 @@ impl AgentSessionRegistry {
             }
             Entry::Vacant(_) => None,
         };
-        info!("🔍 [Registry] project_to_session 移除完成");
+        info!("[Registry] project_to_session 移除完成");
 
         // 移除反向映射
         if let Some(ref sid) = session_id {
-            info!("🔍 [Registry] 移除 session_to_project 映射");
+            info!("[Registry] 移除 session_to_project 映射");
             self.session_to_project.remove(sid);
-            info!("🔍 [Registry] session_to_project 移除完成");
+            info!("[Registry] session_to_project 移除完成");
         }
 
         // 移除 agent_info
@@ -529,7 +529,7 @@ impl AgentSessionRegistry {
         );
 
         // 执行 remove 操作
-        info!("🔍 [Registry] 开始执行 agent_info_map.remove()...");
+        info!("[Registry] 开始执行 agent_info_map.remove()...");
         let removed = self.agent_info_map.remove(project_id).map(|(_, v)| v);
         info!(
             "🔍 [Registry] agent_info_map.remove() 完成, removed={}, 剩余长度={}",
@@ -545,7 +545,7 @@ impl AgentSessionRegistry {
 
             // 🔥 修复：移除 Agent 时释放槽位
             self.release_session_slot();
-            info!("✅ [Registry] 已释放槽位: project_id={}", project_id);
+            info!("[Registry] 已释放槽位: project_id={}", project_id);
         }
 
         info!(
@@ -583,7 +583,7 @@ impl AgentSessionRegistry {
 
                 // 🔥 修复：移除 Agent 时释放槽位（与 remove_by_project 保持一致）
                 self.release_session_slot();
-                info!("✅ [Registry] 已释放槽位: session_id={}", session_id);
+                info!("[Registry] 已释放槽位: session_id={}", session_id);
             }
 
             return removed;
@@ -709,7 +709,7 @@ impl AgentSessionRegistry {
         loop {
             let current = self.active_sessions_count.load(Ordering::Acquire);
             if current == 0 {
-                warn!("⚠️ [原子槽位] 尝试释放槽位但计数器已为 0，跳过操作（防止溢出）");
+                warn!("[原子槽位] 尝试释放槽位但计数器已为 0，跳过操作（防止溢出）");
                 return;
             }
 

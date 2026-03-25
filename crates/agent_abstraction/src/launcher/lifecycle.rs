@@ -489,7 +489,7 @@ impl AgentLifecycleGuard {
                 }
             }
 
-            info!("✅ Claude process group stopped: pgid={}", pgid);
+            info!("Claude process group stopped: pgid={}", pgid);
         }
 
         #[cfg(not(unix))]

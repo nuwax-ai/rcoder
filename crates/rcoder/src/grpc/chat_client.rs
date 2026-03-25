@@ -57,7 +57,7 @@ pub async fn grpc_chat_with_pool(
         user_id, // 传递 user_id
     };
 
-    debug!("📤 [gRPC_CHAT] 发送请求: {:?}", grpc_request);
+    debug!("[gRPC_CHAT] 发送请求: {:?}", grpc_request);
 
     // 构建 tonic Request 并设置请求级别超时
     let mut request = tonic::Request::new(grpc_request);
@@ -119,7 +119,7 @@ pub async fn grpc_cancel_session_with_pool(
         project_id,
     };
 
-    debug!("📤 [gRPC_CANCEL] 发送请求: {:?}", grpc_request);
+    debug!("[gRPC_CANCEL] 发送请求: {:?}", grpc_request);
 
     // 发送请求
     let response = client
@@ -175,7 +175,7 @@ pub async fn grpc_stop_agent_with_pool(
         force,
     };
 
-    debug!("📤 [gRPC_STOP_AGENT] 发送请求: {:?}", grpc_request);
+    debug!("[gRPC_STOP_AGENT] 发送请求: {:?}", grpc_request);
 
     // 发送请求
     let response = client

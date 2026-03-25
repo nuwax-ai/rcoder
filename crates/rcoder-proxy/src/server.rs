@@ -40,7 +40,7 @@ impl ProxyServer {
         // 注意：这是一个库，实际的 Pingora 服务器需要由调用者启动
         // 这里只是准备服务实例
         let pingora_proxy = self.service.create_pingora_proxy().map_err(|e| {
-            error!("❌ [SERVER] 创建 Pingora 代理实例失败: {}", e);
+            error!("[SERVER] 创建 Pingora 代理实例失败: {}", e);
             e
         })?;
         info!("Pingora 代理服务已准备就绪");
