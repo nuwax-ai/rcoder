@@ -5,7 +5,7 @@
 use crate::config::OtlpConfig;
 use anyhow::Result;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::{SdkTracerProvider, Sampler};
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing::info;
 
 /// 初始化 OTLP TracerProvider
@@ -38,8 +38,8 @@ pub async fn init_tracer_provider(
     config: &OtlpConfig,
     service_name: &str,
 ) -> Result<SdkTracerProvider> {
-    use opentelemetry_sdk::Resource;
     use opentelemetry::KeyValue;
+    use opentelemetry_sdk::Resource;
 
     info!(
         "🔧 [OTLP] 初始化 TracerProvider: endpoint={}, grpc={}, sample_rate={}",
@@ -49,9 +49,7 @@ pub async fn init_tracer_provider(
     // 创建 Resource（标识服务）
     // 使用 service.name 语义约定
     let resource = Resource::builder()
-        .with_attributes([
-            KeyValue::new("service.name", service_name.to_string()),
-        ])
+        .with_attributes([KeyValue::new("service.name", service_name.to_string())])
         .build();
 
     // 创建采样器
@@ -105,8 +103,8 @@ async fn init_http_provider(
     resource: opentelemetry_sdk::Resource,
     sampler: Sampler,
 ) -> Result<SdkTracerProvider> {
-    use opentelemetry_otlp::SpanExporter;
     use opentelemetry_otlp::Protocol;
+    use opentelemetry_otlp::SpanExporter;
 
     // 创建 HTTP 导出器
     let exporter = SpanExporter::builder()

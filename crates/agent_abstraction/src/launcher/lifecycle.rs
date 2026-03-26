@@ -19,8 +19,8 @@
 //! - 能够正确清理子进程及其所有孙进程
 
 use anyhow::Result;
-use process_wrap::tokio::ChildWrapper;
 use dashmap::DashMap;
+use process_wrap::tokio::ChildWrapper;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -124,9 +124,9 @@ impl AgentLifecycleGuard {
             child_process,
             stderr_task,
             cancel_token,
-            None,  // 默认无密钥管理器
-            None,  // 默认无 project_uuid_map
-            None,  // 默认无 service_uuid
+            None, // 默认无密钥管理器
+            None, // 默认无 project_uuid_map
+            None, // 默认无 service_uuid
         )
     }
 
@@ -430,7 +430,7 @@ impl AgentLifecycleGuard {
         #[cfg(unix)]
         {
             use nix::errno::Errno;
-            use nix::sys::signal::{kill, Signal};
+            use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
             // 🔥 关键防御性检查：pgid 不能为 0
@@ -455,10 +455,7 @@ impl AgentLifecycleGuard {
 
             match kill(target, signal) {
                 Ok(_) => {
-                    debug!(
-                        "已发送信号到进程组: pgid={}, signal={:?}",
-                        pgid, signal
-                    );
+                    debug!("已发送信号到进程组: pgid={}, signal={:?}", pgid, signal);
 
                     // 如果是 SIGTERM，等待一段时间让进程优雅退出
                     if !force {
@@ -482,10 +479,7 @@ impl AgentLifecycleGuard {
                 }
                 Err(e) => {
                     // 其他错误（如 EINVAL、EFAULT 等）
-                    debug!(
-                        "终止进程组失败: pgid={}, error={:?}",
-                        pgid, e
-                    );
+                    debug!("终止进程组失败: pgid={}, error={:?}", pgid, e);
                 }
             }
 
@@ -547,7 +541,7 @@ impl Drop for AgentLifecycleGuard {
             // 🔥 同步终止进程组
             #[cfg(unix)]
             {
-                use nix::sys::signal::{kill, Signal};
+                use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
 
                 let pgid = self.inner.pgid;

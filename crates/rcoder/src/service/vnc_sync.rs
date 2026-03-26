@@ -178,18 +178,12 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
         if !active_user_ids.contains(user_id) {
             pingora_service.remove_vnc_backend(user_id);
             removed_count += 1;
-            debug!(
-                "🗑️ [VNC_SYNC] 清理已销毁容器的映射: user_id={}",
-                user_id
-            );
+            debug!("🗑️ [VNC_SYNC] 清理已销毁容器的映射: user_id={}", user_id);
         }
     }
 
     if removed_count > 0 {
-        info!(
-            "🗑️ [VNC_SYNC] 清理完成: 移除={} 个旧映射",
-            removed_count
-        );
+        info!("🗑️ [VNC_SYNC] 清理完成: 移除={} 个旧映射", removed_count);
     }
 }
 

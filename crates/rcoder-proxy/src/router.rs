@@ -520,9 +520,7 @@ mod tests {
         let router = create_router().unwrap();
 
         // 测试音频 WebSocket 路由
-        let matched = router
-            .at("/computer/audio/user_123/proj_456/ws")
-            .unwrap();
+        let matched = router.at("/computer/audio/user_123/proj_456/ws").unwrap();
         assert_eq!(*matched.value, RouteType::AudioProxy);
         assert_eq!(matched.params.get("user_id"), Some("user_123"));
         assert_eq!(matched.params.get("project_id"), Some("proj_456"));
@@ -552,9 +550,7 @@ mod tests {
         let router = create_router().unwrap();
 
         // 测试带子路径的 IME 路由
-        let matched = router
-            .at("/computer/ime/alice/myproject/connect")
-            .unwrap();
+        let matched = router.at("/computer/ime/alice/myproject/connect").unwrap();
         assert_eq!(*matched.value, RouteType::ImeProxy);
         assert_eq!(matched.params.get("user_id"), Some("alice"));
         assert_eq!(matched.params.get("project_id"), Some("myproject"));
@@ -568,9 +564,7 @@ mod tests {
         let router = create_router().unwrap();
 
         // 确保音频和 IME 路由不会互相干扰
-        let audio_matched = router
-            .at("/computer/audio/user_123/proj_456/ws")
-            .unwrap();
+        let audio_matched = router.at("/computer/audio/user_123/proj_456/ws").unwrap();
         assert_eq!(*audio_matched.value, RouteType::AudioProxy);
 
         let ime_matched = router

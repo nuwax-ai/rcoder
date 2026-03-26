@@ -248,7 +248,8 @@ impl ContainerStatusChecker {
                     }
                     // 🆕 同步更新 agent 状态为 Active
                     if let Err(e) = self.state.projects.update_agent_status(
-                        &project_id, 1, // Active
+                        &project_id,
+                        1, // Active
                         "active",
                     ) {
                         warn!(
@@ -264,7 +265,8 @@ impl ContainerStatusChecker {
                 } else {
                     // 🆕 同步更新 agent 状态为 Idle
                     if let Err(e) = self.state.projects.update_agent_status(
-                        &project_id, 0, // Idle
+                        &project_id,
+                        0, // Idle
                         "idle",
                     ) {
                         warn!(
@@ -610,7 +612,12 @@ async fn query_container_status(
 
     debug!(
         "📊 [STATUS_CHECKER] 容器状态: user_id={}, is_active={}, active_tasks={}, status={}, last_activity={} ({})",
-        user_id, status_response.is_active, status_response.active_tasks, status_response.status, last_activity_str, relative_time_str
+        user_id,
+        status_response.is_active,
+        status_response.active_tasks,
+        status_response.status,
+        last_activity_str,
+        relative_time_str
     );
 
     // 如果容器有活跃任务，则认为容器活跃

@@ -719,7 +719,8 @@ pub async fn pod_ensure(
                         .await
                         .ok();
                     if let Some(mgr) = docker_mgr {
-                        if let Ok(Some(info)) = mgr.get_user_container_info(&request.user_id).await {
+                        if let Ok(Some(info)) = mgr.get_user_container_info(&request.user_id).await
+                        {
                             info!(
                                 "✅ [POD_ENSURE] 等待成功，容器已就绪（等待{}秒）: user_id={}, container_id={}",
                                 wait_sec, request.user_id, info.container_id
@@ -731,7 +732,10 @@ pub async fn pod_ensure(
                 }
 
                 if wait_sec % 5 == 0 {
-                    debug!("[POD_ENSURE] 仍在等待容器创建: user_id={}, 第{}秒", request.user_id, wait_sec);
+                    debug!(
+                        "[POD_ENSURE] 仍在等待容器创建: user_id={}, 第{}秒",
+                        request.user_id, wait_sec
+                    );
                 }
             }
 
@@ -739,12 +743,8 @@ pub async fn pod_ensure(
             if let Some(info) = waited_container_info {
                 // 同步 VNC 后端映射
                 if let Some(ref pingora_service) = state.pingora_service {
-                    sync_single_vnc_backend(
-                        pingora_service,
-                        &request.user_id,
-                        &info.container_ip,
-                    )
-                    .await;
+                    sync_single_vnc_backend(pingora_service, &request.user_id, &info.container_ip)
+                        .await;
                     info!(
                         "🔄 [POD_ENSURE] VNC 后端映射已同步: user_id={} -> {}",
                         request.user_id, info.container_ip
@@ -777,7 +777,10 @@ pub async fn pod_ensure(
                 return Ok(HttpResult::success(EnsurePodResponse {
                     created: false,
                     container_info: pod_container_info,
-                    message: format!("容器已就绪（等待其他请求创建完成）: container_id={}", info.container_id),
+                    message: format!(
+                        "容器已就绪（等待其他请求创建完成）: container_id={}",
+                        info.container_id
+                    ),
                 }));
             }
             // 等待超时，继续正常的创建流程（此时标记可能已过期被清理）
@@ -842,7 +845,10 @@ pub async fn pod_ensure(
                         "❌ [POD_ENSURE] Failed to delete old container: container_id={}, error={}",
                         result.container_id, e
                     );
-                    AppError::internal_server_error(&format!("Failed to delete old container: {}", e))
+                    AppError::internal_server_error(&format!(
+                        "Failed to delete old container: {}",
+                        e
+                    ))
                 })?;
 
             info!(
@@ -867,7 +873,9 @@ pub async fn pod_ensure(
     // 3. 获取或创建容器（带重试机制 + 标记）
     let (container_info, created) = if need_create {
         // 🆕 设置创建标记，防止并发请求重复创建
-        state.pod_creating.insert(request.user_id.clone(), Instant::now());
+        state
+            .pod_creating
+            .insert(request.user_id.clone(), Instant::now());
 
         // 创建新容器，最多重试 3 次
         let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
@@ -931,7 +939,7 @@ pub async fn pod_ensure(
                 // 创建成功，清除标记
                 state.pod_creating.remove(&request.user_id);
                 (info, true)
-            },
+            }
             None => {
                 // 创建失败，也要清除标记
                 state.pod_creating.remove(&request.user_id);
@@ -963,7 +971,10 @@ pub async fn pod_ensure(
                 let mut retry_info = None;
                 for retry_attempt in 1..=3 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    match docker_manager.get_user_container_info(&request.user_id).await {
+                    match docker_manager
+                        .get_user_container_info(&request.user_id)
+                        .await
+                    {
                         Ok(Some(info)) => {
                             info!(
                                 "✅ [POD_ENSURE] 内部映射已同步（第{}次重试）: container_id={}",
@@ -987,14 +998,17 @@ pub async fn pod_ensure(
                             request.user_id
                         );
 
-                        let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
-                            memory_limit: limits.memory,
-                            cpu_limit: limits.cpu,
-                            swap_limit: limits.swap,
-                        });
+                        let resource_limits =
+                            request.resource_limits.map(|limits| ServiceResourceLimits {
+                                memory_limit: limits.memory,
+                                cpu_limit: limits.cpu,
+                                swap_limit: limits.swap,
+                            });
 
                         // 设置创建标记
-                        state.pod_creating.insert(request.user_id.clone(), std::time::Instant::now());
+                        state
+                            .pod_creating
+                            .insert(request.user_id.clone(), std::time::Instant::now());
 
                         let result = ComputerContainerManager::get_or_create_container_for_user(
                             &request.user_id,
@@ -1199,7 +1213,9 @@ pub async fn pod_keepalive(
         let info = ComputerContainerManager::get_container_info(&request.user_id)
             .await?
             .ok_or_else(|| {
-                error!("[POD_KEEPALIVE] Container status abnormal：DuckDB 有记录但 Docker 中找不到容器");
+                error!(
+                    "[POD_KEEPALIVE] Container status abnormal：DuckDB 有记录但 Docker 中找不到容器"
+                );
                 AppError::internal_server_error("Container status abnormal")
             })?;
         (info, false)
@@ -1611,7 +1627,11 @@ pub async fn pod_status(
     // 4. 通过 DockerManager 查询容器状态
     match query_result {
         Ok(Some(result)) => {
-            let status_str = if result.is_running { "running" } else { "stopped" };
+            let status_str = if result.is_running {
+                "running"
+            } else {
+                "stopped"
+            };
             let message = if result.is_running {
                 "容器正在运行中".to_string()
             } else {
@@ -1649,7 +1669,11 @@ pub async fn pod_status(
         if let Some(ref project_id) = params.project_id {
             match docker_manager.find_container_realtime(project_id).await {
                 Ok(Some(result)) => {
-                    let status_str = if result.is_running { "running" } else { "stopped" };
+                    let status_str = if result.is_running {
+                        "running"
+                    } else {
+                        "stopped"
+                    };
                     let message = if result.is_running {
                         "容器正在运行中".to_string()
                     } else {

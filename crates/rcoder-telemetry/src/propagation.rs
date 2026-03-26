@@ -26,9 +26,7 @@ struct MetadataMapExtractor<'a>(&'a MetadataMap);
 
 impl Extractor for MetadataMapExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
-            .get(key)
-            .and_then(|value| value.to_str().ok())
+        self.0.get(key).and_then(|value| value.to_str().ok())
     }
 
     fn keys(&self) -> Vec<&str> {
@@ -124,16 +122,11 @@ pub struct HttpHeaderExtractor<'a>(pub &'a http::HeaderMap);
 
 impl Extractor for HttpHeaderExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
-            .get(key)
-            .and_then(|value| value.to_str().ok())
+        self.0.get(key).and_then(|value| value.to_str().ok())
     }
 
     fn keys(&self) -> Vec<&str> {
-        self.0
-            .keys()
-            .map(|key| key.as_str())
-            .collect()
+        self.0.keys().map(|key| key.as_str()).collect()
     }
 }
 
@@ -188,7 +181,12 @@ mod tests {
         let mut metadata = MetadataMap::new();
 
         // 手动设置一些 metadata
-        metadata.insert("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".parse().unwrap());
+        metadata.insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
+        );
 
         // 提取 context
         let cx = extract_context(&metadata);
@@ -202,7 +200,9 @@ mod tests {
         // 手动设置 traceparent header
         headers.insert(
             "traceparent",
-            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".parse().unwrap(),
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
         );
 
         // 提取 context

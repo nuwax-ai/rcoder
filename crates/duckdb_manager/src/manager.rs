@@ -7,8 +7,8 @@ use crate::error::DuckDbResult;
 use crate::models::StorageStats;
 use crate::repositories::{ContainerRepository, ProjectRepository};
 use crate::schema::SchemaInitializer;
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// DuckDB 全局管理器
 ///
@@ -206,24 +206,28 @@ mod tests {
 
         // 添加容器
         let containers = manager.containers().unwrap();
-        containers.upsert(&ContainerRecord::new(
-            "c1".to_string(),
-            "container-1".to_string(),
-            "127.0.0.1".to_string(),
-            8080,
-            8080,
-            ServiceType::RCoder,
-            "running".to_string(),
-            "http://localhost:8080".to_string(),
-        )).unwrap();
+        containers
+            .upsert(&ContainerRecord::new(
+                "c1".to_string(),
+                "container-1".to_string(),
+                "127.0.0.1".to_string(),
+                8080,
+                8080,
+                ServiceType::RCoder,
+                "running".to_string(),
+                "http://localhost:8080".to_string(),
+            ))
+            .unwrap();
 
         // 添加项目
         let projects = manager.projects().unwrap();
-        projects.upsert(&ProjectRecord::new(
-            "p1".to_string(),
-            ServiceType::RCoder,
-            "c1".to_string(),
-        )).unwrap();
+        projects
+            .upsert(&ProjectRecord::new(
+                "p1".to_string(),
+                ServiceType::RCoder,
+                "c1".to_string(),
+            ))
+            .unwrap();
 
         // 添加会话
         projects.update_session("p1", "session-1").unwrap();
@@ -240,16 +244,18 @@ mod tests {
 
         // 使用原始 manager 添加数据
         let containers = manager.containers().unwrap();
-        containers.upsert(&ContainerRecord::new(
-            "c1".to_string(),
-            "container-1".to_string(),
-            "127.0.0.1".to_string(),
-            8080,
-            8080,
-            ServiceType::RCoder,
-            "running".to_string(),
-            "http://localhost:8080".to_string(),
-        )).unwrap();
+        containers
+            .upsert(&ContainerRecord::new(
+                "c1".to_string(),
+                "container-1".to_string(),
+                "127.0.0.1".to_string(),
+                8080,
+                8080,
+                ServiceType::RCoder,
+                "running".to_string(),
+                "http://localhost:8080".to_string(),
+            ))
+            .unwrap();
 
         // 克隆 manager
         let cloned = manager.clone();

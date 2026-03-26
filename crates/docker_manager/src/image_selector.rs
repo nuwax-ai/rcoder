@@ -54,9 +54,7 @@ impl ImageSelector {
 
         info!(
             "选择镜像: {} (服务: {}, 平台: {})",
-            image_name,
-            service_type,
-            self.platform
+            image_name, service_type, self.platform
         );
 
         Ok(image_name)

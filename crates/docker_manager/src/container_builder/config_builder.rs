@@ -111,8 +111,13 @@ impl ContainerConfigBuilder {
     }
 
     /// 添加端口映射
-    pub fn port_binding(mut self, container_port: impl Into<String>, host_port: impl Into<String>) -> Self {
-        self.port_bindings.insert(container_port.into(), host_port.into());
+    pub fn port_binding(
+        mut self,
+        container_port: impl Into<String>,
+        host_port: impl Into<String>,
+    ) -> Self {
+        self.port_bindings
+            .insert(container_port.into(), host_port.into());
         self
     }
 
@@ -179,11 +184,19 @@ impl ContainerConfigBuilder {
 
         // 使用默认值或提供的值
         let image = self.image.unwrap_or_else(crate::default_docker_image);
-        let name_prefix = self.name_prefix.unwrap_or_else(|| "rcoder-agent".to_string());
+        let name_prefix = self
+            .name_prefix
+            .unwrap_or_else(|| "rcoder-agent".to_string());
         let host_path = self.host_path.unwrap_or_default();
-        let container_path = self.container_path.unwrap_or_else(|| crate::DEFAULT_WORK_DIR.to_string());
-        let work_dir = self.work_dir.unwrap_or_else(|| crate::DEFAULT_WORK_DIR.to_string());
-        let network_mode = self.network_mode.unwrap_or_else(|| crate::DEFAULT_NETWORK_MODE.to_string());
+        let container_path = self
+            .container_path
+            .unwrap_or_else(|| crate::DEFAULT_WORK_DIR.to_string());
+        let work_dir = self
+            .work_dir
+            .unwrap_or_else(|| crate::DEFAULT_WORK_DIR.to_string());
+        let network_mode = self
+            .network_mode
+            .unwrap_or_else(|| crate::DEFAULT_NETWORK_MODE.to_string());
 
         let config = DockerContainerConfig {
             project_id: self.project_id,
@@ -220,9 +233,7 @@ mod tests {
 
     #[test]
     fn test_builder_minimal() {
-        let config = ContainerConfigBuilder::new("test-project")
-            .build()
-            .unwrap();
+        let config = ContainerConfigBuilder::new("test-project").build().unwrap();
 
         assert_eq!(config.project_id, "test-project");
         assert_eq!(config.name_prefix, "rcoder-agent");
@@ -291,7 +302,10 @@ mod tests {
 
         assert!(config.resource_limits.is_some());
         let resource_limits = config.resource_limits.unwrap();
-        assert_eq!(resource_limits.memory_limit, Some((512 * 1024 * 1024) as f64));
+        assert_eq!(
+            resource_limits.memory_limit,
+            Some((512 * 1024 * 1024) as f64)
+        );
         assert_eq!(resource_limits.cpu_limit, Some(1.0));
     }
 }

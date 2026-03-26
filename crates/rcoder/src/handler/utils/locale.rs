@@ -4,7 +4,7 @@
 //! 优先级：HTTP Header > 环境变量 > 默认值 (en-US)
 
 use axum::http::HeaderMap;
-use shared_types::{parse_accept_language, SUPPORTED_LOCALES};
+use shared_types::{SUPPORTED_LOCALES, parse_accept_language};
 use std::sync::OnceLock;
 
 /// 默认语言（硬编码回退值）
@@ -51,10 +51,7 @@ fn get_default_locale_from_env() -> &'static str {
 /// 语言代码，如 "zh-CN", "en-US"
 pub fn get_locale_from_headers(headers: &HeaderMap) -> &'static str {
     // 1. 首先尝试从 HTTP Header 获取
-    if let Some(header) = headers
-        .get("Accept-Language")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(header) = headers.get("Accept-Language").and_then(|v| v.to_str().ok()) {
         // parse_accept_language 返回的总是支持的语言或默认值
         return parse_accept_language(Some(header));
     }

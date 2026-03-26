@@ -104,7 +104,10 @@ impl ContainerDestroyer {
         .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
 
         // 3. 清理 DockerManager 内存缓存（防止缓存残留导致孤立容器无法被清理）
-        let _: Option<_> = self.docker_manager.remove_container_cache(container_identifier).await;
+        let _: Option<_> = self
+            .docker_manager
+            .remove_container_cache(container_identifier)
+            .await;
         debug!(
             "🧹 [destroyer] 已清理 DockerManager 内存缓存: identifier={}",
             container_identifier

@@ -40,21 +40,22 @@ fn mask_domain(domain: &str) -> String {
 pub fn mask_url(url: &str) -> String {
     // 尝试解析 URL
     if let Ok(parsed_url) = url::Url::parse(url)
-        && let Some(host) = parsed_url.host_str() {
-            let masked_host = mask_domain(host);
-            // 重新构建 URL，保留协议、端口、路径等
-            let scheme = parsed_url.scheme();
-            let port = parsed_url
-                .port()
-                .map(|p| format!(":{}", p))
-                .unwrap_or_default();
-            let path = parsed_url.path();
-            let query = parsed_url
-                .query()
-                .map(|q| format!("?{}", q))
-                .unwrap_or_default();
-            return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
-        }
+        && let Some(host) = parsed_url.host_str()
+    {
+        let masked_host = mask_domain(host);
+        // 重新构建 URL，保留协议、端口、路径等
+        let scheme = parsed_url.scheme();
+        let port = parsed_url
+            .port()
+            .map(|p| format!(":{}", p))
+            .unwrap_or_default();
+        let path = parsed_url.path();
+        let query = parsed_url
+            .query()
+            .map(|q| format!("?{}", q))
+            .unwrap_or_default();
+        return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
+    }
 
     // 如果解析失败，返回脱敏提示
     "***".to_string()

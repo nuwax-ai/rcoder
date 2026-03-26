@@ -178,7 +178,12 @@ mod tests {
         assert!(config.is_embedded());
         assert!(!config.is_custom());
         assert!(config.get_prompt().is_some());
-        assert!(config.get_prompt().unwrap().contains("<SYSTEM_INSTRUCTIONS>"));
+        assert!(
+            config
+                .get_prompt()
+                .unwrap()
+                .contains("<SYSTEM_INSTRUCTIONS>")
+        );
     }
 
     #[test]
@@ -194,7 +199,11 @@ mod tests {
         let config = SystemPromptConfig::disabled();
         assert!(config.get_prompt().is_none());
         // get_prompt_or_default 仍返回默认值
-        assert!(config.get_prompt_or_default().contains("<SYSTEM_INSTRUCTIONS>"));
+        assert!(
+            config
+                .get_prompt_or_default()
+                .contains("<SYSTEM_INSTRUCTIONS>")
+        );
     }
 
     #[test]
@@ -205,7 +214,12 @@ mod tests {
             enabled: true,
         };
         // 空模板时回退到默认
-        assert!(config.get_prompt().unwrap().contains("<SYSTEM_INSTRUCTIONS>"));
+        assert!(
+            config
+                .get_prompt()
+                .unwrap()
+                .contains("<SYSTEM_INSTRUCTIONS>")
+        );
     }
 
     #[test]

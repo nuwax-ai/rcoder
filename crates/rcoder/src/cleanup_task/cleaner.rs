@@ -73,10 +73,7 @@ impl AgentCleaner {
         match self.log_cleaner.cleanup_once().await {
             Ok(log_stats) => {
                 if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
-                    info!(
-                        "🗑️ [cleaner] 日志清理完成: {}",
-                        log_stats.summary()
-                    );
+                    info!("🗑️ [cleaner] 日志清理完成: {}", log_stats.summary());
                 }
             }
             Err(e) => {

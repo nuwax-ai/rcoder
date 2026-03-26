@@ -120,9 +120,10 @@ impl ServiceResourceLimits {
 
         // Swap 应该 >= 内存
         if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit)
-            && swap < memory {
-                return Err("swap_limit should be >= memory_limit".to_string());
-            }
+            && swap < memory
+        {
+            return Err("swap_limit should be >= memory_limit".to_string());
+        }
 
         Ok(())
     }
@@ -344,12 +345,12 @@ impl ServiceMountConfig {
                 .container_path
                 .chars()
                 .all(|c: char| c.is_alphanumeric() || "/-_.".contains(c))
-            {
-                return ConfigValidationResult::Warning(format!(
-                    "容器挂载路径 '{}' 可能包含无效字符",
-                    self.container_path
-                ));
-            }
+        {
+            return ConfigValidationResult::Warning(format!(
+                "容器挂载路径 '{}' 可能包含无效字符",
+                self.container_path
+            ));
+        }
 
         if self.mount_type != "bind" && self.mount_type != "volume" {
             return ConfigValidationResult::Error(format!(
@@ -428,7 +429,10 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
 
     // 🔥 Agent 清理配置（通过环境变量控制）
     // 设置为 3600 秒（1小时），用户可以在 docker/config.yml 中覆盖此值
-    environment.insert("RCODER_AGENT_IDLE_TIMEOUT_SECS".to_string(), "3600".to_string()); // 1 小时
+    environment.insert(
+        "RCODER_AGENT_IDLE_TIMEOUT_SECS".to_string(),
+        "3600".to_string(),
+    ); // 1 小时
 
     let mounts = vec![];
 
@@ -632,7 +636,10 @@ mod tests {
         let correct_container_name = format!("{}-{}", config_prefix, user_id);
 
         assert_eq!(wrong_container_name, "computer-agent-runner-1743762321");
-        assert_eq!(correct_container_name, "rcoder-computer-agent-runner-1743762321");
+        assert_eq!(
+            correct_container_name,
+            "rcoder-computer-agent-runner-1743762321"
+        );
 
         // 如果用错误的名字去查询，当然找不到正确名字创建的容器
         assert_ne!(wrong_container_name, correct_container_name);
@@ -641,9 +648,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_valid() {
         let valid = ServiceResourceLimits {
-            memory_limit: Some(1_000_000_000.0),  // 1GB
+            memory_limit: Some(1_000_000_000.0), // 1GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(2_000_000_000.0),    // 2GB
+            swap_limit: Some(2_000_000_000.0), // 2GB
         };
         assert!(valid.validate().is_ok());
     }
@@ -651,7 +658,7 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_small() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(256_000_000.0),  // 256MB - 太小
+            memory_limit: Some(256_000_000.0), // 256MB - 太小
             cpu_limit: None,
             swap_limit: None,
         };
@@ -662,7 +669,7 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_large() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(100_000_000_000.0),  // 100GB - 太大
+            memory_limit: Some(100_000_000_000.0), // 100GB - 太大
             cpu_limit: None,
             swap_limit: None,
         };
@@ -694,9 +701,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_swap_less_than_memory() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0),  // 2GB
+            memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: None,
-            swap_limit: Some(1_000_000_000.0),    // 1GB - swap < memory
+            swap_limit: Some(1_000_000_000.0), // 1GB - swap < memory
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -710,15 +717,15 @@ mod tests {
     #[test]
     fn test_resource_limits_merge() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0),  // 2GB
+            memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(4_000_000_000.0),    // 4GB
+            swap_limit: Some(4_000_000_000.0), // 4GB
         };
 
         let override_limits = ServiceResourceLimits {
-            memory_limit: Some(4_000_000_000.0),  // 覆盖：4GB
-            cpu_limit: None,                       // 不覆盖
-            swap_limit: Some(8_000_000_000.0),    // 覆盖：8GB
+            memory_limit: Some(4_000_000_000.0), // 覆盖：4GB
+            cpu_limit: None,                     // 不覆盖
+            swap_limit: Some(8_000_000_000.0),   // 覆盖：8GB
         };
 
         let merged = default_limits.merge_with(&override_limits);
@@ -730,9 +737,9 @@ mod tests {
     #[test]
     fn test_resource_limits_merge_all_none() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0),  // 2GB
+            memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(4_000_000_000.0),    // 4GB
+            swap_limit: Some(4_000_000_000.0), // 4GB
         };
 
         let override_limits = ServiceResourceLimits {

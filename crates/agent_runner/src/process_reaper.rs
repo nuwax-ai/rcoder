@@ -19,10 +19,10 @@
 
 use std::collections::HashMap;
 use std::fs;
-#[cfg(unix)]
-use tokio::signal::unix::{signal, SignalKind};
 use tokio::process::Child;
-use tracing::{debug, info, warn, error};
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
+use tracing::{debug, error, info, warn};
 
 /// 进程回收器配置
 #[derive(Debug, Clone)]
@@ -101,7 +101,10 @@ impl ReaperState {
                     // 进程已退出
                     reaped_now += 1;
                     if self.config.verbose {
-                        debug!("[ProcessReaper] 回收子进程 PID={}, exit_status={:?}", pid, status);
+                        debug!(
+                            "[ProcessReaper] 回收子进程 PID={}, exit_status={:?}",
+                            pid, status
+                        );
                     }
                     false // 移除已回收的进程
                 }
@@ -146,9 +149,10 @@ impl ReaperState {
                         let stat_path = entry.path().join("stat");
                         if let Ok(content) = fs::read_to_string(&stat_path)
                             && let Some(info) = parse_stat_file(pid, &content)
-                                && info.state == 'Z' {
-                                    zombies.push(info);
-                                }
+                            && info.state == 'Z'
+                        {
+                            zombies.push(info);
+                        }
                     }
                 }
             }
@@ -180,7 +184,7 @@ impl ReaperState {
     fn reap_all_zombies_blocking(&mut self) {
         #[cfg(unix)]
         {
-            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+            use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
             use nix::unistd::Pid;
 
             let mut reaped_this_round = 0;
@@ -211,7 +215,10 @@ impl ReaperState {
                     }
                     Ok(WaitStatus::Stopped(pid, signal)) => {
                         // 进程被停止（不是退出），不计入回收
-                        debug!("[ProcessReaper] 进程被停止: PID={}, signal={:?}", pid, signal);
+                        debug!(
+                            "[ProcessReaper] 进程被停止: PID={}, signal={:?}",
+                            pid, signal
+                        );
                         // 继续循环，可能还有其他僵尸进程
                         continue;
                     }
@@ -224,7 +231,10 @@ impl ReaperState {
                     #[cfg(linux_android)]
                     Ok(WaitStatus::PtraceEvent(pid, signal, event)) => {
                         // ptrace 事件，不计入回收
-                        debug!("[ProcessReaper] ptrace 事件: PID={}, signal={:?}, event={}", pid, signal, event);
+                        debug!(
+                            "[ProcessReaper] ptrace 事件: PID={}, signal={:?}, event={}",
+                            pid, signal, event
+                        );
                         continue;
                     }
                     #[cfg(linux_android)]
@@ -310,16 +320,12 @@ fn parse_stat_file(pid: u32, content: &str) -> Option<ZombieProcessInfo> {
 ///
 /// 返回一个 JoinHandle，可以用于等待回收器任务退出（通常不需要）
 pub fn start_process_reaper() -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        run_reaper(ReaperConfig::default()).await
-    })
+    tokio::spawn(async move { run_reaper(ReaperConfig::default()).await })
 }
 
 /// 启动进程回收器任务（带配置）
 pub fn start_process_reaper_with_config(config: ReaperConfig) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        run_reaper(config).await
-    })
+    tokio::spawn(async move { run_reaper(config).await })
 }
 
 /// 核心回收逻辑
@@ -520,9 +526,10 @@ impl ProcessReaperHandle {
                         let stat_path = entry.path().join("stat");
                         if let Ok(content) = fs::read_to_string(&stat_path)
                             && let Some(info) = parse_stat_file(pid, &content)
-                                && info.state == 'Z' {
-                                    zombies.push(info);
-                                }
+                            && info.state == 'Z'
+                        {
+                            zombies.push(info);
+                        }
                     }
                 }
             }
@@ -558,7 +565,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_reaper_state() {
-        let config = ReaperConfig { verbose: true, ..Default::default() };
+        let config = ReaperConfig {
+            verbose: true,
+            ..Default::default()
+        };
         let mut state = ReaperState::new(config);
 
         // 创建一个长时间运行的进程

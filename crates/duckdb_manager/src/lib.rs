@@ -68,11 +68,11 @@ pub mod storage;
 // 重新导出常用类型
 pub use connection::DuckDbConnection;
 pub use error::{DuckDbError, DuckDbResult};
-pub use manager::{get_global_manager, init_global_manager, DuckDbManager};
+pub use manager::{DuckDbManager, get_global_manager, init_global_manager};
 pub use models::{
     CleanupResult, ContainerRecord, IdleContainerInfo, OrphanContainerInfo, ProjectRecord,
     StorageStats,
 };
 pub use repositories::{ContainerRepository, ProjectRepository};
 pub use schema::SchemaInitializer;
-pub use storage::{create_storage, DuckDbStorage, UnifiedStorage};
+pub use storage::{DuckDbStorage, UnifiedStorage, create_storage};

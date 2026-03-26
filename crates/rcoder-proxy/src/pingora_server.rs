@@ -29,10 +29,7 @@ impl PingoraServerManager {
     /// 创建新的 Pingora 服务器管理器
     pub fn new(config: ProxyConfig) -> Self {
         let service = Arc::new(PingoraProxyService::new(config.clone()));
-        Self {
-            config,
-            service,
-        }
+        Self { config, service }
     }
 
     /// 设置共享的 API 密钥管理器

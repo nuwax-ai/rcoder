@@ -131,8 +131,8 @@ impl TelemetryConfig {
     /// - `OTEL_EXPORTER_OTLP_PROTOCOL` - 协议（grpc/http）
     /// - `TELEMETRY_PROMETHEUS_ENABLED` - 是否启用 Prometheus（true/false）
     pub fn from_env(default_service_name: impl Into<String>) -> Self {
-        let service_name = env::var("OTEL_SERVICE_NAME")
-            .unwrap_or_else(|_| default_service_name.into());
+        let service_name =
+            env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| default_service_name.into());
 
         // OTLP 配置
         let otlp_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
@@ -248,8 +248,7 @@ mod tests {
 
     #[test]
     fn test_with_otlp() {
-        let config = TelemetryConfig::new("test")
-            .with_otlp_endpoint("http://jaeger:4317");
+        let config = TelemetryConfig::new("test").with_otlp_endpoint("http://jaeger:4317");
 
         assert!(config.otlp.is_some());
         let otlp = config.otlp.unwrap();
@@ -265,8 +264,7 @@ mod tests {
 
     #[test]
     fn test_with_file_log() {
-        let config = TelemetryConfig::new("test")
-            .with_file_log("my-service");
+        let config = TelemetryConfig::new("test").with_file_log("my-service");
 
         assert!(config.file_log.is_some());
         let file_log = config.file_log.unwrap();

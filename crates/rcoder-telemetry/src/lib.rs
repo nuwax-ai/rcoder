@@ -46,14 +46,12 @@ pub mod propagation;
 pub use config::{FileLogConfig, OtlpConfig, PrometheusConfig, TelemetryConfig};
 pub use middleware::{GrpcMetricsInterceptor, HttpMetricsLayer};
 pub use prometheus::{
-    inc_active_tasks, dec_active_tasks, set_active_tasks,
-    record_agent_task, record_agent_task_duration,
-    record_grpc_duration, record_grpc_request,
-    record_http_duration, record_http_request,
+    dec_active_tasks, inc_active_tasks, record_agent_task, record_agent_task_duration,
+    record_grpc_duration, record_grpc_request, record_http_duration, record_http_request,
+    set_active_tasks,
 };
 pub use propagation::{
-    extract_context, extract_context_http,
-    inject_context, inject_context_http,
+    extract_context, extract_context_http, inject_context, inject_context_http,
     set_global_propagator,
 };
 
@@ -112,7 +110,10 @@ impl Drop for TelemetryGuard {
         if self.tracer_provider.is_some() {
             otlp::shutdown_tracer_provider();
         }
-        info!("[Telemetry] Telemetry system shutdown: {}", self.service_name);
+        info!(
+            "[Telemetry] Telemetry system shutdown: {}",
+            self.service_name
+        );
     }
 }
 
@@ -176,7 +177,10 @@ pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         config.file_log.as_ref(),
     )?;
 
-    info!("[Telemetry] Initializing telemetry system: {}", config.service_name);
+    info!(
+        "[Telemetry] Initializing telemetry system: {}",
+        config.service_name
+    );
     info!(
         "✅ [Telemetry] 遥测系统初始化完成: OTLP={}, Prometheus={}, FileLog={}, Console=true",
         tracer_provider.is_some(),

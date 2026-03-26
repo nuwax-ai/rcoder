@@ -50,10 +50,10 @@ use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
 // 使用 SACP 类型
-use sacp::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;
+use sacp::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use shared_types::{
     AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
 };
@@ -90,10 +90,7 @@ where
     /// - `notifier`: 会话通知器
     /// - `registry`: 会话注册表（通常注入 AGENT_REGISTRY）
     pub fn new(notifier: Arc<N>, registry: Arc<R>) -> Self {
-        Self {
-            registry,
-            notifier,
-        }
+        Self { registry, notifier }
     }
 
     /// 获取会话信息
@@ -397,7 +394,10 @@ where
                     let model_changed = existing.is_model_config_changed(&model_provider);
 
                     if !channel_closed && !model_changed {
-                        info!("[SESSION] 通过 session_id_hint 复用现有会话: project_id={}, session_id={}", project_id, hint_sid);
+                        info!(
+                            "[SESSION] 通过 session_id_hint 复用现有会话: project_id={}, session_id={}",
+                            project_id, hint_sid
+                        );
                         return Ok((existing, false));
                     }
 
@@ -417,7 +417,9 @@ where
                 } else {
                     info!(
                         "⚠️ [SESSION] session_id_hint 属于不同的 project: hint_project={}, current_project={}, session_id={}",
-                        existing.project_id(), project_id, hint_sid
+                        existing.project_id(),
+                        project_id,
+                        hint_sid
                     );
                     // session_id 属于其他 project，不能复用，继续后续逻辑
                 }
@@ -610,7 +612,8 @@ where
 
         let prompt_request = Self::build_text_prompt_request(prompt, session.session_id().clone())?;
 
-        session.prompt_tx()
+        session
+            .prompt_tx()
             .send(prompt_request)
             .await
             .map_err(|e| {
@@ -634,7 +637,8 @@ where
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
-        session.prompt_tx()
+        session
+            .prompt_tx()
             .send(prompt_request)
             .await
             .map_err(|e| {
@@ -647,9 +651,7 @@ where
     }
 }
 
-impl<N: SessionNotifier + 'static, R: SessionRegistry> std::fmt::Debug
-    for AcpSessionManager<N, R>
-{
+impl<N: SessionNotifier + 'static, R: SessionRegistry> std::fmt::Debug for AcpSessionManager<N, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpSessionManager")
             .field("session_count", &self.registry.count())

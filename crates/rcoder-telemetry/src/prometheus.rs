@@ -3,7 +3,9 @@
 //! 提供 Prometheus 指标的定义、记录和导出功能。
 //! 使用 `metrics` crate 作为 facade，`metrics-exporter-prometheus` 作为后端。
 
-use metrics::{counter, gauge, histogram, describe_counter, describe_gauge, describe_histogram, Unit};
+use metrics::{
+    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram, Unit,
+};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
 use tracing::info;

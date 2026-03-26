@@ -26,9 +26,7 @@ impl SseSessionNotifier {
 
 /// 将 anyhow::Error 转换为 Box<dyn std::error::Error + Send + Sync>
 fn convert_error(e: anyhow::Error) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::other(
-        e.to_string(),
-    ))
+    Box::new(std::io::Error::other(e.to_string()))
 }
 
 #[async_trait]

@@ -143,7 +143,9 @@ impl ContainerStateActor {
                 updated_info,
                 reply,
             } => {
-                let existed = if let std::collections::hash_map::Entry::Occupied(mut e) = self.containers.entry(key) {
+                let existed = if let std::collections::hash_map::Entry::Occupied(mut e) =
+                    self.containers.entry(key)
+                {
                     e.insert(updated_info);
                     true
                 } else {

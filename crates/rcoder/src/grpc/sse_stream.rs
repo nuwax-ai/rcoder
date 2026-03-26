@@ -109,11 +109,14 @@ pub async fn create_grpc_sse_stream(
                             Ok(Some(progress_event)) => {
                                 debug!(
                                     "📨 [gRPC_SSE] 收到进度事件: session_id={}, message_type={}, sub_type={}",
-                                    session_id_clone, progress_event.message_type, progress_event.sub_type
+                                    session_id_clone,
+                                    progress_event.message_type,
+                                    progress_event.sub_type
                                 );
 
                                 // 将 ProgressEvent 转换为 SSE Event（传入 session_id 以重建完整消息结构）
-                                let sse_event = progress_event_to_sse(&progress_event, &session_id_clone);
+                                let sse_event =
+                                    progress_event_to_sse(&progress_event, &session_id_clone);
 
                                 if tx.send(Ok(sse_event)).await.is_err() {
                                     warn!(
@@ -136,7 +139,9 @@ pub async fn create_grpc_sse_stream(
                                 // 流异常结束（连接中断、超时等）
                                 error!(
                                     "❌ [gRPC_SSE] gRPC 流异常: session_id={}, code={}, message={}",
-                                    session_id_clone, e.code(), e.message()
+                                    session_id_clone,
+                                    e.code(),
+                                    e.message()
                                 );
 
                                 // 发送标准格式的错误消息
@@ -386,10 +391,7 @@ fn create_grpc_stream_error_event(
 /// 创建连接失败错误事件
 ///
 /// 当 gRPC 连接建立失败（重试后）时发送此事件
-fn create_connection_error_event(
-    session_id: &str,
-    message: &str,
-) -> axum::response::sse::Event {
+fn create_connection_error_event(session_id: &str, message: &str) -> axum::response::sse::Event {
     let unified_message = UnifiedSessionMessage {
         session_id: session_id.to_string(),
         message_type: SessionMessageType::SessionPromptEnd,

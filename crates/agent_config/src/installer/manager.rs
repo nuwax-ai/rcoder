@@ -149,7 +149,10 @@ impl AgentInstallationManager {
                 info!("Agent is installed and verified: {}", command);
                 return Ok(InstallResult::already_installed(None));
             }
-            warn!("Agent command exists but verification failed, trying reinstall: {}", command);
+            warn!(
+                "Agent command exists but verification failed, trying reinstall: {}",
+                command
+            );
         }
 
         // Not installed or validation failed, try to install

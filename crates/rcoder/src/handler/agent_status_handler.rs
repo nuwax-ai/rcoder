@@ -3,8 +3,8 @@ use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
-use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 use super::utils::get_locale_from_headers;
+use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 
 /// 查询Agent状态
 ///

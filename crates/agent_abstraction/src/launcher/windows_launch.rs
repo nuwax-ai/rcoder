@@ -64,11 +64,16 @@ fn resolve_windows_node_exe() -> Option<PathBuf> {
         }
     }
 
-    warn!("[SACP] Windows node resolution failed: NUWAX_NODE_PATH, NUWAX_NODE_EXE, NUWAX_APP_RUNTIME_PATH and APPDATA default paths all missed");
+    warn!(
+        "[SACP] Windows node resolution failed: NUWAX_NODE_PATH, NUWAX_NODE_EXE, NUWAX_APP_RUNTIME_PATH and APPDATA default paths all missed"
+    );
     None
 }
 
-fn npm_package_entry_from_dir(package_dir: &std::path::Path, package_name: &str) -> Option<PathBuf> {
+fn npm_package_entry_from_dir(
+    package_dir: &std::path::Path,
+    package_name: &str,
+) -> Option<PathBuf> {
     let package_json = package_dir.join("package.json");
     let content = std::fs::read_to_string(package_json).ok()?;
     let package_json: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -81,17 +86,18 @@ fn npm_package_entry_from_dir(package_dir: &std::path::Path, package_name: &str)
             .get(package_name)
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .or_else(|| bin_map.values().find_map(|v| v.as_str()).map(str::to_string))
+            .or_else(|| {
+                bin_map
+                    .values()
+                    .find_map(|v| v.as_str())
+                    .map(str::to_string)
+            })
     } else {
         None
     }?;
 
     let entry = package_dir.join(rel_entry);
-    if entry.exists() {
-        Some(entry)
-    } else {
-        None
-    }
+    if entry.exists() { Some(entry) } else { None }
 }
 
 fn get_windows_cmd_script_path(path: &std::path::Path) -> Option<PathBuf> {
@@ -140,11 +146,7 @@ fn resolve_js_entry_from_cmd_shim(cmd_script: &std::path::Path) -> Option<PathBu
     let content = match std::fs::read_to_string(cmd_script) {
         Ok(c) => c,
         Err(e) => {
-            debug!(
-                "[SACP] cmd shim 读取失败: {} ({})",
-                cmd_script.display(),
-                e
-            );
+            debug!("[SACP] cmd shim 读取失败: {} ({})", cmd_script.display(), e);
             return None;
         }
     };
@@ -191,15 +193,15 @@ fn resolve_js_entry_from_cmd_shim(cmd_script: &std::path::Path) -> Option<PathBu
         }
     }
 
-    debug!(
-        "[SACP] cmd shim 未解析到入口: {}",
-        cmd_script.display()
-    );
+    debug!("[SACP] cmd shim 未解析到入口: {}", cmd_script.display());
 
     None
 }
 
-pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+pub fn resolve_windows_node_cli_command(
+    command: &str,
+    args: &[String],
+) -> Option<(String, Vec<String>)> {
     let command_path = which::which(command).unwrap_or_else(|_| PathBuf::from(command));
     let path = command_path.as_path();
     info!(
@@ -210,16 +212,10 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
     let cmd_script = get_windows_cmd_script_path(path);
 
     let node_exe = resolve_windows_node_exe()?;
-    info!(
-        "[SACP] Windows node.exe 已找到: {}",
-        node_exe.display()
-    );
+    info!("[SACP] Windows node.exe 已找到: {}", node_exe.display());
 
     if let Some(cmd_script) = cmd_script.as_ref() {
-        info!(
-            "[SACP] 找到 cmd shim: {}",
-            cmd_script.display()
-        );
+        info!("[SACP] 找到 cmd shim: {}", cmd_script.display());
         if let Some(js_entry) = resolve_js_entry_from_cmd_shim(cmd_script) {
             let mut actual_args = Vec::with_capacity(args.len() + 1);
             actual_args.push(js_entry.to_string_lossy().to_string());
@@ -243,10 +239,14 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
     }
 
     let package_name = match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("cmd") => {
-            path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
-        }
-        None => path.file_name().and_then(|s| s.to_str()).map(str::to_string),
+        Some(ext) if ext.eq_ignore_ascii_case("cmd") => path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string),
+        None => path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string),
         _ => None,
     }?;
 
@@ -277,10 +277,7 @@ pub fn resolve_windows_node_cli_command(command: &str, args: &[String]) -> Optio
 
     for package_dir in package_dirs {
         if !package_dir.exists() {
-            info!(
-                "[SACP] package 目录不存在，跳过: {}",
-                package_dir.display()
-            );
+            info!("[SACP] package 目录不存在，跳过: {}", package_dir.display());
             continue;
         }
         if let Some(js_entry) = npm_package_entry_from_dir(&package_dir, &package_name) {
@@ -336,7 +333,10 @@ pub fn normalize_windows_command_for_no_window(
 
     match ext.as_deref() {
         Some("exe") => {
-            info!("[SACP] Windows detected native .exe: {} - no popup window", path);
+            info!(
+                "[SACP] Windows detected native .exe: {} - no popup window",
+                path
+            );
         }
         Some("cmd" | "bat") => {
             info!("[SACP] 🔍 Windows 检测到 .cmd/.bat: {}", path);

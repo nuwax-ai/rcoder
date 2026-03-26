@@ -14,6 +14,6 @@ pub use error::*;
 pub use installation::*;
 pub use mcp_config::*;
 pub use prompt_config::*;
+pub use system_prompt::DEFAULT_SYSTEM_PROMPT;
 #[allow(deprecated)]
 pub use system_prompt::PromptBuilder;
-pub use system_prompt::DEFAULT_SYSTEM_PROMPT;

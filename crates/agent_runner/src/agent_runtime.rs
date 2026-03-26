@@ -22,12 +22,12 @@
 //! | 重启 | 替换 sender | abort + spawn |
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -327,7 +327,9 @@ mod tests {
 
         // 模拟心跳超时（设置20秒前的时间戳）
         let timestamp_20s_ago = Utc::now().timestamp_millis() - (20 * 1000);
-        runtime.last_heartbeat_ts.store(timestamp_20s_ago, std::sync::atomic::Ordering::Release);
+        runtime
+            .last_heartbeat_ts
+            .store(timestamp_20s_ago, std::sync::atomic::Ordering::Release);
 
         // 心跳超过 15 秒，应检测到超时
         assert!(runtime.check_heartbeat_timeout());

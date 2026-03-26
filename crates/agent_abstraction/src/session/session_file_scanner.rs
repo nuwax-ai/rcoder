@@ -103,10 +103,7 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
 
     // 使用异步 I/O 遍历目录
     let Ok(mut dir_entries) = tokio::fs::read_dir(&projects_dir).await else {
-        warn!(
-            "🔍 [文件扫描] 无法读取项目目录: {}",
-            projects_dir.display()
-        );
+        warn!("🔍 [文件扫描] 无法读取项目目录: {}", projects_dir.display());
         return session_ids;
     };
 
@@ -115,12 +112,12 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
 
         // 匹配编码后的路径（精确或带哈希后缀）
         // 使用 OsStr 避免不必要的 String 分配
-        if dir_name.to_string_lossy().starts_with(encoded_path.as_str()) {
+        if dir_name
+            .to_string_lossy()
+            .starts_with(encoded_path.as_str())
+        {
             let Ok(mut files) = tokio::fs::read_dir(entry.path()).await else {
-                warn!(
-                    "🔍 [文件扫描] 无法读取会话目录: {}",
-                    entry.path().display()
-                );
+                warn!("🔍 [文件扫描] 无法读取会话目录: {}", entry.path().display());
                 continue;
             };
 

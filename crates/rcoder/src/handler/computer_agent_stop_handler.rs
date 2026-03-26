@@ -4,8 +4,8 @@
 //! 与 RCoder 的 agent_stop 不同，这里只停止单个 project_id 的 Agent，
 //! 容器会继续运行其他 project_id 的 Agent。
 
-use axum::{Json, extract::State};
 use axum::http::HeaderMap;
+use axum::{Json, extract::State};
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 
@@ -186,7 +186,8 @@ pub async fn computer_agent_stop(
                             "ℹ️ [COMPUTER_STOP] Agent 已经处于停止状态: project_id={}",
                             project_id
                         );
-                        let message = shared_types::get_i18n_message("success.agent_already_stopped", locale);
+                        let message =
+                            shared_types::get_i18n_message("success.agent_already_stopped", locale);
                         let stop_response = ComputerAgentStopResponse {
                             success: true,
                             message,

@@ -426,10 +426,7 @@ async fn main() -> anyhow::Result<()> {
             let app = Router::new().route("/health", get(health_check));
             let addr = format!("0.0.0.0:{}", health_port);
 
-            info!(
-                "🏥 HTTP 健康检查服务启动，监听端口: {}",
-                health_port
-            );
+            info!("🏥 HTTP 健康检查服务启动，监听端口: {}", health_port);
 
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,

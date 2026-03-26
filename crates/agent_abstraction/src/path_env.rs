@@ -11,13 +11,9 @@ pub const TAURI_APP_DATA_DIR: &str = "com.nuwax.agent-tauri-client";
 /// 在系统 PATH 中查找可执行文件
 fn find_in_path(executable: &str) -> Option<String> {
     let output = if cfg!(windows) {
-        std::process::Command::new("where")
-            .arg(executable)
-            .output()
+        std::process::Command::new("where").arg(executable).output()
     } else {
-        std::process::Command::new("which")
-            .arg(executable)
-            .output()
+        std::process::Command::new("which").arg(executable).output()
     };
 
     match output {

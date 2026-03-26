@@ -30,7 +30,8 @@ use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerMa
 use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
-    extract_grpc_addr_with_port, get_locale_from_headers, get_realtime_container_ip_with_cache, project_dir,
+    extract_grpc_addr_with_port, get_locale_from_headers, get_realtime_container_ip_with_cache,
+    project_dir,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -164,7 +165,9 @@ pub async fn handle_computer_chat(
                 // 标记已被移除 = 创建完成
                 if !state.pod_creating.contains_key(&user_id) {
                     // 尝试获取容器信息
-                    if let Ok(docker_mgr) = docker_manager::global::get_global_docker_manager().await {
+                    if let Ok(docker_mgr) =
+                        docker_manager::global::get_global_docker_manager().await
+                    {
                         if let Ok(Some(info)) = docker_mgr.get_user_container_info(&user_id).await {
                             info!(
                                 "✅ [COMPUTER_CHAT] 等待成功，容器已就绪（等待{}秒）: user_id={}, container_id={}",
@@ -177,7 +180,10 @@ pub async fn handle_computer_chat(
                 }
 
                 if wait_sec % 5 == 0 {
-                    debug!("[COMPUTER_CHAT] 仍在等待容器创建: user_id={}, 第{}秒", user_id, wait_sec);
+                    debug!(
+                        "[COMPUTER_CHAT] 仍在等待容器创建: user_id={}, 第{}秒",
+                        user_id, wait_sec
+                    );
                 }
             }
 
@@ -208,7 +214,9 @@ pub async fn handle_computer_chat(
         info
     } else {
         // 正常创建容器 - 设置标记防止并发
-        state.pod_creating.insert(user_id.clone(), std::time::Instant::now());
+        state
+            .pod_creating
+            .insert(user_id.clone(), std::time::Instant::now());
 
         let result = ComputerContainerManager::get_or_create_container_for_user(
             &user_id,
@@ -683,15 +691,9 @@ async fn forward_computer_request_to_container(
 
         // gRPC 通信失败，直接返回错误
         // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
-        HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_GRPC_ERROR,
-            locale,
-        )
+        HttpResult::error_with_locale(shared_types::error_codes::ERR_GRPC_ERROR, locale)
     } else {
-        HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_UNKNOWN,
-            locale,
-        )
+        HttpResult::error_with_locale(shared_types::error_codes::ERR_UNKNOWN, locale)
     }
 }
 

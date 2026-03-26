@@ -4,11 +4,22 @@ pub use agent_abstraction::PromptMessage;
 
 pub use shared_types::{
     // Agent model exports
-    AgentStatus, ProjectAndAgentInfo,
-    // 取消相关类型
-    CancelNotificationRequestWrapper, CancelResult,
+    AgentStatus,
     // Session and message exports
-    Attachment, AttachmentSource, TextAttachment, ImageAttachment, AudioAttachment, DocumentAttachment, SessionMessageType, UnifiedSessionMessage, SessionNotify, ChatPromptResponse,
+    Attachment,
+    AttachmentSource,
+    AudioAttachment,
+    // 取消相关类型
+    CancelNotificationRequestWrapper,
+    CancelResult,
+    ChatPromptResponse,
+    DocumentAttachment,
+    ImageAttachment,
+    ProjectAndAgentInfo,
+    SessionMessageType,
+    SessionNotify,
+    TextAttachment,
+    UnifiedSessionMessage,
 };
 
 // 重新导出 sacp 类型，供客户端构造取消请求使用

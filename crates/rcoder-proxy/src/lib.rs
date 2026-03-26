@@ -67,7 +67,7 @@ pub mod vnc_resolver;
 // 重新导出公共接口
 pub use config::ProxyConfig;
 pub use pingora_server::PingoraServerManager;
-pub use router::{create_router, get_routes_documentation, RouteType};
+pub use router::{RouteType, create_router, get_routes_documentation};
 pub use server::{PingoraServerRunner, ProxyServer, ProxyServerBuilder};
 pub use service::{PingoraProxyService, PortProxyService}; // PortProxyService 是别名
 pub use vnc_resolver::{

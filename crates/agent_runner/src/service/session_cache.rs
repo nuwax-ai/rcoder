@@ -414,16 +414,17 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             // 🛡️ 关键修复：先主动关闭旧 session 的 SSE 连接，再移除缓存
             // 之前直接 remove 导致旧 SSE 连接的心跳流继续发送但不再收到业务消息，
             // 前端如果没有及时关闭旧连接，会看到孤立的心跳流
-            let cleared_count = if let Some((_, old_session_data)) = SESSION_CACHE.remove(&old_session_id) {
-                old_session_data.close_current_connection().await;
-                info!(
-                    "🔌 [ensure_project_session] 已关闭旧 session SSE 连接: old_session_id={}",
-                    old_session_id
-                );
-                1 // 移除了1个session
-            } else {
-                0 // session不存在
-            };
+            let cleared_count =
+                if let Some((_, old_session_data)) = SESSION_CACHE.remove(&old_session_id) {
+                    old_session_data.close_current_connection().await;
+                    info!(
+                        "🔌 [ensure_project_session] 已关闭旧 session SSE 连接: old_session_id={}",
+                        old_session_id
+                    );
+                    1 // 移除了1个session
+                } else {
+                    0 // session不存在
+                };
 
             // 更新 AGENT_REGISTRY 中的映射关系
             let _ = AGENT_REGISTRY.update_session(project_id, session_id);

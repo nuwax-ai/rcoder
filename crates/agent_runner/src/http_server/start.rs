@@ -7,14 +7,14 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::agent_runtime::AgentRuntime;
 use crate::config::AppConfig;
 use crate::http_server::router::{AppState, create_router};
-use crate::proxy_agent::cleanup_task::{start_cleanup_task, CleanupConfig};
+use crate::proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use crate::proxy_agent::set_unlimited_mode;
 #[cfg(feature = "proxy")]
 use crate::proxy_agent::start_pingora;
@@ -161,12 +161,20 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     // 1. 启动 Agent 清理任务
     let cleanup_config = CleanupConfig {
         idle_timeout: Duration::from_secs(
-            config.app_config.agent_cleanup.clone()
-                .unwrap_or_default().idle_timeout_secs
+            config
+                .app_config
+                .agent_cleanup
+                .clone()
+                .unwrap_or_default()
+                .idle_timeout_secs,
         ),
         cleanup_interval: Duration::from_secs(
-            config.app_config.agent_cleanup.clone()
-                .unwrap_or_default().cleanup_interval_secs
+            config
+                .app_config
+                .agent_cleanup
+                .clone()
+                .unwrap_or_default()
+                .cleanup_interval_secs,
         ),
     };
     info!(
@@ -229,10 +237,9 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     let http_listener = listener;
     join_set.lock().await.spawn(async move {
         // 使用 graceful shutdown wrapper
-        let server = axum::serve(http_listener, http_app)
-            .with_graceful_shutdown(async move {
-                let _ = http_token.cancelled().await;
-            });
+        let server = axum::serve(http_listener, http_app).with_graceful_shutdown(async move {
+            let _ = http_token.cancelled().await;
+        });
 
         match server.await {
             Ok(()) => info!("HTTP 服务正常退出"),

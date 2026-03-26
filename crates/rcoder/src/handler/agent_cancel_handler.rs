@@ -201,7 +201,9 @@ async fn forward_cancel_request_to_container_service(
                             }));
                         } else {
                             // 容器存在但服务不可用（可能是临时故障），返回错误
-                            warn!("[CANCEL_FORWARD] Agent Worker 不可用（容器存在，可能是临时故障）");
+                            warn!(
+                                "[CANCEL_FORWARD] Agent Worker 不可用（容器存在，可能是临时故障）"
+                            );
                             return Ok(HttpResult::error_with_locale(
                                 shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
                                 locale,
@@ -266,7 +268,10 @@ async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> 
         }
         Err(e) => {
             // 无法获取 Docker Manager，保守地认为容器存在
-            warn!("[CANCEL_FORWARD] 获取 Docker Manager 失败: {}，保守认为容器存在", e);
+            warn!(
+                "[CANCEL_FORWARD] 获取 Docker Manager 失败: {}，保守认为容器存在",
+                e
+            );
             true
         }
     }

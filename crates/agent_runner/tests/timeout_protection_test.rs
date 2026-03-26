@@ -90,9 +90,9 @@ async fn test_success_before_timeout() {
 async fn test_graduated_timeout_warnings() {
     // 测试不同时长的请求应该触发不同级别的警告
     let test_cases = vec![
-        (30, false, false),  // 30 秒: 无警告
-        (65, true, false),   // 65 秒: 黄色警告 (> 60s)
-        (125, true, true),   // 125 秒: 红色警告 (> 120s)
+        (30, false, false), // 30 秒: 无警告
+        (65, true, false),  // 65 秒: 黄色警告 (> 60s)
+        (125, true, true),  // 125 秒: 红色警告 (> 120s)
     ];
 
     for (duration_seconds, should_yellow_warn, should_red_warn) in test_cases {
@@ -253,8 +253,8 @@ async fn test_timeout_threshold_configuration() {
 /// 测试超时不会导致死锁
 #[tokio::test]
 async fn test_timeout_does_not_cause_deadlock() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let task_started = Arc::new(AtomicBool::new(false));
     let task_started_clone = task_started.clone();

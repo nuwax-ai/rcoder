@@ -13,15 +13,15 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
-use anyhow::{Context, Result};
 #[cfg(windows)]
 use crate::path_env::TAURI_APP_DATA_DIR;
+use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
+use anyhow::{Context, Result};
 use process_wrap::tokio::CommandWrap;
-#[cfg(windows)]
-use process_wrap::tokio::{CreationFlags, JobObject};
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
+#[cfg(windows)]
+use process_wrap::tokio::{CreationFlags, JobObject};
 use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -46,7 +46,8 @@ use crate::traits::session_registry::SessionRegistry;
 use super::lifecycle::AgentLifecycleGuard;
 #[cfg(windows)]
 use super::windows_launch::{
-    normalize_windows_command_for_no_window, resolve_windows_node_cli_command, CREATE_NO_WINDOW_FLAG,
+    CREATE_NO_WINDOW_FLAG, normalize_windows_command_for_no_window,
+    resolve_windows_node_cli_command,
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
@@ -409,7 +410,10 @@ pub fn get_default_sacp_agent_config(
     } else {
         match which::which("claude-code-acp-ts") {
             Ok(resolved_path) => {
-                tracing::info!("Resolved claude-code-acp-ts path via `which` crate: {}", resolved_path.display());
+                tracing::info!(
+                    "Resolved claude-code-acp-ts path via `which` crate: {}",
+                    resolved_path.display()
+                );
                 resolved_path.to_string_lossy().to_string()
             }
             Err(_) => "claude-code-acp-ts".to_string(),
@@ -508,9 +512,7 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
 
     // 检查日志级别是否为 debug
     if !is_debug_log_level() {
-        debug!(
-            "[MCP] mcp-proxy convert 检测到，但日志级别非 debug，跳过诊断参数注入"
-        );
+        debug!("[MCP] mcp-proxy convert 检测到，但日志级别非 debug，跳过诊断参数注入");
         return args;
     }
 
@@ -537,10 +539,7 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
     if let Some(log_dir) = get_mcp_proxy_log_dir() {
         enhanced_args.push("--log-dir".to_string());
         enhanced_args.push(log_dir.clone());
-        info!(
-            "[MCP] 为 mcp-proxy convert 追加 --log-dir {} 参数",
-            log_dir
-        );
+        info!("[MCP] 为 mcp-proxy convert 追加 --log-dir {} 参数", log_dir);
     }
 
     enhanced_args
@@ -616,10 +615,7 @@ pub fn convert_context_servers_sacp(
             #[cfg(not(windows))]
             if !env_vars.iter().any(|e| e.name == "HOME") {
                 if let Ok(home) = std::env::var("HOME") {
-                    env_vars.push(sacp::schema::EnvVariable::new(
-                        "HOME".to_string(),
-                        home,
-                    ));
+                    env_vars.push(sacp::schema::EnvVariable::new("HOME".to_string(), home));
                 }
             }
 
@@ -921,9 +917,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         #[cfg(windows)]
         let mut child = cmd_wrap
-            .wrap(CreationFlags(PROCESS_CREATION_FLAGS(
-                CREATE_NO_WINDOW_FLAG,
-            )))
+            .wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW_FLAG)))
             .wrap(JobObject)
             .spawn()
             .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
@@ -1984,12 +1978,21 @@ mod tests {
     #[test]
     fn test_has_log_dir_arg() {
         // 检测 --log-dir 参数
-        assert!(has_log_dir_arg(&["--log-dir".to_string(), "/tmp".to_string()]));
+        assert!(has_log_dir_arg(&[
+            "--log-dir".to_string(),
+            "/tmp".to_string()
+        ]));
         assert!(has_log_dir_arg(&["--log-dir=/tmp".to_string()]));
-        assert!(has_log_dir_arg(&["convert".to_string(), "--log-dir".to_string()]));
+        assert!(has_log_dir_arg(&[
+            "convert".to_string(),
+            "--log-dir".to_string()
+        ]));
 
         // 检测 --log-file 参数
-        assert!(has_log_dir_arg(&["--log-file".to_string(), "/tmp/log.txt".to_string()]));
+        assert!(has_log_dir_arg(&[
+            "--log-file".to_string(),
+            "/tmp/log.txt".to_string()
+        ]));
         assert!(has_log_dir_arg(&["--log-file=/tmp/log.txt".to_string()]));
     }
 
@@ -1998,7 +2001,10 @@ mod tests {
         assert!(!has_log_dir_arg(&[]));
         assert!(!has_log_dir_arg(&["convert".to_string()]));
         assert!(!has_log_dir_arg(&["--diagnostic".to_string()]));
-        assert!(!has_log_dir_arg(&["--config".to_string(), "config.json".to_string()]));
+        assert!(!has_log_dir_arg(&[
+            "--config".to_string(),
+            "config.json".to_string()
+        ]));
     }
 
     #[test]
@@ -2024,7 +2030,10 @@ mod tests {
         assert_eq!(result.iter().filter(|a| *a == "--log-dir").count(), 1);
         // --log-dir 的值应该是用户配置的 /custom/path
         let log_dir_idx = result.iter().position(|a| a == "--log-dir").unwrap();
-        assert_eq!(result.get(log_dir_idx + 1), Some(&"/custom/path".to_string()));
+        assert_eq!(
+            result.get(log_dir_idx + 1),
+            Some(&"/custom/path".to_string())
+        );
 
         // 清理环境变量
         // SAFETY: 测试环境中修改环境变量是安全的

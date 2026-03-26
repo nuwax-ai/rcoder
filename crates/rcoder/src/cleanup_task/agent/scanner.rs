@@ -108,7 +108,10 @@ impl AgentScanner {
 
         if !is_timeout {
             // 未超时，但如果状态是 Active/Pending，仍需要通过 gRPC 确认
-            if matches!(status, Some(AgentStatus::Active) | Some(AgentStatus::Pending)) {
+            if matches!(
+                status,
+                Some(AgentStatus::Active) | Some(AgentStatus::Pending)
+            ) {
                 debug!("⏸️ [scanner] 未超时但状态活跃，跳过: {:?}", status);
                 return false;
             }

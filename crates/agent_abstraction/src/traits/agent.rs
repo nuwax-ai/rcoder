@@ -159,9 +159,7 @@ impl AgentStartConfig {
         // Only load project-level settings (skills), block global settings
         options.insert(
             "settingSources".to_string(),
-            serde_json::Value::Array(vec![
-                serde_json::Value::String("project".to_string()),
-            ]),
+            serde_json::Value::Array(vec![serde_json::Value::String("project".to_string())]),
         );
 
         // Add resume session_id if present
@@ -230,9 +228,7 @@ impl AgentStartConfig {
         let mut options = serde_json::Map::new();
         options.insert(
             "settingSources".to_string(),
-            serde_json::Value::Array(vec![
-                serde_json::Value::String("project".to_string()),
-            ]),
+            serde_json::Value::Array(vec![serde_json::Value::String("project".to_string())]),
         );
 
         let mut claude_code = serde_json::Map::new();

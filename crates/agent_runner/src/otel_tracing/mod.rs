@@ -166,9 +166,7 @@ impl RequestSpan {
             project_id, request_id, operation
         );
 
-        Self {
-            span,
-        }
+        Self { span }
     }
 
     /// 设置动态属性（使用 OpenTelemetrySpanExt）
@@ -240,7 +238,11 @@ impl RequestSpan {
     ///     KeyValue::new("cache.ttl", 300),
     /// ]);
     /// ```
-    pub fn add_event(&self, name: impl Into<std::borrow::Cow<'static, str>>, attributes: Vec<opentelemetry::KeyValue>) {
+    pub fn add_event(
+        &self,
+        name: impl Into<std::borrow::Cow<'static, str>>,
+        attributes: Vec<opentelemetry::KeyValue>,
+    ) {
         self.span.add_event(name, attributes);
     }
 
@@ -325,18 +327,14 @@ pub fn child_span(_parent: &RequestSpan, name: &str, attributes: &[(&str, String
 
     info!("📍 [OTel] 子 Span 已创建: {}", name);
 
-    RequestSpan {
-        span,
-    }
+    RequestSpan { span }
 }
 
 /// 从上下文中提取当前 span（用于跨线程传递）
 pub fn current_span() -> RequestSpan {
     let span = Span::current();
 
-    RequestSpan {
-        span,
-    }
+    RequestSpan { span }
 }
 
 /// 创建带属性的 span
@@ -367,9 +365,7 @@ pub fn span_with_attributes(name: &str, attributes: &[(&str, String)]) -> Reques
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    RequestSpan {
-        span,
-    }
+    RequestSpan { span }
 }
 
 #[cfg(test)]

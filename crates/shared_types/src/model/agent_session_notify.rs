@@ -1,5 +1,5 @@
-use sacp::schema::{Error, SessionUpdate, StopReason};
 use chrono::{DateTime, Utc};
+use sacp::schema::{Error, SessionUpdate, StopReason};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 

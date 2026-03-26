@@ -199,36 +199,39 @@ async fn main() -> anyhow::Result<()> {
 
     info!("检查并清理上次可能遗留的容器（所有启用的服务）...");
     if config.cleanup_config.enabled {
-        match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
-            .await
+        match container_stop::startup_cleanup_all_enabled_services(
+            &docker_manager,
+            &multi_image_config,
+        )
+        .await
         {
-        Ok(result) => {
-            let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
-            if result.successfully_removed > 0 {
-                info!(
-                    "✅ 启动时清理完成，共清理了 {} 个遗留容器（涵盖 {} 个服务类型）",
-                    result.successfully_removed,
-                    enabled_services.len()
-                );
-            } else {
-                info!("未发现遗留容器，系统环境干净");
-            }
-
-            // 如果有失败的清理（非409错误），记录警告
-            if result.failed_removals > 0 {
-                warn!("部分容器清理失败: 失败数量={}", result.failed_removals);
-                for failure in &result.failed_removals_details {
-                    warn!(
-                        "  - 容器 {} ({}): {}",
-                        failure.container_id, failure.container_name, failure.error_message
+            Ok(result) => {
+                let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
+                if result.successfully_removed > 0 {
+                    info!(
+                        "✅ 启动时清理完成，共清理了 {} 个遗留容器（涵盖 {} 个服务类型）",
+                        result.successfully_removed,
+                        enabled_services.len()
                     );
+                } else {
+                    info!("未发现遗留容器，系统环境干净");
+                }
+
+                // 如果有失败的清理（非409错误），记录警告
+                if result.failed_removals > 0 {
+                    warn!("部分容器清理失败: 失败数量={}", result.failed_removals);
+                    for failure in &result.failed_removals_details {
+                        warn!(
+                            "  - 容器 {} ({}): {}",
+                            failure.container_id, failure.container_name, failure.error_message
+                        );
+                    }
                 }
             }
+            Err(e) => {
+                warn!("启动时容器清理失败: {}，但这不影响服务启动", e);
+            }
         }
-        Err(e) => {
-            warn!("启动时容器清理失败: {}，但这不影响服务启动", e);
-        }
-    }
     } else {
         info!("🚫 启动时容器清理已禁用（cleanup_config.enabled=false）");
     }
@@ -264,7 +267,9 @@ async fn main() -> anyhow::Result<()> {
     let api_key_config = Arc::new(ArcSwap::from_pointee(config.api_key_auth.clone()));
 
     // 启动代理服务（如果启用）
-    let (proxy_handle, pingora_service_opt, _pingora_shutdown_tx) = if let Some(proxy_config) = &config.proxy_config {
+    let (proxy_handle, pingora_service_opt, _pingora_shutdown_tx) = if let Some(proxy_config) =
+        &config.proxy_config
+    {
         info!(
             "启动 Pingora 反向代理服务，监听端口: {}",
             proxy_config.listen_port
@@ -328,7 +333,11 @@ async fn main() -> anyhow::Result<()> {
 
         info!("[Pingora] 后台任务已启动");
 
-        (Some(handle), Some(pingora_service), Some(pingora_shutdown_tx))
+        (
+            Some(handle),
+            Some(pingora_service),
+            Some(pingora_shutdown_tx),
+        )
     } else {
         info!("⚠️  [Pingora] proxy_config 未配置，跳过 Pingora 启动");
         (None, None, None)
@@ -363,9 +372,11 @@ async fn main() -> anyhow::Result<()> {
     let _cleanup_handle = if config.cleanup_config.enabled {
         let cleanup_config_clone = cleanup_config.clone();
         let state_for_cleanup = state.clone();
-        Some(cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup)
-            .await
-            .map_err(|e| anyhow::anyhow!("清理任务启动失败: {}", e))?)
+        Some(
+            cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup)
+                .await
+                .map_err(|e| anyhow::anyhow!("清理任务启动失败: {}", e))?,
+        )
     } else {
         info!("🚫 容器清理功能已禁用（cleanup_config.enabled=false）");
         None

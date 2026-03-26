@@ -9,8 +9,8 @@ use std::sync::Arc;
 use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{AppError, HttpResult, router::AppState};
 use super::utils::get_locale_from_headers;
+use crate::{AppError, HttpResult, router::AppState};
 
 /// 停止Agent请求参数
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -77,7 +77,9 @@ async fn destroy_container_for_project(
             );
 
             // 直接使用 container_id 停止容器（无需再查缓存）
-            let stop_result = docker_manager.stop_container_by_id(&result.container_id).await;
+            let stop_result = docker_manager
+                .stop_container_by_id(&result.container_id)
+                .await;
 
             if let Err(e) = stop_result {
                 error!("[STOP_DESTROY] 停止容器失败: {}", e);

@@ -2,7 +2,10 @@
 //!
 //! 定义所有 HTTP 端点和路由
 
-use axum::{Json, Router, routing::{get, post}};
+use axum::{
+    Json, Router,
+    routing::{get, post},
+};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tower_http::limit::RequestBodyLimitLayer;

@@ -6,15 +6,15 @@
 //! 3. RAII 设计（PendingGuard）是否可以正常快速销毁 agent
 //! 4. 原子计数器的并发安全性
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Barrier;
 
 // 重新导出必要的类型
+use agent_runner::agent_runtime::{get_concurrency_limit, init_concurrency_limit};
 use agent_runner::service::AgentSessionRegistry;
 use agent_runner::service::PendingGuard;
-use agent_runner::agent_runtime::{get_concurrency_limit, init_concurrency_limit};
 use sacp::schema::SessionId;
 use shared_types::{AgentStatus, ProjectAndAgentInfo, SessionEntry};
 use tokio::sync::mpsc;
@@ -131,25 +131,11 @@ async fn test_atomic_slot_counter_concurrent_acquisition() {
     let failed = failed_count.load(Ordering::Relaxed);
     let limit = get_concurrency_limit();
 
-    assert_eq!(
-        successful,
-        limit,
-        "应该有 {} 个任务成功获取槽位",
-        limit
-    );
-    assert_eq!(
-        failed,
-        limit,
-        "应该有 {} 个任务失败（槽位已满）",
-        limit
-    );
+    assert_eq!(successful, limit, "应该有 {} 个任务成功获取槽位", limit);
+    assert_eq!(failed, limit, "应该有 {} 个任务失败（槽位已满）", limit);
 
     // 验证: 计数器最终应该回到 0
-    assert_eq!(
-        registry.active_sessions_count(),
-        0,
-        "所有槽位应该被释放"
-    );
+    assert_eq!(registry.active_sessions_count(), 0, "所有槽位应该被释放");
 }
 
 #[tokio::test]
@@ -186,11 +172,7 @@ async fn test_atomic_slot_counter_stress_test() {
     }
 
     // 验证: 计数器最终应该回到 0
-    assert_eq!(
-        registry.active_sessions_count(),
-        0,
-        "所有槽位应该被释放"
-    );
+    assert_eq!(registry.active_sessions_count(), 0, "所有槽位应该被释放");
 
     println!(
         "压力测试完成: {} 次成功获取槽位",
@@ -327,7 +309,10 @@ async fn test_concurrent_agent_state_updates() {
     // 验证: agent 仍然存在，没有数据损坏
     assert!(registry.contains_project(project_id));
     let info = registry.get_agent_info(project_id).unwrap();
-    assert!(matches!(info.status, AgentStatus::Active | AgentStatus::Idle));
+    assert!(matches!(
+        info.status,
+        AgentStatus::Active | AgentStatus::Idle
+    ));
 
     // 清理
     registry.remove_by_project(project_id);
@@ -465,7 +450,10 @@ fn test_raii_fast_destruction() {
     // 验证: 所有项目都被清理
     assert_eq!(registry.stats().agent_count, 0);
 
-    println!("RAII 快速销毁测试: {} 个 guard 在 {:?} 内销毁", num_guards, elapsed);
+    println!(
+        "RAII 快速销毁测试: {} 个 guard 在 {:?} 内销毁",
+        num_guards, elapsed
+    );
 }
 
 #[tokio::test]
@@ -593,22 +581,11 @@ async fn test_high_concurrency_stress() {
     let success = success_count.load(Ordering::Relaxed);
     let fail = fail_count.load(Ordering::Relaxed);
 
-    assert_eq!(
-        success + fail,
-        num_requests,
-        "所有请求都应该被处理"
-    );
+    assert_eq!(success + fail, num_requests, "所有请求都应该被处理");
 
-    assert_eq!(
-        registry.active_sessions_count(),
-        0,
-        "所有槽位应该被释放"
-    );
+    assert_eq!(registry.active_sessions_count(), 0, "所有槽位应该被释放");
 
-    println!(
-        "高并发压力测试: {} 成功, {} 失败",
-        success, fail
-    );
+    println!("高并发压力测试: {} 成功, {} 失败", success, fail);
 }
 
 // ============================================================================
@@ -755,7 +732,11 @@ async fn test_concurrent_pending_replacement() {
 
             // 尝试原子性替换
             use dashmap::mapref::entry::Entry;
-            let replaced = match registry_clone.as_ref().inner_mut().entry(project_id.to_string()) {
+            let replaced = match registry_clone
+                .as_ref()
+                .inner_mut()
+                .entry(project_id.to_string())
+            {
                 Entry::Occupied(mut entry) => {
                     // 只有 pending 才替换
                     // 提取状态值，避免借用冲突
@@ -917,4 +898,3 @@ fn debug_simple_registry_operations() {
     registry.remove_by_project("test-1");
     assert!(!registry.contains_project("test-1"));
 }
-

@@ -20,18 +20,14 @@ pub use types::system_prompt::DEFAULT_SYSTEM_PROMPT;
 pub use types::system_prompt::PromptBuilder;
 
 // Installer exports
-pub use installer::{AgentInstallationManager, AgentInstaller, InstallResult, InstallationError, NpmInstaller};
+pub use installer::{
+    AgentInstallationManager, AgentInstaller, InstallResult, InstallationError, NpmInstaller,
+};
 
 // Default configuration exports
 pub use config::default_agent_config::{
-    default_agent_servers,
-    default_agent_servers_for_service,
-    default_context_servers,
-    default_context_servers_for_service,
-    get_default_agent,
-    get_default_agent_for_service,
-    get_default_config_by_service_type,
-    get_default_context_server,
+    CLAUDE_CODE_ACP_AGENT_ID, default_agent_servers, default_agent_servers_for_service,
+    default_context_servers, default_context_servers_for_service, get_default_agent,
+    get_default_agent_for_service, get_default_config_by_service_type, get_default_context_server,
     get_default_context_server_for_service,
-    CLAUDE_CODE_ACP_AGENT_ID,
 };

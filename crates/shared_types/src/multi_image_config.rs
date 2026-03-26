@@ -43,14 +43,12 @@ pub struct GlobalImageDefaults {
 /// 镜像选择策略
 ///
 /// 当前只支持 ServiceOnly 策略，强制使用服务特定配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum ImageSelectionStrategy {
     /// 仅使用服务特定配置（强制明确指定服务类型）
     #[default]
     ServiceOnly,
 }
-
 
 /// 镜像缓存配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,11 +94,12 @@ impl MultiImageConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         // 验证全局默认配置
         if let Some(ref prefix) = self.global_defaults.registry_prefix
-            && prefix.trim().is_empty() {
-                return Err(ConfigError::ValidationError(
-                    "镜像仓库前缀不能为空".to_string(),
-                ));
-            }
+            && prefix.trim().is_empty()
+        {
+            return Err(ConfigError::ValidationError(
+                "镜像仓库前缀不能为空".to_string(),
+            ));
+        }
 
         // 验证缓存配置
         if self.cache_config.enabled {

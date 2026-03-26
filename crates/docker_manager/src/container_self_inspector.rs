@@ -281,7 +281,6 @@ impl ContainerSelfInspector {
 
 #[cfg(test)]
 mod tests {
-    
 
     #[tokio::test]
     async fn test_container_id_parsing() {

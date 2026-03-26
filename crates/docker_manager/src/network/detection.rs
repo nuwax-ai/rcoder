@@ -3,7 +3,7 @@
 //! 从 container_manager.rs 迁移的网络检测逻辑
 
 use crate::{DockerError, DockerResult, RCODER_NETWORK_BASE_NAME};
-use bollard::{query_parameters::InspectContainerOptions, Docker};
+use bollard::{Docker, query_parameters::InspectContainerOptions};
 use tracing::{debug, info, warn};
 
 /// 网络检测器
@@ -47,24 +47,25 @@ impl<'a> NetworkDetector<'a> {
 
         // 获取网络配置
         if let Some(network_settings) = inspect.network_settings
-            && let Some(networks) = network_settings.networks {
-                // 查找包含 "agent-network" 的网络
-                for network_name in networks.keys() {
-                    if network_name.contains(RCODER_NETWORK_BASE_NAME) {
-                        info!("动态检测到主网络: {}", network_name);
-                        return Ok(network_name.clone());
-                    }
+            && let Some(networks) = network_settings.networks
+        {
+            // 查找包含 "agent-network" 的网络
+            for network_name in networks.keys() {
+                if network_name.contains(RCODER_NETWORK_BASE_NAME) {
+                    info!("动态检测到主网络: {}", network_name);
+                    return Ok(network_name.clone());
                 }
+            }
 
-                // 如果没找到,返回错误
-                let available_networks: Vec<String> = networks.keys().cloned().collect();
-                return Err(DockerError::ConnectionError(format!(
-                    "当前容器未连接到包含 '{}' 的网络。\n\
+            // 如果没找到,返回错误
+            let available_networks: Vec<String> = networks.keys().cloned().collect();
+            return Err(DockerError::ConnectionError(format!(
+                "当前容器未连接到包含 '{}' 的网络。\n\
                      可用网络: {:?}\n\
                      请检查 Docker Compose 配置中的网络设置。",
-                    RCODER_NETWORK_BASE_NAME, available_networks
-                )));
-            }
+                RCODER_NETWORK_BASE_NAME, available_networks
+            )));
+        }
 
         Err(DockerError::ConnectionError(format!(
             "当前容器 (hostname: {}) 没有网络配置信息",

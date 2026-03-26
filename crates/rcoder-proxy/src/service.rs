@@ -85,21 +85,22 @@ fn mask_header_value(value: &str) -> String {
 fn mask_url(url: &str) -> String {
     // 尝试解析 URL
     if let Ok(parsed_url) = url::Url::parse(url)
-        && let Some(host) = parsed_url.host_str() {
-            let masked_host = mask_domain(host);
-            // 重新构建 URL，保留协议、端口、路径等
-            let scheme = parsed_url.scheme();
-            let port = parsed_url
-                .port()
-                .map(|p| format!(":{}", p))
-                .unwrap_or_default();
-            let path = parsed_url.path();
-            let query = parsed_url
-                .query()
-                .map(|q| format!("?{}", q))
-                .unwrap_or_default();
-            return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
-        }
+        && let Some(host) = parsed_url.host_str()
+    {
+        let masked_host = mask_domain(host);
+        // 重新构建 URL，保留协议、端口、路径等
+        let scheme = parsed_url.scheme();
+        let port = parsed_url
+            .port()
+            .map(|p| format!(":{}", p))
+            .unwrap_or_default();
+        let path = parsed_url.path();
+        let query = parsed_url
+            .query()
+            .map(|q| format!("?{}", q))
+            .unwrap_or_default();
+        return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
+    }
 
     // 如果解析失败，直接返回原始 URL（不应该发生）
     url.to_string()
@@ -637,7 +638,12 @@ impl ProxyHttp for PortProxy {
                 // ⚠️ 错误响应：提升到 WARN 级别，打印响应 headers
                 warn!(
                     "❌ [API_PROXY] 上游错误响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
-                    upstream_host, upstream_response.status, http_ver, ctx.use_tls, reused, duration
+                    upstream_host,
+                    upstream_response.status,
+                    http_ver,
+                    ctx.use_tls,
+                    reused,
+                    duration
                 );
                 // 打印上游响应 headers
                 for (name, value) in upstream_response.headers.iter() {
@@ -647,7 +653,12 @@ impl ProxyHttp for PortProxy {
             } else {
                 info!(
                     "📡 [API_PROXY] 上游响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
-                    upstream_host, upstream_response.status, http_ver, ctx.use_tls, reused, duration
+                    upstream_host,
+                    upstream_response.status,
+                    http_ver,
+                    ctx.use_tls,
+                    reused,
+                    duration
                 );
             }
         } else {
@@ -1031,9 +1042,16 @@ impl PortProxy {
 
         // 3. 从 ApiKeyManager 查询 API 密钥配置
         let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
-            warn!("🔑 [API_PROXY] 找不到服务 '{}' 的 API 密钥配置", service_name);
+            warn!(
+                "🔑 [API_PROXY] 找不到服务 '{}' 的 API 密钥配置",
+                service_name
+            );
             // 打印所有可用的 key 用于调试
-            let available_keys: Vec<_> = self.api_key_manager.iter().map(|r| r.key().clone()).collect();
+            let available_keys: Vec<_> = self
+                .api_key_manager
+                .iter()
+                .map(|r| r.key().clone())
+                .collect();
             warn!("🔑 [API_PROXY] 可用的 keys: {:?}", available_keys);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
                 format!(
@@ -1050,7 +1068,7 @@ impl PortProxy {
         debug!(
             "🔍 [API_PROXY_DEBUG] ====== DashMap 配置 (service={}) ======\n  base_url: {}\n  api_protocol: {:?}\n  requires_openai_auth: {}\n  api_key: {}",
             service_name,
-            base_url,  // 不脱敏，debug 模式下需要完整 URL 排查
+            base_url, // 不脱敏，debug 模式下需要完整 URL 排查
             config.api_protocol,
             config.requires_openai_auth,
             mask_header_value(&config.api_key),
@@ -1107,10 +1125,7 @@ impl PortProxy {
         };
 
         // 🔍 [DEBUG] 打印完整的上游 URL（不脱敏）
-        debug!(
-            "🔍 [API_PROXY_DEBUG] 上游完整 URL: {}",
-            new_uri_str
-        );
+        debug!("🔍 [API_PROXY_DEBUG] 上游完整 URL: {}", new_uri_str);
 
         let new_uri = new_uri_str.parse::<http::Uri>().map_err(|e| {
             error!("URI 解析失败: {} - {}", new_uri_str, e);
@@ -1589,10 +1604,11 @@ impl PingoraProxyService {
         if path.starts_with("/proxy/") {
             let parts: Vec<&str> = path.split('/').collect();
             if parts.len() >= 3
-                && let Ok(port) = parts[2].parse::<u16>() {
-                    debug!("从路径中提取端口: {}", port);
-                    return Ok(port);
-                }
+                && let Ok(port) = parts[2].parse::<u16>()
+            {
+                debug!("从路径中提取端口: {}", port);
+                return Ok(port);
+            }
         }
 
         // 2. 然后尝试从 URL 查询参数中获取端口 (向后兼容)
@@ -1600,10 +1616,11 @@ impl PingoraProxyService {
             for param in query.split('&') {
                 if let Some((key, value)) = param.split_once('=')
                     && key == self.config.port_param
-                        && let Ok(port) = value.parse::<u16>() {
-                            debug!("从 URL 参数中提取端口: {}", port);
-                            return Ok(port);
-                        }
+                    && let Ok(port) = value.parse::<u16>()
+                {
+                    debug!("从 URL 参数中提取端口: {}", port);
+                    return Ok(port);
+                }
             }
         }
 
