@@ -427,7 +427,7 @@ async fn validate_and_get_session_context(
             error!("[SSE_PROXY] Failed to get global DockerManager: {}", e);
             return Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
+                shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
                 "无法访问 Docker 服务，请联系管理员。",
             ));
         }
@@ -471,7 +471,10 @@ async fn validate_and_get_session_context(
                                 info.container_name
                             }
                             Ok(None) => {
-                                error!("[SSE_PROXY] 降级Query failed：容器不存在: user_id={}", user_id);
+                                error!(
+                                    "[SSE_PROXY] 降级Query failed：容器不存在: user_id={}",
+                                    user_id
+                                );
                                 return Err(create_error_response(
                                     StatusCode::NOT_FOUND,
                                     "CONTAINER_NOT_FOUND",
@@ -479,7 +482,10 @@ async fn validate_and_get_session_context(
                                 ));
                             }
                             Err(e) => {
-                                error!("[SSE_PROXY] 降级Query failed：Failed to query container: {}", e);
+                                error!(
+                                    "[SSE_PROXY] 降级Query failed：Failed to query container: {}",
+                                    e
+                                );
                                 return Err(create_error_response(
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     "CONTAINER_ERROR",
@@ -488,7 +494,10 @@ async fn validate_and_get_session_context(
                             }
                         }
                     } else {
-                        error!("[SSE_PROXY] ComputerAgentRunner 模式下缺少 user_id: session_id={}", session_id);
+                        error!(
+                            "[SSE_PROXY] ComputerAgentRunner 模式下缺少 user_id: session_id={}",
+                            session_id
+                        );
                         return Err(create_error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "INVALID_DATA",
@@ -581,13 +590,10 @@ async fn validate_and_get_session_context(
                 ));
             }
             Err(e) => {
-                error!(
-                    "❌ [SSE_PROXY] Docker API Query failed: {}",
-                    e
-                );
+                error!("❌ [SSE_PROXY] Docker API Query failed: {}", e);
                 return Err(create_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL_ERROR",
+                    shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
                     "检查会话状态时出错，请稍后重试。",
                 ));
             }

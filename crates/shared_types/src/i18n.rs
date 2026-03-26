@@ -69,9 +69,39 @@ pub fn get_locale() -> String {
 pub fn parse_accept_language(accept_language: Option<&str>) -> &'static str {
     match accept_language {
         Some(header) => {
-            // 解析 Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
-            for part in header.split(',') {
-                let lang = part.split(';').next().unwrap_or("").trim();
+            // 解析 Accept-Language，支持 q 权重（例如: zh-CN,zh;q=0.9,en;q=0.8）
+            let mut parts: Vec<(&str, f32, usize)> = header
+                .split(',')
+                .enumerate()
+                .map(|(idx, part)| {
+                    let mut lang = "";
+                    let mut q = 1.0_f32;
+
+                    for (i, seg) in part.split(';').enumerate() {
+                        let seg = seg.trim();
+                        if i == 0 {
+                            lang = seg;
+                            continue;
+                        }
+                        if let Some(value) = seg.strip_prefix("q=") {
+                            if let Ok(parsed) = value.parse::<f32>() {
+                                q = parsed.clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+
+                    (lang, q, idx)
+                })
+                .collect();
+
+            // 按 q 值降序，同权重按原始顺序
+            parts.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+
+            for (lang, _q, _idx) in parts {
                 // 尝试匹配完整语言标签
                 match lang {
                     // 简体中文
@@ -135,6 +165,11 @@ mod tests {
         // 带权重
         assert_eq!(parse_accept_language(Some("zh-CN,zh;q=0.9")), "zh-CN");
         assert_eq!(parse_accept_language(Some("en-US,en;q=0.9")), "en-US");
+        assert_eq!(parse_accept_language(Some("en;q=0.8,zh-TW;q=0.9")), "zh-TW");
+        assert_eq!(
+            parse_accept_language(Some("zh-CN;q=0.7,en-US;q=0.8")),
+            "en-US"
+        );
 
         // 繁体中文变体
         assert_eq!(parse_accept_language(Some("zh-HK")), "zh-TW");

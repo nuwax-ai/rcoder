@@ -5,7 +5,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
 };
 use chrono::Utc;
@@ -19,7 +19,13 @@ use tracing::{error, info, warn};
 
 use crate::http_server::router::AppState;
 use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
-use shared_types::{AgentStatus, HttpResult, SessionMessageType, UnifiedSessionMessage};
+use shared_types::{
+    AgentStatus, HttpResult, SessionMessageType, UnifiedSessionMessage,
+    error_codes::{ERR_INTERNAL_SERVER_ERROR, ERR_SESSION_NOT_FOUND},
+    get_i18n_message,
+};
+
+use super::locale_from_headers;
 
 /// 统一的 SSE 流类型
 type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
@@ -131,8 +137,10 @@ fn create_heartbeat_stream(
 )]
 pub async fn handle_computer_progress(
     State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Sse<SseStream>, (StatusCode, Json<HttpResult<String>>)> {
+    let locale = locale_from_headers(&headers);
     info!(
         "📡 [HTTP] Computer Agent 进度流订阅: session_id={}",
         session_id
@@ -159,9 +167,14 @@ pub async fn handle_computer_progress(
             warn!(" [HTTP] Session 不存在: session_id={}", session_id);
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(HttpResult::error(
-                    "SESSION_NOT_FOUND",
-                    &format!("Session {} not found", session_id),
+                Json(HttpResult::error_with_message(
+                    ERR_SESSION_NOT_FOUND,
+                    locale,
+                    &format!(
+                        "{}: {}",
+                        get_i18n_message("error.session_not_found", locale),
+                        session_id
+                    ),
                 )),
             ));
         }
@@ -177,9 +190,14 @@ pub async fn handle_computer_progress(
             );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HttpResult::error(
-                    "INTERNAL_ERROR",
-                    &format!("Failed to create session connection: {}", e),
+                Json(HttpResult::error_with_message(
+                    ERR_INTERNAL_SERVER_ERROR,
+                    locale,
+                    &format!(
+                        "{}: {}",
+                        get_i18n_message("error.internal_server_error", locale),
+                        e
+                    ),
                 )),
             ));
         }

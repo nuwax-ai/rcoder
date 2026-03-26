@@ -6,7 +6,10 @@ use std::time::Instant;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    http::Request,
+    middleware::Next,
     response::IntoResponse,
+    response::Response,
     routing::{get, post},
 };
 use serde::Serialize;
@@ -20,6 +23,18 @@ use crate::{
 use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+async fn locale_context_middleware(mut req: Request<axum::body::Body>, next: Next) -> Response {
+    let locale = shared_types::parse_accept_language(
+        req.headers()
+            .get("accept-language")
+            .and_then(|v| v.to_str().ok()),
+    );
+
+    req.extensions_mut().insert(locale);
+
+    shared_types::scope_request_locale(locale, async move { next.run(req).await }).await
+}
 
 /// 会话信息结构
 #[derive(Debug, Clone, Serialize)]
@@ -258,6 +273,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
                 next,
             )
         }))
+        .layer(axum::middleware::from_fn(locale_context_middleware))
 }
 
 /// Prometheus 指标处理器

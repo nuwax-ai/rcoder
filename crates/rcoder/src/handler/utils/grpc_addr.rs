@@ -4,6 +4,7 @@
 
 use crate::AppError;
 use shared_types::GRPC_DEFAULT_PORT;
+use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
 
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
 ///
@@ -27,12 +28,13 @@ pub fn extract_grpc_addr_with_port(service_url: &str, grpc_port: u16) -> Result<
         format!("http://{}", service_url)
     };
 
-    let url = url::Url::parse(&url_str)
-        .map_err(|e| AppError::internal_server_error(&format!("Invalid service_url: {}", e)))?;
+    let url = url::Url::parse(&url_str).map_err(|e| {
+        AppError::with_message(ERR_GRPC_ADDR_ERROR, format!("Invalid service_url: {}", e))
+    })?;
 
-    let host = url
-        .host_str()
-        .ok_or_else(|| AppError::internal_server_error("Invalid service_url: 缺少 host"))?;
+    let host = url.host_str().ok_or_else(|| {
+        AppError::with_i18n_key(ERR_GRPC_ADDR_ERROR, "error.grpc_service_url_missing_host")
+    })?;
 
     Ok(format!("{}:{}", host, grpc_port))
 }

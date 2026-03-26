@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use utoipa::ToSchema;
 
-use crate::error_codes::{get_error_message, ERR_INTERNAL_SERVER_ERROR};
+use crate::error_codes::{ERR_INTERNAL_SERVER_ERROR, SUCCESS, get_error_message};
+use crate::i18n::DEFAULT_LOCALE;
 
 /// 从当前 OpenTelemetry context 获取 trace_id
 fn get_trace_id_from_context() -> Option<String> {
@@ -37,8 +38,8 @@ pub struct HttpResult<T> {
 impl<T> HttpResult<T> {
     pub fn success(data: T) -> Self {
         HttpResult {
-            code: "0000".to_string(),
-            message: "成功".to_string(),
+            code: SUCCESS.to_string(),
+            message: get_error_message(SUCCESS, DEFAULT_LOCALE),
             data: Some(data),
             tid: get_trace_id_from_context(),
             success: true,
@@ -90,8 +91,8 @@ impl<T> HttpResult<T> {
     /// 创建成功响应（带多语言）
     pub fn success_with_locale(data: T, locale: &str) -> Self {
         HttpResult {
-            code: "0000".to_string(),
-            message: get_error_message("0000", locale),
+            code: SUCCESS.to_string(),
+            message: get_error_message(SUCCESS, locale),
             data: Some(data),
             tid: get_trace_id_from_context(),
             success: true,

@@ -6,6 +6,7 @@
 use crate::AppError;
 use anyhow::Result;
 use docker_manager::{ContainerBasicInfo, DockerManager};
+use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
 use tracing::{debug, error, info};
 
 /// 通用容器管理服务
@@ -45,7 +46,10 @@ impl ContainerManager {
             .await
             .map_err(|e| {
                 error!("[CONTAINER_MGR] Failed to get global DockerManager: {}", e);
-                AppError::internal_server_error(&format!("Failed to get global DockerManager: {}", e))
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to get global DockerManager: {}", e),
+                )
             })?;
 
         // 🚀 优化：直接调用 DockerManager 的高级 API
@@ -54,7 +58,10 @@ impl ContainerManager {
             .await
             .map_err(|e| {
                 error!("[CONTAINER_MGR] Failed to query container info: {}", e);
-                AppError::internal_server_error(&format!("Failed to query container info: {}", e))
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to query container info: {}", e),
+                )
             })
     }
 }
@@ -69,7 +76,10 @@ async fn ensure_container_exists(
         .await
         .map_err(|e| {
             error!("[CONTAINER_MGR] Failed to get global DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get global DockerManager: {}", e))
+            AppError::with_message(
+                ERR_CONTAINER_ERROR,
+                format!("Failed to get global DockerManager: {}", e),
+            )
         })?;
 
     // 1. 尝试获取现有容器
@@ -101,9 +111,12 @@ async fn create_container_for_request(
     request_resource_limits: Option<shared_types::ServiceResourceLimits>,
 ) -> Result<ContainerBasicInfo, AppError> {
     // 1. 准备工作目录（仍需在 rcoder 容器内创建）
-    create_project_workspace(project_id)
-        .await
-        .map_err(|e| AppError::internal_server_error(&format!("Failed to create workspace directory: {}", e)))?;
+    create_project_workspace(project_id).await.map_err(|e| {
+        AppError::with_message(
+            ERR_WORKSPACE_ERROR,
+            format!("Failed to create workspace directory: {}", e),
+        )
+    })?;
 
     info!(
         "📁 [CONTAINER_MGR] 项目工作区已准备: /app/project_workspace/{}",
@@ -123,7 +136,10 @@ async fn create_container_for_request(
         .await
         .map_err(|e| {
             error!("[CONTAINER_MGR] Failed to start container: {}", e);
-            AppError::internal_server_error(&format!("Failed to start container: {}", e))
+            AppError::with_message(
+                ERR_CONTAINER_ERROR,
+                format!("Failed to start container: {}", e),
+            )
         })?;
 
     info!(
@@ -153,14 +169,26 @@ pub async fn create_project_workspace(project_id: &str) -> Result<std::path::Pat
     tokio::fs::create_dir_all(&workspace_dir)
         .await
         .map_err(|e| {
-            error!("[CONTAINER_MGR] Failed to create workspace directory: {:?}", e);
-            AppError::internal_server_error(&format!("Failed to create workspace directory: {}", e))
+            error!(
+                "[CONTAINER_MGR] Failed to create workspace directory: {:?}",
+                e
+            );
+            AppError::with_message(
+                ERR_WORKSPACE_ERROR,
+                format!("Failed to create workspace directory: {}", e),
+            )
         })?;
 
     let project_dir = workspace_dir.join(project_id);
     tokio::fs::create_dir_all(&project_dir).await.map_err(|e| {
-        error!("[CONTAINER_MGR] Failed to create project directory: {:?}", e);
-        AppError::internal_server_error(&format!("Failed to create project directory: {}", e))
+        error!(
+            "[CONTAINER_MGR] Failed to create project directory: {:?}",
+            e
+        );
+        AppError::with_message(
+            ERR_WORKSPACE_ERROR,
+            format!("Failed to create project directory: {}", e),
+        )
     })?;
 
     Ok(project_dir)

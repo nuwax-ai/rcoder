@@ -22,7 +22,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 use utoipa::ToSchema;
 
+use super::utils::get_locale_from_headers;
 use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 
 /// VNC 桌面路径参数
@@ -161,25 +162,29 @@ const NOVNC_PORT: u16 = 6080;
 #[instrument(skip(_state), fields(user_id = %params.user_id, project_id = %params.project_id))]
 pub async fn computer_desktop_vnc(
     State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(params): Path<DesktopPathParams>,
 ) -> Result<HttpResult<DesktopAccessResponse>, AppError> {
+    let locale = get_locale_from_headers(&headers);
     let user_id = params.user_id.clone();
     let project_id = params.project_id.clone();
 
     // 1. 验证参数
     if user_id.trim().is_empty() {
         error!("[DESKTOP_VNC] user_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id is required",
+            locale,
+            &shared_types::get_i18n_message("error.user_id_required", locale),
         ));
     }
 
     if project_id.trim().is_empty() {
         error!("[DESKTOP_VNC] project_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required",
+            locale,
+            &shared_types::get_i18n_message("error.project_id_required", locale),
         ));
     }
 
@@ -195,9 +200,10 @@ pub async fn computer_desktop_vnc(
         Some(info) => info,
         None => {
             warn!("[DESKTOP_VNC] 找不到用户容器: user_id={}", user_id);
-            return Ok(HttpResult::error(
-                "NOT_FOUND",
-                &format!("找不到用户 {} 的容器，请先发送聊天请求创建容器", user_id),
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                locale,
+                &shared_types::get_i18n_message("error.container_not_found", locale),
             ));
         }
     };

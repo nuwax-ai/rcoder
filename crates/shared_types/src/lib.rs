@@ -7,7 +7,11 @@ mod model;
 
 // i18n 国际化模块
 pub mod i18n;
-pub use i18n::{t, t_default, parse_accept_language, set_locale, get_locale, DEFAULT_LOCALE, SUPPORTED_LOCALES};
+pub use i18n::{
+    DEFAULT_LOCALE, SUPPORTED_LOCALES, get_locale, parse_accept_language, set_locale, t, t_default,
+};
+pub mod request_locale;
+pub use request_locale::{current_request_locale, scope_request_locale};
 
 // Chat Agent 配置模块
 mod chat_agent_config;

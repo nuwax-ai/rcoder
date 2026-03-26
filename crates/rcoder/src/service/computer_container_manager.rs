@@ -16,6 +16,7 @@
 use crate::AppError;
 use crate::handler::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
 use docker_manager::ContainerBasicInfo;
+use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
@@ -60,7 +61,10 @@ impl ComputerContainerManager {
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
-                AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to get DockerManager: {}", e),
+                )
             })?;
 
         // 1. 尝试获取现有容器
@@ -130,7 +134,10 @@ impl ComputerContainerManager {
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
-                AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to get DockerManager: {}", e),
+                )
             })?;
 
         Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
@@ -166,7 +173,10 @@ impl ComputerContainerManager {
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to start container: {}", e);
-                AppError::internal_server_error(&format!("Failed to start container: {}", e))
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to start container: {}", e),
+                )
             })?;
 
         info!(
@@ -196,8 +206,14 @@ impl ComputerContainerManager {
         tokio::fs::create_dir_all(&workspace_root)
             .await
             .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to create workspace directory: {:?}", e);
-                AppError::internal_server_error(&format!("Failed to create workspace directory: {}", e))
+                error!(
+                    "[COMPUTER_CONTAINER] Failed to create workspace directory: {:?}",
+                    e
+                );
+                AppError::with_message(
+                    ERR_WORKSPACE_ERROR,
+                    format!("Failed to create workspace directory: {}", e),
+                )
             })?;
 
         // 创建用户目录
@@ -205,8 +221,14 @@ impl ComputerContainerManager {
         tokio::fs::create_dir_all(&user_workspace)
             .await
             .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to create user directory: {:?}", e);
-                AppError::internal_server_error(&format!("Failed to create user directory: {}", e))
+                error!(
+                    "[COMPUTER_CONTAINER] Failed to create user directory: {:?}",
+                    e
+                );
+                AppError::with_message(
+                    ERR_WORKSPACE_ERROR,
+                    format!("Failed to create user directory: {}", e),
+                )
             })?;
 
         debug!(
@@ -227,7 +249,10 @@ impl ComputerContainerManager {
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
-                AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to get DockerManager: {}", e),
+                )
             })?;
 
         docker_manager
@@ -235,7 +260,10 @@ impl ComputerContainerManager {
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to query container info: {}", e);
-                AppError::internal_server_error(&format!("Failed to query container info: {}", e))
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to query container info: {}", e),
+                )
             })
     }
 }

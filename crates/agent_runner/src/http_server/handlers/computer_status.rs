@@ -2,13 +2,22 @@
 //!
 //! 处理 POST /computer/agent/status 请求
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
-use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse, HttpResult};
+use shared_types::{
+    ComputerAgentStatusRequest, ComputerAgentStatusResponse, HttpResult,
+    error_codes::ERR_VALIDATION, get_i18n_message,
+};
+
+use super::locale_from_headers;
 
 /// 查询 Computer Agent 状态
 ///
@@ -26,8 +35,10 @@ use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse, Http
 )]
 pub async fn handle_computer_status(
     State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ComputerAgentStatusRequest>,
 ) -> Result<Json<HttpResult<ComputerAgentStatusResponse>>, (StatusCode, Json<HttpResult<String>>)> {
+    let locale = locale_from_headers(&headers);
     info!(
         "🔍 [HTTP] Computer Agent 状态查询: user_id={}, project_id={}",
         request.user_id, request.project_id
@@ -37,16 +48,21 @@ pub async fn handle_computer_status(
     if request.user_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(HttpResult::error("VALIDATION_ERROR", "user_id is required")),
+            Json(HttpResult::error_with_message(
+                ERR_VALIDATION,
+                locale,
+                &get_i18n_message("error.user_id_required", locale),
+            )),
         ));
     }
 
     if request.project_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(HttpResult::error(
-                "VALIDATION_ERROR",
-                "project_id is required",
+            Json(HttpResult::error_with_message(
+                ERR_VALIDATION,
+                locale,
+                &get_i18n_message("error.project_id_required", locale),
             )),
         ));
     }

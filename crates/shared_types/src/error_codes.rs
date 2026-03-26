@@ -187,3 +187,54 @@ pub fn get_error_description(code: &str) -> &'static str {
         _ => "未定义的错误码",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_error_codes_have_messages() {
+        let codes = [
+            SUCCESS,
+            ERR_AGENT_BUSY,
+            ERR_CANCEL_FAILED,
+            ERR_STOP_FAILED,
+            ERR_VALIDATION,
+            ERR_INVALID_PARAMS,
+            ERR_INVALID_RESOURCE_LIMITS,
+            ERR_CONTAINER_ERROR,
+            ERR_WORKSPACE_ERROR,
+            ERR_GRPC_ADDR_ERROR,
+            ERR_GRPC_ERROR,
+            ERR_SERVICE_UNAVAILABLE,
+            ERR_AGENT_ERROR,
+            ERR_PROXY_DISABLED,
+            ERR_PROXY_SERVICE_UNAVAILABLE,
+            ERR_UNKNOWN,
+            ERR_SESSION_NOT_FOUND,
+            ERR_AGENT_NOT_FOUND,
+            ERR_CONTAINER_NOT_FOUND,
+            ERR_HTTP_FALLBACK_FAILED,
+            ERR_INTERNAL_SERVER_ERROR,
+            ERR_RESUME_FAILED,
+            ERR_RETRY_EXHAUSTED,
+            ERR_TOO_MANY_REQUESTS,
+            ERR_API_KEY_AUTH_FAILED,
+        ];
+
+        for code in codes {
+            assert!(
+                !get_error_message(code, "en-US").is_empty(),
+                "missing en-US: {code}"
+            );
+            assert!(
+                !get_error_message(code, "zh-CN").is_empty(),
+                "missing zh-CN: {code}"
+            );
+            assert!(
+                !get_error_message(code, "zh-TW").is_empty(),
+                "missing zh-TW: {code}"
+            );
+        }
+    }
+}
