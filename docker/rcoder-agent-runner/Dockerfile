@@ -15,8 +15,7 @@ WORKDIR /home/user
 
 # agent-browser 默认配置（共享 Chromium profile）
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium-for-mcp \
-    AGENT_BROWSER_PROFILE=/home/user/.config/chromium \
-    AGENT_BROWSER_IDLE_TIMEOUT_MS=600000
+    AGENT_BROWSER_PROFILE=/home/user/.config/chromium
 
 
 # ============================================================================
