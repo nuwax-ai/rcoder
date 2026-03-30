@@ -13,8 +13,10 @@ FROM ${BASE_IMAGE}
 # 设置工作目录
 WORKDIR /home/user
 
-# 固定 agent-browser 默认浏览器路径，避免依赖 which 探测顺序
-ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+# agent-browser 默认配置（共享 Chromium profile）
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium-for-mcp \
+    AGENT_BROWSER_PROFILE=/home/user/.config/chromium \
+    AGENT_BROWSER_IDLE_TIMEOUT_MS=600000
 
 
 # ============================================================================

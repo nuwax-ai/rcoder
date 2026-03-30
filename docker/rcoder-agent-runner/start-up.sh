@@ -769,6 +769,9 @@ function start_display_and_desktop() {
 	echo "export CHROMIUM_USER_DATA_DIR='${CHROMIUM_USER_DATA_DIR}'" >> /etc/environment
 	echo "export CHROMIUM_USER_DATA_DIR='${CHROMIUM_USER_DATA_DIR}'" >> /etc/profile.d/chromium-env.sh
 
+	# 4.1 agent-browser 默认配置来自 Dockerfile ENV
+	log_success "agent-browser configured for shared profile: $AGENT_BROWSER_PROFILE"
+
 	# 5. 清理 Chromium profile 锁文件（SingletonLock）
 	if [ -d "$CHROMIUM_USER_DATA_DIR" ]; then
 		# 删除 SingletonLock 文件
