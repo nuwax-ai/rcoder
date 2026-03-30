@@ -165,7 +165,7 @@ async fn forward_cancel_request_to_container_service(
                 let error_msg = grpc_response
                     .message
                     .unwrap_or_else(|| "未知错误".to_string());
-                error!("[CANCEL_FORWARD] gRPC 取消失败: {}", error_msg);
+ error!("[CANCEL_FORWARD] gRPC cancelfailed: {}", error_msg);
                 Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CANCEL_FAILED,
                     locale,
@@ -173,7 +173,7 @@ async fn forward_cancel_request_to_container_service(
             }
         }
         Err(e) => {
-            error!("[CANCEL_FORWARD] gRPC 调用失败: {}", e);
+ error!("[CANCEL_FORWARD] gRPC message failed: {}", e);
 
             // 检查特定的 gRPC 错误码并分类处理
             if let Some(status) = crate::grpc::extract_grpc_status(&e) {
@@ -181,7 +181,7 @@ async fn forward_cancel_request_to_container_service(
                 match status.code() {
                     Code::NotFound => {
                         // 会话或 Agent 不存在，返回成功（幂等设计）
-                        info!("[CANCEL_FORWARD] session 不存在，幂等返回成功");
+ info!("[CANCEL_FORWARD] session not found, message succeeded");
                         return Ok(HttpResult::success(CancelResponse {
                             success: true,
                             session_id: session_id.unwrap_or("").to_string(),
@@ -194,7 +194,7 @@ async fn forward_cancel_request_to_container_service(
 
                         if !container_exists {
                             // 容器已销毁，取消目标已达成（幂等设计）
-                            info!("[CANCEL_FORWARD] 容器已销毁，取消目标已达成");
+ info!("[CANCEL_FORWARD] containeralreadydestroy, cancel message already message ");
                             return Ok(HttpResult::success(CancelResponse {
                                 success: true,
                                 session_id: session_id.unwrap_or("").to_string(),
@@ -212,7 +212,7 @@ async fn forward_cancel_request_to_container_service(
                     }
                     other_code => {
                         // 其他 gRPC 状态码
-                        error!("[CANCEL_FORWARD] gRPC 错误码: {:?}", other_code);
+ error!("[CANCEL_FORWARD] gRPC error message : {:?}", other_code);
                     }
                 }
             }

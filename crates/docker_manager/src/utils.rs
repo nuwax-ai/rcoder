@@ -10,7 +10,7 @@ impl DockerUtils {
         let arch = std::env::consts::ARCH;
         let os = std::env::consts::OS;
 
-        debug!("检测到系统架构: {} {}", os, arch);
+ debug!("detect message : {} {}", os, arch);
 
         match (os, arch) {
             // macOS ARM64
@@ -27,7 +27,7 @@ impl DockerUtils {
             (_, "arm64") => "linux/arm64",
             // 默认回退到 AMD64
             _ => {
-                debug!("未知架构 {} {}, 默认使用 linux/amd64", os, arch);
+ debug!("not message {} {}, default message linux/amd64", os, arch);
                 "linux/amd64"
             }
         }
@@ -38,13 +38,13 @@ impl DockerUtils {
     pub fn get_optimal_platform() -> String {
         // 优先使用环境变量
         if let Ok(platform) = std::env::var("DOCKER_DEFAULT_PLATFORM") {
-            debug!("使用环境变量配置的平台: {}", platform);
+ debug!(" message config message : {}", platform);
             return platform;
         }
 
         // 否则自动检测
         let detected = Self::auto_detect_platform();
-        debug!("自动检测到的平台: {}", detected);
+ debug!(" message detect message : {}", detected);
         detected
     }
 
@@ -69,7 +69,7 @@ impl DockerUtils {
         config.default_platform = Self::get_optimal_platform();
 
         // 🔍 调试日志：打印自动检测结果
-        debug!("DockerUtils::config_from_env 自动检测结果:");
+ debug!("DockerUtils::config_from_env message detect message :");
         debug!("  - default_platform: {}", config.default_platform);
         debug!("  - default_image: {}", config.default_image);
 

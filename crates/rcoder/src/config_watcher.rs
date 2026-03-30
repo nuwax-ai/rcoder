@@ -24,11 +24,11 @@
 //!
 //! match ConfigWatcher::new(config_path, api_key_config) {
 //!     Ok(watcher) => {
-//!         println!("配置监控已启动");
+//! println!("config message alreadystarted");
 //!         // watcher 必须保持存活,否则监控会停止
 //!     }
 //!     Err(e) => {
-//!         eprintln!("配置监控启动失败: {}", e);
+//! eprintln!("config message startedfailed: {}", e);
 //!     }
 //! }
 //! ```
@@ -82,7 +82,7 @@ impl ConfigWatcher {
 
         watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
 
-        info!("📁 [CONFIG_WATCHER] 开始监控配置文件: {:?}", config_path);
+ info!("📁 [CONFIG_WATCHER] starting message configfile: {:?}", config_path);
 
         // 克隆必要的数据以在 tokio 任务中使用
         let config_path_clone = config_path.clone();
@@ -103,7 +103,7 @@ impl ConfigWatcher {
                         )
                         .await
                         {
-                            warn!(" [CONFIG_WATCHER] 配置重载失败: {}", e);
+ warn!(" [CONFIG_WATCHER] config message failed: {}", e);
                         }
                     }
                 }
@@ -126,7 +126,7 @@ impl ConfigWatcher {
             Ok(new_config) => {
                 // 验证配置有效性
                 if new_config.enabled && new_config.api_key.trim().is_empty() {
-                    error!("[CONFIG_WATCHER] API Key 不能为空字符串");
+ error!("[CONFIG_WATCHER] API Key message empty message ");
                     return Err(anyhow::anyhow!("API Key 不能为空字符串"));
                 }
 
@@ -150,7 +150,7 @@ impl ConfigWatcher {
                 }
 
                 if key_changed {
-                    info!("[CONFIG_WATCHER] API Key 已更新");
+ info!("[CONFIG_WATCHER] API Key alreadyupdated");
                 }
 
                 if !old_enabled && !new_enabled && !key_changed {
@@ -158,11 +158,11 @@ impl ConfigWatcher {
                     return Ok(());
                 }
 
-                info!("[CONFIG_WATCHER] 配置热Update succeeded");
+ info!("[CONFIG_WATCHER] config message Update succeeded");
                 Ok(())
             }
             Err(e) => {
-                error!("[CONFIG_WATCHER] 解析配置文件失败: {}", e);
+ error!("[CONFIG_WATCHER] message configfilefailed: {}", e);
                 Err(e)
             }
         }

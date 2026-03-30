@@ -1111,7 +1111,7 @@ async fn create_sse_proxy_stream(
             }
         }
 
-        info!("[SSE_PROXY] SSE代理连接结束: session_id={}", session_id);
+ info!("[SSE_PROXY] SSEproxyconnection message : session_id={}", session_id);
     });
 
     ReceiverStream::new(rx)
@@ -1193,7 +1193,7 @@ async fn get_container_sse_url(
         // info.service_url 格式为 http://ip:8086
         let sse_url = format!("{}/agent/progress/{}", info.service_url, session_id);
 
-        info!("[CONTAINER] 获取容器SSE端点: {}", sse_url);
+ info!("[CONTAINER] getcontainerSSE message : {}", sse_url);
         Ok(sse_url)
     } else {
         Err(AppError::internal_server_error("Container info not found"))

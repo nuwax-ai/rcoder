@@ -24,7 +24,7 @@ impl ImageSelector {
     /// 创建新的镜像选择器
     pub fn new(config: MultiImageConfig) -> Self {
         let platform = DockerUtils::get_optimal_platform();
-        debug!("创建简化版镜像选择器，平台: {}", platform);
+ debug!("created message, message : {}", platform);
 
         Self { config, platform }
     }
@@ -77,7 +77,7 @@ impl ImageSelector {
         let service_key = service_type.to_string();
         match self.config.services.get(&service_key) {
             Some(service_config) => {
-                info!("获取服务配置成功: {}", service_key);
+ info!("get message configsucceeded: {}", service_key);
                 Ok(service_config.clone())
             }
             None => Err(DockerError::ConfigurationError(format!(
@@ -124,25 +124,25 @@ impl ImageSelector {
         if let Some(service_config) = self.config.services.get(&service_key) {
             // 服务级通用镜像（最高优先级）
             if let Some(image) = &service_config.image {
-                debug!("使用服务特定镜像: {}", image);
+ debug!(" message : {}", image);
                 return Ok(image.clone());
             }
 
             // 平台特定镜像
             if self.platform == "linux/arm64" {
                 if let Some(arm64_image) = &service_config.arm64_image {
-                    debug!("使用服务ARM64镜像: {}", arm64_image);
+ debug!(" message ARM64 message : {}", arm64_image);
                     return Ok(arm64_image.clone());
                 }
             } else if let Some(amd64_image) = &service_config.amd64_image {
-                debug!("使用服务AMD64镜像: {}", amd64_image);
+ debug!(" message AMD64 message : {}", amd64_image);
                 return Ok(amd64_image.clone());
             }
         }
 
         // 2. 使用全局默认配置
         if let Some(default_image) = &self.config.global_defaults.default_image {
-            debug!("使用全局默认镜像: {}", default_image);
+ debug!(" message default message : {}", default_image);
             return Ok(default_image.clone());
         }
 

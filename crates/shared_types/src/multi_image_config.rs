@@ -132,7 +132,7 @@ impl MultiImageConfig {
                     // 配置有效
                 }
                 crate::service_config::ConfigValidationResult::Warning(warning) => {
-                    tracing::warn!("服务 '{}' 配置警告: {}", service_key, warning);
+ tracing::warn!(" message '{}' config message : {}", service_key, warning);
                 }
                 crate::service_config::ConfigValidationResult::Error(error) => {
                     return Err(ConfigError::ValidationError(format!(
@@ -240,7 +240,7 @@ impl MultiImageConfig {
                 service_config.default_image = self.global_defaults.default_image.clone();
             }
 
-            tracing::debug!("应用全局默认配置到服务 '{}'", service_key);
+ tracing::debug!(" message defaultconfig message '{}'", service_key);
         }
     }
 

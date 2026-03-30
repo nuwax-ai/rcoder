@@ -71,34 +71,34 @@ async fn main() -> anyhow::Result<()> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     // 🔄 初始化宿主机路径解析器（自动检测模式）
-    info!("开始自动检测宿主机挂载路径...");
+ info!("starting message detect message mountpath...");
     let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH").unwrap_or_else(|_| {
-        info!("环境变量 DOCKER_SOCKET_PATH 未设置，使用默认值: /var/run/docker.sock");
+ info!(" message DOCKER_SOCKET_PATH not message, message default message : /var/run/docker.sock");
         "/var/run/docker.sock".to_string()
     });
 
-    info!("使用 Docker socket: {}", docker_socket_path);
+ info!(" message Docker socket: {}", docker_socket_path);
 
     let _path_resolver =
         match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone()))
             .await
         {
             Ok(resolver) => {
-                info!("宿主机路径解析器初始化成功");
+ info!(" message path message initializesucceeded");
                 info!(
                     "  容器内工作目录: {:?}",
                     resolver.container_workspace_base()
                 );
-                info!("  宿主机工作目录: {:?}", resolver.host_workspace_base());
+ info!(" message workdirectory: {:?}", resolver.host_workspace_base());
                 Some(resolver)
             }
             Err(e) => {
-                error!("宿主机路径解析器初始化失败: {}", e);
-                error!("请检查以下配置:");
-                error!("  1. Docker socket 路径是否正确: {}", docker_socket_path);
-                error!("  2. Docker socket 是否已挂载到容器");
-                error!("  3. 容器是否有权限访问 Docker API");
-                error!("  4. 项目工作目录是否正确挂载");
+ error!(" message path message initializefailed: {}", e);
+ error!(" message check message config:");
+ error!(" 1. Docker socket path message : {}", docker_socket_path);
+ error!(" 2. Docker socket message alreadymount message container");
+ error!(" 3. container message Docker API");
+ error!(" 4. projectworkdirectory message mount");
 
                 // 显示详细的错误信息和解决建议
                 show_docker_configuration_help(&docker_socket_path);
@@ -110,11 +110,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 🧹 启动时清理上次可能遗留的容器
     // 先使用正确配置初始化全局 DockerManager
-    info!("初始化 Docker Manager（使用应用配置）...");
+ info!("initialize Docker Manager( message config)...");
 
     // 从应用配置创建 DockerManagerConfig
     let docker_manager_config = if let Some(docker_config) = &config.docker_config {
-        info!("使用应用中的 Docker 配置，合并多镜像配置");
+ info!(" message Docker config, message config");
         let mut default_config = docker_manager::DockerManagerConfig::default();
 
         // 合并应用配置中的多镜像配置
@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
             docker_config.network_base_name
         );
         if let Some(ref network_base_name) = docker_config.network_base_name {
-            info!("使用配置中的网络基础名称: {}", network_base_name);
+ info!(" message config message : {}", network_base_name);
             default_config.network_base_name = network_base_name.clone();
         } else {
             info!(
@@ -147,26 +147,26 @@ async fn main() -> anyhow::Result<()> {
         // 🔧 应用超时配置
         if let Some(timeout) = docker_config.api_timeout_seconds {
             default_config.api_timeout_seconds = timeout;
-            info!("使用配置的 API 超时: {}秒", timeout);
+ info!(" message config message API timeout: {} message ", timeout);
         }
         if let Some(timeout) = docker_config.api_timeout_quick_seconds {
             default_config.api_timeout_quick_seconds = timeout;
-            info!("使用配置的快速操作超时: {}秒", timeout);
+ info!(" message config message timeout: {} message ", timeout);
         }
 
         // 🔧 应用缓存 TTL 配置
         if let Some(ttl) = docker_config.cache_status_ttl_seconds {
             default_config.cache_status_ttl_seconds = ttl;
-            info!("使用配置的状态缓存 TTL: {}秒", ttl);
+ info!(" message config message status message TTL: {} message ", ttl);
         }
         if let Some(ttl) = docker_config.cache_network_ttl_seconds {
             default_config.cache_network_ttl_seconds = ttl;
-            info!("使用配置的网络缓存 TTL: {}秒", ttl);
+ info!(" message config message TTL: {} message ", ttl);
         }
 
         default_config
     } else {
-        info!("⚠️  应用中无 Docker 配置，使用默认配置");
+ info!("⚠️ message Docker config, message defaultconfig");
         docker_manager::DockerManagerConfig::default()
     };
 
@@ -174,18 +174,18 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) =
         docker_manager::global::init_global_docker_manager_with_config(docker_manager_config).await
     {
-        error!("Docker Manager 初始化失败: {}", e);
+ error!("Docker Manager initializefailed: {}", e);
         return Err(anyhow::anyhow!("Docker Manager 初始化失败: {}", e));
     }
 
     // 获取初始化后的 DockerManager
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(dm) => {
-            info!("Docker Manager 初始化成功（使用应用配置）");
+ info!("Docker Manager initializesucceeded( message config)");
             dm
         }
         Err(e) => {
-            error!("获取 Docker Manager 失败: {}", e);
+ error!("get Docker Manager failed: {}", e);
             return Err(anyhow::anyhow!("获取 Docker Manager 失败: {}", e));
         }
     };
@@ -197,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
         shared_types::create_default_multi_image_config()
     };
 
-    info!("检查并清理上次可能遗留的容器（所有启用的服务）...");
+ info!("check message cleanup message container( message )...");
     if config.cleanup_config.enabled {
         match container_stop::startup_cleanup_all_enabled_services(
             &docker_manager,
@@ -214,12 +214,12 @@ async fn main() -> anyhow::Result<()> {
                         enabled_services.len()
                     );
                 } else {
-                    info!("未发现遗留容器，系统环境干净");
+ info!("not message container, message ");
                 }
 
                 // 如果有失败的清理（非409错误），记录警告
                 if result.failed_removals > 0 {
-                    warn!("部分容器清理失败: 失败数量={}", result.failed_removals);
+ warn!(" message containercleanupfailed: failed message ={}", result.failed_removals);
                     for failure in &result.failed_removals_details {
                         warn!(
                             "  - 容器 {} ({}): {}",
@@ -229,11 +229,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Err(e) => {
-                warn!("启动时容器清理失败: {}，但这不影响服务启动", e);
+ warn!("started message containercleanupfailed: {}, message started", e);
             }
         }
     } else {
-        info!("🚫 启动时容器清理已禁用（cleanup_config.enabled=false）");
+ info!("🚫 started message containercleanupalready message (cleanup_config.enabled=false)");
     }
 
     // 从配置文件读取清理配置
@@ -280,13 +280,13 @@ async fn main() -> anyhow::Result<()> {
         );
 
         // 添加调试日志
-        info!("🔧 [Pingora] 开始初始化 Pingora 配置...");
-        info!("🔧 [Pingora] 监听端口: {}", proxy_config.listen_port);
+ info!("🔧 [Pingora] startinginitialize Pingora config...");
+ info!("🔧 [Pingora] listenport: {}", proxy_config.listen_port);
         info!(
             "🔧 [Pingora] 默认后端端口: {}",
             proxy_config.default_backend_port
         );
-        info!("🔧 [Pingora] 后端主机: {}", proxy_config.backend_host);
+ info!("🔧 [Pingora] message : {}", proxy_config.backend_host);
 
         let pingora_config = ProxyConfig {
             listen_port: proxy_config.listen_port,
@@ -297,15 +297,15 @@ async fn main() -> anyhow::Result<()> {
             verbose: false,
         };
 
-        info!("[Pingora] Pingora 配置创建成功");
+ info!("[Pingora] Pingora configcreatedsucceeded");
 
         // 创建 Pingora 服务器管理器，并提取服务引用用于指标读取
-        info!("🔧 [Pingora] 创建 PingoraServerManager...");
+ info!("🔧 [Pingora] created PingoraServerManager...");
         let mut server_manager = PingoraServerManager::new(pingora_config)
             .with_api_key_config(Arc::clone(&api_key_config)); // 🆕 传递 API Key 配置
         let pingora_service = server_manager.service();
-        info!("[Pingora] PingoraServerManager 创建成功");
-        info!("🔒 [Pingora] API Key 鉴权配置已注入（支持热更新）");
+ info!("[Pingora] PingoraServerManager createdsucceeded");
+ info!("🔒 [Pingora] API Key message configalready message ( message updated)");
 
         // 启动健康检查循环（按配置）
         if proxy_config.health_check.enabled {
@@ -316,22 +316,22 @@ async fn main() -> anyhow::Result<()> {
             );
             pingora_service
                 .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
-            info!("[Pingora] 健康检查循环已启动");
+ info!("[Pingora] message check message alreadystarted");
         }
 
         // 启动 Pingora 服务器（如果启动失败，直接退出程序）
-        info!("[Pingora] 启动 Pingora 服务器...");
+ info!("[Pingora] started Pingora message ...");
         let (pingora_shutdown_tx, pingora_shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            info!("📍 [Pingora] 正在调用 server_manager.start()...");
+ info!("📍 [Pingora] message server_manager.start()...");
             if let Err(e) = server_manager.start(pingora_shutdown_rx).await {
-                error!("[Pingora] Pingora 代理服务器启动失败，程序退出: {:?}", e);
+ error!("[Pingora] Pingora proxy message startedfailed, message : {:?}", e);
                 std::process::exit(1);
             }
-            info!("[Pingora] Pingora 服务器正常退出");
+ info!("[Pingora] Pingora message ");
         });
 
-        info!("[Pingora] 后台任务已启动");
+ info!("[Pingora] message alreadystarted");
 
         (
             Some(handle),
@@ -339,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
             Some(pingora_shutdown_tx),
         )
     } else {
-        info!("⚠️  [Pingora] proxy_config 未配置，跳过 Pingora 启动");
+ info!("⚠️ [Pingora] proxy_config notconfig, skip Pingora started");
         (None, None, None)
     };
 
@@ -353,11 +353,11 @@ async fn main() -> anyhow::Result<()> {
     let _config_watcher =
         match crate::config_watcher::ConfigWatcher::new(config_path, Arc::clone(&api_key_config)) {
             Ok(watcher) => {
-                info!("配置文件监控已启动，支持 API Key 热更新");
+ info!("configfile message alreadystarted, message API Key message updated");
                 Some(watcher)
             }
             Err(e) => {
-                warn!(" 配置文件监控启动失败: {}，API Key 热更新将不可用", e);
+ warn!(" configfile message startedfailed: {}, API Key message updated message ", e);
                 None
             }
         };
@@ -378,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("清理任务启动失败: {}", e))?,
         )
     } else {
-        info!("🚫 容器清理功能已禁用（cleanup_config.enabled=false）");
+ info!("🚫 containercleanup message already message (cleanup_config.enabled=false)");
         None
     };
 
@@ -393,14 +393,14 @@ async fn main() -> anyhow::Result<()> {
     };
     let _status_checker_handle =
         start_container_status_checker(status_checker_config, state.clone());
-    info!("容器状态检查任务已启动（间隔: 30 秒，启用 Docker 主动查询和失败计数器）");
+ info!("containerstatuscheck message alreadystarted( message : 30 message, message Docker message failed message )");
 
     // 启动容器状态同步任务（定期检测被外部删除的容器）
     let container_sync_config = ContainerSyncConfig {
         sync_interval: Duration::from_secs(60), // 每 60 秒同步一次
     };
     let _container_sync_handle = start_container_sync_task(container_sync_config);
-    info!("容器状态同步任务已启动（间隔: 60 秒，检测外部删除的容器）");
+ info!("containerstatus message alreadystarted( message : 60 message, detect message container)");
 
     // 🆕 启动 VNC 后端同步任务（定期从 Docker 同步容器 IP 到 Pingora）
     if let Some(ref pingora_service) = state.pingora_service {
@@ -408,7 +408,7 @@ async fn main() -> anyhow::Result<()> {
             sync_interval: Duration::from_secs(5), // 每 5 秒同步一次
         };
         let _vnc_sync_handle = start_vnc_sync_task(pingora_service.clone(), vnc_sync_config);
-        info!("VNC 后端同步任务已启动（间隔: 5 秒，从 Docker 同步容器 IP）");
+ info!("VNC message alreadystarted( message : 5 message, message Docker message container IP)");
     }
 
     // 创建路由（传入遥测 guard 用于 /metrics 端点）
@@ -427,11 +427,11 @@ async fn main() -> anyhow::Result<()> {
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
     if let Some(proxy_config) = &config.proxy_config {
-        info!("Pingora 反向代理服务已启用");
-        info!("📡 监听端口: {}", proxy_config.listen_port);
-        info!("路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/3000/api/users");
-        info!("动态后端: 根据请求端口自动发现和代理后端服务");
-        info!("💡 示例:");
+ info!("Pingora message proxy message already message ");
+ info!("📡 listenport: {}", proxy_config.listen_port);
+ info!("route message : /proxy/{{port}}{{/path}} - message : /proxy/3000/api/users");
+ info!(" message : message requestport message proxy message ");
+ info!("💡 message :");
         info!(
             "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
             proxy_config.listen_port, config.port, config.port
@@ -448,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 启动服务器，支持优雅关闭
     // 使用自定义 Hyper 配置增加请求头大小限制（默认 8KB -> 128KB）
-    info!("🔧 配置 HTTP 服务器：max_buf_size = 128KB（解决 HTTP 431 错误）");
+ info!("🔧 config HTTP message : max_buf_size = 128KB( message HTTP 431 error)");
 
     let app = app.into_make_service();
     let mut shutdown_rx_clone = shutdown_tx.subscribe();
@@ -459,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 // 等待关闭信号
                 _ = shutdown_rx_clone.recv() => {
-                    info!("🛑 HTTP 服务器收到关闭信号");
+ info!("🛑 HTTP message closed message ");
                     break;
                 }
                 // 接受新连接
@@ -490,7 +490,7 @@ async fn main() -> anyhow::Result<()> {
                                                 if let Err(e) = http_builder.serve_connection(io, hyper_service).await {
                                                     if !e.to_string().contains("connection closed")
                                                        && !e.to_string().contains("early eof") {
-                                                        tracing::debug!("HTTP 连接错误 ({}): {}", addr, e);
+ tracing::debug!("HTTP connectionerror ({}): {}", addr, e);
                                                     }
                                                 }
                                             }
@@ -500,13 +500,13 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::error!("服务未就绪: {}", e);
+ tracing::error!(" message not message : {}", e);
                                     }
                                 }
                             });
                         }
                         Err(e) => {
-                            error!("接受连接失败: {}", e);
+ error!(" message connectionfailed: {}", e);
                         }
                     }
                 }
@@ -528,9 +528,9 @@ async fn main() -> anyhow::Result<()> {
 
 /// 显示 Docker 配置帮助信息
 fn show_docker_configuration_help(socket_path: &str) {
-    error!("📋 Docker 配置帮助:");
+ error!("📋 Docker config message :");
     error!("");
-    error!("请确保您的 docker-compose.yml 包含以下配置:");
+ error!(" message docker-compose.yml message config:");
     error!("");
     error!("services:");
     error!("  rcoder:");
@@ -540,21 +540,21 @@ fn show_docker_configuration_help(socket_path: &str) {
     error!("      - {}:/var/run/docker.sock:ro", socket_path);
     error!("      - ./data/rcoder/project_workspace:/app/project_workspace");
     error!("");
-    error!("🔧 常见 Docker socket 路径:");
-    error!("  Linux 系统: /var/run/docker.sock");
+ error!("🔧 message Docker socket path:");
+ error!(" Linux message : /var/run/docker.sock");
     error!("  macOS + Docker Desktop: /var/run/docker.sock");
     error!("  Rootless Docker: /run/user/$UID/docker.sock");
     error!("");
-    error!("🛠️ 故障排除步骤:");
-    error!("  1. 检查 Docker 是否正在运行: docker ps");
-    error!("  2. 验证 socket 文件存在: ls -l {}", socket_path);
-    error!("  3. 检查权限: groups $USER | grep docker");
+ error!("🛠️ message :");
+ error!(" 1. check Docker message : docker ps");
+ error!(" 2. message socket fileexists: ls -l {}", socket_path);
+ error!(" 3. check message : groups $USER | grep docker");
     error!(
         "  4. 测试 Docker API: curl --unix-socket {} http://localhost/info",
         socket_path
     );
     error!("");
-    error!("如果问题持续存在，请查看 rcoder 容器日志获取更多详细信息。");
+ error!(" message exists, message rcoder container message get message .");
 }
 
 /// 设置信号处理器
@@ -580,20 +580,20 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
                     tokio::select! {
                         _ = sigint.recv() => {
                             if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
-                                info!("收到 SIGINT (Ctrl+C) 信号，开始优雅关闭...");
+ info!(" message SIGINT (Ctrl+C) message, startinggracefulclosed...");
                                 let _ = shutdown_tx_clone.send(());
                             }
                         }
                         _ = sigterm.recv() => {
                             if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
-                                info!("收到 SIGTERM 信号，开始优雅关闭...");
+ info!(" message SIGTERM message, startinggracefulclosed...");
                                 let _ = shutdown_tx_clone.send(());
                             }
                         }
                     }
                 }
                 (Err(e), _) | (_, Err(e)) => {
-                    warn!(" Unix 信号处理器注册失败: {}，将依赖其他关闭机制", e);
+ warn!(" Unix message failed: {}, message closed message ", e);
                     // 注册失败不影响程序运行，仍可通过其他方式关闭（如 tokio::signal::ctrl_c）
                 }
             }
@@ -608,7 +608,7 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
 
             if let Ok(()) = signal::ctrl_c().await {
                 if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
-                    info!("收到 Ctrl+C 信号，开始优雅关闭...");
+ info!(" message Ctrl+C message, startinggracefulclosed...");
                     let _ = shutdown_tx_clone.send(());
                 }
             }
@@ -623,21 +623,21 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) 
     // 等待关闭信号
     let _ = shutdown_rx.recv().await;
 
-    info!("开始优雅关闭流程...");
+ info!("startinggracefulclosed message ...");
 
     // 执行容器清理
     if let Err(e) = cleanup_all_containers().await {
-        error!("容器清理失败: {}", e);
+ error!("containercleanupfailed: {}", e);
     } else {
-        info!("容器清理完成");
+ info!("containercleanupcompleted");
     }
 
-    info!("🛑 RCoder 服务优雅关闭完成");
+ info!("🛑 RCoder message gracefulclosedcompleted");
 }
 
 /// 清理所有动态创建的容器
 async fn cleanup_all_containers() -> anyhow::Result<()> {
-    info!("🧹 开始清理所有动态创建的容器...");
+ info!("🧹 startingcleanup message created message container...");
 
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
@@ -661,11 +661,11 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
             }
 
             if result.failed_removals > 0 {
-                warn!("部分容器清理失败: 失败数量={}", result.failed_removals);
+ warn!(" message containercleanupfailed: failed message ={}", result.failed_removals);
             }
         }
         Err(e) => {
-            warn!("查找孤立容器时出错: {}", e);
+ warn!(" message container message : {}", e);
         }
     }
 

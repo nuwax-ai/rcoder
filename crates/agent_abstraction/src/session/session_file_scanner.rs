@@ -103,7 +103,7 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
 
     // 使用异步 I/O 遍历目录
     let Ok(mut dir_entries) = tokio::fs::read_dir(&projects_dir).await else {
-        warn!("🔍 [文件扫描] 无法读取项目目录: {}", projects_dir.display());
+ warn!("🔍 [file message ] unable to message projectdirectory: {}", projects_dir.display());
         return session_ids;
     };
 
@@ -117,7 +117,7 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
             .starts_with(encoded_path.as_str())
         {
             let Ok(mut files) = tokio::fs::read_dir(entry.path()).await else {
-                warn!("🔍 [文件扫描] 无法读取会话目录: {}", entry.path().display());
+ warn!("🔍 [file message ] unable to message sessiondirectory: {}", entry.path().display());
                 continue;
             };
 
@@ -166,7 +166,7 @@ async fn invalidate_project_cache(project_dir_name: &str) {
 pub fn start_file_watcher() {
     // 确保只启动一次
     if WATCHER_STARTED.swap(true, Ordering::SeqCst) {
-        debug!("[文件监听] 监听器已在运行");
+ debug!("[filelisten] listen message already message ");
         return;
     }
 
@@ -175,7 +175,7 @@ pub fn start_file_watcher() {
     // 创建目录（如果不存在）
     if !projects_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&projects_dir) {
-            warn!("[文件监听] 无法创建 projects 目录: {}", e);
+ warn!("[filelisten] unable tocreated projects directory: {}", e);
             WATCHER_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -198,7 +198,7 @@ pub fn start_file_watcher() {
                     match event.kind {
                         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
                             if let Err(e) = tx.blocking_send(event) {
-                                error!("[文件监听] 发送事件失败: {}", e);
+ error!("[filelisten] send message failed: {}", e);
                             }
                         }
                         _ => {}
@@ -206,7 +206,7 @@ pub fn start_file_watcher() {
                 }
             }
             Err(e) => {
-                error!("[文件监听] 监听错误: {}", e);
+ error!("[filelisten] listenerror: {}", e);
             }
         }
     });
@@ -214,7 +214,7 @@ pub fn start_file_watcher() {
     let mut watcher = match watcher_result {
         Ok(w) => w,
         Err(e) => {
-            error!("[文件监听] 创建监听器失败: {}", e);
+ error!("[filelisten] createdlisten message failed: {}", e);
             WATCHER_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -222,7 +222,7 @@ pub fn start_file_watcher() {
 
     // 开始监听目录
     if let Err(e) = watcher.watch(&projects_dir, RecursiveMode::Recursive) {
-        error!("[文件监听] 监听目录失败: {}", e);
+ error!("[filelisten] listendirectoryfailed: {}", e);
         WATCHER_STARTED.store(false, Ordering::SeqCst);
         return;
     }
@@ -233,7 +233,7 @@ pub fn start_file_watcher() {
         *guard = Some(watcher);
     }
 
-    info!("👁️ [文件监听] 开始监听目录: {}", projects_dir.display());
+ info!("👁️ [filelisten] startinglistendirectory: {}", projects_dir.display());
 
     // 启动异步任务处理事件（带防抖）
     tokio::spawn(async move {
@@ -256,7 +256,7 @@ pub fn start_file_watcher() {
                             debounce_timer = Some(tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS));
                         }
                         None => {
-                            warn!("[文件监听] 事件接收通道已关闭");
+ warn!("[filelisten] message receive message alreadyclosed");
                             break;
                         }
                     }
@@ -286,7 +286,7 @@ pub fn start_file_watcher() {
         }
     });
 
-    info!("[文件监听] 监听器启动完成");
+ info!("[filelisten] listen message startedcompleted");
 }
 
 /// 停止文件系统监听器
@@ -301,7 +301,7 @@ pub fn stop_file_watcher() {
         *guard = None;
     }
 
-    info!("🛑 [文件监听] 监听器已停止");
+ info!("🛑 [filelisten] listen message alreadystopped");
 }
 
 /// 通过文件扫描检查 session 是否存在（带缓存）
@@ -334,9 +334,9 @@ pub async fn check_session_file_exists(session_id: &str, project_path: &str) -> 
     cache.insert(project_path.to_string(), session_ids).await;
 
     if exists {
-        info!("[文件扫描] 找到 session 文件: {}", session_id);
+ info!("[file message ] message session file: {}", session_id);
     } else {
-        debug!("[文件扫描] 未找到 session 文件: {}", session_id);
+ debug!("[file message ] not message session file: {}", session_id);
     }
 
     exists

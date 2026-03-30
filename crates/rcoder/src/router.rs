@@ -100,7 +100,7 @@ impl AppState {
     #[inline]
     pub fn insert_project(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) {
         if let Err(e) = self.projects.insert(project_id.clone(), info) {
-            tracing::error!("插入项目 {} 失败: {}", project_id, e);
+ tracing::error!(" message project {} failed: {}", project_id, e);
         }
     }
 

@@ -113,12 +113,12 @@ pub async fn debug_sql_query(
     let locale = get_locale_from_headers(&headers);
     let start_time = std::time::Instant::now();
 
-    debug!("[DEBUG_SQL] 执行查询: {}", request.sql);
+ debug!("[DEBUG_SQL] message : {}", request.sql);
 
     // 安全检查：Only SELECT queries are allowed
     let sql_trimmed = request.sql.trim().to_uppercase();
     if !sql_trimmed.starts_with("SELECT") {
-        warn!("[DEBUG_SQL] 拒绝非 SELECT 查询: {}", request.sql);
+ warn!("[DEBUG_SQL] message SELECT message : {}", request.sql);
         return HttpResult::error_with_message(
             ERR_INVALID_PARAMS,
             locale,

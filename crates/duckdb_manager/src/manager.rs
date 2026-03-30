@@ -47,7 +47,7 @@ impl DuckDbManager {
         SchemaInitializer::initialize(&self.conn)?;
         *initialized = true;
 
-        tracing::info!("DuckDB Manager 初始化完成");
+ tracing::info!("DuckDB Manager initialized");
         Ok(())
     }
 

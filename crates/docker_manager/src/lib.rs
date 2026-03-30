@@ -185,7 +185,7 @@ pub mod global {
             ))
         })?;
 
-        info!("全局 DockerManager 初始化成功");
+ info!(" message DockerManager initializesucceeded");
         Ok(())
     }
 
@@ -202,7 +202,7 @@ pub mod global {
             ))
         })?;
 
-        info!("全局 DockerManager 初始化成功（自定义配置）");
+ info!(" message DockerManager initializesucceeded( message config)");
         Ok(())
     }
 
@@ -210,7 +210,7 @@ pub mod global {
     /// 如果未初始化，会自动初始化
     pub async fn get_global_docker_manager() -> DockerResult<Arc<DockerManager>> {
         if GLOBAL_DOCKER_MANAGER.get().is_none() {
-            debug!("全局 DockerManager 未初始化，开始自动初始化");
+ debug!(" message DockerManager notinitialize, starting message initialize");
             init_global_docker_manager().await?;
         }
 

@@ -37,7 +37,7 @@ impl ContainerSelfInspector {
     /// # }
     /// ```
     pub async fn new(docker_socket_path: &str) -> Result<Self> {
-        info!("初始化容器自检测器，Docker socket: {}", docker_socket_path);
+ info!("initializecontainer message detect message, Docker socket: {}", docker_socket_path);
 
         // 创建 Docker 客户端
         let docker_client =
@@ -50,14 +50,14 @@ impl ContainerSelfInspector {
             .await
             .context("测试 Docker 连接失败，请检查 socket 路径和权限")?;
 
-        info!("Docker 连接成功");
+ info!("Docker connectionsucceeded");
 
         // 获取当前容器ID
         let container_id = Self::get_current_container_id()
             .await
             .context("获取当前容器ID失败")?;
 
-        info!("检测到当前容器ID: {}", container_id);
+ info!("detect message containerID: {}", container_id);
 
         Ok(Self {
             docker_client,
@@ -80,12 +80,12 @@ impl ContainerSelfInspector {
     /// # async fn example() -> anyhow::Result<()> {
     /// # let inspector = ContainerSelfInspector::new("/var/run/docker.sock").await?;
     /// let host_path = inspector.detect_host_path_for_container_dir("/app/project_workspace").await?;
-    /// println!("宿主机路径: {:?}", host_path);
+ /// println!(" message path: {:?}", host_path);
     /// # Ok(())
     /// # }
     /// ```
     pub async fn detect_host_path_for_container_dir(&self, container_path: &str) -> Result<String> {
-        info!("检测路径 {} 对应的宿主机路径", container_path);
+ info!("detectpath {} message path", container_path);
 
         // 获取容器详细信息
         let inspect_result = self
@@ -104,7 +104,7 @@ impl ContainerSelfInspector {
 
         // 解析挂载信息
         if let Some(mounts) = inspect_result.mounts {
-            debug!("容器共有 {} 个挂载点", mounts.len());
+ debug!("container message {} message mount message ", mounts.len());
 
             for (index, mount) in mounts.iter().enumerate() {
                 let mount_destination = mount
@@ -128,13 +128,13 @@ impl ContainerSelfInspector {
                         .ok_or_else(|| anyhow!("挂载点 {} 没有 source 字段", index))?
                         .clone();
 
-                    info!("找到匹配的挂载点: {} -> {}", container_path, host_path);
+ info!(" message mount message : {} -> {}", container_path, host_path);
                     return Ok(host_path);
                 }
             }
 
             // 如果没找到，列出所有挂载点供调试
-            warn!("未找到路径 {} 的挂载信息，可用的挂载点:", container_path);
+ warn!("not message path {} message mount message, message mount message :", container_path);
             for (index, mount) in mounts.iter().enumerate() {
                 if let (Some(dest), Some(source)) = (&mount.destination, &mount.source) {
                     warn!("  {}: {} -> {}", index, dest, source);
@@ -154,18 +154,18 @@ impl ContainerSelfInspector {
     /// # Returns
     /// * `Result<String>` - 容器ID或错误
     async fn get_current_container_id() -> Result<String> {
-        debug!("开始获取当前容器ID");
+ debug!("startingget message containerID");
 
         let cgroup_content = fs::read_to_string("/proc/self/cgroup")
             .await
             .with_context(|| "读取 /proc/self/cgroup 文件失败")?;
 
-        debug!("cgroup 文件内容: {}", cgroup_content);
+ debug!("cgroup file message : {}", cgroup_content);
 
         // 解析 cgroup 文件获取容器ID
         // 格式示例: 12:perf_event:/docker/abc123def456...
         for line in cgroup_content.lines() {
-            debug!("解析 cgroup 行: {}", line);
+ debug!(" message cgroup message : {}", line);
 
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() >= 3 {
@@ -173,7 +173,7 @@ impl ContainerSelfInspector {
 
                 // 检查是否是 Docker 容器
                 if cgroup_path.contains("/docker/") || cgroup_path.contains(".scope") {
-                    debug!("找到 Docker 相关的 cgroup: {}", cgroup_path);
+ debug!(" message Docker message cgroup: {}", cgroup_path);
 
                     // 提取容器ID
                     let container_id = if cgroup_path.contains("/docker/") {
@@ -202,24 +202,24 @@ impl ContainerSelfInspector {
                     if container_id.len() == 64
                         && container_id.chars().all(|c| c.is_ascii_hexdigit())
                     {
-                        info!("成功解析容器ID: {}", container_id);
+ info!("succeeded message containerID: {}", container_id);
                         return Ok(container_id);
                     } else {
-                        debug!("跳过无效的容器ID: {}", container_id);
+ debug!("skip message containerID: {}", container_id);
                     }
                 }
             }
         }
 
         // 如果 cgroup 方法失败，尝试其他方法
-        warn!("通过 cgroup 无法获取容器ID，尝试其他方法");
+ warn!(" message cgroup unable togetcontainerID, message ");
 
         // 方法2：尝试读取 /proc/1/cgroup（主进程）
         if let Ok(cgroup_content) = fs::read_to_string("/proc/1/cgroup").await {
-            debug!("尝试读取 /proc/1/cgroup");
+ debug!(" message /proc/1/cgroup");
             for line in cgroup_content.lines() {
                 if line.contains("/docker/") || line.contains(".scope") {
-                    debug!("在 /proc/1/cgroup 中找到: {}", line);
+ debug!(" message /proc/1/cgroup message : {}", line);
                     // 类似的解析逻辑...
                 }
             }
@@ -227,10 +227,10 @@ impl ContainerSelfInspector {
 
         // 方法3：尝试读取主机名（某些环境容器ID会作为主机名）
         if let Ok(hostname) = std::env::var("HOSTNAME") {
-            debug!("检查 HOSTNAME 环境变量: {}", hostname);
+ debug!("check HOSTNAME message : {}", hostname);
             if hostname.len() == 12 && hostname.chars().all(|c| c.is_ascii_hexdigit()) {
                 // 可能是短格式的容器ID（前12位）
-                info!("从 HOSTNAME 获取到容器ID前缀: {}", hostname);
+ info!(" message HOSTNAME get message containerID message : {}", hostname);
                 return Ok(hostname);
             }
         }
@@ -247,7 +247,7 @@ impl ContainerSelfInspector {
             .ping()
             .await
             .context("Docker socket 连接测试失败")?;
-        info!("Docker socket 连接验证成功");
+ info!("Docker socket connection message succeeded");
         Ok(())
     }
 

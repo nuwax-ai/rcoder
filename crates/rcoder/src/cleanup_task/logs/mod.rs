@@ -43,7 +43,7 @@ impl LogCleaner {
 
         // 检查是否是目录
         if !log_path.is_dir() {
-            warn!("📋 [log_cleaner] 路径不是目录，跳过清理: {}", self.log_dir);
+ warn!("📋 [log_cleaner] path message directory, skipcleanup: {}", self.log_dir);
             return Ok(LogCleanupStats::default());
         }
 
@@ -57,7 +57,7 @@ impl LogCleaner {
         let cutoff_time = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => duration.as_secs(),
             Err(e) => {
-                warn!("📋 [log_cleaner] 系统时间异常，跳过清理: {}", e);
+ warn!("📋 [log_cleaner] message, skipcleanup: {}", e);
                 return Ok(LogCleanupStats::default());
             }
         };
@@ -67,7 +67,7 @@ impl LogCleaner {
         let mut entries = match fs::read_dir(log_path).await {
             Ok(entries) => entries,
             Err(e) => {
-                warn!("📋 [log_cleaner] 读取日志目录失败: {}", e);
+ warn!("📋 [log_cleaner] message directoryfailed: {}", e);
                 return Ok(LogCleanupStats::default());
             }
         };
@@ -78,7 +78,7 @@ impl LogCleaner {
             let metadata = match entry.metadata().await {
                 Ok(m) => m,
                 Err(e) => {
-                    debug!("📋 [log_cleaner] 获取文件元数据失败: {:?} - {}", path, e);
+ debug!("📋 [log_cleaner] getfile message failed: {:?} - {}", path, e);
                     continue;
                 }
             };
@@ -87,7 +87,7 @@ impl LogCleaner {
             let modified = match metadata.modified() {
                 Ok(time) => time,
                 Err(e) => {
-                    debug!("📋 [log_cleaner] 获取修改时间失败: {:?} - {}", path, e);
+ debug!("📋 [log_cleaner] get message failed: {:?} - {}", path, e);
                     continue;
                 }
             };
@@ -96,7 +96,7 @@ impl LogCleaner {
             let modified_secs = match modified.duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => duration.as_secs(),
                 Err(_) => {
-                    debug!("📋 [log_cleaner] 修改时间无效，跳过: {:?}", path);
+ debug!("📋 [log_cleaner] message, skip: {:?}", path);
                     continue;
                 }
             };
@@ -119,7 +119,7 @@ impl LogCleaner {
                         }
                         Err(e) => {
                             stats.failed_deletions += 1;
-                            warn!("📋 [log_cleaner] 删除文件失败: {:?} - {}", path, e);
+ warn!("📋 [log_cleaner] message filefailed: {:?} - {}", path, e);
                         }
                     }
                 } else if metadata.is_dir() {
@@ -127,11 +127,11 @@ impl LogCleaner {
                     match fs::remove_dir_all(&path).await {
                         Ok(_) => {
                             stats.dirs_deleted += 1;
-                            debug!("🗑️ [log_cleaner] 删除过期目录: {:?}", path);
+ debug!("🗑️ [log_cleaner] message directory: {:?}", path);
                         }
                         Err(e) => {
                             stats.failed_deletions += 1;
-                            warn!("📋 [log_cleaner] 删除目录失败: {:?} - {}", path, e);
+ warn!("📋 [log_cleaner] message directoryfailed: {:?} - {}", path, e);
                         }
                     }
                 }
@@ -146,7 +146,7 @@ impl LogCleaner {
                 stats.bytes_freed as f64 / 1024.0 / 1024.0
             );
         } else {
-            info!("[log_cleaner] 没有过期日志需要清理");
+ info!("[log_cleaner] message cleanup");
         }
 
         Ok(stats)
@@ -237,7 +237,7 @@ mod tests {
             let file_path = log_dir.join(filename);
             if let Err(e) = filetime::set_file_mtime(&file_path, old_time.into()) {
                 // 系统不支持设置修改时间，跳过此测试
-                println!("系统不支持设置修改时间，跳过测试: {}", e);
+ println!(" message, skip message : {}", e);
                 return;
             }
         }

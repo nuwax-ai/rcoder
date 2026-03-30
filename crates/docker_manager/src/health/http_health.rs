@@ -54,7 +54,7 @@ impl HttpHealthChecker {
             health_path.unwrap_or("health").trim_start_matches('/')
         );
 
-        info!("等待服务启动: {}", health_url);
+ info!(" message started: {}", health_url);
 
         for attempt in 0..self.max_attempts {
             match timeout(
@@ -64,7 +64,7 @@ impl HttpHealthChecker {
             .await
             {
                 Ok(Ok(response)) if response.status().is_success() => {
-                    info!("服务已就绪");
+ info!(" message already message ");
                     return Ok(());
                 }
                 Ok(Ok(response)) => {

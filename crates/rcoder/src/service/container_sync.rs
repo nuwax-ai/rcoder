@@ -56,11 +56,11 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
                             checked, removed
                         );
                     } else {
-                        info!("[CONTAINER_SYNC] 同步完成: 检查={}, 无需移除", checked);
+ info!("[CONTAINER_SYNC] message completed: check={}, message removed", checked);
                     }
                 }
                 Err(e) => {
-                    warn!("[CONTAINER_SYNC] 同步失败: {}", e);
+ warn!("[CONTAINER_SYNC] message failed: {}", e);
                 }
             }
         }

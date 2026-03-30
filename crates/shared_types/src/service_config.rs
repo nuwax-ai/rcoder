@@ -235,7 +235,7 @@ impl ServiceImageConfig {
                 .clone()
                 .or_else(|| self.default_image.clone()),
             _ => {
-                tracing::warn!("未知的平台 '{}，使用默认镜像", platform);
+ tracing::warn!("not message '{}, message default message ", platform);
                 self.default_image.clone()
             }
         }

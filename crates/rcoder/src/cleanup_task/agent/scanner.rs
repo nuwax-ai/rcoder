@@ -34,7 +34,7 @@ impl AgentScanner {
         let mut idle_agents = Vec::new();
         let current_time = Utc::now();
 
-        info!("[scanner] 开始扫描闲置 agent");
+ info!("[scanner] starting message agent");
 
         // 收集所有项目 ID
         let project_ids: Vec<String> = self.state.projects.iter().map(|(id, _)| id).collect();
@@ -63,19 +63,19 @@ impl AgentScanner {
         let status = agent.status();
         match status {
             Some(AgentStatus::Idle) => {
-                debug!("[scanner] 状态=Idle: {}", agent.project_id());
+ debug!("[scanner] status=Idle: {}", agent.project_id());
             }
             Some(AgentStatus::Pending) | Some(AgentStatus::Active) => {
                 // 🔧 修复：即使是 Active/Pending 状态，也要检查是否真的活跃
                 // 如果状态卡住（比如 gRPC 服务异常），仍需要清理
-                debug!("⏸️ [scanner] 状态={:?}，需要进一步检查", status);
+ debug!("⏸️ [scanner] status={:?}, message check", status);
                 // 继续检查，不要直接返回 false
             }
             None => {
                 // 状态为 None，检查保护期
                 let age = current_time - agent.created_at();
                 if age.num_seconds() < self.config.container_protection_duration.as_secs() as i64 {
-                    debug!("⏸️ [scanner] 状态=None 且在保护期内");
+ debug!("⏸️ [scanner] status=None message ");
                     return false;
                 }
             }
@@ -95,7 +95,7 @@ impl AgentScanner {
                     );
                     // 继续检查，不要返回 false
                 } else {
-                    debug!("⏸️ [scanner] 状态=Terminating，等待中...");
+ debug!("⏸️ [scanner] status=Terminating, message ...");
                     return false;
                 }
             }
@@ -112,7 +112,7 @@ impl AgentScanner {
                 status,
                 Some(AgentStatus::Active) | Some(AgentStatus::Pending)
             ) {
-                debug!("⏸️ [scanner] 未超时但状态活跃，跳过: {:?}", status);
+ debug!("⏸️ [scanner] nottimeout message statusactive, skip: {:?}", status);
                 return false;
             }
             return false;

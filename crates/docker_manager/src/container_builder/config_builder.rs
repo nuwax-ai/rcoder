@@ -180,7 +180,7 @@ impl ContainerConfigBuilder {
     /// # Returns
     /// * `DockerResult<DockerContainerConfig>` - 构建的配置或错误
     pub fn build(self) -> DockerResult<DockerContainerConfig> {
-        debug!("构建容器配置，项目ID: {}", self.project_id);
+ debug!("builtcontainerconfig, projectID: {}", self.project_id);
 
         // 使用默认值或提供的值
         let image = self.image.unwrap_or_else(crate::default_docker_image);

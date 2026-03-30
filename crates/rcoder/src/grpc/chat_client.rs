@@ -57,7 +57,7 @@ pub async fn grpc_chat_with_pool(
         user_id, // 传递 user_id
     };
 
-    debug!("[gRPC_CHAT] 发送请求: {:?}", grpc_request);
+ debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);
 
     // 构建 tonic Request 并设置请求级别超时
     let mut request = tonic::Request::new(grpc_request);
@@ -65,12 +65,12 @@ pub async fn grpc_chat_with_pool(
     // ✅ 使用 Tonic 原生 API 设置请求超时
     if let Some(timeout) = request_timeout {
         request.set_timeout(timeout);
-        debug!("⏱️ [gRPC_CHAT] 设置请求超时: {:?}", timeout);
+ debug!("⏱️ [gRPC_CHAT] message requesttimeout: {:?}", timeout);
     }
 
     // 发送请求
     let response = client.chat(request).await.map_err(|e| {
-        error!("[gRPC_CHAT] Chat RPC 调用失败: {}", e);
+ error!("[gRPC_CHAT] Chat RPC message failed: {}", e);
         anyhow::anyhow!("gRPC Chat 调用失败: {}", e)
     })?;
 
@@ -119,14 +119,14 @@ pub async fn grpc_cancel_session_with_pool(
         project_id,
     };
 
-    debug!("[gRPC_CANCEL] 发送请求: {:?}", grpc_request);
+ debug!("[gRPC_CANCEL] sendrequest: {:?}", grpc_request);
 
     // 发送请求
     let response = client
         .cancel_session(tonic::Request::new(grpc_request))
         .await
         .map_err(|e| {
-            error!("[gRPC_CANCEL] CancelSession RPC 调用失败: {}", e);
+ error!("[gRPC_CANCEL] CancelSession RPC message failed: {}", e);
             anyhow::anyhow!("gRPC CancelSession 调用失败: {}", e)
         })?;
 
@@ -175,14 +175,14 @@ pub async fn grpc_stop_agent_with_pool(
         force,
     };
 
-    debug!("[gRPC_STOP_AGENT] 发送请求: {:?}", grpc_request);
+ debug!("[gRPC_STOP_AGENT] sendrequest: {:?}", grpc_request);
 
     // 发送请求
     let response = client
         .stop_agent(tonic::Request::new(grpc_request))
         .await
         .map_err(|e| {
-            error!("[gRPC_STOP_AGENT] StopAgent RPC 调用失败: {}", e);
+ error!("[gRPC_STOP_AGENT] StopAgent RPC message failed: {}", e);
             anyhow::anyhow!("gRPC StopAgent 调用失败: {}", e)
         })?;
 

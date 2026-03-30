@@ -75,7 +75,7 @@ impl ServiceType {
         if let Some(service_config) = config.services.get(&service_key) {
             service_config.enabled
         } else {
-            tracing::warn!("服务类型 '{}' 未在配置中找到", service_key);
+ tracing::warn!(" message '{}' not message config message ", service_key);
             false
         }
     }
@@ -113,7 +113,7 @@ pub fn get_enabled_service_types(config: &crate::MultiImageConfig) -> Vec<String
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("解析服务类型失败: {} - {:?}", service_type, e);
+ tracing::warn!(" message failed: {} - {:?}", service_type, e);
                     None
                 }
             }

@@ -88,7 +88,7 @@ impl SchemaInitializer {
                 })?;
             }
 
-            tracing::info!("DuckDB Schema 初始化完成");
+ tracing::info!("DuckDB Schema initialized");
             Ok(())
         })
     }
