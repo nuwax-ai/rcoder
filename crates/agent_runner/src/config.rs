@@ -362,16 +362,19 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     match load_config_from_file() {
         Ok(file_config) => {
             config = file_config;
-            info!("成功从 {} 加载配置", CONFIG_FILE);
+            info!("Loaded config from {}", CONFIG_FILE);
         }
         Err(e) => {
-            warn!("无法读取配置文件 {}: {}, 使用默认配置", CONFIG_FILE, e);
+            warn!(
+                "Failed to read config file {}: {}, using defaults",
+                CONFIG_FILE, e
+            );
 
             // 创建默认配置文件
             if let Err(create_err) = create_default_config_file(&config) {
-                error!("创建默认配置文件失败: {}", create_err);
+                error!("Failed to create default config file: {}", create_err);
             } else {
-                info!("已创建默认配置文件: {}", CONFIG_FILE);
+                info!("Created default config file: {}", CONFIG_FILE);
             }
         }
     }
@@ -381,11 +384,11 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         match port.parse::<u16>() {
             Ok(p) => {
                 config.port = p;
-                info!("使用环境变量 RCODER_PORT 设置端口: {}", p);
+                info!("Set port from env RCODER_PORT: {}", p);
             }
             Err(_) => {
                 warn!(
-                    "环境变量 RCODER_PORT 值无效: {}, 使用配置文件中的端口: {}",
+                    "Invalid RCODER_PORT env value: {}, keeping config port: {}",
                     port, config.port
                 );
             }
@@ -405,12 +408,12 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                         .get_or_insert_with(Default::default)
                         .idle_timeout_secs = timeout;
                     info!(
-                        "使用环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 设置闲置超时: {} 秒",
+                        "Set idle timeout from env RCODER_AGENT_IDLE_TIMEOUT_SECS: {} seconds",
                         timeout
                     );
                 } else {
                     warn!(
-                        "环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 值无效: {} 秒，超出范围 [{}, {}]，使用配置文件中的值",
+                        "Invalid RCODER_AGENT_IDLE_TIMEOUT_SECS: {} seconds, out of range [{}, {}], keeping config value",
                         timeout,
                         AgentCleanupConfig::MIN_IDLE_TIMEOUT,
                         AgentCleanupConfig::MAX_IDLE_TIMEOUT
@@ -419,7 +422,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             }
             Err(_) => {
                 warn!(
-                    "环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 值格式无效: {}，使用配置文件中的值",
+                    "Invalid RCODER_AGENT_IDLE_TIMEOUT_SECS format: {}, keeping config value",
                     idle_timeout
                 );
             }
@@ -439,12 +442,12 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                         .get_or_insert_with(Default::default)
                         .cleanup_interval_secs = interval;
                     info!(
-                        "使用环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 设置清理间隔: {} 秒",
+                        "Set cleanup interval from env RCODER_AGENT_CLEANUP_INTERVAL_SECS: {} seconds",
                         interval
                     );
                 } else {
                     warn!(
-                        "环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 值无效: {} 秒，超出范围 [{}, {}]，使用配置文件中的值",
+                        "Invalid RCODER_AGENT_CLEANUP_INTERVAL_SECS: {} seconds, out of range [{}, {}], keeping config value",
                         interval,
                         AgentCleanupConfig::MIN_CLEANUP_INTERVAL,
                         AgentCleanupConfig::MAX_CLEANUP_INTERVAL
@@ -453,7 +456,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             }
             Err(_) => {
                 warn!(
-                    "环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 值格式无效: {}，使用配置文件中的值",
+                    "Invalid RCODER_AGENT_CLEANUP_INTERVAL_SECS format: {}, keeping config value",
                     cleanup_interval
                 );
             }
@@ -470,12 +473,12 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                         .get_or_insert_with(Default::default)
                         .concurrency_limit = limit;
                     info!(
-                        "使用环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 设置并发限制: {}",
+                        "Set concurrency limit from env RCODER_AGENT_CONCURRENCY_LIMIT: {}",
                         limit
                     );
                 } else {
                     warn!(
-                        "环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 值无效: {}, 必须 >= {}，使用配置文件中的值",
+                        "Invalid RCODER_AGENT_CONCURRENCY_LIMIT: {}, must be >= {}, keeping config value",
                         limit,
                         AgentConcurrencyConfig::MIN_CONCURRENCY_LIMIT
                     );
@@ -483,7 +486,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             }
             Err(_) => {
                 warn!(
-                    "环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 值格式无效: {}，使用配置文件中的值",
+                    "Invalid RCODER_AGENT_CONCURRENCY_LIMIT format: {}, keeping config value",
                     concurrency_limit
                 );
             }
@@ -502,12 +505,12 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                         .get_or_insert_with(Default::default)
                         .cancel_session_timeout_secs = timeout;
                     info!(
-                        "使用环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 设置取消会话超时: {} 秒",
+                        "Set cancel-session timeout from env RCODER_CANCEL_SESSION_TIMEOUT_SECS: {} seconds",
                         timeout
                     );
                 } else {
                     warn!(
-                        "环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 值无效: {} 秒，超出范围 [{}, {}]",
+                        "Invalid RCODER_CANCEL_SESSION_TIMEOUT_SECS: {} seconds, out of range [{}, {}]",
                         timeout,
                         GrpcTimeoutConfig::MIN_CANCEL_TIMEOUT,
                         GrpcTimeoutConfig::MAX_CANCEL_TIMEOUT
@@ -516,7 +519,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             }
             Err(_) => {
                 warn!(
-                    "环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 值格式无效: {}",
+                    "Invalid RCODER_CANCEL_SESSION_TIMEOUT_SECS format: {}",
                     cancel_timeout
                 );
             }
@@ -535,12 +538,12 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                         .get_or_insert_with(Default::default)
                         .acp_session_create_timeout_secs = timeout;
                     info!(
-                        "使用环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 设置 ACP 会话创建超时: {} 秒",
+                        "Set ACP session-create timeout from env RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS: {} seconds",
                         timeout
                     );
                 } else {
                     warn!(
-                        "环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 值无效: {} 秒，超出范围 [{}, {}]",
+                        "Invalid RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS: {} seconds, out of range [{}, {}]",
                         timeout,
                         GrpcTimeoutConfig::MIN_ACP_SESSION_TIMEOUT,
                         GrpcTimeoutConfig::MAX_ACP_SESSION_TIMEOUT
@@ -549,7 +552,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             }
             Err(_) => {
                 warn!(
-                    "环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 值格式无效: {}",
+                    "Invalid RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS format: {}",
                     acp_timeout
                 );
             }
@@ -568,12 +571,12 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                         .get_or_insert_with(Default::default)
                         .agent_cancel_timeout_secs = timeout;
                     info!(
-                        "使用环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 设置 Agent 取消调用超时: {} 秒",
+                        "Set agent-cancel timeout from env RCODER_AGENT_CANCEL_TIMEOUT_SECS: {} seconds",
                         timeout
                     );
                 } else {
                     warn!(
-                        "环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 值无效: {} 秒，超出范围 [{}, {}]",
+                        "Invalid RCODER_AGENT_CANCEL_TIMEOUT_SECS: {} seconds, out of range [{}, {}]",
                         timeout,
                         GrpcTimeoutConfig::MIN_AGENT_CANCEL_TIMEOUT,
                         GrpcTimeoutConfig::MAX_AGENT_CANCEL_TIMEOUT
@@ -582,7 +585,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             }
             Err(_) => {
                 warn!(
-                    "环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 值格式无效: {}",
+                    "Invalid RCODER_AGENT_CANCEL_TIMEOUT_SECS format: {}",
                     agent_cancel_timeout
                 );
             }
@@ -601,12 +604,12 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                         .get_or_insert_with(Default::default)
                         .port_check_timeout_millis = timeout;
                     info!(
-                        "使用环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 设置端口检查超时: {} 毫秒",
+                        "Set port-check timeout from env RCODER_PORT_CHECK_TIMEOUT_MILLIS: {} ms",
                         timeout
                     );
                 } else {
                     warn!(
-                        "环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 值无效: {} 毫秒，超出范围 [{}, {}]",
+                        "Invalid RCODER_PORT_CHECK_TIMEOUT_MILLIS: {} ms, out of range [{}, {}]",
                         timeout,
                         GrpcTimeoutConfig::MIN_PORT_CHECK_TIMEOUT,
                         GrpcTimeoutConfig::MAX_PORT_CHECK_TIMEOUT
@@ -615,7 +618,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             }
             Err(_) => {
                 warn!(
-                    "环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 值格式无效: {}",
+                    "Invalid RCODER_PORT_CHECK_TIMEOUT_MILLIS format: {}",
                     port_check_timeout
                 );
             }
@@ -626,7 +629,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Some(ref cleanup_config) = config.agent_cleanup
         && let Err(e) = cleanup_config.validate()
     {
-        warn!("Agent 清理配置验证失败: {}，使用默认配置", e);
+        warn!("Agent cleanup config validation failed: {}, using defaults", e);
         config.agent_cleanup = Some(AgentCleanupConfig::default());
     }
 
@@ -634,7 +637,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Some(ref concurrency_config) = config.agent_concurrency
         && let Err(e) = concurrency_config.validate()
     {
-        warn!("Agent 并发配置验证失败: {}，使用默认配置", e);
+        warn!("Agent concurrency config validation failed: {}, using defaults", e);
         config.agent_concurrency = Some(AgentConcurrencyConfig::default());
     }
 
@@ -653,19 +656,19 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                 unhealthy_threshold: 3,
             },
         };
-        info!("启用反向代理，监听端口: {}", proxy_config.listen_port);
+        info!("Reverse proxy enabled, listening on port: {}", proxy_config.listen_port);
         config.proxy_config = Some(proxy_config);
     }
 
     // 5. 命令行参数覆盖配置（优先级最高）
     if let Some(port) = cli_args.port {
         config.port = port;
-        info!("使用命令行参数设置端口: {}", port);
+        info!("Set port from CLI arg: {}", port);
     }
 
     if let Some(projects_dir) = cli_args.projects_dir {
         config.projects_dir = projects_dir.clone();
-        info!("使用命令行参数设置项目目录: {:?}", projects_dir);
+        info!("Set projects directory from CLI arg: {:?}", projects_dir);
     }
 
     info!(
@@ -680,7 +683,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Some(ref grpc_timeouts) = config.grpc_timeouts
         && let Err(e) = grpc_timeouts.validate()
     {
-        warn!("gRPC 超时配置验证失败: {}，使用默认配置", e);
+        warn!("gRPC timeout config validation failed: {}, using defaults", e);
         config.grpc_timeouts = Some(GrpcTimeoutConfig::default());
     }
 
@@ -701,11 +704,11 @@ pub fn load_config() -> AppConfig {
 
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
-    let config_content =
-        fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
+    let config_content = fs::read_to_string(CONFIG_FILE)
+        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
 
     Ok(config)
 }

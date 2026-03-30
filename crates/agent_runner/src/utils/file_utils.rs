@@ -301,7 +301,7 @@ impl FileUtils {
             {
                 Ok(attachment) => attachments.push(attachment),
                 Err(e) => {
-                    warn!("跳过文件 {:?}，创建附件失败: {}", file_path, e);
+                    warn!("Skipping file {:?}; failed to create attachment: {}", file_path, e);
                 }
             }
         }

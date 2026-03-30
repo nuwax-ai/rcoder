@@ -585,7 +585,7 @@ async fn test_high_concurrency_stress() {
 
     assert_eq!(registry.active_sessions_count(), 0, "所有槽位应该被释放");
 
-    println!("高并发压力测试: {} 成功, {} 失败", success, fail);
+    println!("High-concurrency stress test: {} success, {} failed", success, fail);
 }
 
 // ============================================================================

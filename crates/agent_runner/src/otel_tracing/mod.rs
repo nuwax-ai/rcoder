@@ -54,7 +54,7 @@ impl Default for TraceConfig {
 /// - `TELEMETRY_PROMETHEUS_ENABLED`: 是否启用 Prometheus（默认 true）
 pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetry::TelemetryGuard> {
     if !config.enabled {
-        info!("📍 [OTel] 追踪已禁用");
+        info!("📍 [OTel] Tracing is disabled");
         // 即使追踪禁用，仍然Initializing Prometheus（如果启用）
         if config.prometheus_enabled {
             return rcoder_telemetry::init_prometheus_only(&config.service_name);
@@ -84,7 +84,7 @@ pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetr
     let guard = rcoder_telemetry::init(telemetry_config).await?;
 
     info!(
-        "✅ [OTel] 追踪已初始化: OTLP={}, Prometheus={}",
+        "✅ [OTel] Tracing initialized: OTLP={}, Prometheus={}",
         guard.is_otlp_enabled(),
         guard.is_prometheus_enabled()
     );
@@ -162,7 +162,7 @@ impl RequestSpan {
         );
 
         info!(
-            "📍 [OTel] Span 已创建: project_id={}, request_id={}, operation={}",
+            "📍 [OTel] Span created: project_id={}, request_id={}, operation={}",
             project_id, request_id, operation
         );
 
@@ -257,7 +257,7 @@ impl RequestSpan {
         self.span.add_event(name.to_string(), kv_attrs);
 
         info!(
-            "📍 [OTel] 事件: {}, 属性: {:?}",
+            "📍 [OTel] Event: {}, attributes: {:?}",
             name,
             attributes
                 .iter()
@@ -272,7 +272,7 @@ impl RequestSpan {
         self.set_error(err.to_string());
         error!(
             error = %err,
-            "📍 [OTel] 请求错误"
+            "📍 [OTel] Request error"
         );
     }
 
@@ -290,7 +290,7 @@ impl RequestSpan {
 
 impl Drop for RequestSpan {
     fn drop(&mut self) {
-        info!("📍 [OTel] Span 已关闭");
+        info!("📍 [OTel] Span closed");
     }
 }
 
@@ -325,7 +325,7 @@ pub fn child_span(_parent: &RequestSpan, name: &str, attributes: &[(&str, String
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    info!("📍 [OTel] 子 Span 已创建: {}", name);
+    info!("📍 [OTel] Child span created: {}", name);
 
     RequestSpan { span }
 }

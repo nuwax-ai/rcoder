@@ -138,7 +138,7 @@ impl AgentCleaner {
         // 删除空的孤立session
         for session_id in sessions_to_remove {
             if let Some((_, _)) = SESSION_CACHE.remove(&session_id) {
-                debug!("移除空session: {}", session_id);
+                debug!("Removed empty session: {}", session_id);
             }
         }
 
@@ -201,11 +201,11 @@ impl AgentCleaner {
             match self.cleanup_agent_raii(&project_id) {
                 Ok(_) => {
                     success_count += 1;
-                    info!("成功清理agent: {}", project_id);
+                    info!("Agent cleaned successfully: {}", project_id);
                 }
                 Err(e) => {
                     failed_count += 1;
-                    warn!("清理agent失败: {} - {}", project_id, e);
+                    warn!("Failed to clean agent: {} - {}", project_id, e);
                 }
             }
             cleaned_count += 1;
@@ -249,7 +249,7 @@ impl AgentCleaner {
     /// 基于RAII的简化清理方法
     /// 只需要从MAP中移除agent，AgentLifecycleGuard会自动清理所有资源
     fn cleanup_agent_raii(&self, project_id: &str) -> Result<()> {
-        debug!("开始RAII清理agent: {}", project_id);
+        debug!("Starting RAII cleanup for agent: {}", project_id);
 
         // 使用统一 Registry 检查并移除（内部自动同步清理所有映射）
         if AGENT_REGISTRY.contains_project(project_id) {
@@ -272,10 +272,10 @@ impl AgentCleaner {
                     project_id
                 );
             } else {
-                warn!("尝试移除agent但未找到: {}", project_id);
+                warn!("Tried to remove agent but it was not found: {}", project_id);
             }
         } else {
-            warn!("Agent不存在于Registry中: {}", project_id);
+            warn!("Agent not found in Registry: {}", project_id);
         }
 
         Ok(())
@@ -283,7 +283,7 @@ impl AgentCleaner {
 
     /// 运行清理任务 - 简化版，只做定时清理
     pub async fn run(&mut self) {
-        info!("清理任务已启动，配置: {:?}", self.config);
+        info!("Cleanup task started, config: {:?}", self.config);
 
         let mut interval = tokio::time::interval(self.config.cleanup_interval);
 
@@ -291,8 +291,8 @@ impl AgentCleaner {
             interval.tick().await;
 
             match self.cleanup_idle_agents().await {
-                Ok(stats) => debug!("定时清理完成: {:?}", stats),
-                Err(e) => warn!("定时清理失败: {}", e),
+                Ok(stats) => debug!("Periodic cleanup completed: {:?}", stats),
+                Err(e) => warn!("Periodic cleanup failed: {}", e),
             }
         }
     }

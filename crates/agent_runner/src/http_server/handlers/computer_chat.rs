@@ -155,14 +155,14 @@ pub async fn handle_computer_chat(
     match SESSION_CACHE.entry(session_id_str.clone()) {
         Entry::Occupied(entry) => {
             info!(
-                "[HTTP] SESSION_CACHE 已存在，复用: session_id={}",
+                "[HTTP] SESSION_CACHE already exists, reusing: session_id={}",
                 session_id_str
             );
             entry.get().clone()
         }
         Entry::Vacant(entry) => {
             let data = SessionData::new(1000);
-            info!("[HTTP] SESSION_CACHE 新建: session_id={}", session_id_str);
+            info!("[HTTP] SESSION_CACHE created: session_id={}", session_id_str);
             entry.insert(data.clone());
             data
         }
@@ -181,7 +181,7 @@ pub async fn handle_computer_chat(
     // 10. 根据执行结果返回成功或错误
     if output.error.is_some() || !output.success {
         error!(
-            "❌ [HTTP] Computer Chat 失败: session_id={}, error={:?}",
+            "❌ [HTTP] Computer Chat failed: session_id={}, error={:?}",
             response.session_id, response.error
         );
         // 返回成功的 HTTP 状态码，但 HttpResult 包含错误信息
@@ -202,7 +202,7 @@ pub async fn handle_computer_chat(
     }
 
     info!(
-        "✅ [HTTP] Computer Chat 响应: session_id={}, error={:?}",
+        "✅ [HTTP] Computer Chat response: session_id={}, error={:?}",
         response.session_id, response.error
     );
 

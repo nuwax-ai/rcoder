@@ -52,12 +52,15 @@ impl ContentBuilder {
                 }
                 Ok(None) => {
                     // 文件不存在或无法读取，静默忽略
-                    tracing::warn!("附件无法加载，已忽略: attachment_id={}", attachment.id());
+                    tracing::warn!(
+                        "Attachment could not be loaded and was ignored: attachment_id={}",
+                        attachment.id()
+                    );
                 }
                 Err(e) => {
                     // 其他错误（如网络错误），记录警告但继续处理
                     tracing::warn!(
-                        "⚠️ 附件转换失败，已忽略: attachment_id={}, error={:?}",
+                        "⚠️ Attachment conversion failed and was ignored: attachment_id={}, error={:?}",
                         attachment.id(),
                         e
                     );
@@ -80,7 +83,7 @@ impl ContentBuilder {
 
                 // 检查文件是否存在
                 if !file_path.exists() {
-                    tracing::warn!("附件文件不存在，已忽略: {:?}", file_path);
+                    tracing::warn!("Attachment file not found, ignored: {:?}", file_path);
                     return Ok(None);
                 }
 
@@ -92,7 +95,7 @@ impl ContentBuilder {
                         "gz" | "zip" | "tar" | "bz2" | "xz" | "7z" | "rar"
                     ) {
                         tracing::warn!(
-                            "⚠️ 不支持压缩文件作为 Text 附件，已忽略: {:?}（文件扩展名: {}）",
+                            "⚠️ Compressed files are not supported as Text attachments, ignored: {:?} (extension: {})",
                             file_path,
                             ext_str
                         );
@@ -105,7 +108,7 @@ impl ContentBuilder {
                     Ok(text) => text,
                     Err(e) => {
                         tracing::warn!(
-                            "⚠️ 无法读取文本文件，已忽略: {:?}，错误: {}（可能是二进制文件或编码不是 UTF-8）",
+                            "⚠️ Failed to read text file, ignored: {:?}, error: {} (may be binary or not UTF-8 encoded)",
                             file_path,
                             e
                         );
@@ -144,7 +147,7 @@ impl ContentBuilder {
 
                 // 检查文件是否存在
                 if !file_path.exists() {
-                    tracing::warn!("图像文件不存在，已忽略: {:?}", file_path);
+                    tracing::warn!("Image file not found, ignored: {:?}", file_path);
                     return Ok(None);
                 }
 
@@ -152,7 +155,7 @@ impl ContentBuilder {
                 let data = match tokio::fs::read(&file_path).await {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::warn!("无法读取图像文件，已忽略: {:?}，错误: {}", file_path, e);
+                        tracing::warn!("Failed to read image file, ignored: {:?}, error: {}", file_path, e);
                         return Ok(None);
                     }
                 };
@@ -189,7 +192,7 @@ impl ContentBuilder {
 
                 // 检查文件是否存在
                 if !file_path.exists() {
-                    tracing::warn!("音频文件不存在，已忽略: {:?}", file_path);
+                    tracing::warn!("Audio file not found, ignored: {:?}", file_path);
                     return Ok(None);
                 }
 
@@ -197,7 +200,7 @@ impl ContentBuilder {
                 let data = match tokio::fs::read(&file_path).await {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::warn!("无法读取音频文件，已忽略: {:?}，错误: {}", file_path, e);
+                        tracing::warn!("Failed to read audio file, ignored: {:?}, error: {}", file_path, e);
                         return Ok(None);
                     }
                 };
@@ -230,7 +233,7 @@ impl ContentBuilder {
 
                 // 检查文件是否存在
                 if !file_path.exists() {
-                    tracing::warn!("文档文件不存在，已忽略: {:?}", file_path);
+                    tracing::warn!("Document file not found, ignored: {:?}", file_path);
                     return Ok(None);
                 }
 

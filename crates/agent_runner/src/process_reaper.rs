@@ -84,7 +84,7 @@ impl ReaperState {
         if id > 0 {
             self.active_children.insert(id, child);
             if self.config.verbose {
-                debug!("[ProcessReaper] 注册子进程 PID={}", id);
+                debug!("[ProcessReaper] Registered child process PID={}", id);
             }
         }
     }
@@ -114,7 +114,7 @@ impl ReaperState {
                 }
                 Err(e) => {
                     // 查询失败，可能进程已不存在
-                    warn!("[ProcessReaper] 查询子进程 PID={} 失败: {}", pid, e);
+                    warn!("[ProcessReaper] Failed to query child PID={}: {}", pid, e);
                     false // 移除无法查询的进程
                 }
             }
@@ -123,7 +123,7 @@ impl ReaperState {
         if reaped_now > 0 {
             self.reaped_count += reaped_now;
             info!(
-                "[ProcessReaper] 回收了 {} 个子进程 (总计: {})",
+                "[ProcessReaper] Reaped {} child processes (total: {})",
                 reaped_now, self.reaped_count
             );
         }
@@ -161,14 +161,14 @@ impl ReaperState {
         if !zombies.is_empty() {
             self.zombie_detected_count += zombies.len() as u64;
             warn!(
-                "[ProcessReaper] 检测到 {} 个僵尸进程 (总计检测到: {})",
+                "[ProcessReaper] Detected {} zombie processes (total detected: {})",
                 zombies.len(),
                 self.zombie_detected_count
             );
 
             for zombie in &zombies {
                 warn!(
-                    "[ProcessReaper] 僵尸进程: PID={}, PPID={}, CMD={}",
+                    "[ProcessReaper] Zombie process: PID={}, PPID={}, CMD={}",
                     zombie.pid, zombie.ppid, zombie.comm
                 );
             }
@@ -198,14 +198,14 @@ impl ReaperState {
                     Ok(WaitStatus::Exited(pid, exit_code)) => {
                         reaped_this_round += 1;
                         debug!(
-                            "[ProcessReaper] 主动回收僵尸进程: PID={}, exit_code={}",
+                            "[ProcessReaper] Reaped zombie proactively: PID={}, exit_code={}",
                             pid, exit_code
                         );
                     }
                     Ok(WaitStatus::Signaled(pid, signal, _)) => {
                         reaped_this_round += 1;
                         debug!(
-                            "[ProcessReaper] 主动回收僵尸进程: PID={}, signal={:?}",
+                            "[ProcessReaper] Reaped zombie proactively: PID={}, signal={:?}",
                             pid, signal
                         );
                     }
@@ -216,7 +216,7 @@ impl ReaperState {
                     Ok(WaitStatus::Stopped(pid, signal)) => {
                         // 进程被停止（不是退出），不计入回收
                         debug!(
-                            "[ProcessReaper] 进程被停止: PID={}, signal={:?}",
+                            "[ProcessReaper] Process stopped: PID={}, signal={:?}",
                             pid, signal
                         );
                         // 继续循环，可能还有其他僵尸进程
@@ -224,7 +224,7 @@ impl ReaperState {
                     }
                     Ok(WaitStatus::Continued(pid)) => {
                         // 进程被恢复（SIGCONT），不计入回收
-                        debug!("[ProcessReaper] 进程被恢复: PID={}", pid);
+                        debug!("[ProcessReaper] Process resumed: PID={}", pid);
                         // 继续循环，可能还有其他僵尸进程
                         continue;
                     }
@@ -232,7 +232,7 @@ impl ReaperState {
                     Ok(WaitStatus::PtraceEvent(pid, signal, event)) => {
                         // ptrace 事件，不计入回收
                         debug!(
-                            "[ProcessReaper] ptrace 事件: PID={}, signal={:?}, event={}",
+                            "[ProcessReaper] ptrace event: PID={}, signal={:?}, event={}",
                             pid, signal, event
                         );
                         continue;
@@ -240,12 +240,12 @@ impl ReaperState {
                     #[cfg(linux_android)]
                     Ok(WaitStatus::PtraceSyscall(pid)) => {
                         // ptrace 系统调用，不计入回收
-                        debug!("[ProcessReaper] ptrace 系统调用: PID={}", pid);
+                        debug!("[ProcessReaper] ptrace syscall: PID={}", pid);
                         continue;
                     }
                     // 非Linux平台忽略 ptrace 相关状态（macOS 上 WaitStatus 包含这些变体但不会实际触发）
                     Ok(_) => {
-                        debug!("[ProcessReaper] 忽略的 waitpid 状态");
+                        debug!("[ProcessReaper] Ignored waitpid status");
                         continue;
                     }
                     Err(nix::errno::Errno::ECHILD) => {
@@ -253,7 +253,7 @@ impl ReaperState {
                         break;
                     }
                     Err(e) => {
-                        warn!("[ProcessReaper] waitpid 错误: {}", e);
+                        warn!("[ProcessReaper] waitpid error: {}", e);
                         break;
                     }
                 }
@@ -262,7 +262,7 @@ impl ReaperState {
             if reaped_this_round > 0 {
                 self.reaped_count += reaped_this_round;
                 info!(
-                    "[ProcessReaper] 主动回收了 {} 个僵尸进程 (总计: {})",
+                    "[ProcessReaper] Reaped {} zombies proactively (total: {})",
                     reaped_this_round, self.reaped_count
                 );
             }
@@ -270,7 +270,7 @@ impl ReaperState {
 
         #[cfg(not(unix))]
         {
-            debug!("[ProcessReaper] 非 Unix 平台，跳过僵尸进程检测");
+            debug!("[ProcessReaper] Non-Unix platform, skipping zombie detection");
         }
     }
 }
@@ -331,10 +331,10 @@ pub fn start_process_reaper_with_config(config: ReaperConfig) -> tokio::task::Jo
 /// 核心回收逻辑
 #[cfg(unix)]
 async fn run_reaper(config: ReaperConfig) {
-    info!("[ProcessReaper] 僵尸进程回收器已启动 (PID 1 模式)");
+    info!("[ProcessReaper] Zombie process reaper started (PID 1 mode)");
     if config.enable_zombie_detection {
         info!(
-            "[ProcessReaper] 僵尸进程检测已启用，检测间隔: {} 秒",
+            "[ProcessReaper] Zombie detection enabled, interval: {} seconds",
             config.zombie_detection_interval_secs
         );
     }
@@ -343,8 +343,8 @@ async fn run_reaper(config: ReaperConfig) {
     let sigchld = match signal(SignalKind::child()) {
         Ok(sig) => sig,
         Err(e) => {
-            error!("[ProcessReaper] 无法注册 SIGCHLD 信号处理器: {}", e);
-            error!("[ProcessReaper] 将使用轮询模式作为回退");
+            error!("[ProcessReaper] Failed to register SIGCHLD handler: {}", e);
+            error!("[ProcessReaper] Falling back to polling mode");
 
             // 回退模式：使用轮询
             run_reaper_polling(config).await;
@@ -375,7 +375,7 @@ async fn run_reaper(config: ReaperConfig) {
 /// Windows 上的回收逻辑（无操作，Windows 没有僵尸进程问题）
 #[cfg(not(unix))]
 async fn run_reaper(_config: ReaperConfig) {
-    info!("[ProcessReaper] 非 Unix 平台，僵尸进程回收器不适用");
+    info!("[ProcessReaper] Non-Unix platform: zombie reaper not applicable");
 }
 
 /// 🔍 启用僵尸进程检测的回收循环
@@ -395,7 +395,7 @@ async fn run_reaper_with_detection(
             // 等待 SIGCHLD 信号
             _ = sigchld.recv() => {
                 if state.config.verbose {
-                    debug!("[ProcessReaper] 收到 SIGCHLD 信号");
+                    debug!("[ProcessReaper] Received SIGCHLD");
                 }
                 state.reap_all();
                 state.reap_all_zombies_blocking();
@@ -406,7 +406,7 @@ async fn run_reaper_with_detection(
             }
             // 🔍 定期主动检测和清理僵尸进程
             _ = zombie_detect_interval.tick() => {
-                debug!("[ProcessReaper] 开始定期僵尸进程检测...");
+                debug!("[ProcessReaper] Running scheduled zombie detection...");
 
                 // 先检测有哪些僵尸进程
                 let zombies = state.detect_zombie_processes();
@@ -432,7 +432,7 @@ async fn run_reaper_without_detection(
             // 等待 SIGCHLD 信号
             _ = sigchld.recv() => {
                 if state.config.verbose {
-                    debug!("[ProcessReaper] 收到 SIGCHLD 信号");
+                    debug!("[ProcessReaper] Received SIGCHLD");
                 }
                 state.reap_all();
                 state.reap_all_zombies_blocking();
@@ -448,7 +448,7 @@ async fn run_reaper_without_detection(
 /// 轮询模式回退（当信号机制不可用时）
 #[cfg(unix)]
 async fn run_reaper_polling(config: ReaperConfig) {
-    info!("[ProcessReaper] 使用轮询模式回收僵尸进程");
+    info!("[ProcessReaper] Using polling mode for zombie reaping");
 
     let state = ReaperState::new(config.clone());
 

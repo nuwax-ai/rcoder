@@ -108,7 +108,7 @@ pub async fn handle_computer_cancel(
         // 检查是否已经空闲或停止中(幂等性)
         if cancel_tx.is_closed() {
             info!(
-                "ℹ️  [HTTP] Agent 已停止,cancel channel 已关闭: session_id={}",
+                "ℹ️  [HTTP] Agent stopped, cancel channel is closed: session_id={}",
                 session_id
             );
         } else {
@@ -126,11 +126,11 @@ pub async fn handle_computer_cancel(
             // 发送取消信号 (异步)
             match cancel_tx.send(cancel_request).await {
                 Ok(_) => {
-                    info!("[HTTP] 取消信号已发送: session_id={}", session_id);
+                    info!("[HTTP] Cancel signal sent: session_id={}", session_id);
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️  [HTTP] 发送取消信号失败: session_id={}, error={}",
+                        "⚠️  [HTTP] Failed to send cancel signal: session_id={}, error={}",
                         session_id, e
                     );
                 }
@@ -139,7 +139,7 @@ pub async fn handle_computer_cancel(
     } else {
         // Session 不存在,幂等返回成功
         info!(
-            "ℹ️  [HTTP] Agent 不存在,幂等返回成功: session_id={}",
+            "ℹ️  [HTTP] Agent not found, returning success idempotently: session_id={}",
             session_id
         );
     }

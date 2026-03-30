@@ -57,12 +57,12 @@ fn set_panic_hook() {
         // 🔥 立即写入日志文件（不依赖 tracing，确保在 panic 时也能写入）
         if let Err(e) = write_panic_to_file(panic_info) {
             // 如果文件写入失败，尝试输出到 stderr
-            eprintln!("❌ [PANIC] 写入 panic 日志文件失败: {}", e);
+            eprintln!("❌ [PANIC] Failed to write panic log file: {}", e);
         }
 
         // 🔥 同时输出到 stderr（Docker 会捕获到容器日志）
         eprintln!("═══════════════════════════════════════════════════════════");
-        eprintln!("❌ [PANIC] agent_runner 发生致命错误！");
+        eprintln!("❌ [PANIC] agent_runner encountered a fatal error!");
         eprintln!("═══════════════════════════════════════════════════════════");
         if let Some(location) = panic_info.location() {
             eprintln!(
@@ -104,8 +104,8 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
         file,
         "═══════════════════════════════════════════════════════════"
     )?;
-    writeln!(file, "❌ [PANIC] agent_runner 发生致命错误！")?;
-    writeln!(file, "时间: {}", now)?;
+    writeln!(file, "❌ [PANIC] agent_runner encountered a fatal error!")?;
+    writeln!(file, "time: {}", now)?;
     writeln!(
         file,
         "═══════════════════════════════════════════════════════════"
@@ -137,7 +137,7 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
     // 强制刷新到磁盘
     file.flush()?;
 
-    eprintln!("✅ Panic 信息已写入: {}", log_path.display());
+    eprintln!("✅ Panic info written to: {}", log_path.display());
 
     Ok(())
 }
@@ -155,7 +155,7 @@ fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("❌ [SIGNAL] 无法注册 SIGTERM 处理器: {}", e);
+                    eprintln!("❌ [SIGNAL] Failed to register SIGTERM handler: {}", e);
                     return;
                 }
             };
@@ -164,24 +164,24 @@ fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
             let mut sigint = match signal(SignalKind::interrupt()) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("❌ [SIGNAL] 无法注册 SIGINT 处理器: {}", e);
+                    eprintln!("❌ [SIGNAL] Failed to register SIGINT handler: {}", e);
                     return;
                 }
             };
 
             tokio::select! {
                 _ = sigterm.recv() => {
-                    eprintln!("📨 [SIGNAL] 收到 SIGTERM 信号（Docker stop），开始优雅关闭...");
+                    eprintln!("📨 [SIGNAL] Received SIGTERM (Docker stop), starting graceful shutdown...");
                     write_shutdown_log("SIGTERM");
                 }
                 _ = sigint.recv() => {
-                    eprintln!("📨 [SIGNAL] 收到 SIGINT 信号（Ctrl+C），开始优雅关闭...");
+                    eprintln!("📨 [SIGNAL] Received SIGINT (Ctrl+C), starting graceful shutdown...");
                     write_shutdown_log("SIGINT");
                 }
             }
 
-            eprintln!("🧹 [SIGNAL] 正在清理资源...");
-            eprintln!("✅ [SIGNAL] 优雅关闭完成，程序退出");
+            eprintln!("🧹 [SIGNAL] Cleaning up resources...");
+            eprintln!("✅ [SIGNAL] Graceful shutdown completed, exiting");
             std::process::exit(0);
         })
     }
@@ -191,12 +191,12 @@ fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             // Windows: 仅监听 Ctrl+C
             if let Ok(()) = tokio::signal::ctrl_c().await {
-                eprintln!("📨 [SIGNAL] 收到 Ctrl+C 信号，开始优雅关闭...");
+                eprintln!("📨 [SIGNAL] Received Ctrl+C, starting graceful shutdown...");
                 write_shutdown_log("Ctrl+C");
             }
 
-            eprintln!("🧹 [SIGNAL] 正在清理资源...");
-            eprintln!("✅ [SIGNAL] 优雅关闭完成，程序退出");
+            eprintln!("🧹 [SIGNAL] Cleaning up resources...");
+            eprintln!("✅ [SIGNAL] Graceful shutdown completed, exiting");
             std::process::exit(0);
         })
     }
@@ -219,15 +219,15 @@ fn write_shutdown_log(signal: &str) {
             file,
             "═══════════════════════════════════════════════════════════"
         );
-        let _ = writeln!(file, "📨 [SHUTDOWN] agent_runner 收到关闭信号");
-        let _ = writeln!(file, "信号类型: {}", signal);
-        let _ = writeln!(file, "时间: {}", now);
+        let _ = writeln!(file, "📨 [SHUTDOWN] agent_runner received a shutdown signal");
+        let _ = writeln!(file, "signal: {}", signal);
+        let _ = writeln!(file, "time: {}", now);
         let _ = writeln!(
             file,
             "═══════════════════════════════════════════════════════════\n"
         );
         let _ = file.flush();
-        eprintln!("✅ 关闭信息已写入: {}", log_path.display());
+        eprintln!("✅ Shutdown info written to: {}", log_path.display());
     }
 }
 
@@ -246,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect(
-            "❌ [FATAL] Rustls CryptoProvider 初始化失败，程序无法继续运行。这通常是系统环境问题。",
+            "❌ [FATAL] Rustls CryptoProvider initialization failed. The process cannot continue. This is usually an environment issue.",
         );
 
     // 🆕 Initializing telemetry system（使用 rcoder-telemetry，包含控制台 + 文件日志）
@@ -290,19 +290,19 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 创建 AgentRuntime（新架构）
     let (agent_runtime, task_receiver) = AgentRuntime::new(1000);
     let agent_runtime = Arc::new(agent_runtime);
-    info!("🔧 [MAIN] AgentRuntime 已创建");
+    info!("🔧 [MAIN] AgentRuntime created");
 
     // 🔥 启动 Worker（在主运行时中，无需独立线程）
     agent_runtime.start(task_receiver).await;
-    info!("📌 [MAIN] Agent Worker 已启动");
+    info!("📌 [MAIN] Agent Worker started");
 
     // 🔥 启动健康检查和重启任务
     let health_monitor = spawn_health_monitor(agent_runtime.clone());
-    info!("[MAIN] Worker 健康监控任务已启动");
+    info!("[MAIN] Worker health monitor started");
 
     // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
     let _reaper_handle = process_reaper::start_process_reaper();
-    info!("🧹 [MAIN] 僵尸进程回收器已启动 (PID 1 模式)");
+    info!("🧹 [MAIN] Process reaper started (PID 1 mode)");
 
     // 🆕 从配置中获取 Agent 清理配置，或使用默认值
     let agent_cleanup_config = config.agent_cleanup.clone().unwrap_or_default();
@@ -312,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!(
-        "🧹 [MAIN] Agent 清理配置: idle_timeout={}秒, cleanup_interval={}秒",
+        "🧹 [MAIN] Agent cleanup config: idle_timeout={}s, cleanup_interval={}s",
         agent_cleanup_config.idle_timeout_secs, agent_cleanup_config.cleanup_interval_secs
     );
 
@@ -324,7 +324,7 @@ async fn main() -> anyhow::Result<()> {
     // 🔒 创建共享的 API 密钥 DashMap
     let shared_api_key_manager =
         Arc::new(dashmap::DashMap::<String, shared_types::ModelProviderConfig>::new());
-    info!("🔑 [MAIN] 共享 API 密钥 DashMap 已创建");
+    info!("🔑 [MAIN] Shared API key DashMap created");
 
     // 🔥 创建 ApiKeyManager 包装器（包装共享 DashMap，消除双重存储）
     let api_key_manager = Arc::new(api_key_manager::ApiKeyManager::from_shared(
@@ -340,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
         use http_server::{HttpServerConfig, start_http_server};
         use proxy_agent::set_unlimited_mode;
 
-        info!("ℹ️  HTTP 服务器模式：仅启动 HTTP + Pingora，不启动 gRPC");
+        info!("ℹ️  HTTP server mode: starting HTTP + Pingora only (no gRPC)");
 
         // 设置为无限制模式（HTTP Server 部署，不限制槽位）
         set_unlimited_mode(true);
@@ -357,12 +357,12 @@ async fn main() -> anyhow::Result<()> {
         let _handle = start_http_server(http_config).await?;
 
         // 永久等待（直到收到关闭信号）
-        info!("HTTP + Pingora 服务已启动，程序将持续运行直到收到关闭信号");
+        info!("HTTP + Pingora services started; running until shutdown signal is received");
 
         // 等待 Ctrl+C 或 SIGTERM 信号
         tokio::signal::ctrl_c().await?;
 
-        info!("📨 收到关闭信号，准备优雅关闭...");
+        info!("📨 Received shutdown signal, preparing graceful shutdown...");
 
         Ok(())
     }
@@ -370,13 +370,13 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 non-http-server 模式：启动 gRPC + Pingora（用于 Docker 容器内）
     #[cfg(not(feature = "http-server"))]
     {
-        info!("ℹ️  容器模式：启动 gRPC + Pingora");
+        info!("ℹ️  Container mode: starting gRPC + Pingora");
 
         // 启动 gRPC 服务
         let grpc_port = shared_types::GRPC_DEFAULT_PORT;
         let grpc_addr = format!("[::]:{}", grpc_port)
             .parse()
-            .map_err(|e| anyhow::anyhow!("gRPC 地址解析失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to parse gRPC address: {}", e))?;
 
         // 为 gRPC 创建 state
         let grpc_state = Arc::new(AppState {
@@ -399,7 +399,7 @@ async fn main() -> anyhow::Result<()> {
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
         let grpc_handle = tokio::spawn(async move {
-            info!("gRPC 服务启动，监听端口: {}", grpc_port);
+            info!("gRPC service started, listening on port: {}", grpc_port);
             info!("gRPC endpoints (port {}):", grpc_port);
             info!("  agent.AgentService/Chat - gRPC chat");
             info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
@@ -410,7 +410,7 @@ async fn main() -> anyhow::Result<()> {
                 .serve(grpc_addr)
                 .await
             {
-                error!("gRPC 服务器错误: {}", e);
+                error!("gRPC server error: {}", e);
             }
         });
 
@@ -426,13 +426,13 @@ async fn main() -> anyhow::Result<()> {
             let app = Router::new().route("/health", get(health_check));
             let addr = format!("0.0.0.0:{}", health_port);
 
-            info!("🏥 HTTP 健康检查服务启动，监听端口: {}", health_port);
+            info!("🏥 HTTP health check service started, listening on port: {}", health_port);
 
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
                     error!(
-                        "❌ HTTP 健康检查服务绑定失败: {} (端口: {})",
+                        "❌ Failed to bind HTTP health check service: {} (port: {})",
                         e, health_port
                     );
                     return;
@@ -440,7 +440,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             if let Err(e) = axum::serve(listener, app).await {
-                error!("HTTP 健康检查服务错误: {}", e);
+                error!("HTTP health check service error: {}", e);
             }
         });
 
@@ -452,14 +452,14 @@ async fn main() -> anyhow::Result<()> {
             if let Some(proxy_config) = &config.proxy_config {
                 Some(start_pingora(proxy_config, shared_api_key_manager.clone()))
             } else {
-                info!("ℹ️  Pingora 代理服务未配置");
+                info!("ℹ️  Pingora proxy service is not configured");
                 None
             }
         };
 
         #[cfg(not(feature = "proxy"))]
         let pingora_result: Option<()> = {
-            info!("ℹ️  Pingora 代理服务未启用 (proxy feature 未开启)");
+            info!("ℹ️  Pingora proxy service is disabled (proxy feature not enabled)");
             None
         };
 
@@ -489,24 +489,24 @@ async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHa
         const MAX_RESTART_ATTEMPTS: u32 = 5;
         const RESTART_COOLDOWN_SECS: u64 = 60;
 
-        info!("[HealthMonitor] 健康监控任务已启动");
+        info!("[HealthMonitor] Health monitor started");
 
         loop {
             interval.tick().await;
 
             // 检查健康状态
             if !runtime.check_health().await {
-                error!("[HealthMonitor] 检测到 Worker 不健康");
+                error!("[HealthMonitor] Worker reported unhealthy");
 
                 // 检查冷却期
                 if consecutive_failures >= MAX_RESTART_ATTEMPTS {
                     warn!(
-                        "⏳ [HealthMonitor] 连续重启失败 {} 次，进入冷却期",
+                        "⏳ [HealthMonitor] {} consecutive restart failures, entering cooldown",
                         consecutive_failures
                     );
                     tokio::time::sleep(Duration::from_secs(RESTART_COOLDOWN_SECS)).await;
                     consecutive_failures = 0;
-                    info!("[HealthMonitor] 冷却期结束，重置失败计数");
+                    info!("[HealthMonitor] Cooldown ended, reset failure counter");
                 }
 
                 // 创建新的通道
@@ -516,7 +516,7 @@ async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHa
                 runtime.restart(new_rx).await;
                 consecutive_failures += 1;
                 info!(
-                    "🔄 [HealthMonitor] Worker 重启完成（第 {} 次）",
+                    "🔄 [HealthMonitor] Worker restart completed (attempt #{})",
                     consecutive_failures
                 );
             } else {

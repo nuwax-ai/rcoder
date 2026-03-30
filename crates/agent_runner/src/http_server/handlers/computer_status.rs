@@ -74,7 +74,7 @@ pub async fn handle_computer_status(
         Some(info) => {
             // Agent 存在且活跃
             info!(
-                "✅ [HTTP] Agent 状态: project_id={}, is_alive=true, session_id={:?}",
+                "✅ [HTTP] Agent status: project_id={}, is_alive=true, session_id={:?}",
                 request.project_id, info.session_id
             );
 
@@ -90,7 +90,7 @@ pub async fn handle_computer_status(
         }
         None => {
             // Agent 不存在
-            warn!(" [HTTP] Agent 不存在: project_id={}", request.project_id);
+            warn!(" [HTTP] Agent not found: project_id={}", request.project_id);
 
             ComputerAgentStatusResponse {
                 user_id: request.user_id.clone(),

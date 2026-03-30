@@ -86,7 +86,7 @@ pub fn start_pingora(
     // 在后台任务中启动 Pingora（直接 move server_manager，无需 Arc<Mutex<>>）
     tokio::spawn(async move {
         if let Err(e) = server_manager.start(shutdown_rx).await {
-            error!("Pingora 代理服务器启动失败: {}", e);
+            error!("Failed to start Pingora proxy server: {}", e);
         }
     });
 

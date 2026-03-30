@@ -191,7 +191,7 @@ impl ApiKeyManager {
 
     /// 清空所有配置
     pub fn clear(&self) {
-        info!("🔑 [API_KEY_MANAGER] 清空所有配置");
+        info!("🔑 [API_KEY_MANAGER] Cleared all configs");
         self.shared.clear();
     }
 

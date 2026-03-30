@@ -196,7 +196,10 @@ pub async fn handle_chat_core(
     // ========== 步骤3: 创建 PendingGuard（RAII）==========
     // 自动在作用域结束时清理，避免状态泄漏
     let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
-    info!("[ChatHandler] 创建 PendingGuard: project_id={}", project_id);
+    info!(
+        "[ChatHandler] Created PendingGuard: project_id={}",
+        project_id
+    );
 
     // ========== 步骤4: 清理无效 session ==========
     // 只在 session 不存在时才清理无效的 session_id
@@ -209,7 +212,7 @@ pub async fn handle_chat_core(
                 sid
             );
         } else if session_exists {
-            info!("[ChatHandler] 复用已存在的 session: session_id={}", sid);
+            info!("[ChatHandler] Reusing existing session: session_id={}", sid);
         }
     }
 
@@ -223,7 +226,7 @@ pub async fn handle_chat_core(
     // 确保目录存在
     if !project_dir.exists() {
         if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
-            error!("[ChatHandler] 创建项目目录失败: {}", e);
+            error!("[ChatHandler] Failed to create project directory: {}", e);
             return ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -250,7 +253,7 @@ pub async fn handle_chat_core(
     {
         Ok(prompt) => prompt,
         Err(e) => {
-            error!("[ChatHandler] 构建 ChatPrompt 失败: {}", e);
+            error!("[ChatHandler] Failed to build ChatPrompt: {}", e);
             return ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -304,7 +307,9 @@ pub async fn handle_chat_core(
             shared_types::mask_url(&provider.base_url)
         );
     } else {
-        warn!("[ChatHandler] 未提供模型配置，将使用环境变量或默认配置");
+        warn!(
+            "[ChatHandler] No model config provided; falling back to env vars or defaults"
+        );
     }
 
     // ========== 步骤8: 检查 Worker 状态 ==========
@@ -313,11 +318,11 @@ pub async fn handle_chat_core(
             // 正常操作，继续处理
         }
         WorkerState::Starting => {
-            warn!("[ChatHandler] Agent Worker 正在启动，请求可能会延迟");
+            warn!("[ChatHandler] Agent Worker is starting; request may be delayed");
         }
         WorkerState::Stopping | WorkerState::Stopped => {
             // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] Agent Worker 不可用");
+            error!("[ChatHandler] Agent Worker unavailable");
             return ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -337,7 +342,7 @@ pub async fn handle_chat_core(
 
     if let Err(e) = context.agent_runtime.send(agent_request).await {
         // PendingGuard 自动清理（在 drop 时）
-        error!("[ChatHandler] 发送任务失败: {}", e);
+        error!("[ChatHandler] Failed to send task: {}", e);
         return ChatHandlerOutput::error(
             project_id,
             session_id.unwrap_or_default(),
@@ -377,7 +382,7 @@ pub async fn handle_chat_core(
         }
         Err(e) => {
             // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] Chat 失败: {}", e);
+            error!("[ChatHandler] Chat failed: {}", e);
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),

@@ -294,7 +294,7 @@ impl AgentSessionRegistry {
     pub fn update_agent_info(&self, project_id: &str, agent_info: ProjectAndAgentInfo) {
         self.agent_info_map
             .insert(project_id.to_string(), agent_info);
-        debug!("[Registry] 更新 agent_info: project={}", project_id);
+        debug!("[Registry] Updated agent_info: project={}", project_id);
     }
 
     /// 🆕 尝试原子性地更新 agent_info
@@ -371,7 +371,10 @@ impl AgentSessionRegistry {
                 if info.status == AgentStatus::Idle {
                     info.status = AgentStatus::Pending;
                     info.last_activity = Utc::now();
-                    debug!("📌 [Registry] 项目 {} 状态: Idle → Pending", project_id);
+                    debug!(
+                        "📌 [Registry] Project {} state: Idle -> Pending",
+                        project_id
+                    );
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -393,7 +396,10 @@ impl AgentSessionRegistry {
                 };
 
                 entry.insert(placeholder);
-                info!("📌 [Registry] 创建 Pending 占位: project_id={}", project_id);
+                info!(
+                    "📌 [Registry] Created Pending placeholder: project_id={}",
+                    project_id
+                );
             }
         }
     }
@@ -409,7 +415,10 @@ impl AgentSessionRegistry {
         {
             drop(info);
             self.remove_by_project(project_id);
-            info!("🗑️ [Registry] 清理 Pending 占位: project_id={}", project_id);
+            info!(
+                "🗑️ [Registry] Cleared Pending placeholder: project_id={}",
+                project_id
+            );
         }
     }
 
@@ -505,7 +514,7 @@ impl AgentSessionRegistry {
         );
 
         // 🎯 原子性地移除 project_to_session 并获取 session_id
-        info!("[Registry] 移除 project_to_session 映射");
+        info!("[Registry] Removing project_to_session mapping");
         let session_id = match self.project_to_session.entry(project_id.to_string()) {
             Entry::Occupied(entry) => {
                 let (_, session_id) = entry.remove_entry(); // 原子性移除
@@ -513,13 +522,13 @@ impl AgentSessionRegistry {
             }
             Entry::Vacant(_) => None,
         };
-        info!("[Registry] project_to_session 移除完成");
+        info!("[Registry] project_to_session mapping removed");
 
         // 移除反向映射
         if let Some(ref sid) = session_id {
-            info!("[Registry] 移除 session_to_project 映射");
+            info!("[Registry] Removing session_to_project mapping");
             self.session_to_project.remove(sid);
-            info!("[Registry] session_to_project 移除完成");
+            info!("[Registry] session_to_project mapping removed");
         }
 
         // 移除 agent_info
@@ -537,7 +546,7 @@ impl AgentSessionRegistry {
         );
 
         // 执行 remove 操作
-        info!("[Registry] 开始执行 agent_info_map.remove()...");
+        info!("[Registry] Executing agent_info_map.remove()...");
         let removed = self.agent_info_map.remove(project_id).map(|(_, v)| v);
         info!(
             "🔍 [Registry] agent_info_map.remove() 完成, removed={}, 剩余长度={}",
@@ -553,7 +562,7 @@ impl AgentSessionRegistry {
 
             // 🔥 修复：移除 Agent 时释放槽位
             self.release_session_slot();
-            info!("[Registry] 已释放槽位: project_id={}", project_id);
+            info!("[Registry] Released session slot: project_id={}", project_id);
         }
 
         info!(
@@ -591,7 +600,7 @@ impl AgentSessionRegistry {
 
                 // 🔥 修复：移除 Agent 时释放槽位（与 remove_by_project 保持一致）
                 self.release_session_slot();
-                info!("[Registry] 已释放槽位: session_id={}", session_id);
+                info!("[Registry] Released session slot: session_id={}", session_id);
             }
 
             return removed;
@@ -688,7 +697,7 @@ impl AgentSessionRegistry {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    debug!("🎯 [原子槽位] 成功获取槽位: {}/{}", old + 1, limit);
+                    debug!("🎯 [AtomicSlot] Acquired slot successfully: {}/{}", old + 1, limit);
                     return true;
                 }
                 Err(new_old) => old = new_old,
@@ -713,7 +722,9 @@ impl AgentSessionRegistry {
         loop {
             let current = self.active_sessions_count.load(Ordering::Acquire);
             if current == 0 {
-                warn!("[原子槽位] 尝试释放槽位但计数器已为 0，跳过操作（防止溢出）");
+                warn!(
+                    "[AtomicSlot] Tried to release slot but counter is already 0, skipping to prevent underflow"
+                );
                 return;
             }
 
@@ -725,7 +736,7 @@ impl AgentSessionRegistry {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    debug!("🔓 [原子槽位] 释放槽位: {} → {}", current, current - 1);
+                    debug!("🔓 [AtomicSlot] Released slot: {} -> {}", current, current - 1);
                     return;
                 }
                 Err(_) => {

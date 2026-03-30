@@ -62,7 +62,7 @@ impl AtomicState {
             2 => WorkerState::Stopping,
             3 => WorkerState::Stopped,
             invalid => {
-                tracing::error!("[AtomicState] 无效的状态值: {}, 返回 Stopped", invalid);
+                tracing::error!("[AtomicState] Invalid state value: {}, falling back to Stopped", invalid);
                 WorkerState::Stopped
             }
         }
@@ -100,7 +100,7 @@ pub static WORKER_THREAD_POOL_SIZE: AtomicUsize = AtomicUsize::new(10);
 /// 初始化并发限制（在应用启动时调用）
 pub fn init_concurrency_limit(limit: usize) {
     WORKER_THREAD_POOL_SIZE.store(limit, Ordering::Release);
-    info!("🔧 并发限制已初始化: {}", limit);
+    info!("🔧 Concurrency limit initialized: {}", limit);
 }
 
 /// 获取当前并发限制
@@ -178,23 +178,23 @@ impl AgentRuntime {
             )
             .await
             {
-                tracing::error!("Agent worker 失败: {}", e);
+                tracing::error!("Agent worker failed: {}", e);
             }
         });
 
         *self.worker_handle.lock().await = Some(handle);
         self.state.set(WorkerState::Running);
-        info!("AgentRuntime: Worker 已启动");
+        info!("AgentRuntime: worker started");
     }
 
     /// 重启 Worker
     pub async fn restart(&self, new_receiver: mpsc::Receiver<AgentRequest>) {
-        warn!("AgentRuntime: 准备重启 Worker...");
+        warn!("AgentRuntime: preparing to restart worker...");
 
         // 1. 停止旧 worker
         if let Some(handle) = self.worker_handle.lock().await.take() {
             handle.abort();
-            info!("AgentRuntime: 旧 Worker 已终止");
+            info!("AgentRuntime: previous worker terminated");
         }
 
         // 2. 重置状态
@@ -204,7 +204,7 @@ impl AgentRuntime {
 
         // 3. 启动新 worker
         self.start(new_receiver).await;
-        info!("AgentRuntime: Worker 重启完成");
+        info!("AgentRuntime: worker restart completed");
     }
 
     /// 发送请求
@@ -275,7 +275,10 @@ impl AgentRuntime {
             match chrono::Utc.timestamp_millis_opt(last_ts).single() {
                 Some(dt) => Some(dt),
                 None => {
-                    tracing::warn!("[WorkerInfo] 无效的时间戳: {}, 使用当前时间", last_ts);
+                    tracing::warn!(
+                        "[WorkerInfo] Invalid timestamp: {}, using current time",
+                        last_ts
+                    );
                     Some(chrono::Utc::now())
                 }
             }
