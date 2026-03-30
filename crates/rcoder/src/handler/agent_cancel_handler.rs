@@ -2,7 +2,7 @@
 //!
 //! 转发取消请求到容器内的 agent_runner 服务
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;
 use shared_types::{AppError, HttpResult};
 
-use super::utils::{extract_grpc_addr, get_locale_from_headers};
+use super::utils::{I18nQuery, extract_grpc_addr, get_locale_from_headers};
 
 /// 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams)]
@@ -384,7 +384,7 @@ async fn handle_session_cancel_internal_v2(
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 404,
@@ -422,7 +422,7 @@ async fn handle_session_cancel_internal_v2(
 pub async fn agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<CancelQuery>,
+    I18nQuery(query): I18nQuery<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
     // 使用新的 v2 版本，保持向后兼容
@@ -476,7 +476,7 @@ pub async fn agent_session_cancel(
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 404,
@@ -514,7 +514,7 @@ pub async fn agent_session_cancel(
 pub async fn computer_agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<ComputerCancelQuery>,
+    I18nQuery(query): I18nQuery<ComputerCancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
 

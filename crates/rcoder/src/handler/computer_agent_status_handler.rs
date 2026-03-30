@@ -2,13 +2,12 @@
 //!
 //! 查询 Computer Agent 的运行状态（通过 gRPC GetStatus 主动确认）
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::utils::{get_locale_from_headers, get_realtime_container_ip_with_cache};
+use super::utils::{I18nJson, get_locale_from_headers, get_realtime_container_ip_with_cache};
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
 use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse};
@@ -74,7 +73,7 @@ const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 500,
@@ -91,7 +90,7 @@ const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
 pub async fn computer_agent_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<ComputerAgentStatusRequest>,
+    I18nJson(request): I18nJson<ComputerAgentStatusRequest>,
 ) -> Result<HttpResult<ComputerAgentStatusResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
@@ -206,6 +205,7 @@ pub async fn computer_agent_status(
         &grpc_addr,
         &request.project_id,
         GRPC_MAX_RETRIES,
+        locale,
     )
     .await
     {
@@ -327,6 +327,7 @@ async fn call_grpc_get_status_with_retry(
     grpc_addr: &str,
     project_id: &str,
     max_retries: u32,
+    locale: &'static str,
 ) -> anyhow::Result<shared_types::grpc::GetStatusResponse> {
     let mut last_error = None;
 
@@ -339,7 +340,7 @@ async fn call_grpc_get_status_with_retry(
                 };
 
                 // 设置超时
-                let mut tonic_request = tonic::Request::new(request);
+                let mut tonic_request = crate::grpc::new_request_with_locale(request, locale);
                 tonic_request
                     .set_timeout(std::time::Duration::from_secs(GRPC_REQUEST_TIMEOUT_SECS));
 

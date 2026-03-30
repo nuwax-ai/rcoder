@@ -5,14 +5,14 @@
 //! 容器会继续运行其他 project_id 的 Agent。
 
 use axum::http::HeaderMap;
-use axum::{Json, extract::State};
+use axum::extract::State;
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 
 use crate::{AppError, HttpResult, router::AppState};
 use shared_types::{ComputerAgentStopRequest, ComputerAgentStopResponse};
 
-use super::utils::{extract_grpc_addr, get_locale_from_headers};
+use super::utils::{I18nJson, extract_grpc_addr, get_locale_from_headers};
 
 /// 停止 Computer Agent
 ///
@@ -52,7 +52,7 @@ use super::utils::{extract_grpc_addr, get_locale_from_headers};
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 404,
@@ -74,7 +74,7 @@ use super::utils::{extract_grpc_addr, get_locale_from_headers};
 pub async fn computer_agent_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<ComputerAgentStopRequest>,
+    I18nJson(request): I18nJson<ComputerAgentStopRequest>,
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);

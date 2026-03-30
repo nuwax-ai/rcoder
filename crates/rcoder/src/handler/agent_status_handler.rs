@@ -1,9 +1,9 @@
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
-use super::utils::get_locale_from_headers;
+use super::utils::{I18nPath, get_locale_from_headers};
 use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 
 /// 查询Agent状态
@@ -65,7 +65,7 @@ use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         )
     ),
     tag = "agent",
@@ -77,7 +77,7 @@ use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 pub async fn agent_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(project_id): Path<String>,
+    I18nPath(project_id): I18nPath<String>,
 ) -> Result<HttpResult<AgentStatusResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
     let project_id = project_id.trim();

@@ -2,14 +2,14 @@
 //!
 //! 转发停止请求到容器内的 agent_runner 服务
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
-use super::utils::get_locale_from_headers;
+use super::utils::{I18nQuery, get_locale_from_headers};
 use crate::{AppError, HttpResult, router::AppState};
 
 /// 停止Agent请求参数
@@ -219,7 +219,7 @@ async fn destroy_container_for_project(
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 500,
@@ -244,7 +244,7 @@ async fn destroy_container_for_project(
 pub async fn agent_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<StopAgentQuery>,
+    I18nQuery(query): I18nQuery<StopAgentQuery>,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
     let project_id = query.project_id.trim();

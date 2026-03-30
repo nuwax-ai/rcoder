@@ -3,7 +3,7 @@
 //! 将原始 HTTP 请求直接转发到容器内的 agent_runner 服务
 
 use anyhow::Result;
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use shared_types::{ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
-use super::utils::{extract_grpc_addr_with_port, get_locale_from_headers};
+use super::utils::{I18nJson, extract_grpc_addr_with_port, get_locale_from_headers};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -106,7 +106,7 @@ pub struct ChatRequest {
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 500,
@@ -131,7 +131,7 @@ pub struct ChatRequest {
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(mut request): Json<ChatRequest>,
+    I18nJson(mut request): I18nJson<ChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);

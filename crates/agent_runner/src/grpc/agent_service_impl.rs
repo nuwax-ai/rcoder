@@ -33,6 +33,25 @@ use crate::router::AppState;
 use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
 
+const ACCEPT_LANGUAGE_METADATA_KEY: &str = "accept-language";
+
+fn locale_from_grpc_request<T>(request: &Request<T>) -> &'static str {
+    shared_types::parse_accept_language(
+        request
+            .metadata()
+            .get(ACCEPT_LANGUAGE_METADATA_KEY)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+fn localized(locale: &'static str, zh_cn: &str, zh_tw: &str, en_us: &str) -> String {
+    match locale {
+        "zh-CN" => zh_cn.to_string(),
+        "zh-TW" => zh_tw.to_string(),
+        _ => en_us.to_string(),
+    }
+}
+
 /// Convert gRPC ModelProviderConfig to internal ModelProviderConfig
 fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProviderConfig {
     ModelProviderConfig {
@@ -219,6 +238,7 @@ impl AgentService for AgentServiceImpl {
         &self,
         request: Request<GrpcChatRequest>,
     ) -> Result<Response<GrpcChatResponse>, Status> {
+        let locale = locale_from_grpc_request(&request);
         let req = request.into_inner();
 
         // 使用脱敏包装器格式化 model_config
@@ -314,7 +334,7 @@ impl AgentService for AgentServiceImpl {
         };
 
         // 5. 调用共享 handler（busy check、PendingGuard、session 清理均在 handle_chat_core 内完成）
-        let output = handle_chat_core(input, &context).await;
+        let output = shared_types::scope_request_locale(locale, handle_chat_core(input, &context)).await;
 
         // 6. 转换为 gRPC 响应
         let grpc_response = GrpcChatResponse {
@@ -342,8 +362,10 @@ impl AgentService for AgentServiceImpl {
         &self,
         request: Request<ProgressRequest>,
     ) -> Result<Response<Self::SubscribeProgressStream>, Status> {
-        let req = request.into_inner();
-        let session_id = req.session_id.clone();
+        let locale = locale_from_grpc_request(&request);
+        shared_types::scope_request_locale(locale, async move {
+            let req = request.into_inner();
+            let session_id = req.session_id.clone();
 
         info!(
             "📡 [gRPC] SubscribeProgress 开始: session_id={}",
@@ -396,7 +418,12 @@ impl AgentService for AgentServiceImpl {
                                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
                                     session_id: session_id_clone.clone(),
                                     stop_reason: StopReason::Cancelled,
-                                    error_message: Some("用户主动取消任务".to_string()),
+                                    error_message: Some(localized(
+                                        locale,
+                                        "用户主动取消任务",
+                                        "使用者主動取消任務",
+                                        "Task cancelled by user",
+                                    )),
                                     request_id: None,
                                 });
                                 let unified_message = notify.to_unified_message();
@@ -440,7 +467,15 @@ impl AgentService for AgentServiceImpl {
                                         let end_event = ProgressEvent {
                                             message_type: "SessionPromptEnd".to_string(),
                                             sub_type: "end_turn".to_string(),
-                                            payload: r#"{"reason":"EndTurn","description":"Agent 当前无在执行任务"}"#.to_string(),
+                                            payload: format!(
+                                                r#"{{"reason":"EndTurn","description":"{}"}}"#,
+                                                localized(
+                                                    locale,
+                                                    "Agent 当前无在执行任务",
+                                                    "Agent 目前沒有執行中的任務",
+                                                    "Agent has no active task",
+                                                )
+                                            ),
                                             request_id: None,
                                             timestamp: chrono::Utc::now().timestamp_millis(),
                                         };
@@ -472,7 +507,16 @@ impl AgentService for AgentServiceImpl {
                 Err(e) => {
                     warn!("[gRPC] Failed to create session connection: {}", e);
                     if let Err(send_err) = tx
-                        .send(Err(Status::internal(format!("创建连接失败: {}", e))))
+                        .send(Err(Status::internal(format!(
+                            "{}: {}",
+                            localized(
+                                locale,
+                                "创建连接失败",
+                                "建立連線失敗",
+                                "Failed to create connection",
+                            ),
+                            e
+                        ))))
                         .await
                     {
                         warn!(
@@ -484,10 +528,12 @@ impl AgentService for AgentServiceImpl {
             }
         });
 
-        let stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(stream) as Self::SubscribeProgressStream
-        ))
+            let stream = ReceiverStream::new(rx);
+            Ok(Response::new(
+                Box::pin(stream) as Self::SubscribeProgressStream
+            ))
+        })
+        .await
     }
 
     /// Cancel session task
@@ -496,11 +542,13 @@ impl AgentService for AgentServiceImpl {
         &self,
         request: Request<CancelRequest>,
     ) -> Result<Response<CancelResponse>, Status> {
-        let req = request.into_inner();
-        info!(
-            "🛑 [gRPC] CancelSession: session_id={}, project_id={}, reason={}",
-            req.session_id, req.project_id, req.reason
-        );
+        let locale = locale_from_grpc_request(&request);
+        shared_types::scope_request_locale(locale, async move {
+            let req = request.into_inner();
+            info!(
+                "🛑 [gRPC] CancelSession: session_id={}, project_id={}, reason={}",
+                req.session_id, req.project_id, req.reason
+            );
 
         // 🔧 Determine actual session_id
         // When session_id is empty, look up by project_id
@@ -527,7 +575,12 @@ impl AgentService for AgentServiceImpl {
                     return Ok(Response::new(CancelResponse {
                         success: true,
                         result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some("Project has no active session".to_string()),
+                        message: Some(localized(
+                            locale,
+                            "项目当前没有活跃会话",
+                            "專案目前沒有活躍工作階段",
+                            "Project has no active session",
+                        )),
                     }));
                 }
             }
@@ -553,7 +606,12 @@ impl AgentService for AgentServiceImpl {
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("Session does not exist or already completed".to_string()),
+                    message: Some(localized(
+                        locale,
+                        "会话不存在或已完成",
+                        "工作階段不存在或已完成",
+                        "Session does not exist or already completed",
+                    )),
                 }));
             }
         };
@@ -571,7 +629,12 @@ impl AgentService for AgentServiceImpl {
                     return Ok(Response::new(CancelResponse {
                         success: true,
                         result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some("Project has no active session".to_string()),
+                        message: Some(localized(
+                            locale,
+                            "项目当前没有活跃会话",
+                            "專案目前沒有活躍工作階段",
+                            "Project has no active session",
+                        )),
                     }));
                 }
             };
@@ -599,7 +662,12 @@ impl AgentService for AgentServiceImpl {
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("Agent already in idle status".to_string()),
+                    message: Some(localized(
+                        locale,
+                        "Agent 已处于空闲状态",
+                        "Agent 已處於閒置狀態",
+                        "Agent already in idle status",
+                    )),
                 }));
             }
             AgentStatus::Terminating => {
@@ -611,7 +679,12 @@ impl AgentService for AgentServiceImpl {
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some("Agent is already stopping".to_string()),
+                    message: Some(localized(
+                        locale,
+                        "Agent 已在停止中",
+                        "Agent 已在停止中",
+                        "Agent is already stopping",
+                    )),
                 }));
             }
             AgentStatus::Active | AgentStatus::Pending => {
@@ -633,7 +706,12 @@ impl AgentService for AgentServiceImpl {
             return Ok(Response::new(CancelResponse {
                 success: false,
                 result: CancelResultType::CancelResultFailed as i32,
-                message: Some("Cancel channel closed, Agent may have stopped".to_string()),
+                message: Some(localized(
+                    locale,
+                    "取消通道已关闭，Agent 可能已停止",
+                    "取消通道已關閉，Agent 可能已停止",
+                    "Cancel channel closed, Agent may have stopped",
+                )),
             }));
         }
 
@@ -654,7 +732,16 @@ impl AgentService for AgentServiceImpl {
             return Ok(Response::new(CancelResponse {
                 success: false,
                 result: CancelResultType::CancelResultFailed as i32,
-                message: Some(format!("Failed to send cancel notification: {}", e)),
+                message: Some(format!(
+                    "{}: {}",
+                    localized(
+                        locale,
+                        "发送取消通知失败",
+                        "發送取消通知失敗",
+                        "Failed to send cancel notification",
+                    ),
+                    e
+                )),
             }));
         }
 
@@ -686,7 +773,12 @@ impl AgentService for AgentServiceImpl {
                     return Ok(Response::new(CancelResponse {
                         success: false,
                         result: CancelResultType::CancelResultFailed as i32,
-                        message: Some("Agent 取消执行失败".to_string()),
+                        message: Some(localized(
+                            locale,
+                            "Agent 取消执行失败",
+                            "Agent 取消執行失敗",
+                            "Agent cancel execution failed",
+                        )),
                     }));
                 }
             }
@@ -704,7 +796,16 @@ impl AgentService for AgentServiceImpl {
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
                     session_id: actual_session_id.clone(),
                     stop_reason: StopReason::Cancelled,
-                    error_message: Some(format!("Agent 响应通道关闭: {}", e)),
+                    error_message: Some(format!(
+                        "{}: {}",
+                        localized(
+                            locale,
+                            "Agent 响应通道关闭",
+                            "Agent 回應通道關閉",
+                            "Agent response channel closed",
+                        ),
+                        e
+                    )),
                     request_id: None,
                 });
 
@@ -724,7 +825,11 @@ impl AgentService for AgentServiceImpl {
                 return Ok(Response::new(CancelResponse {
                     success: false,
                     result: CancelResultType::CancelResultFailed as i32,
-                    message: Some(format!("响应通道关闭: {}", e)),
+                    message: Some(format!(
+                        "{}: {}",
+                        localized(locale, "响应通道关闭", "回應通道關閉", "Response channel closed"),
+                        e
+                    )),
                 }));
             }
             Err(_) => {
@@ -742,7 +847,12 @@ impl AgentService for AgentServiceImpl {
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
                     session_id: actual_session_id.clone(),
                     stop_reason: StopReason::Cancelled,
-                    error_message: Some("取消请求超时，主动清理资源".to_string()),
+                    error_message: Some(localized(
+                        locale,
+                        "取消请求超时，主动清理资源",
+                        "取消請求逾時，主動清理資源",
+                        "Cancel request timed out; resources were cleaned up",
+                    )),
                     request_id: None,
                 });
 
@@ -794,17 +904,21 @@ impl AgentService for AgentServiceImpl {
                 return Ok(Response::new(CancelResponse {
                     success: false,
                     result: CancelResultType::CancelResultTimeout as i32,
-                    message: Some("取消请求超时（30秒）".to_string()),
+                    message: Some(localized(
+                        locale,
+                        "取消请求超时（30秒）",
+                        "取消請求逾時（30 秒）",
+                        "Cancel request timed out (30 seconds)",
+                    )),
                 }));
             }
         }; // match tokio::time::timeout
 
         // 取消成功后的统一清理逻辑
-        {
-            // 主动发送 SessionPromptEnd 通知 SSE 客户端任务已取消
-            use crate::service::push_session_update_with_project;
-            use sacp::schema::StopReason;
-            use shared_types::{SessionNotify, SessionPromptEnd};
+        // 主动发送 SessionPromptEnd 通知 SSE 客户端任务已取消
+        use crate::service::push_session_update_with_project;
+        use sacp::schema::StopReason;
+        use shared_types::{SessionNotify, SessionPromptEnd};
 
             let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
                 session_id: actual_session_id.clone(),
@@ -858,12 +972,18 @@ impl AgentService for AgentServiceImpl {
                 );
             }
 
-            return Ok(Response::new(CancelResponse {
-                success: true,
-                result: CancelResultType::CancelResultSuccess as i32,
-                message: Some("取消成功".to_string()),
-            }));
-        }
+        Ok(Response::new(CancelResponse {
+            success: true,
+            result: CancelResultType::CancelResultSuccess as i32,
+            message: Some(localized(
+                locale,
+                "取消成功",
+                "取消成功",
+                "Cancelled successfully",
+            )),
+        }))
+        })
+        .await
     }
 
     /// 获取 Agent 状态
@@ -874,11 +994,13 @@ impl AgentService for AgentServiceImpl {
         &self,
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
-        let req = request.into_inner();
-        info!(
-            "📊 [gRPC] GetStatus: project_id={}, session_id={}",
-            req.project_id, req.session_id
-        );
+        let locale = locale_from_grpc_request(&request);
+        shared_types::scope_request_locale(locale, async move {
+            let req = request.into_inner();
+            info!(
+                "📊 [gRPC] GetStatus: project_id={}, session_id={}",
+                req.project_id, req.session_id
+            );
 
         // 优先使用 session_id 查询 project_id
         let project_id = if !req.session_id.is_empty() {
@@ -921,10 +1043,12 @@ impl AgentService for AgentServiceImpl {
         );
 
         // 只在最后需要时才转换为 String
-        Ok(Response::new(GetStatusResponse {
-            status: status_str.to_string(),
-            is_found,
-        }))
+            Ok(Response::new(GetStatusResponse {
+                status: status_str.to_string(),
+                is_found,
+            }))
+        })
+        .await
     }
 
     /// 停止 Agent（用于 ComputerAgentRunner 模式）
@@ -940,13 +1064,22 @@ impl AgentService for AgentServiceImpl {
     ) -> Result<Response<shared_types::grpc::StopAgentResponse>, Status> {
         use shared_types::grpc::StopAgentResponse;
 
-        let req = request.into_inner();
-        let project_id = req.project_id.clone();
-        let force = req.force;
-        let reason = req
-            .reason
-            .clone()
-            .unwrap_or_else(|| "用户请求停止".to_string());
+        let locale = locale_from_grpc_request(&request);
+        shared_types::scope_request_locale(locale, async move {
+            let req = request.into_inner();
+            let project_id = req.project_id.clone();
+            let force = req.force;
+            let reason = req
+                .reason
+                .clone()
+                .unwrap_or_else(|| {
+                    localized(
+                        locale,
+                        "用户请求停止",
+                        "使用者請求停止",
+                        "Stop requested by user",
+                    )
+                });
 
         info!(
             "🛑 [gRPC] StopAgent: project_id={}, force={}, reason={}",
@@ -969,7 +1102,16 @@ impl AgentService for AgentServiceImpl {
                 return Ok(Response::new(StopAgentResponse {
                     success: true,
                     result: "not_found".to_string(),
-                    message: Some(format!("项目 {} 的 Agent 不存在或已停止", project_id)),
+                    message: Some(format!(
+                        "{} {}",
+                        localized(
+                            locale,
+                            "项目的 Agent 不存在或已停止:",
+                            "專案的 Agent 不存在或已停止:",
+                            "Agent not found or already stopped for project:",
+                        ),
+                        project_id
+                    )),
                     project_id,
                 }));
             }
@@ -988,7 +1130,12 @@ impl AgentService for AgentServiceImpl {
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
                     session_id: session_id.clone(),
                     stop_reason: StopReason::Cancelled,
-                    error_message: Some("Agent 已在停止中".to_string()),
+                    error_message: Some(localized(
+                        locale,
+                        "Agent 已在停止中",
+                        "Agent 已在停止中",
+                        "Agent is already stopping",
+                    )),
                     request_id: None,
                 });
 
@@ -1010,7 +1157,16 @@ impl AgentService for AgentServiceImpl {
             return Ok(Response::new(StopAgentResponse {
                 success: true,
                 result: "already_stopped".to_string(),
-                message: Some(format!("项目 {} 的 Agent 已在停止中", project_id)),
+                message: Some(format!(
+                    "{} {}",
+                    localized(
+                        locale,
+                        "项目的 Agent 已在停止中:",
+                        "專案的 Agent 已在停止中:",
+                        "Agent is already stopping for project:",
+                    ),
+                    project_id
+                )),
                 project_id,
             }));
         }
@@ -1145,7 +1301,16 @@ impl AgentService for AgentServiceImpl {
                 "✅ [gRPC] StopAgent 立即返回成功,后台清理中: project_id={}",
                 project_id
             );
-            let response_message = format!("项目 {} 的 Agent 正在停止（后台清理中）", project_id);
+            let response_message = format!(
+                "{} {}",
+                localized(
+                    locale,
+                    "项目的 Agent 正在停止（后台清理中）:",
+                    "專案的 Agent 正在停止（後台清理中）:",
+                    "Agent is stopping (background cleanup in progress) for project:",
+                ),
+                project_id
+            );
 
             return Ok(Response::new(StopAgentResponse {
                 success: true,
@@ -1182,7 +1347,16 @@ impl AgentService for AgentServiceImpl {
                 return Ok(Response::new(StopAgentResponse {
                     success: false,
                     result: "error".to_string(),
-                    message: Some(format!("发送取消通知失败: {}", e)),
+                    message: Some(format!(
+                        "{}: {}",
+                        localized(
+                            locale,
+                            "发送取消通知失败",
+                            "發送取消通知失敗",
+                            "Failed to send cancel notification",
+                        ),
+                        e
+                    )),
                     project_id,
                 }));
             }
@@ -1249,8 +1423,16 @@ impl AgentService for AgentServiceImpl {
                                 project_id
                             );
 
-                            let response_message =
-                                format!("项目 {} 的 Agent 已成功停止", project_id);
+                            let response_message = format!(
+                                "{} {}",
+                                localized(
+                                    locale,
+                                    "项目的 Agent 已成功停止:",
+                                    "專案的 Agent 已成功停止:",
+                                    "Agent stopped successfully for project:",
+                                ),
+                                project_id
+                            );
 
                             // 获取 stop_handle 并在后台执行清理
                             if let Some(ref stop_handle) = agent_info.stop_handle {
@@ -1310,7 +1492,12 @@ impl AgentService for AgentServiceImpl {
                             return Ok(Response::new(StopAgentResponse {
                                 success: false,
                                 result: "error".to_string(),
-                                message: Some("移除 Agent 失败".to_string()),
+                                message: Some(localized(
+                                    locale,
+                                    "移除 Agent 失败",
+                                    "移除 Agent 失敗",
+                                    "Failed to remove Agent",
+                                )),
                                 project_id,
                             }));
                         }
@@ -1325,7 +1512,12 @@ impl AgentService for AgentServiceImpl {
                         return Ok(Response::new(StopAgentResponse {
                             success: false,
                             result: "error".to_string(),
-                            message: Some("取消会话失败".to_string()),
+                            message: Some(localized(
+                                locale,
+                                "取消会话失败",
+                                "取消工作階段失敗",
+                                "Failed to cancel session",
+                            )),
                             project_id,
                         }));
                     }
@@ -1345,7 +1537,16 @@ impl AgentService for AgentServiceImpl {
                         let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
                             session_id: session_id.clone(),
                             stop_reason: StopReason::Cancelled,
-                            error_message: Some(format!("Agent 响应通道关闭: {}", e)),
+                            error_message: Some(format!(
+                                "{}: {}",
+                                localized(
+                                    locale,
+                                    "Agent 响应通道关闭",
+                                    "Agent 回應通道關閉",
+                                    "Agent response channel closed",
+                                ),
+                                e
+                            )),
                             request_id: None,
                         });
 
@@ -1367,7 +1568,16 @@ impl AgentService for AgentServiceImpl {
                     return Ok(Response::new(StopAgentResponse {
                         success: false,
                         result: "error".to_string(),
-                        message: Some(format!("响应通道关闭: {}", e)),
+                        message: Some(format!(
+                            "{}: {}",
+                            localized(
+                                locale,
+                                "响应通道关闭",
+                                "回應通道關閉",
+                                "Response channel closed",
+                            ),
+                            e
+                        )),
                         project_id,
                     }));
                 }
@@ -1379,7 +1589,12 @@ impl AgentService for AgentServiceImpl {
                     return Ok(Response::new(StopAgentResponse {
                         success: false,
                         result: "error".to_string(),
-                        message: Some("取消请求超时（30秒）".to_string()),
+                        message: Some(localized(
+                            locale,
+                            "取消请求超时（30秒）",
+                            "取消請求逾時（30 秒）",
+                            "Cancel request timed out (30 seconds)",
+                        )),
                         project_id,
                     }));
                 }
@@ -1391,12 +1606,19 @@ impl AgentService for AgentServiceImpl {
             "⚠️ [gRPC] StopAgent 走到了意外分支: project_id={}",
             project_id
         );
-        Ok(Response::new(StopAgentResponse {
-            success: false,
-            result: "error".to_string(),
-            message: Some("意外的代码分支".to_string()),
-            project_id,
-        }))
+            Ok(Response::new(StopAgentResponse {
+                success: false,
+                result: "error".to_string(),
+                message: Some(localized(
+                    locale,
+                    "意外的代码分支",
+                    "意外的程式分支",
+                    "Unexpected code path",
+                )),
+                project_id,
+            }))
+        })
+        .await
     }
 
     /// 查询容器状态（用于容器生命周期管理）
@@ -1408,7 +1630,9 @@ impl AgentService for AgentServiceImpl {
         &self,
         request: Request<GetContainerStatusRequest>,
     ) -> Result<Response<GetContainerStatusResponse>, Status> {
-        let req = request.into_inner();
+        let locale = locale_from_grpc_request(&request);
+        shared_types::scope_request_locale(locale, async move {
+            let req = request.into_inner();
 
         info!(
             "🔍 [GET_CONTAINER_STATUS] 收到容器状态查询: user_id={}, project_id={}",
@@ -1445,7 +1669,9 @@ impl AgentService for AgentServiceImpl {
             response.is_active, response.active_tasks, response.status, response.uptime_seconds
         );
 
-        Ok(Response::new(response))
+            Ok(Response::new(response))
+        })
+        .await
     }
 
     /// 查询 VNC 服务状态
@@ -1461,7 +1687,9 @@ impl AgentService for AgentServiceImpl {
         &self,
         request: Request<GetVncStatusRequest>,
     ) -> Result<Response<GetVncStatusResponse>, Status> {
-        let req = request.into_inner();
+        let locale = locale_from_grpc_request(&request);
+        shared_types::scope_request_locale(locale, async move {
+            let req = request.into_inner();
 
         info!(
             "🖥️ [GET_VNC_STATUS] 收到 VNC 状态查询: user_id={:?}, project_id={:?}",
@@ -1493,11 +1721,21 @@ impl AgentService for AgentServiceImpl {
 
         // 4. 生成状态消息
         let message = if vnc_ready && novnc_ready {
-            "VNC 服务已就绪".to_string()
+            localized(locale, "VNC 服务已就绪", "VNC 服務已就緒", "VNC service is ready")
         } else if file_exists && !novnc_port_ready {
-            "VNC 标记存在，但 noVNC 端口 6080 不可达".to_string()
+            localized(
+                locale,
+                "VNC 标记存在，但 noVNC 端口 6080 不可达",
+                "VNC 標記存在，但 noVNC 埠 6080 無法連線",
+                "VNC marker exists, but noVNC port 6080 is unreachable",
+            )
         } else {
-            "VNC 服务未就绪（启动中或启动失败）".to_string()
+            localized(
+                locale,
+                "VNC 服务未就绪（启动中或启动失败）",
+                "VNC 服務尚未就緒（啟動中或啟動失敗）",
+                "VNC service is not ready (starting or failed)",
+            )
         };
 
         let uptime_seconds = self.get_uptime_seconds();
@@ -1514,7 +1752,9 @@ impl AgentService for AgentServiceImpl {
             response.vnc_ready, response.novnc_ready, response.message, response.uptime_seconds
         );
 
-        Ok(Response::new(response))
+            Ok(Response::new(response))
+        })
+        .await
     }
 }
 

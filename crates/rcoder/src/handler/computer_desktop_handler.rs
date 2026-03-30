@@ -21,7 +21,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -31,6 +31,7 @@ use tracing::{error, info, instrument, warn};
 use utoipa::ToSchema;
 
 use super::utils::get_locale_from_headers;
+use super::utils::I18nPath;
 use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 
 /// VNC 桌面路径参数
@@ -141,7 +142,7 @@ const NOVNC_PORT: u16 = 6080;
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 404,
@@ -163,7 +164,7 @@ const NOVNC_PORT: u16 = 6080;
 pub async fn computer_desktop_vnc(
     State(_state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(params): Path<DesktopPathParams>,
+    I18nPath(params): I18nPath<DesktopPathParams>,
 ) -> Result<HttpResult<DesktopAccessResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
     let user_id = params.user_id.clone();
@@ -358,7 +359,7 @@ window.open('/computer/vnc/user_123/proj_456/vnc.html', '_blank');
 #[allow(dead_code)]
 pub async fn computer_desktop_proxy(
     State(_state): State<Arc<AppState>>,
-    Path((user_id, project_id, path)): Path<(String, String, Option<String>)>,
+    I18nPath((user_id, project_id, path)): I18nPath<(String, String, Option<String>)>,
 ) -> impl IntoResponse {
     // 占位实现：实际代理由 Pingora 处理
     // 这里返回 501 是为了表明这个端点应该由 Pingora 代理
@@ -507,7 +508,7 @@ ws.onmessage = (event) => {
 #[allow(dead_code)]
 pub async fn computer_audio_proxy(
     State(_state): State<Arc<AppState>>,
-    Path((user_id, project_id, path)): Path<(String, String, Option<String>)>,
+    I18nPath((user_id, project_id, path)): I18nPath<(String, String, Option<String>)>,
 ) -> impl IntoResponse {
     let error_response = DesktopErrorResponse {
         error: "PROXY_REDIRECT".to_string(),
@@ -652,7 +653,7 @@ imeWs.onmessage = (event) => {
 #[allow(dead_code)]
 pub async fn computer_ime_proxy(
     State(_state): State<Arc<AppState>>,
-    Path((user_id, project_id, path)): Path<(String, String, Option<String>)>,
+    I18nPath((user_id, project_id, path)): I18nPath<(String, String, Option<String>)>,
 ) -> impl IntoResponse {
     let error_response = DesktopErrorResponse {
         error: "PROXY_REDIRECT".to_string(),

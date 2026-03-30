@@ -21,7 +21,7 @@
 //!
 //! 注意：Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{extract::State, http::HeaderMap};
 use shared_types::{ChatResponse, ComputerChatRequest};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
@@ -30,7 +30,8 @@ use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerMa
 use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
-    extract_grpc_addr_with_port, get_locale_from_headers, get_realtime_container_ip_with_cache,
+    I18nJson, extract_grpc_addr_with_port, get_locale_from_headers,
+    get_realtime_container_ip_with_cache,
     project_dir,
 };
 
@@ -77,7 +78,7 @@ use super::utils::{
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 500,
@@ -94,7 +95,7 @@ use super::utils::{
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(mut request): Json<ComputerChatRequest>,
+    I18nJson(mut request): I18nJson<ComputerChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
@@ -333,7 +334,10 @@ pub async fn handle_computer_chat(
                     session_id: "".to_string(), // 我们只关心 project 级别的状态
                 };
 
-                match client.get_status(status_req).await {
+                let mut grpc_request = crate::grpc::new_request_with_locale(status_req, locale);
+                grpc_request.set_timeout(std::time::Duration::from_secs(5));
+
+                match client.get_status(grpc_request).await {
                     Ok(resp) => {
                         let status = resp.into_inner().status;
                         info!(

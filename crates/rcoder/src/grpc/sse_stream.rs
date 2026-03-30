@@ -21,6 +21,7 @@ pub async fn create_grpc_sse_stream(
     session_id: String,
     project_id: String,
     pool: std::sync::Arc<crate::grpc::GrpcChannelPool>,
+    locale: &'static str,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
     let (tx, rx) = tokio::sync::mpsc::channel(100);
@@ -52,10 +53,13 @@ pub async fn create_grpc_sse_stream(
             };
 
             // 🆕 2. 先检查 Agent 状态（使用 session_id 查询）
-            let status_request = tonic::Request::new(GetStatusRequest {
-                project_id: String::new(),            // 不使用 project_id
-                session_id: session_id_clone.clone(), // 使用 session_id 查询
-            });
+            let status_request = crate::grpc::new_request_with_locale(
+                GetStatusRequest {
+                    project_id: String::new(),            // 不使用 project_id
+                    session_id: session_id_clone.clone(), // 使用 session_id 查询
+                },
+                locale,
+            );
 
             match client.get_status(status_request).await {
                 Ok(response) => {
@@ -90,9 +94,12 @@ pub async fn create_grpc_sse_stream(
             }
 
             // 3. 发送 SubscribeProgress 请求
-            let request = tonic::Request::new(ProgressRequest {
-                session_id: session_id_clone.clone(),
-            });
+            let request = crate::grpc::new_request_with_locale(
+                ProgressRequest {
+                    session_id: session_id_clone.clone(),
+                },
+                locale,
+            );
 
             match client.subscribe_progress(request).await {
                 Ok(response) => {

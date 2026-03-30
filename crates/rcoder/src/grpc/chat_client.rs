@@ -60,7 +60,8 @@ pub async fn grpc_chat_with_pool(
  debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);
 
     // 构建 tonic Request 并设置请求级别超时
-    let mut request = tonic::Request::new(grpc_request);
+    let locale = super::current_grpc_locale();
+    let mut request = super::new_request_with_locale(grpc_request, locale);
 
     // ✅ 使用 Tonic 原生 API 设置请求超时
     if let Some(timeout) = request_timeout {
@@ -122,8 +123,11 @@ pub async fn grpc_cancel_session_with_pool(
  debug!("[gRPC_CANCEL] sendrequest: {:?}", grpc_request);
 
     // 发送请求
+    let locale = super::current_grpc_locale();
+    let request = super::new_request_with_locale(grpc_request, locale);
+
     let response = client
-        .cancel_session(tonic::Request::new(grpc_request))
+        .cancel_session(request)
         .await
         .map_err(|e| {
  error!("[gRPC_CANCEL] CancelSession RPC message failed: {}", e);
@@ -178,8 +182,11 @@ pub async fn grpc_stop_agent_with_pool(
  debug!("[gRPC_STOP_AGENT] sendrequest: {:?}", grpc_request);
 
     // 发送请求
+    let locale = super::current_grpc_locale();
+    let request = super::new_request_with_locale(grpc_request, locale);
+
     let response = client
-        .stop_agent(tonic::Request::new(grpc_request))
+        .stop_agent(request)
         .await
         .map_err(|e| {
  error!("[gRPC_STOP_AGENT] StopAgent RPC message failed: {}", e);

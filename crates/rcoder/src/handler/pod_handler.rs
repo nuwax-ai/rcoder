@@ -9,7 +9,6 @@
 //! - `POST /computer/pod/keepalive` - 容器保活（刷新活动时间）
 
 use axum::extract::State;
-use axum::{Json, extract::Query};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -17,7 +16,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::{IntoParams, ToSchema};
 
-use super::utils::extract_grpc_addr_with_port;
+use super::utils::{I18nJson, I18nQuery, extract_grpc_addr_with_port};
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::vnc_sync::sync_single_vnc_backend;
@@ -388,7 +387,7 @@ pub struct RestartPodResponse {
     path = "/computer/pod/count",
     responses(
         (status = 200, description = "成功获取容器数量", body = HttpResult<PodCountResponse>),
-        (status = 401, description = "API Key 鉴权失败", body = String),
+        (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -459,7 +458,7 @@ pub async fn pod_count(
     ),
     responses(
         (status = 200, description = "成功获取容器列表", body = HttpResult<PodListResponse>),
-        (status = 401, description = "API Key 鉴权失败", body = String),
+        (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -470,7 +469,7 @@ pub async fn pod_count(
 #[instrument(skip(state))]
 pub async fn pod_list(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<PodListQuery>,
+    I18nQuery(params): I18nQuery<PodListQuery>,
 ) -> Result<HttpResult<PodListResponse>, AppError> {
  debug!("📋 [POD_LIST] getcontainer message : limit={:?}", params.limit);
 
@@ -649,7 +648,7 @@ pub async fn pod_list(
     responses(
         (status = 200, description = "成功启动/获取容器", body = HttpResult<EnsurePodResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
-        (status = 401, description = "API Key 鉴权失败", body = String),
+        (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -660,21 +659,23 @@ pub async fn pod_list(
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_ensure(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<EnsurePodRequest>,
+    I18nJson(request): I18nJson<EnsurePodRequest>,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    let locale = shared_types::current_request_locale();
+
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_ENSURE] user_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id is required",
+            locale,
         ));
     }
     if request.project_id.trim().is_empty() {
         error!("[POD_ENSURE] project_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required",
+            locale,
         ));
     }
 
@@ -682,9 +683,9 @@ pub async fn pod_ensure(
     if let Some(ref limits) = request.resource_limits {
         if let Err(e) = validate_resource_limits(limits) {
  error!("[POD_ENSURE] resources message failed: {}", e);
-            return Ok(HttpResult::error(
+            return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
-                &format!("Invalid resource_limits: {}", e),
+                locale,
             ));
         }
     }
@@ -1122,7 +1123,7 @@ pub async fn pod_ensure(
     responses(
         (status = 200, description = "成功刷新活动时间", body = HttpResult<KeepalivePodResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
-        (status = 401, description = "API Key 鉴权失败", body = String),
+        (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -1133,21 +1134,23 @@ pub async fn pod_ensure(
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_keepalive(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<KeepalivePodRequest>,
+    I18nJson(request): I18nJson<KeepalivePodRequest>,
 ) -> Result<HttpResult<KeepalivePodResponse>, AppError> {
+    let locale = shared_types::current_request_locale();
+
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_KEEPALIVE] user_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id is required",
+            locale,
         ));
     }
     if request.project_id.trim().is_empty() {
         error!("[POD_KEEPALIVE] project_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required",
+            locale,
         ));
     }
 
@@ -1199,12 +1202,9 @@ pub async fn pod_keepalive(
             None => {
                 // Docker 中也没有容器，返回错误而不是创建新容器
  info!("❌ [POD_KEEPALIVE] containernot found: user_id={}", request.user_id);
-                return Ok(HttpResult::error(
+                return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-                    &format!(
-                        "找不到用户 {} 的容器，请先发送聊天请求创建容器",
-                        request.user_id
-                    ),
+                    locale,
                 ));
             }
         }
@@ -1277,7 +1277,7 @@ pub async fn pod_keepalive(
     responses(
         (status = 200, description = "成功重启容器", body = HttpResult<RestartPodResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
-        (status = 401, description = "API Key 鉴权失败", body = String),
+        (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -1288,21 +1288,23 @@ pub async fn pod_keepalive(
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_restart(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<RestartPodRequest>,
+    I18nJson(request): I18nJson<RestartPodRequest>,
 ) -> Result<HttpResult<RestartPodResponse>, AppError> {
+    let locale = shared_types::current_request_locale();
+
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_RESTART] user_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id is required",
+            locale,
         ));
     }
     if request.project_id.trim().is_empty() {
         error!("[POD_RESTART] project_id is required");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required",
+            locale,
         ));
     }
 
@@ -1310,9 +1312,9 @@ pub async fn pod_restart(
     if let Some(ref limits) = request.resource_limits {
         if let Err(e) = validate_resource_limits(limits) {
  error!("[POD_RESTART] resources message failed: {}", e);
-            return Ok(HttpResult::error(
+            return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
-                &format!("Invalid resource_limits: {}", e),
+                locale,
             ));
         }
     }
@@ -1569,7 +1571,7 @@ pub struct PodStatusResponse {
     responses(
         (status = 200, description = "成功查询容器状态", body = HttpResult<PodStatusResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
-        (status = 401, description = "API Key 鉴权失败", body = String),
+        (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -1580,14 +1582,16 @@ pub struct PodStatusResponse {
 #[instrument(skip(_state), fields(project_id = ?params.project_id, user_id = ?params.user_id))]
 pub async fn pod_status(
     State(_state): State<Arc<AppState>>,
-    Query(params): Query<PodStatusQuery>,
+    I18nQuery(params): I18nQuery<PodStatusQuery>,
 ) -> Result<HttpResult<PodStatusResponse>, AppError> {
+    let locale = shared_types::current_request_locale();
+
     // 1. 验证参数：至少需要 user_id 或 project_id 之一
     if params.user_id.is_none() && params.project_id.is_none() {
  error!("[POD_STATUS] user_id message project_id message ");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 和 project_id 至少需要提供一个",
+            locale,
         ));
     }
 
@@ -1776,7 +1780,7 @@ pub struct VncStatusResponse {
     responses(
         (status = 200, description = "成功获取 VNC 状态", body = HttpResult<VncStatusResponse>),
         (status = 400, description = "参数无效", body = HttpResult<String>),
-        (status = 401, description = "API Key 鉴权失败", body = String),
+        (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 404, description = "容器不存在", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
@@ -1788,8 +1792,10 @@ pub struct VncStatusResponse {
 #[instrument(skip(state))]
 pub async fn pod_vnc_status(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<VncStatusQuery>,
+    I18nQuery(params): I18nQuery<VncStatusQuery>,
 ) -> Result<HttpResult<VncStatusResponse>, AppError> {
+    let locale = shared_types::current_request_locale();
+
     // 1. 参数验证：user_id 和 project_id 不能同时为空
     let user_id = params.user_id.as_deref().filter(|s| !s.trim().is_empty());
     let project_id = params
@@ -1799,9 +1805,9 @@ pub async fn pod_vnc_status(
 
     if user_id.is_none() && project_id.is_none() {
  warn!("[POD_VNC_STATUS] user_id message project_id message empty");
-        return Ok(HttpResult::error(
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 和 project_id 不能同时为空",
+            locale,
         ));
     }
 
@@ -1857,12 +1863,9 @@ pub async fn pod_vnc_status(
                 "📭 [POD_VNC_STATUS] 容器不存在: user_id={:?}, project_id={:?}",
                 user_id, project_id
             );
-            return Ok(HttpResult::error(
+            return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-                &format!(
-                    "容器不存在: user_id={:?}, project_id={:?}",
-                    user_id, project_id
-                ),
+                locale,
             ));
         }
     };
@@ -1894,9 +1897,9 @@ pub async fn pod_vnc_status(
                 "❌ [POD_VNC_STATUS] 无法获取容器服务信息: container_id={}",
                 result.container_id
             );
-            return Ok(HttpResult::error(
+            return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                "无法获取容器服务地址",
+                locale,
             ));
         }
     };
@@ -1913,10 +1916,13 @@ pub async fn pod_vnc_status(
 
     match state.grpc_pool.get_client(&grpc_addr).await {
         Ok(mut client) => {
-            let grpc_request = shared_types::grpc::GetVncStatusRequest {
-                user_id: user_id.map(String::from),
-                project_id: project_id.map(String::from),
-            };
+            let grpc_request = crate::grpc::new_request_with_locale(
+                shared_types::grpc::GetVncStatusRequest {
+                    user_id: user_id.map(String::from),
+                    project_id: project_id.map(String::from),
+                },
+                locale,
+            );
 
             match client.get_vnc_status(grpc_request).await {
                 Ok(response) => {
@@ -1936,18 +1942,18 @@ pub async fn pod_vnc_status(
                 }
                 Err(e) => {
  error!("[POD_VNC_STATUS] gRPC message failed: {}", e);
-                    Ok(HttpResult::error(
+                    Ok(HttpResult::error_with_locale(
                         shared_types::error_codes::ERR_GRPC_ERROR,
-                        &format!("gRPC 调用失败: {}", e),
+                        locale,
                     ))
                 }
             }
         }
         Err(e) => {
  error!("[POD_VNC_STATUS] message gRPC connectionfailed: {}", e);
-            Ok(HttpResult::error(
+            Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
-                &format!("建立 gRPC 连接失败: {}", e),
+                locale,
             ))
         }
     }

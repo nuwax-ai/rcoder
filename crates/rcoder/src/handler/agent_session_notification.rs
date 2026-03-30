@@ -2,10 +2,10 @@
 //!
 //! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
 
-use super::utils::get_realtime_container_ip_with_cache;
+use super::utils::{I18nPath, get_realtime_container_ip_with_cache};
 use crate::{AppError, HttpResult};
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{
         Response,
@@ -624,6 +624,7 @@ async fn build_sse_stream_from_container_name(
     project_id: String,
     grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
+    locale: &'static str,
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     // Get latest container IP from Docker API in real-time（带缓存）
@@ -680,6 +681,7 @@ async fn build_sse_stream_from_container_name(
         session_id.clone(),
         project_id,
         grpc_pool.clone(),
+        locale,
     )
     .await;
 
@@ -812,7 +814,7 @@ eventSource.onerror = (error) => {
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 404,
@@ -868,9 +870,10 @@ eventSource.onerror = (error) => {
 详细的事件格式和示例请参考响应描述中的 "SSE 事件格式" 部分。"#
 )]
 pub async fn agent_session_notification(
-    Path(params): Path<SessionNotificationParams>,
+    I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
     info!(
         "🔍 [SSE_PROXY] 收到SSE连接请求: session_id={:?}",
@@ -888,6 +891,7 @@ pub async fn agent_session_notification(
         project_id,
         state.grpc_pool.clone(),
         state.container_ip_cache.clone(),
+        locale,
         "Agent",
     )
     .await
@@ -972,9 +976,10 @@ pub async fn agent_session_notification(
 返回的 SSE 事件遵循 `ProgressEventDoc` 结构，与标准 Agent 接口完全一致。详细的事件类型和使用示例请参考 `/agent/progress/{session_id}` 接口文档。"#
 )]
 pub async fn computer_agent_progress_notification(
-    Path(params): Path<SessionNotificationParams>,
+    I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
     info!(
         "🔍 [SSE_PROXY] 收到 Computer Agent SSE连接请求: session_id={:?}",
@@ -992,6 +997,7 @@ pub async fn computer_agent_progress_notification(
         project_id,
         state.grpc_pool.clone(),
         state.container_ip_cache.clone(),
+        locale,
         "Computer Agent",
     )
     .await
@@ -1151,14 +1157,36 @@ fn create_passthrough_event(event_text: &str) -> Option<Event> {
 
 /// 创建错误响应
 fn create_error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    let error_body = HttpResult::<()>::error(code, message);
+    let locale = shared_types::current_request_locale();
+    let mapped_code = map_error_code_for_locale(code);
+    let localized_message = shared_types::get_error_message(mapped_code, locale);
+    let error_body = HttpResult::<()>::error(code, &localized_message);
     let json_body = serde_json::to_string(&error_body).unwrap_or_default();
+
+    debug!(
+        "[SSE_PROXY] create error response: code={}, status={}, locale={}, original_message={}",
+        code, status, locale, message
+    );
 
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
         .body(json_body.into())
         .unwrap_or_else(|_| Response::new("Internal Server Error".into()))
+}
+
+fn map_error_code_for_locale(code: &str) -> &str {
+    use shared_types::error_codes;
+
+    match code {
+        "SESSION_NOT_FOUND" | "SESSION_EXPIRED" => error_codes::ERR_SESSION_NOT_FOUND,
+        "CONTAINER_NOT_FOUND" => error_codes::ERR_CONTAINER_NOT_FOUND,
+        "GRPC_CONNECTION_ERROR" => error_codes::ERR_GRPC_ERROR,
+        "CONTAINER_ERROR" => error_codes::ERR_CONTAINER_ERROR,
+        "INVALID_DATA" => error_codes::ERR_INVALID_PARAMS,
+        error_codes::ERR_INTERNAL_SERVER_ERROR => error_codes::ERR_INTERNAL_SERVER_ERROR,
+        _ => error_codes::ERR_UNKNOWN,
+    }
 }
 
 /// 获取容器的 SSE 端点 URL
