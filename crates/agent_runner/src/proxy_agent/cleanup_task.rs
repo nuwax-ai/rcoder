@@ -105,13 +105,13 @@ impl AgentCleaner {
                     let session_data = session_data_ref.clone();
                     drop(session_data_ref);
 
-                    let message_count = session_data.message_count().await;
+                        let message_count = session_data.message_count().await;
 
-                    if message_count > 0 {
-                        info!(
-                            "发现孤立session: session_id={}, 消息数量={}",
-                            session_id, message_count
-                        );
+                        if message_count > 0 {
+                            info!(
+                                "Found orphaned session: session_id={}, message_count={}",
+                                session_id, message_count
+                            );
 
                         // 清理这个session的消息 - 直接移除条目
                         if SESSION_CACHE.remove(&session_id).is_some() {
@@ -144,7 +144,7 @@ impl AgentCleaner {
 
         if orphaned_count > 0 {
             info!(
-                "清理孤立SSE session完成: session数量={}, 消息数量={}",
+                "Orphaned SSE session cleanup completed: session_count={}, message_count={}",
                 orphaned_count, messages_cleared
             );
         }
@@ -165,7 +165,7 @@ impl AgentCleaner {
         let total_agents = registry_stats.agent_count;
 
         info!(
-            "开始清理闲置agent和SSE消息，当前时间: {}，当前活动agent数量: {}",
+            "Starting cleanup for idle agents and SSE messages, current_time: {}, active_agent_count: {}",
             current_time, total_agents
         );
 
@@ -185,7 +185,7 @@ impl AgentCleaner {
             {
                 let idle_duration = (current_time - agent_info.last_activity).num_seconds();
                 info!(
-                    "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒, 创建时间: {}",
+                    "Found idle agent: project_id={}, status={:?}, last_activity: {}, idle_duration_seconds: {}, created_at: {}",
                     project_id,
                     agent_info.status,
                     agent_info.last_activity,
@@ -226,7 +226,7 @@ impl AgentCleaner {
         let cached_sessions = SESSION_CACHE.len();
 
         info!(
-            "清理完成: agent(总共={}, 成功={}, 失败={}, 剩余={}) | session(活跃={}, 缓存={}) | SSE消息(清理={})",
+            "Cleanup completed: agent(total={}, success={}, failed={}, remaining={}) | session(active={}, cached={}) | sse_messages(cleared={})",
             cleaned_count,
             success_count,
             failed_count,
@@ -262,13 +262,13 @@ impl AgentCleaner {
             // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
             crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
             debug!(
-                "🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
+                "🧼 [cleanup] Cleared project_id from SESSION_REQUEST_CONTEXT: {}",
                 project_id
             );
 
             if removed.is_some() {
                 info!(
-                    "Agent已从Registry中移除，AgentLifecycleGuard将自动清理资源: {}",
+                    "Agent removed from Registry; AgentLifecycleGuard will clean up resources automatically: {}",
                     project_id
                 );
             } else {

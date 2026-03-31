@@ -334,7 +334,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
             Entry::Vacant(entry) => {
                 let data = SessionData::new(1000);
                 info!(
-                    "📦 [push_session_update] SESSION_CACHE 自动创建: session_id={}",
+                    "📦 [push_session_update] SESSION_CACHE auto-created: session_id={}",
                     session_id
                 );
                 entry.insert(data.clone());
@@ -399,7 +399,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
         Some(mapped_sid) if mapped_sid == session_id => {
             // session_id 相同，不需要做任何操作
             debug!(
-                "📋 Project session映射未变化: project_id={}, session_id={}",
+                "📋 Project session mapping unchanged: project_id={}, session_id={}",
                 project_id, session_id
             );
             0
@@ -407,7 +407,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
         Some(old_session_id) => {
             // session_id 发生变化，需要清理旧 session 的数据
             info!(
-                "🔄 检测到Project session变化: project_id={}, old_session_id={}, new_session_id={}",
+                "🔄 Detected project session change: project_id={}, old_session_id={}, new_session_id={}",
                 project_id, old_session_id, session_id
             );
 
@@ -418,7 +418,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
                 if let Some((_, old_session_data)) = SESSION_CACHE.remove(&old_session_id) {
                     old_session_data.close_current_connection().await;
                     info!(
-                        "🔌 [ensure_project_session] 已关闭旧 session SSE 连接: old_session_id={}",
+                        "🔌 [ensure_project_session] Closed old session SSE connection: old_session_id={}",
                         old_session_id
                     );
                     1 // 移除了1个session
@@ -431,12 +431,12 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
 
             if cleared_count > 0 {
                 info!(
-                    "🧹 已清理旧session数据并更新映射: project_id={}, old_session_id={}, new_session_id={}, cleared_count={}",
+                    "🧹 Cleared old session data and updated mapping: project_id={}, old_session_id={}, new_session_id={}, cleared_count={}",
                     project_id, old_session_id, session_id, cleared_count
                 );
             } else {
                 info!(
-                    "📝 已更新Project session映射: project_id={}, old_session_id={}, new_session_id={}",
+                    "📝 Updated project session mapping: project_id={}, old_session_id={}, new_session_id={}",
                     project_id, old_session_id, session_id
                 );
             }
@@ -448,7 +448,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             // 注意：此时 AGENT_REGISTRY 中可能还没有这个 project 的记录
             // 这种情况下不需要调用 update_session，因为 agent 注册时会调用 register
             info!(
-                "🆕 Project session 首次出现: project_id={}, session_id={}",
+                "🆕 Project session first seen: project_id={}, session_id={}",
                 project_id, session_id
             );
             0
