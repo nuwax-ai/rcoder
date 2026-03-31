@@ -31,7 +31,7 @@ impl<'a> NetworkDetector<'a> {
             )
         })?;
 
- debug!("detect message container hostname: {}", hostname);
+        debug!("detect message container hostname: {}", hostname);
 
         // Inspect 当前容器
         let inspect = self
@@ -52,7 +52,7 @@ impl<'a> NetworkDetector<'a> {
             // 查找包含 "agent-network" 的网络
             for network_name in networks.keys() {
                 if network_name.contains(RCODER_NETWORK_BASE_NAME) {
- info!(" message detect message : {}", network_name);
+                    info!(" message detect message : {}", network_name);
                     return Ok(network_name.clone());
                 }
             }
@@ -94,7 +94,10 @@ impl<'a> NetworkDetector<'a> {
         if let Some(labels) = inspect.config.and_then(|c| c.labels) {
             // Docker Compose 会添加 com.docker.compose.project 标签
             if let Some(project_name) = labels.get("com.docker.compose.project") {
- info!(" message container labels getproject message : {}", project_name);
+                info!(
+                    " message container labels getproject message : {}",
+                    project_name
+                );
                 return Ok(Some(project_name.clone()));
             }
         }
@@ -124,7 +127,10 @@ impl<'a> NetworkDetector<'a> {
             // 容器名称格式: /{project_name}-{service_name}-{number}
             let clean_name = name.trim_start_matches('/');
             if let Some(project_name) = clean_name.split('-').next() {
- info!(" message container message project message : {}", project_name);
+                info!(
+                    " message container message project message : {}",
+                    project_name
+                );
                 return Ok(Some(project_name.to_string()));
             }
         }
@@ -150,7 +156,7 @@ impl<'a> NetworkDetector<'a> {
     ) -> DockerResult<Option<String>> {
         // 方法1: 环境变量
         if let Ok(project_name) = std::env::var("COMPOSE_PROJECT_NAME") {
- info!(" message getproject message : {}", project_name);
+            info!(" message getproject message : {}", project_name);
             return Ok(Some(project_name));
         }
 
@@ -167,7 +173,7 @@ impl<'a> NetworkDetector<'a> {
             return Ok(Some(project_name));
         }
 
- warn!("unable toget Docker Compose project message ");
+        warn!("unable toget Docker Compose project message ");
         Ok(None)
     }
 }

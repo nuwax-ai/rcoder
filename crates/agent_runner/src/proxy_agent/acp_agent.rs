@@ -171,7 +171,10 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
                         request_id: Some(request_id),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
-                        error!("Failed to send error response (receiver closed): {:?}", send_err);
+                        error!(
+                            "Failed to send error response (receiver closed): {:?}",
+                            send_err
+                        );
                     }
                     continue;
                 }
@@ -203,7 +206,10 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
                     request_id: Some(request_id.clone()),
                     service_type: request.prompt_message.service_type.clone(),
                 }) {
-                    error!("Failed to send error response (receiver closed): {:?}", send_err);
+                    error!(
+                        "Failed to send error response (receiver closed): {:?}",
+                        send_err
+                    );
                 }
                 continue;
             }
@@ -323,7 +329,10 @@ pub async fn agent_worker_with_heartbeat(
                 // 限制模式（Docker 容器部署）
                 let active = AGENT_REGISTRY.stats().agent_count;
                 let limit = get_concurrency_limit();
-                info!("💓 [Worker] Heartbeat - active sessions: {}/{}", active, limit);
+                info!(
+                    "💓 [Worker] Heartbeat - active sessions: {}/{}",
+                    active, limit
+                );
             }
 
             // 🔥 P1 修复: 使用原子操作直接更新时间戳（无锁）
@@ -417,7 +426,10 @@ pub async fn agent_worker_with_heartbeat(
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
-                        error!("Failed to send error response (receiver closed): {:?}", send_err);
+                        error!(
+                            "Failed to send error response (receiver closed): {:?}",
+                            send_err
+                        );
                     }
                     return;
                 }
@@ -462,7 +474,10 @@ pub async fn agent_worker_with_heartbeat(
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
-                        error!("Failed to send reject response (receiver closed): {:?}", send_err);
+                        error!(
+                            "Failed to send reject response (receiver closed): {:?}",
+                            send_err
+                        );
                     }
                     return;
                 } else {

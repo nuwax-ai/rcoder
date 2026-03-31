@@ -40,10 +40,10 @@ impl ProxyServer {
         // 注意：这是一个库，实际的 Pingora 服务器需要由调用者启动
         // 这里只是准备服务实例
         let pingora_proxy = self.service.create_pingora_proxy().map_err(|e| {
- error!("[SERVER] created Pingora proxy message failed: {}", e);
+            error!("[SERVER] created Pingora proxy message failed: {}", e);
             e
         })?;
- info!("Pingora proxy message already message ");
+        info!("Pingora proxy message already message ");
         info!(
             "负载均衡算法: {}",
             if pingora_proxy.use_round_robin {
@@ -58,20 +58,23 @@ impl ProxyServer {
 
     /// 记录启动信息
     fn log_startup_info(&self) {
- info!(" message Pingora message proxy message config:");
- info!(" listenport: {}", self.config.listen_port);
- info!(" default message port: {}", self.config.default_backend_port);
- info!(" message : {}", self.config.backend_host);
- info!(" portparams message : {}", self.config.port_param);
- info!("proxy message :");
- info!(" /proxy/3000/path - message port 3000 message ");
- info!(" ?port=3000 - message params message port 3000 message ( message )");
- info!("Pingora message :");
- info!(" - message (Round Robin/Ketama)");
- info!(" - message check");
- info!(" - connection message connectionreuse");
- info!(" - HTTP/1.1 message HTTP/2 message ");
- info!(" - message I/O");
+        info!(" message Pingora message proxy message config:");
+        info!(" listenport: {}", self.config.listen_port);
+        info!(
+            " default message port: {}",
+            self.config.default_backend_port
+        );
+        info!(" message : {}", self.config.backend_host);
+        info!(" portparams message : {}", self.config.port_param);
+        info!("proxy message :");
+        info!(" /proxy/3000/path - message port 3000 message ");
+        info!(" ?port=3000 - message params message port 3000 message ( message )");
+        info!("Pingora message :");
+        info!(" - message (Round Robin/Ketama)");
+        info!(" - message check");
+        info!(" - connection message connectionreuse");
+        info!(" - HTTP/1.1 message HTTP/2 message ");
+        info!(" - message I/O");
     }
 
     /// 获取服务实例
@@ -106,7 +109,7 @@ impl ProxyServer {
             .validate()
             .map_err(|e| anyhow::anyhow!("配置验证失败: {}", e))?;
 
- info!("Pingora proxy message startedcheck message ");
+        info!("Pingora proxy message startedcheck message ");
         Ok(())
     }
 

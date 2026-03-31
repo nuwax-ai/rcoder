@@ -91,12 +91,12 @@ impl AgentInstaller for NpmInstaller {
             package_name.clone()
         };
 
- info!(" message {} message : {}", npm_cmd, package_spec);
+        info!(" message {} message : {}", npm_cmd, package_spec);
 
         // Run npm install -g
         // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
         let output = if package_name == "nuwaxcode" {
- info!("🌐 nuwaxcode message : https://registry.npmjs.org/");
+            info!("🌐 nuwaxcode message : https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
                 &[
@@ -124,7 +124,7 @@ impl AgentInstaller for NpmInstaller {
             // Try to get installed version
             let version = self.parse_installed_version(&stdout);
 
- info!(" message succeeded: {}", package_spec);
+            info!(" message succeeded: {}", package_spec);
             Ok(InstallResult::success(
                 version,
                 format!("Successfully installed {}", package_spec),
@@ -182,7 +182,7 @@ impl AgentInstaller for NpmInstaller {
         // Run npm update -g
         // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
         let output = if package_name == "nuwaxcode" {
- info!("🌐 nuwaxcode message : https://registry.npmjs.org/");
+            info!("🌐 nuwaxcode message : https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
                 &[

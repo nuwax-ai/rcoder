@@ -42,7 +42,7 @@ impl AgentStatusChecker {
                 Ok(false) // Query failed，允许清理
             }
             Err(_) => {
- debug!("⏰ [status_checker] gRPC message timeout");
+                debug!("⏰ [status_checker] gRPC message timeout");
                 Ok(false) // 超时，允许清理
             }
         }

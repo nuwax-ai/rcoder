@@ -40,7 +40,10 @@ impl ContainerManager {
     pub async fn get_container_info(
         project_id: &str,
     ) -> Result<Option<ContainerBasicInfo>, AppError> {
- debug!("[CONTAINER_MGR] getcontainer message : project_id={}", project_id);
+        debug!(
+            "[CONTAINER_MGR] getcontainer message : project_id={}",
+            project_id
+        );
 
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
@@ -84,7 +87,10 @@ async fn ensure_container_exists(
 
     // 1. 尝试获取现有容器
     if let Ok(Some(info)) = docker_manager.get_agent_info(project_id).await {
- info!("[CONTAINER_MGR] containeralreadyexists: {}", info.container_id);
+        info!(
+            "[CONTAINER_MGR] containeralreadyexists: {}",
+            info.container_id
+        );
         return Ok(info);
     }
 

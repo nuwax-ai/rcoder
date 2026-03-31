@@ -629,7 +629,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Some(ref cleanup_config) = config.agent_cleanup
         && let Err(e) = cleanup_config.validate()
     {
-        warn!("Agent cleanup config validation failed: {}, using defaults", e);
+        warn!(
+            "Agent cleanup config validation failed: {}, using defaults",
+            e
+        );
         config.agent_cleanup = Some(AgentCleanupConfig::default());
     }
 
@@ -637,7 +640,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Some(ref concurrency_config) = config.agent_concurrency
         && let Err(e) = concurrency_config.validate()
     {
-        warn!("Agent concurrency config validation failed: {}, using defaults", e);
+        warn!(
+            "Agent concurrency config validation failed: {}, using defaults",
+            e
+        );
         config.agent_concurrency = Some(AgentConcurrencyConfig::default());
     }
 
@@ -656,7 +662,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                 unhealthy_threshold: 3,
             },
         };
-        info!("Reverse proxy enabled, listening on port: {}", proxy_config.listen_port);
+        info!(
+            "Reverse proxy enabled, listening on port: {}",
+            proxy_config.listen_port
+        );
         config.proxy_config = Some(proxy_config);
     }
 
@@ -683,7 +692,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     if let Some(ref grpc_timeouts) = config.grpc_timeouts
         && let Err(e) = grpc_timeouts.validate()
     {
-        warn!("gRPC timeout config validation failed: {}, using defaults", e);
+        warn!(
+            "gRPC timeout config validation failed: {}, using defaults",
+            e
+        );
         config.grpc_timeouts = Some(GrpcTimeoutConfig::default());
     }
 

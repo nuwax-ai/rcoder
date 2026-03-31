@@ -88,7 +88,7 @@ fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
     // 创建东八区时区偏移 (UTC+8)
     // 注意: east_opt 在参数有效时总是返回 Some，这里使用 unwrap_or 仅作为安全保障
     let utc8_offset = FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| {
- tracing::warn!("created UTC+8 message failed, message UTC+0");
+        tracing::warn!("created UTC+8 message failed, message UTC+0");
         FixedOffset::east_opt(0).unwrap_or(FixedOffset::east_opt(0).unwrap())
     });
 
@@ -398,7 +398,7 @@ pub struct RestartPodResponse {
 pub async fn pod_count(
     State(_state): State<Arc<AppState>>,
 ) -> Result<HttpResult<PodCountResponse>, AppError> {
- debug!("📊 [POD_COUNT] getcontainer message ");
+    debug!("📊 [POD_COUNT] getcontainer message ");
 
     // 获取全局 DockerManager
     let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -471,7 +471,10 @@ pub async fn pod_list(
     State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<PodListQuery>,
 ) -> Result<HttpResult<PodListResponse>, AppError> {
- debug!("📋 [POD_LIST] getcontainer message : limit={:?}", params.limit);
+    debug!(
+        "📋 [POD_LIST] getcontainer message : limit={:?}",
+        params.limit
+    );
 
     // 1. 获取 Docker 容器列表
     let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -682,7 +685,7 @@ pub async fn pod_ensure(
     // 1.1 验证资源限制
     if let Some(ref limits) = request.resource_limits {
         if let Err(e) = validate_resource_limits(limits) {
- error!("[POD_ENSURE] resources message failed: {}", e);
+            error!("[POD_ENSURE] resources message failed: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
                 locale,
@@ -860,13 +863,13 @@ pub async fn pod_ensure(
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
             // Docker 删除是异步操作，立即创建同名容器可能导致资源冲突
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
- debug!("⏱️ [POD_ENSURE] already message containerresourcesreleased");
+            debug!("⏱️ [POD_ENSURE] already message containerresourcesreleased");
 
             true
         }
         None => {
             // 容器不存在，需要创建
- info!("🏗️ [POD_ENSURE] containernot found, message created message container");
+            info!("🏗️ [POD_ENSURE] containernot found, message created message container");
             true
         }
     };
@@ -928,7 +931,10 @@ pub async fn pod_ensure(
                         ))
                         .await;
                     } else {
- error!("[POD_ENSURE] containercreatedfailed(alreadyretry {} message )", max_attempts);
+                        error!(
+                            "[POD_ENSURE] containercreatedfailed(alreadyretry {} message )",
+                            max_attempts
+                        );
                     }
                 }
             }
@@ -985,7 +991,10 @@ pub async fn pod_ensure(
                             break;
                         }
                         _ => {
- debug!("[POD_ENSURE] message mapping message not message : message {} message ", retry_attempt);
+                            debug!(
+                                "[POD_ENSURE] message mapping message not message : message {} message ",
+                                retry_attempt
+                            );
                         }
                     }
                 }
@@ -1193,15 +1202,22 @@ pub async fn pod_keepalive(
                         .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                     project_info.set_container(Some(info.clone()));
                     state.insert_project(request.project_id.clone(), Arc::new(project_info));
- info!("[POD_KEEPALIVE] containeralreadyexists(Docker), already message DuckDB message ");
+                    info!(
+                        "[POD_KEEPALIVE] containeralreadyexists(Docker), already message DuckDB message "
+                    );
                 } else {
- info!("[POD_KEEPALIVE] containeralreadyexists(Docker), DuckDB already message ");
+                    info!(
+                        "[POD_KEEPALIVE] containeralreadyexists(Docker), DuckDB already message "
+                    );
                 }
                 (info, false)
             }
             None => {
                 // Docker 中也没有容器，返回错误而不是创建新容器
- info!("❌ [POD_KEEPALIVE] containernot found: user_id={}", request.user_id);
+                info!(
+                    "❌ [POD_KEEPALIVE] containernot found: user_id={}",
+                    request.user_id
+                );
                 return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
                     locale,
@@ -1311,7 +1327,7 @@ pub async fn pod_restart(
     // 1.1 验证资源限制
     if let Some(ref limits) = request.resource_limits {
         if let Err(e) = validate_resource_limits(limits) {
- error!("[POD_RESTART] resources message failed: {}", e);
+            error!("[POD_RESTART] resources message failed: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
                 locale,
@@ -1416,7 +1432,10 @@ pub async fn pod_restart(
                     break;
                 }
                 Err(e) => {
- warn!("[POD_RESTART] checkcontainerremovedstatus message : {}, message alreadyremoved", e);
+                    warn!(
+                        "[POD_RESTART] checkcontainerremovedstatus message : {}, message alreadyremoved",
+                        e
+                    );
                     // 如果是其他错误，也可能意味着Container status abnormal，尝试继续
                     deletion_confirmed = true;
                     break;
@@ -1588,7 +1607,7 @@ pub async fn pod_status(
 
     // 1. 验证参数：至少需要 user_id 或 project_id 之一
     if params.user_id.is_none() && params.project_id.is_none() {
- error!("[POD_STATUS] user_id message project_id message ");
+        error!("[POD_STATUS] user_id message project_id message ");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -1702,7 +1721,7 @@ pub async fn pod_status(
                     // 容器不存在
                 }
                 Err(e) => {
- error!("[POD_STATUS] message project_id Query failed: {}", e);
+                    error!("[POD_STATUS] message project_id Query failed: {}", e);
                     // 继续返回 not_found 而不是错误
                 }
             }
@@ -1804,7 +1823,7 @@ pub async fn pod_vnc_status(
         .filter(|s| !s.trim().is_empty());
 
     if user_id.is_none() && project_id.is_none() {
- warn!("[POD_VNC_STATUS] user_id message project_id message empty");
+        warn!("[POD_VNC_STATUS] user_id message project_id message empty");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -1912,7 +1931,10 @@ pub async fn pod_vnc_status(
             AppError::internal_server_error(&format!("Failed to extract gRPC address: {}", e))
         })?;
 
- info!("📡 [POD_VNC_STATUS] message gRPC connection: addr={}", grpc_addr);
+    info!(
+        "📡 [POD_VNC_STATUS] message gRPC connection: addr={}",
+        grpc_addr
+    );
 
     match state.grpc_pool.get_client(&grpc_addr).await {
         Ok(mut client) => {
@@ -1941,7 +1963,7 @@ pub async fn pod_vnc_status(
                     }))
                 }
                 Err(e) => {
- error!("[POD_VNC_STATUS] gRPC message failed: {}", e);
+                    error!("[POD_VNC_STATUS] gRPC message failed: {}", e);
                     Ok(HttpResult::error_with_locale(
                         shared_types::error_codes::ERR_GRPC_ERROR,
                         locale,
@@ -1950,7 +1972,7 @@ pub async fn pod_vnc_status(
             }
         }
         Err(e) => {
- error!("[POD_VNC_STATUS] message gRPC connectionfailed: {}", e);
+            error!("[POD_VNC_STATUS] message gRPC connectionfailed: {}", e);
             Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 locale,

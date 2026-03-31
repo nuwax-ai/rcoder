@@ -129,7 +129,7 @@ fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String
         let path = build_mcp_server_path_env();
         if !path.is_empty() {
             merged_envs.insert("PATH".to_string(), path);
- debug!("[SACP] 📋 alreadybuilt PATH message ( message PATH message directory)");
+            debug!("[SACP] 📋 alreadybuilt PATH message ( message PATH message directory)");
         }
     }
     #[cfg(windows)]
@@ -242,7 +242,7 @@ fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<Str
     if !merged_envs.contains_key("PATHEXT") {
         if let Ok(pathext) = std::env::var("PATHEXT") {
             merged_envs.insert("PATHEXT".to_string(), pathext);
- debug!("[SACP] 📋 already message PATHEXT message ");
+            debug!("[SACP] 📋 already message PATHEXT message ");
         }
     }
 }
@@ -302,7 +302,10 @@ pub async fn load_sacp_agent_config(
     let config = AgentServersConfig::load_or_default_for_service(service_type).await;
 
     if let Some(agent_config) = config.get_agent("claude-code-acp-ts") {
- debug!("📋 [SACP] message default Agent config: {}", agent_config.agent_id);
+        debug!(
+            "📋 [SACP] message default Agent config: {}",
+            agent_config.agent_id
+        );
 
         // 检查并安装 agent
         if agent_config.installation.package_name.is_some() {
@@ -313,13 +316,16 @@ pub async fn load_sacp_agent_config(
             {
                 Ok(result) => {
                     if result.already_installed {
- debug!("[SACP] Agent already message : {}", agent_config.command);
+                        debug!("[SACP] Agent already message : {}", agent_config.command);
                     } else {
- info!("[SACP] Agent message succeeded: {}", result.message);
+                        info!("[SACP] Agent message succeeded: {}", result.message);
                     }
                 }
                 Err(e) => {
- warn!("[SACP] Agent message Installation failed: {}, message started", e);
+                    warn!(
+                        "[SACP] Agent message Installation failed: {}, message started",
+                        e
+                    );
                 }
             }
         }
@@ -352,7 +358,7 @@ pub async fn load_sacp_agent_config(
             context_servers: config.context_servers.clone(),
         })
     } else {
- warn!("[SACP] config message not message claude-code-acp-ts, message defaultconfig");
+        warn!("[SACP] config message not message claude-code-acp-ts, message defaultconfig");
         get_default_sacp_agent_config(model_provider, service_type)
     }
 }
@@ -512,14 +518,16 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
 
     // 检查日志级别是否为 debug
     if !is_debug_log_level() {
- debug!("[MCP] mcp-proxy convert detect message, message debug, skip message params message ");
+        debug!(
+            "[MCP] mcp-proxy convert detect message, message debug, skip message params message "
+        );
         return args;
     }
 
     // 检查是否已有 --diagnostic 参数
     let has_diagnostic = args.iter().any(|arg| arg == "--diagnostic");
     if has_diagnostic {
- debug!("[MCP] mcp-proxy convert already message --diagnostic params, skip message ");
+        debug!("[MCP] mcp-proxy convert already message --diagnostic params, skip message ");
         return args;
     }
 
@@ -527,11 +535,11 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
 
     // 追加 --diagnostic 参数
     enhanced_args.push("--diagnostic".to_string());
- info!("[MCP] message mcp-proxy convert message --diagnostic params");
+    info!("[MCP] message mcp-proxy convert message --diagnostic params");
 
     // 🔒 关键检查：如果用户已配置 --log-dir 或 --log-file，不覆盖
     if has_log_dir_arg(&enhanced_args) {
- debug!("[MCP] message alreadyconfig message params, skip --log-dir message ");
+        debug!("[MCP] message alreadyconfig message params, skip --log-dir message ");
         return enhanced_args;
     }
 
@@ -539,7 +547,10 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
     if let Some(log_dir) = get_mcp_proxy_log_dir() {
         enhanced_args.push("--log-dir".to_string());
         enhanced_args.push(log_dir.clone());
- info!("[MCP] message mcp-proxy convert message --log-dir {} params", log_dir);
+        info!(
+            "[MCP] message mcp-proxy convert message --log-dir {} params",
+            log_dir
+        );
     }
 
     enhanced_args
@@ -756,17 +767,20 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 创建 CancellationToken
         let cancel_token = CancellationToken::new();
 
- info!("[SACP] projectworkdirectory: {}", &project_path.to_string_lossy());
+        info!(
+            "[SACP] projectworkdirectory: {}",
+            &project_path.to_string_lossy()
+        );
 
         // 准备 MCP 服务器
         let mcp_servers = if start_config.has_mcp_servers() {
- info!("[SACP] message AgentStartConfig message MCP message ");
+            info!("[SACP] message AgentStartConfig message MCP message ");
             start_config.mcp_servers.clone()
         } else if !default_agent_config.context_servers.is_empty() {
- info!("[SACP] message configfile message MCP message ");
+            info!("[SACP] message configfile message MCP message ");
             convert_context_servers_sacp(&default_agent_config.context_servers)
         } else {
- info!("📝 [SACP] notconfig MCP message ");
+            info!("📝 [SACP] notconfig MCP message ");
             Vec::new()
         };
 
@@ -848,10 +862,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     );
                 }
 
- debug!("[SACP] 🔒 alreadyforce message /proxy URL");
+                debug!("[SACP] 🔒 alreadyforce message /proxy URL");
             }
         } else {
- debug!("[SACP] 🔓 message proxy message, message API Key message Base URL");
+            debug!("[SACP] 🔓 message proxy message, message API Key message Base URL");
         }
 
         // 🔍 打印传递给 Agent 的完整环境变量（用于调试）
@@ -860,7 +874,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             "[SACP] 📋 启动 Agent 命令: {} {:?}",
             command_path, command_args
         );
- debug!("[SACP] 📋 workdirectory: {:?}", project_path);
+        debug!("[SACP] 📋 workdirectory: {:?}", project_path);
         debug!(
             "[SACP] 📋 传递给 Agent 的环境变量 ({} 个):",
             merged_envs.len()
@@ -923,10 +937,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
 
         #[cfg(not(any(unix, windows)))]
- compile_error!(" message unix message windows message ");
+        compile_error!(" message unix message windows message ");
 
         let child_pid = child.id().unwrap_or(0);
- info!("[SACP] Claude Code ACP child processalreadystarted, PID: {}", child_pid);
+        info!(
+            "[SACP] Claude Code ACP child processalreadystarted, PID: {}",
+            child_pid
+        );
 
         // 获取 stdio 句柄（process_wrap 使用方法访问 stdio）
         let stdin = take_stdio(&mut child.stdin(), "stdin")?;
@@ -965,7 +982,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             let result = run_sacp_connection(transport, params).await;
 
             if let Err(e) = result {
- error!("[SACP] Claude Code ACP Agent connectionfailed: {}", e);
+                error!("[SACP] Claude Code ACP Agent connectionfailed: {}", e);
             }
         });
 
@@ -988,26 +1005,26 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
             loop {
                 tokio::select! {
-                    biased; // 优先检查取消信号
+                                   biased; // 优先检查取消信号
 
-                    _ = cancel_token_for_stderr.cancelled() => {
- debug!("[SACP] stderr message cancel message ");
-                        break;
-                    }
-                    result = lines.next_line() => {
-                        match result {
-                            Ok(Some(line)) if !line.trim().is_empty() => {
-                                warn!("[SACP] Claude Code Agent stderr: {}", line.trim());
-                            }
-                            Ok(Some(_)) => {} // 空行，忽略
-                            Ok(None) => break, // EOF
-                            Err(e) => {
- error!("[SACP] message stderr failed: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
+                                   _ = cancel_token_for_stderr.cancelled() => {
+                debug!("[SACP] stderr message cancel message ");
+                                       break;
+                                   }
+                                   result = lines.next_line() => {
+                                       match result {
+                                           Ok(Some(line)) if !line.trim().is_empty() => {
+                                               warn!("[SACP] Claude Code Agent stderr: {}", line.trim());
+                                           }
+                                           Ok(Some(_)) => {} // 空行，忽略
+                                           Ok(None) => break, // EOF
+                                           Err(e) => {
+                error!("[SACP] message stderr failed: {}", e);
+                                               break;
+                                           }
+                                       }
+                                   }
+                               }
             }
         });
 
@@ -1510,7 +1527,7 @@ async fn handle_permission_request(
     request: RequestPermissionRequest,
     request_cx: JrRequestCx<RequestPermissionResponse>,
 ) -> Result<(), sacp::Error> {
- debug!("[SACP] message request: {:?}", request);
+    debug!("[SACP] message request: {:?}", request);
 
     // 自动允许：优先选择 AllowAlways，其次 AllowOnce
     let selected = request

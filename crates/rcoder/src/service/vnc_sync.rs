@@ -69,7 +69,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
     // 获取所有容器（DockerManager 已经管理了所有容器的元数据）
     let containers = docker_manager.list_containers().await;
     if containers.is_empty() {
- debug!("[VNC_SYNC] message container");
+        debug!("[VNC_SYNC] message container");
         return;
     }
 
@@ -166,7 +166,10 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
             synced_count, updated_count
         );
     } else if synced_count > 0 {
- debug!("[VNC_SYNC] message completed: check={}, message updated", synced_count);
+        debug!(
+            "[VNC_SYNC] message completed: check={}, message updated",
+            synced_count
+        );
     }
 
     // === 清理已销毁容器的旧映射 ===
@@ -178,12 +181,18 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
         if !active_user_ids.contains(user_id) {
             pingora_service.remove_vnc_backend(user_id);
             removed_count += 1;
- debug!("🗑️ [VNC_SYNC] cleanupalreadydestroycontainer message mapping: user_id={}", user_id);
+            debug!(
+                "🗑️ [VNC_SYNC] cleanupalreadydestroycontainer message mapping: user_id={}",
+                user_id
+            );
         }
     }
 
     if removed_count > 0 {
- info!("🗑️ [VNC_SYNC] cleanupcompleted: removed={} message mapping", removed_count);
+        info!(
+            "🗑️ [VNC_SYNC] cleanupcompleted: removed={} message mapping",
+            removed_count
+        );
     }
 }
 

@@ -162,7 +162,10 @@ pub async fn handle_computer_chat(
         }
         Entry::Vacant(entry) => {
             let data = SessionData::new(1000);
-            info!("[HTTP] SESSION_CACHE created: session_id={}", session_id_str);
+            info!(
+                "[HTTP] SESSION_CACHE created: session_id={}",
+                session_id_str
+            );
             entry.insert(data.clone());
             data
         }

@@ -334,7 +334,8 @@ impl AgentService for AgentServiceImpl {
         };
 
         // 5. 调用共享 handler（busy check、PendingGuard、session 清理均在 handle_chat_core 内完成）
-        let output = shared_types::scope_request_locale(locale, handle_chat_core(input, &context)).await;
+        let output =
+            shared_types::scope_request_locale(locale, handle_chat_core(input, &context)).await;
 
         // 6. 转换为 gRPC 响应
         let grpc_response = GrpcChatResponse {
@@ -1002,47 +1003,47 @@ impl AgentService for AgentServiceImpl {
                 req.project_id, req.session_id
             );
 
-        // 优先使用 session_id 查询 project_id
-        let project_id = if !req.session_id.is_empty() {
-            // 通过 session_id 反查 project_id
-            AGENT_REGISTRY.get_project_by_session(&req.session_id)
-        } else if !req.project_id.is_empty() {
-            // 使用提供的 project_id
-            Some(req.project_id)
-        } else {
-            // 两者都为空，返回 idle 且 is_found=false
-            info!("📊 [gRPC] GetStatus: all parameters are empty, returning not_found");
-            return Ok(Response::new(GetStatusResponse {
-                status: "idle".to_string(),
-                is_found: false,
-            }));
-        };
-
-        // 查询 Agent 状态 - 使用 &str 避免重复 to_string()
-        let (status_str, is_found) = if let Some(ref pid) = project_id {
-            if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid) {
-                let status_str = match agent_info.status {
-                    AgentStatus::Pending => "busy",
-                    AgentStatus::Active => "busy",
-                    AgentStatus::Idle => "idle",
-                    AgentStatus::Terminating => "busy",
-                };
-                (status_str, true) // Agent 存在
+            // 优先使用 session_id 查询 project_id
+            let project_id = if !req.session_id.is_empty() {
+                // 通过 session_id 反查 project_id
+                AGENT_REGISTRY.get_project_by_session(&req.session_id)
+            } else if !req.project_id.is_empty() {
+                // 使用提供的 project_id
+                Some(req.project_id)
             } else {
-                // project_id 不存在，说明 Agent 已完成/未注册
+                // 两者都为空，返回 idle 且 is_found=false
+                info!("📊 [gRPC] GetStatus: all parameters are empty, returning not_found");
+                return Ok(Response::new(GetStatusResponse {
+                    status: "idle".to_string(),
+                    is_found: false,
+                }));
+            };
+
+            // 查询 Agent 状态 - 使用 &str 避免重复 to_string()
+            let (status_str, is_found) = if let Some(ref pid) = project_id {
+                if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid) {
+                    let status_str = match agent_info.status {
+                        AgentStatus::Pending => "busy",
+                        AgentStatus::Active => "busy",
+                        AgentStatus::Idle => "idle",
+                        AgentStatus::Terminating => "busy",
+                    };
+                    (status_str, true) // Agent 存在
+                } else {
+                    // project_id 不存在，说明 Agent 已完成/未注册
+                    ("idle", false)
+                }
+            } else {
+                // session_id 没有对应的 project_id，说明 session 不存在或已完成
                 ("idle", false)
-            }
-        } else {
-            // session_id 没有对应的 project_id，说明 session 不存在或已完成
-            ("idle", false)
-        };
+            };
 
-        info!(
-            "📊 [gRPC] GetStatus 结果: status={}, is_found={}, project_id={:?}",
-            status_str, is_found, project_id
-        );
+            info!(
+                "📊 [gRPC] GetStatus 结果: status={}, is_found={}, project_id={:?}",
+                status_str, is_found, project_id
+            );
 
-        // 只在最后需要时才转换为 String
+            // 只在最后需要时才转换为 String
             Ok(Response::new(GetStatusResponse {
                 status: status_str.to_string(),
                 is_found,

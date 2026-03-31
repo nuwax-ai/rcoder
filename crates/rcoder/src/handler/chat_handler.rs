@@ -188,11 +188,17 @@ pub async fn handle_chat(
 
     // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
     let _ = {
- info!("[CHAT] startingget/createdproject message : project_id={}", project_id);
+        info!(
+            "[CHAT] startingget/createdproject message : project_id={}",
+            project_id
+        );
 
         // 检查项目是否存在
         if let Some(existing_info) = state.get_project(&project_id) {
- info!("[CHAT] updated message project message : project_id={}", project_id);
+            info!(
+                "[CHAT] updated message project message : project_id={}",
+                project_id
+            );
 
             // 检查是否需要更新扩展状态
             let needs_extended_update = existing_info.container().is_none()
@@ -222,11 +228,17 @@ pub async fn handle_chat(
             } else {
                 // 只需要更新活动时间
                 state.update_activity(&project_id);
- info!("[CHAT] project message updatedcompleted: project_id={}", project_id);
+                info!(
+                    "[CHAT] project message updatedcompleted: project_id={}",
+                    project_id
+                );
                 existing_info
             }
         } else {
- info!("[CHAT] created message project message : project_id={}", project_id);
+            info!(
+                "[CHAT] created message project message : project_id={}",
+                project_id
+            );
 
             // 创建新的 ProjectAndContainerInfo
             let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
@@ -252,13 +264,13 @@ pub async fn handle_chat(
     // 请求到达时立即更新活动时间（不等待请求执行结果）
     // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
     state.update_activity(&project_id);
- debug!("[CHAT] alreadyupdated message : project_id={}", project_id);
+    debug!("[CHAT] alreadyupdated message : project_id={}", project_id);
 
     // 🆕 自动查找 session_id 逻辑
     // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
     let session_id_to_use = match &request.session_id {
         Some(sid) if !sid.is_empty() => {
- debug!("[CHAT] message session_id: {}", sid);
+            debug!("[CHAT] message session_id: {}", sid);
             sid.clone()
         }
         _ => {
@@ -275,13 +287,15 @@ pub async fn handle_chat(
                             sid.to_string()
                         }
                         _ => {
- debug!("[CHAT] projectexists message session_id, created message session");
+                            debug!(
+                                "[CHAT] projectexists message session_id, created message session"
+                            );
                             String::new()
                         }
                     }
                 }
                 None => {
- debug!("[CHAT] not message project, created message session");
+                    debug!("[CHAT] not message project, created message session");
                     String::new()
                 }
             }
@@ -298,7 +312,7 @@ pub async fn handle_chat(
     // 🆕 自动查找 session_id 逻辑结束
 
     // 第三步：转发请求到容器服务（使用全局连接池）
- info!("[CHAT] starting message request message container message ");
+    info!("[CHAT] starting message request message container message ");
     let result = forward_request_to_container_service(
         &request_for_forward,
         &container_info,
@@ -306,7 +320,7 @@ pub async fn handle_chat(
         locale,
     )
     .await;
- info!("[CHAT] container message : success={}", result.is_ok());
+    info!("[CHAT] container message : success={}", result.is_ok());
 
     // 响应后状态更新 - 使用 DuckDB 存储
     // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
@@ -351,10 +365,10 @@ pub async fn handle_chat(
     if result.as_ref().map_or(true, |r| {
         !r.is_success() && r.data.as_ref().map_or(true, |d| d.session_id.is_empty())
     }) {
- error!("[CHAT] container message error: {:?}", result);
+        error!("[CHAT] container message error: {:?}", result);
     }
 
- info!("[CHAT] message : project_id={}", project_id);
+    info!("[CHAT] message : project_id={}", project_id);
 
     result
 }
@@ -371,7 +385,7 @@ async fn forward_request_to_container_service(
     let project_id = if let Some(id) = &request.project_id {
         id.clone()
     } else {
- error!("[FORWARD]session project_id is required");
+        error!("[FORWARD]session project_id is required");
         return Ok(crate::HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -464,7 +478,7 @@ async fn forward_request_to_container_service(
                     continue;
                 } else if !should_retry {
                     // 不可重试错误：直接返回
- error!("[FORWARD] detect message retryerror, stoppedretry: {}", e);
+                    error!("[FORWARD] detect message retryerror, stoppedretry: {}", e);
                     last_error = Some(e);
                     break;
                 }
@@ -477,7 +491,7 @@ async fn forward_request_to_container_service(
 
     // 如果所有重试都失败
     if let Some(e) = last_error {
- error!("[FORWARD] gRPC message failed: {}", e);
+        error!("[FORWARD] gRPC message failed: {}", e);
 
         // gRPC 通信失败，直接返回错误
         // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回

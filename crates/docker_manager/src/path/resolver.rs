@@ -43,7 +43,7 @@ impl HostPathResolver {
     /// # Returns
     /// * `DockerResult<Self>` - 路径解析器或错误
     pub async fn new_with_docker_socket(docker_socket_path: Option<String>) -> DockerResult<Self> {
- debug!("startingcreated HostPathResolver");
+        debug!("startingcreated HostPathResolver");
 
         // 创建容器自检器
         let socket_path = docker_socket_path
@@ -138,7 +138,10 @@ impl HostPathResolver {
     /// # }
     /// ```
     pub fn resolve_to_host_path(&self, container_path: &Path) -> DockerResult<PathBuf> {
- debug!(" message containerpath message path: {}", container_path.display());
+        debug!(
+            " message containerpath message path: {}",
+            container_path.display()
+        );
 
         // 如果路径是相对路径，先转换为绝对路径（相对于容器工作空间）
         let container_path = if container_path.is_relative() {

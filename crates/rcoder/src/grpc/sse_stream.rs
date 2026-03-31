@@ -349,7 +349,7 @@ pub async fn get_container_grpc_addr(project_id: &str, grpc_port: u16) -> anyhow
 
     let grpc_addr = format!("{}:{}", agent_info.container_ip, grpc_port);
 
- info!("[CONTAINER] getcontainer gRPC message : {}", grpc_addr);
+    info!("[CONTAINER] getcontainer gRPC message : {}", grpc_addr);
     Ok(grpc_addr)
 }
 

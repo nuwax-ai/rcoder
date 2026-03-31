@@ -77,11 +77,12 @@ mod tests {
             api_key: "valid-key".to_string(),
         }));
 
-        let app = Router::new()
-            .route("/chat", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                api_key_middleware_handler(Arc::clone(&config), req, next)
-            }));
+        let app =
+            Router::new()
+                .route("/chat", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(move |req, next| {
+                    api_key_middleware_handler(Arc::clone(&config), req, next)
+                }));
 
         let response = app
             .oneshot(
@@ -125,11 +126,12 @@ mod tests {
             api_key: "valid-key".to_string(),
         }));
 
-        let app = Router::new()
-            .route("/chat", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                api_key_middleware_handler(Arc::clone(&config), req, next)
-            }));
+        let app =
+            Router::new()
+                .route("/chat", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(move |req, next| {
+                    api_key_middleware_handler(Arc::clone(&config), req, next)
+                }));
 
         let response = app
             .oneshot(

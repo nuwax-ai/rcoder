@@ -4,8 +4,8 @@
 //! 与 RCoder 的 agent_stop 不同，这里只停止单个 project_id 的 Agent，
 //! 容器会继续运行其他 project_id 的 Agent。
 
-use axum::http::HeaderMap;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 
@@ -111,7 +111,7 @@ pub async fn computer_agent_stop(
     let container_info = match container_info {
         Some(info) => info,
         None => {
- warn!("[COMPUTER_STOP] message container: user_id={}", user_id);
+            warn!("[COMPUTER_STOP] message container: user_id={}", user_id);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
                 locale,
@@ -132,7 +132,7 @@ pub async fn computer_agent_stop(
 
     // 提取 gRPC 地址
     let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
- info!("[COMPUTER_STOP] gRPC message : {}", grpc_addr);
+    info!("[COMPUTER_STOP] gRPC message : {}", grpc_addr);
 
     // 调用 StopAgent RPC
     match crate::grpc::grpc_stop_agent_with_pool(
@@ -175,7 +175,10 @@ pub async fn computer_agent_stop(
                 // Agent 停止失败或已经停止
                 match response.result.as_str() {
                     "not_found" => {
- warn!("[COMPUTER_STOP] Agent not message : project_id={}", project_id);
+                        warn!(
+                            "[COMPUTER_STOP] Agent not message : project_id={}",
+                            project_id
+                        );
                         return Ok(HttpResult::error_with_locale(
                             shared_types::error_codes::ERR_AGENT_NOT_FOUND,
                             locale,
@@ -198,14 +201,17 @@ pub async fn computer_agent_stop(
                     }
                     "error" => {
                         let err_msg = response.message.unwrap_or_else(|| "未知错误".to_string());
- error!("[COMPUTER_STOP] Agent stoppedfailed: {}", err_msg);
+                        error!("[COMPUTER_STOP] Agent stoppedfailed: {}", err_msg);
                         return Ok(HttpResult::error_with_locale(
                             shared_types::error_codes::ERR_STOP_FAILED,
                             locale,
                         ));
                     }
                     _ => {
- warn!("[COMPUTER_STOP] not message response message : {}", response.result);
+                        warn!(
+                            "[COMPUTER_STOP] not message response message : {}",
+                            response.result
+                        );
                         return Ok(HttpResult::error_with_locale(
                             shared_types::error_codes::ERR_UNKNOWN,
                             locale,

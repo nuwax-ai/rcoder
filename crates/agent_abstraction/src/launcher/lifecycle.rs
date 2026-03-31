@@ -455,7 +455,7 @@ impl AgentLifecycleGuard {
 
             match kill(target, signal) {
                 Ok(_) => {
- debug!("alreadysend message : pgid={}, signal={:?}", pgid, signal);
+                    debug!("alreadysend message : pgid={}, signal={:?}", pgid, signal);
 
                     // 如果是 SIGTERM，等待一段时间让进程优雅退出
                     if !force {
@@ -463,12 +463,12 @@ impl AgentLifecycleGuard {
 
                         // 强制杀死进程组
                         let _ = kill(target, Signal::SIGKILL);
- debug!("alreadyforce message : pgid={}", pgid);
+                        debug!("alreadyforce message : pgid={}", pgid);
                     }
                 }
                 Err(Errno::ESRCH) => {
                     // 进程组已退出，这是正常的
- debug!(" message already message : pgid={}", pgid);
+                    debug!(" message already message : pgid={}", pgid);
                 }
                 Err(Errno::EPERM) => {
                     // 权限不足，无法终止进程组
@@ -479,7 +479,7 @@ impl AgentLifecycleGuard {
                 }
                 Err(e) => {
                     // 其他错误（如 EINVAL、EFAULT 等）
- debug!(" message failed: pgid={}, error={:?}", pgid, e);
+                    debug!(" message failed: pgid={}, error={:?}", pgid, e);
                 }
             }
 
@@ -488,7 +488,7 @@ impl AgentLifecycleGuard {
 
         #[cfg(not(unix))]
         {
- debug!(" message Unix message, skip message ");
+            debug!(" message Unix message, skip message ");
         }
 
         Ok(())
@@ -573,7 +573,7 @@ impl Drop for AgentLifecycleGuard {
 
             #[cfg(not(unix))]
             {
- debug!("[Claude] message Unix message, skip message ");
+                debug!("[Claude] message Unix message, skip message ");
             }
 
             // 注意：后台回收任务 (reaper_task) 会自动完成

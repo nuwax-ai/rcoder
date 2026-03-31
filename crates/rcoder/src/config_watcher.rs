@@ -82,7 +82,10 @@ impl ConfigWatcher {
 
         watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
 
- info!("📁 [CONFIG_WATCHER] starting message configfile: {:?}", config_path);
+        info!(
+            "📁 [CONFIG_WATCHER] starting message configfile: {:?}",
+            config_path
+        );
 
         // 克隆必要的数据以在 tokio 任务中使用
         let config_path_clone = config_path.clone();
@@ -103,7 +106,7 @@ impl ConfigWatcher {
                         )
                         .await
                         {
- warn!(" [CONFIG_WATCHER] config message failed: {}", e);
+                            warn!(" [CONFIG_WATCHER] config message failed: {}", e);
                         }
                     }
                 }
@@ -126,7 +129,7 @@ impl ConfigWatcher {
             Ok(new_config) => {
                 // 验证配置有效性
                 if new_config.enabled && new_config.api_key.trim().is_empty() {
- error!("[CONFIG_WATCHER] API Key message empty message ");
+                    error!("[CONFIG_WATCHER] API Key message empty message ");
                     return Err(anyhow::anyhow!("API Key 不能为空字符串"));
                 }
 
@@ -150,7 +153,7 @@ impl ConfigWatcher {
                 }
 
                 if key_changed {
- info!("[CONFIG_WATCHER] API Key alreadyupdated");
+                    info!("[CONFIG_WATCHER] API Key alreadyupdated");
                 }
 
                 if !old_enabled && !new_enabled && !key_changed {
@@ -158,11 +161,11 @@ impl ConfigWatcher {
                     return Ok(());
                 }
 
- info!("[CONFIG_WATCHER] config message Update succeeded");
+                info!("[CONFIG_WATCHER] config message Update succeeded");
                 Ok(())
             }
             Err(e) => {
- error!("[CONFIG_WATCHER] message configfilefailed: {}", e);
+                error!("[CONFIG_WATCHER] message configfilefailed: {}", e);
                 Err(e)
             }
         }

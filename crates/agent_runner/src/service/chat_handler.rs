@@ -307,9 +307,7 @@ pub async fn handle_chat_core(
             shared_types::mask_url(&provider.base_url)
         );
     } else {
-        warn!(
-            "[ChatHandler] No model config provided; falling back to env vars or defaults"
-        );
+        warn!("[ChatHandler] No model config provided; falling back to env vars or defaults");
     }
 
     // ========== 步骤8: 检查 Worker 状态 ==========

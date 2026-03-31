@@ -155,7 +155,11 @@ impl ContentBuilder {
                 let data = match tokio::fs::read(&file_path).await {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::warn!("Failed to read image file, ignored: {:?}, error: {}", file_path, e);
+                        tracing::warn!(
+                            "Failed to read image file, ignored: {:?}, error: {}",
+                            file_path,
+                            e
+                        );
                         return Ok(None);
                     }
                 };
@@ -200,7 +204,11 @@ impl ContentBuilder {
                 let data = match tokio::fs::read(&file_path).await {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::warn!("Failed to read audio file, ignored: {:?}, error: {}", file_path, e);
+                        tracing::warn!(
+                            "Failed to read audio file, ignored: {:?}, error: {}",
+                            file_path,
+                            e
+                        );
                         return Ok(None);
                     }
                 };

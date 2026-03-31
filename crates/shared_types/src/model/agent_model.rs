@@ -320,7 +320,10 @@ impl AgentLifecycleGuard {
         // 3. 强制清理资源
         self.force_cleanup().await?;
 
- info!("[Claude] agentgracefulstoppedcompleted: {}", self.inner.project_id);
+        info!(
+            "[Claude] agentgracefulstoppedcompleted: {}",
+            self.inner.project_id
+        );
 
         Ok(())
     }
@@ -341,7 +344,7 @@ impl AgentLifecycleGuard {
                 if let Some(mut child) = child_process.lock().await.take()
                     && let Err(e) = child.kill().await
                 {
- warn!(" message Claudechild processfailed: {}", e);
+                    warn!(" message Claudechild processfailed: {}", e);
                 }
             }
         }

@@ -219,7 +219,10 @@ fn write_shutdown_log(signal: &str) {
             file,
             "═══════════════════════════════════════════════════════════"
         );
-        let _ = writeln!(file, "📨 [SHUTDOWN] agent_runner received a shutdown signal");
+        let _ = writeln!(
+            file,
+            "📨 [SHUTDOWN] agent_runner received a shutdown signal"
+        );
         let _ = writeln!(file, "signal: {}", signal);
         let _ = writeln!(file, "time: {}", now);
         let _ = writeln!(
@@ -426,7 +429,10 @@ async fn main() -> anyhow::Result<()> {
             let app = Router::new().route("/health", get(health_check));
             let addr = format!("0.0.0.0:{}", health_port);
 
-            info!("🏥 HTTP health check service started, listening on port: {}", health_port);
+            info!(
+                "🏥 HTTP health check service started, listening on port: {}",
+                health_port
+            );
 
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,

@@ -84,11 +84,17 @@ fn map_json_rejection(rejection: JsonRejection) -> AppError {
 }
 
 fn map_query_rejection(_rejection: QueryRejection) -> AppError {
-    AppError::with_i18n_key(shared_types::error_codes::ERR_INVALID_PARAMS, "error.invalid_params")
+    AppError::with_i18n_key(
+        shared_types::error_codes::ERR_INVALID_PARAMS,
+        "error.invalid_params",
+    )
 }
 
 fn map_path_rejection(_rejection: PathRejection) -> AppError {
-    AppError::with_i18n_key(shared_types::error_codes::ERR_INVALID_PARAMS, "error.invalid_params")
+    AppError::with_i18n_key(
+        shared_types::error_codes::ERR_INVALID_PARAMS,
+        "error.invalid_params",
+    )
 }
 
 #[cfg(test)]

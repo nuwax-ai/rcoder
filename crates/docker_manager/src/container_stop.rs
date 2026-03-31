@@ -97,14 +97,20 @@ pub async fn startup_cleanup_containers(
     docker_manager: &Arc<DockerManager>,
     pattern: &str,
 ) -> DockerResult<CleanupResult> {
- info!("🧹 [STARTUP_CLEANUP] startingcleanupcontainer: pattern={}", pattern);
+    info!(
+        "🧹 [STARTUP_CLEANUP] startingcleanupcontainer: pattern={}",
+        pattern
+    );
     let start_time = Instant::now();
 
     // 查找匹配模式的容器
     let matched_containers = docker_manager.list_containers_with_pattern(pattern).await?;
 
     let total_found = matched_containers.len();
- info!("[STARTUP_CLEANUP] message {} message container", total_found);
+    info!(
+        "[STARTUP_CLEANUP] message {} message container",
+        total_found
+    );
 
     if total_found == 0 {
         return Ok(CleanupResult {
@@ -530,11 +536,11 @@ pub async fn startup_cleanup_all_enabled_services(
     let patterns = get_container_patterns_for_enabled_services(multi_image_config);
 
     if patterns.is_empty() {
- warn!(" message, skipcontainercleanup");
+        warn!(" message, skipcontainercleanup");
         return Ok(CleanupResult::default());
     }
 
- info!("🧹 startingcleanup message container: {:?}", patterns);
+    info!("🧹 startingcleanup message container: {:?}", patterns);
     let start_time = Instant::now();
 
     // 并行清理多个服务类型的容器
@@ -566,10 +572,10 @@ pub async fn startup_cleanup_all_enabled_services(
                     .extend(result.failed_removals_details);
             }
             Ok(Err(e)) => {
- warn!("cleanup message containerfailed: {}", e);
+                warn!("cleanup message containerfailed: {}", e);
             }
             Err(e) => {
- warn!("cleanup message failed: {}", e);
+                warn!("cleanup message failed: {}", e);
             }
         }
     }

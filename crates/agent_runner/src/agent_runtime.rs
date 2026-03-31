@@ -62,7 +62,10 @@ impl AtomicState {
             2 => WorkerState::Stopping,
             3 => WorkerState::Stopped,
             invalid => {
-                tracing::error!("[AtomicState] Invalid state value: {}, falling back to Stopped", invalid);
+                tracing::error!(
+                    "[AtomicState] Invalid state value: {}, falling back to Stopped",
+                    invalid
+                );
                 WorkerState::Stopped
             }
         }

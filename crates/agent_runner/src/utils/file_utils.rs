@@ -301,7 +301,10 @@ impl FileUtils {
             {
                 Ok(attachment) => attachments.push(attachment),
                 Err(e) => {
-                    warn!("Skipping file {:?}; failed to create attachment: {}", file_path, e);
+                    warn!(
+                        "Skipping file {:?}; failed to create attachment: {}",
+                        file_path, e
+                    );
                 }
             }
         }

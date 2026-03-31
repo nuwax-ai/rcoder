@@ -562,7 +562,10 @@ impl AgentSessionRegistry {
 
             // 🔥 修复：移除 Agent 时释放槽位
             self.release_session_slot();
-            info!("[Registry] Released session slot: project_id={}", project_id);
+            info!(
+                "[Registry] Released session slot: project_id={}",
+                project_id
+            );
         }
 
         info!(
@@ -600,7 +603,10 @@ impl AgentSessionRegistry {
 
                 // 🔥 修复：移除 Agent 时释放槽位（与 remove_by_project 保持一致）
                 self.release_session_slot();
-                info!("[Registry] Released session slot: session_id={}", session_id);
+                info!(
+                    "[Registry] Released session slot: session_id={}",
+                    session_id
+                );
             }
 
             return removed;
@@ -697,7 +703,11 @@ impl AgentSessionRegistry {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    debug!("🎯 [AtomicSlot] Acquired slot successfully: {}/{}", old + 1, limit);
+                    debug!(
+                        "🎯 [AtomicSlot] Acquired slot successfully: {}/{}",
+                        old + 1,
+                        limit
+                    );
                     return true;
                 }
                 Err(new_old) => old = new_old,
@@ -736,7 +746,11 @@ impl AgentSessionRegistry {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    debug!("🔓 [AtomicSlot] Released slot: {} -> {}", current, current - 1);
+                    debug!(
+                        "🔓 [AtomicSlot] Released slot: {} -> {}",
+                        current,
+                        current - 1
+                    );
                     return;
                 }
                 Err(_) => {

@@ -286,7 +286,10 @@ where
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
     ) -> Result<R::Entry> {
- info!("startingcreated message Agent session, project ID: {}", project_id);
+        info!(
+            "startingcreated message Agent session, project ID: {}",
+            project_id
+        );
 
         // 创建 SACP 启动器
         let launcher = ClaudeCodeLauncher::new(self.notifier.clone());
@@ -502,7 +505,7 @@ where
             let model_changed = existing.is_model_config_changed(&model_provider);
 
             if !channel_closed && !model_changed {
- info!("reuse message Agent session, project ID: {}", project_id);
+                info!("reuse message Agent session, project ID: {}", project_id);
                 return Ok((existing.clone(), false));
             }
 
@@ -562,7 +565,10 @@ where
         }
 
         // 会话不存在，需要创建新会话
- info!("sessionnot found, created message session, project ID: {}", project_id);
+        info!(
+            "sessionnot found, created message session, project ID: {}",
+            project_id
+        );
 
         // 第二阶段：在不持有锁的情况下创建新会话
         let new_session = self
@@ -617,11 +623,11 @@ where
             .send(prompt_request)
             .await
             .map_err(|e| {
- error!("send Prompt requestfailed: {:?}", e);
+                error!("send Prompt requestfailed: {:?}", e);
                 anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
             })?;
 
- info!("Prompt requestalreadysend, project ID: {}", project_id);
+        info!("Prompt requestalreadysend, project ID: {}", project_id);
         Ok(())
     }
 
@@ -642,11 +648,11 @@ where
             .send(prompt_request)
             .await
             .map_err(|e| {
- error!("send Prompt requestfailed: {:?}", e);
+                error!("send Prompt requestfailed: {:?}", e);
                 anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
             })?;
 
- info!("Prompt requestalreadysend, project ID: {}", project_id);
+        info!("Prompt requestalreadysend, project ID: {}", project_id);
         Ok(())
     }
 }

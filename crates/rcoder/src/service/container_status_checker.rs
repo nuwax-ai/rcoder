@@ -131,7 +131,7 @@ impl ContainerStatusChecker {
             self.state.projects.iter().collect();
 
         if containers.is_empty() {
- debug!("📭 [STATUS_CHECKER] message check message container");
+            debug!("📭 [STATUS_CHECKER] message check message container");
             return Ok(());
         }
 
@@ -158,7 +158,10 @@ impl ContainerStatusChecker {
             // 检查是否应该跳过
             if self.should_skip_check(&lookup_key) {
                 skipped += 1;
- debug!("⏭️ [STATUS_CHECKER] skipcheck(failed message ): {}", lookup_key);
+                debug!(
+                    "⏭️ [STATUS_CHECKER] skipcheck(failed message ): {}",
+                    lookup_key
+                );
                 continue;
             }
 
@@ -195,7 +198,7 @@ impl ContainerStatusChecker {
         let container = match container_info.container() {
             Some(c) => c,
             None => {
- debug!("⚠️ [STATUS_CHECKER] container message : {}", lookup_key);
+                debug!("⚠️ [STATUS_CHECKER] container message : {}", lookup_key);
                 return Ok(false);
             }
         };
@@ -337,7 +340,7 @@ impl ContainerStatusChecker {
                                 }
                             }
                         } else {
- debug!("⚠️ [STATUS_CHECKER] ComputerAgentRunner message user_id");
+                            debug!("⚠️ [STATUS_CHECKER] ComputerAgentRunner message user_id");
                             false
                         }
                     }
@@ -372,7 +375,7 @@ impl ContainerStatusChecker {
                 exists
             }
             Err(e) => {
- warn!("[STATUS_CHECKER] get Docker Manager failed: {}", e);
+                warn!("[STATUS_CHECKER] get Docker Manager failed: {}", e);
                 // 无法确定容器状态，保守地认为容器存在
                 true
             }
@@ -421,7 +424,7 @@ impl ContainerStatusChecker {
                 // 无需 insert，修改已生效
 
                 if was_failing {
- info!("[STATUS_CHECKER] container message : {}", lookup_key);
+                    info!("[STATUS_CHECKER] container message : {}", lookup_key);
                 }
             }
             Entry::Vacant(entry) => {
@@ -458,7 +461,10 @@ impl ContainerStatusChecker {
         // 🔌 第1次失败或达到阈值时，清理 gRPC 连接池
         if consecutive_failures == 1 || consecutive_failures == self.config.failure_threshold {
             self.state.grpc_pool.remove(grpc_addr);
- info!("🔌 [STATUS_CHECKER] alreadycleanup message connection: {}", grpc_addr);
+            info!(
+                "🔌 [STATUS_CHECKER] alreadycleanup message connection: {}",
+                grpc_addr
+            );
         }
 
         // 📊 分级日志输出
@@ -486,7 +492,7 @@ impl ContainerStatusChecker {
             }
             _ => {
                 // 超过阈值后的偶发检查：DEBUG 级别
- debug!("⏭️ [STATUS_CHECKER] container message : {}", lookup_key);
+                debug!("⏭️ [STATUS_CHECKER] container message : {}", lookup_key);
             }
         }
     }
@@ -529,7 +535,7 @@ impl ContainerStatusChecker {
         for key in keys_to_remove {
             if self.health_states.remove(&key).is_some() {
                 removed_count += 1;
- debug!("🧹 [STATUS_CHECKER] alreadycleanup message status: {}", key);
+                debug!("🧹 [STATUS_CHECKER] alreadycleanup message status: {}", key);
             }
         }
 
@@ -570,7 +576,7 @@ pub fn start_container_status_checker(
 
             // 执行容器状态检查
             if let Err(e) = checker.check_all_containers().await {
- warn!("[STATUS_CHECKER] containerstatuscheckfailed: {}", e);
+                warn!("[STATUS_CHECKER] containerstatuscheckfailed: {}", e);
             }
 
             // 定期清理过期的健康状态

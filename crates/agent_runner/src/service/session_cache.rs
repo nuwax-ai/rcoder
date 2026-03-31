@@ -62,7 +62,10 @@ pub struct SessionData {
 impl SessionData {
     pub fn new(max_size: usize) -> Arc<Self> {
         let start_time = std::time::Instant::now();
-        debug!("⏱️ [SessionData::new] Starting creation, max_size={}", max_size);
+        debug!(
+            "⏱️ [SessionData::new] Starting creation, max_size={}",
+            max_size
+        );
 
         let channel_start = std::time::Instant::now();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -196,7 +199,9 @@ impl SessionData {
         // 🎯 显式关闭 channel 发送端，让接收端立即感知到连接关闭
         let mut current_sender_guard = self.current_sender.lock().await;
         if current_sender_guard.take().is_some() {
-            info!("🔌 [SessionData] Explicitly closed channel sender; receiver disconnects immediately");
+            info!(
+                "🔌 [SessionData] Explicitly closed channel sender; receiver disconnects immediately"
+            );
             // 当 Sender 被 drop 时，Receiver 的 recv() 会返回 None
             // 这里通过 take() 将 sender 从 Option 中移除，触发 drop
         }
@@ -275,10 +280,10 @@ impl SessionWorker {
                             // 如果发送失败，可能是缓冲区满了或连接已关闭
                             // 注意：truncate 在锁内执行，但 50 字符开销可忽略
                             warn!(
-                            "⚠️ SSE sender send failed, disabling real-time delivery: message_type={:?}, sub_type={}, data={}",
-                            message.message_type,
-                            message.sub_type,
-                            truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
+                                "⚠️ SSE sender send failed, disabling real-time delivery: message_type={:?}, sub_type={}, data={}",
+                                message.message_type,
+                                message.sub_type,
+                                truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
                             );
                             *current_sender_guard = None;
                         }
@@ -414,17 +419,18 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             // 🛡️ 关键修复：先主动关闭旧 session 的 SSE 连接，再移除缓存
             // 之前直接 remove 导致旧 SSE 连接的心跳流继续发送但不再收到业务消息，
             // 前端如果没有及时关闭旧连接，会看到孤立的心跳流
-            let cleared_count =
-                if let Some((_, old_session_data)) = SESSION_CACHE.remove(&old_session_id) {
-                    old_session_data.close_current_connection().await;
-                    info!(
-                        "🔌 [ensure_project_session] Closed old session SSE connection: old_session_id={}",
-                        old_session_id
-                    );
-                    1 // 移除了1个session
-                } else {
-                    0 // session不存在
-                };
+            let cleared_count = if let Some((_, old_session_data)) =
+                SESSION_CACHE.remove(&old_session_id)
+            {
+                old_session_data.close_current_connection().await;
+                info!(
+                    "🔌 [ensure_project_session] Closed old session SSE connection: old_session_id={}",
+                    old_session_id
+                );
+                1 // 移除了1个session
+            } else {
+                0 // session不存在
+            };
 
             // 更新 AGENT_REGISTRY 中的映射关系
             let _ = AGENT_REGISTRY.update_session(project_id, session_id);

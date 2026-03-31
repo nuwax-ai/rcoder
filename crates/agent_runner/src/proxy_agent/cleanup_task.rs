@@ -105,13 +105,13 @@ impl AgentCleaner {
                     let session_data = session_data_ref.clone();
                     drop(session_data_ref);
 
-                        let message_count = session_data.message_count().await;
+                    let message_count = session_data.message_count().await;
 
-                        if message_count > 0 {
-                            info!(
-                                "Found orphaned session: session_id={}, message_count={}",
-                                session_id, message_count
-                            );
+                    if message_count > 0 {
+                        info!(
+                            "Found orphaned session: session_id={}, message_count={}",
+                            session_id, message_count
+                        );
 
                         // 清理这个session的消息 - 直接移除条目
                         if SESSION_CACHE.remove(&session_id).is_some() {

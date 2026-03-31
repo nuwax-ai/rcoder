@@ -146,7 +146,11 @@ fn resolve_js_entry_from_cmd_shim(cmd_script: &std::path::Path) -> Option<PathBu
     let content = match std::fs::read_to_string(cmd_script) {
         Ok(c) => c,
         Err(e) => {
- debug!("[SACP] cmd shim message failed: {} ({})", cmd_script.display(), e);
+            debug!(
+                "[SACP] cmd shim message failed: {} ({})",
+                cmd_script.display(),
+                e
+            );
             return None;
         }
     };
@@ -193,7 +197,7 @@ fn resolve_js_entry_from_cmd_shim(cmd_script: &std::path::Path) -> Option<PathBu
         }
     }
 
- debug!("[SACP] cmd shim not message : {}", cmd_script.display());
+    debug!("[SACP] cmd shim not message : {}", cmd_script.display());
 
     None
 }
@@ -212,10 +216,13 @@ pub fn resolve_windows_node_cli_command(
     let cmd_script = get_windows_cmd_script_path(path);
 
     let node_exe = resolve_windows_node_exe()?;
- info!("[SACP] Windows node.exe already message : {}", node_exe.display());
+    info!(
+        "[SACP] Windows node.exe already message : {}",
+        node_exe.display()
+    );
 
     if let Some(cmd_script) = cmd_script.as_ref() {
- info!("[SACP] message cmd shim: {}", cmd_script.display());
+        info!("[SACP] message cmd shim: {}", cmd_script.display());
         if let Some(js_entry) = resolve_js_entry_from_cmd_shim(cmd_script) {
             let mut actual_args = Vec::with_capacity(args.len() + 1);
             actual_args.push(js_entry.to_string_lossy().to_string());
@@ -277,7 +284,10 @@ pub fn resolve_windows_node_cli_command(
 
     for package_dir in package_dirs {
         if !package_dir.exists() {
- info!("[SACP] package directorynot found, skip: {}", package_dir.display());
+            info!(
+                "[SACP] package directorynot found, skip: {}",
+                package_dir.display()
+            );
             continue;
         }
         if let Some(js_entry) = npm_package_entry_from_dir(&package_dir, &package_name) {
@@ -339,10 +349,10 @@ pub fn normalize_windows_command_for_no_window(
             );
         }
         Some("cmd" | "bat") => {
- info!("[SACP] 🔍 Windows detect message .cmd/.bat: {}", path);
- info!("[SACP] 🔄 message node.exe + JS message ...");
+            info!("[SACP] 🔍 Windows detect message .cmd/.bat: {}", path);
+            info!("[SACP] 🔄 message node.exe + JS message ...");
             if let Some((node_path, js_args)) = resolve_windows_node_cli_command(&path, &args) {
- info!("[SACP] message succeeded: {} + {:?}", node_path, js_args);
+                info!("[SACP] message succeeded: {} + {:?}", node_path, js_args);
                 path = node_path;
                 args = js_args;
             } else {
@@ -359,10 +369,10 @@ pub fn normalize_windows_command_for_no_window(
             );
         }
         None => {
- info!("[SACP] 🔍 Windows detect message : {}", path);
+            info!("[SACP] 🔍 Windows detect message : {}", path);
             if let Ok(resolved) = which::which(&path) {
                 let resolved_str = resolved.to_string_lossy().to_string();
- info!("[SACP] 🔄 already message : {}", resolved_str);
+                info!("[SACP] 🔄 already message : {}", resolved_str);
 
                 let resolved_ext = resolved
                     .extension()
@@ -371,28 +381,28 @@ pub fn normalize_windows_command_for_no_window(
 
                 match resolved_ext.as_deref() {
                     Some("exe") => {
- info!("[SACP] message .exe - no popup window");
+                        info!("[SACP] message .exe - no popup window");
                         path = resolved_str;
                     }
                     Some("cmd" | "bat") => {
- info!("[SACP] 🔍 message .cmd/.bat, message ...");
+                        info!("[SACP] 🔍 message .cmd/.bat, message ...");
                         if let Some((node_path, js_args)) =
                             resolve_windows_node_cli_command(&resolved_str, &args)
                         {
- info!("[SACP] message succeeded: {} + {:?}", node_path, js_args);
+                            info!("[SACP] message succeeded: {} + {:?}", node_path, js_args);
                             path = node_path;
                             args = js_args;
                         } else {
- warn!("[SACP] ⚠️ message failed");
+                            warn!("[SACP] ⚠️ message failed");
                         }
                     }
                     _ => {
- info!("[SACP] ℹ️ message, message ");
+                        info!("[SACP] ℹ️ message, message ");
                         path = resolved_str;
                     }
                 }
             } else {
- warn!("[SACP] ⚠️ unable to message path: {}", path);
+                warn!("[SACP] ⚠️ unable to message path: {}", path);
             }
         }
     }

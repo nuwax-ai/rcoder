@@ -71,34 +71,37 @@ async fn main() -> anyhow::Result<()> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     // 🔄 初始化宿主机路径解析器（自动检测模式）
- info!("starting message detect message mountpath...");
+    info!("starting message detect message mountpath...");
     let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH").unwrap_or_else(|_| {
  info!(" message DOCKER_SOCKET_PATH not message, message default message : /var/run/docker.sock");
         "/var/run/docker.sock".to_string()
     });
 
- info!(" message Docker socket: {}", docker_socket_path);
+    info!(" message Docker socket: {}", docker_socket_path);
 
     let _path_resolver =
         match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone()))
             .await
         {
             Ok(resolver) => {
- info!(" message path message initializesucceeded");
+                info!(" message path message initializesucceeded");
                 info!(
                     "  容器内工作目录: {:?}",
                     resolver.container_workspace_base()
                 );
- info!(" message workdirectory: {:?}", resolver.host_workspace_base());
+                info!(
+                    " message workdirectory: {:?}",
+                    resolver.host_workspace_base()
+                );
                 Some(resolver)
             }
             Err(e) => {
- error!(" message path message initializefailed: {}", e);
- error!(" message check message config:");
- error!(" 1. Docker socket path message : {}", docker_socket_path);
- error!(" 2. Docker socket message alreadymount message container");
- error!(" 3. container message Docker API");
- error!(" 4. projectworkdirectory message mount");
+                error!(" message path message initializefailed: {}", e);
+                error!(" message check message config:");
+                error!(" 1. Docker socket path message : {}", docker_socket_path);
+                error!(" 2. Docker socket message alreadymount message container");
+                error!(" 3. container message Docker API");
+                error!(" 4. projectworkdirectory message mount");
 
                 // 显示详细的错误信息和解决建议
                 show_docker_configuration_help(&docker_socket_path);
@@ -110,11 +113,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 🧹 启动时清理上次可能遗留的容器
     // 先使用正确配置初始化全局 DockerManager
- info!("initialize Docker Manager( message config)...");
+    info!("initialize Docker Manager( message config)...");
 
     // 从应用配置创建 DockerManagerConfig
     let docker_manager_config = if let Some(docker_config) = &config.docker_config {
- info!(" message Docker config, message config");
+        info!(" message Docker config, message config");
         let mut default_config = docker_manager::DockerManagerConfig::default();
 
         // 合并应用配置中的多镜像配置
@@ -135,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
             docker_config.network_base_name
         );
         if let Some(ref network_base_name) = docker_config.network_base_name {
- info!(" message config message : {}", network_base_name);
+            info!(" message config message : {}", network_base_name);
             default_config.network_base_name = network_base_name.clone();
         } else {
             info!(
@@ -147,26 +150,29 @@ async fn main() -> anyhow::Result<()> {
         // 🔧 应用超时配置
         if let Some(timeout) = docker_config.api_timeout_seconds {
             default_config.api_timeout_seconds = timeout;
- info!(" message config message API timeout: {} message ", timeout);
+            info!(" message config message API timeout: {} message ", timeout);
         }
         if let Some(timeout) = docker_config.api_timeout_quick_seconds {
             default_config.api_timeout_quick_seconds = timeout;
- info!(" message config message timeout: {} message ", timeout);
+            info!(" message config message timeout: {} message ", timeout);
         }
 
         // 🔧 应用缓存 TTL 配置
         if let Some(ttl) = docker_config.cache_status_ttl_seconds {
             default_config.cache_status_ttl_seconds = ttl;
- info!(" message config message status message TTL: {} message ", ttl);
+            info!(
+                " message config message status message TTL: {} message ",
+                ttl
+            );
         }
         if let Some(ttl) = docker_config.cache_network_ttl_seconds {
             default_config.cache_network_ttl_seconds = ttl;
- info!(" message config message TTL: {} message ", ttl);
+            info!(" message config message TTL: {} message ", ttl);
         }
 
         default_config
     } else {
- info!("⚠️ message Docker config, message defaultconfig");
+        info!("⚠️ message Docker config, message defaultconfig");
         docker_manager::DockerManagerConfig::default()
     };
 
@@ -174,18 +180,18 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) =
         docker_manager::global::init_global_docker_manager_with_config(docker_manager_config).await
     {
- error!("Docker Manager initializefailed: {}", e);
+        error!("Docker Manager initializefailed: {}", e);
         return Err(anyhow::anyhow!("Docker Manager 初始化失败: {}", e));
     }
 
     // 获取初始化后的 DockerManager
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(dm) => {
- info!("Docker Manager initializesucceeded( message config)");
+            info!("Docker Manager initializesucceeded( message config)");
             dm
         }
         Err(e) => {
- error!("get Docker Manager failed: {}", e);
+            error!("get Docker Manager failed: {}", e);
             return Err(anyhow::anyhow!("获取 Docker Manager 失败: {}", e));
         }
     };
@@ -197,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
         shared_types::create_default_multi_image_config()
     };
 
- info!("check message cleanup message container( message )...");
+    info!("check message cleanup message container( message )...");
     if config.cleanup_config.enabled {
         match container_stop::startup_cleanup_all_enabled_services(
             &docker_manager,
@@ -214,12 +220,15 @@ async fn main() -> anyhow::Result<()> {
                         enabled_services.len()
                     );
                 } else {
- info!("not message container, message ");
+                    info!("not message container, message ");
                 }
 
                 // 如果有失败的清理（非409错误），记录警告
                 if result.failed_removals > 0 {
- warn!(" message containercleanupfailed: failed message ={}", result.failed_removals);
+                    warn!(
+                        " message containercleanupfailed: failed message ={}",
+                        result.failed_removals
+                    );
                     for failure in &result.failed_removals_details {
                         warn!(
                             "  - 容器 {} ({}): {}",
@@ -229,11 +238,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Err(e) => {
- warn!("started message containercleanupfailed: {}, message started", e);
+                warn!(
+                    "started message containercleanupfailed: {}, message started",
+                    e
+                );
             }
         }
     } else {
- info!("🚫 started message containercleanupalready message (cleanup_config.enabled=false)");
+        info!("🚫 started message containercleanupalready message (cleanup_config.enabled=false)");
     }
 
     // 从配置文件读取清理配置
@@ -280,13 +292,13 @@ async fn main() -> anyhow::Result<()> {
         );
 
         // 添加调试日志
- info!("🔧 [Pingora] startinginitialize Pingora config...");
- info!("🔧 [Pingora] listenport: {}", proxy_config.listen_port);
+        info!("🔧 [Pingora] startinginitialize Pingora config...");
+        info!("🔧 [Pingora] listenport: {}", proxy_config.listen_port);
         info!(
             "🔧 [Pingora] 默认后端端口: {}",
             proxy_config.default_backend_port
         );
- info!("🔧 [Pingora] message : {}", proxy_config.backend_host);
+        info!("🔧 [Pingora] message : {}", proxy_config.backend_host);
 
         let pingora_config = ProxyConfig {
             listen_port: proxy_config.listen_port,
@@ -297,15 +309,15 @@ async fn main() -> anyhow::Result<()> {
             verbose: false,
         };
 
- info!("[Pingora] Pingora configcreatedsucceeded");
+        info!("[Pingora] Pingora configcreatedsucceeded");
 
         // 创建 Pingora 服务器管理器，并提取服务引用用于指标读取
- info!("🔧 [Pingora] created PingoraServerManager...");
+        info!("🔧 [Pingora] created PingoraServerManager...");
         let mut server_manager = PingoraServerManager::new(pingora_config)
             .with_api_key_config(Arc::clone(&api_key_config)); // 🆕 传递 API Key 配置
         let pingora_service = server_manager.service();
- info!("[Pingora] PingoraServerManager createdsucceeded");
- info!("🔒 [Pingora] API Key message configalready message ( message updated)");
+        info!("[Pingora] PingoraServerManager createdsucceeded");
+        info!("🔒 [Pingora] API Key message configalready message ( message updated)");
 
         // 启动健康检查循环（按配置）
         if proxy_config.health_check.enabled {
@@ -316,22 +328,25 @@ async fn main() -> anyhow::Result<()> {
             );
             pingora_service
                 .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
- info!("[Pingora] message check message alreadystarted");
+            info!("[Pingora] message check message alreadystarted");
         }
 
         // 启动 Pingora 服务器（如果启动失败，直接退出程序）
- info!("[Pingora] started Pingora message ...");
+        info!("[Pingora] started Pingora message ...");
         let (pingora_shutdown_tx, pingora_shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
- info!("📍 [Pingora] message server_manager.start()...");
+            info!("📍 [Pingora] message server_manager.start()...");
             if let Err(e) = server_manager.start(pingora_shutdown_rx).await {
- error!("[Pingora] Pingora proxy message startedfailed, message : {:?}", e);
+                error!(
+                    "[Pingora] Pingora proxy message startedfailed, message : {:?}",
+                    e
+                );
                 std::process::exit(1);
             }
- info!("[Pingora] Pingora message ");
+            info!("[Pingora] Pingora message ");
         });
 
- info!("[Pingora] message alreadystarted");
+        info!("[Pingora] message alreadystarted");
 
         (
             Some(handle),
@@ -339,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
             Some(pingora_shutdown_tx),
         )
     } else {
- info!("⚠️ [Pingora] proxy_config notconfig, skip Pingora started");
+        info!("⚠️ [Pingora] proxy_config notconfig, skip Pingora started");
         (None, None, None)
     };
 
@@ -353,11 +368,14 @@ async fn main() -> anyhow::Result<()> {
     let _config_watcher =
         match crate::config_watcher::ConfigWatcher::new(config_path, Arc::clone(&api_key_config)) {
             Ok(watcher) => {
- info!("configfile message alreadystarted, message API Key message updated");
+                info!("configfile message alreadystarted, message API Key message updated");
                 Some(watcher)
             }
             Err(e) => {
- warn!(" configfile message startedfailed: {}, API Key message updated message ", e);
+                warn!(
+                    " configfile message startedfailed: {}, API Key message updated message ",
+                    e
+                );
                 None
             }
         };
@@ -378,7 +396,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("清理任务启动失败: {}", e))?,
         )
     } else {
- info!("🚫 containercleanup message already message (cleanup_config.enabled=false)");
+        info!("🚫 containercleanup message already message (cleanup_config.enabled=false)");
         None
     };
 
@@ -393,14 +411,18 @@ async fn main() -> anyhow::Result<()> {
     };
     let _status_checker_handle =
         start_container_status_checker(status_checker_config, state.clone());
- info!("containerstatuscheck message alreadystarted( message : 30 message, message Docker message failed message )");
+    info!(
+        "containerstatuscheck message alreadystarted( message : 30 message, message Docker message failed message )"
+    );
 
     // 启动容器状态同步任务（定期检测被外部删除的容器）
     let container_sync_config = ContainerSyncConfig {
         sync_interval: Duration::from_secs(60), // 每 60 秒同步一次
     };
     let _container_sync_handle = start_container_sync_task(container_sync_config);
- info!("containerstatus message alreadystarted( message : 60 message, detect message container)");
+    info!(
+        "containerstatus message alreadystarted( message : 60 message, detect message container)"
+    );
 
     // 🆕 启动 VNC 后端同步任务（定期从 Docker 同步容器 IP 到 Pingora）
     if let Some(ref pingora_service) = state.pingora_service {
@@ -408,7 +430,9 @@ async fn main() -> anyhow::Result<()> {
             sync_interval: Duration::from_secs(5), // 每 5 秒同步一次
         };
         let _vnc_sync_handle = start_vnc_sync_task(pingora_service.clone(), vnc_sync_config);
- info!("VNC message alreadystarted( message : 5 message, message Docker message container IP)");
+        info!(
+            "VNC message alreadystarted( message : 5 message, message Docker message container IP)"
+        );
     }
 
     // 创建路由（传入遥测 guard 用于 /metrics 端点）
@@ -427,11 +451,11 @@ async fn main() -> anyhow::Result<()> {
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
     if let Some(proxy_config) = &config.proxy_config {
- info!("Pingora message proxy message already message ");
- info!("📡 listenport: {}", proxy_config.listen_port);
- info!("route message : /proxy/{{port}}{{/path}} - message : /proxy/3000/api/users");
- info!(" message : message requestport message proxy message ");
- info!("💡 message :");
+        info!("Pingora message proxy message already message ");
+        info!("📡 listenport: {}", proxy_config.listen_port);
+        info!("route message : /proxy/{{port}}{{/path}} - message : /proxy/3000/api/users");
+        info!(" message : message requestport message proxy message ");
+        info!("💡 message :");
         info!(
             "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
             proxy_config.listen_port, config.port, config.port
@@ -448,7 +472,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 启动服务器，支持优雅关闭
     // 使用自定义 Hyper 配置增加请求头大小限制（默认 8KB -> 128KB）
- info!("🔧 config HTTP message : max_buf_size = 128KB( message HTTP 431 error)");
+    info!("🔧 config HTTP message : max_buf_size = 128KB( message HTTP 431 error)");
 
     let app = app.into_make_service();
     let mut shutdown_rx_clone = shutdown_tx.subscribe();
@@ -457,60 +481,60 @@ async fn main() -> anyhow::Result<()> {
     let server_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                // 等待关闭信号
-                _ = shutdown_rx_clone.recv() => {
- info!("🛑 HTTP message closed message ");
-                    break;
-                }
-                // 接受新连接
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, addr)) => {
-                            let mut app_clone = app.clone();
+                           // 等待关闭信号
+                           _ = shutdown_rx_clone.recv() => {
+            info!("🛑 HTTP message closed message ");
+                               break;
+                           }
+                           // 接受新连接
+                           result = listener.accept() => {
+                               match result {
+                                   Ok((stream, addr)) => {
+                                       let mut app_clone = app.clone();
 
-                            tokio::spawn(async move {
-                                // 配置 HTTP1，增加 header 大小限制
-                                let mut http_builder = http1::Builder::new();
-                                http_builder
-                                    .max_buf_size(128 * 1024)  // 128KB buffer（默认约 8KB）
-                                    .preserve_header_case(true)
-                                    .title_case_headers(false);
+                                       tokio::spawn(async move {
+                                           // 配置 HTTP1，增加 header 大小限制
+                                           let mut http_builder = http1::Builder::new();
+                                           http_builder
+                                               .max_buf_size(128 * 1024)  // 128KB buffer（默认约 8KB）
+                                               .preserve_header_case(true)
+                                               .title_case_headers(false);
 
-                                let io = TokioIo::new(stream);
+                                           let io = TokioIo::new(stream);
 
-                                // 使用 tower::Service 调用 MakeService
-                                use tower::Service;
-                                match std::future::poll_fn(|cx| {
-                                    Service::<std::net::SocketAddr>::poll_ready(&mut app_clone, cx)
-                                }).await {
-                                    Ok(()) => {
-                                        match Service::<std::net::SocketAddr>::call(&mut app_clone, addr).await {
-                                            Ok(service) => {
-                                                let hyper_service = TowerToHyperService::new(service);
-                                                if let Err(e) = http_builder.serve_connection(io, hyper_service).await {
-                                                    if !e.to_string().contains("connection closed")
-                                                       && !e.to_string().contains("early eof") {
- tracing::debug!("HTTP connectionerror ({}): {}", addr, e);
-                                                    }
-                                                }
-                                            }
-                                            Err(_) => {
-                                                // Infallible 类型，不会发生
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
- tracing::error!(" message not message : {}", e);
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
- error!(" message connectionfailed: {}", e);
-                        }
-                    }
-                }
-            }
+                                           // 使用 tower::Service 调用 MakeService
+                                           use tower::Service;
+                                           match std::future::poll_fn(|cx| {
+                                               Service::<std::net::SocketAddr>::poll_ready(&mut app_clone, cx)
+                                           }).await {
+                                               Ok(()) => {
+                                                   match Service::<std::net::SocketAddr>::call(&mut app_clone, addr).await {
+                                                       Ok(service) => {
+                                                           let hyper_service = TowerToHyperService::new(service);
+                                                           if let Err(e) = http_builder.serve_connection(io, hyper_service).await {
+                                                               if !e.to_string().contains("connection closed")
+                                                                  && !e.to_string().contains("early eof") {
+            tracing::debug!("HTTP connectionerror ({}): {}", addr, e);
+                                                               }
+                                                           }
+                                                       }
+                                                       Err(_) => {
+                                                           // Infallible 类型，不会发生
+                                                       }
+                                                   }
+                                               }
+                                               Err(e) => {
+            tracing::error!(" message not message : {}", e);
+                                               }
+                                           }
+                                       });
+                                   }
+                                   Err(e) => {
+            error!(" message connectionfailed: {}", e);
+                                   }
+                               }
+                           }
+                       }
         }
     });
 
@@ -528,9 +552,9 @@ async fn main() -> anyhow::Result<()> {
 
 /// 显示 Docker 配置帮助信息
 fn show_docker_configuration_help(socket_path: &str) {
- error!("📋 Docker config message :");
+    error!("📋 Docker config message :");
     error!("");
- error!(" message docker-compose.yml message config:");
+    error!(" message docker-compose.yml message config:");
     error!("");
     error!("services:");
     error!("  rcoder:");
@@ -540,21 +564,21 @@ fn show_docker_configuration_help(socket_path: &str) {
     error!("      - {}:/var/run/docker.sock:ro", socket_path);
     error!("      - ./data/rcoder/project_workspace:/app/project_workspace");
     error!("");
- error!("🔧 message Docker socket path:");
- error!(" Linux message : /var/run/docker.sock");
+    error!("🔧 message Docker socket path:");
+    error!(" Linux message : /var/run/docker.sock");
     error!("  macOS + Docker Desktop: /var/run/docker.sock");
     error!("  Rootless Docker: /run/user/$UID/docker.sock");
     error!("");
- error!("🛠️ message :");
- error!(" 1. check Docker message : docker ps");
- error!(" 2. message socket fileexists: ls -l {}", socket_path);
- error!(" 3. check message : groups $USER | grep docker");
+    error!("🛠️ message :");
+    error!(" 1. check Docker message : docker ps");
+    error!(" 2. message socket fileexists: ls -l {}", socket_path);
+    error!(" 3. check message : groups $USER | grep docker");
     error!(
         "  4. 测试 Docker API: curl --unix-socket {} http://localhost/info",
         socket_path
     );
     error!("");
- error!(" message exists, message rcoder container message get message .");
+    error!(" message exists, message rcoder container message get message .");
 }
 
 /// 设置信号处理器
@@ -578,22 +602,22 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
             match (sigint_result, sigterm_result) {
                 (Ok(mut sigint), Ok(mut sigterm)) => {
                     tokio::select! {
-                        _ = sigint.recv() => {
-                            if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
- info!(" message SIGINT (Ctrl+C) message, startinggracefulclosed...");
-                                let _ = shutdown_tx_clone.send(());
-                            }
-                        }
-                        _ = sigterm.recv() => {
-                            if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
- info!(" message SIGTERM message, startinggracefulclosed...");
-                                let _ = shutdown_tx_clone.send(());
-                            }
-                        }
-                    }
+                                           _ = sigint.recv() => {
+                                               if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
+                    info!(" message SIGINT (Ctrl+C) message, startinggracefulclosed...");
+                                                   let _ = shutdown_tx_clone.send(());
+                                               }
+                                           }
+                                           _ = sigterm.recv() => {
+                                               if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
+                    info!(" message SIGTERM message, startinggracefulclosed...");
+                                                   let _ = shutdown_tx_clone.send(());
+                                               }
+                                           }
+                                       }
                 }
                 (Err(e), _) | (_, Err(e)) => {
- warn!(" Unix message failed: {}, message closed message ", e);
+                    warn!(" Unix message failed: {}, message closed message ", e);
                     // 注册失败不影响程序运行，仍可通过其他方式关闭（如 tokio::signal::ctrl_c）
                 }
             }
@@ -608,7 +632,7 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
 
             if let Ok(()) = signal::ctrl_c().await {
                 if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
- info!(" message Ctrl+C message, startinggracefulclosed...");
+                    info!(" message Ctrl+C message, startinggracefulclosed...");
                     let _ = shutdown_tx_clone.send(());
                 }
             }
@@ -623,21 +647,21 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) 
     // 等待关闭信号
     let _ = shutdown_rx.recv().await;
 
- info!("startinggracefulclosed message ...");
+    info!("startinggracefulclosed message ...");
 
     // 执行容器清理
     if let Err(e) = cleanup_all_containers().await {
- error!("containercleanupfailed: {}", e);
+        error!("containercleanupfailed: {}", e);
     } else {
- info!("containercleanupcompleted");
+        info!("containercleanupcompleted");
     }
 
- info!("🛑 RCoder message gracefulclosedcompleted");
+    info!("🛑 RCoder message gracefulclosedcompleted");
 }
 
 /// 清理所有动态创建的容器
 async fn cleanup_all_containers() -> anyhow::Result<()> {
- info!("🧹 startingcleanup message created message container...");
+    info!("🧹 startingcleanup message created message container...");
 
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
@@ -661,11 +685,14 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
             }
 
             if result.failed_removals > 0 {
- warn!(" message containercleanupfailed: failed message ={}", result.failed_removals);
+                warn!(
+                    " message containercleanupfailed: failed message ={}",
+                    result.failed_removals
+                );
             }
         }
         Err(e) => {
- warn!(" message container message : {}", e);
+            warn!(" message container message : {}", e);
         }
     }
 

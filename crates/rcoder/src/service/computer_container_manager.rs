@@ -243,7 +243,10 @@ impl ComputerContainerManager {
     ///
     /// 通过 user_id 查询容器是否存在
     pub async fn get_container_info(user_id: &str) -> Result<Option<ContainerBasicInfo>, AppError> {
- debug!("[COMPUTER_CONTAINER] getcontainer message : user_id={}", user_id);
+        debug!(
+            "[COMPUTER_CONTAINER] getcontainer message : user_id={}",
+            user_id
+        );
 
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await

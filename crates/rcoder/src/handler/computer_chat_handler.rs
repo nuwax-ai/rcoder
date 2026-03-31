@@ -31,8 +31,7 @@ use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
     I18nJson, extract_grpc_addr_with_port, get_locale_from_headers,
-    get_realtime_container_ip_with_cache,
-    project_dir,
+    get_realtime_container_ip_with_cache, project_dir,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -327,7 +326,7 @@ pub async fn handle_computer_chat(
         .await;
 
         if let Ok(grpc_addr) = grpc_addr_result {
- debug!("[COMPUTER_CHAT] message Agent status: {}", grpc_addr);
+            debug!("[COMPUTER_CHAT] message Agent status: {}", grpc_addr);
             if let Ok(mut client) = state.grpc_pool.get_client(&grpc_addr).await {
                 let status_req = shared_types::grpc::GetStatusRequest {
                     project_id: project_id.clone(),
@@ -347,7 +346,7 @@ pub async fn handle_computer_chat(
                         // 如果状态是 idle，我们可以更有信心地继续
                     }
                     Err(e) => {
- warn!("[COMPUTER_CHAT] message Agent statusfailed: {}", e);
+                        warn!("[COMPUTER_CHAT] message Agent statusfailed: {}", e);
                         // Query failed不阻止请求继续，可能是网络波动，让后续的 Chat 请求去处理
                     }
                 }
@@ -359,7 +358,7 @@ pub async fn handle_computer_chat(
     // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
     let session_id_to_use = match &request.session_id {
         Some(sid) if !sid.is_empty() => {
- debug!("[COMPUTER_CHAT] message session_id: {}", sid);
+            debug!("[COMPUTER_CHAT] message session_id: {}", sid);
             sid.clone()
         }
         _ => {
@@ -376,13 +375,15 @@ pub async fn handle_computer_chat(
                             sid.to_string()
                         }
                         _ => {
- debug!("[COMPUTER_CHAT] projectexists message session_id, created message session");
+                            debug!(
+                                "[COMPUTER_CHAT] projectexists message session_id, created message session"
+                            );
                             String::new()
                         }
                     }
                 }
                 None => {
- debug!("[COMPUTER_CHAT] not message project, created message session");
+                    debug!("[COMPUTER_CHAT] not message project, created message session");
                     String::new()
                 }
             }
@@ -610,7 +611,10 @@ async fn forward_computer_request_to_container(
     // 在容器内：/app/computer-project-workspace/{user_id}/{project_id}
     let project_workspace = format!("{}/", project_dir(&request.user_id, &project_id));
 
- debug!("[COMPUTER_FORWARD] projectworkdirectory: {}", project_workspace);
+    debug!(
+        "[COMPUTER_FORWARD] projectworkdirectory: {}",
+        project_workspace
+    );
 
     // gRPC 调用（带重试机制）
     let max_retries = 2;
@@ -676,7 +680,10 @@ async fn forward_computer_request_to_container(
                     last_error = Some(e);
                     continue;
                 } else if !should_retry {
- error!("[COMPUTER_FORWARD] detect message retryerror, stoppedretry: {}", e);
+                    error!(
+                        "[COMPUTER_FORWARD] detect message retryerror, stoppedretry: {}",
+                        e
+                    );
                     last_error = Some(e);
                     break;
                 }

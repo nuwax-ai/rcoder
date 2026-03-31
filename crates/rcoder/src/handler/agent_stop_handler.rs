@@ -40,7 +40,10 @@ async fn destroy_container_for_project(
     project_id: &str,
     locale: &'static str,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
- info!("[STOP_DESTROY] startingdestroycontainer: project_id={}", project_id);
+    info!(
+        "[STOP_DESTROY] startingdestroycontainer: project_id={}",
+        project_id
+    );
 
     // 使用全局 DockerManager
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
@@ -82,7 +85,7 @@ async fn destroy_container_for_project(
                 .await;
 
             if let Err(e) = stop_result {
- error!("[STOP_DESTROY] stoppedcontainerfailed: {}", e);
+                error!("[STOP_DESTROY] stoppedcontainerfailed: {}", e);
                 return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_STOP_FAILED,
                     locale,
@@ -120,7 +123,7 @@ async fn destroy_container_for_project(
             .await;
 
         if let Err(e) = stop_result {
- error!("[STOP_DESTROY] stoppedcontainerfailed: {}", e);
+            error!("[STOP_DESTROY] stoppedcontainerfailed: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_STOP_FAILED,
                 locale,
@@ -268,12 +271,21 @@ pub async fn agent_stop(
         Ok(response) => {
             if let Some(data) = response.data.as_ref() {
                 if data.success {
- info!("[STOP_DESTROY] containerdestroysucceeded: project_id={}", project_id);
+                    info!(
+                        "[STOP_DESTROY] containerdestroysucceeded: project_id={}",
+                        project_id
+                    );
                 } else {
- error!("[STOP_DESTROY] containerdestroyfailed: project_id={}", project_id);
+                    error!(
+                        "[STOP_DESTROY] containerdestroyfailed: project_id={}",
+                        project_id
+                    );
                 }
             } else {
- error!("[STOP_DESTROY] response message empty: project_id={}", project_id);
+                error!(
+                    "[STOP_DESTROY] response message empty: project_id={}",
+                    project_id
+                );
             }
         }
         Err(e) => {

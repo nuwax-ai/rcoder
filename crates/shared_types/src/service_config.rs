@@ -235,7 +235,7 @@ impl ServiceImageConfig {
                 .clone()
                 .or_else(|| self.default_image.clone()),
             _ => {
- tracing::warn!("not message '{}, message default message ", platform);
+                tracing::warn!("not message '{}, message default message ", platform);
                 self.default_image.clone()
             }
         }

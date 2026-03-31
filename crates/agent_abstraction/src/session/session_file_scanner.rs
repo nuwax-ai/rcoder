@@ -103,7 +103,10 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
 
     // 使用异步 I/O 遍历目录
     let Ok(mut dir_entries) = tokio::fs::read_dir(&projects_dir).await else {
- warn!("🔍 [file message ] unable to message projectdirectory: {}", projects_dir.display());
+        warn!(
+            "🔍 [file message ] unable to message projectdirectory: {}",
+            projects_dir.display()
+        );
         return session_ids;
     };
 
@@ -117,7 +120,10 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
             .starts_with(encoded_path.as_str())
         {
             let Ok(mut files) = tokio::fs::read_dir(entry.path()).await else {
- warn!("🔍 [file message ] unable to message sessiondirectory: {}", entry.path().display());
+                warn!(
+                    "🔍 [file message ] unable to message sessiondirectory: {}",
+                    entry.path().display()
+                );
                 continue;
             };
 
@@ -166,7 +172,7 @@ async fn invalidate_project_cache(project_dir_name: &str) {
 pub fn start_file_watcher() {
     // 确保只启动一次
     if WATCHER_STARTED.swap(true, Ordering::SeqCst) {
- debug!("[filelisten] listen message already message ");
+        debug!("[filelisten] listen message already message ");
         return;
     }
 
@@ -175,7 +181,7 @@ pub fn start_file_watcher() {
     // 创建目录（如果不存在）
     if !projects_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&projects_dir) {
- warn!("[filelisten] unable tocreated projects directory: {}", e);
+            warn!("[filelisten] unable tocreated projects directory: {}", e);
             WATCHER_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -198,7 +204,7 @@ pub fn start_file_watcher() {
                     match event.kind {
                         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
                             if let Err(e) = tx.blocking_send(event) {
- error!("[filelisten] send message failed: {}", e);
+                                error!("[filelisten] send message failed: {}", e);
                             }
                         }
                         _ => {}
@@ -206,7 +212,7 @@ pub fn start_file_watcher() {
                 }
             }
             Err(e) => {
- error!("[filelisten] listenerror: {}", e);
+                error!("[filelisten] listenerror: {}", e);
             }
         }
     });
@@ -214,7 +220,7 @@ pub fn start_file_watcher() {
     let mut watcher = match watcher_result {
         Ok(w) => w,
         Err(e) => {
- error!("[filelisten] createdlisten message failed: {}", e);
+            error!("[filelisten] createdlisten message failed: {}", e);
             WATCHER_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -222,7 +228,7 @@ pub fn start_file_watcher() {
 
     // 开始监听目录
     if let Err(e) = watcher.watch(&projects_dir, RecursiveMode::Recursive) {
- error!("[filelisten] listendirectoryfailed: {}", e);
+        error!("[filelisten] listendirectoryfailed: {}", e);
         WATCHER_STARTED.store(false, Ordering::SeqCst);
         return;
     }
@@ -233,7 +239,10 @@ pub fn start_file_watcher() {
         *guard = Some(watcher);
     }
 
- info!("👁️ [filelisten] startinglistendirectory: {}", projects_dir.display());
+    info!(
+        "👁️ [filelisten] startinglistendirectory: {}",
+        projects_dir.display()
+    );
 
     // 启动异步任务处理事件（带防抖）
     tokio::spawn(async move {
@@ -242,51 +251,51 @@ pub fn start_file_watcher() {
 
         loop {
             tokio::select! {
-                // 接收新事件
-                event = rx.recv() => {
-                    match event {
-                        Some(event) => {
-                            // 提取变化文件所属的项目目录
-                            for path in &event.paths {
-                                if let Some(project_dir) = extract_project_dir_from_path(path) {
-                                    pending_dirs.insert(project_dir);
-                                }
-                            }
-                            // 重置防抖计时器
-                            debounce_timer = Some(tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS));
-                        }
-                        None => {
- warn!("[filelisten] message receive message alreadyclosed");
-                            break;
-                        }
-                    }
-                }
-                // 防抖计时器触发
-                _ = async {
-                    if let Some(timer) = debounce_timer {
-                        tokio::time::sleep_until(timer).await;
-                    } else {
-                        // 没有计时器时永远等待
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    if !pending_dirs.is_empty() {
-                        debug!(
-                            "📁 [文件监听] 防抖触发，刷新 {} 个项目目录",
-                            pending_dirs.len()
-                        );
-                        // 刷新所有待处理的项目目录
-                        for project_dir in pending_dirs.drain() {
-                            invalidate_project_cache(&project_dir).await;
-                        }
-                    }
-                    debounce_timer = None;
-                }
-            }
+                           // 接收新事件
+                           event = rx.recv() => {
+                               match event {
+                                   Some(event) => {
+                                       // 提取变化文件所属的项目目录
+                                       for path in &event.paths {
+                                           if let Some(project_dir) = extract_project_dir_from_path(path) {
+                                               pending_dirs.insert(project_dir);
+                                           }
+                                       }
+                                       // 重置防抖计时器
+                                       debounce_timer = Some(tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS));
+                                   }
+                                   None => {
+            warn!("[filelisten] message receive message alreadyclosed");
+                                       break;
+                                   }
+                               }
+                           }
+                           // 防抖计时器触发
+                           _ = async {
+                               if let Some(timer) = debounce_timer {
+                                   tokio::time::sleep_until(timer).await;
+                               } else {
+                                   // 没有计时器时永远等待
+                                   std::future::pending::<()>().await;
+                               }
+                           } => {
+                               if !pending_dirs.is_empty() {
+                                   debug!(
+                                       "📁 [文件监听] 防抖触发，刷新 {} 个项目目录",
+                                       pending_dirs.len()
+                                   );
+                                   // 刷新所有待处理的项目目录
+                                   for project_dir in pending_dirs.drain() {
+                                       invalidate_project_cache(&project_dir).await;
+                                   }
+                               }
+                               debounce_timer = None;
+                           }
+                       }
         }
     });
 
- info!("[filelisten] listen message startedcompleted");
+    info!("[filelisten] listen message startedcompleted");
 }
 
 /// 停止文件系统监听器
@@ -301,7 +310,7 @@ pub fn stop_file_watcher() {
         *guard = None;
     }
 
- info!("🛑 [filelisten] listen message alreadystopped");
+    info!("🛑 [filelisten] listen message alreadystopped");
 }
 
 /// 通过文件扫描检查 session 是否存在（带缓存）
@@ -334,9 +343,9 @@ pub async fn check_session_file_exists(session_id: &str, project_path: &str) -> 
     cache.insert(project_path.to_string(), session_ids).await;
 
     if exists {
- info!("[file message ] message session file: {}", session_id);
+        info!("[file message ] message session file: {}", session_id);
     } else {
- debug!("[file message ] not message session file: {}", session_id);
+        debug!("[file message ] not message session file: {}", session_id);
     }
 
     exists

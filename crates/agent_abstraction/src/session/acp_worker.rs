@@ -51,17 +51,20 @@ where
         let project_id = request.project_id().to_string();
         let project_path = request.project_path().clone();
 
- info!("📨 AcpAgentWorker message request, project_id: {}", project_id);
+        info!(
+            "📨 AcpAgentWorker message request, project_id: {}",
+            project_id
+        );
 
         // 1. 路径规范化
         let normalized_path = AcpSessionManager::<N, R>::normalize_path(&project_path);
- debug!("📂 path message : {:?}", normalized_path);
+        debug!("📂 path message : {:?}", normalized_path);
 
         // 2. 确保项目目录存在
         AcpSessionManager::<N, R>::ensure_project_dir(&normalized_path)
             .await
             .map_err(|e| {
- error!("createdprojectdirectoryfailed: {:?}", e);
+                error!("createdprojectdirectoryfailed: {:?}", e);
                 e
             })?;
 
@@ -80,7 +83,7 @@ where
 
         // 🆕 获取用户指定的 agent_id（如果有）
         let agent_id = assembler.get_agent_id(default_agent_id);
- debug!("🎯 message Agent ID: {}", agent_id);
+        debug!("🎯 message Agent ID: {}", agent_id);
 
         // 获取最终的系统提示词（入参有值则使用入参，否则使用默认配置）
         // 🆕 使用实际 agent_id 而不是 default_agent_id
@@ -123,7 +126,7 @@ where
 
         // 将 context_servers 转换为 ACP 协议的 McpServer 格式
         let mcp_servers = convert_context_servers(&context_servers);
- debug!("🔌 message MCP message : {}", mcp_servers.len());
+        debug!("🔌 message MCP message : {}", mcp_servers.len());
 
         // 构建 AgentStartConfig 并传递 MCP 服务器、service_type
         let mut start_config = AgentStartConfig::new(request.prompt_message.service_type.clone())
@@ -163,7 +166,7 @@ where
                 super::check_session_file_exists(session_id, &project_path_str).await;
 
             if session_exists {
- info!("Session fileexists, message resume: {}", session_id);
+                info!("Session fileexists, message resume: {}", session_id);
                 start_config = start_config.with_resume_session_id(session_id.clone());
             } else {
                 warn!(
@@ -191,7 +194,7 @@ where
             )
             .await
             .map_err(|e| {
- error!("get message createdsessionfailed: {:?}", e);
+                error!("get message createdsessionfailed: {:?}", e);
                 e
             })?;
 
@@ -204,14 +207,14 @@ where
 
         // 6. 构建 Prompt 请求
         let prompt_request = if let Some(ref attachment_blocks) = request.attachment_blocks {
- debug!("📎 built message Prompt request");
+            debug!("📎 built message Prompt request");
             AcpSessionManager::<N, R>::build_prompt_request_with_attachments(
                 &prompt_message,
                 session_entry.session_id().clone(),
                 attachment_blocks.clone(),
             )?
         } else {
- debug!("📝 built message Prompt request");
+            debug!("📝 built message Prompt request");
             AcpSessionManager::<N, R>::build_text_prompt_request(
                 &prompt_message,
                 session_entry.session_id().clone(),
@@ -223,11 +226,11 @@ where
             .send_prompt_request(&project_id, prompt_request)
             .await
             .map_err(|e| {
- error!("send Prompt requestfailed: {:?}", e);
+                error!("send Prompt requestfailed: {:?}", e);
                 e
             })?;
 
- info!("Prompt requestalreadysend, project_id: {}", project_id);
+        info!("Prompt requestalreadysend, project_id: {}", project_id);
 
         // 8. 构建响应
         if is_new {

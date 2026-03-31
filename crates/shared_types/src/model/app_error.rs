@@ -146,9 +146,6 @@ mod tests {
         })
         .await;
 
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::BAD_REQUEST
-        );
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }
