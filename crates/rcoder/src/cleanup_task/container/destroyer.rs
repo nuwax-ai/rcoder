@@ -101,7 +101,7 @@ impl ContainerDestroyer {
             &actual_container_id,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("停止容器失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop container: {}", e))?;
 
         // 3. 清理 DockerManager 内存缓存（防止缓存残留导致孤立容器无法被清理）
         let _: Option<_> = self

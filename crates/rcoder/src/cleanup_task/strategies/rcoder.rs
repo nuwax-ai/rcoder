@@ -24,7 +24,7 @@ impl CleanupStrategy for RCoderStrategy {
         let project = context
             .state
             .get_project(project_id)
-            .ok_or_else(|| anyhow::anyhow!("项目不存在: {}", project_id))?;
+            .ok_or_else(|| anyhow::anyhow!("Project does not exist: {}", project_id))?;
 
         let now = Utc::now();
         let idle_duration = (now - project.last_activity()).num_seconds();

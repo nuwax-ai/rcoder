@@ -28,7 +28,7 @@ impl ProxyServer {
         // 验证配置
         self.config
             .validate()
-            .map_err(|e| anyhow::anyhow!("配置验证失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {}", e))?;
 
         info!(
             "启动基于 Pingora 的端口代理服务器，监听端口: {}",
@@ -107,7 +107,7 @@ impl ProxyServer {
         // 检查配置
         self.config
             .validate()
-            .map_err(|e| anyhow::anyhow!("配置验证失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {}", e))?;
 
         info!("Pingora proxy message startedcheck message ");
         Ok(())

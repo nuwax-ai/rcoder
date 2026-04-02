@@ -130,7 +130,7 @@ impl ConfigWatcher {
                 // 验证配置有效性
                 if new_config.enabled && new_config.api_key.trim().is_empty() {
                     error!("[CONFIG_WATCHER] API Key message empty message ");
-                    return Err(anyhow::anyhow!("API Key 不能为空字符串"));
+                    return Err(anyhow::anyhow!("API Key cannot be empty string"));
                 }
 
                 // 🚀 使用 ArcSwap 原子更新配置（无锁，不阻塞读取）

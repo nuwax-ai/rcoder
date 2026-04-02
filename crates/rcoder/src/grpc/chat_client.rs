@@ -72,13 +72,13 @@ pub async fn grpc_chat_with_pool(
     // 发送请求
     let response = client.chat(request).await.map_err(|e| {
         error!("[gRPC_CHAT] Chat RPC message failed: {}", e);
-        anyhow::anyhow!("gRPC Chat 调用失败: {}", e)
+        anyhow::anyhow!("gRPC Chat call failed: {}", e)
     })?;
 
     let chat_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_CHAT] 收到响应: project_id={}, session_id={}, success={}",
+        "✅ [gRPC_CHAT] Received response: project_id={}, session_id={}, success={}",
         chat_response.project_id, chat_response.session_id, chat_response.success
     );
 
@@ -128,13 +128,13 @@ pub async fn grpc_cancel_session_with_pool(
 
     let response = client.cancel_session(request).await.map_err(|e| {
         error!("[gRPC_CANCEL] CancelSession RPC message failed: {}", e);
-        anyhow::anyhow!("gRPC CancelSession 调用失败: {}", e)
+        anyhow::anyhow!("gRPC CancelSession call failed: {}", e)
     })?;
 
     let cancel_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_CANCEL] 收到响应: success={}, message={:?}",
+        "✅ [gRPC_CANCEL] Received response: success={}, message={:?}",
         cancel_response.success, cancel_response.message
     );
 
@@ -184,13 +184,13 @@ pub async fn grpc_stop_agent_with_pool(
 
     let response = client.stop_agent(request).await.map_err(|e| {
         error!("[gRPC_STOP_AGENT] StopAgent RPC message failed: {}", e);
-        anyhow::anyhow!("gRPC StopAgent 调用失败: {}", e)
+        anyhow::anyhow!("gRPC StopAgent call failed: {}", e)
     })?;
 
     let stop_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_STOP_AGENT] 收到响应: result={}, success={}, message={:?}",
+        "✅ [gRPC_STOP_AGENT] Received response: result={}, success={}, message={:?}",
         stop_response.result, stop_response.success, stop_response.message
     );
 

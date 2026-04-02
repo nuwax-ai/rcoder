@@ -876,7 +876,7 @@ pub async fn agent_session_notification(
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
     info!(
-        "🔍 [SSE_PROXY] 收到SSE连接请求: session_id={:?}",
+        "🔍 [SSE_PROXY] Received SSE connection request: session_id={:?}",
         session_id
     );
 
@@ -982,7 +982,7 @@ pub async fn computer_agent_progress_notification(
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
     info!(
-        "🔍 [SSE_PROXY] 收到 Computer Agent SSE连接请求: session_id={:?}",
+        "🔍 [SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
         session_id
     );
 

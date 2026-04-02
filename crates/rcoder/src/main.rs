@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
                 show_docker_configuration_help(&docker_socket_path);
 
                 // 返回错误，停止启动
-                return Err(anyhow::anyhow!("容器自检测失败，无法初始化路径解析器"));
+                return Err(anyhow::anyhow!("Container self-check failed, unable to initialize path resolver"));
             }
         };
 
@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
         docker_manager::global::init_global_docker_manager_with_config(docker_manager_config).await
     {
         error!("Docker Manager initializefailed: {}", e);
-        return Err(anyhow::anyhow!("Docker Manager 初始化失败: {}", e));
+        return Err(anyhow::anyhow!("Docker Manager initialization failed: {}", e));
     }
 
     // 获取初始化后的 DockerManager
@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             error!("get Docker Manager failed: {}", e);
-            return Err(anyhow::anyhow!("获取 Docker Manager 失败: {}", e));
+            return Err(anyhow::anyhow!("Failed to get Docker Manager: {}", e));
         }
     };
 
@@ -393,7 +393,7 @@ async fn main() -> anyhow::Result<()> {
         Some(
             cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup)
                 .await
-                .map_err(|e| anyhow::anyhow!("清理任务启动失败: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Failed to start cleanup task: {}", e))?,
         )
     } else {
         info!("🚫 containercleanup message already message (cleanup_config.enabled=false)");
@@ -441,7 +441,7 @@ async fn main() -> anyhow::Result<()> {
     // 启动 HTTP 服务器
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
         .await
-        .map_err(|e| anyhow::anyhow!("HTTP 服务器绑定端口 {} 失败: {}", config.port, e))?;
+        .map_err(|e| anyhow::anyhow!("HTTP server failed to bind port {}: {}", config.port, e))?;
 
     info!("Server starting on port {}", config.port);
     info!("API endpoints:");

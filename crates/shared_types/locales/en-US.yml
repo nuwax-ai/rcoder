@@ -92,3 +92,11 @@ error.resource_limits_validation_failed: "Resource limits validation failed"
 
 # Unknown retry
 error.unknown_retry_error: "Unknown retry error"
+
+# SACP related
+error.sacp_session_id_send_failed: "Failed to send session ID"
+error.agent_process_abnormal_exit: "Agent process exited abnormally, please retry"
+error.session_cancelled: "Session cancelled"
+error.cancel_response_timeout: "Response timeout after cancellation"
+error.agent_init_timeout: "Agent initialization timed out, please retry. Too many MCPs may cause timeout. If this persists, restart the agent computer (click the icon in the upper right corner of PC, then click [...] and select Restart Agent Computer)"
+error.session_cancelled_timeout: "Session cancelled (Agent response timeout)"

@@ -332,7 +332,7 @@ pub async fn handle_chat(
             // 只有当 session_id 非空时才更新映射
             if !session_id.is_empty() {
                 info!(
-                    "📊 [CHAT] 收到聊天响应，开始状态更新: session_id={}, success={}",
+                    "📊 [CHAT] Received chat response, starting state update: session_id={}, success={}",
                     session_id,
                     http_result.is_success()
                 );

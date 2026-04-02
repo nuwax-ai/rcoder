@@ -215,7 +215,7 @@ impl AgentRuntime {
         self.request_tx
             .send(request)
             .await
-            .map_err(|_| anyhow::anyhow!("Worker 已关闭"))?;
+            .map_err(|_| anyhow::anyhow!("Worker is closed"))?;
         Ok(())
     }
 

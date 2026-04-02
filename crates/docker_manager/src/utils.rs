@@ -90,7 +90,7 @@ impl DockerUtils {
                 Ok(seconds) => config.container_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [DOCKER] 无法解析 DOCKER_CONTAINER_TTL '{}': {}, 使用默认值",
+                        "⚠️ [DOCKER] Failed to parse DOCKER_CONTAINER_TTL '{}': {}, using default value",
                         ttl,
                         e
                     );

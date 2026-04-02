@@ -73,7 +73,7 @@ impl AppState {
         api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     ) -> anyhow::Result<Self> {
         let projects = ProjectAdapter::new()
-            .map_err(|e| anyhow::anyhow!("初始化 ProjectAdapter 失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to initialize ProjectAdapter: {}", e))?;
 
         Ok(Self {
             config,

@@ -64,14 +64,14 @@ impl FileUtils {
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .ok_or_else(|| anyhow::anyhow!("文件没有扩展名"))?;
+            .ok_or_else(|| anyhow::anyhow!("File has no extension"))?;
 
         if !self
             .config
             .allowed_extensions
             .contains(&extension.to_lowercase())
         {
-            return Err(anyhow::anyhow!("不支持的文件扩展名: {}", extension));
+            return Err(anyhow::anyhow!("Unsupported file extension: {}", extension));
         }
 
         Ok(())
@@ -121,7 +121,7 @@ impl FileUtils {
         let filename = file_path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("无效的文件名"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
 
         self.validate_extension(filename)?;
 

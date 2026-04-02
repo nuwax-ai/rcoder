@@ -29,13 +29,13 @@ fn format_relative_time(dt: DateTime<Utc>) -> String {
     let duration = now.signed_duration_since(dt);
 
     if duration.num_seconds() < 60 {
-        format!("{}秒前", duration.num_seconds())
+        format!("{}s ago", duration.num_seconds())
     } else if duration.num_minutes() < 60 {
-        format!("{}分钟前", duration.num_minutes())
+        format!("{}m ago", duration.num_minutes())
     } else if duration.num_hours() < 24 {
-        format!("{}小时前", duration.num_hours())
+        format!("{}h ago", duration.num_hours())
     } else {
-        format!("{}天前", duration.num_days())
+        format!("{}d ago", duration.num_days())
     }
 }
 
@@ -136,7 +136,7 @@ impl ContainerStatusChecker {
         }
 
         info!(
-            "🔍 [STATUS_CHECKER] 开始检查 {} 个容器状态",
+            "🔍 [STATUS_CHECKER] Starting to check {} containers",
             containers.len()
         );
 
@@ -179,7 +179,7 @@ impl ContainerStatusChecker {
         }
 
         info!(
-            "📊 [STATUS_CHECKER] 检查完成: 总数={}, 已检查={}, 已跳过={}, 已更新={}, 失败={}",
+            "📊 [STATUS_CHECKER] Check completed: total={}, checked={}, skipped={}, updated={}, failed={}",
             total_count, checked, skipped, updated, failed
         );
 
@@ -244,7 +244,7 @@ impl ContainerStatusChecker {
                     // 注意：使用 project_id 更新 DuckDB，而不是 lookup_key
                     if let Err(e) = update_project_activity(&project_id, &self.state).await {
                         warn!(
-                            "⚠️ [STATUS_CHECKER] 更新活动时间失败: project_id={}, {}",
+                            "⚠️ [STATUS_CHECKER] Failed to update activity time: project_id={}, {}",
                             project_id, e
                         );
                         return Ok(false);

@@ -851,7 +851,7 @@ agent_concurrency:
     );
 
     fs::write(CONFIG_FILE, content_with_comments)
-        .map_err(|e| anyhow::anyhow!("写入配置文件失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to write config file: {}", e))?;
 
     Ok(())
 }

@@ -147,7 +147,7 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
         let request_id = request.prompt_message.request_id.clone();
 
         info!(
-            "📨 接收到请求，project_id: {}, request_id: {}",
+            "📨 Received request, project_id: {}, request_id: {}",
             project_id, request_id
         );
 
@@ -349,7 +349,7 @@ pub async fn agent_worker_with_heartbeat(
         let request_id = request.prompt_message.request_id.clone();
 
         info!(
-            "📨 接收到请求，project_id: {}, request_id: {} - SACP 并发处理",
+            "📨 Received request, project_id: {}, request_id: {} - SACP concurrent processing",
             project_id, request_id
         );
 

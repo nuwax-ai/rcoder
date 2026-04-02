@@ -260,7 +260,7 @@ pub async fn agent_stop(
     }
 
     info!(
-        "🛑 [STOP_DESTROY] 收到销毁容器请求: project_id={}",
+        "🛑 [STOP_DESTROY] Received container destroy request: project_id={}",
         project_id
     );
 

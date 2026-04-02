@@ -624,7 +624,7 @@ where
             .await
             .map_err(|e| {
                 error!("send Prompt requestfailed: {:?}", e);
-                anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
+                anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
             })?;
 
         info!("Prompt requestalreadysend, project ID: {}", project_id);
@@ -649,7 +649,7 @@ where
             .await
             .map_err(|e| {
                 error!("send Prompt requestfailed: {:?}", e);
-                anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
+                anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
             })?;
 
         info!("Prompt requestalreadysend, project ID: {}", project_id);

@@ -92,3 +92,11 @@ error.resource_limits_validation_failed: "资源限制验证失败"
 
 # 未知重试
 error.unknown_retry_error: "未知重试错误"
+
+# SACP 相关
+error.sacp_session_id_send_failed: "无法发送会话 ID"
+error.agent_process_abnormal_exit: "Agent 进程异常退出，请重试"
+error.session_cancelled: "会话已取消"
+error.cancel_response_timeout: "取消后等待响应超时"
+error.agent_init_timeout: "智能体初始化超时，请重试（过多的MCP可能导致超时）。如果持续失败请重启智能体电脑（点击PC端右上图标展开后，在[...]里点击重启智能体电脑）"
+error.session_cancelled_timeout: "用户取消任务（Agent 响应超时）"

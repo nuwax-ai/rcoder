@@ -548,7 +548,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     // 配置验证
     if let Some(docker_config) = &config.docker_config {
         if let Err(e) = docker_config.validate_multi_image_config() {
-            return Err(anyhow::anyhow!("Docker 配置验证失败: {}", e));
+            return Err(anyhow::anyhow!("Docker configuration validation failed: {}", e));
         }
     }
 
@@ -578,12 +578,12 @@ pub fn load_config() -> anyhow::Result<AppConfig> {
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
     let config_content =
-        fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
+        fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
     tracing::debug!("configfile message : {}", config_content);
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
 
     // 调试：打印解析后的多镜像配置
     if let Some(ref docker_config) = config.docker_config {
@@ -620,10 +620,10 @@ pub fn load_api_key_config_from_file(
     config_path: &std::path::Path,
 ) -> anyhow::Result<ApiKeyAuthConfig> {
     let config_content =
-        fs::read_to_string(config_path).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
+        fs::read_to_string(config_path).map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
 
     Ok(config.api_key_auth)
 }
@@ -637,7 +637,7 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
 
     // 创建配置文件目录（如果不存在）
     if let Some(parent) = std::path::Path::new(CONFIG_FILE).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("创建配置目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
     }
 
     // 使用嵌入式配置文件
@@ -648,7 +648,7 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
     let config_content = default_config.replace("{{GENERATED_API_KEY}}", &generated_api_key);
 
     fs::write(CONFIG_FILE, config_content)
-        .map_err(|e| anyhow::anyhow!("写入默认配置文件失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to write default config file: {}", e))?;
 
     info!("alreadycreateddefaultconfigfile: {}", CONFIG_FILE);
     info!("🔑 already message API Key( message not message )");

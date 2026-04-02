@@ -373,7 +373,7 @@ async fn call_grpc_get_status_with_retry(
                             );
                             // 从连接池移除失败的连接
                             pool.remove(grpc_addr);
-                            last_error = Some(anyhow::anyhow!("gRPC 调用失败: {}", e));
+                            last_error = Some(anyhow::anyhow!("gRPC call failed: {}", e));
 
                             // 指数退避: 100ms, 200ms, 400ms
                             let delay_ms = 100 * (1 << (attempt - 1));
@@ -387,7 +387,7 @@ async fn call_grpc_get_status_with_retry(
                                 e.code(),
                                 e
                             );
-                            return Err(anyhow::anyhow!("gRPC 调用失败: {}", e));
+                            return Err(anyhow::anyhow!("gRPC call failed: {}", e));
                         }
                     }
                 }
@@ -408,5 +408,5 @@ async fn call_grpc_get_status_with_retry(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("未知错误")))
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error")))
 }

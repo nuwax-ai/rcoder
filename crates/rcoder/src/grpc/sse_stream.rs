@@ -115,7 +115,7 @@ pub async fn create_grpc_sse_stream(
                         match stream.message().await {
                             Ok(Some(progress_event)) => {
                                 debug!(
-                                    "📨 [gRPC_SSE] 收到进度事件: session_id={}, message_type={}, sub_type={}",
+                                    "📨 [gRPC_SSE] Received progress event: session_id={}, message_type={}, sub_type={}",
                                     session_id_clone,
                                     progress_event.message_type,
                                     progress_event.sub_type

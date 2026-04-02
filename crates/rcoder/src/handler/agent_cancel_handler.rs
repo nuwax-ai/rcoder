@@ -300,7 +300,7 @@ async fn handle_session_cancel_internal_v2(
     };
 
     info!(
-        "🛑 [CANCEL_FORWARD_V2] 收到取消任务请求: session_id={}, project_id={}, {}",
+        "🛑 [CANCEL_FORWARD_V2] Received cancel task request: session_id={}, project_id={}, {}",
         session_id_display, project_id, identifier_display
     );
 

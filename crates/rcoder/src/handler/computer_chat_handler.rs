@@ -154,7 +154,7 @@ pub async fn handle_computer_chat(
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {
             info!(
-                "⏳ [COMPUTER_CHAT] 容器正在创建中，等待完成: user_id={}, 已等待={:?}",
+                "⏳ [COMPUTER_CHAT] Container is being created, waiting for completion: user_id={}, elapsed={:?}",
                 user_id, elapsed
             );
 

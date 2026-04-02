@@ -14,8 +14,9 @@ FROM ${BASE_IMAGE}
 WORKDIR /home/user
 
 # agent-browser 默认配置（独立 Chromium profile，避免与 MCP 锁冲突）
-ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium-for-mcp \
-    AGENT_BROWSER_PROFILE=/home/user/.config/agent-browser/chromium
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium \
+    AGENT_BROWSER_PROFILE=/home/user/.config/agent-browser/chromium \
+    AGENT_BROWSER_HEADED=1
 
 
 # ============================================================================

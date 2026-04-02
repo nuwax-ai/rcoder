@@ -149,7 +149,7 @@ pub async fn computer_agent_stop(
     {
         Ok(response) => {
             info!(
-                "📥 [COMPUTER_STOP] 收到 StopAgent 响应: result={}, success={}",
+                "📥 [COMPUTER_STOP] Received StopAgent response: result={}, success={}",
                 response.result, response.success
             );
 

@@ -90,7 +90,7 @@ pub async fn agent_status(
     }
 
     info!(
-        "📊 [AGENT_STATUS] 收到查询Agent状态请求: project_id={}",
+        "📊 [AGENT_STATUS] Received agent status query: project_id={}",
         project_id
     );
 

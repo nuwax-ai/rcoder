@@ -135,7 +135,7 @@ impl AgentCleaner {
         let agent_info = self
             .state
             .get_project(project_id)
-            .ok_or_else(|| anyhow::anyhow!("Agent 不存在: {}", project_id))?;
+            .ok_or_else(|| anyhow::anyhow!("Agent does not exist: {}", project_id))?;
 
         let service_type = agent_info.service_type().unwrap_or(ServiceType::RCoder);
 

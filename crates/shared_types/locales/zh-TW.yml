@@ -92,3 +92,11 @@ error.resource_limits_validation_failed: "資源限制驗證失敗"
 
 # 未知重試
 error.unknown_retry_error: "未知重試錯誤"
+
+# SACP 相關
+error.sacp_session_id_send_failed: "無法發送工作階段 ID"
+error.agent_process_abnormal_exit: "Agent 處理序異常結束，請重試"
+error.session_cancelled: "工作階段已取消"
+error.cancel_response_timeout: "取消後等待回應逾時"
+error.agent_init_timeout: "智慧體初始化逾時，請重試（過多的MCP可能導致逾時）。如果持續失敗請重啟智慧體電腦（點選PC端右上圖示展開後，在[...]裡點選重啟智慧體電腦）"
+error.session_cancelled_timeout: "使用者取消任務（Agent 回應逾時）"

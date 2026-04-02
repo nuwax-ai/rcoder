@@ -452,11 +452,11 @@ impl AgentService for AgentServiceImpl {
                                             break;
                                         }
 
-                                        // 🚀 收到终止消息后，主动关闭 gRPC 流
+                                        // 🚀主动关闭 gRPC 流
                                         // 不再等待 channel 关闭或心跳超时
                                         if is_terminal_message {
                                             info!(
-                                                "🔚 [gRPC] 收到 SessionPromptEnd，主动关闭流: session_id={}, sub_type={}",
+                                                "🔚 [gRPC] Received SessionPromptEnd, closing stream: session_id={}, sub_type={}",
                                                 session_id_clone, unified_message.sub_type
                                             );
                                             break;
@@ -1636,7 +1636,7 @@ impl AgentService for AgentServiceImpl {
             let req = request.into_inner();
 
         info!(
-            "🔍 [GET_CONTAINER_STATUS] 收到容器状态查询: user_id={}, project_id={}",
+            "🔍 [GET_CONTAINER_STATUS] Received container status query: user_id={}, project_id={}",
             req.user_id, req.project_id
         );
 
@@ -1693,7 +1693,7 @@ impl AgentService for AgentServiceImpl {
             let req = request.into_inner();
 
         info!(
-            "🖥️ [GET_VNC_STATUS] 收到 VNC 状态查询: user_id={:?}, project_id={:?}",
+            "🖥️ [GET_VNC_STATUS] Received VNC status query: user_id={:?}, project_id={:?}",
             req.user_id, req.project_id
         );
 

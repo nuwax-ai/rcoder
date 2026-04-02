@@ -43,12 +43,12 @@ pub async fn handle_computer_chat(
 ) -> Result<Json<HttpResult<ChatResponse>>, (StatusCode, Json<HttpResult<ChatResponse>>)> {
     let locale = locale_from_headers(&headers);
     info!(
-        "📨 [HTTP] 收到 Computer Chat 请求:\n\
+        "📨 [HTTP] Received Computer Chat request:\n\
          ├─ user_id: {:?}\n\
          ├─ project_id: {:?}\n\
          ├─ session_id: {:?}\n\
          ├─ request_id: {:?}\n\
-         ├─ prompt ({}字符): {:?}\n\
+         ├─ prompt ({}chars): {:?}\n\
          ├─ attachments: {:?}\n\
          ├─ data_source_attachments: {:?}\n\
          ├─ model_provider: {:#?}\n\
