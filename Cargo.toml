@@ -10,6 +10,7 @@ default-members = [
     "crates/docker_manager",
     "crates/rcoder-proxy",
     "crates/duckdb_manager",
+    "crates/container-runtime-api",
 ]
 
 

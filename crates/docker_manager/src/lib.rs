@@ -13,6 +13,11 @@ pub mod utils;
 pub mod container_builder;
 pub mod health;
 pub mod network;
+pub mod runtime_selection;
+
+// Runtime abstraction (feature-gated)
+#[cfg(feature = "kubernetes")]
+pub mod runtime;
 
 pub use container_self_inspector::*;
 pub use container_state_actor::*;
