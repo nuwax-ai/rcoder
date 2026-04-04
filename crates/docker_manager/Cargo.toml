@@ -42,8 +42,20 @@ moka = { version = "0.12", features = ["future"] }
 # Shared types
 shared_types = { path = "../shared_types" }
 
+# Runtime API (always needed)
+container-runtime-api = { path = "../container-runtime-api" }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Kubernetes runtime support (feature-gated)
+kube = { version = "0.98", features = ["runtime", "client", "kube-runtime", "config"], optional = true }
+k8s-openapi = { version = "0.24", features = ["v1_30"], optional = true }
+
 [features]
 default = []
+# Kubernetes runtime support
+kubernetes = ["kube", "k8s-openapi"]
 # 🔧 eBPF 调试模式：启用容器特权，允许使用 eBPF 诊断工具
 # 警告：仅在开发调试时使用，生产环境请勿启用
 ebpf-debug = []
