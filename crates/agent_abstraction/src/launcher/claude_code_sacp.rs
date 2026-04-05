@@ -307,28 +307,28 @@ pub async fn load_sacp_agent_config(
             agent_config.agent_id
         );
 
-        // 检查并安装 agent
-        if agent_config.installation.package_name.is_some() {
-            let installation_manager = AgentInstallationManager::new();
-            match installation_manager
-                .ensure_installed(&agent_config.installation, &agent_config.command)
-                .await
-            {
-                Ok(result) => {
-                    if result.already_installed {
-                        debug!("[SACP] Agent already message : {}", agent_config.command);
-                    } else {
-                        info!("[SACP] Agent message succeeded: {}", result.message);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "[SACP] Agent message Installation failed: {}, message started",
-                        e
-                    );
-                }
-            }
-        }
+        // 检查并安装 agent - 临时禁用以测试本地 claude-code-acp-ts
+        // if agent_config.installation.package_name.is_some() {
+        //     let installation_manager = AgentInstallationManager::new();
+        //     match installation_manager
+        //         .ensure_installed(&agent_config.installation, &agent_config.command)
+        //         .await
+        //     {
+        //         Ok(result) => {
+        //             if result.already_installed {
+        //                 debug!("[SACP] Agent already message : {}", agent_config.command);
+        //             } else {
+        //                 info!("[SACP] Agent message succeeded: {}", result.message);
+        //             }
+        //         }
+        //         Err(e) => {
+        //             warn!(
+        //                 "[SACP] Agent message Installation failed: {}, message started",
+        //                 e
+        //             );
+        //         }
+        //     }
+        // }
 
         // 解析环境变量
         let mut resolved_env = agent_config.env.clone();
@@ -350,6 +350,30 @@ pub async fn load_sacp_agent_config(
 
         // 禁用 Claude Code 非必要网络请求
         resolved_env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
+
+        // debug: 打印最终环境变量（API Key 已脱敏）
+        let mask_key = |v: &String| -> String {
+            if v.len() > 8 {
+                format!("{}***{}", &v[..4], &v[v.len()-4..])
+            } else {
+                "***".to_string()
+            }
+        };
+        debug!(
+            "[SACP] Final env config: command={}, ANTHROPIC_API_KEY={}, ANTHROPIC_BASE_URL={}, ANTHROPIC_MODEL={}, \
+             OPENAI_API_KEY={}, OPENAI_BASE_URL={}, OPENCODE_MODEL={}, \
+             RUST_LOG={}, CLAUDE_CODE_MAX_TOKENS={}, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC={}",
+            agent_config.command,
+            resolved_env.get("ANTHROPIC_API_KEY").map(|v| mask_key(v)).unwrap_or_default(),
+            resolved_env.get("ANTHROPIC_BASE_URL").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("ANTHROPIC_MODEL").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("OPENAI_API_KEY").map(|v| mask_key(v)).unwrap_or_default(),
+            resolved_env.get("OPENAI_BASE_URL").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("OPENCODE_MODEL").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("RUST_LOG").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("CLAUDE_CODE_MAX_TOKENS").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap_or(&"<unset>".to_string()),
+        );
 
         Ok(SacpAgentLaunchConfig {
             command: agent_config.command.clone(),

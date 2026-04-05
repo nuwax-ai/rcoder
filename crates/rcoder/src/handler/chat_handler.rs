@@ -168,7 +168,7 @@ pub async fn handle_chat(
     );
 
     // 打印 agent_config 配置信息（debug 级别）
-    debug!(
+    info!(
         "🔧 [CHAT] agent_config 配置: project_id={}, agent_config={:?}",
         project_id, request.agent_config
     );

@@ -87,6 +87,20 @@ RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest --registry=http
 RUN mkdir -p /root/.config/opencode && \
     echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny",\n    "question": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
 
+# # 安装 claude-code-acp-ts（从源码构建，用于测试）
+# # 使用 npm pack + npm install -g <tarball> 确保复制文件而非 symlink
+# RUN echo "Cache bust: ${CACHEBUST}" && \
+#     rm -rf /tmp/claude-code-acp-ts && \
+#     git clone -b feat/claude-code-acp-ts https://github.com/nuwax-ai/claude-code-acp-ts.git /tmp/claude-code-acp-ts && \
+#     cd /tmp/claude-code-acp-ts && npm install && npm run build && \
+#     npm pack . && \
+#     npm install -g ./claude-code-acp-ts-*.tgz && \
+#     echo "验证 claude-code-acp-ts 安装..." && \
+#     (which claude-code-acp-ts > /dev/null 2>&1 && echo "✅ claude-code-acp-ts 安装验证通过") || (echo "❌ claude-code-acp-ts 未正确安装" && exit 1)
+
+
+RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
+
 # 暴露端口
 EXPOSE 8086
 EXPOSE 60000
