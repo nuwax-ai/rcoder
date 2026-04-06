@@ -130,9 +130,10 @@ docker-build-master-base:
 #   - otel          (agent_runner):         OpenTelemetry 追踪
 #   - debug         (rcoder):               调试路由
 #   - proxy         (agent_runner):         Pingora 反向代理（Linux 容器默认开启）
+#   - kubernetes    (rcoder, docker_manager): Kubernetes 运行时支持
 #
 # 本地开发调试默认开启所有功能
-CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,proxy
+CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,proxy,kubernetes
 #
 # 生产模式：禁用 eBPF 工具（通过 make docker-build-agent-production）
 # CARGO_FEATURES ?=
