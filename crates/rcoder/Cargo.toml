@@ -21,6 +21,10 @@ debug = []
 # 此 feature 会传递给 docker_manager crate
 ebpf-debug = ["docker_manager/ebpf-debug"]
 
+# Kubernetes 支持：启用 Kubernetes 运行时模式
+# 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
+kubernetes = ["docker_manager/kubernetes"]
+
 [dev-dependencies]
 filetime = "0.2"
 
