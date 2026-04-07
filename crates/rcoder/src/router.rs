@@ -64,6 +64,9 @@ pub struct AppState {
     /// 🆕 容器创建中标记: user_id -> 创建开始时间
     /// 用于防止并发 pod_ensure 请求互相干扰（无锁方案）
     pub pod_creating: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// 🆕 容器前缀（从配置读取，启动时初始化）
+    pub container_prefix_rcoder: String,
+    pub container_prefix_computer: String,
 }
 
 impl AppState {
@@ -71,6 +74,8 @@ impl AppState {
         config: AppConfig,
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
         api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
+        container_prefix_rcoder: String,
+        container_prefix_computer: String,
     ) -> anyhow::Result<Self> {
         let projects = ProjectAdapter::new()
             .map_err(|e| anyhow::anyhow!("Failed to initialize ProjectAdapter: {}", e))?;
@@ -85,6 +90,8 @@ impl AppState {
             )),
             api_key_config,
             pod_creating: Arc::new(DashMap::new()),
+            container_prefix_rcoder,
+            container_prefix_computer,
         })
     }
 

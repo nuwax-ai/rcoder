@@ -380,10 +380,36 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+    // 获取容器前缀（从配置读取，用于 pod_count 和 pod_list）
+    let docker_config = config.docker_config.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Docker config is required for container prefix"))?;
+    let multi_config = docker_config.get_multi_image_config();
+    let selector = docker_manager::image_selector::ImageSelector::new(multi_config);
+    // 使用 block_in_place 在同步上下文中获取异步配置
+    let (container_prefix_rcoder, container_prefix_computer) = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let rcoder_prefix = selector
+                .get_service_config(&shared_types::ServiceType::RCoder)
+                .await
+                .expect("Failed to get RCoder service config")
+                .container_prefix()
+                .to_string();
+            let computer_prefix = selector
+                .get_service_config(&shared_types::ServiceType::ComputerAgentRunner)
+                .await
+                .expect("Failed to get ComputerAgentRunner service config")
+                .container_prefix()
+                .to_string();
+            (rcoder_prefix, computer_prefix)
+        })
+    });
+
     let state = Arc::new(AppState::new(
         config.clone(),
         pingora_service_opt,
         api_key_config,
+        container_prefix_rcoder,
+        container_prefix_computer,
     )?);
 
     // 在主异步运行时中启动清理任务（如果启用）

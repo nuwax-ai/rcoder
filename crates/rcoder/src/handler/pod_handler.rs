@@ -9,7 +9,6 @@
 //! - `POST /computer/pod/keepalive` - 容器保活（刷新活动时间）
 
 use axum::extract::State;
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -396,7 +395,7 @@ pub struct RestartPodResponse {
     description = "获取当前运行的容器总数及按服务类型分类的统计"
 )]
 pub async fn pod_count(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<HttpResult<PodCountResponse>, AppError> {
     debug!("📊 [POD_COUNT] getcontainer message ");
 
@@ -411,17 +410,23 @@ pub async fn pod_count(
     // 获取所有容器列表
     let containers = docker_manager.list_containers().await;
 
-    // 按服务类型统计
+    // 获取容器前缀（从 AppState 获取，启动时已初始化）
+    let rcoder_prefix = state.container_prefix_rcoder.as_str();
+    let computer_prefix = state.container_prefix_computer.as_str();
+
+    // 按服务类型统计（仅统计运行中的容器）
     let mut rcoder_count = 0u32;
     let mut computer_count = 0u32;
 
     for container in &containers {
-        if container.container_name.starts_with("rcoder-agent-") {
+        // 仅统计运行中的容器
+        if !matches!(container.status, docker_manager::ContainerStatus::Running) {
+            continue;
+        }
+
+        if container.container_name.starts_with(&rcoder_prefix) {
             rcoder_count += 1;
-        } else if container
-            .container_name
-            .starts_with("computer-agent-runner-")
-        {
+        } else if container.container_name.starts_with(&computer_prefix) {
             computer_count += 1;
         }
     }
@@ -492,39 +497,42 @@ pub async fn pod_list(
         AppError::internal_server_error(&format!("Failed to get DuckDB container list: {}", e))
     })?;
 
-    // 3. 创建容器ID到DuckDB记录的映射
+    // 3. 获取容器前缀（从 AppState 获取，启动时已初始化）
+    let rcoder_prefix = state.container_prefix_rcoder.as_str();
+    let computer_prefix = state.container_prefix_computer.as_str();
+
+    // 4. 创建容器ID到DuckDB记录的映射
     let mut duckdb_map: std::collections::HashMap<String, &duckdb_manager::ContainerRecord> =
         std::collections::HashMap::new();
     for record in &duckdb_containers {
         duckdb_map.insert(record.container_id.clone(), record);
     }
 
-    // 4. 合并数据，构建容器详细信息列表
+    // 5. 合并数据，构建容器详细信息列表
     let mut containers: Vec<PodDetailInfo> = Vec::new();
 
     for docker_container in &docker_containers {
+        // 仅处理运行中的容器
+        if !matches!(docker_container.status, docker_manager::ContainerStatus::Running) {
+            continue;
+        }
+
         let duckdb_record = duckdb_map.get(&docker_container.container_id);
 
         // 确定服务类型
-        let service_type = if docker_container.container_name.starts_with("rcoder-agent-") {
+        let service_type = if docker_container.container_name.starts_with(rcoder_prefix) {
             "RCoder"
-        } else if docker_container
-            .container_name
-            .starts_with("computer-agent-runner-")
-        {
+        } else if docker_container.container_name.starts_with(computer_prefix) {
             "ComputerAgentRunner"
         } else {
             "Unknown"
         };
 
         // 从容器名称提取 user_id（如果是 computer-agent-runner-{user_id}）
-        let user_id = if docker_container
-            .container_name
-            .starts_with("computer-agent-runner-")
-        {
+        let user_id = if docker_container.container_name.starts_with(computer_prefix) {
             docker_container
                 .container_name
-                .strip_prefix("computer-agent-runner-")
+                .strip_prefix(computer_prefix)
                 .map(|s| s.to_string())
         } else {
             None
