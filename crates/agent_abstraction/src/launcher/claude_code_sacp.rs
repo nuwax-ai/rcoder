@@ -63,6 +63,7 @@ const ENV_ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
 const ENV_ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 const ENV_ANTHROPIC_MODEL: &str = "ANTHROPIC_MODEL";
 const ENV_DISABLE_NONESSENTIAL: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+const ENV_AGENT_SDK_SKIP_VERSION_CHECK: &str = "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK";
 const ENV_RUST_LOG: &str = "RUST_LOG";
 const ENV_AGENT_WORKING_DIR: &str = "AGENT_WORKING_DIR";
 const ENV_AGENT_PROJECT_ID: &str = "AGENT_PROJECT_ID";
@@ -350,6 +351,8 @@ pub async fn load_sacp_agent_config(
 
         // 禁用 Claude Code 非必要网络请求
         resolved_env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
+        // 跳过 Agent SDK 版本检查
+        resolved_env.insert(ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(), "1".to_string());
 
         // debug: 打印最终环境变量（API Key 已脱敏）
         let mask_key = |v: &String| -> String {
@@ -430,6 +433,7 @@ pub fn get_default_sacp_agent_config(
 
     env.insert(ENV_RUST_LOG.to_string(), "info".to_string());
     env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
+    env.insert(ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(), "1".to_string());
 
     // Resolve the claude-code-acp-ts command path.
     // Priority: CLAUDE_CODE_ACP_PATH env var > `which` crate lookup > bare command name.
