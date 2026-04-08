@@ -31,10 +31,10 @@ publish = false
 
 [workspace.dependencies]
 # ACP Protocol - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
-sacp = "10.1.0"
-sacp-derive = "10.0.0"
+sacp = "11.0.0"
+sacp-derive = "11.0.0"
 # SACP 所需的 schema 依赖（共享类型定义）
-agent-client-protocol-schema = "0.10.7"
+agent-client-protocol-schema =  "0.11.0"
 
 # SACP 所需的额外依赖
 boxfnonce = "0.1.1"

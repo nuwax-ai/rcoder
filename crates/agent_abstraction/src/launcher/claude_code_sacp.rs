@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(windows)]
 use crate::path_env::TAURI_APP_DATA_DIR;
-use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
+use agent_config::{AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
 use process_wrap::tokio::CommandWrap;
 #[cfg(unix)]
@@ -35,7 +35,7 @@ use sacp::schema::{
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
     SessionNotification,
 };
-use sacp::{ClientToAgent, JrConnectionCx, JrRequestCx};
+use sacp::{Agent, Client, ConnectionTo, Responder};
 
 use crate::acp::CancelNotificationRequestWrapper;
 use crate::traits::AgentStartConfig;
@@ -1128,83 +1128,31 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
     let project_id_for_prompt_end = project_id.clone();
 
     // 使用 SACP Builder 模式
-    ClientToAgent::builder()
+    Client.builder()
         .name("rcoder-agent-runner-sacp")
-        // 使用容错的消息处理器（处理未类型化消息，手动解析以捕获错误）
-        // 注意：必须在类型化 handlers 之前注册，以便作为 fallback
-        .on_receive_message(
+        // 处理 SessionNotification 通知
+        .on_receive_notification(
             {
-                async move |msg: sacp::MessageCx<sacp::UntypedMessage, sacp::UntypedMessage>,
-                            _cx: JrConnectionCx<ClientToAgent>| {
-                    match msg {
-                        sacp::MessageCx::Notification(untyped_notif) => {
-                            // 提前克隆需要的字段
-                            let method = untyped_notif.method.clone();
-                            let params = untyped_notif.params.clone();
-
-                            // 尝试解析为 SessionNotification
-                            let parse_result = sacp::MessageCx::Notification(untyped_notif)
-                                .into_notification::<SessionNotification>();
-
-                            match parse_result {
-                                Ok(Ok(notification)) => {
-                                    let notifier = notifier_for_handlers.clone();
-                                    let project_id = project_id_for_handlers.clone();
-                                    // 解析成功，处理通知
-                                    handle_session_notification(notification, notifier, project_id).await;
-                                    Ok(sacp::Handled::Yes)
-                                }
-                                Ok(Err(_)) => {
-                                    // 方法名不匹配，不是 session/update 通知，跳过
-                                    debug!(
-                                        method = %method,
-                                        "[SACP] Skipping non session/update notification"
-                                    );
-                                    // 继续传递给其他 handlers
-                                    Ok(sacp::Handled::No {
-                                        message: sacp::MessageCx::Notification(sacp::UntypedMessage {
-                                            method,
-                                            params,
-                                        }),
-                                        retry: false,
-                                    })
-                                }
-                                Err(ref err) => {
-                                    // 解析失败（如缺少 data 字段），记录警告但不断开连接
-                                    warn!(
-                                        ?err,
-                                        method = %method,
-                                        params = ?params,
-                                        "[SACP] SessionNotification parse failed, skipping message but keeping connection"
-                                    );
-                                    // 跳过此消息但不断开连接
-                                    Ok(sacp::Handled::Yes)
-                                }
-                            }
-                        }
-                        sacp::MessageCx::Request(request, request_cx) => {
-                            // 请求消息继续传递给 RequestPermission handler
-                            Ok(sacp::Handled::No {
-                                message: sacp::MessageCx::Request(request, request_cx),
-                                retry: false,
-                            })
-                        }
-                    }
+                let notifier = notifier_for_handlers.clone();
+                let project_id = project_id_for_handlers.clone();
+                async move |notification: SessionNotification, _cx: ConnectionTo<Agent>| {
+                    handle_session_notification(notification, notifier.clone(), project_id.clone()).await;
+                    Ok(())
                 }
             },
-            sacp::on_receive_message!(),
+            sacp::on_receive_notification!(),
         )
         // 处理 RequestPermission
         .on_receive_request(
             move |request: RequestPermissionRequest,
-                  request_cx: JrRequestCx<RequestPermissionResponse>,
-                  _cx: JrConnectionCx<ClientToAgent>| {
-                async move { handle_permission_request(request, request_cx).await }
+                  responder: Responder<RequestPermissionResponse>,
+                  _cx: ConnectionTo<Agent>| {
+                async move { handle_permission_request(request, responder).await }
             },
             sacp::on_receive_request!(),
         )
         // 主连接逻辑
-        .run_until(transport, move |cx: JrConnectionCx<ClientToAgent>| {
+        .connect_with(transport, move |cx: ConnectionTo<Agent>| {
             let project_path = project_path.clone();
             let mcp_servers = mcp_servers.clone();
             let start_config = start_config.clone();
@@ -1568,7 +1516,7 @@ async fn handle_session_notification<N: SessionNotifier>(
 /// 处理 RequestPermission 回调
 async fn handle_permission_request(
     request: RequestPermissionRequest,
-    request_cx: JrRequestCx<RequestPermissionResponse>,
+    request_cx: Responder<RequestPermissionResponse>,
 ) -> Result<(), sacp::Error> {
     debug!("[SACP] message request: {:?}", request);
 
