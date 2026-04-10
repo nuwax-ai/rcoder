@@ -104,7 +104,7 @@ impl ChatHandlerOutput {
             project_id,
             session_id: session_id.unwrap_or_default(),
             success: false,
-            error: Some("Agent 正在执行任务，请等待当前任务完成后再发送新请求".to_string()),
+            error: Some(error_codes::get_i18n_message_default("error.agent_busy")),
             error_code: Some(error_codes::ERR_AGENT_BUSY.to_string()),
             request_id: None,
             need_fallback: false,
@@ -230,7 +230,11 @@ pub async fn handle_chat_core(
             return ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
-                format!("创建项目目录失败: {}", e),
+                format!(
+                    "{}: {}",
+                    error_codes::get_i18n_message_default("error.create_project_dir_failed"),
+                    e
+                ),
                 error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
             );
         }
@@ -257,7 +261,11 @@ pub async fn handle_chat_core(
             return ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
-                format!("构建 ChatPrompt 失败: {}", e),
+                format!(
+                    "{}: {}",
+                    error_codes::get_i18n_message_default("error.build_chat_prompt_failed"),
+                    e
+                ),
                 error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
             );
         }
@@ -324,7 +332,7 @@ pub async fn handle_chat_core(
             return ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
-                "Agent Worker 不可用，正在重启，请稍后重试".to_string(),
+                error_codes::get_i18n_message_default("error.agent_worker_unavailable"),
                 error_codes::ERR_SERVICE_UNAVAILABLE.to_string(),
             );
         }
@@ -344,7 +352,11 @@ pub async fn handle_chat_core(
         return ChatHandlerOutput::error(
             project_id,
             session_id.unwrap_or_default(),
-            format!("发送任务失败: {}", e),
+            format!(
+                "{}: {}",
+                error_codes::get_i18n_message_default("error.send_task_failed"),
+                e
+            ),
             error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
         );
     }
@@ -384,7 +396,11 @@ pub async fn handle_chat_core(
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
-                format!("处理请求失败: {}", e),
+                format!(
+                    "{}: {}",
+                    error_codes::get_i18n_message_default("error.request_processing_failed"),
+                    e
+                ),
                 error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
             )
         }

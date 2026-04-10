@@ -47,7 +47,7 @@ pub async fn create_grpc_sse_stream(
                         attempt, max_retries, e
                     );
                     pool.remove(&grpc_addr);
-                    last_error_msg = format!("获取客户端失败: {}", e);
+                    last_error_msg = format!("failed to get client: {}", e);
                     continue;
                 }
             };
@@ -181,11 +181,11 @@ pub async fn create_grpc_sse_stream(
                             grpc_addr
                         );
                         pool.remove(&grpc_addr);
-                        last_error_msg = format!("流订阅失败: {}", e);
+                        last_error_msg = format!("stream subscription failed: {}", e);
                         continue;
                     }
 
-                    last_error_msg = format!("流订阅最终失败: {}", e);
+                    last_error_msg = format!("stream subscription ultimately failed: {}", e);
                 }
             }
         }
@@ -349,7 +349,7 @@ pub async fn get_container_grpc_addr(project_id: &str, grpc_port: u16) -> anyhow
 
     let grpc_addr = format!("{}:{}", agent_info.container_ip, grpc_port);
 
-    info!("[CONTAINER] getcontainer gRPC message : {}", grpc_addr);
+    info!("[CONTAINER] get container gRPC addr: {}", grpc_addr);
     Ok(grpc_addr)
 }
 

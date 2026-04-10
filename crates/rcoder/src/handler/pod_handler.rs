@@ -87,7 +87,7 @@ fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
     // 创建东八区时区偏移 (UTC+8)
     // 注意: east_opt 在参数有效时总是返回 Some，这里使用 unwrap_or 仅作为安全保障
     let utc8_offset = FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| {
-        tracing::warn!("created UTC+8 message failed, message UTC+0");
+        tracing::warn!("created UTC+8 timezone failed, fallback to UTC+0");
         FixedOffset::east_opt(0).unwrap_or(FixedOffset::east_opt(0).unwrap())
     });
 
@@ -397,7 +397,7 @@ pub struct RestartPodResponse {
 pub async fn pod_count(
     State(state): State<Arc<AppState>>,
 ) -> Result<HttpResult<PodCountResponse>, AppError> {
-    debug!("📊 [POD_COUNT] getcontainer message ");
+    debug!("📊 [POD_COUNT] Getting container count");
 
     // 获取全局 DockerManager
     let docker_manager = docker_manager::global::get_global_docker_manager()
@@ -477,7 +477,7 @@ pub async fn pod_list(
     I18nQuery(params): I18nQuery<PodListQuery>,
 ) -> Result<HttpResult<PodListResponse>, AppError> {
     debug!(
-        "📋 [POD_LIST] getcontainer message : limit={:?}",
+        "📋 [POD_LIST] get containers: limit={:?}",
         params.limit
     );
 
@@ -693,7 +693,7 @@ pub async fn pod_ensure(
     // 1.1 验证资源限制
     if let Some(ref limits) = request.resource_limits {
         if let Err(e) = validate_resource_limits(limits) {
-            error!("[POD_ENSURE] resources message failed: {}", e);
+            error!("[POD_ENSURE] resources update failed: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
                 locale,
@@ -702,7 +702,7 @@ pub async fn pod_ensure(
     }
 
     info!(
-        "🚀 [POD_ENSURE] 确保容器存在: user_id={}, project_id={}",
+        "🚀 [POD_ENSURE] Ensuring container exists: user_id={}, project_id={}",
         request.user_id, request.project_id
     );
 
@@ -715,7 +715,7 @@ pub async fn pod_ensure(
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {
             info!(
-                "⏳ [POD_ENSURE] 容器正在创建中，等待完成: user_id={}, 已等待={:?}",
+                "⏳ [POD_ENSURE] Container is being created, waiting for completion: user_id={}, elapsed={:?}",
                 request.user_id, elapsed
             );
 
@@ -871,13 +871,13 @@ pub async fn pod_ensure(
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
             // Docker 删除是异步操作，立即创建同名容器可能导致资源冲突
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            debug!("⏱️ [POD_ENSURE] already message containerresourcesreleased");
+            debug!("⏱️ [POD_ENSURE] container resources already released");
 
             true
         }
         None => {
             // 容器不存在，需要创建
-            info!("🏗️ [POD_ENSURE] containernot found, message created message container");
+            info!("🏗️ [POD_ENSURE] container not found, will create new container");
             true
         }
     };
@@ -940,7 +940,7 @@ pub async fn pod_ensure(
                         .await;
                     } else {
                         error!(
-                            "[POD_ENSURE] containercreatedfailed(alreadyretry {} message )",
+                            "[POD_ENSURE] Container creation failed (already retry {})",
                             max_attempts
                         );
                     }
@@ -1000,7 +1000,7 @@ pub async fn pod_ensure(
                         }
                         _ => {
                             debug!(
-                                "[POD_ENSURE] message mapping message not message : message {} message ",
+                                "[POD_ENSURE] Mapping not found: retry {}",
                                 retry_attempt
                             );
                         }
@@ -1211,11 +1211,11 @@ pub async fn pod_keepalive(
                     project_info.set_container(Some(info.clone()));
                     state.insert_project(request.project_id.clone(), Arc::new(project_info));
                     info!(
-                        "[POD_KEEPALIVE] containeralreadyexists(Docker), already message DuckDB message "
+                        "[POD_KEEPALIVE] container already exists (Docker), updating DuckDB"
                     );
                 } else {
                     info!(
-                        "[POD_KEEPALIVE] containeralreadyexists(Docker), DuckDB already message "
+                        "[POD_KEEPALIVE] container already exists (Docker), DuckDB already up to date"
                     );
                 }
                 (info, false)
@@ -1335,7 +1335,7 @@ pub async fn pod_restart(
     // 1.1 验证资源限制
     if let Some(ref limits) = request.resource_limits {
         if let Err(e) = validate_resource_limits(limits) {
-            error!("[POD_RESTART] resources message failed: {}", e);
+            error!("[POD_RESTART] resources update failed: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
                 locale,
@@ -1355,7 +1355,7 @@ pub async fn pod_restart(
     // 3. 如果容器存在，先销毁
     if let Some(container_info) = existing_container {
         info!(
-            "🗑️ [POD_RESTART] 销毁现有容器: container_id={}",
+            "🗑️ [POD_RESTART] Destroying existing container: container_id={}",
             container_info.container_id
         );
 
@@ -1367,14 +1367,14 @@ pub async fn pod_restart(
         {
             Ok((container_deleted, deleted_projects)) => {
                 info!(
-                    "🧹 [POD_RESTART] 已清理旧容器记录: container_id={}, container_deleted={}, deleted_projects={}",
+                    "🧹 [POD_RESTART] Cleaned up old container records: container_id={}, container_deleted={}, deleted_projects={}",
                     container_info.container_id, container_deleted, deleted_projects
                 );
             }
             Err(e) => {
                 // 记录错误但继续执行(不阻塞容器创建)
                 error!(
-                    "⚠️ [POD_RESTART] 清理旧容器记录失败（继续创建）: container_id={}, error={}",
+                    "⚠️ [POD_RESTART] Failed to clean up old container records (will continue creating): container_id={}, error={}",
                     container_info.container_id, e
                 );
             }
@@ -1441,7 +1441,7 @@ pub async fn pod_restart(
                 }
                 Err(e) => {
                     warn!(
-                        "[POD_RESTART] checkcontainerremovedstatus message : {}, message alreadyremoved",
+                        "[POD_RESTART] check container removed status: {}, container already removed",
                         e
                     );
                     // 如果是其他错误，也可能意味着Container status abnormal，尝试继续
@@ -1468,7 +1468,7 @@ pub async fn pod_restart(
 
     // 5. 强制创建新容器
     info!(
-        "🏗️ [POD_RESTART] 强制创建新容器: user_id={}",
+        "🏗️ [POD_RESTART] Force creating new container: user_id={}",
         request.user_id
     );
 
@@ -1479,7 +1479,7 @@ pub async fn pod_restart(
     .await?;
 
     info!(
-        "✅ [POD_RESTART] 新容器创建成功: container_id={}",
+        "✅ [POD_RESTART] New container created successfully: container_id={}",
         container_info.container_id
     );
 
@@ -1615,7 +1615,7 @@ pub async fn pod_status(
 
     // 1. 验证参数：至少需要 user_id 或 project_id 之一
     if params.user_id.is_none() && params.project_id.is_none() {
-        error!("[POD_STATUS] user_id message project_id message ");
+        error!("[POD_STATUS] user_id and project_id are both empty");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -1664,9 +1664,9 @@ pub async fn pod_status(
                 "stopped"
             };
             let message = if result.is_running {
-                "容器正在运行中".to_string()
+                "container is running".to_string()
             } else {
-                format!("容器存在但状态为: {:?}", result.status)
+                format!("container exists but status is: {:?}", result.status)
             };
 
             info!(
@@ -1706,9 +1706,9 @@ pub async fn pod_status(
                         "stopped"
                     };
                     let message = if result.is_running {
-                        "容器正在运行中".to_string()
+                        "container is running".to_string()
                     } else {
-                        format!("容器存在但状态为: {:?}", result.status)
+                        format!("container exists but status is: {:?}", result.status)
                     };
 
                     info!(
@@ -1729,7 +1729,7 @@ pub async fn pod_status(
                     // 容器不存在
                 }
                 Err(e) => {
-                    error!("[POD_STATUS] message project_id Query failed: {}", e);
+                    error!("[POD_STATUS] Query failed: {}", e);
                     // 继续返回 not_found 而不是错误
                 }
             }
@@ -1831,7 +1831,7 @@ pub async fn pod_vnc_status(
         .filter(|s| !s.trim().is_empty());
 
     if user_id.is_none() && project_id.is_none() {
-        warn!("[POD_VNC_STATUS] user_id message project_id message empty");
+        warn!("[POD_VNC_STATUS] user_id and project_id are both empty");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -1921,7 +1921,7 @@ pub async fn pod_vnc_status(
         _ => {
             // 如果无法获取 agent_info，返回错误
             error!(
-                "❌ [POD_VNC_STATUS] 无法获取容器服务信息: container_id={}",
+                "❌ [POD_VNC_STATUS] unable to get container service info: container_id={}",
                 result.container_id
             );
             return Ok(HttpResult::error_with_locale(
@@ -1940,7 +1940,7 @@ pub async fn pod_vnc_status(
         })?;
 
     info!(
-        "📡 [POD_VNC_STATUS] message gRPC connection: addr={}",
+        "📡 [POD_VNC_STATUS] Checking gRPC connection: addr={}",
         grpc_addr
     );
 
@@ -1971,7 +1971,7 @@ pub async fn pod_vnc_status(
                     }))
                 }
                 Err(e) => {
-                    error!("[POD_VNC_STATUS] gRPC message failed: {}", e);
+                    error!("[POD_VNC_STATUS] gRPC call failed: {}", e);
                     Ok(HttpResult::error_with_locale(
                         shared_types::error_codes::ERR_GRPC_ERROR,
                         locale,
@@ -1980,7 +1980,7 @@ pub async fn pod_vnc_status(
             }
         }
         Err(e) => {
-            error!("[POD_VNC_STATUS] message gRPC connectionfailed: {}", e);
+            error!("[POD_VNC_STATUS] gRPC connection failed: {}", e);
             Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 locale,

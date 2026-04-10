@@ -24,7 +24,7 @@ impl ImageSelector {
     /// 创建新的镜像选择器
     pub fn new(config: MultiImageConfig) -> Self {
         let platform = DockerUtils::get_optimal_platform();
-        debug!("created message, message : {}", platform);
+        debug!("created selector for: {}", platform);
 
         Self { config, platform }
     }
@@ -42,7 +42,7 @@ impl ImageSelector {
         // 强制验证：service_type 必须明确指定并启用
         if !self.is_service_enabled(service_type) {
             return Err(DockerError::ConfigurationError(format!(
-                "服务类型 '{}' 未启用或配置不存在",
+                "service type '{}' is not enabled or configuration does not exist",
                 service_type
             )));
         }
@@ -68,7 +68,7 @@ impl ImageSelector {
         // 强制验证：service_type 必须明确指定并启用
         if !self.is_service_enabled(service_type) {
             return Err(DockerError::ConfigurationError(format!(
-                "服务类型 '{}' 未启用或配置不存在",
+                "service type '{}' is not enabled or configuration does not exist",
                 service_type
             )));
         }
@@ -77,11 +77,11 @@ impl ImageSelector {
         let service_key = service_type.to_string();
         match self.config.services.get(&service_key) {
             Some(service_config) => {
-                info!("get message configsucceeded: {}", service_key);
+                info!("Get config succeeded: {}", service_key);
                 Ok(service_config.clone())
             }
             None => Err(DockerError::ConfigurationError(format!(
-                "服务类型 '{}' 的配置不存在",
+                "configuration for service type '{}' does not exist",
                 service_type
             ))),
         }
@@ -124,25 +124,25 @@ impl ImageSelector {
         if let Some(service_config) = self.config.services.get(&service_key) {
             // 服务级通用镜像（最高优先级）
             if let Some(image) = &service_config.image {
-                debug!(" message : {}", image);
+                debug!(" using image: {}", image);
                 return Ok(image.clone());
             }
 
             // 平台特定镜像
             if self.platform == "linux/arm64" {
                 if let Some(arm64_image) = &service_config.arm64_image {
-                    debug!(" message ARM64 message : {}", arm64_image);
+                    debug!(" using ARM64 image: {}", arm64_image);
                     return Ok(arm64_image.clone());
                 }
             } else if let Some(amd64_image) = &service_config.amd64_image {
-                debug!(" message AMD64 message : {}", amd64_image);
+                debug!(" using AMD64 image: {}", amd64_image);
                 return Ok(amd64_image.clone());
             }
         }
 
         // 2. 使用全局默认配置
         if let Some(default_image) = &self.config.global_defaults.default_image {
-            debug!(" message default message : {}", default_image);
+            debug!(" using default image: {}", default_image);
             return Ok(default_image.clone());
         }
 

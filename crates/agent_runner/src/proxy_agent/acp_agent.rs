@@ -167,7 +167,11 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
                         project_id: project_id.clone(),
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                        error: Some(format!("附件处理失败: {:?}", e)),
+                        error: Some(format!(
+                            "{}: {:?}",
+                            shared_types::error_codes::get_i18n_message_default("error.attachment_processing_failed"),
+                            e
+                        )),
                         request_id: Some(request_id),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
@@ -202,7 +206,11 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
                     project_id: project_id.clone(),
                     session_id: String::new(),
                     code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                    error: Some(format!("处理失败: {:?}", e)),
+                    error: Some(format!(
+                        "{}: {:?}",
+                        shared_types::error_codes::get_i18n_message_default("error.processing_failed"),
+                        e
+                    )),
                     request_id: Some(request_id.clone()),
                     service_type: request.prompt_message.service_type.clone(),
                 }) {
@@ -385,7 +393,11 @@ pub async fn agent_worker_with_heartbeat(
                             project_id: project_id.clone(),
                             session_id: String::new(),
                             code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                            error: Some(format!("附件处理失败: {:?}", e)),
+                            error: Some(format!(
+                                "{}: {:?}",
+                                shared_types::error_codes::get_i18n_message_default("error.attachment_processing_failed"),
+                                e
+                            )),
                             request_id: Some(request_id.clone()),
                             service_type: request.prompt_message.service_type.clone(),
                         }) {
@@ -422,7 +434,11 @@ pub async fn agent_worker_with_heartbeat(
                         project_id: project_id.clone(),
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                        error: Some(format!("处理失败: {:?}", e)),
+                        error: Some(format!(
+                            "{}: {:?}",
+                            shared_types::error_codes::get_i18n_message_default("error.processing_failed"),
+                            e
+                        )),
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
@@ -468,9 +484,9 @@ pub async fn agent_worker_with_heartbeat(
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
                         error: Some(format!(
-                            "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
-                            limit
-                        )),
+                            "{}",
+                            shared_types::error_codes::get_i18n_message_default("error.system_busy")
+                        ).replace("{}", &limit.to_string())),
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {

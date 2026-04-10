@@ -108,7 +108,7 @@ pub async fn startup_cleanup_containers(
 
     let total_found = matched_containers.len();
     info!(
-        "[STARTUP_CLEANUP] message {} message container",
+        "[STARTUP_CLEANUP] Found {} containers",
         total_found
     );
 
@@ -536,11 +536,11 @@ pub async fn startup_cleanup_all_enabled_services(
     let patterns = get_container_patterns_for_enabled_services(multi_image_config);
 
     if patterns.is_empty() {
-        warn!(" message, skipcontainercleanup");
+        warn!("No patterns, skip container cleanup");
         return Ok(CleanupResult::default());
     }
 
-    info!("🧹 startingcleanup message container: {:?}", patterns);
+    info!("🧹 Starting cleanup container: {:?}", patterns);
     let start_time = Instant::now();
 
     // 并行清理多个服务类型的容器
@@ -572,10 +572,10 @@ pub async fn startup_cleanup_all_enabled_services(
                     .extend(result.failed_removals_details);
             }
             Ok(Err(e)) => {
-                warn!("cleanup message containerfailed: {}", e);
+                warn!("cleanup container failed: {}", e);
             }
             Err(e) => {
-                warn!("cleanup message failed: {}", e);
+                warn!("cleanup failed: {}", e);
             }
         }
     }

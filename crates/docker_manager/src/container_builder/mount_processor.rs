@@ -76,7 +76,7 @@ impl MountProcessor {
                 let pattern = format!("{{{}}}", key);
                 if host_path.contains(&pattern) {
                     host_path = host_path.replace(&pattern, value);
-                    debug!(" message : {} -> {}", pattern, value);
+                    debug!(" substituted: {} -> {}", pattern, value);
                 }
             }
         }
@@ -109,7 +109,7 @@ impl MountProcessor {
         mounts: Vec<(String, String, bool)>,
         variables: Option<&HashMap<String, String>>,
     ) -> DockerResult<Vec<MountPoint>> {
-        debug!(" message {} message mount message ", mounts.len());
+        debug!("Processing {} mounts", mounts.len());
 
         let processed: DockerResult<Vec<MountPoint>> = mounts
             .into_iter()
@@ -120,7 +120,7 @@ impl MountProcessor {
 
         let processed = processed?;
         info!(
-            " message mount message completed: {} message ",
+            "Mount processing completed: {} mounts",
             processed.len()
         );
 

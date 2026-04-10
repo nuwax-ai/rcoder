@@ -61,7 +61,7 @@ impl ContainerDestroyer {
         );
 
         // 输出详细原因
-        debug!("📋 [destroyer] destroy message : {}", reason.description());
+        debug!("📋 [destroyer] destroy reason: {}", reason.description());
 
         // 1. 🔍 通过容器名称实时查询最新的容器信息
         // 这样可以获取最新的 container_id，避免使用缓存中过期的 ID

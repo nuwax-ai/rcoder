@@ -478,7 +478,7 @@ async fn validate_and_get_session_context(
                                 return Err(create_error_response(
                                     StatusCode::NOT_FOUND,
                                     "CONTAINER_NOT_FOUND",
-                                    &format!("容器不存在: user_id={}", user_id),
+                                    &format!("container not found: user_id={}", user_id),
                                 ));
                             }
                             Err(e) => {
@@ -646,13 +646,13 @@ async fn build_sse_stream_from_container_name(
                 ip
             } else {
                 error!(
-                    "❌ [gRPC_SSE] 无法获取容器 IP: container_name={}",
+                    "❌ [gRPC_SSE] unable to get container IP: container_name={}",
                     container_name
                 );
                 return Err(create_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "GRPC_CONNECTION_ERROR",
-                    "无法获取容器 IP 地址",
+                    "unable to get container IP address",
                 ));
             }
         }
@@ -664,14 +664,14 @@ async fn build_sse_stream_from_container_name(
             return Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "GRPC_CONNECTION_ERROR",
-                &format!("获取容器 IP 失败: {}", e),
+                &format!("failed to get container IP: {}", e),
             ));
         }
     };
 
     let grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
     info!(
-        "🚀 [gRPC_SSE] 建立 {} gRPC SSE 代理连接: {}, project_id={}",
+        "🚀 [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
         agent_type, grpc_addr, project_id
     );
 
@@ -1089,7 +1089,7 @@ async fn create_sse_proxy_stream(
                     // 发送错误事件
                     let error_event = Event::default()
                         .event("error")
-                        .data(format!("容器连接失败: {}", response.status()));
+                        .data(format!("container connection failed: {}", response.status()));
                     if let Err(send_err) = tx.send(Ok(error_event)).await {
                         warn!(
                             "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
@@ -1107,7 +1107,7 @@ async fn create_sse_proxy_stream(
                 // 发送连接错误事件
                 let error_event = Event::default()
                     .event("error")
-                    .data(format!("连接错误: {}", e));
+                    .data(format!("connection error: {}", e));
                 if let Err(send_err) = tx.send(Ok(error_event)).await {
                     warn!(
                         "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
@@ -1118,7 +1118,7 @@ async fn create_sse_proxy_stream(
         }
 
         info!(
-            "[SSE_PROXY] SSEproxyconnection message : session_id={}",
+            "[SSE_PROXY] SSE proxy connection: session_id={}",
             session_id
         );
     });
@@ -1224,7 +1224,7 @@ async fn get_container_sse_url(
         // info.service_url 格式为 http://ip:8086
         let sse_url = format!("{}/agent/progress/{}", info.service_url, session_id);
 
-        info!("[CONTAINER] getcontainerSSE message : {}", sse_url);
+        info!("[CONTAINER] get container SSE: {}", sse_url);
         Ok(sse_url)
     } else {
         Err(AppError::internal_server_error("Container info not found"))

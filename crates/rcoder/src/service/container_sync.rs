@@ -57,13 +57,13 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
                         );
                     } else {
                         info!(
-                            "[CONTAINER_SYNC] message completed: check={}, message removed",
+                            "[CONTAINER_SYNC] Sync completed: checked={}",
                             checked
                         );
                     }
                 }
                 Err(e) => {
-                    warn!("[CONTAINER_SYNC] message failed: {}", e);
+                    warn!("[CONTAINER_SYNC] sync failed: {}", e);
                 }
             }
         }

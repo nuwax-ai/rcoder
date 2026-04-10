@@ -100,3 +100,15 @@ error.session_cancelled: "工作階段已取消"
 error.cancel_response_timeout: "取消後等待回應逾時"
 error.agent_init_timeout: "智慧體初始化逾時，請重試（過多的MCP可能導致逾時）。如果持續失敗請重啟智慧體電腦（點選PC端右上圖示展開後，在[...]裡點選重啟智慧體電腦）"
 error.session_cancelled_timeout: "使用者取消任務（Agent 回應逾時）"
+
+# 處理錯誤
+error.attachment_processing_failed: "附件處理失敗"
+error.processing_failed: "處理失敗"
+
+# Chat handler 錯誤
+error.create_project_dir_failed: "建立專案目錄失敗"
+error.build_chat_prompt_failed: "建構 ChatPrompt 失敗"
+error.agent_worker_unavailable: "Agent Worker 不可用，正在重啟，請稍後重試"
+error.send_task_failed: "發送任務失敗"
+error.request_processing_failed: "處理請求失敗"
+error.system_busy: "系統繁忙：並發 Agent 工作階段數已達上限 ({} 個)，請稍後重試"

@@ -24,11 +24,11 @@
 //!
 //! match ConfigWatcher::new(config_path, api_key_config) {
 //!     Ok(watcher) => {
-//! println!("config message alreadystarted");
+//! println!("config watcher already started");
 //!         // watcher 必须保持存活,否则监控会停止
 //!     }
 //!     Err(e) => {
-//! eprintln!("config message startedfailed: {}", e);
+//! eprintln!("config watcher start failed: {}", e);
 //!     }
 //! }
 //! ```
@@ -83,7 +83,7 @@ impl ConfigWatcher {
         watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
 
         info!(
-            "📁 [CONFIG_WATCHER] starting message configfile: {:?}",
+            "📁 [CONFIG_WATCHER] Starting config file watch: {:?}",
             config_path
         );
 
@@ -106,7 +106,7 @@ impl ConfigWatcher {
                         )
                         .await
                         {
-                            warn!(" [CONFIG_WATCHER] config message failed: {}", e);
+                            warn!(" [CONFIG_WATCHER] config reload failed: {}", e);
                         }
                     }
                 }
@@ -129,7 +129,7 @@ impl ConfigWatcher {
             Ok(new_config) => {
                 // 验证配置有效性
                 if new_config.enabled && new_config.api_key.trim().is_empty() {
-                    error!("[CONFIG_WATCHER] API Key message empty message ");
+                    error!("[CONFIG_WATCHER] API Key is empty");
                     return Err(anyhow::anyhow!("API Key cannot be empty string"));
                 }
 
@@ -161,11 +161,11 @@ impl ConfigWatcher {
                     return Ok(());
                 }
 
-                info!("[CONFIG_WATCHER] config message Update succeeded");
+                info!("[CONFIG_WATCHER] Config update succeeded");
                 Ok(())
             }
             Err(e) => {
-                error!("[CONFIG_WATCHER] message configfilefailed: {}", e);
+                error!("[CONFIG_WATCHER] Config file reload failed: {}", e);
                 Err(e)
             }
         }

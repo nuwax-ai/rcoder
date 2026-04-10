@@ -74,7 +74,7 @@ pub async fn get_realtime_container_ip_with_cache(
     let network_ips = docker_manager
         .get_container_network_info(container_name)
         .await
-        .map_err(|e| format!("获取容器网络信息失败: {}", e))?;
+        .map_err(|e| format!("failed to get container network info: {}", e))?;
 
     // 3. 优先使用第一个可用的 IP，并写入缓存
     match network_ips.values().next().cloned() {

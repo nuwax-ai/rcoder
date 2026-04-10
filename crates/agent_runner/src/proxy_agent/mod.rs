@@ -51,11 +51,11 @@ pub fn start_pingora(
     shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
 ) -> PingoraStartResult {
     info!(
-        "🚀 启动 Pingora 反向代理服务，监听端口: {}",
+        "Starting Pingora reverse proxy service, listening on port: {}",
         proxy_config.listen_port
     );
     info!(
-        "🔄 代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/{}/health",
+        "Proxy route format: /proxy/{{port}}{{/path}} - e.g.: /proxy/{}/health",
         proxy_config.default_backend_port
     );
 

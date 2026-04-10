@@ -111,7 +111,7 @@ pub async fn computer_agent_stop(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!("[COMPUTER_STOP] message container: user_id={}", user_id);
+            warn!("[COMPUTER_STOP] Container not found: user_id={}", user_id);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
                 locale,
@@ -132,7 +132,7 @@ pub async fn computer_agent_stop(
 
     // 提取 gRPC 地址
     let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
-    info!("[COMPUTER_STOP] gRPC message : {}", grpc_addr);
+    info!("[COMPUTER_STOP] gRPC addr: {}", grpc_addr);
 
     // 调用 StopAgent RPC
     match crate::grpc::grpc_stop_agent_with_pool(
@@ -176,7 +176,7 @@ pub async fn computer_agent_stop(
                 match response.result.as_str() {
                     "not_found" => {
                         warn!(
-                            "[COMPUTER_STOP] Agent not message : project_id={}",
+                            "[COMPUTER_STOP] Agent not found: project_id={}",
                             project_id
                         );
                         return Ok(HttpResult::error_with_locale(
@@ -209,7 +209,7 @@ pub async fn computer_agent_stop(
                     }
                     _ => {
                         warn!(
-                            "[COMPUTER_STOP] not message response message : {}",
+                            "[COMPUTER_STOP] not response: {}",
                             response.result
                         );
                         return Ok(HttpResult::error_with_locale(

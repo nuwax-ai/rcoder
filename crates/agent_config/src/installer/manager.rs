@@ -163,7 +163,7 @@ impl AgentInstallationManager {
             Ok(install_result) => {
                 if install_result.success {
                     info!(
-                        "✅ Agent 安装成功: {} - {}",
+                        "Agent installed successfully: {} - {}",
                         command, install_result.message
                     );
                 } else {
@@ -198,7 +198,7 @@ impl AgentInstallationManager {
         })?;
 
         info!(
-            "📦 开始安装 Agent: {} via {}",
+            "Starting Agent installation: {} via {}",
             package_name,
             installer.package_manager_name()
         );

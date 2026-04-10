@@ -81,7 +81,7 @@ impl FileUtils {
     pub async fn validate_file_size(&self, file_path: &Path) -> Result<()> {
         let metadata = fs::metadata(file_path)
             .await
-            .context("无法获取文件元数据")?;
+            .context("unable to get file metadata")?;
 
         if metadata.len() > self.config.max_file_size {
             return Err(AttachmentError::FileSizeExceeded(metadata.len()).into());
@@ -318,7 +318,7 @@ impl FileUtils {
             if temp_file.exists() {
                 fs::remove_file(temp_file)
                     .await
-                    .with_context(|| format!("删除临时文件失败: {:?}", temp_file))?;
+                    .with_context(|| format!("failed to delete temp file: {:?}", temp_file))?;
             }
         }
         Ok(())

@@ -72,7 +72,7 @@ impl ProjectAdapter {
             self.storage.save_container(&container_record)?;
         } else {
             debug!(
-                " message project message container message : project_id={}",
+                " project container: project_id={}",
                 project_id
             );
         }
@@ -85,7 +85,7 @@ impl ProjectAdapter {
         );
         self.storage.save_project(&record)?;
 
-        debug!(" message project: {}", project_id);
+        debug!("Removed project: {}", project_id);
         Ok(())
     }
 
@@ -96,11 +96,11 @@ impl ProjectAdapter {
 
         // 删除项目记录
         if let Err(e) = self.storage.delete_project(project_id) {
-            warn!(" message project {} failed: {}", project_id, e);
+            warn!("Failed to remove project {}: {}", project_id, e);
             return None;
         }
 
-        debug!(" message project: {}", project_id);
+        debug!("Removed project: {}", project_id);
         Some(info)
     }
 
@@ -109,7 +109,7 @@ impl ProjectAdapter {
         match self.storage.project_exists(project_id) {
             Ok(exists) => exists,
             Err(e) => {
-                warn!("checkproject {} message existsfailed: {}", project_id, e);
+                warn!("Failed to check project {} exists: {}", project_id, e);
                 false
             }
         }
@@ -151,7 +151,7 @@ impl ProjectAdapter {
             }
             Ok(None) => None,
             Err(e) => {
-                warn!(" message sessionID {} getprojectfailed: {}", session_id, e);
+                warn!("Failed to get project for session {}: {}", session_id, e);
                 None
             }
         }
@@ -188,7 +188,7 @@ impl ProjectAdapter {
             }
             Err(e) => {
                 warn!(
-                    " message sessionID {} getcontainer message failed: {}",
+                    " sessionID {} getcontainer failed: {}",
                     session_id, e
                 );
                 None
@@ -212,7 +212,7 @@ impl ProjectAdapter {
             }
             Ok(None) => None,
             Err(e) => {
-                warn!("updatedproject {} message failed: {}", project_id, e);
+                warn!("update project {} failed: {}", project_id, e);
                 None
             }
         }
@@ -229,7 +229,7 @@ impl ProjectAdapter {
                 updated
             }
             Err(e) => {
-                warn!("updatedsession {} message failed: {}", session_id, e);
+                warn!("update session {} failed: {}", session_id, e);
                 false
             }
         }
@@ -291,7 +291,7 @@ impl ProjectAdapter {
                 .map(DataBridge::container_record_to_info)
                 .collect(),
             Err(e) => {
-                warn!(" message getcontainerfailed: {}", e);
+                warn!("Failed to get container: {}", e);
                 Vec::new()
             }
         }
@@ -325,11 +325,11 @@ impl ProjectAdapter {
                 self.get_container(&container_id)
             }
             Ok(None) => {
-                debug!("not message {} message project message ", user_id);
+                debug!("No project for user_id {} ", user_id);
                 None
             }
             Err(e) => {
-                warn!(" message ID {} message containerfailed: {}", user_id, e);
+                warn!("Failed to get container for user_id {}: {}", user_id, e);
                 None
             }
         }
@@ -345,7 +345,7 @@ impl ProjectAdapter {
         match self.storage.find_projects_by_user_id(user_id) {
             Ok(projects) => projects,
             Err(e) => {
-                warn!(" message ID {} message projectfailed: {}", user_id, e);
+                warn!("Failed to get project for user_id {}: {}", user_id, e);
                 Vec::new()
             }
         }
@@ -365,7 +365,7 @@ impl ProjectAdapter {
         {
             Ok(containers) => containers,
             Err(e) => {
-                warn!(" message containerfailed: {}", e);
+                warn!("Failed to get container: {}", e);
                 Vec::new()
             }
         }
@@ -376,7 +376,7 @@ impl ProjectAdapter {
         match self.storage.get_stats() {
             Ok(stats) => stats,
             Err(e) => {
-                warn!("get message failed: {}", e);
+                warn!("get value failed: {}", e);
                 StorageStats::default()
             }
         }

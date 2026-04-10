@@ -53,7 +53,7 @@ impl ComputerContainerManager {
         resource_limits: Option<ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
-            "🔍 [COMPUTER_CONTAINER] 获取/创建用户容器: user_id={}",
+            "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}",
             user_id
         );
 
@@ -77,14 +77,14 @@ impl ComputerContainerManager {
             {
                 Ok(true) => {
                     info!(
-                        "✅ [COMPUTER_CONTAINER] 用户容器已存在且运行中: user_id={}, container_id={}",
+                        "✅ [COMPUTER_CONTAINER] User container already exists and running: user_id={}, container_id={}",
                         user_id, info.container_id
                     );
                     return Ok(info);
                 }
                 Ok(false) => {
                     warn!(
-                        "⚠️ [COMPUTER_CONTAINER] 用户容器存在但已停止: user_id={}, container_id={}, 将删除并重建",
+                        "⚠️ [COMPUTER_CONTAINER] User container exists but stopped: user_id={}, container_id={}, will delete and recreate",
                         user_id, info.container_id
                     );
                     // 删除已停止的旧容器
@@ -101,7 +101,7 @@ impl ComputerContainerManager {
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️ [COMPUTER_CONTAINER] 检查容器状态失败: user_id={}, error={}, 将尝试创建新容器",
+                        "⚠️ [COMPUTER_CONTAINER] Failed to check container status: user_id={}, error={}, will try creating new container",
                         user_id, e
                     );
                     // 继续创建新容器
@@ -111,7 +111,7 @@ impl ComputerContainerManager {
 
         // 2. 容器不存在或已停止，创建新容器
         info!(
-            "🏗️ [COMPUTER_CONTAINER] 创建新用户容器: user_id={}",
+            "🏗️ [COMPUTER_CONTAINER] Creating new user container: user_id={}",
             user_id
         );
         Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
@@ -126,7 +126,7 @@ impl ComputerContainerManager {
         resource_limits: Option<ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
-            "🏗️ [COMPUTER_CONTAINER] 强制创建新用户容器: user_id={}",
+            "🏗️ [COMPUTER_CONTAINER] Force creating new user container: user_id={}",
             user_id
         );
 
@@ -156,7 +156,7 @@ impl ComputerContainerManager {
         Self::create_user_workspace(user_id).await?;
 
         info!(
-            "📁 [COMPUTER_CONTAINER] 用户工作区已准备: /app/computer-project-workspace/{}",
+            "📁 [COMPUTER_CONTAINER] User workspace prepared: /app/computer-project-workspace/{}",
             user_id
         );
 
@@ -180,7 +180,7 @@ impl ComputerContainerManager {
             })?;
 
         info!(
-            "🚀 [COMPUTER_CONTAINER] 用户容器创建成功: user_id={}, container_id={}, ip={}",
+            "🚀 [COMPUTER_CONTAINER] User container created successfully: user_id={}, container_id={}, ip={}",
             user_id, container_info.container_id, container_info.container_ip
         );
 
@@ -232,7 +232,7 @@ impl ComputerContainerManager {
             })?;
 
         debug!(
-            "📁 [COMPUTER_CONTAINER] 用户工作区创建成功: {:?}",
+            "📁 [COMPUTER_CONTAINER] User workspace created successfully: {:?}",
             user_workspace
         );
 
@@ -244,7 +244,7 @@ impl ComputerContainerManager {
     /// 通过 user_id 查询容器是否存在
     pub async fn get_container_info(user_id: &str) -> Result<Option<ContainerBasicInfo>, AppError> {
         debug!(
-            "[COMPUTER_CONTAINER] getcontainer message : user_id={}",
+            "[COMPUTER_CONTAINER] get container: user_id={}",
             user_id
         );
 

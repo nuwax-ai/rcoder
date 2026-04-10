@@ -121,7 +121,7 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
         {
             let Ok(mut files) = tokio::fs::read_dir(entry.path()).await else {
                 warn!(
-                    "🔍 [file message ] unable to message sessiondirectory: {}",
+                    "🔍 [file_scanner] Unable to scan session directory: {}",
                     entry.path().display()
                 );
                 continue;
@@ -172,7 +172,7 @@ async fn invalidate_project_cache(project_dir_name: &str) {
 pub fn start_file_watcher() {
     // 确保只启动一次
     if WATCHER_STARTED.swap(true, Ordering::SeqCst) {
-        debug!("[filelisten] listen message already message ");
+        debug!("[filelisten] File watcher already started");
         return;
     }
 
@@ -181,7 +181,7 @@ pub fn start_file_watcher() {
     // 创建目录（如果不存在）
     if !projects_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&projects_dir) {
-            warn!("[filelisten] unable tocreated projects directory: {}", e);
+            warn!("[filelisten] Unable to create projects directory: {}", e);
             WATCHER_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -204,7 +204,7 @@ pub fn start_file_watcher() {
                     match event.kind {
                         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
                             if let Err(e) = tx.blocking_send(event) {
-                                error!("[filelisten] send message failed: {}", e);
+                                error!("[filelisten] Failed to send event: {}", e);
                             }
                         }
                         _ => {}
@@ -212,7 +212,7 @@ pub fn start_file_watcher() {
                 }
             }
             Err(e) => {
-                error!("[filelisten] listenerror: {}", e);
+                error!("[filelisten] Listener error: {}", e);
             }
         }
     });
@@ -220,7 +220,7 @@ pub fn start_file_watcher() {
     let mut watcher = match watcher_result {
         Ok(w) => w,
         Err(e) => {
-            error!("[filelisten] createdlisten message failed: {}", e);
+            error!("[filelisten] Failed to create listener: {}", e);
             WATCHER_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -228,7 +228,7 @@ pub fn start_file_watcher() {
 
     // 开始监听目录
     if let Err(e) = watcher.watch(&projects_dir, RecursiveMode::Recursive) {
-        error!("[filelisten] listendirectoryfailed: {}", e);
+        error!("[filelisten] Failed to watch directory: {}", e);
         WATCHER_STARTED.store(false, Ordering::SeqCst);
         return;
     }
@@ -265,7 +265,7 @@ pub fn start_file_watcher() {
                                        debounce_timer = Some(tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS));
                                    }
                                    None => {
-            warn!("[filelisten] message receive message alreadyclosed");
+            warn!("[filelisten] Received event but channel already closed");
                                        break;
                                    }
                                }
@@ -310,7 +310,7 @@ pub fn stop_file_watcher() {
         *guard = None;
     }
 
-    info!("🛑 [filelisten] listen message alreadystopped");
+    info!("🛑 [filelisten] File watcher already stopped");
 }
 
 /// 通过文件扫描检查 session 是否存在（带缓存）
@@ -343,9 +343,9 @@ pub async fn check_session_file_exists(session_id: &str, project_path: &str) -> 
     cache.insert(project_path.to_string(), session_ids).await;
 
     if exists {
-        info!("[file message ] message session file: {}", session_id);
+        info!("[file_scan] Session file found: {}", session_id);
     } else {
-        debug!("[file message ] not message session file: {}", session_id);
+        debug!("[file_scan] Not a session file: {}", session_id);
     }
 
     exists

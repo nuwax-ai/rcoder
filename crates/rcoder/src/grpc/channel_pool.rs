@@ -55,12 +55,12 @@ impl GrpcChannelPool {
 
         // 第一阶段：快速检查（无锁读）
         if let Some(entry) = self.channels.get(addr) {
-            debug!("📡 [gRPC] reuse message connection: {}", addr);
+            debug!("📡 [gRPC] reuse connection: {}", addr);
             return Ok(create_configured_client(entry.value().clone()));
         }
 
         // 第二阶段：创建连接（不持有任何锁）
-        info!("🔌 [gRPC] created message connection: {}", addr);
+        info!("🔌 [gRPC] created connection: {}", addr);
         let endpoint = format!("http://{}", addr);
         let channel = Channel::from_shared(endpoint)
             .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
@@ -85,13 +85,13 @@ impl GrpcChannelPool {
         match self.channels.entry(addr.to_string()) {
             Entry::Vacant(entry) => {
                 // 其他线程还没有创建，使用我们创建的连接
-                debug!("📡 [gRPC] message connectionalready message : {}", addr);
+                debug!("📡 [gRPC] connection already exists: {}", addr);
                 entry.insert(channel.clone());
                 Ok(create_configured_client(channel))
             }
             Entry::Occupied(entry) => {
                 // 其他线程已经创建了连接，使用已存在的（丢弃我们创建的）
-                debug!("📡 [gRPC] message created message connection: {}", addr);
+                debug!("📡 [gRPC] created new connection: {}", addr);
                 Ok(create_configured_client(entry.get().clone()))
             }
         }
@@ -119,7 +119,7 @@ impl GrpcChannelPool {
     /// 清空所有连接
     pub fn clear(&self) {
         self.channels.clear();
-        info!("🔌 [gRPC] message empty message connection");
+        info!("🔌 [gRPC] cleared all connections");
     }
 
     /// 获取当前连接数

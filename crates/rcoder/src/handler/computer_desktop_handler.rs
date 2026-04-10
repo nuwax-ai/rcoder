@@ -200,7 +200,7 @@ pub async fn computer_desktop_vnc(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!("[DESKTOP_VNC] message container: user_id={}", user_id);
+            warn!("[DESKTOP_VNC] Container not found: user_id={}", user_id);
             return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
                 locale,
@@ -686,7 +686,7 @@ async fn check_vnc_available(container_ip: &str) -> bool {
 
     match timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
         Ok(Ok(_)) => {
-            info!("[DESKTOP_VNC] VNC message : {}", addr);
+            info!("[DESKTOP_VNC] VNC reachable: {}", addr);
             true
         }
         Ok(Err(e)) => {

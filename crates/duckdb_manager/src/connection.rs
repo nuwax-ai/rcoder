@@ -68,14 +68,14 @@ impl DuckDbConnection {
 
         // 开始事务
         conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| DuckDbError::TransactionError(format!("开始事务失败: {}", e)))?;
+            .map_err(|e| DuckDbError::TransactionError(format!("failed to begin transaction: {}", e)))?;
 
         // 执行操作
         match f(&conn) {
             Ok(result) => {
                 // 提交事务
                 conn.execute("COMMIT", [])
-                    .map_err(|e| DuckDbError::TransactionError(format!("提交事务失败: {}", e)))?;
+                    .map_err(|e| DuckDbError::TransactionError(format!("failed to commit transaction: {}", e)))?;
                 Ok(result)
             }
             Err(e) => {

@@ -89,7 +89,7 @@ pub fn build_rcoder_path_env() -> Option<String> {
     if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
         let runtime_path = runtime_path.trim().to_string();
         if !runtime_path.is_empty() {
-            info!("[Env] already message NUWAX_APP_RUNTIME_PATH built PATH");
+            info!("[Env] Using NUWAX_APP_RUNTIME_PATH to build PATH");
             return Some(runtime_path);
         }
     }
@@ -111,7 +111,7 @@ pub fn build_rcoder_path_env() -> Option<String> {
 
         if !paths.is_empty() {
             let path_value = paths.join(sep);
-            info!("[Env] message APPDATA built PATH: {}", path_value);
+            info!("[Env] APPDATA built PATH: {}", path_value);
             return Some(path_value);
         }
     }

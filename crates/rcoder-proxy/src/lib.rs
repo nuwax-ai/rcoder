@@ -167,22 +167,22 @@ pub async fn quick_start(
     server.start().await
 }
 
-/// 代理错误类型
+/// Proxy error type
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    #[error("配置错误: {0}")]
+    #[error("config error: {0}")]
     Config(String),
 
-    #[error("网络错误: {0}")]
+    #[error("network error: {0}")]
     Network(String),
 
-    #[error("后端错误: {0}")]
+    #[error("backend error: {0}")]
     Backend(String),
 
-    #[error("端口提取错误: {0}")]
+    #[error("port extraction error: {0}")]
     PortExtraction(String),
 
-    #[error("请求处理错误: {0}")]
+    #[error("request handling error: {0}")]
     RequestHandling(String),
 }
 

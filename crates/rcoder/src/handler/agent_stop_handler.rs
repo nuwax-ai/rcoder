@@ -283,7 +283,7 @@ pub async fn agent_stop(
                 }
             } else {
                 error!(
-                    "[STOP_DESTROY] response message empty: project_id={}",
+                    "[STOP_DESTROY] Empty response: project_id={}",
                     project_id
                 );
             }

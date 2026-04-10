@@ -91,7 +91,7 @@ impl<'a> PendingGuard<'a> {
     pub fn commit_success(self) {
         self.cleaned.store(true, Ordering::Release);
         debug!(
-            "🛡️ [PendingGuard] 提交成功，保留 Pending 状态: project_id={}",
+            "🛡️ [PendingGuard] Commit success, keeping Pending state: project_id={}",
             self.project_id
         );
         std::mem::forget(self); // 防止 drop 时清理
@@ -103,7 +103,7 @@ impl<'a> Drop for PendingGuard<'a> {
         // 只有未标记为成功时才清理
         if !self.cleaned.load(Ordering::Acquire) {
             debug!(
-                "🛡️ [PendingGuard] Drop 时自动清理 Pending 状态: project_id={}",
+                "🛡️ [PendingGuard] Auto clearing Pending state on Drop: project_id={}",
                 self.project_id
             );
             self.registry.clear_pending_if_exists(&self.project_id);
@@ -213,13 +213,13 @@ impl AgentSessionRegistry {
             // remove 本身是原子操作，此时新映射已插入，不会影响查询
             self.session_to_project.remove(&old_sid);
             debug!(
-                "🔄 [Registry] 清理旧 session 映射: project={}, old_session={}",
+                "🔄 [Registry] Cleaning old session mapping: project={}, old_session={}",
                 project_id, old_sid
             );
         }
 
         info!(
-            "✅ [Registry] 注册 Agent: project={}, session={}",
+            "✅ [Registry] Registering Agent: project={}, session={}",
             project_id, session_id
         );
     }
@@ -549,14 +549,14 @@ impl AgentSessionRegistry {
         info!("[Registry] Executing agent_info_map.remove()...");
         let removed = self.agent_info_map.remove(project_id).map(|(_, v)| v);
         info!(
-            "🔍 [Registry] agent_info_map.remove() 完成, removed={}, 剩余长度={}",
+            "🔍 [Registry] agent_info_map.remove() completed, removed={}, remaining_length={}",
             removed.is_some(),
             self.agent_info_map.len()
         );
 
         if removed.is_some() {
             info!(
-                "🗑️ [Registry] 移除 Agent: project={}, session={:?}",
+                "🗑️ [Registry] Removing Agent: project={}, session={:?}",
                 project_id, session_id
             );
 
@@ -597,7 +597,7 @@ impl AgentSessionRegistry {
 
             if removed.is_some() {
                 info!(
-                    "🗑️ [Registry] 通过 session 移除 Agent: session={}, project={}",
+                    "🗑️ [Registry] Removing Agent via session: session={}, project={}",
                     session_id, pid
                 );
 

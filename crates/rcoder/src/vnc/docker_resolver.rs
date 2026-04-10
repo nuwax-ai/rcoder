@@ -87,7 +87,7 @@ impl CachedDockerResolver {
                     "⚠️ [VNC_RESOLVER] 查询容器信息失败: user_id={}, error={}",
                     user_id, e
                 );
-                VncResolveError::QueryFailed(format!("查询容器信息失败: {}", e))
+                VncResolveError::QueryFailed(format!("failed to query container info: {}", e))
             })?
             .ok_or_else(|| {
                 debug!("[VNC_RESOLVER] containernot found: user_id={}", user_id);

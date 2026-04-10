@@ -463,7 +463,7 @@ impl AgentService for AgentServiceImpl {
                                         }
                                     }
                                     None => {
-                                        debug!("📡 [gRPC] Session message channel closed, sending SessionPromptEnd event");
+                                        debug!("📡 [gRPC] Session channel closed, sending SessionPromptEnd event");
                                         // Agent 执行完毕，发送 SessionPromptEnd 事件通知客户端（兜底逻辑）
                                         let end_event = ProgressEvent {
                                             message_type: "SessionPromptEnd".to_string(),
@@ -1224,12 +1224,12 @@ impl AgentService for AgentServiceImpl {
                 // 2. 清理 shared_api_key_manager 中的配置
                 if let Some((key, config)) = self.app_state.shared_api_key_manager.remove(&uuid) {
                     info!(
-                        "🗑️ [gRPC] 已清理 API 密钥配置: uuid={}, provider_name={}",
+                        "🗑️ [gRPC] Cleaned up API key config: uuid={}, provider_name={}",
                         key, config.name
                     );
                 }
                 info!(
-                    "🗑️ [gRPC] 已清理 project UUID 映射: project_id={}, uuid={}",
+                    "🗑️ [gRPC] Cleaned up project UUID mapping: project_id={}, uuid={}",
                     project_id, uuid
                 );
             } else {
@@ -1245,7 +1245,7 @@ impl AgentService for AgentServiceImpl {
 
             if let Some(agent_info) = removed_agent_info {
                 info!(
-                    "✅ [gRPC] Agent 已从 Registry 移除: project_id={}",
+                    "✅ [gRPC] Agent removed from Registry: project_id={}",
                     project_id
                 );
 

@@ -41,7 +41,7 @@ impl ContainerManager {
         project_id: &str,
     ) -> Result<Option<ContainerBasicInfo>, AppError> {
         debug!(
-            "[CONTAINER_MGR] getcontainer message : project_id={}",
+            "[CONTAINER_MGR] get container: project_id={}",
             project_id
         );
 
@@ -88,7 +88,7 @@ async fn ensure_container_exists(
     // 1. 尝试获取现有容器
     if let Ok(Some(info)) = docker_manager.get_agent_info(project_id).await {
         info!(
-            "[CONTAINER_MGR] containeralreadyexists: {}",
+            "[CONTAINER_MGR] container already exists: {}",
             info.container_id
         );
         return Ok(info);
@@ -96,7 +96,7 @@ async fn ensure_container_exists(
 
     // 2. 创建新容器
     info!(
-        "🏗️ [CONTAINER_MGR] 容器不存在，创建新容器: project_id={}, service_type={:?}",
+        "🏗️ [CONTAINER_MGR] Container does not exist, creating new container: project_id={}, service_type={:?}",
         project_id, service_type
     );
 
@@ -125,7 +125,7 @@ async fn create_container_for_request(
     })?;
 
     info!(
-        "📁 [CONTAINER_MGR] 项目工作区已准备: /app/project_workspace/{}",
+        "📁 [CONTAINER_MGR] Project workspace prepared: /app/project_workspace/{}",
         project_id
     );
 
@@ -149,7 +149,7 @@ async fn create_container_for_request(
         })?;
 
     info!(
-        "🚀 [CONTAINER_MGR] 容器创建成功: project_id={}, container_id={}, ip={}",
+        "🚀 [CONTAINER_MGR] Container created successfully: project_id={}, container_id={}, ip={}",
         project_id, container_info.container_id, container_info.container_ip
     );
 

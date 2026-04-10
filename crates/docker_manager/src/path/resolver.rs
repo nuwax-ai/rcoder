@@ -54,7 +54,7 @@ impl HostPathResolver {
             ContainerSelfInspector::new(socket_path)
                 .await
                 .map_err(|e| {
-                    DockerError::ConfigurationError(format!("创建容器自检器失败: {}", e))
+                    DockerError::ConfigurationError(format!("failed to create container self-inspector: {}", e))
                 })?,
         );
 
@@ -62,7 +62,7 @@ impl HostPathResolver {
         let mounts = inspector
             .get_all_mounts()
             .await
-            .map_err(|e| DockerError::ConfigurationError(format!("获取挂载点失败: {}", e)))?;
+            .map_err(|e| DockerError::ConfigurationError(format!("failed to get mount points: {}", e)))?;
 
         if mounts.is_empty() {
             return Err(DockerError::ConfigurationError(
@@ -139,7 +139,7 @@ impl HostPathResolver {
     /// ```
     pub fn resolve_to_host_path(&self, container_path: &Path) -> DockerResult<PathBuf> {
         debug!(
-            " message containerpath message path: {}",
+            "Resolving container path to host path: {}",
             container_path.display()
         );
 
@@ -174,11 +174,11 @@ impl HostPathResolver {
 
         // 没有找到匹配的挂载点，返回错误
         warn!(
-            "⚠️ 无法解析路径 {}: 未找到匹配的挂载点",
+            "⚠️ unable to resolve path {}: no matching mount point found",
             container_path.display()
         );
         Err(DockerError::ConfigurationError(format!(
-            "无法解析容器路径 '{}': 未找到匹配的挂载点。可用挂载点: {:?}",
+            "unable to resolve container path '{}': no matching mount point found. available mount points: {:?}",
             container_path.display(),
             self.all_mounts
                 .iter()
@@ -250,7 +250,7 @@ impl HostPathResolver {
                 .verify_docker_connection()
                 .await
                 .map(|_| true)
-                .map_err(|e| DockerError::ConnectionError(format!("Docker 连接检查失败: {}", e)))
+                .map_err(|e| DockerError::ConnectionError(format!("Docker connection check failed: {}", e)))
         } else {
             Ok(false)
         }

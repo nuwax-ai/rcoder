@@ -173,7 +173,7 @@ async fn forward_cancel_request_to_container_service(
             }
         }
         Err(e) => {
-            error!("[CANCEL_FORWARD] gRPC message failed: {}", e);
+            error!("[CANCEL_FORWARD] gRPC call failed: {}", e);
 
             // 检查特定的 gRPC 错误码并分类处理
             if let Some(status) = crate::grpc::extract_grpc_status(&e) {
@@ -181,7 +181,7 @@ async fn forward_cancel_request_to_container_service(
                 match status.code() {
                     Code::NotFound => {
                         // 会话或 Agent 不存在，返回成功（幂等设计）
-                        info!("[CANCEL_FORWARD] session not found, message succeeded");
+                        info!("[CANCEL_FORWARD] Session not found, cancel succeeded");
                         return Ok(HttpResult::success(CancelResponse {
                             success: true,
                             session_id: session_id.unwrap_or("").to_string(),
@@ -195,7 +195,7 @@ async fn forward_cancel_request_to_container_service(
                         if !container_exists {
                             // 容器已销毁，取消目标已达成（幂等设计）
                             info!(
-                                "[CANCEL_FORWARD] containeralreadydestroy, cancel message already message "
+                                "[CANCEL_FORWARD] container already destroyed, cancel request already completed"
                             );
                             return Ok(HttpResult::success(CancelResponse {
                                 success: true,
@@ -214,7 +214,7 @@ async fn forward_cancel_request_to_container_service(
                     }
                     other_code => {
                         // 其他 gRPC 状态码
-                        error!("[CANCEL_FORWARD] gRPC error message : {:?}", other_code);
+                        error!("[CANCEL_FORWARD] gRPC error code: {:?}", other_code);
                     }
                 }
             }
@@ -539,7 +539,7 @@ pub async fn computer_agent_session_cancel(
     }
 
     info!(
-        "🚀 [COMPUTER_CANCEL] 开始处理取消请求: user_id={}, project_id={}, session_id={:?}",
+        "🚀 [COMPUTER_CANCEL] Starting to process cancel request: user_id={}, project_id={}, session_id={:?}",
         query.user_id, query.project_id, query.session_id
     );
 

@@ -364,7 +364,7 @@ pub async fn proxy_to_port(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ProxyErrorResponse {
                     error: "RESPONSE_BUILD_ERROR".to_string(),
-                    message: format!("构建响应失败: {}", e),
+                    message: format!("failed to build response: {}", e),
                     target_port: port,
                     timestamp: Utc::now().to_rfc3339(),
                 }),
@@ -463,7 +463,7 @@ pub async fn proxy_to_port_with_path(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ProxyErrorResponse {
                     error: "RESPONSE_BUILD_ERROR".to_string(),
-                    message: format!("构建响应失败: {}", e),
+                    message: format!("failed to build response: {}", e),
                     target_port: port,
                     timestamp: Utc::now().to_rfc3339(),
                 }),

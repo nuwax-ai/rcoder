@@ -46,7 +46,7 @@ impl DockerApiCache {
     /// * `network_ttl` - 网络缓存 TTL（秒）
     pub fn new(status_ttl: u64, network_ttl: u64) -> Self {
         info!(
-            "🗄️ [API_CACHE] 初始化 Docker API 缓存: status_ttl={}秒, network_ttl={}秒",
+            "Initializing Docker API cache: status_ttl={}s, network_ttl={}s",
             status_ttl, network_ttl
         );
 
@@ -135,20 +135,20 @@ impl DockerManager {
 
         // 测试连接
         docker.ping().await.map_err(|e| {
-            DockerError::ConnectionError(format!("无法连接到 Docker 守护进程: {}", e))
+            DockerError::ConnectionError(format!("unable to connect to Docker daemon: {}", e))
         })?;
 
-        info!("Docker message initializesucceeded");
+        info!("Docker manager initialized");
 
         // 🔍 动态检测主网络名称（必须成功）
         let main_network_name =
             match Self::detect_main_network_name_static(&docker, &config.network_base_name).await {
                 Ok(network_name) => {
-                    info!("detect message : {}", network_name);
+                    info!("detecting network: {}", network_name);
                     network_name
                 }
                 Err(e) => {
-                    error!("unable todetect message : {}", e);
+                    error!("unable to detect network: {}", e);
                     return Err(e);
                 }
             };
@@ -156,7 +156,7 @@ impl DockerManager {
         // 🆕 创建容器状态 Actor 并启动
         let (actor, containers) = ContainerStateActor::new();
         tokio::spawn(actor.run());
-        info!("ContainerStateActor alreadystarted");
+        info!("ContainerStateActor already started");
 
         // 🗄️ 初始化 Docker API 缓存（使用配置的 TTL）
         let api_cache = Arc::new(DockerApiCache::new(
@@ -230,22 +230,22 @@ impl DockerManager {
 
             // 无论容器是运行还是停止状态，都先删除
             info!(
-                "🗑️ [CREATE] 删除旧容器 {} ({})",
+                "Deleting old container {} ({})",
                 result.container_name, result.container_id
             );
             if let Err(e) = self.stop_container_by_id(&result.container_id).await {
-                error!("[CREATE] message containerfailed: {}", e);
+                error!("[CREATE] delete container failed: {}", e);
                 // 继续尝试创建，Docker 会返回 409 错误
             } else {
                 // 🔧 stop_container_by_id 已处理缓存失效
-                info!("[CREATE] message container message succeeded");
+                info!("[CREATE] delete container succeeded");
             }
         }
 
         // 检查内存缓存并清理
         if let Some(existing) = self.containers.get(&config.project_id).await {
             warn!(
-                "🧹 [CREATE] 清理内存缓存中的容器记录: project_id={}, container_name={}",
+                "Cleaning container record from memory cache: project_id={}, container_name={}",
                 config.project_id, existing.container_name
             );
             self.containers.remove(&config.project_id).await;
@@ -272,7 +272,7 @@ impl DockerManager {
                 config.host_path, config.container_path
             );
         } else {
-            debug!("📌 [DOCKER_MGR] skip message mount, message extra_mounts config");
+            debug!("📌 [DOCKER_MGR] skip default mount, using extra_mounts config");
         }
 
         // 添加额外的挂载点
@@ -401,7 +401,7 @@ impl DockerManager {
             )
         } else {
             info!(
-                "🌐 [NETWORK] container {} message host message ",
+                "🌐 [NETWORK] Container {} uses host network",
                 container_name
             );
             (None, "host".to_string())
@@ -446,7 +446,7 @@ impl DockerManager {
             .docker
             .create_container(Some(create_options), container_config)
             .await
-            .map_err(|e| DockerError::ContainerCreationError(format!("创建容器失败: {}", e)))?;
+            .map_err(|e| DockerError::ContainerCreationError(format!("failed to create container: {}", e)))?;
 
         let container_id = create_result.id.clone();
 
@@ -454,7 +454,7 @@ impl DockerManager {
         self.docker
             .start_container(&container_id, None::<StartContainerOptions>)
             .await
-            .map_err(|e| DockerError::ContainerStartError(format!("启动容器失败: {}", e)))?;
+            .map_err(|e| DockerError::ContainerStartError(format!("failed to start container: {}", e)))?;
 
         // 等待容器启动完成
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -533,7 +533,7 @@ impl DockerManager {
             .remove_container(container_id, remove_options)
             .await
             .map_err(|e| {
-                warn!(" message container {} failed: {}", container_id, e);
+                warn!("Failed to remove container {}: {}", container_id, e);
                 DockerError::BollardError(e)
             })?;
 
@@ -562,7 +562,7 @@ impl DockerManager {
         let container_info = if let Some(info) = self.containers.get(project_id).await {
             info
         } else {
-            warn!("project {} message container", project_id);
+            warn!("Project {} has no container", project_id);
             return Ok(());
         };
 
@@ -678,7 +678,7 @@ impl DockerManager {
                                 )
                                 .unwrap_or_else(|e| {
                                     warn!(
-                                        " message containercreated message failed: {}, message ",
+                                        "parse container created failed: {}, retry with current time",
                                         e
                                     );
                                     Utc::now()
@@ -774,13 +774,13 @@ impl DockerManager {
         identifier: &str,
     ) -> DockerResult<Option<ContainerQueryResult>> {
         debug!(
-            "[REALTIME] message containerstatus: identifier={}",
+            "[REALTIME] Getting container status: identifier={}",
             identifier
         );
 
         // 1. 尝试从缓存获取（只缓存成功结果，不缓存 404）
         if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
-            debug!("[REALTIME] message : identifier={}", identifier);
+            debug!("[REALTIME] cache hit: identifier={}", identifier);
             // Arc::clone 只是增加引用计数，开销很小
             return Ok(Some((*cached).clone()));
         }
@@ -1245,7 +1245,7 @@ impl DockerManager {
             && let Some(existing) = self.get_container_info(id).await
         {
             warn!(
-                " message container {}, message stopped...",
+                "Stopping container {}, already stopped...",
                 existing.container_name
             );
             self.stop_container(id).await?;
@@ -1306,7 +1306,7 @@ impl DockerManager {
             );
         } else {
             debug!(
-                "📌 [DOCKER_MANAGER] skip message mount, message mounts config message mount message "
+                "📌 [DOCKER_MANAGER] Skip mount, no mounts config"
             );
         }
 
@@ -1464,7 +1464,7 @@ impl DockerManager {
             }
 
             info!(
-                "📁 [DOCKER_MGR] 添加挂载点: {} -> {} (read_only: {})",
+                "Adding mount point: {} -> {} (read_only: {})",
                 resolved_host_path, resolved_container_path, mount_config.read_only
             );
 
@@ -1502,7 +1502,7 @@ impl DockerManager {
                     // 构建容器内可访问的路径
                     let create_path = format!("{}{}", resolve_from_path, relative_part);
                     debug!(
-                        "📁 [DOCKER_MGR] 使用容器内路径创建目录: {} (resolve_from: {}, relative: {})",
+                        "Creating directory using container path: {} (resolve_from: {}, relative: {})",
                         create_path, resolve_from_path, relative_part
                     );
 
@@ -1518,7 +1518,7 @@ impl DockerManager {
                     // 没有配置 resolve_from，无法在容器内创建宿主机路径
                     // 假设目录已存在，跳过创建
                     info!(
-                        "📁 [DOCKER_MGR] 跳过目录创建 (未配置 resolve_from): {}",
+                        "Skipping directory creation (resolve_from not configured): {}",
                         resolved_host_path
                     );
                 }
@@ -1557,15 +1557,15 @@ impl DockerManager {
 
         // 5. 等待就绪并返回信息
         let info = self.get_agent_info(container_id).await?.ok_or_else(|| {
-            DockerError::ContainerStartError("容器启动后无法获取信息".to_string())
+            DockerError::ContainerStartError("unable to get info after container started".to_string())
         })?;
 
         // 健康检查
         crate::health::wait_for_service_ready(&info.service_url)
             .await
-            .map_err(|e| DockerError::ContainerStartError(format!("健康检查失败: {}", e)))?;
+            .map_err(|e| DockerError::ContainerStartError(format!("health check failed: {}", e)))?;
 
-        info!("Agent containerstarted message : {}", info.service_url);
+        info!("Agent container started: {}", info.service_url);
         Ok(info)
     }
 
@@ -1696,7 +1696,7 @@ impl DockerManager {
                 .cloned()
                 .or_else(|| network_ips.values().next().cloned()),
             Err(e) => {
-                warn!("getcontainer message failed: {}", e);
+                warn!("get container ip failed: {}", e);
                 None
             }
         };
@@ -1979,35 +1979,35 @@ impl DockerManager {
 
     /// 清理所有容器
     pub async fn cleanup_all_containers(&self) -> DockerResult<()> {
-        info!("startingcleanup message container");
+        info!("Starting cleanup of all containers");
 
         let project_ids: Vec<String> = self.containers.keys().await;
 
         for project_id in project_ids {
             if let Err(e) = self.stop_container(&project_id).await {
                 error!(
-                    "cleanupproject {} message containerfailed: {}",
+                    "cleanup project {} container failed: {}",
                     project_id, e
                 );
             }
         }
 
-        info!(" message containercleanupcompleted");
+        info!("Container cleanup completed");
         Ok(())
     }
 
     /// 确保镜像存在，如果不存在则拉取
     async fn ensure_image_exists(&self, image: &str) -> DockerResult<()> {
-        debug!("check message exists: {}", image);
+        debug!("Checking if image exists: {}", image);
 
         // 检查镜像是否存在
         match self.docker.inspect_image(image).await {
             Ok(_) => {
-                debug!(" message {} alreadyexists", image);
+                debug!("Image {} already exists", image);
                 Ok(())
             }
             Err(_) => {
-                info!(" message {} not found, starting message ", image);
+                info!("Image {} not found, pulling...", image);
 
                 let pull_options = CreateImageOptions {
                     from_image: Some(image.to_string()),
@@ -2020,7 +2020,7 @@ impl DockerManager {
                     match result {
                         Ok(progress) => {
                             if let Some(status) = progress.status {
-                                debug!(" message : {}", status);
+                                debug!("container status: {}", status);
                             }
                         }
                         Err(e) => {
@@ -2032,7 +2032,7 @@ impl DockerManager {
                     }
                 }
 
-                info!(" message {} message completed", image);
+                info!("Image {} pull completed", image);
                 Ok(())
             }
         }
@@ -2045,7 +2045,7 @@ impl DockerManager {
         } else {
             return Err(DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("项目 {} 没有对应的容器", project_id),
+                format!("project {} has no corresponding container", project_id),
             )));
         };
 
@@ -2068,7 +2068,7 @@ impl DockerManager {
                     logs.push_str(&String::from_utf8_lossy(&output.into_bytes()));
                 }
                 Err(e) => {
-                    warn!("getcontainer message failed: {}", e);
+                    warn!("get container ip failed: {}", e);
                 }
             }
         }
@@ -2078,14 +2078,14 @@ impl DockerManager {
 
     /// 重启容器
     pub async fn restart_container(&self, project_id: &str) -> DockerResult<()> {
-        info!(" message container, projectID: {}", project_id);
+        info!("Creating container, projectID: {}", project_id);
 
         let container_info = if let Some(info) = self.containers.get(project_id).await {
             info
         } else {
             return Err(DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("项目 {} 没有对应的容器", project_id),
+                format!("project {} has no corresponding container", project_id),
             )));
         };
 
@@ -2095,7 +2095,7 @@ impl DockerManager {
                 None::<RestartContainerOptions>,
             )
             .await
-            .map_err(|e| DockerError::ContainerStartError(format!("重启容器失败: {}", e)))?;
+            .map_err(|e| DockerError::ContainerStartError(format!("failed to restart container: {}", e)))?;
 
         // 🔧 使缓存失效（容器状态已变更）
         self.api_cache
@@ -2106,7 +2106,7 @@ impl DockerManager {
             .await;
 
         info!(
-            "container message succeeded: {}",
+            "Container created: {}",
             container_info.container_name
         );
         Ok(())
@@ -2115,18 +2115,18 @@ impl DockerManager {
     /// 确保 RCoder 网络存在
     async fn ensure_rcoder_network(&self) -> DockerResult<()> {
         let main_network = self.get_main_network_name().await;
-        info!("check RCoder message status: {}...", main_network);
+        info!("Checking RCoder network status: {}...", main_network);
 
         // 检查网络是否已存在
         match self.inspect_network(&main_network).await {
             Ok(_) => {
-                info!("RCoder message alreadyexists: {}", main_network);
+                info!("RCoder network already exists: {}", main_network);
                 Ok(())
             }
             Err(_) => {
-                warn!("RCoder message not found: {}", main_network);
-                warn!(" message container message ");
-                warn!(" message check Docker Compose config");
+                warn!("RCoder network not found: {}", main_network);
+                warn!("Network mode: bridge");
+                warn!("Please check Docker Compose config");
                 // 不创建网络，因为主网络应该由 Docker Compose 创建
                 Ok(())
             }
@@ -2142,7 +2142,7 @@ impl DockerManager {
             .docker
             .list_networks(None::<ListNetworksOptions>)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("列出网络失败: {}", e)))?;
+            .map_err(|e| DockerError::ConnectionError(format!("failed to list networks: {}", e)))?;
 
         if networks
             .iter()
@@ -2174,7 +2174,7 @@ impl DockerManager {
         use crate::image_selector::ImageSelector;
         let selector = ImageSelector::new(self.config.multi_image_config.clone());
 
-        debug!(" message ImageSelector message : {:?}", service_type);
+        debug!(" ImageSelector: {:?}", service_type);
         selector.select_image(service_type, project_overrides).await
     }
 
@@ -2186,7 +2186,7 @@ impl DockerManager {
         use crate::image_selector::ImageSelector;
         let selector = ImageSelector::new(self.config.multi_image_config.clone());
 
-        debug!("get message config: {:?}", service_type);
+        debug!("Getting config: {:?}", service_type);
         selector.get_service_config(service_type).await
     }
 
@@ -2204,7 +2204,7 @@ impl DockerManager {
     ) -> DockerResult<HashMap<String, String>> {
         // 1. 尝试从缓存获取
         if let Some(Some(cached)) = self.api_cache.get_network(container_id).await {
-            debug!("[NETWORK] message : container_id={}", container_id);
+            debug!("[NETWORK] getting network info: container_id={}", container_id);
             // Arc::clone 只是增加引用计数，解引用后 clone HashMap
             return Ok((*cached).clone());
         }
@@ -2291,7 +2291,7 @@ impl DockerManager {
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("检查容器状态失败: {}", e)))?;
+            .map_err(|e| DockerError::ConnectionError(format!("failed to check container status: {}", e)))?;
 
         // 检查容器状态
         if let Some(state) = inspect.state {
@@ -2300,7 +2300,7 @@ impl DockerManager {
 
             match status {
                 Some(bollard::models::ContainerStateStatusEnum::RUNNING) => {
-                    info!("container {} message ", container_id);
+                    info!("Container {} is running", container_id);
                     Ok(())
                 }
                 Some(bollard::models::ContainerStateStatusEnum::EXITED) => {
@@ -2316,7 +2316,7 @@ impl DockerManager {
                 }
                 Some(bollard::models::ContainerStateStatusEnum::CREATED) => {
                     warn!(
-                        "container {} alreadycreated message notstarted",
+                        "container {} already created but not started",
                         container_id
                     );
                     Err(DockerError::ContainerStartError(format!(
@@ -2327,7 +2327,7 @@ impl DockerManager {
                 Some(status) => {
                     let status_str = format!("{:?}", status);
                     error!(
-                        "container {} message not message status: {}",
+                        "Container {} has unexpected status: {}",
                         container_id, status_str
                     );
                     Err(DockerError::ContainerStartError(format!(
@@ -2336,7 +2336,7 @@ impl DockerManager {
                     )))
                 }
                 None => {
-                    error!("container {} status message empty", container_id);
+                    error!("Container {} status is empty", container_id);
                     Err(DockerError::ContainerStartError(format!(
                         "容器状态为空: {}",
                         container_id
@@ -2345,11 +2345,11 @@ impl DockerManager {
             }
         } else {
             error!(
-                "unable togetcontainer {} message status message ",
+                "Unable to get container {} status",
                 container_id
             );
             Err(DockerError::ContainerStartError(format!(
-                "无法获取容器状态信息: {}",
+                "unable to get container status info: {}",
                 container_id
             )))
         }
@@ -2366,7 +2366,7 @@ impl DockerManager {
         &self,
         pattern: &str,
     ) -> DockerResult<Vec<ContainerSummary>> {
-        info!(" message container: pattern={}", pattern);
+        info!("Listing containers: pattern={}", pattern);
 
         // 🎯 获取当前容器的 ID（用于排除自己）
         let current_container_id = std::env::var("HOSTNAME").ok();
@@ -2381,7 +2381,7 @@ impl DockerManager {
             .docker
             .list_containers(options)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("获取容器列表失败: {}", e)))?;
+            .map_err(|e| DockerError::ConnectionError(format!("failed to get container list: {}", e)))?;
 
         // 创建过滤器
         let filter = ContainerFilter::name_pattern(pattern);
@@ -2396,7 +2396,7 @@ impl DockerManager {
                     if let Some(ref container_id) = container.id {
                         // HOSTNAME 是容器 ID 的前 12 位
                         if container_id.starts_with(current_id) {
-                            info!("🚫 skip message container message : {}", container_id);
+                            info!("🚫 skip removing container: {}", container_id);
                             return false;
                         }
                     }
@@ -2429,7 +2429,7 @@ impl DockerManager {
         options: CleanupOptions,
     ) -> DockerResult<CleanupResult> {
         info!(
-            "🔥 starting message cleanupcontainer: message ={}",
+            "🔥 Starting cleanup container: count={}",
             container_ids.len()
         );
 
@@ -2480,7 +2480,7 @@ impl DockerManager {
         container_id: &str,
         options: &CleanupOptions,
     ) -> DockerResult<()> {
-        info!(" message cleanupcontainer: {}", container_id);
+        info!("Cleaning up container: {}", container_id);
 
         // 第一步：获取容器信息
         let container_info = self.inspect_container_for_cleanup(container_id).await?;
@@ -2494,14 +2494,14 @@ impl DockerManager {
             Some(status) if status.to_string() == "running" => {
                 if !options.force_remove_running {
                     info!(
-                        "⚠️ container {} message, skip message ( message force message )",
+                        "⚠️ Container {} is running, skip (force=false)",
                         container_id
                     );
                     return Ok(());
                 }
 
                 if options.wait_for_graceful_stop {
-                    info!("🛑 message gracefulstoppedcontainer: {}", container_id);
+                    info!("🛑 Gracefully stopped container: {}", container_id);
                     if let Err(e) = self
                         .graceful_stop_container(container_id, options.stop_timeout_seconds)
                         .await
@@ -2519,10 +2519,10 @@ impl DockerManager {
                 }
             }
             Some(_) => {
-                info!("container {} not message, message ", container_id);
+                info!("Container {} is not running", container_id);
             }
             None => {
-                warn!("unable togetcontainer {} status, message ", container_id);
+                warn!("Unable to get container {} status", container_id);
             }
         }
 
@@ -2544,7 +2544,7 @@ impl DockerManager {
         self.docker
             .inspect_container(container_id, options)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))
+            .map_err(|e| DockerError::ConnectionError(format!("failed to get container info: {}", e)))
     }
 
     /// 优雅停止容器
@@ -2565,7 +2565,7 @@ impl DockerManager {
         self.docker
             .stop_container(container_id, stop_options)
             .await
-            .map_err(|e| DockerError::ContainerStopError(format!("优雅停止容器失败: {}", e)))
+            .map_err(|e| DockerError::ContainerStopError(format!("failed to gracefully stop container: {}", e)))
     }
 
     /// 强制停止容器
@@ -2578,7 +2578,7 @@ impl DockerManager {
         self.docker
             .stop_container(container_id, stop_options)
             .await
-            .map_err(|e| DockerError::ContainerStopError(format!("强制停止容器失败: {}", e)))
+            .map_err(|e| DockerError::ContainerStopError(format!("failed to force stop container: {}", e)))
     }
 
     /// 删除单个容器
@@ -2596,7 +2596,7 @@ impl DockerManager {
         self.docker
             .remove_container(container_id, remove_options)
             .await
-            .map_err(|e| DockerError::ContainerRemoveError(format!("删除容器失败: {}", e)))
+            .map_err(|e| DockerError::ContainerRemoveError(format!("failed to delete container: {}", e)))
     }
 
     /// 使用模式匹配清理容器（主要接口）
@@ -2613,7 +2613,7 @@ impl DockerManager {
         options: CleanupOptions,
     ) -> DockerResult<CleanupResult> {
         info!(
-            "🧹 starting message cleanupcontainer: pattern={:?}",
+            "🧹 Starting cleanup container: pattern={:?}",
             pattern
         );
 
@@ -2688,11 +2688,11 @@ impl DockerManager {
         // 🎯 优化：直接通过 HOSTNAME 环境变量 inspect 当前容器，无需列出所有容器
         let hostname = std::env::var("HOSTNAME").map_err(|_| {
             DockerError::ConnectionError(
-                "无法获取 HOSTNAME 环境变量。请确保代码运行在 Docker 容器中。".to_string(),
+                "unable to get HOSTNAME environment variable. Please ensure code is running in Docker container.".to_string(),
             )
         })?;
 
-        debug!("detect message container hostname: {}", hostname);
+        debug!("Detecting container hostname: {}", hostname);
 
         // 直接 inspect 当前容器（hostname 通常是容器 ID 的前12位，但 Docker API 支持前缀匹配）
         let inspect = docker
@@ -2700,7 +2700,7 @@ impl DockerManager {
             .await
             .map_err(|e| {
                 DockerError::ConnectionError(format!(
-                    "无法获取当前容器信息 (hostname: {}): {}",
+                    "unable to get current container info (hostname: {}): {}",
                     hostname, e
                 ))
             })?;
@@ -2712,7 +2712,7 @@ impl DockerManager {
             // 查找包含指定网络基础名称的网络
             for network_name in networks.keys() {
                 if network_name.contains(network_base_name) {
-                    info!(" message detect message : {}", network_name);
+                    info!("detected network: {}", network_name);
                     return Ok(network_name.clone());
                 }
             }
@@ -2772,7 +2772,7 @@ mod tests {
         // 测试容器名称
         let container_name = "rcoder-rcoder-1";
 
-        println!("\n🔍 message container: {}", container_name);
+        println!("\n🔍 checking container: {}", container_name);
         println!("─────────────────────────────────────────");
 
         // 直接调用 Docker API 获取容器信息
@@ -2784,30 +2784,30 @@ mod tests {
             .await
         {
             Ok(details) => {
-                println!("✅ succeededgetcontainer message ");
+                println!("✅ succeeded getcontainer");
 
                 // 获取创建时间字符串
                 if let Some(ref created_str) = details.created {
-                    println!(" Docker API message : {}", created_str);
+                    println!(" Docker API created: {}", created_str);
 
                     // 解析时间戳
                     match DateTime::parse_from_rfc3339(&created_str) {
                         Ok(created_time) => {
                             let created_time_utc = created_time.with_timezone(&Utc);
-                            println!(" message UTC: {}", created_time_utc);
+                            println!(" created UTC: {}", created_time_utc);
 
                             // 计算容器年龄
                             let age = Utc::now().signed_duration_since(created_time_utc);
-                            println!(" container message : {} message ", age.num_seconds());
-                            println!(" container message : {} message ", age.num_minutes());
-                            println!(" container message : {} message ", age.num_hours());
-                            println!(" container message : {} message ", age.num_days());
+                            println!(" container age (seconds): {}", age.num_seconds());
+                            println!(" container age (minutes): {}", age.num_minutes());
+                            println!(" container age (hours): {}", age.num_hours());
+                            println!(" container age (days): {}", age.num_days());
 
                             // 验证时间是否合理
                             assert!(created_time_utc < Utc::now(), "创建时间应该在过去");
                             assert!(age.num_days() < 365, "创建时间不应该超过 1 年");
 
-                            println!("\n✅ message ！");
+                            println!("\n✅ timestamp test passed!");
                         }
                         Err(e) => {
                             panic!("❌ RFC3339 时间戳解析失败: {}", e);
@@ -2818,7 +2818,7 @@ mod tests {
                 }
 
                 // 使用 Docker CLI 对比验证
-                println!("\n🔍 message Docker CLI message :");
+                println!("\n🔍 checking Docker CLI:");
                 println!("─────────────────────────────────────────");
 
                 use std::process::Command;
@@ -2828,26 +2828,26 @@ mod tests {
                     .expect("Failed to run docker inspect");
 
                 let docker_cli_time = String::from_utf8_lossy(&output.stdout);
-                println!(" Docker CLI message : {}", docker_cli_time.trim());
+                println!(" Docker CLI created: {}", docker_cli_time.trim());
 
                 // 解析 Docker CLI 返回的时间
                 if let Ok(docker_time) = DateTime::parse_from_rfc3339(docker_cli_time.trim()) {
                     let docker_time_utc = docker_time.with_timezone(&Utc);
-                    println!("   Docker CLI UTC:  {}", docker_time_utc);
+                    println!("   Docker CLI UTC: {}", docker_time_utc);
 
                     // 从 Docker API 获取的时间
                     if let Some(ref created_str) = details.created {
                         if let Ok(api_time) = DateTime::parse_from_rfc3339(&created_str) {
                             let api_time_utc = api_time.with_timezone(&Utc);
-                            println!(" API message UTC: {}", api_time_utc);
+                            println!(" API created UTC: {}", api_time_utc);
 
                             // 时间差应该为 0（应该完全一致）
                             let diff =
                                 (docker_time_utc.timestamp() - api_time_utc.timestamp()).abs();
-                            println!(" message : {} message ", diff);
+                            println!(" time diff: {} seconds", diff);
 
                             assert_eq!(diff, 0, "API 和 CLI 返回的时间应该完全一致");
-                            println!("\n✅ message Docker CLI message ！");
+                            println!("\n✅ Docker CLI check passed!");
                         }
                     }
                 }
@@ -2865,26 +2865,26 @@ mod tests {
     async fn test_unix_timestamp_parsing() {
         use chrono::TimeZone;
 
-        println!("\n🔍 message Unix message ( message bug message )");
+        println!("\n🔍 testing Unix timestamp ( old bug )");
         println!("─────────────────────────────────────────");
 
         // 容器实际创建时间: 2026-01-19T07:35:53Z
         let expected_time = Utc.with_ymd_and_hms(2026, 1, 19, 7, 35, 53).unwrap();
         let unix_timestamp = expected_time.timestamp(); // 1768808153 秒
 
-        println!(" message : {}", expected_time);
-        println!(" Unix message : {}", unix_timestamp);
+        println!(" expected time: {}", expected_time);
+        println!(" unix timestamp: {}", unix_timestamp);
 
         // 使用我们的解析函数
         match DockerManager::parse_unix_timestamp(unix_timestamp, "test") {
             Ok(parsed_time) => {
-                println!(" message : {}", parsed_time);
+                println!(" parsed time: {}", parsed_time);
 
                 let diff = (parsed_time.timestamp() - expected_time.timestamp()).abs();
-                println!(" message : {} message ", diff);
+                println!(" time diff: {} seconds", diff);
 
                 assert_eq!(diff, 0, "时间戳解析应该完全准确");
-                println!("\n✅ Unix message ！");
+                println!("\n✅ Unix timestamp test passed!");
             }
             Err(e) => {
                 panic!("❌ 解析失败: {}", e);
@@ -2892,10 +2892,10 @@ mod tests {
         }
 
         // 验证旧代码的错误
-        println!("\n🔍 message bug:");
+        println!("\n🔍 verifying bug:");
         let wrong_seconds = unix_timestamp / 1000; // 旧代码的错误处理
         let wrong_time = Utc.timestamp_opt(wrong_seconds, 0).single().unwrap();
-        println!(" message : {} (error！)", wrong_time);
+        println!(" wrong time: {} (error!)", wrong_time);
         println!(
             "   与正确时间相差: {} 天",
             (expected_time.timestamp() - wrong_time.timestamp()) / 86400
@@ -2922,12 +2922,12 @@ mod tests {
         // 测试容器名称（使用时间戳避免冲突）
         let container_name = format!("test-timestamp-{}", chrono::Utc::now().timestamp());
 
-        println!("\n🔍 message ");
+        println!("\n🔍 testing timestamp parsing");
         println!("─────────────────────────────────────────");
-        println!(" container message : {}", container_name);
+        println!(" testing container: {}", container_name);
 
         // 拉取 alpine 镜像（如果不存在）
-        println!("\n📥 message : alpine:latest");
+        println!("\n📥 pulling image: alpine:latest");
         let create_image_options = CreateImageOptionsBuilder::default()
             .from_image("alpine:latest")
             .build();
@@ -2957,7 +2957,7 @@ mod tests {
             .await
             .expect("Failed to create test container");
 
-        println!("✅ containeralreadycreated: {}", create_result.id);
+        println!("✅ container already created: {}", create_result.id);
 
         // 2. 启动容器
         docker
@@ -2968,13 +2968,13 @@ mod tests {
             .await
             .expect("Failed to start test container");
 
-        println!("✅ containeralreadystarted");
+        println!("✅ container already started");
 
         // 等待容器完全启动
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // 3. 使用 list_containers API 获取 Unix 时间戳
-        println!("\n📋 message list_containers API (Unix message ):");
+        println!("\n📋 testing list_containers API (Unix timestamp):");
         println!("─────────────────────────────────────────");
 
         let mut filters = std::collections::HashMap::new();
@@ -2994,7 +2994,7 @@ mod tests {
         let container = &containers[0];
 
         let unix_timestamp = container.created.expect("容器应该有 created 字段");
-        println!(" message Unix message : {} message ", unix_timestamp);
+        println!(" unix timestamp: {} seconds", unix_timestamp);
 
         // 使用 parse_unix_timestamp 解析
         let parsed_unix_time = DockerManager::parse_unix_timestamp(
@@ -3003,10 +3003,10 @@ mod tests {
         )
         .expect("parse_unix_timestamp 应该成功");
 
-        println!(" message (UTC): {}", parsed_unix_time);
+        println!(" parsed (UTC): {}", parsed_unix_time);
 
         // 4. 使用 inspect_container API 获取 RFC3339 时间戳
-        println!("\n📋 message inspect_container API (RFC3339 message ):");
+        println!("\n📋 testing inspect_container API (RFC3339 timestamp):");
         println!("─────────────────────────────────────────");
 
         let details = docker
@@ -3015,7 +3015,7 @@ mod tests {
             .expect("Failed to inspect container");
 
         let rfc3339_str = details.created.expect("容器应该有 created 字段");
-        println!(" message RFC3339 message : {}", rfc3339_str);
+        println!(" RFC3339 timestamp: {}", rfc3339_str);
 
         // 使用 parse_rfc3339_timestamp 解析
         let parsed_rfc3339_time = DockerManager::parse_rfc3339_timestamp(
@@ -3024,16 +3024,16 @@ mod tests {
         )
         .expect("parse_rfc3339_timestamp 应该成功");
 
-        println!(" message (UTC): {}", parsed_rfc3339_time);
+        println!(" parsed (UTC): {}", parsed_rfc3339_time);
 
         // 5. 验证两个解析结果的一致性
-        println!("\n🔍 message API message :");
+        println!("\n🔍 comparing API results:");
         println!("─────────────────────────────────────────");
 
         let time_diff = (parsed_unix_time.timestamp() - parsed_rfc3339_time.timestamp()).abs();
-        println!(" list_containers message : {}", parsed_unix_time);
-        println!(" inspect_container message : {}", parsed_rfc3339_time);
-        println!(" message : {} message ", time_diff);
+        println!(" list_containers parsed: {}", parsed_unix_time);
+        println!(" inspect_container parsed: {}", parsed_rfc3339_time);
+        println!(" time diff: {} seconds", time_diff);
 
         // 两个 API 应该返回相同的时间（允许 1 秒误差，因为精度不同）
         assert!(
@@ -3043,22 +3043,22 @@ mod tests {
         );
 
         // 6. 验证时间合理性
-        println!("\n🔍 message :");
+        println!("\n🔍 verifying timestamps:");
         println!("─────────────────────────────────────────");
 
         let now = Utc::now();
         let age = now.signed_duration_since(parsed_unix_time);
 
-        println!(" message : {}", now);
-        println!(" container message : {} message ", age.num_seconds());
+        println!(" current time: {}", now);
+        println!(" container age (seconds): {}", age.num_seconds());
 
         assert!(age.num_seconds() >= 0, "容器创建时间应该在过去");
         assert!(age.num_seconds() < 60, "容器应该是刚创建的（< 60 秒）");
 
-        println!("\n✅ message ！");
+        println!("\n✅ timestamp test passed!");
 
         // 7. 清理测试容器
-        println!("\n🧹 cleanup message container...");
+        println!("\n🧹 cleaning up test container...");
 
         let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
 
@@ -3067,6 +3067,6 @@ mod tests {
             .await
             .expect("Failed to cleanup test container");
 
-        println!("✅ message containeralreadycleanup: {}", container_name);
+        println!("✅ container already cleaned up: {}", container_name);
     }
 }

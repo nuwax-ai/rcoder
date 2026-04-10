@@ -287,7 +287,7 @@ where
         service_uuid: Option<String>,
     ) -> Result<R::Entry> {
         info!(
-            "startingcreated message Agent session, project ID: {}",
+            "Creating Agent session, project ID: {}",
             project_id
         );
 
@@ -505,7 +505,7 @@ where
             let model_changed = existing.is_model_config_changed(&model_provider);
 
             if !channel_closed && !model_changed {
-                info!("reuse message Agent session, project ID: {}", project_id);
+                info!("Reuse Agent session, project ID: {}", project_id);
                 return Ok((existing.clone(), false));
             }
 
@@ -566,7 +566,7 @@ where
 
         // 会话不存在，需要创建新会话
         info!(
-            "sessionnot found, created message session, project ID: {}",
+            "Session not found, creating new session, project ID: {}",
             project_id
         );
 
@@ -627,7 +627,7 @@ where
                 anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
             })?;
 
-        info!("Prompt requestalreadysend, project ID: {}", project_id);
+        info!("Prompt request already sent, project ID: {}", project_id);
         Ok(())
     }
 
@@ -652,7 +652,7 @@ where
                 anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
             })?;
 
-        info!("Prompt requestalreadysend, project ID: {}", project_id);
+        info!("Prompt request already sent, project ID: {}", project_id);
         Ok(())
     }
 }

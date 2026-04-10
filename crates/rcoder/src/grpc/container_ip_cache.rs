@@ -28,7 +28,7 @@ impl ContainerIpCache {
     /// * `ttl_seconds` - 缓存过期时间（秒）
     pub fn new(ttl_seconds: u64) -> Self {
         info!(
-            "🗄️ [IP_CACHE] 初始化容器 IP 缓存: TTL={}秒 (使用 moka 无锁缓存)",
+            "🗄️ [IP_CACHE] Initializing container IP cache: TTL={} seconds (using moka lock-free cache)",
             ttl_seconds
         );
 
@@ -77,7 +77,7 @@ impl ContainerIpCache {
         // moka 的 invalidate 方法无需检查是否存在
         self.cache.invalidate(container_name);
         info!(
-            "🗑️ [IP_CACHE] 缓存已失效: container_name={}",
+            "🗑️ [IP_CACHE] Cache invalidated: container_name={}",
             container_name
         );
     }

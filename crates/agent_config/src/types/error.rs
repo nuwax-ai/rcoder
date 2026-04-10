@@ -6,23 +6,23 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum AgentConfigError {
     /// Configuration error
-    #[error("配置错误: {0}")]
+    #[error("configuration error: {0}")]
     Configuration(#[from] ConfigError),
 
     /// I/O error
-    #[error("I/O错误: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] IoError),
 
     /// Installation error
-    #[error("安装错误: {0}")]
+    #[error("installation error: {0}")]
     Installation(#[from] InstallationError),
 
     /// Validation error
-    #[error("验证错误: {0}")]
+    #[error("validation error: {0}")]
     Validation(#[from] ValidationError),
 
     /// Other error
-    #[error("其他错误: {0}")]
+    #[error("other error: {0}")]
     Other(String),
 }
 
@@ -42,31 +42,31 @@ impl From<std::path::PathBuf> for AgentConfigError {
 #[derive(Error, Debug)]
 pub enum ConfigError {
     /// Serialization error
-    #[error("序列化错误: {0}")]
+    #[error("serialization error: {0}")]
     Serialization(String),
 
     /// Deserialization error
-    #[error("反序列化错误: {0}")]
+    #[error("deserialization error: {0}")]
     Deserialization(String),
 
     /// Missing required field
-    #[error("缺少必需字段: {0}")]
+    #[error("missing required field: {0}")]
     MissingField(String),
 
     /// Invalid value
-    #[error("无效值: {0}")]
+    #[error("invalid value: {0}")]
     InvalidValue(String),
 
     /// File not found
-    #[error("文件未找到: {0}")]
+    #[error("file not found: {0}")]
     FileNotFound(String),
 
     /// Permission denied
-    #[error("权限被拒绝: {0}")]
+    #[error("permission denied: {0}")]
     PermissionDenied(String),
 
     /// Read error
-    #[error("读取错误: {0}")]
+    #[error("read error: {0}")]
     Read(String),
 }
 
@@ -96,23 +96,23 @@ impl ConfigError {
 #[derive(Error, Debug)]
 pub enum IoError {
     /// Path error
-    #[error("路径错误: {0:?}")]
+    #[error("path error: {0:?}")]
     PathError(std::path::PathBuf),
 
     /// Read error
-    #[error("读取错误: {0}")]
+    #[error("read error: {0}")]
     Read(String),
 
     /// Write error
-    #[error("写入错误: {0}")]
+    #[error("write error: {0}")]
     Write(String),
 
     /// Create error
-    #[error("创建错误: {0}")]
+    #[error("create error: {0}")]
     Create(String),
 
     /// Delete error
-    #[error("删除错误: {0}")]
+    #[error("delete error: {0}")]
     Delete(String),
 }
 
@@ -132,19 +132,19 @@ impl IoError {
 #[derive(Error, Debug)]
 pub enum InstallationError {
     /// Package not found
-    #[error("包未找到: {0}")]
+    #[error("package not found: {0}")]
     PackageNotFound(String),
 
     /// Installation failed
-    #[error("Installation failed: {0}")]
+    #[error("installation failed: {0}")]
     InstallationFailed(String),
 
     /// Validation failed
-    #[error("验证失败: {0}")]
+    #[error("validation failed: {0}")]
     ValidationFailed(String),
 
     /// Permission denied
-    #[error("权限被拒绝: {0}")]
+    #[error("permission denied: {0}")]
     PermissionDenied(String),
 }
 
@@ -152,15 +152,15 @@ pub enum InstallationError {
 #[derive(Error, Debug)]
 pub enum ValidationError {
     /// Invalid configuration
-    #[error("无效配置: {0}")]
+    #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
 
     /// Missing dependency
-    #[error("缺少依赖: {0}")]
+    #[error("missing dependency: {0}")]
     MissingDependency(String),
 
     /// Constraint violation
-    #[error("约束违规: {0}")]
+    #[error("constraint violation: {0}")]
     ConstraintViolation(String),
 }
 

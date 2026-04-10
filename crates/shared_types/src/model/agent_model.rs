@@ -344,7 +344,7 @@ impl AgentLifecycleGuard {
                 if let Some(mut child) = child_process.lock().await.take()
                     && let Err(e) = child.kill().await
                 {
-                    warn!(" message Claudechild processfailed: {}", e);
+                    warn!("Claude child process failed: {}", e);
                 }
             }
         }

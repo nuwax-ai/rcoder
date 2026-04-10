@@ -187,7 +187,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
             RouteType::VncProxy,
         )
         .map_err(|e| {
-            tracing::error!("[ROUTER] VNC route message failed: {}", e);
+            tracing::error!("[ROUTER] VNC route config failed: {}", e);
             anyhow::anyhow!("VNC route configuration error: {}", e)
         })?;
 
@@ -210,7 +210,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
     router
         .insert("/proxy/{port}/{*path}", RouteType::PortProxy)
         .map_err(|e| {
-            tracing::error!("[ROUTER] portproxyroute message failed: {}", e);
+            tracing::error!("[ROUTER] port proxy route config failed: {}", e);
             anyhow::anyhow!("Port proxy route configuration error: {}", e)
         })?;
 
@@ -230,7 +230,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
     router
         .insert("/health", RouteType::HealthCheck)
         .map_err(|e| {
-            tracing::error!("[ROUTER] message checkroute message failed: {}", e);
+            tracing::error!("[ROUTER] health check route config failed: {}", e);
             anyhow::anyhow!("Health check route configuration error: {}", e)
         })?;
 
@@ -259,7 +259,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
     router
         .insert("/api/{service_name}/{*path}", RouteType::ApiProxy)
         .map_err(|e| {
-            tracing::error!("[ROUTER] API proxyroute message failed: {}", e);
+            tracing::error!("[ROUTER] API proxy route config failed: {}", e);
             anyhow::anyhow!("API proxy route configuration error: {}", e)
         })?;
 
@@ -288,7 +288,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
             RouteType::AudioProxy,
         )
         .map_err(|e| {
-            tracing::error!("[ROUTER] message proxyroute message failed: {}", e);
+            tracing::error!("[ROUTER] audio proxy route config failed: {}", e);
             anyhow::anyhow!("Audio proxy route configuration error: {}", e)
         })?;
 
@@ -314,7 +314,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
             RouteType::ImeProxy,
         )
         .map_err(|e| {
-            tracing::error!("[ROUTER] IME proxyroute message failed: {}", e);
+            tracing::error!("[ROUTER] IME proxy route config failed: {}", e);
             anyhow::anyhow!("IME proxy route configuration error: {}", e)
         })?;
 

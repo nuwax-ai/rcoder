@@ -396,7 +396,7 @@ impl UnifiedStorage for DuckDbStorage {
                     result.cleaned_projects += projects_deleted;
                 }
                 Err(e) => {
-                    result.add_error(format!("删除容器 {} 失败: {}", container.container_id, e));
+                    result.add_error(format!("failed to delete container {}: {}", container.container_id, e));
                 }
             }
         }

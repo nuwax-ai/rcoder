@@ -100,3 +100,15 @@ error.session_cancelled: "Session cancelled"
 error.cancel_response_timeout: "Response timeout after cancellation"
 error.agent_init_timeout: "Agent initialization timed out, please retry. Too many MCPs may cause timeout. If this persists, restart the agent computer (click the icon in the upper right corner of PC, then click [...] and select Restart Agent Computer)"
 error.session_cancelled_timeout: "Session cancelled (Agent response timeout)"
+
+# Processing errors
+error.attachment_processing_failed: "Attachment processing failed"
+error.processing_failed: "Processing failed"
+
+# Chat handler errors
+error.create_project_dir_failed: "Failed to create project directory"
+error.build_chat_prompt_failed: "Failed to build ChatPrompt"
+error.agent_worker_unavailable: "Agent Worker is unavailable, restarting. Please retry later"
+error.send_task_failed: "Failed to send task"
+error.request_processing_failed: "Failed to process request"
+error.system_busy: "System is busy: concurrent Agent sessions reached limit ({}), please retry later"

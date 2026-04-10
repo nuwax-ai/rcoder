@@ -75,7 +75,7 @@ impl DestroyReason {
                 )
             }
             DestroyReason::ManualStop { source } => {
-                format!("手动停止 (来源:{})", source)
+                format!("manual stop (source:{})", source)
             }
         }
     }

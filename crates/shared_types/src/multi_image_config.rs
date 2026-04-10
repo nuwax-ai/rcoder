@@ -74,18 +74,18 @@ pub struct ProjectImageOverrides {
     pub environment: HashMap<String, String>,
 }
 
-/// 配置验证错误
+/// Config validation error
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("配置解析错误: {0}")]
+    #[error("config parse error: {0}")]
     ParseError(String),
-    #[error("配置验证错误: {0}")]
+    #[error("config validation error: {0}")]
     ValidationError(String),
-    #[error("服务类型 '{0}' 未找到")]
+    #[error("service type '{0}' not found")]
     ServiceNotFound(String),
-    #[error("服务类型 '{0}' 未启用")]
+    #[error("service type '{0}' is disabled")]
     ServiceDisabled(String),
-    #[error("镜像配置错误: {0}")]
+    #[error("image config error: {0}")]
     ImageConfigError(String),
 }
 
@@ -132,7 +132,7 @@ impl MultiImageConfig {
                     // 配置有效
                 }
                 crate::service_config::ConfigValidationResult::Warning(warning) => {
-                    tracing::warn!(" message '{}' config message : {}", service_key, warning);
+                    tracing::warn!("Warning in '{}' config: {}", service_key, warning);
                 }
                 crate::service_config::ConfigValidationResult::Error(error) => {
                     return Err(ConfigError::ValidationError(format!(
@@ -240,7 +240,7 @@ impl MultiImageConfig {
                 service_config.default_image = self.global_defaults.default_image.clone();
             }
 
-            tracing::debug!(" message defaultconfig message '{}'", service_key);
+            tracing::debug!("Using default config for '{}'", service_key);
         }
     }
 
@@ -339,7 +339,7 @@ impl ProjectImageOverrides {
         if let Some(override_image) = self.images.get(&service_key) {
             config.image = Some(override_image.clone());
             tracing::info!(
-                "应用项目级镜像覆盖到服务 '{}': {}",
+                "Applying project-level image override to service '{}': {}",
                 service_key,
                 override_image
             );

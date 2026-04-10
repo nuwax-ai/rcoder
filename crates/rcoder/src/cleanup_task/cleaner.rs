@@ -74,19 +74,19 @@ impl AgentCleaner {
             Ok(log_stats) => {
                 if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
                     info!(
-                        "🗑️ [cleaner] message cleanupcompleted: {}",
+                        "🗑️ [cleaner] Cleanup completed: {}",
                         log_stats.summary()
                     );
                 }
             }
             Err(e) => {
-                warn!("[cleaner] message cleanupfailed: {}", e);
+                warn!("[cleaner] Cleanup failed: {}", e);
             }
         }
 
         // 2. 扫描需要清理的 agent
         let idle_agents = self.agent_scanner.scan_idle_agents().await?;
-        info!("[cleaner] message {} message agent", idle_agents.len());
+        info!("[cleaner] Found {} idle agents to clean", idle_agents.len());
 
         // 3. 清理每个 agent
         for project_id in idle_agents {
@@ -121,7 +121,7 @@ impl AgentCleaner {
             duration.as_secs_f64(),
             current_stats.summary()
         );
-        info!("[cleaner] message : {}", self.stats.summary());
+        info!("[cleaner] stats: {}", self.stats.summary());
 
         Ok(current_stats)
     }
@@ -186,7 +186,7 @@ impl AgentCleaner {
         // 5. 从存储中移除项目记录（始终执行）
         self.state.remove_project(project_id);
         info!(
-            "[cleaner] already message project message : project_id={}",
+            "[cleaner] already removed project: project_id={}",
             project_id
         );
 
@@ -195,7 +195,7 @@ impl AgentCleaner {
 
     /// 运行清理任务（定时）
     pub async fn run(&mut self) {
-        info!("[cleaner] cleanup message alreadystarted");
+        info!("[cleaner] cleanup task already started");
 
         let mut interval = interval(self.config.cleanup_interval);
 
@@ -203,8 +203,8 @@ impl AgentCleaner {
             interval.tick().await;
 
             match self.cleanup_once().await {
-                Ok(_) => debug!("[cleaner] message cleanupcompleted"),
-                Err(e) => warn!("[cleaner] message cleanupfailed: {}", e),
+                Ok(_) => debug!("[cleaner] Cleanup completed"),
+                Err(e) => warn!("[cleaner] Cleanup failed: {}", e),
             }
         }
     }

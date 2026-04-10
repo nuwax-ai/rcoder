@@ -1,54 +1,54 @@
-//! DuckDB Manager 错误类型定义
+//! DuckDB Manager error types
 //!
-//! 定义 DuckDB 存储管理器的错误类型
+//! Defines error types for DuckDB storage manager
 
 use thiserror::Error;
 
-/// DuckDB 存储管理器错误类型
+/// DuckDB storage manager error type
 #[derive(Debug, Error)]
 pub enum DuckDbError {
-    /// 数据库连接错误
-    #[error("数据库连接错误: {0}")]
+    /// Database connection error
+    #[error("database connection error: {0}")]
     ConnectionError(String),
 
-    /// SQL 执行错误
-    #[error("SQL 执行错误: {0}")]
+    /// SQL execution error
+    #[error("SQL execution error: {0}")]
     QueryError(String),
 
-    /// 数据未找到
-    #[error("数据未找到: {entity} with {key} = {value}")]
+    /// Data not found
+    #[error("data not found: {entity} with {key} = {value}")]
     NotFound {
         entity: &'static str,
         key: &'static str,
         value: String,
     },
 
-    /// 数据已存在
-    #[error("数据已存在: {entity} with {key} = {value}")]
+    /// Data already exists
+    #[error("data already exists: {entity} with {key} = {value}")]
     AlreadyExists {
         entity: &'static str,
         key: &'static str,
         value: String,
     },
 
-    /// 事务错误
-    #[error("事务错误: {0}")]
+    /// Transaction error
+    #[error("transaction error: {0}")]
     TransactionError(String),
 
-    /// 序列化/反序列化错误
-    #[error("序列化错误: {0}")]
+    /// Serialization/deserialization error
+    #[error("serialization error: {0}")]
     SerializationError(String),
 
-    /// 数据完整性错误
-    #[error("数据完整性错误: {0}")]
+    /// Data integrity error
+    #[error("data integrity error: {0}")]
     IntegrityError(String),
 
-    /// 初始化错误
-    #[error("初始化错误: {0}")]
+    /// Initialization error
+    #[error("initialization error: {0}")]
     InitializationError(String),
 
-    /// 内部错误
-    #[error("内部错误: {0}")]
+    /// Internal error
+    #[error("internal error: {0}")]
     InternalError(String),
 }
 

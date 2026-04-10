@@ -121,11 +121,11 @@ impl ServiceHealthChecker {
                 is_healthy
             }
             Ok(Err(e)) => {
-                debug!("HTTP message checkfailed {}: {}", url, e);
+                debug!("HTTP health check failed {}: {}", url, e);
                 false
             }
             Err(_) => {
-                debug!("HTTP message checktimeout {}", url);
+                debug!("HTTP health check timeout {}", url);
                 false
             }
         }
@@ -152,7 +152,7 @@ impl ServiceHealthChecker {
         .await
         {
             Ok(Ok(_stream)) => {
-                debug!("gRPC port message connection: {}", addr);
+                debug!("gRPC port connection: {}", addr);
                 true
             }
             Ok(Err(e)) => {
