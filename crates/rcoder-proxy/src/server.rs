@@ -45,7 +45,7 @@ impl ProxyServer {
         })?;
         info!("Pingora proxy already initialized");
         info!(
-            "负载均衡算法: {}",
+            "Load balancing algorithm: {}",
             if pingora_proxy.use_round_robin {
                 "Round Robin"
             } else {

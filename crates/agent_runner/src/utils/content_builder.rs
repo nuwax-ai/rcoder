@@ -338,7 +338,7 @@ impl ContentBuilder {
             Ok(data) => data,
             Err(e) => {
                 tracing::warn!(
-                    "⚠️ 无法读取二进制文档，已忽略: {:?}，错误: {}",
+                    "⚠️ Cannot read binary document, ignored: {:?}, error: {}",
                     file_path,
                     e
                 );

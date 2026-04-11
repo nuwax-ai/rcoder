@@ -45,20 +45,20 @@ impl ContainerSelfInspector {
         // 创建 Docker 客户端
         let docker_client =
             Docker::connect_with_socket(docker_socket_path, 120, API_DEFAULT_VERSION)
-                .context("连接 Docker socket 失败")?;
+                .context("Failed to connect to Docker socket")?;
 
         // 测试 Docker 连接
         docker_client
             .ping()
             .await
-            .context("测试 Docker 连接失败，请检查 socket 路径和权限")?;
+            .context("Failed to test Docker connection, please check socket path and permissions")?;
 
         info!("Docker connectionsucceeded");
 
         // 获取当前容器ID
         let container_id = Self::get_current_container_id()
             .await
-            .context("获取当前容器ID失败")?;
+            .context("Failed to get current container ID")?;
 
         info!("Detected container ID: {}", container_id);
 
@@ -98,10 +98,10 @@ impl ContainerSelfInspector {
                 None::<bollard::query_parameters::InspectContainerOptions>,
             )
             .await
-            .context("调用 Docker inspect API 失败")?;
+            .context("Failed to call Docker inspect API")?;
 
         debug!(
-            "容器 inspect 结果: {:?}",
+            "Container inspect result: {:?}",
             serde_json::to_string_pretty(&inspect_result)?
         );
 
@@ -117,7 +117,7 @@ impl ContainerSelfInspector {
                     .clone();
 
                 debug!(
-                    "挂载点 {}: {} -> {}",
+                    "Mount point {}: {} -> {}",
                     index,
                     mount_destination,
                     mount.source.as_ref().unwrap_or(&String::new()).clone()
@@ -167,7 +167,7 @@ impl ContainerSelfInspector {
 
         let cgroup_content = fs::read_to_string("/proc/self/cgroup")
             .await
-            .with_context(|| "读取 /proc/self/cgroup 文件失败")?;
+            .with_context(|| "Failed to read /proc/self/cgroup file")?;
 
         debug!("cgroup file: {}", cgroup_content);
 
@@ -258,7 +258,7 @@ impl ContainerSelfInspector {
         self.docker_client
             .ping()
             .await
-            .context("Docker socket 连接测试失败")?;
+            .context("Docker socket connection test failed")?;
         info!("Docker socket connection succeeded");
         Ok(())
     }
@@ -275,7 +275,7 @@ impl ContainerSelfInspector {
                 None::<bollard::query_parameters::InspectContainerOptions>,
             )
             .await
-            .context("调用 Docker inspect API 失败")?;
+            .context("Failed to call Docker inspect API")?;
 
         let mut mounts = Vec::new();
 

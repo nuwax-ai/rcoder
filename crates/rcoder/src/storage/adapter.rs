@@ -64,7 +64,7 @@ impl ProjectAdapter {
         // 如果有容器信息，先保存容器
         if let Some(container) = info.container() {
             debug!(
-                "插入项目容器信息: project_id={}, container_id={}, container_ip={}",
+                "Inserting project container info: project_id={}, container_id={}, container_ip={}",
                 project_id, container.container_id, container.container_ip
             );
             let container_record =
@@ -72,7 +72,7 @@ impl ProjectAdapter {
             self.storage.save_container(&container_record)?;
         } else {
             debug!(
-                " project container: project_id={}",
+                "No project container: project_id={}",
                 project_id
             );
         }
@@ -80,7 +80,7 @@ impl ProjectAdapter {
         // 保存项目记录
         let record = DataBridge::info_to_project_record(&info, &project_id);
         debug!(
-            "保存项目记录: project_id={}, session_id={:?}, container_id={}",
+            "Saving project record: project_id={}, session_id={:?}, container_id={}",
             record.project_id, record.session_id, record.container_id
         );
         self.storage.save_project(&record)?;
@@ -165,7 +165,7 @@ impl ProjectAdapter {
     ) -> Result<(), duckdb_manager::DuckDbError> {
         self.storage.update_session(project_id, session_id)?;
         debug!(
-            "更新会话: project_id={}, session_id={}",
+            "Updating session: project_id={}, session_id={}",
             project_id, session_id
         );
         Ok(())
@@ -181,7 +181,7 @@ impl ProjectAdapter {
         match self.storage.get_container_name_by_session(session_id) {
             Ok(container_name) => {
                 debug!(
-                    "通过会话ID获取容器名称: session_id={}, container_name={:?}",
+                    "Getting container name by session_id: session_id={}, container_name={:?}",
                     session_id, container_name
                 );
                 container_name

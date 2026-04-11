@@ -113,7 +113,7 @@ impl ServiceHealthChecker {
             Ok(Ok(response)) => {
                 let is_healthy = response.status().is_success();
                 debug!(
-                    "HTTP 健康检查 {}: status={}, healthy={}",
+                    "HTTP health check {}: status={}, healthy={}",
                     url,
                     response.status(),
                     is_healthy
@@ -198,7 +198,7 @@ impl ServiceHealthChecker {
 
         if !is_fully_healthy {
             warn!(
-                "⚠️ 服务健康检查：IP={}, HTTP={}, gRPC={}, 连续失败={}",
+                "Service health check: IP={}, HTTP={}, gRPC={}, consecutive_failures={}",
                 container_ip, http_healthy, grpc_healthy, consecutive_failures
             );
         }

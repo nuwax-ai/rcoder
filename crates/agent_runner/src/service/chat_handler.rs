@@ -154,7 +154,7 @@ pub async fn handle_chat_core(
     let request_id = input.request_id.clone();
 
     info!(
-        "[ChatHandler] 开始处理请求: project_id={}, session_id={:?}, prompt_len={}, has_model_config={}",
+        "[ChatHandler] Starting to process request: project_id={}, session_id={:?}, prompt_len={}, has_model_config={}",
         project_id,
         session_id,
         input.prompt.len(),
@@ -165,7 +165,7 @@ pub async fn handle_chat_core(
     // 优先通过 session_id 查找，回退到 project_id 查找
     let agent_info_ref = if let Some(ref sid) = session_id {
         info!(
-            "[ChatHandler] 通过 session_id 查找 Agent: session_id={}",
+            "[ChatHandler] Looking up Agent by session_id: session_id={}",
             sid
         );
         AGENT_REGISTRY.get_agent_info_by_session(sid)
@@ -175,7 +175,7 @@ pub async fn handle_chat_core(
 
     let agent_info_ref = agent_info_ref.or_else(|| {
         info!(
-            "[ChatHandler] 通过 project_id 查找 Agent: project_id={}",
+            "[ChatHandler] Looking up Agent by project_id: project_id={}",
             project_id
         );
         AGENT_REGISTRY.get_agent_info(&project_id)
@@ -186,7 +186,7 @@ pub async fn handle_chat_core(
     if let Some(agent_info) = agent_info_ref {
         if agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending {
             info!(
-                "[ChatHandler] Agent Busy，返回 9010 错误: project_id={}, status={:?}, session_id={:?}",
+                "[ChatHandler] Agent Busy, returning 9010 error: project_id={}, status={:?}, session_id={:?}",
                 project_id, agent_info.status, session_id
             );
             return ChatHandlerOutput::agent_busy(project_id, session_id);
@@ -208,7 +208,7 @@ pub async fn handle_chat_core(
 
         if !session_exists && SESSION_CACHE.remove(sid).is_some() {
             info!(
-                "[ChatHandler] session 不存在，移除无效 session: session_id={}",
+                "[ChatHandler] session does not exist, removing invalid session: session_id={}",
                 sid
             );
         } else if session_exists {
@@ -219,7 +219,7 @@ pub async fn handle_chat_core(
     // ========== 步骤5: 获取项目工作目录 ==========
     let project_dir = input.project_dir.clone();
     info!(
-        "[ChatHandler] 项目工作目录: {:?}, service_type={:?}",
+        "[ChatHandler] Project working directory: {:?}, service_type={:?}",
         project_dir, input.service_type
     );
 
@@ -309,7 +309,7 @@ pub async fn handle_chat_core(
             .insert(project_id.clone(), service_uuid_ref.to_string());
 
         info!(
-            "[ChatHandler] 已存储 API 配置: service_uuid={}, provider_name={}, base_url={}",
+            "[ChatHandler] Stored API config: service_uuid={}, provider_name={}, base_url={}",
             service_uuid_ref,
             provider.name,
             shared_types::mask_url(&provider.base_url)
@@ -380,7 +380,7 @@ pub async fn handle_chat_core(
             };
 
             info!(
-                "[ChatHandler] Chat 完成: success={}, session_id={}",
+                "[ChatHandler] Chat completed: success={}, session_id={}",
                 output.success, output.session_id
             );
 

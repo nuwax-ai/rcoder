@@ -66,7 +66,7 @@ impl MountProcessor {
         let mut host_path = host_path.as_ref().to_string();
 
         debug!(
-            "处理挂载点: {} -> {} (只读: {})",
+            "Processing mount point: {} -> {} (read_only: {})",
             container_path, host_path, read_only
         );
 
@@ -85,7 +85,7 @@ impl MountProcessor {
         let normalized_host_path = self.resolve_path(&host_path)?;
 
         info!(
-            "✅ 挂载点处理完成: {} -> {}",
+            "Mount point processing completed: {} -> {}",
             container_path, normalized_host_path
         );
 
@@ -150,7 +150,7 @@ impl MountProcessor {
         if container_absolute_path.starts_with("/app") {
             // 容器内路径：转换为宿主机路径
             debug!(
-                "检测到容器内路径，进行路径解析: {}",
+                "Detected container path, resolving to host path: {}",
                 container_absolute_path.display()
             );
             let host_abs_path = self
@@ -160,7 +160,7 @@ impl MountProcessor {
         } else {
             // 可能已经是宿主机路径，直接使用
             debug!(
-                "使用可能是宿主机的路径: {}",
+                "Using potential host path: {}",
                 container_absolute_path.display()
             );
             Ok(container_absolute_path.to_string_lossy().to_string())

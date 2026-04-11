@@ -190,7 +190,7 @@ pub async fn computer_desktop_vnc(
     }
 
     info!(
-        "🖥️ [DESKTOP_VNC] 获取 VNC 访问信息: user_id={}, project_id={}",
+        "🖥️ [DESKTOP_VNC] Getting VNC access info: user_id={}, project_id={}",
         user_id, project_id
     );
 
@@ -210,7 +210,7 @@ pub async fn computer_desktop_vnc(
     };
 
     info!(
-        "📦 [DESKTOP_VNC] 找到容器: container_id={}, ip={}",
+        "📦 [DESKTOP_VNC] Found container: container_id={}, ip={}",
         container_info.container_id, container_info.container_ip
     );
 
@@ -241,7 +241,7 @@ pub async fn computer_desktop_vnc(
     };
 
     info!(
-        "✅ [DESKTOP_VNC] VNC 访问信息已生成: user_id={}, proxy_vnc_url={}",
+        "✅ [DESKTOP_VNC] VNC access info generated: user_id={}, proxy_vnc_url={}",
         user_id, proxy_vnc_url
     );
 

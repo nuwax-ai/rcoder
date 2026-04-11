@@ -199,7 +199,7 @@ impl DockerManager {
         .await
         .map_err(|_| {
             DockerError::Timeout(format!(
-                "Docker API 调用超时 ({}秒): identifier={}",
+                "Docker API call timeout ({}s): identifier={}",
                 timeout.as_secs(),
                 identifier
             ))
@@ -224,7 +224,7 @@ impl DockerManager {
         // 这是必要的，因为容器可能被外部 stop 但未删除，导致 409 Conflict
         if let Ok(Some(result)) = self.find_container_realtime(&container_name).await {
             warn!(
-                "🔍 [CREATE] 发现同名容器: name={}, id={}, status={:?}, running={}",
+                "[CREATE] Found duplicate container: name={}, id={}, status={:?}, running={}",
                 result.container_name, result.container_id, result.status, result.is_running
             );
 
@@ -268,7 +268,7 @@ impl DockerManager {
                 ..Default::default()
             });
             debug!(
-                "📌 [DOCKER_MGR] 添加主挂载: {} -> {}",
+                "[DOCKER_MGR] Adding primary mount: {} -> {}",
                 config.host_path, config.container_path
             );
         } else {
@@ -389,7 +389,7 @@ impl DockerManager {
             );
 
             info!(
-                "🌐 [NETWORK] 容器 {} 连接到主网络: {}",
+                "[NETWORK] Container {} connecting to main network: {}",
                 container_name, network_name
             );
 
@@ -494,7 +494,7 @@ impl DockerManager {
             .await;
 
         info!(
-            "✅ 容器创建并启动成功: {} (ID: {}) - 已连接到网络 {}",
+            "Container created and started: {} (ID: {}) - connected to network {}",
             container_name, container_id, container_network_name
         );
 
@@ -514,7 +514,7 @@ impl DockerManager {
         timeout_seconds: u64,
     ) -> DockerResult<()> {
         info!(
-            "快速销毁容器: {} (超时: {}秒)",
+            "Quick destroy container: {} (timeout: {}s)",
             container_id, timeout_seconds
         );
 
@@ -664,7 +664,7 @@ impl DockerManager {
                         if clean_name == identifier {
                             let container_id = container.id.clone().unwrap_or_default();
                             info!(
-                                "通过 Docker API 找到容器: {} (ID: {})",
+                                "Found container via Docker API: {} (ID: {})",
                                 identifier, container_id
                             );
 
@@ -685,7 +685,7 @@ impl DockerManager {
                                 })
                             } else {
                                 warn!(
-                                    "⚠️ 容器缺少创建时间信息，使用当前时间作为备用: container_id={}",
+                                    "Container missing creation time info, using current time as fallback: container_id={}",
                                     container_id
                                 );
                                 Utc::now()
@@ -828,7 +828,7 @@ impl DockerManager {
                     .await;
 
                 info!(
-                    "✅ [REALTIME] 容器状态查询成功: id={}, name={}, status={:?}, running={}",
+                    "[REALTIME] Container status query succeeded: id={}, name={}, status={:?}, running={}",
                     container_id, container_name, result_arc.status, result_arc.is_running
                 );
 
@@ -843,14 +843,14 @@ impl DockerManager {
                 // 原因：容器可能刚被创建，缓存 404 会导致 SSE 连接时序问题
                 // 容器状态变化快，404 缓存收益小但风险大
                 debug!(
-                    "📭 [REALTIME] 容器不存在（不缓存 404）: identifier={}",
+                    "[REALTIME] Container does not exist (not caching 404): identifier={}",
                     identifier
                 );
                 None
             }
             Err(DockerError::Timeout(_)) => {
                 warn!(
-                    "[REALTIME] 查询超时，尝试从缓存获取: identifier={}",
+                    "[REALTIME] Query timeout, trying to get from cache: identifier={}",
                     identifier
                 );
                 // 超时时，尝试返回缓存中的旧值（如果有的话）
@@ -858,13 +858,13 @@ impl DockerManager {
                     return Ok(Some((*cached).clone()));
                 }
                 return Err(DockerError::Timeout(format!(
-                    "容器状态查询超时且无可用缓存: identifier={}",
+                    "Container status query timeout with no available cache: identifier={}",
                     identifier
                 )));
             }
             Err(e) => {
                 error!(
-                    "❌ [REALTIME] 查询容器状态失败: identifier={}, error={}",
+                    "[REALTIME] Query container status failed: identifier={}, error={}",
                     identifier, e
                 );
                 return Err(e);
@@ -904,7 +904,7 @@ impl DockerManager {
         container_name: &str,
     ) -> DockerResult<Option<DateTime<Utc>>> {
         debug!(
-            "🔍 [DOCKER_MGR] 查询容器创建时间: container_name={}",
+            "[DOCKER_MGR] Querying container creation time: container_name={}",
             container_name
         );
 
@@ -921,14 +921,14 @@ impl DockerManager {
                     ) {
                         Ok(created_time_utc) => {
                             debug!(
-                                "✅ [DOCKER_MGR] 容器创建时间: container_name={}, created={}",
+                                "[DOCKER_MGR] Container creation time: container_name={}, created={}",
                                 container_name, created_time_utc
                             );
                             Ok(Some(created_time_utc))
                         }
                         Err(e) => {
                             error!(
-                                "❌ [DOCKER_MGR] 解析容器创建时间失败: container_name={}, error={}",
+                                "[DOCKER_MGR] Failed to parse container creation time: container_name={}, error={}",
                                 container_name, e
                             );
                             Err(DockerError::InvalidTimestamp(e))
@@ -936,7 +936,7 @@ impl DockerManager {
                     }
                 } else {
                     warn!(
-                        "⚠️ [DOCKER_MGR] 容器创建时间字段为空: container_name={}",
+                        "[DOCKER_MGR] Container creation time field is empty: container_name={}",
                         container_name
                     );
                     Ok(None)
@@ -945,16 +945,16 @@ impl DockerManager {
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => {
-                // 容器不存在
+                // Container does not exist
                 debug!(
-                    "📭 [DOCKER_MGR] 容器不存在: container_name={}",
+                    "[DOCKER_MGR] Container does not exist: container_name={}",
                     container_name
                 );
                 Ok(None)
             }
             Err(e) => {
                 error!(
-                    "❌ [DOCKER_MGR] 查询容器信息失败: container_name={}, error={}",
+                    "[DOCKER_MGR] Query container info failed: container_name={}, error={}",
                     container_name, e
                 );
                 Err(DockerError::BollardError(e))
@@ -1042,7 +1042,7 @@ impl DockerManager {
         container_name: &str,
     ) -> DockerResult<Option<DockerContainerInfo>> {
         debug!(
-            "🔍 [DOCKER_MGR] 通过容器名称查询完整信息: container_name={}",
+            "[DOCKER_MGR] Querying full info by container name: container_name={}",
             container_name
         );
 
@@ -1055,7 +1055,7 @@ impl DockerManager {
                 // 解析容器 ID
                 let container_id = details
                     .id
-                    .ok_or_else(|| DockerError::ConfigurationError("容器 ID 为空".to_string()))?;
+                    .ok_or_else(|| DockerError::ConfigurationError("Container ID is empty".to_string()))?;
 
                 // 解析容器名称（去除前导斜杠）
                 let name = details
@@ -1084,7 +1084,7 @@ impl DockerManager {
                 let created_at = details
                     .created
                     .ok_or_else(|| {
-                        DockerError::InvalidTimestamp("容器缺少 created 字段".to_string())
+                        DockerError::InvalidTimestamp("Container missing created field".to_string())
                     })
                     .and_then(|s| {
                         Self::parse_rfc3339_timestamp(&s, "created")
@@ -1192,7 +1192,7 @@ impl DockerManager {
                 };
 
                 debug!(
-                    "✅ [DOCKER_MGR] 容器信息查询成功: name={}, id={}, status={:?}",
+                    "[DOCKER_MGR] Container info query succeeded: name={}, id={}, status={:?}",
                     info.container_name, info.container_id, info.status
                 );
 
@@ -1201,16 +1201,16 @@ impl DockerManager {
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => {
-                // 容器不存在
+                // Container does not exist
                 debug!(
-                    "📭 [DOCKER_MGR] 容器不存在: container_name={}",
+                    "[DOCKER_MGR] Container does not exist: container_name={}",
                     container_name
                 );
                 Ok(None)
             }
             Err(e) => {
                 error!(
-                    "❌ [DOCKER_MGR] 查询容器信息失败: container_name={}, error={}",
+                    "[DOCKER_MGR] Query container info failed: container_name={}, error={}",
                     container_name, e
                 );
                 Err(DockerError::BollardError(e))
@@ -1230,7 +1230,7 @@ impl DockerManager {
         request_resource_limits: Option<shared_types::ServiceResourceLimits>,
     ) -> DockerResult<ContainerBasicInfo> {
         info!(
-            "启动 Agent 容器: project_id={:?}, user_id={:?}, type={:?}, host_path={}",
+            "Starting Agent container: project_id={:?}, user_id={:?}, type={:?}, host_path={}",
             project_id, user_id, service_type, host_workspace_path
         );
 
@@ -1269,7 +1269,7 @@ impl DockerManager {
         } else {
             // 错误：至少需要提供 project_id 或 user_id 其中一个
             return Err(DockerError::ConfigurationError(
-                "必须提供 project_id 或 user_id 中的至少一个".to_string(),
+                "Must provide at least one of project_id or user_id".to_string(),
             ));
         };
 
@@ -1301,7 +1301,7 @@ impl DockerManager {
                 .container_path(container_work_path.clone());
 
             debug!(
-                "📌 [DOCKER_MANAGER] 主挂载: {} -> {}",
+                "📌 [DOCKER_MANAGER] Main mount: {} -> {}",
                 host_workspace_path, container_work_path
             );
         } else {
@@ -1402,7 +1402,7 @@ impl DockerManager {
                         {
                             Ok(host_base_path) => {
                                 info!(
-                                    "📁 [DOCKER_MGR] 从 {} 解析到宿主机路径: {}",
+                                    "[DOCKER_MGR] Resolved from {} to host path: {}",
                                     resolve_from_path,
                                     host_base_path.display()
                                 );
@@ -1413,7 +1413,7 @@ impl DockerManager {
                             }
                             Err(e) => {
                                 warn!(
-                                    "⚠️ [DOCKER_MGR] 无法解析路径 (resolve_from: {}): {}",
+                                    "[DOCKER_MGR] Unable to resolve path (resolve_from: {}): {}",
                                     resolve_from_path, e
                                 );
                                 None
@@ -1430,7 +1430,7 @@ impl DockerManager {
                 } else {
                     // 如果解析失败，跳过此挂载点
                     warn!(
-                        "⚠️ [DOCKER_MGR] 跳过挂载点 (无法解析 resolve_from): {}",
+                        "[DOCKER_MGR] Skipping mount point (unable to resolve resolve_from): {}",
                         mount_config.container_path
                     );
                     continue;
@@ -1443,7 +1443,7 @@ impl DockerManager {
             // 检查是否还有未替换的变量（如 {logs_host_path} 等）
             if resolved_host_path.contains('{') && resolved_host_path.contains('}') {
                 warn!(
-                    "⚠️ [DOCKER_MGR] 跳过挂载点 (host_path 包含未解析的变量): {}",
+                    "[DOCKER_MGR] Skipping mount point (host_path contains unresolved variables): {}",
                     resolved_host_path
                 );
                 continue;
@@ -1549,7 +1549,7 @@ impl DockerManager {
             info.user_id = user_id.map(|s| s.to_string());
             info.service_type = Some(service_type.clone());
             debug!(
-                "📝 [DOCKER_MGR] 更新容器元数据: container_id={}, user_id={:?}, service_type={:?}",
+                "📝 [DOCKER_MGR] Updating container metadata: container_id={}, user_id={:?}, service_type={:?}",
                 container_id, info.user_id, info.service_type
             );
             self.containers.insert(container_id.to_string(), info).await;
@@ -1604,7 +1604,7 @@ impl DockerManager {
             Ok(config) => config.container_prefix().to_string(),
             Err(e) => {
                 warn!(
-                    "⚠️ [FIND_CONTAINER] 获取服务配置失败，使用默认前缀: service_type={:?}, error={}",
+                    "⚠️ [FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
                     service_type, e
                 );
                 service_type.container_prefix().to_string()
@@ -1645,7 +1645,7 @@ impl DockerManager {
                     // 容器已被外部删除，清理内存映射并返回 None
                     // 这样上层调用者可以重新创建容器
                     warn!(
-                        "⚠️ [GET_AGENT_INFO] 容器已被外部删除，清理内存映射: project_id={}, container_id={}",
+                        "⚠️ [GET_AGENT_INFO] Container was externally deleted, cleaning up memory mapping: project_id={}, container_id={}",
                         project_id, container_info.container_id
                     );
                     self.containers.remove(project_id).await;
@@ -1660,7 +1660,7 @@ impl DockerManager {
             .get(&network_name)
             .cloned()
             .or_else(|| network_ips.values().next().cloned())
-            .ok_or_else(|| DockerError::ConnectionError("容器未连接到任何网络".to_string()))?;
+            .ok_or_else(|| DockerError::ConnectionError("Container not connected to any network".to_string()))?;
 
         // 3. 构建服务 URL (Agent 内部默认监听 8086)
         let server_url = format!("http://{}:8086", container_ip);
@@ -1771,7 +1771,7 @@ impl DockerManager {
             Ok(config) => config.container_prefix().to_string(),
             Err(e) => {
                 warn!(
-                    "⚠️ [FIND_CONTAINER] 获取服务配置失败，使用默认前缀: service_type={:?}, error={}",
+                    "⚠️ [FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
                     service_type, e
                 );
                 service_type.container_prefix().to_string()
@@ -1894,7 +1894,7 @@ impl DockerManager {
                     // 容器不存在，已从缓存中移除
                     removed_count += 1;
                     info!(
-                        "🧹 [SYNC] 容器已从缓存移除（Docker 中不存在）: project_id={}",
+                        "[SYNC] Container removed from cache (does not exist in Docker): project_id={}",
                         project_id
                     );
                 }
@@ -1941,12 +1941,12 @@ impl DockerManager {
 
                                 if health_status.is_fully_healthy() {
                                     debug!(
-                                        "✅ [SYNC] 服务健康: container_id={}, service_type={:?}",
+                                        "[SYNC] Service healthy: container_id={}, service_type={:?}",
                                         project_id, container_info.service_type
                                     );
                                 } else {
                                     warn!(
-                                        "⚠️ [SYNC] 服务不健康: container_id={}, service_type={:?}, http={}, grpc={}, failures={}",
+                                        "[SYNC] Service unhealthy: container_id={}, service_type={:?}, http={}, grpc={}, failures={}",
                                         project_id,
                                         container_info.service_type,
                                         health_status.http_healthy,
@@ -1960,7 +1960,7 @@ impl DockerManager {
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️ [SYNC] 检查容器状态失败: project_id={}, error={}",
+                        "[SYNC] Check container status failed: project_id={}, error={}",
                         project_id, e
                     );
                 }
@@ -1969,7 +1969,7 @@ impl DockerManager {
 
         if removed_count > 0 || health_checked_count > 0 {
             info!(
-                "🔄 [SYNC] 容器状态同步完成: 检查={}, 移除={}, 健康检查={}",
+                "[SYNC] Container status sync completed: checked={}, removed={}, health_checked={}",
                 total, removed_count, health_checked_count
             );
         }
@@ -2025,7 +2025,7 @@ impl DockerManager {
                         }
                         Err(e) => {
                             return Err(DockerError::ImagePullError(format!(
-                                "拉取镜像失败: {}",
+                                "Failed to pull image: {}",
                                 e
                             )));
                         }
@@ -2150,7 +2150,7 @@ impl DockerManager {
         {
             Ok(())
         } else {
-            Err(DockerError::ConnectionError("网络不存在".to_string()))
+            Err(DockerError::ConnectionError("Network does not exist".to_string()))
         }
     }
 
@@ -2212,7 +2212,7 @@ impl DockerManager {
         // 1.5 检查是否缓存了 None（空网络信息）
         if let Some(None) = self.api_cache.get_network(container_id).await {
             debug!(
-                "📭 [NETWORK] 缓存命中（空网络）: container_id={}",
+                "📭 [NETWORK] Cache hit (empty network): container_id={}",
                 container_id
             );
             return Ok(HashMap::new());
@@ -2228,7 +2228,7 @@ impl DockerManager {
             })) => {
                 // 容器不存在 - 缓存空 HashMap
                 debug!(
-                    "📭 [NETWORK] 容器不存在，缓存空网络: container_id={}",
+                    "📭 [NETWORK] Container does not exist, caching empty network: container_id={}",
                     container_id
                 );
                 self.api_cache
@@ -2238,7 +2238,7 @@ impl DockerManager {
             }
             Err(DockerError::Timeout(_)) => {
                 warn!(
-                    "[NETWORK] 查询超时，尝试从缓存获取: container_id={}",
+                    "[NETWORK] Query timeout, trying to get from cache: container_id={}",
                     container_id
                 );
                 // 超时时，尝试返回缓存中的旧值（如果有的话）
@@ -2246,7 +2246,7 @@ impl DockerManager {
                     return Ok((*cached).clone());
                 }
                 return Err(DockerError::Timeout(format!(
-                    "容器网络信息查询超时且无可用缓存: container_id={}",
+                    "Container network info query timeout and no available cache: container_id={}",
                     container_id
                 )));
             }
@@ -2304,13 +2304,13 @@ impl DockerManager {
                     Ok(())
                 }
                 Some(bollard::models::ContainerStateStatusEnum::EXITED) => {
-                    let error_msg = state.error.as_deref().unwrap_or("未知错误");
+                    let error_msg = state.error.as_deref().unwrap_or("unknown error");
                     error!(
-                        "❌ 容器 {} 已退出 (退出码: {}): {}",
+                        "Container {} exited (exit code: {}): {}",
                         container_id, exit_code, error_msg
                     );
                     Err(DockerError::ContainerStartError(format!(
-                        "容器启动后立即退出: {} (退出码: {}), 错误: {}",
+                        "Container exited immediately after startup: {} (exit code: {}), error: {}",
                         container_id, exit_code, error_msg
                     )))
                 }
@@ -2320,7 +2320,7 @@ impl DockerManager {
                         container_id
                     );
                     Err(DockerError::ContainerStartError(format!(
-                        "容器已创建但未启动: {}",
+                        "Container created but not started: {}",
                         container_id
                     )))
                 }
@@ -2331,14 +2331,14 @@ impl DockerManager {
                         container_id, status_str
                     );
                     Err(DockerError::ContainerStartError(format!(
-                        "容器处于未知状态: {} - {}",
+                        "Container in unknown state: {} - {}",
                         container_id, status_str
                     )))
                 }
                 None => {
                     error!("Container {} status is empty", container_id);
                     Err(DockerError::ContainerStartError(format!(
-                        "容器状态为空: {}",
+                        "Container status is empty: {}",
                         container_id
                     )))
                 }
@@ -2406,7 +2406,7 @@ impl DockerManager {
             .collect();
 
         info!(
-            "✅ 容器查找完成: 总数={}, 匹配数={} (已排除自身), pattern={}",
+            "Container lookup completed: total={}, matched={} (self excluded), pattern={}",
             containers.len(),
             matched_containers.len(),
             pattern
@@ -2464,7 +2464,7 @@ impl DockerManager {
         result.duration_ms = start_time.elapsed().as_millis() as u64;
 
         info!(
-            "🧹 容器批量清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
+            "Batch container cleanup completed: total={}, success={}, failed={}, duration={}ms",
             result.total_found,
             result.successfully_removed,
             result.failed_removals,
@@ -2628,7 +2628,7 @@ impl DockerManager {
             .collect();
 
         info!(
-            "🎯 找到 {} 个匹配的容器: pattern={}",
+            "Found {} matching containers: pattern={}",
             container_ids.len(),
             pattern
         );
@@ -2660,7 +2660,7 @@ impl DockerManager {
                             .is_some()
                         {
                             info!(
-                                "🧹 从内部映射中移除: project_id={}, container_id={}",
+                                "Removed from internal mapping: project_id={}, container_id={}",
                                 info.project_id, container_id
                             );
                         }
@@ -2728,7 +2728,7 @@ impl DockerManager {
         }
 
         Err(DockerError::ConnectionError(format!(
-            "当前容器 (hostname: {}) 没有网络配置信息",
+            "Current container (hostname: {}) has no network configuration information",
             hostname
         )))
     }

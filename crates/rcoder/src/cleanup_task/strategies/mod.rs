@@ -46,9 +46,9 @@ impl DestroyReason {
     /// 获取销毁原因的简短描述（用于日志）
     pub fn as_str(&self) -> &str {
         match self {
-            DestroyReason::IdleTimeout { .. } => "闲置超时",
-            DestroyReason::Orphaned { .. } => "孤立容器",
-            DestroyReason::ManualStop { .. } => "手动停止",
+            DestroyReason::IdleTimeout { .. } => "Idle timeout",
+            DestroyReason::Orphaned { .. } => "Orphaned container",
+            DestroyReason::ManualStop { .. } => "Manual stop",
         }
     }
 
@@ -60,7 +60,7 @@ impl DestroyReason {
                 timeout_secs,
             } => {
                 format!(
-                    "闲置超时 (闲置{}秒 / 超时{}秒)",
+                    "Idle timeout (idle {}s / timeout {}s)",
                     idle_duration_secs, timeout_secs
                 )
             }
@@ -69,7 +69,7 @@ impl DestroyReason {
                 was_protected,
             } => {
                 format!(
-                    "孤立容器 (创建于{}, 保护期:{})",
+                    "Orphaned container (created at {}, protected:{})",
                     created_at.format("%Y-%m-%d %H:%M:%S"),
                     was_protected
                 )

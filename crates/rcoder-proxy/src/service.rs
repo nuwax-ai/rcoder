@@ -471,7 +471,7 @@ impl ProxyHttp for PortProxy {
                 // 健康检查：代理到 Axum 的 /health 端点
                 // 这样既能验证 Pingora 正常运行，又能验证 Axum 正常运行
                 info!(
-                    "🏥 健康检查请求: {} - 代理到 Axum ({})",
+                    "🏥 Health check request: {} - proxying to Axum ({})",
                     path, self.default_backend_port
                 );
 
@@ -573,7 +573,7 @@ impl ProxyHttp for PortProxy {
         // 根据 peer 的 ALPN 配置推断协议
         let alpn_str = match peer.options.alpn {
             ALPN::H2 => "HTTP/2 (H2)",
-            ALPN::H2H1 => "HTTP/2 优先 (H2H1)",
+            ALPN::H2H1 => "HTTP/2 preferred (H2H1)",
             ALPN::H1 => "HTTP/1.1 (H1)",
             ALPN::Custom(_) => "Custom ALPN",
         };
@@ -583,12 +583,12 @@ impl ProxyHttp for PortProxy {
         let tls_info = digest
             .and_then(|d| d.ssl_digest.as_ref())
             .map(|ssl| format!("TLS {}", ssl.version))
-            .unwrap_or_else(|| "无 TLS".to_string());
+            .unwrap_or_else(|| "No TLS".to_string());
 
         // 只在 API 代理场景打印详细日志
         if ctx.upstream_host.is_some() {
             debug!(
-                "🔌 [API_PROXY] 连接建立: ALPN={}, {}, 复用={}",
+                "🔌 [API_PROXY] Connection established: ALPN={}, {}, reused={}",
                 alpn_str, tls_info, reused
             );
         }
@@ -626,18 +626,18 @@ impl ProxyHttp for PortProxy {
         // 日志记录
         if ctx.vnc_target_ip.is_some() {
             debug!(
-                "VNC 响应: {} (耗时: {:?})",
+                "VNC response: {} (duration: {:?})",
                 upstream_response.status, duration
             );
         } else if let Some(upstream_host) = &ctx.upstream_host {
             // 🔗 API 代理响应: 打印协议版本
             let http_ver = ctx.http_version.as_deref().unwrap_or("unknown");
-            let reused = if ctx.connection_reused { "是" } else { "否" };
+            let reused = if ctx.connection_reused { "yes" } else { "no" };
 
             if status_code >= 400 {
                 // ⚠️ 错误响应：提升到 WARN 级别，打印响应 headers
                 warn!(
-                    "❌ [API_PROXY] 上游错误响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
+                    "❌ [API_PROXY] Upstream error response: {} -> {} (protocol: {}, TLS: {}, reused: {}, duration: {:?})",
                     upstream_host,
                     upstream_response.status,
                     http_ver,
@@ -652,7 +652,7 @@ impl ProxyHttp for PortProxy {
                 }
             } else {
                 info!(
-                    "📡 [API_PROXY] 上游响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
+                    "📡 [API_PROXY] Upstream response: {} -> {} (protocol: {}, TLS: {}, reused: {}, duration: {:?})",
                     upstream_host,
                     upstream_response.status,
                     http_ver,
@@ -694,7 +694,7 @@ impl ProxyHttp for PortProxy {
                 if end_of_stream && !ctx.error_body_buf.is_empty() {
                     let body_str = String::from_utf8_lossy(&ctx.error_body_buf);
                     warn!(
-                        "❌ [API_PROXY] 上游错误响应体 (service={}, status={}): {}",
+                        "❌ [API_PROXY] Upstream error response body (service={}, status={}): {}",
                         service_name, status, body_str
                     );
                 }
@@ -755,7 +755,7 @@ impl PortProxy {
         };
 
         debug!(
-            "VNC 请求: user_id={}, project_id={}, target_path={}",
+            "VNC request: user_id={}, project_id={}, target_path={}",
             user_id, project_id, target_path
         );
 
@@ -904,7 +904,7 @@ impl PortProxy {
         ctx.upstream_host = Some(format!("{}:{}", container_ip, target_port));
 
         info!(
-            "🎵 [AUDIO] 音频代理: user_id={}, project_id={}, path={}, target={}:{}",
+            "🎵 [AUDIO] Audio proxy: user_id={}, project_id={}, path={}, target={}:{}",
             user_id, project_id, remaining_path, container_ip, target_port
         );
 
@@ -966,7 +966,7 @@ impl PortProxy {
         ctx.upstream_host = Some(format!("{}:{}", container_ip, IME_PORT));
 
         info!(
-            "⌨️ [IME] 输入法代理: user_id={}, project_id={}, path={}, target={}:{}",
+            "⌨️ [IME] IME proxy: user_id={}, project_id={}, path={}, target={}:{}",
             user_id, project_id, remaining_path, container_ip, IME_PORT
         );
 
@@ -1017,7 +1017,7 @@ impl PortProxy {
         ctx.api_service_name = Some(service_name.to_string());
 
         debug!(
-            "🔒 API 代理请求: service_name={}, api_path={}",
+            "🔒 API proxy request: service_name={}, api_path={}",
             service_name, api_path
         );
 
@@ -1026,7 +1026,7 @@ impl PortProxy {
             let method = upstream_request.method.as_str();
             let uri = original_uri.to_string();
             debug!(
-                "🔍 [API_PROXY_DEBUG] ====== 原始请求 ======\n  Method: {}\n  URI: {}",
+                "🔍 [API_PROXY_DEBUG] ====== Original request ======\n  Method: {}\n  URI: {}",
                 method, uri
             );
             for (name, value) in upstream_request.headers.iter() {
@@ -1046,7 +1046,7 @@ impl PortProxy {
         // 3. 从 ApiKeyManager 查询 API 密钥配置
         let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
             warn!(
-                "🔑 [API_PROXY] 找不到服务 '{}' 的 API 密钥配置",
+                "🔑 [API_PROXY] Cannot find API key config for service '{}'",
                 service_name
             );
             // 打印所有可用的 key 用于调试
@@ -1058,7 +1058,7 @@ impl PortProxy {
             warn!("🔑 [API_PROXY] available keys: {:?}", available_keys);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
                 format!(
-                    "找不到服务 {} 的 API 密钥配置，请确保已正确配置",
+                    "Cannot find API key config for service {}, please ensure it is properly configured",
                     service_name
                 ),
             )
@@ -1069,7 +1069,7 @@ impl PortProxy {
 
         // 🔍 [DEBUG] 打印完整的 ModelProviderConfig（脱敏）
         debug!(
-            "🔍 [API_PROXY_DEBUG] ====== DashMap 配置 (service={}) ======\n  base_url: {}\n  api_protocol: {:?}\n  requires_openai_auth: {}\n  api_key: {}",
+            "🔍 [API_PROXY_DEBUG] ====== DashMap config (service={}) ======\n  base_url: {}\n  api_protocol: {:?}\n  requires_openai_auth: {}\n  api_key: {}",
             service_name,
             base_url, // 不脱敏，debug 模式下需要完整 URL 排查
             config.api_protocol,
@@ -1099,7 +1099,7 @@ impl PortProxy {
         if use_anthropic_auth {
             upstream_request.insert_header("x-api-key", &config.api_key)?;
             info!(
-                "🔑 [API_PROXY] 已注入 Anthropic 格式 x-api-key: {} (api_protocol={:?})",
+                "🔑 [API_PROXY] Injected Anthropic format x-api-key: {} (api_protocol={:?})",
                 mask_header_value(&config.api_key),
                 config.api_protocol
             );
@@ -1107,7 +1107,7 @@ impl PortProxy {
             upstream_request
                 .insert_header("authorization", format!("Bearer {}", config.api_key))?;
             info!(
-                "🔑 [API_PROXY] 已注入 OpenAI 格式 Bearer: {} (api_protocol={:?})",
+                "🔑 [API_PROXY] Injected OpenAI format Bearer: {} (api_protocol={:?})",
                 mask_header_value(&config.api_key),
                 config.api_protocol
             );
@@ -1155,7 +1155,7 @@ impl PortProxy {
         // 对 URL 进行脱敏处理后输出日志
         let masked_url = mask_url(base_url);
         info!(
-            "✅ [API_PROXY] {} 请求已重写到: {}",
+            "✅ [API_PROXY] {} request rewritten to: {}",
             service_name, masked_url
         );
 
@@ -1319,7 +1319,7 @@ impl PortProxy {
         let project_id = params.get("project_id").unwrap_or("");
 
         debug!(
-            "VNC 代理请求: user_id={}, project_id={}",
+            "VNC proxy request: user_id={}, project_id={}",
             user_id, project_id
         );
 
@@ -1343,7 +1343,7 @@ impl PortProxy {
         ctx.vnc_target_ip = Some(container_ip.clone());
 
         debug!(
-            "VNC 代理: user_id={}, project_id={} -> {}:{}",
+            "VNC proxy: user_id={}, project_id={} -> {}:{}",
             user_id, project_id, container_ip, NOVNC_PORT
         );
 
@@ -1676,7 +1676,7 @@ impl PingoraProxyService {
         // 这个方法提供兼容性，但实际的代理由 Pingora 服务器处理
         // 在实际部署中，请求会直接发送到 Pingora 监听的端口
         Err(anyhow!(
-            "此方法仅用于兼容性。实际的代理功能由 Pingora 服务器处理，请直接请求 Pingora 监听的端口"
+            "This method is only for compatibility. Actual proxy functionality is handled by Pingora server, please directly request the port Pingora is listening on"
         ))
     }
 
@@ -1750,7 +1750,7 @@ impl PingoraProxyService {
         self.vnc_backends
             .insert(user_id.to_string(), container_ip.to_string());
         info!(
-            "添加 VNC 后端: user_id={} -> container_ip={}",
+            "Added VNC backend: user_id={} -> container_ip={}",
             user_id, container_ip
         );
     }

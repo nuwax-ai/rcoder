@@ -369,7 +369,7 @@ impl DockerConfig {
                 Ok(seconds) => self.container_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_CONTAINER_TTL '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_CONTAINER_TTL '{}': {}, using default",
                         val,
                         e
                     );
@@ -384,7 +384,7 @@ impl DockerConfig {
                 Ok(seconds) => self.api_timeout_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_API_TIMEOUT_SECONDS '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_API_TIMEOUT_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -399,7 +399,7 @@ impl DockerConfig {
                 Ok(seconds) => self.api_timeout_quick_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -414,7 +414,7 @@ impl DockerConfig {
                 Ok(seconds) => self.cache_status_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -429,7 +429,7 @@ impl DockerConfig {
                 Ok(seconds) => self.cache_network_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -440,11 +440,11 @@ impl DockerConfig {
         Ok(())
     }
 
-    /// 获取配置摘要信息
+    /// Get configuration summary
     pub fn get_summary(&self) -> String {
         format!(
-            "Docker配置: 网络模式={}, 网络基础名称={}, 工作目录={}, 自动清理={}, 容器TTL={}, API超时={}秒, 快速超时={}秒, 状态缓存={}秒, 网络缓存={}秒",
-            self.network_mode.as_deref().unwrap_or("默认"),
+            "Docker config: network_mode={}, network_base_name={}, work_dir={}, auto_cleanup={}, container_ttl={}, api_timeout={}s, quick_timeout={}s, status_cache={}s, network_cache={}s",
+            self.network_mode.as_deref().unwrap_or("default"),
             self.network_base_name.as_deref().unwrap_or("agent-network"),
             self.work_dir.as_deref().unwrap_or("/app"),
             self.auto_cleanup.unwrap_or(true),
@@ -541,7 +541,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     // 验证 API Key 配置
     if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {
         return Err(anyhow::anyhow!(
-            "API Key 鉴权已启用但 API Key 为空,请检查配置文件或环境变量"
+            "API Key authentication is enabled but API Key is empty, please check config file or environment variables"
         ));
     }
 
@@ -553,7 +553,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     }
 
     info!(
-        "最终配置: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
+        "Final config: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
         config.port,
         config.projects_dir,
         config.default_agent_id,
@@ -591,7 +591,7 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
             tracing::debug!("Multi-image config:");
             for (service_key, service_config) in &multi_config.services {
                 tracing::debug!(
-                    "  服务 '{}' 挂载配置 (共 {} 个):",
+                    "  Service '{}' mount config (total {} mounts):",
                     service_key,
                     service_config.mounts.len()
                 );

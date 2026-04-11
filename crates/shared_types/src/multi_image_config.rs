@@ -97,7 +97,7 @@ impl MultiImageConfig {
             && prefix.trim().is_empty()
         {
             return Err(ConfigError::ValidationError(
-                "镜像仓库前缀不能为空".to_string(),
+                "Image registry prefix cannot be empty".to_string(),
             ));
         }
 
@@ -105,13 +105,13 @@ impl MultiImageConfig {
         if self.cache_config.enabled {
             if self.cache_config.ttl_seconds == 0 {
                 return Err(ConfigError::ValidationError(
-                    "缓存过期时间必须大于0".to_string(),
+                    "Cache TTL must be greater than 0".to_string(),
                 ));
             }
 
             if self.cache_config.max_entries == 0 {
                 return Err(ConfigError::ValidationError(
-                    "最大缓存条目数必须大于0".to_string(),
+                    "Maximum cache entries must be greater than 0".to_string(),
                 ));
             }
         }
@@ -121,7 +121,7 @@ impl MultiImageConfig {
             // 验证服务名称一致性
             if service_config.service_type.to_string() != *service_key {
                 return Err(ConfigError::ValidationError(format!(
-                    "服务键 '{}'与服务类型 '{}' 不匹配",
+                    "Service key '{}' does not match service type '{}'",
                     service_key, service_config.service_type
                 )));
             }
@@ -136,7 +136,7 @@ impl MultiImageConfig {
                 }
                 crate::service_config::ConfigValidationResult::Error(error) => {
                     return Err(ConfigError::ValidationError(format!(
-                        "服务 '{}' 配置错误: {}",
+                        "Service '{}' config error: {}",
                         service_key, error
                     )));
                 }
@@ -147,7 +147,7 @@ impl MultiImageConfig {
         let enabled_services = self.list_enabled_services();
         if enabled_services.is_empty() {
             return Err(ConfigError::ValidationError(
-                "至少需要启用一个服务类型".to_string(),
+                "At least one service type must be enabled".to_string(),
             ));
         }
 
@@ -303,13 +303,13 @@ impl ProjectImageOverrides {
         for (service_type, image_name) in &self.images {
             if service_type.trim().is_empty() {
                 return Err(ConfigError::ValidationError(
-                    "服务类型名称不能为空".to_string(),
+                    "Service type name cannot be empty".to_string(),
                 ));
             }
 
             if image_name.trim().is_empty() {
                 return Err(ConfigError::ValidationError(format!(
-                    "服务类型 '{}' 的镜像名称不能为空",
+                    "Image name for service type '{}' cannot be empty",
                     service_type
                 )));
             }
@@ -319,7 +319,7 @@ impl ProjectImageOverrides {
         for service_type in &self.enabled_services {
             if service_type.trim().is_empty() {
                 return Err(ConfigError::ValidationError(
-                    "启用的服务类型名称不能为空".to_string(),
+                    "Enabled service type name cannot be empty".to_string(),
                 ));
             }
         }

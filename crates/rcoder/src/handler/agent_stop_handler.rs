@@ -65,7 +65,7 @@ async fn destroy_container_for_project(
     if container_info.is_none() {
         let expected_container_name = format!("rcoder-agent-{}", project_id);
         info!(
-            "🔍 [STOP_DESTROY] 通过 project_id 未找到缓存，尝试实时查找容器: {}",
+            "🔍 [STOP_DESTROY] Cache not found via project_id, trying real-time container lookup: {}",
             expected_container_name
         );
 
@@ -75,7 +75,7 @@ async fn destroy_container_for_project(
             .await
         {
             info!(
-                "🎯 [STOP_DESTROY] 实时查找到容器: container_id={}, name={}, status={:?}, running={}",
+                "🎯 [STOP_DESTROY] Real-time container found: container_id={}, name={}, status={:?}, running={}",
                 result.container_id, result.container_name, result.status, result.is_running
             );
 
@@ -96,7 +96,7 @@ async fn destroy_container_for_project(
             state.remove_project(project_id);
 
             info!(
-                "✅ [STOP_DESTROY] 容器销毁成功（实时查找）: project_id={}, container_id={}",
+                "✅ [STOP_DESTROY] Container destroyed successfully (real-time lookup): project_id={}, container_id={}",
                 project_id, result.container_id
             );
 
@@ -113,7 +113,7 @@ async fn destroy_container_for_project(
 
     if let Some(container_info) = container_info {
         info!(
-            "🎯 [STOP_DESTROY] 找到容器，开始销毁: project_id={}, container_id={}, container_name={}",
+            "🎯 [STOP_DESTROY] Container found, starting destruction: project_id={}, container_id={}, container_name={}",
             project_id, container_info.container_id, container_info.container_name
         );
 
@@ -136,7 +136,7 @@ async fn destroy_container_for_project(
         }
 
         info!(
-            "✅ [STOP_DESTROY] 容器销毁成功: project_id={}, container_id={}, container_name={}",
+            "✅ [STOP_DESTROY] Container destroyed successfully: project_id={}, container_id={}, container_name={}",
             project_id, container_info.container_id, container_info.container_name
         );
 
@@ -151,7 +151,7 @@ async fn destroy_container_for_project(
     } else {
         // 容器不存在，但返回成功
         info!(
-            "📭 [STOP_DESTROY] 容器不存在，无需销毁: project_id={}",
+            "📭 [STOP_DESTROY] Container does not exist, no need to destroy: project_id={}",
             project_id
         );
 

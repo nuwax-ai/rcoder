@@ -33,7 +33,7 @@ pub async fn start_cleanup_task(
         .await
         .map_err(|e| {
             tracing::error!(
-                "🚨 [CLEANUP_TASK] Failed to get DockerManager: {}，清理任务无法启动",
+                "🚨 [CLEANUP_TASK] Failed to get DockerManager: {}, cleanup task cannot start",
                 e
             );
             anyhow::anyhow!("Failed to get DockerManager: {}", e)

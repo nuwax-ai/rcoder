@@ -28,7 +28,7 @@ impl Default for ContainerSyncConfig {
 /// 如果不存在则从缓存中移除。
 pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::JoinHandle<()> {
     info!(
-        "🔄 [CONTAINER_SYNC] 启动容器状态同步任务: 间隔={}秒",
+        "🔄 [CONTAINER_SYNC] Starting container state sync task: interval={}s",
         config.sync_interval.as_secs()
     );
 
@@ -52,7 +52,7 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
                 Ok((checked, removed)) => {
                     if removed > 0 {
                         info!(
-                            "🔄 [CONTAINER_SYNC] 同步完成: 检查={}, 移除={}",
+                            "🔄 [CONTAINER_SYNC] Sync completed: checked={}, removed={}",
                             checked, removed
                         );
                     } else {

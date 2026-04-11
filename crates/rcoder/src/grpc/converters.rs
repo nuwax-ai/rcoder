@@ -147,7 +147,7 @@ pub fn from_grpc_progress_event(
         Some(ts) => ts,
         None => {
             warn!(
-                "⚠️ [CONVERTER] 无效的时间戳: session_id={}, timestamp={}, 使用当前时间",
+                "⚠️ [CONVERTER] Invalid timestamp: session_id={}, timestamp={}, using current time",
                 session_id, event.timestamp
             );
             Utc::now()
@@ -168,7 +168,7 @@ pub fn from_grpc_progress_event(
         Ok(data) => data,
         Err(e) => {
             warn!(
-                "⚠️ [CONVERTER] 解析 gRPC payload 失败: session_id={}, payload_preview={}, error={}",
+                "⚠️ [CONVERTER] Failed to parse gRPC payload: session_id={}, payload_preview={}, error={}",
                 session_id,
                 event.payload.chars().take(100).collect::<String>(),
                 e

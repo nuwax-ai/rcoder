@@ -133,7 +133,7 @@ pub async fn debug_sql_query(
             let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
             debug!(
-                "✅ [DEBUG_SQL] 查询成功: {} 行, {} ms",
+                "✅ [DEBUG_SQL] Query succeeded: {} rows, {} ms",
                 row_count, execution_time_ms
             );
 

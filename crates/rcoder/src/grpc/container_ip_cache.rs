@@ -48,12 +48,12 @@ impl ContainerIpCache {
 
         if let Some(ref ip) = result {
             debug!(
-                "✅ [IP_CACHE] 缓存命中: container_name={}, ip={}",
+                "✅ [IP_CACHE] Cache hit: container_name={}, ip={}",
                 container_name, ip
             );
         } else {
             debug!(
-                "❌ [IP_CACHE] 缓存未命中: container_name={}",
+                "❌ [IP_CACHE] Cache miss: container_name={}",
                 container_name
             );
         }
@@ -64,7 +64,7 @@ impl ContainerIpCache {
     /// 缓存 IP
     pub fn insert(&self, container_name: String, ip: String) {
         debug!(
-            "📝 [IP_CACHE] 写入缓存: container_name={}, ip={}",
+            "📝 [IP_CACHE] Cache write: container_name={}, ip={}",
             container_name, ip
         );
         self.cache.insert(container_name, ip);

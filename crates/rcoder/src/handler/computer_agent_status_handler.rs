@@ -112,7 +112,7 @@ pub async fn computer_agent_status(
     }
 
     info!(
-        "🔍 [COMPUTER_AGENT_STATUS] 查询 Agent 状态: user_id={}, project_id={}",
+        "🔍 [COMPUTER_AGENT_STATUS] Querying Agent status: user_id={}, project_id={}",
         request.user_id, request.project_id
     );
 
@@ -132,7 +132,7 @@ pub async fn computer_agent_status(
         Ok(Some(info)) => info,
         Ok(None) => {
             info!(
-                "📭 [COMPUTER_AGENT_STATUS] 容器不存在: user_id={}",
+                "📭 [COMPUTER_AGENT_STATUS] Container not found: user_id={}",
                 request.user_id
             );
             // Early return: 直接 move request 的字段
@@ -143,11 +143,11 @@ pub async fn computer_agent_status(
         }
         Err(e) => {
             error!(
-                "❌ [COMPUTER_AGENT_STATUS] 查询容器信息失败: user_id={}, error={}",
+                "❌ [COMPUTER_AGENT_STATUS] Failed to query container info: user_id={}, error={}",
                 request.user_id, e
             );
             return Err(AppError::internal_server_error(&format!(
-                "查询容器信息失败: {}",
+                "Failed to query container info: {}",
                 e
             )));
         }
@@ -156,7 +156,7 @@ pub async fn computer_agent_status(
     // 3. 检查容器是否运行中
     if container_info.status != "running" {
         info!(
-            "⚠️ [COMPUTER_AGENT_STATUS] 容器未运行: user_id={}, status={}",
+            "⚠️ [COMPUTER_AGENT_STATUS] Container not running: user_id={}, status={}",
             request.user_id, container_info.status
         );
         // Early return: 直接 move request 的字段
@@ -167,7 +167,7 @@ pub async fn computer_agent_status(
     }
 
     info!(
-        "✅ [COMPUTER_AGENT_STATUS] 容器运行中: container_id={}, container_ip={}",
+        "✅ [COMPUTER_AGENT_STATUS] Container running: container_id={}, container_ip={}",
         container_info.container_id, container_info.container_ip
     );
 
@@ -183,7 +183,7 @@ pub async fn computer_agent_status(
         Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
         Err(e) => {
             error!(
-                "❌ [COMPUTER_AGENT_STATUS] 获取容器 IP 失败: user_id={}, error={}",
+                "❌ [COMPUTER_AGENT_STATUS] Failed to get container IP: user_id={}, error={}",
                 request.user_id, e
             );
             // Early return: 直接 move request 的字段
@@ -195,7 +195,7 @@ pub async fn computer_agent_status(
     };
 
     debug!(
-        "📡 [COMPUTER_AGENT_STATUS] gRPC 地址: {}, project_id={}",
+        "📡 [COMPUTER_AGENT_STATUS] gRPC address: {}, project_id={}",
         grpc_addr, request.project_id
     );
 
@@ -212,7 +212,7 @@ pub async fn computer_agent_status(
         Ok(response) => response,
         Err(e) => {
             warn!(
-                "⚠️ [COMPUTER_AGENT_STATUS] gRPC GetStatus 调用失败: user_id={}, project_id={}, error={}",
+                "⚠️ [COMPUTER_AGENT_STATUS] gRPC GetStatus call failed: user_id={}, project_id={}, error={}",
                 request.user_id, request.project_id, e
             );
             // gRPC 调用失败视为 Agent 不存在
@@ -229,7 +229,7 @@ pub async fn computer_agent_status(
 
     if !is_alive {
         info!(
-            "📭 [COMPUTER_AGENT_STATUS] Agent 未启动: user_id={}, project_id={}, is_found={}",
+            "📭 [COMPUTER_AGENT_STATUS] Agent not started: user_id={}, project_id={}, is_found={}",
             request.user_id, request.project_id, grpc_response.is_found
         );
         return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
@@ -252,7 +252,7 @@ pub async fn computer_agent_status(
     } else {
         // DuckDB 中无记录，但 gRPC 确认 Agent 存在
         warn!(
-            "⚠️ [COMPUTER_AGENT_STATUS] Agent 存在但 DuckDB 无记录 (可能是服务重启导致状态丢失): user_id={}, project_id={}. 正在尝试自愈(Self-Healing)...",
+            "⚠️ [COMPUTER_AGENT_STATUS] Agent exists but no DuckDB record (may be due to service restart causing state loss): user_id={}, project_id={}. Attempting self-healing...",
             request.user_id, request.project_id
         );
 
@@ -279,7 +279,7 @@ pub async fn computer_agent_status(
         state.insert_project(request.project_id.clone(), Arc::new(project_info.clone()));
 
         info!(
-            "🔄 [COMPUTER_AGENT_STATUS] ✅ 状态自愈成功: 已恢复项目记录 project_id={}, user_id={}",
+            "🔄 [COMPUTER_AGENT_STATUS] ✅ Self-healing succeeded: restored project record project_id={}, user_id={}",
             request.project_id, request.user_id
         );
 
@@ -296,7 +296,7 @@ pub async fn computer_agent_status(
     };
 
     info!(
-        "✅ [COMPUTER_AGENT_STATUS] Agent 状态查询完成: user_id={}, project_id={}, is_alive={}, status={}",
+        "✅ [COMPUTER_AGENT_STATUS] Agent status query completed: user_id={}, project_id={}, is_alive={}, status={}",
         request.user_id,
         request.project_id,
         response.is_alive,
@@ -348,7 +348,7 @@ async fn call_grpc_get_status_with_retry(
                     Ok(response) => {
                         let grpc_response = response.into_inner();
                         debug!(
-                            "✅ [GRPC_GET_STATUS] 第 {} 次尝试成功: project_id={}, status={}, is_found={}",
+                            "✅ [GRPC_GET_STATUS] Attempt {} succeeded: project_id={}, status={}, is_found={}",
                             attempt, project_id, grpc_response.status, grpc_response.is_found
                         );
                         return Ok(grpc_response);
@@ -365,7 +365,7 @@ async fn call_grpc_get_status_with_retry(
 
                         if should_retry && attempt < max_retries {
                             warn!(
-                                "⚠️ [GRPC_GET_STATUS] 第 {} 次尝试失败（可重试）: project_id={}, code={:?}, error={}",
+                                "⚠️ [GRPC_GET_STATUS] Attempt {} failed (retryable): project_id={}, code={:?}, error={}",
                                 attempt,
                                 project_id,
                                 e.code(),
@@ -381,7 +381,7 @@ async fn call_grpc_get_status_with_retry(
                             continue;
                         } else {
                             error!(
-                                "❌ [GRPC_GET_STATUS] 第 {} 次尝试失败（不可重试或已达最大重试次数）: project_id={}, code={:?}, error={}",
+                                "❌ [GRPC_GET_STATUS] Attempt {} failed (non-retryable or max retries reached): project_id={}, code={:?}, error={}",
                                 attempt,
                                 project_id,
                                 e.code(),
@@ -394,7 +394,7 @@ async fn call_grpc_get_status_with_retry(
             }
             Err(e) => {
                 warn!(
-                    "⚠️ [GRPC_GET_STATUS] 第 {} 次获取 gRPC 客户端失败: error={}",
+                    "⚠️ [GRPC_GET_STATUS] Attempt {} to get gRPC client failed: error={}",
                     attempt, e
                 );
                 last_error = Some(e);

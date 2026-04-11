@@ -35,7 +35,7 @@ impl LogCleaner {
         // 检查目录是否存在
         if !log_path.exists() {
             debug!(
-                "📋 [log_cleaner] 日志目录不存在，跳过清理: {}",
+                "📋 [log_cleaner] Log directory does not exist, skipping cleanup: {}",
                 self.log_dir
             );
             return Ok(LogCleanupStats::default());
@@ -51,7 +51,7 @@ impl LogCleaner {
         }
 
         info!(
-            "🧹 [log_cleaner] 开始清理日志目录: {}, 保留期限: {} 天",
+            "🧹 [log_cleaner] Starting log directory cleanup: {}, retention: {} days",
             self.log_dir,
             self.retention_duration.as_secs() / 86400
         );
@@ -149,7 +149,7 @@ impl LogCleaner {
 
         if stats.files_deleted > 0 || stats.dirs_deleted > 0 {
             info!(
-                "✅ [log_cleaner] 日志清理完成: 删除 {} 个文件, {} 个目录, 释放 {:.2} MB",
+                "✅ [log_cleaner] Log cleanup completed: deleted {} files, {} dirs, freed {:.2} MB",
                 stats.files_deleted,
                 stats.dirs_deleted,
                 stats.bytes_freed as f64 / 1024.0 / 1024.0
@@ -189,12 +189,12 @@ impl LogCleanupStats {
     /// 获取格式化的统计摘要
     pub fn summary(&self) -> String {
         if self.files_deleted == 0 && self.dirs_deleted == 0 && self.failed_deletions == 0 {
-            "无过期日志".to_string()
+            "No expired logs".to_string()
         } else {
             let mut parts = Vec::new();
             if self.files_deleted > 0 {
                 parts.push(format!(
-                    "删除: {} 个文件, 释放: {:.2} MB",
+                    "Deleted: {} files, freed: {:.2} MB",
                     self.files_deleted,
                     self.bytes_freed as f64 / 1024.0 / 1024.0
                 ));

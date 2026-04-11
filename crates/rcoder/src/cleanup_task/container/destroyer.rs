@@ -53,7 +53,7 @@ impl ContainerDestroyer {
         reason: &DestroyReason,
     ) -> Result<()> {
         info!(
-            "🔥 [destroyer] 开始销毁容器: container_name={}, service_type={:?}, identifier={}, 原因={}",
+            "🔥 [destroyer] Starting container destruction: container_name={}, service_type={:?}, identifier={}, reason={}",
             container_name,
             service_type,
             container_identifier,
@@ -72,7 +72,7 @@ impl ContainerDestroyer {
         {
             Ok(Some(result)) => {
                 debug!(
-                    "✅ [destroyer] 找到容器: name={}, id={}",
+                    "✅ [destroyer] Found container: name={}, id={}",
                     container_name, result.container_id
                 );
                 result.container_id
@@ -80,7 +80,7 @@ impl ContainerDestroyer {
             Ok(None) => {
                 // 容器不存在，可能已经被删除了，这不是错误
                 info!(
-                    "⚠️ [destroyer] 容器不存在，可能已被删除: name={}",
+                    "⚠️ [destroyer] Container does not exist, may have been deleted: name={}",
                     container_name
                 );
                 return Ok(());
@@ -88,7 +88,7 @@ impl ContainerDestroyer {
             Err(e) => {
                 // 查询出错，返回错误
                 return Err(anyhow::anyhow!(
-                    "查询容器信息失败: name={}, error={}",
+                    "Failed to query container info: name={}, error={}",
                     container_name,
                     e
                 ));
@@ -109,7 +109,7 @@ impl ContainerDestroyer {
             .remove_container_cache(container_identifier)
             .await;
         debug!(
-            "🧹 [destroyer] 已清理 DockerManager 内存缓存: identifier={}",
+            "🧹 [destroyer] DockerManager memory cache cleaned: identifier={}",
             container_identifier
         );
 
@@ -131,7 +131,7 @@ impl ContainerDestroyer {
         }
 
         info!(
-            "✅ [destroyer] 容器销毁完成: container_name={}, actual_id={}, 原因={}",
+            "✅ [destroyer] Container destruction completed: container_name={}, actual_id={}, reason={}",
             container_name,
             actual_container_id,
             reason.as_str()

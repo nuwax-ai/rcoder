@@ -49,19 +49,19 @@ impl ProxyConfig {
     /// 验证配置的有效性
     pub fn validate(&self) -> Result<(), String> {
         if self.listen_port == 0 {
-            return Err("监听端口不能为 0".to_string());
+            return Err("Listen port cannot be 0".to_string());
         }
 
         if self.default_backend_port == 0 {
-            return Err("默认后端端口不能为 0".to_string());
+            return Err("Default backend port cannot be 0".to_string());
         }
 
         if self.backend_host.is_empty() {
-            return Err("后端主机地址不能为空".to_string());
+            return Err("Backend host address cannot be empty".to_string());
         }
 
         if self.port_param.is_empty() {
-            return Err("端口参数名不能为空".to_string());
+            return Err("Port parameter name cannot be empty".to_string());
         }
 
         Ok(())

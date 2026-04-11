@@ -66,7 +66,7 @@ impl HostPathResolver {
 
         if mounts.is_empty() {
             return Err(DockerError::ConfigurationError(
-                "未检测到任何挂载点，请检查是否在容器内运行，并确保 docker-compose.yml 中配置了 volume 挂载".to_string()
+                "No mount points detected, check if running inside container and ensure docker-compose.yml has volume mounts configured".to_string()
             ));
         }
 
@@ -79,7 +79,7 @@ impl HostPathResolver {
         all_mounts.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
 
         info!(
-            "📁 [HostPathResolver] 缓存 {} 个挂载点（按路径长度降序）:",
+            "[HostPathResolver] Cached {} mount points (sorted by path length descending):",
             all_mounts.len()
         );
         for (idx, (cp, hp)) in all_mounts.iter().enumerate() {
@@ -102,7 +102,7 @@ impl HostPathResolver {
         let (container_workspace, host_workspace) = default_workspace.clone();
 
         info!(
-            "✅ [HostPathResolver] 默认工作空间: {} (host) -> {} (container)",
+            "[HostPathResolver] Default workspace: {} (host) -> {} (container)",
             host_workspace.display(),
             container_workspace.display()
         );
@@ -161,7 +161,7 @@ impl HostPathResolver {
                 let host_path = mount_host.join(relative_path);
 
                 debug!(
-                    "✅ 从挂载点解析: {} -> {} (mount: {} -> {})",
+                    "Resolved from mount point: {} -> {} (mount: {} -> {})",
                     container_path.display(),
                     host_path.display(),
                     mount_container.display(),
@@ -204,13 +204,13 @@ impl HostPathResolver {
     pub fn validate(&self) -> DockerResult<()> {
         if !self.host_project_workspace.is_absolute() {
             return Err(DockerError::ConfigurationError(
-                "宿主机工作空间必须是绝对路径".to_string(),
+                "Host workspace must be an absolute path".to_string(),
             ));
         }
 
         if !self.container_project_workspace.is_absolute() {
             return Err(DockerError::ConfigurationError(
-                "容器工作空间必须是绝对路径".to_string(),
+                "Container workspace must be an absolute path".to_string(),
             ));
         }
 

@@ -100,7 +100,7 @@ pub async fn computer_agent_stop(
     let project_id = request.project_id.clone();
 
     info!(
-        "🛑 [COMPUTER_STOP] 开始停止 Agent: user_id={}, project_id={}, session_id={:?}",
+        "🛑 [COMPUTER_STOP] Starting to stop Agent: user_id={}, project_id={}, session_id={:?}",
         user_id, project_id, request.session_id
     );
 
@@ -120,13 +120,13 @@ pub async fn computer_agent_stop(
     };
 
     info!(
-        "📦 [COMPUTER_STOP] 找到容器: container_id={}, ip={}",
+        "📦 [COMPUTER_STOP] Container found: container_id={}, ip={}",
         container_info.container_id, container_info.container_ip
     );
 
     // 3. 通过 gRPC 调用 StopAgent RPC
     info!(
-        "🔄 [COMPUTER_STOP] 准备调用 StopAgent RPC: project_id={}",
+        "🔄 [COMPUTER_STOP] Preparing to call StopAgent RPC: project_id={}",
         project_id
     );
 
@@ -142,7 +142,7 @@ pub async fn computer_agent_stop(
         request
             .session_id
             .clone()
-            .or_else(|| Some("用户请求停止".to_string())),
+            .or_else(|| Some("User requested stop".to_string())),
         false, // force=false，优雅停止
     )
     .await
@@ -155,7 +155,7 @@ pub async fn computer_agent_stop(
 
             if response.success {
                 let message = format!(
-                    "Agent {} 已成功停止，容器 {} 继续运行",
+                    "Agent {} stopped successfully, container {} continues running",
                     project_id, container_info.container_id
                 );
 
@@ -167,7 +167,7 @@ pub async fn computer_agent_stop(
                 };
 
                 info!(
-                    "✅ [COMPUTER_STOP] Agent 停止完成: user_id={}, project_id={}",
+                    "✅ [COMPUTER_STOP] Agent stop completed: user_id={}, project_id={}",
                     user_id, project_id
                 );
                 return Ok(HttpResult::success(stop_response));
@@ -186,7 +186,7 @@ pub async fn computer_agent_stop(
                     }
                     "already_stopped" => {
                         info!(
-                            "ℹ️ [COMPUTER_STOP] Agent 已经处于停止状态: project_id={}",
+                            "ℹ️ [COMPUTER_STOP] Agent already in stopped state: project_id={}",
                             project_id
                         );
                         let message =
@@ -200,7 +200,7 @@ pub async fn computer_agent_stop(
                         return Ok(HttpResult::success(stop_response));
                     }
                     "error" => {
-                        let err_msg = response.message.unwrap_or_else(|| "未知错误".to_string());
+                        let err_msg = response.message.unwrap_or_else(|| "Unknown error".to_string());
                         error!("[COMPUTER_STOP] Agent stoppedfailed: {}", err_msg);
                         return Ok(HttpResult::error_with_locale(
                             shared_types::error_codes::ERR_STOP_FAILED,
@@ -222,7 +222,7 @@ pub async fn computer_agent_stop(
         }
         Err(e) => {
             error!(
-                "❌ [COMPUTER_STOP] 调用 StopAgent RPC 失败: {}, project_id={}",
+                "❌ [COMPUTER_STOP] StopAgent RPC call failed: {}, project_id={}",
                 e, project_id
             );
             return Ok(HttpResult::error_with_locale(

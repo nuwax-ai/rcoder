@@ -147,7 +147,7 @@ impl ConfigWatcher {
                 // 记录配置变更
                 if old_enabled != new_enabled {
                     info!(
-                        "🔄 [CONFIG_WATCHER] API Key 鉴权状态已更新: {} -> {}",
+                        "🔄 [CONFIG_WATCHER] API Key auth status updated: {} -> {}",
                         old_enabled, new_enabled
                     );
                 }

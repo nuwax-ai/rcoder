@@ -98,7 +98,7 @@ pub async fn startup_cleanup_containers(
     pattern: &str,
 ) -> DockerResult<CleanupResult> {
     info!(
-        "🧹 [STARTUP_CLEANUP] startingcleanupcontainer: pattern={}",
+        "[STARTUP_CLEANUP] Starting cleanup container: pattern={}",
         pattern
     );
     let start_time = Instant::now();
@@ -159,7 +159,7 @@ pub async fn startup_cleanup_containers(
                     successfully_removed += 1;
                     removed_container_ids.push(container_id.clone());
                     info!(
-                        "✅ [STARTUP_CLEANUP] 容器清理成功: container_id={}, name={}",
+                        "[STARTUP_CLEANUP] Container cleanup succeeded: container_id={}, name={}",
                         container_id, container_name
                     );
                 }
@@ -167,7 +167,7 @@ pub async fn startup_cleanup_containers(
                     // 检查是否为409冲突错误
                     if is_409_conflict_error(&e) {
                         info!(
-                            "🔄 [STARTUP_CLEANUP] 容器已在删除中，跳过: container_id={}, name={}",
+                            "[STARTUP_CLEANUP] Container already being removed, skipping: container_id={}, name={}",
                             container_id, container_name
                         );
                         // 409错误不计入失败统计
@@ -176,7 +176,7 @@ pub async fn startup_cleanup_containers(
                     } else {
                         failed_removals += 1;
                         warn!(
-                            "⚠️ [STARTUP_CLEANUP] 容器清理失败: container_id={}, name={}, error={}",
+                            "[STARTUP_CLEANUP] Container cleanup failed: container_id={}, name={}, error={}",
                             container_id, container_name, e
                         );
                         failed_removals_details.push(ContainerRemovalFailure {
@@ -193,7 +193,7 @@ pub async fn startup_cleanup_containers(
     let duration_ms = start_time.elapsed().as_millis() as u64;
 
     info!(
-        "🎯 [STARTUP_CLEANUP] 清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
+        "[STARTUP_CLEANUP] Cleanup completed: total={}, success={}, failed={}, duration={}ms",
         total_found, successfully_removed, failed_removals, duration_ms
     );
 
@@ -288,21 +288,21 @@ pub async fn runtime_cleanup_container(
     container_id: &str,
 ) -> DockerResult<()> {
     info!(
-        "🔥 [RUNTIME_CLEANUP] 开始停止容器: container_id={}",
+        "[RUNTIME_CLEANUP] Starting to stop container: container_id={}",
         container_id
     );
 
     match stop_container_runtime_mode(docker_manager, container_id).await {
         Ok(_) => {
             info!(
-                "✅ [RUNTIME_CLEANUP] 容器停止成功: container_id={}",
+                "[RUNTIME_CLEANUP] Container stop succeeded: container_id={}",
                 container_id
             );
             Ok(())
         }
         Err(e) => {
             warn!(
-                "⚠️ [RUNTIME_CLEANUP] 容器停止失败: container_id={}, error={}",
+                "[RUNTIME_CLEANUP] Container stop failed: container_id={}, error={}",
                 container_id, e
             );
             Err(e)
@@ -350,7 +350,7 @@ pub async fn runtime_cleanup_containers(
     container_ids: Vec<String>,
 ) -> DockerResult<CleanupResult> {
     info!(
-        "🔥 [RUNTIME_CLEANUP] 开始批量清理容器: 数量={}",
+        "[RUNTIME_CLEANUP] Starting batch container cleanup: count={}",
         container_ids.len()
     );
     let start_time = Instant::now();
@@ -382,14 +382,14 @@ pub async fn runtime_cleanup_containers(
                     successfully_removed += 1;
                     removed_container_ids.push(container_id.clone());
                     info!(
-                        "✅ [RUNTIME_CLEANUP] 容器清理成功: container_id={}",
+                        "[RUNTIME_CLEANUP] Container cleanup succeeded: container_id={}",
                         container_id
                     );
                 }
                 Err(e) => {
                     failed_removals += 1;
                     warn!(
-                        "⚠️ [RUNTIME_CLEANUP] 容器清理失败: container_id={}, error={}",
+                        "[RUNTIME_CLEANUP] Container cleanup failed: container_id={}, error={}",
                         container_id, e
                     );
                     failed_removals_details.push(ContainerRemovalFailure {
@@ -405,7 +405,7 @@ pub async fn runtime_cleanup_containers(
     let duration_ms = start_time.elapsed().as_millis() as u64;
 
     info!(
-        "🎯 [RUNTIME_CLEANUP] 批量清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
+        "[RUNTIME_CLEANUP] Batch cleanup completed: total={}, success={}, failed={}, duration={}ms",
         total_found, successfully_removed, failed_removals, duration_ms
     );
 
@@ -481,7 +481,7 @@ pub fn get_container_patterns_for_enabled_services(
             let prefix = config.container_prefix();
             let pattern = format!("{}-*", prefix);
             tracing::debug!(
-                "🔍 [CLEANUP_PATTERN] 服务类型: {:?}, 使用前缀: {}, 模式: {}",
+                "🔍 [CLEANUP_PATTERN] Service type: {:?}, using prefix: {}, pattern: {}",
                 config.service_type,
                 prefix,
                 pattern
@@ -583,7 +583,7 @@ pub async fn startup_cleanup_all_enabled_services(
     aggregated_result.duration_ms = start_time.elapsed().as_millis() as u64;
 
     info!(
-        "🎯 [MULTI_SERVICE_CLEANUP] 多服务清理完成: 总数={}, 成功={}, 失败={}, 耗时={}ms",
+        "[MULTI_SERVICE_CLEANUP] Multi-service cleanup completed: total={}, success={}, failed={}, duration={}ms",
         aggregated_result.total_found,
         aggregated_result.successfully_removed,
         aggregated_result.failed_removals,

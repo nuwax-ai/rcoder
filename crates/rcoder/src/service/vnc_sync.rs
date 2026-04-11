@@ -39,7 +39,7 @@ pub fn start_vnc_sync_task(
     config: VncSyncConfig,
 ) -> tokio::task::JoinHandle<()> {
     info!(
-        "🔄 [VNC_SYNC] 启动 VNC 后端同步任务: 间隔={}秒",
+        "🔄 [VNC_SYNC] Starting VNC backend sync task: interval={}s",
         config.sync_interval.as_secs()
     );
 
@@ -91,7 +91,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
         let user_id = container_info.container_key();
         if user_id.is_empty() {
             debug!(
-                "⏭️ [VNC_SYNC] 跳过无业务标识的容器: {}",
+                "⏭️ [VNC_SYNC] Skipping container without business identifier: {}",
                 container_info.container_name
             );
             continue;
@@ -100,7 +100,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
         // 检查容器是否在运行
         if container_info.status.to_string().to_lowercase() != "running" {
             debug!(
-                "⏭️ [VNC_SYNC] 跳过非运行状态容器: {} (status={})",
+                "⏭️ [VNC_SYNC] Skipping non-running container: {} (status={})",
                 container_info.container_name,
                 container_info.status.to_string()
             );
@@ -115,14 +115,14 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
             Ok(Some(ip)) => ip,
             Ok(None) => {
                 warn!(
-                    "⚠️ [VNC_SYNC] 容器 {} 没有 IP 地址",
+                    "⚠️ [VNC_SYNC] Container {} has no IP address",
                     container_info.container_name
                 );
                 continue;
             }
             Err(e) => {
                 error!(
-                    "❌ [VNC_SYNC] 获取容器 {} IP 失败: {}",
+                    "❌ [VNC_SYNC] Failed to get container {} IP: {}",
                     container_info.container_name, e
                 );
                 continue;
@@ -138,7 +138,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
             Some(existing_ip) => {
                 // IP 变化了，需要更新
                 debug!(
-                    "🔄 [VNC_SYNC] 容器 IP 变化: user_id={}, old={}, new={}",
+                    "🔄 [VNC_SYNC] Container IP changed: user_id={}, old={}, new={}",
                     user_id, existing_ip, container_ip
                 );
                 true
@@ -146,7 +146,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
             None => {
                 // 新容器，需要添加
                 debug!(
-                    "➕ [VNC_SYNC] 新容器映射: user_id={} -> {}",
+                    "➕ [VNC_SYNC] New container mapping: user_id={} -> {}",
                     user_id, container_ip
                 );
                 true
@@ -162,7 +162,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
 
     if updated_count > 0 {
         info!(
-            "🔄 [VNC_SYNC] 同步完成: 检查={}, 更新={}",
+            "🔄 [VNC_SYNC] Sync completed: checked={}, updated={}",
             synced_count, updated_count
         );
     } else if synced_count > 0 {
@@ -206,7 +206,7 @@ pub async fn sync_single_vnc_backend(
 ) {
     pingora_service.add_vnc_backend(user_id, container_ip);
     debug!(
-        "➕ [VNC_SYNC] 单容器映射更新: user_id={} -> {}",
+        "➕ [VNC_SYNC] Single container mapping updated: user_id={} -> {}",
         user_id, container_ip
     );
 }

@@ -72,7 +72,7 @@ impl<'a> PendingGuard<'a> {
     pub fn new(registry: &'a AgentSessionRegistry, project_id: &str) -> Self {
         registry.set_pending(project_id);
         debug!(
-            "🛡️ [PendingGuard] 创建并设置 Pending 状态: project_id={}",
+            "🛡️ [PendingGuard] Created and set Pending status: project_id={}",
             project_id
         );
         Self {
@@ -277,12 +277,12 @@ impl AgentSessionRegistry {
 
         if let Some(ref old_sid) = old_session_id {
             info!(
-                "🔄 [Registry] Session 更新: project={}, {} → {}",
+                "🔄 [Registry] Session updated: project={}, {} → {}",
                 project_id, old_sid, new_session_id
             );
         } else {
             info!(
-                "🆕 [Registry] Session 新建: project={}, session={}",
+                "🆕 [Registry] Session created: project={}, session={}",
                 project_id, new_session_id
             );
         }
@@ -331,13 +331,13 @@ impl AgentSessionRegistry {
                 let info = entry.get_mut();
                 if f(info) {
                     debug!(
-                        "[Registry] 原子性更新 agent_info 成功: project={}",
+                        "[Registry] Atomic update agent_info succeeded: project={}",
                         project_id
                     );
                     true
                 } else {
                     debug!(
-                        "[Registry] agent_info 无需更新（条件不满足）: project={}",
+                        "[Registry] agent_info no update needed (condition not met): project={}",
                         project_id
                     );
                     false
@@ -345,7 +345,7 @@ impl AgentSessionRegistry {
             }
             Entry::Vacant(_) => {
                 debug!(
-                    "[Registry] agent_info 不存在，无法更新: project={}",
+                    "[Registry] agent_info does not exist, cannot update: project={}",
                     project_id
                 );
                 false
@@ -509,7 +509,7 @@ impl AgentSessionRegistry {
         use dashmap::mapref::entry::Entry;
 
         info!(
-            "🔍 [Registry] remove_by_project 开始: project_id={}",
+            "🔍 [Registry] remove_by_project started: project_id={}",
             project_id
         );
 
@@ -533,7 +533,7 @@ impl AgentSessionRegistry {
 
         // 移除 agent_info
         info!(
-            "🔍 [Registry] 准备移除 agent_info_map, project_id={}, 当前 map 长度={}",
+            "🔍 [Registry] Preparing to remove agent_info_map, project_id={}, current map length={}",
             project_id,
             self.agent_info_map.len()
         );
@@ -541,7 +541,7 @@ impl AgentSessionRegistry {
         // 检查 key 是否存在
         let key_exists = self.agent_info_map.contains_key(project_id);
         info!(
-            "🔍 [Registry] agent_info_map key 存在检查: project_id={}, exists={}",
+            "🔍 [Registry] agent_info_map key existence check: project_id={}, exists={}",
             project_id, key_exists
         );
 
@@ -569,7 +569,7 @@ impl AgentSessionRegistry {
         }
 
         info!(
-            "🔍 [Registry] remove_by_project 完成: project_id={}",
+            "🔍 [Registry] remove_by_project completed: project_id={}",
             project_id
         );
         removed

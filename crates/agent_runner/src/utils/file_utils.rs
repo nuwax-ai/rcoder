@@ -94,7 +94,7 @@ impl FileUtils {
     pub async fn read_file_as_base64(&self, file_path: &Path) -> Result<String> {
         self.validate_file_size(file_path).await?;
 
-        let content = fs::read(file_path).await.context("读取文件失败")?;
+        let content = fs::read(file_path).await.context("Failed to read file")?;
 
         Ok(general_purpose::STANDARD.encode(content))
     }
@@ -105,7 +105,7 @@ impl FileUtils {
 
         let content = fs::read_to_string(file_path)
             .await
-            .context("读取文本文件失败")?;
+            .context("Failed to read text file")?;
 
         Ok(content)
     }

@@ -217,7 +217,7 @@ impl ContainerConfigBuilder {
         };
 
         debug!(
-            "✅ 容器配置构建完成: image={}, network={:?}, mounts={}",
+            "Container config built: image={}, network={:?}, mounts={}",
             config.image,
             config.network_name,
             config.extra_mounts.len()

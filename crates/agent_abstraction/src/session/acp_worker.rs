@@ -94,7 +94,7 @@ where
             assembler.apply_user_prompt(&agent_id, &request.prompt_message.content);
 
         info!(
-            "📝 提示词处理 - 系统提示词: has_override={}, length={} | 用户提示词: has_template={}, original_len={}, final_len={}",
+            "📝 Prompt processing - System prompt: has_override={}, length={} | User prompt: has_template={}, original_len={}, final_len={}",
             assembler.has_system_prompt_override(),
             system_prompt.len(),
             assembler.has_user_prompt_template_override(),
@@ -103,13 +103,13 @@ where
         );
 
         debug!(
-            "📝 系统提示词: has_override={}, length={}, content={}",
+            "📝 System prompt: has_override={}, length={}, content={}",
             assembler.has_system_prompt_override(),
             system_prompt.len(),
             system_prompt
         );
         debug!(
-            "📝 用户提示词: has_template={}, original_len={}, final_len={}, final_content={}",
+            "📝 User prompt: has_template={}, original_len={}, final_len={}, final_content={}",
             assembler.has_user_prompt_template_override(),
             request.prompt_message.content.len(),
             final_user_prompt.len(),
@@ -119,7 +119,7 @@ where
         // 获取 MCP 服务器配置（入参有值则使用入参，否则使用默认配置）
         let context_servers = assembler.get_context_servers();
         debug!(
-            "🔌 MCP 服务器配置: has_override={}, count={}",
+            "🔌 MCP server config: has_override={}, count={}",
             assembler.has_agent_config_override(),
             context_servers.len()
         );
@@ -138,7 +138,7 @@ where
         if let Some(ref override_config) = request.prompt_message.agent_config_override {
             if let Some(ref agent_server) = override_config.agent_server {
                 debug!(
-                    "📝 使用用户指定的 Agent 服务器配置: command={:?}, args={:?}",
+                    "📝 Using user-specified Agent server config: command={:?}, args={:?}",
                     agent_server.command, agent_server.args
                 );
                 start_config = start_config.with_agent_server_override(agent_server.clone());
@@ -170,7 +170,7 @@ where
                 start_config = start_config.with_resume_session_id(session_id.clone());
             } else {
                 warn!(
-                    "⚠️ Session 文件不存在，跳过 resume，将创建新会话: session_id={}",
+                    "⚠️ Session file does not exist, skipping resume, will create new session: session_id={}",
                     session_id
                 );
                 // 不设置 resume_session_id，Agent 将创建新会话
@@ -200,7 +200,7 @@ where
 
         // 使用 SessionEntry trait 方法访问会话信息
         info!(
-            "✅ 会话已准备，session_id: {}, is_new: {}",
+            "✅ Session ready, session_id: {}, is_new: {}",
             session_entry.session_id(),
             is_new
         );

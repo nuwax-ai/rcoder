@@ -582,7 +582,7 @@ async fn forward_computer_request_to_container(
         Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
         Err(e) => {
             warn!(
-                "⚠️ [COMPUTER_FORWARD] 实时 IP 解析失败: {}, 尝试从 service_url 提取",
+                "⚠️ [COMPUTER_FORWARD] Real-time IP resolution failed: {}, trying to extract from service_url",
                 e
             );
             match extract_grpc_addr_with_port(
@@ -602,7 +602,7 @@ async fn forward_computer_request_to_container(
     };
 
     debug!(
-        "📡 [COMPUTER_FORWARD] gRPC 地址: {}, prompt_len={}, attachments={}",
+        "📡 [COMPUTER_FORWARD] gRPC address: {}, prompt_len={}, attachments={}",
         grpc_addr,
         request.prompt.len(),
         request.attachments.len()
@@ -645,20 +645,20 @@ async fn forward_computer_request_to_container(
                 if grpc_response.success {
                     let chat_response = crate::grpc::grpc_response_to_chat_response(grpc_response);
                     info!(
-                        "✅ [COMPUTER_FORWARD] gRPC 响应成功: project_id={}, session_id={}",
+                        "✅ [COMPUTER_FORWARD] gRPC response success: project_id={}, session_id={}",
                         chat_response.project_id, chat_response.session_id
                     );
                     return HttpResult::success(chat_response);
                 } else {
                     let error_msg = grpc_response
                         .error
-                        .unwrap_or_else(|| "未知错误".to_string());
+                        .unwrap_or_else(|| "Unknown error".to_string());
                     // 🎯 从 gRPC 响应中提取错误码（完整透传）
                     let error_code = grpc_response
                         .error_code
                         .unwrap_or_else(|| shared_types::error_codes::ERR_AGENT_ERROR.to_string());
                     error!(
-                        "❌ [COMPUTER_FORWARD] gRPC 响应错误: code={}, message={}",
+                        "❌ [COMPUTER_FORWARD] gRPC response error: code={}, message={}",
                         error_code, error_msg
                     );
                     return HttpResult::error(&error_code, &error_msg);
@@ -666,7 +666,7 @@ async fn forward_computer_request_to_container(
             }
             Err(e) => {
                 warn!(
-                    "⚠️ [COMPUTER_FORWARD] gRPC 调用失败 (第 {}/{} 次): {}",
+                    "⚠️ [COMPUTER_FORWARD] gRPC call failed (attempt {}/{}): {}",
                     attempt, max_retries, e
                 );
 
@@ -674,7 +674,7 @@ async fn forward_computer_request_to_container(
 
                 if should_retry && attempt < max_retries {
                     info!(
-                        "🔄 [COMPUTER_FORWARD] 检测到可重试错误，从连接池移除 {} 并重试...",
+                        "🔄 [COMPUTER_FORWARD] Detected retryable error, removing {} from connection pool and retrying...",
                         grpc_addr
                     );
                     grpc_pool.remove(&grpc_addr);
@@ -697,7 +697,7 @@ async fn forward_computer_request_to_container(
     // 所有重试都失败
     if let Some(e) = last_error {
         error!(
-            "❌ [COMPUTER_FORWARD] gRPC 最终调用失败: {}, user_id={}, project_id={}",
+            "❌ [COMPUTER_FORWARD] gRPC final call failed: {}, user_id={}, project_id={}",
             e, request.user_id, project_id
         );
 
@@ -720,7 +720,7 @@ async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Res
     let project_workspace_path = std::path::PathBuf::from(project_dir(user_id, project_id));
 
     debug!(
-        "📁 [COMPUTER_CHAT] 确保项目工作目录存在: {:?}",
+        "📁 [COMPUTER_CHAT] Ensuring project workspace directory exists: {:?}",
         project_workspace_path
     );
 
@@ -771,13 +771,13 @@ fn ensure_project_mapping_in_state(
         if let Some(existing_container) = existing_project.container() {
             if existing_container.container_id != container_info.container_id {
                 info!(
-                    "🔄 [COMPUTER_CHAT] 检测到容器变更: project_id={}, old_cid={}, new_cid={}",
+                    "🔄 [COMPUTER_CHAT] Detected container change: project_id={}, old_cid={}, new_cid={}",
                     project_id, existing_container.container_id, container_info.container_id
                 );
                 // 容器变更，继续执行后续的插入/更新逻辑（insert_project 会执行 upsert）
             } else {
                 debug!(
-                    "🔄 [COMPUTER_CHAT] DuckDB 记录已存在且容器未变: project_id={}",
+                    "🔄 [COMPUTER_CHAT] DuckDB record already exists and container unchanged: project_id={}",
                     project_id
                 );
                 return Ok(());
@@ -805,7 +805,7 @@ fn ensure_project_mapping_in_state(
     state.insert_project(project_id.to_string(), Arc::new(project_info));
 
     info!(
-        "🆕 [COMPUTER_CHAT] 已插入 DuckDB 记录（容器创建后立即）: user_id={}, project_id={}, container_id={}",
+        "🆕 [COMPUTER_CHAT] Inserted DuckDB record (immediately after container creation): user_id={}, project_id={}, container_id={}",
         user_id, project_id, container_info.container_id
     );
 

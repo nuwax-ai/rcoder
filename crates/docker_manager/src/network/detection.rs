@@ -68,7 +68,7 @@ impl<'a> NetworkDetector<'a> {
         }
 
         Err(DockerError::ConnectionError(format!(
-            "当前容器 (hostname: {}) 没有网络配置信息",
+            "Current container (hostname: {}) has no network configuration information",
             hostname
         )))
     }

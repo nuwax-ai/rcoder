@@ -62,7 +62,7 @@ impl CachedDockerResolver {
             .build();
 
         info!(
-            "🔧 [VNC_RESOLVER] 创建 CachedDockerResolver: TTL={}s",
+            "🔧 [VNC_RESOLVER] Creating CachedDockerResolver: TTL={}s",
             ttl.as_secs()
         );
 
@@ -84,7 +84,7 @@ impl CachedDockerResolver {
             .await
             .map_err(|e| {
                 warn!(
-                    "⚠️ [VNC_RESOLVER] 查询容器信息失败: user_id={}, error={}",
+                    "⚠️ [VNC_RESOLVER] Failed to query container info: user_id={}, error={}",
                     user_id, e
                 );
                 VncResolveError::QueryFailed(format!("failed to query container info: {}", e))
@@ -98,7 +98,7 @@ impl CachedDockerResolver {
         let is_running = container_info.status.to_lowercase() == "running";
         if !is_running {
             warn!(
-                "⚠️ [VNC_RESOLVER] 容器未运行: user_id={}, status={}",
+                "⚠️ [VNC_RESOLVER] Container not running: user_id={}, status={}",
                 user_id, container_info.status
             );
         }
@@ -110,7 +110,7 @@ impl CachedDockerResolver {
         );
 
         debug!(
-            "✅ [VNC_RESOLVER] 解析成功: user_id={} -> {}:{} (running={})",
+            "✅ [VNC_RESOLVER] Resolution successful: user_id={} -> {}:{} (running={})",
             user_id, info.container_ip, info.vnc_port, info.is_running
         );
 
@@ -124,7 +124,7 @@ impl VncBackendResolver for CachedDockerResolver {
         // 先尝试从缓存获取
         if let Some(cached) = self.cache.get(user_id).await {
             debug!(
-                "🎯 [VNC_RESOLVER] 缓存命中: user_id={} -> {}",
+                "🎯 [VNC_RESOLVER] Cache hit: user_id={} -> {}",
                 user_id, cached.container_ip
             );
             return Ok(cached);
@@ -132,7 +132,7 @@ impl VncBackendResolver for CachedDockerResolver {
 
         // 缓存未命中，查询 Docker
         debug!(
-            "🔍 [VNC_RESOLVER] 缓存未命中，查询 Docker: user_id={}",
+            "🔍 [VNC_RESOLVER] Cache miss, querying Docker: user_id={}",
             user_id
         );
         let info = self.query_docker(user_id).await?;

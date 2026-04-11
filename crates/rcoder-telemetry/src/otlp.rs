@@ -42,7 +42,7 @@ pub async fn init_tracer_provider(
     use opentelemetry_sdk::Resource;
 
     info!(
-        "🔧 [OTLP] 初始化 TracerProvider: endpoint={}, grpc={}, sample_rate={}",
+        "🔧 [OTLP] Initializing TracerProvider: endpoint={}, grpc={}, sample_rate={}",
         config.endpoint, config.use_grpc, config.sample_rate
     );
 

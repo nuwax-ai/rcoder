@@ -93,7 +93,7 @@ impl ComputerContainerManager {
                         .await
                     {
                         warn!(
-                            "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (继续创建新容器): {}",
+                            "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (will create new container anyway): {}",
                             e
                         );
                     }

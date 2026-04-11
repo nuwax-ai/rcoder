@@ -156,7 +156,7 @@ impl ServiceImageConfig {
             && self.default_image.is_none()
         {
             return ConfigValidationResult::Error(format!(
-                "服务类型 {} 必须至少配置一个镜像",
+                "Service type {} must have at least one image configured",
                 self.service_type
             ));
         }
@@ -171,7 +171,7 @@ impl ServiceImageConfig {
             if let Some(image) = image_name {
                 if image.trim().is_empty() {
                     return ConfigValidationResult::Warning(format!(
-                        "服务类型 {} 包含空的镜像名称",
+                        "Service type {} has empty image name",
                         self.service_type
                     ));
                 }
@@ -182,7 +182,7 @@ impl ServiceImageConfig {
                     .all(|c: char| c.is_alphanumeric() || "/:.-_".contains(c))
                 {
                     return ConfigValidationResult::Warning(format!(
-                        "服务类型 {} 的镜像名称 '{}' 可能包含无效字符",
+                        "Service type {} image name '{}' may contain invalid characters",
                         self.service_type, image
                     ));
                 }
@@ -193,14 +193,14 @@ impl ServiceImageConfig {
         for mount in &self.mounts {
             if mount.container_path.trim().is_empty() {
                 return ConfigValidationResult::Error(format!(
-                    "服务类型 {} 包含空的容器挂载路径",
+                    "Service type {} has empty container mount path",
                     self.service_type
                 ));
             }
 
             if mount.host_path.trim().is_empty() {
                 return ConfigValidationResult::Error(format!(
-                    "服务类型 {} 包含空的宿主机挂载路径",
+                    "Service type {} has empty host mount path",
                     self.service_type
                 ));
             }
@@ -208,7 +208,7 @@ impl ServiceImageConfig {
             // 验证挂载类型
             if mount.mount_type != "bind" && mount.mount_type != "volume" {
                 return ConfigValidationResult::Warning(format!(
-                    "服务类型 {} 包含不支持的挂载类型 '{}'",
+                    "Service type {} has unsupported mount type '{}'",
                     self.service_type, mount.mount_type
                 ));
             }
@@ -251,7 +251,7 @@ impl ServiceImageConfig {
     /// 获取挂载点的字符串表示
     pub fn get_mounts_description(&self) -> String {
         if self.mounts.is_empty() {
-            return "无挂载点".to_string();
+            return "No mount points".to_string();
         }
 
         self.mounts
@@ -332,11 +332,11 @@ impl ServiceMountConfig {
     /// 验证挂载点配置
     pub fn validate(&self) -> ConfigValidationResult {
         if self.container_path.trim().is_empty() {
-            return ConfigValidationResult::Error("容器挂载路径不能为空".to_string());
+            return ConfigValidationResult::Error("Container mount path cannot be empty".to_string());
         }
 
         if self.host_path.trim().is_empty() {
-            return ConfigValidationResult::Error("宿主机挂载路径不能为空".to_string());
+            return ConfigValidationResult::Error("Host mount path cannot be empty".to_string());
         }
 
         // 验证路径格式
@@ -347,14 +347,14 @@ impl ServiceMountConfig {
                 .all(|c: char| c.is_alphanumeric() || "/-_.".contains(c))
         {
             return ConfigValidationResult::Warning(format!(
-                "容器挂载路径 '{}' 可能包含无效字符",
+                "Container mount path '{}' may contain invalid characters",
                 self.container_path
             ));
         }
 
         if self.mount_type != "bind" && self.mount_type != "volume" {
             return ConfigValidationResult::Error(format!(
-                "不支持的挂载类型 '{}'，必须为 'bind' 或 'volume'",
+                "Unsupported mount type '{}', must be 'bind' or 'volume'",
                 self.mount_type
             ));
         }

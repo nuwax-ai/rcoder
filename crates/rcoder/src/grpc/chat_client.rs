@@ -106,7 +106,7 @@ pub async fn grpc_cancel_session_with_pool(
     project_id: String,
 ) -> anyhow::Result<CancelResponse> {
     info!(
-        "🛑 [gRPC_CANCEL] 发送取消会话请求 (连接池): addr={}, session_id={}, project_id={}",
+        "🛑 [gRPC_CANCEL] Sending cancel session request (connection pool): addr={}, session_id={}, project_id={}",
         grpc_addr, session_id, project_id
     );
 
@@ -162,7 +162,7 @@ pub async fn grpc_stop_agent_with_pool(
     force: bool,
 ) -> anyhow::Result<shared_types::grpc::StopAgentResponse> {
     info!(
-        "🔄 [gRPC_STOP_AGENT] 发送停止 Agent 请求 (连接池): addr={}, project_id={}, force={}",
+        "🔄 [gRPC_STOP_AGENT] Sending stop Agent request (connection pool): addr={}, project_id={}, force={}",
         grpc_addr, project_id, force
     );
 

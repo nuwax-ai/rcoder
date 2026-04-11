@@ -65,7 +65,7 @@ impl CleanupStats {
     /// 获取格式化的统计摘要
     pub fn summary(&self) -> String {
         format!(
-            "总计清理: {}, 成功: {}, 失败: {}, 容器销毁: {}, 成功率: {:.1}%",
+            "Total cleanup: {}, success: {}, failed: {}, containers destroyed: {}, success rate: {:.1}%",
             self.total_cleaned,
             self.success_cleaned,
             self.failed_cleaned,

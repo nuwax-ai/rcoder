@@ -102,7 +102,7 @@ impl ReaperState {
                     reaped_now += 1;
                     if self.config.verbose {
                         debug!(
-                            "[ProcessReaper] 回收子进程 PID={}, exit_status={:?}",
+                            "[ProcessReaper] Reaped child process PID={}, exit_status={:?}",
                             pid, status
                         );
                     }

@@ -12,24 +12,24 @@ use tracing::{error, info, warn};
 #[command(about = "AI-powered development platform")]
 #[command(version)]
 pub struct CliArgs {
-    /// 服务端口
-    #[arg(short, long, help = "服务端口")]
+    /// Service port
+    #[arg(short, long, help = "Service port")]
     pub port: Option<u16>,
 
-    /// 项目工作目录
-    #[arg(short = 'd', long, help = "项目工作的根目录")]
+    /// Project workspace directory
+    #[arg(short = 'd', long, help = "Root directory for project workspace")]
     pub projects_dir: Option<PathBuf>,
 
-    /// 启用反向代理
-    #[arg(long, help = "启用基于端口的反向代理")]
+    /// Enable port-based reverse proxy
+    #[arg(long, help = "Enable port-based reverse proxy")]
     pub enable_proxy: bool,
 
-    /// 代理监听端口
-    #[arg(long, help = "代理服务监听端口")]
+    /// Proxy listener port
+    #[arg(long, help = "Proxy service listener port")]
     pub proxy_port: Option<u16>,
 
-    /// 默认后端端口
-    #[arg(long, help = "默认后端服务端口")]
+    /// Default backend port
+    #[arg(long, help = "Default backend service port")]
     pub default_backend_port: Option<u16>,
 }
 
@@ -117,7 +117,7 @@ impl AgentConcurrencyConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.concurrency_limit < Self::MIN_CONCURRENCY_LIMIT {
             return Err(format!(
-                "concurrency_limit 必须 >= {}，当前值: {}",
+                "concurrency_limit must be >= {}, current value: {}",
                 Self::MIN_CONCURRENCY_LIMIT,
                 self.concurrency_limit
             ));
@@ -244,7 +244,7 @@ impl AgentCleanupConfig {
             || self.idle_timeout_secs > Self::MAX_IDLE_TIMEOUT
         {
             return Err(format!(
-                "idle_timeout_secs 必须在 {} 到 {} 之间，当前值: {}",
+                "idle_timeout_secs must be between {} and {}, current value: {}",
                 Self::MIN_IDLE_TIMEOUT,
                 Self::MAX_IDLE_TIMEOUT,
                 self.idle_timeout_secs
@@ -255,7 +255,7 @@ impl AgentCleanupConfig {
             || self.cleanup_interval_secs > Self::MAX_CLEANUP_INTERVAL
         {
             return Err(format!(
-                "cleanup_interval_secs 必须在 {} 到 {} 之间，当前值: {}",
+                "cleanup_interval_secs must be between {} and {}, current value: {}",
                 Self::MIN_CLEANUP_INTERVAL,
                 Self::MAX_CLEANUP_INTERVAL,
                 self.cleanup_interval_secs

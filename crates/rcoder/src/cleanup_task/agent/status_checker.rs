@@ -65,7 +65,7 @@ impl AgentStatusChecker {
         let status = response.into_inner();
 
         debug!(
-            "📊 [status_checker] 容器状态: is_active={}, active_tasks={}",
+            "📊 [status_checker] Container status: is_active={}, active_tasks={}",
             status.is_active, status.active_tasks
         );
 

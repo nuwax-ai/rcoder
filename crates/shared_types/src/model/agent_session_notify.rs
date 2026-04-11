@@ -195,11 +195,11 @@ fn stop_reason_to_string(reason: &StopReason) -> String {
 /// 获取 StopReason 的描述
 fn stop_reason_to_description(reason: &StopReason) -> &'static str {
     match reason {
-        StopReason::EndTurn => "正常结束",
-        StopReason::MaxTokens => "达到最大令牌数限制",
-        StopReason::MaxTurnRequests => "达到最大请求数限制",
-        StopReason::Refusal => "代理拒绝继续",
-        StopReason::Cancelled => "用户取消",
+        StopReason::EndTurn => "Normal end",
+        StopReason::MaxTokens => "Max token limit reached",
+        StopReason::MaxTurnRequests => "Max turn request limit reached",
+        StopReason::Refusal => "Agent refused to continue",
+        StopReason::Cancelled => "User cancelled",
         // 处理未来可能添加的新停止原因
         _ => "unknown",
     }

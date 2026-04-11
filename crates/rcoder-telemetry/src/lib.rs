@@ -182,7 +182,7 @@ pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         config.service_name
     );
     info!(
-        "✅ [Telemetry] 遥测系统初始化完成: OTLP={}, Prometheus={}, FileLog={}, Console=true",
+        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, Console=true",
         tracer_provider.is_some(),
         prometheus_handle.is_some(),
         config.file_log.is_some()

@@ -51,8 +51,8 @@ impl ServiceType {
     /// 获取服务类型的描述
     pub fn description(&self) -> &str {
         match self {
-            ServiceType::RCoder => "标准 RCoder 服务，提供完整的 AI 开发功能",
-            ServiceType::ComputerAgentRunner => "Computer Agent Runner 服务，专注于代理运行和执行",
+            ServiceType::RCoder => "Standard RCoder service, providing full AI development functionality",
+            ServiceType::ComputerAgentRunner => "Computer Agent Runner service, focused on agent execution",
         }
     }
 

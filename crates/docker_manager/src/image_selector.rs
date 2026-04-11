@@ -53,7 +53,7 @@ impl ImageSelector {
             .await?;
 
         info!(
-            "选择镜像: {} (服务: {}, 平台: {})",
+            "Selected image: {} (service: {}, platform: {})",
             image_name, service_type, self.platform
         );
 
@@ -91,19 +91,19 @@ impl ImageSelector {
     pub fn is_service_enabled(&self, service_type: &ServiceType) -> bool {
         let service_key = service_type.to_string();
         info!(
-            "🔍 [IMAGE_SELECTOR] 检查服务是否启用: service_type={:?}, service_key={}",
+            "[IMAGE_SELECTOR] Checking if service is enabled: service_type={:?}, service_key={}",
             service_type, service_key
         );
 
         if let Some(service_config) = self.config.services.get(&service_key) {
             info!(
-                "✅ [IMAGE_SELECTOR] 服务已找到: enabled={}, arm64_image={:?}",
+                "[IMAGE_SELECTOR] Service found: enabled={}, arm64_image={:?}",
                 service_config.enabled, service_config.arm64_image
             );
             service_config.enabled
         } else {
             warn!(
-                "❌ [IMAGE_SELECTOR] 服务类型 '{}' 未在配置中找到，可用服务: {:?}",
+                "[IMAGE_SELECTOR] Service type '{}' not found in config, available services: {:?}",
                 service_key,
                 self.config.services.keys().collect::<Vec<_>>()
             );
@@ -148,7 +148,7 @@ impl ImageSelector {
 
         // 3. 配置错误：不应该发生，因为默认配置已经设置了镜像
         Err(DockerError::ConfigurationError(format!(
-            "服务类型 '{}' 没有可用的镜像配置，请检查配置文件",
+            "Service type '{}' has no available image config, please check the configuration file",
             service_key
         )))
     }

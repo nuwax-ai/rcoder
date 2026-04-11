@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting rcoder - AI-powered development platform");
     info!(
-        "📋 日志配置: 保留 {} 天的日志文件",
+        "📋 Log config: keeping log files for {} days",
         config.cleanup_config.log_cleanup.log_retention_days
     );
 
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(resolver) => {
                 info!("path resolver initialized successfully");
                 info!(
-                    "  容器内工作目录: {:?}",
+                    "  Container workspace: {:?}",
                     resolver.container_workspace_base()
                 );
                 info!(
@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
             default_config.network_base_name = network_base_name.clone();
         } else {
             info!(
-                "⚠️ 配置中无 network_base_name，使用默认值: {}",
+                "⚠️ No network_base_name in config, using default: {}",
                 default_config.network_base_name
             );
         }
@@ -215,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
                 let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
                 if result.successfully_removed > 0 {
                     info!(
-                        "✅ 启动时清理完成，共清理了 {} 个遗留容器（涵盖 {} 个服务类型）",
+                        "✅ Startup cleanup completed, removed {} leftover containers (covering {} service types)",
                         result.successfully_removed,
                         enabled_services.len()
                     );
@@ -231,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                     for failure in &result.failed_removals_details {
                         warn!(
-                            "  - 容器 {} ({}): {}",
+                            "  - Container {} ({}): {}",
                             failure.container_id, failure.container_name, failure.error_message
                         );
                     }
@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         ),
     };
     info!(
-        "🧹 清理配置: 闲置超时={}秒, 清理间隔={}秒, Docker停止超时={}秒, 容器保护时间={}秒, 日志目录={}, 日志保留={}天",
+        "🧹 Cleanup config: idle_timeout={}s, cleanup_interval={}s, docker_stop_timeout={}s, container_protection={}s, log_dir={}, log_retention={}days",
         config.cleanup_config.idle_timeout_seconds,
         config.cleanup_config.cleanup_interval_seconds,
         config.cleanup_config.docker_stop_timeout_seconds,
@@ -283,11 +283,11 @@ async fn main() -> anyhow::Result<()> {
         &config.proxy_config
     {
         info!(
-            "启动 Pingora 反向代理服务，监听端口: {}",
+            "Starting Pingora reverse proxy service, listening on port: {}",
             proxy_config.listen_port
         );
         info!(
-            "代理路由格式: /proxy/{{port}}{{/path}} - 例如: /proxy/{}/health",
+            "Proxy route format: /proxy/{{port}}{{/path}} - e.g.: /proxy/{}/health",
             config.port
         );
 
@@ -295,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
         info!("🔧 [Pingora] startinginitialize Pingora config...");
         info!("🔧 [Pingora] listenport: {}", proxy_config.listen_port);
         info!(
-            "🔧 [Pingora] 默认后端端口: {}",
+            "🔧 [Pingora] Default backend port: {}",
             proxy_config.default_backend_port
         );
         info!("🔧 [Pingora] backend host: {}", proxy_config.backend_host);
@@ -323,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
         if proxy_config.health_check.enabled {
             let hc = &proxy_config.health_check;
             info!(
-                "🔧 [Pingora] 启动健康检查循环: interval={}s, timeout={}s",
+                "🔧 [Pingora] Starting health check loop: interval={}s, timeout={}s",
                 hc.interval_seconds, hc.timeout_seconds
             );
             pingora_service
@@ -491,7 +491,7 @@ async fn main() -> anyhow::Result<()> {
             proxy_config.listen_port, config.port, config.port
         );
         info!(
-            "   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (动态发现)",
+            "   http://localhost:{}/proxy/9000/health → http://127.0.0.1:9000/health (dynamic discovery)",
             proxy_config.listen_port
         );
     }
@@ -600,7 +600,7 @@ fn show_docker_configuration_help(socket_path: &str) {
     error!("2. check socket file exists: ls -l {}", socket_path);
     error!("3. check docker group: groups $USER | grep docker");
     error!(
-        "  4. 测试 Docker API: curl --unix-socket {} http://localhost/info",
+        "  4. Test Docker API: curl --unix-socket {} http://localhost/info",
         socket_path
     );
     error!("");
@@ -705,7 +705,7 @@ async fn cleanup_all_containers() -> anyhow::Result<()> {
         Ok(result) => {
             if result.successfully_removed > 0 {
                 info!(
-                    "🧹 清理了 {} 个容器（所有启用的服务）",
+                    "🧹 Cleaned up {} containers (all enabled services)",
                     result.successfully_removed
                 );
             }

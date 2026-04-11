@@ -123,7 +123,7 @@ impl ApiKeyManager {
     /// ```
     pub fn store_config(&self, service_name: &str, config: ModelProviderConfig) {
         debug!(
-            "🔑 [API_KEY_MANAGER] 存储配置: service_name={}",
+            "🔑 [API_KEY_MANAGER] Storing config: service_name={}",
             service_name
         );
         self.shared.insert(service_name.to_string(), config);
@@ -183,7 +183,7 @@ impl ApiKeyManager {
     /// 如果找到并移除了配置则返回 `Some(ModelProviderConfig)`，否则返回 `None`。
     pub fn remove(&self, service_name: &str) -> Option<ModelProviderConfig> {
         debug!(
-            "🔑 [API_KEY_MANAGER] 移除配置: service_name={}",
+            "🔑 [API_KEY_MANAGER] Removing config: service_name={}",
             service_name
         );
         self.shared.remove(service_name).map(|(_, v)| v)

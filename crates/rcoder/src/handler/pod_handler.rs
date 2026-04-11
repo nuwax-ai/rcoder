@@ -444,7 +444,7 @@ pub async fn pod_count(
     };
 
     debug!(
-        "✅ [POD_COUNT] 容器统计完成: total={}, rcoder={}, computer_agent_runner={}",
+        "✅ [POD_COUNT] Container count completed: total={}, rcoder={}, computer_agent_runner={}",
         total_count, rcoder_count, computer_count
     );
 
@@ -641,7 +641,7 @@ pub async fn pod_list(
     };
 
     info!(
-        "✅ [POD_LIST] 容器列表获取完成: total={}, returned={}, paginated={}",
+        "✅ [POD_LIST] Container list retrieved: total={}, returned={}, paginated={}",
         total, returned, paginated
     );
 
@@ -734,7 +734,7 @@ pub async fn pod_ensure(
                         if let Ok(Some(info)) = mgr.get_user_container_info(&request.user_id).await
                         {
                             info!(
-                                "✅ [POD_ENSURE] 等待成功，容器已就绪（等待{}秒）: user_id={}, container_id={}",
+                                "✅ [POD_ENSURE] Wait succeeded, container ready (waited {}s): user_id={}, container_id={}",
                                 wait_sec, request.user_id, info.container_id
                             );
                             waited_container_info = Some(info);
@@ -745,7 +745,7 @@ pub async fn pod_ensure(
 
                 if wait_sec % 5 == 0 {
                     debug!(
-                        "[POD_ENSURE] 仍在等待容器创建: user_id={}, 第{}秒",
+                        "[POD_ENSURE] Still waiting for container creation: user_id={}, {}s",
                         request.user_id, wait_sec
                     );
                 }
@@ -758,7 +758,7 @@ pub async fn pod_ensure(
                     sync_single_vnc_backend(pingora_service, &request.user_id, &info.container_ip)
                         .await;
                     info!(
-                        "🔄 [POD_ENSURE] VNC 后端映射已同步: user_id={} -> {}",
+                        "🔄 [POD_ENSURE] VNC backend mapping synced: user_id={} -> {}",
                         request.user_id, info.container_ip
                     );
                 }
@@ -777,7 +777,7 @@ pub async fn pod_ensure(
                 };
                 state.insert_project(request.project_id.clone(), Arc::new(project_info));
                 debug!(
-                    "📝 [POD_ENSURE] DuckDB 记录已更新: project_id={}, user_id={}, container_id={}",
+                    "📝 [POD_ENSURE] DuckDB record updated: project_id={}, user_id={}, container_id={}",
                     request.project_id, request.user_id, info.container_id
                 );
 
@@ -790,20 +790,20 @@ pub async fn pod_ensure(
                     created: false,
                     container_info: pod_container_info,
                     message: format!(
-                        "容器已就绪（等待其他请求创建完成）: container_id={}",
+                        "Container ready (waiting for other request to complete creation): container_id={}",
                         info.container_id
                     ),
                 }));
             }
             // 等待超时，继续正常的创建流程（此时标记可能已过期被清理）
             warn!(
-                "⚠️ [POD_ENSURE] 等待容器创建超时（30秒），将继续尝试创建: user_id={}",
+                "⚠️ [POD_ENSURE] Wait for container creation timeout (30s), will continue to try creating: user_id={}",
                 request.user_id
             );
         } else {
             // 标记过期，清理后继续
             warn!(
-                "⚠️ [POD_ENSURE] 创建标记已过期（{:?}），清理并继续",
+                "⚠️ [POD_ENSURE] Creation mark expired ({:?}), cleaning up and continuing",
                 elapsed
             );
             state.pod_creating.remove(&request.user_id);
@@ -835,7 +835,7 @@ pub async fn pod_ensure(
         Some(result) if result.is_running => {
             // 容器存在且正在运行，无需创建
             info!(
-                "📦 [POD_ENSURE] 容器已存在且运行中: container_id={}, status={:?}",
+                "📦 [POD_ENSURE] Container already exists and running: container_id={}, status={:?}",
                 result.container_id, result.status
             );
             false
@@ -843,7 +843,7 @@ pub async fn pod_ensure(
         Some(result) => {
             // 容器存在但未运行（Exited 等状态），需要删除并重建
             warn!(
-                "⚠️ [POD_ENSURE] 容器存在但未运行: container_id={}, status={:?}, 将删除并重建",
+                "⚠️ [POD_ENSURE] Container exists but not running: container_id={}, status={:?}, will delete and recreate",
                 result.container_id, result.status
             );
 
@@ -864,7 +864,7 @@ pub async fn pod_ensure(
                 })?;
 
             info!(
-                "✅ [POD_ENSURE] 旧容器已删除: container_id={}",
+                "✅ [POD_ENSURE] Old container deleted: container_id={}",
                 result.container_id
             );
 
@@ -910,12 +910,12 @@ pub async fn pod_ensure(
                 Ok(info) => {
                     if attempt > 1 {
                         info!(
-                            "✅ [POD_ENSURE] 容器创建成功（第 {} 次尝试）: container_id={}",
+                            "✅ [POD_ENSURE] Container created successfully (attempt {}): container_id={}",
                             attempt, info.container_id
                         );
                     } else {
                         info!(
-                            "✅ [POD_ENSURE] 容器创建成功: container_id={}",
+                            "✅ [POD_ENSURE] Container created successfully: container_id={}",
                             info.container_id
                         );
                     }
@@ -926,12 +926,12 @@ pub async fn pod_ensure(
                     last_error = Some(e);
                     if attempt < max_attempts {
                         warn!(
-                            "⚠️ [POD_ENSURE] 容器创建失败（第 {} 次尝试），将重试: {}",
+                            "⚠️ [POD_ENSURE] Container creation failed (attempt {}), will retry: {}",
                             attempt,
                             last_error
                                 .as_ref()
                                 .map(|e| e.to_string())
-                                .unwrap_or_else(|| "未知错误".to_string())
+                                .unwrap_or_else(|| "Unknown error".to_string())
                         );
                         // 等待一段时间后重试（指数退避）
                         tokio::time::sleep(tokio::time::Duration::from_millis(
@@ -961,7 +961,7 @@ pub async fn pod_ensure(
                 let error_msg = last_error
                     .as_ref()
                     .map(|e| e.to_string())
-                    .unwrap_or_else(|| "容器创建失败但未捕获到错误信息".to_string());
+                    .unwrap_or_else(|| "Container creation failed but no error info captured".to_string());
                 return Err(AppError::internal_server_error(&error_msg));
             }
         }
@@ -979,7 +979,7 @@ pub async fn pod_ensure(
                 // Docker API 确认容器在运行，但内部 map 还没同步
                 // 短暂等待让内部 map 同步，而不是直接重建
                 warn!(
-                    "⚠️ [POD_ENSURE] 容器运行中但内部映射未就绪，等待同步: user_id={}",
+                    "⚠️ [POD_ENSURE] Container running but internal mapping not ready, waiting for sync: user_id={}",
                     request.user_id
                 );
 
@@ -992,7 +992,7 @@ pub async fn pod_ensure(
                     {
                         Ok(Some(info)) => {
                             info!(
-                                "✅ [POD_ENSURE] 内部映射已同步（第{}次重试）: container_id={}",
+                                "✅ [POD_ENSURE] Internal mapping synced (retry {}): container_id={}",
                                 retry_attempt, info.container_id
                             );
                             retry_info = Some(info);
@@ -1012,7 +1012,7 @@ pub async fn pod_ensure(
                     None => {
                         // 3次重试后仍失败，才考虑重建
                         warn!(
-                            "⚠️ [POD_ENSURE] 等待同步超时，尝试重新创建: user_id={}",
+                            "⚠️ [POD_ENSURE] Wait for sync timeout, attempting to recreate: user_id={}",
                             request.user_id
                         );
 
@@ -1040,14 +1040,14 @@ pub async fn pod_ensure(
                         match result {
                             Ok(info) => {
                                 info!(
-                                    "✅ [POD_ENSURE] 容器重新创建成功: container_id={}",
+                                    "✅ [POD_ENSURE] Container recreated successfully: container_id={}",
                                     info.container_id
                                 );
                                 (info, true)
                             }
                             Err(e) => {
                                 error!(
-                                    "❌ [POD_ENSURE] 容器重新创建失败: user_id={}, error={}",
+                                    "❌ [POD_ENSURE] Container recreation failed: user_id={}, error={}",
                                     request.user_id, e
                                 );
                                 return Err(e);
@@ -1058,11 +1058,11 @@ pub async fn pod_ensure(
             }
             Err(e) => {
                 error!(
-                    "❌ [POD_ENSURE] 获取容器完整信息失败: user_id={}, error={}",
+                    "❌ [POD_ENSURE] Failed to get container full info: user_id={}, error={}",
                     request.user_id, e
                 );
                 return Err(AppError::internal_server_error(&format!(
-                    "获取容器完整信息失败: {}",
+                    "Failed to get container full info: {}",
                     e
                 )));
             }
@@ -1080,7 +1080,7 @@ pub async fn pod_ensure(
             )
             .await;
             info!(
-                "🔄 [POD_ENSURE] VNC 后端映射已同步: user_id={} -> {}",
+                "🔄 [POD_ENSURE] VNC backend mapping synced: user_id={} -> {}",
                 request.user_id, container_info.container_ip
             );
         }
@@ -1104,7 +1104,7 @@ pub async fn pod_ensure(
 
     state.insert_project(request.project_id.clone(), Arc::new(project_info));
     debug!(
-        "📝 [POD_ENSURE] DuckDB 记录已更新: project_id={}, user_id={}, container_id={}",
+        "📝 [POD_ENSURE] DuckDB record updated: project_id={}, user_id={}, container_id={}",
         request.project_id, request.user_id, container_info.container_id
     );
 
@@ -1115,9 +1115,9 @@ pub async fn pod_ensure(
     };
 
     let message = if created {
-        "容器创建成功，可通过 VNC 访问虚拟桌面（Agent 服务未启动）".to_string()
+        "Container created successfully, can access virtual desktop via VNC (Agent service not started)".to_string()
     } else {
-        "容器已存在，可直接通过 VNC 访问虚拟桌面".to_string()
+        "Container already exists, can access virtual desktop via VNC directly".to_string()
     };
 
     let response = EnsurePodResponse {
@@ -1172,7 +1172,7 @@ pub async fn pod_keepalive(
     }
 
     info!(
-        "💓 [POD_KEEPALIVE] 容器保活: user_id={}, project_id={}",
+        "💓 [POD_KEEPALIVE] Container keepalive: user_id={}, project_id={}",
         request.user_id, request.project_id
     );
 
@@ -1238,7 +1238,7 @@ pub async fn pod_keepalive(
             .await?
             .ok_or_else(|| {
                 error!(
-                    "[POD_KEEPALIVE] Container status abnormal：DuckDB 有记录但 Docker 中找不到容器"
+                    "[POD_KEEPALIVE] Container status abnormal: DuckDB has record but container not found in Docker"
                 );
                 AppError::internal_server_error("Container status abnormal")
             })?;
@@ -1256,12 +1256,12 @@ pub async fn pod_keepalive(
 
     let message = if created {
         format!(
-            "容器已自动创建，距离自动清理还有 {} 分钟",
+            "Container auto created, {} minutes until auto cleanup",
             idle_timeout_seconds / 60
         )
     } else {
         format!(
-            "容器活动时间已刷新，距离自动清理还有 {} 分钟",
+            "Container activity time refreshed, {} minutes until auto cleanup",
             idle_timeout_seconds / 60
         )
     };
@@ -1283,7 +1283,7 @@ pub async fn pod_keepalive(
     };
 
     info!(
-        "✅ [POD_KEEPALIVE] 保活完成: existed={}, created={}, time_until_cleanup={}s",
+        "✅ [POD_KEEPALIVE] Keepalive completed: existed={}, created={}, time_until_cleanup={}s",
         !created, created, idle_timeout_seconds
     );
 
@@ -1344,7 +1344,7 @@ pub async fn pod_restart(
     }
 
     info!(
-        "🔄 [POD_RESTART] 重启容器: user_id={}, project_id={}",
+        "🔄 [POD_RESTART] Restarting container: user_id={}, project_id={}",
         request.user_id, request.project_id
     );
 
@@ -1397,12 +1397,12 @@ pub async fn pod_restart(
         {
             // 记录错误但继续尝试创建新容器
             error!(
-                "⚠️ [POD_RESTART] 停止容器失败（继续创建新容器）: container_id={}, error={}",
+                "⚠️ [POD_RESTART] Failed to stop container (will continue creating new container): container_id={}, error={}",
                 container_info.container_id, e
             );
         } else {
             info!(
-                "✅ [POD_RESTART] 容器已销毁: container_id={}",
+                "✅ [POD_RESTART] Container destroyed: container_id={}",
                 container_info.container_id
             );
         }
@@ -1425,7 +1425,7 @@ pub async fn pod_restart(
                 Ok(Some(_)) => {
                     if i == 0 {
                         info!(
-                            "⏳ [POD_RESTART] 容器仍在 Docker 中，等待清理: name={}",
+                            "⏳ [POD_RESTART] Container still in Docker, waiting for cleanup: name={}",
                             container_name
                         );
                     }
@@ -1433,7 +1433,7 @@ pub async fn pod_restart(
                 }
                 Ok(None) => {
                     info!(
-                        "✅ [POD_RESTART] 确认容器已从 Docker 移除: name={}",
+                        "✅ [POD_RESTART] Confirmed container removed from Docker: name={}",
                         container_name
                     );
                     deletion_confirmed = true;
@@ -1453,7 +1453,7 @@ pub async fn pod_restart(
 
         if !deletion_confirmed {
             warn!(
-                "⚠️ [POD_RESTART] 等待容器移除超时，后续创建可能会失败: name={}",
+                "⚠️ [POD_RESTART] Wait for container removal timeout, subsequent creation may fail: name={}",
                 container_name
             );
         }
@@ -1493,7 +1493,7 @@ pub async fn pod_restart(
         )
         .await;
         info!(
-            "🔄 [POD_RESTART] VNC 后端映射已同步: user_id={} -> {}",
+            "🔄 [POD_RESTART] VNC backend mapping synced: user_id={} -> {}",
             request.user_id, container_info.container_ip
         );
     }
@@ -1514,9 +1514,9 @@ pub async fn pod_restart(
     };
 
     let message = if was_existing {
-        "容器已重启，可通过 VNC 访问虚拟桌面（Agent 服务未启动）".to_string()
+        "Container restarted, can access virtual desktop via VNC (Agent service not started)".to_string()
     } else {
-        "容器创建成功（之前不存在），可通过 VNC 访问虚拟桌面（Agent 服务未启动）".to_string()
+        "Container created (previously did not exist), can access virtual desktop via VNC (Agent service not started)".to_string()
     };
 
     let response = RestartPodResponse {
@@ -1527,7 +1527,7 @@ pub async fn pod_restart(
     };
 
     info!(
-        "✅ [POD_RESTART] 完成: was_existing={}, container_id={}",
+        "✅ [POD_RESTART] Completed: was_existing={}, container_id={}",
         was_existing, container_info.container_id
     );
 
@@ -1623,7 +1623,7 @@ pub async fn pod_status(
     }
 
     info!(
-        "🔍 [POD_STATUS] 查询容器状态: project_id={:?}, user_id={:?}",
+        "🔍 [POD_STATUS] Querying container status: project_id={:?}, user_id={:?}",
         params.project_id, params.user_id
     );
 
@@ -1670,7 +1670,7 @@ pub async fn pod_status(
             };
 
             info!(
-                "✅ [POD_STATUS] 容器状态: alive={}, status={}, container_id={}",
+                "✅ [POD_STATUS] Container status: alive={}, status={}, container_id={}",
                 result.is_running, status_str, result.container_id
             );
 
@@ -1712,7 +1712,7 @@ pub async fn pod_status(
                     };
 
                     info!(
-                        "✅ [POD_STATUS] 通过 project_id 找到容器: alive={}, container_id={}",
+                        "✅ [POD_STATUS] Found container by project_id: alive={}, container_id={}",
                         result.is_running, result.container_id
                     );
 
@@ -1738,7 +1738,7 @@ pub async fn pod_status(
 
     // 6. 未找到容器
     info!(
-        "📭 [POD_STATUS] 未找到容器: user_id={:?}, project_id={:?}",
+        "📭 [POD_STATUS] Container not found: user_id={:?}, project_id={:?}",
         params.user_id, params.project_id
     );
 
@@ -1749,7 +1749,7 @@ pub async fn pod_status(
         container_name: None,
         timestamp,
         message: format!(
-            "未找到对应的容器 (user_id={:?}, project_id={:?})",
+            "Container not found (user_id={:?}, project_id={:?})",
             params.user_id, params.project_id
         ),
     }))
@@ -1839,7 +1839,7 @@ pub async fn pod_vnc_status(
     }
 
     info!(
-        "🖥️ [POD_VNC_STATUS] 查询 VNC 状态: user_id={:?}, project_id={:?}",
+        "🖥️ [POD_VNC_STATUS] Querying VNC status: user_id={:?}, project_id={:?}",
         user_id, project_id
     );
 
@@ -1887,7 +1887,7 @@ pub async fn pod_vnc_status(
         Some(info) => info,
         None => {
             info!(
-                "📭 [POD_VNC_STATUS] 容器不存在: user_id={:?}, project_id={:?}",
+                "📭 [POD_VNC_STATUS] Container does not exist: user_id={:?}, project_id={:?}",
                 user_id, project_id
             );
             return Ok(HttpResult::error_with_locale(
@@ -1900,13 +1900,13 @@ pub async fn pod_vnc_status(
     // 5. 检查容器是否正在运行
     if !result.is_running {
         info!(
-            "⚠️ [POD_VNC_STATUS] 容器未运行: container_id={}",
+            "⚠️ [POD_VNC_STATUS] Container not running: container_id={}",
             result.container_id
         );
         return Ok(HttpResult::success(VncStatusResponse {
             vnc_ready: false,
             novnc_ready: false,
-            message: "容器未运行".to_string(),
+            message: "Container not running".to_string(),
             uptime_seconds: 0,
             container_id: result.container_id,
         }));
@@ -1958,7 +1958,7 @@ pub async fn pod_vnc_status(
                 Ok(response) => {
                     let resp = response.into_inner();
                     info!(
-                        "✅ [POD_VNC_STATUS] gRPC 调用成功: vnc_ready={}, novnc_ready={}",
+                        "✅ [POD_VNC_STATUS] gRPC call successful: vnc_ready={}, novnc_ready={}",
                         resp.vnc_ready, resp.novnc_ready
                     );
 

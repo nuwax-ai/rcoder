@@ -76,7 +76,7 @@ async fn get_container_for_cancel_duckdb(
     };
 
     info!(
-        "🔍 [CANCEL_CONTAINER_DUCKDB] 查找容器: {}",
+        "🔍 [CANCEL_CONTAINER_DUCKDB] Looking up container: {}",
         identifier_display
     );
 
@@ -97,12 +97,12 @@ async fn get_container_for_cancel_duckdb(
 
     if let Some(ref info) = container_info {
         info!(
-            "✅ [CANCEL_CONTAINER_DUCKDB] 找到容器: {}, container_id={}, service_url={}",
+            "✅ [CANCEL_CONTAINER_DUCKDB] Container found: {}, container_id={}, service_url={}",
             identifier_display, info.container_id, info.service_url
         );
     } else {
         info!(
-            "ℹ️ [CANCEL_CONTAINER_DUCKDB] 容器不存在: {}, 无需取消",
+            "ℹ️ [CANCEL_CONTAINER_DUCKDB] Container not found: {}, no need to cancel",
             identifier_display
         );
     }
@@ -124,7 +124,7 @@ async fn forward_cancel_request_to_container_service(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "None".to_string());
     info!(
-        "📤 [CANCEL_FORWARD] 转发取消请求到容器 (gRPC): project_id={}, session_id={}, container_id={}",
+        "📤 [CANCEL_FORWARD] Forwarding cancel request to container (gRPC): project_id={}, session_id={}, container_id={}",
         project_id, session_id_display, container_info.container_id
     );
 
@@ -133,13 +133,13 @@ async fn forward_cancel_request_to_container_service(
     let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
 
     info!(
-        "📡 [CANCEL_FORWARD] 发送 gRPC 取消请求到: {}, session_id={}",
+        "📡 [CANCEL_FORWARD] Sending gRPC cancel request to: {}, session_id={}",
         grpc_addr, session_id_display
     );
 
     // 构建 session_id（如果未提供则使用空字符串，由 Agent Runner 根据 project_id 查找）
     let session_id_str = session_id.unwrap_or("").to_string();
-    let reason = "用户请求取消".to_string();
+    let reason = "User requested cancellation".to_string();
 
     // 调用 gRPC CancelSession
     match crate::grpc::grpc_cancel_session_with_pool(
@@ -154,7 +154,7 @@ async fn forward_cancel_request_to_container_service(
         Ok(grpc_response) => {
             if grpc_response.success {
                 info!(
-                    "✅ [CANCEL_FORWARD] gRPC 取消成功: session_id={}",
+                    "✅ [CANCEL_FORWARD] gRPC cancel succeeded: session_id={}",
                     session_id_str
                 );
                 Ok(HttpResult::success(CancelResponse {
@@ -164,7 +164,7 @@ async fn forward_cancel_request_to_container_service(
             } else {
                 let error_msg = grpc_response
                     .message
-                    .unwrap_or_else(|| "未知错误".to_string());
+                    .unwrap_or_else(|| "Unknown error".to_string());
                 error!("[CANCEL_FORWARD] gRPC cancelfailed: {}", error_msg);
                 Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CANCEL_FAILED,
@@ -204,7 +204,7 @@ async fn forward_cancel_request_to_container_service(
                         } else {
                             // 容器存在但服务不可用（可能是临时故障），返回错误
                             warn!(
-                                "[CANCEL_FORWARD] Agent Worker 不可用（容器存在，可能是临时故障）"
+                                "[CANCEL_FORWARD] Agent Worker unavailable (container exists, may be temporary failure)"
                             );
                             return Ok(HttpResult::error_with_locale(
                                 shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
@@ -246,14 +246,14 @@ async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> 
             {
                 Ok(Some(info)) => {
                     debug!(
-                        "🔍 [CANCEL_FORWARD] Docker 容器存在: name={}, id={}, status={:?}",
+                        "🔍 [CANCEL_FORWARD] Docker container exists: name={}, id={}, status={:?}",
                         info.container_name, info.container_id, info.status
                     );
                     true
                 }
                 Ok(None) => {
                     info!(
-                        "🔍 [CANCEL_FORWARD] Docker 容器不存在（已销毁）: {}",
+                        "🔍 [CANCEL_FORWARD] Docker container not found (already destroyed): {}",
                         container_info.container_name
                     );
                     false
@@ -261,7 +261,7 @@ async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> 
                 Err(e) => {
                     // Query failed，保守地认为容器存在
                     warn!(
-                        "⚠️ [CANCEL_FORWARD] Failed to query container status: {}，保守认为容器存在",
+                        "⚠️ [CANCEL_FORWARD] Failed to query container status: {}, conservatively assuming container exists",
                         e
                     );
                     true
@@ -271,7 +271,7 @@ async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> 
         Err(e) => {
             // 无法获取 Docker Manager，保守地认为容器存在
             warn!(
-                "[CANCEL_FORWARD] 获取 Docker Manager 失败: {}，保守认为容器存在",
+                "[CANCEL_FORWARD] Failed to get Docker Manager: {}, conservatively assuming container exists",
                 e
             );
             true
@@ -310,7 +310,7 @@ async fn handle_session_cancel_internal_v2(
     // 如果容器不存在，说明任务已经结束或从未启动，直接返回成功
     let Some(container_info) = container_info else {
         info!(
-            "✅ [CANCEL_FORWARD_V2] 容器不存在，取消目标已达成: {}",
+            "✅ [CANCEL_FORWARD_V2] Container not found, cancel target already achieved: {}",
             identifier_display
         );
         return Ok(HttpResult::success(CancelResponse {
@@ -332,13 +332,13 @@ async fn handle_session_cancel_internal_v2(
     match &result {
         Ok(_) => {
             info!(
-                "✅ [CANCEL_FORWARD_V2] 取消请求处理成功: project_id={}, {}",
+                "✅ [CANCEL_FORWARD_V2] Cancel request handled successfully: project_id={}, {}",
                 project_id, identifier_display
             );
         }
         Err(e) => {
             error!(
-                "❌ [CANCEL_FORWARD_V2] 取消请求处理失败: project_id={}, {}, error={}",
+                "❌ [CANCEL_FORWARD_V2] Cancel request handling failed: project_id={}, {}, error={}",
                 project_id, identifier_display, e
             );
         }

@@ -20,7 +20,7 @@ impl ContainerManager {
         request_resource_limits: Option<shared_types::ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
-            "🔍 [CONTAINER_MGR] 开始处理容器: project_id={}, service_type={:?}",
+            "🔍 [CONTAINER_MGR] Starting container processing: project_id={}, service_type={:?}",
             project_id, service_type
         );
 
@@ -29,7 +29,7 @@ impl ContainerManager {
             ensure_container_exists(project_id, service_type, request_resource_limits).await?;
 
         info!(
-            "✅ [CONTAINER_MGR] 容器准备就绪: project_id={}, container_id={}",
+            "✅ [CONTAINER_MGR] Container ready: project_id={}, container_id={}",
             project_id, container_info.container_id
         );
 

@@ -36,7 +36,7 @@ pub async fn proxy_status(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用或不可用".to_string(),
+                message: "Pingora proxy service is not enabled or unavailable".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -48,7 +48,7 @@ pub async fn proxy_status(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
-                message: "Pingora 代理服务实例不可用".to_string(),
+                message: "Pingora proxy service instance is unavailable".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -102,7 +102,7 @@ pub async fn proxy_status(
     };
 
     info!(
-        "查询代理状态: 端口 {}, 默认后端: {}:{} (后端数: {})",
+        "Query proxy status: port {}, default backend: {}:{} (backend count: {})",
         status.listen_port, status.default_backend_host, status.default_backend_port, backend_count
     );
 
@@ -130,7 +130,7 @@ pub async fn proxy_stats(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用或不可用".to_string(),
+                message: "Pingora proxy service is not enabled or unavailable".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -142,7 +142,7 @@ pub async fn proxy_stats(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
-                message: "Pingora 代理服务实例不可用".to_string(),
+                message: "Pingora proxy service instance is unavailable".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -190,7 +190,7 @@ pub async fn proxy_stats(
     };
 
     info!(
-        "查询代理统计: 总请求 {}, 成功 {}, 失败 {}, 平均耗时 {:.2}ms",
+        "Query proxy stats: total requests {}, success {}, failed {}, avg response time {:.2}ms",
         stats.total_requests,
         stats.successful_requests,
         stats.failed_requests,
@@ -220,7 +220,7 @@ pub async fn proxy_config(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用或不可用".to_string(),
+                message: "Pingora proxy service is not enabled or unavailable".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -232,7 +232,7 @@ pub async fn proxy_config(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
-                message: "Pingora 代理服务实例不可用".to_string(),
+                message: "Pingora proxy service instance is unavailable".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -248,7 +248,7 @@ pub async fn proxy_config(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ProxyErrorResponse {
                     error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
-                    message: "Pingora 代理配置不可用".to_string(),
+                    message: "Pingora proxy config unavailable".to_string(),
                     target_port: 0,
                     timestamp: Utc::now().to_rfc3339(),
                 }),
@@ -275,7 +275,7 @@ pub async fn proxy_config(
     };
 
     info!(
-        "查询代理配置: 监听端口 {}, 默认后端: {}:{}，LB算法: {}",
+        "Query proxy config: listen port {}, default backend: {}:{}, LB algorithm: {}",
         config.listen_port,
         config.default_backend_host,
         config.default_backend_port,
@@ -332,7 +332,7 @@ pub async fn proxy_to_port(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用".to_string(),
+                message: "Pingora proxy service not enabled".to_string(),
                 target_port: port,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -344,7 +344,7 @@ pub async fn proxy_to_port(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
-                message: "Pingora 代理配置不可用".to_string(),
+                message: "Pingora proxy config unavailable".to_string(),
                 target_port: port,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -422,7 +422,7 @@ pub async fn proxy_to_port_with_path(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用".to_string(),
+                message: "Pingora proxy service not enabled".to_string(),
                 target_port: port,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -434,7 +434,7 @@ pub async fn proxy_to_port_with_path(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
-                message: "Pingora 代理配置不可用".to_string(),
+                message: "Pingora proxy config unavailable".to_string(),
                 target_port: port,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -484,7 +484,7 @@ async fn proxy_request_handler(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_DISABLED".to_string(),
-                message: "Pingora 代理服务未启用".to_string(),
+                message: "Pingora proxy service not enabled".to_string(),
                 target_port: port,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -496,7 +496,7 @@ async fn proxy_request_handler(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProxyErrorResponse {
                 error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
-                message: "Pingora 代理配置不可用".to_string(),
+                message: "Pingora proxy config unavailable".to_string(),
                 target_port: port,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -525,7 +525,7 @@ async fn proxy_request_handler(
     };
 
     info!(
-        "代理请求文档演示: 端口 {}, 路径 {}, 目标: {}",
+        "Proxy request documentation demo: port {}, path {}, target: {}",
         port, target_path, target_url
     );
 
@@ -568,7 +568,7 @@ pub async fn proxy_with_query_params(
             StatusCode::BAD_REQUEST,
             Json(ProxyErrorResponse {
                 error: "MISSING_PORT".to_string(),
-                message: "缺少端口号参数".to_string(),
+                message: "Missing port parameter".to_string(),
                 target_port: 0,
                 timestamp: Utc::now().to_rfc3339(),
             }),
@@ -577,7 +577,7 @@ pub async fn proxy_with_query_params(
 
     let path = params.path.clone().unwrap_or_else(|| "/".to_string());
     warn!(
-        "使用了过时的查询参数代理方式，建议使用路径格式: /proxy/{}/{}",
+        "Using deprecated query parameter proxy method, recommended path format: /proxy/{}/{}",
         port, path
     );
 

@@ -30,7 +30,7 @@ pub async fn create_grpc_sse_stream(
     // 在后台任务中处理 gRPC 流
     tokio::spawn(async move {
         info!(
-            "🔗 [gRPC_SSE] 开始连接 agent_runner gRPC: addr={}, session_id={}, project_id={}",
+            "🔗 [gRPC_SSE] Starting connection to agent_runner gRPC: addr={}, session_id={}, project_id={}",
             grpc_addr, session_id_clone, project_id
         );
 
@@ -43,7 +43,7 @@ pub async fn create_grpc_sse_stream(
                 Ok(client) => client,
                 Err(e) => {
                     warn!(
-                        "⚠️ [gRPC_SSE] 获取客户端失败 (尝试 {}/{}): {}, 清理连接池并重试...",
+                        "⚠️ [gRPC_SSE] Failed to get client (attempt {}/{}): {}, cleaning connection pool and retrying...",
                         attempt, max_retries, e
                     );
                     pool.remove(&grpc_addr);
@@ -67,27 +67,27 @@ pub async fn create_grpc_sse_stream(
                     if status == "idle" {
                         // Agent 闲置，发送 SessionPromptEnd 并关闭连接
                         info!(
-                            "💤 [gRPC_SSE] Agent 处于闲置状态，发送 SessionPromptEnd 并关闭: session_id={}",
+                            "💤 [gRPC_SSE] Agent is idle, sending SessionPromptEnd and closing: session_id={}",
                             session_id_clone
                         );
                         let end_event = create_session_prompt_end_event(&session_id_clone);
                         if let Err(e) = tx.send(Ok(end_event)).await {
                             warn!(
-                                "⚠️ [gRPC_SSE] 发送 SessionPromptEnd 事件失败: session_id={}, error={}",
+                                "⚠️ [gRPC_SSE] Failed to send SessionPromptEnd event: session_id={}, error={}",
                                 session_id_clone, e
                             );
                         }
                         return; // 直接结束，不建立流
                     }
                     info!(
-                        "🔄 [gRPC_SSE] Agent 状态为 {}, 继续建立流: session_id={}",
+                        "🔄 [gRPC_SSE] Agent status is {}, continuing to establish stream: session_id={}",
                         status, session_id_clone
                     );
                 }
                 Err(e) => {
                     // 状态检查失败，记录警告但继续尝试建立流
                     warn!(
-                        "⚠️ [gRPC_SSE] Agent 状态检查失败: {}, 继续尝试建立流: session_id={}",
+                        "⚠️ [gRPC_SSE] Agent status check failed: {}, continuing to try establishing stream: session_id={}",
                         e, session_id_clone
                     );
                 }
@@ -104,7 +104,7 @@ pub async fn create_grpc_sse_stream(
             match client.subscribe_progress(request).await {
                 Ok(response) => {
                     info!(
-                        "✅ [gRPC_SSE] 成功建立 SubscribeProgress 流: session_id={}",
+                        "✅ [gRPC_SSE] Successfully established SubscribeProgress stream: session_id={}",
                         session_id_clone
                     );
 
@@ -127,7 +127,7 @@ pub async fn create_grpc_sse_stream(
 
                                 if tx.send(Ok(sse_event)).await.is_err() {
                                     warn!(
-                                        "⚠️ [gRPC_SSE] 客户端已断开连接: session_id={}",
+                                        "⚠️ [gRPC_SSE] Client disconnected: session_id={}",
                                         session_id_clone
                                     );
                                     // 客户端断开，直接退出任务
@@ -137,7 +137,7 @@ pub async fn create_grpc_sse_stream(
                             Ok(None) => {
                                 // 流正常结束（agent_runner 主动关闭）
                                 info!(
-                                    "✅ [gRPC_SSE] gRPC 流正常结束: session_id={}",
+                                    "✅ [gRPC_SSE] gRPC stream ended normally: session_id={}",
                                     session_id_clone
                                 );
                                 return;
@@ -145,7 +145,7 @@ pub async fn create_grpc_sse_stream(
                             Err(e) => {
                                 // 流异常结束（连接中断、超时等）
                                 error!(
-                                    "❌ [gRPC_SSE] gRPC 流异常: session_id={}, code={}, message={}",
+                                    "❌ [gRPC_SSE] gRPC stream error: session_id={}, code={}, message={}",
                                     session_id_clone,
                                     e.code(),
                                     e.message()
@@ -159,7 +159,7 @@ pub async fn create_grpc_sse_stream(
                                 );
                                 if let Err(e) = tx.send(Ok(error_event)).await {
                                     warn!(
-                                        "⚠️ [gRPC_SSE] 发送错误事件失败: session_id={}, error={}",
+                                        "⚠️ [gRPC_SSE] Failed to send error event: session_id={}, error={}",
                                         session_id_clone, e
                                     );
                                 }
@@ -170,14 +170,14 @@ pub async fn create_grpc_sse_stream(
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️ [gRPC_SSE] SubscribeProgress 调用失败 (尝试 {}/{}): {}",
+                        "⚠️ [gRPC_SSE] SubscribeProgress call failed (attempt {}/{}): {}",
                         attempt, max_retries, e
                     );
 
                     // 如果不是最后一次尝试，清理连接池并重试
                     if attempt < max_retries {
                         info!(
-                            "🔌 [gRPC_SSE] 可能是连接已断开，从连接池移除 {} 并重试...",
+                            "🔌 [gRPC_SSE] Possibly connection broken, removing {} from connection pool and retrying...",
                             grpc_addr
                         );
                         pool.remove(&grpc_addr);
@@ -192,14 +192,14 @@ pub async fn create_grpc_sse_stream(
 
         // 如果循环结束还没有 return，说明所有重试都失败了
         error!(
-            "❌ [gRPC_SSE] 重试 {} 次后最终失败: session_id={}, error={}",
+            "❌ [gRPC_SSE] Retried {} times ultimately failed: session_id={}, error={}",
             max_retries, session_id_clone, last_error_msg
         );
 
         let error_event = create_connection_error_event(&session_id_clone, &last_error_msg);
         if let Err(e) = tx.send(Ok(error_event)).await {
             warn!(
-                "⚠️ [gRPC_SSE] 发送错误事件失败: session_id={}, error={}",
+                "⚠️ [gRPC_SSE] Failed to send error event: session_id={}, error={}",
                 session_id_clone, e
             );
         }
@@ -218,7 +218,7 @@ fn create_session_prompt_end_event(session_id: &str) -> axum::response::sse::Eve
         sub_type: "end_turn".to_string(),
         data: serde_json::json!({
             "reason": "EndTurn",
-            "description": "Agent 当前无在执行任务"
+            "description": "Agent has no task in execution"
         }),
         timestamp: Utc::now(),
     };
@@ -227,7 +227,7 @@ fn create_session_prompt_end_event(session_id: &str) -> axum::response::sse::Eve
         Ok(json) => json,
         Err(e) => {
             warn!(
-                "⚠️ [gRPC_SSE] 序列化 SessionPromptEnd 消息失败: {}, error={}",
+                "⚠️ [gRPC_SSE] Failed to serialize SessionPromptEnd message: {}, error={}",
                 session_id, e
             );
             // 返回包含 session_id 的最小可用结构
@@ -260,7 +260,7 @@ fn progress_event_to_sse(
         Some(ts) => ts,
         None => {
             warn!(
-                "⚠️ [gRPC_SSE] 无效的时间戳: session_id={}, timestamp={}, 使用当前时间",
+                "⚠️ [gRPC_SSE] Invalid timestamp: session_id={}, timestamp={}, using current time",
                 session_id, event.timestamp
             );
             Utc::now()
@@ -284,7 +284,7 @@ fn progress_event_to_sse(
         Ok(json) => json,
         Err(e) => {
             warn!(
-                "⚠️ [gRPC_SSE] 序列化 ProgressEvent 消息失败: session_id={}, message_type={}, error={}",
+                "⚠️ [gRPC_SSE] Failed to serialize ProgressEvent message: session_id={}, message_type={}, error={}",
                 session_id, event.message_type, e
             );
             // 返回包含 session_id 的最小可用结构
@@ -318,7 +318,7 @@ fn parse_message_type(message_type: &str) -> SessionMessageType {
         // 默认作为 AgentSessionUpdate 处理
         _ => {
             debug!(
-                "⚠️ [gRPC_SSE] 未知的 message_type: {}, 使用 AgentSessionUpdate 作为默认值",
+                "⚠️ [gRPC_SSE] Unknown message_type: {}, using AgentSessionUpdate as default",
                 message_type
             );
             SessionMessageType::AgentSessionUpdate
@@ -332,7 +332,7 @@ fn parse_message_type(message_type: &str) -> SessionMessageType {
 /// 默认 gRPC 端口为 50051
 pub async fn get_container_grpc_addr(project_id: &str, grpc_port: u16) -> anyhow::Result<String> {
     info!(
-        "🔍 [CONTAINER] 获取容器 gRPC 地址: project_id={}",
+        "🔍 [CONTAINER] Getting container gRPC address: project_id={}",
         project_id
     );
 
@@ -370,7 +370,7 @@ fn create_grpc_stream_error_event(
         sub_type: "error".to_string(),
         data: serde_json::json!({
             "code": error_code,
-            "message": "智能体电脑执行异常，请重试（消耗过多内存的任务可能导致智能体电脑进程终止）。",
+            "message": "Agent computer execution error, please retry (tasks consuming too much memory may cause the agent computer process to terminate).",
         }),
         timestamp: Utc::now(),
     };
@@ -379,12 +379,12 @@ fn create_grpc_stream_error_event(
         Ok(json) => json,
         Err(e) => {
             warn!(
-                "⚠️ [gRPC_SSE] 序列化 gRPC 流错误事件失败: session_id={}, error={}",
+                "⚠️ [gRPC_SSE] Failed to serialize gRPC stream error event: session_id={}, error={}",
                 session_id, e
             );
             // 返回包含基本信息的最小结构
             format!(
-                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"error","data":{{"code":"{}","message":"智能体电脑执行异常，请重试（消耗过多内存的任务可能导致智能体电脑进程终止）。"}}}}"#,
+                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"error","data":{{"code":"{}","message":"Agent computer execution error, please retry (tasks consuming too much memory may cause the agent computer process to terminate)."}}}}"#,
                 session_id, error_code
             )
         }
@@ -414,12 +414,12 @@ fn create_connection_error_event(session_id: &str, message: &str) -> axum::respo
         Ok(json) => json,
         Err(e) => {
             warn!(
-                "⚠️ [gRPC_SSE] 序列化连接失败错误事件失败: session_id={}, error={}",
+                "⚠️ [gRPC_SSE] Failed to serialize connection error event: session_id={}, error={}",
                 session_id, e
             );
             // 返回包含基本信息的最小结构
             format!(
-                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"error","data":{{"code":"GRPC_CONNECTION_FAILED","message":"连接失败"}}}}"#,
+                r#"{{"session_id":"{}","message_type":"SessionPromptEnd","sub_type":"error","data":{{"code":"GRPC_CONNECTION_FAILED","message":"Connection failed"}}}}"#,
                 session_id
             )
         }

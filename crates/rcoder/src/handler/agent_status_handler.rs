@@ -110,7 +110,7 @@ pub async fn agent_status(
         };
 
         info!(
-            "✅ [AGENT_STATUS] 成功获取Agent状态: project_id={}, status={:?}",
+            "✅ [AGENT_STATUS] Successfully retrieved Agent status: project_id={}, status={:?}",
             project_id,
             agent_info.status()
         );
@@ -118,7 +118,7 @@ pub async fn agent_status(
         Ok(HttpResult::success(response))
     } else {
         info!(
-            "📭 [AGENT_STATUS] Agent服务不存在: project_id={}",
+            "📭 [AGENT_STATUS] Agent service not found: project_id={}",
             project_id
         );
 

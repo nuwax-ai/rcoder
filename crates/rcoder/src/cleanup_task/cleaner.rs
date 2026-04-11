@@ -117,7 +117,7 @@ impl AgentCleaner {
 
         let duration = start_time.elapsed();
         info!(
-            "✅ [cleaner] 清理完成，耗时: {:.2}秒, 本次: {}",
+            "✅ [cleaner] Cleanup completed, duration: {:.2}s, this run: {}",
             duration.as_secs_f64(),
             current_stats.summary()
         );

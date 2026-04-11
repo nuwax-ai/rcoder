@@ -143,7 +143,7 @@ impl AppState {
     pub fn update_session(&self, project_id: &str, session_id: &str) {
         if let Err(e) = self.projects.update_session(project_id, session_id) {
             tracing::error!(
-                "更新会话失败: project_id={}, session_id={}, error={}",
+                "Failed to update session: project_id={}, session_id={}, error={}",
                 project_id,
                 session_id,
                 e
