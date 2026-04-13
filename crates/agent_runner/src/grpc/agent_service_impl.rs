@@ -248,10 +248,11 @@ impl AgentService for AgentServiceImpl {
             .map(shared_types::MaskedModelConfig);
 
         info!(
-            "🚀 [gRPC] Chat request: project_id={}, session_id={}, prompt_len={}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
+            "🚀 [gRPC] Chat request: project_id={}, session_id={}, prompt_len={}, agent_config={:?}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
             req.project_id,
             req.session_id,
             req.prompt.len(),
+            req.agent_config,
             model_config_debug,
             req.service_type,
             req.user_id,
