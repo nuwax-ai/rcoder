@@ -32,6 +32,7 @@ filetime = "0.2"
 # Internal crates
 shared_types = { path = "../shared_types" }
 rcoder-proxy = { path = "../rcoder-proxy" }
+container-runtime-api = { path = "../container-runtime-api" }
 
 # 🚀 无锁配置热更新
 arc-swap = "1.8"

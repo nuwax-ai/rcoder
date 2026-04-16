@@ -34,6 +34,7 @@ use service::{
 
 // 导入统一的容器停止模块
 use docker_manager::container_stop;
+use docker_manager::runtime_selection::RuntimeType;
 
 // 路由创建函数已移动到 handler 模块
 
@@ -184,64 +185,74 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("Docker Manager initialization failed: {}", e));
     }
 
-    // 获取初始化后的 DockerManager
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(dm) => {
-            info!("Docker Manager initialized successfully (with config)");
-            dm
-        }
-        Err(e) => {
-            error!("get Docker Manager failed: {}", e);
-            return Err(anyhow::anyhow!("Failed to get Docker Manager: {}", e));
-        }
-    };
-
-    // 🔧 从配置获取多镜像配置用于容器清理
-    let multi_image_config = if let Some(docker_config) = &config.docker_config {
-        docker_config.get_multi_image_config()
-    } else {
-        shared_types::create_default_multi_image_config()
-    };
-
     info!("checking cleanup for container (enabled)...");
     if config.cleanup_config.enabled {
-        match container_stop::startup_cleanup_all_enabled_services(
-            &docker_manager,
-            &multi_image_config,
-        )
-        .await
-        {
-            Ok(result) => {
-                let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
-                if result.successfully_removed > 0 {
-                    info!(
-                        "✅ Startup cleanup completed, removed {} leftover containers (covering {} service types)",
-                        result.successfully_removed,
-                        enabled_services.len()
-                    );
-                } else {
-                    info!("no containers to cleanup");
-                }
+        match docker_manager::runtime::RuntimeManager::runtime_type() {
+            RuntimeType::Docker => {
+                let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+                    Ok(dm) => {
+                        info!("Docker Manager initialized successfully (with config)");
+                        dm
+                    }
+                    Err(e) => {
+                        error!("get Docker Manager failed: {}", e);
+                        return Err(anyhow::anyhow!("Failed to get Docker Manager: {}", e));
+                    }
+                };
 
-                // 如果有失败的清理（非409错误），记录警告
-                if result.failed_removals > 0 {
-                    warn!(
-                        "container cleanup failed: failed count={}",
-                        result.failed_removals
-                    );
-                    for failure in &result.failed_removals_details {
-                        warn!(
-                            "  - Container {} ({}): {}",
-                            failure.container_id, failure.container_name, failure.error_message
-                        );
+                let multi_image_config = if let Some(docker_config) = &config.docker_config {
+                    docker_config.get_multi_image_config()
+                } else {
+                    shared_types::create_default_multi_image_config()
+                };
+
+                match container_stop::startup_cleanup_all_enabled_services(
+                    &docker_manager,
+                    &multi_image_config,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
+                        if result.successfully_removed > 0 {
+                            info!(
+                                "✅ Startup cleanup completed, removed {} leftover containers (covering {} service types)",
+                                result.successfully_removed,
+                                enabled_services.len()
+                            );
+                        } else {
+                            info!("no containers to cleanup");
+                        }
+
+                        if result.failed_removals > 0 {
+                            warn!(
+                                "container cleanup failed: failed count={}",
+                                result.failed_removals
+                            );
+                            for failure in &result.failed_removals_details {
+                                warn!(
+                                    "  - Container {} ({}): {}",
+                                    failure.container_id, failure.container_name, failure.error_message
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("container cleanup failed: {}, cleanup skipped", e);
                     }
                 }
             }
-            Err(e) => {
-                warn!(
-                    "container cleanup failed: {}, cleanup skipped",
-                    e
-                );
+            RuntimeType::Kubernetes => {
+                match docker_manager::runtime::RuntimeManager::get().await {
+                    Ok(runtime) => {
+                        if let Err(e) = runtime.cleanup_all().await {
+                            warn!("k8s startup cleanup failed: {}", e);
+                        } else {
+                            info!("k8s startup cleanup completed");
+                        }
+                    }
+                    Err(e) => warn!("failed to get runtime for k8s startup cleanup: {}", e),
+                }
             }
         }
     } else {
@@ -689,36 +700,47 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) 
 async fn cleanup_all_containers() -> anyhow::Result<()> {
     info!("🧹 starting cleanup of dynamically created containers...");
 
-    let docker_manager = docker_manager::global::get_global_docker_manager()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get global DockerManager: {}", e))?;
+    match docker_manager::runtime::RuntimeManager::runtime_type() {
+        RuntimeType::Docker => {
+            let docker_manager = docker_manager::global::get_global_docker_manager()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get global DockerManager: {}", e))?;
 
-    // 🔧 使用默认多镜像配置
-    // 注意：在关闭时使用默认配置是安全的，因为启用的服务类型在默认配置中已定义
-    let multi_image_config = shared_types::create_default_multi_image_config();
+            let multi_image_config = shared_types::create_default_multi_image_config();
+            match container_stop::startup_cleanup_all_enabled_services(
+                &docker_manager,
+                &multi_image_config,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if result.successfully_removed > 0 {
+                        info!(
+                            "🧹 Cleaned up {} containers (all enabled services)",
+                            result.successfully_removed
+                        );
+                    }
 
-    // 使用启动清理策略（服务关闭时也使用相同策略）
-    // 🔒 安全说明：只清理数据库中有记录的容器，不会影响其他 RCoder 实例
-    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
-        .await
-    {
-        Ok(result) => {
-            if result.successfully_removed > 0 {
-                info!(
-                    "🧹 Cleaned up {} containers (all enabled services)",
-                    result.successfully_removed
-                );
-            }
-
-            if result.failed_removals > 0 {
-                warn!(
-                    "container cleanup failed: failed count={}",
-                    result.failed_removals
-                );
+                    if result.failed_removals > 0 {
+                        warn!(
+                            "container cleanup failed: failed count={}",
+                            result.failed_removals
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("container cleanup error: {}", e);
+                }
             }
         }
-        Err(e) => {
-            warn!("container cleanup error: {}", e);
+        RuntimeType::Kubernetes => {
+            let runtime = docker_manager::runtime::RuntimeManager::get()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get runtime: {}", e))?;
+            runtime
+                .cleanup_all()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to cleanup runtime resources: {}", e))?;
         }
     }
 

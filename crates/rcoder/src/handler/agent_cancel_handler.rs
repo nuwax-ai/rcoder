@@ -236,32 +236,50 @@ async fn forward_cancel_request_to_container_service(
 ///
 /// 使用容器名称而非 ID，因为容器重启后 ID 会变，但名称不变
 async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> bool {
-    match docker_manager::global::get_global_docker_manager().await {
-        Ok(docker_manager) => {
-            // 通过容器名称查找（名称在容器重启后不变）
-            // 使用 get_container_info_by_name 获取完整的容器信息
-            match docker_manager
-                .get_container_info_by_name(&container_info.container_name)
-                .await
+    match docker_manager::runtime::RuntimeManager::get().await {
+        Ok(runtime) => {
+            let rcoder_prefix = shared_types::ServiceType::RCoder.container_prefix();
+            let computer_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
+
+            let query = if let Some(identifier) = container_info
+                .container_name
+                .strip_prefix(&format!("{}-", computer_prefix))
             {
+                runtime
+                    .get_container_info_by_identifier(
+                        identifier,
+                        &shared_types::ServiceType::ComputerAgentRunner,
+                    )
+                    .await
+            } else if let Some(identifier) = container_info
+                .container_name
+                .strip_prefix(&format!("{}-", rcoder_prefix))
+            {
+                runtime
+                    .get_container_info_by_identifier(identifier, &shared_types::ServiceType::RCoder)
+                    .await
+            } else {
+                return true;
+            };
+
+            match query {
                 Ok(Some(info)) => {
                     debug!(
-                        "🔍 [CANCEL_FORWARD] Docker container exists: name={}, id={}, status={:?}",
-                        info.container_name, info.container_id, info.status
+                        "🔍 [CANCEL_FORWARD] Runtime container exists: name={}, id={}",
+                        info.container_name, info.container_id
                     );
                     true
                 }
                 Ok(None) => {
                     info!(
-                        "🔍 [CANCEL_FORWARD] Docker container not found (already destroyed): {}",
+                        "🔍 [CANCEL_FORWARD] Runtime container not found (already destroyed): {}",
                         container_info.container_name
                     );
                     false
                 }
                 Err(e) => {
-                    // Query failed，保守地认为容器存在
                     warn!(
-                        "⚠️ [CANCEL_FORWARD] Failed to query container status: {}, conservatively assuming container exists",
+                        "⚠️ [CANCEL_FORWARD] Failed to query runtime container status: {}, conservatively assuming container exists",
                         e
                     );
                     true
@@ -269,9 +287,9 @@ async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> 
             }
         }
         Err(e) => {
-            // 无法获取 Docker Manager，保守地认为容器存在
+            // 无法获取 runtime，保守地认为容器存在
             warn!(
-                "[CANCEL_FORWARD] Failed to get Docker Manager: {}, conservatively assuming container exists",
+                "[CANCEL_FORWARD] Failed to get runtime: {}, conservatively assuming container exists",
                 e
             );
             true

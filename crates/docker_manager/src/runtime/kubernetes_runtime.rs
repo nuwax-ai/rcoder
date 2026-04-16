@@ -33,6 +33,8 @@ use tracing::info;
 
 #[cfg(feature = "kubernetes")]
 use crate::types::DockerManagerConfig;
+#[cfg(feature = "kubernetes")]
+const RUNTIME_MANAGED_LABEL: &str = "managed-by=rcoder-runtime";
 
 /// Kubernetes runtime implementation using kube-rs
 #[cfg(feature = "kubernetes")]
@@ -119,13 +121,37 @@ impl KubernetesRuntime {
         }
     }
 
+    fn runtime_info_from_pod(pod: &Pod) -> RuntimeContainerInfo {
+        let status = Self::extract_pod_status(pod);
+        let metadata = &pod.metadata;
+        RuntimeContainerInfo {
+            container_id: metadata.uid.clone().unwrap_or_default(),
+            container_name: metadata.name.clone().unwrap_or_default(),
+            container_ip: pod
+                .status
+                .as_ref()
+                .and_then(|s| s.pod_ip.clone())
+                .unwrap_or_default(),
+            status,
+            created_at: metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|ts| ts.0)
+                .unwrap_or_else(Utc::now),
+        }
+    }
+
     /// Wait for pod to be ready
-    async fn wait_for_pod_ready(&self, project_id: &str) -> ContainerRuntimeResult<()> {
+    async fn wait_for_pod_ready(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
         let timeout = std::time::Duration::from_secs(120);
         let start = std::time::Instant::now();
 
         while start.elapsed() < timeout {
-            if let Some(pod) = self.find_container(project_id, &ServiceType::RCoder).await? {
+            if let Some(pod) = self.find_container(identifier, service_type).await? {
                 if pod.status == ContainerRuntimeStatus::Running {
                     return Ok(());
                 }
@@ -139,7 +165,7 @@ impl KubernetesRuntime {
     }
 
     /// Select image based on service type
-    fn select_image(&self, service_type: ServiceType) -> String {
+    fn select_image(&self, service_type: &ServiceType) -> String {
         match service_type {
             ServiceType::RCoder => std::env::var("RCODER_DOCKER_IMAGE")
                 .unwrap_or_else(|_| "registry.yichamao.com/agent-runner:latest".to_string()),
@@ -179,44 +205,53 @@ impl ContainerRuntime for KubernetesRuntime {
     async fn create_container(
         &self,
         project_id: Option<&str>,
-        _user_id: Option<&str>,
+        user_id: Option<&str>,
         _host_workspace_path: &str,
         service_type: ServiceType,
         _resource_limits: Option<ServiceResourceLimits>,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        let project_id =
-            project_id.ok_or_else(|| {
-                ContainerRuntimeError::ConfigurationError(
-                    "project_id is required for K8s runtime".to_string(),
-                )
-            })?;
+        // 确定容器标识符：user_id 优先（ComputerAgentRunner），否则用 project_id
+        let identifier = user_id.or(project_id).ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError(
+                "Either project_id or user_id must be provided".to_string(),
+            )
+        })?;
 
-        let pod_name = self.pod_name(project_id, &service_type);
+        // Pod 名称：当 user_id 存在时使用它（ComputerAgentRunner）来保证唯一性
+        let pod_name = match user_id {
+            Some(uid) => format!("{}-{}", service_type.container_prefix(), uid),
+            None => format!("{}-{}", service_type.container_prefix(), project_id.unwrap()),
+        };
 
         // Check if pod already exists and is running
-        if let Some(cached) = self.pod_cache.read().await.get(project_id) {
+        if let Some(cached) = self.pod_cache.read().await.get(identifier) {
             if cached.status == ContainerRuntimeStatus::Running {
                 info!("[K8S] Pod {} already exists and is running", pod_name);
                 return self
-                    .get_container_info(project_id)
+                    .get_container_info_by_identifier(identifier, &service_type)
                     .await?
                     .ok_or_else(|| {
-                        ContainerRuntimeError::ContainerNotFound(project_id.to_string())
+                        ContainerRuntimeError::ContainerNotFound(identifier.to_string())
                     });
             }
         }
 
         let service_type_str = service_type.to_string();
-        let image = self.select_image(service_type);
+        let image = self.select_image(&service_type);
 
         // Build labels using BTreeMap (required by k8s-openapi)
-        let labels: BTreeMap<String, String> = vec![
+        // 当 user_id 存在时添加 user_id label，用于查询
+        let mut label_pairs = vec![
             ("app".to_string(), "rcoder".to_string()),
-            ("project_id".to_string(), project_id.to_string()),
+            ("managed-by".to_string(), "rcoder-runtime".to_string()),
             ("service_type".to_string(), service_type_str.clone()),
-        ]
-        .into_iter()
-        .collect();
+        ];
+        if let Some(uid) = user_id {
+            label_pairs.push(("user_id".to_string(), uid.to_string()));
+        } else {
+            label_pairs.push(("project_id".to_string(), project_id.unwrap().to_string()));
+        }
+        let labels: BTreeMap<String, String> = label_pairs.into_iter().collect();
 
         // Build Pod object using k8s-openapi types
         let pod: Pod = Pod {
@@ -233,7 +268,12 @@ impl ContainerRuntime for KubernetesRuntime {
                     env: Some(vec![
                         EnvVar {
                             name: "PROJECT_ID".to_string(),
-                            value: Some(project_id.to_string()),
+                            value: Some(project_id.unwrap_or_default().to_string()),
+                            ..Default::default()
+                        },
+                        EnvVar {
+                            name: "USER_ID".to_string(),
+                            value: Some(user_id.unwrap_or_default().to_string()),
                             ..Default::default()
                         },
                         EnvVar {
@@ -267,108 +307,131 @@ impl ContainerRuntime for KubernetesRuntime {
         info!("[K8S] Pod {} created successfully", pod_name);
 
         // Wait for pod to be ready
-        self.wait_for_pod_ready(project_id).await?;
+        self.wait_for_pod_ready(identifier, &service_type).await?;
 
         // Get pod info
-        self.get_container_info(project_id).await?.ok_or_else(|| {
-            ContainerRuntimeError::ContainerCreationError("Pod created but info not found".to_string())
-        })
+        self.get_container_info_by_identifier(identifier, &service_type)
+            .await?
+            .ok_or_else(|| {
+                ContainerRuntimeError::ContainerCreationError(
+                    "Pod created but info not found".to_string(),
+                )
+            })
     }
 
     async fn get_container_info(
         &self,
-        project_id: &str,
+        identifier: &str,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         // Try cache first
-        if let Some(cached) = self.pod_cache.read().await.get(project_id) {
+        if let Some(cached) = self.pod_cache.read().await.get(identifier) {
             if cached.status == ContainerRuntimeStatus::Running {
                 return Ok(Some(
-                    self.build_container_basic_info(project_id, cached).await?,
+                    self.build_container_basic_info(identifier, cached).await?,
                 ));
             }
         }
 
-        // Query K8s API - try to find pod with this project_id label
-        let lp = ListParams::default().labels(&format!("project_id={}", project_id));
-        let pods = self.pods().list(&lp).await.map_err(|e| {
-            ContainerRuntimeError::K8sError(format!("Failed to list pods: {}", e))
-        })?;
+        // Query K8s API - 尝试两种稳定标识查询：
+        // 1. project_id label
+        // 2. user_id label
+        let search_queries = vec![
+            format!("project_id={}", identifier),
+            format!("user_id={}", identifier),
+        ];
 
-        for p in pods.items {
-            let pod: Pod = p;
-            let status = Self::extract_pod_status(&pod);
-            let metadata = &pod.metadata;
-            let uid = metadata.uid.clone().unwrap_or_default();
-            let name = metadata.name.clone().unwrap_or_default();
-            let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.clone()).unwrap_or_default();
-            let created_at = metadata
-                .creation_timestamp
-                .as_ref()
-                .map(|ts| ts.0)
-                .unwrap_or_else(|| Utc::now());
+        for query in search_queries {
+            let lp = ListParams::default().labels(&query);
+            if let Ok(pods) = self.pods().list(&lp).await {
+                for p in pods.items {
+                    let pod: Pod = p;
+                    let status = Self::extract_pod_status(&pod);
+                    let metadata = &pod.metadata;
+                    let uid = metadata.uid.clone().unwrap_or_default();
+                    let name = metadata.name.clone().unwrap_or_default();
+                    let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.clone()).unwrap_or_default();
+                    let created_at = metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|ts| ts.0)
+                        .unwrap_or_else(|| Utc::now());
 
-            let pod_info = RuntimeContainerInfo {
-                container_id: uid,
-                container_name: name,
-                container_ip: pod_ip,
-                status,
-                created_at,
-            };
+                    let pod_info = RuntimeContainerInfo {
+                        container_id: uid,
+                        container_name: name,
+                        container_ip: pod_ip,
+                        status,
+                        created_at,
+                    };
 
-            // Update cache if running
-            if pod_info.status == ContainerRuntimeStatus::Running {
-                self.pod_cache
-                    .write()
-                    .await
-                    .insert(project_id.to_string(), pod_info.clone());
+                    // Update cache if running
+                    if pod_info.status == ContainerRuntimeStatus::Running {
+                        self.pod_cache
+                            .write()
+                            .await
+                            .insert(identifier.to_string(), pod_info.clone());
+                    }
+
+                    return Ok(Some(
+                        self.build_container_basic_info(identifier, &pod_info).await?,
+                    ));
+                }
             }
-
-            return Ok(Some(
-                self.build_container_basic_info(project_id, &pod_info).await?,
-            ));
         }
 
         Ok(None)
     }
 
+    async fn get_container_info_by_identifier(
+        &self,
+        identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        self.get_container_info(identifier).await
+    }
+
     async fn find_container(
         &self,
-        project_id: &str,
+        identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
         // Check cache first
-        if let Some(cached) = self.pod_cache.read().await.get(project_id) {
+        if let Some(cached) = self.pod_cache.read().await.get(identifier) {
             return Ok(Some(cached.clone()));
         }
 
-        // Query K8s
-        let pod_name = self.pod_name(project_id, service_type);
-        let pod: Pod = match self.pods().get(&pod_name).await {
-            Ok(p) => p,
-            Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(None),
+        // 1) Query by concrete pod name
+        let pod_name = self.pod_name(identifier, service_type);
+        match self.pods().get(&pod_name).await {
+            Ok(pod) => return Ok(Some(Self::runtime_info_from_pod(&pod))),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
-                    "Failed to get pod: {}",
-                    e
+                    "Failed to get pod by name '{}': {}",
+                    pod_name, e
                 )))
             }
-        };
+        }
 
-        let status = Self::extract_pod_status(&pod);
-        let metadata = &pod.metadata;
-        let pod_info = RuntimeContainerInfo {
-            container_id: metadata.uid.clone().unwrap_or_default(),
-            container_name: metadata.name.clone().unwrap_or_default(),
-            container_ip: pod.status.as_ref().and_then(|s| s.pod_ip.clone()).unwrap_or_default(),
-            status,
-            created_at: metadata
-                .creation_timestamp
-                .as_ref()
-                .map(|ts| ts.0)
-                .unwrap_or_else(|| Utc::now()),
-        };
+        // 2) Query by labels
+        for selector in [format!("user_id={}", identifier), format!("project_id={}", identifier)] {
+            let pods = self
+                .pods()
+                .list(&ListParams::default().labels(&selector).limit(1))
+                .await
+                .map_err(|e| {
+                    ContainerRuntimeError::K8sError(format!(
+                        "Failed to list pods with selector '{}': {}",
+                        selector, e
+                    ))
+                })?;
 
-        Ok(Some(pod_info))
+            if let Some(pod) = pods.items.into_iter().next() {
+                return Ok(Some(Self::runtime_info_from_pod(&pod)));
+            }
+        }
+
+        Ok(None)
     }
 
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()> {
@@ -388,6 +451,27 @@ impl ContainerRuntime for KubernetesRuntime {
         Ok(())
     }
 
+    async fn stop_container_by_identifier(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        let pod_name = self.pod_name(identifier, service_type);
+
+        match self.pods().delete(&pod_name, &DeleteParams::default()).await {
+            Ok(_) => {
+                self.pod_cache.write().await.remove(identifier);
+                info!("[K8S] Pod {} deleted successfully", pod_name);
+                Ok(())
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+            Err(e) => Err(ContainerRuntimeError::ContainerStopError(format!(
+                "Failed to delete pod {}: {}",
+                pod_name, e
+            ))),
+        }
+    }
+
     async fn is_container_running(&self, project_id: &str) -> ContainerRuntimeResult<bool> {
         Ok(self
             .find_container(project_id, &ServiceType::RCoder)
@@ -396,8 +480,20 @@ impl ContainerRuntime for KubernetesRuntime {
             .unwrap_or(false))
     }
 
+    async fn is_container_running_by_identifier(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(self
+            .find_container(identifier, service_type)
+            .await?
+            .map(|p| p.status == ContainerRuntimeStatus::Running)
+            .unwrap_or(false))
+    }
+
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
-        let lp = ListParams::default().labels("app=rcoder");
+        let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
         let pods = self.pods().list(&lp).await.map_err(|e| {
             ContainerRuntimeError::K8sError(format!("Failed to list pods: {}", e))
         })?;
@@ -425,7 +521,7 @@ impl ContainerRuntime for KubernetesRuntime {
     }
 
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
-        let lp = ListParams::default().labels("app=rcoder");
+        let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
         let _ = self.pods().delete_collection(&DeleteParams::default(), &lp).await.map_err(|e| {
             ContainerRuntimeError::ConnectionError(format!("Failed to cleanup pods: {}", e))
         })?;

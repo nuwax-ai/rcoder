@@ -1,15 +1,15 @@
 //! VNC 后端同步任务
 //!
-//! 定期从 DockerManager 同步容器的 IP 到 Pingora 的 vnc_backends 映射。
-//! 使用 `DockerContainerInfo.container_key()` 获取正确的业务标识符：
-//! - RCoder 模式: 使用 `project_id`
-//! - ComputerAgentRunner 模式: 使用 `user_id`
+//! 定期从 Runtime 同步容器的 IP 到 Pingora 的 vnc_backends 映射。
+//! 使用容器命名规则解析业务标识符：
+//! - RCoder: `rcoder-agent-{project_id}`
+//! - ComputerAgentRunner: `computer-agent-runner-{user_id}`
 //! 解决服务重启后 VNC 映射丢失的问题，并支持容器重启后自动更新 IP。
 
 use rcoder_proxy::PingoraProxyService;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// VNC 后端同步配置
 #[derive(Debug, Clone)]
@@ -58,26 +58,48 @@ pub fn start_vnc_sync_task(
 
 /// 同步 VNC 后端映射
 async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(dm) => dm,
+    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
+        Ok(rt) => rt,
         Err(e) => {
-            warn!("[VNC_SYNC] Failed to get DockerManager: {}", e);
+            warn!("[VNC_SYNC] Failed to get runtime: {}", e);
             return;
         }
     };
 
-    // 获取所有容器（DockerManager 已经管理了所有容器的元数据）
-    let containers = docker_manager.list_containers().await;
+    let containers = match runtime.list_containers().await {
+        Ok(list) => list,
+        Err(e) => {
+            warn!("[VNC_SYNC] Failed to list containers from runtime: {}", e);
+            return;
+        }
+    };
     if containers.is_empty() {
         debug!("[VNC_SYNC] Syncing containers");
         return;
     }
 
-    // 预先收集运行中容器的 user_id 集合（用于后续清理旧映射）
+    let computer_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
+    let rcoder_prefix = shared_types::ServiceType::RCoder.container_prefix();
+
+    // 预先收集运行中容器的 key 集合（用于后续清理旧映射）
     let active_user_ids: std::collections::HashSet<String> = containers
         .iter()
-        .filter(|c| c.status.to_string().to_lowercase() == "running")
-        .map(|c| c.container_key().to_string())
+        .filter(|c| c.status == container_runtime_api::ContainerRuntimeStatus::Running)
+        .filter_map(|c| {
+            if c.container_name.starts_with(computer_prefix) {
+                return c
+                    .container_name
+                    .strip_prefix(&format!("{}-", computer_prefix))
+                    .map(|v| v.to_string());
+            }
+            if c.container_name.starts_with(rcoder_prefix) {
+                return c
+                    .container_name
+                    .strip_prefix(&format!("{}-", rcoder_prefix))
+                    .map(|v| v.to_string());
+            }
+            None
+        })
         .filter(|k| !k.is_empty())
         .collect();
 
@@ -85,10 +107,21 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
     let mut updated_count = 0;
 
     for container_info in containers {
-        // 使用 container_key() 获取正确的业务标识符
-        // - RCoder 模式: 返回 project_id
-        // - ComputerAgentRunner 模式: 返回 user_id（如果有），否则回退到 project_id
-        let user_id = container_info.container_key();
+        let user_id = if container_info.container_name.starts_with(computer_prefix) {
+            container_info
+                .container_name
+                .strip_prefix(&format!("{}-", computer_prefix))
+                .unwrap_or("")
+                .to_string()
+        } else if container_info.container_name.starts_with(rcoder_prefix) {
+            container_info
+                .container_name
+                .strip_prefix(&format!("{}-", rcoder_prefix))
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
         if user_id.is_empty() {
             debug!(
                 "⏭️ [VNC_SYNC] Skipping container without business identifier: {}",
@@ -98,36 +131,23 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
         }
 
         // 检查容器是否在运行
-        if container_info.status.to_string().to_lowercase() != "running" {
+        if container_info.status != container_runtime_api::ContainerRuntimeStatus::Running {
             debug!(
                 "⏭️ [VNC_SYNC] Skipping non-running container: {} (status={})",
                 container_info.container_name,
-                container_info.status.to_string()
+                String::from(container_info.status.clone())
             );
             continue;
         }
 
-        // 获取容器 IP
-        let container_ip = match docker_manager
-            .get_container_connection_info(&container_info)
-            .await
-        {
-            Ok(Some(ip)) => ip,
-            Ok(None) => {
-                warn!(
-                    "⚠️ [VNC_SYNC] Container {} has no IP address",
-                    container_info.container_name
-                );
-                continue;
-            }
-            Err(e) => {
-                error!(
-                    "❌ [VNC_SYNC] Failed to get container {} IP: {}",
-                    container_info.container_name, e
-                );
-                continue;
-            }
-        };
+        let container_ip = container_info.container_ip.clone();
+        if container_ip.is_empty() {
+            warn!(
+                "⚠️ [VNC_SYNC] Container {} has no IP address",
+                container_info.container_name
+            );
+            continue;
+        }
 
         // 检查是否需要更新映射
         let needs_update = match pingora_service.get_vnc_backend(&user_id) {

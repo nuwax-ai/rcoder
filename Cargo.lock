@@ -4579,6 +4579,7 @@ dependencies = [
  "bytes 1.11.1",
  "chrono",
  "clap 4.5.57",
+ "container-runtime-api",
  "dashmap",
  "derive_builder",
  "docker_manager",

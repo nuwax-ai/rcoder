@@ -93,6 +93,38 @@ pub trait ContainerRuntime: Send + Sync {
         project_id: &str,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>>;
 
+    /// Get container information by identifier + service type.
+    ///
+    /// `identifier` means:
+    /// - RCoder: `project_id`
+    /// - ComputerAgentRunner: `user_id`
+    async fn get_container_info_by_identifier(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if matches!(service_type, ServiceType::RCoder) {
+            return self.get_container_info(identifier).await;
+        }
+
+        let info = self.find_container(identifier, service_type).await?;
+        Ok(info.map(|pod| ContainerBasicInfo {
+            container_id: pod.container_id,
+            container_name: pod.container_name,
+            container_ip: pod.container_ip.clone(),
+            internal_port: shared_types::GRPC_DEFAULT_PORT,
+            external_port: 0,
+            project_id: identifier.to_string(),
+            status: String::from(pod.status),
+            created_at: pod.created_at,
+            service_url: format!(
+                "http://{}:{}",
+                pod.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            ),
+        }))
+    }
+
     /// Find container by project_id (returns None if not running)
     async fn find_container(
         &self,
@@ -103,8 +135,34 @@ pub trait ContainerRuntime: Send + Sync {
     /// Stop and remove container
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()>;
 
+    /// Stop and remove container by identifier + service type.
+    ///
+    /// `identifier` means:
+    /// - RCoder: `project_id`
+    /// - ComputerAgentRunner: `user_id`
+    async fn stop_container_by_identifier(
+        &self,
+        identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        self.stop_container(identifier).await
+    }
+
     /// Get container status
     async fn is_container_running(&self, project_id: &str) -> ContainerRuntimeResult<bool>;
+
+    /// Get container status by identifier + service type.
+    async fn is_container_running_by_identifier(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(self
+            .find_container(identifier, service_type)
+            .await?
+            .map(|c| c.status == ContainerRuntimeStatus::Running)
+            .unwrap_or(false))
+    }
 
     /// List all containers managed by this runtime
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>>;

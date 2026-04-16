@@ -45,11 +45,10 @@ async fn destroy_container_for_project(
         project_id
     );
 
-    // 使用全局 DockerManager
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(manager) => manager,
+    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
+        Ok(rt) => rt,
         Err(e) => {
-            error!("[STOP_DESTROY] Failed to get global DockerManager: {}", e);
+            error!("[STOP_DESTROY] Failed to get runtime: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_ERROR,
                 locale,
@@ -57,59 +56,11 @@ async fn destroy_container_for_project(
         }
     };
 
-    // 尝试通过多种方式查找容器
-    // 1. 先通过 project_id 查找
-    let container_info = docker_manager.get_container_info(project_id).await;
-
-    // 2. 如果没找到，尝试通过容器名称实时查找并直接停止
-    if container_info.is_none() {
-        let expected_container_name = format!("rcoder-agent-{}", project_id);
-        info!(
-            "🔍 [STOP_DESTROY] Cache not found via project_id, trying real-time container lookup: {}",
-            expected_container_name
-        );
-
-        // 使用 find_container_realtime 获取最新的容器信息
-        if let Ok(Some(result)) = docker_manager
-            .find_container_realtime(&expected_container_name)
-            .await
-        {
-            info!(
-                "🎯 [STOP_DESTROY] Real-time container found: container_id={}, name={}, status={:?}, running={}",
-                result.container_id, result.container_name, result.status, result.is_running
-            );
-
-            // 直接使用 container_id 停止容器（无需再查缓存）
-            let stop_result = docker_manager
-                .stop_container_by_id(&result.container_id)
-                .await;
-
-            if let Err(e) = stop_result {
-                error!("[STOP_DESTROY] stoppedcontainerfailed: {}", e);
-                return Ok(HttpResult::error_with_locale(
-                    shared_types::error_codes::ERR_STOP_FAILED,
-                    locale,
-                ));
-            }
-
-            // 从 DuckDB 存储中移除项目
-            state.remove_project(project_id);
-
-            info!(
-                "✅ [STOP_DESTROY] Container destroyed successfully (real-time lookup): project_id={}, container_id={}",
-                project_id, result.container_id
-            );
-
-            let response = StopAgentResponse {
-                success: true,
-                project_id: project_id.to_string(),
-                session_id: None,
-                message: shared_types::get_i18n_message("success.container_destroyed", locale),
-            };
-
-            return Ok(HttpResult::success(response));
-        }
-    }
+    let container_info = runtime
+        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)
+        .await
+        .ok()
+        .flatten();
 
     if let Some(container_info) = container_info {
         info!(
@@ -118,8 +69,8 @@ async fn destroy_container_for_project(
         );
 
         // 停止容器
-        let stop_result = docker_manager
-            .stop_container_by_id(&container_info.container_id)
+        let stop_result = runtime
+            .stop_container_by_identifier(project_id, &shared_types::ServiceType::RCoder)
             .await;
 
         if let Err(e) = stop_result {

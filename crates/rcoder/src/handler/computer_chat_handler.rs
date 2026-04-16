@@ -165,10 +165,15 @@ pub async fn handle_computer_chat(
                 // 标记已被移除 = 创建完成
                 if !state.pod_creating.contains_key(&user_id) {
                     // 尝试获取容器信息
-                    if let Ok(docker_mgr) =
-                        docker_manager::global::get_global_docker_manager().await
+                    if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await
                     {
-                        if let Ok(Some(info)) = docker_mgr.get_user_container_info(&user_id).await {
+                        if let Ok(Some(info)) = runtime
+                            .get_container_info_by_identifier(
+                                &user_id,
+                                &shared_types::ServiceType::ComputerAgentRunner,
+                            )
+                            .await
+                        {
                             info!(
                                 "✅ [COMPUTER_CHAT] Wait successful, container is ready (waited {}s): user_id={}, container_id={}",
                                 wait_sec, user_id, info.container_id
@@ -427,26 +432,31 @@ pub async fn handle_computer_chat(
                 result.is_success()
             );
 
-            // 🆕 KEY FIX: Get latest container network info from Docker API in real-time
-            // 这确保即使内存映射中的信息过时，也能获取到正确的 container_ip
-            let docker_manager = docker_manager::global::get_global_docker_manager()
+            // 从 Runtime API 获取最新容器信息，避免使用过期 IP
+            let runtime = docker_manager::runtime::RuntimeManager::get()
                 .await
                 .map_err(|e| {
-                    error!("[COMPUTER_CHAT] Failed to get DockerManager: {}", e);
-                    AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+                    error!("[COMPUTER_CHAT] Failed to get runtime: {}", e);
+                    AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
                 })?;
 
-            let container_info = match docker_manager.get_agent_info(&user_id).await {
+            let container_info = match runtime
+                .get_container_info_by_identifier(
+                    &user_id,
+                    &shared_types::ServiceType::ComputerAgentRunner,
+                )
+                .await
+            {
                 Ok(Some(info)) => {
                     info!(
-                        "🔄 [COMPUTER_CHAT] Getting latest container info from Docker API: user_id={}, container_id={}, container_ip={}",
+                        "🔄 [COMPUTER_CHAT] Getting latest container info from Runtime API: user_id={}, container_id={}, container_ip={}",
                         user_id, info.container_id, info.container_ip
                     );
                     info
                 }
                 Ok(None) => {
                     warn!(
-                        "⚠️ [COMPUTER_CHAT] Container not found in Docker API: user_id={}, using cached container info",
+                        "⚠️ [COMPUTER_CHAT] Container not found in runtime: user_id={}, using cached container info",
                         user_id
                     );
                     // 使用之前获取的容器信息
@@ -454,7 +464,7 @@ pub async fn handle_computer_chat(
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️ [COMPUTER_CHAT] Failed to get container info from Docker API: user_id={}, error={}, using cached container info",
+                        "⚠️ [COMPUTER_CHAT] Failed to get container info from runtime: user_id={}, error={}, using cached container info",
                         user_id, e
                     );
                     // 使用之前获取的容器信息

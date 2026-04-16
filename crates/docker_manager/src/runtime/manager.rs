@@ -30,7 +30,7 @@ impl RuntimeManager {
         let runtime: Arc<dyn ContainerRuntime> = match runtime_type {
             RuntimeType::Docker => {
                 info!("[RUNTIME] Initializing Docker runtime");
-                let docker_manager = crate::DockerManager::new(config)
+                let docker_manager = crate::DockerManager::new(config.clone())
                     .await
                     .map_err(|e| {
                         container_runtime_api::ContainerRuntimeError::ConnectionError(
@@ -50,7 +50,7 @@ impl RuntimeManager {
                     );
                 }
                 info!("[RUNTIME] Initializing Kubernetes runtime");
-                let k8s_runtime = KubernetesRuntime::new(config)
+                let k8s_runtime = KubernetesRuntime::new(config.clone())
                     .await
                     .map_err(|e| {
                         container_runtime_api::ContainerRuntimeError::K8sError(e.to_string())

@@ -421,14 +421,14 @@ async fn validate_and_get_session_context(
         }
     };
 
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(dm) => dm,
+    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
+        Ok(rt) => rt,
         Err(e) => {
-            error!("[SSE_PROXY] Failed to get global DockerManager: {}", e);
+            error!("[SSE_PROXY] Failed to get runtime: {}", e);
             return Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                "Unable to access Docker service. Please contact administrator.",
+                "Unable to access runtime service. Please contact administrator.",
             ));
         }
     };
@@ -457,12 +457,17 @@ async fn validate_and_get_session_context(
             );
 
             // 根据 service_type 选择不同的查询策略
-            // （使用已获取的 docker_manager 和 project_info，避免重复获取）
             let resolved_container_name = match project_info.service_type() {
                 Some(shared_types::ServiceType::ComputerAgentRunner) => {
                     // ComputerAgentRunner 模式：通过 user_id 查询容器
                     if let Some(user_id) = project_info.user_id() {
-                        match docker_manager.get_user_container_info(&user_id).await {
+                        match runtime
+                            .get_container_info_by_identifier(
+                                &user_id,
+                                &shared_types::ServiceType::ComputerAgentRunner,
+                            )
+                            .await
+                        {
                             Ok(Some(info)) => {
                                 info!(
                                     "✅ [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
@@ -557,17 +562,29 @@ async fn validate_and_get_session_context(
     } else {
         // 内存中没有容器信息，调用 Docker API 实时查询
         warn!(
-            "⚠️ [SSE_PROXY] Container info missing in memory, calling Docker API query: container_name={}",
+            "⚠️ [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
             container_name
         );
-        match docker_manager
-            .find_container_realtime(&container_name)
-            .await
-        {
+        let computer_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
+        let rcoder_prefix = shared_types::ServiceType::RCoder.container_prefix();
+        let query = if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix)) {
+            runtime
+                .find_container(id, &shared_types::ServiceType::ComputerAgentRunner)
+                .await
+        } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
+            runtime
+                .find_container(id, &shared_types::ServiceType::RCoder)
+                .await
+        } else {
+            runtime
+                .find_container(project_info.project_id(), &shared_types::ServiceType::RCoder)
+                .await
+        };
+        match query {
             Ok(Some(result)) => {
-                if result.is_running {
+                if result.status == container_runtime_api::ContainerRuntimeStatus::Running {
                     info!(
-                        "✅ [SSE_PROXY] Docker API query successful, container is running: container_name={}",
+                        "✅ [SSE_PROXY] Runtime query successful, container is running: container_name={}",
                         container_name
                     );
                 } else {
@@ -590,7 +607,7 @@ async fn validate_and_get_session_context(
                 ));
             }
             Err(e) => {
-                error!("❌ [SSE_PROXY] Docker API Query failed: {}", e);
+                error!("❌ [SSE_PROXY] Runtime query failed: {}", e);
                 return Err(create_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
@@ -1203,17 +1220,15 @@ async fn get_container_sse_url(
         project_id, session_id
     );
 
-    // 🎯 修复：使用全局DockerManager实例
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[CONTAINER] Failed to get global DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get global DockerManager: {}", e))
+            error!("[CONTAINER] Failed to get runtime: {}", e);
+            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
-    // 使用高级 API 获取容器信息
-    if let Some(info) = docker_manager
-        .get_agent_info(project_id)
+    if let Some(info) = runtime
+        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)
         .await
         .map_err(|e| {
             error!("[CONTAINER] Failed to get container info: {}", e);

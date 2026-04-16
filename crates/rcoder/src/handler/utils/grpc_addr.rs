@@ -66,26 +66,34 @@ pub async fn get_realtime_container_ip_with_cache(
         return Ok(cached_ip);
     }
 
-    // 2. 缓存未命中，查询 Docker API
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    // 2. 缓存未命中，查询 Runtime API
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
-        .map_err(|e| format!("Failed to get DockerManager: {}", e))?;
+        .map_err(|e| format!("Failed to get runtime: {}", e))?;
 
-    let network_ips = docker_manager
-        .get_container_network_info(container_name)
+    let computer_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
+    let rcoder_prefix = shared_types::ServiceType::RCoder.container_prefix();
+    let (identifier, service_type) = if let Some(id) =
+        container_name.strip_prefix(&format!("{}-", computer_prefix))
+    {
+        (id, shared_types::ServiceType::ComputerAgentRunner)
+    } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
+        (id, shared_types::ServiceType::RCoder)
+    } else {
+        return Ok(fallback_ip.to_string());
+    };
+
+    // 3. 优先使用 Runtime 查询到的 IP，并写入缓存
+    match runtime
+        .get_container_info_by_identifier(identifier, &service_type)
         .await
-        .map_err(|e| format!("failed to get container network info: {}", e))?;
-
-    // 3. 优先使用第一个可用的 IP，并写入缓存
-    match network_ips.values().next().cloned() {
-        Some(ip) => {
-            cache.insert(container_name.to_string(), ip.clone());
-            Ok(ip)
+    {
+        Ok(Some(info)) if !info.container_ip.is_empty() => {
+            cache.insert(container_name.to_string(), info.container_ip.clone());
+            Ok(info.container_ip)
         }
-        None => {
-            // 如果无法获取 IP，使用 fallback
-            Ok(fallback_ip.to_string())
-        }
+        Ok(_) => Ok(fallback_ip.to_string()),
+        Err(e) => Err(format!("failed to get container info from runtime: {}", e)),
     }
 }
 

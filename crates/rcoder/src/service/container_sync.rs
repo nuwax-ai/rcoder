@@ -1,7 +1,7 @@
 //! 容器状态同步任务
 //!
-//! 定期从 Docker 同步容器状态到内存缓存。
-//! 主要用于检测被外部手动停止/删除的容器，并从缓存中清理。
+//! 定期从运行时同步容器状态。
+//! 在 K8s 模式下通过 Runtime API 获取 Pod 状态；在 Docker 模式下同样通过 Runtime 抽象层访问。
 
 use std::time::Duration;
 use tracing::{info, warn};
@@ -38,29 +38,19 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
         loop {
             interval.tick().await;
 
-            // 获取全局 DockerManager
-            let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-                Ok(dm) => dm,
+            // 获取全局 Runtime
+            let runtime = match docker_manager::runtime::RuntimeManager::get().await {
+                Ok(rt) => rt,
                 Err(e) => {
-                    warn!("[CONTAINER_SYNC] Failed to get DockerManager: {}", e);
+                    warn!("[CONTAINER_SYNC] Failed to get runtime: {}", e);
                     continue;
                 }
             };
 
-            // 执行同步
-            match docker_manager.sync_all_container_states().await {
-                Ok((checked, removed)) => {
-                    if removed > 0 {
-                        info!(
-                            "🔄 [CONTAINER_SYNC] Sync completed: checked={}, removed={}",
-                            checked, removed
-                        );
-                    } else {
-                        info!(
-                            "[CONTAINER_SYNC] Sync completed: checked={}",
-                            checked
-                        );
-                    }
+            // 统一运行时下，同步以“拉取最新容器列表”为主
+            match runtime.list_containers().await {
+                Ok(containers) => {
+                    info!("[CONTAINER_SYNC] Sync completed: checked={}", containers.len());
                 }
                 Err(e) => {
                     warn!("[CONTAINER_SYNC] sync failed: {}", e);

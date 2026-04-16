@@ -399,16 +399,19 @@ pub async fn pod_count(
 ) -> Result<HttpResult<PodCountResponse>, AppError> {
     debug!("📊 [POD_COUNT] Getting container count");
 
-    // 获取全局 DockerManager
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    // 获取全局 Runtime
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[POD_COUNT] Failed to get DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+            error!("[POD_COUNT] Failed to get runtime: {}", e);
+            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
     // 获取所有容器列表
-    let containers = docker_manager.list_containers().await;
+    let containers = runtime.list_containers().await.map_err(|e| {
+        error!("[POD_COUNT] Failed to list containers: {}", e);
+        AppError::internal_server_error(&format!("Failed to list containers: {}", e))
+    })?;
 
     // 获取容器前缀（从 AppState 获取，启动时已初始化）
     let rcoder_prefix = state.container_prefix_rcoder.as_str();
@@ -420,7 +423,7 @@ pub async fn pod_count(
 
     for container in &containers {
         // 仅统计运行中的容器
-        if !matches!(container.status, docker_manager::ContainerStatus::Running) {
+        if container.status != container_runtime_api::ContainerRuntimeStatus::Running {
             continue;
         }
 
@@ -481,15 +484,18 @@ pub async fn pod_list(
         params.limit
     );
 
-    // 1. 获取 Docker 容器列表
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    // 1. 获取 runtime 容器列表
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[POD_LIST] Failed to get DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+            error!("[POD_LIST] Failed to get runtime: {}", e);
+            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
-    let docker_containers = docker_manager.list_containers().await;
+    let runtime_containers = runtime.list_containers().await.map_err(|e| {
+        error!("[POD_LIST] Failed to list runtime containers: {}", e);
+        AppError::internal_server_error(&format!("Failed to list runtime containers: {}", e))
+    })?;
 
     // 2. 获取 DuckDB 存储中的容器记录
     let duckdb_containers = state.projects.get_all_container_records().map_err(|e| {
@@ -511,9 +517,9 @@ pub async fn pod_list(
     // 5. 合并数据，构建容器详细信息列表
     let mut containers: Vec<PodDetailInfo> = Vec::new();
 
-    for docker_container in &docker_containers {
+    for docker_container in &runtime_containers {
         // 仅处理运行中的容器
-        if !matches!(docker_container.status, docker_manager::ContainerStatus::Running) {
+        if docker_container.status != container_runtime_api::ContainerRuntimeStatus::Running {
             continue;
         }
 
@@ -532,7 +538,7 @@ pub async fn pod_list(
         let user_id = if docker_container.container_name.starts_with(computer_prefix) {
             docker_container
                 .container_name
-                .strip_prefix(computer_prefix)
+                .strip_prefix(&format!("{}-", computer_prefix))
                 .map(|s| s.to_string())
         } else {
             None
@@ -550,10 +556,8 @@ pub async fn pod_list(
             })
             .or_else(|| {
                 // 如果DuckDB中没有，使用Docker容器中的project_id
-                if !docker_container.project_id.is_empty()
-                    && docker_container.project_id != "unknown"
-                {
-                    Some(docker_container.project_id.clone())
+                if !docker_container.container_name.is_empty() && docker_container.container_name != "unknown" {
+                    Some(docker_container.container_name.clone())
                 } else {
                     None
                 }
@@ -579,38 +583,19 @@ pub async fn pod_list(
             container_name: docker_container.container_name.clone(),
             container_ip: duckdb_record
                 .map(|r| r.container_ip.clone())
-                .unwrap_or_else(|| "unknown".to_string()),
+                .unwrap_or_else(|| docker_container.container_ip.clone()),
             service_url: duckdb_record
                 .map(|r| r.service_url.clone())
-                .unwrap_or_else(|| {
-                    format!(
-                        "http://{}:{}",
-                        docker_container.assigned_port, docker_container.internal_port
-                    )
-                }),
-            status: match &docker_container.status {
-                docker_manager::ContainerStatus::Running => "running".to_string(),
-                docker_manager::ContainerStatus::Stopped => "stopped".to_string(),
-                docker_manager::ContainerStatus::Creating => "creating".to_string(),
-                docker_manager::ContainerStatus::Paused => "paused".to_string(),
-                docker_manager::ContainerStatus::Restarting => "restarting".to_string(),
-                docker_manager::ContainerStatus::Removing => "removing".to_string(),
-                docker_manager::ContainerStatus::Exited => "exited".to_string(),
-                docker_manager::ContainerStatus::Dead => "dead".to_string(),
-                docker_manager::ContainerStatus::Unknown(s) => format!("unknown:{}", s),
-            },
+                .unwrap_or_else(|| format!("http://{}:{}", docker_container.container_ip, 8086)),
+            status: String::from(docker_container.status.clone()),
             service_type: service_type.to_string(),
             project_id,
             user_id: final_user_id,
             created_at: docker_container.created_at.timestamp_millis() as u64,
             last_activity: duckdb_record.map(|r| r.last_activity.timestamp_millis() as u64),
-            image: Some(docker_container.image.clone()),
-            internal_port: Some(docker_container.internal_port),
-            external_port: if docker_container.assigned_port > 0 {
-                Some(docker_container.assigned_port)
-            } else {
-                duckdb_record.map(|r| r.external_port)
-            },
+            image: None,
+            internal_port: Some(8086),
+            external_port: duckdb_record.map(|r| r.external_port),
         };
 
         containers.push(container_info);
@@ -727,11 +712,13 @@ pub async fn pod_ensure(
                 // 标记已被移除 = 创建完成
                 if !state.pod_creating.contains_key(&request.user_id) {
                     // 尝试获取容器信息
-                    let docker_mgr = docker_manager::global::get_global_docker_manager()
-                        .await
-                        .ok();
-                    if let Some(mgr) = docker_mgr {
-                        if let Ok(Some(info)) = mgr.get_user_container_info(&request.user_id).await
+                    if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await {
+                        if let Ok(Some(info)) = runtime
+                            .get_container_info_by_identifier(
+                                &request.user_id,
+                                &shared_types::ServiceType::ComputerAgentRunner,
+                            )
+                            .await
                         {
                             info!(
                                 "✅ [POD_ENSURE] Wait succeeded, container ready (waited {}s): user_id={}, container_id={}",
@@ -810,17 +797,16 @@ pub async fn pod_ensure(
         }
     }
 
-    // 2. 🔍 实时查询 Docker API 检查容器是否存在（不依赖缓存）
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    // 2. 🔍 实时查询 runtime 检查容器是否存在（不依赖缓存）
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[POD_ENSURE] Failed to get DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+            error!("[POD_ENSURE] Failed to get runtime: {}", e);
+            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
-    // 通过 find_user_container 查询容器（使用 ServiceConfig 中配置的容器前缀）
-    let existing_container = docker_manager
-        .find_user_container(
+    let existing_container = runtime
+        .find_container(
             &request.user_id,
             &shared_types::ServiceType::ComputerAgentRunner,
         )
@@ -832,7 +818,7 @@ pub async fn pod_ensure(
 
     // 判断是否需要创建新容器
     let need_create = match existing_container {
-        Some(result) if result.is_running => {
+        Some(result) if result.status == container_runtime_api::ContainerRuntimeStatus::Running => {
             // 容器存在且正在运行，无需创建
             info!(
                 "📦 [POD_ENSURE] Container already exists and running: container_id={}, status={:?}",
@@ -849,8 +835,11 @@ pub async fn pod_ensure(
 
             // 删除旧容器
             // 如果删除失败（包括容器不存在等情况），返回错误让调用者知道
-            docker_manager
-                .stop_container_by_id(&result.container_id)
+            runtime
+                .stop_container_by_identifier(
+                    &request.user_id,
+                    &shared_types::ServiceType::ComputerAgentRunner,
+                )
                 .await
                 .map_err(|e| {
                     error!(
@@ -967,8 +956,11 @@ pub async fn pod_ensure(
         }
     } else {
         // 获取现有容器的完整信息
-        match docker_manager
-            .get_user_container_info(&request.user_id)
+        match runtime
+            .get_container_info_by_identifier(
+                &request.user_id,
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
             .await
         {
             Ok(Some(info)) => {
@@ -986,8 +978,11 @@ pub async fn pod_ensure(
                 let mut retry_info = None;
                 for retry_attempt in 1..=3 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    match docker_manager
-                        .get_user_container_info(&request.user_id)
+                    match runtime
+                        .get_container_info_by_identifier(
+                            &request.user_id,
+                            &shared_types::ServiceType::ComputerAgentRunner,
+                        )
                         .await
                     {
                         Ok(Some(info)) => {
@@ -1380,20 +1375,16 @@ pub async fn pod_restart(
             }
         }
 
-        // 获取 DockerManager 并停止容器
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                error!("[POD_RESTART] Failed to get DockerManager: {}", e);
-                AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+                error!("[POD_RESTART] Failed to get runtime: {}", e);
+                AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
             })?;
 
-        // 使用 container_stop 模块的运行时清理策略
-        if let Err(e) = docker_manager::container_stop::runtime_cleanup_container(
-            &docker_manager,
-            &container_info.container_id,
-        )
-        .await
+        if let Err(e) = runtime
+            .stop_container_by_identifier(&request.user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .await
         {
             // 记录错误但继续尝试创建新容器
             error!(
@@ -1412,29 +1403,31 @@ pub async fn pod_restart(
             .container_ip_cache
             .invalidate(&container_info.container_name);
 
-        // 🆕 增强逻辑: 验证容器是否真正移除，防止 "Name already in use"
-        let container_name = container_info.container_name.clone();
+        // 验证容器是否真正移除
         let mut deletion_confirmed = false;
 
         for i in 0..10 {
             // 最多等待 5 秒 (10 * 500ms)
-            match docker_manager
-                .find_container_realtime(&container_name)
+            match runtime
+                .find_container(
+                    &request.user_id,
+                    &shared_types::ServiceType::ComputerAgentRunner,
+                )
                 .await
             {
                 Ok(Some(_)) => {
                     if i == 0 {
                         info!(
-                            "⏳ [POD_RESTART] Container still in Docker, waiting for cleanup: name={}",
-                            container_name
+                            "⏳ [POD_RESTART] Container still exists, waiting for cleanup: user_id={}",
+                            request.user_id
                         );
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
                 Ok(None) => {
                     info!(
-                        "✅ [POD_RESTART] Confirmed container removed from Docker: name={}",
-                        container_name
+                        "✅ [POD_RESTART] Confirmed container removed: user_id={}",
+                        request.user_id
                     );
                     deletion_confirmed = true;
                     break;
@@ -1453,8 +1446,8 @@ pub async fn pod_restart(
 
         if !deletion_confirmed {
             warn!(
-                "⚠️ [POD_RESTART] Wait for container removal timeout, subsequent creation may fail: name={}",
-                container_name
+                "⚠️ [POD_RESTART] Wait for container removal timeout, subsequent creation may fail: user_id={}",
+                request.user_id
             );
         }
     }
@@ -1629,41 +1622,37 @@ pub async fn pod_status(
 
     let timestamp = chrono::Utc::now().timestamp_millis() as u64;
 
-    // 2. 获取 DockerManager
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    // 2. 获取 Runtime
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[POD_STATUS] Failed to get DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+            error!("[POD_STATUS] Failed to get runtime: {}", e);
+            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
     // 3. 查询容器状态
-    //
-    // 两种查询路径：
-    // - user_id 路径：使用 find_user_container()，通过 ServiceConfig 获取配置化的容器前缀
-    //   （如 "rcoder-computer-agent-runner-{user_id}"），避免硬编码前缀与实际容器名不一致
-    // - project_id 路径：直接使用 find_container_realtime()，project_id 作为 DuckDB 中存储的容器标识符
     let query_result = if let Some(ref user_id) = params.user_id {
-        // user_id 路径：通过配置化前缀查找容器
-        docker_manager
-            .find_user_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+        runtime
+            .find_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
             .await
     } else if let Some(ref project_id) = params.project_id {
-        // project_id 路径：直接按标识符查找（DuckDB 中存储的是完整容器名）
-        docker_manager.find_container_realtime(project_id).await
+        runtime
+            .find_container(project_id, &shared_types::ServiceType::RCoder)
+            .await
     } else {
         unreachable!()
     };
 
-    // 4. 通过 DockerManager 查询容器状态
+    // 4. 通过 runtime 查询容器状态
     match query_result {
         Ok(Some(result)) => {
-            let status_str = if result.is_running {
+            let is_running = result.status == container_runtime_api::ContainerRuntimeStatus::Running;
+            let status_str = if is_running {
                 "running"
             } else {
                 "stopped"
             };
-            let message = if result.is_running {
+            let message = if is_running {
                 "container is running".to_string()
             } else {
                 format!("container exists but status is: {:?}", result.status)
@@ -1671,11 +1660,11 @@ pub async fn pod_status(
 
             info!(
                 "✅ [POD_STATUS] Container status: alive={}, status={}, container_id={}",
-                result.is_running, status_str, result.container_id
+                is_running, status_str, result.container_id
             );
 
             return Ok(HttpResult::success(PodStatusResponse {
-                alive: result.is_running,
+                alive: is_running,
                 status: status_str.to_string(),
                 container_id: Some(result.container_id),
                 container_name: Some(result.container_name),
@@ -1698,14 +1687,18 @@ pub async fn pod_status(
     // 5. 如果用 user_id 没找到，且同时提供了 project_id，再试 project_id
     if params.user_id.is_some() {
         if let Some(ref project_id) = params.project_id {
-            match docker_manager.find_container_realtime(project_id).await {
+            match runtime
+                .find_container(project_id, &shared_types::ServiceType::RCoder)
+                .await
+            {
                 Ok(Some(result)) => {
-                    let status_str = if result.is_running {
+                    let is_running = result.status == container_runtime_api::ContainerRuntimeStatus::Running;
+                    let status_str = if is_running {
                         "running"
                     } else {
                         "stopped"
                     };
-                    let message = if result.is_running {
+                    let message = if is_running {
                         "container is running".to_string()
                     } else {
                         format!("container exists but status is: {:?}", result.status)
@@ -1713,11 +1706,11 @@ pub async fn pod_status(
 
                     info!(
                         "✅ [POD_STATUS] Found container by project_id: alive={}, container_id={}",
-                        result.is_running, result.container_id
+                        is_running, result.container_id
                     );
 
                     return Ok(HttpResult::success(PodStatusResponse {
-                        alive: result.is_running,
+                        alive: is_running,
                         status: status_str.to_string(),
                         container_id: Some(result.container_id),
                         container_name: Some(result.container_name),
@@ -1843,31 +1836,34 @@ pub async fn pod_vnc_status(
         user_id, project_id
     );
 
-    // 2. 获取 DockerManager
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    // 2. 获取 Runtime
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[POD_VNC_STATUS] Failed to get DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+            error!("[POD_VNC_STATUS] Failed to get runtime: {}", e);
+            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
     // 3. 定位容器
-    // 优先使用 user_id 查找（通过 find_user_container 获取配置化的容器前缀）
+    // 优先使用 user_id 查找
     let (lookup_user_id, container_info) = if let Some(uid) = user_id {
         (
             uid,
-            docker_manager
-                .find_user_container(uid, &shared_types::ServiceType::ComputerAgentRunner)
+            runtime
+                .find_container(uid, &shared_types::ServiceType::ComputerAgentRunner)
                 .await,
         )
     } else if let Some(pid) = project_id {
         // 如果只有 project_id，通过 DuckDB 查找关联的容器
-        if let Some(container_info) = state.projects.get_container_by_user_id(pid) {
+        if state.projects.get_container_by_user_id(pid).is_some() {
             // project_id 可能实际上是 user_id
             (
                 pid,
-                docker_manager
-                    .find_container_realtime(&container_info.container_name)
+                runtime
+                    .find_container(
+                        pid,
+                        &shared_types::ServiceType::ComputerAgentRunner,
+                    )
                     .await,
             )
         } else {
@@ -1898,7 +1894,7 @@ pub async fn pod_vnc_status(
     };
 
     // 5. 检查容器是否正在运行
-    if !result.is_running {
+    if result.status != container_runtime_api::ContainerRuntimeStatus::Running {
         info!(
             "⚠️ [POD_VNC_STATUS] Container not running: container_id={}",
             result.container_id
@@ -1913,8 +1909,12 @@ pub async fn pod_vnc_status(
     }
 
     // 6. 通过 gRPC 调用容器内的 agent_runner 获取 VNC 状态
-    // 使用 get_user_container_info 获取服务 URL
-    let agent_info = docker_manager.get_user_container_info(lookup_user_id).await;
+    let agent_info = runtime
+        .get_container_info_by_identifier(
+            lookup_user_id,
+            &shared_types::ServiceType::ComputerAgentRunner,
+        )
+        .await;
 
     let service_url = match agent_info {
         Ok(Some(info)) => info.service_url,

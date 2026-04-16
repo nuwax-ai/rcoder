@@ -5,8 +5,10 @@
 
 use crate::AppError;
 use anyhow::Result;
-use docker_manager::{ContainerBasicInfo, DockerManager};
+use container_runtime_api::ContainerRuntime;
+use docker_manager::ContainerBasicInfo;
 use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
+use std::sync::Arc;
 use tracing::{debug, error, info};
 
 /// 通用容器管理服务
@@ -45,19 +47,18 @@ impl ContainerManager {
             project_id
         );
 
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                error!("[CONTAINER_MGR] Failed to get global DockerManager: {}", e);
+                error!("[CONTAINER_MGR] Failed to get global runtime: {}", e);
                 AppError::with_message(
                     ERR_CONTAINER_ERROR,
-                    format!("Failed to get global DockerManager: {}", e),
+                    format!("Failed to get global runtime: {}", e),
                 )
             })?;
 
-        // 🚀 优化：直接调用 DockerManager 的高级 API
-        docker_manager
-            .get_agent_info(project_id)
+        runtime
+            .get_container_info(project_id)
             .await
             .map_err(|e| {
                 error!("[CONTAINER_MGR] Failed to query container info: {}", e);
@@ -75,18 +76,18 @@ async fn ensure_container_exists(
     service_type: &shared_types::ServiceType,
     request_resource_limits: Option<shared_types::ServiceResourceLimits>,
 ) -> Result<ContainerBasicInfo, AppError> {
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[CONTAINER_MGR] Failed to get global DockerManager: {}", e);
+            error!("[CONTAINER_MGR] Failed to get global runtime: {}", e);
             AppError::with_message(
                 ERR_CONTAINER_ERROR,
-                format!("Failed to get global DockerManager: {}", e),
+                format!("Failed to get global runtime: {}", e),
             )
         })?;
 
     // 1. 尝试获取现有容器
-    if let Ok(Some(info)) = docker_manager.get_agent_info(project_id).await {
+    if let Ok(Some(info)) = runtime.get_container_info(project_id).await {
         info!(
             "[CONTAINER_MGR] container already exists: {}",
             info.container_id
@@ -100,20 +101,15 @@ async fn ensure_container_exists(
         project_id, service_type
     );
 
-    create_container_for_request(
-        project_id,
-        service_type,
-        &docker_manager,
-        request_resource_limits,
-    )
-    .await
+    create_container_for_request(project_id, service_type, &runtime, request_resource_limits)
+        .await
 }
 
 /// 为请求创建容器
 async fn create_container_for_request(
     project_id: &str,
     service_type: &shared_types::ServiceType,
-    docker_manager: &std::sync::Arc<DockerManager>,
+    runtime: &Arc<dyn ContainerRuntime>,
     request_resource_limits: Option<shared_types::ServiceResourceLimits>,
 ) -> Result<ContainerBasicInfo, AppError> {
     // 1. 准备工作目录（仍需在 rcoder 容器内创建）
@@ -129,13 +125,12 @@ async fn create_container_for_request(
         project_id
     );
 
-    // 2. 调用 DockerManager 启动容器
-    // 注意：不再传递 host_path，挂载由 config.yml 的 mounts 配置管理
-    let container_info = docker_manager
-        .start_agent_container(
-            Some(project_id), // 用于清理旧容器和变量替换
-            None,             // RCoder 不需要 user_id
-            "",               // 空字符串，表示不使用硬编码挂载，完全依赖 mounts 配置
+    // 2. 调用容器运行时启动容器
+    let container_info = runtime
+        .create_container(
+            Some(project_id),
+            None, // RCoder 不需要 user_id
+            "",   // 空字符串，表示不使用硬编码挂载
             service_type.clone(),
             request_resource_limits,
         )

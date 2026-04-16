@@ -116,17 +116,20 @@ pub async fn computer_agent_status(
         request.user_id, request.project_id
     );
 
-    // 2. 查询容器信息（通过 DockerManager）
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    // 2. 查询容器信息（通过 Runtime）
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[COMPUTER_AGENT_STATUS] Failed to get DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+            error!("[COMPUTER_AGENT_STATUS] Failed to get runtime: {}", e);
+            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
     // 获取容器信息（ComputerAgentRunner 使用 user_id 作为容器标识）
-    let container_info = match docker_manager
-        .get_user_container_info(&request.user_id)
+    let container_info = match runtime
+        .get_container_info_by_identifier(
+            &request.user_id,
+            &shared_types::ServiceType::ComputerAgentRunner,
+        )
         .await
     {
         Ok(Some(info)) => info,

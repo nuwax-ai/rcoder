@@ -15,10 +15,12 @@
 
 use crate::AppError;
 use crate::handler::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
+use container_runtime_api::ContainerRuntime;
 use docker_manager::ContainerBasicInfo;
 use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Computer Agent Runner 容器管理服务
@@ -57,22 +59,25 @@ impl ComputerContainerManager {
             user_id
         );
 
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
                 AppError::with_message(
                     ERR_CONTAINER_ERROR,
-                    format!("Failed to get DockerManager: {}", e),
+                    format!("Failed to get runtime: {}", e),
                 )
             })?;
 
         // 1. 尝试获取现有容器
         // 使用 user_id 作为容器标识进行查询
-        if let Ok(Some(info)) = docker_manager.get_user_container_info(user_id).await {
+        if let Ok(Some(info)) = runtime
+            .get_container_info_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
+            .await
+        {
             // ✅ 关键修复: 验证容器是否真的在运行
-            match docker_manager
-                .is_container_running(&info.container_id)
+            match runtime
+                .is_container_running_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
                 .await
             {
                 Ok(true) => {
@@ -88,8 +93,8 @@ impl ComputerContainerManager {
                         user_id, info.container_id
                     );
                     // 删除已停止的旧容器
-                    if let Err(e) = docker_manager
-                        .stop_container_by_id(&info.container_id)
+                    if let Err(e) = runtime
+                        .stop_container_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
                         .await
                     {
                         warn!(
@@ -114,7 +119,7 @@ impl ComputerContainerManager {
             "🏗️ [COMPUTER_CONTAINER] Creating new user container: user_id={}",
             user_id
         );
-        Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
+        Self::create_container_for_user(user_id, &runtime, resource_limits).await
     }
 
     /// 强制为用户创建新容器（跳过检查）
@@ -130,17 +135,17 @@ impl ComputerContainerManager {
             user_id
         );
 
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
                 AppError::with_message(
                     ERR_CONTAINER_ERROR,
-                    format!("Failed to get DockerManager: {}", e),
+                    format!("Failed to get runtime: {}", e),
                 )
             })?;
 
-        Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
+        Self::create_container_for_user(user_id, &runtime, resource_limits).await
     }
 
     /// 为用户创建容器
@@ -148,7 +153,7 @@ impl ComputerContainerManager {
     /// 内部方法，负责实际的容器创建逻辑。
     async fn create_container_for_user(
         user_id: &str,
-        docker_manager: &std::sync::Arc<docker_manager::DockerManager>,
+        runtime: &Arc<dyn ContainerRuntime>,
         resource_limits: Option<ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
         // 1. 准备用户级工作目录（仍需在 rcoder 容器内创建）
@@ -162,11 +167,11 @@ impl ComputerContainerManager {
 
         // 2. 调用 DockerManager 启动容器
         // 注意：不再传递 host_path，挂载由 config.yml 的 mounts 配置管理
-        let container_info = docker_manager
-            .start_agent_container(
-                Some(user_id), // 用于清理旧容器的标识符
-                Some(user_id), // Computer Agent Runner 的 user_id 参数
-                "",            // ✅ 空字符串，表示不使用硬编码挂载，完全依赖 mounts 配置
+        let container_info = runtime
+            .create_container(
+                Some(user_id), // 保持与 DockerRuntime 兼容
+                Some(user_id),
+                "",
                 ServiceType::ComputerAgentRunner,
                 resource_limits,
             )
@@ -248,18 +253,18 @@ impl ComputerContainerManager {
             user_id
         );
 
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
                 AppError::with_message(
                     ERR_CONTAINER_ERROR,
-                    format!("Failed to get DockerManager: {}", e),
+                    format!("Failed to get runtime: {}", e),
                 )
             })?;
 
-        docker_manager
-            .get_user_container_info(user_id)
+        runtime
+            .get_container_info_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to query container info: {}", e);

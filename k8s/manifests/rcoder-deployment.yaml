@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rcoder
+  namespace: rcoder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rcoder
+  template:
+    metadata:
+      labels:
+        app: rcoder
+    spec:
+      serviceAccountName: rcoder-pods-sa
+      containers:
+      - name: rcoder
+        image: rcoder:test
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8087
+        env:
+        - name: CONTAINER_RUNTIME
+          value: "kubernetes"
+        - name: RCODER_K8S_NAMESPACE
+          value: "rcoder"
+        - name: RUST_LOG
+          value: "info"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"

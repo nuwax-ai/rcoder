@@ -1,4 +1,4 @@
-.PHONY: help build docker-build docker-build-base docker-build-master docker-build-master-base docker-build-agent-runner docker-build-agent-base docker-build-agent-production docker-pre-download-libreoffice docker-clean-libreoffice-downloads install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag test test-unit test-integration test-all test-blocking test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu pyroscope-up pyroscope-down pyroscope-logs
+.PHONY: help build docker-build docker-build-base docker-build-master docker-build-master-base docker-build-agent-runner docker-build-agent-base docker-build-agent-production docker-pre-download-libreoffice docker-clean-libreoffice-downloads install install-agent uninstall dev-build dev-up dev-restart dev-down dev-logs update-image-tag test test-unit test-integration test-all test-blocking test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu pyroscope-up pyroscope-down pyroscope-logs dev-build-k8s dev-up-k8s dev-restart-k8s dev-down-k8s dev-logs-k8s
 
 # 默认目标：显示帮助信息
 help:
@@ -28,6 +28,15 @@ help:
 	@echo "  make dev-restart    - 重启开发模式容器（重新构建镜像并启动）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
+	@echo ""
+	@echo "☸️  K8s 开发模式命令："
+	@echo "  make dev-build-k8s  - 构建 K8s 镜像（启用 kubernetes feature）"
+	@echo "  make dev-up-k8s     - 启动 K8s 开发模式（标准 kubectl apply）"
+	@echo "  make dev-restart-k8s - 重启 K8s 开发模式（重新构建镜像+部署）"
+	@echo "  make dev-down-k8s   - 停止 K8s 开发模式（从集群移除）"
+	@echo "  make dev-logs-k8s   - 查看 K8s 开发模式日志"
+	@echo "  变量: IMAGE=rcoder:test-k8s ROLLOUT_TIMEOUT=180s"
+	@echo "  示例: make dev-restart-k8s IMAGE=rcoder:test-k8s"
 	@echo ""
 	@echo "📊 Pyroscope 持续剖析："
 	@echo "  make pyroscope-up   - 启动 Pyroscope Server"
@@ -387,6 +396,61 @@ dev-restart: dev-build
 	@echo "🎉 完整重启完成！"
 	@echo "🎉 如需构建基础镜像,可以执行: make docker-build-base"
 	@echo "💡 代码更改已生效，因为重新构建了镜像！"
+
+# ==================== K8s 开发模式命令 ====================
+
+IMAGE ?= rcoder:test-k8s
+K8S_NAMESPACE := rcoder
+ROLLOUT_TIMEOUT ?= 180s
+
+# 构建 K8s 镜像（启用 kubernetes feature）
+# 依赖 docker-build-master-base 确保基础镜像存在
+dev-build-k8s: docker-build-master-base
+	@echo "☸️  构建 K8s 镜像..."
+	@echo "📍 镜像名称: $(IMAGE)"
+	@echo "⏳ 这可能需要较长时间（包含 Rust 编译）..."
+	@docker build -f docker/rcoder-master/Dockerfile -t $(IMAGE) --build-arg CARGO_FLAGS="--features kubernetes" .
+	@echo "✅ K8s 镜像构建完成！"
+	@echo "💡 下一步: make dev-up-k8s 启动 K8s 开发模式"
+
+# 启动 K8s 开发模式（部署到已有 K8s 集群）
+dev-up-k8s:
+	@echo "☸️  启动 K8s 开发模式..."
+	@kubectl apply -f k8s/manifests/namespace.yaml
+	@kubectl apply -f k8s/manifests/serviceaccount.yaml
+	@kubectl apply -f k8s/manifests/rcoder-deployment.yaml
+	@kubectl set image deployment/rcoder rcoder=$(IMAGE) -n $(K8S_NAMESPACE)
+	@kubectl apply -f k8s/manifests/rcoder-service.yaml
+	@kubectl rollout status deploy/rcoder -n $(K8S_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
+	@echo "📋 K8s 部署状态:"
+	@kubectl get pods -n $(K8S_NAMESPACE)
+	@echo ""
+	@echo "💡 查看日志: make dev-logs-k8s"
+
+# 重启 K8s 开发模式（重新构建镜像+部署）
+dev-restart-k8s: dev-build-k8s
+	@echo "☸️  重启 K8s 开发模式..."
+	@kubectl apply -f k8s/manifests/namespace.yaml
+	@kubectl apply -f k8s/manifests/serviceaccount.yaml
+	@kubectl apply -f k8s/manifests/rcoder-deployment.yaml
+	@kubectl set image deployment/rcoder rcoder=$(IMAGE) -n $(K8S_NAMESPACE)
+	@kubectl apply -f k8s/manifests/rcoder-service.yaml
+	@kubectl rollout restart deploy/rcoder -n $(K8S_NAMESPACE)
+	@kubectl rollout status deploy/rcoder -n $(K8S_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
+	@echo "✅ K8s 部署已重启！"
+	@echo "📋 查看状态: kubectl get pods -n $(K8S_NAMESPACE)"
+
+# 停止 K8s 开发模式（从集群移除）
+dev-down-k8s:
+	@echo "☸️  停止 K8s 开发模式..."
+	@kubectl delete -f k8s/manifests/rcoder-deployment.yaml --ignore-not-found
+	@kubectl delete -f k8s/manifests/rcoder-service.yaml --ignore-not-found
+	@echo "✅ K8s 部署已移除"
+
+# 查看 K8s 开发模式日志
+dev-logs-k8s:
+	@echo "☸️  查看 K8s 开发模式日志..."
+	@kubectl logs -n $(K8S_NAMESPACE) -l app=rcoder -f
 
 # ==================== 测试命令 ====================
 
