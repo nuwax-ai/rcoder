@@ -120,9 +120,10 @@ impl ServiceResourceLimits {
 
         // Swap 应该 >= 内存
         if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit)
-            && swap < memory {
-                return Err("swap_limit should be >= memory_limit".to_string());
-            }
+            && swap < memory
+        {
+            return Err("swap_limit should be >= memory_limit".to_string());
+        }
 
         Ok(())
     }
@@ -155,7 +156,7 @@ impl ServiceImageConfig {
             && self.default_image.is_none()
         {
             return ConfigValidationResult::Error(format!(
-                "服务类型 {} 必须至少配置一个镜像",
+                "Service type {} must have at least one image configured",
                 self.service_type
             ));
         }
@@ -170,7 +171,7 @@ impl ServiceImageConfig {
             if let Some(image) = image_name {
                 if image.trim().is_empty() {
                     return ConfigValidationResult::Warning(format!(
-                        "服务类型 {} 包含空的镜像名称",
+                        "Service type {} has empty image name",
                         self.service_type
                     ));
                 }
@@ -181,7 +182,7 @@ impl ServiceImageConfig {
                     .all(|c: char| c.is_alphanumeric() || "/:.-_".contains(c))
                 {
                     return ConfigValidationResult::Warning(format!(
-                        "服务类型 {} 的镜像名称 '{}' 可能包含无效字符",
+                        "Service type {} image name '{}' may contain invalid characters",
                         self.service_type, image
                     ));
                 }
@@ -192,14 +193,14 @@ impl ServiceImageConfig {
         for mount in &self.mounts {
             if mount.container_path.trim().is_empty() {
                 return ConfigValidationResult::Error(format!(
-                    "服务类型 {} 包含空的容器挂载路径",
+                    "Service type {} has empty container mount path",
                     self.service_type
                 ));
             }
 
             if mount.host_path.trim().is_empty() {
                 return ConfigValidationResult::Error(format!(
-                    "服务类型 {} 包含空的宿主机挂载路径",
+                    "Service type {} has empty host mount path",
                     self.service_type
                 ));
             }
@@ -207,7 +208,7 @@ impl ServiceImageConfig {
             // 验证挂载类型
             if mount.mount_type != "bind" && mount.mount_type != "volume" {
                 return ConfigValidationResult::Warning(format!(
-                    "服务类型 {} 包含不支持的挂载类型 '{}'",
+                    "Service type {} has unsupported mount type '{}'",
                     self.service_type, mount.mount_type
                 ));
             }
@@ -234,7 +235,7 @@ impl ServiceImageConfig {
                 .clone()
                 .or_else(|| self.default_image.clone()),
             _ => {
-                tracing::warn!("未知的平台 '{}，使用默认镜像", platform);
+                tracing::warn!("Unknown platform '{}', using default image", platform);
                 self.default_image.clone()
             }
         }
@@ -250,7 +251,7 @@ impl ServiceImageConfig {
     /// 获取挂载点的字符串表示
     pub fn get_mounts_description(&self) -> String {
         if self.mounts.is_empty() {
-            return "无挂载点".to_string();
+            return "No mount points".to_string();
         }
 
         self.mounts
@@ -331,11 +332,11 @@ impl ServiceMountConfig {
     /// 验证挂载点配置
     pub fn validate(&self) -> ConfigValidationResult {
         if self.container_path.trim().is_empty() {
-            return ConfigValidationResult::Error("容器挂载路径不能为空".to_string());
+            return ConfigValidationResult::Error("Container mount path cannot be empty".to_string());
         }
 
         if self.host_path.trim().is_empty() {
-            return ConfigValidationResult::Error("宿主机挂载路径不能为空".to_string());
+            return ConfigValidationResult::Error("Host mount path cannot be empty".to_string());
         }
 
         // 验证路径格式
@@ -344,16 +345,16 @@ impl ServiceMountConfig {
                 .container_path
                 .chars()
                 .all(|c: char| c.is_alphanumeric() || "/-_.".contains(c))
-            {
-                return ConfigValidationResult::Warning(format!(
-                    "容器挂载路径 '{}' 可能包含无效字符",
-                    self.container_path
-                ));
-            }
+        {
+            return ConfigValidationResult::Warning(format!(
+                "Container mount path '{}' may contain invalid characters",
+                self.container_path
+            ));
+        }
 
         if self.mount_type != "bind" && self.mount_type != "volume" {
             return ConfigValidationResult::Error(format!(
-                "不支持的挂载类型 '{}'，必须为 'bind' 或 'volume'",
+                "Unsupported mount type '{}', must be 'bind' or 'volume'",
                 self.mount_type
             ));
         }
@@ -428,7 +429,10 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
 
     // 🔥 Agent 清理配置（通过环境变量控制）
     // 设置为 3600 秒（1小时），用户可以在 docker/config.yml 中覆盖此值
-    environment.insert("RCODER_AGENT_IDLE_TIMEOUT_SECS".to_string(), "3600".to_string()); // 1 小时
+    environment.insert(
+        "RCODER_AGENT_IDLE_TIMEOUT_SECS".to_string(),
+        "3600".to_string(),
+    ); // 1 小时
 
     let mounts = vec![];
 
@@ -632,7 +636,10 @@ mod tests {
         let correct_container_name = format!("{}-{}", config_prefix, user_id);
 
         assert_eq!(wrong_container_name, "computer-agent-runner-1743762321");
-        assert_eq!(correct_container_name, "rcoder-computer-agent-runner-1743762321");
+        assert_eq!(
+            correct_container_name,
+            "rcoder-computer-agent-runner-1743762321"
+        );
 
         // 如果用错误的名字去查询，当然找不到正确名字创建的容器
         assert_ne!(wrong_container_name, correct_container_name);
@@ -641,9 +648,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_valid() {
         let valid = ServiceResourceLimits {
-            memory_limit: Some(1_000_000_000.0),  // 1GB
+            memory_limit: Some(1_000_000_000.0), // 1GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(2_000_000_000.0),    // 2GB
+            swap_limit: Some(2_000_000_000.0), // 2GB
         };
         assert!(valid.validate().is_ok());
     }
@@ -651,7 +658,7 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_small() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(256_000_000.0),  // 256MB - 太小
+            memory_limit: Some(256_000_000.0), // 256MB - 太小
             cpu_limit: None,
             swap_limit: None,
         };
@@ -662,7 +669,7 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_large() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(100_000_000_000.0),  // 100GB - 太大
+            memory_limit: Some(100_000_000_000.0), // 100GB - 太大
             cpu_limit: None,
             swap_limit: None,
         };
@@ -694,9 +701,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_swap_less_than_memory() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0),  // 2GB
+            memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: None,
-            swap_limit: Some(1_000_000_000.0),    // 1GB - swap < memory
+            swap_limit: Some(1_000_000_000.0), // 1GB - swap < memory
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -710,15 +717,15 @@ mod tests {
     #[test]
     fn test_resource_limits_merge() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0),  // 2GB
+            memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(4_000_000_000.0),    // 4GB
+            swap_limit: Some(4_000_000_000.0), // 4GB
         };
 
         let override_limits = ServiceResourceLimits {
-            memory_limit: Some(4_000_000_000.0),  // 覆盖：4GB
-            cpu_limit: None,                       // 不覆盖
-            swap_limit: Some(8_000_000_000.0),    // 覆盖：8GB
+            memory_limit: Some(4_000_000_000.0), // 覆盖：4GB
+            cpu_limit: None,                     // 不覆盖
+            swap_limit: Some(8_000_000_000.0),   // 覆盖：8GB
         };
 
         let merged = default_limits.merge_with(&override_limits);
@@ -730,9 +737,9 @@ mod tests {
     #[test]
     fn test_resource_limits_merge_all_none() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0),  // 2GB
+            memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: Some(2.0),
-            swap_limit: Some(4_000_000_000.0),    // 4GB
+            swap_limit: Some(4_000_000_000.0), // 4GB
         };
 
         let override_limits = ServiceResourceLimits {

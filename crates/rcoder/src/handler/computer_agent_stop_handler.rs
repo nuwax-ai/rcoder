@@ -4,14 +4,15 @@
 //! 与 RCoder 的 agent_stop 不同，这里只停止单个 project_id 的 Agent，
 //! 容器会继续运行其他 project_id 的 Agent。
 
-use axum::{Json, extract::State};
+use axum::extract::State;
+use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 
 use crate::{AppError, HttpResult, router::AppState};
 use shared_types::{ComputerAgentStopRequest, ComputerAgentStopResponse};
 
-use super::utils::extract_grpc_addr;
+use super::utils::{I18nJson, extract_grpc_addr, get_locale_from_headers};
 
 /// 停止 Computer Agent
 ///
@@ -51,7 +52,7 @@ use super::utils::extract_grpc_addr;
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 404,
@@ -72,22 +73,26 @@ use super::utils::extract_grpc_addr;
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn computer_agent_stop(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<ComputerAgentStopRequest>,
+    headers: HeaderMap,
+    I18nJson(request): I18nJson<ComputerAgentStopRequest>,
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
+    // 获取语言设置
+    let locale = get_locale_from_headers(&headers);
+
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
-        error!("❌ [COMPUTER_STOP] user_id 不能为空");
-        return Ok(HttpResult::error(
+        error!("[COMPUTER_STOP] user_id is required");
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            locale,
         ));
     }
 
     if request.project_id.trim().is_empty() {
-        error!("❌ [COMPUTER_STOP] project_id 不能为空");
-        return Ok(HttpResult::error(
+        error!("[COMPUTER_STOP] project_id is required");
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            locale,
         ));
     }
 
@@ -95,7 +100,7 @@ pub async fn computer_agent_stop(
     let project_id = request.project_id.clone();
 
     info!(
-        "🛑 [COMPUTER_STOP] 开始停止 Agent: user_id={}, project_id={}, session_id={:?}",
+        "🛑 [COMPUTER_STOP] Starting to stop Agent: user_id={}, project_id={}, session_id={:?}",
         user_id, project_id, request.session_id
     );
 
@@ -106,28 +111,28 @@ pub async fn computer_agent_stop(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!("⚠️ [COMPUTER_STOP] 找不到用户容器: user_id={}", user_id);
-            return Ok(HttpResult::error(
-                "NOT_FOUND",
-                &format!("找不到用户 {} 的容器", user_id),
+            warn!("[COMPUTER_STOP] Container not found: user_id={}", user_id);
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                locale,
             ));
         }
     };
 
     info!(
-        "📦 [COMPUTER_STOP] 找到容器: container_id={}, ip={}",
+        "📦 [COMPUTER_STOP] Container found: container_id={}, ip={}",
         container_info.container_id, container_info.container_ip
     );
 
     // 3. 通过 gRPC 调用 StopAgent RPC
     info!(
-        "🔄 [COMPUTER_STOP] 准备调用 StopAgent RPC: project_id={}",
+        "🔄 [COMPUTER_STOP] Preparing to call StopAgent RPC: project_id={}",
         project_id
     );
 
     // 提取 gRPC 地址
     let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
-    info!("🌐 [COMPUTER_STOP] gRPC 地址: {}", grpc_addr);
+    info!("[COMPUTER_STOP] gRPC addr: {}", grpc_addr);
 
     // 调用 StopAgent RPC
     match crate::grpc::grpc_stop_agent_with_pool(
@@ -137,20 +142,20 @@ pub async fn computer_agent_stop(
         request
             .session_id
             .clone()
-            .or_else(|| Some("用户请求停止".to_string())),
+            .or_else(|| Some("User requested stop".to_string())),
         false, // force=false，优雅停止
     )
     .await
     {
         Ok(response) => {
             info!(
-                "📥 [COMPUTER_STOP] 收到 StopAgent 响应: result={}, success={}",
+                "📥 [COMPUTER_STOP] Received StopAgent response: result={}, success={}",
                 response.result, response.success
             );
 
             if response.success {
                 let message = format!(
-                    "Agent {} 已成功停止，容器 {} 继续运行",
+                    "Agent {} stopped successfully, container {} continues running",
                     project_id, container_info.container_id
                 );
 
@@ -162,7 +167,7 @@ pub async fn computer_agent_stop(
                 };
 
                 info!(
-                    "✅ [COMPUTER_STOP] Agent 停止完成: user_id={}, project_id={}",
+                    "✅ [COMPUTER_STOP] Agent stop completed: user_id={}, project_id={}",
                     user_id, project_id
                 );
                 return Ok(HttpResult::success(stop_response));
@@ -170,21 +175,22 @@ pub async fn computer_agent_stop(
                 // Agent 停止失败或已经停止
                 match response.result.as_str() {
                     "not_found" => {
-                        warn!("⚠️ [COMPUTER_STOP] Agent 未找到: project_id={}", project_id);
-                        return Ok(HttpResult::error(
-                            "NOT_FOUND",
-                            &format!("找不到项目 {} 的 Agent", project_id),
+                        warn!(
+                            "[COMPUTER_STOP] Agent not found: project_id={}",
+                            project_id
+                        );
+                        return Ok(HttpResult::error_with_locale(
+                            shared_types::error_codes::ERR_AGENT_NOT_FOUND,
+                            locale,
                         ));
                     }
                     "already_stopped" => {
                         info!(
-                            "ℹ️ [COMPUTER_STOP] Agent 已经处于停止状态: project_id={}",
+                            "ℹ️ [COMPUTER_STOP] Agent already in stopped state: project_id={}",
                             project_id
                         );
-                        let message = format!(
-                            "Agent {} 已经处于停止状态，容器 {} 继续运行",
-                            project_id, container_info.container_id
-                        );
+                        let message =
+                            shared_types::get_i18n_message("success.agent_already_stopped", locale);
                         let stop_response = ComputerAgentStopResponse {
                             success: true,
                             message,
@@ -194,15 +200,21 @@ pub async fn computer_agent_stop(
                         return Ok(HttpResult::success(stop_response));
                     }
                     "error" => {
-                        let err_msg = response.message.unwrap_or_else(|| "未知错误".to_string());
-                        error!("❌ [COMPUTER_STOP] Agent 停止失败: {}", err_msg);
-                        return Ok(HttpResult::error("STOP_FAILED", &err_msg));
+                        let err_msg = response.message.unwrap_or_else(|| "Unknown error".to_string());
+                        error!("[COMPUTER_STOP] Agent stoppedfailed: {}", err_msg);
+                        return Ok(HttpResult::error_with_locale(
+                            shared_types::error_codes::ERR_STOP_FAILED,
+                            locale,
+                        ));
                     }
                     _ => {
-                        warn!("⚠️ [COMPUTER_STOP] 未知的响应结果: {}", response.result);
-                        return Ok(HttpResult::error(
-                            "UNKNOWN_RESULT",
-                            &format!("未知的响应结果: {}", response.result),
+                        warn!(
+                            "[COMPUTER_STOP] not response: {}",
+                            response.result
+                        );
+                        return Ok(HttpResult::error_with_locale(
+                            shared_types::error_codes::ERR_UNKNOWN,
+                            locale,
                         ));
                     }
                 }
@@ -210,12 +222,12 @@ pub async fn computer_agent_stop(
         }
         Err(e) => {
             error!(
-                "❌ [COMPUTER_STOP] 调用 StopAgent RPC 失败: {}, project_id={}",
+                "❌ [COMPUTER_STOP] StopAgent RPC call failed: {}, project_id={}",
                 e, project_id
             );
-            return Ok(HttpResult::error(
-                "GRPC_ERROR",
-                &format!("调用 StopAgent RPC 失败: {}", e),
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_GRPC_ERROR,
+                locale,
             ));
         }
     }

@@ -7,14 +7,14 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::agent_runtime::AgentRuntime;
 use crate::config::AppConfig;
 use crate::http_server::router::{AppState, create_router};
-use crate::proxy_agent::cleanup_task::{start_cleanup_task, CleanupConfig};
+use crate::proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use crate::proxy_agent::set_unlimited_mode;
 #[cfg(feature = "proxy")]
 use crate::proxy_agent::start_pingora;
@@ -53,7 +53,7 @@ impl HttpServerHandle {
 
     /// 停止 HTTP 服务器并等待所有任务完成
     pub async fn stop(&self) {
-        info!("正在停止 HTTP 服务器...");
+        info!("Stopping HTTP server...");
 
         // 1. 发送关闭信号
         self.shutdown_token.cancel();
@@ -75,24 +75,24 @@ impl HttpServerHandle {
         loop {
             match tokio::time::timeout(timeout, join_set.join_next()).await {
                 Ok(Some(Ok(()))) => {
-                    info!("任务正常结束");
+                    info!("Task exited normally");
                 }
                 Ok(Some(Err(e))) => {
-                    warn!("任务出错: {:?}", e);
+                    warn!("Task error: {:?}", e);
                 }
                 Ok(None) => {
                     // JoinSet 为空，所有任务已完成
                     break;
                 }
                 Err(_) => {
-                    warn!("等待任务完成超时（3s），强制终止残留任务");
+                    warn!("Timed out waiting for tasks (3s), aborting remaining tasks");
                     join_set.abort_all();
                     break;
                 }
             }
         }
 
-        info!("HTTP 服务器已停止");
+        info!("HTTP server stopped");
     }
 }
 
@@ -146,7 +146,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
         unsafe {
             std::env::set_var("MCP_PROXY_LOG_DIR", log_dir);
         }
-        info!("🔧 设置 MCP_PROXY_LOG_DIR={}", log_dir);
+        info!("🔧 Set MCP_PROXY_LOG_DIR={}", log_dir);
     }
 
     // 设置无限制模式（HTTP Server 部署不限制槽位）
@@ -161,16 +161,24 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     // 1. 启动 Agent 清理任务
     let cleanup_config = CleanupConfig {
         idle_timeout: Duration::from_secs(
-            config.app_config.agent_cleanup.clone()
-                .unwrap_or_default().idle_timeout_secs
+            config
+                .app_config
+                .agent_cleanup
+                .clone()
+                .unwrap_or_default()
+                .idle_timeout_secs,
         ),
         cleanup_interval: Duration::from_secs(
-            config.app_config.agent_cleanup.clone()
-                .unwrap_or_default().cleanup_interval_secs
+            config
+                .app_config
+                .agent_cleanup
+                .clone()
+                .unwrap_or_default()
+                .cleanup_interval_secs,
         ),
     };
     info!(
-        "🧹 [HTTP] Agent 清理配置: idle_timeout={}秒, cleanup_interval={}秒",
+        "🧹 [HTTP] Agent cleanup config: idle_timeout={}s, cleanup_interval={}s",
         cleanup_config.idle_timeout.as_secs(),
         cleanup_config.cleanup_interval.as_secs()
     );
@@ -179,7 +187,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
         tokio::select! {
             _ = start_cleanup_task(cleanup_config) => {}
             _ = cleanup_token.cancelled() => {
-                info!("清理任务收到关闭信号");
+                info!("Cleanup task received shutdown signal");
             }
         }
     });
@@ -191,11 +199,11 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
         // 保存 Pingora 结果以便后续调用 stop
         *pingora_result.lock().await = Some(result);
     } else {
-        info!("Pingora 代理服务未配置，跳过启动");
+        info!("Pingora proxy service is not configured, skipping startup");
     }
 
     #[cfg(not(feature = "proxy"))]
-    info!("Pingora 代理服务未启用 (proxy feature 未开启)");
+    info!("Pingora proxy service is disabled (proxy feature not enabled)");
 
     // 3. 创建 HTTP 应用状态
     let state = Arc::new(AppState::new(
@@ -211,7 +219,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    info!("HTTP 服务器启动在端口 {}", config.port);
+    info!("HTTP server started on port {}", config.port);
 
     info!("HTTP API endpoints:");
     info!("  POST /computer/chat - Computer Agent chat");
@@ -229,14 +237,13 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     let http_listener = listener;
     join_set.lock().await.spawn(async move {
         // 使用 graceful shutdown wrapper
-        let server = axum::serve(http_listener, http_app)
-            .with_graceful_shutdown(async move {
-                let _ = http_token.cancelled().await;
-            });
+        let server = axum::serve(http_listener, http_app).with_graceful_shutdown(async move {
+            let _ = http_token.cancelled().await;
+        });
 
         match server.await {
-            Ok(()) => info!("HTTP 服务正常退出"),
-            Err(e) => error!("HTTP 服务错误: {:?}", e),
+            Ok(()) => info!("HTTP service exited normally"),
+            Err(e) => error!("HTTP service error: {:?}", e),
         }
     });
 

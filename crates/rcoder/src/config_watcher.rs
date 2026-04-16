@@ -24,11 +24,11 @@
 //!
 //! match ConfigWatcher::new(config_path, api_key_config) {
 //!     Ok(watcher) => {
-//!         println!("配置监控已启动");
+//! println!("config watcher already started");
 //!         // watcher 必须保持存活,否则监控会停止
 //!     }
 //!     Err(e) => {
-//!         eprintln!("配置监控启动失败: {}", e);
+//! eprintln!("config watcher start failed: {}", e);
 //!     }
 //! }
 //! ```
@@ -82,7 +82,10 @@ impl ConfigWatcher {
 
         watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
 
-        info!("📁 [CONFIG_WATCHER] 开始监控配置文件: {:?}", config_path);
+        info!(
+            "📁 [CONFIG_WATCHER] Starting config file watch: {:?}",
+            config_path
+        );
 
         // 克隆必要的数据以在 tokio 任务中使用
         let config_path_clone = config_path.clone();
@@ -103,7 +106,7 @@ impl ConfigWatcher {
                         )
                         .await
                         {
-                            warn!("⚠️  [CONFIG_WATCHER] 配置重载失败: {}", e);
+                            warn!(" [CONFIG_WATCHER] config reload failed: {}", e);
                         }
                     }
                 }
@@ -126,8 +129,8 @@ impl ConfigWatcher {
             Ok(new_config) => {
                 // 验证配置有效性
                 if new_config.enabled && new_config.api_key.trim().is_empty() {
-                    error!("❌ [CONFIG_WATCHER] API Key 不能为空字符串");
-                    return Err(anyhow::anyhow!("API Key 不能为空字符串"));
+                    error!("[CONFIG_WATCHER] API Key is empty");
+                    return Err(anyhow::anyhow!("API Key cannot be empty string"));
                 }
 
                 // 🚀 使用 ArcSwap 原子更新配置（无锁，不阻塞读取）
@@ -144,13 +147,13 @@ impl ConfigWatcher {
                 // 记录配置变更
                 if old_enabled != new_enabled {
                     info!(
-                        "🔄 [CONFIG_WATCHER] API Key 鉴权状态已更新: {} -> {}",
+                        "🔄 [CONFIG_WATCHER] API Key auth status updated: {} -> {}",
                         old_enabled, new_enabled
                     );
                 }
 
                 if key_changed {
-                    info!("🔄 [CONFIG_WATCHER] API Key 已更新");
+                    info!("[CONFIG_WATCHER] API Key alreadyupdated");
                 }
 
                 if !old_enabled && !new_enabled && !key_changed {
@@ -158,11 +161,11 @@ impl ConfigWatcher {
                     return Ok(());
                 }
 
-                info!("✅ [CONFIG_WATCHER] 配置热更新成功");
+                info!("[CONFIG_WATCHER] Config update succeeded");
                 Ok(())
             }
             Err(e) => {
-                error!("❌ [CONFIG_WATCHER] 解析配置文件失败: {}", e);
+                error!("[CONFIG_WATCHER] Config file reload failed: {}", e);
                 Err(e)
             }
         }

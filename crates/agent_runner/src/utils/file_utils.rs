@@ -64,14 +64,14 @@ impl FileUtils {
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .ok_or_else(|| anyhow::anyhow!("文件没有扩展名"))?;
+            .ok_or_else(|| anyhow::anyhow!("File has no extension"))?;
 
         if !self
             .config
             .allowed_extensions
             .contains(&extension.to_lowercase())
         {
-            return Err(anyhow::anyhow!("不支持的文件扩展名: {}", extension));
+            return Err(anyhow::anyhow!("Unsupported file extension: {}", extension));
         }
 
         Ok(())
@@ -81,7 +81,7 @@ impl FileUtils {
     pub async fn validate_file_size(&self, file_path: &Path) -> Result<()> {
         let metadata = fs::metadata(file_path)
             .await
-            .context("无法获取文件元数据")?;
+            .context("unable to get file metadata")?;
 
         if metadata.len() > self.config.max_file_size {
             return Err(AttachmentError::FileSizeExceeded(metadata.len()).into());
@@ -94,7 +94,7 @@ impl FileUtils {
     pub async fn read_file_as_base64(&self, file_path: &Path) -> Result<String> {
         self.validate_file_size(file_path).await?;
 
-        let content = fs::read(file_path).await.context("读取文件失败")?;
+        let content = fs::read(file_path).await.context("Failed to read file")?;
 
         Ok(general_purpose::STANDARD.encode(content))
     }
@@ -105,7 +105,7 @@ impl FileUtils {
 
         let content = fs::read_to_string(file_path)
             .await
-            .context("读取文本文件失败")?;
+            .context("Failed to read text file")?;
 
         Ok(content)
     }
@@ -121,7 +121,7 @@ impl FileUtils {
         let filename = file_path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("无效的文件名"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
 
         self.validate_extension(filename)?;
 
@@ -301,7 +301,10 @@ impl FileUtils {
             {
                 Ok(attachment) => attachments.push(attachment),
                 Err(e) => {
-                    warn!("跳过文件 {:?}，创建附件失败: {}", file_path, e);
+                    warn!(
+                        "Skipping file {:?}; failed to create attachment: {}",
+                        file_path, e
+                    );
                 }
             }
         }
@@ -315,7 +318,7 @@ impl FileUtils {
             if temp_file.exists() {
                 fs::remove_file(temp_file)
                     .await
-                    .with_context(|| format!("删除临时文件失败: {:?}", temp_file))?;
+                    .with_context(|| format!("failed to delete temp file: {:?}", temp_file))?;
             }
         }
         Ok(())

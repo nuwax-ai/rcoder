@@ -1,31 +1,31 @@
-//! Agent 抽象层错误类型
+//! Agent abstraction layer error types
 
 use thiserror::Error;
 
-/// Agent 抽象层错误
+/// Agent abstraction layer error
 #[derive(Error, Debug)]
 pub enum AgentAbstractionError {
-    #[error("连接错误: {0}")]
+    #[error("connection error: {0}")]
     Connection(String),
 
-    #[error("注册表错误: {0}")]
+    #[error("registry error: {0}")]
     Registry(String),
 
-    #[error("进程错误: {0}")]
+    #[error("process error: {0}")]
     Process(String),
 
-    #[error("其他错误: {0}")]
+    #[error("other error: {0}")]
     Other(String),
 
-    #[error("序列化错误: {0}")]
+    #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
-    #[error("I/O 错误: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("类型转换错误")]
+    #[error("type cast error")]
     Cast,
 
-    #[error("不存在: {0}")]
+    #[error("not found: {0}")]
     NotFound(String),
 }

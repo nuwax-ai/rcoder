@@ -113,7 +113,7 @@ impl ServiceHealthChecker {
             Ok(Ok(response)) => {
                 let is_healthy = response.status().is_success();
                 debug!(
-                    "HTTP 健康检查 {}: status={}, healthy={}",
+                    "HTTP health check {}: status={}, healthy={}",
                     url,
                     response.status(),
                     is_healthy
@@ -121,11 +121,11 @@ impl ServiceHealthChecker {
                 is_healthy
             }
             Ok(Err(e)) => {
-                debug!("HTTP 健康检查失败 {}: {}", url, e);
+                debug!("HTTP health check failed {}: {}", url, e);
                 false
             }
             Err(_) => {
-                debug!("HTTP 健康检查超时 {}", url);
+                debug!("HTTP health check timeout {}", url);
                 false
             }
         }
@@ -152,15 +152,15 @@ impl ServiceHealthChecker {
         .await
         {
             Ok(Ok(_stream)) => {
-                debug!("gRPC 端口可连接: {}", addr);
+                debug!("gRPC port connection: {}", addr);
                 true
             }
             Ok(Err(e)) => {
-                debug!("gRPC 端口连接失败 {}: {}", addr, e);
+                debug!("gRPC portconnectionfailed {}: {}", addr, e);
                 false
             }
             Err(_) => {
-                debug!("gRPC 端口连接超时 {}", addr);
+                debug!("gRPC portconnectiontimeout {}", addr);
                 false
             }
         }
@@ -198,7 +198,7 @@ impl ServiceHealthChecker {
 
         if !is_fully_healthy {
             warn!(
-                "⚠️ 服务健康检查：IP={}, HTTP={}, gRPC={}, 连续失败={}",
+                "Service health check: IP={}, HTTP={}, gRPC={}, consecutive_failures={}",
                 container_ip, http_healthy, grpc_healthy, consecutive_failures
             );
         }

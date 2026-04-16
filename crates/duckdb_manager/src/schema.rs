@@ -67,28 +67,28 @@ impl SchemaInitializer {
         conn.with_connection(|c| {
             // 创建表
             c.execute(CREATE_CONTAINERS_TABLE, []).map_err(|e| {
-                DuckDbError::InitializationError(format!("创建 containers 表失败: {}", e))
+                DuckDbError::InitializationError(format!("failed to create containers table: {}", e))
             })?;
 
             c.execute(CREATE_PROJECTS_TABLE, []).map_err(|e| {
-                DuckDbError::InitializationError(format!("创建 projects 表失败: {}", e))
+                DuckDbError::InitializationError(format!("failed to create projects table: {}", e))
             })?;
 
             // 创建容器表索引
             for sql in CREATE_CONTAINERS_INDEXES {
                 c.execute(sql, []).map_err(|e| {
-                    DuckDbError::InitializationError(format!("创建容器表索引失败: {}", e))
+                    DuckDbError::InitializationError(format!("failed to create containers table index: {}", e))
                 })?;
             }
 
             // 创建项目表索引
             for sql in CREATE_PROJECTS_INDEXES {
                 c.execute(sql, []).map_err(|e| {
-                    DuckDbError::InitializationError(format!("创建项目表索引失败: {}", e))
+                    DuckDbError::InitializationError(format!("failed to create projects table index: {}", e))
                 })?;
             }
 
-            tracing::info!("DuckDB Schema 初始化完成");
+            tracing::info!("DuckDB Schema initialized");
             Ok(())
         })
     }
@@ -116,7 +116,7 @@ impl SchemaInitializer {
                 let mut rows = stmt.query([])?;
                 let row = rows
                     .next()?
-                    .ok_or_else(|| DuckDbError::InternalError("无法查询表信息".to_string()))?;
+                    .ok_or_else(|| DuckDbError::InternalError("unable to query table info".to_string()))?;
                 row.get(0)?
             };
 
@@ -128,7 +128,7 @@ impl SchemaInitializer {
                 let mut rows = stmt.query([])?;
                 let row = rows
                     .next()?
-                    .ok_or_else(|| DuckDbError::InternalError("无法查询表信息".to_string()))?;
+                    .ok_or_else(|| DuckDbError::InternalError("unable to query table info".to_string()))?;
                 row.get(0)?
             };
 

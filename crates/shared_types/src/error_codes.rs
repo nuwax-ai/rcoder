@@ -2,6 +2,8 @@
 //!
 //! 🔴 重要原则：保持所有现有错误码不变，与前端约定保持一致
 
+use crate::i18n::t;
+
 // ========== 成功状态码 ==========
 /// 操作成功
 pub const SUCCESS: &str = "0000";
@@ -84,34 +86,155 @@ pub const ERR_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
 /// API Key 鉴权失败
 pub const ERR_API_KEY_AUTH_FAILED: &str = "4010";
 
-/// 获取错误码的默认描述
+/// 获取错误码对应的翻译 key
+fn get_error_i18n_key(code: &str) -> &'static str {
+    match code {
+        SUCCESS => "success",
+        ERR_AGENT_BUSY => "error.agent_busy",
+        ERR_CANCEL_FAILED => "error.cancel_failed",
+        ERR_STOP_FAILED => "error.stop_failed",
+        ERR_VALIDATION => "error.validation",
+        ERR_INVALID_PARAMS => "error.invalid_params",
+        ERR_INVALID_RESOURCE_LIMITS => "error.invalid_resource_limits",
+        ERR_CONTAINER_ERROR => "error.container_error",
+        ERR_WORKSPACE_ERROR => "error.workspace_error",
+        ERR_GRPC_ADDR_ERROR => "error.grpc_addr_error",
+        ERR_GRPC_ERROR => "error.grpc_error",
+        ERR_SERVICE_UNAVAILABLE => "error.service_unavailable",
+        ERR_AGENT_ERROR => "error.agent_error",
+        ERR_PROXY_DISABLED => "error.proxy_disabled",
+        ERR_PROXY_SERVICE_UNAVAILABLE => "error.proxy_service_unavailable",
+        ERR_SESSION_NOT_FOUND => "error.session_not_found",
+        ERR_AGENT_NOT_FOUND => "error.agent_not_found",
+        ERR_CONTAINER_NOT_FOUND => "error.container_not_found",
+        ERR_HTTP_FALLBACK_FAILED => "error.http_fallback_failed",
+        ERR_INTERNAL_SERVER_ERROR => "error.internal_server_error",
+        ERR_RESUME_FAILED => "error.resume_failed",
+        ERR_RETRY_EXHAUSTED => "error.retry_exhausted",
+        ERR_TOO_MANY_REQUESTS => "error.too_many_requests",
+        ERR_API_KEY_AUTH_FAILED => "error.api_key_auth_failed",
+        ERR_UNKNOWN => "error.unknown",
+        _ => "error.undefined",
+    }
+}
+
+/// 获取错误码的多语言描述
+///
+/// # Arguments
+/// * `code` - 错误码
+/// * `locale` - 语言代码，如 "zh-CN", "en-US"
+///
+/// # Returns
+/// 多语言错误描述
+pub fn get_error_message(code: &str, locale: &str) -> String {
+    let key = get_error_i18n_key(code);
+    t(key, locale)
+}
+
+/// 通过 i18n key 直接获取多语言消息
+///
+/// # Arguments
+/// * `key` - i18n key，如 "error.user_id_required"
+/// * `locale` - 语言代码
+///
+/// # Returns
+/// 多语言消息
+pub fn get_i18n_message(key: &str, locale: &str) -> String {
+    t(key, locale)
+}
+
+/// 通过 i18n key 获取默认语言消息
+///
+/// # Arguments
+/// * `key` - i18n key，如 "error.user_id_required"
+///
+/// # Returns
+/// 默认语言的消息
+pub fn get_i18n_message_default(key: &str) -> String {
+    t(key, crate::i18n::DEFAULT_LOCALE)
+}
+
+/// 获取错误码的默认描述（向后兼容，使用默认语言）
+///
+/// 🔴 注意：此函数保留用于向后兼容，新代码请使用 `get_error_message`
 pub fn get_error_description(code: &str) -> &'static str {
     match code {
-        SUCCESS => "操作成功",
-        ERR_AGENT_BUSY => "Agent 正在执行任务",
-        ERR_CANCEL_FAILED => "取消操作失败",
-        ERR_STOP_FAILED => "停止操作失败",
-        ERR_VALIDATION => "参数验证失败",
-        ERR_INVALID_PARAMS => "参数缺失或无效",
-        ERR_INVALID_RESOURCE_LIMITS => "资源限制配置无效",
-        ERR_CONTAINER_ERROR => "容器操作失败",
-        ERR_WORKSPACE_ERROR => "工作目录错误",
-        ERR_GRPC_ADDR_ERROR => "gRPC 地址解析失败",
-        ERR_GRPC_ERROR => "gRPC 调用失败",
-        ERR_SERVICE_UNAVAILABLE => "服务暂时不可用",
-        ERR_AGENT_ERROR => "Agent 内部错误",
-        ERR_PROXY_DISABLED => "代理服务未启用",
-        ERR_PROXY_SERVICE_UNAVAILABLE => "代理服务不可用",
-        ERR_SESSION_NOT_FOUND => "会话不存在或已完成",
-        ERR_AGENT_NOT_FOUND => "Agent 不存在或已停止",
-        ERR_CONTAINER_NOT_FOUND => "容器不存在",
-        ERR_HTTP_FALLBACK_FAILED => "HTTP 回退失败",
-        ERR_INTERNAL_SERVER_ERROR => "内部服务器错误",
-        ERR_RESUME_FAILED => "Resume 会话失败",
-        ERR_RETRY_EXHAUSTED => "降级重试次数耗尽",
-        ERR_TOO_MANY_REQUESTS => "请求过多",
-        ERR_API_KEY_AUTH_FAILED => "API Key 鉴权失败",
-        ERR_UNKNOWN => "未知错误",
-        _ => "未定义的错误码",
+        SUCCESS => "Operation successful",
+        ERR_AGENT_BUSY => "Agent is executing a task",
+        ERR_CANCEL_FAILED => "Cancel operation failed",
+        ERR_STOP_FAILED => "Stop operation failed",
+        ERR_VALIDATION => "Parameter validation failed",
+        ERR_INVALID_PARAMS => "Parameter missing or invalid",
+        ERR_INVALID_RESOURCE_LIMITS => "Invalid resource limit configuration",
+        ERR_CONTAINER_ERROR => "Container operation failed",
+        ERR_WORKSPACE_ERROR => "Workspace error",
+        ERR_GRPC_ADDR_ERROR => "gRPC address resolution failed",
+        ERR_GRPC_ERROR => "gRPC call failed",
+        ERR_SERVICE_UNAVAILABLE => "Service temporarily unavailable",
+        ERR_AGENT_ERROR => "Agent internal error",
+        ERR_PROXY_DISABLED => "Proxy service not enabled",
+        ERR_PROXY_SERVICE_UNAVAILABLE => "Proxy service unavailable",
+        ERR_SESSION_NOT_FOUND => "Session does not exist or has completed",
+        ERR_AGENT_NOT_FOUND => "Agent does not exist or has stopped",
+        ERR_CONTAINER_NOT_FOUND => "Container not found",
+        ERR_HTTP_FALLBACK_FAILED => "HTTP fallback failed",
+        ERR_INTERNAL_SERVER_ERROR => "Internal server error",
+        ERR_RESUME_FAILED => "Resume session failed",
+        ERR_RETRY_EXHAUSTED => "Degraded retry count exhausted",
+        ERR_TOO_MANY_REQUESTS => "Too many requests",
+        ERR_API_KEY_AUTH_FAILED => "API Key authentication failed",
+        ERR_UNKNOWN => "Unknown error",
+        _ => "Undefined error code",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_error_codes_have_messages() {
+        let codes = [
+            SUCCESS,
+            ERR_AGENT_BUSY,
+            ERR_CANCEL_FAILED,
+            ERR_STOP_FAILED,
+            ERR_VALIDATION,
+            ERR_INVALID_PARAMS,
+            ERR_INVALID_RESOURCE_LIMITS,
+            ERR_CONTAINER_ERROR,
+            ERR_WORKSPACE_ERROR,
+            ERR_GRPC_ADDR_ERROR,
+            ERR_GRPC_ERROR,
+            ERR_SERVICE_UNAVAILABLE,
+            ERR_AGENT_ERROR,
+            ERR_PROXY_DISABLED,
+            ERR_PROXY_SERVICE_UNAVAILABLE,
+            ERR_UNKNOWN,
+            ERR_SESSION_NOT_FOUND,
+            ERR_AGENT_NOT_FOUND,
+            ERR_CONTAINER_NOT_FOUND,
+            ERR_HTTP_FALLBACK_FAILED,
+            ERR_INTERNAL_SERVER_ERROR,
+            ERR_RESUME_FAILED,
+            ERR_RETRY_EXHAUSTED,
+            ERR_TOO_MANY_REQUESTS,
+            ERR_API_KEY_AUTH_FAILED,
+        ];
+
+        for code in codes {
+            assert!(
+                !get_error_message(code, "en-US").is_empty(),
+                "missing en-US: {code}"
+            );
+            assert!(
+                !get_error_message(code, "zh-CN").is_empty(),
+                "missing zh-CN: {code}"
+            );
+            assert!(
+                !get_error_message(code, "zh-TW").is_empty(),
+                "missing zh-TW: {code}"
+            );
+        }
     }
 }

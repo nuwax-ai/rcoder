@@ -38,7 +38,10 @@ impl AgentServersConfig {
     /// # 已弃用
     ///
     /// 此方法已弃用，请使用 `load_or_default_for_service` 以支持多服务类型。
-    #[deprecated(since = "0.2.0", note = "请使用 load_or_default_for_service 以支持多服务类型")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "请使用 load_or_default_for_service 以支持多服务类型"
+    )]
     pub async fn load_or_default() -> Self {
         Self::default()
     }
@@ -50,9 +53,7 @@ impl AgentServersConfig {
     ///
     /// # 返回
     /// 对应服务类型的默认配置
-    pub async fn load_or_default_for_service(
-        service_type: &shared_types::ServiceType,
-    ) -> Self {
+    pub async fn load_or_default_for_service(service_type: &shared_types::ServiceType) -> Self {
         Self::default_for_service(service_type)
     }
 
@@ -213,8 +214,9 @@ mod tests {
         assert!(!rcoder_config.agent_servers.is_empty());
 
         // 测试 ComputerAgentRunner
-        let car_config =
-            AgentServersConfig::default_for_service(&shared_types::ServiceType::ComputerAgentRunner);
+        let car_config = AgentServersConfig::default_for_service(
+            &shared_types::ServiceType::ComputerAgentRunner,
+        );
         assert!(!car_config.agent_servers.is_empty());
 
         // 验证配置不同

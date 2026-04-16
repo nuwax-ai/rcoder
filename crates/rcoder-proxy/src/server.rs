@@ -28,10 +28,10 @@ impl ProxyServer {
         // 验证配置
         self.config
             .validate()
-            .map_err(|e| anyhow::anyhow!("配置验证失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {}", e))?;
 
         info!(
-            "启动基于 Pingora 的端口代理服务器，监听端口: {}",
+            "starting Pingora-based port proxy server, listening on port: {}",
             self.config.listen_port
         );
 
@@ -40,12 +40,12 @@ impl ProxyServer {
         // 注意：这是一个库，实际的 Pingora 服务器需要由调用者启动
         // 这里只是准备服务实例
         let pingora_proxy = self.service.create_pingora_proxy().map_err(|e| {
-            error!("❌ [SERVER] 创建 Pingora 代理实例失败: {}", e);
+            error!("[SERVER] created Pingora proxy failed: {}", e);
             e
         })?;
-        info!("Pingora 代理服务已准备就绪");
+        info!("Pingora proxy already initialized");
         info!(
-            "负载均衡算法: {}",
+            "Load balancing algorithm: {}",
             if pingora_proxy.use_round_robin {
                 "Round Robin"
             } else {
@@ -58,20 +58,23 @@ impl ProxyServer {
 
     /// 记录启动信息
     fn log_startup_info(&self) {
-        info!("基于 Pingora 的代理服务器配置:");
-        info!("  监听端口: {}", self.config.listen_port);
-        info!("  默认后端端口: {}", self.config.default_backend_port);
-        info!("  后端主机: {}", self.config.backend_host);
-        info!("  端口参数名: {}", self.config.port_param);
-        info!("代理使用方式:");
-        info!("  /proxy/3000/path - 访问端口 3000 的服务");
-        info!("  ?port=3000 - 通过查询参数访问端口 3000 的服务（向后兼容）");
-        info!("Pingora 高级特性:");
-        info!("  - 负载均衡 (Round Robin/Ketama)");
-        info!("  - 健康检查");
-        info!("  - 连接池和连接复用");
-        info!("  - HTTP/1.1 和 HTTP/2 支持");
-        info!("  - 高性能异步 I/O");
+        info!(" Pingora proxy config:");
+        info!(" listen port: {}", self.config.listen_port);
+        info!(
+            " default backend port: {}",
+            self.config.default_backend_port
+        );
+        info!(" backend host: {}", self.config.backend_host);
+        info!(" port param: {}", self.config.port_param);
+        info!("proxy examples:");
+        info!(" /proxy/3000/path - proxy to port 3000");
+        info!(" ?port=3000 - proxy params to port 3000 (query)");
+        info!("Pingora features:");
+        info!(" - load balancing (Round Robin/Ketama)");
+        info!(" - health check");
+        info!(" - connection and connection reuse");
+        info!(" - HTTP/1.1 and HTTP/2");
+        info!(" - async I/O");
     }
 
     /// 获取服务实例
@@ -104,9 +107,9 @@ impl ProxyServer {
         // 检查配置
         self.config
             .validate()
-            .map_err(|e| anyhow::anyhow!("配置验证失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {}", e))?;
 
-        info!("Pingora 代理服务器预启动检查通过");
+        info!("Pingora proxy pre-start check passed");
         Ok(())
     }
 

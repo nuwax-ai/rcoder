@@ -15,7 +15,6 @@ pub enum ModelApiProtocol {
     OpenAI,
 }
 
-
 impl FromStr for ModelApiProtocol {
     type Err = ();
 

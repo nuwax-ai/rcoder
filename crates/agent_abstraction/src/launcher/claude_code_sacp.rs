@@ -13,16 +13,16 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
-use anyhow::{Context, Result};
 #[cfg(windows)]
 use crate::path_env::TAURI_APP_DATA_DIR;
+use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
+use anyhow::{Context, Result};
 use process_wrap::tokio::CommandWrap;
-#[cfg(windows)]
-use process_wrap::tokio::{CreationFlags, JobObject};
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
+#[cfg(windows)]
+use process_wrap::tokio::{CreationFlags, JobObject};
+use shared_types::{error_codes, ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
@@ -46,7 +46,8 @@ use crate::traits::session_registry::SessionRegistry;
 use super::lifecycle::AgentLifecycleGuard;
 #[cfg(windows)]
 use super::windows_launch::{
-    normalize_windows_command_for_no_window, resolve_windows_node_cli_command, CREATE_NO_WINDOW_FLAG,
+    CREATE_NO_WINDOW_FLAG, normalize_windows_command_for_no_window,
+    resolve_windows_node_cli_command,
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
@@ -62,6 +63,7 @@ const ENV_ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
 const ENV_ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 const ENV_ANTHROPIC_MODEL: &str = "ANTHROPIC_MODEL";
 const ENV_DISABLE_NONESSENTIAL: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+const ENV_AGENT_SDK_SKIP_VERSION_CHECK: &str = "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK";
 const ENV_RUST_LOG: &str = "RUST_LOG";
 const ENV_AGENT_WORKING_DIR: &str = "AGENT_WORKING_DIR";
 const ENV_AGENT_PROJECT_ID: &str = "AGENT_PROJECT_ID";
@@ -128,7 +130,7 @@ fn ensure_subprocess_path_env(merged_envs: &mut std::collections::HashMap<String
         let path = build_mcp_server_path_env();
         if !path.is_empty() {
             merged_envs.insert("PATH".to_string(), path);
-            debug!("[SACP] 📋 已构建 PATH 环境变量（包含系统 PATH 和用户目录）");
+            debug!("[SACP] 📋 already built PATH (using existing PATH directory)");
         }
     }
     #[cfg(windows)]
@@ -241,7 +243,7 @@ fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<Str
     if !merged_envs.contains_key("PATHEXT") {
         if let Ok(pathext) = std::env::var("PATHEXT") {
             merged_envs.insert("PATHEXT".to_string(), pathext);
-            debug!("[SACP] 📋 已添加系统 PATHEXT 环境变量");
+            debug!("[SACP] 📋 PATHEXT already set");
         }
     }
 }
@@ -301,27 +303,33 @@ pub async fn load_sacp_agent_config(
     let config = AgentServersConfig::load_or_default_for_service(service_type).await;
 
     if let Some(agent_config) = config.get_agent("claude-code-acp-ts") {
-        debug!("📋 [SACP] 加载默认 Agent 配置: {}", agent_config.agent_id);
+        debug!(
+            "📋 [SACP] using default Agent config: {}",
+            agent_config.agent_id
+        );
 
-        // 检查并安装 agent
-        if agent_config.installation.package_name.is_some() {
-            let installation_manager = AgentInstallationManager::new();
-            match installation_manager
-                .ensure_installed(&agent_config.installation, &agent_config.command)
-                .await
-            {
-                Ok(result) => {
-                    if result.already_installed {
-                        debug!("[SACP] Agent 已安装: {}", agent_config.command);
-                    } else {
-                        info!("✅ [SACP] Agent 安装成功: {}", result.message);
-                    }
-                }
-                Err(e) => {
-                    warn!("⚠️ [SACP] Agent 自动安装失败: {}，尝试继续启动", e);
-                }
-            }
-        }
+        // 检查并安装 agent - 临时禁用以测试本地 claude-code-acp-ts
+        // if agent_config.installation.package_name.is_some() {
+        //     let installation_manager = AgentInstallationManager::new();
+        //     match installation_manager
+        //         .ensure_installed(&agent_config.installation, &agent_config.command)
+        //         .await
+        //     {
+        //         Ok(result) => {
+        //             if result.already_installed {
+        //                 debug!("[SACP] Agent already installed: {}", agent_config.command);
+        //             } else {
+        //                 info!("[SACP] Agent message succeeded: {}", result.message);
+        //             }
+        //         }
+        //         Err(e) => {
+        //             warn!(
+        //                 "[SACP] Agent message Installation failed: {}, message started",
+        //                 e
+        //             );
+        //         }
+        //     }
+        // }
 
         // 解析环境变量
         let mut resolved_env = agent_config.env.clone();
@@ -343,6 +351,32 @@ pub async fn load_sacp_agent_config(
 
         // 禁用 Claude Code 非必要网络请求
         resolved_env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
+        // 跳过 Agent SDK 版本检查
+        resolved_env.insert(ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(), "1".to_string());
+
+        // debug: 打印最终环境变量（API Key 已脱敏）
+        let mask_key = |v: &String| -> String {
+            if v.len() > 8 {
+                format!("{}***{}", &v[..4], &v[v.len()-4..])
+            } else {
+                "***".to_string()
+            }
+        };
+        debug!(
+            "[SACP] Final env config: command={}, ANTHROPIC_API_KEY={}, ANTHROPIC_BASE_URL={}, ANTHROPIC_MODEL={}, \
+             OPENAI_API_KEY={}, OPENAI_BASE_URL={}, OPENCODE_MODEL={}, \
+             RUST_LOG={}, CLAUDE_CODE_MAX_TOKENS={}, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC={}",
+            agent_config.command,
+            resolved_env.get("ANTHROPIC_API_KEY").map(|v| mask_key(v)).unwrap_or_default(),
+            resolved_env.get("ANTHROPIC_BASE_URL").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("ANTHROPIC_MODEL").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("OPENAI_API_KEY").map(|v| mask_key(v)).unwrap_or_default(),
+            resolved_env.get("OPENAI_BASE_URL").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("OPENCODE_MODEL").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("RUST_LOG").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("CLAUDE_CODE_MAX_TOKENS").unwrap_or(&"<unset>".to_string()),
+            resolved_env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap_or(&"<unset>".to_string()),
+        );
 
         Ok(SacpAgentLaunchConfig {
             command: agent_config.command.clone(),
@@ -351,7 +385,7 @@ pub async fn load_sacp_agent_config(
             context_servers: config.context_servers.clone(),
         })
     } else {
-        warn!("⚠️ [SACP] 配置中未找到 claude-code-acp-ts，使用默认配置");
+        warn!("[SACP] config not found for claude-code-acp-ts, using default config");
         get_default_sacp_agent_config(model_provider, service_type)
     }
 }
@@ -399,6 +433,7 @@ pub fn get_default_sacp_agent_config(
 
     env.insert(ENV_RUST_LOG.to_string(), "info".to_string());
     env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
+    env.insert(ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(), "1".to_string());
 
     // Resolve the claude-code-acp-ts command path.
     // Priority: CLAUDE_CODE_ACP_PATH env var > `which` crate lookup > bare command name.
@@ -409,7 +444,10 @@ pub fn get_default_sacp_agent_config(
     } else {
         match which::which("claude-code-acp-ts") {
             Ok(resolved_path) => {
-                tracing::info!("Resolved claude-code-acp-ts path via `which` crate: {}", resolved_path.display());
+                tracing::info!(
+                    "Resolved claude-code-acp-ts path via `which` crate: {}",
+                    resolved_path.display()
+                );
                 resolved_path.to_string_lossy().to_string()
             }
             Err(_) => "claude-code-acp-ts".to_string(),
@@ -509,7 +547,7 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
     // 检查日志级别是否为 debug
     if !is_debug_log_level() {
         debug!(
-            "[MCP] mcp-proxy convert 检测到，但日志级别非 debug，跳过诊断参数注入"
+            "[MCP] mcp-proxy convert detected, but not debug, skip diagnostic params"
         );
         return args;
     }
@@ -517,7 +555,7 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
     // 检查是否已有 --diagnostic 参数
     let has_diagnostic = args.iter().any(|arg| arg == "--diagnostic");
     if has_diagnostic {
-        debug!("[MCP] mcp-proxy convert 已有 --diagnostic 参数，跳过注入");
+        debug!("[MCP] mcp-proxy already has --diagnostic params, skipping");
         return args;
     }
 
@@ -525,11 +563,11 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
 
     // 追加 --diagnostic 参数
     enhanced_args.push("--diagnostic".to_string());
-    info!("[MCP] 为 mcp-proxy convert 追加 --diagnostic 参数");
+    info!("[MCP] added --diagnostic params to mcp-proxy");
 
     // 🔒 关键检查：如果用户已配置 --log-dir 或 --log-file，不覆盖
     if has_log_dir_arg(&enhanced_args) {
-        debug!("[MCP] 用户已配置日志参数，跳过 --log-dir 注入");
+        debug!("[MCP] already has config params, skip --log-dir");
         return enhanced_args;
     }
 
@@ -538,7 +576,7 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
         enhanced_args.push("--log-dir".to_string());
         enhanced_args.push(log_dir.clone());
         info!(
-            "[MCP] 为 mcp-proxy convert 追加 --log-dir {} 参数",
+            "[MCP] adding mcp-proxy convert --log-dir {} params",
             log_dir
         );
     }
@@ -616,10 +654,7 @@ pub fn convert_context_servers_sacp(
             #[cfg(not(windows))]
             if !env_vars.iter().any(|e| e.name == "HOME") {
                 if let Ok(home) = std::env::var("HOME") {
-                    env_vars.push(sacp::schema::EnvVariable::new(
-                        "HOME".to_string(),
-                        home,
-                    ));
+                    env_vars.push(sacp::schema::EnvVariable::new("HOME".to_string(), home));
                 }
             }
 
@@ -723,13 +758,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                             .replace("{MODEL_PROVIDER_NAME}", &provider.name);
                     }
                     debug!(
-                        "🔧 [SACP] 已替换自定义环境变量模板, model={}",
+                        "🔧 [SACP] Replaced custom env var template, model={}",
                         provider.default_model
                     );
                 }
 
                 info!(
-                    "🎯 [SACP] 使用自定义 Agent: agent_id={}, command={} {:?}",
+                    "🎯 [SACP] Using custom Agent: agent_id={}, command={} {:?}",
                     agent_server_override.get_agent_id(),
                     cmd,
                     args
@@ -738,7 +773,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             } else {
                 // 使用默认配置
                 info!(
-                    "📋 [SACP] 使用默认 Agent: {} {:?}",
+                    "📋 [SACP] Using default Agent: {} {:?}",
                     default_agent_config.command, default_agent_config.args
                 );
                 (
@@ -760,17 +795,20 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 创建 CancellationToken
         let cancel_token = CancellationToken::new();
 
-        info!("[SACP] 项目工作目录: {}", &project_path.to_string_lossy());
+        info!(
+            "[SACP] projectworkdirectory: {}",
+            &project_path.to_string_lossy()
+        );
 
         // 准备 MCP 服务器
         let mcp_servers = if start_config.has_mcp_servers() {
-            info!("📦 [SACP] 使用 AgentStartConfig 中的 MCP 服务器");
+            info!("[SACP] using AgentStartConfig MCP servers");
             start_config.mcp_servers.clone()
         } else if !default_agent_config.context_servers.is_empty() {
-            info!("📦 [SACP] 使用配置文件中的 MCP 服务器");
+            info!("[SACP] using config file MCP servers");
             convert_context_servers_sacp(&default_agent_config.context_servers)
         } else {
-            info!("📝 [SACP] 未配置 MCP 服务器");
+            info!("📝 [SACP] no config MCP servers");
             Vec::new()
         };
 
@@ -783,7 +821,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         {
             let entry = resolved_args.first().cloned().unwrap_or_default();
             info!(
-                "[SACP] Windows 直连 node 启动: {} -> {} {}",
+                "[SACP] Windows direct node startup: {} -> {} {}",
                 command_path, resolved_program, entry
             );
             command_path = resolved_program;
@@ -852,21 +890,21 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     );
                 }
 
-                debug!("[SACP] 🔒 已强制替换敏感环境变量为占位符/代理 URL");
+                debug!("[SACP] 🔒 force replaced with proxy URL");
             }
         } else {
-            debug!("[SACP] 🔓 非代理模式，使用真实 API Key 和 Base URL");
+            debug!("[SACP] 🔓 not proxy mode, keeping API Key and Base URL");
         }
 
         // 🔍 打印传递给 Agent 的完整环境变量（用于调试）
         // 注意：敏感字段（API Key）需要脱敏处理，防止日志泄露
         debug!(
-            "[SACP] 📋 启动 Agent 命令: {} {:?}",
+            "[SACP] 📋 Start Agent command: {} {:?}",
             command_path, command_args
         );
-        debug!("[SACP] 📋 工作目录: {:?}", project_path);
+        debug!("[SACP] 📋 work directory: {:?}", project_path);
         debug!(
-            "[SACP] 📋 传递给 Agent 的环境变量 ({} 个):",
+            "[SACP] 📋 Environment variables passed to Agent ({} items):",
             merged_envs.len()
         );
 
@@ -917,22 +955,23 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let mut child = cmd_wrap
             .wrap(ProcessGroup::leader())
             .spawn()
-            .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
+            .context("[SACP] Failed to start claude-code-acp-ts subprocess")?;
 
         #[cfg(windows)]
         let mut child = cmd_wrap
-            .wrap(CreationFlags(PROCESS_CREATION_FLAGS(
-                CREATE_NO_WINDOW_FLAG,
-            )))
+            .wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW_FLAG)))
             .wrap(JobObject)
             .spawn()
-            .context("[SACP] 无法启动 claude-code-acp-ts 子进程")?;
+            .context("[SACP] Failed to start claude-code-acp-ts subprocess")?;
 
         #[cfg(not(any(unix, windows)))]
-        compile_error!("仅支持 unix 和 windows 平台");
+        compile_error!("neither unix nor windows");
 
         let child_pid = child.id().unwrap_or(0);
-        info!("[SACP] Claude Code ACP 子进程已启动，PID: {}", child_pid);
+        info!(
+            "[SACP] Claude Code ACP child process already started, PID: {}",
+            child_pid
+        );
 
         // 获取 stdio 句柄（process_wrap 使用方法访问 stdio）
         let stdin = take_stdio(&mut child.stdin(), "stdin")?;
@@ -971,18 +1010,18 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             let result = run_sacp_connection(transport, params).await;
 
             if let Err(e) = result {
-                error!("[SACP] Claude Code ACP Agent 连接失败: {}", e);
+                error!("[SACP] Claude Code ACP Agent connection failed: {}", e);
             }
         });
 
         // 等待会话 ID
         let session_id = session_id_rx.await.map_err(|e| {
-            error!("[SACP] 智能体初始化超时: {}", e);
-            anyhow::anyhow!("智能体初始化超时，请重试（过多的MCP可能导致超时）。如果持续失败请重启智能体电脑（点击PC端右上图标展开后，在[...]里点击重启智能体电脑）")
+            error!("[SACP] initialize timeout: {}", e);
+            anyhow::anyhow!("{}", error_codes::get_i18n_message_default("error.agent_init_timeout"))
         })?;
 
         info!(
-            "[SACP] Claude Code ACP Agent 服务启动完成，会话 ID: {}",
+            "[SACP] Claude Code ACP Agent service started successfully, session ID: {}",
             session_id
         );
 
@@ -994,26 +1033,26 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
             loop {
                 tokio::select! {
-                    biased; // 优先检查取消信号
+                                   biased; // 优先检查取消信号
 
-                    _ = cancel_token_for_stderr.cancelled() => {
-                        debug!("[SACP] stderr 读取任务收到取消信号");
-                        break;
-                    }
-                    result = lines.next_line() => {
-                        match result {
-                            Ok(Some(line)) if !line.trim().is_empty() => {
-                                warn!("[SACP] Claude Code Agent stderr: {}", line.trim());
-                            }
-                            Ok(Some(_)) => {} // 空行，忽略
-                            Ok(None) => break, // EOF
-                            Err(e) => {
-                                error!("[SACP] 读取 stderr 失败: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
+                                   _ = cancel_token_for_stderr.cancelled() => {
+                debug!("[SACP] stderr cancel received");
+                                       break;
+                                   }
+                                   result = lines.next_line() => {
+                                       match result {
+                                           Ok(Some(line)) if !line.trim().is_empty() => {
+                                               warn!("[SACP] Claude Code Agent stderr: {}", line.trim());
+                                           }
+                                           Ok(Some(_)) => {} // 空行，忽略
+                                           Ok(None) => break, // EOF
+                                           Err(e) => {
+                error!("[SACP] read stderr failed: {}", e);
+                                               break;
+                                           }
+                                       }
+                                   }
+                               }
             }
         });
 
@@ -1039,7 +1078,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 /// 从 Option 中取出 stdio 句柄，失败时返回错误
 fn take_stdio<T>(opt: &mut Option<T>, name: &str) -> Result<T> {
     opt.take()
-        .ok_or_else(|| anyhow::anyhow!("[SACP] 无法获取子进程 {}", name))
+        .ok_or_else(|| anyhow::anyhow!("[SACP] Failed to get subprocess {}", name))
 }
 
 /// SACP 连接参数（封装 run_sacp_connection 的参数）
@@ -1119,7 +1158,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     // 方法名不匹配，不是 session/update 通知，跳过
                                     debug!(
                                         method = %method,
-                                        "[SACP] 跳过非 session/update 通知"
+                                        "[SACP] Skipping non session/update notification"
                                     );
                                     // 继续传递给其他 handlers
                                     Ok(sacp::Handled::No {
@@ -1136,7 +1175,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                         ?err,
                                         method = %method,
                                         params = ?params,
-                                        "[SACP] SessionNotification 解析失败，跳过此消息但保持连接"
+                                        "[SACP] SessionNotification parse failed, skipping message but keeping connection"
                                     );
                                     // 跳过此消息但不断开连接
                                     Ok(sacp::Handled::Yes)
@@ -1175,7 +1214,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
 
             async move {
                 // 1. 初始化连接
-                debug!("[SACP] 初始化 ACP 连接...");
+ debug!("[SACP] initialize ACP connection...");
                 let _init_response = cx
                     .send_request(
                         InitializeRequest::new(VERSION)
@@ -1186,13 +1225,13 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     )
                     .block_task()
                     .await?;
-                info!("[SACP] ACP 连接初始化成功");
+ info!("[SACP] ACP connection initialized");
 
                 // 2. 构建 meta（包含系统提示词和可能的 resume）
                 let system_prompt_meta = start_config.build_meta();
 
                 // 3. 创建新会话
-                info!("[SACP] 创建 ACP 会话...");
+ info!("[SACP] creating ACP session...");
                 let new_session_request = NewSessionRequest::new(project_path.clone())
                     .mcp_servers(mcp_servers.clone())
                     .meta(system_prompt_meta);
@@ -1211,17 +1250,20 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 .map_err(|_| {
                     sacp::Error::new(
                         -32000,
-                        format!("[SACP] new_session 超时 ({}s)", timeout_secs)
+                        format!("[SACP] new_session timeout ({}s)", timeout_secs)
                     )
                 })??;
 
                 let session_id = session_response.session_id;
-                info!("[SACP] ACP 会话创建成功, session_id={}", session_id);
+ info!("[SACP] ACP session created, session_id={}", session_id);
 
                 // 发送会话 ID 到主任务
                 if session_id_tx.send(session_id.clone()).is_err() {
-                    error!("[SACP] 无法发送会话 ID");
-                    return Err(sacp::Error::new(-32001, "[SACP] 无法发送会话 ID"));
+                    error!("[SACP] unable to send session ID");
+                    return Err(sacp::Error::new(
+                        -32001,
+                        error_codes::get_i18n_message_default("error.sacp_session_id_send_failed"),
+                    ));
                 }
 
                 // 4. 处理 Prompt 和 Cancel 请求
@@ -1236,21 +1278,24 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             if is_abnormal {
                                 // Agent 进程异常退出，发送 SSE 错误通知
                                 warn!(
-                                    "[SACP] Agent 进程异常退出，发送 SSE 错误通知并断开连接: project_id={}, session_id={}",
+                                    "[SACP] Agent process exited abnormally, sending SSE error notification and disconnecting: project_id={}, session_id={}",
                                     project_id_for_prompt, session_id
                                 );
                                 if let Err(e) = notifier_for_prompt
                                     .notify_prompt_error(
                                         &project_id_for_prompt,
                                         &session_id.to_string(),
-                                        sacp::Error::new(-32001, "Agent 进程异常退出，请重试"),
+                                        sacp::Error::new(
+                                            -32001,
+                                            error_codes::get_i18n_message_default("error.agent_process_abnormal_exit"),
+                                        ),
                                         None, // request_id 可能已经不可用
                                     )
                                     .await
                                 {
-                                    error!("[SACP] 发送 Agent 退出错误通知失败: {:?}", e);
+ error!("[SACP] send Agent error notification failed: {:?}", e);
                                 } else {
-                                    info!("[SACP] 已发送 Agent 退出错误通知: project_id={}", project_id_for_prompt);
+ info!("[SACP] already sent Agent error notification: project_id={}", project_id_for_prompt);
                                 }
                             } else {
                                 // 🔥 修复：正常取消时也要发送 PromptEnd，确保状态回退 Idle
@@ -1260,15 +1305,15 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                         &project_id_for_prompt,
                                         &session_id.to_string(),
                                         sacp::schema::StopReason::Cancelled,
-                                        Some("用户取消任务".to_string()),
+                                        Some(error_codes::get_i18n_message_default("error.session_cancelled")),
                                         None,
                                     )
                                     .await
                                 {
-                                    error!("[SACP] 发送 PromptEnd (Cancelled) 通知失败: {:?}", e);
+ error!("[SACP] send PromptEnd (Cancelled) notification failed: {:?}", e);
                                 } else {
                                     info!(
-                                        "[SACP] 已发送 PromptEnd (Cancelled) 通知，状态将回退 Idle: project_id={}, session_id={}",
+                                        "[SACP] Sent PromptEnd (Cancelled) notification, state will revert to Idle: project_id={}, session_id={}",
                                         project_id_for_prompt, session_id
                                     );
                                 }
@@ -1277,24 +1322,24 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                         }
                         Some(cancel_request) = cancel_rx.recv() => {
                             let session_id_str = cancel_request.cancel_notification.session_id.0.to_string();
-                            info!("[SACP] 收到取消请求: session_id={}", session_id_str);
+ info!("[SACP] received cancel request: session_id={}", session_id_str);
                             // 构建 SACP 版本的 CancelNotification 并发送到 Agent
                             let sacp_session_id = SessionId::new(Arc::from(session_id_str.as_str()));
                             let cancel_notification = CancelNotification::new(sacp_session_id);
                             if let Err(e) = cx.send_notification(cancel_notification) {
-                                error!("[SACP] 发送取消通知失败: {:?}", e);
+                                error!("[SACP] send cancel notification failed: {:?}", e);
                                 // 通知调用方取消失败
                                 let _ = cancel_request.result_tx.send(shared_types::CancelResult::Failed(
-                                    format!("发送取消通知失败: {:?}", e)
+                                    format!("Failed to send cancel notification: {:?}", e)
                                 ));
                             } else {
-                                info!("[SACP] 取消通知已发送");
+ info!("[SACP] cancel notification sent");
                                 // 通知调用方取消成功
                                 let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
                             }
                         }
                         Some(prompt_request) = prompt_rx.recv() => {
-                            debug!("[SACP] 处理 Prompt 请求");
+ debug!("[SACP] received Prompt request");
 
                             // 从 meta 中提取 request_id
                             let request_id = prompt_request
@@ -1315,10 +1360,10 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                 )
                                 .await
                             {
-                                error!("[SACP] 发送 PromptStart 通知失败: {:?}", e);
+                                error!("[SACP] send PromptStart notification failed: {:?}", e);
                             } else {
                                 info!(
-                                    "[SACP] PromptStart 通知已发送: session_id={}, request_id={:?}",
+                                    "[SACP] PromptStart notification sent: session_id={}, request_id={:?}",
                                     session_id_str, request_id
                                 );
                             }
@@ -1341,45 +1386,54 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                         let is_abnormal = abnormal_exit_flag.load(Ordering::SeqCst);
                                         if is_abnormal {
                                             warn!(
-                                                "[SACP] Prompt 处理中检测到 Agent 进程异常退出: project_id={}, session_id={}",
+                                                "[SACP] Detected Agent process abnormal exit during prompt processing: project_id={}, session_id={}",
                                                 project_id_for_prompt, session_id
                                             );
-                                            break Err(sacp::Error::new(-32001, "Agent 进程异常退出，请重试"));
+                                            break Err(sacp::Error::new(
+                                                -32001,
+                                                error_codes::get_i18n_message_default("error.agent_process_abnormal_exit"),
+                                            ));
                                         } else {
                                             // 正常取消（用户主动取消或 Agent 正常退出）
                                             info!(
-                                                "[SACP] Prompt 处理中收到取消信号: project_id={}, session_id={}",
+                                                "[SACP] Received cancel signal during prompt processing: project_id={}, session_id={}",
                                                 project_id_for_prompt, session_id
                                             );
-                                            break Err(sacp::Error::new(-32002, "会话已取消"));
+                                            break Err(sacp::Error::new(
+                                                -32002,
+                                                error_codes::get_i18n_message_default("error.session_cancelled"),
+                                            ));
                                         }
                                     }
                                     // 取消后的超时保护（只有 is_cancelled 为 true 时才有意义）
                                     _ = &mut cancel_timeout, if is_cancelled => {
                                         // 取消后超时，强制返回错误
-                                        warn!("[SACP] 取消后等待 Prompt 响应超时 (10s)，强制返回");
-                                        break Err(sacp::Error::new(-32001, "取消后等待响应超时"));
+                                        warn!("[SACP] cancel message Prompt response timeout (10s), force exit");
+                                        break Err(sacp::Error::new(
+                                            -32001,
+                                            error_codes::get_i18n_message_default("error.cancel_response_timeout"),
+                                        ));
                                     }
                                     // 检查取消请求（无论是否已取消都要接收，避免调用方超时）
                                     Some(cancel_request) = cancel_rx.recv() => {
                                         if is_cancelled {
                                             // 🎯 已经在取消中，直接返回成功（通知已发送）
-                                            info!("[SACP] 已有取消请求在处理中，直接返回成功");
+                                            info!("[SACP] already sent cancel request, notification succeeded");
                                             let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
                                         } else {
                                             let session_id_str = cancel_request.cancel_notification.session_id.0.to_string();
-                                            info!("[SACP] 在 Prompt 处理中收到取消请求: session_id={}", session_id_str);
+                                            info!("[SACP] received Prompt cancel request: session_id={}", session_id_str);
                                             // 发送取消通知给 Agent
                                             let sacp_session_id = SessionId::new(Arc::from(session_id_str.as_str()));
                                             let cancel_notification = CancelNotification::new(sacp_session_id);
                                             if let Err(e) = cx.send_notification(cancel_notification) {
-                                                error!("[SACP] 发送取消通知失败: {:?}", e);
+                                                error!("[SACP] send cancel notification failed: {:?}", e);
                                                 // 发送失败立即返回错误
                                                 let _ = cancel_request.result_tx.send(shared_types::CancelResult::Failed(
-                                                    format!("发送取消通知失败: {:?}", e)
+                                                    format!("Failed to send cancel notification: {:?}", e)
                                                 ));
                                             } else {
-                                                info!("[SACP] 取消通知已发送");
+                                                info!("[SACP] cancel notification sent");
                                                 // 🎯 立即返回成功，不阻塞调用方
                                                 let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
                                                 is_cancelled = true;
@@ -1399,7 +1453,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             // 处理 Prompt 响应结果
                             match prompt_result {
                                 Ok(response) => {
-                                    debug!("[SACP] Prompt 响应: stop_reason={:?}", response.stop_reason);
+ debug!("[SACP] Prompt response: stop_reason={:?}", response.stop_reason);
                                     // 发送 PromptEnd 通知
                                     if let Err(e) = notifier_for_prompt
                                         .notify_prompt_end(
@@ -1411,10 +1465,10 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                         )
                                         .await
                                     {
-                                        error!("[SACP] 发送 PromptEnd 通知失败: {:?}", e);
+                                        error!("[SACP] send PromptEnd notification failed: {:?}", e);
                                     } else {
                                         info!(
-                                            "[SACP] PromptEnd 通知已发送: session_id={}, request_id={:?}",
+                                            "[SACP] PromptEnd notification sent: session_id={}, request_id={:?}",
                                             session_id, request_id
                                         );
                                     }
@@ -1423,22 +1477,22 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     // 🎯 区分"取消超时"和"真正的错误"
                                     if is_cancelled {
                                         // 取消超时：发送 PromptEnd (Cancelled) 而非 PromptError
-                                        info!("[SACP] 取消超时，发送 PromptEnd (Cancelled): session_id={}", session_id);
+                                        info!("[SACP] cancel timeout, send PromptEnd (Cancelled): session_id={}", session_id);
                                         if let Err(notify_err) = notifier_for_prompt
                                             .notify_prompt_end(
                                                 &project_id_for_prompt,
                                                 &session_id.to_string(),
                                                 sacp::schema::StopReason::Cancelled,
-                                                Some("用户取消任务（Agent 响应超时）".to_string()),
+                                                Some(error_codes::get_i18n_message_default("error.session_cancelled_timeout")),
                                                 request_id.clone(),
                                             )
                                             .await
                                         {
-                                            error!("[SACP] 发送 PromptEnd (Cancelled) 通知失败: {:?}", notify_err);
+                                            error!("[SACP] send PromptEnd (Cancelled) notification failed: {:?}", notify_err);
                                         }
                                     } else {
                                         // 真正的错误：发送 PromptError
-                                        error!("[SACP] Prompt 请求失败: {:?}", e);
+ error!("[SACP] Prompt request failed: {:?}", e);
                                         if let Err(notify_err) = notifier_for_prompt
                                             .notify_prompt_error(
                                                 &project_id_for_prompt,
@@ -1448,14 +1502,14 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                             )
                                             .await
                                         {
-                                            error!("[SACP] 发送 PromptError 通知失败: {:?}", notify_err);
+ error!("[SACP] send PromptError notification failed: {:?}", notify_err);
                                         }
                                     }
 
                                     // 🔥 关键：如果 cancel_token 已取消，直接退出外层 loop
                                     // 避免回到外层 loop 时再次触发 cancel_token.cancelled() 导致重复发送通知
                                     if cancel_token.is_cancelled() {
-                                        info!("[SACP] Prompt 处理完成且 cancel_token 已取消，退出");
+ info!("[SACP] Prompt completed but cancel_token already cancelled, exiting");
                                         break;
                                     }
                                 }
@@ -1463,7 +1517,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                         }
                         else => {
                             // 所有通道已关闭
-                            info!("[SACP] 通道已关闭，退出");
+ info!("[SACP] channels already closed, exiting");
                             break;
                         }
                     }
@@ -1505,7 +1559,7 @@ async fn handle_session_notification<N: SessionNotifier>(
         .await
     {
         error!(
-            "[SACP] 推送会话更新失败: project_id={}, session_id={}, error={:?}",
+            "[SACP] Push session update failed: project_id={}, session_id={}, error={:?}",
             project_id, session_id, e
         );
     }
@@ -1516,7 +1570,7 @@ async fn handle_permission_request(
     request: RequestPermissionRequest,
     request_cx: JrRequestCx<RequestPermissionResponse>,
 ) -> Result<(), sacp::Error> {
-    debug!("[SACP] 权限请求: {:?}", request);
+    debug!("[SACP] permission request: {:?}", request);
 
     // 自动允许：优先选择 AllowAlways，其次 AllowOnce
     let selected = request
@@ -1984,12 +2038,21 @@ mod tests {
     #[test]
     fn test_has_log_dir_arg() {
         // 检测 --log-dir 参数
-        assert!(has_log_dir_arg(&["--log-dir".to_string(), "/tmp".to_string()]));
+        assert!(has_log_dir_arg(&[
+            "--log-dir".to_string(),
+            "/tmp".to_string()
+        ]));
         assert!(has_log_dir_arg(&["--log-dir=/tmp".to_string()]));
-        assert!(has_log_dir_arg(&["convert".to_string(), "--log-dir".to_string()]));
+        assert!(has_log_dir_arg(&[
+            "convert".to_string(),
+            "--log-dir".to_string()
+        ]));
 
         // 检测 --log-file 参数
-        assert!(has_log_dir_arg(&["--log-file".to_string(), "/tmp/log.txt".to_string()]));
+        assert!(has_log_dir_arg(&[
+            "--log-file".to_string(),
+            "/tmp/log.txt".to_string()
+        ]));
         assert!(has_log_dir_arg(&["--log-file=/tmp/log.txt".to_string()]));
     }
 
@@ -1998,7 +2061,10 @@ mod tests {
         assert!(!has_log_dir_arg(&[]));
         assert!(!has_log_dir_arg(&["convert".to_string()]));
         assert!(!has_log_dir_arg(&["--diagnostic".to_string()]));
-        assert!(!has_log_dir_arg(&["--config".to_string(), "config.json".to_string()]));
+        assert!(!has_log_dir_arg(&[
+            "--config".to_string(),
+            "config.json".to_string()
+        ]));
     }
 
     #[test]
@@ -2024,7 +2090,10 @@ mod tests {
         assert_eq!(result.iter().filter(|a| *a == "--log-dir").count(), 1);
         // --log-dir 的值应该是用户配置的 /custom/path
         let log_dir_idx = result.iter().position(|a| a == "--log-dir").unwrap();
-        assert_eq!(result.get(log_dir_idx + 1), Some(&"/custom/path".to_string()));
+        assert_eq!(
+            result.get(log_dir_idx + 1),
+            Some(&"/custom/path".to_string())
+        );
 
         // 清理环境变量
         // SAFETY: 测试环境中修改环境变量是安全的

@@ -62,12 +62,15 @@ pub struct SessionData {
 impl SessionData {
     pub fn new(max_size: usize) -> Arc<Self> {
         let start_time = std::time::Instant::now();
-        debug!("⏱️ [SessionData::new] 开始创建，max_size={}", max_size);
+        debug!(
+            "⏱️ [SessionData::new] Starting creation, max_size={}",
+            max_size
+        );
 
         let channel_start = std::time::Instant::now();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         debug!(
-            "⏱️ [SessionData::new] channel创建耗时: {:?}",
+            "⏱️ [SessionData::new] Channel creation took: {:?}",
             channel_start.elapsed()
         );
 
@@ -78,7 +81,7 @@ impl SessionData {
             current_cancel: Arc::new(tokio::sync::Mutex::new(None)),
         });
         debug!(
-            "⏱️ [SessionData::new] Arc创建耗时: {:?}",
+            "⏱️ [SessionData::new] Arc creation took: {:?}",
             arc_start.elapsed()
         );
 
@@ -90,12 +93,12 @@ impl SessionData {
             session.current_cancel.clone(),
         );
         debug!(
-            "⏱️ [SessionData::new] SessionWorker::spawn耗时: {:?}",
+            "⏱️ [SessionData::new] SessionWorker::spawn took: {:?}",
             spawn_start.elapsed()
         );
 
         debug!(
-            "⏱️ [SessionData::new] 总创建耗时: {:?}",
+            "⏱️ [SessionData::new] Total creation took: {:?}",
             start_time.elapsed()
         );
         session
@@ -108,7 +111,7 @@ impl SessionData {
             .send(SessionCommand::MessageCount { ack: tx })
             .is_err()
         {
-            warn!("⚠️ message_count 指令发送失败，worker 已退出");
+            warn!("Failed to send message_count command; worker has exited");
             return 0;
         }
         rx.await.unwrap_or(0)
@@ -120,21 +123,21 @@ impl SessionData {
     ) -> Result<(mpsc::Receiver<UnifiedSessionMessage>, CancellationToken)> {
         let start_time = std::time::Instant::now();
         debug!(
-            "⏱️ [create_new_connection] 开始创建连接，buffer_size={}",
+            "⏱️ [create_new_connection] Starting connection creation, buffer_size={}",
             buffer_size
         );
 
         let token_start = std::time::Instant::now();
         let cancellation_token = CancellationToken::new();
         debug!(
-            "⏱️ [create_new_connection] CancellationToken创建耗时: {:?}",
+            "⏱️ [create_new_connection] CancellationToken creation took: {:?}",
             token_start.elapsed()
         );
 
         let channel_start = std::time::Instant::now();
         let (tx, rx) = mpsc::channel(buffer_size);
         debug!(
-            "⏱️ [create_new_connection] mpsc channel创建耗时: {:?}",
+            "⏱️ [create_new_connection] mpsc channel creation took: {:?}",
             channel_start.elapsed()
         );
 
@@ -155,12 +158,12 @@ impl SessionData {
             *current_sender_guard = Some(tx);
         }
         debug!(
-            "⏱️ [create_new_connection] 连接状态设置耗时: {:?}",
+            "⏱️ [create_new_connection] Connection state setup took: {:?}",
             setup_start.elapsed()
         );
 
         debug!(
-            "⏱️ [create_new_connection] 总连接创建耗时: {:?}",
+            "⏱️ [create_new_connection] Total connection creation took: {:?}",
             start_time.elapsed()
         );
         Ok((rx, cancellation_token))
@@ -172,7 +175,7 @@ impl SessionData {
             .send(SessionCommand::Push { message })
             .is_err()
         {
-            warn!("⚠️ 推送消息失败，worker 已退出");
+            warn!("Failed to push message; worker has exited");
         }
     }
 
@@ -188,7 +191,7 @@ impl SessionData {
         // 🎯 主动触发取消令牌，关闭 SSE 连接
         let mut current_cancel_guard = self.current_cancel.lock().await;
         if let Some(token) = current_cancel_guard.take() {
-            info!("🔌 [SessionData] 主动触发CancellationToken，关闭SSE连接");
+            info!("🔌 [SessionData] Triggering CancellationToken to close SSE connection");
             token.cancel();
         }
         drop(current_cancel_guard);
@@ -196,7 +199,9 @@ impl SessionData {
         // 🎯 显式关闭 channel 发送端，让接收端立即感知到连接关闭
         let mut current_sender_guard = self.current_sender.lock().await;
         if current_sender_guard.take().is_some() {
-            info!("🔌 [SessionData] 显式关闭channel发送端，让接收端立即断开");
+            info!(
+                "🔌 [SessionData] Explicitly closed channel sender; receiver disconnects immediately"
+            );
             // 当 Sender 被 drop 时，Receiver 的 recv() 会返回 None
             // 这里通过 take() 将 sender 从 Option 中移除，触发 drop
         }
@@ -220,7 +225,7 @@ impl SessionWorker {
     ) {
         let start_time = std::time::Instant::now();
         debug!(
-            "⏱️ [SessionWorker::spawn] 开始创建SessionWorker，max_size={}",
+            "⏱️ [SessionWorker::spawn] Starting SessionWorker creation, max_size={}",
             max_size
         );
 
@@ -234,11 +239,11 @@ impl SessionWorker {
         let spawn_start = std::time::Instant::now();
         tokio::spawn(worker.run());
         debug!(
-            "⏱️ [SessionWorker::spawn] tokio::spawn耗时: {:?}",
+            "⏱️ [SessionWorker::spawn] tokio::spawn took: {:?}",
             spawn_start.elapsed()
         );
         debug!(
-            "⏱️ [SessionWorker::spawn] 总spawn耗时: {:?}",
+            "⏱️ [SessionWorker::spawn] Total spawn took: {:?}",
             start_time.elapsed()
         );
     }
@@ -263,7 +268,7 @@ impl SessionWorker {
                         if producer.try_push(message.clone()).is_ok() {
                             buffered_len += 1;
                         } else {
-                            warn!("⚠️ ring buffer push 失败，只能实时推送");
+                            warn!("Ring buffer push failed; real-time delivery only");
                         }
                     }
 
@@ -275,7 +280,7 @@ impl SessionWorker {
                             // 如果发送失败，可能是缓冲区满了或连接已关闭
                             // 注意：truncate 在锁内执行，但 50 字符开销可忽略
                             warn!(
-                                "⚠️ SSE sender 发送失败，关闭实时推送: message_type={:?}, sub_type={}, data={}",
+                                "⚠️ SSE sender send failed, disabling real-time delivery: message_type={:?}, sub_type={}, data={}",
                                 message.message_type,
                                 message.sub_type,
                                 truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
@@ -285,7 +290,7 @@ impl SessionWorker {
                     } else {
                         // 连接不存在，跳过实时推送（记录为 info 级别，便于排查问题）
                         info!(
-                            "📭 SSE sender 不存在，跳过实时推送（消息已缓存到 ring buffer）: message_type={:?}, sub_type={}, data={}",
+                            "📭 SSE sender missing, skipping real-time delivery (message buffered in ring buffer): message_type={:?}, sub_type={}, data={}",
                             message.message_type,
                             message.sub_type,
                             truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
@@ -306,7 +311,7 @@ impl SessionWorker {
             }
         }
 
-        debug!("🔚 SessionWorker 结束运行");
+        debug!("🔚 SessionWorker stopped");
     }
 }
 
@@ -334,7 +339,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
             Entry::Vacant(entry) => {
                 let data = SessionData::new(1000);
                 info!(
-                    "📦 [push_session_update] SESSION_CACHE 自动创建: session_id={}",
+                    "📦 [push_session_update] SESSION_CACHE auto-created: session_id={}",
                     session_id
                 );
                 entry.insert(data.clone());
@@ -346,7 +351,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
     let unified_message = notify.to_unified_message();
 
     debug!(
-        "📥 推送消息到缓存: session_id={}, message_type={:?}, sub_type={}",
+        "📥 Pushing message to cache: session_id={}, message_type={:?}, sub_type={}",
         session_id, unified_message.message_type, unified_message.sub_type
     );
 
@@ -371,7 +376,7 @@ pub async fn push_session_update_with_project(
 
     if cleared_count > 0 {
         info!(
-            "📝 [push_session_update_with_project] 检测到session变化，已清理 {} 条旧消息: project_id={}, new_session_id={}",
+            "📝 [push_session_update_with_project] Session changed, cleaned {} old messages: project_id={}, new_session_id={}",
             cleared_count, project_id, session_id
         );
     }
@@ -399,7 +404,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
         Some(mapped_sid) if mapped_sid == session_id => {
             // session_id 相同，不需要做任何操作
             debug!(
-                "📋 Project session映射未变化: project_id={}, session_id={}",
+                "📋 Project session mapping unchanged: project_id={}, session_id={}",
                 project_id, session_id
             );
             0
@@ -407,17 +412,19 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
         Some(old_session_id) => {
             // session_id 发生变化，需要清理旧 session 的数据
             info!(
-                "🔄 检测到Project session变化: project_id={}, old_session_id={}, new_session_id={}",
+                "🔄 Detected project session change: project_id={}, old_session_id={}, new_session_id={}",
                 project_id, old_session_id, session_id
             );
 
             // 🛡️ 关键修复：先主动关闭旧 session 的 SSE 连接，再移除缓存
             // 之前直接 remove 导致旧 SSE 连接的心跳流继续发送但不再收到业务消息，
             // 前端如果没有及时关闭旧连接，会看到孤立的心跳流
-            let cleared_count = if let Some((_, old_session_data)) = SESSION_CACHE.remove(&old_session_id) {
+            let cleared_count = if let Some((_, old_session_data)) =
+                SESSION_CACHE.remove(&old_session_id)
+            {
                 old_session_data.close_current_connection().await;
                 info!(
-                    "🔌 [ensure_project_session] 已关闭旧 session SSE 连接: old_session_id={}",
+                    "🔌 [ensure_project_session] Closed old session SSE connection: old_session_id={}",
                     old_session_id
                 );
                 1 // 移除了1个session
@@ -430,12 +437,12 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
 
             if cleared_count > 0 {
                 info!(
-                    "🧹 已清理旧session数据并更新映射: project_id={}, old_session_id={}, new_session_id={}, cleared_count={}",
+                    "🧹 Cleared old session data and updated mapping: project_id={}, old_session_id={}, new_session_id={}, cleared_count={}",
                     project_id, old_session_id, session_id, cleared_count
                 );
             } else {
                 info!(
-                    "📝 已更新Project session映射: project_id={}, old_session_id={}, new_session_id={}",
+                    "📝 Updated project session mapping: project_id={}, old_session_id={}, new_session_id={}",
                     project_id, old_session_id, session_id
                 );
             }
@@ -447,7 +454,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             // 注意：此时 AGENT_REGISTRY 中可能还没有这个 project 的记录
             // 这种情况下不需要调用 update_session，因为 agent 注册时会调用 register
             info!(
-                "🆕 Project session 首次出现: project_id={}, session_id={}",
+                "🆕 Project session first seen: project_id={}, session_id={}",
                 project_id, session_id
             );
             0

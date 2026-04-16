@@ -409,7 +409,7 @@ impl ProjectRepository {
             let mut rows = stmt.query([])?;
             let row = rows
                 .next()?
-                .ok_or_else(|| DuckDbError::InternalError("无法获取项目数量".to_string()))?;
+                .ok_or_else(|| DuckDbError::InternalError("unable to get project count".to_string()))?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
         })
@@ -423,7 +423,7 @@ impl ProjectRepository {
             let mut rows = stmt.query([])?;
             let row = rows
                 .next()?
-                .ok_or_else(|| DuckDbError::InternalError("无法获取会话数量".to_string()))?;
+                .ok_or_else(|| DuckDbError::InternalError("unable to get session count".to_string()))?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
         })
@@ -514,7 +514,7 @@ impl ProjectRepository {
 
         let service_type = service_type_str
             .parse::<ServiceType>()
-            .map_err(|e| DuckDbError::InternalError(format!("解析服务类型失败: {}", e)))?;
+            .map_err(|e| DuckDbError::InternalError(format!("failed to parse service type: {}", e)))?;
 
         Ok(ProjectRecord {
             project_id,
@@ -546,10 +546,10 @@ impl ProjectRepository {
             }
             ValueRef::Text(bytes) => {
                 let s = std::str::from_utf8(bytes)
-                    .map_err(|e| DuckDbError::InternalError(format!("UTF8 解析失败: {}", e)))?;
+                    .map_err(|e| DuckDbError::InternalError(format!("UTF8 parsing failed: {}", e)))?;
                 DateTime::parse_from_rfc3339(s)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| DuckDbError::InternalError(format!("时间戳解析失败: {}", e)))
+                    .map_err(|e| DuckDbError::InternalError(format!("timestamp parsing failed: {}", e)))
             }
             _ => Ok(Utc::now()),
         }
@@ -574,10 +574,10 @@ impl ProjectRepository {
             }
             ValueRef::Text(bytes) => {
                 let s = std::str::from_utf8(bytes)
-                    .map_err(|e| DuckDbError::InternalError(format!("UTF8 解析失败: {}", e)))?;
+                    .map_err(|e| DuckDbError::InternalError(format!("UTF8 parsing failed: {}", e)))?;
                 DateTime::parse_from_rfc3339(s)
                     .map(|dt| Some(dt.with_timezone(&Utc)))
-                    .map_err(|e| DuckDbError::InternalError(format!("时间戳解析失败: {}", e)))
+                    .map_err(|e| DuckDbError::InternalError(format!("timestamp parsing failed: {}", e)))
             }
             _ => Ok(None),
         }

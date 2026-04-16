@@ -46,7 +46,7 @@ pub static BLOCKING_CONFIG: std::sync::LazyLock<Arc<std::sync::RwLock<BlockingCo
 /// });
 /// ```
 pub fn inject_blocking(config: BlockingConfig) {
-    tracing::warn!("🧪 [TEST] 阻塞配置已更新: {:?}", config);
+    tracing::warn!("🧪 [TEST] Blocking config updated: {:?}", config);
     let mut global = BLOCKING_CONFIG.write().unwrap();
     *global = config;
 }
@@ -77,7 +77,7 @@ pub async fn maybe_block(blocking_type: &str) {
 
     if should_block {
         tracing::warn!(
-            "🧪 [TEST] 注入阻塞: {}, 持续时间: {:?}",
+            "🧪 [TEST] Injected blocking: {}, duration: {:?}",
             blocking_type,
             config.block_duration
         );

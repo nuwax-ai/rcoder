@@ -21,17 +21,17 @@
 //!
 //! 注意：Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 
-use axum::{Json, extract::State};
-use shared_types::{ChatResponse, ComputerChatRequest, ModelProviderConfig};
+use axum::{extract::State, http::HeaderMap};
+use shared_types::{ChatResponse, ComputerChatRequest};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 use docker_manager::ContainerBasicInfo;
-use shared_types::Attachment;
 
 use super::utils::{
-    extract_grpc_addr_with_port, get_realtime_container_ip_with_cache, project_dir,
+    I18nJson, extract_grpc_addr_with_port, get_locale_from_headers,
+    get_realtime_container_ip_with_cache, project_dir,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -77,7 +77,7 @@ use super::utils::{
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 500,
@@ -93,14 +93,18 @@ use super::utils::{
 #[instrument(skip(state, request), fields(user_id = %request.user_id, project_id = ?request.project_id))]
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
-    Json(mut request): Json<ComputerChatRequest>,
+    headers: HeaderMap,
+    I18nJson(mut request): I18nJson<ComputerChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
+    // 获取语言设置
+    let locale = get_locale_from_headers(&headers);
+
     // 1. 验证 user_id
     if request.user_id.trim().is_empty() {
-        error!("❌ [COMPUTER_CHAT] user_id 不能为空");
-        return Ok(HttpResult::error(
+        error!("[COMPUTER_CHAT] user_id is required");
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            locale,
         ));
     }
 
@@ -117,7 +121,7 @@ pub async fn handle_computer_chat(
     };
 
     info!(
-        "🚀 [COMPUTER_CHAT] 开始处理请求: user_id={}, project_id={}, session_id={:?}, prompt_len={}, attachments={}, model_provider={:?}, agent_config={:?}",
+        "🚀 [COMPUTER_CHAT] Starting to process request: user_id={}, project_id={}, session_id={:?}, prompt_len={}, attachments={}, model_provider={:?}, agent_config={:?}",
         user_id,
         project_id,
         request.session_id,
@@ -131,10 +135,10 @@ pub async fn handle_computer_chat(
     if let Some(ref agent_config) = request.agent_config {
         if let Some(ref resource_limits) = agent_config.resource_limits {
             if let Err(e) = resource_limits.validate() {
-                error!("❌ [COMPUTER_CHAT] 资源限制验证失败: {}", e);
-                return Ok(HttpResult::error(
+                error!("[COMPUTER_CHAT] Resource limits validation failed: {}", e);
+                return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
-                    &format!("Invalid resource limits: {}", e),
+                    locale,
                 ));
             }
         }
@@ -150,7 +154,7 @@ pub async fn handle_computer_chat(
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {
             info!(
-                "⏳ [COMPUTER_CHAT] 容器正在创建中，等待完成: user_id={}, 已等待={:?}",
+                "⏳ [COMPUTER_CHAT] Container is being created, waiting for completion: user_id={}, elapsed={:?}",
                 user_id, elapsed
             );
 
@@ -161,10 +165,12 @@ pub async fn handle_computer_chat(
                 // 标记已被移除 = 创建完成
                 if !state.pod_creating.contains_key(&user_id) {
                     // 尝试获取容器信息
-                    if let Ok(docker_mgr) = docker_manager::global::get_global_docker_manager().await {
+                    if let Ok(docker_mgr) =
+                        docker_manager::global::get_global_docker_manager().await
+                    {
                         if let Ok(Some(info)) = docker_mgr.get_user_container_info(&user_id).await {
                             info!(
-                                "✅ [COMPUTER_CHAT] 等待成功，容器已就绪（等待{}秒）: user_id={}, container_id={}",
+                                "✅ [COMPUTER_CHAT] Wait successful, container is ready (waited {}s): user_id={}, container_id={}",
                                 wait_sec, user_id, info.container_id
                             );
                             waited_container_info = Some(info);
@@ -174,21 +180,24 @@ pub async fn handle_computer_chat(
                 }
 
                 if wait_sec % 5 == 0 {
-                    debug!("⏳ [COMPUTER_CHAT] 仍在等待容器创建: user_id={}, 第{}秒", user_id, wait_sec);
+                    debug!(
+                        "[COMPUTER_CHAT] Still waiting for container creation: user_id={}, {}s elapsed",
+                        user_id, wait_sec
+                    );
                 }
             }
 
             if waited_container_info.is_none() {
                 // 等待超时，继续正常的创建流程（此时标记可能已过期被清理）
                 warn!(
-                    "⚠️ [COMPUTER_CHAT] 等待容器创建超时（30秒），将继续尝试创建: user_id={}",
+                    "⚠️ [COMPUTER_CHAT] Wait for container creation timeout (30s), will try to create: user_id={}",
                     user_id
                 );
             }
         } else {
             // 标记过期，清理后继续
             warn!(
-                "⚠️ [COMPUTER_CHAT] 创建标记已过期（{:?}），清理并继续",
+                "⚠️ [COMPUTER_CHAT] Creation marker expired ({:?}), cleaning up and continuing",
                 elapsed
             );
             state.pod_creating.remove(&user_id);
@@ -199,13 +208,15 @@ pub async fn handle_computer_chat(
     let container_info = if let Some(info) = waited_container_info {
         // 使用等待获得的容器信息
         info!(
-            "📦 [COMPUTER_CHAT] 使用已就绪的容器（等待其他请求创建完成）: user_id={}, container_id={}",
+            "📦 [COMPUTER_CHAT] Using ready container (waiting for other request to finish creation): user_id={}, container_id={}",
             user_id, info.container_id
         );
         info
     } else {
         // 正常创建容器 - 设置标记防止并发
-        state.pod_creating.insert(user_id.clone(), std::time::Instant::now());
+        state
+            .pod_creating
+            .insert(user_id.clone(), std::time::Instant::now());
 
         let result = ComputerContainerManager::get_or_create_container_for_user(
             &user_id,
@@ -222,17 +233,17 @@ pub async fn handle_computer_chat(
         match result {
             Ok(info) => info,
             Err(e) => {
-                error!("❌ [COMPUTER_CHAT] 获取或创建容器失败: {}", e);
-                return Ok(HttpResult::error(
+                error!("[COMPUTER_CHAT] Failed to get or create container: {}", e);
+                return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CONTAINER_ERROR,
-                    &format!("获取或创建容器失败: {}", e),
+                    locale,
                 ));
             }
         }
     };
 
     info!(
-        "✅ [COMPUTER_CHAT] 容器就绪: user_id={}, container_id={}, ip={}",
+        "✅ [COMPUTER_CHAT] Container ready: user_id={}, container_id={}, ip={}",
         user_id, container_info.container_id, container_info.container_ip
     );
 
@@ -242,10 +253,11 @@ pub async fn handle_computer_chat(
         if let Some(existing_user_id) = existing_info.user_id() {
             if existing_user_id != user_id {
                 warn!(
-                    "⚠️ [USER_ID_MISMATCH] 检测到 project_id 对应的 user_id 发生变化: \
-                     project_id={}, 原有 user_id={}, 新 user_id={}, 时间={}, \
-                     原因可能是负载测试脚本使用了多个不同的 user_id，这会导致创建多个容器浪费资源。 \
-                     建议检查测试脚本确保同一 project_id 使用相同的 user_id。",
+                    "⚠️ [USER_ID_MISMATCH] Detected user_id change for project_id: \
+                     project_id={}, original user_id={}, new user_id={}, time={}. \
+                     This may be caused by load test scripts using different user_ids, \
+                     which creates multiple containers and wastes resources. \
+                     Please ensure the same project_id uses the same user_id in your test scripts.",
                     project_id,
                     existing_user_id,
                     user_id,
@@ -269,17 +281,17 @@ pub async fn handle_computer_chat(
     // 注意：这里使用 project_id 而不是 user_id，因为 DuckDB 的 key 是 project_id
     state.update_activity(&project_id);
     debug!(
-        "🔄 [COMPUTER_CHAT] 已更新活动时间: project_id={}",
+        "🔄 [COMPUTER_CHAT] Updated activity time: project_id={}",
         project_id
     );
 
     // 5. 创建项目工作目录（在用户容器内）
     // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
     if let Err(e) = ensure_project_workspace_exists(&user_id, &project_id).await {
-        error!("❌ [COMPUTER_CHAT] 创建项目工作目录失败: {}", e);
-        return Ok(HttpResult::error(
+        error!("[COMPUTER_CHAT] Failed to create project workspace: {}", e);
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_WORKSPACE_ERROR,
-            &format!("创建项目工作目录失败: {}", e),
+            locale,
         ));
     }
 
@@ -287,7 +299,7 @@ pub async fn handle_computer_chat(
     if let Some(ref pingora_service) = state.pingora_service {
         pingora_service.add_vnc_backend(&user_id, &container_info.container_ip);
         debug!(
-            "🔗 [COMPUTER_CHAT] VNC 后端已注册: user_id={} -> {}",
+            "🔗 [COMPUTER_CHAT] VNC backend registered: user_id={} -> {}",
             user_id, container_info.container_ip
         );
     }
@@ -315,25 +327,28 @@ pub async fn handle_computer_chat(
         .await;
 
         if let Ok(grpc_addr) = grpc_addr_result {
-            debug!("🔍 [COMPUTER_CHAT] 主动查询 Agent 状态: {}", grpc_addr);
+            debug!("[COMPUTER_CHAT] Checking Agent status: {}", grpc_addr);
             if let Ok(mut client) = state.grpc_pool.get_client(&grpc_addr).await {
                 let status_req = shared_types::grpc::GetStatusRequest {
                     project_id: project_id.clone(),
                     session_id: "".to_string(), // 我们只关心 project 级别的状态
                 };
 
-                match client.get_status(status_req).await {
+                let mut grpc_request = crate::grpc::new_request_with_locale(status_req, locale);
+                grpc_request.set_timeout(std::time::Duration::from_secs(5));
+
+                match client.get_status(grpc_request).await {
                     Ok(resp) => {
                         let status = resp.into_inner().status;
                         info!(
-                            "📊 [COMPUTER_CHAT] Agent 当前状态: project_id={}, status={}",
+                            "📊 [COMPUTER_CHAT] Agent current status: project_id={}, status={}",
                             project_id, status
                         );
                         // 如果状态是 idle，我们可以更有信心地继续
                     }
                     Err(e) => {
-                        warn!("⚠️ [COMPUTER_CHAT] 主动查询 Agent 状态失败: {}", e);
-                        // 查询失败不阻止请求继续，可能是网络波动，让后续的 Chat 请求去处理
+                        warn!("[COMPUTER_CHAT] Failed to get Agent status: {}", e);
+                        // Query failed不阻止请求继续，可能是网络波动，让后续的 Chat 请求去处理
                     }
                 }
             }
@@ -344,7 +359,7 @@ pub async fn handle_computer_chat(
     // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
     let session_id_to_use = match &request.session_id {
         Some(sid) if !sid.is_empty() => {
-            debug!("🔍 [COMPUTER_CHAT] 使用用户传递的 session_id: {}", sid);
+            debug!("[COMPUTER_CHAT] Using session_id: {}", sid);
             sid.clone()
         }
         _ => {
@@ -355,19 +370,21 @@ pub async fn handle_computer_chat(
                     match existing_session_id {
                         Some(sid) if !sid.is_empty() => {
                             info!(
-                                "🔄 [COMPUTER_CHAT] 未传递 session_id，自动使用最新会话: project_id={}, session_id={}",
+                                "🔄 [COMPUTER_CHAT] No session_id provided, auto using latest session: project_id={}, session_id={}",
                                 project_id, sid
                             );
                             sid.to_string()
                         }
                         _ => {
-                            debug!("🆕 [COMPUTER_CHAT] 项目存在但无 session_id，创建新会话");
+                            debug!(
+                                "[COMPUTER_CHAT] Project exists, creating new session"
+                            );
                             String::new()
                         }
                     }
                 }
                 None => {
-                    debug!("🆕 [COMPUTER_CHAT] 未找到现有项目，创建新会话");
+                    debug!("[COMPUTER_CHAT] No project, creating new session");
                     String::new()
                 }
             }
@@ -390,6 +407,7 @@ pub async fn handle_computer_chat(
         &container_info,
         &state.grpc_pool,
         &state.container_ip_cache,
+        locale,
     )
     .await;
 
@@ -402,33 +420,33 @@ pub async fn handle_computer_chat(
         // 只有当 session_id 非空时才更新映射
         if !session_id.is_empty() {
             info!(
-                "🔗 [COMPUTER_CHAT] 关联会话: session_id={} -> user_id={}, project_id={}, success={}",
+                "🔗 [COMPUTER_CHAT] Associated session: session_id={} -> user_id={}, project_id={}, success={}",
                 session_id,
                 user_id,
                 project_id,
                 result.is_success()
             );
 
-            // 🆕 关键修复：实时从 Docker API 获取容器的最新网络信息
+            // 🆕 KEY FIX: Get latest container network info from Docker API in real-time
             // 这确保即使内存映射中的信息过时，也能获取到正确的 container_ip
             let docker_manager = docker_manager::global::get_global_docker_manager()
                 .await
                 .map_err(|e| {
-                    error!("❌ [COMPUTER_CHAT] 获取 DockerManager 失败: {}", e);
-                    AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                    error!("[COMPUTER_CHAT] Failed to get DockerManager: {}", e);
+                    AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
                 })?;
 
             let container_info = match docker_manager.get_agent_info(&user_id).await {
                 Ok(Some(info)) => {
                     info!(
-                        "🔄 [COMPUTER_CHAT] 从 Docker API 获取最新容器信息: user_id={}, container_id={}, container_ip={}",
+                        "🔄 [COMPUTER_CHAT] Getting latest container info from Docker API: user_id={}, container_id={}, container_ip={}",
                         user_id, info.container_id, info.container_ip
                     );
                     info
                 }
                 Ok(None) => {
                     warn!(
-                        "⚠️ [COMPUTER_CHAT] Docker API 未找到容器: user_id={}, 使用缓存的容器信息",
+                        "⚠️ [COMPUTER_CHAT] Container not found in Docker API: user_id={}, using cached container info",
                         user_id
                     );
                     // 使用之前获取的容器信息
@@ -436,7 +454,7 @@ pub async fn handle_computer_chat(
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️ [COMPUTER_CHAT] 从 Docker API 获取容器信息失败: user_id={}, error={}, 使用缓存的容器信息",
+                        "⚠️ [COMPUTER_CHAT] Failed to get container info from Docker API: user_id={}, error={}, using cached container info",
                         user_id, e
                     );
                     // 使用之前获取的容器信息
@@ -471,7 +489,7 @@ pub async fn handle_computer_chat(
                 state.update_session(&map_key, &session_id);
 
                 info!(
-                    "🔄 [COMPUTER_CHAT] 已更新现有容器映射: user_id={}, project_id={}, session_id={} (last_activity 已刷新)",
+                    "🔄 [COMPUTER_CHAT] Updated existing container mapping: user_id={}, project_id={}, session_id={} (last_activity refreshed)",
                     user_id, project_id, session_id
                 );
             } else {
@@ -498,19 +516,19 @@ pub async fn handle_computer_chat(
                 state.update_session(&map_key, &session_id);
 
                 info!(
-                    "🆕 [COMPUTER_CHAT] 已创建新容器映射: user_id={}, project_id={}, session_id={}",
+                    "🆕 [COMPUTER_CHAT] Created new container mapping: user_id={}, project_id={}, session_id={}",
                     user_id, project_id, session_id
                 );
             }
 
             if result.is_success() {
                 info!(
-                    "✅ [COMPUTER_CHAT] 请求处理完成: user_id={}, project_id={}, session_id={} (所有映射表已更新)",
+                    "✅ [COMPUTER_CHAT] Request processed: user_id={}, project_id={}, session_id={} (all mappings updated)",
                     user_id, project_id, session_id
                 );
             } else {
                 warn!(
-                    "⚠️ [COMPUTER_CHAT] 请求失败但已保存会话映射: user_id={}, project_id={}, session_id={}, code={}, message={}",
+                    "⚠️ [COMPUTER_CHAT] Request failed but session mapping saved: user_id={}, project_id={}, session_id={}, code={}, message={}",
                     user_id, project_id, session_id, result.code, result.message
                 );
             }
@@ -524,7 +542,7 @@ pub async fn handle_computer_chat(
             .map_or(true, |d| d.session_id.is_empty())
     {
         error!(
-            "❌ [COMPUTER_CHAT] 容器服务返回错误（无 session_id）: user_id={}, project_id={}, code={}, message={}",
+            "❌ [COMPUTER_CHAT] Container service returned error (no session_id): user_id={}, project_id={}, code={}, message={}",
             user_id, project_id, result.code, result.message
         );
     }
@@ -542,9 +560,10 @@ async fn forward_computer_request_to_container(
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
     container_ip_cache: &Arc<crate::grpc::ContainerIpCache>,
+    locale: &'static str,
 ) -> HttpResult<ChatResponse> {
     info!(
-        "📤 [COMPUTER_FORWARD] 转发请求到容器 (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}",
+        "📤 [COMPUTER_FORWARD] Forwarding request to container (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}",
         request.user_id, project_id, request.session_id, container_info.container_id
     );
 
@@ -563,7 +582,7 @@ async fn forward_computer_request_to_container(
         Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
         Err(e) => {
             warn!(
-                "⚠️ [COMPUTER_FORWARD] 实时 IP 解析失败: {}, 尝试从 service_url 提取",
+                "⚠️ [COMPUTER_FORWARD] Real-time IP resolution failed: {}, trying to extract from service_url",
                 e
             );
             match extract_grpc_addr_with_port(
@@ -572,10 +591,10 @@ async fn forward_computer_request_to_container(
             ) {
                 Ok(addr) => addr,
                 Err(e) => {
-                    error!("❌ [COMPUTER_FORWARD] 提取 gRPC 地址失败: {}", e);
-                    return HttpResult::error(
+                    error!("[COMPUTER_FORWARD] Failed to extract gRPC address: {}", e);
+                    return HttpResult::error_with_locale(
                         shared_types::error_codes::ERR_GRPC_ADDR_ERROR,
-                        &format!("提取 gRPC 地址失败: {}", e),
+                        locale,
                     );
                 }
             }
@@ -583,7 +602,7 @@ async fn forward_computer_request_to_container(
     };
 
     debug!(
-        "📡 [COMPUTER_FORWARD] gRPC 地址: {}, prompt_len={}, attachments={}",
+        "📡 [COMPUTER_FORWARD] gRPC address: {}, prompt_len={}, attachments={}",
         grpc_addr,
         request.prompt.len(),
         request.attachments.len()
@@ -593,7 +612,10 @@ async fn forward_computer_request_to_container(
     // 在容器内：/app/computer-project-workspace/{user_id}/{project_id}
     let project_workspace = format!("{}/", project_dir(&request.user_id, &project_id));
 
-    debug!("📁 [COMPUTER_FORWARD] 项目工作目录: {}", project_workspace);
+    debug!(
+        "[COMPUTER_FORWARD] projectworkdirectory: {}",
+        project_workspace
+    );
 
     // gRPC 调用（带重试机制）
     let max_retries = 2;
@@ -623,20 +645,20 @@ async fn forward_computer_request_to_container(
                 if grpc_response.success {
                     let chat_response = crate::grpc::grpc_response_to_chat_response(grpc_response);
                     info!(
-                        "✅ [COMPUTER_FORWARD] gRPC 响应成功: project_id={}, session_id={}",
+                        "✅ [COMPUTER_FORWARD] gRPC response success: project_id={}, session_id={}",
                         chat_response.project_id, chat_response.session_id
                     );
                     return HttpResult::success(chat_response);
                 } else {
                     let error_msg = grpc_response
                         .error
-                        .unwrap_or_else(|| "未知错误".to_string());
+                        .unwrap_or_else(|| "Unknown error".to_string());
                     // 🎯 从 gRPC 响应中提取错误码（完整透传）
                     let error_code = grpc_response
                         .error_code
                         .unwrap_or_else(|| shared_types::error_codes::ERR_AGENT_ERROR.to_string());
                     error!(
-                        "❌ [COMPUTER_FORWARD] gRPC 响应错误: code={}, message={}",
+                        "❌ [COMPUTER_FORWARD] gRPC response error: code={}, message={}",
                         error_code, error_msg
                     );
                     return HttpResult::error(&error_code, &error_msg);
@@ -644,7 +666,7 @@ async fn forward_computer_request_to_container(
             }
             Err(e) => {
                 warn!(
-                    "⚠️ [COMPUTER_FORWARD] gRPC 调用失败 (第 {}/{} 次): {}",
+                    "⚠️ [COMPUTER_FORWARD] gRPC call failed (attempt {}/{}): {}",
                     attempt, max_retries, e
                 );
 
@@ -652,14 +674,17 @@ async fn forward_computer_request_to_container(
 
                 if should_retry && attempt < max_retries {
                     info!(
-                        "🔄 [COMPUTER_FORWARD] 检测到可重试错误，从连接池移除 {} 并重试...",
+                        "🔄 [COMPUTER_FORWARD] Detected retryable error, removing {} from connection pool and retrying...",
                         grpc_addr
                     );
                     grpc_pool.remove(&grpc_addr);
                     last_error = Some(e);
                     continue;
                 } else if !should_retry {
-                    error!("❌ [COMPUTER_FORWARD] 检测到不可重试错误，停止重试: {}", e);
+                    error!(
+                        "[COMPUTER_FORWARD] Retry error, stopped retry: {}",
+                        e
+                    );
                     last_error = Some(e);
                     break;
                 }
@@ -672,18 +697,15 @@ async fn forward_computer_request_to_container(
     // 所有重试都失败
     if let Some(e) = last_error {
         error!(
-            "❌ [COMPUTER_FORWARD] gRPC 最终调用失败: {}, user_id={}, project_id={}",
+            "❌ [COMPUTER_FORWARD] gRPC final call failed: {}, user_id={}, project_id={}",
             e, request.user_id, project_id
         );
 
         // gRPC 通信失败，直接返回错误
         // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
-        HttpResult::error(
-            shared_types::error_codes::ERR_GRPC_ERROR,
-            &format!("容器通信失败: {}", e),
-        )
+        HttpResult::error_with_locale(shared_types::error_codes::ERR_GRPC_ERROR, locale)
     } else {
-        HttpResult::error(shared_types::error_codes::ERR_UNKNOWN, "未知重试错误")
+        HttpResult::error_with_locale(shared_types::error_codes::ERR_UNKNOWN, locale)
     }
 }
 
@@ -698,7 +720,7 @@ async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Res
     let project_workspace_path = std::path::PathBuf::from(project_dir(user_id, project_id));
 
     debug!(
-        "📁 [COMPUTER_CHAT] 确保项目工作目录存在: {:?}",
+        "📁 [COMPUTER_CHAT] Ensuring project workspace directory exists: {:?}",
         project_workspace_path
     );
 
@@ -707,14 +729,14 @@ async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Res
         .await
         .map_err(|e| {
             error!(
-                "❌ [COMPUTER_CHAT] 创建项目工作目录失败: path={:?}, error={}",
+                "❌ [COMPUTER_CHAT] Failed to create project workspace: path={:?}, error={}",
                 project_workspace_path, e
             );
-            AppError::internal_server_error(&format!("创建项目工作目录失败: {}", e))
+            AppError::internal_server_error(&format!("Failed to create project workspace: {}", e))
         })?;
 
     info!(
-        "✅ [COMPUTER_CHAT] 项目工作目录已创建: user_id={}, project_id={}, path={:?}",
+        "✅ [COMPUTER_CHAT] Project workspace directory created: user_id={}, project_id={}, path={:?}",
         user_id, project_id, project_workspace_path
     );
 
@@ -749,13 +771,13 @@ fn ensure_project_mapping_in_state(
         if let Some(existing_container) = existing_project.container() {
             if existing_container.container_id != container_info.container_id {
                 info!(
-                    "🔄 [COMPUTER_CHAT] 检测到容器变更: project_id={}, old_cid={}, new_cid={}",
+                    "🔄 [COMPUTER_CHAT] Detected container change: project_id={}, old_cid={}, new_cid={}",
                     project_id, existing_container.container_id, container_info.container_id
                 );
                 // 容器变更，继续执行后续的插入/更新逻辑（insert_project 会执行 upsert）
             } else {
                 debug!(
-                    "🔄 [COMPUTER_CHAT] DuckDB 记录已存在且容器未变: project_id={}",
+                    "🔄 [COMPUTER_CHAT] DuckDB record already exists and container unchanged: project_id={}",
                     project_id
                 );
                 return Ok(());
@@ -783,7 +805,7 @@ fn ensure_project_mapping_in_state(
     state.insert_project(project_id.to_string(), Arc::new(project_info));
 
     info!(
-        "🆕 [COMPUTER_CHAT] 已插入 DuckDB 记录（容器创建后立即）: user_id={}, project_id={}, container_id={}",
+        "🆕 [COMPUTER_CHAT] Inserted DuckDB record (immediately after container creation): user_id={}, project_id={}, container_id={}",
         user_id, project_id, container_info.container_id
     );
 

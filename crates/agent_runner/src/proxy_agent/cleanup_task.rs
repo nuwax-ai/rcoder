@@ -109,7 +109,7 @@ impl AgentCleaner {
 
                     if message_count > 0 {
                         info!(
-                            "发现孤立session: session_id={}, 消息数量={}",
+                            "Found orphaned session: session_id={}, message_count={}",
                             session_id, message_count
                         );
 
@@ -138,13 +138,13 @@ impl AgentCleaner {
         // 删除空的孤立session
         for session_id in sessions_to_remove {
             if let Some((_, _)) = SESSION_CACHE.remove(&session_id) {
-                debug!("移除空session: {}", session_id);
+                debug!("Removed empty session: {}", session_id);
             }
         }
 
         if orphaned_count > 0 {
             info!(
-                "清理孤立SSE session完成: session数量={}, 消息数量={}",
+                "Orphaned SSE session cleanup completed: session_count={}, message_count={}",
                 orphaned_count, messages_cleared
             );
         }
@@ -165,7 +165,7 @@ impl AgentCleaner {
         let total_agents = registry_stats.agent_count;
 
         info!(
-            "开始清理闲置agent和SSE消息，当前时间: {}，当前活动agent数量: {}",
+            "Starting cleanup for idle agents and SSE messages, current_time: {}, active_agent_count: {}",
             current_time, total_agents
         );
 
@@ -185,7 +185,7 @@ impl AgentCleaner {
             {
                 let idle_duration = (current_time - agent_info.last_activity).num_seconds();
                 info!(
-                    "发现闲置agent: project_id={}, 状态={:?}, 最后活动: {}, 闲置时长: {}秒, 创建时间: {}",
+                    "Found idle agent: project_id={}, status={:?}, last_activity: {}, idle_duration_seconds: {}, created_at: {}",
                     project_id,
                     agent_info.status,
                     agent_info.last_activity,
@@ -201,11 +201,11 @@ impl AgentCleaner {
             match self.cleanup_agent_raii(&project_id) {
                 Ok(_) => {
                     success_count += 1;
-                    info!("成功清理agent: {}", project_id);
+                    info!("Agent cleaned successfully: {}", project_id);
                 }
                 Err(e) => {
                     failed_count += 1;
-                    warn!("清理agent失败: {} - {}", project_id, e);
+                    warn!("Failed to clean agent: {} - {}", project_id, e);
                 }
             }
             cleaned_count += 1;
@@ -226,7 +226,7 @@ impl AgentCleaner {
         let cached_sessions = SESSION_CACHE.len();
 
         info!(
-            "清理完成: agent(总共={}, 成功={}, 失败={}, 剩余={}) | session(活跃={}, 缓存={}) | SSE消息(清理={})",
+            "Cleanup completed: agent(total={}, success={}, failed={}, remaining={}) | session(active={}, cached={}) | sse_messages(cleared={})",
             cleaned_count,
             success_count,
             failed_count,
@@ -249,7 +249,7 @@ impl AgentCleaner {
     /// 基于RAII的简化清理方法
     /// 只需要从MAP中移除agent，AgentLifecycleGuard会自动清理所有资源
     fn cleanup_agent_raii(&self, project_id: &str) -> Result<()> {
-        debug!("开始RAII清理agent: {}", project_id);
+        debug!("Starting RAII cleanup for agent: {}", project_id);
 
         // 使用统一 Registry 检查并移除（内部自动同步清理所有映射）
         if AGENT_REGISTRY.contains_project(project_id) {
@@ -262,20 +262,20 @@ impl AgentCleaner {
             // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
             crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
             debug!(
-                "🧼 [cleanup] 已清理 SESSION_REQUEST_CONTEXT 中的 project_id={}",
+                "🧼 [cleanup] Cleared project_id from SESSION_REQUEST_CONTEXT: {}",
                 project_id
             );
 
             if removed.is_some() {
                 info!(
-                    "Agent已从Registry中移除，AgentLifecycleGuard将自动清理资源: {}",
+                    "Agent removed from Registry; AgentLifecycleGuard will clean up resources automatically: {}",
                     project_id
                 );
             } else {
-                warn!("尝试移除agent但未找到: {}", project_id);
+                warn!("Tried to remove agent but it was not found: {}", project_id);
             }
         } else {
-            warn!("Agent不存在于Registry中: {}", project_id);
+            warn!("Agent not found in Registry: {}", project_id);
         }
 
         Ok(())
@@ -283,7 +283,7 @@ impl AgentCleaner {
 
     /// 运行清理任务 - 简化版，只做定时清理
     pub async fn run(&mut self) {
-        info!("清理任务已启动，配置: {:?}", self.config);
+        info!("Cleanup task started, config: {:?}", self.config);
 
         let mut interval = tokio::time::interval(self.config.cleanup_interval);
 
@@ -291,8 +291,8 @@ impl AgentCleaner {
             interval.tick().await;
 
             match self.cleanup_idle_agents().await {
-                Ok(stats) => debug!("定时清理完成: {:?}", stats),
-                Err(e) => warn!("定时清理失败: {}", e),
+                Ok(stats) => debug!("Periodic cleanup completed: {:?}", stats),
+                Err(e) => warn!("Periodic cleanup failed: {}", e),
             }
         }
     }

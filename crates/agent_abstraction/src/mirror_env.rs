@@ -43,7 +43,11 @@ mod tests {
     #[test]
     fn mappings_have_correct_targets() {
         // 确保目标变量名是工具直接使用的名称
-        assert!(MIRROR_MAPPINGS.iter().any(|(t, _)| *t == "npm_config_registry"));
+        assert!(
+            MIRROR_MAPPINGS
+                .iter()
+                .any(|(t, _)| *t == "npm_config_registry")
+        );
         assert!(MIRROR_MAPPINGS.iter().any(|(t, _)| *t == "UV_INDEX_URL"));
         assert!(MIRROR_MAPPINGS.iter().any(|(t, _)| *t == "PIP_INDEX_URL"));
     }

@@ -2,7 +2,11 @@
 //!
 //! 处理 POST /computer/chat 请求
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -11,7 +15,12 @@ use crate::service::AGENT_REGISTRY;
 use crate::service::chat_handler::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
 use crate::service::{SESSION_CACHE, SessionData};
 use dashmap::mapref::entry::Entry;
-use shared_types::{ChatResponse, ComputerChatRequest, HttpResult, ServiceType};
+use shared_types::{
+    ChatResponse, ComputerChatRequest, HttpResult, ServiceType,
+    error_codes::ERR_INTERNAL_SERVER_ERROR, error_codes::ERR_VALIDATION, get_i18n_message,
+};
+
+use super::locale_from_headers;
 
 /// 处理 Computer Agent Chat 请求
 ///
@@ -29,15 +38,17 @@ use shared_types::{ChatResponse, ComputerChatRequest, HttpResult, ServiceType};
 )]
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ComputerChatRequest>,
 ) -> Result<Json<HttpResult<ChatResponse>>, (StatusCode, Json<HttpResult<ChatResponse>>)> {
+    let locale = locale_from_headers(&headers);
     info!(
-        "📨 [HTTP] 收到 Computer Chat 请求:\n\
+        "📨 [HTTP] Received Computer Chat request:\n\
          ├─ user_id: {:?}\n\
          ├─ project_id: {:?}\n\
          ├─ session_id: {:?}\n\
          ├─ request_id: {:?}\n\
-         ├─ prompt ({}字符): {:?}\n\
+         ├─ prompt ({}chars): {:?}\n\
          ├─ attachments: {:?}\n\
          ├─ data_source_attachments: {:?}\n\
          ├─ model_provider: {:#?}\n\
@@ -60,11 +71,15 @@ pub async fn handle_computer_chat(
 
     // 1. 验证必填字段
     if request.user_id.is_empty() {
-        let error_msg = "user_id is required for ComputerAgentRunner";
-        error!("❌ [HTTP] {}", error_msg);
+        let error_msg = get_i18n_message("error.user_id_required", locale);
+        error!("[HTTP] {}", error_msg);
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(HttpResult::error("VALIDATION_ERROR", error_msg)),
+            Json(HttpResult::error_with_message(
+                ERR_VALIDATION,
+                locale,
+                &error_msg,
+            )),
         ));
     }
 
@@ -87,11 +102,19 @@ pub async fn handle_computer_chat(
     let project_dir = state.config.projects_dir.join(&user_id).join(&project_id);
 
     if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
-        let error_msg = format!("Failed to create project directory: {}", e);
-        error!("❌ [HTTP] {}", error_msg);
+        let error_msg = format!(
+            "{}: {}",
+            get_i18n_message("error.project_dir_create_failed", locale),
+            e
+        );
+        error!("[HTTP] {}", error_msg);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(HttpResult::error("INTERNAL_ERROR", &error_msg)),
+            Json(HttpResult::error_with_message(
+                ERR_INTERNAL_SERVER_ERROR,
+                locale,
+                &error_msg,
+            )),
         ));
     }
 
@@ -132,14 +155,17 @@ pub async fn handle_computer_chat(
     match SESSION_CACHE.entry(session_id_str.clone()) {
         Entry::Occupied(entry) => {
             info!(
-                "[HTTP] SESSION_CACHE 已存在，复用: session_id={}",
+                "[HTTP] SESSION_CACHE already exists, reusing: session_id={}",
                 session_id_str
             );
             entry.get().clone()
         }
         Entry::Vacant(entry) => {
             let data = SessionData::new(1000);
-            info!("[HTTP] SESSION_CACHE 新建: session_id={}", session_id_str);
+            info!(
+                "[HTTP] SESSION_CACHE created: session_id={}",
+                session_id_str
+            );
             entry.insert(data.clone());
             data
         }
@@ -158,19 +184,28 @@ pub async fn handle_computer_chat(
     // 10. 根据执行结果返回成功或错误
     if output.error.is_some() || !output.success {
         error!(
-            "❌ [HTTP] Computer Chat 失败: session_id={}, error={:?}",
+            "❌ [HTTP] Computer Chat failed: session_id={}, error={:?}",
             response.session_id, response.error
         );
         // 返回成功的 HTTP 状态码，但 HttpResult 包含错误信息
         // 这与 rcoder 的行为一致：HTTP 200 + HttpResult.error
         return Ok(Json(HttpResult::error(
-            output.error_code.as_deref().unwrap_or("CHAT_ERROR"),
-            output.error.as_deref().unwrap_or("Unknown error"),
+            output
+                .error_code
+                .as_deref()
+                .unwrap_or(ERR_INTERNAL_SERVER_ERROR),
+            &shared_types::get_error_message(
+                output
+                    .error_code
+                    .as_deref()
+                    .unwrap_or(ERR_INTERNAL_SERVER_ERROR),
+                locale,
+            ),
         )));
     }
 
     info!(
-        "✅ [HTTP] Computer Chat 响应: session_id={}, error={:?}",
+        "✅ [HTTP] Computer Chat response: session_id={}, error={:?}",
         response.session_id, response.error
     );
 

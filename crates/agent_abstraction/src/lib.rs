@@ -73,15 +73,13 @@ pub mod traits;
 
 // Re-export types from submodules
 pub use acp::{CancelNotificationRequestWrapper, CancelResult};
+pub use error::AgentAbstractionError;
 pub use launcher::{
-    AgentLaunchConfig, AgentLifecycleGuard,
-    ClaudeCodeLauncher, LauncherConnectionInfoComplete,
+    AgentLaunchConfig, AgentLifecycleGuard, ClaudeCodeLauncher, LauncherConnectionInfoComplete,
     convert_context_servers, get_default_agent_config, load_agent_config,
 };
-pub use error::AgentAbstractionError;
 pub use session::{
-    AcpAgentWorker, AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest,
-    WorkerResponse,
+    AcpAgentWorker, AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse,
 };
 pub use traits::agent::{AgentStartConfig, PromptMessage};
 pub use traits::session_notifier::SessionNotifier;

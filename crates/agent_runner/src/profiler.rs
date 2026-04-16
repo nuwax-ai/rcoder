@@ -76,20 +76,22 @@ pub fn init_pyroscope_profiler(config: ProfilerConfig) -> Result<ProfilerGuard> 
         return Ok(ProfilerGuard { _agent: None });
     }
 
-    info!("Initializing Pyroscope profiler: {}", config.application_name);
+    info!(
+        "Initializing Pyroscope profiler: {}",
+        config.application_name
+    );
     info!("  Server URL: {}", config.server_url);
     info!("  Sample rate: {} Hz", config.sample_rate);
     info!("  CPU profiling: {}", config.enable_cpu);
     info!("  Memory profiling: {}", config.enable_memory);
 
     // 使用正确的 API: builder() -> backend() -> build()
-    let agent = PyroscopeAgent::builder(
-        config.server_url,
-        config.application_name,
-    )
-    .backend(pprof_backend(PprofConfig::new().sample_rate(config.sample_rate)))
-    .build()
-    .context("Failed to build Pyroscope agent")?;
+    let agent = PyroscopeAgent::builder(config.server_url, config.application_name)
+        .backend(pprof_backend(
+            PprofConfig::new().sample_rate(config.sample_rate),
+        ))
+        .build()
+        .context("Failed to build Pyroscope agent")?;
 
     // 启动 profiling，返回 PyroscopeAgent<PyroscopeAgentRunning>
     let agent_running = agent

@@ -1,0 +1,114 @@
+# English translations
+# RCoder error messages
+
+# Success
+success: "Operation successful"
+success.container_destroyed: "Container destroyed successfully"
+success.container_not_exist: "Container does not exist, no action needed"
+success.agent_already_stopped: "Agent is already stopped"
+
+# Agent errors
+error.agent_busy: "Agent is busy processing"
+error.agent_error: "Agent internal error"
+error.agent_not_found: "Agent not found or stopped"
+
+# Cancel/Stop operations
+error.cancel_failed: "Cancel operation failed"
+error.stop_failed: "Stop operation failed"
+
+# Validation
+error.validation: "Validation failed"
+error.invalid_params: "Invalid or missing parameters"
+error.invalid_resource_limits: "Invalid resource limits configuration"
+
+# Container
+error.container_error: "Container operation failed"
+error.container_not_found: "Container not found"
+
+# Workspace
+error.workspace_error: "Workspace error"
+
+# gRPC
+error.grpc_addr_error: "gRPC address resolution failed"
+error.grpc_error: "gRPC call failed"
+
+# Service status
+error.service_unavailable: "Service temporarily unavailable"
+error.http_fallback_failed: "HTTP fallback failed"
+error.internal_server_error: "Internal server error"
+
+# Proxy
+error.proxy_disabled: "Proxy service is disabled"
+error.proxy_service_unavailable: "Proxy service unavailable"
+
+# Session
+error.session_not_found: "Session not found or completed"
+error.resume_failed: "Resume session failed"
+error.retry_exhausted: "Retry attempts exhausted"
+
+# Rate limiting
+error.too_many_requests: "Too many requests"
+
+# Authentication
+error.api_key_auth_failed: "API Key authentication failed"
+
+# Unknown
+error.unknown: "Unknown error"
+error.undefined: "Undefined error code"
+
+# === New i18n keys ===
+
+# Parameter validation
+error.user_id_required: "user_id is required"
+error.project_id_required: "project_id is required"
+error.session_id_required: "session_id is required"
+
+# Docker related
+error.docker_manager_failed: "Failed to get DockerManager"
+error.container_not_found_info: "Container info not found"
+error.container_status_abnormal: "Container status abnormal"
+error.container_start_failed: "Failed to start container"
+error.container_query_failed: "Failed to query container"
+error.container_delete_failed: "Failed to delete container"
+error.container_create_failed: "Failed to create container"
+
+# Directory related
+error.workspace_create_failed: "Failed to create workspace directory"
+error.project_dir_create_failed: "Failed to create project directory"
+error.user_dir_create_failed: "Failed to create user directory"
+
+# gRPC related
+error.grpc_addr_extract_failed: "Failed to extract gRPC address"
+error.grpc_service_url_invalid: "Invalid service_url"
+error.grpc_service_url_missing_host: "Invalid service_url: missing host"
+
+# Query related
+error.select_only: "Only SELECT queries are allowed"
+error.query_execution_failed: "Query execution failed"
+
+# Resource related
+error.resource_limits_invalid: "Invalid resource limits"
+error.resource_limits_validation_failed: "Resource limits validation failed"
+
+# Unknown retry
+error.unknown_retry_error: "Unknown retry error"
+
+# SACP related
+error.sacp_session_id_send_failed: "Failed to send session ID"
+error.agent_process_abnormal_exit: "Agent process exited abnormally, please retry"
+error.session_cancelled: "Session cancelled"
+error.cancel_response_timeout: "Response timeout after cancellation"
+error.agent_init_timeout: "Agent initialization timed out, please retry. Too many MCPs may cause timeout. If this persists, restart the agent computer (click the icon in the upper right corner of PC, then click [...] and select Restart Agent Computer)"
+error.session_cancelled_timeout: "Session cancelled (Agent response timeout)"
+
+# Processing errors
+error.attachment_processing_failed: "Attachment processing failed"
+error.processing_failed: "Processing failed"
+
+# Chat handler errors
+error.create_project_dir_failed: "Failed to create project directory"
+error.build_chat_prompt_failed: "Failed to build ChatPrompt"
+error.agent_worker_unavailable: "Agent Worker is unavailable, restarting. Please retry later"
+error.send_task_failed: "Failed to send task"
+error.request_processing_failed: "Failed to process request"
+error.system_busy: "System is busy: concurrent Agent sessions reached limit ({}), please retry later"

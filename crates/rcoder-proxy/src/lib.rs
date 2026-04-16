@@ -67,7 +67,7 @@ pub mod vnc_resolver;
 // 重新导出公共接口
 pub use config::ProxyConfig;
 pub use pingora_server::PingoraServerManager;
-pub use router::{create_router, get_routes_documentation, RouteType};
+pub use router::{RouteType, create_router, get_routes_documentation};
 pub use server::{PingoraServerRunner, ProxyServer, ProxyServerBuilder};
 pub use service::{PingoraProxyService, PortProxyService}; // PortProxyService 是别名
 pub use vnc_resolver::{
@@ -167,22 +167,22 @@ pub async fn quick_start(
     server.start().await
 }
 
-/// 代理错误类型
+/// Proxy error type
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    #[error("配置错误: {0}")]
+    #[error("config error: {0}")]
     Config(String),
 
-    #[error("网络错误: {0}")]
+    #[error("network error: {0}")]
     Network(String),
 
-    #[error("后端错误: {0}")]
+    #[error("backend error: {0}")]
     Backend(String),
 
-    #[error("端口提取错误: {0}")]
+    #[error("port extraction error: {0}")]
     PortExtraction(String),
 
-    #[error("请求处理错误: {0}")]
+    #[error("request handling error: {0}")]
     RequestHandling(String),
 }
 

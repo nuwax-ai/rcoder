@@ -54,7 +54,7 @@ impl HttpHealthChecker {
             health_path.unwrap_or("health").trim_start_matches('/')
         );
 
-        info!("等待服务启动: {}", health_url);
+        info!("Health check started: {}", health_url);
 
         for attempt in 0..self.max_attempts {
             match timeout(
@@ -64,12 +64,12 @@ impl HttpHealthChecker {
             .await
             {
                 Ok(Ok(response)) if response.status().is_success() => {
-                    info!("服务已就绪");
+                    info!("health check passed");
                     return Ok(());
                 }
                 Ok(Ok(response)) => {
                     debug!(
-                        "服务返回非成功状态: {}, 等待中... ({}/{})",
+                        "Service returned non-success status: {}, waiting... ({}/{})",
                         response.status(),
                         attempt + 1,
                         self.max_attempts
@@ -77,7 +77,7 @@ impl HttpHealthChecker {
                 }
                 Ok(Err(e)) => {
                     debug!(
-                        "连接失败: {}, 继续等待... ({}/{})",
+                        "Connection failed: {}, continuing to wait... ({}/{})",
                         e,
                         attempt + 1,
                         self.max_attempts
@@ -85,7 +85,7 @@ impl HttpHealthChecker {
                 }
                 Err(_) => {
                     debug!(
-                        "连接超时, 继续等待... ({}/{})",
+                        "Connection timeout, continuing to wait... ({}/{})",
                         attempt + 1,
                         self.max_attempts
                     );
@@ -95,7 +95,7 @@ impl HttpHealthChecker {
             // 每 10 次尝试输出一次 info 日志
             if (attempt + 1) % 10 == 0 {
                 info!(
-                    "仍在等待服务启动... ({}/{})",
+                    "Still waiting for service to start... ({}/{})",
                     attempt + 1,
                     self.max_attempts
                 );
@@ -105,7 +105,7 @@ impl HttpHealthChecker {
         }
 
         Err(DockerError::ContainerStartError(format!(
-            "等待服务启动超时: {} (尝试{}次)",
+            "Wait for service startup timeout: {} (attempted {} times)",
             health_url, self.max_attempts
         )))
     }

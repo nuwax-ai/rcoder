@@ -21,8 +21,8 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::State,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,8 @@ use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 use utoipa::ToSchema;
 
+use super::utils::I18nPath;
+use super::utils::get_locale_from_headers;
 use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 
 /// VNC 桌面路径参数
@@ -140,7 +142,7 @@ const NOVNC_PORT: u16 = 6080;
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         ),
         (
             status = 404,
@@ -161,30 +163,34 @@ const NOVNC_PORT: u16 = 6080;
 #[instrument(skip(_state), fields(user_id = %params.user_id, project_id = %params.project_id))]
 pub async fn computer_desktop_vnc(
     State(_state): State<Arc<AppState>>,
-    Path(params): Path<DesktopPathParams>,
+    headers: HeaderMap,
+    I18nPath(params): I18nPath<DesktopPathParams>,
 ) -> Result<HttpResult<DesktopAccessResponse>, AppError> {
+    let locale = get_locale_from_headers(&headers);
     let user_id = params.user_id.clone();
     let project_id = params.project_id.clone();
 
     // 1. 验证参数
     if user_id.trim().is_empty() {
-        error!("❌ [DESKTOP_VNC] user_id 不能为空");
-        return Ok(HttpResult::error(
+        error!("[DESKTOP_VNC] user_id is required");
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            "user_id 不能为空",
+            locale,
+            &shared_types::get_i18n_message("error.user_id_required", locale),
         ));
     }
 
     if project_id.trim().is_empty() {
-        error!("❌ [DESKTOP_VNC] project_id 不能为空");
-        return Ok(HttpResult::error(
+        error!("[DESKTOP_VNC] project_id is required");
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            "project_id 不能为空",
+            locale,
+            &shared_types::get_i18n_message("error.project_id_required", locale),
         ));
     }
 
     info!(
-        "🖥️ [DESKTOP_VNC] 获取 VNC 访问信息: user_id={}, project_id={}",
+        "🖥️ [DESKTOP_VNC] Getting VNC access info: user_id={}, project_id={}",
         user_id, project_id
     );
 
@@ -194,16 +200,17 @@ pub async fn computer_desktop_vnc(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!("⚠️ [DESKTOP_VNC] 找不到用户容器: user_id={}", user_id);
-            return Ok(HttpResult::error(
-                "NOT_FOUND",
-                &format!("找不到用户 {} 的容器，请先发送聊天请求创建容器", user_id),
+            warn!("[DESKTOP_VNC] Container not found: user_id={}", user_id);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                locale,
+                &shared_types::get_i18n_message("error.container_not_found", locale),
             ));
         }
     };
 
     info!(
-        "📦 [DESKTOP_VNC] 找到容器: container_id={}, ip={}",
+        "📦 [DESKTOP_VNC] Found container: container_id={}, ip={}",
         container_info.container_id, container_info.container_ip
     );
 
@@ -234,7 +241,7 @@ pub async fn computer_desktop_vnc(
     };
 
     info!(
-        "✅ [DESKTOP_VNC] VNC 访问信息已生成: user_id={}, proxy_vnc_url={}",
+        "✅ [DESKTOP_VNC] VNC access info generated: user_id={}, proxy_vnc_url={}",
         user_id, proxy_vnc_url
     );
 
@@ -352,7 +359,7 @@ window.open('/computer/vnc/user_123/proj_456/vnc.html', '_blank');
 #[allow(dead_code)]
 pub async fn computer_desktop_proxy(
     State(_state): State<Arc<AppState>>,
-    Path((user_id, project_id, path)): Path<(String, String, Option<String>)>,
+    I18nPath((user_id, project_id, path)): I18nPath<(String, String, Option<String>)>,
 ) -> impl IntoResponse {
     // 占位实现：实际代理由 Pingora 处理
     // 这里返回 501 是为了表明这个端点应该由 Pingora 代理
@@ -501,7 +508,7 @@ ws.onmessage = (event) => {
 #[allow(dead_code)]
 pub async fn computer_audio_proxy(
     State(_state): State<Arc<AppState>>,
-    Path((user_id, project_id, path)): Path<(String, String, Option<String>)>,
+    I18nPath((user_id, project_id, path)): I18nPath<(String, String, Option<String>)>,
 ) -> impl IntoResponse {
     let error_response = DesktopErrorResponse {
         error: "PROXY_REDIRECT".to_string(),
@@ -646,7 +653,7 @@ imeWs.onmessage = (event) => {
 #[allow(dead_code)]
 pub async fn computer_ime_proxy(
     State(_state): State<Arc<AppState>>,
-    Path((user_id, project_id, path)): Path<(String, String, Option<String>)>,
+    I18nPath((user_id, project_id, path)): I18nPath<(String, String, Option<String>)>,
 ) -> impl IntoResponse {
     let error_response = DesktopErrorResponse {
         error: "PROXY_REDIRECT".to_string(),
@@ -679,15 +686,15 @@ async fn check_vnc_available(container_ip: &str) -> bool {
 
     match timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
         Ok(Ok(_)) => {
-            info!("✅ [DESKTOP_VNC] VNC 服务可用: {}", addr);
+            info!("[DESKTOP_VNC] VNC reachable: {}", addr);
             true
         }
         Ok(Err(e)) => {
-            warn!("⚠️ [DESKTOP_VNC] VNC 连接失败: {} - {}", addr, e);
+            warn!("[DESKTOP_VNC] VNC connectionfailed: {} - {}", addr, e);
             false
         }
         Err(_) => {
-            warn!("⚠️ [DESKTOP_VNC] VNC 连接超时: {}", addr);
+            warn!("[DESKTOP_VNC] VNC connectiontimeout: {}", addr);
             false
         }
     }

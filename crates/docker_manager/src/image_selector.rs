@@ -24,7 +24,7 @@ impl ImageSelector {
     /// 创建新的镜像选择器
     pub fn new(config: MultiImageConfig) -> Self {
         let platform = DockerUtils::get_optimal_platform();
-        debug!("创建简化版镜像选择器，平台: {}", platform);
+        debug!("created selector for: {}", platform);
 
         Self { config, platform }
     }
@@ -42,7 +42,7 @@ impl ImageSelector {
         // 强制验证：service_type 必须明确指定并启用
         if !self.is_service_enabled(service_type) {
             return Err(DockerError::ConfigurationError(format!(
-                "服务类型 '{}' 未启用或配置不存在",
+                "service type '{}' is not enabled or configuration does not exist",
                 service_type
             )));
         }
@@ -53,10 +53,8 @@ impl ImageSelector {
             .await?;
 
         info!(
-            "选择镜像: {} (服务: {}, 平台: {})",
-            image_name,
-            service_type,
-            self.platform
+            "Selected image: {} (service: {}, platform: {})",
+            image_name, service_type, self.platform
         );
 
         Ok(image_name)
@@ -70,7 +68,7 @@ impl ImageSelector {
         // 强制验证：service_type 必须明确指定并启用
         if !self.is_service_enabled(service_type) {
             return Err(DockerError::ConfigurationError(format!(
-                "服务类型 '{}' 未启用或配置不存在",
+                "service type '{}' is not enabled or configuration does not exist",
                 service_type
             )));
         }
@@ -79,11 +77,11 @@ impl ImageSelector {
         let service_key = service_type.to_string();
         match self.config.services.get(&service_key) {
             Some(service_config) => {
-                info!("获取服务配置成功: {}", service_key);
+                info!("Get config succeeded: {}", service_key);
                 Ok(service_config.clone())
             }
             None => Err(DockerError::ConfigurationError(format!(
-                "服务类型 '{}' 的配置不存在",
+                "configuration for service type '{}' does not exist",
                 service_type
             ))),
         }
@@ -93,19 +91,19 @@ impl ImageSelector {
     pub fn is_service_enabled(&self, service_type: &ServiceType) -> bool {
         let service_key = service_type.to_string();
         info!(
-            "🔍 [IMAGE_SELECTOR] 检查服务是否启用: service_type={:?}, service_key={}",
+            "[IMAGE_SELECTOR] Checking if service is enabled: service_type={:?}, service_key={}",
             service_type, service_key
         );
 
         if let Some(service_config) = self.config.services.get(&service_key) {
             info!(
-                "✅ [IMAGE_SELECTOR] 服务已找到: enabled={}, arm64_image={:?}",
+                "[IMAGE_SELECTOR] Service found: enabled={}, arm64_image={:?}",
                 service_config.enabled, service_config.arm64_image
             );
             service_config.enabled
         } else {
             warn!(
-                "❌ [IMAGE_SELECTOR] 服务类型 '{}' 未在配置中找到，可用服务: {:?}",
+                "[IMAGE_SELECTOR] Service type '{}' not found in config, available services: {:?}",
                 service_key,
                 self.config.services.keys().collect::<Vec<_>>()
             );
@@ -126,31 +124,31 @@ impl ImageSelector {
         if let Some(service_config) = self.config.services.get(&service_key) {
             // 服务级通用镜像（最高优先级）
             if let Some(image) = &service_config.image {
-                debug!("使用服务特定镜像: {}", image);
+                debug!(" using image: {}", image);
                 return Ok(image.clone());
             }
 
             // 平台特定镜像
             if self.platform == "linux/arm64" {
                 if let Some(arm64_image) = &service_config.arm64_image {
-                    debug!("使用服务ARM64镜像: {}", arm64_image);
+                    debug!(" using ARM64 image: {}", arm64_image);
                     return Ok(arm64_image.clone());
                 }
             } else if let Some(amd64_image) = &service_config.amd64_image {
-                debug!("使用服务AMD64镜像: {}", amd64_image);
+                debug!(" using AMD64 image: {}", amd64_image);
                 return Ok(amd64_image.clone());
             }
         }
 
         // 2. 使用全局默认配置
         if let Some(default_image) = &self.config.global_defaults.default_image {
-            debug!("使用全局默认镜像: {}", default_image);
+            debug!(" using default image: {}", default_image);
             return Ok(default_image.clone());
         }
 
         // 3. 配置错误：不应该发生，因为默认配置已经设置了镜像
         Err(DockerError::ConfigurationError(format!(
-            "服务类型 '{}' 没有可用的镜像配置，请检查配置文件",
+            "Service type '{}' has no available image config, please check the configuration file",
             service_key
         )))
     }

@@ -51,8 +51,8 @@ impl ServiceType {
     /// 获取服务类型的描述
     pub fn description(&self) -> &str {
         match self {
-            ServiceType::RCoder => "标准 RCoder 服务，提供完整的 AI 开发功能",
-            ServiceType::ComputerAgentRunner => "Computer Agent Runner 服务，专注于代理运行和执行",
+            ServiceType::RCoder => "Standard RCoder service, providing full AI development functionality",
+            ServiceType::ComputerAgentRunner => "Computer Agent Runner service, focused on agent execution",
         }
     }
 
@@ -75,20 +75,20 @@ impl ServiceType {
         if let Some(service_config) = config.services.get(&service_key) {
             service_config.enabled
         } else {
-            tracing::warn!("服务类型 '{}' 未在配置中找到", service_key);
+            tracing::warn!("Service '{}' not found in config", service_key);
             false
         }
     }
 }
 
-/// 服务类型验证错误
+/// Service type validation error
 #[derive(Debug, Error)]
 pub enum ServiceTypeError {
-    #[error("服务类型不能为空")]
+    #[error("service type cannot be empty")]
     EmptyServiceType,
-    #[error("不支持的服务类型 '{0}'，请使用 'rcoder' 或 'computer-agent-runner'")]
+    #[error("unsupported service type '{0}', please use 'rcoder' or 'computer-agent-runner'")]
     InvalidServiceType(String),
-    #[error("服务类型 '{0}' 已禁用")]
+    #[error("service type '{0}' is disabled")]
     ServiceDisabled(String),
 }
 
@@ -113,7 +113,7 @@ pub fn get_enabled_service_types(config: &crate::MultiImageConfig) -> Vec<String
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("解析服务类型失败: {} - {:?}", service_type, e);
+                    tracing::warn!(" parse service type failed: {} - {:?}", service_type, e);
                     None
                 }
             }

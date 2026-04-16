@@ -273,8 +273,8 @@ async fn test_end_to_end_proxy_request() {
     // 检查是否正确解析了端口（即使连接失败）
     // 这主要验证端口提取和URI构建逻辑
     match result {
-        Ok(_) => println!("代理请求成功"),
-        Err(e) => println!("代理请求失败（预期）: {}", e),
+ Ok(_) => println!("proxyrequestsucceeded"),
+ Err(e) => println!("proxyrequestfailed( message ): {}", e),
     }
 }
 

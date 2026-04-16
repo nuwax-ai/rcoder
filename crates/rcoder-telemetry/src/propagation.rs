@@ -26,9 +26,7 @@ struct MetadataMapExtractor<'a>(&'a MetadataMap);
 
 impl Extractor for MetadataMapExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
-            .get(key)
-            .and_then(|value| value.to_str().ok())
+        self.0.get(key).and_then(|value| value.to_str().ok())
     }
 
     fn keys(&self) -> Vec<&str> {
@@ -70,10 +68,10 @@ pub fn inject_context(metadata: &mut MetadataMap) {
     let mut injector = MetadataMapInjector(metadata);
     propagator.inject_context(&cx, &mut injector);
 
-    debug!("📤 [Propagation] Trace context 已注入到 gRPC metadata");
+    debug!("[Propagation] Trace context injected into gRPC metadata");
 }
 
-/// 从 gRPC metadata 提取 trace context
+/// Extracting trace context from gRPC metadata
 ///
 /// 从 gRPC metadata 中提取 trace context，
 /// 用于继续跨服务的 trace。
@@ -101,7 +99,7 @@ pub fn extract_context(metadata: &MetadataMap) -> Context {
     let extractor = MetadataMapExtractor(metadata);
     let cx = propagator.extract(&extractor);
 
-    debug!("📥 [Propagation] 从 gRPC metadata 提取 trace context");
+    debug!("[Propagation] Extracting trace context from gRPC metadata");
 
     cx
 }
@@ -124,16 +122,11 @@ pub struct HttpHeaderExtractor<'a>(pub &'a http::HeaderMap);
 
 impl Extractor for HttpHeaderExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
-            .get(key)
-            .and_then(|value| value.to_str().ok())
+        self.0.get(key).and_then(|value| value.to_str().ok())
     }
 
     fn keys(&self) -> Vec<&str> {
-        self.0
-            .keys()
-            .map(|key| key.as_str())
-            .collect()
+        self.0.keys().map(|key| key.as_str()).collect()
     }
 }
 
@@ -148,10 +141,10 @@ pub fn inject_context_http(headers: &mut http::HeaderMap) {
     let mut injector = HttpHeaderInjector(headers);
     propagator.inject_context(&cx, &mut injector);
 
-    debug!("📤 [Propagation] Trace context 已注入到 HTTP headers");
+    debug!("[Propagation] Trace context injected into HTTP headers");
 }
 
-/// 从 HTTP headers 提取 trace context
+/// Extracting trace context from HTTP headers
 ///
 /// # Arguments
 ///
@@ -165,7 +158,7 @@ pub fn extract_context_http(headers: &http::HeaderMap) -> Context {
     let extractor = HttpHeaderExtractor(headers);
     let cx = propagator.extract(&extractor);
 
-    debug!("📥 [Propagation] 从 HTTP headers 提取 trace context");
+    debug!("[Propagation] Extracting trace context from HTTP headers");
 
     cx
 }
@@ -175,7 +168,7 @@ pub fn extract_context_http(headers: &http::HeaderMap) -> Context {
 /// 应该在应用启动时调用一次。
 pub fn set_global_propagator() {
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
-    debug!("✅ [Propagation] 全局 TraceContextPropagator 已设置");
+    debug!("[Propagation] Global TraceContextPropagator set");
 }
 
 #[cfg(test)]
@@ -188,7 +181,12 @@ mod tests {
         let mut metadata = MetadataMap::new();
 
         // 手动设置一些 metadata
-        metadata.insert("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".parse().unwrap());
+        metadata.insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
+        );
 
         // 提取 context
         let cx = extract_context(&metadata);
@@ -202,7 +200,9 @@ mod tests {
         // 手动设置 traceparent header
         headers.insert(
             "traceparent",
-            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".parse().unwrap(),
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
         );
 
         // 提取 context

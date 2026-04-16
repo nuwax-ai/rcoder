@@ -5,7 +5,7 @@
 use axum::{
     Json,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use sacp::schema::{CancelNotification, SessionId};
 use std::sync::Arc;
@@ -15,7 +15,12 @@ use tracing::{info, warn};
 use crate::CancelNotificationRequestWrapper;
 use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
-use shared_types::{ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult};
+use shared_types::{
+    ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult,
+    error_codes::ERR_VALIDATION, get_i18n_message,
+};
+
+use super::locale_from_headers;
 
 /// 取消 Computer Agent 会话任务
 ///
@@ -35,8 +40,10 @@ use shared_types::{ComputerAgentCancelRequest, ComputerAgentCancelResponse, Http
 )]
 pub async fn handle_computer_cancel(
     State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(request): Query<ComputerAgentCancelRequest>,
 ) -> Result<Json<HttpResult<ComputerAgentCancelResponse>>, (StatusCode, Json<HttpResult<String>>)> {
+    let locale = locale_from_headers(&headers);
     info!(
         "🚫 [HTTP] Computer Agent 取消请求: user_id={}, project_id={}, session_id={:?}",
         request.user_id, request.project_id, request.session_id
@@ -46,16 +53,21 @@ pub async fn handle_computer_cancel(
     if request.user_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(HttpResult::error("VALIDATION_ERROR", "user_id is required")),
+            Json(HttpResult::error_with_message(
+                ERR_VALIDATION,
+                locale,
+                &get_i18n_message("error.user_id_required", locale),
+            )),
         ));
     }
 
     if request.project_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(HttpResult::error(
-                "VALIDATION_ERROR",
-                "project_id is required",
+            Json(HttpResult::error_with_message(
+                ERR_VALIDATION,
+                locale,
+                &get_i18n_message("error.project_id_required", locale),
             )),
         ));
     }
@@ -96,7 +108,7 @@ pub async fn handle_computer_cancel(
         // 检查是否已经空闲或停止中(幂等性)
         if cancel_tx.is_closed() {
             info!(
-                "ℹ️  [HTTP] Agent 已停止,cancel channel 已关闭: session_id={}",
+                "ℹ️  [HTTP] Agent stopped, cancel channel is closed: session_id={}",
                 session_id
             );
         } else {
@@ -114,11 +126,11 @@ pub async fn handle_computer_cancel(
             // 发送取消信号 (异步)
             match cancel_tx.send(cancel_request).await {
                 Ok(_) => {
-                    info!("✅ [HTTP] 取消信号已发送: session_id={}", session_id);
+                    info!("[HTTP] Cancel signal sent: session_id={}", session_id);
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️  [HTTP] 发送取消信号失败: session_id={}, error={}",
+                        "⚠️  [HTTP] Failed to send cancel signal: session_id={}, error={}",
                         session_id, e
                     );
                 }
@@ -127,7 +139,7 @@ pub async fn handle_computer_cancel(
     } else {
         // Session 不存在,幂等返回成功
         info!(
-            "ℹ️  [HTTP] Agent 不存在,幂等返回成功: session_id={}",
+            "ℹ️  [HTTP] Agent not found, returning success idempotently: session_id={}",
             session_id
         );
     }

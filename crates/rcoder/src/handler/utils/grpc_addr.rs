@@ -4,6 +4,7 @@
 
 use crate::AppError;
 use shared_types::GRPC_DEFAULT_PORT;
+use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
 
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
 ///
@@ -27,12 +28,13 @@ pub fn extract_grpc_addr_with_port(service_url: &str, grpc_port: u16) -> Result<
         format!("http://{}", service_url)
     };
 
-    let url = url::Url::parse(&url_str)
-        .map_err(|e| AppError::internal_server_error(&format!("无效的 service_url: {}", e)))?;
+    let url = url::Url::parse(&url_str).map_err(|e| {
+        AppError::with_message(ERR_GRPC_ADDR_ERROR, format!("Invalid service_url: {}", e))
+    })?;
 
-    let host = url
-        .host_str()
-        .ok_or_else(|| AppError::internal_server_error("无效的 service_url: 缺少 host"))?;
+    let host = url.host_str().ok_or_else(|| {
+        AppError::with_i18n_key(ERR_GRPC_ADDR_ERROR, "error.grpc_service_url_missing_host")
+    })?;
 
     Ok(format!("{}:{}", host, grpc_port))
 }
@@ -67,12 +69,12 @@ pub async fn get_realtime_container_ip_with_cache(
     // 2. 缓存未命中，查询 Docker API
     let docker_manager = docker_manager::global::get_global_docker_manager()
         .await
-        .map_err(|e| format!("获取 DockerManager 失败: {}", e))?;
+        .map_err(|e| format!("Failed to get DockerManager: {}", e))?;
 
     let network_ips = docker_manager
         .get_container_network_info(container_name)
         .await
-        .map_err(|e| format!("获取容器网络信息失败: {}", e))?;
+        .map_err(|e| format!("failed to get container network info: {}", e))?;
 
     // 3. 优先使用第一个可用的 IP，并写入缓存
     match network_ips.values().next().cloned() {

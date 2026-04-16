@@ -9,7 +9,7 @@ mod computer_agent_stop_handler;
 mod computer_chat_handler;
 mod computer_desktop_handler;
 mod health_handler;
-mod pod_handler;
+pub mod pod_handler;
 pub mod proxy_api;
 pub mod proxy_handler_api;
 pub mod utils;

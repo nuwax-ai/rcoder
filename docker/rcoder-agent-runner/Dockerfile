@@ -13,6 +13,11 @@ FROM ${BASE_IMAGE}
 # 设置工作目录
 WORKDIR /home/user
 
+# agent-browser 默认配置（独立 Chromium profile，避免与 MCP 锁冲突）
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium \
+    AGENT_BROWSER_PROFILE=/home/user/.config/agent-browser/chromium \
+    AGENT_BROWSER_HEADED=1
+
 
 # ============================================================================
 # 📦 复制业务代码和配置文件
@@ -25,8 +30,14 @@ ARG CACHEBUST=1
 # 使用 CACHEBUST 变量触发缓存失效
 RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-stdio-proxy
 
-# 安装 claude-code-acp-rs CLI 工具
-RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs --no-default-features --features otel,sacp-flush
+# # 安装 claude-code-acp-rs CLI 工具
+# RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs --no-default-features --features otel,sacp-flush
+
+# 安装 agent-browser CLI（仅安装命令行工具，不在构建期下载浏览器）
+RUN . /opt/cargo/env && \
+    echo "Cache bust: ${CACHEBUST}" && \
+    cargo install agent-browser && \
+    agent-browser --version
 
 # 测试agent
 RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest

@@ -54,8 +54,8 @@ impl Default for TraceConfig {
 /// - `TELEMETRY_PROMETHEUS_ENABLED`: 是否启用 Prometheus（默认 true）
 pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetry::TelemetryGuard> {
     if !config.enabled {
-        info!("📍 [OTel] 追踪已禁用");
-        // 即使追踪禁用，仍然初始化 Prometheus（如果启用）
+        info!("📍 [OTel] Tracing is disabled");
+        // 即使追踪禁用，仍然Initializing Prometheus（如果启用）
         if config.prometheus_enabled {
             return rcoder_telemetry::init_prometheus_only(&config.service_name);
         }
@@ -80,11 +80,11 @@ pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetr
         telemetry_config = telemetry_config.without_prometheus();
     }
 
-    // 初始化遥测系统
+    // Initializing telemetry system
     let guard = rcoder_telemetry::init(telemetry_config).await?;
 
     info!(
-        "✅ [OTel] 追踪已初始化: OTLP={}, Prometheus={}",
+        "✅ [OTel] Tracing initialized: OTLP={}, Prometheus={}",
         guard.is_otlp_enabled(),
         guard.is_prometheus_enabled()
     );
@@ -162,13 +162,11 @@ impl RequestSpan {
         );
 
         info!(
-            "📍 [OTel] Span 已创建: project_id={}, request_id={}, operation={}",
+            "📍 [OTel] Span created: project_id={}, request_id={}, operation={}",
             project_id, request_id, operation
         );
 
-        Self {
-            span,
-        }
+        Self { span }
     }
 
     /// 设置动态属性（使用 OpenTelemetrySpanExt）
@@ -240,7 +238,11 @@ impl RequestSpan {
     ///     KeyValue::new("cache.ttl", 300),
     /// ]);
     /// ```
-    pub fn add_event(&self, name: impl Into<std::borrow::Cow<'static, str>>, attributes: Vec<opentelemetry::KeyValue>) {
+    pub fn add_event(
+        &self,
+        name: impl Into<std::borrow::Cow<'static, str>>,
+        attributes: Vec<opentelemetry::KeyValue>,
+    ) {
         self.span.add_event(name, attributes);
     }
 
@@ -255,7 +257,7 @@ impl RequestSpan {
         self.span.add_event(name.to_string(), kv_attrs);
 
         info!(
-            "📍 [OTel] 事件: {}, 属性: {:?}",
+            "📍 [OTel] Event: {}, attributes: {:?}",
             name,
             attributes
                 .iter()
@@ -270,7 +272,7 @@ impl RequestSpan {
         self.set_error(err.to_string());
         error!(
             error = %err,
-            "📍 [OTel] 请求错误"
+            "📍 [OTel] Request error"
         );
     }
 
@@ -288,7 +290,7 @@ impl RequestSpan {
 
 impl Drop for RequestSpan {
     fn drop(&mut self) {
-        info!("📍 [OTel] Span 已关闭");
+        info!("📍 [OTel] Span closed");
     }
 }
 
@@ -323,20 +325,16 @@ pub fn child_span(_parent: &RequestSpan, name: &str, attributes: &[(&str, String
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    info!("📍 [OTel] 子 Span 已创建: {}", name);
+    info!("📍 [OTel] Child span created: {}", name);
 
-    RequestSpan {
-        span,
-    }
+    RequestSpan { span }
 }
 
 /// 从上下文中提取当前 span（用于跨线程传递）
 pub fn current_span() -> RequestSpan {
     let span = Span::current();
 
-    RequestSpan {
-        span,
-    }
+    RequestSpan { span }
 }
 
 /// 创建带属性的 span
@@ -367,9 +365,7 @@ pub fn span_with_attributes(name: &str, attributes: &[(&str, String)]) -> Reques
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    RequestSpan {
-        span,
-    }
+    RequestSpan { span }
 }
 
 #[cfg(test)]

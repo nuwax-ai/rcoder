@@ -43,7 +43,7 @@ impl HostPathResolver {
     /// # Returns
     /// * `DockerResult<Self>` - 路径解析器或错误
     pub async fn new_with_docker_socket(docker_socket_path: Option<String>) -> DockerResult<Self> {
-        debug!("开始创建 HostPathResolver");
+        debug!("startingcreated HostPathResolver");
 
         // 创建容器自检器
         let socket_path = docker_socket_path
@@ -54,7 +54,7 @@ impl HostPathResolver {
             ContainerSelfInspector::new(socket_path)
                 .await
                 .map_err(|e| {
-                    DockerError::ConfigurationError(format!("创建容器自检器失败: {}", e))
+                    DockerError::ConfigurationError(format!("failed to create container self-inspector: {}", e))
                 })?,
         );
 
@@ -62,11 +62,11 @@ impl HostPathResolver {
         let mounts = inspector
             .get_all_mounts()
             .await
-            .map_err(|e| DockerError::ConfigurationError(format!("获取挂载点失败: {}", e)))?;
+            .map_err(|e| DockerError::ConfigurationError(format!("failed to get mount points: {}", e)))?;
 
         if mounts.is_empty() {
             return Err(DockerError::ConfigurationError(
-                "未检测到任何挂载点，请检查是否在容器内运行，并确保 docker-compose.yml 中配置了 volume 挂载".to_string()
+                "No mount points detected, check if running inside container and ensure docker-compose.yml has volume mounts configured".to_string()
             ));
         }
 
@@ -79,7 +79,7 @@ impl HostPathResolver {
         all_mounts.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
 
         info!(
-            "📁 [HostPathResolver] 缓存 {} 个挂载点（按路径长度降序）:",
+            "[HostPathResolver] Cached {} mount points (sorted by path length descending):",
             all_mounts.len()
         );
         for (idx, (cp, hp)) in all_mounts.iter().enumerate() {
@@ -102,7 +102,7 @@ impl HostPathResolver {
         let (container_workspace, host_workspace) = default_workspace.clone();
 
         info!(
-            "✅ [HostPathResolver] 默认工作空间: {} (host) -> {} (container)",
+            "[HostPathResolver] Default workspace: {} (host) -> {} (container)",
             host_workspace.display(),
             container_workspace.display()
         );
@@ -138,7 +138,10 @@ impl HostPathResolver {
     /// # }
     /// ```
     pub fn resolve_to_host_path(&self, container_path: &Path) -> DockerResult<PathBuf> {
-        debug!("解析容器路径到宿主机路径: {}", container_path.display());
+        debug!(
+            "Resolving container path to host path: {}",
+            container_path.display()
+        );
 
         // 如果路径是相对路径，先转换为绝对路径（相对于容器工作空间）
         let container_path = if container_path.is_relative() {
@@ -158,7 +161,7 @@ impl HostPathResolver {
                 let host_path = mount_host.join(relative_path);
 
                 debug!(
-                    "✅ 从挂载点解析: {} -> {} (mount: {} -> {})",
+                    "Resolved from mount point: {} -> {} (mount: {} -> {})",
                     container_path.display(),
                     host_path.display(),
                     mount_container.display(),
@@ -171,11 +174,11 @@ impl HostPathResolver {
 
         // 没有找到匹配的挂载点，返回错误
         warn!(
-            "⚠️ 无法解析路径 {}: 未找到匹配的挂载点",
+            "⚠️ unable to resolve path {}: no matching mount point found",
             container_path.display()
         );
         Err(DockerError::ConfigurationError(format!(
-            "无法解析容器路径 '{}': 未找到匹配的挂载点。可用挂载点: {:?}",
+            "unable to resolve container path '{}': no matching mount point found. available mount points: {:?}",
             container_path.display(),
             self.all_mounts
                 .iter()
@@ -201,13 +204,13 @@ impl HostPathResolver {
     pub fn validate(&self) -> DockerResult<()> {
         if !self.host_project_workspace.is_absolute() {
             return Err(DockerError::ConfigurationError(
-                "宿主机工作空间必须是绝对路径".to_string(),
+                "Host workspace must be an absolute path".to_string(),
             ));
         }
 
         if !self.container_project_workspace.is_absolute() {
             return Err(DockerError::ConfigurationError(
-                "容器工作空间必须是绝对路径".to_string(),
+                "Container workspace must be an absolute path".to_string(),
             ));
         }
 
@@ -247,7 +250,7 @@ impl HostPathResolver {
                 .verify_docker_connection()
                 .await
                 .map(|_| true)
-                .map_err(|e| DockerError::ConnectionError(format!("Docker 连接检查失败: {}", e)))
+                .map_err(|e| DockerError::ConnectionError(format!("Docker connection check failed: {}", e)))
         } else {
             Ok(false)
         }

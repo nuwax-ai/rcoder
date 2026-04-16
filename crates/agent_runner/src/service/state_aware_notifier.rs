@@ -57,7 +57,7 @@ impl StateAwareNotifier {
                 info.status = status;
                 info.last_activity = chrono::Utc::now();
                 debug!(
-                    "🔄 [原子状态] 项目[{}]状态: {:?} -> {:?}",
+                    "🔄 [atomic_status] Project[{}] status: {:?} -> {:?}",
                     project_id, old_status, status
                 );
                 true
@@ -88,7 +88,7 @@ impl SessionNotifier for StateAwareNotifier {
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(
-            "📨 项目[{}]发送 SessionPromptStart 通知, session_id={}, request_id={:?}",
+            "📨 Project[{}] sending SessionPromptStart notification, session_id={}, request_id={:?}",
             project_id, session_id, request_id
         );
 
@@ -115,7 +115,7 @@ impl SessionNotifier for StateAwareNotifier {
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(
-            "✅ 项目[{}]发送 SessionPromptEnd 通知, session_id={}, stop_reason={:?}, request_id={:?}",
+            "✅ Project[{}] sending SessionPromptEnd notification, session_id={}, stop_reason={:?}, request_id={:?}",
             project_id, session_id, stop_reason, request_id
         );
 
@@ -150,7 +150,7 @@ impl SessionNotifier for StateAwareNotifier {
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         error!(
-            "❌ 项目[{}]发送 SessionPromptError 通知, session_id={}, error_code={}, error_message={}, request_id={:?}",
+            "❌ Project[{}] sending SessionPromptError notification, session_id={}, error_code={}, error_message={}, request_id={:?}",
             project_id, session_id, error.code, error.message, request_id
         );
 
@@ -177,7 +177,7 @@ impl SessionNotifier for StateAwareNotifier {
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!(
-            "🔄 项目[{}]发送 SessionUpdate 通知, session_id={}",
+            "🔄 Project[{}] sending SessionUpdate notification, session_id={}",
             project_id, session_id
         );
 
@@ -197,7 +197,7 @@ impl SessionNotifier for StateAwareNotifier {
         notify: SessionNotify,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!(
-            "📢 项目[{}]发送通用会话通知, session_id={}",
+            "📢 Project[{}] sending generic session notification, session_id={}",
             project_id, session_id
         );
 

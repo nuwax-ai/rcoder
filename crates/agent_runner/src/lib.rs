@@ -32,6 +32,6 @@ pub use service::*; // 重新导出 service 模块
 pub use utils::*;
 
 #[cfg(feature = "http-server")]
-pub use http_server::{HttpServerConfig, start_http_server};
-#[cfg(feature = "http-server")]
 pub use http_server::start::HttpServerHandle;
+#[cfg(feature = "http-server")]
+pub use http_server::{HttpServerConfig, start_http_server};

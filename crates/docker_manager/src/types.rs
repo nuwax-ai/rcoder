@@ -152,9 +152,7 @@ impl ContainerQueryResult {
     }
 
     /// 从元组创建（用于兼容旧代码）
-    pub fn from_tuple(
-        tuple: (String, String, ContainerStatus, bool),
-    ) -> Self {
+    pub fn from_tuple(tuple: (String, String, ContainerStatus, bool)) -> Self {
         Self {
             container_id: tuple.0,
             container_name: tuple.1,

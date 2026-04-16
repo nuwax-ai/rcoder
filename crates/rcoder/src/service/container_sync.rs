@@ -28,7 +28,7 @@ impl Default for ContainerSyncConfig {
 /// 如果不存在则从缓存中移除。
 pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::JoinHandle<()> {
     info!(
-        "🔄 [CONTAINER_SYNC] 启动容器状态同步任务: 间隔={}秒",
+        "🔄 [CONTAINER_SYNC] Starting container state sync task: interval={}s",
         config.sync_interval.as_secs()
     );
 
@@ -42,7 +42,7 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
             let docker_manager = match docker_manager::global::get_global_docker_manager().await {
                 Ok(dm) => dm,
                 Err(e) => {
-                    warn!("⚠️ [CONTAINER_SYNC] 获取 DockerManager 失败: {}", e);
+                    warn!("[CONTAINER_SYNC] Failed to get DockerManager: {}", e);
                     continue;
                 }
             };
@@ -52,15 +52,18 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
                 Ok((checked, removed)) => {
                     if removed > 0 {
                         info!(
-                            "🔄 [CONTAINER_SYNC] 同步完成: 检查={}, 移除={}",
+                            "🔄 [CONTAINER_SYNC] Sync completed: checked={}, removed={}",
                             checked, removed
                         );
                     } else {
-                        info!("🔄 [CONTAINER_SYNC] 同步完成: 检查={}, 无需移除", checked);
+                        info!(
+                            "[CONTAINER_SYNC] Sync completed: checked={}",
+                            checked
+                        );
                     }
                 }
                 Err(e) => {
-                    warn!("⚠️ [CONTAINER_SYNC] 同步失败: {}", e);
+                    warn!("[CONTAINER_SYNC] sync failed: {}", e);
                 }
             }
         }

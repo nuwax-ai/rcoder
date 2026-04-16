@@ -30,7 +30,7 @@ pub async fn grpc_chat_with_pool(
     user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
 ) -> anyhow::Result<GrpcChatResponse> {
     info!(
-        "🚀 [gRPC_CHAT] 发送 Chat 请求 (连接池): addr={}, project_id={}",
+        "🚀 [gRPC_CHAT] Sending Chat request (connection pool): addr={}, project_id={}",
         grpc_addr, project_id
     );
 
@@ -57,27 +57,28 @@ pub async fn grpc_chat_with_pool(
         user_id, // 传递 user_id
     };
 
-    debug!("📤 [gRPC_CHAT] 发送请求: {:?}", grpc_request);
+    debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);
 
     // 构建 tonic Request 并设置请求级别超时
-    let mut request = tonic::Request::new(grpc_request);
+    let locale = super::current_grpc_locale();
+    let mut request = super::new_request_with_locale(grpc_request, locale);
 
     // ✅ 使用 Tonic 原生 API 设置请求超时
     if let Some(timeout) = request_timeout {
         request.set_timeout(timeout);
-        debug!("⏱️ [gRPC_CHAT] 设置请求超时: {:?}", timeout);
+        debug!("⏱️ [gRPC_CHAT] request timeout: {:?}", timeout);
     }
 
     // 发送请求
     let response = client.chat(request).await.map_err(|e| {
-        error!("❌ [gRPC_CHAT] Chat RPC 调用失败: {}", e);
-        anyhow::anyhow!("gRPC Chat 调用失败: {}", e)
+        error!("[gRPC_CHAT] Chat RPC call failed: {}", e);
+        anyhow::anyhow!("gRPC Chat call failed: {}", e)
     })?;
 
     let chat_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_CHAT] 收到响应: project_id={}, session_id={}, success={}",
+        "✅ [gRPC_CHAT] Received response: project_id={}, session_id={}, success={}",
         chat_response.project_id, chat_response.session_id, chat_response.success
     );
 
@@ -105,7 +106,7 @@ pub async fn grpc_cancel_session_with_pool(
     project_id: String,
 ) -> anyhow::Result<CancelResponse> {
     info!(
-        "🛑 [gRPC_CANCEL] 发送取消会话请求 (连接池): addr={}, session_id={}, project_id={}",
+        "🛑 [gRPC_CANCEL] Sending cancel session request (connection pool): addr={}, session_id={}, project_id={}",
         grpc_addr, session_id, project_id
     );
 
@@ -119,21 +120,21 @@ pub async fn grpc_cancel_session_with_pool(
         project_id,
     };
 
-    debug!("📤 [gRPC_CANCEL] 发送请求: {:?}", grpc_request);
+    debug!("[gRPC_CANCEL] sendrequest: {:?}", grpc_request);
 
     // 发送请求
-    let response = client
-        .cancel_session(tonic::Request::new(grpc_request))
-        .await
-        .map_err(|e| {
-            error!("❌ [gRPC_CANCEL] CancelSession RPC 调用失败: {}", e);
-            anyhow::anyhow!("gRPC CancelSession 调用失败: {}", e)
-        })?;
+    let locale = super::current_grpc_locale();
+    let request = super::new_request_with_locale(grpc_request, locale);
+
+    let response = client.cancel_session(request).await.map_err(|e| {
+        error!("[gRPC_CANCEL] CancelSession RPC call failed: {}", e);
+        anyhow::anyhow!("gRPC CancelSession call failed: {}", e)
+    })?;
 
     let cancel_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_CANCEL] 收到响应: success={}, message={:?}",
+        "✅ [gRPC_CANCEL] Received response: success={}, message={:?}",
         cancel_response.success, cancel_response.message
     );
 
@@ -161,7 +162,7 @@ pub async fn grpc_stop_agent_with_pool(
     force: bool,
 ) -> anyhow::Result<shared_types::grpc::StopAgentResponse> {
     info!(
-        "🔄 [gRPC_STOP_AGENT] 发送停止 Agent 请求 (连接池): addr={}, project_id={}, force={}",
+        "🔄 [gRPC_STOP_AGENT] Sending stop Agent request (connection pool): addr={}, project_id={}, force={}",
         grpc_addr, project_id, force
     );
 
@@ -175,21 +176,21 @@ pub async fn grpc_stop_agent_with_pool(
         force,
     };
 
-    debug!("📤 [gRPC_STOP_AGENT] 发送请求: {:?}", grpc_request);
+    debug!("[gRPC_STOP_AGENT] sendrequest: {:?}", grpc_request);
 
     // 发送请求
-    let response = client
-        .stop_agent(tonic::Request::new(grpc_request))
-        .await
-        .map_err(|e| {
-            error!("❌ [gRPC_STOP_AGENT] StopAgent RPC 调用失败: {}", e);
-            anyhow::anyhow!("gRPC StopAgent 调用失败: {}", e)
-        })?;
+    let locale = super::current_grpc_locale();
+    let request = super::new_request_with_locale(grpc_request, locale);
+
+    let response = client.stop_agent(request).await.map_err(|e| {
+        error!("[gRPC_STOP_AGENT] StopAgent RPC call failed: {}", e);
+        anyhow::anyhow!("gRPC StopAgent call failed: {}", e)
+    })?;
 
     let stop_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_STOP_AGENT] 收到响应: result={}, success={}, message={:?}",
+        "✅ [gRPC_STOP_AGENT] Received response: result={}, success={}, message={:?}",
         stop_response.result, stop_response.success, stop_response.message
     );
 

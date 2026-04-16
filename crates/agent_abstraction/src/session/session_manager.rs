@@ -50,10 +50,10 @@ use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
 // 使用 SACP 类型
-use sacp::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;
+use sacp::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use shared_types::{
     AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
 };
@@ -90,10 +90,7 @@ where
     /// - `notifier`: 会话通知器
     /// - `registry`: 会话注册表（通常注入 AGENT_REGISTRY）
     pub fn new(notifier: Arc<N>, registry: Arc<R>) -> Self {
-        Self {
-            registry,
-            notifier,
-        }
+        Self { registry, notifier }
     }
 
     /// 获取会话信息
@@ -184,7 +181,7 @@ where
 
         // 将 request_id 放入 meta 字段
         debug!(
-            "🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta",
+            "🔧 [build_prompt] Putting request_id={} into PromptRequest.meta",
             prompt.request_id
         );
         let mut meta = serde_json::Map::new();
@@ -226,7 +223,7 @@ where
 
         // 将 request_id 放入 meta 字段
         debug!(
-            "🔧 [build_prompt] 将 request_id={} 放入 PromptRequest.meta",
+            "🔧 [build_prompt] Putting request_id={} into PromptRequest.meta",
             prompt.request_id
         );
         let mut meta = serde_json::Map::new();
@@ -289,7 +286,10 @@ where
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
     ) -> Result<R::Entry> {
-        info!("开始创建新的 Agent 会话，项目 ID: {}", project_id);
+        info!(
+            "Creating Agent session, project ID: {}",
+            project_id
+        );
 
         // 创建 SACP 启动器
         let launcher = ClaudeCodeLauncher::new(self.notifier.clone());
@@ -298,7 +298,7 @@ where
         let has_resume = start_config.resume_session_id.is_some();
         if has_resume {
             info!(
-                "📌 使用 resume 启动 Agent: session_id={:?}",
+                "📌 Starting Agent with resume: session_id={:?}",
                 start_config.resume_session_id
             );
         }
@@ -317,7 +317,7 @@ where
             .await?;
 
         info!(
-            "✅ Agent 会话创建成功，会话 ID: {}",
+            "✅ Agent session created successfully, session ID: {}",
             connection_info.session_id
         );
 
@@ -397,33 +397,38 @@ where
                     let model_changed = existing.is_model_config_changed(&model_provider);
 
                     if !channel_closed && !model_changed {
-                        info!("🔄 [SESSION] 通过 session_id_hint 复用现有会话: project_id={}, session_id={}", project_id, hint_sid);
+                        info!(
+                            "[SESSION] Reusing existing session via session_id_hint: project_id={}, session_id={}",
+                            project_id, hint_sid
+                        );
                         return Ok((existing, false));
                     }
 
                     if channel_closed {
                         info!(
-                            "⚠️ [SESSION] session_id_hint 对应的会话 channel 已关闭，需要重建: project_id={}, session_id={}",
+                            "⚠️ [SESSION] Session channel closed for session_id_hint, need to rebuild: project_id={}, session_id={}",
                             project_id, hint_sid
                         );
                     }
                     if model_changed {
                         info!(
-                            "🔄 [SESSION] session_id_hint 对应的会话模型配置变化，需要重建: project_id={}, session_id={}",
+                            "🔄 [SESSION] Model config changed for session_id_hint, need to rebuild: project_id={}, session_id={}",
                             project_id, hint_sid
                         );
                     }
                     // 会话无效，继续后续逻辑（可能需要重建）
                 } else {
                     info!(
-                        "⚠️ [SESSION] session_id_hint 属于不同的 project: hint_project={}, current_project={}, session_id={}",
-                        existing.project_id(), project_id, hint_sid
+                        "⚠️ [SESSION] session_id_hint belongs to different project: hint_project={}, current_project={}, session_id={}",
+                        existing.project_id(),
+                        project_id,
+                        hint_sid
                     );
                     // session_id 属于其他 project，不能复用，继续后续逻辑
                 }
             } else {
                 info!(
-                    "🔍 [SESSION] session_id_hint 不存在于 registry: session_id={}",
+                    "🔍 [SESSION] session_id_hint does not exist in registry: session_id={}",
                     hint_sid
                 );
                 // session_id 不存在，继续后续逻辑
@@ -437,7 +442,7 @@ where
             // 🔥 显式检查 Pending 状态 - PendingGuard 创建的占位符需要被替换
             if *existing.status() == AgentStatus::Pending {
                 info!(
-                    "🔄 [SESSION] 检测到 Pending 占位符，准备替换: project_id={}",
+                    "🔄 [SESSION] Detected Pending placeholder, preparing to replace: project_id={}",
                     project_id
                 );
                 // 显式释放 entry 锁
@@ -460,7 +465,7 @@ where
                         let new_session_id = new_session.session_id().to_string();
                         entry.insert(new_session.clone());
                         info!(
-                            "✅ [SESSION] 插入新会话替换 pending: project_id={}, session_id={}",
+                            "✅ [SESSION] Inserted new session to replace pending: project_id={}, session_id={}",
                             project_id, new_session_id
                         );
                         return Ok((new_session, true));
@@ -476,7 +481,7 @@ where
                             let new_session_id = new_session.session_id().to_string();
                             entry.insert(new_session.clone());
                             info!(
-                                "✅ [SESSION] 替换 pending 占位符: project_id={}, {} → {}",
+                                "✅ [SESSION] Replaced pending placeholder: project_id={}, {} → {}",
                                 project_id, old_session_id, new_session_id
                             );
                             return Ok((new_session, true));
@@ -486,7 +491,7 @@ where
                             let created_session_id = new_session.session_id().to_string();
                             let existing_session_id = existing_session.session_id().to_string();
                             info!(
-                                "🔄 [SESSION] 检测到并发创建（其他线程已创建真实会话）: project_id={}, 丢弃 session_id={}, 使用 session_id={}",
+                                "🔄 [SESSION] Detected concurrent creation (other thread already created real session): project_id={}, discarded session_id={}, using session_id={}",
                                 project_id, created_session_id, existing_session_id
                             );
                             // new_session 会被 drop，AgentLifecycleGuard 会清理 Agent 进程
@@ -500,7 +505,7 @@ where
             let model_changed = existing.is_model_config_changed(&model_provider);
 
             if !channel_closed && !model_changed {
-                info!("复用现有 Agent 会话，项目 ID: {}", project_id);
+                info!("Reuse Agent session, project ID: {}", project_id);
                 return Ok((existing.clone(), false));
             }
 
@@ -510,13 +515,13 @@ where
 
             if channel_closed {
                 info!(
-                    "⚠️ 检测到会话 channel 已关闭（Agent 进程已退出），重建会话，项目 ID: {}, 旧 session_id: {}",
+                    "⚠️ Detected session channel closed (Agent process exited), rebuilding session, project ID: {}, old session_id: {}",
                     project_id, session_id_str
                 );
             }
             if model_changed {
                 info!(
-                    "检测到模型配置变化，重启 Agent 会话，项目 ID: {}, 旧 session_id: {}",
+                    "Model config changed, restarting Agent session, project ID: {}, old session_id: {}",
                     project_id, session_id_str
                 );
             }
@@ -539,7 +544,7 @@ where
                     let new_session_id = new_session.session_id().to_string();
                     entry.insert(new_session.clone());
                     info!(
-                        "✅ 已重建会话，项目 ID: {}, 新 session_id: {}",
+                        "✅ Session rebuilt, project ID: {}, new session_id: {}",
                         project_id, new_session_id
                     );
                     return Ok((new_session, true));
@@ -550,7 +555,7 @@ where
                     let created_session_id = new_session.session_id().to_string();
                     let existing_session_id = existing_session.session_id().to_string();
                     info!(
-                        "🔄 [SESSION] 检测到并发创建，使用其他线程创建的会话: project_id={}, 丢弃 session_id={}, 使用 session_id={}",
+                        "🔄 [SESSION] Detected concurrent creation, using other thread's session: project_id={}, discarded session_id={}, using session_id={}",
                         project_id, created_session_id, existing_session_id
                     );
                     // new_session 会被 drop，Session 的 Drop 实现会清理 Agent 进程
@@ -560,7 +565,10 @@ where
         }
 
         // 会话不存在，需要创建新会话
-        info!("会话不存在，创建新会话，项目 ID: {}", project_id);
+        info!(
+            "Session not found, creating new session, project ID: {}",
+            project_id
+        );
 
         // 第二阶段：在不持有锁的情况下创建新会话
         let new_session = self
@@ -580,7 +588,7 @@ where
                 let session_id_str = new_session.session_id().to_string();
                 entry.insert(new_session.clone());
                 info!(
-                    "✅ 新会话创建完成，项目 ID: {}, session_id: {}",
+                    "✅ New session created, project ID: {}, session_id: {}",
                     project_id, session_id_str
                 );
                 Ok((new_session, true))
@@ -591,7 +599,7 @@ where
                 let created_session_id = new_session.session_id().to_string();
                 let existing_session_id = existing_session.session_id().to_string();
                 info!(
-                    "🔄 [SESSION] 检测到并发创建，使用其他线程创建的会话: project_id={}, 丢弃 session_id={}, 使用 session_id={}",
+                    "🔄 [SESSION] Detected concurrent creation, using session created by other thread: project_id={}, discarding session_id={}, using session_id={}",
                     project_id, created_session_id, existing_session_id
                 );
                 // new_session 会被 drop，Session 的 Drop 实现会清理 Agent 进程
@@ -610,15 +618,16 @@ where
 
         let prompt_request = Self::build_text_prompt_request(prompt, session.session_id().clone())?;
 
-        session.prompt_tx()
+        session
+            .prompt_tx()
             .send(prompt_request)
             .await
             .map_err(|e| {
-                error!("发送 Prompt 请求失败: {:?}", e);
-                anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
+                error!("send Prompt requestfailed: {:?}", e);
+                anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
             })?;
 
-        info!("✅ Prompt 请求已发送，项目 ID: {}", project_id);
+        info!("Prompt request already sent, project ID: {}", project_id);
         Ok(())
     }
 
@@ -634,22 +643,21 @@ where
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
-        session.prompt_tx()
+        session
+            .prompt_tx()
             .send(prompt_request)
             .await
             .map_err(|e| {
-                error!("发送 Prompt 请求失败: {:?}", e);
-                anyhow::anyhow!("发送 Prompt 请求失败: {:?}", e)
+                error!("send Prompt requestfailed: {:?}", e);
+                anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
             })?;
 
-        info!("✅ Prompt 请求已发送，项目 ID: {}", project_id);
+        info!("Prompt request already sent, project ID: {}", project_id);
         Ok(())
     }
 }
 
-impl<N: SessionNotifier + 'static, R: SessionRegistry> std::fmt::Debug
-    for AcpSessionManager<N, R>
-{
+impl<N: SessionNotifier + 'static, R: SessionRegistry> std::fmt::Debug for AcpSessionManager<N, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpSessionManager")
             .field("session_count", &self.registry.count())

@@ -1,22 +1,22 @@
-//! 系统提示词配置类型
+//! System prompt configuration types
 //!
-//! 这个模块提供编译时嵌入的默认系统提示词常量和相关辅助功能。
-//! 默认系统提示词在编译时从外部文件嵌入，支持运行时通过配置覆盖。
+//! This module provides compile-time embedded default system prompt constants and related helper functions.
+//! Default system prompt is embedded at compile time from external files, with runtime override support via configuration.
 
-/// 编译时嵌入的默认系统提示词
+/// Compile-time embedded default system prompt
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../configs/prompts/frontend_expert.txt");
 
-/// 提示词构建器（为了兼容性保留，推荐直接使用 SystemPromptConfig::get_prompt()）
+/// Prompt builder (kept for compatibility, recommend using SystemPromptConfig::get_prompt() directly)
 #[derive(Debug, Clone)]
 pub struct PromptBuilder;
 
 impl PromptBuilder {
-    /// 构建用户提示词（不包含系统提示词）
+    /// Build user prompt (without system prompt)
     pub fn build_user_prompt(user_prompt: &str) -> String {
         user_prompt.to_string()
     }
 
-    /// 构建带数据源的用户提示词
+    /// Build user prompt with data sources
     pub fn build_user_prompt_with_data_sources(
         user_prompt: &str,
         data_sources: &[String],
@@ -29,10 +29,10 @@ impl PromptBuilder {
         format!(
             "{}\n\n\
             <DATA_SOURCES>\n\
-            以下是可供使用的数据源信息，包含了后端API接口、数据库连接等外部数据源。\n\
-            在开发前端应用时，你可以使用这些数据源来获取真实数据，例如查询比特币交易额、股票价格、天气信息等。\n\
-            请根据开发需求合理使用这些数据源，并确保前端应用能够正确调用相关接口。\n\
-            使用 Axios 客户端或 Fetch API 进行 API 调用,或者根据当前框架的接口调用方式,来使用。\n\n\
+            The following are available data source information, including backend API endpoints, database connections, and other external data sources.\n\
+            When developing frontend applications, you can use these data sources to fetch real data, such as querying Bitcoin transaction volumes, stock prices, weather information, etc.\n\
+            Please use these data sources reasonably according to development needs, and ensure the frontend application can correctly call the relevant interfaces.\n\
+            Use Axios client or Fetch API for API calls, or according to the interface calling method of the current framework.\n\n\
             {}\n\
             </DATA_SOURCES>",
             user_prompt, data_sources_section
@@ -40,16 +40,16 @@ impl PromptBuilder {
     }
 }
 
-/// 格式化数据源信息为可读文本
+/// Format data source information into readable text
 fn format_data_sources(data_sources: &[String]) -> String {
     if data_sources.is_empty() {
-        return "无数据源".to_string();
+        return "No data sources".to_string();
     }
 
     let mut formatted = String::new();
 
     for (index, data_source) in data_sources.iter().enumerate() {
-        formatted.push_str(&format!("数据源 {}:\n", index + 1));
+        formatted.push_str(&format!("Data source {}:\n", index + 1));
 
         // 尝试解析 JSON 字符串并格式化
         match serde_json::from_str::<serde_json::Value>(data_source) {
@@ -94,7 +94,7 @@ mod tests {
         let data_sources = vec![r#"{"api": "https://api.example.com"}"#.to_string()];
         let formatted = format_data_sources(&data_sources);
 
-        assert!(formatted.contains("数据源 1"));
+        assert!(formatted.contains("Data source 1"));
         assert!(formatted.contains("api.example.com"));
     }
 
@@ -102,6 +102,6 @@ mod tests {
     fn test_format_empty_data_sources() {
         let data_sources: Vec<String> = vec![];
         let formatted = format_data_sources(&data_sources);
-        assert_eq!(formatted, "无数据源");
+        assert_eq!(formatted, "No data sources");
     }
 }

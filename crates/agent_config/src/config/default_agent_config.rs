@@ -247,19 +247,21 @@ mod tests {
     #[test]
     fn test_get_default_config_by_service_type() {
         // 测试 RCoder 配置
-        let rcoder_config =
-            get_default_config_by_service_type(&shared_types::ServiceType::RCoder);
-        assert!(rcoder_config
-            .agent_servers
-            .contains_key(CLAUDE_CODE_ACP_AGENT_ID));
+        let rcoder_config = get_default_config_by_service_type(&shared_types::ServiceType::RCoder);
+        assert!(
+            rcoder_config
+                .agent_servers
+                .contains_key(CLAUDE_CODE_ACP_AGENT_ID)
+        );
 
         // 测试 ComputerAgentRunner 配置
-        let car_config = get_default_config_by_service_type(
-            &shared_types::ServiceType::ComputerAgentRunner,
+        let car_config =
+            get_default_config_by_service_type(&shared_types::ServiceType::ComputerAgentRunner);
+        assert!(
+            car_config
+                .agent_servers
+                .contains_key(CLAUDE_CODE_ACP_AGENT_ID)
         );
-        assert!(car_config
-            .agent_servers
-            .contains_key(CLAUDE_CODE_ACP_AGENT_ID));
 
         // ComputerAgentRunner 应该有更多 context servers
         assert!(
@@ -271,8 +273,7 @@ mod tests {
     #[test]
     fn test_default_agent_servers_for_service() {
         // RCoder
-        let rcoder_servers =
-            default_agent_servers_for_service(&shared_types::ServiceType::RCoder);
+        let rcoder_servers = default_agent_servers_for_service(&shared_types::ServiceType::RCoder);
         assert!(!rcoder_servers.is_empty());
 
         // ComputerAgentRunner
@@ -286,9 +287,7 @@ mod tests {
         // RCoder - 基础 MCP servers
         let rcoder_contexts =
             default_context_servers_for_service(&shared_types::ServiceType::RCoder);
-        assert!(
-            rcoder_contexts.contains_key("fetch") || rcoder_contexts.contains_key("context7")
-        );
+        assert!(rcoder_contexts.contains_key("fetch") || rcoder_contexts.contains_key("context7"));
 
         // ComputerAgentRunner - 增强 MCP servers
         let car_contexts =
@@ -314,10 +313,8 @@ mod tests {
         assert!(agent.is_some());
 
         // 测试不存在的 agent
-        let agent = get_default_agent_for_service(
-            "non-existent-agent",
-            &shared_types::ServiceType::RCoder,
-        );
+        let agent =
+            get_default_agent_for_service("non-existent-agent", &shared_types::ServiceType::RCoder);
         assert!(agent.is_none());
     }
 

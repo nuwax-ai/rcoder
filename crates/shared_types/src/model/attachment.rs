@@ -181,18 +181,18 @@ impl Attachment {
     }
 }
 
-/// 附件处理错误
+/// Attachment processing error
 #[derive(Debug, thiserror::Error)]
 pub enum AttachmentError {
-    #[error("文件读取失败: {0}")]
+    #[error("file read failed: {0}")]
     FileReadError(String),
-    #[error("不支持的文件类型: {0}")]
+    #[error("unsupported file type: {0}")]
     UnsupportedFileType(String),
-    #[error("Base64 解码失败: {0}")]
+    #[error("base64 decode failed: {0}")]
     Base64DecodeError(String),
-    #[error("文件大小超过限制: {0} bytes")]
+    #[error("file size exceeds limit: {0} bytes")]
     FileSizeExceeded(u64),
-    #[error("URL 访问失败: {0}")]
+    #[error("URL access failed: {0}")]
     UrlAccessError(String),
 }
 

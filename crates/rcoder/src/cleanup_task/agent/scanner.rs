@@ -34,7 +34,7 @@ impl AgentScanner {
         let mut idle_agents = Vec::new();
         let current_time = Utc::now();
 
-        info!("🔍 [scanner] 开始扫描闲置 agent");
+        info!("[scanner] Starting agent scan");
 
         // 收集所有项目 ID
         let project_ids: Vec<String> = self.state.projects.iter().map(|(id, _)| id).collect();
@@ -48,7 +48,7 @@ impl AgentScanner {
         }
 
         info!(
-            "🎯 [scanner] 扫描完成: 发现 {} 个闲置 agent",
+            "🎯 [scanner] Scan completed: found {} idle agents",
             idle_agents.len()
         );
         Ok(idle_agents)
@@ -63,19 +63,19 @@ impl AgentScanner {
         let status = agent.status();
         match status {
             Some(AgentStatus::Idle) => {
-                debug!("✅ [scanner] 状态=Idle: {}", agent.project_id());
+                debug!("[scanner] status=Idle: {}", agent.project_id());
             }
             Some(AgentStatus::Pending) | Some(AgentStatus::Active) => {
                 // 🔧 修复：即使是 Active/Pending 状态，也要检查是否真的活跃
                 // 如果状态卡住（比如 gRPC 服务异常），仍需要清理
-                debug!("⏸️ [scanner] 状态={:?}，需要进一步检查", status);
+                debug!("⏸️ [scanner] status={:?}, checking", status);
                 // 继续检查，不要直接返回 false
             }
             None => {
                 // 状态为 None，检查保护期
                 let age = current_time - agent.created_at();
                 if age.num_seconds() < self.config.container_protection_duration.as_secs() as i64 {
-                    debug!("⏸️ [scanner] 状态=None 且在保护期内");
+                    debug!("⏸️ [scanner] status=None, in protection period");
                     return false;
                 }
             }
@@ -88,14 +88,14 @@ impl AgentScanner {
 
                 if terminating_stuck_secs > max_terminating_secs {
                     warn!(
-                        "⚠️ [scanner] Terminating 状态卡住超过 {} 秒，强制清理: project_id={}, 卡住时长={}秒",
+                        "⚠️ [scanner] Terminating status stuck for more than {} seconds, forcing cleanup: project_id={}, stuck_duration={}s",
                         max_terminating_secs,
                         agent.project_id(),
                         terminating_stuck_secs
                     );
                     // 继续检查，不要返回 false
                 } else {
-                    debug!("⏸️ [scanner] 状态=Terminating，等待中...");
+                    debug!("⏸️ [scanner] status=Terminating, waiting...");
                     return false;
                 }
             }
@@ -108,8 +108,14 @@ impl AgentScanner {
 
         if !is_timeout {
             // 未超时，但如果状态是 Active/Pending，仍需要通过 gRPC 确认
-            if matches!(status, Some(AgentStatus::Active) | Some(AgentStatus::Pending)) {
-                debug!("⏸️ [scanner] 未超时但状态活跃，跳过: {:?}", status);
+            if matches!(
+                status,
+                Some(AgentStatus::Active) | Some(AgentStatus::Pending)
+            ) {
+                debug!(
+                    "⏸️ [scanner] Not timeout, status active, skip: {:?}",
+                    status
+                );
                 return false;
             }
             return false;
@@ -130,7 +136,7 @@ impl AgentScanner {
                 Ok(addr) => addr,
                 Err(e) => {
                     debug!(
-                        "⚠️ [scanner] 解析 gRPC 地址失败: project_id={}, error={}",
+                        "⚠️ [scanner] Failed to parse gRPC address: project_id={}, error={}",
                         agent.project_id(),
                         e
                     );
@@ -151,20 +157,20 @@ impl AgentScanner {
             {
                 Ok(true) => {
                     info!(
-                        "🔄 [scanner] gRPC 二次确认: 容器内 agent 仍在活跃，跳过清理: project_id={}, user_id={}",
+                        "🔄 [scanner] gRPC secondary confirmation: agent in container is still active, skipping cleanup: project_id={}, user_id={}",
                         project_id, user_id
                     );
                     return false;
                 }
                 Ok(false) => {
                     debug!(
-                        "💤 [scanner] gRPC 二次确认: 容器内 agent 确认空闲，可以清理: project_id={}, user_id={}",
+                        "💤 [scanner] gRPC secondary confirmation: agent in container is idle, can cleanup: project_id={}, user_id={}",
                         project_id, user_id
                     );
                 }
                 Err(e) => {
                     debug!(
-                        "⚠️ [scanner] gRPC 二次确认失败，允许清理: project_id={}, user_id={}, error={}",
+                        "⚠️ [scanner] gRPC secondary confirmation failed, allowing cleanup: project_id={}, user_id={}, error={}",
                         project_id, user_id, e
                     );
                 }
@@ -184,7 +190,7 @@ impl AgentScanner {
 
         if age.num_seconds() < self.config.container_protection_duration.as_secs() as i64 {
             info!(
-                "🛡️ [scanner] 容器在保护期内，跳过清理: project_id={}, 创建时长={}秒",
+                "🛡️ [scanner] Container in protection period, skipping cleanup: project_id={}, age={}s",
                 project_id,
                 age.num_seconds()
             );

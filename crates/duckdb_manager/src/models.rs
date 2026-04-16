@@ -104,11 +104,7 @@ pub struct ProjectRecord {
 
 impl ProjectRecord {
     /// 创建新的项目记录
-    pub fn new(
-        project_id: String,
-        service_type: ServiceType,
-        container_id: String,
-    ) -> Self {
+    pub fn new(project_id: String, service_type: ServiceType, container_id: String) -> Self {
         let now = Utc::now();
         Self {
             project_id,
@@ -159,9 +155,7 @@ impl ProjectRecord {
     /// - ComputerAgentRunner 模式：返回 user_id（如果存在）
     pub fn container_key(&self) -> &str {
         match self.service_type {
-            ServiceType::ComputerAgentRunner => {
-                self.user_id.as_deref().unwrap_or(&self.project_id)
-            }
+            ServiceType::ComputerAgentRunner => self.user_id.as_deref().unwrap_or(&self.project_id),
             ServiceType::RCoder => &self.project_id,
         }
     }

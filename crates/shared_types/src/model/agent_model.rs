@@ -12,8 +12,8 @@ use tracing::{info, warn};
 
 use super::{ModelProviderConfig, ModelProviderSafeInfo};
 // SACP 类型导入（替代 agent_client_protocol）
-use sacp::schema::{CancelNotification, PromptRequest, SessionId};
 use chrono::{DateTime, Utc};
+use sacp::schema::{CancelNotification, PromptRequest, SessionId};
 use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;
 
@@ -320,7 +320,10 @@ impl AgentLifecycleGuard {
         // 3. 强制清理资源
         self.force_cleanup().await?;
 
-        info!("[Claude] agent优雅停止完成: {}", self.inner.project_id);
+        info!(
+            "[Claude] agentgracefulstoppedcompleted: {}",
+            self.inner.project_id
+        );
 
         Ok(())
     }
@@ -341,7 +344,7 @@ impl AgentLifecycleGuard {
                 if let Some(mut child) = child_process.lock().await.take()
                     && let Err(e) = child.kill().await
                 {
-                    warn!("终止Claude子进程失败: {}", e);
+                    warn!("Claude child process failed: {}", e);
                 }
             }
         }
@@ -400,13 +403,14 @@ impl Drop for AgentLifecycleGuard {
                 AgentResources::Claude { child_process, .. } => {
                     if let Ok(mut child_guard) = child_process.try_lock()
                         && let Some(mut child) = child_guard.take()
-                        && let Err(e) = child.start_kill() {
-                            tracing::warn!(
-                                "⚠️ [AGENT] start_kill 失败: project_id={}, error={}",
-                                self.inner.project_id,
-                                e
-                            );
-                        }
+                        && let Err(e) = child.start_kill()
+                    {
+                        tracing::warn!(
+                            "⚠️ [AGENT] start_kill 失败: project_id={}, error={}",
+                            self.inner.project_id,
+                            e
+                        );
+                    }
                 }
             }
 

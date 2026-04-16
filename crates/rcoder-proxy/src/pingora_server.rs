@@ -29,10 +29,7 @@ impl PingoraServerManager {
     /// 创建新的 Pingora 服务器管理器
     pub fn new(config: ProxyConfig) -> Self {
         let service = Arc::new(PingoraProxyService::new(config.clone()));
-        Self {
-            config,
-            service,
-        }
+        Self { config, service }
     }
 
     /// 设置共享的 API 密钥管理器
@@ -79,9 +76,9 @@ impl PingoraServerManager {
     /// 当 `shutdown_rx` 收到信号（或 sender 被 drop）时，`start()` 返回。
     /// Pingora 服务器线程运行 `run_forever()`，由进程退出时 OS 清理。
     pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
-        info!("🚀 启动 Pingora 反向代理服务器...");
-        info!("📡 监听地址: 0.0.0.0:{}", self.config.listen_port);
-        info!("🔄 路由规则: /proxy/{{port}}{{/path}}");
+        info!("starting Pingora proxy server...");
+        info!("📡 listening on: 0.0.0.0:{}", self.config.listen_port);
+        info!("route: /proxy/{{port}}{{/path}}");
 
         // 创建 Pingora 服务器配置
         let opt = Opt::default();
@@ -92,7 +89,7 @@ impl PingoraServerManager {
 
         // 创建代理服务实例
         let proxy_service = self.service.create_pingora_proxy().map_err(|e| {
-            error!("❌ [PINGORA] 创建代理服务实例失败: {}", e);
+            error!("[PINGORA] create proxy failed: {}", e);
             e
         })?;
         let proxy_service = Arc::new(proxy_service);
@@ -112,16 +109,16 @@ impl PingoraServerManager {
 
         // 在独立线程中运行服务器（使用 std::thread 而不是 spawn_blocking）
         // spawn_blocking 在某些环境下可能有调度延迟问题
-        info!("🔧 正在创建 Pingora 服务器线程...");
+        info!("🔧 created Pingora proxy service...");
         let server_thread = std::thread::spawn(move || {
-            info!("🎯 Pingora 服务器开始运行...");
+            info!("🎯 Pingora proxy starting...");
             my_server.run_forever();
         });
-        info!("✅ Pingora 服务器线程已创建");
+        info!("Pingora server already created");
 
         // 等待外部关闭信号（sender 被 drop 或显式发送信号都会触发）
         let _ = shutdown_rx.await;
-        info!("📴 收到关闭信号，Pingora 服务器线程将在进程退出时由 OS 清理");
+        info!("📴 shutdown signal received, Pingora proxy cleanup by OS");
 
         // 不再 join 线程 — run_forever() 永不返回，join() 会导致永久阻塞
         // detach 线程，让进程退出时自动清理

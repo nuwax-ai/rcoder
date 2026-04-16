@@ -38,11 +38,11 @@ impl AgentStatusChecker {
         {
             Ok(Ok(is_active)) => Ok(is_active),
             Ok(Err(e)) => {
-                debug!("⚠️ [status_checker] gRPC 查询失败: {}", e);
-                Ok(false) // 查询失败，允许清理
+                debug!("⚠️ [status_checker] gRPC Query failed: {}", e);
+                Ok(false) // Query failed，允许清理
             }
             Err(_) => {
-                debug!("⏰ [status_checker] gRPC 查询超时");
+                debug!("⏰ [status_checker] gRPC timeout");
                 Ok(false) // 超时，允许清理
             }
         }
@@ -65,7 +65,7 @@ impl AgentStatusChecker {
         let status = response.into_inner();
 
         debug!(
-            "📊 [status_checker] 容器状态: is_active={}, active_tasks={}",
+            "📊 [status_checker] Container status: is_active={}, active_tasks={}",
             status.is_active, status.active_tasks
         );
 

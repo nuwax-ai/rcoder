@@ -26,15 +26,13 @@ impl fmt::Display for ApiKeyAuthError {
 impl std::error::Error for ApiKeyAuthError {}
 
 /// API Key 鉴权配置
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct ApiKeyAuthConfig {
     /// 是否启用 API Key 鉴权
     pub enabled: bool,
     /// API Key 值
     pub api_key: String,
 }
-
 
 /// API Key 验证器
 pub struct ApiKeyValidator;

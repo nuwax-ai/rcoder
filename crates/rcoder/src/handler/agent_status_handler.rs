@@ -1,7 +1,9 @@
-use axum::extract::{Path, State};
+use axum::extract::State;
+use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+use super::utils::{I18nPath, get_locale_from_headers};
 use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 
 /// 查询Agent状态
@@ -63,7 +65,7 @@ use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
         (
             status = 401,
             description = "API Key 鉴权失败",
-            body = String
+            body = HttpResult<String>
         )
     ),
     tag = "agent",
@@ -74,19 +76,21 @@ use crate::{AgentStatusResponse, AppError, HttpResult, router::AppState};
 #[instrument(skip(state))]
 pub async fn agent_status(
     State(state): State<Arc<AppState>>,
-    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    I18nPath(project_id): I18nPath<String>,
 ) -> Result<HttpResult<AgentStatusResponse>, AppError> {
+    let locale = get_locale_from_headers(&headers);
     let project_id = project_id.trim();
 
     if project_id.is_empty() {
-        return Ok(HttpResult::error(
-            "INVALID_PARAMS",
-            "project_id cannot be empty",
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_INVALID_PARAMS,
+            locale,
         ));
     }
 
     info!(
-        "📊 [AGENT_STATUS] 收到查询Agent状态请求: project_id={}",
+        "📊 [AGENT_STATUS] Received agent status query: project_id={}",
         project_id
     );
 
@@ -106,7 +110,7 @@ pub async fn agent_status(
         };
 
         info!(
-            "✅ [AGENT_STATUS] 成功获取Agent状态: project_id={}, status={:?}",
+            "✅ [AGENT_STATUS] Successfully retrieved Agent status: project_id={}, status={:?}",
             project_id,
             agent_info.status()
         );
@@ -114,7 +118,7 @@ pub async fn agent_status(
         Ok(HttpResult::success(response))
     } else {
         info!(
-            "📭 [AGENT_STATUS] Agent服务不存在: project_id={}",
+            "📭 [AGENT_STATUS] Agent service not found: project_id={}",
             project_id
         );
 

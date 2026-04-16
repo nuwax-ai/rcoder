@@ -4,14 +4,20 @@
 //!
 //! ⚠️ 警告：这些接口仅用于开发和调试，生产环境应禁用或添加权限控制
 
-use axum::{Json, extract::State};
+use axum::{Json, extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 use utoipa::ToSchema;
 
 use crate::router::AppState;
-use shared_types::HttpResult;
+use shared_types::{
+    HttpResult,
+    error_codes::{ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS},
+    get_i18n_message,
+};
+
+use super::utils::get_locale_from_headers;
 
 /// DuckDB 查询请求
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
@@ -101,17 +107,23 @@ pub struct DebugStorageStatsResponse {
 #[axum::debug_handler]
 pub async fn debug_sql_query(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<DebugSqlQueryRequest>,
 ) -> HttpResult<DebugSqlQueryResponse> {
+    let locale = get_locale_from_headers(&headers);
     let start_time = std::time::Instant::now();
 
-    debug!("🔍 [DEBUG_SQL] 执行查询: {}", request.sql);
+    debug!("[DEBUG_SQL] executing: {}", request.sql);
 
-    // 安全检查：只允许 SELECT 查询
+    // 安全检查：Only SELECT queries are allowed
     let sql_trimmed = request.sql.trim().to_uppercase();
     if !sql_trimmed.starts_with("SELECT") {
-        warn!("❌ [DEBUG_SQL] 拒绝非 SELECT 查询: {}", request.sql);
-        return HttpResult::error("INVALID_QUERY", "只允许 SELECT 查询");
+        warn!("[DEBUG_SQL] non-SELECT query: {}", request.sql);
+        return HttpResult::error_with_message(
+            ERR_INVALID_PARAMS,
+            locale,
+            &get_i18n_message("error.select_only", locale),
+        );
     }
 
     // 执行查询
@@ -121,7 +133,7 @@ pub async fn debug_sql_query(
             let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
             debug!(
-                "✅ [DEBUG_SQL] 查询成功: {} 行, {} ms",
+                "✅ [DEBUG_SQL] Query succeeded: {} rows, {} ms",
                 row_count, execution_time_ms
             );
 
@@ -133,8 +145,16 @@ pub async fn debug_sql_query(
             })
         }
         Err(e) => {
-            error!("❌ [DEBUG_SQL] 查询失败: {}", e);
-            HttpResult::error("QUERY_ERROR", &format!("查询执行失败: {}", e))
+            error!("[DEBUG_SQL] Query failed: {}", e);
+            HttpResult::error_with_message(
+                ERR_INTERNAL_SERVER_ERROR,
+                locale,
+                &format!(
+                    "{}: {}",
+                    get_i18n_message("error.query_execution_failed", locale),
+                    e
+                ),
+            )
         }
     }
 }
@@ -157,6 +177,7 @@ pub async fn debug_sql_query(
 #[axum::debug_handler]
 pub async fn debug_storage_stats(
     State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
 ) -> HttpResult<DebugStorageStatsResponse> {
     let stats = state.projects.get_stats();
 
@@ -191,7 +212,9 @@ pub async fn debug_storage_stats(
 #[axum::debug_handler]
 pub async fn debug_list_projects(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> HttpResult<DebugSqlQueryResponse> {
+    let locale = get_locale_from_headers(&headers);
     let start_time = std::time::Instant::now();
     let sql = "SELECT project_id, session_id, service_type, container_id, user_id, agent_status_name, created_at, last_activity FROM projects ORDER BY last_activity DESC";
 
@@ -202,7 +225,15 @@ pub async fn debug_list_projects(
             rows,
             execution_time_ms: start_time.elapsed().as_millis() as u64,
         }),
-        Err(e) => HttpResult::error("QUERY_ERROR", &format!("查询失败: {}", e)),
+        Err(e) => HttpResult::error_with_message(
+            ERR_INTERNAL_SERVER_ERROR,
+            locale,
+            &format!(
+                "{}: {}",
+                get_i18n_message("error.query_execution_failed", locale),
+                e
+            ),
+        ),
     }
 }
 
@@ -224,7 +255,9 @@ pub async fn debug_list_projects(
 #[axum::debug_handler]
 pub async fn debug_list_containers(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> HttpResult<DebugSqlQueryResponse> {
+    let locale = get_locale_from_headers(&headers);
     let start_time = std::time::Instant::now();
     let sql = "SELECT container_id, container_name, container_ip, service_type, status, created_at, last_activity FROM containers ORDER BY last_activity DESC";
 
@@ -235,7 +268,15 @@ pub async fn debug_list_containers(
             rows,
             execution_time_ms: start_time.elapsed().as_millis() as u64,
         }),
-        Err(e) => HttpResult::error("QUERY_ERROR", &format!("查询失败: {}", e)),
+        Err(e) => HttpResult::error_with_message(
+            ERR_INTERNAL_SERVER_ERROR,
+            locale,
+            &format!(
+                "{}: {}",
+                get_i18n_message("error.query_execution_failed", locale),
+                e
+            ),
+        ),
     }
 }
 

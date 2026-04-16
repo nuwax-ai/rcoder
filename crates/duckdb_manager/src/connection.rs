@@ -68,14 +68,14 @@ impl DuckDbConnection {
 
         // 开始事务
         conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| DuckDbError::TransactionError(format!("开始事务失败: {}", e)))?;
+            .map_err(|e| DuckDbError::TransactionError(format!("failed to begin transaction: {}", e)))?;
 
         // 执行操作
         match f(&conn) {
             Ok(result) => {
                 // 提交事务
                 conn.execute("COMMIT", [])
-                    .map_err(|e| DuckDbError::TransactionError(format!("提交事务失败: {}", e)))?;
+                    .map_err(|e| DuckDbError::TransactionError(format!("failed to commit transaction: {}", e)))?;
                 Ok(result)
             }
             Err(e) => {
@@ -85,7 +85,6 @@ impl DuckDbConnection {
             }
         }
     }
-
 }
 
 impl std::fmt::Debug for DuckDbConnection {
@@ -124,21 +123,25 @@ mod tests {
         conn.with_connection(|c| {
             c.execute("CREATE TABLE test (id INTEGER)", [])?;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // 使用事务插入数据
         conn.transaction(|c| {
             c.execute("INSERT INTO test VALUES (1)", [])?;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // 验证数据存在
-        let count: i32 = conn.with_connection(|c| {
-            let mut stmt = c.prepare("SELECT COUNT(*) FROM test")?;
-            let mut rows = stmt.query([])?;
-            let row = rows.next()?.unwrap();
-            Ok(row.get(0)?)
-        }).unwrap();
+        let count: i32 = conn
+            .with_connection(|c| {
+                let mut stmt = c.prepare("SELECT COUNT(*) FROM test")?;
+                let mut rows = stmt.query([])?;
+                let row = rows.next()?.unwrap();
+                Ok(row.get(0)?)
+            })
+            .unwrap();
 
         assert_eq!(count, 1);
     }
@@ -151,7 +154,8 @@ mod tests {
         conn.with_connection(|c| {
             c.execute("CREATE TABLE test (id INTEGER)", [])?;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // 使用事务插入数据，但返回错误触发回滚
         let result: DuckDbResult<()> = conn.transaction(|c| {
@@ -162,14 +166,15 @@ mod tests {
         assert!(result.is_err());
 
         // 验证数据不存在（已回滚）
-        let count: i32 = conn.with_connection(|c| {
-            let mut stmt = c.prepare("SELECT COUNT(*) FROM test")?;
-            let mut rows = stmt.query([])?;
-            let row = rows.next()?.unwrap();
-            Ok(row.get(0)?)
-        }).unwrap();
+        let count: i32 = conn
+            .with_connection(|c| {
+                let mut stmt = c.prepare("SELECT COUNT(*) FROM test")?;
+                let mut rows = stmt.query([])?;
+                let row = rows.next()?.unwrap();
+                Ok(row.get(0)?)
+            })
+            .unwrap();
 
         assert_eq!(count, 0);
     }
 }
-

@@ -30,43 +30,43 @@ pub use path::{
     HostPathResolver, get_host_path_resolver, normalize_path, resolve_container_path_to_host,
 };
 
-/// Docker 管理器错误类型
+/// Docker manager error type
 #[derive(Error, Debug)]
 pub enum DockerError {
-    #[error("Docker 连接失败: {0}")]
+    #[error("docker connection failed: {0}")]
     ConnectionError(String),
 
-    #[error("容器创建失败: {0}")]
+    #[error("container creation failed: {0}")]
     ContainerCreationError(String),
 
-    #[error("容器启动失败: {0}")]
+    #[error("container start failed: {0}")]
     ContainerStartError(String),
 
-    #[error("容器停止失败: {0}")]
+    #[error("container stop failed: {0}")]
     ContainerStopError(String),
 
-    #[error("容器删除失败: {0}")]
+    #[error("container removal failed: {0}")]
     ContainerRemoveError(String),
 
-    #[error("镜像拉取失败: {0}")]
+    #[error("image pull failed: {0}")]
     ImagePullError(String),
 
-    #[error("配置错误: {0}")]
+    #[error("configuration error: {0}")]
     ConfigurationError(String),
 
-    #[error("IO 错误: {0}")]
+    #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
-    #[error("序列化错误: {0}")]
+    #[error("serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 
-    #[error("时间戳解析失败: {0}")]
+    #[error("timestamp parsing failed: {0}")]
     InvalidTimestamp(String),
 
-    #[error("Docker API 调用超时: {0}")]
+    #[error("docker API call timeout: {0}")]
     Timeout(String),
 
-    #[error("Bollard Docker 错误: {0}")]
+    #[error("bollard docker error: {0}")]
     BollardError(#[from] bollard::errors::Error),
 }
 
@@ -181,11 +181,11 @@ pub mod global {
         GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
             DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "全局 DockerManager 已经初始化",
+                "global DockerManager already initialized",
             ))
         })?;
 
-        info!("✅ 全局 DockerManager 初始化成功");
+        info!("DockerManager initialized");
         Ok(())
     }
 
@@ -198,11 +198,11 @@ pub mod global {
         GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
             DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "全局 DockerManager 已经初始化",
+                "global DockerManager already initialized",
             ))
         })?;
 
-        info!("✅ 全局 DockerManager 初始化成功（自定义配置）");
+        info!("DockerManager initialized with config");
         Ok(())
     }
 
@@ -210,14 +210,14 @@ pub mod global {
     /// 如果未初始化，会自动初始化
     pub async fn get_global_docker_manager() -> DockerResult<Arc<DockerManager>> {
         if GLOBAL_DOCKER_MANAGER.get().is_none() {
-            debug!("全局 DockerManager 未初始化，开始自动初始化");
+            debug!("DockerManager not initialized, starting initialize");
             init_global_docker_manager().await?;
         }
 
         GLOBAL_DOCKER_MANAGER.get().cloned().ok_or_else(|| {
             DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "无法获取全局 DockerManager",
+                "unable to get global DockerManager",
             ))
         })
     }

@@ -5,7 +5,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
 };
 use chrono::Utc;
@@ -19,7 +19,13 @@ use tracing::{error, info, warn};
 
 use crate::http_server::router::AppState;
 use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
-use shared_types::{AgentStatus, HttpResult, SessionMessageType, UnifiedSessionMessage};
+use shared_types::{
+    AgentStatus, HttpResult, SessionMessageType, UnifiedSessionMessage,
+    error_codes::{ERR_INTERNAL_SERVER_ERROR, ERR_SESSION_NOT_FOUND},
+    get_i18n_message,
+};
+
+use super::locale_from_headers;
 
 /// 统一的 SSE 流类型
 type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
@@ -96,7 +102,7 @@ fn create_heartbeat_stream(
             let json_str = match serde_json::to_string(&heartbeat_msg) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("❌ [HTTP] 心跳消息序列化失败: {}", e);
+                    error!("[HTTP] Failed to serialize heartbeat message: {}", e);
                     continue;
                 }
             };
@@ -131,17 +137,19 @@ fn create_heartbeat_stream(
 )]
 pub async fn handle_computer_progress(
     State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Sse<SseStream>, (StatusCode, Json<HttpResult<String>>)> {
+    let locale = locale_from_headers(&headers);
     info!(
-        "📡 [HTTP] Computer Agent 进度流订阅: session_id={}",
+        "📡 [HTTP] Computer Agent progress stream subscribed: session_id={}",
         session_id
     );
 
     // 0. 检查 Agent 状态（必须在 SESSION_CACHE 查找之前检查）
     if is_agent_idle(&session_id).await {
         info!(
-            "💤 [HTTP] Agent 处于 idle 状态，发送 SessionPromptEnd 并关闭: session_id={}",
+            "💤 [HTTP] Agent is idle, sending SessionPromptEnd and closing: session_id={}",
             session_id
         );
         let end_event = create_idle_end_event(&session_id);
@@ -156,12 +164,17 @@ pub async fn handle_computer_progress(
     let session_data = match SESSION_CACHE.get(&session_id) {
         Some(data) => data.value().clone(),
         None => {
-            warn!("⚠️  [HTTP] Session 不存在: session_id={}", session_id);
+            warn!(" [HTTP] Session not found: session_id={}", session_id);
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(HttpResult::error(
-                    "SESSION_NOT_FOUND",
-                    &format!("Session {} not found", session_id),
+                Json(HttpResult::error_with_message(
+                    ERR_SESSION_NOT_FOUND,
+                    locale,
+                    &format!(
+                        "{}: {}",
+                        get_i18n_message("error.session_not_found", locale),
+                        session_id
+                    ),
                 )),
             ));
         }
@@ -172,14 +185,19 @@ pub async fn handle_computer_progress(
         Ok(conn) => conn,
         Err(e) => {
             error!(
-                "❌ [HTTP] 创建 session 连接失败: session_id={}, error={}",
+                "❌ [HTTP] Failed to create session connection: session_id={}, error={}",
                 session_id, e
             );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HttpResult::error(
-                    "INTERNAL_ERROR",
-                    &format!("Failed to create session connection: {}", e),
+                Json(HttpResult::error_with_message(
+                    ERR_INTERNAL_SERVER_ERROR,
+                    locale,
+                    &format!(
+                        "{}: {}",
+                        get_i18n_message("error.internal_server_error", locale),
+                        e
+                    ),
                 )),
             ));
         }
@@ -192,7 +210,7 @@ pub async fn handle_computer_progress(
         let json_str = match serde_json::to_string(&msg) {
             Ok(s) => s,
             Err(e) => {
-                error!("❌ [HTTP] 消息序列化失败: {}", e);
+                error!("[HTTP] Failed to serialize message: {}", e);
                 return Ok(Event::default().data("{}"));
             }
         };
@@ -208,7 +226,7 @@ pub async fn handle_computer_progress(
     // 使用 select! 合并，保持事件顺序
     let merged_stream = futures_util::stream::select(message_stream, heartbeat_stream);
 
-    info!("✅ [HTTP] SSE 流已建立: session_id={}", session_id);
+    info!("[HTTP] SSE stream established: session_id={}", session_id);
 
     let stream: SseStream = Box::pin(merged_stream);
     Ok(Sse::new(stream))

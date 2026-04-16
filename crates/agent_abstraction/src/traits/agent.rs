@@ -2,7 +2,7 @@
 
 // SACP type imports
 use sacp::schema::McpServer;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Agent startup configuration
 ///
@@ -145,6 +145,16 @@ impl AgentStartConfig {
                 "systemPrompt".to_string(),
                 serde_json::Value::Object(system_prompt_obj),
             );
+            info!(
+                "[ACP] Sending system_prompt to agent: length={}",
+                system_prompt.len()
+            );
+            debug!(
+                "[ACP] system_prompt content (first 200 chars): \"{}\"",
+                &system_prompt[..system_prompt.len().min(200)]
+            );
+        } else {
+            info!("[ACP] No system_prompt to send to agent");
         }
 
         // Build claudeCode.options structure
@@ -159,9 +169,7 @@ impl AgentStartConfig {
         // Only load project-level settings (skills), block global settings
         options.insert(
             "settingSources".to_string(),
-            serde_json::Value::Array(vec![
-                serde_json::Value::String("project".to_string()),
-            ]),
+            serde_json::Value::Array(vec![serde_json::Value::String("project".to_string())]),
         );
 
         // Add resume session_id if present
@@ -224,15 +232,21 @@ impl AgentStartConfig {
                 "systemPrompt".to_string(),
                 serde_json::Value::Object(system_prompt_obj),
             );
+            info!(
+                "[ACP] Sending system_prompt to agent (no resume): length={}",
+                system_prompt.len()
+            );
+            debug!(
+                "[ACP] system_prompt content (first 200 chars): \"{}\"",
+                &system_prompt[..system_prompt.len().min(200)]
+            );
         }
 
         // Only load project-level settings (consistent with build_meta)
         let mut options = serde_json::Map::new();
         options.insert(
             "settingSources".to_string(),
-            serde_json::Value::Array(vec![
-                serde_json::Value::String("project".to_string()),
-            ]),
+            serde_json::Value::Array(vec![serde_json::Value::String("project".to_string())]),
         );
 
         let mut claude_code = serde_json::Map::new();

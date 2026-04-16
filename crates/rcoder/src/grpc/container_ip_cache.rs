@@ -27,41 +27,44 @@ impl ContainerIpCache {
     /// # 参数
     /// * `ttl_seconds` - 缓存过期时间（秒）
     pub fn new(ttl_seconds: u64) -> Self {
-        info!("🗄️ [IP_CACHE] 初始化容器 IP 缓存: TTL={}秒 (使用 moka 无锁缓存)", ttl_seconds);
-        
+        info!(
+            "🗄️ [IP_CACHE] Initializing container IP cache: TTL={} seconds (using moka lock-free cache)",
+            ttl_seconds
+        );
+
         let cache = Cache::builder()
             // 设置 TTL
             .time_to_live(Duration::from_secs(ttl_seconds))
             // 最大容量（可按需调整）
             .max_capacity(1000)
             .build();
-        
+
         Self { cache }
     }
 
     /// 获取缓存的 IP（如果未过期）
     pub fn get(&self, container_name: &str) -> Option<String> {
         let result = self.cache.get(container_name);
-        
+
         if let Some(ref ip) = result {
             debug!(
-                "✅ [IP_CACHE] 缓存命中: container_name={}, ip={}",
+                "✅ [IP_CACHE] Cache hit: container_name={}, ip={}",
                 container_name, ip
             );
         } else {
             debug!(
-                "❌ [IP_CACHE] 缓存未命中: container_name={}",
+                "❌ [IP_CACHE] Cache miss: container_name={}",
                 container_name
             );
         }
-        
+
         result
     }
 
     /// 缓存 IP
     pub fn insert(&self, container_name: String, ip: String) {
         debug!(
-            "📝 [IP_CACHE] 写入缓存: container_name={}, ip={}",
+            "📝 [IP_CACHE] Cache write: container_name={}, ip={}",
             container_name, ip
         );
         self.cache.insert(container_name, ip);
@@ -74,7 +77,7 @@ impl ContainerIpCache {
         // moka 的 invalidate 方法无需检查是否存在
         self.cache.invalidate(container_name);
         info!(
-            "🗑️ [IP_CACHE] 缓存已失效: container_name={}",
+            "🗑️ [IP_CACHE] Cache invalidated: container_name={}",
             container_name
         );
     }
@@ -91,9 +94,9 @@ mod tests {
     #[test]
     fn test_cache_insert_and_get() {
         let cache = ContainerIpCache::new(10);
-        
+
         cache.insert("container-1".to_string(), "192.168.1.1".to_string());
-        
+
         let result = cache.get("container-1");
         assert_eq!(result, Some("192.168.1.1".to_string()));
     }
@@ -101,7 +104,7 @@ mod tests {
     #[test]
     fn test_cache_miss() {
         let cache = ContainerIpCache::new(10);
-        
+
         let result = cache.get("non-existent");
         assert_eq!(result, None);
     }
@@ -109,10 +112,10 @@ mod tests {
     #[test]
     fn test_cache_invalidate() {
         let cache = ContainerIpCache::new(10);
-        
+
         cache.insert("container-1".to_string(), "192.168.1.1".to_string());
         cache.invalidate("container-1");
-        
+
         let result = cache.get("container-1");
         assert_eq!(result, None);
     }
@@ -121,15 +124,15 @@ mod tests {
     fn test_cache_ttl_expiration() {
         // 使用 1 秒 TTL 测试过期
         let cache = ContainerIpCache::new(1);
-        
+
         cache.insert("container-1".to_string(), "192.168.1.1".to_string());
-        
+
         // 立即获取应该命中
         assert!(cache.get("container-1").is_some());
-        
+
         // 等待超过 TTL
         sleep(Duration::from_millis(1500));
-        
+
         // 过期后应该返回 None
         assert!(cache.get("container-1").is_none());
     }

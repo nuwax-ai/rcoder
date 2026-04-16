@@ -6,7 +6,8 @@
 # 平时不需要重新构建，只有在修改系统依赖时才需要重新构建
 # ============================================================================
 
-FROM debian:12
+ARG DOCKER_MIRROR
+FROM ${DOCKER_MIRROR}debian:12
 
 # Base image with desktop environment and applications
 # Environment variables:
@@ -168,34 +169,60 @@ RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
     cd /opt/noVNC && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
     git clone --depth 1 -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
-# Install LibreOffice from official website
+
+# ============================================================================
+# Install LibreOffice
+# ============================================================================
+# Installation logic:
+#   1. If local tar.gz exists in downloads/ (pre-downloaded via Makefile) -> use it
+#   2. Otherwise -> download from official URL (fallback)
+#
+# This allows:
+#   - Fast build with pre-downloaded files (avoid slow external download)
+#   - Fallback to online download if local file is missing
+# ============================================================================
+ARG LIBREOFFICE_FILE
 ARG TARGETARCH
-RUN case "$TARGETARCH" in \
-    "amd64") LO_ARCH="x86_64" ;; \
-    "arm64") LO_ARCH="aarch64" ;; \
-    *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
+
+# Determine URL based on architecture
+RUN echo "Installing LibreOffice..." && \
+    case "${TARGETARCH}" in \
+    "amd64") \
+        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/x86_64/${LIBREOFFICE_FILE}" \
+        ;; \
+    "arm64") \
+        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/aarch64/${LIBREOFFICE_FILE}" \
+        ;; \
+    *) echo "❌ Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
-    case "$TARGETARCH" in \
-    "amd64") LO_ARCH2="x86-64" ;; \
-    "arm64") LO_ARCH2="aarch64" ;; \
-    *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
-    esac && \
-    wget -O /tmp/libreoffice.tar.gz "https://download.documentfoundation.org/libreoffice/stable/25.8.4/deb/${LO_ARCH}/LibreOffice_25.8.4_Linux_${LO_ARCH2}_deb.tar.gz" && \
+    # Check if local pre-downloaded file exists
+    if [ -f "downloads/${LIBREOFFICE_FILE}" ]; then \
+        echo "📦 Using pre-downloaded file: downloads/${LIBREOFFICE_FILE}"; \
+        cp downloads/${LIBREOFFICE_FILE} /tmp/libreoffice.tar.gz; \
+    else \
+        echo "🌐 No local file found, downloading from official URL..."; \
+        wget -q -O /tmp/libreoffice.tar.gz "${LIBREOFFICE_URL}" || { \
+            echo "❌ ERROR: Failed to download LibreOffice from ${LIBREOFFICE_URL}"; \
+            exit 1; \
+        }; \
+    fi && \
+    # Extract and install
     cd /tmp && \
     tar -xzf libreoffice.tar.gz && \
     cd LibreOffice_*/DEBS && \
     dpkg -i *.deb && \
     apt-get update && \
     apt-get install -f -y && \
-    # Create symlinks for LibreOffice executables (they are installed in /opt/libreofficeXX.X/program/)
+    # Create symlinks for LibreOffice executables
     LIBREOFFICE_BIN=$(find /opt -name "soffice" -path "*/program/*" 2>/dev/null | head -1) && \
     if [ -n "$LIBREOFFICE_BIN" ]; then \
-    LIBREOFFICE_DIR=$(dirname "$LIBREOFFICE_BIN") && \
-    ln -sf "$LIBREOFFICE_BIN" /usr/bin/soffice && \
-    ln -sf "$LIBREOFFICE_DIR/libreoffice" /usr/bin/libreoffice 2>/dev/null || true && \
-    echo "✅ LibreOffice linked: $LIBREOFFICE_BIN -> /usr/bin/soffice"; \
+        LIBREOFFICE_DIR=$(dirname "$LIBREOFFICE_BIN") && \
+        ln -sf "$LIBREOFFICE_BIN" /usr/bin/soffice && \
+        ln -sf "$LIBREOFFICE_DIR/libreoffice" /usr/bin/libreoffice 2>/dev/null || true && \
+        echo "✅ LibreOffice installed: $LIBREOFFICE_BIN -> /usr/bin/soffice"; \
     else \
-    echo "⚠️ LibreOffice soffice binary not found in /opt"; \
+        echo "❌ ERROR: LibreOffice soffice binary not found in /opt"; \
+        exit 1; \
     fi && \
     # Clean up
     rm -rf /tmp/LibreOffice_* /tmp/libreoffice.tar.gz && \

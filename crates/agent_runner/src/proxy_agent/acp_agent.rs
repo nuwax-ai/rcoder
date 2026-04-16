@@ -128,7 +128,7 @@ pub type LocalSetAgentRequest = AgentRequest;
 pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>) -> Result<()> {
     use agent_abstraction::session::{AcpAgentWorker, AgentWorker, WorkerRequest};
 
-    info!("🚀 agent_worker 启动（SACP 版本），开始监听请求...");
+    info!("agent_worker started (SACP version), listening for requests...");
 
     // 创建 AcpSessionManager，注入 AGENT_REGISTRY 作为 SessionRegistry
     // SACP 版本只需要 2 个泛型参数：N (SessionNotifier) 和 R (SessionRegistry)
@@ -147,7 +147,7 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
         let request_id = request.prompt_message.request_id.clone();
 
         info!(
-            "📨 接收到请求，project_id: {}, request_id: {}",
+            "📨 Received request, project_id: {}, request_id: {}",
             project_id, request_id
         );
 
@@ -161,17 +161,24 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
             {
                 Ok(blocks) => Some(blocks),
                 Err(e) => {
-                    error!("❌ 附件处理失败: {:?}", e);
+                    error!("Attachment processing failed: {:?}", e);
 
                     if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                         project_id: project_id.clone(),
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                        error: Some(format!("附件处理失败: {:?}", e)),
+                        error: Some(format!(
+                            "{}: {:?}",
+                            shared_types::error_codes::get_i18n_message_default("error.attachment_processing_failed"),
+                            e
+                        )),
                         request_id: Some(request_id),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
-                        error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                        error!(
+                            "Failed to send error response (receiver closed): {:?}",
+                            send_err
+                        );
                     }
                     continue;
                 }
@@ -193,17 +200,24 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
         let worker_response = match worker.process_request(worker_request).await {
             Ok(response) => response,
             Err(e) => {
-                error!("❌ Worker 处理失败: {:?}", e);
+                error!("Worker processing failed: {:?}", e);
 
                 if let Err(send_err) = request.chat_prompt_tx.send(ChatPromptResponse {
                     project_id: project_id.clone(),
                     session_id: String::new(),
                     code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                    error: Some(format!("处理失败: {:?}", e)),
+                    error: Some(format!(
+                        "{}: {:?}",
+                        shared_types::error_codes::get_i18n_message_default("error.processing_failed"),
+                        e
+                    )),
                     request_id: Some(request_id.clone()),
                     service_type: request.prompt_message.service_type.clone(),
                 }) {
-                    error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                    error!(
+                        "Failed to send error response (receiver closed): {:?}",
+                        send_err
+                    );
                 }
                 continue;
             }
@@ -212,7 +226,7 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
         // 4. 更新全局状态（使用统一的 AGENT_REGISTRY）
         if worker_response.is_new_session {
             if let Some(handles) = &worker_response.session_handles {
-                debug!("🆕 新会话，注册到 AGENT_REGISTRY");
+                debug!("🆕 New session, registering in AGENT_REGISTRY");
 
                 let project_and_agent_info = ProjectAndAgentInfo {
                     project_id: project_id.clone(),
@@ -240,7 +254,7 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
                 );
             }
         } else {
-            debug!("♻️ 复用会话，无需更新全局 Registry");
+            debug!("♻️ Reusing session, no global Registry update needed");
         }
 
         // 5. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
@@ -261,11 +275,11 @@ pub async fn agent_worker(mut request_rx: mpsc::UnboundedReceiver<AgentRequest>)
         };
 
         if let Err(e) = request.chat_prompt_tx.send(chat_prompt_response) {
-            error!("❌ 发送回执失败: {:?}", e);
+            error!("Failed to send acknowledgment: {:?}", e);
         }
     }
 
-    info!("🛑 agent_worker 停止");
+    info!("🛑 agent_worker stopped");
     Ok(())
 }
 
@@ -286,7 +300,7 @@ pub async fn agent_worker_with_heartbeat(
     last_heartbeat_ts: Arc<std::sync::atomic::AtomicI64>,
     active_requests: Arc<tokio::sync::Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 ) -> Result<()> {
-    info!("🚀 agent_worker 启动（SACP 版本，带心跳支持），开始监听请求...");
+    info!("agent_worker started (SACP version with heartbeat), listening for requests...");
 
     use agent_abstraction::session::{AcpAgentWorker, AgentWorker, WorkerRequest};
     use tokio::time::{Duration, interval};
@@ -305,7 +319,7 @@ pub async fn agent_worker_with_heartbeat(
 
     // 设置状态为 Running（就绪信号）
     state.set(crate::agent_runtime::WorkerState::Running);
-    info!("✅ [Worker] SACP Worker 初始化完成，状态设置为 Running");
+    info!("[Worker] SACP Worker initialized, state set to Running");
 
     // 启动心跳任务 - 🔥 P1 修复: 使用原子操作直接更新 last_heartbeat_ts
     let last_heartbeat_ts_clone = last_heartbeat_ts.clone();
@@ -318,12 +332,15 @@ pub async fn agent_worker_with_heartbeat(
             // 📊 打印当前 Worker 占用情况
             if IS_UNLIMITED_MODE.load(Ordering::SeqCst) {
                 // 无限制模式（HTTP Server 部署）- 不显示具体数量，避免误解
-                info!("💓 [Worker] 心跳 - 活跃会话: (无限制)");
+                info!("💓 [Worker] Heartbeat - active sessions: (unlimited)");
             } else {
                 // 限制模式（Docker 容器部署）
                 let active = AGENT_REGISTRY.stats().agent_count;
                 let limit = get_concurrency_limit();
-                info!("💓 [Worker] 心跳 - 活跃会话: {}/{}", active, limit);
+                info!(
+                    "💓 [Worker] Heartbeat - active sessions: {}/{}",
+                    active, limit
+                );
             }
 
             // 🔥 P1 修复: 使用原子操作直接更新时间戳（无锁）
@@ -340,7 +357,7 @@ pub async fn agent_worker_with_heartbeat(
         let request_id = request.prompt_message.request_id.clone();
 
         info!(
-            "📨 接收到请求，project_id: {}, request_id: {} - SACP 并发处理",
+            "📨 Received request, project_id: {}, request_id: {} - SACP concurrent processing",
             project_id, request_id
         );
 
@@ -368,7 +385,7 @@ pub async fn agent_worker_with_heartbeat(
                 {
                     Ok(blocks) => Some(blocks),
                     Err(e) => {
-                        error!("❌ 附件处理失败: {:?}", e);
+                        error!("Attachment processing failed: {:?}", e);
 
                         // 🔥 DeferGuard 自动清理，无需手动调用 clear_pending_if_exists
 
@@ -376,11 +393,18 @@ pub async fn agent_worker_with_heartbeat(
                             project_id: project_id.clone(),
                             session_id: String::new(),
                             code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                            error: Some(format!("附件处理失败: {:?}", e)),
+                            error: Some(format!(
+                                "{}: {:?}",
+                                shared_types::error_codes::get_i18n_message_default("error.attachment_processing_failed"),
+                                e
+                            )),
                             request_id: Some(request_id.clone()),
                             service_type: request.prompt_message.service_type.clone(),
                         }) {
-                            error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                            error!(
+                                "Failed to send error response (receiver closed): {:?}",
+                                send_err
+                            );
                         }
                         return;
                     }
@@ -402,7 +426,7 @@ pub async fn agent_worker_with_heartbeat(
             let worker_response = match worker_clone.process_request(worker_request).await {
                 Ok(response) => response,
                 Err(e) => {
-                    error!("❌ Worker 处理失败: {:?}", e);
+                    error!("Worker processing failed: {:?}", e);
 
                     // 🔥 DeferGuard 自动清理，无需手动调用 clear_pending_if_exists
 
@@ -410,11 +434,18 @@ pub async fn agent_worker_with_heartbeat(
                         project_id: project_id.clone(),
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_AGENT_ERROR.to_string(),
-                        error: Some(format!("处理失败: {:?}", e)),
+                        error: Some(format!(
+                            "{}: {:?}",
+                            shared_types::error_codes::get_i18n_message_default("error.processing_failed"),
+                            e
+                        )),
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
-                        error!("❌ 发送错误响应失败（接收端已关闭）: {:?}", send_err);
+                        error!(
+                            "Failed to send error response (receiver closed): {:?}",
+                            send_err
+                        );
                     }
                     return;
                 }
@@ -453,13 +484,16 @@ pub async fn agent_worker_with_heartbeat(
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
                         error: Some(format!(
-                            "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试",
-                            limit
-                        )),
+                            "{}",
+                            shared_types::error_codes::get_i18n_message_default("error.system_busy")
+                        ).replace("{}", &limit.to_string())),
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {
-                        error!("❌ 发送拒绝响应失败（接收端已关闭）: {:?}", send_err);
+                        error!(
+                            "Failed to send reject response (receiver closed): {:?}",
+                            send_err
+                        );
                     }
                     return;
                 } else {
@@ -472,7 +506,7 @@ pub async fn agent_worker_with_heartbeat(
                 }
 
                 if let Some(ref handles) = session_handles {
-                    debug!("🆕 新会话，注册到 AGENT_REGISTRY");
+                    debug!("🆕 New session, registering in AGENT_REGISTRY");
 
                     let project_and_agent_info = ProjectAndAgentInfo {
                         project_id: project_id.clone(),
@@ -499,7 +533,7 @@ pub async fn agent_worker_with_heartbeat(
                     );
                 }
             } else {
-                debug!("♻️ 复用会话，无需获取新槽位（Agent 已占用槽位）");
+                debug!("♻️ Reusing session, no new slot needed (Agent already holds slot)");
             }
 
             // 6. 更新 SESSION_REQUEST_CONTEXT（请求追踪）
@@ -520,7 +554,7 @@ pub async fn agent_worker_with_heartbeat(
             };
 
             if let Err(e) = request.chat_prompt_tx.send(chat_prompt_response) {
-                error!("❌ 发送回执失败: {:?}", e);
+                error!("Failed to send acknowledgment: {:?}", e);
             } else {
                 info!(
                     "✅ 回执已发送，project_id: {}",
@@ -584,6 +618,6 @@ pub async fn agent_worker_with_heartbeat(
     // 清理心跳任务
     heartbeat_task.abort();
 
-    info!("🛑 agent_worker 停止");
+    info!("🛑 agent_worker stopped");
     Ok(())
 }

@@ -91,12 +91,12 @@ impl AgentInstaller for NpmInstaller {
             package_name.clone()
         };
 
-        info!("📦 使用 {} 全局安装: {}", npm_cmd, package_spec);
+        info!(" running {} : {}", npm_cmd, package_spec);
 
         // Run npm install -g
         // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
         let output = if package_name == "nuwaxcode" {
-            info!("🌐 nuwaxcode 使用官方源: https://registry.npmjs.org/");
+            info!("🌐 nuwaxcode using registry: https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
                 &[
@@ -124,14 +124,14 @@ impl AgentInstaller for NpmInstaller {
             // Try to get installed version
             let version = self.parse_installed_version(&stdout);
 
-            info!("✅ 安装成功: {}", package_spec);
+            info!("Package installed: {}", package_spec);
             Ok(InstallResult::success(
                 version,
                 format!("Successfully installed {}", package_spec),
             ))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("❌ 安装失败: {}", stderr);
+            warn!("Installation failed: {}", stderr);
             Err(InstallationError::InstallFailed {
                 package: package_spec,
                 reason: stderr.to_string(),
@@ -177,12 +177,12 @@ impl AgentInstaller for NpmInstaller {
             InstallationError::ConfigError("Package name is required".to_string())
         })?;
 
-        info!("🔄 更新全局包: {}", package_name);
+        info!("Updating global package: {}", package_name);
 
         // Run npm update -g
         // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
         let output = if package_name == "nuwaxcode" {
-            info!("🌐 nuwaxcode 使用官方源: https://registry.npmjs.org/");
+            info!("🌐 nuwaxcode using registry: https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
                 &[
@@ -202,14 +202,14 @@ impl AgentInstaller for NpmInstaller {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let version = self.parse_installed_version(&stdout);
 
-            info!("✅ 更新成功: {}", package_name);
+            info!("Update succeeded: {}", package_name);
             Ok(InstallResult::success(
                 version,
                 format!("Successfully updated {}", package_name),
             ))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("❌ 更新失败: {}", stderr);
+            warn!("Update failed: {}", stderr);
             Err(InstallationError::InstallFailed {
                 package: package_name.clone(),
                 reason: stderr.to_string(),

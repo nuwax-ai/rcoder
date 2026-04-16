@@ -3,7 +3,7 @@
 //! 从 container_manager.rs 迁移的网络检测逻辑
 
 use crate::{DockerError, DockerResult, RCODER_NETWORK_BASE_NAME};
-use bollard::{query_parameters::InspectContainerOptions, Docker};
+use bollard::{Docker, query_parameters::InspectContainerOptions};
 use tracing::{debug, info, warn};
 
 /// 网络检测器
@@ -27,11 +27,11 @@ impl<'a> NetworkDetector<'a> {
         // 从 HOSTNAME 环境变量获取容器ID
         let hostname = std::env::var("HOSTNAME").map_err(|_| {
             DockerError::ConnectionError(
-                "无法获取 HOSTNAME 环境变量。请确保代码运行在 Docker 容器中。".to_string(),
+                "unable to get HOSTNAME environment variable. Please ensure code is running in Docker container.".to_string(),
             )
         })?;
 
-        debug!("检测到容器 hostname: {}", hostname);
+        debug!("Detecting container hostname: {}", hostname);
 
         // Inspect 当前容器
         let inspect = self
@@ -40,34 +40,35 @@ impl<'a> NetworkDetector<'a> {
             .await
             .map_err(|e| {
                 DockerError::ConnectionError(format!(
-                    "无法获取当前容器信息 (hostname: {}): {}",
+                    "unable to get current container info (hostname: {}): {}",
                     hostname, e
                 ))
             })?;
 
         // 获取网络配置
         if let Some(network_settings) = inspect.network_settings
-            && let Some(networks) = network_settings.networks {
-                // 查找包含 "agent-network" 的网络
-                for network_name in networks.keys() {
-                    if network_name.contains(RCODER_NETWORK_BASE_NAME) {
-                        info!("✅ 动态检测到主网络: {}", network_name);
-                        return Ok(network_name.clone());
-                    }
+            && let Some(networks) = network_settings.networks
+        {
+            // 查找包含 "agent-network" 的网络
+            for network_name in networks.keys() {
+                if network_name.contains(RCODER_NETWORK_BASE_NAME) {
+                    info!(" detected network: {}", network_name);
+                    return Ok(network_name.clone());
                 }
-
-                // 如果没找到,返回错误
-                let available_networks: Vec<String> = networks.keys().cloned().collect();
-                return Err(DockerError::ConnectionError(format!(
-                    "当前容器未连接到包含 '{}' 的网络。\n\
-                     可用网络: {:?}\n\
-                     请检查 Docker Compose 配置中的网络设置。",
-                    RCODER_NETWORK_BASE_NAME, available_networks
-                )));
             }
 
+            // 如果没找到,返回错误
+            let available_networks: Vec<String> = networks.keys().cloned().collect();
+            return Err(DockerError::ConnectionError(format!(
+                "当前容器未连接到包含 '{}' 的网络。\n\
+                     可用网络: {:?}\n\
+                     请检查 Docker Compose 配置中的网络设置。",
+                RCODER_NETWORK_BASE_NAME, available_networks
+            )));
+        }
+
         Err(DockerError::ConnectionError(format!(
-            "当前容器 (hostname: {}) 没有网络配置信息",
+            "Current container (hostname: {}) has no network configuration information",
             hostname
         )))
     }
@@ -87,13 +88,16 @@ impl<'a> NetworkDetector<'a> {
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))?;
+            .map_err(|e| DockerError::ConnectionError(format!("failed to get container info: {}", e)))?;
 
         // 从 labels 中获取项目名称
         if let Some(labels) = inspect.config.and_then(|c| c.labels) {
             // Docker Compose 会添加 com.docker.compose.project 标签
             if let Some(project_name) = labels.get("com.docker.compose.project") {
-                info!("通过容器 labels 获取项目名称: {}", project_name);
+                info!(
+                    " container labels get project: {}",
+                    project_name
+                );
                 return Ok(Some(project_name.clone()));
             }
         }
@@ -116,14 +120,17 @@ impl<'a> NetworkDetector<'a> {
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("获取容器信息失败: {}", e)))?;
+            .map_err(|e| DockerError::ConnectionError(format!("failed to get container info: {}", e)))?;
 
         // 从容器名称推断项目名称
         if let Some(name) = inspect.name {
             // 容器名称格式: /{project_name}-{service_name}-{number}
             let clean_name = name.trim_start_matches('/');
             if let Some(project_name) = clean_name.split('-').next() {
-                info!("通过容器名称推断项目名称: {}", project_name);
+                info!(
+                    " container project: {}",
+                    project_name
+                );
                 return Ok(Some(project_name.to_string()));
             }
         }
@@ -149,7 +156,7 @@ impl<'a> NetworkDetector<'a> {
     ) -> DockerResult<Option<String>> {
         // 方法1: 环境变量
         if let Ok(project_name) = std::env::var("COMPOSE_PROJECT_NAME") {
-            info!("通过环境变量获取项目名称: {}", project_name);
+            info!(" got project: {}", project_name);
             return Ok(Some(project_name));
         }
 
@@ -166,7 +173,7 @@ impl<'a> NetworkDetector<'a> {
             return Ok(Some(project_name));
         }
 
-        warn!("无法获取 Docker Compose 项目名称");
+        warn!("Unable to get Docker Compose project");
         Ok(None)
     }
 }

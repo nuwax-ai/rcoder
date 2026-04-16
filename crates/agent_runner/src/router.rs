@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use axum::{Router, routing::get, response::IntoResponse};
-use dashmap::DashMap;
-use serde::Serialize;
 use crate::agent_runtime::AgentRuntime;
 use crate::{config::AppConfig, handler};
-use rcoder_telemetry::{TelemetryGuard, HttpMetricsLayer};
+use axum::{Router, response::IntoResponse, routing::get};
+use dashmap::DashMap;
+use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
+use serde::Serialize;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -83,12 +83,18 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
     match telemetry.render_metrics() {
         Some(metrics) => (
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             metrics,
         ),
         None => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             "Prometheus metrics not enabled".to_string(),
         ),
     }

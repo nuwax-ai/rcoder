@@ -187,7 +187,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
             RouteType::VncProxy,
         )
         .map_err(|e| {
-            tracing::error!("❌ [ROUTER] VNC 路由插入失败: {}", e);
+            tracing::error!("[ROUTER] VNC route config failed: {}", e);
             anyhow::anyhow!("VNC route configuration error: {}", e)
         })?;
 
@@ -210,7 +210,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
     router
         .insert("/proxy/{port}/{*path}", RouteType::PortProxy)
         .map_err(|e| {
-            tracing::error!("❌ [ROUTER] 端口代理路由插入失败: {}", e);
+            tracing::error!("[ROUTER] port proxy route config failed: {}", e);
             anyhow::anyhow!("Port proxy route configuration error: {}", e)
         })?;
 
@@ -230,7 +230,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
     router
         .insert("/health", RouteType::HealthCheck)
         .map_err(|e| {
-            tracing::error!("❌ [ROUTER] 健康检查路由插入失败: {}", e);
+            tracing::error!("[ROUTER] health check route config failed: {}", e);
             anyhow::anyhow!("Health check route configuration error: {}", e)
         })?;
 
@@ -259,7 +259,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
     router
         .insert("/api/{service_name}/{*path}", RouteType::ApiProxy)
         .map_err(|e| {
-            tracing::error!("❌ [ROUTER] API 代理路由插入失败: {}", e);
+            tracing::error!("[ROUTER] API proxy route config failed: {}", e);
             anyhow::anyhow!("API proxy route configuration error: {}", e)
         })?;
 
@@ -288,7 +288,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
             RouteType::AudioProxy,
         )
         .map_err(|e| {
-            tracing::error!("❌ [ROUTER] 音频代理路由插入失败: {}", e);
+            tracing::error!("[ROUTER] audio proxy route config failed: {}", e);
             anyhow::anyhow!("Audio proxy route configuration error: {}", e)
         })?;
 
@@ -314,7 +314,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
             RouteType::ImeProxy,
         )
         .map_err(|e| {
-            tracing::error!("❌ [ROUTER] IME 代理路由插入失败: {}", e);
+            tracing::error!("[ROUTER] IME proxy route config failed: {}", e);
             anyhow::anyhow!("IME proxy route configuration error: {}", e)
         })?;
 
@@ -328,33 +328,33 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
     vec![
         (
             "/computer/vnc/{user_id}/{project_id}/{*path}".to_string(),
-            "VNC WebSocket 代理".to_string(),
-            "代理到用户容器的 noVNC 服务（端口 6080），支持 WebSocket 升级".to_string(),
+            "VNC WebSocket proxy".to_string(),
+            "Proxy to user's container noVNC service (port 6080), supports WebSocket upgrade".to_string(),
         ),
         (
             "/proxy/{port}/{*path}".to_string(),
-            "端口反向代理".to_string(),
-            "动态路由到指定端口的后端服务".to_string(),
+            "Port reverse proxy".to_string(),
+            "Dynamic routing to backend service on specified port".to_string(),
         ),
         (
             "/health".to_string(),
-            "健康检查".to_string(),
-            "返回 Pingora 代理服务的健康状态".to_string(),
+            "Health check".to_string(),
+            "Returns Pingora proxy service health status".to_string(),
         ),
         (
             "/api/{service_name}/{*path}".to_string(),
-            "🔒 API 密钥代理".to_string(),
-            "拦截 AI API 请求，注入真实密钥后转发到真实 API 端点".to_string(),
+            "🔒 API key proxy".to_string(),
+            "Intercept AI API requests, inject real key and forward to actual API endpoint".to_string(),
         ),
         (
             "/computer/audio/{user_id}/{project_id}/{*path}".to_string(),
-            "🎵 音频流代理".to_string(),
-            "代理到用户容器的音频流服务（HTTP 6090 / WebSocket 6089）".to_string(),
+            "🎵 Audio stream proxy".to_string(),
+            "Proxy to user's container audio stream service (HTTP 6090 / WebSocket 6089)".to_string(),
         ),
         (
             "/computer/ime/{user_id}/{project_id}/{*path}".to_string(),
-            "⌨️ 输入法代理".to_string(),
-            "代理到用户容器的 IME 输入法服务（WebSocket 6091）".to_string(),
+            "⌨️ IME proxy".to_string(),
+            "Proxy to user's container IME input service (WebSocket 6091)".to_string(),
         ),
     ]
 }
@@ -520,9 +520,7 @@ mod tests {
         let router = create_router().unwrap();
 
         // 测试音频 WebSocket 路由
-        let matched = router
-            .at("/computer/audio/user_123/proj_456/ws")
-            .unwrap();
+        let matched = router.at("/computer/audio/user_123/proj_456/ws").unwrap();
         assert_eq!(*matched.value, RouteType::AudioProxy);
         assert_eq!(matched.params.get("user_id"), Some("user_123"));
         assert_eq!(matched.params.get("project_id"), Some("proj_456"));
@@ -552,9 +550,7 @@ mod tests {
         let router = create_router().unwrap();
 
         // 测试带子路径的 IME 路由
-        let matched = router
-            .at("/computer/ime/alice/myproject/connect")
-            .unwrap();
+        let matched = router.at("/computer/ime/alice/myproject/connect").unwrap();
         assert_eq!(*matched.value, RouteType::ImeProxy);
         assert_eq!(matched.params.get("user_id"), Some("alice"));
         assert_eq!(matched.params.get("project_id"), Some("myproject"));
@@ -568,9 +564,7 @@ mod tests {
         let router = create_router().unwrap();
 
         // 确保音频和 IME 路由不会互相干扰
-        let audio_matched = router
-            .at("/computer/audio/user_123/proj_456/ws")
-            .unwrap();
+        let audio_matched = router.at("/computer/audio/user_123/proj_456/ws").unwrap();
         assert_eq!(*audio_matched.value, RouteType::AudioProxy);
 
         let ime_matched = router

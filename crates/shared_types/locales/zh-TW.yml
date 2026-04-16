@@ -1,0 +1,114 @@
+# 繁體中文翻譯
+# RCoder 錯誤訊息
+
+# 成功狀態
+success: "操作成功"
+success.container_destroyed: "容器已成功銷毀"
+success.container_not_exist: "容器不存在，無需操作"
+success.agent_already_stopped: "Agent 已處於停止狀態"
+
+# Agent 相關錯誤
+error.agent_busy: "Agent 正在執行任務"
+error.agent_error: "Agent 內部錯誤"
+error.agent_not_found: "Agent 不存在或已停止"
+
+# 取消/停止操作
+error.cancel_failed: "取消操作失敗"
+error.stop_failed: "停止操作失敗"
+
+# 參數驗證
+error.validation: "參數驗證失敗"
+error.invalid_params: "參數缺失或無效"
+error.invalid_resource_limits: "資源限制配置無效"
+
+# 容器相關
+error.container_error: "容器操作失敗"
+error.container_not_found: "容器不存在"
+
+# 工作目錄
+error.workspace_error: "工作目錄錯誤"
+
+# gRPC 相關
+error.grpc_addr_error: "gRPC 位址解析失敗"
+error.grpc_error: "gRPC 呼叫失敗"
+
+# 服務狀態
+error.service_unavailable: "服務暫時無法使用"
+error.http_fallback_failed: "HTTP 備援失敗"
+error.internal_server_error: "內部伺服器錯誤"
+
+# 代理服務
+error.proxy_disabled: "代理服務未啟用"
+error.proxy_service_unavailable: "代理服務無法使用"
+
+# 工作階段相關
+error.session_not_found: "工作階段不存在或已完成"
+error.resume_failed: "Resume 工作階段失敗"
+error.retry_exhausted: "降級重試次數已用盡"
+
+# 請求限制
+error.too_many_requests: "請求過多"
+
+# 驗證
+error.api_key_auth_failed: "API Key 驗證失敗"
+
+# 未知錯誤
+error.unknown: "未知錯誤"
+error.undefined: "未定義的錯誤碼"
+
+# === 新增翻譯 ===
+
+# 參數驗證
+error.user_id_required: "user_id 不能為空"
+error.project_id_required: "project_id 不能為空"
+error.session_id_required: "session_id 不能為空"
+
+# Docker 相關
+error.docker_manager_failed: "取得 DockerManager 失敗"
+error.container_not_found_info: "未找到容器資訊"
+error.container_status_abnormal: "容器狀態異常"
+error.container_start_failed: "啟動容器失敗"
+error.container_query_failed: "查詢容器失敗"
+error.container_delete_failed: "刪除容器失敗"
+error.container_create_failed: "建立容器失敗"
+
+# 目錄相關
+error.workspace_create_failed: "建立工作目錄失敗"
+error.project_dir_create_failed: "建立專案目錄失敗"
+error.user_dir_create_failed: "建立使用者目錄失敗"
+
+# gRPC 相關
+error.grpc_addr_extract_failed: "提取 gRPC 位址失敗"
+error.grpc_service_url_invalid: "無效的 service_url"
+error.grpc_service_url_missing_host: "無效的 service_url: 缺少 host"
+
+# 查詢相關
+error.select_only: "只允許 SELECT 查詢"
+error.query_execution_failed: "查詢執行失敗"
+
+# 資源相關
+error.resource_limits_invalid: "資源限制無效"
+error.resource_limits_validation_failed: "資源限制驗證失敗"
+
+# 未知重試
+error.unknown_retry_error: "未知重試錯誤"
+
+# SACP 相關
+error.sacp_session_id_send_failed: "無法發送工作階段 ID"
+error.agent_process_abnormal_exit: "Agent 處理序異常結束，請重試"
+error.session_cancelled: "工作階段已取消"
+error.cancel_response_timeout: "取消後等待回應逾時"
+error.agent_init_timeout: "智慧體初始化逾時，請重試（過多的MCP可能導致逾時）。如果持續失敗請重啟智慧體電腦（點選PC端右上圖示展開後，在[...]裡點選重啟智慧體電腦）"
+error.session_cancelled_timeout: "使用者取消任務（Agent 回應逾時）"
+
+# 處理錯誤
+error.attachment_processing_failed: "附件處理失敗"
+error.processing_failed: "處理失敗"
+
+# Chat handler 錯誤
+error.create_project_dir_failed: "建立專案目錄失敗"
+error.build_chat_prompt_failed: "建構 ChatPrompt 失敗"
+error.agent_worker_unavailable: "Agent Worker 不可用，正在重啟，請稍後重試"
+error.send_task_failed: "發送任務失敗"
+error.request_processing_failed: "處理請求失敗"
+error.system_busy: "系統繁忙：並發 Agent 工作階段數已達上限 ({} 個)，請稍後重試"

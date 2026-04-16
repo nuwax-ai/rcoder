@@ -285,14 +285,14 @@ impl DockerConfig {
 
     /// 从传统配置创建多镜像配置
     fn create_legacy_multi_config(&self) -> shared_types::MultiImageConfig {
-        info!("从传统配置创建多镜像配置");
+        info!("Config created from legacy config");
 
         // 创建基于传统配置的多镜像配置
         let mut services = std::collections::HashMap::new();
 
         // 为 RCoder 服务使用默认配置
         let rcoder_service = {
-            info!("使用默认镜像配置");
+            info!("Using default config");
             shared_types::service_config::default_rcoder_service_config()
         };
 
@@ -340,36 +340,36 @@ impl DockerConfig {
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
         // 应用网络模式
         if let Ok(val) = std::env::var("RCODER_NETWORK_MODE") {
-            info!("应用环境变量 RCODER_NETWORK_MODE");
+            info!("RCODER_NETWORK_MODE overridden");
             self.network_mode = Some(val);
         }
 
         // 应用网络基础名称
         if let Ok(val) = std::env::var("RCODER_NETWORK_BASE_NAME") {
-            info!("应用环境变量 RCODER_NETWORK_BASE_NAME: {}", val);
+            info!("RCODER_NETWORK_BASE_NAME: {}", val);
             self.network_base_name = Some(val);
         }
 
         // 应用工作目录
         if let Ok(val) = std::env::var("RCODER_WORK_DIR") {
-            info!("应用环境变量 RCODER_WORK_DIR");
+            info!("RCODER_WORK_DIR overridden");
             self.work_dir = Some(val);
         }
 
         // 应用自动清理
         if let Ok(val) = std::env::var("RCODER_AUTO_CLEANUP") {
-            info!("应用环境变量 RCODER_AUTO_CLEANUP");
+            info!("RCODER_AUTO_CLEANUP overridden");
             self.auto_cleanup = Some(val.parse().unwrap_or(true));
         }
 
         // 应用容器存活时间
         if let Ok(val) = std::env::var("RCODER_CONTAINER_TTL") {
-            info!("应用环境变量 RCODER_CONTAINER_TTL");
+            info!("RCODER_CONTAINER_TTL overridden");
             match val.parse() {
                 Ok(seconds) => self.container_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_CONTAINER_TTL '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_CONTAINER_TTL '{}': {}, using default",
                         val,
                         e
                     );
@@ -379,12 +379,12 @@ impl DockerConfig {
 
         // 🔧 应用 API 超时配置
         if let Ok(val) = std::env::var("RCODER_API_TIMEOUT_SECONDS") {
-            info!("应用环境变量 RCODER_API_TIMEOUT_SECONDS");
+            info!("RCODER_API_TIMEOUT_SECONDS overridden");
             match val.parse() {
                 Ok(seconds) => self.api_timeout_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_API_TIMEOUT_SECONDS '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_API_TIMEOUT_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -394,12 +394,12 @@ impl DockerConfig {
 
         // 🔧 应用快速操作超时配置
         if let Ok(val) = std::env::var("RCODER_API_TIMEOUT_QUICK_SECONDS") {
-            info!("应用环境变量 RCODER_API_TIMEOUT_QUICK_SECONDS");
+            info!("RCODER_API_TIMEOUT_QUICK_SECONDS overridden");
             match val.parse() {
                 Ok(seconds) => self.api_timeout_quick_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -409,12 +409,12 @@ impl DockerConfig {
 
         // 🔧 应用状态缓存 TTL 配置
         if let Ok(val) = std::env::var("RCODER_CACHE_STATUS_TTL_SECONDS") {
-            info!("应用环境变量 RCODER_CACHE_STATUS_TTL_SECONDS");
+            info!("RCODER_CACHE_STATUS_TTL_SECONDS overridden");
             match val.parse() {
                 Ok(seconds) => self.cache_status_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -424,12 +424,12 @@ impl DockerConfig {
 
         // 🔧 应用网络缓存 TTL 配置
         if let Ok(val) = std::env::var("RCODER_CACHE_NETWORK_TTL_SECONDS") {
-            info!("应用环境变量 RCODER_CACHE_NETWORK_TTL_SECONDS");
+            info!("RCODER_CACHE_NETWORK_TTL_SECONDS overridden");
             match val.parse() {
                 Ok(seconds) => self.cache_network_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] 无法解析 RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, 使用默认值",
+                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -440,11 +440,11 @@ impl DockerConfig {
         Ok(())
     }
 
-    /// 获取配置摘要信息
+    /// Get configuration summary
     pub fn get_summary(&self) -> String {
         format!(
-            "Docker配置: 网络模式={}, 网络基础名称={}, 工作目录={}, 自动清理={}, 容器TTL={}, API超时={}秒, 快速超时={}秒, 状态缓存={}秒, 网络缓存={}秒",
-            self.network_mode.as_deref().unwrap_or("默认"),
+            "Docker config: network_mode={}, network_base_name={}, work_dir={}, auto_cleanup={}, container_ttl={}, api_timeout={}s, quick_timeout={}s, status_cache={}s, network_cache={}s",
+            self.network_mode.as_deref().unwrap_or("default"),
             self.network_base_name.as_deref().unwrap_or("agent-network"),
             self.work_dir.as_deref().unwrap_or("/app"),
             self.auto_cleanup.unwrap_or(true),
@@ -463,16 +463,19 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         // 尝试从文件加载配置
         match load_config_from_file() {
             Ok(file_config) => {
-                info!("已从配置文件加载: {}", CONFIG_FILE);
+                info!("Config file already loaded: {}", CONFIG_FILE);
                 file_config
             }
             Err(e) => {
-                warn!("加载配置文件失败，使用默认配置: {}", e);
+                warn!("Failed to load config file, using default config: {}", e);
                 AppConfig::default()
             }
         }
     } else {
-        info!("配置文件不存在，创建默认配置文件: {}", CONFIG_FILE);
+        info!(
+            "configfilenot found, createddefaultconfigfile: {}",
+            CONFIG_FILE
+        );
         let default_config = AppConfig::default();
         create_default_config_file(&default_config)?;
         default_config
@@ -492,7 +495,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         if let Ok(port) = port.parse::<u16>() {
             config.port = port;
         } else {
-            warn!("无效的 RCODER_PORT 环境变量值: {}", port);
+            warn!(" parse RCODER_PORT failed: {}", port);
         }
     }
 
@@ -524,33 +527,33 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     if let Ok(val) = std::env::var("RCODER_API_KEY_ENABLED") {
         if let Ok(enabled) = val.parse::<bool>() {
             config.api_key_auth.enabled = enabled;
-            info!("应用环境变量 RCODER_API_KEY_ENABLED: {}", enabled);
+            info!(" RCODER_API_KEY_ENABLED: {}", enabled);
         } else {
-            warn!("无效的 RCODER_API_KEY_ENABLED 环境变量值: {}", val);
+            warn!(" parse RCODER_API_KEY_ENABLED failed: {}", val);
         }
     }
 
     if let Ok(val) = std::env::var("RCODER_API_KEY") {
         config.api_key_auth.api_key = val.clone();
-        info!("应用环境变量 RCODER_API_KEY");
+        info!(" RCODER_API_KEY configured");
     }
 
     // 验证 API Key 配置
     if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {
         return Err(anyhow::anyhow!(
-            "API Key 鉴权已启用但 API Key 为空,请检查配置文件或环境变量"
+            "API Key authentication is enabled but API Key is empty, please check config file or environment variables"
         ));
     }
 
     // 配置验证
     if let Some(docker_config) = &config.docker_config {
         if let Err(e) = docker_config.validate_multi_image_config() {
-            return Err(anyhow::anyhow!("Docker 配置验证失败: {}", e));
+            return Err(anyhow::anyhow!("Docker configuration validation failed: {}", e));
         }
     }
 
     info!(
-        "最终配置: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
+        "Final config: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
         config.port,
         config.projects_dir,
         config.default_agent_id,
@@ -575,20 +578,20 @@ pub fn load_config() -> anyhow::Result<AppConfig> {
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
     let config_content =
-        fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
+        fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
-    tracing::debug!("配置文件内容: {}", config_content);
+    tracing::debug!("config file content: {}", config_content);
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
 
     // 调试：打印解析后的多镜像配置
     if let Some(ref docker_config) = config.docker_config {
         if let Some(ref multi_config) = docker_config.multi_image_config {
-            tracing::debug!("解析后的多镜像配置:");
+            tracing::debug!("Multi-image config:");
             for (service_key, service_config) in &multi_config.services {
                 tracing::debug!(
-                    "  服务 '{}' 挂载配置 (共 {} 个):",
+                    "  Service '{}' mount config (total {} mounts):",
                     service_key,
                     service_config.mounts.len()
                 );
@@ -617,10 +620,10 @@ pub fn load_api_key_config_from_file(
     config_path: &std::path::Path,
 ) -> anyhow::Result<ApiKeyAuthConfig> {
     let config_content =
-        fs::read_to_string(config_path).map_err(|e| anyhow::anyhow!("读取配置文件失败: {}", e))?;
+        fs::read_to_string(config_path).map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("解析配置文件失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
 
     Ok(config.api_key_auth)
 }
@@ -634,7 +637,7 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
 
     // 创建配置文件目录（如果不存在）
     if let Some(parent) = std::path::Path::new(CONFIG_FILE).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("创建配置目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
     }
 
     // 使用嵌入式配置文件
@@ -645,9 +648,9 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
     let config_content = default_config.replace("{{GENERATED_API_KEY}}", &generated_api_key);
 
     fs::write(CONFIG_FILE, config_content)
-        .map_err(|e| anyhow::anyhow!("写入默认配置文件失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to write default config file: {}", e))?;
 
-    info!("已创建默认配置文件: {}", CONFIG_FILE);
-    info!("🔑 已生成随机 API Key（当前未启用鉴权）");
+    info!("Created default config file: {}", CONFIG_FILE);
+    info!("🔑 Loaded API Key (not set)");
     Ok(())
 }

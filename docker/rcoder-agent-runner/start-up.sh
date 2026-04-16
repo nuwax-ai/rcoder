@@ -769,6 +769,11 @@ function start_display_and_desktop() {
 	echo "export CHROMIUM_USER_DATA_DIR='${CHROMIUM_USER_DATA_DIR}'" >> /etc/environment
 	echo "export CHROMIUM_USER_DATA_DIR='${CHROMIUM_USER_DATA_DIR}'" >> /etc/profile.d/chromium-env.sh
 
+	# 4.1 agent-browser 使用独立 profile，避免与 MCP 的 Chromium 争抢锁
+	AGENT_BROWSER_PROFILE="${AGENT_BROWSER_PROFILE:-/home/user/.config/agent-browser/chromium}"
+	export AGENT_BROWSER_PROFILE
+	log_success "agent-browser configured with isolated profile: $AGENT_BROWSER_PROFILE"
+
 	# 5. 清理 Chromium profile 锁文件（SingletonLock）
 	if [ -d "$CHROMIUM_USER_DATA_DIR" ]; then
 		# 删除 SingletonLock 文件
@@ -785,6 +790,17 @@ function start_display_and_desktop() {
 		find "$CHROMIUM_USER_DATA_DIR" -name "lockfile" -type f -delete 2>/dev/null || true
 
 		log_success "Chromium lock files cleaned from: $CHROMIUM_USER_DATA_DIR"
+	fi
+
+	# 5.1 清理 agent-browser 独立 profile 锁文件（如果与 MCP profile 不同）
+	if [ "$AGENT_BROWSER_PROFILE" != "$CHROMIUM_USER_DATA_DIR" ]; then
+		mkdir -p "$AGENT_BROWSER_PROFILE"
+		rm -f "$AGENT_BROWSER_PROFILE/SingletonLock" || true
+		rm -f "$AGENT_BROWSER_PROFILE/SingletonSocket" || true
+		rm -f "$AGENT_BROWSER_PROFILE/SingletonCookie" || true
+		find "$AGENT_BROWSER_PROFILE" -name "*.lock" -type f -delete 2>/dev/null || true
+		find "$AGENT_BROWSER_PROFILE" -name "lockfile" -type f -delete 2>/dev/null || true
+		log_success "agent-browser lock files cleaned from: $AGENT_BROWSER_PROFILE"
 	fi
 
 	# 6. 清理 /tmp 中的 Chromium 临时文件

@@ -72,7 +72,7 @@ impl<'a> PendingGuard<'a> {
     pub fn new(registry: &'a AgentSessionRegistry, project_id: &str) -> Self {
         registry.set_pending(project_id);
         debug!(
-            "🛡️ [PendingGuard] 创建并设置 Pending 状态: project_id={}",
+            "🛡️ [PendingGuard] Created and set Pending status: project_id={}",
             project_id
         );
         Self {
@@ -91,7 +91,7 @@ impl<'a> PendingGuard<'a> {
     pub fn commit_success(self) {
         self.cleaned.store(true, Ordering::Release);
         debug!(
-            "🛡️ [PendingGuard] 提交成功，保留 Pending 状态: project_id={}",
+            "🛡️ [PendingGuard] Commit success, keeping Pending state: project_id={}",
             self.project_id
         );
         std::mem::forget(self); // 防止 drop 时清理
@@ -103,7 +103,7 @@ impl<'a> Drop for PendingGuard<'a> {
         // 只有未标记为成功时才清理
         if !self.cleaned.load(Ordering::Acquire) {
             debug!(
-                "🛡️ [PendingGuard] Drop 时自动清理 Pending 状态: project_id={}",
+                "🛡️ [PendingGuard] Auto clearing Pending state on Drop: project_id={}",
                 self.project_id
             );
             self.registry.clear_pending_if_exists(&self.project_id);
@@ -127,7 +127,9 @@ impl Clone for AgentSessionRegistry {
             project_to_session: self.project_to_session.clone(),
             session_to_project: self.session_to_project.clone(),
             // 注意：AtomicUsize 共享同一个计数器，这是设计意图
-            active_sessions_count: AtomicUsize::new(self.active_sessions_count.load(Ordering::Acquire)),
+            active_sessions_count: AtomicUsize::new(
+                self.active_sessions_count.load(Ordering::Acquire),
+            ),
         }
     }
 }
@@ -206,17 +208,18 @@ impl AgentSessionRegistry {
         // ✅ 清理旧的 session_to_project 映射（如果需要）
         // 只有当 session 真正变化时才清理旧值
         if let Some(old_sid) = old_session_id
-            && old_sid != session_id {
-                // remove 本身是原子操作，此时新映射已插入，不会影响查询
-                self.session_to_project.remove(&old_sid);
-                debug!(
-                    "🔄 [Registry] 清理旧 session 映射: project={}, old_session={}",
-                    project_id, old_sid
-                );
-            }
+            && old_sid != session_id
+        {
+            // remove 本身是原子操作，此时新映射已插入，不会影响查询
+            self.session_to_project.remove(&old_sid);
+            debug!(
+                "🔄 [Registry] Cleaning old session mapping: project={}, old_session={}",
+                project_id, old_sid
+            );
+        }
 
         info!(
-            "✅ [Registry] 注册 Agent: project={}, session={}",
+            "✅ [Registry] Registering Agent: project={}, session={}",
             project_id, session_id
         );
     }
@@ -266,19 +269,20 @@ impl AgentSessionRegistry {
 
         // ✅ 清理旧的 session_to_project 映射（原子操作）
         if let Some(ref old_sid) = old_session_id
-            && old_sid != new_session_id {
-                // remove 本身是原子操作
-                self.session_to_project.remove(old_sid);
-            }
+            && old_sid != new_session_id
+        {
+            // remove 本身是原子操作
+            self.session_to_project.remove(old_sid);
+        }
 
         if let Some(ref old_sid) = old_session_id {
             info!(
-                "🔄 [Registry] Session 更新: project={}, {} → {}",
+                "🔄 [Registry] Session updated: project={}, {} → {}",
                 project_id, old_sid, new_session_id
             );
         } else {
             info!(
-                "🆕 [Registry] Session 新建: project={}, session={}",
+                "🆕 [Registry] Session created: project={}, session={}",
                 project_id, new_session_id
             );
         }
@@ -290,7 +294,7 @@ impl AgentSessionRegistry {
     pub fn update_agent_info(&self, project_id: &str, agent_info: ProjectAndAgentInfo) {
         self.agent_info_map
             .insert(project_id.to_string(), agent_info);
-        debug!("[Registry] 更新 agent_info: project={}", project_id);
+        debug!("[Registry] Updated agent_info: project={}", project_id);
     }
 
     /// 🆕 尝试原子性地更新 agent_info
@@ -299,10 +303,10 @@ impl AgentSessionRegistry {
     ///
     /// # 参数
     /// - `project_id`: 项目 ID
-    /// - `f`: 更新函数，返回 true 表示更新成功，false 表示无需更新
+    /// - `f`: 更新函数，返回 true 表示Update succeeded，false 表示无需更新
     ///
     /// # 返回
-    /// - true: 更新成功
+    /// - true: Update succeeded
     /// - false: Agent 不存在或条件不满足（未更新）
     ///
     /// # 示例
@@ -310,7 +314,7 @@ impl AgentSessionRegistry {
     /// registry.try_update_agent_info("project-123", |info| {
     ///     if info.status == AgentStatus::Active {
     ///         info.status = AgentStatus::Idle;
-    ///         true  // 更新成功
+    ///         true  // Update succeeded
     ///     } else {
     ///         false  // 无需更新
     ///     }
@@ -327,13 +331,13 @@ impl AgentSessionRegistry {
                 let info = entry.get_mut();
                 if f(info) {
                     debug!(
-                        "[Registry] 原子性更新 agent_info 成功: project={}",
+                        "[Registry] Atomic update agent_info succeeded: project={}",
                         project_id
                     );
                     true
                 } else {
                     debug!(
-                        "[Registry] agent_info 无需更新（条件不满足）: project={}",
+                        "[Registry] agent_info no update needed (condition not met): project={}",
                         project_id
                     );
                     false
@@ -341,7 +345,7 @@ impl AgentSessionRegistry {
             }
             Entry::Vacant(_) => {
                 debug!(
-                    "[Registry] agent_info 不存在，无法更新: project={}",
+                    "[Registry] agent_info does not exist, cannot update: project={}",
                     project_id
                 );
                 false
@@ -354,8 +358,8 @@ impl AgentSessionRegistry {
     /// 如果项目不存在，则创建一个占位记录
     /// 如果项目已存在且为 Idle 状态，则更新为 Pending
     pub fn set_pending(&self, project_id: &str) {
-        use sacp::schema::SessionId;
         use chrono::Utc;
+        use sacp::schema::SessionId;
         use shared_types::AgentStatus;
         use std::sync::Arc;
         use tokio::sync::mpsc;
@@ -367,7 +371,10 @@ impl AgentSessionRegistry {
                 if info.status == AgentStatus::Idle {
                     info.status = AgentStatus::Pending;
                     info.last_activity = Utc::now();
-                    debug!("📌 [Registry] 项目 {} 状态: Idle → Pending", project_id);
+                    debug!(
+                        "📌 [Registry] Project {} state: Idle -> Pending",
+                        project_id
+                    );
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -389,7 +396,10 @@ impl AgentSessionRegistry {
                 };
 
                 entry.insert(placeholder);
-                info!("📌 [Registry] 创建 Pending 占位: project_id={}", project_id);
+                info!(
+                    "📌 [Registry] Created Pending placeholder: project_id={}",
+                    project_id
+                );
             }
         }
     }
@@ -401,11 +411,15 @@ impl AgentSessionRegistry {
         use shared_types::AgentStatus;
 
         if let Some(info) = self.agent_info_map.get(project_id)
-            && info.status == AgentStatus::Pending {
-                drop(info);
-                self.remove_by_project(project_id);
-                info!("🗑️ [Registry] 清理 Pending 占位: project_id={}", project_id);
-            }
+            && info.status == AgentStatus::Pending
+        {
+            drop(info);
+            self.remove_by_project(project_id);
+            info!(
+                "🗑️ [Registry] Cleared Pending placeholder: project_id={}",
+                project_id
+            );
+        }
     }
 
     // ========== 查询操作 ==========
@@ -463,7 +477,10 @@ impl AgentSessionRegistry {
     /// ## 使用建议
     /// - 在调用此方法后，如果返回 None，应该视为"会话不存在"
     /// - 不要依赖此方法进行强一致性的事务操作
-    pub fn get_agent_info_by_session(&self, session_id: &str) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
+    pub fn get_agent_info_by_session(
+        &self,
+        session_id: &str,
+    ) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
         // 先通过 session_id 找到 project_id
         let project_id = self.session_to_project.get(session_id)?;
         let project_id_str = project_id.value().clone();
@@ -492,12 +509,12 @@ impl AgentSessionRegistry {
         use dashmap::mapref::entry::Entry;
 
         info!(
-            "🔍 [Registry] remove_by_project 开始: project_id={}",
+            "🔍 [Registry] remove_by_project started: project_id={}",
             project_id
         );
 
         // 🎯 原子性地移除 project_to_session 并获取 session_id
-        info!("🔍 [Registry] 移除 project_to_session 映射");
+        info!("[Registry] Removing project_to_session mapping");
         let session_id = match self.project_to_session.entry(project_id.to_string()) {
             Entry::Occupied(entry) => {
                 let (_, session_id) = entry.remove_entry(); // 原子性移除
@@ -505,18 +522,18 @@ impl AgentSessionRegistry {
             }
             Entry::Vacant(_) => None,
         };
-        info!("🔍 [Registry] project_to_session 移除完成");
+        info!("[Registry] project_to_session mapping removed");
 
         // 移除反向映射
         if let Some(ref sid) = session_id {
-            info!("🔍 [Registry] 移除 session_to_project 映射");
+            info!("[Registry] Removing session_to_project mapping");
             self.session_to_project.remove(sid);
-            info!("🔍 [Registry] session_to_project 移除完成");
+            info!("[Registry] session_to_project mapping removed");
         }
 
         // 移除 agent_info
         info!(
-            "🔍 [Registry] 准备移除 agent_info_map, project_id={}, 当前 map 长度={}",
+            "🔍 [Registry] Preparing to remove agent_info_map, project_id={}, current map length={}",
             project_id,
             self.agent_info_map.len()
         );
@@ -524,32 +541,35 @@ impl AgentSessionRegistry {
         // 检查 key 是否存在
         let key_exists = self.agent_info_map.contains_key(project_id);
         info!(
-            "🔍 [Registry] agent_info_map key 存在检查: project_id={}, exists={}",
+            "🔍 [Registry] agent_info_map key existence check: project_id={}, exists={}",
             project_id, key_exists
         );
 
         // 执行 remove 操作
-        info!("🔍 [Registry] 开始执行 agent_info_map.remove()...");
+        info!("[Registry] Executing agent_info_map.remove()...");
         let removed = self.agent_info_map.remove(project_id).map(|(_, v)| v);
         info!(
-            "🔍 [Registry] agent_info_map.remove() 完成, removed={}, 剩余长度={}",
+            "🔍 [Registry] agent_info_map.remove() completed, removed={}, remaining_length={}",
             removed.is_some(),
             self.agent_info_map.len()
         );
 
         if removed.is_some() {
             info!(
-                "🗑️ [Registry] 移除 Agent: project={}, session={:?}",
+                "🗑️ [Registry] Removing Agent: project={}, session={:?}",
                 project_id, session_id
             );
 
             // 🔥 修复：移除 Agent 时释放槽位
             self.release_session_slot();
-            info!("✅ [Registry] 已释放槽位: project_id={}", project_id);
+            info!(
+                "[Registry] Released session slot: project_id={}",
+                project_id
+            );
         }
 
         info!(
-            "🔍 [Registry] remove_by_project 完成: project_id={}",
+            "🔍 [Registry] remove_by_project completed: project_id={}",
             project_id
         );
         removed
@@ -577,13 +597,16 @@ impl AgentSessionRegistry {
 
             if removed.is_some() {
                 info!(
-                    "🗑️ [Registry] 通过 session 移除 Agent: session={}, project={}",
+                    "🗑️ [Registry] Removing Agent via session: session={}, project={}",
                     session_id, pid
                 );
 
                 // 🔥 修复：移除 Agent 时释放槽位（与 remove_by_project 保持一致）
                 self.release_session_slot();
-                info!("✅ [Registry] 已释放槽位: session_id={}", session_id);
+                info!(
+                    "[Registry] Released session slot: session_id={}",
+                    session_id
+                );
             }
 
             return removed;
@@ -681,7 +704,7 @@ impl AgentSessionRegistry {
             ) {
                 Ok(_) => {
                     debug!(
-                        "🎯 [原子槽位] 成功获取槽位: {}/{}",
+                        "🎯 [AtomicSlot] Acquired slot successfully: {}/{}",
                         old + 1,
                         limit
                     );
@@ -709,7 +732,9 @@ impl AgentSessionRegistry {
         loop {
             let current = self.active_sessions_count.load(Ordering::Acquire);
             if current == 0 {
-                warn!("⚠️ [原子槽位] 尝试释放槽位但计数器已为 0，跳过操作（防止溢出）");
+                warn!(
+                    "[AtomicSlot] Tried to release slot but counter is already 0, skipping to prevent underflow"
+                );
                 return;
             }
 
@@ -722,7 +747,7 @@ impl AgentSessionRegistry {
             ) {
                 Ok(_) => {
                     debug!(
-                        "🔓 [原子槽位] 释放槽位: {} → {}",
+                        "🔓 [AtomicSlot] Released slot: {} -> {}",
                         current,
                         current - 1
                     );
@@ -784,7 +809,9 @@ impl SessionRegistry for AgentSessionRegistry {
 
     fn get_project_by_session(&self, session_id: &str) -> Option<String> {
         // 🔥 修复：调用内部方法，避免递归
-        self.session_to_project.get(session_id).map(|r| r.value().clone())
+        self.session_to_project
+            .get(session_id)
+            .map(|r| r.value().clone())
     }
 
     fn get_entry_by_session(&self, session_id: &str) -> Option<Self::Entry> {
@@ -798,7 +825,8 @@ impl SessionRegistry for AgentSessionRegistry {
         // 且第一次查询（session_to_project）完成后立即释放锁，
         // 第二次查询（agent_info_map）在同一分片或相邻分片上执行，
         // 竞态窗口比两次独立调用要小得多。
-        self.get_agent_info_by_session(session_id).map(|r| r.clone())
+        self.get_agent_info_by_session(session_id)
+            .map(|r| r.clone())
     }
 
     fn list_project_ids(&self) -> Vec<String> {
@@ -823,8 +851,8 @@ impl Default for AgentSessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sacp::schema::SessionId;
     use chrono::Utc;
+    use sacp::schema::SessionId;
     use shared_types::AgentStatus;
     use std::sync::Arc;
     use tokio::sync::mpsc;

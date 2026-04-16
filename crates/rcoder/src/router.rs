@@ -6,7 +6,10 @@ use std::time::Instant;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    http::Request,
+    middleware::Next,
     response::IntoResponse,
+    response::Response,
     routing::{get, post},
 };
 use serde::Serialize;
@@ -20,6 +23,18 @@ use crate::{
 use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+async fn locale_context_middleware(mut req: Request<axum::body::Body>, next: Next) -> Response {
+    let locale = shared_types::parse_accept_language(
+        req.headers()
+            .get("accept-language")
+            .and_then(|v| v.to_str().ok()),
+    );
+
+    req.extensions_mut().insert(locale);
+
+    shared_types::scope_request_locale(locale, async move { next.run(req).await }).await
+}
 
 /// 会话信息结构
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +64,9 @@ pub struct AppState {
     /// 🆕 容器创建中标记: user_id -> 创建开始时间
     /// 用于防止并发 pod_ensure 请求互相干扰（无锁方案）
     pub pod_creating: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// 🆕 容器前缀（从配置读取，启动时初始化）
+    pub container_prefix_rcoder: String,
+    pub container_prefix_computer: String,
 }
 
 impl AppState {
@@ -56,9 +74,11 @@ impl AppState {
         config: AppConfig,
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
         api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
+        container_prefix_rcoder: String,
+        container_prefix_computer: String,
     ) -> anyhow::Result<Self> {
         let projects = ProjectAdapter::new()
-            .map_err(|e| anyhow::anyhow!("初始化 ProjectAdapter 失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to initialize ProjectAdapter: {}", e))?;
 
         Ok(Self {
             config,
@@ -70,6 +90,8 @@ impl AppState {
             )),
             api_key_config,
             pod_creating: Arc::new(DashMap::new()),
+            container_prefix_rcoder,
+            container_prefix_computer,
         })
     }
 
@@ -85,7 +107,7 @@ impl AppState {
     #[inline]
     pub fn insert_project(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) {
         if let Err(e) = self.projects.insert(project_id.clone(), info) {
-            tracing::error!("插入项目 {} 失败: {}", project_id, e);
+            tracing::error!("Failed to insert project {}: {}", project_id, e);
         }
     }
 
@@ -121,7 +143,7 @@ impl AppState {
     pub fn update_session(&self, project_id: &str, session_id: &str) {
         if let Err(e) = self.projects.update_session(project_id, session_id) {
             tracing::error!(
-                "更新会话失败: project_id={}, session_id={}, error={}",
+                "Failed to update session: project_id={}, session_id={}, error={}",
                 project_id,
                 session_id,
                 e
@@ -258,6 +280,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
                 next,
             )
         }))
+        .layer(axum::middleware::from_fn(locale_context_middleware))
 }
 
 /// Prometheus 指标处理器

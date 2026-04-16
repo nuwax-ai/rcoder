@@ -35,7 +35,7 @@ impl CleanupStrategy for ComputerRunnerStrategy {
             .state
             .get_project(project_id)
             .and_then(|p| p.user_id().map(|s| s.to_string()))
-            .ok_or_else(|| anyhow::anyhow!("无法获取 user_id: {}", project_id))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to get user_id: {}", project_id))?;
 
         // 查询该用户的所有项目
         let related_projects = context.state.projects.find_projects_by_user_id(&user_id);
@@ -80,7 +80,7 @@ impl CleanupStrategy for ComputerRunnerStrategy {
         project_info
             .user_id
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("user_id 缺失"))
+            .ok_or_else(|| anyhow::anyhow!("user_id is missing"))
     }
 }
 

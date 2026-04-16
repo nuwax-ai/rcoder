@@ -5,11 +5,13 @@
 use std::{path::PathBuf, sync::Arc};
 
 // SACP 类型导入
-use sacp::schema::{ContentBlock, PromptRequest};
 use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use shared_types::{AgentLifecycle, CancelNotificationRequestWrapper, ModelProviderConfig, ServiceType};
+use sacp::schema::{ContentBlock, PromptRequest};
+use shared_types::{
+    AgentLifecycle, CancelNotificationRequestWrapper, ModelProviderConfig, ServiceType,
+};
 use tokio::sync::mpsc;
 
 use crate::PromptMessage;
@@ -49,7 +51,10 @@ impl WorkerRequest {
     }
 
     /// 设置 shared_api_key_manager
-    pub fn with_key_manager(mut self, key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>) -> Self {
+    pub fn with_key_manager(
+        mut self,
+        key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    ) -> Self {
         self.shared_api_key_manager = key_manager;
         self
     }
@@ -86,7 +91,13 @@ impl std::fmt::Debug for SessionHandles {
         f.debug_struct("SessionHandles")
             .field("prompt_tx", &"Sender<PromptRequest>")
             .field("cancel_tx", &"Sender<CancelNotificationRequestWrapper>")
-            .field("lifecycle_handle", &self.lifecycle_handle.as_ref().map(|_| "Some(AgentLifecycle)"))
+            .field(
+                "lifecycle_handle",
+                &self
+                    .lifecycle_handle
+                    .as_ref()
+                    .map(|_| "Some(AgentLifecycle)"),
+            )
             .finish()
     }
 }

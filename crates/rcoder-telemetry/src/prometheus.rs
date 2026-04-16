@@ -3,7 +3,9 @@
 //! 提供 Prometheus 指标的定义、记录和导出功能。
 //! 使用 `metrics` crate 作为 facade，`metrics-exporter-prometheus` 作为后端。
 
-use metrics::{counter, gauge, histogram, describe_counter, describe_gauge, describe_histogram, Unit};
+use metrics::{
+    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram, Unit,
+};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
 use tracing::info;
@@ -29,7 +31,7 @@ pub const AGENT_ACTIVE_TASKS: &str = "agent_active_tasks";
 
 // ============= 初始化 =============
 
-/// 初始化 Prometheus 指标系统
+/// Initializing Prometheus 指标系统
 ///
 /// 安装 Prometheus recorder 并返回 handle，用于渲染指标。
 ///
@@ -56,7 +58,7 @@ pub fn init_prometheus() -> anyhow::Result<PrometheusHandle> {
     // 注册指标描述
     register_metric_descriptions();
 
-    info!("✅ [Prometheus] 指标系统初始化完成");
+    info!("[Prometheus] Metrics system initialization completed");
 
     Ok(handle)
 }

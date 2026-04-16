@@ -16,6 +16,7 @@
 use crate::AppError;
 use crate::handler::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
 use docker_manager::ContainerBasicInfo;
+use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
@@ -52,15 +53,18 @@ impl ComputerContainerManager {
         resource_limits: Option<ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
-            "🔍 [COMPUTER_CONTAINER] 获取/创建用户容器: user_id={}",
+            "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}",
             user_id
         );
 
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to get DockerManager: {}", e),
+                )
             })?;
 
         // 1. 尝试获取现有容器
@@ -73,14 +77,14 @@ impl ComputerContainerManager {
             {
                 Ok(true) => {
                     info!(
-                        "✅ [COMPUTER_CONTAINER] 用户容器已存在且运行中: user_id={}, container_id={}",
+                        "✅ [COMPUTER_CONTAINER] User container already exists and running: user_id={}, container_id={}",
                         user_id, info.container_id
                     );
                     return Ok(info);
                 }
                 Ok(false) => {
                     warn!(
-                        "⚠️ [COMPUTER_CONTAINER] 用户容器存在但已停止: user_id={}, container_id={}, 将删除并重建",
+                        "⚠️ [COMPUTER_CONTAINER] User container exists but stopped: user_id={}, container_id={}, will delete and recreate",
                         user_id, info.container_id
                     );
                     // 删除已停止的旧容器
@@ -89,7 +93,7 @@ impl ComputerContainerManager {
                         .await
                     {
                         warn!(
-                            "⚠️ [COMPUTER_CONTAINER] 删除旧容器失败 (继续创建新容器): {}",
+                            "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (will create new container anyway): {}",
                             e
                         );
                     }
@@ -97,7 +101,7 @@ impl ComputerContainerManager {
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️ [COMPUTER_CONTAINER] 检查容器状态失败: user_id={}, error={}, 将尝试创建新容器",
+                        "⚠️ [COMPUTER_CONTAINER] Failed to check container status: user_id={}, error={}, will try creating new container",
                         user_id, e
                     );
                     // 继续创建新容器
@@ -107,7 +111,7 @@ impl ComputerContainerManager {
 
         // 2. 容器不存在或已停止，创建新容器
         info!(
-            "🏗️ [COMPUTER_CONTAINER] 创建新用户容器: user_id={}",
+            "🏗️ [COMPUTER_CONTAINER] Creating new user container: user_id={}",
             user_id
         );
         Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
@@ -122,15 +126,18 @@ impl ComputerContainerManager {
         resource_limits: Option<ServiceResourceLimits>,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
-            "🏗️ [COMPUTER_CONTAINER] 强制创建新用户容器: user_id={}",
+            "🏗️ [COMPUTER_CONTAINER] Force creating new user container: user_id={}",
             user_id
         );
 
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to get DockerManager: {}", e),
+                )
             })?;
 
         Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
@@ -149,7 +156,7 @@ impl ComputerContainerManager {
         Self::create_user_workspace(user_id).await?;
 
         info!(
-            "📁 [COMPUTER_CONTAINER] 用户工作区已准备: /app/computer-project-workspace/{}",
+            "📁 [COMPUTER_CONTAINER] User workspace prepared: /app/computer-project-workspace/{}",
             user_id
         );
 
@@ -165,12 +172,15 @@ impl ComputerContainerManager {
             )
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 启动容器失败: {}", e);
-                AppError::internal_server_error(&format!("启动容器失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to start container: {}", e);
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to start container: {}", e),
+                )
             })?;
 
         info!(
-            "🚀 [COMPUTER_CONTAINER] 用户容器创建成功: user_id={}, container_id={}, ip={}",
+            "🚀 [COMPUTER_CONTAINER] User container created successfully: user_id={}, container_id={}, ip={}",
             user_id, container_info.container_id, container_info.container_ip
         );
 
@@ -196,8 +206,14 @@ impl ComputerContainerManager {
         tokio::fs::create_dir_all(&workspace_root)
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 创建 workspace 目录失败: {:?}", e);
-                AppError::internal_server_error(&format!("创建 workspace 目录失败: {}", e))
+                error!(
+                    "[COMPUTER_CONTAINER] Failed to create workspace directory: {:?}",
+                    e
+                );
+                AppError::with_message(
+                    ERR_WORKSPACE_ERROR,
+                    format!("Failed to create workspace directory: {}", e),
+                )
             })?;
 
         // 创建用户目录
@@ -205,12 +221,18 @@ impl ComputerContainerManager {
         tokio::fs::create_dir_all(&user_workspace)
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 创建用户目录失败: {:?}", e);
-                AppError::internal_server_error(&format!("创建用户目录失败: {}", e))
+                error!(
+                    "[COMPUTER_CONTAINER] Failed to create user directory: {:?}",
+                    e
+                );
+                AppError::with_message(
+                    ERR_WORKSPACE_ERROR,
+                    format!("Failed to create user directory: {}", e),
+                )
             })?;
 
         debug!(
-            "📁 [COMPUTER_CONTAINER] 用户工作区创建成功: {:?}",
+            "📁 [COMPUTER_CONTAINER] User workspace created successfully: {:?}",
             user_workspace
         );
 
@@ -221,21 +243,30 @@ impl ComputerContainerManager {
     ///
     /// 通过 user_id 查询容器是否存在
     pub async fn get_container_info(user_id: &str) -> Result<Option<ContainerBasicInfo>, AppError> {
-        debug!("[COMPUTER_CONTAINER] 获取容器信息: user_id={}", user_id);
+        debug!(
+            "[COMPUTER_CONTAINER] get container: user_id={}",
+            user_id
+        );
 
         let docker_manager = docker_manager::global::get_global_docker_manager()
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 获取 DockerManager 失败: {}", e);
-                AppError::internal_server_error(&format!("获取 DockerManager 失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to get DockerManager: {}", e),
+                )
             })?;
 
         docker_manager
             .get_user_container_info(user_id)
             .await
             .map_err(|e| {
-                error!("❌ [COMPUTER_CONTAINER] 查询容器信息失败: {}", e);
-                AppError::internal_server_error(&format!("查询容器信息失败: {}", e))
+                error!("[COMPUTER_CONTAINER] Failed to query container info: {}", e);
+                AppError::with_message(
+                    ERR_CONTAINER_ERROR,
+                    format!("Failed to query container info: {}", e),
+                )
             })
     }
 }

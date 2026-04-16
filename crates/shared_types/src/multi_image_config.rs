@@ -43,14 +43,12 @@ pub struct GlobalImageDefaults {
 /// 镜像选择策略
 ///
 /// 当前只支持 ServiceOnly 策略，强制使用服务特定配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum ImageSelectionStrategy {
     /// 仅使用服务特定配置（强制明确指定服务类型）
     #[default]
     ServiceOnly,
 }
-
 
 /// 镜像缓存配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,18 +74,18 @@ pub struct ProjectImageOverrides {
     pub environment: HashMap<String, String>,
 }
 
-/// 配置验证错误
+/// Config validation error
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("配置解析错误: {0}")]
+    #[error("config parse error: {0}")]
     ParseError(String),
-    #[error("配置验证错误: {0}")]
+    #[error("config validation error: {0}")]
     ValidationError(String),
-    #[error("服务类型 '{0}' 未找到")]
+    #[error("service type '{0}' not found")]
     ServiceNotFound(String),
-    #[error("服务类型 '{0}' 未启用")]
+    #[error("service type '{0}' is disabled")]
     ServiceDisabled(String),
-    #[error("镜像配置错误: {0}")]
+    #[error("image config error: {0}")]
     ImageConfigError(String),
 }
 
@@ -96,23 +94,24 @@ impl MultiImageConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         // 验证全局默认配置
         if let Some(ref prefix) = self.global_defaults.registry_prefix
-            && prefix.trim().is_empty() {
-                return Err(ConfigError::ValidationError(
-                    "镜像仓库前缀不能为空".to_string(),
-                ));
-            }
+            && prefix.trim().is_empty()
+        {
+            return Err(ConfigError::ValidationError(
+                "Image registry prefix cannot be empty".to_string(),
+            ));
+        }
 
         // 验证缓存配置
         if self.cache_config.enabled {
             if self.cache_config.ttl_seconds == 0 {
                 return Err(ConfigError::ValidationError(
-                    "缓存过期时间必须大于0".to_string(),
+                    "Cache TTL must be greater than 0".to_string(),
                 ));
             }
 
             if self.cache_config.max_entries == 0 {
                 return Err(ConfigError::ValidationError(
-                    "最大缓存条目数必须大于0".to_string(),
+                    "Maximum cache entries must be greater than 0".to_string(),
                 ));
             }
         }
@@ -122,7 +121,7 @@ impl MultiImageConfig {
             // 验证服务名称一致性
             if service_config.service_type.to_string() != *service_key {
                 return Err(ConfigError::ValidationError(format!(
-                    "服务键 '{}'与服务类型 '{}' 不匹配",
+                    "Service key '{}' does not match service type '{}'",
                     service_key, service_config.service_type
                 )));
             }
@@ -133,11 +132,11 @@ impl MultiImageConfig {
                     // 配置有效
                 }
                 crate::service_config::ConfigValidationResult::Warning(warning) => {
-                    tracing::warn!("服务 '{}' 配置警告: {}", service_key, warning);
+                    tracing::warn!("Warning in '{}' config: {}", service_key, warning);
                 }
                 crate::service_config::ConfigValidationResult::Error(error) => {
                     return Err(ConfigError::ValidationError(format!(
-                        "服务 '{}' 配置错误: {}",
+                        "Service '{}' config error: {}",
                         service_key, error
                     )));
                 }
@@ -148,7 +147,7 @@ impl MultiImageConfig {
         let enabled_services = self.list_enabled_services();
         if enabled_services.is_empty() {
             return Err(ConfigError::ValidationError(
-                "至少需要启用一个服务类型".to_string(),
+                "At least one service type must be enabled".to_string(),
             ));
         }
 
@@ -241,7 +240,7 @@ impl MultiImageConfig {
                 service_config.default_image = self.global_defaults.default_image.clone();
             }
 
-            tracing::debug!("应用全局默认配置到服务 '{}'", service_key);
+            tracing::debug!("Using default config for '{}'", service_key);
         }
     }
 
@@ -304,13 +303,13 @@ impl ProjectImageOverrides {
         for (service_type, image_name) in &self.images {
             if service_type.trim().is_empty() {
                 return Err(ConfigError::ValidationError(
-                    "服务类型名称不能为空".to_string(),
+                    "Service type name cannot be empty".to_string(),
                 ));
             }
 
             if image_name.trim().is_empty() {
                 return Err(ConfigError::ValidationError(format!(
-                    "服务类型 '{}' 的镜像名称不能为空",
+                    "Image name for service type '{}' cannot be empty",
                     service_type
                 )));
             }
@@ -320,7 +319,7 @@ impl ProjectImageOverrides {
         for service_type in &self.enabled_services {
             if service_type.trim().is_empty() {
                 return Err(ConfigError::ValidationError(
-                    "启用的服务类型名称不能为空".to_string(),
+                    "Enabled service type name cannot be empty".to_string(),
                 ));
             }
         }
@@ -340,7 +339,7 @@ impl ProjectImageOverrides {
         if let Some(override_image) = self.images.get(&service_key) {
             config.image = Some(override_image.clone());
             tracing::info!(
-                "应用项目级镜像覆盖到服务 '{}': {}",
+                "Applying project-level image override to service '{}': {}",
                 service_key,
                 override_image
             );

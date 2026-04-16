@@ -40,9 +40,7 @@ impl MountProcessor {
     ///
     /// # Returns
     /// * `DockerResult<Self>` - 挂载点处理器或错误
-    pub async fn new_with_docker_socket(
-        docker_socket_path: Option<String>,
-    ) -> DockerResult<Self> {
+    pub async fn new_with_docker_socket(docker_socket_path: Option<String>) -> DockerResult<Self> {
         let resolver = HostPathResolver::new_with_docker_socket(docker_socket_path).await?;
         Ok(Self { resolver })
     }
@@ -68,7 +66,7 @@ impl MountProcessor {
         let mut host_path = host_path.as_ref().to_string();
 
         debug!(
-            "处理挂载点: {} -> {} (只读: {})",
+            "Processing mount point: {} -> {} (read_only: {})",
             container_path, host_path, read_only
         );
 
@@ -78,7 +76,7 @@ impl MountProcessor {
                 let pattern = format!("{{{}}}", key);
                 if host_path.contains(&pattern) {
                     host_path = host_path.replace(&pattern, value);
-                    debug!("变量替换: {} -> {}", pattern, value);
+                    debug!(" substituted: {} -> {}", pattern, value);
                 }
             }
         }
@@ -87,7 +85,7 @@ impl MountProcessor {
         let normalized_host_path = self.resolve_path(&host_path)?;
 
         info!(
-            "✅ 挂载点处理完成: {} -> {}",
+            "Mount point processing completed: {} -> {}",
             container_path, normalized_host_path
         );
 
@@ -111,7 +109,7 @@ impl MountProcessor {
         mounts: Vec<(String, String, bool)>,
         variables: Option<&HashMap<String, String>>,
     ) -> DockerResult<Vec<MountPoint>> {
-        debug!("批量处理 {} 个挂载点", mounts.len());
+        debug!("Processing {} mounts", mounts.len());
 
         let processed: DockerResult<Vec<MountPoint>> = mounts
             .into_iter()
@@ -121,7 +119,10 @@ impl MountProcessor {
             .collect();
 
         let processed = processed?;
-        info!("✅ 批量挂载点处理完成: {} 个", processed.len());
+        info!(
+            "Mount processing completed: {} mounts",
+            processed.len()
+        );
 
         Ok(processed)
     }
@@ -138,8 +139,8 @@ impl MountProcessor {
 
         // 处理相对路径：转换为容器内绝对路径
         let container_absolute_path = if path_obj.is_relative() {
-            let current_dir = std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("/app"));
+            let current_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/app"));
             current_dir.join(path_obj)
         } else {
             path_obj.to_path_buf()
@@ -148,12 +149,20 @@ impl MountProcessor {
         // 检查是否为容器内路径
         if container_absolute_path.starts_with("/app") {
             // 容器内路径：转换为宿主机路径
-            debug!("检测到容器内路径，进行路径解析: {}", container_absolute_path.display());
-            let host_abs_path = self.resolver.resolve_to_host_path(&container_absolute_path)?;
+            debug!(
+                "Detected container path, resolving to host path: {}",
+                container_absolute_path.display()
+            );
+            let host_abs_path = self
+                .resolver
+                .resolve_to_host_path(&container_absolute_path)?;
             Ok(host_abs_path.to_string_lossy().to_string())
         } else {
             // 可能已经是宿主机路径，直接使用
-            debug!("使用可能是宿主机的路径: {}", container_absolute_path.display());
+            debug!(
+                "Using potential host path: {}",
+                container_absolute_path.display()
+            );
             Ok(container_absolute_path.to_string_lossy().to_string())
         }
     }

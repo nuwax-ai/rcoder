@@ -49,7 +49,7 @@ impl ProjectAdapter {
             }
             Ok(None) => None,
             Err(e) => {
-                warn!("获取项目 {} 失败: {}", project_id, e);
+                warn!("getproject {} failed: {}", project_id, e);
                 None
             }
         }
@@ -64,25 +64,28 @@ impl ProjectAdapter {
         // 如果有容器信息，先保存容器
         if let Some(container) = info.container() {
             debug!(
-                "插入项目容器信息: project_id={}, container_id={}, container_ip={}",
+                "Inserting project container info: project_id={}, container_id={}, container_ip={}",
                 project_id, container.container_id, container.container_ip
             );
             let container_record =
                 DataBridge::container_info_to_record(container, info.service_type());
             self.storage.save_container(&container_record)?;
         } else {
-            debug!("插入项目但无容器信息: project_id={}", project_id);
+            debug!(
+                "No project container: project_id={}",
+                project_id
+            );
         }
 
         // 保存项目记录
         let record = DataBridge::info_to_project_record(&info, &project_id);
         debug!(
-            "保存项目记录: project_id={}, session_id={:?}, container_id={}",
+            "Saving project record: project_id={}, session_id={:?}, container_id={}",
             record.project_id, record.session_id, record.container_id
         );
         self.storage.save_project(&record)?;
 
-        debug!("插入项目: {}", project_id);
+        debug!("Removed project: {}", project_id);
         Ok(())
     }
 
@@ -93,11 +96,11 @@ impl ProjectAdapter {
 
         // 删除项目记录
         if let Err(e) = self.storage.delete_project(project_id) {
-            warn!("删除项目 {} 失败: {}", project_id, e);
+            warn!("Failed to remove project {}: {}", project_id, e);
             return None;
         }
 
-        debug!("删除项目: {}", project_id);
+        debug!("Removed project: {}", project_id);
         Some(info)
     }
 
@@ -106,7 +109,7 @@ impl ProjectAdapter {
         match self.storage.project_exists(project_id) {
             Ok(exists) => exists,
             Err(e) => {
-                warn!("检查项目 {} 是否存在失败: {}", project_id, e);
+                warn!("Failed to check project {} exists: {}", project_id, e);
                 false
             }
         }
@@ -148,7 +151,7 @@ impl ProjectAdapter {
             }
             Ok(None) => None,
             Err(e) => {
-                warn!("通过会话ID {} 获取项目失败: {}", session_id, e);
+                warn!("Failed to get project for session {}: {}", session_id, e);
                 None
             }
         }
@@ -162,7 +165,7 @@ impl ProjectAdapter {
     ) -> Result<(), duckdb_manager::DuckDbError> {
         self.storage.update_session(project_id, session_id)?;
         debug!(
-            "更新会话: project_id={}, session_id={}",
+            "Updating session: project_id={}, session_id={}",
             project_id, session_id
         );
         Ok(())
@@ -178,13 +181,16 @@ impl ProjectAdapter {
         match self.storage.get_container_name_by_session(session_id) {
             Ok(container_name) => {
                 debug!(
-                    "通过会话ID获取容器名称: session_id={}, container_name={:?}",
+                    "Getting container name by session_id: session_id={}, container_name={:?}",
                     session_id, container_name
                 );
                 container_name
             }
             Err(e) => {
-                warn!("通过会话ID {} 获取容器名称失败: {}", session_id, e);
+                warn!(
+                    " sessionID {} getcontainer failed: {}",
+                    session_id, e
+                );
                 None
             }
         }
@@ -206,7 +212,7 @@ impl ProjectAdapter {
             }
             Ok(None) => None,
             Err(e) => {
-                warn!("更新项目 {} 活动时间失败: {}", project_id, e);
+                warn!("update project {} failed: {}", project_id, e);
                 None
             }
         }
@@ -223,7 +229,7 @@ impl ProjectAdapter {
                 updated
             }
             Err(e) => {
-                warn!("更新会话 {} 活动时间失败: {}", session_id, e);
+                warn!("update session {} failed: {}", session_id, e);
                 false
             }
         }
@@ -260,7 +266,7 @@ impl ProjectAdapter {
             Ok(Some(record)) => Some(DataBridge::container_record_to_info(&record)),
             Ok(None) => None,
             Err(e) => {
-                warn!("获取容器 {} 失败: {}", container_id, e);
+                warn!("getcontainer {} failed: {}", container_id, e);
                 None
             }
         }
@@ -285,7 +291,7 @@ impl ProjectAdapter {
                 .map(DataBridge::container_record_to_info)
                 .collect(),
             Err(e) => {
-                warn!("按服务类型获取容器失败: {}", e);
+                warn!("Failed to get container: {}", e);
                 Vec::new()
             }
         }
@@ -319,11 +325,11 @@ impl ProjectAdapter {
                 self.get_container(&container_id)
             }
             Ok(None) => {
-                debug!("未找到用户 {} 的项目记录", user_id);
+                debug!("No project for user_id {} ", user_id);
                 None
             }
             Err(e) => {
-                warn!("通过用户ID {} 查找容器失败: {}", user_id, e);
+                warn!("Failed to get container for user_id {}: {}", user_id, e);
                 None
             }
         }
@@ -339,7 +345,7 @@ impl ProjectAdapter {
         match self.storage.find_projects_by_user_id(user_id) {
             Ok(projects) => projects,
             Err(e) => {
-                warn!("通过用户ID {} 查找项目失败: {}", user_id, e);
+                warn!("Failed to get project for user_id {}: {}", user_id, e);
                 Vec::new()
             }
         }
@@ -359,7 +365,7 @@ impl ProjectAdapter {
         {
             Ok(containers) => containers,
             Err(e) => {
-                warn!("查找闲置容器失败: {}", e);
+                warn!("Failed to get container: {}", e);
                 Vec::new()
             }
         }
@@ -370,7 +376,7 @@ impl ProjectAdapter {
         match self.storage.get_stats() {
             Ok(stats) => stats,
             Err(e) => {
-                warn!("获取存储统计失败: {}", e);
+                warn!("get value failed: {}", e);
                 StorageStats::default()
             }
         }
@@ -387,7 +393,7 @@ impl ProjectAdapter {
     ) -> Result<(Vec<String>, Vec<serde_json::Value>), String> {
         self.storage
             .execute_raw_query(sql)
-            .map_err(|e| format!("查询执行失败: {}", e))
+            .map_err(|e| format!("Query execution failed: {}", e))
     }
 
     // ========== 内部辅助方法 ==========

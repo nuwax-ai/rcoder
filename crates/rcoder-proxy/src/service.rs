@@ -85,21 +85,22 @@ fn mask_header_value(value: &str) -> String {
 fn mask_url(url: &str) -> String {
     // 尝试解析 URL
     if let Ok(parsed_url) = url::Url::parse(url)
-        && let Some(host) = parsed_url.host_str() {
-            let masked_host = mask_domain(host);
-            // 重新构建 URL，保留协议、端口、路径等
-            let scheme = parsed_url.scheme();
-            let port = parsed_url
-                .port()
-                .map(|p| format!(":{}", p))
-                .unwrap_or_default();
-            let path = parsed_url.path();
-            let query = parsed_url
-                .query()
-                .map(|q| format!("?{}", q))
-                .unwrap_or_default();
-            return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
-        }
+        && let Some(host) = parsed_url.host_str()
+    {
+        let masked_host = mask_domain(host);
+        // 重新构建 URL，保留协议、端口、路径等
+        let scheme = parsed_url.scheme();
+        let port = parsed_url
+            .port()
+            .map(|p| format!(":{}", p))
+            .unwrap_or_default();
+        let path = parsed_url.path();
+        let query = parsed_url
+            .query()
+            .map(|q| format!("?{}", q))
+            .unwrap_or_default();
+        return format!("{}://{}{}{}{}", scheme, masked_host, port, path, query);
+    }
 
     // 如果解析失败，直接返回原始 URL（不应该发生）
     url.to_string()
@@ -452,7 +453,7 @@ impl ProxyHttp for PortProxy {
 
         // 使用 matchit 匹配路由
         let matched = self.router.at(path).map_err(|_| {
-            warn!("未匹配到路由: {}", path);
+            warn!("route not found: {}", path);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
         })?;
 
@@ -470,7 +471,7 @@ impl ProxyHttp for PortProxy {
                 // 健康检查：代理到 Axum 的 /health 端点
                 // 这样既能验证 Pingora 正常运行，又能验证 Axum 正常运行
                 info!(
-                    "🏥 健康检查请求: {} - 代理到 Axum ({})",
+                    "🏥 Health check request: {} - proxying to Axum ({})",
                     path, self.default_backend_port
                 );
 
@@ -512,7 +513,7 @@ impl ProxyHttp for PortProxy {
 
         // 使用 matchit 匹配路由
         let matched = self.router.at(path).map_err(|_| {
-            warn!("未匹配到路由: {}", path);
+            warn!("route not found: {}", path);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
         })?;
 
@@ -572,7 +573,7 @@ impl ProxyHttp for PortProxy {
         // 根据 peer 的 ALPN 配置推断协议
         let alpn_str = match peer.options.alpn {
             ALPN::H2 => "HTTP/2 (H2)",
-            ALPN::H2H1 => "HTTP/2 优先 (H2H1)",
+            ALPN::H2H1 => "HTTP/2 preferred (H2H1)",
             ALPN::H1 => "HTTP/1.1 (H1)",
             ALPN::Custom(_) => "Custom ALPN",
         };
@@ -582,12 +583,12 @@ impl ProxyHttp for PortProxy {
         let tls_info = digest
             .and_then(|d| d.ssl_digest.as_ref())
             .map(|ssl| format!("TLS {}", ssl.version))
-            .unwrap_or_else(|| "无 TLS".to_string());
+            .unwrap_or_else(|| "No TLS".to_string());
 
         // 只在 API 代理场景打印详细日志
         if ctx.upstream_host.is_some() {
             debug!(
-                "🔌 [API_PROXY] 连接建立: ALPN={}, {}, 复用={}",
+                "🔌 [API_PROXY] Connection established: ALPN={}, {}, reused={}",
                 alpn_str, tls_info, reused
             );
         }
@@ -625,33 +626,43 @@ impl ProxyHttp for PortProxy {
         // 日志记录
         if ctx.vnc_target_ip.is_some() {
             debug!(
-                "VNC 响应: {} (耗时: {:?})",
+                "VNC response: {} (duration: {:?})",
                 upstream_response.status, duration
             );
         } else if let Some(upstream_host) = &ctx.upstream_host {
             // 🔗 API 代理响应: 打印协议版本
             let http_ver = ctx.http_version.as_deref().unwrap_or("unknown");
-            let reused = if ctx.connection_reused { "是" } else { "否" };
+            let reused = if ctx.connection_reused { "yes" } else { "no" };
 
             if status_code >= 400 {
                 // ⚠️ 错误响应：提升到 WARN 级别，打印响应 headers
                 warn!(
-                    "❌ [API_PROXY] 上游错误响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
-                    upstream_host, upstream_response.status, http_ver, ctx.use_tls, reused, duration
+                    "❌ [API_PROXY] Upstream error response: {} -> {} (protocol: {}, TLS: {}, reused: {}, duration: {:?})",
+                    upstream_host,
+                    upstream_response.status,
+                    http_ver,
+                    ctx.use_tls,
+                    reused,
+                    duration
                 );
                 // 打印上游响应 headers
                 for (name, value) in upstream_response.headers.iter() {
                     let val_str = value.to_str().unwrap_or("<binary>");
-                    debug!("🔍 [API_PROXY_DEBUG] 响应 Header: {} = {}", name, val_str);
+                    debug!("[API_PROXY_DEBUG] response Header: {} = {}", name, val_str);
                 }
             } else {
                 info!(
-                    "📡 [API_PROXY] 上游响应: {} -> {} (协议: {}, TLS: {}, 复用: {}, 耗时: {:?})",
-                    upstream_host, upstream_response.status, http_ver, ctx.use_tls, reused, duration
+                    "📡 [API_PROXY] Upstream response: {} -> {} (protocol: {}, TLS: {}, reused: {}, duration: {:?})",
+                    upstream_host,
+                    upstream_response.status,
+                    http_ver,
+                    ctx.use_tls,
+                    reused,
+                    duration
                 );
             }
         } else {
-            debug!("收到上游响应: {}", upstream_response.status);
+            debug!("upstream response: {}", upstream_response.status);
         }
 
         Ok(())
@@ -683,7 +694,7 @@ impl ProxyHttp for PortProxy {
                 if end_of_stream && !ctx.error_body_buf.is_empty() {
                     let body_str = String::from_utf8_lossy(&ctx.error_body_buf);
                     warn!(
-                        "❌ [API_PROXY] 上游错误响应体 (service={}, status={}): {}",
+                        "❌ [API_PROXY] Upstream error response body (service={}, status={}): {}",
                         service_name, status, body_str
                     );
                 }
@@ -705,7 +716,7 @@ impl PortProxy {
         };
 
         new_uri_str.parse().map_err(|e| {
-            error!("URI 解析失败: {} - {}", new_uri_str, e);
+            error!("URI rewrite failed: {} - {}", new_uri_str, e);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })
     }
@@ -726,12 +737,12 @@ impl PortProxy {
     ) -> PingoraResult<()> {
         // 从路径参数中提取 user_id 和 project_id
         let user_id = params.get("user_id").ok_or_else(|| {
-            error!("VNC 路由缺少 user_id 参数");
+            error!("VNC route missing user_id param");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
         let project_id = params.get("project_id").ok_or_else(|| {
-            error!("VNC 路由缺少 project_id 参数");
+            error!("VNC route missing project_id param");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -744,7 +755,7 @@ impl PortProxy {
         };
 
         debug!(
-            "VNC 请求: user_id={}, project_id={}, target_path={}",
+            "VNC request: user_id={}, project_id={}, target_path={}",
             user_id, project_id, target_path
         );
 
@@ -774,12 +785,12 @@ impl PortProxy {
     ) -> PingoraResult<()> {
         // 从路径参数中提取端口
         let port_str = params.get("port").ok_or_else(|| {
-            error!("端口代理路由缺少 port 参数");
+            error!("port proxy route missing port params");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
         let port: u16 = port_str.parse().map_err(|_| {
-            error!("无效的端口号: {}", port_str);
+            error!(" parse port failed: {}", port_str);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -791,7 +802,10 @@ impl PortProxy {
             format!("/{}", remaining_path)
         };
 
-        debug!("端口代理请求: port={}, target_path={}", port, target_path);
+        debug!(
+            "portproxyrequest: port={}, target_path={}",
+            port, target_path
+        );
 
         // 设置 Host 头
         upstream_request.insert_header("Host", "127.0.0.1")?;
@@ -856,12 +870,12 @@ impl PortProxy {
     ) -> PingoraResult<()> {
         // 提取参数
         let user_id = params.get("user_id").ok_or_else(|| {
-            error!("音频路由缺少 user_id 参数");
+            error!(" missing route user_id params");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
         let project_id = params.get("project_id").ok_or_else(|| {
-            error!("音频路由缺少 project_id 参数");
+            error!(" missing route project_id params");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -880,9 +894,9 @@ impl PortProxy {
             .get(user_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
-                warn!("❌ [AUDIO] 用户容器不存在: user_id={}", user_id);
+                warn!("[AUDIO] container not found: user_id={}", user_id);
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                    .more_context(format!("找不到用户 {} 的音频后端，请先创建容器", user_id))
+                    .more_context(format!("audio backend for user {} not found, please create container first", user_id))
             })?;
 
         // 记录上下文
@@ -890,7 +904,7 @@ impl PortProxy {
         ctx.upstream_host = Some(format!("{}:{}", container_ip, target_port));
 
         info!(
-            "🎵 [AUDIO] 音频代理: user_id={}, project_id={}, path={}, target={}:{}",
+            "🎵 [AUDIO] Audio proxy: user_id={}, project_id={}, path={}, target={}:{}",
             user_id, project_id, remaining_path, container_ip, target_port
         );
 
@@ -925,12 +939,12 @@ impl PortProxy {
         ctx: &mut TrackingCtx,
     ) -> PingoraResult<()> {
         let user_id = params.get("user_id").ok_or_else(|| {
-            error!("IME 路由缺少 user_id 参数");
+            error!("IME route missing user_id param");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
         let project_id = params.get("project_id").ok_or_else(|| {
-            error!("IME 路由缺少 project_id 参数");
+            error!("IME route missing project_id param");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -943,16 +957,16 @@ impl PortProxy {
             .get(user_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
-                warn!("❌ [IME] 用户容器不存在: user_id={}", user_id);
+                warn!("[IME] container not found: user_id={}", user_id);
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                    .more_context(format!("找不到用户 {} 的 IME 后端，请先创建容器", user_id))
+                    .more_context(format!("IME backend for user {} not found, please create container first", user_id))
             })?;
 
         ctx.target_port = Some(IME_PORT);
         ctx.upstream_host = Some(format!("{}:{}", container_ip, IME_PORT));
 
         info!(
-            "⌨️ [IME] 输入法代理: user_id={}, project_id={}, path={}, target={}:{}",
+            "⌨️ [IME] IME proxy: user_id={}, project_id={}, path={}, target={}:{}",
             user_id, project_id, remaining_path, container_ip, IME_PORT
         );
 
@@ -992,7 +1006,7 @@ impl PortProxy {
     ) -> PingoraResult<()> {
         // 1. 提取服务名称（如 "anthropic", "openai"）
         let service_name = params.get("service_name").ok_or_else(|| {
-            error!("API 代理路由缺少 service_name 参数");
+            error!("API proxy route missing service_name param");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -1003,7 +1017,7 @@ impl PortProxy {
         ctx.api_service_name = Some(service_name.to_string());
 
         debug!(
-            "🔒 API 代理请求: service_name={}, api_path={}",
+            "🔒 API proxy request: service_name={}, api_path={}",
             service_name, api_path
         );
 
@@ -1012,7 +1026,7 @@ impl PortProxy {
             let method = upstream_request.method.as_str();
             let uri = original_uri.to_string();
             debug!(
-                "🔍 [API_PROXY_DEBUG] ====== 原始请求 ======\n  Method: {}\n  URI: {}",
+                "🔍 [API_PROXY_DEBUG] ====== Original request ======\n  Method: {}\n  URI: {}",
                 method, uri
             );
             for (name, value) in upstream_request.headers.iter() {
@@ -1022,22 +1036,29 @@ impl PortProxy {
                     || name.as_str().eq_ignore_ascii_case("authorization")
                 {
                     let masked = mask_header_value(val_str);
-                    debug!("🔍 [API_PROXY_DEBUG]   Header: {} = {}", name, masked);
+                    debug!("[API_PROXY_DEBUG]   Header: {} = {}", name, masked);
                 } else {
-                    debug!("🔍 [API_PROXY_DEBUG]   Header: {} = {}", name, val_str);
+                    debug!("[API_PROXY_DEBUG]   Header: {} = {}", name, val_str);
                 }
             }
         }
 
         // 3. 从 ApiKeyManager 查询 API 密钥配置
         let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
-            warn!("🔑 [API_PROXY] 找不到服务 '{}' 的 API 密钥配置", service_name);
+            warn!(
+                "🔑 [API_PROXY] Cannot find API key config for service '{}'",
+                service_name
+            );
             // 打印所有可用的 key 用于调试
-            let available_keys: Vec<_> = self.api_key_manager.iter().map(|r| r.key().clone()).collect();
-            warn!("🔑 [API_PROXY] 可用的 keys: {:?}", available_keys);
+            let available_keys: Vec<_> = self
+                .api_key_manager
+                .iter()
+                .map(|r| r.key().clone())
+                .collect();
+            warn!("🔑 [API_PROXY] available keys: {:?}", available_keys);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
                 format!(
-                    "找不到服务 {} 的 API 密钥配置，请确保已正确配置",
+                    "Cannot find API key config for service {}, please ensure it is properly configured",
                     service_name
                 ),
             )
@@ -1048,9 +1069,9 @@ impl PortProxy {
 
         // 🔍 [DEBUG] 打印完整的 ModelProviderConfig（脱敏）
         debug!(
-            "🔍 [API_PROXY_DEBUG] ====== DashMap 配置 (service={}) ======\n  base_url: {}\n  api_protocol: {:?}\n  requires_openai_auth: {}\n  api_key: {}",
+            "🔍 [API_PROXY_DEBUG] ====== DashMap config (service={}) ======\n  base_url: {}\n  api_protocol: {:?}\n  requires_openai_auth: {}\n  api_key: {}",
             service_name,
-            base_url,  // 不脱敏，debug 模式下需要完整 URL 排查
+            base_url, // 不脱敏，debug 模式下需要完整 URL 排查
             config.api_protocol,
             config.requires_openai_auth,
             mask_header_value(&config.api_key),
@@ -1078,7 +1099,7 @@ impl PortProxy {
         if use_anthropic_auth {
             upstream_request.insert_header("x-api-key", &config.api_key)?;
             info!(
-                "🔑 [API_PROXY] 已注入 Anthropic 格式 x-api-key: {} (api_protocol={:?})",
+                "🔑 [API_PROXY] Injected Anthropic format x-api-key: {} (api_protocol={:?})",
                 mask_header_value(&config.api_key),
                 config.api_protocol
             );
@@ -1086,7 +1107,7 @@ impl PortProxy {
             upstream_request
                 .insert_header("authorization", format!("Bearer {}", config.api_key))?;
             info!(
-                "🔑 [API_PROXY] 已注入 OpenAI 格式 Bearer: {} (api_protocol={:?})",
+                "🔑 [API_PROXY] Injected OpenAI format Bearer: {} (api_protocol={:?})",
                 mask_header_value(&config.api_key),
                 config.api_protocol
             );
@@ -1107,13 +1128,10 @@ impl PortProxy {
         };
 
         // 🔍 [DEBUG] 打印完整的上游 URL（不脱敏）
-        debug!(
-            "🔍 [API_PROXY_DEBUG] 上游完整 URL: {}",
-            new_uri_str
-        );
+        debug!("🔍 [API_PROXY_DEBUG] proxy URL: {}", new_uri_str);
 
         let new_uri = new_uri_str.parse::<http::Uri>().map_err(|e| {
-            error!("URI 解析失败: {} - {}", new_uri_str, e);
+            error!("URI rewrite failed: {} - {}", new_uri_str, e);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -1126,7 +1144,7 @@ impl PortProxy {
             .and_then(|s: &str| s.split('/').next())
         {
             upstream_request.insert_header("Host", host)?;
-            debug!("🔑 已设置 Host: {}", host);
+            debug!("🔑 Host header already set: {}", host);
         }
 
         // 9. 设置通用代理头
@@ -1137,25 +1155,25 @@ impl PortProxy {
         // 对 URL 进行脱敏处理后输出日志
         let masked_url = mask_url(base_url);
         info!(
-            "✅ [API_PROXY] {} 请求已重写到: {}",
+            "✅ [API_PROXY] {} request rewritten to: {}",
             service_name, masked_url
         );
 
         // 🔍 [DEBUG] 打印最终发送到上游的所有 headers
         {
-            debug!("🔍 [API_PROXY_DEBUG] ====== 最终上游请求 Headers ======");
+            debug!("[API_PROXY_DEBUG] ====== request Headers ======");
             for (name, value) in upstream_request.headers.iter() {
                 let val_str = value.to_str().unwrap_or("<binary>");
                 if name.as_str().eq_ignore_ascii_case("x-api-key")
                     || name.as_str().eq_ignore_ascii_case("authorization")
                 {
                     let masked = mask_header_value(val_str);
-                    debug!("🔍 [API_PROXY_DEBUG]   {} = {}", name, masked);
+                    debug!("[API_PROXY_DEBUG]   {} = {}", name, masked);
                 } else {
-                    debug!("🔍 [API_PROXY_DEBUG]   {} = {}", name, val_str);
+                    debug!("[API_PROXY_DEBUG]   {} = {}", name, val_str);
                 }
             }
-            debug!("🔍 [API_PROXY_DEBUG] ====== Headers 结束 ======");
+            debug!("[API_PROXY_DEBUG] ====== response Headers ======");
         }
 
         Ok(())
@@ -1171,15 +1189,15 @@ impl PortProxy {
     ) -> PingoraResult<Box<HttpPeer>> {
         // 1. 提取服务名称
         let service_name = params.get("service_name").ok_or_else(|| {
-            error!("API 代理路由缺少 service_name 参数");
+            error!("API proxy route missing service_name param");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
         // 2. 从 ApiKeyManager 查询 API 配置
         let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
-            warn!("找不到服务 {} 的 API 密钥配置", service_name);
+            warn!("{} not in API config", service_name);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                .more_context(format!("找不到服务 {} 的 API 密钥配置", service_name))
+                .more_context(format!("API key config for service {} not found", service_name))
         })?;
 
         let config = api_config.value();
@@ -1208,7 +1226,7 @@ impl PortProxy {
         } else {
             return Err(
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
-                    .more_context(format!("无效的 base_url 格式: {}", base_url)),
+                    .more_context(format!("invalid base_url format: {}", base_url)),
             );
         };
 
@@ -1275,7 +1293,7 @@ impl PortProxy {
         backends
             .get(&port)
             .cloned()
-            .ok_or_else(|| anyhow!("未找到端口 {} 对应的后端服务", port))
+            .ok_or_else(|| anyhow!("backend service not found for port {}", port))
             .or_else(|_| Ok(self.backend_host.clone())) // 如果找不到，使用默认主机
     }
 
@@ -1294,14 +1312,14 @@ impl PortProxy {
     ) -> PingoraResult<Box<HttpPeer>> {
         // 从路径参数中提取 user_id
         let user_id = params.get("user_id").ok_or_else(|| {
-            error!("VNC 路由缺少 user_id 参数");
+            error!("VNC route missing user_id param");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
         let project_id = params.get("project_id").unwrap_or("");
 
         debug!(
-            "VNC 代理请求: user_id={}, project_id={}",
+            "VNC proxy request: user_id={}, project_id={}",
             user_id, project_id
         );
 
@@ -1309,10 +1327,10 @@ impl PortProxy {
         let container_ip = match self.vnc_backends.get(user_id) {
             Some(ip_ref) => ip_ref.value().clone(),
             None => {
-                info!("找不到用户 {} 的 VNC 后端", user_id);
+                info!("routing {} to VNC", user_id);
                 return Err(
                     pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                        .more_context(format!("找不到用户 {} 的 VNC 后端，请先创建容器", user_id)),
+                        .more_context(format!("VNC backend for user {} not found, please create container first", user_id)),
                 );
             }
         };
@@ -1325,7 +1343,7 @@ impl PortProxy {
         ctx.vnc_target_ip = Some(container_ip.clone());
 
         debug!(
-            "VNC 代理: user_id={}, project_id={} -> {}:{}",
+            "VNC proxy: user_id={}, project_id={} -> {}:{}",
             user_id, project_id, container_ip, NOVNC_PORT
         );
 
@@ -1347,7 +1365,7 @@ impl PortProxy {
         params: Params<'_, '_>,
     ) -> PingoraResult<Box<HttpPeer>> {
         let user_id = params.get("user_id").ok_or_else(|| {
-            error!("音频路由缺少 user_id 参数");
+            error!(" missing route user_id params");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -1364,9 +1382,9 @@ impl PortProxy {
             .get(user_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
-                warn!("❌ [AUDIO] 容器不存在: user_id={}", user_id);
+                warn!("[AUDIO] containernot found: user_id={}", user_id);
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                    .more_context(format!("找不到用户 {} 的音频后端", user_id))
+                    .more_context(format!("audio backend for user {} not found", user_id))
             })?;
 
         // 记录指标
@@ -1384,7 +1402,7 @@ impl PortProxy {
         peer.options.total_connection_timeout = Some(Duration::from_secs(15));
         peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1 小时空闲超时
 
-        debug!("🎵 [AUDIO] 连接到音频后端: {}", peer_addr);
+        debug!("🎵 [AUDIO] connection from: {}", peer_addr);
 
         Ok(peer)
     }
@@ -1396,7 +1414,7 @@ impl PortProxy {
         params: Params<'_, '_>,
     ) -> PingoraResult<Box<HttpPeer>> {
         let user_id = params.get("user_id").ok_or_else(|| {
-            error!("IME 路由缺少 user_id 参数");
+            error!("IME route missing user_id param");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -1405,9 +1423,9 @@ impl PortProxy {
             .get(user_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
-                warn!("❌ [IME] 容器不存在: user_id={}", user_id);
+                warn!("[IME] containernot found: user_id={}", user_id);
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                    .more_context(format!("找不到用户 {} 的 IME 后端", user_id))
+                    .more_context(format!("IME backend for user {} not found", user_id))
             })?;
 
         self.metrics.record_request();
@@ -1424,7 +1442,7 @@ impl PortProxy {
         peer.options.total_connection_timeout = Some(Duration::from_secs(15));
         peer.options.idle_timeout = Some(Duration::from_secs(3600));
 
-        debug!("⌨️ [IME] 连接到 IME 后端: {}", peer_addr);
+        debug!("⌨️ [IME] connection IME from: {}", peer_addr);
 
         Ok(peer)
     }
@@ -1437,12 +1455,12 @@ impl PortProxy {
     ) -> PingoraResult<Box<HttpPeer>> {
         // 从路径参数中提取端口
         let port_str = params.get("port").ok_or_else(|| {
-            error!("端口代理路由缺少 port 参数");
+            error!("port proxy route missing port params");
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
         let target_port: u16 = port_str.parse().map_err(|_| {
-            error!("无效的端口号: {}", port_str);
+            error!(" parse port failed: {}", port_str);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
@@ -1458,13 +1476,13 @@ impl PortProxy {
                 .write()
                 .await
                 .insert(target_port, backend_host.clone());
-            debug!("动态添加后端服务: {} -> {}", target_port, backend_host);
+            debug!(" routing: {} -> {}", target_port, backend_host);
         }
 
         // 获取后端主机地址
         let backend_host = self.get_backend_host(target_port).await?;
 
-        debug!("路由到后端: {}:{}", backend_host, target_port);
+        debug!("route: {}:{}", backend_host, target_port);
 
         // 创建 HTTP Peer
         let peer = Box::new(HttpPeer::new(
@@ -1531,7 +1549,7 @@ impl PingoraProxyService {
     pub fn create_pingora_proxy(&self) -> anyhow::Result<PortProxy> {
         // 使用统一的路由配置
         let router = create_router().map_err(|e| {
-            tracing::error!("❌ [PROXY] 创建路由表失败: {}", e);
+            tracing::error!("[PROXY] create route failed: {}", e);
             e
         })?;
 
@@ -1552,14 +1570,14 @@ impl PingoraProxyService {
     pub async fn add_backend(&self, port: u16, host: String) {
         let mut backends = self.backends.write().await;
         backends.insert(port, host.clone());
-        info!("添加后端服务: {} -> {}", port, host);
+        info!(" proxy route: {} -> {}", port, host);
     }
 
     /// 移除后端服务
     pub async fn remove_backend(&self, port: u16) {
         let mut backends = self.backends.write().await;
         if backends.remove(&port).is_some() {
-            info!("移除后端服务: {}", port);
+            info!("removed route: {}", port);
         }
     }
 
@@ -1589,10 +1607,11 @@ impl PingoraProxyService {
         if path.starts_with("/proxy/") {
             let parts: Vec<&str> = path.split('/').collect();
             if parts.len() >= 3
-                && let Ok(port) = parts[2].parse::<u16>() {
-                    debug!("从路径中提取端口: {}", port);
-                    return Ok(port);
-                }
+                && let Ok(port) = parts[2].parse::<u16>()
+            {
+                debug!("proxy path for port: {}", port);
+                return Ok(port);
+            }
         }
 
         // 2. 然后尝试从 URL 查询参数中获取端口 (向后兼容)
@@ -1600,15 +1619,16 @@ impl PingoraProxyService {
             for param in query.split('&') {
                 if let Some((key, value)) = param.split_once('=')
                     && key == self.config.port_param
-                        && let Ok(port) = value.parse::<u16>() {
-                            debug!("从 URL 参数中提取端口: {}", port);
-                            return Ok(port);
-                        }
+                    && let Ok(port) = value.parse::<u16>()
+                {
+                    debug!("URL params for port: {}", port);
+                    return Ok(port);
+                }
             }
         }
 
         // 3. 使用默认端口
-        debug!("使用默认端口: {}", self.config.default_backend_port);
+        debug!("default port: {}", self.config.default_backend_port);
         Ok(self.config.default_backend_port)
     }
 
@@ -1618,7 +1638,7 @@ impl PingoraProxyService {
         backends
             .get(&port)
             .cloned()
-            .ok_or_else(|| anyhow!("未找到端口 {} 对应的后端服务", port))
+            .ok_or_else(|| anyhow!("backend service not found for port {}", port))
     }
 
     /// 创建负载均衡器
@@ -1656,7 +1676,7 @@ impl PingoraProxyService {
         // 这个方法提供兼容性，但实际的代理由 Pingora 服务器处理
         // 在实际部署中，请求会直接发送到 Pingora 监听的端口
         Err(anyhow!(
-            "此方法仅用于兼容性。实际的代理功能由 Pingora 服务器处理，请直接请求 Pingora 监听的端口"
+            "This method is only for compatibility. Actual proxy functionality is handled by Pingora server, please directly request the port Pingora is listening on"
         ))
     }
 
@@ -1730,7 +1750,7 @@ impl PingoraProxyService {
         self.vnc_backends
             .insert(user_id.to_string(), container_ip.to_string());
         info!(
-            "添加 VNC 后端: user_id={} -> container_ip={}",
+            "Added VNC backend: user_id={} -> container_ip={}",
             user_id, container_ip
         );
     }
@@ -1741,7 +1761,7 @@ impl PingoraProxyService {
     pub fn remove_vnc_backend(&self, user_id: &str) -> Option<String> {
         let removed = self.vnc_backends.remove(user_id);
         if let Some((_, ip)) = &removed {
-            info!("移除 VNC 后端: user_id={} (was: {})", user_id, ip);
+            info!("removed VNC route: user_id={} (was: {})", user_id, ip);
         }
         removed.map(|(_, ip)| ip)
     }
@@ -1943,7 +1963,7 @@ mod tests {
     #[test]
     fn test_matchit_debug() {
         // 验证 matchit 0.8 的正确语法: {*name} 而不是 *name
-        eprintln!("\n=== matchit 0.8 语法验证 ===");
+        eprintln!("\n=== matchit 0.8 mismatch ===");
 
         let mut router: Router<&str> = Router::new();
         router
@@ -1954,7 +1974,7 @@ mod tests {
         let path = "/computer/vnc/user_123/proj_456/vnc.html";
         match router.at(path) {
             Ok(m) => {
-                eprintln!("✓ 路由匹配成功!");
+                eprintln!("✓ route match succeeded!");
                 eprintln!("  user_id = {}", m.params.get("user_id").unwrap());
                 eprintln!("  project_id = {}", m.params.get("project_id").unwrap());
                 eprintln!("  path = {}", m.params.get("path").unwrap());

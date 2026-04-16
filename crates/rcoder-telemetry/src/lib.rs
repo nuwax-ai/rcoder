@@ -16,7 +16,7 @@
 //!     // 从环境变量初始化配置
 //!     let config = TelemetryConfig::from_env("my-service");
 //!
-//!     // 初始化遥测系统（包含 console 日志、OTLP 追踪、Prometheus 指标）
+//!     // Initializing telemetry system（包含 console 日志、OTLP 追踪、Prometheus 指标）
 //!     let telemetry = init(config).await?;
 //!
 //!     // 在应用中使用 telemetry.render_metrics() 暴露 /metrics 端点
@@ -46,14 +46,12 @@ pub mod propagation;
 pub use config::{FileLogConfig, OtlpConfig, PrometheusConfig, TelemetryConfig};
 pub use middleware::{GrpcMetricsInterceptor, HttpMetricsLayer};
 pub use prometheus::{
-    inc_active_tasks, dec_active_tasks, set_active_tasks,
-    record_agent_task, record_agent_task_duration,
-    record_grpc_duration, record_grpc_request,
-    record_http_duration, record_http_request,
+    dec_active_tasks, inc_active_tasks, record_agent_task, record_agent_task_duration,
+    record_grpc_duration, record_grpc_request, record_http_duration, record_http_request,
+    set_active_tasks,
 };
 pub use propagation::{
-    extract_context, extract_context_http,
-    inject_context, inject_context_http,
+    extract_context, extract_context_http, inject_context, inject_context_http,
     set_global_propagator,
 };
 
@@ -112,11 +110,14 @@ impl Drop for TelemetryGuard {
         if self.tracer_provider.is_some() {
             otlp::shutdown_tracer_provider();
         }
-        info!("🔚 [Telemetry] 遥测系统已关闭: {}", self.service_name);
+        info!(
+            "[Telemetry] Telemetry system shutdown: {}",
+            self.service_name
+        );
     }
 }
 
-/// 一键初始化遥测系统
+/// 一键Initializing telemetry system
 ///
 /// 根据配置初始化完整的遥测栈：
 /// - **Console 日志**: 始终启用，输出到标准输出
@@ -162,7 +163,7 @@ pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         None
     };
 
-    // 初始化 Prometheus（如果配置了）
+    // Initializing Prometheus（如果配置了）
     let prometheus_handle = if config.prometheus.is_some() {
         Some(prometheus::init_prometheus()?)
     } else {
@@ -176,9 +177,12 @@ pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         config.file_log.as_ref(),
     )?;
 
-    info!("🚀 [Telemetry] 初始化遥测系统: {}", config.service_name);
     info!(
-        "✅ [Telemetry] 遥测系统初始化完成: OTLP={}, Prometheus={}, FileLog={}, Console=true",
+        "[Telemetry] Initializing telemetry system: {}",
+        config.service_name
+    );
+    info!(
+        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, Console=true",
         tracer_provider.is_some(),
         prometheus_handle.is_some(),
         config.file_log.is_some()
@@ -308,13 +312,13 @@ fn init_tracing_subscriber(
     Ok(())
 }
 
-/// 仅初始化 Prometheus（不初始化 OTLP 和 tracing）
+/// 仅Initializing Prometheus（不初始化 OTLP 和 tracing）
 ///
 /// 适用于只需要 metrics 不需要 tracing 的场景。
 /// **注意**：此函数不会初始化 tracing subscriber，调用方需要自行初始化。
 pub fn init_prometheus_only(service_name: impl Into<String>) -> Result<TelemetryGuard> {
     let service_name = service_name.into();
-    info!("🚀 [Telemetry] 初始化 Prometheus: {}", service_name);
+    info!("[Telemetry] Initializing Prometheus: {}", service_name);
 
     let prometheus_handle = prometheus::init_prometheus()?;
 

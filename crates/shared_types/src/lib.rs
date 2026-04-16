@@ -1,5 +1,17 @@
+// 在 crate 根级别初始化 i18n
+// fallback 设置为默认语言 en-US，保持一致性
+rust_i18n::i18n!("locales", fallback = "en-US");
+
 mod container;
 mod model;
+
+// i18n 国际化模块
+pub mod i18n;
+pub use i18n::{
+    DEFAULT_LOCALE, SUPPORTED_LOCALES, get_locale, parse_accept_language, set_locale, t, t_default,
+};
+pub mod request_locale;
+pub use request_locale::{current_request_locale, scope_request_locale};
 
 // Chat Agent 配置模块
 mod chat_agent_config;
@@ -20,6 +32,7 @@ pub use constants::*;
 
 // 错误码定义模块
 pub mod error_codes;
+pub use error_codes::{get_error_message, get_i18n_message, get_i18n_message_default};
 
 // gRPC 模块
 pub mod grpc {

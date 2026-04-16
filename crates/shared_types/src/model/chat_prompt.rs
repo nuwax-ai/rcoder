@@ -33,7 +33,6 @@ pub struct ChatPrompt {
     pub model_provider: Option<ModelProviderConfig>,
 
     // === 新增字段 (v2) ===
-
     /// 可选的系统提示词覆盖
     ///
     /// 如果提供，将覆盖默认的系统提示词配置

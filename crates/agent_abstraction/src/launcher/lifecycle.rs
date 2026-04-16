@@ -19,8 +19,8 @@
 //! - 能够正确清理子进程及其所有孙进程
 
 use anyhow::Result;
-use process_wrap::tokio::ChildWrapper;
 use dashmap::DashMap;
+use process_wrap::tokio::ChildWrapper;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -124,9 +124,9 @@ impl AgentLifecycleGuard {
             child_process,
             stderr_task,
             cancel_token,
-            None,  // 默认无密钥管理器
-            None,  // 默认无 project_uuid_map
-            None,  // 默认无 service_uuid
+            None, // 默认无密钥管理器
+            None, // 默认无 project_uuid_map
+            None, // 默认无 service_uuid
         )
     }
 
@@ -430,7 +430,7 @@ impl AgentLifecycleGuard {
         #[cfg(unix)]
         {
             use nix::errno::Errno;
-            use nix::sys::signal::{kill, Signal};
+            use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
             // 🔥 关键防御性检查：pgid 不能为 0
@@ -455,10 +455,7 @@ impl AgentLifecycleGuard {
 
             match kill(target, signal) {
                 Ok(_) => {
-                    debug!(
-                        "已发送信号到进程组: pgid={}, signal={:?}",
-                        pgid, signal
-                    );
+                    debug!("already sent signal: pgid={}, signal={:?}", pgid, signal);
 
                     // 如果是 SIGTERM，等待一段时间让进程优雅退出
                     if !force {
@@ -466,12 +463,12 @@ impl AgentLifecycleGuard {
 
                         // 强制杀死进程组
                         let _ = kill(target, Signal::SIGKILL);
-                        debug!("已强制终止进程组: pgid={}", pgid);
+                        debug!("already force killed: pgid={}", pgid);
                     }
                 }
                 Err(Errno::ESRCH) => {
                     // 进程组已退出，这是正常的
-                    debug!("进程组已退出: pgid={}", pgid);
+                    debug!("process group already exited: pgid={}", pgid);
                 }
                 Err(Errno::EPERM) => {
                     // 权限不足，无法终止进程组
@@ -482,19 +479,16 @@ impl AgentLifecycleGuard {
                 }
                 Err(e) => {
                     // 其他错误（如 EINVAL、EFAULT 等）
-                    debug!(
-                        "终止进程组失败: pgid={}, error={:?}",
-                        pgid, e
-                    );
+                    debug!(" kill failed: pgid={}, error={:?}", pgid, e);
                 }
             }
 
-            info!("✅ Claude process group stopped: pgid={}", pgid);
+            info!("Claude process group stopped: pgid={}", pgid);
         }
 
         #[cfg(not(unix))]
         {
-            debug!("非 Unix 平台，跳过进程组终止");
+            debug!("Unix platform, skipping process group stop");
         }
 
         Ok(())
@@ -547,7 +541,7 @@ impl Drop for AgentLifecycleGuard {
             // 🔥 同步终止进程组
             #[cfg(unix)]
             {
-                use nix::sys::signal::{kill, Signal};
+                use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
 
                 let pgid = self.inner.pgid;
@@ -579,7 +573,7 @@ impl Drop for AgentLifecycleGuard {
 
             #[cfg(not(unix))]
             {
-                debug!("[Claude] 非 Unix 平台，跳过进程组终止");
+                debug!("[Claude] Unix platform, skipping process group stop");
             }
 
             // 注意：后台回收任务 (reaper_task) 会自动完成

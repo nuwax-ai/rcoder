@@ -11,13 +11,9 @@ pub const TAURI_APP_DATA_DIR: &str = "com.nuwax.agent-tauri-client";
 /// 在系统 PATH 中查找可执行文件
 fn find_in_path(executable: &str) -> Option<String> {
     let output = if cfg!(windows) {
-        std::process::Command::new("where")
-            .arg(executable)
-            .output()
+        std::process::Command::new("where").arg(executable).output()
     } else {
-        std::process::Command::new("which")
-            .arg(executable)
-            .output()
+        std::process::Command::new("which").arg(executable).output()
     };
 
     match output {
@@ -93,7 +89,7 @@ pub fn build_rcoder_path_env() -> Option<String> {
     if let Ok(runtime_path) = std::env::var("NUWAX_APP_RUNTIME_PATH") {
         let runtime_path = runtime_path.trim().to_string();
         if !runtime_path.is_empty() {
-            info!("[Env] 已从 NUWAX_APP_RUNTIME_PATH 构建 PATH");
+            info!("[Env] Using NUWAX_APP_RUNTIME_PATH to build PATH");
             return Some(runtime_path);
         }
     }
@@ -115,7 +111,7 @@ pub fn build_rcoder_path_env() -> Option<String> {
 
         if !paths.is_empty() {
             let path_value = paths.join(sep);
-            info!("[Env] 从 APPDATA 构建 PATH: {}", path_value);
+            info!("[Env] APPDATA built PATH: {}", path_value);
             return Some(path_value);
         }
     }

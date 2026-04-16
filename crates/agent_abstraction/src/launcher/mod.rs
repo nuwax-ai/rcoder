@@ -51,8 +51,8 @@
 //!
 //! 这确保了 Agent 资源的正确清理，即使在异常情况下也不会泄漏。
 
-pub mod lifecycle;
 mod claude_code_sacp;
+pub mod lifecycle;
 #[cfg(windows)]
 mod windows_launch;
 
@@ -64,18 +64,13 @@ pub use lifecycle::AgentLifecycleGuard;
 
 // 直接导出 SACP 类型
 pub use claude_code_sacp::{
-    SacpClaudeCodeLauncher,
-    SacpLauncherConnectionInfo,
-    SacpAgentLaunchConfig,
-    load_sacp_agent_config,
-    get_default_sacp_agent_config,
-    convert_context_servers_sacp,
+    SacpAgentLaunchConfig, SacpClaudeCodeLauncher, SacpLauncherConnectionInfo,
+    convert_context_servers_sacp, get_default_sacp_agent_config, load_sacp_agent_config,
 };
 
 // ============================================================================
 // 兼容性类型别名（向后兼容旧代码）
 // ============================================================================
-
 
 /// 兼容性别名：ClaudeCodeLauncher -> SacpClaudeCodeLauncher
 pub type ClaudeCodeLauncher<N> = SacpClaudeCodeLauncher<N>;

@@ -23,7 +23,7 @@ logs/
 docker/project_workspace/
 docker/logs/
 docker/specs/
-docker/rcoder-agent-runner/
+# docker/rcoder-agent-runner/  # 保留（包含 downloads/ 用于 LibreOffice 预下载）
 docker/computer-cache/
 docker/computer-project-workspace/
 
