@@ -175,7 +175,7 @@ RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
 # ============================================================================
 # Installation logic:
 #   1. If local tar.gz exists in downloads/ (pre-downloaded via Makefile) -> use it
-#   2. Otherwise -> download from official URL (fallback)
+#   2. Otherwise -> download from Waterloo mirror (primary), then official (fallback)
 #
 # This allows:
 #   - Fast build with pre-downloaded files (avoid slow external download)
@@ -184,27 +184,42 @@ RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
 ARG LIBREOFFICE_FILE
 ARG TARGETARCH
 
+# Copy pre-downloaded LibreOffice files (from Makefile docker-pre-download-libreoffice)
+COPY downloads/ /downloads/
+
 # Determine URL based on architecture
+# Use Waterloo mirror (fast) as primary, official as fallback
 RUN echo "Installing LibreOffice..." && \
     case "${TARGETARCH}" in \
     "amd64") \
-        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/x86_64/${LIBREOFFICE_FILE}" \
+        LIBREOFFICE_PRIMARY="https://mirror.csclub.uwaterloo.ca/tdf/libreoffice/stable/25.8.5/deb/x86_64/${LIBREOFFICE_FILE}" \
+        LIBREOFFICE_FALLBACK="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/x86_64/${LIBREOFFICE_FILE}" \
         ;; \
     "arm64") \
-        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/aarch64/${LIBREOFFICE_FILE}" \
+        LIBREOFFICE_PRIMARY="https://mirror.csclub.uwaterloo.ca/tdf/libreoffice/stable/25.8.5/deb/aarch64/${LIBREOFFICE_FILE}" \
+        LIBREOFFICE_FALLBACK="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/aarch64/${LIBREOFFICE_FILE}" \
         ;; \
     *) echo "❌ Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
     # Check if local pre-downloaded file exists
-    if [ -f "downloads/${LIBREOFFICE_FILE}" ]; then \
-        echo "📦 Using pre-downloaded file: downloads/${LIBREOFFICE_FILE}"; \
-        cp downloads/${LIBREOFFICE_FILE} /tmp/libreoffice.tar.gz; \
+    if [ -f "/downloads/${LIBREOFFICE_FILE}" ]; then \
+        echo "📦 Using pre-downloaded file: /downloads/${LIBREOFFICE_FILE}"; \
+        cp /downloads/${LIBREOFFICE_FILE} /tmp/libreoffice.tar.gz; \
     else \
-        echo "🌐 No local file found, downloading from official URL..."; \
-        wget -q -O /tmp/libreoffice.tar.gz "${LIBREOFFICE_URL}" || { \
-            echo "❌ ERROR: Failed to download LibreOffice from ${LIBREOFFICE_URL}"; \
-            exit 1; \
-        }; \
+        echo "🌐 No local file found, downloading..."; \
+        # Try primary mirror first (Waterloo - fast)
+        if wget -q -O /tmp/libreoffice.tar.gz "${LIBREOFFICE_PRIMARY}"; then \
+            echo "✅ Downloaded from Waterloo mirror"; \
+        else \
+            echo "⚠️ Primary mirror failed, trying official fallback..."; \
+            wget -q -O /tmp/libreoffice.tar.gz "${LIBREOFFICE_FALLBACK}" || { \
+                echo "❌ ERROR: Failed to download LibreOffice from all sources"; \
+                echo "   Primary: ${LIBREOFFICE_PRIMARY}"; \
+                echo "   Fallback: ${LIBREOFFICE_FALLBACK}"; \
+                exit 1; \
+            }; \
+            echo "✅ Downloaded from official fallback"; \
+        fi; \
     fi && \
     # Extract and install
     cd /tmp && \
@@ -226,6 +241,7 @@ RUN echo "Installing LibreOffice..." && \
     fi && \
     # Clean up
     rm -rf /tmp/LibreOffice_* /tmp/libreoffice.tar.gz && \
+    rm -rf /downloads/ && \
     apt-get autoremove -y && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/*
