@@ -18,6 +18,8 @@ spec:
       - name: rcoder
         image: rcoder:test
         imagePullPolicy: Never
+        command: ["/app/bin/rcoder"]
+        args: ["--port", "8087"]
         ports:
         - containerPort: 8087
         env:

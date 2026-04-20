@@ -41,6 +41,14 @@ kubectl logs -n rcoder -l app=rcoder -f
 
 ### 4. 清理
 
+与 `make dev-up-k8s` 对称的完整卸载（Deployment、Service、运行时创建的 Pod、RBAC、Namespace）：
+
+```bash
+make dev-down-k8s
+```
+
+或在 `k8s/` 目录下使用脚本（逻辑与上面一致）：
+
 ```bash
 ./undeploy.sh
 ```

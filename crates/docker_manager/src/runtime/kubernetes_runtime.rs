@@ -13,7 +13,9 @@ use container_runtime_api::{
     RuntimeContainerInfo,
 };
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::api::core::v1::{Container as K8sContainer, ContainerPort, EnvVar, Pod, PodSpec};
+use k8s_openapi::api::core::v1::{Container as K8sContainer, ContainerPort, EnvVar, Pod, PodSpec, Probe};
+#[cfg(feature = "kubernetes")]
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
@@ -29,7 +31,7 @@ use std::sync::Arc;
 #[cfg(feature = "kubernetes")]
 use tokio::sync::RwLock;
 #[cfg(feature = "kubernetes")]
-use tracing::info;
+use tracing::{debug, info};
 
 #[cfg(feature = "kubernetes")]
 use crate::types::DockerManagerConfig;
@@ -102,8 +104,11 @@ impl KubernetesRuntime {
     }
 
     /// Generate pod name from project_id
+    /// K8s Pod names must conform to RFC 1123: lowercase alphanumeric + '-', must start/end with alphanumeric
+    /// Replace underscores with hyphens to ensure compatibility
     fn pod_name(&self, project_id: &str, service_type: &ServiceType) -> String {
-        format!("{}-{}", service_type.container_prefix(), project_id)
+        let sanitized_id = project_id.replace('_', "-");
+        format!("{}-{}", service_type.container_prefix(), sanitized_id)
     }
 
     /// Extract pod status from Pod object
@@ -142,6 +147,7 @@ impl KubernetesRuntime {
     }
 
     /// Wait for pod to be ready
+    /// 使用 readinessProbe 检查 Pod 是否真正就绪，而非仅检查 Running 状态
     async fn wait_for_pod_ready(
         &self,
         identifier: &str,
@@ -149,11 +155,55 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         let timeout = std::time::Duration::from_secs(120);
         let start = std::time::Instant::now();
+        let pod_name = self.pod_name(identifier, service_type);
 
         while start.elapsed() < timeout {
-            if let Some(pod) = self.find_container(identifier, service_type).await? {
-                if pod.status == ContainerRuntimeStatus::Running {
-                    return Ok(());
+            match self.pods().get(&pod_name).await {
+                Ok(pod) => {
+                    // 检查 Pod phase，提前识别永久失败状态
+                    if let Some(phase) = pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
+                        match phase {
+                            "Failed" | "Succeeded" => {
+                                return Err(ContainerRuntimeError::K8sError(format!(
+                                    "Pod {} entered terminal state: {}",
+                                    pod_name, phase
+                                )));
+                            }
+                            "Running" => {
+                                // Pod 运行中，检查 Ready condition
+                            }
+                            _ => {
+                                // Pending 等其他状态，继续等待
+                            }
+                        }
+                    }
+
+                    // 检查 Pod 是否 Ready (需要 readinessProbe 返回成功)
+                    if let Some(status) = &pod.status {
+                        if let Some(conditions) = &status.conditions {
+                            let all_ready = conditions.iter().any(|c| {
+                                c.type_ == "Ready" && c.status == "True"
+                            });
+                            if all_ready {
+                                info!("[K8S] Pod {} is Ready", pod_name);
+                                return Ok(());
+                            }
+                            // 调试用：打印当前状态
+                            let ready_status = conditions.iter()
+                                .map(|c| format!("{}={}", c.type_, c.status))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            debug!("[K8S] Pod {} conditions: {}", pod_name, ready_status);
+                        }
+                    }
+                }
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                    // Pod 还没创建，继续等待
+                }
+                Err(e) => {
+                    return Err(ContainerRuntimeError::K8sError(format!(
+                        "Failed to get pod '{}': {}", pod_name, e
+                    )));
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -186,14 +236,14 @@ impl KubernetesRuntime {
             container_id: pod_info.container_id.clone(),
             container_name: pod_info.container_name.clone(),
             container_ip: pod_info.container_ip.clone(),
-            internal_port: shared_types::GRPC_DEFAULT_PORT,
+            internal_port: shared_types::HTTP_DEFAULT_PORT,
             external_port: 0,
             project_id: project_id.to_string(),
             status: String::from(pod_info.status.clone()),
             created_at: pod_info.created_at,
             service_url: format!(
                 "http://{}:{}",
-                pod_info.container_ip, shared_types::GRPC_DEFAULT_PORT
+                pod_info.container_ip, shared_types::HTTP_DEFAULT_PORT
             ),
         })
     }
@@ -265,6 +315,7 @@ impl ContainerRuntime for KubernetesRuntime {
                 containers: vec![K8sContainer {
                     name: "agent".to_string(),
                     image: Some(image),
+                    image_pull_policy: Some("Never".to_string()),
                     env: Some(vec![
                         EnvVar {
                             name: "PROJECT_ID".to_string(),
@@ -282,11 +333,32 @@ impl ContainerRuntime for KubernetesRuntime {
                             ..Default::default()
                         },
                     ]),
-                    ports: Some(vec![ContainerPort {
-                        container_port: shared_types::GRPC_DEFAULT_PORT as i32,
-                        name: Some("grpc".to_string()),
+                    ports: Some(vec![
+                        ContainerPort {
+                            container_port: shared_types::GRPC_DEFAULT_PORT as i32,
+                            name: Some("grpc".to_string()),
+                            ..Default::default()
+                        },
+                        // HTTP health check port for agent_runner
+                        ContainerPort {
+                            container_port: 8086,
+                            name: Some("http".to_string()),
+                            ..Default::default()
+                        },
+                    ]),
+                    readiness_probe: Some(Probe {
+                        http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                            path: Some("/health".to_string()),
+                            port: IntOrString::Int(8086),
+                            ..Default::default()
+                        }),
+                        initial_delay_seconds: Some(5),
+                        period_seconds: Some(5),
+                        timeout_seconds: Some(3),
+                        failure_threshold: Some(20),
+                        success_threshold: Some(1),
                         ..Default::default()
-                    }]),
+                    }),
                     ..Default::default()
                 }],
                 restart_policy: Some("Never".to_string()),
@@ -435,19 +507,35 @@ impl ContainerRuntime for KubernetesRuntime {
     }
 
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()> {
-        let pod_name = self.pod_name(project_id, &ServiceType::RCoder);
+        // First check if pod exists with either service type to avoid unnecessary 404
+        // Try both service types - one of them should have the pod
+        let rcoder_exists = self
+            .find_container(project_id, &ServiceType::RCoder)
+            .await?
+            .is_some();
+        let computer_exists = self
+            .find_container(project_id, &ServiceType::ComputerAgentRunner)
+            .await?
+            .is_some();
 
-        self.pods()
-            .delete(&pod_name, &DeleteParams::default())
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::ContainerStopError(format!("Failed to delete pod: {}", e))
-            })?;
+        if rcoder_exists {
+            self.stop_container_by_identifier(project_id, &ServiceType::RCoder)
+                .await?;
+            info!("[K8S] Pod for project {} deleted successfully (RCoder)", project_id);
+            return Ok(());
+        }
 
-        // Remove from cache
-        self.pod_cache.write().await.remove(project_id);
+        if computer_exists {
+            self.stop_container_by_identifier(project_id, &ServiceType::ComputerAgentRunner)
+                .await?;
+            info!(
+                "[K8S] Pod for project {} deleted successfully (ComputerAgentRunner)",
+                project_id
+            );
+            return Ok(());
+        }
 
-        info!("[K8S] Pod {} deleted successfully", pod_name);
+        // Pod doesn't exist - this is OK, consider it already stopped
         Ok(())
     }
 

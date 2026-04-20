@@ -19,10 +19,10 @@
 修复 RCoder 的 Kubernetes 运行时支持，使系统能够在 K8s 环境中动态创建和管理容器（Pod），而不依赖 Docker Socket。
 
 主要改动：
-1. 重构 `global` 模块使用 `RuntimeManager` 选择运行时
-2. K8s Runtime 支持 `user_id` 参数
-3. 使用 Pod IP 通信（与 Docker 保持一致，无需 Service DNS）
-4. 实现 `list_containers`
+1. 重构 `global` 模块使用 `RuntimeManager` 选择运行时 **（P0 - 关键路径）**
+2. K8s Runtime 支持 `user_id` 参数 **（P0 - ComputerAgent 支持）**
+3. 修复 `stop_container` 方法正确处理不同 ServiceType **（P0）**
+4. 更新 Makefile K8s 命令避免重复操作 **（P1）**
 
 ## Technical Context
 **Language/Version**: Rust 1.75+ (2024 Edition)  
@@ -35,6 +35,32 @@
 - 必须兼容现有 Docker 模式
 - K8s Service Account 需要预配置
 - 需要 RBAC 权限创建/删除 Pod
+
+## Problem Analysis (Updated 2026-04-20)
+
+### P0 Issues (Critical - Blocking K8s)
+
+| Issue | Location | Description |
+|-------|----------|-------------|
+| `RuntimeManager::init()` never called | `main.rs:181-186` | K8s mode calls `init_global_docker_manager_with_config()` which does NOT initialize `RuntimeManager::RUNTIME_INSTANCE` |
+| `stop_container` ignores service_type | `kubernetes_runtime.rs:437` | Always uses `ServiceType::RCoder`, cannot stop ComputerAgentRunner pods |
+| K8s path not properly initialized | `lib.rs:201-223` | `init_global_docker_manager_with_config()` has K8s code but never reaches it properly |
+
+### Root Cause
+
+```rust
+// main.rs calls this:
+docker_manager::global::init_global_docker_manager_with_config(config).await
+
+// But this function does NOT call RuntimeManager::init() for K8s mode!
+// It only sets GLOBAL_DOCKER_MANAGER (for Docker mode)
+```
+
+### Required Changes
+
+1. **main.rs**: Initialize using `RuntimeManager::init()` for K8s, or modify `init_global_docker_manager_with_config()` to properly call `RuntimeManager::init()` when K8s mode detected
+
+2. **kubernetes_runtime.rs**: Fix `stop_container` to handle different service types
 
 ## Constitution Check
 *Note: Constitution file is empty template - no gates to check*
@@ -112,64 +138,77 @@ k8s/
 
 ## Phase 1: Design & Contracts
 
-### Interface Changes
+### Actual Code Changes Required
 
-1. **`ContainerRuntime` trait** (新增方法):
+#### 1. Fix `lib.rs` - global module initialization
+
+**Current (broken)**:
 ```rust
-// 新增方法
-async fn list_containers_by_label(&self, label: &str) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>>;
-```
+pub async fn init_global_docker_manager_with_config(config: DockerManagerConfig) -> DockerResult<()> {
+    let runtime_type = RuntimeType::from_env();
+    crate::runtime::RuntimeManager::init(config.clone()).await  // <- Already calls RuntimeManager::init()!
 
-2. **`KubernetesRuntime` 实现**:
-```rust
-// 支持 user_id
-async fn create_container(&self, project_id: Option<&str>, user_id: Option<&str>, ...) -> Result<...>
-
-// 使用 Pod IP 通信（与 Docker 保持一致）
-// service_url: "http://{pod_ip}:{port}"
-```
-
-3. **`global` 模块重构**:
-```rust
-// 修改 init
-pub async fn init_global_runtime(config: DockerManagerConfig) -> DockerResult<()> {
-    match RuntimeType::from_env() {
-        RuntimeType::Kubernetes => RuntimeManager::init(config).await,
-        RuntimeType::Docker => {
-            // 直接初始化 DockerManager（保持向后兼容）
-            init_docker_manager_direct(config).await
-        }
+    if runtime_type == RuntimeType::Docker {
+        let manager = Arc::new(DockerManager::new(config).await?);
+        GLOBAL_DOCKER_MANAGER.set(manager)...;
     }
+    // Problem: Sets RUNTIME_INSTANCE in RuntimeManager::init() but returns DockerResult
 }
 ```
 
-4. **Health Check 抽象**:
+**Fix**: Ensure proper error handling and that K8s path doesn't try to set GLOBAL_DOCKER_MANAGER
+
+#### 2. Fix `main.rs` - runtime initialization
+
+**Current**: Calls `init_global_docker_manager_with_config()` which should work, but error handling may be wrong
+
+**Fix**: Verify RuntimeManager is properly initialized before using `RuntimeManager::get()`
+
+#### 3. Fix `kubernetes_runtime.rs` - stop_container
+
+**Current**:
 ```rust
-// 新增 K8s 健康检查
-async fn wait_for_pod_ready(&self, pod_name: &str) -> ContainerRuntimeResult<()>
+async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()> {
+    let pod_name = self.pod_name(project_id, &ServiceType::RCoder);  // Always RCoder!
+    // ...
+}
 ```
 
-### Data Model
-See `data-model.md`
+**Fix**: Need to track service_type per container or change the interface
+
+#### 4. Fix Makefile k8s commands
+
+**Current**:
+```makefile
+dev-up-k8s:
+    kubectl apply -f manifests/rcoder-deployment.yaml
+    kubectl set image deployment/rcoder rcoder=$(IMAGE)  # Redundant after apply
+
+dev-restart-k8s: dev-build-k8s
+    kubectl apply -f manifests/rcoder-deployment.yaml
+    kubectl set image deployment/rcoder rcoder=$(IMAGE)
+    kubectl rollout restart deploy/rcoder  # rollout restart uses current deployment image, not new one!
+```
+
+**Fix**: Use `kubectl delete pods` or fix the image update flow
 
 ## Phase 2: Task Planning Approach
 *This section describes what the /tasks command will do - DO NOT execute during /plan*
 
 **Task Generation Strategy**:
-- 依赖分析：首先解决 global 模块重构（P0）
-- 然后修复 K8s Runtime 的 user_id 支持（P0）
-- 实现 list_containers（P1）
-- 最后更新健康检查（P1）
+- P0 优先级：先解决阻止 K8s 运行的 critical 问题
+- P1 优先级：修复已知的 bug 和不完整实现
+- P2 优先级：改进和优化
 
-**Ordering Strategy**:
-1. 重构 global 模块使其使用 RuntimeManager
-2. 修改 rcoder main.rs 适配新接口
-3. 修复 KubernetesRuntime user_id 支持
-4. 实现 list_containers
-5. 更新 K8s 健康检查
-6. 测试和文档
+**Task Order (Dependency-Based)**:
+1. **[P0] Fix global module initialization** - 确保 K8s 模式下 RuntimeManager 正确初始化
+2. **[P0] Fix rcoder main.rs** - 调用正确的初始化函数
+3. **[P0] Fix stop_container in KubernetesRuntime** - 正确处理不同 service_type
+4. **[P1] Fix Makefile k8s commands** - 消除重复操作，简化逻辑
+5. **[P1] Test K8s mode end-to-end** - 验证修复有效
+6. **[P2] Improve K8s health check** - 如有时间，优化健康检查
 
-**Estimated Output**: ~10-15 tasks
+**Estimated Output**: 8-10 focused tasks
 
 ## Complexity Tracking
 | Violation | Why Needed | Simpler Alternative Rejected Because |

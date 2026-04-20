@@ -33,7 +33,7 @@ help:
 	@echo "  make dev-build-k8s  - 构建 K8s 镜像（启用 kubernetes feature）"
 	@echo "  make dev-up-k8s     - 启动 K8s 开发模式（标准 kubectl apply）"
 	@echo "  make dev-restart-k8s - 重启 K8s 开发模式（重新构建镜像+部署）"
-	@echo "  make dev-down-k8s   - 停止 K8s 开发模式（从集群移除）"
+	@echo "  make dev-down-k8s   - 停止 K8s 开发模式（Workload + RBAC + Namespace，与 dev-up 对称）"
 	@echo "  make dev-logs-k8s   - 查看 K8s 开发模式日志"
 	@echo "  变量: IMAGE=rcoder:test-k8s ROLLOUT_TIMEOUT=180s"
 	@echo "  示例: make dev-restart-k8s IMAGE=rcoder:test-k8s"
@@ -418,8 +418,7 @@ dev-up-k8s:
 	@echo "☸️  启动 K8s 开发模式..."
 	@kubectl apply -f k8s/manifests/namespace.yaml
 	@kubectl apply -f k8s/manifests/serviceaccount.yaml
-	@kubectl apply -f k8s/manifests/rcoder-deployment.yaml
-	@kubectl set image deployment/rcoder rcoder=$(IMAGE) -n $(K8S_NAMESPACE)
+	@sed "s|image: rcoder:test|image: $(IMAGE)|" k8s/manifests/rcoder-deployment.yaml | kubectl apply -f -
 	@kubectl apply -f k8s/manifests/rcoder-service.yaml
 	@kubectl rollout status deploy/rcoder -n $(K8S_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
 	@echo "📋 K8s 部署状态:"
@@ -430,22 +429,25 @@ dev-up-k8s:
 # 重启 K8s 开发模式（重新构建镜像+部署）
 dev-restart-k8s: dev-build-k8s
 	@echo "☸️  重启 K8s 开发模式..."
-	@kubectl apply -f k8s/manifests/namespace.yaml
-	@kubectl apply -f k8s/manifests/serviceaccount.yaml
-	@kubectl apply -f k8s/manifests/rcoder-deployment.yaml
-	@kubectl set image deployment/rcoder rcoder=$(IMAGE) -n $(K8S_NAMESPACE)
-	@kubectl apply -f k8s/manifests/rcoder-service.yaml
-	@kubectl rollout restart deploy/rcoder -n $(K8S_NAMESPACE)
+	@kubectl delete pods -n $(K8S_NAMESPACE) -l app=rcoder --ignore-not-found
+	@sed "s|image: rcoder:test|image: $(IMAGE)|" k8s/manifests/rcoder-deployment.yaml | kubectl apply -f -
 	@kubectl rollout status deploy/rcoder -n $(K8S_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
 	@echo "✅ K8s 部署已重启！"
 	@echo "📋 查看状态: kubectl get pods -n $(K8S_NAMESPACE)"
 
-# 停止 K8s 开发模式（从集群移除）
+# 停止 K8s 开发模式（与 dev-up-k8s / k8s/undeploy.sh 对称：Workload → 运行时 Pod → RBAC → Namespace）
 dev-down-k8s:
 	@echo "☸️  停止 K8s 开发模式..."
 	@kubectl delete -f k8s/manifests/rcoder-deployment.yaml --ignore-not-found
 	@kubectl delete -f k8s/manifests/rcoder-service.yaml --ignore-not-found
-	@echo "✅ K8s 部署已移除"
+	@echo "☸️  清理由 RCoder 运行时创建的 Pod（managed-by=rcoder-runtime）..."
+	@kubectl get namespace $(K8S_NAMESPACE) >/dev/null 2>&1 && \
+		kubectl delete pods -n $(K8S_NAMESPACE) -l managed-by=rcoder-runtime --ignore-not-found || true
+	@echo "☸️  移除 ServiceAccount 与集群级 RBAC（ClusterRole / ClusterRoleBinding）..."
+	@kubectl delete -f k8s/manifests/serviceaccount.yaml --ignore-not-found
+	@echo "☸️  移除 Namespace $(K8S_NAMESPACE)..."
+	@kubectl delete -f k8s/manifests/namespace.yaml --ignore-not-found
+	@echo "✅ K8s 开发栈已从集群移除（含 $(K8S_NAMESPACE) 命名空间）"
 
 # 查看 K8s 开发模式日志
 dev-logs-k8s:
