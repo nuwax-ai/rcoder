@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.specify/scripts/bash/setup-plan.sh --help)",
+      "Bash(.specify/scripts/bash/setup-plan.sh)",
+      "Bash(.specify/scripts/bash/setup-plan.sh --json)",
+      "Bash(git add *)"
+    ]
+  }
+}
