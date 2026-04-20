@@ -72,45 +72,52 @@ async fn main() -> anyhow::Result<()> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     // 🔄 初始化宿主机路径解析器（自动检测模式）
+    // K8s 模式下不需要 Docker socket，跳过路径解析器初始化
     info!("starting to detect mount path...");
-    let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH").unwrap_or_else(|_| {
- info!("DOCKER_SOCKET_PATH not set, using default: /var/run/docker.sock");
-        "/var/run/docker.sock".to_string()
-    });
+    let runtime_type = docker_manager::runtime_selection::RuntimeType::from_env();
 
-    info!("Docker socket: {}", docker_socket_path);
+    if runtime_type == docker_manager::runtime_selection::RuntimeType::Kubernetes {
+        info!("[K8S] Kubernetes runtime mode, skipping Docker socket path resolver");
+    } else {
+        let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH").unwrap_or_else(|_| {
+            info!("DOCKER_SOCKET_PATH not set, using default: /var/run/docker.sock");
+            "/var/run/docker.sock".to_string()
+        });
 
-    let _path_resolver =
-        match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone()))
-            .await
-        {
-            Ok(resolver) => {
-                info!("path resolver initialized successfully");
-                info!(
-                    "  Container workspace: {:?}",
-                    resolver.container_workspace_base()
-                );
-                info!(
-                    "work directory: {:?}",
-                    resolver.host_workspace_base()
-                );
-                Some(resolver)
-            }
-            Err(e) => {
-                error!("path resolver initialization failed: {}", e);
-                error!("please check config:");
-                error!("1. Docker socket path: {}", docker_socket_path);
-                error!("2. Docker socket already mounted in container");
-                error!("3. container has Docker API access");
-                error!("4. project work directory mounted");
+        info!("Docker socket: {}", docker_socket_path);
 
-                // 显示详细的错误信息和解决建议
-                show_docker_configuration_help(&docker_socket_path);
+        let _path_resolver =
+            match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone()))
+                .await
+            {
+                Ok(resolver) => {
+                    info!("path resolver initialized successfully");
+                    info!(
+                        "  Container workspace: {:?}",
+                        resolver.container_workspace_base()
+                    );
+                    info!(
+                        "work directory: {:?}",
+                        resolver.host_workspace_base()
+                    );
+                    Some(resolver)
+                }
+                Err(e) => {
+                    error!("path resolver initialization failed: {}", e);
+                    error!("please check config:");
+                    error!("1. Docker socket path: {}", docker_socket_path);
+                    error!("2. Docker socket already mounted in container");
+                    error!("3. container has Docker API access");
+                    error!("4. project work directory mounted");
 
-                // 返回错误，停止启动
-                return Err(anyhow::anyhow!("Container self-check failed, unable to initialize path resolver"));
-            }
-        };
+                    // 显示详细的错误信息和解决建议
+                    show_docker_configuration_help(&docker_socket_path);
+
+                    // 返回错误，停止启动
+                    return Err(anyhow::anyhow!("Container self-check failed, unable to initialize path resolver"));
+                }
+            };
+    }
 
     // 🧹 启动时清理上次可能遗留的容器
     // 先使用正确配置初始化全局 DockerManager

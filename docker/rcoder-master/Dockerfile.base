@@ -11,6 +11,19 @@ FROM node:22
 # 设置环境变量
 ENV TZ=Asia/Shanghai
 
+# 使用 LinuxMirrors 一键配置阿里云镜像源
+# 参考: https://github.com/SuperManito/LinuxMirrors
+# node:22 基础镜像已预装 curl，可直接执行脚本配置镜像源
+RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
+    --source mirrors.aliyun.com \
+    --protocol https \
+    --use-intranet-source false \
+    --install-epel false \
+    --backup false \
+    --upgrade-software false \
+    --clean-cache true \
+    --ignore-backup-tips
+
 # 安装必要的运行时依赖（apt 包管理器）
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -33,6 +46,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
+
+# 复制 npmrc 配置镜像（使用国内镜像加速）
+COPY .npmrc /root/.npmrc
 
 # 配置 npm 使用国内镜像源
 RUN npm config set registry https://registry.npmmirror.com
@@ -67,25 +83,31 @@ RUN npm install -g @openai/codex@latest
 # 安装 Chrome DevTools MCP（强制更新到最新版本）
 RUN npm install -g chrome-devtools-mcp@latest
 
-# 安装 Bun
-RUN curl -fsSL https://bun.sh/install | bash
+# 安装 Bun（使用 npm 从阿里云 npmmirror 安装 prebuilt 二进制，避免从 bun.sh/install 走 GitHub 下载不稳定）
+# bun 的 npm 包通过 optionalDependencies 引入平台特定二进制（如 @oven/bun-linux-x64），npmmirror 已镜像
+# --prefix=/usr/local 让 bun 安装到 /usr/local/bin/bun（默认就在 PATH 中，无需额外 ENV）
+RUN npm install -g --prefix=/usr/local --registry=https://registry.npmmirror.com bun && \
+    /usr/local/bin/bun --version
 
-# 添加 Bun 到 PATH
-ENV PATH="/root/.bun/bin:${PATH}"
-
-# Bun 配置
-RUN mkdir -p /root/.bun && \
-    echo '[install]' > /root/.bunfig.toml && \
+# Bun 运行时配置（bun install 使用的 registry）
+RUN echo '[install]' > /root/.bunfig.toml && \
     echo 'registry = "https://registry.npmmirror.com"' >> /root/.bunfig.toml && \
     echo '' >> /root/.bunfig.toml && \
     echo '[install.scopes]' >> /root/.bunfig.toml && \
+    # @upstash scope 走 npmmirror 加速：bun 装 @upstash 包默认从这里下载，国内速度快
+    # 注意：bun 与 npmmirror 的 tarball 校验存在偶发性 bug（#21493），但 docker build 期
+    # 预装 context7-mcp 时已用 --registry npmjs.org 命令行参数覆盖，避开 build 失败
+    # 运行时 bunx @upstash/context7-mcp 会命中 ~/.bun/install/global 全局缓存，无需再下载
     echo '"@upstash" = "https://registry.npmmirror.com"' >> /root/.bunfig.toml
 
-# 安装 uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+# 安装 python3-pip（node:22 基础镜像默认不带 Python，用 pip 装 uv 需要先安装）
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/*
 
-# 添加uv到PATH
-ENV PATH="/root/.local/bin:${PATH}"
+# 安装 uv 并验证（使用 pip 从阿里云 PyPI 镜像安装，避免从 astral.sh 下载二进制慢/不稳定）
+# --break-system-packages: Debian 12+ 的 PEP 668 限制，系统 Python 默认不允许直接 pip install
+RUN pip3 install --break-system-packages --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple uv && \
+    uv --version || (echo "ERROR: uv installation failed" && exit 1)
 
 # 设置 uv 镜像加速地址
 ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
@@ -99,12 +121,13 @@ RUN mkdir -p /app/bin
 # 预安装 MCP 工具到 uv 缓存中
 RUN uv tool install mcp-server-fetch
 
-# 预安装 context7 MCP 工具到 bun 全局缓存
+# 预安装 context7 MCP 工具（Bun 全局安装）
+# 代码里通过 bunx 调用 MCP，预装到 bun 全局后 bunx 可直接命中 ~/.bun/install/global，无需运行时再下载
 RUN bun add -g @upstash/context7-mcp
 
 # 创建 Claude Code 配置目录并禁用 webfetch 功能，添加 MCP 工具
 RUN mkdir -p /root/.claude && \
-    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"context7":{"args":["-y","@upstash/context7-mcp"],"command":"bunx","env":{}},"chrome-devtools":{"command":"npx","args":["-y","chrome-devtools-mcp@latest"]}}}' > /root/.claude/settings.json
+    echo '{"permissions":{"deny":["WebFetch", "WebSearch"]},"mcpServers":{"mcp-fetch":{"args":["mcp-server-fetch"],"command":"uvx"},"chrome-devtools":{"command":"npx","args":["-y","chrome-devtools-mcp@latest"]}}}' > /root/.claude/settings.json
 
 # 添加所有工具安装路径到 PATH
 ENV PNPM_HOME="/home/user/.local/share/pnpm" \
