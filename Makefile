@@ -197,6 +197,11 @@ docker-build-agent-runner:
 	else \
 		echo "🔒 生产模式，容器权限受限"; \
 	fi
+	@echo "📤 推送镜像到阿里云仓库..."
+	@docker tag rcoder-agent-runner:latest $(K8S_IMAGE_REGISTRY)
+	@docker tag rcoder-agent-runner:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest
+	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest
+	@echo "✅ 镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
 
 # 构建生产版本（禁用 eBPF 工具，减小镜像大小）
 docker-build-agent-production:
@@ -405,12 +410,18 @@ ROLLOUT_TIMEOUT ?= 180s
 
 # 构建 K8s 镜像（启用 kubernetes feature）
 # 依赖 docker-build-master-base 确保基础镜像存在
+K8S_IMAGE_REGISTRY ?= nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest
+
 dev-build-k8s: docker-build-master-base
 	@echo "☸️  构建 K8s 镜像..."
 	@echo "📍 镜像名称: $(IMAGE)"
 	@echo "⏳ 这可能需要较长时间（包含 Rust 编译）..."
 	@docker build -f docker/rcoder-master/Dockerfile -t $(IMAGE) --build-arg CARGO_FLAGS="--features kubernetes" .
 	@echo "✅ K8s 镜像构建完成！"
+	@echo "📤 推送镜像到阿里云仓库..."
+	@docker tag $(IMAGE) $(K8S_IMAGE_REGISTRY)
+	@skopeo copy docker-daemon:$(K8S_IMAGE_REGISTRY) docker://$(K8S_IMAGE_REGISTRY)
+	@echo "✅ 镜像已推送到 $(K8S_IMAGE_REGISTRY)"
 	@echo "💡 下一步: make dev-up-k8s 启动 K8s 开发模式"
 
 # 启动 K8s 开发模式（部署到已有 K8s 集群）
@@ -418,6 +429,7 @@ dev-up-k8s:
 	@echo "☸️  启动 K8s 开发模式..."
 	@kubectl apply -f k8s/manifests/namespace.yaml
 	@kubectl apply -f k8s/manifests/serviceaccount.yaml
+	@kubectl apply -f k8s/manifests/rcoder-configmap.yaml
 	@sed "s|image: rcoder:test|image: $(IMAGE)|" k8s/manifests/rcoder-deployment.yaml | kubectl apply -f -
 	@kubectl apply -f k8s/manifests/rcoder-service.yaml
 	@kubectl rollout status deploy/rcoder -n $(K8S_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
@@ -429,6 +441,9 @@ dev-up-k8s:
 # 重启 K8s 开发模式（重新构建镜像+部署）
 dev-restart-k8s: dev-build-k8s
 	@echo "☸️  重启 K8s 开发模式..."
+	@kubectl apply -f k8s/manifests/namespace.yaml
+	@kubectl apply -f k8s/manifests/serviceaccount.yaml
+	@kubectl apply -f k8s/manifests/rcoder-configmap.yaml
 	@kubectl delete pods -n $(K8S_NAMESPACE) -l app=rcoder --ignore-not-found
 	@sed "s|image: rcoder:test|image: $(IMAGE)|" k8s/manifests/rcoder-deployment.yaml | kubectl apply -f -
 	@kubectl rollout status deploy/rcoder -n $(K8S_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
@@ -440,6 +455,7 @@ dev-down-k8s:
 	@echo "☸️  停止 K8s 开发模式..."
 	@kubectl delete -f k8s/manifests/rcoder-deployment.yaml --ignore-not-found
 	@kubectl delete -f k8s/manifests/rcoder-service.yaml --ignore-not-found
+	@kubectl delete -f k8s/manifests/rcoder-configmap.yaml --ignore-not-found
 	@echo "☸️  清理由 RCoder 运行时创建的 Pod（managed-by=rcoder-runtime）..."
 	@kubectl get namespace $(K8S_NAMESPACE) >/dev/null 2>&1 && \
 		kubectl delete pods -n $(K8S_NAMESPACE) -l managed-by=rcoder-runtime --ignore-not-found || true

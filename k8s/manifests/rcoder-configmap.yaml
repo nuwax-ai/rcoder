@@ -1,0 +1,81 @@
+# ConfigMap for RCoder configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rcoder-config
+  namespace: rcoder
+data:
+  config.yml: |
+    # RCoder 配置文件
+    # 默认使用的 AI 代理类型 (Claude/Codex)
+    default_agent: "Claude"
+
+    # 项目工作目录
+    projects_dir: "/app/project_workspace"
+
+    # 主服务端口
+    port: 8087
+
+    # 容器清理配置
+    cleanup_config:
+      enabled: true
+      idle_timeout_seconds: 600
+      cleanup_interval_seconds: 300
+      docker_stop_timeout_seconds: 30
+
+    # Pingora 反向代理配置
+    proxy_config:
+      listen_port: 8088
+      default_backend_port: 8087
+      backend_host: "127.0.0.1"
+      port_param: "port"
+      health_check:
+        enabled: true
+        interval_seconds: 5
+        timeout_seconds: 1
+        healthy_threshold: 2
+        unhealthy_threshold: 3
+
+    # Docker 配置
+    docker_config:
+      multi_image_config:
+        # 全局默认配置
+        global_defaults:
+          registry_prefix: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev"
+
+        # 服务镜像配置
+        services:
+          rcoder:
+            service_type: "RCoder"
+            arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
+            amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
+            default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
+            image_tag_prefix: "rcoder"
+            enabled: true
+
+          computer-agent-runner:
+            service_type: "ComputerAgentRunner"
+            arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+            amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+            default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+            image_tag_prefix: "rcoder-computer-agent-runner"
+            enabled: true
+
+        # 镜像选择策略
+        selection_strategy: "ServiceOnly"
+
+        cache_config:
+          enabled: true
+          ttl_seconds: 3600
+          max_entries: 50
+
+      network_base_name: "agent-network"
+      network_mode: "bridge"
+      work_dir: "/app"
+      auto_cleanup: true
+      container_ttl_seconds: 3600
+
+    # API Key 鉴权配置
+    api_key_auth:
+      enabled: false
+      api_key: "YOUR_API_KEY_HERE"

@@ -16,8 +16,8 @@ spec:
       serviceAccountName: rcoder-pods-sa
       containers:
       - name: rcoder
-        image: rcoder:test
-        imagePullPolicy: Never
+        image: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest
+        imagePullPolicy: Always
         command: ["/app/bin/rcoder"]
         args: ["--port", "8087"]
         ports:
@@ -29,6 +29,10 @@ spec:
           value: "rcoder"
         - name: RUST_LOG
           value: "info"
+        - name: RCODER_DOCKER_IMAGE
+          value: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
+        - name: RCODER_DOCKER_IMAGE_COMPUTER
+          value: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
         resources:
           requests:
             memory: "256Mi"
@@ -36,3 +40,11 @@ spec:
           limits:
             memory: "1Gi"
             cpu: "1000m"
+        volumeMounts:
+        - name: rcoder-config
+          mountPath: /app/config.yml
+          subPath: config.yml
+      volumes:
+      - name: rcoder-config
+        configMap:
+          name: rcoder-config

@@ -33,7 +33,7 @@ use std::sync::Arc;
 #[cfg(feature = "kubernetes")]
 use tokio::sync::RwLock;
 #[cfg(feature = "kubernetes")]
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "kubernetes")]
 use crate::types::DockerManagerConfig;
@@ -61,6 +61,8 @@ pub struct KubernetesRuntimeConfig {
     pub image_pull_secret: Option<String>,
     /// Service account name for pods
     pub service_account_name: String,
+    /// DockerManagerConfig for image selection (包含 multi_image_config)
+    pub docker_manager_config: DockerManagerConfig,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -92,6 +94,7 @@ impl KubernetesRuntime {
                 pod_ttl_seconds: config.container_ttl_seconds,
                 image_pull_secret: None,
                 service_account_name: "rcoder-pods-sa".to_string(),
+                docker_manager_config: config,
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
@@ -215,15 +218,57 @@ impl KubernetesRuntime {
         ))
     }
 
-    /// Select image based on service type
+    /// Select image based on service type, using multi_image_config from ConfigMap
     fn select_image(&self, service_type: &ServiceType) -> String {
+        // 优先使用环境变量（允许运行时覆盖）
+        if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE") {
+            if !env_image.is_empty() {
+                info!("[K8S] Using image from RCODER_DOCKER_IMAGE env: {}", env_image);
+                return env_image;
+            }
+        }
+        if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER") {
+            if !env_image.is_empty() {
+                info!("[K8S] Using image from RCODER_DOCKER_IMAGE_COMPUTER env: {}", env_image);
+                return env_image;
+            }
+        }
+
+        // 使用 multi_image_config 配置
+        let multi_config = &self.config.docker_manager_config.multi_image_config;
+        let service_key = service_type.to_string();
+
+        if let Some(service_config) = multi_config.services.get(&service_key) {
+            // 优先使用 image 字段
+            if let Some(ref image) = service_config.image {
+                info!("[K8S] Using image from multi_image_config: {}", image);
+                return image.clone();
+            }
+            // 使用架构特定镜像
+            let arch = std::env::consts::ARCH;
+            let image = if arch == "aarch64" || arch == "arm64" {
+                service_config.arm64_image.clone()
+            } else {
+                service_config.amd64_image.clone()
+            };
+            if let Some(img) = image {
+                info!("[K8S] Using architecture-specific image: {}", img);
+                return img.to_string();
+            }
+            // 使用默认镜像
+            if let Some(ref img) = service_config.default_image {
+                info!("[K8S] Using default image: {}", img);
+                return img.clone();
+            }
+        }
+
+        // 兜底：使用硬编码默认值（不应该到达这里，因为 multi_image_config 总是有默认值）
+        warn!("[K8S] No image config found, using hardcoded fallback");
         match service_type {
-            ServiceType::RCoder => std::env::var("RCODER_DOCKER_IMAGE")
-                .unwrap_or_else(|_| "registry.yichamao.com/agent-runner:latest".to_string()),
-            ServiceType::ComputerAgentRunner => std::env::var("RCODER_DOCKER_IMAGE_COMPUTER")
-                .unwrap_or_else(|_| {
-                    "registry.yichamao.com/computer-agent-runner:latest".to_string()
-                }),
+            ServiceType::RCoder => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
+            ServiceType::ComputerAgentRunner => {
+                "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest".to_string()
+            }
         }
     }
 
@@ -321,7 +366,7 @@ impl ContainerRuntime for KubernetesRuntime {
                 containers: vec![K8sContainer {
                     name: "agent".to_string(),
                     image: Some(image),
-                    image_pull_policy: Some("Never".to_string()),
+                    image_pull_policy: Some("Always".to_string()),
                     env: Some(vec![
                         EnvVar {
                             name: "PROJECT_ID".to_string(),
