@@ -39,7 +39,7 @@ pub use shared_types::ApiKeyAuthConfig;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// 默认使用的 Agent ID
-    #[serde(default = "default_agent_id")]
+    #[serde(default = "default_agent_id", alias = "default_agent")]
     pub default_agent_id: String,
     /// 项目工作目录
     pub projects_dir: PathBuf,
@@ -587,9 +587,12 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
 
     // 调试：打印解析后的多镜像配置
     if let Some(ref docker_config) = config.docker_config {
+        tracing::info!("[CONFIG] docker_config is Some, checking multi_image_config");
         if let Some(ref multi_config) = docker_config.multi_image_config {
-            tracing::debug!("Multi-image config:");
+            tracing::info!("[CONFIG] multi_image_config is Some, services count: {}", multi_config.services.len());
             for (service_key, service_config) in &multi_config.services {
+                tracing::info!("[CONFIG]   Service '{}': arm64_image={:?}, amd64_image={:?}",
+                    service_key, service_config.arm64_image, service_config.amd64_image);
                 tracing::debug!(
                     "  Service '{}' mount config (total {} mounts):",
                     service_key,

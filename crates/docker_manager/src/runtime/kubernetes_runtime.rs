@@ -221,16 +221,29 @@ impl KubernetesRuntime {
     /// Select image based on service type, using multi_image_config from ConfigMap
     fn select_image(&self, service_type: &ServiceType) -> String {
         // 优先使用环境变量（允许运行时覆盖）
-        if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE") {
-            if !env_image.is_empty() {
-                info!("[K8S] Using image from RCODER_DOCKER_IMAGE env: {}", env_image);
-                return env_image;
+        // 注意：ComputerAgentRunner 必须优先检查 RCODER_DOCKER_IMAGE_COMPUTER
+        match service_type {
+            ServiceType::ComputerAgentRunner => {
+                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER") {
+                    if !env_image.is_empty() {
+                        info!("[K8S] Using image from RCODER_DOCKER_IMAGE_COMPUTER env: {}", env_image);
+                        return env_image;
+                    }
+                }
+                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE") {
+                    if !env_image.is_empty() {
+                        info!("[K8S] Using image from RCODER_DOCKER_IMAGE env: {}", env_image);
+                        return env_image;
+                    }
+                }
             }
-        }
-        if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER") {
-            if !env_image.is_empty() {
-                info!("[K8S] Using image from RCODER_DOCKER_IMAGE_COMPUTER env: {}", env_image);
-                return env_image;
+            _ => {
+                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE") {
+                    if !env_image.is_empty() {
+                        info!("[K8S] Using image from RCODER_DOCKER_IMAGE env: {}", env_image);
+                        return env_image;
+                    }
+                }
             }
         }
 
