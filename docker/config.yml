@@ -49,18 +49,18 @@ docker_config:
   multi_image_config:
     # 全局默认配置
     global_defaults:
-      registry_prefix: "registry.yichamao.com"
+      registry_prefix: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev"
 
     # 服务镜像配置
     services:
       # RCoder 主服务配置（使用与主容器相同的镜像）
       rcoder:
         service_type: "RCoder"
-        # 🎯 使用本地测试镜像（与主容器相同）
-        image: "master-rcoder:latest"
-        arm64_image: "master-rcoder:latest"
-        amd64_image: "master-rcoder:latest"
-        default_image: "master-rcoder:latest"
+        # 🎯 使用阿里云镜像
+        image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
+        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
+        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
+        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
         image_tag_prefix: "rcoder"
         enabled: true
 
@@ -94,11 +94,11 @@ docker_config:
       # ComputerAgentRunner 服务配置
       computer-agent-runner:
         service_type: "ComputerAgentRunner"
-        # 🎯 使用本地测试镜像
-        image: "rcoder-agent-runner:latest"
-        arm64_image: "rcoder-agent-runner:latest"
-        amd64_image: "rcoder-agent-runner:latest"
-        default_image: "rcoder-agent-runner:latest"
+        # 🎯 使用阿里云镜像
+        image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
         image_tag_prefix: "computer-agent-runner"
         enabled: true
 
