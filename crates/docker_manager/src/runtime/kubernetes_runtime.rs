@@ -13,15 +13,17 @@ use container_runtime_api::{
     RuntimeContainerInfo,
 };
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::api::core::v1::{Container as K8sContainer, ContainerPort, EnvVar, Pod, PodSpec, Probe};
+use k8s_openapi::api::core::v1::{
+    Container as K8sContainer, ContainerPort, EnvVar, Pod, PodSpec, Probe,
+};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+#[cfg(feature = "kubernetes")]
+use kube::Config;
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
-#[cfg(feature = "kubernetes")]
-use kube::Config;
 #[cfg(feature = "kubernetes")]
 use shared_types::{ContainerBasicInfo, ServiceResourceLimits, ServiceType};
 #[cfg(feature = "kubernetes")]
@@ -66,16 +68,13 @@ impl KubernetesRuntime {
     /// Create a new Kubernetes runtime
     pub async fn new(config: DockerManagerConfig) -> ContainerRuntimeResult<Self> {
         // Load kube config from environment or in-cluster config
-        let kube_config = Config::infer()
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("Failed to load kube config: {}", e))
-            })?;
+        let kube_config = Config::infer().await.map_err(|e| {
+            ContainerRuntimeError::K8sError(format!("Failed to load kube config: {}", e))
+        })?;
 
-        let client = Client::try_from(kube_config)
-            .map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("Failed to create K8s client: {}", e))
-            })?;
+        let client = Client::try_from(kube_config).map_err(|e| {
+            ContainerRuntimeError::K8sError(format!("Failed to create K8s client: {}", e))
+        })?;
 
         let namespace =
             std::env::var("RCODER_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
@@ -181,15 +180,16 @@ impl KubernetesRuntime {
                     // 检查 Pod 是否 Ready (需要 readinessProbe 返回成功)
                     if let Some(status) = &pod.status {
                         if let Some(conditions) = &status.conditions {
-                            let all_ready = conditions.iter().any(|c| {
-                                c.type_ == "Ready" && c.status == "True"
-                            });
+                            let all_ready = conditions
+                                .iter()
+                                .any(|c| c.type_ == "Ready" && c.status == "True");
                             if all_ready {
                                 info!("[K8S] Pod {} is Ready", pod_name);
                                 return Ok(());
                             }
                             // 调试用：打印当前状态
-                            let ready_status = conditions.iter()
+                            let ready_status = conditions
+                                .iter()
                                 .map(|c| format!("{}={}", c.type_, c.status))
                                 .collect::<Vec<_>>()
                                 .join(", ");
@@ -202,7 +202,8 @@ impl KubernetesRuntime {
                 }
                 Err(e) => {
                     return Err(ContainerRuntimeError::K8sError(format!(
-                        "Failed to get pod '{}': {}", pod_name, e
+                        "Failed to get pod '{}': {}",
+                        pod_name, e
                     )));
                 }
             }
@@ -243,7 +244,8 @@ impl KubernetesRuntime {
             created_at: pod_info.created_at,
             service_url: format!(
                 "http://{}:{}",
-                pod_info.container_ip, shared_types::HTTP_DEFAULT_PORT
+                pod_info.container_ip,
+                shared_types::HTTP_DEFAULT_PORT
             ),
         })
     }
@@ -270,7 +272,11 @@ impl ContainerRuntime for KubernetesRuntime {
         // Pod 名称：当 user_id 存在时使用它（ComputerAgentRunner）来保证唯一性
         let pod_name = match user_id {
             Some(uid) => format!("{}-{}", service_type.container_prefix(), uid),
-            None => format!("{}-{}", service_type.container_prefix(), project_id.unwrap()),
+            None => format!(
+                "{}-{}",
+                service_type.container_prefix(),
+                project_id.unwrap()
+            ),
         };
 
         // Check if pod already exists and is running
@@ -352,8 +358,8 @@ impl ContainerRuntime for KubernetesRuntime {
                             port: IntOrString::Int(8086),
                             ..Default::default()
                         }),
-                        initial_delay_seconds: Some(5),
-                        period_seconds: Some(5),
+                        initial_delay_seconds: Some(3),
+                        period_seconds: Some(3),
                         timeout_seconds: Some(3),
                         failure_threshold: Some(20),
                         success_threshold: Some(1),
@@ -369,12 +375,9 @@ impl ContainerRuntime for KubernetesRuntime {
         };
 
         let pp = PostParams::default();
-        self.pods()
-            .create(&pp, &pod)
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::ContainerCreationError(format!("Failed to create pod: {}", e))
-            })?;
+        self.pods().create(&pp, &pod).await.map_err(|e| {
+            ContainerRuntimeError::ContainerCreationError(format!("Failed to create pod: {}", e))
+        })?;
 
         info!("[K8S] Pod {} created successfully", pod_name);
 
@@ -421,7 +424,11 @@ impl ContainerRuntime for KubernetesRuntime {
                     let metadata = &pod.metadata;
                     let uid = metadata.uid.clone().unwrap_or_default();
                     let name = metadata.name.clone().unwrap_or_default();
-                    let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.clone()).unwrap_or_default();
+                    let pod_ip = pod
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.pod_ip.clone())
+                        .unwrap_or_default();
                     let created_at = metadata
                         .creation_timestamp
                         .as_ref()
@@ -445,7 +452,8 @@ impl ContainerRuntime for KubernetesRuntime {
                     }
 
                     return Ok(Some(
-                        self.build_container_basic_info(identifier, &pod_info).await?,
+                        self.build_container_basic_info(identifier, &pod_info)
+                            .await?,
                     ));
                 }
             }
@@ -481,12 +489,15 @@ impl ContainerRuntime for KubernetesRuntime {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "Failed to get pod by name '{}': {}",
                     pod_name, e
-                )))
+                )));
             }
         }
 
         // 2) Query by labels
-        for selector in [format!("user_id={}", identifier), format!("project_id={}", identifier)] {
+        for selector in [
+            format!("user_id={}", identifier),
+            format!("project_id={}", identifier),
+        ] {
             let pods = self
                 .pods()
                 .list(&ListParams::default().labels(&selector).limit(1))
@@ -521,7 +532,10 @@ impl ContainerRuntime for KubernetesRuntime {
         if rcoder_exists {
             self.stop_container_by_identifier(project_id, &ServiceType::RCoder)
                 .await?;
-            info!("[K8S] Pod for project {} deleted successfully (RCoder)", project_id);
+            info!(
+                "[K8S] Pod for project {} deleted successfully (RCoder)",
+                project_id
+            );
             return Ok(());
         }
 
@@ -546,7 +560,11 @@ impl ContainerRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         let pod_name = self.pod_name(identifier, service_type);
 
-        match self.pods().delete(&pod_name, &DeleteParams::default()).await {
+        match self
+            .pods()
+            .delete(&pod_name, &DeleteParams::default())
+            .await
+        {
             Ok(_) => {
                 self.pod_cache.write().await.remove(identifier);
                 info!("[K8S] Pod {} deleted successfully", pod_name);
@@ -582,9 +600,10 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
-        let pods = self.pods().list(&lp).await.map_err(|e| {
-            ContainerRuntimeError::K8sError(format!("Failed to list pods: {}", e))
-        })?;
+        let pods =
+            self.pods().list(&lp).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("Failed to list pods: {}", e))
+            })?;
 
         let mut result = Vec::new();
         for p in pods.items {
@@ -594,7 +613,11 @@ impl ContainerRuntime for KubernetesRuntime {
             let pod_info = RuntimeContainerInfo {
                 container_id: metadata.uid.clone().unwrap_or_default(),
                 container_name: metadata.name.clone().unwrap_or_default(),
-                container_ip: pod.status.as_ref().and_then(|s| s.pod_ip.clone()).unwrap_or_default(),
+                container_ip: pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.pod_ip.clone())
+                    .unwrap_or_default(),
                 status,
                 created_at: metadata
                     .creation_timestamp
@@ -610,9 +633,13 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
-        let _ = self.pods().delete_collection(&DeleteParams::default(), &lp).await.map_err(|e| {
-            ContainerRuntimeError::ConnectionError(format!("Failed to cleanup pods: {}", e))
-        })?;
+        let _ = self
+            .pods()
+            .delete_collection(&DeleteParams::default(), &lp)
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::ConnectionError(format!("Failed to cleanup pods: {}", e))
+            })?;
 
         self.pod_cache.write().await.clear();
         Ok(())
