@@ -20,14 +20,18 @@ dev-build-k8s: docker-build-master-base
 	@echo "💡 下一步: make dev-up-k8s 启动 K8s 开发模式"
 
 # 启动 K8s 开发模式（部署到已有 K8s 集群）
+# NFS 存储层: nfs-subdir-provisioner.yaml (连接外部 NFS Server)
+# 如需内建 NFS Server，额外部署 nfs-server.yaml
 dev-up-k8s:
 	@echo "☸️  启动 K8s 开发模式..."
-	# Step 1: 先部署 NFS 存储层 (NFS Server + NFS Subdir External Provisioner + StorageClass)
-	@kubectl apply -f k8s/manifests/nfs-server.yaml
+	# Step 1: 创建 nfs-storage namespace (provisioner 需要)
+	@kubectl apply -f k8s/manifests/namespace.yaml
+	# Step 2: 部署 NFS Subdir Provisioner + StorageClass
+	# ⚠️ 使用外部 NFS Server 时，先修改 nfs-subdir-provisioner.yaml 中的 NFS_SERVER 为实际地址
+	@kubectl apply -f k8s/manifests/nfs-subdir-provisioner.yaml
 	@echo "⏳ 等待 NFS Provisioner 就绪..."
 	@kubectl wait --for=condition=available deployment/nfs-client-provisioner -n nfs-storage --timeout=120s 2>/dev/null || echo "⚠️  NFS Provisioner 等待超时，继续部署..."
-	# Step 2: 部署 RCoder 应用层
-	@kubectl apply -f k8s/manifests/namespace.yaml
+	# Step 3: 部署 RCoder 应用层
 	@kubectl apply -f k8s/manifests/serviceaccount.yaml
 	@kubectl apply -f k8s/manifests/rcoder-configmap.yaml
 	@kubectl apply -f k8s/manifests/rcoder-pvc.yaml
@@ -46,12 +50,11 @@ dev-up-k8s:
 # 重启 K8s 开发模式（重新构建镜像+部署）
 dev-restart-k8s: dev-build-k8s
 	@echo "☸️  重启 K8s 开发模式..."
-	# 先重建 NFS 存储层
-	@kubectl apply -f k8s/manifests/nfs-server.yaml
+	# 重建 NFS Provisioner 层
+	@kubectl apply -f k8s/manifests/nfs-subdir-provisioner.yaml
 	@echo "⏳ 等待 NFS Provisioner 就绪..."
 	@kubectl wait --for=condition=available deployment/nfs-client-provisioner -n nfs-storage --timeout=120s 2>/dev/null || echo "⚠️  NFS Provisioner 等待超时，继续部署..."
 	# 重建 RCoder 应用层
-	@kubectl apply -f k8s/manifests/namespace.yaml
 	@kubectl apply -f k8s/manifests/serviceaccount.yaml
 	@kubectl apply -f k8s/manifests/rcoder-configmap.yaml
 	@kubectl apply -f k8s/manifests/rcoder-pvc.yaml
@@ -81,8 +84,8 @@ dev-down-k8s:
 	@kubectl delete -f k8s/manifests/serviceaccount.yaml --ignore-not-found
 	@echo "☸️  移除 Namespace $(K8S_NAMESPACE)..."
 	@kubectl delete -f k8s/manifests/namespace.yaml --ignore-not-found
-	# Step 2: 清理 NFS 存储层（最后删除，确保无 Pod 引用）
-	@kubectl delete -f k8s/manifests/nfs-server.yaml --ignore-not-found
+	# Step 2: 清理 NFS Provisioner 层
+	@kubectl delete -f k8s/manifests/nfs-subdir-provisioner.yaml --ignore-not-found
 	@echo "✅ K8s 开发栈已从集群移除"
 
 # 查看 K8s 开发模式日志

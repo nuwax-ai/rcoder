@@ -1,12 +1,11 @@
-# NFS Server 用于 K8s 集群内共享存储
+# ============================================================
+# NFS Server (内建模式)
+# 集群内自建 NFS Server，数据持久化到 local-path PV
 #
-# 支持两种模式:
-#   模式一(内建): 集群内自建 NFS Server，数据持久化到 local-path PV
-#   模式二(外部): 使用客户已有的 NFS Server，参考下方「外部 NFS 配置」
+# ⚠️ 注意: OrbStack/Mac 桌面 K8s 环境不支持此方式，请使用外部 NFS Server
 #
-# 默认启用模式一。如需切换到模式二，删除 NFS Server StatefulSet 部分，
-# 并在 rcoder-configmap.yaml 中配置 NFS_SERVER 和 NFS_PATH 环境变量。
-#
+# 如使用外部 NFS Server，跳过此文件，直接部署 nfs-subdir-provisioner.yaml
+# ============================================================
 ---
 apiVersion: v1
 kind: Namespace
@@ -50,10 +49,7 @@ spec:
         app: nfs-server
     spec:
       # 亲和性: NFS Server 调度到有 local-path 存储的节点
-      # 如果集群没有 local-path-provisioner，请替换 nodeSelector 使用有足够磁盘空间的节点
       affinity:
-        # NFS Server 必须调度到有 local-path PV 可用的节点
-        # K3s 的 local-path 在 /var/lib/rancher/k3s/storage 目录
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
@@ -95,11 +91,6 @@ spec:
         persistentVolumeClaim:
           claimName: nfs-server-pvc
 ---
-# NFS Server 数据持久化 PVC
-# 使用 local-path StorageClass (Kubespray/kubeadm 自建集群推荐)
-# 如果集群没有 local-path StorageClass，可改为 standard / gp2 / managed-premium 等存在的 SC
-# 查看集群 SC: kubectl get storageclass
----
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -109,165 +100,7 @@ metadata:
     app: nfs-server
 spec:
   accessModes: ["ReadWriteOnce"]
-  # ⚠️ 如果集群没有 local-path StorageClass，请修改为实际存在的 SC 名称
-  # 常见自建集群: local-path / standard / hostpath
   storageClassName: local-path
   resources:
     requests:
       storage: 100Gi
----
-# ============================================================
-# NFS Subdir External Provisioner
-# 自动为每个 PVC 创建 NFS 子目录 PV
-# 参考: https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner
-#
-# ⚠️ 外部 NFS 模式配置:
-# 如客户已有 NFS Server，修改以下两处即可切换到外部 NFS:
-#   1. provisioner 的 NFS_SERVER 环境变量 (第 196-199 行)
-#   2. volumes.nfs.server (第 218 行)
-# 示例:
-#   - name: NFS_SERVER
-#     value: "nfs.customer.com"    # 客户 NFS 地址
-#   - name: NFS_PATH
-#     value: "/shared/rcoder"      # 客户 NFS 共享路径
-# ============================================================
-# 自动为每个 PVC 创建 NFS 子目录 PV
-# 参考: https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: nfs-client-provisioner
-  namespace: nfs-storage
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: nfs-client-provisioner-cluster-runner
-rules:
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "create", "delete"]
-  - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "watch", "update"]
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["storageclasses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "update", "patch"]
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["csinodeinfos"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "create", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: nfs-client-provisioner-cluster-runner-binding
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: nfs-client-provisioner-cluster-runner
-subjects:
-  - kind: ServiceAccount
-    name: nfs-client-provisioner
-    namespace: nfs-storage
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: nfs-client-provisioner
-  namespace: nfs-storage
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: nfs-client-provisioner
-  template:
-    metadata:
-      labels:
-        app: nfs-client-provisioner
-    spec:
-      serviceAccountName: nfs-client-provisioner
-      containers:
-      - name: nfs-client-provisioner
-        # 使用官方 nfs-subdir-external-provisioner 镜像
-        image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
-        volumeMounts:
-        - name: nfs-provisioner
-          mountPath: /persistentvolumes
-        env:
-        - name: PROVISIONER_NAME
-          value: rcoder-nfs  # StorageClass 的 provisioner
-        - name: NFS_SERVER
-          value: nfs-server.nfs-storage.svc.cluster.local
-        - name: NFS_PATH
-          value: /exports
-        - name: NFS_MOUNT_OPTIONS
-          value: " vers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2"
-        - name: ON_DELETE_POLICY
-          # " retainer": 保留 PV 和数据 (默认)
-          # " delete": 删除 PVC 时自动删除 PV 和数据
-          value: "delete"
-        - name: ARCHIVE_ON_DELETE
-          # "true": 删除时不删除数据目录,重命名为 archive-
-          # "false": 直接删除数据目录
-          value: "false"
-        resources:
-          requests:
-            cpu: "50m"
-            memory: "64Mi"
-          limits:
-            cpu: "200m"
-            memory: "256Mi"
-      volumes:
-      - name: nfs-provisioner
-        nfs:
-          server: nfs-server.nfs-storage.svc.cluster.local
-          path: /exports
----
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: rcoder-nfs
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "false"
-provisioner: rcoder-nfs  # 必须与 PROVISIONER_NAME 环境变量一致
-parameters:
-  pathPattern: "${.PVC.namespace}/${.PVC.name}"
-  onDelete: "delete"
-  archiveOnDelete: "false"
-mountOptions:
-  - vers=4.1
-  - rsize=1048576
-  - wsize=1048576
-  - hard
-  - timeo=600
-  - retrans=2
-  - noresvport
-reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
----
-# 预创建的共享 PVC (所有 RCoder Pod 共用同一个工作空间)
-# 此 PVC 由 rcoder-nfs StorageClass 自动创建 NFS 子目录
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: rcoder-workspace
-  namespace: rcoder
-  labels:
-    app: rcoder
-spec:
-  accessModes: ["ReadWriteMany"]  # NFS 支持多节点读写
-  storageClassName: rcoder-nfs
-  resources:
-    requests:
-      storage: 50Gi
