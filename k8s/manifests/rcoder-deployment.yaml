@@ -8,6 +8,8 @@ spec:
   selector:
     matchLabels:
       app: rcoder
+  # Graceful shutdown: allow 60s for containers to clean up
+  terminationGracePeriodSeconds: 60
   template:
     metadata:
       labels:
@@ -29,22 +31,58 @@ spec:
           value: "rcoder"
         - name: RUST_LOG
           value: "info"
+        # NFS 存储配置 (支持外部 NFS Server)
+        # 内建 NFS: nfs-server.nfs-storage.svc.cluster.local (默认值)
+        # 外部 NFS: 替换为客户提供的 NFS Server 地址
+        - name: RCODER_K8S_NFS_SERVER
+          value: "nfs-server.nfs-storage.svc.cluster.local"
+        - name: RCODER_K8S_NFS_PATH
+          value: "/exports"
+        - name: RCODER_K8S_STORAGE_CLASS
+          value: "rcoder-nfs"
         - name: RCODER_DOCKER_IMAGE
           value: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
         - name: RCODER_DOCKER_IMAGE_COMPUTER
           value: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "250m"
+            memory: "512Mi"
+            cpu: "500m"
           limits:
-            memory: "1Gi"
-            cpu: "1000m"
+            memory: "2Gi"
+            cpu: "2000m"
+        # Health probes for K8s liveness/readiness detection
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8087
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8087
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
         volumeMounts:
         - name: rcoder-config
           mountPath: /app/config.yml
           subPath: config.yml
+        - name: project-workspace
+          mountPath: /app/project_workspace
+        - name: computer-workspace
+          mountPath: /app/computer-project-workspace
       volumes:
       - name: rcoder-config
         configMap:
           name: rcoder-config
+      - name: project-workspace
+        persistentVolumeClaim:
+          claimName: rcoder-workspace
+      - name: computer-workspace
+        persistentVolumeClaim:
+          claimName: rcoder-workspace

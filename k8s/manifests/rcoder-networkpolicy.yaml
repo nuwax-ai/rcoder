@@ -1,0 +1,49 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rcoder-network-policy
+  namespace: rcoder
+spec:
+  podSelector:
+    matchLabels:
+      app: rcoder
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # 允许来自同 namespace 的流量
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8087
+    - protocol: TCP
+      port: 8088
+  egress:
+  # DNS 解析
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  # K8s API Server
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          kubernetes.io/service-name: kubernetes
+    ports:
+    - protocol: TCP
+      port: 443
+  # NFS Server 访问（nfs-storage namespace）
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: nfs-storage
+    ports:
+    - protocol: TCP
+      port: 2049
+    - protocol: TCP
+      port: 20048

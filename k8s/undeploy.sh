@@ -3,19 +3,26 @@ set -e
 
 echo "=== Undeploying RCoder from K8s cluster ==="
 
-# 删除 Deployment 和 Service
+# Step 1: 清理 RCoder 应用层
 kubectl delete -f manifests/rcoder-deployment.yaml --ignore-not-found
 kubectl delete -f manifests/rcoder-service.yaml --ignore-not-found
+kubectl delete -f manifests/rcoder-pdb.yaml --ignore-not-found
+kubectl delete -f manifests/rcoder-networkpolicy.yaml --ignore-not-found
+kubectl delete -f manifests/rcoder-pvc.yaml --ignore-not-found
+kubectl delete -f manifests/rcoder-configmap.yaml --ignore-not-found
 
-# 清理由 RCoder Kubernetes 运行时创建的 Agent 等业务 Pod（与 Makefile dev-down-k8s 一致）
+# 清理 RCoder 运行时创建的 Pod 和 PVC
 if kubectl get namespace rcoder >/dev/null 2>&1; then
-  kubectl delete pods -n rcoder -l managed-by=rcoder-runtime --ignore-not-found
+  kubectl delete pods,pvc -n rcoder -l managed-by=rcoder-runtime --ignore-not-found
 fi
 
-# 删除 RBAC 配置（须先于 namespace：避免仅删 ns 时遗留 ClusterRole/ClusterRoleBinding）
+# Step 2: 清理 RBAC
 kubectl delete -f manifests/serviceaccount.yaml --ignore-not-found
 
-# 删除 namespace
+# Step 3: 清理 Namespace
 kubectl delete -f manifests/namespace.yaml --ignore-not-found
+
+# Step 4: 清理 NFS 存储层（最后删除，确保无 Pod 引用）
+kubectl delete -f manifests/nfs-server.yaml --ignore-not-found
 
 echo "=== RCoder undeployed ==="

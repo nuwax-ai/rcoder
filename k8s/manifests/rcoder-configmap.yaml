@@ -79,3 +79,15 @@ data:
     api_key_auth:
       enabled: false
       api_key: "YOUR_API_KEY_HERE"
+
+    # K8s NFS 存储配置
+    # 内建模式: 使用 nfs-server.nfs-storage.svc.cluster.local (nfs-server.yaml 已部署)
+    # 外部模式: 替换为客户提供的 NFS Server 地址
+    kubernetes_config:
+      # NFS Server 地址 (K8s 集群内 DNS 或外部 IP)
+      # 默认使用集群内建的 NFS Server
+      nfs_server: "nfs-server.nfs-storage.svc.cluster.local"
+      # NFS 共享路径
+      nfs_path: "/exports"
+      # StorageClass 名称 (nfs-subdir-external-provisioner 创建的 SC)
+      storage_class: "rcoder-nfs"
