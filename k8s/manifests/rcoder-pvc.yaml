@@ -9,8 +9,6 @@ metadata:
   namespace: rcoder
   labels:
     app: rcoder
-  annotations:
-    volume.beta.kubernetes.io/storage-class: "rcoder-nfs"
 spec:
   # ReadWriteMany: 支持 K8s 多节点同时读写 (NFS 特性)
   # 注意: 云厂商块存储 (AWS EBS / 阿里云 ESSD) 不支持 RWX, 必须使用 NFS
