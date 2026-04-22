@@ -1,0 +1,98 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rcoder
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rcoder.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rcoder.selectorLabels" . | nindent 8 }}
+      {{- with .Values.pod.annotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.pod.terminationGracePeriodSeconds }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      securityContext:
+        {{- toYaml .Values.pod.securityContext | nindent 8 }}
+      containers:
+        - name: rcoder
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/bin/rcoder"]
+          args: ["--port", "{{ .Values.rcoder.port }}"]
+          ports:
+            - containerPort: {{ .Values.rcoder.port }}
+          env:
+            - name: CONTAINER_RUNTIME
+              value: "kubernetes"
+            - name: RCODER_K8S_NAMESPACE
+              value: {{ .Values.namespace | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.rcoder.logLevel | quote }}
+            {{- if .Values.juicefs.enabled }}
+            - name: RCODER_K8S_STORAGE_CLASS
+              value: {{ .Values.juicefs.storageClass | quote }}
+            {{- end }}
+            - name: RCODER_DOCKER_IMAGE
+              value: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+            - name: RCODER_DOCKER_IMAGE_COMPUTER
+              value: "{{ .Values.image.agentRunner.registry }}/{{ .Values.image.agentRunner.repository }}:{{ .Values.image.agentRunner.tag }}"
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.rcoder.port }}
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.rcoder.port }}
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.container.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: rcoder-config
+              mountPath: /app/config.yml
+              subPath: config.yml
+            - name: project-workspace
+              mountPath: /app/project_workspace
+            - name: computer-workspace
+              mountPath: /app/computer-project-workspace
+      volumes:
+        - name: rcoder-config
+          configMap:
+            name: rcoder-config
+        {{- if .Values.juicefs.enabled }}
+        - name: project-workspace
+          persistentVolumeClaim:
+            claimName: rcoder-workspace
+        - name: computer-workspace
+          persistentVolumeClaim:
+            claimName: rcoder-workspace
+        {{- else }}
+        - name: project-workspace
+          emptyDir: {}
+        - name: computer-workspace
+          emptyDir: {}
+        {{- end }}

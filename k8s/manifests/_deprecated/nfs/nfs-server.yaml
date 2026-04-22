@@ -16,7 +16,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: nfs-server
-  namespace: nfs-storage
+  namespace: nuwax-nfs-storage
 spec:
   clusterIP: None
   selector:
@@ -36,7 +36,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: nfs-server
-  namespace: nfs-storage
+  namespace: nuwax-nfs-storage
 spec:
   serviceName: nfs-server
   replicas: 1
@@ -95,7 +95,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: nfs-server-pvc
-  namespace: nfs-storage
+  namespace: nuwax-nfs-storage
   labels:
     app: nfs-server
 spec:

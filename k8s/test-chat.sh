@@ -4,7 +4,7 @@ set -e
 echo "=== Testing RCoder in K8s ==="
 
 # 获取 NodePort
-NODE_PORT=$(kubectl get svc rcoder -n rcoder -o jsonpath='{.spec.ports[0].nodePort}')
+NODE_PORT=$(kubectl get svc rcoder -n nuwax-rcoder -o jsonpath='{.spec.ports[0].nodePort}')
 echo "NodePort: $NODE_PORT"
 
 # 获取节点 IP
@@ -37,9 +37,9 @@ COMPUTER_PROJECT_ID=$(echo "${COMPUTER_RESP}" | jq -r '.data.project_id // empty
 echo ""
 echo "Verifying created pods by labels..."
 if [ -n "${PROJECT_ID}" ]; then
-  kubectl get pods -n rcoder -l "project_id=${PROJECT_ID}" -o wide
+  kubectl get pods -n nuwax-rcoder -l "project_id=${PROJECT_ID}" -o wide
 fi
-kubectl get pods -n rcoder -l "user_id=${USER_ID}" -o wide
+kubectl get pods -n nuwax-rcoder -l "user_id=${USER_ID}" -o wide
 
 echo ""
 echo "Verifying pod status API..."

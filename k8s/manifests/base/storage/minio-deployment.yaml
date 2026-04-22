@@ -1,0 +1,106 @@
+# ============================================================
+# MinIO for JuiceFS Data Storage
+# JuiceFS S3 兼容对象存储
+# ============================================================
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+  namespace: nuwax-rcoder
+  labels:
+    app: minio
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: "longhorn"  # 使用 Longhorn（支持快照、备份、在线扩容）
+  resources:
+    requests:
+      storage: 100Gi  # 根据数据量调整
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: nuwax-rcoder
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:latest
+        ports:
+        - containerPort: 9000
+          name: api
+        - containerPort: 9001
+          name: console
+        env:
+        - name: MINIO_ROOT_USER
+          value: "minioadmin"
+        - name: MINIO_ROOT_PASSWORD
+          value: "minioadmin"  # 生产环境使用 Secret
+        args:
+          - server
+          - /data
+          - --console-address
+          - ":9001"
+        livenessProbe:
+          httpGet:
+            path: /minio/health/live
+            port: 9000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /minio/health/ready
+            port: 9000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: minio-data
+          mountPath: /data
+      volumes:
+      - name: minio-data
+        persistentVolumeClaim:
+          claimName: minio-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: nuwax-rcoder
+spec:
+  selector:
+    app: minio
+  ports:
+  - name: api
+    port: 9000
+    targetPort: 9000
+  - name: console
+    port: 9001
+    targetPort: 9001
+  clusterIP: None  # Headless service for StatefulSet
+---
+# Service for K8s internal access (ClusterIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-service
+  namespace: nuwax-rcoder
+spec:
+  selector:
+    app: minio
+  ports:
+  - name: api
+    port: 9000
+    targetPort: 9000
+  - name: console
+    port: 9001
+    targetPort: 9001

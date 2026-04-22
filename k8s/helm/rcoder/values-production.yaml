@@ -1,0 +1,70 @@
+# Production values for RCoder
+
+# 生产环境副本数
+replicaCount: 2
+
+# 生产环境镜像 tag
+image:
+  tag: stable
+  agentRunner:
+    tag: stable
+
+# 生产环境资源配置
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+  limits:
+    cpu: 4000m
+    memory: 4Gi
+
+# 生产环境 PostgreSQL 配置
+postgresql:
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+  storage:
+    size: 50Gi
+    storageClass: longhorn  # 生产环境建议使用 Longhorn（支持快照、备份、扩容）
+
+# 生产环境 MinIO 配置
+minio:
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+  storage:
+    size: 500Gi
+    storageClass: longhorn  # 生产环境建议使用 Longhorn
+
+# 生产环境 Ingress
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+  hosts:
+    - host: rcoder.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: rcoder-tls
+      hosts:
+        - rcoder.example.com
+
+# 生产环境 PDB
+pdb:
+  minAvailable: 1
+
+# 生产环境 JuiceFS PVC
+juicefs:
+  pvcSize: 100Gi

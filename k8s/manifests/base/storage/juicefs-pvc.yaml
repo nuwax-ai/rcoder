@@ -1,0 +1,18 @@
+# ============================================================
+# RCoder JuiceFS PVC
+# 替代原来的 NFS PVC
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rcoder-workspace
+  namespace: nuwax-rcoder
+  labels:
+    app: rcoder
+spec:
+  # ReadWriteMany: 支持 K8s 多节点同时读写 (JuiceFS 特性)
+  accessModes: ["ReadWriteMany"]
+  storageClassName: juicefs-sc
+  resources:
+    requests:
+      storage: 50Gi

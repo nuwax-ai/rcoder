@@ -83,7 +83,7 @@ help:
 	@echo "  make dev-build-k8s  - 构建 K8s 镜像（启用 kubernetes feature）"
 	@echo "  make dev-up-k8s    - 启动 K8s 开发模式（标准 kubectl apply）"
 	@echo "  make dev-restart-k8s - 重启 K8s 开发模式（重新构建镜像+部署）"
-	@echo "  make dev-down-k8s  - 停止 K8s 开发模式（Workload + RBAC + NFS + Namespace）"
+	@echo "  make dev-down-k8s  - 停止 K8s 开发模式（存储层 + 应用层 + RBAC + Namespace）"
 	@echo "  make dev-logs-k8s  - 查看 K8s 开发模式日志"
 	@echo ""
 	@echo "📊 Pyroscope 持续剖析："

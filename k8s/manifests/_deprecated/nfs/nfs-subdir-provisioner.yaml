@@ -17,7 +17,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: nfs-client-provisioner
-  namespace: nfs-storage
+  namespace: nuwax-nfs-storage
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -57,13 +57,13 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: nfs-client-provisioner
-    namespace: nfs-storage
+    namespace: nuwax-nfs-storage
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: nfs-client-provisioner
-  namespace: nfs-storage
+  namespace: nuwax-nfs-storage
 spec:
   replicas: 1
   selector:

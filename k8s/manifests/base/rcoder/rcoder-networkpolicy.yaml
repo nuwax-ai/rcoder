@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: rcoder-network-policy
-  namespace: rcoder
+  namespace: nuwax-rcoder
 spec:
   podSelector:
     matchLabels:
@@ -37,13 +37,21 @@ spec:
     ports:
     - protocol: TCP
       port: 443
-  # NFS Server 访问（nfs-storage namespace）
+  # PostgreSQL 访问
   - to:
-    - namespaceSelector:
+    - podSelector:
         matchLabels:
-          name: nfs-storage
+          app: postgresql
     ports:
     - protocol: TCP
-      port: 2049
+      port: 5432
+  # MinIO 访问
+  - to:
+    - podSelector:
+        matchLabels:
+          app: minio
+    ports:
     - protocol: TCP
-      port: 20048
+      port: 9000
+    - protocol: TCP
+      port: 9001

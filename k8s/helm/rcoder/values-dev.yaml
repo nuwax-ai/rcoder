@@ -1,0 +1,45 @@
+# Development values for RCoder
+
+# 开发环境副本数
+replicaCount: 1
+
+# 开发环境资源配置
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+# 开发环境 PostgreSQL 配置
+postgresql:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  storage:
+    size: 10Gi
+
+# 开发环境 MinIO 配置
+minio:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  storage:
+    size: 50Gi
+
+# 开发环境 Ingress (禁用)
+ingress:
+  enabled: false
+
+# 开发环境 JuiceFS PVC
+juicefs:
+  pvcSize: 20Gi

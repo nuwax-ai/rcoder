@@ -1,0 +1,41 @@
+# ============================================================
+# MinIO Bucket 初始化 Job
+# 创建 JuiceFS 所需的 bucket
+# ============================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: nuwax-rcoder
+spec:
+  ttlSecondsAfterFinished: 300  # Job 完成后 5 分钟自动清理
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: mc
+        image: minio/mc:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # 等待 MinIO 就绪
+          echo "Waiting for MinIO to be ready..."
+          until mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do
+            echo "MinIO not ready, retrying..."
+            sleep 2
+          done
+
+          echo "MinIO is ready, creating bucket..."
+          # 创建 JuiceFS 专用 bucket
+          mc mb myminio/juicefs --ignore-existing
+
+          # 验证
+          mc ls myminio/
+
+          echo "MinIO initialization completed!"
+        env:
+        - name: MINIO_ROOT_USER
+          value: "minioadmin"
+        - name: MINIO_ROOT_PASSWORD
+          value: "minioadmin"

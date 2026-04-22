@@ -1,0 +1,64 @@
+{{- if .Values.juicefs.enabled }}
+---
+# JuiceFS Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.juicefs.secretName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: juicefs
+    {{- include "rcoder.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{- if .Values.postgresql.enabled }}
+  METAURL: {{ printf "postgres://%s:%s@postgresql.%s:5432/%s" .Values.postgresql.auth.username .Values.postgresql.auth.password .Values.namespace .Values.postgresql.auth.database }}
+  {{- else }}
+  METAURL: {{ printf "postgres://%s:%s@%s:%d/%s" .Values.postgresql.auth.username .Values.postgresql.auth.password .Values.postgresql.host .Values.postgresql.port .Values.postgresql.auth.database }}
+  {{- end }}
+  {{- if .Values.minio.enabled }}
+  MINIO_ACCESS_KEY: {{ .Values.minio.auth.username }}
+  MINIO_SECRET_KEY: {{ .Values.minio.auth.password }}
+  {{- else }}
+  MINIO_ACCESS_KEY: {{ .Values.minio.accessKey }}
+  MINIO_SECRET_KEY: {{ .Values.minio.secretKey }}
+  {{- end }}
+  APPEND_FSYNC: "1"
+  CACHE_SIZE: "1024"
+---
+# JuiceFS StorageClass
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.juicefs.storageClass }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+provisioner: csi.juicefs.com
+parameters:
+  csi.storage.k8s.io/provisioner-secret-name: {{ .Values.juicefs.secretName }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ .Values.namespace }}
+  csi.storage.k8s.io/controller-expand-secret-name: {{ .Values.juicefs.secretName }}
+  csi.storage.k8s.io/controller-expand-secret-namespace: {{ .Values.namespace }}
+  csi.storage.k8s.io/node-publish-secret-name: {{ .Values.juicefs.secretName }}
+  csi.storage.k8s.io/node-publish-secret-namespace: {{ .Values.namespace }}
+  juicefs/mountOptions: "cache-size=1024,allow-other"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+---
+# RCoder JuiceFS PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rcoder-workspace
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: rcoder
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: {{ .Values.juicefs.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.juicefs.pvcSize }}
+{{- end }}

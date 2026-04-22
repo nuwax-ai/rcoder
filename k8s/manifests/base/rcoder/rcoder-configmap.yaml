@@ -3,7 +3,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rcoder-config
-  namespace: rcoder
+  namespace: nuwax-rcoder
 data:
   config.yml: |
     # RCoder 配置文件
@@ -80,14 +80,8 @@ data:
       enabled: false
       api_key: "YOUR_API_KEY_HERE"
 
-    # K8s NFS 存储配置
-    # 内建模式: 使用 nfs-server.nfs-storage.svc.cluster.local (nfs-server.yaml 已部署)
-    # 外部模式: 替换为客户提供的 NFS Server 地址
+    # K8s JuiceFS 存储配置
+    # 存储层: JuiceFS + MinIO + PostgreSQL
     kubernetes_config:
-      # NFS Server 地址 (K8s 集群内 DNS 或外部 IP)
-      # 默认使用集群内建的 NFS Server
-      nfs_server: "nfs-server.nfs-storage.svc.cluster.local"
-      # NFS 共享路径
-      nfs_path: "/exports"
-      # StorageClass 名称 (nfs-subdir-external-provisioner 创建的 SC)
-      storage_class: "rcoder-nfs"
+      # StorageClass 名称 (juicefs-sc)
+      storage_class: "juicefs-sc"

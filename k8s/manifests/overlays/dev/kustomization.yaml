@@ -1,0 +1,31 @@
+# Dev environment overlay
+# 使用方式: kubectl apply -k manifests/overlays/dev
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nuwax-rcoder-dev
+
+bases:
+  - ../../base
+
+# 开发环境配置覆盖
+patches:
+  # 开发环境使用更小的资源
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rcoder
+      spec:
+        replicas: 1
+    target:
+      kind: Deployment
+      name: rcoder
+
+# 开发环境镜像 tag
+images:
+  - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder
+    newTag: latest
+  - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner
+    newTag: latest

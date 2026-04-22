@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rcoder
-  namespace: rcoder
+  namespace: nuwax-rcoder
 spec:
   replicas: 1
   selector:
@@ -28,18 +28,12 @@ spec:
         - name: CONTAINER_RUNTIME
           value: "kubernetes"
         - name: RCODER_K8S_NAMESPACE
-          value: "rcoder"
+          value: "nuwax-rcoder"
         - name: RUST_LOG
           value: "info"
-        # NFS 存储配置 (支持外部 NFS Server)
-        # 内建 NFS: nfs-server.nfs-storage.svc.cluster.local (默认值)
-        # 外部 NFS: 替换为客户提供的 NFS Server 地址
-        - name: RCODER_K8S_NFS_SERVER
-          value: "nfs-server.nfs-storage.svc.cluster.local"
-        - name: RCODER_K8S_NFS_PATH
-          value: "/exports"
+        # JuiceFS 存储配置 (通过 juicefs-sc StorageClass)
         - name: RCODER_K8S_STORAGE_CLASS
-          value: "rcoder-nfs"
+          value: "juicefs-sc"
         - name: RCODER_DOCKER_IMAGE
           value: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
         - name: RCODER_DOCKER_IMAGE_COMPUTER

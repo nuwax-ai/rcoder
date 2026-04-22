@@ -1,0 +1,26 @@
+# Production environment overlay
+# 使用方式: kubectl apply -k manifests/overlays/prod
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nuwax-rcoder-prod
+
+bases:
+  - ../../base
+
+# 生产环境副本数
+replicas:
+  - name: rcoder
+    count: 2
+
+# 生产环境镜像 tag
+images:
+  - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder
+    newTag: stable
+  - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner
+    newTag: stable
+
+# 生产环境资源配置 (如有需要可添加)
+# commonLabels:
+#   environment: production

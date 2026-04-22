@@ -1,0 +1,90 @@
+# ============================================================
+# PostgreSQL for JuiceFS Metadata
+# JuiceFS 元数据存储
+# ============================================================
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgresql-pvc
+  namespace: nuwax-rcoder
+  labels:
+    app: postgresql
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: "longhorn"  # 使用 Longhorn（支持快照、备份、在线扩容）
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: nuwax-rcoder
+spec:
+  serviceName: postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+    spec:
+      containers:
+      - name: postgresql
+        image: postgres:16-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_DB
+          value: "juicefs"
+        - name: POSTGRES_USER
+          value: "juicefs"
+        - name: POSTGRES_PASSWORD
+          value: "juicefs_password"  # 生产环境使用 Secret
+        args:
+          - -c wal_level=replica
+          - -c max_wal_senders=10
+          - -c hot_standby=on
+          - -c listen_addresses=*
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - juicefs
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - juicefs
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: postgresql-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: nuwax-rcoder
+spec:
+  selector:
+    app: postgresql
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+  clusterIP: None  # Headless service for StatefulSet
