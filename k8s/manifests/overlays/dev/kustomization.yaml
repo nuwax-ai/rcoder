@@ -4,10 +4,21 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: nuwax-rcoder-dev
+namespace: nuwax-rcoder
 
 bases:
   - ../../base
+
+# 开发环境配置覆盖
+commonLabels:
+  environment: dev
+
+# 开发环境镜像 tag
+images:
+  - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder
+    newTag: latest
+  - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner
+    newTag: latest
 
 # 开发环境配置覆盖
 patches:

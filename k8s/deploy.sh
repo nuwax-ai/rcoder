@@ -13,10 +13,50 @@ NC='\033[0m' # No Color
 
 NAMESPACE="${NAMESPACE:-nuwax-rcoder}"
 HELM_DIR="${HELM_DIR:-./helm/rcoder}"
+JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE:-juicedata/mount:ce-v1.3.1}"
+DNS_CHECK_IMAGE="${DNS_CHECK_IMAGE:-busybox:1.36}"
 
 echo -e "${GREEN}=========================================="
 echo "  RCoder K8s 一键部署"
 echo "==========================================${NC}"
+
+ensure_juicefs_ce_image() {
+    echo -e "${YELLOW}配置 JuiceFS CSI 使用 CE Mount 镜像: ${JUICEFS_CE_MOUNT_IMAGE}${NC}"
+
+    local node_ds=""
+    if kubectl get daemonset/juicefs-csi-node -n kube-system &> /dev/null; then
+        node_ds="juicefs-csi-node"
+    elif kubectl get daemonset/juicefs-csi-driver-node -n kube-system &> /dev/null; then
+        node_ds="juicefs-csi-driver-node"
+    fi
+
+    if [ -n "$node_ds" ]; then
+        kubectl -n kube-system set env "daemonset/${node_ds}" -c juicefs-plugin \
+        JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE}" \
+        JUICEFS_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE}" >/dev/null
+    fi
+
+    kubectl -n kube-system set env statefulset/juicefs-csi-controller -c juicefs-plugin \
+        JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE}" \
+        JUICEFS_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE}" >/dev/null
+
+    kubectl -n kube-system patch configmap juicefs-csi-driver-config --type merge \
+      -p "{\"data\":{\"config.yaml\":\"enableNodeSelector: false\\nmountImage: ${JUICEFS_CE_MOUNT_IMAGE}\\nmountPodPatch:\\n\"}}" >/dev/null || true
+}
+
+check_cluster_dns() {
+    echo -e "${GREEN}检查集群 DNS 基线...${NC}"
+    local check_name="rcoder-dns-check-$(date +%s)"
+    if kubectl run "${check_name}" --restart=Never --rm -i -n "${NAMESPACE}" \
+        --image="${DNS_CHECK_IMAGE}" --command -- \
+        sh -lc "nslookup kubernetes.default.svc.cluster.local >/dev/null && nslookup postgresql.${NAMESPACE}.svc.cluster.local >/dev/null && nslookup minio-service.${NAMESPACE}.svc.cluster.local >/dev/null" >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ 集群 DNS 解析正常${NC}"
+    else
+        echo -e "${RED}❌ 集群 DNS 解析异常：无法解析 Kubernetes/业务 Service 域名${NC}"
+        echo -e "${YELLOW}建议先修复 CoreDNS 后再继续（例如重启 coredns / 检查 coredns addon）${NC}"
+        exit 1
+    fi
+}
 
 # ============================================================
 # 步骤 1: 检查 K8s 集群
@@ -165,8 +205,9 @@ kubectl get sc | grep longhorn || echo -e "${YELLOW}Warning: Longhorn StorageCla
 echo ""
 echo -e "${GREEN}[3/6] 检查/部署 JuiceFS CSI Driver...${NC}"
 
-if kubectl get ds juicefs-csi-driver-node -n kube-system &> /dev/null; then
+if kubectl get ds juicefs-csi-driver-node -n kube-system &> /dev/null || kubectl get ds juicefs-csi-node -n kube-system &> /dev/null; then
     echo -e "${GREEN}✅ JuiceFS CSI Driver 已安装${NC}"
+    ensure_juicefs_ce_image
 else
     echo -e "${YELLOW}JuiceFS CSI Driver 未安装，正在部署...${NC}"
 
@@ -178,12 +219,14 @@ else
         helm repo update
         helm install juicefs-csi-driver juicefs/juicefs-csi-driver \
             --namespace kube-system \
-            --set webhook.enabled=false
+            --set webhook.enabled=false \
+            --set defaultMountImage.ce="${JUICEFS_CE_MOUNT_IMAGE}"
 
         echo -e "${GREEN}⏳ 等待 JuiceFS CSI Driver 就绪...${NC}"
         kubectl wait --for=condition=ready pod -l app=juicefs-csi-driver-node \
             -n kube-system --timeout=120s 2>/dev/null || true
 
+        ensure_juicefs_ce_image
         echo -e "${GREEN}✅ JuiceFS CSI Driver 部署完成${NC}"
     fi
 fi
@@ -214,6 +257,7 @@ else
 fi
 
 echo -e "${GREEN}✅ RCoder 部署完成${NC}"
+check_cluster_dns
 
 # ============================================================
 # 步骤 5: 验证部署

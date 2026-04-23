@@ -20,6 +20,10 @@ parameters:
   csi.storage.k8s.io/controller-expand-secret-namespace: nuwax-rcoder
   csi.storage.k8s.io/node-publish-secret-name: juicefs-secret
   csi.storage.k8s.io/node-publish-secret-namespace: nuwax-rcoder
+  # 禁用 controller quota set (开源版不支持)
+  juicefs/controllerQuotaSet: "false"
+  # 强制使用社区版 Mount 镜像，避免误用 ee 镜像
+  juicefs/mount-image: "juicedata/mount:ce-v1.3.1"
   # JuiceFS 挂载选项
   juicefs/mountOptions: "cache-size=1024,allow-other"
 reclaimPolicy: Retain  # 重要！防止误删导致数据丢失

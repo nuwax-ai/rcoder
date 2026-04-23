@@ -11,15 +11,25 @@ metadata:
     {{- include "rcoder.labels" . | nindent 4 }}
 type: Opaque
 stringData:
+  # JuiceFS CE 必需字段（小写键名）
+  name: "rcoder-juicefs"
   {{- if .Values.postgresql.enabled }}
+  metaurl: {{ printf "postgres://%s:%s@postgresql.%s:5432/%s" .Values.postgresql.auth.username .Values.postgresql.auth.password .Values.namespace .Values.postgresql.auth.database }}
   METAURL: {{ printf "postgres://%s:%s@postgresql.%s:5432/%s" .Values.postgresql.auth.username .Values.postgresql.auth.password .Values.namespace .Values.postgresql.auth.database }}
   {{- else }}
+  metaurl: {{ printf "postgres://%s:%s@%s:%d/%s" .Values.postgresql.auth.username .Values.postgresql.auth.password .Values.postgresql.host .Values.postgresql.port .Values.postgresql.auth.database }}
   METAURL: {{ printf "postgres://%s:%s@%s:%d/%s" .Values.postgresql.auth.username .Values.postgresql.auth.password .Values.postgresql.host .Values.postgresql.port .Values.postgresql.auth.database }}
   {{- end }}
+  storage: "minio"
+  bucket: {{ printf "http://minio-service.%s:9000/%s" .Values.namespace .Values.minio.bucket | quote }}
   {{- if .Values.minio.enabled }}
+  access-key: {{ .Values.minio.auth.username }}
+  secret-key: {{ .Values.minio.auth.password }}
   MINIO_ACCESS_KEY: {{ .Values.minio.auth.username }}
   MINIO_SECRET_KEY: {{ .Values.minio.auth.password }}
   {{- else }}
+  access-key: {{ .Values.minio.accessKey }}
+  secret-key: {{ .Values.minio.secretKey }}
   MINIO_ACCESS_KEY: {{ .Values.minio.accessKey }}
   MINIO_SECRET_KEY: {{ .Values.minio.secretKey }}
   {{- end }}
@@ -41,6 +51,8 @@ parameters:
   csi.storage.k8s.io/controller-expand-secret-namespace: {{ .Values.namespace }}
   csi.storage.k8s.io/node-publish-secret-name: {{ .Values.juicefs.secretName }}
   csi.storage.k8s.io/node-publish-secret-namespace: {{ .Values.namespace }}
+  juicefs/controllerQuotaSet: "false"
+  juicefs/mount-image: "juicedata/mount:ce-v1.3.1"
   juicefs/mountOptions: "cache-size=1024,allow-other"
 reclaimPolicy: Retain
 allowVolumeExpansion: true

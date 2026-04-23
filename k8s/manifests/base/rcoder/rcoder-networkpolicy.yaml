@@ -55,3 +55,14 @@ spec:
       port: 9000
     - protocol: TCP
       port: 9001
+  # Agent Pod gRPC 访问 (rcoder -> agent 通信)
+  # 使用 service_type 标签匹配，因为 K8s runtime 动态创建的 pod 使用 app=rcoder 标签
+  - to:
+    - podSelector:
+        matchLabels:
+          service_type: computer-agent-runner
+    ports:
+    - protocol: TCP
+      port: 50051
+    - protocol: TCP
+      port: 8086

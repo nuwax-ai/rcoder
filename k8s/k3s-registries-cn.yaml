@@ -1,0 +1,15 @@
+# 复制到节点: /etc/rancher/k3s/registries.yaml 后执行: sudo systemctl restart k3s
+#
+# 注意: 「k3s ctr images pull」通常不走本文件；验证请用 crictl（与 kubelet 一致），例如:
+#   sudo crictl --runtime-endpoint unix:///run/k3s/containerd/containerd.sock pull docker.io/rancher/mirrored-pause:3.6
+#
+# 文档: https://docs.k3s.io/installation/private-registry
+
+mirrors:
+  "docker.io":
+    endpoint:
+      - "https://docker.m.daocloud.io"
+      - "https://docker.1ms.run"
+  "ghcr.io":
+    endpoint:
+      - "https://ghcr.m.daocloud.io"
