@@ -12,10 +12,10 @@ metadata:
     app: minio
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: "longhorn"  # 使用 Longhorn（支持快照、备份、在线扩容）
+  storageClassName: "local-path"  # 单节点环境使用 local-path
   resources:
     requests:
-      storage: 100Gi  # 根据数据量调整
+      storage: 30Gi  # 单节点环境使用较小存储
 ---
 apiVersion: apps/v1
 kind: StatefulSet

@@ -7,8 +7,8 @@ echo "=== Testing RCoder in K8s ==="
 NODE_PORT=$(kubectl get svc rcoder -n nuwax-rcoder -o jsonpath='{.spec.ports[0].nodePort}')
 echo "NodePort: $NODE_PORT"
 
-# 获取节点 IP
-NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+# 获取节点 IP（优先使用第一个 IPv4，避免 dual-stack 返回多个地址导致 URL 拼接失败）
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' | awk '{print $1}')
 echo "Node IP: $NODE_IP"
 
 BASE_URL="http://${NODE_IP}:${NODE_PORT}"

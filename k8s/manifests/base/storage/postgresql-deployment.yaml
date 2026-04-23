@@ -12,10 +12,10 @@ metadata:
     app: postgresql
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: "longhorn"  # 使用 Longhorn（支持快照、备份、在线扩容）
+  storageClassName: "local-path"  # 单节点环境使用 local-path
   resources:
     requests:
-      storage: 20Gi
+      storage: 10Gi
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -33,6 +33,13 @@ spec:
       labels:
         app: postgresql
     spec:
+      initContainers:
+      - name: cleanup
+        image: postgres:16-alpine
+        command: ["rm", "-rf", "/var/lib/postgresql/data/lost+found"]
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
       containers:
       - name: postgresql
         image: postgres:16-alpine
@@ -46,11 +53,6 @@ spec:
           value: "juicefs"
         - name: POSTGRES_PASSWORD
           value: "juicefs_password"  # 生产环境使用 Secret
-        args:
-          - -c wal_level=replica
-          - -c max_wal_senders=10
-          - -c hot_standby=on
-          - -c listen_addresses=*
         livenessProbe:
           exec:
             command:
@@ -87,4 +89,3 @@ spec:
   - name: postgres
     port: 5432
     targetPort: 5432
-  clusterIP: None  # Headless service for StatefulSet

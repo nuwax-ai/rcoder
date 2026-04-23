@@ -77,8 +77,10 @@ spec:
               subPath: config.yml
             - name: project-workspace
               mountPath: /app/project_workspace
-            - name: computer-workspace
+              subPath: project_workspace
+            - name: project-workspace
               mountPath: /app/computer-project-workspace
+              subPath: computer_workspace
       volumes:
         - name: rcoder-config
           configMap:
@@ -87,12 +89,7 @@ spec:
         - name: project-workspace
           persistentVolumeClaim:
             claimName: rcoder-workspace
-        - name: computer-workspace
-          persistentVolumeClaim:
-            claimName: rcoder-workspace
         {{- else }}
         - name: project-workspace
-          emptyDir: {}
-        - name: computer-workspace
           emptyDir: {}
         {{- end }}
