@@ -36,6 +36,21 @@ pub struct DockerContainerConfig {
     pub entrypoint: Option<Vec<String>>,
     /// 网络名称 (可选，如果不指定则使用默认的 RCODER_NETWORK_NAME)
     pub network_name: Option<String>,
+
+    // === 新增字段 (隔离类型支持) ===
+    /// 容器唯一标识（可选），用于容器复用
+    /// 若传值，则使用此 ID 作为容器标识，优先级高于 project_id/user_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_id: Option<String>,
+    /// 租户 ID（可选），用于多租户场景下的数据隔离
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// 空间 ID（可选），用于区分租户下的不同空间
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    /// 隔离类型（可选），控制容器共享粒度：tenant/space/project
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_type: Option<String>,
 }
 
 /// 挂载点配置
@@ -102,6 +117,11 @@ impl DockerContainerConfig {
             command: None,
             entrypoint: None,
             network_name: None,
+            // 新增字段（隔离类型支持）
+            pod_id: None,
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
         }
     }
 }

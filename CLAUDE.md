@@ -139,10 +139,20 @@ make update-image-tag
 - ACP 操作必须在 `LocalSet` 中执行以支持 `spawn_local`
 
 ### Docker 容器动态创建
-- **项目级隔离**: 每个项目对应一个独立的 Docker 容器
+- **多级隔离架构**: 支持三种隔离级别
+  - `project` (默认): 每个项目对应一个独立的 Docker 容器
+  - `tenant`: 租户级隔离，同一租户共享容器
+  - `space`: 空间级隔离，同一空间共享容器
+- **容器复用**: 通过 `pod_id` 字段实现跨用户容器复用
 - **自动架构检测**: 根据 OS 和 ARCH 自动选择合适的镜像
 - **内部网络通信**: 容器间通过 Docker 内部网络直接通信，无需端口映射
 - **路径自动解析**: 自动检测容器内路径到宿主机路径的映射
+
+### 容器工作空间路径
+| 隔离类型 | RCoder 路径 | Computer 路径 |
+|---------|------------|--------------|
+| project | `/app/project_workspace/{project_id}` | `/app/computer-project-workspace/{user_id}/{project_id}` |
+| tenant/space | `/app/project_workspace/{tenant_id}/{space_id}/{project_id}` | `/app/computer-project-workspace/{tenant_id}/{space_id}/{project_id}` |
 
 ### 配置系统
 多层级配置优先级 (从高到低):
@@ -178,11 +188,14 @@ COMPOSE_PROJECT_NAME=rcoder                 # Docker Compose 项目名
 ## API 接口
 
 ### 核心端点
-- `POST /chat`: 发送聊天消息到 AI 代理
+- `POST /chat`: 发送聊天消息到 AI 代理 (支持 `pod_id`, `tenant_id`, `space_id`, `isolation_type` 多租户参数)
+- `POST /computer/chat`: Computer Agent 聊天接口 (支持多租户参数)
 - `GET /agent/progress/{session_id}`: SSE 进度流，接收实时通知
 - `POST /agent/session/cancel`: 取消正在执行的任务
 - `POST /agent/stop`: 停止 Agent
 - `GET /agent/status/{project_id}`: 查询 Agent 状态
+- `POST /pod/ensure`: 确保容器存在，支持多租户参数
+- `POST /pod/restart`: 重启容器，支持多租户参数
 - `GET /health`: 健康检查
 
 ### Pingora 反向代理
@@ -211,7 +224,7 @@ struct HttpResult<T> {
 4. ** Always Response in 中文** - 所有响应必须使用中文
 
 ### Docker 容器管理
-- **容器名称格式**: `rcoder-agent-{project_id}`
+- **容器名称格式**: `rcoder-agent-{project_id}` 或 `rcoder-agent-{pod_id}` (当 pod_id 提供时)
 - **镜像选择策略**: 通用镜像 > 架构特定镜像 > 默认回退镜像
 - **网络模式**: 优先使用内部网络，支持 host 网络模式
 - **安全配置**: 自动移除 NET_RAW 和 NET_ADMIN 权限

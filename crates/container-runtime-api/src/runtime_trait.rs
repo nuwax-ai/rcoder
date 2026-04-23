@@ -71,6 +71,115 @@ impl From<ContainerRuntimeStatus> for String {
     }
 }
 
+/// Parameters for creating a container
+///
+/// Bundles all parameters needed for container creation to avoid
+/// long parameter lists that hurt code readability and maintainability.
+#[derive(Debug, Clone)]
+pub struct ContainerCreateParams {
+    /// Project identifier (used as container name base for RCoder service)
+    pub project_id: Option<String>,
+    /// User identifier (used as container name base for ComputerAgentRunner)
+    pub user_id: Option<String>,
+    /// Workspace path on host
+    pub host_workspace_path: String,
+    /// Service type determining container purpose
+    pub service_type: ServiceType,
+    /// Optional resource constraints
+    pub resource_limits: Option<ServiceResourceLimits>,
+    /// Pod identifier for container reuse (for multi-tenant scenarios)
+    pub pod_id: Option<String>,
+    /// Isolation type: tenant|space|project (for multi-tenant scenarios)
+    pub isolation_type: Option<String>,
+    /// Tenant identifier (for multi-tenant scenarios)
+    pub tenant_id: Option<String>,
+    /// Space identifier (for multi-tenant scenarios)
+    pub space_id: Option<String>,
+}
+
+impl ContainerCreateParams {
+    /// Create a new builder for container create params
+    pub fn builder() -> ContainerCreateParamsBuilder {
+        ContainerCreateParamsBuilder::default()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContainerCreateParamsBuilder {
+    project_id: Option<String>,
+    user_id: Option<String>,
+    host_workspace_path: Option<String>,
+    service_type: Option<ServiceType>,
+    resource_limits: Option<ServiceResourceLimits>,
+    pod_id: Option<String>,
+    isolation_type: Option<String>,
+    tenant_id: Option<String>,
+    space_id: Option<String>,
+}
+
+impl ContainerCreateParamsBuilder {
+    pub fn project_id(mut self, project_id: impl Into<String>) -> Self {
+        self.project_id = Some(project_id.into());
+        self
+    }
+
+    pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = Some(user_id.into());
+        self
+    }
+
+    pub fn host_workspace_path(mut self, host_workspace_path: impl Into<String>) -> Self {
+        self.host_workspace_path = Some(host_workspace_path.into());
+        self
+    }
+
+    pub fn service_type(mut self, service_type: ServiceType) -> Self {
+        self.service_type = Some(service_type);
+        self
+    }
+
+    pub fn resource_limits(mut self, resource_limits: ServiceResourceLimits) -> Self {
+        self.resource_limits = Some(resource_limits);
+        self
+    }
+
+    pub fn pod_id(mut self, pod_id: impl Into<String>) -> Self {
+        self.pod_id = Some(pod_id.into());
+        self
+    }
+
+    pub fn isolation_type(mut self, isolation_type: impl Into<String>) -> Self {
+        self.isolation_type = Some(isolation_type.into());
+        self
+    }
+
+    pub fn tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    pub fn space_id(mut self, space_id: impl Into<String>) -> Self {
+        self.space_id = Some(space_id.into());
+        self
+    }
+
+    pub fn build(self) -> ContainerCreateParams {
+        ContainerCreateParams {
+            project_id: self.project_id,
+            user_id: self.user_id,
+            host_workspace_path: self
+                .host_workspace_path
+                .unwrap_or_else(|| String::new()),
+            service_type: self.service_type.unwrap_or(ServiceType::RCoder),
+            resource_limits: self.resource_limits,
+            pod_id: self.pod_id,
+            isolation_type: self.isolation_type,
+            tenant_id: self.tenant_id,
+            space_id: self.space_id,
+        }
+    }
+}
+
 /// Abstraction trait for container runtimes (Docker, Kubernetes, etc.)
 ///
 /// This trait follows the Interface Segregation Principle - it provides
@@ -80,11 +189,7 @@ pub trait ContainerRuntime: Send + Sync {
     /// Create and start a container
     async fn create_container(
         &self,
-        project_id: Option<&str>,
-        user_id: Option<&str>,
-        host_workspace_path: &str,
-        service_type: ServiceType,
-        resource_limits: Option<ServiceResourceLimits>,
+        params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo>;
 
     /// Get container information by project_id

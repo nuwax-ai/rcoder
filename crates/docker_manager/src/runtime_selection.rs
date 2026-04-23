@@ -59,35 +59,62 @@ mod tests {
 
     #[test]
     fn test_runtime_type_from_env_docker() {
-        env::set_var("CONTAINER_RUNTIME", "docker");
+        // SAFETY: Test-only environment variable manipulation, runs in serial
+        unsafe {
+            env::set_var("CONTAINER_RUNTIME", "docker");
+        }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Docker);
-        env::remove_var("CONTAINER_RUNTIME");
+        // SAFETY: Test-only environment variable cleanup, runs in serial
+        unsafe {
+            env::remove_var("CONTAINER_RUNTIME");
+        }
     }
 
     #[test]
     fn test_runtime_type_from_env_kubernetes() {
-        env::set_var("CONTAINER_RUNTIME", "kubernetes");
+        // SAFETY: Test-only environment variable manipulation, runs in serial
+        unsafe {
+            env::set_var("CONTAINER_RUNTIME", "kubernetes");
+        }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Kubernetes);
-        env::remove_var("CONTAINER_RUNTIME");
+        // SAFETY: Test-only environment variable cleanup, runs in serial
+        unsafe {
+            env::remove_var("CONTAINER_RUNTIME");
+        }
     }
 
     #[test]
     fn test_runtime_type_from_env_k8s() {
-        env::set_var("CONTAINER_RUNTIME", "k8s");
+        // SAFETY: Test-only environment variable manipulation, runs in serial
+        unsafe {
+            env::set_var("CONTAINER_RUNTIME", "k8s");
+        }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Kubernetes);
-        env::remove_var("CONTAINER_RUNTIME");
+        // SAFETY: Test-only environment variable cleanup, runs in serial
+        unsafe {
+            env::remove_var("CONTAINER_RUNTIME");
+        }
     }
 
     #[test]
     fn test_runtime_type_from_env_default() {
-        env::remove_var("CONTAINER_RUNTIME");
+        // SAFETY: Test-only environment variable cleanup, runs in serial
+        unsafe {
+            env::remove_var("CONTAINER_RUNTIME");
+        }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Docker);
     }
 
     #[test]
     fn test_runtime_type_from_env_unknown() {
-        env::set_var("CONTAINER_RUNTIME", "unknown");
+        // SAFETY: Test-only environment variable manipulation, runs in serial
+        unsafe {
+            env::set_var("CONTAINER_RUNTIME", "unknown");
+        }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Docker);
-        env::remove_var("CONTAINER_RUNTIME");
+        // SAFETY: Test-only environment variable cleanup, runs in serial
+        unsafe {
+            env::remove_var("CONTAINER_RUNTIME");
+        }
     }
 }

@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
-use super::utils::{I18nJson, extract_grpc_addr_with_port, get_locale_from_headers};
+use super::utils::{I18nJson, extract_grpc_addr_with_port, get_locale_from_headers, build_workspace_path};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -66,6 +66,32 @@ pub struct ChatRequest {
     /// 可选的 Agent 运行时配置（Agent 服务器 + MCP 服务器）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_config: Option<ChatAgentConfig>,
+
+    // === 新增字段 (v3 - 隔离类型支持) ===
+    /// 容器唯一标识，若传值则使用此 ID 标识容器，实现容器复用
+    /// 若不传则使用 project_id 作为容器标识（保持原有逻辑）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_tenant_123")]
+    pub pod_id: Option<String>,
+
+    /// 租户 ID，用于多租户场景下的数据隔离
+    /// 当 pod_id 有值时，此字段必须非空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID，用于区分租户下的不同空间
+    /// 当 pod_id 有值时，此字段必须非空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型，控制容器共享粒度和数据目录结构
+    /// 可选值：tenant（租户隔离）、space（空间隔离）、project（项目隔离，默认）
+    /// 当 pod_id 有值时，此字段必须非空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
 }
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
@@ -145,6 +171,71 @@ pub async fn handle_chat(
         }
     };
 
+    // ========== 隔离类型参数校验 ==========
+    // IF pod_id IS NOT NULL THEN isolation_type, tenant_id, space_id 必须非空
+    if request.pod_id.is_some() {
+        if request.isolation_type.is_none() {
+            error!("[CHAT] Validation failed: isolation_type is required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+        if request.tenant_id.is_none() {
+            error!("[CHAT] Validation failed: tenant_id is required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+        if request.space_id.is_none() {
+            error!("[CHAT] Validation failed: space_id is required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+
+        // 验证 isolation_type 值有效
+        if let Some(ref it) = request.isolation_type {
+            if it != "tenant" && it != "space" && it != "project" {
+                error!("[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
+                return Ok(HttpResult::error_with_locale(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    locale,
+                ));
+            }
+        }
+
+        // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
+        if let (Some(pid), Some(it), Some(tid), Some(sid)) = (
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+        ) {
+            info!(
+                "🔒 [CHAT] Isolation parameters validated: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
+                pid, it, tid, sid
+            );
+        }
+    }
+
+    // ========== 构建工作空间路径 ==========
+    // 根据 isolation_type 确定容器内工作目录
+    let container_work_path = build_workspace_path(
+        request.isolation_type.as_deref(),
+        request.tenant_id.as_deref(),
+        request.space_id.as_deref(),
+        &project_id,
+    );
+
+    info!(
+        "📁 [CHAT] Workspace path determined: {} (isolation_type={})",
+        container_work_path,
+        request.isolation_type.as_deref().unwrap_or("project")
+    );
+
     // 验证资源限制配置
     if let Some(ref agent_config) = request.agent_config {
         if let Some(ref resource_limits) = agent_config.resource_limits {
@@ -183,6 +274,11 @@ pub async fn handle_chat(
                 .agent_config
                 .as_ref()
                 .and_then(|c| c.resource_limits.clone()),
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+            &container_work_path,
         )
         .await?;
 

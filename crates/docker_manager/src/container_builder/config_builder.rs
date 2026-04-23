@@ -41,6 +41,11 @@ pub struct ContainerConfigBuilder {
     command: Option<Vec<String>>,
     entrypoint: Option<Vec<String>>,
     network_name: Option<String>,
+    // 新增字段（隔离类型支持）
+    pod_id: Option<String>,
+    tenant_id: Option<String>,
+    space_id: Option<String>,
+    isolation_type: Option<String>,
 }
 
 impl ContainerConfigBuilder {
@@ -65,6 +70,11 @@ impl ContainerConfigBuilder {
             command: None,
             entrypoint: None,
             network_name: None,
+            // 新增字段（隔离类型支持）
+            pod_id: None,
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
         }
     }
 
@@ -175,6 +185,30 @@ impl ContainerConfigBuilder {
         self
     }
 
+    /// 设置 pod_id（容器唯一标识，用于容器复用）
+    pub fn pod_id(mut self, pod_id: impl Into<String>) -> Self {
+        self.pod_id = Some(pod_id.into());
+        self
+    }
+
+    /// 设置 tenant_id（租户 ID）
+    pub fn tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    /// 设置 space_id（空间 ID）
+    pub fn space_id(mut self, space_id: impl Into<String>) -> Self {
+        self.space_id = Some(space_id.into());
+        self
+    }
+
+    /// 设置 isolation_type（隔离类型）
+    pub fn isolation_type(mut self, isolation_type: impl Into<String>) -> Self {
+        self.isolation_type = Some(isolation_type.into());
+        self
+    }
+
     /// 构建 DockerContainerConfig
     ///
     /// # Returns
@@ -214,6 +248,11 @@ impl ContainerConfigBuilder {
             command: self.command,
             entrypoint: self.entrypoint,
             network_name: self.network_name,
+            // 新增字段（隔离类型支持）
+            pod_id: self.pod_id,
+            tenant_id: self.tenant_id,
+            space_id: self.space_id,
+            isolation_type: self.isolation_type,
         };
 
         debug!(

@@ -31,7 +31,7 @@ use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
     I18nJson, extract_grpc_addr_with_port, get_locale_from_headers,
-    get_realtime_container_ip_with_cache, project_dir,
+    get_realtime_container_ip_with_cache, project_dir, build_computer_workspace_path,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -109,6 +109,56 @@ pub async fn handle_computer_chat(
     }
 
     let user_id = request.user_id.clone();
+
+    // ========== 隔离类型参数校验 ==========
+    // IF pod_id IS NOT NULL THEN isolation_type, tenant_id, space_id 必须非空
+    if request.pod_id.is_some() {
+        if request.isolation_type.is_none() {
+            error!("[COMPUTER_CHAT] Validation failed: isolation_type is required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+        if request.tenant_id.is_none() {
+            error!("[COMPUTER_CHAT] Validation failed: tenant_id is required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+        if request.space_id.is_none() {
+            error!("[COMPUTER_CHAT] Validation failed: space_id is required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+
+        // 验证 isolation_type 值有效
+        if let Some(ref it) = request.isolation_type {
+            if it != "tenant" && it != "space" && it != "project" {
+                error!("[COMPUTER_CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
+                return Ok(HttpResult::error_with_locale(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    locale,
+                ));
+            }
+        }
+
+        // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
+        if let (Some(pid), Some(it), Some(tid), Some(sid)) = (
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+        ) {
+            info!(
+                "🔒 [COMPUTER_CHAT] Isolation parameters validated: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
+                pid, it, tid, sid
+            );
+        }
+    }
 
     // 2. 生成或使用提供的 project_id
     let project_id = match &request.project_id {
@@ -229,6 +279,10 @@ pub async fn handle_computer_chat(
                 .agent_config
                 .as_ref()
                 .and_then(|c| c.resource_limits.clone()),
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
         )
         .await;
 
@@ -292,7 +346,14 @@ pub async fn handle_computer_chat(
 
     // 5. 创建项目工作目录（在用户容器内）
     // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
-    if let Err(e) = ensure_project_workspace_exists(&user_id, &project_id).await {
+    if let Err(e) = ensure_project_workspace_exists(
+        request.isolation_type.as_deref(),
+        request.tenant_id.as_deref(),
+        request.space_id.as_deref(),
+        &user_id,
+        &project_id,
+    )
+    .await {
         error!("[COMPUTER_CHAT] Failed to create project workspace: {}", e);
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_WORKSPACE_ERROR,
@@ -725,9 +786,28 @@ async fn forward_computer_request_to_container(
 /// /app/computer-project-workspace/{user_id}/{project_id}/
 ///
 /// 注意：这个目录已经在 docker-compose.yml 中挂载，可以直接在 rcoder 容器内创建
-async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Result<(), AppError> {
-    // 项目工作目录路径
-    let project_workspace_path = std::path::PathBuf::from(project_dir(user_id, project_id));
+///
+/// # 参数
+/// - `isolation_type`: 隔离类型（可选）
+/// - `tenant_id`: 租户 ID（可选）
+/// - `space_id`: 空间 ID（可选）
+/// - `user_id`: 用户 ID（当 isolation_type 为 project 时使用）
+/// - `project_id`: 项目 ID
+async fn ensure_project_workspace_exists(
+    isolation_type: Option<&str>,
+    tenant_id: Option<&str>,
+    space_id: Option<&str>,
+    user_id: &str,
+    project_id: &str,
+) -> Result<(), AppError> {
+    // 根据隔离类型构建工作空间路径
+    let project_workspace_path = std::path::PathBuf::from(build_computer_workspace_path(
+        isolation_type,
+        tenant_id,
+        space_id,
+        user_id,
+        project_id,
+    ));
 
     debug!(
         "📁 [COMPUTER_CHAT] Ensuring project workspace directory exists: {:?}",
@@ -746,8 +826,8 @@ async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Res
         })?;
 
     info!(
-        "✅ [COMPUTER_CHAT] Project workspace directory created: user_id={}, project_id={}, path={:?}",
-        user_id, project_id, project_workspace_path
+        "✅ [COMPUTER_CHAT] Project workspace directory created: user_id={}, project_id={}, isolation_type={:?}, path={:?}",
+        user_id, project_id, isolation_type, project_workspace_path
     );
 
     Ok(())

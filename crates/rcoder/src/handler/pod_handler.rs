@@ -88,7 +88,12 @@ fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
     // 注意: east_opt 在参数有效时总是返回 Some，这里使用 unwrap_or 仅作为安全保障
     let utc8_offset = FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| {
         tracing::warn!("created UTC+8 timezone failed, fallback to UTC+0");
-        FixedOffset::east_opt(0).unwrap_or(FixedOffset::east_opt(0).unwrap())
+        // east_opt(0) 始终返回 Some(0)，因为 0 是有效参数
+        // 使用 unwrap_or_else 避免嵌套 unwrap，仅作为防御性编程
+        FixedOffset::east_opt(0).unwrap_or_else(|| {
+            // 这个分支永远不会执行，因为 east_opt(0) 不会失败
+            unreachable!("FixedOffset::east_opt(0) is guaranteed to return Some")
+        })
     });
 
     // 转换为东八区时间并格式化
@@ -240,6 +245,26 @@ pub struct EnsurePodRequest {
     /// 可选的资源限制配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<PodResourceLimits>,
+
+    /// 容器唯一标识，若传值则使用此 ID 标识容器，实现容器复用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_tenant_123")]
+    pub pod_id: Option<String>,
+
+    /// 租户 ID，用于多租户场景下的数据隔离
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID，用于区分租户下的不同空间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型，控制容器共享粒度和数据目录结构
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
 }
 
 /// Pod 资源限制配置
@@ -298,6 +323,27 @@ pub struct KeepalivePodRequest {
     /// 项目唯一标识符
     #[schema(example = "proj_456")]
     pub project_id: String,
+
+    // === 新增字段 (多租户隔离支持) ===
+    /// 容器唯一标识，若传值则使用此 ID 标识容器
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_tenant_123")]
+    pub pod_id: Option<String>,
+
+    /// 租户 ID，用于多租户场景下的数据隔离
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID，用于区分租户下的不同空间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型，控制容器共享粒度和数据目录结构
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
 }
 
 /// 容器保活响应
@@ -355,6 +401,26 @@ pub struct RestartPodRequest {
     /// 可选的资源限制配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<PodResourceLimits>,
+
+    /// 容器唯一标识，若传值则使用此 ID 标识容器，实现容器复用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_tenant_123")]
+    pub pod_id: Option<String>,
+
+    /// 租户 ID，用于多租户场景下的数据隔离
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID，用于区分租户下的不同空间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型，控制容器共享粒度和数据目录结构
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
 }
 
 /// 重启容器响应
@@ -893,6 +959,10 @@ pub async fn pod_ensure(
             match ComputerContainerManager::get_or_create_container_for_user(
                 &request.user_id,
                 resource_limits.clone(),
+                request.pod_id.as_deref(),
+                request.isolation_type.as_deref(),
+                request.tenant_id.as_deref(),
+                request.space_id.as_deref(),
             )
             .await
             {
@@ -1026,6 +1096,10 @@ pub async fn pod_ensure(
                         let result = ComputerContainerManager::get_or_create_container_for_user(
                             &request.user_id,
                             resource_limits,
+                            request.pod_id.as_deref(),
+                            request.isolation_type.as_deref(),
+                            request.tenant_id.as_deref(),
+                            request.space_id.as_deref(),
                         )
                         .await;
 
@@ -1166,9 +1240,34 @@ pub async fn pod_keepalive(
         ));
     }
 
+    // 1.1 验证隔离参数完整性（当 pod_id 有值时）
+    let container_identifier = if let Some(ref pod_id) = request.pod_id {
+        if request.isolation_type.is_none() || request.tenant_id.is_none() || request.space_id.is_none() {
+            error!("[POD_KEEPALIVE] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+        // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
+        if let (Some(it), Some(tid), Some(sid)) = (
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+        ) {
+            info!(
+                "🔒 [POD_KEEPALIVE] Using pod_id for container lookup: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
+                pod_id, it, tid, sid
+            );
+        }
+        pod_id.clone()
+    } else {
+        request.user_id.clone()
+    };
+
     info!(
-        "💓 [POD_KEEPALIVE] Container keepalive: user_id={}, project_id={}",
-        request.user_id, request.project_id
+        "💓 [POD_KEEPALIVE] Container keepalive: user_id={}, project_id={}, container_identifier={}",
+        request.user_id, request.project_id, container_identifier
     );
 
     // 2. 检查 DuckDB 存储中是否有记录，并更新活动时间
@@ -1193,7 +1292,7 @@ pub async fn pod_keepalive(
     let (container_info, created) = if !existed {
         // DuckDB 存储中没有记录，检查 Docker 中是否有容器
         let existing_container =
-            ComputerContainerManager::get_container_info(&request.user_id).await?;
+            ComputerContainerManager::get_container_info(&container_identifier).await?;
 
         match existing_container {
             Some(info) => {
@@ -1218,8 +1317,8 @@ pub async fn pod_keepalive(
             None => {
                 // Docker 中也没有容器，返回错误而不是创建新容器
                 info!(
-                    "❌ [POD_KEEPALIVE] containernot found: user_id={}",
-                    request.user_id
+                    "❌ [POD_KEEPALIVE] container not found: container_identifier={}",
+                    container_identifier
                 );
                 return Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
@@ -1229,7 +1328,7 @@ pub async fn pod_keepalive(
         }
     } else {
         // DuckDB 存储中有记录，直接获取容器信息
-        let info = ComputerContainerManager::get_container_info(&request.user_id)
+        let info = ComputerContainerManager::get_container_info(&container_identifier)
             .await?
             .ok_or_else(|| {
                 error!(
@@ -1468,6 +1567,10 @@ pub async fn pod_restart(
     let container_info = ComputerContainerManager::force_create_container_for_user(
         &request.user_id,
         resource_limits,
+        request.pod_id.as_deref(),
+        request.isolation_type.as_deref(),
+        request.tenant_id.as_deref(),
+        request.space_id.as_deref(),
     )
     .await?;
 
@@ -1545,6 +1648,31 @@ pub struct PodStatusQuery {
     #[schema(example = "user_123")]
     #[serde(default)]
     pub user_id: Option<String>,
+
+    // === 新增字段 (多租户隔离支持) ===
+    /// 容器唯一标识，若传值则使用此 ID 标识容器
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(example = "pod_tenant_123")]
+    #[schema(example = "pod_tenant_123")]
+    pub pod_id: Option<String>,
+
+    /// 租户 ID，用于多租户场景下的数据隔离
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(example = "tenant_abc")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID，用于区分租户下的不同空间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(example = "space_xyz")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型，控制容器共享粒度和数据目录结构
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(example = "tenant")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
 }
 
 /// 查询容器状态响应
@@ -1606,18 +1734,43 @@ pub async fn pod_status(
 ) -> Result<HttpResult<PodStatusResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
-    // 1. 验证参数：至少需要 user_id 或 project_id 之一
-    if params.user_id.is_none() && params.project_id.is_none() {
-        error!("[POD_STATUS] user_id and project_id are both empty");
+    // 1. 验证参数：至少需要 pod_id、user_id 或 project_id 之一
+    if params.pod_id.is_none() && params.user_id.is_none() && params.project_id.is_none() {
+        error!("[POD_STATUS] pod_id, user_id and project_id are all empty");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
         ));
     }
 
+    // 1.1 验证隔离参数完整性（当 pod_id 有值时）
+    let container_identifier = if let Some(ref pod_id) = params.pod_id {
+        if params.isolation_type.is_none() || params.tenant_id.is_none() || params.space_id.is_none() {
+            error!("[POD_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+        // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
+        if let (Some(it), Some(tid), Some(sid)) = (
+            params.isolation_type.as_deref(),
+            params.tenant_id.as_deref(),
+            params.space_id.as_deref(),
+        ) {
+            info!(
+                "🔒 [POD_STATUS] Using pod_id for container lookup: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
+                pod_id, it, tid, sid
+            );
+        }
+        Some(pod_id.clone())
+    } else {
+        None
+    };
+
     info!(
-        "🔍 [POD_STATUS] Querying container status: project_id={:?}, user_id={:?}",
-        params.project_id, params.user_id
+        "🔍 [POD_STATUS] Querying container status: project_id={:?}, user_id={:?}, pod_id={:?}, container_identifier={:?}",
+        params.project_id, params.user_id, params.pod_id, container_identifier
     );
 
     let timestamp = chrono::Utc::now().timestamp_millis() as u64;
@@ -1631,7 +1784,13 @@ pub async fn pod_status(
         })?;
 
     // 3. 查询容器状态
-    let query_result = if let Some(ref user_id) = params.user_id {
+    // 优先级：pod_id > user_id > project_id
+    let query_result = if let Some(ref identifier) = container_identifier {
+        // 使用 pod_id 查找（多租户场景）
+        runtime
+            .find_container(identifier, &shared_types::ServiceType::ComputerAgentRunner)
+            .await
+    } else if let Some(ref user_id) = params.user_id {
         runtime
             .find_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
             .await
@@ -1764,6 +1923,31 @@ pub struct VncStatusQuery {
     #[param(example = "proj_456")]
     #[schema(example = "proj_456")]
     pub project_id: Option<String>,
+
+    // === 新增字段 (多租户隔离支持) ===
+    /// 容器唯一标识，若传值则使用此 ID 标识容器
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(example = "pod_tenant_123")]
+    #[schema(example = "pod_tenant_123")]
+    pub pod_id: Option<String>,
+
+    /// 租户 ID，用于多租户场景下的数据隔离
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(example = "tenant_abc")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID，用于区分租户下的不同空间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(example = "space_xyz")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型，控制容器共享粒度和数据目录结构
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(example = "tenant")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
 }
 
 /// VNC 状态响应
@@ -1816,15 +2000,27 @@ pub async fn pod_vnc_status(
 ) -> Result<HttpResult<VncStatusResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
-    // 1. 参数验证：user_id 和 project_id 不能同时为空
+    // 1. 参数验证：pod_id、user_id 和 project_id 不能同时为空
     let user_id = params.user_id.as_deref().filter(|s| !s.trim().is_empty());
     let project_id = params
         .project_id
         .as_deref()
         .filter(|s| !s.trim().is_empty());
+    let pod_id = params.pod_id.as_deref().filter(|s| !s.trim().is_empty());
 
-    if user_id.is_none() && project_id.is_none() {
-        warn!("[POD_VNC_STATUS] user_id and project_id are both empty");
+    // 1.1 验证隔离参数完整性（当 pod_id 有值时）
+    if pod_id.is_some() {
+        if params.isolation_type.is_none() || params.tenant_id.is_none() || params.space_id.is_none() {
+            error!("[POD_VNC_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+    }
+
+    if pod_id.is_none() && user_id.is_none() && project_id.is_none() {
+        warn!("[POD_VNC_STATUS] pod_id, user_id and project_id are all empty");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -1832,8 +2028,8 @@ pub async fn pod_vnc_status(
     }
 
     info!(
-        "🖥️ [POD_VNC_STATUS] Querying VNC status: user_id={:?}, project_id={:?}",
-        user_id, project_id
+        "🖥️ [POD_VNC_STATUS] Querying VNC status: user_id={:?}, project_id={:?}, pod_id={:?}",
+        user_id, project_id, pod_id
     );
 
     // 2. 获取 Runtime
@@ -1845,8 +2041,16 @@ pub async fn pod_vnc_status(
         })?;
 
     // 3. 定位容器
-    // 优先使用 user_id 查找
-    let (lookup_user_id, container_info) = if let Some(uid) = user_id {
+    // 优先级：pod_id > user_id > project_id
+    let (lookup_user_id, container_info) = if let Some(pid) = pod_id {
+        // 使用 pod_id 查找（多租户场景）
+        (
+            pid,
+            runtime
+                .find_container(pid, &shared_types::ServiceType::ComputerAgentRunner)
+                .await,
+        )
+    } else if let Some(uid) = user_id {
         (
             uid,
             runtime

@@ -12,4 +12,4 @@ pub use grpc_addr::{
 };
 pub use i18n_extractors::{I18nJson, I18nPath, I18nQuery};
 pub use locale::get_locale_from_headers;
-pub use paths::{COMPUTER_WORKSPACE_ROOT, project_dir, user_dir};
+pub use paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT, build_workspace_path, build_computer_workspace_path, project_dir, user_dir};

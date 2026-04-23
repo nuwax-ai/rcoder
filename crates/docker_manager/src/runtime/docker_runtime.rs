@@ -5,10 +5,10 @@
 
 use async_trait::async_trait;
 use container_runtime_api::{
-    ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
-    RuntimeContainerInfo,
+    ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
+    ContainerRuntimeStatus, RuntimeContainerInfo,
 };
-use shared_types::{ContainerBasicInfo, ServiceResourceLimits, ServiceType};
+use shared_types::{ContainerBasicInfo, ServiceType};
 use std::sync::Arc;
 
 use crate::DockerManager;
@@ -29,20 +29,10 @@ impl DockerRuntime {
 impl ContainerRuntime for DockerRuntime {
     async fn create_container(
         &self,
-        project_id: Option<&str>,
-        user_id: Option<&str>,
-        host_workspace_path: &str,
-        service_type: ServiceType,
-        resource_limits: Option<ServiceResourceLimits>,
+        params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         self.inner
-            .start_agent_container(
-                project_id,
-                user_id,
-                host_workspace_path,
-                service_type,
-                resource_limits,
-            )
+            .start_agent_container(params)
             .await
             .map_err(|e| ContainerRuntimeError::ContainerCreationError(e.to_string()))
     }

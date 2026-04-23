@@ -59,6 +59,32 @@ pub struct ComputerChatRequest {
     /// Agent 运行时配置
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_config: Option<ChatAgentConfig>,
+
+    // === 新增字段 (v2 - 隔离类型支持) ===
+    /// 容器唯一标识，若传值则使用此 ID 标识容器，实现容器复用
+    /// 若不传则使用 user_id 作为容器标识（保持原有逻辑）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_tenant_123")]
+    pub pod_id: Option<String>,
+
+    /// 租户 ID，用于多租户场景下的数据隔离
+    /// 当 pod_id 有值时，此字段必须非空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID，用于区分租户下的不同空间
+    /// 当 pod_id 有值时，此字段必须非空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型，控制容器共享粒度和数据目录结构
+    /// 可选值：tenant（租户隔离）、space（空间隔离）、project（项目隔离，默认）
+    /// 当 pod_id 有值时，此字段必须非空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
 }
 
 /// Computer Agent 状态查询请求

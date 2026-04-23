@@ -105,6 +105,10 @@ pub use service_type::{
     ServiceType, ServiceTypeError, get_enabled_service_types, get_supported_service_types,
 };
 
+// 隔离类型模块
+pub mod isolation_type;
+pub use isolation_type::{IsolationType, IsolationTypeError};
+
 // 导出ChatPrompt的Builder
 pub use model::chat_prompt::ChatPromptBuilder;
 

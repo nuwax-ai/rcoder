@@ -214,10 +214,15 @@ impl DockerManager {
     ) -> DockerResult<DockerContainerInfo> {
         info!("startingcreatedcontainer, projectID: {}", config.project_id);
 
-        // 生成容器名称：使用工具函数统一维护
+        // 生成容器名称：优先使用 pod_id（用于容器复用），否则使用 project_id
+        // 当 pod_id 有值时，表示这是多租户场景下的容器复用请求
+        let container_identifier = config
+            .pod_id
+            .as_ref()
+            .unwrap_or(&config.project_id);
         let container_name = super::utils::DockerUtils::generate_container_name(
             &config.name_prefix,
-            &config.project_id,
+            container_identifier,
         );
 
         // 🔍 先检查 Docker API 中是否存在同名容器（无论运行状态）
@@ -1223,15 +1228,23 @@ impl DockerManager {
     /// 替代 rcoder 层的复杂编排逻辑
     pub async fn start_agent_container(
         &self,
-        project_id: Option<&str>, // 容器标识符（project_id），用于清理旧容器，可选
-        user_id: Option<&str>,    // Computer Agent Runner 中使用，其他情况为 None
-        host_workspace_path: &str,
-        service_type: shared_types::ServiceType,
-        request_resource_limits: Option<shared_types::ServiceResourceLimits>,
+        params: container_runtime_api::ContainerCreateParams,
     ) -> DockerResult<ContainerBasicInfo> {
+        let container_runtime_api::ContainerCreateParams {
+            project_id,
+            user_id,
+            host_workspace_path,
+            service_type,
+            resource_limits: request_resource_limits,
+            pod_id,
+            isolation_type,
+            tenant_id,
+            space_id,
+        } = params;
+
         info!(
-            "Starting Agent container: project_id={:?}, user_id={:?}, type={:?}, host_path={}",
-            project_id, user_id, service_type, host_workspace_path
+            "Starting Agent container: project_id={:?}, user_id={:?}, type={:?}, host_path={}, pod_id={:?}, isolation_type={:?}",
+            project_id, user_id, service_type, host_workspace_path, pod_id, isolation_type
         );
 
         // 1. 在宿主机上预创建工作目录
@@ -1241,7 +1254,7 @@ impl DockerManager {
         // 所以这里不需要额外创建目录
 
         // 2. 清理旧容器（如果提供了 project_id）
-        if let Some(id) = project_id
+        if let Some(ref id) = project_id
             && let Some(existing) = self.get_container_info(id).await
         {
             warn!(
@@ -1260,12 +1273,12 @@ impl DockerManager {
 
         // 确定用于构建容器配置的主 ID
         // 标准 RCoder 使用 project_id，Computer Agent Runner 使用 user_id
-        let container_id = if let Some(uid) = user_id {
+        let container_id: String = if let Some(ref uid) = user_id {
             // Computer Agent Runner 使用 user_id
-            uid
-        } else if let Some(pid) = project_id {
+            uid.clone()
+        } else if let Some(ref pid) = project_id {
             // 标准 RCoder 使用 project_id
-            pid
+            pid.clone()
         } else {
             // 错误：至少需要提供 project_id 或 user_id 其中一个
             return Err(DockerError::ConfigurationError(
@@ -1276,22 +1289,36 @@ impl DockerManager {
         // 解析容器内工作目录路径
         let mut variables = std::collections::HashMap::new();
         // 根据服务类型设置相应的变量
-        if let Some(pid) = project_id {
-            variables.insert("project_id".to_string(), pid.to_string());
+        if let Some(ref pid) = project_id {
+            variables.insert("project_id".to_string(), pid.clone());
         }
-        if let Some(uid) = user_id {
-            variables.insert("user_id".to_string(), uid.to_string());
+        if let Some(ref uid) = user_id {
+            variables.insert("user_id".to_string(), uid.clone());
         }
         variables.insert("service_type".to_string(), service_type.to_string());
         let container_work_path = service_config.resolve_container_path(&variables);
 
         // 构建基础配置
-        let mut builder = ContainerConfigBuilder::new(container_id)
+        let mut builder = ContainerConfigBuilder::new(container_id.clone())
             .image(image)
             .name_prefix(service_config.container_prefix())
             .work_dir(service_config.work_dir.clone())
             .network_mode(service_config.network_mode.clone())
             .auto_remove(true);
+
+        // 添加隔离类型相关配置
+        if let Some(pid) = pod_id {
+            builder = builder.pod_id(pid);
+        }
+        if let Some(it) = isolation_type {
+            builder = builder.isolation_type(it);
+        }
+        if let Some(tid) = tenant_id {
+            builder = builder.tenant_id(tid);
+        }
+        if let Some(sid) = space_id {
+            builder = builder.space_id(sid);
+        }
 
         // 只在 host_workspace_path 非空时添加主挂载点
         // 如果为空，表示完全依赖 mounts 配置（例如 ComputerAgentRunner）
@@ -1337,23 +1364,24 @@ impl DockerManager {
         });
 
         // 添加环境变量
-        // 根据服务类型设置相应的环境变量
-        if let Some(pid) = project_id {
-            builder = builder.env("PROJECT_ID", pid);
-        }
-        if let Some(uid) = user_id {
-            builder = builder.env("USER_ID", uid);
-        }
-        // 处理其他环境变量中的模板
+        // 处理其他环境变量中的模板（先处理，因为后续需要使用 project_id/user_id 的值）
         for (key, value) in &service_config.environment {
             let mut processed_value = value.clone();
-            if let Some(pid) = project_id {
+            if let Some(ref pid) = project_id {
                 processed_value = processed_value.replace("{project_id}", pid);
             }
-            if let Some(uid) = user_id {
+            if let Some(ref uid) = user_id {
                 processed_value = processed_value.replace("{user_id}", uid);
             }
             builder = builder.env(key, &processed_value);
+        }
+
+        // 根据服务类型设置相应的环境变量（最后设置，覆盖模板处理的值）
+        if let Some(ref pid) = project_id {
+            builder = builder.env("PROJECT_ID", pid);
+        }
+        if let Some(ref uid) = user_id {
+            builder = builder.env("USER_ID", uid);
         }
 
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
@@ -1545,7 +1573,7 @@ impl DockerManager {
         self.create_container(config).await?;
 
         // 🆕 更新容器映射中的 user_id 和 service_type
-        if let Some(mut info) = self.containers.get(container_id).await {
+        if let Some(mut info) = self.containers.get(&container_id).await {
             info.user_id = user_id.map(|s| s.to_string());
             info.service_type = Some(service_type.clone());
             debug!(
@@ -1556,7 +1584,7 @@ impl DockerManager {
         }
 
         // 5. 等待就绪并返回信息
-        let info = self.get_agent_info(container_id).await?.ok_or_else(|| {
+        let info = self.get_agent_info(&container_id).await?.ok_or_else(|| {
             DockerError::ContainerStartError("unable to get info after container started".to_string())
         })?;
 
