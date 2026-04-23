@@ -22,7 +22,7 @@ echo "==========================================${NC}"
 # 步骤 1: 检查 K8s 集群
 # ============================================================
 echo ""
-echo -e "${GREEN}[1/5] 检查 K8s 集群...${NC}"
+echo -e "${GREEN}[1/6] 检查 K8s 集群...${NC}"
 
 if ! command -v kubectl &> /dev/null; then
     echo -e "${RED}Error: kubectl not found${NC}"
@@ -54,10 +54,90 @@ echo -e "${GREEN}✅ K8s 集群连接正常${NC}"
 kubectl get nodes
 
 # ============================================================
+# 步骤 1.5: 检查/安装 open-iscsi (Longhorn 依赖)
+# ============================================================
+echo ""
+echo -e "${GREEN}[1.5/6] 检查 open-iscsi 依赖...${NC}"
+
+install_open_iscsi() {
+    echo -e "${YELLOW}正在检测操作系统...${NC}"
+
+    # 检测操作系统类型
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID="$ID"
+        OS_VERSION="$VERSION_ID"
+    else
+        OS_ID="unknown"
+    fi
+
+    echo -e "${YELLOW}检测到操作系统: $OS_ID${NC}"
+
+    case "$OS_ID" in
+        ubuntu|debian)
+            echo -e "${YELLOW}安装 open-iscsi...${NC}"
+            apt-get update -qq
+            apt-get install -y -qq open-iscsi > /dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux)
+            echo -e "${YELLOW}安装 iscsi-initiator-utils...${NC}"
+            yum install -y -q iscsi-initiator-utils > /dev/null 2>&1
+            ;;
+        sles|opensuse-leap|opensuse-tumbleweed)
+            echo -e "${YELLOW}安装 open-iscsi...${NC}"
+            zypper install -y -q open-iscsi > /dev/null 2>&1
+            ;;
+        *)
+            echo -e "${RED}不支持的操作系统: $OS_ID${NC}"
+            echo -e "${YELLOW}请手动安装 open-iscsi 或 iscsi-initiator-utils${NC}"
+            return 1
+            ;;
+    esac
+
+    echo -e "${YELLOW}启动 iscsid 服务...${NC}"
+    systemctl enable --now iscsid 2>/dev/null || true
+    systemctl enable --now iscsid.socket 2>/dev/null || true
+
+    return 0
+}
+
+# 检查 iscsiadm 是否存在
+if command -v iscsiadm &> /dev/null; then
+    echo -e "${GREEN}✅ open-iscsi 已安装: $(iscsiadm --version 2>&1 | head -1)${NC}"
+else
+    echo -e "${YELLOW}⚠️  open-iscsi 未安装${NC}"
+    echo -e "${YELLOW}Longhorn 需要 open-iscsi 来提供 iSCSI 存储${NC}"
+
+    # 尝试自动安装
+    if [ "$EUID" -eq 0 ]; then
+        install_open_iscsi
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ open-iscsi 安装成功${NC}"
+        fi
+    else
+        echo -e "${YELLOW}请使用 sudo 运行此脚本，或手动安装:${NC}"
+        echo -e "  ${CYAN}Ubuntu/Debian: sudo apt install open-iscsi${NC}"
+        echo -e "  ${CYAN}CentOS/RHEL:   sudo yum install iscsi-initiator-utils${NC}"
+        echo -e "  ${CYAN}SUSE:          sudo zypper install open-iscsi${NC}"
+        echo ""
+        echo -e "${YELLOW}安装完成后，重新运行此脚本${NC}"
+        exit 1
+    fi
+fi
+
+# 验证 iscsiadm 可用
+if ! command -v iscsiadm &> /dev/null; then
+    echo -e "${RED}❌ open-iscsi 安装失败${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✅ open-iscsi 检查完成${NC}"
+
+# ============================================================
 # 步骤 2: 部署 Longhorn 存储
 # ============================================================
 echo ""
-echo -e "${GREEN}[2/5] 检查/部署 Longhorn 存储...${NC}"
+echo -e "${GREEN}[2/6] 检查/部署 Longhorn 存储...${NC}"
 
 if kubectl get sc longhorn &> /dev/null; then
     echo -e "${GREEN}✅ Longhorn 已安装${NC}"
@@ -83,7 +163,7 @@ kubectl get sc | grep longhorn || echo -e "${YELLOW}Warning: Longhorn StorageCla
 # 步骤 3: 部署 JuiceFS CSI
 # ============================================================
 echo ""
-echo -e "${GREEN}[3/5] 检查/部署 JuiceFS CSI Driver...${NC}"
+echo -e "${GREEN}[3/6] 检查/部署 JuiceFS CSI Driver...${NC}"
 
 if kubectl get ds juicefs-csi-driver-node -n kube-system &> /dev/null; then
     echo -e "${GREEN}✅ JuiceFS CSI Driver 已安装${NC}"
@@ -112,7 +192,7 @@ fi
 # 步骤 4: 部署 RCoder (Helm)
 # ============================================================
 echo ""
-echo -e "${GREEN}[4/5] 部署 RCoder...${NC}"
+echo -e "${GREEN}[4/6] 部署 RCoder...${NC}"
 
 HELM_SCRIPT="${HELM_DIR}/scripts/helm-deploy.sh"
 if [ -f "$HELM_SCRIPT" ]; then
@@ -139,7 +219,7 @@ echo -e "${GREEN}✅ RCoder 部署完成${NC}"
 # 步骤 5: 验证部署
 # ============================================================
 echo ""
-echo -e "${GREEN}[5/5] 验证部署状态...${NC}"
+echo -e "${GREEN}[5/6] 验证部署状态...${NC}"
 
 echo ""
 echo "--- Pods ---"
