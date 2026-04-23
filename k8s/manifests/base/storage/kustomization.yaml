@@ -1,4 +1,5 @@
 # Storage layer - 存储层配置
+# 注意: juicefs-secret 由各环境 overlay 提供 (dev/prod)
 
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -7,6 +8,6 @@ resources:
   - postgresql-deployment.yaml
   - minio-deployment.yaml
   - minio-init-job.yaml
-  - juicefs-secret.yaml
+  - juicefs-init-job.yaml
   - juicefs-storageclass.yaml
   - juicefs-pvc.yaml

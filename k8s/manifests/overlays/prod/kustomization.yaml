@@ -6,6 +6,9 @@ kind: Kustomization
 
 namespace: nuwax-rcoder-prod
 
+resources:
+  - juicefs-secret.yaml  # 覆盖 base 中的 juicefs-secret
+
 bases:
   - ../../base
 
@@ -24,3 +27,80 @@ images:
 # 生产环境资源配置 (如有需要可添加)
 # commonLabels:
 #   environment: production
+
+# 生产环境配置覆盖
+patches:
+  # 替换 juicefs-init-job 中的 namespace 域名
+  - patch: |-
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: juicefs-init
+      spec:
+        template:
+          spec:
+            containers:
+            - name: juicefs-format
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  METAURL="postgres://juicefs:juicefs_password@postgresql.nuwax-rcoder-prod:5432/juicefs"
+                  VOLUME_NAME="rcoder-juicefs"
+                  BUCKET="http://minio-service.nuwax-rcoder-prod:9000/juicefs"
+
+                  echo '=== Creating MinIO bucket ==='
+                  apt-get update -qq && apt-get install -y -qq curl > /dev/null 2>&1
+                  curl -s -X PUT -u minioadmin:minioadmin "${BUCKET}/" || true
+
+                  echo '=== Checking if volume exists ==='
+                  /usr/local/bin/juicefs status "$METAURL" 2>&1 && echo "Volume already exists" || {
+                    echo '=== Volume does not exist, formatting ==='
+                    /usr/local/bin/juicefs format \
+                      "$METAURL" \
+                      "$VOLUME_NAME" \
+                      --storage minio \
+                      --bucket "$BUCKET" \
+                      --access-key minioadmin \
+                      --secret-key minioadmin
+                    echo '=== Volume formatted successfully ==='
+                  }
+
+                  echo '=== Verifying volume status ==='
+                  /usr/local/bin/juicefs status "$METAURL"
+    target:
+      kind: Job
+      name: juicefs-init
+
+  # 替换 StorageClass 中的 secret-namespace
+  - patch: |-
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: juicefs-sc
+      parameters:
+        csi.storage.k8s.io/provisioner-secret-namespace: nuwax-rcoder-prod
+        csi.storage.k8s.io/controller-expand-secret-namespace: nuwax-rcoder-prod
+        csi.storage.k8s.io/node-publish-secret-namespace: nuwax-rcoder-prod
+    target:
+      kind: StorageClass
+      name: juicefs-sc
+
+  # 替换 rcoder deployment 中的 RCODER_K8S_NAMESPACE 环境变量
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rcoder
+      spec:
+        template:
+          spec:
+            containers:
+            - name: rcoder
+              env:
+              - name: RCODER_K8S_NAMESPACE
+                value: nuwax-rcoder-prod
+    target:
+      kind: Deployment
+      name: rcoder

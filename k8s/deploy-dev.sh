@@ -11,7 +11,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-NAMESPACE="${NAMESPACE:-nuwax-rcoder}"
+NAMESPACE="${NAMESPACE:-nuwax-rcoder-dev}"
 KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-./manifests/overlays/dev}"
 JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE:-juicedata/mount:ce-v1.3.1}"
 DNS_CHECK_IMAGE="${DNS_CHECK_IMAGE:-busybox:1.36}"

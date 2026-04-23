@@ -6,7 +6,7 @@
 
 set -e
 
-NAMESPACE="nuwax-rcoder"
+NAMESPACE="${NAMESPACE:-nuwax-rcoder}"
 MANIFESTS_DIR="./manifests"
 STORAGE_DIR="${MANIFESTS_DIR}/base/storage"
 
