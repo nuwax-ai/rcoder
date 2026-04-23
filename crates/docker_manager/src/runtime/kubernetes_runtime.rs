@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
-    RuntimeContainerInfo,
+    ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
+    ContainerRuntimeStatus, RuntimeContainerInfo,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
@@ -568,28 +568,36 @@ impl KubernetesRuntime {
 impl ContainerRuntime for KubernetesRuntime {
     async fn create_container(
         &self,
-        project_id: Option<&str>,
-        user_id: Option<&str>,
-        _host_workspace_path: &str,
-        service_type: ServiceType,
-        resource_limits: Option<ServiceResourceLimits>,
+        params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let ContainerCreateParams {
+            project_id,
+            user_id,
+            host_workspace_path: _,
+            service_type,
+            resource_limits,
+            pod_id: _,
+            isolation_type: _,
+            tenant_id: _,
+            space_id: _,
+        } = params;
+
         // 确定容器标识符：user_id 优先（ComputerAgentRunner），否则用 project_id
-        let identifier = user_id.or(project_id).ok_or_else(|| {
+        // 注意：需要先克隆值，因为后面还需要使用 unwrap_or_default()
+        let project_id_val = project_id.clone().unwrap_or_default();
+        let user_id_val = user_id.clone().unwrap_or_default();
+        let identifier = user_id.as_ref().or(project_id.as_ref()).ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError(
                 "Either project_id or user_id must be provided".to_string(),
             )
         })?;
 
-        // Pod 名称：当 user_id 存在时使用它（ComputerAgentRunner）来保证唯一性
-        let pod_name = match user_id {
-            Some(uid) => format!("{}-{}", service_type.container_prefix(), uid),
-            None => format!(
-                "{}-{}",
-                service_type.container_prefix(),
-                project_id.unwrap()
-            ),
-        };
+        // Pod 名称：使用 identifier（user_id 优先，否则 project_id）
+        let pod_name = format!(
+            "{}-{}",
+            service_type.container_prefix(),
+            identifier
+        );
 
         // Ensure workspace PVC exists first (NFS-backed, each project/user gets its own PVC)
         // The PVC is backed by NFS Subdir External Provisioner which automatically
@@ -620,10 +628,10 @@ impl ContainerRuntime for KubernetesRuntime {
             ("managed-by".to_string(), "rcoder-runtime".to_string()),
             ("service_type".to_string(), service_type_str.clone()),
         ];
-        if let Some(uid) = user_id {
-            label_pairs.push(("user_id".to_string(), uid.to_string()));
+        if let Some(ref uid) = user_id {
+            label_pairs.push(("user_id".to_string(), uid.clone()));
         } else {
-            label_pairs.push(("project_id".to_string(), project_id.unwrap().to_string()));
+            label_pairs.push(("project_id".to_string(), identifier.clone()));
         }
         let labels: BTreeMap<String, String> = label_pairs.into_iter().collect();
 
@@ -688,12 +696,12 @@ impl ContainerRuntime for KubernetesRuntime {
                     env: Some(vec![
                         EnvVar {
                             name: "PROJECT_ID".to_string(),
-                            value: Some(project_id.unwrap_or_default().to_string()),
+                            value: Some(project_id_val.to_string()),
                             ..Default::default()
                         },
                         EnvVar {
                             name: "USER_ID".to_string(),
-                            value: Some(user_id.unwrap_or_default().to_string()),
+                            value: Some(user_id_val.to_string()),
                             ..Default::default()
                         },
                         EnvVar {

@@ -1,7 +1,7 @@
 name: rcoder
 services:
   rcoder:
-    image: ${RCODER_IMAGE:-master-rcoder:latest}
+    image: ${RCODER_IMAGE:-nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest}
     ports:
       - "${RCODER_PORT:-8087}:${RCODER_PORT:-8087}"
       - "8088:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）

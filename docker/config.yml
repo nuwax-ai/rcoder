@@ -57,11 +57,11 @@ docker_config:
       rcoder:
         service_type: "RCoder"
         # 🎯 使用阿里云镜像
-        image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
-        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
-        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
-        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
-        image_tag_prefix: "rcoder"
+        image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest"
+        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest"
+        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest"
+        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest"
+        image_tag_prefix: "master-rcoder"
         enabled: true
 
         environment:

@@ -17,10 +17,9 @@ dev-up:
 		exit 1; \
 	fi
 	@echo "🔧 使用开发模式配置："
-	@echo "  - 镜像: master-rcoder:latest (容器内编译的 Linux 二进制)"
+	@echo "  - 镜像: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest"
 	@echo "  - 启动命令: 直接执行 /app/rcoder"
-	@RCODER_IMAGE=master-rcoder:latest \
-	docker-compose -f docker/docker-compose.yml up -d
+	@docker-compose -f docker/docker-compose.yml up -d
 	@echo "📋 开发模式服务状态:"
 	@docker-compose -f docker/docker-compose.yml ps
 
