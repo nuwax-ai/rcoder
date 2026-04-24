@@ -9,3 +9,16 @@ services:
       REGISTRY_STORAGE_DELETE_ENABLED: "true"
     volumes:
       - ./data:/var/lib/registry
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    container_name: registry2-ui
+    restart: unless-stopped
+    ports:
+      - "5080:80"
+    environment:
+      SINGLE_REGISTRY: "true"
+      REGISTRY_TITLE: "registry2"
+      REGISTRY_URL: "http://registry2:5000"
+    depends_on:
+      - registry2
