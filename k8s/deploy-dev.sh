@@ -214,14 +214,13 @@ else
 
     if ! command -v helm &> /dev/null; then
         echo -e "${YELLOW}Helm 未安装，跳过 JuiceFS CSI 部署${NC}"
-        echo "请手动安装: helm repo add juicefs https://juicefs.github.io/charts"
+        echo "请手动安装: helm repo add juicedata https://juicedata.github.io/charts"
     else
-        helm repo add juicefs https://juicefs.github.io/charts 2>/dev/null || true
+        helm repo add juicedata https://juicedata.github.io/charts 2>/dev/null || true
         helm repo update
-        helm install juicefs-csi-driver juicefs/juicefs-csi-driver \
+        helm install juicefs-csi-driver juicedata/juicefs-csi-driver \
             --namespace kube-system \
-            --set webhook.enabled=false \
-            --set defaultMountImage.ce="${JUICEFS_CE_MOUNT_IMAGE}"
+            --set webhook.enabled=false
 
         echo -e "${GREEN}⏳ 等待 JuiceFS CSI Driver 就绪...${NC}"
         kubectl wait --for=condition=ready pod -l app=juicefs-csi-driver-node \
