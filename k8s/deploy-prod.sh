@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================
-# RCoder K8s 一键部署脚本
+# RCoder K8s 生产环境部署脚本 (Kustomize)
+# 部署目标: namespace = nuwax-rcoder-prod, overlay = manifests/overlays/prod
 # 支持 K3s / 标准 K8s 集群
 # ============================================================
 
@@ -11,14 +12,49 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-NAMESPACE="${NAMESPACE:-nuwax-rcoder}"
-HELM_DIR="${HELM_DIR:-./helm/rcoder}"
+# 路径解析：支持从任意 cwd 调用脚本
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+NAMESPACE="${NAMESPACE:-nuwax-rcoder-prod}"
+KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${SCRIPT_DIR}/manifests/overlays/prod}"
 JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE:-juicedata/mount:ce-v1.3.1}"
 DNS_CHECK_IMAGE="${DNS_CHECK_IMAGE:-busybox:1.36}"
 
 echo -e "${GREEN}=========================================="
-echo "  RCoder K8s 一键部署"
+echo "  RCoder K8s 生产环境部署 (Kustomize)"
 echo "==========================================${NC}"
+echo -e "  namespace: ${NAMESPACE}"
+echo -e "  overlay:   ${KUSTOMIZE_DIR}"
+echo ""
+
+# ============================================================
+# 生产环境安全闸门: 拒绝使用占位符密码部署
+# 允许用 FORCE_PROD_DEPLOY=1 绕过（用于 CI 在外部注入 Secret 的场景）
+# ============================================================
+check_prod_credentials() {
+    local overlay_dir="$1"
+    local files=("${overlay_dir}/credentials.yaml" "${overlay_dir}/juicefs-secret.yaml")
+    local found=0
+    for f in "${files[@]}"; do
+        if [ -f "$f" ] && grep -q "CHANGE-ME-BEFORE-DEPLOY" "$f"; then
+            echo -e "${RED}❌ 检测到占位符密码未替换: $f${NC}" >&2
+            found=1
+        fi
+    done
+    if [ "$found" -eq 1 ]; then
+        echo "" >&2
+        echo -e "${YELLOW}生产环境禁止使用 CHANGE-ME-BEFORE-DEPLOY 占位符部署。${NC}" >&2
+        echo -e "${YELLOW}处理方式（二选一）:${NC}" >&2
+        echo -e "  1) 把上述文件里的占位符替换为真实强密码后再部署" >&2
+        echo -e "  2) 如果你用 SealedSecret / ExternalSecret 从外部注入密钥，" >&2
+        echo -e "     请设置 FORCE_PROD_DEPLOY=1 并确保上线后真正的 Secret 已就绪" >&2
+        exit 1
+    fi
+}
+
+if [ "${FORCE_PROD_DEPLOY:-0}" != "1" ]; then
+    check_prod_credentials "${KUSTOMIZE_DIR}"
+fi
 
 ensure_juicefs_ce_image() {
     echo -e "${YELLOW}配置 JuiceFS CSI 使用 CE Mount 镜像: ${JUICEFS_CE_MOUNT_IMAGE}${NC}"
@@ -73,13 +109,9 @@ fi
 if ! kubectl cluster-info &> /dev/null; then
     echo -e "${RED}Error: 无法连接到 K8s 集群${NC}"
     echo ""
-    echo -e "${YELLOW}请先部署 K3s 集群:${NC}"
+    echo -e "${YELLOW}请先部署 K3s 集群 (中国镜像):${NC}"
     echo ""
-    echo "  # 安装 K3s (单节点) - 中国镜像:"
     echo "  curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -"
-    echo ""
-    echo "  # 或者安装 K3s (多节点) - 中国镜像:"
-    echo "  curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh - --cluster-init"
     echo ""
     echo "  # 安装完成后, 配置 kubectl:"
     echo "  mkdir -p ~/.kube"
@@ -102,7 +134,6 @@ echo -e "${GREEN}[1.5/6] 检查 open-iscsi 依赖...${NC}"
 install_open_iscsi() {
     echo -e "${YELLOW}正在检测操作系统...${NC}"
 
-    # 检测操作系统类型
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS_ID="$ID"
@@ -141,14 +172,12 @@ install_open_iscsi() {
     return 0
 }
 
-# 检查 iscsiadm 是否存在
 if command -v iscsiadm &> /dev/null; then
     echo -e "${GREEN}✅ open-iscsi 已安装: $(iscsiadm --version 2>&1 | head -1)${NC}"
 else
     echo -e "${YELLOW}⚠️  open-iscsi 未安装${NC}"
     echo -e "${YELLOW}Longhorn 需要 open-iscsi 来提供 iSCSI 存储${NC}"
 
-    # 尝试自动安装
     if [ "$EUID" -eq 0 ]; then
         install_open_iscsi
         if [ $? -eq 0 ]; then
@@ -156,16 +185,15 @@ else
         fi
     else
         echo -e "${YELLOW}请使用 sudo 运行此脚本，或手动安装:${NC}"
-        echo -e "  ${CYAN}Ubuntu/Debian: sudo apt install open-iscsi${NC}"
-        echo -e "  ${CYAN}CentOS/RHEL:   sudo yum install iscsi-initiator-utils${NC}"
-        echo -e "  ${CYAN}SUSE:          sudo zypper install open-iscsi${NC}"
+        echo -e "  Ubuntu/Debian: sudo apt install open-iscsi"
+        echo -e "  CentOS/RHEL:   sudo yum install iscsi-initiator-utils"
+        echo -e "  SUSE:          sudo zypper install open-iscsi"
         echo ""
         echo -e "${YELLOW}安装完成后，重新运行此脚本${NC}"
         exit 1
     fi
 fi
 
-# 验证 iscsiadm 可用
 if ! command -v iscsiadm &> /dev/null; then
     echo -e "${RED}❌ open-iscsi 安装失败${NC}"
     exit 1
@@ -186,11 +214,8 @@ else
     kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/master/deploy/longhorn.yaml
     echo -e "${GREEN}⏳ 等待 Longhorn 就绪...${NC}"
 
-    # 等待 Longhorn Manager 就绪
     kubectl wait --for=condition=ready pod -l app=longhorn-manager \
         -n longhorn-system --timeout=300s 2>/dev/null || true
-
-    # 等待 Longhorn UI 就绪
     kubectl wait --for=condition=ready pod -l app=longhorn-ui \
         -n longhorn-system --timeout=300s 2>/dev/null || true
 
@@ -212,8 +237,9 @@ else
     echo -e "${YELLOW}JuiceFS CSI Driver 未安装，正在部署...${NC}"
 
     if ! command -v helm &> /dev/null; then
-        echo -e "${YELLOW}Helm 未安装，跳过 JuiceFS CSI 部署${NC}"
-        echo "请手动安装: helm repo add juicefs https://juicefs.github.io/charts"
+        echo -e "${RED}Error: Helm not found（安装 JuiceFS CSI Driver 需要 Helm）${NC}"
+        echo "请安装 Helm: https://helm.sh/docs/intro/install/"
+        exit 1
     else
         helm repo add juicefs https://juicefs.github.io/charts 2>/dev/null || true
         helm repo update
@@ -232,32 +258,45 @@ else
 fi
 
 # ============================================================
-# 步骤 4: 部署 RCoder (Helm)
+# 步骤 4: 使用 Kustomize 部署 RCoder (prod overlay)
 # ============================================================
 echo ""
-echo -e "${GREEN}[4/6] 部署 RCoder...${NC}"
+echo -e "${GREEN}[4/6] 部署 RCoder 到 namespace: $NAMESPACE${NC}"
 
-HELM_SCRIPT="${HELM_DIR}/scripts/helm-deploy.sh"
-if [ -f "$HELM_SCRIPT" ]; then
-    NAMESPACE="$NAMESPACE" VALUES_FILE="${HELM_DIR}/values.yaml" "$HELM_SCRIPT" install
-else
-    # 回退：直接使用 helm 命令
-    if ! command -v helm &> /dev/null; then
-        echo -e "${RED}Error: Helm not found${NC}"
-        echo "请安装 Helm: https://helm.sh/docs/intro/install/"
-        exit 1
-    fi
-    helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
-    helm repo update 2>/dev/null || true
-    helm upgrade --install rcoder "$HELM_DIR" \
-        --namespace "$NAMESPACE" \
-        --create-namespace \
-        --values "$HELM_DIR/values.yaml" \
-        --wait --timeout 5m
+if ! kubectl kustomize --help &> /dev/null; then
+    echo -e "${RED}Error: kubectl kustomize 插件未找到 (需要 kubectl 1.14+)${NC}"
+    exit 1
 fi
 
-echo -e "${GREEN}✅ RCoder 部署完成${NC}"
+# 分两阶段部署：等 PostgreSQL/MinIO 就绪再让 rcoder 起，避免 JuiceFS CSI mount 的 60s retry 噪音
+echo -e "${YELLOW}阶段 1/2: apply manifests...${NC}"
+kubectl apply -k "$KUSTOMIZE_DIR"
+
+echo -e "${YELLOW}等待 PostgreSQL 就绪 (JuiceFS CSI 依赖)...${NC}"
+kubectl wait --for=condition=ready pod -l app=postgresql -n "$NAMESPACE" --timeout=180s 2>&1 || {
+    echo -e "${RED}❌ PostgreSQL 未在 180s 内就绪${NC}"
+    kubectl get pods -n "$NAMESPACE"
+    exit 1
+}
+
+echo -e "${YELLOW}等待 MinIO 就绪...${NC}"
+kubectl wait --for=condition=ready pod -l app=minio -n "$NAMESPACE" --timeout=180s 2>&1 || {
+    echo -e "${RED}❌ MinIO 未在 180s 内就绪${NC}"
+    exit 1
+}
+
+RCODER_POD_READY=$(kubectl get pod -n "$NAMESPACE" -l app=rcoder -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -c True)
+if [ "${RCODER_POD_READY:-0}" -eq 0 ]; then
+    echo -e "${YELLOW}阶段 2/2: 重建 rcoder pod 以触发干净 mount...${NC}"
+    kubectl delete pod -n "$NAMESPACE" -l app=rcoder --ignore-not-found --wait=false
+fi
+
+echo -e "${YELLOW}等待 rcoder Deployment 就绪...${NC}"
+kubectl rollout status deploy/rcoder -n "$NAMESPACE" --timeout=180s
+
 check_cluster_dns
+
+echo -e "${GREEN}✅ RCoder 部署完成${NC}"
 
 # ============================================================
 # 步骤 5: 验证部署
@@ -281,7 +320,6 @@ echo ""
 echo "--- PVC ---"
 kubectl get pvc -n "$NAMESPACE"
 
-# 获取访问信息
 NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "localhost")
 SVC_TYPE=$(kubectl get svc rcoder -n "$NAMESPACE" -o jsonpath='{.spec.type}' 2>/dev/null)
 
@@ -305,10 +343,10 @@ else
 fi
 
 echo ""
-echo -e "Helm 管理命令:"
-echo -e "  ${YELLOW}helm list -n $NAMESPACE${NC}                              # 查看 release"
-echo -e "  ${YELLOW}cd $HELM_DIR && make install-prod${NC}                      # 升级 (生产环境)"
-echo -e "  ${YELLOW}cd $HELM_DIR/scripts && ./helm-deploy.sh uninstall${NC}    # 卸载"
+echo -e "Kustomize 管理命令:"
+echo -e "  ${YELLOW}kubectl apply -k $KUSTOMIZE_DIR${NC}      # 部署/更新"
+echo -e "  ${YELLOW}kubectl delete -k $KUSTOMIZE_DIR${NC}      # 删除"
+echo -e "  ${YELLOW}kubectl get all -n $NAMESPACE${NC}          # 查看状态"
 echo ""
 echo -e "Longhorn 控制台:"
 echo -e "  ${YELLOW}kubectl port-forward svc/longhorn-frontend 8080:80 -n longhorn-system${NC}"

@@ -353,4 +353,4 @@ crates/docker_manager/src/
 - [ServiceType 枚举定义](../../crates/shared_types/src/service_type.rs)
 - [容器路径模板配置](../../crates/shared_types/src/service_config.rs)
 - [Docker Compose 配置](../../docker/docker-compose.yml)
-- [Kubernetes Helm Values](../../k8s/helm/rcoder/values.yaml)
+- [Kubernetes Kustomize overlays](../../k8s/manifests/overlays/)

@@ -1,0 +1,17 @@
+# ============================================================
+# ClusterRoleBinding - Prod 环境专用
+# 把 base 里共享的 ClusterRole 绑定到 prod namespace 的 ServiceAccount
+# 集群级资源独立命名，避免与 dev 冲突
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rcoder-pods-crb-prod
+subjects:
+- kind: ServiceAccount
+  name: rcoder-pods-sa
+  namespace: nuwax-rcoder-prod
+roleRef:
+  kind: ClusterRole
+  name: rcoder-pods-clusterrole
+  apiGroup: rbac.authorization.k8s.io

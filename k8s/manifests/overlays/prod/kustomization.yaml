@@ -7,10 +7,21 @@ kind: Kustomization
 namespace: nuwax-rcoder-prod
 
 resources:
-  - juicefs-secret.yaml  # 覆盖 base 中的 juicefs-secret
-
-bases:
   - ../../base
+  # prod 独立的集群级资源（避免与 dev 冲突）
+  - juicefs-storageclass.yaml
+  - clusterrolebinding.yaml
+  # prod 独立的 namespace 内资源
+  - rcoder-configmap.yaml
+  - credentials.yaml
+  - juicefs-secret.yaml
+
+# 生产环境标签（含义同 dev 注释）
+labels:
+  - pairs:
+      environment: production
+    includeSelectors: false
+    includeTemplates: true
 
 # 生产环境副本数
 replicas:
@@ -20,74 +31,39 @@ replicas:
 # 生产环境镜像 tag
 images:
   - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder
-    newTag: stable
+    newTag: latest
   - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner
-    newTag: stable
+    newTag: latest
 
-# 生产环境资源配置 (如有需要可添加)
-# commonLabels:
-#   environment: production
-
-# 生产环境配置覆盖
 patches:
-  # 替换 juicefs-init-job 中的 namespace 域名
+  # NodePort: 30081（prod 专用，与 dev 30080 错开）
   - patch: |-
-      apiVersion: batch/v1
-      kind: Job
+      apiVersion: v1
+      kind: Service
       metadata:
-        name: juicefs-init
+        name: rcoder
       spec:
-        template:
-          spec:
-            containers:
-            - name: juicefs-format
-              command:
-                - sh
-                - -c
-                - |
-                  set -e
-                  METAURL="postgres://juicefs:juicefs_password@postgresql.nuwax-rcoder-prod:5432/juicefs"
-                  VOLUME_NAME="rcoder-juicefs"
-                  BUCKET="http://minio-service.nuwax-rcoder-prod:9000/juicefs"
-
-                  echo '=== Creating MinIO bucket ==='
-                  apt-get update -qq && apt-get install -y -qq curl > /dev/null 2>&1
-                  curl -s -X PUT -u minioadmin:minioadmin "${BUCKET}/" || true
-
-                  echo '=== Checking if volume exists ==='
-                  /usr/local/bin/juicefs status "$METAURL" 2>&1 && echo "Volume already exists" || {
-                    echo '=== Volume does not exist, formatting ==='
-                    /usr/local/bin/juicefs format \
-                      "$METAURL" \
-                      "$VOLUME_NAME" \
-                      --storage minio \
-                      --bucket "$BUCKET" \
-                      --access-key minioadmin \
-                      --secret-key minioadmin
-                    echo '=== Volume formatted successfully ==='
-                  }
-
-                  echo '=== Verifying volume status ==='
-                  /usr/local/bin/juicefs status "$METAURL"
+        ports:
+          - port: 8087
+            targetPort: 8087
+            nodePort: 30081
     target:
-      kind: Job
-      name: juicefs-init
+      kind: Service
+      name: rcoder
 
-  # 替换 StorageClass 中的 secret-namespace
+  # PVC 指向 prod 专属 StorageClass
   - patch: |-
-      apiVersion: storage.k8s.io/v1
-      kind: StorageClass
+      apiVersion: v1
+      kind: PersistentVolumeClaim
       metadata:
-        name: juicefs-sc
-      parameters:
-        csi.storage.k8s.io/provisioner-secret-namespace: nuwax-rcoder-prod
-        csi.storage.k8s.io/controller-expand-secret-namespace: nuwax-rcoder-prod
-        csi.storage.k8s.io/node-publish-secret-namespace: nuwax-rcoder-prod
+        name: rcoder-workspace
+      spec:
+        storageClassName: juicefs-sc-prod
     target:
-      kind: StorageClass
-      name: juicefs-sc
+      kind: PersistentVolumeClaim
+      name: rcoder-workspace
 
-  # 替换 rcoder deployment 中的 RCODER_K8S_NAMESPACE 环境变量
+  # rcoder deployment 指向 prod 环境的 namespace 和 StorageClass
   - patch: |-
       apiVersion: apps/v1
       kind: Deployment
@@ -101,6 +77,9 @@ patches:
               env:
               - name: RCODER_K8S_NAMESPACE
                 value: nuwax-rcoder-prod
+              - name: RCODER_K8S_STORAGE_CLASS
+                value: juicefs-sc-prod
     target:
       kind: Deployment
       name: rcoder
+

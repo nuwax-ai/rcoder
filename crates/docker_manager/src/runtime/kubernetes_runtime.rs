@@ -356,13 +356,23 @@ impl KubernetesRuntime {
                     // 检查 Pod phase，提前识别永久失败状态
                     if let Some(phase) = pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
                         match phase {
-                            "Failed" | "Succeeded" => {
-                                // 检测具体的失败原因
+                            "Failed" => {
+                                // Pod 实际失败：容器异常退出/OOM/镜像拉失败 等
                                 let reason = Self::detect_container_failure(&pod);
                                 return Err(ContainerRuntimeError::K8sError(format!(
-                                    "Pod {} entered terminal state: {}, reason: {:?}",
-                                    pod_name, phase, reason
+                                    "Pod {} entered terminal state: Failed, reason: {:?}",
+                                    pod_name, reason
                                 )));
+                            }
+                            "Succeeded" => {
+                                // 容器跑完正常退出（run-to-completion 场景，例如一次性任务型 Pod）。
+                                // 这不是失败：pod 已成功执行到结束。对调用方而言"ready" 的语义是
+                                // "容器至少跑起来过"，Succeeded 满足这个语义。
+                                info!(
+                                    "[K8S] Pod {} completed with phase=Succeeded (run-to-completion)",
+                                    pod_name
+                                );
+                                return Ok(());
                             }
                             "Running" => {
                                 // Pod 运行中，检查 Ready condition
@@ -692,7 +702,19 @@ impl ContainerRuntime for KubernetesRuntime {
                 containers: vec![K8sContainer {
                     name: "agent".to_string(),
                     image: Some(image),
-                    image_pull_policy: Some("Always".to_string()),
+                    // IfNotPresent: 动态 pod 频繁创建（每 chat/computer-chat 一个），
+                    // 节点已缓存就直接用，避免每次都去 registry 验 token/manifest。
+                    // image 更新由主 Deployment 触发拉取（用户做 rollout restart 时），
+                    // 主服务用新 image 启动后，动态 pod 跟着用同样的 image 引用。
+                    image_pull_policy: Some("IfNotPresent".to_string()),
+                    // 启动命令由 orchestration 层显式指定，避免依赖镜像默认行为：
+                    //   - RCoder 服务类型：运行 agent_runner binary（gRPC 50051 + HTTP 8086）。
+                    //     注意 rcoder-master 镜像本身没有 CMD/ENTRYPOINT，必须显式指定。
+                    //   - ComputerAgentRunner 服务类型：使用镜像自己的 ENTRYPOINT（start-up.sh）。
+                    command: match service_type {
+                        ServiceType::RCoder => Some(vec!["/app/bin/agent_runner".to_string()]),
+                        ServiceType::ComputerAgentRunner => None,
+                    },
                     env: Some(vec![
                         EnvVar {
                             name: "PROJECT_ID".to_string(),

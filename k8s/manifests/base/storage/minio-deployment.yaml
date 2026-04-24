@@ -43,9 +43,15 @@ spec:
           name: console
         env:
         - name: MINIO_ROOT_USER
-          value: "minioadmin"
+          valueFrom:
+            secretKeyRef:
+              name: rcoder-credentials
+              key: MINIO_ROOT_USER
         - name: MINIO_ROOT_PASSWORD
-          value: "minioadmin"  # 生产环境使用 Secret
+          valueFrom:
+            secretKeyRef:
+              name: rcoder-credentials
+              key: MINIO_ROOT_PASSWORD
         args:
           - server
           - /data

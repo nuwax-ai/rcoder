@@ -12,7 +12,8 @@ metadata:
 spec:
   # ReadWriteMany: 支持 K8s 多节点同时读写 (JuiceFS 特性)
   accessModes: ["ReadWriteMany"]
-  storageClassName: juicefs-sc
+  # storageClassName 由各环境 overlay 覆盖（dev: juicefs-sc-dev, prod: juicefs-sc-prod）
+  storageClassName: juicefs-sc-placeholder
   resources:
     requests:
       storage: 50Gi

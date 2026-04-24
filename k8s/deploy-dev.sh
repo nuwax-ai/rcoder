@@ -11,8 +11,11 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# 路径解析：支持从任意 cwd 调用脚本
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 NAMESPACE="${NAMESPACE:-nuwax-rcoder-dev}"
-KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-./manifests/overlays/dev}"
+KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${SCRIPT_DIR}/manifests/overlays/dev}"
 JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE:-juicedata/mount:ce-v1.3.1}"
 DNS_CHECK_IMAGE="${DNS_CHECK_IMAGE:-busybox:1.36}"
 
@@ -241,8 +244,33 @@ if ! kubectl kustomize --help &> /dev/null; then
     exit 1
 fi
 
-# 部署
+# 部署 (分两阶段避免 JuiceFS CSI mount 期间 postgresql 未就绪导致 60s retry 噪音)
+echo -e "${YELLOW}阶段 1/2: 先部署存储层 + RBAC + Secret...${NC}"
 kubectl apply -k "$KUSTOMIZE_DIR"
+
+echo -e "${YELLOW}等待 PostgreSQL 就绪 (JuiceFS CSI 依赖)...${NC}"
+kubectl wait --for=condition=ready pod -l app=postgresql -n "$NAMESPACE" --timeout=180s 2>&1 || {
+    echo -e "${RED}❌ PostgreSQL 未在 180s 内就绪${NC}"
+    kubectl get pods -n "$NAMESPACE"
+    exit 1
+}
+
+echo -e "${YELLOW}等待 MinIO 就绪...${NC}"
+kubectl wait --for=condition=ready pod -l app=minio -n "$NAMESPACE" --timeout=180s 2>&1 || {
+    echo -e "${RED}❌ MinIO 未在 180s 内就绪${NC}"
+    exit 1
+}
+
+# 如果 rcoder pod 已经创建但还卡在 mount retry，删掉让它重建 (clean mount)
+RCODER_POD_READY=$(kubectl get pod -n "$NAMESPACE" -l app=rcoder -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -c True)
+if [ "${RCODER_POD_READY:-0}" -eq 0 ]; then
+    echo -e "${YELLOW}阶段 2/2: 重建 rcoder pod 以触发干净 mount...${NC}"
+    kubectl delete pod -n "$NAMESPACE" -l app=rcoder --ignore-not-found --wait=false
+fi
+
+echo -e "${YELLOW}等待 rcoder Deployment 就绪...${NC}"
+kubectl rollout status deploy/rcoder -n "$NAMESPACE" --timeout=180s
+
 check_cluster_dns
 
 echo -e "${GREEN}✅ RCoder 部署完成${NC}"

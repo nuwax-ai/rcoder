@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 为 K3s 配置中国大陆常用的 containerd 镜像加速（docker.io / ghcr.io）
 # 用法（在 K3s 节点上）:
-#   cd k8s && sudo ./install-k3s-registry-mirrors-cn.sh
+#   sudo k8s/scripts/install-k3s-registry-mirrors-cn.sh
 #
 # 可选：禁止回退到 Docker Hub / GHCR 官方地址（对已配置 mirrors 的仓库不再走官方 endpoint）
-#   sudo env INSTALL_DISABLE_REGISTRY_FALLBACK=1 ./install-k3s-registry-mirrors-cn.sh
+#   sudo env INSTALL_DISABLE_REGISTRY_FALLBACK=1 k8s/scripts/install-k3s-registry-mirrors-cn.sh
 #
 # 完成后会重启 k3s，短暂影响调度中的 Pod。
 

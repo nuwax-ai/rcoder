@@ -8,10 +8,12 @@ spec:
   selector:
     matchLabels:
       app: rcoder
+      component: rcoder-main
   template:
     metadata:
       labels:
         app: rcoder
+        component: rcoder-main
     spec:
       # Graceful shutdown: allow 60s for containers to clean up
       terminationGracePeriodSeconds: 60
@@ -19,7 +21,9 @@ spec:
       containers:
       - name: rcoder
         image: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest
-        imagePullPolicy: Always
+        # IfNotPresent: 节点已缓存就直接用，避免每次启动都去 registry 验 token/manifest
+        # 缺点: latest tag 内容更新后需 kubectl rollout restart 才会拉新 image
+        imagePullPolicy: IfNotPresent
         command: ["/app/bin/rcoder"]
         args: ["--port", "8087"]
         ports:
@@ -31,9 +35,9 @@ spec:
           value: "nuwax-rcoder"
         - name: RUST_LOG
           value: "info"
-        # JuiceFS 存储配置 (通过 juicefs-sc StorageClass)
+        # JuiceFS 存储配置 (StorageClass 名称由各环境 overlay 覆盖)
         - name: RCODER_K8S_STORAGE_CLASS
-          value: "juicefs-sc"
+          value: "juicefs-sc-placeholder"
         - name: RCODER_DOCKER_IMAGE
           value: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
         - name: RCODER_DOCKER_IMAGE_COMPUTER

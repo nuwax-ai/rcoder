@@ -56,11 +56,13 @@ spec:
     - protocol: TCP
       port: 9001
   # Agent Pod gRPC 访问 (rcoder -> agent 通信)
-  # 使用 service_type 标签匹配，因为 K8s runtime 动态创建的 pod 使用 app=rcoder 标签
+  # 用 managed-by: rcoder-runtime 标签同时匹配两类动态创建的 pod：
+  #   - service_type=rcoder (legacy /chat 创建的 rcoder-agent pod)
+  #   - service_type=computer-agent-runner (/computer/chat 创建的 computer-agent-runner pod)
   - to:
     - podSelector:
         matchLabels:
-          service_type: computer-agent-runner
+          managed-by: rcoder-runtime
     ports:
     - protocol: TCP
       port: 50051

@@ -7,14 +7,29 @@ kind: Kustomization
 namespace: nuwax-rcoder-dev
 
 resources:
-  - juicefs-secret.yaml  # 覆盖 base 中的 juicefs-secret
-
-bases:
   - ../../base
+  # dev 独立的集群级资源（避免与 prod 冲突）
+  - juicefs-storageclass.yaml
+  - clusterrolebinding.yaml
+  # dev 独立的 namespace 内资源
+  - rcoder-configmap.yaml
+  - credentials.yaml
+  - juicefs-secret.yaml
 
-# 开发环境配置覆盖
-commonLabels:
-  environment: dev
+# 开发环境标签
+# - includeSelectors 必须保持 false：否则 environment label 会被注入到
+#   NetworkPolicy 的 egress podSelector，误伤 K8s API Server 和动态创建的 Agent Runner Pod。
+# - includeTemplates: true 让 Pod 模板也带上 environment label，方便 kubectl 按环境筛选。
+labels:
+  - pairs:
+      environment: dev
+    includeSelectors: false
+    includeTemplates: true
+
+# 开发环境副本数
+replicas:
+  - name: rcoder
+    count: 1
 
 # 开发环境镜像 tag
 images:
@@ -23,78 +38,35 @@ images:
   - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner
     newTag: latest
 
-# 开发环境配置覆盖
 patches:
-  # 开发环境使用更小的资源
+  # NodePort: 30080（dev 专用）
   - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
+      apiVersion: v1
+      kind: Service
       metadata:
         name: rcoder
       spec:
-        replicas: 1
+        ports:
+          - port: 8087
+            targetPort: 8087
+            nodePort: 30080
     target:
-      kind: Deployment
+      kind: Service
       name: rcoder
 
-  # 替换 juicefs-init-job 中的 namespace 域名
+  # PVC 指向 dev 专属 StorageClass
   - patch: |-
-      apiVersion: batch/v1
-      kind: Job
+      apiVersion: v1
+      kind: PersistentVolumeClaim
       metadata:
-        name: juicefs-init
+        name: rcoder-workspace
       spec:
-        template:
-          spec:
-            containers:
-            - name: juicefs-format
-              command:
-                - sh
-                - -c
-                - |
-                  set -e
-                  METAURL="postgres://juicefs:juicefs_password@postgresql.nuwax-rcoder-dev:5432/juicefs"
-                  VOLUME_NAME="rcoder-juicefs"
-                  BUCKET="http://minio-service.nuwax-rcoder-dev:9000/juicefs"
-
-                  echo '=== Creating MinIO bucket ==='
-                  apt-get update -qq && apt-get install -y -qq curl > /dev/null 2>&1
-                  curl -s -X PUT -u minioadmin:minioadmin "${BUCKET}/" || true
-
-                  echo '=== Checking if volume exists ==='
-                  /usr/local/bin/juicefs status "$METAURL" 2>&1 && echo "Volume already exists" || {
-                    echo '=== Volume does not exist, formatting ==='
-                    /usr/local/bin/juicefs format \
-                      "$METAURL" \
-                      "$VOLUME_NAME" \
-                      --storage minio \
-                      --bucket "$BUCKET" \
-                      --access-key minioadmin \
-                      --secret-key minioadmin
-                    echo '=== Volume formatted successfully ==='
-                  }
-
-                  echo '=== Verifying volume status ==='
-                  /usr/local/bin/juicefs status "$METAURL"
+        storageClassName: juicefs-sc-dev
     target:
-      kind: Job
-      name: juicefs-init
+      kind: PersistentVolumeClaim
+      name: rcoder-workspace
 
-  # 替换 StorageClass 中的 secret-namespace
-  - patch: |-
-      apiVersion: storage.k8s.io/v1
-      kind: StorageClass
-      metadata:
-        name: juicefs-sc
-      parameters:
-        csi.storage.k8s.io/provisioner-secret-namespace: nuwax-rcoder-dev
-        csi.storage.k8s.io/controller-expand-secret-namespace: nuwax-rcoder-dev
-        csi.storage.k8s.io/node-publish-secret-namespace: nuwax-rcoder-dev
-    target:
-      kind: StorageClass
-      name: juicefs-sc
-
-  # 替换 rcoder deployment 中的 RCODER_K8S_NAMESPACE 环境变量
+  # rcoder deployment 指向 dev 环境的 namespace 和 StorageClass
   - patch: |-
       apiVersion: apps/v1
       kind: Deployment
@@ -108,6 +80,9 @@ patches:
               env:
               - name: RCODER_K8S_NAMESPACE
                 value: nuwax-rcoder-dev
+              - name: RCODER_K8S_STORAGE_CLASS
+                value: juicefs-sc-dev
     target:
       kind: Deployment
       name: rcoder
+

@@ -50,9 +50,15 @@ spec:
         - name: POSTGRES_DB
           value: "juicefs"
         - name: POSTGRES_USER
-          value: "juicefs"
+          valueFrom:
+            secretKeyRef:
+              name: rcoder-credentials
+              key: POSTGRES_USER
         - name: POSTGRES_PASSWORD
-          value: "juicefs_password"  # 生产环境使用 Secret
+          valueFrom:
+            secretKeyRef:
+              name: rcoder-credentials
+              key: POSTGRES_PASSWORD
         livenessProbe:
           exec:
             command:

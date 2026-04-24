@@ -1,5 +1,0 @@
-# Dev namespace
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: nuwax-rcoder-dev

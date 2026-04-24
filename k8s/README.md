@@ -1,188 +1,102 @@
 # RCoder K8s 部署配置
 
-本目录包含在 Kubernetes 环境中部署 RCoder 所需的完整配置，支持 **Kustomize** 和 **Helm** 两种部署方式。
+本目录包含在 Kubernetes 环境中部署 RCoder 所需的完整配置，使用 **Kustomize** 做 dev/prod 环境隔离。
 
 ## 目录结构
 
 ```
 k8s/
-├── manifests/                    # Kustomize 部署方式 (开发环境)
-│   ├── base/                    # 基础配置
-│   │   ├── storage/
-│   │   └── rcoder/
-│   └── overlays/               # 环境覆盖
-│       ├── dev/                # 开发环境 (nuwax-rcoder-dev)
-│       └── prod/               # 生产环境 (nuwax-rcoder-prod)
+├── manifests/                    # Kustomize manifests
+│   ├── base/                    # 基础配置（不可直接部署，需走 overlay）
+│   │   ├── storage/             # postgresql / minio / juicefs-init / juicefs-pvc
+│   │   └── rcoder/              # rcoder Deployment/Service/NetworkPolicy/PDB/SA+ClusterRole
+│   └── overlays/
+│       ├── dev/                 # 开发环境 (nuwax-rcoder-dev, NodePort 30080)
+│       └── prod/                # 生产环境 (nuwax-rcoder-prod, NodePort 30081)
 │
-├── helm/                        # Helm 部署方式 (生产环境)
-│   └── rcoder/
-│       ├── Chart.yaml
-│       ├── values.yaml         # 默认配置
-│       ├── values-dev.yaml     # 开发环境配置
-│       ├── values-prod.yaml    # 生产环境配置
-│       ├── templates/          # 资源模板
-│       ├── Makefile            # Helm Makefile
-│       └── scripts/            # Helm 部署脚本
-│           └── helm-deploy.sh  # Helm 部署脚本
+├── deploy-dev.sh                 # [核心] Kustomize 开发环境一键部署
+├── deploy-prod.sh                # [核心] Kustomize 生产环境一键部署（含占位符密码守卫）
+├── undeploy.sh                   # [核心] 清理部署（ENV=dev|prod）
 │
-├── _deprecated/nfs/             # 废弃的 NFS 配置
+├── scripts/                      # 辅助脚本
+│   ├── deploy-juicefs.sh         # 仅部署存储层 (ENV=dev|prod)
+│   ├── test-chat.sh              # 功能冒烟测试 (NAMESPACE 可覆盖)
+│   ├── install-k3s-registry-mirrors-cn.sh  # K3s 节点镜像加速配置
+│   └── k3s-registries-cn.yaml    # 镜像加速配置模板
 │
-├── deploy.sh                    # Helm 生产环境一键部署
-├── deploy-dev.sh               # Kustomize 开发环境一键部署
-├── deploy-juicefs.sh           # (已废弃) 存储层部署脚本
-├── test-chat.sh               # 测试脚本
-└── README.md                  # 本文档
+└── README.md
+```
+
+dev 和 prod 可以并存于同一个集群：
+- 集群级资源（StorageClass / ClusterRoleBinding）命名独立：`juicefs-sc-dev` / `juicefs-sc-prod`、`rcoder-pods-crb-dev` / `rcoder-pods-crb-prod`
+- NodePort 错开：dev=30080 / prod=30081
+- ClusterRole `rcoder-pods-clusterrole` 是唯一共享的集群级资源（两个 overlay 写入完全一致，幂等）
+
+---
+
+## 快速开始
+
+### 开发环境
+
+```bash
+# 首次完整部署（含 Longhorn、JuiceFS CSI、open-iscsi 检查）
+./k8s/deploy-dev.sh
+
+# 常用
+kubectl apply -k k8s/manifests/overlays/dev     # 部署/更新
+kubectl delete -k k8s/manifests/overlays/dev    # 删除
+kubectl get all -n nuwax-rcoder-dev             # 查看状态
+k8s/scripts/test-chat.sh                        # 冒烟测试
+```
+
+### 生产环境
+
+> **重要**：首次部署前必须替换 `k8s/manifests/overlays/prod/credentials.yaml` 和 `juicefs-secret.yaml` 里的 `CHANGE-ME-BEFORE-DEPLOY` 占位符；`deploy-prod.sh` 有守卫检查，发现占位符会拒绝部署。若使用 SealedSecret / ExternalSecret 在集群外注入，设置 `FORCE_PROD_DEPLOY=1` 跳过。
+
+```bash
+# 首次完整部署
+./k8s/deploy-prod.sh
+
+# 跳过占位符检查（仅当通过外部密钥注入方案时）
+FORCE_PROD_DEPLOY=1 ./k8s/deploy-prod.sh
+
+# 常用
+kubectl apply -k k8s/manifests/overlays/prod
+kubectl get all -n nuwax-rcoder-prod
+NAMESPACE=nuwax-rcoder-prod k8s/scripts/test-chat.sh
+```
+
+### 清理
+
+```bash
+ENV=dev  ./k8s/undeploy.sh      # 清理 dev
+ENV=prod ./k8s/undeploy.sh      # 清理 prod
 ```
 
 ---
 
-## 部署方式
+## Makefile 快捷命令
 
-### 开发环境 (Kustomize) - 快速迭代
-
-```bash
-# 一键部署 (包含 Longhorn + JuiceFS CSI + RCoder)
-./deploy-dev.sh
-
-# 常用命令
-kubectl apply -k manifests/overlays/dev    # 部署/更新
-kubectl delete -k manifests/overlays/dev  # 删除
-kubectl get all -n nuwax-rcoder-dev        # 查看状态
-```
-
----
-
-### 生产环境 (Helm) - 版本管理
+在项目根目录执行：
 
 ```bash
-# 一键部署 (包含 Longhorn + JuiceFS CSI + RCoder)
-./deploy.sh
+# 镜像
+make dev-build-k8s             # 构建并推送 K8s 镜像
 
-# 或直接使用 Helm 脚本
-cd helm/rcoder && ./scripts/helm-deploy.sh install
+# 部署/清理（默认走 overlay）
+make deploy-dev                # kubectl apply -k overlays/dev
+make deploy-prod               # kubectl apply -k overlays/prod
+make undeploy-dev              # 清理 dev
+make undeploy-prod             # 清理 prod
 
-# 常用命令
-helm list -n nuwax-rcoder                  # 查看 release
-helm/rcoder/scripts/helm-deploy.sh upgrade  # 升级
-helm rollback rcoder -n nuwax-rcoder       # 回滚
-helm/rcoder/scripts/helm-deploy.sh uninstall  # 卸载
-```
+# 开发闭环
+make dev-up-k8s                # 部署 dev
+make dev-restart-k8s           # 重新构建镜像 + 重部署 dev
+make dev-down-k8s              # 清理 dev
+make dev-logs-k8s              # 跟随 rcoder 日志
 
-#### Helm Makefile (在 helm/rcoder 目录下执行)
-
-```bash
-cd helm/rcoder
-
-make install          # 安装 (默认 values.yaml)
-make install-dev      # 安装 (开发环境)
-make install-prod     # 安装 (生产环境)
-make upgrade          # 升级
-make uninstall        # 卸载
-make status           # 查看 release 状态
-make template         # 渲染模板 (不部署)
-make package          # 打包 Chart
-```
-
----
-
-### Makefile 方式
-
-```bash
-# 开发环境
-make dev-build-k8s     # 构建镜像
-make dev-up-k8s        # 部署
-make dev-down-k8s      # 清理
-
-# 生产环境
-make helm-up-prod       # Helm 生产部署
-make helm-upgrade       # 升级
-make helm-down          # 卸载
-```
-
-```bash
-# 构建镜像
-make dev-build-k8s
-
-# 部署
-make dev-up-k8s
-
-# 重启
-make dev-restart-k8s
-
-# 清理
-make dev-down-k8s
-
-# 查看日志
-make dev-logs-k8s
-```
-
----
-
-## 环境配置
-
-### Helm values 文件
-
-| 文件 | 用途 |
-|------|------|
-| `values.yaml` | 默认配置 |
-| `values-dev.yaml` | 开发环境 (小资源) |
-| `values-prod.yaml` | 生产环境 (高可用) |
-
-### 自定义配置
-
-创建 `values-custom.yaml`：
-
-```yaml
-# 镜像配置
-image:
-  registry: your-registry.com
-  repository: rcoder
-  tag: v1.0.0
-
-# 命名空间
-namespace: my-rcoder
-
-# 副本数
-replicaCount: 3
-
-# 资源限制
-resources:
-  requests:
-    cpu: 1000m
-    memory: 2Gi
-  limits:
-    cpu: 4000m
-    memory: 8Gi
-
-# 使用外部 PostgreSQL
-postgresql:
-  enabled: false
-  external: true
-  host: "postgres.example.com"
-  port: 5432
-  auth:
-    database: juicefs
-    username: juicefs
-    password: "your-password"
-
-# 使用外部 S3
-minio:
-  enabled: false
-  external: true
-  endpoint: "https://s3.example.com"
-  accessKey: "your-access-key"
-  secretKey: "your-secret-key"
-```
-
-部署：
-
-```bash
-helm upgrade --install rcoder ./helm/rcoder \
-  --values ./helm/rcoder/values.yaml \
-  --values values-custom.yaml \
-  --namespace my-rcoder \
-  --create-namespace \
-  --wait
+# 本地验证（不部署）
+make kustomize-build           # 分别 build base / dev / prod
 ```
 
 ---
@@ -193,56 +107,41 @@ helm upgrade --install rcoder ./helm/rcoder \
 ┌─────────────────────────────────────────────────────────────┐
 │                     Kubernetes 集群                          │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │            JuiceFS CSI Driver                         │  │
-│  │         (StorageClass: juicefs-sc)                    │  │
+│  │            JuiceFS CSI Driver (kube-system)           │  │
 │  └──────────────────────────────────────────────────────┘  │
 │                            ↓                                │
-│  ┌────────────────┐    ┌────────────────┐                │
-│  │ rcoder 主服务   │    │ Agent Runner   │                │
-│  │ Pod (Deployment)│    │ Pod (动态创建)  │                │
-│  └────────┬───────┘    └────────┬───────┘                │
-│           │                      │                         │
-│           └──────────┬───────────┘                         │
-│                      ↓                                     │
-│              ┌──────────────┐                              │
-│              │ JuiceFS 卷   │  ← 共享文件系统 (RWX)        │
-│              └───────┬──────┘                              │
-└──────────────────────┼────────────────────────────────────┘
+│  ┌────────────────┐    ┌────────────────┐                   │
+│  │ rcoder 主服务   │    │ Agent Runner   │                   │
+│  │ (Deployment)   │    │ (动态创建 Pod) │                    │
+│  └────────┬───────┘    └────────┬───────┘                   │
+│           └──────────┬───────────┘                          │
+│                      ↓                                      │
+│              ┌──────────────┐                               │
+│              │ JuiceFS 卷   │  ← ReadWriteMany 共享         │
+│              └───────┬──────┘                               │
+└──────────────────────┼──────────────────────────────────────┘
                        ↓
 ┌───────────────────────────────────────────────────────────────┐
-│  MinIO (S3) ←──── 数据存储                                  │
-│  PostgreSQL ← 元数据存储                                     │
+│  MinIO (S3)    ← JuiceFS 数据存储（per-namespace）             │
+│  PostgreSQL    ← JuiceFS 元数据存储（per-namespace）           │
 └───────────────────────────────────────────────────────────────┘
 ```
+
+每个 namespace 独立拥有 PostgreSQL 和 MinIO 实例，metadata 和 object 存储互不干扰。
 
 ---
 
 ## 环境要求
 
-- Kubernetes 1.14+
-- kubectl 已配置
-- Helm 3.x (使用 Helm 时)
-- Longhorn 存储 (提供持久化存储，支持快照和备份)
-- JuiceFS CSI Driver (使用 JuiceFS 时)
+- Kubernetes 1.14+（本仓库在 K3s 1.34.x 上测试）
+- kubectl 已配置 kubeconfig
+- Helm（仅用于集群首次安装 JuiceFS CSI Driver）
+- Longhorn 存储（为 PostgreSQL/MinIO 提供 PV；`deploy-*.sh` 会自动安装）
+- `open-iscsi`（Longhorn 依赖；`deploy-*.sh` 会自动安装）
 
-### 部署 Longhorn 存储
-
+国内节点建议先配置 k3s 镜像加速：
 ```bash
-# 部署 Longhorn (单节点或多节点集群)
-kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/master/deploy/longhorn.yaml
-
-# 或使用 Helm
-helm repo add longhorn https://charts.longhorn.io
-helm install longhorn longhorn/longhorn -n longhorn-system --create-namespace
-```
-
-### 部署 JuiceFS CSI Driver
-
-```bash
-helm repo add juicefs https://juicefs.github.io/charts
-helm install juicefs-csi-driver juicefs/juicefs-csi-driver \
-  --namespace kube-system \
-  --set webhook.enabled=false
+sudo k8s/scripts/install-k3s-registry-mirrors-cn.sh
 ```
 
 ---
@@ -250,39 +149,27 @@ helm install juicefs-csi-driver juicefs/juicefs-csi-driver \
 ## 故障排查
 
 ```bash
-# 查看 Helm release 状态
-helm status rcoder -n nuwax-rcoder
+# Pod 状态
+kubectl get pods -n nuwax-rcoder-dev   # 或 -prod
 
-# 查看 Pod 状态
-kubectl get pods -n nuwax-rcoder
+# 事件
+kubectl get events -n nuwax-rcoder-dev --sort-by='.lastTimestamp'
 
-# 查看日志
-kubectl logs -n nuwax-rcoder -l app=rcoder --tail=100
+# RCoder 日志
+kubectl logs -n nuwax-rcoder-dev -l app=rcoder --tail=200 -f
 
-# 查看 PVC
-kubectl get pvc -n nuwax-rcoder
+# PVC 绑定情况
+kubectl get pvc -n nuwax-rcoder-dev
+kubectl describe pvc rcoder-workspace -n nuwax-rcoder-dev
 
-# 查看 Events
-kubectl get events -n nuwax-rcoder --sort-by='.lastTimestamp'
+# StorageClass
+kubectl get sc
 ```
 
 ---
 
-## 生产环境部署 (K3s)
+## 从 Helm 迁移（历史说明）
 
-```bash
-# 1. 安装 K3s (中国镜像)
-curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -
-
-# 2. 确保 K3s 集群已配置 kubectl
-kubectl get nodes
-
-# 2. 一键部署 (自动安装 Longhorn + JuiceFS CSI + RCoder)
-./deploy.sh
-
-# 3. 查看状态
-kubectl get pods -n nuwax-rcoder
-
-# 4. 测试
-./test-chat.sh
-```
+此前仓库曾提供 `k8s/helm/rcoder/` Helm chart 作为另一条部署路径，现已删除。所有 K8s 部署统一走 Kustomize：
+- 原 `deploy.sh`（Helm-based）→ 重写为 `deploy-prod.sh`（Kustomize-based）
+- `make helm-*` 目标已移除；改用 `make deploy-dev` / `make deploy-prod`
