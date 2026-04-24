@@ -12,13 +12,15 @@
 	update-image-tag \
 	test test-unit test-integration test-all test-blocking \
 	test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu \
-	pyroscope-up pyroscope-down pyroscope-logs
+	pyroscope-up pyroscope-down pyroscope-logs \
+	k8s-offline-bundle k8s-offline-import k8s-offline-images-list k8s-offline-clean
 
 # 包含子 Makefile
 include make/docker.mk
 include make/libreoffice.mk
 include make/dev.mk
 include make/k8s.mk
+include make/k8s-offline.mk
 include make/test.mk
 include make/pyroscope.mk
 
@@ -85,6 +87,13 @@ help:
 	@echo "  make dev-restart-k8s - 重启 K8s 开发模式（重新构建镜像+部署）"
 	@echo "  make dev-down-k8s  - 停止 K8s 开发模式（存储层 + 应用层 + RBAC + Namespace）"
 	@echo "  make dev-logs-k8s  - 查看 K8s 开发模式日志"
+	@echo ""
+	@echo "📦 离线部署 (政企内网用):"
+	@echo "  make k8s-offline-bundle        - 打包完整离线包 (images + helm + manifests)"
+	@echo "  make k8s-offline-import BUNDLE=<tgz> INSTALL_ARGS=\"--mode=direct --env=dev\""
+	@echo "                                 - 解压并一键部署 (在离线机器上跑)"
+	@echo "  make k8s-offline-images-list  - 打印所有离线依赖镜像清单"
+	@echo "  make k8s-offline-clean        - 清理构建产物"
 	@echo ""
 	@echo "📊 Pyroscope 持续剖析："
 	@echo "  make pyroscope-up   - 启动 Pyroscope Server"

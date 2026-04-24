@@ -1,0 +1,176 @@
+# ============================================================================
+# RCoder Helm values - 默认（共享）配置
+#
+# 使用方式：
+#   helm install rcoder-dev  k8s/helm/rcoder -f k8s/helm/rcoder/values-dev.yaml
+#   helm install rcoder-prod k8s/helm/rcoder -f k8s/helm/rcoder/values-prod.yaml
+#
+# 离线部署叠加 values-offline.yaml 覆盖 global.imageRegistry。
+# ============================================================================
+
+global:
+  # 所有镜像的仓库前缀。离线部署时覆盖为 harbor.internal/rcoder 等私有地址。
+  # 应用到: rcoder / rcoder-agent-runner / postgres / minio / mc / juicedata/mount
+  # 说明: 为空时使用每个镜像的原始 repo；非空时会被拼到 repo 前面形成 "{registry}/{repo}"。
+  imageRegistry: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev"
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets: []
+  # 第三方镜像的 registry 前缀。离线/私有场景用于把 postgres / minio/minio / minio/mc /
+  # juicedata/mount 这些上游镜像指向客户私有仓库。为空时使用原始 repo。
+  thirdPartyRegistry: ""
+
+# ----------------------------------------------------------------------------
+# 应用部署
+# ----------------------------------------------------------------------------
+environment: dev    # dev | prod —— 仅作为 label 和默认后缀
+
+rcoder:
+  image:
+    repository: rcoder
+    tag: ""                 # 空时继承 .Chart.appVersion
+  replicas: 1
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 500m
+    limits:
+      memory: 2Gi
+      cpu: 2000m
+  service:
+    type: NodePort
+    port: 8087
+    nodePort: 30080
+  terminationGracePeriodSeconds: 60
+  rustLog: info
+  livenessProbe:
+    httpGet: { path: /health, port: 8087 }
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet: { path: /health, port: 8087 }
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+  # NetworkPolicy 是否启用 (cluster 不支持 NetworkPolicy 时置 false)
+  networkPolicy:
+    enabled: true
+  # PodDisruptionBudget
+  pdb:
+    enabled: true
+    maxUnavailable: 0
+  # 是否创建共享的 ClusterRole (rcoder-pods-clusterrole)
+  # - true (默认): chart 拥有该 ClusterRole
+  # - false: 当集群里已有其他方式创建的同名 ClusterRole (如 Kustomize 并存) 时置 false
+  clusterRole:
+    create: true
+
+# 动态 agent pod 使用的镜像 (通过 env var 注入，不会直接创建 pod)
+agentRunner:
+  image:
+    repository: rcoder-agent-runner
+    tag: ""                 # 空时继承 .Chart.appVersion
+
+# ----------------------------------------------------------------------------
+# 存储层
+# ----------------------------------------------------------------------------
+postgresql:
+  image:
+    repository: postgres
+    tag: 16-alpine
+  storage:
+    size: 10Gi
+    # 默认 local-path（与 Kustomize base 保持一致, k3s 自带）。
+    # Longhorn / 离线集群可按需改为 longhorn / "" (空 => 集群默认)。
+    storageClass: local-path
+  service:
+    port: 5432
+
+minio:
+  image:
+    repository: minio/minio
+    tag: latest
+  initImage:
+    repository: minio/mc
+    tag: latest
+  storage:
+    size: 30Gi
+    storageClass: local-path
+  service:
+    apiPort: 9000
+    consolePort: 9001
+  bucket: juicefs           # 需与 juicefs.bucket 对应
+
+juicefs:
+  mountImage:
+    repository: juicedata/mount
+    tag: ce-v1.3.1
+  # StorageClass 是集群级资源; Helm release 之间必须独立命名避免冲突
+  storageClass:
+    create: true
+    # 留空则自动使用 "juicefs-sc-{release}"
+    name: ""
+    reclaimPolicy: Retain
+    mountOptions: "cache-size=1024,allow-other"
+  # juicefs-secret 里会使用到, 决定 mount 时的元数据连接 / 对象存储地址
+  meta:
+    appendFsync: "1"
+    cacheSize: "1024"
+  # bucket URL 指向 namespace 内的 minio-service (自动拼装, 无需修改)
+  bucket: juicefs
+
+# ----------------------------------------------------------------------------
+# 凭据 (Secret rcoder-credentials)
+# ----------------------------------------------------------------------------
+credentials:
+  postgresql:
+    user: juicefs
+    password: CHANGE-ME
+  minio:
+    rootUser: minioadmin
+    rootPassword: minioadmin
+
+# ----------------------------------------------------------------------------
+# 工作空间 PVC (ReadWriteMany via JuiceFS)
+# ----------------------------------------------------------------------------
+workspace:
+  size: 50Gi
+
+# ----------------------------------------------------------------------------
+# RCoder 应用配置 (渲染为 ConfigMap 里的 config.yml)
+# ----------------------------------------------------------------------------
+config:
+  defaultAgent: Claude
+  projectsDir: /app/project_workspace
+  port: 8087
+  cleanup:
+    enabled: true
+    idleTimeoutSeconds: 600
+    cleanupIntervalSeconds: 300
+    dockerStopTimeoutSeconds: 30
+  proxy:
+    listenPort: 8088
+    defaultBackendPort: 8087
+    backendHost: 127.0.0.1
+    portParam: port
+    healthCheck:
+      enabled: true
+      intervalSeconds: 5
+      timeoutSeconds: 1
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+  dockerConfig:
+    networkBaseName: agent-network
+    networkMode: bridge
+    workDir: /app
+    autoCleanup: true
+    containerTtlSeconds: 3600
+    cache:
+      enabled: true
+      ttlSeconds: 3600
+      maxEntries: 50
+  apiKeyAuth:
+    enabled: false
+    apiKey: YOUR_API_KEY_HERE

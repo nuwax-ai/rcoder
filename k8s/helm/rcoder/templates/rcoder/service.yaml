@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rcoder
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.rcoder.service.type }}
+  # component=rcoder-main 把动态创建的 rcoder-agent / computer-agent-runner pod
+  # (它们也带 app=rcoder 标签) 排除在外, 避免 NodePort 把流量路由到不监听 8087 的 agent pod
+  selector:
+    {{- include "rcoder.selectorLabels" . | nindent 4 }}
+  ports:
+    - port: {{ .Values.rcoder.service.port }}
+      targetPort: {{ .Values.rcoder.service.port }}
+      {{- if eq .Values.rcoder.service.type "NodePort" }}
+      nodePort: {{ .Values.rcoder.service.nodePort }}
+      {{- end }}

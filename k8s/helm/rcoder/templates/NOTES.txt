@@ -1,0 +1,39 @@
+RCoder {{ .Chart.AppVersion }} 已安装到 namespace "{{ .Release.Namespace }}" (release: {{ .Release.Name }}).
+
+环境: {{ .Values.environment }}
+副本数: {{ .Values.rcoder.replicas }}
+NodePort: {{ .Values.rcoder.service.nodePort }}
+StorageClass: {{ include "rcoder.storageClassName" . }}
+
+1. 查看部署状态：
+   kubectl get pods -n {{ .Release.Namespace }}
+   kubectl get svc  -n {{ .Release.Namespace }}
+   kubectl get pvc  -n {{ .Release.Namespace }}
+
+2. 等待就绪（首次部署 PostgreSQL + MinIO + JuiceFS mount 约需 2-5 分钟）：
+   kubectl rollout status deploy/rcoder -n {{ .Release.Namespace }} --timeout=300s
+
+3. 访问服务 (NodePort):
+{{- if eq .Values.rcoder.service.type "NodePort" }}
+   NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+   curl http://${NODE_IP}:{{ .Values.rcoder.service.nodePort }}/health
+{{- else }}
+   kubectl port-forward svc/rcoder {{ .Values.rcoder.service.port }}:{{ .Values.rcoder.service.port }} -n {{ .Release.Namespace }}
+   curl http://localhost:{{ .Values.rcoder.service.port }}/health
+{{- end }}
+
+4. 查看日志：
+   kubectl logs -n {{ .Release.Namespace }} -l app=rcoder -f
+
+{{- if eq .Values.environment "prod" }}
+
+⚠️  生产环境安全提醒：
+   - credentials.postgresql.password / credentials.minio.rootPassword 不应使用默认值
+   - 建议使用 --set 动态注入或 SealedSecret / ExternalSecret 方案
+   - 当前密码: {{ .Values.credentials.postgresql.password }} （如为 CHANGE-ME-BEFORE-DEPLOY 请立即替换）
+{{- end }}
+
+升级: helm upgrade {{ .Release.Name }} k8s/helm/rcoder -f <values>
+卸载: helm uninstall {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+      （注意：StorageClass 与 ClusterRoleBinding 是集群级资源，会随 release 删除；
+       PostgreSQL / MinIO 的 PVC 由 reclaimPolicy 决定是否保留数据）

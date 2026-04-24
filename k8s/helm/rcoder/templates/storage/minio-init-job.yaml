@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+  annotations:
+    # 每次 helm upgrade 强制重新运行 (确保 bucket 一定存在, 即使 Job 已清理)
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      {{- include "rcoder.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: mc
+          image: {{ include "rcoder.thirdPartyImage" (dict "repository" .Values.minio.initImage.repository "tag" .Values.minio.initImage.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for MinIO to be ready..."
+              until mc alias set myminio http://minio:{{ .Values.minio.service.apiPort }} ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do
+                echo "MinIO not ready, retrying..."
+                sleep 2
+              done
+
+              echo "MinIO is ready, creating bucket..."
+              mc mb myminio/{{ .Values.minio.bucket }} --ignore-existing
+              mc ls myminio/
+              echo "MinIO initialization completed!"
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rcoder-credentials
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rcoder-credentials
+                  key: MINIO_ROOT_PASSWORD

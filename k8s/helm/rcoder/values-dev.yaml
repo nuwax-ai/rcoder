@@ -1,0 +1,25 @@
+# ============================================================================
+# Dev 环境覆盖
+# 使用: helm install rcoder-dev k8s/helm/rcoder -f k8s/helm/rcoder/values-dev.yaml \
+#              --namespace nuwax-rcoder-dev --create-namespace
+# ============================================================================
+
+environment: dev
+
+rcoder:
+  replicas: 1
+  service:
+    nodePort: 30080
+
+juicefs:
+  storageClass:
+    name: juicefs-sc-dev
+
+# Dev 默认值 —— 方便本地联调，生产部署前必须改
+credentials:
+  postgresql:
+    user: juicefs
+    password: juicefs_password
+  minio:
+    rootUser: minioadmin
+    rootPassword: minioadmin

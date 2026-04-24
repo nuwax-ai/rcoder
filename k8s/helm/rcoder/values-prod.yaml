@@ -1,0 +1,30 @@
+# ============================================================================
+# Prod 环境覆盖
+#
+# ⚠️ 上线前必须替换 credentials.* 里的 CHANGE-ME-BEFORE-DEPLOY 占位符。
+#    推荐做法：不把真实密码写进这里，改用 --set 或 SealedSecret/ExternalSecret。
+#
+# 使用: helm install rcoder-prod k8s/helm/rcoder -f k8s/helm/rcoder/values-prod.yaml \
+#              --namespace nuwax-rcoder-prod --create-namespace \
+#              --set credentials.postgresql.password=<real> \
+#              --set credentials.minio.rootPassword=<real>
+# ============================================================================
+
+environment: prod
+
+rcoder:
+  replicas: 2
+  service:
+    nodePort: 30081
+
+juicefs:
+  storageClass:
+    name: juicefs-sc-prod
+
+credentials:
+  postgresql:
+    user: juicefs
+    password: CHANGE-ME-BEFORE-DEPLOY
+  minio:
+    rootUser: CHANGE-ME-BEFORE-DEPLOY
+    rootPassword: CHANGE-ME-BEFORE-DEPLOY

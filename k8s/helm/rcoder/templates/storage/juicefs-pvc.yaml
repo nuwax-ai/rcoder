@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rcoder-workspace
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: rcoder
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  # JuiceFS 原生支持 RWX, 多节点 rcoder pod 共享工作空间
+  accessModes: ["ReadWriteMany"]
+  storageClassName: {{ include "rcoder.storageClassName" . | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.workspace.size | quote }}

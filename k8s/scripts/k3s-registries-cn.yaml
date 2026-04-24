@@ -4,12 +4,60 @@
 #   sudo crictl --runtime-endpoint unix:///run/k3s/containerd/containerd.sock pull docker.io/rancher/mirrored-pause:3.6
 #
 # 文档: https://docs.k3s.io/installation/private-registry
+#
+# ============================================================================
+# 可选: 内网本地 registry 加速
+# ----------------------------------------------------------------------------
+# 如果你在局域网起了 registry:2 (见 k8s/register2/docker-compose.yml), 建议把它
+# 作为首选 mirror —— 命中时走内网 (~千兆), 未命中自动回退到公网 cn mirror。
+#
+# 使用 install-k3s-registry-mirrors-cn.sh 时, 设置 REGISTRY_HOST=<ip>:<port> 会
+# 自动生成包含本地 registry 的完整配置; 或者手动把下方注释掉的 `- "http://..."`
+# 行取消注释并改成你的 registry 地址。
+# ============================================================================
 
 mirrors:
   "docker.io":
     endpoint:
+      # - "http://192.168.32.228:5000"       # 本地私有 (按需 push 加速专用镜像)
+      # - "http://192.168.32.228:5002"       # 本地 pull-through 缓存
       - "https://docker.m.daocloud.io"
       - "https://docker.1ms.run"
+
+  "registry.k8s.io":
+    endpoint:
+      # - "http://192.168.32.228:5000"
+      - "https://registry.aliyuncs.com/google_containers"
+      - "https://k8s.m.daocloud.io"
+
   "ghcr.io":
     endpoint:
+      # - "http://192.168.32.228:5000"
       - "https://ghcr.m.daocloud.io"
+
+  "quay.io":
+    endpoint:
+      # - "http://192.168.32.228:5000"
+      - "https://quay.m.daocloud.io"
+
+  # RCoder 自有阿里云镜像 —— 本地 registry 命中时走内网
+  # "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com":
+  #   endpoint:
+  #     - "http://192.168.32.228:5000"
+  #     - "https://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com"
+
+  # 自指 mirror: 允许 "crictl pull 192.168.32.228:5000/foo" 直接走 plain HTTP
+  # "192.168.32.228:5000":
+  #   endpoint:
+  #     - "http://192.168.32.228:5000"
+  # "192.168.32.228:5002":
+  #   endpoint:
+  #     - "http://192.168.32.228:5002"
+
+# configs:
+#   "192.168.32.228:5000":
+#     tls:
+#       insecure_skip_verify: true
+#   "192.168.32.228:5002":
+#     tls:
+#       insecure_skip_verify: true

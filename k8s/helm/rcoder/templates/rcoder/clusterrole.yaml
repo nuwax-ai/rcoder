@@ -1,0 +1,29 @@
+{{- if .Values.rcoder.clusterRole.create }}
+# 集群级 ClusterRole —— 多 release 共享同一个 (规则与 namespace 无关, 重复 apply 幂等)
+# 与 Kustomize 并存时, 把 .Values.rcoder.clusterRole.create 置 false, 让 Kustomize 持有所有权
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "rcoder.clusterRoleName" . }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+  annotations:
+    # 避免多 release 互相 helm uninstall 时删除共享 ClusterRole
+    "helm.sh/resource-policy": keep
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+{{- end }}

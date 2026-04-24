@@ -1,0 +1,14 @@
+{{- if .Values.rcoder.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rcoder-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.rcoder.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      app: rcoder
+{{- end }}
