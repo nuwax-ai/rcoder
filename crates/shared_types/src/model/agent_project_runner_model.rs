@@ -293,6 +293,16 @@ impl ProjectAndContainerInfo {
         }
     }
 
+    /// 清除会话ID（将 session_id 设置为 None）
+    ///
+    /// 用于 Agent 停止后清理会话状态
+    pub fn clear_session_id(&mut self) {
+        self.state.update_core(|core| {
+            core.session_id = None;
+            core.last_activity = chrono::Utc::now();
+        });
+    }
+
     /// 设置用户ID（ComputerAgentRunner 模式专用）
     pub fn set_user_id(&mut self, user_id: Option<String>) {
         self.state.update_core(|core| {

@@ -3,13 +3,13 @@ services:
   rcoder:
     image: ${RCODER_IMAGE:-nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest}
     ports:
-      - "${RCODER_PORT:-8087}:${RCODER_PORT:-8087}"
+      - "${RCODER_PORT:-8090}:${RCODER_PORT:-8090}"
       - "8088:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）
       - "60001:60000"
       - "8199:80"
     environment:
       - TZ=Asia/Shanghai
-      - RCODER_PORT=${RCODER_PORT:-8087}
+      - RCODER_PORT=${RCODER_PORT:-8090}
       - RUST_LOG=debug # 设置调试日志级别
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}

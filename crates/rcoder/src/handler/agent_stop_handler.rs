@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
-use super::utils::{I18nQuery, get_locale_from_headers};
+use super::utils::{I18nJson, get_locale_from_headers};
 use crate::{AppError, HttpResult, router::AppState};
 
 /// 停止Agent请求参数
@@ -18,6 +18,22 @@ pub struct StopAgentQuery {
     /// 项目ID
     #[param(example = "test_project")]
     pub project_id: String,
+    /// Pod ID，用于共享容器模式下的容器定位（可选）
+    #[param(example = "pod_abc123")]
+    #[serde(default)]
+    pub pod_id: Option<String>,
+    /// 租户ID（可选）
+    #[param(example = "tenant_001")]
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// 空间ID（可选）
+    #[param(example = "space_001")]
+    #[serde(default)]
+    pub space_id: Option<String>,
+    /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[param(example = "project")]
+    #[serde(default)]
+    pub isolation_type: Option<String>,
 }
 
 /// 停止Agent响应
@@ -123,9 +139,7 @@ async fn destroy_container_for_project(
 #[utoipa::path(
     post,
     path = "/agent/stop",
-    params(
-        StopAgentQuery
-    ),
+    request_body = StopAgentQuery,
     responses(
         (
             status = 200,
@@ -198,10 +212,10 @@ async fn destroy_container_for_project(
 pub async fn agent_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nQuery(query): I18nQuery<StopAgentQuery>,
+    I18nJson(request): I18nJson<StopAgentQuery>,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
-    let project_id = query.project_id.trim();
+    let project_id = request.project_id.trim();
 
     if project_id.is_empty() {
         return Ok(HttpResult::error_with_locale(

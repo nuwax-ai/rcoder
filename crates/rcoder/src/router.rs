@@ -151,6 +151,20 @@ impl AppState {
         }
     }
 
+    /// 清除会话信息（将 session_id 设置为 NULL）
+    ///
+    /// 用于 Agent 停止后清理会话状态
+    #[inline]
+    pub fn clear_session(&self, project_id: &str) {
+        if let Err(e) = self.projects.clear_session(project_id) {
+            tracing::error!(
+                "Failed to clear session: project_id={}, error={}",
+                project_id,
+                e
+            );
+        }
+    }
+
     /// 更新项目活动时间，返回实际更新使用的时间戳
     #[inline]
     pub fn update_activity(&self, project_id: &str) -> Option<chrono::DateTime<chrono::Utc>> {

@@ -27,6 +27,22 @@ pub struct SessionNotificationParams {
     /// 会话ID，用于标识特定的会话连接
     #[param(example = "session456")]
     pub session_id: String,
+    /// Pod ID，用于共享容器模式下的容器定位（可选）
+    #[param(example = "pod_abc123")]
+    #[serde(default)]
+    pub pod_id: Option<String>,
+    /// 租户ID（可选）
+    #[param(example = "tenant_001")]
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// 空间ID（可选）
+    #[param(example = "space_001")]
+    #[serde(default)]
+    pub space_id: Option<String>,
+    /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[param(example = "project")]
+    #[serde(default)]
+    pub isolation_type: Option<String>,
 }
 
 /// SSE 进度事件（用于 OpenAPI 文档）

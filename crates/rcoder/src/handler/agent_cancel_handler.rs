@@ -11,12 +11,12 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;
-use shared_types::{AppError, HttpResult};
+use shared_types::{AppError, ComputerAgentCancelRequest, HttpResult};
 
-use super::utils::{I18nQuery, extract_grpc_addr, get_locale_from_headers};
+use super::utils::{I18nJson, extract_grpc_addr, get_locale_from_headers};
 
-/// 取消任务的查询参数
-#[derive(Debug, Deserialize, IntoParams)]
+/// 取消任务的请求参数
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct CancelQuery {
     /// 项目ID，用于标识特定的项目
     #[param(example = "test_project")]
@@ -25,15 +25,31 @@ pub struct CancelQuery {
     #[param(example = "session456")]
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Pod ID，用于共享容器模式下的容器定位（可选）
+    #[param(example = "pod_abc123")]
+    #[serde(default)]
+    pub pod_id: Option<String>,
+    /// 租户ID（可选）
+    #[param(example = "tenant_001")]
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// 空间ID（可选）
+    #[param(example = "space_001")]
+    #[serde(default)]
+    pub space_id: Option<String>,
+    /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[param(example = "project")]
+    #[serde(default)]
+    pub isolation_type: Option<String>,
 }
 
 /// Computer Agent 取消任务的查询参数
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ComputerCancelQuery {
-    /// 用户ID，用于标识特定的用户容器（ComputerAgentRunner模式）
+    /// 用户ID，用于标识特定的用户容器（ComputerAgentRunner模式，可与 pod_id 二选一）
     #[param(example = "user_123")]
     #[schema(example = "user_123")]
-    pub user_id: String,
+    pub user_id: Option<String>,
     /// 项目ID，必填，用于标识要取消的特定项目的 agent
     #[param(example = "project456")]
     #[schema(example = "project456")]
@@ -43,6 +59,22 @@ pub struct ComputerCancelQuery {
     #[serde(default)]
     #[schema(example = "session789")]
     pub session_id: Option<String>,
+    /// Pod ID，用于共享容器模式下的容器定位（可选）
+    #[param(example = "pod_abc123")]
+    #[serde(default)]
+    pub pod_id: Option<String>,
+    /// 租户ID（可选）
+    #[param(example = "tenant_001")]
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// 空间ID（可选）
+    #[param(example = "space_001")]
+    #[serde(default)]
+    pub space_id: Option<String>,
+    /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[param(example = "project")]
+    #[serde(default)]
+    pub isolation_type: Option<String>,
 }
 
 /// 取消操作的标识符
@@ -52,6 +84,8 @@ enum CancelIdentifier {
     Project(String),
     /// ComputerAgentRunner 模式：使用 user_id
     User(String),
+    /// 共享容器模式：使用 pod_id
+    Pod(String),
 }
 
 /// 取消任务的响应
@@ -73,6 +107,7 @@ async fn get_container_for_cancel_duckdb(
     let identifier_display = match identifier {
         CancelIdentifier::Project(pid) => format!("project_id={}", pid),
         CancelIdentifier::User(uid) => format!("user_id={}", uid),
+        CancelIdentifier::Pod(pod_id) => format!("pod_id={}", pod_id),
     };
 
     info!(
@@ -92,6 +127,11 @@ async fn get_container_for_cancel_duckdb(
             // ComputerAgentRunner 模式：通过 user_id 查询容器
             // 使用新添加的 get_container_by_user_id 方法
             state.projects.get_container_by_user_id(user_id)
+        }
+        CancelIdentifier::Pod(pod_id) => {
+            // 共享容器模式：通过 pod_id 查询容器
+            // 目前暂时使用 get_container_by_user_id 作为占位，后续需要实现 get_container_by_pod_id
+            state.projects.get_container_by_pod_id(pod_id)
         }
     };
 
@@ -315,6 +355,7 @@ async fn handle_session_cancel_internal_v2(
     let identifier_display = match &identifier {
         CancelIdentifier::Project(pid) => format!("project_id={}", pid),
         CancelIdentifier::User(uid) => format!("user_id={}", uid),
+        CancelIdentifier::Pod(pod_id) => format!("pod_id={}", pod_id),
     };
 
     info!(
@@ -371,9 +412,7 @@ async fn handle_session_cancel_internal_v2(
 #[utoipa::path(
     post,
     path = "/agent/session/cancel",
-    params(
-        CancelQuery
-    ),
+    request_body = CancelQuery,
     responses(
         (
             status = 200,
@@ -438,20 +477,20 @@ async fn handle_session_cancel_internal_v2(
     summary = "转发Agent任务取消请求（gRPC）",
     description = "将取消请求通过 gRPC 转发到容器内的 agent_runner 服务"
 )]
-#[instrument(skip(state), fields(project_id = %query.project_id))]
+#[instrument(skip(state), fields(project_id = %request.project_id))]
 pub async fn agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nQuery(query): I18nQuery<CancelQuery>,
+    I18nJson(request): I18nJson<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
     // 使用新的 v2 版本，保持向后兼容
-    let project_id = query.project_id.clone();
+    let project_id = request.project_id.clone();
     handle_session_cancel_internal_v2(
         &state,
         CancelIdentifier::Project(project_id.clone()),
         project_id,
-        query.session_id,
+        request.session_id,
         locale,
     )
     .await
@@ -463,9 +502,7 @@ pub async fn agent_session_cancel(
 #[utoipa::path(
     post,
     path = "/computer/agent/session/cancel",
-    params(
-        ComputerCancelQuery
-    ),
+    request_body = ComputerAgentCancelRequest,
     responses(
         (
             status = 200,
@@ -489,7 +526,7 @@ pub async fn agent_session_cancel(
                 "data": null,
                 "error": {
                     "code": "ERR_VALIDATION",
-                    "message": "user_id 或 project_id is required"
+                    "message": "user_id 或 pod_id is required"
                 }
             })
         ),
@@ -528,19 +565,21 @@ pub async fn agent_session_cancel(
     tag = "computer",
     operation_id = "computer_agent_session_cancel",
     summary = "转发 Computer Agent 任务取消请求（支持 user_id）",
-    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 定位用户容器"
+    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器"
 )]
-#[instrument(skip(state), fields(user_id = %query.user_id, project_id = %query.project_id))]
+#[instrument(skip(state), fields(user_id = ?request.user_id.as_ref().map(|s| s.as_str()), project_id = %request.project_id, pod_id = ?request.pod_id.as_ref().map(|s| s.as_str())))]
 pub async fn computer_agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nQuery(query): I18nQuery<ComputerCancelQuery>,
+    I18nJson(request): I18nJson<ComputerAgentCancelRequest>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
 
-    // 验证 user_id 不为空
-    if query.user_id.trim().is_empty() {
-        error!("[COMPUTER_CANCEL] user_id is required");
+    // 验证 user_id 或 pod_id 至少有一个
+    let has_user_id = request.user_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let has_pod_id = request.pod_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !has_user_id && !has_pod_id {
+        error!("[COMPUTER_CANCEL] user_id or pod_id is required");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -548,7 +587,7 @@ pub async fn computer_agent_session_cancel(
     }
 
     // 验证 project_id 不为空
-    if query.project_id.trim().is_empty() {
+    if request.project_id.trim().is_empty() {
         error!("[COMPUTER_CANCEL] project_id is required");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
@@ -557,15 +596,22 @@ pub async fn computer_agent_session_cancel(
     }
 
     info!(
-        "🚀 [COMPUTER_CANCEL] Starting to process cancel request: user_id={}, project_id={}, session_id={:?}",
-        query.user_id, query.project_id, query.session_id
+        "🚀 [COMPUTER_CANCEL] Starting to process cancel request: user_id={:?}, pod_id={:?}, project_id={}, session_id={:?}",
+        request.user_id, request.pod_id, request.project_id, request.session_id
     );
+
+    // 使用 user_id 或 pod_id 来构建 CancelIdentifier
+    let identifier = if has_user_id {
+        CancelIdentifier::User(request.user_id.clone().unwrap())
+    } else {
+        CancelIdentifier::Pod(request.pod_id.clone().unwrap())
+    };
 
     handle_session_cancel_internal_v2(
         &state,
-        CancelIdentifier::User(query.user_id),
-        query.project_id, // 必填的 project_id
-        query.session_id,
+        identifier,
+        request.project_id, // 必填的 project_id
+        request.session_id,
         locale,
     )
     .await
@@ -586,7 +632,7 @@ mod tests {
         });
 
         let query: ComputerCancelQuery = serde_json::from_value(query_json).unwrap();
-        assert_eq!(query.user_id, "user_123");
+        assert_eq!(query.user_id, Some("user_123".to_string()));
         assert_eq!(query.project_id, "project_456");
         assert_eq!(query.session_id, Some("session_789".to_string()));
     }
@@ -600,7 +646,7 @@ mod tests {
         });
 
         let query: ComputerCancelQuery = serde_json::from_value(query_json).unwrap();
-        assert_eq!(query.user_id, "user_123");
+        assert_eq!(query.user_id, Some("user_123".to_string()));
         assert_eq!(query.project_id, "project_456");
         assert_eq!(query.session_id, None);
     }
@@ -610,17 +656,24 @@ mod tests {
         // 测试 CancelIdentifier 的显示格式
         let project_id = CancelIdentifier::Project("test_project".to_string());
         let user_id = CancelIdentifier::User("test_user".to_string());
+        let pod_id = CancelIdentifier::Pod("test_pod".to_string());
 
-        let display = match project_id {
+        let display = match &project_id {
             CancelIdentifier::Project(pid) => format!("project_id={}", pid),
-            CancelIdentifier::User(_) => unreachable!(),
+            _ => unreachable!(),
         };
         assert_eq!(display, "project_id=test_project");
 
-        let display = match user_id {
+        let display = match &user_id {
             CancelIdentifier::User(uid) => format!("user_id={}", uid),
-            CancelIdentifier::Project(_) => unreachable!(),
+            _ => unreachable!(),
         };
         assert_eq!(display, "user_id=test_user");
+
+        let display = match &pod_id {
+            CancelIdentifier::Pod(pod_id) => format!("pod_id={}", pod_id),
+            _ => unreachable!(),
+        };
+        assert_eq!(display, "pod_id=test_pod");
     }
 }

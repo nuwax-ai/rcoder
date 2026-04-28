@@ -171,6 +171,18 @@ impl ProjectAdapter {
         Ok(())
     }
 
+    /// 清除会话信息（将 session_id 设置为 NULL）
+    ///
+    /// 用于 Agent 停止后清理会话状态
+    pub fn clear_session(&self, project_id: &str) -> Result<(), duckdb_manager::DuckDbError> {
+        self.storage.clear_session(project_id)?;
+        debug!(
+            "Clearing session: project_id={}",
+            project_id
+        );
+        Ok(())
+    }
+
     // ========== session_to_container_id 替代方法 ==========
 
     /// 通过会话ID获取容器名称（用于容器重启后的容器查询）
@@ -330,6 +342,30 @@ impl ProjectAdapter {
             }
             Err(e) => {
                 warn!("Failed to get container for user_id {}: {}", user_id, e);
+                None
+            }
+        }
+    }
+
+    /// 通过 Pod ID 获取容器信息（共享容器模式）
+    ///
+    /// 在共享容器模式中，多个项目可能共享同一个容器
+    /// 此方法返回该 Pod 下最近活跃项目关联的容器信息
+    pub fn get_container_by_pod_id(&self, pod_id: &str) -> Option<ContainerBasicInfo> {
+        match self.storage.get_latest_container_id_by_pod_id(pod_id) {
+            Ok(Some(container_id)) => {
+                debug!(
+                    "Found container_id for pod_id={}: container_id={}",
+                    pod_id, container_id
+                );
+                self.get_container(&container_id)
+            }
+            Ok(None) => {
+                debug!("No container found for pod_id={}", pod_id);
+                None
+            }
+            Err(e) => {
+                warn!("Failed to get container for pod_id {}: {}", pod_id, e);
                 None
             }
         }

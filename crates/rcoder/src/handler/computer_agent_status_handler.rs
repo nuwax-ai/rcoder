@@ -86,7 +86,7 @@ const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
     summary = "查询 Computer Agent 状态",
     description = "查询指定 user_id + project_id 对应的 Computer Agent 是否已启动。通过主动调用子容器的 gRPC GetStatus 接口确认 Agent 真实状态。"
 )]
-#[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
+#[instrument(skip(state), fields(user_id = ?request.user_id.as_ref().map(|s| s.as_str()), project_id = %request.project_id, pod_id = ?request.pod_id.as_ref().map(|s| s.as_str())))]
 pub async fn computer_agent_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -95,9 +95,11 @@ pub async fn computer_agent_status(
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
 
-    // 1. 参数验证
-    if request.user_id.trim().is_empty() {
-        error!("[COMPUTER_AGENT_STATUS] user_id is required");
+    // 1. 参数验证：user_id 或 pod_id 至少有一个
+    let has_user_id = request.user_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let has_pod_id = request.pod_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !has_user_id && !has_pod_id {
+        error!("[COMPUTER_AGENT_STATUS] user_id or pod_id is required");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -111,9 +113,16 @@ pub async fn computer_agent_status(
         ));
     }
 
+    // 用于日志输出的标识符
+    let identifier_display = if has_user_id {
+        format!("user_id={}", request.user_id.as_ref().unwrap())
+    } else {
+        format!("pod_id={}", request.pod_id.as_ref().unwrap())
+    };
+
     info!(
-        "🔍 [COMPUTER_AGENT_STATUS] Querying Agent status: user_id={}, project_id={}",
-        request.user_id, request.project_id
+        "🔍 [COMPUTER_AGENT_STATUS] Querying Agent status: {}, project_id={}",
+        identifier_display, request.project_id
     );
 
     // 2. 查询容器信息（通过 Runtime）
@@ -124,10 +133,14 @@ pub async fn computer_agent_status(
             AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
-    // 获取容器信息（ComputerAgentRunner 使用 user_id 作为容器标识）
+    // 获取容器标识符（user_id 或 pod_id）
+    let identifier = request.user_id.clone().or(request.pod_id.clone());
+    let identifier_str = identifier.as_deref().unwrap_or("");
+
+    // 获取容器信息（ComputerAgentRunner 使用 user_id 或 pod_id 作为容器标识）
     let container_info = match runtime
         .get_container_info_by_identifier(
-            &request.user_id,
+            identifier_str,
             &shared_types::ServiceType::ComputerAgentRunner,
         )
         .await
@@ -135,19 +148,19 @@ pub async fn computer_agent_status(
         Ok(Some(info)) => info,
         Ok(None) => {
             info!(
-                "📭 [COMPUTER_AGENT_STATUS] Container not found: user_id={}",
-                request.user_id
+                "📭 [COMPUTER_AGENT_STATUS] Container not found: identifier={}",
+                identifier_str
             );
             // Early return: 直接 move request 的字段
             return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
-                request.user_id,
+                request.user_id.clone(),
                 request.project_id,
             )));
         }
         Err(e) => {
             error!(
-                "❌ [COMPUTER_AGENT_STATUS] Failed to query container info: user_id={}, error={}",
-                request.user_id, e
+                "❌ [COMPUTER_AGENT_STATUS] Failed to query container info: identifier={}, error={}",
+                identifier_str, e
             );
             return Err(AppError::internal_server_error(&format!(
                 "Failed to query container info: {}",
@@ -159,12 +172,12 @@ pub async fn computer_agent_status(
     // 3. 检查容器是否运行中
     if container_info.status != "running" {
         info!(
-            "⚠️ [COMPUTER_AGENT_STATUS] Container not running: user_id={}, status={}",
-            request.user_id, container_info.status
+            "⚠️ [COMPUTER_AGENT_STATUS] Container not running: identifier={}, status={}",
+            identifier_str, container_info.status
         );
         // Early return: 直接 move request 的字段
         return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
-            request.user_id,
+            request.user_id.clone(),
             request.project_id,
         )));
     }
@@ -186,8 +199,8 @@ pub async fn computer_agent_status(
         Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
         Err(e) => {
             error!(
-                "❌ [COMPUTER_AGENT_STATUS] Failed to get container IP: user_id={}, error={}",
-                request.user_id, e
+                "❌ [COMPUTER_AGENT_STATUS] Failed to get container IP: identifier={}, error={}",
+                identifier_str, e
             );
             // Early return: 直接 move request 的字段
             return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
@@ -215,13 +228,13 @@ pub async fn computer_agent_status(
         Ok(response) => response,
         Err(e) => {
             warn!(
-                "⚠️ [COMPUTER_AGENT_STATUS] gRPC GetStatus call failed: user_id={}, project_id={}, error={}",
-                request.user_id, request.project_id, e
+                "⚠️ [COMPUTER_AGENT_STATUS] gRPC GetStatus call failed: {}, project_id={}, error={}",
+                identifier_display, request.project_id, e
             );
             // gRPC 调用失败视为 Agent 不存在
             // Early return: 直接 move request 的字段
             return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
-                request.user_id,
+                request.user_id.clone(),
                 request.project_id,
             )));
         }
@@ -232,11 +245,11 @@ pub async fn computer_agent_status(
 
     if !is_alive {
         info!(
-            "📭 [COMPUTER_AGENT_STATUS] Agent not started: user_id={}, project_id={}, is_found={}",
-            request.user_id, request.project_id, grpc_response.is_found
+            "📭 [COMPUTER_AGENT_STATUS] Agent not started: {}, project_id={}, is_found={}",
+            identifier_display, request.project_id, grpc_response.is_found
         );
         return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
-            request.user_id,
+            request.user_id.clone(),
             request.project_id,
         )));
     }
@@ -255,15 +268,15 @@ pub async fn computer_agent_status(
     } else {
         // DuckDB 中无记录，但 gRPC 确认 Agent 存在
         warn!(
-            "⚠️ [COMPUTER_AGENT_STATUS] Agent exists but no DuckDB record (may be due to service restart causing state loss): user_id={}, project_id={}. Attempting self-healing...",
-            request.user_id, request.project_id
+            "⚠️ [COMPUTER_AGENT_STATUS] Agent exists but no DuckDB record (may be due to service restart causing state loss): {}, project_id={}. Attempting self-healing...",
+            identifier_display, request.project_id
         );
 
         // 🛡️ 自愈逻辑 (Self-Healing)
         // 自动恢复丢失的项目记录，防止容器被孤立清理器误杀
         let mut project_info =
             shared_types::ProjectAndContainerInfo::new(request.project_id.clone());
-        project_info.set_user_id(Some(request.user_id.clone()));
+        project_info.set_user_id(request.user_id.clone());
 
         // 恢复容器信息
         // 注意：这里我们使用查询到的 container_info
@@ -282,8 +295,8 @@ pub async fn computer_agent_status(
         state.insert_project(request.project_id.clone(), Arc::new(project_info.clone()));
 
         info!(
-            "🔄 [COMPUTER_AGENT_STATUS] ✅ Self-healing succeeded: restored project record project_id={}, user_id={}",
-            request.project_id, request.user_id
+            "🔄 [COMPUTER_AGENT_STATUS] ✅ Self-healing succeeded: restored project record project_id={}, {}",
+            request.project_id, identifier_display
         );
 
         ComputerAgentStatusResponse {
@@ -299,8 +312,8 @@ pub async fn computer_agent_status(
     };
 
     info!(
-        "✅ [COMPUTER_AGENT_STATUS] Agent status query completed: user_id={}, project_id={}, is_alive={}, status={}",
-        request.user_id,
+        "✅ [COMPUTER_AGENT_STATUS] Agent status query completed: {}, project_id={}, is_alive={}, status={}",
+        identifier_display,
         request.project_id,
         response.is_alive,
         response.status.as_deref().unwrap_or("unknown")

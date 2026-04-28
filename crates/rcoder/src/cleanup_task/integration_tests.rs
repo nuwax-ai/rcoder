@@ -27,6 +27,7 @@ mod tests {
             service_type,
             container_id: format!("container_{}", project_id),
             user_id: Some(user_id.to_string()),
+            pod_id: None,
             agent_status_code: None,
             agent_status_name: None,
             request_id: None,

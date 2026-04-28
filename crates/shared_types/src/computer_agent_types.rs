@@ -90,21 +90,42 @@ pub struct ComputerChatRequest {
 /// Computer Agent 状态查询请求
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ComputerAgentStatusRequest {
-    /// 用户 ID（必填）
+    /// 用户 ID（可与 pod_id 二选一）
     #[schema(example = "user_123")]
-    pub user_id: String,
+    pub user_id: Option<String>,
 
     /// 项目 ID（必填）
     #[schema(example = "project_456")]
     pub project_id: String,
+
+    /// Pod ID，用于共享容器模式下的容器定位（可与 user_id 二选一）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_abc123")]
+    pub pod_id: Option<String>,
+
+    /// 租户ID（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant_001")]
+    pub tenant_id: Option<String>,
+
+    /// 空间ID（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "space_001")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "project")]
+    pub isolation_type: Option<String>,
 }
 
 /// Computer Agent 状态查询响应
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ComputerAgentStatusResponse {
-    /// 用户 ID
+    /// 用户 ID（可选，因为请求中 user_id 和 pod_id 二选一）
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "user_123")]
-    pub user_id: String,
+    pub user_id: Option<String>,
 
     /// 项目 ID
     #[schema(example = "project_456")]
@@ -135,7 +156,7 @@ pub struct ComputerAgentStatusResponse {
 
 impl ComputerAgentStatusResponse {
     /// 创建 Agent 未启动的响应
-    pub fn not_alive(user_id: String, project_id: String) -> Self {
+    pub fn not_alive(user_id: Option<String>, project_id: String) -> Self {
         Self {
             user_id,
             project_id,
@@ -151,9 +172,9 @@ impl ComputerAgentStatusResponse {
 /// Computer Agent 停止请求
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ComputerAgentStopRequest {
-    /// 用户 ID（必填）
+    /// 用户 ID（可与 pod_id 二选一）
     #[schema(example = "user_123")]
-    pub user_id: String,
+    pub user_id: Option<String>,
 
     /// 项目 ID（必填）
     #[schema(example = "project_456")]
@@ -163,6 +184,26 @@ pub struct ComputerAgentStopRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "session789")]
     pub session_id: Option<String>,
+
+    /// Pod ID，用于共享容器模式下的容器定位（可与 user_id 二选一）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_abc123")]
+    pub pod_id: Option<String>,
+
+    /// 租户ID（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "tenant_001")]
+    pub tenant_id: Option<String>,
+
+    /// 空间ID（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "space_001")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "project")]
+    pub isolation_type: Option<String>,
 }
 
 /// Computer Agent 停止响应
@@ -176,22 +217,28 @@ pub struct ComputerAgentStopResponse {
     #[schema(example = "Agent stopped successfully")]
     pub message: String,
 
-    /// 用户 ID
+    /// 用户 ID（可选，因为请求中 user_id 和 pod_id 二选一）
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "user_123")]
-    pub user_id: String,
+    pub user_id: Option<String>,
+
+    /// Pod ID（可选，因为请求中 user_id 和 pod_id 二选一）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_abc123")]
+    pub pod_id: Option<String>,
 
     /// 项目 ID
     #[schema(example = "project_456")]
     pub project_id: String,
 }
 
-/// Computer Agent 取消任务的查询参数
+/// Computer Agent 取消任务的请求参数
 #[derive(Debug, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 pub struct ComputerAgentCancelRequest {
-    /// 用户 ID（必填）
+    /// 用户 ID（可与 pod_id 二选一）
     #[param(example = "user_123")]
     #[schema(example = "user_123")]
-    pub user_id: String,
+    pub user_id: Option<String>,
 
     /// 项目 ID（必填）
     #[param(example = "project_456")]
@@ -203,6 +250,30 @@ pub struct ComputerAgentCancelRequest {
     #[schema(example = "session_789")]
     #[serde(default)]
     pub session_id: Option<String>,
+
+    /// Pod ID，用于共享容器模式下的容器定位（可与 user_id 二选一）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "pod_abc123")]
+    #[schema(example = "pod_abc123")]
+    pub pod_id: Option<String>,
+
+    /// 租户ID（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "tenant_001")]
+    #[schema(example = "tenant_001")]
+    pub tenant_id: Option<String>,
+
+    /// 空间ID（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "space_001")]
+    #[schema(example = "space_001")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "project")]
+    #[schema(example = "project")]
+    pub isolation_type: Option<String>,
 }
 
 /// Computer Agent 取消响应

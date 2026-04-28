@@ -90,6 +90,12 @@ pub trait UnifiedStorage: Send + Sync {
     /// 此方法返回该用户最近活跃项目关联的容器ID
     fn get_latest_container_id_by_user_id(&self, user_id: &str) -> DuckDbResult<Option<String>>;
 
+    /// 获取 Pod 最新活跃项目的容器ID（共享容器模式）
+    ///
+    /// 在共享容器模式下，多个项目可能共享同一个容器（通过 pod_id 标识），
+    /// 此方法返回该 Pod 下最近活跃项目关联的容器ID
+    fn get_latest_container_id_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Option<String>>;
+
     // ========== 会话操作 ==========
 
     /// 根据会话ID获取项目
@@ -103,6 +109,9 @@ pub trait UnifiedStorage: Send + Sync {
 
     /// 更新会话
     fn update_session(&self, project_id: &str, session_id: &str) -> DuckDbResult<bool>;
+
+    /// 清除会话（将 session_id 设置为 NULL）
+    fn clear_session(&self, project_id: &str) -> DuckDbResult<bool>;
 
     /// 更新会话活动时间
     fn update_session_activity(&self, session_id: &str) -> DuckDbResult<bool>;
@@ -323,6 +332,10 @@ impl UnifiedStorage for DuckDbStorage {
         self.projects()?.get_latest_container_id_by_user_id(user_id)
     }
 
+    fn get_latest_container_id_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Option<String>> {
+        self.projects()?.get_latest_container_id_by_pod_id(pod_id)
+    }
+
     // ========== 会话操作 ==========
 
     fn get_project_by_session(&self, session_id: &str) -> DuckDbResult<Option<ProjectRecord>> {
@@ -335,6 +348,10 @@ impl UnifiedStorage for DuckDbStorage {
 
     fn update_session(&self, project_id: &str, session_id: &str) -> DuckDbResult<bool> {
         self.projects()?.update_session(project_id, session_id)
+    }
+
+    fn clear_session(&self, project_id: &str) -> DuckDbResult<bool> {
+        self.projects()?.clear_session(project_id)
     }
 
     /// 更新会话活动时间（同时也更新关联容器的活动时间）
