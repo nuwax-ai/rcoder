@@ -246,8 +246,14 @@ async fn stop_container_startup_mode(
 ///
 /// 如果是409冲突错误返回 `true`，否则返回 `false`
 fn is_409_conflict_error(error: &DockerError) -> bool {
-    let error_str = error.to_string();
-    error_str.contains("409") && error_str.contains("already in progress")
+    // 检查是否是 Docker 409 冲突错误（容器删除已在进行中）
+    matches!(
+        error,
+        DockerError::BollardError(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            ..
+        })
+    )
 }
 
 /// 运行时容器清理策略（单个容器）

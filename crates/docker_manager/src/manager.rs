@@ -523,6 +523,57 @@ impl DockerManager {
             container_id, timeout_seconds
         );
 
+        // 先检查容器是否真实存在，避免删除不存在的容器导致错误
+        // 使用 inspect API 检查容器状态
+        let timeout = Duration::from_secs(timeout_seconds);
+        let container_exists = match tokio::time::timeout(
+            timeout,
+            self.docker.inspect_container(container_id, None::<InspectContainerOptions>),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                // 根据 bollard 错误类型判断：DockerResponseServerError 包含 status_code
+                // 404 表示容器不存在，这是正常的（可能已被外部清理）
+                // 其他错误则记录警告但继续尝试删除
+                match &e {
+                    bollard::errors::Error::DockerResponseServerError { status_code, .. }
+                        if *status_code == 404 =>
+                    {
+                        info!(
+                            "Container {} does not exist in Docker (status 404, already cleaned up), skipping destroy",
+                            container_id
+                        );
+                        return Ok(());
+                    }
+                    _ => {
+                        warn!(
+                            "Failed to inspect container {} before destroy: {}, will try remove anyway",
+                            container_id, e
+                        );
+                        true // 继续尝试删除
+                    }
+                }
+            }
+            Err(_) => {
+                // 超时，假设容器可能已不存在，尝试删除
+                warn!(
+                    "Timeout inspecting container {} ({}s), will try remove anyway",
+                    container_id, timeout_seconds
+                );
+                true
+            }
+        };
+
+        if !container_exists {
+            info!(
+                "Container {} does not exist, destroy skipped",
+                container_id
+            );
+            return Ok(());
+        }
+
         // 🚀 直接使用 force remove，无需先 stop
         // force: true 会自动停止运行中的容器
         // 这样可以避免 "removal already in progress" 的竞态问题
@@ -532,8 +583,6 @@ impl DockerManager {
             link: false,
         });
 
-        // 不容忍任何错误，直接返回让调用者处理
-        // 这样可以避免掩盖潜在问题（如 404 可能有多种含义，409 的字符串匹配不可靠）
         self.docker
             .remove_container(container_id, remove_options)
             .await
@@ -1667,13 +1716,18 @@ impl DockerManager {
         {
             Ok(ips) => ips,
             Err(e) => {
-                // 检查是否是容器不存在的错误
-                let error_str = e.to_string();
-                if error_str.contains("No such container") || error_str.contains("404") {
-                    // 容器已被外部删除，清理内存映射并返回 None
-                    // 这样上层调用者可以重新创建容器
+                // 检查是否是容器不存在的错误（404 状态码）
+                // 容器已被外部删除，清理内存映射并返回 None
+                // 这样上层调用者可以重新创建容器
+                if matches!(
+                    &e,
+                    DockerError::BollardError(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ) {
                     warn!(
-                        "⚠️ [GET_AGENT_INFO] Container was externally deleted, cleaning up memory mapping: project_id={}, container_id={}",
+                        "⚠️ [GET_AGENT_INFO] Container was externally deleted (status 404), cleaning up memory mapping: project_id={}, container_id={}",
                         project_id, container_info.container_id
                     );
                     self.containers.remove(project_id).await;
