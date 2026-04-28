@@ -31,8 +31,10 @@ replicas:
 # 生产环境镜像 tag
 images:
   - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder
+    newName: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-k8s
     newTag: latest
   - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner
+    newName: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-computer-agent-runner
     newTag: latest
 
 patches:
