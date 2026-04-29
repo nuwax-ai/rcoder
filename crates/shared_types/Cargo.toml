@@ -63,8 +63,11 @@ axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 futures = { workspace = true }
+futures-util = { workspace = true }
 tokio-stream = "0.1"
-async-stream = "0.3"
+
+# async trait for service trait definition
+async-trait = { workspace = true }
 
 # gRPC - 使用 tonic 0.14 运行时
 tonic = { version = "0.14.2", features = ["tls-native-roots"] }

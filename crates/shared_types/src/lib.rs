@@ -115,3 +115,14 @@ pub use model::chat_prompt::ChatPromptBuilder;
 // Computer Agent HTTP API 类型
 pub mod computer_agent_types;
 pub use computer_agent_types::*;
+
+// RCoder Agent HTTP Service trait
+pub mod agent_http_service;
+pub use agent_http_service::AgentHttpService;
+
+// RCoder Agent HTTP API 类型
+pub mod rcoder_agent_types;
+pub use rcoder_agent_types::*;
+
+// 通用 HTTP Handlers（基于 trait）
+pub mod http_handlers;

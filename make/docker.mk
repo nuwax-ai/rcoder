@@ -83,9 +83,10 @@ docker-build-master-base:
 #   - debug         (rcoder):               调试路由
 #   - proxy         (agent_runner):         Pingora 反向代理（Linux 容器默认开启）
 #   - kubernetes    (rcoder, docker_manager): Kubernetes 运行时支持
+#   - http-server   (agent_runner):         HTTP REST API 服务（RCoder-mode endpoints）
 #
 # 本地开发调试默认开启所有功能
-CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,proxy,kubernetes
+CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,proxy,kubernetes,http-server
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
 docker-build-agent-runner:

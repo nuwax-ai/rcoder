@@ -1412,6 +1412,12 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             }
                         }
                         Some(prompt_request) = prompt_rx.recv() => {
+                            // 收到新 prompt，重置取消标志
+                            // 场景：用户快速发送 prompt A → cancel → prompt B
+                            // - cancel 设置 session_cancelled=true
+                            // - prompt B 到达时重置为 false，处理完后不 break
+                            // - 保持 outer loop 存活以接收后续 prompt
+                            session_cancelled = false;
  debug!("[SACP] received Prompt request");
 
                             // 从 meta 中提取 request_id
@@ -1588,14 +1594,26 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                 }
                             }
 
-                            // 🎯 关键修复：如果会话已被取消，prompt 完成后主动退出循环
-                            // 这样 spawned task 会退出，lifecycle_guard 被 drop，cancel_token 触发，
-                            // 从而 acp_agent.rs 中的 remove_by_project 被调用，清理 registry。
-                            // 否则 spawned task 会永远等待 cancel_token.cancelled()，导致 session 泄漏。
-                            if session_cancelled {
- info!("[SACP] Session cancelled, exiting connection loop: project_id={}, session_id={}", project_id_for_prompt, session_id);
-                                break;
-                            }
+                            // 🎯 关键设计：cancel 后不退出 outer loop，保持 Agent 子进程存活
+                            //
+                            // 为什么不能 break outer loop：
+                            // - outer loop break → spawned task 退出 → lifecycle_guard drop
+                            // - LifecycleGuard::drop() → SIGKILL → Agent 子进程被杀
+                            // - 子进程被杀 → 内存中的对话上下文丢失
+                            // - 下次请求 get_or_create_session → is_channel_closed()=true → 创建新 session → 上下文断裂
+                            //
+                            // 正确行为：
+                            // - inner loop 处理了 cancel → is_cancelled=true → inner loop 退出
+                            // - notify_prompt_end(Cancelled) → 状态恢复 Idle
+                            // - outer loop 继续等待 prompt_rx.recv() → 收到新 prompt → 复用同一 Agent 进程
+                            // - 上下文连续：同一子进程、同一 SACP 连接、同一对话历史
+                            //
+                            // is_cancelled 不传播到 session_cancelled，保持 outer loop 存活。
+                            // session_cancelled 仅在 outer select 中收到 cancel（无活跃 prompt）时设置。
+                            info!(
+                                "[SACP] Prompt cancelled, session ready for next prompt: project_id={}, session_id={}",
+                                project_id_for_prompt, session_id
+                            );
                         }
                         else => {
                             // 所有通道已关闭

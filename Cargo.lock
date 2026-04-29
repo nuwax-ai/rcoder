@@ -5599,7 +5599,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
- "async-stream",
+ "async-trait",
  "axum",
  "axum-tracing-opentelemetry",
  "base64",
@@ -5607,6 +5607,7 @@ dependencies = [
  "dashmap",
  "derive_builder",
  "futures 0.3.32",
+ "futures-util",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost 0.14.3",

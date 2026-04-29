@@ -45,12 +45,13 @@ pub async fn handle_computer_cancel(
 ) -> Result<Json<HttpResult<ComputerAgentCancelResponse>>, (StatusCode, Json<HttpResult<String>>)> {
     let locale = locale_from_headers(&headers);
     info!(
-        "🚫 [HTTP] Computer Agent 取消请求: user_id={}, project_id={}, session_id={:?}",
+        "🚫 [HTTP] Computer Agent 取消请求: user_id={:?}, project_id={}, session_id={:?}",
         request.user_id, request.project_id, request.session_id
     );
 
     // 1. 验证必填字段
-    if request.user_id.is_empty() {
+    // user_id 是 Option<String>，需要用 as_ref() 或直接检查
+    if request.user_id.as_ref().map_or(true, |s| s.is_empty()) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(HttpResult::error_with_message(

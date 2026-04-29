@@ -195,22 +195,27 @@ async fn cancel_current_task(
         Ok(Ok(cancel_result)) => {
             if cancel_result.is_success() {
                 info!(
-                    "[ChatHandler] Cancel notification sent successfully, waiting for Agent session cleanup: project_id={}, session_id={}",
+                    "[ChatHandler] Cancel notification sent successfully, proceeding with new request: project_id={}, session_id={}",
                     project_id, session_id
                 );
 
-                // 🎯 关键：等待会话从 Registry 中被移除
+                // 🎯 关键设计：cancel 后立即返回，不等待 session 移除
                 //
-                // 时序分析：
-                // 1. CancelNotification 发送成功 → Agent 处理取消
-                // 2. Agent 调用 notify_prompt_end → 状态变为 Idle
-                // 3. run_sacp_connection 退出 → spawned task 继续执行清理
-                // 4. spawned task 调用 remove_by_project() → 会话从 Registry 移除
+                // 上下文连续性保证：
+                // - 不等待 session 移除 → session 保持在 Registry 中
+                // - get_or_create_session → is_channel_closed()=false → 复用同一 session
+                // - 新 prompt 发送到同一 session 的 prompt_tx → 同一 Agent 子进程处理
+                // - Agent 子进程保持存活 → 内存中的对话上下文连续
                 //
-                // 如果只等待 Idle 状态就返回，新请求可能在步骤 3-4 之间到达，
-                // 此时会话还在 Registry 中但即将被移除，导致竞态条件。
-                // 因此需要等待会话完全从 Registry 中移除，确保旧 Agent 进程已退出。
-                wait_for_session_removed(project_id, Duration::from_secs(15)).await
+                // 时序：
+                // 1. CancelResult::Success → cancel 通知已发送给 Agent
+                // 2. SACP inner loop 收到 cancel → is_cancelled=true → 等待 Agent 响应或超时
+                // 3. inner loop 退出 → outer loop 继续等待 prompt_rx
+                // 4. 新请求的 prompt 到达 → session_cancelled 重置 → 处理新 prompt
+                // 5. 同一 Agent 子进程处理新 prompt → 上下文连续
+                //
+                // 最坏情况延迟：inner cancel timeout (10s) — Agent 不响应 cancel 时
+                Ok(())
             } else {
                 let error_msg = cancel_result.error_message().unwrap_or("Unknown error");
                 error!(
@@ -253,64 +258,6 @@ async fn cancel_current_task(
                 error_codes::ERR_CANCEL_FAILED.to_string(),
             ))
         }
-    }
-}
-
-/// 等待会话从 Registry 中移除
-///
-/// 轮询检查 AGENT_REGISTRY 中的会话是否已被移除。
-/// 当 cancel 后，旧的 Agent spawned task 会调用 remove_by_project() 清理会话，
-/// 此函数等待清理完成后再返回，确保新请求不会与旧会话产生竞态。
-///
-/// # Arguments
-/// * `project_id` - 项目 ID
-/// * `timeout` - 超时时间
-///
-/// # Returns
-/// * `Ok(())` - 会话已从 Registry 移除（或本就不存在）
-/// * `Err(ChatHandlerOutput)` - 超时
-async fn wait_for_session_removed(
-    project_id: &str,
-    timeout: Duration,
-) -> Result<(), ChatHandlerOutput> {
-    let start = tokio::time::Instant::now();
-    let check_interval = Duration::from_millis(100); // 每 100ms 检查一次
-
-    info!(
-        "[ChatHandler] Waiting for session to be removed from registry: project_id={}",
-        project_id
-    );
-
-    loop {
-        // 检查是否超时
-        if start.elapsed() >= timeout {
-            error!(
-                "[ChatHandler] Timeout waiting for session removal: project_id={}, elapsed={:?}",
-                project_id, start.elapsed()
-            );
-            return Err(ChatHandlerOutput::error(
-                project_id.to_string(),
-                String::new(),
-                error_codes::get_i18n_message_default("error.cancel_timeout"),
-                error_codes::ERR_CANCEL_FAILED.to_string(),
-            ));
-        }
-
-        // 检查会话是否已从 Registry 中移除
-        if !AGENT_REGISTRY.contains_project(project_id) {
-            info!(
-                "[ChatHandler] Session removed from registry, proceeding: project_id={}, elapsed={:?}",
-                project_id, start.elapsed()
-            );
-            return Ok(());
-        }
-
-        debug!(
-            "[ChatHandler] Session still in registry, waiting for cleanup: project_id={}, elapsed={:?}",
-            project_id, start.elapsed()
-        );
-
-        tokio::time::sleep(check_interval).await;
     }
 }
 

@@ -583,11 +583,12 @@ pub async fn agent_worker_with_heartbeat(
                         lifecycle.cancellation_token().cancelled().await;
 
                         // 🔥 关键修复：lifecycle 结束后，主动清理 Agent 并释放槽位
-                        // 这确保了槽位释放和 Registry 清理的原子性
-                        // 后续的 stop_agent 或 cleanup_task 调用 remove_by_project() 会发现 Agent 已不存在
-                        // 因此不会重复释放槽位
+                        // 使用 session-aware 移除，避免旧 session 的 cleanup 误删新 session 的 registry 条目。
+                        // 场景：用户快速发送多条消息时，旧 session 被取消，新 session 注册。
+                        // 旧 session 的 spawned task 退出时，registry 中已是新 session 的条目。
+                        // 如果用 remove_by_project 会误删新 session，导致新请求超时。
 
-                        AGENT_REGISTRY.remove_by_project(&project_id);
+                        AGENT_REGISTRY.remove_by_project_if_session_matches(&project_id, &response_session_id);
 
                         info!(
                             "🛑 [SACP] Agent 生命周期结束，已清理 Registry - project_id={}, session_id={}",
@@ -599,7 +600,7 @@ pub async fn agent_worker_with_heartbeat(
                             project_id
                         );
                         // 缺少 lifecycle_handle，立即清理
-                        AGENT_REGISTRY.remove_by_project(&project_id);
+                        AGENT_REGISTRY.remove_by_project_if_session_matches(&project_id, &response_session_id);
                     }
                 }
             } else {

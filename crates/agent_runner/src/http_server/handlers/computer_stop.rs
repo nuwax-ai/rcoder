@@ -45,12 +45,12 @@ pub async fn handle_computer_stop(
 ) -> Result<Json<HttpResult<ComputerAgentStopResponse>>, (StatusCode, Json<HttpResult<String>>)> {
     let locale = locale_from_headers(&headers);
     info!(
-        "🛑 [HTTP] Computer Agent 停止请求: user_id={}, project_id={}",
+        "🛑 [HTTP] Computer Agent 停止请求: user_id={:?}, project_id={}",
         request.user_id, request.project_id
     );
 
     // 1. 验证必填字段
-    if request.user_id.is_empty() {
+    if request.user_id.as_ref().map_or(true, |s| s.is_empty()) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(HttpResult::error_with_message(
@@ -140,6 +140,7 @@ pub async fn handle_computer_stop(
         success,
         message,
         user_id: request.user_id.clone(),
+        pod_id: None,
         project_id: request.project_id.clone(),
     };
 
