@@ -14,6 +14,9 @@ error.agent_not_found: "Agent 不存在或已停止"
 
 # 取消/停止操作
 error.cancel_failed: "取消操作失败"
+error.cancel_channel_closed: "取消通道已关闭"
+error.cancel_channel_dropped: "取消结果通道已断开"
+error.cancel_timeout: "取消操作超时"
 error.stop_failed: "停止操作失败"
 
 # 参数验证

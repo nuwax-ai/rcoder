@@ -14,6 +14,9 @@ error.agent_not_found: "Agent not found or stopped"
 
 # Cancel/Stop operations
 error.cancel_failed: "Cancel operation failed"
+error.cancel_channel_closed: "Cancel channel closed"
+error.cancel_channel_dropped: "Cancel result channel dropped"
+error.cancel_timeout: "Cancel operation timed out"
 error.stop_failed: "Stop operation failed"
 
 # Validation

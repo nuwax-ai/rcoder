@@ -1337,6 +1337,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 }
 
                 // 4. 处理 Prompt 和 Cancel 请求
+                let mut session_cancelled = false;
                 loop {
                     tokio::select! {
                         _ = cancel_token.cancelled() => {
@@ -1406,6 +1407,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
  info!("[SACP] cancel notification sent");
                                 // 通知调用方取消成功
                                 let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
+                                // 标记会话已取消，当前 prompt 完成后退出循环
+                                session_cancelled = true;
                             }
                         }
                         Some(prompt_request) = prompt_rx.recv() => {
@@ -1583,6 +1586,15 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                         break;
                                     }
                                 }
+                            }
+
+                            // 🎯 关键修复：如果会话已被取消，prompt 完成后主动退出循环
+                            // 这样 spawned task 会退出，lifecycle_guard 被 drop，cancel_token 触发，
+                            // 从而 acp_agent.rs 中的 remove_by_project 被调用，清理 registry。
+                            // 否则 spawned task 会永远等待 cancel_token.cancelled()，导致 session 泄漏。
+                            if session_cancelled {
+ info!("[SACP] Session cancelled, exiting connection loop: project_id={}, session_id={}", project_id_for_prompt, session_id);
+                                break;
                             }
                         }
                         else => {
