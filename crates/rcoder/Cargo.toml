@@ -87,7 +87,7 @@ piper = "0.2"
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
-bollard = "0.19"
+bollard = { workspace = true }
 rustls = { workspace = true }
 
 # OpenTelemetry
@@ -107,7 +107,7 @@ utoipa-swagger-ui = { workspace = true }
 ringbuf = { workspace = true }
 
 # Random and hashing
-rand = "0.9"
+rand = { workspace = true }
 md5 = "0.8"
 
 # Cache
