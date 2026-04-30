@@ -1157,8 +1157,8 @@ impl DockerManager {
                     .mounts
                     .as_ref()
                     .and_then(|mounts| {
-                        mounts.iter().find(|m: &&bollard::secret::MountPoint| {
-                            matches!(m.typ, Some(bollard::secret::MountPointTypeEnum::BIND))
+                        mounts.iter().find(|m: &&bollard::models::MountPoint| {
+                            matches!(m.typ, Some(bollard::models::MountPointTypeEnum::BIND))
                         })
                     })
                     .and_then(|mount| {
