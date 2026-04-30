@@ -12,7 +12,7 @@ use tracing::{error, info, instrument, warn};
 use crate::{AppError, HttpResult, router::AppState};
 use shared_types::{ComputerAgentStopRequest, ComputerAgentStopResponse};
 
-use super::utils::{I18nJson, extract_grpc_addr, get_locale_from_headers};
+use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
 
 /// 停止 Computer Agent
 ///
@@ -74,7 +74,7 @@ use super::utils::{I18nJson, extract_grpc_addr, get_locale_from_headers};
 pub async fn computer_agent_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(request): I18nJson<ComputerAgentStopRequest>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerAgentStopRequest>,
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);

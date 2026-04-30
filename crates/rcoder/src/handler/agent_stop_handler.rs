@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::{error, info, instrument};
 use utoipa::{IntoParams, ToSchema};
 
-use super::utils::{I18nJson, get_locale_from_headers};
+use super::utils::{I18nJsonOrQuery, get_locale_from_headers};
 use crate::{AppError, HttpResult, router::AppState};
 
 /// 停止Agent请求参数
@@ -208,11 +208,12 @@ async fn destroy_container_for_project(
     summary = "销毁Agent容器",
     description = "直接销毁 project_id 对应的容器，不向容器内的 agent_runner 发送消息。如果容器不存在，也返回成功。"
 )]
+#[axum::debug_handler]
 #[instrument(skip(state))]
 pub async fn agent_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(request): I18nJson<StopAgentQuery>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<StopAgentQuery>,
 ) -> Result<HttpResult<StopAgentResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
     let project_id = request.project_id.trim();

@@ -13,7 +13,7 @@ use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;
 use shared_types::{AppError, ComputerAgentCancelRequest, HttpResult};
 
-use super::utils::{I18nJson, extract_grpc_addr, get_locale_from_headers};
+use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
 
 /// 取消任务的请求参数
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -481,7 +481,7 @@ async fn handle_session_cancel_internal_v2(
 pub async fn agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(request): I18nJson<CancelQuery>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<CancelQuery>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
     // 使用新的 v2 版本，保持向后兼容
@@ -571,7 +571,7 @@ pub async fn agent_session_cancel(
 pub async fn computer_agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(request): I18nJson<ComputerAgentCancelRequest>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerAgentCancelRequest>,
 ) -> Result<HttpResult<CancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
 

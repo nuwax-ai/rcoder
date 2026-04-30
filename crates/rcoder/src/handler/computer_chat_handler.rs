@@ -30,7 +30,7 @@ use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerMa
 use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
-    I18nJson, extract_grpc_addr_with_port, get_locale_from_headers,
+    I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers,
     get_realtime_container_ip_with_cache, project_dir, build_computer_workspace_path,
 };
 
@@ -94,7 +94,7 @@ use super::utils::{
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(mut request): I18nJson<ComputerChatRequest>,
+    I18nJsonOrQuery(mut request): I18nJsonOrQuery<ComputerChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);

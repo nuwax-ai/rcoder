@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::utils::{I18nJson, get_locale_from_headers, get_realtime_container_ip_with_cache};
+use super::utils::{I18nJsonOrQuery, get_locale_from_headers, get_realtime_container_ip_with_cache};
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
 use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse};
@@ -90,7 +90,7 @@ const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
 pub async fn computer_agent_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(request): I18nJson<ComputerAgentStatusRequest>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerAgentStatusRequest>,
 ) -> Result<HttpResult<ComputerAgentStatusResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);

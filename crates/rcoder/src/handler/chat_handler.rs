@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
-use super::utils::{I18nJson, extract_grpc_addr_with_port, get_locale_from_headers, build_workspace_path};
+use super::utils::{I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers, build_workspace_path};
 
 /// 用户请求结构 - 支持多媒体内容
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -157,7 +157,7 @@ pub struct ChatRequest {
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(mut request): I18nJson<ChatRequest>,
+    I18nJsonOrQuery(mut request): I18nJsonOrQuery<ChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);

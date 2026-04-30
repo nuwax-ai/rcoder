@@ -15,7 +15,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::{IntoParams, ToSchema};
 
-use super::utils::{I18nJson, I18nQuery, extract_grpc_addr_with_port};
+use super::utils::{I18nJsonOrQuery, I18nQuery, extract_grpc_addr_with_port};
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::vnc_sync::sync_single_vnc_backend;
@@ -721,7 +721,7 @@ pub async fn pod_list(
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_ensure(
     State(state): State<Arc<AppState>>,
-    I18nJson(request): I18nJson<EnsurePodRequest>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<EnsurePodRequest>,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
@@ -1220,7 +1220,7 @@ pub async fn pod_ensure(
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_keepalive(
     State(state): State<Arc<AppState>>,
-    I18nJson(request): I18nJson<KeepalivePodRequest>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<KeepalivePodRequest>,
 ) -> Result<HttpResult<KeepalivePodResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
@@ -1406,7 +1406,7 @@ pub async fn pod_keepalive(
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_restart(
     State(state): State<Arc<AppState>>,
-    I18nJson(request): I18nJson<RestartPodRequest>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<RestartPodRequest>,
 ) -> Result<HttpResult<RestartPodResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 

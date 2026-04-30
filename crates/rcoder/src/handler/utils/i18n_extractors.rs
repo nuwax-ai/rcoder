@@ -10,6 +10,7 @@ use axum::{
     },
     http::request::Parts,
 };
+use serde::de::DeserializeOwned;
 
 use crate::AppError;
 
@@ -63,6 +64,55 @@ where
         match Path::<T>::from_request_parts(parts, state).await {
             Ok(Path(value)) => Ok(Self(value)),
             Err(rejection) => Err(map_path_rejection(rejection)),
+        }
+    }
+}
+
+/// 🆕 JSON 或 Query 参数提取器
+///
+/// 支持两种输入方式：
+/// 1. JSON body: `{"project_id": "xxx"}`
+/// 2. Query params: `?project_id=xxx`
+///
+/// 如果两者同时存在，优先使用 JSON body。
+///
+/// 适用于需要同时兼容 GET（query）和 POST（body）两种调用方式的接口。
+pub struct I18nJsonOrQuery<T>(pub T);
+
+impl<S, T> FromRequest<S> for I18nJsonOrQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        // 1. 先提取 query string（URI 的所有权不需要消费整个 request）
+        let query_string = req.uri().query().unwrap_or("").to_string();
+
+        // 2. 尝试解析 JSON body
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(_) => {
+                // 3. JSON 解析失败，尝试解析 query params
+                if query_string.is_empty() {
+                    // 既没有 JSON body 也没有 query params，返回参数错误
+                    Err(AppError::with_i18n_key(
+                        shared_types::error_codes::ERR_INVALID_PARAMS,
+                        "error.invalid_params",
+                    ))
+                } else {
+                    // 使用 serde_urlencoded 解析 query string
+                    match serde_urlencoded::from_str::<T>(&query_string) {
+                        Ok(value) => Ok(Self(value)),
+                        Err(_) => Err(AppError::with_i18n_key(
+                            shared_types::error_codes::ERR_INVALID_PARAMS,
+                            "error.invalid_params",
+                        )),
+                    }
+                }
+            }
         }
     }
 }
