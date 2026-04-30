@@ -1184,9 +1184,16 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     .acp_session_create_timeout_secs
                     .unwrap_or(60);
 
-                let session_id: SessionId = if let Some(ref resume_id) = start_config.resume_session_id {
+                // 🔥 修复：使用 Result 累积错误，避免 ? 操作符提前返回
+                // 无论成功失败，都确保能执行到 session_id_tx.send()
+                let session_result: Result<SessionId, String> = if let Some(ref resume_id) =
+                    start_config.resume_session_id
+                {
                     // 有 resume_session_id，尝试加载历史会话
-                    info!("[SACP] Attempting to load existing session: {}", resume_id);
+                    info!(
+                        "[SACP] Attempting to load existing session: {}",
+                        resume_id
+                    );
 
                     let load_request = LoadSessionRequest::new(
                         resume_id.clone(),
@@ -1197,32 +1204,34 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
 
                     debug!("load_session_request: {:?}", load_request);
 
-                    let timeout_result = tokio::time::timeout(
+                    match tokio::time::timeout(
                         tokio::time::Duration::from_secs(timeout_secs),
                         cx.send_request(load_request).block_task(),
                     )
-                    .await;
-
-                    match timeout_result {
+                    .await
+                    {
                         Ok(Ok(_response)) => {
                             // LoadSession 成功，使用请求中的 session_id
                             info!(
                                 "[SACP] Session loaded successfully: {}, resuming session",
                                 resume_id
                             );
-                            SessionId::from(resume_id.clone())
+                            Ok(SessionId::from(resume_id.clone()))
                         }
-                        Ok(Err(e)) => {
+                        Ok(Err(load_err)) => {
                             // LoadSession 返回错误，降级到 NewSessionRequest
-                            // 先发送 CancelNotification 尝试清理之前的请求
                             warn!(
-                                "[SACP] LoadSession failed (agent may not support it), falling back to NewSession: {}",
-                                e
+                                "[SACP] LoadSession failed, falling back to NewSession: {}",
+                                load_err
                             );
 
-                            let cancel_notification = CancelNotification::new(SessionId::from(resume_id.clone()));
+                            let cancel_notification =
+                                CancelNotification::new(SessionId::from(resume_id.clone()));
                             if let Err(e) = cx.send_notification(cancel_notification) {
-                                debug!("[SACP] Failed to send cancel notification for LoadSession: {}", e);
+                                debug!(
+                                    "[SACP] Failed to send cancel notification for LoadSession: {}",
+                                    e
+                                );
                             }
                             // 等待一小段时间让 agent 有机会清理
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1233,37 +1242,37 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
 
                             debug!("new_session_request: {:?}", new_request);
 
-                            let session_response = tokio::time::timeout(
+                            // 🔥 尝试 NewSession，不要用 ? 操作符
+                            match tokio::time::timeout(
                                 tokio::time::Duration::from_secs(timeout_secs),
                                 cx.send_request(new_request).block_task(),
                             )
                             .await
-                            .map_err(|_| {
-                                sacp::Error::new(
-                                    -32000,
-                                    format!("[SACP] new_session timeout ({}s)", timeout_secs),
-                                )
-                            })
-                            .and_then(|r| r.map_err(|e| {
-                                sacp::Error::new(
-                                    -32002,
-                                    format!("[SACP] new_session failed: {}", e),
-                                )
-                            }))?;
-
-                            session_response.session_id
+                            {
+                                Ok(Ok(response)) => Ok(response.session_id),
+                                Ok(Err(new_err)) => Err(format!(
+                                    "[SACP] LoadSession failed ({}), NewSession also failed ({})",
+                                    load_err, new_err
+                                )),
+                                Err(_) => Err(format!(
+                                    "[SACP] LoadSession failed (timeout), NewSession timeout"
+                                )),
+                            }
                         }
                         Err(_) => {
                             // LoadSession 超时，降级到 NewSessionRequest
-                            // 先发送 CancelNotification 尝试清理之前的请求
                             warn!(
                                 "[SACP] LoadSession timeout ({}s), falling back to NewSession",
                                 timeout_secs
                             );
 
-                            let cancel_notification = CancelNotification::new(SessionId::from(resume_id.clone()));
+                            let cancel_notification =
+                                CancelNotification::new(SessionId::from(resume_id.clone()));
                             if let Err(e) = cx.send_notification(cancel_notification) {
-                                debug!("[SACP] Failed to send cancel notification for LoadSession: {}", e);
+                                debug!(
+                                    "[SACP] Failed to send cancel notification for LoadSession: {}",
+                                    e
+                                );
                             }
                             // 等待一小段时间让 agent 有机会清理
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1274,25 +1283,22 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
 
                             debug!("new_session_request: {:?}", new_request);
 
-                            let session_response = tokio::time::timeout(
+                            // 🔥 尝试 NewSession，不要用 ? 操作符
+                            match tokio::time::timeout(
                                 tokio::time::Duration::from_secs(timeout_secs),
                                 cx.send_request(new_request).block_task(),
                             )
                             .await
-                            .map_err(|_| {
-                                sacp::Error::new(
-                                    -32000,
-                                    format!("[SACP] new_session timeout ({}s)", timeout_secs),
-                                )
-                            })
-                            .and_then(|r| r.map_err(|e| {
-                                sacp::Error::new(
-                                    -32002,
-                                    format!("[SACP] new_session failed: {}", e),
-                                )
-                            }))?;
-
-                            session_response.session_id
+                            {
+                                Ok(Ok(response)) => Ok(response.session_id),
+                                Ok(Err(new_err)) => Err(format!(
+                                    "[SACP] LoadSession timeout, NewSession failed ({})",
+                                    new_err
+                                )),
+                                Err(_) => {
+                                    Err("[SACP] LoadSession timeout, NewSession timeout".to_string())
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1305,27 +1311,36 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
 
                     debug!("new_session_request: {:?}", new_request);
 
-                    let session_response = tokio::time::timeout(
+                    // 🔥 尝试 NewSession，不要用 ? 操作符
+                    match tokio::time::timeout(
                         tokio::time::Duration::from_secs(timeout_secs),
                         cx.send_request(new_request).block_task(),
                     )
                     .await
-                    .map_err(|_| {
-                        sacp::Error::new(
-                            -32000,
-                            format!("[SACP] new_session timeout ({}s)", timeout_secs),
-                        )
-                    })
-                    .and_then(|r| {
-                        r.map_err(|e| {
-                            sacp::Error::new(-32002, format!("[SACP] new_session failed: {}", e))
-                        })
-                    })?;
-
-                    session_response.session_id
+                    {
+                        Ok(Ok(response)) => Ok(response.session_id),
+                        Ok(Err(e)) => Err(format!("[SACP] NewSession failed: {}", e)),
+                        Err(_) => Err(format!(
+                            "[SACP] NewSession timeout ({}s)",
+                            timeout_secs
+                        )),
+                    }
                 };
 
- info!("[SACP] ACP session ready, session_id={}", session_id);
+                // 🔥 关键修复：在闭包最后统一处理 session 创建结果
+                // 确保无论成功失败都能执行到发送逻辑
+                let session_id = match session_result {
+                    Ok(sid) => sid,
+                    Err(err_msg) => {
+                        error!("[SACP] Session creation failed: {}", err_msg);
+                        return Err(sacp::Error::new(-32000, err_msg));
+                    }
+                };
+
+                info!(
+                    "[SACP] ACP session ready, session_id={}",
+                    session_id
+                );
 
                 // 发送会话 ID 到主任务
                 if session_id_tx.send(session_id.clone()).is_err() {

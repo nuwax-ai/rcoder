@@ -337,18 +337,71 @@ async fn main() -> anyhow::Result<()> {
     // 🔒 project_id -> service_uuid 映射
     let project_uuid_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
-    // 🔥 http-server 模式：只启动 HTTP + Pingora（不需要 gRPC）
+    // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
     {
         use http_server::{HttpServerConfig, start_http_server};
         use proxy_agent::set_unlimited_mode;
 
-        info!("ℹ️  HTTP server mode: starting HTTP + Pingora only (no gRPC)");
-
         // 设置为无限制模式（HTTP Server 部署，不限制槽位）
         set_unlimited_mode(true);
 
-        // 创建 HttpServerConfig（包含所有配置）
+        // 🔥 1. 可选：启动 gRPC 服务（当 grpc-server feature 启用时）
+        #[cfg(feature = "grpc-server")]
+        let grpc_handle = {
+            info!("ℹ️  HTTP server mode: starting HTTP + gRPC + Pingora");
+
+            let grpc_port = shared_types::GRPC_DEFAULT_PORT;
+            let grpc_addr = format!("[::]:{}", grpc_port)
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse gRPC address: {}", e))?;
+
+            // 为 gRPC 创建 state
+            let grpc_state = Arc::new(AppState {
+                sessions: Arc::new(DashMap::new()),
+                config: config.clone(),
+                local_task_sender: agent_runtime.clone(),
+                agent_runtime: agent_runtime.clone(),
+                #[cfg(feature = "proxy")]
+                pingora_service: None,
+                api_key_manager: api_key_manager.clone(),
+                shared_api_key_manager: shared_api_key_manager.clone(),
+                project_uuid_map: project_uuid_map.clone(),
+            });
+
+            // gRPC 消息大小限制
+            let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
+                grpc::AgentServiceImpl::new(grpc_state.clone()),
+            )
+            .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
+
+            let handle = tokio::spawn(async move {
+                info!("gRPC service started, listening on port: {}", grpc_port);
+                info!("gRPC endpoints (port {}):", grpc_port);
+                info!("  agent.AgentService/Chat - gRPC chat");
+                info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
+                info!("  agent.AgentService/CancelSession - gRPC cancel");
+                info!("  agent.AgentService/GetStatus - gRPC status");
+                if let Err(e) = tonic::transport::Server::builder()
+                    .add_service(grpc_service)
+                    .serve(grpc_addr)
+                    .await
+                {
+                    error!("gRPC server error: {}", e);
+                }
+            });
+
+            Some(handle)
+        };
+
+        // 无 gRPC 模式
+        #[cfg(not(feature = "grpc-server"))]
+        {
+            info!("ℹ️  HTTP server mode: starting HTTP + Pingora only (no gRPC)");
+        }
+
+        // 🔥 2. 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {
             port: config.port,
             app_config: config.clone(),
@@ -356,16 +409,29 @@ async fn main() -> anyhow::Result<()> {
             shared_api_key_manager: shared_api_key_manager.clone(),
         };
 
-        // 启动 HTTP 服务器（内部会启动 Pingora）
+        // 🔥 3. 启动 HTTP 服务器（内部会启动 Pingora）
         let _handle = start_http_server(http_config).await?;
 
-        // 永久等待（直到收到关闭信号）
+        // 🔥 4. 同时等待 gRPC（如果有）和信号
         info!("HTTP + Pingora services started; running until shutdown signal is received");
 
-        // 等待 Ctrl+C 或 SIGTERM 信号
-        tokio::signal::ctrl_c().await?;
+        #[cfg(feature = "grpc-server")]
+        {
+            tokio::select! {
+                _ = grpc_handle.unwrap() => {
+                    info!("gRPC service ended unexpectedly, shutting down...");
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("📨 Received shutdown signal, preparing graceful shutdown...");
+                }
+            }
+        }
 
-        info!("📨 Received shutdown signal, preparing graceful shutdown...");
+        #[cfg(not(feature = "grpc-server"))]
+        {
+            tokio::signal::ctrl_c().await?;
+            info!("📨 Received shutdown signal, preparing graceful shutdown...");
+        }
 
         Ok(())
     }
