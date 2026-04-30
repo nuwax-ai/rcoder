@@ -1178,6 +1178,18 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 // 2. 构建 meta（包含系统提示词和可能的 resume）
                 let system_prompt_meta = start_config.build_meta();
 
+                // 构建不含 resume 的 clean meta，用于 LoadSession 失败后回退到 NewSession
+                // NewSession 应该是全新会话，不应携带旧的 resume session_id
+                let new_session_meta = {
+                    let mut meta = system_prompt_meta.clone();
+                    if let Some(claude_code) = meta.get_mut("claudeCode").and_then(|v| v.as_object_mut()) {
+                        if let Some(options) = claude_code.get_mut("options").and_then(|v| v.as_object_mut()) {
+                            options.remove("resume");
+                        }
+                    }
+                    meta
+                };
+
                 // 3. 创建或加载会话
                 // 从配置获取超时值，默认 60 秒
                 let timeout_secs = start_config
@@ -1238,7 +1250,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
 
                             let new_request = NewSessionRequest::new(project_path.clone())
                                 .mcp_servers(mcp_servers.clone())
-                                .meta(system_prompt_meta);
+                                .meta(new_session_meta.clone());
 
                             debug!("new_session_request: {:?}", new_request);
 
@@ -1279,7 +1291,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
 
                             let new_request = NewSessionRequest::new(project_path.clone())
                                 .mcp_servers(mcp_servers.clone())
-                                .meta(system_prompt_meta);
+                                .meta(new_session_meta.clone());
 
                             debug!("new_session_request: {:?}", new_request);
 
