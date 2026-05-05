@@ -13,6 +13,10 @@ pub use i18n::{
 pub mod request_locale;
 pub use request_locale::{current_request_locale, scope_request_locale};
 
+// HTTP 请求提取器模块（支持 JSON body 和 Query string 两种参数方式）
+pub mod i18n_extractors;
+pub use i18n_extractors::I18nJsonOrQuery;
+
 // Chat Agent 配置模块
 mod chat_agent_config;
 pub use chat_agent_config::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
@@ -33,6 +37,10 @@ pub use constants::*;
 // 错误码定义模块
 pub mod error_codes;
 pub use error_codes::{get_error_message, get_i18n_message, get_i18n_message_default};
+
+// Validation 模块
+pub mod validation;
+pub use validation::garde_err_to_app_error;
 
 // gRPC 模块
 pub mod grpc {
@@ -111,6 +119,10 @@ pub use isolation_type::{IsolationType, IsolationTypeError};
 
 // 导出ChatPrompt的Builder
 pub use model::chat_prompt::ChatPromptBuilder;
+
+// Agent HTTP API 类型（rcoder 和 agent_runner 共用）
+pub mod agent_types;
+pub use agent_types::*;
 
 // Computer Agent HTTP API 类型
 pub mod computer_agent_types;

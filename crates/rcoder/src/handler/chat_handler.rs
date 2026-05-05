@@ -5,7 +5,7 @@
 use anyhow::Result;
 use axum::{extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
-use shared_types::{ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
+use shared_types::{AgentChatRequest, ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
@@ -14,85 +14,6 @@ use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
 use super::utils::{I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers, build_workspace_path};
-
-/// 用户请求结构 - 支持多媒体内容
-#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
-pub struct ChatRequest {
-    /// 用户输入的 prompt
-    #[schema(example = "帮我写一个 Rust 的 Hello World 程序")]
-    pub prompt: String,
-    /// 可选的项目 ID
-    #[schema(example = "test_project")]
-    pub project_id: Option<String>,
-    /// 可选的会话 ID，如果不提供则创建新会话
-    #[schema(example = "session456")]
-    pub session_id: Option<String>,
-    /// 可选的附件列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<Attachment>,
-    /// 数据源附件列表 - 用于AI开发时获取外部数据源信息（如API接口、数据库等）
-    /// 直接传递 JSON 字符串数组，简化使用方式
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub data_source_attachments: Vec<String>,
-    /// 模型配置
-    #[schema(
-        example = json!({
-            "id": "openai_gpt4",
-            "name": "openai",
-            "base_url": "https://api.openai.com/v1",
-            "api_key": "sk-...",
-            "requires_openai_auth": true,
-            "default_model": "gpt-4",
-            "api_protocol": "openai"
-        })
-    )]
-    pub model_provider: Option<ModelProviderConfig>,
-    /// 可选的请求ID，如果不提供则自动生成，用于标识和追踪请求
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "req_123456789")]
-    pub request_id: Option<String>,
-
-    // === 新增字段 (v2) ===
-    /// 可选的系统提示词，覆盖默认配置
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "你是一个专业的 Rust 开发者")]
-    pub system_prompt: Option<String>,
-
-    /// 可选的用户提示词模板，支持 {user_prompt} 变量替换
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "请用 Rust 完成：{user_prompt}")]
-    pub user_prompt: Option<String>,
-
-    /// 可选的 Agent 运行时配置（Agent 服务器 + MCP 服务器）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_config: Option<ChatAgentConfig>,
-
-    // === 新增字段 (v3 - 隔离类型支持) ===
-    /// 容器唯一标识，若传值则使用此 ID 标识容器，实现容器复用
-    /// 若不传则使用 project_id 作为容器标识（保持原有逻辑）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "pod_tenant_123")]
-    pub pod_id: Option<String>,
-
-    /// 租户 ID，用于多租户场景下的数据隔离
-    /// 当 pod_id 有值时，此字段必须非空
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "tenant_abc")]
-    pub tenant_id: Option<String>,
-
-    /// 空间 ID，用于区分租户下的不同空间
-    /// 当 pod_id 有值时，此字段必须非空
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "space_xyz")]
-    pub space_id: Option<String>,
-
-    /// 隔离类型，控制容器共享粒度和数据目录结构
-    /// 可选值：tenant（租户隔离）、space（空间隔离）、project（项目隔离，默认）
-    /// 当 pod_id 有值时，此字段必须非空
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "tenant")]
-    pub isolation_type: Option<String>,
-}
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
 ///
@@ -109,7 +30,7 @@ pub struct ChatRequest {
     post,
     path = "/chat",
     request_body(
-        content = ChatRequest,
+        content = AgentChatRequest,
         description = "聊天请求，包含用户输入的 prompt 和可选的多媒体附件",
         content_type = "application/json"
     ),
@@ -157,7 +78,7 @@ pub struct ChatRequest {
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJsonOrQuery(mut request): I18nJsonOrQuery<ChatRequest>,
+    I18nJsonOrQuery(mut request): I18nJsonOrQuery<AgentChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
@@ -473,7 +394,7 @@ pub async fn handle_chat(
 ///
 /// 🎯 使用 gRPC Chat RPC 替代 HTTP 转发（使用全局连接池）
 async fn forward_request_to_container_service(
-    request: &ChatRequest,
+    request: &AgentChatRequest,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
     locale: &'static str,

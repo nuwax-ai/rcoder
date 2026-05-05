@@ -1,5 +1,5 @@
 # RCoder Makefile
-# 包含子模块: docker, dev, k8s, test, pyroscope
+# 包含子模块: docker, dev, k8s, test, pyroscope, agent-runner
 
 # Phony targets
 .PHONY: help \
@@ -13,6 +13,7 @@
 	test test-unit test-integration test-all test-blocking \
 	test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu \
 	pyroscope-up pyroscope-down pyroscope-logs \
+	agent-runner-up agent-runner-down agent-runner-logs agent-runner-restart agent-runner-status \
 	k8s-offline-bundle k8s-offline-import k8s-offline-images-list k8s-offline-clean
 
 # 包含子 Makefile
@@ -23,6 +24,7 @@ include make/k8s.mk
 include make/k8s-offline.mk
 include make/test.mk
 include make/pyroscope.mk
+include make/agent-runner.mk
 
 # 本地编译（仅编译，不构建镜像）
 build:
@@ -99,6 +101,12 @@ help:
 	@echo "  make pyroscope-up   - 启动 Pyroscope Server"
 	@echo "  make pyroscope-down - 停止 Pyroscope Server"
 	@echo "  make pyroscope-logs - 查看 Pyroscope 日志"
+	@echo ""
+	@echo "🚀 agent_runner 本地服务:"
+	@echo "  make agent-runner-up        - 启动 agent_runner HTTP server（前台运行）"
+	@echo "  make agent-runner-logs      - 查看日志"
+	@echo ""
+	@echo "  变量: AGENT_RUNNER_PORT=8086 AGENT_RUNNER_GRPC=yes AGENT_RUNNER_PROJECTS_DIR=./project_workspace"
 	@echo ""
 	@echo "🧪 测试命令："
 	@echo "  make test           - 运行所有测试"

@@ -4,75 +4,40 @@
 
 use axum::extract::State;
 use axum::http::HeaderMap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
-use utoipa::{IntoParams, ToSchema};
+use utoipa::ToSchema;
 
 use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;
-use shared_types::{AppError, ComputerAgentCancelRequest, HttpResult};
+use shared_types::{AppError, AgentCancelRequest, AgentCancelResponse, ComputerAgentCancelRequest, HttpResult};
 
 use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
 
-/// 取消任务的请求参数
-#[derive(Debug, Deserialize, IntoParams, ToSchema)]
-pub struct CancelQuery {
-    /// 项目ID，用于标识特定的项目
-    #[param(example = "test_project")]
-    pub project_id: String,
-    /// 会话ID，用于标识要取消的会话（可选，如果不提供则取消该项目的所有会话）
-    #[param(example = "session456")]
-    #[serde(default)]
-    pub session_id: Option<String>,
-    /// Pod ID，用于共享容器模式下的容器定位（可选）
-    #[param(example = "pod_abc123")]
-    #[serde(default)]
-    pub pod_id: Option<String>,
-    /// 租户ID（可选）
-    #[param(example = "tenant_001")]
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// 空间ID（可选）
-    #[param(example = "space_001")]
-    #[serde(default)]
-    pub space_id: Option<String>,
-    /// 隔离类型（可选），如 "project", "tenant", "space"
-    #[param(example = "project")]
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
-
-/// Computer Agent 取消任务的查询参数
-#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+/// Computer Agent 取消任务的查询参数（仅用于测试）
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ComputerCancelQuery {
     /// 用户ID，用于标识特定的用户容器（ComputerAgentRunner模式，可与 pod_id 二选一）
-    #[param(example = "user_123")]
     #[schema(example = "user_123")]
     pub user_id: Option<String>,
     /// 项目ID，必填，用于标识要取消的特定项目的 agent
-    #[param(example = "project456")]
     #[schema(example = "project456")]
     pub project_id: String,
     /// 会话ID，用于标识要取消的会话（可选）
-    #[param(example = "session789")]
     #[serde(default)]
     #[schema(example = "session789")]
     pub session_id: Option<String>,
     /// Pod ID，用于共享容器模式下的容器定位（可选）
-    #[param(example = "pod_abc123")]
     #[serde(default)]
     pub pod_id: Option<String>,
     /// 租户ID（可选）
-    #[param(example = "tenant_001")]
     #[serde(default)]
     pub tenant_id: Option<String>,
     /// 空间ID（可选）
-    #[param(example = "space_001")]
     #[serde(default)]
     pub space_id: Option<String>,
     /// 隔离类型（可选），如 "project", "tenant", "space"
-    #[param(example = "project")]
     #[serde(default)]
     pub isolation_type: Option<String>,
 }
@@ -86,17 +51,6 @@ enum CancelIdentifier {
     User(String),
     /// 共享容器模式：使用 pod_id
     Pod(String),
-}
-
-/// 取消任务的响应
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CancelResponse {
-    /// 取消操作是否成功
-    #[schema(example = true)]
-    pub success: bool,
-    /// 被取消的会话ID
-    #[schema(example = "session456")]
-    pub session_id: String,
 }
 
 /// 统一的容器查询函数 - 通过 DuckDB 查询
@@ -159,7 +113,7 @@ async fn forward_cancel_request_to_container_service(
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
     locale: &'static str,
-) -> Result<HttpResult<CancelResponse>, AppError> {
+) -> Result<HttpResult<AgentCancelResponse>, AppError> {
     let session_id_display = session_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| "None".to_string());
@@ -197,7 +151,7 @@ async fn forward_cancel_request_to_container_service(
                     "✅ [CANCEL_FORWARD] gRPC cancel succeeded: session_id={}",
                     session_id_str
                 );
-                Ok(HttpResult::success(CancelResponse {
+                Ok(HttpResult::success(AgentCancelResponse {
                     success: true,
                     session_id: session_id_str,
                 }))
@@ -222,7 +176,7 @@ async fn forward_cancel_request_to_container_service(
                     Code::NotFound => {
                         // 会话或 Agent 不存在，返回成功（幂等设计）
                         info!("[CANCEL_FORWARD] Session not found, cancel succeeded");
-                        return Ok(HttpResult::success(CancelResponse {
+                        return Ok(HttpResult::success(AgentCancelResponse {
                             success: true,
                             session_id: session_id.unwrap_or("").to_string(),
                         }));
@@ -237,7 +191,7 @@ async fn forward_cancel_request_to_container_service(
                             info!(
                                 "[CANCEL_FORWARD] container already destroyed, cancel request already completed"
                             );
-                            return Ok(HttpResult::success(CancelResponse {
+                            return Ok(HttpResult::success(AgentCancelResponse {
                                 success: true,
                                 session_id: session_id.unwrap_or("").to_string(),
                             }));
@@ -346,7 +300,7 @@ async fn handle_session_cancel_internal_v2(
     project_id: String,         // 必填：传递给 agent_runner 的项目ID
     session_id: Option<String>, // 可选：会话ID
     locale: &'static str,
-) -> Result<HttpResult<CancelResponse>, AppError> {
+) -> Result<HttpResult<AgentCancelResponse>, AppError> {
     let session_id_display = session_id
         .as_deref()
         .map(|s| s.to_string())
@@ -372,7 +326,7 @@ async fn handle_session_cancel_internal_v2(
             "✅ [CANCEL_FORWARD_V2] Container not found, cancel target already achieved: {}",
             identifier_display
         );
-        return Ok(HttpResult::success(CancelResponse {
+        return Ok(HttpResult::success(AgentCancelResponse {
             success: true,
             session_id: session_id.unwrap_or_else(|| "all".to_string()),
         }));
@@ -412,12 +366,12 @@ async fn handle_session_cancel_internal_v2(
 #[utoipa::path(
     post,
     path = "/agent/session/cancel",
-    request_body = CancelQuery,
+    request_body = AgentCancelRequest,
     responses(
         (
             status = 200,
             description = "成功转发取消请求到容器",
-            body = HttpResult<CancelResponse>,
+            body = HttpResult<AgentCancelResponse>,
             example = json!({
                 "success": true,
                 "data": {
@@ -477,19 +431,27 @@ async fn handle_session_cancel_internal_v2(
     summary = "转发Agent任务取消请求（gRPC）",
     description = "将取消请求通过 gRPC 转发到容器内的 agent_runner 服务"
 )]
-#[instrument(skip(state), fields(project_id = %request.project_id))]
+#[instrument(skip(state))]
 pub async fn agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJsonOrQuery(request): I18nJsonOrQuery<CancelQuery>,
-) -> Result<HttpResult<CancelResponse>, AppError> {
+    I18nJsonOrQuery(request): I18nJsonOrQuery<AgentCancelRequest>,
+) -> Result<HttpResult<AgentCancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
-    // 使用新的 v2 版本，保持向后兼容
-    let project_id = request.project_id.clone();
+
+    // 使用 garde 进行字段校验
+    let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
+    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+
+    info!(
+        "🚫 [CANCEL] Agent cancel request: project_id={}, session_id={:?}",
+        project_id, request.session_id
+    );
+
     handle_session_cancel_internal_v2(
         &state,
-        CancelIdentifier::Project(project_id.clone()),
-        project_id,
+        CancelIdentifier::Project(project_id.to_string()),
+        project_id.to_string(),
         request.session_id,
         locale,
     )
@@ -507,7 +469,7 @@ pub async fn agent_session_cancel(
         (
             status = 200,
             description = "成功转发取消请求到容器",
-            body = HttpResult<CancelResponse>,
+            body = HttpResult<AgentCancelResponse>,
             example = json!({
                 "success": true,
                 "data": {
@@ -572,7 +534,7 @@ pub async fn computer_agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerAgentCancelRequest>,
-) -> Result<HttpResult<CancelResponse>, AppError> {
+) -> Result<HttpResult<AgentCancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
 
     // 验证 user_id 或 pod_id 至少有一个

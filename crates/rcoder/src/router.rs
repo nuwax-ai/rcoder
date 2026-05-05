@@ -357,10 +357,10 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         schemas(
             // 响应结构体
             handler::HealthResponse,
-            handler::ChatRequest,
+            shared_types::AgentChatRequest,
             shared_types::ChatResponse,
-            handler::StopAgentResponse,
-            handler::CancelResponse,
+            shared_types::AgentStopResponse,
+            shared_types::AgentCancelResponse,
             // 移除 SessionUpdateEvent，因为现在使用 ProxyRedirectResponse
             handler::ProxyErrorResponse,
             // 模型配置相关结构体

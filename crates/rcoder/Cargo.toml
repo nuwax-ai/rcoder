@@ -64,6 +64,9 @@ serde_json = { workspace = true }
 serde_yaml = "=0.9.33"
 serde_urlencoded = "0.7"
 
+# Validation
+garde = { version = "0.22.1", features = ["derive"] }
+
 derive_builder = { workspace = true }
 
 # Workspace dependencies

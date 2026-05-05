@@ -4,58 +4,20 @@
 
 use axum::extract::State;
 use axum::http::HeaderMap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info, instrument};
-use utoipa::{IntoParams, ToSchema};
 
 use super::utils::{I18nJsonOrQuery, get_locale_from_headers};
 use crate::{AppError, HttpResult, router::AppState};
-
-/// 停止Agent请求参数
-#[derive(Debug, Deserialize, ToSchema, IntoParams)]
-pub struct StopAgentQuery {
-    /// 项目ID
-    #[param(example = "test_project")]
-    pub project_id: String,
-    /// Pod ID，用于共享容器模式下的容器定位（可选）
-    #[param(example = "pod_abc123")]
-    #[serde(default)]
-    pub pod_id: Option<String>,
-    /// 租户ID（可选）
-    #[param(example = "tenant_001")]
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// 空间ID（可选）
-    #[param(example = "space_001")]
-    #[serde(default)]
-    pub space_id: Option<String>,
-    /// 隔离类型（可选），如 "project", "tenant", "space"
-    #[param(example = "project")]
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
-
-/// 停止Agent响应
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct StopAgentResponse {
-    /// 是否成功停止
-    pub success: bool,
-    /// 项目ID
-    #[schema(example = "test_project")]
-    pub project_id: String,
-    /// 会话ID（如果存在）
-    pub session_id: Option<String>,
-    /// 消息
-    pub message: String,
-}
+use shared_types::{AgentStopRequest, AgentStopResponse};
 
 /// 直接销毁指定项目对应的容器
 async fn destroy_container_for_project(
     state: &Arc<AppState>,
     project_id: &str,
     locale: &'static str,
-) -> Result<HttpResult<StopAgentResponse>, AppError> {
+) -> Result<HttpResult<AgentStopResponse>, AppError> {
     info!(
         "[STOP_DESTROY] startingdestroycontainer: project_id={}",
         project_id
@@ -107,7 +69,7 @@ async fn destroy_container_for_project(
             project_id, container_info.container_id, container_info.container_name
         );
 
-        let response = StopAgentResponse {
+        let response = AgentStopResponse {
             success: true,
             project_id: project_id.to_string(),
             session_id: None,
@@ -122,7 +84,7 @@ async fn destroy_container_for_project(
             project_id
         );
 
-        let response = StopAgentResponse {
+        let response = AgentStopResponse {
             success: true,
             project_id: project_id.to_string(),
             session_id: None,
@@ -139,12 +101,12 @@ async fn destroy_container_for_project(
 #[utoipa::path(
     post,
     path = "/agent/stop",
-    request_body = StopAgentQuery,
+    request_body = AgentStopRequest,
     responses(
         (
             status = 200,
             description = "成功销毁容器",
-            body = HttpResult<StopAgentResponse>,
+            body = HttpResult<AgentStopResponse>,
             example = json!({
                 "success": true,
                 "data": {
@@ -159,7 +121,7 @@ async fn destroy_container_for_project(
         (
             status = 200,
             description = "容器不存在但返回成功",
-            body = HttpResult<StopAgentResponse>,
+            body = HttpResult<AgentStopResponse>,
             example = json!({
                 "success": true,
                 "data": {
@@ -213,17 +175,13 @@ async fn destroy_container_for_project(
 pub async fn agent_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJsonOrQuery(request): I18nJsonOrQuery<StopAgentQuery>,
-) -> Result<HttpResult<StopAgentResponse>, AppError> {
+    I18nJsonOrQuery(request): I18nJsonOrQuery<AgentStopRequest>,
+) -> Result<HttpResult<AgentStopResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
-    let project_id = request.project_id.trim();
 
-    if project_id.is_empty() {
-        return Ok(HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_INVALID_PARAMS,
-            locale,
-        ));
-    }
+    // 使用 garde 进行字段校验
+    let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
+    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
 
     info!(
         "🛑 [STOP_DESTROY] Received container destroy request: project_id={}",

@@ -2,11 +2,7 @@
 //!
 //! 处理 POST /computer/chat 请求
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-};
+use axum::{extract::State, http::HeaderMap, Json};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -16,7 +12,7 @@ use crate::service::chat_handler::{ChatHandlerContext, ChatHandlerInput, handle_
 use crate::service::{SESSION_CACHE, SessionData};
 use dashmap::mapref::entry::Entry;
 use shared_types::{
-    ChatResponse, ComputerChatRequest, HttpResult, ServiceType,
+    ChatResponse, ComputerChatRequest, HttpResult, I18nJsonOrQuery, ServiceType,
     error_codes::ERR_INTERNAL_SERVER_ERROR, error_codes::ERR_VALIDATION, get_i18n_message,
 };
 
@@ -39,8 +35,8 @@ use super::locale_from_headers;
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<ComputerChatRequest>,
-) -> Result<Json<HttpResult<ChatResponse>>, (StatusCode, Json<HttpResult<ChatResponse>>)> {
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerChatRequest>,
+) -> Result<Json<HttpResult<ChatResponse>>, shared_types::AppError> {
     let locale = locale_from_headers(&headers);
     info!(
         "📨 [HTTP] Received Computer Chat request:\n\
@@ -49,6 +45,10 @@ pub async fn handle_computer_chat(
          ├─ session_id: {:?}\n\
          ├─ request_id: {:?}\n\
          ├─ prompt ({}chars): {:?}\n\
+         ├─ pod_id: {:?}\n\
+         ├─ tenant_id: {:?}\n\
+         ├─ space_id: {:?}\n\
+         ├─ isolation_type: {:?}\n\
          ├─ attachments: {:?}\n\
          ├─ data_source_attachments: {:?}\n\
          ├─ model_provider: {:#?}\n\
@@ -61,6 +61,10 @@ pub async fn handle_computer_chat(
         request.request_id,
         request.prompt.len(),
         request.prompt,
+        request.pod_id,
+        request.tenant_id,
+        request.space_id,
+        request.isolation_type,
         request.attachments,
         request.data_source_attachments,
         request.model_provider,
@@ -73,13 +77,9 @@ pub async fn handle_computer_chat(
     if request.user_id.is_empty() {
         let error_msg = get_i18n_message("error.user_id_required", locale);
         error!("[HTTP] {}", error_msg);
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(HttpResult::error_with_message(
-                ERR_VALIDATION,
-                locale,
-                &error_msg,
-            )),
+        return Err(shared_types::AppError::with_i18n_key(
+            ERR_VALIDATION,
+            &error_msg,
         ));
     }
 
@@ -108,13 +108,9 @@ pub async fn handle_computer_chat(
             e
         );
         error!("[HTTP] {}", error_msg);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(HttpResult::error_with_message(
-                ERR_INTERNAL_SERVER_ERROR,
-                locale,
-                &error_msg,
-            )),
+        return Err(shared_types::AppError::with_message(
+            ERR_INTERNAL_SERVER_ERROR,
+            &error_msg,
         ));
     }
 

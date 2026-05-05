@@ -104,6 +104,7 @@ dependencies = [
  "derive_builder",
  "futures 0.3.32",
  "futures-util",
+ "garde",
  "nix 0.31.2",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -940,6 +941,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1111,6 +1121,20 @@ dependencies = [
  "crossterm",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b79c4069c6cad78e2e0cdfcbd26275770669fb39fd308a752dc110e83b9af32"
+dependencies = [
+ "castaway",
+ "cfg-if 1.0.4",
+ "itoa",
+ "rustversion",
+ "ryu",
+ "static_assertions",
 ]
 
 [[package]]
@@ -2008,6 +2032,28 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "garde"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a74b56a4039a46e8c91cc9d84e8a7df4e1f8b24239ca57d1304b3263cb599b9"
+dependencies = [
+ "compact_str",
+ "garde_derive",
+ "smallvec",
+]
+
+[[package]]
+name = "garde_derive"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7224c08ec489e2840af29ed882b47f7f6ac8f4ce15c275d9fc0d6d1b94578ae6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4750,6 +4796,7 @@ dependencies = [
  "filetime",
  "futures 0.3.32",
  "futures-util",
+ "garde",
  "hyper",
  "hyper-util",
  "md5",
@@ -5758,6 +5805,7 @@ dependencies = [
  "derive_builder",
  "futures 0.3.32",
  "futures-util",
+ "garde",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost 0.14.3",
@@ -5767,6 +5815,7 @@ dependencies = [
  "sacp",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

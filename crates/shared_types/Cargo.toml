@@ -34,6 +34,9 @@ tokio-util = { workspace = true }
 
 thiserror = { workspace = true }
 
+# Validation
+garde = { version = "0.22.1", features = ["derive"] }
+
 base64 = { workspace = true }
 
 derive_builder = { workspace = true }
@@ -56,6 +59,9 @@ arc-swap = "1.8"
 
 # i18n (国际化)
 rust-i18n = { workspace = true }
+
+# URL query string 解析
+serde_urlencoded = "0.7"
 
 
 # HTTP server

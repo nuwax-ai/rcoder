@@ -232,7 +232,7 @@ pub struct PodListResponse {
 // ============================================================================
 
 /// 启动容器请求
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct EnsurePodRequest {
     /// 用户唯一标识符 (必填)
     #[schema(example = "user_123")]
@@ -314,7 +314,7 @@ pub struct PodContainerInfo {
 // ============================================================================
 
 /// 容器保活请求
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct KeepalivePodRequest {
     /// 用户唯一标识符
     #[schema(example = "user_123")]
@@ -388,7 +388,7 @@ pub struct KeepalivePodResponse {
 // ============================================================================
 
 /// 重启容器请求
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct RestartPodRequest {
     /// 用户唯一标识符 (必填)
     #[schema(example = "user_123")]

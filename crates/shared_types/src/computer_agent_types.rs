@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
+use garde::Validate;
 
 use crate::{Attachment, ChatAgentConfig, ModelProviderConfig};
 
@@ -88,32 +89,40 @@ pub struct ComputerChatRequest {
 }
 
 /// Computer Agent 状态查询请求
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, ToSchema)]
 pub struct ComputerAgentStatusRequest {
     /// 用户 ID（可与 pod_id 二选一）
+    #[garde(skip)]
+    #[serde(default)]
     #[schema(example = "user_123")]
     pub user_id: Option<String>,
 
     /// 项目 ID（必填）
+    #[garde(required, length(min = 1))]
+    #[serde(default)]
     #[schema(example = "project_456")]
-    pub project_id: String,
+    pub project_id: Option<String>,
 
     /// Pod ID，用于共享容器模式下的容器定位（可与 user_id 二选一）
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
 
     /// 租户ID（可选）
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "tenant_001")]
     pub tenant_id: Option<String>,
 
     /// 空间ID（可选）
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "space_001")]
     pub space_id: Option<String>,
 
     /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
@@ -170,37 +179,46 @@ impl ComputerAgentStatusResponse {
 }
 
 /// Computer Agent 停止请求
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, ToSchema)]
 pub struct ComputerAgentStopRequest {
     /// 用户 ID（可与 pod_id 二选一）
+    #[garde(skip)]
+    #[serde(default)]
     #[schema(example = "user_123")]
     pub user_id: Option<String>,
 
     /// 项目 ID（必填）
+    #[garde(required, length(min = 1))]
+    #[serde(default)]
     #[schema(example = "project_456")]
-    pub project_id: String,
+    pub project_id: Option<String>,
 
     /// 可选的会话 ID
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "session789")]
     pub session_id: Option<String>,
 
     /// Pod ID，用于共享容器模式下的容器定位（可与 user_id 二选一）
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
 
     /// 租户ID（可选）
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "tenant_001")]
     pub tenant_id: Option<String>,
 
     /// 空间ID（可选）
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "space_001")]
     pub space_id: Option<String>,
 
     /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "project")]
     pub isolation_type: Option<String>,

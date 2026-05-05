@@ -2,11 +2,7 @@
 //!
 //! 处理 POST /computer/agent/stop 请求
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-};
+use axum::{extract::State, http::HeaderMap, Json};
 use sacp::schema::{CancelNotification, SessionId};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -16,7 +12,7 @@ use crate::CancelNotificationRequestWrapper;
 use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
 use shared_types::{
-    ComputerAgentStopRequest, ComputerAgentStopResponse, HttpResult,
+    ComputerAgentStopRequest, ComputerAgentStopResponse, HttpResult, I18nJsonOrQuery,
     error_codes::{ERR_VALIDATION, SUCCESS},
     get_error_message, get_i18n_message,
 };
@@ -41,47 +37,38 @@ use super::locale_from_headers;
 pub async fn handle_computer_stop(
     State(_state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<ComputerAgentStopRequest>,
-) -> Result<Json<HttpResult<ComputerAgentStopResponse>>, (StatusCode, Json<HttpResult<String>>)> {
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerAgentStopRequest>,
+) -> Result<Json<HttpResult<ComputerAgentStopResponse>>, shared_types::AppError> {
     let locale = locale_from_headers(&headers);
+
+    // 使用 garde 进行字段校验
+    let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
+    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+
+    // 验证 user_id 或 project_id 至少有一个
+    let user_id_empty = request.user_id.as_ref().map_or(true, |s| s.is_empty());
+    if user_id_empty && project_id.is_empty() {
+        return Err(shared_types::AppError::with_i18n_key(
+            ERR_VALIDATION,
+            &get_i18n_message("error.user_id_or_project_id_required", locale),
+        ));
+    }
+
     info!(
-        "🛑 [HTTP] Computer Agent 停止请求: user_id={:?}, project_id={}",
-        request.user_id, request.project_id
+        "🛑 [HTTP] Computer Agent 停止请求: user_id={:?}, project_id={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}",
+        request.user_id, project_id, request.pod_id, request.tenant_id, request.space_id, request.isolation_type
     );
 
-    // 1. 验证必填字段
-    if request.user_id.as_ref().map_or(true, |s| s.is_empty()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(HttpResult::error_with_message(
-                ERR_VALIDATION,
-                locale,
-                &get_i18n_message("error.user_id_required", locale),
-            )),
-        ));
-    }
-
-    if request.project_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(HttpResult::error_with_message(
-                ERR_VALIDATION,
-                locale,
-                &get_i18n_message("error.project_id_required", locale),
-            )),
-        ));
-    }
-
-    // 2. 获取 Agent 信息并发送取消信号
+    // 获取 Agent 信息并发送取消信号
     let (success, message) =
-        if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&request.project_id) {
+        if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(project_id) {
             let session_id = agent_info.session_id.to_string();
             let cancel_tx = agent_info.cancel_tx.clone();
 
             // 释放读锁
             drop(agent_info);
 
-            // 3. 发送取消信号（如果 channel 仍然打开）
+            // 发送取消信号（如果 channel 仍然打开）
             if !cancel_tx.is_closed() {
                 let session_id_obj = SessionId::new(Arc::from(session_id.as_str()));
                 let cancel_notification = CancelNotification::new(session_id_obj);
@@ -105,19 +92,19 @@ pub async fn handle_computer_stop(
                 }
             }
 
-            // 4. 从 AGENT_REGISTRY 移除 Agent
+            // 从 AGENT_REGISTRY 移除 Agent
             let removed = AGENT_REGISTRY
-                .remove_by_project(&request.project_id)
+                .remove_by_project(project_id)
                 .is_some();
 
             if removed {
-                info!("[HTTP] Agent stopped: project_id={}", request.project_id);
+                info!("[HTTP] Agent stopped: project_id={}", project_id);
                 (true, get_error_message(SUCCESS, locale))
             } else {
                 // 可能在取消期间已被清理
                 info!(
                     "ℹ️  [HTTP] Agent already cleaned up: project_id={}",
-                    request.project_id
+                    project_id
                 );
                 (
                     true,
@@ -128,7 +115,7 @@ pub async fn handle_computer_stop(
             // Agent 不存在,幂等返回成功
             info!(
                 "ℹ️  [HTTP] Agent not found, returning success idempotently: project_id={}",
-                request.project_id
+                project_id
             );
             (
                 true,
@@ -141,7 +128,7 @@ pub async fn handle_computer_stop(
         message,
         user_id: request.user_id.clone(),
         pod_id: None,
-        project_id: request.project_id.clone(),
+        project_id: project_id.to_string(),
     };
 
     Ok(Json(HttpResult::success(response)))

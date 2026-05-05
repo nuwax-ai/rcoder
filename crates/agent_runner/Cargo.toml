@@ -105,6 +105,9 @@ path-clean = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 
+# Validation
+garde = { version = "0.22.1", features = ["derive"] }
+
 ringbuf = { workspace = true }
 
 # Atomic swap for sender replacement

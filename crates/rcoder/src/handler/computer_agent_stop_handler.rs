@@ -70,7 +70,7 @@ use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
     summary = "停止 Computer Agent",
     description = "停止特定 project_id 的 Agent，不销毁容器"
 )]
-#[instrument(skip(state), fields(user_id = ?request.user_id.as_ref().map(|s| s.as_str()), project_id = %request.project_id, pod_id = ?request.pod_id.as_ref().map(|s| s.as_str())))]
+#[instrument(skip(state))]
 pub async fn computer_agent_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -78,6 +78,10 @@ pub async fn computer_agent_stop(
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
+
+    // 使用 garde 进行字段校验
+    let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
+    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
 
     // 1. 验证参数：user_id 或 pod_id 至少有一个
     let has_user_id = request.user_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
@@ -90,17 +94,8 @@ pub async fn computer_agent_stop(
         ));
     }
 
-    if request.project_id.trim().is_empty() {
-        error!("[COMPUTER_STOP] project_id is required");
-        return Ok(HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_VALIDATION,
-            locale,
-        ));
-    }
-
     let user_id = request.user_id.clone();
     let pod_id = request.pod_id.clone();
-    let project_id = request.project_id.clone();
 
     info!(
         "🛑 [COMPUTER_STOP] Starting to stop Agent: user_id={:?}, pod_id={:?}, project_id={}, session_id={:?}",
@@ -146,7 +141,7 @@ pub async fn computer_agent_stop(
     match crate::grpc::grpc_stop_agent_with_pool(
         &state.grpc_pool,
         &grpc_addr,
-        project_id.clone(),
+        project_id.to_string(),
         request
             .session_id
             .clone()
@@ -175,7 +170,7 @@ pub async fn computer_agent_stop(
                     message,
                     user_id: user_id.clone(),
                     pod_id: pod_id.clone(),
-                    project_id: project_id.clone(),
+                    project_id: project_id.to_string(),
                 };
 
                 info!(
@@ -211,7 +206,7 @@ pub async fn computer_agent_stop(
                             message,
                             user_id: user_id.clone(),
                             pod_id: pod_id.clone(),
-                            project_id: project_id.clone(),
+                            project_id: project_id.to_string(),
                         };
                         return Ok(HttpResult::success(stop_response));
                     }
