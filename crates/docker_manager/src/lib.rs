@@ -227,6 +227,13 @@ pub mod global {
     pub async fn init_global_docker_manager_with_config(
         config: DockerManagerConfig,
     ) -> DockerResult<()> {
+        // Initialize RuntimeManager so RUNTIME_INSTANCE is set
+        // This allows RuntimeManager::get() to work in docker compose mode
+        crate::runtime::RuntimeManager::init(config.clone())
+            .await
+            .map_err(|e| DockerError::ConfigurationError(e.to_string()))?;
+        info!("Runtime initialized with config");
+
         let manager = Arc::new(DockerManager::new(config).await?);
         GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
             DockerError::IoError(std::io::Error::new(
