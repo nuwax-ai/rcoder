@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    Json,
 };
 
 use crate::{
@@ -16,7 +15,7 @@ use crate::{
         RcoderAgentCancelRequest, RcoderAgentCancelResponse, RcoderAgentStopRequest,
         RcoderAgentStopResponse,
     },
-    AgentStatusResponse, ChatResponse, HttpResult, RcoderChatRequest,
+    AgentStatusResponse, ChatResponse, HttpResult, I18nJsonOrQuery, RcoderChatRequest,
 };
 
 /// 通用 Chat handler（适用于 POST /chat）
@@ -35,9 +34,9 @@ use crate::{
 )]
 pub async fn handle_chat<S: AgentHttpService>(
     State(service): State<Arc<S>>,
-    Json(request): Json<RcoderChatRequest>,
-) -> Json<HttpResult<ChatResponse>> {
-    Json(service.chat(request).await)
+    I18nJsonOrQuery(request): I18nJsonOrQuery<RcoderChatRequest>,
+) -> Result<axum::Json<HttpResult<ChatResponse>>, crate::AppError> {
+    Ok(axum::Json(service.chat(request).await))
 }
 
 /// 通用 Status handler（适用于 GET /agent/status/{project_id}）
@@ -57,8 +56,8 @@ pub async fn handle_chat<S: AgentHttpService>(
 pub async fn handle_status<S: AgentHttpService>(
     State(service): State<Arc<S>>,
     Path(project_id): Path<String>,
-) -> Json<HttpResult<AgentStatusResponse>> {
-    Json(service.get_status(&project_id).await)
+) -> axum::Json<HttpResult<AgentStatusResponse>> {
+    axum::Json(service.get_status(&project_id).await)
 }
 
 /// 通用 Stop handler（适用于 POST /agent/stop）
@@ -75,9 +74,9 @@ pub async fn handle_status<S: AgentHttpService>(
 )]
 pub async fn handle_stop<S: AgentHttpService>(
     State(service): State<Arc<S>>,
-    Json(request): Json<RcoderAgentStopRequest>,
-) -> Json<HttpResult<RcoderAgentStopResponse>> {
-    Json(service.stop(request).await)
+    I18nJsonOrQuery(request): I18nJsonOrQuery<RcoderAgentStopRequest>,
+) -> Result<axum::Json<HttpResult<RcoderAgentStopResponse>>, crate::AppError> {
+    Ok(axum::Json(service.stop(request).await))
 }
 
 /// 通用 Cancel handler（适用于 POST /agent/session/cancel）
@@ -97,7 +96,7 @@ pub async fn handle_stop<S: AgentHttpService>(
 )]
 pub async fn handle_cancel<S: AgentHttpService>(
     State(service): State<Arc<S>>,
-    Json(request): Json<RcoderAgentCancelRequest>,
-) -> Json<HttpResult<RcoderAgentCancelResponse>> {
-    Json(service.cancel(request).await)
+    I18nJsonOrQuery(request): I18nJsonOrQuery<RcoderAgentCancelRequest>,
+) -> Result<axum::Json<HttpResult<RcoderAgentCancelResponse>>, crate::AppError> {
+    Ok(axum::Json(service.cancel(request).await))
 }
