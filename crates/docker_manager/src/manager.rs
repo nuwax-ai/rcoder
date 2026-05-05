@@ -863,12 +863,35 @@ impl DockerManager {
                     (ContainerStatus::Unknown("no state".to_string()), false)
                 };
 
+                // 🔧 获取容器 IP（用于 gRPC 连接）
+                let container_ip = match self
+                    .get_container_network_info(&container_id)
+                    .await
+                {
+                    Ok(network_ips) => {
+                        let network_name = self.get_main_network_name().await;
+                        network_ips
+                            .get(&network_name)
+                            .cloned()
+                            .or_else(|| network_ips.values().next().cloned())
+                            .unwrap_or_default()
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[REALTIME] Failed to get container IP, will retry later: container_id={}, error={}",
+                            container_id, e
+                        );
+                        String::new()
+                    }
+                };
+
                 // 🔧 使用 Arc 包装，减少 clone 开销
                 let query_result = ContainerQueryResult::new(
                     container_id.clone(),
                     container_name.clone(),
                     status,
                     is_running,
+                    container_ip,
                 );
                 let result_arc = Arc::new(query_result);
 
@@ -882,8 +905,8 @@ impl DockerManager {
                     .await;
 
                 info!(
-                    "[REALTIME] Container status query succeeded: id={}, name={}, status={:?}, running={}",
-                    container_id, container_name, result_arc.status, result_arc.is_running
+                    "[REALTIME] Container status query succeeded: id={}, name={}, status={:?}, running={}, ip={}",
+                    container_id, container_name, result_arc.status, result_arc.is_running, result_arc.container_ip
                 );
 
                 // 返回解引用后的值（因为返回类型不是 Arc）
@@ -1672,6 +1695,7 @@ impl DockerManager {
                 info.container_name.clone(),
                 info.status.clone(),
                 matches!(info.status, ContainerStatus::Running),
+                String::new(), // 缓存命中时 IP 可能已过期，依赖后续实时查询更新
             )));
         }
 
@@ -1844,6 +1868,7 @@ impl DockerManager {
                 info.container_name.clone(),
                 info.status.clone(),
                 matches!(info.status, ContainerStatus::Running),
+                String::new(), // 缓存命中时 IP 可能已过期，依赖后续实时查询更新
             )));
         }
 

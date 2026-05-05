@@ -5,6 +5,7 @@
 use crate::AppError;
 use shared_types::GRPC_DEFAULT_PORT;
 use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
+use tracing::{debug, info};
 
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
 ///
@@ -92,7 +93,29 @@ pub async fn get_realtime_container_ip_with_cache(
             cache.insert(container_name.to_string(), info.container_ip.clone());
             Ok(info.container_ip)
         }
-        Ok(_) => Ok(fallback_ip.to_string()),
+        Ok(_) => {
+            // 内存映射未命中或 IP 为空，直接通过 Runtime 的 find_container 查询容器 IP
+            // find_container 会直接调用 Docker API 获取最新的容器信息，不依赖内存映射
+            match runtime.find_container(identifier, &service_type).await {
+                Ok(Some(info)) if !info.container_ip.is_empty() => {
+                    info!(
+                        "🔍 [IP_QUERY] Got container IP via find_container: container_name={}, ip={}",
+                        container_name, info.container_ip
+                    );
+                    cache.insert(container_name.to_string(), info.container_ip.clone());
+                    Ok(info.container_ip)
+                }
+                Ok(_) => {
+                    // find_container 返回空或 IP 为空，使用 fallback
+                    info!(
+                        "⚠️ [IP_QUERY] find_container returned empty, using fallback: container_name={}",
+                        container_name
+                    );
+                    Ok(fallback_ip.to_string())
+                }
+                Err(e) => Err(format!("runtime find_container failed: {}", e)),
+            }
+        }
         Err(e) => Err(format!("failed to get container info from runtime: {}", e)),
     }
 }

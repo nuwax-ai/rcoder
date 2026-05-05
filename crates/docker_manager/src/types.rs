@@ -161,13 +161,14 @@ impl ContainerQueryResult {
         container_name: String,
         status: ContainerStatus,
         is_running: bool,
+        container_ip: String,
     ) -> Self {
         Self {
             container_id,
             container_name,
             status,
             is_running,
-            container_ip: String::new(), // 默认为空，需要后续更新
+            container_ip,
         }
     }
 
