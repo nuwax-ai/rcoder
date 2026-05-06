@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use sacp::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::{CancelNotification, SessionId};
 use shared_types::{
     agent_http_service::AgentHttpService,
     rcoder_agent_types::{

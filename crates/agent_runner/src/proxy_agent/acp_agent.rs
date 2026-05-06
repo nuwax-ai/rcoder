@@ -22,8 +22,7 @@ use shared_types::ModelProviderConfig;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-// SACP 类型导入
-use sacp::schema::SessionId;
+use agent_client_protocol::schema::SessionId;
 
 use crate::{
     agent_runtime::get_concurrency_limit,
@@ -116,12 +115,7 @@ impl AgentRequest {
     }
 }
 
-// 向后兼容类型别名（SACP 迁移）
-/// 旧名称别名，保持向后兼容
-#[deprecated(since = "0.1.0", note = "请使用 AgentRequest 代替")]
-pub type LocalSetAgentRequest = AgentRequest;
-
-/// Agent Worker 任务 (SACP 版本)
+/// Agent Worker 任务
 ///
 /// 使用标准 tokio::spawn 处理 Agent 请求队列。
 /// SACP 支持 Send trait，无需 LocalSet。

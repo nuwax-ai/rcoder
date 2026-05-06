@@ -55,8 +55,8 @@ tracing = { workspace = true }
 # 兼容性
 tokio-util = { workspace = true }
 
-# ACP 协议 - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
-sacp = { workspace = true }
+# ACP 协议 - 官方 SDK（完全 Send-safe，无需 LocalSet）
+agent-client-protocol = { workspace = true }
 
 # 跨平台命令查找
 which = { workspace = true }

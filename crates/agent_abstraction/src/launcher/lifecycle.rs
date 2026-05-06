@@ -30,8 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-// SACP 类型导入
-use sacp::schema::SessionId;
+use agent_client_protocol::schema::SessionId;
 use shared_types::{AgentLifecycle, ModelProviderConfig};
 
 /// Agent生命周期守卫

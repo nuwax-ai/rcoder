@@ -3,11 +3,7 @@ pub mod cleanup_task;
 
 use crate::CancelNotificationRequestWrapper;
 // 导出 agent_worker 相关类型和函数
-// AgentRequest 是 SACP 版本的新类型，LocalSetAgentRequest 是向后兼容别名
-#[allow(deprecated)]
-pub use acp_agent::{
-    AgentRequest, LocalSetAgentRequest, agent_worker_with_heartbeat, set_unlimited_mode,
-};
+pub use acp_agent::{AgentRequest, agent_worker_with_heartbeat, set_unlimited_mode};
 use shared_types::AgentLifecycleGuard;
 // SACP 类型导入
 #[cfg(feature = "proxy")]
@@ -15,7 +11,7 @@ use crate::config::ProxyConfig;
 use dashmap::DashMap;
 #[cfg(feature = "proxy")]
 use rcoder_proxy::{PingoraServerManager, ProxyConfig as PingoraProxyConfig};
-use sacp::schema::{PromptRequest, SessionId};
+use agent_client_protocol::schema::{PromptRequest, SessionId};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 #[cfg(feature = "proxy")]

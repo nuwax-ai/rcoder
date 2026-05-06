@@ -7,7 +7,7 @@ use axum::{
     extract::State,
     http::HeaderMap,
 };
-use sacp::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::{CancelNotification, SessionId};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{info, warn};

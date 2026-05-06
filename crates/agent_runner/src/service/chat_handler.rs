@@ -16,7 +16,7 @@ use shared_types::{
     Attachment, CancelNotificationRequestWrapper, CancelResult, ChatAgentConfig, ChatPromptBuilder,
     ModelProviderConfig, ServiceType, error_codes,
 };
-use sacp::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::{CancelNotification, SessionId};
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 

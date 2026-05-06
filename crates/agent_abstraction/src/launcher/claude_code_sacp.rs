@@ -28,14 +28,13 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-// SACP 库导入
-use sacp::schema::{
+use agent_client_protocol::schema::{
     CancelNotification, InitializeRequest, LoadSessionRequest, McpServer, McpServerStdio,
     NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionId, SessionNotification,
 };
-use sacp::{Agent, Client, ConnectionTo, Responder};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 
 use crate::acp::CancelNotificationRequestWrapper;
 use crate::traits::AgentStartConfig;
@@ -608,9 +607,9 @@ pub fn convert_context_servers_sacp(
                 server = server.args(final_args);
             }
 
-            let mut env_vars: Vec<sacp::schema::EnvVariable> = if let Some(env) = &c.env {
+            let mut env_vars: Vec<agent_client_protocol::schema::EnvVariable> = if let Some(env) = &c.env {
                 env.iter()
-                    .map(|(k, v)| sacp::schema::EnvVariable::new(k.clone(), v.clone()))
+                    .map(|(k, v)| agent_client_protocol::schema::EnvVariable::new(k.clone(), v.clone()))
                     .collect()
             } else {
                 Vec::new()
@@ -622,7 +621,7 @@ pub fn convert_context_servers_sacp(
                     .iter()
                     .any(|e| e.name == "DBUS_SESSION_BUS_ADDRESS")
                 {
-                    env_vars.push(sacp::schema::EnvVariable::new(
+                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                         "DBUS_SESSION_BUS_ADDRESS".to_string(),
                         addr.clone(),
                     ));
@@ -632,7 +631,7 @@ pub fn convert_context_servers_sacp(
             // 注入镜像源环境变量（npx/bunx/uvx 子进程使用）
             for (key, val) in crate::mirror_env::collect_mirror_env_vars() {
                 if !env_vars.iter().any(|e| e.name == key) {
-                    env_vars.push(sacp::schema::EnvVariable::new(key, val));
+                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(key, val));
                 }
             }
 
@@ -643,7 +642,7 @@ pub fn convert_context_servers_sacp(
             if !env_vars.iter().any(|e| e.name == "PATH") {
                 let path_value = build_mcp_server_path_env();
                 if !path_value.is_empty() {
-                    env_vars.push(sacp::schema::EnvVariable::new(
+                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                         "PATH".to_string(),
                         path_value,
                     ));
@@ -654,7 +653,7 @@ pub fn convert_context_servers_sacp(
             #[cfg(not(windows))]
             if !env_vars.iter().any(|e| e.name == "HOME") {
                 if let Ok(home) = std::env::var("HOME") {
-                    env_vars.push(sacp::schema::EnvVariable::new("HOME".to_string(), home));
+                    env_vars.push(agent_client_protocol::schema::EnvVariable::new("HOME".to_string(), home));
                 }
             }
 
@@ -663,7 +662,7 @@ pub fn convert_context_servers_sacp(
             {
                 if !env_vars.iter().any(|e| e.name == "USERPROFILE") {
                     if let Ok(profile) = std::env::var("USERPROFILE") {
-                        env_vars.push(sacp::schema::EnvVariable::new(
+                        env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                             "USERPROFILE".to_string(),
                             profile,
                         ));
@@ -671,7 +670,7 @@ pub fn convert_context_servers_sacp(
                 }
                 if !env_vars.iter().any(|e| e.name == "PATHEXT") {
                     if let Ok(pathext) = std::env::var("PATHEXT") {
-                        env_vars.push(sacp::schema::EnvVariable::new(
+                        env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                             "PATHEXT".to_string(),
                             pathext,
                         ));
@@ -979,7 +978,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let stderr = take_stdio(&mut child.stderr(), "stderr")?;
 
         // 创建 SACP transport
-        let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());
+        let transport = agent_client_protocol::ByteStreams::new(stdin.compat_write(), stdout.compat());
 
         // 🔥 新增：创建共享的异常退出标志
         // 此标志在 reaper_task 检测到子进程异常退出时设置为 true
@@ -1100,7 +1099,7 @@ struct SacpConnectionParams<N: SessionNotifier> {
 ///
 /// 使用 SACP 的 Builder 模式建立连接并处理消息
 async fn run_sacp_connection<N: SessionNotifier + 'static>(
-    transport: sacp::ByteStreams<
+    transport: agent_client_protocol::ByteStreams<
         tokio_util::compat::Compat<tokio::process::ChildStdin>,
         tokio_util::compat::Compat<tokio::process::ChildStdout>,
     >,
@@ -1140,7 +1139,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     Ok(())
                 }
             },
-            sacp::on_receive_notification!(),
+            agent_client_protocol::on_receive_notification!(),
         )
         // 处理 RequestPermission
         .on_receive_request(
@@ -1149,7 +1148,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                   _cx: ConnectionTo<Agent>| {
                 async move { handle_permission_request(request, responder).await }
             },
-            sacp::on_receive_request!(),
+            agent_client_protocol::on_receive_request!(),
         )
         // 主连接逻辑
         .connect_with(transport, move |cx: ConnectionTo<Agent>| {
@@ -1166,7 +1165,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 let _init_response = cx
                     .send_request(
                         InitializeRequest::new(VERSION)
-                            .client_info(sacp::schema::Implementation::new(
+                            .client_info(agent_client_protocol::schema::Implementation::new(
                                 "rcoder-agent-runner",
                                 env!("CARGO_PKG_VERSION"),
                             )),
@@ -1345,7 +1344,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     Ok(sid) => sid,
                     Err(err_msg) => {
                         error!("[SACP] Session creation failed: {}", err_msg);
-                        return Err(sacp::Error::new(-32000, err_msg));
+                        return Err(agent_client_protocol::Error::new(1000, err_msg));
                     }
                 };
 
@@ -1357,8 +1356,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 // 发送会话 ID 到主任务
                 if session_id_tx.send(session_id.clone()).is_err() {
                     error!("[SACP] unable to send session ID");
-                    return Err(sacp::Error::new(
-                        -32001,
+                    return Err(agent_client_protocol::Error::new(
+                        1001,
                         error_codes::get_i18n_message_default("error.sacp_session_id_send_failed"),
                     ));
                 }
@@ -1383,8 +1382,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     .notify_prompt_error(
                                         &project_id_for_prompt,
                                         &session_id.to_string(),
-                                        sacp::Error::new(
-                                            -32001,
+                                        agent_client_protocol::Error::new(
+                                            1001,
                                             error_codes::get_i18n_message_default("error.agent_process_abnormal_exit"),
                                         ),
                                         None, // request_id 可能已经不可用
@@ -1402,7 +1401,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     .notify_prompt_end(
                                         &project_id_for_prompt,
                                         &session_id.to_string(),
-                                        sacp::schema::StopReason::Cancelled,
+                                        agent_client_protocol::schema::StopReason::Cancelled,
                                         Some(error_codes::get_i18n_message_default("error.session_cancelled")),
                                         None,
                                     )
@@ -1495,8 +1494,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                                 "[SACP] Detected Agent process abnormal exit during prompt processing: project_id={}, session_id={}",
                                                 project_id_for_prompt, session_id
                                             );
-                                            break Err(sacp::Error::new(
-                                                -32001,
+                                            break Err(agent_client_protocol::Error::new(
+                                                1001,
                                                 error_codes::get_i18n_message_default("error.agent_process_abnormal_exit"),
                                             ));
                                         } else {
@@ -1505,8 +1504,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                                 "[SACP] Received cancel signal during prompt processing: project_id={}, session_id={}",
                                                 project_id_for_prompt, session_id
                                             );
-                                            break Err(sacp::Error::new(
-                                                -32002,
+                                            break Err(agent_client_protocol::Error::new(
+                                                1002,
                                                 error_codes::get_i18n_message_default("error.session_cancelled"),
                                             ));
                                         }
@@ -1515,8 +1514,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     _ = &mut cancel_timeout, if is_cancelled => {
                                         // 取消后超时，强制返回错误
                                         warn!("[SACP] cancel message Prompt response timeout (10s), force exit");
-                                        break Err(sacp::Error::new(
-                                            -32001,
+                                        break Err(agent_client_protocol::Error::new(
+                                            1001,
                                             error_codes::get_i18n_message_default("error.cancel_response_timeout"),
                                         ));
                                     }
@@ -1588,7 +1587,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                             .notify_prompt_end(
                                                 &project_id_for_prompt,
                                                 &session_id.to_string(),
-                                                sacp::schema::StopReason::Cancelled,
+                                                agent_client_protocol::schema::StopReason::Cancelled,
                                                 Some(error_codes::get_i18n_message_default("error.session_cancelled_timeout")),
                                                 request_id.clone(),
                                             )
@@ -1680,7 +1679,7 @@ async fn handle_session_notification<N: SessionNotifier>(
         .map(|s| s.to_string());
 
     // 通过 notifier 推送会话更新
-    // 注意：sacp::schema::SessionUpdate 与 agent_client_protocol::SessionUpdate 是同一类型
+    // SessionUpdate 通过 agent_client_protocol::schema 导入
     if let Err(e) = notifier
         .notify_session_update(&project_id, &session_id, notification.update, request_id)
         .await
@@ -1696,7 +1695,7 @@ async fn handle_session_notification<N: SessionNotifier>(
 async fn handle_permission_request(
     request: RequestPermissionRequest,
     request_cx: Responder<RequestPermissionResponse>,
-) -> Result<(), sacp::Error> {
+) -> Result<(), agent_client_protocol::Error> {
     debug!("[SACP] permission request: {:?}", request);
 
     // 自动允许：优先选择 AllowAlways，其次 AllowOnce

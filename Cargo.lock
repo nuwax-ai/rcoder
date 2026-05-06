@@ -24,23 +24,61 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aae1277d39aeec15cb388266ecc24b11c80469deae6067e17a1a7aa9e5c1f234"
 
 [[package]]
-name = "agent-client-protocol-schema"
-version = "0.11.7"
+name = "agent-client-protocol"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d24232129441563139fe5389de351433240d5f0ec8a6c775bf632dc6da7e549"
+checksum = "2af62fb84df2af0f933d8f5fd78b843fa5eb0ec5a48fa1b528c41951d0bbe36c"
+dependencies = [
+ "agent-client-protocol-derive",
+ "agent-client-protocol-schema",
+ "anyhow",
+ "futures 0.3.32",
+ "futures-concurrency",
+ "jsonrpcmsg",
+ "rmcp 1.5.0",
+ "rustc-hash",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agent-client-protocol-derive"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce42c2d3c048c12897eef2e577dfff1e3355c632c9f1625cc953b9df48b44631"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "agent-client-protocol-schema"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49bae57dad1c28a362fbdcf7bab0583316a02b45a70792109fced55780a3b63c"
 dependencies = [
  "anyhow",
  "derive_more",
- "schemars",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
+ "serde_with",
  "strum 0.28.0",
+ "tracing",
 ]
 
 [[package]]
 name = "agent_abstraction"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "agent_config",
  "anyhow",
  "async-trait",
@@ -52,7 +90,6 @@ dependencies = [
  "notify",
  "process-wrap",
  "rmcp 0.12.0",
- "sacp",
  "serde",
  "serde_json",
  "shared_types",
@@ -88,6 +125,7 @@ dependencies = [
 name = "agent_runner"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "agent_abstraction",
  "agent_config",
  "anyhow",
@@ -118,7 +156,6 @@ dependencies = [
  "reqwest 0.13.3",
  "ringbuf",
  "rustls",
- "sacp",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -847,12 +884,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boxfnonce"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5988cb1d626264ac94100be357308f29ff7cbdd3b36bda27f450a4ee3f713426"
-
-[[package]]
 name = "brotli"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,6 +1544,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
+ "serde_core",
 ]
 
 [[package]]
@@ -2686,6 +2718,7 @@ checksum = "bd070e393353796e801d209ad339e89596eb4c8d430d18ede6a1cced8fafbd99"
 dependencies = [
  "autocfg",
  "hashbrown 0.12.3",
+ "serde",
 ]
 
 [[package]]
@@ -5133,7 +5166,7 @@ dependencies = [
  "pin-project-lite",
  "process-wrap",
  "rmcp-macros 0.12.0",
- "schemars",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5156,7 +5189,7 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "rmcp-macros 1.5.0",
- "schemars",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5480,42 +5513,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "sacp"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c55e83008bb3aec4bc1348bf1a58dc5d42381ee704697dccb5c59553dce0fc"
-dependencies = [
- "agent-client-protocol-schema",
- "anyhow",
- "boxfnonce",
- "futures 0.3.32",
- "futures-concurrency",
- "jsonrpcmsg",
- "rmcp 1.5.0",
- "rustc-hash",
- "sacp-derive",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "sacp-derive"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab42f7ccff8ab957cb7eaee9727cfca1ba38ea390178cb3d1cdfc1ddbce1ddd8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5531,6 +5528,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "schemars"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd191f9397d57d581cddd31014772520aa448f65ef991055d7f61582c65165f"
+dependencies = [
+ "dyn-clone",
+ "ref-cast",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5736,6 +5745,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_with"
+version = "3.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05839ce67618e14a09b286535c0d9c94e85ef25469b0e13cb4f844e5593eb19"
+dependencies = [
+ "base64",
+ "chrono",
+ "hex",
+ "indexmap 1.9.3",
+ "indexmap 2.14.0",
+ "schemars 0.9.0",
+ "schemars 1.2.1",
+ "serde_core",
+ "serde_json",
+ "serde_with_macros",
+ "time",
+]
+
+[[package]]
+name = "serde_with_macros"
+version = "3.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf2ebbe86054f9b45bc3881e865683ccfaccce97b9b4cb53f3039d67f355a334"
+dependencies = [
+ "darling 0.23.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "serde_yaml"
 version = "0.9.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5794,6 +5834,7 @@ dependencies = [
 name = "shared_types"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -5812,7 +5853,6 @@ dependencies = [
  "prost-types",
  "reqwest 0.13.3",
  "rust-i18n",
- "sacp",
  "serde",
  "serde_json",
  "serde_urlencoded",

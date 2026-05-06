@@ -359,7 +359,7 @@ impl AgentSessionRegistry {
     /// 如果项目已存在且为 Idle 状态，则更新为 Pending
     pub fn set_pending(&self, project_id: &str) {
         use chrono::Utc;
-        use sacp::schema::SessionId;
+        use agent_client_protocol::schema::SessionId;
         use shared_types::AgentStatus;
         use std::sync::Arc;
         use tokio::sync::mpsc;
@@ -904,7 +904,7 @@ impl Default for AgentSessionRegistry {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use sacp::schema::SessionId;
+    use agent_client_protocol::schema::SessionId;
     use shared_types::AgentStatus;
     use std::sync::Arc;
     use tokio::sync::mpsc;

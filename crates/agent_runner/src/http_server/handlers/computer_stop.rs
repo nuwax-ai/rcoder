@@ -3,7 +3,7 @@
 //! 处理 POST /computer/agent/stop 请求
 
 use axum::{extract::State, http::HeaderMap, Json};
-use sacp::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::{CancelNotification, SessionId};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{info, warn};

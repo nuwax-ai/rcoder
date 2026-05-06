@@ -1,7 +1,6 @@
 //! Agent trait definition.
 
-// SACP type imports
-use sacp::schema::McpServer;
+use agent_client_protocol::schema::McpServer;
 use tracing::{debug, info};
 
 /// Agent startup configuration

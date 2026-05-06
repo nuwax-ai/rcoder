@@ -49,11 +49,10 @@
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
-// 使用 SACP 类型
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;
-use sacp::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
+use agent_client_protocol::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use shared_types::{
     AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
 };
