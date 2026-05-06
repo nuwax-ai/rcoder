@@ -90,7 +90,9 @@ pub fn build_workspace_path(
     space_id: Option<&str>,
     project_id: &str,
 ) -> String {
-    match isolation_type {
+    // 大小写不敏感：统一转小写后匹配
+    let normalized = isolation_type.map(|s| s.to_lowercase());
+    match normalized.as_deref() {
         Some("tenant") | Some("space") => {
             // tenant/space: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
             let tid = tenant_id.unwrap_or("default");
@@ -133,7 +135,9 @@ pub fn build_computer_workspace_path(
     user_id: &str,
     project_id: &str,
 ) -> String {
-    match isolation_type {
+    // 大小写不敏感：统一转小写后匹配
+    let normalized = isolation_type.map(|s| s.to_lowercase());
+    match normalized.as_deref() {
         Some("tenant") | Some("space") => {
             // tenant/space: /app/computer-project-workspace/{tenant_id}/{space_id}/{project_id}
             let tid = tenant_id.unwrap_or("default");

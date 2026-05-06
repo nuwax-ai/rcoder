@@ -304,8 +304,22 @@ impl AgentService for AgentServiceImpl {
                 std::path::PathBuf::from("/home/user").join(&project_id)
             }
             shared_types::ServiceType::RCoder => {
-                // RCoder 模式：./project_workspace/{project_id}
-                std::path::PathBuf::from("./project_workspace").join(&project_id)
+                // RCoder 模式：检查是否有多租户隔离环境变量
+                // 有 TENANT_ID + SPACE_ID: ./project_workspace/{tenant_id}/{space_id}/{project_id}
+                // 否则: ./project_workspace/{project_id}
+                let tenant_id = std::env::var("TENANT_ID").ok();
+                let space_id = std::env::var("SPACE_ID").ok();
+                match (tenant_id, space_id) {
+                    (Some(tid), Some(sid)) => {
+                        std::path::PathBuf::from("./project_workspace")
+                            .join(&tid)
+                            .join(&sid)
+                            .join(&project_id)
+                    }
+                    _ => {
+                        std::path::PathBuf::from("./project_workspace").join(&project_id)
+                    }
+                }
             }
         };
 

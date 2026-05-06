@@ -84,6 +84,10 @@ docker_config:
 
         # 🎯 主挂载：项目工作目录
         # 宿主机: /project_workspace/{project_id} → 容器: /app/project_workspace/{project_id}
+        # 注意：当 pod_id 存在时，会根据 isolation_type 动态调整挂载路径
+        #   - space: /app/project_workspace/{tenant_id}/{space_id}
+        #   - tenant: /app/project_workspace/{tenant_id}
+        #   - project: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
         mounts:
           - container_path: "/app/project_workspace/{project_id}"
             host_path: "{resolved_path}/{project_id}"

@@ -1368,6 +1368,21 @@ impl DockerManager {
             variables.insert("user_id".to_string(), uid.clone());
         }
         variables.insert("service_type".to_string(), service_type.to_string());
+
+        // 添加隔离类型相关变量（用于挂载路径解析）
+        if let Some(ref pid) = pod_id {
+            variables.insert("pod_id".to_string(), pid.clone());
+        }
+        if let Some(ref it) = isolation_type {
+            variables.insert("isolation_type".to_string(), it.clone());
+        }
+        if let Some(ref tid) = tenant_id {
+            variables.insert("tenant_id".to_string(), tid.clone());
+        }
+        if let Some(ref sid) = space_id {
+            variables.insert("space_id".to_string(), sid.clone());
+        }
+
         let container_work_path = service_config.resolve_container_path(&variables);
 
         // 构建基础配置
@@ -1379,16 +1394,19 @@ impl DockerManager {
             .auto_remove(true);
 
         // 添加隔离类型相关配置
-        if let Some(pid) = pod_id {
-            builder = builder.pod_id(pid);
+        if let Some(ref pid) = pod_id {
+            builder = builder.pod_id(pid.clone());
         }
-        if let Some(it) = isolation_type {
-            builder = builder.isolation_type(it);
+        if let Some(ref it) = isolation_type {
+            builder = builder.isolation_type(it.clone());
         }
-        if let Some(tid) = tenant_id {
+        // 保存引用供后续使用
+        let tenant_id_ref = tenant_id.as_deref();
+        let space_id_ref = space_id.as_deref();
+        if let Some(tid) = tenant_id_ref {
             builder = builder.tenant_id(tid);
         }
-        if let Some(sid) = space_id {
+        if let Some(sid) = space_id_ref {
             builder = builder.space_id(sid);
         }
 
@@ -1454,6 +1472,16 @@ impl DockerManager {
         }
         if let Some(ref uid) = user_id {
             builder = builder.env("USER_ID", uid);
+        }
+        // 隔离模式相关环境变量（agent_runner 用于构建工作目录路径）
+        if let Some(ref tid) = tenant_id {
+            builder = builder.env("TENANT_ID", tid);
+        }
+        if let Some(ref sid) = space_id {
+            builder = builder.env("SPACE_ID", sid);
+        }
+        if let Some(ref it) = isolation_type {
+            builder = builder.env("ISOLATION_TYPE", it);
         }
 
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
@@ -1563,6 +1591,83 @@ impl DockerManager {
                     resolved_container_path.replace(&format!("{{{}}}", key), value);
             }
 
+            // 🎯 动态调整挂载路径：当 pod_id 存在时，根据 isolation_type 选择挂载级别
+            // 工作目录始终是：/app/project_workspace/{tenant_id}/{space_id}/{project_id}
+            // 挂载目录根据 isolation_type 决定：
+            //   - space: /app/project_workspace/{tenant_id}/{space_id}
+            //   - tenant: /app/project_workspace/{tenant_id}
+            //   - project: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
+            let (resolved_host_path, resolved_container_path) = if pod_id.is_some() {
+                if let (Some(tid), Some(sid)) = (tenant_id_ref, space_id_ref) {
+                    // 检查是否是项目工作目录的挂载（包含 {project_id} 的路径）
+                    if mount_config.container_path.contains("{project_id}") {
+                        // 从 variables 中获取 project_id
+                        let pid = mount_variables.get("project_id").map(|s| s.as_str()).unwrap_or("default");
+
+                        // 根据 isolation_type 确定挂载级别（大小写不敏感）
+                        // 当 pod_id 存在时，isolation_type 必须由上游提供，不应为 None
+                        let mount_level = match isolation_type.as_deref() {
+                            Some(it) => it.to_lowercase(),
+                            None => {
+                                error!(
+                                    "[DOCKER_MGR] isolation_type is None when pod_id is present, \
+                                     this should have been validated upstream. \
+                                     tenant_id={}, space_id={}, project_id={}",
+                                    tid, sid, pid
+                                );
+                                return Err(DockerError::ConfigurationError(
+                                    "isolation_type is required when pod_id is provided".to_string()
+                                ));
+                            }
+                        };
+                        let (container_mount_path, host_mount_suffix) = match mount_level.as_str() {
+                            "space" => {
+                                // space 隔离：挂载到 tenant/space 级别
+                                (
+                                    format!("/app/project_workspace/{}/{}", tid, sid),
+                                    format!("{}/{}", tid, sid),
+                                )
+                            }
+                            "tenant" => {
+                                // tenant 隔离：挂载到 tenant 级别
+                                (
+                                    format!("/app/project_workspace/{}", tid),
+                                    format!("{}", tid),
+                                )
+                            }
+                            _ => {
+                                // project 隔离（默认）：挂载到完整路径
+                                (
+                                    format!("/app/project_workspace/{}/{}/{}", tid, sid, pid),
+                                    format!("{}/{}/{}", tid, sid, pid),
+                                )
+                            }
+                        };
+
+                        // 计算宿主机路径：从 resolved_host_path 中提取基础路径，然后拼接后缀
+                        // resolved_host_path 格式通常是：/host_base/project_id
+                        // 我们需要：/host_base/tenant_id/space_id
+                        let host_base = resolved_host_path
+                            .rsplit_once('/')
+                            .map(|(h, _)| h)
+                            .unwrap_or(&resolved_host_path);
+                        let host_mount_path = format!("{}/{}", host_base, host_mount_suffix);
+
+                        info!(
+                            "🔄 [DOCKER_MGR] Pod mode (isolation={}): redirecting mount: {} -> {}",
+                            mount_level, mount_config.container_path, container_mount_path
+                        );
+                        (host_mount_path, container_mount_path)
+                    } else {
+                        (resolved_host_path, resolved_container_path)
+                    }
+                } else {
+                    (resolved_host_path, resolved_container_path)
+                }
+            } else {
+                (resolved_host_path, resolved_container_path)
+            };
+
             info!(
                 "Adding mount point: {} -> {} (read_only: {})",
                 resolved_host_path, resolved_container_path, mount_config.read_only
@@ -1577,8 +1682,33 @@ impl DockerManager {
             // 策略：必须配置 resolve_from 才能正确创建目录
             // 使用 resolve_from + 相对路径 来创建目录
             if !mount_config.read_only {
-                if let Some(ref resolve_from_path) = mount_config.resolve_from {
-                    // 从 host_path 模板中提取相对路径部分
+                if pod_id.is_some()
+                    && mount_config.container_path.contains("{project_id}")
+                    && tenant_id_ref.is_some()
+                    && space_id_ref.is_some()
+                {
+                    // Pod 模式下挂载路径已被重定向，需要创建完整的工作目录
+                    // 使用 resolve_from_path 作为基础（rcoder 容器内可访问的路径）
+                    // 例如：/app/project_workspace/{tenant_id}/{space_id}/{project_id}
+                    if let Some(ref resolve_from_path) = mount_config.resolve_from {
+                        let tid = tenant_id_ref.unwrap_or("default");
+                        let sid = space_id_ref.unwrap_or("default");
+                        let pid = mount_variables
+                            .get("project_id")
+                            .map(|s| s.as_str())
+                            .unwrap_or("default");
+                        let create_path = format!("{}/{}/{}/{}", resolve_from_path, tid, sid, pid);
+                        if let Err(e) = std::fs::create_dir_all(&create_path) {
+                            warn!(
+                                "[DOCKER_MGR] pod mode create directory failed: {} - {}",
+                                create_path, e
+                            );
+                        } else {
+                            info!("[DOCKER_MGR] pod mode directory created: {}", create_path);
+                        }
+                    }
+                } else if let Some(ref resolve_from_path) = mount_config.resolve_from {
+                    // 非 pod 模式：从 host_path 模板中提取相对路径部分
                     // host_path 格式通常是 "{resolved_path}/{variable}"
                     // 我们需要取 {resolved_path} 之后的部分，并拼接到 resolve_from 上
                     let host_path_template = &mount_config.host_path;

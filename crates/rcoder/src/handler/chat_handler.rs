@@ -5,7 +5,7 @@
 use anyhow::Result;
 use axum::{extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
-use shared_types::{AgentChatRequest, ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
+use shared_types::{AgentChatRequest, ChatAgentConfig, IsolationType, ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
@@ -97,33 +97,37 @@ pub async fn handle_chat(
     if request.pod_id.is_some() {
         if request.isolation_type.is_none() {
             error!("[CHAT] Validation failed: isolation_type is required when pod_id is provided");
-            return Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
+                "isolation_type is required when pod_id is provided",
             ));
         }
         if request.tenant_id.is_none() {
             error!("[CHAT] Validation failed: tenant_id is required when pod_id is provided");
-            return Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
+                "tenant_id is required when pod_id is provided",
             ));
         }
         if request.space_id.is_none() {
             error!("[CHAT] Validation failed: space_id is required when pod_id is provided");
-            return Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
+                "space_id is required when pod_id is provided",
             ));
         }
 
-        // 验证 isolation_type 值有效
+        // 验证 isolation_type 值有效（大小写不敏感）
         if let Some(ref it) = request.isolation_type {
-            if it != "tenant" && it != "space" && it != "project" {
+            if IsolationType::from_str(it).is_err() {
                 error!("[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
-                return Ok(HttpResult::error_with_locale(
+                return Ok(HttpResult::error_with_message(
                     shared_types::error_codes::ERR_VALIDATION,
                     locale,
+                    &format!("invalid isolation_type '{}', expected: tenant, space, project", it),
                 ));
             }
         }
@@ -143,7 +147,9 @@ pub async fn handle_chat(
     }
 
     // ========== 构建工作空间路径 ==========
-    // 根据 isolation_type 确定容器内工作目录
+    // 根据 isolation_type 确定容器内工作目录：
+    // - tenant/space: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
+    // - project 或默认: /app/project_workspace/{project_id}
     let container_work_path = build_workspace_path(
         request.isolation_type.as_deref(),
         request.tenant_id.as_deref(),

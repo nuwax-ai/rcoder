@@ -22,7 +22,7 @@
 //! 注意：Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 
 use axum::{extract::State, http::HeaderMap};
-use shared_types::{ChatResponse, ComputerChatRequest};
+use shared_types::{ChatResponse, ComputerChatRequest, IsolationType};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -115,33 +115,37 @@ pub async fn handle_computer_chat(
     if request.pod_id.is_some() {
         if request.isolation_type.is_none() {
             error!("[COMPUTER_CHAT] Validation failed: isolation_type is required when pod_id is provided");
-            return Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
+                "isolation_type is required when pod_id is provided",
             ));
         }
         if request.tenant_id.is_none() {
             error!("[COMPUTER_CHAT] Validation failed: tenant_id is required when pod_id is provided");
-            return Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
+                "tenant_id is required when pod_id is provided",
             ));
         }
         if request.space_id.is_none() {
             error!("[COMPUTER_CHAT] Validation failed: space_id is required when pod_id is provided");
-            return Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
+                "space_id is required when pod_id is provided",
             ));
         }
 
-        // 验证 isolation_type 值有效
+        // 验证 isolation_type 值有效（大小写不敏感）
         if let Some(ref it) = request.isolation_type {
-            if it != "tenant" && it != "space" && it != "project" {
+            if IsolationType::from_str(it).is_err() {
                 error!("[COMPUTER_CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
-                return Ok(HttpResult::error_with_locale(
+                return Ok(HttpResult::error_with_message(
                     shared_types::error_codes::ERR_VALIDATION,
                     locale,
+                    &format!("invalid isolation_type '{}', expected: tenant, space, project", it),
                 ));
             }
         }
