@@ -113,6 +113,8 @@ async fn forward_cancel_request_to_container_service(
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
     locale: &'static str,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
 ) -> Result<HttpResult<AgentCancelResponse>, AppError> {
     let session_id_display = session_id
         .map(|s| s.to_string())
@@ -184,7 +186,7 @@ async fn forward_cancel_request_to_container_service(
                     Code::Unavailable => {
                         // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
                         // 通过 Docker API 检查容器是否真的存在
-                        let container_exists = check_container_exists_by_info(container_info).await;
+                        let container_exists = check_container_exists_by_info(container_info, rcoder_prefix, computer_prefix).await;
 
                         if !container_exists {
                             // 容器已销毁，取消目标已达成（幂等设计）
@@ -229,11 +231,14 @@ async fn forward_cancel_request_to_container_service(
 /// - 容器存在但服务不可用 → 返回 true（临时故障）
 ///
 /// 使用容器名称而非 ID，因为容器重启后 ID 会变，但名称不变
-async fn check_container_exists_by_info(container_info: &ContainerBasicInfo) -> bool {
+async fn check_container_exists_by_info(
+    container_info: &ContainerBasicInfo,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
+) -> bool {
     match docker_manager::runtime::RuntimeManager::get().await {
         Ok(runtime) => {
-            let rcoder_prefix = shared_types::ServiceType::RCoder.container_prefix();
-            let computer_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
+            // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
 
             let query = if let Some(identifier) = container_info
                 .container_name
@@ -339,6 +344,8 @@ async fn handle_session_cancel_internal_v2(
         &container_info,
         &state.grpc_pool,
         locale,
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
     )
     .await;
 

@@ -581,8 +581,9 @@ async fn validate_and_get_session_context(
             "⚠️ [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
             container_name
         );
-        let computer_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-        let rcoder_prefix = shared_types::ServiceType::RCoder.container_prefix();
+        // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
+        let computer_prefix = &state.container_prefix_computer;
+        let rcoder_prefix = &state.container_prefix_rcoder;
         let query = if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix)) {
             runtime
                 .find_container(id, &shared_types::ServiceType::ComputerAgentRunner)
@@ -659,7 +660,9 @@ async fn build_sse_stream_from_container_name(
     container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
     locale: &'static str,
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    rcoder_prefix: &str,
+    computer_prefix: &str,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
     // Get latest container IP from Docker API in real-time（带缓存）
     // 使用 container_name（如 computer-agent-runner-user_123）查询
     // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
@@ -667,6 +670,8 @@ async fn build_sse_stream_from_container_name(
         &container_name,
         &container_ip_cache,
         "", // 无 fallback_ip，直接使用 Docker API 查询结果
+        rcoder_prefix,
+        computer_prefix,
     )
     .await
     {
@@ -926,6 +931,8 @@ pub async fn agent_session_notification(
         state.container_ip_cache.clone(),
         locale,
         "Agent",
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
     )
     .await
 }
@@ -1032,6 +1039,8 @@ pub async fn computer_agent_progress_notification(
         state.container_ip_cache.clone(),
         locale,
         "Computer Agent",
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
     )
     .await
 }

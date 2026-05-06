@@ -37,6 +37,8 @@ impl Default for VncSyncConfig {
 pub fn start_vnc_sync_task(
     pingora_service: Arc<PingoraProxyService>,
     config: VncSyncConfig,
+    rcoder_prefix: String,
+    computer_prefix: String,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         "🔄 [VNC_SYNC] Starting VNC backend sync task: interval={}s",
@@ -47,17 +49,21 @@ pub fn start_vnc_sync_task(
         let mut interval = tokio::time::interval(config.sync_interval);
 
         // 首次立即执行同步（用于服务启动时恢复映射）
-        sync_vnc_backends(&pingora_service).await;
+        sync_vnc_backends(&pingora_service, &rcoder_prefix, &computer_prefix).await;
 
         loop {
             interval.tick().await;
-            sync_vnc_backends(&pingora_service).await;
+            sync_vnc_backends(&pingora_service, &rcoder_prefix, &computer_prefix).await;
         }
     })
 }
 
 /// 同步 VNC 后端映射
-async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
+async fn sync_vnc_backends(
+    pingora_service: &Arc<PingoraProxyService>,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
+) {
     let runtime = match docker_manager::runtime::RuntimeManager::get().await {
         Ok(rt) => rt,
         Err(e) => {
@@ -78,8 +84,7 @@ async fn sync_vnc_backends(pingora_service: &Arc<PingoraProxyService>) {
         return;
     }
 
-    let computer_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-    let rcoder_prefix = shared_types::ServiceType::RCoder.container_prefix();
+    // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
 
     // 预先收集运行中容器的 key 集合（用于后续清理旧映射）
     let active_user_ids: std::collections::HashSet<String> = containers

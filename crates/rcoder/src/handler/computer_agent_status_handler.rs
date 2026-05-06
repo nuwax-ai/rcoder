@@ -190,6 +190,8 @@ pub async fn computer_agent_status(
         &container_info.container_name,
         &state.container_ip_cache,
         &container_info.container_ip,
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
     )
     .await
     {

@@ -57,10 +57,19 @@ pub fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
 /// 因为 container_id 在容器重启后会改变，但 container_name 是稳定的。
 ///
 /// 查询顺序：缓存 → Docker API → 回退到 fallback_ip
+///
+/// # 参数
+/// - `container_name`: 容器名称
+/// - `cache`: IP 缓存
+/// - `fallback_ip`: 回退 IP 地址
+/// - `rcoder_prefix`: RCoder 服务的容器前缀（从配置读取）
+/// - `computer_prefix`: ComputerAgentRunner 服务的容器前缀（从配置读取）
 pub async fn get_realtime_container_ip_with_cache(
     container_name: &str,
     cache: &crate::grpc::ContainerIpCache,
     fallback_ip: &str,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
 ) -> Result<String, String> {
     // 1. 先查缓存
     if let Some(cached_ip) = cache.get(container_name) {
@@ -72,8 +81,7 @@ pub async fn get_realtime_container_ip_with_cache(
         .await
         .map_err(|e| format!("Failed to get runtime: {}", e))?;
 
-    let computer_prefix = shared_types::ServiceType::ComputerAgentRunner.container_prefix();
-    let rcoder_prefix = shared_types::ServiceType::RCoder.container_prefix();
+    // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
     let (identifier, service_type) = if let Some(id) =
         container_name.strip_prefix(&format!("{}-", computer_prefix))
     {

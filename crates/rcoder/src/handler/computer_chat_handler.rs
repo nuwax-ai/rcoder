@@ -380,6 +380,8 @@ pub async fn handle_computer_chat(
                 &container_info.container_name,
                 &state.container_ip_cache,
                 &container_info.container_ip,
+                &state.container_prefix_rcoder,
+                &state.container_prefix_computer,
             )
             .await
             .map_err(|e| format!("IP resolution error: {}", e))?;
@@ -474,6 +476,8 @@ pub async fn handle_computer_chat(
         &state.grpc_pool,
         &state.container_ip_cache,
         locale,
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
     )
     .await;
 
@@ -632,6 +636,8 @@ async fn forward_computer_request_to_container(
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
     container_ip_cache: &Arc<crate::grpc::ContainerIpCache>,
     locale: &'static str,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
 ) -> HttpResult<ChatResponse> {
     info!(
         "📤 [COMPUTER_FORWARD] Forwarding request to container (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}",
@@ -647,6 +653,8 @@ async fn forward_computer_request_to_container(
         &container_info.container_name,
         container_ip_cache,
         &container_info.container_ip,
+        rcoder_prefix,
+        computer_prefix,
     )
     .await
     {

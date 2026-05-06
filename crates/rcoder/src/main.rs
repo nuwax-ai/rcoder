@@ -473,7 +473,12 @@ async fn main() -> anyhow::Result<()> {
         let vnc_sync_config = VncSyncConfig {
             sync_interval: Duration::from_secs(5), // 每 5 秒同步一次
         };
-        let _vnc_sync_handle = start_vnc_sync_task(pingora_service.clone(), vnc_sync_config);
+        let _vnc_sync_handle = start_vnc_sync_task(
+            pingora_service.clone(),
+            vnc_sync_config,
+            state.container_prefix_rcoder.clone(),
+            state.container_prefix_computer.clone(),
+        );
         info!(
             "VNC sync already started (interval: 5s, sync Docker container IP)"
         );
