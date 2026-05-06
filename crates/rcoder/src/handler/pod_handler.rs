@@ -899,11 +899,12 @@ pub async fn pod_ensure(
                 result.container_id, result.status
             );
 
-            // 删除旧容器
+            // 删除旧容器（使用 pod_id 优先的标识符，与创建时一致）
             // 如果删除失败（包括容器不存在等情况），返回错误让调用者知道
+            let container_identifier = request.pod_id.as_deref().unwrap_or(&request.user_id);
             runtime
                 .stop_container_by_identifier(
-                    &request.user_id,
+                    container_identifier,
                     &shared_types::ServiceType::ComputerAgentRunner,
                 )
                 .await
@@ -1481,8 +1482,10 @@ pub async fn pod_restart(
                 AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
             })?;
 
+        // 使用 pod_id 优先的标识符停止容器（与创建时一致）
+        let container_identifier = request.pod_id.as_deref().unwrap_or(&request.user_id);
         if let Err(e) = runtime
-            .stop_container_by_identifier(&request.user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .stop_container_by_identifier(container_identifier, &shared_types::ServiceType::ComputerAgentRunner)
             .await
         {
             // 记录错误但继续尝试创建新容器
