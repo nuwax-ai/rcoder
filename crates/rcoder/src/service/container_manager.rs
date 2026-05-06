@@ -46,6 +46,7 @@ impl ContainerManager {
 
         // 检查或创建容器
         let container_info = ensure_container_exists(
+            project_id,
             container_identifier,
             service_type,
             request_resource_limits,
@@ -99,6 +100,7 @@ impl ContainerManager {
 
 /// 根据 project_id 检查对应容器是否存在，不存在就动态创建容器
 async fn ensure_container_exists(
+    project_id: &str,
     container_identifier: &str,
     service_type: &shared_types::ServiceType,
     request_resource_limits: Option<shared_types::ServiceResourceLimits>,
@@ -134,6 +136,7 @@ async fn ensure_container_exists(
     );
 
     create_container_for_request(
+        project_id,
         container_identifier,
         service_type,
         &runtime,
@@ -149,6 +152,7 @@ async fn ensure_container_exists(
 
 /// 为请求创建容器
 async fn create_container_for_request(
+    project_id: &str,
     container_identifier: &str,
     service_type: &shared_types::ServiceType,
     runtime: &Arc<dyn ContainerRuntime>,
@@ -174,9 +178,10 @@ async fn create_container_for_request(
     );
 
     // 2. 调用容器运行时启动容器
-    // 注意：传递 pod_id, isolation_type 等用于容器配置
+    // 注意：project_id 始终使用实际的 project_id（不被 pod_id 覆盖）
+    // 容器命名由 runtime 层通过 pod_id 处理
     let mut params_builder = ContainerCreateParams::builder()
-        .project_id(container_identifier)
+        .project_id(project_id)
         .host_workspace_path("") // 空字符串，表示不使用硬编码挂载
         .service_type(service_type.clone());
 

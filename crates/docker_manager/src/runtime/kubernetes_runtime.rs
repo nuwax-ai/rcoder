@@ -135,8 +135,10 @@ impl KubernetesRuntime {
     }
 
     /// Get workspace PVC name for a project/user
+    /// PVC 名称包含 identifier 以实现存储隔离
     fn workspace_pvc_name(identifier: &str, service_type: &ServiceType) -> String {
-        format!("{}-workspace", service_type.container_prefix())
+        let sanitized = identifier.replace('_', "-");
+        format!("{}-{}-workspace", service_type.container_prefix(), sanitized)
     }
 
     /// Ensure workspace PVC exists, create if not
@@ -586,28 +588,26 @@ impl ContainerRuntime for KubernetesRuntime {
             host_workspace_path: _,
             service_type,
             resource_limits,
-            pod_id: _,
-            isolation_type: _,
-            tenant_id: _,
-            space_id: _,
+            pod_id,
+            isolation_type,
+            tenant_id,
+            space_id,
         } = params;
 
-        // 确定容器标识符：user_id 优先（ComputerAgentRunner），否则用 project_id
-        // 注意：需要先克隆值，因为后面还需要使用 unwrap_or_default()
+        // 确定容器标识符：pod_id > user_id > project_id（与 Docker 模式一致）
         let project_id_val = project_id.clone().unwrap_or_default();
         let user_id_val = user_id.clone().unwrap_or_default();
-        let identifier = user_id.as_ref().or(project_id.as_ref()).ok_or_else(|| {
-            ContainerRuntimeError::ConfigurationError(
-                "Either project_id or user_id must be provided".to_string(),
-            )
-        })?;
+        let identifier = pod_id.as_ref()
+            .or(user_id.as_ref())
+            .or(project_id.as_ref())
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(
+                    "At least one of pod_id, user_id, or project_id must be provided".to_string(),
+                )
+            })?;
 
-        // Pod 名称：使用 identifier（user_id 优先，否则 project_id）
-        let pod_name = format!(
-            "{}-{}",
-            service_type.container_prefix(),
-            identifier
-        );
+        // Pod 名称：统一使用 pod_name() helper（含 RFC 1123 下划线清理）
+        let pod_name = self.pod_name(identifier, &service_type);
 
         // Ensure workspace PVC exists first (NFS-backed, each project/user gets its own PVC)
         // The PVC is backed by NFS Subdir External Provisioner which automatically
@@ -632,14 +632,16 @@ impl ContainerRuntime for KubernetesRuntime {
         let image = self.select_image(&service_type);
 
         // Build labels using BTreeMap (required by k8s-openapi)
-        // 当 user_id 存在时添加 user_id label，用于查询
+        // Label 与 identifier 优先级一致：pod_id > user_id > project_id
         let mut label_pairs = vec![
             ("app".to_string(), "rcoder".to_string()),
             ("managed-by".to_string(), "rcoder-runtime".to_string()),
             ("service_type".to_string(), service_type_str.clone()),
         ];
-        if let Some(ref uid) = user_id {
-            label_pairs.push(("user_id".to_string(), uid.clone()));
+        if pod_id.is_some() {
+            label_pairs.push(("pod_id".to_string(), identifier.clone()));
+        } else if user_id.is_some() {
+            label_pairs.push(("user_id".to_string(), identifier.clone()));
         } else {
             label_pairs.push(("project_id".to_string(), identifier.clone()));
         }
@@ -715,23 +717,48 @@ impl ContainerRuntime for KubernetesRuntime {
                         ServiceType::RCoder => Some(vec!["/app/bin/agent_runner".to_string()]),
                         ServiceType::ComputerAgentRunner => None,
                     },
-                    env: Some(vec![
-                        EnvVar {
-                            name: "PROJECT_ID".to_string(),
-                            value: Some(project_id_val.to_string()),
-                            ..Default::default()
-                        },
-                        EnvVar {
-                            name: "USER_ID".to_string(),
-                            value: Some(user_id_val.to_string()),
-                            ..Default::default()
-                        },
-                        EnvVar {
-                            name: "SERVICE_TYPE".to_string(),
-                            value: Some(service_type_str.clone()),
-                            ..Default::default()
-                        },
-                    ]),
+                    env: {
+                        let mut env_vars = vec![
+                            EnvVar {
+                                name: "PROJECT_ID".to_string(),
+                                value: Some(project_id_val.to_string()),
+                                ..Default::default()
+                            },
+                            EnvVar {
+                                name: "USER_ID".to_string(),
+                                value: Some(user_id_val.to_string()),
+                                ..Default::default()
+                            },
+                            EnvVar {
+                                name: "SERVICE_TYPE".to_string(),
+                                value: Some(service_type_str.clone()),
+                                ..Default::default()
+                            },
+                        ];
+                        // 多租户环境变量（agent_runner 用于构建工作目录路径）
+                        if let Some(ref tid) = tenant_id {
+                            env_vars.push(EnvVar {
+                                name: "TENANT_ID".to_string(),
+                                value: Some(tid.clone()),
+                                ..Default::default()
+                            });
+                        }
+                        if let Some(ref sid) = space_id {
+                            env_vars.push(EnvVar {
+                                name: "SPACE_ID".to_string(),
+                                value: Some(sid.clone()),
+                                ..Default::default()
+                            });
+                        }
+                        if let Some(ref it) = isolation_type {
+                            env_vars.push(EnvVar {
+                                name: "ISOLATION_TYPE".to_string(),
+                                value: Some(it.clone()),
+                                ..Default::default()
+                            });
+                        }
+                        Some(env_vars)
+                    },
                     ports: Some(vec![
                         ContainerPort {
                             container_port: shared_types::GRPC_DEFAULT_PORT as i32,
@@ -815,12 +842,11 @@ impl ContainerRuntime for KubernetesRuntime {
             }
         }
 
-        // Query K8s API - 尝试两种稳定标识查询：
-        // 1. project_id label
-        // 2. user_id label
+        // Query K8s API - 尝试多种标识查询（与 label 构建逻辑一致）
         let search_queries = vec![
-            format!("project_id={}", identifier),
+            format!("pod_id={}", identifier),
             format!("user_id={}", identifier),
+            format!("project_id={}", identifier),
         ];
 
         for query in search_queries {
@@ -903,6 +929,7 @@ impl ContainerRuntime for KubernetesRuntime {
 
         // 2) Query by labels
         for selector in [
+            format!("pod_id={}", identifier),
             format!("user_id={}", identifier),
             format!("project_id={}", identifier),
         ] {

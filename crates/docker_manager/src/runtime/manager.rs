@@ -41,14 +41,6 @@ impl RuntimeManager {
             }
             #[cfg(feature = "kubernetes")]
             RuntimeType::Kubernetes => {
-                if !runtime_type.is_kubernetes() {
-                    return Err(
-                        container_runtime_api::ContainerRuntimeError::ConfigurationError(
-                            "Kubernetes support is not compiled. Enable the 'kubernetes' feature flag."
-                                .to_string(),
-                        ),
-                    );
-                }
                 info!("[RUNTIME] Initializing Kubernetes runtime");
                 let k8s_runtime = KubernetesRuntime::new(config.clone())
                     .await
