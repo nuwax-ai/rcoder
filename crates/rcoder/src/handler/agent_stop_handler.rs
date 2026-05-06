@@ -16,11 +16,15 @@ use shared_types::{AgentStopRequest, AgentStopResponse};
 async fn destroy_container_for_project(
     state: &Arc<AppState>,
     project_id: &str,
+    pod_id: Option<&str>,
     locale: &'static str,
 ) -> Result<HttpResult<AgentStopResponse>, AppError> {
+    // 容器标识符：pod_id 优先，否则使用 project_id（与创建时一致）
+    let container_identifier = pod_id.unwrap_or(project_id);
+
     info!(
-        "[STOP_DESTROY] startingdestroycontainer: project_id={}",
-        project_id
+        "[STOP_DESTROY] startingdestroycontainer: project_id={}, pod_id={:?}, container_identifier={}",
+        project_id, pod_id, container_identifier
     );
 
     let runtime = match docker_manager::runtime::RuntimeManager::get().await {
@@ -35,20 +39,20 @@ async fn destroy_container_for_project(
     };
 
     let container_info = runtime
-        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)
+        .get_container_info_by_identifier(container_identifier, &shared_types::ServiceType::RCoder)
         .await
         .ok()
         .flatten();
 
     if let Some(container_info) = container_info {
         info!(
-            "🎯 [STOP_DESTROY] Container found, starting destruction: project_id={}, container_id={}, container_name={}",
-            project_id, container_info.container_id, container_info.container_name
+            "🎯 [STOP_DESTROY] Container found, starting destruction: container_identifier={}, container_id={}, container_name={}",
+            container_identifier, container_info.container_id, container_info.container_name
         );
 
-        // 停止容器
+        // 停止容器（使用 container_identifier 构造正确的 pod name / container name）
         let stop_result = runtime
-            .stop_container_by_identifier(project_id, &shared_types::ServiceType::RCoder)
+            .stop_container_by_identifier(container_identifier, &shared_types::ServiceType::RCoder)
             .await;
 
         if let Err(e) = stop_result {
@@ -184,12 +188,12 @@ pub async fn agent_stop(
     let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
 
     info!(
-        "🛑 [STOP_DESTROY] Received container destroy request: project_id={}",
-        project_id
+        "🛑 [STOP_DESTROY] Received container destroy request: project_id={}, pod_id={:?}",
+        project_id, request.pod_id
     );
 
     // 直接销毁容器
-    let result = destroy_container_for_project(&state, project_id, locale).await;
+    let result = destroy_container_for_project(&state, project_id, request.pod_id.as_deref(), locale).await;
 
     match &result {
         Ok(response) => {
