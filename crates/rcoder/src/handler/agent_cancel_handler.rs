@@ -32,10 +32,10 @@ pub struct ComputerCancelQuery {
     #[serde(default)]
     pub pod_id: Option<String>,
     /// 租户ID（可选）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
     pub tenant_id: Option<String>,
     /// 空间ID（可选）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
     pub space_id: Option<String>,
     /// 隔离类型（可选），如 "project", "tenant", "space"
     #[serde(default)]

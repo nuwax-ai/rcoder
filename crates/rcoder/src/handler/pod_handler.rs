@@ -252,12 +252,12 @@ pub struct EnsurePodRequest {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 
@@ -331,12 +331,12 @@ pub struct KeepalivePodRequest {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 
@@ -408,12 +408,12 @@ pub struct RestartPodRequest {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 
@@ -1657,13 +1657,13 @@ pub struct PodStatusQuery {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[param(example = "tenant_abc")]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[param(example = "space_xyz")]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
@@ -1932,13 +1932,13 @@ pub struct VncStatusQuery {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[param(example = "tenant_abc")]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
     #[param(example = "space_xyz")]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,

@@ -5,6 +5,9 @@ rust_i18n::i18n!("locales", fallback = "en-US");
 mod container;
 mod model;
 
+// 灵活的字符串反序列化器（支持 JSON 字符串和数字）
+pub mod flexible_string;
+
 // i18n 国际化模块
 pub mod i18n;
 pub use i18n::{
