@@ -8,6 +8,8 @@ namespace: rcoder-local
 
 resources:
   - ../../base
+  - clusterrolebinding.yaml
+  - credentials.yaml
   - rcoder-configmap.yaml
 
 labels:

@@ -178,10 +178,18 @@ K8S_LOCAL_AGENT_IMAGE ?= rcoder-agent-runner-local:latest
 # 构建本地 K8s 测试镜像（不推送到远程仓库）
 dev-build-k8s-local:
 	@echo "🔨 构建本地 K8s 测试镜像..."
-	@echo "📦 构建 rcoder (features=kubernetes)..."
+	@echo "📦 [1/2] 构建 rcoder (features=kubernetes)..."
 	@docker build -f docker/rcoder-master/Dockerfile -t $(K8S_LOCAL_IMAGE) --build-arg CARGO_FLAGS="--features kubernetes" .
-	@echo "📦 构建 agent-runner..."
-	@docker build -f docker/rcoder-agent-runner/Dockerfile -t $(K8S_LOCAL_AGENT_IMAGE) .
+	@echo "📦 [2/2] 构建 agent-runner..."
+	@echo "  步骤 1: 在 Docker 中编译 agent_runner 二进制..."
+	@docker build -f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build-local .
+	@mkdir -p docker/rcoder-agent-runner/bin
+	@docker create --name build-container-local rcoder-agent-runner-build-local 2>/dev/null || true
+	@docker cp build-container-local:/build/target/release/agent_runner docker/rcoder-agent-runner/bin/agent_runner
+	@docker rm build-container-local
+	@docker rmi rcoder-agent-runner-build-local
+	@echo "  步骤 2: 构建最终 agent-runner 镜像..."
+	@cd docker/rcoder-agent-runner && docker build -f Dockerfile --build-arg INSTALL_EBPF_TOOLS=false -t $(K8S_LOCAL_AGENT_IMAGE) .
 	@echo "✅ 本地镜像构建完成！"
 	@docker images | grep -E "rcoder-local|rcoder-agent-runner-local"
 
