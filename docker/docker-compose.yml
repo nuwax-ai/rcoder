@@ -32,14 +32,13 @@ services:
       # - ./wallpaper:/app/assets
     command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8087/health"]
+      test:
+        ["CMD", "curl", "-f", "http://localhost:${RCODER_PORT:-8090}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
     restart: always
-    networks:
-      - local-agent-network
 
   # Pyroscope Server - 持续剖析数据存储和可视化
   pyroscope:
@@ -54,8 +53,6 @@ services:
     command:
       - server
     restart: unless-stopped
-    networks:
-      - local-agent-network
 
   # Prometheus Server - 时序数据库，存储常规指标
   prometheus:
@@ -74,8 +71,6 @@ services:
       - prometheus-data:/prometheus
     environment:
       - TZ=Asia/Shanghai
-    networks:
-      - local-agent-network
     restart: unless-stopped
 
   # Grafana - 可视化平台
@@ -92,8 +87,6 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-    networks:
-      - local-agent-network
     depends_on:
       - prometheus
     restart: unless-stopped
@@ -102,7 +95,3 @@ volumes:
   pyroscope-data:
   prometheus-data:
   grafana-data:
-
-networks:
-  local-agent-network:
-    driver: bridge

@@ -338,7 +338,7 @@ impl AgentService for AgentServiceImpl {
             agent_config_override: req.agent_config.map(convert_agent_config),
             system_prompt_override: req.system_prompt,
             user_prompt_template_override: req.user_prompt,
-            skip_slot_limit: false, // gRPC 请求（Docker 容器部署），继续限制槽位
+            skip_slot_limit: true, // 去掉并发限制
         };
 
         // 4. 构建 ChatHandlerContext

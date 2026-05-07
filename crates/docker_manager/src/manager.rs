@@ -2954,14 +2954,20 @@ impl DockerManager {
                 }
             }
 
-            // 如果没找到包含指定基础名称的，返回错误
-            let available_networks: Vec<String> = networks.keys().cloned().collect();
-            return Err(DockerError::ConnectionError(format!(
-                "当前容器未连接到包含 '{}' 的网络。\n\
-                     可用网络: {:?}\n\
-                     请检查 Docker Compose 配置中的网络设置。",
-                network_base_name, available_networks
-            )));
+            // 如果没找到包含指定基础名称的，回退到第一个可用网络（Docker Compose 默认网络）
+            if let Some(fallback_name) = networks.keys().next() {
+                warn!(
+                    "未找到包含 '{}' 的网络，回退使用当前容器的默认网络: {} (可用网络: {:?})",
+                    network_base_name,
+                    fallback_name,
+                    networks.keys().collect::<Vec<_>>()
+                );
+                return Ok(fallback_name.clone());
+            }
+
+            return Err(DockerError::ConnectionError(
+                "当前容器没有任何网络配置".to_string(),
+            ));
         }
 
         Err(DockerError::ConnectionError(format!(
