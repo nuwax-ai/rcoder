@@ -522,9 +522,9 @@ pub async fn handle_chat_core(
         );
     }
 
-    // ========== 步骤10: 等待响应 ==========
-    match chat_prompt_rx.await {
-        Ok(response) => {
+    // ========== 步骤10: 等待响应（5 分钟超时）==========
+    match tokio::time::timeout(std::time::Duration::from_secs(300), chat_prompt_rx).await {
+        Ok(Ok(response)) => {
             let output = ChatHandlerOutput {
                 project_id: response.project_id,
                 session_id: response.session_id,
@@ -545,15 +545,17 @@ pub async fn handle_chat_core(
                 output.success, output.session_id
             );
 
-            // 请求成功，提交 PendingGuard 保留 Pending 状态
-            // Agent 已成功启动，Pending 状态将由后续操作转换为 Active
-            pending_guard.commit_success();
+            // 只有请求成功时才提交 PendingGuard 保留 Pending 状态
+            // 失败时 PendingGuard 自动 drop 清理，允许下次请求重新创建 Agent
+            if output.success {
+                pending_guard.commit_success();
+            }
 
             output
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] Chat failed: {}", e);
+            error!("[ChatHandler] Chat response channel dropped: {}", e);
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -562,6 +564,17 @@ pub async fn handle_chat_core(
                     error_codes::get_i18n_message_default("error.request_processing_failed"),
                     e
                 ),
+                error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
+            )
+        }
+        Err(_elapsed) => {
+            // PendingGuard 自动清理（在 drop 时）
+            error!("[ChatHandler] ⏰ Chat request timeout (300s): project_id={}", project_id);
+            ChatHandlerOutput::error(
+                project_id,
+                session_id.unwrap_or_default(),
+                error_codes::get_i18n_message_default("error.request_processing_failed")
+                    + ": request timeout (300s)",
                 error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
             )
         }

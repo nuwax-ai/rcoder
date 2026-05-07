@@ -268,7 +268,7 @@ impl DockerManager {
             mounts.push(Mount {
                 target: Some(config.container_path.clone()),
                 source: Some(config.host_path.clone()),
-                typ: Some(bollard::models::MountTypeEnum::BIND),
+                typ: Some(bollard::models::MountType::BIND),
                 read_only: Some(false),
                 ..Default::default()
             });
@@ -285,7 +285,7 @@ impl DockerManager {
             mounts.push(Mount {
                 target: Some(extra_mount.container_path.clone()),
                 source: Some(extra_mount.host_path.clone()),
-                typ: Some(bollard::models::MountTypeEnum::BIND),
+                typ: Some(bollard::models::MountType::BIND),
                 read_only: Some(extra_mount.read_only),
                 ..Default::default()
             });
@@ -1181,7 +1181,7 @@ impl DockerManager {
                     .as_ref()
                     .and_then(|mounts| {
                         mounts.iter().find(|m: &&bollard::models::MountPoint| {
-                            matches!(m.typ, Some(bollard::models::MountPointTypeEnum::BIND))
+                            m.typ.as_deref() == Some("bind")
                         })
                     })
                     .and_then(|mount| {

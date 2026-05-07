@@ -1349,13 +1349,20 @@ impl PortProxy {
 
         // 创建 HTTP Peer 到容器的 noVNC 端口
         // Pingora 会自动处理 WebSocket upgrade
-        let peer = Box::new(HttpPeer::new(
+        let mut peer = HttpPeer::new(
             (container_ip.as_str(), NOVNC_PORT),
             false,          // 不使用 TLS
             "".to_string(), // SNI
-        ));
+        );
 
-        Ok(peer)
+        // VNC WebSocket 长连接优化配置
+        peer.options.connection_timeout = Some(Duration::from_secs(10));
+        peer.options.read_timeout = None; // 无限等待（VNC 持续流）
+        peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
+        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+        peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1小时空闲超时
+
+        Ok(Box::new(peer))
     }
 
     /// 处理音频流的上游连接
@@ -1398,7 +1405,7 @@ impl PortProxy {
         // WebSocket 长连接优化配置
         peer.options.connection_timeout = Some(Duration::from_secs(10));
         peer.options.read_timeout = None; // 无限等待(音频流可能持续数小时)
-        peer.options.write_timeout = Some(Duration::from_secs(30));
+        peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
         peer.options.total_connection_timeout = Some(Duration::from_secs(15));
         peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1 小时空闲超时
 
@@ -1438,7 +1445,7 @@ impl PortProxy {
         // IME 长连接优化 (与音频流相同配置)
         peer.options.connection_timeout = Some(Duration::from_secs(10));
         peer.options.read_timeout = None; // 无限等待
-        peer.options.write_timeout = Some(Duration::from_secs(30));
+        peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
         peer.options.total_connection_timeout = Some(Duration::from_secs(15));
         peer.options.idle_timeout = Some(Duration::from_secs(3600));
 
@@ -1485,13 +1492,21 @@ impl PortProxy {
         debug!("route: {}:{}", backend_host, target_port);
 
         // 创建 HTTP Peer
-        let peer = Box::new(HttpPeer::new(
+        let mut peer = HttpPeer::new(
             (backend_host.as_str(), target_port),
             false,          // 不使用 TLS
             "".to_string(), // SNI
-        ));
+        );
 
-        Ok(peer)
+        // 端口代理长连接优化配置（支持 WebSocket、Vite HMR 等）
+        // 与音频/IME WebSocket 场景保持一致
+        peer.options.connection_timeout = Some(Duration::from_secs(10));
+        peer.options.read_timeout = None; // 无限等待（WebSocket/Vite HMR 需要长连接）
+        peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
+        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+        peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1小时空闲超时
+
+        Ok(Box::new(peer))
     }
 }
 

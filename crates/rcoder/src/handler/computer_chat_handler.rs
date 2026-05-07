@@ -715,7 +715,7 @@ async fn forward_computer_request_to_container(
             request.data_source_attachments.clone(),
             request.model_provider.clone(),
             request.request_id.clone(),
-            None, // 使用默认超时
+            Some(std::time::Duration::from_secs(300)), // 5 分钟超时，避免永久阻塞
             request.system_prompt.clone(),
             request.user_prompt.clone(),
             request.agent_config.clone(),

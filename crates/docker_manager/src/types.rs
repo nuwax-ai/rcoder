@@ -575,6 +575,7 @@ impl ContainerFilter {
                         bollard::models::ContainerSummaryStateEnum::RESTARTING => "restarting",
                         bollard::models::ContainerSummaryStateEnum::REMOVING => "removing",
                         bollard::models::ContainerSummaryStateEnum::DEAD => "dead",
+                        bollard::models::ContainerSummaryStateEnum::STOPPING => "stopping",
                         bollard::models::ContainerSummaryStateEnum::EMPTY => "unknown",
                     };
                     statuses.iter().any(|s| s.to_string() == state_str)

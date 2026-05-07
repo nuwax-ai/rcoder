@@ -206,25 +206,39 @@ pub async fn handle_computer_progress(
     // 3. 创建消息流和心跳流
     // UnifiedSessionMessage 已使用 #[serde(rename_all = "camelCase")], 序列化后符合 RCoder 约定
     let message_stream = ReceiverStream::new(message_rx).map(|msg| {
-        // 直接序列化 UnifiedSessionMessage（使用 camelCase）
+        let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
         let json_str = match serde_json::to_string(&msg) {
             Ok(s) => s,
             Err(e) => {
                 error!("[HTTP] Failed to serialize message: {}", e);
-                return Ok(Event::default().data("{}"));
+                return (Ok(Event::default().data("{}")), false);
             }
         };
-
-        // 使用 sub_type 作为 SSE event name（与 RCoder 约定一致）
-        Ok(Event::default().event(msg.sub_type).data(json_str))
+        (Ok(Event::default().event(msg.sub_type).data(json_str)), is_terminal)
     });
 
-    // 4. 创建心跳流
-    let heartbeat_stream = create_heartbeat_stream(session_id.clone());
+    // 4. 创建心跳流（标记为非终端）
+    let heartbeat_stream = create_heartbeat_stream(session_id.clone())
+        .map(|event| (event, false));
 
-    // 5. 合并两个流（消息流优先级更高，心跳作为背景流）
-    // 使用 select! 合并，保持事件顺序
-    let merged_stream = futures_util::stream::select(message_stream, heartbeat_stream);
+    // 5. 合并两个流，并用 scan 监测终止条件
+    // select 会继续轮询心跳流（永不结束），所以必须在合并流层面检测终止
+    // 终止条件：
+    //   - 收到 SessionPromptEnd（终端消息）→ 发送后结束流
+    //   - channel 关闭 → message_stream 返回 None，scan 最终也会结束
+    let merged_stream = futures_util::stream::select(message_stream, heartbeat_stream)
+        .scan(false, |seen_terminal, (event, is_terminal)| {
+            if *seen_terminal {
+                // 已发送终端消息，结束流
+                return std::future::ready(None);
+            }
+
+            if is_terminal {
+                *seen_terminal = true;
+            }
+
+            std::future::ready(Some(event))
+        });
 
     info!("[HTTP] SSE stream established: session_id={}", session_id);
 

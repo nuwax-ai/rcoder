@@ -447,7 +447,7 @@ async fn forward_request_to_container_service(
             request.data_source_attachments.clone(),
             request.model_provider.clone(),
             request.request_id.clone(),
-            None, // ✅ 使用连接级别默认超时，未来可根据需要设置
+            Some(std::time::Duration::from_secs(300)), // 5 分钟超时，避免永久阻塞
             // 新增参数 (v2)
             request.system_prompt.clone(),
             request.user_prompt.clone(),
