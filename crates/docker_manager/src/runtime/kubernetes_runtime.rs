@@ -72,6 +72,8 @@ pub struct KubernetesRuntimeConfig {
     pub nfs_path: String,
     /// StorageClass 名称 (nfs-subdir-external-provisioner 创建的 SC)
     pub storage_class: String,
+    /// PVC 访问模式: ReadWriteMany (默认, JuiceFS/NFS) 或 ReadWriteOnce (local-path)
+    pub access_mode: String,
     /// DockerManagerConfig for image selection (包含 multi_image_config)
     pub docker_manager_config: DockerManagerConfig,
 }
@@ -99,13 +101,15 @@ impl KubernetesRuntime {
             .unwrap_or_else(|_| "/exports".to_string());
         let storage_class = std::env::var("RCODER_K8S_STORAGE_CLASS")
             .unwrap_or_else(|_| "rcoder-nfs".to_string());
+        let access_mode = std::env::var("RCODER_K8S_PVC_ACCESS_MODE")
+            .unwrap_or_else(|_| "ReadWriteMany".to_string());
 
         info!(
             "[K8S] Kubernetes runtime initialized, namespace: {}",
             namespace
         );
-        info!("[K8S] NFS storage: server={}, path={}, storage_class={}",
-            nfs_server, nfs_path, storage_class);
+        info!("[K8S] NFS storage: server={}, path={}, storage_class={}, access_mode={}",
+            nfs_server, nfs_path, storage_class, access_mode);
 
         Ok(Self {
             client,
@@ -118,6 +122,7 @@ impl KubernetesRuntime {
                 nfs_server,
                 nfs_path,
                 storage_class,
+                access_mode,
                 docker_manager_config: config,
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -189,7 +194,7 @@ impl KubernetesRuntime {
                 ..Default::default()
             },
             spec: Some(PersistentVolumeClaimSpec {
-                access_modes: Some(vec!["ReadWriteMany".to_string()]),
+                access_modes: Some(vec![self.config.access_mode.clone()]),
                 storage_class_name: Some(self.config.storage_class.clone()),
                 resources: Some(VolumeResourceRequirements {
                     requests: Some({
