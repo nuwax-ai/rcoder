@@ -1,0 +1,50 @@
+# RCoder ConfigMap - 本地测试环境
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rcoder-config
+data:
+  config.yml: |
+    default_agent: "Claude"
+
+    projects_dir: "/app/project_workspace"
+    port: 8087
+
+    cleanup_config:
+      enabled: true
+      idle_timeout_seconds: 600
+      cleanup_interval_seconds: 300
+      docker_stop_timeout_seconds: 30
+
+    docker_config:
+      multi_image_config:
+        global_defaults:
+          registry_prefix: ""
+        services:
+          rcoder:
+            service_type: "RCoder"
+            arm64_image: "rcoder-local:latest"
+            amd64_image: "rcoder-local:latest"
+            default_image: "rcoder-local:latest"
+            image_tag_prefix: "rcoder"
+            enabled: true
+          computer-agent-runner:
+            service_type: "ComputerAgentRunner"
+            arm64_image: "rcoder-agent-runner-local:latest"
+            amd64_image: "rcoder-agent-runner-local:latest"
+            default_image: "rcoder-agent-runner-local:latest"
+            image_tag_prefix: "rcoder-agent-runner"
+            enabled: true
+        selection_strategy: "ServiceOnly"
+
+      network_base_name: "agent-network"
+      network_mode: "bridge"
+      work_dir: "/app"
+      auto_cleanup: true
+      container_ttl_seconds: 3600
+
+    api_key_auth:
+      enabled: false
+
+    kubernetes_config:
+      storage_class: "local-path"

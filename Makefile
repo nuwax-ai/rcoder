@@ -6,6 +6,7 @@
 	build install install-agent uninstall \
 	dev-build dev-up dev-restart dev-down dev-logs \
 	dev-build-k8s dev-up-k8s dev-restart-k8s dev-down-k8s dev-logs-k8s \
+	dev-build-k8s-local dev-up-k8s-local dev-restart-k8s-local dev-down-k8s-local dev-logs-k8s-local dev-local-k8s \
 	docker-build docker-build-base docker-build-master docker-build-master-base \
 	docker-build-agent-runner docker-build-agent-base docker-build-agent-production \
 	docker-pre-download-libreoffice docker-clean-libreoffice-downloads \
@@ -89,6 +90,14 @@ help:
 	@echo "  make dev-restart-k8s - 重启 K8s 开发模式（重新构建镜像+部署）"
 	@echo "  make dev-down-k8s  - 停止 K8s 开发模式（存储层 + 应用层 + RBAC + Namespace）"
 	@echo "  make dev-logs-k8s  - 查看 K8s 开发模式日志"
+	@echo ""
+	@echo "☸️  本地 K8s 测试 (OrbStack/k3d/kind):"
+	@echo "  make dev-local-k8s         - 一键构建+部署到本地 K8s"
+	@echo "  make dev-build-k8s-local   - 构建本地 K8s 镜像（不推送远程）"
+	@echo "  make dev-up-k8s-local      - 启动本地 K8s 测试（使用 local-path 存储）"
+	@echo "  make dev-restart-k8s-local - 重启本地 K8s 测试"
+	@echo "  make dev-down-k8s-local    - 停止本地 K8s 测试"
+	@echo "  make dev-logs-k8s-local    - 查看本地 K8s 测试日志"
 	@echo ""
 	@echo "📦 离线部署 (政企内网用):"
 	@echo "  make k8s-offline-bundle        - 打包完整离线包 (images + helm + manifests)"

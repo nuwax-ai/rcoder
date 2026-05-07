@@ -166,3 +166,57 @@ kustomize-build:
 	@kubectl kustomize $(KUSTOMIZE_DIR)/overlays/dev >/dev/null && echo "  ✓"
 	@echo "=== Prod Overlay ==="
 	@kubectl kustomize $(KUSTOMIZE_DIR)/overlays/prod >/dev/null && echo "  ✓"
+
+# ============================================================================
+# 本地 K8s 测试 (OrbStack / k3d / kind)
+# ============================================================================
+
+K8S_LOCAL_NAMESPACE := rcoder-local
+K8S_LOCAL_IMAGE ?= rcoder-local:latest
+K8S_LOCAL_AGENT_IMAGE ?= rcoder-agent-runner-local:latest
+
+# 构建本地 K8s 测试镜像（不推送到远程仓库）
+dev-build-k8s-local:
+	@echo "🔨 构建本地 K8s 测试镜像..."
+	@echo "📦 构建 rcoder (features=kubernetes)..."
+	@docker build -f docker/rcoder-master/Dockerfile -t $(K8S_LOCAL_IMAGE) --build-arg CARGO_FLAGS="--features kubernetes" .
+	@echo "📦 构建 agent-runner..."
+	@docker build -f docker/rcoder-agent-runner/Dockerfile -t $(K8S_LOCAL_AGENT_IMAGE) .
+	@echo "✅ 本地镜像构建完成！"
+	@docker images | grep -E "rcoder-local|rcoder-agent-runner-local"
+
+# 启动本地 K8s 测试（OrbStack 自动共享 Docker 镜像，无需手动 import）
+dev-up-k8s-local:
+	@echo "☸️  启动本地 K8s 测试 ($(K8S_LOCAL_NAMESPACE))..."
+	@kubectl apply -k $(KUSTOMIZE_DIR)/overlays/local
+	@echo ""
+	@echo "⏳ 等待 RCoder 就绪..."
+	@kubectl rollout status deploy/rcoder -n $(K8S_LOCAL_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
+	@echo ""
+	@echo "📋 部署状态:"
+	@kubectl get pods -n $(K8S_LOCAL_NAMESPACE)
+	@kubectl get pvc -n $(K8S_LOCAL_NAMESPACE)
+	@echo ""
+	@echo "💡 访问: http://localhost:30087"
+	@echo "💡 日志: make dev-logs-k8s-local"
+
+# 重启本地 K8s 测试
+dev-restart-k8s-local:
+	@echo "☸️  重启本地 K8s 测试..."
+	@kubectl delete pods -n $(K8S_LOCAL_NAMESPACE) -l app=rcoder --ignore-not-found
+	@kubectl rollout status deploy/rcoder -n $(K8S_LOCAL_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
+	@echo "✅ 已重启！"
+
+# 停止本地 K8s 测试
+dev-down-k8s-local:
+	@echo "☸️  停止本地 K8s 测试..."
+	@kubectl delete -k $(KUSTOMIZE_DIR)/overlays/local --ignore-not-found
+	@echo "✅ 已清理"
+
+# 查看本地 K8s 测试日志
+dev-logs-k8s-local:
+	@kubectl logs -n $(K8S_LOCAL_NAMESPACE) -l app=rcoder -f --tail=100
+
+# 一键构建+部署（本地 K8s 测试）
+dev-local-k8s: dev-build-k8s-local dev-up-k8s-local
+	@echo "🎉 本地 K8s 测试环境已就绪！"
