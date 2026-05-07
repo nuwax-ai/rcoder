@@ -165,10 +165,10 @@ impl KubernetesRuntime {
             }
         };
 
-        // If PVC already exists, wait for it to be Bound before proceeding
-        // (WaitForFirstConsumer PVCs may still be Pending until first consumer schedules)
+        // If PVC already exists, return immediately
+        // WaitForFirstConsumer PVCs will be Bound once a Pod referencing them is scheduled
         if pvc_exists {
-            self.wait_for_pvc_bound(&pvc_name).await?;
+            info!("[K8S] PVC {} already exists, skipping Bound check (WaitForFirstConsumer)", pvc_name);
             return Ok(());
         }
         // If not found, create it (falls through to creation logic below)
@@ -215,12 +215,10 @@ impl KubernetesRuntime {
             ))
         })?;
 
-        info!("[K8S] PVC {} created, waiting for Bound...", pvc_name);
+        info!("[K8S] PVC {} created", pvc_name);
 
-        // Wait for PVC to be Bound before creating Pod
-        self.wait_for_pvc_bound(&pvc_name).await?;
-
-        info!("[K8S] PVC {} is ready", pvc_name);
+        // 不等待 PVC Bound：WaitForFirstConsumer 存储类需要 Pod 调度后才会绑定 PVC
+        // 直接返回，让后续 Pod 创建触发 PVC 绑定
         Ok(())
     }
 
