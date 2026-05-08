@@ -271,12 +271,14 @@ impl DockerManager {
         // 拉取镜像（如果本地不存在）
         self.ensure_image_exists(&config.image).await?;
 
-        // 创建挂载点
+        // 创建挂载点（按 container_path 去重，避免 Docker Duplicate mount point 错误）
         let mut mounts = Vec::new();
+        let mut mounted_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // 只在 host_path 非空时添加主挂载点
         // 如果为空，表示完全依赖 extra_mounts（例如 ComputerAgentRunner）
         if !config.host_path.is_empty() {
+            mounted_targets.insert(config.container_path.clone());
             mounts.push(Mount {
                 target: Some(config.container_path.clone()),
                 source: Some(config.host_path.clone()),
@@ -292,8 +294,15 @@ impl DockerManager {
             debug!("📌 [DOCKER_MGR] skip default mount, using extra_mounts config");
         }
 
-        // 添加额外的挂载点
+        // 添加额外的挂载点（跳过已存在的 container_path）
         for extra_mount in &config.extra_mounts {
+            if !mounted_targets.insert(extra_mount.container_path.clone()) {
+                warn!(
+                    "[DOCKER_MGR] Skipping duplicate mount target: {} (host: {})",
+                    extra_mount.container_path, extra_mount.host_path
+                );
+                continue;
+            }
             mounts.push(Mount {
                 target: Some(extra_mount.container_path.clone()),
                 source: Some(extra_mount.host_path.clone()),
@@ -1508,23 +1517,6 @@ impl DockerManager {
         // workspace_resolution: rcoder 容器内路径 → 解析宿主机路径
         // workspace_container: sub-container 内挂载目标
 
-        // 检查 config.yml 中是否已有 workspace 挂载（含 {project_id} 模板）
-        // 如果有，config 的动态调整逻辑会根据 isolation_type 自动处理挂载级别，
-        // 无需 auto-inject 重复注入，否则会导致 Duplicate mount point 错误
-        let config_has_workspace_mount = pod_id.is_some()
-            && service_config.mounts.iter().any(|m| {
-                m.container_path.starts_with(&workspace_container)
-                    && m.container_path.contains("{project_id}")
-            });
-
-        if config_has_workspace_mount {
-            debug!(
-                "Skipping auto-inject workspace mount: config already has workspace mount \
-                 with {{project_id}} template that will be adjusted by isolation_type logic"
-            );
-        }
-
-        if !config_has_workspace_mount {
         match crate::path::resolve_container_path_to_host(
             std::path::Path::new(&workspace_resolution),
         )
@@ -1580,7 +1572,6 @@ impl DockerManager {
                 );
             }
         }
-        } // end if !config_has_workspace_mount
 
         // 🎯 处理配置文件中的挂载点 (service_config.mounts)
         let container_name = format!("{}-{}", container_prefix, container_id);
