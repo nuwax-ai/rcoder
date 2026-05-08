@@ -164,6 +164,35 @@ impl ProjectRepository {
         })
     }
 
+    /// 根据 pod_id 查找所有项目 (RCoder 共享容器模式)
+    ///
+    /// 在 RCoder 共享容器模式下，多个项目可能共享同一个容器（通过 pod_id 标识），
+    /// 返回该 Pod 下所有项目记录，按最后活动时间倒序排列
+    pub fn find_projects_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Vec<ProjectRecord>> {
+        self.conn.with_connection(|c| {
+            let mut stmt = c.prepare(
+                r#"
+                SELECT project_id, session_id, service_type, container_id,
+                       user_id, pod_id, agent_status_code, agent_status_name,
+                       request_id, model_provider_json, created_at, last_activity,
+                       session_created_at, session_last_activity
+                FROM projects
+                WHERE pod_id = ?
+                ORDER BY last_activity DESC
+                "#,
+            )?;
+
+            let mut rows = stmt.query(params![pod_id])?;
+            let mut records = Vec::new();
+
+            while let Some(row) = rows.next()? {
+                records.push(Self::row_to_record(row)?);
+            }
+
+            Ok(records)
+        })
+    }
+
     /// 获取 Pod 最新活跃项目的容器ID (共享容器模式)
     ///
     /// 在共享容器模式下，多个项目可能共享同一个容器（通过 pod_id 标识），

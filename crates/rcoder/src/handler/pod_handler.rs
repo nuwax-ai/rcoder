@@ -824,6 +824,7 @@ pub async fn pod_ensure(
                 } else {
                     let mut pinfo = ProjectAndContainerInfo::new(request.project_id.clone());
                     pinfo.set_user_id(Some(request.user_id.clone()));
+                    pinfo.set_pod_id(request.pod_id.clone());
                     pinfo.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                     pinfo.set_container(Some(info.clone()));
                     pinfo
@@ -1178,6 +1179,7 @@ pub async fn pod_ensure(
         // 如果不存在记录，创建新记录
         let mut info = ProjectAndContainerInfo::new(request.project_id.clone());
         info.set_user_id(Some(request.user_id.clone()));
+        info.set_pod_id(request.pod_id.clone());
         info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
         info.set_container(Some(container_info.clone()));
         info
@@ -1294,8 +1296,13 @@ pub async fn pod_keepalive(
                 .map(|t| t.timestamp_millis() as u64)
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
 
-            // 更新同用户下其他项目的 last_activity（防止共享容器被误清理）
-            let related_projects = state.projects.find_projects_by_user_id(&request.user_id);
+            // 更新同容器下其他项目的 last_activity（防止共享容器被误清理）
+            // 优先使用 pod_id 查找（RCoder 共享容器模式），否则使用 user_id
+            let related_projects = if let Some(ref pod_id) = request.pod_id {
+                state.projects.find_projects_by_pod_id(pod_id)
+            } else {
+                state.projects.find_projects_by_user_id(&request.user_id)
+            };
             for related in &related_projects {
                 if related.project_id != request.project_id {
                     state.update_activity(&related.project_id);
@@ -1321,6 +1328,7 @@ pub async fn pod_keepalive(
                 if !state.contains_project(&request.project_id) {
                     let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
                     project_info.set_user_id(Some(request.user_id.clone()));
+                    project_info.set_pod_id(request.pod_id.clone());
                     project_info
                         .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                     project_info.set_container(Some(info.clone()));
@@ -1631,6 +1639,7 @@ pub async fn pod_restart(
     {
         let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
         project_info.set_user_id(Some(request.user_id.clone()));
+        project_info.set_pod_id(request.pod_id.clone());
         project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
         project_info.set_container(Some(container_info.clone()));
         state.insert_project(request.project_id.clone(), Arc::new(project_info));

@@ -276,6 +276,7 @@ pub async fn computer_agent_status(
         let mut project_info =
             shared_types::ProjectAndContainerInfo::new(project_id.to_string());
         project_info.set_user_id(request.user_id.clone());
+        project_info.set_pod_id(request.pod_id.clone());
 
         // 恢复容器信息
         // 注意：这里我们使用查询到的 container_info

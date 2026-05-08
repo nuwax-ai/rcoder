@@ -155,12 +155,12 @@ impl ProjectRecord {
     /// 获取容器唯一标识
     ///
     /// 根据 service_type 返回不同的标识符：
-    /// - RCoder 模式：返回 project_id
+    /// - RCoder 模式：返回 pod_id（如果存在，共享容器），否则返回 project_id
     /// - ComputerAgentRunner 模式：返回 user_id（如果存在）
     pub fn container_key(&self) -> &str {
         match self.service_type {
             ServiceType::ComputerAgentRunner => self.user_id.as_deref().unwrap_or(&self.project_id),
-            ServiceType::RCoder => &self.project_id,
+            ServiceType::RCoder => self.pod_id.as_deref().unwrap_or(&self.project_id),
         }
     }
 }

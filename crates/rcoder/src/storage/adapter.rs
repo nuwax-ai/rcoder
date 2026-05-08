@@ -387,6 +387,22 @@ impl ProjectAdapter {
         }
     }
 
+    /// 根据 pod_id 查找所有项目（RCoder 共享容器模式）
+    ///
+    /// 返回该 Pod 下所有项目记录，按最后活动时间倒序排列
+    pub fn find_projects_by_pod_id(
+        &self,
+        pod_id: &str,
+    ) -> Vec<duckdb_manager::models::ProjectRecord> {
+        match self.storage.find_projects_by_pod_id(pod_id) {
+            Ok(projects) => projects,
+            Err(e) => {
+                warn!("Failed to get project for pod_id {}: {}", pod_id, e);
+                Vec::new()
+            }
+        }
+    }
+
     // ========== 清理相关方法 ==========
 
     /// 查找闲置容器

@@ -96,6 +96,11 @@ pub trait UnifiedStorage: Send + Sync {
     /// 此方法返回该 Pod 下最近活跃项目关联的容器ID
     fn get_latest_container_id_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Option<String>>;
 
+    /// 根据 pod_id 查找所有项目（RCoder 共享容器模式）
+    ///
+    /// 返回该 Pod 下所有项目记录，按最后活动时间倒序排列
+    fn find_projects_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Vec<ProjectRecord>>;
+
     // ========== 会话操作 ==========
 
     /// 根据会话ID获取项目
@@ -334,6 +339,10 @@ impl UnifiedStorage for DuckDbStorage {
 
     fn get_latest_container_id_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Option<String>> {
         self.projects()?.get_latest_container_id_by_pod_id(pod_id)
+    }
+
+    fn find_projects_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Vec<ProjectRecord>> {
+        self.projects()?.find_projects_by_pod_id(pod_id)
     }
 
     // ========== 会话操作 ==========

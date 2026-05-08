@@ -39,6 +39,10 @@ pub struct ProjectCoreState {
     /// - RCoder 模式：None（使用 project_id 作为容器唯一标识）
     /// - ComputerAgentRunner 模式：Some(user_id)（使用 user_id 作为容器唯一标识）
     pub user_id: Option<String>,
+    /// Pod ID（共享容器模式）
+    /// - RCoder 模式：当 pod_id 有值时，多个项目共享同一个容器
+    /// - ComputerAgentRunner 模式：通常为 None（使用 user_id 共享）
+    pub pod_id: Option<String>,
     /// 会话ID，agent 服务启动时会创建一个会话ID
     pub session_id: Option<String>,
     /// 最后活动时间
@@ -53,6 +57,7 @@ impl ProjectCoreState {
         Self {
             project_id,
             user_id: None,
+            pod_id: None,
             session_id: None,
             last_activity: now,
             created_at: now,
@@ -66,6 +71,7 @@ impl ProjectCoreState {
         Self {
             project_id,
             user_id: Some(user_id),
+            pod_id: None,
             session_id: None,
             last_activity: now,
             created_at: now,
@@ -239,17 +245,22 @@ impl ProjectAndContainerInfo {
         self.state.core.user_id.as_deref()
     }
 
+    /// 获取 Pod ID（共享容器模式）
+    pub fn pod_id(&self) -> Option<&str> {
+        self.state.core.pod_id.as_deref()
+    }
+
     /// 获取容器唯一标识
     ///
     /// 根据 service_type 返回不同的标识符：
-    /// - RCoder 模式：返回 project_id
+    /// - RCoder 模式：返回 pod_id（如果存在，共享容器），否则返回 project_id
     /// - ComputerAgentRunner 模式：返回 user_id（如果存在），否则回退到 project_id
     pub fn container_key(&self) -> &str {
         match self.service_type() {
             Some(ServiceType::ComputerAgentRunner) => {
                 self.user_id().unwrap_or_else(|| self.project_id())
             }
-            _ => self.project_id(),
+            _ => self.pod_id().unwrap_or_else(|| self.project_id()),
         }
     }
 
@@ -307,6 +318,12 @@ impl ProjectAndContainerInfo {
     pub fn set_user_id(&mut self, user_id: Option<String>) {
         self.state.update_core(|core| {
             core.user_id = user_id;
+        });
+    }
+
+    pub fn set_pod_id(&mut self, pod_id: Option<String>) {
+        self.state.update_core(|core| {
+            core.pod_id = pod_id;
         });
     }
 

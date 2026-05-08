@@ -577,6 +577,8 @@ pub async fn handle_computer_chat(
 
                 // 设置 user_id（ComputerAgentRunner 模式）
                 project_info.set_user_id(Some(user_id.clone()));
+                // 设置 pod_id（共享容器模式）
+                project_info.set_pod_id(request.pod_id.clone());
 
                 // 更新会话ID
                 project_info.update_session(session_id.clone());
@@ -894,6 +896,8 @@ fn ensure_project_mapping_in_state(
 
     // 设置 user_id（ComputerAgentRunner 模式）
     project_info.set_user_id(Some(user_id.to_string()));
+    // 设置 pod_id（共享容器模式）
+    project_info.set_pod_id(request.pod_id.clone());
 
     // 更新容器信息
     project_info.update_extended_from_request(

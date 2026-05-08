@@ -231,6 +231,10 @@ pub async fn handle_chat(
             if needs_extended_update {
                 // 创建更新后的信息
                 let mut mutable_info = (*existing_info).clone();
+                // 补充 pod_id（兼容旧数据或服务重启后丢失的情况）
+                if mutable_info.pod_id().is_none() && request.pod_id.is_some() {
+                    mutable_info.set_pod_id(request.pod_id.clone());
+                }
                 mutable_info.update_extended_from_request(
                     Some(container_info.clone()),
                     request.model_provider.clone(),
@@ -265,6 +269,7 @@ pub async fn handle_chat(
 
             // 创建新的 ProjectAndContainerInfo
             let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
+            new_info.set_pod_id(request.pod_id.clone());
             new_info.update_extended_from_request(
                 Some(container_info.clone()),
                 request.model_provider.clone(),
