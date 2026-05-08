@@ -95,12 +95,28 @@ impl ComputerContainerManager {
                 .is_container_running_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
                 .await
             {
-                Ok(true) => {
+                Ok(true) if !info.container_ip.is_empty() => {
                     info!(
-                        "✅ [COMPUTER_CONTAINER] User container already exists and running: container_identifier={}, container_id={}",
-                        container_identifier, info.container_id
+                        "✅ [COMPUTER_CONTAINER] User container already exists and running: container_identifier={}, container_id={}, ip={}",
+                        container_identifier, info.container_id, info.container_ip
                     );
                     return Ok(info);
+                }
+                Ok(true) => {
+                    // 容器报告为运行中但 IP 为空，说明容器状态异常（可能刚被销毁但缓存未清理）
+                    warn!(
+                        "⚠️ [COMPUTER_CONTAINER] Container reported running but has empty IP, will recreate: container_identifier={}, container_id={}",
+                        container_identifier, info.container_id
+                    );
+                    if let Err(e) = runtime
+                        .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                        .await
+                    {
+                        warn!(
+                            "⚠️ [COMPUTER_CONTAINER] Failed to delete broken container: {}",
+                            e
+                        );
+                    }
                 }
                 Ok(false) => {
                     warn!(
