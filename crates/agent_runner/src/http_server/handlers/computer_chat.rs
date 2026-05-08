@@ -99,7 +99,9 @@ pub async fn handle_computer_chat(
     });
 
     // 4. 创建项目工作目录（使用配置中的 projects_dir，支持外部配置）
-    let project_dir = state.config.projects_dir.join(&user_id).join(&project_id);
+    // Docker 挂载：宿主机 /computer-project-workspace/{user_id} → 容器 /home/user
+    // Agent 工作目录：/home/user/{project_id}
+    let project_dir = state.config.projects_dir.join(&project_id);
 
     if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
         let error_msg = format!(
