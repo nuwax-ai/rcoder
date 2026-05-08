@@ -198,6 +198,9 @@ dev-up-k8s-local:
 	@echo "☸️  启动本地 K8s 测试 ($(K8S_LOCAL_NAMESPACE))..."
 	@kubectl apply -k $(KUSTOMIZE_DIR)/overlays/local
 	@echo ""
+	@echo "🔄 重启 Pod 使新镜像生效..."
+	@kubectl delete pods -n $(K8S_LOCAL_NAMESPACE) -l app=rcoder --ignore-not-found
+	@echo ""
 	@echo "⏳ 等待 RCoder 就绪..."
 	@kubectl rollout status deploy/rcoder -n $(K8S_LOCAL_NAMESPACE) --timeout=$(ROLLOUT_TIMEOUT)
 	@echo ""
