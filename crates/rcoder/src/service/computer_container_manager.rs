@@ -90,57 +90,61 @@ impl ComputerContainerManager {
             .get_container_info_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
             .await
         {
-            // ✅ 关键修复: 验证容器是否真的在运行
-            match runtime
-                .is_container_running_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
-                .await
-            {
-                Ok(true) if !info.container_ip.is_empty() => {
-                    info!(
-                        "✅ [COMPUTER_CONTAINER] User container already exists and running: container_identifier={}, container_id={}, ip={}",
-                        container_identifier, info.container_id, info.container_ip
-                    );
-                    return Ok(info);
-                }
-                Ok(true) => {
-                    // 容器报告为运行中但 IP 为空，说明容器状态异常（可能刚被销毁但缓存未清理）
+            // ✅ 关键修复: 先验证 IP 是否有效，再检查容器运行状态
+            // 顺序很重要：IP 为空说明容器已异常（被 kill 后网络已销毁），
+            // 此时不应再调用 is_container_running_by_identifier（可能因缓存返回错误结果）
+            if info.container_ip.trim().is_empty() {
+                warn!(
+                    "⚠️ [COMPUTER_CONTAINER] Container has empty IP (likely killed externally), will recreate: container_identifier={}, container_id={}",
+                    container_identifier, info.container_id
+                );
+                // 尝试清理已失效的容器
+                if let Err(e) = runtime
+                    .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                    .await
+                {
                     warn!(
-                        "⚠️ [COMPUTER_CONTAINER] Container reported running but has empty IP, will recreate: container_identifier={}, container_id={}",
-                        container_identifier, info.container_id
+                        "⚠️ [COMPUTER_CONTAINER] Failed to cleanup broken container (will create new anyway): {}",
+                        e
                     );
-                    if let Err(e) = runtime
-                        .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
-                        .await
-                    {
-                        warn!(
-                            "⚠️ [COMPUTER_CONTAINER] Failed to delete broken container: {}",
-                            e
+                }
+                // 继续创建新容器
+            } else {
+                // IP 非空，进一步验证容器是否真的在运行
+                match runtime
+                    .is_container_running_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            "✅ [COMPUTER_CONTAINER] User container already exists and running: container_identifier={}, container_id={}, ip={}",
+                            container_identifier, info.container_id, info.container_ip
                         );
+                        return Ok(info);
                     }
-                }
-                Ok(false) => {
-                    warn!(
-                        "⚠️ [COMPUTER_CONTAINER] User container exists but stopped: container_identifier={}, container_id={}, will delete and recreate",
-                        container_identifier, info.container_id
-                    );
-                    // 删除已停止的旧容器
-                    if let Err(e) = runtime
-                        .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
-                        .await
-                    {
+                    Ok(false) => {
                         warn!(
-                            "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (will create new container anyway): {}",
-                            e
+                            "⚠️ [COMPUTER_CONTAINER] User container exists but stopped: container_identifier={}, container_id={}, will delete and recreate",
+                            container_identifier, info.container_id
                         );
+                        if let Err(e) = runtime
+                            .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                            .await
+                        {
+                            warn!(
+                                "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (will create new container anyway): {}",
+                                e
+                            );
+                        }
+                        // 继续创建新容器
                     }
-                    // 继续创建新容器
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ [COMPUTER_CONTAINER] Failed to check container status: container_identifier={}, error={}, will try creating new container",
-                        container_identifier, e
-                    );
-                    // 继续创建新容器
+                    Err(e) => {
+                        warn!(
+                            "⚠️ [COMPUTER_CONTAINER] Failed to check container status: container_identifier={}, error={}, will try creating new container",
+                            container_identifier, e
+                        );
+                        // 继续创建新容器
+                    }
                 }
             }
         }

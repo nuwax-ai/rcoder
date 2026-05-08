@@ -226,12 +226,12 @@ impl DockerManager {
         );
 
         // 🔍 先检查 Docker API 中是否存在同名容器
-        // 如果容器正在运行，直接复用（避免 pod_id 模式下每次请求都重建容器）
+        // 如果容器正在运行且 IP 有效，直接复用（避免 pod_id 模式下每次请求都重建容器）
         if let Ok(Some(result)) = self.find_container_realtime(&container_name).await {
-            if result.is_running {
+            if result.is_running && !result.container_ip.is_empty() {
                 info!(
-                    "[CREATE] Container already exists and running, reusing: name={}, id={}",
-                    result.container_name, result.container_id
+                    "[CREATE] Container already exists and running, reusing: name={}, id={}, ip={}",
+                    result.container_name, result.container_id, result.container_ip
                 );
 
                 let info = DockerContainerInfo::new(
@@ -247,10 +247,18 @@ impl DockerManager {
                 return Ok(info);
             }
 
-            warn!(
-                "[CREATE] Found stopped container: name={}, id={}, status={:?}, deleting",
-                result.container_name, result.container_id, result.status
-            );
+            // 容器已停止，或运行中但 IP 为空（被外部 kill 后网络已销毁）
+            if result.is_running {
+                warn!(
+                    "[CREATE] Container running but has empty IP (likely killed externally), deleting: name={}, id={}",
+                    result.container_name, result.container_id
+                );
+            } else {
+                warn!(
+                    "[CREATE] Found stopped container: name={}, id={}, status={:?}, deleting",
+                    result.container_name, result.container_id, result.status
+                );
+            }
 
             if let Err(e) = self.stop_container_by_id(&result.container_id).await {
                 error!("[CREATE] delete container failed: {}", e);

@@ -305,6 +305,54 @@ pub async fn handle_computer_chat(
         }
     };
 
+    // 🛡️ 二次验证：确保容器 IP 非空
+    // 容器管理器应该已经处理了空 IP 的情况，但缓存/Docker API 可能返回不一致结果
+    // 如果 IP 为空，先清理旧容器再强制重建（不返回错误给客户端）
+    let container_info = if container_info.container_ip.trim().is_empty() {
+        warn!(
+            "⚠️ [COMPUTER_CHAT] Container has empty IP after get_or_create, cleaning up and recreating: \
+             user_id={}, old_container_id={}",
+            user_id, container_info.container_id
+        );
+        // 必须先清理旧容器，否则 create_container 发现同名 "running" 容器会复用它
+        let container_identifier = request.pod_id.as_deref().unwrap_or(&user_id);
+        if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await {
+            if let Err(e) = runtime
+                .stop_container_by_identifier(
+                    container_identifier,
+                    &shared_types::ServiceType::ComputerAgentRunner,
+                )
+                .await
+            {
+                warn!(
+                    "⚠️ [COMPUTER_CHAT] Failed to cleanup broken container before recreate: {}",
+                    e
+                );
+            }
+        }
+        ComputerContainerManager::force_create_container_for_user(
+            &user_id,
+            request
+                .agent_config
+                .as_ref()
+                .and_then(|c| c.resource_limits.clone()),
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("[COMPUTER_CHAT] Force recreate container failed: {}", e);
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                format!("Container recreation failed: {}", e),
+            )
+        })?
+    } else {
+        container_info
+    };
+
     info!(
         "✅ [COMPUTER_CHAT] Container ready: user_id={}, container_id={}, ip={}",
         user_id, container_info.container_id, container_info.container_ip
