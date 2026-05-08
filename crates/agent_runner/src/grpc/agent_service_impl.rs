@@ -299,17 +299,12 @@ impl AgentService for AgentServiceImpl {
 
         // 2.1 根据 service_type 计算项目目录（服务端容器内路径）
         // Docker 挂载：宿主机 /computer-project-workspace/{user_id} → 容器 /home/user
-        // Agent 工作目录：/home/user/{user_id}/{project_id}
-        let user_id = req.user_id.clone();
+        // Agent 工作目录：/home/user/{project_id}
         let project_dir = match service_type {
             shared_types::ServiceType::ComputerAgentRunner => {
-                // ComputerAgentRunner 模式：user_id 是必填的
-                let uid = user_id.as_deref().ok_or_else(|| {
-                    error!("[gRPC] ComputerAgentRunner requires user_id, but it's missing");
-                    Status::invalid_argument("user_id is required for ComputerAgentRunner service")
-                })?;
-                // Agent 工作目录：/home/user/{user_id}/{project_id}
-                std::path::PathBuf::from("/home/user").join(uid).join(&project_id)
+                // Agent 工作目录：/home/user/{project_id}
+                // /home/user 已经通过挂载映射到宿主机 /computer-project-workspace/{user_id}
+                std::path::PathBuf::from("/home/user").join(&project_id)
             }
             shared_types::ServiceType::RCoder => {
                 // RCoder 模式：检查是否有多租户隔离环境变量
