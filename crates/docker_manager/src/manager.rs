@@ -1508,6 +1508,23 @@ impl DockerManager {
         // workspace_resolution: rcoder 容器内路径 → 解析宿主机路径
         // workspace_container: sub-container 内挂载目标
 
+        // 检查 config.yml 中是否已有 workspace 挂载（含 {project_id} 模板）
+        // 如果有，config 的动态调整逻辑会根据 isolation_type 自动处理挂载级别，
+        // 无需 auto-inject 重复注入，否则会导致 Duplicate mount point 错误
+        let config_has_workspace_mount = pod_id.is_some()
+            && service_config.mounts.iter().any(|m| {
+                m.container_path.starts_with(&workspace_container)
+                    && m.container_path.contains("{project_id}")
+            });
+
+        if config_has_workspace_mount {
+            debug!(
+                "Skipping auto-inject workspace mount: config already has workspace mount \
+                 with {{project_id}} template that will be adjusted by isolation_type logic"
+            );
+        }
+
+        if !config_has_workspace_mount {
         match crate::path::resolve_container_path_to_host(
             std::path::Path::new(&workspace_resolution),
         )
@@ -1563,6 +1580,7 @@ impl DockerManager {
                 );
             }
         }
+        } // end if !config_has_workspace_mount
 
         // 🎯 处理配置文件中的挂载点 (service_config.mounts)
         let container_name = format!("{}-{}", container_prefix, container_id);

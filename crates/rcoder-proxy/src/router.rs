@@ -263,6 +263,15 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
             anyhow::anyhow!("API proxy route configuration error: {}", e)
         })?;
 
+    // Fallback: 匹配 /api/{service_name}（无额外路径段）
+    // 用于 Claude Code 启动时对 base URL 的 HEAD 连通性检查
+    router
+        .insert("/api/{service_name}", RouteType::ApiProxy)
+        .map_err(|e| {
+            tracing::error!("[ROUTER] API proxy fallback route config failed: {}", e);
+            anyhow::anyhow!("API proxy fallback route configuration error: {}", e)
+        })?;
+
     // ========================================================================
     // 🎵 音频流代理路由
     // ========================================================================
@@ -345,6 +354,11 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
             "/api/{service_name}/{*path}".to_string(),
             "🔒 API key proxy".to_string(),
             "Intercept AI API requests, inject real key and forward to actual API endpoint".to_string(),
+        ),
+        (
+            "/api/{service_name}".to_string(),
+            "🔒 API key proxy (fallback)".to_string(),
+            "Fallback for API proxy health check (HEAD requests without path suffix)".to_string(),
         ),
         (
             "/computer/audio/{user_id}/{project_id}/{*path}".to_string(),
@@ -451,7 +465,7 @@ mod tests {
     #[test]
     fn test_get_routes_documentation() {
         let docs = get_routes_documentation();
-        assert_eq!(docs.len(), 6);
+        assert_eq!(docs.len(), 7);
 
         // 验证 VNC 路由文档
         assert!(docs[0].0.contains("vnc"));
@@ -459,23 +473,27 @@ mod tests {
 
         // 验证端口代理路由文档
         assert!(docs[1].0.contains("proxy"));
-        assert!(docs[1].1.contains("端口"));
+        assert!(docs[1].1.contains("Port"));
 
         // 验证健康检查路由文档
         assert!(docs[2].0.contains("health"));
-        assert!(docs[2].1.contains("健康"));
+        assert!(docs[2].1.contains("Health"));
 
         // 验证 API 代理路由文档
         assert!(docs[3].0.contains("api"));
         assert!(docs[3].1.contains("API"));
 
+        // 验证 API 代理 fallback 路由文档
+        assert!(docs[4].0.contains("api"));
+        assert!(docs[4].1.contains("API"));
+
         // 验证音频代理路由文档
-        assert!(docs[4].0.contains("audio"));
-        assert!(docs[4].1.contains("音频"));
+        assert!(docs[5].0.contains("audio"));
+        assert!(docs[5].1.contains("Audio"));
 
         // 验证 IME 代理路由文档
-        assert!(docs[5].0.contains("ime"));
-        assert!(docs[5].1.contains("输入"));
+        assert!(docs[6].0.contains("ime"));
+        assert!(docs[6].1.contains("IME"));
     }
 
     #[test]
