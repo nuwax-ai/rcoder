@@ -4,7 +4,7 @@
 
 # Docker 镜像构建（仅构建镜像，不编译）
 # 串行构建镜像，避免资源竞争
-docker-build: docker-build-agent-base
+docker-build:
 	@echo "🔨 开始构建主镜像..."
 	@$(MAKE) docker-build-master & \
 	$(MAKE) docker-build-agent-runner & \
