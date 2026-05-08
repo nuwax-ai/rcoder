@@ -18,7 +18,7 @@ use bollard::{
 };
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
-use shared_types::ContainerBasicInfo;
+use shared_types::{ContainerBasicInfo, ServiceType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1529,31 +1529,45 @@ impl DockerManager {
         .await
         {
             Ok(workspace_host_path) => {
-                let (host_sub, container_sub) = if pod_id.is_some() {
+                let (host_sub, container_mount) = if pod_id.is_some() {
                     // pod_id 有值：根据 isolation_type 决定挂载级别
                     let tid = tenant_id.as_deref().unwrap_or("default");
                     let sid = space_id.as_deref().unwrap_or("default");
                     let proj = project_id.as_deref().unwrap_or("default");
                     match isolation_type.as_deref().map(|s| s.to_lowercase()) {
                         Some(ref it) if it == "space" => {
-                            (format!("{}/{}", tid, sid), format!("{}/{}", tid, sid))
+                            let sub = format!("{}/{}", tid, sid);
+                            (sub.clone(), std::path::PathBuf::from(&workspace_container).join(&sub))
                         }
                         Some(ref it) if it == "tenant" => {
-                            (format!("{}", tid), format!("{}", tid))
+                            let sub = format!("{}", tid);
+                            (sub.clone(), std::path::PathBuf::from(&workspace_container).join(&sub))
                         }
-                        _ => (
-                            format!("{}/{}/{}", tid, sid, proj),
-                            format!("{}/{}/{}", tid, sid, proj),
-                        ),
+                        _ => {
+                            let sub = format!("{}/{}/{}", tid, sid, proj);
+                            (sub.clone(), std::path::PathBuf::from(&workspace_container).join(&sub))
+                        }
                     }
                 } else {
-                    // pod_id 无值：使用 project_id
-                    let pid = project_id.as_deref().unwrap_or("default");
-                    (pid.to_string(), pid.to_string())
+                    // pod_id 无值：根据 service_type 选择挂载策略
+                    match service_type {
+                        // ComputerAgentRunner: 一个 user_id 对应一个容器
+                        // 挂载: 宿主机 /computer-project-workspace/{user_id} → 容器 /home/user
+                        // config.yml 中 container_path: "/home/user"
+                        ServiceType::ComputerAgentRunner => {
+                            let uid = user_id.as_deref().unwrap_or("default");
+                            (uid.to_string(), std::path::PathBuf::from(&workspace_container))
+                        }
+                        // RCoder: 一个 project_id 对应一个容器
+                        // 挂载: 宿主机 /project_workspace/{project_id} → 容器 /project_workspace/{project_id}
+                        ServiceType::RCoder => {
+                            let pid = project_id.as_deref().unwrap_or("default");
+                            (pid.to_string(), std::path::PathBuf::from(&workspace_container).join(pid))
+                        }
+                    }
                 };
 
                 let host_mount = workspace_host_path.join(&host_sub);
-                let container_mount = std::path::PathBuf::from(&workspace_container).join(&container_sub);
 
                 // 创建目录（在容器内创建，bind mount 传播到宿主机）
                 std::fs::create_dir_all(&container_mount).ok();
