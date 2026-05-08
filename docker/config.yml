@@ -64,6 +64,9 @@ docker_config:
         image_tag_prefix: "master-rcoder"
         enabled: true
 
+        # rcoder 容器内用于反向解析宿主机路径的基准路径
+        workspace_resolution_path: "/app/project_workspace"
+
         environment:
           RUST_LOG: "debug"
           SERVICE_MODE: "full"
@@ -113,6 +116,9 @@ docker_config:
         default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
         image_tag_prefix: "computer-agent-runner"
         enabled: true
+
+        # rcoder 容器内用于反向解析宿主机路径的基准路径
+        workspace_resolution_path: "/app/computer-project-workspace"
 
         environment:
           RUST_LOG: "debug"

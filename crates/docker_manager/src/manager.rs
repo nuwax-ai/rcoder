@@ -1439,8 +1439,10 @@ impl DockerManager {
             );
         }
 
-        // 先获取 container_prefix，因为后续字段会被移动
+        // 先获取借用字段，因为后续字段会被移动
         let container_prefix = service_config.container_prefix().to_string();
+        let workspace_resolution = service_config.effective_workspace_resolution_path();
+        let workspace_container = service_config.workspace_container_path();
 
         // 应用资源限制
         let limits = service_config.resource_limits;
@@ -1502,6 +1504,66 @@ impl DockerManager {
         let network_name = self.get_main_network_name().await;
         builder = builder.network_name(network_name);
 
+        // ===== 自动注入 workspace 挂载 =====
+        // workspace_resolution: rcoder 容器内路径 → 解析宿主机路径
+        // workspace_container: sub-container 内挂载目标
+
+        match crate::path::resolve_container_path_to_host(
+            std::path::Path::new(&workspace_resolution),
+        )
+        .await
+        {
+            Ok(workspace_host_path) => {
+                let (host_sub, container_sub) = if pod_id.is_some() {
+                    // pod_id 有值：根据 isolation_type 决定挂载级别
+                    let tid = tenant_id.as_deref().unwrap_or("default");
+                    let sid = space_id.as_deref().unwrap_or("default");
+                    let proj = project_id.as_deref().unwrap_or("default");
+                    match isolation_type.as_deref().map(|s| s.to_lowercase()) {
+                        Some(ref it) if it == "space" => {
+                            (format!("{}/{}", tid, sid), format!("{}/{}", tid, sid))
+                        }
+                        Some(ref it) if it == "tenant" => {
+                            (format!("{}", tid), format!("{}", tid))
+                        }
+                        _ => (
+                            format!("{}/{}/{}", tid, sid, proj),
+                            format!("{}/{}/{}", tid, sid, proj),
+                        ),
+                    }
+                } else {
+                    // pod_id 无值：使用 project_id
+                    let pid = project_id.as_deref().unwrap_or("default");
+                    (pid.to_string(), pid.to_string())
+                };
+
+                let host_mount =
+                    format!("{}/{}", workspace_host_path.display(), host_sub);
+                let container_mount =
+                    format!("{}/{}", workspace_container, container_sub);
+
+                // 创建目录（在容器内创建，bind mount 传播到宿主机）
+                std::fs::create_dir_all(&container_mount).ok();
+
+                builder = builder.add_mount(crate::MountPoint {
+                    host_path: host_mount.clone(),
+                    container_path: container_mount.clone(),
+                    read_only: false,
+                });
+
+                info!(
+                    "📌 [DOCKER_MGR] Auto workspace mount: {} -> {}",
+                    host_mount, container_mount
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️ [DOCKER_MGR] Failed to resolve workspace host path, skipping auto mount: {}",
+                    e
+                );
+            }
+        }
+
         // 🎯 处理配置文件中的挂载点 (service_config.mounts)
         let container_name = format!("{}-{}", container_prefix, container_id);
         let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
@@ -1525,6 +1587,15 @@ impl DockerManager {
 
         // 添加配置文件中定义的挂载点
         for mount_config in &service_config.mounts {
+            // 跳过 config.yml 中与自动注入完全重复的挂载（精确匹配，不排除父目录挂载）
+            if mount_config.container_path == workspace_container {
+                debug!(
+                    "Skipping workspace mount from config (auto-injected): {}",
+                    mount_config.container_path
+                );
+                continue;
+            }
+
             let mut mount_variables = base_variables.clone();
 
             // 如果配置了 resolve_from，解析动态路径

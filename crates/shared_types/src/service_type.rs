@@ -157,6 +157,7 @@ mod tests {
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
                 container_path_template: "/app/project_workspace/{project_id}".to_string(),
+                workspace_resolution_path: None,
             },
         );
 
@@ -181,7 +182,8 @@ mod tests {
                 },
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
-                container_path_template: "/app/project_workspace/{project_id}".to_string(),
+                container_path_template: "/app/computer-project-workspace/{user_id}/{project_id}".to_string(),
+                workspace_resolution_path: None,
             },
         );
 
