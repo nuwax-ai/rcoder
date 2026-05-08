@@ -1283,6 +1283,7 @@ pub async fn pod_keepalive(
     );
 
     // 2. 检查 DuckDB 存储中是否有记录，并更新活动时间
+    // 同时更新该用户下所有项目的 last_activity（共享容器场景）
     let (previous_activity_time, current_activity_time, existed) = {
         if let Some(existing_info) = state.get_project(&request.project_id) {
             let prev = existing_info.last_activity().timestamp_millis() as u64;
@@ -1292,6 +1293,14 @@ pub async fn pod_keepalive(
             let current = updated_time
                 .map(|t| t.timestamp_millis() as u64)
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+
+            // 更新同用户下其他项目的 last_activity（防止共享容器被误清理）
+            let related_projects = state.projects.find_projects_by_user_id(&request.user_id);
+            for related in &related_projects {
+                if related.project_id != request.project_id {
+                    state.update_activity(&related.project_id);
+                }
+            }
 
             (prev, current, true)
         } else {
