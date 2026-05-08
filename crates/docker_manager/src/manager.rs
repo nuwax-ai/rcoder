@@ -1912,14 +1912,34 @@ impl DockerManager {
         project_id: &str,
         service_type: &shared_types::ServiceType,
     ) -> DockerResult<Option<ContainerQueryResult>> {
-        // 1. 查 Map (如果存在且运行中，直接返回)
+        // 1. 查 DashMap 缓存 (如果存在且运行中，通过容器名查询 IP)
         if let Some(info) = self.containers.get(project_id).await {
+            let is_running = matches!(info.status, ContainerStatus::Running);
+            if !is_running {
+                return Ok(Some(ContainerQueryResult::new(
+                    info.container_id.clone(),
+                    info.container_name.clone(),
+                    info.status.clone(),
+                    false,
+                    String::new(),
+                )));
+            }
+
+            // 容器运行中，通过容器名查询获取 IP（Moka API 缓存优先，miss 时才调 Docker API）
+            let container_ip = match self
+                .find_container_realtime(&info.container_name)
+                .await
+            {
+                Ok(Some(realtime_info)) => realtime_info.container_ip,
+                _ => String::new(),
+            };
+
             return Ok(Some(ContainerQueryResult::new(
                 info.container_id.clone(),
                 info.container_name.clone(),
                 info.status.clone(),
-                matches!(info.status, ContainerStatus::Running),
-                String::new(), // 缓存命中时 IP 可能已过期，依赖后续实时查询更新
+                true,
+                container_ip,
             )));
         }
 
@@ -1985,6 +2005,17 @@ impl DockerManager {
                 return Err(e);
             }
         };
+
+        // 如果网络信息为空，说明容器可能已被删除或未正确连接到网络
+        // 清理内存映射并返回 None，让上层调用者重新创建容器
+        if network_ips.is_empty() {
+            warn!(
+                "⚠️ [GET_AGENT_INFO] Container has no network info (may have been deleted), cleaning up memory mapping: project_id={}, container_id={}",
+                project_id, container_info.container_id
+            );
+            self.containers.remove(project_id).await;
+            return Ok(None);
+        }
 
         let container_ip = network_ips
             .get(&network_name)

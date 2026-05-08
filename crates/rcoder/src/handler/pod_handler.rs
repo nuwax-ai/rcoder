@@ -15,7 +15,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::{IntoParams, ToSchema};
 
-use super::utils::{I18nJsonOrQuery, I18nQuery, extract_grpc_addr_with_port};
+use super::utils::{I18nJsonOrQuery, I18nQuery};
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::vnc_sync::sync_single_vnc_backend;
@@ -2115,36 +2115,33 @@ pub async fn pod_vnc_status(
         }));
     }
 
-    // 6. 通过 gRPC 调用容器内的 agent_runner 获取 VNC 状态
-    let agent_info = runtime
-        .get_container_info_by_identifier(
-            lookup_user_id,
-            &shared_types::ServiceType::ComputerAgentRunner,
-        )
-        .await;
-
-    let service_url = match agent_info {
-        Ok(Some(info)) => info.service_url,
-        _ => {
-            // 如果无法获取 agent_info，返回错误
-            error!(
-                "❌ [POD_VNC_STATUS] unable to get container service info: container_id={}",
-                result.container_id
-            );
-            return Ok(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                locale,
-            ));
+    // 6. 构建 gRPC 地址
+    // 直接使用步骤 3 find_container 获取的 container_ip，避免二次缓存查找失败
+    // （find_container 实时查询 Docker API，get_container_info_by_identifier 只查内存缓存，
+    //   服务重启后缓存丢失会导致查找失败）
+    let container_ip = if !result.container_ip.is_empty() {
+        result.container_ip.clone()
+    } else {
+        // 缓存命中时 IP 可能为空，重新实时查询获取 IP
+        match runtime
+            .find_container(lookup_user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .await
+        {
+            Ok(Some(info)) if !info.container_ip.is_empty() => info.container_ip,
+            _ => {
+                error!(
+                    "❌ [POD_VNC_STATUS] unable to get container IP: container_id={}",
+                    result.container_id
+                );
+                return Ok(HttpResult::error_with_locale(
+                    shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
+                    locale,
+                ));
+            }
         }
     };
 
-    // 7. 建立 gRPC 连接并调用 GetVncStatus
-    // 使用工具函数安全提取 gRPC 地址（自动处理协议前缀和端口）
-    let grpc_addr = extract_grpc_addr_with_port(&service_url, shared_types::GRPC_DEFAULT_PORT)
-        .map_err(|e| {
-            error!("[POD_VNC_STATUS] Failed to extract gRPC address: {}", e);
-            AppError::internal_server_error(&format!("Failed to extract gRPC address: {}", e))
-        })?;
+    let grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
 
     info!(
         "📡 [POD_VNC_STATUS] Checking gRPC connection: addr={}",

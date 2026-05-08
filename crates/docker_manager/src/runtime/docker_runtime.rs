@@ -58,11 +58,27 @@ impl ContainerRuntime for DockerRuntime {
                 .get_agent_info(identifier)
                 .await
                 .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string())),
-            ServiceType::ComputerAgentRunner => self
-                .inner
-                .get_user_container_info(identifier)
-                .await
-                .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string())),
+            // 使用 find_container 实时查询 Docker API 获取 IP，
+            // 避免 get_user_container_info → get_agent_info → get_container_info 只查缓存
+            // 导致服务重启后缓存丢失返回 None
+            ServiceType::ComputerAgentRunner => {
+                let result = self.find_container(identifier, service_type).await?;
+                Ok(result.map(|pod| ContainerBasicInfo {
+                    container_id: pod.container_id,
+                    container_name: pod.container_name,
+                    container_ip: pod.container_ip.clone(),
+                    internal_port: shared_types::GRPC_DEFAULT_PORT,
+                    external_port: 0,
+                    project_id: identifier.to_string(),
+                    status: String::from(pod.status),
+                    created_at: pod.created_at,
+                    service_url: format!(
+                        "http://{}:{}",
+                        pod.container_ip,
+                        shared_types::GRPC_DEFAULT_PORT
+                    ),
+                }))
+            }
         }
     }
 
