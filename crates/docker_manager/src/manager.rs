@@ -225,24 +225,36 @@ impl DockerManager {
             container_identifier,
         );
 
-        // 🔍 先检查 Docker API 中是否存在同名容器（无论运行状态）
-        // 这是必要的，因为容器可能被外部 stop 但未删除，导致 409 Conflict
+        // 🔍 先检查 Docker API 中是否存在同名容器
+        // 如果容器正在运行，直接复用（避免 pod_id 模式下每次请求都重建容器）
         if let Ok(Some(result)) = self.find_container_realtime(&container_name).await {
+            if result.is_running {
+                info!(
+                    "[CREATE] Container already exists and running, reusing: name={}, id={}",
+                    result.container_name, result.container_id
+                );
+
+                let info = DockerContainerInfo::new(
+                    result.container_id,
+                    result.container_name,
+                    config.project_id.clone(),
+                    config.image.clone(),
+                );
+
+                // 缓存到 DashMap 以便后续查找
+                self.containers.insert(container_identifier.to_string(), info.clone()).await;
+
+                return Ok(info);
+            }
+
             warn!(
-                "[CREATE] Found duplicate container: name={}, id={}, status={:?}, running={}",
-                result.container_name, result.container_id, result.status, result.is_running
+                "[CREATE] Found stopped container: name={}, id={}, status={:?}, deleting",
+                result.container_name, result.container_id, result.status
             );
 
-            // 无论容器是运行还是停止状态，都先删除
-            info!(
-                "Deleting old container {} ({})",
-                result.container_name, result.container_id
-            );
             if let Err(e) = self.stop_container_by_id(&result.container_id).await {
                 error!("[CREATE] delete container failed: {}", e);
-                // 继续尝试创建，Docker 会返回 409 错误
             } else {
-                // 🔧 stop_container_by_id 已处理缓存失效
                 info!("[CREATE] delete container succeeded");
             }
         }
@@ -1782,11 +1794,22 @@ impl DockerManager {
                 "📝 [DOCKER_MGR] Updating container metadata: container_id={}, user_id={:?}, service_type={:?}",
                 container_id, info.user_id, info.service_type
             );
-            self.containers.insert(container_id.to_string(), info).await;
+            self.containers.insert(container_id.to_string(), info.clone()).await;
+
+            // 当 pod_id 存在时，也用 pod_id 作为 key 缓存，确保后续请求通过 pod_id 能找到容器
+            if let Some(ref pid) = pod_id {
+                self.containers.insert(pid.to_string(), info).await;
+                debug!(
+                    "📝 [DOCKER_MGR] Cached container under pod_id key: pod_id={}",
+                    pid
+                );
+            }
         }
 
         // 5. 等待就绪并返回信息
-        let info = self.get_agent_info(&container_id).await?.ok_or_else(|| {
+        // 优先使用 pod_id 查找（复用场景），否则使用 container_id (project_id)
+        let lookup_key = pod_id.as_deref().unwrap_or(&container_id);
+        let info = self.get_agent_info(lookup_key).await?.ok_or_else(|| {
             DockerError::ContainerStartError("unable to get info after container started".to_string())
         })?;
 

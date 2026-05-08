@@ -89,12 +89,20 @@ docker_config:
         #   - tenant: /app/project_workspace/{tenant_id}
         #   - project: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
         mounts:
-          - container_path: "/app/project_workspace/{project_id}"
-            host_path: "{resolved_path}/{project_id}"
+          #   - container_path: "/app/project_workspace/{project_id}"
+          #     host_path: "{resolved_path}/{project_id}"
+          #     read_only: false
+          #     mount_type: "bind"
+          #     resolve_from: "/app/project_workspace"
+          # 动态挂载：日志目录 (使用变量替换)
+          # resolve_from: 指定从哪个容器内路径解析宿主机基础路径
+          # {resolved_path}: 解析后的宿主机基础路径
+          # {log_dir_name}: 日志目录名（container_name-timestamp）
+          - container_path: "/app/logs"
+            host_path: "{resolved_path}/page-logs/{log_dir_name}"
             read_only: false
             mount_type: "bind"
-            resolve_from: "/app/project_workspace"
-
+            resolve_from: "/app/logs"
       # ComputerAgentRunner 服务配置
       computer-agent-runner:
         service_type: "ComputerAgentRunner"

@@ -254,6 +254,34 @@ pub struct DockerContainerInfo {
 }
 
 impl DockerContainerInfo {
+    /// 创建基础容器信息（仅必填字段，其余使用默认值）
+    pub fn new(
+        container_id: String,
+        container_name: String,
+        project_id: String,
+        image: String,
+    ) -> Self {
+        Self {
+            container_id,
+            container_name,
+            project_id,
+            user_id: None,
+            service_type: None,
+            image,
+            status: ContainerStatus::Running,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            host_path: String::new(),
+            container_path: String::new(),
+            port_bindings: std::collections::HashMap::new(),
+            assigned_port: 0,
+            health_status: None,
+            service_health: None,
+            internal_port: shared_types::GRPC_DEFAULT_PORT,
+            network_name: String::new(),
+        }
+    }
+
     /// 获取容器的业务主键
     ///
     /// 根据 `service_type` 返回正确的标识符：
