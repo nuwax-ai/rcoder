@@ -63,6 +63,19 @@ async fn destroy_container_for_project(
             ));
         }
 
+        // 清理旧容器的 gRPC 连接和 IP 缓存（避免复用已失效的 TCP 连接）
+        if !container_info.container_ip.is_empty() {
+            let old_grpc_addr = format!(
+                "{}:{}",
+                container_info.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            );
+            state.grpc_pool.remove(&old_grpc_addr);
+        }
+        state
+            .container_ip_cache
+            .invalidate(&container_info.container_name);
+
         // 从 DuckDB 存储中移除项目（如果 project_id 不是 "unknown"）
         if container_info.project_id != "unknown" {
             state.remove_project(&container_info.project_id);

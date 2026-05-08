@@ -924,6 +924,17 @@ pub async fn pod_ensure(
                 result.container_id
             );
 
+            // 清理旧容器的 gRPC 连接和 IP 缓存
+            if !result.container_ip.is_empty() {
+                let old_grpc_addr = format!(
+                    "{}:{}",
+                    result.container_ip,
+                    shared_types::GRPC_DEFAULT_PORT
+                );
+                state.grpc_pool.remove(&old_grpc_addr);
+            }
+            state.container_ip_cache.invalidate(&result.container_name);
+
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
             // Docker 删除是异步操作，立即创建同名容器可能导致资源冲突
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1504,6 +1515,16 @@ pub async fn pod_restart(
         state
             .container_ip_cache
             .invalidate(&container_info.container_name);
+
+        // 🆕 清理旧容器的 gRPC 连接（避免复用已失效的 TCP 连接）
+        if !container_info.container_ip.is_empty() {
+            let old_grpc_addr = format!(
+                "{}:{}",
+                container_info.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            );
+            state.grpc_pool.remove(&old_grpc_addr);
+        }
 
         // 验证容器是否真正移除
         let mut deletion_confirmed = false;

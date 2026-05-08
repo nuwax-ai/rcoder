@@ -1516,6 +1516,12 @@ impl DockerManager {
         // ===== 自动注入 workspace 挂载 =====
         // workspace_resolution: rcoder 容器内路径 → 解析宿主机路径
         // workspace_container: sub-container 内挂载目标
+        //
+        // auto-inject 统一处理 workspace 隔离挂载，config mounts 中的 workspace 挂载
+        // 通过 resolve_from 精确匹配跳过，避免重复。
+
+        // 记录 auto-inject 已添加的 container_path，用于后续冲突检测
+        let mut auto_injected_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         match crate::path::resolve_container_path_to_host(
             std::path::Path::new(&workspace_resolution),
@@ -1546,23 +1552,24 @@ impl DockerManager {
                     (pid.to_string(), pid.to_string())
                 };
 
-                let host_mount =
-                    format!("{}/{}", workspace_host_path.display(), host_sub);
-                let container_mount =
-                    format!("{}/{}", workspace_container, container_sub);
+                let host_mount = workspace_host_path.join(&host_sub);
+                let container_mount = std::path::PathBuf::from(&workspace_container).join(&container_sub);
 
                 // 创建目录（在容器内创建，bind mount 传播到宿主机）
                 std::fs::create_dir_all(&container_mount).ok();
 
+                let host_mount_str = host_mount.to_string_lossy().to_string();
+                let container_mount_str = container_mount.to_string_lossy().to_string();
+                auto_injected_paths.insert(container_mount_str.clone());
                 builder = builder.add_mount(crate::MountPoint {
-                    host_path: host_mount.clone(),
-                    container_path: container_mount.clone(),
+                    host_path: host_mount_str,
+                    container_path: container_mount_str,
                     read_only: false,
                 });
 
                 info!(
                     "📌 [DOCKER_MGR] Auto workspace mount: {} -> {}",
-                    host_mount, container_mount
+                    host_mount.display(), container_mount.display()
                 );
             }
             Err(e) => {
@@ -1596,11 +1603,14 @@ impl DockerManager {
 
         // 添加配置文件中定义的挂载点
         for mount_config in &service_config.mounts {
-            // 跳过 config.yml 中与自动注入完全重复的挂载（精确匹配，不排除父目录挂载）
-            if mount_config.container_path == workspace_container {
+            // 跳过 workspace 挂载：auto-inject 统一处理隔离挂载
+            // 精确匹配 resolve_from，不靠路径模式猜测
+            if mount_config.resolve_from.as_deref() == Some(&workspace_resolution) {
                 debug!(
-                    "Skipping workspace mount from config (auto-injected): {}",
-                    mount_config.container_path
+                    "Skipping workspace mount from config (auto-inject handles isolation): \
+                     container_path={}, resolve_from={}",
+                    mount_config.container_path,
+                    mount_config.resolve_from.as_deref().unwrap_or("")
                 );
                 continue;
             }
@@ -1643,9 +1653,10 @@ impl DockerManager {
 
                 // 添加解析后的基础路径变量
                 if let Some(resolved_path) = resolved_base {
+                    let normalized = resolved_path.components().collect::<std::path::PathBuf>();
                     mount_variables.insert(
                         "resolved_path".to_string(),
-                        resolved_path.to_string_lossy().to_string(),
+                        normalized.to_string_lossy().to_string(),
                     );
                 } else {
                     // 如果解析失败，跳过此挂载点
@@ -1683,82 +1694,6 @@ impl DockerManager {
                     resolved_container_path.replace(&format!("{{{}}}", key), value);
             }
 
-            // 🎯 动态调整挂载路径：当 pod_id 存在时，根据 isolation_type 选择挂载级别
-            // 工作目录始终是：/app/project_workspace/{tenant_id}/{space_id}/{project_id}
-            // 挂载目录根据 isolation_type 决定：
-            //   - space: /app/project_workspace/{tenant_id}/{space_id}
-            //   - tenant: /app/project_workspace/{tenant_id}
-            //   - project: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
-            let (resolved_host_path, resolved_container_path) = if pod_id.is_some() {
-                if let (Some(tid), Some(sid)) = (tenant_id_ref, space_id_ref) {
-                    // 检查是否是项目工作目录的挂载（包含 {project_id} 的路径）
-                    if mount_config.container_path.contains("{project_id}") {
-                        // 从 variables 中获取 project_id
-                        let pid = mount_variables.get("project_id").map(|s| s.as_str()).unwrap_or("default");
-
-                        // 根据 isolation_type 确定挂载级别（大小写不敏感）
-                        // 当 pod_id 存在时，isolation_type 必须由上游提供，不应为 None
-                        let mount_level = match isolation_type.as_deref() {
-                            Some(it) => it.to_lowercase(),
-                            None => {
-                                error!(
-                                    "[DOCKER_MGR] isolation_type is None when pod_id is present, \
-                                     this should have been validated upstream. \
-                                     tenant_id={}, space_id={}, project_id={}",
-                                    tid, sid, pid
-                                );
-                                return Err(DockerError::ConfigurationError(
-                                    "isolation_type is required when pod_id is provided".to_string()
-                                ));
-                            }
-                        };
-                        let (container_mount_path, host_mount_suffix) = match mount_level.as_str() {
-                            "space" => {
-                                // space 隔离：挂载到 tenant/space 级别
-                                (
-                                    format!("/app/project_workspace/{}/{}", tid, sid),
-                                    format!("{}/{}", tid, sid),
-                                )
-                            }
-                            "tenant" => {
-                                // tenant 隔离：挂载到 tenant 级别
-                                (
-                                    format!("/app/project_workspace/{}", tid),
-                                    format!("{}", tid),
-                                )
-                            }
-                            _ => {
-                                // project 隔离（默认）：挂载到完整路径
-                                (
-                                    format!("/app/project_workspace/{}/{}/{}", tid, sid, pid),
-                                    format!("{}/{}/{}", tid, sid, pid),
-                                )
-                            }
-                        };
-
-                        // 计算宿主机路径：从 resolved_host_path 中提取基础路径，然后拼接后缀
-                        // resolved_host_path 格式通常是：/host_base/project_id
-                        // 我们需要：/host_base/tenant_id/space_id
-                        let host_base = resolved_host_path
-                            .rsplit_once('/')
-                            .map(|(h, _)| h)
-                            .unwrap_or(&resolved_host_path);
-                        let host_mount_path = format!("{}/{}", host_base, host_mount_suffix);
-
-                        info!(
-                            "🔄 [DOCKER_MGR] Pod mode (isolation={}): redirecting mount: {} -> {}",
-                            mount_level, mount_config.container_path, container_mount_path
-                        );
-                        (host_mount_path, container_mount_path)
-                    } else {
-                        (resolved_host_path, resolved_container_path)
-                    }
-                } else {
-                    (resolved_host_path, resolved_container_path)
-                }
-            } else {
-                (resolved_host_path, resolved_container_path)
-            };
 
             info!(
                 "Adding mount point: {} -> {} (read_only: {})",
@@ -1774,32 +1709,7 @@ impl DockerManager {
             // 策略：必须配置 resolve_from 才能正确创建目录
             // 使用 resolve_from + 相对路径 来创建目录
             if !mount_config.read_only {
-                if pod_id.is_some()
-                    && mount_config.container_path.contains("{project_id}")
-                    && tenant_id_ref.is_some()
-                    && space_id_ref.is_some()
-                {
-                    // Pod 模式下挂载路径已被重定向，需要创建完整的工作目录
-                    // 使用 resolve_from_path 作为基础（rcoder 容器内可访问的路径）
-                    // 例如：/app/project_workspace/{tenant_id}/{space_id}/{project_id}
-                    if let Some(ref resolve_from_path) = mount_config.resolve_from {
-                        let tid = tenant_id_ref.unwrap_or("default");
-                        let sid = space_id_ref.unwrap_or("default");
-                        let pid = mount_variables
-                            .get("project_id")
-                            .map(|s| s.as_str())
-                            .unwrap_or("default");
-                        let create_path = format!("{}/{}/{}/{}", resolve_from_path, tid, sid, pid);
-                        if let Err(e) = std::fs::create_dir_all(&create_path) {
-                            warn!(
-                                "[DOCKER_MGR] pod mode create directory failed: {} - {}",
-                                create_path, e
-                            );
-                        } else {
-                            info!("[DOCKER_MGR] pod mode directory created: {}", create_path);
-                        }
-                    }
-                } else if let Some(ref resolve_from_path) = mount_config.resolve_from {
+                if let Some(ref resolve_from_path) = mount_config.resolve_from {
                     // 非 pod 模式：从 host_path 模板中提取相对路径部分
                     // host_path 格式通常是 "{resolved_path}/{variable}"
                     // 我们需要取 {resolved_path} 之后的部分，并拼接到 resolve_from 上
@@ -1844,6 +1754,16 @@ impl DockerManager {
                         resolved_host_path
                     );
                 }
+            }
+
+            // 冲突检测：如果 config 挂载的 container_path 与 auto-inject 重复，丢弃 config 挂载
+            if auto_injected_paths.contains(&resolved_container_path) {
+                warn!(
+                    "[DOCKER_MGR] Skipping config mount (conflicts with auto-inject): \
+                     {} -> {}",
+                    resolved_container_path, resolved_host_path
+                );
+                continue;
             }
 
             builder = builder.add_mount(crate::MountPoint {
