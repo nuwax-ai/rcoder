@@ -949,6 +949,8 @@ impl DockerManager {
                 // 🔧 修复：不再缓存 404 响应
                 // 原因：容器可能刚被创建，缓存 404 会导致 SSE 连接时序问题
                 // 容器状态变化快，404 缓存收益小但风险大
+                // 同时清理 network_cache 避免残留旧 IP（容器重建后 IP 可能变化）
+                self.api_cache.invalidate(identifier).await;
                 debug!(
                     "[REALTIME] Container does not exist (not caching 404): identifier={}",
                     identifier
@@ -2327,6 +2329,16 @@ impl DockerManager {
             info!(
                 "[SYNC] Container status sync completed: checked={}, removed={}, health_checked={}",
                 total, removed.len(), health_checked_count
+            );
+        }
+
+        // 清理被移除容器的 API 缓存（避免残留数据导致后续查询返回旧 IP）
+        if !removed.is_empty() {
+            let identifiers: Vec<String> = removed.iter().map(|r| r.identifier.clone()).collect();
+            self.api_cache.invalidate_all(&identifiers).await;
+            debug!(
+                "[SYNC] Invalidated API cache for {} removed containers",
+                identifiers.len()
             );
         }
 
