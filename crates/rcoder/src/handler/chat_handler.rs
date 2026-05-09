@@ -431,7 +431,8 @@ async fn forward_request_to_container_service(
 
     // 🎯 使用 gRPC 替代 HTTP
     // 使用实时 IP 获取，避免容器重建后 IP 变化导致连接失败
-    let container_name = format!("{}-{}", rcoder_prefix, project_id);
+    // 直接使用 container_info.container_name（创建时已确定，无需重新拼接）
+    let container_name = container_info.container_name.clone();
     let mut grpc_addr = match super::utils::get_realtime_container_ip(
         &container_name,
         &container_info.container_ip,
