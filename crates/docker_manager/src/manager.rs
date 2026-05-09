@@ -45,19 +45,20 @@ impl DockerApiCache {
     /// # 参数
     /// * `status_ttl` - 状态缓存 TTL（秒）
     /// * `network_ttl` - 网络缓存 TTL（秒）
-    pub fn new(status_ttl: u64, network_ttl: u64) -> Self {
+    /// * `max_capacity` - 缓存最大容量
+    pub fn new(status_ttl: u64, network_ttl: u64, max_capacity: u64) -> Self {
         info!(
-            "Initializing Docker API cache: status_ttl={}s, network_ttl={}s",
-            status_ttl, network_ttl
+            "Initializing Docker API cache: status_ttl={}s, network_ttl={}s, max_capacity={}",
+            status_ttl, network_ttl, max_capacity
         );
 
         Self {
             status_cache: Cache::builder()
-                .max_capacity(1000)
+                .max_capacity(max_capacity)
                 .time_to_live(Duration::from_secs(status_ttl))
                 .build(),
             network_cache: Cache::builder()
-                .max_capacity(1000)
+                .max_capacity(max_capacity)
                 .time_to_live(Duration::from_secs(network_ttl))
                 .build(),
         }
@@ -66,7 +67,7 @@ impl DockerApiCache {
     /// 使用默认配置创建缓存实例
     #[allow(dead_code)]
     pub fn with_defaults() -> Self {
-        Self::new(10, 15)
+        Self::new(10, 15, 10000)
     }
 
     /// 获取状态缓存
@@ -159,10 +160,11 @@ impl DockerManager {
         tokio::spawn(actor.run());
         info!("ContainerStateActor already started");
 
-        // 🗄️ 初始化 Docker API 缓存（使用配置的 TTL）
+        // 🗄️ 初始化 Docker API 缓存（使用配置的 TTL 和容量）
         let api_cache = Arc::new(DockerApiCache::new(
             config.cache_status_ttl_seconds,
             config.cache_network_ttl_seconds,
+            config.cache_max_capacity,
         ));
 
         let manager = Self {

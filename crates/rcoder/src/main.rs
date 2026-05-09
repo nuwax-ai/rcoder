@@ -177,6 +177,10 @@ async fn main() -> anyhow::Result<()> {
             default_config.cache_network_ttl_seconds = ttl;
             info!("using config: network cache TTL: {} seconds", ttl);
         }
+        if let Some(capacity) = docker_config.cache_max_capacity {
+            default_config.cache_max_capacity = capacity as u64;
+            info!("using config: cache max capacity: {}", capacity);
+        }
 
         default_config
     } else {

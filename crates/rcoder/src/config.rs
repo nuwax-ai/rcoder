@@ -209,6 +209,8 @@ pub struct DockerConfig {
     pub cache_status_ttl_seconds: Option<u64>,
     /// 🔧 网络缓存 TTL（秒）
     pub cache_network_ttl_seconds: Option<u64>,
+    /// 🔧 缓存最大容量
+    pub cache_max_capacity: Option<u64>,
 }
 
 pub const CONFIG_FILE: &str = "config.yml";
@@ -268,6 +270,7 @@ impl Default for DockerConfig {
             api_timeout_quick_seconds: Some(5),
             cache_status_ttl_seconds: Some(10),
             cache_network_ttl_seconds: Some(15),
+            cache_max_capacity: Some(10000),
         }
     }
 }
@@ -437,13 +440,28 @@ impl DockerConfig {
             }
         }
 
+        // 🔧 应用缓存最大容量配置
+        if let Ok(val) = std::env::var("RCODER_CACHE_MAX_CAPACITY") {
+            info!("RCODER_CACHE_MAX_CAPACITY overridden");
+            match val.parse() {
+                Ok(capacity) => self.cache_max_capacity = Some(capacity),
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_MAX_CAPACITY '{}': {}, using default",
+                        val,
+                        e
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Get configuration summary
     pub fn get_summary(&self) -> String {
         format!(
-            "Docker config: network_mode={}, network_base_name={}, work_dir={}, auto_cleanup={}, container_ttl={}, api_timeout={}s, quick_timeout={}s, status_cache={}s, network_cache={}s",
+            "Docker config: network_mode={}, network_base_name={}, work_dir={}, auto_cleanup={}, container_ttl={}, api_timeout={}s, quick_timeout={}s, status_cache={}s, network_cache={}s, cache_max_capacity={}",
             self.network_mode.as_deref().unwrap_or("default"),
             self.network_base_name.as_deref().unwrap_or("agent-network"),
             self.work_dir.as_deref().unwrap_or("/app"),
@@ -452,7 +470,8 @@ impl DockerConfig {
             self.api_timeout_seconds.unwrap_or(10),
             self.api_timeout_quick_seconds.unwrap_or(5),
             self.cache_status_ttl_seconds.unwrap_or(10),
-            self.cache_network_ttl_seconds.unwrap_or(15)
+            self.cache_network_ttl_seconds.unwrap_or(15),
+            self.cache_max_capacity.unwrap_or(10000)
         )
     }
 }

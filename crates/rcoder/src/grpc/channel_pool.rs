@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 const CHANNEL_TTL_SECS: u64 = 300;
 
 /// gRPC 连接池最大容量
-const MAX_CAPACITY: usize = 1000;
+const MAX_CAPACITY: usize = 10000;
 
 /// 创建配置好的 gRPC 客户端（设置消息大小限制）
 ///

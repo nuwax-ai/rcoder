@@ -419,6 +419,11 @@ pub struct DockerManagerConfig {
     /// 用于缓存容器网络信息（network_name -> ip_address）
     #[serde(default = "default_cache_network_ttl")]
     pub cache_network_ttl_seconds: u64,
+
+    /// 🔧 缓存最大容量
+    /// 用于 DockerApiCache 的 status_cache 和 network_cache
+    #[serde(default = "default_cache_max_capacity")]
+    pub cache_max_capacity: u64,
 }
 
 /// 默认 API 超时时间（10秒）
@@ -439,6 +444,11 @@ fn default_cache_status_ttl() -> u64 {
 /// 默认网络缓存 TTL（15秒）
 fn default_cache_network_ttl() -> u64 {
     15
+}
+
+/// 默认缓存最大容量（10000）
+fn default_cache_max_capacity() -> u64 {
+    10000
 }
 
 /// Docker 配置（从 rcoder 配置传递）
@@ -481,6 +491,7 @@ impl Default for DockerManagerConfig {
 
             cache_status_ttl_seconds: default_cache_status_ttl(), // 默认 10 秒
             cache_network_ttl_seconds: default_cache_network_ttl(), // 默认 15 秒
+            cache_max_capacity: default_cache_max_capacity(), // 默认 10000
         }
     }
 }
