@@ -102,8 +102,8 @@ impl GrpcChannelPool {
             .await
             .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
 
-        // 检查容量限制，清理过期连接
-        self.try_cleanup_expired();
+        // 清理过期连接
+        self.cleanup_expired();
 
         // 插入缓存
         self.channels.insert(
@@ -118,16 +118,11 @@ impl GrpcChannelPool {
         Ok(create_configured_client(channel))
     }
 
-    /// 尝试清理过期的连接（如果缓存已满）
+    /// 清理过期的连接
     ///
-    /// 只有当缓存接近容量上限时才执行清理，避免每次调用都扫描。
-    fn try_cleanup_expired(&self) {
+    /// 每次调用时检查并清理过期连接，保持缓存高效。
+    fn cleanup_expired(&self) {
         let len = self.channels.len();
-
-        // 只有当缓存接近满时（>= 容量上限的 80%），才执行清理
-        if len < MAX_CAPACITY * 8 / 10 {
-            return;
-        }
 
         // 收集所有过期连接的键
         let expired: Vec<String> = self
