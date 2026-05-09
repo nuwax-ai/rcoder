@@ -31,7 +31,7 @@ use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
     I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers,
-    get_realtime_container_ip_with_cache, project_dir, build_computer_workspace_path,
+    get_realtime_container_ip, project_dir, build_computer_workspace_path,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -426,11 +426,10 @@ pub async fn handle_computer_chat(
     // 在转发请求前，主动查询 Agent 状态，确保状态是最新的。
     // 这有助于在容器重启后，确认 Agent 是否真正处于空闲状态。
     {
-        // 💫 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期的问题
+        // 💫 使用实时 IP 获取，避免 restart 后 IP 过期的问题
         let grpc_addr_result = async {
-            let container_ip = get_realtime_container_ip_with_cache(
+            let container_ip = get_realtime_container_ip(
                 &container_info.container_name,
-                &state.container_ip_cache,
                 &container_info.container_ip,
                 &state.container_prefix_rcoder,
                 &state.container_prefix_computer,
@@ -526,7 +525,6 @@ pub async fn handle_computer_chat(
         &project_id,
         &container_info,
         &state.grpc_pool,
-        &state.container_ip_cache,
         locale,
         &state.container_prefix_rcoder,
         &state.container_prefix_computer,
@@ -688,7 +686,6 @@ async fn forward_computer_request_to_container(
     project_id: &str,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
-    container_ip_cache: &Arc<crate::grpc::ContainerIpCache>,
     locale: &'static str,
     rcoder_prefix: &str,
     computer_prefix: &str,
@@ -702,10 +699,9 @@ async fn forward_computer_request_to_container(
     // gRPC 连接失败会自动返回错误，由上层处理
 
     // 从 service_url 提取 gRPC 地址
-    // 🆕 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期的问题
-    let grpc_addr = match get_realtime_container_ip_with_cache(
+    // 🆕 使用实时 IP 获取，避免 restart 后 IP 过期的问题
+    let grpc_addr = match get_realtime_container_ip(
         &container_info.container_name,
-        container_ip_cache,
         &container_info.container_ip,
         rcoder_prefix,
         computer_prefix,

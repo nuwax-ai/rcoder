@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::grpc::{ContainerIpCache, GrpcChannelPool};
+use crate::grpc::GrpcChannelPool;
 
 /// 容器状态同步配置
 #[derive(Debug, Clone)]
@@ -32,11 +32,9 @@ impl Default for ContainerSyncConfig {
 ///
 /// 同时清理已移除容器的关联资源：
 /// - gRPC 连接池中的旧连接
-/// - 容器 IP 缓存
 pub fn start_container_sync_task(
     config: ContainerSyncConfig,
     grpc_pool: Arc<GrpcChannelPool>,
-    container_ip_cache: Arc<ContainerIpCache>,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         "🔄 [CONTAINER_SYNC] Starting container state sync task: interval={}s",
@@ -81,8 +79,6 @@ pub fn start_container_sync_task(
                                 );
                                 grpc_pool.remove(&grpc_addr);
                             }
-                            // 使 IP 缓存失效
-                            container_ip_cache.invalidate(&container.container_name);
                         }
                     }
                 }

@@ -8,7 +8,7 @@ mod locale;
 mod paths;
 
 pub use grpc_addr::{
-    extract_grpc_addr, extract_grpc_addr_with_port, get_realtime_container_ip_with_cache,
+    extract_grpc_addr, extract_grpc_addr_with_port, get_realtime_container_ip,
 };
 pub use i18n_extractors::{I18nJson, I18nJsonOrQuery, I18nPath, I18nQuery, require_field};
 pub use locale::get_locale_from_headers;

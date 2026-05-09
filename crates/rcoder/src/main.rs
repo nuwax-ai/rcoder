@@ -466,7 +466,6 @@ async fn main() -> anyhow::Result<()> {
     let _container_sync_handle = start_container_sync_task(
         container_sync_config,
         state.grpc_pool.clone(),
-        state.container_ip_cache.clone(),
     );
     info!(
         "Container status sync already started (interval: 60s, detect container)"

@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::utils::{I18nJsonOrQuery, get_locale_from_headers, get_realtime_container_ip_with_cache};
+use super::utils::{I18nJsonOrQuery, get_locale_from_headers, get_realtime_container_ip};
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
 use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse};
@@ -185,10 +185,9 @@ pub async fn computer_agent_status(
     );
 
     // 4. 主动调用 gRPC GetStatus 确认 Agent 真实状态
-    // 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期
-    let grpc_addr = match get_realtime_container_ip_with_cache(
+    // 使用实时 IP 获取，避免 restart 后 IP 过期
+    let grpc_addr = match get_realtime_container_ip(
         &container_info.container_name,
-        &state.container_ip_cache,
         &container_info.container_ip,
         &state.container_prefix_rcoder,
         &state.container_prefix_computer,

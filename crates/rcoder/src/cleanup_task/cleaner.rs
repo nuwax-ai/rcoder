@@ -52,8 +52,7 @@ impl AgentCleaner {
                 docker_manager.clone(),
                 grpc_pool,
                 pingora_service,
-            )
-            .with_ip_cache(state.container_ip_cache.clone()),
+            ),
             agent_scanner: {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)

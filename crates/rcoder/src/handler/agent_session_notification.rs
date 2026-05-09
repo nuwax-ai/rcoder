@@ -2,7 +2,7 @@
 //!
 //! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
 
-use super::utils::{I18nPath, get_realtime_container_ip_with_cache};
+use super::utils::{I18nPath, get_realtime_container_ip};
 use crate::{AppError, HttpResult};
 use axum::{
     extract::State,
@@ -657,18 +657,16 @@ async fn build_sse_stream_from_container_name(
     session_id: String,
     project_id: String,
     grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
-    container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
     locale: &'static str,
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
     rcoder_prefix: &str,
     computer_prefix: &str,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
-    // Get latest container IP from Docker API in real-time（带缓存）
+    // Get latest container IP from Docker API in real-time
     // 使用 container_name（如 computer-agent-runner-user_123）查询
     // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
-    let container_ip = match get_realtime_container_ip_with_cache(
+    let container_ip = match get_realtime_container_ip(
         &container_name,
-        &container_ip_cache,
         "", // 无 fallback_ip，直接使用 Docker API 查询结果
         rcoder_prefix,
         computer_prefix,
@@ -928,7 +926,6 @@ pub async fn agent_session_notification(
         session_id.to_string(),
         project_id,
         state.grpc_pool.clone(),
-        state.container_ip_cache.clone(),
         locale,
         "Agent",
         &state.container_prefix_rcoder,
@@ -1036,7 +1033,6 @@ pub async fn computer_agent_progress_notification(
         session_id.to_string(),
         project_id,
         state.grpc_pool.clone(),
-        state.container_ip_cache.clone(),
         locale,
         "Computer Agent",
         &state.container_prefix_rcoder,
