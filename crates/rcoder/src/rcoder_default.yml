@@ -223,6 +223,14 @@ docker_config:
   #   - 实时要求高: 10-15
   cache_network_ttl_seconds: 15
 
+  # 🔧 缓存最大容量
+  # 用于 DockerApiCache 的 status_cache 和 network_cache 的最大条目数
+  # 建议值：
+  #   - 小型环境: 1000-5000
+  #   - 中型环境: 5000-10000（默认）
+  #   - 大型环境: 10000-50000
+  cache_max_capacity: 10000
+
 # API Key 鉴权配置（可选）
 api_key_auth:
   # 是否启用 API Key 鉴权（默认关闭）
