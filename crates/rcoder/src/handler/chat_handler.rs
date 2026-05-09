@@ -345,6 +345,8 @@ pub async fn handle_chat(
         &request_for_forward,
         &container_info,
         &state.grpc_pool,
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
         locale,
     )
     .await;
@@ -408,6 +410,8 @@ async fn forward_request_to_container_service(
     request: &AgentChatRequest,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
     locale: &'static str,
 ) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
     let project_id = if let Some(id) = &request.project_id {
@@ -426,9 +430,22 @@ async fn forward_request_to_container_service(
     );
 
     // 🎯 使用 gRPC 替代 HTTP
-    // 从 service_url 提取主机名
-    let grpc_addr =
-        extract_grpc_addr_with_port(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?;
+    // 使用实时 IP 获取，避免容器重建后 IP 变化导致连接失败
+    let container_name = format!("{}-{}", rcoder_prefix, project_id);
+    let mut grpc_addr = match super::utils::get_realtime_container_ip(
+        &container_name,
+        &container_info.container_ip,
+        rcoder_prefix,
+        computer_prefix,
+    )
+    .await
+    {
+        Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
+        Err(e) => {
+            warn!("[FORWARD] Real-time IP resolution failed: {}, falling back to service_url", e);
+            extract_grpc_addr_with_port(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?
+        }
+    };
 
     debug!(
         "📡 [FORWARD] Sending gRPC request to: {}, prompt_length={}, attachments_count={}",
@@ -496,12 +513,35 @@ async fn forward_request_to_container_service(
                 let should_retry = crate::grpc::should_retry_error(&e);
 
                 if should_retry && attempt < max_retries {
-                    // 可重试错误：清理连接池并重试
-                    info!(
-                        "🔄 [FORWARD] Detected retryable error, removing {} from connection pool and retrying...",
-                        grpc_addr
-                    );
+                    // 可重试错误：清理连接池并重新获取 IP 后重试
+                    info!("🔄 [FORWARD] Detected retryable error, re-resolving container IP and retrying...");
                     grpc_pool.remove(&grpc_addr);
+
+                    // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
+                    match super::utils::get_realtime_container_ip(
+                        &container_name,
+                        &container_info.container_ip,
+                        rcoder_prefix,
+                        computer_prefix,
+                    )
+                    .await
+                    {
+                        Ok(ip) => {
+                            let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
+                            info!(
+                                "🔄 [FORWARD] Container IP re-resolved: {} -> {}",
+                                grpc_addr, new_addr
+                            );
+                            grpc_addr = new_addr;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️ [FORWARD] Failed to re-resolve container IP, keeping old address: {}",
+                                e
+                            );
+                        }
+                    }
+
                     last_error = Some(e);
                     continue;
                 } else if !should_retry {

@@ -213,10 +213,13 @@ pub async fn computer_agent_status(
         grpc_addr, project_id
     );
 
-    // 调用 gRPC GetStatus（带超时和重试）
+    // 调用 gRPC GetStatus（带超时和重试，重试时自动重新获取 IP）
     let grpc_response = match call_grpc_get_status_with_retry(
         &state.grpc_pool,
-        &grpc_addr,
+        &container_info.container_name,
+        &container_info.container_ip,
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
         project_id,
         GRPC_MAX_RETRIES,
         locale,
@@ -336,18 +339,42 @@ pub async fn computer_agent_status(
 /// # 重试策略
 /// - 仅对可重试的错误进行重试：Unavailable, DeadlineExceeded, Unknown, Internal
 /// - 使用指数退避：100ms, 200ms, 400ms
-/// - 失败后自动从连接池移除失败的连接
+/// - 失败后自动从连接池移除失败的连接，并重新获取容器 IP
 async fn call_grpc_get_status_with_retry(
     pool: &Arc<crate::grpc::GrpcChannelPool>,
-    grpc_addr: &str,
+    container_name: &str,
+    fallback_ip: &str,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
     project_id: &str,
     max_retries: u32,
     locale: &'static str,
 ) -> anyhow::Result<shared_types::grpc::GetStatusResponse> {
     let mut last_error = None;
+    let mut grpc_addr = format!("{}:{}", fallback_ip, shared_types::GRPC_DEFAULT_PORT);
 
     for attempt in 1..=max_retries {
-        match pool.get_client(grpc_addr).await {
+        // 重新获取最新容器 IP（每次重试时）
+        if attempt > 1 {
+            match get_realtime_container_ip(container_name, fallback_ip, rcoder_prefix, computer_prefix).await {
+                Ok(ip) => {
+                    let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
+                    info!(
+                        "🔄 [GRPC_GET_STATUS] Container IP re-resolved: {} -> {}",
+                        grpc_addr, new_addr
+                    );
+                    grpc_addr = new_addr;
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [GRPC_GET_STATUS] Failed to re-resolve container IP, keeping old address: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        match pool.get_client(&grpc_addr).await {
             Ok(mut client) => {
                 let request = shared_types::grpc::GetStatusRequest {
                     project_id: project_id.to_string(),
@@ -387,7 +414,7 @@ async fn call_grpc_get_status_with_retry(
                                 e
                             );
                             // 从连接池移除失败的连接
-                            pool.remove(grpc_addr);
+                            pool.remove(&grpc_addr);
                             last_error = Some(anyhow::anyhow!("gRPC call failed: {}", e));
 
                             // 指数退避: 100ms, 200ms, 400ms
@@ -412,6 +439,8 @@ async fn call_grpc_get_status_with_retry(
                     "⚠️ [GRPC_GET_STATUS] Attempt {} to get gRPC client failed: error={}",
                     attempt, e
                 );
+                // 从连接池移除可能失效的连接
+                pool.remove(&grpc_addr);
                 last_error = Some(e);
                 if attempt < max_retries {
                     // 指数退避: 100ms, 200ms, 400ms
