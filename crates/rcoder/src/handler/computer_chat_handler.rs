@@ -700,7 +700,7 @@ async fn forward_computer_request_to_container(
 
     // 从 service_url 提取 gRPC 地址
     // 🆕 使用实时 IP 获取，避免 restart 后 IP 过期的问题
-    let grpc_addr = match get_realtime_container_ip(
+    let mut grpc_addr = match get_realtime_container_ip(
         &container_info.container_name,
         &container_info.container_ip,
         rcoder_prefix,
@@ -803,10 +803,35 @@ async fn forward_computer_request_to_container(
 
                 if should_retry && attempt < max_retries {
                     info!(
-                        "🔄 [COMPUTER_FORWARD] Detected retryable error, removing {} from connection pool and retrying...",
-                        grpc_addr
+                        "🔄 [COMPUTER_FORWARD] Detected retryable error, re-resolving container IP and retrying..."
                     );
                     grpc_pool.remove(&grpc_addr);
+
+                    // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
+                    match get_realtime_container_ip(
+                        &container_info.container_name,
+                        &container_info.container_ip,
+                        rcoder_prefix,
+                        computer_prefix,
+                    )
+                    .await
+                    {
+                        Ok(ip) => {
+                            let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
+                            info!(
+                                "🔄 [COMPUTER_FORWARD] Container IP re-resolved: {} -> {}",
+                                grpc_addr, new_addr
+                            );
+                            grpc_addr = new_addr;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️ [COMPUTER_FORWARD] Failed to re-resolve container IP, keeping old address: {}",
+                                e
+                            );
+                        }
+                    }
+
                     last_error = Some(e);
                     continue;
                 } else if !should_retry {
