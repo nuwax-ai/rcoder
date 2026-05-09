@@ -10,7 +10,7 @@ use chrono::Utc;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
     ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, RuntimeContainerInfo,
+    ContainerRuntimeStatus, RemovedContainerInfo, RuntimeContainerInfo,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
@@ -1073,6 +1073,47 @@ impl ContainerRuntime for KubernetesRuntime {
         }
 
         Ok(result)
+    }
+
+    async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
+        let mut removed = Vec::new();
+
+        // 获取缓存快照 (identifier, RuntimeContainerInfo)
+        let cache_snapshot: Vec<(String, RuntimeContainerInfo)> = self
+            .pod_cache
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let checked_count = cache_snapshot.len() as u32;
+
+        for (identifier, container_info) in cache_snapshot {
+            // 使用缓存中的 container_name (完整 pod name) 进行 API 查询
+            match self.pods().get(&container_info.container_name).await {
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                    // Pod 不存在，从缓存中移除，并收集信息用于清理关联资源
+                    self.pod_cache.write().await.remove(&identifier);
+                    removed.push(RemovedContainerInfo {
+                        container_name: container_info.container_name.clone(),
+                        container_ip: container_info.container_ip.clone(),
+                        identifier: identifier.clone(),
+                        service_type: ServiceType::RCoder, // K8s 模式目前只有 RCoder
+                    });
+                    info!("[K8S_SYNC] Removed stale pod from cache: {} (identifier={})", container_info.container_name, identifier);
+                }
+                Ok(_) => {
+                    // Pod 存在，无需处理
+                }
+                Err(e) => {
+                    // 其他错误，只记录日志
+                    warn!("[K8S_SYNC] Failed to check pod {}: {}", container_info.container_name, e);
+                }
+            }
+        }
+
+        Ok((checked_count, removed))
     }
 
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {

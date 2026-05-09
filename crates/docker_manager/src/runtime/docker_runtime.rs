@@ -6,22 +6,32 @@
 use async_trait::async_trait;
 use container_runtime_api::{
     ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, RuntimeContainerInfo,
+    ContainerRuntimeStatus, RemovedContainerInfo, RuntimeContainerInfo,
 };
+use moka::future::Cache;
 use shared_types::{ContainerBasicInfo, ServiceType};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::DockerManager;
 
 /// Docker runtime implementation wrapping DockerManager
 pub struct DockerRuntime {
     inner: Arc<DockerManager>,
+    /// TTL cache for list_containers result (15 seconds)
+    list_cache: Cache<(), Vec<RuntimeContainerInfo>>,
 }
 
 impl DockerRuntime {
     /// Create a new DockerRuntime wrapping the given DockerManager
     pub fn new(inner: Arc<DockerManager>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            list_cache: Cache::builder()
+                .max_capacity(1)
+                .time_to_live(Duration::from_secs(15))
+                .build(),
+        }
     }
 }
 
@@ -172,6 +182,46 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
+        // 尝试从缓存获取
+        if let Some(cached) = self.list_cache.get(&()).await {
+            return Ok(cached);
+        }
+
+        // 缓存未命中或过期，fetch 并写入缓存
+        let result = self.fetch_containers().await?;
+        self.list_cache.insert((), result.clone()).await;
+        Ok(result)
+    }
+
+    async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
+        self.inner
+            .sync_all_container_states()
+            .await
+            .map_err(|e| ContainerRuntimeError::DockerError(e.to_string()))
+    }
+
+    async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
+        self.inner
+            .cleanup_all_containers()
+            .await
+            .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string()))
+    }
+
+    async fn health_check(&self) -> ContainerRuntimeResult<()> {
+        self.inner
+            .get_docker_client()
+            .ping()
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::ConnectionError(format!("Docker ping failed: {}", e))
+            })?;
+        Ok(())
+    }
+}
+
+impl DockerRuntime {
+    /// Fetch containers from Docker API (used as cache loader)
+    async fn fetch_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         let containers = self.inner.list_containers().await;
         let mut result = Vec::with_capacity(containers.len());
         for c in containers {
@@ -205,23 +255,5 @@ impl ContainerRuntime for DockerRuntime {
             });
         }
         Ok(result)
-    }
-
-    async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
-        self.inner
-            .cleanup_all_containers()
-            .await
-            .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string()))
-    }
-
-    async fn health_check(&self) -> ContainerRuntimeResult<()> {
-        self.inner
-            .get_docker_client()
-            .ping()
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::ConnectionError(format!("Docker ping failed: {}", e))
-            })?;
-        Ok(())
     }
 }

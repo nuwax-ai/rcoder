@@ -59,6 +59,19 @@ pub struct RuntimeContainerInfo {
     pub created_at: DateTime<Utc>,
 }
 
+/// 已被移除的容器信息（用于清理关联资源）
+#[derive(Debug, Clone)]
+pub struct RemovedContainerInfo {
+    /// 容器名称（稳定标识符）
+    pub container_name: String,
+    /// 容器 IP
+    pub container_ip: String,
+    /// 容器标识符（project_id 或 user_id）
+    pub identifier: String,
+    /// 服务类型
+    pub service_type: ServiceType,
+}
+
 impl From<ContainerRuntimeStatus> for String {
     fn from(status: ContainerRuntimeStatus) -> Self {
         match status {
@@ -271,6 +284,18 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// List all containers managed by this runtime
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>>;
+
+    /// 同步缓存状态，清理失效的容器记录
+    ///
+    /// 对于 Docker：遍历 ContainerStateActor 缓存，通过 Docker API 验证容器是否仍存在
+    /// 对于 K8s：遍历 pod_cache，通过 K8s API 验证 Pod 是否仍存在
+    ///
+    /// # Returns
+    /// 返回元组 (已检查数量, 已移除容器信息列表)
+    async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
+        // 默认实现：不做任何事（向后兼容）
+        Ok((0, Vec::new()))
+    }
 
     /// Cleanup all containers (used on shutdown)
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()>;

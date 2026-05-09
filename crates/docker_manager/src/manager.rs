@@ -3,6 +3,7 @@ use super::{
     ContainerRemovalFailure, ContainerStatus, DockerContainerConfig, DockerContainerInfo,
     DockerError, DockerManagerConfig, DockerResult,
 };
+use container_runtime_api::{ContainerRuntimeStatus, RemovedContainerInfo};
 use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
 use anyhow::Result;
 use bollard::query_parameters::{
@@ -2202,27 +2203,52 @@ impl DockerManager {
     /// 🆕 对运行中的容器执行服务健康检查（HTTP + gRPC）
     ///
     /// # Returns
-    /// 返回元组 (已检查数量, 已移除数量)
-    pub async fn sync_all_container_states(&self) -> DockerResult<(u32, u32)> {
+    /// 返回元组 (已检查数量, 已移除容器信息列表)
+    pub async fn sync_all_container_states(&self) -> DockerResult<(u32, Vec<RemovedContainerInfo>)> {
         // 获取所有 project_id 的快照
         let project_ids: Vec<String> = self.containers.keys().await;
 
         if project_ids.is_empty() {
-            return Ok((0, 0));
+            return Ok((0, Vec::new()));
         }
 
         let total = project_ids.len() as u32;
-        let mut removed_count = 0u32;
+        let mut removed = Vec::new();
         let mut health_checked_count = 0u32;
 
         // 创建健康检查器（复用同一个实例）
         let health_checker = crate::health::ServiceHealthChecker::new();
 
         for project_id in project_ids {
+            // 在调用 update_container_status 之前获取容器信息（用于在容器被移除时构造 RemovedContainerInfo）
+            let container_info_before_update = self.containers.get(&project_id).await;
+
             match self.update_container_status(&project_id).await {
                 Ok(None) => {
                     // 容器不存在，已从缓存中移除
-                    removed_count += 1;
+                    if let Some(info) = container_info_before_update {
+                        // 获取容器 IP（用于清理 gRPC 连接池）
+                        let container_ip = match self
+                            .get_container_network_info(&info.container_id)
+                            .await
+                        {
+                            Ok(ips) => ips.values().next().cloned().unwrap_or_default(),
+                            Err(e) => {
+                                warn!(
+                                    "[SYNC] Failed to get container IP for cleanup: container_id={}, error={}",
+                                    info.container_id, e
+                                );
+                                String::new()
+                            }
+                        };
+
+                        removed.push(RemovedContainerInfo {
+                            container_name: info.container_name,
+                            container_ip,
+                            identifier: project_id.clone(),
+                            service_type: info.service_type.unwrap_or(ServiceType::RCoder),
+                        });
+                    }
                     info!(
                         "[SYNC] Container removed from cache (does not exist in Docker): project_id={}",
                         project_id
@@ -2297,14 +2323,14 @@ impl DockerManager {
             }
         }
 
-        if removed_count > 0 || health_checked_count > 0 {
+        if !removed.is_empty() || health_checked_count > 0 {
             info!(
                 "[SYNC] Container status sync completed: checked={}, removed={}, health_checked={}",
-                total, removed_count, health_checked_count
+                total, removed.len(), health_checked_count
             );
         }
 
-        Ok((total, removed_count))
+        Ok((total, removed))
     }
 
     /// 清理所有容器

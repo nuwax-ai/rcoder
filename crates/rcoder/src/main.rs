@@ -463,7 +463,11 @@ async fn main() -> anyhow::Result<()> {
     let container_sync_config = ContainerSyncConfig {
         sync_interval: Duration::from_secs(60), // 每 60 秒同步一次
     };
-    let _container_sync_handle = start_container_sync_task(container_sync_config);
+    let _container_sync_handle = start_container_sync_task(
+        container_sync_config,
+        state.grpc_pool.clone(),
+        state.container_ip_cache.clone(),
+    );
     info!(
         "Container status sync already started (interval: 60s, detect container)"
     );
