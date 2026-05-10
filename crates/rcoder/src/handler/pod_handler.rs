@@ -1284,7 +1284,7 @@ pub async fn pod_keepalive(
     );
 
     // 2. 检查 DuckDB 存储中是否有记录，并更新活动时间
-    // 同时更新该用户下所有项目的 last_activity（共享容器场景）
+    // 更新当前项目的 last_activity；共享容器场景下还需更新同容器下其他项目
     let (previous_activity_time, current_activity_time, existed) = {
         if let Some(existing_info) = state.get_project(&request.project_id) {
             let prev = existing_info.last_activity().timestamp_millis() as u64;
@@ -1295,18 +1295,16 @@ pub async fn pod_keepalive(
                 .map(|t| t.timestamp_millis() as u64)
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
 
-            // 更新同容器下其他项目的 last_activity（防止共享容器被误清理）
-            // 优先使用 pod_id 查找（RCoder 共享容器模式），否则使用 user_id
-            let related_projects = if let Some(ref pod_id) = request.pod_id {
-                state.projects.find_projects_by_pod_id(pod_id)
-            } else {
-                state.projects.find_projects_by_user_id(&request.user_id)
-            };
-            for related in &related_projects {
-                if related.project_id != request.project_id {
-                    state.update_activity(&related.project_id);
+            // 更新同容器下其他项目的 last_activity（仅限共享容器场景）
+            if let Some(ref pod_id) = request.pod_id {
+                let related_projects = state.projects.find_projects_by_pod_id(pod_id);
+                for related in &related_projects {
+                    if related.project_id != request.project_id {
+                        state.update_activity(&related.project_id);
+                    }
                 }
             }
+            // 非共享容器模式：每个项目独立，不需更新其他项目
 
             (prev, current, true)
         } else {
