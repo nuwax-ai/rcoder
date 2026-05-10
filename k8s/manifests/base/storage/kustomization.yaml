@@ -1,0 +1,15 @@
+# Storage layer - 存储层配置
+# 注意:
+#   - juicefs-secret 由各环境 overlay 提供 (dev/prod)
+#   - juicefs-storageclass 由各环境 overlay 提供（集群级资源需按环境独立命名，避免冲突）
+#   - 不再使用 juicefs-init Job：JuiceFS CSI driver 首次挂载时会用 Secret 里的
+#     name/metaurl/storage/bucket/access-key/secret-key 自动执行 format，Job 是冗余的
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - postgresql-deployment.yaml
+  - minio-deployment.yaml
+  - minio-init-job.yaml
+  - juicefs-pvc.yaml

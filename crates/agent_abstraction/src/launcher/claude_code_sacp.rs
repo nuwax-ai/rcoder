@@ -15,27 +15,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(windows)]
 use crate::path_env::TAURI_APP_DATA_DIR;
-use agent_config::{AgentInstallationManager, AgentServersConfig, ContextServerConfig};
+use agent_config::{AgentServersConfig, ContextServerConfig};
 use anyhow::{Context, Result};
 use process_wrap::tokio::CommandWrap;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
 #[cfg(windows)]
 use process_wrap::tokio::{CreationFlags, JobObject};
-use shared_types::{error_codes, ModelProviderConfig, ProjectAndAgentInfo};
+use shared_types::{ModelProviderConfig, ProjectAndAgentInfo, error_codes};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-// SACP 库导入
-use sacp::schema::{
-    CancelNotification, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
-    SessionNotification,
+use agent_client_protocol::schema::{
+    CancelNotification, InitializeRequest, LoadSessionRequest, McpServer, McpServerStdio,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionId, SessionNotification,
 };
-use sacp::{ClientToAgent, JrConnectionCx, JrRequestCx};
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, Dispatch, Handled, JsonRpcMessage, Responder,
+};
 
 use crate::acp::CancelNotificationRequestWrapper;
 use crate::traits::AgentStartConfig;
@@ -352,12 +353,15 @@ pub async fn load_sacp_agent_config(
         // 禁用 Claude Code 非必要网络请求
         resolved_env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
         // 跳过 Agent SDK 版本检查
-        resolved_env.insert(ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(), "1".to_string());
+        resolved_env.insert(
+            ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(),
+            "1".to_string(),
+        );
 
         // debug: 打印最终环境变量（API Key 已脱敏）
         let mask_key = |v: &String| -> String {
             if v.len() > 8 {
-                format!("{}***{}", &v[..4], &v[v.len()-4..])
+                format!("{}***{}", &v[..4], &v[v.len() - 4..])
             } else {
                 "***".to_string()
             }
@@ -367,15 +371,35 @@ pub async fn load_sacp_agent_config(
              OPENAI_API_KEY={}, OPENAI_BASE_URL={}, OPENCODE_MODEL={}, \
              RUST_LOG={}, CLAUDE_CODE_MAX_TOKENS={}, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC={}",
             agent_config.command,
-            resolved_env.get("ANTHROPIC_API_KEY").map(|v| mask_key(v)).unwrap_or_default(),
-            resolved_env.get("ANTHROPIC_BASE_URL").unwrap_or(&"<unset>".to_string()),
-            resolved_env.get("ANTHROPIC_MODEL").unwrap_or(&"<unset>".to_string()),
-            resolved_env.get("OPENAI_API_KEY").map(|v| mask_key(v)).unwrap_or_default(),
-            resolved_env.get("OPENAI_BASE_URL").unwrap_or(&"<unset>".to_string()),
-            resolved_env.get("OPENCODE_MODEL").unwrap_or(&"<unset>".to_string()),
-            resolved_env.get("RUST_LOG").unwrap_or(&"<unset>".to_string()),
-            resolved_env.get("CLAUDE_CODE_MAX_TOKENS").unwrap_or(&"<unset>".to_string()),
-            resolved_env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("ANTHROPIC_API_KEY")
+                .map(|v| mask_key(v))
+                .unwrap_or_default(),
+            resolved_env
+                .get("ANTHROPIC_BASE_URL")
+                .unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("ANTHROPIC_MODEL")
+                .unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("OPENAI_API_KEY")
+                .map(|v| mask_key(v))
+                .unwrap_or_default(),
+            resolved_env
+                .get("OPENAI_BASE_URL")
+                .unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("OPENCODE_MODEL")
+                .unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("RUST_LOG")
+                .unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("CLAUDE_CODE_MAX_TOKENS")
+                .unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+                .unwrap_or(&"<unset>".to_string()),
         );
 
         Ok(SacpAgentLaunchConfig {
@@ -433,7 +457,10 @@ pub fn get_default_sacp_agent_config(
 
     env.insert(ENV_RUST_LOG.to_string(), "info".to_string());
     env.insert(ENV_DISABLE_NONESSENTIAL.to_string(), "1".to_string());
-    env.insert(ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(), "1".to_string());
+    env.insert(
+        ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(),
+        "1".to_string(),
+    );
 
     // Resolve the claude-code-acp-ts command path.
     // Priority: CLAUDE_CODE_ACP_PATH env var > `which` crate lookup > bare command name.
@@ -546,9 +573,7 @@ fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
 
     // 检查日志级别是否为 debug
     if !is_debug_log_level() {
-        debug!(
-            "[MCP] mcp-proxy convert detected, but not debug, skip diagnostic params"
-        );
+        debug!("[MCP] mcp-proxy convert detected, but not debug, skip diagnostic params");
         return args;
     }
 
@@ -608,13 +633,16 @@ pub fn convert_context_servers_sacp(
                 server = server.args(final_args);
             }
 
-            let mut env_vars: Vec<sacp::schema::EnvVariable> = if let Some(env) = &c.env {
-                env.iter()
-                    .map(|(k, v)| sacp::schema::EnvVariable::new(k.clone(), v.clone()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let mut env_vars: Vec<agent_client_protocol::schema::EnvVariable> =
+                if let Some(env) = &c.env {
+                    env.iter()
+                        .map(|(k, v)| {
+                            agent_client_protocol::schema::EnvVariable::new(k.clone(), v.clone())
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
             // 注入 D-Bus 会话地址
             if let Some(ref addr) = dbus_address {
@@ -622,7 +650,7 @@ pub fn convert_context_servers_sacp(
                     .iter()
                     .any(|e| e.name == "DBUS_SESSION_BUS_ADDRESS")
                 {
-                    env_vars.push(sacp::schema::EnvVariable::new(
+                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                         "DBUS_SESSION_BUS_ADDRESS".to_string(),
                         addr.clone(),
                     ));
@@ -632,7 +660,7 @@ pub fn convert_context_servers_sacp(
             // 注入镜像源环境变量（npx/bunx/uvx 子进程使用）
             for (key, val) in crate::mirror_env::collect_mirror_env_vars() {
                 if !env_vars.iter().any(|e| e.name == key) {
-                    env_vars.push(sacp::schema::EnvVariable::new(key, val));
+                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(key, val));
                 }
             }
 
@@ -643,7 +671,7 @@ pub fn convert_context_servers_sacp(
             if !env_vars.iter().any(|e| e.name == "PATH") {
                 let path_value = build_mcp_server_path_env();
                 if !path_value.is_empty() {
-                    env_vars.push(sacp::schema::EnvVariable::new(
+                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                         "PATH".to_string(),
                         path_value,
                     ));
@@ -654,7 +682,10 @@ pub fn convert_context_servers_sacp(
             #[cfg(not(windows))]
             if !env_vars.iter().any(|e| e.name == "HOME") {
                 if let Ok(home) = std::env::var("HOME") {
-                    env_vars.push(sacp::schema::EnvVariable::new("HOME".to_string(), home));
+                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(
+                        "HOME".to_string(),
+                        home,
+                    ));
                 }
             }
 
@@ -663,7 +694,7 @@ pub fn convert_context_servers_sacp(
             {
                 if !env_vars.iter().any(|e| e.name == "USERPROFILE") {
                     if let Ok(profile) = std::env::var("USERPROFILE") {
-                        env_vars.push(sacp::schema::EnvVariable::new(
+                        env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                             "USERPROFILE".to_string(),
                             profile,
                         ));
@@ -671,7 +702,7 @@ pub fn convert_context_servers_sacp(
                 }
                 if !env_vars.iter().any(|e| e.name == "PATHEXT") {
                     if let Ok(pathext) = std::env::var("PATHEXT") {
-                        env_vars.push(sacp::schema::EnvVariable::new(
+                        env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                             "PATHEXT".to_string(),
                             pathext,
                         ));
@@ -978,13 +1009,62 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let stdout = take_stdio(&mut child.stdout(), "stdout")?;
         let stderr = take_stdio(&mut child.stderr(), "stderr")?;
 
+        // 🔥 立即启动 stderr 读取任务（在 session_id 等待之前）
+        // 这样即使子进程在初始化阶段就退出，也能捕获 stderr 输出
+        let cancel_token_for_stderr = cancel_token.clone();
+        let stderr_output_shared = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let stderr_output_clone = stderr_output_shared.clone();
+        let stderr_task_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+
+            loop {
+                tokio::select! {
+                    biased; // 优先检查取消信号
+
+                    _ = cancel_token_for_stderr.cancelled() => {
+                        debug!("[SACP] stderr cancel received");
+                        break;
+                    }
+                    result = lines.next_line() => {
+                        match result {
+                            Ok(Some(line)) if !line.trim().is_empty() => {
+                                warn!("[SACP] Claude Code Agent stderr: {}", line.trim());
+                                // 存储 stderr 输出，用于错误传播
+                                if let Ok(mut buf) = stderr_output_clone.lock() {
+                                    buf.push(line.trim().to_string());
+                                    // 限制最多存储 20 行，避免内存膨胀
+                                    if buf.len() > 20 {
+                                        buf.remove(0);
+                                    }
+                                }
+                            }
+                            Ok(Some(_)) => {} // 空行，忽略
+                            Ok(None) => break, // EOF
+                            Err(e) => {
+                                error!("[SACP] read stderr failed: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // 创建 SACP transport
-        let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());
+        let transport =
+            agent_client_protocol::ByteStreams::new(stdin.compat_write(), stdout.compat());
 
         // 🔥 新增：创建共享的异常退出标志
         // 此标志在 reaper_task 检测到子进程异常退出时设置为 true
         // SACP 连接层可以检测此标志并发送相应的错误通知
         let abnormal_exit_flag = Arc::new(AtomicBool::new(false));
+
+        // 共享的 session_id，用于连接失败时发送错误通知
+        let session_id_shared = Arc::new(std::sync::Mutex::new(None::<String>));
+
+        // 共享的连接错误信息，用于 "channel dropped" 时传播真实错误原因
+        let connection_error_shared = Arc::new(std::sync::Mutex::new(None::<String>));
 
         // 克隆用于闭包
         let project_path_clone = project_path.clone();
@@ -992,12 +1072,29 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let cancel_token_clone = cancel_token.clone();
         let notifier_clone = self.notifier.clone();
         let abnormal_exit_flag_clone = abnormal_exit_flag.clone();
+        let session_id_shared_clone = session_id_shared.clone();
+        let connection_error_clone = connection_error_shared.clone();
+        let error_notifier = self.notifier.clone();
+
+        // 🔥 连接失败通知通道：连接任务失败时立即通知，不等 60 秒超时
+        let (connection_failed_tx, connection_failed_rx) =
+            tokio::sync::oneshot::channel::<String>();
+        let mut connection_failed_tx = Some(connection_failed_tx);
+
+        // 保存 command_path 用于超时日志
+        let command_path_for_log = command_path.clone();
 
         // 🔥 使用标准 tokio::spawn（无需 LocalSet！）
-        tokio::spawn(async move {
+        // 保存 JoinHandle 用于超时时取消子任务
+        let spawn_project_id = project_id.clone();
+        let connection_task_handle = tokio::spawn(async move {
+            info!(
+                "[SACP] 🚀 Spawned ACP connection task, project_id={}",
+                spawn_project_id
+            );
             let params = SacpConnectionParams {
                 project_path: project_path_clone,
-                project_id: project_id_clone,
+                project_id: project_id_clone.clone(),
                 mcp_servers,
                 start_config,
                 session_id_tx,
@@ -1006,62 +1103,197 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 cancel_token: cancel_token_clone,
                 notifier: notifier_clone,
                 abnormal_exit_flag: abnormal_exit_flag_clone,
+                session_id_shared: session_id_shared_clone,
+                connection_failed_tx: connection_failed_tx.take(),
+                child_pid,
             };
             let result = run_sacp_connection(transport, params).await;
 
+            match &result {
+                Ok(_) => info!(
+                    "[SACP] ✅ ACP connection task completed successfully, project_id={}",
+                    spawn_project_id
+                ),
+                Err(e) => error!(
+                    "[SACP] ❌ ACP connection task failed: {}, project_id={}",
+                    e, spawn_project_id
+                ),
+            }
+
             if let Err(e) = result {
                 error!("[SACP] Claude Code ACP Agent connection failed: {}", e);
+
+                // 存储连接错误到共享状态，供 "channel dropped" 时使用
+                if let Ok(mut guard) = connection_error_clone.lock() {
+                    *guard = Some(format!("{}", e));
+                }
+
+                // 🔥 立即通知外层连接失败，避免等待 60 秒超时
+                if let Some(tx) = connection_failed_tx.take() {
+                    let _ = tx.send(format!("{}", e));
+                }
+
+                // 🔥 关键修复：连接失败时发送错误通知到 SSE 流
+                // 只有在 session_id 已经初始化的情况下才能发送（连接建立后才会有 session_id）
+                let session_id = session_id_shared
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+
+                if let Some(session_id) = session_id {
+                    warn!(
+                        "[SACP] Sending error notification to SSE stream: project_id={}, session_id={}",
+                        project_id_clone, session_id
+                    );
+                    let error = agent_client_protocol::schema::Error::new(
+                        1001,
+                        format!("ACP connection failed: {}", e),
+                    );
+                    if let Err(notify_err) = error_notifier
+                        .notify_prompt_error(&project_id_clone, &session_id, error, None)
+                        .await
+                    {
+                        error!("[SACP] Failed to send error notification: {:?}", notify_err);
+                    }
+                } else {
+                    debug!(
+                        "[SACP] session_id not yet available, skipping error notification: project_id={}",
+                        project_id_clone
+                    );
+                }
             }
         });
 
-        // 等待会话 ID
-        let session_id = session_id_rx.await.map_err(|e| {
-            error!("[SACP] initialize timeout: {}", e);
-            anyhow::anyhow!("{}", error_codes::get_i18n_message_default("error.agent_init_timeout"))
-        })?;
+        // 等待会话 ID（60 秒超时），同时监听连接失败
+        info!(
+            "[SACP] Waiting for session_id from ACP agent, project_id={}, timeout=60s",
+            project_id
+        );
+        let session_id = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            async {
+                tokio::select! {
+                    result = session_id_rx => {
+                        match result {
+                            Ok(sid) => Ok(Ok(sid)),
+                            Err(e) => Ok(Err(anyhow::anyhow!("channel dropped: {}", e))),
+                        }
+                    }
+                    failed = connection_failed_rx => {
+                        match failed {
+                            Ok(err_msg) => Err(anyhow::anyhow!("{}", err_msg)),
+                            Err(_) => Ok(Err(anyhow::anyhow!("connection ended without session_id or error"))),
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        {
+            Ok(Ok(Ok(session_id))) => {
+                info!(
+                    "[SACP] Received session_id from ACP agent: {}, project_id={}",
+                    session_id, project_id
+                );
+                session_id
+            }
+            Err(_timeout_elapsed) => {
+                // 60 秒超时，连接任务仍在运行
+                let stderr_info = stderr_output_shared.lock().ok()
+                    .map(|buf| buf.join("\n"))
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("; stderr: {}", s))
+                    .unwrap_or_default();
+                error!(
+                    "[SACP] ⏰ Agent initialization timeout (60s), project_id={}, command={}, child_pid={}, stderr={}",
+                    project_id, command_path_for_log, child_pid, stderr_info
+                );
+                // 超时后取消 spawned 任务，避免子进程泄漏
+                connection_task_handle.abort();
+                // kill 子进程（使用进程组 kill 清理所有孙进程）
+                #[cfg(unix)]
+                {
+                    use nix::sys::signal::{Signal, killpg};
+                    use nix::unistd::Pid;
+                    if child_pid > 0 {
+                        let pgid = Pid::from_raw(-(child_pid as i32));
+                        match killpg(pgid, Signal::SIGKILL) {
+                            Ok(_) => warn!(
+                                "[SACP] Killed process group (SIGKILL) for child_pid={}, project_id={}",
+                                child_pid, project_id
+                            ),
+                            Err(e) => error!(
+                                "[SACP] Failed to kill process group for child_pid={}: {}, project_id={}",
+                                child_pid, e, project_id
+                            ),
+                        }
+                    }
+                }
+                return Err(anyhow::anyhow!(
+                    "{}: agent initialization timeout (60s){}",
+                    error_codes::get_i18n_message_default("error.agent_init_timeout"),
+                    stderr_info
+                ));
+            }
+            Ok(Err(e)) => {
+                // 连接任务主动报告了失败，立即返回
+                let err_str = e.to_string();
+                let stderr_info = stderr_output_shared.lock().ok()
+                    .map(|buf| buf.join("\n"))
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("; stderr: {}", s))
+                    .unwrap_or_default();
+                let clean_msg = err_str
+                    .strip_prefix("connection failed: ")
+                    .unwrap_or(&err_str);
+                error!(
+                    "[SACP] Agent connection failed early: project_id={}, error={}, stderr={}",
+                    project_id, err_str, stderr_info
+                );
+                return Err(anyhow::anyhow!(
+                    "Agent process failed: {}{}",
+                    clean_msg,
+                    stderr_info
+                ));
+            }
+            Ok(Ok(Err(e))) => {
+                // channel dropped — 读取连接任务的实际错误原因
+                let connection_error = connection_error_shared.lock().ok()
+                    .and_then(|guard| guard.clone())
+                    .unwrap_or_else(|| "unknown error".to_string());
+                // 读取 stderr 输出
+                let stderr_info = stderr_output_shared.lock().ok()
+                    .map(|buf| buf.join("\n"))
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("; stderr: {}", s))
+                    .unwrap_or_default();
+                error!(
+                    "[SACP] session_id channel dropped (connection task failed): recv_error={}, actual_error={}, project_id={}",
+                    e, connection_error, project_id
+                );
+                // 连接任务已自行结束，无需 abort
+                return Err(anyhow::anyhow!(
+                    "{}: {}{}",
+                    error_codes::get_i18n_message_default("error.agent_init_timeout"),
+                    connection_error,
+                    stderr_info
+                ));
+            }
+        };
 
         info!(
             "[SACP] Claude Code ACP Agent service started successfully, session ID: {}",
             session_id
         );
 
-        // 创建 stderr 任务
-        let cancel_token_for_stderr = cancel_token.clone();
-        let stderr_task = tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut lines = BufReader::new(stderr).lines();
-
-            loop {
-                tokio::select! {
-                                   biased; // 优先检查取消信号
-
-                                   _ = cancel_token_for_stderr.cancelled() => {
-                debug!("[SACP] stderr cancel received");
-                                       break;
-                                   }
-                                   result = lines.next_line() => {
-                                       match result {
-                                           Ok(Some(line)) if !line.trim().is_empty() => {
-                                               warn!("[SACP] Claude Code Agent stderr: {}", line.trim());
-                                           }
-                                           Ok(Some(_)) => {} // 空行，忽略
-                                           Ok(None) => break, // EOF
-                                           Err(e) => {
-                error!("[SACP] read stderr failed: {}", e);
-                                               break;
-                                           }
-                                       }
-                                   }
-                               }
-            }
-        });
+        // stderr 任务已在子进程启动后立即创建（stderr_task_handle），无需重复创建
 
         // 创建生命周期守卫（带异常退出标志）
         let lifecycle_guard = AgentLifecycleGuard::new_claude_with_abnormal_flag(
             project_id.clone(),
             session_id.clone(),
             child,
-            stderr_task,
+            stderr_task_handle,
             cancel_token.clone(),
             abnormal_exit_flag,
         );
@@ -1094,13 +1326,20 @@ struct SacpConnectionParams<N: SessionNotifier> {
     notifier: Arc<N>,
     /// 🔥 新增：共享的异常退出标志（子进程异常退出时设置为 true）
     abnormal_exit_flag: Arc<AtomicBool>,
+    /// 共享的 session_id，用于连接失败时发送错误通知
+    /// 在 connect_with 内部初始化完成后设置，供外部错误处理使用
+    session_id_shared: Arc<std::sync::Mutex<Option<String>>>,
+    /// 🔥 连接失败通知通道：内部失败时立即通知外层，避免等待超时
+    connection_failed_tx: Option<tokio::sync::oneshot::Sender<String>>,
+    /// 子进程 PID，用于 waitpid 检测子进程退出
+    child_pid: u32,
 }
 
 /// 运行 SACP 连接
 ///
 /// 使用 SACP 的 Builder 模式建立连接并处理消息
 async fn run_sacp_connection<N: SessionNotifier + 'static>(
-    transport: sacp::ByteStreams<
+    transport: agent_client_protocol::ByteStreams<
         tokio_util::compat::Compat<tokio::process::ChildStdin>,
         tokio_util::compat::Compat<tokio::process::ChildStdout>,
     >,
@@ -1118,6 +1357,9 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
         cancel_token,
         notifier,
         abnormal_exit_flag,
+        session_id_shared,
+        mut connection_failed_tx,
+        child_pid,
     } = params;
 
     // 克隆变量供 handlers 使用
@@ -1128,145 +1370,384 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
     let project_id_for_prompt_end = project_id.clone();
 
     // 使用 SACP Builder 模式
-    ClientToAgent::builder()
+    Client.builder()
         .name("rcoder-agent-runner-sacp")
-        // 使用容错的消息处理器（处理未类型化消息，手动解析以捕获错误）
-        // 注意：必须在类型化 handlers 之前注册，以便作为 fallback
-        .on_receive_message(
+        // 处理 SessionNotification 通知（使用 dispatch 方式，优雅处理未知消息类型）
+        .on_receive_dispatch(
             {
-                async move |msg: sacp::MessageCx<sacp::UntypedMessage, sacp::UntypedMessage>,
-                            _cx: JrConnectionCx<ClientToAgent>| {
-                    match msg {
-                        sacp::MessageCx::Notification(untyped_notif) => {
-                            // 提前克隆需要的字段
-                            let method = untyped_notif.method.clone();
-                            let params = untyped_notif.params.clone();
-
-                            // 尝试解析为 SessionNotification
-                            let parse_result = sacp::MessageCx::Notification(untyped_notif)
-                                .into_notification::<SessionNotification>();
-
-                            match parse_result {
-                                Ok(Ok(notification)) => {
-                                    let notifier = notifier_for_handlers.clone();
-                                    let project_id = project_id_for_handlers.clone();
-                                    // 解析成功，处理通知
-                                    handle_session_notification(notification, notifier, project_id).await;
-                                    Ok(sacp::Handled::Yes)
+                let notifier = notifier_for_handlers.clone();
+                let project_id = project_id_for_handlers.clone();
+                async move |dispatch: Dispatch, _cx: ConnectionTo<Agent>| {
+                    match dispatch {
+                        Dispatch::Notification(message) => {
+                            if SessionNotification::matches_method(&message.method) {
+                                match SessionNotification::parse_message(&message.method, &message.params) {
+                                    Ok(notification) => {
+                                        handle_session_notification(notification, notifier.clone(), project_id.clone()).await;
+                                        Ok(Handled::Yes)
+                                    }
+                                    Err(err) => {
+                                        // 🔥 关键：未知消息类型只打 warn，不中断连接
+                                        warn!(
+                                            "[SACP] Failed to parse SessionNotification, ignoring: method={}, error={:?}, json={:?}",
+                                            message.method, err, message.params
+                                        );
+                                        Ok(Handled::Yes)
+                                    }
                                 }
-                                Ok(Err(_)) => {
-                                    // 方法名不匹配，不是 session/update 通知，跳过
-                                    debug!(
-                                        method = %method,
-                                        "[SACP] Skipping non session/update notification"
-                                    );
-                                    // 继续传递给其他 handlers
-                                    Ok(sacp::Handled::No {
-                                        message: sacp::MessageCx::Notification(sacp::UntypedMessage {
-                                            method,
-                                            params,
-                                        }),
-                                        retry: false,
-                                    })
-                                }
-                                Err(ref err) => {
-                                    // 解析失败（如缺少 data 字段），记录警告但不断开连接
-                                    warn!(
-                                        ?err,
-                                        method = %method,
-                                        params = ?params,
-                                        "[SACP] SessionNotification parse failed, skipping message but keeping connection"
-                                    );
-                                    // 跳过此消息但不断开连接
-                                    Ok(sacp::Handled::Yes)
-                                }
+                            } else {
+                                Ok(Handled::No {
+                                    message: Dispatch::Notification(message),
+                                    retry: false,
+                                })
                             }
                         }
-                        sacp::MessageCx::Request(request, request_cx) => {
-                            // 请求消息继续传递给 RequestPermission handler
-                            Ok(sacp::Handled::No {
-                                message: sacp::MessageCx::Request(request, request_cx),
-                                retry: false,
-                            })
-                        }
+                        other => Ok(Handled::No {
+                            message: other,
+                            retry: false,
+                        }),
                     }
                 }
             },
-            sacp::on_receive_message!(),
+            agent_client_protocol::on_receive_dispatch!(),
         )
         // 处理 RequestPermission
         .on_receive_request(
             move |request: RequestPermissionRequest,
-                  request_cx: JrRequestCx<RequestPermissionResponse>,
-                  _cx: JrConnectionCx<ClientToAgent>| {
-                async move { handle_permission_request(request, request_cx).await }
+                  responder: Responder<RequestPermissionResponse>,
+                  _cx: ConnectionTo<Agent>| {
+                async move { handle_permission_request(request, responder).await }
             },
-            sacp::on_receive_request!(),
+            agent_client_protocol::on_receive_request!(),
         )
         // 主连接逻辑
-        .run_until(transport, move |cx: JrConnectionCx<ClientToAgent>| {
+        .connect_with(transport, move |cx: ConnectionTo<Agent>| {
             let project_path = project_path.clone();
             let mcp_servers = mcp_servers.clone();
             let start_config = start_config.clone();
             let notifier_for_prompt = notifier_for_prompt_end.clone();
             let project_id_for_prompt = project_id_for_prompt_end.clone();
             let abnormal_exit_flag = abnormal_exit_flag.clone();
+            let session_id_shared = session_id_shared.clone();
 
             async move {
-                // 1. 初始化连接
- debug!("[SACP] initialize ACP connection...");
-                let _init_response = cx
-                    .send_request(
-                        InitializeRequest::new(VERSION)
-                            .client_info(sacp::schema::Implementation::new(
-                                "rcoder-agent-runner",
-                                env!("CARGO_PKG_VERSION"),
-                            )),
-                    )
-                    .block_task()
-                    .await?;
- info!("[SACP] ACP connection initialized");
+                // 1. 初始化连接（30 秒超时）
+                info!(
+                    "[SACP] Step 1/4: Initializing ACP connection, project_id={}",
+                    project_id
+                );
+                let init_request = InitializeRequest::new(VERSION)
+                    .client_info(agent_client_protocol::schema::Implementation::new(
+                        "rcoder-agent-runner",
+                        env!("CARGO_PKG_VERSION"),
+                    ));
+                debug!("[SACP] Sending InitializeRequest: {:?}", init_request);
+
+                // 🔥 同时等待 InitializeRequest 和子进程退出
+                // 子进程崩溃时立即返回，不等 50 秒超时
+                let init_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(50),
+                    async {
+                        tokio::select! {
+                            result = cx.send_request(init_request).block_task() => {
+                                Ok(result)
+                            }
+                            exit_info = tokio::task::spawn_blocking(move || {
+                                use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+                                use nix::unistd::Pid;
+                                use nix::errno::Errno;
+                                let target_pid = Pid::from_raw(child_pid as i32);
+                                // 使用 WNOHANG 轮询特定子进程 PID
+                                // 避免与 tokio 内部进程 reaper 竞争
+                                loop {
+                                    match waitpid(target_pid, Some(WaitPidFlag::WNOHANG)) {
+                                        Ok(WaitStatus::Exited(pid, code)) => {
+                                            return Some((pid.as_raw(), code));
+                                        }
+                                        Ok(WaitStatus::Signaled(pid, signal, _)) => {
+                                            return Some((pid.as_raw(), signal.as_str().parse::<i32>().unwrap_or(-1)));
+                                        }
+                                        Ok(WaitStatus::StillAlive) => {
+                                            // 子进程仍在运行，等待 50ms 后重试
+                                            std::thread::sleep(std::time::Duration::from_millis(50));
+                                            continue;
+                                        }
+                                        Err(Errno::ECHILD) => {
+                                            // 子进程已被回收（可能被 tokio reaper 或已退出）
+                                            // 视为进程已退出
+                                            return Some((child_pid as i32, -1));
+                                        }
+                                        _ => {
+                                            // 其他错误
+                                            return None;
+                                        }
+                                    }
+                                }
+                            }) => {
+                                match exit_info {
+                                    Ok(Some((pid, code))) => {
+                                        // 子进程退出，立即返回错误
+                                        if code == -1 {
+                                            // ECHILD: 进程已被回收，退出码未知
+                                            Err(anyhow::anyhow!("subprocess exited prematurely: pid={}, exit_code unknown (process already reaped)", pid))
+                                        } else {
+                                            Err(anyhow::anyhow!("subprocess exited prematurely: pid={}, exit_code={}", pid, code))
+                                        }
+                                    }
+                                    _ => {
+                                        // waitpid 未返回有效信息
+                                        Err(anyhow::anyhow!("subprocess exit detection failed for pid={}", child_pid))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ).await;
+
+                let _init_response = match init_result {
+                    Ok(Ok(Ok(result))) => {
+                        // InitializeRequest 成功
+                        result
+                    }
+                    Ok(Ok(Err(e))) => {
+                        // send_request 返回错误
+                        error!("[SACP] InitializeRequest error: {}, project_id={}", e, project_id);
+                        if let Some(tx) = connection_failed_tx.take() {
+                            let _ = tx.send(format!("InitializeRequest error: {}", e));
+                        }
+                        return Err(e);
+                    }
+                    Ok(Err(process_err)) => {
+                        // 子进程异常退出
+                        let err_msg = process_err.to_string();
+                        error!("[SACP] Process exited during init: {}, project_id={}", err_msg, project_id);
+                        if let Some(tx) = connection_failed_tx.take() {
+                            let _ = tx.send(err_msg.clone());
+                        }
+                        return Err(agent_client_protocol::Error::new(1003, err_msg));
+                    }
+                    Err(_elapsed) => {
+                        error!(
+                            "[SACP] ⏰ InitializeRequest timeout (30s), project_id={}",
+                            project_id
+                        );
+                        if let Some(tx) = connection_failed_tx.take() {
+                            let _ = tx.send(format!("ACP InitializeRequest timeout (30s), project_id={}", project_id));
+                        }
+                        return Err(agent_client_protocol::Error::new(
+                            1002,
+                            format!("ACP InitializeRequest timeout (30s), project_id={}", project_id),
+                        ));
+                    }
+                };
+                info!(
+                    "[SACP] Step 1/4: ACP connection initialized successfully, project_id={}",
+                    project_id
+                );
 
                 // 2. 构建 meta（包含系统提示词和可能的 resume）
                 let system_prompt_meta = start_config.build_meta();
 
-                // 3. 创建新会话
- info!("[SACP] creating ACP session...");
-                let new_session_request = NewSessionRequest::new(project_path.clone())
-                    .mcp_servers(mcp_servers.clone())
-                    .meta(system_prompt_meta);
+                // 构建不含 resume 的 clean meta，用于 LoadSession 失败后回退到 NewSession
+                // NewSession 应该是全新会话，不应携带旧的 resume session_id
+                let new_session_meta = {
+                    let mut meta = system_prompt_meta.clone();
+                    if let Some(claude_code) = meta.get_mut("claudeCode").and_then(|v| v.as_object_mut()) {
+                        if let Some(options) = claude_code.get_mut("options").and_then(|v| v.as_object_mut()) {
+                            options.remove("resume");
+                        }
+                    }
+                    meta
+                };
 
-                debug!("new_session_request: {:?}", new_session_request);
-
-                // 从配置获取超时值，默认 100 秒
+                // 3. 创建或加载会话
+                // 从配置获取超时值，默认 60 秒
                 let timeout_secs = start_config
                     .acp_session_create_timeout_secs
-                    .unwrap_or(100);
-                let session_response = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(timeout_secs),
-                    cx.send_request(new_session_request).block_task(),
-                )
-                .await
-                .map_err(|_| {
-                    sacp::Error::new(
-                        -32000,
-                        format!("[SACP] new_session timeout ({}s)", timeout_secs)
-                    )
-                })??;
+                    .unwrap_or(60);
+                info!(
+                    "[SACP] Step 3/4: Creating/loading session, project_id={}, timeout={}s, has_resume={}",
+                    project_id, timeout_secs, start_config.resume_session_id.is_some()
+                );
 
-                let session_id = session_response.session_id;
- info!("[SACP] ACP session created, session_id={}", session_id);
+                // 🔥 修复：使用 Result 累积错误，避免 ? 操作符提前返回
+                // 无论成功失败，都确保能执行到 session_id_tx.send()
+                let session_result: Result<SessionId, String> = if let Some(ref resume_id) =
+                    start_config.resume_session_id
+                {
+                    // 有 resume_session_id，尝试加载历史会话
+                    info!(
+                        "[SACP] Attempting to load existing session: {}",
+                        resume_id
+                    );
+
+                    let load_request = LoadSessionRequest::new(
+                        resume_id.clone(),
+                        project_path.clone(),
+                    )
+                    .mcp_servers(mcp_servers.clone())
+                    .meta(system_prompt_meta.clone());
+
+                    debug!("load_session_request: {:?}", load_request);
+
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(timeout_secs),
+                        cx.send_request(load_request).block_task(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_response)) => {
+                            // LoadSession 成功，使用请求中的 session_id
+                            info!(
+                                "[SACP] Session loaded successfully: {}, resuming session",
+                                resume_id
+                            );
+                            Ok(SessionId::from(resume_id.clone()))
+                        }
+                        Ok(Err(load_err)) => {
+                            // LoadSession 返回错误，降级到 NewSessionRequest
+                            warn!(
+                                "[SACP] LoadSession failed, falling back to NewSession: {}",
+                                load_err
+                            );
+
+                            let cancel_notification =
+                                CancelNotification::new(SessionId::from(resume_id.clone()));
+                            if let Err(e) = cx.send_notification(cancel_notification) {
+                                debug!(
+                                    "[SACP] Failed to send cancel notification for LoadSession: {}",
+                                    e
+                                );
+                            }
+                            // 等待一小段时间让 agent 有机会清理
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                            let new_request = NewSessionRequest::new(project_path.clone())
+                                .mcp_servers(mcp_servers.clone())
+                                .meta(new_session_meta.clone());
+
+                            debug!("new_session_request: {:?}", new_request);
+
+                            // 🔥 尝试 NewSession，不要用 ? 操作符
+                            match tokio::time::timeout(
+                                tokio::time::Duration::from_secs(timeout_secs),
+                                cx.send_request(new_request).block_task(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(response)) => Ok(response.session_id),
+                                Ok(Err(new_err)) => Err(format!(
+                                    "[SACP] LoadSession failed ({}), NewSession also failed ({})",
+                                    load_err, new_err
+                                )),
+                                Err(_) => Err(format!(
+                                    "[SACP] LoadSession failed (timeout), NewSession timeout"
+                                )),
+                            }
+                        }
+                        Err(_) => {
+                            // LoadSession 超时，降级到 NewSessionRequest
+                            warn!(
+                                "[SACP] LoadSession timeout ({}s), falling back to NewSession",
+                                timeout_secs
+                            );
+
+                            let cancel_notification =
+                                CancelNotification::new(SessionId::from(resume_id.clone()));
+                            if let Err(e) = cx.send_notification(cancel_notification) {
+                                debug!(
+                                    "[SACP] Failed to send cancel notification for LoadSession: {}",
+                                    e
+                                );
+                            }
+                            // 等待一小段时间让 agent 有机会清理
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                            let new_request = NewSessionRequest::new(project_path.clone())
+                                .mcp_servers(mcp_servers.clone())
+                                .meta(new_session_meta.clone());
+
+                            debug!("new_session_request: {:?}", new_request);
+
+                            // 🔥 尝试 NewSession，不要用 ? 操作符
+                            match tokio::time::timeout(
+                                tokio::time::Duration::from_secs(timeout_secs),
+                                cx.send_request(new_request).block_task(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(response)) => Ok(response.session_id),
+                                Ok(Err(new_err)) => Err(format!(
+                                    "[SACP] LoadSession timeout, NewSession failed ({})",
+                                    new_err
+                                )),
+                                Err(_) => {
+                                    Err("[SACP] LoadSession timeout, NewSession timeout".to_string())
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // 没有 resume_session_id，创建新会话
+                    info!("[SACP] Creating new ACP session (no resume_session_id)...");
+
+                    let new_request = NewSessionRequest::new(project_path.clone())
+                        .mcp_servers(mcp_servers.clone())
+                        .meta(system_prompt_meta);
+
+                    debug!("new_session_request: {:?}", new_request);
+
+                    // 🔥 尝试 NewSession，不要用 ? 操作符
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(timeout_secs),
+                        cx.send_request(new_request).block_task(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) => Ok(response.session_id),
+                        Ok(Err(e)) => Err(format!("[SACP] NewSession failed: {}", e)),
+                        Err(_) => Err(format!(
+                            "[SACP] NewSession timeout ({}s)",
+                            timeout_secs
+                        )),
+                    }
+                };
+
+                // 🔥 关键修复：在闭包最后统一处理 session 创建结果
+                // 确保无论成功失败都能执行到发送逻辑
+                let session_id = match session_result {
+                    Ok(sid) => sid,
+                    Err(err_msg) => {
+                        error!("[SACP] Session creation failed: {}", err_msg);
+                        return Err(agent_client_protocol::Error::new(1000, err_msg));
+                    }
+                };
+
+                info!(
+                    "[SACP] ACP session ready, session_id={}",
+                    session_id
+                );
 
                 // 发送会话 ID 到主任务
                 if session_id_tx.send(session_id.clone()).is_err() {
                     error!("[SACP] unable to send session ID");
-                    return Err(sacp::Error::new(
-                        -32001,
+                    return Err(agent_client_protocol::Error::new(
+                        1001,
                         error_codes::get_i18n_message_default("error.sacp_session_id_send_failed"),
                     ));
                 }
 
+                // 同步设置共享 session_id，供连接失败时的错误通知使用
+                if let Ok(mut guard) = session_id_shared.lock() {
+                    *guard = Some(session_id.to_string());
+                }
+
                 // 4. 处理 Prompt 和 Cancel 请求
+                info!(
+                    "[SACP] Step 4/4: Entering prompt processing loop, project_id={}, session_id={}",
+                    project_id, session_id
+                );
+                let mut session_cancelled = false;
                 loop {
                     tokio::select! {
                         _ = cancel_token.cancelled() => {
@@ -1285,8 +1766,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     .notify_prompt_error(
                                         &project_id_for_prompt,
                                         &session_id.to_string(),
-                                        sacp::Error::new(
-                                            -32001,
+                                        agent_client_protocol::Error::new(
+                                            1001,
                                             error_codes::get_i18n_message_default("error.agent_process_abnormal_exit"),
                                         ),
                                         None, // request_id 可能已经不可用
@@ -1304,7 +1785,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     .notify_prompt_end(
                                         &project_id_for_prompt,
                                         &session_id.to_string(),
-                                        sacp::schema::StopReason::Cancelled,
+                                        agent_client_protocol::schema::StopReason::Cancelled,
                                         Some(error_codes::get_i18n_message_default("error.session_cancelled")),
                                         None,
                                     )
@@ -1336,9 +1817,17 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
  info!("[SACP] cancel notification sent");
                                 // 通知调用方取消成功
                                 let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
+                                // 标记会话已取消，当前 prompt 完成后退出循环
+                                session_cancelled = true;
                             }
                         }
                         Some(prompt_request) = prompt_rx.recv() => {
+                            // 收到新 prompt，重置取消标志
+                            // 场景：用户快速发送 prompt A → cancel → prompt B
+                            // - cancel 设置 session_cancelled=true
+                            // - prompt B 到达时重置为 false，处理完后不 break
+                            // - 保持 outer loop 存活以接收后续 prompt
+                            session_cancelled = false;
  debug!("[SACP] received Prompt request");
 
                             // 从 meta 中提取 request_id
@@ -1389,8 +1878,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                                 "[SACP] Detected Agent process abnormal exit during prompt processing: project_id={}, session_id={}",
                                                 project_id_for_prompt, session_id
                                             );
-                                            break Err(sacp::Error::new(
-                                                -32001,
+                                            break Err(agent_client_protocol::Error::new(
+                                                1001,
                                                 error_codes::get_i18n_message_default("error.agent_process_abnormal_exit"),
                                             ));
                                         } else {
@@ -1399,8 +1888,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                                 "[SACP] Received cancel signal during prompt processing: project_id={}, session_id={}",
                                                 project_id_for_prompt, session_id
                                             );
-                                            break Err(sacp::Error::new(
-                                                -32002,
+                                            break Err(agent_client_protocol::Error::new(
+                                                1002,
                                                 error_codes::get_i18n_message_default("error.session_cancelled"),
                                             ));
                                         }
@@ -1409,8 +1898,8 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     _ = &mut cancel_timeout, if is_cancelled => {
                                         // 取消后超时，强制返回错误
                                         warn!("[SACP] cancel message Prompt response timeout (10s), force exit");
-                                        break Err(sacp::Error::new(
-                                            -32001,
+                                        break Err(agent_client_protocol::Error::new(
+                                            1001,
                                             error_codes::get_i18n_message_default("error.cancel_response_timeout"),
                                         ));
                                     }
@@ -1482,7 +1971,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                             .notify_prompt_end(
                                                 &project_id_for_prompt,
                                                 &session_id.to_string(),
-                                                sacp::schema::StopReason::Cancelled,
+                                                agent_client_protocol::schema::StopReason::Cancelled,
                                                 Some(error_codes::get_i18n_message_default("error.session_cancelled_timeout")),
                                                 request_id.clone(),
                                             )
@@ -1514,6 +2003,27 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     }
                                 }
                             }
+
+                            // 🎯 关键设计：cancel 后不退出 outer loop，保持 Agent 子进程存活
+                            //
+                            // 为什么不能 break outer loop：
+                            // - outer loop break → spawned task 退出 → lifecycle_guard drop
+                            // - LifecycleGuard::drop() → SIGKILL → Agent 子进程被杀
+                            // - 子进程被杀 → 内存中的对话上下文丢失
+                            // - 下次请求 get_or_create_session → is_channel_closed()=true → 创建新 session → 上下文断裂
+                            //
+                            // 正确行为：
+                            // - inner loop 处理了 cancel → is_cancelled=true → inner loop 退出
+                            // - notify_prompt_end(Cancelled) → 状态恢复 Idle
+                            // - outer loop 继续等待 prompt_rx.recv() → 收到新 prompt → 复用同一 Agent 进程
+                            // - 上下文连续：同一子进程、同一 SACP 连接、同一对话历史
+                            //
+                            // is_cancelled 不传播到 session_cancelled，保持 outer loop 存活。
+                            // session_cancelled 仅在 outer select 中收到 cancel（无活跃 prompt）时设置。
+                            info!(
+                                "[SACP] Prompt cancelled, session ready for next prompt: project_id={}, session_id={}",
+                                project_id_for_prompt, session_id
+                            );
                         }
                         else => {
                             // 所有通道已关闭
@@ -1553,7 +2063,7 @@ async fn handle_session_notification<N: SessionNotifier>(
         .map(|s| s.to_string());
 
     // 通过 notifier 推送会话更新
-    // 注意：sacp::schema::SessionUpdate 与 agent_client_protocol::SessionUpdate 是同一类型
+    // SessionUpdate 通过 agent_client_protocol::schema 导入
     if let Err(e) = notifier
         .notify_session_update(&project_id, &session_id, notification.update, request_id)
         .await
@@ -1568,8 +2078,8 @@ async fn handle_session_notification<N: SessionNotifier>(
 /// 处理 RequestPermission 回调
 async fn handle_permission_request(
     request: RequestPermissionRequest,
-    request_cx: JrRequestCx<RequestPermissionResponse>,
-) -> Result<(), sacp::Error> {
+    request_cx: Responder<RequestPermissionResponse>,
+) -> Result<(), agent_client_protocol::Error> {
     debug!("[SACP] permission request: {:?}", request);
 
     // 自动允许：优先选择 AllowAlways，其次 AllowOnce

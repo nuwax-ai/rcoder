@@ -22,7 +22,7 @@
 //! 注意：Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 
 use axum::{extract::State, http::HeaderMap};
-use shared_types::{ChatResponse, ComputerChatRequest};
+use shared_types::{ChatResponse, ComputerChatRequest, IsolationType};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -30,8 +30,8 @@ use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerMa
 use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
-    I18nJson, extract_grpc_addr_with_port, get_locale_from_headers,
-    get_realtime_container_ip_with_cache, project_dir,
+    I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers,
+    get_realtime_container_ip, project_dir, build_computer_workspace_path,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -94,7 +94,7 @@ use super::utils::{
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(mut request): I18nJson<ComputerChatRequest>,
+    I18nJsonOrQuery(mut request): I18nJsonOrQuery<ComputerChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
@@ -109,6 +109,60 @@ pub async fn handle_computer_chat(
     }
 
     let user_id = request.user_id.clone();
+
+    // ========== 隔离类型参数校验 ==========
+    // IF pod_id IS NOT NULL THEN isolation_type, tenant_id, space_id 必须非空
+    if request.pod_id.is_some() {
+        if request.isolation_type.is_none() {
+            error!("[COMPUTER_CHAT] Validation failed: isolation_type is required when pod_id is provided");
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                "isolation_type is required when pod_id is provided",
+            ));
+        }
+        if request.tenant_id.is_none() {
+            error!("[COMPUTER_CHAT] Validation failed: tenant_id is required when pod_id is provided");
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                "tenant_id is required when pod_id is provided",
+            ));
+        }
+        if request.space_id.is_none() {
+            error!("[COMPUTER_CHAT] Validation failed: space_id is required when pod_id is provided");
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                "space_id is required when pod_id is provided",
+            ));
+        }
+
+        // 验证 isolation_type 值有效（大小写不敏感）
+        if let Some(ref it) = request.isolation_type {
+            if IsolationType::from_str(it).is_err() {
+                error!("[COMPUTER_CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
+                return Ok(HttpResult::error_with_message(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    locale,
+                    &format!("invalid isolation_type '{}', expected: tenant, space, project", it),
+                ));
+            }
+        }
+
+        // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
+        if let (Some(pid), Some(it), Some(tid), Some(sid)) = (
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+        ) {
+            info!(
+                "🔒 [COMPUTER_CHAT] Isolation parameters validated: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
+                pid, it, tid, sid
+            );
+        }
+    }
 
     // 2. 生成或使用提供的 project_id
     let project_id = match &request.project_id {
@@ -165,10 +219,15 @@ pub async fn handle_computer_chat(
                 // 标记已被移除 = 创建完成
                 if !state.pod_creating.contains_key(&user_id) {
                     // 尝试获取容器信息
-                    if let Ok(docker_mgr) =
-                        docker_manager::global::get_global_docker_manager().await
+                    if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await
                     {
-                        if let Ok(Some(info)) = docker_mgr.get_user_container_info(&user_id).await {
+                        if let Ok(Some(info)) = runtime
+                            .get_container_info_by_identifier(
+                                &user_id,
+                                &shared_types::ServiceType::ComputerAgentRunner,
+                            )
+                            .await
+                        {
                             info!(
                                 "✅ [COMPUTER_CHAT] Wait successful, container is ready (waited {}s): user_id={}, container_id={}",
                                 wait_sec, user_id, info.container_id
@@ -224,6 +283,10 @@ pub async fn handle_computer_chat(
                 .agent_config
                 .as_ref()
                 .and_then(|c| c.resource_limits.clone()),
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
         )
         .await;
 
@@ -240,6 +303,54 @@ pub async fn handle_computer_chat(
                 ));
             }
         }
+    };
+
+    // 🛡️ 二次验证：确保容器 IP 非空
+    // 容器管理器应该已经处理了空 IP 的情况，但缓存/Docker API 可能返回不一致结果
+    // 如果 IP 为空，先清理旧容器再强制重建（不返回错误给客户端）
+    let container_info = if container_info.container_ip.trim().is_empty() {
+        warn!(
+            "⚠️ [COMPUTER_CHAT] Container has empty IP after get_or_create, cleaning up and recreating: \
+             user_id={}, old_container_id={}",
+            user_id, container_info.container_id
+        );
+        // 必须先清理旧容器，否则 create_container 发现同名 "running" 容器会复用它
+        let container_identifier = request.pod_id.as_deref().unwrap_or(&user_id);
+        if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await {
+            if let Err(e) = runtime
+                .stop_container_by_identifier(
+                    container_identifier,
+                    &shared_types::ServiceType::ComputerAgentRunner,
+                )
+                .await
+            {
+                warn!(
+                    "⚠️ [COMPUTER_CHAT] Failed to cleanup broken container before recreate: {}",
+                    e
+                );
+            }
+        }
+        ComputerContainerManager::force_create_container_for_user(
+            &user_id,
+            request
+                .agent_config
+                .as_ref()
+                .and_then(|c| c.resource_limits.clone()),
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("[COMPUTER_CHAT] Force recreate container failed: {}", e);
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                format!("Container recreation failed: {}", e),
+            )
+        })?
+    } else {
+        container_info
     };
 
     info!(
@@ -287,7 +398,14 @@ pub async fn handle_computer_chat(
 
     // 5. 创建项目工作目录（在用户容器内）
     // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
-    if let Err(e) = ensure_project_workspace_exists(&user_id, &project_id).await {
+    if let Err(e) = ensure_project_workspace_exists(
+        request.isolation_type.as_deref(),
+        request.tenant_id.as_deref(),
+        request.space_id.as_deref(),
+        &user_id,
+        &project_id,
+    )
+    .await {
         error!("[COMPUTER_CHAT] Failed to create project workspace: {}", e);
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_WORKSPACE_ERROR,
@@ -308,12 +426,13 @@ pub async fn handle_computer_chat(
     // 在转发请求前，主动查询 Agent 状态，确保状态是最新的。
     // 这有助于在容器重启后，确认 Agent 是否真正处于空闲状态。
     {
-        // 💫 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期的问题
+        // 💫 使用实时 IP 获取，避免 restart 后 IP 过期的问题
         let grpc_addr_result = async {
-            let container_ip = get_realtime_container_ip_with_cache(
+            let container_ip = get_realtime_container_ip(
                 &container_info.container_name,
-                &state.container_ip_cache,
                 &container_info.container_ip,
+                &state.container_prefix_rcoder,
+                &state.container_prefix_computer,
             )
             .await
             .map_err(|e| format!("IP resolution error: {}", e))?;
@@ -406,8 +525,9 @@ pub async fn handle_computer_chat(
         &project_id,
         &container_info,
         &state.grpc_pool,
-        &state.container_ip_cache,
         locale,
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
     )
     .await;
 
@@ -427,26 +547,31 @@ pub async fn handle_computer_chat(
                 result.is_success()
             );
 
-            // 🆕 KEY FIX: Get latest container network info from Docker API in real-time
-            // 这确保即使内存映射中的信息过时，也能获取到正确的 container_ip
-            let docker_manager = docker_manager::global::get_global_docker_manager()
+            // 从 Runtime API 获取最新容器信息，避免使用过期 IP
+            let runtime = docker_manager::runtime::RuntimeManager::get()
                 .await
                 .map_err(|e| {
-                    error!("[COMPUTER_CHAT] Failed to get DockerManager: {}", e);
-                    AppError::internal_server_error(&format!("Failed to get DockerManager: {}", e))
+                    error!("[COMPUTER_CHAT] Failed to get runtime: {}", e);
+                    AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
                 })?;
 
-            let container_info = match docker_manager.get_agent_info(&user_id).await {
+            let container_info = match runtime
+                .get_container_info_by_identifier(
+                    &user_id,
+                    &shared_types::ServiceType::ComputerAgentRunner,
+                )
+                .await
+            {
                 Ok(Some(info)) => {
                     info!(
-                        "🔄 [COMPUTER_CHAT] Getting latest container info from Docker API: user_id={}, container_id={}, container_ip={}",
+                        "🔄 [COMPUTER_CHAT] Getting latest container info from Runtime API: user_id={}, container_id={}, container_ip={}",
                         user_id, info.container_id, info.container_ip
                     );
                     info
                 }
                 Ok(None) => {
                     warn!(
-                        "⚠️ [COMPUTER_CHAT] Container not found in Docker API: user_id={}, using cached container info",
+                        "⚠️ [COMPUTER_CHAT] Container not found in runtime: user_id={}, using cached container info",
                         user_id
                     );
                     // 使用之前获取的容器信息
@@ -454,7 +579,7 @@ pub async fn handle_computer_chat(
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️ [COMPUTER_CHAT] Failed to get container info from Docker API: user_id={}, error={}, using cached container info",
+                        "⚠️ [COMPUTER_CHAT] Failed to get container info from runtime: user_id={}, error={}, using cached container info",
                         user_id, e
                     );
                     // 使用之前获取的容器信息
@@ -498,6 +623,8 @@ pub async fn handle_computer_chat(
 
                 // 设置 user_id（ComputerAgentRunner 模式）
                 project_info.set_user_id(Some(user_id.clone()));
+                // 设置 pod_id（共享容器模式）
+                project_info.set_pod_id(request.pod_id.clone());
 
                 // 更新会话ID
                 project_info.update_session(session_id.clone());
@@ -559,8 +686,9 @@ async fn forward_computer_request_to_container(
     project_id: &str,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
-    container_ip_cache: &Arc<crate::grpc::ContainerIpCache>,
     locale: &'static str,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
 ) -> HttpResult<ChatResponse> {
     info!(
         "📤 [COMPUTER_FORWARD] Forwarding request to container (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}",
@@ -571,11 +699,12 @@ async fn forward_computer_request_to_container(
     // gRPC 连接失败会自动返回错误，由上层处理
 
     // 从 service_url 提取 gRPC 地址
-    // 🆕 使用实时 IP 获取（带缓存），避免 restart 后 IP 过期的问题
-    let grpc_addr = match get_realtime_container_ip_with_cache(
+    // 🆕 使用实时 IP 获取，避免 restart 后 IP 过期的问题
+    let mut grpc_addr = match get_realtime_container_ip(
         &container_info.container_name,
-        container_ip_cache,
         &container_info.container_ip,
+        rcoder_prefix,
+        computer_prefix,
     )
     .await
     {
@@ -632,7 +761,7 @@ async fn forward_computer_request_to_container(
             request.data_source_attachments.clone(),
             request.model_provider.clone(),
             request.request_id.clone(),
-            None, // 使用默认超时
+            Some(std::time::Duration::from_secs(300)), // 5 分钟超时，避免永久阻塞
             request.system_prompt.clone(),
             request.user_prompt.clone(),
             request.agent_config.clone(),
@@ -674,10 +803,35 @@ async fn forward_computer_request_to_container(
 
                 if should_retry && attempt < max_retries {
                     info!(
-                        "🔄 [COMPUTER_FORWARD] Detected retryable error, removing {} from connection pool and retrying...",
-                        grpc_addr
+                        "🔄 [COMPUTER_FORWARD] Detected retryable error, re-resolving container IP and retrying..."
                     );
                     grpc_pool.remove(&grpc_addr);
+
+                    // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
+                    match get_realtime_container_ip(
+                        &container_info.container_name,
+                        &container_info.container_ip,
+                        rcoder_prefix,
+                        computer_prefix,
+                    )
+                    .await
+                    {
+                        Ok(ip) => {
+                            let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
+                            info!(
+                                "🔄 [COMPUTER_FORWARD] Container IP re-resolved: {} -> {}",
+                                grpc_addr, new_addr
+                            );
+                            grpc_addr = new_addr;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️ [COMPUTER_FORWARD] Failed to re-resolve container IP, keeping old address: {}",
+                                e
+                            );
+                        }
+                    }
+
                     last_error = Some(e);
                     continue;
                 } else if !should_retry {
@@ -715,9 +869,28 @@ async fn forward_computer_request_to_container(
 /// /app/computer-project-workspace/{user_id}/{project_id}/
 ///
 /// 注意：这个目录已经在 docker-compose.yml 中挂载，可以直接在 rcoder 容器内创建
-async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Result<(), AppError> {
-    // 项目工作目录路径
-    let project_workspace_path = std::path::PathBuf::from(project_dir(user_id, project_id));
+///
+/// # 参数
+/// - `isolation_type`: 隔离类型（可选）
+/// - `tenant_id`: 租户 ID（可选）
+/// - `space_id`: 空间 ID（可选）
+/// - `user_id`: 用户 ID（当 isolation_type 为 project 时使用）
+/// - `project_id`: 项目 ID
+async fn ensure_project_workspace_exists(
+    isolation_type: Option<&str>,
+    tenant_id: Option<&str>,
+    space_id: Option<&str>,
+    user_id: &str,
+    project_id: &str,
+) -> Result<(), AppError> {
+    // 根据隔离类型构建工作空间路径
+    let project_workspace_path = std::path::PathBuf::from(build_computer_workspace_path(
+        isolation_type,
+        tenant_id,
+        space_id,
+        user_id,
+        project_id,
+    ));
 
     debug!(
         "📁 [COMPUTER_CHAT] Ensuring project workspace directory exists: {:?}",
@@ -736,8 +909,8 @@ async fn ensure_project_workspace_exists(user_id: &str, project_id: &str) -> Res
         })?;
 
     info!(
-        "✅ [COMPUTER_CHAT] Project workspace directory created: user_id={}, project_id={}, path={:?}",
-        user_id, project_id, project_workspace_path
+        "✅ [COMPUTER_CHAT] Project workspace directory created: user_id={}, project_id={}, isolation_type={:?}, path={:?}",
+        user_id, project_id, isolation_type, project_workspace_path
     );
 
     Ok(())
@@ -792,6 +965,8 @@ fn ensure_project_mapping_in_state(
 
     // 设置 user_id（ComputerAgentRunner 模式）
     project_info.set_user_id(Some(user_id.to_string()));
+    // 设置 pod_id（共享容器模式）
+    project_info.set_pod_id(request.pod_id.clone());
 
     // 更新容器信息
     project_info.update_extended_from_request(

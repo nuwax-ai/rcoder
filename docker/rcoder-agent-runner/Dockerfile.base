@@ -7,7 +7,17 @@
 # ============================================================================
 
 ARG DOCKER_MIRROR
-FROM ${DOCKER_MIRROR}debian:12
+# GitHub 镜像加速配置（默认启用）
+ARG USE_GITHUB_MIRROR=true
+# 基础镜像: buildpack-deps:bookworm-curl
+# - 基于 debian:12 (bookworm), 与 debian:12 100% 兼容
+# - 预装 curl + wget + ca-certificates + gnupg, 无需先 apt 安装
+# - Docker 官方维护, 与 debian:12 共享底层 layer, 拉取几乎零增量
+# - 避免"先用海外 apt 源装 curl 再配置镜像"的鸡生蛋死循环
+FROM ${DOCKER_MIRROR}buildpack-deps:bookworm-curl
+
+# GitHub 镜像加速环境变量（必须在 FROM 之后设置）
+ENV GITHUB_MIRROR_URL=https://gh-proxy.org/https://github.com/
 
 # Base image with desktop environment and applications
 # Environment variables:
@@ -22,6 +32,25 @@ ENV \
     PIP_DEFAULT_TIMEOUT=100 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
+
+# 使用 LinuxMirrors 一键配置阿里云镜像源
+# 参考: https://github.com/SuperManito/LinuxMirrors
+# buildpack-deps:bookworm-curl 已预装 curl，可直接执行脚本配置镜像源
+RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
+    --source mirrors.aliyun.com \
+    --protocol https \
+    --use-intranet-source false \
+    --install-epel false \
+    --backup false \
+    --upgrade-software false \
+    --clean-cache true \
+    --ignore-backup-tips
+
+
+# 复制 npmrc 配置镜像（使用国内镜像加速）
+COPY .npmrc /root/.npmrc
+
+
 
 # Desktop environment and applications (merged for smaller image size):
 
@@ -68,7 +97,11 @@ RUN apt-get update && \
 # Debian 12 官方仓库的 FFmpeg 版本是 5.1.8，这里从源码编译安装最新的 FFmpeg 8
 RUN echo "Building FFmpeg 8.0 from source..." && \
     cd /tmp && \
-    git clone --depth 1 --branch release/8.0 https://github.com/FFmpeg/FFmpeg.git ffmpeg-8.0 && \
+    if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
+        git clone --depth 1 --branch release/8.0 ${GITHUB_MIRROR_URL}FFmpeg/FFmpeg.git ffmpeg-8.0; \
+    else \
+        git clone --depth 1 --branch release/8.0 https://github.com/FFmpeg/FFmpeg.git ffmpeg-8.0; \
+    fi && \
     cd ffmpeg-8.0 && \
     ./configure \
         --extra-version="8.0" \
@@ -165,10 +198,19 @@ RUN pip3 install --break-system-packages --upgrade pip setuptools wheel && \
 # 添加构建参数以强制打破缓存（每次构建时传入不同的 CACHEBUST_NOVNC）
 ARG CACHEBUST_NOVNC=1
 RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
-    git clone --depth 1 -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
+    if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
+        echo "Using GitHub mirror: ${GITHUB_MIRROR_URL}"; \
+        echo "Cloning noVNC from: ${GITHUB_MIRROR_URL}nuwax-ai/noVNC.git"; \
+        git clone --depth 1 -b release ${GITHUB_MIRROR_URL}nuwax-ai/noVNC.git /opt/noVNC && \
+        echo "Cloning websockify from: ${GITHUB_MIRROR_URL}novnc/websockify"; \
+        git clone --depth 1 -b v0.12.0 ${GITHUB_MIRROR_URL}novnc/websockify /opt/noVNC/utils/websockify; \
+    else \
+        echo "Using direct GitHub (no mirror)"; \
+        git clone --depth 1 -b release https://github.com/nuwax-ai/noVNC.git /opt/noVNC && \
+        git clone --depth 1 -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify; \
+    fi && \
     cd /opt/noVNC && \
-    ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html && \
-    git clone --depth 1 -b v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
+    ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html
 
 # ============================================================================
 # Install LibreOffice
@@ -184,6 +226,8 @@ RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
 ARG LIBREOFFICE_FILE
 ARG TARGETARCH
 
+COPY downloads /tmp/downloads
+
 # Determine URL based on architecture
 RUN echo "Installing LibreOffice..." && \
     case "${TARGETARCH}" in \
@@ -196,9 +240,9 @@ RUN echo "Installing LibreOffice..." && \
     *) echo "❌ Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
     # Check if local pre-downloaded file exists
-    if [ -f "downloads/${LIBREOFFICE_FILE}" ]; then \
-        echo "📦 Using pre-downloaded file: downloads/${LIBREOFFICE_FILE}"; \
-        cp downloads/${LIBREOFFICE_FILE} /tmp/libreoffice.tar.gz; \
+    if [ -f "/tmp/downloads/${LIBREOFFICE_FILE}" ]; then \
+        echo "📦 Using pre-downloaded file: /tmp/downloads/${LIBREOFFICE_FILE}"; \
+        cp /tmp/downloads/${LIBREOFFICE_FILE} /tmp/libreoffice.tar.gz; \
     else \
         echo "🌐 No local file found, downloading from official URL..."; \
         wget -q -O /tmp/libreoffice.tar.gz "${LIBREOFFICE_URL}" || { \
@@ -225,7 +269,7 @@ RUN echo "Installing LibreOffice..." && \
         exit 1; \
     fi && \
     # Clean up
-    rm -rf /tmp/LibreOffice_* /tmp/libreoffice.tar.gz && \
+    rm -rf /tmp/LibreOffice_* /tmp/libreoffice.tar.gz /tmp/downloads && \
     apt-get autoremove -y && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/*
@@ -508,22 +552,24 @@ RUN apt-get update && \
     apt-get install -y nodejs && \
     # 更新证书
     update-ca-certificates && \
-    # 配置 pnpm
-    corepack enable && \
-    corepack prepare pnpm@latest --activate && \
+    # Clean up package cache to reduce image size:
+    apt-get autoremove -y && \
+    apt-get autoclean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# 使用 npm 安装 pnpm（使用阿里云镜像）
+RUN npm install -g pnpm@latest && \
     # 创建 pnpm 环境配置脚本（用户通过终端使用时会加载）
     echo '#!/bin/sh' > /etc/profile.d/pnpm-env.sh && \
     echo '# PNPM environment configuration' >> /etc/profile.d/pnpm-env.sh && \
     echo 'export PNPM_HOME="/home/user/.local/share/pnpm"' >> /etc/profile.d/pnpm-env.sh && \
     echo 'export npm_config_registry="https://registry.npmmirror.com"' >> /etc/profile.d/pnpm-env.sh && \
     chmod +x /etc/profile.d/pnpm-env.sh && \
+    # Clean up npm cache
+    npm cache clean --force && \
     echo "Node.js version: $(node -v)" && \
     echo "npm version: $(npm -v)" && \
-    echo "pnpm version: $(pnpm -v)" && \
-    # Clean up package cache to reduce image size:
-    apt-get autoremove -y && \
-    apt-get autoclean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    echo "pnpm version: $(pnpm -v)"
 
 # 环境变量设置
 ENV R_VERSION=4.4.2
@@ -681,7 +727,10 @@ ENV BUN_CONFIG_REGISTRY="https://registry.npmmirror.com" \
     BUN_INSTALL="/usr/local" \
     PATH="/usr/local/bin:$PATH"
 
-RUN curl -fsSL https://bun.sh/install | bash && \
+# 使用 npm 从阿里云 npmmirror 安装 bun 的 prebuilt 二进制，避免从 bun.sh/install 走 GitHub 下载不稳定
+# bun 的 npm 包通过 optionalDependencies 引入平台特定二进制（如 @oven/bun-linux-x64），npmmirror 已镜像
+# --prefix=/usr/local 让 bun 安装到 /usr/local/bin/bun（与上方 BUN_INSTALL 路径保持一致）
+RUN npm install -g --prefix=/usr/local --registry=https://registry.npmmirror.com bun && \
     /usr/local/bin/bun --version && \
     # 创建 bun 环境配置脚本（用户通过终端使用时会加载）
     echo '#!/bin/sh' > /etc/profile.d/bun-env.sh && \
@@ -690,18 +739,23 @@ RUN curl -fsSL https://bun.sh/install | bash && \
     echo 'export BUN_CONFIG_INSTALL_CACHE_DIR="/home/user/.cache/bun/install"' >> /etc/profile.d/bun-env.sh && \
     echo 'export BUN_CONFIG_GLOBAL_CACHE_DIR="/home/user/.cache/bun/global"' >> /etc/profile.d/bun-env.sh && \
     echo 'export BUN_INSTALL="/usr/local"' >> /etc/profile.d/bun-env.sh && \
-    chmod +x /etc/profile.d/bun-env.sh
+    chmod +x /etc/profile.d/bun-env.sh && \
+    # Clean up npm cache
+    npm cache clean --force
 
 # 安装全局 npm 包（需要 root，因为安装到 /usr/lib/node_modules）
 RUN npm install -g @zed-industries/claude-code-acp@latest && \
     npm install -g @anthropic-ai/claude-code@latest && \
     npm install -g chrome-devtools-mcp@latest && \
-    # 安装 Playwright（使用系统已安装的 Chromium，无需重复下载）
-    npx playwright install chromium && \
-    echo "✅ Playwright installed (using system Chromium)" && \
     # 安装 pptxgenjs 和 sharp（全局安装，不受 /home/user 挂载影响）
     npm install -g pptxgenjs sharp && \
+    # Clean up npm cache
+    npm cache clean --force && \
     echo "✅ pptxgenjs and sharp installed globally"
+
+# # 安装 Playwright Chromium（独立 RUN 以利用 Docker 缓存）
+# RUN npx playwright install chromium && \
+#     echo "✅ Playwright Chromium installed"
 
 # 安装 OpenSSL 开发包和构建依赖（mcp-stdio-proxy 需要）
 RUN apt-get update && apt-get install -y \
@@ -723,9 +777,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
 # 使用阿里云 PyPI 镜像源（与 pip 保持一致，稳定可靠，无限流限制）
-ENV UV_INSTALL_DIR=/usr/local/bin \
-    UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+# 使用 pip 安装（避免从 astral.sh/GitHub 下载二进制慢/不稳定），pip 全局安装默认放 /usr/local/bin
+ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+RUN pip3 install --break-system-packages --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple uv && \
+    uv --version && \
     # 创建 uv 环境配置脚本（用户通过终端使用时会加载）
     echo '#!/bin/sh' > /etc/profile.d/uv-env.sh && \
     echo '# UV environment configuration' >> /etc/profile.d/uv-env.sh && \
@@ -738,11 +793,10 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 # 添加所有工具安装路径到 PATH:
 # - /root/.local/bin: root 用户使用 uv tool install 时的可执行文件位置
 # - /home/user/.local/bin: user 用户使用 uv tool install 时的可执行文件位置
-# - /home/user/.local/share/pnpm: pnpm 全局安装的工具位置
 # - /opt/cargo/bin: Rust cargo 安装的工具
-# - /usr/local/bin: 系统级工具（bun, uv 等）
+# - /usr/local/bin: 系统级工具（bun, uv, pnpm 等）
 ENV PNPM_HOME="/home/user/.local/share/pnpm" \
-    PATH="/root/.local/bin:/home/user/.local/bin:/home/user/.local/share/pnpm:/opt/cargo/bin:/usr/local/bin:${PATH}"
+    PATH="/root/.local/bin:/home/user/.local/bin:/opt/cargo/bin:/usr/local/bin:${PATH}"
 
 # ============================================================================
 # 🔊 pcmflux 音频流服务安装
@@ -750,7 +804,11 @@ ENV PNPM_HOME="/home/user/.local/share/pnpm" \
 # 安装 pcmflux Python 包（需要 root，用于编译 C++ 扩展）
 # 使用 --break-system-packages 绕过 Debian 12 的 PEP 668 限制
 RUN pip3 install --break-system-packages websockets && \
-    pip3 install --break-system-packages git+https://github.com/linuxserver/pcmflux.git && \
+    if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
+        pip3 install --break-system-packages git+${GITHUB_MIRROR_URL}linuxserver/pcmflux.git; \
+    else \
+        pip3 install --break-system-packages git+https://github.com/linuxserver/pcmflux.git; \
+    fi && \
     echo "✅ pcmflux audio streaming installed"
 
 # 暴露音频流端口
@@ -764,9 +822,8 @@ EXPOSE 6091
 # 预安装全局工具（root 模式）- 系统级别，不受 /home/user 挂载影响
 # ============================================================================
 # 预安装 context7 MCP 工具（Bun 全局安装）
-# 注意：由于 bun 与 npmmirror 的 tarball 下载存在兼容性问题（参考：https://github.com/oven-sh/bun/issues/21493），
-# 此处使用官方 npm 源进行安装
-RUN bun add -g @upstash/context7-mcp --registry https://registry.npmjs.org
+# 代码里通过 bunx 调用 MCP，预装到 bun 全局后 bunx 可直接命中 ~/.bun/install/global，无需运行时再下载
+RUN bun add -g @upstash/context7-mcp
 
 # 预安装 mcp-server-fetch（UV 全局安装到系统目录）
 ENV UV_TOOL_DIR=/usr/local/share/uv/tools \

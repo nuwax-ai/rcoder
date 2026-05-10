@@ -48,7 +48,7 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 # 安装失败时主动退出，避免构建包含不完整的镜像
 RUN echo "Cache bust: ${CACHEBUST}" && \
     echo "📦 开始安装 nuwaxcode..." && \
-    npm i -g nuwaxcode@latest --registry=https://registry.npmjs.org/ && \
+    npm i -g nuwaxcode@latest && \
     echo "✅ nuwaxcode 安装完成，开始验证..." && \
     which nuwaxcode && \
     echo "✅ nuwaxcode 验证成功: $(nuwaxcode -v)" || \
@@ -60,14 +60,14 @@ RUN mkdir -p /root/.config/opencode && \
     echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny",\n    "question": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
 
 
-# 安装 opencode - AI 驱动的代码导航工具
-# 注意：npm 包不支持 ARM64，使用官方安装脚本
-RUN echo "📦 安装 opencode..." && \
-    curl -fsSL https://opencode.ai/install | bash && \
-    ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode && \
-    echo "验证 opencode 安装..." && \
-    opencode --version && \
-    echo "✅ opencode 安装成功（已创建符号链接到 /usr/local/bin）"
+# # 安装 opencode - AI 驱动的代码导航工具
+# # 注意：npm 包不支持 ARM64，使用官方安装脚本
+# RUN echo "📦 安装 opencode..." && \
+#     curl -fsSL https://opencode.ai/install | bash && \
+#     ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode && \
+#     echo "验证 opencode 安装..." && \
+#     opencode --version && \
+#     echo "✅ opencode 安装成功（已创建符号链接到 /usr/local/bin）"
 
 # ============================================================================
 # 🔧 eBPF 诊断工具安装
@@ -96,8 +96,12 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
 
 # 安装 FlameGraph 工具
 RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
-    git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph \
-    && cp /tmp/FlameGraph/*.pl /usr/local/bin/ \
+    if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
+        git clone ${GITHUB_MIRROR_URL}brendangregg/FlameGraph /tmp/FlameGraph; \
+    else \
+        git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph; \
+    fi && \
+    cp /tmp/FlameGraph/*.pl /usr/local/bin/ \
     && rm -rf /tmp/FlameGraph \
     && echo "✅ FlameGraph 工具已安装"; \
     fi

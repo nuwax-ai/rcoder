@@ -1,0 +1,91 @@
+# Local overlay - OrbStack 本地测试
+# 用法: kubectl apply -k k8s/manifests/overlays/local
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: rcoder-local
+
+resources:
+  - ../../base
+  - clusterrolebinding.yaml
+  - credentials.yaml
+  - rcoder-configmap.yaml
+
+labels:
+  - pairs:
+      environment: local
+    includeSelectors: false
+    includeTemplates: true
+
+replicas:
+  - name: rcoder
+    count: 1
+
+images:
+  - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder
+    newName: rcoder-local
+    newTag: latest
+  - name: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner
+    newName: rcoder-agent-runner-local
+    newTag: latest
+
+patches:
+  # PVC 使用 local-path（OrbStack 默认 StorageClass）
+  # local-path 只支持 ReadWriteOnce，本地测试改为单节点读写
+  - patch: |-
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: rcoder-workspace
+      spec:
+        storageClassName: local-path
+        accessModes:
+          - ReadWriteOnce
+    target:
+      kind: PersistentVolumeClaim
+      name: rcoder-workspace
+
+  # Deployment 环境变量适配
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rcoder
+      spec:
+        template:
+          spec:
+            containers:
+            - name: rcoder
+              env:
+              - name: RCODER_K8S_NAMESPACE
+                value: rcoder-local
+              - name: RCODER_K8S_STORAGE_CLASS
+                value: local-path
+              - name: RCODER_K8S_PVC_ACCESS_MODE
+                value: ReadWriteOnce
+              - name: RUST_LOG
+                value: "debug"
+              - name: RCODER_DOCKER_IMAGE
+                value: "rcoder-local:latest"
+              - name: RCODER_DOCKER_IMAGE_COMPUTER
+                value: "rcoder-agent-runner-local:latest"
+    target:
+      kind: Deployment
+      name: rcoder
+
+  # Service 使用 NodePort（本地访问）
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: rcoder
+      spec:
+        type: NodePort
+        ports:
+          - port: 8087
+            targetPort: 8087
+            nodePort: 30087
+    target:
+      kind: Service
+      name: rcoder

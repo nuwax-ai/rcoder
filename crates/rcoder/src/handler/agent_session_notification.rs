@@ -2,7 +2,7 @@
 //!
 //! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
 
-use super::utils::{I18nPath, get_realtime_container_ip_with_cache};
+use super::utils::{I18nPath, get_realtime_container_ip};
 use crate::{AppError, HttpResult};
 use axum::{
     extract::State,
@@ -27,6 +27,22 @@ pub struct SessionNotificationParams {
     /// 会话ID，用于标识特定的会话连接
     #[param(example = "session456")]
     pub session_id: String,
+    /// Pod ID，用于共享容器模式下的容器定位（可选）
+    #[param(example = "pod_abc123")]
+    #[serde(default)]
+    pub pod_id: Option<String>,
+    /// 租户ID（可选）
+    #[param(example = "tenant_001")]
+    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    pub tenant_id: Option<String>,
+    /// 空间ID（可选）
+    #[param(example = "space_001")]
+    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    pub space_id: Option<String>,
+    /// 隔离类型（可选），如 "project", "tenant", "space"
+    #[param(example = "project")]
+    #[serde(default)]
+    pub isolation_type: Option<String>,
 }
 
 /// SSE 进度事件（用于 OpenAPI 文档）
@@ -421,14 +437,14 @@ async fn validate_and_get_session_context(
         }
     };
 
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(dm) => dm,
+    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
+        Ok(rt) => rt,
         Err(e) => {
-            error!("[SSE_PROXY] Failed to get global DockerManager: {}", e);
+            error!("[SSE_PROXY] Failed to get runtime: {}", e);
             return Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                "Unable to access Docker service. Please contact administrator.",
+                "Unable to access runtime service. Please contact administrator.",
             ));
         }
     };
@@ -457,12 +473,17 @@ async fn validate_and_get_session_context(
             );
 
             // 根据 service_type 选择不同的查询策略
-            // （使用已获取的 docker_manager 和 project_info，避免重复获取）
             let resolved_container_name = match project_info.service_type() {
                 Some(shared_types::ServiceType::ComputerAgentRunner) => {
                     // ComputerAgentRunner 模式：通过 user_id 查询容器
                     if let Some(user_id) = project_info.user_id() {
-                        match docker_manager.get_user_container_info(&user_id).await {
+                        match runtime
+                            .get_container_info_by_identifier(
+                                &user_id,
+                                &shared_types::ServiceType::ComputerAgentRunner,
+                            )
+                            .await
+                        {
                             Ok(Some(info)) => {
                                 info!(
                                     "✅ [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
@@ -557,17 +578,30 @@ async fn validate_and_get_session_context(
     } else {
         // 内存中没有容器信息，调用 Docker API 实时查询
         warn!(
-            "⚠️ [SSE_PROXY] Container info missing in memory, calling Docker API query: container_name={}",
+            "⚠️ [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
             container_name
         );
-        match docker_manager
-            .find_container_realtime(&container_name)
-            .await
-        {
+        // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
+        let computer_prefix = &state.container_prefix_computer;
+        let rcoder_prefix = &state.container_prefix_rcoder;
+        let query = if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix)) {
+            runtime
+                .find_container(id, &shared_types::ServiceType::ComputerAgentRunner)
+                .await
+        } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
+            runtime
+                .find_container(id, &shared_types::ServiceType::RCoder)
+                .await
+        } else {
+            runtime
+                .find_container(project_info.project_id(), &shared_types::ServiceType::RCoder)
+                .await
+        };
+        match query {
             Ok(Some(result)) => {
-                if result.is_running {
+                if result.status == container_runtime_api::ContainerRuntimeStatus::Running {
                     info!(
-                        "✅ [SSE_PROXY] Docker API query successful, container is running: container_name={}",
+                        "✅ [SSE_PROXY] Runtime query successful, container is running: container_name={}",
                         container_name
                     );
                 } else {
@@ -590,7 +624,7 @@ async fn validate_and_get_session_context(
                 ));
             }
             Err(e) => {
-                error!("❌ [SSE_PROXY] Docker API Query failed: {}", e);
+                error!("❌ [SSE_PROXY] Runtime query failed: {}", e);
                 return Err(create_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
@@ -623,17 +657,19 @@ async fn build_sse_stream_from_container_name(
     session_id: String,
     project_id: String,
     grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
-    container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
     locale: &'static str,
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
-    // Get latest container IP from Docker API in real-time（带缓存）
+    rcoder_prefix: &str,
+    computer_prefix: &str,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
+    // Get latest container IP from Docker API in real-time
     // 使用 container_name（如 computer-agent-runner-user_123）查询
     // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
-    let container_ip = match get_realtime_container_ip_with_cache(
+    let container_ip = match get_realtime_container_ip(
         &container_name,
-        &container_ip_cache,
         "", // 无 fallback_ip，直接使用 Docker API 查询结果
+        rcoder_prefix,
+        computer_prefix,
     )
     .await
     {
@@ -890,9 +926,10 @@ pub async fn agent_session_notification(
         session_id.to_string(),
         project_id,
         state.grpc_pool.clone(),
-        state.container_ip_cache.clone(),
         locale,
         "Agent",
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
     )
     .await
 }
@@ -996,9 +1033,10 @@ pub async fn computer_agent_progress_notification(
         session_id.to_string(),
         project_id,
         state.grpc_pool.clone(),
-        state.container_ip_cache.clone(),
         locale,
         "Computer Agent",
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
     )
     .await
 }
@@ -1203,17 +1241,15 @@ async fn get_container_sse_url(
         project_id, session_id
     );
 
-    // 🎯 修复：使用全局DockerManager实例
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| {
-            error!("[CONTAINER] Failed to get global DockerManager: {}", e);
-            AppError::internal_server_error(&format!("Failed to get global DockerManager: {}", e))
+            error!("[CONTAINER] Failed to get runtime: {}", e);
+            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
         })?;
 
-    // 使用高级 API 获取容器信息
-    if let Some(info) = docker_manager
-        .get_agent_info(project_id)
+    if let Some(info) = runtime
+        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)
         .await
         .map_err(|e| {
             error!("[CONTAINER] Failed to get container info: {}", e);

@@ -227,6 +227,13 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     info!("  POST /computer/agent/stop - Computer Agent stop");
     info!("  POST /computer/agent/session/cancel - Computer Agent cancel");
     info!("  GET  /computer/progress/:session_id - SSE progress stream");
+    info!("  -- RCoder Agent endpoints (new) --");
+    info!("  POST /chat - RCoder Agent chat");
+    info!("  GET  /agent/status/:project_id - RCoder Agent status");
+    info!("  POST /agent/stop - RCoder Agent stop");
+    info!("  POST /agent/session/cancel - RCoder Agent cancel");
+    info!("  GET  /agent/progress/:session_id - RCoder SSE progress stream");
+    info!("  -- Common endpoints --");
     info!("  GET  /health - Health check");
     info!("  GET  /api/docs - Swagger API documentation");
 

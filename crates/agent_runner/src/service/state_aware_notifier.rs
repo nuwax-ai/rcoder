@@ -110,7 +110,7 @@ impl SessionNotifier for StateAwareNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        stop_reason: sacp::schema::StopReason,
+        stop_reason: agent_client_protocol::schema::StopReason,
         error_message: Option<String>,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -146,7 +146,7 @@ impl SessionNotifier for StateAwareNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        error: sacp::schema::Error,
+        error: agent_client_protocol::schema::Error,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         error!(
@@ -173,7 +173,7 @@ impl SessionNotifier for StateAwareNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        session_update: sacp::schema::SessionUpdate,
+        session_update: agent_client_protocol::schema::SessionUpdate,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!(

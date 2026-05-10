@@ -14,8 +14,8 @@ serde.workspace = true
 serde_json.workspace = true
 dashmap = { workspace = true }
 uuid.workspace = true
-# ACP Protocol - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
-sacp = { workspace = true }
+# ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）
+agent-client-protocol = { workspace = true }
 chrono.workspace = true
 
 # OpenAPI documentation
@@ -33,6 +33,9 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 
 thiserror = { workspace = true }
+
+# Validation
+garde = { version = "0.22.1", features = ["derive"] }
 
 base64 = { workspace = true }
 
@@ -57,14 +60,20 @@ arc-swap = "1.8"
 # i18n (国际化)
 rust-i18n = { workspace = true }
 
+# URL query string 解析
+serde_urlencoded = "0.7"
+
 
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 futures = { workspace = true }
+futures-util = { workspace = true }
 tokio-stream = "0.1"
-async-stream = "0.3"
+
+# async trait for service trait definition
+async-trait = { workspace = true }
 
 # gRPC - 使用 tonic 0.14 运行时
 tonic = { version = "0.14.2", features = ["tls-native-roots"] }

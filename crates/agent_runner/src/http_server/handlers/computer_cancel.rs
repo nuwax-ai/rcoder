@@ -4,10 +4,10 @@
 
 use axum::{
     Json,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::State,
+    http::HeaderMap,
 };
-use sacp::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::{CancelNotification, SessionId};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -16,8 +16,8 @@ use crate::CancelNotificationRequestWrapper;
 use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
 use shared_types::{
-    ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult,
-    error_codes::ERR_VALIDATION, get_i18n_message,
+    ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult, I18nJsonOrQuery,
+    error_codes::ERR_VALIDATION, get_i18n_message, AppError,
 };
 
 use super::locale_from_headers;
@@ -41,34 +41,27 @@ use super::locale_from_headers;
 pub async fn handle_computer_cancel(
     State(_state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(request): Query<ComputerAgentCancelRequest>,
-) -> Result<Json<HttpResult<ComputerAgentCancelResponse>>, (StatusCode, Json<HttpResult<String>>)> {
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerAgentCancelRequest>,
+) -> Result<Json<HttpResult<ComputerAgentCancelResponse>>, AppError> {
     let locale = locale_from_headers(&headers);
     info!(
-        "🚫 [HTTP] Computer Agent 取消请求: user_id={}, project_id={}, session_id={:?}",
+        "🚫 [HTTP] Computer Agent 取消请求: user_id={:?}, project_id={}, session_id={:?}",
         request.user_id, request.project_id, request.session_id
     );
 
     // 1. 验证必填字段
-    if request.user_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(HttpResult::error_with_message(
-                ERR_VALIDATION,
-                locale,
-                &get_i18n_message("error.user_id_required", locale),
-            )),
+    // user_id 是 Option<String>，需要用 as_ref() 或直接检查
+    if request.user_id.as_ref().map_or(true, |s| s.is_empty()) {
+        return Err(AppError::with_i18n_key(
+            ERR_VALIDATION,
+            &get_i18n_message("error.user_id_required", locale),
         ));
     }
 
     if request.project_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(HttpResult::error_with_message(
-                ERR_VALIDATION,
-                locale,
-                &get_i18n_message("error.project_id_required", locale),
-            )),
+        return Err(AppError::with_i18n_key(
+            ERR_VALIDATION,
+            &get_i18n_message("error.project_id_required", locale),
         ));
     }
 

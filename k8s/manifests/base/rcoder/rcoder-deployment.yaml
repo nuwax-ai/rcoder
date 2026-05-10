@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rcoder
+  namespace: nuwax-rcoder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rcoder
+      component: rcoder-main
+  template:
+    metadata:
+      labels:
+        app: rcoder
+        component: rcoder-main
+    spec:
+      # Graceful shutdown: allow 60s for containers to clean up
+      terminationGracePeriodSeconds: 60
+      serviceAccountName: rcoder-pods-sa
+      containers:
+      - name: rcoder
+        image: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest
+        # IfNotPresent: 节点已缓存就直接用，避免每次启动都去 registry 验 token/manifest
+        # 缺点: latest tag 内容更新后需 kubectl rollout restart 才会拉新 image
+        imagePullPolicy: IfNotPresent
+        command: ["/app/bin/rcoder"]
+        args: ["--port", "8087"]
+        ports:
+        - containerPort: 8087
+        env:
+        - name: CONTAINER_RUNTIME
+          value: "kubernetes"
+        - name: RCODER_K8S_NAMESPACE
+          value: "nuwax-rcoder"
+        - name: RUST_LOG
+          value: "info"
+        # JuiceFS 存储配置 (StorageClass 名称由各环境 overlay 覆盖)
+        - name: RCODER_K8S_STORAGE_CLASS
+          value: "juicefs-sc-placeholder"
+        - name: RCODER_DOCKER_IMAGE
+          value: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest"
+        - name: RCODER_DOCKER_IMAGE_COMPUTER
+          value: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        # Health probes for K8s liveness/readiness detection
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8087
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8087
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        volumeMounts:
+        - name: rcoder-config
+          mountPath: /app/config.yml
+          subPath: config.yml
+        - name: project-workspace
+          mountPath: /app/project_workspace
+          subPath: project_workspace
+        - name: project-workspace
+          mountPath: /app/computer-project-workspace
+          subPath: computer_workspace
+      volumes:
+      - name: rcoder-config
+        configMap:
+          name: rcoder-config
+      - name: project-workspace
+        persistentVolumeClaim:
+          claimName: rcoder-workspace

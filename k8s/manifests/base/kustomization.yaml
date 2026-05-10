@@ -1,0 +1,10 @@
+# Kustomize base - 基础配置
+# 使用方式: kubectl apply -k manifests/base
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - storage
+  - rcoder

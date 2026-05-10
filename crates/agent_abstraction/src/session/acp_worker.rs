@@ -12,7 +12,7 @@ use std::sync::Arc;
 use agent_config::{AgentServersConfig, PromptConfigAssembler};
 use anyhow::Result;
 use shared_types::{ProjectAndAgentInfo, SessionEntry};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
 use crate::launcher::convert_context_servers;
@@ -145,36 +145,21 @@ where
             }
         }
 
-        // Resume 策略：验证 session 文件是否存在，再决定是否 resume
+        // Resume 策略：直接传递 session_id，由 LoadSessionRequest 在 Agent 层面检查
         //
         // 工作原理：
-        // 1. 用户传入 session_id → 检查磁盘上是否存在 session 文件
-        // 2. 如果存在 → 设置 resume_session_id → Agent 恢复上下文
-        // 3. 如果不存在 → 不设置 resume → Agent 创建新会话
-        //
-        // Session 文件路径: ~/.claude/projects/{encoded_path}/{session_id}.jsonl
+        // 1. 用户传入 session_id → 直接设置 resume_session_id
+        // 2. claude_code_sacp.rs 尝试 LoadSessionRequest 加载历史会话
+        // 3. 如果 Agent 返回成功 → 恢复上下文
+        // 4. 如果 Agent 返回错误/超时 → 降级到 NewSessionRequest 创建新会话
         //
         // 优势：
-        // - 提前验证，避免传入无效 session_id 导致 Agent 启动失败
-        // - 服务重启后能恢复磁盘上的会话
-        // - 不依赖内存状态，更健壮
+        // - Agent 层面统一处理，无需本地检查文件
+        // - 与 Agent 行为保持一致
         // - 自动降级（有会话就恢复，没有就创建）
         if let Some(ref session_id) = request.prompt_message.session_id {
-            // 检查 session 文件是否存在（使用文件系统扫描 + 缓存）
-            let project_path_str = normalized_path.to_string_lossy().to_string();
-            let session_exists =
-                super::check_session_file_exists(session_id, &project_path_str).await;
-
-            if session_exists {
-                info!("Session file exists, resuming: {}", session_id);
-                start_config = start_config.with_resume_session_id(session_id.clone());
-            } else {
-                warn!(
-                    "⚠️ Session file does not exist, skipping resume, will create new session: session_id={}",
-                    session_id
-                );
-                // 不设置 resume_session_id，Agent 将创建新会话
-            }
+            info!("Setting resume_session_id: {}", session_id);
+            start_config = start_config.with_resume_session_id(session_id.clone());
         }
 
         // 4. 更新 prompt_message 的 content 为处理后的用户提示词

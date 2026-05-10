@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rcoder
+  namespace: nuwax-rcoder
+spec:
+  type: NodePort
+  # 用 component=rcoder-main 把动态创建的 rcoder-agent / computer-agent-runner pod
+  # （它们也带 app=rcoder 标签）排除在外，避免 NodePort 把流量路由到不监听 8087 的 agent pod
+  selector:
+    app: rcoder
+    component: rcoder-main
+  ports:
+  # nodePort 由各环境 overlay 指定（避免同集群下 dev/prod 冲突）
+  - port: 8087
+    targetPort: 8087

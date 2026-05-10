@@ -1,0 +1,106 @@
+# ============================================================
+# NFS Server (内建模式)
+# 集群内自建 NFS Server，数据持久化到 local-path PV
+#
+# ⚠️ 注意: OrbStack/Mac 桌面 K8s 环境不支持此方式，请使用外部 NFS Server
+#
+# 如使用外部 NFS Server，跳过此文件，直接部署 nfs-subdir-provisioner.yaml
+# ============================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nfs-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfs-server
+  namespace: nuwax-nfs-storage
+spec:
+  clusterIP: None
+  selector:
+    app: nfs-server
+  ports:
+  - name: nfs
+    port: 2049
+    targetPort: 2049
+  - name: mountd
+    port: 20048
+    targetPort: 20048
+  - name: rpcbind
+    port: 111
+    targetPort: 111
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nfs-server
+  namespace: nuwax-nfs-storage
+spec:
+  serviceName: nfs-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nfs-server
+  template:
+    metadata:
+      labels:
+        app: nfs-server
+    spec:
+      # 亲和性: NFS Server 调度到有 local-path 存储的节点
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: Exists
+      containers:
+      - name: nfs-server
+        image: itsthenetwork/nfs-server-alpine:latest
+        env:
+        - name: SHARED_DIRECTORY
+          value: "/exports"
+        - name: SYNC
+          value: "true"
+        ports:
+        - name: nfs
+          containerPort: 2049
+          protocol: TCP
+        - name: mountd
+          containerPort: 20048
+          protocol: TCP
+        - name: rpcbind
+          containerPort: 111
+          protocol: TCP
+        securityContext:
+          runAsUser: 0
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: nfs-data
+          mountPath: /exports
+      volumes:
+      - name: nfs-data
+        persistentVolumeClaim:
+          claimName: nfs-server-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-server-pvc
+  namespace: nuwax-nfs-storage
+  labels:
+    app: nfs-server
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 100Gi

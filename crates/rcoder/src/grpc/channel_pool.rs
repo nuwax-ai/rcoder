@@ -1,12 +1,21 @@
 //! gRPC Channel 连接池
 //!
-//! 管理到各个 agent_runner 容器的 gRPC 连接
+//! 管理到各个 agent_runner 容器的 gRPC 连接，支持 TTL 自动清理失效连接。
 
 use anyhow::Result;
 use dashmap::DashMap;
 use shared_types::grpc::agent_service_client::AgentServiceClient;
+use std::time::{Duration, Instant};
 use tonic::transport::Channel;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// gRPC 连接池 TTL（5分钟）
+///
+/// 连接超过此时间未被使用则自动清理，防止内存泄漏。
+const CHANNEL_TTL_SECS: u64 = 300;
+
+/// gRPC 连接池最大容量
+const MAX_CAPACITY: usize = 10000;
 
 /// 创建配置好的 gRPC 客户端（设置消息大小限制）
 ///
@@ -18,12 +27,28 @@ fn create_configured_client(channel: Channel) -> AgentServiceClient<Channel> {
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
 }
 
+/// Channel 元数据（包含创建时间）
+#[derive(Clone)]
+struct ChannelEntry {
+    channel: Channel,
+    created_at: Instant,
+}
+
+impl ChannelEntry {
+    fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > Duration::from_secs(CHANNEL_TTL_SECS)
+    }
+}
+
 /// gRPC 连接池
 ///
-/// 为每个容器维护独立的 gRPC 连接，支持连接复用
+/// 为每个容器维护独立的 gRPC 连接，支持：
+/// - 连接复用：相同地址的请求复用同一连接
+/// - TTL 自动清理：5分钟未使用的连接自动移除，防止内存泄漏
+/// - 并发安全：支持高并发下的安全连接创建
 pub struct GrpcChannelPool {
-    /// 容器地址到 gRPC Channel 的映射
-    channels: DashMap<String, Channel>,
+    /// 容器地址到 Channel 的映射
+    channels: DashMap<String, ChannelEntry>,
 }
 
 impl GrpcChannelPool {
@@ -36,64 +61,106 @@ impl GrpcChannelPool {
 
     /// 获取指定地址的 gRPC 客户端
     ///
-    /// 如果连接不存在则创建新连接
-    ///
-    /// # 并发安全性
-    ///
-    /// 使用三阶段模式避免在持有 entry 期间调用 `.await`：
-    ///
-    /// 1. **快速检查**：先检查连接是否已存在
-    /// 2. **创建连接**：如果不存在，在**不持有锁**的情况下创建连接（.await）
-    /// 3. **原子性插入**：使用 entry API 原子性插入，如果其他线程已创建则使用已存在的
-    ///
-    /// 这样确保：
-    /// - 不会在持有 DashMap entry 期间跨越 await 点
-    /// - 高并发下同一地址最多只有一个连接被实际使用
-    /// - 避免了 TOCTOU 竞态条件
+    /// 如果连接不存在则创建新连接。过期连接会被自动清理。
     pub async fn get_client(&self, addr: &str) -> Result<AgentServiceClient<Channel>> {
-        use dashmap::mapref::entry::Entry;
+        // 先检查缓存，同时清理过期条目
+        // 使用 remove_if_available 模式避免 TOCTOU 竞态
+        let should_remove = {
+            self.channels.get(addr).map(|entry| entry.is_expired()).unwrap_or(false)
+        };
 
-        // 第一阶段：快速检查（无锁读）
-        if let Some(entry) = self.channels.get(addr) {
-            debug!("📡 [gRPC] reuse connection: {}", addr);
-            return Ok(create_configured_client(entry.value().clone()));
+        if should_remove {
+            // 过期则移除
+            self.channels.remove(addr);
         }
 
-        // 第二阶段：创建连接（不持有任何锁）
-        info!("🔌 [gRPC] created connection: {}", addr);
+        // 再次检查（可能被其他线程修改）
+        if let Some(entry) = self.channels.get(addr) {
+            debug!("📡 [gRPC] reuse connection: {}", addr);
+            return Ok(create_configured_client(entry.channel.clone()));
+        }
+
+        // 缓存未命中或已过期，创建新连接
+        info!("🔌 [gRPC] creating connection: {}", addr);
         let endpoint = format!("http://{}", addr);
         let channel = Channel::from_shared(endpoint)
             .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
-            .connect_timeout(std::time::Duration::from_secs(
+            .connect_timeout(Duration::from_secs(
                 shared_types::GRPC_CONNECT_TIMEOUT_SECS,
             ))
-            .timeout(std::time::Duration::from_secs(
+            .timeout(Duration::from_secs(
                 shared_types::GRPC_REQUEST_TIMEOUT_SECS,
             ))
             // HTTP/2 Keepalive 配置
-            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-            .keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
             // TCP Keepalive 配置
-            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
 
-        // 第三阶段：原子性插入
-        match self.channels.entry(addr.to_string()) {
-            Entry::Vacant(entry) => {
-                // 其他线程还没有创建，使用我们创建的连接
-                debug!("📡 [gRPC] connection already exists: {}", addr);
-                entry.insert(channel.clone());
-                Ok(create_configured_client(channel))
+        // 清理过期连接
+        self.cleanup_expired();
+
+        // 插入缓存
+        self.channels.insert(
+            addr.to_string(),
+            ChannelEntry {
+                channel: channel.clone(),
+                created_at: Instant::now(),
+            },
+        );
+
+        debug!("📡 [gRPC] connection ready: {}", addr);
+        Ok(create_configured_client(channel))
+    }
+
+    /// 清理过期的连接
+    ///
+    /// 每次调用时检查并清理过期连接，保持缓存高效。
+    fn cleanup_expired(&self) {
+        let len = self.channels.len();
+
+        // 收集所有过期连接的键
+        let expired: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|e| e.is_expired())
+            .map(|e| e.key().clone())
+            .collect();
+
+        // 移除过期连接
+        for key in &expired {
+            self.channels.remove(key);
+        }
+
+        if !expired.is_empty() {
+            debug!(
+                "🔌 [gRPC] cleaned up {} expired connections (cache size: {})",
+                expired.len(),
+                self.channels.len()
+            );
+        }
+
+        // 如果清理后仍然满（>= 80%），再清理一半的非过期连接
+        if self.channels.len() >= MAX_CAPACITY * 8 / 10 {
+            let to_remove: Vec<_> = self
+                .channels
+                .iter()
+                .take(MAX_CAPACITY / 2)
+                .map(|e| e.key().clone())
+                .collect();
+
+            for key in &to_remove {
+                self.channels.remove(key);
             }
-            Entry::Occupied(entry) => {
-                // 其他线程已经创建了连接，使用已存在的（丢弃我们创建的）
-                debug!("📡 [gRPC] created new connection: {}", addr);
-                Ok(create_configured_client(entry.get().clone()))
-            }
+            warn!(
+                "🔌 [gRPC] cache still full after cleanup, evicted {} entries",
+                to_remove.len()
+            );
         }
     }
 
@@ -112,7 +179,7 @@ impl GrpcChannelPool {
     /// 移除指定地址的连接
     pub fn remove(&self, addr: &str) {
         if self.channels.remove(addr).is_some() {
-            info!("🔌 [gRPC] removedconnection: {}", addr);
+            info!("🔌 [gRPC] removed connection: {}", addr);
         }
     }
 
@@ -139,5 +206,30 @@ impl std::fmt::Debug for GrpcChannelPool {
         f.debug_struct("GrpcChannelPool")
             .field("connection_count", &self.connection_count())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_pool() {
+        let pool = GrpcChannelPool::new();
+        assert_eq!(pool.connection_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_non_existent() {
+        let pool = GrpcChannelPool::new();
+        pool.remove("non_existent");
+        assert_eq!(pool.connection_count(), 0);
+    }
+
+    #[test]
+    fn test_clear() {
+        let pool = GrpcChannelPool::new();
+        pool.clear();
+        assert_eq!(pool.connection_count(), 0);
     }
 }

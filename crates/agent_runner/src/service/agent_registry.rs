@@ -359,7 +359,7 @@ impl AgentSessionRegistry {
     /// 如果项目已存在且为 Idle 状态，则更新为 Pending
     pub fn set_pending(&self, project_id: &str) {
         use chrono::Utc;
-        use sacp::schema::SessionId;
+        use agent_client_protocol::schema::SessionId;
         use shared_types::AgentStatus;
         use std::sync::Arc;
         use tokio::sync::mpsc;
@@ -573,6 +573,58 @@ impl AgentSessionRegistry {
             project_id
         );
         removed
+    }
+
+    /// 通过 project_id 移除映射（仅当 session_id 匹配时）
+    ///
+    /// 用于 spawned task 清理：当旧 session 的 spawned task 退出时调用，
+    /// 避免误删已被新 session 替换的 registry 条目。
+    ///
+    /// ## 并发安全性
+    ///
+    /// 使用 DashMap entry API 实现原子性的"检查 session_id 并移除"，
+    /// 避免 TOCTOU 竞态条件。
+    pub fn remove_by_project_if_session_matches(
+        &self,
+        project_id: &str,
+        expected_session_id: &str,
+    ) -> Option<ProjectAndAgentInfo> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.agent_info_map.entry(project_id.to_string()) {
+            Entry::Occupied(entry) => {
+                let current_session_id = entry.get().session_id.to_string();
+                if current_session_id != expected_session_id {
+                    info!(
+                        "🔄 [Registry] Session mismatch, skip removal: project={}, expected={}, current={}",
+                        project_id, expected_session_id, current_session_id
+                    );
+                    return None;
+                }
+                // session_id 匹配，安全移除
+                let (_, removed_info) = entry.remove_entry();
+                info!(
+                    "🗑️ [Registry] Removing Agent (session matched): project={}, session={}",
+                    project_id, expected_session_id
+                );
+
+                // 清理 project_to_session 和 session_to_project 映射
+                self.project_to_session.remove(project_id);
+                self.session_to_project.remove(expected_session_id);
+
+                // 释放槽位
+                self.release_session_slot();
+
+                Some(removed_info)
+            }
+            Entry::Vacant(_) => {
+                debug!(
+                    "🔄 [Registry] Agent already removed: project={}",
+                    project_id
+                );
+                None
+            }
+        }
     }
 
     /// 通过 session_id 移除所有相关映射
@@ -852,7 +904,7 @@ impl Default for AgentSessionRegistry {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use sacp::schema::SessionId;
+    use agent_client_protocol::schema::SessionId;
     use shared_types::AgentStatus;
     use std::sync::Arc;
     use tokio::sync::mpsc;

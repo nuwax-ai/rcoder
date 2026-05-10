@@ -4,52 +4,33 @@
 
 use axum::extract::State;
 use axum::http::HeaderMap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info, instrument};
-use utoipa::{IntoParams, ToSchema};
 
-use super::utils::{I18nQuery, get_locale_from_headers};
+use super::utils::{I18nJsonOrQuery, get_locale_from_headers};
 use crate::{AppError, HttpResult, router::AppState};
-
-/// 停止Agent请求参数
-#[derive(Debug, Deserialize, ToSchema, IntoParams)]
-pub struct StopAgentQuery {
-    /// 项目ID
-    #[param(example = "test_project")]
-    pub project_id: String,
-}
-
-/// 停止Agent响应
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct StopAgentResponse {
-    /// 是否成功停止
-    pub success: bool,
-    /// 项目ID
-    #[schema(example = "test_project")]
-    pub project_id: String,
-    /// 会话ID（如果存在）
-    pub session_id: Option<String>,
-    /// 消息
-    pub message: String,
-}
+use shared_types::{AgentStopRequest, AgentStopResponse};
 
 /// 直接销毁指定项目对应的容器
 async fn destroy_container_for_project(
     state: &Arc<AppState>,
     project_id: &str,
+    pod_id: Option<&str>,
     locale: &'static str,
-) -> Result<HttpResult<StopAgentResponse>, AppError> {
+) -> Result<HttpResult<AgentStopResponse>, AppError> {
+    // 容器标识符：pod_id 优先，否则使用 project_id（与创建时一致）
+    let container_identifier = pod_id.unwrap_or(project_id);
+
     info!(
-        "[STOP_DESTROY] startingdestroycontainer: project_id={}",
-        project_id
+        "[STOP_DESTROY] startingdestroycontainer: project_id={}, pod_id={:?}, container_identifier={}",
+        project_id, pod_id, container_identifier
     );
 
-    // 使用全局 DockerManager
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(manager) => manager,
+    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
+        Ok(rt) => rt,
         Err(e) => {
-            error!("[STOP_DESTROY] Failed to get global DockerManager: {}", e);
+            error!("[STOP_DESTROY] Failed to get runtime: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_ERROR,
                 locale,
@@ -57,69 +38,21 @@ async fn destroy_container_for_project(
         }
     };
 
-    // 尝试通过多种方式查找容器
-    // 1. 先通过 project_id 查找
-    let container_info = docker_manager.get_container_info(project_id).await;
-
-    // 2. 如果没找到，尝试通过容器名称实时查找并直接停止
-    if container_info.is_none() {
-        let expected_container_name = format!("rcoder-agent-{}", project_id);
-        info!(
-            "🔍 [STOP_DESTROY] Cache not found via project_id, trying real-time container lookup: {}",
-            expected_container_name
-        );
-
-        // 使用 find_container_realtime 获取最新的容器信息
-        if let Ok(Some(result)) = docker_manager
-            .find_container_realtime(&expected_container_name)
-            .await
-        {
-            info!(
-                "🎯 [STOP_DESTROY] Real-time container found: container_id={}, name={}, status={:?}, running={}",
-                result.container_id, result.container_name, result.status, result.is_running
-            );
-
-            // 直接使用 container_id 停止容器（无需再查缓存）
-            let stop_result = docker_manager
-                .stop_container_by_id(&result.container_id)
-                .await;
-
-            if let Err(e) = stop_result {
-                error!("[STOP_DESTROY] stoppedcontainerfailed: {}", e);
-                return Ok(HttpResult::error_with_locale(
-                    shared_types::error_codes::ERR_STOP_FAILED,
-                    locale,
-                ));
-            }
-
-            // 从 DuckDB 存储中移除项目
-            state.remove_project(project_id);
-
-            info!(
-                "✅ [STOP_DESTROY] Container destroyed successfully (real-time lookup): project_id={}, container_id={}",
-                project_id, result.container_id
-            );
-
-            let response = StopAgentResponse {
-                success: true,
-                project_id: project_id.to_string(),
-                session_id: None,
-                message: shared_types::get_i18n_message("success.container_destroyed", locale),
-            };
-
-            return Ok(HttpResult::success(response));
-        }
-    }
+    let container_info = runtime
+        .get_container_info_by_identifier(container_identifier, &shared_types::ServiceType::RCoder)
+        .await
+        .ok()
+        .flatten();
 
     if let Some(container_info) = container_info {
         info!(
-            "🎯 [STOP_DESTROY] Container found, starting destruction: project_id={}, container_id={}, container_name={}",
-            project_id, container_info.container_id, container_info.container_name
+            "🎯 [STOP_DESTROY] Container found, starting destruction: container_identifier={}, container_id={}, container_name={}",
+            container_identifier, container_info.container_id, container_info.container_name
         );
 
-        // 停止容器
-        let stop_result = docker_manager
-            .stop_container_by_id(&container_info.container_id)
+        // 停止容器（使用 container_identifier 构造正确的 pod name / container name）
+        let stop_result = runtime
+            .stop_container_by_identifier(container_identifier, &shared_types::ServiceType::RCoder)
             .await;
 
         if let Err(e) = stop_result {
@@ -128,6 +61,16 @@ async fn destroy_container_for_project(
                 shared_types::error_codes::ERR_STOP_FAILED,
                 locale,
             ));
+        }
+
+        // 清理旧容器的 gRPC 连接（避免复用已失效的 TCP 连接）
+        if !container_info.container_ip.is_empty() {
+            let old_grpc_addr = format!(
+                "{}:{}",
+                container_info.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            );
+            state.grpc_pool.remove(&old_grpc_addr);
         }
 
         // 从 DuckDB 存储中移除项目（如果 project_id 不是 "unknown"）
@@ -140,7 +83,7 @@ async fn destroy_container_for_project(
             project_id, container_info.container_id, container_info.container_name
         );
 
-        let response = StopAgentResponse {
+        let response = AgentStopResponse {
             success: true,
             project_id: project_id.to_string(),
             session_id: None,
@@ -155,7 +98,7 @@ async fn destroy_container_for_project(
             project_id
         );
 
-        let response = StopAgentResponse {
+        let response = AgentStopResponse {
             success: true,
             project_id: project_id.to_string(),
             session_id: None,
@@ -172,14 +115,12 @@ async fn destroy_container_for_project(
 #[utoipa::path(
     post,
     path = "/agent/stop",
-    params(
-        StopAgentQuery
-    ),
+    request_body = AgentStopRequest,
     responses(
         (
             status = 200,
             description = "成功销毁容器",
-            body = HttpResult<StopAgentResponse>,
+            body = HttpResult<AgentStopResponse>,
             example = json!({
                 "success": true,
                 "data": {
@@ -194,7 +135,7 @@ async fn destroy_container_for_project(
         (
             status = 200,
             description = "容器不存在但返回成功",
-            body = HttpResult<StopAgentResponse>,
+            body = HttpResult<AgentStopResponse>,
             example = json!({
                 "success": true,
                 "data": {
@@ -243,29 +184,26 @@ async fn destroy_container_for_project(
     summary = "销毁Agent容器",
     description = "直接销毁 project_id 对应的容器，不向容器内的 agent_runner 发送消息。如果容器不存在，也返回成功。"
 )]
+#[axum::debug_handler]
 #[instrument(skip(state))]
 pub async fn agent_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nQuery(query): I18nQuery<StopAgentQuery>,
-) -> Result<HttpResult<StopAgentResponse>, AppError> {
+    I18nJsonOrQuery(request): I18nJsonOrQuery<AgentStopRequest>,
+) -> Result<HttpResult<AgentStopResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
-    let project_id = query.project_id.trim();
 
-    if project_id.is_empty() {
-        return Ok(HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_INVALID_PARAMS,
-            locale,
-        ));
-    }
+    // 使用 garde 进行字段校验
+    let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
+    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
 
     info!(
-        "🛑 [STOP_DESTROY] Received container destroy request: project_id={}",
-        project_id
+        "🛑 [STOP_DESTROY] Received container destroy request: project_id={}, pod_id={:?}",
+        project_id, request.pod_id
     );
 
     // 直接销毁容器
-    let result = destroy_container_for_project(&state, project_id, locale).await;
+    let result = destroy_container_for_project(&state, project_id, request.pod_id.as_deref(), locale).await;
 
     match &result {
         Ok(response) => {

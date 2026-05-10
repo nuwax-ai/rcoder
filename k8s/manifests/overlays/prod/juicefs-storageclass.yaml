@@ -1,0 +1,24 @@
+# ============================================================
+# JuiceFS StorageClass - Prod 环境专用
+# 集群级资源独立命名，避免与 dev 冲突
+# ============================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: juicefs-sc-prod
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: csi.juicefs.com
+parameters:
+  csi.storage.k8s.io/provisioner-secret-name: juicefs-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: nuwax-rcoder-prod
+  csi.storage.k8s.io/controller-expand-secret-name: juicefs-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: nuwax-rcoder-prod
+  csi.storage.k8s.io/node-publish-secret-name: juicefs-secret
+  csi.storage.k8s.io/node-publish-secret-namespace: nuwax-rcoder-prod
+  juicefs/controllerQuotaSet: "false"
+  juicefs/mountImage: "juicedata/mount:ce-v1.3.1"
+  juicefs/mountOptions: "cache-size=1024,allow-other"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: Immediate

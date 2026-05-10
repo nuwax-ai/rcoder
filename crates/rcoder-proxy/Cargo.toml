@@ -38,4 +38,4 @@ url = { workspace = true }
 shared_types = { path = "../shared_types" }
 
 # 🚀 无锁配置热更新
-arc-swap = "1.8"
+arc-swap = "1.9"

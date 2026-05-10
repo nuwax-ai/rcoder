@@ -10,11 +10,17 @@ name = "agent_runner"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["http-server", "grpc-server"]
 
 # HTTP 服务器功能：启用 HTTP REST API 和 SSE 进度流
-# 禁用此 feature 后,应用将仅运行 gRPC 服务
+# 注意：启用 http-server 时会同时启动 gRPC（除非明确禁用）
 http-server = []
+
+# gRPC 服务功能：启用 gRPC 服务
+# 在 http-server 模式下：
+#   - 启用 grpc-server：同时运行 HTTP + gRPC
+#   - 禁用 grpc-server：仅运行 HTTP（无 gRPC）
+grpc-server = []
 
 # Pingora 代理模式：API Key 和 Base URL 使用占位符，由 Pingora 代理注入真实值
 # Windows 不支持 Pingora，禁用此 feature 时直接使用真实的 API Key 和 Base URL
@@ -39,8 +45,8 @@ rcoder-proxy = { path = "../rcoder-proxy", optional = true }
 rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
-# ACP Protocol - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
-sacp = { workspace = true }
+# ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）
+agent-client-protocol = { workspace = true }
 async-trait = "0.1"
 parking_lot = "0.12"
 tempfile = { workspace = true }
@@ -98,6 +104,9 @@ path-clean = { workspace = true }
 # OpenAPI documentation
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
+
+# Validation
+garde = { version = "0.22.1", features = ["derive"] }
 
 ringbuf = { workspace = true }
 

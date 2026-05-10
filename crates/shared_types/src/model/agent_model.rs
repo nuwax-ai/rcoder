@@ -11,9 +11,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{ModelProviderConfig, ModelProviderSafeInfo};
-// SACP 类型导入（替代 agent_client_protocol）
 use chrono::{DateTime, Utc};
-use sacp::schema::{CancelNotification, PromptRequest, SessionId};
+use agent_client_protocol::schema::{CancelNotification, PromptRequest, SessionId};
 use tokio::sync::{mpsc, oneshot};
 use utoipa::ToSchema;
 

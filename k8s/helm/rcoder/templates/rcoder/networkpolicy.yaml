@@ -1,0 +1,62 @@
+{{- if .Values.rcoder.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rcoder-network-policy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: rcoder
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # 同 namespace 入站流量
+    - from:
+        - podSelector: {}
+      ports:
+        - { protocol: TCP, port: {{ .Values.rcoder.service.port }} }
+        - { protocol: TCP, port: {{ .Values.config.proxy.listenPort }} }
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+    # K8s API Server
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              kubernetes.io/service-name: kubernetes
+      ports:
+        - { protocol: TCP, port: 443 }
+    # PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgresql
+      ports:
+        - { protocol: TCP, port: {{ .Values.postgresql.service.port }} }
+    # MinIO
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - { protocol: TCP, port: {{ .Values.minio.service.apiPort }} }
+        - { protocol: TCP, port: {{ .Values.minio.service.consolePort }} }
+    # 动态 agent pod (rcoder -> agent gRPC/HTTP)
+    - to:
+        - podSelector:
+            matchLabels:
+              managed-by: rcoder-runtime
+      ports:
+        - { protocol: TCP, port: 50051 }
+        - { protocol: TCP, port: 8086 }
+{{- end }}

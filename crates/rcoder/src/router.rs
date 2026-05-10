@@ -57,8 +57,6 @@ pub struct AppState {
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
-    /// 容器 IP 缓存（5秒 TTL，避免频繁调用 Docker API）
-    pub container_ip_cache: Arc<crate::grpc::ContainerIpCache>,
     /// 🆕 可热更新的 API Key 配置（使用 ArcSwap 实现无锁读取）
     pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     /// 🆕 容器创建中标记: user_id -> 创建开始时间
@@ -85,9 +83,6 @@ impl AppState {
             projects,
             pingora_service: pingora,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
-            container_ip_cache: Arc::new(crate::grpc::ContainerIpCache::new(
-                crate::grpc::DEFAULT_CACHE_TTL_SECONDS,
-            )),
             api_key_config,
             pod_creating: Arc::new(DashMap::new()),
             container_prefix_rcoder,
@@ -146,6 +141,20 @@ impl AppState {
                 "Failed to update session: project_id={}, session_id={}, error={}",
                 project_id,
                 session_id,
+                e
+            );
+        }
+    }
+
+    /// 清除会话信息（将 session_id 设置为 NULL）
+    ///
+    /// 用于 Agent 停止后清理会话状态
+    #[inline]
+    pub fn clear_session(&self, project_id: &str) {
+        if let Err(e) = self.projects.clear_session(project_id) {
+            tracing::error!(
+                "Failed to clear session: project_id={}, error={}",
+                project_id,
                 e
             );
         }
@@ -343,10 +352,10 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         schemas(
             // 响应结构体
             handler::HealthResponse,
-            handler::ChatRequest,
+            shared_types::AgentChatRequest,
             shared_types::ChatResponse,
-            handler::StopAgentResponse,
-            handler::CancelResponse,
+            shared_types::AgentStopResponse,
+            shared_types::AgentCancelResponse,
             // 移除 SessionUpdateEvent，因为现在使用 ProxyRedirectResponse
             handler::ProxyErrorResponse,
             // 模型配置相关结构体

@@ -5,7 +5,7 @@
 use anyhow::Result;
 use axum::{extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
-use shared_types::{ChatAgentConfig, ModelProviderConfig, ProjectAndContainerInfo};
+use shared_types::{AgentChatRequest, ChatAgentConfig, IsolationType, ModelProviderConfig, ProjectAndContainerInfo};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::ToSchema;
@@ -13,60 +13,7 @@ use utoipa::ToSchema;
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
-use super::utils::{I18nJson, extract_grpc_addr_with_port, get_locale_from_headers};
-
-/// 用户请求结构 - 支持多媒体内容
-#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
-pub struct ChatRequest {
-    /// 用户输入的 prompt
-    #[schema(example = "帮我写一个 Rust 的 Hello World 程序")]
-    pub prompt: String,
-    /// 可选的项目 ID
-    #[schema(example = "test_project")]
-    pub project_id: Option<String>,
-    /// 可选的会话 ID，如果不提供则创建新会话
-    #[schema(example = "session456")]
-    pub session_id: Option<String>,
-    /// 可选的附件列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<Attachment>,
-    /// 数据源附件列表 - 用于AI开发时获取外部数据源信息（如API接口、数据库等）
-    /// 直接传递 JSON 字符串数组，简化使用方式
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub data_source_attachments: Vec<String>,
-    /// 模型配置
-    #[schema(
-        example = json!({
-            "id": "openai_gpt4",
-            "name": "openai",
-            "base_url": "https://api.openai.com/v1",
-            "api_key": "sk-...",
-            "requires_openai_auth": true,
-            "default_model": "gpt-4",
-            "api_protocol": "openai"
-        })
-    )]
-    pub model_provider: Option<ModelProviderConfig>,
-    /// 可选的请求ID，如果不提供则自动生成，用于标识和追踪请求
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "req_123456789")]
-    pub request_id: Option<String>,
-
-    // === 新增字段 (v2) ===
-    /// 可选的系统提示词，覆盖默认配置
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "你是一个专业的 Rust 开发者")]
-    pub system_prompt: Option<String>,
-
-    /// 可选的用户提示词模板，支持 {user_prompt} 变量替换
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "请用 Rust 完成：{user_prompt}")]
-    pub user_prompt: Option<String>,
-
-    /// 可选的 Agent 运行时配置（Agent 服务器 + MCP 服务器）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_config: Option<ChatAgentConfig>,
-}
+use super::utils::{I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers, build_workspace_path};
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
 ///
@@ -83,7 +30,7 @@ pub struct ChatRequest {
     post,
     path = "/chat",
     request_body(
-        content = ChatRequest,
+        content = AgentChatRequest,
         description = "聊天请求，包含用户输入的 prompt 和可选的多媒体附件",
         content_type = "application/json"
     ),
@@ -131,7 +78,7 @@ pub struct ChatRequest {
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJson(mut request): I18nJson<ChatRequest>,
+    I18nJsonOrQuery(mut request): I18nJsonOrQuery<AgentChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
@@ -144,6 +91,77 @@ pub async fn handle_chat(
             project_id
         }
     };
+
+    // ========== 隔离类型参数校验 ==========
+    // IF pod_id IS NOT NULL THEN isolation_type, tenant_id, space_id 必须非空
+    if request.pod_id.is_some() {
+        if request.isolation_type.is_none() {
+            error!("[CHAT] Validation failed: isolation_type is required when pod_id is provided");
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                "isolation_type is required when pod_id is provided",
+            ));
+        }
+        if request.tenant_id.is_none() {
+            error!("[CHAT] Validation failed: tenant_id is required when pod_id is provided");
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                "tenant_id is required when pod_id is provided",
+            ));
+        }
+        if request.space_id.is_none() {
+            error!("[CHAT] Validation failed: space_id is required when pod_id is provided");
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                "space_id is required when pod_id is provided",
+            ));
+        }
+
+        // 验证 isolation_type 值有效（大小写不敏感）
+        if let Some(ref it) = request.isolation_type {
+            if IsolationType::from_str(it).is_err() {
+                error!("[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
+                return Ok(HttpResult::error_with_message(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    locale,
+                    &format!("invalid isolation_type '{}', expected: tenant, space, project", it),
+                ));
+            }
+        }
+
+        // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
+        if let (Some(pid), Some(it), Some(tid), Some(sid)) = (
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+        ) {
+            info!(
+                "🔒 [CHAT] Isolation parameters validated: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
+                pid, it, tid, sid
+            );
+        }
+    }
+
+    // ========== 构建工作空间路径 ==========
+    // 根据 isolation_type 确定容器内工作目录：
+    // - tenant/space: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
+    // - project 或默认: /app/project_workspace/{project_id}
+    let container_work_path = build_workspace_path(
+        request.isolation_type.as_deref(),
+        request.tenant_id.as_deref(),
+        request.space_id.as_deref(),
+        &project_id,
+    );
+
+    info!(
+        "📁 [CHAT] Workspace path determined: {} (isolation_type={})",
+        container_work_path,
+        request.isolation_type.as_deref().unwrap_or("project")
+    );
 
     // 验证资源限制配置
     if let Some(ref agent_config) = request.agent_config {
@@ -183,6 +201,11 @@ pub async fn handle_chat(
                 .agent_config
                 .as_ref()
                 .and_then(|c| c.resource_limits.clone()),
+            request.pod_id.as_deref(),
+            request.isolation_type.as_deref(),
+            request.tenant_id.as_deref(),
+            request.space_id.as_deref(),
+            &container_work_path,
         )
         .await?;
 
@@ -208,6 +231,10 @@ pub async fn handle_chat(
             if needs_extended_update {
                 // 创建更新后的信息
                 let mut mutable_info = (*existing_info).clone();
+                // 补充 pod_id（兼容旧数据或服务重启后丢失的情况）
+                if mutable_info.pod_id().is_none() && request.pod_id.is_some() {
+                    mutable_info.set_pod_id(request.pod_id.clone());
+                }
                 mutable_info.update_extended_from_request(
                     Some(container_info.clone()),
                     request.model_provider.clone(),
@@ -242,6 +269,7 @@ pub async fn handle_chat(
 
             // 创建新的 ProjectAndContainerInfo
             let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
+            new_info.set_pod_id(request.pod_id.clone());
             new_info.update_extended_from_request(
                 Some(container_info.clone()),
                 request.model_provider.clone(),
@@ -317,6 +345,8 @@ pub async fn handle_chat(
         &request_for_forward,
         &container_info,
         &state.grpc_pool,
+        &state.container_prefix_rcoder,
+        &state.container_prefix_computer,
         locale,
     )
     .await;
@@ -377,9 +407,11 @@ pub async fn handle_chat(
 ///
 /// 🎯 使用 gRPC Chat RPC 替代 HTTP 转发（使用全局连接池）
 async fn forward_request_to_container_service(
-    request: &ChatRequest,
+    request: &AgentChatRequest,
     container_info: &ContainerBasicInfo,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
     locale: &'static str,
 ) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
     let project_id = if let Some(id) = &request.project_id {
@@ -398,9 +430,23 @@ async fn forward_request_to_container_service(
     );
 
     // 🎯 使用 gRPC 替代 HTTP
-    // 从 service_url 提取主机名
-    let grpc_addr =
-        extract_grpc_addr_with_port(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?;
+    // 使用实时 IP 获取，避免容器重建后 IP 变化导致连接失败
+    // 直接使用 container_info.container_name（创建时已确定，无需重新拼接）
+    let container_name = container_info.container_name.clone();
+    let mut grpc_addr = match super::utils::get_realtime_container_ip(
+        &container_name,
+        &container_info.container_ip,
+        rcoder_prefix,
+        computer_prefix,
+    )
+    .await
+    {
+        Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
+        Err(e) => {
+            warn!("[FORWARD] Real-time IP resolution failed: {}, falling back to service_url", e);
+            extract_grpc_addr_with_port(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?
+        }
+    };
 
     debug!(
         "📡 [FORWARD] Sending gRPC request to: {}, prompt_length={}, attachments_count={}",
@@ -424,7 +470,7 @@ async fn forward_request_to_container_service(
             request.data_source_attachments.clone(),
             request.model_provider.clone(),
             request.request_id.clone(),
-            None, // ✅ 使用连接级别默认超时，未来可根据需要设置
+            Some(std::time::Duration::from_secs(300)), // 5 分钟超时，避免永久阻塞
             // 新增参数 (v2)
             request.system_prompt.clone(),
             request.user_prompt.clone(),
@@ -468,12 +514,35 @@ async fn forward_request_to_container_service(
                 let should_retry = crate::grpc::should_retry_error(&e);
 
                 if should_retry && attempt < max_retries {
-                    // 可重试错误：清理连接池并重试
-                    info!(
-                        "🔄 [FORWARD] Detected retryable error, removing {} from connection pool and retrying...",
-                        grpc_addr
-                    );
+                    // 可重试错误：清理连接池并重新获取 IP 后重试
+                    info!("🔄 [FORWARD] Detected retryable error, re-resolving container IP and retrying...");
                     grpc_pool.remove(&grpc_addr);
+
+                    // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
+                    match super::utils::get_realtime_container_ip(
+                        &container_name,
+                        &container_info.container_ip,
+                        rcoder_prefix,
+                        computer_prefix,
+                    )
+                    .await
+                    {
+                        Ok(ip) => {
+                            let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
+                            info!(
+                                "🔄 [FORWARD] Container IP re-resolved: {} -> {}",
+                                grpc_addr, new_addr
+                            );
+                            grpc_addr = new_addr;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️ [FORWARD] Failed to re-resolve container IP, keeping old address: {}",
+                                e
+                            );
+                        }
+                    }
+
                     last_error = Some(e);
                     continue;
                 } else if !should_retry {

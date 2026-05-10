@@ -1,0 +1,31 @@
+# ============================================================================
+# 离线部署覆盖
+#
+# 使用场景：政企内网，无公网访问，所有镜像已 re-tag 推送到客户私有 registry。
+#
+# 如果走 "ctr image import 到每个节点" 模式，节点 containerd 里会以原始 repo:tag
+# 保存镜像，此时不需要改 global.imageRegistry —— 保留默认值即可，配合
+# imagePullPolicy: IfNotPresent 直接用本地缓存。
+#
+# 如果走 "re-tag + push 到私有 registry" 模式，把下面两个字段覆盖为实际地址：
+#
+#   global:
+#     imageRegistry: harbor.internal/rcoder          # RCoder 自有镜像仓库
+#     thirdPartyRegistry: harbor.internal/thirdparty # 第三方镜像 (postgres/minio/juicedata)
+#
+# 使用:
+#   helm install rcoder k8s/helm/rcoder \
+#        -f k8s/helm/rcoder/values-dev.yaml \
+#        -f k8s/helm/rcoder/values-offline.yaml \
+#        --set global.imageRegistry=harbor.internal/rcoder \
+#        --set global.thirdPartyRegistry=harbor.internal/thirdparty
+# ============================================================================
+
+global:
+  # 示例值, 客户按需改
+  imageRegistry: harbor.internal/rcoder
+  thirdPartyRegistry: harbor.internal/thirdparty
+  imagePullPolicy: IfNotPresent
+  # 如果私有 registry 需要认证，在集群里创建 Secret 后填:
+  # imagePullSecrets: [{name: harbor-pull-secret}]
+  imagePullSecrets: []

@@ -52,8 +52,7 @@ impl AgentCleaner {
                 docker_manager.clone(),
                 grpc_pool,
                 pingora_service,
-            )
-            .with_ip_cache(state.container_ip_cache.clone()),
+            ),
             agent_scanner: {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)
@@ -89,7 +88,31 @@ impl AgentCleaner {
         info!("[cleaner] Found {} idle agents to clean", idle_agents.len());
 
         // 3. 清理每个 agent
+        // 记录已销毁的容器名称，避免共享容器被重复销毁（ComputerAgentRunner 场景）
+        let mut destroyed_containers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for project_id in idle_agents {
+            // 检查该项目的容器是否已被本轮销毁（共享容器场景）
+            let container_name: Option<String> = self
+                .state
+                .get_project(&project_id)
+                .and_then(|info| info.container().map(|c| c.container_name.clone()));
+
+            if let Some(ref name) = container_name {
+                if destroyed_containers.contains(name) {
+                    // 容器已被销毁，只需删除项目记录
+                    self.state.remove_project(&project_id);
+                    current_stats.total_cleaned += 1;
+                    current_stats.success_cleaned += 1;
+                    info!(
+                        "[cleaner] Container already destroyed, removed project record only: project_id={}",
+                        project_id
+                    );
+                    continue;
+                }
+            }
+
             current_stats.total_cleaned += 1;
 
             match self.cleanup_agent(&project_id).await {
@@ -97,6 +120,10 @@ impl AgentCleaner {
                     current_stats.success_cleaned += 1;
                     if destroyed {
                         current_stats.containers_destroyed += 1;
+                        // 记录已销毁的容器名称，跳过后续同容器的销毁
+                        if let Some(name) = container_name {
+                            destroyed_containers.insert(name);
+                        }
                     }
                     info!("[cleaner] Agent cleanupsucceeded: {}", project_id);
                 }
@@ -162,6 +189,7 @@ impl AgentCleaner {
                 let project_info = super::strategies::ProjectInfo {
                     project_id: agent_info.project_id().to_string(),
                     user_id: agent_info.user_id().map(|s| s.to_string()),
+                    pod_id: agent_info.pod_id().map(|s| s.to_string()),
                     last_activity: agent_info.last_activity(),
                 };
 

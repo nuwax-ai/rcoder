@@ -1,10 +1,13 @@
 //! 容器状态同步任务
 //!
-//! 定期从 Docker 同步容器状态到内存缓存。
-//! 主要用于检测被外部手动停止/删除的容器，并从缓存中清理。
+//! 定期从运行时同步容器状态。
+//! 在 K8s 模式下通过 Runtime API 获取 Pod 状态；在 Docker 模式下同样通过 Runtime 抽象层访问。
 
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::grpc::GrpcChannelPool;
 
 /// 容器状态同步配置
 #[derive(Debug, Clone)]
@@ -23,10 +26,16 @@ impl Default for ContainerSyncConfig {
 
 /// 启动容器状态同步任务
 ///
-/// 定期调用 `DockerManager::sync_all_container_states()` 方法，
-/// 检查缓存中的容器是否仍然存在于 Docker 中，
+/// 定期调用 `ContainerRuntime::sync_states()` 方法，
+/// 检查缓存中的容器是否仍然存在于运行时（Docker/K8s）中，
 /// 如果不存在则从缓存中移除。
-pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::JoinHandle<()> {
+///
+/// 同时清理已移除容器的关联资源：
+/// - gRPC 连接池中的旧连接
+pub fn start_container_sync_task(
+    config: ContainerSyncConfig,
+    grpc_pool: Arc<GrpcChannelPool>,
+) -> tokio::task::JoinHandle<()> {
     info!(
         "🔄 [CONTAINER_SYNC] Starting container state sync task: interval={}s",
         config.sync_interval.as_secs()
@@ -34,32 +43,43 @@ pub fn start_container_sync_task(config: ContainerSyncConfig) -> tokio::task::Jo
 
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(config.sync_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
 
-            // 获取全局 DockerManager
-            let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-                Ok(dm) => dm,
+            // 获取全局 Runtime
+            let runtime = match docker_manager::runtime::RuntimeManager::get().await {
+                Ok(rt) => rt,
                 Err(e) => {
-                    warn!("[CONTAINER_SYNC] Failed to get DockerManager: {}", e);
+                    warn!("[CONTAINER_SYNC] Failed to get runtime: {}", e);
                     continue;
                 }
             };
 
-            // 执行同步
-            match docker_manager.sync_all_container_states().await {
+            // 同步缓存状态 - 清理失效的容器记录
+            debug!("[CONTAINER_SYNC] Syncing container states...");
+            match runtime.sync_states().await {
                 Ok((checked, removed)) => {
-                    if removed > 0 {
+                    if !removed.is_empty() {
                         info!(
-                            "🔄 [CONTAINER_SYNC] Sync completed: checked={}, removed={}",
-                            checked, removed
+                            "[CONTAINER_SYNC] Sync completed: checked={}, removed_stale={}",
+                            checked,
+                            removed.len()
                         );
-                    } else {
-                        info!(
-                            "[CONTAINER_SYNC] Sync completed: checked={}",
-                            checked
-                        );
+
+                        // 清理关联资源
+                        for container in removed {
+                            // 清理 gRPC 连接池
+                            if !container.container_ip.is_empty() {
+                                let grpc_addr = format!(
+                                    "{}:{}",
+                                    container.container_ip,
+                                    shared_types::GRPC_DEFAULT_PORT
+                                );
+                                grpc_pool.remove(&grpc_addr);
+                            }
+                        }
                     }
                 }
                 Err(e) => {

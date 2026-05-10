@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS projects (
     service_type VARCHAR NOT NULL,
     container_id VARCHAR NOT NULL,
     user_id VARCHAR,
+    pod_id VARCHAR,
     agent_status_code INTEGER,
     agent_status_name VARCHAR,
     request_id VARCHAR,
@@ -52,6 +53,7 @@ const CREATE_PROJECTS_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_projects_session_id ON projects(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_projects_container_id ON projects(container_id)",
     "CREATE INDEX IF NOT EXISTS idx_projects_user_id ON projects(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_projects_pod_id ON projects(pod_id)",
     "CREATE INDEX IF NOT EXISTS idx_projects_service_type ON projects(service_type)",
     "CREATE INDEX IF NOT EXISTS idx_projects_last_activity ON projects(last_activity)",
 ];

@@ -33,10 +33,10 @@ impl ProjectRepository {
                 r#"
                 INSERT OR REPLACE INTO projects (
                     project_id, session_id, service_type, container_id,
-                    user_id, agent_status_code, agent_status_name,
+                    user_id, pod_id, agent_status_code, agent_status_name,
                     request_id, model_provider_json, created_at, last_activity,
                     session_created_at, session_last_activity
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
                 params![
                     record.project_id,
@@ -44,6 +44,7 @@ impl ProjectRepository {
                     service_type_str,
                     record.container_id,
                     record.user_id,
+                    record.pod_id,
                     record.agent_status_code,
                     record.agent_status_name,
                     record.request_id,
@@ -64,7 +65,7 @@ impl ProjectRepository {
             let mut stmt = c.prepare(
                 r#"
                 SELECT project_id, session_id, service_type, container_id,
-                       user_id, agent_status_code, agent_status_name,
+                       user_id, pod_id, agent_status_code, agent_status_name,
                        request_id, model_provider_json, created_at, last_activity,
                        session_created_at, session_last_activity
                 FROM projects
@@ -87,7 +88,7 @@ impl ProjectRepository {
             let mut stmt = c.prepare(
                 r#"
                 SELECT project_id, session_id, service_type, container_id,
-                       user_id, agent_status_code, agent_status_name,
+                       user_id, pod_id, agent_status_code, agent_status_name,
                        request_id, model_provider_json, created_at, last_activity,
                        session_created_at, session_last_activity
                 FROM projects
@@ -112,7 +113,7 @@ impl ProjectRepository {
             let mut stmt = c.prepare(
                 r#"
                 SELECT project_id, session_id, service_type, container_id,
-                       user_id, agent_status_code, agent_status_name,
+                       user_id, pod_id, agent_status_code, agent_status_name,
                        request_id, model_provider_json, created_at, last_activity,
                        session_created_at, session_last_activity
                 FROM projects
@@ -163,13 +164,73 @@ impl ProjectRepository {
         })
     }
 
+    /// 根据 pod_id 查找所有项目 (RCoder 共享容器模式)
+    ///
+    /// 在 RCoder 共享容器模式下，多个项目可能共享同一个容器（通过 pod_id 标识），
+    /// 返回该 Pod 下所有项目记录，按最后活动时间倒序排列
+    pub fn find_projects_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Vec<ProjectRecord>> {
+        self.conn.with_connection(|c| {
+            let mut stmt = c.prepare(
+                r#"
+                SELECT project_id, session_id, service_type, container_id,
+                       user_id, pod_id, agent_status_code, agent_status_name,
+                       request_id, model_provider_json, created_at, last_activity,
+                       session_created_at, session_last_activity
+                FROM projects
+                WHERE pod_id = ?
+                ORDER BY last_activity DESC
+                "#,
+            )?;
+
+            let mut rows = stmt.query(params![pod_id])?;
+            let mut records = Vec::new();
+
+            while let Some(row) = rows.next()? {
+                records.push(Self::row_to_record(row)?);
+            }
+
+            Ok(records)
+        })
+    }
+
+    /// 获取 Pod 最新活跃项目的容器ID (共享容器模式)
+    ///
+    /// 在共享容器模式下，多个项目可能共享同一个容器（通过 pod_id 标识），
+    /// 此方法返回该 Pod 下最近活跃项目关联的容器ID
+    pub fn get_latest_container_id_by_pod_id(
+        &self,
+        pod_id: &str,
+    ) -> DuckDbResult<Option<String>> {
+        self.conn.with_connection(|c| {
+            let mut stmt = c.prepare(
+                r#"
+                SELECT container_id
+                FROM projects
+                WHERE pod_id = ?
+                ORDER BY last_activity DESC
+                LIMIT 1
+                "#,
+            )?;
+
+            let mut rows = stmt.query(params![pod_id])?;
+
+            match rows.next()? {
+                Some(row) => {
+                    let container_id: String = row.get(0)?;
+                    Ok(Some(container_id))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     /// 根据容器ID查找所有关联的项目
     pub fn find_by_container_id(&self, container_id: &str) -> DuckDbResult<Vec<ProjectRecord>> {
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare(
                 r#"
                 SELECT project_id, session_id, service_type, container_id,
-                       user_id, agent_status_code, agent_status_name,
+                       user_id, pod_id, agent_status_code, agent_status_name,
                        request_id, model_provider_json, created_at, last_activity,
                        session_created_at, session_last_activity
                 FROM projects
@@ -246,6 +307,26 @@ impl ProjectRepository {
                 WHERE project_id = ?
                 "#,
                 params![session_id, now_str, now_str, now_str, project_id],
+            )?;
+            Ok(affected > 0)
+        })
+    }
+
+    /// 清除会话信息（将 session_id 设置为 NULL）
+    ///
+    /// 用于 Agent 停止后清理会话状态
+    pub fn clear_session(&self, project_id: &str) -> DuckDbResult<bool> {
+        let now_str = Utc::now().to_rfc3339();
+        self.conn.with_connection(|c| {
+            let affected = c.execute(
+                r#"
+                UPDATE projects
+                SET session_id = NULL,
+                    last_activity = ?,
+                    session_last_activity = ?
+                WHERE project_id = ?
+                "#,
+                params![now_str, now_str, project_id],
             )?;
             Ok(affected > 0)
         })
@@ -328,7 +409,7 @@ impl ProjectRepository {
             let mut stmt = c.prepare(
                 r#"
                 SELECT project_id, session_id, service_type, container_id,
-                       user_id, agent_status_code, agent_status_name,
+                       user_id, pod_id, agent_status_code, agent_status_name,
                        request_id, model_provider_json, created_at, last_activity,
                        session_created_at, session_last_activity
                 FROM projects
@@ -353,7 +434,7 @@ impl ProjectRepository {
             let mut stmt = c.prepare(
                 r#"
                 SELECT project_id, session_id, service_type, container_id,
-                       user_id, agent_status_code, agent_status_name,
+                       user_id, pod_id, agent_status_code, agent_status_name,
                        request_id, model_provider_json, created_at, last_activity,
                        session_created_at, session_last_activity
                 FROM projects
@@ -382,7 +463,7 @@ impl ProjectRepository {
             let mut stmt = c.prepare(
                 r#"
                 SELECT project_id, session_id, service_type, container_id,
-                       user_id, agent_status_code, agent_status_name,
+                       user_id, pod_id, agent_status_code, agent_status_name,
                        request_id, model_provider_json, created_at, last_activity,
                        session_created_at, session_last_activity
                 FROM projects
@@ -501,16 +582,17 @@ impl ProjectRepository {
         let service_type_str: String = row.get(2)?;
         let container_id: String = row.get(3)?;
         let user_id: Option<String> = row.get(4)?;
-        let agent_status_code: Option<i32> = row.get(5)?;
-        let agent_status_name: Option<String> = row.get(6)?;
-        let request_id: Option<String> = row.get(7)?;
-        let model_provider_json: Option<String> = row.get(8)?;
+        let pod_id: Option<String> = row.get(5)?;
+        let agent_status_code: Option<i32> = row.get(6)?;
+        let agent_status_name: Option<String> = row.get(7)?;
+        let request_id: Option<String> = row.get(8)?;
+        let model_provider_json: Option<String> = row.get(9)?;
 
         // DuckDB 返回 TIMESTAMP 类型，需要使用 get_ref 并转换
-        let created_at = Self::get_timestamp_from_row(row, 9)?;
-        let last_activity = Self::get_timestamp_from_row(row, 10)?;
-        let session_created_at = Self::get_optional_timestamp_from_row(row, 11)?;
-        let session_last_activity = Self::get_optional_timestamp_from_row(row, 12)?;
+        let created_at = Self::get_timestamp_from_row(row, 10)?;
+        let last_activity = Self::get_timestamp_from_row(row, 11)?;
+        let session_created_at = Self::get_optional_timestamp_from_row(row, 12)?;
+        let session_last_activity = Self::get_optional_timestamp_from_row(row, 13)?;
 
         let service_type = service_type_str
             .parse::<ServiceType>()
@@ -522,6 +604,7 @@ impl ProjectRepository {
             service_type,
             container_id,
             user_id,
+            pod_id,
             agent_status_code,
             agent_status_name,
             request_id,
@@ -756,6 +839,29 @@ mod tests {
 
         // 现在应该返回容器ID
         let container_id = repo.get_latest_container_id_by_user_id("user-1").unwrap();
+        assert_eq!(container_id, Some("c1".to_string()));
+    }
+
+    #[test]
+    fn test_get_latest_container_id_by_pod_id() {
+        let repo = setup_test_db();
+
+        // Pod 没有项目时返回 None
+        let container_id = repo.get_latest_container_id_by_pod_id("pod-1").unwrap();
+        assert!(container_id.is_none());
+
+        // 创建带 pod_id 的项目
+        let mut record = ProjectRecord::new_with_user_id(
+            "p1".to_string(),
+            "user-1".to_string(),
+            ServiceType::ComputerAgentRunner,
+            "c1".to_string(),
+        );
+        record.pod_id = Some("pod-1".to_string());
+        repo.upsert(&record).unwrap();
+
+        // 现在应该返回容器ID
+        let container_id = repo.get_latest_container_id_by_pod_id("pod-1").unwrap();
         assert_eq!(container_id, Some("c1".to_string()));
     }
 }

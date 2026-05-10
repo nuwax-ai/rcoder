@@ -1,0 +1,18 @@
+apiVersion: v2
+name: rcoder
+description: RCoder AI 驱动开发平台 (ACP-based, Rust) —— 含 RCoder 主服务 + PostgreSQL + MinIO + JuiceFS StorageClass
+type: application
+version: 1.0.0
+appVersion: "latest"
+kubeVersion: ">=1.19.0-0"
+keywords:
+  - rcoder
+  - acp
+  - ai
+  - agent
+  - juicefs
+  - rust
+maintainers:
+  - name: RCoder Team
+annotations:
+  category: AI

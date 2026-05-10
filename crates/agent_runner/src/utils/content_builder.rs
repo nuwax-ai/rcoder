@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
-use sacp::schema::{
+use agent_client_protocol::schema::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, ResourceLink, TextContent, TextResourceContents,
 };

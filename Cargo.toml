@@ -10,6 +10,7 @@ default-members = [
     "crates/docker_manager",
     "crates/rcoder-proxy",
     "crates/duckdb_manager",
+    "crates/container-runtime-api",
 ]
 
 
@@ -30,26 +31,18 @@ description = "Rust-based AI agent framework"
 publish = false
 
 [workspace.dependencies]
-# ACP Protocol - SACP (Symposium ACP) 替代官方 ACP，支持 Send trait
-sacp = "10.1.0"
-sacp-derive = "10.0.0"
-# SACP 所需的 schema 依赖（共享类型定义）
-agent-client-protocol-schema = "0.10.7"
-
-# SACP 所需的额外依赖
-boxfnonce = "0.1.1"
-fxhash = "0.2.1"
-jsonrpcmsg = "0.1.2"
+# ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）
+agent-client-protocol = { version = "0.11.1", features = ["unstable_session_usage"] }
 
 # MCP 协议 - rmcp 官方库 (升级到 0.12 以兼容 SACP)
 rmcp = { version = "0.12.0", features = ["server", "client", "transport-io", "transport-child-process", "schemars"] }
 
 piper = "0.2"
 
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
-tokio = { version = "1.48", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 async-trait = "0.1"
 smol = "2.0"
@@ -65,7 +58,7 @@ axum = { version = "0.8", features = [
 ] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-tonic = { version = "0.14.2", features = ["tls-native-roots"] }
+tonic = { version = "0.14.5", features = ["tls-native-roots"] }
 http = "1.0"
 http-body = "1.0"
 http-body-util = "0.1"
@@ -97,18 +90,18 @@ log = "0.4"
 env_logger = "0.11"
 
 # OpenTelemetry (统一使用 0.30 以兼容 tracing-opentelemetry)
-opentelemetry = "0.30"
-opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.30", features = [
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = [
     "grpc-tonic",
     "http-proto",
 ] }
-tracing-opentelemetry = "0.31"
-axum-tracing-opentelemetry = "0.30"
+tracing-opentelemetry = "0.32"
+axum-tracing-opentelemetry = "0.33"
 
 # Prometheus Metrics
 metrics = "0.24"
-metrics-exporter-prometheus = "0.17"
+metrics-exporter-prometheus = "0.18"
 
 # UUID
 uuid = { version = "1.0", features = ["serde", "v4", "v7"] }
@@ -141,7 +134,7 @@ rustls = { version = "0.23", features = ["ring"] }
 # Additional utilities
 indoc = "2.0"
 parking_lot = "0.12"
-convert_case = "0.8"
+convert_case = "0.11"
 handlebars = { version = "6.3", features = ["rust-embed"] }
 rust-embed = "8.0"
 zstd = "0.13"
@@ -152,15 +145,15 @@ derive_builder = "0.20"
 
 # Zed 核心功能依赖
 libc = "0.2"
-nix = { version = "0.30.1", features = ["fs", "process", "term", "signal"] }
+nix = { version = "0.31.2", features = ["fs", "process", "term", "signal"] }
 unindent = "0.2"                                                   # 使用 crates.io 版本
 open = "5.0"                                                       # 使用 crates.io 版本
-git2 = "0.20.1"
+git2 = "0.20.4"
 tree-sitter-rust = "0.24"                                          # 使用 crates.io 版本
 
 
 # Additional dependencies for nuwax_parser
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 walkdir = "2.5"
 reqwest = { version = "0.13", features = ["json", "stream"] }
@@ -170,11 +163,11 @@ aho-corasick = "1.0"
 # askpass = "0.1"  # 这个包不存在
 base64 = "0.22"
 circular-buffer = "1.2"
-fancy-regex = "0.17"
+fancy-regex = "0.18"
 fuzzy = "0.0.1"
 globset = "0.4"
 image = "0.25"
-indexmap = "2.12"
+indexmap = "2.14"
 pathdiff = "0.2"
 postage = "0.5"
 regex = "1.0"
@@ -188,10 +181,10 @@ which = "8.0"
 
 
 # Dev dependencies for testing
-ctor = "0.6"
+ctor = "0.13"
 pretty_assertions = "1.4"
 tempfile = "3.24"
-rand = "0.9"
+rand = "0.10"
 tokio-test = "0.4"
 expect-test = "1.5"
 
@@ -201,32 +194,32 @@ dirs = "6.0"
 # Archive utilities
 flate2 = "1.0"
 tar = "0.4"
-zip = "7.0"
+zip = "8.6"
 
 utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
 
-ringbuf = "0.4.8"
+ringbuf = "0.5"
 
 
-diffy = { version = "0.4.2" }
+diffy = { version = "0.5" }
 
-pingora = { version = "0.7", features = ["lb", "rustls"] }
-pingora-core = { version = "0.7", features = ["rustls"] }
-pingora-http = "0.7"
-pingora-proxy = { version = "0.7", features = ["rustls"] }
-pingora-load-balancing = { version = "0.7", features = ["rustls"] }
-matchit = "0.9.1"
+pingora = { version = "0.8", features = ["lb", "rustls"] }
+pingora-core = { version = "0.8", features = ["rustls"] }
+pingora-http = "0.8"
+pingora-proxy = { version = "0.8", features = ["rustls"] }
+pingora-load-balancing = { version = "0.8", features = ["rustls"] }
+matchit = "0.9.2"
 structopt = "0.3"
 
-bollard = { version = "0.19.4" }
+bollard = { version = "0.21" }
 
 # Cache library
 moka = { version = "0.12", features = ["future", "sync"] }
 
 # i18n (国际化)
-rust-i18n = "3"
+rust-i18n = "4"
 
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }

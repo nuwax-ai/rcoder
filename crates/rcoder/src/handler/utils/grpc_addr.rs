@@ -5,6 +5,7 @@
 use crate::AppError;
 use shared_types::GRPC_DEFAULT_PORT;
 use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
+use tracing::{debug, info};
 
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
 ///
@@ -50,42 +51,59 @@ pub fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
     extract_grpc_addr_with_port(service_url, GRPC_DEFAULT_PORT)
 }
 
-/// 从 Docker API 实时获取容器 IP（带 5 秒缓存）
+/// 从 Docker API 实时获取容器 IP
 ///
 /// 使用容器名称（如 `computer-agent-runner-user_123`）查询，
 /// 因为 container_id 在容器重启后会改变，但 container_name 是稳定的。
 ///
-/// 查询顺序：缓存 → Docker API → 回退到 fallback_ip
-pub async fn get_realtime_container_ip_with_cache(
+/// 查询顺序：Runtime find_container（带内部缓存）
+///
+/// # 参数
+/// - `container_name`: 容器名称
+/// - `fallback_ip`: 回退 IP 地址
+/// - `rcoder_prefix`: RCoder 服务的容器前缀（从配置读取）
+/// - `computer_prefix`: ComputerAgentRunner 服务的容器前缀（从配置读取）
+pub async fn get_realtime_container_ip(
     container_name: &str,
-    cache: &crate::grpc::ContainerIpCache,
     fallback_ip: &str,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
 ) -> Result<String, String> {
-    // 1. 先查缓存
-    if let Some(cached_ip) = cache.get(container_name) {
-        return Ok(cached_ip);
-    }
-
-    // 2. 缓存未命中，查询 Docker API
-    let docker_manager = docker_manager::global::get_global_docker_manager()
+    // 查询 Runtime API
+    let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
-        .map_err(|e| format!("Failed to get DockerManager: {}", e))?;
+        .map_err(|e| format!("Failed to get runtime: {}", e))?;
 
-    let network_ips = docker_manager
-        .get_container_network_info(container_name)
-        .await
-        .map_err(|e| format!("failed to get container network info: {}", e))?;
+    // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
+    let (identifier, service_type) = if let Some(id) =
+        container_name.strip_prefix(&format!("{}-", computer_prefix))
+    {
+        (id, shared_types::ServiceType::ComputerAgentRunner)
+    } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
+        (id, shared_types::ServiceType::RCoder)
+    } else {
+        return Ok(fallback_ip.to_string());
+    };
 
-    // 3. 优先使用第一个可用的 IP，并写入缓存
-    match network_ips.values().next().cloned() {
-        Some(ip) => {
-            cache.insert(container_name.to_string(), ip.clone());
-            Ok(ip)
+    // 通过 Runtime 的 find_container 查询容器 IP
+    // find_container 会直接调用 Docker API 获取最新的容器信息
+    match runtime.find_container(identifier, &service_type).await {
+        Ok(Some(info)) if !info.container_ip.is_empty() => {
+            debug!(
+                "🔍 [IP_QUERY] Got container IP: container_name={}, ip={}",
+                container_name, info.container_ip
+            );
+            Ok(info.container_ip)
         }
-        None => {
-            // 如果无法获取 IP，使用 fallback
+        Ok(_) => {
+            // find_container 返回空或 IP 为空，使用 fallback
+            info!(
+                "⚠️ [IP_QUERY] find_container returned empty, using fallback: container_name={}",
+                container_name
+            );
             Ok(fallback_ip.to_string())
         }
+        Err(e) => Err(format!("runtime find_container failed: {}", e)),
     }
 }
 

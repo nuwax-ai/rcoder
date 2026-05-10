@@ -22,5 +22,5 @@ pub use shared_types::{
     UnifiedSessionMessage,
 };
 
-// 重新导出 sacp 类型，供客户端构造取消请求使用
-pub use sacp::schema::{CancelNotification, SessionId};
+// 重新导出 ACP 类型，供客户端构造取消请求使用
+pub use agent_client_protocol::schema::{CancelNotification, SessionId};

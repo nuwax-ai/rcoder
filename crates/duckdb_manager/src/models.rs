@@ -84,6 +84,8 @@ pub struct ProjectRecord {
     pub container_id: String,
     /// 用户ID (ComputerAgentRunner 模式)
     pub user_id: Option<String>,
+    /// Pod ID (共享容器模式)
+    pub pod_id: Option<String>,
     /// Agent 状态码
     pub agent_status_code: Option<i32>,
     /// Agent 状态名称
@@ -112,6 +114,7 @@ impl ProjectRecord {
             service_type,
             container_id,
             user_id: None,
+            pod_id: None,
             agent_status_code: None,
             agent_status_name: None,
             request_id: None,
@@ -137,6 +140,7 @@ impl ProjectRecord {
             service_type,
             container_id,
             user_id: Some(user_id),
+            pod_id: None,
             agent_status_code: None,
             agent_status_name: None,
             request_id: None,
@@ -151,12 +155,12 @@ impl ProjectRecord {
     /// 获取容器唯一标识
     ///
     /// 根据 service_type 返回不同的标识符：
-    /// - RCoder 模式：返回 project_id
+    /// - RCoder 模式：返回 pod_id（如果存在，共享容器），否则返回 project_id
     /// - ComputerAgentRunner 模式：返回 user_id（如果存在）
     pub fn container_key(&self) -> &str {
         match self.service_type {
             ServiceType::ComputerAgentRunner => self.user_id.as_deref().unwrap_or(&self.project_id),
-            ServiceType::RCoder => &self.project_id,
+            ServiceType::RCoder => self.pod_id.as_deref().unwrap_or(&self.project_id),
         }
     }
 }

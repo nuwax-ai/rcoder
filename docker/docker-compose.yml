@@ -1,15 +1,15 @@
 name: rcoder
 services:
   rcoder:
-    image: ${RCODER_IMAGE:-master-rcoder:latest}
+    image: ${RCODER_IMAGE:-nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest}
     ports:
-      - "${RCODER_PORT:-8087}:${RCODER_PORT:-8087}"
+      - "${RCODER_PORT:-8090}:${RCODER_PORT:-8090}"
       - "8088:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）
       - "60001:60000"
       - "8199:80"
     environment:
       - TZ=Asia/Shanghai
-      - RCODER_PORT=${RCODER_PORT:-8087}
+      - RCODER_PORT=${RCODER_PORT:-8090}
       - RUST_LOG=debug # 设置调试日志级别
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
@@ -32,14 +32,13 @@ services:
       # - ./wallpaper:/app/assets
     command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8087/health"]
+      test:
+        ["CMD", "curl", "-f", "http://localhost:${RCODER_PORT:-8090}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
     restart: always
-    networks:
-      - local-agent-network
 
   # Pyroscope Server - 持续剖析数据存储和可视化
   pyroscope:
@@ -54,8 +53,6 @@ services:
     command:
       - server
     restart: unless-stopped
-    networks:
-      - local-agent-network
 
   # Prometheus Server - 时序数据库，存储常规指标
   prometheus:
@@ -74,8 +71,6 @@ services:
       - prometheus-data:/prometheus
     environment:
       - TZ=Asia/Shanghai
-    networks:
-      - local-agent-network
     restart: unless-stopped
 
   # Grafana - 可视化平台
@@ -92,8 +87,6 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-    networks:
-      - local-agent-network
     depends_on:
       - prometheus
     restart: unless-stopped
@@ -102,7 +95,3 @@ volumes:
   pyroscope-data:
   prometheus-data:
   grafana-data:
-
-networks:
-  local-agent-network:
-    driver: bridge

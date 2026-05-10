@@ -1,0 +1,135 @@
+# ============================================================
+# NFS Subdir External Provisioner + StorageClass
+#
+# 两种使用方式:
+#   模式一(内建 NFS): nfs-server.yaml 部署后，使用此文件
+#   模式二(外部 NFS): 直接修改 NFS_SERVER/NFS_PATH 环境变量指向外部 NFS
+#
+# 参考: https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner
+# ============================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nfs-storage
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfs-client-provisioner
+  namespace: nuwax-nfs-storage
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nfs-client-provisioner-cluster-runner
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodeinfos"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nfs-client-provisioner-cluster-runner-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nfs-client-provisioner-cluster-runner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    namespace: nuwax-nfs-storage
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-client-provisioner
+  namespace: nuwax-nfs-storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nfs-client-provisioner
+  template:
+    metadata:
+      labels:
+        app: nfs-client-provisioner
+    spec:
+      serviceAccountName: nfs-client-provisioner
+      containers:
+      - name: nfs-client-provisioner
+        image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+        volumeMounts:
+        - name: nfs-provisioner
+          mountPath: /persistentvolumes
+        env:
+        - name: PROVISIONER_NAME
+          value: rcoder-nfs
+        # ⚠️ 修改此处指向外部 NFS Server
+        # 内建模式: nfs-server.nfs-storage.svc.cluster.local (nfs-server.yaml 部署后)
+        # 外部模式: 替换为客户提供的 NFS 地址，如 192.168.1.100
+        - name: NFS_SERVER
+          value: nfs-server.nfs-storage.svc.cluster.local
+        - name: NFS_PATH
+          value: /exports
+        - name: NFS_MOUNT_OPTIONS
+          value: "vers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2"
+        - name: ON_DELETE_POLICY
+          value: "delete"
+        - name: ARCHIVE_ON_DELETE
+          value: "false"
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: nfs-provisioner
+        nfs:
+          # ⚠️ 修改此处指向外部 NFS Server
+          server: nfs-server.nfs-storage.svc.cluster.local
+          path: /exports
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rcoder-nfs
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: rcoder-nfs
+parameters:
+  pathPattern: "${.PVC.namespace}/${.PVC.name}"
+  onDelete: "delete"
+  archiveOnDelete: "false"
+mountOptions:
+  - vers=4.1
+  - rsize=1048576
+  - wsize=1048576
+  - hard
+  - timeo=600
+  - retrans=2
+  - noresvport
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

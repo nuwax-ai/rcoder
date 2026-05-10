@@ -34,6 +34,7 @@ use service::{
 
 // 导入统一的容器停止模块
 use docker_manager::container_stop;
+use docker_manager::runtime_selection::RuntimeType;
 
 // 路由创建函数已移动到 handler 模块
 
@@ -71,45 +72,52 @@ async fn main() -> anyhow::Result<()> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     // 🔄 初始化宿主机路径解析器（自动检测模式）
+    // K8s 模式下不需要 Docker socket，跳过路径解析器初始化
     info!("starting to detect mount path...");
-    let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH").unwrap_or_else(|_| {
- info!("DOCKER_SOCKET_PATH not set, using default: /var/run/docker.sock");
-        "/var/run/docker.sock".to_string()
-    });
+    let runtime_type = docker_manager::runtime_selection::RuntimeType::from_env();
 
-    info!("Docker socket: {}", docker_socket_path);
+    if runtime_type == docker_manager::runtime_selection::RuntimeType::Kubernetes {
+        info!("[K8S] Kubernetes runtime mode, skipping Docker socket path resolver");
+    } else {
+        let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH").unwrap_or_else(|_| {
+            info!("DOCKER_SOCKET_PATH not set, using default: /var/run/docker.sock");
+            "/var/run/docker.sock".to_string()
+        });
 
-    let _path_resolver =
-        match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone()))
-            .await
-        {
-            Ok(resolver) => {
-                info!("path resolver initialized successfully");
-                info!(
-                    "  Container workspace: {:?}",
-                    resolver.container_workspace_base()
-                );
-                info!(
-                    "work directory: {:?}",
-                    resolver.host_workspace_base()
-                );
-                Some(resolver)
-            }
-            Err(e) => {
-                error!("path resolver initialization failed: {}", e);
-                error!("please check config:");
-                error!("1. Docker socket path: {}", docker_socket_path);
-                error!("2. Docker socket already mounted in container");
-                error!("3. container has Docker API access");
-                error!("4. project work directory mounted");
+        info!("Docker socket: {}", docker_socket_path);
 
-                // 显示详细的错误信息和解决建议
-                show_docker_configuration_help(&docker_socket_path);
+        let _path_resolver =
+            match utils::HostPathResolver::new_with_docker_socket(Some(docker_socket_path.clone()))
+                .await
+            {
+                Ok(resolver) => {
+                    info!("path resolver initialized successfully");
+                    info!(
+                        "  Container workspace: {:?}",
+                        resolver.container_workspace_base()
+                    );
+                    info!(
+                        "work directory: {:?}",
+                        resolver.host_workspace_base()
+                    );
+                    Some(resolver)
+                }
+                Err(e) => {
+                    error!("path resolver initialization failed: {}", e);
+                    error!("please check config:");
+                    error!("1. Docker socket path: {}", docker_socket_path);
+                    error!("2. Docker socket already mounted in container");
+                    error!("3. container has Docker API access");
+                    error!("4. project work directory mounted");
 
-                // 返回错误，停止启动
-                return Err(anyhow::anyhow!("Container self-check failed, unable to initialize path resolver"));
-            }
-        };
+                    // 显示详细的错误信息和解决建议
+                    show_docker_configuration_help(&docker_socket_path);
+
+                    // 返回错误，停止启动
+                    return Err(anyhow::anyhow!("Container self-check failed, unable to initialize path resolver"));
+                }
+            };
+    }
 
     // 🧹 启动时清理上次可能遗留的容器
     // 先使用正确配置初始化全局 DockerManager
@@ -169,6 +177,10 @@ async fn main() -> anyhow::Result<()> {
             default_config.cache_network_ttl_seconds = ttl;
             info!("using config: network cache TTL: {} seconds", ttl);
         }
+        if let Some(capacity) = docker_config.cache_max_capacity {
+            default_config.cache_max_capacity = capacity as u64;
+            info!("using config: cache max capacity: {}", capacity);
+        }
 
         default_config
     } else {
@@ -184,64 +196,74 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("Docker Manager initialization failed: {}", e));
     }
 
-    // 获取初始化后的 DockerManager
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(dm) => {
-            info!("Docker Manager initialized successfully (with config)");
-            dm
-        }
-        Err(e) => {
-            error!("get Docker Manager failed: {}", e);
-            return Err(anyhow::anyhow!("Failed to get Docker Manager: {}", e));
-        }
-    };
-
-    // 🔧 从配置获取多镜像配置用于容器清理
-    let multi_image_config = if let Some(docker_config) = &config.docker_config {
-        docker_config.get_multi_image_config()
-    } else {
-        shared_types::create_default_multi_image_config()
-    };
-
     info!("checking cleanup for container (enabled)...");
     if config.cleanup_config.enabled {
-        match container_stop::startup_cleanup_all_enabled_services(
-            &docker_manager,
-            &multi_image_config,
-        )
-        .await
-        {
-            Ok(result) => {
-                let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
-                if result.successfully_removed > 0 {
-                    info!(
-                        "✅ Startup cleanup completed, removed {} leftover containers (covering {} service types)",
-                        result.successfully_removed,
-                        enabled_services.len()
-                    );
-                } else {
-                    info!("no containers to cleanup");
-                }
+        match docker_manager::runtime::RuntimeManager::runtime_type() {
+            RuntimeType::Docker => {
+                let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+                    Ok(dm) => {
+                        info!("Docker Manager initialized successfully (with config)");
+                        dm
+                    }
+                    Err(e) => {
+                        error!("get Docker Manager failed: {}", e);
+                        return Err(anyhow::anyhow!("Failed to get Docker Manager: {}", e));
+                    }
+                };
 
-                // 如果有失败的清理（非409错误），记录警告
-                if result.failed_removals > 0 {
-                    warn!(
-                        "container cleanup failed: failed count={}",
-                        result.failed_removals
-                    );
-                    for failure in &result.failed_removals_details {
-                        warn!(
-                            "  - Container {} ({}): {}",
-                            failure.container_id, failure.container_name, failure.error_message
-                        );
+                let multi_image_config = if let Some(docker_config) = &config.docker_config {
+                    docker_config.get_multi_image_config()
+                } else {
+                    shared_types::create_default_multi_image_config()
+                };
+
+                match container_stop::startup_cleanup_all_enabled_services(
+                    &docker_manager,
+                    &multi_image_config,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
+                        if result.successfully_removed > 0 {
+                            info!(
+                                "✅ Startup cleanup completed, removed {} leftover containers (covering {} service types)",
+                                result.successfully_removed,
+                                enabled_services.len()
+                            );
+                        } else {
+                            info!("no containers to cleanup");
+                        }
+
+                        if result.failed_removals > 0 {
+                            warn!(
+                                "container cleanup failed: failed count={}",
+                                result.failed_removals
+                            );
+                            for failure in &result.failed_removals_details {
+                                warn!(
+                                    "  - Container {} ({}): {}",
+                                    failure.container_id, failure.container_name, failure.error_message
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("container cleanup failed: {}, cleanup skipped", e);
                     }
                 }
             }
-            Err(e) => {
-                warn!(
-                    "container cleanup failed: {}, cleanup skipped",
-                    e
-                );
+            RuntimeType::Kubernetes => {
+                match docker_manager::runtime::RuntimeManager::get().await {
+                    Ok(runtime) => {
+                        if let Err(e) = runtime.cleanup_all().await {
+                            warn!("k8s startup cleanup failed: {}", e);
+                        } else {
+                            info!("k8s startup cleanup completed");
+                        }
+                    }
+                    Err(e) => warn!("failed to get runtime for k8s startup cleanup: {}", e),
+                }
             }
         }
     } else {
@@ -445,7 +467,10 @@ async fn main() -> anyhow::Result<()> {
     let container_sync_config = ContainerSyncConfig {
         sync_interval: Duration::from_secs(60), // 每 60 秒同步一次
     };
-    let _container_sync_handle = start_container_sync_task(container_sync_config);
+    let _container_sync_handle = start_container_sync_task(
+        container_sync_config,
+        state.grpc_pool.clone(),
+    );
     info!(
         "Container status sync already started (interval: 60s, detect container)"
     );
@@ -455,7 +480,12 @@ async fn main() -> anyhow::Result<()> {
         let vnc_sync_config = VncSyncConfig {
             sync_interval: Duration::from_secs(5), // 每 5 秒同步一次
         };
-        let _vnc_sync_handle = start_vnc_sync_task(pingora_service.clone(), vnc_sync_config);
+        let _vnc_sync_handle = start_vnc_sync_task(
+            pingora_service.clone(),
+            vnc_sync_config,
+            state.container_prefix_rcoder.clone(),
+            state.container_prefix_computer.clone(),
+        );
         info!(
             "VNC sync already started (interval: 5s, sync Docker container IP)"
         );
@@ -689,36 +719,47 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) 
 async fn cleanup_all_containers() -> anyhow::Result<()> {
     info!("🧹 starting cleanup of dynamically created containers...");
 
-    let docker_manager = docker_manager::global::get_global_docker_manager()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get global DockerManager: {}", e))?;
+    match docker_manager::runtime::RuntimeManager::runtime_type() {
+        RuntimeType::Docker => {
+            let docker_manager = docker_manager::global::get_global_docker_manager()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get global DockerManager: {}", e))?;
 
-    // 🔧 使用默认多镜像配置
-    // 注意：在关闭时使用默认配置是安全的，因为启用的服务类型在默认配置中已定义
-    let multi_image_config = shared_types::create_default_multi_image_config();
+            let multi_image_config = shared_types::create_default_multi_image_config();
+            match container_stop::startup_cleanup_all_enabled_services(
+                &docker_manager,
+                &multi_image_config,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if result.successfully_removed > 0 {
+                        info!(
+                            "🧹 Cleaned up {} containers (all enabled services)",
+                            result.successfully_removed
+                        );
+                    }
 
-    // 使用启动清理策略（服务关闭时也使用相同策略）
-    // 🔒 安全说明：只清理数据库中有记录的容器，不会影响其他 RCoder 实例
-    match container_stop::startup_cleanup_all_enabled_services(&docker_manager, &multi_image_config)
-        .await
-    {
-        Ok(result) => {
-            if result.successfully_removed > 0 {
-                info!(
-                    "🧹 Cleaned up {} containers (all enabled services)",
-                    result.successfully_removed
-                );
-            }
-
-            if result.failed_removals > 0 {
-                warn!(
-                    "container cleanup failed: failed count={}",
-                    result.failed_removals
-                );
+                    if result.failed_removals > 0 {
+                        warn!(
+                            "container cleanup failed: failed count={}",
+                            result.failed_removals
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("container cleanup error: {}", e);
+                }
             }
         }
-        Err(e) => {
-            warn!("container cleanup error: {}", e);
+        RuntimeType::Kubernetes => {
+            let runtime = docker_manager::runtime::RuntimeManager::get()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get runtime: {}", e))?;
+            runtime
+                .cleanup_all()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to cleanup runtime resources: {}", e))?;
         }
     }
 

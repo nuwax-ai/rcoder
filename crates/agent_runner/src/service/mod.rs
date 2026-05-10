@@ -1,5 +1,6 @@
 pub mod agent_registry;
 pub mod chat_handler;
+pub mod local_agent_service;
 mod session_cache;
 mod session_notifier;
 mod state_aware_notifier;

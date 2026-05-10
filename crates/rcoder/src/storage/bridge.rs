@@ -26,6 +26,7 @@ impl DataBridge {
         // 设置基本信息
         info.set_session_id(record.session_id.clone());
         info.set_user_id(record.user_id.clone());
+        info.set_pod_id(record.pod_id.clone());
         info.set_service_type(Some(record.service_type.clone()));
         info.set_container(container);
 
@@ -70,6 +71,9 @@ impl DataBridge {
 
         // 设置用户ID
         record.user_id = info.user_id().map(|s| s.to_string());
+
+        // 设置 Pod ID（共享容器模式）
+        record.pod_id = info.pod_id().map(|s| s.to_string());
 
         // 设置 Agent 状态
         if let Some(status) = info.status() {

@@ -13,6 +13,10 @@ pub mod utils;
 pub mod container_builder;
 pub mod health;
 pub mod network;
+pub mod runtime_selection;
+
+// Runtime abstraction (Docker/K8s selection)
+pub mod runtime;
 
 pub use container_self_inspector::*;
 pub use container_state_actor::*;
@@ -166,11 +170,13 @@ pub const RCODER_NETWORK_BASE_NAME: &str = "agent-network";
 /// 全局 Docker 管理器实例
 pub mod global {
     use super::*;
+    #[cfg(feature = "kubernetes")]
+    use crate::runtime_selection::RuntimeType;
     use std::sync::Arc;
     use tokio::sync::OnceCell;
     use tracing::{debug, info};
 
-    /// 全局 DockerManager 单例
+    /// 全局 DockerManager 单例（用于向后兼容）
     static GLOBAL_DOCKER_MANAGER: OnceCell<Arc<DockerManager>> = OnceCell::const_new();
 
     /// 初始化全局 DockerManager
@@ -190,25 +196,89 @@ pub mod global {
     }
 
     /// 使用自定义配置初始化全局 DockerManager
+    ///
+    /// 注意：此函数保持向后兼容。对于 K8s 支持，请使用 init_global_runtime()
+    #[cfg(feature = "kubernetes")]
     pub async fn init_global_docker_manager_with_config(
         config: DockerManagerConfig,
     ) -> DockerResult<()> {
-        let manager = Arc::new(DockerManager::new(config).await?);
+        let runtime_type = RuntimeType::from_env();
+        crate::runtime::RuntimeManager::init(config.clone())
+            .await
+            .map_err(|e| DockerError::ConfigurationError(e.to_string()))?;
+        info!("Runtime initialized with config");
 
+        if runtime_type == RuntimeType::Docker {
+            let manager = Arc::new(DockerManager::new(config).await?);
+            GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
+                DockerError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "global DockerManager already initialized",
+                ))
+            })?;
+            info!("DockerManager initialized with config");
+        }
+
+        Ok(())
+    }
+
+    /// 使用自定义配置初始化全局 DockerManager（无 K8s 支持）
+    #[cfg(not(feature = "kubernetes"))]
+    pub async fn init_global_docker_manager_with_config(
+        config: DockerManagerConfig,
+    ) -> DockerResult<()> {
+        // Initialize RuntimeManager so RUNTIME_INSTANCE is set
+        // This allows RuntimeManager::get() to work in docker compose mode
+        crate::runtime::RuntimeManager::init(config.clone())
+            .await
+            .map_err(|e| DockerError::ConfigurationError(e.to_string()))?;
+        info!("Runtime initialized with config");
+
+        let manager = Arc::new(DockerManager::new(config).await?);
         GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
             DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "global DockerManager already initialized",
             ))
         })?;
-
         info!("DockerManager initialized with config");
         Ok(())
     }
 
+    /// 初始化全局运行时（RuntimeManager）
+    ///
+    /// 根据 CONTAINER_RUNTIME 环境变量选择 Docker 或 Kubernetes 运行时
+    #[cfg(feature = "kubernetes")]
+    pub async fn init_global_runtime(
+        config: DockerManagerConfig,
+    ) -> container_runtime_api::ContainerRuntimeResult<()> {
+        crate::runtime::RuntimeManager::init(config).await
+    }
+
+    /// 获取全局运行时实例（Arc<dyn ContainerRuntime>）
+    ///
+    /// 支持 Docker 和 Kubernetes 运行时
+    #[cfg(feature = "kubernetes")]
+    pub async fn get_global_runtime(
+    ) -> container_runtime_api::ContainerRuntimeResult<Arc<dyn container_runtime_api::ContainerRuntime>> {
+        crate::runtime::RuntimeManager::get().await
+    }
+
     /// 获取全局 DockerManager 实例
+    ///
+    /// 注意：此函数仅在 Docker 模式下返回有效的 DockerManager。
+    /// 如果需要同时支持 Docker 和 K8s，请使用 get_global_runtime()
+    ///
     /// 如果未初始化，会自动初始化
     pub async fn get_global_docker_manager() -> DockerResult<Arc<DockerManager>> {
+        #[cfg(feature = "kubernetes")]
+        if RuntimeType::from_env() == RuntimeType::Kubernetes {
+            return Err(DockerError::ConfigurationError(
+                "DockerManager is unavailable in Kubernetes runtime mode. Use RuntimeManager::get()"
+                    .to_string(),
+            ));
+        }
+
         if GLOBAL_DOCKER_MANAGER.get().is_none() {
             debug!("DockerManager not initialized, starting initialize");
             init_global_docker_manager().await?;
@@ -222,7 +292,7 @@ pub mod global {
         })
     }
 
-    /// 使用全局 DockerManager 执行操作
+    /// 使用全局 DockerManager 执行操作（向后兼容）
     pub async fn with_global_docker_manager<F, R>(f: F) -> DockerResult<R>
     where
         F: FnOnce(&Arc<DockerManager>) -> R,

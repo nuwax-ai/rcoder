@@ -15,10 +15,12 @@
 
 use crate::AppError;
 use crate::handler::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
+use container_runtime_api::{ContainerCreateParams, ContainerRuntime};
 use docker_manager::ContainerBasicInfo;
 use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Computer Agent Runner 容器管理服务
@@ -28,14 +30,18 @@ use tracing::{debug, error, info, warn};
 pub struct ComputerContainerManager;
 
 impl ComputerContainerManager {
-    /// 根据 user_id 获取或创建容器
+    /// 根据 user_id 或 pod_id 获取或创建容器
     ///
-    /// 容器命名规则: `computer-agent-runner-{user_id}`
-    /// 工作区路径: `/app/computer-project-workspace/{user_id}`
+    /// 容器命名规则: `computer-agent-runner-{pod_id}` 或 `computer-agent-runner-{user_id}`
+    /// 工作区路径: `/app/computer-project-workspace/{user_id}` 或基于 isolation 的路径
     ///
     /// # 参数
     /// - `user_id`: 用户唯一标识符
     /// - `resource_limits`: 可选的资源限额配置
+    /// - `pod_id`: 可选的容器唯一标识，若提供则使用此 ID 作为容器标识（实现容器复用）
+    /// - `isolation_type`: 隔离类型
+    /// - `tenant_id`: 租户 ID
+    /// - `space_id`: 空间 ID
     ///
     /// # 返回
     /// 容器基本信息，包含容器 ID、IP 地址等
@@ -45,76 +51,119 @@ impl ComputerContainerManager {
     /// let container_info = ComputerContainerManager::get_or_create_container_for_user(
     ///     "user_123",
     ///     None,
+    ///     None,
+    ///     None,
+    ///     None,
+    ///     None,
     /// ).await?;
     /// println!("Container IP: {}", container_info.container_ip);
     /// ```
     pub async fn get_or_create_container_for_user(
         user_id: &str,
         resource_limits: Option<ServiceResourceLimits>,
+        pod_id: Option<&str>,
+        isolation_type: Option<&str>,
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
     ) -> Result<ContainerBasicInfo, AppError> {
+        // 确定容器标识符：pod_id 有值时使用 pod_id，否则使用 user_id
+        let container_identifier = pod_id.unwrap_or(user_id);
+
         info!(
-            "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}",
-            user_id
+            "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}, pod_id={:?}, container_identifier={}",
+            user_id, pod_id, container_identifier
         );
 
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
                 AppError::with_message(
                     ERR_CONTAINER_ERROR,
-                    format!("Failed to get DockerManager: {}", e),
+                    format!("Failed to get runtime: {}", e),
                 )
             })?;
 
         // 1. 尝试获取现有容器
-        // 使用 user_id 作为容器标识进行查询
-        if let Ok(Some(info)) = docker_manager.get_user_container_info(user_id).await {
-            // ✅ 关键修复: 验证容器是否真的在运行
-            match docker_manager
-                .is_container_running(&info.container_id)
-                .await
-            {
-                Ok(true) => {
-                    info!(
-                        "✅ [COMPUTER_CONTAINER] User container already exists and running: user_id={}, container_id={}",
-                        user_id, info.container_id
-                    );
-                    return Ok(info);
-                }
-                Ok(false) => {
+        // 使用 container_identifier 作为容器标识进行查询
+        if let Ok(Some(info)) = runtime
+            .get_container_info_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+            .await
+        {
+            // ✅ 关键修复: 先验证 IP 是否有效，再检查容器运行状态
+            // 顺序很重要：IP 为空说明容器已异常（被 kill 后网络已销毁），
+            // 此时不应再调用 is_container_running_by_identifier（可能因缓存返回错误结果）
+            if info.container_ip.trim().is_empty() {
+                warn!(
+                    "⚠️ [COMPUTER_CONTAINER] Container has empty IP (likely killed externally), will recreate: container_identifier={}, container_id={}",
+                    container_identifier, info.container_id
+                );
+                // 尝试清理已失效的容器
+                if let Err(e) = runtime
+                    .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                    .await
+                {
                     warn!(
-                        "⚠️ [COMPUTER_CONTAINER] User container exists but stopped: user_id={}, container_id={}, will delete and recreate",
-                        user_id, info.container_id
+                        "⚠️ [COMPUTER_CONTAINER] Failed to cleanup broken container (will create new anyway): {}",
+                        e
                     );
-                    // 删除已停止的旧容器
-                    if let Err(e) = docker_manager
-                        .stop_container_by_id(&info.container_id)
-                        .await
-                    {
-                        warn!(
-                            "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (will create new container anyway): {}",
-                            e
+                }
+                // 继续创建新容器
+            } else {
+                // IP 非空，进一步验证容器是否真的在运行
+                match runtime
+                    .is_container_running_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            "✅ [COMPUTER_CONTAINER] User container already exists and running: container_identifier={}, container_id={}, ip={}",
+                            container_identifier, info.container_id, info.container_ip
                         );
+                        return Ok(info);
                     }
-                    // 继续创建新容器
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ [COMPUTER_CONTAINER] Failed to check container status: user_id={}, error={}, will try creating new container",
-                        user_id, e
-                    );
-                    // 继续创建新容器
+                    Ok(false) => {
+                        warn!(
+                            "⚠️ [COMPUTER_CONTAINER] User container exists but stopped: container_identifier={}, container_id={}, will delete and recreate",
+                            container_identifier, info.container_id
+                        );
+                        if let Err(e) = runtime
+                            .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                            .await
+                        {
+                            warn!(
+                                "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (will create new container anyway): {}",
+                                e
+                            );
+                        }
+                        // 继续创建新容器
+                    }
+                    Err(e) => {
+                        warn!(
+                            "⚠️ [COMPUTER_CONTAINER] Failed to check container status: container_identifier={}, error={}, will try creating new container",
+                            container_identifier, e
+                        );
+                        // 继续创建新容器
+                    }
                 }
             }
         }
 
         // 2. 容器不存在或已停止，创建新容器
         info!(
-            "🏗️ [COMPUTER_CONTAINER] Creating new user container: user_id={}",
-            user_id
+            "🏗️ [COMPUTER_CONTAINER] Creating new user container: container_identifier={}",
+            container_identifier
         );
-        Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
+        Self::create_container_for_user(
+            user_id,
+            &runtime,
+            resource_limits,
+            pod_id,
+            isolation_type,
+            tenant_id,
+            space_id,
+        )
+        .await
     }
 
     /// 强制为用户创建新容器（跳过检查）
@@ -124,23 +173,37 @@ impl ComputerContainerManager {
     pub async fn force_create_container_for_user(
         user_id: &str,
         resource_limits: Option<ServiceResourceLimits>,
+        pod_id: Option<&str>,
+        isolation_type: Option<&str>,
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
     ) -> Result<ContainerBasicInfo, AppError> {
+        let container_identifier = pod_id.unwrap_or(user_id);
         info!(
-            "🏗️ [COMPUTER_CONTAINER] Force creating new user container: user_id={}",
-            user_id
+            "🏗️ [COMPUTER_CONTAINER] Force creating new user container: container_identifier={}",
+            container_identifier
         );
 
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
                 AppError::with_message(
                     ERR_CONTAINER_ERROR,
-                    format!("Failed to get DockerManager: {}", e),
+                    format!("Failed to get runtime: {}", e),
                 )
             })?;
 
-        Self::create_container_for_user(user_id, &docker_manager, resource_limits).await
+        Self::create_container_for_user(
+            user_id,
+            &runtime,
+            resource_limits,
+            pod_id,
+            isolation_type,
+            tenant_id,
+            space_id,
+        )
+        .await
     }
 
     /// 为用户创建容器
@@ -148,9 +211,16 @@ impl ComputerContainerManager {
     /// 内部方法，负责实际的容器创建逻辑。
     async fn create_container_for_user(
         user_id: &str,
-        docker_manager: &std::sync::Arc<docker_manager::DockerManager>,
+        runtime: &Arc<dyn ContainerRuntime>,
         resource_limits: Option<ServiceResourceLimits>,
+        pod_id: Option<&str>,
+        isolation_type: Option<&str>,
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
     ) -> Result<ContainerBasicInfo, AppError> {
+        // 确定容器标识符：pod_id 有值时使用 pod_id，否则使用 user_id
+        let container_identifier = pod_id.unwrap_or(user_id);
+
         // 1. 准备用户级工作目录（仍需在 rcoder 容器内创建）
         // 在容器内创建目录，绑定挂载会自动同步到宿主机
         Self::create_user_workspace(user_id).await?;
@@ -162,14 +232,36 @@ impl ComputerContainerManager {
 
         // 2. 调用 DockerManager 启动容器
         // 注意：不再传递 host_path，挂载由 config.yml 的 mounts 配置管理
-        let container_info = docker_manager
-            .start_agent_container(
-                Some(user_id), // 用于清理旧容器的标识符
-                Some(user_id), // Computer Agent Runner 的 user_id 参数
-                "",            // ✅ 空字符串，表示不使用硬编码挂载，完全依赖 mounts 配置
-                ServiceType::ComputerAgentRunner,
-                resource_limits,
-            )
+        // 使用 container_identifier 作为 project_id（用于容器名称生成）
+        let mut params_builder = ContainerCreateParams::builder()
+            .project_id(container_identifier) // 用于容器名称生成和查找
+            .user_id(user_id) // user_id 用于容器内配置
+            .host_workspace_path("")
+            .service_type(ServiceType::ComputerAgentRunner);
+
+        // 只有在有资源限制时才设置
+        if let Some(limits) = resource_limits {
+            params_builder = params_builder.resource_limits(limits);
+        }
+
+        // 设置可选的隔离参数
+        if let Some(pid) = pod_id {
+            params_builder = params_builder.pod_id(pid);
+        }
+        if let Some(it) = isolation_type {
+            params_builder = params_builder.isolation_type(it);
+        }
+        if let Some(tid) = tenant_id {
+            params_builder = params_builder.tenant_id(tid);
+        }
+        if let Some(sid) = space_id {
+            params_builder = params_builder.space_id(sid);
+        }
+
+        let params = params_builder.build();
+
+        let container_info = runtime
+            .create_container(params)
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to start container: {}", e);
@@ -248,18 +340,18 @@ impl ComputerContainerManager {
             user_id
         );
 
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get DockerManager: {}", e);
+                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
                 AppError::with_message(
                     ERR_CONTAINER_ERROR,
-                    format!("Failed to get DockerManager: {}", e),
+                    format!("Failed to get runtime: {}", e),
                 )
             })?;
 
-        docker_manager
-            .get_user_container_info(user_id)
+        runtime
+            .get_container_info_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to query container info: {}", e);

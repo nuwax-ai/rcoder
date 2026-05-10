@@ -1,0 +1,26 @@
+services:
+  registry2:
+    image: registry:2
+    container_name: registry2
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - ./data:/var/lib/registry
+      - ./registry-config.yml:/etc/docker/registry/config.yml:ro
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    container_name: registry2-ui
+    restart: unless-stopped
+    ports:
+      - "5080:80"
+    environment:
+      SINGLE_REGISTRY: "true"
+      REGISTRY_TITLE: "registry2"
+      # UI 在浏览器端直接请求 registry，这里必须是浏览器可达的地址
+      REGISTRY_URL: "http://192.168.32.228:5000"
+    depends_on:
+      - registry2

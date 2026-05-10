@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-// SACP 类型导入
-use sacp::schema::{CancelNotification, PromptRequest, SessionId};
+use agent_client_protocol::schema::{CancelNotification, PromptRequest, SessionId};
 use tokio::sync::{mpsc, oneshot};
 
 // 重新导出 shared_types 中的统一类型

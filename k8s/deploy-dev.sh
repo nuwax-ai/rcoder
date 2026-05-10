@@ -1,0 +1,331 @@
+#!/bin/bash
+# ============================================================
+# RCoder K8s 开发环境部署脚本 (Kustomize)
+# 用于日常开发测试验证
+# ============================================================
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# 路径解析：支持从任意 cwd 调用脚本
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+NAMESPACE="${NAMESPACE:-nuwax-rcoder-dev}"
+KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${SCRIPT_DIR}/manifests/overlays/dev}"
+JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE:-juicedata/mount:ce-v1.3.1}"
+DNS_CHECK_IMAGE="${DNS_CHECK_IMAGE:-busybox:1.36}"
+
+echo -e "${GREEN}=========================================="
+echo "  RCoder K8s 开发环境部署 (Kustomize)"
+echo "==========================================${NC}"
+
+ensure_juicefs_ce_image() {
+    echo -e "${YELLOW}配置 JuiceFS CSI 使用 CE Mount 镜像: ${JUICEFS_CE_MOUNT_IMAGE}${NC}"
+
+    local node_ds=""
+    if kubectl get daemonset/juicefs-csi-node -n kube-system &> /dev/null; then
+        node_ds="juicefs-csi-node"
+    elif kubectl get daemonset/juicefs-csi-driver-node -n kube-system &> /dev/null; then
+        node_ds="juicefs-csi-driver-node"
+    fi
+
+    # 兼容不同版本 CSI 驱动：同时设置旧变量与 CE 专用变量
+    if [ -n "$node_ds" ]; then
+        kubectl -n kube-system set env "daemonset/${node_ds}" -c juicefs-plugin \
+        JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE}" \
+        JUICEFS_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE}" >/dev/null
+    fi
+
+    kubectl -n kube-system set env statefulset/juicefs-csi-controller -c juicefs-plugin \
+        JUICEFS_CE_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE}" \
+        JUICEFS_MOUNT_IMAGE="${JUICEFS_CE_MOUNT_IMAGE}" >/dev/null
+
+    # 同步更新驱动 ConfigMap（部分版本从这里读取 mountImage）
+    kubectl -n kube-system patch configmap juicefs-csi-driver-config --type merge \
+      -p "{\"data\":{\"config.yaml\":\"enableNodeSelector: false\\nmountImage: ${JUICEFS_CE_MOUNT_IMAGE}\\nmountPodPatch:\\n\"}}" >/dev/null || true
+}
+
+check_cluster_dns() {
+    echo -e "${GREEN}检查集群 DNS 基线...${NC}"
+    local check_name="rcoder-dns-check-$(date +%s)"
+    if kubectl run "${check_name}" --restart=Never --rm -i -n "${NAMESPACE}" \
+        --image="${DNS_CHECK_IMAGE}" --command -- \
+        sh -lc "nslookup kubernetes.default.svc.cluster.local >/dev/null && nslookup postgresql.${NAMESPACE}.svc.cluster.local >/dev/null && nslookup minio-service.${NAMESPACE}.svc.cluster.local >/dev/null" >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ 集群 DNS 解析正常${NC}"
+    else
+        echo -e "${RED}❌ 集群 DNS 解析异常：无法解析 Kubernetes/业务 Service 域名${NC}"
+        echo -e "${YELLOW}建议先修复 CoreDNS 后再继续（例如重启 coredns / 检查 coredns addon）${NC}"
+        exit 1
+    fi
+}
+
+# ============================================================
+# 步骤 1: 检查 K8s 集群
+# ============================================================
+echo ""
+echo -e "${GREEN}[1/6] 检查 K8s 集群...${NC}"
+
+if ! command -v kubectl &> /dev/null; then
+    echo -e "${RED}Error: kubectl not found${NC}"
+    echo "请安装 kubectl: https://kubernetes.io/docs/tasks/tools/"
+    exit 1
+fi
+
+if ! kubectl cluster-info &> /dev/null; then
+    echo -e "${RED}Error: 无法连接到 K8s 集群${NC}"
+    echo ""
+    echo -e "${YELLOW}请先部署 K3s 集群 (中国镜像):${NC}"
+    echo ""
+    echo "  curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -"
+    echo ""
+    echo "  # 安装完成后, 配置 kubectl:"
+    echo "  mkdir -p ~/.kube"
+    echo "  sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config"
+    echo "  chmod 600 ~/.kube/config"
+    echo ""
+    echo "  # 重新运行此脚本"
+    exit 1
+fi
+
+echo -e "${GREEN}✅ K8s 集群连接正常${NC}"
+kubectl get nodes
+
+# ============================================================
+# 步骤 1.5: 检查/安装 open-iscsi (Longhorn 依赖)
+# ============================================================
+echo ""
+echo -e "${GREEN}[1.5/6] 检查 open-iscsi 依赖...${NC}"
+
+install_open_iscsi() {
+    echo -e "${YELLOW}正在检测操作系统...${NC}"
+
+    # 检测操作系统类型
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID="$ID"
+        OS_VERSION="$VERSION_ID"
+    else
+        OS_ID="unknown"
+    fi
+
+    echo -e "${YELLOW}检测到操作系统: $OS_ID${NC}"
+
+    case "$OS_ID" in
+        ubuntu|debian)
+            echo -e "${YELLOW}安装 open-iscsi...${NC}"
+            apt-get update -qq
+            apt-get install -y -qq open-iscsi > /dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux)
+            echo -e "${YELLOW}安装 iscsi-initiator-utils...${NC}"
+            yum install -y -q iscsi-initiator-utils > /dev/null 2>&1
+            ;;
+        sles|opensuse-leap|opensuse-tumbleweed)
+            echo -e "${YELLOW}安装 open-iscsi...${NC}"
+            zypper install -y -q open-iscsi > /dev/null 2>&1
+            ;;
+        *)
+            echo -e "${RED}不支持的操作系统: $OS_ID${NC}"
+            echo -e "${YELLOW}请手动安装 open-iscsi 或 iscsi-initiator-utils${NC}"
+            return 1
+            ;;
+    esac
+
+    echo -e "${YELLOW}启动 iscsid 服务...${NC}"
+    systemctl enable --now iscsid 2>/dev/null || true
+    systemctl enable --now iscsid.socket 2>/dev/null || true
+
+    return 0
+}
+
+# 检查 iscsiadm 是否存在
+if command -v iscsiadm &> /dev/null; then
+    echo -e "${GREEN}✅ open-iscsi 已安装: $(iscsiadm --version 2>&1 | head -1)${NC}"
+else
+    echo -e "${YELLOW}⚠️  open-iscsi 未安装${NC}"
+    echo -e "${YELLOW}Longhorn 需要 open-iscsi 来提供 iSCSI 存储${NC}"
+
+    # 尝试自动安装
+    if [ "$EUID" -eq 0 ]; then
+        install_open_iscsi
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ open-iscsi 安装成功${NC}"
+        fi
+    else
+        echo -e "${YELLOW}请使用 sudo 运行此脚本，或手动安装:${NC}"
+        echo -e "  ${CYAN}Ubuntu/Debian: sudo apt install open-iscsi${NC}"
+        echo -e "  ${CYAN}CentOS/RHEL:   sudo yum install iscsi-initiator-utils${NC}"
+        echo -e "  ${CYAN}SUSE:          sudo zypper install open-iscsi${NC}"
+        echo ""
+        echo -e "${YELLOW}安装完成后，重新运行此脚本${NC}"
+        exit 1
+    fi
+fi
+
+# 验证 iscsiadm 可用
+if ! command -v iscsiadm &> /dev/null; then
+    echo -e "${RED}❌ open-iscsi 安装失败${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✅ open-iscsi 检查完成${NC}"
+
+# ============================================================
+# 步骤 2: 部署 Longhorn 存储
+# ============================================================
+echo ""
+echo -e "${GREEN}[2/6] 检查/部署 Longhorn 存储...${NC}"
+
+if kubectl get sc longhorn &> /dev/null; then
+    echo -e "${GREEN}✅ Longhorn 已安装${NC}"
+else
+    echo -e "${YELLOW}Longhorn 未安装，正在部署...${NC}"
+    kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/master/deploy/longhorn.yaml
+    echo -e "${GREEN}⏳ 等待 Longhorn 就绪...${NC}"
+
+    # 等待 Longhorn Manager 就绪
+    kubectl wait --for=condition=ready pod -l app=longhorn-manager \
+        -n longhorn-system --timeout=300s 2>/dev/null || true
+
+    # 等待 Longhorn UI 就绪
+    kubectl wait --for=condition=ready pod -l app=longhorn-ui \
+        -n longhorn-system --timeout=300s 2>/dev/null || true
+
+    echo -e "${GREEN}✅ Longhorn 部署完成${NC}"
+fi
+
+kubectl get sc | grep longhorn || echo -e "${YELLOW}Warning: Longhorn StorageClass 未就绪${NC}"
+
+# ============================================================
+# 步骤 3: 部署 JuiceFS CSI
+# ============================================================
+echo ""
+echo -e "${GREEN}[3/6] 检查/部署 JuiceFS CSI Driver...${NC}"
+
+if kubectl get ds juicefs-csi-driver-node -n kube-system &> /dev/null || kubectl get ds juicefs-csi-node -n kube-system &> /dev/null; then
+    echo -e "${GREEN}✅ JuiceFS CSI Driver 已安装${NC}"
+    ensure_juicefs_ce_image
+else
+    echo -e "${YELLOW}JuiceFS CSI Driver 未安装，正在部署...${NC}"
+
+    if ! command -v helm &> /dev/null; then
+        echo -e "${YELLOW}Helm 未安装，跳过 JuiceFS CSI 部署${NC}"
+        echo "请手动安装: helm repo add juicedata https://juicedata.github.io/charts"
+    else
+        helm repo add juicedata https://juicedata.github.io/charts 2>/dev/null || true
+        helm repo update
+        helm install juicefs-csi-driver juicedata/juicefs-csi-driver \
+            --namespace kube-system \
+            --set webhook.enabled=false
+
+        echo -e "${GREEN}⏳ 等待 JuiceFS CSI Driver 就绪...${NC}"
+        kubectl wait --for=condition=ready pod -l app=juicefs-csi-driver-node \
+            -n kube-system --timeout=120s 2>/dev/null || true
+
+        ensure_juicefs_ce_image
+        echo -e "${GREEN}✅ JuiceFS CSI Driver 部署完成${NC}"
+    fi
+fi
+
+# ============================================================
+# 步骤 4: 使用 Kustomize 部署 RCoder
+# ============================================================
+echo ""
+echo -e "${GREEN}[4/6] 部署 RCoder 到 namespace: $NAMESPACE${NC}"
+
+# 检查 kubectl kustomize 插件
+if ! kubectl kustomize --help &> /dev/null; then
+    echo -e "${RED}Error: kubectl kustomize 插件未找到 (需要 kubectl 1.14+)${NC}"
+    exit 1
+fi
+
+# 部署 (分两阶段避免 JuiceFS CSI mount 期间 postgresql 未就绪导致 60s retry 噪音)
+echo -e "${YELLOW}阶段 1/2: 先部署存储层 + RBAC + Secret...${NC}"
+kubectl apply -k "$KUSTOMIZE_DIR"
+
+echo -e "${YELLOW}等待 PostgreSQL 就绪 (JuiceFS CSI 依赖)...${NC}"
+kubectl wait --for=condition=ready pod -l app=postgresql -n "$NAMESPACE" --timeout=180s 2>&1 || {
+    echo -e "${RED}❌ PostgreSQL 未在 180s 内就绪${NC}"
+    kubectl get pods -n "$NAMESPACE"
+    exit 1
+}
+
+echo -e "${YELLOW}等待 MinIO 就绪...${NC}"
+kubectl wait --for=condition=ready pod -l app=minio -n "$NAMESPACE" --timeout=180s 2>&1 || {
+    echo -e "${RED}❌ MinIO 未在 180s 内就绪${NC}"
+    exit 1
+}
+
+# 如果 rcoder pod 已经创建但还卡在 mount retry，删掉让它重建 (clean mount)
+RCODER_POD_READY=$(kubectl get pod -n "$NAMESPACE" -l app=rcoder -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -c True)
+if [ "${RCODER_POD_READY:-0}" -eq 0 ]; then
+    echo -e "${YELLOW}阶段 2/2: 重建 rcoder pod 以触发干净 mount...${NC}"
+    kubectl delete pod -n "$NAMESPACE" -l app=rcoder --ignore-not-found --wait=false
+fi
+
+echo -e "${YELLOW}等待 rcoder Deployment 就绪...${NC}"
+kubectl rollout status deploy/rcoder -n "$NAMESPACE" --timeout=180s
+
+check_cluster_dns
+
+echo -e "${GREEN}✅ RCoder 部署完成${NC}"
+
+# ============================================================
+# 步骤 5: 验证部署
+# ============================================================
+echo ""
+echo -e "${GREEN}[5/6] 验证部署状态...${NC}"
+
+echo ""
+echo "--- Pods ---"
+kubectl get pods -n "$NAMESPACE"
+
+echo ""
+echo "--- Services ---"
+kubectl get svc -n "$NAMESPACE"
+
+echo ""
+echo "--- StorageClass ---"
+kubectl get sc | grep -E "longhorn|juicefs"
+
+echo ""
+echo "--- PVC ---"
+kubectl get pvc -n "$NAMESPACE"
+
+# 获取访问信息
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "localhost")
+SVC_TYPE=$(kubectl get svc rcoder -n "$NAMESPACE" -o jsonpath='{.spec.type}' 2>/dev/null)
+
+echo ""
+echo -e "${GREEN}=========================================="
+echo "  部署完成!"
+echo "==========================================${NC}"
+echo ""
+echo -e "访问方式:"
+
+if [ "$SVC_TYPE" = "NodePort" ]; then
+    NODE_PORT=$(kubectl get svc rcoder -n "$NAMESPACE" -o jsonpath='{.spec.ports[0].nodePort}')
+    echo -e "  ${GREEN}http://${NODE_IP}:${NODE_PORT}/health${NC}"
+    echo -e "  ${GREEN}http://${NODE_IP}:${NODE_PORT}/chat${NC}"
+elif [ "$SVC_TYPE" = "LoadBalancer" ]; then
+    EXT_IP=$(kubectl get svc rcoder -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "<pending>")
+    echo -e "  ${GREEN}http://${EXT_IP}:8087/health${NC}"
+else
+    echo -e "  ${GREEN}kubectl port-forward svc/rcoder 8087:8087 -n $NAMESPACE${NC}"
+    echo -e "  然后访问: ${GREEN}http://localhost:8087/health${NC}"
+fi
+
+echo ""
+echo -e "Kustomize 管理命令:"
+echo -e "  ${YELLOW}kubectl apply -k $KUSTOMIZE_DIR${NC}      # 部署/更新"
+echo -e "  ${YELLOW}kubectl delete -k $KUSTOMIZE_DIR${NC}      # 删除"
+echo -e "  ${YELLOW}kubectl get all -n $NAMESPACE${NC}          # 查看状态"
+echo ""
+echo -e "Longhorn 控制台:"
+echo -e "  ${YELLOW}kubectl port-forward svc/longhorn-frontend 8080:80 -n longhorn-system${NC}"
+echo -e "  访问: ${GREEN}http://localhost:8080${NC}"
+echo ""

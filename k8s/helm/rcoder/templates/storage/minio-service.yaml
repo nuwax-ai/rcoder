@@ -1,0 +1,41 @@
+---
+# Headless Service for StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: minio
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: {{ .Values.minio.service.apiPort }}
+      targetPort: {{ .Values.minio.service.apiPort }}
+    - name: console
+      port: {{ .Values.minio.service.consolePort }}
+      targetPort: {{ .Values.minio.service.consolePort }}
+---
+# ClusterIP Service for internal access
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: minio
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: {{ .Values.minio.service.apiPort }}
+      targetPort: {{ .Values.minio.service.apiPort }}
+    - name: console
+      port: {{ .Values.minio.service.consolePort }}
+      targetPort: {{ .Values.minio.service.consolePort }}

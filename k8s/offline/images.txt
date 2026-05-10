@@ -1,0 +1,52 @@
+# ============================================================================
+# 离线部署镜像清单 —— 所有 make k8s-offline-bundle 会拉取 + 打包的镜像
+#
+# 格式: 一行一个 <repo>:<tag>; # 开头为注释, 空行忽略
+# 原则: 版本必须 pin, 避免离线包随时间漂移
+#
+# 升级 Longhorn / JuiceFS CSI 时, 同步更新本文件 + longhorn-$VERSION.yaml
+# ============================================================================
+
+# ==== RCoder 自有镜像 ====
+nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest
+nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest
+
+# ==== 存储层 ====
+postgres:16-alpine
+minio/minio:RELEASE.2024-12-18T13-15-44Z
+minio/mc:RELEASE.2024-11-21T17-21-54Z
+busybox:1.36
+
+# ==== JuiceFS CE Mount ====
+juicedata/mount:ce-v1.3.1
+
+# ==== JuiceFS CSI Driver v0.31.3 (通过官方 deploy/k8s.yaml 安装) ====
+# 清单来源: curl https://raw.githubusercontent.com/juicedata/juicefs-csi-driver/v0.31.3/deploy/k8s.yaml | grep image:
+juicedata/juicefs-csi-driver:v0.31.3
+juicedata/csi-dashboard:v0.31.3
+
+# ==== JuiceFS CSI sidecars (版本由 juicefs-csi k8s.yaml 决定) ====
+registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.0
+registry.k8s.io/sig-storage/csi-provisioner:v3.6.0
+registry.k8s.io/sig-storage/csi-resizer:v1.9.0
+registry.k8s.io/sig-storage/livenessprobe:v2.11.0
+
+# ==== Longhorn v1.7.2 核心组件 ====
+# 清单来源: curl https://raw.githubusercontent.com/longhorn/longhorn/v1.7.2/deploy/longhorn-images.txt
+# 升级时必须重新拉取 longhorn-images.txt 并同步 tag
+longhornio/longhorn-manager:v1.7.2
+longhornio/longhorn-engine:v1.7.2
+longhornio/longhorn-ui:v1.7.2
+longhornio/longhorn-instance-manager:v1.7.2
+longhornio/longhorn-share-manager:v1.7.2
+longhornio/backing-image-manager:v1.7.2
+longhornio/longhorn-cli:v1.7.2
+longhornio/support-bundle-kit:v0.0.45
+
+# ==== Longhorn CSI sidecars (独立于 Longhorn 主镜像, 版本随 Longhorn 升级变化) ====
+longhornio/csi-attacher:v4.7.0
+longhornio/csi-provisioner:v4.0.1-20241007
+longhornio/csi-resizer:v1.12.0
+longhornio/csi-snapshotter:v7.0.2-20241007
+longhornio/csi-node-driver-registrar:v2.12.0
+longhornio/livenessprobe:v2.14.0

@@ -1,0 +1,15 @@
+# 集群级 ClusterRoleBinding —— 每个 release 独立, 解决同集群多 release 冲突
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "rcoder.clusterRoleBindingName" . }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: rcoder-pods-sa
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "rcoder.clusterRoleName" . }}
+  apiGroup: rbac.authorization.k8s.io

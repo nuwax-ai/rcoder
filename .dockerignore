@@ -41,6 +41,7 @@ README.md
 
 # 测试数据
 fixtures/
+dist
 
 # 临时文件
 *.tmp

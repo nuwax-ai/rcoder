@@ -1,0 +1,32 @@
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy]
+registry = "https://rsproxy.cn/crates.io-index"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[source.aliyun]
+registry = "https://mirrors.aliyun.com/crates.io-index"
+
+[source.aliyun-sparse]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+
+[source.tencent]
+registry = "https://mirrors.cloud.tencent.com/crates.io-index"
+
+[source.tencent-sparse]
+registry = "sparse+https://mirrors.cloud.tencent.com/crates.io-index/"
+
+[source.ustc]
+registry = "https://mirrors.ustc.edu.cn/crates.io-index"
+
+[source.ustc-sparse]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[registries.rsproxy]
+index = "https://rsproxy.cn/crates.io-index"
+
+[net]
+git-fetch-with-cli = true

@@ -309,14 +309,14 @@ impl ContainerStatusChecker {
         }
     }
 
-    /// 检查 Docker 容器是否存在
+    /// 检查 runtime 容器是否存在
     async fn check_container_exists(
         &self,
         container_info: &Arc<shared_types::ProjectAndContainerInfo>,
         grpc_addr: &str,
     ) -> bool {
-        match docker_manager::global::get_global_docker_manager().await {
-            Ok(docker_manager) => {
+        match docker_manager::runtime::RuntimeManager::get().await {
+            Ok(runtime) => {
                 let service_type = container_info
                     .service_type()
                     .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
@@ -328,10 +328,7 @@ impl ContainerStatusChecker {
                     shared_types::ServiceType::ComputerAgentRunner => {
                         // ComputerAgentRunner 模式：使用 user_id 查找容器
                         if let Some(user_id) = container_info.user_id() {
-                            match docker_manager
-                                .find_user_container(user_id, &service_type)
-                                .await
-                            {
+                            match runtime.find_container(user_id, &service_type).await {
                                 Ok(Some(_)) => true,
                                 Ok(None) => false,
                                 Err(e) => {
@@ -346,8 +343,8 @@ impl ContainerStatusChecker {
                     }
                     shared_types::ServiceType::RCoder => {
                         // RCoder 模式：使用 project_id 查找容器
-                        match docker_manager
-                            .find_project_container(container_info.project_id(), &service_type)
+                        match runtime
+                            .find_container(container_info.project_id(), &service_type)
                             .await
                         {
                             Ok(Some(_)) => true,
@@ -362,12 +359,12 @@ impl ContainerStatusChecker {
 
                 if exists {
                     debug!(
-                        "🔍 [STATUS_CHECKER] Docker container exists, likely network issue: {} (service_type={:?})",
+                        "🔍 [STATUS_CHECKER] Runtime container exists, likely network issue: {} (service_type={:?})",
                         grpc_addr, service_type
                     );
                 } else {
                     info!(
-                        "🔍 [STATUS_CHECKER] Docker container does not exist (already destroyed): {} (service_type={:?})",
+                        "🔍 [STATUS_CHECKER] Runtime container does not exist (already destroyed): {} (service_type={:?})",
                         grpc_addr, service_type
                     );
                 }
@@ -375,7 +372,7 @@ impl ContainerStatusChecker {
                 exists
             }
             Err(e) => {
-                warn!("[STATUS_CHECKER] get Docker Manager failed: {}", e);
+                warn!("[STATUS_CHECKER] get runtime failed: {}", e);
                 // 无法确定容器状态，保守地认为容器存在
                 true
             }

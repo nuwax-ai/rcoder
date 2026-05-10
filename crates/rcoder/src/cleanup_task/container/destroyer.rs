@@ -1,6 +1,6 @@
 //! 容器销毁器
 //!
-//! 销毁容器并清理相关资源（gRPC 连接池、Pingora VNC 后端、容器 IP 缓存）
+//! 销毁容器并清理相关资源（gRPC 连接池、Pingora VNC 后端）
 
 use anyhow::Result;
 use shared_types::ServiceType;
@@ -14,8 +14,6 @@ pub struct ContainerDestroyer {
     pub docker_manager: Arc<docker_manager::DockerManager>,
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
-    /// 容器 IP 缓存（用于销毁时失效）
-    pub container_ip_cache: Option<Arc<crate::grpc::ContainerIpCache>>,
 }
 
 impl ContainerDestroyer {
@@ -28,14 +26,7 @@ impl ContainerDestroyer {
             docker_manager,
             grpc_pool,
             pingora_service,
-            container_ip_cache: None,
         }
-    }
-
-    /// 设置容器 IP 缓存引用
-    pub fn with_ip_cache(mut self, cache: Arc<crate::grpc::ContainerIpCache>) -> Self {
-        self.container_ip_cache = Some(cache);
-        self
     }
 
     /// 销毁容器并清理相关资源（带原因）
@@ -65,17 +56,17 @@ impl ContainerDestroyer {
 
         // 1. 🔍 通过容器名称实时查询最新的容器信息
         // 这样可以获取最新的 container_id，避免使用缓存中过期的 ID
-        let actual_container_id = match self
+        let (actual_container_id, container_ip) = match self
             .docker_manager
             .find_container_realtime(container_name)
             .await
         {
             Ok(Some(result)) => {
                 debug!(
-                    "✅ [destroyer] Found container: name={}, id={}",
-                    container_name, result.container_id
+                    "✅ [destroyer] Found container: name={}, id={}, ip={}",
+                    container_name, result.container_id, result.container_ip
                 );
-                result.container_id
+                (result.container_id, result.container_ip)
             }
             Ok(None) => {
                 // 容器不存在，可能已经被删除了，这不是错误
@@ -113,20 +104,21 @@ impl ContainerDestroyer {
             container_identifier
         );
 
-        // 4. 对于 ComputerAgentRunner，清理 Pingora VNC 后端
+        // 4. 清理关联资源
+        // 清理 gRPC 连接池中的旧连接（避免复用已失效的 TCP 连接）
+        if !container_ip.is_empty() {
+            let old_grpc_addr = format!(
+                "{}:{}",
+                container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            );
+            self.grpc_pool.remove(&old_grpc_addr);
+        }
+
         if *service_type == ServiceType::ComputerAgentRunner {
+            // 清理 Pingora VNC 后端
             if let Some(ref pingora_service) = self.pingora_service {
                 let _: Option<String> = pingora_service.remove_vnc_backend(container_identifier);
-            }
-
-            // 🆕 使容器 IP 缓存失效
-            if let Some(ref cache) = self.container_ip_cache {
-                cache.invalidate(container_name);
-            }
-        } else {
-            // RCoder 模式：使容器 IP 缓存失效
-            if let Some(ref cache) = self.container_ip_cache {
-                cache.invalidate(container_name);
             }
         }
 

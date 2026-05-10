@@ -1,0 +1,70 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rcoder-network-policy
+  namespace: nuwax-rcoder
+spec:
+  podSelector:
+    matchLabels:
+      app: rcoder
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # 允许来自同 namespace 的流量
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8087
+    - protocol: TCP
+      port: 8088
+  egress:
+  # DNS 解析
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  # K8s API Server
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          kubernetes.io/service-name: kubernetes
+    ports:
+    - protocol: TCP
+      port: 443
+  # PostgreSQL 访问
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgresql
+    ports:
+    - protocol: TCP
+      port: 5432
+  # MinIO 访问
+  - to:
+    - podSelector:
+        matchLabels:
+          app: minio
+    ports:
+    - protocol: TCP
+      port: 9000
+    - protocol: TCP
+      port: 9001
+  # Agent Pod gRPC 访问 (rcoder -> agent 通信)
+  # 用 managed-by: rcoder-runtime 标签同时匹配两类动态创建的 pod：
+  #   - service_type=rcoder (legacy /chat 创建的 rcoder-agent pod)
+  #   - service_type=computer-agent-runner (/computer/chat 创建的 computer-agent-runner pod)
+  - to:
+    - podSelector:
+        matchLabels:
+          managed-by: rcoder-runtime
+    ports:
+    - protocol: TCP
+      port: 50051
+    - protocol: TCP
+      port: 8086

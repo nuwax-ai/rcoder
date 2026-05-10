@@ -115,6 +115,7 @@ pub struct CleanupContext {
 pub struct ProjectInfo {
     pub project_id: String,
     pub user_id: Option<String>,
+    pub pod_id: Option<String>,
     pub last_activity: DateTime<Utc>,
 }
 

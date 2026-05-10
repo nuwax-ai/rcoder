@@ -86,12 +86,15 @@ impl CleanupStrategy for ComputerRunnerStrategy {
 
 /// 判断项目是否活跃
 ///
-/// 根据 active_window 判断项目是否在活跃时间窗口内
+/// 使用 idle_timeout 作为判断标准：如果项目的闲置时间小于 idle_timeout，
+/// 则认为项目仍然活跃，不应销毁其关联的容器。
+/// 这与 scanner 的 idle 判断标准一致，避免出现 scanner 认为项目未超时
+/// 但策略却认为项目不活跃的矛盾情况。
 pub fn is_project_active(
     project: &ProjectRecord,
     config: &crate::cleanup_task::config::CleanupConfig,
 ) -> bool {
     let now = Utc::now();
     let idle_duration = now - project.last_activity;
-    idle_duration.num_seconds() < config.active_window.as_secs() as i64
+    idle_duration.num_seconds() < config.idle_timeout.as_secs() as i64
 }

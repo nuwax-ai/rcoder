@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sacp::schema::{Error, SessionUpdate, StopReason};
+use agent_client_protocol::schema::{Error, SessionUpdate, StopReason};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -247,7 +247,7 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sacp::schema::ContentChunk;
+    use agent_client_protocol::schema::ContentChunk;
 
     #[test]
     fn test_session_prompt_start_to_unified() {

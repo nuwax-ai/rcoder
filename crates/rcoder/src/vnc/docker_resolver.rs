@@ -1,7 +1,7 @@
-//! 基于 DockerManager 的 VNC 后端解析器
+//! 基于 Runtime 的 VNC 后端解析器
 //!
-//! 通过 docker_manager 的全局实例动态查询容器 IP，
-//! 支持带 TTL 缓存以减少 Docker API 调用。
+//! 通过 runtime 的全局实例动态查询容器 IP，
+//! 支持带 TTL 缓存以减少运行时 API 调用。
 //!
 //! ## 设计说明
 //!
@@ -69,18 +69,18 @@ impl CachedDockerResolver {
         Self { cache }
     }
 
-    /// 直接从 DockerManager 查询容器信息（不走缓存）
-    async fn query_docker(&self, user_id: &str) -> Result<VncBackendInfo, VncResolveError> {
-        let docker_manager = docker_manager::global::get_global_docker_manager()
+    /// 直接从 runtime 查询容器信息（不走缓存）
+    async fn query_runtime(&self, user_id: &str) -> Result<VncBackendInfo, VncResolveError> {
+        let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
-                warn!("[VNC_RESOLVER] Failed to get DockerManager: {}", e);
-                VncResolveError::QueryFailed(format!("Failed to get DockerManager: {}", e))
+                warn!("[VNC_RESOLVER] Failed to get runtime: {}", e);
+                VncResolveError::QueryFailed(format!("Failed to get runtime: {}", e))
             })?;
 
         // ComputerAgentRunner 模式：使用 user_id 作为容器标识
-        let container_info = docker_manager
-            .get_user_container_info(user_id)
+        let container_info = runtime
+            .get_container_info_by_identifier(user_id, &shared_types::ServiceType::ComputerAgentRunner)
             .await
             .map_err(|e| {
                 warn!(
@@ -130,12 +130,12 @@ impl VncBackendResolver for CachedDockerResolver {
             return Ok(cached);
         }
 
-        // 缓存未命中，查询 Docker
+        // 缓存未命中，查询 runtime
         debug!(
-            "🔍 [VNC_RESOLVER] Cache miss, querying Docker: user_id={}",
+            "🔍 [VNC_RESOLVER] Cache miss, querying runtime: user_id={}",
             user_id
         );
-        let info = self.query_docker(user_id).await?;
+        let info = self.query_runtime(user_id).await?;
 
         // 写入缓存
         self.cache.insert(user_id.to_string(), info.clone()).await;

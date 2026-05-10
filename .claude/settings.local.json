@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.specify/scripts/bash/setup-plan.sh --help)",
+      "Bash(.specify/scripts/bash/setup-plan.sh)",
+      "Bash(.specify/scripts/bash/setup-plan.sh --json)",
+      "Bash(git add *)",
+      "Bash(mkdir -p ~/.kube)",
+      "Bash(sudo cp *)",
+      "Bash(sudo chmod *)",
+      "Bash(echo 'export KUBECONFIG=~/.kube/config')",
+      "Bash(cargo metadata *)"
+    ]
+  }
+}

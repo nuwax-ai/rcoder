@@ -1,0 +1,70 @@
+# ConfigMap: 渲染 config.yml —— 保持与 k8s/manifests/overlays 下 rcoder-configmap.yaml 结构对齐
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rcoder-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+data:
+  config.yml: |
+    default_agent: {{ .Values.config.defaultAgent | quote }}
+
+    projects_dir: {{ .Values.config.projectsDir | quote }}
+    port: {{ .Values.config.port }}
+
+    cleanup_config:
+      enabled: {{ .Values.config.cleanup.enabled }}
+      idle_timeout_seconds: {{ .Values.config.cleanup.idleTimeoutSeconds }}
+      cleanup_interval_seconds: {{ .Values.config.cleanup.cleanupIntervalSeconds }}
+      docker_stop_timeout_seconds: {{ .Values.config.cleanup.dockerStopTimeoutSeconds }}
+
+    proxy_config:
+      listen_port: {{ .Values.config.proxy.listenPort }}
+      default_backend_port: {{ .Values.config.proxy.defaultBackendPort }}
+      backend_host: {{ .Values.config.proxy.backendHost | quote }}
+      port_param: {{ .Values.config.proxy.portParam | quote }}
+      health_check:
+        enabled: {{ .Values.config.proxy.healthCheck.enabled }}
+        interval_seconds: {{ .Values.config.proxy.healthCheck.intervalSeconds }}
+        timeout_seconds: {{ .Values.config.proxy.healthCheck.timeoutSeconds }}
+        healthy_threshold: {{ .Values.config.proxy.healthCheck.healthyThreshold }}
+        unhealthy_threshold: {{ .Values.config.proxy.healthCheck.unhealthyThreshold }}
+
+    docker_config:
+      multi_image_config:
+        global_defaults:
+          registry_prefix: {{ include "rcoder.registryPrefix" . | quote }}
+        services:
+          rcoder:
+            service_type: "RCoder"
+            arm64_image: {{ include "rcoder.image" . | quote }}
+            amd64_image: {{ include "rcoder.image" . | quote }}
+            default_image: {{ include "rcoder.image" . | quote }}
+            image_tag_prefix: "rcoder"
+            enabled: true
+          computer-agent-runner:
+            service_type: "ComputerAgentRunner"
+            arm64_image: {{ include "rcoder.agentRunnerImage" . | quote }}
+            amd64_image: {{ include "rcoder.agentRunnerImage" . | quote }}
+            default_image: {{ include "rcoder.agentRunnerImage" . | quote }}
+            image_tag_prefix: "rcoder-computer-agent-runner"
+            enabled: true
+        selection_strategy: "ServiceOnly"
+        cache_config:
+          enabled: {{ .Values.config.dockerConfig.cache.enabled }}
+          ttl_seconds: {{ .Values.config.dockerConfig.cache.ttlSeconds }}
+          max_entries: {{ .Values.config.dockerConfig.cache.maxEntries }}
+
+      network_base_name: {{ .Values.config.dockerConfig.networkBaseName | quote }}
+      network_mode: {{ .Values.config.dockerConfig.networkMode | quote }}
+      work_dir: {{ .Values.config.dockerConfig.workDir | quote }}
+      auto_cleanup: {{ .Values.config.dockerConfig.autoCleanup }}
+      container_ttl_seconds: {{ .Values.config.dockerConfig.containerTtlSeconds }}
+
+    api_key_auth:
+      enabled: {{ .Values.config.apiKeyAuth.enabled }}
+      api_key: {{ .Values.config.apiKeyAuth.apiKey | quote }}
+
+    kubernetes_config:
+      storage_class: {{ include "rcoder.storageClassName" . | quote }}

@@ -60,7 +60,7 @@ docker_config:
     # 全局默认配置
     global_defaults:
       # 默认镜像仓库前缀
-      registry_prefix: "registry.yichamao.com"
+      registry_prefix: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev"
       # 其他默认镜像配置（可选）
       # image: "custom/default-image:latest"
       # arm64_image: "custom/default-image:arm64"
@@ -73,10 +73,10 @@ docker_config:
       rcoder:
         service_type: "RCoder"
         # 镜像配置（使用架构特定镜像）
-        # image: "registry.yichamao.com/rcoder:latest"  # 通用镜像
-        arm64_image: "registry.yichamao.com/rcoder:latest-arm64"
-        amd64_image: "registry.yichamao.com/rcoder:latest-amd64"
-        default_image: "registry.yichamao.com/rcoder:latest"
+        # image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/rcoder:latest"  # 通用镜像,"nuwax"是生产环境镜像, "nuwax-test"和"dev"都是测试镜像,默认生产环境镜像
+        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/rcoder:latest"
+        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/rcoder:latest"
+        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/rcoder:latest"
         image_tag_prefix: "rcoder"
         enabled: true
 
@@ -125,9 +125,9 @@ docker_config:
       computer-agent-runner:
         service_type: "ComputerAgentRunner"
         # 镜像配置（使用架构特定镜像）
-        arm64_image: "registry.yichamao.com/rcoder-computer-agent-runner:latest-arm64"
-        amd64_image: "registry.yichamao.com/rcoder-computer-agent-runner:latest-amd64"
-        default_image: "registry.yichamao.com/rcoder-computer-agent-runner:latest"
+        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
         image_tag_prefix: "rcoder-computer-agent-runner"
         enabled: true
 
@@ -222,6 +222,14 @@ docker_config:
   #   - 平衡模式: 15-30（默认）
   #   - 实时要求高: 10-15
   cache_network_ttl_seconds: 15
+
+  # 🔧 缓存最大容量
+  # 用于 DockerApiCache 的 status_cache 和 network_cache 的最大条目数
+  # 建议值：
+  #   - 小型环境: 1000-5000
+  #   - 中型环境: 5000-10000（默认）
+  #   - 大型环境: 10000-50000
+  cache_max_capacity: 10000
 
 # API Key 鉴权配置（可选）
 api_key_auth:

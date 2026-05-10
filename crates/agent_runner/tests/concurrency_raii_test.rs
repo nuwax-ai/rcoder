@@ -15,7 +15,7 @@ use tokio::sync::Barrier;
 use agent_runner::agent_runtime::{get_concurrency_limit, init_concurrency_limit};
 use agent_runner::service::AgentSessionRegistry;
 use agent_runner::service::PendingGuard;
-use sacp::schema::SessionId;
+use agent_client_protocol::schema::SessionId;
 use shared_types::{AgentStatus, ProjectAndAgentInfo, SessionEntry};
 use tokio::sync::mpsc;
 

@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sacp::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::{CancelNotification, SessionId};
 use shared_types::ModelProviderConfig;
 use shared_types::grpc::{
     CancelRequest, CancelResponse, CancelResultType, ChatAgentConfig as GrpcChatAgentConfig,
@@ -298,14 +298,31 @@ impl AgentService for AgentServiceImpl {
             .unwrap_or(shared_types::ServiceType::RCoder);
 
         // 2.1 根据 service_type 计算项目目录（服务端容器内路径）
+        // Docker 挂载：宿主机 /computer-project-workspace/{user_id} → 容器 /home/user
+        // Agent 工作目录：/home/user/{project_id}
         let project_dir = match service_type {
             shared_types::ServiceType::ComputerAgentRunner => {
-                // ComputerAgentRunner 模式：/home/user/{project_id}
+                // Agent 工作目录：/home/user/{project_id}
+                // /home/user 已经通过挂载映射到宿主机 /computer-project-workspace/{user_id}
                 std::path::PathBuf::from("/home/user").join(&project_id)
             }
             shared_types::ServiceType::RCoder => {
-                // RCoder 模式：./project_workspace/{project_id}
-                std::path::PathBuf::from("./project_workspace").join(&project_id)
+                // RCoder 模式：检查是否有多租户隔离环境变量
+                // 有 TENANT_ID + SPACE_ID: ./project_workspace/{tenant_id}/{space_id}/{project_id}
+                // 否则: ./project_workspace/{project_id}
+                let tenant_id = std::env::var("TENANT_ID").ok();
+                let space_id = std::env::var("SPACE_ID").ok();
+                match (tenant_id, space_id) {
+                    (Some(tid), Some(sid)) => {
+                        std::path::PathBuf::from("./project_workspace")
+                            .join(&tid)
+                            .join(&sid)
+                            .join(&project_id)
+                    }
+                    _ => {
+                        std::path::PathBuf::from("./project_workspace").join(&project_id)
+                    }
+                }
             }
         };
 
@@ -324,7 +341,7 @@ impl AgentService for AgentServiceImpl {
             agent_config_override: req.agent_config.map(convert_agent_config),
             system_prompt_override: req.system_prompt,
             user_prompt_template_override: req.user_prompt,
-            skip_slot_limit: false, // gRPC 请求（Docker 容器部署），继续限制槽位
+            skip_slot_limit: true, // 去掉并发限制
         };
 
         // 4. 构建 ChatHandlerContext
@@ -414,7 +431,7 @@ impl AgentService for AgentServiceImpl {
                                 info!("📡 [gRPC] Session connection cancelled, sending SessionPromptEnd: session_id={}", session_id_clone);
 
                                 // ✅ 在断开连接之前，主动发送 SessionPromptEnd 消息
-                                use sacp::schema::StopReason;
+                                use agent_client_protocol::schema::StopReason;
                                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -792,7 +809,7 @@ impl AgentService for AgentServiceImpl {
 
                 // 通道关闭说明 Agent 处理线程已崩溃或退出，发送 SessionPromptEnd
                 use crate::service::push_session_update_with_project;
-                use sacp::schema::StopReason;
+                use agent_client_protocol::schema::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -842,7 +859,7 @@ impl AgentService for AgentServiceImpl {
 
                 // 🆕 超时时主动清理资源，确保一致性
                 use crate::service::push_session_update_with_project;
-                use sacp::schema::StopReason;
+                use agent_client_protocol::schema::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 // 1. 发送 SessionPromptEnd 通知
@@ -919,7 +936,7 @@ impl AgentService for AgentServiceImpl {
         // 取消成功后的统一清理逻辑
         // 主动发送 SessionPromptEnd 通知 SSE 客户端任务已取消
         use crate::service::push_session_update_with_project;
-        use sacp::schema::StopReason;
+        use agent_client_protocol::schema::StopReason;
         use shared_types::{SessionNotify, SessionPromptEnd};
 
             let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -1126,7 +1143,7 @@ impl AgentService for AgentServiceImpl {
             // 🆕 即使已在停止中，也要发送 SessionPromptEnd 确保前端收到结束消息
             if !session_id.is_empty() {
                 use crate::service::push_session_update_with_project;
-                use sacp::schema::StopReason;
+                use agent_client_protocol::schema::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -1184,7 +1201,7 @@ impl AgentService for AgentServiceImpl {
             // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端 Agent 已停止
             if !session_id.is_empty() {
                 use crate::service::push_session_update_with_project;
-                use sacp::schema::StopReason;
+                use agent_client_protocol::schema::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -1382,7 +1399,7 @@ impl AgentService for AgentServiceImpl {
                         // 🆕 主动发送 SessionPromptEnd 消息通知 SSE 客户端 Agent 已停止
                         {
                             use crate::service::push_session_update_with_project;
-                            use sacp::schema::StopReason;
+                            use agent_client_protocol::schema::StopReason;
                             use shared_types::{SessionNotify, SessionPromptEnd};
 
                             let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
@@ -1533,7 +1550,7 @@ impl AgentService for AgentServiceImpl {
                     // 通道关闭说明 Agent 处理线程已崩溃或退出，发送 SessionPromptEnd
                     {
                         use crate::service::push_session_update_with_project;
-                        use sacp::schema::StopReason;
+                        use agent_client_protocol::schema::StopReason;
                         use shared_types::{SessionNotify, SessionPromptEnd};
 
                         let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {

@@ -36,6 +36,21 @@ pub struct DockerContainerConfig {
     pub entrypoint: Option<Vec<String>>,
     /// 网络名称 (可选，如果不指定则使用默认的 RCODER_NETWORK_NAME)
     pub network_name: Option<String>,
+
+    // === 新增字段 (隔离类型支持) ===
+    /// 容器唯一标识（可选），用于容器复用
+    /// 若传值，则使用此 ID 作为容器标识，优先级高于 project_id/user_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_id: Option<String>,
+    /// 租户 ID（可选），用于多租户场景下的数据隔离
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// 空间 ID（可选），用于区分租户下的不同空间
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    /// 隔离类型（可选），控制容器共享粒度：tenant/space/project
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_type: Option<String>,
 }
 
 /// 挂载点配置
@@ -102,6 +117,11 @@ impl DockerContainerConfig {
             command: None,
             entrypoint: None,
             network_name: None,
+            // 新增字段（隔离类型支持）
+            pod_id: None,
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
         }
     }
 }
@@ -141,13 +161,14 @@ impl ContainerQueryResult {
         container_name: String,
         status: ContainerStatus,
         is_running: bool,
+        container_ip: String,
     ) -> Self {
         Self {
             container_id,
             container_name,
             status,
             is_running,
-            container_ip: String::new(), // 默认为空，需要后续更新
+            container_ip,
         }
     }
 
@@ -233,6 +254,34 @@ pub struct DockerContainerInfo {
 }
 
 impl DockerContainerInfo {
+    /// 创建基础容器信息（仅必填字段，其余使用默认值）
+    pub fn new(
+        container_id: String,
+        container_name: String,
+        project_id: String,
+        image: String,
+    ) -> Self {
+        Self {
+            container_id,
+            container_name,
+            project_id,
+            user_id: None,
+            service_type: None,
+            image,
+            status: ContainerStatus::Running,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            host_path: String::new(),
+            container_path: String::new(),
+            port_bindings: std::collections::HashMap::new(),
+            assigned_port: 0,
+            health_status: None,
+            service_health: None,
+            internal_port: shared_types::GRPC_DEFAULT_PORT,
+            network_name: String::new(),
+        }
+    }
+
     /// 获取容器的业务主键
     ///
     /// 根据 `service_type` 返回正确的标识符：
@@ -370,6 +419,11 @@ pub struct DockerManagerConfig {
     /// 用于缓存容器网络信息（network_name -> ip_address）
     #[serde(default = "default_cache_network_ttl")]
     pub cache_network_ttl_seconds: u64,
+
+    /// 🔧 缓存最大容量
+    /// 用于 DockerApiCache 的 status_cache 和 network_cache
+    #[serde(default = "default_cache_max_capacity")]
+    pub cache_max_capacity: u64,
 }
 
 /// 默认 API 超时时间（10秒）
@@ -390,6 +444,11 @@ fn default_cache_status_ttl() -> u64 {
 /// 默认网络缓存 TTL（15秒）
 fn default_cache_network_ttl() -> u64 {
     15
+}
+
+/// 默认缓存最大容量（10000）
+fn default_cache_max_capacity() -> u64 {
+    10000
 }
 
 /// Docker 配置（从 rcoder 配置传递）
@@ -432,6 +491,7 @@ impl Default for DockerManagerConfig {
 
             cache_status_ttl_seconds: default_cache_status_ttl(), // 默认 10 秒
             cache_network_ttl_seconds: default_cache_network_ttl(), // 默认 15 秒
+            cache_max_capacity: default_cache_max_capacity(), // 默认 10000
         }
     }
 }
@@ -554,6 +614,7 @@ impl ContainerFilter {
                         bollard::models::ContainerSummaryStateEnum::RESTARTING => "restarting",
                         bollard::models::ContainerSummaryStateEnum::REMOVING => "removing",
                         bollard::models::ContainerSummaryStateEnum::DEAD => "dead",
+                        bollard::models::ContainerSummaryStateEnum::STOPPING => "stopping",
                         bollard::models::ContainerSummaryStateEnum::EMPTY => "unknown",
                     };
                     statuses.iter().any(|s| s.to_string() == state_str)

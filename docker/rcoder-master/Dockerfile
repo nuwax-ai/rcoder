@@ -24,6 +24,18 @@ ARG TARGETARCH
 # 设置工作目录
 WORKDIR /build
 
+# 使用 LinuxMirrors 一键配置阿里云镜像源
+# 参考: https://github.com/SuperManito/LinuxMirrors
+RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
+    --source mirrors.aliyun.com \
+    --protocol https \
+    --use-intranet-source false \
+    --install-epel false \
+    --backup false \
+    --upgrade-software false \
+    --clean-cache true \
+    --ignore-backup-tips
+
 # 安装构建依赖（包括cmake和protoc）
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -34,7 +46,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    . /root/.cargo/env && cargo --version
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # 复制整个项目源代码（通过 .dockerignore 排除不需要的文件）
@@ -76,16 +89,13 @@ RUN if [ -f /build/target/release/codex-acp-agent ]; then \
 # 设置执行权限
 RUN chmod +x /app/bin/rcoder /app/bin/agent_runner
 
+
+
 # 使用构建参数破坏缓存（每次构建都获取最新版本的工具）
 ARG CACHEBUST=1
 
-# 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
-# 使用 CACHEBUST 变量触发缓存失效
-RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest --registry=https://registry.npmjs.org/
-
-# 配置 nuwaxcode - 禁用 websearch, webfetch 和 question 权限
-RUN mkdir -p /root/.config/opencode && \
-    echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny",\n    "question": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
+# agent install
+RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 
 # # 安装 claude-code-acp-ts（从源码构建，用于测试）
 # # 使用 npm pack + npm install -g <tarball> 确保复制文件而非 symlink
@@ -99,7 +109,18 @@ RUN mkdir -p /root/.config/opencode && \
 #     (which claude-code-acp-ts > /dev/null 2>&1 && echo "✅ claude-code-acp-ts 安装验证通过") || (echo "❌ claude-code-acp-ts 未正确安装" && exit 1)
 
 
-RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
+# 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
+# 使用 CACHEBUST 变量触发缓存失效
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest
+
+# 安装 nuwax-file-server（文件服务器）
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwax-file-server@latest
+
+# 配置 nuwaxcode - 禁用 websearch, webfetch 和 question 权限
+RUN mkdir -p /root/.config/opencode && \
+    echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny",\n    "question": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
+
+
 
 # 暴露端口
 EXPOSE 8086

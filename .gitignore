@@ -2,6 +2,7 @@
 /tmp
 /temp
 /other
+/dist
 .idea
 /logs
 
@@ -18,3 +19,6 @@ docker/rcoder-agent-runner/downloads
 docker/computer-cache
 docker/computer-project-workspace
 docker/logs
+
+# Stakpak session files
+.stakpak/session*

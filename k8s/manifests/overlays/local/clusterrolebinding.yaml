@@ -1,0 +1,14 @@
+# ClusterRoleBinding - 本地测试环境
+# 把 base 里共享的 ClusterRole 绑定到 local namespace 的 ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rcoder-pods-crb-local
+subjects:
+- kind: ServiceAccount
+  name: rcoder-pods-sa
+  namespace: rcoder-local
+roleRef:
+  kind: ClusterRole
+  name: rcoder-pods-clusterrole
+  apiGroup: rbac.authorization.k8s.io
