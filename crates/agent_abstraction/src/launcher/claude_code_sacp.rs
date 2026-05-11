@@ -2140,6 +2140,7 @@ mod tests {
             default_model: "test-model".to_string(),
             requires_openai_auth: false,
             api_protocol: None,
+            wire_api: None,
         };
 
         let config =
@@ -2191,6 +2192,7 @@ mod tests {
             default_model: "openai-compatible/gpt-4".to_string(), // model_name 已包含前缀
             requires_openai_auth: true,
             api_protocol: Some("openai".to_string()),
+            wire_api: None,
         };
 
         let config =
@@ -2247,6 +2249,7 @@ mod tests {
             default_model: "openai-compatible/gpt-4".to_string(),
             requires_openai_auth: true,
             api_protocol: Some("openai".to_string()),
+            wire_api: None,
         };
 
         let config =

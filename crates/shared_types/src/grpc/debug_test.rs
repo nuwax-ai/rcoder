@@ -12,6 +12,7 @@ mod tests {
             api_base: Some("https://test-code-api.xspaceagi.com/api/anthropic/session-62f9fbe19dff4e41bce2cfaf19c14b64".to_string()),
             requires_openai_auth: Some(true),
             api_protocol: Some("anthropic".to_string()),
+            wire_api: None,
         };
 
         let debug_output = format!("{:?}", config);
@@ -42,6 +43,7 @@ mod tests {
             api_base: None,
             requires_openai_auth: None,
             api_protocol: None,
+            wire_api: None,
         };
 
         let debug_output = format!("{:?}", config);
@@ -61,6 +63,7 @@ mod tests {
             api_base: Some("https://api.openai.com/v1/chat/completions".to_string()),
             requires_openai_auth: Some(false),
             api_protocol: Some("openai".to_string()),
+            wire_api: None,
         };
 
         let debug_output = format!("{:?}", config);

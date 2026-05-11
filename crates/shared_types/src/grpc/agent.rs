@@ -179,6 +179,9 @@ pub struct ModelProviderConfig {
     /// 模型接口协议类型 (anthropic/openai)
     #[prost(string, optional, tag = "7")]
     pub api_protocol: ::core::option::Option<::prost::alloc::string::String>,
+    /// 线路 API 格式: "chat" 表示 Chat Completions API, "response" 表示 Responses API
+    #[prost(string, optional, tag = "8")]
+    pub wire_api: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// 附件数据源
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

@@ -393,8 +393,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::DesktopAccessResponse,
             handler::DesktopErrorResponse,
             // Pod 容器管理相关结构体
-            handler::PodCountResponse,
-            handler::PodCountByServiceType,
+            shared_types::PodCountResponse,
+            shared_types::PodCountByServiceType,
             handler::PodListQuery,
             handler::PodListResponse,
             handler::PodDetailInfo,

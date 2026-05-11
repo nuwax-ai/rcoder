@@ -62,6 +62,7 @@ fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProvider
         requires_openai_auth: grpc_config.requires_openai_auth.unwrap_or(true),
         default_model: grpc_config.model,
         api_protocol: grpc_config.api_protocol,
+        wire_api: grpc_config.wire_api,
     }
 }
 

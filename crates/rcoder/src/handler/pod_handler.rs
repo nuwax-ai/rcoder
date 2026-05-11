@@ -20,7 +20,7 @@ use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::vnc_sync::sync_single_vnc_backend;
 use crate::{AppError, HttpResult};
-use shared_types::{ProjectAndContainerInfo, ServiceResourceLimits};
+use shared_types::{PodCountByServiceType, PodCountResponse, ProjectAndContainerInfo, ServiceResourceLimits};
 
 // ============================================================================
 // 辅助函数
@@ -107,32 +107,7 @@ fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
 // 接口一：获取容器数量
 // ============================================================================
 
-/// 容器数量响应
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct PodCountResponse {
-    /// 当前运行的容器总数
-    #[schema(example = 5)]
-    pub total_count: u32,
-
-    /// 按服务类型分类的容器数量
-    pub by_service_type: PodCountByServiceType,
-
-    /// 统计时间戳 (Unix 毫秒)
-    #[schema(example = 1702700000000_u64)]
-    pub timestamp: u64,
-}
-
-/// 按服务类型分类的容器数量
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct PodCountByServiceType {
-    /// RCoder 类型容器数量
-    #[schema(example = 2)]
-    pub rcoder: u32,
-
-    /// ComputerAgentRunner 类型容器数量
-    #[schema(example = 3)]
-    pub computer_agent_runner: u32,
-}
+// 类型定义已移至 shared_types::pod_types 模块
 
 // ============================================================================
 // 接口二：获取所有容器信息

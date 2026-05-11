@@ -86,6 +86,8 @@ pub use model::{
     HealthResponse,
     HttpResult,
     ImageAttachment,
+    PodCountByServiceType,
+    PodCountResponse,
     ImageDimensions,
     ModelApiProtocol,
     ModelProviderConfig,

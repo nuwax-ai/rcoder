@@ -227,3 +227,6 @@ rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 # Pyroscope Continuous Profiling
 pyroscope = "0.5"
 pyroscope_pprofrs = "0.2"
+
+# Codex protocol conversion (Response API <-> Chat API)
+codex-convert-proxy = { version = "0.1.0", default-features = false, features = ["providers-lib"] }

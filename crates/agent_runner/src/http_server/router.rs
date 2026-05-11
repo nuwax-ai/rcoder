@@ -59,7 +59,7 @@ impl AppState {
 pub fn create_router(state: Arc<AppState>) -> Router {
     use super::handlers::{
         computer_cancel, computer_chat, computer_progress, computer_status, computer_stop,
-        rcoder_progress,
+        pod_count, rcoder_progress,
     };
     use shared_types::http_handlers;
 
@@ -85,6 +85,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/computer/progress/{session_id}",
             get(computer_progress::handle_computer_progress),
         )
+        .route("/computer/pod/count", get(pod_count::handle_pod_count))
         .with_state(state.clone());
 
     // RCoder Agent 路由（使用 LocalAgentHttpService）
@@ -140,6 +141,7 @@ fn create_swagger_ui() -> SwaggerUi {
         computer_cancel::__path_handle_computer_cancel, computer_chat::__path_handle_computer_chat,
         computer_progress::__path_handle_computer_progress,
         computer_status::__path_handle_computer_status, computer_stop::__path_handle_computer_stop,
+        pod_count::__path_handle_pod_count,
     };
 
     #[derive(OpenApi)]
@@ -151,6 +153,8 @@ fn create_swagger_ui() -> SwaggerUi {
             handle_computer_stop,
             handle_computer_cancel,
             handle_computer_progress,
+            // Pod 管理端点
+            handle_pod_count,
             // 健康检查
             health_check,
         ),
@@ -173,10 +177,14 @@ fn create_swagger_ui() -> SwaggerUi {
             shared_types::AgentStatusResponse,
             // 通用类型
             shared_types::HealthResponse,
+            // Pod 管理类型
+            shared_types::PodCountResponse,
+            shared_types::PodCountByServiceType,
         )),
         tags(
             (name = "Computer Agent", description = "Computer Agent HTTP API"),
             (name = "RCoder Agent", description = "RCoder Agent HTTP API"),
+            (name = "pod", description = "Pod 容器管理接口"),
             (name = "System", description = "系统管理接口")
         )
     )]

@@ -42,6 +42,9 @@ RUN . /opt/cargo/env && \
 # 测试agent
 RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 
+# 安装 codex-acp（Codex ACP 代理）
+RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
+
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
 # 使用 CACHEBUST 变量触发缓存失效

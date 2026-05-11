@@ -168,6 +168,8 @@ message ModelProviderConfig {
   optional bool requires_openai_auth = 6;
   // 模型接口协议类型 (anthropic/openai)
   optional string api_protocol = 7;
+  // 线路 API 格式: "chat" 表示 Chat Completions API, "response" 表示 Responses API
+  optional string wire_api = 8;
 }
 
 // === Attachment 相关定义 ===

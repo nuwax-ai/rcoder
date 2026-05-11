@@ -9,6 +9,7 @@ mod computer_agent_model;
 mod health_response;
 mod http_result;
 mod model_provider;
+mod pod_types;
 
 pub use agent_model::*;
 pub use agent_project_runner_model::*;
@@ -22,3 +23,4 @@ pub use computer_agent_model::*;
 pub use health_response::*;
 pub use http_result::*;
 pub use model_provider::{ModelApiProtocol, ModelProviderConfig, ModelProviderSafeInfo};
+pub use pod_types::{PodCountByServiceType, PodCountResponse};

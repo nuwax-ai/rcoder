@@ -97,6 +97,9 @@ ARG CACHEBUST=1
 # agent install
 RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 
+# 安装 codex-acp（Codex ACP 代理）
+RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
+
 # # 安装 claude-code-acp-ts（从源码构建，用于测试）
 # # 使用 npm pack + npm install -g <tarball> 确保复制文件而非 symlink
 # RUN echo "Cache bust: ${CACHEBUST}" && \

@@ -40,6 +40,7 @@ impl<'a> fmt::Debug for MaskedModelConfig<'a> {
             .field("api_base", &masked_api_base)
             .field("requires_openai_auth", &config.requires_openai_auth)
             .field("api_protocol", &config.api_protocol)
+            .field("wire_api", &config.wire_api)
             .finish()
     }
 }
@@ -61,6 +62,7 @@ mod tests {
             ),
             requires_openai_auth: Some(true),
             api_protocol: Some("anthropic".to_string()),
+            wire_api: None,
         };
 
         let masked = MaskedModelConfig(&config);

@@ -20,6 +20,7 @@
 //!     requires_openai_auth: false,
 //!     default_model: "claude-3-5-sonnet-20241022".to_string(),
 //!     api_protocol: Some("anthropic".to_string()),
+//!     wire_api: None,
 //! };
 //! manager.store_config("anthropic", config);
 //!
@@ -118,6 +119,7 @@ impl ApiKeyManager {
     ///     requires_openai_auth: false,
     ///     default_model: "claude-3-5-sonnet-20241022".to_string(),
     ///     api_protocol: Some("anthropic".to_string()),
+    ///     wire_api: None,
     /// };
     /// manager.store_config("svc-uuid-123", config);
     /// ```
@@ -219,6 +221,7 @@ mod tests {
             requires_openai_auth: name == "openai",
             default_model: "test-model".to_string(),
             api_protocol: Some(name.to_string()),
+            wire_api: None,
         }
     }
 

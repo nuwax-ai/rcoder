@@ -61,6 +61,11 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "openai")]
     pub api_protocol: Option<String>,
+    /// 线路 API 格式: "chat" 表示 Chat Completions API, "response" 表示 Responses API (默认)
+    /// 当 wire_api == "chat" 时，代理会将 Responses API 请求转换为 Chat API 请求
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "chat")]
+    pub wire_api: Option<String>,
 }
 
 impl ModelProviderConfig {
@@ -104,14 +109,15 @@ impl fmt::Display for ModelProviderConfig {
 
         write!(
             f,
-            "{{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}}}",
+            "{{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}, wire_api: {}}}",
             self.id,
             self.name,
             self.default_model,
             masked_base_url,
             self.mask_api_key(),
             self.requires_openai_auth,
-            self.api_protocol.as_deref().unwrap_or("None")
+            self.api_protocol.as_deref().unwrap_or("None"),
+            self.wire_api.as_deref().unwrap_or("None")
         )
     }
 }
@@ -125,14 +131,15 @@ impl fmt::Debug for ModelProviderConfig {
         // 使用与 Display 相同的脱敏格式
         write!(
             f,
-            "ModelProviderConfig {{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}}}",
+            "ModelProviderConfig {{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}, wire_api: {}}}",
             self.id,
             self.name,
             self.default_model,
             masked_base_url,
             self.mask_api_key(),
             self.requires_openai_auth,
-            self.api_protocol.as_deref().unwrap_or("None")
+            self.api_protocol.as_deref().unwrap_or("None"),
+            self.wire_api.as_deref().unwrap_or("None")
         )
     }
 }

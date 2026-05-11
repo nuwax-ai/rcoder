@@ -146,6 +146,15 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
         crate::service::TrackingCtx::new()
     }
 
+    async fn request_filter(
+        &self,
+        session: &mut pingora_proxy::Session,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<bool> {
+        // 委托给内部的 PortProxy 实现（协议转换拦截）
+        self.inner.request_filter(session, ctx).await
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut pingora_proxy::Session,
