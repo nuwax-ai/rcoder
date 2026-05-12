@@ -45,6 +45,8 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 # 安装 codex-acp（Codex ACP 代理）
 RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
 
+# 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
+RUN cargo install --git https://github.com/soddygo/codex-acp --branch dev
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
 # 使用 CACHEBUST 变量触发缓存失效
@@ -100,9 +102,9 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
 # 安装 FlameGraph 工具
 RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
     if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
-        git clone ${GITHUB_MIRROR_URL}brendangregg/FlameGraph /tmp/FlameGraph; \
+    git clone ${GITHUB_MIRROR_URL}brendangregg/FlameGraph /tmp/FlameGraph; \
     else \
-        git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph; \
+    git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph; \
     fi && \
     cp /tmp/FlameGraph/*.pl /usr/local/bin/ \
     && rm -rf /tmp/FlameGraph \

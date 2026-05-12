@@ -284,6 +284,7 @@ mod tests {
             port_param: "port".to_string(),
             config_file: None,
             verbose: false,
+            ..Default::default()
         };
 
         let server = ProxyServer::new(config);

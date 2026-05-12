@@ -24,6 +24,7 @@ fn create_test_config() -> ProxyConfig {
         port_param: "port".to_string(),
         config_file: None,
         verbose: false,
+        ..Default::default()
     }
 }
 
@@ -36,6 +37,7 @@ fn create_test_server_config(listen_port: u16) -> ProxyConfig {
         port_param: "port".to_string(),
         config_file: None,
         verbose: false,
+        ..Default::default()
     }
 }
 
@@ -347,6 +349,7 @@ async fn test_edge_cases() {
         port_param: "port".to_string(),
         config_file: None,
         verbose: false,
+        ..Default::default()
     };
     assert!(empty_config.validate().is_err());
 }

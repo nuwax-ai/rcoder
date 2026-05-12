@@ -151,7 +151,7 @@ pub async fn handle_converted_request(
     if is_stream {
         handle_streaming_response(session, req_builder, request_context, &config.name, &config.default_model).await?;
     } else {
-        handle_non_streaming_response(session, req_builder, request_context, &config.name, &config.default_model).await?;
+        handle_non_streaming_response(session, req_builder, request_context, &config.name).await?;
     }
 
     Ok(true)
@@ -204,7 +204,6 @@ async fn handle_non_streaming_response(
     req_builder: reqwest::RequestBuilder,
     request_context: ResponseRequestContext,
     provider_name: &str,
-    _model: &str,
 ) -> PingoraResult<()> {
     // 发送请求到上游
     let resp = match req_builder.send().await {
@@ -377,6 +376,11 @@ async fn handle_streaming_response(
         }
         sse_raw_buf.extend_from_slice(&chunk);
 
+        // 归一化 SSE 行尾 (W3C spec §9.2.4):
+        // 去掉所有 \r 字节，使得 \r\n、\r、\n 统一为 \n。
+        // 确保 find_sse_boundary 和 parse_sse 不依赖上游的行尾约定。
+        sse_raw_buf.retain(|&b| b != b'\r');
+
         // 查找最后一个完整的 SSE 事件边界 (\n\n)
         // 只解析到边界处，保留不完整的部分
         let parse_boundary = find_sse_boundary(&sse_raw_buf);
@@ -433,6 +437,8 @@ async fn handle_streaming_response(
 
     // 处理缓冲区中剩余的数据
     if !sse_raw_buf.is_empty() {
+        // 归一化残余缓冲区（与主循环保持一致）
+        sse_raw_buf.retain(|&b| b != b'\r');
         if let Ok(sse_text) = std::str::from_utf8(&sse_raw_buf) {
             let (events, _) = parse_sse(sse_text);
             for event in &events {
@@ -511,4 +517,36 @@ fn find_sse_boundary(data: &[u8]) -> usize {
         i += 1;
     }
     last_boundary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_sse_boundary_lf_only() {
+        let data = b"data: {\"x\":1}\n\ndata: {\"y\":2}\n\n";
+        // find_sse_boundary 返回最后一个完整边界的位置 (30 = 第二个 \n\n 之后)
+        assert_eq!(find_sse_boundary(data), 30);
+    }
+
+    #[test]
+    fn test_find_sse_boundary_no_boundary() {
+        let data = b"data: incomplete";
+        assert_eq!(find_sse_boundary(data), 0);
+    }
+
+    #[test]
+    fn test_normalize_crlf_produces_valid_boundary() {
+        let mut buf = b"data: {\"x\":1}\r\n\r\ndata: {\"y\":2}\r\n\r\n".to_vec();
+        buf.retain(|&b| b != b'\r');
+        assert!(find_sse_boundary(&buf) > 0);
+    }
+
+    #[test]
+    fn test_normalize_empty_buffer() {
+        let mut buf: Vec<u8> = vec![];
+        buf.retain(|&b| b != b'\r');
+        assert_eq!(find_sse_boundary(&buf), 0);
+    }
 }

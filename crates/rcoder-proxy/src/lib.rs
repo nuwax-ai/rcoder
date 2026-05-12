@@ -162,6 +162,7 @@ pub async fn quick_start(
         port_param: DEFAULT_PORT_PARAM.to_string(),
         config_file: None,
         verbose: false,
+        ..Default::default()
     };
 
     let server = ProxyServer::new(config);

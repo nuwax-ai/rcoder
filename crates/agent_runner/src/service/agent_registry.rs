@@ -406,19 +406,52 @@ impl AgentSessionRegistry {
 
     /// 清理 Pending 状态（仅当当前状态为 Pending 时移除）
     ///
-    /// 用于在任务失败时清理预占位，避免死锁
+    /// 用于在任务失败时清理预占位，避免死锁。
+    ///
+    /// ## 并发安全性
+    ///
+    /// 使用 DashMap entry API 实现原子性的"检查状态 + 移除/回退"，
+    /// 避免 clear_pending_if_exists 和 register 之间的 TOCTOU 竞态条件。
+    ///
+    /// ## 行为
+    ///
+    /// - **新建占位符**（session_id == "pending"）：完全移除条目及相关映射
+    /// - **已有条目回退**（session_id != "pending"）：仅将状态从 Pending 恢复为 Idle
     pub fn clear_pending_if_exists(&self, project_id: &str) {
+        use dashmap::mapref::entry::Entry;
         use shared_types::AgentStatus;
 
-        if let Some(info) = self.agent_info_map.get(project_id)
-            && info.status == AgentStatus::Pending
-        {
-            drop(info);
-            self.remove_by_project(project_id);
-            info!(
-                "🗑️ [Registry] Cleared Pending placeholder: project_id={}",
-                project_id
-            );
+        match self.agent_info_map.entry(project_id.to_string()) {
+            Entry::Occupied(mut entry) if entry.get().status == AgentStatus::Pending => {
+                // 区分两种场景：
+                // 1. session_id == "pending" → set_pending 创建的占位符，需完全移除
+                // 2. session_id != "pending" → 从 Idle 改为 Pending 的已有条目，只需回退状态
+                if entry.get().session_id.to_string() == "pending" {
+                    let (_, _removed) = entry.remove_entry();
+                    // 使用 entry API 安全移除 project_to_session 映射
+                    // 仅当映射仍指向 "pending" 时才移除，避免与 register() 的竞态条件
+                    if let Entry::Occupied(oe) = self.project_to_session.entry(project_id.to_string()) {
+                        if oe.get().as_str() == "pending" {
+                            oe.remove_entry();
+                        }
+                    }
+                    // Pending 占位符不占用槽位，无需 release_session_slot
+                    info!(
+                        "🗑️ [Registry] Cleared Pending placeholder: project_id={}",
+                        project_id
+                    );
+                } else {
+                    // 回退状态到 Idle，保留已有的 session 映射
+                    entry.get_mut().status = AgentStatus::Idle;
+                    info!(
+                        "↩️ [Registry] Reverted Pending to Idle: project_id={}",
+                        project_id
+                    );
+                }
+            }
+            _ => {
+                // 不存在或状态不是 Pending，不操作
+            }
         }
     }
 

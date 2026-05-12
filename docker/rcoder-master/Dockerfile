@@ -119,6 +119,28 @@ RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest
 # 安装 nuwax-file-server（文件服务器）
 RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwax-file-server@latest
 
+
+
+
+# 使用国内镜像源加速下载
+#ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
+#ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
+# 安装 Rust 并验证
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc && \
+    export PATH="/root/.cargo/bin:$PATH" && \
+    which cargo && cargo --version
+
+# 设置 PATH 环境变量（确保后续命令能找到 cargo）
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 复制 cargo 镜像配置文件（使用国内镜像加速）
+COPY .cargo/config.toml /root/.cargo/config.toml
+# 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
+RUN cargo install --git https://github.com/soddygo/codex-acp --branch dev
+
+
+
 # 配置 nuwaxcode - 禁用 websearch, webfetch 和 question 权限
 RUN mkdir -p /root/.config/opencode && \
     echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny",\n    "question": "deny"\n  }\n}' > /root/.config/opencode/opencode.json

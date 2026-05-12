@@ -84,6 +84,34 @@ pub struct HealthCheckConfig {
     pub unhealthy_threshold: u32,
 }
 
+/// 代理 HTTP 客户端配置（用于协议转换时连接上游 API）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyHttpClientConfig {
+    /// 请求超时（秒），默认 600（10 分钟，AI 请求可能很长）
+    #[serde(default = "default_http_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// 连接建立超时（秒），默认 10
+    #[serde(default = "default_http_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+    /// 连接池空闲超时（秒），默认 90
+    #[serde(default = "default_http_pool_idle_timeout_seconds")]
+    pub pool_idle_timeout_seconds: u64,
+}
+
+fn default_http_request_timeout_seconds() -> u64 { 600 }
+fn default_http_connect_timeout_seconds() -> u64 { 10 }
+fn default_http_pool_idle_timeout_seconds() -> u64 { 90 }
+
+impl Default for ProxyHttpClientConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_seconds: 600,
+            connect_timeout_seconds: 10,
+            pool_idle_timeout_seconds: 90,
+        }
+    }
+}
+
 /// 反向代理配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -97,6 +125,9 @@ pub struct ProxyConfig {
     pub port_param: String,
     /// 健康检查配置
     pub health_check: HealthCheckConfig,
+    /// HTTP 客户端配置（用于协议转换时连接上游 API）
+    #[serde(default)]
+    pub http_client: ProxyHttpClientConfig,
 }
 
 /// 日志清理配置
@@ -240,6 +271,7 @@ impl Default for ProxyConfig {
             backend_host: "127.0.0.1".to_string(),
             port_param: "port".to_string(),
             health_check: HealthCheckConfig::default(),
+            http_client: ProxyHttpClientConfig::default(),
         }
     }
 }

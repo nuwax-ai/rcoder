@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) =
         docker_manager::global::init_global_docker_manager_with_config(docker_manager_config).await
     {
-        error!("Docker Manager initializefailed: {}", e);
+        error!("Docker Manager initialization failed: {}", e);
         return Err(anyhow::anyhow!("Docker Manager initialization failed: {}", e));
     }
 
@@ -314,8 +314,8 @@ async fn main() -> anyhow::Result<()> {
         );
 
         // 添加调试日志
-        info!("🔧 [Pingora] startinginitialize Pingora config...");
-        info!("🔧 [Pingora] listenport: {}", proxy_config.listen_port);
+        info!("[Pingora] starting to initialize Pingora config...");
+        info!("🔧 [Pingora] listen port: {}", proxy_config.listen_port);
         info!(
             "🔧 [Pingora] Default backend port: {}",
             proxy_config.default_backend_port
@@ -329,16 +329,18 @@ async fn main() -> anyhow::Result<()> {
             port_param: proxy_config.port_param.clone(),
             config_file: None,
             verbose: false,
+            request_timeout_seconds: Some(proxy_config.http_client.request_timeout_seconds),
+            connect_timeout_seconds: Some(proxy_config.http_client.connect_timeout_seconds),
+            pool_idle_timeout_seconds: Some(proxy_config.http_client.pool_idle_timeout_seconds),
         };
 
-        info!("[Pingora] Pingora configcreatedsucceeded");
+        info!("[Pingora] Pingora config created successfully");
 
         // 创建 Pingora 服务器管理器，并提取服务引用用于指标读取
-        info!("🔧 [Pingora] created PingoraServerManager...");
+        info!("[Pingora] PingoraServerManager created successfully");
         let mut server_manager = PingoraServerManager::new(pingora_config)
             .with_api_key_config(Arc::clone(&api_key_config)); // 🆕 传递 API Key 配置
         let pingora_service = server_manager.service();
-        info!("[Pingora] PingoraServerManager createdsucceeded");
         info!("[Pingora] API Key config already loaded (no updates)");
 
         // 启动健康检查循环（按配置）
@@ -376,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
             Some(pingora_shutdown_tx),
         )
     } else {
-        info!("⚠️ [Pingora] proxy_config notconfig, skip Pingora started");
+        info!("[Pingora] proxy_config not configured, skipping Pingora startup");
         (None, None, None)
     };
 
@@ -570,7 +572,7 @@ async fn main() -> anyhow::Result<()> {
                                                            if let Err(e) = http_builder.serve_connection(io, hyper_service).await {
                                                                if !e.to_string().contains("connection closed")
                                                                   && !e.to_string().contains("early eof") {
-            tracing::debug!("HTTP connectionerror ({}): {}", addr, e);
+            tracing::debug!("HTTP connection error ({}): {}", addr, e);
                                                                }
                                                            }
                                                        }
@@ -660,20 +662,20 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
                     tokio::select! {
                                            _ = sigint.recv() => {
                                                if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
-                    info!(" received SIGINT (Ctrl+C), starting graceful shutdown...");
+                    info!("received SIGINT (Ctrl+C), starting graceful shutdown...");
                                                    let _ = shutdown_tx_clone.send(());
                                                }
                                            }
                                            _ = sigterm.recv() => {
                                                if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
-                    info!(" received SIGTERM, starting graceful shutdown...");
+                    info!("received SIGTERM, starting graceful shutdown...");
                                                    let _ = shutdown_tx_clone.send(());
                                                }
                                            }
                                        }
                 }
                 (Err(e), _) | (_, Err(e)) => {
-                    warn!(" unix signal handler failed: {}, shutdown may not be graceful", e);
+                    warn!("unix signal handler failed: {}, shutdown may not be graceful", e);
                     // 注册失败不影响程序运行，仍可通过其他方式关闭（如 tokio::signal::ctrl_c）
                 }
             }
@@ -688,7 +690,7 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
 
             if let Ok(()) = signal::ctrl_c().await {
                 if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
-                    info!(" received Ctrl+C, starting graceful shutdown...");
+                    info!("received Ctrl+C, starting graceful shutdown...");
                     let _ = shutdown_tx_clone.send(());
                 }
             }

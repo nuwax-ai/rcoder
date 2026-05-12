@@ -53,6 +53,12 @@ proxy_config:
     healthy_threshold: 2
     unhealthy_threshold: 3
 
+  # HTTP 客户端配置（协议转换时连接上游 API）
+  http_client:
+    request_timeout_seconds: 600
+    connect_timeout_seconds: 10
+    pool_idle_timeout_seconds: 90
+
 # Docker 配置
 docker_config:
   # 多镜像配置系统

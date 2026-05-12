@@ -1643,15 +1643,26 @@ impl PingoraProxyService {
             router,
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(), // 传递 API Key 配置
-            http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(600)) // 10 分钟超时，AI 请求可能很长
-                .connect_timeout(std::time::Duration::from_secs(10)) // 连接建立超时
-                .pool_idle_timeout(std::time::Duration::from_secs(90)) // 空闲连接回收
-                .build()
-                .map_err(|e| {
-                    tracing::error!("[PROXY] Failed to create reqwest::Client: {}", e);
-                    anyhow::anyhow!("Failed to create reqwest::Client: {}", e)
-                })?,
+            http_client: {
+                let request_timeout = self.config.request_timeout_seconds.unwrap_or(600);
+                let connect_timeout = self.config.connect_timeout_seconds.unwrap_or(10);
+                let pool_idle_timeout = self.config.pool_idle_timeout_seconds.unwrap_or(90);
+
+                info!(
+                    "[PROXY] Creating reqwest::Client: request={}s, connect={}s, pool_idle={}s",
+                    request_timeout, connect_timeout, pool_idle_timeout
+                );
+
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(request_timeout))
+                    .connect_timeout(std::time::Duration::from_secs(connect_timeout))
+                    .pool_idle_timeout(std::time::Duration::from_secs(pool_idle_timeout))
+                    .build()
+                    .map_err(|e| {
+                        tracing::error!("[PROXY] Failed to create reqwest::Client: {}", e);
+                        anyhow::anyhow!("Failed to create reqwest::Client: {}", e)
+                    })?
+            },
         })
     }
 
@@ -1933,6 +1944,7 @@ mod tests {
             port_param: "port".to_string(),
             config_file: None,
             verbose: false,
+            ..Default::default()
         }
     }
 

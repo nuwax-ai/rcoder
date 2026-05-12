@@ -769,10 +769,21 @@ RUN apt-get update && apt-get install -y \
 ENV RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
     PATH="/opt/cargo/bin:$PATH"
+
+# 使用国内镜像源加速下载
+#ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
+#ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
+# 安装 Rust 并验证
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    chmod -R 755 /opt/rustup /opt/cargo && \
-    # 确保 user 可以使用 cargo
-    chmod -R o+rX /opt/cargo /opt/rustup
+    echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc && \
+    export PATH="/root/.cargo/bin:$PATH" && \
+    which cargo && cargo --version
+
+# 设置 PATH 环境变量（确保后续命令能找到 cargo）
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 复制 cargo 镜像配置文件（使用国内镜像加速）
+COPY .cargo/config.toml /root/.cargo/config.toml
 
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
