@@ -12,6 +12,7 @@ use codex_convert_proxy::{
     util::parse_sse,
     ResponseRequestContext, StreamState,
 };
+use codex_convert_proxy::convert::request::ToolPriority;
 use pingora_core::Result as PingoraResult;
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
@@ -94,7 +95,12 @@ pub async fn handle_converted_request(
 
     let request_context = ResponseRequestContext::from(&response_req);
 
-    let chat_req = match response_to_chat(response_req, provider.as_ref(), Some(&config.default_model))
+    let chat_req = match response_to_chat(
+        response_req,
+        provider.as_ref(),
+        Some(&config.default_model),
+        ToolPriority::Merge,
+    )
     {
         Ok(req) => req,
         Err(e) => {
