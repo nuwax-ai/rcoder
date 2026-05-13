@@ -864,16 +864,35 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         ensure_subprocess_path_env(&mut merged_envs);
 
+        // 🔍 调试：打印替换前的关键环境变量
+        info!(
+            "[SACP] 🔍 Before UUID replacement: OPENAI_BASE_URL={}, ANTHROPIC_BASE_URL={}, service_uuid={:?}",
+            merged_envs.get(ENV_OPENAI_BASE_URL).map(|s| s.as_str()).unwrap_or("<unset>"),
+            merged_envs.get(ENV_ANTHROPIC_BASE_URL).map(|s| s.as_str()).unwrap_or("<unset>"),
+            service_uuid
+        );
+
         // 替换 UUID 占位符
         if let Some(ref uuid) = service_uuid {
+            info!("[SACP] 🔍 Replacing {{SERVICE_UUID}} with: {}", uuid);
             for (_key, value) in merged_envs.iter_mut() {
                 *value = value.replace("{SERVICE_UUID}", uuid);
             }
+        } else {
+            warn!("[SACP] ⚠️ service_uuid is None, UUID placeholder will NOT be replaced!");
         }
+
+        // 🔍 调试：打印替换后的关键环境变量
+        info!(
+            "[SACP] 🔍 After UUID replacement: OPENAI_BASE_URL={}, ANTHROPIC_BASE_URL={}",
+            merged_envs.get(ENV_OPENAI_BASE_URL).map(|s| s.as_str()).unwrap_or("<unset>"),
+            merged_envs.get(ENV_ANTHROPIC_BASE_URL).map(|s| s.as_str()).unwrap_or("<unset>")
+        );
 
         // 🔒 安全防护：proxy 模式下强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
         // 即使用户在配置中直接写了真实的 API_KEY 或 BASE_URL，也会被替换
         if cfg!(feature = "proxy") {
+            info!("[SACP] 🔒 Proxy mode enabled, forcing proxy URL replacement");
             if model_provider.is_some() {
                 // 强制替换 Anthropic 敏感变量
                 if merged_envs.contains_key(ENV_ANTHROPIC_API_KEY) {
@@ -881,6 +900,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                         ENV_ANTHROPIC_API_KEY.to_string(),
                         API_KEY_PLACEHOLDER.to_string(),
                     );
+                    info!("[SACP] 🔒 Replaced ANTHROPIC_API_KEY with placeholder");
                 }
                 // ANTHROPIC_AUTH_TOKEN 也需要替换（某些场景下可能存在）
                 if merged_envs.contains_key("ANTHROPIC_AUTH_TOKEN") {
@@ -890,13 +910,12 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     );
                 }
                 if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
-                    merged_envs.insert(
-                        ENV_ANTHROPIC_BASE_URL.to_string(),
-                        service_uuid
-                            .as_ref()
-                            .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
-                            .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
-                    );
+                    let proxy_url = service_uuid
+                        .as_ref()
+                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string());
+                    merged_envs.insert(ENV_ANTHROPIC_BASE_URL.to_string(), proxy_url.clone());
+                    info!("[SACP] 🔒 Replaced ANTHROPIC_BASE_URL with: {}", proxy_url);
                 }
 
                 // 强制替换 OpenAI 敏感变量
@@ -905,47 +924,40 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                         ENV_OPENAI_API_KEY.to_string(),
                         API_KEY_PLACEHOLDER.to_string(),
                     );
+                    info!("[SACP] 🔒 Replaced OPENAI_API_KEY with placeholder");
                 }
                 if merged_envs.contains_key(ENV_OPENAI_BASE_URL) {
-                    merged_envs.insert(
-                        ENV_OPENAI_BASE_URL.to_string(),
-                        service_uuid
-                            .as_ref()
-                            .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
-                            .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string()),
-                    );
+                    let proxy_url = service_uuid
+                        .as_ref()
+                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string());
+                    merged_envs.insert(ENV_OPENAI_BASE_URL.to_string(), proxy_url.clone());
+                    info!("[SACP] 🔒 Replaced OPENAI_BASE_URL with: {}", proxy_url);
                 }
-
-                debug!("[SACP] 🔒 force replaced with proxy URL");
             }
         } else {
-            debug!("[SACP] 🔓 not proxy mode, keeping API Key and Base URL");
+            info!("[SACP] 🔓 Not proxy mode, keeping original API Key and Base URL");
         }
 
-        // 🔍 打印传递给 Agent 的完整环境变量（用于调试）
-        // 注意：敏感字段（API Key）需要脱敏处理，防止日志泄露
-        debug!(
-            "[SACP] 📋 Start Agent command: {} {:?}",
-            command_path, command_args
-        );
-        debug!("[SACP] 📋 work directory: {:?}", project_path);
-        debug!(
-            "[SACP] 📋 Environment variables passed to Agent ({} items):",
+        // 🔧 Windows：将 .cmd/.bat 等规范化为不弹窗的 node.exe + JS 形式（逻辑在 windows_launch 中）
+        #[cfg(windows)]
+        let (command_path, command_args) =
+            normalize_windows_command_for_no_window(command_path, command_args);
+
+        // 📋 打印完整的子进程环境变量（用于调试代理 URL 问题）
+        info!(
+            "[SACP] 📋 Subprocess environment variables ({} items):",
             merged_envs.len()
         );
-
-        // 需要脱敏的环境变量 key 列表（即使在 debug 日志中也不暴露完整值）
+        // 需要脱敏的环境变量 key 列表
         const SENSITIVE_ENV_KEYS: &[&str] = &[
             ENV_ANTHROPIC_API_KEY,
             ENV_OPENAI_API_KEY,
             "ANTHROPIC_AUTH_TOKEN",
         ];
-
-        // 按字母顺序排序并打印所有环境变量（仅在 debug 级别）
         let mut env_keys: Vec<_> = merged_envs.keys().collect();
         env_keys.sort();
-
-        for key in env_keys.iter() {
+        for key in &env_keys {
             let value = merged_envs.get(*key).unwrap();
             if SENSITIVE_ENV_KEYS.contains(&key.as_str()) {
                 // 脱敏：只显示前4个字符 + ***
@@ -954,16 +966,11 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 } else {
                     "***".to_string()
                 };
-                debug!("[SACP] 📋   {} = {}", key, masked);
+                info!("[SACP] 📋   {} = {}", key, masked);
             } else {
-                debug!("[SACP] 📋   {} = {}", key, value);
+                info!("[SACP] 📋   {} = {}", key, value);
             }
         }
-
-        // 🔧 Windows：将 .cmd/.bat 等规范化为不弹窗的 node.exe + JS 形式（逻辑在 windows_launch 中）
-        #[cfg(windows)]
-        let (command_path, command_args) =
-            normalize_windows_command_for_no_window(command_path, command_args);
 
         // 启动子进程（使用进程组/Job Object 来管理整个进程树）
         // Unix: ProcessGroup::leader() 创建进程组，确保能够清理所有孙进程
