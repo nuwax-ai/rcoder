@@ -67,21 +67,23 @@ pub fn inject_blocking(config: BlockingConfig) {
 /// # }
 /// ```
 pub async fn maybe_block(blocking_type: &str) {
-    let config = BLOCKING_CONFIG.read().unwrap();
-
-    let should_block = match blocking_type {
-        "new_session" => config.block_new_session,
-        "prompt" => config.block_prompt,
-        _ => false,
+    let (should_block, block_duration) = {
+        let config = BLOCKING_CONFIG.read().unwrap();
+        let should_block = match blocking_type {
+            "new_session" => config.block_new_session,
+            "prompt" => config.block_prompt,
+            _ => false,
+        };
+        (should_block, config.block_duration)
     };
 
     if should_block {
         tracing::warn!(
             "🧪 [TEST] Injected blocking: {}, duration: {:?}",
             blocking_type,
-            config.block_duration
+            block_duration
         );
-        tokio::time::sleep(config.block_duration).await;
+        tokio::time::sleep(block_duration).await;
     }
 }
 

@@ -881,7 +881,6 @@ async fn test_session_manager_pending_replacement_flow() {
 #[test]
 fn debug_simple_registry_operations() {
     use agent_runner::service::AgentSessionRegistry;
-    use shared_types::SessionEntry;
 
     let registry = AgentSessionRegistry::new();
     registry.set_pending("test-1");

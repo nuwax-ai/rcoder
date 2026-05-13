@@ -642,7 +642,7 @@ pub async fn pod_list(
     }
 
     // 5. 按创建时间倒序排序（最新的在前）
-    containers.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    containers.sort_by_key(|c| std::cmp::Reverse(c.created_at));
 
     // 6. 应用分页
     let total = containers.len() as u32;

@@ -33,10 +33,8 @@ impl NpmInstaller {
     async fn get_npm_command(&self) -> &'static str {
         if self.prefer_pnpm && which::which("pnpm").is_ok() {
             "pnpm"
-        } else if which::which("npm").is_ok() {
-            "npm"
         } else {
-            "npm" // Default, will fail if not available
+            "npm" // Default, will fail at exec time if not available
         }
     }
 

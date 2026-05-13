@@ -96,7 +96,7 @@ pub struct WorkerReady {
 ///
 /// 工作线程池大小 - 决定可以并发处理的 Agent 会话数量
 /// 🔥 已改为运行时可配置的全局变量，使用 get_concurrency_limit() 获取
-
+///
 /// 全局并发限制（运行时可配置）
 pub static WORKER_THREAD_POOL_SIZE: AtomicUsize = AtomicUsize::new(10);
 

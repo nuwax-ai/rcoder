@@ -228,7 +228,7 @@ impl ReaperState {
                         // 继续循环，可能还有其他僵尸进程
                         continue;
                     }
-                    #[cfg(linux_android)]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     Ok(WaitStatus::PtraceEvent(pid, signal, event)) => {
                         // ptrace 事件，不计入回收
                         debug!(
@@ -237,15 +237,10 @@ impl ReaperState {
                         );
                         continue;
                     }
-                    #[cfg(linux_android)]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     Ok(WaitStatus::PtraceSyscall(pid)) => {
                         // ptrace 系统调用，不计入回收
                         debug!("[ProcessReaper] ptrace syscall: PID={}", pid);
-                        continue;
-                    }
-                    // 非Linux平台忽略 ptrace 相关状态（macOS 上 WaitStatus 包含这些变体但不会实际触发）
-                    Ok(_) => {
-                        debug!("[ProcessReaper] Ignored waitpid status");
                         continue;
                     }
                     Err(nix::errno::Errno::ECHILD) => {

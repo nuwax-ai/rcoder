@@ -174,11 +174,14 @@ impl AgentServersConfig {
         self.context_servers.get(name)
     }
 
-    /// 创建默认配置
-    ///
-    /// 从 `configs/default_agents.json` 加载的配置（编译时嵌入）。
-    /// 修改 JSON 文件后重新编译即可生效。
-    pub fn default() -> Self {
+}
+
+/// 创建默认配置
+///
+/// 从 `configs/default_agents.json` 加载的配置（编译时嵌入）。
+/// 修改 JSON 文件后重新编译即可生效。
+impl Default for AgentServersConfig {
+    fn default() -> Self {
         Self {
             agent_servers: default_agent_servers(),
             context_servers: default_context_servers(),

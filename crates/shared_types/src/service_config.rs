@@ -171,30 +171,31 @@ impl ServiceImageConfig {
         }
 
         // 验证镜像名称格式
-        for image_name in [
+        for image in [
             &self.image,
             &self.arm64_image,
             &self.amd64_image,
             &self.default_image,
-        ] {
-            if let Some(image) = image_name {
-                if image.trim().is_empty() {
-                    return ConfigValidationResult::Warning(format!(
-                        "Service type {} has empty image name",
-                        self.service_type
-                    ));
-                }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if image.trim().is_empty() {
+                return ConfigValidationResult::Warning(format!(
+                    "Service type {} has empty image name",
+                    self.service_type
+                ));
+            }
 
-                // 验证镜像名称格式（简单的格式检查）
-                if !image
-                    .chars()
-                    .all(|c: char| c.is_alphanumeric() || "/:.-_".contains(c))
-                {
-                    return ConfigValidationResult::Warning(format!(
-                        "Service type {} image name '{}' may contain invalid characters",
-                        self.service_type, image
-                    ));
-                }
+            // 验证镜像名称格式（简单的格式检查）
+            if !image
+                .chars()
+                .all(|c: char| c.is_alphanumeric() || "/:.-_".contains(c))
+            {
+                return ConfigValidationResult::Warning(format!(
+                    "Service type {} image name '{}' may contain invalid characters",
+                    self.service_type, image
+                ));
             }
         }
 

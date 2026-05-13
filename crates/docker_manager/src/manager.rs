@@ -2802,8 +2802,10 @@ impl DockerManager {
         );
 
         let start_time = Instant::now();
-        let mut result = CleanupResult::default();
-        result.total_found = container_ids.len();
+        let mut result = CleanupResult {
+            total_found: container_ids.len(),
+            ..Default::default()
+        };
 
         for container_id in &container_ids {
             match self
@@ -2922,11 +2924,7 @@ impl DockerManager {
         timeout_seconds: u64,
     ) -> DockerResult<()> {
         let stop_options = Some(StopContainerOptions {
-            t: Some(
-                (timeout_seconds as i32)
-                    .try_into()
-                    .expect("timeout should be within valid range"),
-            ),
+            t: Some(timeout_seconds as i32),
             signal: None::<String>,
         });
 

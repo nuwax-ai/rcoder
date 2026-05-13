@@ -358,18 +358,18 @@ impl From<String> for ContainerStatus {
     }
 }
 
-impl ToString for ContainerStatus {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for ContainerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContainerStatus::Creating => "created".to_string(),
-            ContainerStatus::Running => "running".to_string(),
-            ContainerStatus::Stopped => "stopped".to_string(),
-            ContainerStatus::Paused => "paused".to_string(),
-            ContainerStatus::Restarting => "restarting".to_string(),
-            ContainerStatus::Removing => "removing".to_string(),
-            ContainerStatus::Exited => "exited".to_string(),
-            ContainerStatus::Dead => "dead".to_string(),
-            ContainerStatus::Unknown(s) => s.clone(),
+            ContainerStatus::Creating => f.write_str("created"),
+            ContainerStatus::Running => f.write_str("running"),
+            ContainerStatus::Stopped => f.write_str("stopped"),
+            ContainerStatus::Paused => f.write_str("paused"),
+            ContainerStatus::Restarting => f.write_str("restarting"),
+            ContainerStatus::Removing => f.write_str("removing"),
+            ContainerStatus::Exited => f.write_str("exited"),
+            ContainerStatus::Dead => f.write_str("dead"),
+            ContainerStatus::Unknown(s) => f.write_str(s),
         }
     }
 }

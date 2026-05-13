@@ -76,7 +76,7 @@ impl HostPathResolver {
             .map(|(cp, hp)| (PathBuf::from(cp), PathBuf::from(hp)))
             .collect();
         // 按容器路径长度降序排列，确保最具体的路径优先匹配
-        all_mounts.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+        all_mounts.sort_by_key(|m| std::cmp::Reverse(m.0.as_os_str().len()));
 
         info!(
             "[HostPathResolver] Cached {} mount points (sorted by path length descending):",

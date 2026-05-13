@@ -118,11 +118,6 @@ impl ProxyServer {
         Self::new(config)
     }
 
-    /// 使用默认配置创建代理服务器
-    pub fn default() -> Self {
-        Self::new(ProxyConfig::default())
-    }
-
     /// 使用指定监听端口创建代理服务器
     pub fn with_listen_port(port: u16) -> Self {
         Self::new(ProxyConfig::with_listen_port(port))
@@ -237,6 +232,12 @@ impl Default for ProxyServerBuilder {
     }
 }
 
+impl Default for ProxyServer {
+    fn default() -> Self {
+        Self::new(ProxyConfig::default())
+    }
+}
+
 /// Pingora 代理服务器运行器
 ///
 /// 提供更直接的 Pingora 服务器控制方式
@@ -342,8 +343,10 @@ mod tests {
         assert!(server.can_start().is_ok());
 
         // 测试无效配置（端口为0）
-        let mut invalid_config = ProxyConfig::default();
-        invalid_config.listen_port = 0;
+        let invalid_config = ProxyConfig {
+            listen_port: 0,
+            ..ProxyConfig::default()
+        };
         let server = ProxyServer::new(invalid_config);
         assert!(server.can_start().is_err());
     }

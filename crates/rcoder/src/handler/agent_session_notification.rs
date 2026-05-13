@@ -1173,10 +1173,10 @@ fn create_passthrough_event(event_text: &str) -> Option<Event> {
 
     // 解析SSE消息的各个部分
     for line in event_text.lines() {
-        if line.starts_with("event:") {
-            event_type = Some(line[6..].trim().to_string());
-        } else if line.starts_with("data:") {
-            data_lines.push(line[5..].trim());
+        if let Some(value) = line.strip_prefix("event:") {
+            event_type = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data_lines.push(value.trim());
         }
     }
 

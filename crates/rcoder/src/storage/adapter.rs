@@ -118,10 +118,10 @@ impl ProjectAdapter {
     /// 获取所有项目（替代 project_and_agent_map.iter）
     pub fn iter(&self) -> impl Iterator<Item = (String, Arc<ProjectAndContainerInfo>)> + '_ {
         let projects = self.storage.get_all_projects().unwrap_or_default();
-        projects.into_iter().filter_map(move |record| {
+        projects.into_iter().map(move |record| {
             let container = self.get_container_for_project(&record);
             let info = DataBridge::project_record_to_info(&record, container);
-            Some((record.project_id.clone(), Arc::new(info)))
+            (record.project_id.clone(), Arc::new(info))
         })
     }
 

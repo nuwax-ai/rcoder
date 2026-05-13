@@ -351,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
                 hc.interval_seconds, hc.timeout_seconds
             );
             pingora_service
-                .start_health_check_loop(hc.interval_seconds, ((hc.timeout_seconds * 1000)));
+                .start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
             info!("[Pingora] health check already started");
         }
 

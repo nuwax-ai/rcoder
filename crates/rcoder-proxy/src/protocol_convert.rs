@@ -163,22 +163,17 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// 从 Pingora session 读取完整的请求 body
 async fn read_full_request_body(session: &mut Session) -> PingoraResult<Bytes> {
     let mut body_buf = Vec::new();
-    loop {
-        match session.downstream_session.read_request_body().await? {
-            Some(chunk) => {
-                if body_buf.len() + chunk.len() > MAX_BODY_SIZE {
-                    error!(
-                        "[PROTOCOL_CONVERT] Request body exceeds max size ({} bytes)",
-                        MAX_BODY_SIZE
-                    );
-                    return Err(pingora_core::Error::new(
-                        pingora_core::ErrorType::HTTPStatus(413),
-                    ));
-                }
-                body_buf.extend_from_slice(&chunk);
-            }
-            None => break, // end of stream
+    while let Some(chunk) = session.downstream_session.read_request_body().await? {
+        if body_buf.len() + chunk.len() > MAX_BODY_SIZE {
+            error!(
+                "[PROTOCOL_CONVERT] Request body exceeds max size ({} bytes)",
+                MAX_BODY_SIZE
+            );
+            return Err(pingora_core::Error::new(
+                pingora_core::ErrorType::HTTPStatus(413),
+            ));
         }
+        body_buf.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(body_buf))
 }
@@ -187,13 +182,9 @@ async fn read_full_request_body(session: &mut Session) -> PingoraResult<Bytes> {
 fn build_upstream_url(base_url: &str, api_path: &str) -> String {
     let base = base_url.trim_end_matches('/');
     // 只替换路径末尾的 /responses，避免误替换中间部分
-    let chat_path = if api_path.ends_with("/responses") {
-        format!(
-            "{}/chat/completions",
-            &api_path[..api_path.len() - "/responses".len()]
-        )
-    } else {
-        api_path.to_string()
+    let chat_path = match api_path.strip_suffix("/responses") {
+        Some(prefix) => format!("{}/chat/completions", prefix),
+        None => api_path.to_string(),
     };
     format!("{}{}", base, chat_path)
 }

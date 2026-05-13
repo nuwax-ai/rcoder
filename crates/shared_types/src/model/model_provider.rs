@@ -27,11 +27,11 @@ impl FromStr for ModelApiProtocol {
     }
 }
 
-impl ToString for ModelApiProtocol {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for ModelApiProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModelApiProtocol::Anthropic => "Anthropic".to_string(),
-            ModelApiProtocol::OpenAI => "Openai".to_string(),
+            ModelApiProtocol::Anthropic => f.write_str("Anthropic"),
+            ModelApiProtocol::OpenAI => f.write_str("Openai"),
         }
     }
 }

@@ -119,12 +119,10 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
     }
     writeln!(file, "panic.payload: {}", panic_info)?;
 
-    // 写入 backtrace（如果启用）
-    #[cfg(feature = "backtrace")]
-    {
-        if let Ok(backtrace) = std::backtrace::Backtrace::capture() {
-            writeln!(file, "Backtrace:\n{}", backtrace)?;
-        }
+    // 写入 backtrace（受 RUST_BACKTRACE 环境变量控制）
+    let backtrace = std::backtrace::Backtrace::capture();
+    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+        writeln!(file, "Backtrace:\n{}", backtrace)?;
     }
 
     writeln!(
