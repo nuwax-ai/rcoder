@@ -855,8 +855,7 @@ impl ContainerRuntime for KubernetesRuntime {
         for query in search_queries {
             let lp = ListParams::default().labels(&query);
             if let Ok(pods) = self.pods().list(&lp).await {
-                for p in pods.items {
-                    let pod: Pod = p;
+                if let Some(pod) = pods.items.into_iter().next() {
                     let status = Self::extract_pod_status(&pod);
                     let metadata = &pod.metadata;
                     let uid = metadata.uid.clone().unwrap_or_default();

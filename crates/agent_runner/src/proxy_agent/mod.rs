@@ -62,6 +62,7 @@ pub fn start_pingora(
         port_param: proxy_config.port_param.clone(),
         config_file: None,
         verbose: false,
+        ..Default::default()
     };
 
     // 创建 Pingora 服务器管理器
