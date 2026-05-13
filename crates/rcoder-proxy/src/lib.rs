@@ -239,11 +239,12 @@ mod integration_tests {
 
     #[test]
     fn test_features() {
-        assert!(features::QUERY_PARAM_ROUTING);
-        assert!(features::PATH_ROUTING);
-        assert!(features::DYNAMIC_BACKENDS);
-        assert!(features::CONFIG_FILE_SUPPORT);
-        assert!(features::VERBOSE_LOGGING);
+        // 编译期断言：feature 常量始终为 true（作为文档，确保有人故意设为 false 时编译失败）
+        const _: () = assert!(features::QUERY_PARAM_ROUTING);
+        const _: () = assert!(features::PATH_ROUTING);
+        const _: () = assert!(features::DYNAMIC_BACKENDS);
+        const _: () = assert!(features::CONFIG_FILE_SUPPORT);
+        const _: () = assert!(features::VERBOSE_LOGGING);
     }
 
     #[test]

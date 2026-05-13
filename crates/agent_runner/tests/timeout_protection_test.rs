@@ -233,7 +233,7 @@ async fn test_timeout_threshold_configuration() {
         },
     ];
 
-    for config in configs {
+    for config in &configs {
         assert!(
             config.threshold_seconds > 0,
             "{} 超时阈值应该大于 0",
@@ -245,9 +245,22 @@ async fn test_timeout_threshold_configuration() {
         );
     }
 
-    // 验证阈值递增关系
-    assert!(60 < 120, "warn 阈值应小于 error 阈值");
-    assert!(120 < 180, "error 阈值应小于 restart 阈值");
+    // 验证阈值递增关系（从 configs 实际读取，避免硬编码常量比较成为无意义的断言）
+    let threshold = |name: &str| -> u64 {
+        configs
+            .iter()
+            .find(|c| c.name == name)
+            .expect("config entry missing")
+            .threshold_seconds
+    };
+    assert!(
+        threshold("monitor_warn") < threshold("monitor_error"),
+        "warn 阈值应小于 error 阈值"
+    );
+    assert!(
+        threshold("monitor_error") < threshold("monitor_restart"),
+        "error 阈值应小于 restart 阈值"
+    );
 }
 
 /// 测试超时不会导致死锁

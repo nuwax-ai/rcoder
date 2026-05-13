@@ -1742,7 +1742,6 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     "[SACP] Step 4/4: Entering prompt processing loop, project_id={}, session_id={}",
                     project_id, session_id
                 );
-                let mut session_cancelled = false;
                 loop {
                     tokio::select! {
                         _ = cancel_token.cancelled() => {
@@ -1812,18 +1811,15 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
  info!("[SACP] cancel notification sent");
                                 // 通知调用方取消成功
                                 let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
-                                // 标记会话已取消，当前 prompt 完成后退出循环
-                                session_cancelled = true;
+                                // 注意：故意不退出 outer loop（保持 Agent 进程存活以接收后续 prompt）
+                                // 参见下方 prompt 分支的设计注释
                             }
                         }
                         Some(prompt_request) = prompt_rx.recv() => {
-                            // 收到新 prompt，重置取消标志
                             // 场景：用户快速发送 prompt A → cancel → prompt B
-                            // - cancel 设置 session_cancelled=true
-                            // - prompt B 到达时重置为 false，处理完后不 break
-                            // - 保持 outer loop 存活以接收后续 prompt
-                            session_cancelled = false;
- debug!("[SACP] received Prompt request");
+                            // - cancel 通知已发送给 Agent，但 outer loop 不退出
+                            // - prompt B 到达时直接继续处理，保持 Agent 进程存活
+                            debug!("[SACP] received Prompt request");
 
                             // 从 meta 中提取 request_id
                             let request_id = prompt_request
@@ -2013,8 +2009,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             // - outer loop 继续等待 prompt_rx.recv() → 收到新 prompt → 复用同一 Agent 进程
                             // - 上下文连续：同一子进程、同一 SACP 连接、同一对话历史
                             //
-                            // is_cancelled 不传播到 session_cancelled，保持 outer loop 存活。
-                            // session_cancelled 仅在 outer select 中收到 cancel（无活跃 prompt）时设置。
+                            // is_cancelled 仅是 inner loop 的局部标志，不退出 outer loop。
                             info!(
                                 "[SACP] Prompt cancelled, session ready for next prompt: project_id={}, session_id={}",
                                 project_id_for_prompt, session_id
