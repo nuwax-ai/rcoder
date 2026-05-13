@@ -178,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
             info!("using config: network cache TTL: {} seconds", ttl);
         }
         if let Some(capacity) = docker_config.cache_max_capacity {
-            default_config.cache_max_capacity = capacity as u64;
+            default_config.cache_max_capacity = capacity;
             info!("using config: cache max capacity: {}", capacity);
         }
 
@@ -351,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
                 hc.interval_seconds, hc.timeout_seconds
             );
             pingora_service
-                .start_health_check_loop(hc.interval_seconds, (hc.timeout_seconds * 1000) as u64);
+                .start_health_check_loop(hc.interval_seconds, ((hc.timeout_seconds * 1000)));
             info!("[Pingora] health check already started");
         }
 
@@ -569,12 +569,11 @@ async fn main() -> anyhow::Result<()> {
                                                    match Service::<std::net::SocketAddr>::call(&mut app_clone, addr).await {
                                                        Ok(service) => {
                                                            let hyper_service = TowerToHyperService::new(service);
-                                                           if let Err(e) = http_builder.serve_connection(io, hyper_service).await {
-                                                               if !e.to_string().contains("connection closed")
+                                                           if let Err(e) = http_builder.serve_connection(io, hyper_service).await
+                                                               && !e.to_string().contains("connection closed")
                                                                   && !e.to_string().contains("early eof") {
             tracing::debug!("HTTP connection error ({}): {}", addr, e);
                                                                }
-                                                           }
                                                        }
                                                        Err(_) => {
                                                            // Infallible 类型，不会发生

@@ -201,7 +201,7 @@ impl KubernetesRuntime {
                         let mut r = BTreeMap::new();
                         r.insert(
                             "storage".to_string(),
-                            Quantity(format!("{}", storage_size)),
+                            Quantity(storage_size.to_string()),
                         );
                         r
                     }),
@@ -328,13 +328,11 @@ impl KubernetesRuntime {
     fn detect_container_failure(pod: &Pod) -> Option<String> {
         let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
         for cs in statuses {
-            if let Some(state) = &cs.state {
-                if let Some(waiting) = &state.waiting {
-                    if let Some(reason) = &waiting.reason {
+            if let Some(state) = &cs.state
+                && let Some(waiting) = &state.waiting
+                    && let Some(reason) = &waiting.reason {
                         return Some(reason.clone());
                     }
-                }
-            }
         }
         None
     }
@@ -412,8 +410,8 @@ impl KubernetesRuntime {
                     }
 
                     // 检查 Pod 是否 Ready (需要 readinessProbe 返回成功)
-                    if let Some(status) = &pod.status {
-                        if let Some(conditions) = &status.conditions {
+                    if let Some(status) = &pod.status
+                        && let Some(conditions) = &status.conditions {
                             let all_ready = conditions
                                 .iter()
                                 .any(|c| c.type_ == "Ready" && c.status == "True");
@@ -429,7 +427,6 @@ impl KubernetesRuntime {
                                 .join(", ");
                             debug!("[K8S] Pod {} conditions: {}", pod_name, ready_status);
                         }
-                    }
                 }
                 Err(kube::Error::Api(ae)) if ae.code == 404 => {
                     // Pod 还没创建，继续等待
@@ -455,26 +452,23 @@ impl KubernetesRuntime {
         // 注意：ComputerAgentRunner 必须优先检查 RCODER_DOCKER_IMAGE_COMPUTER
         match service_type {
             ServiceType::ComputerAgentRunner => {
-                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER") {
-                    if !env_image.is_empty() {
+                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER")
+                    && !env_image.is_empty() {
                         info!("[K8S] Using image from RCODER_DOCKER_IMAGE_COMPUTER env: {}", env_image);
                         return env_image;
                     }
-                }
-                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE") {
-                    if !env_image.is_empty() {
+                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE")
+                    && !env_image.is_empty() {
                         info!("[K8S] Using image from RCODER_DOCKER_IMAGE env: {}", env_image);
                         return env_image;
                     }
-                }
             }
             _ => {
-                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE") {
-                    if !env_image.is_empty() {
+                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE")
+                    && !env_image.is_empty() {
                         info!("[K8S] Using image from RCODER_DOCKER_IMAGE env: {}", env_image);
                         return env_image;
                     }
-                }
             }
         }
 
@@ -619,8 +613,8 @@ impl ContainerRuntime for KubernetesRuntime {
         self.ensure_workspace_pvc(identifier, &service_type, None).await?;
 
         // Check if pod already exists and is running
-        if let Some(cached) = self.pod_cache.read().await.get(identifier) {
-            if cached.status == ContainerRuntimeStatus::Running {
+        if let Some(cached) = self.pod_cache.read().await.get(identifier)
+            && cached.status == ContainerRuntimeStatus::Running {
                 info!("[K8S] Pod {} already exists and is running", pod_name);
                 return self
                     .get_container_info_by_identifier(identifier, &service_type)
@@ -629,7 +623,6 @@ impl ContainerRuntime for KubernetesRuntime {
                         ContainerRuntimeError::ContainerNotFound(identifier.to_string())
                     });
             }
-        }
 
         let service_type_str = service_type.to_string();
         let image = self.select_image(&service_type);
@@ -659,7 +652,7 @@ impl ContainerRuntime for KubernetesRuntime {
         // Build resource requirements if limits are provided
         let resources = resource_limits
             .as_ref()
-            .and_then(|limits| Self::build_resource_requirements(limits));
+            .and_then(Self::build_resource_requirements);
 
         // Build workspace volume using PVC (NFS-backed persistent storage)
         // 每个项目/用户使用独立的 PVC，底层由 NFS Subdir External Provisioner
@@ -837,13 +830,12 @@ impl ContainerRuntime for KubernetesRuntime {
         identifier: &str,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         // Try cache first
-        if let Some(cached) = self.pod_cache.read().await.get(identifier) {
-            if cached.status == ContainerRuntimeStatus::Running {
+        if let Some(cached) = self.pod_cache.read().await.get(identifier)
+            && cached.status == ContainerRuntimeStatus::Running {
                 return Ok(Some(
                     self.build_container_basic_info(identifier, cached).await?,
                 ));
             }
-        }
 
         // Query K8s API - 尝试多种标识查询（与 label 构建逻辑一致）
         let search_queries = vec![
@@ -854,8 +846,8 @@ impl ContainerRuntime for KubernetesRuntime {
 
         for query in search_queries {
             let lp = ListParams::default().labels(&query);
-            if let Ok(pods) = self.pods().list(&lp).await {
-                if let Some(pod) = pods.items.into_iter().next() {
+            if let Ok(pods) = self.pods().list(&lp).await
+                && let Some(pod) = pods.items.into_iter().next() {
                     let status = Self::extract_pod_status(&pod);
                     let metadata = &pod.metadata;
                     let uid = metadata.uid.clone().unwrap_or_default();
@@ -869,7 +861,7 @@ impl ContainerRuntime for KubernetesRuntime {
                         .creation_timestamp
                         .as_ref()
                         .map(|ts| ts.0)
-                        .unwrap_or_else(|| Utc::now());
+                        .unwrap_or_else(Utc::now);
 
                     let pod_info = RuntimeContainerInfo {
                         container_id: uid,
@@ -892,7 +884,6 @@ impl ContainerRuntime for KubernetesRuntime {
                             .await?,
                     ));
                 }
-            }
         }
 
         Ok(None)
@@ -1066,7 +1057,7 @@ impl ContainerRuntime for KubernetesRuntime {
                     .creation_timestamp
                     .as_ref()
                     .map(|ts| ts.0)
-                    .unwrap_or_else(|| Utc::now()),
+                    .unwrap_or_else(Utc::now),
             };
             result.push(pod_info);
         }

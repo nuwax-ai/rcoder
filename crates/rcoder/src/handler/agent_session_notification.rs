@@ -473,7 +473,9 @@ async fn validate_and_get_session_context(
             );
 
             // 根据 service_type 选择不同的查询策略
-            let resolved_container_name = match project_info.service_type() {
+            
+
+            match project_info.service_type() {
                 Some(shared_types::ServiceType::ComputerAgentRunner) => {
                     // ComputerAgentRunner 模式：通过 user_id 查询容器
                     if let Some(user_id) = project_info.user_id() {
@@ -555,9 +557,7 @@ async fn validate_and_get_session_context(
                         }
                     }
                 }
-            };
-
-            resolved_container_name
+            }
         }
     };
 

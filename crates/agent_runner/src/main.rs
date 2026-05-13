@@ -36,8 +36,6 @@ use agent_runtime::AgentRuntime;
 use config::{CliArgs, load_config_with_args};
 use model::*;
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
-#[cfg(feature = "proxy")]
-use rcoder_proxy::{PingoraServerManager, ProxyConfig};
 use router::AppState;
 use std::fs::OpenOptions;
 use std::io::Write;

@@ -34,11 +34,11 @@ pub async fn api_key_middleware_handler(
             match err {
                 ApiKeyAuthError::Invalid | ApiKeyAuthError::Missing => {
                     warn!("🔒 [API_KEY_AUTH] {} for path: {}", err, path);
-                    return api_key_error_response(
+                    api_key_error_response(
                         StatusCode::UNAUTHORIZED,
                         shared_types::error_codes::ERR_API_KEY_AUTH_FAILED,
                         locale,
-                    );
+                    )
                 }
                 ApiKeyAuthError::ConfigError => {
                     tracing::error!("🔒 [API_KEY_AUTH] {}", err);

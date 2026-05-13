@@ -103,7 +103,7 @@ mod tests {
         );
 
         // 验证引用计数逻辑：存在活跃引用，不应该销毁容器
-        let related_projects = vec![proj_a.clone(), proj_b.clone(), proj_c.clone()];
+        let related_projects = [proj_a.clone(), proj_b.clone(), proj_c.clone()];
         let has_active_refs = related_projects.iter().any(|p| {
             p.project_id != "proj_A" && strategies::computer_runner::is_project_active(p, &config)
         });
@@ -318,7 +318,7 @@ mod tests {
         );
 
         // 验证引用计数逻辑：存在活跃引用，不应该销毁容器
-        let related_projects = vec![proj_a.clone(), proj_b.clone(), proj_c.clone()];
+        let related_projects = [proj_a.clone(), proj_b.clone(), proj_c.clone()];
         let has_active_refs = related_projects.iter().any(|p| {
             p.project_id != "proj_A" && strategies::computer_runner::is_project_active(p, &config)
         });
