@@ -300,7 +300,7 @@ mod tests {
         );
         assert_eq!(unified.sub_type, "end_turn");
         assert_eq!(unified.data["reason"], "EndTurn");
-        assert_eq!(unified.data["description"], "正常结束");
+        assert_eq!(unified.data["description"], "Normal end");
         assert!(
             !unified
                 .data
@@ -328,7 +328,7 @@ mod tests {
         );
         assert_eq!(unified.sub_type, "cancelled");
         assert_eq!(unified.data["reason"], "Cancelled");
-        assert_eq!(unified.data["description"], "用户取消");
+        assert_eq!(unified.data["description"], "User cancelled");
         assert_eq!(unified.data["error_message"], "Connection timeout");
         assert!(!unified.data.as_object().unwrap().contains_key("request_id"));
     }
@@ -350,7 +350,7 @@ mod tests {
         );
         assert_eq!(unified.sub_type, "cancelled");
         assert_eq!(unified.data["reason"], "Cancelled");
-        assert_eq!(unified.data["description"], "用户取消");
+        assert_eq!(unified.data["description"], "User cancelled");
         assert_eq!(unified.data["error_message"], "Connection timeout");
         assert_eq!(unified.data["request_id"], "req_123456789");
     }

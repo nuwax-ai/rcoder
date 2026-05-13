@@ -341,6 +341,9 @@ async fn handle_streaming_response(
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let mut stream_state = StreamState::new(response_id, model.to_string(), Some(request_context));
 
+    // SSE 事件序列号
+    let mut seq: u64 = 0;
+
     // 最大 SSE 缓冲区大小: 10MB
     const MAX_SSE_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 
@@ -418,7 +421,8 @@ async fn handle_streaming_response(
             };
 
             for resp_event in &response_events {
-                let sse_text = event_to_sse(resp_event);
+                let sse_text = event_to_sse(resp_event, seq);
+                seq += 1;
                 session
                     .write_response_body(Some(Bytes::from(sse_text)), false)
                     .await?;
@@ -441,7 +445,8 @@ async fn handle_streaming_response(
                         chat_chunk_to_response_events(&chat_chunk, &mut stream_state)
                     {
                         for resp_event in &response_events {
-                            let sse_text = event_to_sse(resp_event);
+                            let sse_text = event_to_sse(resp_event, seq);
+                            seq += 1;
                             session
                                 .write_response_body(Some(Bytes::from(sse_text)), false)
                                 .await?;

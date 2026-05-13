@@ -250,9 +250,9 @@ mod integration_tests {
     #[test]
     fn test_proxy_error() {
         let error = ProxyError::Config("Invalid port".to_string());
-        assert!(error.to_string().contains("配置错误"));
+        assert!(error.to_string().contains("config error"));
 
         let error = ProxyError::Network("Connection failed".to_string());
-        assert!(error.to_string().contains("网络错误"));
+        assert!(error.to_string().contains("network error"));
     }
 }

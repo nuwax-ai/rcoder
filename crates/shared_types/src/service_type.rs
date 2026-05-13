@@ -213,11 +213,11 @@ mod tests {
             "computer-agent-runner"
         );
 
-        assert!(ServiceType::RCoder.description().contains("完整"));
+        assert!(ServiceType::RCoder.description().contains("full"));
         assert!(
             ServiceType::ComputerAgentRunner
                 .description()
-                .contains("执行")
+                .contains("execution")
         );
     }
 

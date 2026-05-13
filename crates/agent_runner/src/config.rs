@@ -866,7 +866,10 @@ mod tests {
     #[test]
     fn test_agent_cleanup_default_values() {
         let config = AgentCleanupConfig::default();
-        assert_eq!(config.idle_timeout_secs, 300);
+        #[cfg(feature = "http-server")]
+        assert_eq!(config.idle_timeout_secs, 86400); // 24 hours in http-server mode
+        #[cfg(not(feature = "http-server"))]
+        assert_eq!(config.idle_timeout_secs, 300); // 5 minutes in CLI mode
         assert_eq!(config.cleanup_interval_secs, 30);
     }
 
