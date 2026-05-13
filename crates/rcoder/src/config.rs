@@ -597,11 +597,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     }
 
     // 配置验证
-    if let Some(docker_config) = &config.docker_config {
-        if let Err(e) = docker_config.validate_multi_image_config() {
+    if let Some(docker_config) = &config.docker_config
+        && let Err(e) = docker_config.validate_multi_image_config() {
             return Err(anyhow::anyhow!("Docker configuration validation failed: {}", e));
         }
-    }
 
     info!(
         "Final config: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",

@@ -373,7 +373,7 @@ pub async fn load_sacp_agent_config(
             agent_config.command,
             resolved_env
                 .get("ANTHROPIC_API_KEY")
-                .map(|v| mask_key(v))
+                .map(&mask_key)
                 .unwrap_or_default(),
             resolved_env
                 .get("ANTHROPIC_BASE_URL")
@@ -383,7 +383,7 @@ pub async fn load_sacp_agent_config(
                 .unwrap_or(&"<unset>".to_string()),
             resolved_env
                 .get("OPENAI_API_KEY")
-                .map(|v| mask_key(v))
+                .map(mask_key)
                 .unwrap_or_default(),
             resolved_env
                 .get("OPENAI_BASE_URL")
@@ -645,8 +645,8 @@ pub fn convert_context_servers_sacp(
                 };
 
             // 注入 D-Bus 会话地址
-            if let Some(ref addr) = dbus_address {
-                if !env_vars
+            if let Some(ref addr) = dbus_address
+                && !env_vars
                     .iter()
                     .any(|e| e.name == "DBUS_SESSION_BUS_ADDRESS")
                 {
@@ -655,7 +655,6 @@ pub fn convert_context_servers_sacp(
                         addr.clone(),
                     ));
                 }
-            }
 
             // 注入镜像源环境变量（npx/bunx/uvx 子进程使用）
             for (key, val) in crate::mirror_env::collect_mirror_env_vars() {
@@ -680,14 +679,13 @@ pub fn convert_context_servers_sacp(
 
             // 注入 HOME 环境变量（uvx/npx 等工具需要 HOME 来定位缓存目录）
             #[cfg(not(windows))]
-            if !env_vars.iter().any(|e| e.name == "HOME") {
-                if let Ok(home) = std::env::var("HOME") {
+            if !env_vars.iter().any(|e| e.name == "HOME")
+                && let Ok(home) = std::env::var("HOME") {
                     env_vars.push(agent_client_protocol::schema::EnvVariable::new(
                         "HOME".to_string(),
                         home,
                     ));
                 }
-            }
 
             // Windows: 注入 USERPROFILE 和 PATHEXT
             #[cfg(windows)]
@@ -843,8 +841,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             Vec::new()
         };
 
-        let mut command_path = command_path;
-        let mut command_args = command_args;
+        let command_path = command_path;
+        let command_args = command_args;
 
         #[cfg(windows)]
         if let Some((resolved_program, resolved_args)) =
@@ -1005,9 +1003,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         );
 
         // 获取 stdio 句柄（process_wrap 使用方法访问 stdio）
-        let stdin = take_stdio(&mut child.stdin(), "stdin")?;
-        let stdout = take_stdio(&mut child.stdout(), "stdout")?;
-        let stderr = take_stdio(&mut child.stderr(), "stderr")?;
+        let stdin = take_stdio(child.stdin(), "stdin")?;
+        let stdout = take_stdio(child.stdout(), "stdout")?;
+        let stderr = take_stdio(child.stderr(), "stderr")?;
 
         // 🔥 立即启动 stderr 读取任务（在 session_id 等待之前）
         // 这样即使子进程在初始化阶段就退出，也能捕获 stderr 输出
@@ -1552,11 +1550,10 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 // NewSession 应该是全新会话，不应携带旧的 resume session_id
                 let new_session_meta = {
                     let mut meta = system_prompt_meta.clone();
-                    if let Some(claude_code) = meta.get_mut("claudeCode").and_then(|v| v.as_object_mut()) {
-                        if let Some(options) = claude_code.get_mut("options").and_then(|v| v.as_object_mut()) {
+                    if let Some(claude_code) = meta.get_mut("claudeCode").and_then(|v| v.as_object_mut())
+                        && let Some(options) = claude_code.get_mut("options").and_then(|v| v.as_object_mut()) {
                             options.remove("resume");
                         }
-                    }
                     meta
                 };
 
@@ -1640,9 +1637,7 @@ async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     "[SACP] LoadSession failed ({}), NewSession also failed ({})",
                                     load_err, new_err
                                 )),
-                                Err(_) => Err(format!(
-                                    "[SACP] LoadSession failed (timeout), NewSession timeout"
-                                )),
+                                Err(_) => Err("[SACP] LoadSession failed (timeout), NewSession timeout".to_string()),
                             }
                         }
                         Err(_) => {

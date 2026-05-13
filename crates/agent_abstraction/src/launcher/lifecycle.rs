@@ -299,11 +299,10 @@ impl AgentLifecycleGuard {
                 }
                 Err(e) => {
                     // wait 失败，可能是进程已被其他方式回收
-                    if let Some(ref flag) = abnormal_exit_flag_clone {
-                        if !was_cancelled {
+                    if let Some(ref flag) = abnormal_exit_flag_clone
+                        && !was_cancelled {
                             flag.store(true, Ordering::SeqCst);
                         }
-                    }
                     warn!(
                         "[ProcessReaper] Agent 进程 wait() 失败: project_id={}, pid={}, pgid={}, error={}, was_cancelled={}",
                         project_id_for_reaper, pid, pgid, e, was_cancelled

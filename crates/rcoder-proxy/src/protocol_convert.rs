@@ -445,8 +445,8 @@ async fn handle_streaming_response(
                 if event.data.is_empty() || event.data == "[DONE]" {
                     continue;
                 }
-                if let Ok(chat_chunk) = serde_json::from_str::<ChatStreamChunk>(&event.data) {
-                    if let Ok(response_events) =
+                if let Ok(chat_chunk) = serde_json::from_str::<ChatStreamChunk>(&event.data)
+                    && let Ok(response_events) =
                         chat_chunk_to_response_events(&chat_chunk, &mut stream_state)
                     {
                         for resp_event in &response_events {
@@ -456,7 +456,6 @@ async fn handle_streaming_response(
                                 .await?;
                         }
                     }
-                }
             }
         }
     }

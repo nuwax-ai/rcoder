@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 
@@ -292,7 +292,7 @@ pub async fn agent_worker_with_heartbeat(
     mut request_rx: mpsc::Receiver<AgentRequest>,
     state: Arc<crate::agent_runtime::AtomicState>,
     last_heartbeat_ts: Arc<std::sync::atomic::AtomicI64>,
-    active_requests: Arc<tokio::sync::Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
+    _active_requests: Arc<tokio::sync::Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 ) -> Result<()> {
     info!("agent_worker started (SACP version with heartbeat), listening for requests...");
 
@@ -477,10 +477,7 @@ pub async fn agent_worker_with_heartbeat(
                         project_id: project_id.clone(),
                         session_id: String::new(),
                         code: shared_types::error_codes::ERR_TOO_MANY_REQUESTS.to_string(),
-                        error: Some(format!(
-                            "{}",
-                            shared_types::error_codes::get_i18n_message_default("error.system_busy")
-                        ).replace("{}", &limit.to_string())),
+                        error: Some(shared_types::error_codes::get_i18n_message_default("error.system_busy").to_string().replace("{}", &limit.to_string())),
                         request_id: Some(request_id.clone()),
                         service_type: request.prompt_message.service_type.clone(),
                     }) {

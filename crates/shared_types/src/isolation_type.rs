@@ -13,20 +13,17 @@ use utoipa::ToSchema;
 /// - Space: 空间隔离，同一租户同一空间下的用户共享容器
 /// - Project: 项目隔离，每个项目独立容器（默认行为）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
+#[derive(Default)]
 pub enum IsolationType {
     /// 租户隔离：同一租户共用一个容器
     Tenant,
     /// 空间隔离：同一租户同一空间共用一个容器
     Space,
     /// 项目隔离：每个项目独立容器（当前默认逻辑）
+    #[default]
     Project,
 }
 
-impl Default for IsolationType {
-    fn default() -> Self {
-        IsolationType::Project
-    }
-}
 
 impl IsolationType {
     /// 从字符串解析隔离类型

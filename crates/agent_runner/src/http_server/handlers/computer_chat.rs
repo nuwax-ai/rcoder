@@ -83,7 +83,7 @@ pub async fn handle_computer_chat(
         ));
     }
 
-    let user_id = request.user_id.clone();
+    let _user_id = request.user_id.clone();
 
     // 2. 生成或使用提供的 project_id (直接用 UUID，去掉连字符，与 rcoder 保持一致)
     let project_id = request

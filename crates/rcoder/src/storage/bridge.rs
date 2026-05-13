@@ -40,11 +40,10 @@ impl DataBridge {
         info.set_request_id(record.request_id.clone());
 
         // 设置模型提供商配置
-        if let Some(json) = &record.model_provider_json {
-            if let Ok(config) = serde_json::from_str::<ModelProviderConfig>(json) {
+        if let Some(json) = &record.model_provider_json
+            && let Ok(config) = serde_json::from_str::<ModelProviderConfig>(json) {
                 info.set_model_provider(Some(config));
             }
-        }
 
         // 🔧 关键修复：从 record 恢复原始的时间戳
         // 否则 created_at 会被 new() 设置为当前时间，导致清理任务一直认为容器"刚创建"
@@ -86,11 +85,10 @@ impl DataBridge {
         record.request_id = info.request_id().map(|s| s.to_string());
 
         // 设置模型提供商配置
-        if let Some(config) = info.model_provider() {
-            if let Ok(json) = serde_json::to_string(config) {
+        if let Some(config) = info.model_provider()
+            && let Ok(json) = serde_json::to_string(config) {
                 record.model_provider_json = Some(json);
             }
-        }
 
         // 设置时间戳
         record.created_at = info.created_at();

@@ -319,8 +319,8 @@ pub async fn handle_chat_core(
 
     // ========== 步骤2: 检查 Agent Busy 状态，如果忙则取消当前任务 ==========
     use crate::model::AgentStatus;
-    if let Some(agent_info) = agent_info_ref {
-        if agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending {
+    if let Some(agent_info) = agent_info_ref
+        && (agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending) {
             info!(
                 "[ChatHandler] Agent Busy, cancelling current task: project_id={}, status={:?}, session_id={:?}",
                 project_id, agent_info.status, session_id
@@ -352,7 +352,6 @@ pub async fn handle_chat_core(
                 project_id
             );
         }
-    }
 
     // ========== 步骤3: 创建 PendingGuard（RAII）==========
     // 自动在作用域结束时清理，避免状态泄漏
@@ -385,8 +384,8 @@ pub async fn handle_chat_core(
     );
 
     // 确保目录存在
-    if !project_dir.exists() {
-        if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
+    if !project_dir.exists()
+        && let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
             error!("[ChatHandler] Failed to create project directory: {}", e);
             return ChatHandlerOutput::error(
                 project_id,
@@ -399,7 +398,6 @@ pub async fn handle_chat_core(
                 error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
             );
         }
-    }
 
     // ========== 步骤6: 构建 ChatPrompt 和 PromptMessage ==========
     let chat_prompt = match ChatPromptBuilder::default()
@@ -446,7 +444,7 @@ pub async fn handle_chat_core(
     };
 
     // 存储 API 配置到共享 DashMap
-    if let (Some(ref provider), Some(ref service_uuid_ref)) =
+    if let (Some(provider), Some(ref service_uuid_ref)) =
         (model_provider.as_ref(), service_uuid.as_ref())
     {
         debug!(
@@ -462,7 +460,7 @@ pub async fn handle_chat_core(
         // 存储 ModelProviderConfig 到共享 DashMap（使用 UUID 作为 key）
         context
             .shared_api_key_manager
-            .insert(service_uuid_ref.to_string(), (*provider).clone());
+            .insert(service_uuid_ref.to_string(), provider.clone());
 
         // 存储 project_id -> UUID 映射（用于后续清理时查找）
         context

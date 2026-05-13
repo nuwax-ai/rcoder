@@ -42,7 +42,7 @@ fn find_bin_dir(executable: &str) -> Option<String> {
             let bin_dir = parent
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| {
+                .and_then(|n| {
                     if n.eq_ignore_ascii_case("cmd") {
                         parent
                             .parent()
@@ -50,13 +50,11 @@ fn find_bin_dir(executable: &str) -> Option<String> {
                     } else {
                         None
                     }
-                })
-                .flatten();
-            if let Some(bin) = bin_dir {
-                if PathBuf::from(&bin).join("bash.exe").exists() {
+                });
+            if let Some(bin) = bin_dir
+                && PathBuf::from(&bin).join("bash.exe").exists() {
                     return Some(bin);
                 }
-            }
         }
 
         Some(parent_str)

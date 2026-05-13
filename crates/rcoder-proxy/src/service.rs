@@ -744,8 +744,7 @@ impl ProxyHttp for PortProxy {
         // 仅在 API 代理场景且上游返回 4xx/5xx 时捕获
         if let (Some(status), Some(service_name)) =
             (ctx.upstream_status, ctx.api_service_name.as_ref())
-        {
-            if status >= 400 {
+            && status >= 400 {
                 // 限制捕获大小（最多 4KB，避免 OOM）
                 const MAX_ERROR_BODY: usize = 4096;
                 if let Some(b) = body.as_ref() {
@@ -764,7 +763,6 @@ impl ProxyHttp for PortProxy {
                     );
                 }
             }
-        }
 
         // 不修改响应体，透传给客户端
         Ok(None)

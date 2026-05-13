@@ -182,7 +182,7 @@ impl ContainerCreateParamsBuilder {
             user_id: self.user_id,
             host_workspace_path: self
                 .host_workspace_path
-                .unwrap_or_else(|| String::new()),
+                .unwrap_or_default(),
             service_type: self.service_type.unwrap_or(ServiceType::RCoder),
             resource_limits: self.resource_limits,
             pod_id: self.pod_id,

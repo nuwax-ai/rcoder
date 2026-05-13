@@ -122,7 +122,7 @@ impl GrpcChannelPool {
     ///
     /// 每次调用时检查并清理过期连接，保持缓存高效。
     fn cleanup_expired(&self) {
-        let len = self.channels.len();
+        let _len = self.channels.len();
 
         // 收集所有过期连接的键
         let expired: Vec<String> = self

@@ -158,7 +158,7 @@ pub async fn computer_agent_stop(
 
             if response.success {
                 // 🆕 清除 rcoder 端的 session_id（即使成功停止，也清理会话状态）
-                state.clear_session(&project_id);
+                state.clear_session(project_id);
 
                 let message = format!(
                     "Agent {} stopped successfully, container {} continues running",
@@ -197,7 +197,7 @@ pub async fn computer_agent_stop(
                             project_id
                         );
                         // 🆕 清除 rcoder 端的 session_id（即使 Agent 已停止，也清理会话状态）
-                        state.clear_session(&project_id);
+                        state.clear_session(project_id);
 
                         let message =
                             shared_types::get_i18n_message("success.agent_already_stopped", locale);

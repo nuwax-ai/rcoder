@@ -259,9 +259,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptStart),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptStart)
         );
         assert_eq!(unified.sub_type, "prompt_start");
         assert_eq!(unified.data, serde_json::json!({}));
@@ -277,9 +276,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptStart),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptStart)
         );
         assert_eq!(unified.sub_type, "prompt_start");
         assert_eq!(unified.data["request_id"], "req_123456789");
@@ -297,9 +295,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd)
         );
         assert_eq!(unified.sub_type, "end_turn");
         assert_eq!(unified.data["reason"], "EndTurn");
@@ -326,9 +323,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd)
         );
         assert_eq!(unified.sub_type, "cancelled");
         assert_eq!(unified.data["reason"], "Cancelled");
@@ -349,9 +345,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd)
         );
         assert_eq!(unified.sub_type, "cancelled");
         assert_eq!(unified.data["reason"], "Cancelled");
@@ -374,9 +369,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::AgentSessionUpdate),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::AgentSessionUpdate)
         );
         assert_eq!(unified.sub_type, "agent_message_chunk");
 
@@ -401,9 +395,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::AgentSessionUpdate),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::AgentSessionUpdate)
         );
         assert_eq!(unified.sub_type, "agent_message_chunk");
         // ACP 0.8 中 ContentChunk 的格式：{"content": {"text": "...", "type": "text"}}
@@ -423,9 +416,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd)
         );
         assert_eq!(unified.sub_type, "error");
 
@@ -447,9 +439,8 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
+        assert!(
+            matches!(unified.message_type, SessionMessageType::SessionPromptEnd)
         );
         assert_eq!(unified.sub_type, "error");
 

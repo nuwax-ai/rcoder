@@ -216,10 +216,10 @@ async fn forward_cancel_request_to_container_service(
             }
 
             // 其他 gRPC 通信失败（网络错误等）
-            return Ok(HttpResult::error_with_locale(
+            Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 locale,
-            ));
+            ))
         }
     }
 }
@@ -536,7 +536,7 @@ pub async fn agent_session_cancel(
     summary = "转发 Computer Agent 任务取消请求（支持 user_id）",
     description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器"
 )]
-#[instrument(skip(state), fields(user_id = ?request.user_id.as_ref().map(|s| s.as_str()), project_id = %request.project_id, pod_id = ?request.pod_id.as_ref().map(|s| s.as_str())))]
+#[instrument(skip(state), fields(user_id = ?request.user_id.as_deref(), project_id = %request.project_id, pod_id = ?request.pod_id.as_deref()))]
 pub async fn computer_agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

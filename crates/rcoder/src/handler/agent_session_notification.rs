@@ -479,7 +479,7 @@ async fn validate_and_get_session_context(
                     if let Some(user_id) = project_info.user_id() {
                         match runtime
                             .get_container_info_by_identifier(
-                                &user_id,
+                                user_id,
                                 &shared_types::ServiceType::ComputerAgentRunner,
                             )
                             .await

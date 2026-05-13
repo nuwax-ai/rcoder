@@ -167,7 +167,7 @@ impl AgentHttpService for LocalAgentHttpService {
                 project_id: project_id.to_string(),
                 is_alive: true,
                 session_id: Some(info.session_id.to_string()),
-                status: Some(info.status.clone()),
+                status: Some(info.status),
                 last_activity: Some(info.last_activity),
                 created_at: Some(info.created_at),
                 model_provider: None, // AgentRegistry 不存储 model_provider

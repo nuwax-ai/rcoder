@@ -83,11 +83,10 @@ pub fn parse_accept_language(accept_language: Option<&str>) -> &'static str {
                             lang = seg;
                             continue;
                         }
-                        if let Some(value) = seg.strip_prefix("q=") {
-                            if let Ok(parsed) = value.parse::<f32>() {
+                        if let Some(value) = seg.strip_prefix("q=")
+                            && let Ok(parsed) = value.parse::<f32>() {
                                 q = parsed.clamp(0.0, 1.0);
                             }
-                        }
                     }
 
                     (lang, q, idx)

@@ -255,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
     // 🆕 Initializing telemetry system（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
-    let telemetry = Arc::new(telemetry);
+    let _telemetry = Arc::new(telemetry);
 
     // 🆕 Pyroscope Profiler 初始化（可选：需要 pyroscope feature）
     #[cfg(feature = "pyroscope")]
@@ -300,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
     info!("📌 [MAIN] Agent Worker started");
 
     // 🔥 启动健康检查和重启任务
-    let health_monitor = spawn_health_monitor(agent_runtime.clone());
+    let _health_monitor = spawn_health_monitor(agent_runtime.clone());
     info!("[MAIN] Worker health monitor started");
 
     // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
@@ -582,7 +582,7 @@ async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHa
                 }
 
                 // 创建新的通道
-                let (new_tx, new_rx) = tokio::sync::mpsc::channel(1000);
+                let (_new_tx, new_rx) = tokio::sync::mpsc::channel(1000);
 
                 // 重启 worker
                 runtime.restart(new_rx).await;

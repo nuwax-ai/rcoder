@@ -7,5 +7,4 @@ pub mod handlers;
 pub mod router;
 pub mod start;
 
-pub use router::{AppState, create_router};
 pub use start::{HttpServerConfig, start_http_server};

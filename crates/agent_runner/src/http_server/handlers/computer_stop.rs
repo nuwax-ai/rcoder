@@ -46,7 +46,7 @@ pub async fn handle_computer_stop(
     let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
 
     // 验证 user_id 或 project_id 至少有一个
-    let user_id_empty = request.user_id.as_ref().map_or(true, |s| s.is_empty());
+    let user_id_empty = request.user_id.as_ref().is_none_or(|s| s.is_empty());
     if user_id_empty && project_id.is_empty() {
         return Err(shared_types::AppError::with_i18n_key(
             ERR_VALIDATION,

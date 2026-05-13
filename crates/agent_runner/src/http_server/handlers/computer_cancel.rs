@@ -51,7 +51,7 @@ pub async fn handle_computer_cancel(
 
     // 1. 验证必填字段
     // user_id 是 Option<String>，需要用 as_ref() 或直接检查
-    if request.user_id.as_ref().map_or(true, |s| s.is_empty()) {
+    if request.user_id.as_ref().is_none_or(|s| s.is_empty()) {
         return Err(AppError::with_i18n_key(
             ERR_VALIDATION,
             &get_i18n_message("error.user_id_required", locale),

@@ -3,7 +3,7 @@ use super::{
     ContainerRemovalFailure, ContainerStatus, DockerContainerConfig, DockerContainerInfo,
     DockerError, DockerManagerConfig, DockerResult,
 };
-use container_runtime_api::{ContainerRuntimeStatus, RemovedContainerInfo};
+use container_runtime_api::RemovedContainerInfo;
 use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
 use anyhow::Result;
 use bollard::query_parameters::{
@@ -1199,7 +1199,7 @@ impl DockerManager {
                     })
                     .and_then(|s| {
                         Self::parse_rfc3339_timestamp(&s, "created")
-                            .map_err(|e| DockerError::InvalidTimestamp(e))
+                            .map_err(DockerError::InvalidTimestamp)
                     })?;
 
                 // 解析镜像
@@ -1246,11 +1246,10 @@ impl DockerManager {
                                         if let Some(ref host_port) = binding.host_port {
                                             ports.insert(container_port.clone(), host_port.clone());
                                             // 尝试解析为数字端口
-                                            if assigned == 0 {
-                                                if let Ok(port) = host_port.parse::<u16>() {
+                                            if assigned == 0
+                                                && let Ok(port) = host_port.parse::<u16>() {
                                                     assigned = port;
                                                 }
-                                            }
                                         }
                                     }
                                 }
@@ -1553,7 +1552,7 @@ impl DockerManager {
                             (sub.clone(), std::path::PathBuf::from(&workspace_container).join(&sub))
                         }
                         Some(ref it) if it == "tenant" => {
-                            let sub = format!("{}", tid);
+                            let sub = tid.to_string();
                             (sub.clone(), std::path::PathBuf::from(&workspace_container).join(&sub))
                         }
                         _ => {
@@ -2762,15 +2761,14 @@ impl DockerManager {
             .into_iter()
             .filter(|container| {
                 // 排除当前容器自己
-                if let Some(ref current_id) = current_container_id {
-                    if let Some(ref container_id) = container.id {
+                if let Some(ref current_id) = current_container_id
+                    && let Some(ref container_id) = container.id {
                         // HOSTNAME 是容器 ID 的前 12 位
                         if container_id.starts_with(current_id) {
                             info!("🚫 skip removing container: {}", container_id);
                             return false;
                         }
                     }
-                }
                 filter.matches(container)
             })
             .collect();
@@ -3167,7 +3165,7 @@ mod tests {
                     println!(" Docker API created: {}", created_str);
 
                     // 解析时间戳
-                    match DateTime::parse_from_rfc3339(&created_str) {
+                    match DateTime::parse_from_rfc3339(created_str) {
                         Ok(created_time) => {
                             let created_time_utc = created_time.with_timezone(&Utc);
                             println!(" created UTC: {}", created_time_utc);
@@ -3199,7 +3197,7 @@ mod tests {
 
                 use std::process::Command;
                 let output = Command::new("docker")
-                    .args(&["inspect", container_name, "--format", "{{.Created}}"])
+                    .args(["inspect", container_name, "--format", "{{.Created}}"])
                     .output()
                     .expect("Failed to run docker inspect");
 
@@ -3212,8 +3210,8 @@ mod tests {
                     println!("   Docker CLI UTC: {}", docker_time_utc);
 
                     // 从 Docker API 获取的时间
-                    if let Some(ref created_str) = details.created {
-                        if let Ok(api_time) = DateTime::parse_from_rfc3339(&created_str) {
+                    if let Some(ref created_str) = details.created
+                        && let Ok(api_time) = DateTime::parse_from_rfc3339(created_str) {
                             let api_time_utc = api_time.with_timezone(&Utc);
                             println!(" API created UTC: {}", api_time_utc);
 
@@ -3225,7 +3223,6 @@ mod tests {
                             assert_eq!(diff, 0, "API 和 CLI 返回的时间应该完全一致");
                             println!("\n✅ Docker CLI check passed!");
                         }
-                    }
                 }
             }
             Err(e) => {

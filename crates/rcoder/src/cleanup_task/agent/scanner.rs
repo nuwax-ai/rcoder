@@ -40,11 +40,10 @@ impl AgentScanner {
         let project_ids: Vec<String> = self.state.projects.iter().map(|(id, _)| id).collect();
 
         for project_id in project_ids {
-            if let Some(agent) = self.state.get_project(&project_id) {
-                if self.should_cleanup_agent(&agent, current_time).await {
+            if let Some(agent) = self.state.get_project(&project_id)
+                && self.should_cleanup_agent(&agent, current_time).await {
                     idle_agents.push(project_id);
                 }
-            }
         }
 
         info!(
@@ -122,7 +121,7 @@ impl AgentScanner {
         }
 
         // 保护期检查
-        if self.should_skip_cleanup_due_to_protection(agent.created_at(), &agent.project_id()) {
+        if self.should_skip_cleanup_due_to_protection(agent.created_at(), agent.project_id()) {
             return false;
         }
 

@@ -99,8 +99,8 @@ impl AgentCleaner {
                 .get_project(&project_id)
                 .and_then(|info| info.container().map(|c| c.container_name.clone()));
 
-            if let Some(ref name) = container_name {
-                if destroyed_containers.contains(name) {
+            if let Some(ref name) = container_name
+                && destroyed_containers.contains(name) {
                     // 容器已被销毁，只需删除项目记录
                     self.state.remove_project(&project_id);
                     current_stats.total_cleaned += 1;
@@ -111,7 +111,6 @@ impl AgentCleaner {
                     );
                     continue;
                 }
-            }
 
             current_stats.total_cleaned += 1;
 
@@ -184,8 +183,8 @@ impl AgentCleaner {
 
         // 4. 如果需要销毁容器
         let mut container_destroyed = false;
-        if let Some(reason) = destroy_reason {
-            if let Some(container_info) = agent_info.container() {
+        if let Some(reason) = destroy_reason
+            && let Some(container_info) = agent_info.container() {
                 let project_info = super::strategies::ProjectInfo {
                     project_id: agent_info.project_id().to_string(),
                     user_id: agent_info.user_id().map(|s| s.to_string()),
@@ -209,7 +208,6 @@ impl AgentCleaner {
 
                 container_destroyed = true;
             }
-        }
 
         // 5. 从存储中移除项目记录（始终执行）
         self.state.remove_project(project_id);

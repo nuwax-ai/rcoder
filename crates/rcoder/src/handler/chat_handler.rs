@@ -4,11 +4,9 @@
 
 use anyhow::Result;
 use axum::{extract::State, http::HeaderMap};
-use serde::{Deserialize, Serialize};
-use shared_types::{AgentChatRequest, ChatAgentConfig, IsolationType, ModelProviderConfig, ProjectAndContainerInfo};
+use shared_types::{AgentChatRequest, IsolationType, ProjectAndContainerInfo};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
-use utoipa::ToSchema;
 
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
@@ -121,8 +119,8 @@ pub async fn handle_chat(
         }
 
         // 验证 isolation_type 值有效（大小写不敏感）
-        if let Some(ref it) = request.isolation_type {
-            if IsolationType::from_str(it).is_err() {
+        if let Some(ref it) = request.isolation_type
+            && IsolationType::from_str(it).is_err() {
                 error!("[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
                 return Ok(HttpResult::error_with_message(
                     shared_types::error_codes::ERR_VALIDATION,
@@ -130,7 +128,6 @@ pub async fn handle_chat(
                     &format!("invalid isolation_type '{}', expected: tenant, space, project", it),
                 ));
             }
-        }
 
         // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
         if let (Some(pid), Some(it), Some(tid), Some(sid)) = (
@@ -164,13 +161,12 @@ pub async fn handle_chat(
     );
 
     // 验证资源限制配置
-    if let Some(ref agent_config) = request.agent_config {
-        if let Some(ref resource_limits) = agent_config.resource_limits {
+    if let Some(ref agent_config) = request.agent_config
+        && let Some(ref resource_limits) = agent_config.resource_limits {
             resource_limits.validate().map_err(|e| {
                 AppError::validation_error(&format!("Invalid resource limits: {}", e))
             })?;
         }
-    }
 
     info!(
         "🚀 [CHAT] Starting to process chat request: project_id={}, session_id={:?}, prompt_length={}, attachments_count={}, model_provider={}",
@@ -355,8 +351,8 @@ pub async fn handle_chat(
     // 响应后状态更新 - 使用 DuckDB 存储
     // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
     // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
-    if let Ok(http_result) = &result {
-        if let Some(chat_response) = &http_result.data {
+    if let Ok(http_result) = &result
+        && let Some(chat_response) = &http_result.data {
             let session_id = chat_response.session_id.clone();
 
             // 只有当 session_id 非空时才更新映射
@@ -390,10 +386,9 @@ pub async fn handle_chat(
                 }
             }
         }
-    }
 
     if result.as_ref().map_or(true, |r| {
-        !r.is_success() && r.data.as_ref().map_or(true, |d| d.session_id.is_empty())
+        !r.is_success() && r.data.as_ref().is_none_or(|d| d.session_id.is_empty())
     }) {
         error!("[CHAT] Container returned error: {:?}", result);
     }

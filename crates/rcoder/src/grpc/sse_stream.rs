@@ -358,7 +358,7 @@ pub async fn get_container_grpc_addr(project_id: &str, grpc_port: u16) -> anyhow
 fn create_grpc_stream_error_event(
     session_id: &str,
     code: Code,
-    message: &str,
+    _message: &str,
 ) -> axum::response::sse::Event {
     // 使用项目标准的错误码映射
     let error_code = map_tonic_code_to_error_code(code);

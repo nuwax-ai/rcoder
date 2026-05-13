@@ -20,7 +20,7 @@ static DEFAULT_LOCALE_CACHED: OnceLock<&'static str> = OnceLock::new();
 ///
 /// 使用 OnceLock 缓存，只在首次调用时读取环境变量
 fn get_default_locale_from_env() -> &'static str {
-    *DEFAULT_LOCALE_CACHED.get_or_init(|| {
+    DEFAULT_LOCALE_CACHED.get_or_init(|| {
         if let Ok(locale) = std::env::var("DEFAULT_LOCALE") {
             // 验证是否为支持的语言
             if SUPPORTED_LOCALES.contains(&locale.as_str()) {

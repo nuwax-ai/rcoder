@@ -1,7 +1,6 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::{
     Router,

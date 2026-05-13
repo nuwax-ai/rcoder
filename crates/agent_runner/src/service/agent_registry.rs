@@ -430,11 +430,10 @@ impl AgentSessionRegistry {
                     let (_, _removed) = entry.remove_entry();
                     // 使用 entry API 安全移除 project_to_session 映射
                     // 仅当映射仍指向 "pending" 时才移除，避免与 register() 的竞态条件
-                    if let Entry::Occupied(oe) = self.project_to_session.entry(project_id.to_string()) {
-                        if oe.get().as_str() == "pending" {
+                    if let Entry::Occupied(oe) = self.project_to_session.entry(project_id.to_string())
+                        && oe.get().as_str() == "pending" {
                             oe.remove_entry();
                         }
-                    }
                     // Pending 占位符不占用槽位，无需 release_session_slot
                     info!(
                         "🗑️ [Registry] Cleared Pending placeholder: project_id={}",

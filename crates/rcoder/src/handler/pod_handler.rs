@@ -60,11 +60,10 @@ fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
             return Err("swap must be at least 512MB".to_string());
         }
         // swap 必须 >= memory（如果两者都设置了）
-        if let (Some(memory), Some(swap_val)) = (limits.memory, limits.swap) {
-            if swap_val < memory {
+        if let (Some(memory), Some(swap_val)) = (limits.memory, limits.swap)
+            && swap_val < memory {
                 return Err("swap should be >= memory".to_string());
             }
-        }
     }
 
     Ok(())
@@ -82,7 +81,7 @@ fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
 
     // 直接从毫秒时间戳创建 DateTime<Utc>
     let datetime = DateTime::from_timestamp_millis(timestamp_millis as i64)
-        .unwrap_or_else(|| DateTime::UNIX_EPOCH);
+        .unwrap_or(DateTime::UNIX_EPOCH);
 
     // 创建东八区时区偏移 (UTC+8)
     // 注意: east_opt 在参数有效时总是返回 Some，这里使用 unwrap_or 仅作为安全保障
@@ -468,9 +467,9 @@ pub async fn pod_count(
             continue;
         }
 
-        if container.container_name.starts_with(&rcoder_prefix) {
+        if container.container_name.starts_with(rcoder_prefix) {
             rcoder_count += 1;
-        } else if container.container_name.starts_with(&computer_prefix) {
+        } else if container.container_name.starts_with(computer_prefix) {
             computer_count += 1;
         }
     }
@@ -613,7 +612,7 @@ pub async fn pod_list(
                     .and_then(|projects| {
                         projects
                             .first()
-                            .and_then(|p| p.user_id.as_ref().map(|s| s.clone()))
+                            .and_then(|p| p.user_id.clone())
                     })
             })
         });
@@ -717,15 +716,14 @@ pub async fn pod_ensure(
     }
 
     // 1.1 验证资源限制
-    if let Some(ref limits) = request.resource_limits {
-        if let Err(e) = validate_resource_limits(limits) {
+    if let Some(ref limits) = request.resource_limits
+        && let Err(e) = validate_resource_limits(limits) {
             error!("[POD_ENSURE] resources update failed: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
                 locale,
             ));
         }
-    }
 
     info!(
         "🚀 [POD_ENSURE] Ensuring container exists: user_id={}, project_id={}",
@@ -753,8 +751,8 @@ pub async fn pod_ensure(
                 // 标记已被移除 = 创建完成
                 if !state.pod_creating.contains_key(&request.user_id) {
                     // 尝试获取容器信息
-                    if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await {
-                        if let Ok(Some(info)) = runtime
+                    if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await
+                        && let Ok(Some(info)) = runtime
                             .get_container_info_by_identifier(
                                 &request.user_id,
                                 &shared_types::ServiceType::ComputerAgentRunner,
@@ -768,7 +766,6 @@ pub async fn pod_ensure(
                             waited_container_info = Some(info);
                             break;
                         }
-                    }
                 }
 
                 if wait_sec % 5 == 0 {
@@ -1127,8 +1124,8 @@ pub async fn pod_ensure(
 
     // 4. 🆕 如果是新创建的容器，立即同步 VNC 后端映射
     // 这消除了等待定时同步任务（最多 5 秒）的空窗期
-    if created {
-        if let Some(ref pingora_service) = state.pingora_service {
+    if created
+        && let Some(ref pingora_service) = state.pingora_service {
             sync_single_vnc_backend(
                 pingora_service,
                 &request.user_id,
@@ -1140,7 +1137,6 @@ pub async fn pod_ensure(
                 request.user_id, container_info.container_ip
             );
         }
-    }
 
     // 5. 更新 DuckDB 存储中的容器信息（用于后续保活）
     // 无论容器是新建还是已存在，都要确保 DuckDB 记录是最新的
@@ -1428,15 +1424,14 @@ pub async fn pod_restart(
     }
 
     // 1.1 验证资源限制
-    if let Some(ref limits) = request.resource_limits {
-        if let Err(e) = validate_resource_limits(limits) {
+    if let Some(ref limits) = request.resource_limits
+        && let Err(e) = validate_resource_limits(limits) {
             error!("[POD_RESTART] resources update failed: {}", e);
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
                 locale,
             ));
         }
-    }
 
     info!(
         "🔄 [POD_RESTART] Restarting container: user_id={}, project_id={}",
@@ -1853,8 +1848,8 @@ pub async fn pod_status(
     }
 
     // 5. 如果用 user_id 没找到，且同时提供了 project_id，再试 project_id
-    if params.user_id.is_some() {
-        if let Some(ref project_id) = params.project_id {
+    if params.user_id.is_some()
+        && let Some(ref project_id) = params.project_id {
             match runtime
                 .find_container(project_id, &shared_types::ServiceType::RCoder)
                 .await
@@ -1895,7 +1890,6 @@ pub async fn pod_status(
                 }
             }
         }
-    }
 
     // 6. 未找到容器
     info!(
@@ -2018,15 +2012,14 @@ pub async fn pod_vnc_status(
     let pod_id = params.pod_id.as_deref().filter(|s| !s.trim().is_empty());
 
     // 1.1 验证隔离参数完整性（当 pod_id 有值时）
-    if pod_id.is_some() {
-        if params.isolation_type.is_none() || params.tenant_id.is_none() || params.space_id.is_none() {
+    if pod_id.is_some()
+        && (params.isolation_type.is_none() || params.tenant_id.is_none() || params.space_id.is_none()) {
             error!("[POD_VNC_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided");
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
             ));
         }
-    }
 
     if pod_id.is_none() && user_id.is_none() && project_id.is_none() {
         warn!("[POD_VNC_STATUS] pod_id, user_id and project_id are all empty");

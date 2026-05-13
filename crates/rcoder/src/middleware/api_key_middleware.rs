@@ -42,13 +42,13 @@ pub async fn api_key_middleware_handler(
                 }
                 ApiKeyAuthError::ConfigError => {
                     tracing::error!("🔒 [API_KEY_AUTH] {}", err);
-                    return api_key_error_response(
+                    api_key_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
                         locale,
-                    );
+                    )
                 }
-            };
+            }
         }
     }
 }

@@ -7,7 +7,7 @@
 //! 4. 原子计数器的并发安全性
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Barrier;
 
@@ -70,7 +70,7 @@ fn test_pending_guard_early_return_cleanup() {
     let early_return = || {
         let _guard = PendingGuard::new(&registry, "test-project");
         // 早期返回（模拟错误场景）
-        return false;
+        false
     };
 
     // 调用后，guard 已经被 drop，应该被清理
@@ -97,7 +97,7 @@ async fn test_atomic_slot_counter_concurrent_acquisition() {
     let mut handles = vec![];
 
     // 启动并发任务尝试获取槽位
-    for i in 0..num_tasks {
+    for _i in 0..num_tasks {
         let registry_clone = registry.clone();
         let barrier_clone = barrier.clone();
         let successful_count_clone = successful_count.clone();
@@ -278,7 +278,7 @@ async fn test_concurrent_agent_state_updates() {
     let num_updates = 100;
     let mut handles = vec![];
 
-    for i in 0..10 {
+    for _i in 0..10 {
         let registry_clone = registry.clone();
 
         let handle = tokio::spawn(async move {
@@ -735,7 +735,9 @@ async fn test_concurrent_pending_replacement() {
 
             // 尝试原子性替换
             use dashmap::mapref::entry::Entry;
-            let replaced = match registry_clone
+            
+
+            match registry_clone
                 .as_ref()
                 .inner_mut()
                 .entry(project_id.to_string())
@@ -756,9 +758,7 @@ async fn test_concurrent_pending_replacement() {
                     }
                 }
                 Entry::Vacant(_) => false,
-            };
-
-            replaced
+            }
         });
 
         handles.push(handle);

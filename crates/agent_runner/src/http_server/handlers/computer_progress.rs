@@ -6,7 +6,7 @@ use axum::{
     Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::sse::{Event, KeepAlive, Sse},
+    response::sse::{Event, Sse},
 };
 use chrono::Utc;
 use futures_util::stream::{Stream, StreamExt};
