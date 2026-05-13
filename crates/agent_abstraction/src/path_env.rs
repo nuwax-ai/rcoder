@@ -1,6 +1,9 @@
 //! 子进程环境变量管理 - 供 Agent 子进程使用
 //!
 //! 提供 PATH 环境变量构建函数，供 rcoder 启动 Claude Code 等 Agent 时使用。
+//! find_in_path/find_bin_dir 为通用工具函数，当前未被引用，保留供未来使用。
+
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 

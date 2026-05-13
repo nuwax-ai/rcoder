@@ -340,6 +340,7 @@ pub async fn computer_agent_status(
 /// - 仅对可重试的错误进行重试：Unavailable, DeadlineExceeded, Unknown, Internal
 /// - 使用指数退避：100ms, 200ms, 400ms
 /// - 失败后自动从连接池移除失败的连接，并重新获取容器 IP
+#[allow(clippy::too_many_arguments)]
 async fn call_grpc_get_status_with_retry(
     pool: &Arc<crate::grpc::GrpcChannelPool>,
     container_name: &str,

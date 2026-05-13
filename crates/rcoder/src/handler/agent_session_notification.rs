@@ -2,6 +2,8 @@
 //!
 //! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
 
+#![allow(dead_code)]
+
 use super::utils::{I18nPath, get_realtime_container_ip};
 use crate::{AppError, HttpResult};
 use axum::{
@@ -652,6 +654,7 @@ async fn validate_and_get_session_context(
 ///
 /// 这个函数被 agent_session_notification 和 computer_agent_progress_notification 共同使用
 /// 通过 container_name 创建 gRPC SSE 流
+#[allow(clippy::too_many_arguments)]
 async fn build_sse_stream_from_container_name(
     container_name: String,
     session_id: String,
@@ -729,7 +732,6 @@ async fn build_sse_stream_from_container_name(
 }
 
 /// Agent 会话 SSE 通知处理器
-
 ///
 /// 此接口直接返回 SSE 流，实现从容器到客户端的实时消息转发
 ///

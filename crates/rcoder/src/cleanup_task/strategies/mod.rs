@@ -2,6 +2,8 @@
 //!
 //! 定义不同服务类型的清理策略 trait
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

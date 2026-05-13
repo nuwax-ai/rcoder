@@ -23,6 +23,7 @@
 
 use axum::{extract::State, http::HeaderMap};
 use shared_types::{ChatResponse, ComputerChatRequest, IsolationType};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 

@@ -1,3 +1,7 @@
+// router 整体由 binary (main.rs) 使用，lib 内不直接调用 create_router / ApiDoc 等。
+// 抑制 dead_code 以避免 lib 维度误报。
+#![allow(dead_code)]
+
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;

@@ -2,6 +2,8 @@
 //!
 //! 定义所有 HTTP 端点和路由
 
+#![allow(dead_code)]
+
 use axum::{
     Json, Router,
     routing::{get, post},

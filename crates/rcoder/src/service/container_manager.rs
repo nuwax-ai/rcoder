@@ -3,6 +3,8 @@
 //! 提供通用的容器创建、管理和复用逻辑
 //! 供各个 handler 模块使用
 
+#![allow(dead_code)]
+
 use crate::AppError;
 use anyhow::Result;
 use container_runtime_api::{ContainerCreateParams, ContainerRuntime};
@@ -26,6 +28,7 @@ impl ContainerManager {
     /// - `tenant_id`: 租户 ID（可选）
     /// - `space_id`: 空间 ID（可选）
     /// - `container_work_path`: 容器内工作路径
+    #[allow(clippy::too_many_arguments)] // 多租户 + 资源限制参数无法合并
     pub async fn get_or_create_container(
         project_id: &str,
         service_type: &shared_types::ServiceType,
@@ -99,6 +102,7 @@ impl ContainerManager {
 }
 
 /// 根据 project_id 检查对应容器是否存在，不存在就动态创建容器
+#[allow(clippy::too_many_arguments)] // 多租户 + 资源限制参数
 async fn ensure_container_exists(
     project_id: &str,
     container_identifier: &str,
@@ -151,6 +155,7 @@ async fn ensure_container_exists(
 }
 
 /// 为请求创建容器
+#[allow(clippy::too_many_arguments)] // 多租户 + 资源限制参数
 async fn create_container_for_request(
     project_id: &str,
     container_identifier: &str,

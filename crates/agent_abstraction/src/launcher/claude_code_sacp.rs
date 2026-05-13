@@ -841,9 +841,6 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             Vec::new()
         };
 
-        let command_path = command_path;
-        let command_args = command_args;
-
         #[cfg(windows)]
         if let Some((resolved_program, resolved_args)) =
             resolve_windows_node_cli_command(&command_path, &command_args)

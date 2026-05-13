@@ -3,6 +3,8 @@
 //! 提供便捷的 HTTP 服务器启动 API
 //! 支持 HTTP REST API 和可选的 Pingora 代理服务
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;

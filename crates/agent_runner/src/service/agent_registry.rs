@@ -3,6 +3,8 @@
 //! 统一管理 project_id、session_id 和 AgentInfo 之间的映射关系
 //! 所有映射操作都通过此结构体的方法进行，确保数据一致性
 
+#![allow(dead_code)]
+
 use agent_abstraction::traits::SessionRegistry;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;

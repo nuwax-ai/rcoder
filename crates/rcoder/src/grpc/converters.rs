@@ -20,6 +20,7 @@ use shared_types::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConf
 /// 注意：此函数目前未被使用，chat_client.rs 直接构建 GrpcChatRequest。
 /// 保留以备将来使用或重构。
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // 直接映射 ChatRequest 字段
 pub fn to_grpc_chat_request(
     project_id: String,
     session_id: String,

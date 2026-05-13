@@ -25,9 +25,10 @@ pub enum IsolationType {
 }
 
 
-impl IsolationType {
-    /// 从字符串解析隔离类型
-    pub fn from_str(s: &str) -> Result<Self, IsolationTypeError> {
+impl std::str::FromStr for IsolationType {
+    type Err = IsolationTypeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "tenant" => Ok(IsolationType::Tenant),
             "space" => Ok(IsolationType::Space),
@@ -35,7 +36,9 @@ impl IsolationType {
             _ => Err(IsolationTypeError::InvalidIsolationType(s.to_string())),
         }
     }
+}
 
+impl IsolationType {
     /// 获取隔离类型的字符串表示
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -67,6 +70,7 @@ impl std::fmt::Display for IsolationType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_from_str_valid() {

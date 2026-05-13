@@ -17,6 +17,8 @@
 //! let _reaper_handle = start_process_reaper();
 //! ```
 
+#![allow(dead_code)] // start_process_reaper_with_config / detect_zombies_now / register_child 为可选 API
+
 use std::collections::HashMap;
 use std::fs;
 use tokio::process::Child;

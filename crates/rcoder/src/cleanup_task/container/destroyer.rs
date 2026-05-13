@@ -2,6 +2,8 @@
 //!
 //! 销毁容器并清理相关资源（gRPC 连接池、Pingora VNC 后端）
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use shared_types::ServiceType;
 use std::sync::Arc;

@@ -1,3 +1,6 @@
+// 配置模块由 binary 使用；lib 内部不直接调用 load_config 等 helper。
+#![allow(dead_code)]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;

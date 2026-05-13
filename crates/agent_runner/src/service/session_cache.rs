@@ -2,6 +2,8 @@
 //!
 //! 使用LazyLock初始化全局DashMap，按session_id分组缓存统一会话消息到ringbuf循环缓冲区
 
+#![allow(dead_code)]
+
 use crate::{SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
 use dashmap::DashMap;

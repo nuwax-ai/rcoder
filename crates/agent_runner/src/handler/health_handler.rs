@@ -1,4 +1,8 @@
 //! 健康检查处理器
+//!
+//! 由 binary 端的 router 注册，lib 内不直接调用。
+
+#![allow(dead_code)]
 
 use axum::Json;
 use chrono::Utc;

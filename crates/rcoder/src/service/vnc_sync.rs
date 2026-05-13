@@ -4,7 +4,13 @@
 //! 使用容器命名规则解析业务标识符：
 //! - RCoder: `rcoder-agent-{project_id}`
 //! - ComputerAgentRunner: `computer-agent-runner-{user_id}`
+//!
 //! 解决服务重启后 VNC 映射丢失的问题，并支持容器重启后自动更新 IP。
+//!
+//! 注意：本模块大部分由 binary (main.rs) 使用，lib 内仅 sync_single_vnc_backend
+//! 被 pod_handler 引用。
+
+#![allow(dead_code)]
 
 use rcoder_proxy::PingoraProxyService;
 use std::sync::Arc;

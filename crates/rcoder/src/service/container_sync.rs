@@ -2,6 +2,10 @@
 //!
 //! 定期从运行时同步容器状态。
 //! 在 K8s 模式下通过 Runtime API 获取 Pod 状态；在 Docker 模式下同样通过 Runtime 抽象层访问。
+//!
+//! 注意：本模块由 binary (main.rs) 使用，lib 内部不直接调用。
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::Duration;

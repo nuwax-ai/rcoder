@@ -8,6 +8,8 @@
 //! - **DashMap Entry API**: 避免读写锁竞态条件
 //! - **Fail Fast**: 尽早暴露问题，便于定位修复
 
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

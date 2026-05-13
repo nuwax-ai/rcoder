@@ -1,6 +1,9 @@
 //! 文件处理工具函数
 //!
-//! 提供文件读取、验证、转换等实用功能
+//! 提供文件读取、验证、转换等实用功能。
+//! 整套 API 当前未被引用，保留为通用工具模块。
+
+#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};

@@ -1,6 +1,10 @@
 //! Pingora 代理 API 处理函数
 //!
 //! 提供 Pingora 代理相关的 API 接口，主要用于文档展示和状态查询。
+//!
+//! 路由由 binary 端 router 注册；lib 维度看不到调用点，故抑制 dead_code。
+
+#![allow(dead_code)]
 
 use axum::{
     extract::{Path, Query, State},

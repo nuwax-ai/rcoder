@@ -2,6 +2,8 @@
 //!
 //! 负责清理 /app/logs/container 目录下的过期日志文件
 
+#![allow(dead_code)]
+
 use std::path::Path;
 use std::time::Duration;
 use std::vec::Vec;

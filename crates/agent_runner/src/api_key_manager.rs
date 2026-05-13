@@ -3,6 +3,9 @@
 //! 在内存中存储 API 密钥配置，支持通过服务名称快速查询。
 //! 密钥配置通过 gRPC 从 rcoder 主服务传递到 agent_runner。
 //!
+//! 注意：当前 manager 由 binary 通过 gRPC 处理流程注入，lib 内部不直接调用
+//! get/store/remove 等方法，故抑制 dead_code 警告。
+//!
 //! ## 使用示例
 //!
 //! ```rust
@@ -29,6 +32,8 @@
 //!     println!("API Key: {}", key);
 //! }
 //! ```
+
+#![allow(dead_code)]
 
 use dashmap::DashMap;
 use shared_types::ModelProviderConfig;

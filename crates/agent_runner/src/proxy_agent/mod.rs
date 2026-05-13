@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod acp_agent;
 pub mod cleanup_task;
 

@@ -228,6 +228,7 @@ impl KubernetesRuntime {
     }
 
     /// Wait for PVC to be in Bound state
+    #[allow(dead_code)] // 保留：WaitForFirstConsumer 模式下 PVC 立即返回，此辅助函数仅在切换为预绑定策略时使用
     async fn wait_for_pvc_bound(&self, pvc_name: &str) -> ContainerRuntimeResult<()> {
         let wait_timeout = std::time::Duration::from_secs(60);
         let start = std::time::Instant::now();

@@ -33,6 +33,7 @@ pub struct ContainerRecord {
 
 impl ContainerRecord {
     /// 创建新的容器记录
+    #[allow(clippy::too_many_arguments)] // 数据模型构造器，参数与字段一一对应
     pub fn new(
         container_id: String,
         container_name: String,

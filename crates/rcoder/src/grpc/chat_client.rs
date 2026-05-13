@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 /// 通过 gRPC 发送 Chat 请求到 agent_runner (使用连接池)
+#[allow(clippy::too_many_arguments)] // 直接映射 ChatRequest 字段，参数无法合并
 pub async fn grpc_chat_with_pool(
     pool: &Arc<GrpcChannelPool>,
     grpc_addr: &str,

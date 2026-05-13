@@ -9,6 +9,8 @@
 //! - 使用标准 `tokio::spawn` 进行并发处理
 //! - 简化了并发模型，提高性能
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -13,6 +13,8 @@
 //! | 挂载配置 | 硬编码 | config.yml mounts (配置化) |
 //! | Agent 实例 | 1 个 | 多个（按 project_id 区分） |
 
+#![allow(dead_code)]
+
 use crate::AppError;
 use crate::handler::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
 use container_runtime_api::{ContainerCreateParams, ContainerRuntime};

@@ -18,6 +18,8 @@
 //! - 终止时发送 `kill(-pgid, SIGKILL)` 到整个进程组
 //! - 能够正确清理子进程及其所有孙进程
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use dashmap::DashMap;
 use process_wrap::tokio::ChildWrapper;

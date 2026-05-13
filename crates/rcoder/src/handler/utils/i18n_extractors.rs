@@ -2,6 +2,11 @@
 //!
 //! These wrappers map Axum extractor rejections into unified `AppError` so
 //! HTTP error responses are consistently localized through `AppError::into_response`.
+//!
+//! `I18nJson` / `require_field` / `map_json_rejection` 当前未被路由直接使用，
+//! 由其它 i18n 入口替代，但保留以备复用。
+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 

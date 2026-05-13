@@ -78,6 +78,7 @@ impl AtomicState {
 
 /// 心跳包
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // 预留：基于心跳的 Worker 健康监控（当前未实装，由 gRPC 流式心跳替代）
 pub struct Heartbeat {
     /// 心跳时间戳
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -87,6 +88,7 @@ pub struct Heartbeat {
 ///
 /// Worker 在初始化完成后发送此信号
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // 预留：基于心跳的 Worker 健康监控（当前未实装，由 gRPC 流式心跳替代）
 pub struct WorkerReady {
     /// 就绪时间戳
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -140,6 +142,7 @@ pub struct AgentRuntime {
     heartbeat_timeout: Duration,
 
     /// 首次启动宽限期
+    #[allow(dead_code)] // 预留：心跳监控启用时使用
     initial_grace_period: Duration,
 }
 
@@ -250,6 +253,7 @@ impl AgentRuntime {
     ///
     /// - `true`: 心跳超时（超过 15 秒未收到心跳）
     /// - `false`: 心跳正常或在宽限期内
+    #[allow(dead_code)] // 预留：基于心跳的 Worker 健康监控
     pub fn check_heartbeat_timeout(&self) -> bool {
         let last_ts = self.last_heartbeat_ts.load(Ordering::Acquire);
 
@@ -269,6 +273,7 @@ impl AgentRuntime {
     ///
     /// - `Some(timestamp)`: 最后心跳时间
     /// - `None`: 从未收到心跳
+    #[allow(dead_code)] // 预留：基于心跳的 Worker 健康监控
     pub fn last_heartbeat_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         let last_ts = self.last_heartbeat_ts.load(Ordering::Acquire);
         if last_ts > 0 {
@@ -291,11 +296,13 @@ impl AgentRuntime {
     }
 
     /// 获取活跃请求句柄
+    #[allow(dead_code)] // 预留：监控/调试用
     pub fn active_requests(&self) -> Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>> {
         self.active_requests.clone()
     }
 
     /// 检查请求通道是否已关闭
+    #[allow(dead_code)] // 预留：监控/调试用
     pub fn is_closed(&self) -> bool {
         self.request_tx.is_closed()
     }

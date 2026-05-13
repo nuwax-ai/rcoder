@@ -5,6 +5,8 @@
 //! 2. 从PROJECT_AND_AGENT_INFO_MAP中移除
 //! 3. AgentLifecycleGuard自动drop并清理资源
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
