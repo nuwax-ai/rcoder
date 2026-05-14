@@ -4,6 +4,7 @@
 //! Chat Completions API (国内大模型提供商使用) 之间进行透明的双向协议转换。
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use codex_convert_proxy::{
     chat_chunk_to_response_events, chat_to_response_with_context, create_provider,
     event_to_sse, response_to_chat,
@@ -18,6 +19,11 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use shared_types::ModelProviderConfig;
 use tracing::{debug, error, info, warn};
+use std::sync::Arc;
+
+/// Provider 缓存（避免重复调用 create_provider）
+static PROVIDER_CACHE: std::sync::LazyLock<DashMap<String, Arc<dyn codex_convert_proxy::Provider + Send + Sync>>> =
+    std::sync::LazyLock::new(|| DashMap::new());
 
 /// 判断请求路径是否需要协议转换
 /// Codex 发送请求到 `/v1/responses` 或 `/responses` 等路径
@@ -27,8 +33,13 @@ pub fn needs_conversion(api_path: &str) -> bool {
 }
 
 /// 判断 wire_api 是否为 "chat" (需要转换)
+/// 当 wire_api 为 None 时，默认启用转换（国内模型提供商通常使用 Chat API）
 pub fn is_chat_wire_api(config: &ModelProviderConfig) -> bool {
-    config.wire_api.as_deref() == Some("chat")
+    config
+        .wire_api
+        .as_deref()
+        .map(|v| v == "chat")
+        .unwrap_or(true) // wire_api 为 None 时默认启用转换
 }
 
 /// 处理需要协议转换的请求
@@ -41,27 +52,49 @@ pub async fn handle_converted_request(
     api_path: &str,
     http_client: &reqwest::Client,
 ) -> PingoraResult<bool> {
+    debug!("[PROTOCOL_CONVERT] handle_converted_request called: path={}, config.name={}", api_path, config.name);
+
     // 只在 wire_api == "chat" 且路径包含 /response 时转换
-    if !is_chat_wire_api(config) || !needs_conversion(api_path) {
+    let wire_api_is_chat = is_chat_wire_api(config);
+    let needs_conv = needs_conversion(api_path);
+    debug!("[PROTOCOL_CONVERT] is_chat_wire_api={}, needs_conversion={}", wire_api_is_chat, needs_conv);
+
+    if !wire_api_is_chat || !needs_conv {
+        debug!("[PROTOCOL_CONVERT] Skipping conversion - is_chat={}, needs_conv={}", wire_api_is_chat, needs_conv);
         return Ok(false);
     }
 
+    debug!("[PROTOCOL_CONVERT] Intercepting Responses API request: path={}, provider={}", api_path, config.name);
     info!(
         "[PROTOCOL_CONVERT] Intercepting Responses API request: path={}, provider={}",
         api_path, config.name
     );
 
-    // 1. 读取完整的请求 body
-    let body_bytes = match read_full_request_body(session).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
+    // 1. 读取完整的请求 body（带超时保护）
+    debug!("[PROTOCOL_CONVERT] Starting to read request body...");
+    let body_bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        read_full_request_body(session),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => {
+            debug!("[PROTOCOL_CONVERT] Successfully read {} bytes from request body", bytes.len());
+            bytes
+        }
+        Ok(Err(e)) => {
             error!("[PROTOCOL_CONVERT] Failed to read request body: {}", e);
-            // 保留原始错误状态码（如 413 Payload Too Large）
             let status = match e.etype {
                 pingora_core::ErrorType::HTTPStatus(code) => code,
                 _ => 400,
             };
             write_error_response(session, status, "Failed to read request body").await?;
+            return Ok(true);
+        }
+        Err(_) => {
+            // 超时
+            error!("[PROTOCOL_CONVERT] Timeout reading request body (30s)");
+            write_error_response(session, 408, "Request body read timeout").await?;
             return Ok(true);
         }
     };
@@ -79,31 +112,63 @@ pub async fn handle_converted_request(
 
     let is_stream = response_req.stream;
 
-    // 3. 创建 Provider 并转换请求
-    let provider = match create_provider(&config.name) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(
-                "[PROTOCOL_CONVERT] Failed to create provider '{}': {}",
-                config.name, e
-            );
-            write_error_response(session, 500, &format!("Unsupported provider: {}", config.name))
-                .await?;
-            return Ok(true);
-        }
+    debug!("[PROTOCOL_CONVERT] ResponseRequest parsed, stream={}", is_stream);
+
+    // 3. 获取或创建 Provider（使用缓存）
+    // codex-convert-proxy 支持默认 fallback，未知 provider 会使用默认 provider
+    let provider_name = &config.name;
+
+    // 检查缓存
+    let provider = if let Some(cached) = PROVIDER_CACHE.get(provider_name) {
+        debug!("[PROTOCOL_CONVERT] Using cached provider for name={}", provider_name);
+        cached.value().clone()
+    } else {
+        // 缓存未命中，创建 provider
+        debug!("[PROTOCOL_CONVERT] Provider cache miss, creating provider for name={}", provider_name);
+
+        let result = match create_provider(provider_name) {
+            Ok(p) => {
+                debug!("[PROTOCOL_CONVERT] Provider created: {}", provider_name);
+                p
+            }
+            Err(e) => {
+                error!(
+                    "[PROTOCOL_CONVERT] Failed to create provider '{}': {}",
+                    provider_name, e
+                );
+                write_error_response(session, 500, &format!("Unsupported provider: {}", provider_name))
+                    .await?;
+                return Ok(true);
+            }
+        };
+
+        // 缓存 provider
+        let cached = result.clone();
+        PROVIDER_CACHE.insert(provider_name.to_string(), cached.clone());
+        result
     };
 
     let request_context = ResponseRequestContext::from(&response_req);
 
-    let chat_req = match response_to_chat(
-        response_req,
-        provider.as_ref(),
-        Some(&config.default_model),
-        ToolPriority::Merge,
+    debug!("[PROTOCOL_CONVERT] Calling response_to_chat...");
+    let chat_req = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        async {
+            response_to_chat(
+                response_req,
+                provider.as_ref(),
+                Some(&config.default_model),
+                ToolPriority::Merge,
+            )
+        },
     )
+    .await
     {
-        Ok(req) => req,
-        Err(e) => {
+        Ok(Ok(req)) => {
+            debug!("[PROTOCOL_CONVERT] response_to_chat succeeded");
+            req
+        }
+        Ok(Err(e)) => {
             error!("[PROTOCOL_CONVERT] Request conversion failed: {}", e);
             write_error_response(
                 session,
@@ -111,6 +176,11 @@ pub async fn handle_converted_request(
                 &format!("Request conversion error: {}", e),
             )
             .await?;
+            return Ok(true);
+        }
+        Err(_) => {
+            error!("[PROTOCOL_CONVERT] response_to_chat timed out after 30s");
+            write_error_response(session, 408, "Request conversion timeout").await?;
             return Ok(true);
         }
     };
@@ -133,6 +203,7 @@ pub async fn handle_converted_request(
 
     // 4. 构建上游 URL (将 /v1/responses 替换为 /v1/chat/completions)
     let upstream_url = build_upstream_url(&config.base_url, api_path);
+    debug!("[PROTOCOL_CONVERT] upstream_url={}", upstream_url);
 
     // 5. 构建认证 headers
     let mut req_builder = http_client
@@ -185,14 +256,41 @@ async fn read_full_request_body(session: &mut Session) -> PingoraResult<Bytes> {
 }
 
 /// 构建上游 URL: 将 Responses API 路径转换为 Chat API 路径
+///
+/// api_path 来自路由 /api/{service_name}/{*path}，格式如 "v1/responses"
+/// base_url 是模型提供商的完整 API 路径，如 "https://open.bigmodel.cn/api/coding/paas/v4"
+///
+/// 转换逻辑: 去掉 /responses 后缀和 version prefix (v1/)，直接追加 /chat/completions
 fn build_upstream_url(base_url: &str, api_path: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    // 只替换路径末尾的 /responses，避免误替换中间部分
-    let chat_path = match api_path.strip_suffix("/responses") {
-        Some(prefix) => format!("{}/chat/completions", prefix),
-        None => api_path.to_string(),
+
+    debug!(
+        "[PROTOCOL_CONVERT] build_upstream_url: base_url={}, api_path={}",
+        base, api_path
+    );
+
+    // 处理 /responses 或 responses 后缀
+    let chat_path = if api_path.ends_with("/responses") || api_path.ends_with("responses") {
+        // 去掉 /responses 或 responses 后缀
+        let stripped = api_path
+            .trim_end_matches("/responses")
+            .trim_end_matches("responses");
+
+        // 去掉 version prefix (v1/ 或 /v1/)，因为 base_url 已经包含完整 API 版本
+        let cleaned = stripped
+            .trim_start_matches("/v1/")
+            .trim_start_matches("v1/")
+            .trim_end_matches('/');
+
+        format!("{}/chat/completions", cleaned)
+    } else {
+        // 不需要转换，直接返回原路径
+        api_path.to_string()
     };
-    format!("{}{}", base, chat_path)
+
+    let result = format!("{}{}", base, chat_path);
+    debug!("[PROTOCOL_CONVERT] build_upstream_url result: {}", result);
+    result
 }
 
 /// 处理非流式响应

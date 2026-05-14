@@ -75,8 +75,24 @@ const ENV_OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
 /// nuwaxcode 使用 OPENCODE_MODEL 而不是 OPENAI_MODEL
 const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
 
+/// Codex 环境变量常量（nuwax-codex-acp 使用这些变量）
+const ENV_CODEX_API_KEY: &str = "CODEX_API_KEY";
+const ENV_CODEX_BASE_URL: &str = "CODEX_BASE_URL";
+const ENV_CODEX_MODEL: &str = "CODEX_MODEL";
+const ENV_CODEX_PROVIDER_ID: &str = "CODEX_PROVIDER_ID";
+
+/// 代理端口环境变量（可通过此变量覆盖默认的 8088 端口）
+const ENV_PROXY_PORT: &str = "AGENT_RUNNER_PROXY_PORT";
+
+/// 默认代理端口
+const DEFAULT_PROXY_PORT: &str = "8088";
+
 /// 默认代理 Base URL（包含 UUID 占位符）
-const DEFAULT_PROXY_BASE_URL: &str = "http://localhost:8088/api/{SERVICE_UUID}";
+/// 端口可通过 AGENT_RUNNER_PROXY_PORT 环境变量覆盖
+fn get_proxy_base_url() -> String {
+    let port = std::env::var(ENV_PROXY_PORT).unwrap_or_else(|_| DEFAULT_PROXY_PORT.to_string());
+    format!("http://localhost:{}/api/{{SERVICE_UUID}}", port)
+}
 
 /// 获取各平台下常用的用户二进制目录
 ///
@@ -251,6 +267,8 @@ fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<Str
 
 /// 根据 proxy feature 决定使用占位符还是真实 API Key
 fn resolve_api_key(provider: &ModelProviderConfig) -> String {
+    let is_proxy = cfg!(feature = "proxy");
+    tracing::info!("[SACP] 🔍 resolve_api_key: proxy_mode={}, provider_api_key_present={}", is_proxy, !provider.api_key.is_empty());
     if cfg!(feature = "proxy") {
         API_KEY_PLACEHOLDER.to_string()
     } else {
@@ -260,8 +278,11 @@ fn resolve_api_key(provider: &ModelProviderConfig) -> String {
 
 /// 根据 proxy feature 决定使用代理 URL 还是真实 Base URL
 fn resolve_base_url(provider: &ModelProviderConfig) -> String {
+    let is_proxy = cfg!(feature = "proxy");
+    let proxy_url = get_proxy_base_url();
+    tracing::info!("[SACP] 🔍 resolve_base_url: proxy_mode={}, base_url={}", is_proxy, proxy_url);
     if cfg!(feature = "proxy") {
-        DEFAULT_PROXY_BASE_URL.to_string()
+        proxy_url
     } else {
         provider.base_url.clone()
     }
@@ -746,6 +767,12 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
     where
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
+        info!("[SACP] 🚀 LAUNCH FUNCTION CALLED: project_id={}, has_agent_server_override={}, service_uuid={:?}",
+            project_id,
+            start_config.agent_server_override.is_some(),
+            service_uuid
+        );
+
         // 从配置加载默认 Agent 参数
         let default_agent_config =
             load_sacp_agent_config(model_provider.as_ref(), &start_config.service_type).await?;
@@ -891,6 +918,14 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // 🔒 安全防护：proxy 模式下强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
         // 即使用户在配置中直接写了真实的 API_KEY 或 BASE_URL，也会被替换
+        {
+            let is_proxy = cfg!(feature = "proxy");
+            if is_proxy {
+                info!("[SACP] 🔒 Proxy mode ENABLED - will use proxy URL replacement");
+            } else {
+                info!("[SACP] ⚠️ Proxy mode DISABLED - will use direct URL");
+            }
+        }
         if cfg!(feature = "proxy") {
             info!("[SACP] 🔒 Proxy mode enabled, forcing proxy URL replacement");
             if model_provider.is_some() {
@@ -910,10 +945,11 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     );
                 }
                 if merged_envs.contains_key(ENV_ANTHROPIC_BASE_URL) {
+                    let proxy_base_url = get_proxy_base_url();
                     let proxy_url = service_uuid
                         .as_ref()
-                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
-                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string());
+                        .map(|uuid| proxy_base_url.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| proxy_base_url);
                     merged_envs.insert(ENV_ANTHROPIC_BASE_URL.to_string(), proxy_url.clone());
                     info!("[SACP] 🔒 Replaced ANTHROPIC_BASE_URL with: {}", proxy_url);
                 }
@@ -927,12 +963,31 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     info!("[SACP] 🔒 Replaced OPENAI_API_KEY with placeholder");
                 }
                 if merged_envs.contains_key(ENV_OPENAI_BASE_URL) {
+                    let proxy_base_url = get_proxy_base_url();
                     let proxy_url = service_uuid
                         .as_ref()
-                        .map(|uuid| DEFAULT_PROXY_BASE_URL.replace("{SERVICE_UUID}", uuid))
-                        .unwrap_or_else(|| DEFAULT_PROXY_BASE_URL.to_string());
+                        .map(|uuid| proxy_base_url.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| proxy_base_url);
                     merged_envs.insert(ENV_OPENAI_BASE_URL.to_string(), proxy_url.clone());
                     info!("[SACP] 🔒 Replaced OPENAI_BASE_URL with: {}", proxy_url);
+                }
+
+                // 强制替换 Codex 敏感变量（nuwax-codex-acp 使用这些变量）
+                if merged_envs.contains_key(ENV_CODEX_API_KEY) {
+                    merged_envs.insert(
+                        ENV_CODEX_API_KEY.to_string(),
+                        API_KEY_PLACEHOLDER.to_string(),
+                    );
+                    info!("[SACP] 🔒 Replaced CODEX_API_KEY with placeholder");
+                }
+                if merged_envs.contains_key(ENV_CODEX_BASE_URL) {
+                    let proxy_base_url = get_proxy_base_url();
+                    let proxy_url = service_uuid
+                        .as_ref()
+                        .map(|uuid| proxy_base_url.replace("{SERVICE_UUID}", uuid))
+                        .unwrap_or_else(|| proxy_base_url);
+                    merged_envs.insert(ENV_CODEX_BASE_URL.to_string(), proxy_url.clone());
+                    info!("[SACP] 🔒 Replaced CODEX_BASE_URL with: {}", proxy_url);
                 }
             }
         } else {
@@ -953,6 +1008,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         const SENSITIVE_ENV_KEYS: &[&str] = &[
             ENV_ANTHROPIC_API_KEY,
             ENV_OPENAI_API_KEY,
+            ENV_CODEX_API_KEY,
             "ANTHROPIC_AUTH_TOKEN",
         ];
         let mut env_keys: Vec<_> = merged_envs.keys().collect();
@@ -2205,7 +2261,7 @@ mod tests {
             );
             assert_eq!(
                 config.env.get("OPENAI_BASE_URL"),
-                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+                Some(&get_proxy_base_url())
             );
         } else {
             assert_eq!(
@@ -2263,11 +2319,11 @@ mod tests {
             );
             assert_eq!(
                 config.env.get("ANTHROPIC_BASE_URL"),
-                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+                Some(&get_proxy_base_url())
             );
             assert_eq!(
                 config.env.get("OPENAI_BASE_URL"),
-                Some(&DEFAULT_PROXY_BASE_URL.to_string())
+                Some(&get_proxy_base_url())
             );
         } else {
             // 非 proxy 模式下：使用真实值

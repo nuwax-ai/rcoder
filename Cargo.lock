@@ -1129,9 +1129,9 @@ dependencies = [
 
 [[package]]
 name = "codex-convert-proxy"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47381efda8f141b488123f1f7855851a7ac8fe1e6aea1a5edd55095899ad9149"
+checksum = "85dafb321e8761e6611dfdaf5e7913e78f3b09810f4a347f7feeee76fd44ef31"
 dependencies = [
  "anyhow",
  "async-trait",

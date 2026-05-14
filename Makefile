@@ -115,7 +115,7 @@ help:
 	@echo "  make agent-runner-up        - 启动 agent_runner HTTP server（前台运行）"
 	@echo "  make agent-runner-logs      - 查看日志"
 	@echo ""
-	@echo "  变量: AGENT_RUNNER_PORT=8086 AGENT_RUNNER_GRPC=yes AGENT_RUNNER_PROJECTS_DIR=./project_workspace"
+	@echo "  变量: AGENT_RUNNER_PORT=8286 AGENT_RUNNER_GRPC=no AGENT_RUNNER_PROXY=yes AGENT_RUNNER_PROJECTS_DIR=./project_workspace"
 	@echo ""
 	@echo "🧪 测试命令："
 	@echo "  make test           - 运行所有测试"

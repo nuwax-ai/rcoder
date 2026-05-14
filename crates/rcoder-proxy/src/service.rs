@@ -407,40 +407,84 @@ impl ProxyHttp for PortProxy {
     ) -> PingoraResult<bool> {
         let path = session.req_header().uri.path().to_string();
 
+        debug!(
+            "[API_PROXY] request_filter called: path={}",
+            path
+        );
+
         // 只拦截 API 代理请求
         if !path.starts_with("/api/") {
+            debug!("[API_PROXY] path does not start with /api/, skipping");
             return Ok(false);
         }
 
         // 匹配路由（复用 ApiProxy 的路由表）
         let matched = match self.router.at(&path) {
             Ok(m) => m,
-            Err(_) => return Ok(false), // 404 交给 upstream_request_filter 处理
+            Err(_) => {
+                debug!("[API_PROXY] route match failed for path={}", path);
+                return Ok(false); // 404 交给 upstream_request_filter 处理
+            }
         };
 
+        debug!(
+            "[API_PROXY] route matched: path={}, route_type={:?}",
+            path, matched.value
+        );
+
         if *matched.value != RouteType::ApiProxy {
+            debug!("[API_PROXY] route is not ApiProxy, skipping");
             return Ok(false);
         }
 
         // 提取 service_name 和 api_path
         let service_name = match matched.params.get("service_name") {
             Some(name) => name.to_string(),
-            None => return Ok(false),
+            None => {
+                debug!("[API_PROXY] service_name not found in params");
+                return Ok(false);
+            }
         };
         let api_path = matched.params.get("path").unwrap_or("").to_string();
+
+        debug!(
+            "[API_PROXY] extracted: service_name={}, api_path={}",
+            service_name, api_path
+        );
 
         // 查找配置
         let api_config = match self.api_key_manager.get(&service_name) {
             Some(config) => config,
-            None => return Ok(false), // 404 交给 upstream_request_filter 处理
+            None => {
+                debug!(
+                    "[API_PROXY] config not found for service_name={}, available keys: {:?}",
+                    service_name,
+                    self.api_key_manager.iter().map(|r| r.key().clone()).collect::<Vec<_>>()
+                );
+                return Ok(false); // 404 交给 upstream_request_filter 处理
+            }
         };
 
         let config = api_config.value().clone(); // clone 以释放 DashMap Ref
 
+        debug!(
+            "[API_PROXY] config found: service={}, base_url={}, wire_api={:?}, api_protocol={:?}",
+            config.name, config.base_url, config.wire_api, config.api_protocol
+        );
+
         // 判断是否需要协议转换
-        if !crate::protocol_convert::is_chat_wire_api(&config)
-            || !crate::protocol_convert::needs_conversion(&api_path)
-        {
+        let chat_wire_api = crate::protocol_convert::is_chat_wire_api(&config);
+        let needs_conv = crate::protocol_convert::needs_conversion(&api_path);
+        debug!(
+            "[API_PROXY] conversion check: is_chat_wire_api={}, needs_conversion={}, api_path={}",
+            chat_wire_api, needs_conv, api_path
+        );
+
+        if !chat_wire_api || !needs_conv {
+            debug!(
+                "[API_PROXY] skipping conversion: chat_wire_api={}, needs_conv={}",
+                chat_wire_api, needs_conv
+            );
             return Ok(false); // 不需要转换，走正常 ApiProxy 流程
         }
 
