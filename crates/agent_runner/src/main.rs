@@ -333,6 +333,13 @@ async fn main() -> anyhow::Result<()> {
     // 🔒 project_id -> service_uuid 映射
     let project_uuid_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
+    // 🔒 设置代理模式标志，使 launcher 将 CODEX_BASE_URL/CODEX_API_KEY 替换为代理 URL/占位符
+    if config.proxy_config.is_some() {
+        // SAFETY: This is safe in a single-threaded context before any async tasks are spawned
+        unsafe { std::env::set_var("RCODER_PROXY_MODE", "1") };
+        info!("🔒 [MAIN] Proxy mode enabled: RCODER_PROXY_MODE=1");
+    }
+
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
     {

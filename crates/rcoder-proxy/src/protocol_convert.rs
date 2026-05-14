@@ -11,7 +11,7 @@ use codex_convert_proxy::{
     types::chat_api::ChatStreamChunk,
     types::response_api::ResponseRequest,
     util::parse_sse,
-    ResponseRequestContext, StreamState,
+    ResponseRequestContext, ResponseStreamEvent, StreamState,
 };
 use codex_convert_proxy::convert::request::ToolPriority;
 use pingora_core::Result as PingoraResult;
@@ -560,7 +560,23 @@ async fn handle_streaming_response(
         }
     }
 
-    // 发送结束标记
+    // 发送 response.completed SSE 事件（修复 codex agent "stream disconnected before completion" 错误）
+    let response_obj = stream_state.build_response_object();
+    let completed_event = ResponseStreamEvent::Completed {
+        response: response_obj,
+    };
+    let sse_data = event_to_sse(&completed_event, seq);
+    session
+        .write_response_body(Some(Bytes::from(sse_data)), false)
+        .await?;
+    debug!("[PROTOCOL_CONVERT] Sent response.completed SSE event");
+
+    // 发送 [DONE] 标记
+    session
+        .write_response_body(Some(Bytes::from("data: [DONE]\n\n")), false)
+        .await?;
+
+    // 关闭流
     session.write_response_body(None, true).await?;
 
     info!(

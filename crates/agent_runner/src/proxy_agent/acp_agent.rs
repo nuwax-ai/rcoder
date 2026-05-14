@@ -352,9 +352,11 @@ pub async fn agent_worker_with_heartbeat(
         let project_id = request.prompt_message.project_id.clone();
         let request_id = request.prompt_message.request_id.clone();
 
+        // 🔍 调试日志：检查 model_provider 是否有值
+        let model_provider_debug = request.model_provider.as_ref().map(|p| format!("provider={}, model={}", p.name, p.default_model));
         info!(
-            "📨 Received request, project_id: {}, request_id: {} - SACP concurrent processing",
-            project_id, request_id
+            "📨 Received request, project_id: {}, request_id: {}, has_model_provider: {}, model_provider: {:?}",
+            project_id, request_id, request.model_provider.is_some(), model_provider_debug
         );
 
         // 克隆需要的变量，用于 spawn 任务

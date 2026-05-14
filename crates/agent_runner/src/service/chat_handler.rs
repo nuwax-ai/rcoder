@@ -411,6 +411,7 @@ pub async fn handle_chat_core(
         .data_source_attachments(input.data_source_attachments)
         .service_type(input.service_type)
         .request_id(request_id.clone())
+        .model_provider(input.model_config.clone())
         .system_prompt_override(input.system_prompt_override)
         .user_prompt_template_override(input.user_prompt_template_override)
         .agent_config_override(input.agent_config_override)

@@ -265,23 +265,25 @@ fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<Str
     }
 }
 
-/// 根据 proxy feature 决定使用占位符还是真实 API Key
+/// 根据 proxy 模式决定使用占位符还是真实 API Key
+/// 使用环境变量 RCODER_PROXY_MODE 判断（避免循环依赖）
 fn resolve_api_key(provider: &ModelProviderConfig) -> String {
-    let is_proxy = cfg!(feature = "proxy");
+    let is_proxy = std::env::var("RCODER_PROXY_MODE").map(|v| v == "1").unwrap_or(false);
     tracing::info!("[SACP] 🔍 resolve_api_key: proxy_mode={}, provider_api_key_present={}", is_proxy, !provider.api_key.is_empty());
-    if cfg!(feature = "proxy") {
+    if is_proxy {
         API_KEY_PLACEHOLDER.to_string()
     } else {
         provider.api_key.clone()
     }
 }
 
-/// 根据 proxy feature 决定使用代理 URL 还是真实 Base URL
+/// 根据 proxy 模式决定使用代理 URL 还是真实 Base URL
+/// 使用环境变量 RCODER_PROXY_MODE 判断（避免循环依赖）
 fn resolve_base_url(provider: &ModelProviderConfig) -> String {
-    let is_proxy = cfg!(feature = "proxy");
+    let is_proxy = std::env::var("RCODER_PROXY_MODE").map(|v| v == "1").unwrap_or(false);
     let proxy_url = get_proxy_base_url();
     tracing::info!("[SACP] 🔍 resolve_base_url: proxy_mode={}, base_url={}", is_proxy, proxy_url);
-    if cfg!(feature = "proxy") {
+    if is_proxy {
         proxy_url
     } else {
         provider.base_url.clone()
@@ -918,15 +920,14 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // 🔒 安全防护：proxy 模式下强制将敏感环境变量替换为占位符/代理 URL，防止密钥泄露
         // 即使用户在配置中直接写了真实的 API_KEY 或 BASE_URL，也会被替换
-        {
-            let is_proxy = cfg!(feature = "proxy");
-            if is_proxy {
-                info!("[SACP] 🔒 Proxy mode ENABLED - will use proxy URL replacement");
-            } else {
-                info!("[SACP] ⚠️ Proxy mode DISABLED - will use direct URL");
-            }
+        // 使用环境变量 RCODER_PROXY_MODE 判断（避免循环依赖）
+        let is_proxy = std::env::var("RCODER_PROXY_MODE").map(|v| v == "1").unwrap_or(false);
+        if is_proxy {
+            info!("[SACP] 🔒 Proxy mode ENABLED - will use proxy URL replacement");
+        } else {
+            info!("[SACP] ⚠️ Proxy mode DISABLED - will use direct URL");
         }
-        if cfg!(feature = "proxy") {
+        if is_proxy {
             info!("[SACP] 🔒 Proxy mode enabled, forcing proxy URL replacement");
             if model_provider.is_some() {
                 // 强制替换 Anthropic 敏感变量
