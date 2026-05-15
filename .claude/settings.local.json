@@ -9,7 +9,8 @@
       "Bash(sudo cp *)",
       "Bash(sudo chmod *)",
       "Bash(echo 'export KUBECONFIG=~/.kube/config')",
-      "Bash(cargo metadata *)"
+      "Bash(cargo metadata *)",
+      "Bash(ls -la /Volumes/soddygo/git-rust-work/fork-codex-acp/)"
     ]
   }
 }

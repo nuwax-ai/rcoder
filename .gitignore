@@ -22,3 +22,4 @@ docker/logs
 
 # Stakpak session files
 .stakpak/session*
+crates/agent_runner/config.yml

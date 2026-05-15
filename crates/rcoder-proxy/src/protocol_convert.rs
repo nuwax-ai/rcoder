@@ -4,32 +4,33 @@
 //! Chat Completions API (国内大模型提供商使用) 之间进行透明的双向协议转换。
 
 use bytes::Bytes;
-use dashmap::DashMap;
-use codex_convert_proxy::{
-    chat_chunk_to_response_events, chat_to_response_with_context, create_provider,
-    event_to_sse, response_to_chat,
-    types::chat_api::ChatStreamChunk,
-    types::response_api::ResponseRequest,
-    util::parse_sse,
-    ResponseRequestContext, ResponseStreamEvent, StreamState,
-};
 use codex_convert_proxy::convert::request::ToolPriority;
+use codex_convert_proxy::{
+    ResponseRequestContext, ResponseStreamEvent, StreamState, chat_chunk_to_response_events,
+    chat_to_response_with_context, create_provider, event_to_sse, response_to_chat,
+    types::chat_api::ChatStreamChunk, types::response_api::ResponseRequest, util::parse_sse,
+};
+use dashmap::DashMap;
 use pingora_core::Result as PingoraResult;
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use shared_types::ModelProviderConfig;
-use tracing::{debug, error, info, warn};
 use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 /// Provider 缓存（避免重复调用 create_provider）
-static PROVIDER_CACHE: std::sync::LazyLock<DashMap<String, Arc<dyn codex_convert_proxy::Provider + Send + Sync>>> =
-    std::sync::LazyLock::new(DashMap::new);
+static PROVIDER_CACHE: std::sync::LazyLock<
+    DashMap<String, Arc<dyn codex_convert_proxy::Provider + Send + Sync>>,
+> = std::sync::LazyLock::new(DashMap::new);
 
 /// 判断请求路径是否需要协议转换
 /// Codex 发送请求到 `/v1/responses` 或 `/responses` 等路径
 pub fn needs_conversion(api_path: &str) -> bool {
     let path = api_path.trim_end_matches('/');
-    matches!(path, "responses" | "v1/responses" | "/responses" | "/v1/responses")
+    matches!(
+        path,
+        "responses" | "v1/responses" | "/responses" | "/v1/responses"
+    )
 }
 
 /// 判断 wire_api 是否为 "chat" (需要转换)
@@ -52,19 +53,31 @@ pub async fn handle_converted_request(
     api_path: &str,
     http_client: &reqwest::Client,
 ) -> PingoraResult<bool> {
-    debug!("[PROTOCOL_CONVERT] handle_converted_request called: path={}, config.name={}", api_path, config.name);
+    debug!(
+        "[PROTOCOL_CONVERT] handle_converted_request called: path={}, config.name={}",
+        api_path, config.name
+    );
 
     // 只在 wire_api == "chat" 且路径包含 /response 时转换
     let wire_api_is_chat = is_chat_wire_api(config);
     let needs_conv = needs_conversion(api_path);
-    debug!("[PROTOCOL_CONVERT] is_chat_wire_api={}, needs_conversion={}", wire_api_is_chat, needs_conv);
+    debug!(
+        "[PROTOCOL_CONVERT] is_chat_wire_api={}, needs_conversion={}",
+        wire_api_is_chat, needs_conv
+    );
 
     if !wire_api_is_chat || !needs_conv {
-        debug!("[PROTOCOL_CONVERT] Skipping conversion - is_chat={}, needs_conv={}", wire_api_is_chat, needs_conv);
+        debug!(
+            "[PROTOCOL_CONVERT] Skipping conversion - is_chat={}, needs_conv={}",
+            wire_api_is_chat, needs_conv
+        );
         return Ok(false);
     }
 
-    debug!("[PROTOCOL_CONVERT] Intercepting Responses API request: path={}, provider={}", api_path, config.name);
+    debug!(
+        "[PROTOCOL_CONVERT] Intercepting Responses API request: path={}, provider={}",
+        api_path, config.name
+    );
     info!(
         "[PROTOCOL_CONVERT] Intercepting Responses API request: path={}, provider={}",
         api_path, config.name
@@ -79,7 +92,10 @@ pub async fn handle_converted_request(
     .await
     {
         Ok(Ok(bytes)) => {
-            debug!("[PROTOCOL_CONVERT] Successfully read {} bytes from request body", bytes.len());
+            debug!(
+                "[PROTOCOL_CONVERT] Successfully read {} bytes from request body",
+                bytes.len()
+            );
             bytes
         }
         Ok(Err(e)) => {
@@ -104,15 +120,22 @@ pub async fn handle_converted_request(
         Ok(req) => req,
         Err(e) => {
             error!("[PROTOCOL_CONVERT] Failed to parse ResponseRequest: {}", e);
-            write_error_response(session, 400, &format!("Invalid Responses API request: {}", e))
-                .await?;
+            write_error_response(
+                session,
+                400,
+                &format!("Invalid Responses API request: {}", e),
+            )
+            .await?;
             return Ok(true);
         }
     };
 
     let is_stream = response_req.stream;
 
-    debug!("[PROTOCOL_CONVERT] ResponseRequest parsed, stream={}", is_stream);
+    debug!(
+        "[PROTOCOL_CONVERT] ResponseRequest parsed, stream={}",
+        is_stream
+    );
 
     // 3. 获取或创建 Provider（使用缓存）
     // codex-convert-proxy 支持默认 fallback，未知 provider 会使用默认 provider
@@ -120,11 +143,17 @@ pub async fn handle_converted_request(
 
     // 检查缓存
     let provider = if let Some(cached) = PROVIDER_CACHE.get(provider_name) {
-        debug!("[PROTOCOL_CONVERT] Using cached provider for name={}", provider_name);
+        debug!(
+            "[PROTOCOL_CONVERT] Using cached provider for name={}",
+            provider_name
+        );
         cached.value().clone()
     } else {
         // 缓存未命中，创建 provider
-        debug!("[PROTOCOL_CONVERT] Provider cache miss, creating provider for name={}", provider_name);
+        debug!(
+            "[PROTOCOL_CONVERT] Provider cache miss, creating provider for name={}",
+            provider_name
+        );
 
         let result = match create_provider(provider_name) {
             Ok(p) => {
@@ -136,8 +165,12 @@ pub async fn handle_converted_request(
                     "[PROTOCOL_CONVERT] Failed to create provider '{}': {}",
                     provider_name, e
                 );
-                write_error_response(session, 500, &format!("Unsupported provider: {}", provider_name))
-                    .await?;
+                write_error_response(
+                    session,
+                    500,
+                    &format!("Unsupported provider: {}", provider_name),
+                )
+                .await?;
                 return Ok(true);
             }
         };
@@ -151,17 +184,14 @@ pub async fn handle_converted_request(
     let request_context = ResponseRequestContext::from(&response_req);
 
     debug!("[PROTOCOL_CONVERT] Calling response_to_chat...");
-    let chat_req = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        async {
-            response_to_chat(
-                response_req,
-                provider.as_ref(),
-                Some(&config.default_model),
-                ToolPriority::Merge,
-            )
-        },
-    )
+    let chat_req = match tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        response_to_chat(
+            response_req,
+            provider.as_ref(),
+            Some(&config.default_model),
+            ToolPriority::Merge,
+        )
+    })
     .await
     {
         Ok(Ok(req)) => {
@@ -170,12 +200,7 @@ pub async fn handle_converted_request(
         }
         Ok(Err(e)) => {
             error!("[PROTOCOL_CONVERT] Request conversion failed: {}", e);
-            write_error_response(
-                session,
-                400,
-                &format!("Request conversion error: {}", e),
-            )
-            .await?;
+            write_error_response(session, 400, &format!("Request conversion error: {}", e)).await?;
             return Ok(true);
         }
         Err(_) => {
@@ -226,7 +251,14 @@ pub async fn handle_converted_request(
 
     // 6. 发送请求并处理响应
     if is_stream {
-        handle_streaming_response(session, req_builder, request_context, &config.name, &config.default_model).await?;
+        handle_streaming_response(
+            session,
+            req_builder,
+            request_context,
+            &config.name,
+            &config.default_model,
+        )
+        .await?;
     } else {
         handle_non_streaming_response(session, req_builder, request_context, &config.name).await?;
     }
@@ -315,7 +347,10 @@ async fn handle_non_streaming_response(
         let error_body = match resp.text().await {
             Ok(body) => body,
             Err(e) => {
-                warn!("[PROTOCOL_CONVERT] Failed to read upstream error body: {}", e);
+                warn!(
+                    "[PROTOCOL_CONVERT] Failed to read upstream error body: {}",
+                    e
+                );
                 String::new()
             }
         };
@@ -339,7 +374,10 @@ async fn handle_non_streaming_response(
     let chat_resp: codex_convert_proxy::types::chat_api::ChatResponse = match resp.json().await {
         Ok(r) => r,
         Err(e) => {
-            error!("[PROTOCOL_CONVERT] Failed to parse upstream response: {}", e);
+            error!(
+                "[PROTOCOL_CONVERT] Failed to parse upstream response: {}",
+                e
+            );
             write_error_response(session, 502, &format!("Invalid upstream response: {}", e))
                 .await?;
             return Ok(());
@@ -369,10 +407,7 @@ async fn handle_non_streaming_response(
 
     let mut resp_header = ResponseHeader::build(200, None)?;
     resp_header.insert_header("Content-Type", "application/json")?;
-    resp_header.insert_header(
-        "Content-Length",
-        response_json.len().to_string(),
-    )?;
+    resp_header.insert_header("Content-Length", response_json.len().to_string())?;
 
     session
         .write_response_header(Box::new(resp_header), false)
@@ -402,7 +437,10 @@ async fn handle_streaming_response(
     let resp = match req_builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            error!("[PROTOCOL_CONVERT] Upstream streaming request failed: {}", e);
+            error!(
+                "[PROTOCOL_CONVERT] Upstream streaming request failed: {}",
+                e
+            );
             write_error_response(session, 502, &format!("Upstream request failed: {}", e)).await?;
             return Ok(());
         }
@@ -413,7 +451,10 @@ async fn handle_streaming_response(
         let error_body = match resp.text().await {
             Ok(body) => body,
             Err(e) => {
-                warn!("[PROTOCOL_CONVERT] Failed to read upstream streaming error body: {}", e);
+                warn!(
+                    "[PROTOCOL_CONVERT] Failed to read upstream streaming error body: {}",
+                    e
+                );
                 String::new()
             }
         };
@@ -443,7 +484,7 @@ async fn handle_streaming_response(
 
     // 创建流式转换状态
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let mut stream_state = StreamState::new(response_id, model.to_string(), Some(request_context));
+    let mut stream_state = StreamState::new(response_id, model.to_string());
 
     // SSE 事件序列号
     let mut seq: u64 = 0;
@@ -515,14 +556,18 @@ async fn handle_streaming_response(
                 }
             };
 
-            let response_events = match chat_chunk_to_response_events(&chat_chunk, &mut stream_state)
-            {
-                Ok(events) => events,
-                Err(e) => {
-                    warn!("[PROTOCOL_CONVERT] SSE event conversion failed: {}", e);
-                    continue;
-                }
-            };
+            let response_events =
+                match chat_chunk_to_response_events(
+                    &chat_chunk,
+                    &mut stream_state,
+                    Some(&request_context),
+                ) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        warn!("[PROTOCOL_CONVERT] SSE event conversion failed: {}", e);
+                        continue;
+                    }
+                };
 
             for resp_event in &response_events {
                 let sse_text = event_to_sse(resp_event, seq);
@@ -546,22 +591,26 @@ async fn handle_streaming_response(
                 }
                 if let Ok(chat_chunk) = serde_json::from_str::<ChatStreamChunk>(&event.data)
                     && let Ok(response_events) =
-                        chat_chunk_to_response_events(&chat_chunk, &mut stream_state)
-                    {
-                        for resp_event in &response_events {
-                            let sse_text = event_to_sse(resp_event, seq);
-                            seq += 1;
-                            session
-                                .write_response_body(Some(Bytes::from(sse_text)), false)
-                                .await?;
-                        }
+                        chat_chunk_to_response_events(
+                            &chat_chunk,
+                            &mut stream_state,
+                            Some(&request_context),
+                        )
+                {
+                    for resp_event in &response_events {
+                        let sse_text = event_to_sse(resp_event, seq);
+                        seq += 1;
+                        session
+                            .write_response_body(Some(Bytes::from(sse_text)), false)
+                            .await?;
                     }
+                }
             }
         }
     }
 
     // 发送 response.completed SSE 事件（修复 codex agent "stream disconnected before completion" 错误）
-    let response_obj = stream_state.build_response_object();
+    let response_obj = stream_state.build_response_object(Some(&request_context));
     let completed_event = ResponseStreamEvent::Completed {
         response: response_obj,
     };
@@ -602,9 +651,13 @@ async fn write_error_response(
     let body_bytes = match serde_json::to_vec(&error_body) {
         Ok(bytes) => bytes,
         Err(e) => {
-            error!("[PROTOCOL_CONVERT] Failed to serialize error response: {}", e);
+            error!(
+                "[PROTOCOL_CONVERT] Failed to serialize error response: {}",
+                e
+            );
             // 使用最简单的 fallback 错误 JSON
-            br#"{"error":{"message":"internal proxy error","type":"proxy_error","code":500}}"#.to_vec()
+            br#"{"error":{"message":"internal proxy error","type":"proxy_error","code":500}}"#
+                .to_vec()
         }
     };
 
