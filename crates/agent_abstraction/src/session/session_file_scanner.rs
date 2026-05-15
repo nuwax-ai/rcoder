@@ -129,11 +129,12 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
 
             while let Ok(Some(file)) = files.next_entry().await {
                 if let Some(filename) = file.file_name().to_str()
-                    && filename.ends_with(".jsonl") {
-                        // 提取 session_id（去掉 .jsonl 后缀）
-                        let session_id = filename.trim_end_matches(".jsonl").to_string();
-                        session_ids.insert(session_id);
-                    }
+                    && filename.ends_with(".jsonl")
+                {
+                    // 提取 session_id（去掉 .jsonl 后缀）
+                    let session_id = filename.trim_end_matches(".jsonl").to_string();
+                    session_ids.insert(session_id);
+                }
             }
         }
     }
@@ -179,11 +180,12 @@ pub fn start_file_watcher() {
 
     // 创建目录（如果不存在）
     if !projects_dir.exists()
-        && let Err(e) = std::fs::create_dir_all(&projects_dir) {
-            warn!("[filelisten] Unable to create projects directory: {}", e);
-            WATCHER_STARTED.store(false, Ordering::SeqCst);
-            return;
-        }
+        && let Err(e) = std::fs::create_dir_all(&projects_dir)
+    {
+        warn!("[filelisten] Unable to create projects directory: {}", e);
+        WATCHER_STARTED.store(false, Ordering::SeqCst);
+        return;
+    }
 
     // 创建异步通道
     let (tx, mut rx) = mpsc::channel::<Event>(100);

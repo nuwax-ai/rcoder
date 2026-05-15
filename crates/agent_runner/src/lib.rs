@@ -2,7 +2,6 @@
 //!
 //! 提供 AI 代理运行时和 ACP 协议集成
 
-pub mod agent_runtime;
 pub mod api_key_manager;
 mod config;
 pub mod grpc;
@@ -23,7 +22,6 @@ pub mod http_server;
 pub mod testing;
 
 // 重新导出主要的类型和函数
-pub use agent_runtime::*;
 pub use config::*;
 pub use model::*;
 pub use otel_tracing::*;

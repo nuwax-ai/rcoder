@@ -66,9 +66,10 @@ impl PromptConfigAssembler {
     pub fn get_system_prompt(&self, agent_id: &str) -> String {
         // 入参有值且非空，直接使用
         if let Some(ref sp) = self.system_prompt
-            && !sp.is_empty() {
-                return sp.clone();
-            }
+            && !sp.is_empty()
+        {
+            return sp.clone();
+        }
 
         // 使用默认配置
         self.default_config.get_system_prompt(agent_id)
@@ -83,16 +84,18 @@ impl PromptConfigAssembler {
     pub fn apply_user_prompt(&self, agent_id: &str, user_input: &str) -> String {
         // 入参有模板且非空，使用入参模板
         if let Some(ref template) = self.user_prompt_template
-            && !template.is_empty() {
-                return template.replace("{user_prompt}", user_input);
-            }
+            && !template.is_empty()
+        {
+            return template.replace("{user_prompt}", user_input);
+        }
 
         // 检查默认配置中的 user_prompt 模板
         if let Some(agent) = self.default_config.get_agent(agent_id)
             && let Some(ref prompt_config) = agent.user_prompt
-                && prompt_config.enabled {
-                    return prompt_config.apply(user_input);
-                }
+            && prompt_config.enabled
+        {
+            return prompt_config.apply(user_input);
+        }
 
         // 无模板，直接返回原始输入
         user_input.to_string()
@@ -113,9 +116,10 @@ impl PromptConfigAssembler {
 
         // 如果入参有 agent_server 配置，合并覆盖
         if let Some(ref config) = self.agent_config
-            && let Some(ref agent_server) = config.agent_server {
-                return self.merge_agent_config(&default_agent, agent_server);
-            }
+            && let Some(ref agent_server) = config.agent_server
+        {
+            return self.merge_agent_config(&default_agent, agent_server);
+        }
 
         // 使用默认配置
         default_agent
@@ -171,22 +175,23 @@ impl PromptConfigAssembler {
     pub fn get_context_servers(&self) -> HashMap<String, ContextServerConfig> {
         // 入参有非空的 MCP 配置，使用入参
         if let Some(ref config) = self.agent_config
-            && config.has_context_servers() {
-                return config
-                    .context_servers
-                    .iter()
-                    .map(|(name, chat_config)| {
-                        let ctx_config = ContextServerConfig {
-                            source: chat_config.source.clone(),
-                            enabled: chat_config.enabled,
-                            command: chat_config.command.clone(),
-                            args: chat_config.args.clone(),
-                            env: chat_config.env.clone(),
-                        };
-                        (name.clone(), ctx_config)
-                    })
-                    .collect();
-            }
+            && config.has_context_servers()
+        {
+            return config
+                .context_servers
+                .iter()
+                .map(|(name, chat_config)| {
+                    let ctx_config = ContextServerConfig {
+                        source: chat_config.source.clone(),
+                        enabled: chat_config.enabled,
+                        command: chat_config.command.clone(),
+                        args: chat_config.args.clone(),
+                        env: chat_config.env.clone(),
+                    };
+                    (name.clone(), ctx_config)
+                })
+                .collect();
+        }
 
         // context_servers 为空或未提供，使用默认配置
         self.default_config.context_servers.clone()
@@ -197,9 +202,10 @@ impl PromptConfigAssembler {
     /// 逻辑：入参有指定则使用入参，否则使用默认
     pub fn get_agent_id(&self, default_agent_id: &str) -> String {
         if let Some(ref config) = self.agent_config
-            && let Some(ref agent_server) = config.agent_server {
-                return agent_server.get_agent_id().to_string();
-            }
+            && let Some(ref agent_server) = config.agent_server
+        {
+            return agent_server.get_agent_id().to_string();
+        }
         default_agent_id.to_string()
     }
 
@@ -329,6 +335,7 @@ mod tests {
                 command: None,
                 args: None,
                 env: None,
+                model_env_bindings: Vec::new(),
                 metadata: None,
             }),
             context_servers: HashMap::new(),
@@ -362,6 +369,7 @@ mod tests {
                 command: None,
                 args: None,
                 env: Some(override_env),
+                model_env_bindings: Vec::new(),
                 metadata: None,
             }),
             context_servers: HashMap::new(),

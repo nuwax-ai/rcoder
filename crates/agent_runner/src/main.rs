@@ -1,15 +1,20 @@
 use clap::Parser;
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
+use tracing::error;
+use tracing::info;
+#[cfg(any(feature = "pyroscope", not(feature = "proxy")))]
+use tracing::warn;
 
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
-mod agent_runtime;
 mod api_key_manager;
 mod config;
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 mod grpc;
 mod handler;
 mod model;
@@ -32,11 +37,13 @@ mod utils;
 #[cfg(feature = "http-server")]
 mod http_server;
 
-use agent_runtime::AgentRuntime;
+pub use model::*;
+
 use config::{CliArgs, load_config_with_args};
-use model::*;
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 use router::AppState;
+use service::AgentSessionService;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic;
@@ -230,6 +237,36 @@ fn write_shutdown_log(signal: &str) {
     }
 }
 
+fn create_model_env_resolver(
+    config: &config::AppConfig,
+) -> Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> {
+    #[cfg(feature = "proxy")]
+    {
+        if let Some(proxy_config) = &config.proxy_config {
+            let proxy_base_url_template = format!(
+                "http://localhost:{}/api/{{SERVICE_UUID}}",
+                proxy_config.listen_port
+            );
+            info!(
+                "🔒 [MAIN] Proxy model env enabled: {}",
+                proxy_base_url_template
+            );
+            return Arc::new(
+                agent_abstraction::launcher::ProxyModelRuntimeEnvResolver::new(
+                    proxy_base_url_template,
+                ),
+            );
+        }
+    }
+
+    #[cfg(not(feature = "proxy"))]
+    if config.proxy_config.is_some() {
+        warn!("Proxy config is present, but proxy feature is not enabled; using direct model env");
+    }
+
+    Arc::new(agent_abstraction::launcher::DirectModelRuntimeEnvResolver)
+}
+
 // 路由创建函数已移动到 handler 模块
 
 #[tokio::main]
@@ -281,24 +318,6 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
-    // 🔥 初始化并发限制（从配置读取）
-    if let Some(ref concurrency_config) = config.agent_concurrency {
-        agent_runtime::init_concurrency_limit(concurrency_config.concurrency_limit);
-    }
-
-    // 🔥 创建 AgentRuntime（新架构）
-    let (agent_runtime, task_receiver) = AgentRuntime::new(1000);
-    let agent_runtime = Arc::new(agent_runtime);
-    info!("🔧 [MAIN] AgentRuntime created");
-
-    // 🔥 启动 Worker（在主运行时中，无需独立线程）
-    agent_runtime.start(task_receiver).await;
-    info!("📌 [MAIN] Agent Worker started");
-
-    // 🔥 启动健康检查和重启任务
-    let _health_monitor = spawn_health_monitor(agent_runtime.clone());
-    info!("[MAIN] Worker health monitor started");
-
     // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
     let _reaper_handle = process_reaper::start_process_reaper();
     info!("🧹 [MAIN] Process reaper started (PID 1 mode)");
@@ -325,30 +344,23 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(dashmap::DashMap::<String, shared_types::ModelProviderConfig>::new());
     info!("🔑 [MAIN] Shared API key DashMap created");
 
-    // 🔥 创建 ApiKeyManager 包装器（包装共享 DashMap，消除双重存储）
+    #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
     let api_key_manager = Arc::new(api_key_manager::ApiKeyManager::from_shared(
         shared_api_key_manager.clone(),
     ));
 
-    // 🔒 project_id -> service_uuid 映射
+    #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
     let project_uuid_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
-    // 🔒 设置代理模式标志，使 launcher 将 CODEX_BASE_URL/CODEX_API_KEY 替换为代理 URL/占位符
-    if config.proxy_config.is_some() {
-        // SAFETY: This is safe in a single-threaded context before any async tasks are spawned
-        unsafe { std::env::set_var("RCODER_PROXY_MODE", "1") };
-        info!("🔒 [MAIN] Proxy mode enabled: RCODER_PROXY_MODE=1");
-    }
+    let model_env_resolver: Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> =
+        create_model_env_resolver(&config);
+    let agent_session_service = Arc::new(AgentSessionService::new(model_env_resolver));
+    info!("🔧 [MAIN] AgentSessionService created");
 
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
     {
         use http_server::{HttpServerConfig, start_http_server};
-        use proxy_agent::set_unlimited_mode;
-
-        // 设置为无限制模式（HTTP Server 部署，不限制槽位）
-        set_unlimited_mode(true);
-
         // 🔥 1. 可选：启动 gRPC 服务（当 grpc-server feature 启用时）
         #[cfg(feature = "grpc-server")]
         let grpc_handle = {
@@ -363,8 +375,7 @@ async fn main() -> anyhow::Result<()> {
             let grpc_state = Arc::new(AppState {
                 sessions: Arc::new(DashMap::new()),
                 config: config.clone(),
-                local_task_sender: agent_runtime.clone(),
-                agent_runtime: agent_runtime.clone(),
+                agent_session_service: agent_session_service.clone(),
                 #[cfg(feature = "proxy")]
                 pingora_service: None,
                 api_key_manager: api_key_manager.clone(),
@@ -408,7 +419,7 @@ async fn main() -> anyhow::Result<()> {
         let http_config = HttpServerConfig {
             port: config.port,
             app_config: config.clone(),
-            agent_runtime: agent_runtime.clone(),
+            agent_session_service: agent_session_service.clone(),
             shared_api_key_manager: shared_api_key_manager.clone(),
         };
 
@@ -454,8 +465,7 @@ async fn main() -> anyhow::Result<()> {
         let grpc_state = Arc::new(AppState {
             sessions: Arc::new(DashMap::new()),
             config: config.clone(),
-            local_task_sender: agent_runtime.clone(),
-            agent_runtime: agent_runtime.clone(),
+            agent_session_service: agent_session_service.clone(),
             #[cfg(feature = "proxy")]
             pingora_service: None,
             api_key_manager: api_key_manager.clone(),
@@ -525,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
             use proxy_agent::start_pingora;
 
             if let Some(proxy_config) = &config.proxy_config {
-                Some(start_pingora(proxy_config, shared_api_key_manager.clone()))
+                Some(start_pingora(proxy_config, shared_api_key_manager.clone())?)
             } else {
                 info!("ℹ️  Pingora proxy service is not configured");
                 None
@@ -552,51 +562,4 @@ async fn main() -> anyhow::Result<()> {
 
         Ok(())
     }
-}
-
-/// 🔥 健康监控任务 (新架构)
-///
-/// 定期检查 Agent Worker 健康状态，自动重启不健康的 Worker
-async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        let mut consecutive_failures: u32 = 0;
-        const MAX_RESTART_ATTEMPTS: u32 = 5;
-        const RESTART_COOLDOWN_SECS: u64 = 60;
-
-        info!("[HealthMonitor] Health monitor started");
-
-        loop {
-            interval.tick().await;
-
-            // 检查健康状态
-            if !runtime.check_health().await {
-                error!("[HealthMonitor] Worker reported unhealthy");
-
-                // 检查冷却期
-                if consecutive_failures >= MAX_RESTART_ATTEMPTS {
-                    warn!(
-                        "⏳ [HealthMonitor] {} consecutive restart failures, entering cooldown",
-                        consecutive_failures
-                    );
-                    tokio::time::sleep(Duration::from_secs(RESTART_COOLDOWN_SECS)).await;
-                    consecutive_failures = 0;
-                    info!("[HealthMonitor] Cooldown ended, reset failure counter");
-                }
-
-                // 创建新的通道
-                let (_new_tx, new_rx) = tokio::sync::mpsc::channel(1000);
-
-                // 重启 worker
-                runtime.restart(new_rx).await;
-                consecutive_failures += 1;
-                info!(
-                    "🔄 [HealthMonitor] Worker restart completed (attempt #{})",
-                    consecutive_failures
-                );
-            } else {
-                consecutive_failures = 0;
-            }
-        }
-    })
 }

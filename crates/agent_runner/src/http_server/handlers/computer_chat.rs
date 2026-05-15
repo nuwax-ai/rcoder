@@ -2,7 +2,7 @@
 //!
 //! 处理 POST /computer/chat 请求
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{Json, extract::State, http::HeaderMap};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -135,12 +135,11 @@ pub async fn handle_computer_chat(
         agent_config_override: request.agent_config,
         system_prompt_override: request.system_prompt,
         user_prompt_template_override: request.user_prompt,
-        skip_slot_limit: true, // HTTP Server 部署，跳过槽位限制
     };
 
     // 7. 构建 ChatHandlerContext
     let context = ChatHandlerContext {
-        agent_runtime: state.agent_runtime.clone(),
+        agent_session_service: state.agent_session_service.clone(),
         shared_api_key_manager: state.shared_api_key_manager.clone(),
         project_uuid_map: state.project_uuid_map.clone(),
     };

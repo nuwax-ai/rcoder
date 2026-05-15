@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 /// Provider 缓存（避免重复调用 create_provider）
 static PROVIDER_CACHE: std::sync::LazyLock<DashMap<String, Arc<dyn codex_convert_proxy::Provider + Send + Sync>>> =
-    std::sync::LazyLock::new(|| DashMap::new());
+    std::sync::LazyLock::new(DashMap::new);
 
 /// 判断请求路径是否需要协议转换
 /// Codex 发送请求到 `/v1/responses` 或 `/responses` 等路径

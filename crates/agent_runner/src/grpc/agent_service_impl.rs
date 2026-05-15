@@ -14,6 +14,7 @@ use shared_types::grpc::{
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, GetContainerStatusRequest, GetContainerStatusResponse,
     GetStatusRequest, GetStatusResponse, GetVncStatusRequest, GetVncStatusResponse,
+    ModelEnvBinding as GrpcModelEnvBinding, ModelEnvBindingSource as GrpcModelEnvBindingSource,
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent, ProgressRequest,
     agent_service_server::AgentService, attachment, attachment_source,
 };
@@ -21,7 +22,10 @@ use shared_types::{
     Attachment, AttachmentSource, AudioAttachment, DocumentAttachment, ImageAttachment,
     ImageDimensions, TextAttachment,
 };
-use shared_types::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
+use shared_types::{
+    ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
+    ModelEnvBindingSource,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
@@ -67,21 +71,26 @@ fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProvider
 }
 
 /// Convert gRPC ChatAgentConfig to internal ChatAgentConfig
-fn convert_agent_config(grpc_config: GrpcChatAgentConfig) -> ChatAgentConfig {
-    ChatAgentConfig {
-        agent_server: grpc_config.agent_server.map(convert_agent_server_config),
+fn convert_agent_config(grpc_config: GrpcChatAgentConfig) -> Result<ChatAgentConfig, Status> {
+    Ok(ChatAgentConfig {
+        agent_server: grpc_config
+            .agent_server
+            .map(convert_agent_server_config)
+            .transpose()?,
         context_servers: grpc_config
             .context_servers
             .into_iter()
             .map(|(k, v)| (k, convert_context_server_config(v)))
             .collect(),
         resource_limits: None, // resource_limits not temporarily passed in gRPC messages
-    }
+    })
 }
 
 /// Convert gRPC ChatAgentServerConfig to internal ChatAgentServerConfig
-fn convert_agent_server_config(grpc_config: GrpcChatAgentServerConfig) -> ChatAgentServerConfig {
-    ChatAgentServerConfig {
+fn convert_agent_server_config(
+    grpc_config: GrpcChatAgentServerConfig,
+) -> Result<ChatAgentServerConfig, Status> {
+    Ok(ChatAgentServerConfig {
         agent_id: grpc_config.agent_id,
         command: grpc_config.command,
         args: if grpc_config.args.is_empty() {
@@ -94,12 +103,42 @@ fn convert_agent_server_config(grpc_config: GrpcChatAgentServerConfig) -> ChatAg
         } else {
             Some(grpc_config.env)
         },
+        model_env_bindings: grpc_config
+            .model_env_bindings
+            .into_iter()
+            .map(convert_model_env_binding)
+            .collect::<Result<Vec<_>, _>>()?,
         metadata: if grpc_config.metadata.is_empty() {
             None
         } else {
             Some(grpc_config.metadata)
         },
+    })
+}
+
+fn convert_model_env_binding(grpc_binding: GrpcModelEnvBinding) -> Result<ModelEnvBinding, Status> {
+    let source = match GrpcModelEnvBindingSource::try_from(grpc_binding.source) {
+        Ok(GrpcModelEnvBindingSource::ApiKey) => ModelEnvBindingSource::ApiKey,
+        Ok(GrpcModelEnvBindingSource::BaseUrl) => ModelEnvBindingSource::BaseUrl,
+        Ok(GrpcModelEnvBindingSource::DefaultModel) => ModelEnvBindingSource::DefaultModel,
+        Ok(GrpcModelEnvBindingSource::ProviderName) => ModelEnvBindingSource::ProviderName,
+        Ok(GrpcModelEnvBindingSource::Unspecified) | Err(_) => {
+            return Err(Status::invalid_argument(
+                "model_env_bindings.source must be specified",
+            ));
+        }
+    };
+
+    if grpc_binding.env_key.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "model_env_bindings.env_key must not be empty",
+        ));
     }
+
+    Ok(ModelEnvBinding {
+        env_key: grpc_binding.env_key,
+        source,
+    })
 }
 
 /// 将 gRPC ChatContextServerConfig 转换为内部 ChatContextServerConfig
@@ -314,21 +353,19 @@ impl AgentService for AgentServiceImpl {
                 let tenant_id = std::env::var("TENANT_ID").ok();
                 let space_id = std::env::var("SPACE_ID").ok();
                 match (tenant_id, space_id) {
-                    (Some(tid), Some(sid)) => {
-                        std::path::PathBuf::from("./project_workspace")
-                            .join(&tid)
-                            .join(&sid)
-                            .join(&project_id)
-                    }
-                    _ => {
-                        std::path::PathBuf::from("./project_workspace").join(&project_id)
-                    }
+                    (Some(tid), Some(sid)) => std::path::PathBuf::from("./project_workspace")
+                        .join(&tid)
+                        .join(&sid)
+                        .join(&project_id),
+                    _ => std::path::PathBuf::from("./project_workspace").join(&project_id),
                 }
             }
         };
 
         // 3. 构建 ChatHandlerInput（类型转换）
         use crate::service::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
+        let agent_config_override = req.agent_config.map(convert_agent_config).transpose()?;
+
         let input = ChatHandlerInput {
             project_id,
             project_dir,
@@ -339,15 +376,14 @@ impl AgentService for AgentServiceImpl {
             data_source_attachments: req.data_source_attachments,
             model_config: req.model_config.map(convert_model_provider),
             service_type,
-            agent_config_override: req.agent_config.map(convert_agent_config),
+            agent_config_override,
             system_prompt_override: req.system_prompt,
             user_prompt_template_override: req.user_prompt,
-            skip_slot_limit: true, // 去掉并发限制
         };
 
         // 4. 构建 ChatHandlerContext
         let context = ChatHandlerContext {
-            agent_runtime: self.app_state.agent_runtime.clone(),
+            agent_session_service: self.app_state.agent_session_service.clone(),
             shared_api_key_manager: self.app_state.shared_api_key_manager.clone(),
             project_uuid_map: self.app_state.project_uuid_map.clone(),
         };

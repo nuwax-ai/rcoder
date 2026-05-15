@@ -2,7 +2,7 @@
 //!
 //! 处理 POST /computer/agent/status 请求
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{Json, extract::State, http::HeaderMap};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -38,7 +38,10 @@ pub async fn handle_computer_status(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+    let project_id = request
+        .project_id
+        .as_ref()
+        .expect("validated: project_id is required and non-empty");
 
     // 验证 user_id 或 project_id 至少有一个
     let user_id_empty = request.user_id.as_ref().is_none_or(|s| s.is_empty());
@@ -51,7 +54,12 @@ pub async fn handle_computer_status(
 
     info!(
         "🔍 [HTTP] Computer Agent 状态查询: user_id={:?}, project_id={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}",
-        request.user_id, project_id, request.pod_id, request.tenant_id, request.space_id, request.isolation_type
+        request.user_id,
+        project_id,
+        request.pod_id,
+        request.tenant_id,
+        request.space_id,
+        request.isolation_type
     );
 
     // 从 AGENT_REGISTRY 查询 Agent 状态

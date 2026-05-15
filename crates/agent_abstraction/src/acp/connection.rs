@@ -93,8 +93,7 @@ impl AgentConnection {
         prompt: PromptRequest,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.prompt_tx.send(prompt).map_err(|e| {
-            Box::new(std::io::Error::other(e))
-                as Box<dyn std::error::Error + Send + Sync>
+            Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
         })
     }
 
@@ -118,8 +117,7 @@ impl AgentConnection {
                 result_tx,
             })
             .map_err(|e| {
-                Box::new(std::io::Error::other(e))
-                    as Box<dyn std::error::Error + Send + Sync>
+                Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
             })?;
 
         Ok(result_rx)
@@ -135,9 +133,10 @@ impl AgentConnection {
         let result_rx = self.send_cancel(cancel_notification).await?;
 
         result_rx.await.map_err(|e| {
-            Box::new(std::io::Error::other(
-                format!("Failed to receive cancel result: {}", e),
-            )) as Box<dyn std::error::Error + Send + Sync>
+            Box::new(std::io::Error::other(format!(
+                "Failed to receive cancel result: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
         })
     }
 }

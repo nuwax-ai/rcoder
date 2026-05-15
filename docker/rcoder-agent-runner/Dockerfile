@@ -46,7 +46,7 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
 
 # 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
-RUN cargo install --git https://github.com/soddygo/codex-acp --branch dev
+RUN cargo install --git https://github.com/nuwax-ai/codex-acp.git --branch dev
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
 # 使用 CACHEBUST 变量触发缓存失效

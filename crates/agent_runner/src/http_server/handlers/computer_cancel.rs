@@ -2,12 +2,8 @@
 //!
 //! 处理 POST /computer/agent/session/cancel 请求
 
-use axum::{
-    Json,
-    extract::State,
-    http::HeaderMap,
-};
 use agent_client_protocol::schema::{CancelNotification, SessionId};
+use axum::{Json, extract::State, http::HeaderMap};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -16,8 +12,8 @@ use crate::CancelNotificationRequestWrapper;
 use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
 use shared_types::{
-    ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult, I18nJsonOrQuery,
-    error_codes::ERR_VALIDATION, get_i18n_message, AppError,
+    AppError, ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult, I18nJsonOrQuery,
+    error_codes::ERR_VALIDATION, get_i18n_message,
 };
 
 use super::locale_from_headers;

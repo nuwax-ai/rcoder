@@ -11,12 +11,9 @@ use dashmap::mapref::entry::Entry;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
 use shared_types::ProjectAndAgentInfo;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use tracing::{debug, info, warn};
-
-// 导入工作线程池大小相关函数
-use crate::agent_runtime::get_concurrency_limit;
+use tracing::{debug, info};
 
 /// 全局 Agent 会话注册表（Arc 包装版本，用于 AcpSessionManager 注入）
 pub static AGENT_REGISTRY: LazyLock<Arc<AgentSessionRegistry>> =
@@ -118,20 +115,15 @@ impl<'a> Drop for PendingGuard<'a> {
 /// 统一管理 project_id、session_id 和 AgentInfo 之间的映射关系
 /// 所有映射操作都通过此结构体的方法进行，确保数据一致性
 ///
-/// ## 🔥 P0 修复: Clone 手动实现
+/// ## Clone 手动实现
 ///
-/// 由于 `AtomicUsize` 不实现 `Clone` trait，我们需要手动实现 `Clone`。
-/// DashMap 支持克隆（内部使用 Arc），AtomicUsize 通过 load/store 实现。
+/// DashMap 支持克隆（内部使用 Arc），这里显式 clone 各映射。
 impl Clone for AgentSessionRegistry {
     fn clone(&self) -> Self {
         Self {
             agent_info_map: self.agent_info_map.clone(),
             project_to_session: self.project_to_session.clone(),
             session_to_project: self.session_to_project.clone(),
-            // 注意：AtomicUsize 共享同一个计数器，这是设计意图
-            active_sessions_count: AtomicUsize::new(
-                self.active_sessions_count.load(Ordering::Acquire),
-            ),
         }
     }
 }
@@ -143,9 +135,6 @@ pub struct AgentSessionRegistry {
     project_to_session: DashMap<String, String>,
     /// session_id → project_id (反向映射)
     session_to_project: DashMap<String, String>,
-    /// 🔥 P0 修复: 原子计数器，用于无锁并发限制检查
-    /// 使用 Compare-And-Swap (CAS) 操作避免 TOCTOU 竞态条件
-    active_sessions_count: AtomicUsize,
 }
 
 impl AgentSessionRegistry {
@@ -155,7 +144,6 @@ impl AgentSessionRegistry {
             agent_info_map: DashMap::new(),
             project_to_session: DashMap::new(),
             session_to_project: DashMap::new(),
-            active_sessions_count: AtomicUsize::new(0),
         }
     }
 
@@ -360,8 +348,8 @@ impl AgentSessionRegistry {
     /// 如果项目不存在，则创建一个占位记录
     /// 如果项目已存在且为 Idle 状态，则更新为 Pending
     pub fn set_pending(&self, project_id: &str) {
-        use chrono::Utc;
         use agent_client_protocol::schema::SessionId;
+        use chrono::Utc;
         use shared_types::AgentStatus;
         use std::sync::Arc;
         use tokio::sync::mpsc;
@@ -432,11 +420,12 @@ impl AgentSessionRegistry {
                     let (_, _removed) = entry.remove_entry();
                     // 使用 entry API 安全移除 project_to_session 映射
                     // 仅当映射仍指向 "pending" 时才移除，避免与 register() 的竞态条件
-                    if let Entry::Occupied(oe) = self.project_to_session.entry(project_id.to_string())
-                        && oe.get().as_str() == "pending" {
-                            oe.remove_entry();
-                        }
-                    // Pending 占位符不占用槽位，无需 release_session_slot
+                    if let Entry::Occupied(oe) =
+                        self.project_to_session.entry(project_id.to_string())
+                        && oe.get().as_str() == "pending"
+                    {
+                        oe.remove_entry();
+                    }
                     info!(
                         "🗑️ [Registry] Cleared Pending placeholder: project_id={}",
                         project_id
@@ -593,13 +582,6 @@ impl AgentSessionRegistry {
                 "🗑️ [Registry] Removing Agent: project={}, session={:?}",
                 project_id, session_id
             );
-
-            // 🔥 修复：移除 Agent 时释放槽位
-            self.release_session_slot();
-            info!(
-                "[Registry] Released session slot: project_id={}",
-                project_id
-            );
         }
 
         info!(
@@ -646,9 +628,6 @@ impl AgentSessionRegistry {
                 self.project_to_session.remove(project_id);
                 self.session_to_project.remove(expected_session_id);
 
-                // 释放槽位
-                self.release_session_slot();
-
                 Some(removed_info)
             }
             Entry::Vacant(_) => {
@@ -685,13 +664,6 @@ impl AgentSessionRegistry {
                 info!(
                     "🗑️ [Registry] Removing Agent via session: session={}, project={}",
                     session_id, pid
-                );
-
-                // 🔥 修复：移除 Agent 时释放槽位（与 remove_by_project 保持一致）
-                self.release_session_slot();
-                info!(
-                    "[Registry] Released session slot: session_id={}",
-                    session_id
                 );
             }
 
@@ -736,122 +708,6 @@ impl AgentSessionRegistry {
             agent_count,
             session_count,
         }
-    }
-
-    // ========== 🔥 P0 修复: 原子性会话槽位管理 ==========
-
-    /// 尝试获取会话槽位（原子操作）
-    ///
-    /// ## TOCTOU 竞态条件修复
-    ///
-    /// 使用 Compare-And-Swap (CAS) 操作实现原子性的"检查并递增"，
-    /// 避免了检查 `active_sessions_count` 和注册之间的竞态窗口。
-    ///
-    /// ## 算法
-    ///
-    /// ```text,ignore
-    /// loop {
-    ///     old = load()
-    ///     if old >= LIMIT { return false }
-    ///     if compare_exchange_weak(old, old + 1).is_ok() {
-    ///         return true
-    ///     }
-    ///     // CAS 失败，重试
-    /// }
-    /// ```
-    ///
-    /// ## 返回
-    ///
-    /// - `true`: 成功获取槽位（计数器已递增）
-    /// - `false`: 槽位已满，拒绝请求
-    ///
-    /// ## 使用示例
-    ///
-    /// ```rust,ignore
-    /// if !AGENT_REGISTRY.try_acquire_session_slot() {
-    ///     AGENT_REGISTRY.clear_pending_if_exists(&project_id);
-    ///     return error("系统繁忙，请稍后重试");
-    /// }
-    /// // ... 处理请求 ...
-    /// AGENT_REGISTRY.release_session_slot();
-    /// ```
-    pub fn try_acquire_session_slot(&self) -> bool {
-        let mut old = self.active_sessions_count.load(Ordering::Acquire);
-        let limit = get_concurrency_limit();
-        loop {
-            if old >= limit {
-                return false;
-            }
-            match self.active_sessions_count.compare_exchange_weak(
-                old,
-                old + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    debug!(
-                        "🎯 [AtomicSlot] Acquired slot successfully: {}/{}",
-                        old + 1,
-                        limit
-                    );
-                    return true;
-                }
-                Err(new_old) => old = new_old,
-            }
-        }
-    }
-
-    /// 释放会话槽位
-    ///
-    /// ## 使用场景
-    ///
-    /// 在请求处理完成（无论成功失败）后调用，释放槽位供后续请求使用。
-    ///
-    /// ## ⚠️ 注意事项
-    ///
-    /// - 必须与 `try_acquire_session_slot()` 配对使用
-    /// - 使用 CAS 循环防止溢出（从 0 减到 usize::MAX）
-    /// - 建议使用 `PendingGuard` RAII 模式自动管理
-    pub fn release_session_slot(&self) {
-        // 🛡️ 使用 CAS 循环防止溢出
-        // 如果当前值为 0，不执行减操作（防止溢出到 usize::MAX）
-        loop {
-            let current = self.active_sessions_count.load(Ordering::Acquire);
-            if current == 0 {
-                warn!(
-                    "[AtomicSlot] Tried to release slot but counter is already 0, skipping to prevent underflow"
-                );
-                return;
-            }
-
-            // CAS: 如果当前值仍然是 current，则减 1
-            match self.active_sessions_count.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    debug!(
-                        "🔓 [AtomicSlot] Released slot: {} -> {}",
-                        current,
-                        current - 1
-                    );
-                    return;
-                }
-                Err(_) => {
-                    // 值已被其他线程修改，重试
-                    continue;
-                }
-            }
-        }
-    }
-
-    /// 获取当前活跃会话计数（原子读取）
-    ///
-    /// 用于日志记录和监控，无需遍历 DashMap。
-    pub fn active_sessions_count(&self) -> usize {
-        self.active_sessions_count.load(Ordering::Acquire)
     }
 
     /// 获取内部 agent_info_map 的可变引用（仅用于测试）
@@ -937,8 +793,8 @@ impl Default for AgentSessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use agent_client_protocol::schema::SessionId;
+    use chrono::Utc;
     use shared_types::AgentStatus;
     use std::sync::Arc;
     use tokio::sync::mpsc;

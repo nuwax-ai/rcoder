@@ -5,7 +5,6 @@
 //! - 验证超时后清理资源
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -135,8 +134,8 @@ async fn test_timeout_does_not_cause_deadlock() {
 async fn test_timeout_threshold_configuration() {
     // 测试超时阈值的逻辑判断
     let thresholds = vec![
-        (100, false, false),  // 100ms: 无警告
-        (1000, false, false), // 1s: 无警告
+        (100, false, false),   // 100ms: 无警告
+        (1000, false, false),  // 1s: 无警告
         (30000, false, false), // 30s: 无警告
         (60000, false, false), // 60s: 无警告
         (60001, true, false),  // 60s+1ms: 黄色警告

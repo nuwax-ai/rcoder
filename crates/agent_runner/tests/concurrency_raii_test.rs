@@ -1,10 +1,8 @@
-//! 并发和 RAII 设计测试
+//! PendingGuard RAII 设计测试
 //!
 //! 验证以下功能：
 //! 1. PendingGuard RAII 自动清理
-//! 2. 槽位计数器的基本操作
 
-use agent_runner::agent_runtime::get_concurrency_limit;
 use agent_runner::service::AgentSessionRegistry;
 use agent_runner::service::PendingGuard;
 
@@ -44,67 +42,7 @@ fn test_pending_guard_early_return_cleanup() {
 }
 
 // ============================================================================
-// 2. 原子计数器并发安全性测试
-// ============================================================================
-
-#[test]
-fn test_atomic_slot_counter_basic() {
-    let registry = AgentSessionRegistry::new();
-
-    // 验证初始状态
-    assert_eq!(registry.active_sessions_count(), 0);
-
-    // 获取槽位
-    assert!(registry.try_acquire_session_slot());
-    assert_eq!(registry.active_sessions_count(), 1);
-
-    // 释放槽位
-    registry.release_session_slot();
-    assert_eq!(registry.active_sessions_count(), 0);
-}
-
-#[test]
-fn test_atomic_slot_counter_limit() {
-    let registry = AgentSessionRegistry::new();
-
-    // 获取当前并发限制
-    let limit = get_concurrency_limit();
-
-    // 获取所有槽位
-    for i in 0..limit {
-        assert!(registry.try_acquire_session_slot(), "第 {} 次获取应该成功", i + 1);
-    }
-
-    // 超出限制后应该失败
-    assert!(!registry.try_acquire_session_slot(), "超出限制后应该失败");
-
-    // 释放一个槽位
-    registry.release_session_slot();
-
-    // 现在可以再获取一个
-    assert!(registry.try_acquire_session_slot());
-}
-
-// ============================================================================
-// 3. 边界条件测试
-// ============================================================================
-
-#[test]
-fn test_slot_counter_underflow_protection() {
-    let registry = AgentSessionRegistry::new();
-
-    // 尝试释放从未获取的槽位
-    for _ in 0..10 {
-        registry.release_session_slot();
-    }
-
-    // 验证: 计数器不会下溢（使用 saturating_sub）
-    let count = registry.active_sessions_count();
-    assert_eq!(count, 0, "计数器应该保持为 0，不会下溢");
-}
-
-// ============================================================================
-// 4. RAII 快速销毁测试
+// 2. RAII 快速销毁测试
 // ============================================================================
 
 #[test]
@@ -135,7 +73,7 @@ fn test_raii_fast_destruction() {
 }
 
 // ============================================================================
-// 5. PendingGuard 基本工作流测试
+// 3. PendingGuard 基本工作流测试
 // ============================================================================
 
 #[test]
@@ -155,7 +93,7 @@ fn test_pending_guard_basic_workflow() {
 }
 
 // ============================================================================
-// 6. 调试测试
+// 4. 调试测试
 // ============================================================================
 
 #[test]

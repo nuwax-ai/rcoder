@@ -4,10 +4,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use agent_client_protocol::schema::{ContentBlock, PromptRequest};
 use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use agent_client_protocol::schema::{ContentBlock, PromptRequest};
 use shared_types::{
     AgentLifecycle, CancelNotificationRequestWrapper, ModelProviderConfig, ServiceType,
 };

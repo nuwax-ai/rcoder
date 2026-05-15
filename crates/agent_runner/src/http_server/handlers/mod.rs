@@ -10,7 +10,7 @@ pub mod computer_progress;
 pub mod computer_status;
 pub mod computer_stop;
 pub mod pod_count;
-pub mod rcoder_progress;  // RCoder 模式的 SSE 进度流
+pub mod rcoder_progress; // RCoder 模式的 SSE 进度流
 
 pub(super) fn locale_from_headers(headers: &HeaderMap) -> &'static str {
     let accept_language = headers.get("accept-language").and_then(|v| v.to_str().ok());

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::agent_runtime::AgentRuntime;
+use crate::service::AgentSessionService;
 use crate::{config::AppConfig, handler};
 use axum::{Router, response::IntoResponse, routing::get};
 use dashmap::DashMap;
@@ -31,16 +31,8 @@ pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
 
-    /// 🆕 Agent Runtime（新架构）
-    ///
-    /// **推荐**: 使用 `agent_runtime.send().await` 发送任务
-    /// - 支持自动重启
-    /// - 提供健康状态检查
-    /// - 线程安全的原子操作
-    pub local_task_sender: Arc<AgentRuntime>,
-
-    /// 🆕 Agent Runtime（用于健康检查和状态监控）
-    pub agent_runtime: Arc<AgentRuntime>,
+    /// Agent 会话服务
+    pub agent_session_service: Arc<AgentSessionService>,
 
     /// Pingora 代理服务引用（用于读取真实指标）
     #[cfg(feature = "proxy")]

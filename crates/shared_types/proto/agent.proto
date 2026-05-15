@@ -264,6 +264,23 @@ message ChatAgentServerConfig {
   map<string, string> env = 4;
   // 元数据
   map<string, string> metadata = 5;
+  // 模型环境变量显式绑定规则
+  repeated ModelEnvBinding model_env_bindings = 6;
+}
+
+message ModelEnvBinding {
+  // Agent 子进程环境变量名
+  string env_key = 1;
+  // 绑定来源
+  ModelEnvBindingSource source = 2;
+}
+
+enum ModelEnvBindingSource {
+  MODEL_ENV_BINDING_SOURCE_UNSPECIFIED = 0;
+  MODEL_ENV_BINDING_SOURCE_API_KEY = 1;
+  MODEL_ENV_BINDING_SOURCE_BASE_URL = 2;
+  MODEL_ENV_BINDING_SOURCE_DEFAULT_MODEL = 3;
+  MODEL_ENV_BINDING_SOURCE_PROVIDER_NAME = 4;
 }
 
 // MCP 服务器配置

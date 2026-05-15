@@ -51,7 +51,7 @@ pub fn inject_blocking(config: BlockingConfig) {
     *global = config;
 }
 
-/// 检查并执行阻塞 (在 agent_worker_with_heartbeat 中调用)
+/// 检查并执行阻塞 (在 AgentSessionService 请求路径中调用)
 ///
 /// # Arguments
 ///
@@ -62,7 +62,7 @@ pub fn inject_blocking(config: BlockingConfig) {
 /// ```rust
 /// # use agent_runner::testing::blocking::maybe_block;
 /// # async fn test() {
-/// // 在 agent_worker_with_heartbeat 中调用
+/// // 在 AgentSessionService 请求路径中调用
 /// maybe_block("prompt").await;
 /// # }
 /// ```

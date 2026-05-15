@@ -49,17 +49,17 @@
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
+use agent_client_protocol::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;
-use agent_client_protocol::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use shared_types::{
     AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
 };
 use tracing::{debug, error, info};
 
 use crate::PromptMessage;
-use crate::launcher::ClaudeCodeLauncher;
+use crate::launcher::{ClaudeCodeLauncher, ModelRuntimeEnvResolver};
 use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 
 /// ACP 会话管理器 (SACP 版本)
@@ -77,6 +77,8 @@ pub struct AcpSessionManager<N: SessionNotifier, R: SessionRegistry> {
     registry: Arc<R>,
     /// 会话通知器
     notifier: Arc<N>,
+    /// 模型运行时环境解析策略
+    model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
 }
 
 impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpSessionManager<N, R>
@@ -89,7 +91,23 @@ where
     /// - `notifier`: 会话通知器
     /// - `registry`: 会话注册表（通常注入 AGENT_REGISTRY）
     pub fn new(notifier: Arc<N>, registry: Arc<R>) -> Self {
-        Self { registry, notifier }
+        Self::with_model_env_resolver(
+            notifier,
+            registry,
+            crate::launcher::direct_model_runtime_env_resolver(),
+        )
+    }
+
+    pub fn with_model_env_resolver(
+        notifier: Arc<N>,
+        registry: Arc<R>,
+        model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+    ) -> Self {
+        Self {
+            registry,
+            notifier,
+            model_env_resolver,
+        }
     }
 
     /// 获取会话信息
@@ -285,13 +303,13 @@ where
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
     ) -> Result<R::Entry> {
-        info!(
-            "Creating Agent session, project ID: {}",
-            project_id
-        );
+        info!("Creating Agent session, project ID: {}", project_id);
 
         // 创建 SACP 启动器
-        let launcher = ClaudeCodeLauncher::new(self.notifier.clone());
+        let launcher = ClaudeCodeLauncher::with_model_env_resolver(
+            self.notifier.clone(),
+            self.model_env_resolver.clone(),
+        );
 
         // 记录是否使用了 resume（仅用于日志）
         let has_resume = start_config.resume_session_id.is_some();

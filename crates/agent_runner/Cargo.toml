@@ -24,7 +24,7 @@ grpc-server = []
 
 # Pingora 代理模式：API Key 和 Base URL 使用占位符，由 Pingora 代理注入真实值
 # Windows 不支持 Pingora，禁用此 feature 时直接使用真实的 API Key 和 Base URL
-proxy = ["agent_abstraction/proxy", "dep:rcoder-proxy"]
+proxy = ["dep:rcoder-proxy"]
 
 # 测试相关 features
 testing = ["test-blocking"]

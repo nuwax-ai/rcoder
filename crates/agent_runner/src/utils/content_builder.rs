@@ -2,12 +2,12 @@
 //!
 //! 将 Attachment 转换为 ACP 协议的 ContentBlock
 
-use anyhow::Result;
-use base64::{Engine as _, engine::general_purpose};
 use agent_client_protocol::schema::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, ResourceLink, TextContent, TextResourceContents,
 };
+use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose};
 use std::path::Path;
 
 use crate::model::{Attachment, AttachmentSource};

@@ -2,8 +2,8 @@
 //!
 //! 处理 POST /computer/agent/stop 请求
 
-use axum::{extract::State, http::HeaderMap, Json};
 use agent_client_protocol::schema::{CancelNotification, SessionId};
+use axum::{Json, extract::State, http::HeaderMap};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -43,7 +43,10 @@ pub async fn handle_computer_stop(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+    let project_id = request
+        .project_id
+        .as_ref()
+        .expect("validated: project_id is required and non-empty");
 
     // 验证 user_id 或 project_id 至少有一个
     let user_id_empty = request.user_id.as_ref().is_none_or(|s| s.is_empty());
@@ -56,72 +59,74 @@ pub async fn handle_computer_stop(
 
     info!(
         "🛑 [HTTP] Computer Agent 停止请求: user_id={:?}, project_id={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}",
-        request.user_id, project_id, request.pod_id, request.tenant_id, request.space_id, request.isolation_type
+        request.user_id,
+        project_id,
+        request.pod_id,
+        request.tenant_id,
+        request.space_id,
+        request.isolation_type
     );
 
     // 获取 Agent 信息并发送取消信号
-    let (success, message) =
-        if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(project_id) {
-            let session_id = agent_info.session_id.to_string();
-            let cancel_tx = agent_info.cancel_tx.clone();
+    let (success, message) = if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(project_id) {
+        let session_id = agent_info.session_id.to_string();
+        let cancel_tx = agent_info.cancel_tx.clone();
 
-            // 释放读锁
-            drop(agent_info);
+        // 释放读锁
+        drop(agent_info);
 
-            // 发送取消信号（如果 channel 仍然打开）
-            if !cancel_tx.is_closed() {
-                let session_id_obj = SessionId::new(Arc::from(session_id.as_str()));
-                let cancel_notification = CancelNotification::new(session_id_obj);
+        // 发送取消信号（如果 channel 仍然打开）
+        if !cancel_tx.is_closed() {
+            let session_id_obj = SessionId::new(Arc::from(session_id.as_str()));
+            let cancel_notification = CancelNotification::new(session_id_obj);
 
-                let (result_tx, _result_rx) = oneshot::channel();
-                let cancel_request = CancelNotificationRequestWrapper {
-                    cancel_notification,
-                    result_tx,
-                };
+            let (result_tx, _result_rx) = oneshot::channel();
+            let cancel_request = CancelNotificationRequestWrapper {
+                cancel_notification,
+                result_tx,
+            };
 
-                match cancel_tx.send(cancel_request).await {
-                    Ok(_) => {
-                        info!("[HTTP] Cancel signal sent: session_id={}", session_id);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "⚠️  [HTTP] Failed to send cancel signal: session_id={}, error={}",
-                            session_id, e
-                        );
-                    }
+            match cancel_tx.send(cancel_request).await {
+                Ok(_) => {
+                    info!("[HTTP] Cancel signal sent: session_id={}", session_id);
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️  [HTTP] Failed to send cancel signal: session_id={}, error={}",
+                        session_id, e
+                    );
                 }
             }
+        }
 
-            // 从 AGENT_REGISTRY 移除 Agent
-            let removed = AGENT_REGISTRY
-                .remove_by_project(project_id)
-                .is_some();
+        // 从 AGENT_REGISTRY 移除 Agent
+        let removed = AGENT_REGISTRY.remove_by_project(project_id).is_some();
 
-            if removed {
-                info!("[HTTP] Agent stopped: project_id={}", project_id);
-                (true, get_error_message(SUCCESS, locale))
-            } else {
-                // 可能在取消期间已被清理
-                info!(
-                    "ℹ️  [HTTP] Agent already cleaned up: project_id={}",
-                    project_id
-                );
-                (
-                    true,
-                    get_i18n_message("success.agent_already_stopped", locale),
-                )
-            }
+        if removed {
+            info!("[HTTP] Agent stopped: project_id={}", project_id);
+            (true, get_error_message(SUCCESS, locale))
         } else {
-            // Agent 不存在,幂等返回成功
+            // 可能在取消期间已被清理
             info!(
-                "ℹ️  [HTTP] Agent not found, returning success idempotently: project_id={}",
+                "ℹ️  [HTTP] Agent already cleaned up: project_id={}",
                 project_id
             );
             (
                 true,
                 get_i18n_message("success.agent_already_stopped", locale),
             )
-        };
+        }
+    } else {
+        // Agent 不存在,幂等返回成功
+        info!(
+            "ℹ️  [HTTP] Agent not found, returning success idempotently: project_id={}",
+            project_id
+        );
+        (
+            true,
+            get_i18n_message("success.agent_already_stopped", locale),
+        )
+    };
 
     let response = ComputerAgentStopResponse {
         success,

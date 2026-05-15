@@ -75,8 +75,10 @@ pub mod traits;
 pub use acp::{CancelNotificationRequestWrapper, CancelResult};
 pub use error::AgentAbstractionError;
 pub use launcher::{
-    AgentLaunchConfig, AgentLifecycleGuard, ClaudeCodeLauncher, LauncherConnectionInfoComplete,
-    convert_context_servers, get_default_agent_config, load_agent_config,
+    AgentLaunchConfig, AgentLifecycleGuard, ClaudeCodeLauncher, DirectModelRuntimeEnvResolver,
+    LauncherConnectionInfoComplete, ModelRuntimeEnvResolver, ProxyModelRuntimeEnvResolver,
+    ResolvedModelEnv, convert_context_servers, direct_model_runtime_env_resolver,
+    get_default_agent_config, load_agent_config,
 };
 pub use session::{
     AcpAgentWorker, AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse,

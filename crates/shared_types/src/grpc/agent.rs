@@ -338,6 +338,18 @@ pub struct ChatAgentServerConfig {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+    /// 模型环境变量显式绑定规则
+    #[prost(message, repeated, tag = "6")]
+    pub model_env_bindings: ::prost::alloc::vec::Vec<ModelEnvBinding>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ModelEnvBinding {
+    /// Agent 子进程环境变量名
+    #[prost(string, tag = "1")]
+    pub env_key: ::prost::alloc::string::String,
+    /// 绑定来源
+    #[prost(enumeration = "ModelEnvBindingSource", tag = "2")]
+    pub source: i32,
 }
 /// MCP 服务器配置
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -448,6 +460,41 @@ impl CancelResultType {
             "CANCEL_RESULT_SUCCESS" => Some(Self::CancelResultSuccess),
             "CANCEL_RESULT_FAILED" => Some(Self::CancelResultFailed),
             "CANCEL_RESULT_TIMEOUT" => Some(Self::CancelResultTimeout),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ModelEnvBindingSource {
+    Unspecified = 0,
+    ApiKey = 1,
+    BaseUrl = 2,
+    DefaultModel = 3,
+    ProviderName = 4,
+}
+impl ModelEnvBindingSource {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MODEL_ENV_BINDING_SOURCE_UNSPECIFIED",
+            Self::ApiKey => "MODEL_ENV_BINDING_SOURCE_API_KEY",
+            Self::BaseUrl => "MODEL_ENV_BINDING_SOURCE_BASE_URL",
+            Self::DefaultModel => "MODEL_ENV_BINDING_SOURCE_DEFAULT_MODEL",
+            Self::ProviderName => "MODEL_ENV_BINDING_SOURCE_PROVIDER_NAME",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MODEL_ENV_BINDING_SOURCE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MODEL_ENV_BINDING_SOURCE_API_KEY" => Some(Self::ApiKey),
+            "MODEL_ENV_BINDING_SOURCE_BASE_URL" => Some(Self::BaseUrl),
+            "MODEL_ENV_BINDING_SOURCE_DEFAULT_MODEL" => Some(Self::DefaultModel),
+            "MODEL_ENV_BINDING_SOURCE_PROVIDER_NAME" => Some(Self::ProviderName),
             _ => None,
         }
     }

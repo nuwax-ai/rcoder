@@ -54,7 +54,7 @@ pub struct AppConfig {
     /// gRPC 超时配置
     #[serde(default)]
     pub grpc_timeouts: Option<GrpcTimeoutConfig>,
-    /// Agent 并发配置
+    /// Deprecated no-op. Kept only so old config files still deserialize.
     #[serde(default)]
     pub agent_concurrency: Option<AgentConcurrencyConfig>,
     /// mcp-proxy 日志目录（可选）
@@ -103,20 +103,18 @@ pub struct AgentCleanupConfig {
     pub cleanup_interval_secs: u64,
 }
 
-/// Agent 并发配置
+/// Deprecated no-op. Agent process count is no longer limited by agent_runner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConcurrencyConfig {
-    /// 并发会话槽位数量，默认 10
+    /// Deprecated no-op.
     #[serde(default = "default_concurrency_limit")]
     pub concurrency_limit: usize,
 }
 
-/// Agent 并发配置常量
+/// Deprecated no-op config validation kept for compatibility.
 impl AgentConcurrencyConfig {
-    /// 最小并发限制
     pub const MIN_CONCURRENCY_LIMIT: usize = 1;
 
-    /// 验证配置值是否在有效范围内
     pub fn validate(&self) -> Result<(), String> {
         if self.concurrency_limit < Self::MIN_CONCURRENCY_LIMIT {
             return Err(format!(
@@ -331,7 +329,7 @@ impl Default for AppConfig {
             proxy_config: Some(ProxyConfig::default()),
             agent_cleanup: Some(AgentCleanupConfig::default()),
             grpc_timeouts: Some(GrpcTimeoutConfig::default()),
-            agent_concurrency: Some(AgentConcurrencyConfig::default()),
+            agent_concurrency: None,
             mcp_proxy_log_dir: None,
         }
     }
@@ -461,36 +459,6 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
                 warn!(
                     "Invalid RCODER_AGENT_CLEANUP_INTERVAL_SECS format: {}, keeping config value",
                     cleanup_interval
-                );
-            }
-        }
-    }
-
-    // 🆕 Agent 并发配置：支持环境变量覆盖
-    if let Ok(concurrency_limit) = env::var("RCODER_AGENT_CONCURRENCY_LIMIT") {
-        match concurrency_limit.parse::<usize>() {
-            Ok(limit) => {
-                if limit >= AgentConcurrencyConfig::MIN_CONCURRENCY_LIMIT {
-                    config
-                        .agent_concurrency
-                        .get_or_insert_with(Default::default)
-                        .concurrency_limit = limit;
-                    info!(
-                        "Set concurrency limit from env RCODER_AGENT_CONCURRENCY_LIMIT: {}",
-                        limit
-                    );
-                } else {
-                    warn!(
-                        "Invalid RCODER_AGENT_CONCURRENCY_LIMIT: {}, must be >= {}, keeping config value",
-                        limit,
-                        AgentConcurrencyConfig::MIN_CONCURRENCY_LIMIT
-                    );
-                }
-            }
-            Err(_) => {
-                warn!(
-                    "Invalid RCODER_AGENT_CONCURRENCY_LIMIT format: {}, keeping config value",
-                    concurrency_limit
                 );
             }
         }
@@ -639,18 +607,18 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         config.agent_cleanup = Some(AgentCleanupConfig::default());
     }
 
-    // 🆕 验证 Agent 并发配置的有效性
-    if let Some(ref concurrency_config) = config.agent_concurrency
-        && let Err(e) = concurrency_config.validate()
-    {
-        warn!(
-            "Agent concurrency config validation failed: {}, using defaults",
-            e
-        );
-        config.agent_concurrency = Some(AgentConcurrencyConfig::default());
+    // 4. 命令行参数覆盖配置（优先级最高）
+    if let Some(port) = cli_args.port {
+        config.port = port;
+        info!("Set port from CLI arg: {}", port);
     }
 
-    // 4. 处理代理配置
+    if let Some(projects_dir) = cli_args.projects_dir {
+        config.projects_dir = projects_dir.clone();
+        info!("Set projects directory from CLI arg: {:?}", projects_dir);
+    }
+
+    // 5. 处理代理配置。必须在最终 HTTP port 确定后再推导 default_backend_port。
     if cli_args.enable_proxy {
         let proxy_config = ProxyConfig {
             listen_port: cli_args.proxy_port.unwrap_or(8080),
@@ -670,17 +638,6 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
             proxy_config.listen_port
         );
         config.proxy_config = Some(proxy_config);
-    }
-
-    // 5. 命令行参数覆盖配置（优先级最高）
-    if let Some(port) = cli_args.port {
-        config.port = port;
-        info!("Set port from CLI arg: {}", port);
-    }
-
-    if let Some(projects_dir) = cli_args.projects_dir {
-        config.projects_dir = projects_dir.clone();
-        info!("Set projects directory from CLI arg: {:?}", projects_dir);
     }
 
     info!(
@@ -738,13 +695,6 @@ fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
 
     // 获取 grpc_timeouts 配置，如果不存在则使用默认值
     let grpc_timeouts = config.grpc_timeouts.as_ref().cloned().unwrap_or_default();
-
-    // 获取 agent_concurrency 配置，如果不存在则使用默认值
-    let agent_concurrency = config
-        .agent_concurrency
-        .as_ref()
-        .cloned()
-        .unwrap_or_default();
 
     // 手动构建带注释的 YAML 内容
     let content_with_comments = format!(
@@ -822,15 +772,6 @@ grpc_timeouts:
   # 可通过环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 覆盖
   port_check_timeout_millis: {}
 
-# Agent 并发配置
-# 如果省略此配置块，将使用以下默认值：
-#   - concurrency_limit: 10 (10个并发会话)
-agent_concurrency:
-  # Agent 并发会话槽位数量
-  # 决定可以同时处理的 Agent 会话数量
-  # 有效范围: >= 1
-  # 可通过环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 覆盖
-  concurrency_limit: {}
 "#,
         config.default_agent_id,
         config.projects_dir.display(),
@@ -849,8 +790,7 @@ agent_concurrency:
         grpc_timeouts.cancel_session_timeout_secs,
         grpc_timeouts.acp_session_create_timeout_secs,
         grpc_timeouts.agent_cancel_timeout_secs,
-        grpc_timeouts.port_check_timeout_millis,
-        agent_concurrency.concurrency_limit
+        grpc_timeouts.port_check_timeout_millis
     );
 
     fs::write(CONFIG_FILE, content_with_comments)
@@ -956,5 +896,37 @@ mod tests {
         // 应该先检测到 idle_timeout_secs 的错误
         let err = config.validate().unwrap_err();
         assert!(err.contains("idle_timeout_secs"));
+    }
+
+    #[test]
+    fn proxy_default_backend_port_uses_final_cli_port() {
+        let config = load_config_with_args(CliArgs {
+            port: Some(8286),
+            projects_dir: None,
+            enable_proxy: true,
+            proxy_port: Some(8089),
+            default_backend_port: None,
+        });
+
+        let proxy_config = config.proxy_config.expect("proxy config");
+        assert_eq!(config.port, 8286);
+        assert_eq!(proxy_config.listen_port, 8089);
+        assert_eq!(proxy_config.default_backend_port, 8286);
+    }
+
+    #[test]
+    fn proxy_default_backend_port_keeps_explicit_cli_value() {
+        let config = load_config_with_args(CliArgs {
+            port: Some(8286),
+            projects_dir: None,
+            enable_proxy: true,
+            proxy_port: Some(8089),
+            default_backend_port: Some(9000),
+        });
+
+        let proxy_config = config.proxy_config.expect("proxy config");
+        assert_eq!(config.port, 8286);
+        assert_eq!(proxy_config.listen_port, 8089);
+        assert_eq!(proxy_config.default_backend_port, 9000);
     }
 }

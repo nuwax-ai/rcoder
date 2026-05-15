@@ -13,19 +13,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_client_protocol::schema::{CancelNotification, SessionId};
 use dashmap::DashMap;
 use shared_types::{
     Attachment, CancelNotificationRequestWrapper, CancelResult, ChatAgentConfig, ChatPromptBuilder,
     ModelProviderConfig, ServiceType, error_codes,
 };
-use agent_client_protocol::schema::{CancelNotification, SessionId};
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::AgentRuntime;
-use crate::agent_runtime::WorkerState;
-use crate::proxy_agent::AgentRequest;
-use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
+use crate::service::{
+    AGENT_REGISTRY, AgentRequest, AgentSessionService, PendingGuard, SESSION_CACHE,
+};
 
 /// Chat Handler 输入参数
 ///
@@ -56,8 +55,6 @@ pub struct ChatHandlerInput {
     pub system_prompt_override: Option<String>,
     /// 用户提示模板覆盖（可选）
     pub user_prompt_template_override: Option<String>,
-    /// 是否跳过槽位限制（HTTP Server 宿主机部署时为 true）
-    pub skip_slot_limit: bool,
 }
 
 /// Chat Handler 输出结果
@@ -122,8 +119,8 @@ impl ChatHandlerOutput {
 ///
 /// 包含处理 chat 请求所需的运行时依赖
 pub struct ChatHandlerContext {
-    /// Agent 运行时
-    pub agent_runtime: Arc<AgentRuntime>,
+    /// Agent 会话服务
+    pub agent_session_service: Arc<AgentSessionService>,
     /// 共享的 API 密钥管理器
     pub shared_api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
     /// project_id -> UUID 映射
@@ -322,38 +319,39 @@ pub async fn handle_chat_core(
     // ========== 步骤2: 检查 Agent Busy 状态，如果忙则取消当前任务 ==========
     use crate::model::AgentStatus;
     if let Some(agent_info) = agent_info_ref
-        && (agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending) {
-            info!(
-                "[ChatHandler] Agent Busy, cancelling current task: project_id={}, status={:?}, session_id={:?}",
-                project_id, agent_info.status, session_id
+        && (agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending)
+    {
+        info!(
+            "[ChatHandler] Agent Busy, cancelling current task: project_id={}, status={:?}, session_id={:?}",
+            project_id, agent_info.status, session_id
+        );
+
+        // 获取 cancel_tx 和 session_id，并释放 DashMap 读锁（防死锁）
+        let cancel_tx = agent_info.cancel_tx.clone();
+        // 优先使用请求中的 session_id，如果为空则从 agent_info 中获取
+        let actual_session_id = session_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| agent_info.session_id.to_string());
+        drop(agent_info);
+
+        // 取消当前任务
+        if let Err(cancel_error) =
+            cancel_current_task(&cancel_tx, &actual_session_id, &project_id).await
+        {
+            // 取消失败，返回错误
+            error!(
+                "[ChatHandler] Failed to cancel current task: project_id={}, error={:?}",
+                project_id, cancel_error
             );
-
-            // 获取 cancel_tx 和 session_id，并释放 DashMap 读锁（防死锁）
-            let cancel_tx = agent_info.cancel_tx.clone();
-            // 优先使用请求中的 session_id，如果为空则从 agent_info 中获取
-            let actual_session_id = session_id
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| agent_info.session_id.to_string());
-            drop(agent_info);
-
-            // 取消当前任务
-            if let Err(cancel_error) =
-                cancel_current_task(&cancel_tx, &actual_session_id, &project_id).await
-            {
-                // 取消失败，返回错误
-                error!(
-                    "[ChatHandler] Failed to cancel current task: project_id={}, error={:?}",
-                    project_id, cancel_error
-                );
-                return cancel_error;
-            }
-
-            info!(
-                "[ChatHandler] Current task cancelled, proceeding with new request: project_id={}",
-                project_id
-            );
+            return cancel_error;
         }
+
+        info!(
+            "[ChatHandler] Current task cancelled, proceeding with new request: project_id={}",
+            project_id
+        );
+    }
 
     // ========== 步骤3: 创建 PendingGuard（RAII）==========
     // 自动在作用域结束时清理，避免状态泄漏
@@ -387,19 +385,20 @@ pub async fn handle_chat_core(
 
     // 确保目录存在
     if !project_dir.exists()
-        && let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
-            error!("[ChatHandler] Failed to create project directory: {}", e);
-            return ChatHandlerOutput::error(
-                project_id,
-                session_id.unwrap_or_default(),
-                format!(
-                    "{}: {}",
-                    error_codes::get_i18n_message_default("error.create_project_dir_failed"),
-                    e
-                ),
-                error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-            );
-        }
+        && let Err(e) = tokio::fs::create_dir_all(&project_dir).await
+    {
+        error!("[ChatHandler] Failed to create project directory: {}", e);
+        return ChatHandlerOutput::error(
+            project_id,
+            session_id.unwrap_or_default(),
+            format!(
+                "{}: {}",
+                error_codes::get_i18n_message_default("error.create_project_dir_failed"),
+                e
+            ),
+            error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
+        );
+    }
 
     // ========== 步骤6: 构建 ChatPrompt 和 PromptMessage ==========
     let chat_prompt = match ChatPromptBuilder::default()
@@ -480,51 +479,19 @@ pub async fn handle_chat_core(
         warn!("[ChatHandler] No model config provided; falling back to env vars or defaults");
     }
 
-    // ========== 步骤8: 检查 Worker 状态 ==========
-    match context.agent_runtime.state() {
-        WorkerState::Running => {
-            // 正常操作，继续处理
-        }
-        WorkerState::Starting => {
-            warn!("[ChatHandler] Agent Worker is starting; request may be delayed");
-        }
-        WorkerState::Stopping | WorkerState::Stopped => {
-            // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] Agent Worker unavailable");
-            return ChatHandlerOutput::error(
-                project_id,
-                session_id.unwrap_or_default(),
-                error_codes::get_i18n_message_default("error.agent_worker_unavailable"),
-                error_codes::ERR_SERVICE_UNAVAILABLE.to_string(),
-            );
-        }
-    }
-
-    // ========== 步骤9: 发送任务到 Agent Worker ==========
+    // ========== 步骤8: 直接调用 Agent 会话服务 ==========
     // 创建请求并设置 UUID 和密钥管理器
-    let (agent_request, chat_prompt_rx) = AgentRequest::new(prompt_message, model_provider);
-    let agent_request = agent_request
+    let agent_request = AgentRequest::new(prompt_message, model_provider)
         .with_service_uuid(service_uuid)
-        .with_key_manager(Some(context.shared_api_key_manager.clone()))
-        .with_skip_slot_limit(input.skip_slot_limit);
+        .with_key_manager(Some(context.shared_api_key_manager.clone()));
 
-    if let Err(e) = context.agent_runtime.send(agent_request).await {
-        // PendingGuard 自动清理（在 drop 时）
-        error!("[ChatHandler] Failed to send task: {}", e);
-        return ChatHandlerOutput::error(
-            project_id,
-            session_id.unwrap_or_default(),
-            format!(
-                "{}: {}",
-                error_codes::get_i18n_message_default("error.send_task_failed"),
-                e
-            ),
-            error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-        );
-    }
-
-    // ========== 步骤10: 等待响应（5 分钟超时）==========
-    match tokio::time::timeout(std::time::Duration::from_secs(300), chat_prompt_rx).await {
+    // ========== 步骤9: 等待响应（5 分钟超时）==========
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        context.agent_session_service.process_request(agent_request),
+    )
+    .await
+    {
         Ok(Ok(response)) => {
             let output = ChatHandlerOutput {
                 project_id: response.project_id,
@@ -556,7 +523,7 @@ pub async fn handle_chat_core(
         }
         Ok(Err(e)) => {
             // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] Chat response channel dropped: {}", e);
+            error!("[ChatHandler] Agent session processing failed: {}", e);
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -570,7 +537,10 @@ pub async fn handle_chat_core(
         }
         Err(_elapsed) => {
             // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] ⏰ Chat request timeout (300s): project_id={}", project_id);
+            error!(
+                "[ChatHandler] ⏰ Chat request timeout (300s): project_id={}",
+                project_id
+            );
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),

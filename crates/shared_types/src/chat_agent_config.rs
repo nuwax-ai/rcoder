@@ -57,9 +57,34 @@ pub struct ChatAgentServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
 
+    /// 模型环境变量显式绑定规则
+    ///
+    /// 用于声明某个 Agent env key 应该绑定到 model_provider 的哪个字段。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_env_bindings: Vec<ModelEnvBinding>,
+
     /// 元数据（可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
+}
+
+/// 模型环境变量绑定规则
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct ModelEnvBinding {
+    /// Agent 子进程环境变量名
+    pub env_key: String,
+    /// 绑定来源
+    pub source: ModelEnvBindingSource,
+}
+
+/// 模型环境变量绑定来源
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelEnvBindingSource {
+    ApiKey,
+    BaseUrl,
+    DefaultModel,
+    ProviderName,
 }
 
 /// MCP 服务器配置
@@ -182,10 +207,43 @@ mod tests {
         let config: ChatAgentConfig = serde_json::from_str(json).unwrap();
         assert!(config.has_agent_server());
         assert!(config.has_context_servers());
+        assert!(
+            config
+                .agent_server
+                .as_ref()
+                .unwrap()
+                .model_env_bindings
+                .is_empty()
+        );
         assert_eq!(
             config.agent_server.as_ref().unwrap().get_agent_id(),
             "claude-code-acp-ts"
         );
+    }
+
+    #[test]
+    fn test_chat_agent_server_model_env_bindings_json_deserialize() {
+        let json = r#"{
+            "agent_server": {
+                "agent_id": "nuwax-codex-acp",
+                "env": {"CODEX_MODEL": "placeholder"},
+                "model_env_bindings": [
+                    {"env_key": "CODEX_API_KEY", "source": "api_key"},
+                    {"env_key": "CODEX_BASE_URL", "source": "base_url"},
+                    {"env_key": "CODEX_MODEL", "source": "default_model"},
+                    {"env_key": "CODEX_PROVIDER", "source": "provider_name"}
+                ]
+            }
+        }"#;
+        let config: ChatAgentConfig = serde_json::from_str(json).unwrap();
+        let bindings = &config.agent_server.unwrap().model_env_bindings;
+
+        assert_eq!(bindings.len(), 4);
+        assert_eq!(bindings[0].env_key, "CODEX_API_KEY");
+        assert_eq!(bindings[0].source, ModelEnvBindingSource::ApiKey);
+        assert_eq!(bindings[1].source, ModelEnvBindingSource::BaseUrl);
+        assert_eq!(bindings[2].source, ModelEnvBindingSource::DefaultModel);
+        assert_eq!(bindings[3].source, ModelEnvBindingSource::ProviderName);
     }
 
     #[test]

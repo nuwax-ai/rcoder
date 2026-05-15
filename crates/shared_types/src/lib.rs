@@ -22,7 +22,10 @@ pub use i18n_extractors::I18nJsonOrQuery;
 
 // Chat Agent 配置模块
 mod chat_agent_config;
-pub use chat_agent_config::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
+pub use chat_agent_config::{
+    ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
+    ModelEnvBindingSource,
+};
 
 // API Key 验证器模块
 pub mod api_key_validator;
@@ -86,12 +89,12 @@ pub use model::{
     HealthResponse,
     HttpResult,
     ImageAttachment,
-    PodCountByServiceType,
-    PodCountResponse,
     ImageDimensions,
     ModelApiProtocol,
     ModelProviderConfig,
     ModelProviderSafeInfo,
+    PodCountByServiceType,
+    PodCountResponse,
     ProjectAndAgentInfo,
     ProjectAndContainerInfo,
     // Session trait

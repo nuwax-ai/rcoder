@@ -1,21 +1,17 @@
-#![allow(dead_code)]
-
-mod acp_agent;
 pub mod cleanup_task;
 
-use crate::CancelNotificationRequestWrapper;
-// 导出 agent_worker 相关类型和函数
-pub use acp_agent::{AgentRequest, agent_worker_with_heartbeat, set_unlimited_mode};
-use shared_types::AgentLifecycleGuard;
-// SACP 类型导入
 #[cfg(feature = "proxy")]
 use crate::config::ProxyConfig;
+#[cfg(feature = "proxy")]
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 #[cfg(feature = "proxy")]
 use rcoder_proxy::{PingoraServerManager, ProxyConfig as PingoraProxyConfig};
-use agent_client_protocol::schema::{PromptRequest, SessionId};
-use std::sync::{Arc, LazyLock};
-use tokio::sync::mpsc;
+#[cfg(feature = "proxy")]
+use std::net::TcpListener;
+#[cfg(feature = "proxy")]
+use std::sync::Arc;
+use std::sync::LazyLock;
 #[cfg(feature = "proxy")]
 use tracing::{error, info};
 
@@ -43,11 +39,10 @@ impl PingoraStartResult {
 /// 封装 Pingora 的创建和启动逻辑，供 main.rs 和 http_server/start.rs 复用。
 /// shutdown 通道在外部创建，`stop()` 直接发送信号，不经过 Mutex，消除死锁风险。
 #[cfg(feature = "proxy")]
-#[must_use]
 pub fn start_pingora(
     proxy_config: &ProxyConfig,
     shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
-) -> PingoraStartResult {
+) -> Result<PingoraStartResult> {
     info!(
         "Starting Pingora reverse proxy service, listening on port: {}",
         proxy_config.listen_port
@@ -56,6 +51,8 @@ pub fn start_pingora(
         "Proxy route format: /proxy/{{port}}{{/path}} - e.g.: /proxy/{}/health",
         proxy_config.default_backend_port
     );
+
+    preflight_proxy_port(proxy_config.listen_port)?;
 
     let pingora_config = PingoraProxyConfig {
         listen_port: proxy_config.listen_port,
@@ -94,9 +91,19 @@ pub fn start_pingora(
         proxy_config.listen_port
     );
 
-    PingoraStartResult {
+    Ok(PingoraStartResult {
         shutdown_tx: Some(shutdown_tx),
-    }
+    })
+}
+
+#[cfg(feature = "proxy")]
+fn preflight_proxy_port(listen_port: u16) -> Result<()> {
+    let addr = format!("0.0.0.0:{listen_port}");
+    let listener = TcpListener::bind(&addr)
+        .with_context(|| format!("Pingora proxy port preflight failed: {addr} is unavailable"))?;
+    drop(listener);
+    info!("Pingora proxy port preflight passed: {}", addr);
+    Ok(())
 }
 
 /// 会话级别的 request_id 上下文映射（project_id -> request_id）
@@ -104,15 +111,3 @@ pub fn start_pingora(
 /// 避免使用 PROJECT_AND_AGENT_INFO_MAP 导致的锁竞争问题
 /// 注意：使用 project_id 而非 session_id，确保同一项目的多次请求能自动覆盖为最新值
 pub static SESSION_REQUEST_CONTEXT: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
-
-/// ACP协议的连接信息
-pub struct AcpConnectionInfo {
-    /// 会话ID
-    pub session_id: SessionId,
-    /// 用于发送 Prompt 的通道
-    pub prompt_tx: mpsc::UnboundedSender<PromptRequest>,
-    /// 用于发送取消通知的通道（使用新类型）
-    pub cancel_tx: mpsc::UnboundedSender<CancelNotificationRequestWrapper>,
-    /// Agent停止句柄（将被包装为守卫并放入 ProjectAndAgentInfo）
-    pub stop_handle: Option<Arc<AgentLifecycleGuard>>,
-}

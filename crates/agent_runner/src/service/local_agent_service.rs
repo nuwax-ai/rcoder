@@ -6,24 +6,24 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_client_protocol::schema::{CancelNotification, SessionId};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use agent_client_protocol::schema::{CancelNotification, SessionId};
 use shared_types::{
+    AgentStatusResponse, ChatResponse, HttpResult, RcoderChatRequest, ServiceType,
     agent_http_service::AgentHttpService,
     rcoder_agent_types::{
         RcoderAgentCancelRequest, RcoderAgentCancelResponse, RcoderAgentStopRequest,
         RcoderAgentStopResponse,
     },
-    AgentStatusResponse, ChatResponse, HttpResult, RcoderChatRequest, ServiceType,
 };
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use crate::AgentRuntime;
 use crate::service::{
+    AGENT_REGISTRY, AgentSessionService, SESSION_CACHE, SessionData,
     chat_handler::{ChatHandlerContext, ChatHandlerInput},
-    handle_chat_core, AGENT_REGISTRY, SESSION_CACHE, SessionData,
+    handle_chat_core,
 };
 
 /// Agent Runner 本地服务实现
@@ -31,8 +31,8 @@ use crate::service::{
 /// 直接调用本地 AGENT_REGISTRY、SESSION_CACHE、handle_chat_core()
 /// 不需要 gRPC 转发
 pub struct LocalAgentHttpService {
-    /// Agent 运行时
-    pub agent_runtime: Arc<AgentRuntime>,
+    /// Agent 会话服务
+    pub agent_session_service: Arc<AgentSessionService>,
     /// 共享 API Key 管理器
     pub shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
     /// project_id -> UUID 映射
@@ -44,13 +44,13 @@ pub struct LocalAgentHttpService {
 impl LocalAgentHttpService {
     /// 创建新的 LocalAgentHttpService
     pub fn new(
-        agent_runtime: Arc<AgentRuntime>,
+        agent_session_service: Arc<AgentSessionService>,
         shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
         project_uuid_map: Arc<DashMap<String, String>>,
         projects_dir: PathBuf,
     ) -> Self {
         Self {
-            agent_runtime,
+            agent_session_service,
             shared_api_key_manager,
             project_uuid_map,
             projects_dir,
@@ -95,7 +95,10 @@ impl AgentHttpService for LocalAgentHttpService {
         if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
             let error_msg = format!("Failed to create project dir: {}", e);
             warn!("[LocalAgent] {}", error_msg);
-            return HttpResult::error(shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR, &error_msg);
+            return HttpResult::error(
+                shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
+                &error_msg,
+            );
         }
 
         // 4. 生成 request_id（如果未提供）
@@ -117,12 +120,11 @@ impl AgentHttpService for LocalAgentHttpService {
             agent_config_override: request.agent_config,
             system_prompt_override: request.system_prompt,
             user_prompt_template_override: request.user_prompt,
-            skip_slot_limit: true, // HTTP Server 部署，跳过槽位限制
         };
 
         // 6. 构建 ChatHandlerContext
         let context = ChatHandlerContext {
-            agent_runtime: self.agent_runtime.clone(),
+            agent_session_service: self.agent_session_service.clone(),
             shared_api_key_manager: self.shared_api_key_manager.clone(),
             project_uuid_map: self.project_uuid_map.clone(),
         };
@@ -139,7 +141,10 @@ impl AgentHttpService for LocalAgentHttpService {
 
         // 9. 构建响应
         if output.error.is_some() || !output.success {
-            let error_code = output.error_code.as_deref().unwrap_or(shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR);
+            let error_code = output
+                .error_code
+                .as_deref()
+                .unwrap_or(shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR);
             let error_msg = output.error.unwrap_or_else(|| "Unknown error".to_string());
             HttpResult::error(error_code, &error_msg)
         } else {
@@ -156,10 +161,7 @@ impl AgentHttpService for LocalAgentHttpService {
 
     /// 查询 Agent 状态
     async fn get_status(&self, project_id: &str) -> HttpResult<AgentStatusResponse> {
-        info!(
-            "🔍 [LocalAgent] Status query: project_id={}",
-            project_id
-        );
+        info!("🔍 [LocalAgent] Status query: project_id={}", project_id);
 
         if let Some(info) = AGENT_REGISTRY.get_agent_info(project_id) {
             // Agent 存在且活跃
@@ -175,17 +177,13 @@ impl AgentHttpService for LocalAgentHttpService {
 
             info!(
                 "✅ [LocalAgent] Agent status: project_id={}, is_alive=true, status={:?}",
-                project_id,
-                info.status
+                project_id, info.status
             );
 
             HttpResult::success(response)
         } else {
             // Agent 不存在
-            info!(
-                "📭 [LocalAgent] Agent not found: project_id={}",
-                project_id
-            );
+            info!("📭 [LocalAgent] Agent not found: project_id={}", project_id);
 
             let response = AgentStatusResponse {
                 project_id: project_id.to_string(),
@@ -271,7 +269,10 @@ impl AgentHttpService for LocalAgentHttpService {
     }
 
     /// 取消正在执行的任务
-    async fn cancel(&self, request: RcoderAgentCancelRequest) -> HttpResult<RcoderAgentCancelResponse> {
+    async fn cancel(
+        &self,
+        request: RcoderAgentCancelRequest,
+    ) -> HttpResult<RcoderAgentCancelResponse> {
         info!(
             "🚫 [LocalAgent] Cancel request: project_id={}, session_id={:?}",
             request.project_id, request.session_id

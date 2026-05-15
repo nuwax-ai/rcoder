@@ -214,20 +214,23 @@ pub async fn handle_computer_progress(
                 return (Ok(Event::default().data("{}")), false);
             }
         };
-        (Ok(Event::default().event(msg.sub_type).data(json_str)), is_terminal)
+        (
+            Ok(Event::default().event(msg.sub_type).data(json_str)),
+            is_terminal,
+        )
     });
 
     // 4. 创建心跳流（标记为非终端）
-    let heartbeat_stream = create_heartbeat_stream(session_id.clone())
-        .map(|event| (event, false));
+    let heartbeat_stream = create_heartbeat_stream(session_id.clone()).map(|event| (event, false));
 
     // 5. 合并两个流，并用 scan 监测终止条件
     // select 会继续轮询心跳流（永不结束），所以必须在合并流层面检测终止
     // 终止条件：
     //   - 收到 SessionPromptEnd（终端消息）→ 发送后结束流
     //   - channel 关闭 → message_stream 返回 None，scan 最终也会结束
-    let merged_stream = futures_util::stream::select(message_stream, heartbeat_stream)
-        .scan(false, |seen_terminal, (event, is_terminal)| {
+    let merged_stream = futures_util::stream::select(message_stream, heartbeat_stream).scan(
+        false,
+        |seen_terminal, (event, is_terminal)| {
             if *seen_terminal {
                 // 已发送终端消息，结束流
                 return std::future::ready(None);
@@ -238,7 +241,8 @@ pub async fn handle_computer_progress(
             }
 
             std::future::ready(Some(event))
-        });
+        },
+    );
 
     info!("[HTTP] SSE stream established: session_id={}", session_id);
 

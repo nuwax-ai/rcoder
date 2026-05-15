@@ -14,16 +14,16 @@ use tower_http::limit::RequestBodyLimitLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::agent_runtime::AgentRuntime;
 use crate::api_key_manager::ApiKeyManager;
 use crate::config::AppConfig;
+use crate::service::AgentSessionService;
 use crate::service::local_agent_service::LocalAgentHttpService;
 
 /// HTTP 应用状态
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
-    pub agent_runtime: Arc<AgentRuntime>,
+    pub agent_session_service: Arc<AgentSessionService>,
     pub api_key_manager: Arc<ApiKeyManager>,
     pub shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
     pub project_uuid_map: Arc<DashMap<String, String>>,
@@ -32,12 +32,12 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         config: AppConfig,
-        agent_runtime: Arc<AgentRuntime>,
+        agent_session_service: Arc<AgentSessionService>,
         shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
     ) -> Self {
         Self {
             config,
-            agent_runtime: agent_runtime.clone(),
+            agent_session_service: agent_session_service.clone(),
             api_key_manager: Arc::new(ApiKeyManager::from_shared(shared_api_key_manager.clone())),
             shared_api_key_manager,
             project_uuid_map: Arc::new(DashMap::new()),
@@ -47,7 +47,7 @@ impl AppState {
     /// 创建 LocalAgentHttpService 实例用于 RCoder 模式
     pub fn create_local_agent_service(&self) -> Arc<LocalAgentHttpService> {
         Arc::new(LocalAgentHttpService::new(
-            self.agent_runtime.clone(),
+            self.agent_session_service.clone(),
             self.shared_api_key_manager.clone(),
             self.project_uuid_map.clone(),
             self.config.projects_dir.clone(),
@@ -92,12 +92,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     // RCoder Agent 路由（使用 LocalAgentHttpService）
     let rcoder_routes = Router::new()
-        .route("/chat", post(http_handlers::handle_chat::<LocalAgentHttpService>))
+        .route(
+            "/chat",
+            post(http_handlers::handle_chat::<LocalAgentHttpService>),
+        )
         .route(
             "/agent/session/cancel",
             post(http_handlers::handle_cancel::<LocalAgentHttpService>),
         )
-        .route("/agent/stop", post(http_handlers::handle_stop::<LocalAgentHttpService>))
+        .route(
+            "/agent/stop",
+            post(http_handlers::handle_stop::<LocalAgentHttpService>),
+        )
         .route(
             "/agent/status/{project_id}",
             get(http_handlers::handle_status::<LocalAgentHttpService>),

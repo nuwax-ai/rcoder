@@ -136,13 +136,14 @@ where
         // 🆕 如果用户指定了 agent_server 配置，添加到 start_config
         // 注意：这里直接使用用户传入的配置，由 launcher 层负责与默认配置合并
         if let Some(ref override_config) = request.prompt_message.agent_config_override
-            && let Some(ref agent_server) = override_config.agent_server {
-                debug!(
-                    "📝 Using user-specified Agent server config: command={:?}, args={:?}",
-                    agent_server.command, agent_server.args
-                );
-                start_config = start_config.with_agent_server_override(agent_server.clone());
-            }
+            && let Some(ref agent_server) = override_config.agent_server
+        {
+            debug!(
+                "📝 Using user-specified Agent server config: command={:?}, args={:?}",
+                agent_server.command, agent_server.args
+            );
+            start_config = start_config.with_agent_server_override(agent_server.clone());
+        }
 
         // Resume 策略：直接传递 session_id，由 LoadSessionRequest 在 Agent 层面检查
         //

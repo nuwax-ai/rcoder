@@ -9,11 +9,15 @@ use shared_types::grpc::{
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, DocumentAttachment as GrpcDocumentAttachment,
     ImageAttachment as GrpcImageAttachment, ImageDimensions as GrpcImageDimensions,
+    ModelEnvBinding as GrpcModelEnvBinding, ModelEnvBindingSource as GrpcModelEnvBindingSource,
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent,
     TextAttachment as GrpcTextAttachment, attachment, attachment_source,
 };
 use shared_types::{Attachment, AttachmentSource, ModelProviderConfig, UnifiedSessionMessage};
-use shared_types::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
+use shared_types::{
+    ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
+    ModelEnvBindingSource,
+};
 
 /// 将内部 ChatRequest 转换为 gRPC ChatRequest
 ///
@@ -216,6 +220,27 @@ pub fn to_grpc_chat_agent_server_config(
         args: config.args.unwrap_or_default(),
         env: config.env.unwrap_or_default(),
         metadata: config.metadata.unwrap_or_default(),
+        model_env_bindings: config
+            .model_env_bindings
+            .into_iter()
+            .map(to_grpc_model_env_binding)
+            .collect(),
+    }
+}
+
+fn to_grpc_model_env_binding(binding: ModelEnvBinding) -> GrpcModelEnvBinding {
+    GrpcModelEnvBinding {
+        env_key: binding.env_key,
+        source: to_grpc_model_env_binding_source(binding.source) as i32,
+    }
+}
+
+fn to_grpc_model_env_binding_source(source: ModelEnvBindingSource) -> GrpcModelEnvBindingSource {
+    match source {
+        ModelEnvBindingSource::ApiKey => GrpcModelEnvBindingSource::ApiKey,
+        ModelEnvBindingSource::BaseUrl => GrpcModelEnvBindingSource::BaseUrl,
+        ModelEnvBindingSource::DefaultModel => GrpcModelEnvBindingSource::DefaultModel,
+        ModelEnvBindingSource::ProviderName => GrpcModelEnvBindingSource::ProviderName,
     }
 }
 
