@@ -23,7 +23,7 @@ pub use i18n_extractors::I18nJsonOrQuery;
 // Chat Agent 配置模块
 mod chat_agent_config;
 pub use chat_agent_config::{
-    ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
+    AgentMode, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
     ModelEnvBindingSource,
 };
 
@@ -33,8 +33,13 @@ pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 
 // 新增多镜像配置相关模块
 pub mod multi_image_config;
+pub mod permission_types;
 pub mod service_config;
 pub mod service_type;
+pub use permission_types::{
+    PermissionResolveRequest, ResolvePermissionHttpRequest, ResolvePermissionRequestDto,
+    ResolvePermissionResponseDto,
+};
 
 // 常量定义模块
 pub mod constants;
@@ -63,6 +68,7 @@ pub mod grpc_wrapper;
 pub use grpc_wrapper::MaskedModelConfig;
 
 pub use model::{
+    AcpRequestPermission,
     AgentLifecycle,
     AgentLifecycleGuard,
     AgentSessionUpdate,

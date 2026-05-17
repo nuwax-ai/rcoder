@@ -5,7 +5,9 @@
 use crate::grpc::GrpcChannelPool;
 use shared_types::ChatAgentConfig;
 use shared_types::grpc::{
-    CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest, ChatResponse as GrpcChatResponse,
+    CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest,
+    ChatResponse as GrpcChatResponse, ResolvePermissionRequest as GrpcResolvePermissionRequest,
+    ResolvePermissionResponse as GrpcResolvePermissionResponse,
 };
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -152,6 +154,38 @@ pub async fn grpc_cancel_session(
     // 创建临时连接池（单次使用）
     let pool = Arc::new(GrpcChannelPool::new());
     grpc_cancel_session_with_pool(&pool, grpc_addr, session_id, reason, project_id).await
+}
+
+/// Resolve a pending ACP permission request through agent_runner gRPC.
+pub async fn grpc_resolve_permission_with_pool(
+    pool: &Arc<GrpcChannelPool>,
+    grpc_addr: &str,
+    input: shared_types::ResolvePermissionRequestDto,
+) -> anyhow::Result<GrpcResolvePermissionResponse> {
+    info!(
+        "[gRPC_PERMISSION] Sending ResolvePermission: addr={}, session_id={}, tool_call_id={}",
+        grpc_addr, input.session_id, input.tool_call_id
+    );
+
+    let mut client = pool.get_client(grpc_addr).await?;
+    let grpc_request = GrpcResolvePermissionRequest {
+        session_id: input.session_id,
+        tool_call_id: input.tool_call_id,
+        option_id: input.option_id,
+        cancelled: input.cancelled,
+        save_rule: input.save_rule,
+        project_id: input.project_id.unwrap_or_default(),
+        user_id: input.user_id,
+    };
+
+    let locale = super::current_grpc_locale();
+    let request = super::new_request_with_locale(grpc_request, locale);
+    let response = client.resolve_permission(request).await.map_err(|e| {
+        error!("[gRPC_PERMISSION] ResolvePermission RPC call failed: {}", e);
+        anyhow::anyhow!("gRPC ResolvePermission call failed: {}", e)
+    })?;
+
+    Ok(response.into_inner())
 }
 
 /// 通过 gRPC 停止 Agent（使用连接池）

@@ -27,6 +27,12 @@ pub struct AgentStartConfig {
     /// Service type (for loading corresponding config, required)
     pub service_type: shared_types::ServiceType,
 
+    /// User ID, mainly used by ComputerAgentRunner permission routing.
+    pub user_id: Option<String>,
+
+    /// Permission approval mode.
+    pub agent_mode: shared_types::AgentMode,
+
     /// Session ID for resuming sessions
     ///
     /// When resuming a previous session, pass the previous session_id,
@@ -62,6 +68,8 @@ impl AgentStartConfig {
             mcp_servers: Vec::new(),
             extra_meta: None,
             service_type,
+            user_id: None,
+            agent_mode: shared_types::AgentMode::Yolo,
             resume_session_id: None,
             agent_server_override: None,
             acp_session_create_timeout_secs: None,
@@ -93,6 +101,18 @@ impl AgentStartConfig {
     /// Set service type
     pub fn with_service_type(mut self, service_type: shared_types::ServiceType) -> Self {
         self.service_type = service_type;
+        self
+    }
+
+    /// Set user ID.
+    pub fn with_user_id(mut self, user_id: Option<String>) -> Self {
+        self.user_id = user_id.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Set permission approval mode.
+    pub fn with_agent_mode(mut self, agent_mode: shared_types::AgentMode) -> Self {
+        self.agent_mode = agent_mode;
         self
     }
 
@@ -299,6 +319,9 @@ pub struct PromptMessage {
     /// Service type
     pub service_type: shared_types::ServiceType,
 
+    /// User ID, mainly used by ComputerAgentRunner permission routing.
+    pub user_id: Option<String>,
+
     // === New fields (v2) ===
     /// System prompt override
     ///
@@ -334,6 +357,7 @@ impl PromptMessage {
             attachments: Vec::new(),
             data_source_attachments: Vec::new(),
             service_type,
+            user_id: None,
             // New fields default to None
             system_prompt_override: None,
             user_prompt_template_override: None,
@@ -379,6 +403,12 @@ impl PromptMessage {
         self.agent_config_override = config;
         self
     }
+
+    /// Set user ID.
+    pub fn with_user_id(mut self, user_id: Option<String>) -> Self {
+        self.user_id = user_id.filter(|s| !s.trim().is_empty());
+        self
+    }
 }
 
 /// Convert from ChatPrompt to PromptMessage
@@ -404,6 +434,7 @@ impl From<shared_types::ChatPrompt> for PromptMessage {
             attachments: chat_prompt.attachments,
             data_source_attachments: chat_prompt.data_source_attachments,
             service_type: chat_prompt.service_type,
+            user_id: chat_prompt.user_id,
             // Map new fields
             system_prompt_override: chat_prompt.system_prompt_override,
             user_prompt_template_override: chat_prompt.user_prompt_template_override,

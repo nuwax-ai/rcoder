@@ -100,6 +100,7 @@ impl TestRequestBuilder {
             attachments: self.attachments.clone(),
             data_source_attachments: vec![],
             service_type: ServiceType::RCoder,
+            user_id: None,
             system_prompt_override: None,
             user_prompt_template_override: None,
             agent_config_override: None,
@@ -196,12 +197,10 @@ mod tests {
     }
 
     #[test]
-    fn test_test_request_builder_build_returns_receiver() {
-        // 验证 build() 返回的接收器可用
-        let (_req, mut rx) = TestRequestBuilder::new().build();
-
-        // 验证接收器尚未收到消息
-        assert!(rx.try_recv().is_err(), "接收器应该为空");
+    fn test_test_request_builder_build_returns_agent_request() {
+        let request = TestRequestBuilder::new().build();
+        assert_eq!(request.prompt_message.project_id, "test-project");
+        assert_eq!(request.prompt_message.content, "Hello, Agent!");
     }
 
     #[test]

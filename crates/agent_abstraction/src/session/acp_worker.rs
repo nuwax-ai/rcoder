@@ -12,7 +12,7 @@ use std::sync::Arc;
 use agent_config::{AgentServersConfig, PromptConfigAssembler};
 use anyhow::Result;
 use shared_types::{ProjectAndAgentInfo, SessionEntry};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
 use crate::launcher::convert_context_servers;
@@ -131,7 +131,8 @@ where
         // 构建 AgentStartConfig 并传递 MCP 服务器、service_type
         let mut start_config = AgentStartConfig::new(request.prompt_message.service_type.clone())
             .with_system_prompt(system_prompt)
-            .with_mcp_servers(mcp_servers);
+            .with_mcp_servers(mcp_servers)
+            .with_user_id(request.prompt_message.user_id.clone());
 
         // 🆕 如果用户指定了 agent_server 配置，添加到 start_config
         // 注意：这里直接使用用户传入的配置，由 launcher 层负责与默认配置合并
@@ -141,6 +142,17 @@ where
             debug!(
                 "📝 Using user-specified Agent server config: command={:?}, args={:?}",
                 agent_server.command, agent_server.args
+            );
+            if let Err(err) = agent_server.agent_mode() {
+                warn!(
+                    "[ACP] Invalid agent_mode, falling back to yolo: project_id={}, error={}",
+                    request.prompt_message.project_id, err
+                );
+            }
+            start_config = start_config.with_agent_mode(
+                agent_server
+                    .agent_mode()
+                    .unwrap_or(shared_types::AgentMode::Yolo),
             );
             start_config = start_config.with_agent_server_override(agent_server.clone());
         }

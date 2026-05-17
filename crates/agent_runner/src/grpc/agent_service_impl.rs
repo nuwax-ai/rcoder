@@ -16,7 +16,9 @@ use shared_types::grpc::{
     GetStatusRequest, GetStatusResponse, GetVncStatusRequest, GetVncStatusResponse,
     ModelEnvBinding as GrpcModelEnvBinding, ModelEnvBindingSource as GrpcModelEnvBindingSource,
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent, ProgressRequest,
-    agent_service_server::AgentService, attachment, attachment_source,
+    ResolvePermissionRequest as GrpcResolvePermissionRequest,
+    ResolvePermissionResponse as GrpcResolvePermissionResponse, agent_service_server::AgentService,
+    attachment, attachment_source,
 };
 use shared_types::{
     Attachment, AttachmentSource, AudioAttachment, DocumentAttachment, ImageAttachment,
@@ -34,7 +36,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::model::AgentStatus;
 use crate::router::AppState;
-use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER, SESSION_CACHE};
 use crate::{CancelNotificationRequestWrapper, CancelResult};
 
 const ACCEPT_LANGUAGE_METADATA_KEY: &str = "accept-language";
@@ -90,6 +92,10 @@ fn convert_agent_config(grpc_config: GrpcChatAgentConfig) -> Result<ChatAgentCon
 fn convert_agent_server_config(
     grpc_config: GrpcChatAgentServerConfig,
 ) -> Result<ChatAgentServerConfig, Status> {
+    if let Err(err) = shared_types::AgentMode::parse(grpc_config.agent_mode.as_deref()) {
+        return Err(Status::invalid_argument(err));
+    }
+
     Ok(ChatAgentServerConfig {
         agent_id: grpc_config.agent_id,
         command: grpc_config.command,
@@ -108,6 +114,7 @@ fn convert_agent_server_config(
             .into_iter()
             .map(convert_model_env_binding)
             .collect::<Result<Vec<_>, _>>()?,
+        agent_mode: grpc_config.agent_mode,
         metadata: if grpc_config.metadata.is_empty() {
             None
         } else {
@@ -376,6 +383,7 @@ impl AgentService for AgentServiceImpl {
             data_source_attachments: req.data_source_attachments,
             model_config: req.model_config.map(convert_model_provider),
             service_type,
+            user_id: req.user_id,
             agent_config_override,
             system_prompt_override: req.system_prompt,
             user_prompt_template_override: req.user_prompt,
@@ -643,6 +651,15 @@ impl AgentService for AgentServiceImpl {
         } else {
             req.session_id.clone()
         };
+
+        let cancelled_permissions =
+            PERMISSION_MANAGER.cancel_session_permissions(&actual_session_id);
+        if cancelled_permissions > 0 {
+            info!(
+                "[gRPC] cancelled {} pending permission request(s): session_id={}",
+                cancelled_permissions, actual_session_id
+            );
+        }
 
         // 1. Get project_id via unified Registry O(1) reverse query
         let project_id = match AGENT_REGISTRY.get_project_by_session(&actual_session_id) {
@@ -1042,6 +1059,50 @@ impl AgentService for AgentServiceImpl {
         .await
     }
 
+    /// Resolve pending ACP permission request.
+    #[instrument(skip(self, request))]
+    async fn resolve_permission(
+        &self,
+        request: Request<GrpcResolvePermissionRequest>,
+    ) -> Result<Response<GrpcResolvePermissionResponse>, Status> {
+        let req = request.into_inner();
+        info!(
+            "[gRPC] ResolvePermission: session_id={}, tool_call_id={}, project_id={}, cancelled={}, save_rule={}",
+            req.session_id, req.tool_call_id, req.project_id, req.cancelled, req.save_rule
+        );
+
+        if req.session_id.trim().is_empty() || req.tool_call_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "session_id and tool_call_id are required",
+            ));
+        }
+
+        let dto = shared_types::ResolvePermissionRequestDto {
+            session_id: req.session_id,
+            tool_call_id: req.tool_call_id,
+            option_id: req.option_id,
+            cancelled: req.cancelled,
+            save_rule: req.save_rule,
+            project_id: Some(req.project_id).filter(|s| !s.trim().is_empty()),
+            user_id: req.user_id,
+            pod_id: None,
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+        };
+
+        let result = PERMISSION_MANAGER.resolve_permission(dto).await;
+        Ok(Response::new(GrpcResolvePermissionResponse {
+            success: result.success,
+            session_id: result.session_id,
+            tool_call_id: result.tool_call_id,
+            outcome_json: result.outcome_json,
+            rule_saved: result.rule_saved,
+            error_code: result.error_code,
+            message: result.message,
+        }))
+    }
+
     /// 获取 Agent 状态
     ///
     /// 支持通过 `project_id` 或 `session_id` 查询 Agent 状态
@@ -1141,6 +1202,14 @@ impl AgentService for AgentServiceImpl {
             "🛑 [gRPC] StopAgent: project_id={}, force={}, reason={}",
             project_id, force, reason
         );
+
+        let cancelled_permissions = PERMISSION_MANAGER.cancel_project_permissions(&project_id);
+        if cancelled_permissions > 0 {
+            info!(
+                "[gRPC] cancelled {} pending permission request(s): project_id={}",
+                cancelled_permissions, project_id
+            );
+        }
 
         // 检查 Agent 是否存在，并提取需要的数据后立即释放读锁
         // ⚠️ 重要：必须在任何 .await 之前 drop 掉 Ref，否则会导致死锁

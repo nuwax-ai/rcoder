@@ -49,6 +49,8 @@ pub struct ChatHandlerInput {
     pub model_config: Option<ModelProviderConfig>,
     /// 服务类型
     pub service_type: ServiceType,
+    /// 用户 ID（ComputerAgentRunner 模式使用）
+    pub user_id: Option<String>,
     /// Agent 配置覆盖（可选）
     pub agent_config_override: Option<ChatAgentConfig>,
     /// 系统提示覆盖（可选）
@@ -409,6 +411,7 @@ pub async fn handle_chat_core(
         .attachments(input.attachments)
         .data_source_attachments(input.data_source_attachments)
         .service_type(input.service_type)
+        .user_id(input.user_id)
         .request_id(request_id.clone())
         .model_provider(input.model_config.clone())
         .system_prompt_override(input.system_prompt_override)

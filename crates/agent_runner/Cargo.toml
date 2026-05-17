@@ -66,6 +66,8 @@ tonic = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+regex = { workspace = true }
+shlex = { workspace = true }
 
 derive_builder = { workspace = true }
 

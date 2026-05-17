@@ -40,9 +40,9 @@ use super::types::{
 };
 use crate::acp::CancelNotificationRequestWrapper;
 use crate::launcher::model_env;
-use crate::traits::AgentStartConfig;
 use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::session_registry::SessionRegistry;
+use crate::traits::{AgentStartConfig, PermissionRequestHandler, YoloPermissionRequestHandler};
 
 /// Claude Code ACP Agent 启动器 (SACP 版本)
 ///
@@ -51,21 +51,28 @@ pub struct SacpClaudeCodeLauncher<N: SessionNotifier> {
     /// 会话通知器
     notifier: Arc<N>,
     model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+    permission_handler: Arc<dyn PermissionRequestHandler>,
 }
 
 impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
     /// 创建新的启动器
     pub fn new(notifier: Arc<N>) -> Self {
-        Self::with_model_env_resolver(notifier, model_env::direct_model_runtime_env_resolver())
+        Self::with_model_env_resolver(
+            notifier,
+            model_env::direct_model_runtime_env_resolver(),
+            Arc::new(YoloPermissionRequestHandler),
+        )
     }
 
     pub fn with_model_env_resolver(
         notifier: Arc<N>,
         model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+        permission_handler: Arc<dyn PermissionRequestHandler>,
     ) -> Self {
         Self {
             notifier,
             model_env_resolver,
+            permission_handler,
         }
     }
 
@@ -418,6 +425,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let project_id_clone = project_id.clone();
         let cancel_token_clone = cancel_token.clone();
         let notifier_clone = self.notifier.clone();
+        let permission_handler_clone = self.permission_handler.clone();
         let abnormal_exit_flag_clone = abnormal_exit_flag.clone();
         let session_id_shared_clone = session_id_shared.clone();
         let connection_error_clone = connection_error_shared.clone();
@@ -449,6 +457,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 cancel_rx,
                 cancel_token: cancel_token_clone,
                 notifier: notifier_clone,
+                permission_handler: permission_handler_clone,
                 abnormal_exit_flag: abnormal_exit_flag_clone,
                 session_id_shared: session_id_shared_clone,
                 connection_failed_tx: connection_failed_tx.take(),

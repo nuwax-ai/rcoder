@@ -83,7 +83,7 @@ pub async fn handle_computer_chat(
         ));
     }
 
-    let _user_id = request.user_id.clone();
+    let user_id = request.user_id.clone();
 
     // 2. 生成或使用提供的 project_id (直接用 UUID，去掉连字符，与 rcoder 保持一致)
     let project_id = request
@@ -132,6 +132,7 @@ pub async fn handle_computer_chat(
         data_source_attachments: request.data_source_attachments,
         model_config: request.model_provider,
         service_type: ServiceType::ComputerAgentRunner,
+        user_id: Some(user_id),
         agent_config_override: request.agent_config,
         system_prompt_override: request.system_prompt,
         user_prompt_template_override: request.user_prompt,

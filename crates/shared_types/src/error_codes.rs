@@ -86,6 +86,15 @@ pub const ERR_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
 /// API Key 鉴权失败
 pub const ERR_API_KEY_AUTH_FAILED: &str = "4010";
 
+/// Permission request not found or already resolved
+pub const ERR_PERMISSION_NOT_FOUND: &str = "PERMISSION_NOT_FOUND";
+
+/// Permission resolve operation failed
+pub const ERR_PERMISSION_RESOLVE_FAILED: &str = "PERMISSION_RESOLVE_FAILED";
+
+/// Permission request expired before user approval
+pub const ERR_PERMISSION_EXPIRED: &str = "PERMISSION_EXPIRED";
+
 /// 获取错误码对应的翻译 key
 fn get_error_i18n_key(code: &str) -> &'static str {
     match code {
@@ -113,6 +122,9 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_RETRY_EXHAUSTED => "error.retry_exhausted",
         ERR_TOO_MANY_REQUESTS => "error.too_many_requests",
         ERR_API_KEY_AUTH_FAILED => "error.api_key_auth_failed",
+        ERR_PERMISSION_NOT_FOUND => "error.permission_not_found",
+        ERR_PERMISSION_RESOLVE_FAILED => "error.permission_resolve_failed",
+        ERR_PERMISSION_EXPIRED => "error.permission_expired",
         ERR_UNKNOWN => "error.unknown",
         _ => "error.undefined",
     }
@@ -183,6 +195,9 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_RETRY_EXHAUSTED => "Degraded retry count exhausted",
         ERR_TOO_MANY_REQUESTS => "Too many requests",
         ERR_API_KEY_AUTH_FAILED => "API Key authentication failed",
+        ERR_PERMISSION_NOT_FOUND => "Permission request not found or already resolved",
+        ERR_PERMISSION_RESOLVE_FAILED => "Permission resolve operation failed",
+        ERR_PERMISSION_EXPIRED => "Permission request expired",
         ERR_UNKNOWN => "Unknown error",
         _ => "Undefined error code",
     }
@@ -220,6 +235,9 @@ mod tests {
             ERR_RETRY_EXHAUSTED,
             ERR_TOO_MANY_REQUESTS,
             ERR_API_KEY_AUTH_FAILED,
+            ERR_PERMISSION_NOT_FOUND,
+            ERR_PERMISSION_RESOLVE_FAILED,
+            ERR_PERMISSION_EXPIRED,
         ];
 
         for code in codes {

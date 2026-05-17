@@ -3,15 +3,15 @@
 //! 在 Rust 内部类型和 gRPC Protobuf 类型之间进行转换
 
 use shared_types::grpc::{
-    Attachment as GrpcAttachment, AttachmentSource as GrpcAttachmentSource,
-    AudioAttachment as GrpcAudioAttachment, Base64Data, ChatAgentConfig as GrpcChatAgentConfig,
-    ChatAgentServerConfig as GrpcChatAgentServerConfig,
+    attachment, attachment_source, Attachment as GrpcAttachment,
+    AttachmentSource as GrpcAttachmentSource, AudioAttachment as GrpcAudioAttachment, Base64Data,
+    ChatAgentConfig as GrpcChatAgentConfig, ChatAgentServerConfig as GrpcChatAgentServerConfig,
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, DocumentAttachment as GrpcDocumentAttachment,
     ImageAttachment as GrpcImageAttachment, ImageDimensions as GrpcImageDimensions,
     ModelEnvBinding as GrpcModelEnvBinding, ModelEnvBindingSource as GrpcModelEnvBindingSource,
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent,
-    TextAttachment as GrpcTextAttachment, attachment, attachment_source,
+    TextAttachment as GrpcTextAttachment,
 };
 use shared_types::{Attachment, AttachmentSource, ModelProviderConfig, UnifiedSessionMessage};
 use shared_types::{
@@ -165,6 +165,7 @@ pub fn from_grpc_progress_event(
         "SessionPromptStart" => SessionMessageType::SessionPromptStart,
         "SessionPromptEnd" => SessionMessageType::SessionPromptEnd,
         "AgentSessionUpdate" => SessionMessageType::AgentSessionUpdate,
+        "AcpRequestPermission" => SessionMessageType::AcpRequestPermission,
         "Heartbeat" => SessionMessageType::Heartbeat,
         _ => SessionMessageType::AgentSessionUpdate, // 默认为 AgentSessionUpdate
     };
@@ -225,6 +226,7 @@ pub fn to_grpc_chat_agent_server_config(
             .into_iter()
             .map(to_grpc_model_env_binding)
             .collect(),
+        agent_mode: config.agent_mode,
     }
 }
 

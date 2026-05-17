@@ -314,6 +314,7 @@ fn parse_message_type(message_type: &str) -> SessionMessageType {
         "SessionPromptStart" => SessionMessageType::SessionPromptStart,
         "SessionPromptEnd" => SessionMessageType::SessionPromptEnd,
         "AgentSessionUpdate" => SessionMessageType::AgentSessionUpdate,
+        "AcpRequestPermission" => SessionMessageType::AcpRequestPermission,
         "Heartbeat" => SessionMessageType::Heartbeat,
         // 默认作为 AgentSessionUpdate 处理
         _ => {

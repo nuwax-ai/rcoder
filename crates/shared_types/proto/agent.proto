@@ -13,6 +13,9 @@ service AgentService {
   // 取消会话任务 (Unary)
   rpc CancelSession(CancelRequest) returns (CancelResponse);
 
+  // Resolve a pending ACP permission request (Unary)
+  rpc ResolvePermission(ResolvePermissionRequest) returns (ResolvePermissionResponse);
+
   // 获取 Agent 状态 (Unary)
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 
@@ -116,6 +119,28 @@ message CancelResponse {
   bool success = 1;
   CancelResultType result = 2;
   optional string message = 3;
+}
+
+// === Resolve Permission ===
+
+message ResolvePermissionRequest {
+  string session_id = 1;
+  string tool_call_id = 2;
+  optional string option_id = 3;
+  bool cancelled = 4;
+  bool save_rule = 5;
+  string project_id = 6;
+  optional string user_id = 7;
+}
+
+message ResolvePermissionResponse {
+  bool success = 1;
+  string session_id = 2;
+  string tool_call_id = 3;
+  optional string outcome_json = 4;
+  bool rule_saved = 5;
+  optional string error_code = 6;
+  optional string message = 7;
 }
 
 // === Get Status ===
@@ -266,6 +291,8 @@ message ChatAgentServerConfig {
   map<string, string> metadata = 5;
   // 模型环境变量显式绑定规则
   repeated ModelEnvBinding model_env_bindings = 6;
+  // Permission approval mode: "yolo" (default) or "ask"
+  optional string agent_mode = 7;
 }
 
 message ModelEnvBinding {

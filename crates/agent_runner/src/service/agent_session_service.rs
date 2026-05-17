@@ -17,7 +17,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo};
 use crate::proxy_agent::SESSION_REQUEST_CONTEXT;
-use crate::service::{AGENT_REGISTRY, AgentSessionRegistry, StateAwareNotifier};
+use crate::service::{
+    AGENT_REGISTRY, AgentSessionRegistry, PERMISSION_MANAGER, StateAwareNotifier,
+};
 use crate::utils::ContentBuilder;
 
 #[derive(Debug)]
@@ -63,10 +65,11 @@ pub struct AgentSessionService {
 impl AgentSessionService {
     pub fn new(model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>) -> Self {
         let session_manager = Arc::new(
-            AcpSessionManager::<StateAwareNotifier, AgentSessionRegistry>::with_model_env_resolver(
+            AcpSessionManager::<StateAwareNotifier, AgentSessionRegistry>::with_dependencies(
                 Arc::new(StateAwareNotifier::new()),
                 AGENT_REGISTRY.clone(),
                 model_env_resolver,
+                PERMISSION_MANAGER.clone(),
             ),
         );
 

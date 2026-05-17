@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::{
     CancelNotification, InitializeRequest, LoadSessionRequest, McpServer, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    PromptRequest, RequestPermissionRequest, RequestPermissionResponse, SessionId,
+    SessionNotification,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectionTo, Dispatch, Handled, JsonRpcMessage, Responder,
@@ -17,8 +17,8 @@ use tracing::{debug, error, info, warn};
 
 use super::types::VERSION;
 use crate::acp::CancelNotificationRequestWrapper;
-use crate::traits::AgentStartConfig;
 use crate::traits::session_notifier::SessionNotifier;
+use crate::traits::{AgentStartConfig, PermissionRequestContext, PermissionRequestHandler};
 use shared_types::error_codes;
 
 /// SACP 连接参数（封装 run_sacp_connection 的参数）
@@ -32,6 +32,7 @@ pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
     pub(crate) cancel_rx: mpsc::Receiver<CancelNotificationRequestWrapper>,
     pub(crate) cancel_token: CancellationToken,
     pub(crate) notifier: Arc<N>,
+    pub(crate) permission_handler: Arc<dyn PermissionRequestHandler>,
     /// 🔥 新增：共享的异常退出标志（子进程异常退出时设置为 true）
     pub(crate) abnormal_exit_flag: Arc<AtomicBool>,
     /// 共享的 session_id，用于连接失败时发送错误通知
@@ -64,6 +65,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         mut cancel_rx,
         cancel_token,
         notifier,
+        permission_handler,
         abnormal_exit_flag,
         session_id_shared,
         mut connection_failed_tx,
@@ -73,6 +75,14 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
     // 克隆变量供 handlers 使用
     let notifier_for_handlers = notifier.clone();
     let project_id_for_handlers = project_id.clone();
+    let permission_handler_for_request = permission_handler.clone();
+    let permission_context = PermissionRequestContext {
+        project_id: project_id.clone(),
+        user_id: start_config.user_id.clone(),
+        agent_mode: start_config.agent_mode,
+        service_type: start_config.service_type.clone(),
+        request_id: None,
+    };
     // 克隆 notifier 和 project_id 供 prompt 结束通知使用
     let notifier_for_prompt_end = notifier.clone();
     let project_id_for_prompt_end = project_id.clone();
@@ -121,10 +131,21 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         )
         // 处理 RequestPermission
         .on_receive_request(
-            move |request: RequestPermissionRequest,
-                  responder: Responder<RequestPermissionResponse>,
-                  _cx: ConnectionTo<Agent>| {
-                async move { handle_permission_request(request, responder).await }
+            {
+                let permission_handler = permission_handler_for_request.clone();
+                let context = permission_context.clone();
+                move |request: RequestPermissionRequest,
+                      responder: Responder<RequestPermissionResponse>,
+                      _cx: ConnectionTo<Agent>| {
+                    let permission_handler = permission_handler.clone();
+                    let context = context.clone();
+                    async move {
+                        debug!("[SACP] permission request: {:?}", request);
+                        permission_handler
+                            .handle_permission_request(context, request, responder)
+                            .await
+                    }
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -772,39 +793,5 @@ async fn handle_session_notification<N: SessionNotifier>(
             "[SACP] Push session update failed: project_id={}, session_id={}, error={:?}",
             project_id, session_id, e
         );
-    }
-}
-
-/// 处理 RequestPermission 回调
-async fn handle_permission_request(
-    request: RequestPermissionRequest,
-    request_cx: Responder<RequestPermissionResponse>,
-) -> Result<(), agent_client_protocol::Error> {
-    debug!("[SACP] permission request: {:?}", request);
-
-    // 自动允许：优先选择 AllowAlways，其次 AllowOnce
-    let selected = request
-        .options
-        .iter()
-        .find(|o| o.kind == PermissionOptionKind::AllowAlways)
-        .or_else(|| {
-            request
-                .options
-                .iter()
-                .find(|o| o.kind == PermissionOptionKind::AllowOnce)
-        })
-        .or_else(|| request.options.first());
-
-    if let Some(option) = selected {
-        request_cx.respond(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                option.option_id.clone(),
-            )),
-        ))
-    } else {
-        // 无可选项则取消
-        request_cx.respond(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Cancelled,
-        ))
     }
 }

@@ -84,5 +84,8 @@ pub use session::{
     AcpAgentWorker, AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse,
 };
 pub use traits::agent::{AgentStartConfig, PromptMessage};
+pub use traits::permission_handler::{
+    PermissionRequestContext, PermissionRequestHandler, YoloPermissionRequestHandler,
+};
 pub use traits::session_notifier::SessionNotifier;
 pub use traits::session_registry::SessionRegistry;

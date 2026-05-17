@@ -104,6 +104,11 @@ error.cancel_response_timeout: "取消后等待响应超时"
 error.agent_init_timeout: "智能体初始化超时，请重试（过多的MCP可能导致超时）。如果持续失败请重启智能体电脑（点击PC端右上图标展开后，在[...]里点击重启智能体电脑）"
 error.session_cancelled_timeout: "用户取消任务（Agent 响应超时）"
 
+# 权限审批
+error.permission_not_found: "权限请求不存在或已处理"
+error.permission_resolve_failed: "权限审批处理失败"
+error.permission_expired: "权限请求已过期"
+
 # 处理错误
 error.attachment_processing_failed: "附件处理失败"
 error.processing_failed: "处理失败"

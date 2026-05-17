@@ -60,7 +60,10 @@ use tracing::{debug, error, info};
 
 use crate::PromptMessage;
 use crate::launcher::{ClaudeCodeLauncher, ModelRuntimeEnvResolver};
-use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
+use crate::traits::{
+    AgentStartConfig, PermissionRequestHandler, SessionNotifier, SessionRegistry,
+    YoloPermissionRequestHandler,
+};
 
 /// ACP 会话管理器 (SACP 版本)
 ///
@@ -79,6 +82,8 @@ pub struct AcpSessionManager<N: SessionNotifier, R: SessionRegistry> {
     notifier: Arc<N>,
     /// 模型运行时环境解析策略
     model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+    /// ACP permission request handler.
+    permission_handler: Arc<dyn PermissionRequestHandler>,
 }
 
 impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpSessionManager<N, R>
@@ -103,10 +108,25 @@ where
         registry: Arc<R>,
         model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
     ) -> Self {
+        Self::with_dependencies(
+            notifier,
+            registry,
+            model_env_resolver,
+            Arc::new(YoloPermissionRequestHandler),
+        )
+    }
+
+    pub fn with_dependencies(
+        notifier: Arc<N>,
+        registry: Arc<R>,
+        model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+        permission_handler: Arc<dyn PermissionRequestHandler>,
+    ) -> Self {
         Self {
             registry,
             notifier,
             model_env_resolver,
+            permission_handler,
         }
     }
 
@@ -309,6 +329,7 @@ where
         let launcher = ClaudeCodeLauncher::with_model_env_resolver(
             self.notifier.clone(),
             self.model_env_resolver.clone(),
+            self.permission_handler.clone(),
         );
 
         // 记录是否使用了 resume（仅用于日志）

@@ -25,6 +25,9 @@ pub struct ChatPrompt {
     /// 必填：服务类型选择 (强制要求指定)
     /// "rcoder" 或 "agent-runner"，不允许为空
     pub service_type: crate::ServiceType,
+    /// 可选用户 ID，ComputerAgentRunner 权限审批链路使用
+    #[builder(default)]
+    pub user_id: Option<String>,
     /// 可选的请求ID，用于标识和追踪请求
     #[builder(default)]
     pub request_id: Option<String>,

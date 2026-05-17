@@ -114,6 +114,40 @@ pub struct CancelResponse {
     pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolvePermissionRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub tool_call_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub option_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "4")]
+    pub cancelled: bool,
+    #[prost(bool, tag = "5")]
+    pub save_rule: bool,
+    #[prost(string, tag = "6")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "7")]
+    pub user_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolvePermissionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub tool_call_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub outcome_json: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "5")]
+    pub rule_saved: bool,
+    #[prost(string, optional, tag = "6")]
+    pub error_code: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "7")]
+    pub message: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetStatusRequest {
     #[prost(string, tag = "1")]
     pub project_id: ::prost::alloc::string::String,
@@ -341,6 +375,9 @@ pub struct ChatAgentServerConfig {
     /// 模型环境变量显式绑定规则
     #[prost(message, repeated, tag = "6")]
     pub model_env_bindings: ::prost::alloc::vec::Vec<ModelEnvBinding>,
+    /// Permission approval mode: "yolo" (default) or "ask"
+    #[prost(string, optional, tag = "7")]
+    pub agent_mode: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ModelEnvBinding {
@@ -658,6 +695,31 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("agent.AgentService", "CancelSession"));
             self.inner.unary(req, path, codec).await
         }
+        /// Resolve a pending ACP permission request (Unary)
+        pub async fn resolve_permission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ResolvePermissionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ResolvePermissionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentService/ResolvePermission",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentService", "ResolvePermission"));
+            self.inner.unary(req, path, codec).await
+        }
         /// 获取 Agent 状态 (Unary)
         pub async fn get_status(
             &mut self,
@@ -801,6 +863,14 @@ pub mod agent_service_server {
             &self,
             request: tonic::Request<super::CancelRequest>,
         ) -> std::result::Result<tonic::Response<super::CancelResponse>, tonic::Status>;
+        /// Resolve a pending ACP permission request (Unary)
+        async fn resolve_permission(
+            &self,
+            request: tonic::Request<super::ResolvePermissionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ResolvePermissionResponse>,
+            tonic::Status,
+        >;
         /// 获取 Agent 状态 (Unary)
         async fn get_status(
             &self,
@@ -1034,6 +1104,52 @@ pub mod agent_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CancelSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentService/ResolvePermission" => {
+                    #[allow(non_camel_case_types)]
+                    struct ResolvePermissionSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::ResolvePermissionRequest>
+                    for ResolvePermissionSvc<T> {
+                        type Response = super::ResolvePermissionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ResolvePermissionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::resolve_permission(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ResolvePermissionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

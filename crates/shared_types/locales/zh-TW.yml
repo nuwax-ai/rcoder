@@ -104,6 +104,11 @@ error.cancel_response_timeout: "取消後等待回應逾時"
 error.agent_init_timeout: "智慧體初始化逾時，請重試（過多的MCP可能導致逾時）。如果持續失敗請重啟智慧體電腦（點選PC端右上圖示展開後，在[...]裡點選重啟智慧體電腦）"
 error.session_cancelled_timeout: "使用者取消任務（Agent 回應逾時）"
 
+# 權限審批
+error.permission_not_found: "權限請求不存在或已處理"
+error.permission_resolve_failed: "權限審批處理失敗"
+error.permission_expired: "權限請求已過期"
+
 # 處理錯誤
 error.attachment_processing_failed: "附件處理失敗"
 error.processing_failed: "處理失敗"

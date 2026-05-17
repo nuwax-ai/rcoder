@@ -186,6 +186,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             get(handler::agent_session_notification),
         )
         .route("/agent/session/cancel", post(handler::agent_session_cancel))
+        .route(
+            "/agent/notify-resolved",
+            post(handler::agent_notify_resolved),
+        )
         .route("/agent/stop", post(handler::agent_stop))
         .route("/agent/status/{project_id}", get(handler::agent_status))
         .with_state(state.clone());
@@ -201,6 +205,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route(
             "/computer/agent/session/cancel",
             post(handler::computer_agent_session_cancel),
+        )
+        .route(
+            "/computer/notify-resolved",
+            post(handler::computer_notify_resolved),
         )
         // 进度流复用现有的 agent_session_notification
         .route(
@@ -325,12 +333,14 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::handle_chat,
         handler::agent_session_notification,
         handler::agent_session_cancel,
+        handler::agent_notify_resolved,
         handler::agent_stop,
         handler::agent_status,
         handler::handle_computer_chat,
         handler::computer_agent_stop,
         handler::computer_agent_status, // 🆕 新增
         handler::computer_agent_session_cancel,
+        handler::computer_notify_resolved,
         handler::computer_agent_progress_notification,
         handler::computer_desktop_vnc,
         handler::computer_desktop_proxy,
@@ -383,6 +393,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             // 会话消息相关结构体
             shared_types::UnifiedSessionMessage,
             shared_types::SessionMessageType,
+            // Permission 相关结构体
+            shared_types::ResolvePermissionResponseDto,
             // Computer Agent 相关结构体
             shared_types::ComputerChatRequest,
             shared_types::ComputerAgentStopRequest,

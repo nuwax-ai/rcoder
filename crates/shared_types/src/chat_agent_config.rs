@@ -8,6 +8,41 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+/// Agent permission approval mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMode {
+    /// Automatically allow safe permission requests.
+    #[default]
+    Yolo,
+    /// Ask the user before resolving permission requests.
+    Ask,
+}
+
+impl AgentMode {
+    pub const DEFAULT_STR: &'static str = "yolo";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Yolo => "yolo",
+            Self::Ask => "ask",
+        }
+    }
+
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value
+            .unwrap_or(Self::DEFAULT_STR)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "yolo" => Ok(Self::Yolo),
+            "ask" => Ok(Self::Ask),
+            other => Err(format!("agent_mode must be yolo or ask, got: {other}")),
+        }
+    }
+}
+
 /// Chat 接口的 Agent 配置
 ///
 /// 包含单个 Agent 的运行时配置和多个 MCP 服务器配置。
@@ -62,6 +97,10 @@ pub struct ChatAgentServerConfig {
     /// 用于声明某个 Agent env key 应该绑定到 model_provider 的哪个字段。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_env_bindings: Vec<ModelEnvBinding>,
+
+    /// Permission approval mode: "yolo" (default) or "ask".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_mode: Option<String>,
 
     /// 元数据（可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +196,15 @@ impl ChatAgentServerConfig {
     pub fn get_agent_id(&self) -> &str {
         self.agent_id.as_deref().unwrap_or("claude-code-acp-ts")
     }
+
+    /// Resolve and validate the permission approval mode.
+    pub fn agent_mode(&self) -> Result<AgentMode, String> {
+        AgentMode::parse(self.agent_mode.as_deref())
+    }
+
+    pub fn agent_mode_str(&self) -> Result<&'static str, String> {
+        Ok(self.agent_mode()?.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +298,30 @@ mod tests {
     fn test_get_agent_id_default() {
         let config = ChatAgentServerConfig::default();
         assert_eq!(config.get_agent_id(), "claude-code-acp-ts");
+    }
+
+    #[test]
+    fn test_agent_mode_default_and_validation() {
+        let config = ChatAgentServerConfig::default();
+        assert_eq!(config.agent_mode().unwrap(), AgentMode::Yolo);
+
+        let config = ChatAgentServerConfig {
+            agent_mode: Some("ask".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.agent_mode().unwrap(), AgentMode::Ask);
+
+        let config = ChatAgentServerConfig {
+            agent_mode: Some("YOLO".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.agent_mode().unwrap(), AgentMode::Yolo);
+
+        let config = ChatAgentServerConfig {
+            agent_mode: Some("careful".to_string()),
+            ..Default::default()
+        };
+        assert!(config.agent_mode().is_err());
     }
 
     #[test]

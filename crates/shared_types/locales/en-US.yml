@@ -104,6 +104,11 @@ error.cancel_response_timeout: "Response timeout after cancellation"
 error.agent_init_timeout: "Agent initialization timed out, please retry. Too many MCPs may cause timeout. If this persists, restart the agent computer (click the icon in the upper right corner of PC, then click [...] and select Restart Agent Computer)"
 error.session_cancelled_timeout: "Session cancelled (Agent response timeout)"
 
+# Permission
+error.permission_not_found: "Permission request not found or already resolved"
+error.permission_resolve_failed: "Permission resolve operation failed"
+error.permission_expired: "Permission request expired"
+
 # Processing errors
 error.attachment_processing_failed: "Attachment processing failed"
 error.processing_failed: "Processing failed"
