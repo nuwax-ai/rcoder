@@ -1,6 +1,7 @@
 use agent_client_protocol::schema::{Error, SessionUpdate, StopReason};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use utoipa::ToSchema;
 
 /// 消息主类型枚举
@@ -241,6 +242,18 @@ fn stop_reason_to_description(reason: &StopReason) -> &'static str {
     }
 }
 
+/// 将 SessionUpdate 附属载荷序列化为 JSON（用于 SSE `data`）
+fn session_update_payload<T: serde::Serialize>(context: &'static str, v: &T) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or_else(|e| {
+        warn!(
+            context,
+            error = %e,
+            "session_update_to_parts: serde_json::to_value failed for SessionUpdate payload"
+        );
+        serde_json::json!({})
+    })
+}
+
 /// 将 SessionUpdate 转换为 (sub_type, data) 元组
 fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value) {
     match update {
@@ -263,27 +276,38 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
             serde_json::json!(tool_call_update),
         ),
         SessionUpdate::Plan(plan) => ("plan".to_string(), serde_json::json!(plan)),
-        SessionUpdate::AvailableCommandsUpdate(available_commands) => (
+        SessionUpdate::AvailableCommandsUpdate(v) => (
             "available_commands_update".to_string(),
-            serde_json::json!({
-                "available_commands": available_commands
-            }),
+            session_update_payload("available_commands_update", &v),
         ),
-        SessionUpdate::CurrentModeUpdate(current_mode_id) => (
+        SessionUpdate::CurrentModeUpdate(v) => (
             "current_mode_update".to_string(),
-            serde_json::json!({
-                "current_mode_id": current_mode_id
-            }),
+            session_update_payload("current_mode_update", &v),
         ),
-        // 处理未来可能添加的新更新类型
-        _ => ("unknown_update".to_string(), serde_json::json!({})),
+        SessionUpdate::ConfigOptionUpdate(v) => (
+            "config_option_update".to_string(),
+            session_update_payload("config_option_update", &v),
+        ),
+        SessionUpdate::SessionInfoUpdate(v) => (
+            "session_info_update".to_string(),
+            session_update_payload("session_info_update", &v),
+        ),
+        SessionUpdate::UsageUpdate(v) => (
+            "usage_update".to_string(),
+            session_update_payload("usage_update", &v),
+        ),
+        // #[non_exhaustive] 与未来协议新增变体
+        _ => {
+            warn!("session_update_to_parts: unmapped SessionUpdate variant (upgrade ACP mapper or extend match)");
+            ("unknown_update".to_string(), serde_json::json!({}))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::ContentChunk;
+    use agent_client_protocol::schema::{ContentChunk, SessionInfoUpdate, UsageUpdate};
 
     #[test]
     fn test_session_prompt_start_to_unified() {
@@ -446,6 +470,39 @@ mod tests {
         assert_eq!(unified.data["content"]["text"], "Hello, World!");
         assert_eq!(unified.data["content"]["type"], "text");
         assert_eq!(unified.data["request_id"], "req_123456789");
+    }
+
+    #[test]
+    fn test_session_info_update_to_unified() {
+        let update = SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("minesweeper-task"),
+        );
+        let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
+            session_id: "test_session".to_string(),
+            session_update: update,
+            request_id: None,
+        }));
+
+        let unified = notify.to_unified_message();
+
+        assert_eq!(unified.sub_type, "session_info_update");
+        assert_eq!(unified.data["title"], "minesweeper-task");
+    }
+
+    #[test]
+    fn test_usage_update_to_unified() {
+        let update = SessionUpdate::UsageUpdate(UsageUpdate::new(1024, 200_000));
+        let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
+            session_id: "test_session".to_string(),
+            session_update: update,
+            request_id: None,
+        }));
+
+        let unified = notify.to_unified_message();
+
+        assert_eq!(unified.sub_type, "usage_update");
+        assert_eq!(unified.data["used"], 1024);
+        assert_eq!(unified.data["size"], 200_000);
     }
 
     #[test]

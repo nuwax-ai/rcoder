@@ -9,8 +9,9 @@ AGENT_RUNNER_LOG_DIR ?= ./logs
 # 代理端口（可通过环境变量 RCODER_PROXY_PORT 覆盖）
 AGENT_RUNNER_PROXY_PORT ?= 8088
 
-# 默认启用 proxy feature，使 API Key 和 Base URL 通过 Pingora 代理注入真实值
-AGENT_RUNNER_PROXY ?= yes
+# 默认关闭 proxy feature（与 docker 开发构建一致；Codex 等需在子进程内看到真实 API key）
+# 需要 Pingora 注入密钥时：make agent-runner-up AGENT_RUNNER_PROXY=yes
+AGENT_RUNNER_PROXY ?= no
 
 ifeq ($(AGENT_RUNNER_GRPC),yes)
     AGENT_RUNNER_FEATURES := http-server,grpc-server

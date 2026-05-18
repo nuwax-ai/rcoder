@@ -73,7 +73,7 @@ docker-build-master-base:
 # ============================================================================
 # Cargo feature 配置
 # ============================================================================
-# 开发模式：启用所有调试、监控和追踪功能
+# 开发模式：启用调试、监控和追踪（默认不含 agent_runner 的 proxy，见下文）
 # ⚠️  注意：添加新的调试 feature 时，必须同步更新此列表！
 #
 # 当前启用的调试 features：
@@ -81,13 +81,17 @@ docker-build-master-base:
 #   - pyroscope     (agent_runner):         性能分析 (CPU/Memory)
 #   - otel          (agent_runner):         OpenTelemetry 追踪
 #   - debug         (rcoder):               调试路由
-#   - proxy         (agent_runner):         Pingora 反向代理（Linux 容器默认开启）
+#   - proxy         (agent_runner):         Pingora + 模型密钥代理（可选；见下方说明）
 #   - kubernetes    (rcoder, docker_manager): Kubernetes 运行时支持
 #   - http-server   (agent_runner):         HTTP REST API 服务（默认启用）
 #   - grpc-server   (agent_runner):         gRPC 服务（默认启用）
 #
-# 本地开发调试默认开启所有功能（http-server 和 grpc-server 默认启用）
-CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,proxy,kubernetes
+# proxy 默认关闭：子进程会收到真实 MODEL_PROVIDER API key/base_url（如 nuwax-codex-acp 本地鉴权）。
+# 需要密钥经 Pingora 注入时，构建前设置例如：
+#   make dev-restart CARGO_FEATURES='--features ebpf-debug,pyroscope,otel,debug,kubernetes,proxy'
+#
+# 本地开发调试默认开启上述功能（http-server / grpc-server 仍由 agent_runner 默认 features 提供）
+CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,kubernetes
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
 docker-build-agent-runner:
