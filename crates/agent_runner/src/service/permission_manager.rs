@@ -209,11 +209,10 @@ impl PermissionManager {
         };
 
         let mut rule_saved = false;
-        if input.save_rule {
-            if let (Some(suggestion), Some(kind)) = (&pending.save_rule, selected_kind) {
+        if input.save_rule
+            && let (Some(suggestion), Some(kind)) = (&pending.save_rule, selected_kind) {
                 rule_saved = self.save_rule_from_option_kind(&pending.context, suggestion, kind);
             }
-        }
 
         let outcome_json = serde_json::to_string(&response).ok();
         match pending.responder.respond(response) {

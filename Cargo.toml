@@ -220,7 +220,3 @@ rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 # Pyroscope Continuous Profiling
 pyroscope = "0.5"
 pyroscope_pprofrs = "0.2"
-
-# Codex protocol conversion (Response API <-> Chat API)
-# codex-convert-proxy = { version = "0.1.4", default-features = false, features = ["lib"] }
-codex-convert-proxy = { git = "https://github.com/soddygo/codex-convert-proxy.git", branch = "main", default-features = false, features = ["lib"] }

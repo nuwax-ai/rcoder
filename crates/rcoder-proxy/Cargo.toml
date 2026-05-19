@@ -28,9 +28,6 @@ pingora-proxy = { workspace = true }
 pingora-load-balancing = { workspace = true }
 async-trait = { workspace = true }
 
-# HTTP client for fallback
-reqwest = { workspace = true }
-
 # URL parsing for masking
 url = { workspace = true }
 
@@ -40,8 +37,6 @@ shared_types = { path = "../shared_types" }
 # 🚀 无锁配置热更新
 arc-swap = "1.9"
 
-# Codex protocol conversion (Response API <-> Chat API)
-codex-convert-proxy = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }

@@ -383,8 +383,6 @@ pub struct PortProxy {
     api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
     /// 🔒 API Key 鉴权配置（可选，用于 VNC 等路由的鉴权，使用 ArcSwap 实现无锁读取）
     api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
-    /// HTTP client for protocol conversion requests (reused across requests)
-    http_client: reqwest::Client,
 }
 
 #[async_trait]
@@ -397,109 +395,14 @@ impl ProxyHttp for PortProxy {
 
     /// 在代理流程之前拦截请求
     ///
-    /// 当 wire_api == "chat" 且路径包含 /response 时，执行协议转换
-    /// (Response API <-> Chat API)，自行完成完整的请求-响应周期。
-    /// 其他请求返回 Ok(false) 走正常 ApiProxy 流程。
+    /// 不再进行协议转换，所有请求都走正常 ApiProxy 流程。
     async fn request_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> PingoraResult<bool> {
-        let path = session.req_header().uri.path().to_string();
-
-        debug!(
-            "[API_PROXY] request_filter called: path={}",
-            path
-        );
-
-        // 只拦截 API 代理请求
-        if !path.starts_with("/api/") {
-            debug!("[API_PROXY] path does not start with /api/, skipping");
-            return Ok(false);
-        }
-
-        // 匹配路由（复用 ApiProxy 的路由表）
-        let matched = match self.router.at(&path) {
-            Ok(m) => m,
-            Err(_) => {
-                debug!("[API_PROXY] route match failed for path={}", path);
-                return Ok(false); // 404 交给 upstream_request_filter 处理
-            }
-        };
-
-        debug!(
-            "[API_PROXY] route matched: path={}, route_type={:?}",
-            path, matched.value
-        );
-
-        if *matched.value != RouteType::ApiProxy {
-            debug!("[API_PROXY] route is not ApiProxy, skipping");
-            return Ok(false);
-        }
-
-        // 提取 service_name 和 api_path
-        let service_name = match matched.params.get("service_name") {
-            Some(name) => name.to_string(),
-            None => {
-                debug!("[API_PROXY] service_name not found in params");
-                return Ok(false);
-            }
-        };
-        let api_path = matched.params.get("path").unwrap_or("").to_string();
-
-        debug!(
-            "[API_PROXY] extracted: service_name={}, api_path={}",
-            service_name, api_path
-        );
-
-        // 查找配置
-        let api_config = match self.api_key_manager.get(&service_name) {
-            Some(config) => config,
-            None => {
-                debug!(
-                    "[API_PROXY] config not found for service_name={}, available keys: {:?}",
-                    service_name,
-                    self.api_key_manager.iter().map(|r| r.key().clone()).collect::<Vec<_>>()
-                );
-                return Ok(false); // 404 交给 upstream_request_filter 处理
-            }
-        };
-
-        let config = api_config.value().clone(); // clone 以释放 DashMap Ref
-
-        debug!(
-            "[API_PROXY] config found: service={}, base_url={}, wire_api={:?}, api_protocol={:?}",
-            config.name, config.base_url, config.wire_api, config.api_protocol
-        );
-
-        // 判断是否需要协议转换
-        let chat_wire_api = crate::protocol_convert::is_chat_wire_api(&config);
-        let needs_conv = crate::protocol_convert::needs_conversion(&api_path);
-        debug!(
-            "[API_PROXY] conversion check: is_chat_wire_api={}, needs_conversion={}, api_path={}",
-            chat_wire_api, needs_conv, api_path
-        );
-
-        if !chat_wire_api || !needs_conv {
-            debug!(
-                "[API_PROXY] skipping conversion: chat_wire_api={}, needs_conv={}",
-                chat_wire_api, needs_conv
-            );
-            return Ok(false); // 不需要转换，走正常 ApiProxy 流程
-        }
-
-        // 执行协议转换（自行完成完整的请求-响应周期）
-        info!(
-            "[API_PROXY] Protocol conversion: service={}, path={}",
-            service_name, api_path
-        );
-        crate::protocol_convert::handle_converted_request(
-            session,
-            &config,
-            &api_path,
-            &self.http_client,
-        )
-        .await
+        // 协议转换已移除，所有请求直接走正常代理流程
+        Ok(false)
     }
 
     /// 过滤请求头和路径
@@ -1685,26 +1588,6 @@ impl PingoraProxyService {
             router,
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(), // 传递 API Key 配置
-            http_client: {
-                let request_timeout = self.config.request_timeout_seconds.unwrap_or(600);
-                let connect_timeout = self.config.connect_timeout_seconds.unwrap_or(10);
-                let pool_idle_timeout = self.config.pool_idle_timeout_seconds.unwrap_or(90);
-
-                info!(
-                    "[PROXY] Creating reqwest::Client: request={}s, connect={}s, pool_idle={}s",
-                    request_timeout, connect_timeout, pool_idle_timeout
-                );
-
-                reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(request_timeout))
-                    .connect_timeout(std::time::Duration::from_secs(connect_timeout))
-                    .pool_idle_timeout(std::time::Duration::from_secs(pool_idle_timeout))
-                    .build()
-                    .map_err(|e| {
-                        tracing::error!("[PROXY] Failed to create reqwest::Client: {}", e);
-                        anyhow::anyhow!("Failed to create reqwest::Client: {}", e)
-                    })?
-            },
         })
     }
 

@@ -56,17 +56,15 @@ fn computer_container(
     state: &AppState,
     input: &ResolvePermissionRequestDto,
 ) -> Result<ContainerBasicInfo, AppError> {
-    if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty()) {
-        if let Some(container) = state.projects.get_container_by_user_id(user_id) {
+    if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
+        && let Some(container) = state.projects.get_container_by_user_id(user_id) {
             return Ok(container);
         }
-    }
 
-    if let Some(pod_id) = input.pod_id.as_deref().filter(|s| !s.trim().is_empty()) {
-        if let Some(container) = state.projects.get_container_by_pod_id(pod_id) {
+    if let Some(pod_id) = input.pod_id.as_deref().filter(|s| !s.trim().is_empty())
+        && let Some(container) = state.projects.get_container_by_pod_id(pod_id) {
             return Ok(container);
         }
-    }
 
     Err(AppError::with_message(
         shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
