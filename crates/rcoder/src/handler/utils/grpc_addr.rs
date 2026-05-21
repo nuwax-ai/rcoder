@@ -75,15 +75,14 @@ pub async fn get_realtime_container_ip(
         .map_err(|e| format!("Failed to get runtime: {}", e))?;
 
     // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
-    let (identifier, service_type) = if let Some(id) =
-        container_name.strip_prefix(&format!("{}-", computer_prefix))
-    {
-        (id, shared_types::ServiceType::ComputerAgentRunner)
-    } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
-        (id, shared_types::ServiceType::RCoder)
-    } else {
-        return Ok(fallback_ip.to_string());
-    };
+    let (identifier, service_type) =
+        if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix)) {
+            (id, shared_types::ServiceType::ComputerAgentRunner)
+        } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
+            (id, shared_types::ServiceType::RCoder)
+        } else {
+            return Ok(fallback_ip.to_string());
+        };
 
     // 通过 Runtime 的 find_container 查询容器 IP
     // find_container 会直接调用 Docker API 获取最新的容器信息

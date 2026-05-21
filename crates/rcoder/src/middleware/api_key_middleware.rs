@@ -30,26 +30,24 @@ pub async fn api_key_middleware_handler(
     match ApiKeyValidator::validate(&api_key_config, path, api_key) {
         Ok(()) => next.run(req).await,
 
-        Err(err) => {
-            match err {
-                ApiKeyAuthError::Invalid | ApiKeyAuthError::Missing => {
-                    warn!("🔒 [API_KEY_AUTH] {} for path: {}", err, path);
-                    api_key_error_response(
-                        StatusCode::UNAUTHORIZED,
-                        shared_types::error_codes::ERR_API_KEY_AUTH_FAILED,
-                        locale,
-                    )
-                }
-                ApiKeyAuthError::ConfigError => {
-                    tracing::error!("🔒 [API_KEY_AUTH] {}", err);
-                    api_key_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                        locale,
-                    )
-                }
+        Err(err) => match err {
+            ApiKeyAuthError::Invalid | ApiKeyAuthError::Missing => {
+                warn!("🔒 [API_KEY_AUTH] {} for path: {}", err, path);
+                api_key_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    shared_types::error_codes::ERR_API_KEY_AUTH_FAILED,
+                    locale,
+                )
             }
-        }
+            ApiKeyAuthError::ConfigError => {
+                tracing::error!("🔒 [API_KEY_AUTH] {}", err);
+                api_key_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
+                    locale,
+                )
+            }
+        },
     }
 }
 

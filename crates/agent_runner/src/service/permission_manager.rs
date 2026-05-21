@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,7 @@ struct PendingPermission {
     responder: Responder<RequestPermissionResponse>,
     context: PermissionRequestContext,
     created_at: Instant,
+    generation: u64,
     save_rule: Option<SaveRuleSuggestion>,
 }
 
@@ -59,6 +61,7 @@ struct PermissionRule {
 
 pub struct PermissionManager {
     pending: Mutex<HashMap<PendingKey, PendingPermission>>,
+    pending_generation: AtomicU64,
     rules: DashMap<RuleKey, Vec<PermissionRule>>,
 }
 
@@ -66,6 +69,7 @@ impl Default for PermissionManager {
     fn default() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            pending_generation: AtomicU64::new(1),
             rules: DashMap::new(),
         }
     }
@@ -185,13 +189,8 @@ impl PermissionManager {
                         tool_call_id,
                         outcome_json: None,
                         rule_saved: false,
-                        error_code: Some(
-                            shared_types::error_codes::ERR_VALIDATION.to_string(),
-                        ),
-                        message: Some(
-                            "option_id is required when cancelled is false"
-                                .to_string(),
-                        ),
+                        error_code: Some(shared_types::error_codes::ERR_VALIDATION.to_string()),
+                        message: Some("option_id is required when cancelled is false".to_string()),
                     };
                 }
             }
@@ -210,9 +209,10 @@ impl PermissionManager {
 
         let mut rule_saved = false;
         if input.save_rule
-            && let (Some(suggestion), Some(kind)) = (&pending.save_rule, selected_kind) {
-                rule_saved = self.save_rule_from_option_kind(&pending.context, suggestion, kind);
-            }
+            && let (Some(suggestion), Some(kind)) = (&pending.save_rule, selected_kind)
+        {
+            rule_saved = self.save_rule_from_option_kind(&pending.context, suggestion, kind);
+        }
 
         let outcome_json = serde_json::to_string(&response).ok();
         match pending.responder.respond(response) {
@@ -274,8 +274,20 @@ impl PermissionManager {
         count
     }
 
-    fn store_pending(&self, key: PendingKey, pending: PendingPermission) {
-        self.pending.lock().insert(key.clone(), pending);
+    fn store_pending(&self, key: PendingKey, mut pending: PendingPermission) {
+        let generation = self.pending_generation.fetch_add(1, Ordering::Relaxed);
+        pending.generation = generation;
+        let replaced = self.pending.lock().insert(key.clone(), pending);
+        if let Some(replaced) = replaced {
+            warn!(
+                "[Permission] replaced duplicate pending permission, cancelling previous responder: session_id={}, tool_call_id={}",
+                key.0, key.1
+            );
+            if let Err(err) = replaced.responder.respond(cancelled_response()) {
+                warn!("[Permission] failed to cancel replaced pending permission: {err}");
+            }
+        }
+
         // PERMISSION_MANAGER is the single global instance (LazyLock<Arc<PermissionManager>>).
         // It is safe to capture via Arc clone here because:
         // 1. There is exactly one instance in the agent_runner process.
@@ -284,7 +296,19 @@ impl PermissionManager {
         let manager = PERMISSION_MANAGER.clone();
         tokio::spawn(async move {
             tokio::time::sleep(PENDING_TIMEOUT).await;
-            let pending = manager.pending.lock().remove(&key);
+            let pending = {
+                let mut pending_map = manager.pending.lock();
+                if pending_map
+                    .get(&key)
+                    .map(|pending| pending.generation == generation)
+                    .unwrap_or(false)
+                {
+                    pending_map.remove(&key)
+                } else {
+                    None
+                }
+            };
+
             if let Some(pending) = pending {
                 warn!(
                     "[Permission] permission request expired: session_id={}, tool_call_id={}",
@@ -315,12 +339,21 @@ impl PermissionManager {
             user_key,
             suggestion.tool_name.clone(),
         );
-        let compiled = regex::Regex::new(&suggestion.pattern).ok();
+        let compiled = match regex::Regex::new(&suggestion.pattern) {
+            Ok(compiled) => compiled,
+            Err(err) => {
+                warn!(
+                    "[Permission] skip invalid permission rule pattern: project_id={}, tool_name={}, pattern={}, error={}",
+                    context.project_id, suggestion.tool_name, suggestion.pattern, err
+                );
+                return false;
+            }
+        };
         let mut rules = self.rules.entry(key).or_default();
         rules.push(PermissionRule {
             decision,
             pattern: suggestion.pattern.clone(),
-            compiled,
+            compiled: Some(compiled),
         });
         true
     }
@@ -428,6 +461,7 @@ impl PermissionRequestHandler for PermissionManager {
             responder,
             context: context.clone(),
             created_at: Instant::now(),
+            generation: 0,
             save_rule,
         };
         self.store_pending((session_id.clone(), tool_call_id.clone()), pending);
@@ -556,7 +590,10 @@ fn is_dangerous_command(command: Option<&str>) -> bool {
 
 /// Strip `sudo` and any flags that follow it until the actual command is reached.
 fn strip_sudo_and_flags(command: &str) -> String {
-    let rest = command.strip_prefix("sudo").map(str::trim).unwrap_or(command);
+    let rest = command
+        .strip_prefix("sudo")
+        .map(str::trim)
+        .unwrap_or(command);
     let mut tokens = rest.split_whitespace();
     while let Some(token) = tokens.next() {
         if token.starts_with('-') {
@@ -570,8 +607,10 @@ fn strip_sudo_and_flags(command: &str) -> String {
                 // Sudo flags that take a value: -u, -g, -p, -h, -r, -t, -C.
                 // Flags like -E, -n, -S, -s, -i, -b, -k, -K, -v, -V, -l, -A don't.
                 if token.len() == 2 {
-                    let takes_value =
-                        matches!(token.as_bytes()[1], b'u' | b'g' | b'p' | b'h' | b'r' | b't' | b'C');
+                    let takes_value = matches!(
+                        token.as_bytes()[1],
+                        b'u' | b'g' | b'p' | b'h' | b'r' | b't' | b'C'
+                    );
                     if takes_value {
                         let _ = tokens.next();
                     }
@@ -896,7 +935,10 @@ mod tests {
             pattern: "^cargo\\s+build(\\s|$)".to_string(),
             compiled: regex::Regex::new("^cargo\\s+build(\\s|$)").ok(),
         };
-        assert!(command_matches_pattern("cargo build --release", &rule_allow_build));
+        assert!(command_matches_pattern(
+            "cargo build --release",
+            &rule_allow_build
+        ));
         assert!(!command_matches_pattern("cargo test", &rule_allow_build));
     }
 
@@ -980,10 +1022,7 @@ mod tests {
 
         // User from a different project should NOT match
         let other_ctx = test_context("proj2", "user2");
-        assert_eq!(
-            pm.rule_decision(&other_ctx, "bash", Some("ls -la")),
-            None,
-        );
+        assert_eq!(pm.rule_decision(&other_ctx, "bash", Some("ls -la")), None,);
     }
 
     #[test]
@@ -996,11 +1035,7 @@ mod tests {
         };
 
         // AllowOnce should NOT persist a rule
-        assert!(!pm.save_rule_from_option_kind(
-            &ctx,
-            &suggestion,
-            PermissionOptionKind::AllowOnce
-        ));
+        assert!(!pm.save_rule_from_option_kind(&ctx, &suggestion, PermissionOptionKind::AllowOnce));
 
         // RejectOnce should NOT persist a rule
         assert!(!pm.save_rule_from_option_kind(
@@ -1028,5 +1063,22 @@ mod tests {
             pm.rule_decision(&ctx, "bash", Some("npm install")),
             Some(RuleDecision::Deny) // deny beats allow since RejectAlways was stored last
         );
+    }
+
+    #[test]
+    fn save_rule_from_option_kind_rejects_invalid_regex() {
+        let pm = PermissionManager::default();
+        let ctx = test_context("proj1", "user1");
+        let suggestion = SaveRuleSuggestion {
+            tool_name: "bash".to_string(),
+            pattern: "[".to_string(),
+        };
+
+        assert!(!pm.save_rule_from_option_kind(
+            &ctx,
+            &suggestion,
+            PermissionOptionKind::AllowAlways
+        ));
+        assert_eq!(pm.rule_decision(&ctx, "bash", Some("anything")), None);
     }
 }

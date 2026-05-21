@@ -338,7 +338,8 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
         (
             "/computer/vnc/{user_id}/{project_id}/{*path}".to_string(),
             "VNC WebSocket proxy".to_string(),
-            "Proxy to user's container noVNC service (port 6080), supports WebSocket upgrade".to_string(),
+            "Proxy to user's container noVNC service (port 6080), supports WebSocket upgrade"
+                .to_string(),
         ),
         (
             "/proxy/{port}/{*path}".to_string(),
@@ -353,7 +354,8 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
         (
             "/api/{service_name}/{*path}".to_string(),
             "🔒 API key proxy".to_string(),
-            "Intercept AI API requests, inject real key and forward to actual API endpoint".to_string(),
+            "Intercept AI API requests, inject real key and forward to actual API endpoint"
+                .to_string(),
         ),
         (
             "/api/{service_name}".to_string(),
@@ -363,7 +365,8 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
         (
             "/computer/audio/{user_id}/{project_id}/{*path}".to_string(),
             "🎵 Audio stream proxy".to_string(),
-            "Proxy to user's container audio stream service (HTTP 6090 / WebSocket 6089)".to_string(),
+            "Proxy to user's container audio stream service (HTTP 6090 / WebSocket 6089)"
+                .to_string(),
         ),
         (
             "/computer/ime/{user_id}/{project_id}/{*path}".to_string(),

@@ -12,8 +12,7 @@ use utoipa::ToSchema;
 /// - Tenant: 租户隔离，同一租户下的所有用户共享容器
 /// - Space: 空间隔离，同一租户同一空间下的用户共享容器
 /// - Project: 项目隔离，每个项目独立容器（默认行为）
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema, Default)]
 pub enum IsolationType {
     /// 租户隔离：同一租户共用一个容器
     Tenant,
@@ -23,7 +22,6 @@ pub enum IsolationType {
     #[default]
     Project,
 }
-
 
 impl std::str::FromStr for IsolationType {
     type Err = IsolationTypeError;
@@ -74,13 +72,28 @@ mod tests {
 
     #[test]
     fn test_from_str_valid() {
-        assert_eq!(IsolationType::from_str("tenant").unwrap(), IsolationType::Tenant);
-        assert_eq!(IsolationType::from_str("space").unwrap(), IsolationType::Space);
-        assert_eq!(IsolationType::from_str("project").unwrap(), IsolationType::Project);
+        assert_eq!(
+            IsolationType::from_str("tenant").unwrap(),
+            IsolationType::Tenant
+        );
+        assert_eq!(
+            IsolationType::from_str("space").unwrap(),
+            IsolationType::Space
+        );
+        assert_eq!(
+            IsolationType::from_str("project").unwrap(),
+            IsolationType::Project
+        );
 
         // 大小写不敏感
-        assert_eq!(IsolationType::from_str("TENANT").unwrap(), IsolationType::Tenant);
-        assert_eq!(IsolationType::from_str("Space").unwrap(), IsolationType::Space);
+        assert_eq!(
+            IsolationType::from_str("TENANT").unwrap(),
+            IsolationType::Tenant
+        );
+        assert_eq!(
+            IsolationType::from_str("Space").unwrap(),
+            IsolationType::Space
+        );
     }
 
     #[test]

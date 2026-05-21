@@ -67,15 +67,17 @@ impl DuckDbConnection {
         let conn = self.inner.lock();
 
         // 开始事务
-        conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| DuckDbError::TransactionError(format!("failed to begin transaction: {}", e)))?;
+        conn.execute("BEGIN TRANSACTION", []).map_err(|e| {
+            DuckDbError::TransactionError(format!("failed to begin transaction: {}", e))
+        })?;
 
         // 执行操作
         match f(&conn) {
             Ok(result) => {
                 // 提交事务
-                conn.execute("COMMIT", [])
-                    .map_err(|e| DuckDbError::TransactionError(format!("failed to commit transaction: {}", e)))?;
+                conn.execute("COMMIT", []).map_err(|e| {
+                    DuckDbError::TransactionError(format!("failed to commit transaction: {}", e))
+                })?;
                 Ok(result)
             }
             Err(e) => {

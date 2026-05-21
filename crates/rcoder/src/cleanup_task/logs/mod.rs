@@ -83,10 +83,7 @@ impl LogCleaner {
             let metadata = match entry.metadata().await {
                 Ok(m) => m,
                 Err(e) => {
-                    debug!(
-                        "📋 [log_cleaner] get file failed: {:?} - {}",
-                        path, e
-                    );
+                    debug!("📋 [log_cleaner] get file failed: {:?} - {}", path, e);
                     continue;
                 }
             };
@@ -95,7 +92,10 @@ impl LogCleaner {
             let modified = match metadata.modified() {
                 Ok(time) => time,
                 Err(e) => {
-                    debug!("📋 [log_cleaner] get modified time failed: {:?} - {}", path, e);
+                    debug!(
+                        "📋 [log_cleaner] get modified time failed: {:?} - {}",
+                        path, e
+                    );
                     continue;
                 }
             };

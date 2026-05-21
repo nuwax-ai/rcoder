@@ -3,15 +3,15 @@
 //! 在 Rust 内部类型和 gRPC Protobuf 类型之间进行转换
 
 use shared_types::grpc::{
-    attachment, attachment_source, Attachment as GrpcAttachment,
-    AttachmentSource as GrpcAttachmentSource, AudioAttachment as GrpcAudioAttachment, Base64Data,
-    ChatAgentConfig as GrpcChatAgentConfig, ChatAgentServerConfig as GrpcChatAgentServerConfig,
+    Attachment as GrpcAttachment, AttachmentSource as GrpcAttachmentSource,
+    AudioAttachment as GrpcAudioAttachment, Base64Data, ChatAgentConfig as GrpcChatAgentConfig,
+    ChatAgentServerConfig as GrpcChatAgentServerConfig,
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, DocumentAttachment as GrpcDocumentAttachment,
     ImageAttachment as GrpcImageAttachment, ImageDimensions as GrpcImageDimensions,
     ModelEnvBinding as GrpcModelEnvBinding, ModelEnvBindingSource as GrpcModelEnvBindingSource,
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent,
-    TextAttachment as GrpcTextAttachment,
+    TextAttachment as GrpcTextAttachment, attachment, attachment_source,
 };
 use shared_types::{Attachment, AttachmentSource, ModelProviderConfig, UnifiedSessionMessage};
 use shared_types::{

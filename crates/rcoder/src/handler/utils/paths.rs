@@ -228,7 +228,13 @@ mod tests {
     fn test_build_computer_workspace_path_tenant() {
         // tenant 隔离
         assert_eq!(
-            build_computer_workspace_path(Some("tenant"), Some("t1"), Some("s1"), "user_123", "proj_456"),
+            build_computer_workspace_path(
+                Some("tenant"),
+                Some("t1"),
+                Some("s1"),
+                "user_123",
+                "proj_456"
+            ),
             "/app/computer-project-workspace/t1/s1/proj_456"
         );
     }
@@ -237,7 +243,13 @@ mod tests {
     fn test_build_computer_workspace_path_space() {
         // space 隔离
         assert_eq!(
-            build_computer_workspace_path(Some("space"), Some("t1"), Some("s1"), "user_123", "proj_456"),
+            build_computer_workspace_path(
+                Some("space"),
+                Some("t1"),
+                Some("s1"),
+                "user_123",
+                "proj_456"
+            ),
             "/app/computer-project-workspace/t1/s1/proj_456"
         );
     }

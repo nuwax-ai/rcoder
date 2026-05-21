@@ -72,10 +72,7 @@ impl AgentCleaner {
         match self.log_cleaner.cleanup_once().await {
             Ok(log_stats) => {
                 if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
-                    info!(
-                        "🗑️ [cleaner] Cleanup completed: {}",
-                        log_stats.summary()
-                    );
+                    info!("🗑️ [cleaner] Cleanup completed: {}", log_stats.summary());
                 }
             }
             Err(e) => {
@@ -100,17 +97,18 @@ impl AgentCleaner {
                 .and_then(|info| info.container().map(|c| c.container_name.clone()));
 
             if let Some(ref name) = container_name
-                && destroyed_containers.contains(name) {
-                    // 容器已被销毁，只需删除项目记录
-                    self.state.remove_project(&project_id);
-                    current_stats.total_cleaned += 1;
-                    current_stats.success_cleaned += 1;
-                    info!(
-                        "[cleaner] Container already destroyed, removed project record only: project_id={}",
-                        project_id
-                    );
-                    continue;
-                }
+                && destroyed_containers.contains(name)
+            {
+                // 容器已被销毁，只需删除项目记录
+                self.state.remove_project(&project_id);
+                current_stats.total_cleaned += 1;
+                current_stats.success_cleaned += 1;
+                info!(
+                    "[cleaner] Container already destroyed, removed project record only: project_id={}",
+                    project_id
+                );
+                continue;
+            }
 
             current_stats.total_cleaned += 1;
 
@@ -184,30 +182,31 @@ impl AgentCleaner {
         // 4. 如果需要销毁容器
         let mut container_destroyed = false;
         if let Some(reason) = destroy_reason
-            && let Some(container_info) = agent_info.container() {
-                let project_info = super::strategies::ProjectInfo {
-                    project_id: agent_info.project_id().to_string(),
-                    user_id: agent_info.user_id().map(|s| s.to_string()),
-                    pod_id: agent_info.pod_id().map(|s| s.to_string()),
-                    last_activity: agent_info.last_activity(),
-                };
+            && let Some(container_info) = agent_info.container()
+        {
+            let project_info = super::strategies::ProjectInfo {
+                project_id: agent_info.project_id().to_string(),
+                user_id: agent_info.user_id().map(|s| s.to_string()),
+                pod_id: agent_info.pod_id().map(|s| s.to_string()),
+                last_activity: agent_info.last_activity(),
+            };
 
-                let container_identifier = strategy.get_container_identifier(&project_info)?;
+            let container_identifier = strategy.get_container_identifier(&project_info)?;
 
-                // 🔧 使用容器名称而不是 container_id 来销毁容器
-                // 容器名称更稳定，不会因为容器重启而改变
-                // Docker API 的 remove_container 既接受 ID 也接受名称
-                self.container_destroyer
-                    .destroy_with_reason(
-                        &container_info.container_name,
-                        &service_type,
-                        &container_identifier,
-                        &reason,
-                    )
-                    .await?;
+            // 🔧 使用容器名称而不是 container_id 来销毁容器
+            // 容器名称更稳定，不会因为容器重启而改变
+            // Docker API 的 remove_container 既接受 ID 也接受名称
+            self.container_destroyer
+                .destroy_with_reason(
+                    &container_info.container_name,
+                    &service_type,
+                    &container_identifier,
+                    &reason,
+                )
+                .await?;
 
-                container_destroyed = true;
-            }
+            container_destroyed = true;
+        }
 
         // 5. 从存储中移除项目记录（始终执行）
         self.state.remove_project(project_id);

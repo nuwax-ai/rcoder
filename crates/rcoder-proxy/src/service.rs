@@ -691,25 +691,26 @@ impl ProxyHttp for PortProxy {
         // 仅在 API 代理场景且上游返回 4xx/5xx 时捕获
         if let (Some(status), Some(service_name)) =
             (ctx.upstream_status, ctx.api_service_name.as_ref())
-            && status >= 400 {
-                // 限制捕获大小（最多 4KB，避免 OOM）
-                const MAX_ERROR_BODY: usize = 4096;
-                if let Some(b) = body.as_ref() {
-                    let remaining = MAX_ERROR_BODY.saturating_sub(ctx.error_body_buf.len());
-                    if remaining > 0 {
-                        let to_copy = b.len().min(remaining);
-                        ctx.error_body_buf.extend_from_slice(&b[..to_copy]);
-                    }
-                }
-
-                if end_of_stream && !ctx.error_body_buf.is_empty() {
-                    let body_str = String::from_utf8_lossy(&ctx.error_body_buf);
-                    warn!(
-                        "❌ [API_PROXY] Upstream error response body (service={}, status={}): {}",
-                        service_name, status, body_str
-                    );
+            && status >= 400
+        {
+            // 限制捕获大小（最多 4KB，避免 OOM）
+            const MAX_ERROR_BODY: usize = 4096;
+            if let Some(b) = body.as_ref() {
+                let remaining = MAX_ERROR_BODY.saturating_sub(ctx.error_body_buf.len());
+                if remaining > 0 {
+                    let to_copy = b.len().min(remaining);
+                    ctx.error_body_buf.extend_from_slice(&b[..to_copy]);
                 }
             }
+
+            if end_of_stream && !ctx.error_body_buf.is_empty() {
+                let body_str = String::from_utf8_lossy(&ctx.error_body_buf);
+                warn!(
+                    "❌ [API_PROXY] Upstream error response body (service={}, status={}): {}",
+                    service_name, status, body_str
+                );
+            }
+        }
 
         // 不修改响应体，透传给客户端
         Ok(None)
@@ -905,8 +906,12 @@ impl PortProxy {
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
                 warn!("[AUDIO] container not found: user_id={}", user_id);
-                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                    .more_context(format!("audio backend for user {} not found, please create container first", user_id))
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+                    format!(
+                        "audio backend for user {} not found, please create container first",
+                        user_id
+                    ),
+                )
             })?;
 
         // 记录上下文
@@ -968,8 +973,12 @@ impl PortProxy {
             .map(|entry| entry.value().clone())
             .ok_or_else(|| {
                 warn!("[IME] container not found: user_id={}", user_id);
-                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                    .more_context(format!("IME backend for user {} not found, please create container first", user_id))
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+                    format!(
+                        "IME backend for user {} not found, please create container first",
+                        user_id
+                    ),
+                )
             })?;
 
         ctx.target_port = Some(IME_PORT);
@@ -1206,8 +1215,9 @@ impl PortProxy {
         // 2. 从 ApiKeyManager 查询 API 配置
         let api_config = self.api_key_manager.get(service_name).ok_or_else(|| {
             warn!("{} not in API config", service_name);
-            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                .more_context(format!("API key config for service {} not found", service_name))
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+                format!("API key config for service {} not found", service_name),
+            )
         })?;
 
         let config = api_config.value();
@@ -1340,7 +1350,10 @@ impl PortProxy {
                 info!("routing {} to VNC", user_id);
                 return Err(
                     pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
-                        .more_context(format!("VNC backend for user {} not found, please create container first", user_id)),
+                        .more_context(format!(
+                            "VNC backend for user {} not found, please create container first",
+                            user_id
+                        )),
                 );
             }
         };

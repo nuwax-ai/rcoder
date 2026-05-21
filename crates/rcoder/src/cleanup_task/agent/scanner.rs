@@ -41,9 +41,10 @@ impl AgentScanner {
 
         for project_id in project_ids {
             if let Some(agent) = self.state.get_project(&project_id)
-                && self.should_cleanup_agent(&agent, current_time).await {
-                    idle_agents.push(project_id);
-                }
+                && self.should_cleanup_agent(&agent, current_time).await
+            {
+                idle_agents.push(project_id);
+            }
         }
 
         info!(

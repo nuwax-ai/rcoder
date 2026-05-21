@@ -107,10 +107,7 @@ pub async fn startup_cleanup_containers(
     let matched_containers = docker_manager.list_containers_with_pattern(pattern).await?;
 
     let total_found = matched_containers.len();
-    info!(
-        "[STARTUP_CLEANUP] Found {} containers",
-        total_found
-    );
+    info!("[STARTUP_CLEANUP] Found {} containers", total_found);
 
     if total_found == 0 {
         return Ok(CleanupResult {

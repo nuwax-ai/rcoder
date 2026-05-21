@@ -69,7 +69,10 @@ impl SchemaInitializer {
         conn.with_connection(|c| {
             // 创建表
             c.execute(CREATE_CONTAINERS_TABLE, []).map_err(|e| {
-                DuckDbError::InitializationError(format!("failed to create containers table: {}", e))
+                DuckDbError::InitializationError(format!(
+                    "failed to create containers table: {}",
+                    e
+                ))
             })?;
 
             c.execute(CREATE_PROJECTS_TABLE, []).map_err(|e| {
@@ -79,14 +82,20 @@ impl SchemaInitializer {
             // 创建容器表索引
             for sql in CREATE_CONTAINERS_INDEXES {
                 c.execute(sql, []).map_err(|e| {
-                    DuckDbError::InitializationError(format!("failed to create containers table index: {}", e))
+                    DuckDbError::InitializationError(format!(
+                        "failed to create containers table index: {}",
+                        e
+                    ))
                 })?;
             }
 
             // 创建项目表索引
             for sql in CREATE_PROJECTS_INDEXES {
                 c.execute(sql, []).map_err(|e| {
-                    DuckDbError::InitializationError(format!("failed to create projects table index: {}", e))
+                    DuckDbError::InitializationError(format!(
+                        "failed to create projects table index: {}",
+                        e
+                    ))
                 })?;
             }
 
@@ -116,9 +125,9 @@ impl SchemaInitializer {
                     "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'containers'"
                 )?;
                 let mut rows = stmt.query([])?;
-                let row = rows
-                    .next()?
-                    .ok_or_else(|| DuckDbError::InternalError("unable to query table info".to_string()))?;
+                let row = rows.next()?.ok_or_else(|| {
+                    DuckDbError::InternalError("unable to query table info".to_string())
+                })?;
                 row.get(0)?
             };
 
@@ -128,9 +137,9 @@ impl SchemaInitializer {
                     "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'projects'",
                 )?;
                 let mut rows = stmt.query([])?;
-                let row = rows
-                    .next()?
-                    .ok_or_else(|| DuckDbError::InternalError("unable to query table info".to_string()))?;
+                let row = rows.next()?.ok_or_else(|| {
+                    DuckDbError::InternalError("unable to query table info".to_string())
+                })?;
                 row.get(0)?
             };
 

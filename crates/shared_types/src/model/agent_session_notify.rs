@@ -298,7 +298,9 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
         ),
         // #[non_exhaustive] 与未来协议新增变体
         _ => {
-            warn!("session_update_to_parts: unmapped SessionUpdate variant (upgrade ACP mapper or extend match)");
+            warn!(
+                "session_update_to_parts: unmapped SessionUpdate variant (upgrade ACP mapper or extend match)"
+            );
             ("unknown_update".to_string(), serde_json::json!({}))
         }
     }
@@ -474,9 +476,8 @@ mod tests {
 
     #[test]
     fn test_session_info_update_to_unified() {
-        let update = SessionUpdate::SessionInfoUpdate(
-            SessionInfoUpdate::new().title("minesweeper-task"),
-        );
+        let update =
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title("minesweeper-task"));
         let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
             session_id: "test_session".to_string(),
             session_update: update,

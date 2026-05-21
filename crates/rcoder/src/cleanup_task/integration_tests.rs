@@ -278,27 +278,12 @@ mod tests {
         //
         // 预期：清理 proj_A 时，因为 proj_B 仍活跃，容器应该被保留
 
-        let proj_a = create_test_project_with_pod(
-            "proj_A",
-            "user_1",
-            "pod_1",
-            ServiceType::RCoder,
-            1800,
-        );
-        let proj_b = create_test_project_with_pod(
-            "proj_B",
-            "user_1",
-            "pod_1",
-            ServiceType::RCoder,
-            120,
-        );
-        let proj_c = create_test_project_with_pod(
-            "proj_C",
-            "user_1",
-            "pod_1",
-            ServiceType::RCoder,
-            1800,
-        );
+        let proj_a =
+            create_test_project_with_pod("proj_A", "user_1", "pod_1", ServiceType::RCoder, 1800);
+        let proj_b =
+            create_test_project_with_pod("proj_B", "user_1", "pod_1", ServiceType::RCoder, 120);
+        let proj_c =
+            create_test_project_with_pod("proj_C", "user_1", "pod_1", ServiceType::RCoder, 1800);
 
         let config = CleanupConfig {
             idle_timeout: Duration::from_secs(600), // 10分钟
@@ -339,27 +324,12 @@ mod tests {
         //
         // 预期：清理 proj_D 时，因为所有项目都闲置，应该销毁容器
 
-        let proj_d = create_test_project_with_pod(
-            "proj_D",
-            "user_2",
-            "pod_2",
-            ServiceType::RCoder,
-            3600,
-        );
-        let proj_e = create_test_project_with_pod(
-            "proj_E",
-            "user_2",
-            "pod_2",
-            ServiceType::RCoder,
-            7200,
-        );
-        let proj_f = create_test_project_with_pod(
-            "proj_F",
-            "user_2",
-            "pod_2",
-            ServiceType::RCoder,
-            1800,
-        );
+        let proj_d =
+            create_test_project_with_pod("proj_D", "user_2", "pod_2", ServiceType::RCoder, 3600);
+        let proj_e =
+            create_test_project_with_pod("proj_E", "user_2", "pod_2", ServiceType::RCoder, 7200);
+        let proj_f =
+            create_test_project_with_pod("proj_F", "user_2", "pod_2", ServiceType::RCoder, 1800);
 
         let config = CleanupConfig {
             idle_timeout: Duration::from_secs(600),
@@ -399,10 +369,7 @@ mod tests {
         };
 
         // 确认没有 pod_id
-        assert!(
-            proj.pod_id.is_none(),
-            "无 pod_id 的项目应该直接销毁容器"
-        );
+        assert!(proj.pod_id.is_none(), "无 pod_id 的项目应该直接销毁容器");
 
         // 项目闲置
         assert!(

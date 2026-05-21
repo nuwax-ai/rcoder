@@ -194,7 +194,10 @@ pub async fn agent_stop(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+    let project_id = request
+        .project_id
+        .as_ref()
+        .expect("validated: project_id is required and non-empty");
 
     info!(
         "🛑 [STOP_DESTROY] Received container destroy request: project_id={}, pod_id={:?}",
@@ -202,7 +205,8 @@ pub async fn agent_stop(
     );
 
     // 直接销毁容器
-    let result = destroy_container_for_project(&state, project_id, request.pod_id.as_deref(), locale).await;
+    let result =
+        destroy_container_for_project(&state, project_id, request.pod_id.as_deref(), locale).await;
 
     match &result {
         Ok(response) => {
@@ -219,10 +223,7 @@ pub async fn agent_stop(
                     );
                 }
             } else {
-                error!(
-                    "[STOP_DESTROY] Empty response: project_id={}",
-                    project_id
-                );
+                error!("[STOP_DESTROY] Empty response: project_id={}", project_id);
             }
         }
         Err(e) => {

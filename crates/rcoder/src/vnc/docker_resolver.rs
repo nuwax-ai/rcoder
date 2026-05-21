@@ -80,7 +80,10 @@ impl CachedDockerResolver {
 
         // ComputerAgentRunner 模式：使用 user_id 作为容器标识
         let container_info = runtime
-            .get_container_info_by_identifier(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .get_container_info_by_identifier(
+                user_id,
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
             .await
             .map_err(|e| {
                 warn!(

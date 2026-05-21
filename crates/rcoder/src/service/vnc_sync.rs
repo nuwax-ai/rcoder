@@ -197,10 +197,7 @@ async fn sync_vnc_backends(
             synced_count, updated_count
         );
     } else if synced_count > 0 {
-        debug!(
-            "[VNC_SYNC] Sync completed: synced={}",
-            synced_count
-        );
+        debug!("[VNC_SYNC] Sync completed: synced={}", synced_count);
     }
 
     // === 清理已销毁容器的旧映射 ===

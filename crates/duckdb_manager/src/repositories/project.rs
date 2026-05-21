@@ -197,10 +197,7 @@ impl ProjectRepository {
     ///
     /// 在共享容器模式下，多个项目可能共享同一个容器（通过 pod_id 标识），
     /// 此方法返回该 Pod 下最近活跃项目关联的容器ID
-    pub fn get_latest_container_id_by_pod_id(
-        &self,
-        pod_id: &str,
-    ) -> DuckDbResult<Option<String>> {
+    pub fn get_latest_container_id_by_pod_id(&self, pod_id: &str) -> DuckDbResult<Option<String>> {
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare(
                 r#"
@@ -488,9 +485,9 @@ impl ProjectRepository {
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare("SELECT COUNT(*) FROM projects")?;
             let mut rows = stmt.query([])?;
-            let row = rows
-                .next()?
-                .ok_or_else(|| DuckDbError::InternalError("unable to get project count".to_string()))?;
+            let row = rows.next()?.ok_or_else(|| {
+                DuckDbError::InternalError("unable to get project count".to_string())
+            })?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
         })
@@ -502,9 +499,9 @@ impl ProjectRepository {
             let mut stmt =
                 c.prepare("SELECT COUNT(*) FROM projects WHERE session_id IS NOT NULL")?;
             let mut rows = stmt.query([])?;
-            let row = rows
-                .next()?
-                .ok_or_else(|| DuckDbError::InternalError("unable to get session count".to_string()))?;
+            let row = rows.next()?.ok_or_else(|| {
+                DuckDbError::InternalError("unable to get session count".to_string())
+            })?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
         })
@@ -594,9 +591,9 @@ impl ProjectRepository {
         let session_created_at = Self::get_optional_timestamp_from_row(row, 12)?;
         let session_last_activity = Self::get_optional_timestamp_from_row(row, 13)?;
 
-        let service_type = service_type_str
-            .parse::<ServiceType>()
-            .map_err(|e| DuckDbError::InternalError(format!("failed to parse service type: {}", e)))?;
+        let service_type = service_type_str.parse::<ServiceType>().map_err(|e| {
+            DuckDbError::InternalError(format!("failed to parse service type: {}", e))
+        })?;
 
         Ok(ProjectRecord {
             project_id,
@@ -628,11 +625,14 @@ impl ProjectRepository {
                 Ok(DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now))
             }
             ValueRef::Text(bytes) => {
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| DuckDbError::InternalError(format!("UTF8 parsing failed: {}", e)))?;
+                let s = std::str::from_utf8(bytes).map_err(|e| {
+                    DuckDbError::InternalError(format!("UTF8 parsing failed: {}", e))
+                })?;
                 DateTime::parse_from_rfc3339(s)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| DuckDbError::InternalError(format!("timestamp parsing failed: {}", e)))
+                    .map_err(|e| {
+                        DuckDbError::InternalError(format!("timestamp parsing failed: {}", e))
+                    })
             }
             _ => Ok(Utc::now()),
         }
@@ -656,11 +656,14 @@ impl ProjectRepository {
                 ))
             }
             ValueRef::Text(bytes) => {
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| DuckDbError::InternalError(format!("UTF8 parsing failed: {}", e)))?;
+                let s = std::str::from_utf8(bytes).map_err(|e| {
+                    DuckDbError::InternalError(format!("UTF8 parsing failed: {}", e))
+                })?;
                 DateTime::parse_from_rfc3339(s)
                     .map(|dt| Some(dt.with_timezone(&Utc)))
-                    .map_err(|e| DuckDbError::InternalError(format!("timestamp parsing failed: {}", e)))
+                    .map_err(|e| {
+                        DuckDbError::InternalError(format!("timestamp parsing failed: {}", e))
+                    })
             }
             _ => Ok(None),
         }

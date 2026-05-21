@@ -51,8 +51,12 @@ impl ServiceType {
     /// 获取服务类型的描述
     pub fn description(&self) -> &str {
         match self {
-            ServiceType::RCoder => "Standard RCoder service, providing full AI development functionality",
-            ServiceType::ComputerAgentRunner => "Computer Agent Runner service, focused on agent execution",
+            ServiceType::RCoder => {
+                "Standard RCoder service, providing full AI development functionality"
+            }
+            ServiceType::ComputerAgentRunner => {
+                "Computer Agent Runner service, focused on agent execution"
+            }
         }
     }
 
@@ -182,7 +186,8 @@ mod tests {
                 },
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
-                container_path_template: "/app/computer-project-workspace/{user_id}/{project_id}".to_string(),
+                container_path_template: "/app/computer-project-workspace/{user_id}/{project_id}"
+                    .to_string(),
                 workspace_resolution_path: None,
             },
         );

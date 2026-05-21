@@ -48,10 +48,9 @@ impl ContainerSelfInspector {
                 .context("Failed to connect to Docker socket")?;
 
         // 测试 Docker 连接
-        docker_client
-            .ping()
-            .await
-            .context("Failed to test Docker connection, please check socket path and permissions")?;
+        docker_client.ping().await.context(
+            "Failed to test Docker connection, please check socket path and permissions",
+        )?;
 
         info!("Docker connectionsucceeded");
 
@@ -131,19 +130,13 @@ impl ContainerSelfInspector {
                         .ok_or_else(|| anyhow!("mount {} has no source field", index))?
                         .clone();
 
-                    info!(
-                        " mount: {} -> {}",
-                        container_path, host_path
-                    );
+                    info!(" mount: {} -> {}", container_path, host_path);
                     return Ok(host_path);
                 }
             }
 
             // 如果没找到，列出所有挂载点供调试
-            warn!(
-                "not found path {} in mount, mount info:",
-                container_path
-            );
+            warn!("not found path {} in mount, mount info:", container_path);
             for (index, mount) in mounts.iter().enumerate() {
                 if let (Some(dest), Some(source)) = (&mount.destination, &mount.source) {
                     warn!("  {}: {} -> {}", index, dest, source);
@@ -239,15 +232,14 @@ impl ContainerSelfInspector {
             debug!("check HOSTNAME: {}", hostname);
             if hostname.len() == 12 && hostname.chars().all(|c| c.is_ascii_hexdigit()) {
                 // 可能是短格式的容器ID（前12位）
-                info!(
-                    " HOSTNAME get containerID: {}",
-                    hostname
-                );
+                info!(" HOSTNAME get containerID: {}", hostname);
                 return Ok(hostname);
             }
         }
 
-        bail!("unable to get current container ID, please ensure container has sufficient permissions to access /proc/self/cgroup");
+        bail!(
+            "unable to get current container ID, please ensure container has sufficient permissions to access /proc/self/cgroup"
+        );
     }
 
     /// 验证 Docker socket 连接

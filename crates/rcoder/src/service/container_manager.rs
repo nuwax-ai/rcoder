@@ -73,10 +73,7 @@ impl ContainerManager {
     pub async fn get_container_info(
         project_id: &str,
     ) -> Result<Option<ContainerBasicInfo>, AppError> {
-        debug!(
-            "[CONTAINER_MGR] get container: project_id={}",
-            project_id
-        );
+        debug!("[CONTAINER_MGR] get container: project_id={}", project_id);
 
         let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
@@ -88,16 +85,13 @@ impl ContainerManager {
                 )
             })?;
 
-        runtime
-            .get_container_info(project_id)
-            .await
-            .map_err(|e| {
-                error!("[CONTAINER_MGR] Failed to query container info: {}", e);
-                AppError::with_message(
-                    ERR_CONTAINER_ERROR,
-                    format!("Failed to query container info: {}", e),
-                )
-            })
+        runtime.get_container_info(project_id).await.map_err(|e| {
+            error!("[CONTAINER_MGR] Failed to query container info: {}", e);
+            AppError::with_message(
+                ERR_CONTAINER_ERROR,
+                format!("Failed to query container info: {}", e),
+            )
+        })
     }
 }
 
@@ -170,12 +164,14 @@ async fn create_container_for_request(
 ) -> Result<ContainerBasicInfo, AppError> {
     // 1. 准备工作目录（在 rcoder 容器内创建）
     // 注意：container_work_path 已经是完整的路径
-    create_workspace_dir(container_work_path).await.map_err(|e| {
-        AppError::with_message(
-            ERR_WORKSPACE_ERROR,
-            format!("Failed to create workspace directory: {}", e),
-        )
-    })?;
+    create_workspace_dir(container_work_path)
+        .await
+        .map_err(|e| {
+            AppError::with_message(
+                ERR_WORKSPACE_ERROR,
+                format!("Failed to create workspace directory: {}", e),
+            )
+        })?;
 
     info!(
         "📁 [CONTAINER_MGR] Project workspace prepared: {}",
@@ -211,16 +207,13 @@ async fn create_container_for_request(
 
     let params = params_builder.build();
 
-    let container_info = runtime
-        .create_container(params)
-        .await
-        .map_err(|e| {
-            error!("[CONTAINER_MGR] Failed to start container: {}", e);
-            AppError::with_message(
-                ERR_CONTAINER_ERROR,
-                format!("Failed to start container: {}", e),
-            )
-        })?;
+    let container_info = runtime.create_container(params).await.map_err(|e| {
+        error!("[CONTAINER_MGR] Failed to start container: {}", e);
+        AppError::with_message(
+            ERR_CONTAINER_ERROR,
+            format!("Failed to start container: {}", e),
+        )
+    })?;
 
     info!(
         "🚀 [CONTAINER_MGR] Container created successfully: container_identifier={}, container_id={}, ip={}",
@@ -237,10 +230,7 @@ async fn create_workspace_dir(full_path: &str) -> Result<std::path::PathBuf, App
     // 确保父目录存在
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            error!(
-                "[CONTAINER_MGR] Failed to create parent directory: {:?}",
-                e
-            );
+            error!("[CONTAINER_MGR] Failed to create parent directory: {:?}", e);
             AppError::with_message(
                 ERR_WORKSPACE_ERROR,
                 format!("Failed to create parent directory: {}", e),

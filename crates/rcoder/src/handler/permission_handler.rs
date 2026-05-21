@@ -57,14 +57,16 @@ fn computer_container(
     input: &ResolvePermissionRequestDto,
 ) -> Result<ContainerBasicInfo, AppError> {
     if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
-        && let Some(container) = state.projects.get_container_by_user_id(user_id) {
-            return Ok(container);
-        }
+        && let Some(container) = state.projects.get_container_by_user_id(user_id)
+    {
+        return Ok(container);
+    }
 
     if let Some(pod_id) = input.pod_id.as_deref().filter(|s| !s.trim().is_empty())
-        && let Some(container) = state.projects.get_container_by_pod_id(pod_id) {
-            return Ok(container);
-        }
+        && let Some(container) = state.projects.get_container_by_pod_id(pod_id)
+    {
+        return Ok(container);
+    }
 
     Err(AppError::with_message(
         shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
@@ -304,6 +306,12 @@ pub async fn computer_notify_resolved(
     let locale = get_locale_from_headers(&headers);
     let dto = input.to_dto();
     validate_common(&dto)?;
+    if input.project_id.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(AppError::with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            "project_id is required",
+        ));
+    }
     if input.user_id.as_deref().unwrap_or("").trim().is_empty()
         && input.pod_id.as_deref().unwrap_or("").trim().is_empty()
     {

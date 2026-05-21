@@ -216,9 +216,10 @@ impl AgentInstallationManager {
 
         // If validate_command is specified, use it
         if let Some(validate_cmd) = &config.validate_command
-            && !validate_cmd.is_empty() {
-                return self.run_validation_command(validate_cmd).await;
-            }
+            && !validate_cmd.is_empty()
+        {
+            return self.run_validation_command(validate_cmd).await;
+        }
 
         // 使用 which 检查命令是否可用（适用于 Debian/Docker 环境）
         // which::which 是 Rust crate，不依赖系统 which 命令

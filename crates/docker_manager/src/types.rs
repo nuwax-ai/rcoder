@@ -491,7 +491,7 @@ impl Default for DockerManagerConfig {
 
             cache_status_ttl_seconds: default_cache_status_ttl(), // 默认 10 秒
             cache_network_ttl_seconds: default_cache_network_ttl(), // 默认 15 秒
-            cache_max_capacity: default_cache_max_capacity(), // 默认 10000
+            cache_max_capacity: default_cache_max_capacity(),     // 默认 10000
         }
     }
 }

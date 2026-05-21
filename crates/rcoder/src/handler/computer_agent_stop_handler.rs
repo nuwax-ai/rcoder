@@ -81,11 +81,22 @@ pub async fn computer_agent_stop(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+    let project_id = request
+        .project_id
+        .as_ref()
+        .expect("validated: project_id is required and non-empty");
 
     // 1. 验证参数：user_id 或 pod_id 至少有一个
-    let has_user_id = request.user_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let has_pod_id = request.pod_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let has_user_id = request
+        .user_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_pod_id = request
+        .pod_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     if !has_user_id && !has_pod_id {
         error!("[COMPUTER_STOP] user_id or pod_id is required");
         return Ok(HttpResult::error_with_locale(
@@ -104,7 +115,8 @@ pub async fn computer_agent_stop(
 
     // 2. 查找容器（根据 user_id 或 pod_id）
     let container_info = if has_user_id {
-        crate::service::ComputerContainerManager::get_container_info(user_id.as_ref().unwrap()).await?
+        crate::service::ComputerContainerManager::get_container_info(user_id.as_ref().unwrap())
+            .await?
     } else {
         // TODO: 实现通过 pod_id 查找容器的逻辑
         warn!("[COMPUTER_STOP] pod_id lookup not fully implemented yet");
@@ -114,7 +126,10 @@ pub async fn computer_agent_stop(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            warn!("[COMPUTER_STOP] Container not found: user_id={:?}, pod_id={:?}", user_id, pod_id);
+            warn!(
+                "[COMPUTER_STOP] Container not found: user_id={:?}, pod_id={:?}",
+                user_id, pod_id
+            );
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
                 locale,
@@ -182,10 +197,7 @@ pub async fn computer_agent_stop(
                 // Agent 停止失败或已经停止
                 match response.result.as_str() {
                     "not_found" => {
-                        warn!(
-                            "[COMPUTER_STOP] Agent not found: project_id={}",
-                            project_id
-                        );
+                        warn!("[COMPUTER_STOP] Agent not found: project_id={}", project_id);
                         return Ok(HttpResult::error_with_locale(
                             shared_types::error_codes::ERR_AGENT_NOT_FOUND,
                             locale,
@@ -211,7 +223,9 @@ pub async fn computer_agent_stop(
                         return Ok(HttpResult::success(stop_response));
                     }
                     "error" => {
-                        let err_msg = response.message.unwrap_or_else(|| "Unknown error".to_string());
+                        let err_msg = response
+                            .message
+                            .unwrap_or_else(|| "Unknown error".to_string());
                         error!("[COMPUTER_STOP] Agent stoppedfailed: {}", err_msg);
                         return Ok(HttpResult::error_with_locale(
                             shared_types::error_codes::ERR_STOP_FAILED,
@@ -219,10 +233,7 @@ pub async fn computer_agent_stop(
                         ));
                     }
                     _ => {
-                        warn!(
-                            "[COMPUTER_STOP] not response: {}",
-                            response.result
-                        );
+                        warn!("[COMPUTER_STOP] not response: {}", response.result);
                         return Ok(HttpResult::error_with_locale(
                             shared_types::error_codes::ERR_UNKNOWN,
                             locale,

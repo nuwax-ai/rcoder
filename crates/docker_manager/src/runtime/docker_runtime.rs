@@ -118,9 +118,7 @@ impl ContainerRuntime for DockerRuntime {
                 crate::types::ContainerStatus::Dead => ContainerRuntimeStatus::Failed,
                 crate::types::ContainerStatus::Removing => ContainerRuntimeStatus::Failed,
                 crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
-                crate::types::ContainerStatus::Unknown(s) => {
-                    ContainerRuntimeStatus::Unknown(s)
-                }
+                crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
             },
             created_at: chrono::Utc::now(),
         }))
@@ -208,13 +206,9 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn health_check(&self) -> ContainerRuntimeResult<()> {
-        self.inner
-            .get_docker_client()
-            .ping()
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::ConnectionError(format!("Docker ping failed: {}", e))
-            })?;
+        self.inner.get_docker_client().ping().await.map_err(|e| {
+            ContainerRuntimeError::ConnectionError(format!("Docker ping failed: {}", e))
+        })?;
         Ok(())
     }
 }
@@ -247,9 +241,7 @@ impl DockerRuntime {
                     crate::types::ContainerStatus::Dead => ContainerRuntimeStatus::Failed,
                     crate::types::ContainerStatus::Removing => ContainerRuntimeStatus::Failed,
                     crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
-                    crate::types::ContainerStatus::Unknown(s) => {
-                        ContainerRuntimeStatus::Unknown(s)
-                    }
+                    crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
                 },
                 created_at: c.created_at,
             });

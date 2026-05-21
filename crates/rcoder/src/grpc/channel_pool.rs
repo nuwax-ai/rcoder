@@ -66,7 +66,10 @@ impl GrpcChannelPool {
         // 先检查缓存，同时清理过期条目
         // 使用 remove_if_available 模式避免 TOCTOU 竞态
         let should_remove = {
-            self.channels.get(addr).map(|entry| entry.is_expired()).unwrap_or(false)
+            self.channels
+                .get(addr)
+                .map(|entry| entry.is_expired())
+                .unwrap_or(false)
         };
 
         if should_remove {
@@ -85,12 +88,8 @@ impl GrpcChannelPool {
         let endpoint = format!("http://{}", addr);
         let channel = Channel::from_shared(endpoint)
             .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
-            .connect_timeout(Duration::from_secs(
-                shared_types::GRPC_CONNECT_TIMEOUT_SECS,
-            ))
-            .timeout(Duration::from_secs(
-                shared_types::GRPC_REQUEST_TIMEOUT_SECS,
-            ))
+            .connect_timeout(Duration::from_secs(shared_types::GRPC_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(shared_types::GRPC_REQUEST_TIMEOUT_SECS))
             // HTTP/2 Keepalive 配置
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))

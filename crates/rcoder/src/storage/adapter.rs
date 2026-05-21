@@ -71,10 +71,7 @@ impl ProjectAdapter {
                 DataBridge::container_info_to_record(container, info.service_type());
             self.storage.save_container(&container_record)?;
         } else {
-            debug!(
-                "No project container: project_id={}",
-                project_id
-            );
+            debug!("No project container: project_id={}", project_id);
         }
 
         // 保存项目记录
@@ -176,10 +173,7 @@ impl ProjectAdapter {
     /// 用于 Agent 停止后清理会话状态
     pub fn clear_session(&self, project_id: &str) -> Result<(), duckdb_manager::DuckDbError> {
         self.storage.clear_session(project_id)?;
-        debug!(
-            "Clearing session: project_id={}",
-            project_id
-        );
+        debug!("Clearing session: project_id={}", project_id);
         Ok(())
     }
 
@@ -199,10 +193,7 @@ impl ProjectAdapter {
                 container_name
             }
             Err(e) => {
-                warn!(
-                    " sessionID {} getcontainer failed: {}",
-                    session_id, e
-                );
+                warn!(" sessionID {} getcontainer failed: {}", session_id, e);
                 None
             }
         }

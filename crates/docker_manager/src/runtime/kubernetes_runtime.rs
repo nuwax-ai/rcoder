@@ -14,9 +14,8 @@ use container_runtime_api::{
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
-    Container as K8sContainer, ContainerPort, EnvVar,
-    LocalObjectReference, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements,
+    Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements,
     Volume, VolumeMount, VolumeResourceRequirements,
 };
 #[cfg(feature = "kubernetes")]
@@ -97,10 +96,10 @@ impl KubernetesRuntime {
         // NFS 存储配置 (支持外部 NFS Server)
         let nfs_server = std::env::var("RCODER_K8S_NFS_SERVER")
             .unwrap_or_else(|_| "nfs-server.nfs-storage.svc.cluster.local".to_string());
-        let nfs_path = std::env::var("RCODER_K8S_NFS_PATH")
-            .unwrap_or_else(|_| "/exports".to_string());
-        let storage_class = std::env::var("RCODER_K8S_STORAGE_CLASS")
-            .unwrap_or_else(|_| "rcoder-nfs".to_string());
+        let nfs_path =
+            std::env::var("RCODER_K8S_NFS_PATH").unwrap_or_else(|_| "/exports".to_string());
+        let storage_class =
+            std::env::var("RCODER_K8S_STORAGE_CLASS").unwrap_or_else(|_| "rcoder-nfs".to_string());
         let access_mode = std::env::var("RCODER_K8S_PVC_ACCESS_MODE")
             .unwrap_or_else(|_| "ReadWriteMany".to_string());
 
@@ -108,8 +107,10 @@ impl KubernetesRuntime {
             "[K8S] Kubernetes runtime initialized, namespace: {}",
             namespace
         );
-        info!("[K8S] NFS storage: server={}, path={}, storage_class={}, access_mode={}",
-            nfs_server, nfs_path, storage_class, access_mode);
+        info!(
+            "[K8S] NFS storage: server={}, path={}, storage_class={}, access_mode={}",
+            nfs_server, nfs_path, storage_class, access_mode
+        );
 
         Ok(Self {
             client,
@@ -143,7 +144,11 @@ impl KubernetesRuntime {
     /// PVC 名称包含 identifier 以实现存储隔离
     fn workspace_pvc_name(identifier: &str, service_type: &ServiceType) -> String {
         let sanitized = identifier.replace('_', "-");
-        format!("{}-{}-workspace", service_type.container_prefix(), sanitized)
+        format!(
+            "{}-{}-workspace",
+            service_type.container_prefix(),
+            sanitized
+        )
     }
 
     /// Ensure workspace PVC exists, create if not
@@ -173,7 +178,10 @@ impl KubernetesRuntime {
         // If PVC already exists, return immediately
         // WaitForFirstConsumer PVCs will be Bound once a Pod referencing them is scheduled
         if pvc_exists {
-            info!("[K8S] PVC {} already exists, skipping Bound check (WaitForFirstConsumer)", pvc_name);
+            info!(
+                "[K8S] PVC {} already exists, skipping Bound check (WaitForFirstConsumer)",
+                pvc_name
+            );
             return Ok(());
         }
         // If not found, create it (falls through to creation logic below)
@@ -199,10 +207,7 @@ impl KubernetesRuntime {
                 resources: Some(VolumeResourceRequirements {
                     requests: Some({
                         let mut r = BTreeMap::new();
-                        r.insert(
-                            "storage".to_string(),
-                            Quantity(storage_size.to_string()),
-                        );
+                        r.insert("storage".to_string(), Quantity(storage_size.to_string()));
                         r
                     }),
                     ..Default::default()
@@ -213,12 +218,15 @@ impl KubernetesRuntime {
             status: None,
         };
 
-        self.pvcs().create(&PostParams::default(), &pvc).await.map_err(|e| {
-            ContainerRuntimeError::ContainerCreationError(format!(
-                "Failed to create PVC '{}': {}",
-                pvc_name, e
-            ))
-        })?;
+        self.pvcs()
+            .create(&PostParams::default(), &pvc)
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::ContainerCreationError(format!(
+                    "Failed to create PVC '{}': {}",
+                    pvc_name, e
+                ))
+            })?;
 
         info!("[K8S] PVC {} created", pvc_name);
 
@@ -235,10 +243,7 @@ impl KubernetesRuntime {
         while start.elapsed() < wait_timeout {
             match self.pvcs().get(pvc_name).await {
                 Ok(pvc) => {
-                    if pvc.status.as_ref()
-                        .and_then(|s| s.phase.as_deref())
-                        == Some("Bound")
-                    {
+                    if pvc.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Bound") {
                         return Ok(());
                     }
                     debug!(
@@ -268,7 +273,11 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         let pvc_name = Self::workspace_pvc_name(identifier, service_type);
 
-        match self.pvcs().delete(&pvc_name, &DeleteParams::default()).await {
+        match self
+            .pvcs()
+            .delete(&pvc_name, &DeleteParams::default())
+            .await
+        {
             Ok(_) => {
                 info!("[K8S] PVC {} deleted successfully", pvc_name);
             }
@@ -331,9 +340,10 @@ impl KubernetesRuntime {
         for cs in statuses {
             if let Some(state) = &cs.state
                 && let Some(waiting) = &state.waiting
-                    && let Some(reason) = &waiting.reason {
-                        return Some(reason.clone());
-                    }
+                && let Some(reason) = &waiting.reason
+            {
+                return Some(reason.clone());
+            }
         }
         None
     }
@@ -346,11 +356,7 @@ impl KubernetesRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
         // Pod wait timeout: configurable from config, default 120s
-        let timeout = std::time::Duration::from_secs(
-            self.config
-                .pod_ttl_seconds
-                .unwrap_or(120),
-        );
+        let timeout = std::time::Duration::from_secs(self.config.pod_ttl_seconds.unwrap_or(120));
         let start = std::time::Instant::now();
         let pod_name = self.pod_name(identifier, service_type);
 
@@ -400,7 +406,9 @@ impl KubernetesRuntime {
                                 return Err(ContainerRuntimeError::K8sError(format!(
                                     "Pod {} failed to pull image: {:?}",
                                     pod_name,
-                                    pod.status.as_ref().and_then(|s| s.container_statuses.as_ref())
+                                    pod.status
+                                        .as_ref()
+                                        .and_then(|s| s.container_statuses.as_ref())
                                 )));
                             }
                             _ => {
@@ -412,22 +420,23 @@ impl KubernetesRuntime {
 
                     // 检查 Pod 是否 Ready (需要 readinessProbe 返回成功)
                     if let Some(status) = &pod.status
-                        && let Some(conditions) = &status.conditions {
-                            let all_ready = conditions
-                                .iter()
-                                .any(|c| c.type_ == "Ready" && c.status == "True");
-                            if all_ready {
-                                info!("[K8S] Pod {} is Ready", pod_name);
-                                return Ok(());
-                            }
-                            // 调试用：打印当前状态
-                            let ready_status = conditions
-                                .iter()
-                                .map(|c| format!("{}={}", c.type_, c.status))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            debug!("[K8S] Pod {} conditions: {}", pod_name, ready_status);
+                        && let Some(conditions) = &status.conditions
+                    {
+                        let all_ready = conditions
+                            .iter()
+                            .any(|c| c.type_ == "Ready" && c.status == "True");
+                        if all_ready {
+                            info!("[K8S] Pod {} is Ready", pod_name);
+                            return Ok(());
                         }
+                        // 调试用：打印当前状态
+                        let ready_status = conditions
+                            .iter()
+                            .map(|c| format!("{}={}", c.type_, c.status))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        debug!("[K8S] Pod {} conditions: {}", pod_name, ready_status);
+                    }
                 }
                 Err(kube::Error::Api(ae)) if ae.code == 404 => {
                     // Pod 还没创建，继续等待
@@ -454,22 +463,34 @@ impl KubernetesRuntime {
         match service_type {
             ServiceType::ComputerAgentRunner => {
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER")
-                    && !env_image.is_empty() {
-                        info!("[K8S] Using image from RCODER_DOCKER_IMAGE_COMPUTER env: {}", env_image);
-                        return env_image;
-                    }
+                    && !env_image.is_empty()
+                {
+                    info!(
+                        "[K8S] Using image from RCODER_DOCKER_IMAGE_COMPUTER env: {}",
+                        env_image
+                    );
+                    return env_image;
+                }
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE")
-                    && !env_image.is_empty() {
-                        info!("[K8S] Using image from RCODER_DOCKER_IMAGE env: {}", env_image);
-                        return env_image;
-                    }
+                    && !env_image.is_empty()
+                {
+                    info!(
+                        "[K8S] Using image from RCODER_DOCKER_IMAGE env: {}",
+                        env_image
+                    );
+                    return env_image;
+                }
             }
             _ => {
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE")
-                    && !env_image.is_empty() {
-                        info!("[K8S] Using image from RCODER_DOCKER_IMAGE env: {}", env_image);
-                        return env_image;
-                    }
+                    && !env_image.is_empty()
+                {
+                    info!(
+                        "[K8S] Using image from RCODER_DOCKER_IMAGE env: {}",
+                        env_image
+                    );
+                    return env_image;
+                }
             }
         }
 
@@ -512,9 +533,7 @@ impl KubernetesRuntime {
     }
 
     /// Build resource requirements for K8s container from ServiceResourceLimits
-    fn build_resource_requirements(
-        limits: &ServiceResourceLimits,
-    ) -> Option<ResourceRequirements> {
+    fn build_resource_requirements(limits: &ServiceResourceLimits) -> Option<ResourceRequirements> {
         let mut requests: std::collections::BTreeMap<String, Quantity> =
             std::collections::BTreeMap::new();
         let mut lims: std::collections::BTreeMap<String, Quantity> =
@@ -524,18 +543,12 @@ impl KubernetesRuntime {
             // memory_limit is in bytes, convert to Mi
             let mem_mb = (memory / (1024.0 * 1024.0)) as i64;
             // Quantity is a string wrapper, construct directly with formatted string
-            requests.insert(
-                "memory".to_string(),
-                Quantity(format!("{}Mi", mem_mb)),
-            );
+            requests.insert("memory".to_string(), Quantity(format!("{}Mi", mem_mb)));
             lims.insert("memory".to_string(), Quantity(format!("{}Mi", mem_mb)));
         }
         if let Some(cpu) = limits.cpu_limit {
             // cpu_limit is core count, format as decimal string
-            requests.insert(
-                "cpu".to_string(),
-                Quantity(format!("{}", cpu)),
-            );
+            requests.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
             lims.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
         }
 
@@ -595,7 +608,8 @@ impl ContainerRuntime for KubernetesRuntime {
         // 确定容器标识符：pod_id > user_id > project_id（与 Docker 模式一致）
         let project_id_val = project_id.clone().unwrap_or_default();
         let user_id_val = user_id.clone().unwrap_or_default();
-        let identifier = pod_id.as_ref()
+        let identifier = pod_id
+            .as_ref()
             .or(user_id.as_ref())
             .or(project_id.as_ref())
             .ok_or_else(|| {
@@ -611,19 +625,19 @@ impl ContainerRuntime for KubernetesRuntime {
         // The PVC is backed by NFS Subdir External Provisioner which automatically
         // creates NFS subdirectory per PVC for isolation and automatic cleanup
         // Note: ensure_workspace_pvc waits for PVC Bound state before returning
-        self.ensure_workspace_pvc(identifier, &service_type, None).await?;
+        self.ensure_workspace_pvc(identifier, &service_type, None)
+            .await?;
 
         // Check if pod already exists and is running
         if let Some(cached) = self.pod_cache.read().await.get(identifier)
-            && cached.status == ContainerRuntimeStatus::Running {
-                info!("[K8S] Pod {} already exists and is running", pod_name);
-                return self
-                    .get_container_info_by_identifier(identifier, &service_type)
-                    .await?
-                    .ok_or_else(|| {
-                        ContainerRuntimeError::ContainerNotFound(identifier.to_string())
-                    });
-            }
+            && cached.status == ContainerRuntimeStatus::Running
+        {
+            info!("[K8S] Pod {} already exists and is running", pod_name);
+            return self
+                .get_container_info_by_identifier(identifier, &service_type)
+                .await?
+                .ok_or_else(|| ContainerRuntimeError::ContainerNotFound(identifier.to_string()));
+        }
 
         let service_type_str = service_type.to_string();
         let image = self.select_image(&service_type);
@@ -832,11 +846,12 @@ impl ContainerRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         // Try cache first
         if let Some(cached) = self.pod_cache.read().await.get(identifier)
-            && cached.status == ContainerRuntimeStatus::Running {
-                return Ok(Some(
-                    self.build_container_basic_info(identifier, cached).await?,
-                ));
-            }
+            && cached.status == ContainerRuntimeStatus::Running
+        {
+            return Ok(Some(
+                self.build_container_basic_info(identifier, cached).await?,
+            ));
+        }
 
         // Query K8s API - 尝试多种标识查询（与 label 构建逻辑一致）
         let search_queries = vec![
@@ -848,43 +863,44 @@ impl ContainerRuntime for KubernetesRuntime {
         for query in search_queries {
             let lp = ListParams::default().labels(&query);
             if let Ok(pods) = self.pods().list(&lp).await
-                && let Some(pod) = pods.items.into_iter().next() {
-                    let status = Self::extract_pod_status(&pod);
-                    let metadata = &pod.metadata;
-                    let uid = metadata.uid.clone().unwrap_or_default();
-                    let name = metadata.name.clone().unwrap_or_default();
-                    let pod_ip = pod
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.pod_ip.clone())
-                        .unwrap_or_default();
-                    let created_at = metadata
-                        .creation_timestamp
-                        .as_ref()
-                        .map(|ts| ts.0)
-                        .unwrap_or_else(Utc::now);
+                && let Some(pod) = pods.items.into_iter().next()
+            {
+                let status = Self::extract_pod_status(&pod);
+                let metadata = &pod.metadata;
+                let uid = metadata.uid.clone().unwrap_or_default();
+                let name = metadata.name.clone().unwrap_or_default();
+                let pod_ip = pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.pod_ip.clone())
+                    .unwrap_or_default();
+                let created_at = metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .map(|ts| ts.0)
+                    .unwrap_or_else(Utc::now);
 
-                    let pod_info = RuntimeContainerInfo {
-                        container_id: uid,
-                        container_name: name,
-                        container_ip: pod_ip,
-                        status,
-                        created_at,
-                    };
+                let pod_info = RuntimeContainerInfo {
+                    container_id: uid,
+                    container_name: name,
+                    container_ip: pod_ip,
+                    status,
+                    created_at,
+                };
 
-                    // Update cache if running
-                    if pod_info.status == ContainerRuntimeStatus::Running {
-                        self.pod_cache
-                            .write()
-                            .await
-                            .insert(identifier.to_string(), pod_info.clone());
-                    }
-
-                    return Ok(Some(
-                        self.build_container_basic_info(identifier, &pod_info)
-                            .await?,
-                    ));
+                // Update cache if running
+                if pod_info.status == ContainerRuntimeStatus::Running {
+                    self.pod_cache
+                        .write()
+                        .await
+                        .insert(identifier.to_string(), pod_info.clone());
                 }
+
+                return Ok(Some(
+                    self.build_container_basic_info(identifier, &pod_info)
+                        .await?,
+                ));
+            }
         }
 
         Ok(None)
@@ -1092,14 +1108,20 @@ impl ContainerRuntime for KubernetesRuntime {
                         identifier: identifier.clone(),
                         service_type: ServiceType::RCoder, // K8s 模式目前只有 RCoder
                     });
-                    info!("[K8S_SYNC] Removed stale pod from cache: {} (identifier={})", container_info.container_name, identifier);
+                    info!(
+                        "[K8S_SYNC] Removed stale pod from cache: {} (identifier={})",
+                        container_info.container_name, identifier
+                    );
                 }
                 Ok(_) => {
                     // Pod 存在，无需处理
                 }
                 Err(e) => {
                     // 其他错误，只记录日志
-                    warn!("[K8S_SYNC] Failed to check pod {}: {}", container_info.container_name, e);
+                    warn!(
+                        "[K8S_SYNC] Failed to check pod {}: {}",
+                        container_info.container_name, e
+                    );
                 }
             }
         }

@@ -54,15 +54,17 @@ impl HostPathResolver {
             ContainerSelfInspector::new(socket_path)
                 .await
                 .map_err(|e| {
-                    DockerError::ConfigurationError(format!("failed to create container self-inspector: {}", e))
+                    DockerError::ConfigurationError(format!(
+                        "failed to create container self-inspector: {}",
+                        e
+                    ))
                 })?,
         );
 
         // 获取所有挂载点信息
-        let mounts = inspector
-            .get_all_mounts()
-            .await
-            .map_err(|e| DockerError::ConfigurationError(format!("failed to get mount points: {}", e)))?;
+        let mounts = inspector.get_all_mounts().await.map_err(|e| {
+            DockerError::ConfigurationError(format!("failed to get mount points: {}", e))
+        })?;
 
         if mounts.is_empty() {
             return Err(DockerError::ConfigurationError(
@@ -250,7 +252,9 @@ impl HostPathResolver {
                 .verify_docker_connection()
                 .await
                 .map(|_| true)
-                .map_err(|e| DockerError::ConnectionError(format!("Docker connection check failed: {}", e)))
+                .map_err(|e| {
+                    DockerError::ConnectionError(format!("Docker connection check failed: {}", e))
+                })
         } else {
             Ok(false)
         }

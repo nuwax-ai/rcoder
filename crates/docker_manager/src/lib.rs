@@ -259,8 +259,9 @@ pub mod global {
     ///
     /// 支持 Docker 和 Kubernetes 运行时
     #[cfg(feature = "kubernetes")]
-    pub async fn get_global_runtime(
-    ) -> container_runtime_api::ContainerRuntimeResult<Arc<dyn container_runtime_api::ContainerRuntime>> {
+    pub async fn get_global_runtime() -> container_runtime_api::ContainerRuntimeResult<
+        Arc<dyn container_runtime_api::ContainerRuntime>,
+    > {
         crate::runtime::RuntimeManager::get().await
     }
 

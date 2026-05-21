@@ -96,10 +96,7 @@ async fn main() -> anyhow::Result<()> {
                         "  Container workspace: {:?}",
                         resolver.container_workspace_base()
                     );
-                    info!(
-                        "work directory: {:?}",
-                        resolver.host_workspace_base()
-                    );
+                    info!("work directory: {:?}", resolver.host_workspace_base());
                     Some(resolver)
                 }
                 Err(e) => {
@@ -114,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
                     show_docker_configuration_help(&docker_socket_path);
 
                     // 返回错误，停止启动
-                    return Err(anyhow::anyhow!("Container self-check failed, unable to initialize path resolver"));
+                    return Err(anyhow::anyhow!(
+                        "Container self-check failed, unable to initialize path resolver"
+                    ));
                 }
             };
     }
@@ -168,10 +167,7 @@ async fn main() -> anyhow::Result<()> {
         // 🔧 应用缓存 TTL 配置
         if let Some(ttl) = docker_config.cache_status_ttl_seconds {
             default_config.cache_status_ttl_seconds = ttl;
-            info!(
-                "using config: status cache TTL: {} seconds",
-                ttl
-            );
+            info!("using config: status cache TTL: {} seconds", ttl);
         }
         if let Some(ttl) = docker_config.cache_network_ttl_seconds {
             default_config.cache_network_ttl_seconds = ttl;
@@ -193,14 +189,18 @@ async fn main() -> anyhow::Result<()> {
         docker_manager::global::init_global_docker_manager_with_config(docker_manager_config).await
     {
         error!("Docker Manager initialization failed: {}", e);
-        return Err(anyhow::anyhow!("Docker Manager initialization failed: {}", e));
+        return Err(anyhow::anyhow!(
+            "Docker Manager initialization failed: {}",
+            e
+        ));
     }
 
     info!("checking cleanup for container (enabled)...");
     if config.cleanup_config.enabled {
         match docker_manager::runtime::RuntimeManager::runtime_type() {
             RuntimeType::Docker => {
-                let docker_manager = match docker_manager::global::get_global_docker_manager().await {
+                let docker_manager = match docker_manager::global::get_global_docker_manager().await
+                {
                     Ok(dm) => {
                         info!("Docker Manager initialized successfully (with config)");
                         dm
@@ -224,7 +224,8 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 {
                     Ok(result) => {
-                        let enabled_services = shared_types::get_enabled_service_types(&multi_image_config);
+                        let enabled_services =
+                            shared_types::get_enabled_service_types(&multi_image_config);
                         if result.successfully_removed > 0 {
                             info!(
                                 "✅ Startup cleanup completed, removed {} leftover containers (covering {} service types)",
@@ -243,7 +244,9 @@ async fn main() -> anyhow::Result<()> {
                             for failure in &result.failed_removals_details {
                                 warn!(
                                     "  - Container {} ({}): {}",
-                                    failure.container_id, failure.container_name, failure.error_message
+                                    failure.container_id,
+                                    failure.container_name,
+                                    failure.error_message
                                 );
                             }
                         }
@@ -253,18 +256,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            RuntimeType::Kubernetes => {
-                match docker_manager::runtime::RuntimeManager::get().await {
-                    Ok(runtime) => {
-                        if let Err(e) = runtime.cleanup_all().await {
-                            warn!("k8s startup cleanup failed: {}", e);
-                        } else {
-                            info!("k8s startup cleanup completed");
-                        }
+            RuntimeType::Kubernetes => match docker_manager::runtime::RuntimeManager::get().await {
+                Ok(runtime) => {
+                    if let Err(e) = runtime.cleanup_all().await {
+                        warn!("k8s startup cleanup failed: {}", e);
+                    } else {
+                        info!("k8s startup cleanup completed");
                     }
-                    Err(e) => warn!("failed to get runtime for k8s startup cleanup: {}", e),
                 }
-            }
+                Err(e) => warn!("failed to get runtime for k8s startup cleanup: {}", e),
+            },
         }
     } else {
         info!("Container cleanup task already started (cleanup_config.enabled=false)");
@@ -350,8 +351,7 @@ async fn main() -> anyhow::Result<()> {
                 "🔧 [Pingora] Starting health check loop: interval={}s, timeout={}s",
                 hc.interval_seconds, hc.timeout_seconds
             );
-            pingora_service
-                .start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
+            pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
             info!("[Pingora] health check already started");
         }
 
@@ -361,10 +361,7 @@ async fn main() -> anyhow::Result<()> {
         let handle = tokio::spawn(async move {
             info!("📍 [Pingora] calling server_manager.start()...");
             if let Err(e) = server_manager.start(pingora_shutdown_rx).await {
-                error!(
-                    "[Pingora] Pingora proxy start failed, error: {:?}",
-                    e
-                );
+                error!("[Pingora] Pingora proxy start failed, error: {:?}", e);
                 std::process::exit(1);
             }
             info!("[Pingora] server started");
@@ -396,16 +393,15 @@ async fn main() -> anyhow::Result<()> {
                 Some(watcher)
             }
             Err(e) => {
-                warn!(
-                    "config file watcher start failed: {}, API Key updated",
-                    e
-                );
+                warn!("config file watcher start failed: {}, API Key updated", e);
                 None
             }
         };
 
     // 获取容器前缀（从配置读取，用于 pod_count 和 pod_list）
-    let docker_config = config.docker_config.as_ref()
+    let docker_config = config
+        .docker_config
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Docker config is required for container prefix"))?;
     let multi_config = docker_config.get_multi_image_config();
     let selector = docker_manager::image_selector::ImageSelector::new(multi_config);
@@ -461,21 +457,15 @@ async fn main() -> anyhow::Result<()> {
     };
     let _status_checker_handle =
         start_container_status_checker(status_checker_config, state.clone());
-    info!(
-        "Container status checker already started (interval: 30s, will skip Docker on failure)"
-    );
+    info!("Container status checker already started (interval: 30s, will skip Docker on failure)");
 
     // 启动容器状态同步任务（定期检测被外部删除的容器）
     let container_sync_config = ContainerSyncConfig {
         sync_interval: Duration::from_secs(60), // 每 60 秒同步一次
     };
-    let _container_sync_handle = start_container_sync_task(
-        container_sync_config,
-        state.grpc_pool.clone(),
-    );
-    info!(
-        "Container status sync already started (interval: 60s, detect container)"
-    );
+    let _container_sync_handle =
+        start_container_sync_task(container_sync_config, state.grpc_pool.clone());
+    info!("Container status sync already started (interval: 60s, detect container)");
 
     // 🆕 启动 VNC 后端同步任务（定期从 Docker 同步容器 IP 到 Pingora）
     if let Some(ref pingora_service) = state.pingora_service {
@@ -488,9 +478,7 @@ async fn main() -> anyhow::Result<()> {
             state.container_prefix_rcoder.clone(),
             state.container_prefix_computer.clone(),
         );
-        info!(
-            "VNC sync already started (interval: 5s, sync Docker container IP)"
-        );
+        info!("VNC sync already started (interval: 5s, sync Docker container IP)");
     }
 
     // 创建路由（传入遥测 guard 用于 /metrics 端点）
@@ -674,7 +662,10 @@ fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
                                        }
                 }
                 (Err(e), _) | (_, Err(e)) => {
-                    warn!("unix signal handler failed: {}, shutdown may not be graceful", e);
+                    warn!(
+                        "unix signal handler failed: {}, shutdown may not be graceful",
+                        e
+                    );
                     // 注册失败不影响程序运行，仍可通过其他方式关闭（如 tokio::signal::ctrl_c）
                 }
             }

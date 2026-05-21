@@ -16,7 +16,6 @@ fn default_computer_agent_runner_container_path_template() -> String {
     "/app/computer-project-workspace/{user_id}/{project_id}".to_string()
 }
 
-
 /// 服务镜像配置
 ///
 /// 定义了每个服务类型的详细配置，包括镜像选择、环境变量和挂载点。
@@ -310,12 +309,12 @@ impl ServiceImageConfig {
     /// 优先使用显式配置的 workspace_resolution_path，
     /// 未配置时根据 service_type 使用默认值。
     pub fn effective_workspace_resolution_path(&self) -> String {
-        self.workspace_resolution_path.clone().unwrap_or_else(|| {
-            match self.service_type {
+        self.workspace_resolution_path
+            .clone()
+            .unwrap_or_else(|| match self.service_type {
                 ServiceType::RCoder => "/app/project_workspace".to_string(),
                 ServiceType::ComputerAgentRunner => "/app/computer-project-workspace".to_string(),
-            }
-        })
+            })
     }
 
     /// 获取 workspace 在 sub-container 内的挂载路径
@@ -369,7 +368,9 @@ impl ServiceMountConfig {
     /// 验证挂载点配置
     pub fn validate(&self) -> ConfigValidationResult {
         if self.container_path.trim().is_empty() {
-            return ConfigValidationResult::Error("Container mount path cannot be empty".to_string());
+            return ConfigValidationResult::Error(
+                "Container mount path cannot be empty".to_string(),
+            );
         }
 
         if self.host_path.trim().is_empty() {
@@ -464,7 +465,10 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     environment.insert("RUST_LOG".to_string(), "debug".to_string());
     environment.insert("SERVICE_MODE".to_string(), "agent-only".to_string());
     environment.insert("AGENT_PORT".to_string(), "8086".to_string());
-    environment.insert("PROJECT_WORKSPACE_BASE".to_string(), "/home/user".to_string());
+    environment.insert(
+        "PROJECT_WORKSPACE_BASE".to_string(),
+        "/home/user".to_string(),
+    );
 
     // 🔥 Agent 清理配置（通过环境变量控制）
     // 设置为 3600 秒（1小时），用户可以在 docker/config.yml 中覆盖此值
@@ -800,14 +804,20 @@ mod tests {
     fn test_workspace_resolution_path_rcoder() {
         let config = default_rcoder_service_config();
         // 未显式配置时，从 container_path_template 推导
-        assert_eq!(config.effective_workspace_resolution_path(), "/app/project_workspace");
+        assert_eq!(
+            config.effective_workspace_resolution_path(),
+            "/app/project_workspace"
+        );
     }
 
     #[test]
     fn test_workspace_resolution_path_computer_agent_runner() {
         let config = default_agent_runner_service_config();
         // 未显式配置时，从 container_path_template 推导
-        assert_eq!(config.effective_workspace_resolution_path(), "/app/computer-project-workspace");
+        assert_eq!(
+            config.effective_workspace_resolution_path(),
+            "/app/computer-project-workspace"
+        );
     }
 
     #[test]
@@ -836,6 +846,9 @@ mod tests {
         let mut config = default_rcoder_service_config();
         config.environment.remove("PROJECT_WORKSPACE_BASE");
         // 无环境变量时回退到 effective_workspace_resolution_path
-        assert_eq!(config.workspace_container_path(), config.effective_workspace_resolution_path());
+        assert_eq!(
+            config.workspace_container_path(),
+            config.effective_workspace_resolution_path()
+        );
     }
 }

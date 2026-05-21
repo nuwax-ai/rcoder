@@ -203,7 +203,10 @@ impl ContainerStatusChecker {
         let container = match container_info.container() {
             Some(c) => c,
             None => {
-                debug!("⚠️ [STATUS_CHECKER] Container info not found: {}", lookup_key);
+                debug!(
+                    "⚠️ [STATUS_CHECKER] Container info not found: {}",
+                    lookup_key
+                );
                 return Ok(false);
             }
         };
@@ -395,9 +398,10 @@ impl ContainerStatusChecker {
                 if let Some(first_failure) = health.first_failure_time {
                     let elapsed = now.signed_duration_since(first_failure);
                     if let Ok(skip_duration) = chrono::Duration::from_std(self.config.skip_duration)
-                        && elapsed < skip_duration {
-                            return true; // 仍在跳过期内
-                        }
+                        && elapsed < skip_duration
+                    {
+                        return true; // 仍在跳过期内
+                    }
                 }
                 // 跳过期已过，允许重新检查（但不重置失败计数器）
             }

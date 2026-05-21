@@ -80,16 +80,16 @@ impl ComputerContainerManager {
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
-                AppError::with_message(
-                    ERR_CONTAINER_ERROR,
-                    format!("Failed to get runtime: {}", e),
-                )
+                AppError::with_message(ERR_CONTAINER_ERROR, format!("Failed to get runtime: {}", e))
             })?;
 
         // 1. 尝试获取现有容器
         // 使用 container_identifier 作为容器标识进行查询
         if let Ok(Some(info)) = runtime
-            .get_container_info_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+            .get_container_info_by_identifier(
+                container_identifier,
+                &ServiceType::ComputerAgentRunner,
+            )
             .await
         {
             // ✅ 关键修复: 先验证 IP 是否有效，再检查容器运行状态
@@ -102,7 +102,10 @@ impl ComputerContainerManager {
                 );
                 // 尝试清理已失效的容器
                 if let Err(e) = runtime
-                    .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                    .stop_container_by_identifier(
+                        container_identifier,
+                        &ServiceType::ComputerAgentRunner,
+                    )
                     .await
                 {
                     warn!(
@@ -114,7 +117,10 @@ impl ComputerContainerManager {
             } else {
                 // IP 非空，进一步验证容器是否真的在运行
                 match runtime
-                    .is_container_running_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                    .is_container_running_by_identifier(
+                        container_identifier,
+                        &ServiceType::ComputerAgentRunner,
+                    )
                     .await
                 {
                     Ok(true) => {
@@ -130,7 +136,10 @@ impl ComputerContainerManager {
                             container_identifier, info.container_id
                         );
                         if let Err(e) = runtime
-                            .stop_container_by_identifier(container_identifier, &ServiceType::ComputerAgentRunner)
+                            .stop_container_by_identifier(
+                                container_identifier,
+                                &ServiceType::ComputerAgentRunner,
+                            )
                             .await
                         {
                             warn!(
@@ -190,10 +199,7 @@ impl ComputerContainerManager {
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
-                AppError::with_message(
-                    ERR_CONTAINER_ERROR,
-                    format!("Failed to get runtime: {}", e),
-                )
+                AppError::with_message(ERR_CONTAINER_ERROR, format!("Failed to get runtime: {}", e))
             })?;
 
         Self::create_container_for_user(
@@ -262,16 +268,13 @@ impl ComputerContainerManager {
 
         let params = params_builder.build();
 
-        let container_info = runtime
-            .create_container(params)
-            .await
-            .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to start container: {}", e);
-                AppError::with_message(
-                    ERR_CONTAINER_ERROR,
-                    format!("Failed to start container: {}", e),
-                )
-            })?;
+        let container_info = runtime.create_container(params).await.map_err(|e| {
+            error!("[COMPUTER_CONTAINER] Failed to start container: {}", e);
+            AppError::with_message(
+                ERR_CONTAINER_ERROR,
+                format!("Failed to start container: {}", e),
+            )
+        })?;
 
         info!(
             "🚀 [COMPUTER_CONTAINER] User container created successfully: user_id={}, container_id={}, ip={}",
@@ -337,19 +340,13 @@ impl ComputerContainerManager {
     ///
     /// 通过 user_id 查询容器是否存在
     pub async fn get_container_info(user_id: &str) -> Result<Option<ContainerBasicInfo>, AppError> {
-        debug!(
-            "[COMPUTER_CONTAINER] get container: user_id={}",
-            user_id
-        );
+        debug!("[COMPUTER_CONTAINER] get container: user_id={}", user_id);
 
         let runtime = docker_manager::runtime::RuntimeManager::get()
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
-                AppError::with_message(
-                    ERR_CONTAINER_ERROR,
-                    format!("Failed to get runtime: {}", e),
-                )
+                AppError::with_message(ERR_CONTAINER_ERROR, format!("Failed to get runtime: {}", e))
             })?;
 
         runtime

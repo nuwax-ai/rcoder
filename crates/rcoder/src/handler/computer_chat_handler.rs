@@ -31,8 +31,8 @@ use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerMa
 use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
-    I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers,
-    get_realtime_container_ip, project_dir, build_computer_workspace_path,
+    I18nJsonOrQuery, build_computer_workspace_path, extract_grpc_addr_with_port,
+    get_locale_from_headers, get_realtime_container_ip, project_dir,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -115,7 +115,9 @@ pub async fn handle_computer_chat(
     // IF pod_id IS NOT NULL THEN isolation_type, tenant_id, space_id 必须非空
     if request.pod_id.is_some() {
         if request.isolation_type.is_none() {
-            error!("[COMPUTER_CHAT] Validation failed: isolation_type is required when pod_id is provided");
+            error!(
+                "[COMPUTER_CHAT] Validation failed: isolation_type is required when pod_id is provided"
+            );
             return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
@@ -123,7 +125,9 @@ pub async fn handle_computer_chat(
             ));
         }
         if request.tenant_id.is_none() {
-            error!("[COMPUTER_CHAT] Validation failed: tenant_id is required when pod_id is provided");
+            error!(
+                "[COMPUTER_CHAT] Validation failed: tenant_id is required when pod_id is provided"
+            );
             return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
@@ -131,7 +135,9 @@ pub async fn handle_computer_chat(
             ));
         }
         if request.space_id.is_none() {
-            error!("[COMPUTER_CHAT] Validation failed: space_id is required when pod_id is provided");
+            error!(
+                "[COMPUTER_CHAT] Validation failed: space_id is required when pod_id is provided"
+            );
             return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
@@ -141,14 +147,21 @@ pub async fn handle_computer_chat(
 
         // 验证 isolation_type 值有效（大小写不敏感）
         if let Some(ref it) = request.isolation_type
-            && IsolationType::from_str(it).is_err() {
-                error!("[COMPUTER_CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
-                return Ok(HttpResult::error_with_message(
-                    shared_types::error_codes::ERR_VALIDATION,
-                    locale,
-                    &format!("invalid isolation_type '{}', expected: tenant, space, project", it),
-                ));
-            }
+            && IsolationType::from_str(it).is_err()
+        {
+            error!(
+                "[COMPUTER_CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project",
+                it
+            );
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &format!(
+                    "invalid isolation_type '{}', expected: tenant, space, project",
+                    it
+                ),
+            ));
+        }
 
         // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
         if let (Some(pid), Some(it), Some(tid), Some(sid)) = (
@@ -188,13 +201,14 @@ pub async fn handle_computer_chat(
     // 3. 验证资源限制配置
     if let Some(ref agent_config) = request.agent_config
         && let Some(ref resource_limits) = agent_config.resource_limits
-            && let Err(e) = resource_limits.validate() {
-                error!("[COMPUTER_CHAT] Resource limits validation failed: {}", e);
-                return Ok(HttpResult::error_with_locale(
-                    shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
-                    locale,
-                ));
-            }
+        && let Err(e) = resource_limits.validate()
+    {
+        error!("[COMPUTER_CHAT] Resource limits validation failed: {}", e);
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
+            locale,
+        ));
+    }
 
     // 4. === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
     // 使用原子标记（DashMap）避免并发请求互相干扰，无死锁风险
@@ -224,14 +238,14 @@ pub async fn handle_computer_chat(
                                 &shared_types::ServiceType::ComputerAgentRunner,
                             )
                             .await
-                        {
-                            info!(
-                                "✅ [COMPUTER_CHAT] Wait successful, container is ready (waited {}s): user_id={}, container_id={}",
-                                wait_sec, user_id, info.container_id
-                            );
-                            waited_container_info = Some(info);
-                            break;
-                        }
+                    {
+                        info!(
+                            "✅ [COMPUTER_CHAT] Wait successful, container is ready (waited {}s): user_id={}, container_id={}",
+                            wait_sec, user_id, info.container_id
+                        );
+                        waited_container_info = Some(info);
+                        break;
+                    }
                 }
 
                 if wait_sec % 5 == 0 {
@@ -319,12 +333,12 @@ pub async fn handle_computer_chat(
                     &shared_types::ServiceType::ComputerAgentRunner,
                 )
                 .await
-            {
-                warn!(
-                    "⚠️ [COMPUTER_CHAT] Failed to cleanup broken container before recreate: {}",
-                    e
-                );
-            }
+        {
+            warn!(
+                "⚠️ [COMPUTER_CHAT] Failed to cleanup broken container before recreate: {}",
+                e
+            );
+        }
         ComputerContainerManager::force_create_container_for_user(
             &user_id,
             request
@@ -357,19 +371,20 @@ pub async fn handle_computer_chat(
     // 这通常意味着负载测试脚本使用了多个不同的 user_id，会导致创建多个容器浪费资源
     if let Some(existing_info) = state.get_project(&project_id)
         && let Some(existing_user_id) = existing_info.user_id()
-            && existing_user_id != user_id {
-                warn!(
-                    "⚠️ [USER_ID_MISMATCH] Detected user_id change for project_id: \
+        && existing_user_id != user_id
+    {
+        warn!(
+            "⚠️ [USER_ID_MISMATCH] Detected user_id change for project_id: \
                      project_id={}, original user_id={}, new user_id={}, time={}. \
                      This may be caused by load test scripts using different user_ids, \
                      which creates multiple containers and wastes resources. \
                      Please ensure the same project_id uses the same user_id in your test scripts.",
-                    project_id,
-                    existing_user_id,
-                    user_id,
-                    chrono::Utc::now().to_rfc3339()
-                );
-            }
+            project_id,
+            existing_user_id,
+            user_id,
+            chrono::Utc::now().to_rfc3339()
+        );
+    }
 
     // 🛡️ 关键修复：容器创建成功后立即插入 DuckDB 记录
     // 这样可以防止孤立容器清理器误判并清理刚创建的容器
@@ -398,7 +413,8 @@ pub async fn handle_computer_chat(
         &user_id,
         &project_id,
     )
-    .await {
+    .await
+    {
         error!("[COMPUTER_CHAT] Failed to create project workspace: {}", e);
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_WORKSPACE_ERROR,
@@ -488,9 +504,7 @@ pub async fn handle_computer_chat(
                             sid.to_string()
                         }
                         _ => {
-                            debug!(
-                                "[COMPUTER_CHAT] Project exists, creating new session"
-                            );
+                            debug!("[COMPUTER_CHAT] Project exists, creating new session");
                             String::new()
                         }
                     }
@@ -655,12 +669,7 @@ pub async fn handle_computer_chat(
         }
     }
 
-    if !result.is_success()
-        && result
-            .data
-            .as_ref()
-            .is_none_or(|d| d.session_id.is_empty())
-    {
+    if !result.is_success() && result.data.as_ref().is_none_or(|d| d.session_id.is_empty()) {
         error!(
             "❌ [COMPUTER_CHAT] Container service returned error (no session_id): user_id={}, project_id={}, code={}, message={}",
             user_id, project_id, result.code, result.message
@@ -828,10 +837,7 @@ async fn forward_computer_request_to_container(
                     last_error = Some(e);
                     continue;
                 } else if !should_retry {
-                    error!(
-                        "[COMPUTER_FORWARD] Retry error, stopped retry: {}",
-                        e
-                    );
+                    error!("[COMPUTER_FORWARD] Retry error, stopped retry: {}", e);
                     last_error = Some(e);
                     break;
                 }

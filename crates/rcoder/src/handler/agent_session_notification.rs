@@ -35,11 +35,17 @@ pub struct SessionNotificationParams {
     pub pod_id: Option<String>,
     /// 租户ID（可选）
     #[param(example = "tenant_001")]
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     pub tenant_id: Option<String>,
     /// 空间ID（可选）
     #[param(example = "space_001")]
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     pub space_id: Option<String>,
     /// 隔离类型（可选），如 "project", "tenant", "space"
     #[param(example = "project")]
@@ -475,7 +481,6 @@ async fn validate_and_get_session_context(
             );
 
             // 根据 service_type 选择不同的查询策略
-            
 
             match project_info.service_type() {
                 Some(shared_types::ServiceType::ComputerAgentRunner) => {
@@ -586,7 +591,8 @@ async fn validate_and_get_session_context(
         // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
         let computer_prefix = &state.container_prefix_computer;
         let rcoder_prefix = &state.container_prefix_rcoder;
-        let query = if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix)) {
+        let query = if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix))
+        {
             runtime
                 .find_container(id, &shared_types::ServiceType::ComputerAgentRunner)
                 .await
@@ -596,7 +602,10 @@ async fn validate_and_get_session_context(
                 .await
         } else {
             runtime
-                .find_container(project_info.project_id(), &shared_types::ServiceType::RCoder)
+                .find_container(
+                    project_info.project_id(),
+                    &shared_types::ServiceType::RCoder,
+                )
                 .await
         };
         match query {
@@ -1127,9 +1136,10 @@ async fn create_sse_proxy_stream(
                     );
 
                     // 发送错误事件
-                    let error_event = Event::default()
-                        .event("error")
-                        .data(format!("container connection failed: {}", response.status()));
+                    let error_event = Event::default().event("error").data(format!(
+                        "container connection failed: {}",
+                        response.status()
+                    ));
                     if let Err(send_err) = tx.send(Ok(error_event)).await {
                         warn!(
                             "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",

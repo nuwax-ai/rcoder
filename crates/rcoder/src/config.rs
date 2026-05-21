@@ -102,9 +102,15 @@ pub struct ProxyHttpClientConfig {
     pub pool_idle_timeout_seconds: u64,
 }
 
-fn default_http_request_timeout_seconds() -> u64 { 600 }
-fn default_http_connect_timeout_seconds() -> u64 { 10 }
-fn default_http_pool_idle_timeout_seconds() -> u64 { 90 }
+fn default_http_request_timeout_seconds() -> u64 {
+    600
+}
+fn default_http_connect_timeout_seconds() -> u64 {
+    10
+}
+fn default_http_pool_idle_timeout_seconds() -> u64 {
+    90
+}
 
 impl Default for ProxyHttpClientConfig {
     fn default() -> Self {
@@ -602,9 +608,13 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
 
     // 配置验证
     if let Some(docker_config) = &config.docker_config
-        && let Err(e) = docker_config.validate_multi_image_config() {
-            return Err(anyhow::anyhow!("Docker configuration validation failed: {}", e));
-        }
+        && let Err(e) = docker_config.validate_multi_image_config()
+    {
+        return Err(anyhow::anyhow!(
+            "Docker configuration validation failed: {}",
+            e
+        ));
+    }
 
     info!(
         "Final config: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
@@ -631,8 +641,8 @@ pub fn load_config() -> anyhow::Result<AppConfig> {
 
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
-    let config_content =
-        fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+    let config_content = fs::read_to_string(CONFIG_FILE)
+        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
     tracing::debug!("config file content: {}", config_content);
 
@@ -643,10 +653,17 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
     if let Some(ref docker_config) = config.docker_config {
         tracing::info!("[CONFIG] docker_config is Some, checking multi_image_config");
         if let Some(ref multi_config) = docker_config.multi_image_config {
-            tracing::info!("[CONFIG] multi_image_config is Some, services count: {}", multi_config.services.len());
+            tracing::info!(
+                "[CONFIG] multi_image_config is Some, services count: {}",
+                multi_config.services.len()
+            );
             for (service_key, service_config) in &multi_config.services {
-                tracing::info!("[CONFIG]   Service '{}': arm64_image={:?}, amd64_image={:?}",
-                    service_key, service_config.arm64_image, service_config.amd64_image);
+                tracing::info!(
+                    "[CONFIG]   Service '{}': arm64_image={:?}, amd64_image={:?}",
+                    service_key,
+                    service_config.arm64_image,
+                    service_config.amd64_image
+                );
                 tracing::debug!(
                     "  Service '{}' mount config (total {} mounts):",
                     service_key,
@@ -676,8 +693,8 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
 pub fn load_api_key_config_from_file(
     config_path: &std::path::Path,
 ) -> anyhow::Result<ApiKeyAuthConfig> {
-    let config_content =
-        fs::read_to_string(config_path).map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+    let config_content = fs::read_to_string(config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
@@ -694,7 +711,8 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
 
     // 创建配置文件目录（如果不存在）
     if let Some(parent) = std::path::Path::new(CONFIG_FILE).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
     }
 
     // 使用嵌入式配置文件

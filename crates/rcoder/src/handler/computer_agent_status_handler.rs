@@ -97,11 +97,22 @@ pub async fn computer_agent_status(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+    let project_id = request
+        .project_id
+        .as_ref()
+        .expect("validated: project_id is required and non-empty");
 
     // 1. 参数验证：user_id 或 pod_id 至少有一个
-    let has_user_id = request.user_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let has_pod_id = request.pod_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let has_user_id = request
+        .user_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_pod_id = request
+        .pod_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     if !has_user_id && !has_pod_id {
         error!("[COMPUTER_AGENT_STATUS] user_id or pod_id is required");
         return Ok(HttpResult::error_with_locale(
@@ -275,8 +286,7 @@ pub async fn computer_agent_status(
 
         // 🛡️ 自愈逻辑 (Self-Healing)
         // 自动恢复丢失的项目记录，防止容器被孤立清理器误杀
-        let mut project_info =
-            shared_types::ProjectAndContainerInfo::new(project_id.to_string());
+        let mut project_info = shared_types::ProjectAndContainerInfo::new(project_id.to_string());
         project_info.set_user_id(request.user_id.clone());
         project_info.set_pod_id(request.pod_id.clone());
 
@@ -357,7 +367,14 @@ async fn call_grpc_get_status_with_retry(
     for attempt in 1..=max_retries {
         // 重新获取最新容器 IP（每次重试时）
         if attempt > 1 {
-            match get_realtime_container_ip(container_name, fallback_ip, rcoder_prefix, computer_prefix).await {
+            match get_realtime_container_ip(
+                container_name,
+                fallback_ip,
+                rcoder_prefix,
+                computer_prefix,
+            )
+            .await
+            {
                 Ok(ip) => {
                     let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
                     info!(

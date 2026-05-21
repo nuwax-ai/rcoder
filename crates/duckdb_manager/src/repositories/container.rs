@@ -233,9 +233,9 @@ impl ContainerRepository {
                 let service_type_str: String = row.get(2)?;
                 let idle_mins: i64 = row.get(3)?;
 
-                let service_type = service_type_str
-                    .parse::<ServiceType>()
-                    .map_err(|e| DuckDbError::InternalError(format!("failed to parse service type: {}", e)))?;
+                let service_type = service_type_str.parse::<ServiceType>().map_err(|e| {
+                    DuckDbError::InternalError(format!("failed to parse service type: {}", e))
+                })?;
 
                 results.push(IdleContainerInfo {
                     container_id,
@@ -288,9 +288,9 @@ impl ContainerRepository {
         self.conn.with_connection(|c| {
             let mut stmt = c.prepare("SELECT COUNT(*) FROM containers")?;
             let mut rows = stmt.query([])?;
-            let row = rows
-                .next()?
-                .ok_or_else(|| DuckDbError::InternalError("unable to get container count".to_string()))?;
+            let row = rows.next()?.ok_or_else(|| {
+                DuckDbError::InternalError("unable to get container count".to_string())
+            })?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
         })
@@ -334,9 +334,9 @@ impl ContainerRepository {
         let created_at = Self::get_timestamp_from_row(row, 8)?;
         let last_activity = Self::get_timestamp_from_row(row, 9)?;
 
-        let service_type = service_type_str
-            .parse::<ServiceType>()
-            .map_err(|e| DuckDbError::InternalError(format!("failed to parse service type: {}", e)))?;
+        let service_type = service_type_str.parse::<ServiceType>().map_err(|e| {
+            DuckDbError::InternalError(format!("failed to parse service type: {}", e))
+        })?;
 
         Ok(ContainerRecord {
             container_id,
@@ -367,11 +367,14 @@ impl ContainerRepository {
                 Ok(DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now))
             }
             ValueRef::Text(bytes) => {
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| DuckDbError::InternalError(format!("UTF8 parsing failed: {}", e)))?;
+                let s = std::str::from_utf8(bytes).map_err(|e| {
+                    DuckDbError::InternalError(format!("UTF8 parsing failed: {}", e))
+                })?;
                 DateTime::parse_from_rfc3339(s)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| DuckDbError::InternalError(format!("timestamp parsing failed: {}", e)))
+                    .map_err(|e| {
+                        DuckDbError::InternalError(format!("timestamp parsing failed: {}", e))
+                    })
             }
             _ => Ok(Utc::now()), // 默认返回当前时间
         }

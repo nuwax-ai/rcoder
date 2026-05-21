@@ -20,7 +20,9 @@ use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::vnc_sync::sync_single_vnc_backend;
 use crate::{AppError, HttpResult};
-use shared_types::{PodCountByServiceType, PodCountResponse, ProjectAndContainerInfo, ServiceResourceLimits};
+use shared_types::{
+    PodCountByServiceType, PodCountResponse, ProjectAndContainerInfo, ServiceResourceLimits,
+};
 
 // ============================================================================
 // 辅助函数
@@ -61,9 +63,10 @@ fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
         }
         // swap 必须 >= memory（如果两者都设置了）
         if let (Some(memory), Some(swap_val)) = (limits.memory, limits.swap)
-            && swap_val < memory {
-                return Err("swap should be >= memory".to_string());
-            }
+            && swap_val < memory
+        {
+            return Err("swap should be >= memory".to_string());
+        }
     }
 
     Ok(())
@@ -80,8 +83,8 @@ fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
     use chrono::{DateTime, FixedOffset};
 
     // 直接从毫秒时间戳创建 DateTime<Utc>
-    let datetime = DateTime::from_timestamp_millis(timestamp_millis as i64)
-        .unwrap_or(DateTime::UNIX_EPOCH);
+    let datetime =
+        DateTime::from_timestamp_millis(timestamp_millis as i64).unwrap_or(DateTime::UNIX_EPOCH);
 
     // 创建东八区时区偏移 (UTC+8)
     // 注意: east_opt 在参数有效时总是返回 Some，这里使用 unwrap_or 仅作为安全保障
@@ -226,12 +229,20 @@ pub struct EnsurePodRequest {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 
@@ -305,12 +316,20 @@ pub struct KeepalivePodRequest {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 
@@ -382,12 +401,20 @@ pub struct RestartPodRequest {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 
@@ -519,10 +546,7 @@ pub async fn pod_list(
     State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<PodListQuery>,
 ) -> Result<HttpResult<PodListResponse>, AppError> {
-    debug!(
-        "📋 [POD_LIST] get containers: limit={:?}",
-        params.limit
-    );
+    debug!("📋 [POD_LIST] get containers: limit={:?}", params.limit);
 
     // 1. 获取 runtime 容器列表
     let runtime = docker_manager::runtime::RuntimeManager::get()
@@ -596,7 +620,9 @@ pub async fn pod_list(
             })
             .or_else(|| {
                 // 如果DuckDB中没有，使用Docker容器中的project_id
-                if !docker_container.container_name.is_empty() && docker_container.container_name != "unknown" {
+                if !docker_container.container_name.is_empty()
+                    && docker_container.container_name != "unknown"
+                {
                     Some(docker_container.container_name.clone())
                 } else {
                     None
@@ -609,11 +635,7 @@ pub async fn pod_list(
                     .projects
                     .get_projects_by_container_id(&r.container_id)
                     .ok()
-                    .and_then(|projects| {
-                        projects
-                            .first()
-                            .and_then(|p| p.user_id.clone())
-                    })
+                    .and_then(|projects| projects.first().and_then(|p| p.user_id.clone()))
             })
         });
 
@@ -717,13 +739,14 @@ pub async fn pod_ensure(
 
     // 1.1 验证资源限制
     if let Some(ref limits) = request.resource_limits
-        && let Err(e) = validate_resource_limits(limits) {
-            error!("[POD_ENSURE] resources update failed: {}", e);
-            return Ok(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
-                locale,
-            ));
-        }
+        && let Err(e) = validate_resource_limits(limits)
+    {
+        error!("[POD_ENSURE] resources update failed: {}", e);
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
+            locale,
+        ));
+    }
 
     info!(
         "🚀 [POD_ENSURE] Ensuring container exists: user_id={}, project_id={}",
@@ -758,14 +781,14 @@ pub async fn pod_ensure(
                                 &shared_types::ServiceType::ComputerAgentRunner,
                             )
                             .await
-                        {
-                            info!(
-                                "✅ [POD_ENSURE] Wait succeeded, container ready (waited {}s): user_id={}, container_id={}",
-                                wait_sec, request.user_id, info.container_id
-                            );
-                            waited_container_info = Some(info);
-                            break;
-                        }
+                    {
+                        info!(
+                            "✅ [POD_ENSURE] Wait succeeded, container ready (waited {}s): user_id={}, container_id={}",
+                            wait_sec, request.user_id, info.container_id
+                        );
+                        waited_container_info = Some(info);
+                        break;
+                    }
                 }
 
                 if wait_sec % 5 == 0 {
@@ -1004,7 +1027,9 @@ pub async fn pod_ensure(
                 let error_msg = last_error
                     .as_ref()
                     .map(|e| e.to_string())
-                    .unwrap_or_else(|| "Container creation failed but no error info captured".to_string());
+                    .unwrap_or_else(|| {
+                        "Container creation failed but no error info captured".to_string()
+                    });
                 return Err(AppError::internal_server_error(&error_msg));
             }
         }
@@ -1048,10 +1073,7 @@ pub async fn pod_ensure(
                             break;
                         }
                         _ => {
-                            debug!(
-                                "[POD_ENSURE] Mapping not found: retry {}",
-                                retry_attempt
-                            );
+                            debug!("[POD_ENSURE] Mapping not found: retry {}", retry_attempt);
                         }
                     }
                 }
@@ -1124,19 +1146,18 @@ pub async fn pod_ensure(
 
     // 4. 🆕 如果是新创建的容器，立即同步 VNC 后端映射
     // 这消除了等待定时同步任务（最多 5 秒）的空窗期
-    if created
-        && let Some(ref pingora_service) = state.pingora_service {
-            sync_single_vnc_backend(
-                pingora_service,
-                &request.user_id,
-                &container_info.container_ip,
-            )
-            .await;
-            info!(
-                "🔄 [POD_ENSURE] VNC backend mapping synced: user_id={} -> {}",
-                request.user_id, container_info.container_ip
-            );
-        }
+    if created && let Some(ref pingora_service) = state.pingora_service {
+        sync_single_vnc_backend(
+            pingora_service,
+            &request.user_id,
+            &container_info.container_ip,
+        )
+        .await;
+        info!(
+            "🔄 [POD_ENSURE] VNC backend mapping synced: user_id={} -> {}",
+            request.user_id, container_info.container_ip
+        );
+    }
 
     // 5. 更新 DuckDB 存储中的容器信息（用于后续保活）
     // 无论容器是新建还是已存在，都要确保 DuckDB 记录是最新的
@@ -1226,8 +1247,13 @@ pub async fn pod_keepalive(
 
     // 1.1 验证隔离参数完整性（当 pod_id 有值时）
     let container_identifier = if let Some(ref pod_id) = request.pod_id {
-        if request.isolation_type.is_none() || request.tenant_id.is_none() || request.space_id.is_none() {
-            error!("[POD_KEEPALIVE] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided");
+        if request.isolation_type.is_none()
+            || request.tenant_id.is_none()
+            || request.space_id.is_none()
+        {
+            error!(
+                "[POD_KEEPALIVE] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
+            );
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
@@ -1301,9 +1327,7 @@ pub async fn pod_keepalive(
                         .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                     project_info.set_container(Some(info.clone()));
                     state.insert_project(request.project_id.clone(), Arc::new(project_info));
-                    info!(
-                        "[POD_KEEPALIVE] container already exists (Docker), updating DuckDB"
-                    );
+                    info!("[POD_KEEPALIVE] container already exists (Docker), updating DuckDB");
                 } else {
                     info!(
                         "[POD_KEEPALIVE] container already exists (Docker), DuckDB already up to date"
@@ -1425,13 +1449,14 @@ pub async fn pod_restart(
 
     // 1.1 验证资源限制
     if let Some(ref limits) = request.resource_limits
-        && let Err(e) = validate_resource_limits(limits) {
-            error!("[POD_RESTART] resources update failed: {}", e);
-            return Ok(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
-                locale,
-            ));
-        }
+        && let Err(e) = validate_resource_limits(limits)
+    {
+        error!("[POD_RESTART] resources update failed: {}", e);
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
+            locale,
+        ));
+    }
 
     info!(
         "🔄 [POD_RESTART] Restarting container: user_id={}, project_id={}",
@@ -1480,7 +1505,10 @@ pub async fn pod_restart(
         // 使用 pod_id 优先的标识符停止容器（与创建时一致）
         let container_identifier = request.pod_id.as_deref().unwrap_or(&request.user_id);
         if let Err(e) = runtime
-            .stop_container_by_identifier(container_identifier, &shared_types::ServiceType::ComputerAgentRunner)
+            .stop_container_by_identifier(
+                container_identifier,
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
             .await
         {
             // 记录错误但继续尝试创建新容器
@@ -1614,7 +1642,8 @@ pub async fn pod_restart(
     };
 
     let message = if was_existing {
-        "Container restarted, can access virtual desktop via VNC (Agent service not started)".to_string()
+        "Container restarted, can access virtual desktop via VNC (Agent service not started)"
+            .to_string()
     } else {
         "Container created (previously did not exist), can access virtual desktop via VNC (Agent service not started)".to_string()
     };
@@ -1661,13 +1690,21 @@ pub struct PodStatusQuery {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[param(example = "tenant_abc")]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[param(example = "space_xyz")]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
@@ -1749,8 +1786,13 @@ pub async fn pod_status(
 
     // 1.1 验证隔离参数完整性（当 pod_id 有值时）
     let container_identifier = if let Some(ref pod_id) = params.pod_id {
-        if params.isolation_type.is_none() || params.tenant_id.is_none() || params.space_id.is_none() {
-            error!("[POD_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided");
+        if params.isolation_type.is_none()
+            || params.tenant_id.is_none()
+            || params.space_id.is_none()
+        {
+            error!(
+                "[POD_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
+            );
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
@@ -1809,12 +1851,9 @@ pub async fn pod_status(
     // 4. 通过 runtime 查询容器状态
     match query_result {
         Ok(Some(result)) => {
-            let is_running = result.status == container_runtime_api::ContainerRuntimeStatus::Running;
-            let status_str = if is_running {
-                "running"
-            } else {
-                "stopped"
-            };
+            let is_running =
+                result.status == container_runtime_api::ContainerRuntimeStatus::Running;
+            let status_str = if is_running { "running" } else { "stopped" };
             let message = if is_running {
                 "container is running".to_string()
             } else {
@@ -1849,47 +1888,45 @@ pub async fn pod_status(
 
     // 5. 如果用 user_id 没找到，且同时提供了 project_id，再试 project_id
     if params.user_id.is_some()
-        && let Some(ref project_id) = params.project_id {
-            match runtime
-                .find_container(project_id, &shared_types::ServiceType::RCoder)
-                .await
-            {
-                Ok(Some(result)) => {
-                    let is_running = result.status == container_runtime_api::ContainerRuntimeStatus::Running;
-                    let status_str = if is_running {
-                        "running"
-                    } else {
-                        "stopped"
-                    };
-                    let message = if is_running {
-                        "container is running".to_string()
-                    } else {
-                        format!("container exists but status is: {:?}", result.status)
-                    };
+        && let Some(ref project_id) = params.project_id
+    {
+        match runtime
+            .find_container(project_id, &shared_types::ServiceType::RCoder)
+            .await
+        {
+            Ok(Some(result)) => {
+                let is_running =
+                    result.status == container_runtime_api::ContainerRuntimeStatus::Running;
+                let status_str = if is_running { "running" } else { "stopped" };
+                let message = if is_running {
+                    "container is running".to_string()
+                } else {
+                    format!("container exists but status is: {:?}", result.status)
+                };
 
-                    info!(
-                        "✅ [POD_STATUS] Found container by project_id: alive={}, container_id={}",
-                        is_running, result.container_id
-                    );
+                info!(
+                    "✅ [POD_STATUS] Found container by project_id: alive={}, container_id={}",
+                    is_running, result.container_id
+                );
 
-                    return Ok(HttpResult::success(PodStatusResponse {
-                        alive: is_running,
-                        status: status_str.to_string(),
-                        container_id: Some(result.container_id),
-                        container_name: Some(result.container_name),
-                        timestamp,
-                        message,
-                    }));
-                }
-                Ok(None) => {
-                    // 容器不存在
-                }
-                Err(e) => {
-                    error!("[POD_STATUS] Query failed: {}", e);
-                    // 继续返回 not_found 而不是错误
-                }
+                return Ok(HttpResult::success(PodStatusResponse {
+                    alive: is_running,
+                    status: status_str.to_string(),
+                    container_id: Some(result.container_id),
+                    container_name: Some(result.container_name),
+                    timestamp,
+                    message,
+                }));
+            }
+            Ok(None) => {
+                // 容器不存在
+            }
+            Err(e) => {
+                error!("[POD_STATUS] Query failed: {}", e);
+                // 继续返回 not_found 而不是错误
             }
         }
+    }
 
     // 6. 未找到容器
     info!(
@@ -1935,13 +1972,21 @@ pub struct VncStatusQuery {
     pub pod_id: Option<String>,
 
     /// 租户 ID，用于多租户场景下的数据隔离
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[param(example = "tenant_abc")]
     #[schema(example = "tenant_abc")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID，用于区分租户下的不同空间
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     #[param(example = "space_xyz")]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
@@ -2013,13 +2058,18 @@ pub async fn pod_vnc_status(
 
     // 1.1 验证隔离参数完整性（当 pod_id 有值时）
     if pod_id.is_some()
-        && (params.isolation_type.is_none() || params.tenant_id.is_none() || params.space_id.is_none()) {
-            error!("[POD_VNC_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided");
-            return Ok(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_VALIDATION,
-                locale,
-            ));
-        }
+        && (params.isolation_type.is_none()
+            || params.tenant_id.is_none()
+            || params.space_id.is_none())
+    {
+        error!(
+            "[POD_VNC_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
+        );
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+        ));
+    }
 
     if pod_id.is_none() && user_id.is_none() && project_id.is_none() {
         warn!("[POD_VNC_STATUS] pod_id, user_id and project_id are all empty");
@@ -2066,10 +2116,7 @@ pub async fn pod_vnc_status(
             (
                 pid,
                 runtime
-                    .find_container(
-                        pid,
-                        &shared_types::ServiceType::ComputerAgentRunner,
-                    )
+                    .find_container(pid, &shared_types::ServiceType::ComputerAgentRunner)
                     .await,
             )
         } else {
@@ -2123,7 +2170,10 @@ pub async fn pod_vnc_status(
     } else {
         // 缓存命中时 IP 可能为空，重新实时查询获取 IP
         match runtime
-            .find_container(lookup_user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .find_container(
+                lookup_user_id,
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
             .await
         {
             Ok(Some(info)) if !info.container_ip.is_empty() => info.container_ip,

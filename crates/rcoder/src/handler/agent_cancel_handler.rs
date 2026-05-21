@@ -13,7 +13,9 @@ use utoipa::ToSchema;
 
 use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;
-use shared_types::{AppError, AgentCancelRequest, AgentCancelResponse, ComputerAgentCancelRequest, HttpResult};
+use shared_types::{
+    AgentCancelRequest, AgentCancelResponse, AppError, ComputerAgentCancelRequest, HttpResult,
+};
 
 use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
 
@@ -34,10 +36,16 @@ pub struct ComputerCancelQuery {
     #[serde(default)]
     pub pod_id: Option<String>,
     /// 租户ID（可选）
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     pub tenant_id: Option<String>,
     /// 空间ID（可选）
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     pub space_id: Option<String>,
     /// 隔离类型（可选），如 "project", "tenant", "space"
     #[serde(default)]
@@ -188,7 +196,12 @@ async fn forward_cancel_request_to_container_service(
                     Code::Unavailable => {
                         // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
                         // 通过 Docker API 检查容器是否真的存在
-                        let container_exists = check_container_exists_by_info(container_info, rcoder_prefix, computer_prefix).await;
+                        let container_exists = check_container_exists_by_info(
+                            container_info,
+                            rcoder_prefix,
+                            computer_prefix,
+                        )
+                        .await;
 
                         if !container_exists {
                             // 容器已销毁，取消目标已达成（幂等设计）
@@ -257,7 +270,10 @@ async fn check_container_exists_by_info(
                 .strip_prefix(&format!("{}-", rcoder_prefix))
             {
                 runtime
-                    .get_container_info_by_identifier(identifier, &shared_types::ServiceType::RCoder)
+                    .get_container_info_by_identifier(
+                        identifier,
+                        &shared_types::ServiceType::RCoder,
+                    )
                     .await
             } else {
                 return true;
@@ -450,7 +466,10 @@ pub async fn agent_session_cancel(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+    let project_id = request
+        .project_id
+        .as_ref()
+        .expect("validated: project_id is required and non-empty");
 
     info!(
         "🚫 [CANCEL] Agent cancel request: project_id={}, session_id={:?}",
@@ -547,8 +566,16 @@ pub async fn computer_agent_session_cancel(
     let locale = get_locale_from_headers(&headers);
 
     // 验证 user_id 或 pod_id 至少有一个
-    let has_user_id = request.user_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let has_pod_id = request.pod_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let has_user_id = request
+        .user_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_pod_id = request
+        .pod_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     if !has_user_id && !has_pod_id {
         error!("[COMPUTER_CANCEL] user_id or pod_id is required");
         return Ok(HttpResult::error_with_locale(

@@ -109,11 +109,7 @@ impl ContainerDestroyer {
         // 4. 清理关联资源
         // 清理 gRPC 连接池中的旧连接（避免复用已失效的 TCP 连接）
         if !container_ip.is_empty() {
-            let old_grpc_addr = format!(
-                "{}:{}",
-                container_ip,
-                shared_types::GRPC_DEFAULT_PORT
-            );
+            let old_grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
             self.grpc_pool.remove(&old_grpc_addr);
         }
 

@@ -12,7 +12,9 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
-use super::utils::{I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers, build_workspace_path};
+use super::utils::{
+    I18nJsonOrQuery, build_workspace_path, extract_grpc_addr_with_port, get_locale_from_headers,
+};
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
 ///
@@ -121,14 +123,21 @@ pub async fn handle_chat(
 
         // 验证 isolation_type 值有效（大小写不敏感）
         if let Some(ref it) = request.isolation_type
-            && IsolationType::from_str(it).is_err() {
-                error!("[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
-                return Ok(HttpResult::error_with_message(
-                    shared_types::error_codes::ERR_VALIDATION,
-                    locale,
-                    &format!("invalid isolation_type '{}', expected: tenant, space, project", it),
-                ));
-            }
+            && IsolationType::from_str(it).is_err()
+        {
+            error!(
+                "[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project",
+                it
+            );
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &format!(
+                    "invalid isolation_type '{}', expected: tenant, space, project",
+                    it
+                ),
+            ));
+        }
 
         // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
         if let (Some(pid), Some(it), Some(tid), Some(sid)) = (
@@ -163,11 +172,12 @@ pub async fn handle_chat(
 
     // 验证资源限制配置
     if let Some(ref agent_config) = request.agent_config
-        && let Some(ref resource_limits) = agent_config.resource_limits {
-            resource_limits.validate().map_err(|e| {
-                AppError::validation_error(&format!("Invalid resource limits: {}", e))
-            })?;
-        }
+        && let Some(ref resource_limits) = agent_config.resource_limits
+    {
+        resource_limits
+            .validate()
+            .map_err(|e| AppError::validation_error(&format!("Invalid resource limits: {}", e)))?;
+    }
 
     info!(
         "🚀 [CHAT] Starting to process chat request: project_id={}, session_id={:?}, prompt_length={}, attachments_count={}, model_provider={}",
@@ -208,10 +218,7 @@ pub async fn handle_chat(
 
     // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
     let _ = {
-        info!(
-            "[CHAT] Getting/creating project: project_id={}",
-            project_id
-        );
+        info!("[CHAT] Getting/creating project: project_id={}", project_id);
 
         // 检查项目是否存在
         if let Some(existing_info) = state.get_project(&project_id) {
@@ -252,17 +259,11 @@ pub async fn handle_chat(
             } else {
                 // 只需要更新活动时间
                 state.update_activity(&project_id);
-                info!(
-                    "[CHAT] Activity time updated: project_id={}",
-                    project_id
-                );
+                info!("[CHAT] Activity time updated: project_id={}", project_id);
                 existing_info
             }
         } else {
-            info!(
-                "[CHAT] Creating new project: project_id={}",
-                project_id
-            );
+            info!("[CHAT] Creating new project: project_id={}", project_id);
 
             // 创建新的 ProjectAndContainerInfo
             let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
@@ -347,46 +348,50 @@ pub async fn handle_chat(
         locale,
     )
     .await;
-    info!("[CHAT] Container request completed: success={}", result.is_ok());
+    info!(
+        "[CHAT] Container request completed: success={}",
+        result.is_ok()
+    );
 
     // 响应后状态更新 - 使用 DuckDB 存储
     // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
     // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
     if let Ok(http_result) = &result
-        && let Some(chat_response) = &http_result.data {
-            let session_id = chat_response.session_id.clone();
+        && let Some(chat_response) = &http_result.data
+    {
+        let session_id = chat_response.session_id.clone();
 
-            // 只有当 session_id 非空时才更新映射
-            if !session_id.is_empty() {
+        // 只有当 session_id 非空时才更新映射
+        if !session_id.is_empty() {
+            info!(
+                "📊 [CHAT] Received chat response, starting state update: session_id={}, success={}",
+                session_id,
+                http_result.is_success()
+            );
+
+            // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
+            info!(
+                "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
+                session_id, project_id
+            );
+            state.update_session(&project_id, &session_id);
+
+            // 更新项目活动时间
+            state.update_activity(&project_id);
+
+            if http_result.is_success() {
                 info!(
-                    "📊 [CHAT] Received chat response, starting state update: session_id={}, success={}",
-                    session_id,
-                    http_result.is_success()
+                    "🎯 [CHAT] All state updates completed: project_id={}, session_id={}",
+                    project_id, session_id
                 );
-
-                // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
-                info!(
-                    "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
-                    session_id, project_id
+            } else {
+                warn!(
+                    "⚠️ [CHAT] Request failed but session mapping saved: project_id={}, session_id={}, code={}, message={}",
+                    project_id, session_id, http_result.code, http_result.message
                 );
-                state.update_session(&project_id, &session_id);
-
-                // 更新项目活动时间
-                state.update_activity(&project_id);
-
-                if http_result.is_success() {
-                    info!(
-                        "🎯 [CHAT] All state updates completed: project_id={}, session_id={}",
-                        project_id, session_id
-                    );
-                } else {
-                    warn!(
-                        "⚠️ [CHAT] Request failed but session mapping saved: project_id={}, session_id={}, code={}, message={}",
-                        project_id, session_id, http_result.code, http_result.message
-                    );
-                }
             }
         }
+    }
 
     if result.as_ref().map_or(true, |r| {
         !r.is_success() && r.data.as_ref().is_none_or(|d| d.session_id.is_empty())
@@ -439,8 +444,14 @@ async fn forward_request_to_container_service(
     {
         Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
         Err(e) => {
-            warn!("[FORWARD] Real-time IP resolution failed: {}, falling back to service_url", e);
-            extract_grpc_addr_with_port(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?
+            warn!(
+                "[FORWARD] Real-time IP resolution failed: {}, falling back to service_url",
+                e
+            );
+            extract_grpc_addr_with_port(
+                &container_info.service_url,
+                shared_types::GRPC_DEFAULT_PORT,
+            )?
         }
     };
 
@@ -511,7 +522,9 @@ async fn forward_request_to_container_service(
 
                 if should_retry && attempt < max_retries {
                     // 可重试错误：清理连接池并重新获取 IP 后重试
-                    info!("🔄 [FORWARD] Detected retryable error, re-resolving container IP and retrying...");
+                    info!(
+                        "🔄 [FORWARD] Detected retryable error, re-resolving container IP and retrying..."
+                    );
                     grpc_pool.remove(&grpc_addr);
 
                     // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
@@ -543,7 +556,10 @@ async fn forward_request_to_container_service(
                     continue;
                 } else if !should_retry {
                     // 不可重试错误：直接返回
-                    error!("[FORWARD] Detected non-retryable error, stopped retry: {}", e);
+                    error!(
+                        "[FORWARD] Detected non-retryable error, stopped retry: {}",
+                        e
+                    );
                     last_error = Some(e);
                     break;
                 }

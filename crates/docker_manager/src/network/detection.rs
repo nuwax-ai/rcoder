@@ -94,16 +94,15 @@ impl<'a> NetworkDetector<'a> {
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("failed to get container info: {}", e)))?;
+            .map_err(|e| {
+                DockerError::ConnectionError(format!("failed to get container info: {}", e))
+            })?;
 
         // 从 labels 中获取项目名称
         if let Some(labels) = inspect.config.and_then(|c| c.labels) {
             // Docker Compose 会添加 com.docker.compose.project 标签
             if let Some(project_name) = labels.get("com.docker.compose.project") {
-                info!(
-                    " container labels get project: {}",
-                    project_name
-                );
+                info!(" container labels get project: {}", project_name);
                 return Ok(Some(project_name.clone()));
             }
         }
@@ -126,17 +125,16 @@ impl<'a> NetworkDetector<'a> {
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| DockerError::ConnectionError(format!("failed to get container info: {}", e)))?;
+            .map_err(|e| {
+                DockerError::ConnectionError(format!("failed to get container info: {}", e))
+            })?;
 
         // 从容器名称推断项目名称
         if let Some(name) = inspect.name {
             // 容器名称格式: /{project_name}-{service_name}-{number}
             let clean_name = name.trim_start_matches('/');
             if let Some(project_name) = clean_name.split('-').next() {
-                info!(
-                    " container project: {}",
-                    project_name
-                );
+                info!(" container project: {}", project_name);
                 return Ok(Some(project_name.to_string()));
             }
         }

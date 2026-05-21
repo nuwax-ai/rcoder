@@ -11,7 +11,10 @@ use async_trait::async_trait;
 
 use crate::{
     AgentStatusResponse, ChatResponse, HttpResult,
-    rcoder_agent_types::{RcoderAgentCancelRequest, RcoderAgentCancelResponse, RcoderAgentStopRequest, RcoderAgentStopResponse},
+    rcoder_agent_types::{
+        RcoderAgentCancelRequest, RcoderAgentCancelResponse, RcoderAgentStopRequest,
+        RcoderAgentStopResponse,
+    },
 };
 
 /// Agent HTTP 服务抽象 trait
@@ -22,7 +25,10 @@ use crate::{
 #[async_trait]
 pub trait AgentHttpService: Send + Sync + 'static {
     /// Chat 对话请求
-    async fn chat(&self, request: crate::rcoder_agent_types::RcoderChatRequest) -> HttpResult<ChatResponse>;
+    async fn chat(
+        &self,
+        request: crate::rcoder_agent_types::RcoderChatRequest,
+    ) -> HttpResult<ChatResponse>;
 
     /// 查询 Agent 状态
     async fn get_status(&self, project_id: &str) -> HttpResult<AgentStatusResponse>;
@@ -31,5 +37,8 @@ pub trait AgentHttpService: Send + Sync + 'static {
     async fn stop(&self, request: RcoderAgentStopRequest) -> HttpResult<RcoderAgentStopResponse>;
 
     /// 取消正在执行的任务
-    async fn cancel(&self, request: RcoderAgentCancelRequest) -> HttpResult<RcoderAgentCancelResponse>;
+    async fn cancel(
+        &self,
+        request: RcoderAgentCancelRequest,
+    ) -> HttpResult<RcoderAgentCancelResponse>;
 }

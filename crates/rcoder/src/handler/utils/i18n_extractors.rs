@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use axum::http::Uri;
 use axum::{
     extract::{
         FromRequest, FromRequestParts, Json, Path, Query, Request,
@@ -17,7 +18,6 @@ use axum::{
     },
     http::request::Parts,
 };
-use axum::http::Uri;
 use serde::de::DeserializeOwned;
 
 use crate::AppError;
@@ -120,15 +120,16 @@ where
         match Json::<T>::from_request(req, state).await {
             Ok(Json(json_value)) => {
                 // 4. JSON 存在，合并两者（JSON 优先）
-                let json_value_as_value = serde_json::to_value(&json_value)
-                    .unwrap_or(serde_json::Value::Null);
+                let json_value_as_value =
+                    serde_json::to_value(&json_value).unwrap_or(serde_json::Value::Null);
                 let merged = deep_merge(query_value, json_value_as_value);
                 // 反序列化为 T（只需要 DeserializeOwned）
-                let result = serde_json::from_value(merged)
-                    .map_err(|_| AppError::with_i18n_key(
+                let result = serde_json::from_value(merged).map_err(|_| {
+                    AppError::with_i18n_key(
                         shared_types::error_codes::ERR_INVALID_PARAMS,
                         "error.invalid_params",
-                    ))?;
+                    )
+                })?;
                 Ok(Self(result))
             }
             Err(_) => {
@@ -141,11 +142,12 @@ where
                     ));
                 }
                 // 使用 query string 反序列化
-                let result = serde_json::from_value(query_value)
-                    .map_err(|_| AppError::with_i18n_key(
+                let result = serde_json::from_value(query_value).map_err(|_| {
+                    AppError::with_i18n_key(
                         shared_types::error_codes::ERR_INVALID_PARAMS,
                         "error.invalid_params",
-                    ))?;
+                    )
+                })?;
                 Ok(Self(result))
             }
         }
@@ -164,7 +166,9 @@ where
     /// let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
     /// ```
     pub fn validate_into_app_error(self) -> Result<Self, AppError> {
-        self.0.validate().map_err(shared_types::garde_err_to_app_error)?;
+        self.0
+            .validate()
+            .map_err(shared_types::garde_err_to_app_error)?;
         Ok(self)
     }
 }
@@ -205,10 +209,12 @@ pub fn require_field<'a>(value: &'a Option<String>, field_name: &str) -> Result<
         .as_ref()
         .filter(|s| !s.is_empty())
         .map(|s| s.as_str())
-        .ok_or_else(|| AppError::with_i18n_key(
-            shared_types::error_codes::ERR_VALIDATION,
-            &format!("{} is required", field_name),
-        ))
+        .ok_or_else(|| {
+            AppError::with_i18n_key(
+                shared_types::error_codes::ERR_VALIDATION,
+                &format!("{} is required", field_name),
+            )
+        })
 }
 
 fn map_json_rejection(rejection: JsonRejection) -> AppError {
@@ -244,9 +250,9 @@ fn map_path_rejection(_rejection: PathRejection) -> AppError {
 #[cfg(test)]
 mod tests {
     use axum::{
-        body::to_bytes,
         Router,
         body::Body,
+        body::to_bytes,
         http::{Request, StatusCode},
         response::IntoResponse,
         routing::{get, post},
@@ -295,7 +301,9 @@ mod tests {
     }
 
     /// I18nJsonOrQuery 测试处理器
-    async fn stop_handler(I18nJsonOrQuery(params): I18nJsonOrQuery<StopAgentQuery>) -> impl IntoResponse {
+    async fn stop_handler(
+        I18nJsonOrQuery(params): I18nJsonOrQuery<StopAgentQuery>,
+    ) -> impl IntoResponse {
         format!("project_id={}", params.project_id.unwrap_or_default())
     }
 

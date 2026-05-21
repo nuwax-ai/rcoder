@@ -43,9 +43,10 @@ impl NpmInstaller {
         // npm list output format: "package@version"
         for line in output.lines() {
             if line.contains('@')
-                && let Some(version) = line.split('@').next_back() {
-                    return Some(version.trim().to_string());
-                }
+                && let Some(version) = line.split('@').next_back()
+            {
+                return Some(version.trim().to_string());
+            }
         }
         None
     }

@@ -66,9 +66,8 @@ pub struct ChatAgentServerConfig {
   "permission_resolve_request": {
     "request_permission_response": {
       "outcome": {
-        "Selected": {
-          "option_id": "always_allow:terminal"
-        }
+        "outcome": "selected",
+        "optionId": "always_allow:terminal"
       }
     },
     "session_id": "session_789",
@@ -102,11 +101,14 @@ pub struct RequestPermissionResponse {
 }
 
 pub enum RequestPermissionOutcome {
+    #[serde(rename = "cancelled")]
     Cancelled,
+    #[serde(rename = "selected")]
     Selected(SelectedPermissionOutcome),
 }
 
 pub struct SelectedPermissionOutcome {
+    #[serde(rename = "optionId")]
     pub option_id: String,
 }
 ```
@@ -116,8 +118,8 @@ pub struct SelectedPermissionOutcome {
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `permission_resolve_request.request_permission_response` | Object | ✅ | 审批结果 |
-| `permission_resolve_request.request_permission_response.outcome` | Object | ✅ | outcome 是 tagged enum，值为 `Cancelled` 或 `Selected` |
-| `permission_resolve_request.request_permission_response.outcome.Selected.option_id` | String | ✅ | 用户选择的 option_id |
+| `permission_resolve_request.request_permission_response.outcome` | Object | ✅ | ACP internally tagged enum，`outcome` 值为 `selected` 或 `cancelled` |
+| `permission_resolve_request.request_permission_response.outcome.optionId` | String | ✅ | 用户选择的 option_id（仅 `selected` 时存在） |
 | `permission_resolve_request.session_id` | String | ✅ | 会话 ID（关联审批请求） |
 | `permission_resolve_request.tool_call_id` | String | ✅ | 工具调用 ID（用于定位具体工具权限请求） |
 | `permission_resolve_request.save_rule` | bool | ❌ | 是否保存为规则（默认 false） |
@@ -205,7 +207,8 @@ pub struct SelectedPermissionOutcome {
     "session_id": "session_789",
     "tool_call_id": "tool_001",
     "outcome": {
-      "Selected": { "option_id": "always_allow:terminal" }
+      "outcome": "selected",
+      "optionId": "always_allow:terminal"
     },
     "rule_saved": true
   },
