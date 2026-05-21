@@ -12,6 +12,7 @@
 
 #![allow(dead_code)]
 
+use crate::handler::utils::container_identity_from_name;
 use rcoder_proxy::PingoraProxyService;
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,26 +91,13 @@ async fn sync_vnc_backends(
         return;
     }
 
-    // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
-
     // 预先收集运行中容器的 key 集合（用于后续清理旧映射）
     let active_user_ids: std::collections::HashSet<String> = containers
         .iter()
         .filter(|c| c.status == container_runtime_api::ContainerRuntimeStatus::Running)
         .filter_map(|c| {
-            if c.container_name.starts_with(computer_prefix) {
-                return c
-                    .container_name
-                    .strip_prefix(&format!("{}-", computer_prefix))
-                    .map(|v| v.to_string());
-            }
-            if c.container_name.starts_with(rcoder_prefix) {
-                return c
-                    .container_name
-                    .strip_prefix(&format!("{}-", rcoder_prefix))
-                    .map(|v| v.to_string());
-            }
-            None
+            container_identity_from_name(&c.container_name, rcoder_prefix, computer_prefix)
+                .map(|(identifier, _service_type)| identifier.to_string())
         })
         .filter(|k| !k.is_empty())
         .collect();
@@ -118,21 +106,13 @@ async fn sync_vnc_backends(
     let mut updated_count = 0;
 
     for container_info in containers {
-        let user_id = if container_info.container_name.starts_with(computer_prefix) {
-            container_info
-                .container_name
-                .strip_prefix(&format!("{}-", computer_prefix))
-                .unwrap_or("")
-                .to_string()
-        } else if container_info.container_name.starts_with(rcoder_prefix) {
-            container_info
-                .container_name
-                .strip_prefix(&format!("{}-", rcoder_prefix))
-                .unwrap_or("")
-                .to_string()
-        } else {
-            String::new()
-        };
+        let user_id = container_identity_from_name(
+            &container_info.container_name,
+            rcoder_prefix,
+            computer_prefix,
+        )
+        .map(|(identifier, _service_type)| identifier.to_string())
+        .unwrap_or_default();
         if user_id.is_empty() {
             debug!(
                 "⏭️ [VNC_SYNC] Skipping container without business identifier: {}",

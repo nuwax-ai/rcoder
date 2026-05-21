@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use super::utils::{I18nPath, get_realtime_container_ip};
+use super::utils::{I18nPath, container_identity_from_name, get_realtime_container_ip};
 use crate::{AppError, HttpResult};
 use axum::{
     extract::State,
@@ -588,18 +588,12 @@ async fn validate_and_get_session_context(
             "⚠️ [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
             container_name
         );
-        // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
         let computer_prefix = &state.container_prefix_computer;
         let rcoder_prefix = &state.container_prefix_rcoder;
-        let query = if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix))
+        let query = if let Some((id, service_type)) =
+            container_identity_from_name(&container_name, rcoder_prefix, computer_prefix)
         {
-            runtime
-                .find_container(id, &shared_types::ServiceType::ComputerAgentRunner)
-                .await
-        } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
-            runtime
-                .find_container(id, &shared_types::ServiceType::RCoder)
-                .await
+            runtime.find_container(id, &service_type).await
         } else {
             runtime
                 .find_container(

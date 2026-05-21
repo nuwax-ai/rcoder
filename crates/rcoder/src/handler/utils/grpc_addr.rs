@@ -4,7 +4,9 @@
 
 use crate::AppError;
 use shared_types::GRPC_DEFAULT_PORT;
+use shared_types::ServiceType;
 use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
+use std::cmp::Reverse;
 use tracing::{debug, info};
 
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
@@ -51,6 +53,39 @@ pub fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
     extract_grpc_addr_with_port(service_url, GRPC_DEFAULT_PORT)
 }
 
+/// Resolve a runtime container/pod name to its business identifier and service type.
+///
+/// The configured prefix is the source of truth. Keep the longest configured
+/// prefix first so a prefix like `rcoder` does not steal
+/// `rcoder-computer-agent-runner-*` names.
+pub fn container_identity_from_name<'a>(
+    container_name: &'a str,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
+) -> Option<(&'a str, ServiceType)> {
+    let mut candidates = vec![
+        (
+            computer_prefix.to_string(),
+            ServiceType::ComputerAgentRunner,
+        ),
+        (rcoder_prefix.to_string(), ServiceType::RCoder),
+    ];
+    candidates.sort_by_key(|candidate| Reverse(candidate.0.len()));
+    candidates.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+    for (prefix, service_type) in candidates {
+        if prefix.is_empty() {
+            continue;
+        }
+        let full_prefix = format!("{}-", prefix);
+        if let Some(identifier) = container_name.strip_prefix(&full_prefix) {
+            return Some((identifier, service_type));
+        }
+    }
+
+    None
+}
+
 /// 从 Docker API 实时获取容器 IP
 ///
 /// 使用容器名称（如 `computer-agent-runner-user_123`）查询，
@@ -74,15 +109,11 @@ pub async fn get_realtime_container_ip(
         .await
         .map_err(|e| format!("Failed to get runtime: {}", e))?;
 
-    // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
-    let (identifier, service_type) =
-        if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix)) {
-            (id, shared_types::ServiceType::ComputerAgentRunner)
-        } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
-            (id, shared_types::ServiceType::RCoder)
-        } else {
-            return Ok(fallback_ip.to_string());
-        };
+    let Some((identifier, service_type)) =
+        container_identity_from_name(container_name, rcoder_prefix, computer_prefix)
+    else {
+        return Ok(fallback_ip.to_string());
+    };
 
     // 通过 Runtime 的 find_container 查询容器 IP
     // find_container 会直接调用 Docker API 获取最新的容器信息
@@ -160,5 +191,52 @@ mod tests {
         // 测试空字符串
         let result = extract_grpc_addr("");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_container_identity_uses_longest_configured_prefix_first() {
+        let (identifier, service_type) = container_identity_from_name(
+            "rcoder-computer-agent-runner-user-1",
+            "rcoder",
+            "rcoder-computer-agent-runner",
+        )
+        .unwrap();
+
+        assert_eq!(identifier, "user-1");
+        assert_eq!(service_type, ServiceType::ComputerAgentRunner);
+    }
+
+    #[test]
+    fn test_container_identity_only_uses_configured_prefixes() {
+        assert!(
+            container_identity_from_name(
+                "computer-agent-runner-user-1",
+                "rcoder-k8s",
+                "rcoder-computer-agent-runner",
+            )
+            .is_none()
+        );
+
+        assert!(
+            container_identity_from_name("rcoder-agent-project-1", "rcoder-k8s", "computer")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_container_identity_accepts_configured_k8s_prefixes() {
+        let (identifier, service_type) = container_identity_from_name(
+            "rcoder-computer-agent-runner-user-1",
+            "rcoder-k8s",
+            "rcoder-computer-agent-runner",
+        )
+        .unwrap();
+        assert_eq!(identifier, "user-1");
+        assert_eq!(service_type, ServiceType::ComputerAgentRunner);
+
+        let (identifier, service_type) =
+            container_identity_from_name("rcoder-k8s-project-1", "rcoder-k8s", "computer").unwrap();
+        assert_eq!(identifier, "project-1");
+        assert_eq!(service_type, ServiceType::RCoder);
     }
 }

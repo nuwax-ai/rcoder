@@ -140,15 +140,51 @@ impl KubernetesRuntime {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-    /// Get workspace PVC name for a project/user
-    /// PVC 名称包含 identifier 以实现存储隔离
-    fn workspace_pvc_name(identifier: &str, service_type: &ServiceType) -> String {
+    fn service_container_prefix(
+        &self,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        let service_key = service_type.to_string();
+        self.config
+            .docker_manager_config
+            .multi_image_config
+            .services
+            .get(&service_key)
+            .map(|config| config.container_prefix().to_string())
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(format!(
+                    "Service config not found for service_type={}",
+                    service_type
+                ))
+            })
+    }
+
+    fn sanitize_k8s_name_part(input: &str) -> String {
+        input
+            .to_ascii_lowercase()
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    }
+
+    /// Get workspace PVC name for a project/user.
+    /// PVC 名称包含 identifier 以实现存储隔离。
+    fn workspace_pvc_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        let prefix = Self::sanitize_k8s_name_part(&self.service_container_prefix(service_type)?);
         let sanitized = identifier.replace('_', "-");
-        format!(
-            "{}-{}-workspace",
-            service_type.container_prefix(),
-            sanitized
-        )
+        Ok(format!("{}-{}-workspace", prefix, sanitized))
     }
 
     /// Ensure workspace PVC exists, create if not
@@ -158,7 +194,7 @@ impl KubernetesRuntime {
         service_type: &ServiceType,
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
-        let pvc_name = Self::workspace_pvc_name(identifier, service_type);
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
 
         // Check if PVC already exists
         let pvc_exists = match self.pvcs().get(&pvc_name).await {
@@ -271,7 +307,7 @@ impl KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
-        let pvc_name = Self::workspace_pvc_name(identifier, service_type);
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
 
         match self
             .pvcs()
@@ -294,9 +330,14 @@ impl KubernetesRuntime {
     /// Generate pod name from project_id
     /// K8s Pod names must conform to RFC 1123: lowercase alphanumeric + '-', must start/end with alphanumeric
     /// Replace underscores with hyphens to ensure compatibility
-    fn pod_name(&self, project_id: &str, service_type: &ServiceType) -> String {
+    fn pod_name(
+        &self,
+        project_id: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        let prefix = Self::sanitize_k8s_name_part(&self.service_container_prefix(service_type)?);
         let sanitized_id = project_id.replace('_', "-");
-        format!("{}-{}", service_type.container_prefix(), sanitized_id)
+        Ok(format!("{}-{}", prefix, sanitized_id))
     }
 
     /// Extract pod status from Pod object
@@ -358,7 +399,7 @@ impl KubernetesRuntime {
         // Pod wait timeout: configurable from config, default 120s
         let timeout = std::time::Duration::from_secs(self.config.pod_ttl_seconds.unwrap_or(120));
         let start = std::time::Instant::now();
-        let pod_name = self.pod_name(identifier, service_type);
+        let pod_name = self.pod_name(identifier, service_type)?;
 
         while start.elapsed() < timeout {
             match self.pods().get(&pod_name).await {
@@ -619,7 +660,7 @@ impl ContainerRuntime for KubernetesRuntime {
             })?;
 
         // Pod 名称：统一使用 pod_name() helper（含 RFC 1123 下划线清理）
-        let pod_name = self.pod_name(identifier, &service_type);
+        let pod_name = self.pod_name(identifier, &service_type)?;
 
         // Ensure workspace PVC exists first (NFS-backed, each project/user gets its own PVC)
         // The PVC is backed by NFS Subdir External Provisioner which automatically
@@ -672,7 +713,7 @@ impl ContainerRuntime for KubernetesRuntime {
         // Build workspace volume using PVC (NFS-backed persistent storage)
         // 每个项目/用户使用独立的 PVC，底层由 NFS Subdir External Provisioner
         // 自动在 NFS Server 上创建子目录，实现存储隔离和自动回收
-        let pvc_name = Self::workspace_pvc_name(identifier, &service_type);
+        let pvc_name = self.workspace_pvc_name(identifier, &service_type)?;
         let volumes = Some(vec![Volume {
             name: "workspace".to_string(),
             persistent_volume_claim: Some(
@@ -925,7 +966,7 @@ impl ContainerRuntime for KubernetesRuntime {
         }
 
         // 1) Query by concrete pod name
-        let pod_name = self.pod_name(identifier, service_type);
+        let pod_name = self.pod_name(identifier, service_type)?;
         match self.pods().get(&pod_name).await {
             Ok(pod) => return Ok(Some(Self::runtime_info_from_pod(&pod))),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
@@ -1003,7 +1044,7 @@ impl ContainerRuntime for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
-        let pod_name = self.pod_name(identifier, service_type);
+        let pod_name = self.pod_name(identifier, service_type)?;
 
         match self
             .pods()

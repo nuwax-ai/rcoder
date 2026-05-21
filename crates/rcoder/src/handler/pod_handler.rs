@@ -15,13 +15,14 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 use utoipa::{IntoParams, ToSchema};
 
-use super::utils::{I18nJsonOrQuery, I18nQuery};
+use super::utils::{I18nJsonOrQuery, I18nQuery, container_identity_from_name};
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::vnc_sync::sync_single_vnc_backend;
 use crate::{AppError, HttpResult};
 use shared_types::{
     PodCountByServiceType, PodCountResponse, ProjectAndContainerInfo, ServiceResourceLimits,
+    ServiceType,
 };
 
 // ============================================================================
@@ -494,10 +495,16 @@ pub async fn pod_count(
             continue;
         }
 
-        if container.container_name.starts_with(rcoder_prefix) {
-            rcoder_count += 1;
-        } else if container.container_name.starts_with(computer_prefix) {
-            computer_count += 1;
+        match container_identity_from_name(
+            &container.container_name,
+            rcoder_prefix,
+            computer_prefix,
+        )
+        .map(|(_, service_type)| service_type)
+        {
+            Some(ServiceType::RCoder) => rcoder_count += 1,
+            Some(ServiceType::ComputerAgentRunner) => computer_count += 1,
+            None => {}
         }
     }
 
@@ -590,22 +597,24 @@ pub async fn pod_list(
         let duckdb_record = duckdb_map.get(&docker_container.container_id);
 
         // 确定服务类型
-        let service_type = if docker_container.container_name.starts_with(rcoder_prefix) {
-            "RCoder"
-        } else if docker_container.container_name.starts_with(computer_prefix) {
-            "ComputerAgentRunner"
-        } else {
-            "Unknown"
+        let container_identity = container_identity_from_name(
+            &docker_container.container_name,
+            rcoder_prefix,
+            computer_prefix,
+        );
+        let service_type = match container_identity
+            .as_ref()
+            .map(|(_, service_type)| service_type)
+        {
+            Some(ServiceType::RCoder) => "RCoder",
+            Some(ServiceType::ComputerAgentRunner) => "ComputerAgentRunner",
+            None => "Unknown",
         };
 
         // 从容器名称提取 user_id（如果是 computer-agent-runner-{user_id}）
-        let user_id = if docker_container.container_name.starts_with(computer_prefix) {
-            docker_container
-                .container_name
-                .strip_prefix(&format!("{}-", computer_prefix))
-                .map(|s| s.to_string())
-        } else {
-            None
+        let user_id = match container_identity {
+            Some((identifier, ServiceType::ComputerAgentRunner)) => Some(identifier.to_string()),
+            _ => None,
         };
 
         // 获取项目ID和用户ID（从DuckDB或Docker容器信息）

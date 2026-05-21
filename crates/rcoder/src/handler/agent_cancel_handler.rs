@@ -17,7 +17,9 @@ use shared_types::{
     AgentCancelRequest, AgentCancelResponse, AppError, ComputerAgentCancelRequest, HttpResult,
 };
 
-use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
+use super::utils::{
+    I18nJsonOrQuery, container_identity_from_name, extract_grpc_addr, get_locale_from_headers,
+};
 
 /// Computer Agent 取消任务的查询参数（仅用于测试）
 #[derive(Debug, Deserialize, ToSchema)]
@@ -253,27 +255,13 @@ async fn check_container_exists_by_info(
 ) -> bool {
     match docker_manager::runtime::RuntimeManager::get().await {
         Ok(runtime) => {
-            // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
-
-            let query = if let Some(identifier) = container_info
-                .container_name
-                .strip_prefix(&format!("{}-", computer_prefix))
-            {
+            let query = if let Some((identifier, service_type)) = container_identity_from_name(
+                &container_info.container_name,
+                rcoder_prefix,
+                computer_prefix,
+            ) {
                 runtime
-                    .get_container_info_by_identifier(
-                        identifier,
-                        &shared_types::ServiceType::ComputerAgentRunner,
-                    )
-                    .await
-            } else if let Some(identifier) = container_info
-                .container_name
-                .strip_prefix(&format!("{}-", rcoder_prefix))
-            {
-                runtime
-                    .get_container_info_by_identifier(
-                        identifier,
-                        &shared_types::ServiceType::RCoder,
-                    )
+                    .get_container_info_by_identifier(identifier, &service_type)
                     .await
             } else {
                 return true;
