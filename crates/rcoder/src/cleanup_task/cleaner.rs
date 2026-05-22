@@ -223,6 +223,8 @@ impl AgentCleaner {
         info!("[cleaner] cleanup task already started");
 
         let mut interval = interval(self.config.cleanup_interval);
+        let mut memory_log_counter = 0u32;
+        const MEMORY_LOG_INTERVAL: u32 = 12; // 每 12 次清理（大约 1 小时）输出一次内存日志
 
         loop {
             interval.tick().await;
@@ -230,6 +232,15 @@ impl AgentCleaner {
             match self.cleanup_once().await {
                 Ok(_) => debug!("[cleaner] Cleanup completed"),
                 Err(e) => warn!("[cleaner] Cleanup failed: {}", e),
+            }
+
+            // 定期输出 DuckDB 内存使用统计
+            memory_log_counter += 1;
+            if memory_log_counter >= MEMORY_LOG_INTERVAL {
+                memory_log_counter = 0;
+                if let Ok(stats) = self.state.projects.get_memory_stats() {
+                    debug!("[cleaner] DuckDB Memory Stats:\n{}", stats);
+                }
             }
         }
     }

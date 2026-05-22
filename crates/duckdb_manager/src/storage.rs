@@ -236,6 +236,13 @@ impl DuckDbStorage {
             Ok((columns, rows))
         })
     }
+
+    /// 获取 DuckDB 内存使用统计（用于调试和监控）
+    ///
+    /// 返回内存使用的详细信息，帮助定位内存问题
+    pub fn get_memory_stats(&self) -> DuckDbResult<String> {
+        self.conn.get_memory_stats()
+    }
 }
 
 impl UnifiedStorage for DuckDbStorage {
