@@ -448,6 +448,13 @@ impl ProjectAdapter {
             .map_err(|e| format!("Query execution failed: {}", e))
     }
 
+    /// 获取 DuckDB 内存使用统计（用于调试和监控）
+    pub fn get_memory_stats(&self) -> Result<String, String> {
+        self.storage
+            .get_memory_stats()
+            .map_err(|e| format!("Failed to get memory stats: {}", e))
+    }
+
     // ========== 内部辅助方法 ==========
 
     /// 获取项目关联的容器信息

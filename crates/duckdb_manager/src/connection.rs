@@ -16,10 +16,42 @@ pub struct DuckDbConnection {
 }
 
 impl DuckDbConnection {
+    /// DuckDB 内存限制默认值（2GB）
+    const DEFAULT_MEMORY_LIMIT: &str = "2GB";
+
     /// 创建内存模式的数据库连接
     pub fn open_in_memory() -> DuckDbResult<Self> {
         let conn = Connection::open_in_memory()
             .map_err(|e| DuckDbError::ConnectionError(e.to_string()))?;
+
+        // 设置 DuckDB 内存限制，防止无限占用内存
+        // 注意：memory_limit 只限制 buffer manager，部分数据结构（如向量、查询结果）
+        // 可能在 buffer manager 外部分配，因此实际内存可能略高于此限制
+        conn.execute(
+            &format!("PRAGMA memory_limit='{}'", Self::DEFAULT_MEMORY_LIMIT),
+            [],
+        )
+        .map_err(|e| DuckDbError::ConnectionError(format!("Failed to set memory_limit: {}", e)))?;
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// 创建内存模式的数据库连接（带自定义内存限制）
+    ///
+    /// # Arguments
+    /// * `memory_limit` - 内存限制字符串，如 "2GB", "512MB", "1GB"
+    pub fn open_in_memory_with_limit(memory_limit: &str) -> DuckDbResult<Self> {
+        let conn = Connection::open_in_memory()
+            .map_err(|e| DuckDbError::ConnectionError(e.to_string()))?;
+
+        // 设置自定义内存限制
+        conn.execute(
+            &format!("PRAGMA memory_limit='{}'", memory_limit),
+            [],
+        )
+        .map_err(|e| DuckDbError::ConnectionError(format!("Failed to set memory_limit: {}", e)))?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
@@ -55,6 +87,31 @@ impl DuckDbConnection {
             Some(conn) => Ok(Some(f(&conn)?)),
             None => Ok(None),
         }
+    }
+
+    /// 获取 DuckDB 内存使用统计
+    ///
+    /// 返回格式化的内存使用信息字符串，用于调试和监控
+    pub fn get_memory_stats(&self) -> DuckDbResult<String> {
+        self.with_connection(|c| {
+            // 查询内存使用情况
+            let mut stmt = c.prepare(
+                "SELECT name, size, reservation FROM duckdb_memory() ORDER BY size DESC LIMIT 10",
+            )?;
+            let mut rows = stmt.query([])?;
+
+            let mut result = String::from("DuckDB Memory Usage (Top 10):\n");
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(0).unwrap_or_default();
+                let size: i64 = row.get(1).unwrap_or(0);
+                let reservation: i64 = row.get(2).unwrap_or(0);
+                result.push_str(&format!(
+                    "  {}: size={}, reservation={}\n",
+                    name, size, reservation
+                ));
+            }
+            Ok(result)
+        })
     }
 
     /// 执行事务
