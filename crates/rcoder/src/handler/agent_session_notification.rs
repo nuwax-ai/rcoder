@@ -1207,7 +1207,7 @@ fn create_error_response(status: StatusCode, code: &str, message: &str) -> Respo
     let locale = shared_types::current_request_locale();
     let mapped_code = map_error_code_for_locale(code);
     let localized_message = shared_types::get_error_message(mapped_code, locale);
-    let error_body = HttpResult::<()>::error(code, &localized_message);
+    let error_body = HttpResult::<()>::error(mapped_code, &localized_message);
     let json_body = serde_json::to_string(&error_body).unwrap_or_default();
 
     debug!(

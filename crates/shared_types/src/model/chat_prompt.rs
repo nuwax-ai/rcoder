@@ -62,7 +62,7 @@ pub struct ChatPromptResponse {
     pub project_id: String,
     /// agent 的会话ID ,可能没有,如果没有,agent使用自动创建会话,返回会话id
     pub session_id: String,
-    /// 错误码（如 "9010", "VALIDATION_ERROR"，成功时为 "0000"）
+    /// 错误码（如 "9010", "ERR_VALIDATION"，成功时为 "0000"）
     pub code: String,
     /// 错误信息，如果有的话
     pub error: Option<String>,

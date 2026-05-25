@@ -1085,10 +1085,10 @@ impl AgentService for AgentServiceImpl {
             save_rule: req.save_rule,
             project_id: Some(req.project_id).filter(|s| !s.trim().is_empty()),
             user_id: req.user_id,
-            pod_id: None,
-            tenant_id: None,
-            space_id: None,
-            isolation_type: None,
+            pod_id: req.pod_id,
+            tenant_id: req.tenant_id,
+            space_id: req.space_id,
+            isolation_type: req.isolation_type,
         };
 
         let result = PERMISSION_MANAGER.resolve_permission(dto).await;

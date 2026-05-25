@@ -66,7 +66,7 @@ message ChatResponse {
   bool success = 3;
   optional string error = 4;
   optional string request_id = 5;
-  optional string error_code = 6; // 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
+  optional string error_code = 6; // 🆕 业务错误码（如 "9010", "ERR_VALIDATION"）
 
   // 🆕 Resume 失败标识 (用于 rcoder 层降级处理)
   bool need_fallback = 7; // true 表示需要降级重试
@@ -131,6 +131,10 @@ message ResolvePermissionRequest {
   bool save_rule = 5;
   string project_id = 6;
   optional string user_id = 7;
+  optional string pod_id = 8;
+  optional string tenant_id = 9;
+  optional string space_id = 10;
+  optional string isolation_type = 11;
 }
 
 message ResolvePermissionResponse {

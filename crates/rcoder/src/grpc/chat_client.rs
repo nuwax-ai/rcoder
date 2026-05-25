@@ -176,6 +176,10 @@ pub async fn grpc_resolve_permission_with_pool(
         save_rule: input.save_rule,
         project_id: input.project_id.unwrap_or_default(),
         user_id: input.user_id,
+        pod_id: input.pod_id,
+        tenant_id: input.tenant_id,
+        space_id: input.space_id,
+        isolation_type: input.isolation_type,
     };
 
     let locale = super::current_grpc_locale();

@@ -50,7 +50,7 @@ pub struct ChatResponse {
     pub error: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "5")]
     pub request_id: ::core::option::Option<::prost::alloc::string::String>,
-    /// 🆕 业务错误码（如 "9010", "VALIDATION_ERROR"）
+    /// 🆕 业务错误码（如 "9010", "ERR_VALIDATION"）
     #[prost(string, optional, tag = "6")]
     pub error_code: ::core::option::Option<::prost::alloc::string::String>,
     /// 🆕 Resume 失败标识 (用于 rcoder 层降级处理)
@@ -129,6 +129,14 @@ pub struct ResolvePermissionRequest {
     pub project_id: ::prost::alloc::string::String,
     #[prost(string, optional, tag = "7")]
     pub user_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "8")]
+    pub pod_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "9")]
+    pub tenant_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "10")]
+    pub space_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "11")]
+    pub isolation_type: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResolvePermissionResponse {

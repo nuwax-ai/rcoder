@@ -22,7 +22,7 @@ pub const ERR_STOP_FAILED: &str = "STOP001";
 // ========== 现有错误码（字符串格式，保持不变）==========
 
 /// 参数验证失败
-pub const ERR_VALIDATION: &str = "VALIDATION_ERROR";
+pub const ERR_VALIDATION: &str = "ERR_VALIDATION";
 
 /// 参数缺失或无效
 pub const ERR_INVALID_PARAMS: &str = "INVALID_PARAMS";
@@ -31,7 +31,7 @@ pub const ERR_INVALID_PARAMS: &str = "INVALID_PARAMS";
 pub const ERR_INVALID_RESOURCE_LIMITS: &str = "INVALID_RESOURCE_LIMITS";
 
 /// 容器操作失败
-pub const ERR_CONTAINER_ERROR: &str = "CONTAINER_ERROR";
+pub const ERR_CONTAINER_ERROR: &str = "ERR_CONTAINER_ERROR";
 
 /// 工作目录错误
 pub const ERR_WORKSPACE_ERROR: &str = "WORKSPACE_ERROR";
@@ -60,7 +60,7 @@ pub const ERR_UNKNOWN: &str = "UNKNOWN_ERROR";
 // ========== 新增错误码（仅用于未来新功能）==========
 
 /// 会话不存在或已完成
-pub const ERR_SESSION_NOT_FOUND: &str = "SESSION_NOT_FOUND";
+pub const ERR_SESSION_NOT_FOUND: &str = "ERR_SESSION_NOT_FOUND";
 
 /// Agent 不存在或已停止
 pub const ERR_AGENT_NOT_FOUND: &str = "AGENT_NOT_FOUND";
@@ -87,13 +87,13 @@ pub const ERR_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
 pub const ERR_API_KEY_AUTH_FAILED: &str = "4010";
 
 /// Permission request not found or already resolved
-pub const ERR_PERMISSION_NOT_FOUND: &str = "PERMISSION_NOT_FOUND";
+pub const ERR_PERMISSION_NOT_FOUND: &str = "ERR_PERMISSION_NOT_FOUND";
 
 /// Permission resolve operation failed
-pub const ERR_PERMISSION_RESOLVE_FAILED: &str = "PERMISSION_RESOLVE_FAILED";
+pub const ERR_PERMISSION_RESOLVE_FAILED: &str = "ERR_PERMISSION_RESOLVE_FAILED";
 
 /// Permission request expired before user approval
-pub const ERR_PERMISSION_EXPIRED: &str = "PERMISSION_EXPIRED";
+pub const ERR_PERMISSION_EXPIRED: &str = "ERR_PERMISSION_EXPIRED";
 
 /// 获取错误码对应的翻译 key
 fn get_error_i18n_key(code: &str) -> &'static str {
