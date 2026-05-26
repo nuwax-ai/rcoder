@@ -148,6 +148,31 @@ make update-image-tag
 - **内部网络通信**: 容器间通过 Docker 内部网络直接通信，无需端口映射
 - **路径自动解析**: 自动检测容器内路径到宿主机路径的映射
 
+### K8s Pod/PVC 生命周期管理
+
+K8s 模式下，Pod 和 PVC 的停止流程需要严格顺序，否则会导致 Terminating 卡死：
+
+```
+stop_container_by_identifier()
+  ├─ Step 1: pods().delete()       // 发送删除请求（graceful, 60s grace period）
+  ├─ Step 2: wait_for_pod_terminated()  // 轮询等待 Pod 消失（404），超时 90s 后 force-delete
+  ├─ Step 3: wait_for_pvc_removable()   // 等待 pvc-protection finalizer 移除（30s）
+  └─ Step 4: delete_workspace_pvc()     // 安全删除 PVC
+```
+
+**历史问题**: 早期版本在 `pods().delete()` 后立即调用 `delete_workspace_pvc()`，此时 Pod 还在运行、JuiceFS FUSE 卷仍被挂载，导致 PVC 的 `pvc-protection` finalizer 无法移除 → Pod 和 PVC 双双卡死在 Terminating。
+
+**关键文件**：
+- `crates/docker_manager/src/runtime/kubernetes_runtime.rs` - 核心：`stop_container_by_identifier()`
+- `crates/docker_manager/src/runtime/k8s_pod.rs` - Pod 生命周期：`K8sPodOps` trait（wait_for_pod_ready, wait_for_pod_terminated）
+- `crates/docker_manager/src/runtime/k8s_pvc.rs` - PVC 生命周期：`K8sPvcOps` trait（ensure_workspace_pvc, wait_for_pvc_removable, delete_workspace_pvc）
+- `crates/agent_runner/src/shutdown.rs` - 进程优雅关闭：`terminate_children()`（SIGTERM → 3s → SIGKILL）
+
+**Pod 停止时的三道防线**：
+1. **preStop lifecycle hook**: `sync && sleep 2`，在 SIGTERM 前 flush FUSE 写入 buffer
+2. **agent_runner shutdown handler**: 构建进程树，递归收集所有后代 + 孤儿进程（ppid=1），叶子优先 SIGTERM → 等待 3s → SIGKILL
+3. **wait_for_pod_terminated**: 等待 Pod 从 API Server 消失（404），超时后 `gracePeriodSeconds=0` 强制删除
+
 ### 容器工作空间路径
 | 隔离类型 | RCoder 路径 | Computer 路径 |
 |---------|------------|--------------|

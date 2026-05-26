@@ -3,11 +3,7 @@ use clap::Parser;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
-use tracing::error;
-use tracing::info;
-#[cfg(any(feature = "pyroscope", not(feature = "proxy")))]
-use tracing::warn;
+use tracing::{error, info, warn};
 
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
@@ -31,6 +27,7 @@ mod otel_tracing;
 
 mod router;
 mod service;
+mod shutdown;
 mod utils;
 
 // HTTP 服务器模块 (仅在 http-server feature 启用时)
@@ -44,198 +41,7 @@ use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 use router::AppState;
 use service::AgentSessionService;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::panic;
-use std::path::PathBuf;
-#[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
-
-/// 🔥 设置自定义 Panic Hook
-///
-/// 当 agent_runner panic 时，将完整的 panic 信息（包括 backtrace）写入日志文件
-/// 这样即使容器被销毁，也能通过挂载的日志目录找到崩溃原因
-fn set_panic_hook() {
-    let default_hook = panic::take_hook();
-
-    panic::set_hook(Box::new(move |panic_info| {
-        // 🔥 立即写入日志文件（不依赖 tracing，确保在 panic 时也能写入）
-        if let Err(e) = write_panic_to_file(panic_info) {
-            // 如果文件写入失败，尝试输出到 stderr
-            eprintln!("❌ [PANIC] Failed to write panic log file: {}", e);
-        }
-
-        // 🔥 同时输出到 stderr（Docker 会捕获到容器日志）
-        eprintln!("═══════════════════════════════════════════════════════════");
-        eprintln!("❌ [PANIC] agent_runner encountered a fatal error!");
-        eprintln!("═══════════════════════════════════════════════════════════");
-        if let Some(location) = panic_info.location() {
-            eprintln!(
-                "panic.location: {}:{}:{}",
-                location.file(),
-                location.line(),
-                location.column()
-            );
-        }
-        eprintln!("panic.payload: {}", panic_info);
-        eprintln!("═══════════════════════════════════════════════════════════");
-
-        // 调用默认 hook（会终止进程）
-        default_hook(panic_info);
-    }));
-}
-
-/// 将 panic 信息写入日志文件
-fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()> {
-    // 🔥 日志文件路径：/app/container-logs/agent_runner_panic.log（使用已有的挂载目录）
-    let log_path = PathBuf::from("/app/container-logs/agent_runner_panic.log");
-
-    // 确保目录存在
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // 打开文件（追加模式）
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-
-    // 获取当前时间
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-
-    // 写入 panic 信息
-    writeln!(
-        file,
-        "═══════════════════════════════════════════════════════════"
-    )?;
-    writeln!(file, "❌ [PANIC] agent_runner encountered a fatal error!")?;
-    writeln!(file, "time: {}", now)?;
-    writeln!(
-        file,
-        "═══════════════════════════════════════════════════════════"
-    )?;
-    if let Some(location) = panic_info.location() {
-        writeln!(
-            file,
-            "panic.location: {}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()
-        )?;
-    }
-    writeln!(file, "panic.payload: {}", panic_info)?;
-
-    // 写入 backtrace（受 RUST_BACKTRACE 环境变量控制）
-    let backtrace = std::backtrace::Backtrace::capture();
-    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-        writeln!(file, "Backtrace:\n{}", backtrace)?;
-    }
-
-    writeln!(
-        file,
-        "═══════════════════════════════════════════════════════════\n"
-    )?;
-
-    // 强制刷新到磁盘
-    file.flush()?;
-
-    eprintln!("✅ Panic info written to: {}", log_path.display());
-
-    Ok(())
-}
-
-/// 🔥 设置优雅关闭信号处理器
-///
-/// 监听系统信号，实现优雅关闭：
-/// - Unix: SIGTERM (Docker stop) + SIGINT (Ctrl+C)
-/// - Windows: Ctrl+C
-fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
-    #[cfg(unix)]
-    {
-        tokio::spawn(async move {
-            // 监听 SIGTERM（Docker stop）
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("❌ [SIGNAL] Failed to register SIGTERM handler: {}", e);
-                    return;
-                }
-            };
-
-            // 监听 SIGINT（Ctrl+C）
-            let mut sigint = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("❌ [SIGNAL] Failed to register SIGINT handler: {}", e);
-                    return;
-                }
-            };
-
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    eprintln!("📨 [SIGNAL] Received SIGTERM (Docker stop), starting graceful shutdown...");
-                    write_shutdown_log("SIGTERM");
-                }
-                _ = sigint.recv() => {
-                    eprintln!("📨 [SIGNAL] Received SIGINT (Ctrl+C), starting graceful shutdown...");
-                    write_shutdown_log("SIGINT");
-                }
-            }
-
-            eprintln!("🧹 [SIGNAL] Cleaning up resources...");
-            eprintln!("✅ [SIGNAL] Graceful shutdown completed, exiting");
-            std::process::exit(0);
-        })
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::spawn(async move {
-            // Windows: 仅监听 Ctrl+C
-            if let Ok(()) = tokio::signal::ctrl_c().await {
-                eprintln!("📨 [SIGNAL] Received Ctrl+C, starting graceful shutdown...");
-                write_shutdown_log("Ctrl+C");
-            }
-
-            eprintln!("🧹 [SIGNAL] Cleaning up resources...");
-            eprintln!("✅ [SIGNAL] Graceful shutdown completed, exiting");
-            std::process::exit(0);
-        })
-    }
-}
-
-/// 将关闭事件写入日志文件
-fn write_shutdown_log(signal: &str) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let log_path = PathBuf::from("/app/container-logs/agent_runner_shutdown.log");
-
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-        let _ = writeln!(
-            file,
-            "═══════════════════════════════════════════════════════════"
-        );
-        let _ = writeln!(
-            file,
-            "📨 [SHUTDOWN] agent_runner received a shutdown signal"
-        );
-        let _ = writeln!(file, "signal: {}", signal);
-        let _ = writeln!(file, "time: {}", now);
-        let _ = writeln!(
-            file,
-            "═══════════════════════════════════════════════════════════\n"
-        );
-        let _ = file.flush();
-        eprintln!("✅ Shutdown info written to: {}", log_path.display());
-    }
-}
+use shutdown::{set_panic_hook, setup_shutdown_handler};
 
 fn create_model_env_resolver(
     config: &config::AppConfig,
