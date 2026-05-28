@@ -374,6 +374,7 @@ where
             last_activity: now,
             created_at: now,
             stop_handle: lifecycle_handle,
+            agent_binary_snapshot: None,
         };
 
         // 返回 agent_info（不插入 registry，由调用方处理）
