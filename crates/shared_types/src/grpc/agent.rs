@@ -61,6 +61,11 @@ pub struct ChatResponse {
     /// 降级原因：如 "session_not_found"
     #[prost(string, optional, tag = "8")]
     pub fallback_reason: ::core::option::Option<::prost::alloc::string::String>,
+    /// 🆕 Auto-reload 标识（DevComputer 调试模式下 agent 二进制变化时触发）
+    ///
+    /// true 表示本次请求触发了 agent 热重载
+    #[prost(bool, tag = "9")]
+    pub reloaded: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProgressRequest {
@@ -355,6 +360,9 @@ pub struct ChatAgentConfig {
         ::prost::alloc::string::String,
         ChatContextServerConfig,
     >,
+    /// 🆕 Auto-reload 配置（可选，DevComputer 调试模式下启用）
+    #[prost(message, optional, tag = "3")]
+    pub auto_reload: ::core::option::Option<AutoReloadConfig>,
 }
 /// 单个 Agent 服务器配置
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -417,6 +425,25 @@ pub struct ChatContextServerConfig {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+}
+/// 🆕 Auto-reload 热重载配置（DevComputer 调试模式）
+///
+/// 检测 agent 二进制文件变化并自动触发重载。
+/// stability check 防止加载编译中的不完整二进制。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AutoReloadConfig {
+    /// 是否启用 auto-reload（默认 true）
+    #[prost(bool, tag = "1")]
+    pub enabled: bool,
+    /// 稳定性检查间隔（毫秒，默认 500）
+    #[prost(uint64, tag = "2")]
+    pub stability_check_ms: u64,
+    /// 连续稳定检查次数（默认 3）
+    #[prost(uint32, tag = "3")]
+    pub stability_retries: u32,
+    /// 强制重载（跳过稳定性检查）
+    #[prost(bool, tag = "4")]
+    pub force: bool,
 }
 /// 容器状态查询请求
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

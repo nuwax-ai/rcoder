@@ -23,8 +23,8 @@ pub use i18n_extractors::I18nJsonOrQuery;
 // Chat Agent 配置模块
 mod chat_agent_config;
 pub use chat_agent_config::{
-    AgentMode, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
-    ModelEnvBindingSource,
+    AgentMode, AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
+    ModelEnvBinding, ModelEnvBindingSource,
 };
 
 // API Key 验证器模块
@@ -69,6 +69,7 @@ pub use grpc_wrapper::MaskedModelConfig;
 
 pub use model::{
     AcpRequestPermission,
+    AgentBinarySnapshot,
     AgentLifecycle,
     AgentLifecycleGuard,
     AgentSessionUpdate,

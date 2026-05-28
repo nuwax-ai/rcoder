@@ -71,6 +71,9 @@ message ChatResponse {
   // 🆕 Resume 失败标识 (用于 rcoder 层降级处理)
   bool need_fallback = 7; // true 表示需要降级重试
   optional string fallback_reason = 8; // 降级原因：如 "session_not_found"
+
+  // 🆕 Auto-reload 标识（DevComputer 调试模式下 agent 二进制变化时触发）
+  bool reloaded = 9; // true 表示本次请求触发了 agent 热重载
 }
 
 // === Progress Streaming ===
@@ -279,6 +282,8 @@ message ChatAgentConfig {
   optional ChatAgentServerConfig agent_server = 1;
   // MCP 服务器配置（多个）
   map<string, ChatContextServerConfig> context_servers = 2;
+  // 🆕 Auto-reload 配置（可选，DevComputer 调试模式下启用）
+  optional AutoReloadConfig auto_reload = 3;
 }
 
 // 单个 Agent 服务器配置
@@ -326,6 +331,21 @@ message ChatContextServerConfig {
   repeated string args = 4;
   // 环境变量
   map<string, string> env = 5;
+}
+
+// 🆕 Auto-reload 热重载配置（DevComputer 调试模式）
+//
+// 检测 agent 二进制文件变化并自动触发重载。
+// stability check 防止加载编译中的不完整二进制。
+message AutoReloadConfig {
+  // 是否启用 auto-reload（默认 true）
+  bool enabled = 1;
+  // 稳定性检查间隔（毫秒，默认 500）
+  uint64 stability_check_ms = 2;
+  // 连续稳定检查次数（默认 3）
+  uint32 stability_retries = 3;
+  // 强制重载（跳过稳定性检查）
+  bool force = 4;
 }
 
 // === Get Container Status ===

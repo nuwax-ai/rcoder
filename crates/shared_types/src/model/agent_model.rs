@@ -1,6 +1,7 @@
 //! Agent 相关的核心结构体 - rcoder 和 agent_runner 共用
 
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -149,6 +150,48 @@ pub enum AgentStatus {
     Terminating,
 }
 
+/// Agent 二进制文件快照
+///
+/// 记录 Agent 可执行文件的路径和修改时间，用于检测文件是否发生变化。
+/// Auto-Reload 机制通过比较新旧快照来决定是否重启 Agent。
+#[derive(Debug, Clone)]
+pub struct AgentBinarySnapshot {
+    /// 二进制文件路径
+    pub path: PathBuf,
+    /// 文件修改时间（Unix 时间戳，秒）
+    pub modified_secs: i64,
+    /// 文件大小（字节）
+    pub size_bytes: u64,
+}
+
+impl AgentBinarySnapshot {
+    /// 从文件路径创建快照
+    ///
+    /// 读取文件的 metadata 获取 mtime 和 size。
+    /// 如果文件不存在或无法读取，返回 None。
+    pub fn from_path(path: &std::path::Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata.modified().ok()?;
+        let modified_secs = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+
+        Some(Self {
+            path: path.to_path_buf(),
+            modified_secs,
+            size_bytes: metadata.len(),
+        })
+    }
+
+    /// 检查两个快照是否相同（文件未变化）
+    pub fn is_same_as(&self, other: &AgentBinarySnapshot) -> bool {
+        self.path == other.path
+            && self.modified_secs == other.modified_secs
+            && self.size_bytes == other.size_bytes
+    }
+}
+
 /// 项目id与 Agent 服务池，一个项目对应一个 Agent 服务
 ///
 /// Clone trait 是必需的，因为 DashMap::insert() 要求值类型实现 Clone
@@ -174,6 +217,8 @@ pub struct ProjectAndAgentInfo {
     pub created_at: DateTime<Utc>,
     /// Agent生命周期管理句柄
     pub stop_handle: Option<Arc<dyn AgentLifecycle>>,
+    /// Agent 二进制文件快照（用于 Auto-Reload 检测）
+    pub agent_binary_snapshot: Option<AgentBinarySnapshot>,
 }
 
 // ============================================================================

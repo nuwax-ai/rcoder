@@ -304,6 +304,7 @@ mod tests {
             agent_server: None,
             context_servers,
             resource_limits: None,
+            auto_reload: None,
         };
 
         let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
@@ -341,6 +342,7 @@ mod tests {
             }),
             context_servers: HashMap::new(),
             resource_limits: None,
+            auto_reload: None,
         };
 
         let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
@@ -376,6 +378,7 @@ mod tests {
             }),
             context_servers: HashMap::new(),
             resource_limits: None,
+            auto_reload: None,
         };
 
         let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));

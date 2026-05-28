@@ -69,6 +69,85 @@ pub struct ChatAgentConfig {
     /// 支持动态设置内存、CPU、Swap、磁盘和进程数等资源限制。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ServiceResourceLimits>,
+
+    /// 自动重载配置（可选）
+    ///
+    /// 启用后，当检测到 Agent 二进制文件发生变化时，自动停止旧进程并启动新进程。
+    /// 主要用于 DevComputer 调试场景，实现热重载开发体验。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reload: Option<AutoReloadConfig>,
+}
+
+/// 自动重载配置
+///
+/// 控制 Agent 二进制文件变化检测和自动重启行为。
+/// 主要用于 DevComputer 调试场景，开发者编译新 agent 后无需手动重启。
+///
+/// # Stability Check
+///
+/// 为避免加载尚未写完的二进制（例如编译中途），检测逻辑会在
+/// `stability_check_ms` 内多次检查文件 mtime，只有当 mtime 不再变化
+/// 时才认为新二进制已就绪。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AutoReloadConfig {
+    /// 是否启用自动重载
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// 稳定性检查间隔（毫秒）
+    ///
+    /// 检测到 mtime 变化后，等待此时间再次检查，确认文件不再被写入。
+    /// 默认 500ms，高速编译场景可适当增大。
+    #[serde(default = "default_stability_check_ms")]
+    pub stability_check_ms: u64,
+
+    /// 稳定性检查重试次数
+    ///
+    /// 在 stability_check_ms 间隔内连续检测到 mtime 不变才算通过。
+    /// 默认 3 次。
+    #[serde(default = "default_stability_retries")]
+    pub stability_retries: u32,
+
+    /// 强制重载（忽略 stability check）
+    ///
+    /// 设为 true 时跳过稳定性检查，直接重载。
+    /// 仅在确定二进制已完整写入时使用。
+    #[serde(default)]
+    pub force: bool,
+}
+
+impl Default for AutoReloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            stability_check_ms: default_stability_check_ms(),
+            stability_retries: default_stability_retries(),
+            force: false,
+        }
+    }
+}
+
+impl AutoReloadConfig {
+    /// 创建一个默认启用的配置
+    pub fn default_enabled() -> Self {
+        Self::default()
+    }
+
+    /// 创建一个禁用的配置
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+}
+
+fn default_stability_check_ms() -> u64 {
+    500
+}
+
+fn default_stability_retries() -> u32 {
+    3
 }
 
 /// 单个 Agent 服务器配置
@@ -230,6 +309,7 @@ mod tests {
             }),
             context_servers: HashMap::new(),
             resource_limits: None,
+            auto_reload: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("test-agent"));
@@ -345,6 +425,7 @@ mod tests {
             agent_server: None,
             context_servers,
             resource_limits: None,
+            auto_reload: None,
         };
         let enabled = config.get_enabled_context_servers();
         assert_eq!(enabled.len(), 1);
