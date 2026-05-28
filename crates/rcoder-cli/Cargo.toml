@@ -1,0 +1,50 @@
+[package]
+name = "rcoder-cli"
+version = "0.1.0"
+edition = "2024"
+authors = ["soddy <soddygo@qq.com>"]
+license = "MIT OR Apache-2.0"
+description = "CLI tool for testing ACP agents locally"
+publish = false
+
+[[bin]]
+name = "rcoder-cli"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+agent_abstraction = { path = "../agent_abstraction" }
+shared_types = { path = "../shared_types" }
+
+# ACP Protocol SDK
+agent-client-protocol = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["signal"] }
+async-trait = { workspace = true }
+
+# CLI argument parsing
+clap = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Concurrent collections (SimpleSessionRegistry — required by SessionRegistry trait's entry() API)
+dashmap = { workspace = true }
+
+# TUI
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+pulldown-cmark = { workspace = true }
+unicode-width = { workspace = true }
+futures = { workspace = true }
+
+# Serialization (for debug output)
+serde_json = { workspace = true }
