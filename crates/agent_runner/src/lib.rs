@@ -3,6 +3,7 @@
 //! 提供 AI 代理运行时和 ACP 协议集成
 
 pub mod api_key_manager;
+pub mod auto_reload;
 mod config;
 pub mod grpc;
 mod handler;

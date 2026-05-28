@@ -22,6 +22,7 @@ use shared_types::{
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use crate::auto_reload;
 use crate::service::{
     AGENT_REGISTRY, AgentRequest, AgentSessionService, PendingGuard, SESSION_CACHE,
 };
@@ -80,6 +81,8 @@ pub struct ChatHandlerOutput {
     pub need_fallback: bool,
     /// 降级原因（可选）
     pub fallback_reason: Option<String>,
+    /// 是否触发了 agent 二进制热重载
+    pub reloaded: bool,
 }
 
 impl ChatHandlerOutput {
@@ -99,6 +102,7 @@ impl ChatHandlerOutput {
             request_id: None,
             need_fallback: false,
             fallback_reason: None,
+            reloaded: false,
         }
     }
 
@@ -113,6 +117,7 @@ impl ChatHandlerOutput {
             request_id: None,
             need_fallback: false,
             fallback_reason: None,
+            reloaded: false,
         }
     }
 }
@@ -378,6 +383,94 @@ pub async fn handle_chat_core(
         }
     }
 
+    // ========== 步骤 4.5: Auto-Reload 检测 ==========
+    // 检查 agent 二进制是否发生变化（DevComputer 调试模式）。
+    // 如果检测到变化，停止旧 session 并让后续流程创建新 session。
+    let mut was_reloaded = false;
+
+    if let Some(agent_config) = &input.agent_config_override
+        && let Some(auto_reload_config) = &agent_config.auto_reload
+        && auto_reload_config.enabled
+        && let Some(agent_server) = &agent_config.agent_server
+        && let Some(command) = agent_server.command.as_deref()
+    {
+        // Re-lookup from registry (original binding may have been consumed in Step 2)
+        let agent_info_for_reload = AGENT_REGISTRY.get_agent_info(&project_id);
+
+        if let Some(agent_info) = agent_info_for_reload {
+            // Extract needed data, then IMMEDIATELY drop Ref before .await
+            let old_snapshot = agent_info.agent_binary_snapshot.clone();
+            let stop_handle = agent_info.stop_handle.clone();
+            let old_session_id = agent_info.session_id.to_string();
+            drop(agent_info); // Release DashMap read lock BEFORE .await
+
+            info!(
+                "[ChatHandler] Checking auto_reload: command={}, project_id={}",
+                command, project_id
+            );
+
+            if let Some(new_snapshot) = auto_reload::check_and_wait_for_reload(
+                command,
+                &input.project_dir,
+                &old_snapshot,
+                auto_reload_config,
+            )
+            .await
+            {
+                info!(
+                    "[ChatHandler] Auto-reload triggered: project_id={}, \
+                     new_mtime={}, new_size={}",
+                    project_id, new_snapshot.modified_secs, new_snapshot.size_bytes
+                );
+
+                // 1. Stop old agent subprocess
+                if let Some(handle) = &stop_handle
+                    && let Err(e) = handle.graceful_stop().await
+                {
+                    warn!(
+                        "[ChatHandler] graceful_stop failed during reload: {}, forcing cancel",
+                        e
+                    );
+                    handle.cancel(); // CancellationToken fallback — infallible, no process signal dependency
+                }
+
+                // 2. Remove from AGENT_REGISTRY
+                AGENT_REGISTRY.remove_by_project(&project_id);
+
+                // 3. Notify SSE stream + clean SESSION_CACHE
+                if !old_session_id.is_empty() {
+                    use crate::service::push_session_update_with_project;
+                    use agent_client_protocol::schema::StopReason;
+                    use shared_types::{SessionNotify, SessionPromptEnd};
+
+                    let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                        session_id: old_session_id.clone(),
+                        stop_reason: StopReason::EndTurn,
+                        error_message: Some("Agent binary changed, reloading".into()),
+                        request_id: None,
+                    });
+                    let _ =
+                        push_session_update_with_project(&project_id, &old_session_id, notify)
+                            .await;
+
+                    if let Some(sd_ref) = SESSION_CACHE.get(&old_session_id) {
+                        let sd = sd_ref.clone();
+                        drop(sd_ref);
+                        sd.close_current_connection().await;
+                    }
+                    SESSION_CACHE.remove(&old_session_id);
+                }
+
+                was_reloaded = true;
+                info!(
+                    "[ChatHandler] Auto-reload complete, will create new session: \
+                     project_id={}",
+                    project_id
+                );
+            }
+        }
+    }
+
     // ========== 步骤5: 获取项目工作目录 ==========
     let project_dir = input.project_dir.clone();
     info!(
@@ -403,6 +496,9 @@ pub async fn handle_chat_core(
     }
 
     // ========== 步骤6: 构建 ChatPrompt 和 PromptMessage ==========
+    // Clone agent_config before it's consumed by the builder (needed for snapshot storage later)
+    let agent_config_for_snapshot = input.agent_config_override.clone();
+
     let chat_prompt = match ChatPromptBuilder::default()
         .project_id(project_id.clone())
         .project_path(project_dir)
@@ -509,16 +605,40 @@ pub async fn handle_chat_core(
                 request_id: Some(request_id),
                 need_fallback: false,
                 fallback_reason: None,
+                reloaded: was_reloaded,
             };
 
             info!(
-                "[ChatHandler] Chat completed: success={}, session_id={}",
-                output.success, output.session_id
+                "[ChatHandler] Chat completed: success={}, session_id={}, reloaded={}",
+                output.success, output.session_id, output.reloaded
             );
 
             // 只有请求成功时才提交 PendingGuard 保留 Pending 状态
             // 失败时 PendingGuard 自动 drop 清理，允许下次请求重新创建 Agent
             if output.success {
+                // Store binary snapshot for future auto_reload checks
+                if let Some(agent_config) = agent_config_for_snapshot.as_ref()
+                    && let Some(ar_config) = &agent_config.auto_reload
+                    && ar_config.enabled
+                    && let Some(agent_server) = &agent_config.agent_server
+                    && let Some(cmd) = agent_server.command.as_deref()
+                    && let Some(binary_path) =
+                        auto_reload::resolve_agent_binary(cmd, &input.project_dir)
+                    && let Some(snapshot) = auto_reload::take_snapshot(&binary_path)
+                {
+                    AGENT_REGISTRY.try_update_agent_info(&project_id, |info| {
+                        info.agent_binary_snapshot = Some(snapshot.clone());
+                        true
+                    });
+                    debug!(
+                        "[ChatHandler] Stored agent binary snapshot: \
+                         path={}, mtime={}, size={}",
+                        snapshot.path.display(),
+                        snapshot.modified_secs,
+                        snapshot.size_bytes
+                    );
+                }
+
                 pending_guard.commit_success();
             }
 

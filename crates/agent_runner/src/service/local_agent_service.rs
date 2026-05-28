@@ -156,6 +156,7 @@ impl AgentHttpService for LocalAgentHttpService {
                 request_id: Some(request_id),
                 need_fallback: None,
                 fallback_reason: None,
+                reloaded: if output.reloaded { Some(true) } else { None },
             })
         }
     }

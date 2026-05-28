@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
 mod api_key_manager;
+mod auto_reload;
 mod config;
 #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 mod grpc;

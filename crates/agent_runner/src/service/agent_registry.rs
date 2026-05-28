@@ -383,6 +383,7 @@ impl AgentSessionRegistry {
                     last_activity: Utc::now(),
                     created_at: Utc::now(),
                     stop_handle: None,
+                    agent_binary_snapshot: None,
                 };
 
                 entry.insert(placeholder);
@@ -782,6 +783,36 @@ impl SessionRegistry for AgentSessionRegistry {
     fn entry(&self, project_id: String) -> Entry<'_, String, Self::Entry> {
         self.agent_info_map.entry(project_id)
     }
+
+    fn update_agent_status(&self, project_id: &str, status: shared_types::AgentStatus) {
+        self.try_update_agent_info(project_id, |info| {
+            let old_status = info.status;
+            if old_status != status {
+                info.status = status;
+                info.last_activity = chrono::Utc::now();
+                tracing::debug!(
+                    "🔄 [atomic_status] Project[{}] status: {:?} -> {:?}",
+                    project_id,
+                    old_status,
+                    status
+                );
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn update_last_activity(
+        &self,
+        project_id: &str,
+        activity: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.try_update_agent_info(project_id, |info| {
+            info.last_activity = activity;
+            true
+        });
+    }
 }
 
 impl Default for AgentSessionRegistry {
@@ -814,6 +845,7 @@ mod tests {
             last_activity: Utc::now(),
             created_at: Utc::now(),
             stop_handle: None,
+            agent_binary_snapshot: None,
         }
     }
 

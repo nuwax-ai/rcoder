@@ -59,14 +59,14 @@ impl AgentRequest {
 
 #[derive(Clone)]
 pub struct AgentSessionService {
-    worker: AcpAgentWorker<StateAwareNotifier, AgentSessionRegistry>,
+    worker: AcpAgentWorker<StateAwareNotifier<AgentSessionRegistry>, AgentSessionRegistry>,
 }
 
 impl AgentSessionService {
     pub fn new(model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>) -> Self {
         let session_manager = Arc::new(
-            AcpSessionManager::<StateAwareNotifier, AgentSessionRegistry>::with_dependencies(
-                Arc::new(StateAwareNotifier::new()),
+            AcpSessionManager::<StateAwareNotifier<AgentSessionRegistry>, AgentSessionRegistry>::with_dependencies(
+                Arc::new(StateAwareNotifier::new(AGENT_REGISTRY.clone())),
                 AGENT_REGISTRY.clone(),
                 model_env_resolver,
                 PERMISSION_MANAGER.clone(),
@@ -146,6 +146,7 @@ impl AgentSessionService {
                     last_activity: Utc::now(),
                     created_at: Utc::now(),
                     stop_handle: handles.lifecycle_handle.clone(),
+                    agent_binary_snapshot: None,
                 };
 
                 AGENT_REGISTRY.register(&project_id, &response_session_id, project_and_agent_info);

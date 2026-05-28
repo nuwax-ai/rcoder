@@ -177,6 +177,7 @@ pub async fn handle_computer_chat(
         request_id: Some(request_id),
         need_fallback: None,
         fallback_reason: None,
+        reloaded: if output.reloaded { Some(true) } else { None },
     };
 
     // 10. 根据执行结果返回成功或错误

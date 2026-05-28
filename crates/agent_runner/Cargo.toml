@@ -102,6 +102,7 @@ axum-tracing-opentelemetry = { workspace = true }
 # File system
 tokio-fs = { workspace = true }
 path-clean = { workspace = true }
+which = { workspace = true }
 
 # OpenAPI documentation
 utoipa = { workspace = true }

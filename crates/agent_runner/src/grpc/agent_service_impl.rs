@@ -9,7 +9,8 @@ use std::time::Duration;
 use agent_client_protocol::schema::{CancelNotification, SessionId};
 use shared_types::ModelProviderConfig;
 use shared_types::grpc::{
-    CancelRequest, CancelResponse, CancelResultType, ChatAgentConfig as GrpcChatAgentConfig,
+    AutoReloadConfig as GrpcAutoReloadConfig, CancelRequest, CancelResponse, CancelResultType,
+    ChatAgentConfig as GrpcChatAgentConfig,
     ChatAgentServerConfig as GrpcChatAgentServerConfig,
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, GetContainerStatusRequest, GetContainerStatusResponse,
@@ -21,8 +22,8 @@ use shared_types::grpc::{
     attachment, attachment_source,
 };
 use shared_types::{
-    Attachment, AttachmentSource, AudioAttachment, DocumentAttachment, ImageAttachment,
-    ImageDimensions, TextAttachment,
+    Attachment, AttachmentSource, AudioAttachment, AutoReloadConfig, DocumentAttachment,
+    ImageAttachment, ImageDimensions, TextAttachment,
 };
 use shared_types::{
     ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
@@ -85,7 +86,26 @@ fn convert_agent_config(grpc_config: GrpcChatAgentConfig) -> Result<ChatAgentCon
             .map(|(k, v)| (k, convert_context_server_config(v)))
             .collect(),
         resource_limits: None, // resource_limits not temporarily passed in gRPC messages
+        auto_reload: grpc_config.auto_reload.map(convert_auto_reload_config),
     })
+}
+
+/// Convert gRPC AutoReloadConfig to internal AutoReloadConfig
+fn convert_auto_reload_config(grpc_config: GrpcAutoReloadConfig) -> AutoReloadConfig {
+    AutoReloadConfig {
+        enabled: grpc_config.enabled,
+        stability_check_ms: if grpc_config.stability_check_ms == 0 {
+            500 // default
+        } else {
+            grpc_config.stability_check_ms
+        },
+        stability_retries: if grpc_config.stability_retries == 0 {
+            3 // default
+        } else {
+            grpc_config.stability_retries
+        },
+        force: grpc_config.force,
+    }
 }
 
 /// Convert gRPC ChatAgentServerConfig to internal ChatAgentServerConfig
@@ -410,6 +430,7 @@ impl AgentService for AgentServiceImpl {
             request_id: output.request_id,
             need_fallback: output.need_fallback,
             fallback_reason: output.fallback_reason,
+            reloaded: output.reloaded,
         };
 
         info!("[gRPC] Chat completed: success={}", grpc_response.success);
