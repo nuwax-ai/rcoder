@@ -2167,7 +2167,7 @@ export INPUT_METHOD=fcitx; \
 export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
-export PATH=/usr/local/bin:/opt/cargo/bin:\$PATH"
+export PATH=/home/user/acp-agent:/usr/local/bin:/opt/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
 # 否则执行默认的 agent_runner

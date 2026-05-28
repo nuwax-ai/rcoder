@@ -97,6 +97,7 @@ pub fn grpc_response_to_chat_response(grpc_resp: GrpcChatResponse) -> shared_typ
         request_id: grpc_resp.request_id,
         need_fallback: None,
         fallback_reason: None,
+        reloaded: if grpc_resp.reloaded { Some(true) } else { None },
     }
 }
 

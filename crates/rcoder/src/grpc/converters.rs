@@ -4,7 +4,8 @@
 
 use shared_types::grpc::{
     Attachment as GrpcAttachment, AttachmentSource as GrpcAttachmentSource,
-    AudioAttachment as GrpcAudioAttachment, Base64Data, ChatAgentConfig as GrpcChatAgentConfig,
+    AudioAttachment as GrpcAudioAttachment, AutoReloadConfig as GrpcAutoReloadConfig, Base64Data,
+    ChatAgentConfig as GrpcChatAgentConfig,
     ChatAgentServerConfig as GrpcChatAgentServerConfig,
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, DocumentAttachment as GrpcDocumentAttachment,
@@ -15,8 +16,8 @@ use shared_types::grpc::{
 };
 use shared_types::{Attachment, AttachmentSource, ModelProviderConfig, UnifiedSessionMessage};
 use shared_types::{
-    ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
-    ModelEnvBindingSource,
+    AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
+    ModelEnvBinding, ModelEnvBindingSource,
 };
 
 /// 将内部 ChatRequest 转换为 gRPC ChatRequest
@@ -208,6 +209,17 @@ pub fn to_grpc_chat_agent_config(config: ChatAgentConfig) -> GrpcChatAgentConfig
             .into_iter()
             .map(|(k, v)| (k, to_grpc_chat_context_server_config(v)))
             .collect(),
+        auto_reload: config.auto_reload.map(to_grpc_auto_reload_config),
+    }
+}
+
+/// 将 AutoReloadConfig 转换为 gRPC 格式
+fn to_grpc_auto_reload_config(config: AutoReloadConfig) -> GrpcAutoReloadConfig {
+    GrpcAutoReloadConfig {
+        enabled: config.enabled,
+        stability_check_ms: config.stability_check_ms,
+        stability_retries: config.stability_retries,
+        force: config.force,
     }
 }
 

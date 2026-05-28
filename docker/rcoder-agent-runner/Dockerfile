@@ -13,6 +13,14 @@ FROM ${BASE_IMAGE}
 # 设置工作目录
 WORKDIR /home/user
 
+# 创建自定义 ACP Agent 目录（devcomputer 调试用）
+# 开发者将编译好的可执行文件放在 /home/user/acp-agent/{name}/{name} 下
+# 通过 bind mount 从宿主机 workspace 同步
+RUN mkdir -p /home/user/acp-agent
+
+# 将自定义 ACP Agent 目录加入 PATH（使 which codex-acp 等命令可用）
+ENV PATH="/home/user/acp-agent:$PATH"
+
 # agent-browser 默认配置（独立 Chromium profile，避免与 MCP 锁冲突）
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium \
     AGENT_BROWSER_PROFILE=/home/user/.config/agent-browser/chromium \

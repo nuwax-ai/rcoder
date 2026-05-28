@@ -247,6 +247,34 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/proxy/config", get(handler::proxy_config))
         .with_state(state.clone());
 
+    // DevComputer 调试路由 — 委托给 /computer/* 处理器，共享同一个容器
+    let devcomputer_routes = Router::new()
+        .route(
+            "/devcomputer/chat",
+            post(handler::handle_devcomputer_chat),
+        )
+        .route(
+            "/devcomputer/agent/stop",
+            post(handler::devcomputer_agent_stop),
+        )
+        .route(
+            "/devcomputer/agent/status",
+            post(handler::devcomputer_agent_status),
+        )
+        .route(
+            "/devcomputer/agent/session/cancel",
+            post(handler::devcomputer_agent_session_cancel),
+        )
+        .route(
+            "/devcomputer/notify-resolved",
+            post(handler::devcomputer_notify_resolved),
+        )
+        .route(
+            "/devcomputer/progress/{session_id}",
+            get(handler::devcomputer_agent_progress_notification),
+        )
+        .with_state(state.clone());
+
     // 调试路由（仅用于开发和问题排查，需要 feature flag "debug" 启用）
     #[cfg(feature = "debug")]
     let debug_routes = Router::new()
@@ -265,6 +293,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .merge(health_routes)
         .merge(api_routes)
         .merge(computer_routes)
+        .merge(devcomputer_routes)
         .merge(proxy_api_routes);
 
     // 仅在启用 debug feature 时添加调试路由
