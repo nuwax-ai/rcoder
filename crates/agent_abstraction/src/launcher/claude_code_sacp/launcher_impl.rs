@@ -92,9 +92,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
         info!(
-            "[SACP] 🚀 LAUNCH FUNCTION CALLED: project_id={}, has_agent_server_override={}, service_uuid={:?}",
+            "[SACP] 🚀 LAUNCH FUNCTION CALLED: project_id={}, has_agent_server_override={}, has_model_provider={}, service_uuid={:?}",
             project_id,
             start_config.agent_server_override.is_some(),
+            model_provider.is_some(),
             service_uuid
         );
 
@@ -166,7 +167,25 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 );
                 (cmd, args, env, bound_model_env_keys)
             } else {
-                if !agent_server_override.model_env_bindings.is_empty() {
+                // model_provider 为 None，模板变量无法解析
+                // 检查 env 中是否仍包含未解析的模板占位符
+                let unresolved_keys: Vec<_> = env
+                    .iter()
+                    .filter(|(_, v)| {
+                        v.contains("{MODEL_PROVIDER_API_KEY}")
+                            || v.contains("{MODEL_PROVIDER_BASE_URL}")
+                            || v.contains("{MODEL_PROVIDER_DEFAULT_MODEL}")
+                            || v.contains("{MODEL_PROVIDER_NAME}")
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                if !unresolved_keys.is_empty() {
+                    warn!(
+                        "[SACP] ⚠️ model_provider is None, {} env keys contain unresolved template placeholders: {:?}. Agent may fail due to invalid config.",
+                        unresolved_keys.len(),
+                        unresolved_keys
+                    );
+                } else if !agent_server_override.model_env_bindings.is_empty() {
                     warn!(
                         "[SACP] model_env_bindings configured but model_provider is missing; bindings were not applied"
                     );
@@ -327,6 +346,16 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 启动子进程（使用进程组/Job Object 来管理整个进程树）
         // Unix: ProcessGroup::leader() 创建进程组，确保能够清理所有孙进程
         // Windows: JobObject 管理进程树
+        let full_command_line = format!(
+            "{} {}",
+            command_path,
+            command_args.join(" ")
+        );
+        info!(
+            "[SACP] 🚀 Spawning subprocess: cmd=[{}], cwd={}",
+            full_command_line,
+            project_path.display()
+        );
         let mut cmd_wrap = CommandWrap::with_new(&command_path, |cmd| {
             cmd.args(&command_args)
                 .stdin(Stdio::piped())
@@ -436,8 +465,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             tokio::sync::oneshot::channel::<String>();
         let mut connection_failed_tx = Some(connection_failed_tx);
 
-        // 保存 command_path 用于超时日志
-        let command_path_for_log = command_path.clone();
+        // command_path 信息现在通过 full_command_line 传递
 
         // 🔥 使用标准 tokio::spawn（无需 LocalSet！）
         // 保存 JoinHandle 用于超时时取消子任务
@@ -447,6 +475,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 "[SACP] 🚀 Spawned ACP connection task, project_id={}",
                 spawn_project_id
             );
+            let command_line_clone = full_command_line.clone();
             let params = SacpConnectionParams {
                 project_path: project_path_clone,
                 project_id: project_id_clone.clone(),
@@ -462,6 +491,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 session_id_shared: session_id_shared_clone,
                 connection_failed_tx: connection_failed_tx.take(),
                 child_pid,
+                command_line: command_line_clone,
             };
             let result = run_sacp_connection(transport, params).await;
 
@@ -561,8 +591,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     .map(|s| format!("; stderr: {}", s))
                     .unwrap_or_default();
                 error!(
-                    "[SACP] ⏰ Agent initialization timeout (60s), project_id={}, command={}, child_pid={}, stderr={}",
-                    project_id, command_path_for_log, child_pid, stderr_info
+                    "[SACP] ⏰ Agent initialization timeout (60s), project_id={}, command=[{}], child_pid={}, stderr={}",
+                    project_id, full_command_line, child_pid, stderr_info
                 );
                 // 超时后取消 spawned 任务，避免子进程泄漏
                 connection_task_handle.abort();

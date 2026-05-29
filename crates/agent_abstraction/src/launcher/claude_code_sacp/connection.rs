@@ -42,6 +42,8 @@ pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
     pub(crate) connection_failed_tx: Option<tokio::sync::oneshot::Sender<String>>,
     /// 子进程 PID，用于 waitpid 检测子进程退出
     pub(crate) child_pid: u32,
+    /// 子进程命令行（用于错误诊断）
+    pub(crate) command_line: String,
 }
 
 /// 运行 SACP 连接
@@ -70,6 +72,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         session_id_shared,
         mut connection_failed_tx,
         child_pid,
+        command_line,
     } = params;
 
     // 克隆变量供 handlers 使用
@@ -181,51 +184,62 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             result = cx.send_request(init_request).block_task() => {
                                 Ok(result)
                             }
-                            exit_info = tokio::task::spawn_blocking(move || {
+                            exit_info = tokio::task::spawn_blocking({
+                                let cmd_line = command_line.clone();
+                                move || {
                                 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
                                 use nix::unistd::Pid;
                                 use nix::errno::Errno;
                                 let target_pid = Pid::from_raw(child_pid as i32);
-                                // 使用 WNOHANG 轮询特定子进程 PID
-                                // 避免与 tokio 内部进程 reaper 竞争
+                                // 缩短轮询间隔到 10ms，在 tokio reaper 之前捕获退出码
                                 loop {
                                     match waitpid(target_pid, Some(WaitPidFlag::WNOHANG)) {
                                         Ok(WaitStatus::Exited(pid, code)) => {
-                                            return Some((pid.as_raw(), code));
+                                            return Some((pid.as_raw(), code, None::<String>));
                                         }
                                         Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                                            return Some((pid.as_raw(), signal.as_str().parse::<i32>().unwrap_or(-1)));
+                                            let desc = format!("killed by signal {}", signal.as_str());
+                                            return Some((pid.as_raw(), -1, Some(desc)));
                                         }
                                         Ok(WaitStatus::StillAlive) => {
-                                            // 子进程仍在运行，等待 50ms 后重试
-                                            std::thread::sleep(std::time::Duration::from_millis(50));
+                                            std::thread::sleep(std::time::Duration::from_millis(10));
                                             continue;
                                         }
                                         Err(Errno::ECHILD) => {
-                                            // 子进程已被回收（可能被 tokio reaper 或已退出）
-                                            // 视为进程已退出
-                                            return Some((child_pid as i32, -1));
+                                            let reason = format!(
+                                                "process already reaped. Command: {}", cmd_line
+                                            );
+                                            return Some((child_pid as i32, -1, Some(reason)));
                                         }
-                                        _ => {
-                                            // 其他错误
-                                            return None;
+                                        e => {
+                                            let reason = format!("waitpid error: {:?}. Command: {}", e, cmd_line);
+                                            return Some((child_pid as i32, -1, Some(reason)));
                                         }
                                     }
                                 }
-                            }) => {
+                            }}) => {
                                 match exit_info {
-                                    Ok(Some((pid, code))) => {
-                                        // 子进程退出，立即返回错误
+                                    Ok(Some((pid, code, reason))) => {
+                                        let cmd_info = format!("command=[{}]", command_line);
                                         if code == -1 {
-                                            // ECHILD: 进程已被回收，退出码未知
-                                            Err(anyhow::anyhow!("subprocess exited prematurely: pid={}, exit_code unknown (process already reaped)", pid))
+                                            let detail = reason.as_deref().unwrap_or("exit_code unknown");
+                                            Err(anyhow::anyhow!(
+                                                "subprocess exited prematurely: pid={}, {} -- {}",
+                                                pid, detail, cmd_info
+                                            ))
                                         } else {
-                                            Err(anyhow::anyhow!("subprocess exited prematurely: pid={}, exit_code={}", pid, code))
+                                            let extra = reason.map(|r| format!(" ({})", r)).unwrap_or_default();
+                                            Err(anyhow::anyhow!(
+                                                "subprocess exited prematurely: pid={}, exit_code={}{} -- {}",
+                                                pid, code, extra, cmd_info
+                                            ))
                                         }
                                     }
                                     _ => {
-                                        // waitpid 未返回有效信息
-                                        Err(anyhow::anyhow!("subprocess exit detection failed for pid={}", child_pid))
+                                        Err(anyhow::anyhow!(
+                                            "subprocess exit detection failed for pid={} -- command=[{}]",
+                                            child_pid, command_line
+                                        ))
                                     }
                                 }
                             }
