@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let telemetry = Arc::new(telemetry);
 
     info!("Starting rcoder - AI-powered development platform");
+    info!("📦 rcoder version: {}", env!("CARGO_PKG_VERSION"));
     info!(
         "📋 Log config: keeping log files for {} days",
         config.cleanup_config.log_cleanup.log_retention_days

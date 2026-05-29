@@ -43,6 +43,7 @@ use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 use router::AppState;
 use service::AgentSessionService;
 use shutdown::{set_panic_hook, setup_shutdown_handler};
+use utils::spawn_tool_version_log;
 
 fn create_model_env_resolver(
     config: &config::AppConfig,
@@ -118,6 +119,11 @@ async fn main() -> anyhow::Result<()> {
     let _pyroscope_guard: Option<()> = None;
 
     info!("Starting rcoder - AI-powered development platform");
+    info!("📦 agent-runner version: {}", env!("CARGO_PKG_VERSION"));
+
+    // 非阻塞打印外部工具版本（不阻塞启动流程）
+    spawn_tool_version_log("nuwaxcode", &["nuwaxcode", "-v"]);
+    spawn_tool_version_log("claude-code-acp-ts", &["claude-code-acp-ts", "-v"]);
 
     // 解析命令行参数
     let cli_args = CliArgs::parse();

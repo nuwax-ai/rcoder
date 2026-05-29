@@ -470,12 +470,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 🔥 使用标准 tokio::spawn（无需 LocalSet！）
         // 保存 JoinHandle 用于超时时取消子任务
         let spawn_project_id = project_id.clone();
+        let spawn_command_line = full_command_line.clone();
         let connection_task_handle = tokio::spawn(async move {
             info!(
                 "[SACP] 🚀 Spawned ACP connection task, project_id={}",
                 spawn_project_id
             );
-            let command_line_clone = full_command_line.clone();
+            let command_line_clone = spawn_command_line;
             let params = SacpConnectionParams {
                 project_path: project_path_clone,
                 project_id: project_id_clone.clone(),
