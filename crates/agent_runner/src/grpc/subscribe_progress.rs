@@ -43,22 +43,31 @@ pub async fn subscribe_progress(
         tokio::spawn(async move {
             use dashmap::mapref::entry::Entry;
 
-            let session_data = match SESSION_CACHE.entry(session_id_clone.clone()) {
-                Entry::Occupied(entry) => {
-                    info!(
-                        "📦 [gRPC] SESSION_CACHE already exists, reusing: session_id={}",
-                        session_id_clone
-                    );
-                    entry.get().clone()
-                }
-                Entry::Vacant(entry) => {
-                    info!(
-                        "🆕 [gRPC] SESSION_CACHE does not exist, creating new: session_id={}",
-                        session_id_clone
-                    );
-                    let session_data = crate::service::SessionData::new(1000).await;
-                    entry.insert(session_data.clone());
-                    session_data
+            // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
+            let session_data = if let Some(existing) = SESSION_CACHE.get(&session_id_clone) {
+                info!(
+                    "📦 [gRPC] SESSION_CACHE already exists, reusing: session_id={}",
+                    session_id_clone
+                );
+                existing.clone()
+            } else {
+                let session_data = crate::service::SessionData::new(1000).await;
+                match SESSION_CACHE.entry(session_id_clone.clone()) {
+                    Entry::Occupied(entry) => {
+                        info!(
+                            "📦 [gRPC] SESSION_CACHE already exists, reusing: session_id={}",
+                            session_id_clone
+                        );
+                        entry.get().clone()
+                    }
+                    Entry::Vacant(entry) => {
+                        info!(
+                            "🆕 [gRPC] SESSION_CACHE does not exist, creating new: session_id={}",
+                            session_id_clone
+                        );
+                        entry.insert(session_data.clone());
+                        session_data
+                    }
                 }
             };
 

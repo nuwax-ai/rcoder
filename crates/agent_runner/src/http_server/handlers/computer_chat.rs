@@ -148,23 +148,19 @@ pub async fn handle_computer_chat(
     let output = handle_chat_core(input, &context).await;
 
     // 🔧 关键修复：将 session 写入 SESSION_CACHE（SSE 进度流需要从这里读取）
+    // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
     let session_id_str = output.session_id.clone();
-    match SESSION_CACHE.entry(session_id_str.clone()) {
-        Entry::Occupied(entry) => {
-            info!(
-                "[HTTP] SESSION_CACHE already exists, reusing: session_id={}",
-                session_id_str
-            );
-            entry.get().clone()
-        }
-        Entry::Vacant(entry) => {
-            let data = SessionData::new(1000).await;
-            info!(
-                "[HTTP] SESSION_CACHE created: session_id={}",
-                session_id_str
-            );
-            entry.insert(data.clone());
-            data
+    if let Some(_existing) = SESSION_CACHE.get(&session_id_str) {
+        // 已存在，无需创建
+    } else {
+        let data = SessionData::new(1000).await;
+        match SESSION_CACHE.entry(session_id_str.clone()) {
+            Entry::Occupied(_entry) => {
+                // 其他任务已创建，丢弃我们创建的 data
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(data);
+            }
         }
     };
 

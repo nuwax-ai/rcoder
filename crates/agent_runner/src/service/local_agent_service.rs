@@ -134,10 +134,11 @@ impl AgentHttpService for LocalAgentHttpService {
         let output = handle_chat_core(input, &context).await;
 
         // 8. 将 session 写入 SESSION_CACHE（SSE 进度流需要）
+        // 🛡️ 关键修复：使用 entry API 原子操作，避免 TOCTOU 竞态
         let session_id_str = output.session_id.clone();
-        if SESSION_CACHE.get(&session_id_str).is_none() {
+        if let dashmap::mapref::entry::Entry::Vacant(entry) = SESSION_CACHE.entry(session_id_str) {
             let session_data = SessionData::new(1000).await;
-            SESSION_CACHE.insert(session_id_str, session_data);
+            entry.insert(session_data);
         }
 
         // 9. 构建响应

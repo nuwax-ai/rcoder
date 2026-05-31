@@ -417,48 +417,52 @@ enum SessionCommand {
 pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
     use dashmap::mapref::entry::Entry;
 
-    // 🛡️ 关键修复：使用 entry API 原子性地获取或创建 SessionData
-    // 之前直接用 get()，如果 session 不存在就丢弃消息。
-    // 竞态场景：Agent 开始推送消息 → push_session_update 查找 SESSION_CACHE → 不存在（因为
-    // handle_chat_core 尚未返回，computer_chat.rs 还未创建条目）→ 消息被丢弃
-    let session_data = {
-        match SESSION_CACHE.entry(session_id.to_string()) {
-            Entry::Occupied(mut entry) => {
-                let existing_data = entry.get().clone();
-                // 🔒 Critical fix: 检查 worker 是否 panic，如果是则重新创建
-                if existing_data.has_worker_panicked().await {
-                    warn!(
-                        "🔴 [push_session_update] SessionWorker panicked for session_id={}, recreating...",
-                        session_id
-                    );
-                    let new_data = SessionData::new(1000).await;
-                    entry.insert(new_data.clone());
-                    new_data
-                } else {
-                    existing_data
-                }
-            }
-            Entry::Vacant(entry) => {
-                let data = SessionData::new(1000).await;
-                info!(
-                    "📦 [push_session_update] SESSION_CACHE auto-created: session_id={}",
-                    session_id
-                );
-                entry.insert(data.clone());
-                data
-            }
+    // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
+    // 之前 .await 在 entry() 作用域内执行，持有 shard 写锁跨 yield point，
+    // 导致同 shard 的所有并发操作被阻塞（包括其他 session 的 push/get）。
+    //
+    // 修复策略：
+    // 1. 快速路径：get() + 检查（只持 shard 读锁，不在锁内 await）
+    // 2. 慢速路径：先在 entry() 外部 await 创建 SessionData，再原子插入
+
+    // 快速路径：session 存在 → 检查 worker 状态 → 推送
+    if let Some(existing_data) = SESSION_CACHE.get(session_id) {
+        let existing = existing_data.clone();
+        drop(existing_data); // 立即释放 DashMap 读锁
+
+        if existing.has_worker_panicked().await {
+            // Worker panic：在 entry() 外部创建新 SessionData
+            warn!(
+                "🔴 [push_session_update] SessionWorker panicked for session_id={}, recreating...",
+                session_id
+            );
+            let new_data = SessionData::new(1000).await;
+            // 原子替换
+            SESSION_CACHE.insert(session_id.to_string(), new_data.clone());
+            new_data.push_message(notify.to_unified_message());
+        } else {
+            existing.push_message(notify.to_unified_message());
+        }
+        return Ok(());
+    }
+
+    // 慢速路径：session 不存在 → 在 entry() 外部 await 创建
+    let data = SessionData::new(1000).await;
+    info!(
+        "📦 [push_session_update] SESSION_CACHE auto-created: session_id={}",
+        session_id
+    );
+
+    // 原子插入（如果其他任务先创建了，则使用现有的）
+    let session_data = match SESSION_CACHE.entry(session_id.to_string()) {
+        Entry::Occupied(entry) => entry.get().clone(),
+        Entry::Vacant(entry) => {
+            entry.insert(data.clone());
+            data
         }
     };
 
-    let unified_message = notify.to_unified_message();
-
-    debug!(
-        "📥 Pushing message to cache: session_id={}, message_type={:?}, sub_type={}",
-        session_id, unified_message.message_type, unified_message.sub_type
-    );
-
-    session_data.push_message(unified_message);
-
+    session_data.push_message(notify.to_unified_message());
     Ok(())
 }
 
