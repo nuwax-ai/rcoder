@@ -134,11 +134,20 @@ impl AgentHttpService for LocalAgentHttpService {
         let output = handle_chat_core(input, &context).await;
 
         // 8. 将 session 写入 SESSION_CACHE（SSE 进度流需要）
-        // 🛡️ 关键修复：使用 entry API 原子操作，避免 TOCTOU 竞态
+        // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
         let session_id_str = output.session_id.clone();
-        if let dashmap::mapref::entry::Entry::Vacant(entry) = SESSION_CACHE.entry(session_id_str) {
+        if let Some(_existing) = SESSION_CACHE.get(&session_id_str) {
+            // 已存在，无需创建
+        } else {
             let session_data = SessionData::new(1000).await;
-            entry.insert(session_data);
+            match SESSION_CACHE.entry(session_id_str) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    // 其他任务已创建，丢弃我们创建的 session_data
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(session_data);
+                }
+            }
         }
 
         // 9. 构建响应
