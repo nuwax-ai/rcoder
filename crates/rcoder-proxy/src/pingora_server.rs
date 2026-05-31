@@ -2,7 +2,7 @@
 //!
 //! 提供基于 Pingora 库的完整反向代理服务器启动功能，支持 HTTP/1.1 和 HTTP/2。
 
-use anyhow::Result;
+use crate::ProxyError;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -75,7 +75,7 @@ impl PingoraServerManager {
     /// 接受一个 `shutdown_rx` 用于接收外部关闭信号。
     /// 当 `shutdown_rx` 收到信号（或 sender 被 drop）时，`start()` 返回。
     /// Pingora 服务器线程运行 `run_forever()`，由进程退出时 OS 清理。
-    pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
+    pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<(), ProxyError> {
         info!("starting Pingora proxy server...");
         info!("📡 listening on: 0.0.0.0:{}", self.config.listen_port);
         info!("route: /proxy/{{port}}{{/path}}");
@@ -84,7 +84,8 @@ impl PingoraServerManager {
         let opt = Opt::default();
 
         // 创建 Pingora 服务器
-        let mut my_server = Server::new(Some(opt))?;
+        let mut my_server = Server::new(Some(opt))
+            .map_err(|e| ProxyError::Config(format!("Failed to create Pingora server: {}", e)))?;
         my_server.bootstrap();
 
         // 创建代理服务实例
@@ -220,7 +221,7 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
 /// 注意：此函数启动后会阻塞直到进程退出，因为内部创建的 shutdown 通道
 /// 的 sender 会在函数结束时立即 drop，导致 `start()` 立即返回。
 /// 如需长时间运行，请使用 `PingoraServerManager::new()` + `start(shutdown_rx)` 组合。
-pub async fn start_pingora_proxy(config: ProxyConfig) -> Result<()> {
+pub async fn start_pingora_proxy(config: ProxyConfig) -> Result<(), ProxyError> {
     let (_shutdown_tx, shutdown_rx) = oneshot::channel();
     let mut manager = PingoraServerManager::new(config);
     manager.start(shutdown_rx).await

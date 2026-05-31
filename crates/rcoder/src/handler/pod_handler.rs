@@ -468,12 +468,7 @@ pub async fn pod_count(
     debug!("📊 [POD_COUNT] Getting container count");
 
     // 获取全局 Runtime
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[POD_COUNT] Failed to get runtime: {}", e);
-            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-        })?;
+    let runtime = state.runtime().clone();
 
     // 获取所有容器列表
     let containers = runtime.list_containers().await.map_err(|e| {
@@ -509,7 +504,7 @@ pub async fn pod_count(
     }
 
     let total_count = rcoder_count + computer_count;
-    let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+    let timestamp = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
     let response = PodCountResponse {
         total_count,
@@ -556,12 +551,7 @@ pub async fn pod_list(
     debug!("📋 [POD_LIST] get containers: limit={:?}", params.limit);
 
     // 1. 获取 runtime 容器列表
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[POD_LIST] Failed to get runtime: {}", e);
-            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-        })?;
+    let runtime = state.runtime().clone();
 
     let runtime_containers = runtime.list_containers().await.map_err(|e| {
         error!("[POD_LIST] Failed to list runtime containers: {}", e);
@@ -662,8 +652,8 @@ pub async fn pod_list(
             service_type: service_type.to_string(),
             project_id,
             user_id: final_user_id,
-            created_at: docker_container.created_at.timestamp_millis() as u64,
-            last_activity: duckdb_record.map(|r| r.last_activity.timestamp_millis() as u64),
+            created_at: docker_container.created_at.timestamp_millis().max(0) as u64,
+            last_activity: duckdb_record.map(|r| r.last_activity.timestamp_millis().max(0) as u64),
             image: None,
             internal_port: Some(8086),
             external_port: duckdb_record.map(|r| r.external_port),
@@ -686,7 +676,7 @@ pub async fn pod_list(
         total
     };
 
-    let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+    let timestamp = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
     let response = PodListResponse {
         containers,
@@ -764,6 +754,12 @@ pub async fn pod_ensure(
 
     // === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
     // 使用原子标记（DashMap）避免并发请求互相干扰，无死锁风险
+
+    // 🚀 关键修复：先订阅 broadcast channel，再检查 pod_creating
+    // 避免 subscribe-after-send 竞态：如果在检查 pod_creating 之后才订阅，
+    // 创建者可能已经移除了标记并发送了通知，导致我们错过消息。
+    let mut rx = state.pod_created_tx.subscribe();
+
     if let Some(creating_since) = state.pod_creating.get(&request.user_id) {
         let elapsed = creating_since.elapsed();
         drop(creating_since); // 释放 DashMap ref
@@ -775,35 +771,54 @@ pub async fn pod_ensure(
                 request.user_id, elapsed
             );
 
-            // 轮询等待容器就绪（最多等 30 秒，每秒检查一次）
             let mut waited_container_info = None;
-            for wait_sec in 1..=30 {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-                // 标记已被移除 = 创建完成
-                if !state.pod_creating.contains_key(&request.user_id) {
-                    // 尝试获取容器信息
-                    if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await
-                        && let Ok(Some(info)) = runtime
-                            .get_container_info_by_identifier(
-                                &request.user_id,
-                                &shared_types::ServiceType::ComputerAgentRunner,
-                            )
-                            .await
-                    {
-                        info!(
-                            "✅ [POD_ENSURE] Wait succeeded, container ready (waited {}s): user_id={}, container_id={}",
-                            wait_sec, request.user_id, info.container_id
-                        );
-                        waited_container_info = Some(info);
-                        break;
+            match tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(created_user_id) if created_user_id == request.user_id => {
+                            // 我们等待的容器已创建
+                            break;
+                        }
+                        Ok(_) => continue, // 其他用户的容器，继续等待
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // 通道关闭，退出
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // 消息丢失，检查标记是否已移除
+                            if !state.pod_creating.contains_key(&request.user_id) {
+                                break;
+                            }
+                            continue;
+                        }
                     }
                 }
-
-                if wait_sec % 5 == 0 {
-                    debug!(
-                        "[POD_ENSURE] Still waiting for container creation: user_id={}, {}s",
-                        request.user_id, wait_sec
+            })
+            .await
+            {
+                Ok(_) => {
+                    // 容器创建成功，获取容器信息
+                    if let Ok(Some(info)) = state
+                        .runtime()
+                        .get_container_info_by_identifier(
+                            &request.user_id,
+                            &shared_types::ServiceType::ComputerAgentRunner,
+                        )
+                        .await
+                    {
+                        info!(
+                            "✅ [POD_ENSURE] Wait succeeded, container ready: user_id={}, container_id={}",
+                            request.user_id, info.container_id
+                        );
+                        waited_container_info = Some(info);
+                    }
+                }
+                Err(_) => {
+                    // 超时处理
+                    warn!(
+                        "⚠️ [POD_ENSURE] Wait for container creation timeout (30s): user_id={}",
+                        request.user_id
                     );
                 }
             }
@@ -869,12 +884,7 @@ pub async fn pod_ensure(
     }
 
     // 2. 🔍 实时查询 runtime 检查容器是否存在（不依赖缓存）
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[POD_ENSURE] Failed to get runtime: {}", e);
-            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-        })?;
+    let runtime = state.runtime().clone();
 
     let existing_container = runtime
         .find_container(
@@ -979,6 +989,7 @@ pub async fn pod_ensure(
                 request.isolation_type.as_deref(),
                 request.tenant_id.as_deref(),
                 request.space_id.as_deref(),
+                state.runtime(),
             )
             .await
             {
@@ -1028,6 +1039,8 @@ pub async fn pod_ensure(
             Some(info) => {
                 // 创建成功，清除标记
                 state.pod_creating.remove(&request.user_id);
+                // 🚀 发送容器创建完成通知（唤醒等待方）
+                let _ = state.pod_created_tx.send(request.user_id.clone());
                 (info, true)
             }
             None => {
@@ -1115,11 +1128,17 @@ pub async fn pod_ensure(
                             request.isolation_type.as_deref(),
                             request.tenant_id.as_deref(),
                             request.space_id.as_deref(),
+                            state.runtime(),
                         )
                         .await;
 
                         // 清除创建标记
                         state.pod_creating.remove(&request.user_id);
+
+                        // 🚀 发送容器创建完成通知（唤醒等待方）
+                        if result.is_ok() {
+                            let _ = state.pod_created_tx.send(request.user_id.clone());
+                        }
 
                         match result {
                             Ok(info) => {
@@ -1293,13 +1312,13 @@ pub async fn pod_keepalive(
     // 更新当前项目的 last_activity；共享容器场景下还需更新同容器下其他项目
     let (previous_activity_time, current_activity_time, existed) = {
         if let Some(existing_info) = state.get_project(&request.project_id) {
-            let prev = existing_info.last_activity().timestamp_millis() as u64;
+            let prev = existing_info.last_activity().timestamp_millis().max(0) as u64;
 
             // 获取实际更新的时间
             let updated_time = state.update_activity(&request.project_id);
             let current = updated_time
-                .map(|t| t.timestamp_millis() as u64)
-                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+                .map(|t| t.timestamp_millis().max(0) as u64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().max(0) as u64);
 
             // 更新同容器下其他项目的 last_activity（仅限共享容器场景）
             if let Some(ref pod_id) = request.pod_id {
@@ -1314,7 +1333,7 @@ pub async fn pod_keepalive(
 
             (prev, current, true)
         } else {
-            let now = chrono::Utc::now().timestamp_millis() as u64;
+            let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
             (0u64, now, false)
         }
     };
@@ -1323,7 +1342,7 @@ pub async fn pod_keepalive(
     let (container_info, created) = if !existed {
         // DuckDB 存储中没有记录，检查 Docker 中是否有容器
         let existing_container =
-            ComputerContainerManager::get_container_info(&container_identifier).await?;
+            ComputerContainerManager::get_container_info(&container_identifier, state.runtime()).await?;
 
         match existing_container {
             Some(info) => {
@@ -1358,7 +1377,7 @@ pub async fn pod_keepalive(
         }
     } else {
         // DuckDB 存储中有记录，直接获取容器信息
-        let info = ComputerContainerManager::get_container_info(&container_identifier)
+        let info = ComputerContainerManager::get_container_info(&container_identifier, state.runtime())
             .await?
             .ok_or_else(|| {
                 error!(
@@ -1473,7 +1492,7 @@ pub async fn pod_restart(
     );
 
     // 2. 检查容器是否存在
-    let existing_container = ComputerContainerManager::get_container_info(&request.user_id).await?;
+    let existing_container = ComputerContainerManager::get_container_info(&request.user_id, state.runtime()).await?;
     let was_existing = existing_container.is_some();
 
     // 3. 如果容器存在，先销毁
@@ -1504,12 +1523,7 @@ pub async fn pod_restart(
             }
         }
 
-        let runtime = docker_manager::runtime::RuntimeManager::get()
-            .await
-            .map_err(|e| {
-                error!("[POD_RESTART] Failed to get runtime: {}", e);
-                AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-            })?;
+        let runtime = state.runtime().clone();
 
         // 使用 pod_id 优先的标识符停止容器（与创建时一致）
         let container_identifier = request.pod_id.as_deref().unwrap_or(&request.user_id);
@@ -1611,6 +1625,7 @@ pub async fn pod_restart(
         request.isolation_type.as_deref(),
         request.tenant_id.as_deref(),
         request.space_id.as_deref(),
+        state.runtime(),
     )
     .await?;
 
@@ -1636,11 +1651,21 @@ pub async fn pod_restart(
 
     // 6. 在 DuckDB 存储中记录容器信息
     {
-        let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
-        project_info.set_user_id(Some(request.user_id.clone()));
-        project_info.set_pod_id(request.pod_id.clone());
-        project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
-        project_info.set_container(Some(container_info.clone()));
+        // 🛡️ 关键修复：如果项目已存在，保留现有的 session_id
+        let project_info = if let Some(existing) = state.get_project(&request.project_id) {
+            // 项目已存在，只更新容器信息，保留 session_id 等状态
+            let mut info = (*existing).clone();
+            info.set_container(Some(container_info.clone()));
+            info
+        } else {
+            // 项目不存在，创建新记录
+            let mut info = ProjectAndContainerInfo::new(request.project_id.clone());
+            info.set_user_id(Some(request.user_id.clone()));
+            info.set_pod_id(request.pod_id.clone());
+            info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+            info.set_container(Some(container_info.clone()));
+            info
+        };
         state.insert_project(request.project_id.clone(), Arc::new(project_info));
     }
 
@@ -1777,9 +1802,9 @@ pub struct PodStatusResponse {
     summary = "查询容器状态（是否存活）",
     description = "根据 user_id 或 project_id 查询对应容器是否存活"
 )]
-#[instrument(skip(_state), fields(project_id = ?params.project_id, user_id = ?params.user_id))]
+#[instrument(skip(state), fields(project_id = ?params.project_id, user_id = ?params.user_id))]
 pub async fn pod_status(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<PodStatusQuery>,
 ) -> Result<HttpResult<PodStatusResponse>, AppError> {
     let locale = shared_types::current_request_locale();
@@ -1828,15 +1853,10 @@ pub async fn pod_status(
         params.project_id, params.user_id, params.pod_id, container_identifier
     );
 
-    let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+    let timestamp = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
     // 2. 获取 Runtime
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[POD_STATUS] Failed to get runtime: {}", e);
-            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-        })?;
+    let runtime = state.runtime().clone();
 
     // 3. 查询容器状态
     // 优先级：pod_id > user_id > project_id
@@ -1854,7 +1874,13 @@ pub async fn pod_status(
             .find_container(project_id, &shared_types::ServiceType::RCoder)
             .await
     } else {
-        unreachable!()
+        // 防御性编程：理论上不会到达这里（已在上方验证至少有一个标识符）
+        // 但为了安全起见，返回验证错误而不是 panic
+        error!("[POD_STATUS] Unexpected: all identifiers are None despite validation");
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+        ));
     };
 
     // 4. 通过 runtime 查询容器状态
@@ -2094,12 +2120,7 @@ pub async fn pod_vnc_status(
     );
 
     // 2. 获取 Runtime
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[POD_VNC_STATUS] Failed to get runtime: {}", e);
-            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-        })?;
+    let runtime = state.runtime().clone();
 
     // 3. 定位容器
     // 优先级：pod_id > user_id > project_id

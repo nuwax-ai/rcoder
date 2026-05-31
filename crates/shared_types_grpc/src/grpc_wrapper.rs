@@ -12,13 +12,16 @@ impl<'a> fmt::Debug for MaskedModelConfig<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let config = self.0;
 
-        // 脱敏 API Key：只显示前 4 位和后 4 位
+        // 脱敏 API Key：只显示前 4 位和后 4 位（使用 char-based 切片避免 UTF-8 边界 panic）
         let masked_api_key = config
             .api_key
             .as_ref()
             .map(|key: &String| {
-                if key.len() > 8 {
-                    format!("{}***{}", &key[..4], &key[key.len() - 4..])
+                let chars: Vec<char> = key.chars().collect();
+                if chars.len() > 8 {
+                    let prefix: String = chars[..4].iter().collect();
+                    let suffix: String = chars[chars.len() - 4..].iter().collect();
+                    format!("{}***{}", prefix, suffix)
                 } else {
                     "***".to_string()
                 }

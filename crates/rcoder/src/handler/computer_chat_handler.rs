@@ -213,6 +213,12 @@ pub async fn handle_computer_chat(
     // 4. === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
     // 使用原子标记（DashMap）避免并发请求互相干扰，无死锁风险
     let mut waited_container_info: Option<ContainerBasicInfo> = None;
+
+    // 🚀 关键修复：先订阅 broadcast channel，再检查 pod_creating
+    // 避免 subscribe-after-send 竞态：如果在检查 pod_creating 之后才订阅，
+    // 创建者可能已经移除了标记并发送了通知，导致我们错过消息。
+    let mut rx = state.pod_created_tx.subscribe();
+
     if let Some(creating_since) = state.pod_creating.get(&user_id) {
         let elapsed = creating_since.elapsed();
         drop(creating_since); // 释放 DashMap ref
@@ -224,44 +230,54 @@ pub async fn handle_computer_chat(
                 user_id, elapsed
             );
 
-            // 轮询等待容器就绪（最多等 30 秒，每秒检查一次）
-            for wait_sec in 1..=30 {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                // 标记已被移除 = 创建完成
-                if !state.pod_creating.contains_key(&user_id) {
-                    // 尝试获取容器信息
-                    if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await
-                        && let Ok(Some(info)) = runtime
-                            .get_container_info_by_identifier(
-                                &user_id,
-                                &shared_types::ServiceType::ComputerAgentRunner,
-                            )
-                            .await
-                    {
-                        info!(
-                            "✅ [COMPUTER_CHAT] Wait successful, container is ready (waited {}s): user_id={}, container_id={}",
-                            wait_sec, user_id, info.container_id
-                        );
-                        waited_container_info = Some(info);
-                        break;
+            match tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(created_user_id) if created_user_id == user_id => {
+                            // 我们等待的容器已创建
+                            break;
+                        }
+                        Ok(_) => continue, // 其他用户的容器，继续等待
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // 通道关闭，退出
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // 消息丢失，检查标记是否已移除
+                            if !state.pod_creating.contains_key(&user_id) {
+                                break;
+                            }
+                            continue;
+                        }
                     }
                 }
-
-                if wait_sec % 5 == 0 {
-                    debug!(
-                        "[COMPUTER_CHAT] Still waiting for container creation: user_id={}, {}s elapsed",
-                        user_id, wait_sec
+            })
+            .await
+            {
+                Ok(_) => {
+                    // 容器创建成功，获取容器信息
+                    if let Ok(Some(info)) = state
+                        .runtime()
+                        .get_container_info_by_identifier(
+                            &user_id,
+                            &shared_types::ServiceType::ComputerAgentRunner,
+                        )
+                        .await
+                    {
+                        info!(
+                            "✅ [COMPUTER_CHAT] Wait successful, container is ready: user_id={}, container_id={}",
+                            user_id, info.container_id
+                        );
+                        waited_container_info = Some(info);
+                    }
+                }
+                Err(_) => {
+                    // 超时处理
+                    warn!(
+                        "⚠️ [COMPUTER_CHAT] Wait for container creation timeout (30s), will try to create: user_id={}",
+                        user_id
                     );
                 }
-            }
-
-            if waited_container_info.is_none() {
-                // 等待超时，继续正常的创建流程（此时标记可能已过期被清理）
-                warn!(
-                    "⚠️ [COMPUTER_CHAT] Wait for container creation timeout (30s), will try to create: user_id={}",
-                    user_id
-                );
             }
         } else {
             // 标记过期，清理后继续
@@ -297,11 +313,17 @@ pub async fn handle_computer_chat(
             request.isolation_type.as_deref(),
             request.tenant_id.as_deref(),
             request.space_id.as_deref(),
+            state.runtime(),
         )
         .await;
 
         // 清除标记（无论成功还是失败）
         state.pod_creating.remove(&user_id);
+
+        // 🚀 发送容器创建完成通知（唤醒等待方）
+        if result.is_ok() {
+            let _ = state.pod_created_tx.send(user_id.clone());
+        }
 
         match result {
             Ok(info) => info,
@@ -326,8 +348,7 @@ pub async fn handle_computer_chat(
         );
         // 必须先清理旧容器，否则 create_container 发现同名 "running" 容器会复用它
         let container_identifier = request.pod_id.as_deref().unwrap_or(&user_id);
-        if let Ok(runtime) = docker_manager::runtime::RuntimeManager::get().await
-            && let Err(e) = runtime
+        if let Err(e) = state.runtime()
                 .stop_container_by_identifier(
                     container_identifier,
                     &shared_types::ServiceType::ComputerAgentRunner,
@@ -349,6 +370,7 @@ pub async fn handle_computer_chat(
             request.isolation_type.as_deref(),
             request.tenant_id.as_deref(),
             request.space_id.as_deref(),
+            state.runtime(),
         )
         .await
         .map_err(|e| {
@@ -406,21 +428,15 @@ pub async fn handle_computer_chat(
 
     // 5. 创建项目工作目录（在用户容器内）
     // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
-    if let Err(e) = ensure_project_workspace_exists(
+    // 使用 ? 传播 AppError：验证错误 → HTTP 400，I/O 错误 → HTTP 500
+    ensure_project_workspace_exists(
         request.isolation_type.as_deref(),
         request.tenant_id.as_deref(),
         request.space_id.as_deref(),
         &user_id,
         &project_id,
     )
-    .await
-    {
-        error!("[COMPUTER_CHAT] Failed to create project workspace: {}", e);
-        return Ok(HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_WORKSPACE_ERROR,
-            locale,
-        ));
-    }
+    .await?;
 
     // 6. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
     if let Some(ref pingora_service) = state.pingora_service {
@@ -438,6 +454,7 @@ pub async fn handle_computer_chat(
         // 💫 使用实时 IP 获取，避免 restart 后 IP 过期的问题
         let grpc_addr_result = async {
             let container_ip = get_realtime_container_ip(
+                state.runtime(),
                 &container_info.container_name,
                 &container_info.container_ip,
                 &state.container_prefix_rcoder,
@@ -522,7 +539,7 @@ pub async fn handle_computer_chat(
     request_for_forward.session_id = if session_id_to_use.is_empty() {
         None
     } else {
-        Some(session_id_to_use)
+        Some(session_id_to_use.clone())
     };
     // 🆕 自动查找 session_id 逻辑结束
 
@@ -531,6 +548,7 @@ pub async fn handle_computer_chat(
         &request_for_forward, // 使用修改后的 request
         &project_id,
         &container_info,
+        state.runtime(),
         &state.grpc_pool,
         locale,
         &state.container_prefix_rcoder,
@@ -555,14 +573,7 @@ pub async fn handle_computer_chat(
             );
 
             // 从 Runtime API 获取最新容器信息，避免使用过期 IP
-            let runtime = docker_manager::runtime::RuntimeManager::get()
-                .await
-                .map_err(|e| {
-                    error!("[COMPUTER_CHAT] Failed to get runtime: {}", e);
-                    AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-                })?;
-
-            let container_info = match runtime
+            let container_info = match state.runtime()
                 .get_container_info_by_identifier(
                     &user_id,
                     &shared_types::ServiceType::ComputerAgentRunner,
@@ -605,7 +616,10 @@ pub async fn handle_computer_chat(
 
                 // 更新活动时间
                 updated_info.update_activity();
-                updated_info.update_session(session_id.clone());
+                // 🛡️ 关键修复：不在这里设置 session_id，避免双重写入导致 CAS 永远失败
+                // insert_project 会将 session_id 写入 DB，然后 update_session_atomic 再写一次
+                // 但 CAS 检查的是旧 session_id，而 DB 已经是新 session_id，导致 CAS 永远失败
+                // 修复：只通过 update_session_atomic 设置 session_id
 
                 // 更新扩展信息
                 updated_info.update_extended_from_request(
@@ -617,8 +631,20 @@ pub async fn handle_computer_chat(
 
                 state.insert_project(map_key.clone(), Arc::new(updated_info));
 
-                // 更新会话映射
-                state.update_session(&map_key, &session_id);
+                // 🛡️ 使用原子更新防止竞态条件
+                // 预期值：如果 session_id_to_use 非空，预期 DB 中是该值；否则预期是 None
+                let expected_current = if session_id_to_use.is_empty() {
+                    None
+                } else {
+                    Some(session_id_to_use.as_str())
+                };
+                let updated = state.update_session_atomic(&map_key, &session_id, expected_current);
+                if !updated {
+                    warn!(
+                        "⚠️ [COMPUTER_CHAT] Session CAS failed: project_id={}, expected={:?}, new={}",
+                        map_key, expected_current, session_id
+                    );
+                }
 
                 info!(
                     "🔄 [COMPUTER_CHAT] Updated existing container mapping: user_id={}, project_id={}, session_id={} (last_activity refreshed)",
@@ -633,8 +659,9 @@ pub async fn handle_computer_chat(
                 // 设置 pod_id（共享容器模式）
                 project_info.set_pod_id(request.pod_id.clone());
 
-                // 更新会话ID
-                project_info.update_session(session_id.clone());
+                // 🛡️ 关键修复：不在这里设置 session_id，避免双重写入导致 CAS 永远失败
+                // insert_project 会将 session_id = NULL 写入 DB
+                // 然后 update_session_atomic 检查 WHERE session_id IS NULL → 匹配 → 更新
 
                 // 更新扩展信息（容器、模型配置等）
                 project_info.update_extended_from_request(
@@ -646,8 +673,19 @@ pub async fn handle_computer_chat(
 
                 state.insert_project(map_key.clone(), Arc::new(project_info));
 
-                // 更新会话映射
-                state.update_session(&map_key, &session_id);
+                // 🛡️ 新项目：预期 DB 中没有 session_id，使用 None
+                let expected_current = if session_id_to_use.is_empty() {
+                    None
+                } else {
+                    Some(session_id_to_use.as_str())
+                };
+                let updated = state.update_session_atomic(&map_key, &session_id, expected_current);
+                if !updated {
+                    warn!(
+                        "⚠️ [COMPUTER_CHAT] Session CAS failed (new project): project_id={}, expected={:?}, new={}",
+                        map_key, expected_current, session_id
+                    );
+                }
 
                 info!(
                     "🆕 [COMPUTER_CHAT] Created new container mapping: user_id={}, project_id={}, session_id={}",
@@ -683,10 +721,12 @@ pub async fn handle_computer_chat(
 ///
 /// 与 RCoder 的 forward_request_to_container_service 类似，
 /// 但专门用于 ComputerAgentRunner 模式。
+#[allow(clippy::too_many_arguments)]
 async fn forward_computer_request_to_container(
     request: &ComputerChatRequest,
     project_id: &str,
     container_info: &ContainerBasicInfo,
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
     locale: &'static str,
     rcoder_prefix: &str,
@@ -703,6 +743,7 @@ async fn forward_computer_request_to_container(
     // 从 service_url 提取 gRPC 地址
     // 🆕 使用实时 IP 获取，避免 restart 后 IP 过期的问题
     let mut grpc_addr = match get_realtime_container_ip(
+        runtime,
         &container_info.container_name,
         &container_info.container_ip,
         rcoder_prefix,
@@ -741,7 +782,16 @@ async fn forward_computer_request_to_container(
 
     // Computer Agent Runner 的工作目录路径
     // 在容器内：/app/computer-project-workspace/{user_id}/{project_id}
-    let project_workspace = format!("{}/", project_dir(&request.user_id, project_id));
+    let project_workspace = match project_dir(&request.user_id, project_id) {
+        Ok(path) => format!("{}/", path),
+        Err(e) => {
+            return HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e.to_string(),
+            );
+        }
+    };
 
     debug!(
         "[COMPUTER_FORWARD] projectworkdirectory: {}",
@@ -811,6 +861,7 @@ async fn forward_computer_request_to_container(
 
                     // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
                     match get_realtime_container_ip(
+                        runtime,
                         &container_info.container_name,
                         &container_info.container_ip,
                         rcoder_prefix,
@@ -883,13 +934,16 @@ async fn ensure_project_workspace_exists(
     project_id: &str,
 ) -> Result<(), AppError> {
     // 根据隔离类型构建工作空间路径
-    let project_workspace_path = std::path::PathBuf::from(build_computer_workspace_path(
-        isolation_type,
-        tenant_id,
-        space_id,
-        user_id,
-        project_id,
-    ));
+    let project_workspace_path = std::path::PathBuf::from(
+        build_computer_workspace_path(
+            isolation_type,
+            tenant_id,
+            space_id,
+            user_id,
+            project_id,
+        )
+        .map_err(|e| AppError::validation_error(&e.to_string()))?,
+    );
 
     debug!(
         "📁 [COMPUTER_CHAT] Ensuring project workspace directory exists: {:?}",
@@ -938,21 +992,22 @@ fn ensure_project_mapping_in_state(
     request: &ComputerChatRequest,
 ) -> Result<(), AppError> {
     // 检查是否已存在该 project_id 的记录
-    if let Some(existing_project) = state.get_project(project_id) {
+    let existing_project = state.get_project(project_id);
+    if let Some(ref existing) = existing_project {
         // 如果记录存在，检查容器ID是否变更
-        if let Some(existing_container) = existing_project.container() {
-            if existing_container.container_id != container_info.container_id {
-                info!(
-                    "🔄 [COMPUTER_CHAT] Detected container change: project_id={}, old_cid={}, new_cid={}",
-                    project_id, existing_container.container_id, container_info.container_id
-                );
-                // 容器变更，继续执行后续的插入/更新逻辑（insert_project 会执行 upsert）
-            } else {
+        if let Some(existing_container) = existing.container() {
+            if existing_container.container_id == container_info.container_id {
                 debug!(
                     "🔄 [COMPUTER_CHAT] DuckDB record already exists and container unchanged: project_id={}",
                     project_id
                 );
                 return Ok(());
+            } else {
+                info!(
+                    "🔄 [COMPUTER_CHAT] Detected container change: project_id={}, old_cid={}, new_cid={}",
+                    project_id, existing_container.container_id, container_info.container_id
+                );
+                // 容器变更，继续执行后续的插入/更新逻辑（insert_project 会执行 upsert）
             }
         } else {
             // 现有记录没有容器信息，继续更新
@@ -966,6 +1021,18 @@ fn ensure_project_mapping_in_state(
     project_info.set_user_id(Some(user_id.to_string()));
     // 设置 pod_id（共享容器模式）
     project_info.set_pod_id(request.pod_id.clone());
+
+    // 🛡️ 关键修复：如果现有记录有 session_id，保留它
+    // 避免容器变更时丢失 session 状态，导致 CAS 更新失败
+    if let Some(ref existing) = existing_project
+        && let Some(existing_session_id) = existing.session_id()
+    {
+        project_info.update_session(existing_session_id.to_string());
+        debug!(
+            "🔄 [COMPUTER_CHAT] Preserved existing session_id: project_id={}, session_id={}",
+            project_id, existing_session_id
+        );
+    }
 
     // 更新容器信息
     project_info.update_extended_from_request(

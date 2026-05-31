@@ -28,29 +28,37 @@ use event::AppEvent;
 use notifier::TuiSessionNotifier;
 use permission::TuiPermissionPrompt;
 
+/// TUI 事件通道的缓冲区大小
+///
+/// 用于限制事件队列的最大长度，防止 OOM。
+/// TUI 事件（诊断信息、会话通知、权限请求等）产生速度较慢，
+/// 100 个缓冲区足够处理突发情况。
+const EVENT_CHANNEL_BUFFER_SIZE: usize = 100;
+
 /// TUI 诊断监听器
 ///
 /// 将 DiagnosticsListener 的同步回调通过 channel 转发到 TUI 事件循环。
 struct TuiDiagnosticsListener {
-    tx: mpsc::UnboundedSender<AppEvent>,
+    tx: mpsc::Sender<AppEvent>,
 }
 
 impl TuiDiagnosticsListener {
-    fn new(tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+    fn new(tx: mpsc::Sender<AppEvent>) -> Self {
         Self { tx }
     }
 }
 
 impl DiagnosticsListener for TuiDiagnosticsListener {
     fn on_process_started(&self, pid: u32, command: &str) {
-        let _ = self.tx.send(AppEvent::Diagnostics(format!(
+        // 使用 try_send 提供背压保护，避免在同步回调中阻塞
+        let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
             "Agent 进程已启动: pid={}, command={}",
             pid, command
         )));
     }
 
     fn on_acp_initialized(&self, session_id: &str) {
-        let _ = self.tx.send(AppEvent::Diagnostics(format!(
+        let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
             "ACP 初始化完成: session_id={}",
             session_id
         )));
@@ -58,11 +66,11 @@ impl DiagnosticsListener for TuiDiagnosticsListener {
 
     fn on_process_exited(&self, diagnostics: &ProcessDiagnostics) {
         if diagnostics.exit_code == Some(0) {
-            let _ = self.tx.send(AppEvent::Diagnostics(
+            let _ = self.tx.try_send(AppEvent::Diagnostics(
                 "Agent 进程正常退出".to_string(),
             ));
         } else {
-            let _ = self.tx.send(AppEvent::Diagnostics(format!(
+            let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
                 "Agent 进程异常退出: exit_code={:?}",
                 diagnostics.exit_code
             )));
@@ -70,7 +78,7 @@ impl DiagnosticsListener for TuiDiagnosticsListener {
     }
 
     fn on_process_error(&self, diagnostics: &ProcessDiagnostics) {
-        let _ = self.tx.send(AppEvent::Diagnostics(format!(
+        let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
             "Agent 进程错误: {}",
             diagnostics.error_message.as_deref().unwrap_or("unknown")
         )));
@@ -80,7 +88,7 @@ impl DiagnosticsListener for TuiDiagnosticsListener {
 /// 构建 TUI 模式的 AcpClient
 async fn build_tui_client(
     args: &TuiArgs,
-    event_tx: mpsc::UnboundedSender<AppEvent>,
+    event_tx: mpsc::Sender<AppEvent>,
     completion_signal: PromptCompletionSignal,
 ) -> Result<Client, anyhow::Error> {
     let notifier = TuiSessionNotifier::new(event_tx.clone(), Some(completion_signal.clone()));
@@ -130,8 +138,8 @@ async fn build_tui_client(
 pub async fn execute_tui(args: TuiArgs, verbose: u8, quiet: bool) -> ExitCode {
     let use_markdown = !args.no_markdown;
 
-    // 创建事件通道
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    // 创建事件通道（有界通道，提供背压保护，防止 OOM）
+    let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_BUFFER_SIZE);
 
     // 创建完成信号
     let completion_signal = PromptCompletionSignal::new();

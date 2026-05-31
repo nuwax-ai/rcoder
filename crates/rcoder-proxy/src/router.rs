@@ -161,7 +161,7 @@ pub enum RouteType {
 /// assert_eq!(*matched.value, RouteType::PortProxy);
 /// assert_eq!(matched.params.get("port"), Some("8080"));
 /// ```
-pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
+pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     let mut router = Router::new();
 
     // ========================================================================
@@ -188,7 +188,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
         )
         .map_err(|e| {
             tracing::error!("[ROUTER] VNC route config failed: {}", e);
-            anyhow::anyhow!("VNC route configuration error: {}", e)
+            crate::ProxyError::RouteConfig(format!("VNC route configuration error: {}", e))
         })?;
 
     // ========================================================================
@@ -211,7 +211,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
         .insert("/proxy/{port}/{*path}", RouteType::PortProxy)
         .map_err(|e| {
             tracing::error!("[ROUTER] port proxy route config failed: {}", e);
-            anyhow::anyhow!("Port proxy route configuration error: {}", e)
+            crate::ProxyError::RouteConfig(format!("Port proxy route configuration error: {}", e))
         })?;
 
     // ========================================================================
@@ -231,7 +231,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
         .insert("/health", RouteType::HealthCheck)
         .map_err(|e| {
             tracing::error!("[ROUTER] health check route config failed: {}", e);
-            anyhow::anyhow!("Health check route configuration error: {}", e)
+            crate::ProxyError::RouteConfig(format!("Health check route configuration error: {}", e))
         })?;
 
     // ========================================================================
@@ -260,7 +260,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
         .insert("/api/{service_name}/{*path}", RouteType::ApiProxy)
         .map_err(|e| {
             tracing::error!("[ROUTER] API proxy route config failed: {}", e);
-            anyhow::anyhow!("API proxy route configuration error: {}", e)
+            crate::ProxyError::RouteConfig(format!("API proxy route configuration error: {}", e))
         })?;
 
     // Fallback: 匹配 /api/{service_name}（无额外路径段）
@@ -269,7 +269,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
         .insert("/api/{service_name}", RouteType::ApiProxy)
         .map_err(|e| {
             tracing::error!("[ROUTER] API proxy fallback route config failed: {}", e);
-            anyhow::anyhow!("API proxy fallback route configuration error: {}", e)
+            crate::ProxyError::RouteConfig(format!("API proxy fallback route configuration error: {}", e))
         })?;
 
     // ========================================================================
@@ -298,7 +298,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
         )
         .map_err(|e| {
             tracing::error!("[ROUTER] audio proxy route config failed: {}", e);
-            anyhow::anyhow!("Audio proxy route configuration error: {}", e)
+            crate::ProxyError::RouteConfig(format!("Audio proxy route configuration error: {}", e))
         })?;
 
     // ========================================================================
@@ -324,7 +324,7 @@ pub fn create_router() -> Result<Router<RouteType>, anyhow::Error> {
         )
         .map_err(|e| {
             tracing::error!("[ROUTER] IME proxy route config failed: {}", e);
-            anyhow::anyhow!("IME proxy route configuration error: {}", e)
+            crate::ProxyError::RouteConfig(format!("IME proxy route configuration error: {}", e))
         })?;
 
     Ok(router)

@@ -11,7 +11,6 @@ use dashmap::mapref::entry::Entry;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
 use shared_types::ProjectAndAgentInfo;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
 
@@ -63,7 +62,8 @@ pub struct RegistryStats {
 pub struct PendingGuard<'a> {
     registry: &'a AgentSessionRegistry,
     project_id: String,
-    cleaned: AtomicBool,
+    /// 标记是否已显式提交成功（commit_success 被调用）
+    committed: bool,
 }
 
 impl<'a> PendingGuard<'a> {
@@ -77,7 +77,7 @@ impl<'a> PendingGuard<'a> {
         Self {
             registry,
             project_id: project_id.to_string(),
-            cleaned: AtomicBool::new(false),
+            committed: false,
         }
     }
 
@@ -86,21 +86,21 @@ impl<'a> PendingGuard<'a> {
     /// ## ⚠️ 重要
     ///
     /// 调用此方法后，Pending 状态将被保留（因为 Agent 已成功启动）。
-    /// 必须使用 `std::mem::forget()` 防止 Drop 执行清理。
-    pub fn commit_success(self) {
-        self.cleaned.store(true, Ordering::Release);
+    /// `committed` 标志会阻止 Drop 执行清理逻辑。
+    pub fn commit_success(mut self) {
+        self.committed = true;
         debug!(
             "🛡️ [PendingGuard] Commit success, keeping Pending state: project_id={}",
             self.project_id
         );
-        std::mem::forget(self); // 防止 drop 时清理
+        // drop 正常运行，但 Drop::drop 检查 committed 标志后跳过清理
     }
 }
 
 impl<'a> Drop for PendingGuard<'a> {
     fn drop(&mut self) {
-        // 只有未标记为成功时才清理
-        if !self.cleaned.load(Ordering::Acquire) {
+        // 只有未提交成功时才清理
+        if !self.committed {
             debug!(
                 "🛡️ [PendingGuard] Auto clearing Pending state on Drop: project_id={}",
                 self.project_id
@@ -176,13 +176,17 @@ impl AgentSessionRegistry {
 
         // 🔒 使用 entry API 原子性地更新 session_to_project
         // 这样避免了 insert + remove 分离操作带来的竞态窗口
-        let _should_clean_old = match self.session_to_project.entry(session_id.to_string()) {
+        let old_project_for_session = match self.session_to_project.entry(session_id.to_string()) {
             Entry::Occupied(mut entry) => {
                 // key 已存在，原子性地替换值
                 let old_project_id = entry.get().clone();
                 entry.insert(project_id.to_string());
-                // 如果 session_id 对应的 project_id 发生变化，需要清理旧映射
-                Some(old_project_id != project_id)
+                // 如果 session_id 对应的 project_id 发生变化，返回旧 project_id 用于清理
+                if old_project_id != project_id {
+                    Some(old_project_id)
+                } else {
+                    None
+                }
             }
             Entry::Vacant(entry) => {
                 // key 不存在，直接插入
@@ -205,6 +209,20 @@ impl AgentSessionRegistry {
             debug!(
                 "🔄 [Registry] Cleaning old session mapping: project={}, old_session={}",
                 project_id, old_sid
+            );
+        }
+
+        // ✅ 清理旧 project 的 stale project_to_session 映射
+        // 当 session_id 被重新分配给不同的 project 时，旧 project 的
+        // project_to_session 条目变为过期（仍指向此 session_id），需要清理
+        if let Some(ref old_project_id) = old_project_for_session
+            && let Entry::Occupied(oe) = self.project_to_session.entry(old_project_id.clone())
+            && oe.get() == session_id
+        {
+            oe.remove_entry();
+            debug!(
+                "🔄 [Registry] Cleaning stale project_to_session: old_project={}, session={}",
+                old_project_id, session_id
             );
         }
 
@@ -243,12 +261,16 @@ impl AgentSessionRegistry {
         };
 
         // 🔒 使用 entry API 原子性地更新 session_to_project
-        let _should_clean_old = match self.session_to_project.entry(new_session_id.to_string()) {
+        let old_project_for_session = match self.session_to_project.entry(new_session_id.to_string()) {
             Entry::Occupied(mut entry) => {
                 // key 已存在，原子性地替换值
                 let old_project_id = entry.get().clone();
                 entry.insert(project_id.to_string());
-                Some(old_project_id != project_id)
+                if old_project_id != project_id {
+                    Some(old_project_id)
+                } else {
+                    None
+                }
             }
             Entry::Vacant(entry) => {
                 // key 不存在，直接插入
@@ -263,6 +285,18 @@ impl AgentSessionRegistry {
         {
             // remove 本身是原子操作
             self.session_to_project.remove(old_sid);
+        }
+
+        // ✅ 清理旧 project 的 stale project_to_session 映射
+        if let Some(ref old_project_id) = old_project_for_session
+            && let Entry::Occupied(oe) = self.project_to_session.entry(old_project_id.clone())
+            && oe.get() == new_session_id
+        {
+            oe.remove_entry();
+            debug!(
+                "🔄 [Registry] Cleaning stale project_to_session in update_session: old_project={}, session={}",
+                old_project_id, new_session_id
+            );
         }
 
         if let Some(ref old_sid) = old_session_id {
@@ -533,12 +567,12 @@ impl AgentSessionRegistry {
         use dashmap::mapref::entry::Entry;
 
         info!(
-            "🔍 [Registry] remove_by_project started: project_id={}",
+            "[Registry] remove_by_project started: project_id={}",
             project_id
         );
 
         // 🎯 原子性地移除 project_to_session 并获取 session_id
-        info!("[Registry] Removing project_to_session mapping");
+        debug!("[Registry] Removing project_to_session mapping");
         let session_id = match self.project_to_session.entry(project_id.to_string()) {
             Entry::Occupied(entry) => {
                 let (_, session_id) = entry.remove_entry(); // 原子性移除
@@ -546,47 +580,47 @@ impl AgentSessionRegistry {
             }
             Entry::Vacant(_) => None,
         };
-        info!("[Registry] project_to_session mapping removed");
+        debug!("[Registry] project_to_session mapping removed");
 
         // 移除反向映射
         if let Some(ref sid) = session_id {
-            info!("[Registry] Removing session_to_project mapping");
+            debug!("[Registry] Removing session_to_project mapping");
             self.session_to_project.remove(sid);
-            info!("[Registry] session_to_project mapping removed");
+            debug!("[Registry] session_to_project mapping removed");
         }
 
         // 移除 agent_info
-        info!(
-            "🔍 [Registry] Preparing to remove agent_info_map, project_id={}, current map length={}",
+        debug!(
+            "[Registry] Preparing to remove agent_info_map, project_id={}, current map length={}",
             project_id,
             self.agent_info_map.len()
         );
 
         // 检查 key 是否存在
         let key_exists = self.agent_info_map.contains_key(project_id);
-        info!(
-            "🔍 [Registry] agent_info_map key existence check: project_id={}, exists={}",
+        debug!(
+            "[Registry] agent_info_map key existence check: project_id={}, exists={}",
             project_id, key_exists
         );
 
         // 执行 remove 操作
-        info!("[Registry] Executing agent_info_map.remove()...");
+        debug!("[Registry] Executing agent_info_map.remove()...");
         let removed = self.agent_info_map.remove(project_id).map(|(_, v)| v);
-        info!(
-            "🔍 [Registry] agent_info_map.remove() completed, removed={}, remaining_length={}",
+        debug!(
+            "[Registry] agent_info_map.remove() completed, removed={}, remaining_length={}",
             removed.is_some(),
             self.agent_info_map.len()
         );
 
         if removed.is_some() {
             info!(
-                "🗑️ [Registry] Removing Agent: project={}, session={:?}",
+                "[Registry] Removed Agent: project={}, session={:?}",
                 project_id, session_id
             );
         }
 
         info!(
-            "🔍 [Registry] remove_by_project completed: project_id={}",
+            "[Registry] remove_by_project completed: project_id={}",
             project_id
         );
         removed
@@ -626,8 +660,20 @@ impl AgentSessionRegistry {
                 );
 
                 // 清理 project_to_session 和 session_to_project 映射
-                self.project_to_session.remove(project_id);
-                self.session_to_project.remove(expected_session_id);
+                // 使用 entry API 进行条件移除，避免 TOCTOU 竞态：
+                // 在 agent_info_map 锁释放后，另一个线程可能已 register() 了新数据，
+                // 直接 remove() 会误删新线程的映射
+                if let Entry::Occupied(oe) = self.project_to_session.entry(project_id.to_string())
+                    && oe.get() == expected_session_id
+                {
+                    oe.remove_entry();
+                }
+                if let Entry::Occupied(oe) =
+                    self.session_to_project.entry(expected_session_id.to_string())
+                    && oe.get() == project_id
+                {
+                    oe.remove_entry();
+                }
 
                 Some(removed_info)
             }

@@ -13,7 +13,9 @@
 #![allow(dead_code)]
 
 use crate::handler::utils::container_identity_from_name;
+use container_runtime_api::ContainerRuntime;
 use rcoder_proxy::PingoraProxyService;
+use shared_types::ServiceType;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -46,6 +48,7 @@ pub fn start_vnc_sync_task(
     config: VncSyncConfig,
     rcoder_prefix: String,
     computer_prefix: String,
+    runtime: Arc<dyn ContainerRuntime>,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         "🔄 [VNC_SYNC] Starting VNC backend sync task: interval={}s",
@@ -55,12 +58,11 @@ pub fn start_vnc_sync_task(
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(config.sync_interval);
 
-        // 首次立即执行同步（用于服务启动时恢复映射）
-        sync_vnc_backends(&pingora_service, &rcoder_prefix, &computer_prefix).await;
-
+        // 首次 interval.tick() 立即触发（Tokio Interval 首次 tick 是即时的），
+        // 无需手动调用 sync_vnc_backends，避免重复执行
         loop {
             interval.tick().await;
-            sync_vnc_backends(&pingora_service, &rcoder_prefix, &computer_prefix).await;
+            sync_vnc_backends(&pingora_service, &rcoder_prefix, &computer_prefix, &runtime).await;
         }
     })
 }
@@ -70,15 +72,8 @@ async fn sync_vnc_backends(
     pingora_service: &Arc<PingoraProxyService>,
     rcoder_prefix: &str,
     computer_prefix: &str,
+    runtime: &Arc<dyn ContainerRuntime>,
 ) {
-    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
-        Ok(rt) => rt,
-        Err(e) => {
-            warn!("[VNC_SYNC] Failed to get runtime: {}", e);
-            return;
-        }
-    };
-
     let containers = match runtime.list_containers().await {
         Ok(list) => list,
         Err(e) => {
@@ -187,6 +182,29 @@ async fn sync_vnc_backends(
     let mut removed_count = 0;
     for user_id in current_backends.keys() {
         if !active_user_ids.contains(user_id) {
+            // 🛡️ 防止竞态条件：在删除前做一次实时检查
+            // 快照和清理之间可能有新容器被创建，直接删除会导致
+            // 刚创建的容器后端被误移除
+            let still_running = runtime
+                .is_container_running_by_identifier(user_id, &ServiceType::RCoder)
+                .await
+                .unwrap_or(false)
+                || runtime
+                    .is_container_running_by_identifier(
+                        user_id,
+                        &ServiceType::ComputerAgentRunner,
+                    )
+                    .await
+                    .unwrap_or(false);
+
+            if still_running {
+                debug!(
+                    "🛡️ [VNC_SYNC] Keeping backend despite snapshot miss (container still running): user_id={}",
+                    user_id
+                );
+                continue;
+            }
+
             pingora_service.remove_vnc_backend(user_id);
             removed_count += 1;
             debug!(

@@ -6,7 +6,7 @@ use shared_types::grpc::{
     GetVncStatusRequest, GetVncStatusResponse,
 };
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use crate::model::AgentStatus;
 use crate::router::AppState;
@@ -187,17 +187,9 @@ fn get_active_tasks_count() -> i32 {
 }
 
 fn get_uptime_seconds() -> i64 {
-    use std::time::SystemTime;
+    static START_TIME: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
-    static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+    let start = START_TIME.get_or_init(std::time::Instant::now);
 
-    let start = START_TIME.get_or_init(SystemTime::now);
-
-    match SystemTime::now().duration_since(*start) {
-        Ok(duration) => duration.as_secs() as i64,
-        Err(_) => {
-            warn!("[GET_CONTAINER_STATUS] failed to calculate uptime, returning 0");
-            0
-        }
-    }
+    start.elapsed().as_secs() as i64
 }

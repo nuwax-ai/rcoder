@@ -183,13 +183,19 @@ impl ReaperState {
     ///
     /// 使用 waitpid 循环回收所有可能的僵尸进程，不仅仅是追踪的子进程
     /// 这是 PID 1 的责任：回收所有孤儿进程
+    ///
+    /// ⚠️ 跳过已在 active_children 中注册的 PID，避免抢占 reap_all() 的退出状态
     fn reap_all_zombies_blocking(&mut self) {
         #[cfg(unix)]
         {
             use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
             use nix::unistd::Pid;
+            use std::collections::HashSet;
 
             let mut reaped_this_round = 0;
+
+            // 收集已注册的活跃子进程 PID，避免抢占其退出状态
+            let registered_pids: HashSet<u32> = self.active_children.keys().copied().collect();
 
             // 循环调用 waitpid，直到没有更多僵尸进程
             loop {
@@ -198,6 +204,15 @@ impl ReaperState {
                     Some(WaitPidFlag::WNOHANG),
                 ) {
                     Ok(WaitStatus::Exited(pid, exit_code)) => {
+                        // 跳过已注册的子进程，交由 reap_all() 处理
+                        if registered_pids.contains(&(pid.as_raw() as u32)) {
+                            debug!(
+                                "[ProcessReaper] Skipping registered child PID={} (exit_code={}), \
+                                 will be reaped by reap_all()",
+                                pid, exit_code
+                            );
+                            continue;
+                        }
                         reaped_this_round += 1;
                         debug!(
                             "[ProcessReaper] Reaped zombie proactively: PID={}, exit_code={}",
@@ -205,6 +220,15 @@ impl ReaperState {
                         );
                     }
                     Ok(WaitStatus::Signaled(pid, signal, _)) => {
+                        // 跳过已注册的子进程，交由 reap_all() 处理
+                        if registered_pids.contains(&(pid.as_raw() as u32)) {
+                            debug!(
+                                "[ProcessReaper] Skipping registered child PID={} (signal={:?}), \
+                                 will be reaped by reap_all()",
+                                pid, signal
+                            );
+                            continue;
+                        }
                         reaped_this_round += 1;
                         debug!(
                             "[ProcessReaper] Reaped zombie proactively: PID={}, signal={:?}",
@@ -541,10 +565,16 @@ impl ProcessReaperHandle {
     }
 
     /// 注册一个子进程（未来扩展）
+    ///
+    /// ⚠️ 当前实现为空操作，调用方需注意子进程不会被自动追踪和回收。
+    /// 子进程仍由其创建者负责管理。
     #[allow(dead_code)]
     pub fn register(&self, _child: Child) {
-        // 当前实现中，子进程由各自的创建者负责回收
-        // 此方法保留用于未来中央化管理的扩展
+        warn!(
+            "[ProcessReaper] register() called but not implemented - \
+             child process will not be tracked. \
+             Caller should manage the child process lifecycle independently."
+        );
     }
 }
 

@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use tracing::debug;
 
 /// Agent 状态检查器
+#[derive(Clone)]
 pub struct AgentStatusChecker {
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
 }

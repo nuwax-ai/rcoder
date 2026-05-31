@@ -31,21 +31,41 @@ impl AgentScanner {
 
     /// 扫描需要清理的 agent
     pub async fn scan_idle_agents(&self) -> Result<Vec<String>> {
-        let mut idle_agents = Vec::new();
+        use futures::stream::{self, StreamExt};
+
         let current_time = Utc::now();
 
-        info!("[scanner] Starting agent scan");
+        info!("🔍 [scanner] Starting agent scan");
 
-        // 收集所有项目 ID
-        let project_ids: Vec<String> = self.state.projects.iter().map(|(id, _)| id).collect();
+        // 🚀 修复 N+1：iter() 已经 JOIN 获取了所有项目+容器数据
+        // 直接收集 (project_id, Arc<ProjectAndContainerInfo>)，避免逐个 get_project() 重新查询
+        let projects: Vec<(String, Arc<shared_types::ProjectAndContainerInfo>)> =
+            self.state.projects.iter().collect();
 
-        for project_id in project_ids {
-            if let Some(agent) = self.state.get_project(&project_id)
-                && self.should_cleanup_agent(&agent, current_time).await
-            {
-                idle_agents.push(project_id);
-            }
-        }
+        // 🚀 优化：使用流式并发替代批次等待，提高吞吐量
+        // buffered(10) 表示最多 10 个并发任务
+        let idle_agents: Vec<String> = stream::iter(projects)
+            .map(|(project_id, agent)| {
+                let state = self.state.clone();
+                let config = self.config.clone();
+                let status_checker = self.status_checker.clone();
+                async move {
+                    let scanner = AgentScanner {
+                        state,
+                        config,
+                        status_checker,
+                    };
+                    if scanner.should_cleanup_agent(&agent, current_time).await {
+                        Some(project_id)
+                    } else {
+                        None
+                    }
+                }
+            })
+            .buffered(10)
+            .filter_map(|result| async move { result })
+            .collect()
+            .await;
 
         info!(
             "🎯 [scanner] Scan completed: found {} idle agents",

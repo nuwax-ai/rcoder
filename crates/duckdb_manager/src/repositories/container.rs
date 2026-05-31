@@ -22,34 +22,40 @@ impl ContainerRepository {
 
     /// 插入或更新容器记录
     pub fn upsert(&self, record: &ContainerRecord) -> DuckDbResult<()> {
+        self.conn.with_connection(|c| Self::upsert_with_connection(c, record))
+    }
+
+    /// 使用提供的连接插入或更新容器记录（用于事务）
+    pub fn upsert_with_connection(
+        c: &duckdb::Connection,
+        record: &ContainerRecord,
+    ) -> DuckDbResult<()> {
         let service_type_str = record.service_type.to_string();
         let created_at_str = record.created_at.to_rfc3339();
         let last_activity_str = record.last_activity.to_rfc3339();
 
-        self.conn.with_connection(|c| {
-            c.execute(
-                r#"
-                INSERT OR REPLACE INTO containers (
-                    container_id, container_name, container_ip,
-                    internal_port, external_port, service_type,
-                    status, service_url, created_at, last_activity
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-                params![
-                    record.container_id,
-                    record.container_name,
-                    record.container_ip,
-                    record.internal_port as i32,
-                    record.external_port as i32,
-                    service_type_str,
-                    record.status,
-                    record.service_url,
-                    created_at_str,
-                    last_activity_str,
-                ],
-            )?;
-            Ok(())
-        })
+        c.execute(
+            r#"
+            INSERT OR REPLACE INTO containers (
+                container_id, container_name, container_ip,
+                internal_port, external_port, service_type,
+                status, service_url, created_at, last_activity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                record.container_id,
+                record.container_name,
+                record.container_ip,
+                record.internal_port as i32,
+                record.external_port as i32,
+                service_type_str,
+                record.status,
+                record.service_url,
+                created_at_str,
+                last_activity_str,
+            ],
+        )?;
+        Ok(())
     }
 
     /// 根据容器ID查找容器
@@ -206,20 +212,28 @@ impl ContainerRepository {
     }
 
     /// 查找闲置容器（超过指定分钟数未活动且不在保护期内）
+    ///
+    /// 使用 JOIN + GROUP_CONCAT 一次性获取容器和关联的 project_ids，避免 N+1 查询。
     pub fn find_idle_containers(
         &self,
         idle_minutes: i64,
         protection_minutes: i64,
     ) -> DuckDbResult<Vec<IdleContainerInfo>> {
         self.conn.with_connection(|c| {
-            // 使用 DuckDB 的时间函数计算
+            // 使用 LEFT JOIN + GROUP_CONCAT 聚合 project_ids
             let mut stmt = c.prepare(
                 r#"
-                SELECT c.container_id, c.container_name, c.service_type,
-                       DATEDIFF('minute', c.last_activity, NOW()) as idle_mins
+                SELECT
+                    c.container_id,
+                    c.container_name,
+                    c.service_type,
+                    DATEDIFF('minute', c.last_activity, NOW()) as idle_mins,
+                    COALESCE(GROUP_CONCAT(p.project_id), '') as project_ids
                 FROM containers c
+                LEFT JOIN projects p ON c.container_id = p.container_id
                 WHERE DATEDIFF('minute', c.last_activity, NOW()) >= ?
                   AND DATEDIFF('minute', c.created_at, NOW()) >= ?
+                GROUP BY c.container_id, c.container_name, c.service_type, c.last_activity
                 ORDER BY idle_mins DESC
                 "#,
             )?;
@@ -232,17 +246,25 @@ impl ContainerRepository {
                 let container_name: String = row.get(1)?;
                 let service_type_str: String = row.get(2)?;
                 let idle_mins: i64 = row.get(3)?;
+                let project_ids_str: String = row.get(4)?;
 
                 let service_type = service_type_str.parse::<ServiceType>().map_err(|e| {
                     DuckDbError::InternalError(format!("failed to parse service type: {}", e))
                 })?;
+
+                // 解析 project_ids（逗号分隔的字符串）
+                let project_ids: Vec<String> = if project_ids_str.is_empty() {
+                    Vec::new()
+                } else {
+                    project_ids_str.split(',').map(String::from).collect()
+                };
 
                 results.push(IdleContainerInfo {
                     container_id,
                     container_name,
                     service_type,
                     idle_minutes: idle_mins,
-                    project_ids: Vec::new(), // 稍后填充
+                    project_ids, // 直接填充，无需后续查询
                 });
             }
 
@@ -261,7 +283,7 @@ impl ContainerRepository {
             return Ok(Vec::new());
         }
 
-        self.conn.with_connection(|c| {
+        self.conn.try_with_connection(|c| {
             // 获取数据库中所有容器 ID
             let mut stmt = c.prepare("SELECT container_id FROM containers")?;
             let mut rows = stmt.query([])?;
@@ -280,16 +302,31 @@ impl ContainerRepository {
                 .collect();
 
             Ok(orphans)
-        })
+        }).and_then(|opt| opt.ok_or_else(|| DuckDbError::InternalError("database busy, try again".to_string())))
     }
 
     /// 获取容器数量统计
     pub fn count(&self) -> DuckDbResult<usize> {
-        self.conn.with_connection(|c| {
+        self.conn.try_with_connection(|c| {
             let mut stmt = c.prepare("SELECT COUNT(*) FROM containers")?;
             let mut rows = stmt.query([])?;
             let row = rows.next()?.ok_or_else(|| {
                 DuckDbError::InternalError("unable to get container count".to_string())
+            })?;
+            let count: i64 = row.get(0)?;
+            Ok(count as usize)
+        }).and_then(|opt| opt.ok_or_else(|| DuckDbError::InternalError("database busy, try again".to_string())))
+    }
+
+    /// 统计闲置容器数量（不加载全量数据，直接 SQL 聚合）
+    pub fn count_idle(&self, idle_minutes: i64) -> DuckDbResult<usize> {
+        self.conn.with_connection(|c| {
+            let mut stmt = c.prepare(
+                "SELECT COUNT(*) FROM containers WHERE DATEDIFF('minute', last_activity, NOW()::timestamp) >= ?",
+            )?;
+            let mut rows = stmt.query(params![idle_minutes])?;
+            let row = rows.next()?.ok_or_else(|| {
+                DuckDbError::InternalError("unable to get idle container count".to_string())
             })?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
@@ -300,7 +337,7 @@ impl ContainerRepository {
     pub fn count_by_service_type(
         &self,
     ) -> DuckDbResult<std::collections::HashMap<ServiceType, usize>> {
-        self.conn.with_connection(|c| {
+        self.conn.try_with_connection(|c| {
             let mut stmt =
                 c.prepare("SELECT service_type, COUNT(*) FROM containers GROUP BY service_type")?;
             let mut rows = stmt.query([])?;
@@ -316,23 +353,30 @@ impl ContainerRepository {
             }
 
             Ok(counts)
-        })
+        }).and_then(|opt| opt.ok_or_else(|| DuckDbError::InternalError("database busy, try again".to_string())))
     }
 
     /// 从数据库行转换为 ContainerRecord
     fn row_to_record(row: &duckdb::Row<'_>) -> DuckDbResult<ContainerRecord> {
-        let container_id: String = row.get(0)?;
-        let container_name: String = row.get(1)?;
-        let container_ip: String = row.get(2)?;
-        let internal_port: i32 = row.get(3)?;
-        let external_port: i32 = row.get(4)?;
-        let service_type_str: String = row.get(5)?;
-        let status: String = row.get(6)?;
-        let service_url: String = row.get(7)?;
+        Self::row_to_record_from_offset(row, 0)
+    }
+
+    /// 从数据库行的指定偏移量开始转换为 ContainerRecord
+    ///
+    /// 用于 JOIN 查询场景，容器字段从指定列索引开始
+    pub fn row_to_record_from_offset(row: &duckdb::Row<'_>, offset: usize) -> DuckDbResult<ContainerRecord> {
+        let container_id: String = row.get(offset)?;
+        let container_name: String = row.get(offset + 1)?;
+        let container_ip: String = row.get(offset + 2)?;
+        let internal_port: i32 = row.get(offset + 3)?;
+        let external_port: i32 = row.get(offset + 4)?;
+        let service_type_str: String = row.get(offset + 5)?;
+        let status: String = row.get(offset + 6)?;
+        let service_url: String = row.get(offset + 7)?;
 
         // DuckDB 返回 TIMESTAMP 类型，需要使用 get_ref 并转换
-        let created_at = Self::get_timestamp_from_row(row, 8)?;
-        let last_activity = Self::get_timestamp_from_row(row, 9)?;
+        let created_at = Self::get_timestamp_from_row(row, offset + 8)?;
+        let last_activity = Self::get_timestamp_from_row(row, offset + 9)?;
 
         let service_type = service_type_str.parse::<ServiceType>().map_err(|e| {
             DuckDbError::InternalError(format!("failed to parse service type: {}", e))
@@ -361,9 +405,9 @@ impl ContainerRepository {
         let value_ref = row.get_ref(idx)?;
         match value_ref {
             ValueRef::Timestamp(_, micros) => {
-                // 微秒转秒和纳秒
-                let secs = micros / 1_000_000;
-                let nsecs = ((micros % 1_000_000) * 1000) as u32;
+                // 微秒转秒和纳秒（使用 Euclidean 除法正确处理 epoch 之前的负时间戳）
+                let secs = micros.div_euclid(1_000_000);
+                let nsecs = (micros.rem_euclid(1_000_000) * 1000) as u32;
                 Ok(DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now))
             }
             ValueRef::Text(bytes) => {

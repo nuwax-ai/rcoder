@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use container_runtime_api::ContainerRuntime;
+
 use crate::grpc::GrpcChannelPool;
 
 /// 容器状态同步配置
@@ -39,6 +41,7 @@ impl Default for ContainerSyncConfig {
 pub fn start_container_sync_task(
     config: ContainerSyncConfig,
     grpc_pool: Arc<GrpcChannelPool>,
+    runtime: Arc<dyn ContainerRuntime>,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         "🔄 [CONTAINER_SYNC] Starting container state sync task: interval={}s",
@@ -51,15 +54,6 @@ pub fn start_container_sync_task(
 
         loop {
             interval.tick().await;
-
-            // 获取全局 Runtime
-            let runtime = match docker_manager::runtime::RuntimeManager::get().await {
-                Ok(rt) => rt,
-                Err(e) => {
-                    warn!("[CONTAINER_SYNC] Failed to get runtime: {}", e);
-                    continue;
-                }
-            };
 
             // 同步缓存状态 - 清理失效的容器记录
             debug!("[CONTAINER_SYNC] Syncing container states...");

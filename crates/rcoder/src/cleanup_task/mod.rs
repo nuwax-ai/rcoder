@@ -53,17 +53,11 @@ pub async fn start_cleanup_task(
 
     if docker_manager.is_none() {
         let state_for_k8s = state.clone();
+        let runtime_for_k8s = state.runtime().clone();
         return Ok(tokio::task::spawn(async move {
             let mut interval = tokio::time::interval(config.cleanup_interval);
             loop {
                 interval.tick().await;
-                let runtime = match docker_manager::runtime::RuntimeManager::get().await {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::warn!("[CLEANUP_TASK] failed to get runtime: {}", e);
-                        continue;
-                    }
-                };
                 let idle_threshold = match chrono::Duration::from_std(config.idle_timeout) {
                     Ok(v) => v,
                     Err(e) => {
@@ -92,7 +86,7 @@ pub async fn start_cleanup_task(
                         shared_types::ServiceType::RCoder => project_id.clone(),
                     };
 
-                    if let Err(e) = runtime
+                    if let Err(e) = runtime_for_k8s
                         .stop_container_by_identifier(&identifier, &service_type)
                         .await
                     {

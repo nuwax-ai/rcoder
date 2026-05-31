@@ -71,6 +71,7 @@ pub use model_env::{
 pub use claude_code_sacp::{
     SacpAgentLaunchConfig, SacpClaudeCodeLauncher, SacpLauncherConnectionInfo,
     convert_context_servers_sacp, get_default_sacp_agent_config, load_sacp_agent_config,
+    set_mcp_proxy_log_dir,
 };
 
 // ============================================================================

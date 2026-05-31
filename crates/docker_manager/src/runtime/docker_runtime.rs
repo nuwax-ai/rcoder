@@ -41,6 +41,10 @@ impl ContainerRuntime for DockerRuntime {
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        // start_agent_container 被标记为 deprecated 是因为返回的 container_id 可能过期，
+        // 但 ContainerRuntime trait 的调用方应通过 find_container 获取最新信息，
+        // 因此在 runtime 适配层使用是安全的。
+        #[allow(deprecated)]
         self.inner
             .start_agent_container(params)
             .await
@@ -120,7 +124,7 @@ impl ContainerRuntime for DockerRuntime {
                 crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
                 crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
             },
-            created_at: chrono::Utc::now(),
+            created_at: r.created_at,
         }))
     }
 

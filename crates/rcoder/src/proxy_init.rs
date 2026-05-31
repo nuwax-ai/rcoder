@@ -80,9 +80,8 @@ pub async fn init_proxy(
         info!("📍 [Pingora] calling server_manager.start()...");
         if let Err(e) = server_manager.start(pingora_shutdown_rx).await {
             error!("[Pingora] Pingora proxy start failed, error: {:?}", e);
-            std::process::exit(1);
         }
-        info!("[Pingora] server started");
+        info!("[Pingora] server exited");
     });
 
     info!("[Pingora] already started");

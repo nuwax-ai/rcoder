@@ -67,6 +67,7 @@ impl ComputerContainerManager {
         isolation_type: Option<&str>,
         tenant_id: Option<&str>,
         space_id: Option<&str>,
+        runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
         // 确定容器标识符：pod_id 有值时使用 pod_id，否则使用 user_id
         let container_identifier = pod_id.unwrap_or(user_id);
@@ -75,13 +76,6 @@ impl ComputerContainerManager {
             "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}, pod_id={:?}, container_identifier={}",
             user_id, pod_id, container_identifier
         );
-
-        let runtime = docker_manager::runtime::RuntimeManager::get()
-            .await
-            .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
-                AppError::with_message(ERR_CONTAINER_ERROR, format!("Failed to get runtime: {}", e))
-            })?;
 
         // 1. 尝试获取现有容器
         // 使用 container_identifier 作为容器标识进行查询
@@ -167,7 +161,7 @@ impl ComputerContainerManager {
         );
         Self::create_container_for_user(
             user_id,
-            &runtime,
+            runtime,
             resource_limits,
             pod_id,
             isolation_type,
@@ -188,6 +182,7 @@ impl ComputerContainerManager {
         isolation_type: Option<&str>,
         tenant_id: Option<&str>,
         space_id: Option<&str>,
+        runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
         let container_identifier = pod_id.unwrap_or(user_id);
         info!(
@@ -195,16 +190,9 @@ impl ComputerContainerManager {
             container_identifier
         );
 
-        let runtime = docker_manager::runtime::RuntimeManager::get()
-            .await
-            .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
-                AppError::with_message(ERR_CONTAINER_ERROR, format!("Failed to get runtime: {}", e))
-            })?;
-
         Self::create_container_for_user(
             user_id,
-            &runtime,
+            runtime,
             resource_limits,
             pod_id,
             isolation_type,
@@ -290,7 +278,9 @@ impl ComputerContainerManager {
     ///
     /// 注意：project_id 作为子目录由容器内的 agent 自己管理
     pub async fn get_user_workspace(user_id: &str) -> Result<PathBuf, AppError> {
-        Ok(PathBuf::from(user_dir(user_id)))
+        Ok(PathBuf::from(
+            user_dir(user_id).map_err(|e| AppError::validation_error(&e.to_string()))?,
+        ))
     }
 
     /// 创建用户工作区目录
@@ -314,7 +304,9 @@ impl ComputerContainerManager {
             })?;
 
         // 创建用户目录
-        let user_workspace = PathBuf::from(user_dir(user_id));
+        let user_workspace = PathBuf::from(
+            user_dir(user_id).map_err(|e| AppError::validation_error(&e.to_string()))?,
+        );
         tokio::fs::create_dir_all(&user_workspace)
             .await
             .map_err(|e| {
@@ -339,15 +331,11 @@ impl ComputerContainerManager {
     /// 获取容器信息
     ///
     /// 通过 user_id 查询容器是否存在
-    pub async fn get_container_info(user_id: &str) -> Result<Option<ContainerBasicInfo>, AppError> {
+    pub async fn get_container_info(
+        user_id: &str,
+        runtime: &Arc<dyn ContainerRuntime>,
+    ) -> Result<Option<ContainerBasicInfo>, AppError> {
         debug!("[COMPUTER_CONTAINER] get container: user_id={}", user_id);
-
-        let runtime = docker_manager::runtime::RuntimeManager::get()
-            .await
-            .map_err(|e| {
-                error!("[COMPUTER_CONTAINER] Failed to get runtime: {}", e);
-                AppError::with_message(ERR_CONTAINER_ERROR, format!("Failed to get runtime: {}", e))
-            })?;
 
         runtime
             .get_container_info_by_identifier(user_id, &ServiceType::ComputerAgentRunner)

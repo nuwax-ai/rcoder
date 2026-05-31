@@ -772,7 +772,14 @@ impl ContainerRuntime for KubernetesRuntime {
 
                 // ── Step 2: 等待 Pod 完全终止（404）或超时后 force-delete ──
                 let step_start = std::time::Instant::now();
-                self.wait_for_pod_terminated(&pod_name).await?;
+                if let Err(e) = self.wait_for_pod_terminated(&pod_name).await {
+                    // Pod 终止失败不阻止 PVC 清理：即使 Pod 仍在运行，
+                    // PVC 清理有自己的超时和容错机制
+                    warn!(
+                        "[K8S] wait_for_pod_terminated failed for {}: {} (continuing to PVC cleanup)",
+                        pod_name, e
+                    );
+                }
                 info!(
                     "[K8S] Step 2 (wait pod terminated) took {:.1}s",
                     step_start.elapsed().as_secs_f64()
@@ -910,28 +917,117 @@ impl ContainerRuntime for KubernetesRuntime {
     }
 
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
-        // Clean up all managed pods
+        let total_start = std::time::Instant::now();
+        info!("[K8S_CLEANUP] Starting cleanup_all — sequential pod → PVC deletion");
+
         let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
-        let _ = self
+
+        // ── Step 1: 获取所有 managed Pod 名称（用于后续等待终止）──
+        let pods_to_wait: Vec<String> = self
             .pods()
-            .delete_collection(&DeleteParams::default(), &lp)
+            .list(&lp)
             .await
             .map_err(|e| {
-                ContainerRuntimeError::ConnectionError(format!("Failed to cleanup pods: {}", e))
-            })?;
+                ContainerRuntimeError::ConnectionError(format!(
+                    "Failed to list pods for cleanup: {}",
+                    e
+                ))
+            })?
+            .items
+            .iter()
+            .filter_map(|pod| pod.metadata.name.clone())
+            .collect();
 
-        // Clean up all managed PVCs (workspace PVCs for each project/user)
-        // These have the managed-by=rcoder-runtime label
+        info!(
+            "[K8S_CLEANUP] Found {} managed pods to clean",
+            pods_to_wait.len()
+        );
+
+        // ── Step 2: 批量删除 Pod（graceful, Foreground 传播）──
+        let dp = DeleteParams {
+            propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
+            grace_period_seconds: Some(30),
+            ..Default::default()
+        };
+
+        match self.pods().delete_collection(&dp, &lp).await {
+            Ok(_) => info!("[K8S CLEANUP] Pod delete_collection requested"),
+            Err(e) => {
+                tracing::warn!(
+                    "[K8S CLEANUP] Pod delete_collection failed: {} (continuing)",
+                    e
+                );
+            }
+        }
+
+        // ── Step 3: 等待所有 Pod 完全终止 ──
+        // 关键：必须在删除 PVC 之前完成，确保 FUSE 卷已卸载
+        let wait_futures: Vec<_> = pods_to_wait
+            .iter()
+            .map(|pod_name| self.wait_for_pod_terminated(pod_name))
+            .collect();
+
+        let wait_results = futures_util::future::join_all(wait_futures).await;
+        for (pod_name, result) in pods_to_wait.iter().zip(wait_results.iter()) {
+            if let Err(e) = result {
+                tracing::warn!(
+                    "[K8S CLEANUP] Pod {} termination wait failed: {}",
+                    pod_name,
+                    e
+                );
+            }
+        }
+
+        // ── Step 4: 等待 PVC finalizer 移除后批量删除 PVC ──
         let pvc_lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
-        let _ = self
+        let pvcs_to_clean: Vec<String> = self
+            .pvcs()
+            .list(&pvc_lp)
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::ConnectionError(format!(
+                    "Failed to list PVCs for cleanup: {}",
+                    e
+                ))
+            })?
+            .items
+            .iter()
+            .filter_map(|pvc| pvc.metadata.name.clone())
+            .collect();
+
+        info!(
+            "[K8S CLEANUP] Found {} managed PVCs to clean",
+            pvcs_to_clean.len()
+        );
+
+        for pvc_name in &pvcs_to_clean {
+            if let Err(e) = self.wait_for_pvc_removable(pvc_name).await {
+                tracing::warn!(
+                    "[K8S CLEANUP] PVC {} not removable: {} (force deleting)",
+                    pvc_name,
+                    e
+                );
+            }
+        }
+
+        match self
             .pvcs()
             .delete_collection(&DeleteParams::default(), &pvc_lp)
             .await
-            .map_err(|e| {
-                ContainerRuntimeError::ConnectionError(format!("Failed to cleanup PVCs: {}", e))
-            })?;
+        {
+            Ok(_) => info!("[K8S CLEANUP] PVC delete_collection completed"),
+            Err(e) => {
+                tracing::warn!("[K8S CLEANUP] PVC delete_collection failed: {}", e);
+            }
+        }
 
+        // 清理缓存
         self.pod_cache.write().await.clear();
+
+        info!(
+            "[K8S CLEANUP] cleanup_all completed in {:.1}s",
+            total_start.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 

@@ -56,33 +56,38 @@ impl ProjectAdapter {
     }
 
     /// 插入或更新项目信息（替代 project_and_agent_map.insert）
+    ///
+    /// 使用事务确保项目和容器记录的原子性写入，避免部分写入导致的孤儿记录。
     pub fn insert(
         &self,
         project_id: String,
         info: Arc<ProjectAndContainerInfo>,
     ) -> Result<(), duckdb_manager::DuckDbError> {
-        // 如果有容器信息，先保存容器
-        if let Some(container) = info.container() {
+        // 准备容器记录（如果存在）
+        let container_record = info.container().map(|container| {
             debug!(
                 "Inserting project container info: project_id={}, container_id={}, container_ip={}",
                 project_id, container.container_id, container.container_ip
             );
-            let container_record =
-                DataBridge::container_info_to_record(container, info.service_type());
-            self.storage.save_container(&container_record)?;
-        } else {
+            DataBridge::container_info_to_record(container, info.service_type())
+        });
+
+        if container_record.is_none() {
             debug!("No project container: project_id={}", project_id);
         }
 
-        // 保存项目记录
+        // 准备项目记录
         let record = DataBridge::info_to_project_record(&info, &project_id);
         debug!(
             "Saving project record: project_id={}, session_id={:?}, container_id={}",
             record.project_id, record.session_id, record.container_id
         );
-        self.storage.save_project(&record)?;
 
-        debug!("Removed project: {}", project_id);
+        // 使用事务原子性地保存项目和容器记录
+        self.storage
+            .save_project_and_container_atomic(&record, container_record.as_ref())?;
+
+        debug!("Inserted project: {}", project_id);
         Ok(())
     }
 
@@ -113,12 +118,18 @@ impl ProjectAdapter {
     }
 
     /// 获取所有项目（替代 project_and_agent_map.iter）
+    ///
+    /// 使用 JOIN 查询一次性获取项目和容器信息，避免 N+1 查询问题。
+    /// 100 个项目：从 101 次查询优化为 1 次查询。
     pub fn iter(&self) -> impl Iterator<Item = (String, Arc<ProjectAndContainerInfo>)> + '_ {
-        let projects = self.storage.get_all_projects().unwrap_or_default();
-        projects.into_iter().map(move |record| {
-            let container = self.get_container_for_project(&record);
-            let info = DataBridge::project_record_to_info(&record, container);
-            (record.project_id.clone(), Arc::new(info))
+        let data = self
+            .storage
+            .get_all_projects_with_containers()
+            .unwrap_or_default();
+        data.into_iter().map(|(project_record, container_record)| {
+            let container = container_record.map(|c| DataBridge::container_record_to_info(&c));
+            let info = DataBridge::project_record_to_info(&project_record, container);
+            (project_record.project_id.clone(), Arc::new(info))
         })
     }
 
@@ -168,6 +179,36 @@ impl ProjectAdapter {
         Ok(())
     }
 
+    /// 原子更新会话信息（仅当当前 session_id 与预期相同时才更新）
+    ///
+    /// 使用 compare-and-swap 模式防止并发更新导致的竞态条件。
+    /// 只有当数据库中当前的 session_id 与 `expected_current_session_id` 相同时才更新。
+    /// 如果 `expected_current_session_id` 为 None，则只在当前没有 session_id 时更新。
+    pub fn update_session_atomic(
+        &self,
+        project_id: &str,
+        new_session_id: &str,
+        expected_current_session_id: Option<&str>,
+    ) -> Result<bool, duckdb_manager::DuckDbError> {
+        let updated = self.storage.update_session_atomic(
+            project_id,
+            new_session_id,
+            expected_current_session_id,
+        )?;
+        if updated {
+            debug!(
+                "Atomic session update: project_id={}, new_session_id={}, expected_current={:?}",
+                project_id, new_session_id, expected_current_session_id
+            );
+        } else {
+            debug!(
+                "Atomic session update skipped (session_id changed): project_id={}, expected_current={:?}",
+                project_id, expected_current_session_id
+            );
+        }
+        Ok(updated)
+    }
+
     /// 清除会话信息（将 session_id 设置为 NULL）
     ///
     /// 用于 Agent 停止后清理会话状态
@@ -202,18 +243,12 @@ impl ProjectAdapter {
     // ========== 活动时间更新方法 ==========
 
     /// 更新项目活动时间，返回实际更新使用的时间戳
+    ///
+    /// 使用原子操作在单个事务中同时更新项目和关联容器的活动时间，
+    /// 避免多次 mutex 获取之间的 TOCTOU 竞态条件。
     pub fn update_activity(&self, project_id: &str) -> Option<DateTime<Utc>> {
-        match self.storage.update_project_activity(project_id) {
-            Ok(Some(updated_time)) => {
-                // 使用相同的时间更新关联容器的活动时间
-                if let Ok(Some(record)) = self.storage.get_project(project_id) {
-                    let _ = self
-                        .storage
-                        .update_container_activity_with_time(&record.container_id, updated_time);
-                }
-                Some(updated_time)
-            }
-            Ok(None) => None,
+        match self.storage.update_activity_atomic(project_id) {
+            Ok(updated_time) => updated_time,
             Err(e) => {
                 warn!("update project {} failed: {}", project_id, e);
                 None

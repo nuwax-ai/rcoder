@@ -1,18 +1,15 @@
-// 在 crate 根级别初始化 i18n
-// fallback 设置为默认语言 en-US，保持一致性
-rust_i18n::i18n!("locales", fallback = "en-US");
-
 mod container;
 mod model;
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
 
-// i18n 国际化模块
-pub mod i18n;
-pub use i18n::{
-    DEFAULT_LOCALE, SUPPORTED_LOCALES, get_locale, parse_accept_language, set_locale, t, t_default,
+// i18n 国际化模块 — 重导出自 shared_types_i18n（过渡期兼容）
+pub use shared_types_i18n::{
+    i18n, DEFAULT_LOCALE, SUPPORTED_LOCALES, get_locale, parse_accept_language, set_locale, t,
+    t_default,
 };
+
 pub mod request_locale;
 pub use request_locale::{current_request_locale, scope_request_locale};
 
@@ -45,27 +42,31 @@ pub use permission_types::{
 pub mod constants;
 pub use constants::*;
 
-// 错误码定义模块
-pub mod error_codes;
-pub use error_codes::{get_error_message, get_i18n_message, get_i18n_message_default};
+// 错误码定义模块 — 重导出自 shared_types_i18n（过渡期兼容）
+pub use shared_types_i18n::{
+    error_codes, get_error_message, get_i18n_message, get_i18n_message_default,
+    get_error_description, SUCCESS, ERR_AGENT_BUSY, ERR_CANCEL_FAILED, ERR_STOP_FAILED,
+    ERR_VALIDATION, ERR_INVALID_PARAMS, ERR_INVALID_RESOURCE_LIMITS, ERR_CONTAINER_ERROR,
+    ERR_WORKSPACE_ERROR, ERR_GRPC_ADDR_ERROR, ERR_GRPC_ERROR, ERR_SERVICE_UNAVAILABLE,
+    ERR_AGENT_ERROR, ERR_PROXY_DISABLED, ERR_PROXY_SERVICE_UNAVAILABLE, ERR_UNKNOWN,
+    ERR_SESSION_NOT_FOUND, ERR_AGENT_NOT_FOUND, ERR_CONTAINER_NOT_FOUND,
+    ERR_HTTP_FALLBACK_FAILED, ERR_INTERNAL_SERVER_ERROR, ERR_RESUME_FAILED,
+    ERR_RETRY_EXHAUSTED, ERR_TOO_MANY_REQUESTS, ERR_API_KEY_AUTH_FAILED,
+    ERR_PERMISSION_NOT_FOUND, ERR_PERMISSION_RESOLVE_FAILED, ERR_PERMISSION_EXPIRED,
+};
 
 // Validation 模块
 pub mod validation;
 pub use validation::garde_err_to_app_error;
 
-// gRPC 模块
-pub mod grpc {
-    // 包含生成的代码，路径相对于当前文件
-    include!("grpc/agent.rs");
-}
+// gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
+pub use shared_types_grpc::grpc;
 
-// 导出 URL 脱敏工具函数
-pub mod grpc_mask;
-pub use grpc_mask::mask_url;
+// 导出 URL 脱敏工具函数（re-export from shared_types_grpc）
+pub use shared_types_grpc::mask_url;
 
-// 导出 gRPC 脱敏包装器
-pub mod grpc_wrapper;
-pub use grpc_wrapper::MaskedModelConfig;
+// 导出 gRPC 脱敏包装器（重导出自 shared_types_grpc）
+pub use shared_types_grpc::MaskedModelConfig;
 
 pub use model::{
     AcpRequestPermission,

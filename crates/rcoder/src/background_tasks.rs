@@ -74,7 +74,7 @@ pub async fn start_all_background_tasks(
         sync_interval: Duration::from_secs(60),
     };
     let container_sync_handle =
-        start_container_sync_task(container_sync_config, state.grpc_pool.clone());
+        start_container_sync_task(container_sync_config, state.grpc_pool.clone(), state.runtime().clone());
     info!("Container status sync already started (interval: 60s, detect container)");
 
     let vnc_sync_handle = if let Some(ref pingora_service) = state.pingora_service {
@@ -86,6 +86,7 @@ pub async fn start_all_background_tasks(
             vnc_sync_config,
             state.container_prefix_rcoder.clone(),
             state.container_prefix_computer.clone(),
+            state.runtime().clone(),
         );
         info!("VNC sync already started (interval: 5s, sync Docker container IP)");
         Some(handle)

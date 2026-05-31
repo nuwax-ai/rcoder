@@ -117,7 +117,7 @@ pub async fn startup_cleanup_containers(
             skipped_running: 0,
             removed_container_ids: Vec::new(),
             failed_removals_details: Vec::new(),
-            duration_ms: start_time.elapsed().as_millis() as u64,
+            duration_ms: start_time.elapsed().as_millis().min(u64::MAX as u128) as u64,
         });
     }
 
@@ -187,7 +187,7 @@ pub async fn startup_cleanup_containers(
         }
     }
 
-    let duration_ms = start_time.elapsed().as_millis() as u64;
+    let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     info!(
         "[STARTUP_CLEANUP] Cleanup completed: total={}, success={}, failed={}, duration={}ms",
@@ -405,7 +405,7 @@ pub async fn runtime_cleanup_containers(
         }
     }
 
-    let duration_ms = start_time.elapsed().as_millis() as u64;
+    let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     info!(
         "[RUNTIME_CLEANUP] Batch cleanup completed: total={}, success={}, failed={}, duration={}ms",
@@ -583,7 +583,7 @@ pub async fn startup_cleanup_all_enabled_services(
         }
     }
 
-    aggregated_result.duration_ms = start_time.elapsed().as_millis() as u64;
+    aggregated_result.duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     info!(
         "[MULTI_SERVICE_CLEANUP] Multi-service cleanup completed: total={}, success={}, failed={}, duration={}ms",

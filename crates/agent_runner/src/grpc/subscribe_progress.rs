@@ -2,7 +2,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use shared_types::grpc::{ProgressEvent, ProgressRequest};
 use tokio::sync::mpsc;
@@ -17,6 +17,10 @@ use crate::service::SESSION_CACHE;
 use super::locale::{locale_from_grpc_request, localized};
 
 pub type SubscribeProgressStream = Pin<Box<dyn Stream<Item = Result<ProgressEvent, Status>> + Send>>;
+
+/// 空闲超时时间（5分钟）
+/// 如果在这个时间内没有收到任何真实消息（不包括心跳），则关闭流
+const IDLE_TIMEOUT_SECS: u64 = 300;
 
 #[instrument(skip(_app_state, request))]
 pub async fn subscribe_progress(
@@ -52,7 +56,7 @@ pub async fn subscribe_progress(
                         "🆕 [gRPC] SESSION_CACHE does not exist, creating new: session_id={}",
                         session_id_clone
                     );
-                    let session_data = crate::service::SessionData::new(1000);
+                    let session_data = crate::service::SessionData::new(1000).await;
                     entry.insert(session_data.clone());
                     session_data
                 }
@@ -61,6 +65,8 @@ pub async fn subscribe_progress(
             match session_data.create_new_connection(100).await {
                 Ok((mut message_rx, cancellation_token)) => {
                     info!("📡 [gRPC] Session connection created successfully: {}", session_id_clone);
+
+                    let mut last_message_time = Instant::now();
 
                     loop {
                         tokio::select! {
@@ -93,6 +99,9 @@ pub async fn subscribe_progress(
                             msg = message_rx.recv() => {
                                 match msg {
                                     Some(unified_message) => {
+                                        // 重置空闲超时计时器
+                                        last_message_time = Instant::now();
+
                                         let is_terminal_message = matches!(
                                             unified_message.message_type,
                                             crate::model::SessionMessageType::SessionPromptEnd
@@ -137,6 +146,31 @@ pub async fn subscribe_progress(
                                 }
                             }
                             _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                                // 检查空闲超时
+                                if last_message_time.elapsed() > Duration::from_secs(IDLE_TIMEOUT_SECS) {
+                                    info!(
+                                        "⏱️ [gRPC] Idle timeout ({}s) reached, closing stream: session_id={}",
+                                        IDLE_TIMEOUT_SECS, session_id_clone
+                                    );
+                                    let timeout_event = ProgressEvent {
+                                        message_type: "SessionPromptEnd".to_string(),
+                                        sub_type: "idle_timeout".to_string(),
+                                        payload: format!(
+                                            r#"{{"reason":"IdleTimeout","description":"{}"}}"#,
+                                            localized(
+                                                locale,
+                                                "会话空闲超时",
+                                                "會話空閒超時",
+                                                "Session idle timeout",
+                                            )
+                                        ),
+                                        request_id: None,
+                                        timestamp: chrono::Utc::now().timestamp_millis(),
+                                    };
+                                    let _ = tx.send(Ok(timeout_event)).await;
+                                    break;
+                                }
+
                                 let heartbeat = ProgressEvent {
                                     message_type: "Heartbeat".to_string(),
                                     sub_type: "ping".to_string(),

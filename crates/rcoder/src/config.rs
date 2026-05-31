@@ -644,7 +644,8 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
     let config_content = fs::read_to_string(CONFIG_FILE)
         .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
-    tracing::debug!("config file content: {}", config_content);
+    // 安全修复：移除完整配置内容的 debug 日志，避免泄露 API Key 等敏感信息
+    tracing::debug!("config file loaded, size: {} bytes", config_content.len());
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;

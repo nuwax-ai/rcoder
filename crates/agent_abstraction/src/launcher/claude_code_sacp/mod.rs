@@ -17,7 +17,7 @@ pub use config::{
     load_sacp_agent_config, load_sacp_agent_config_with_resolver,
 };
 pub use launcher_impl::SacpClaudeCodeLauncher;
-pub use mcp::convert_context_servers_sacp;
+pub use mcp::{convert_context_servers_sacp, set_mcp_proxy_log_dir};
 pub use types::{SacpAgentLaunchConfig, SacpLauncherConnectionInfo};
 
 #[cfg(test)]

@@ -134,19 +134,12 @@ pub async fn computer_agent_status(
     );
 
     // 2. 查询容器信息（通过 Runtime）
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[COMPUTER_AGENT_STATUS] Failed to get runtime: {}", e);
-            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-        })?;
-
     // 获取容器标识符（user_id 或 pod_id）
     let identifier = request.user_id.clone().or(request.pod_id.clone());
     let identifier_str = identifier.as_deref().unwrap_or("");
 
     // 获取容器信息（ComputerAgentRunner 使用 user_id 或 pod_id 作为容器标识）
-    let container_info = match runtime
+    let container_info = match state.runtime()
         .get_container_info_by_identifier(
             identifier_str,
             &shared_types::ServiceType::ComputerAgentRunner,
@@ -198,6 +191,7 @@ pub async fn computer_agent_status(
     // 4. 主动调用 gRPC GetStatus 确认 Agent 真实状态
     // 使用实时 IP 获取，避免 restart 后 IP 过期
     let grpc_addr = match get_realtime_container_ip(
+        state.runtime(),
         &container_info.container_name,
         &container_info.container_ip,
         &state.container_prefix_rcoder,
@@ -227,6 +221,7 @@ pub async fn computer_agent_status(
     // 调用 gRPC GetStatus（带超时和重试，重试时自动重新获取 IP）
     let grpc_response = match call_grpc_get_status_with_retry(
         &state.grpc_pool,
+        state.runtime(),
         &container_info.container_name,
         &container_info.container_ip,
         &state.container_prefix_rcoder,
@@ -353,6 +348,7 @@ pub async fn computer_agent_status(
 #[allow(clippy::too_many_arguments)]
 async fn call_grpc_get_status_with_retry(
     pool: &Arc<crate::grpc::GrpcChannelPool>,
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     container_name: &str,
     fallback_ip: &str,
     rcoder_prefix: &str,
@@ -368,6 +364,7 @@ async fn call_grpc_get_status_with_retry(
         // 重新获取最新容器 IP（每次重试时）
         if attempt > 1 {
             match get_realtime_container_ip(
+                runtime,
                 container_name,
                 fallback_ip,
                 rcoder_prefix,

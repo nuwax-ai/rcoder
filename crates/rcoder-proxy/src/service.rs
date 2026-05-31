@@ -74,7 +74,14 @@ fn mask_header_value(value: &str) -> String {
     if value.len() <= 10 {
         return "***".to_string();
     }
-    format!("{}***{}", &value[..4], &value[value.len() - 4..])
+    // 使用 char-based 切片避免 UTF-8 边界 panic
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 10 {
+        return "***".to_string();
+    }
+    let prefix: String = chars[..4].iter().collect();
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
+    format!("{}***{}", prefix, suffix)
 }
 
 /// 对 URL 进行脱敏处理，隐藏域名中间部分
@@ -111,18 +118,19 @@ fn mask_url(url: &str) -> String {
 /// # 规则
 /// - 保留前 3 个字符和后 6 个字符（包括顶级域名）
 /// - 中间部分用 `***` 替代
+/// - `localhost` 和短域名（<=6 字符）不做脱敏处理
 ///
 /// # 示例
 /// - `anthropic-code-api.nuwax.com` -> `ant***ax.com`
 /// - `api.openai.com` -> `api***ai.com`
-/// - `localhost` -> `loc***ost` (短域名)
+/// - `localhost` -> `localhost` (特殊域名不脱敏)
 fn mask_domain(domain: &str) -> String {
     // 使用字符而非字节处理，避免 Unicode 边界问题
     let chars: Vec<char> = domain.chars().collect();
     let len = chars.len();
 
-    // 如果域名太短（小于等于 6 个字符），不脱敏
-    if len <= 6 {
+    // 如果域名太短（小于等于 6 个字符），或者特定域名（localhost），不脱敏
+    if len <= 6 || domain == "localhost" {
         return domain.to_string();
     }
 
@@ -178,7 +186,7 @@ impl ProxyMetrics {
     pub fn record_response(&self, status_text: &str, duration: std::time::Duration) {
         self.total_responses.fetch_add(1, Ordering::Relaxed);
         self.total_response_time_ns
-            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+            .fetch_add(duration.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
         // 粗略判断成功：2xx
         let is_success = status_text.starts_with('2');
         if is_success {
@@ -196,7 +204,7 @@ impl ProxyMetrics {
     ) {
         let arc = self.get_or_create_port_metrics(port);
         arc.total_response_time_ns
-            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+            .fetch_add(duration.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
         let is_success = status_text.starts_with('2');
         if is_success {
             arc.successes.fetch_add(1, Ordering::Relaxed);
@@ -1494,8 +1502,8 @@ impl PortProxy {
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
-        self.metrics.record_request();
         ctx.target_port = Some(target_port);
+        self.metrics.record_request();
         self.metrics.record_request_port(target_port).await;
         self.metrics.inc_active();
 
@@ -1584,7 +1592,7 @@ impl PingoraProxyService {
     }
 
     /// 创建 Pingora 代理服务实例
-    pub fn create_pingora_proxy(&self) -> anyhow::Result<PortProxy> {
+    pub fn create_pingora_proxy(&self) -> Result<PortProxy, crate::ProxyError> {
         // 使用统一的路由配置
         let router = create_router().map_err(|e| {
             tracing::error!("[PROXY] create route failed: {}", e);
@@ -1639,7 +1647,7 @@ impl PingoraProxyService {
 
     /// 从请求中提取目标端口（兼容接口）
     #[allow(dead_code)]
-    pub fn extract_target_port(&self, req: &axum::extract::Request) -> Result<u16> {
+    pub fn extract_target_port(&self, req: &axum::extract::Request) -> crate::ProxyResult<u16> {
         // 1. 首先尝试从 Path 中提取端口 (例如 /proxy/8080/path)
         let path = req.uri().path();
         if path.starts_with("/proxy/") {
@@ -1671,12 +1679,12 @@ impl PingoraProxyService {
     }
 
     /// 获取目标后端地址
-    pub async fn get_target_backend(&self, port: u16) -> Result<String> {
+    pub async fn get_target_backend(&self, port: u16) -> crate::ProxyResult<String> {
         let backends = self.backends.read().await;
         backends
             .get(&port)
             .cloned()
-            .ok_or_else(|| anyhow!("backend service not found for port {}", port))
+            .ok_or_else(|| crate::ProxyError::Backend(format!("backend service not found for port {}", port)))
     }
 
     /// 创建负载均衡器
@@ -1710,11 +1718,11 @@ impl PingoraProxyService {
     pub async fn proxy_request(
         &self,
         _req: axum::extract::Request,
-    ) -> Result<axum::response::Response> {
+    ) -> crate::ProxyResult<axum::response::Response> {
         // 这个方法提供兼容性，但实际的代理由 Pingora 服务器处理
         // 在实际部署中，请求会直接发送到 Pingora 监听的端口
-        Err(anyhow!(
-            "This method is only for compatibility. Actual proxy functionality is handled by Pingora server, please directly request the port Pingora is listening on"
+        Err(crate::ProxyError::RequestHandling(
+            "This method is only for compatibility. Actual proxy functionality is handled by Pingora server, please directly request the port Pingora is listening on".to_string()
         ))
     }
 
@@ -1830,20 +1838,6 @@ impl PingoraProxyService {
     // ========================================================================
     // 🔒 API 密钥管理方法
     // ========================================================================
-
-    /// 设置 API 密钥管理器（用于共享 DashMap）
-    ///
-    /// 这个方法允许从外部传入一个共享的 DashMap，使 agent_runner 和 Pingora
-    /// 能够共享 API 密钥配置。
-    pub fn set_api_key_manager(&self, api_key_manager: Arc<DashMap<String, ModelProviderConfig>>) {
-        // 由于 DashMap 使用 Arc，我们可以通过修改内部实现来替换
-        // 注意：这里需要使用 unsafe 或者重新设计架构
-        // 简单起见，我们直接插入所有现有配置到新的 DashMap
-        for entry in self.api_key_manager.iter() {
-            let (key, value) = (entry.key().clone(), entry.value().clone());
-            api_key_manager.insert(key, value);
-        }
-    }
 
     /// 获取 API 密钥管理器的引用（用于共享）
     pub fn get_api_key_manager(&self) -> Arc<DashMap<String, ModelProviderConfig>> {
@@ -2230,7 +2224,8 @@ mod tests {
     #[test]
     fn test_mask_domain_short() {
         // 短域名（7-10 字符）：保留前 3 后 3 字符
-        assert_eq!(mask_domain("localhost"), "loc***ost"); // 9 字符
+        // 注意：localhost 是特殊域名，不脱敏
+        assert_eq!(mask_domain("localhost"), "localhost"); // 特殊域名
         assert_eq!(mask_domain("test.com"), "tes***com"); // 8 字符
     }
 
@@ -2262,6 +2257,6 @@ mod tests {
     #[test]
     fn test_mask_url_http() {
         let result = mask_url("http://localhost:8080/api");
-        assert_eq!(result, "http://loc***ost:8080/api");
+        assert_eq!(result, "http://localhost:8080/api"); // localhost 不脱敏
     }
 }

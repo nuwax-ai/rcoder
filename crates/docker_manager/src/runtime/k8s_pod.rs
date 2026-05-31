@@ -16,7 +16,7 @@ use kube::api::DeleteParams;
 #[cfg(feature = "kubernetes")]
 use shared_types::ServiceType;
 #[cfg(feature = "kubernetes")]
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "kubernetes")]
 use super::kubernetes_runtime::KubernetesRuntime;
@@ -281,24 +281,65 @@ impl K8sPodOps for KubernetesRuntime {
             ..Default::default()
         };
         match self.pods().delete(pod_name, &force_dp).await {
-            Ok(_) => info!(
-                "[K8S] Pod {} force-delete requested (gracePeriod=0)",
-                pod_name
-            ),
+            Ok(_) => {
+                info!(
+                    "[K8S] Pod {} force-delete requested (gracePeriod=0)",
+                    pod_name
+                );
+                // force-delete 成功后仍需等待 Pod 真正消失（404）
+                // 因为 force-delete 只是发起请求，kubelet 还需要时间清理
+                let cleanup_start = std::time::Instant::now();
+                let cleanup_timeout = std::time::Duration::from_secs(15);
+                while cleanup_start.elapsed() < cleanup_timeout {
+                    match self.pods().get(pod_name).await {
+                        Ok(_) => {
+                            debug!(
+                                "[K8S] Pod {} still cleaning up after force-delete ({:.0}s elapsed)...",
+                                pod_name,
+                                cleanup_start.elapsed().as_secs_f64()
+                            );
+                        }
+                        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                            info!(
+                                "[K8S] Pod {} fully terminated after force-delete (took {:.1}s)",
+                                pod_name,
+                                start.elapsed().as_secs_f64()
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            debug!(
+                                "[K8S] Poll pod {} after force-delete returned {} (will retry)",
+                                pod_name, e
+                            );
+                        }
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+                // 即使等待后仍未消失，也不返回错误
+                // K8s 最终会回收 Pod，PVC 清理有独立容错
+                warn!(
+                    "[K8S] Pod {} still not 404 after force-delete + 15s wait, proceeding anyway",
+                    pod_name
+                );
+                Ok(())
+            }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 info!("[K8S] Pod {} already gone after timeout", pod_name);
+                Ok(())
             }
             Err(e) => {
-                warn!(
-                    "[K8S] Force-delete pod {} failed: {}. \
-                     Pod may still be running; subsequent PVC cleanup may encounter unmount issues.",
+                // force-delete 失败：Pod 仍在运行，返回错误让调用方知道
+                // 这会影响后续的 PVC 清理决策
+                error!(
+                    "[K8S] Force-delete pod {} failed: {}. Pod is still running.",
                     pod_name, e
                 );
-                // 不返回错误，让调用方继续：
-                // - K8s 最终会回收 Pod（grace period 到期后 kubelet 强杀）
-                // - PVC 清理有独立的超时和容错机制
+                Err(ContainerRuntimeError::ContainerStopError(format!(
+                    "force-delete pod {} failed after 75s timeout: {}",
+                    pod_name, e
+                )))
             }
         }
-        Ok(())
     }
 }

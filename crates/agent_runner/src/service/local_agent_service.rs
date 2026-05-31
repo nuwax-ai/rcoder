@@ -136,7 +136,7 @@ impl AgentHttpService for LocalAgentHttpService {
         // 8. 将 session 写入 SESSION_CACHE（SSE 进度流需要）
         let session_id_str = output.session_id.clone();
         if SESSION_CACHE.get(&session_id_str).is_none() {
-            let session_data = SessionData::new(1000);
+            let session_data = SessionData::new(1000).await;
             SESSION_CACHE.insert(session_id_str, session_data);
         }
 

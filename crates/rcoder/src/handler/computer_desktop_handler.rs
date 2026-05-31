@@ -160,9 +160,9 @@ const NOVNC_PORT: u16 = 6080;
     summary = "获取 VNC 桌面访问信息",
     description = "返回 VNC 桌面的访问 URL，推荐使用 Pingora 代理路径访问"
 )]
-#[instrument(skip(_state), fields(user_id = %params.user_id, project_id = %params.project_id))]
+#[instrument(skip(state), fields(user_id = %params.user_id, project_id = %params.project_id))]
 pub async fn computer_desktop_vnc(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     I18nPath(params): I18nPath<DesktopPathParams>,
 ) -> Result<HttpResult<DesktopAccessResponse>, AppError> {
@@ -195,7 +195,7 @@ pub async fn computer_desktop_vnc(
     );
 
     // 2. 查找用户容器
-    let container_info = ComputerContainerManager::get_container_info(&user_id).await?;
+    let container_info = ComputerContainerManager::get_container_info(&user_id, state.runtime()).await?;
 
     let container_info = match container_info {
         Some(info) => info,

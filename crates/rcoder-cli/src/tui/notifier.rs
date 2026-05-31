@@ -13,13 +13,13 @@ use crate::tui::event::AppEvent;
 
 /// TUI 会话通知器
 pub struct TuiSessionNotifier {
-    tx: mpsc::UnboundedSender<AppEvent>,
+    tx: mpsc::Sender<AppEvent>,
     completion_signal: Option<PromptCompletionSignal>,
 }
 
 impl TuiSessionNotifier {
     pub fn new(
-        tx: mpsc::UnboundedSender<AppEvent>,
+        tx: mpsc::Sender<AppEvent>,
         completion_signal: Option<PromptCompletionSignal>,
     ) -> Self {
         Self {
@@ -43,7 +43,8 @@ impl SessionNotifier for TuiSessionNotifier {
         session_id: &str,
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _ = self.tx.send(AppEvent::PromptStarted {
+        // 使用 try_send 提供背压保护，避免无限缓冲
+        let _ = self.tx.try_send(AppEvent::PromptStarted {
             session_id: session_id.to_string(),
         });
         Ok(())
@@ -57,7 +58,7 @@ impl SessionNotifier for TuiSessionNotifier {
         error_message: Option<String>,
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _ = self.tx.send(AppEvent::PromptEnded {
+        let _ = self.tx.try_send(AppEvent::PromptEnded {
             session_id: session_id.to_string(),
             error: error_message,
         });
@@ -72,7 +73,7 @@ impl SessionNotifier for TuiSessionNotifier {
         error: agent_client_protocol::schema::Error,
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _ = self.tx.send(AppEvent::PromptEnded {
+        let _ = self.tx.try_send(AppEvent::PromptEnded {
             session_id: session_id.to_string(),
             error: Some(format!("{:?}", error)),
         });
@@ -90,16 +91,16 @@ impl SessionNotifier for TuiSessionNotifier {
         match session_update {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 if let ContentBlock::Text(text) = &chunk.content {
-                    let _ = self.tx.send(AppEvent::AgentText(text.text.clone()));
+                    let _ = self.tx.try_send(AppEvent::AgentText(text.text.clone()));
                 }
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
                 if let ContentBlock::Text(text) = &chunk.content {
-                    let _ = self.tx.send(AppEvent::AgentThought(text.text.clone()));
+                    let _ = self.tx.try_send(AppEvent::AgentThought(text.text.clone()));
                 }
             }
             SessionUpdate::ToolCall(tool_call) => {
-                let _ = self.tx.send(AppEvent::ToolCall {
+                let _ = self.tx.try_send(AppEvent::ToolCall {
                     title: tool_call.title.clone(),
                     status: format!("{:?}", tool_call.status),
                 });
@@ -112,7 +113,7 @@ impl SessionNotifier for TuiSessionNotifier {
                         .as_ref()
                         .map(|s| format!("{:?}", s))
                         .unwrap_or_else(|| "updating".to_string());
-                    let _ = self.tx.send(AppEvent::ToolCall {
+                    let _ = self.tx.try_send(AppEvent::ToolCall {
                         title: title.clone(),
                         status: status_str,
                     });

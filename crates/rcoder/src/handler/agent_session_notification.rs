@@ -445,17 +445,7 @@ async fn validate_and_get_session_context(
         }
     };
 
-    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!("[SSE_PROXY] Failed to get runtime: {}", e);
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                "Unable to access runtime service. Please contact administrator.",
-            ));
-        }
-    };
+    let runtime = state.runtime().clone();
 
     // ========== 阶段 2: 获取稳定的 container_name（不是 container_id） ==========
     // 🔧 关键修复：container_name 在容器重建后保持不变（如 computer-agent-runner-user_123）
@@ -659,6 +649,7 @@ async fn validate_and_get_session_context(
 /// 通过 container_name 创建 gRPC SSE 流
 #[allow(clippy::too_many_arguments)]
 async fn build_sse_stream_from_container_name(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     container_name: String,
     session_id: String,
     project_id: String,
@@ -672,6 +663,7 @@ async fn build_sse_stream_from_container_name(
     // 使用 container_name（如 computer-agent-runner-user_123）查询
     // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
     let container_ip = match get_realtime_container_ip(
+        runtime,
         &container_name,
         "", // 无 fallback_ip，直接使用 Docker API 查询结果
         rcoder_prefix,
@@ -927,6 +919,7 @@ pub async fn agent_session_notification(
 
     // 使用通用函数创建 SSE 响应流
     build_sse_stream_from_container_name(
+        state.runtime(),
         container_name,
         session_id.to_string(),
         project_id,
@@ -1034,6 +1027,7 @@ pub async fn computer_agent_progress_notification(
 
     // 使用通用函数创建 SSE 响应流
     build_sse_stream_from_container_name(
+        state.runtime(),
         container_name,
         session_id.to_string(),
         project_id,
@@ -1238,6 +1232,7 @@ fn map_error_code_for_locale(code: &str) -> &str {
 
 /// 获取容器的 SSE 端点 URL
 async fn get_container_sse_url(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     project_id: &str,
     _agent_info: &ProjectAndContainerInfo,
     session_id: &str,
@@ -1246,13 +1241,6 @@ async fn get_container_sse_url(
         "🔍 [CONTAINER] 获取容器SSE端点: project_id={}, session_id={}",
         project_id, session_id
     );
-
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[CONTAINER] Failed to get runtime: {}", e);
-            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-        })?;
 
     if let Some(info) = runtime
         .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)

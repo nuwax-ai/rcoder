@@ -4,11 +4,13 @@
 //! 这是对 Docker 容器状态检查的补充，用于确认容器内服务是否真正可用。
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tonic::transport::Channel;
 use tracing::{debug, warn};
 
 /// 默认 HTTP 健康检查端口
@@ -68,6 +70,9 @@ pub struct ServiceHealthChecker {
     http_port: u16,
     grpc_port: u16,
     timeout_secs: u64,
+    /// gRPC channel 缓存，避免每次健康检查都创建新连接
+    /// Key: IP 地址，Value: 复用的 Channel
+    channel_cache: Arc<DashMap<String, Channel>>,
 }
 
 impl ServiceHealthChecker {
@@ -81,6 +86,7 @@ impl ServiceHealthChecker {
             http_port: DEFAULT_HTTP_HEALTH_PORT,
             grpc_port: DEFAULT_GRPC_PORT,
             timeout_secs: HEALTH_CHECK_TIMEOUT_SECS,
+            channel_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -91,6 +97,28 @@ impl ServiceHealthChecker {
             grpc_port,
             ..Self::new()
         }
+    }
+
+    /// 获取或创建 gRPC channel（复用连接）
+    async fn get_or_create_channel(&self, addr: &str) -> Result<Channel, String> {
+        // 尝试从缓存获取
+        if let Some(channel) = self.channel_cache.get(addr) {
+            return Ok(channel.clone());
+        }
+
+        // 创建新 channel
+        let channel = Channel::from_shared(addr.to_string())
+            .map_err(|e| format!("Invalid URI: {}", e))?
+            .connect_timeout(Duration::from_secs(self.timeout_secs))
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .connect()
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
+
+        // 存入缓存
+        self.channel_cache.insert(addr.to_string(), channel.clone());
+
+        Ok(channel)
     }
 
     /// 检查 HTTP 健康端点
@@ -131,36 +159,66 @@ impl ServiceHealthChecker {
         }
     }
 
-    /// 检查 gRPC 端口连通性
+    /// 检查 gRPC 服务端口是否可连接且响应正常
     ///
-    /// 通过 TCP 连接测试 gRPC 端口是否可达。
-    /// 注意：这只是连接测试，不执行实际的 gRPC 健康检查协议。
+    /// 使用实际的 gRPC 客户端调用 GetStatus RPC 来验证服务是否真正可用，
+    /// 而不仅仅是 TCP 端口可连接。
     ///
     /// # Arguments
     /// * `ip` - 容器 IP 地址
     ///
     /// # Returns
-    /// * `true` - 能够建立 TCP 连接
-    /// * `false` - 连接失败或超时
+    /// * `true` - gRPC 服务响应正常
+    /// * `false` - 连接失败、超时或 RPC 调用失败
     pub async fn check_grpc_connectivity(&self, ip: &str) -> bool {
-        let addr = format!("{}:{}", ip, self.grpc_port);
+        use shared_types::grpc::agent_service_client::AgentServiceClient;
+        use shared_types::grpc::GetStatusRequest;
 
-        match timeout(
-            Duration::from_secs(self.timeout_secs),
-            TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(_stream)) => {
-                debug!("gRPC port connection: {}", addr);
-                true
+        let addr = format!("http://{}:{}", ip, self.grpc_port);
+
+        // 尝试获取或创建 gRPC 连接并调用 GetStatus
+        let check_future = async {
+            // 获取或创建 channel（复用连接）
+            let channel = match self.get_or_create_channel(&addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    debug!("gRPC connection failed {}: {}", addr, e);
+                    // 连接失败时清除缓存，下次重试
+                    self.channel_cache.remove(&addr);
+                    return Err(format!("Connection failed: {}", e));
+                }
+            };
+
+            // 创建客户端并调用 GetStatus
+            let mut client = AgentServiceClient::new(channel);
+            let request = tonic::Request::new(GetStatusRequest {
+                project_id: String::new(),
+                session_id: String::new(),
+            });
+
+            match client.get_status(request).await {
+                Ok(response) => {
+                    let status = response.into_inner();
+                    debug!("gRPC health check success {}: status={:?}", addr, status);
+                    Ok(())
+                }
+                Err(e) => {
+                    debug!("gRPC GetStatus failed {}: {}", addr, e);
+                    // RPC 失败时清除缓存，可能是连接已断开
+                    self.channel_cache.remove(&addr);
+                    Err(format!("RPC failed: {}", e))
+                }
             }
+        };
+
+        match timeout(Duration::from_secs(self.timeout_secs), check_future).await {
+            Ok(Ok(_)) => true,
             Ok(Err(e)) => {
-                debug!("gRPC portconnectionfailed {}: {}", addr, e);
+                debug!("gRPC health check failed {}: {}", addr, e);
                 false
             }
             Err(_) => {
-                debug!("gRPC portconnectiontimeout {}", addr);
+                debug!("gRPC health check timeout {}", addr);
                 false
             }
         }

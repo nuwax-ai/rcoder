@@ -153,7 +153,7 @@ pub async fn quick_start(
     listen_port: u16,
     default_backend_port: u16,
     backend_host: &str,
-) -> anyhow::Result<()> {
+) -> ProxyResult<()> {
     let config = ProxyConfig {
         listen_port,
         default_backend_port,
@@ -185,6 +185,9 @@ pub enum ProxyError {
 
     #[error("request handling error: {0}")]
     RequestHandling(String),
+
+    #[error("route configuration error: {0}")]
+    RouteConfig(String),
 }
 
 impl From<anyhow::Error> for ProxyError {

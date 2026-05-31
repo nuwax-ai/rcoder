@@ -75,7 +75,7 @@ pub async fn grpc_chat_with_pool(
     // 发送请求
     let response = client.chat(request).await.map_err(|e| {
         error!("[gRPC_CHAT] Chat RPC call failed: {}", e);
-        anyhow::anyhow!("gRPC Chat call failed: {}", e)
+        anyhow::Error::new(e)
     })?;
 
     let chat_response = response.into_inner();
@@ -108,6 +108,7 @@ pub async fn grpc_cancel_session_with_pool(
     session_id: String,
     reason: String,
     project_id: String,
+    request_timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<CancelResponse> {
     info!(
         "🛑 [gRPC_CANCEL] Sending cancel session request (connection pool): addr={}, session_id={}, project_id={}",
@@ -126,13 +127,19 @@ pub async fn grpc_cancel_session_with_pool(
 
     debug!("[gRPC_CANCEL] sendrequest: {:?}", grpc_request);
 
-    // 发送请求
+    // 构建 tonic Request 并设置请求级别超时
     let locale = super::current_grpc_locale();
-    let request = super::new_request_with_locale(grpc_request, locale);
+    let mut request = super::new_request_with_locale(grpc_request, locale);
+
+    let timeout = request_timeout.unwrap_or_else(|| {
+        std::time::Duration::from_secs(shared_types::GRPC_CANCEL_SESSION_TIMEOUT_SECS)
+    });
+    request.set_timeout(timeout);
+    debug!("⏱️ [gRPC_CANCEL] request timeout: {:?}", timeout);
 
     let response = client.cancel_session(request).await.map_err(|e| {
         error!("[gRPC_CANCEL] CancelSession RPC call failed: {}", e);
-        anyhow::anyhow!("gRPC CancelSession call failed: {}", e)
+        anyhow::Error::new(e)
     })?;
 
     let cancel_response = response.into_inner();
@@ -154,7 +161,7 @@ pub async fn grpc_cancel_session(
 ) -> anyhow::Result<CancelResponse> {
     // 创建临时连接池（单次使用）
     let pool = Arc::new(GrpcChannelPool::new());
-    grpc_cancel_session_with_pool(&pool, grpc_addr, session_id, reason, project_id).await
+    grpc_cancel_session_with_pool(&pool, grpc_addr, session_id, reason, project_id, None).await
 }
 
 /// Resolve a pending ACP permission request through agent_runner gRPC.
@@ -162,6 +169,7 @@ pub async fn grpc_resolve_permission_with_pool(
     pool: &Arc<GrpcChannelPool>,
     grpc_addr: &str,
     input: shared_types::ResolvePermissionRequestDto,
+    request_timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<GrpcResolvePermissionResponse> {
     info!(
         "[gRPC_PERMISSION] Sending ResolvePermission: addr={}, session_id={}, tool_call_id={}",
@@ -184,10 +192,17 @@ pub async fn grpc_resolve_permission_with_pool(
     };
 
     let locale = super::current_grpc_locale();
-    let request = super::new_request_with_locale(grpc_request, locale);
+    let mut request = super::new_request_with_locale(grpc_request, locale);
+
+    let timeout = request_timeout.unwrap_or_else(|| {
+        std::time::Duration::from_secs(shared_types::GRPC_RESOLVE_PERMISSION_TIMEOUT_SECS)
+    });
+    request.set_timeout(timeout);
+    debug!("⏱️ [gRPC_PERMISSION] request timeout: {:?}", timeout);
+
     let response = client.resolve_permission(request).await.map_err(|e| {
         error!("[gRPC_PERMISSION] ResolvePermission RPC call failed: {}", e);
-        anyhow::anyhow!("gRPC ResolvePermission call failed: {}", e)
+        anyhow::Error::new(e)
     })?;
 
     Ok(response.into_inner())
@@ -200,6 +215,7 @@ pub async fn grpc_stop_agent_with_pool(
     project_id: String,
     reason: Option<String>,
     force: bool,
+    request_timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<shared_types::grpc::StopAgentResponse> {
     info!(
         "🔄 [gRPC_STOP_AGENT] Sending stop Agent request (connection pool): addr={}, project_id={}, force={}",
@@ -218,13 +234,19 @@ pub async fn grpc_stop_agent_with_pool(
 
     debug!("[gRPC_STOP_AGENT] sendrequest: {:?}", grpc_request);
 
-    // 发送请求
+    // 构建 tonic Request 并设置请求级别超时
     let locale = super::current_grpc_locale();
-    let request = super::new_request_with_locale(grpc_request, locale);
+    let mut request = super::new_request_with_locale(grpc_request, locale);
+
+    let timeout = request_timeout.unwrap_or_else(|| {
+        std::time::Duration::from_secs(shared_types::GRPC_STOP_AGENT_TIMEOUT_SECS)
+    });
+    request.set_timeout(timeout);
+    debug!("⏱️ [gRPC_STOP_AGENT] request timeout: {:?}", timeout);
 
     let response = client.stop_agent(request).await.map_err(|e| {
         error!("[gRPC_STOP_AGENT] StopAgent RPC call failed: {}", e);
-        anyhow::anyhow!("gRPC StopAgent call failed: {}", e)
+        anyhow::Error::new(e)
     })?;
 
     let stop_response = response.into_inner();

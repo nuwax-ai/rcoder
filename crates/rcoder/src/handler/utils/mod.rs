@@ -17,3 +17,7 @@ pub use paths::{
     COMPUTER_WORKSPACE_ROOT, build_computer_workspace_path, build_workspace_path, project_dir,
     user_dir,
 };
+
+// 内部使用：路径验证（通过路径函数自动调用，无需外部直接使用）
+#[allow(unused_imports)]
+pub use paths::{PathValidationError, validate_identifier};

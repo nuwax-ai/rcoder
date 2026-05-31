@@ -162,7 +162,8 @@ pub async fn handle_chat(
         request.tenant_id.as_deref(),
         request.space_id.as_deref(),
         &project_id,
-    );
+    )
+    .map_err(|e| AppError::validation_error(&e.to_string()))?;
 
     info!(
         "📁 [CHAT] Workspace path determined: {} (isolation_type={})",
@@ -213,6 +214,7 @@ pub async fn handle_chat(
             request.tenant_id.as_deref(),
             request.space_id.as_deref(),
             &container_work_path,
+            state.runtime(),
         )
         .await?;
 
@@ -333,7 +335,7 @@ pub async fn handle_chat(
     request_for_forward.session_id = if session_id_to_use.is_empty() {
         None
     } else {
-        Some(session_id_to_use)
+        Some(session_id_to_use.clone())
     };
     // 🆕 自动查找 session_id 逻辑结束
 
@@ -342,6 +344,7 @@ pub async fn handle_chat(
     let result = forward_request_to_container_service(
         &request_for_forward,
         &container_info,
+        state.runtime(),
         &state.grpc_pool,
         &state.container_prefix_rcoder,
         &state.container_prefix_computer,
@@ -369,25 +372,53 @@ pub async fn handle_chat(
                 http_result.is_success()
             );
 
-            // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
-            info!(
-                "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
-                session_id, project_id
-            );
-            state.update_session(&project_id, &session_id);
-
-            // 更新项目活动时间
-            state.update_activity(&project_id);
-
-            if http_result.is_success() {
-                info!(
-                    "🎯 [CHAT] All state updates completed: project_id={}, session_id={}",
-                    project_id, session_id
-                );
+            // 使用原子更新防止竞态条件
+            // 只有当当前 session_id 与我们之前读取的相同时才更新
+            // 这样可以防止并发请求覆盖彼此的 session_id
+            //
+            // 🛡️ 关键修复：使用 session_id_to_use（我们发送给 agent 的实际值）作为 CAS 预期值
+            // 而不是 request.session_id（用户原始输入，可能为 None）
+            // 当用户未传 session_id 但自动检测到已有 session 时：
+            //   - request.session_id = None
+            //   - session_id_to_use = "existing-session" (DB 中的真实值)
+            //   - CAS 预期应该是 "existing-session"，而不是 None
+            let expected_current = if session_id_to_use.is_empty() {
+                None
             } else {
+                Some(session_id_to_use.as_str())
+            };
+            let updated = state.update_session_atomic(
+                &project_id,
+                &session_id,
+                expected_current,
+            );
+
+            if updated {
+                info!(
+                    "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
+                    session_id, project_id
+                );
+
+                // 更新项目活动时间
+                state.update_activity(&project_id);
+
+                if http_result.is_success() {
+                    info!(
+                        "🎯 [CHAT] All state updates completed: project_id={}, session_id={}",
+                        project_id, session_id
+                    );
+                } else {
+                    warn!(
+                        "⚠️ [CHAT] Request failed but session mapping saved: project_id={}, session_id={}, code={}, message={}",
+                        project_id, session_id, http_result.code, http_result.message
+                    );
+                }
+            } else {
+                // 另一个并发请求已经更新了这个 project 的 session_id
+                // 我们不覆盖它，避免竞态条件
                 warn!(
-                    "⚠️ [CHAT] Request failed but session mapping saved: project_id={}, session_id={}, code={}, message={}",
-                    project_id, session_id, http_result.code, http_result.message
+                    "⚠️ [CHAT] Session already updated by another request, skipping update: project_id={}, our_session_id={}, expected_current={:?}",
+                    project_id, session_id, expected_current
                 );
             }
         }
@@ -410,6 +441,7 @@ pub async fn handle_chat(
 async fn forward_request_to_container_service(
     request: &AgentChatRequest,
     container_info: &ContainerBasicInfo,
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
     rcoder_prefix: &str,
     computer_prefix: &str,
@@ -435,6 +467,7 @@ async fn forward_request_to_container_service(
     // 直接使用 container_info.container_name（创建时已确定，无需重新拼接）
     let container_name = container_info.container_name.clone();
     let mut grpc_addr = match super::utils::get_realtime_container_ip(
+        runtime,
         &container_name,
         &container_info.container_ip,
         rcoder_prefix,
@@ -529,6 +562,7 @@ async fn forward_request_to_container_service(
 
                     // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
                     match super::utils::get_realtime_container_ip(
+                        runtime,
                         &container_name,
                         &container_info.container_ip,
                         rcoder_prefix,

@@ -87,7 +87,7 @@ async fn forward_permission_resolution(
     );
 
     let response =
-        match crate::grpc::grpc_resolve_permission_with_pool(&state.grpc_pool, &grpc_addr, input)
+        match crate::grpc::grpc_resolve_permission_with_pool(&state.grpc_pool, &grpc_addr, input, None)
             .await
         {
             Ok(response) => response,

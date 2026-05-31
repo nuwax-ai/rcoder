@@ -26,16 +26,7 @@ async fn destroy_container_for_project(
         project_id, pod_id, container_identifier
     );
 
-    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!("[STOP_DESTROY] Failed to get runtime: {}", e);
-            return Ok(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                locale,
-            ));
-        }
-    };
+    let runtime = state.runtime().clone();
 
     let container_info = runtime
         .get_container_info_by_identifier(container_identifier, &shared_types::ServiceType::RCoder)

@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use agent_client_protocol::schema::{McpServer, McpServerStdio};
 use agent_config::ContextServerConfig;
 use tracing::{debug, info};
 
 use super::env::build_mcp_server_path_env;
+
+/// mcp-proxy 日志目录（通过 set_mcp_proxy_log_dir 设置，替代 env::set_var 避免 UB）
+static MCP_PROXY_LOG_DIR_VALUE: OnceLock<String> = OnceLock::new();
 
 /// 从文件内容中解析 D-Bus 会话地址
 fn parse_dbus_address_from_content(content: &str) -> Option<String> {
@@ -56,9 +60,30 @@ fn is_debug_log_level() -> bool {
     tracing::enabled!(tracing::Level::DEBUG)
 }
 
-/// 获取 mcp-proxy 日志目录（如果配置了的话）
+/// 设置 mcp-proxy 日志目录（进程内全局，线程安全）
+///
+/// 替代 `std::env::set_var("MCP_PROXY_LOG_DIR", ...)` 以避免多线程环境下的 UB。
+/// 仅首次调用生效，后续调用会被忽略（OnceLock 语义）。
+pub fn set_mcp_proxy_log_dir(path: String) {
+    match MCP_PROXY_LOG_DIR_VALUE.set(path.clone()) {
+        Ok(()) => {
+            info!("[MCP] Set MCP_PROXY_LOG_DIR via OnceLock: {}", path);
+        }
+        Err(_) => {
+            debug!("[MCP] MCP_PROXY_LOG_DIR already set, ignoring new value: {}", path);
+        }
+    }
+}
+
+/// 获取 mcp-proxy 日志目录
+///
+/// 优先从进程内 OnceLock 读取（由 `set_mcp_proxy_log_dir` 设置），
+/// 其次从环境变量 `MCP_PROXY_LOG_DIR` 读取（兼容外部设置）。
 pub(crate) fn get_mcp_proxy_log_dir() -> Option<String> {
-    std::env::var(ENV_MCP_PROXY_LOG_DIR).ok()
+    MCP_PROXY_LOG_DIR_VALUE
+        .get()
+        .cloned()
+        .or_else(|| std::env::var(ENV_MCP_PROXY_LOG_DIR).ok())
 }
 
 /// 检查参数中是否已有 --log-dir 或 --log-file 参数

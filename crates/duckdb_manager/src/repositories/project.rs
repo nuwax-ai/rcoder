@@ -22,41 +22,47 @@ impl ProjectRepository {
 
     /// 插入或更新项目记录
     pub fn upsert(&self, record: &ProjectRecord) -> DuckDbResult<()> {
+        self.conn.with_connection(|c| Self::upsert_with_connection(c, record))
+    }
+
+    /// 使用提供的连接插入或更新项目记录（用于事务）
+    pub fn upsert_with_connection(
+        c: &duckdb::Connection,
+        record: &ProjectRecord,
+    ) -> DuckDbResult<()> {
         let service_type_str = record.service_type.to_string();
         let created_at_str = record.created_at.to_rfc3339();
         let last_activity_str = record.last_activity.to_rfc3339();
         let session_created_at_str = record.session_created_at.map(|dt| dt.to_rfc3339());
         let session_last_activity_str = record.session_last_activity.map(|dt| dt.to_rfc3339());
 
-        self.conn.with_connection(|c| {
-            c.execute(
-                r#"
-                INSERT OR REPLACE INTO projects (
-                    project_id, session_id, service_type, container_id,
-                    user_id, pod_id, agent_status_code, agent_status_name,
-                    request_id, model_provider_json, created_at, last_activity,
-                    session_created_at, session_last_activity
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-                params![
-                    record.project_id,
-                    record.session_id,
-                    service_type_str,
-                    record.container_id,
-                    record.user_id,
-                    record.pod_id,
-                    record.agent_status_code,
-                    record.agent_status_name,
-                    record.request_id,
-                    record.model_provider_json,
-                    created_at_str,
-                    last_activity_str,
-                    session_created_at_str,
-                    session_last_activity_str,
-                ],
-            )?;
-            Ok(())
-        })
+        c.execute(
+            r#"
+            INSERT OR REPLACE INTO projects (
+                project_id, session_id, service_type, container_id,
+                user_id, pod_id, agent_status_code, agent_status_name,
+                request_id, model_provider_json, created_at, last_activity,
+                session_created_at, session_last_activity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                record.project_id,
+                record.session_id,
+                service_type_str,
+                record.container_id,
+                record.user_id,
+                record.pod_id,
+                record.agent_status_code,
+                record.agent_status_name,
+                record.request_id,
+                record.model_provider_json,
+                created_at_str,
+                last_activity_str,
+                session_created_at_str,
+                session_last_activity_str,
+            ],
+        )?;
+        Ok(())
     }
 
     /// 根据项目ID查找项目
@@ -290,6 +296,51 @@ impl ProjectRepository {
         })
     }
 
+    /// 原子性地更新项目和关联容器的最后活动时间
+    ///
+    /// 在单个事务中完成：
+    /// 1. 更新项目的 last_activity
+    /// 2. 查询项目关联的 container_id
+    /// 3. 使用相同时间戳更新容器的 last_activity
+    ///
+    /// 避免多次 mutex 获取之间的 TOCTOU 竞态条件
+    pub fn update_activity_atomic(
+        &self,
+        project_id: &str,
+    ) -> DuckDbResult<Option<DateTime<Utc>>> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        self.conn.transaction(|c| {
+            // Step 1: 更新项目活动时间
+            let affected = c.execute(
+                "UPDATE projects SET last_activity = ? WHERE project_id = ?",
+                params![now_str, project_id],
+            )?;
+
+            if affected == 0 {
+                return Ok(None);
+            }
+
+            // Step 2: 查询关联的 container_id
+            let mut stmt = c.prepare(
+                "SELECT container_id FROM projects WHERE project_id = ?",
+            )?;
+            let container_id: Option<String> = stmt
+                .query_row(params![project_id], |row| row.get::<_, String>(0))
+                .ok();
+
+            // Step 3: 使用相同时间戳更新容器活动时间
+            if let Some(cid) = container_id {
+                c.execute(
+                    "UPDATE containers SET last_activity = ? WHERE container_id = ?",
+                    params![now_str, cid],
+                )?;
+            }
+
+            Ok(Some(now))
+        })
+    }
+
     /// 更新会话信息
     pub fn update_session(&self, project_id: &str, session_id: &str) -> DuckDbResult<bool> {
         let now_str = Utc::now().to_rfc3339();
@@ -305,6 +356,52 @@ impl ProjectRepository {
                 "#,
                 params![session_id, now_str, now_str, now_str, project_id],
             )?;
+            Ok(affected > 0)
+        })
+    }
+
+    /// 原子更新会话信息（仅当当前 session_id 与预期相同时才更新）
+    ///
+    /// 使用 compare-and-swap 模式防止并发更新导致的竞态条件。
+    /// 只有当数据库中当前的 session_id 与 `expected_current_session_id` 相同时才更新。
+    /// 如果 `expected_current_session_id` 为 None，则只在当前没有 session_id 时更新。
+    pub fn update_session_atomic(
+        &self,
+        project_id: &str,
+        new_session_id: &str,
+        expected_current_session_id: Option<&str>,
+    ) -> DuckDbResult<bool> {
+        let now_str = Utc::now().to_rfc3339();
+        self.conn.with_connection(|c| {
+            let affected = match expected_current_session_id {
+                Some(expected) => {
+                    // 只有当前 session_id 与预期相同时才更新
+                    c.execute(
+                        r#"
+                        UPDATE projects
+                        SET session_id = ?,
+                            last_activity = ?,
+                            session_last_activity = ?
+                        WHERE project_id = ? AND session_id = ?
+                        "#,
+                        params![new_session_id, now_str, now_str, project_id, expected],
+                    )?
+                }
+                None => {
+                    // 只在当前没有 session_id 时更新
+                    c.execute(
+                        r#"
+                        UPDATE projects
+                        SET session_id = ?,
+                            last_activity = ?,
+                            session_created_at = ?,
+                            session_last_activity = ?
+                        WHERE project_id = ? AND session_id IS NULL
+                        "#,
+                        params![new_session_id, now_str, now_str, now_str, project_id],
+                    )?
+                }
+            };
             Ok(affected > 0)
         })
     }
@@ -450,6 +547,51 @@ impl ProjectRepository {
         })
     }
 
+    /// 获取所有项目及其关联的容器信息（JOIN 查询优化）
+    ///
+    /// 使用 LEFT JOIN 一次性获取项目和容器数据，避免 N+1 查询问题。
+    /// 如果项目没有关联容器，container_record 为 None。
+    pub fn find_all_with_containers(
+        &self,
+    ) -> DuckDbResult<Vec<(ProjectRecord, Option<crate::models::ContainerRecord>)>> {
+        self.conn.with_connection(|c| {
+            let mut stmt = c.prepare(
+                r#"
+                SELECT
+                    p.project_id, p.session_id, p.service_type, p.container_id,
+                    p.user_id, p.pod_id, p.agent_status_code, p.agent_status_name,
+                    p.request_id, p.model_provider_json, p.created_at, p.last_activity,
+                    p.session_created_at, p.session_last_activity,
+                    c.container_id, c.container_name, c.container_ip,
+                    c.internal_port, c.external_port, c.service_type,
+                    c.status, c.service_url, c.created_at, c.last_activity
+                FROM projects p
+                LEFT JOIN containers c ON p.container_id = c.container_id
+                ORDER BY p.created_at DESC
+                "#,
+            )?;
+
+            let mut rows = stmt.query([])?;
+            let mut results = Vec::new();
+
+            while let Some(row) = rows.next()? {
+                let project = Self::row_to_record(row)?;
+
+                // 尝试获取容器信息（LEFT JOIN 可能为 NULL）
+                let container_id: Option<String> = row.get(14)?;
+                let container = if container_id.is_some() {
+                    Some(crate::repositories::container::ContainerRepository::row_to_record_from_offset(row, 14)?)
+                } else {
+                    None
+                };
+
+                results.push((project, container));
+            }
+
+            Ok(results)
+        })
+    }
+
     /// 按服务类型查找项目
     pub fn find_by_service_type(
         &self,
@@ -482,7 +624,7 @@ impl ProjectRepository {
 
     /// 获取项目数量统计
     pub fn count(&self) -> DuckDbResult<usize> {
-        self.conn.with_connection(|c| {
+        self.conn.try_with_connection(|c| {
             let mut stmt = c.prepare("SELECT COUNT(*) FROM projects")?;
             let mut rows = stmt.query([])?;
             let row = rows.next()?.ok_or_else(|| {
@@ -490,7 +632,7 @@ impl ProjectRepository {
             })?;
             let count: i64 = row.get(0)?;
             Ok(count as usize)
-        })
+        }).and_then(|opt| opt.ok_or_else(|| DuckDbError::InternalError("database busy, try again".to_string())))
     }
 
     /// 获取活跃会话数量
@@ -511,7 +653,7 @@ impl ProjectRepository {
     pub fn count_by_service_type(
         &self,
     ) -> DuckDbResult<std::collections::HashMap<ServiceType, usize>> {
-        self.conn.with_connection(|c| {
+        self.conn.try_with_connection(|c| {
             let mut stmt =
                 c.prepare("SELECT service_type, COUNT(*) FROM projects GROUP BY service_type")?;
             let mut rows = stmt.query([])?;
@@ -527,7 +669,7 @@ impl ProjectRepository {
             }
 
             Ok(counts)
-        })
+        }).and_then(|opt| opt.ok_or_else(|| DuckDbError::InternalError("database busy, try again".to_string())))
     }
 
     /// 更新模型提供商配置
@@ -620,8 +762,8 @@ impl ProjectRepository {
         let value_ref = row.get_ref(idx)?;
         match value_ref {
             ValueRef::Timestamp(_, micros) => {
-                let secs = micros / 1_000_000;
-                let nsecs = ((micros % 1_000_000) * 1000) as u32;
+                let secs = micros.div_euclid(1_000_000);
+                let nsecs = (micros.rem_euclid(1_000_000) * 1000) as u32;
                 Ok(DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now))
             }
             ValueRef::Text(bytes) => {
@@ -649,8 +791,8 @@ impl ProjectRepository {
         match value_ref {
             ValueRef::Null => Ok(None),
             ValueRef::Timestamp(_, micros) => {
-                let secs = micros / 1_000_000;
-                let nsecs = ((micros % 1_000_000) * 1000) as u32;
+                let secs = micros.div_euclid(1_000_000);
+                let nsecs = (micros.rem_euclid(1_000_000) * 1000) as u32;
                 Ok(Some(
                     DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now),
                 ))

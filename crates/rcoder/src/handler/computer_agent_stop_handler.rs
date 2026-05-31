@@ -115,12 +115,18 @@ pub async fn computer_agent_stop(
 
     // 2. 查找容器（根据 user_id 或 pod_id）
     let container_info = if has_user_id {
-        crate::service::ComputerContainerManager::get_container_info(user_id.as_ref().unwrap())
-            .await?
+        crate::service::ComputerContainerManager::get_container_info(
+            user_id.as_ref().unwrap(),
+            state.runtime(),
+        )
+        .await?
     } else {
-        // TODO: 实现通过 pod_id 查找容器的逻辑
-        warn!("[COMPUTER_STOP] pod_id lookup not fully implemented yet");
-        None
+        // pod_id 作为容器标识符查找
+        crate::service::ComputerContainerManager::get_container_info(
+            pod_id.as_ref().unwrap(),
+            state.runtime(),
+        )
+        .await?
     };
 
     let container_info = match container_info {
@@ -162,6 +168,7 @@ pub async fn computer_agent_stop(
             .clone()
             .or_else(|| Some("User requested stop".to_string())),
         false, // force=false，优雅停止
+        None,  // 使用默认超时 (GRPC_STOP_AGENT_TIMEOUT_SECS)
     )
     .await
     {

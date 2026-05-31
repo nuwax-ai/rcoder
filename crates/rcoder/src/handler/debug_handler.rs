@@ -126,11 +126,30 @@ pub async fn debug_sql_query(
         );
     }
 
+    // 安全检查：阻止 DuckDB 文件读取和危险函数
+    let blocked_patterns = [
+        "READFILE", "READ_CSV", "READ_JSON", "READ_PARQUET", "READ_BLOB",
+        "READ_TEXT", "LIST_FILES",
+        "GLOB(", "PARQUET_SCAN", "SQLITE_SCAN", "POSTGRES_SCAN",
+        "HTTPGET", "JSON_SCAN", "ST_READ", "FILE_SCAN",
+        "PRAGMA", "DUCKDB_",
+        "COPY", "EXPORT", "ATTACH", "INSTALL", "LOAD", "IMPORT",
+        "CREATE", "INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
+    ];
+    if blocked_patterns.iter().any(|p| sql_trimmed.contains(p)) {
+        warn!("[DEBUG_SQL] blocked dangerous pattern in query: {}", request.sql);
+        return HttpResult::error_with_message(
+            ERR_INVALID_PARAMS,
+            locale,
+            "Query contains blocked functions/keywords",
+        );
+    }
+
     // 执行查询
     match execute_sql_query(&state.projects, &request.sql) {
         Ok((columns, rows)) => {
             let row_count = rows.len();
-            let execution_time_ms = start_time.elapsed().as_millis() as u64;
+            let execution_time_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
             debug!(
                 "✅ [DEBUG_SQL] Query succeeded: {} rows, {} ms",
@@ -223,7 +242,7 @@ pub async fn debug_list_projects(
             columns,
             row_count: rows.len(),
             rows,
-            execution_time_ms: start_time.elapsed().as_millis() as u64,
+            execution_time_ms: start_time.elapsed().as_millis().min(u64::MAX as u128) as u64,
         }),
         Err(e) => HttpResult::error_with_message(
             ERR_INTERNAL_SERVER_ERROR,
@@ -266,7 +285,7 @@ pub async fn debug_list_containers(
             columns,
             row_count: rows.len(),
             rows,
-            execution_time_ms: start_time.elapsed().as_millis() as u64,
+            execution_time_ms: start_time.elapsed().as_millis().min(u64::MAX as u128) as u64,
         }),
         Err(e) => HttpResult::error_with_message(
             ERR_INTERNAL_SERVER_ERROR,

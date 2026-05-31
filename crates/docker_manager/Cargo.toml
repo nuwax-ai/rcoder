@@ -42,6 +42,9 @@ moka = { version = "0.12", features = ["future"] }
 # Shared types
 shared_types = { path = "../shared_types" }
 
+# gRPC client (for health checks)
+tonic = { workspace = true }
+
 # Runtime API (always needed)
 container-runtime-api = { path = "../container-runtime-api" }
 

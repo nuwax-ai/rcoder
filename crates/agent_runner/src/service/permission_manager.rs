@@ -636,6 +636,11 @@ fn split_commands(command: &str) -> Vec<&str> {
         if bytes[i] == b';' {
             segments.push(command[current_start..i].trim());
             current_start = i + 1;
+        } else if bytes[i] == b'\n' {
+            // 换行符也是 shell 命令分隔符，必须与 `;`、`&&`、`||` 同等对待
+            // 否则 "echo hello\nrm -rf /" 会被当成单一命令段，绕过危险命令检测
+            segments.push(command[current_start..i].trim());
+            current_start = i + 1;
         } else if bytes[i] == b'&' && i + 1 < bytes.len() && bytes[i + 1] == b'&' {
             segments.push(command[current_start..i].trim());
             current_start = i + 2;

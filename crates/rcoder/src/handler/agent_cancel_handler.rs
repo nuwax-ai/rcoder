@@ -119,7 +119,9 @@ async fn get_container_for_cancel_duckdb(
 /// 转发取消请求到容器内的 agent_runner 服务
 ///
 /// 🎯 使用 gRPC CancelSession RPC 替代 HTTP 转发
+#[allow(clippy::too_many_arguments)]
 async fn forward_cancel_request_to_container_service(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     project_id: &str,
     session_id: Option<&str>,
     container_info: &ContainerBasicInfo,
@@ -156,6 +158,7 @@ async fn forward_cancel_request_to_container_service(
         session_id_str.clone(),
         reason,
         project_id.to_string(),
+        None, // 使用默认超时 (GRPC_CANCEL_SESSION_TIMEOUT_SECS)
     )
     .await
     {
@@ -199,6 +202,7 @@ async fn forward_cancel_request_to_container_service(
                         // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
                         // 通过 Docker API 检查容器是否真的存在
                         let container_exists = check_container_exists_by_info(
+                            runtime,
                             container_info,
                             rcoder_prefix,
                             computer_prefix,
@@ -249,52 +253,41 @@ async fn forward_cancel_request_to_container_service(
 ///
 /// 使用容器名称而非 ID，因为容器重启后 ID 会变，但名称不变
 async fn check_container_exists_by_info(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     container_info: &ContainerBasicInfo,
     rcoder_prefix: &str,
     computer_prefix: &str,
 ) -> bool {
-    match docker_manager::runtime::RuntimeManager::get().await {
-        Ok(runtime) => {
-            let query = if let Some((identifier, service_type)) = container_identity_from_name(
-                &container_info.container_name,
-                rcoder_prefix,
-                computer_prefix,
-            ) {
-                runtime
-                    .get_container_info_by_identifier(identifier, &service_type)
-                    .await
-            } else {
-                return true;
-            };
+    let query = if let Some((identifier, service_type)) = container_identity_from_name(
+        &container_info.container_name,
+        rcoder_prefix,
+        computer_prefix,
+    ) {
+        runtime
+            .get_container_info_by_identifier(identifier, &service_type)
+            .await
+    } else {
+        return true;
+    };
 
-            match query {
-                Ok(Some(info)) => {
-                    debug!(
-                        "🔍 [CANCEL_FORWARD] Runtime container exists: name={}, id={}",
-                        info.container_name, info.container_id
-                    );
-                    true
-                }
-                Ok(None) => {
-                    info!(
-                        "🔍 [CANCEL_FORWARD] Runtime container not found (already destroyed): {}",
-                        container_info.container_name
-                    );
-                    false
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ [CANCEL_FORWARD] Failed to query runtime container status: {}, conservatively assuming container exists",
-                        e
-                    );
-                    true
-                }
-            }
+    match query {
+        Ok(Some(info)) => {
+            debug!(
+                "🔍 [CANCEL_FORWARD] Runtime container exists: name={}, id={}",
+                info.container_name, info.container_id
+            );
+            true
+        }
+        Ok(None) => {
+            info!(
+                "🔍 [CANCEL_FORWARD] Runtime container not found (already destroyed): {}",
+                container_info.container_name
+            );
+            false
         }
         Err(e) => {
-            // 无法获取 runtime，保守地认为容器存在
             warn!(
-                "[CANCEL_FORWARD] Failed to get runtime: {}, conservatively assuming container exists",
+                "⚠️ [CANCEL_FORWARD] Failed to query runtime container status: {}, conservatively assuming container exists",
                 e
             );
             true
@@ -345,6 +338,7 @@ async fn handle_session_cancel_internal_v2(
 
     // 转发取消请求到容器服务
     let result = forward_cancel_request_to_container_service(
+        state.runtime(),
         &project_id, // 使用传入的 project_id
         session_id.as_deref(),
         &container_info,

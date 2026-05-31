@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 /// gRPC 连接池 TTL（5分钟）
 ///
 /// 连接超过此时间未被使用则自动清理，防止内存泄漏。
+/// 注意：基于最后使用时间而非创建时间，活跃连接不会被误清理。
 const CHANNEL_TTL_SECS: u64 = 300;
 
 /// gRPC 连接池最大容量
@@ -27,16 +28,20 @@ fn create_configured_client(channel: Channel) -> AgentServiceClient<Channel> {
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
 }
 
-/// Channel 元数据（包含创建时间）
+/// Channel 元数据（包含最后使用时间）
 #[derive(Clone)]
 struct ChannelEntry {
     channel: Channel,
-    created_at: Instant,
+    last_used: Instant,
 }
 
 impl ChannelEntry {
     fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > Duration::from_secs(CHANNEL_TTL_SECS)
+        self.last_used.elapsed() > Duration::from_secs(CHANNEL_TTL_SECS)
+    }
+
+    fn touch(&mut self) {
+        self.last_used = Instant::now();
     }
 }
 
@@ -44,7 +49,7 @@ impl ChannelEntry {
 ///
 /// 为每个容器维护独立的 gRPC 连接，支持：
 /// - 连接复用：相同地址的请求复用同一连接
-/// - TTL 自动清理：5分钟未使用的连接自动移除，防止内存泄漏
+/// - TTL 自动清理：5分钟未使用的连接自动移除，防止内存泄漏（基于最后使用时间）
 /// - 并发安全：支持高并发下的安全连接创建
 pub struct GrpcChannelPool {
     /// 容器地址到 Channel 的映射
@@ -62,24 +67,16 @@ impl GrpcChannelPool {
     /// 获取指定地址的 gRPC 客户端
     ///
     /// 如果连接不存在则创建新连接。过期连接会被自动清理。
+    /// 🚀 优化：使用 entry API 原子化检查和插入，消除 TOCTOU 竞态窗口
     pub async fn get_client(&self, addr: &str) -> Result<AgentServiceClient<Channel>> {
-        // 先检查缓存，同时清理过期条目
-        // 使用 remove_if_available 模式避免 TOCTOU 竞态
-        let should_remove = {
-            self.channels
-                .get(addr)
-                .map(|entry| entry.is_expired())
-                .unwrap_or(false)
-        };
-
-        if should_remove {
-            // 过期则移除
-            self.channels.remove(addr);
-        }
-
-        // 再次检查（可能被其他线程修改）
-        if let Some(entry) = self.channels.get(addr) {
+        // 第一次检查：快速路径，如果缓存命中且未过期则直接返回
+        // ⚠️ 注意：get_mut() 返回 DashMap RefMut（持有 shard 写锁），
+        // 不可跨 .await 持有，否则会造成死锁。
+        if let Some(mut entry) = self.channels.get_mut(addr)
+            && !entry.is_expired()
+        {
             debug!("📡 [gRPC] reuse connection: {}", addr);
+            entry.touch();
             return Ok(create_configured_client(entry.channel.clone()));
         }
 
@@ -101,17 +98,35 @@ impl GrpcChannelPool {
             .await
             .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
 
-        // 清理过期连接
+        // 清理过期连接（在插入前清理，避免刚插入就被清理）
         self.cleanup_expired();
 
-        // 插入缓存
-        self.channels.insert(
-            addr.to_string(),
-            ChannelEntry {
-                channel: channel.clone(),
-                created_at: Instant::now(),
-            },
-        );
+        // 第二次检查：双重检查锁定，避免并发创建重复连接
+        // 使用 entry API 原子化检查和插入
+        match self.channels.entry(addr.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                // 另一个线程已经创建了连接，复用现有的
+                let existing = entry.get_mut();
+                if !existing.is_expired() {
+                    debug!("📡 [gRPC] concurrent creation detected, reusing: {}", addr);
+                    existing.touch();
+                    return Ok(create_configured_client(existing.channel.clone()));
+                }
+                // 如果已过期（不太可能），替换为新连接
+                debug!("📡 [gRPC] replacing expired connection: {}", addr);
+                entry.insert(ChannelEntry {
+                    channel: channel.clone(),
+                    last_used: Instant::now(),
+                });
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // 插入新连接
+                entry.insert(ChannelEntry {
+                    channel: channel.clone(),
+                    last_used: Instant::now(),
+                });
+            }
+        }
 
         debug!("📡 [gRPC] connection ready: {}", addr);
         Ok(create_configured_client(channel))

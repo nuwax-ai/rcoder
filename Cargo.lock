@@ -1793,6 +1793,7 @@ dependencies = [
  "shared_types",
  "thiserror 2.0.18",
  "tokio",
+ "tonic",
  "tracing",
  "uuid",
 ]
@@ -5049,6 +5050,7 @@ dependencies = [
  "rand 0.10.1",
  "rcoder-proxy",
  "rcoder-telemetry",
+ "regex",
  "reqwest 0.13.3",
  "ringbuf",
  "rustls",
@@ -6081,20 +6083,16 @@ dependencies = [
  "garde",
  "opentelemetry",
  "opentelemetry_sdk",
- "prost 0.14.3",
- "prost-types",
  "reqwest 0.13.3",
- "rust-i18n",
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "shared_types_grpc",
+ "shared_types_i18n",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
  "tower",
  "tower-http",
  "tracing",
@@ -6104,6 +6102,26 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+]
+
+[[package]]
+name = "shared_types_grpc"
+version = "0.1.0"
+dependencies = [
+ "prost 0.14.3",
+ "prost-types",
+ "serde",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "url",
+]
+
+[[package]]
+name = "shared_types_i18n"
+version = "0.1.0"
+dependencies = [
+ "rust-i18n",
 ]
 
 [[package]]

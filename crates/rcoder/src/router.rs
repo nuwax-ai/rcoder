@@ -3,8 +3,10 @@
 #![allow(dead_code)]
 
 use arc_swap::ArcSwap;
+use container_runtime_api::ContainerRuntime;
 use dashmap::DashMap;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 use axum::{
     Router,
@@ -65,9 +67,14 @@ pub struct AppState {
     /// 🆕 容器创建中标记: user_id -> 创建开始时间
     /// 用于防止并发 pod_ensure 请求互相干扰（无锁方案）
     pub pod_creating: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// 🚀 容器创建完成通知通道（替代轮询等待）
+    /// 当容器创建完成时，发送 user_id 通知等待方
+    pub pod_created_tx: Arc<broadcast::Sender<String>>,
     /// 🆕 容器前缀（从配置读取，启动时初始化）
     pub container_prefix_rcoder: String,
     pub container_prefix_computer: String,
+    /// 容器运行时（通过 DI 注入，替代全局 RuntimeManager::get()）
+    pub runtime: Arc<dyn ContainerRuntime>,
 }
 
 impl AppState {
@@ -77,9 +84,13 @@ impl AppState {
         api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
         container_prefix_rcoder: String,
         container_prefix_computer: String,
+        runtime: Arc<dyn ContainerRuntime>,
     ) -> anyhow::Result<Self> {
         let projects = ProjectAdapter::new()
             .map_err(|e| anyhow::anyhow!("Failed to initialize ProjectAdapter: {}", e))?;
+
+        // 创建容器创建完成通知通道（缓冲区大小 32，足够应对并发创建）
+        let (pod_created_tx, _) = broadcast::channel(32);
 
         Ok(Self {
             config,
@@ -88,9 +99,17 @@ impl AppState {
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
             api_key_config,
             pod_creating: Arc::new(DashMap::new()),
+            pod_created_tx: Arc::new(pod_created_tx),
             container_prefix_rcoder,
             container_prefix_computer,
+            runtime,
         })
+    }
+
+    /// 获取容器运行时引用（替代 RuntimeManager::get()）
+    #[inline]
+    pub fn runtime(&self) -> &Arc<dyn ContainerRuntime> {
+        &self.runtime
     }
 
     // ========== 向后兼容的便捷方法 ==========
@@ -146,6 +165,40 @@ impl AppState {
                 session_id,
                 e
             );
+        }
+    }
+
+    /// 原子更新会话信息（仅当当前 session_id 与预期相同时才更新）
+    ///
+    /// 使用 compare-and-swap 模式防止并发更新导致的竞态条件。
+    /// 只有当数据库中当前的 session_id 与 `expected_current_session_id` 相同时才更新。
+    /// 如果 `expected_current_session_id` 为 None，则只在当前没有 session_id 时更新。
+    ///
+    /// # Returns
+    /// 返回是否成功更新。如果返回 false，说明当前 session_id 与预期不同，更新被跳过。
+    #[inline]
+    pub fn update_session_atomic(
+        &self,
+        project_id: &str,
+        new_session_id: &str,
+        expected_current_session_id: Option<&str>,
+    ) -> bool {
+        match self.projects.update_session_atomic(
+            project_id,
+            new_session_id,
+            expected_current_session_id,
+        ) {
+            Ok(updated) => updated,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to atomic update session: project_id={}, new_session_id={}, expected_current={:?}, error={}",
+                    project_id,
+                    new_session_id,
+                    expected_current_session_id,
+                    e
+                );
+                false
+            }
         }
     }
 
@@ -320,8 +373,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     router
         .merge(create_swagger_ui())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
-        .layer(HttpMetricsLayer::new()) // 🆕 HTTP 指标中间件
-        // 🆕 添加 API Key 鉴权中间件（支持热更新）
+        .layer(HttpMetricsLayer::new()) // HTTP 指标中间件
+        // API Key 鉴权中间件（支持热更新）
         .layer(axum::middleware::from_fn(move |req, next| {
             crate::middleware::api_key_middleware::api_key_middleware_handler(
                 Arc::clone(&api_key_config),
@@ -330,6 +383,27 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             )
         }))
         .layer(axum::middleware::from_fn(locale_context_middleware))
+        // 安全响应头 — 防止常见 Web 攻击
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-frame-options"),
+            axum::http::HeaderValue::from_static("DENY"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-content-type-options"),
+            axum::http::HeaderValue::from_static("nosniff"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("strict-transport-security"),
+            axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("referrer-policy"),
+            axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-xss-protection"),
+            axum::http::HeaderValue::from_static("0"),
+        ))
 }
 
 /// Prometheus 指标处理器

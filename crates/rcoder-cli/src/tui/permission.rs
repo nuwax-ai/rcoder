@@ -18,12 +18,12 @@ use crate::tui::event::{AppEvent, PermissionOption};
 /// 将权限请求转换为 AppEvent::PermissionRequest，由事件循环渲染为弹窗。
 /// 用户选择结果通过 oneshot channel 返回。
 pub struct TuiPermissionPrompt {
-    tx: mpsc::UnboundedSender<AppEvent>,
+    tx: mpsc::Sender<AppEvent>,
     next_id: AtomicUsize,
 }
 
 impl TuiPermissionPrompt {
-    pub fn new(tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+    pub fn new(tx: mpsc::Sender<AppEvent>) -> Self {
         Self {
             tx,
             next_id: AtomicUsize::new(0),
@@ -82,12 +82,21 @@ impl PermissionPrompt for TuiPermissionPrompt {
         let (resp_tx, resp_rx) = oneshot::channel();
 
         // 发送权限请求到 TUI 事件循环
-        let _ = self.tx.send(AppEvent::PermissionRequest {
-            request_id,
-            tool_name,
-            options,
-            response_tx: resp_tx,
-        });
+        // 权限请求是低频且关键的操作，使用 send().await 确保一定能发送
+        if self
+            .tx
+            .send(AppEvent::PermissionRequest {
+                request_id,
+                tool_name,
+                options,
+                response_tx: resp_tx,
+            })
+            .await
+            .is_err()
+        {
+            // 如果发送失败（接收端已关闭），返回 None 表示取消
+            return Ok(None);
+        }
 
         // 等待用户在弹窗中选择结果
         match resp_rx.await {

@@ -21,6 +21,9 @@ use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::{AgentStartConfig, PermissionRequestContext, PermissionRequestHandler};
 use shared_types::error_codes;
 
+/// InitializeRequest 超时时间（秒）
+const INIT_TIMEOUT_SECS: u64 = 50;
+
 /// SACP 连接参数（封装 run_sacp_connection 的参数）
 pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
     pub(crate) project_path: PathBuf,
@@ -163,7 +166,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
             let session_id_shared = session_id_shared.clone();
 
             async move {
-                // 1. 初始化连接（30 秒超时）
+                // 1. 初始化连接（INIT_TIMEOUT_SECS 秒超时）
                 info!(
                     "[SACP] Step 1/4: Initializing ACP connection, project_id={}",
                     project_id
@@ -175,72 +178,29 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     ));
                 debug!("[SACP] Sending InitializeRequest: {:?}", init_request);
 
-                // 🔥 同时等待 InitializeRequest 和子进程退出
-                // 子进程崩溃时立即返回，不等 50 秒超时
+                // 🔥 同时等待 InitializeRequest 和 cancel_token（由 lifecycle reaper 触发）
+                // 不再使用 waitpid 轮询，避免与 lifecycle.rs 的 child_process.wait() 竞争
                 let init_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(50),
+                    std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
                     async {
                         tokio::select! {
                             result = cx.send_request(init_request).block_task() => {
                                 Ok(result)
                             }
-                            exit_info = tokio::task::spawn_blocking({
-                                let cmd_line = command_line.clone();
-                                move || {
-                                use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-                                use nix::unistd::Pid;
-                                use nix::errno::Errno;
-                                let target_pid = Pid::from_raw(child_pid as i32);
-                                // 缩短轮询间隔到 10ms，在 tokio reaper 之前捕获退出码
-                                loop {
-                                    match waitpid(target_pid, Some(WaitPidFlag::WNOHANG)) {
-                                        Ok(WaitStatus::Exited(pid, code)) => {
-                                            return Some((pid.as_raw(), code, None::<String>));
-                                        }
-                                        Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                                            let desc = format!("killed by signal {}", signal.as_str());
-                                            return Some((pid.as_raw(), -1, Some(desc)));
-                                        }
-                                        Ok(WaitStatus::StillAlive) => {
-                                            std::thread::sleep(std::time::Duration::from_millis(10));
-                                            continue;
-                                        }
-                                        Err(Errno::ECHILD) => {
-                                            let reason = format!(
-                                                "process already reaped. Command: {}", cmd_line
-                                            );
-                                            return Some((child_pid as i32, -1, Some(reason)));
-                                        }
-                                        e => {
-                                            let reason = format!("waitpid error: {:?}. Command: {}", e, cmd_line);
-                                            return Some((child_pid as i32, -1, Some(reason)));
-                                        }
-                                    }
-                                }
-                            }}) => {
-                                match exit_info {
-                                    Ok(Some((pid, code, reason))) => {
-                                        let cmd_info = format!("command=[{}]", command_line);
-                                        if code == -1 {
-                                            let detail = reason.as_deref().unwrap_or("exit_code unknown");
-                                            Err(anyhow::anyhow!(
-                                                "subprocess exited prematurely: pid={}, {} -- {}",
-                                                pid, detail, cmd_info
-                                            ))
-                                        } else {
-                                            let extra = reason.map(|r| format!(" ({})", r)).unwrap_or_default();
-                                            Err(anyhow::anyhow!(
-                                                "subprocess exited prematurely: pid={}, exit_code={}{} -- {}",
-                                                pid, code, extra, cmd_info
-                                            ))
-                                        }
-                                    }
-                                    _ => {
-                                        Err(anyhow::anyhow!(
-                                            "subprocess exit detection failed for pid={} -- command=[{}]",
-                                            child_pid, command_line
-                                        ))
-                                    }
+                            _ = cancel_token.cancelled() => {
+                                // lifecycle reaper 检测到子进程退出后会 cancel token
+                                let cmd_info = format!("command=[{}]", command_line);
+                                let is_abnormal = abnormal_exit_flag.load(Ordering::SeqCst);
+                                if is_abnormal {
+                                    Err(anyhow::anyhow!(
+                                        "subprocess exited abnormally during init (pid={}) -- {}",
+                                        child_pid, cmd_info
+                                    ))
+                                } else {
+                                    Err(anyhow::anyhow!(
+                                        "subprocess cancelled during init (pid={}) -- {}",
+                                        child_pid, cmd_info
+                                    ))
                                 }
                             }
                         }
@@ -248,22 +208,14 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 ).await;
 
                 let _init_response = match init_result {
-                    Ok(Ok(Ok(result))) => {
+                    Ok(Ok(result)) => {
                         // InitializeRequest 成功
                         result
                     }
-                    Ok(Ok(Err(e))) => {
-                        // send_request 返回错误
-                        error!("[SACP] InitializeRequest error: {}, project_id={}", e, project_id);
-                        if let Some(tx) = connection_failed_tx.take() {
-                            let _ = tx.send(format!("InitializeRequest error: {}", e));
-                        }
-                        return Err(e);
-                    }
-                    Ok(Err(process_err)) => {
-                        // 子进程异常退出
-                        let err_msg = process_err.to_string();
-                        error!("[SACP] Process exited during init: {}, project_id={}", err_msg, project_id);
+                    Ok(Err(e)) => {
+                        // send_request 返回错误 或 子进程退出
+                        let err_msg = e.to_string();
+                        error!("[SACP] Init phase error: {}, project_id={}", err_msg, project_id);
                         if let Some(tx) = connection_failed_tx.take() {
                             let _ = tx.send(err_msg.clone());
                         }
@@ -271,15 +223,21 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     }
                     Err(_elapsed) => {
                         error!(
-                            "[SACP] ⏰ InitializeRequest timeout (30s), project_id={}",
-                            project_id
+                            "[SACP] ⏰ InitializeRequest timeout ({}s), project_id={}",
+                            INIT_TIMEOUT_SECS, project_id
                         );
                         if let Some(tx) = connection_failed_tx.take() {
-                            let _ = tx.send(format!("ACP InitializeRequest timeout (30s), project_id={}", project_id));
+                            let _ = tx.send(format!(
+                                "ACP InitializeRequest timeout ({}s), project_id={}",
+                                INIT_TIMEOUT_SECS, project_id
+                            ));
                         }
                         return Err(agent_client_protocol::Error::new(
                             1002,
-                            format!("ACP InitializeRequest timeout (30s), project_id={}", project_id),
+                            format!(
+                                "ACP InitializeRequest timeout ({}s), project_id={}",
+                                INIT_TIMEOUT_SECS, project_id
+                            ),
                         ));
                     }
                 };

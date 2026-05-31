@@ -38,6 +38,7 @@ impl ContainerManager {
         tenant_id: Option<&str>,
         space_id: Option<&str>,
         container_work_path: &str,
+        runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
             "🔍 [CONTAINER_MGR] Starting container processing: project_id={}, service_type={:?}, pod_id={:?}, isolation_type={:?}",
@@ -58,6 +59,7 @@ impl ContainerManager {
             tenant_id,
             space_id,
             container_work_path,
+            runtime,
         )
         .await?;
 
@@ -72,18 +74,9 @@ impl ContainerManager {
     /// 获取容器信息
     pub async fn get_container_info(
         project_id: &str,
+        runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<Option<ContainerBasicInfo>, AppError> {
         debug!("[CONTAINER_MGR] get container: project_id={}", project_id);
-
-        let runtime = docker_manager::runtime::RuntimeManager::get()
-            .await
-            .map_err(|e| {
-                error!("[CONTAINER_MGR] Failed to get global runtime: {}", e);
-                AppError::with_message(
-                    ERR_CONTAINER_ERROR,
-                    format!("Failed to get global runtime: {}", e),
-                )
-            })?;
 
         runtime.get_container_info(project_id).await.map_err(|e| {
             error!("[CONTAINER_MGR] Failed to query container info: {}", e);
@@ -107,17 +100,8 @@ async fn ensure_container_exists(
     tenant_id: Option<&str>,
     space_id: Option<&str>,
     container_work_path: &str,
+    runtime: &Arc<dyn ContainerRuntime>,
 ) -> Result<ContainerBasicInfo, AppError> {
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[CONTAINER_MGR] Failed to get global runtime: {}", e);
-            AppError::with_message(
-                ERR_CONTAINER_ERROR,
-                format!("Failed to get global runtime: {}", e),
-            )
-        })?;
-
     // 1. 尝试获取现有容器（使用 container_identifier 查找）
     if let Ok(Some(info)) = runtime.get_container_info(container_identifier).await {
         info!(
@@ -137,7 +121,7 @@ async fn ensure_container_exists(
         project_id,
         container_identifier,
         service_type,
-        &runtime,
+        runtime,
         request_resource_limits,
         pod_id,
         isolation_type,

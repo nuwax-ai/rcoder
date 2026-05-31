@@ -7,6 +7,7 @@ use shared_types::GRPC_DEFAULT_PORT;
 use shared_types::ServiceType;
 use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
 use std::cmp::Reverse;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
@@ -99,16 +100,12 @@ pub fn container_identity_from_name<'a>(
 /// - `rcoder_prefix`: RCoder 服务的容器前缀（从配置读取）
 /// - `computer_prefix`: ComputerAgentRunner 服务的容器前缀（从配置读取）
 pub async fn get_realtime_container_ip(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     container_name: &str,
     fallback_ip: &str,
     rcoder_prefix: &str,
     computer_prefix: &str,
 ) -> Result<String, String> {
-    // 查询 Runtime API
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| format!("Failed to get runtime: {}", e))?;
-
     let Some((identifier, service_type)) =
         container_identity_from_name(container_name, rcoder_prefix, computer_prefix)
     else {

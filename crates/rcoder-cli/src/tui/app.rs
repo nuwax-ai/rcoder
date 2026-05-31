@@ -62,9 +62,9 @@ pub struct App {
     /// 输入框状态
     pub composer: Composer,
     /// 应用事件接收端
-    event_rx: mpsc::UnboundedReceiver<AppEvent>,
+    event_rx: mpsc::Receiver<AppEvent>,
     /// 应用事件发送端（clone 给 spawned tasks）
-    event_tx: mpsc::UnboundedSender<AppEvent>,
+    event_tx: mpsc::Sender<AppEvent>,
     /// Agent 客户端
     client: Arc<Client>,
     /// 终端实例
@@ -105,8 +105,8 @@ pub struct App {
 impl App {
     pub fn new(
         client: Arc<Client>,
-        event_tx: mpsc::UnboundedSender<AppEvent>,
-        event_rx: mpsc::UnboundedReceiver<AppEvent>,
+        event_tx: mpsc::Sender<AppEvent>,
+        event_rx: mpsc::Receiver<AppEvent>,
         terminal: TuiTerminal,
         use_markdown: bool,
         _verbose: u8,
@@ -377,19 +377,15 @@ impl App {
                     Ok(true) => {
                         match event::read() {
                             Ok(Event::Key(key)) => {
-                                if tx.send(AppEvent::Key(key)).is_err() {
-                                    break;
-                                }
+                                // 使用 try_send 避免在同步上下文中阻塞
+                                // channel 满时丢弃事件（保持轮询不退出）
+                                let _ = tx.try_send(AppEvent::Key(key));
                             }
                             Ok(Event::Resize(_, _)) => {
-                                if tx.send(AppEvent::Resize).is_err() {
-                                    break;
-                                }
+                                let _ = tx.try_send(AppEvent::Resize);
                             }
                             Ok(Event::Paste(text)) => {
-                                if tx.send(AppEvent::Paste(text)).is_err() {
-                                    break;
-                                }
+                                let _ = tx.try_send(AppEvent::Paste(text));
                             }
                             Ok(_) => {} // 忽略其他事件（mouse 等）
                             Err(_) => break,
@@ -400,7 +396,9 @@ impl App {
                 }
             }
             // Poller 退出（通常是终端错误）→ 发送 Exit 防止应用挂死
-            let _ = tx.send(AppEvent::Exit);
+            // Exit 是关键事件，必须送达：使用 blocking_send 等待空间
+            // 在 spawn_blocking 上下文中 blocking_send 会阻塞当前线程（不影响 tokio runtime）
+            let _ = tx.blocking_send(AppEvent::Exit);
         });
     }
 
@@ -619,11 +617,11 @@ impl App {
                 // （notifier 在 signal_completion 前先发送 PromptEnded），
                 // 所以大多数情况下 waiting 已经是 false。
                 // ResetWaiting 处理的是 Agent 完全无响应的边界情况。
-                let _ = tx.send(AppEvent::ResetWaiting(current_gen));
-                let _ = tx.send(AppEvent::Diagnostics(format!(
+                drop(tx.send(AppEvent::ResetWaiting(current_gen)));
+                drop(tx.send(AppEvent::Diagnostics(format!(
                     "Prompt 失败: {}",
                     e
-                )));
+                ))));
             }
         });
 
@@ -679,7 +677,7 @@ impl App {
         tokio::spawn(async move {
             let _ = client.cancel().await;
             // 无论 cancel 成功还是超时，都发送 ResetWaiting 作为兜底
-            let _ = tx.send(AppEvent::ResetWaiting(cancel_gen));
+            drop(tx.send(AppEvent::ResetWaiting(cancel_gen)));
         });
     }
 }

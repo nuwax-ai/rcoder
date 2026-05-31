@@ -58,7 +58,7 @@ axum-tracing-opentelemetry = { workspace = true }
 arc-swap = "1.8"
 
 # i18n (国际化)
-rust-i18n = { workspace = true }
+shared_types_i18n = { path = "../shared_types_i18n" }
 
 # URL query string 解析
 serde_urlencoded = "0.7"
@@ -75,12 +75,5 @@ tokio-stream = "0.1"
 # async trait for service trait definition
 async-trait = { workspace = true }
 
-# gRPC - 使用 tonic 0.14 运行时
-tonic = { version = "0.14.2", features = ["tls-native-roots"] }
-tonic-prost = "0.14"                                            # 添加 tonic-prost 依赖
-prost = "0.14"
-prost-types = "0.14"
-
-[build-dependencies]
-# 使用 tonic-prost-build 而不是 tonic-build！
-tonic-prost-build = "0.14"
+# gRPC types (extracted to shared_types_grpc)
+shared_types_grpc = { path = "../shared_types_grpc" }

@@ -11,6 +11,9 @@ pub mod utils;
 
 // 新增模块
 pub mod container_builder;
+pub mod container_creator;
+pub mod agent_container_starter;
+pub mod container_query;
 pub mod health;
 pub mod network;
 pub mod runtime_selection;

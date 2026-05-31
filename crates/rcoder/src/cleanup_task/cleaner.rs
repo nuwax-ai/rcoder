@@ -96,6 +96,19 @@ impl AgentCleaner {
                 .get_project(&project_id)
                 .and_then(|info| info.container().map(|c| c.container_name.clone()));
 
+            // 🛡️ 关键修复：项目可能已被本轮清理的共享容器连带删除
+            // 例如：cleanup_agent("P1") 销毁共享容器后，delete_container_with_projects
+            // 会同时删除 P1 和 P2 的 DB 记录。当循环到 P2 时，项目已不存在。
+            if container_name.is_none() && !self.state.contains_project(&project_id) {
+                info!(
+                    "[cleaner] Project already removed (likely by shared container cleanup): project_id={}",
+                    project_id
+                );
+                current_stats.total_cleaned += 1;
+                current_stats.success_cleaned += 1;
+                continue;
+            }
+
             if let Some(ref name) = container_name
                 && destroyed_containers.contains(name)
             {
@@ -122,11 +135,11 @@ impl AgentCleaner {
                             destroyed_containers.insert(name);
                         }
                     }
-                    info!("[cleaner] Agent cleanupsucceeded: {}", project_id);
+                    info!("✅ [cleaner] Agent cleanup succeeded: {}", project_id);
                 }
                 Err(e) => {
                     current_stats.failed_cleaned += 1;
-                    warn!("[cleaner] Agent cleanupfailed: {} - {}", project_id, e);
+                    warn!("⚠️ [cleaner] Agent cleanup failed: {} - {}", project_id, e);
                 }
             }
         }
@@ -145,7 +158,7 @@ impl AgentCleaner {
             duration.as_secs_f64(),
             current_stats.summary()
         );
-        info!("[cleaner] stats: {}", self.stats.summary());
+        info!("📊 [cleaner] Stats: {}", self.stats.summary());
 
         Ok(current_stats)
     }
@@ -153,7 +166,7 @@ impl AgentCleaner {
     /// 清理单个 agent
     /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录
     async fn cleanup_agent(&self, project_id: &str) -> Result<bool> {
-        info!("[cleaner] startingcleanup agent: {}", project_id);
+        info!("🧹 [cleaner] Starting cleanup agent: {}", project_id);
 
         // 1. 获取项目信息
         let agent_info = self
@@ -208,12 +221,37 @@ impl AgentCleaner {
             container_destroyed = true;
         }
 
-        // 5. 从存储中移除项目记录（始终执行）
-        self.state.remove_project(project_id);
-        info!(
-            "[cleaner] already removed project: project_id={}",
-            project_id
-        );
+        // 5. 从存储中移除记录
+        if container_destroyed {
+            // 容器已销毁：删除容器记录及其关联的所有项目记录（避免孤立容器记录）
+            let container_id = agent_info
+                .container()
+                .map(|c| c.container_id.clone())
+                .unwrap_or_default();
+            match self.state.projects.delete_container_with_projects(&container_id) {
+                Ok((deleted, project_count)) => {
+                    info!(
+                        "[cleaner] Deleted container and {} associated projects from DuckDB: container_id={}, container_deleted={}",
+                        project_count, container_id, deleted
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "[cleaner] Failed to delete container record from DuckDB, falling back to remove_project: container_id={}, error={}",
+                        container_id, e
+                    );
+                    // 回退：至少删除当前项目记录
+                    self.state.remove_project(project_id);
+                }
+            }
+        } else {
+            // 容器未销毁（仅超时等原因）：只删除当前项目记录
+            self.state.remove_project(project_id);
+            info!(
+                "[cleaner] Removed project record only (container not destroyed): project_id={}",
+                project_id
+            );
+        }
 
         Ok(container_destroyed)
     }

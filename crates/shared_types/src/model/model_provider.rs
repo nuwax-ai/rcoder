@@ -88,13 +88,13 @@ impl ModelProviderConfig {
     }
 
     /// 获取脱敏后的 API Key（只显示前4位和后4位）
+    /// 使用 char-based 切片避免 UTF-8 边界 panic
     fn mask_api_key(&self) -> String {
-        if self.api_key.len() > 8 {
-            format!(
-                "{}***{}",
-                &self.api_key[..4],
-                &self.api_key[self.api_key.len() - 4..]
-            )
+        let chars: Vec<char> = self.api_key.chars().collect();
+        if chars.len() > 8 {
+            let prefix: String = chars[..4].iter().collect();
+            let suffix: String = chars[chars.len() - 4..].iter().collect();
+            format!("{}***{}", prefix, suffix)
         } else {
             "***".to_string()
         }
@@ -104,8 +104,8 @@ impl ModelProviderConfig {
 /// 实现 Display trait，方便日志打印（自动对 API Key 和 URL 进行脱敏）
 impl fmt::Display for ModelProviderConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 对 base_url 进行脱敏（使用 grpc_mask::mask_url）
-        let masked_base_url = crate::grpc_mask::mask_url(&self.base_url);
+        // 对 base_url 进行脱敏（使用 shared_types_grpc::mask_url）
+        let masked_base_url = shared_types_grpc::mask_url(&self.base_url);
 
         write!(
             f,
@@ -126,7 +126,7 @@ impl fmt::Display for ModelProviderConfig {
 impl fmt::Debug for ModelProviderConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // 对 base_url 进行脱敏
-        let masked_base_url = crate::grpc_mask::mask_url(&self.base_url);
+        let masked_base_url = shared_types_grpc::mask_url(&self.base_url);
 
         // 使用与 Display 相同的脱敏格式
         write!(

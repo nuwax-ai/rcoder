@@ -32,6 +32,21 @@ pub const GRPC_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024; // 128MB
 /// Chat 等可能较慢的请求需要较长超时
 pub const GRPC_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// CancelSession 请求超时（秒）
+///
+/// 取消会话应该是快速操作（仅发送取消信号），10 秒足够
+pub const GRPC_CANCEL_SESSION_TIMEOUT_SECS: u64 = 10;
+
+/// StopAgent 请求超时（秒）
+///
+/// 停止 Agent 需要等待当前操作完成和进程退出，30 秒合理
+pub const GRPC_STOP_AGENT_TIMEOUT_SECS: u64 = 30;
+
+/// ResolvePermission 请求超时（秒）
+///
+/// 权限解析是简单的状态更新操作，10 秒足够
+pub const GRPC_RESOLVE_PERMISSION_TIMEOUT_SECS: u64 = 10;
+
 // === SSE 配置 ===
 
 /// SSE Keep-alive 间隔（秒）

@@ -2,7 +2,7 @@
 //!
 //! 提供使用 Cloudflare Pingora 库的高性能代理服务器启动、管理和请求处理功能。
 
-use anyhow::Result;
+use crate::{ProxyError, ProxyResult};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -24,11 +24,11 @@ impl ProxyServer {
     }
 
     /// 启动代理服务器
-    pub async fn start(self) -> Result<()> {
+    pub async fn start(self) -> ProxyResult<()> {
         // 验证配置
         self.config
             .validate()
-            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {}", e))?;
+            .map_err(|e| ProxyError::Config(format!("Configuration validation failed: {}", e)))?;
 
         info!(
             "starting Pingora-based port proxy server, listening on port: {}",
@@ -103,11 +103,11 @@ impl ProxyServer {
     }
 
     /// 预启动检查（不实际启动服务器）
-    pub async fn pre_start_check(&self) -> Result<()> {
+    pub async fn pre_start_check(&self) -> ProxyResult<()> {
         // 检查配置
         self.config
             .validate()
-            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {}", e))?;
+            .map_err(|e| ProxyError::Config(format!("Configuration validation failed: {}", e)))?;
 
         info!("Pingora proxy pre-start check passed");
         Ok(())
@@ -266,7 +266,7 @@ impl PingoraServerRunner {
     }
 
     /// 获取 Pingora 代理实例
-    pub fn create_pingora_proxy(&self) -> anyhow::Result<crate::service::PortProxy> {
+    pub fn create_pingora_proxy(&self) -> Result<crate::service::PortProxy, crate::ProxyError> {
         self.service.create_pingora_proxy()
     }
 }

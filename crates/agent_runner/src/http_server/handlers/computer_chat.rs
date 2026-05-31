@@ -44,7 +44,7 @@ pub async fn handle_computer_chat(
          ├─ project_id: {:?}\n\
          ├─ session_id: {:?}\n\
          ├─ request_id: {:?}\n\
-         ├─ prompt ({}chars): {:?}\n\
+         ├─ prompt_len: {} chars\n\
          ├─ pod_id: {:?}\n\
          ├─ tenant_id: {:?}\n\
          ├─ space_id: {:?}\n\
@@ -53,14 +53,13 @@ pub async fn handle_computer_chat(
          ├─ data_source_attachments: {:?}\n\
          ├─ model_provider: {:#?}\n\
          ├─ agent_config: {:#?}\n\
-         ├─ system_prompt: {:?}\n\
-         └─ user_prompt: {:?}",
+         ├─ system_prompt_len: {} chars\n\
+         └─ user_prompt_len: {} chars",
         request.user_id,
         request.project_id,
         request.session_id,
         request.request_id,
         request.prompt.len(),
-        request.prompt,
         request.pod_id,
         request.tenant_id,
         request.space_id,
@@ -69,8 +68,8 @@ pub async fn handle_computer_chat(
         request.data_source_attachments,
         request.model_provider,
         request.agent_config,
-        request.system_prompt,
-        request.user_prompt
+        request.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0),
+        request.user_prompt.as_ref().map(|s| s.len()).unwrap_or(0)
     );
 
     // 1. 验证必填字段
@@ -159,7 +158,7 @@ pub async fn handle_computer_chat(
             entry.get().clone()
         }
         Entry::Vacant(entry) => {
-            let data = SessionData::new(1000);
+            let data = SessionData::new(1000).await;
             info!(
                 "[HTTP] SESSION_CACHE created: session_id={}",
                 session_id_str

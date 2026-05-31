@@ -244,11 +244,33 @@ async fn main() -> anyhow::Result<()> {
 
         #[cfg(feature = "grpc-server")]
         {
-            tokio::select! {
-                _ = grpc_handle.unwrap() => {
-                    info!("gRPC service ended unexpectedly, shutting down...");
+            match grpc_handle {
+                Some(handle) => {
+                    tokio::select! {
+                        result = handle => {
+                            match result {
+                                Ok(_) => info!("gRPC service ended normally"),
+                                Err(e) if e.is_panic() => {
+                                    error!("🔴 gRPC service panicked: {:?}", e);
+                                }
+                                Err(e) if e.is_cancelled() => {
+                                    info!("gRPC service was cancelled");
+                                }
+                                Err(e) => {
+                                    error!("⚠️ gRPC service ended with error: {:?}", e);
+                                }
+                            }
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("📨 Received shutdown signal, preparing graceful shutdown...");
+                        }
+                    }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                None => {
+                    // This should never happen if grpc-server feature is enabled
+                    error!("🔴 CRITICAL: gRPC handle is None despite grpc-server feature being enabled. This is a bug in initialization logic.");
+                    // Wait for ctrl_c instead of silently continuing
+                    tokio::signal::ctrl_c().await?;
                     info!("📨 Received shutdown signal, preparing graceful shutdown...");
                 }
             }
@@ -362,7 +384,15 @@ async fn main() -> anyhow::Result<()> {
         };
 
         // 等待 gRPC 服务
-        let _ = grpc_handle.await;
+        if let Err(e) = grpc_handle.await {
+            if e.is_panic() {
+                error!("🔴 gRPC service panicked: {:?}", e);
+            } else if e.is_cancelled() {
+                info!("gRPC service was cancelled");
+            } else {
+                error!("⚠️ gRPC service ended with error: {:?}", e);
+            }
+        }
 
         // 停止 Pingora 服务
         #[cfg(feature = "proxy")]

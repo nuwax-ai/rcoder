@@ -1,0 +1,9 @@
+[package]
+name = "shared_types_i18n"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# i18n (国际化)
+rust-i18n = { workspace = true }

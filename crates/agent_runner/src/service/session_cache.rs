@@ -53,16 +53,23 @@ fn truncate_message_for_log(data: &serde_json::Value, max_len: usize) -> String 
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
 
+/// Session命令通道的缓冲区大小
+///
+/// 与 ring buffer 大小一致，提供足够的缓冲同时防止 OOM
+const COMMAND_CHANNEL_BUFFER_SIZE: usize = 1000;
+
 /// Session数据包装 - 极简版本，专注消息传输
 pub struct SessionData {
-    command_tx: mpsc::UnboundedSender<SessionCommand>,
+    command_tx: mpsc::Sender<SessionCommand>,
     // 🎯 极简优化：直接存储当前连接，无需命令传递
     current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
     current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+    // 🔒 Critical fix: 存储 worker JoinHandle，用于检测 panic
+    worker_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl SessionData {
-    pub fn new(max_size: usize) -> Arc<Self> {
+    pub async fn new(max_size: usize) -> Arc<Self> {
         let start_time = std::time::Instant::now();
         debug!(
             "⏱️ [SessionData::new] Starting creation, max_size={}",
@@ -70,7 +77,7 @@ impl SessionData {
         );
 
         let channel_start = std::time::Instant::now();
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER_SIZE);
         debug!(
             "⏱️ [SessionData::new] Channel creation took: {:?}",
             channel_start.elapsed()
@@ -81,6 +88,7 @@ impl SessionData {
             command_tx,
             current_sender: Arc::new(tokio::sync::Mutex::new(None)),
             current_cancel: Arc::new(tokio::sync::Mutex::new(None)),
+            worker_handle: Arc::new(tokio::sync::Mutex::new(None)),
         });
         debug!(
             "⏱️ [SessionData::new] Arc creation took: {:?}",
@@ -88,12 +96,19 @@ impl SessionData {
         );
 
         let spawn_start = std::time::Instant::now();
-        SessionWorker::spawn(
+        let handle = SessionWorker::spawn(
             max_size,
             command_rx,
             session.current_sender.clone(),
             session.current_cancel.clone(),
         );
+
+        // 🔒 Critical fix: 使用 async lock 替代 blocking_lock，避免阻塞 executor
+        {
+            let mut worker_guard = session.worker_handle.lock().await;
+            *worker_guard = Some(handle);
+        }
+
         debug!(
             "⏱️ [SessionData::new] SessionWorker::spawn took: {:?}",
             spawn_start.elapsed()
@@ -111,12 +126,55 @@ impl SessionData {
         if self
             .command_tx
             .send(SessionCommand::MessageCount { ack: tx })
+            .await
             .is_err()
         {
             warn!("Failed to send message_count command; worker has exited");
             return 0;
         }
         rx.await.unwrap_or(0)
+    }
+
+    /// 检查 worker 是否仍然存活
+    ///
+    /// 如果 worker panic 或正常退出，返回 false
+    pub async fn is_worker_alive(&self) -> bool {
+        let mut guard = self.worker_handle.lock().await;
+        match guard.as_mut() {
+            Some(handle) => !handle.is_finished(),
+            None => false,
+        }
+    }
+
+    /// 检查 worker 是否 panic
+    ///
+    /// 如果 worker 已经 panic，返回 true 并记录错误信息
+    pub async fn has_worker_panicked(&self) -> bool {
+        let mut guard = self.worker_handle.lock().await;
+        match guard.take() {
+            Some(handle) if handle.is_finished() => {
+                // 尝试 await 获取结果，检查是否 panic
+                match handle.await {
+                    Err(e) if e.is_panic() => {
+                        warn!("⚠️ [SessionData] SessionWorker panicked: {:?}", e);
+                        true
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        debug!("[SessionData] SessionWorker was cancelled");
+                        false
+                    }
+                    Ok(_) => {
+                        debug!("[SessionData] SessionWorker exited normally");
+                        false
+                    }
+                    _ => false, // 尚未完成
+                }
+            }
+            other => {
+                *guard = other; // 恢复未完成的 handle
+                false
+            }
+        }
     }
 
     pub async fn create_new_connection(
@@ -171,13 +229,39 @@ impl SessionData {
         Ok((rx, cancellation_token))
     }
 
+    /// 检查 worker 是否已完成 (non-blocking)
+    ///
+    /// 如果 worker 已完成（正常退出、取消或 panic），返回 true
+    /// 如果无法获取锁或 worker 仍在运行，返回 false
+    ///
+    /// 注意：此方法无法区分正常退出和 panic，需要调用 async 版本的
+    /// `has_worker_panicked()` 来获取准确的 panic 检测结果
+    pub fn is_worker_finished_nonblocking(&self) -> bool {
+        // 使用 try_lock 避免阻塞
+        if let Ok(guard) = self.worker_handle.try_lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            return handle.is_finished();
+        }
+        false
+    }
+
     pub fn push_message(&self, message: UnifiedSessionMessage) {
+        // 使用 try_send 提供背压保护：通道满时丢弃消息而不是无限增长
+        // 这是安全的，因为：
+        // 1. ring buffer 已经缓存了最近的消息（用于重连时恢复）
+        // 2. SSE 客户端断线重连后会从 ring buffer 获取历史消息
         if self
             .command_tx
-            .send(SessionCommand::Push { message })
+            .try_send(SessionCommand::Push { message })
             .is_err()
         {
-            warn!("Failed to push message; worker has exited");
+            // 检查是否因为 worker 已完成导致通道关闭
+            if self.is_worker_finished_nonblocking() {
+                warn!("⚠️ [SessionData] Failed to push message: SessionWorker has exited (normal exit, cancelled, or panicked). Messages will be lost until session is recreated");
+            } else {
+                warn!("Failed to push message: command channel full (backpressure)");
+            }
         }
     }
 
@@ -212,7 +296,7 @@ impl SessionData {
 
 struct SessionWorker {
     max_size: usize,
-    command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+    command_rx: mpsc::Receiver<SessionCommand>,
     // 🎯 极简优化：直接共享连接状态，无需命令传递
     current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
     current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
@@ -221,10 +305,10 @@ struct SessionWorker {
 impl SessionWorker {
     fn spawn(
         max_size: usize,
-        command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+        command_rx: mpsc::Receiver<SessionCommand>,
         current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
         current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let start_time = std::time::Instant::now();
         debug!(
             "⏱️ [SessionWorker::spawn] Starting SessionWorker creation, max_size={}",
@@ -239,7 +323,7 @@ impl SessionWorker {
         };
 
         let spawn_start = std::time::Instant::now();
-        tokio::spawn(worker.run());
+        let handle = tokio::spawn(worker.run());
         debug!(
             "⏱️ [SessionWorker::spawn] tokio::spawn took: {:?}",
             spawn_start.elapsed()
@@ -248,6 +332,8 @@ impl SessionWorker {
             "⏱️ [SessionWorker::spawn] Total spawn took: {:?}",
             start_time.elapsed()
         );
+
+        handle
     }
 
     async fn run(mut self) {
@@ -337,9 +423,23 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
     // handle_chat_core 尚未返回，computer_chat.rs 还未创建条目）→ 消息被丢弃
     let session_data = {
         match SESSION_CACHE.entry(session_id.to_string()) {
-            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Occupied(mut entry) => {
+                let existing_data = entry.get().clone();
+                // 🔒 Critical fix: 检查 worker 是否 panic，如果是则重新创建
+                if existing_data.has_worker_panicked().await {
+                    warn!(
+                        "🔴 [push_session_update] SessionWorker panicked for session_id={}, recreating...",
+                        session_id
+                    );
+                    let new_data = SessionData::new(1000).await;
+                    entry.insert(new_data.clone());
+                    new_data
+                } else {
+                    existing_data
+                }
+            }
             Entry::Vacant(entry) => {
-                let data = SessionData::new(1000);
+                let data = SessionData::new(1000).await;
                 info!(
                     "📦 [push_session_update] SESSION_CACHE auto-created: session_id={}",
                     session_id

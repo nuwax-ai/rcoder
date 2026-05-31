@@ -18,6 +18,7 @@ use shared_types::{
     ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
     ModelEnvBindingSource,
 };
+use tracing::warn;
 use tonic::Status;
 
 pub fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProviderConfig {
@@ -159,49 +160,123 @@ pub fn convert_attachment_source(
     })
 }
 
-pub fn convert_attachment(grpc_attachment: shared_types::grpc::Attachment) -> Option<Attachment> {
-    let attachment_type = grpc_attachment.attachment_type?;
+pub fn convert_attachment(
+    grpc_attachment: shared_types::grpc::Attachment,
+    attachment_index: usize,
+) -> Option<Attachment> {
+    let attachment_type = match grpc_attachment.attachment_type {
+        Some(at) => at,
+        None => {
+            warn!(
+                "⚠️ [gRPC] Attachment {} has no attachment_type, skipping",
+                attachment_index
+            );
+            return None;
+        }
+    };
 
-    Some(match attachment_type {
-        attachment::AttachmentType::Text(text) => Attachment::Text(TextAttachment {
-            id: text.id,
-            source: convert_attachment_source(text.source)?,
-            filename: text.filename,
-            description: text.description,
-        }),
-        attachment::AttachmentType::Image(image) => Attachment::Image(ImageAttachment {
-            id: image.id,
-            source: convert_attachment_source(image.source)?,
-            mime_type: image.mime_type,
-            filename: image.filename,
-            description: image.description,
-            dimensions: image.dimensions.map(|d| ImageDimensions {
-                width: d.width,
-                height: d.height,
-            }),
-        }),
-        attachment::AttachmentType::Audio(audio) => Attachment::Audio(AudioAttachment {
-            id: audio.id,
-            source: convert_attachment_source(audio.source)?,
-            mime_type: audio.mime_type,
-            filename: audio.filename,
-            description: audio.description,
-            duration: audio.duration,
-        }),
-        attachment::AttachmentType::Document(doc) => Attachment::Document(DocumentAttachment {
-            id: doc.id,
-            source: convert_attachment_source(doc.source)?,
-            mime_type: doc.mime_type,
-            filename: doc.filename,
-            description: doc.description,
-            size: doc.size,
-        }),
-    })
+    let result = match attachment_type {
+        attachment::AttachmentType::Text(text) => {
+            let source = match convert_attachment_source(text.source) {
+                Some(s) => s,
+                None => {
+                    warn!(
+                        "⚠️ [gRPC] Text attachment {} has invalid source, skipping",
+                        attachment_index
+                    );
+                    return None;
+                }
+            };
+            Attachment::Text(TextAttachment {
+                id: text.id,
+                source,
+                filename: text.filename,
+                description: text.description,
+            })
+        }
+        attachment::AttachmentType::Image(image) => {
+            let source = match convert_attachment_source(image.source) {
+                Some(s) => s,
+                None => {
+                    warn!(
+                        "⚠️ [gRPC] Image attachment {} has invalid source, skipping",
+                        attachment_index
+                    );
+                    return None;
+                }
+            };
+            Attachment::Image(ImageAttachment {
+                id: image.id,
+                source,
+                mime_type: image.mime_type,
+                filename: image.filename,
+                description: image.description,
+                dimensions: image.dimensions.map(|d| ImageDimensions {
+                    width: d.width,
+                    height: d.height,
+                }),
+            })
+        }
+        attachment::AttachmentType::Audio(audio) => {
+            let source = match convert_attachment_source(audio.source) {
+                Some(s) => s,
+                None => {
+                    warn!(
+                        "⚠️ [gRPC] Audio attachment {} has invalid source, skipping",
+                        attachment_index
+                    );
+                    return None;
+                }
+            };
+            Attachment::Audio(AudioAttachment {
+                id: audio.id,
+                source,
+                mime_type: audio.mime_type,
+                filename: audio.filename,
+                description: audio.description,
+                duration: audio.duration,
+            })
+        }
+        attachment::AttachmentType::Document(doc) => {
+            let source = match convert_attachment_source(doc.source) {
+                Some(s) => s,
+                None => {
+                    warn!(
+                        "⚠️ [gRPC] Document attachment {} has invalid source, skipping",
+                        attachment_index
+                    );
+                    return None;
+                }
+            };
+            Attachment::Document(DocumentAttachment {
+                id: doc.id,
+                source,
+                mime_type: doc.mime_type,
+                filename: doc.filename,
+                description: doc.description,
+                size: doc.size,
+            })
+        }
+    };
+
+    Some(result)
 }
 
 pub fn convert_attachments(grpc_attachments: Vec<shared_types::grpc::Attachment>) -> Vec<Attachment> {
-    grpc_attachments
+    let total = grpc_attachments.len();
+    let converted: Vec<Attachment> = grpc_attachments
         .into_iter()
-        .filter_map(convert_attachment)
-        .collect()
+        .enumerate()
+        .filter_map(|(idx, att)| convert_attachment(att, idx))
+        .collect();
+
+    let dropped = total - converted.len();
+    if dropped > 0 {
+        warn!(
+            "⚠️ [gRPC] Dropped {} malformed attachment(s) out of {} total",
+            dropped, total
+        );
+    }
+
+    converted
 }

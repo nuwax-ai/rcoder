@@ -1,7 +1,9 @@
 //! 信号处理与优雅关闭
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use container_runtime_api::ContainerRuntime;
 use docker_manager::container_stop;
 use docker_manager::runtime_selection::RuntimeType;
 use tracing::{error, info, warn};
@@ -68,12 +70,13 @@ pub fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
 pub async fn graceful_shutdown(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     config: crate::config::AppConfig,
+    runtime: Arc<dyn ContainerRuntime>,
 ) {
     let _ = shutdown_rx.recv().await;
 
     info!("starting graceful shutdown...");
 
-    if let Err(e) = cleanup_all_containers(&config).await {
+    if let Err(e) = cleanup_all_containers(&config, &runtime).await {
         error!("container cleanup failed: {}", e);
     } else {
         info!("container cleanup completed");
@@ -82,7 +85,10 @@ pub async fn graceful_shutdown(
     info!("🛑 RCoder graceful shutdown completed");
 }
 
-async fn cleanup_all_containers(config: &crate::config::AppConfig) -> anyhow::Result<()> {
+async fn cleanup_all_containers(
+    config: &crate::config::AppConfig,
+    runtime: &Arc<dyn ContainerRuntime>,
+) -> anyhow::Result<()> {
     info!("🧹 starting cleanup of dynamically created containers...");
 
     match docker_manager::runtime::RuntimeManager::runtime_type() {
@@ -124,9 +130,6 @@ async fn cleanup_all_containers(config: &crate::config::AppConfig) -> anyhow::Re
             }
         }
         RuntimeType::Kubernetes => {
-            let runtime = docker_manager::runtime::RuntimeManager::get()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to get runtime: {}", e))?;
             runtime
                 .cleanup_all()
                 .await

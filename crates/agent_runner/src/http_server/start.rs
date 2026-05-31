@@ -146,12 +146,10 @@ impl HttpServerHandle {
 /// }
 /// ```
 pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHandle> {
-    // 设置 mcp-proxy 日志目录环境变量（如果配置了的话）
+    // 设置 mcp-proxy 日志目录（如果配置了的话）
+    // 使用 OnceLock 替代 env::set_var，避免多线程环境下的 UB（Rust 1.84+）
     if let Some(ref log_dir) = config.app_config.mcp_proxy_log_dir {
-        // SAFETY: 在服务启动时设置环境变量是安全的，此时尚未启动多线程任务
-        unsafe {
-            std::env::set_var("MCP_PROXY_LOG_DIR", log_dir);
-        }
+        agent_abstraction::launcher::set_mcp_proxy_log_dir(log_dir.clone());
         info!("🔧 Set MCP_PROXY_LOG_DIR={}", log_dir);
     }
 

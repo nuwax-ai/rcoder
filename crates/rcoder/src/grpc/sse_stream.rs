@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use shared_types::grpc::{GetStatusRequest, ProgressRequest};
 use shared_types::{SessionMessageType, UnifiedSessionMessage};
+use std::sync::Arc;
 use tonic::Code;
 use tracing::{debug, error, info, warn};
 
@@ -318,8 +319,8 @@ fn parse_message_type(message_type: &str) -> SessionMessageType {
         "Heartbeat" => SessionMessageType::Heartbeat,
         // 默认作为 AgentSessionUpdate 处理
         _ => {
-            debug!(
-                "⚠️ [gRPC_SSE] Unknown message_type: {}, using AgentSessionUpdate as default",
+            warn!(
+                "⚠️ [gRPC_SSE] Unknown message_type '{}', falling back to AgentSessionUpdate",
                 message_type
             );
             SessionMessageType::AgentSessionUpdate
@@ -331,15 +332,15 @@ fn parse_message_type(message_type: &str) -> SessionMessageType {
 ///
 /// 返回格式: `{container_ip}:{grpc_port}`
 /// 默认 gRPC 端口为 50051
-pub async fn get_container_grpc_addr(project_id: &str, grpc_port: u16) -> anyhow::Result<String> {
+pub async fn get_container_grpc_addr(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
+    project_id: &str,
+    grpc_port: u16,
+) -> anyhow::Result<String> {
     info!(
         "🔍 [CONTAINER] Getting container gRPC address: project_id={}",
         project_id
     );
-
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get runtime: {}", e))?;
 
     let agent_info = runtime
         .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)

@@ -149,6 +149,8 @@ pub struct ContainerQueryResult {
     pub is_running: bool,
     /// 容器 IP 地址（用于 gRPC 健康检查）
     pub container_ip: String,
+    /// 容器创建时间
+    pub created_at: DateTime<Utc>,
 }
 
 /// 容器实时查询结果的 Arc 包装（用于缓存）
@@ -162,6 +164,7 @@ impl ContainerQueryResult {
         status: ContainerStatus,
         is_running: bool,
         container_ip: String,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
             container_id,
@@ -169,6 +172,7 @@ impl ContainerQueryResult {
             status,
             is_running,
             container_ip,
+            created_at,
         }
     }
 
@@ -180,6 +184,7 @@ impl ContainerQueryResult {
             status: tuple.2,
             is_running: tuple.3,
             container_ip: String::new(), // 默认为空，需要后续更新
+            created_at: chrono::Utc::now(), // 兼容旧代码，使用当前时间
         }
     }
 
@@ -190,6 +195,7 @@ impl ContainerQueryResult {
         status: ContainerStatus,
         is_running: bool,
         container_ip: String,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
             container_id,
@@ -197,6 +203,7 @@ impl ContainerQueryResult {
             status,
             is_running,
             container_ip,
+            created_at,
         }
     }
 

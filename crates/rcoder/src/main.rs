@@ -61,20 +61,27 @@ async fn main() -> anyhow::Result<()> {
     let (container_prefix_rcoder, container_prefix_computer) =
         docker_init::get_container_prefixes(&bootstrap_result.config)?;
 
+    // 获取容器运行时（在 init_docker_manager 之后可用）
+    let runtime = docker_manager::runtime::RuntimeManager::get()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get container runtime: {}", e))?;
+
     let state = Arc::new(AppState::new(
         bootstrap_result.config.clone(),
         proxy_result.pingora_service.clone(),
         bootstrap_result.api_key_config,
         container_prefix_rcoder,
         container_prefix_computer,
+        runtime,
     )?);
 
     let _bg_handles = background_tasks::start_all_background_tasks(&bootstrap_result.config, state.clone()).await?;
 
+    let runtime_for_shutdown = state.runtime().clone();
     let app = router::create_router(state, Some(bootstrap_result.telemetry));
     let server_handle = server::start_http_server(app, bootstrap_result.config.port, shutdown_tx.clone()).await?;
 
-    shutdown::graceful_shutdown(shutdown_tx.subscribe(), bootstrap_result.config.clone()).await;
+    shutdown::graceful_shutdown(shutdown_tx.subscribe(), bootstrap_result.config.clone(), runtime_for_shutdown).await;
     server_handle.abort();
 
     if let Some(pingora_shutdown_tx) = proxy_result.pingora_shutdown_tx {

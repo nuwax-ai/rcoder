@@ -444,6 +444,17 @@ impl AgentLifecycleGuard {
                 return Ok(());
             }
 
+            // 🔥 关键：pgid 必须在 i32 范围内才能安全转换为负数
+            // Linux PIDs 最大可达 4,194,304，远小于 i32::MAX (2,147,483,647)
+            // 但为了防御性编程，仍然检查
+            if pgid > i32::MAX as u32 {
+                warn!(
+                    "[LifecycleGuard] 进程组 ID {} 超出 i32 范围，跳过进程组终止: project_id={}",
+                    pgid, self.inner.project_id
+                );
+                return Ok(());
+            }
+
             // 🔥 关键：使用负的进程组 ID（真实的进程组 ID）
             // -pgid 表示发送信号到整个进程组，而不仅仅是进程组组长
             let target = Pid::from_raw(-(pgid as i32));
@@ -547,12 +558,17 @@ impl Drop for AgentLifecycleGuard {
 
                 let pgid = self.inner.pgid;
 
-                // 🔥 关键防御性检查：pgid 不能为 0
+                // 🔥 关键防御性检查：pgid 不能为 0 且必须在 i32 范围内
                 // kill(0, SIGKILL) 会杀死调用者自己的进程组，这是危险的
                 if pgid == 0 {
                     debug!(
                         "[Claude] 进程组 ID 为 0，跳过进程组终止: project_id={}",
                         self.inner.project_id
+                    );
+                } else if pgid > i32::MAX as u32 {
+                    debug!(
+                        "[Claude] 进程组 ID {} 超出 i32 范围，跳过进程组终止: project_id={}",
+                        pgid, self.inner.project_id
                     );
                 } else {
                     let target = Pid::from_raw(-(pgid as i32));

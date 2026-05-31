@@ -169,6 +169,7 @@ where
     ///
     /// - 如果是相对路径，先与当前目录拼接
     /// - 去除路径中的 "./"（CurDir 组件）
+    /// - 解析 ".."（ParentDir）：绝对路径弹出上一个普通组件，相对路径保留
     pub fn normalize_path(path: &PathBuf) -> PathBuf {
         let joined_path = if path.is_absolute() {
             path.clone()
@@ -176,10 +177,25 @@ where
             std::env::current_dir().unwrap_or_default().join(path)
         };
 
-        joined_path
-            .components()
-            .filter(|c| !matches!(c, Component::CurDir))
-            .collect()
+        let mut components = Vec::new();
+        for c in joined_path.components() {
+            match c {
+                Component::CurDir => {} // skip .
+                Component::ParentDir => {
+                    // 绝对路径：弹出最后一个普通组件，防止目录穿越
+                    // 相对路径：保留 ..（由调用方负责处理）
+                    if joined_path.is_absolute() {
+                        if let Some(Component::Normal(_)) = components.last() {
+                            components.pop();
+                        }
+                    } else {
+                        components.push(c);
+                    }
+                }
+                _ => components.push(c),
+            }
+        }
+        components.iter().collect()
     }
 
     /// 确保项目目录存在

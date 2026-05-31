@@ -9,6 +9,7 @@ use crate::models::{
 };
 use crate::repositories::{ContainerRepository, ProjectRepository};
 use crate::schema::SchemaInitializer;
+use duckdb::params;
 use shared_types::ServiceType;
 use std::sync::Arc;
 
@@ -76,8 +77,35 @@ pub trait UnifiedStorage: Send + Sync {
         project_id: &str,
     ) -> DuckDbResult<Option<chrono::DateTime<chrono::Utc>>>;
 
+    /// 原子性地更新项目和关联容器的活动时间
+    ///
+    /// 在单个事务中完成项目和容器的活动时间更新，避免 TOCTOU 竞态条件。
+    /// 返回实际使用的时间戳，若项目不存在则返回 None。
+    fn update_activity_atomic(
+        &self,
+        project_id: &str,
+    ) -> DuckDbResult<Option<chrono::DateTime<chrono::Utc>>>;
+
+    /// 原子性地保存项目和关联容器
+    ///
+    /// 在单个事务中完成项目和容器的保存，避免部分写入导致的孤儿记录。
+    /// 如果容器记录存在，先保存容器，再保存项目。
+    fn save_project_and_container_atomic(
+        &self,
+        project_record: &ProjectRecord,
+        container_record: Option<&ContainerRecord>,
+    ) -> DuckDbResult<()>;
+
     /// 获取所有项目
     fn get_all_projects(&self) -> DuckDbResult<Vec<ProjectRecord>>;
+
+    /// 获取所有项目及其关联的容器信息（JOIN 查询优化）
+    ///
+    /// 使用 LEFT JOIN 一次性获取项目和容器数据，避免 N+1 查询问题。
+    /// 如果项目没有关联容器，container_record 为 None。
+    fn get_all_projects_with_containers(
+        &self,
+    ) -> DuckDbResult<Vec<(ProjectRecord, Option<ContainerRecord>)>>;
 
     /// 根据用户ID查找所有项目（ComputerAgentRunner模式）
     ///
@@ -115,6 +143,18 @@ pub trait UnifiedStorage: Send + Sync {
     /// 更新会话
     fn update_session(&self, project_id: &str, session_id: &str) -> DuckDbResult<bool>;
 
+    /// 原子更新会话（仅当当前 session_id 与预期相同时才更新）
+    ///
+    /// 使用 compare-and-swap 模式防止并发更新导致的竞态条件。
+    /// 只有当数据库中当前的 session_id 与 `expected_current_session_id` 相同时才更新。
+    /// 如果 `expected_current_session_id` 为 None，则只在当前没有 session_id 时更新。
+    fn update_session_atomic(
+        &self,
+        project_id: &str,
+        new_session_id: &str,
+        expected_current_session_id: Option<&str>,
+    ) -> DuckDbResult<bool>;
+
     /// 清除会话（将 session_id 设置为 NULL）
     fn clear_session(&self, project_id: &str) -> DuckDbResult<bool>;
 
@@ -145,6 +185,9 @@ pub trait UnifiedStorage: Send + Sync {
     fn cleanup(&self, idle_minutes: i64, protection_minutes: i64) -> DuckDbResult<CleanupResult>;
 
     // ========== 统计操作 ==========
+
+    /// 统计闲置容器数量（直接 SQL 聚合，不加载全量数据）
+    fn count_idle_containers(&self, idle_minutes: i64) -> DuckDbResult<usize>;
 
     /// 获取存储统计信息
     fn get_stats(&self) -> DuckDbResult<StorageStats>;
@@ -293,18 +336,9 @@ impl UnifiedStorage for DuckDbStorage {
         idle_minutes: i64,
         protection_minutes: i64,
     ) -> DuckDbResult<Vec<IdleContainerInfo>> {
-        let mut idle_containers = self
-            .containers()?
-            .find_idle_containers(idle_minutes, protection_minutes)?;
-
-        // 为每个闲置容器填充关联的项目ID
-        let projects_repo = self.projects()?;
-        for container in &mut idle_containers {
-            let projects = projects_repo.find_by_container_id(&container.container_id)?;
-            container.project_ids = projects.iter().map(|p| p.project_id.clone()).collect();
-        }
-
-        Ok(idle_containers)
+        // 使用 JOIN + GROUP_CONCAT 一次性获取容器和关联的 project_ids，避免 N+1 查询
+        self.containers()?
+            .find_idle_containers(idle_minutes, protection_minutes)
     }
 
     // ========== 项目操作 ==========
@@ -332,8 +366,39 @@ impl UnifiedStorage for DuckDbStorage {
         self.projects()?.update_activity(project_id)
     }
 
+    fn update_activity_atomic(
+        &self,
+        project_id: &str,
+    ) -> DuckDbResult<Option<chrono::DateTime<chrono::Utc>>> {
+        self.projects()?.update_activity_atomic(project_id)
+    }
+
+    fn save_project_and_container_atomic(
+        &self,
+        project_record: &ProjectRecord,
+        container_record: Option<&ContainerRecord>,
+    ) -> DuckDbResult<()> {
+        self.conn.transaction(|c| {
+            // 如果有容器记录，先保存容器
+            if let Some(container) = container_record {
+                ContainerRepository::upsert_with_connection(c, container)?;
+            }
+
+            // 保存项目记录
+            ProjectRepository::upsert_with_connection(c, project_record)?;
+
+            Ok(())
+        })
+    }
+
     fn get_all_projects(&self) -> DuckDbResult<Vec<ProjectRecord>> {
         self.projects()?.find_all()
+    }
+
+    fn get_all_projects_with_containers(
+        &self,
+    ) -> DuckDbResult<Vec<(ProjectRecord, Option<ContainerRecord>)>> {
+        self.projects()?.find_all_with_containers()
     }
 
     fn find_projects_by_user_id(&self, user_id: &str) -> DuckDbResult<Vec<ProjectRecord>> {
@@ -366,6 +431,19 @@ impl UnifiedStorage for DuckDbStorage {
         self.projects()?.update_session(project_id, session_id)
     }
 
+    fn update_session_atomic(
+        &self,
+        project_id: &str,
+        new_session_id: &str,
+        expected_current_session_id: Option<&str>,
+    ) -> DuckDbResult<bool> {
+        self.projects()?.update_session_atomic(
+            project_id,
+            new_session_id,
+            expected_current_session_id,
+        )
+    }
+
     fn clear_session(&self, project_id: &str) -> DuckDbResult<bool> {
         self.projects()?.clear_session(project_id)
     }
@@ -377,7 +455,13 @@ impl UnifiedStorage for DuckDbStorage {
         // 如果会话活跃，同时也更新关联容器的活跃状态
         if updated {
             // 使用新方法直接通过 session_id 更新容器活动时间，无需获取 container_id
-            let _ = self.containers()?.update_activity_by_session(session_id);
+            if let Err(e) = self.containers()?.update_activity_by_session(session_id) {
+                tracing::warn!(
+                    "Failed to update container activity for session {}: {}",
+                    session_id,
+                    e
+                );
+            }
         }
 
         Ok(updated)
@@ -402,13 +486,23 @@ impl UnifiedStorage for DuckDbStorage {
     }
 
     fn delete_container_with_projects(&self, container_id: &str) -> DuckDbResult<(bool, usize)> {
-        // 先删除关联的项目
-        let deleted_projects = self.projects()?.delete_by_container_id(container_id)?;
+        // 使用事务确保原子性：删除关联项目和容器在同一个事务中完成
+        // 避免两次独立的 mutex 获取导致部分删除的不一致状态
+        self.conn.transaction(|c| {
+            // 先删除关联的项目
+            let deleted_projects = c.execute(
+                "DELETE FROM projects WHERE container_id = ?",
+                params![container_id],
+            )?;
 
-        // 再删除容器
-        let container_deleted = self.containers()?.delete(container_id)?;
+            // 再删除容器
+            let deleted_containers = c.execute(
+                "DELETE FROM containers WHERE container_id = ?",
+                params![container_id],
+            )?;
 
-        Ok((container_deleted, deleted_projects))
+            Ok((deleted_containers > 0, deleted_projects))
+        })
     }
 
     // ========== 清理操作 ==========
@@ -442,6 +536,10 @@ impl UnifiedStorage for DuckDbStorage {
 
     // ========== 统计操作 ==========
 
+    fn count_idle_containers(&self, idle_minutes: i64) -> DuckDbResult<usize> {
+        self.containers()?.count_idle(idle_minutes)
+    }
+
     fn get_stats(&self) -> DuckDbResult<StorageStats> {
         let containers = self.containers()?;
         let projects = self.projects()?;
@@ -451,20 +549,10 @@ impl UnifiedStorage for DuckDbStorage {
         let active_sessions = projects.count_active_sessions()?;
         let projects_by_service_type = projects.count_by_service_type()?;
 
-        // 计算活跃和闲置容器
-        let all_containers = containers.find_all()?;
+        // 使用 SQL 聚合统计闲置容器，避免加载全量数据到内存
         let idle_threshold_minutes = 30;
-
-        let mut active_containers = 0;
-        let mut idle_containers = 0;
-
-        for container in &all_containers {
-            if container.is_idle(idle_threshold_minutes) {
-                idle_containers += 1;
-            } else {
-                active_containers += 1;
-            }
-        }
+        let idle_containers = containers.count_idle(idle_threshold_minutes)?;
+        let active_containers = total_containers.saturating_sub(idle_containers);
 
         Ok(StorageStats {
             total_containers,

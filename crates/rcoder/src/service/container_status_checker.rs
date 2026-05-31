@@ -112,6 +112,7 @@ impl Default for ContainerStatusCheckerConfig {
 }
 
 /// 容器状态检查器
+#[derive(Clone)]
 struct ContainerStatusChecker {
     config: ContainerStatusCheckerConfig,
     state: Arc<AppState>,
@@ -130,7 +131,12 @@ impl ContainerStatusChecker {
     }
 
     /// 检查所有容器的状态
+    ///
+    /// 🚀 使用并发批处理优化：每批最多 10 个容器并发检查
+    /// 100 个容器从最差 300s (5分钟) 降低到 ~30s
     async fn check_all_containers(&self) -> anyhow::Result<()> {
+        use futures_util::future::join_all;
+
         // 收集所有需要检查的容器（创建快照，使用 DuckDB 存储）
         let containers: Vec<(String, Arc<shared_types::ProjectAndContainerInfo>)> =
             self.state.projects.iter().collect();
@@ -146,40 +152,54 @@ impl ContainerStatusChecker {
         );
 
         let total_count = containers.len();
-        let mut checked = 0;
         let mut skipped = 0;
+
+        // 🚀 预过滤：收集需要检查的容器（should_skip_check 是同步操作）
+        let to_check: Vec<_> = containers
+            .into_iter()
+            .filter_map(|(_project_id, container_info)| {
+                let lookup_key = container_info.container_key().to_string();
+                if self.should_skip_check(&lookup_key) {
+                    skipped += 1;
+                    debug!(
+                        "⏭️ [STATUS_CHECKER] Skipping check (recently failed): {}",
+                        lookup_key
+                    );
+                    None
+                } else {
+                    Some((lookup_key, container_info))
+                }
+            })
+            .collect();
+
+        let checked = to_check.len();
         let mut updated = 0;
         let mut failed = 0;
 
-        for (_project_id, container_info) in containers {
-            // 使用 container_key() 获取正确的容器标识符
-            // - RCoder 模式：返回 project_id
-            // - ComputerAgentRunner 模式：返回 user_id（用于匹配容器名称）
-            let lookup_key = container_info.container_key().to_string();
+        // 🚀 并发批处理：每批最多 10 个容器
+        let batch_size = 10;
+        for chunk in to_check.chunks(batch_size) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(lookup_key, container_info)| {
+                    let checker = self.clone();
+                    let lookup_key = lookup_key.clone();
+                    let container_info = container_info.clone();
+                    async move {
+                        checker
+                            .check_single_container(&lookup_key, &container_info)
+                            .await
+                    }
+                })
+                .collect();
 
-            // 🆕 检查所有类型的容器（RCoder 和 ComputerAgentRunner）
-            // 两种模式都可能执行长时间任务，需要定期检查状态防止被误杀
-
-            // 检查是否应该跳过
-            if self.should_skip_check(&lookup_key) {
-                skipped += 1;
-                debug!(
-                    "⏭️ [STATUS_CHECKER] Skipping check (recently failed): {}",
-                    lookup_key
-                );
-                continue;
-            }
-
-            checked += 1;
-
-            // 执行单个容器检查
-            match self
-                .check_single_container(&lookup_key, &container_info)
-                .await
-            {
-                Ok(true) => updated += 1,
-                Ok(false) => {} // 容器空闲或未更新
-                Err(_) => failed += 1,
+            let results = join_all(futures).await;
+            for result in results {
+                match result {
+                    Ok(true) => updated += 1,
+                    Ok(false) => {} // 容器空闲或未更新
+                    Err(_) => failed += 1,
+                }
             }
         }
 
@@ -323,68 +343,60 @@ impl ContainerStatusChecker {
         container_info: &Arc<shared_types::ProjectAndContainerInfo>,
         grpc_addr: &str,
     ) -> bool {
-        match docker_manager::runtime::RuntimeManager::get().await {
-            Ok(runtime) => {
-                let service_type = container_info
-                    .service_type()
-                    .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
+        let runtime = self.state.runtime();
+        let service_type = container_info
+            .service_type()
+            .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
 
-                // 根据 service_type 使用不同的查找方法
-                // - RCoder 模式：使用 project_id 查找
-                // - ComputerAgentRunner 模式：使用 user_id 查找
-                let exists = match service_type {
-                    shared_types::ServiceType::ComputerAgentRunner => {
-                        // ComputerAgentRunner 模式：使用 user_id 查找容器
-                        if let Some(user_id) = container_info.user_id() {
-                            match runtime.find_container(user_id, &service_type).await {
-                                Ok(Some(_)) => true,
-                                Ok(None) => false,
-                                Err(e) => {
-                                    debug!("⚠️ [STATUS_CHECKER] Failed to query container: {}", e);
-                                    false
-                                }
-                            }
-                        } else {
-                            debug!("⚠️ [STATUS_CHECKER] ComputerAgentRunner missing user_id");
+        // 根据 service_type 使用不同的查找方法
+        // - RCoder 模式：使用 project_id 查找
+        // - ComputerAgentRunner 模式：使用 user_id 查找
+        let exists = match service_type {
+            shared_types::ServiceType::ComputerAgentRunner => {
+                // ComputerAgentRunner 模式：使用 user_id 查找容器
+                if let Some(user_id) = container_info.user_id() {
+                    match runtime.find_container(user_id, &service_type).await {
+                        Ok(Some(_)) => true,
+                        Ok(None) => false,
+                        Err(e) => {
+                            debug!("⚠️ [STATUS_CHECKER] Failed to query container: {}", e);
                             false
                         }
                     }
-                    shared_types::ServiceType::RCoder => {
-                        // RCoder 模式：使用 project_id 查找容器
-                        match runtime
-                            .find_container(container_info.project_id(), &service_type)
-                            .await
-                        {
-                            Ok(Some(_)) => true,
-                            Ok(None) => false,
-                            Err(e) => {
-                                debug!("⚠️ [STATUS_CHECKER] Failed to query container: {}", e);
-                                false
-                            }
-                        }
-                    }
-                };
-
-                if exists {
-                    debug!(
-                        "🔍 [STATUS_CHECKER] Runtime container exists, likely network issue: {} (service_type={:?})",
-                        grpc_addr, service_type
-                    );
                 } else {
-                    info!(
-                        "🔍 [STATUS_CHECKER] Runtime container does not exist (already destroyed): {} (service_type={:?})",
-                        grpc_addr, service_type
-                    );
+                    debug!("⚠️ [STATUS_CHECKER] ComputerAgentRunner missing user_id");
+                    false
                 }
+            }
+            shared_types::ServiceType::RCoder => {
+                // RCoder 模式：使用 project_id 查找容器
+                match runtime
+                    .find_container(container_info.project_id(), &service_type)
+                    .await
+                {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(e) => {
+                        debug!("⚠️ [STATUS_CHECKER] Failed to query container: {}", e);
+                        false
+                    }
+                }
+            }
+        };
 
-                exists
-            }
-            Err(e) => {
-                warn!("[STATUS_CHECKER] get runtime failed: {}", e);
-                // 无法确定容器状态，保守地认为容器存在
-                true
-            }
+        if exists {
+            debug!(
+                "🔍 [STATUS_CHECKER] Runtime container exists, likely network issue: {} (service_type={:?})",
+                grpc_addr, service_type
+            );
+        } else {
+            info!(
+                "🔍 [STATUS_CHECKER] Runtime container does not exist (already destroyed): {} (service_type={:?})",
+                grpc_addr, service_type
+            );
         }
+
+        exists
     }
 
     /// 判断是否应该跳过检查
@@ -580,7 +592,7 @@ pub fn start_container_status_checker(
 
             // 执行容器状态检查
             if let Err(e) = checker.check_all_containers().await {
-                warn!("[STATUS_CHECKER] containerstatuscheckfailed: {}", e);
+                warn!("⚠️ [STATUS_CHECKER] Container status check failed: {}", e);
             }
 
             // 定期清理过期的健康状态

@@ -170,7 +170,7 @@ impl AgentStartConfig {
             );
             debug!(
                 "[ACP] system_prompt content (first 200 chars): \"{}\"",
-                &system_prompt[..system_prompt.len().min(200)]
+                system_prompt.chars().take(200).collect::<String>()
             );
         } else {
             info!("[ACP] No system_prompt to send to agent");
@@ -257,7 +257,7 @@ impl AgentStartConfig {
             );
             debug!(
                 "[ACP] system_prompt content (first 200 chars): \"{}\"",
-                &system_prompt[..system_prompt.len().min(200)]
+                system_prompt.chars().take(200).collect::<String>()
             );
         }
 
