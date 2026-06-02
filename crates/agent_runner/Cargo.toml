@@ -39,6 +39,8 @@ pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
 [dependencies]
 # Internal crates
 shared_types = { path = "../shared_types" }
+shared_types_grpc = { path = "../shared_types_grpc" }
+shared_types_i18n = { path = "../shared_types_i18n" }
 agent_config = { path = "../agent_config" }
 agent_abstraction = { path = "../agent_abstraction" }
 rcoder-proxy = { path = "../rcoder-proxy", optional = true }
@@ -93,6 +95,13 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 
+# Archive extraction (binary_installer) with path-traversal + zip-bomb protection
+hex = { workspace = true }
+sha2 = "0.11"
+flate2 = "1.0"
+tar = "0.4"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
 # OpenTelemetry
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
@@ -123,3 +132,8 @@ pyroscope_pprofrs = { workspace = true, optional = true }
 # Unix 信号处理（用于僵尸进程回收，仅 Unix 平台）
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
+
+[dev-dependencies]
+# 集成测试用:解析响应 body
+http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }

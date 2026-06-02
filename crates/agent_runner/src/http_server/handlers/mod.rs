@@ -4,6 +4,7 @@
 
 use axum::http::HeaderMap;
 
+pub mod agent_mgmt_handler;
 pub mod computer_cancel;
 pub mod computer_chat;
 pub mod computer_progress;

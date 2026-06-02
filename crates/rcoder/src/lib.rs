@@ -5,7 +5,7 @@
 pub mod cleanup_task;
 mod config;
 pub mod grpc;
-mod handler;
+pub mod handler;
 pub mod middleware;
 pub mod router;
 mod service;

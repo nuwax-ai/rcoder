@@ -280,6 +280,7 @@ where
                 self.registry.clone(),
                 model_env_resolver,
                 permission_handler,
+                self.diagnostics_listener.clone(),
             ),
         );
 

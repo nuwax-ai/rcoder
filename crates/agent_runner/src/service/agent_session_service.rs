@@ -18,7 +18,8 @@ use tracing::{debug, error, info, warn};
 use crate::model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo};
 use crate::proxy_agent::SESSION_REQUEST_CONTEXT;
 use crate::service::{
-    AGENT_REGISTRY, AgentSessionRegistry, PERMISSION_MANAGER, StateAwareNotifier,
+    AGENT_REGISTRY, AgentSessionRegistry, LoggingDiagnosticsListener, PERMISSION_MANAGER,
+    StateAwareNotifier,
 };
 use crate::utils::ContentBuilder;
 
@@ -70,6 +71,7 @@ impl AgentSessionService {
                 AGENT_REGISTRY.clone(),
                 model_env_resolver,
                 PERMISSION_MANAGER.clone(),
+                Some(Arc::new(LoggingDiagnosticsListener)),
             ),
         );
 

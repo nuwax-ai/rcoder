@@ -352,6 +352,7 @@ pub const AUDIO_WS_PORT: u16 = 6089; // 音频 WebSocket 流
 
 /// IME 输入法服务端口
 pub const IME_PORT: u16 = 6091;
+pub const TTYD_PORT: u16 = 7681;
 
 /// 基于 Pingora 的端口反向代理服务
 pub struct PingoraProxyService {
@@ -517,6 +518,11 @@ impl ProxyHttp for PortProxy {
                 self.handle_ime_request(upstream_request, &original_uri, matched.params, ctx)
                     .await?;
             }
+            RouteType::TtydProxy => {
+                // 🖥️ ttyd Web 终端代理：单端口双协议（HTTP + WebSocket）
+                self.handle_ttyd_request(upstream_request, &original_uri, matched.params, ctx)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -569,6 +575,10 @@ impl ProxyHttp for PortProxy {
             RouteType::ImeProxy => {
                 // ⌨️ IME 输入法代理：返回 IME 服务的 peer
                 self.handle_ime_upstream(ctx, matched.params).await
+            }
+            RouteType::TtydProxy => {
+                // 🖥️ ttyd 代理：返回 ttyd 服务的 peer（端口 7681）
+                self.handle_ttyd_upstream(ctx, matched.params).await
             }
         }
     }
@@ -791,6 +801,62 @@ impl PortProxy {
         upstream_request.insert_header("X-VNC-Proxy", "pingora")?;
         upstream_request.insert_header("X-VNC-User-Id", user_id)?;
         upstream_request.insert_header("X-VNC-Project-Id", project_id)?;
+
+        Ok(())
+    }
+
+    /// 处理 ttyd Web 终端代理请求
+    ///
+    /// 路径格式: /computer/ttyd/{user_id}/{project_id}[/...]
+    /// 例如: /computer/ttyd/user_123/proj_456/ws
+    ///
+    /// ttyd 单端口（7681）同时服务 HTTP 和 WebSocket，
+    /// pingora 默认透传所有 header（含 Connection: Upgrade），
+    /// ttyd 端 libwebsockets 根据 Upgrade 头自动分发到 PTY 协议。
+    async fn handle_ttyd_request(
+        &self,
+        upstream_request: &mut RequestHeader,
+        original_uri: &http::Uri,
+        params: Params<'_, '_>,
+        ctx: &TrackingCtx,
+    ) -> PingoraResult<()> {
+        // 从路径参数中提取 user_id 和 project_id
+        let user_id = params.get("user_id").ok_or_else(|| {
+            error!("ttyd route missing user_id param");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        let project_id = params.get("project_id").ok_or_else(|| {
+            error!("ttyd route missing project_id param");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        // 提取剩余路径（通配符部分）
+        let remaining_path = params.get("path").unwrap_or("");
+        let target_path = if remaining_path.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", remaining_path)
+        };
+
+        debug!(
+            "ttyd request: user_id={}, project_id={}, target_path={}",
+            user_id, project_id, target_path
+        );
+
+        // 设置 Host 头
+        let host = ctx.vnc_target_ip.as_deref().unwrap_or("127.0.0.1");
+        upstream_request.insert_header("Host", host)?;
+
+        // 重写 URI
+        let new_uri = Self::rewrite_uri(original_uri, target_path)?;
+        upstream_request.set_uri(new_uri);
+
+        // 设置代理标识头
+        Self::set_common_headers(upstream_request)?;
+        upstream_request.insert_header("X-Ttyd-Proxy", "pingora")?;
+        upstream_request.insert_header("X-Ttyd-User-Id", user_id)?;
+        upstream_request.insert_header("X-Ttyd-Project-Id", project_id)?;
 
         Ok(())
     }
@@ -1389,6 +1455,78 @@ impl PortProxy {
         // VNC WebSocket 长连接优化配置
         peer.options.connection_timeout = Some(Duration::from_secs(10));
         peer.options.read_timeout = None; // 无限等待（VNC 持续流）
+        peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
+        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+        peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1小时空闲超时
+
+        Ok(Box::new(peer))
+    }
+
+    /// 处理 ttyd 代理的上游选择
+    ///
+    /// 路径格式: /computer/ttyd/{user_id}/{project_id}[/...]
+    /// 例如: /computer/ttyd/user_123/proj_456/ws
+    ///
+    /// ttyd 单端口（7681）同时服务 HTTP 和 WebSocket，
+    /// pingora 默认透传所有 header（含 Connection: Upgrade），
+    /// ttyd 端 libwebsockets 根据 Upgrade 头自动分发。
+    /// 客户端必须传子协议 `tty`（透传到 ttyd，否则 ttyd 不会 fork bash）。
+    async fn handle_ttyd_upstream(
+        &self,
+        ctx: &mut TrackingCtx,
+        params: Params<'_, '_>,
+    ) -> PingoraResult<Box<HttpPeer>> {
+        // 从路径参数中提取 user_id
+        let user_id = params.get("user_id").ok_or_else(|| {
+            error!("ttyd route missing user_id param");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })?;
+
+        let project_id = params.get("project_id").unwrap_or("");
+
+        debug!(
+            "ttyd proxy request: user_id={}, project_id={}",
+            user_id, project_id
+        );
+
+        // 查找用户容器 IP（复用 vnc_backends DashMap）
+        let container_ip = match self.vnc_backends.get(user_id) {
+            Some(ip_ref) => ip_ref.value().clone(),
+            None => {
+                info!("routing {} to ttyd", user_id);
+                return Err(
+                    pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+                        .more_context(format!(
+                            "ttyd backend for user {} not found, please create container first",
+                            user_id
+                        )),
+                );
+            }
+        };
+
+        // 记录指标
+        self.metrics.record_request();
+        self.metrics.inc_active();
+
+        // 保存目标 IP 到上下文（用于响应过滤等）
+        ctx.vnc_target_ip = Some(container_ip.clone());
+
+        debug!(
+            "ttyd proxy: user_id={}, project_id={} -> {}:{}",
+            user_id, project_id, container_ip, TTYD_PORT
+        );
+
+        // 创建 HTTP Peer 到容器的 ttyd 端口
+        // Pingora 会自动处理 WebSocket upgrade
+        let mut peer = HttpPeer::new(
+            (container_ip.as_str(), TTYD_PORT),
+            false,          // 不使用 TLS
+            "".to_string(), // SNI
+        );
+
+        // ttyd WebSocket 长连接优化配置（与 vnc 一致）
+        peer.options.connection_timeout = Some(Duration::from_secs(10));
+        peer.options.read_timeout = None; // 无限等待（持续双向流）
         peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
         peer.options.total_connection_timeout = Some(Duration::from_secs(15));
         peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1小时空闲超时

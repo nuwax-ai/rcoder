@@ -32,6 +32,30 @@ service AgentService {
   rpc GetVncStatus(GetVncStatusRequest) returns (GetVncStatusResponse);
 }
 
+// === Agent Management Service (P0-1) ===
+//
+// 部署在 agent_runner 容器内,提供安装/卸载/检查 agent 二进制的能力。
+// 二进制上传通过 client streaming(InstallAgent) 走 1MB chunk。
+service AgentMgmtService {
+  // 列出已安装的 agent
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+
+  // 上传二进制(支持单文件/tar.gz/zip,client streaming)
+  rpc InstallAgent(stream InstallAgentRequest) returns (InstallAgentResponse);
+
+  // 卸载 agent
+  rpc UninstallAgent(UninstallAgentRequest) returns (UninstallAgentResponse);
+
+  // 检查指定 agent 状态
+  rpc CheckAgent(CheckAgentRequest) returns (CheckAgentResponse);
+
+  // 列出默认 agent(由镜像提供,内置注册)
+  rpc ListDefaultAgents(ListDefaultAgentsRequest) returns (ListDefaultAgentsResponse);
+
+  // 查询单个 agent 详情(快速)
+  rpc GetAgent(GetAgentRequest) returns (GetAgentResponse);
+}
+
 // === ChatRequest/Response ===
 
 message ChatRequest {
@@ -394,4 +418,135 @@ message GetVncStatusResponse {
   string message = 3;
   // 容器启动时间（秒）
   int64 uptime_seconds = 4;
+}
+
+// === Agent Management Messages (P0-1) ===
+
+message SystemInfo {
+  string os = 1;
+  string arch = 2;
+  string platform = 3;
+}
+
+enum InstallType {
+  INSTALL_TYPE_UNSPECIFIED = 0;
+  INSTALL_TYPE_BUILTIN = 1;
+  INSTALL_TYPE_BINARY = 2;
+  INSTALL_TYPE_NPM = 3;
+  INSTALL_TYPE_URL = 4;
+}
+
+enum AgentInstallStatus {
+  AGENT_INSTALL_STATUS_UNSPECIFIED = 0;
+  AGENT_INSTALL_STATUS_AVAILABLE = 1;
+  AGENT_INSTALL_STATUS_BROKEN = 2;
+  AGENT_INSTALL_STATUS_NOT_INSTALLED = 3;
+}
+
+message AgentInfo {
+  string agent_id = 1;
+  InstallType install_type = 2;
+  AgentInstallStatus status = 3;
+  optional string version = 4;
+  optional string binary_path = 5;
+  optional int64 installed_at = 6;
+}
+
+message StaticCheckResult {
+  bool file_exists = 1;
+  bool executable = 2;
+  bool in_path = 3;
+}
+
+message AgentDetailInfo {
+  string agent_id = 1;
+  InstallType install_type = 2;
+  bool installed = 3;
+  AgentInstallStatus status = 4;
+  optional string version = 5;
+  bool version_check_supported = 6;
+  StaticCheckResult static_checks = 7;
+}
+
+message ListAgentsRequest {
+  bool include_builtin = 1;
+}
+
+message ListAgentsResponse {
+  SystemInfo system_info = 1;
+  repeated AgentInfo agents = 2;
+  int32 total = 3;
+  string install_dir = 4;
+}
+
+message CheckAgentRequest {
+  string agent_id = 1;
+}
+
+message CheckAgentResponse {
+  SystemInfo system_info = 1;
+  AgentDetailInfo agent = 2;
+}
+
+message GetAgentRequest {
+  string agent_id = 1;
+}
+
+message GetAgentResponse {
+  bool found = 1;
+  AgentDetailInfo agent = 2; // 仅当 found=true 有效
+}
+
+message ListDefaultAgentsRequest {}
+
+message ListDefaultAgentsResponse {
+  repeated DefaultAgentInfo default_agents = 1;
+}
+
+message DefaultAgentInfo {
+  string agent_id = 1;
+  string display_name = 2;
+  string description = 3;
+  InstallType install_type = 4;
+}
+
+message UninstallAgentRequest {
+  string agent_id = 1;
+}
+
+message UninstallAgentResponse {
+  bool uninstalled = 1;
+  InstallType install_type = 2;
+  string agent_id = 3;
+}
+
+// 上传 binary 用的 streaming request
+// 首包携带 metadata,后续包只携带 data
+message InstallAgentRequest {
+  // 首包用
+  message Metadata {
+    optional string agent_id = 1;
+    optional string command = 2;
+    repeated string args = 3;
+    optional string sha256 = 4;
+    // 扩展字段(P0-1):用于 URL / NPM / ARCHIVE 安装
+    optional InstallType install_type = 5;        // 缺省 BINARY
+    optional string source_url = 6;               // URL 安装时必填
+    optional string npm_package = 7;             // NPM 安装时必填(@scope/name)
+  }
+  // 元数据(只首包携带)
+  Metadata metadata = 1;
+  // 后续 chunk 的数据(二进制/URL 下载/npm 元数据均可,URL/npm 模式下 data 通常为空)
+  bytes data = 2;
+}
+
+message InstallAgentResponse {
+  string agent_id = 1;
+  AgentInstallStatus status = 2;
+  string binary_path = 3;
+  string file_type = 4;
+  optional int32 file_count = 5;
+  int64 file_size = 6;
+  optional string version = 7;
+  optional string source_url = 8;
 }

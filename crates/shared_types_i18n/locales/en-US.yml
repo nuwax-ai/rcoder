@@ -120,3 +120,7 @@ error.agent_worker_unavailable: "Agent Worker is unavailable, restarting. Please
 error.send_task_failed: "Failed to send task"
 error.request_processing_failed: "Failed to process request"
 error.system_busy: "System is busy: concurrent Agent sessions reached limit ({}), please retry later"
+
+# Agent Management forwarding (P0-4)
+error.project_not_found: "Project not found or stopped"
+error.agent_runner_unavailable: "Agent Runner container is unavailable"

@@ -27,6 +27,8 @@ pub struct AppState {
     pub api_key_manager: Arc<ApiKeyManager>,
     pub shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
     pub project_uuid_map: Arc<DashMap<String, String>>,
+    /// P0-1: agent management state
+    pub agent_mgmt_http_state: Option<super::handlers::agent_mgmt_handler::AgentMgmtHttpState>,
 }
 
 impl AppState {
@@ -41,7 +43,20 @@ impl AppState {
             api_key_manager: Arc::new(ApiKeyManager::from_shared(shared_api_key_manager.clone())),
             shared_api_key_manager,
             project_uuid_map: Arc::new(DashMap::new()),
+            agent_mgmt_http_state: None,
         }
+    }
+
+    /// P0-1: 设置 agent management 状态(在 main.rs 中注册)
+    pub fn with_agent_mgmt(
+        mut self,
+        registry: std::sync::Arc<crate::agent_mgmt::AgentRegistry>,
+        path_manager: crate::agent_mgmt::PathManager,
+    ) -> Self {
+        self.agent_mgmt_http_state = Some(
+            super::handlers::agent_mgmt_handler::AgentMgmtHttpState::new(registry, path_manager),
+        );
+        self
     }
 
     /// 创建 LocalAgentHttpService 实例用于 RCoder 模式
@@ -119,11 +134,19 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_check))
         .with_state(state.clone());
 
+    // P0-1: Agent 管理路由(仅在 agent_mgmt_http_state 被设置时启用)
+    let agent_mgmt_routes = if let Some(am_state) = state.agent_mgmt_http_state.clone() {
+        create_agent_mgmt_router(am_state)
+    } else {
+        Router::new()
+    };
+
     // 组合路由
     Router::new()
         .merge(computer_routes)
         .merge(rcoder_routes)
         .merge(api_routes)
+        .merge(agent_mgmt_routes)
         .merge(create_swagger_ui())
         .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 🔥 50MB body 限制
 }
@@ -141,6 +164,26 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 )]
 pub async fn health_check() -> Json<shared_types::HealthResponse> {
     Json(shared_types::HealthResponse::new("agent-runner"))
+}
+
+/// P0-1: 构建 agent_mgmt 子路由(导出供集成测试使用)
+pub fn create_agent_mgmt_router(
+    state: super::handlers::agent_mgmt_handler::AgentMgmtHttpState,
+) -> Router {
+    use super::handlers::agent_mgmt_handler::{
+        check_agent, get_agent, install_agent, install_from_npm, install_from_url, list_agents,
+        list_default_agents, uninstall_agent,
+    };
+    Router::new()
+        .route("/agent-mgmt/agents/list", post(list_agents))
+        .route("/agent-mgmt/agents/get", post(get_agent))
+        .route("/agent-mgmt/agents/check", post(check_agent))
+        .route("/agent-mgmt/default-agents/list", post(list_default_agents))
+        .route("/agent-mgmt/agents/install", post(install_agent))
+        .route("/agent-mgmt/agents/install-from-url", post(install_from_url))
+        .route("/agent-mgmt/agents/install-from-npm", post(install_from_npm))
+        .route("/agent-mgmt/agents/uninstall", post(uninstall_agent))
+        .with_state(state)
 }
 
 /// 创建 Swagger UI

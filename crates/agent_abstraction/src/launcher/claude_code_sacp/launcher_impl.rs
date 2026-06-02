@@ -39,6 +39,7 @@ use super::types::{
     ENV_CODEX_API_KEY, ENV_OPENAI_API_KEY, ENV_OPENAI_BASE_URL, SacpLauncherConnectionInfo,
 };
 use crate::acp::CancelNotificationRequestWrapper;
+use crate::diagnostics::DiagnosticsListener;
 use crate::launcher::model_env;
 use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::session_registry::SessionRegistry;
@@ -52,15 +53,18 @@ pub struct SacpClaudeCodeLauncher<N: SessionNotifier> {
     notifier: Arc<N>,
     model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
     permission_handler: Arc<dyn PermissionRequestHandler>,
+    /// 进程诊断监听器（可选，注入自 AcpClientBuilder）
+    diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
 }
 
 impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
     /// 创建新的启动器
     pub fn new(notifier: Arc<N>) -> Self {
-        Self::with_model_env_resolver(
+        Self::with_diagnostics_listener(
             notifier,
             model_env::direct_model_runtime_env_resolver(),
             Arc::new(YoloPermissionRequestHandler),
+            None,
         )
     }
 
@@ -69,10 +73,26 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
         permission_handler: Arc<dyn PermissionRequestHandler>,
     ) -> Self {
+        Self::with_diagnostics_listener(
+            notifier,
+            model_env_resolver,
+            permission_handler,
+            None,
+        )
+    }
+
+    /// 注入诊断监听器
+    pub fn with_diagnostics_listener(
+        notifier: Arc<N>,
+        model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+        permission_handler: Arc<dyn PermissionRequestHandler>,
+        diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
+    ) -> Self {
         Self {
             notifier,
             model_env_resolver,
             permission_handler,
+            diagnostics_listener,
         }
     }
 
@@ -387,6 +407,11 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             child_pid
         );
 
+        // P0-2 接线: 进程启动成功,通知 listener
+        if let Some(ref listener) = self.diagnostics_listener {
+            listener.on_process_started(child_pid, &full_command_line);
+        }
+
         // 获取 stdio 句柄（process_wrap 使用方法访问 stdio）
         let stdin = take_stdio(child.stdin(), "stdin")?;
         let stdout = take_stdio(child.stdout(), "stdout")?;
@@ -471,6 +496,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 保存 JoinHandle 用于超时时取消子任务
         let spawn_project_id = project_id.clone();
         let spawn_command_line = full_command_line.clone();
+        let diagnostics_listener_for_task = self.diagnostics_listener.clone();
         let connection_task_handle = tokio::spawn(async move {
             info!(
                 "[SACP] 🚀 Spawned ACP connection task, project_id={}",
@@ -493,6 +519,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 connection_failed_tx: connection_failed_tx.take(),
                 child_pid,
                 command_line: command_line_clone,
+                diagnostics_listener: diagnostics_listener_for_task,
             };
             let result = run_sacp_connection(transport, params).await;
 
@@ -675,14 +702,23 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // stderr 任务已在子进程启动后立即创建（stderr_task_handle），无需重复创建
 
-        // 创建生命周期守卫（带异常退出标志）
-        let lifecycle_guard = AgentLifecycleGuard::new_claude_with_abnormal_flag(
-            project_id.clone(),
-            session_id.clone(),
-            child,
-            stderr_task_handle,
-            cancel_token.clone(),
-            abnormal_exit_flag,
+        // 创建生命周期守卫（带异常退出标志 + 诊断监听器）
+        let lifecycle_guard = AgentLifecycleGuard::new_claude_full(
+            crate::launcher::lifecycle::ClaudeProcessParams {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                child_process: child,
+                stderr_task: stderr_task_handle,
+                cancel_token: cancel_token.clone(),
+                shared_api_key_manager: None,
+                project_uuid_map: None,
+                service_uuid: None,
+                abnormal_exit_flag: Some(abnormal_exit_flag),
+                diagnostics_listener: self.diagnostics_listener.clone(),
+                process_command: command_path,
+                process_args: command_args,
+                working_dir: project_path,
+            },
         );
 
         Ok(SacpLauncherConnectionInfo {

@@ -503,6 +503,185 @@ pub struct GetVncStatusResponse {
     #[prost(int64, tag = "4")]
     pub uptime_seconds: i64,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SystemInfo {
+    #[prost(string, tag = "1")]
+    pub os: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub arch: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub platform: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AgentInfo {
+    #[prost(string, tag = "1")]
+    pub agent_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "InstallType", tag = "2")]
+    pub install_type: i32,
+    #[prost(enumeration = "AgentInstallStatus", tag = "3")]
+    pub status: i32,
+    #[prost(string, optional, tag = "4")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub binary_path: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "6")]
+    pub installed_at: ::core::option::Option<i64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StaticCheckResult {
+    #[prost(bool, tag = "1")]
+    pub file_exists: bool,
+    #[prost(bool, tag = "2")]
+    pub executable: bool,
+    #[prost(bool, tag = "3")]
+    pub in_path: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AgentDetailInfo {
+    #[prost(string, tag = "1")]
+    pub agent_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "InstallType", tag = "2")]
+    pub install_type: i32,
+    #[prost(bool, tag = "3")]
+    pub installed: bool,
+    #[prost(enumeration = "AgentInstallStatus", tag = "4")]
+    pub status: i32,
+    #[prost(string, optional, tag = "5")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "6")]
+    pub version_check_supported: bool,
+    #[prost(message, optional, tag = "7")]
+    pub static_checks: ::core::option::Option<StaticCheckResult>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListAgentsRequest {
+    #[prost(bool, tag = "1")]
+    pub include_builtin: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAgentsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub system_info: ::core::option::Option<SystemInfo>,
+    #[prost(message, repeated, tag = "2")]
+    pub agents: ::prost::alloc::vec::Vec<AgentInfo>,
+    #[prost(int32, tag = "3")]
+    pub total: i32,
+    #[prost(string, tag = "4")]
+    pub install_dir: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CheckAgentRequest {
+    #[prost(string, tag = "1")]
+    pub agent_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CheckAgentResponse {
+    #[prost(message, optional, tag = "1")]
+    pub system_info: ::core::option::Option<SystemInfo>,
+    #[prost(message, optional, tag = "2")]
+    pub agent: ::core::option::Option<AgentDetailInfo>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetAgentRequest {
+    #[prost(string, tag = "1")]
+    pub agent_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetAgentResponse {
+    #[prost(bool, tag = "1")]
+    pub found: bool,
+    /// 仅当 found=true 有效
+    #[prost(message, optional, tag = "2")]
+    pub agent: ::core::option::Option<AgentDetailInfo>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListDefaultAgentsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDefaultAgentsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub default_agents: ::prost::alloc::vec::Vec<DefaultAgentInfo>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DefaultAgentInfo {
+    #[prost(string, tag = "1")]
+    pub agent_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub display_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub description: ::prost::alloc::string::String,
+    #[prost(enumeration = "InstallType", tag = "4")]
+    pub install_type: i32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UninstallAgentRequest {
+    #[prost(string, tag = "1")]
+    pub agent_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UninstallAgentResponse {
+    #[prost(bool, tag = "1")]
+    pub uninstalled: bool,
+    #[prost(enumeration = "InstallType", tag = "2")]
+    pub install_type: i32,
+    #[prost(string, tag = "3")]
+    pub agent_id: ::prost::alloc::string::String,
+}
+/// 上传 binary 用的 streaming request
+/// 首包携带 metadata,后续包只携带 data
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InstallAgentRequest {
+    /// 元数据(只首包携带)
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<install_agent_request::Metadata>,
+    /// 后续 chunk 的数据(二进制/URL 下载/npm 元数据均可,URL/npm 模式下 data 通常为空)
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+/// Nested message and enum types in `InstallAgentRequest`.
+pub mod install_agent_request {
+    /// 首包用
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Metadata {
+        #[prost(string, optional, tag = "1")]
+        pub agent_id: ::core::option::Option<::prost::alloc::string::String>,
+        #[prost(string, optional, tag = "2")]
+        pub command: ::core::option::Option<::prost::alloc::string::String>,
+        #[prost(string, repeated, tag = "3")]
+        pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+        #[prost(string, optional, tag = "4")]
+        pub sha256: ::core::option::Option<::prost::alloc::string::String>,
+        /// 扩展字段(P0-1):用于 URL / NPM / ARCHIVE 安装
+        ///
+        /// 缺省 BINARY
+        #[prost(enumeration = "super::InstallType", optional, tag = "5")]
+        pub install_type: ::core::option::Option<i32>,
+        /// URL 安装时必填
+        #[prost(string, optional, tag = "6")]
+        pub source_url: ::core::option::Option<::prost::alloc::string::String>,
+        /// NPM 安装时必填(@scope/name)
+        #[prost(string, optional, tag = "7")]
+        pub npm_package: ::core::option::Option<::prost::alloc::string::String>,
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InstallAgentResponse {
+    #[prost(string, tag = "1")]
+    pub agent_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "AgentInstallStatus", tag = "2")]
+    pub status: i32,
+    #[prost(string, tag = "3")]
+    pub binary_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub file_type: ::prost::alloc::string::String,
+    #[prost(int32, optional, tag = "5")]
+    pub file_count: ::core::option::Option<i32>,
+    #[prost(int64, tag = "6")]
+    pub file_size: i64,
+    #[prost(string, optional, tag = "7")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "8")]
+    pub source_url: ::core::option::Option<::prost::alloc::string::String>,
+}
 /// 取消结果类型（对应 Rust CancelResult）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -567,6 +746,73 @@ impl ModelEnvBindingSource {
             "MODEL_ENV_BINDING_SOURCE_BASE_URL" => Some(Self::BaseUrl),
             "MODEL_ENV_BINDING_SOURCE_DEFAULT_MODEL" => Some(Self::DefaultModel),
             "MODEL_ENV_BINDING_SOURCE_PROVIDER_NAME" => Some(Self::ProviderName),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum InstallType {
+    Unspecified = 0,
+    Builtin = 1,
+    Binary = 2,
+    Npm = 3,
+    Url = 4,
+}
+impl InstallType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "INSTALL_TYPE_UNSPECIFIED",
+            Self::Builtin => "INSTALL_TYPE_BUILTIN",
+            Self::Binary => "INSTALL_TYPE_BINARY",
+            Self::Npm => "INSTALL_TYPE_NPM",
+            Self::Url => "INSTALL_TYPE_URL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "INSTALL_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "INSTALL_TYPE_BUILTIN" => Some(Self::Builtin),
+            "INSTALL_TYPE_BINARY" => Some(Self::Binary),
+            "INSTALL_TYPE_NPM" => Some(Self::Npm),
+            "INSTALL_TYPE_URL" => Some(Self::Url),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AgentInstallStatus {
+    Unspecified = 0,
+    Available = 1,
+    Broken = 2,
+    NotInstalled = 3,
+}
+impl AgentInstallStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AGENT_INSTALL_STATUS_UNSPECIFIED",
+            Self::Available => "AGENT_INSTALL_STATUS_AVAILABLE",
+            Self::Broken => "AGENT_INSTALL_STATUS_BROKEN",
+            Self::NotInstalled => "AGENT_INSTALL_STATUS_NOT_INSTALLED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AGENT_INSTALL_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "AGENT_INSTALL_STATUS_AVAILABLE" => Some(Self::Available),
+            "AGENT_INSTALL_STATUS_BROKEN" => Some(Self::Broken),
+            "AGENT_INSTALL_STATUS_NOT_INSTALLED" => Some(Self::NotInstalled),
             _ => None,
         }
     }
@@ -1418,6 +1664,715 @@ pub mod agent_service_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "agent.AgentService";
     impl<T> tonic::server::NamedService for AgentServiceServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// Generated client implementations.
+pub mod agent_mgmt_service_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// === Agent Management Service (P0-1) ===
+    ///
+    /// 部署在 agent_runner 容器内,提供安装/卸载/检查 agent 二进制的能力。
+    /// 二进制上传通过 client streaming(InstallAgent) 走 1MB chunk。
+    #[derive(Debug, Clone)]
+    pub struct AgentMgmtServiceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl AgentMgmtServiceClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> AgentMgmtServiceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> AgentMgmtServiceClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            AgentMgmtServiceClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// 列出已安装的 agent
+        pub async fn list_agents(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListAgentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListAgentsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentMgmtService/ListAgents",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentMgmtService", "ListAgents"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// 上传二进制(支持单文件/tar.gz/zip,client streaming)
+        pub async fn install_agent(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::InstallAgentRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::InstallAgentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentMgmtService/InstallAgent",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentMgmtService", "InstallAgent"));
+            self.inner.client_streaming(req, path, codec).await
+        }
+        /// 卸载 agent
+        pub async fn uninstall_agent(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UninstallAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UninstallAgentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentMgmtService/UninstallAgent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentMgmtService", "UninstallAgent"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// 检查指定 agent 状态
+        pub async fn check_agent(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CheckAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CheckAgentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentMgmtService/CheckAgent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentMgmtService", "CheckAgent"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// 列出默认 agent(由镜像提供,内置注册)
+        pub async fn list_default_agents(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListDefaultAgentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListDefaultAgentsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentMgmtService/ListDefaultAgents",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentMgmtService", "ListDefaultAgents"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// 查询单个 agent 详情(快速)
+        pub async fn get_agent(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetAgentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/agent.AgentMgmtService/GetAgent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("agent.AgentMgmtService", "GetAgent"));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod agent_mgmt_service_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with AgentMgmtServiceServer.
+    #[async_trait]
+    pub trait AgentMgmtService: std::marker::Send + std::marker::Sync + 'static {
+        /// 列出已安装的 agent
+        async fn list_agents(
+            &self,
+            request: tonic::Request<super::ListAgentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListAgentsResponse>,
+            tonic::Status,
+        >;
+        /// 上传二进制(支持单文件/tar.gz/zip,client streaming)
+        async fn install_agent(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::InstallAgentRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<super::InstallAgentResponse>,
+            tonic::Status,
+        >;
+        /// 卸载 agent
+        async fn uninstall_agent(
+            &self,
+            request: tonic::Request<super::UninstallAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UninstallAgentResponse>,
+            tonic::Status,
+        >;
+        /// 检查指定 agent 状态
+        async fn check_agent(
+            &self,
+            request: tonic::Request<super::CheckAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CheckAgentResponse>,
+            tonic::Status,
+        >;
+        /// 列出默认 agent(由镜像提供,内置注册)
+        async fn list_default_agents(
+            &self,
+            request: tonic::Request<super::ListDefaultAgentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListDefaultAgentsResponse>,
+            tonic::Status,
+        >;
+        /// 查询单个 agent 详情(快速)
+        async fn get_agent(
+            &self,
+            request: tonic::Request<super::GetAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetAgentResponse>,
+            tonic::Status,
+        >;
+    }
+    /// === Agent Management Service (P0-1) ===
+    ///
+    /// 部署在 agent_runner 容器内,提供安装/卸载/检查 agent 二进制的能力。
+    /// 二进制上传通过 client streaming(InstallAgent) 走 1MB chunk。
+    #[derive(Debug)]
+    pub struct AgentMgmtServiceServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> AgentMgmtServiceServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for AgentMgmtServiceServer<T>
+    where
+        T: AgentMgmtService,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/agent.AgentMgmtService/ListAgents" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListAgentsSvc<T: AgentMgmtService>(pub Arc<T>);
+                    impl<
+                        T: AgentMgmtService,
+                    > tonic::server::UnaryService<super::ListAgentsRequest>
+                    for ListAgentsSvc<T> {
+                        type Response = super::ListAgentsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListAgentsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentMgmtService>::list_agents(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListAgentsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentMgmtService/InstallAgent" => {
+                    #[allow(non_camel_case_types)]
+                    struct InstallAgentSvc<T: AgentMgmtService>(pub Arc<T>);
+                    impl<
+                        T: AgentMgmtService,
+                    > tonic::server::ClientStreamingService<super::InstallAgentRequest>
+                    for InstallAgentSvc<T> {
+                        type Response = super::InstallAgentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::InstallAgentRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentMgmtService>::install_agent(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InstallAgentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.client_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentMgmtService/UninstallAgent" => {
+                    #[allow(non_camel_case_types)]
+                    struct UninstallAgentSvc<T: AgentMgmtService>(pub Arc<T>);
+                    impl<
+                        T: AgentMgmtService,
+                    > tonic::server::UnaryService<super::UninstallAgentRequest>
+                    for UninstallAgentSvc<T> {
+                        type Response = super::UninstallAgentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UninstallAgentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentMgmtService>::uninstall_agent(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UninstallAgentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentMgmtService/CheckAgent" => {
+                    #[allow(non_camel_case_types)]
+                    struct CheckAgentSvc<T: AgentMgmtService>(pub Arc<T>);
+                    impl<
+                        T: AgentMgmtService,
+                    > tonic::server::UnaryService<super::CheckAgentRequest>
+                    for CheckAgentSvc<T> {
+                        type Response = super::CheckAgentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CheckAgentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentMgmtService>::check_agent(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CheckAgentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentMgmtService/ListDefaultAgents" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListDefaultAgentsSvc<T: AgentMgmtService>(pub Arc<T>);
+                    impl<
+                        T: AgentMgmtService,
+                    > tonic::server::UnaryService<super::ListDefaultAgentsRequest>
+                    for ListDefaultAgentsSvc<T> {
+                        type Response = super::ListDefaultAgentsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListDefaultAgentsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentMgmtService>::list_default_agents(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListDefaultAgentsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/agent.AgentMgmtService/GetAgent" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetAgentSvc<T: AgentMgmtService>(pub Arc<T>);
+                    impl<
+                        T: AgentMgmtService,
+                    > tonic::server::UnaryService<super::GetAgentRequest>
+                    for GetAgentSvc<T> {
+                        type Response = super::GetAgentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetAgentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentMgmtService>::get_agent(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetAgentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for AgentMgmtServiceServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "agent.AgentMgmtService";
+    impl<T> tonic::server::NamedService for AgentMgmtServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

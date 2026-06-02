@@ -1,5 +1,6 @@
 //! HTTP 路由和处理器模块
 mod agent_cancel_handler;
+pub mod agent_mgmt_handler;
 mod agent_session_notification;
 mod agent_status_handler;
 mod agent_stop_handler;
@@ -21,6 +22,7 @@ pub mod utils;
 mod debug_handler;
 
 pub use agent_cancel_handler::*;
+pub use agent_mgmt_handler::*;
 pub use agent_session_notification::*;
 pub use agent_status_handler::*;
 pub use agent_stop_handler::*;

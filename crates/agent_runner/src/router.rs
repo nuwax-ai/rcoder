@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::agent_mgmt::{AgentRegistry, PathManager};
 use crate::service::AgentSessionService;
 use crate::{config::AppConfig, handler};
 use axum::{Router, response::IntoResponse, routing::get};
@@ -48,6 +49,11 @@ pub struct AppState {
 
     /// 🔒 project_id -> service_uuid 映射（用于清理时查找对应的配置）
     pub project_uuid_map: Arc<DashMap<String, String>>,
+
+    /// Agent 管理注册表(P0-1)
+    pub agent_mgmt_registry: Arc<AgentRegistry>,
+    /// Agent 安装目录管理(P0-1)
+    pub agent_mgmt_path_manager: PathManager,
 }
 
 /// 创建 Axum 路由

@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use super::types::VERSION;
 use crate::acp::CancelNotificationRequestWrapper;
+use crate::diagnostics::DiagnosticsListener;
 use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::{AgentStartConfig, PermissionRequestContext, PermissionRequestHandler};
 use shared_types::error_codes;
@@ -47,6 +48,8 @@ pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
     pub(crate) child_pid: u32,
     /// 子进程命令行（用于错误诊断）
     pub(crate) command_line: String,
+    /// 进程诊断监听器（可选，注入自 AcpClientBuilder）
+    pub(crate) diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
 }
 
 /// 运行 SACP 连接
@@ -76,6 +79,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         mut connection_failed_tx,
         child_pid,
         command_line,
+        diagnostics_listener,
     } = params;
 
     // 克隆变量供 handlers 使用
@@ -438,6 +442,11 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 // 同步设置共享 session_id，供连接失败时的错误通知使用
                 if let Ok(mut guard) = session_id_shared.lock() {
                     *guard = Some(session_id.to_string());
+                }
+
+                // P0-2 接线: ACP 握手成功,通知 listener
+                if let Some(ref listener) = diagnostics_listener {
+                    listener.on_acp_initialized(&session_id.to_string());
                 }
 
                 // 4. 处理 Prompt 和 Cancel 请求

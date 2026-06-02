@@ -48,7 +48,7 @@ tempfile = { workspace = true }
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
-tower-http = { workspace = true, features = ["cors", "trace", "set-header"] }
+tower-http = { workspace = true, features = ["cors", "trace", "set-header", "limit"] }
 hyper = { version = "1.8", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 futures = { workspace = true }

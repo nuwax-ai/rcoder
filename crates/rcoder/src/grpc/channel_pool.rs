@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
+use shared_types::grpc::agent_mgmt_service_client::AgentMgmtServiceClient;
 use shared_types::grpc::agent_service_client::AgentServiceClient;
 use std::time::{Duration, Instant};
 use tonic::transport::Channel;
@@ -24,6 +25,13 @@ const MAX_CAPACITY: usize = 10000;
 /// 无法在 Channel 或 Endpoint 级别统一配置，所以需要这个辅助函数。
 fn create_configured_client(channel: Channel) -> AgentServiceClient<Channel> {
     AgentServiceClient::new(channel)
+        .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+}
+
+/// P0-4: 创建配置好的 AgentMgmtServiceClient(共享 Channel,但独立的消息大小限制)
+fn create_mgmt_client(channel: Channel) -> AgentMgmtServiceClient<Channel> {
+    AgentMgmtServiceClient::new(channel)
         .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
 }
@@ -69,66 +77,7 @@ impl GrpcChannelPool {
     /// 如果连接不存在则创建新连接。过期连接会被自动清理。
     /// 🚀 优化：使用 entry API 原子化检查和插入，消除 TOCTOU 竞态窗口
     pub async fn get_client(&self, addr: &str) -> Result<AgentServiceClient<Channel>> {
-        // 第一次检查：快速路径，如果缓存命中且未过期则直接返回
-        // ⚠️ 注意：get_mut() 返回 DashMap RefMut（持有 shard 写锁），
-        // 不可跨 .await 持有，否则会造成死锁。
-        if let Some(mut entry) = self.channels.get_mut(addr)
-            && !entry.is_expired()
-        {
-            debug!("📡 [gRPC] reuse connection: {}", addr);
-            entry.touch();
-            return Ok(create_configured_client(entry.channel.clone()));
-        }
-
-        // 缓存未命中或已过期，创建新连接
-        info!("🔌 [gRPC] creating connection: {}", addr);
-        let endpoint = format!("http://{}", addr);
-        let channel = Channel::from_shared(endpoint)
-            .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
-            .connect_timeout(Duration::from_secs(shared_types::GRPC_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(shared_types::GRPC_REQUEST_TIMEOUT_SECS))
-            // HTTP/2 Keepalive 配置
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            // TCP Keepalive 配置
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .tcp_nodelay(true)
-            .connect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
-
-        // 清理过期连接（在插入前清理，避免刚插入就被清理）
-        self.cleanup_expired();
-
-        // 第二次检查：双重检查锁定，避免并发创建重复连接
-        // 使用 entry API 原子化检查和插入
-        match self.channels.entry(addr.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                // 另一个线程已经创建了连接，复用现有的
-                let existing = entry.get_mut();
-                if !existing.is_expired() {
-                    debug!("📡 [gRPC] concurrent creation detected, reusing: {}", addr);
-                    existing.touch();
-                    return Ok(create_configured_client(existing.channel.clone()));
-                }
-                // 如果已过期（不太可能），替换为新连接
-                debug!("📡 [gRPC] replacing expired connection: {}", addr);
-                entry.insert(ChannelEntry {
-                    channel: channel.clone(),
-                    last_used: Instant::now(),
-                });
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                // 插入新连接
-                entry.insert(ChannelEntry {
-                    channel: channel.clone(),
-                    last_used: Instant::now(),
-                });
-            }
-        }
-
-        debug!("📡 [gRPC] connection ready: {}", addr);
+        let channel = self.get_or_create_channel(addr).await?;
         Ok(create_configured_client(channel))
     }
 
@@ -188,6 +137,74 @@ impl GrpcChannelPool {
     ) -> Result<AgentServiceClient<Channel>> {
         let addr = format!("{}:{}", container_ip, grpc_port);
         self.get_client(&addr).await
+    }
+
+    /// P0-4: 获取指定地址的 AgentMgmtServiceClient(用于 agent_mgmt 转发层)
+    ///
+    /// 复用 cache 中的 Channel(cheap clone),但 wrap 成 AgentMgmtServiceClient。
+    /// 调用方负责传 project 维度的容器地址。
+    pub async fn get_mgmt_client(
+        &self,
+        addr: &str,
+    ) -> Result<AgentMgmtServiceClient<Channel>> {
+        let channel = self.get_or_create_channel(addr).await?;
+        Ok(create_mgmt_client(channel))
+    }
+
+    /// 获取或创建 Channel(公共逻辑,消除 get_client / get_mgmt_client 重复)
+    ///
+    /// 流程:缓存命中 → 创建新连接 → entry API 双重检查 → 写入缓存
+    async fn get_or_create_channel(&self, addr: &str) -> Result<Channel> {
+        // 快速路径:缓存命中且未过期
+        if let Some(mut entry) = self.channels.get_mut(addr)
+            && !entry.is_expired()
+        {
+            debug!("📡 [gRPC] reuse connection: {}", addr);
+            entry.touch();
+            return Ok(entry.channel.clone());
+        }
+
+        // 缓存未命中或已过期,创建新连接
+        info!("🔌 [gRPC] creating connection: {}", addr);
+        let endpoint = format!("http://{}", addr);
+        let channel = Channel::from_shared(endpoint)
+            .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
+            .connect_timeout(Duration::from_secs(shared_types::GRPC_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(shared_types::GRPC_REQUEST_TIMEOUT_SECS))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            .connect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
+
+        self.cleanup_expired();
+
+        // entry API 双重检查:避免并发创建重复连接
+        match self.channels.entry(addr.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if !existing.is_expired() {
+                    debug!("📡 [gRPC] concurrent creation detected, reusing: {}", addr);
+                    existing.touch();
+                    return Ok(existing.channel.clone());
+                }
+                entry.insert(ChannelEntry {
+                    channel: channel.clone(),
+                    last_used: Instant::now(),
+                });
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(ChannelEntry {
+                    channel: channel.clone(),
+                    last_used: Instant::now(),
+                });
+            }
+        }
+
+        Ok(channel)
     }
 
     /// 移除指定地址的连接

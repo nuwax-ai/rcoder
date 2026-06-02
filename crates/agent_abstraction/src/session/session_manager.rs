@@ -59,6 +59,7 @@ use shared_types::{
 use tracing::{debug, error, info};
 
 use crate::PromptMessage;
+use crate::diagnostics::DiagnosticsListener;
 use crate::launcher::{ClaudeCodeLauncher, ModelRuntimeEnvResolver};
 use crate::traits::{
     AgentStartConfig, PermissionRequestHandler, SessionNotifier, SessionRegistry,
@@ -84,6 +85,8 @@ pub struct AcpSessionManager<N: SessionNotifier, R: SessionRegistry> {
     model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
     /// ACP permission request handler.
     permission_handler: Arc<dyn PermissionRequestHandler>,
+    /// 进程诊断监听器（可选，注入自 AcpClientBuilder）
+    diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
 }
 
 impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpSessionManager<N, R>
@@ -113,6 +116,7 @@ where
             registry,
             model_env_resolver,
             Arc::new(YoloPermissionRequestHandler),
+            None,
         )
     }
 
@@ -121,12 +125,14 @@ where
         registry: Arc<R>,
         model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
         permission_handler: Arc<dyn PermissionRequestHandler>,
+        diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
     ) -> Self {
         Self {
             registry,
             notifier,
             model_env_resolver,
             permission_handler,
+            diagnostics_listener,
         }
     }
 
@@ -342,10 +348,11 @@ where
         info!("Creating Agent session, project ID: {}", project_id);
 
         // 创建 SACP 启动器
-        let launcher = ClaudeCodeLauncher::with_model_env_resolver(
+        let launcher = ClaudeCodeLauncher::with_diagnostics_listener(
             self.notifier.clone(),
             self.model_env_resolver.clone(),
             self.permission_handler.clone(),
+            self.diagnostics_listener.clone(),
         );
 
         // 记录是否使用了 resume（仅用于日志）

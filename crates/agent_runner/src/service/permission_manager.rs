@@ -408,16 +408,8 @@ impl PermissionRequestHandler for PermissionManager {
 
         if is_dangerous_command(command.as_deref()) {
             info!(
-                "[Permission] auto reject dangerous command: session_id={}, tool_call_id={}, command={:?}",
+                "[Permission] dangerous command detected, will push to user for approval: session_id={}, tool_call_id={}, command={:?}",
                 session_id, tool_call_id, command
-            );
-            return respond_with_preferred_option(
-                &request,
-                responder,
-                &[
-                    PermissionOptionKind::RejectAlways,
-                    PermissionOptionKind::RejectOnce,
-                ],
             );
         }
 
@@ -816,9 +808,9 @@ fn extract_terminal_command_prefix(command: &str) -> Option<CommandPrefix> {
 fn terminal_pattern_from_tokens(tokens: &[String]) -> Option<String> {
     match tokens {
         [] => None,
-        [single] => Some(format!("^{}\\b", escape_for_pattern(single))),
+        [single] => Some(format!("^{}\\b\\z", escape_for_pattern(single))),
         [rest @ .., last] => Some(format!(
-            "^{}\\s+{}(\\s|$)",
+            "^{}\\s+{}(\\s|$)\\z",
             rest.iter()
                 .map(|token| escape_for_pattern(token))
                 .collect::<Vec<_>>()
@@ -937,14 +929,44 @@ mod tests {
     fn command_pattern_matches_simple_generated_rules() {
         let rule_allow_build = PermissionRule {
             decision: RuleDecision::Allow,
-            pattern: "^cargo\\s+build(\\s|$)".to_string(),
-            compiled: regex::Regex::new("^cargo\\s+build(\\s|$)").ok(),
+            pattern: "^cargo\\s+build(\\s|$)\\z".to_string(),
+            compiled: regex::Regex::new("^cargo\\s+build(\\s|$)\\z").ok(),
         };
-        assert!(command_matches_pattern(
+        assert!(command_matches_pattern("cargo build", &rule_allow_build));
+        assert!(!command_matches_pattern(
             "cargo build --release",
             &rule_allow_build
         ));
         assert!(!command_matches_pattern("cargo test", &rule_allow_build));
+    }
+
+    #[test]
+    fn terminal_pattern_blocks_overmatch_via_chained_command() {
+        // 修复前 pattern `^cargo\s+build(\s|$)` 会让 `cargo build && rm -rf /` 命中
+        // 修复后 pattern 末尾 \z 锚定,确保只匹配完整命令本身
+        let pattern_cargo_build =
+            terminal_pattern_from_tokens(&["cargo".to_string(), "build".to_string()])
+                .expect("pattern should be generated for two tokens");
+
+        let re = regex::Regex::new(&pattern_cargo_build).expect("pattern should compile");
+        // 完整命令应匹配
+        assert!(re.is_match("cargo build"));
+        // 带 flag 的命令(新行为下不匹配,需要保存更具体的规则)
+        assert!(!re.is_match("cargo build --release"));
+        // 链式危险命令不应通过此 allow 规则
+        assert!(!re.is_match("cargo build && rm -rf /"));
+        assert!(!re.is_match("cargo build; rm -rf $HOME"));
+    }
+
+    #[test]
+    fn terminal_pattern_single_token_is_end_anchored() {
+        // 单 token pattern 也需要 \z 锚定,防止 `ls && rm -rf /` 之类误匹配
+        let pattern = terminal_pattern_from_tokens(&["ls".to_string()])
+            .expect("pattern should be generated for single token");
+        let re = regex::Regex::new(&pattern).expect("pattern should compile");
+        assert!(re.is_match("ls"));
+        assert!(!re.is_match("ls -la"));
+        assert!(!re.is_match("ls && rm -rf /"));
     }
 
     // === rule_decision + save_rule_from_option_kind tests ===

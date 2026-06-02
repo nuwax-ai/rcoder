@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
+mod agent_mgmt;
 mod api_key_manager;
 mod auto_reload;
 mod config;
@@ -170,6 +171,39 @@ async fn main() -> anyhow::Result<()> {
     let agent_session_service = Arc::new(AgentSessionService::new(model_env_resolver));
     info!("🔧 [MAIN] AgentSessionService created");
 
+    // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
+    // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 router::AppState 同编译单元),
+    //     lib 和 binary 是两个独立 crate,类型不能混用。
+    let agent_mgmt_path_manager = crate::agent_mgmt::PathManager::new();
+    let agent_mgmt_registry = match crate::agent_mgmt::AgentRegistry::load(
+        agent_mgmt_path_manager.clone(),
+    ) {
+        Ok(r) => {
+            info!(
+                "📋 [MAIN] Agent management registry loaded: total={}, builtin={}",
+                r.total(),
+                r.builtin_count()
+            );
+            std::sync::Arc::new(r)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "⚠️  [MAIN] Failed to load agent management registry, starting empty: {e}"
+            );
+            std::sync::Arc::new(crate::agent_mgmt::AgentRegistry::empty(
+                agent_mgmt_path_manager.clone(),
+            ))
+        }
+    };
+
+    // 异步注册内置 agent(失败不阻塞启动)
+    let _default_agent_handle =
+        crate::agent_mgmt::installer::default_agents::spawn_registration(
+            agent_mgmt_registry.clone(),
+            agent_mgmt_path_manager.clone(),
+        );
+    info!("🆕 [MAIN] Default agent registration spawned");
+
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
     {
@@ -194,6 +228,8 @@ async fn main() -> anyhow::Result<()> {
                 api_key_manager: api_key_manager.clone(),
                 shared_api_key_manager: shared_api_key_manager.clone(),
                 project_uuid_map: project_uuid_map.clone(),
+                agent_mgmt_registry: agent_mgmt_registry.clone(),
+                agent_mgmt_path_manager: agent_mgmt_path_manager.clone(),
             });
 
             // gRPC 消息大小限制
@@ -203,6 +239,13 @@ async fn main() -> anyhow::Result<()> {
             .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
             .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
+            // P0-1: Agent 管理 gRPC 服务
+            let agent_mgmt_service =
+                crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+                    agent_mgmt_registry.clone(),
+                    agent_mgmt_path_manager.clone(),
+                );
+
             let handle = tokio::spawn(async move {
                 info!("gRPC service started, listening on port: {}", grpc_port);
                 info!("gRPC endpoints (port {}):", grpc_port);
@@ -210,8 +253,16 @@ async fn main() -> anyhow::Result<()> {
                 info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
                 info!("  agent.AgentService/CancelSession - gRPC cancel");
                 info!("  agent.AgentService/GetStatus - gRPC status");
+                info!("  agent.AgentMgmtService/* - agent management (P0-1)");
                 if let Err(e) = tonic::transport::Server::builder()
                     .add_service(grpc_service)
+                    .add_service(
+                        shared_types::grpc::agent_mgmt_service_server::AgentMgmtServiceServer::new(
+                            agent_mgmt_service,
+                        )
+                        .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+                        .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE),
+                    )
                     .serve(grpc_addr)
                     .await
                 {
@@ -234,6 +285,8 @@ async fn main() -> anyhow::Result<()> {
             app_config: config.clone(),
             agent_session_service: agent_session_service.clone(),
             shared_api_key_manager: shared_api_key_manager.clone(),
+            agent_mgmt_registry: Some(agent_mgmt_registry.clone()),
+            agent_mgmt_path_manager: Some(agent_mgmt_path_manager.clone()),
         };
 
         // 🔥 3. 启动 HTTP 服务器（内部会启动 Pingora）
@@ -306,6 +359,8 @@ async fn main() -> anyhow::Result<()> {
             api_key_manager: api_key_manager.clone(),
             shared_api_key_manager: shared_api_key_manager.clone(),
             project_uuid_map: project_uuid_map.clone(),
+            agent_mgmt_registry: agent_mgmt_registry.clone(),
+            agent_mgmt_path_manager: agent_mgmt_path_manager.clone(),
         });
 
         // gRPC 消息大小限制
@@ -315,6 +370,12 @@ async fn main() -> anyhow::Result<()> {
         .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
+        // P0-1: Agent 管理 gRPC 服务
+        let agent_mgmt_service = crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+            agent_mgmt_registry.clone(),
+            agent_mgmt_path_manager.clone(),
+        );
+
         let grpc_handle = tokio::spawn(async move {
             info!("gRPC service started, listening on port: {}", grpc_port);
             info!("gRPC endpoints (port {}):", grpc_port);
@@ -322,8 +383,16 @@ async fn main() -> anyhow::Result<()> {
             info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
             info!("  agent.AgentService/CancelSession - gRPC cancel");
             info!("  agent.AgentService/GetStatus - gRPC status");
+            info!("  agent.AgentMgmtService/* - agent management (P0-1)");
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(grpc_service)
+                .add_service(
+                    shared_types::grpc::agent_mgmt_service_server::AgentMgmtServiceServer::new(
+                        agent_mgmt_service,
+                    )
+                    .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE),
+                )
                 .serve(grpc_addr)
                 .await
             {

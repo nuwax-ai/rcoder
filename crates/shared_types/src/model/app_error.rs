@@ -108,14 +108,31 @@ impl axum::response::IntoResponse for AppError {
 }
 
 fn status_from_code(code: &str) -> axum::http::StatusCode {
+    use crate::error_codes as ec;
     match code {
-        crate::error_codes::ERR_VALIDATION | crate::error_codes::ERR_INVALID_PARAMS => {
-            axum::http::StatusCode::BAD_REQUEST
-        }
-        crate::error_codes::ERR_API_KEY_AUTH_FAILED => axum::http::StatusCode::UNAUTHORIZED,
-        crate::error_codes::ERR_TOO_MANY_REQUESTS => axum::http::StatusCode::TOO_MANY_REQUESTS,
-        crate::error_codes::ERR_SESSION_NOT_FOUND | crate::error_codes::ERR_CONTAINER_NOT_FOUND => {
-            axum::http::StatusCode::NOT_FOUND
+        ec::ERR_VALIDATION | ec::ERR_INVALID_PARAMS => axum::http::StatusCode::BAD_REQUEST,
+        ec::ERR_API_KEY_AUTH_FAILED => axum::http::StatusCode::UNAUTHORIZED,
+        ec::ERR_TOO_MANY_REQUESTS => axum::http::StatusCode::TOO_MANY_REQUESTS,
+        ec::ERR_SESSION_NOT_FOUND
+        | ec::ERR_CONTAINER_NOT_FOUND
+        | ec::ERR_PROJECT_NOT_FOUND
+        | ec::ERR_AGENT_MGMT_NOT_FOUND
+        | ec::ERR_AGENT_MGMT_UNKNOWN_AGENT => axum::http::StatusCode::NOT_FOUND,
+        ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED => axum::http::StatusCode::FORBIDDEN,
+        ec::ERR_AGENT_MGMT_ALREADY_INSTALLED => axum::http::StatusCode::CONFLICT,
+        ec::ERR_AGENT_MGMT_INVALID_MANIFEST
+        | ec::ERR_AGENT_MGMT_INVALID_CHUNK
+        | ec::ERR_AGENT_MGMT_CHECKSUM_MISMATCH
+        | ec::ERR_AGENT_MGMT_PATH_TRAVERSAL
+        | ec::ERR_AGENT_MGMT_BINARY_TOO_LARGE
+        | ec::ERR_AGENT_MGMT_ARCHIVE_BOMB
+        | ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE => axum::http::StatusCode::BAD_REQUEST,
+        ec::ERR_AGENT_MGMT_COMMAND_TIMEOUT => axum::http::StatusCode::GATEWAY_TIMEOUT,
+        ec::ERR_AGENT_MGMT_PERMISSION_DENIED => axum::http::StatusCode::FORBIDDEN,
+        ec::ERR_AGENT_MGMT_DISK_FULL => axum::http::StatusCode::INSUFFICIENT_STORAGE,
+        ec::ERR_AGENT_MGMT_STREAM_TRUNCATED => axum::http::StatusCode::BAD_REQUEST,
+        ec::ERR_SERVICE_UNAVAILABLE | ec::ERR_AGENT_RUNNER_UNAVAILABLE => {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
         }
         _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
     }

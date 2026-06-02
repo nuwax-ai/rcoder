@@ -29,6 +29,10 @@ pub struct HttpServerConfig {
     pub agent_session_service: Arc<AgentSessionService>,
     /// 共享 API Key Manager
     pub shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
+    /// P0-1: Agent 管理注册表(可选,启用 /agent-mgmt/* 路由)
+    pub agent_mgmt_registry: Option<Arc<crate::agent_mgmt::AgentRegistry>>,
+    /// P0-1: Agent 安装目录管理(可选,启用 /agent-mgmt/* 路由)
+    pub agent_mgmt_path_manager: Option<crate::agent_mgmt::PathManager>,
 }
 
 /// HTTP 服务器控制柄
@@ -136,6 +140,8 @@ impl HttpServerHandle {
 ///         },
 ///         agent_session_service,
 ///         shared_api_key_manager: Arc::new(dashmap::DashMap::new()),
+///         agent_mgmt_registry: None,    // P0-1: 不启用 /agent-mgmt/* 路由
+///         agent_mgmt_path_manager: None,
 ///     };
 ///
 ///     // 启动 HTTP Server
@@ -173,11 +179,24 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     info!("Pingora proxy service is disabled (proxy feature not enabled)");
 
     // 2. 创建 HTTP 应用状态
-    let state = Arc::new(AppState::new(
+    let mut state = AppState::new(
         config.app_config.clone(),
         config.agent_session_service,
         config.shared_api_key_manager,
-    ));
+    );
+
+    // 2.5 P0-1: 启用 agent_mgmt 路由(若提供)
+    if let (Some(registry), Some(pm)) = (
+        config.agent_mgmt_registry.clone(),
+        config.agent_mgmt_path_manager.clone(),
+    ) {
+        state = state.with_agent_mgmt(registry, pm);
+        info!("P0-1: agent-mgmt HTTP routes enabled");
+    } else {
+        info!("P0-1: agent-mgmt HTTP routes disabled (no registry/path_manager)");
+    }
+
+    let state = Arc::new(state);
 
     // 3. 创建路由
     let app = create_router(state.clone());

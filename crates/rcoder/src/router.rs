@@ -342,12 +342,65 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/health", get(handler::health_check))
         .with_state(state.clone());
 
+    // P0-5: Agent Management 路由(全部 POST + body 解析)
+    // - 简单 JSON 端点使用 I18nJsonOrQuery(同时支持 JSON body 和 ?project_id=xxx query)
+    // - install 端点使用 multipart/form-data(file + metadata JSON 字段)
+    //
+    // ⚠️ install 路由的 body 限制必须在 Router 层挂,而不是 MethodRouter 层。
+    // axum 的 `Multipart` 提取器通过 `with_limited_body()` 读取
+    // `DefaultBodyLimitKind` 扩展(Request 上挂的 layer 才生效),`MethodRouter::layer`
+    // 出来的 MethodRouter 不携带这个扩展,无法被 multipart 识别。
+    // 此外 `RequestBodyLimitLayer` 是 tower 中间件,只读取 Content-Length 头,
+    // 对 streaming 的 multipart body 不直接生效,但保留作为 defense-in-depth。
+    let install_route = Router::new()
+        .route(
+            "/agent-mgmt/agents/install",
+            post(handler::install_agent),
+        )
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            1024 * 1024 * 1024,
+        ));
+
+    let agent_mgmt_routes = Router::new()
+        .route(
+            "/agent-mgmt/agents/list",
+            post(handler::list_agents),
+        )
+        .route(
+            "/agent-mgmt/agents/get",
+            post(handler::get_agent),
+        )
+        .route(
+            "/agent-mgmt/agents/check",
+            post(handler::check_agent),
+        )
+        .route(
+            "/agent-mgmt/default-agents/list",
+            post(handler::list_default_agents),
+        )
+        .merge(install_route)
+        .route(
+            "/agent-mgmt/agents/install-from-url",
+            post(handler::install_from_url),
+        )
+        .route(
+            "/agent-mgmt/agents/install-from-npm",
+            post(handler::install_from_npm),
+        )
+        .route(
+            "/agent-mgmt/agents/uninstall",
+            post(handler::uninstall_agent),
+        )
+        .with_state(state.clone());
+
     let mut router = Router::new()
         .merge(health_routes)
         .merge(api_routes)
         .merge(computer_routes)
         .merge(devcomputer_routes)
-        .merge(proxy_api_routes);
+        .merge(proxy_api_routes)
+        .merge(agent_mgmt_routes);
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]
@@ -463,6 +516,15 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::proxy_to_port,
         handler::proxy_to_port_with_path,
         handler::proxy_with_query_params,
+        // P0-4: Agent Management 转发层
+        handler::list_agents,
+        handler::get_agent,
+        handler::check_agent,
+        handler::list_default_agents,
+        handler::install_agent,
+        handler::install_from_url,
+        handler::install_from_npm,
+        handler::uninstall_agent,
     ),
     components(
         schemas(
@@ -540,6 +602,35 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::BackendInfo,
             handler::PortStats,
             handler::HealthCheckConfig,
+            // P0-4: Agent Management 类型
+            shared_types::AgentInfo,
+            shared_types::AgentDetailInfo,
+            shared_types::AgentInstallStatus,
+            shared_types::InstallType,
+            shared_types::ListAgentsRequest,
+            shared_types::ListAgentsResponse,
+            shared_types::CheckAgentRequest,
+            shared_types::CheckAgentResponse,
+            shared_types::InstallFromUrlRequest,
+            shared_types::InstallFromPackageManagerRequest,
+            shared_types::InstallAgentResponse,
+            shared_types::UninstallAgentRequest,
+            shared_types::UninstallAgentResponse,
+            shared_types::ListDefaultAgentsResponse,
+            shared_types::DefaultAgentInfo,
+            shared_types::StaticCheckResult,
+            shared_types::SystemInfo,
+            // P0-5: HTTP body 类型(独立于 gRPC proto,加 project_id 字段)
+            handler::ContainerRoutingParams,
+            handler::ListAgentsBody,
+            handler::GetAgentBody,
+            handler::CheckAgentBody,
+            handler::ListDefaultAgentsBody,
+            handler::UninstallAgentBody,
+            handler::InstallFromUrlHttpRequest,
+            handler::InstallFromPackageManagerHttpRequest,
+            handler::InstallMetadataBody,
+            handler::InstallMultipartBody,
         )
     ),
     tags(
@@ -549,6 +640,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         (name = "computer", description = "Computer Agent 桌面与聊天接口"),
         (name = "pod", description = "Pod 容器管理接口，支持容器监控、启动和保活"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
+        (name = "agent-mgmt", description = "Agent 二进制安装/卸载/检查接口(P0-4: rcoder 转发到 agent_runner 容器)"),
     ),
     info(
         description = r#"

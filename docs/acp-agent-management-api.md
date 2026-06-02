@@ -1,5 +1,8 @@
 # ACP Agent Management API 设计文档
 
+> **P0-4 架构更新(2026-06)**:rcoder 是唯一对外暴露 HTTP 的服务,agent-runner 容器不再直接对外提供 HTTP 端点(虽然本地直起模式仍保留其 HTTP 服务)。
+> 本文档 §6、§B.1、§B.2 已按转发模型更新——`/agent-mgmt/*` 路径在 **rcoder** 上,通过 gRPC 转发到对应项目的 agent_runner 容器内的 `AgentMgmtService`。
+
 ## 1. 背景与目标
 
 ### 1.1 现状分析
@@ -147,8 +150,111 @@ PATH 管理（后端自动处理）:
 
 ## 3. API 接口设计
 
-所有接口挂载在 `/agent-management/` 前缀下，作为独立的 API 路由组。
-**所有接口统一使用 POST 方法**，请求参数通过 JSON Body 传递。
+> **P0-5 设计更新(2026-06)**:本节下面 §3.1 ~ §3.6 是**历史详细设计**(旧 API 草稿),部分字段名/路径与最新实现不同。
+> **请以 §3.0 客户端调用示例和 §6 API 端点汇总为准**。
+> 历史细节(请求/响应类型完整定义、错误码详细说明等)仍有参考价值,这里保留以便对照。
+
+所有接口挂载在 `/agent-mgmt/` 前缀下，作为独立的 API 路由组。
+**所有接口统一使用 POST 方法**，请求参数通过 **JSON Body**(`install` 端点用 `multipart/form-data`)传递。
+- 简单 JSON 端点:`{project_id, ...}` 形式,`project_id` 必填(也兼容 `?project_id=xxx` query,JSON 优先)
+- `install` 端点:`multipart/form-data`,字段 `file` (binary) + `metadata` (JSON 字符串,含 `project_id`)
+
+### 3.0 客户端调用示例(新增)
+
+#### 列出已安装 agents(POST + JSON body)
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/agents/list \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1", "include_builtin": false}'
+```
+
+响应:
+```json
+{
+  "success": true,
+  "code": "0000",
+  "message": "Success",
+  "data": {
+    "system_info": { "os": "linux", "arch": "amd64", "platform": "linux/amd64" },
+    "agents": [...],
+    "total": 3,
+    "install_dir": "/root/.rcoder/agents"
+  }
+}
+```
+
+#### 查询单个 agent(POST + JSON body)
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/agents/get \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1", "agent_id": "codex-acp"}'
+```
+
+#### 健康检查(POST + JSON body)
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/agents/check \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1", "agent_id": "codex-acp"}'
+```
+
+#### 列出默认 agents(POST + JSON body)
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/default-agents/list \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1"}'
+```
+
+#### 卸载(POST + JSON body)
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1", "agent_id": "codex-acp"}'
+```
+
+#### 从 URL 安装(POST + JSON body)
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "p1",
+    "agent_id": "codex-acp",
+    "command": "codex-acp",
+    "args": ["--serve"],
+    "url": "https://github.com/xxx/codex-acp/releases/latest/download/codex-acp-linux-amd64.tar.gz",
+    "sha256": "abc123..."
+  }'
+```
+
+#### 从 NPM 安装(POST + JSON body)
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-npm \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "p1",
+    "agent_id": "kimi-cli",
+    "command": "kimi",
+    "package": "@scope/kimi-cli"
+  }'
+```
+
+#### 上传二进制(POST + multipart/form-data)
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/agents/install \
+  -F 'metadata={"project_id":"p1","agent_id":"codex-acp","command":"codex-acp","args":["--serve"],"install_type":"BINARY","sha256":"abc123"};type=application/json' \
+  -F 'file=@./codex-acp-linux-amd64;type=application/octet-stream'
+```
+
+> `install` 端点的 `metadata` 字段是 JSON 字符串,所有元数据(包含 `project_id`)都集中在这里,
+> 与其他 5 个 JSON body 端点保持一致的"参数化"风格。
+> `install_type` 取值: `BINARY`(默认) / `URL` / `NPM` / `ARCHIVE`。
 
 ### 统一响应格式
 
@@ -1248,40 +1354,61 @@ curl -X POST http://localhost:8087/agent-management/agents/uninstall \
 
 ## 6. API 端点汇总
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/agent-management/agents/list` | 列出所有已安装 Agent |
-| POST | `/agent-management/agents/check` | 检查指定 Agent 状态 |
-| POST | `/agent-management/agents/install/binary` | 上传二进制 Agent |
-| POST | `/agent-management/agents/install/package` | 包管理器安装 Agent |
-| POST | `/agent-management/agents/install/url` | 通过 URL 下载安装 Agent |
-| POST | `/agent-management/agents/uninstall` | 卸载 Agent |
-| POST | `/computer/chat` | 聊天（通过 `agent_server` 使用已安装 Agent） |
+> **P0-5 设计更新(2026-06)**:全部 8 个端点改用 **POST + body JSON** 接收请求,完全替换旧的 GET/DELETE 路由。
+> - 简单 JSON 端点使用 `I18nJsonOrQuery` 提取器(优先 body JSON,兼容 `?project_id=xxx` query 调试)
+> - `install` 端点改用 `multipart/form-data`(字段 `file` + 字段 `metadata` JSON 字符串)
+> - 路径从 `/{id}` 改为 `/list` / `/get` / `/check` / `/uninstall` 等动词路径,语义更清晰
+
+| 方法 | 路径 | Body | 转发到 |
+|------|------|------|--------|
+| POST | `/agent-mgmt/agents/list`             | `ListAgentsBody` JSON:`{project_id, include_builtin?}` | `AgentMgmtService.ListAgents` |
+| POST | `/agent-mgmt/agents/get`              | `GetAgentBody` JSON:`{project_id, agent_id}` | `AgentMgmtService.GetAgent` |
+| POST | `/agent-mgmt/agents/check`            | `CheckAgentBody` JSON:`{project_id, agent_id}` | `AgentMgmtService.CheckAgent` |
+| POST | `/agent-mgmt/default-agents/list`     | `ListDefaultAgentsBody` JSON:`{project_id}` | `AgentMgmtService.ListDefaultAgents` |
+| POST | `/agent-mgmt/agents/install`          | `multipart/form-data`:`file`(binary) + `metadata`(JSON 字符串) | `AgentMgmtService.InstallAgent` (client streaming) |
+| POST | `/agent-mgmt/agents/install-from-url` | `InstallFromUrlHttpRequest` JSON:`{project_id, agent_id, command, args, url, sha256?}` | `AgentMgmtService.InstallAgent` (metadata only) |
+| POST | `/agent-mgmt/agents/install-from-npm` | `InstallFromPackageManagerHttpRequest` JSON:`{project_id, agent_id, command, package}` | `AgentMgmtService.InstallAgent` (metadata only) |
+| POST | `/agent-mgmt/agents/uninstall`        | `UninstallAgentBody` JSON:`{project_id, agent_id}` | `AgentMgmtService.UninstallAgent` |
+| POST | `/computer/chat`                      | `ComputerChatRequest` JSON | `AgentService.Chat` |
 
 ---
 
 ## 7. 错误码汇总
 
+> **实现说明**:agent-runner 端在 gRPC `Status.message` 中以 `"{code}: {msg}"` 前缀传递业务错误码,
+> rcoder 转发层(`status_to_app_error`)解析前缀还原为 `AppError`,前端拿到的错误码与直连 agent-runner HTTP 一致。
+> rcoder 自身还会产生两个新增错误码(`ERR_PROJECT_NOT_FOUND` / `ERR_AGENT_RUNNER_UNAVAILABLE`),
+> 用于"项目不存在"和"agent-runner 不可用"两种转发层失败模式。
+
+### 7.1 agent-runner 业务错误码(18 个)
+
 | 错误码 | 说明 | 涉及的接口 |
 |--------|------|-----------|
-| ERR_AGENT_NOT_FOUND | 指定 agent_id 未安装 | uninstall, check |
-| ERR_BUILTIN_AGENT | builtin 类型不允许卸载 | uninstall |
-| ERR_UNINSTALL_FAILED | 文件删除失败 | uninstall |
-| ERR_PACKAGE_UNINSTALL_FAILED | npm uninstall 失败 | uninstall |
-| ERR_FILE_TOO_LARGE | 上传文件超过 500MB 限制 | install/binary, install/url |
-| ERR_PERMISSION_DENIED | 文件系统权限问题 | install/binary, install/url |
-| ERR_PATH_NOT_FOUND | PATH 配置异常，which 验证失败 | install/binary, install/package, install/url |
-| ERR_CONTAINER_NOT_FOUND | 目标容器不存在 | 所有接口 |
-| ERR_PACKAGE_MANAGER_NOT_FOUND | 容器内未安装 npm/bun/pnpm | install/package |
-| ERR_PACKAGE_INSTALL_FAILED | npm install 失败 | install/package |
-| ERR_COMMAND_NOT_FOUND | 安装后命令不可用 | install/package, install/url |
-| ERR_INSTALL_TIMEOUT | 安装超时（超过 5 分钟） | install/package |
-| ERR_ARCHIVE_EXTRACT_FAILED | 压缩包解压失败（文件损坏或非标准格式） | install/binary, install/url |
-| ERR_ENTRY_NOT_FOUND | 压缩包中找不到 `command` 指定的入口可执行文件 | install/binary, install/url |
-| ERR_INVALID_URL | URL 格式无效（非 http/https 协议） | install/url |
-| ERR_DOWNLOAD_FAILED | 下载失败（HTTP 4xx/5xx 或网络错误） | install/url |
-| ERR_DOWNLOAD_TIMEOUT | 下载超时（超过 10 分钟） | install/url |
-| ERR_CHECKSUM_MISMATCH | 下载文件与指定 checksum 不一致 | install/url |
+| `ERR_AGENT_MGMT_NOT_FOUND` | 指定 agent_id 未安装 | uninstall, check, get |
+| `ERR_AGENT_MGMT_ALREADY_INSTALLED` | 重复安装 | install |
+| `ERR_AGENT_MGMT_INVALID_MANIFEST` | 安装元数据字段缺失或冲突 | install |
+| `ERR_AGENT_MGMT_CHECKSUM_MISMATCH` | 下载/上传文件 SHA256 不匹配 | install-from-url |
+| `ERR_AGENT_MGMT_ARCHIVE_BOMB` | 解压后体积超阈值(防 zip bomb) | install, install-from-url |
+| `ERR_AGENT_MGMT_PATH_TRAVERSAL` | 压缩包含 `..` 等逃逸路径 | install, install-from-url |
+| `ERR_AGENT_MGMT_COMMAND_TIMEOUT` | 安装命令执行超时 | install |
+| `ERR_AGENT_MGMT_INSTALL_FAILED` | 安装命令返回非零 | install, install-from-npm, install-from-url |
+| `ERR_AGENT_MGMT_UNINSTALL_FAILED` | 文件删除失败 | uninstall |
+| `ERR_AGENT_MGMT_CHECK_FAILED` | `which` 验证或版本检查失败 | check |
+| `ERR_AGENT_MGMT_BINARY_TOO_LARGE` | 二进制超过 500MB 限制 | install |
+| `ERR_AGENT_MGMT_UNSUPPORTED_TYPE` | 不支持的 install_type | install |
+| `ERR_AGENT_MGMT_BUILTIN_PROTECTED` | builtin 类型不允许卸载 | uninstall |
+| `ERR_AGENT_MGMT_STREAM_TRUNCATED` | client streaming 断流 | install |
+| `ERR_AGENT_MGMT_DISK_FULL` | 容器磁盘空间不足 | install |
+| `ERR_AGENT_MGMT_PERMISSION_DENIED` | 文件系统权限问题 | install, uninstall |
+| `ERR_AGENT_MGMT_UNKNOWN_AGENT` | manifest 中 agent_id 未知 | check |
+| `ERR_AGENT_MGMT_INVALID_CHUNK` | streaming chunk 格式错误 | install |
+
+### 7.2 rcoder 转发层错误码(2 个,新增)
+
+| 错误码 | 说明 | 涉及的接口 |
+|--------|------|-----------|
+| `ERR_PROJECT_NOT_FOUND` | URL 中 `project_id` 未注册 / 容器未创建 | 所有接口 |
+| `ERR_AGENT_RUNNER_UNAVAILABLE` | gRPC 连接失败 / 容器离线 / Status 无业务码前缀 | 所有接口 |
 
 ---
 
@@ -1614,51 +1741,86 @@ impl Default for AgentRegistry {
 
 ## 附录 B: 路由注册
 
-### B.1 rcoder 主服务路由
+> **P0-5 设计更新(2026-06)**:全部 8 个端点改用 **POST + body JSON** 或 **multipart/form-data(install)**,
+> 路径从 `/{id}` 改为动词路径(`/list` / `/get` / `/check` / `/uninstall`)。
+> 旧 GET/DELETE 路由(2026-06 之前)已完全下线。
+> rcoder 端不做任何 agent 安装/卸载逻辑,只做参数提取 + gRPC 转发。
+> agent_runner 端(本地直起模式)与本节描述保持一致(也用 POST + body)。
+
+### B.1 rcoder 主服务路由(对外)
 
 文件路径: `crates/rcoder/src/router.rs`
 
 ```rust
+use crate::handler::agent_mgmt_handler as handler;
+
 let agent_mgmt_routes = Router::new()
-    // 列出已安装 Agent
-    .route("/agent-management/agents/list", post(handler::list_installed_agents))
-    // 检查指定 Agent 状态
-    .route("/agent-management/agents/check", post(handler::check_agent_status))
-    // 上传二进制 Agent（限制 500MB）
+    // 查询类(POST + JSON body,使用 I18nJsonOrQuery 提取器)
+    .route("/agent-mgmt/agents/list",             post(handler::list_agents))
+    .route("/agent-mgmt/agents/get",              post(handler::get_agent))
+    .route("/agent-mgmt/agents/check",            post(handler::check_agent))
+    .route("/agent-mgmt/default-agents/list",     post(handler::list_default_agents))
+    // 安装(三种模式,都走 POST)
     .route(
-        "/agent-management/agents/install/binary",
-        post(handler::install_agent_binary)
+        "/agent-mgmt/agents/install",
+        post(handler::install_agent)
             .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
     )
-    // 通过包管理器安装 Agent
-    .route(
-        "/agent-management/agents/install/package",
-        post(handler::install_agent_package),
-    )
-    // 通过 URL 安装 Agent
-    .route(
-        "/agent-management/agents/install/url",
-        post(handler::install_agent_from_url),
-    )
-    // 卸载 Agent
-    .route(
-        "/agent-management/agents/uninstall",
-        post(handler::uninstall_agent),
-    );
+    .route("/agent-mgmt/agents/install-from-url",  post(handler::install_from_url))
+    .route("/agent-mgmt/agents/install-from-npm",  post(handler::install_from_npm))
+    // 卸载(POST + body)
+    .route("/agent-mgmt/agents/uninstall",        post(handler::uninstall_agent));
 ```
 
-### B.2 agent_runner 容器内路由
+> `project_id` 优先从 body JSON 读取,也兼容 `?project_id=xxx` query(I18nJsonOrQuery 自动合并,JSON 优先)。
+
+### B.2 agent_runner 容器内路由(本地直起模式)
 
 文件路径: `crates/agent_runner/src/http_server/router.rs`
 
+> 本地直起模式(无 rcoder,直接 `cargo run -p agent_runner`)下保留 HTTP 端点,便于本地开发调试。
+> 生产部署通过 K8s/Docker 时,这些路径不会被外部访问——rcoder 通过 gRPC 转发。
+> **本节路径与 B.1 完全一致**(都是 POST + body),只是内部直连 installer,不经 gRPC。
+
 ```rust
 let agent_mgmt_routes = Router::new()
-    .route("/agent-management/agents/list", post(handler::list_installed_agents_local))
-    .route("/agent-management/agents/check", post(handler::check_agent_status_local))
-    .route("/agent-management/agents/install/binary", post(handler::install_agent_binary_local))
-    .route("/agent-management/agents/install/package", post(handler::install_agent_package_local))
-    .route("/agent-management/agents/install/url", post(handler::install_agent_from_url_local))
-    .route("/agent-management/agents/uninstall", post(handler::uninstall_agent_local));
+    .route("/agent-mgmt/agents/list",             post(handler::list_agents))
+    .route("/agent-mgmt/agents/get",              post(handler::get_agent))
+    .route("/agent-mgmt/agents/check",            post(handler::check_agent))
+    .route("/agent-mgmt/default-agents/list",     post(handler::list_default_agents))
+    .route("/agent-mgmt/agents/install",          post(handler::install_agent))
+    .route("/agent-mgmt/agents/install-from-url",  post(handler::install_from_url))
+    .route("/agent-mgmt/agents/install-from-npm",  post(handler::install_from_npm))
+    .route("/agent-mgmt/agents/uninstall",        post(handler::uninstall_agent));
+```
+
+### B.3 转发层数据流(新增)
+
+```
+外部 HTTP 客户端
+  │  GET /agent-mgmt/agents?project_id=P
+  ▼
+rcoder HTTP handler (handler/agent_mgmt_handler.rs)
+  │  1. resolve_project(state, project_id) → Arc<ProjectAndContainerInfo>
+  │  2. build_ctx(state) → AgentMgmtForwardCtx
+  │  3. fwd_list_agents(&ctx, &project, include_builtin)
+  ▼
+agent_mgmt_forward::list_agents
+  │  4. resolve_client(ctx, project)
+  │     ├─ get_realtime_container_ip(runtime, container_name, fallback_ip)
+  │     │   → 实时查询容器 IP,失败回退 fallback_ip
+  │     ├─ format!("{ip}:{GRPC_DEFAULT_PORT}")
+  │     └─ pool.get_mgmt_client(addr) → AgentMgmtServiceClient<Channel>
+  │  5. client.list_agents(req)
+  ▼
+gRPC over Docker internal network
+  ▼
+agent_runner 容器内 AgentMgmtService
+  │  list_agents → installer.list_agents() → ListAgentsResponse
+  ▼
+proto → shared_types::ListAgentsResponse (via conversion.rs)
+  ▼
+HttpResult<ListAgentsResponse> JSON
 ```
 
 ---

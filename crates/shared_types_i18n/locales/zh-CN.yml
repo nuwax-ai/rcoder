@@ -120,3 +120,7 @@ error.agent_worker_unavailable: "Agent Worker 不可用，正在重启，请稍�
 error.send_task_failed: "发送任务失败"
 error.request_processing_failed: "处理请求失败"
 error.system_busy: "系统繁忙：并发 Agent 会话数已达上限 ({} 个)，请稍后重试"
+
+# Agent Management 转发层 (P0-4)
+error.project_not_found: "项目不存在或已停止"
+error.agent_runner_unavailable: "Agent Runner 容器不可用"

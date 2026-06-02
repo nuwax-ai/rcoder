@@ -95,6 +95,68 @@ pub const ERR_PERMISSION_RESOLVE_FAILED: &str = "ERR_PERMISSION_RESOLVE_FAILED";
 /// Permission request expired before user approval
 pub const ERR_PERMISSION_EXPIRED: &str = "ERR_PERMISSION_EXPIRED";
 
+// ========== Agent Management API 错误码 (P0-1) ==========
+
+/// Agent 未找到
+pub const ERR_AGENT_MGMT_NOT_FOUND: &str = "ERR_AGENT_MGMT_NOT_FOUND";
+
+/// Agent 已安装（无法重复安装）
+pub const ERR_AGENT_MGMT_ALREADY_INSTALLED: &str = "ERR_AGENT_MGMT_ALREADY_INSTALLED";
+
+/// Agent manifest 格式无效
+pub const ERR_AGENT_MGMT_INVALID_MANIFEST: &str = "ERR_AGENT_MGMT_INVALID_MANIFEST";
+
+/// 下载文件 checksum 与指定值不一致
+pub const ERR_AGENT_MGMT_CHECKSUM_MISMATCH: &str = "ERR_AGENT_MGMT_CHECKSUM_MISMATCH";
+
+/// 压缩包解压后大小超限(zip bomb 防护)
+pub const ERR_AGENT_MGMT_ARCHIVE_BOMB: &str = "ERR_AGENT_MGMT_ARCHIVE_BOMB";
+
+/// 压缩包包含路径遍历条目(安全防护)
+pub const ERR_AGENT_MGMT_PATH_TRAVERSAL: &str = "ERR_AGENT_MGMT_PATH_TRAVERSAL";
+
+/// 执行命令超时
+pub const ERR_AGENT_MGMT_COMMAND_TIMEOUT: &str = "ERR_AGENT_MGMT_COMMAND_TIMEOUT";
+
+/// 安装过程失败
+pub const ERR_AGENT_MGMT_INSTALL_FAILED: &str = "ERR_AGENT_MGMT_INSTALL_FAILED";
+
+/// 卸载过程失败
+pub const ERR_AGENT_MGMT_UNINSTALL_FAILED: &str = "ERR_AGENT_MGMT_UNINSTALL_FAILED";
+
+/// 健康检查失败
+pub const ERR_AGENT_MGMT_CHECK_FAILED: &str = "ERR_AGENT_MGMT_CHECK_FAILED";
+
+/// 二进制文件超过大小上限
+pub const ERR_AGENT_MGMT_BINARY_TOO_LARGE: &str = "ERR_AGENT_MGMT_BINARY_TOO_LARGE";
+
+/// 不支持的安装类型
+pub const ERR_AGENT_MGMT_UNSUPPORTED_TYPE: &str = "ERR_AGENT_MGMT_UNSUPPORTED_TYPE";
+
+/// 内置 agent 受保护,不可卸载
+pub const ERR_AGENT_MGMT_BUILTIN_PROTECTED: &str = "ERR_AGENT_MGMT_BUILTIN_PROTECTED";
+
+/// 流式上传在传输中途断开
+pub const ERR_AGENT_MGMT_STREAM_TRUNCATED: &str = "ERR_AGENT_MGMT_STREAM_TRUNCATED";
+
+/// 磁盘空间不足
+pub const ERR_AGENT_MGMT_DISK_FULL: &str = "ERR_AGENT_MGMT_DISK_FULL";
+
+/// 权限不足(无法写入安装目录)
+pub const ERR_AGENT_MGMT_PERMISSION_DENIED: &str = "ERR_AGENT_MGMT_PERMISSION_DENIED";
+
+/// 未知 agent_id
+pub const ERR_AGENT_MGMT_UNKNOWN_AGENT: &str = "ERR_AGENT_MGMT_UNKNOWN_AGENT";
+
+/// 上传 chunk 格式无效
+pub const ERR_AGENT_MGMT_INVALID_CHUNK: &str = "ERR_AGENT_MGMT_INVALID_CHUNK";
+
+/// 项目不存在(P0-4: rcoder 转发层用于找不到 project_id 时)
+pub const ERR_PROJECT_NOT_FOUND: &str = "ERR_PROJECT_NOT_FOUND";
+
+/// Agent Runner 容器不可用(P0-4: gRPC 调用失败 / 容器离线)
+pub const ERR_AGENT_RUNNER_UNAVAILABLE: &str = "ERR_AGENT_RUNNER_UNAVAILABLE";
+
 /// 获取错误码对应的翻译 key
 fn get_error_i18n_key(code: &str) -> &'static str {
     match code {
@@ -125,6 +187,26 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_PERMISSION_NOT_FOUND => "error.permission_not_found",
         ERR_PERMISSION_RESOLVE_FAILED => "error.permission_resolve_failed",
         ERR_PERMISSION_EXPIRED => "error.permission_expired",
+        ERR_AGENT_MGMT_NOT_FOUND => "error.agent_mgmt_not_found",
+        ERR_AGENT_MGMT_ALREADY_INSTALLED => "error.agent_mgmt_already_installed",
+        ERR_AGENT_MGMT_INVALID_MANIFEST => "error.agent_mgmt_invalid_manifest",
+        ERR_AGENT_MGMT_CHECKSUM_MISMATCH => "error.agent_mgmt_checksum_mismatch",
+        ERR_AGENT_MGMT_ARCHIVE_BOMB => "error.agent_mgmt_archive_bomb",
+        ERR_AGENT_MGMT_PATH_TRAVERSAL => "error.agent_mgmt_path_traversal",
+        ERR_AGENT_MGMT_COMMAND_TIMEOUT => "error.agent_mgmt_command_timeout",
+        ERR_AGENT_MGMT_INSTALL_FAILED => "error.agent_mgmt_install_failed",
+        ERR_AGENT_MGMT_UNINSTALL_FAILED => "error.agent_mgmt_uninstall_failed",
+        ERR_AGENT_MGMT_CHECK_FAILED => "error.agent_mgmt_check_failed",
+        ERR_AGENT_MGMT_BINARY_TOO_LARGE => "error.agent_mgmt_binary_too_large",
+        ERR_AGENT_MGMT_UNSUPPORTED_TYPE => "error.agent_mgmt_unsupported_type",
+        ERR_AGENT_MGMT_BUILTIN_PROTECTED => "error.agent_mgmt_builtin_protected",
+        ERR_AGENT_MGMT_STREAM_TRUNCATED => "error.agent_mgmt_stream_truncated",
+        ERR_AGENT_MGMT_DISK_FULL => "error.agent_mgmt_disk_full",
+        ERR_AGENT_MGMT_PERMISSION_DENIED => "error.agent_mgmt_permission_denied",
+        ERR_AGENT_MGMT_UNKNOWN_AGENT => "error.agent_mgmt_unknown_agent",
+        ERR_AGENT_MGMT_INVALID_CHUNK => "error.agent_mgmt_invalid_chunk",
+        ERR_PROJECT_NOT_FOUND => "error.project_not_found",
+        ERR_AGENT_RUNNER_UNAVAILABLE => "error.agent_runner_unavailable",
         ERR_UNKNOWN => "error.unknown",
         _ => "error.undefined",
     }
@@ -198,6 +280,26 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_PERMISSION_NOT_FOUND => "Permission request not found or already resolved",
         ERR_PERMISSION_RESOLVE_FAILED => "Permission resolve operation failed",
         ERR_PERMISSION_EXPIRED => "Permission request expired",
+        ERR_AGENT_MGMT_NOT_FOUND => "Agent not found",
+        ERR_AGENT_MGMT_ALREADY_INSTALLED => "Agent already installed",
+        ERR_AGENT_MGMT_INVALID_MANIFEST => "Invalid agent manifest",
+        ERR_AGENT_MGMT_CHECKSUM_MISMATCH => "Checksum mismatch",
+        ERR_AGENT_MGMT_ARCHIVE_BOMB => "Archive too large (possible zip bomb)",
+        ERR_AGENT_MGMT_PATH_TRAVERSAL => "Archive contains path traversal entries",
+        ERR_AGENT_MGMT_COMMAND_TIMEOUT => "Command execution timeout",
+        ERR_AGENT_MGMT_INSTALL_FAILED => "Agent installation failed",
+        ERR_AGENT_MGMT_UNINSTALL_FAILED => "Agent uninstallation failed",
+        ERR_AGENT_MGMT_CHECK_FAILED => "Agent health check failed",
+        ERR_AGENT_MGMT_BINARY_TOO_LARGE => "Binary file exceeds size limit",
+        ERR_AGENT_MGMT_UNSUPPORTED_TYPE => "Unsupported install type",
+        ERR_AGENT_MGMT_BUILTIN_PROTECTED => "Builtin agent is protected from uninstallation",
+        ERR_AGENT_MGMT_STREAM_TRUNCATED => "Upload stream truncated",
+        ERR_AGENT_MGMT_DISK_FULL => "Insufficient disk space",
+        ERR_AGENT_MGMT_PERMISSION_DENIED => "Permission denied",
+        ERR_AGENT_MGMT_UNKNOWN_AGENT => "Unknown agent_id",
+        ERR_AGENT_MGMT_INVALID_CHUNK => "Invalid upload chunk",
+        ERR_PROJECT_NOT_FOUND => "Project not found or stopped",
+        ERR_AGENT_RUNNER_UNAVAILABLE => "Agent Runner container is unavailable",
         ERR_UNKNOWN => "Unknown error",
         _ => "Undefined error code",
     }
@@ -238,6 +340,26 @@ mod tests {
             ERR_PERMISSION_NOT_FOUND,
             ERR_PERMISSION_RESOLVE_FAILED,
             ERR_PERMISSION_EXPIRED,
+            ERR_AGENT_MGMT_NOT_FOUND,
+            ERR_AGENT_MGMT_ALREADY_INSTALLED,
+            ERR_AGENT_MGMT_INVALID_MANIFEST,
+            ERR_AGENT_MGMT_CHECKSUM_MISMATCH,
+            ERR_AGENT_MGMT_ARCHIVE_BOMB,
+            ERR_AGENT_MGMT_PATH_TRAVERSAL,
+            ERR_AGENT_MGMT_COMMAND_TIMEOUT,
+            ERR_AGENT_MGMT_INSTALL_FAILED,
+            ERR_AGENT_MGMT_UNINSTALL_FAILED,
+            ERR_AGENT_MGMT_CHECK_FAILED,
+            ERR_AGENT_MGMT_BINARY_TOO_LARGE,
+            ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
+            ERR_AGENT_MGMT_BUILTIN_PROTECTED,
+            ERR_AGENT_MGMT_STREAM_TRUNCATED,
+            ERR_AGENT_MGMT_DISK_FULL,
+            ERR_AGENT_MGMT_PERMISSION_DENIED,
+            ERR_AGENT_MGMT_UNKNOWN_AGENT,
+            ERR_AGENT_MGMT_INVALID_CHUNK,
+            ERR_PROJECT_NOT_FOUND,
+            ERR_AGENT_RUNNER_UNAVAILABLE,
         ];
 
         for code in codes {
