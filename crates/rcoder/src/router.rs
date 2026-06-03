@@ -502,6 +502,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::computer_desktop_proxy,
         handler::computer_audio_proxy,
         handler::computer_ime_proxy,
+        handler::computer_ttyd_proxy,
         handler::pod_count,
         handler::pod_list,
         handler::pod_ensure,
@@ -577,6 +578,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::VncProxyPathParams,
             handler::AudioProxyPathParams,
             handler::ImeProxyPathParams,
+            handler::TtydProxyPathParams,
             handler::DesktopAccessResponse,
             handler::DesktopErrorResponse,
             // Pod 容器管理相关结构体
