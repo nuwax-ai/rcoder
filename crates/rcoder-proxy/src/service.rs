@@ -470,7 +470,7 @@ impl ProxyHttp for PortProxy {
         // 原有路由处理逻辑
         // ========================================
         let original_uri = upstream_request.uri.clone();
-        let path = original_uri.path();
+        let path = Self::normalize_path(original_uri.path());
 
         // 使用 matchit 匹配路由
         let matched = self.router.at(path).map_err(|_| {
@@ -535,7 +535,7 @@ impl ProxyHttp for PortProxy {
         ctx: &mut Self::CTX,
     ) -> PingoraResult<Box<HttpPeer>> {
         let req_header = session.req_header();
-        let path = req_header.uri.path();
+        let path = Self::normalize_path(req_header.uri.path());
 
         // 使用 matchit 匹配路由
         let matched = self.router.at(path).map_err(|_| {
@@ -736,6 +736,19 @@ impl ProxyHttp for PortProxy {
 }
 
 impl PortProxy {
+    /// 路径标准化：去掉尾部斜杠（matchit 的 `{*path}` 不匹配空路径）
+    ///
+    /// - `"/"` → `"/"`（保留根路径）
+    /// - `"/foo/"` → `"/foo"`
+    /// - `"/foo/bar/"` → `"/foo/bar"`
+    fn normalize_path(raw: &str) -> &str {
+        if raw.len() > 1 {
+            raw.trim_end_matches('/')
+        } else {
+            raw
+        }
+    }
+
     /// 统一的 URI 重写方法，消除重复代码
     fn rewrite_uri(original_uri: &http::Uri, target_path: String) -> PingoraResult<http::Uri> {
         let new_uri_str = if let Some(query) = original_uri.query() {
