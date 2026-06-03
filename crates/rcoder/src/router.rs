@@ -525,6 +525,13 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::install_from_url,
         handler::install_from_npm,
         handler::uninstall_agent,
+        // DevComputer 调试接口
+        handler::handle_devcomputer_chat,
+        handler::devcomputer_agent_stop,
+        handler::devcomputer_agent_status,
+        handler::devcomputer_agent_session_cancel,
+        handler::devcomputer_notify_resolved,
+        handler::devcomputer_agent_progress_notification,
     ),
     components(
         schemas(
@@ -641,6 +648,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         (name = "pod", description = "Pod 容器管理接口，支持容器监控、启动和保活"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
         (name = "agent-mgmt", description = "Agent 二进制安装/卸载/检查接口(P0-4: rcoder 转发到 agent_runner 容器)"),
+        (name = "devcomputer", description = "DevComputer 调试接口（与 /computer 共享容器，自动注入 auto_reload 配置）"),
     ),
     info(
         description = r#"
