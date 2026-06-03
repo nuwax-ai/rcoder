@@ -161,12 +161,29 @@ PATH 管理（后端自动处理）:
 
 ### 3.0 客户端调用示例(新增)
 
+> **容器路由说明**：所有端点支持两种路由方式：
+> 1. **project_id 路由**（向后兼容）：传 `project_id` 字段
+> 2. **user_id/pod_id 路由**（多租户）：传 `user_id`（或 `pod_id` + 隔离字段）
+>
+> 两种方式二选一，`project_id` 优先。JSON body 和 `?project_id=xxx` query 都支持（JSON 优先）。
+
 #### 列出已安装 agents(POST + JSON body)
 
 ```bash
+# 方式 1: project_id 路由
 curl -X POST http://localhost:8087/agent-mgmt/agents/list \
   -H "Content-Type: application/json" \
   -d '{"project_id": "p1", "include_builtin": false}'
+
+# 方式 2: user_id 路由（多租户）
+curl -X POST http://localhost:8087/agent-mgmt/agents/list \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "user_123"}'
+
+# 方式 3: pod_id + 隔离字段路由
+curl -X POST http://localhost:8087/agent-mgmt/agents/list \
+  -H "Content-Type: application/json" \
+  -d '{"pod_id": "pod_1", "tenant_id": "t1", "space_id": "s1", "isolation_type": "tenant"}'
 ```
 
 响应:
@@ -179,7 +196,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/list \
     "system_info": { "os": "linux", "arch": "amd64", "platform": "linux/amd64" },
     "agents": [...],
     "total": 3,
-    "install_dir": "/root/.rcoder/agents"
+    "install_dir": "/home/user/acp-agent"
   }
 }
 ```
@@ -225,9 +242,8 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
     "project_id": "p1",
     "agent_id": "codex-acp",
     "command": "codex-acp",
-    "args": ["--serve"],
     "url": "https://github.com/xxx/codex-acp/releases/latest/download/codex-acp-linux-amd64.tar.gz",
-    "sha256": "abc123..."
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   }'
 ```
 
@@ -238,23 +254,23 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-npm \
   -H "Content-Type: application/json" \
   -d '{
     "project_id": "p1",
-    "agent_id": "kimi-cli",
-    "command": "kimi",
-    "package": "@scope/kimi-cli"
+    "agent_id": "claude-code-acp",
+    "command": "claude-code-acp",
+    "package": "@anthropic-ai/claude-code-acp"
   }'
 ```
 
-#### 上传二进制(POST + multipart/form-data)
+#### 上传压缩包(POST + multipart/form-data)
 
 ```bash
 curl -X POST http://localhost:8087/agent-mgmt/agents/install \
-  -F 'metadata={"project_id":"p1","agent_id":"codex-acp","command":"codex-acp","args":["--serve"],"install_type":"BINARY","sha256":"abc123"};type=application/json' \
-  -F 'file=@./codex-acp-linux-amd64;type=application/octet-stream'
+  -F 'metadata={"project_id":"p1","agent_id":"codex-acp","command":"codex-acp","install_type":"BINARY","sha256":"e3b0c44298fc1c14..."};type=application/json' \
+  -F 'file=@./codex-acp-linux-amd64.tar.gz;type=application/octet-stream'
 ```
 
-> `install` 端点的 `metadata` 字段是 JSON 字符串,所有元数据(包含 `project_id`)都集中在这里,
-> 与其他 5 个 JSON body 端点保持一致的"参数化"风格。
-> `install_type` 取值: `BINARY`(默认) / `URL` / `NPM` / `ARCHIVE`。
+> `install` 端点的 `metadata` 字段是 JSON 字符串,所有元数据(包含 `project_id`)都集中在这里。
+> `install_type` 取值: `BINARY`(默认) / `URL` / `NPM`（大小写不敏感）。
+> URL 和 NPM 类型请使用专用端点 `/install-from-url` 和 `/install-from-npm`。
 
 ### 统一响应格式
 
@@ -292,7 +308,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ### 3.1 列出已安装的 Agent
 
-**`POST /agent-management/agents/list`**
+**`POST /agent-mgmt/agents/list`**
 
 列出容器内所有已安装的 ACP Agent。
 
@@ -300,7 +316,9 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ```json
 {
-  "user_id": "user_123",
+  "project_id": "demo-project-001",
+  "include_builtin": true,
+  "user_id": null,
   "pod_id": null,
   "tenant_id": null,
   "space_id": null,
@@ -312,59 +330,47 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| user_id | string | 是 | 用户 ID（定位容器） |
-| pod_id | string | 否 | Pod ID（共享容器模式） |
-| tenant_id | string | 否 | 租户 ID |
-| space_id | string | 否 | 空间 ID |
-| isolation_type | string | 否 | 隔离类型 |
+| project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一，向后兼容） |
+| include_builtin | boolean | 否 | 是否包含内置 agent（默认 true） |
+| user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式，定位容器） |
+| pod_id | string | 否 | Pod ID（有值时覆盖 user_id 作为容器标识） |
+| tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
+| space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
+| isolation_type | string | 条件必填 | 隔离类型：tenant / space / project（pod_id 有值时必填） |
+
+> **路由规则**：`project_id` 优先；无 `project_id` 时按 `pod_id`（或 `user_id`）+ 隔离字段定位容器。详见 §3.0 容器路由说明。
 
 #### 响应
 
+> 以下仅展示 `data` 字段内容，省略外层 HttpResult 包装。
+
 ```json
 {
-  "code": "0000",
-  "message": "Success",
-  "data": {
-    "system_info": {
-      "os": "linux",
-      "arch": "amd64",
-      "platform": "linux/amd64"
-    },
-    "agents": [
-      {
-        "agent_id": "claude-code-acp-ts",
-        "install_type": "builtin",
-        "install_dir": null,
-        "command": "claude-code-acp-ts",
-        "args": [],
-        "status": "available",
-        "version": "1.0.38",
-        "version_check_supported": true,
-        "binary_path": "/usr/local/bin/claude-code-acp-ts",
-        "installed_at": null,
-        "metadata": {
-          "description": "Claude Code ACP Agent (builtin)"
-        }
-      },
-      {
-        "agent_id": "codex-acp",
-        "install_type": "binary",
-        "install_dir": "/home/user/acp-agent",
-        "command": "codex-acp",
-        "args": [],
-        "status": "available",
-        "version": "1.2.0",
-        "version_check_supported": true,
-        "binary_path": "/home/user/acp-agent/bin/codex-acp",
-        "installed_at": "2025-05-25T10:30:00Z",
-        "metadata": {}
-      }
-    ],
-    "total": 2,
-    "install_dir": "/home/user/acp-agent"
+  "system_info": {
+    "os": "linux",
+    "arch": "amd64",
+    "platform": "linux/amd64"
   },
-  "tid": "abc123def456",
-  "success": true
+  "agents": [
+    {
+      "agent_id": "claude-code-acp-ts",
+      "install_type": "builtin",
+      "status": "available",
+      "version": "1.0.38",
+      "binary_path": "/usr/local/bin/claude-code-acp-ts",
+      "installed_at": null
+    },
+    {
+      "agent_id": "codex-acp",
+      "install_type": "binary",
+      "status": "available",
+      "version": "1.2.0",
+      "binary_path": "/home/user/acp-agent/bin/codex-acp",
+      "installed_at": 1716637800
+    }
+  ],
+  "total": 2,
+  "install_dir": "/home/user/acp-agent"
 }
 ```
 
@@ -383,16 +389,11 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | agent_id | string | Agent 标识符 |
-| install_type | `"builtin"` \| `"binary"` \| `"npm"` \| null | 安装类型（未安装时为 null） |
-| install_dir | string? | 安装根目录（后端内部路径，builtin 为 null） |
-| command | string? | 启动命令 |
-| args | string[] | 默认启动参数 |
+| install_type | `"builtin"` \| `"binary"` \| `"npm"` \| `"url"` \| `"unknown"` | 安装类型 |
 | status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 状态 |
 | version | string? | 版本号（无法检测时为 null） |
-| version_check_supported | boolean | 是否支持版本检测 |
 | binary_path | string? | 可执行文件路径（未安装时为 null） |
-| installed_at | string? | 安装时间 (ISO 8601)，builtin 和未安装时为 null |
-| metadata | object | 扩展元数据 |
+| installed_at | number? | 安装时间 (Unix timestamp)，builtin 和未安装时为 null |
 
 > **builtin Agent 发现机制**: builtin Agent（如 `claude-code-acp-ts`）不在注册表 `registry.json` 中。list 接口会额外扫描编译时嵌入的默认配置（`default_agents.json` / `computer_agent_default.json`），将其中 `enabled: true` 的 Agent 合并到列表结果中，`install_type` 标记为 `builtin`，`install_dir` 为 null。
 
@@ -400,7 +401,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ### 3.2 检查指定 Agent 状态
 
-**`POST /agent-management/agents/check`**
+**`POST /agent-mgmt/agents/check`**
 
 检查指定 ACP Agent 是否已安装、版本号、是否可正常执行。
 
@@ -408,8 +409,9 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ```json
 {
-  "user_id": "user_123",
+  "project_id": "demo-project-001",
   "agent_id": "codex-acp",
+  "user_id": null,
   "pod_id": null,
   "tenant_id": null,
   "space_id": null,
@@ -421,12 +423,13 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| user_id | string | 是 | 用户 ID |
+| project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
 | agent_id | string | 是 | Agent 标识符 |
+| user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
-| tenant_id | string | 否 | 租户 ID |
-| space_id | string | 否 | 空间 ID |
-| isolation_type | string | 否 | 隔离类型 |
+| tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
+| space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
+| isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
 
 #### 响应 - Agent 已安装
 
@@ -439,24 +442,20 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
     "arch": "amd64",
     "platform": "linux/amd64"
   },
-  "agent_id": "codex-acp",
-  "install_type": "binary",
-  "install_dir": "/home/user/acp-agent",
-  "status": "available",
-  "installed": true,
-  "version": "1.2.0",
-  "version_check_supported": true,
-  "version_check_output": "codex-acp v1.2.0",
-  "command": "codex-acp",
-  "binary_path": "/home/user/acp-agent/bin/codex-acp",
-  "which_output": "/home/user/acp-agent/bin/codex-acp",
-  "static_checks": {
-    "file_exists": true,
-    "executable": true,
-    "in_path": true
-  },
-  "installed_at": "2025-05-25T10:30:00Z",
-  "metadata": {}
+  "agent": {
+    "agent_id": "codex-acp",
+    "install_type": "binary",
+    "status": "available",
+    "installed": true,
+    "version": "1.2.0",
+    "version_check_supported": true,
+    "binary_path": "/home/user/acp-agent/bin/codex-acp",
+    "static_checks": {
+      "file_exists": true,
+      "executable": true,
+      "in_path": true
+    }
+  }
 }
 ```
 
@@ -471,24 +470,20 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
     "arch": "amd64",
     "platform": "linux/amd64"
   },
-  "agent_id": "kimi-cli",
-  "install_type": null,
-  "install_dir": null,
-  "status": "not_installed",
-  "installed": false,
-  "version": null,
-  "version_check_supported": false,
-  "version_check_output": null,
-  "command": null,
-  "binary_path": null,
-  "which_output": null,
-  "static_checks": {
-    "file_exists": false,
-    "executable": false,
-    "in_path": false
-  },
-  "installed_at": null,
-  "metadata": {}
+  "agent": {
+    "agent_id": "kimi-cli",
+    "install_type": "unknown",
+    "status": "not_installed",
+    "installed": false,
+    "version": null,
+    "version_check_supported": false,
+    "binary_path": "",
+    "static_checks": {
+      "file_exists": false,
+      "executable": false,
+      "in_path": false
+    }
+  }
 }
 ```
 
@@ -505,25 +500,20 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
     "arch": "amd64",
     "platform": "linux/amd64"
   },
-  "agent_id": "kilo-code",
-  "install_type": "binary",
-  "install_dir": "/home/user/acp-agent",
-  "status": "broken",
-  "installed": true,
-  "version": null,
-  "version_check_supported": true,
-  "version_check_output": null,
-  "version_check_error": "exit code 1: Permission denied",
-  "command": "kilo-code",
-  "binary_path": "/home/user/acp-agent/bin/kilo-code",
-  "which_output": "/home/user/acp-agent/bin/kilo-code",
-  "static_checks": {
-    "file_exists": true,
-    "executable": true,
-    "in_path": true
-  },
-  "installed_at": "2025-05-24T15:00:00Z",
-  "metadata": {}
+  "agent": {
+    "agent_id": "kilo-code",
+    "install_type": "binary",
+    "status": "broken",
+    "installed": true,
+    "version": null,
+    "version_check_supported": true,
+    "binary_path": "/home/user/acp-agent/bin/kilo-code",
+    "static_checks": {
+      "file_exists": true,
+      "executable": true,
+      "in_path": true
+    }
+  }
 }
 ```
 
@@ -540,40 +530,44 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
     "arch": "amd64",
     "platform": "linux/amd64"
   },
-  "agent_id": "codex-acp",
-  "install_type": "binary",
-  "install_dir": "/home/user/acp-agent",
-  "status": "available",
-  "installed": true,
-  "version": null,
-  "version_check_supported": false,
-  "version_check_output": null,
-  "version_check_error": null,
-  "command": "codex-acp",
-  "binary_path": "/home/user/acp-agent/bin/codex-acp",
-  "which_output": "/home/user/acp-agent/bin/codex-acp",
-  "static_checks": {
-    "file_exists": true,
-    "executable": true,
-    "in_path": true
-  },
-  "installed_at": "2025-05-25T10:30:00Z",
-  "metadata": {}
+  "agent": {
+    "agent_id": "codex-acp",
+    "install_type": "binary",
+    "status": "available",
+    "installed": true,
+    "version": null,
+    "version_check_supported": false,
+    "binary_path": "/home/user/acp-agent/bin/codex-acp",
+    "static_checks": {
+      "file_exists": true,
+      "executable": true,
+      "in_path": true
+    }
+  }
 }
 ```
 
 > 当 `version_check_supported: false` 时，`status` 完全由 `static_checks` 三项静态检查决定。
 > 三项全为 `true` → `available`；任一为 `false` → `broken`。
 
+#### CheckAgentResponse 字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| system_info | SystemInfo | 容器系统信息（操作系统、CPU 架构） |
+| agent | AgentDetailInfo | Agent 详细信息 |
+
 #### AgentDetailInfo 字段说明
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| *(继承 AgentInfo 所有字段)* | | Agent 基本信息 |
+| agent_id | string | Agent 标识符 |
+| install_type | `"builtin"` \| `"binary"` \| `"npm"` \| `"url"` \| `"unknown"` | 安装类型 |
+| status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 状态 |
 | installed | boolean | 是否已安装 |
-| version_check_output | string? | 版本检查命令的 stdout |
-| version_check_error | string? | 版本检查命令的 stderr |
-| which_output | string? | `which {command}` 的输出路径 |
+| version | string? | 版本号 |
+| version_check_supported | boolean | 是否支持版本检测 |
+| binary_path | string | 可执行文件路径 |
 | static_checks | StaticCheckResult | 静态检查结果（不执行 agent 进程） |
 
 #### StaticCheckResult 字段说明
@@ -622,9 +616,9 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ### 3.3 上传二进制 Agent
 
-**`POST /agent-management/agents/install/binary`**
+**`POST /agent-mgmt/agents/install`**
 
-上传可执行文件或压缩包（`.tar.gz` / `.zip`）作为 ACP Agent。后端自动检测文件类型，压缩包会自动解压。
+上传压缩包（`.tar.gz` / `.zip`）作为 ACP Agent。通过 `multipart/form-data` 传递文件和元数据。
 
 #### 请求格式
 
@@ -632,48 +626,41 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| user_id | string | 是 | 用户 ID |
+| file | binary | 是 | 压缩包（.tar.gz / .zip，最大 1GB） |
+| metadata | string | 是 | JSON 字符串，包含安装元数据（见下表） |
+
+**metadata JSON 字段**:
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
 | agent_id | string | 是 | Agent 标识符（如 "codex-acp"） |
-| file | binary | 是 | 可执行文件或压缩包（.tar.gz / .zip） |
-| command | string | 否 | 启动命令名（默认 = agent_id）。压缩包时用于定位入口可执行文件 |
-| args | string | 否 | 默认启动参数 (JSON array) |
-| version_check_command | string | 否 | 版本检查命令 (JSON array)，不传则不检查版本 |
+| command | string | 是 | 入口可执行文件名（如 "codex-acp"） |
+| args | string[] | 否 | 默认启动参数（默认空） |
+| install_type | string | 否 | `"BINARY"`（默认）/ `"URL"` / `"NPM"` |
+| sha256 | string | 否 | SHA-256 校验和（hex，可选） |
+| user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
-| tenant_id | string | 否 | 租户 ID |
-| space_id | string | 否 | 空间 ID |
-| isolation_type | string | 否 | 隔离类型 |
-| metadata | string | 否 | 扩展元数据 (JSON object) |
+| tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
+| space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
+| isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
 
-#### 支持的文件类型
-
-| 类型 | 扩展名 | 处理方式 |
-|------|--------|---------|
-| 可执行文件 | 无特定扩展名 | 直接放置到 `bin/{command}` |
-| tar.gz 压缩包 | `.tar.gz`, `.tgz` | 自动解压，根据 `command` 字段定位入口可执行文件 |
-| zip 压缩包 | `.zip` | 自动解压，根据 `command` 字段定位入口可执行文件 |
-
-> **文件类型检测**: 后端通过文件扩展名 + magic bytes 双重检测，调用方无需额外传参。
-
-#### 请求示例 - 上传单个可执行文件
-
-```bash
-curl -X POST http://localhost:8087/agent-management/agents/install/binary \
-  -F "user_id=user_123" \
-  -F "agent_id=codex-acp" \
-  -F "file=@./codex-acp-linux-amd64" \
-  -F "command=codex-acp" \
-  -F 'version_check_command=["codex-acp","--version"]'
-```
+> **install_type 说明**：BINARY 模式必须提供 `file` 字段；URL/NPM 模式请使用专用端点 `/install-from-url` 和 `/install-from-npm`。
 
 #### 请求示例 - 上传 tar.gz 压缩包
 
 ```bash
-curl -X POST http://localhost:8087/agent-management/agents/install/binary \
-  -F "user_id=user_123" \
-  -F "agent_id=my-agent" \
-  -F "file=@./my-agent-linux-amd64.tar.gz" \
-  -F "command=my-agent"
-# 后端自动检测为 tar.gz，解压后在目录中找到 my-agent 可执行文件
+curl -X POST http://localhost:8087/agent-mgmt/agents/install \
+  -F 'metadata={"project_id":"p1","agent_id":"codex-acp","command":"codex-acp","install_type":"BINARY"};type=application/json' \
+  -F 'file=@./codex-acp-linux-amd64.tar.gz;type=application/octet-stream'
+```
+
+#### 请求示例 - 使用 user_id 路由
+
+```bash
+curl -X POST http://localhost:8087/agent-mgmt/agents/install \
+  -F 'metadata={"user_id":"user_123","agent_id":"my-agent","command":"my-agent","install_type":"BINARY"};type=application/json' \
+  -F 'file=@./my-agent-v1.0-linux-amd64.tar.gz;type=application/octet-stream'
 ```
 
 #### 响应 - 单文件
@@ -683,16 +670,13 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 ```json
 {
   "agent_id": "codex-acp",
-  "install_type": "binary",
-  "install_dir": "/home/user/acp-agent",
   "status": "available",
-  "version": "1.2.0",
   "binary_path": "/home/user/acp-agent/bin/codex-acp",
-  "command": "codex-acp",
   "file_type": "executable",
   "file_size": 15728640,
   "file_count": 1,
-  "installed_at": "2025-05-25T10:30:00Z"
+  "version": "1.2.0",
+  "source_url": null
 }
 ```
 
@@ -703,17 +687,13 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 ```json
 {
   "agent_id": "my-agent",
-  "install_type": "binary",
-  "install_dir": "/home/user/acp-agent",
   "status": "available",
-  "version": null,
   "binary_path": "/home/user/acp-agent/bin/my-agent",
-  "command": "my-agent",
   "file_type": "tar.gz",
   "file_size": 8388608,
   "file_count": 3,
-  "extracted_files": ["my-agent", "libhelper.so", "config.json"],
-  "installed_at": "2025-05-25T10:30:00Z"
+  "version": null,
+  "source_url": null
 }
 ```
 
@@ -721,17 +701,21 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| file_type | `"executable"` \| `"tar.gz"` \| `"zip"` | 检测到的文件类型 |
-| file_size | number | 上传文件总大小（字节） |
-| file_count | number | 安装的文件数量（单文件为 1，压缩包为解压后的文件数） |
-| extracted_files | string[]? | 压缩包解压后的文件列表（仅压缩包时返回） |
+| agent_id | string | Agent 标识符 |
+| status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 安装后状态 |
+| binary_path | string | 可执行文件路径 |
+| file_type | `"executable"` \| `"tar.gz"` \| `"zip"` \| `"npm"` | 检测到的文件类型 |
+| file_size | number | 文件大小（字节） |
+| file_count | number? | 安装的文件数量（单文件为 1，压缩包为解压后的文件数） |
+| version | string? | 版本号 |
+| source_url | string? | 下载源 URL（URL 安装时有值） |
 
 #### 处理流程
 
 ```
-1. 验证参数（user_id, agent_id, file 必填）
-2. 验证文件大小（上限 500MB）
-3. 定位目标容器（根据 user_id / pod_id / isolation_type）
+1. 验证参数（agent_id, command, metadata 必填）
+2. 验证文件大小（上限 1GB）
+3. 定位目标容器（根据 project_id / user_id / pod_id + 隔离字段）
 4. 确保安装目录存在：
    mkdir -p /home/user/acp-agent/bin
 5. 自动检测文件类型（扩展名 + magic bytes）:
@@ -758,41 +742,36 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 | 错误 | code | 说明 |
 |------|------|------|
-| 文件过大 | ERR_FILE_TOO_LARGE | 超过 500MB 限制 |
-| 无执行权限且 chmod 失败 | ERR_PERMISSION_DENIED | 文件系统权限问题 |
-| which 验证失败 | ERR_PATH_NOT_FOUND | PATH 配置异常 |
+| 文件过大 | ERR_AGENT_MGMT_BINARY_TOO_LARGE | 超过 1GB 限制 |
+| 无执行权限 | ERR_AGENT_MGMT_PERMISSION_DENIED | 文件系统权限问题 |
+| 校验和不匹配 | ERR_AGENT_MGMT_CHECKSUM_MISMATCH | SHA-256 校验失败 |
+| 压缩炸弹 | ERR_AGENT_MGMT_ARCHIVE_BOMB | 解压累计超限 |
+| 路径遍历 | ERR_AGENT_MGMT_PATH_TRAVERSAL | 压缩包含 `..` 等逃逸路径 |
 | 容器不存在 | ERR_CONTAINER_NOT_FOUND | 需要先创建容器 |
-| 压缩包解压失败 | ERR_ARCHIVE_EXTRACT_FAILED | 文件损坏或非标准格式 |
-| 压缩包中找不到入口文件 | ERR_ENTRY_NOT_FOUND | `command` 指定的可执行文件在解压目录中不存在 |
+| agent 已存在 | ERR_AGENT_MGMT_ALREADY_INSTALLED | 重复安装 |
+| 磁盘满 | ERR_AGENT_MGMT_DISK_FULL | 容器磁盘空间不足 |
 
 ---
 
 ### 3.4 通过包管理器安装 Agent
 
-**`POST /agent-management/agents/install/package`**
+**`POST /agent-mgmt/agents/install-from-npm`**
 
-通过 npm 等包管理器安装 ACP Agent。
+通过 npm 全局安装 ACP Agent。
 
 #### 请求体 (JSON)
 
 ```json
 {
-  "user_id": "user_123",
-  "agent_id": "kimi-cli",
-  "package_manager": "npm",
-  "package_name": "@anthropic/kimi-cli",
-  "package_version": "latest",
-  "command": "kimi-cli",
-  "args": [],
-  "version_check_command": ["kimi-cli", "--version"],
-  "registry_url": null,
+  "project_id": "p1",
+  "agent_id": "claude-code-acp",
+  "command": "claude-code-acp",
+  "package": "@anthropic-ai/claude-code-acp",
+  "user_id": null,
   "pod_id": null,
   "tenant_id": null,
   "space_id": null,
-  "isolation_type": null,
-  "metadata": {
-    "description": "Kimi CLI ACP Agent"
-  }
+  "isolation_type": null
 }
 ```
 
@@ -800,20 +779,15 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| user_id | string | 是 | 用户 ID |
+| project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
 | agent_id | string | 是 | Agent 标识符 |
-| package_manager | string | 是 | 包管理器：`npm` / `bun` / `pnpm` |
-| package_name | string | 是 | 包名（如 `@anthropic/kimi-cli`） |
-| package_version | string | 否 | 版本号（默认 `latest`） |
-| command | string | 否 | 启动命令名（默认 = agent_id） |
-| args | string[] | 否 | 默认启动参数 |
-| version_check_command | string[] | 否 | 版本检查命令 |
-| registry_url | string | 否 | 自定义 npm registry |
+| command | string | 是 | 入口可执行文件名（通常是包名去掉 scope） |
+| package | string | 是 | npm 包名（如 `@anthropic-ai/claude-code-acp`） |
+| user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
-| tenant_id | string | 否 | 租户 ID |
-| space_id | string | 否 | 空间 ID |
-| isolation_type | string | 否 | 隔离类型 |
-| metadata | object | 否 | 扩展元数据 |
+| tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
+| space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
+| isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
 
 #### 响应
 
@@ -821,33 +795,27 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 ```json
 {
-  "agent_id": "kimi-cli",
-  "install_type": "npm",
-  "install_dir": "/home/user/acp-agent",
+  "agent_id": "claude-code-acp",
   "status": "available",
-  "version": "0.3.1",
-  "binary_path": "/home/user/acp-agent/npm-global/bin/kimi-cli",
-  "command": "kimi-cli",
-  "package_name": "@anthropic/kimi-cli",
-  "package_version": "latest",
-  "install_output": "added 128 packages in 12s",
-  "installed_at": "2025-05-25T11:00:00Z"
+  "binary_path": "/home/user/acp-agent/npm-global/bin/claude-code-acp",
+  "file_type": "npm",
+  "file_size": 0,
+  "version": "1.0.38",
+  "source_url": null
 }
 ```
 
 #### 处理流程
 
 ```
-1. 验证参数
-2. 定位目标容器
+1. 验证参数（agent_id, command, package 必填）
+2. 定位目标容器（根据 project_id / user_id / pod_id + 隔离字段）
 3. 确保 npm 全局安装目录存在且加入 PATH：
    mkdir -p /home/user/acp-agent/npm-global
    export PATH="/home/user/acp-agent/npm-global/bin:$PATH"
    npm config set prefix /home/user/acp-agent/npm-global
 4. 执行安装命令（在容器内执行，超时 5 分钟）：
-   npm install -g {package_name}@{package_version}
-   或带自定义 registry:
-   npm install -g {package_name}@{package_version} --registry={registry_url}
+   npm install -g {package}
 5. 更新 PATH 持久化脚本
 6. 验证安装：
    which {command}
@@ -859,36 +827,34 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 | 错误 | code | 说明 |
 |------|------|------|
-| 包管理器不存在 | ERR_PACKAGE_MANAGER_NOT_FOUND | 容器内未安装 npm/bun/pnpm |
-| npm install 失败 | ERR_PACKAGE_INSTALL_FAILED | 网络或包问题 |
-| 安装后命令不可用 | ERR_COMMAND_NOT_FOUND | 包未正确导出 bin |
-| 超时 | ERR_INSTALL_TIMEOUT | 安装超过 5 分钟 |
+| npm install 失败 | ERR_AGENT_MGMT_INSTALL_FAILED | 网络或包问题 |
+| 安装超时 | ERR_AGENT_MGMT_COMMAND_TIMEOUT | 安装超过超时限制 |
+| agent 已存在 | ERR_AGENT_MGMT_ALREADY_INSTALLED | 重复安装 |
+| 容器不存在 | ERR_CONTAINER_NOT_FOUND | 需要先创建容器 |
 
 ---
 
 ### 3.5 通过 URL 安装 Agent
 
-**`POST /agent-management/agents/install/url`**
+**`POST /agent-mgmt/agents/install-from-url`**
 
-从指定 URL 下载可执行文件或压缩包作为 ACP Agent。后端（容器内）直接下载文件，自动检测文件类型，压缩包会自动解压。
+从指定 URL 下载压缩包作为 ACP Agent。由 agent_runner 容器内直接下载，自动检测文件类型，压缩包会自动解压。
 
 #### 请求体 (JSON)
 
 ```json
 {
-  "user_id": "user_123",
+  "project_id": "p1",
   "agent_id": "codex-acp",
-  "url": "https://github.com/zed-industries/codex-acp/releases/download/v1.2.0/codex-acp-linux-arm64",
-  "headers": null,
-  "checksum": null,
   "command": "codex-acp",
   "args": [],
-  "version_check_command": null,
+  "url": "https://github.com/zed-industries/codex-acp/releases/download/v1.2.0/codex-acp-linux-arm64.tar.gz",
+  "sha256": null,
+  "user_id": null,
   "pod_id": null,
   "tenant_id": null,
   "space_id": null,
-  "isolation_type": null,
-  "metadata": {}
+  "isolation_type": null
 }
 ```
 
@@ -896,19 +862,17 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| user_id | string | 是 | 用户 ID |
+| project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
 | agent_id | string | 是 | Agent 标识符（如 "codex-acp"） |
+| command | string | 是 | 入口可执行文件名 |
+| args | string[] | 否 | 默认启动参数（默认空） |
 | url | string | 是 | 下载 URL（支持 `http://` / `https://`） |
-| headers | object | 否 | 自定义 HTTP 请求头（用于认证，如 `{"Authorization": "Bearer xxx"}`） |
-| checksum | string | 否 | 文件校验和（格式：`sha256:hex` 或 `sha512:hex`），下载后验证文件完整性 |
-| command | string | 否 | 启动命令名（默认 = agent_id） |
-| args | string[] | 否 | 默认启动参数 |
-| version_check_command | string[] | 否 | 版本检查命令，不传则不检查版本 |
+| sha256 | string | 否 | SHA-256 校验和（hex），下载后验证文件完整性 |
+| user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
-| tenant_id | string | 否 | 租户 ID |
-| space_id | string | 否 | 空间 ID |
-| isolation_type | string | 否 | 隔离类型 |
-| metadata | object | 否 | 扩展元数据 |
+| tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
+| space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
+| isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
 
 #### 响应
 
@@ -917,44 +881,42 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 ```json
 {
   "agent_id": "codex-acp",
-  "install_type": "binary",
-  "install_dir": "/home/user/acp-agent",
   "status": "available",
-  "version": null,
   "binary_path": "/home/user/acp-agent/bin/codex-acp",
-  "command": "codex-acp",
-  "file_type": "executable",
+  "file_type": "tar.gz",
+  "file_count": 3,
   "file_size": 15728640,
-  "file_count": 1,
-  "source_url": "https://github.com/zed-industries/codex-acp/releases/download/v1.2.0/codex-acp-linux-arm64",
-  "installed_at": "2025-05-25T10:30:00Z"
+  "version": null,
+  "source_url": "https://github.com/zed-industries/codex-acp/releases/download/v1.2.0/codex-acp-linux-arm64.tar.gz"
 }
 ```
 
-#### 与 install/binary 响应的区别
+#### 响应字段说明
 
-| 字段 | install/binary | install/url |
-|------|---------------|-------------|
-| source_url | 无 | 有（下载源 URL） |
-| file_type | 有 | 有 |
-| file_count | 有 | 有 |
-| extracted_files | 压缩包时有 | 压缩包时有 |
-
-> 其余字段与 `install/binary` 一致，支持同样的文件类型（可执行文件 / .tar.gz / .zip）和自动解压逻辑。
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| agent_id | string | Agent 标识符 |
+| status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 安装后状态 |
+| binary_path | string | 可执行文件路径 |
+| file_type | `"executable"` \| `"tar.gz"` \| `"zip"` \| `"npm"` | 检测到的文件类型 |
+| file_count | number? | 安装的文件数量（压缩包为解压后的文件数） |
+| file_size | number | 文件大小（字节） |
+| version | string? | 版本号 |
+| source_url | string? | 下载源 URL |
 
 #### 处理流程
 
 ```
-1. 验证参数（user_id, agent_id, url 必填）
+1. 验证参数（agent_id, command, url 必填）
 2. 验证 URL 格式（必须是 http:// 或 https://）
-3. 定位目标容器（根据 user_id / pod_id / isolation_type）
+3. 定位目标容器（根据 project_id / user_id / pod_id + 隔离字段）
 4. 确保安装目录存在：
    mkdir -p /home/user/acp-agent/bin
 5. 在容器内发起下载（流式写入临时文件，超时 10 分钟）：
    curl -fSL -o /tmp/acp-install-{uuid}/{filename} "{url}"
    或带认证头:
    curl -fSL -H "Authorization: Bearer xxx" -o /tmp/... "{url}"
-6. 校验文件大小（上限 500MB）
+6. 校验文件大小（上限 1GB）
 7. 如果有 checksum 参数，验证文件完整性：
    sha256sum /tmp/acp-install-{uuid}/{filename} == checksum
 8. 自动检测文件类型（扩展名 + magic bytes）:
@@ -977,20 +939,19 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 | 错误 | code | 说明 |
 |------|------|------|
-| URL 格式无效 | ERR_INVALID_URL | 非 http/https 协议或格式错误 |
-| 下载失败（HTTP 4xx/5xx） | ERR_DOWNLOAD_FAILED | 远程文件不存在或服务器错误 |
-| 下载超时 | ERR_DOWNLOAD_TIMEOUT | 下载超过 10 分钟 |
-| 文件过大 | ERR_FILE_TOO_LARGE | 下载文件超过 500MB 限制 |
-| 校验和不匹配 | ERR_CHECKSUM_MISMATCH | 下载文件与指定 checksum 不一致 |
-| 压缩包解压失败 | ERR_ARCHIVE_EXTRACT_FAILED | 文件损坏或非标准格式 |
-| 压缩包中找不到入口文件 | ERR_ENTRY_NOT_FOUND | `command` 指定的可执行文件不存在 |
+| URL 格式无效 | ERR_AGENT_MGMT_INVALID_MANIFEST | 非 http/https 协议或格式错误 |
+| 下载失败 | ERR_AGENT_MGMT_INSTALL_FAILED | 远程文件不存在或服务器错误 |
+| 下载超时 | ERR_AGENT_MGMT_COMMAND_TIMEOUT | 下载超时 |
+| 校验和不匹配 | ERR_AGENT_MGMT_CHECKSUM_MISMATCH | 下载文件与指定 sha256 不一致 |
+| 压缩炸弹 | ERR_AGENT_MGMT_ARCHIVE_BOMB | 解压累计超限 |
+| 路径遍历 | ERR_AGENT_MGMT_PATH_TRAVERSAL | 压缩包含 `..` 等逃逸路径 |
 | 容器不存在 | ERR_CONTAINER_NOT_FOUND | 需要先创建容器 |
 
 ---
 
 ### 3.6 卸载 Agent
 
-**`POST /agent-management/agents/uninstall`**
+**`POST /agent-mgmt/agents/uninstall`**
 
 卸载已安装的 ACP Agent。
 
@@ -998,8 +959,9 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 ```json
 {
-  "user_id": "user_123",
+  "project_id": "p1",
   "agent_id": "codex-acp",
+  "user_id": null,
   "pod_id": null,
   "tenant_id": null,
   "space_id": null,
@@ -1011,12 +973,13 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| user_id | string | 是 | 用户 ID |
+| project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
 | agent_id | string | 是 | Agent 标识符 |
+| user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
-| tenant_id | string | 否 | 租户 ID |
-| space_id | string | 否 | 空间 ID |
-| isolation_type | string | 否 | 隔离类型 |
+| tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
+| space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
+| isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
 
 #### 响应
 
@@ -1026,33 +989,38 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
 {
   "agent_id": "codex-acp",
   "uninstalled": true,
-  "install_type": "binary",
-  "install_dir": "/home/user/acp-agent",
-  "removed_path": "/home/user/acp-agent/bin/codex-acp"
+  "install_type": "binary"
 }
 ```
+
+#### 响应字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| agent_id | string | Agent 标识符 |
+| uninstalled | boolean | 是否成功卸载 |
+| install_type | `"builtin"` \| `"binary"` \| `"npm"` \| `"url"` \| `"unknown"` | 安装类型 |
 
 #### 处理逻辑
 
 ```
 1. 读取 registry.json，检查是否有记录
-2. 根据 install_type 执行卸载：
-   - binary: rm /home/user/acp-agent/bin/{command}
-   - npm: npm uninstall -g {package_name}
-   - builtin: 拒绝卸载（返回错误）
-3. 从注册表移除记录
-4. 更新 PATH 持久化脚本（如果已无其他 Agent，从 PATH 中移除）
-5. 返回卸载结果
+2. builtin 类型拒绝卸载（返回 ERR_AGENT_MGMT_BUILTIN_PROTECTED）
+3. 安全检查：binary_path 必须在安装目录下（防止 manifest 被篡改后删除系统文件）
+4. 删除入口二进制/符号链接
+5. 清理 agent 子目录（若有残留的 tar/zip 解压文件）
+6. 从注册表移除记录
+7. 返回卸载结果
 ```
 
 #### 错误场景
 
 | 错误 | code | 说明 |
 |------|------|------|
-| Agent 不在注册表中 | ERR_AGENT_NOT_FOUND | 指定 agent_id 未安装 |
-| 尝试卸载内置 Agent | ERR_BUILTIN_AGENT | builtin 类型不允许卸载 |
-| 文件删除失败 | ERR_UNINSTALL_FAILED | 文件系统权限或 IO 错误 |
-| npm uninstall 失败 | ERR_PACKAGE_UNINSTALL_FAILED | npm 命令执行失败 |
+| Agent 不在注册表中 | ERR_AGENT_MGMT_NOT_FOUND | 指定 agent_id 未安装 |
+| 尝试卸载内置 Agent | ERR_AGENT_MGMT_BUILTIN_PROTECTED | builtin 类型不允许卸载 |
+| 文件删除失败 | ERR_AGENT_MGMT_UNINSTALL_FAILED | 文件系统权限或 IO 错误 |
+| manifest 被篡改 | ERR_AGENT_MGMT_INVALID_MANIFEST | binary_path 超出安装目录范围 |
 
 ---
 
@@ -1130,7 +1098,7 @@ curl -X POST http://localhost:8087/agent-management/agents/install/binary \
    a. 查找注册表 registry.json
    b. 如果找到 → 使用注册表中的 command、args
    c. 如果没找到 → 查找默认配置 default_agents.json
-   d. 都没有 → 报错 ERR_AGENT_NOT_FOUND
+   d. 都没有 → 报错 ERR_AGENT_MGMT_NOT_FOUND
 ```
 
 ---
@@ -1148,33 +1116,32 @@ curl -X POST http://localhost:8087/computer/pod/ensure \
   -d '{"user_id": "user_123"}'
 
 # 2. 检查 codex-acp 是否已安装（同时获取系统信息）
-curl -X POST http://localhost:8087/agent-management/agents/check \
+curl -X POST http://localhost:8087/agent-mgmt/agents/check \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user_123", "agent_id": "codex-acp"}'
+  -d '{"project_id": "p1", "agent_id": "codex-acp"}'
 # → {
 #     "system_info": { "os": "linux", "arch": "arm64", "platform": "linux/arm64" },
-#     "installed": false,
-#     "status": "not_installed"
+#     "agent": { "installed": false, "status": "not_installed", ... }
 #   }
 
-# 3. 根据 system_info 下载对应架构的二进制并上传
-#    平台是 linux/arm64，选择 codex-acp-linux-arm64
-curl -X POST http://localhost:8087/agent-management/agents/install/binary \
-  -F "user_id=user_123" \
-  -F "agent_id=codex-acp" \
-  -F "file=@./codex-acp-linux-arm64" \
-  -F "command=codex-acp"
-# → { "status": "available", "version": null, "file_type": "executable", "file_count": 1 }
+# 3. 根据 system_info 下载对应架构的压缩包并上传
+#    平台是 linux/arm64，选择 codex-acp-linux-arm64.tar.gz
+curl -X POST http://localhost:8087/agent-mgmt/agents/install \
+  -F 'metadata={"project_id":"p1","agent_id":"codex-acp","command":"codex-acp","install_type":"BINARY"};type=application/json' \
+  -F 'file=@./codex-acp-linux-arm64.tar.gz;type=application/octet-stream'
+# → { "status": "available", "version": null, "file_type": "tar.gz", "file_count": 1 }
 
 # 4. 再次确认状态（静态检查通过，version = null）
-curl -X POST http://localhost:8087/agent-management/agents/check \
+curl -X POST http://localhost:8087/agent-mgmt/agents/check \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user_123", "agent_id": "codex-acp"}'
+  -d '{"project_id": "p1", "agent_id": "codex-acp"}'
 # → {
 #     "system_info": { "os": "linux", "arch": "arm64", "platform": "linux/arm64" },
-#     "installed": true, "status": "available", "version": null,
-#     "version_check_supported": false,
-#     "static_checks": { "file_exists": true, "executable": true, "in_path": true }
+#     "agent": {
+#       "installed": true, "status": "available", "version": null,
+#       "version_check_supported": false,
+#       "static_checks": { "file_exists": true, "executable": true, "in_path": true }
+#     }
 #   }
 
 # 5. 通过 /computer/chat 使用 codex-acp
@@ -1202,18 +1169,15 @@ curl -X POST http://localhost:8087/computer/chat \
 
 ```bash
 # 1. 通过 npm 安装 kimi-cli
-curl -X POST http://localhost:8087/agent-management/agents/install/package \
+curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-npm \
   -H "Content-Type: application/json" \
   -d '{
-    "user_id": "user_123",
-    "agent_id": "kimi-cli",
-    "package_manager": "npm",
-    "package_name": "@anthropic/kimi-cli",
-    "package_version": "latest",
-    "command": "kimi-cli",
-    "version_check_command": ["kimi-cli", "--version"]
+    "project_id": "p1",
+    "agent_id": "claude-code-acp",
+    "command": "claude-code-acp",
+    "package": "@anthropic-ai/claude-code-acp"
   }'
-# → { "status": "available", "version": "0.3.1" }
+# → { "status": "available", "version": "1.0.38" }
 
 # 2. 使用 kimi-cli
 curl -X POST http://localhost:8087/computer/chat \
@@ -1242,30 +1206,27 @@ curl -X POST http://localhost:8087/computer/chat \
 
 ```bash
 # 1. 检查系统信息
-curl -X POST http://localhost:8087/agent-management/agents/check \
+curl -X POST http://localhost:8087/agent-mgmt/agents/check \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user_123", "agent_id": "my-agent"}'
-# → { "system_info": { "os": "linux", "arch": "amd64", ... }, "installed": false }
+  -d '{"project_id": "p1", "agent_id": "my-agent"}'
+# → { "system_info": { "os": "linux", "arch": "amd64", ... }, "agent": { "installed": false, ... } }
 
 # 2. 上传 tar.gz 压缩包（后端自动检测并解压）
-curl -X POST http://localhost:8087/agent-management/agents/install/binary \
-  -F "user_id=user_123" \
-  -F "agent_id=my-agent" \
-  -F "file=@./my-agent-v1.0-linux-amd64.tar.gz" \
-  -F "command=my-agent"
+curl -X POST http://localhost:8087/agent-mgmt/agents/install \
+  -F 'metadata={"project_id":"p1","agent_id":"my-agent","command":"my-agent","install_type":"BINARY"};type=application/json' \
+  -F 'file=@./my-agent-v1.0-linux-amd64.tar.gz;type=application/octet-stream'
 # → {
 #     "status": "available",
 #     "file_type": "tar.gz",
 #     "file_count": 3,
-#     "extracted_files": ["my-agent", "libhelper.so", "config.json"],
 #     "binary_path": "/home/user/acp-agent/bin/my-agent"
 #   }
 
 # 3. 验证安装
-curl -X POST http://localhost:8087/agent-management/agents/check \
+curl -X POST http://localhost:8087/agent-mgmt/agents/check \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user_123", "agent_id": "my-agent"}'
-# → { "installed": true, "status": "available", "static_checks": { ... } }
+  -d '{"project_id": "p1", "agent_id": "my-agent"}'
+# → { "agent": { "installed": true, "status": "available", "static_checks": { ... } } }
 ```
 
 ### 5.4 场景四：从 GitHub Releases URL 安装 Agent
@@ -1274,37 +1235,36 @@ Agent 发布在 GitHub Releases 或 OSS 上时，直接给 URL 即可安装。
 
 ```bash
 # 1. 检查系统信息，确定应该下载哪个架构
-curl -X POST http://localhost:8087/agent-management/agents/check \
+curl -X POST http://localhost:8087/agent-mgmt/agents/check \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user_123", "agent_id": "codex-acp"}'
-# → { "system_info": { "os": "linux", "arch": "arm64", ... }, "installed": false }
+  -d '{"project_id": "p1", "agent_id": "codex-acp"}'
+# → { "system_info": { "os": "linux", "arch": "arm64", ... }, "agent": { "installed": false, ... } }
 
 # 2. 通过 URL 安装（容器直接下载）
-curl -X POST http://localhost:8087/agent-management/agents/install/url \
+curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
   -H "Content-Type: application/json" \
   -d '{
-    "user_id": "user_123",
+    "project_id": "p1",
     "agent_id": "codex-acp",
-    "url": "https://github.com/zed-industries/codex-acp/releases/download/v1.2.0/codex-acp-linux-arm64",
-    "command": "codex-acp"
+    "command": "codex-acp",
+    "url": "https://github.com/zed-industries/codex-acp/releases/download/v1.2.0/codex-acp-linux-arm64.tar.gz"
   }'
 # → {
 #     "status": "available",
-#     "file_type": "executable",
-#     "file_size": 15728640,
-#     "source_url": "https://github.com/.../codex-acp-linux-arm64"
+#     "file_type": "tar.gz",
+#     "file_count": 1,
+#     "source_url": "https://github.com/.../codex-acp-linux-arm64.tar.gz"
 #   }
 
-# 3. 从需要认证的私有仓库安装
-curl -X POST http://localhost:8087/agent-management/agents/install/url \
+# 3. 从需要校验的 URL 安装
+curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
   -H "Content-Type: application/json" \
   -d '{
-    "user_id": "user_123",
+    "project_id": "p1",
     "agent_id": "my-private-agent",
+    "command": "my-agent",
     "url": "https://oss.example.com/agents/my-agent-v1.0.tar.gz",
-    "headers": { "Authorization": "Bearer eyJhbGciOi..." },
-    "checksum": "sha256:a1b2c3d4e5f6...",
-    "command": "my-agent"
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   }'
 # → {
 #     "status": "available",
@@ -1318,9 +1278,9 @@ curl -X POST http://localhost:8087/agent-management/agents/install/url \
 
 ```bash
 # 列出所有已安装 Agent
-curl -X POST http://localhost:8087/agent-management/agents/list \
+curl -X POST http://localhost:8087/agent-mgmt/agents/list \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user_123"}'
+  -d '{"project_id": "p1"}'
 # → {
 #     "system_info": { "os": "linux", "arch": "amd64", "platform": "linux/amd64" },
 #     "agents": [
@@ -1337,16 +1297,16 @@ curl -X POST http://localhost:8087/agent-management/agents/list \
 
 ```bash
 # 卸载 codex-acp
-curl -X POST http://localhost:8087/agent-management/agents/uninstall \
+curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user_123", "agent_id": "codex-acp"}'
-# → { "uninstalled": true, "install_type": "binary" }
+  -d '{"project_id": "p1", "agent_id": "codex-acp"}'
+# → { "uninstalled": true, "agent_id": "codex-acp", "install_type": "binary" }
 
 # 尝试卸载内置 Agent（被拒绝）
-curl -X POST http://localhost:8087/agent-management/agents/uninstall \
+curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user_123", "agent_id": "claude-code-acp-ts"}'
-# → { "code": "ERR_BUILTIN_AGENT", "message": "Cannot uninstall builtin agent",
+  -d '{"project_id": "p1", "agent_id": "claude-code-acp-ts"}'
+# → { "code": "ERR_AGENT_MGMT_BUILTIN_PROTECTED", "message": "Cannot uninstall builtin agent",
 #     "data": null, "success": false }
 ```
 
@@ -1358,18 +1318,21 @@ curl -X POST http://localhost:8087/agent-management/agents/uninstall \
 > - 简单 JSON 端点使用 `I18nJsonOrQuery` 提取器(优先 body JSON,兼容 `?project_id=xxx` query 调试)
 > - `install` 端点改用 `multipart/form-data`(字段 `file` + 字段 `metadata` JSON 字符串)
 > - 路径从 `/{id}` 改为 `/list` / `/get` / `/check` / `/uninstall` 等动词路径,语义更清晰
+> - **容器路由**：所有端点支持 `project_id`(向后兼容) 或 `user_id`/`pod_id` + 隔离字段(多租户)两种路由方式
 
 | 方法 | 路径 | Body | 转发到 |
 |------|------|------|--------|
-| POST | `/agent-mgmt/agents/list`             | `ListAgentsBody` JSON:`{project_id, include_builtin?}` | `AgentMgmtService.ListAgents` |
-| POST | `/agent-mgmt/agents/get`              | `GetAgentBody` JSON:`{project_id, agent_id}` | `AgentMgmtService.GetAgent` |
-| POST | `/agent-mgmt/agents/check`            | `CheckAgentBody` JSON:`{project_id, agent_id}` | `AgentMgmtService.CheckAgent` |
-| POST | `/agent-mgmt/default-agents/list`     | `ListDefaultAgentsBody` JSON:`{project_id}` | `AgentMgmtService.ListDefaultAgents` |
+| POST | `/agent-mgmt/agents/list`             | `ListAgentsBody` JSON:`{project_id?, include_builtin?, user_id?, pod_id?, ...}` | `AgentMgmtService.ListAgents` |
+| POST | `/agent-mgmt/agents/get`              | `GetAgentBody` JSON:`{project_id?, agent_id, user_id?, pod_id?, ...}` | `AgentMgmtService.GetAgent` |
+| POST | `/agent-mgmt/agents/check`            | `CheckAgentBody` JSON:`{project_id?, agent_id, user_id?, pod_id?, ...}` | `AgentMgmtService.CheckAgent` |
+| POST | `/agent-mgmt/default-agents/list`     | `ListDefaultAgentsBody` JSON:`{project_id?, user_id?, pod_id?, ...}` | `AgentMgmtService.ListDefaultAgents` |
 | POST | `/agent-mgmt/agents/install`          | `multipart/form-data`:`file`(binary) + `metadata`(JSON 字符串) | `AgentMgmtService.InstallAgent` (client streaming) |
-| POST | `/agent-mgmt/agents/install-from-url` | `InstallFromUrlHttpRequest` JSON:`{project_id, agent_id, command, args, url, sha256?}` | `AgentMgmtService.InstallAgent` (metadata only) |
-| POST | `/agent-mgmt/agents/install-from-npm` | `InstallFromPackageManagerHttpRequest` JSON:`{project_id, agent_id, command, package}` | `AgentMgmtService.InstallAgent` (metadata only) |
-| POST | `/agent-mgmt/agents/uninstall`        | `UninstallAgentBody` JSON:`{project_id, agent_id}` | `AgentMgmtService.UninstallAgent` |
-| POST | `/computer/chat`                      | `ComputerChatRequest` JSON | `AgentService.Chat` |
+| POST | `/agent-mgmt/agents/install-from-url` | `InstallFromUrlHttpRequest` JSON:`{project_id?, agent_id, command, url, args?, sha256?, user_id?, ...}` | `AgentMgmtService.InstallAgent` (metadata only) |
+| POST | `/agent-mgmt/agents/install-from-npm` | `InstallFromPackageManagerHttpRequest` JSON:`{project_id?, agent_id, command, package, user_id?, ...}` | `AgentMgmtService.InstallAgent` (metadata only) |
+| POST | `/agent-mgmt/agents/uninstall`        | `UninstallAgentBody` JSON:`{project_id?, agent_id, user_id?, pod_id?, ...}` | `AgentMgmtService.UninstallAgent` |
+
+> **`...`** 表示共享的 `ContainerRoutingParams` 字段：`user_id`, `pod_id`, `tenant_id`, `space_id`, `isolation_type`。
+> 所有端点的请求体都通过 `#[serde(flatten)]` 嵌入 `ContainerRoutingParams`，`project_id` 优先路由，无 `project_id` 时按 `pod_id`/`user_id` 定位容器。
 
 ---
 
@@ -1394,7 +1357,7 @@ curl -X POST http://localhost:8087/agent-management/agents/uninstall \
 | `ERR_AGENT_MGMT_INSTALL_FAILED` | 安装命令返回非零 | install, install-from-npm, install-from-url |
 | `ERR_AGENT_MGMT_UNINSTALL_FAILED` | 文件删除失败 | uninstall |
 | `ERR_AGENT_MGMT_CHECK_FAILED` | `which` 验证或版本检查失败 | check |
-| `ERR_AGENT_MGMT_BINARY_TOO_LARGE` | 二进制超过 500MB 限制 | install |
+| `ERR_AGENT_MGMT_BINARY_TOO_LARGE` | 二进制超过 1GB 限制 | install |
 | `ERR_AGENT_MGMT_UNSUPPORTED_TYPE` | 不支持的 install_type | install |
 | `ERR_AGENT_MGMT_BUILTIN_PROTECTED` | builtin 类型不允许卸载 | uninstall |
 | `ERR_AGENT_MGMT_STREAM_TRUNCATED` | client streaming 断流 | install |
@@ -1433,6 +1396,29 @@ curl -X POST http://localhost:8087/agent-management/agents/uninstall \
 ### A.1 请求/响应类型 (shared_types)
 
 文件路径: `crates/shared_types/src/agent_mgmt_types.rs`
+
+```rust
+/// 多租户容器路由参数（与 /computer/chat 保持一致）
+///
+/// 所有 `/agent-mgmt/*` 端点共享此参数，用于定位目标容器。
+/// - `project_id` 有值时: 按 project_id 查找（向后兼容）
+/// - `user_id` 或 `pod_id` 有值时: 按容器标识查找（多租户模式）
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ContainerRoutingParams {
+    /// 用户 ID（ComputerAgentRunner 模式，用于定位容器）
+    pub user_id: Option<String>,
+    /// 容器复用标识（有值时覆盖 user_id 作为容器标识）
+    pub pod_id: Option<String>,
+    /// 租户 ID（pod_id 有值时必填）
+    pub tenant_id: Option<String>,
+    /// 空间 ID（pod_id 有值时必填）
+    pub space_id: Option<String>,
+    /// 隔离类型：tenant / space / project（pod_id 有值时必填）
+    pub isolation_type: Option<String>,
+}
+```
+
+> 所有请求体结构通过 `#[serde(flatten)]` 嵌入 `ContainerRoutingParams`，`project_id` 作为独立字段与之并列。
 
 ```rust
 /// 默认安装目录常量
@@ -1752,27 +1738,34 @@ impl Default for AgentRegistry {
 文件路径: `crates/rcoder/src/router.rs`
 
 ```rust
-use crate::handler::agent_mgmt_handler as handler;
+use crate::handler;
+
+let install_route = Router::new()
+    .route(
+        "/agent-mgmt/agents/install",
+        post(handler::install_agent),
+    )
+    .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))  // 1GB
+    .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024 * 1024));
 
 let agent_mgmt_routes = Router::new()
-    // 查询类(POST + JSON body,使用 I18nJsonOrQuery 提取器)
+    // 查询类(POST + JSON body, 使用 I18nJsonOrQuery 提取器)
     .route("/agent-mgmt/agents/list",             post(handler::list_agents))
     .route("/agent-mgmt/agents/get",              post(handler::get_agent))
     .route("/agent-mgmt/agents/check",            post(handler::check_agent))
     .route("/agent-mgmt/default-agents/list",     post(handler::list_default_agents))
-    // 安装(三种模式,都走 POST)
-    .route(
-        "/agent-mgmt/agents/install",
-        post(handler::install_agent)
-            .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
-    )
+    // 安装(multipart, 1GB 限制)
+    .merge(install_route)
+    // 安装(URL 和 NPM, POST + JSON body)
     .route("/agent-mgmt/agents/install-from-url",  post(handler::install_from_url))
     .route("/agent-mgmt/agents/install-from-npm",  post(handler::install_from_npm))
     // 卸载(POST + body)
-    .route("/agent-mgmt/agents/uninstall",        post(handler::uninstall_agent));
+    .route("/agent-mgmt/agents/uninstall",        post(handler::uninstall_agent))
+    .with_state(state.clone());
 ```
 
 > `project_id` 优先从 body JSON 读取,也兼容 `?project_id=xxx` query(I18nJsonOrQuery 自动合并,JSON 优先)。
+> 所有端点都支持 `ContainerRoutingParams` 字段(user_id, pod_id, tenant_id, space_id, isolation_type)通过 `#[serde(flatten)]` 嵌入请求体。
 
 ### B.2 agent_runner 容器内路由(本地直起模式)
 
@@ -1798,20 +1791,24 @@ let agent_mgmt_routes = Router::new()
 
 ```
 外部 HTTP 客户端
-  │  GET /agent-mgmt/agents?project_id=P
+  │  POST /agent-mgmt/agents/list  { project_id: "P", include_builtin: true }
   ▼
 rcoder HTTP handler (handler/agent_mgmt_handler.rs)
-  │  1. resolve_project(state, project_id) → Arc<ProjectAndContainerInfo>
-  │  2. build_ctx(state) → AgentMgmtForwardCtx
-  │  3. fwd_list_agents(&ctx, &project, include_builtin)
+  │  1. validate_routing_params(&body.routing)
+  │  2. resolve_container_target(state, project_id, routing)
+  │     ├─ Path A: project_id 有值 → state.get_project(project_id)
+  │     ├─ Path B: user_id/pod_id → runtime.get_container_info_by_identifier()
+  │     └─ Path C: 都没有 → ERR_VALIDATION
+  │  3. build_ctx(state) → AgentMgmtForwardCtx
+  │  4. fwd_list_agents(&ctx, &project, include_builtin)
   ▼
 agent_mgmt_forward::list_agents
-  │  4. resolve_client(ctx, project)
+  │  5. resolve_client(ctx, project)
   │     ├─ get_realtime_container_ip(runtime, container_name, fallback_ip)
   │     │   → 实时查询容器 IP,失败回退 fallback_ip
   │     ├─ format!("{ip}:{GRPC_DEFAULT_PORT}")
   │     └─ pool.get_mgmt_client(addr) → AgentMgmtServiceClient<Channel>
-  │  5. client.list_agents(req)
+  │  6. client.list_agents(req)
   ▼
 gRPC over Docker internal network
   ▼
@@ -2096,7 +2093,7 @@ fn extract_and_place(
 
 1. 在解压目录根层查找名为 `{command}` 的文件
 2. 如果根层没有，递归查找第一个匹配 `{command}` 的可执行文件
-3. 如果仍找不到，返回 `ERR_ENTRY_NOT_FOUND` 错误
+3. 如果仍找不到，返回 `ERR_AGENT_MGMT_INVALID_MANIFEST` 错误
 
 ### D.3 PATH 管理实现
 
@@ -2122,7 +2119,7 @@ fi
 
 | 风险 | 防护措施 |
 |------|---------|
-| 上传恶意文件 | 限制文件大小 (500MB)；容器隔离不影响宿主机 |
+| 上传恶意文件 | 限制文件大小 (1GB)；容器隔离不影响宿主机 |
 | npm 包投毒 | 仅安装到容器内；容器重建后清空 |
 | PATH 注入 | command 名称验证（只允许字母、数字、连字符、下划线） |
 | 磁盘占满 | 安装前检查可用磁盘空间 (至少 1GB 可用) |
