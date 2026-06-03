@@ -863,6 +863,30 @@ impl PortProxy {
 
         // 重写 URI
         let new_uri = Self::rewrite_uri(original_uri, target_path)?;
+
+        // 注入 ttyd --url-arg：把 project_id 作为 --cwd 参数传给容器内 wrapper 脚本
+        // 容器内挂载: computer-project-workspace/{user_id} → /home/user
+        // 所以项目路径 = /home/user/{project_id}
+        let new_uri = if !project_id.is_empty()
+            && project_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            let cwd = std::path::Path::new("/home/user").join(project_id);
+            let uri_str = new_uri.to_string();
+            let separator = if uri_str.contains('?') { '&' } else { '?' };
+            let new_uri_str = format!(
+                "{}{}arg=--cwd&arg={}",
+                uri_str,
+                separator,
+                cwd.display()
+            );
+            new_uri_str.parse().map_err(|e| {
+                error!("URI rewrite with cwd failed: {}", e);
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+            })?
+        } else {
+            new_uri
+        };
+
         upstream_request.set_uri(new_uri);
 
         // 设置代理标识头
