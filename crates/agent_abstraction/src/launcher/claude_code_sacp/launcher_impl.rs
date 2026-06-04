@@ -36,7 +36,8 @@ use super::mcp::convert_context_servers_sacp;
 use super::process::take_stdio;
 use super::types::{
     ENV_AGENT_PROJECT_ID, ENV_AGENT_WORKING_DIR, ENV_ANTHROPIC_API_KEY, ENV_ANTHROPIC_BASE_URL,
-    ENV_CODEX_API_KEY, ENV_OPENAI_API_KEY, ENV_OPENAI_BASE_URL, SacpLauncherConnectionInfo,
+    ENV_CODEX_API_KEY, ENV_OPENAI_API_KEY, ENV_OPENAI_BASE_URL, ENV_OPENCODE_PERMISSION,
+    SacpLauncherConnectionInfo,
 };
 use crate::acp::CancelNotificationRequestWrapper;
 use crate::diagnostics::DiagnosticsListener;
@@ -282,9 +283,30 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         );
         merged_envs.insert(ENV_AGENT_PROJECT_ID.to_string(), project_id.clone());
 
-        // 🆕 当 agent_mode=ask 时，通过 ACP SetSessionModeRequest 设置（在 connection.rs 中处理）
-        // claude-code-acp-ts: "default" 模式
-        // 其他 agent: 使用默认行为
+        // 🆕 当 agent_mode=ask 时，设置子进程的权限模式
+        // nuwaxcode: 通过 OPENCODE_PERMISSION 环境变量覆盖危险工具为 "ask"
+        // claude-code-acp-ts: 通过 ACP SetSessionModeRequest 设置 "default" 模式（在 connection.rs 中处理）
+        if start_config.agent_mode == shared_types::AgentMode::Ask {
+            let cmd_lower = command_path.to_lowercase();
+            if cmd_lower.contains("nuwaxcode") || cmd_lower.contains("opencode") {
+                // nuwaxcode 使用 OPENCODE_PERMISSION 环境变量控制具体工具权限
+                // 覆盖危险工具（bash、edit）为 "ask"，触发 RequestPermissionRequest
+                // question 设为 "deny"，使用自定义 MCP 实现
+                let permission_config = serde_json::json!({
+                    "bash": "ask",
+                    "edit": "ask",
+                    "question": "deny"
+                });
+                merged_envs.insert(
+                    ENV_OPENCODE_PERMISSION.to_string(),
+                    permission_config.to_string(),
+                );
+                info!(
+                    "[SACP] 🔒 Agent mode=ask, setting OPENCODE_PERMISSION for nuwaxcode: {}",
+                    permission_config
+                );
+            }
+        }
 
         ensure_subprocess_path_env(&mut merged_envs);
 

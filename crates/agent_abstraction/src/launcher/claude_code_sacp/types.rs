@@ -31,6 +31,10 @@ pub(crate) const ENV_OPENCODE_MODEL: &str = "OPENCODE_MODEL";
 pub(crate) const ENV_CODEX_API_KEY: &str = "CODEX_API_KEY";
 pub(crate) const ENV_CODEX_BASE_URL: &str = "CODEX_BASE_URL";
 
+/// nuwaxcode 权限模式环境变量
+/// 当 agent_mode=ask 时，通过此环境变量覆盖 nuwaxcode 的默认权限配置
+pub(crate) const ENV_OPENCODE_PERMISSION: &str = "OPENCODE_PERMISSION";
+
 /// Agent 配置参数 (与旧版兼容)
 #[derive(Debug, Clone)]
 pub struct SacpAgentLaunchConfig {
