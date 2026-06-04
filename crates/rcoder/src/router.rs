@@ -611,6 +611,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             shared_types::AgentDetailInfo,
             shared_types::AgentInstallStatus,
             shared_types::InstallType,
+            shared_types::InstallAction,
+            shared_types::PlatformEntry,
             shared_types::ListAgentsRequest,
             shared_types::ListAgentsResponse,
             shared_types::CheckAgentRequest,

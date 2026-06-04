@@ -65,12 +65,18 @@ fn error_to_response(e: AgentMgmtError) -> Response {
 }
 
 /// 1. POST /agent-mgmt/agents/list
+///
+/// 列出容器内所有已安装(含内置)agent 的元信息。
 #[utoipa::path(
     post,
     path = "/agent-mgmt/agents/list",
+    operation_id = "list_agents",
+    summary = "列出已安装的 agent",
+    description = "查询 agent_runner 注册表,返回所有已安装(含内置)agent 的元信息列表。",
     request_body = ListAgentsRequest,
     responses(
-        (status = 200, description = "列出已安装 agent", body = HttpResult<shared_types::ListAgentsResponse>),
+        (status = 200, description = "查询成功", body = HttpResult<shared_types::ListAgentsResponse>),
+        (status = 500, description = "agent_runner 内部错误"),
     ),
     tag = "agent-mgmt"
 )]
@@ -259,12 +265,21 @@ pub async fn install_agent(
 }
 
 /// 3. POST /agent-mgmt/agents/install-from-url (多平台 + 版本管理)
+///
+/// 根据 `platforms` 映射自动选择匹配当前系统的下载 URL，
+/// 支持版本比较实现幂等安装（已安装则跳过）。
 #[utoipa::path(
     post,
     path = "/agent-mgmt/agents/install-from-url",
+    operation_id = "install_from_url",
+    summary = "从 URL 下载并安装 agent(多平台+版本管理)",
+    description = "根据 platforms 多平台 URL + version 版本号,agent-runner 自动判断是否需要下载安装(幂等)。platforms key 格式为 {os}-{arch},如 linux-x86_64、darwin-arm64。",
     request_body = shared_types::InstallFromUrlRequest,
     responses(
         (status = 200, description = "安装/更新/跳过", body = HttpResult<shared_types::InstallAgentResponse>),
+        (status = 400, description = "参数错误(agent_id/command/version/platforms 缺失或格式错误)"),
+        (status = 400, description = "agent-runner 业务错误(platform 不匹配、version 无效、下载失败等)"),
+        (status = 500, description = "agent_runner 内部错误"),
     ),
     tag = "agent-mgmt"
 )]
@@ -293,6 +308,15 @@ pub async fn install_from_url(
 }
 
 /// 4. POST /agent-mgmt/agents/install-from-npm
+#[utoipa::path(
+    post,
+    path = "/agent-mgmt/agents/install-from-npm",
+    request_body = shared_types::InstallFromPackageManagerRequest,
+    responses(
+        (status = 200, description = "安装成功", body = HttpResult<shared_types::InstallAgentResponse>),
+    ),
+    tag = "agent-mgmt"
+)]
 #[instrument(skip(state, req))]
 pub async fn install_from_npm(
     State(state): State<AgentMgmtHttpState>,
@@ -321,12 +345,21 @@ pub async fn install_from_npm(
 }
 
 /// 5. POST /agent-mgmt/agents/uninstall
+///
+/// 卸载 agent 并清理注册表。内置 agent 受保护，卸载返回 403。
 #[utoipa::path(
     post,
     path = "/agent-mgmt/agents/uninstall",
+    operation_id = "uninstall_agent",
+    summary = "卸载 agent",
+    description = "删除 agent 目录并清理注册表,内置 agent 受保护(返回 403)。",
     request_body = shared_types::UninstallAgentRequest,
     responses(
         (status = 200, description = "卸载成功", body = HttpResult<shared_types::UninstallAgentResponse>),
+        (status = 400, description = "参数错误(agent_id 缺失)"),
+        (status = 403, description = "内置 agent 受保护"),
+        (status = 404, description = "agent 不存在"),
+        (status = 500, description = "agent_runner 内部错误"),
     ),
     tag = "agent-mgmt"
 )]
@@ -349,12 +382,19 @@ pub async fn uninstall_agent(
 }
 
 /// 6. POST /agent-mgmt/agents/check
+///
+/// 检查指定 agent 的安装状态、文件完整性和版本信息。
 #[utoipa::path(
     post,
     path = "/agent-mgmt/agents/check",
+    operation_id = "check_agent",
+    summary = "检查 agent 健康状态",
+    description = "检查指定 agent 的安装状态、文件完整性(可执行权限/PATH)和版本信息。",
     request_body = shared_types::CheckAgentRequest,
     responses(
         (status = 200, description = "健康检查结果", body = HttpResult<shared_types::AgentDetailInfo>),
+        (status = 400, description = "参数错误(agent_id 缺失)"),
+        (status = 500, description = "agent_runner 内部错误"),
     ),
     tag = "agent-mgmt"
 )]
@@ -370,12 +410,19 @@ pub async fn check_agent(
 }
 
 /// 8. POST /agent-mgmt/agents/get
+///
+/// 按 agent_id 查询详情，未找到时返回 `data: null`（不视为错误）。
 #[utoipa::path(
     post,
     path = "/agent-mgmt/agents/get",
+    operation_id = "get_agent",
+    summary = "查询单个 agent 详情",
+    description = "按 agent_id 查询详情,未找到时 data 字段为 null(不视为错误)。",
     request_body = shared_types::GetAgentRequest,
     responses(
-        (status = 200, description = "agent 详情", body = HttpResult<Option<shared_types::AgentDetailInfo>>),
+        (status = 200, description = "查询成功;未找到时 data 为 null", body = HttpResult<Option<shared_types::AgentDetailInfo>>),
+        (status = 400, description = "参数错误(agent_id 缺失)"),
+        (status = 500, description = "agent_runner 内部错误"),
     ),
     tag = "agent-mgmt"
 )]

@@ -11,10 +11,28 @@ use utoipa::ToSchema;
 /// 所有 `/agent-mgmt/*` 端点共享此参数，用于定位目标容器。
 /// agent-runner 独立运行时忽略这些字段（`#[serde(default)]`）。
 /// rcoder 通过这些字段确定转发到哪个容器。
+///
+/// ## 路由模式
+///
+/// **模式 A: project_id（向后兼容）**
+/// ```json
+/// { "project_id": "demo-project-001" }
+/// ```
+///
+/// **模式 B: 多租户（pod_id + tenant/space）**
+/// ```json
+/// {
+///   "pod_id": "pod-abc123",
+///   "tenant_id": "tenant-001",
+///   "space_id": "space-001",
+///   "isolation_type": "tenant"
+/// }
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RoutingParams {
     /// 项目 ID（与 user_id/pod_id 二选一）
     #[serde(default)]
+    #[schema(example = "demo-project-001")]
     pub project_id: Option<String>,
     /// 用户 ID（ComputerAgentRunner 模式，定位容器）
     #[serde(default)]
@@ -188,20 +206,40 @@ pub struct AgentDetailInfo {
 }
 
 /// 检查指定 Agent 状态的请求
+///
+/// ## 示例
+///
+/// ```json
+/// {
+///   "project_id": "demo-project-001",
+///   "agent_id": "codex-acp"
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct CheckAgentRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
     /// Agent ID
+    #[schema(example = "codex-acp")]
     pub agent_id: String,
 }
 
 /// 查询单个 Agent 详情的请求
+///
+/// ## 示例
+///
+/// ```json
+/// {
+///   "project_id": "demo-project-001",
+///   "agent_id": "codex-acp"
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct GetAgentRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
     /// Agent ID
+    #[schema(example = "codex-acp")]
     pub agent_id: String,
 }
 
@@ -235,33 +273,98 @@ pub struct InstallBinaryRequest {
 ///
 /// agent-runner 独立运行时直接使用此类型（路由字段忽略）。
 /// rcoder 通过 `routing` 字段定位目标容器。
+///
+/// ## 多平台示例
+///
+/// ```json
+/// {
+///   "project_id": "demo-project-001",
+///   "agent_id": "codex-acp",
+///   "command": "codex-acp",
+///   "version": "1.2.0",
+///   "platforms": {
+///     "linux-x86_64": {
+///       "url": "https://cdn.example.com/releases/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz",
+///       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+///       "size": 52428800
+///     },
+///     "linux-arm64": {
+///       "url": "https://cdn.example.com/releases/codex-acp/1.2.0/codex-acp-linux-arm64.tar.gz",
+///       "sha256": "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+///       "size": 49283072
+///     },
+///     "darwin-arm64": {
+///       "url": "https://cdn.example.com/releases/codex-acp/1.2.0/codex-acp-darwin-arm64.tar.gz",
+///       "sha256": "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
+///       "size": 47185920
+///     },
+///     "windows-x86_64": {
+///       "url": "https://cdn.example.com/releases/codex-acp/1.2.0/codex-acp-windows-amd64.zip",
+///       "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+///       "size": 55574528
+///     }
+///   }
+/// }
+/// ```
+///
+/// ## 幂等行为
+///
+/// agent-runner 安装时自动判断:
+/// - 已安装版本 >= 请求版本 → 返回 `action: "skipped"`
+/// - 已安装版本 < 请求版本 → 下载更新,返回 `action: "updated"`
+/// - 首次安装 → 返回 `action: "installed"`
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct InstallFromUrlRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
-    /// Agent ID
+    /// Agent ID(容器内唯一标识,如 "codex-acp", "kimi-cli")
+    #[schema(example = "codex-acp")]
     pub agent_id: String,
-    /// 入口可执行文件名
+    /// 入口可执行文件名(安装后可直接调用的命令,如 "codex-acp")
+    #[schema(example = "codex-acp")]
     pub command: String,
-    /// 期望安装的版本号(semver,必填)
+    /// 期望安装的版本号(semver 格式,如 "1.2.0")
+    #[schema(example = "1.2.0")]
     pub version: String,
-    /// 平台 → 下载信息映射(必填,key 如 "linux-x86_64")
+    /// 多平台下载信息映射
+    ///
+    /// key 为 `{os}-{arch}` 格式(如 `linux-x86_64`, `darwin-arm64`),
+    /// value 包含该平台的下载 URL、SHA-256 校验和、文件大小。
+    /// agent-runner 根据容器系统自动选择匹配的平台。
     pub platforms: std::collections::HashMap<String, PlatformEntry>,
-    /// 启动参数
+    /// 启动参数(可选,传递给 agent 进程)
     #[serde(default)]
+    #[schema(example = json!(["--serve", "--port", "7091"]))]
     pub args: Vec<String>,
 }
 
 /// 包管理器安装 Agent 的请求
+///
+/// agent_runner 端调用 `npm install -g <package>` 全局安装，
+/// 适用于官方 npm 发布的 agent（如 `@anthropic-ai/claude-code-acp`）。
+///
+/// ## 示例
+///
+/// ```json
+/// {
+///   "project_id": "demo-project-001",
+///   "agent_id": "claude-code-acp",
+///   "package": "@anthropic-ai/claude-code-acp",
+///   "command": "claude-code-acp"
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct InstallFromPackageManagerRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
-    /// Agent ID
+    /// Agent ID(容器内唯一标识)
+    #[schema(example = "claude-code-acp")]
     pub agent_id: String,
-    /// npm 包名
+    /// npm 包名(含 scope,如 `@anthropic-ai/claude-code-acp`)
+    #[schema(example = "@anthropic-ai/claude-code-acp")]
     pub package: String,
-    /// 入口可执行文件名(必填)
+    /// 入口可执行文件名(一般是包名去掉 scope 后的命令名)
+    #[schema(example = "claude-code-acp")]
     pub command: String,
 }
 
@@ -303,15 +406,32 @@ pub struct InstallAgentResponse {
 }
 
 /// 平台下载信息(platforms map 的值)
+///
+/// 每个 `PlatformEntry` 描述特定 OS + CPU 架构组合的下载信息。
+/// 平台 key 格式为 `{os}-{arch}`，常见值:
+///
+/// | Key | OS | CPU 架构 | 说明 |
+/// |-----|-----|---------|------|
+/// | `linux-x86_64` | Linux | x86_64/AMD64 | 服务器主流 |
+/// | `linux-arm64` | Linux | ARM64/AArch64 | AWS Graviton、M1/M2 Docker |
+/// | `darwin-arm64` | macOS | ARM64/AArch64 | Apple Silicon (M1/M2/M3) |
+/// | `darwin-x86_64` | macOS | Intel | Intel Mac |
+/// | `windows-x86_64` | Windows | x86_64/AMD64 | Windows 桌面 |
+///
+/// 安装时 agent-runner 根据容器系统自动匹配 key，未匹配到则返回
+/// `ERR_AGENT_MGMT_PLATFORM_NOT_FOUND` 错误。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlatformEntry {
     /// 下载 URL(http/https)
+    #[schema(example = "https://cdn.example.com/agent-linux-amd64.tar.gz")]
     pub url: String,
-    /// SHA-256 校验和(hex,可选)
+    /// SHA-256 校验和(hex,可选,提供时安装后校验文件完整性)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")]
     pub sha256: Option<String>,
-    /// 文件大小(字节,用于磁盘空间预检查)
+    /// 文件大小(字节,可选,用于磁盘空间预检查)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 52428800)]
     pub size: Option<u64>,
 }
 
@@ -340,11 +460,26 @@ impl std::str::FromStr for InstallAction {
 }
 
 /// 卸载 Agent 的请求
+///
+/// ## 示例
+///
+/// ```json
+/// {
+///   "project_id": "demo-project-001",
+///   "agent_id": "codex-acp"
+/// }
+/// ```
+///
+/// ## 注意
+///
+/// 内置 agent（`default-agents` 列表中）受保护，卸载会返回
+/// `403 ERR_AGENT_MGMT_BUILTIN_PROTECTED`。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct UninstallAgentRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
-    /// Agent ID
+    /// Agent ID(要卸载的 agent 标识)
+    #[schema(example = "codex-acp")]
     pub agent_id: String,
 }
 

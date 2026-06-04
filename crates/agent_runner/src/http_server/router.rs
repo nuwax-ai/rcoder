@@ -192,6 +192,10 @@ fn create_swagger_ui() -> SwaggerUi {
         computer_progress::__path_handle_computer_progress,
         computer_status::__path_handle_computer_status, computer_stop::__path_handle_computer_stop,
         pod_count::__path_handle_pod_count,
+        agent_mgmt_handler::{
+            __path_list_agents, __path_get_agent, __path_check_agent,
+            __path_install_from_url, __path_install_from_npm, __path_uninstall_agent,
+        },
     };
 
     #[derive(OpenApi)]
@@ -207,6 +211,13 @@ fn create_swagger_ui() -> SwaggerUi {
             handle_pod_count,
             // 健康检查
             health_check,
+            // Agent Management 端点
+            list_agents,
+            get_agent,
+            check_agent,
+            install_from_url,
+            install_from_npm,
+            uninstall_agent,
         ),
         components(schemas(
             // Computer Agent 类型
@@ -230,12 +241,33 @@ fn create_swagger_ui() -> SwaggerUi {
             // Pod 管理类型
             shared_types::PodCountResponse,
             shared_types::PodCountByServiceType,
+            // Agent Management 类型
+            shared_types::RoutingParams,
+            shared_types::ListAgentsRequest,
+            shared_types::ListAgentsResponse,
+            shared_types::GetAgentRequest,
+            shared_types::CheckAgentRequest,
+            shared_types::CheckAgentResponse,
+            shared_types::InstallFromUrlRequest,
+            shared_types::InstallFromPackageManagerRequest,
+            shared_types::InstallAgentResponse,
+            shared_types::UninstallAgentRequest,
+            shared_types::UninstallAgentResponse,
+            shared_types::PlatformEntry,
+            shared_types::AgentInfo,
+            shared_types::AgentDetailInfo,
+            shared_types::InstallType,
+            shared_types::AgentInstallStatus,
+            shared_types::InstallAction,
+            shared_types::SystemInfo,
+            shared_types::StaticCheckResult,
         )),
         tags(
             (name = "Computer Agent", description = "Computer Agent HTTP API"),
             (name = "RCoder Agent", description = "RCoder Agent HTTP API"),
             (name = "pod", description = "Pod 容器管理接口"),
-            (name = "System", description = "系统管理接口")
+            (name = "system", description = "系统管理接口"),
+            (name = "agent-mgmt", description = "Agent 二进制安装/卸载/检查接口，支持多平台 URL 安装和版本管理"),
         )
     )]
     struct ApiDoc;
