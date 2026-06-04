@@ -282,6 +282,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         );
         merged_envs.insert(ENV_AGENT_PROJECT_ID.to_string(), project_id.clone());
 
+        // 🆕 当 agent_mode=ask 时，通过 ACP SetSessionModeRequest 设置（在 connection.rs 中处理）
+        // claude-code-acp-ts: "default" 模式
+        // 其他 agent: 使用默认行为
+
         ensure_subprocess_path_env(&mut merged_envs);
 
         // 🔍 调试：打印替换前的关键环境变量

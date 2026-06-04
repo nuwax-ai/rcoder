@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use agent_client_protocol::schema::{
     CancelNotification, InitializeRequest, LoadSessionRequest, McpServer, NewSessionRequest,
     PromptRequest, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionNotification,
+    SessionNotification, SetSessionModeRequest,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectionTo, Dispatch, Handled, JsonRpcMessage, Responder,
@@ -429,6 +429,44 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     "[SACP] ACP session ready, session_id={}",
                     session_id
                 );
+
+                // 🆕 当 agent_mode=ask 时，通过 ACP 协议设置 session mode
+                // 只对已知 agent 发送对应的 mode，未知 agent 不设置
+                if start_config.agent_mode == shared_types::AgentMode::Ask {
+                    let cmd_lower = command_line.to_lowercase();
+                    // 已知 agent 的 ask 模式映射
+                    let target_mode = if cmd_lower.contains("claude-code") {
+                        Some("default")  // claude-code-acp-ts: "default" 模式（危险操作需要审批）
+                    } else {
+                        None             // 其他 agent（含 nuwaxcode）: 使用默认行为
+                    };
+
+                    if let Some(mode) = target_mode {
+                        let set_mode_request = SetSessionModeRequest::new(
+                            session_id.clone(),
+                            mode,
+                        );
+                        match cx.send_request(set_mode_request).block_task().await {
+                            Ok(_) => {
+                                info!(
+                                    "[SACP] 🔒 Agent mode=ask, SetSessionModeRequest sent: session_id={}, mode={}",
+                                    session_id, mode
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[SACP] Failed to set session mode to {}: session_id={}, error={}",
+                                    mode, session_id, e
+                                );
+                            }
+                        }
+                    } else {
+                        info!(
+                            "[SACP] Agent mode=ask, no known mode mapping for agent: {}, using default behavior",
+                            command_line
+                        );
+                    }
+                }
 
                 // 发送会话 ID 到主任务
                 if session_id_tx.send(session_id.clone()).is_err() {

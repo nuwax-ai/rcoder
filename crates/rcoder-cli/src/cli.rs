@@ -108,17 +108,12 @@ impl CommonArgs {
     ///
     /// 支持 "yolo"（默认）和 "ask"。未知值打印警告并回退到 Yolo。
     pub fn agent_mode(&self) -> shared_types::AgentMode {
-        match self.mode.to_lowercase().as_str() {
-            "ask" => shared_types::AgentMode::Ask,
-            "yolo" => shared_types::AgentMode::Yolo,
-            other => {
-                eprintln!(
-                    "Warning: unknown agent mode '{}', falling back to 'yolo'",
-                    other
-                );
+        self.mode
+            .parse::<shared_types::AgentMode>()
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: {}, falling back to 'yolo'", e);
                 shared_types::AgentMode::Yolo
-            }
-        }
+            })
     }
 }
 

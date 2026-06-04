@@ -84,7 +84,16 @@ impl PermissionManager {
         let tool_call_id = input.tool_call_id.trim().to_string();
         let key = (session_id.clone(), tool_call_id.clone());
 
+        info!(
+            "[Permission] Resolving permission request: session_id={}, tool_call_id={}, cancelled={}, option_id={:?}",
+            session_id, tool_call_id, input.cancelled, input.option_id
+        );
+
         let Some(pending) = self.pending.lock().remove(&key) else {
+            warn!(
+                "[Permission] Permission request not found: session_id={}, tool_call_id={}",
+                session_id, tool_call_id
+            );
             return ResolvePermissionResponseDto {
                 success: false,
                 session_id,
@@ -216,30 +225,43 @@ impl PermissionManager {
 
         let outcome_json = serde_json::to_string(&response).ok();
         match pending.responder.respond(response) {
-            Ok(()) => ResolvePermissionResponseDto {
-                success: true,
-                session_id,
-                tool_call_id,
-                outcome_json,
-                rule_saved,
-                error_code: None,
-                message: None,
-            },
-            Err(err) => ResolvePermissionResponseDto {
-                success: false,
-                session_id,
-                tool_call_id,
-                outcome_json,
-                rule_saved,
-                error_code: Some(
-                    shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED.to_string(),
-                ),
-                message: Some(err.to_string()),
-            },
+            Ok(()) => {
+                info!(
+                    "[Permission] Permission resolved successfully: session_id={}, tool_call_id={}, rule_saved={}",
+                    session_id, tool_call_id, rule_saved
+                );
+                ResolvePermissionResponseDto {
+                    success: true,
+                    session_id,
+                    tool_call_id,
+                    outcome_json,
+                    rule_saved,
+                    error_code: None,
+                    message: None,
+                }
+            }
+            Err(err) => {
+                error!(
+                    "[Permission] Failed to respond to permission request: session_id={}, tool_call_id={}, error={}",
+                    session_id, tool_call_id, err
+                );
+                ResolvePermissionResponseDto {
+                    success: false,
+                    session_id,
+                    tool_call_id,
+                    outcome_json,
+                    rule_saved,
+                    error_code: Some(
+                        shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED.to_string(),
+                    ),
+                    message: Some(err.to_string()),
+                }
+            }
         }
     }
 
     pub fn cancel_session_permissions(&self, session_id: &str) -> usize {
+        info!("[Permission] Cancelling all pending permissions for session: {}", session_id);
         let keys: Vec<_> = self
             .pending
             .lock()
@@ -247,10 +269,13 @@ impl PermissionManager {
             .filter(|(key, _pending)| key.0 == session_id)
             .map(|(key, _pending)| key.clone())
             .collect();
-        self.cancel_keys(keys)
+        let count = self.cancel_keys(keys);
+        info!("[Permission] Cancelled {} pending permissions for session: {}", count, session_id);
+        count
     }
 
     pub fn cancel_project_permissions(&self, project_id: &str) -> usize {
+        info!("[Permission] Cancelling all pending permissions for project: {}", project_id);
         let keys: Vec<_> = self
             .pending
             .lock()
@@ -258,7 +283,9 @@ impl PermissionManager {
             .filter(|(_key, pending)| pending.context.project_id == project_id)
             .map(|(key, _pending)| key.clone())
             .collect();
-        self.cancel_keys(keys)
+        let count = self.cancel_keys(keys);
+        info!("[Permission] Cancelled {} pending permissions for project: {}", count, project_id);
+        count
     }
 
     fn cancel_keys(&self, keys: Vec<PendingKey>) -> usize {
@@ -406,6 +433,11 @@ impl PermissionRequestHandler for PermissionManager {
         let tool_name = extract_tool_name(&request);
         let command = extract_command(&request);
 
+        info!(
+            "[Permission] Received permission request: session_id={}, tool_call_id={}, tool={}, command={:?}, agent_mode={:?}",
+            session_id, tool_call_id, tool_name, command, context.agent_mode
+        );
+
         if is_dangerous_command(command.as_deref()) {
             info!(
                 "[Permission] dangerous command detected, will push to user for approval: session_id={}, tool_call_id={}, command={:?}",
@@ -428,6 +460,10 @@ impl PermissionRequestHandler for PermissionManager {
         }
 
         if context.agent_mode == AgentMode::Yolo {
+            info!(
+                "[Permission] Yolo mode, auto-approving: session_id={}, tool_call_id={}, tool={}",
+                session_id, tool_call_id, tool_name
+            );
             return respond_with_preferred_option(
                 &request,
                 responder,
@@ -437,6 +473,11 @@ impl PermissionRequestHandler for PermissionManager {
                 ],
             );
         }
+
+        info!(
+            "[Permission] Ask mode, pushing SSE to frontend: session_id={}, tool_call_id={}, tool={}",
+            session_id, tool_call_id, tool_name
+        );
 
         let save_rule = build_save_rule_suggestion(&tool_name, command.as_deref());
         let request_json = serde_json::to_value(&request).unwrap_or_else(|_| serde_json::json!({}));

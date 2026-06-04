@@ -6,6 +6,7 @@
 use crate::service_config::ServiceResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use utoipa::ToSchema;
 
 /// Agent permission approval mode.
@@ -36,6 +37,18 @@ impl AgentMode {
             .to_ascii_lowercase()
             .as_str()
         {
+            "yolo" => Ok(Self::Yolo),
+            "ask" => Ok(Self::Ask),
+            other => Err(format!("agent_mode must be yolo or ask, got: {other}")),
+        }
+    }
+}
+
+impl FromStr for AgentMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
             "yolo" => Ok(Self::Yolo),
             "ask" => Ok(Self::Ask),
             other => Err(format!("agent_mode must be yolo or ask, got: {other}")),
