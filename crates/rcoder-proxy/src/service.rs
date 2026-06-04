@@ -916,12 +916,14 @@ impl PortProxy {
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
         })?;
 
-        // 提取剩余路径
-        let remaining_path = params.get("path").unwrap_or("");
-        let target_path = if remaining_path.is_empty() {
+        // 从原始 URI 提取剩余路径（保留尾斜杠）
+        // 不使用 params.get("path")，因为它来自规范化后的 URI，尾斜杠已被去掉
+        let original_path = original_uri.path();
+        let prefix = format!("/proxy/{}", port);
+        let target_path = if original_path.len() <= prefix.len() {
             "/".to_string()
         } else {
-            format!("/{}", remaining_path)
+            original_path[prefix.len()..].to_string()
         };
 
         debug!(
