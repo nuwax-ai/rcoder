@@ -375,10 +375,6 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             "/agent-mgmt/agents/check",
             post(handler::check_agent),
         )
-        .route(
-            "/agent-mgmt/default-agents/list",
-            post(handler::list_default_agents),
-        )
         .merge(install_route)
         .route(
             "/agent-mgmt/agents/install-from-url",
@@ -521,7 +517,6 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::list_agents,
         handler::get_agent,
         handler::check_agent,
-        handler::list_default_agents,
         handler::install_agent,
         handler::install_from_url,
         handler::install_from_npm,
@@ -625,19 +620,11 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             shared_types::InstallAgentResponse,
             shared_types::UninstallAgentRequest,
             shared_types::UninstallAgentResponse,
-            shared_types::ListDefaultAgentsResponse,
-            shared_types::DefaultAgentInfo,
             shared_types::StaticCheckResult,
             shared_types::SystemInfo,
-            // P0-5: HTTP body 类型(独立于 gRPC proto,加 project_id 字段)
-            handler::ContainerRoutingParams,
-            handler::ListAgentsBody,
-            handler::GetAgentBody,
-            handler::CheckAgentBody,
-            handler::ListDefaultAgentsBody,
-            handler::UninstallAgentBody,
-            handler::InstallFromUrlHttpRequest,
-            handler::InstallFromPackageManagerHttpRequest,
+            shared_types::RoutingParams,
+            shared_types::GetAgentRequest,
+            // multipart 特有类型(rcoder 本地)
             handler::InstallMetadataBody,
             handler::InstallMultipartBody,
         )

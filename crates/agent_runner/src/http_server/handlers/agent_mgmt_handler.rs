@@ -1,10 +1,9 @@
 //! Agent Management HTTP Routes (P0-1)
 //!
-//! 8 个 HTTP 端点(全部 POST,与 rcoder 转发层保持一致):
+//! 7 个 HTTP 端点(全部 POST,与 rcoder 转发层保持一致):
 //! - POST /agent-mgmt/agents/list
 //! - POST /agent-mgmt/agents/get
 //! - POST /agent-mgmt/agents/check
-//! - POST /agent-mgmt/default-agents/list
 //! - POST /agent-mgmt/agents/install (binary streaming)
 //! - POST /agent-mgmt/agents/install-from-url
 //! - POST /agent-mgmt/agents/install-from-npm
@@ -55,9 +54,10 @@ fn error_to_response(e: AgentMgmtError) -> Response {
         ec::ERR_AGENT_MGMT_NOT_FOUND => StatusCode::NOT_FOUND,
         ec::ERR_AGENT_MGMT_ALREADY_INSTALLED => StatusCode::CONFLICT,
         ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED => StatusCode::FORBIDDEN,
-        ec::ERR_AGENT_MGMT_INVALID_MANIFEST | ec::ERR_AGENT_MGMT_INVALID_CHUNK => {
-            StatusCode::BAD_REQUEST
-        }
+        ec::ERR_AGENT_MGMT_INVALID_MANIFEST
+        | ec::ERR_AGENT_MGMT_INVALID_CHUNK
+        | ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND
+        | ec::ERR_AGENT_MGMT_INVALID_VERSION => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let result: HttpResult<()> = HttpResult::error(code, &e.to_string());
@@ -79,7 +79,7 @@ pub async fn list_agents(
     State(state): State<AgentMgmtHttpState>,
     Json(req): Json<ListAgentsRequest>,
 ) -> Response {
-    let manifests = state.registry.list(req.include_builtin);
+    let manifests = state.registry.list();
     let system_info = shared_types::SystemInfo::current();
     let agents: Vec<shared_types::AgentInfo> = manifests
         .iter()
@@ -149,14 +149,52 @@ pub async fn install_agent(
     let source_url = meta.get("source_url").and_then(|v| v.as_str()).map(String::from);
     let npm_package = meta.get("npm_package").and_then(|v| v.as_str()).map(String::from);
     let sha256 = meta.get("sha256").and_then(|v| v.as_str()).map(String::from);
+    let version = meta.get("version").and_then(|v| v.as_str()).map(String::from);
+    let meta_args: Vec<String> = meta
+        .get("args")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
 
     let result: AgentMgmtResult<shared_types_grpc::InstallAgentResponse> = match install_type {
         InstallType::Url => {
+            // 新模式: version + platforms → install_with_version_check
+            // metadata JSON 中 platforms 是嵌套对象(不是字符串)
+            let ver_opt = version.as_deref().filter(|s| !s.is_empty());
+            let plat_opt = meta.get("platforms").filter(|v| !v.is_null());
+            if let (Some(ver), Some(platforms_val)) = (ver_opt, plat_opt) {
+                let platforms: std::collections::HashMap<String, shared_types::PlatformEntry> =
+                    match serde_json::from_value(platforms_val.clone()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return error_to_response(AgentMgmtError::InvalidChunk(
+                                format!("invalid platforms field: {e}"),
+                            ));
+                        }
+                    };
+                if !platforms.is_empty() {
+                    return installer::url_installer::install_with_version_check(
+                        &state.registry,
+                        &state.path_manager,
+                        &agent_id,
+                        &command,
+                        &meta_args,
+                        ver,
+                        &platforms,
+                    )
+                    .await
+                    .map(|r| {
+                        let shared = conversion::install_response_to_shared(&r);
+                        Json(HttpResult::success(shared)).into_response()
+                    })
+                    .unwrap_or_else(error_to_response);
+                }
+            }
+            // 旧模式: 单个 source_url
             let url = match source_url {
                 Some(u) => u,
                 None => {
                     return error_to_response(AgentMgmtError::InvalidChunk(
-                        "URL install requires source_url".into(),
+                        "URL install requires source_url or platform_urls".into(),
                     ));
                 }
             };
@@ -166,7 +204,7 @@ pub async fn install_agent(
                 &agent_id,
                 &url,
                 &command,
-                &[],
+                &meta_args,
                 sha256.as_deref(),
             )
             .await
@@ -196,10 +234,12 @@ pub async fn install_agent(
                 installer::binary_installer::InstallBytesParams {
                     agent_id: &agent_id,
                     command: &command,
-                    args: &[],
+                    args: &meta_args,
                     expected_sha256: sha256.as_deref(),
                     install_type: InstallType::Binary,
                     bytes: body,
+                    version: None,
+                    source: None,
                 },
             )
             .await
@@ -218,13 +258,13 @@ pub async fn install_agent(
     }
 }
 
-/// 3. POST /agent-mgmt/agents/install-from-url
+/// 3. POST /agent-mgmt/agents/install-from-url (多平台 + 版本管理)
 #[utoipa::path(
     post,
     path = "/agent-mgmt/agents/install-from-url",
     request_body = shared_types::InstallFromUrlRequest,
     responses(
-        (status = 200, description = "安装成功", body = HttpResult<shared_types::InstallAgentResponse>),
+        (status = 200, description = "安装/更新/跳过", body = HttpResult<shared_types::InstallAgentResponse>),
     ),
     tag = "agent-mgmt"
 )]
@@ -233,23 +273,14 @@ pub async fn install_from_url(
     State(state): State<AgentMgmtHttpState>,
     Json(req): Json<shared_types::InstallFromUrlRequest>,
 ) -> Response {
-    // command 必填(URL 安装必须指定入口名)
-    let command = match req.command.as_deref() {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            return error_to_response(AgentMgmtError::InvalidManifest(
-                "command is required for URL install".into(),
-            ));
-        }
-    };
-    match installer::url_installer::install_from_url(
+    match installer::url_installer::install_with_version_check(
         &state.registry,
         &state.path_manager,
         &req.agent_id,
-        &req.url,
-        command,
+        &req.command,
         &req.args,
-        req.sha256.as_deref(),
+        &req.version,
+        &req.platforms,
     )
     .await
     {
@@ -267,21 +298,17 @@ pub async fn install_from_npm(
     State(state): State<AgentMgmtHttpState>,
     Json(req): Json<shared_types::InstallFromPackageManagerRequest>,
 ) -> Response {
-    // command 必填(npm 安装必须指定入口名)
-    let command = match req.command.as_deref() {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            return error_to_response(AgentMgmtError::InvalidManifest(
-                "command is required for NPM install".into(),
-            ));
-        }
-    };
+    if req.command.is_empty() {
+        return error_to_response(AgentMgmtError::InvalidManifest(
+            "command is required for NPM install".into(),
+        ));
+    }
     match installer::npm_installer::install_from_npm(
         &state.registry,
         &state.path_manager,
         &req.agent_id,
         &req.package,
-        command,
+        &req.command,
     )
     .await
     {
@@ -342,26 +369,11 @@ pub async fn check_agent(
     Json(HttpResult::success(detail)).into_response()
 }
 
-/// 7. POST /agent-mgmt/default-agents/list
-#[utoipa::path(
-    post,
-    path = "/agent-mgmt/default-agents/list",
-    responses(
-        (status = 200, description = "默认 agent 清单"),
-    ),
-    tag = "agent-mgmt"
-)]
-#[instrument(skip(_state))]
-pub async fn list_default_agents(State(_state): State<AgentMgmtHttpState>) -> Response {
-    let defaults = installer::default_agents::list_default_agents();
-    Json(HttpResult::success(defaults)).into_response()
-}
-
 /// 8. POST /agent-mgmt/agents/get
 #[utoipa::path(
     post,
     path = "/agent-mgmt/agents/get",
-    request_body = shared_types::CheckAgentRequest,
+    request_body = shared_types::GetAgentRequest,
     responses(
         (status = 200, description = "agent 详情", body = HttpResult<Option<shared_types::AgentDetailInfo>>),
     ),
@@ -370,7 +382,7 @@ pub async fn list_default_agents(State(_state): State<AgentMgmtHttpState>) -> Re
 #[instrument(skip(state))]
 pub async fn get_agent(
     State(state): State<AgentMgmtHttpState>,
-    Json(req): Json<shared_types::CheckAgentRequest>,
+    Json(req): Json<shared_types::GetAgentRequest>,
 ) -> Response {
     let manifest = state.registry.get(&req.agent_id);
     match manifest {

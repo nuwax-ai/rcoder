@@ -48,12 +48,12 @@ impl AgentRegistry {
         }
     }
 
-    /// 列出所有已安装 agent(可选择包含 builtin)
-    pub fn list(&self, include_builtin: bool) -> Vec<AgentManifest> {
+    /// 列出所有已安装 agent(不含 builtin)
+    pub fn list(&self) -> Vec<AgentManifest> {
         let guard = self.inner.lock();
         guard
             .values()
-            .filter(|m| include_builtin || m.install_type != InstallType::Builtin)
+            .filter(|m| m.install_type != InstallType::Builtin)
             .cloned()
             .collect()
     }
@@ -172,6 +172,44 @@ impl AgentRegistry {
     }
 }
 
+/// 语义化版本比较(major.minor.patch)
+///
+/// 格式不规范时返回 `Ordering::Less`(保守策略:触发更新)。
+/// 支持 "v1.2.3" 前缀,自动剥离。
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let parse = |s: &str| -> (u64, u64, u64) {
+        let s = s.trim().trim_start_matches('v').trim_start_matches('V');
+        let parts: Vec<&str> = s.split('.').collect();
+        let major = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+        let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+        (major, minor, patch)
+    };
+    let (a_major, a_minor, a_patch) = parse(a);
+    let (b_major, b_minor, b_patch) = parse(b);
+    match a_major.cmp(&b_major) {
+        Ordering::Equal => match a_minor.cmp(&b_minor) {
+            Ordering::Equal => a_patch.cmp(&b_patch),
+            other => other,
+        },
+        other => other,
+    }
+}
+
+/// 归一化平台 key: `{os}-{arch}` 格式
+///
+/// - `amd64 → x86_64`, `arm64 → aarch64`
+/// - OS 保持原样(linux, darwin, windows)
+pub fn normalize_platform_key(os: &str, arch: &str) -> String {
+    let normalized_arch = match arch {
+        "amd64" => "x86_64",
+        "arm64" => "aarch64",
+        other => other,
+    };
+    format!("{os}-{normalized_arch}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,10 +318,46 @@ mod tests {
         builtin.install_type = InstallType::Builtin;
         r.insert(builtin).unwrap();
 
-        let all = r.list(true);
-        let user_only = r.list(false);
-        assert_eq!(all.len(), 2);
+        let user_only = r.list();
         assert_eq!(user_only.len(), 1);
         assert_eq!(user_only[0].agent_id, "user-1");
+    }
+
+    #[test]
+    fn compare_versions_basic() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.0.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0", "1.0.1"), Ordering::Less);
+        assert_eq!(compare_versions("1.0.1", "1.0.0"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0", "2.0.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.2.3", "1.2.4"), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_versions_with_v_prefix() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("v1.0.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions("V2.0.0", "1.9.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_versions_malformed_defaults_to_less() {
+        use std::cmp::Ordering;
+        // 格式不规范时,缺失的 patch 默认为 0
+        assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0", "1.0.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn normalize_platform_key_amd64() {
+        assert_eq!(normalize_platform_key("linux", "amd64"), "linux-x86_64");
+        assert_eq!(normalize_platform_key("linux", "x86_64"), "linux-x86_64");
+    }
+
+    #[test]
+    fn normalize_platform_key_arm64() {
+        assert_eq!(normalize_platform_key("linux", "arm64"), "linux-aarch64");
+        assert_eq!(normalize_platform_key("linux", "aarch64"), "linux-aarch64");
+        assert_eq!(normalize_platform_key("darwin", "arm64"), "darwin-aarch64");
     }
 }

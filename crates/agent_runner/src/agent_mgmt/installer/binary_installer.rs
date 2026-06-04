@@ -52,6 +52,10 @@ pub struct InstallBytesParams<'a> {
     pub expected_sha256: Option<&'a str>,
     pub install_type: InstallType,
     pub bytes: Bytes,
+    /// 版本号(写入注册表,可选)
+    pub version: Option<&'a str>,
+    /// 源 URL(写入注册表,可选)
+    pub source: Option<&'a str>,
 }
 
 /// Streaming entry point. Drains the gRPC stream, accumulates the payload,
@@ -140,6 +144,8 @@ pub async fn install_from_stream(
             expected_sha256: expected_sha256.as_deref(),
             install_type: InstallType::Binary,
             bytes,
+            version: None,
+            source: None,
         },
     )
     .await
@@ -204,9 +210,29 @@ pub async fn install_from_prepared_stream(
             expected_sha256: metadata.expected_sha256.as_deref(),
             install_type: InstallType::Binary,
             bytes,
+            version: None,
+            source: None,
         },
     )
     .await
+}
+
+/// 文件路径安装参数（避免全量读入内存）
+///
+/// 用于 `install_from_file`，接受已下载好的文件路径。
+pub struct InstallFileParams<'a> {
+    pub agent_id: &'a str,
+    pub command: &'a str,
+    pub args: &'a [String],
+    pub install_type: InstallType,
+    /// 已下载的文件路径（会被 rename 到 staging 位置）
+    pub download_path: &'a Path,
+    /// 版本号(写入注册表,可选)
+    pub version: Option<&'a str>,
+    /// 源 URL(写入注册表,可选)
+    pub source: Option<&'a str>,
+    /// 文件大小(下载阶段已知,写入注册表)
+    pub file_size: u64,
 }
 
 /// Byte-based entry point. Testable without a gRPC stream.
@@ -222,6 +248,8 @@ pub async fn install_from_bytes(
         expected_sha256,
         install_type,
         bytes,
+        version: param_version,
+        source: param_source,
     } = params;
 
     crate::agent_mgmt::path_manager::validate_agent_id(agent_id)
@@ -257,15 +285,12 @@ pub async fn install_from_bytes(
         )));
     }
 
-    // 3. 放置到目标位置
+    // 3. 写入 staging 文件
     path_manager.ensure_dirs().await?;
-
-    // upsert 场景:清空旧的 agent_dir 防止残留文件累积
     if let Ok(agent_dir) = path_manager.agent_dir(agent_id)
         && agent_dir.exists() {
             tokio::fs::remove_dir_all(&agent_dir).await.ok();
         }
-
     let agent_dir = path_manager
         .agent_dir(agent_id)
         .map_err(AgentMgmtError::InvalidManifest)?;
@@ -278,12 +303,137 @@ pub async fn install_from_bytes(
     };
     let staging = agent_dir.join(format!("staging.{staging_ext}"));
     tokio::fs::write(&staging, &bytes).await?;
+    let file_size = bytes.len() as u64;
 
+    // 4. 共享解压/注册逻辑
+    _install_from_staging(
+        registry,
+        &staging,
+        &agent_dir,
+        agent_id,
+        command,
+        args,
+        install_type,
+        file_type,
+        file_size,
+        param_version,
+        param_source,
+    )
+    .await
+}
+
+/// 文件路径安装入口（避免全量读入内存）。
+///
+/// 适用于 URL 下载等已有磁盘文件的场景：
+/// 1. 读取前 4 字节 magic bytes 检测文件类型
+/// 2. `std::fs::metadata` 校验文件大小
+/// 3. rename 到 staging 位置（同文件系统零拷贝）
+/// 4. 调用共享解压/注册逻辑
+pub async fn install_from_file(
+    registry: &AgentRegistry,
+    path_manager: &PathManager,
+    params: InstallFileParams<'_>,
+) -> AgentMgmtResult<InstallAgentResponse> {
+    let InstallFileParams {
+        agent_id,
+        command,
+        args,
+        install_type,
+        download_path,
+        version: param_version,
+        source: param_source,
+        file_size,
+    } = params;
+
+    crate::agent_mgmt::path_manager::validate_agent_id(agent_id)
+        .map_err(AgentMgmtError::InvalidManifest)?;
+    crate::agent_mgmt::path_manager::validate_command(command)
+        .map_err(AgentMgmtError::InvalidManifest)?;
+
+    // 1. 文件大小校验（metadata 级别，不读入内存）
+    if file_size > shared_types::MAX_BINARY_SIZE {
+        return Err(AgentMgmtError::BinaryTooLarge {
+            size: file_size,
+            max: shared_types::MAX_BINARY_SIZE,
+        });
+    }
+
+    // 2. 读取前 4 字节 magic bytes 检测文件类型
+    let mut header = [0u8; 4];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(download_path).map_err(AgentMgmtError::Io)?;
+        f.read_exact(&mut header).map_err(AgentMgmtError::Io)?;
+    }
+    let file_type = detect_file_type(&header);
+    if file_type != "tar.gz" && file_type != "zip" {
+        return Err(AgentMgmtError::UnsupportedType(format!(
+            "only tar.gz and zip archives are supported, got: {file_type}"
+        )));
+    }
+
+    // 3. 准备 staging 目录 + rename 文件
+    path_manager.ensure_dirs().await?;
+    if let Ok(agent_dir) = path_manager.agent_dir(agent_id)
+        && agent_dir.exists() {
+            tokio::fs::remove_dir_all(&agent_dir).await.ok();
+        }
+    let agent_dir = path_manager
+        .agent_dir(agent_id)
+        .map_err(AgentMgmtError::InvalidManifest)?;
+    tokio::fs::create_dir_all(&agent_dir).await?;
+
+    let staging_ext = match file_type.as_str() {
+        "tar.gz" => "tar.gz",
+        "zip" => "zip",
+        other => unreachable!("file_type already validated, got: {other}"),
+    };
+    let staging = agent_dir.join(format!("staging.{staging_ext}"));
+    // rename（同文件系统零拷贝）或 copy（跨文件系统降级）
+    if tokio::fs::rename(download_path, &staging).await.is_err() {
+        tokio::fs::copy(download_path, &staging).await?;
+        let _ = tokio::fs::remove_file(download_path).await;
+    }
+
+    // 4. 共享解压/注册逻辑
+    _install_from_staging(
+        registry,
+        &staging,
+        &agent_dir,
+        agent_id,
+        command,
+        args,
+        install_type,
+        file_type,
+        file_size,
+        param_version,
+        param_source,
+    )
+    .await
+}
+
+/// 共享的 staging → 解压 → 注册逻辑。
+///
+/// 被 `install_from_bytes` 和 `install_from_file` 共同调用。
+/// staging 文件在解压完成后被清理。
+async fn _install_from_staging(
+    registry: &AgentRegistry,
+    staging: &Path,
+    agent_dir: &Path,
+    agent_id: &str,
+    command: &str,
+    args: &[String],
+    install_type: InstallType,
+    file_type: String,
+    file_size: u64,
+    param_version: Option<&str>,
+    param_source: Option<&str>,
+) -> AgentMgmtResult<InstallAgentResponse> {
     // 同步解压 + entrypoint 查找放到阻塞线程(避免 tar/zip IO 阻塞 tokio runtime)
     let command = command.to_string();
     let command_for_block = command.clone();
-    let agent_dir_clone = agent_dir.clone();
-    let staging_clone = staging.clone();
+    let agent_dir_clone = agent_dir.to_path_buf();
+    let staging_clone = staging.to_path_buf();
     let file_type_clone = file_type.clone();
     let (binary_path_str, file_count) = tokio::task::spawn_blocking(move || {
         let count = match file_type_clone.as_str() {
@@ -308,27 +458,27 @@ pub async fn install_from_bytes(
     .map_err(|e| AgentMgmtError::InstallFailed(format!("extraction task panicked: {e}")))??;
 
     // 清理 staging 文件(如果 spawn_blocking 没删干净)
-    tokio::fs::remove_file(&staging).await.ok();
+    tokio::fs::remove_file(staging).await.ok();
 
-    // 4. 注册到注册表
+    // 注册到注册表
     let manifest = AgentManifest {
         agent_id: agent_id.to_string(),
         install_type,
         command: command.clone(),
         args: args.to_vec(),
         binary_path: binary_path_str.clone(),
-        source: None,
-        version: None,
-        file_size: bytes.len() as u64,
+        source: param_source.map(String::from),
+        version: param_version.map(String::from),
+        file_size,
         file_type: file_type.clone(),
         installed_at: chrono::Utc::now().timestamp(),
     };
     manifest.validate()?;
-    registry.upsert(manifest.clone())?;
+    registry.upsert(manifest)?;
 
     info!(
         "[agent_mgmt] Installed binary: agent_id={}, command={}, file_type={}, size={}",
-        agent_id, command, file_type, bytes.len()
+        agent_id, command, file_type, file_size
     );
 
     Ok(InstallAgentResponse {
@@ -337,9 +487,13 @@ pub async fn install_from_bytes(
         binary_path: binary_path_str,
         file_type,
         file_count: Some(file_count as i32),
-        file_size: bytes.len() as i64,
-        version: None,
-        source_url: None,
+        file_size: file_size as i64,
+        version: param_version.map(String::from),
+        source_url: param_source.map(String::from),
+        action: "installed".to_string(),
+        installed: true,
+        previous_version: String::new(),
+        platform: String::new(),
     })
 }
 
@@ -441,6 +595,8 @@ mod tests {
                 expected_sha256: None,
                 install_type: InstallType::Binary,
                 bytes: Bytes::from_static(payload),
+                version: None,
+                source: None,
             },
         )
         .await
@@ -464,6 +620,8 @@ mod tests {
                 expected_sha256: None,
                 install_type: InstallType::Binary,
                 bytes: Bytes::from(payload),
+                version: None,
+                source: None,
             },
         )
         .await
@@ -502,6 +660,8 @@ mod tests {
                 expected_sha256: Some("0000000000000000000000000000000000000000000000000000000000000000"),
                 install_type: InstallType::Binary,
                 bytes: Bytes::from(payload),
+                version: None,
+                source: None,
             },
         )
         .await
@@ -531,6 +691,8 @@ mod tests {
                 expected_sha256: Some(&actual_sha),
                 install_type: InstallType::Binary,
                 bytes: Bytes::from(payload),
+                version: None,
+                source: None,
             },
         )
         .await
@@ -563,6 +725,8 @@ mod tests {
                 install_type: None,
                 source_url: None,
                 npm_package: None,
+                version: None,
+                platforms: None,
             }),
             data: first_data,
         };

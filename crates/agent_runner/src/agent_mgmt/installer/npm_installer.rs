@@ -155,6 +155,10 @@ pub async fn install_from_npm(
         file_size: 0,
         version,
         source_url: Some(package.to_string()),
+        action: "installed".to_string(),
+        installed: true,
+        previous_version: String::new(),
+        platform: String::new(),
     })
 }
 

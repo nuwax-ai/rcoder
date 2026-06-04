@@ -172,13 +172,12 @@ pub fn create_agent_mgmt_router(
 ) -> Router {
     use super::handlers::agent_mgmt_handler::{
         check_agent, get_agent, install_agent, install_from_npm, install_from_url, list_agents,
-        list_default_agents, uninstall_agent,
+        uninstall_agent,
     };
     Router::new()
         .route("/agent-mgmt/agents/list", post(list_agents))
         .route("/agent-mgmt/agents/get", post(get_agent))
         .route("/agent-mgmt/agents/check", post(check_agent))
-        .route("/agent-mgmt/default-agents/list", post(list_default_agents))
         .route("/agent-mgmt/agents/install", post(install_agent))
         .route("/agent-mgmt/agents/install-from-url", post(install_from_url))
         .route("/agent-mgmt/agents/install-from-npm", post(install_from_npm))

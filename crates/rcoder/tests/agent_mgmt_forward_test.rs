@@ -21,8 +21,7 @@ use shared_types::grpc::agent_mgmt_service_server::{
 use shared_types::grpc::{
     AgentInstallStatus, CheckAgentRequest, CheckAgentResponse, GetAgentRequest, GetAgentResponse,
     InstallAgentRequest, InstallAgentResponse, InstallType, ListAgentsRequest, ListAgentsResponse,
-    ListDefaultAgentsRequest, ListDefaultAgentsResponse, SystemInfo, UninstallAgentRequest,
-    UninstallAgentResponse,
+    SystemInfo, UninstallAgentRequest, UninstallAgentResponse,
 };
 use shared_types::{InstallType as SharedInstallType, error_codes as ec};
 use std::net::SocketAddr;
@@ -36,7 +35,7 @@ use tonic::{Request, Response, Status};
 use rcoder::grpc::GrpcChannelPool;
 use rcoder::handler::utils::{
     AgentMgmtForwardCtx, InstallAgentParams, check_agent, get_agent, install_agent, list_agents,
-    list_default_agents, uninstall_agent,
+    uninstall_agent,
 };
 use rcoder::handler::utils::status_to_app_error;
 
@@ -107,7 +106,6 @@ struct MockState {
     get_calls: usize,
     uninstall_calls: usize,
     check_calls: usize,
-    list_default_calls: usize,
     /// 模拟的 install_agent 错误返回(测试用)
     install_error: Option<String>,
 }
@@ -128,7 +126,6 @@ impl MockAgentMgmt {
             get_calls: s.get_calls,
             uninstall_calls: s.uninstall_calls,
             check_calls: s.check_calls,
-            list_default_calls: s.list_default_calls,
         }
     }
 
@@ -145,7 +142,6 @@ struct MockSnapshot {
     get_calls: usize,
     uninstall_calls: usize,
     check_calls: usize,
-    list_default_calls: usize,
 }
 
 #[async_trait]
@@ -220,6 +216,10 @@ impl AgentMgmtService for MockAgentMgmt {
             file_size: total_data as i64,
             version: Some("0.1.0".into()),
             source_url: None,
+            action: "installed".into(),
+            installed: true,
+            previous_version: String::new(),
+            platform: String::new(),
         }))
     }
 
@@ -241,14 +241,6 @@ impl AgentMgmtService for MockAgentMgmt {
     ) -> Result<Response<CheckAgentResponse>, Status> {
         self.state.lock().unwrap().check_calls += 1;
         Ok(Response::new(CheckAgentResponse::default()))
-    }
-
-    async fn list_default_agents(
-        &self,
-        _req: Request<ListDefaultAgentsRequest>,
-    ) -> Result<Response<ListDefaultAgentsResponse>, Status> {
-        self.state.lock().unwrap().list_default_calls += 1;
-        Ok(Response::new(ListDefaultAgentsResponse::default()))
     }
 
     async fn get_agent(
@@ -355,6 +347,8 @@ async fn install_agent_streams_chunks_to_mock_server() {
         source_url: None,
         npm_package: None,
         sha256: Some("deadbeef".to_string()),
+        version: None,
+        platforms: None,
     };
 
     let resp = install_agent(&ctx, &project, params, body)
@@ -399,6 +393,8 @@ async fn install_agent_url_mode_uses_single_metadata_chunk() {
         source_url: Some("https://example.com/agent.tar.gz".to_string()),
         npm_package: None,
         sha256: None,
+        version: None,
+        platforms: None,
     };
     let resp = install_agent(&ctx, &project, params, Bytes::new())
         .await
@@ -422,7 +418,7 @@ async fn list_agents_returns_parsed_response() {
     let ctx = make_ctx(addr);
     let project = make_project(addr);
 
-    let resp = list_agents(&ctx, &project, true).await.expect("list_agents ok");
+    let resp = list_agents(&ctx, &project).await.expect("list_agents ok");
     assert_eq!(resp.total, 1);
     assert_eq!(resp.agents.len(), 1);
     assert_eq!(resp.agents[0].agent_id, "codex-acp");
@@ -483,20 +479,6 @@ async fn check_agent_forwards_request() {
     assert_eq!(snap.check_calls, 1);
 }
 
-#[tokio::test]
-async fn list_default_agents_forwards_request() {
-    let (addr, mock, _server) = start_mock_server().await;
-    let ctx = make_ctx(addr);
-    let project = make_project(addr);
-
-    let resp = list_default_agents(&ctx, &project)
-        .await
-        .expect("list_default_agents ok");
-    assert_eq!(resp.default_agents.len(), 0);
-    let snap = mock.snapshot();
-    assert_eq!(snap.list_default_calls, 1);
-}
-
 /// gRPC `Status` 携带业务码前缀时,`status_to_app_error` 应当还原为对应业务错误。
 #[tokio::test]
 async fn business_code_in_status_propagates_as_app_error() {
@@ -514,6 +496,8 @@ async fn business_code_in_status_propagates_as_app_error() {
         source_url: None,
         npm_package: None,
         sha256: None,
+        version: None,
+        platforms: None,
     };
     let err = install_agent(&ctx, &project, params, Bytes::new())
         .await

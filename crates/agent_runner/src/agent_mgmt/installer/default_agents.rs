@@ -10,23 +10,13 @@
 //! - 已注册(`registry.contains(...)`)则跳过
 //! - npm 不可用 / 网络失败时记 warn,不返回错误
 
-use shared_types::{DefaultAgentInfo, InstallType};
+use shared_types::InstallType;
 use tracing::{info, warn};
 
 use super::npm_installer;
 use crate::agent_mgmt::error::AgentMgmtResult;
 use crate::agent_mgmt::path_manager::PathManager;
 use crate::agent_mgmt::registry::AgentRegistry;
-
-/// 内置 agent 静态清单
-pub fn list_default_agents() -> Vec<DefaultAgentInfo> {
-    vec![DefaultAgentInfo {
-        agent_id: "claude-code-acp".into(),
-        display_name: "Claude Code ACP".into(),
-        description: "Anthropic 官方 Claude Code ACP 适配器(通过 npm 全局安装)".into(),
-        install_type: InstallType::Npm,
-    }]
-}
 
 /// 内置 agent 配套元数据(供 install 时使用)
 #[derive(Debug, Clone)]

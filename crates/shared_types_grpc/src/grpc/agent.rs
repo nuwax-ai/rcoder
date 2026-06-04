@@ -554,10 +554,7 @@ pub struct AgentDetailInfo {
     pub static_checks: ::core::option::Option<StaticCheckResult>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ListAgentsRequest {
-    #[prost(bool, tag = "1")]
-    pub include_builtin: bool,
-}
+pub struct ListAgentsRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListAgentsResponse {
     #[prost(message, optional, tag = "1")]
@@ -593,24 +590,6 @@ pub struct GetAgentResponse {
     /// 仅当 found=true 有效
     #[prost(message, optional, tag = "2")]
     pub agent: ::core::option::Option<AgentDetailInfo>,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ListDefaultAgentsRequest {}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListDefaultAgentsResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub default_agents: ::prost::alloc::vec::Vec<DefaultAgentInfo>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct DefaultAgentInfo {
-    #[prost(string, tag = "1")]
-    pub agent_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub display_name: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub description: ::prost::alloc::string::String,
-    #[prost(enumeration = "InstallType", tag = "4")]
-    pub install_type: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UninstallAgentRequest {
@@ -661,6 +640,14 @@ pub mod install_agent_request {
         /// NPM 安装时必填(@scope/name)
         #[prost(string, optional, tag = "7")]
         pub npm_package: ::core::option::Option<::prost::alloc::string::String>,
+        /// === 多平台版本管理(install-from-url 新模式) ===
+        ///
+        /// 期望安装的版本号(semver)
+        #[prost(string, optional, tag = "8")]
+        pub version: ::core::option::Option<::prost::alloc::string::String>,
+        /// HashMap\<String, PlatformEntry> 的 JSON 序列化(字符串)
+        #[prost(string, optional, tag = "9")]
+        pub platforms: ::core::option::Option<::prost::alloc::string::String>,
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -681,6 +668,20 @@ pub struct InstallAgentResponse {
     pub version: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "8")]
     pub source_url: ::core::option::Option<::prost::alloc::string::String>,
+    /// === 多平台版本管理响应字段 ===
+    ///
+    /// "installed" / "updated" / "skipped"
+    #[prost(string, tag = "20")]
+    pub action: ::prost::alloc::string::String,
+    /// 本次是否实际安装
+    #[prost(bool, tag = "21")]
+    pub installed: bool,
+    /// 更新前版本(首次安装为空)
+    #[prost(string, tag = "22")]
+    pub previous_version: ::prost::alloc::string::String,
+    /// 实际匹配的平台 key(如 "linux-x86_64")
+    #[prost(string, tag = "23")]
+    pub platform: ::prost::alloc::string::String,
 }
 /// 取消结果类型（对应 Rust CancelResult）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -1864,31 +1865,6 @@ pub mod agent_mgmt_service_client {
                 .insert(GrpcMethod::new("agent.AgentMgmtService", "CheckAgent"));
             self.inner.unary(req, path, codec).await
         }
-        /// 列出默认 agent(由镜像提供,内置注册)
-        pub async fn list_default_agents(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ListDefaultAgentsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ListDefaultAgentsResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/agent.AgentMgmtService/ListDefaultAgents",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("agent.AgentMgmtService", "ListDefaultAgents"));
-            self.inner.unary(req, path, codec).await
-        }
         /// 查询单个 agent 详情(快速)
         pub async fn get_agent(
             &mut self,
@@ -1959,14 +1935,6 @@ pub mod agent_mgmt_service_server {
             request: tonic::Request<super::CheckAgentRequest>,
         ) -> std::result::Result<
             tonic::Response<super::CheckAgentResponse>,
-            tonic::Status,
-        >;
-        /// 列出默认 agent(由镜像提供,内置注册)
-        async fn list_default_agents(
-            &self,
-            request: tonic::Request<super::ListDefaultAgentsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ListDefaultAgentsResponse>,
             tonic::Status,
         >;
         /// 查询单个 agent 详情(快速)
@@ -2227,55 +2195,6 @@ pub mod agent_mgmt_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CheckAgentSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/agent.AgentMgmtService/ListDefaultAgents" => {
-                    #[allow(non_camel_case_types)]
-                    struct ListDefaultAgentsSvc<T: AgentMgmtService>(pub Arc<T>);
-                    impl<
-                        T: AgentMgmtService,
-                    > tonic::server::UnaryService<super::ListDefaultAgentsRequest>
-                    for ListDefaultAgentsSvc<T> {
-                        type Response = super::ListDefaultAgentsResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ListDefaultAgentsRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as AgentMgmtService>::list_default_agents(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ListDefaultAgentsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

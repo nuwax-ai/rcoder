@@ -6,6 +6,33 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// 多租户容器路由参数
+///
+/// 所有 `/agent-mgmt/*` 端点共享此参数，用于定位目标容器。
+/// agent-runner 独立运行时忽略这些字段（`#[serde(default)]`）。
+/// rcoder 通过这些字段确定转发到哪个容器。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct RoutingParams {
+    /// 项目 ID（与 user_id/pod_id 二选一）
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// 用户 ID（ComputerAgentRunner 模式，定位容器）
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// 容器复用标识（有值时覆盖 user_id 作为容器标识）
+    #[serde(default)]
+    pub pod_id: Option<String>,
+    /// 租户 ID（pod_id 有值时必填，同时接受字符串和数字）
+    #[serde(default, deserialize_with = "crate::flexible_string::flexible_string")]
+    pub tenant_id: Option<String>,
+    /// 空间 ID（pod_id 有值时必填，同时接受字符串和数字）
+    #[serde(default, deserialize_with = "crate::flexible_string::flexible_string")]
+    pub space_id: Option<String>,
+    /// 隔离类型：tenant / space / project（pod_id 有值时必填）
+    #[serde(default)]
+    pub isolation_type: Option<String>,
+}
+
 /// 默认安装目录常量
 pub const DEFAULT_ACP_AGENT_INSTALL_DIR: &str = "/home/user/acp-agent";
 
@@ -112,13 +139,8 @@ pub struct AgentInfo {
 /// 列出已安装 Agent 的请求
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct ListAgentsRequest {
-    /// 是否包含内置 agent(默认 true)
-    #[serde(default = "default_true")]
-    pub include_builtin: bool,
-}
-
-fn default_true() -> bool {
-    true
+    #[serde(flatten)]
+    pub routing: RoutingParams,
 }
 
 /// 列出已安装 Agent 的响应
@@ -166,8 +188,19 @@ pub struct AgentDetailInfo {
 }
 
 /// 检查指定 Agent 状态的请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct CheckAgentRequest {
+    #[serde(flatten)]
+    pub routing: RoutingParams,
+    /// Agent ID
+    pub agent_id: String,
+}
+
+/// 查询单个 Agent 详情的请求
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct GetAgentRequest {
+    #[serde(flatten)]
+    pub routing: RoutingParams,
     /// Agent ID
     pub agent_id: String,
 }
@@ -198,37 +231,38 @@ pub struct InstallBinaryRequest {
     pub sha256: Option<String>,
 }
 
-/// URL 安装 Agent 的请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// URL 安装 Agent 的请求(多平台 + 版本管理)
+///
+/// agent-runner 独立运行时直接使用此类型（路由字段忽略）。
+/// rcoder 通过 `routing` 字段定位目标容器。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct InstallFromUrlRequest {
-    /// 下载 URL(http/https)
-    pub url: String,
+    #[serde(flatten)]
+    pub routing: RoutingParams,
     /// Agent ID
     pub agent_id: String,
     /// 入口可执行文件名
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
+    pub command: String,
+    /// 期望安装的版本号(semver,必填)
+    pub version: String,
+    /// 平台 → 下载信息映射(必填,key 如 "linux-x86_64")
+    pub platforms: std::collections::HashMap<String, PlatformEntry>,
     /// 启动参数
     #[serde(default)]
     pub args: Vec<String>,
-    /// 校验和(SHA256,hex)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
 }
 
 /// 包管理器安装 Agent 的请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct InstallFromPackageManagerRequest {
+    #[serde(flatten)]
+    pub routing: RoutingParams,
     /// Agent ID
     pub agent_id: String,
     /// npm 包名
     pub package: String,
-    /// 版本约束(可选,缺省 latest)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    /// 入口命令(可选,缺省用包名)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
+    /// 入口可执行文件名(必填)
+    pub command: String,
 }
 
 /// 安装响应(上传/URL/npm 通用)
@@ -253,11 +287,63 @@ pub struct InstallAgentResponse {
     /// 源 URL(URL 安装时)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    // === 多平台版本管理字段 ===
+    /// 本次操作类型
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<InstallAction>,
+    /// 本次是否实际执行了下载安装
+    #[serde(default)]
+    pub installed: bool,
+    /// 更新前的版本号(首次安装为 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    /// 实际匹配的平台 key(如 "linux-x86_64")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
+/// 平台下载信息(platforms map 的值)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlatformEntry {
+    /// 下载 URL(http/https)
+    pub url: String,
+    /// SHA-256 校验和(hex,可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// 文件大小(字节,用于磁盘空间预检查)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// 安装操作类型
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallAction {
+    /// 首次安装
+    Installed,
+    /// 从旧版本升级
+    Updated,
+    /// 跳过(已安装版本 >= 请求版本)
+    Skipped,
+}
+
+impl std::str::FromStr for InstallAction {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "installed" => Ok(Self::Installed),
+            "updated" => Ok(Self::Updated),
+            "skipped" => Ok(Self::Skipped),
+            other => Err(format!("unknown InstallAction: {other:?}")),
+        }
+    }
 }
 
 /// 卸载 Agent 的请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct UninstallAgentRequest {
+    #[serde(flatten)]
+    pub routing: RoutingParams,
     /// Agent ID
     pub agent_id: String,
 }
@@ -273,25 +359,6 @@ pub struct UninstallAgentResponse {
     pub agent_id: String,
 }
 
-/// 列出默认 Agent 的响应
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListDefaultAgentsResponse {
-    /// 默认 agent 列表
-    pub default_agents: Vec<DefaultAgentInfo>,
-}
-
-/// 默认 Agent 信息
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DefaultAgentInfo {
-    /// Agent ID
-    pub agent_id: String,
-    /// 显示名
-    pub display_name: String,
-    /// 描述
-    pub description: String,
-    /// 安装类型
-    pub install_type: InstallType,
-}
 
 #[cfg(test)]
 mod tests {

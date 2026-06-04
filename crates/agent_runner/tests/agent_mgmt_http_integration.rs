@@ -1,15 +1,14 @@
 //! Agent Management HTTP 路由集成测试 (P0-1g)
 //!
 //! 直接构建 `agent_mgmt` 子路由,用 `tower::ServiceExt::oneshot` 发送请求,
-//! 验证 8 个端点的行为(全部 POST,与 rcoder 转发层保持一致):
+//! 验证 7 个端点的行为(全部 POST,与 rcoder 转发层保持一致):
 //! 1. POST /agent-mgmt/agents/list
 //! 2. POST /agent-mgmt/agents/install      - 二进制上传
 //! 3. POST /agent-mgmt/agents/install-from-url
 //! 4. POST /agent-mgmt/agents/install-from-npm
 //! 5. POST /agent-mgmt/agents/uninstall
 //! 6. POST /agent-mgmt/agents/check
-//! 7. POST /agent-mgmt/default-agents/list
-//! 8. POST /agent-mgmt/agents/get
+//! 7. POST /agent-mgmt/agents/get
 //!
 //! 安全相关:path traversal / zip bomb / unsafe URL scheme 都验证拒绝路径
 
@@ -104,7 +103,7 @@ async fn list_agents_empty_registry() {
     let (state, _tmp) = build_state();
     let router = create_agent_mgmt_router(state);
 
-    let body = serde_json::json!({"include_builtin": true});
+    let body = serde_json::json!({});
     let req = Request::builder()
         .method("POST")
         .uri("/agent-mgmt/agents/list")
@@ -139,7 +138,7 @@ async fn list_agents_with_registered_agent() {
         .unwrap();
 
     let router = create_agent_mgmt_router(state);
-    let body = serde_json::json!({"include_builtin": true});
+    let body = serde_json::json!({});
     let req = Request::builder()
         .method("POST")
         .uri("/agent-mgmt/agents/list")
@@ -259,7 +258,8 @@ async fn install_from_url_rejects_non_http_scheme() {
     let body = serde_json::json!({
         "agent_id": "evil",
         "command": "evil",
-        "url": "file:///etc/passwd"
+        "version": "1.0.0",
+        "platforms": {"linux-x86_64": {"url": "file:///etc/passwd"}}
     });
     let req = Request::builder()
         .method("POST")
@@ -281,7 +281,8 @@ async fn install_from_url_rejects_empty_command() {
     let body = serde_json::json!({
         "agent_id": "x",
         "command": "",
-        "url": "https://example.com/agent"
+        "version": "1.0.0",
+        "platforms": {"linux-x86_64": {"url": "https://example.com/agent"}}
     });
     let req = Request::builder()
         .method("POST")
@@ -436,32 +437,7 @@ async fn check_returns_not_found_for_unknown() {
 }
 
 // ============================================================================
-// 7. POST /agent-mgmt/default-agents/list
-// ============================================================================
-
-#[tokio::test]
-async fn list_default_agents_succeeds() {
-    let (state, _tmp) = build_state();
-    let router = create_agent_mgmt_router(state);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent-mgmt/default-agents/list")
-        .body(Body::empty())
-        .unwrap();
-    let (status, json, _) = send(router, req).await;
-
-    assert_eq!(status, StatusCode::OK);
-    // data 是 Vec<DefaultAgentInfo> 直接序列化后的数组
-    let defaults = json["data"].as_array().expect("data should be array");
-    assert!(!defaults.is_empty(), "should have at least one default");
-    // 至少有一个 claude-code-acp
-    let has_claude = defaults.iter().any(|a| a["agent_id"] == "claude-code-acp");
-    assert!(has_claude, "expected claude-code-acp in defaults");
-}
-
-// ============================================================================
-// 8. POST /agent-mgmt/agents/get
+// 7. POST /agent-mgmt/agents/get
 // ============================================================================
 
 #[tokio::test]

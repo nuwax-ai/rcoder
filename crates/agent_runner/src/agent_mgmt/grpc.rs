@@ -1,11 +1,10 @@
 //! gRPC AgentMgmtService 实现 (P0-1)
 //!
-//! 6 个 RPC:
-//! - `ListAgents` — 列出已安装 agent
+//! 5 个 RPC:
+//! - `ListAgents` — 列出已安装 agent(不含内置)
 //! - `InstallAgent` — client streaming 上传二进制
 //! - `UninstallAgent` — 卸载
 //! - `CheckAgent` — 健康检查
-//! - `ListDefaultAgents` — 列出内置清单
 //! - `GetAgent` — 查询单个 agent
 //!
 //! 错误:内部 `AgentMgmtError` 通过 `error_code()` 映射为业务错误码,转 `tonic::Status::internal(code, msg)`
@@ -16,9 +15,9 @@ use bytes::Bytes;
 use shared_types_grpc::{
     agent_mgmt_service_server::AgentMgmtService,
     AgentDetailInfo as ProtoAgentDetailInfo, AgentInfo as ProtoAgentInfo,
-    CheckAgentRequest, CheckAgentResponse, DefaultAgentInfo as ProtoDefaultAgentInfo,
+    CheckAgentRequest, CheckAgentResponse,
     GetAgentRequest, GetAgentResponse, InstallAgentRequest, InstallAgentResponse,
-    ListAgentsRequest, ListAgentsResponse, ListDefaultAgentsRequest, ListDefaultAgentsResponse,
+    ListAgentsRequest, ListAgentsResponse,
     StaticCheckResult, UninstallAgentRequest, UninstallAgentResponse,
 };
 use tonic::{Request, Response, Status};
@@ -30,7 +29,7 @@ use super::checker::AgentChecker;
 use super::conversion;
 use super::error::AgentMgmtError;
 use super::installer::{
-    binary_installer, default_agents, npm_installer, url_installer,
+    binary_installer, npm_installer, url_installer,
 };
 use super::path_manager::PathManager;
 use super::registry::AgentRegistry;
@@ -76,14 +75,12 @@ impl AgentMgmtServiceImpl {
 
 #[tonic::async_trait]
 impl AgentMgmtService for AgentMgmtServiceImpl {
-    #[instrument(skip(self, request))]
+    #[instrument(skip(self, _request))]
     async fn list_agents(
         &self,
-        request: Request<ListAgentsRequest>,
+        _request: Request<ListAgentsRequest>,
     ) -> Result<Response<ListAgentsResponse>, Status> {
-        let req = request.into_inner();
-        let include_builtin = req.include_builtin;
-        let manifests = self.registry.list(include_builtin);
+        let manifests = self.registry.list();
 
         let system_info = conversion::system_info_to_proto(&shared_types::SystemInfo::current());
         let agents: Vec<ProtoAgentInfo> = manifests
@@ -131,6 +128,8 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
             install_type: install_type_opt,
             source_url,
             npm_package,
+            version,
+            platforms,
         } = metadata;
 
         let agent_id = agent_id.ok_or_else(|| {
@@ -152,11 +151,37 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
         // 分发
         let result: AgentMgmtResult<InstallAgentResponse> = match install_type {
             shared_types::InstallType::Url => {
+                // 新模式: version + platforms → install_with_version_check
+                let ver_opt = version.as_deref().filter(|s| !s.is_empty());
+                let json_opt = platforms.as_deref().filter(|s| !s.is_empty());
+                if let (Some(ver), Some(json)) = (ver_opt, json_opt) {
+                        let platforms: std::collections::HashMap<String, shared_types::PlatformEntry> =
+                            serde_json::from_str(json).map_err(|e| {
+                                Self::to_status(AgentMgmtError::InvalidChunk(
+                                    format!("invalid platforms JSON: {e}"),
+                                ))
+                            })?;
+                        if !platforms.is_empty() {
+                            return url_installer::install_with_version_check(
+                                &self.registry,
+                                &self.path_manager,
+                                &agent_id,
+                                &command,
+                                &args,
+                                ver,
+                                &platforms,
+                            )
+                            .await
+                            .map_err(Self::to_status)
+                            .map(Response::new);
+                    }
+                }
+                // 旧模式: 单个 source_url
                 let url = match source_url {
                     Some(u) => u,
                     None => {
                         return Err(Self::to_status(AgentMgmtError::InvalidChunk(
-                            "URL install requires source_url".into(),
+                            "URL install requires source_url or platform_urls".into(),
                         )));
                     }
                 };
@@ -253,26 +278,6 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
         Ok(Response::new(CheckAgentResponse {
             system_info: Some(system_info),
             agent: Some(detail_to_proto(&detail)),
-        }))
-    }
-
-    #[instrument(skip(self, _request))]
-    async fn list_default_agents(
-        &self,
-        _request: Request<ListDefaultAgentsRequest>,
-    ) -> Result<Response<ListDefaultAgentsResponse>, Status> {
-        let defaults = default_agents::list_default_agents();
-        let proto_defaults: Vec<ProtoDefaultAgentInfo> = defaults
-            .into_iter()
-            .map(|d| ProtoDefaultAgentInfo {
-                agent_id: d.agent_id,
-                display_name: d.display_name,
-                description: d.description,
-                install_type: conversion::install_type_to_proto(d.install_type) as i32,
-            })
-            .collect();
-        Ok(Response::new(ListDefaultAgentsResponse {
-            default_agents: proto_defaults,
         }))
     }
 

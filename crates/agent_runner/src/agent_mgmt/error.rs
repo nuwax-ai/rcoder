@@ -42,6 +42,12 @@ pub enum AgentMgmtError {
     #[error("invalid upload chunk: {0}")]
     InvalidChunk(String),
 
+    #[error("platform not found: {0}")]
+    PlatformNotFound(String),
+
+    #[error("invalid version: {0}")]
+    InvalidVersion(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -56,6 +62,19 @@ pub enum AgentMgmtError {
 }
 
 impl AgentMgmtError {
+    /// 判断是否可重试(网络错误/IO 错误/传输中断)
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::InstallFailed(msg) => {
+                // HTTP 4xx 不可重试,网络错误/5xx 可重试
+                !msg.contains("HTTP 4")
+            }
+            Self::Io(_) | Self::StreamTruncated => true,
+            Self::ChecksumMismatch { .. } => true, // 可能是下载损坏
+            _ => false,
+        }
+    }
+
     /// 映射到业务错误码
     pub fn error_code(&self) -> &'static str {
         match self {
@@ -70,6 +89,8 @@ impl AgentMgmtError {
             Self::BuiltinProtected => ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED,
             Self::StreamTruncated => ec::ERR_AGENT_MGMT_STREAM_TRUNCATED,
             Self::InvalidChunk(_) => ec::ERR_AGENT_MGMT_INVALID_CHUNK,
+            Self::PlatformNotFound(_) => ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
+            Self::InvalidVersion(_) => ec::ERR_AGENT_MGMT_INVALID_VERSION,
             Self::UnsupportedType(_) => ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
             Self::Io(_) | Self::Archive(_) | Self::Json(_) => {
                 ec::ERR_INTERNAL_SERVER_ERROR

@@ -8,13 +8,18 @@
 //! - 限制最大下载字节数(防恶意大文件撑爆磁盘)
 //! - 强制超时(10 分钟,见 [`shared_types::URL_DOWNLOAD_TIMEOUT_SECS`])
 //! - 可选 SHA-256 校验
+//!
+//! 可靠性:
+//! - 下载失败自动重试(最多 3 次,指数退避 1s/2s/4s)
+//! - 支持断点续传(HTTP Range header,服务器需返回 Accept-Ranges: bytes)
 
+use std::io::Write;
 use std::time::Duration;
 
-use bytes::Bytes;
+use futures_util::StreamExt;
 use shared_types::InstallType;
 use shared_types_grpc::InstallAgentResponse;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::binary_installer;
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
@@ -47,71 +52,426 @@ pub async fn install_from_url(
 
     info!("[agent_mgmt] url install: agent_id={}, url={}", agent_id, url);
 
-    let bytes = download_with_limit(url, shared_types::MAX_BINARY_SIZE).await?;
+    // 下载到临时文件(支持重试 + 断点续传)
+    let staging_path = path_manager.install_dir()
+        .join(format!(".download-staging-{}", uuid::Uuid::new_v4()));
+    download_to_file(url, &staging_path, shared_types::MAX_BINARY_SIZE, expected_sha256).await?;
 
-    let mut response = binary_installer::install_from_bytes(
+    // 文件大小（download_to_file 已校验，传递给 install_from_file）
+    let file_size = std::fs::metadata(&staging_path)
+        .map(|m| m.len())
+        .map_err(AgentMgmtError::Io)?;
+
+    let response = binary_installer::install_from_file(
         registry,
         path_manager,
-        binary_installer::InstallBytesParams {
+        binary_installer::InstallFileParams {
             agent_id,
             command,
             args,
-            expected_sha256,
             install_type: InstallType::Url,
-            bytes,
+            download_path: &staging_path,
+            version: None,
+            source: Some(url),
+            file_size,
         },
     )
-    .await?;
+    .await;
 
-    // 用 URL 覆盖 source 字段
+    // install_from_file 成功时已 rename 走了 staging，失败时需清理
+    let _ = std::fs::remove_file(&staging_path);
+
+    let mut response = response?;
     response.source_url = Some(url.to_string());
     Ok(response)
 }
 
-/// 下载到内存,字节数超过 `max_bytes` 时立即终止并返回 `BinaryTooLarge`
-async fn download_with_limit(url: &str, max_bytes: u64) -> AgentMgmtResult<Bytes> {
-    // 禁用自动重定向,手动验证每个重定向目标的 scheme,防止 SSRF
+/// 多平台版本管理安装(幂等)
+///
+/// 1. 查注册表判断 action (installed/updated/skipped)
+/// 2. skipped → 直接返回现有信息
+/// 3. 匹配当前系统平台 → 查 platforms map → 下载 → 安装
+pub async fn install_with_version_check(
+    registry: &AgentRegistry,
+    path_manager: &PathManager,
+    agent_id: &str,
+    command: &str,
+    args: &[String],
+    version: &str,
+    platforms: &std::collections::HashMap<String, shared_types::PlatformEntry>,
+) -> AgentMgmtResult<InstallAgentResponse> {
+    use crate::agent_mgmt::registry::{compare_versions, normalize_platform_key};
+
+    crate::agent_mgmt::path_manager::validate_agent_id(agent_id)
+        .map_err(AgentMgmtError::InvalidManifest)?;
+    crate::agent_mgmt::path_manager::validate_command(command)
+        .map_err(AgentMgmtError::InvalidManifest)?;
+
+    // 0. 版本格式校验(至少包含一个数字)
+    validate_version_format(version)?;
+
+    // 1. 版本检查
+    let existing = registry.get(agent_id);
+    let (action, previous_version) = if let Some(ref manifest) = existing {
+        match compare_versions(
+            manifest.version.as_deref().unwrap_or("0.0.0"),
+            version,
+        ) {
+            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
+                // 已安装版本 >= 请求版本,跳过
+                let mut resp = make_skip_response(manifest);
+                resp.previous_version = manifest.version.clone().unwrap_or_default();
+                return Ok(resp);
+            }
+            std::cmp::Ordering::Less => {
+                // 需要更新
+                ("updated", manifest.version.clone())
+            }
+        }
+    } else {
+        // 首次安装
+        ("installed", None)
+    };
+
+    info!(
+        "[agent_mgmt] version check: agent_id={}, action={}, requested_version={}, previous_version={:?}",
+        agent_id, action, version, previous_version
+    );
+
+    // 2. 匹配当前系统平台
+    let sys_info = shared_types::SystemInfo::current();
+    let platform_key = normalize_platform_key(&sys_info.os, &sys_info.arch);
+
+    let entry = platforms.get(&platform_key).ok_or_else(|| {
+        AgentMgmtError::PlatformNotFound(format!(
+            "{platform_key} (available: {:?})",
+            platforms.keys().collect::<Vec<_>>()
+        ))
+    })?;
+
+    // 3. 验证 URL
+    if !entry.url.starts_with("http://") && !entry.url.starts_with("https://") {
+        return Err(AgentMgmtError::InvalidChunk(format!(
+            "URL must start with http:// or https://: {}",
+            entry.url
+        )));
+    }
+
+    info!(
+        "[agent_mgmt] platform install: agent_id={}, platform={}, url={}",
+        agent_id, platform_key, entry.url
+    );
+
+    // 4. 下载到临时文件(支持重试 + 断点续传)
+    let expected_sha256 = entry.sha256.as_deref().filter(|s| !s.is_empty());
+    let staging_path = path_manager.install_dir()
+        .join(format!(".download-staging-{}", uuid::Uuid::new_v4()));
+    download_to_file(&entry.url, &staging_path, shared_types::MAX_BINARY_SIZE, expected_sha256).await?;
+
+    // 文件大小（download_to_file 已校验，传递给 install_from_file）
+    let file_size = std::fs::metadata(&staging_path)
+        .map(|m| m.len())
+        .map_err(AgentMgmtError::Io)?;
+
+    // 5. 安装(复用 binary_installer::install_from_file，避免全量读入内存)
+    let response = binary_installer::install_from_file(
+        registry,
+        path_manager,
+        binary_installer::InstallFileParams {
+            agent_id,
+            command,
+            args,
+            install_type: InstallType::Url,
+            download_path: &staging_path,
+            version: Some(version),
+            source: Some(&entry.url),
+            file_size,
+        },
+    )
+    .await;
+
+    // install_from_file 成功时已 rename 走了 staging，失败时需清理
+    let _ = std::fs::remove_file(&staging_path);
+
+    let mut response = response?;
+
+    // 6. 覆盖 response 字段
+    response.action = action.to_string();
+    response.installed = true;
+    response.previous_version = previous_version.unwrap_or_default();
+    response.platform = platform_key;
+    response.source_url = Some(entry.url.clone());
+
+    Ok(response)
+}
+
+/// 校验版本格式:至少包含一个数字(如 "1.0.0", "v2", "1.2.3-beta")
+fn validate_version_format(version: &str) -> AgentMgmtResult<()> {
+    let trimmed = version.trim().trim_start_matches('v').trim_start_matches('V');
+    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_ascii_digit()) {
+        return Err(AgentMgmtError::InvalidVersion(format!(
+            "version must contain at least one digit: {version:?}"
+        )));
+    }
+    // 至少第一个 segment 必须是纯数字
+    let first = trimmed.split('.').next().unwrap_or("");
+    if first.parse::<u64>().is_err() {
+        return Err(AgentMgmtError::InvalidVersion(format!(
+            "version major must be a number: {version:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// 构造 skip response(版本已是最新,不需要安装)
+fn make_skip_response(manifest: &crate::agent_mgmt::installer::AgentManifest) -> InstallAgentResponse {
+    InstallAgentResponse {
+        agent_id: manifest.agent_id.clone(),
+        status: shared_types_grpc::AgentInstallStatus::Available as i32,
+        binary_path: manifest.binary_path.clone(),
+        file_type: manifest.file_type.clone(),
+        file_count: None,
+        file_size: 0,
+        version: manifest.version.clone(),
+        source_url: None,
+        action: "skipped".to_string(),
+        installed: false,
+        previous_version: String::new(),
+        platform: String::new(),
+    }
+}
+
+const MAX_DOWNLOAD_RETRIES: usize = 3;
+const RETRY_BACKOFF_BASE_SECS: u64 = 1;
+
+/// 下载 URL 内容到文件,支持重试 + 断点续传
+///
+/// - 最多重试 3 次,指数退避(1s/2s/4s)
+/// - 支持 HTTP Range 断点续传(服务器需支持)
+/// - 流式写入文件,避免大文件占满内存
+/// - 下载完成后校验 SHA-256(如果提供)
+async fn download_to_file(
+    url: &str,
+    dest_path: &std::path::Path,
+    max_bytes: u64,
+    expected_sha256: Option<&str>,
+) -> AgentMgmtResult<u64> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(shared_types::URL_DOWNLOAD_TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| AgentMgmtError::InstallFailed(format!("http client: {e}")))?;
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| AgentMgmtError::InstallFailed(format!("GET {url}: {e}")))?;
+    let mut last_err: Option<AgentMgmtError> = None;
 
-    // 处理重定向:最多跟随 5 次,每次验证 scheme
-    let response = follow_redirects(&client, response, 5).await?;
+    for attempt in 1..=MAX_DOWNLOAD_RETRIES {
+        // 检查已下载字节数(断点续传)
+        let mut downloaded = if dest_path.exists() {
+            std::fs::metadata(dest_path)
+                .map(|m| m.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
-    if !response.status().is_success() {
-        return Err(AgentMgmtError::InstallFailed(format!(
-            "GET {url}: HTTP {}",
-            response.status()
-        )));
-    }
-
-    // 如果 Content-Length 超限,立即拒绝
-    if let Some(len) = response.content_length()
-        && len > max_bytes {
-            return Err(AgentMgmtError::BinaryTooLarge { size: len, max: max_bytes });
+        // 构造请求
+        let mut req = client.get(url);
+        if downloaded > 0 {
+            info!(
+                "[agent_mgmt] resume download: url={}, from_byte={}",
+                url, downloaded
+            );
+            req = req.header("Range", format!("bytes={}-", downloaded));
         }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| AgentMgmtError::InstallFailed(format!("read body: {e}")))?;
+        let response = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = AgentMgmtError::InstallFailed(format!("GET {url}: {e}"));
+                if err.is_retryable() && attempt < MAX_DOWNLOAD_RETRIES {
+                    warn!("[agent_mgmt] download attempt {attempt} failed: {err}, retrying...");
+                    last_err = Some(err);
+                    let backoff = Duration::from_secs(RETRY_BACKOFF_BASE_SECS * 2u64.pow(attempt as u32 - 1));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        };
 
-    if (bytes.len() as u64) > max_bytes {
+        // 跟随重定向
+        let response = match follow_redirects(&client, response, 5).await {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_retryable() && attempt < MAX_DOWNLOAD_RETRIES {
+                    warn!("[agent_mgmt] download attempt {attempt} failed: {e}, retrying...");
+                    last_err = Some(e);
+                    let backoff = Duration::from_secs(RETRY_BACKOFF_BASE_SECS * 2u64.pow(attempt as u32 - 1));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+
+        let status = response.status();
+
+        // 416 Range Not Satisfiable → 文件已完整
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            info!("[agent_mgmt] file already complete: url={}", url);
+            break;
+        }
+
+        // 4xx(非 416) → 不重试
+        if status.is_client_error() {
+            return Err(AgentMgmtError::InstallFailed(format!(
+                "GET {url}: HTTP {}",
+                status
+            )));
+        }
+
+        // 5xx → 可重试
+        if status.is_server_error() {
+            let err = AgentMgmtError::InstallFailed(format!("GET {url}: HTTP {}", status));
+            if attempt < MAX_DOWNLOAD_RETRIES {
+                warn!("[agent_mgmt] download attempt {attempt} failed: {err}, retrying...");
+                last_err = Some(err);
+                let backoff = Duration::from_secs(RETRY_BACKOFF_BASE_SECS * 2u64.pow(attempt as u32 - 1));
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            return Err(err);
+        }
+
+        // 200 但之前有已下载内容 → 服务器不支持续传,清空文件从头下载
+        let append = if status == reqwest::StatusCode::OK && downloaded > 0 {
+            info!("[agent_mgmt] server does not support resume, restarting download");
+            std::fs::File::create(dest_path)
+                .map_err(AgentMgmtError::Io)?;
+            downloaded = 0;
+            false
+        } else {
+            downloaded > 0 // 206 → append
+        };
+
+        // 流式写入文件(max_bytes 限制在写入时逐 chunk 检查)
+        let result = write_response_to_file(
+            response,
+            dest_path,
+            downloaded,
+            max_bytes,
+            append,
+        )
+        .await;
+
+        match result {
+            Ok(total_bytes) => {
+                info!(
+                    "[agent_mgmt] download complete: url={}, bytes={}, attempt={}",
+                    url, total_bytes, attempt
+                );
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                if e.is_retryable() && attempt < MAX_DOWNLOAD_RETRIES {
+                    warn!("[agent_mgmt] download attempt {attempt} failed: {e}, retrying...");
+                    last_err = Some(e);
+                    let backoff = Duration::from_secs(RETRY_BACKOFF_BASE_SECS * 2u64.pow(attempt as u32 - 1));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    // 最终文件大小校验
+    let file_size = std::fs::metadata(dest_path)
+        .map(|m| m.len())
+        .map_err(AgentMgmtError::Io)?;
+
+    if file_size > max_bytes {
         return Err(AgentMgmtError::BinaryTooLarge {
-            size: bytes.len() as u64,
+            size: file_size,
             max: max_bytes,
         });
     }
 
-    Ok(bytes)
+    // SHA-256 校验
+    if let Some(expected) = expected_sha256.filter(|s| !s.is_empty()) {
+        let actual = sha256_file(dest_path)?;
+        if actual != expected {
+            // 校验失败,删除文件以便下次重试
+            let _ = std::fs::remove_file(dest_path);
+            return Err(AgentMgmtError::ChecksumMismatch {
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+
+    Ok(file_size)
+}
+
+/// 流式写入 HTTP response body 到文件
+async fn write_response_to_file(
+    response: reqwest::Response,
+    dest_path: &std::path::Path,
+    initial_offset: u64,
+    max_bytes: u64,
+    append: bool,
+) -> AgentMgmtResult<u64> {
+    let mut file = if append {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dest_path)
+            .map_err(AgentMgmtError::Io)?
+    } else {
+        std::fs::File::create(dest_path).map_err(AgentMgmtError::Io)?
+    };
+
+    let mut total = initial_offset;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AgentMgmtError::InstallFailed(format!("read body: {e}")))?;
+        total += chunk.len() as u64;
+        if total > max_bytes {
+            // 超限,删除文件
+            let _ = std::fs::remove_file(dest_path);
+            return Err(AgentMgmtError::BinaryTooLarge {
+                size: total,
+                max: max_bytes,
+            });
+        }
+        file.write_all(&chunk).map_err(AgentMgmtError::Io)?;
+    }
+    file.flush().map_err(AgentMgmtError::Io)?;
+
+    Ok(total)
+}
+
+/// 计算文件 SHA-256(hex)，流式读取避免大文件占满内存
+fn sha256_file(path: &std::path::Path) -> AgentMgmtResult<String> {
+    use std::io::Read;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(path).map_err(AgentMgmtError::Io)?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf).map_err(AgentMgmtError::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// 手动跟随重定向,每次验证目标 URL 的 scheme 必须是 http/https
@@ -152,6 +512,9 @@ async fn follow_redirects(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
     #[test]
     fn rejects_non_http_scheme() {
         assert!(!url_is_supported("file:///etc/passwd"));
@@ -162,5 +525,247 @@ mod tests {
 
     fn url_is_supported(url: &str) -> bool {
         url.starts_with("http://") || url.starts_with("https://")
+    }
+
+    /// 测试真实 URL 下载(限制下载大小避免测试太慢)
+    #[tokio::test]
+    #[ignore] // 依赖外部网络，手动运行: cargo test -- --ignored
+    async fn download_to_file_real_url() {
+        let url = "https://s3.nuwax.com:9443/nuwaclaw/nuwaclaw-electron/electron-v0.11.43/NuwaClaw-0.11.43-arm64-mac.zip";
+        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let dest = tmp_dir.join("test-download.zip");
+
+        // 清理
+        let _ = std::fs::remove_file(&dest);
+
+        // 限制只下载前 1MB(文件总大小 ~393MB)
+        let max_bytes = 1024 * 1024;
+        let result = download_to_file(url, &dest, max_bytes, None).await;
+
+        // 应该成功(下载了 1MB 后超限报错,或服务器不支持 Range 时下载完整小块)
+        // 实际行为取决于服务器是否支持 Range
+        match result {
+            Ok(size) => {
+                assert!(size > 0, "downloaded size should be > 0");
+                assert!(size <= max_bytes, "should not exceed max_bytes");
+                // 验证文件存在且大小一致
+                let file_size = std::fs::metadata(&dest).unwrap().len();
+                assert_eq!(file_size, size, "file size should match returned size");
+                println!("downloaded {} bytes", size);
+            }
+            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
+                // 下载超过 max_bytes 也是预期行为(服务器不支持 Range 时)
+                assert!(size > max, "should report actual size > max");
+                println!("file too large: {} bytes (max {})", size, max);
+            }
+            Err(e) => {
+                panic!("unexpected error: {}", e);
+            }
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// 测试断点续传:先写入部分文件,再下载剩余部分
+    #[tokio::test]
+    #[ignore] // 依赖外部网络
+    async fn download_to_file_resume() {
+        let url = "https://s3.nuwax.com:9443/nuwaclaw/nuwaclaw-electron/electron-v0.11.43/NuwaClaw-0.11.43-arm64-mac.zip";
+        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let dest = tmp_dir.join("test-resume.zip");
+
+        // 清理
+        let _ = std::fs::remove_file(&dest);
+
+        // 先下载前 100KB
+        let first_bytes = 100 * 1024;
+        let result1 = download_to_file(url, &dest, first_bytes, None).await;
+
+        let downloaded = match result1 {
+            Ok(size) => size,
+            Err(AgentMgmtError::BinaryTooLarge { .. }) => {
+                // 服务器不支持 Range,整个文件太大,跳过续传测试
+                let _ = std::fs::remove_file(&dest);
+                println!("server does not support Range, skipping resume test");
+                return;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                panic!("first download failed: {}", e);
+            }
+        };
+
+        assert!(downloaded > 0, "first download should get some bytes");
+        let file_size_1 = std::fs::metadata(&dest).unwrap().len();
+        assert_eq!(file_size_1, downloaded);
+
+        // 现在用更大的 max_bytes 继续下载(续传)
+        let max_bytes = 200 * 1024; // 200KB
+        let result2 = download_to_file(url, &dest, max_bytes, None).await;
+
+        match result2 {
+            Ok(total_size) => {
+                // 续传成功,文件应该更大了
+                let file_size_2 = std::fs::metadata(&dest).unwrap().len();
+                assert_eq!(file_size_2, total_size);
+                // 如果服务器支持 Range,文件应该从断点继续
+                // 如果不支持,文件会被重新下载
+                println!(
+                    "resume: first={}, total={}, grew by {} bytes",
+                    downloaded,
+                    total_size,
+                    total_size - downloaded
+                );
+            }
+            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
+                println!("resume: file too large after resume: {} (max {})", size, max);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                panic!("resume download failed: {}", e);
+            }
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// 测试 4xx 错误不重试
+    #[tokio::test]
+    #[ignore] // 依赖外部网络 (httpbin.org)
+    async fn download_to_file_404_no_retry() {
+        let url = "https://httpbin.org/status/404";
+        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let dest = tmp_dir.join("test-404.zip");
+        let _ = std::fs::remove_file(&dest);
+
+        let result = download_to_file(url, &dest, 1024, None).await;
+
+        match result {
+            Err(AgentMgmtError::InstallFailed(msg)) => {
+                assert!(msg.contains("HTTP 404"), "should be HTTP 404 error: {}", msg);
+            }
+            other => panic!("expected InstallFailed with HTTP 404, got: {:?}", other),
+        }
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// 断点续传验证(阿里云 OSS,支持 Range):
+    /// 1. 手动下载前 500KB 到文件(模拟中断)
+    /// 2. 调用 download_to_file 续传
+    /// 3. 验证文件增长 + 数据完整性
+    #[tokio::test]
+    #[ignore] // 依赖外部网络 (阿里云 OSS)
+    async fn download_resume_oss() {
+        let url = "https://nuwa-packages.oss-rg-china-mainland.aliyuncs.com/docker/20260529122753/docker-aarch64.zip";
+        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let dest = tmp_dir.join("test-resume-oss.zip");
+        let _ = std::fs::remove_file(&dest);
+
+        // === Step 1: 手动下载前 500KB ===
+        let partial_size: u64 = 500 * 1024;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let resp = client.get(url).send().await.unwrap();
+        assert!(resp.status().is_success(), "should be 200");
+
+        let mut file = std::fs::File::create(&dest).unwrap();
+        let mut written: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            let remaining = partial_size - written;
+            if remaining == 0 {
+                break;
+            }
+            let write_len = (chunk.len() as u64).min(remaining);
+            file.write_all(&chunk[..write_len as usize]).unwrap();
+            written += write_len;
+        }
+        file.flush().unwrap();
+        drop(file);
+        println!("[step1] wrote {} bytes (simulated interrupt)", written);
+
+        let first_100: Vec<u8> = std::fs::read(&dest).unwrap()[..100].to_vec();
+
+        // === Step 2: 调用 download_to_file 续传(max_bytes 设大,允许完成) ===
+        let max_bytes = 5 * 1024 * 1024; // 5MB (测试文件更大,但只要超过续传后的大小即可验证)
+        let result = download_to_file(url, &dest, max_bytes, None).await;
+
+        match result {
+            Ok(total) => {
+                // 续传成功完成
+                let file_size = std::fs::metadata(&dest).unwrap().len();
+                assert_eq!(file_size, total);
+                assert!(total > written, "should have grown: {} > {}", total, written);
+
+                let final_content = std::fs::read(&dest).unwrap();
+                assert_eq!(&final_content[..100], &first_100[..], "first 100 bytes preserved");
+
+                println!(
+                    "[resume OK] {} → {} bytes (grew {}), first 100 bytes intact",
+                    written, total, total - written
+                );
+            }
+            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
+                // 文件超过 5MB,但续传逻辑已正确工作(文件被清理)
+                println!(
+                    "[resume OK but exceeded] file grew beyond {}MB: {} bytes",
+                    max / 1024 / 1024, size
+                );
+                // 验证:续传前 512000,续传后应远大于此
+                assert!(size > written, "should have grown beyond partial: {} > {}", size, written);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                panic!("resume failed: {}", e);
+            }
+        }
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// MinIO 不支持 Range:验证下载到 max_bytes 后正确返回 BinaryTooLarge
+    #[tokio::test]
+    #[ignore] // 依赖外部网络 (MinIO)
+    async fn download_no_resume_minio() {
+        let url = "https://s3.nuwax.com:9443/nuwaclaw/nuwaclaw-electron/electron-v0.11.43/NuwaClaw-0.11.43-arm64-mac.zip";
+        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let dest = tmp_dir.join("test-no-resume-minio.zip");
+        let _ = std::fs::remove_file(&dest);
+
+        // 先写入 100KB 模拟中断
+        let partial = vec![0xABu8; 100 * 1024];
+        std::fs::write(&dest, &partial).unwrap();
+
+        // 尝试续传,但服务器不支持 Range → 从头下载 → 超限
+        let max_bytes = 1024 * 1024; // 1MB
+        let result = download_to_file(url, &dest, max_bytes, None).await;
+
+        match result {
+            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
+                assert!(size > max, "should report actual > max");
+                println!("[no-resume OK] MinIO returned full file, caught at {} bytes (max {})", size, max);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                panic!("unexpected error: {}", e);
+            }
+            Ok(size) => {
+                // 如果文件刚好小于 1MB(不太可能,文件 393MB)
+                println!("[unexpected] download completed: {} bytes", size);
+            }
+        }
+
+        let _ = std::fs::remove_file(&dest);
     }
 }

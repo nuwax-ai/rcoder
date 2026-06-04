@@ -20,14 +20,13 @@ use shared_types::grpc::{
     GetAgentRequest, GetAgentResponse, InstallAgentRequest,
     InstallAgentResponse as ProtoInstallAgentResponse, InstallType as ProtoInstallType,
     ListAgentsRequest as ProtoListAgentsRequest, ListAgentsResponse as ProtoListAgentsResponse,
-    ListDefaultAgentsRequest, ListDefaultAgentsResponse as ProtoListDefaultAgentsResponse,
     StaticCheckResult, SystemInfo as ProtoSystemInfo, UninstallAgentRequest,
     UninstallAgentResponse as ProtoUninstallResponse,
     install_agent_request::Metadata as InstallMetadata,
 };
 use shared_types::{
     AgentDetailInfo, AgentInfo, AgentInstallStatus, AppError, CheckAgentResponse, InstallType,
-    InstallAgentResponse, ListAgentsResponse, ListDefaultAgentsResponse,
+    InstallAgentResponse, ListAgentsResponse,
     SystemInfo, UninstallAgentResponse,
     error_codes as ec,
 };
@@ -68,6 +67,9 @@ pub struct InstallAgentParams {
     pub source_url: Option<String>,
     pub npm_package: Option<String>,
     pub sha256: Option<String>,
+    // === 多平台版本管理 ===
+    pub version: Option<String>,
+    pub platforms: Option<std::collections::HashMap<String, shared_types::PlatformEntry>>,
 }
 
 impl AgentMgmtForwardCtx {
@@ -166,7 +168,7 @@ pub fn status_to_app_error(s: Status) -> AppError {
 }
 
 fn is_known_agent_mgmt_code(code: &str) -> bool {
-    // 18 个 agent_mgmt 业务码 + `ERR_INTERNAL_SERVER_ERROR`(agent_runner 在
+    // 20 个 agent_mgmt 业务码 + `ERR_INTERNAL_SERVER_ERROR`(agent_runner 在
     // I/O/JSON/Archive 内部错误时也会以同样 `"{code}: {msg}"` 格式回传,
     // 必须识别以避免被错误地降级为 ERR_AGENT_RUNNER_UNAVAILABLE / 503)。
     matches!(
@@ -189,6 +191,8 @@ fn is_known_agent_mgmt_code(code: &str) -> bool {
             | ec::ERR_AGENT_MGMT_PERMISSION_DENIED
             | ec::ERR_AGENT_MGMT_UNKNOWN_AGENT
             | ec::ERR_AGENT_MGMT_INVALID_CHUNK
+            | ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND
+            | ec::ERR_AGENT_MGMT_INVALID_VERSION
             | ec::ERR_INTERNAL_SERVER_ERROR
     )
 }
@@ -207,15 +211,14 @@ fn install_type_to_proto_i32(t: InstallType) -> i32 {
 
 // === Forward functions ===
 
-/// 列出已安装 agent
+/// 列出已安装 agent(不含内置)
 #[instrument(skip(ctx, project))]
 pub async fn list_agents(
     ctx: &AgentMgmtForwardCtx,
     project: &ProjectAndContainerInfo,
-    include_builtin: bool,
 ) -> Result<ListAgentsResponse, AppError> {
     let mut client = ctx.resolve_client(project).await?;
-    let req = ProtoListAgentsRequest { include_builtin };
+    let req = ProtoListAgentsRequest {};
     let resp: ProtoListAgentsResponse = client
         .list_agents(req)
         .await
@@ -247,6 +250,10 @@ pub async fn install_agent(
             install_type: Some(install_type_to_proto_i32(params.install_type)),
             source_url: params.source_url.clone(),
             npm_package: params.npm_package.clone(),
+            version: params.version.clone(),
+            platforms: params.platforms.as_ref().and_then(|p| {
+                serde_json::to_string(p).ok()
+            }),
         }),
         data: vec![],
     };
@@ -317,22 +324,6 @@ pub async fn check_agent(
     Ok(check_response_to_shared(resp))
 }
 
-/// 列出默认 agent 清单(per-project,因每个容器内置版本可能不同)
-#[instrument(skip(ctx, project))]
-pub async fn list_default_agents(
-    ctx: &AgentMgmtForwardCtx,
-    project: &ProjectAndContainerInfo,
-) -> Result<ListDefaultAgentsResponse, AppError> {
-    let mut client = ctx.resolve_client(project).await?;
-    let req = ListDefaultAgentsRequest {};
-    let resp: ProtoListDefaultAgentsResponse = client
-        .list_default_agents(req)
-        .await
-        .map_err(status_to_app_error)?
-        .into_inner();
-    Ok(list_default_response_to_shared(resp))
-}
-
 /// 查询单个 agent 详情;未找到返回 `Ok(None)`
 #[instrument(skip(ctx, project))]
 pub async fn get_agent(
@@ -367,6 +358,7 @@ fn list_response_to_shared(p: ProtoListAgentsResponse) -> ListAgentsResponse {
 }
 
 fn install_response_to_shared(p: ProtoInstallAgentResponse) -> InstallAgentResponse {
+    use std::str::FromStr;
     InstallAgentResponse {
         agent_id: p.agent_id,
         status: agent_install_status_from_proto_i32(p.status),
@@ -376,6 +368,10 @@ fn install_response_to_shared(p: ProtoInstallAgentResponse) -> InstallAgentRespo
         file_size: p.file_size.max(0) as u64,
         version: p.version,
         source_url: p.source_url,
+        action: shared_types::InstallAction::from_str(p.action.as_str()).ok(),
+        installed: p.installed,
+        previous_version: if p.previous_version.is_empty() { None } else { Some(p.previous_version) },
+        platform: if p.platform.is_empty() { None } else { Some(p.platform) },
     }
 }
 
@@ -393,24 +389,6 @@ fn check_response_to_shared(
     CheckAgentResponse {
         system_info: p.system_info.map(system_info_to_shared).unwrap_or_default(),
         agent: p.agent.map(agent_detail_to_shared).unwrap_or_default(),
-    }
-}
-
-fn list_default_response_to_shared(
-    p: ProtoListDefaultAgentsResponse,
-) -> ListDefaultAgentsResponse {
-    use shared_types::DefaultAgentInfo;
-    ListDefaultAgentsResponse {
-        default_agents: p
-            .default_agents
-            .into_iter()
-            .map(|d| DefaultAgentInfo {
-                agent_id: d.agent_id,
-                display_name: d.display_name,
-                description: d.description,
-                install_type: install_type_from_proto_i32(d.install_type),
-            })
-            .collect(),
     }
 }
 
@@ -625,6 +603,10 @@ mod tests {
             file_size: -1,
             version: None,
             source_url: None,
+            action: "installed".into(),
+            installed: true,
+            previous_version: String::new(),
+            platform: String::new(),
         };
         let s = install_response_to_shared(proto);
         assert_eq!(s.file_size, 0);
@@ -653,6 +635,8 @@ mod tests {
             ec::ERR_AGENT_MGMT_PERMISSION_DENIED,
             ec::ERR_AGENT_MGMT_UNKNOWN_AGENT,
             ec::ERR_AGENT_MGMT_INVALID_CHUNK,
+            ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
+            ec::ERR_AGENT_MGMT_INVALID_VERSION,
             // agent_runner 在 I/O/JSON/Archive 内部错误时也走同 `"{code}: {msg}"` 格式,
             // 必须识别以避免被错误地降级为 ERR_AGENT_RUNNER_UNAVAILABLE
             ec::ERR_INTERNAL_SERVER_ERROR,

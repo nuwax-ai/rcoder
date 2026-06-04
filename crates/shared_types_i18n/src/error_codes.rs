@@ -151,6 +151,12 @@ pub const ERR_AGENT_MGMT_UNKNOWN_AGENT: &str = "ERR_AGENT_MGMT_UNKNOWN_AGENT";
 /// 上传 chunk 格式无效
 pub const ERR_AGENT_MGMT_INVALID_CHUNK: &str = "ERR_AGENT_MGMT_INVALID_CHUNK";
 
+/// platforms 中无匹配当前系统的 URL
+pub const ERR_AGENT_MGMT_PLATFORM_NOT_FOUND: &str = "ERR_AGENT_MGMT_PLATFORM_NOT_FOUND";
+
+/// version 格式不合法(非语义化版本号)
+pub const ERR_AGENT_MGMT_INVALID_VERSION: &str = "ERR_AGENT_MGMT_INVALID_VERSION";
+
 /// 项目不存在(P0-4: rcoder 转发层用于找不到 project_id 时)
 pub const ERR_PROJECT_NOT_FOUND: &str = "ERR_PROJECT_NOT_FOUND";
 
@@ -205,6 +211,8 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_AGENT_MGMT_PERMISSION_DENIED => "error.agent_mgmt_permission_denied",
         ERR_AGENT_MGMT_UNKNOWN_AGENT => "error.agent_mgmt_unknown_agent",
         ERR_AGENT_MGMT_INVALID_CHUNK => "error.agent_mgmt_invalid_chunk",
+        ERR_AGENT_MGMT_PLATFORM_NOT_FOUND => "error.agent_mgmt_platform_not_found",
+        ERR_AGENT_MGMT_INVALID_VERSION => "error.agent_mgmt_invalid_version",
         ERR_PROJECT_NOT_FOUND => "error.project_not_found",
         ERR_AGENT_RUNNER_UNAVAILABLE => "error.agent_runner_unavailable",
         ERR_UNKNOWN => "error.unknown",

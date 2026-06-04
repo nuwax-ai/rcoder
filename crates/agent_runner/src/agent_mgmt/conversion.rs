@@ -128,6 +128,7 @@ pub fn system_info_from_proto(p: &ProtoSystemInfo) -> shared_types::SystemInfo {
 
 /// proto InstallAgentResponse → shared InstallAgentResponse(供 HTTP 处理器序列化)
 pub fn install_response_to_shared(p: &ProtoInstallResp) -> SharedInstallResp {
+    use std::str::FromStr;
     SharedInstallResp {
         agent_id: p.agent_id.clone(),
         status: install_status_from_proto(p.status),
@@ -137,6 +138,10 @@ pub fn install_response_to_shared(p: &ProtoInstallResp) -> SharedInstallResp {
         file_size: p.file_size.max(0) as u64,
         version: p.version.clone(),
         source_url: p.source_url.clone(),
+        action: shared_types::InstallAction::from_str(p.action.as_str()).ok(),
+        installed: p.installed,
+        previous_version: if p.previous_version.is_empty() { None } else { Some(p.previous_version.clone()) },
+        platform: if p.platform.is_empty() { None } else { Some(p.platform.clone()) },
     }
 }
 

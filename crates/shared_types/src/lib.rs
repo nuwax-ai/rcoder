@@ -62,6 +62,7 @@ pub use shared_types_i18n::{
     ERR_AGENT_MGMT_BUILTIN_PROTECTED, ERR_AGENT_MGMT_STREAM_TRUNCATED,
     ERR_AGENT_MGMT_DISK_FULL, ERR_AGENT_MGMT_PERMISSION_DENIED,
     ERR_AGENT_MGMT_UNKNOWN_AGENT, ERR_AGENT_MGMT_INVALID_CHUNK,
+    ERR_AGENT_MGMT_PLATFORM_NOT_FOUND, ERR_AGENT_MGMT_INVALID_VERSION,
     ERR_PROJECT_NOT_FOUND, ERR_AGENT_RUNNER_UNAVAILABLE,
 };
 
@@ -167,9 +168,9 @@ pub mod http_handlers;
 pub mod agent_mgmt_types;
 pub use agent_mgmt_types::{
     AgentDetailInfo, AgentInfo, AgentInstallStatus, CheckAgentRequest, CheckAgentResponse,
-    DefaultAgentInfo, InstallAgentResponse, InstallBinaryRequest, InstallFromPackageManagerRequest,
-    InstallFromUrlRequest, InstallType, ListAgentsRequest, ListAgentsResponse,
-    ListDefaultAgentsResponse, StaticCheckResult, SystemInfo, UninstallAgentRequest,
-    UninstallAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR, MAX_BINARY_SIZE, MAX_EXTRACTED_SIZE,
-    UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS,
+    GetAgentRequest, InstallAction, InstallAgentResponse, InstallBinaryRequest,
+    InstallFromPackageManagerRequest, InstallFromUrlRequest, InstallType, ListAgentsRequest,
+    ListAgentsResponse, PlatformEntry, RoutingParams, StaticCheckResult, SystemInfo,
+    UninstallAgentRequest, UninstallAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR,
+    MAX_BINARY_SIZE, MAX_EXTRACTED_SIZE, UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS,
 };

@@ -49,9 +49,6 @@ service AgentMgmtService {
   // 检查指定 agent 状态
   rpc CheckAgent(CheckAgentRequest) returns (CheckAgentResponse);
 
-  // 列出默认 agent(由镜像提供,内置注册)
-  rpc ListDefaultAgents(ListDefaultAgentsRequest) returns (ListDefaultAgentsResponse);
-
   // 查询单个 agent 详情(快速)
   rpc GetAgent(GetAgentRequest) returns (GetAgentResponse);
 }
@@ -469,7 +466,8 @@ message AgentDetailInfo {
 }
 
 message ListAgentsRequest {
-  bool include_builtin = 1;
+  // reserved 防止 field number 被复用(proto 3 允许空 message)
+  reserved 1;
 }
 
 message ListAgentsResponse {
@@ -497,19 +495,6 @@ message GetAgentResponse {
   AgentDetailInfo agent = 2; // 仅当 found=true 有效
 }
 
-message ListDefaultAgentsRequest {}
-
-message ListDefaultAgentsResponse {
-  repeated DefaultAgentInfo default_agents = 1;
-}
-
-message DefaultAgentInfo {
-  string agent_id = 1;
-  string display_name = 2;
-  string description = 3;
-  InstallType install_type = 4;
-}
-
 message UninstallAgentRequest {
   string agent_id = 1;
 }
@@ -533,6 +518,9 @@ message InstallAgentRequest {
     optional InstallType install_type = 5;        // 缺省 BINARY
     optional string source_url = 6;               // URL 安装时必填
     optional string npm_package = 7;             // NPM 安装时必填(@scope/name)
+    // === 多平台版本管理(install-from-url 新模式) ===
+    optional string version = 8;                 // 期望安装的版本号(semver)
+    optional string platforms = 9;               // HashMap<String, PlatformEntry> 的 JSON 序列化(字符串)
   }
   // 元数据(只首包携带)
   Metadata metadata = 1;
@@ -549,4 +537,9 @@ message InstallAgentResponse {
   int64 file_size = 6;
   optional string version = 7;
   optional string source_url = 8;
+  // === 多平台版本管理响应字段 ===
+  string action = 20;              // "installed" / "updated" / "skipped"
+  bool installed = 21;             // 本次是否实际安装
+  string previous_version = 22;    // 更新前版本(首次安装为空)
+  string platform = 23;            // 实际匹配的平台 key(如 "linux-x86_64")
 }

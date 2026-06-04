@@ -1,12 +1,11 @@
 //! Agent Management HTTP 处理器 (P0-4 + P0-5 重构)
 //!
-//! 提供 8 个 HTTP 端点(与 agent-runner 端契约一致),内部通过 gRPC 转发到
+//! 提供 7 个 HTTP 端点(与 agent-runner 端契约一致),内部通过 gRPC 转发到
 //! 对应项目的 agent_runner 容器:
 //!
 //! - `POST /agent-mgmt/agents/list?project_id=xxx`           list_agents (body JSON)
 //! - `POST /agent-mgmt/agents/get?project_id=xxx`            get_agent    (body JSON)
 //! - `POST /agent-mgmt/agents/check?project_id=xxx`          check_agent  (body JSON)
-//! - `POST /agent-mgmt/default-agents/list?project_id=xxx`   list_default (body JSON)
 //! - `POST /agent-mgmt/agents/install`                       install_agent (multipart: file + metadata JSON)
 //! - `POST /agent-mgmt/agents/install-from-url`              install_from_url (body JSON)
 //! - `POST /agent-mgmt/agents/install-from-npm`              install_from_npm (body JSON)
@@ -32,7 +31,7 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)] // `json!` 仅在 `#[schema(example = json!(...))]` 宏内使用
 use serde_json::json;
 use shared_types::{
-    AppError, HttpResult, InstallType, IsolationType, ServiceType, error_codes as ec,
+    AppError, HttpResult, InstallType, IsolationType, RoutingParams, ServiceType, error_codes as ec,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -41,108 +40,11 @@ use tracing::{instrument, warn};
 use super::utils::{
     AgentMgmtForwardCtx, I18nJsonOrQuery, InstallAgentParams, check_agent as fwd_check,
     get_agent as fwd_get, install_agent as fwd_install, list_agents as fwd_list,
-    list_default_agents as fwd_list_default, uninstall_agent as fwd_uninstall,
+    uninstall_agent as fwd_uninstall,
 };
 use crate::router::AppState;
 
 // === HTTP 请求体(与 gRPC proto 解耦) ===
-
-/// 多租户容器路由参数（与 /computer/chat 保持一致）
-///
-/// 所有 `/agent-mgmt/*` 端点共享此参数，用于定位目标容器。
-/// - `project_id` 有值时:按 project_id 查找（向后兼容）
-/// - `user_id` 或 `pod_id` 有值时:按容器标识查找（多租户模式）
-#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct ContainerRoutingParams {
-    /// 用户 ID（ComputerAgentRunner 模式，用于定位容器）
-    #[serde(default)]
-    #[schema(example = "user_123")]
-    pub user_id: Option<String>,
-    /// 容器复用标识（有值时覆盖 user_id 作为容器标识）
-    #[serde(default)]
-    #[schema(example = "pod_tenant_123")]
-    pub pod_id: Option<String>,
-    /// 租户 ID（pod_id 有值时必填）
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
-    #[schema(example = "tenant_abc")]
-    pub tenant_id: Option<String>,
-    /// 空间 ID（pod_id 有值时必填）
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
-    #[schema(example = "space_xyz")]
-    pub space_id: Option<String>,
-    /// 隔离类型：tenant / space / project（pod_id 有值时必填）
-    #[serde(default)]
-    #[schema(example = "tenant")]
-    pub isolation_type: Option<String>,
-}
-
-/// `POST /agent-mgmt/agents/list` 请求体
-#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
-pub struct ListAgentsBody {
-    #[serde(flatten)]
-    pub routing: ContainerRoutingParams,
-    /// 项目 ID(也支持 `?project_id=xxx` query,JSON 优先)
-    #[serde(default)]
-    #[schema(example = "demo-project-001")]
-    pub project_id: Option<String>,
-    /// 是否包含内置 agent(默认 true)
-    #[serde(default)]
-    #[schema(example = true)]
-    pub include_builtin: Option<bool>,
-}
-
-/// `POST /agent-mgmt/agents/get` 请求体
-#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
-pub struct GetAgentBody {
-    #[serde(flatten)]
-    pub routing: ContainerRoutingParams,
-    /// 项目 ID(也支持 `?project_id=xxx` query,JSON 优先)
-    #[serde(default)]
-    #[schema(example = "demo-project-001")]
-    pub project_id: Option<String>,
-    /// 要查询的 agent ID(必填)
-    #[schema(example = "codex-acp")]
-    pub agent_id: String,
-}
-
-/// `POST /agent-mgmt/agents/check` 请求体
-#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
-pub struct CheckAgentBody {
-    #[serde(flatten)]
-    pub routing: ContainerRoutingParams,
-    /// 项目 ID(也支持 `?project_id=xxx` query,JSON 优先)
-    #[serde(default)]
-    #[schema(example = "demo-project-001")]
-    pub project_id: Option<String>,
-    /// 要健康检查的 agent ID(必填)
-    #[schema(example = "codex-acp")]
-    pub agent_id: String,
-}
-
-/// `POST /agent-mgmt/default-agents/list` 请求体
-#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
-pub struct ListDefaultAgentsBody {
-    #[serde(flatten)]
-    pub routing: ContainerRoutingParams,
-    /// 项目 ID(也支持 `?project_id=xxx` query,JSON 优先)
-    #[serde(default)]
-    #[schema(example = "demo-project-001")]
-    pub project_id: Option<String>,
-}
-
-/// `POST /agent-mgmt/agents/uninstall` 请求体
-#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
-pub struct UninstallAgentBody {
-    #[serde(flatten)]
-    pub routing: ContainerRoutingParams,
-    /// 项目 ID(也支持 `?project_id=xxx` query,JSON 优先)
-    #[serde(default)]
-    #[schema(example = "demo-project-001")]
-    pub project_id: Option<String>,
-    /// 要卸载的 agent ID(必填)
-    #[schema(example = "codex-acp")]
-    pub agent_id: String,
-}
 
 /// `install` 端点的 multipart body 整体结构(OpenAPI 描述专用)
 ///
@@ -168,11 +70,7 @@ pub struct InstallMultipartBody {
 #[derive(Debug, Deserialize, Default, Serialize, utoipa::ToSchema)]
 pub struct InstallMetadataBody {
     #[serde(flatten)]
-    pub routing: ContainerRoutingParams,
-    /// 项目 ID(也支持 `?project_id=xxx` query,JSON 优先)
-    #[serde(default)]
-    #[schema(example = "demo-project-001")]
-    pub project_id: Option<String>,
+    pub routing: RoutingParams,
     /// Agent ID(必填,在容器内唯一标识)
     #[schema(example = "codex-acp")]
     pub agent_id: String,
@@ -210,7 +108,7 @@ fn default_install_type() -> String {
 /// 验证多租户路由参数（复用 computer_chat_handler 的验证模式）
 ///
 /// 规则:pod_id 有值时,isolation_type / tenant_id / space_id 必须非空且有效。
-fn validate_routing_params(routing: &ContainerRoutingParams) -> Result<(), AppError> {
+fn validate_routing_params(routing: &RoutingParams) -> Result<(), AppError> {
     if let Some(ref pod_id) = routing.pod_id {
         if pod_id.trim().is_empty() {
             return Err(AppError::with_message(
@@ -264,7 +162,7 @@ fn validate_routing_params(routing: &ContainerRoutingParams) -> Result<(), AppEr
 async fn resolve_container_target(
     state: &Arc<AppState>,
     project_id: Option<&str>,
-    routing: &ContainerRoutingParams,
+    routing: &RoutingParams,
 ) -> Result<Arc<shared_types::ProjectAndContainerInfo>, AppError> {
     // Path A: project_id 优先（向后兼容）
     if let Some(pid) = project_id.filter(|s| !s.is_empty()) {
@@ -338,7 +236,7 @@ fn build_ctx(state: &Arc<AppState>) -> AgentMgmtForwardCtx {
 /// ## 请求体示例
 ///
 /// ```json
-/// { "project_id": "demo-project-001", "include_builtin": true }
+/// { "project_id": "demo-project-001" }
 /// ```
 ///
 /// ## 响应示例(200)
@@ -365,7 +263,7 @@ fn build_ctx(state: &Arc<AppState>) -> AgentMgmtForwardCtx {
     operation_id = "list_agents",
     summary = "列出项目下已安装的 agent",
     description = "查询 agent_runner 注册表,返回该项目下所有已安装(含内置)agent 的元信息。支持 `?project_id=xxx` query 调试,JSON body 优先。",
-    request_body = ListAgentsBody,
+    request_body = shared_types::ListAgentsRequest,
     responses(
         (status = 200, description = "查询成功", body = HttpResult<shared_types::ListAgentsResponse>),
         (status = 400, description = "参数错误(project_id 缺失)"),
@@ -378,12 +276,12 @@ fn build_ctx(state: &Arc<AppState>) -> AgentMgmtForwardCtx {
 #[instrument(skip(state, body))]
 pub async fn list_agents(
     State(state): State<Arc<AppState>>,
-    I18nJsonOrQuery(body): I18nJsonOrQuery<ListAgentsBody>,
+    I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::ListAgentsRequest>,
 ) -> Result<Json<HttpResult<shared_types::ListAgentsResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.project_id.as_deref(), &body.routing).await?;
+    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
-    let resp = fwd_list(&ctx, &project, body.include_builtin.unwrap_or(true)).await?;
+    let resp = fwd_list(&ctx, &project).await?;
     Ok(Json(HttpResult::success(resp)))
 }
 
@@ -413,7 +311,7 @@ pub async fn list_agents(
     operation_id = "get_agent",
     summary = "查询单个 agent 的详细信息",
     description = "按 agent_id 在 agent_runner 注册表查询详细信息,未找到时 data 字段为 null(不视为错误)。",
-    request_body = GetAgentBody,
+    request_body = shared_types::GetAgentRequest,
     responses(
         (status = 200, description = "查询成功;未找到时 data 字段为 null", body = HttpResult<Option<shared_types::AgentDetailInfo>>),
         (status = 400, description = "参数错误(project_id 或 agent_id 缺失)"),
@@ -426,10 +324,10 @@ pub async fn list_agents(
 #[instrument(skip(state, body))]
 pub async fn get_agent(
     State(state): State<Arc<AppState>>,
-    I18nJsonOrQuery(body): I18nJsonOrQuery<GetAgentBody>,
+    I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::GetAgentRequest>,
 ) -> Result<Json<HttpResult<Option<shared_types::AgentDetailInfo>>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.project_id.as_deref(), &body.routing).await?;
+    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
     let resp = fwd_get(&ctx, &project, &body.agent_id).await?;
     Ok(Json(HttpResult::success(resp)))
@@ -464,7 +362,7 @@ pub async fn get_agent(
     operation_id = "check_agent",
     summary = "检查 agent 健康状态(进程/版本/端口)",
     description = "在 agent_runner 容器内探测 agent 进程存活状态、版本号、端口监听等健康指标。",
-    request_body = CheckAgentBody,
+    request_body = shared_types::CheckAgentRequest,
     responses(
         (status = 200, description = "健康检查结果(is_alive=true 表示存活)", body = HttpResult<shared_types::CheckAgentResponse>),
         (status = 400, description = "参数错误(project_id 或 agent_id 缺失)"),
@@ -477,61 +375,12 @@ pub async fn get_agent(
 #[instrument(skip(state, body))]
 pub async fn check_agent(
     State(state): State<Arc<AppState>>,
-    I18nJsonOrQuery(body): I18nJsonOrQuery<CheckAgentBody>,
+    I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::CheckAgentRequest>,
 ) -> Result<Json<HttpResult<shared_types::CheckAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.project_id.as_deref(), &body.routing).await?;
+    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
     let resp = fwd_check(&ctx, &project, &body.agent_id).await?;
-    Ok(Json(HttpResult::success(resp)))
-}
-
-/// 列出内置(默认)agent 清单
-///
-/// 返回 agent_runner 容器出厂时内置的 agent(如 `claude-code-acp`),这些 agent
-/// 受保护,不能卸载(`uninstall` 会返回 `ERR_AGENT_MGMT_BUILTIN_PROTECTED`)。
-///
-/// - **路径**:`POST /agent-mgmt/default-agents/list`
-/// - **转发**:rcoder → agent_runner gRPC `ListDefaultAgents`
-/// - **典型场景**:前端展示"出厂自带"agent 列表,引导用户安装第三方 agent
-///
-/// ## 请求体示例
-///
-/// ```json
-/// { "project_id": "demo-project-001" }
-/// ```
-///
-/// ## 错误码
-///
-/// - `400 ERR_VALIDATION` — `project_id` 为空
-/// - `404 ERR_PROJECT_NOT_FOUND` — 项目不存在
-/// - `500 ERR_INTERNAL_SERVER_ERROR` — agent_runner I/O 失败
-/// - `503 ERR_AGENT_RUNNER_UNAVAILABLE` — agent_runner 容器离线
-#[utoipa::path(
-    post,
-    path = "/agent-mgmt/default-agents/list",
-    operation_id = "list_default_agents",
-    summary = "列出内置(出厂)agent 清单",
-    description = "查询 agent_runner 内置 agent 列表,这些 agent 受保护不能卸载。",
-    request_body = ListDefaultAgentsBody,
-    responses(
-        (status = 200, description = "默认 agent 清单", body = HttpResult<shared_types::ListDefaultAgentsResponse>),
-        (status = 400, description = "参数错误(project_id 缺失)"),
-        (status = 404, description = "项目不存在"),
-        (status = 500, description = "agent_runner I/O 或内部错误"),
-        (status = 503, description = "Agent Runner 不可用"),
-    ),
-    tag = "agent-mgmt",
-)]
-#[instrument(skip(state, body))]
-pub async fn list_default_agents(
-    State(state): State<Arc<AppState>>,
-    I18nJsonOrQuery(body): I18nJsonOrQuery<ListDefaultAgentsBody>,
-) -> Result<Json<HttpResult<shared_types::ListDefaultAgentsResponse>>, AppError> {
-    validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.project_id.as_deref(), &body.routing).await?;
-    let ctx = build_ctx(&state);
-    let resp = fwd_list_default(&ctx, &project).await?;
     Ok(Json(HttpResult::success(resp)))
 }
 
@@ -717,7 +566,7 @@ pub async fn install_agent(
 
     // 2. 解析 project + 构造 ctx
     validate_routing_params(&meta.routing)?;
-    let project = resolve_container_target(&state, meta.project_id.as_deref(), &meta.routing).await?;
+    let project = resolve_container_target(&state, meta.routing.project_id.as_deref(), &meta.routing).await?;
     let ctx = build_ctx(&state);
 
     // 3. 构造 forward 参数
@@ -729,39 +578,45 @@ pub async fn install_agent(
         source_url: meta.source_url.clone(),
         npm_package: meta.npm_package.clone(),
         sha256: meta.sha256.clone().filter(|s| !s.is_empty()),
+        version: None,
+        platforms: None,
     };
 
     let resp = fwd_install(&ctx, &project, params, file_bytes).await?;
     Ok(Json(HttpResult::success(resp)))
 }
 
-/// 从 URL 下载并安装 agent
+/// 从 URL 下载并安装 agent(多平台 + 版本管理)
 ///
-/// 由 agent_runner 端负责下载(`http`/`https`)并校验 SHA-256(若提供)。
+/// agent-runner 自动判断:版本相同则跳过下载,版本更新则自动下载安装。
+/// 支持 `platforms` 多平台 URL 映射,根据容器系统架构自动选择。
 ///
 /// - **路径**:`POST /agent-mgmt/agents/install-from-url`
-/// - **转发**:rcoder → agent_runner gRPC `InstallFromUrlRequest`
-/// - **典型场景**:CI/CD 从 GitHub Release / S3 部署 agent
+/// - **转发**:rcoder → agent_runner gRPC `InstallAgent`(metadata only)
+/// - **典型场景**:业务方每次使用 agent 前调用,幂等安装
 ///
 /// ## 请求体示例
 ///
 /// ```json
 /// {
-///   "project_id": "demo-project-001",
-///   "agent_id": "kimi",
-///   "command": "kimi",
-///   "args": ["--serve"],
-///   "url": "https://github.com/example/kimi/releases/download/v1.0.0/kimi.tar.gz",
-///   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+///   "user_id": "user_123",
+///   "agent_id": "codex-acp",
+///   "command": "codex-acp",
+///   "version": "1.2.0",
+///   "platforms": {
+///     "linux-x86_64": { "url": "https://cdn.example.com/codex-acp-linux-amd64.tar.gz" },
+///     "linux-aarch64": { "url": "https://cdn.example.com/codex-acp-linux-arm64.tar.gz" }
+///   }
 /// }
 /// ```
 ///
 /// ## 错误码
 ///
-/// - `400 ERR_VALIDATION` — `agent_id` / `command` / `url` 为空
+/// - `400 ERR_VALIDATION` — `agent_id` / `command` / `version` / `platforms` 为空
 /// - `404 ERR_PROJECT_NOT_FOUND` — 项目不存在
 /// - `400 ERR_AGENT_MGMT_*` — 业务错误
-///   - `ERR_AGENT_MGMT_ALREADY_INSTALLED` — agent_id 已存在
+///   - `ERR_AGENT_MGMT_PLATFORM_NOT_FOUND` — platforms 中无匹配当前系统的 URL
+///   - `ERR_AGENT_MGMT_INVALID_VERSION` — version 格式不合法
 ///   - `ERR_AGENT_MGMT_CHECKSUM_MISMATCH` — SHA-256 校验失败
 ///   - `ERR_AGENT_MGMT_COMMAND_TIMEOUT` — 下载超时
 ///   - `ERR_AGENT_MGMT_PATH_TRAVERSAL` — 归档含路径遍历
@@ -772,14 +627,14 @@ pub async fn install_agent(
     post,
     path = "/agent-mgmt/agents/install-from-url",
     operation_id = "install_from_url",
-    summary = "从 URL 下载并安装 agent",
-    description = "由 agent_runner 端从 http/https URL 下载并安装,可指定 SHA-256 校验和。",
-    request_body = InstallFromUrlHttpRequest,
+    summary = "从 URL 下载并安装 agent(多平台+版本管理)",
+    description = "支持 platforms 多平台 URL + version 版本号,agent-runner 自动判断是否需要下载安装(幂等)。",
+    request_body = shared_types::InstallFromUrlRequest,
     responses(
-        (status = 200, description = "安装成功", body = HttpResult<shared_types::InstallAgentResponse>),
-        (status = 400, description = "参数错误(agent_id / command / url 缺失)"),
+        (status = 200, description = "安装/更新/跳过", body = HttpResult<shared_types::InstallAgentResponse>),
+        (status = 400, description = "参数错误(agent_id / command / version / platforms 缺失)"),
         (status = 404, description = "项目不存在"),
-        (status = 400, description = "agent-runner 业务错误(URL 无效、checksum 不匹配、下载失败等)"),
+        (status = 400, description = "agent-runner 业务错误(platform 不匹配、version 无效、下载失败等)"),
         (status = 500, description = "agent-runner I/O 或内部错误"),
         (status = 503, description = "Agent Runner 不可用"),
     ),
@@ -788,53 +643,42 @@ pub async fn install_agent(
 #[instrument(skip(state, body))]
 pub async fn install_from_url(
     State(state): State<Arc<AppState>>,
-    I18nJsonOrQuery(body): I18nJsonOrQuery<InstallFromUrlHttpRequest>,
+    I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::InstallFromUrlRequest>,
 ) -> Result<Json<HttpResult<shared_types::InstallAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.project_id.as_deref(), &body.routing).await?;
+    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     require_field(Some(&body.agent_id), "agent_id")?;
     require_field(Some(&body.command), "command")?;
-    require_field(Some(&body.url), "url")?;
+    require_field(Some(&body.version), "version")?;
+    if body.platforms.is_empty() {
+        return Err(AppError::with_message(
+            ec::ERR_VALIDATION,
+            "platforms cannot be empty",
+        ));
+    }
+    // 验证每个 platform entry 的 URL 格式
+    for (key, entry) in &body.platforms {
+        if !entry.url.starts_with("http://") && !entry.url.starts_with("https://") {
+            return Err(AppError::with_message(
+                ec::ERR_VALIDATION,
+                format!("platforms[{key}].url must start with http:// or https://"),
+            ));
+        }
+    }
     let params = InstallAgentParams {
         agent_id: body.agent_id.clone(),
         command: body.command.clone(),
         args: body.args.clone(),
         install_type: InstallType::Url,
-        source_url: Some(body.url.clone()),
+        source_url: None,
         npm_package: None,
-        sha256: body.sha256.clone().filter(|s| !s.is_empty()),
+        sha256: None,
+        version: Some(body.version.clone()),
+        platforms: Some(body.platforms.clone()),
     };
     let ctx = build_ctx(&state);
     let resp = fwd_install(&ctx, &project, params, Bytes::new()).await?;
     Ok(Json(HttpResult::success(resp)))
-}
-
-/// URL 安装的 HTTP 请求体(独立类型,因为要加 `project_id` 字段)
-#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
-pub struct InstallFromUrlHttpRequest {
-    #[serde(flatten)]
-    pub routing: ContainerRoutingParams,
-    /// 项目 ID(也支持 `?project_id=xxx` query,JSON 优先)
-    #[serde(default)]
-    #[schema(example = "demo-project-001")]
-    pub project_id: Option<String>,
-    /// Agent ID(必填)
-    #[schema(example = "kimi")]
-    pub agent_id: String,
-    /// 入口可执行文件名(必填)
-    #[schema(example = "kimi")]
-    pub command: String,
-    /// 启动参数(可选,默认空)
-    #[serde(default)]
-    #[schema(value_type = Vec<String>, example = json!(["--serve", "--port", "7091"]))]
-    pub args: Vec<String>,
-    /// 下载 URL(http/https,必填)
-    #[schema(example = "https://github.com/example/kimi/releases/download/v1.0.0/kimi.tar.gz")]
-    pub url: String,
-    /// SHA-256 校验和(hex,可选)
-    #[serde(default)]
-    #[schema(example = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")]
-    pub sha256: Option<String>,
 }
 
 /// 从 npm 全局安装 agent
@@ -878,7 +722,7 @@ pub struct InstallFromUrlHttpRequest {
     operation_id = "install_from_npm",
     summary = "从 npm 全局安装 agent",
     description = "agent_runner 端调用 npm install -g 安装包,适用于官方 npm 发布的 agent(如 @anthropic-ai/claude-code-acp)。",
-    request_body = InstallFromPackageManagerHttpRequest,
+    request_body = shared_types::InstallFromPackageManagerRequest,
     responses(
         (status = 200, description = "安装成功", body = HttpResult<shared_types::InstallAgentResponse>),
         (status = 400, description = "参数错误(agent_id / command / package 缺失)"),
@@ -892,10 +736,10 @@ pub struct InstallFromUrlHttpRequest {
 #[instrument(skip(state, body))]
 pub async fn install_from_npm(
     State(state): State<Arc<AppState>>,
-    I18nJsonOrQuery(body): I18nJsonOrQuery<InstallFromPackageManagerHttpRequest>,
+    I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::InstallFromPackageManagerRequest>,
 ) -> Result<Json<HttpResult<shared_types::InstallAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.project_id.as_deref(), &body.routing).await?;
+    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     require_field(Some(&body.agent_id), "agent_id")?;
     require_field(Some(&body.command), "command")?;
     require_field(Some(&body.package), "package")?;
@@ -907,31 +751,14 @@ pub async fn install_from_npm(
         source_url: None,
         npm_package: Some(body.package.clone()),
         sha256: None,
+        version: None,
+        platforms: None,
     };
     let ctx = build_ctx(&state);
     let resp = fwd_install(&ctx, &project, params, Bytes::new()).await?;
     Ok(Json(HttpResult::success(resp)))
 }
 
-/// NPM 安装的 HTTP 请求体
-#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
-pub struct InstallFromPackageManagerHttpRequest {
-    #[serde(flatten)]
-    pub routing: ContainerRoutingParams,
-    /// 项目 ID(也支持 `?project_id=xxx` query,JSON 优先)
-    #[serde(default)]
-    #[schema(example = "demo-project-001")]
-    pub project_id: Option<String>,
-    /// Agent ID(必填)
-    #[schema(example = "claude-code-acp")]
-    pub agent_id: String,
-    /// 入口可执行文件名(必填,通常是包名去掉 scope)
-    #[schema(example = "claude-code-acp")]
-    pub command: String,
-    /// npm 包名(必填,例如 `@anthropic-ai/claude-code-acp`)
-    #[schema(example = "@anthropic-ai/claude-code-acp")]
-    pub package: String,
-}
 
 /// 卸载一个已安装的 agent
 ///
@@ -962,7 +789,7 @@ pub struct InstallFromPackageManagerHttpRequest {
     operation_id = "uninstall_agent",
     summary = "卸载 agent",
     description = "删除 agent 目录并清理注册表,内置 agent 受保护(返回 403 ERR_AGENT_MGMT_BUILTIN_PROTECTED)。",
-    request_body = UninstallAgentBody,
+    request_body = shared_types::UninstallAgentRequest,
     responses(
         (status = 200, description = "卸载成功", body = HttpResult<shared_types::UninstallAgentResponse>),
         (status = 400, description = "参数错误(agent_id 缺失)"),
@@ -977,10 +804,10 @@ pub struct InstallFromPackageManagerHttpRequest {
 #[instrument(skip(state, body))]
 pub async fn uninstall_agent(
     State(state): State<Arc<AppState>>,
-    I18nJsonOrQuery(body): I18nJsonOrQuery<UninstallAgentBody>,
+    I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::UninstallAgentRequest>,
 ) -> Result<Json<HttpResult<shared_types::UninstallAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.project_id.as_deref(), &body.routing).await?;
+    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
     let resp = fwd_uninstall(&ctx, &project, &body.agent_id).await?;
     Ok(Json(HttpResult::success(resp)))
