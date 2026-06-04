@@ -70,9 +70,9 @@ pub struct ChatAgentServerConfig {
         "optionId": "always_allow:terminal"
       }
     },
-    "session_id": "session_789",
-    "tool_call_id": "tool_001",
-    "save_rule": true
+    "sessionId": "session_789",
+    "toolCallId": "tool_001",
+    "saveRule": true
   },
   "user_id": "user_123",
   "project_id": "proj_456",
@@ -119,10 +119,10 @@ pub struct SelectedPermissionOutcome {
 |------|------|------|------|
 | `permission_resolve_request.request_permission_response` | Object | ✅ | 审批结果 |
 | `permission_resolve_request.request_permission_response.outcome` | Object | ✅ | ACP internally tagged enum，`outcome` 值为 `selected` 或 `cancelled` |
-| `permission_resolve_request.request_permission_response.outcome.optionId` | String | ✅ | 用户选择的 option_id（仅 `selected` 时存在） |
-| `permission_resolve_request.session_id` | String | ✅ | 会话 ID（关联审批请求） |
-| `permission_resolve_request.tool_call_id` | String | ✅ | 工具调用 ID（用于定位具体工具权限请求） |
-| `permission_resolve_request.save_rule` | bool | ❌ | 是否保存为规则（默认 false） |
+| `permission_resolve_request.request_permission_response.outcome.optionId` | String | ✅ | 用户选择的 optionId（仅 `selected` 时存在） |
+| `permission_resolve_request.sessionId` | String | ✅ | 会话 ID（关联审批请求） |
+| `permission_resolve_request.toolCallId` | String | ✅ | 工具调用 ID（用于定位具体工具权限请求） |
+| `permission_resolve_request.saveRule` | bool | ❌ | 是否保存为规则（默认 false） |
 | `user_id` | String | ✅ | 用户 ID |
 | `project_id` | String | ✅ | 项目 ID |
 | `pod_id` | String | ❌ | Pod ID（共享容器模式） |
@@ -132,15 +132,15 @@ pub struct SelectedPermissionOutcome {
 
 #### 设计说明
 
-- **`session_id + tool_call_id` 组合定位**: 用于精确定位是哪个工具的权限审批请求
-  - `session_id`: 关联会话
-  - `tool_call_id`: 具体工具调用 ID（从 `tool_call.tool_call_id` 提取）
-- **`option_id` 的来源和作用**:
-  - `option_id` 是 **ACP Agent 生成**的，RCoder 只是透传
-  - RCoder 收到 Agent 的 `RequestPermissionRequest` 后，将 `options`（含 `option_id`）展示给用户
-  - 用户选择后，RCoder 把用户选择的 `option_id` 传回给 Agent
-  - **RCoder 不需要理解 `option_id` 的含义**，那是 Agent 的事情
-  - 参考 Zed Agent 的 `option_id` 格式（用于解析用户选择）：
+- **`sessionId + toolCallId` 组合定位**: 用于精确定位是哪个工具的权限审批请求
+  - `sessionId`: 关联会话
+  - `toolCallId`: 具体工具调用 ID（从 `toolCall.toolCallId` 提取）
+- **`optionId` 的来源和作用**:
+  - `optionId` 是 **ACP Agent 生成**的，RCoder 只是透传
+  - RCoder 收到 Agent 的 `RequestPermissionRequest` 后，将 `options`（含 `optionId`）展示给用户
+  - 用户选择后，RCoder 把用户选择的 `optionId` 传回给 Agent
+  - **RCoder 不需要理解 `optionId` 的含义**，那是 Agent 的事情
+  - 参考 Zed Agent 的 `optionId` 格式（用于解析用户选择）：
     - `"allow"` / `"deny"` — 一次性允许/拒绝
     - `"always_allow:<tool>"` / `"always_deny:<tool>"` — 始终允许/拒绝
     - `"always_allow_mcp:<server>:<tool>"` / `"always_deny_mcp:<server>:<tool>"` — MCP 工具
@@ -217,6 +217,8 @@ pub struct SelectedPermissionOutcome {
 }
 ```
 
+> **注意**: 响应格式中 `session_id` 和 `tool_call_id` 使用 snake_case，这是 RCoder 自定义的响应格式，与 ACP 协议的驼峰格式不同。
+
 **失败响应**:
 
 ```json
@@ -281,25 +283,25 @@ pub enum SessionMessageType {
   "sub_type": "request_permission",
   "data": {
     "request_permission_request": {
-      "session_id": "session_789",
-      "tool_call": {
-        "tool_call_id": "tool_call_001",
+      "sessionId": "session_789",
+      "toolCall": {
+        "toolCallId": "tool_call_001",
         "kind": "bash",
         "status": "pending",
         "title": "bash",
         "content": [],
-        "raw_input": { "command": "cargo build" },
+        "rawInput": { "command": "cargo build" },
         "_meta": {}
       },
       "options": [
         {
-          "option_id": "always_allow:terminal",
+          "optionId": "always_allow:terminal",
           "name": "始终允许",
           "kind": "allow_always",
           "_meta": {}
         },
         {
-          "option_id": "allow",
+          "optionId": "allow",
           "name": "允许本次",
           "kind": "allow_once",
           "_meta": {}
@@ -324,37 +326,39 @@ pub enum SessionMessageType {
 
 | 字段 | 类型 | 来源 | 说明 |
 |------|------|------|------|
-| `session_id` | String | - | 会话 ID |
+| `session_id` | String | RCoder | 会话 ID |
 | `message_type` | String | RCoder | 固定为 `acpRequestPermission` |
 | `sub_type` | String | RCoder | 固定为 `request_permission` |
 | `timestamp` | String | RCoder | 时间戳 |
 
-**data.request_permission_request 字段**（ACP 协议，直接透传）：
+> **注意**: `UnifiedSessionMessage` 外层字段使用 snake_case，但 `data.request_permission_request` 内部的 ACP 协议字段使用 camelCase。
+
+**data.request_permission_request 字段**（ACP 协议，驼峰格式，直接透传）：
 
 | 字段 | 类型 | 来源 | 说明 |
 |------|------|------|------|
-| `session_id` | String | ACP 协议 | 会话 ID |
-| `tool_call` | Object | ACP 协议 | 工具调用信息（见 tool_call 子字段） |
+| `sessionId` | String | ACP 协议 | 会话 ID |
+| `toolCall` | Object | ACP 协议 | 工具调用信息（见 toolCall 子字段） |
 | `options` | Array | ACP 协议 | 权限选项列表（见 options 子字段） |
 | `_meta` | Object | ACP 协议 | ACP 协议扩展字段（可选） |
 
-**data.request_permission_request.tool_call 子字段**：
+**data.request_permission_request.toolCall 子字段**：
 
 | 字段 | 类型 | 来源 | 说明 |
 |------|------|------|------|
-| `tool_call_id` | String | ACP 协议 | 工具调用 ID |
+| `toolCallId` | String | ACP 协议 | 工具调用 ID |
 | `kind` | String | ACP 协议 | 工具类型（如 "bash"） |
 | `status` | String | ACP 协议 | 执行状态 |
 | `title` | String | ACP 协议 | 工具标题 |
 | `content` | Array | ACP 协议 | 工具输出内容 |
-| `raw_input` | Object | ACP 协议 | 工具输入参数 |
+| `rawInput` | Object | ACP 协议 | 工具输入参数 |
 | `_meta` | Object | ACP 协议 | ACP 协议扩展字段（可选） |
 
 **data.request_permission_request.options[] 子字段**：
 
 | 字段 | 类型 | 来源 | 说明 |
 |------|------|------|------|
-| `option_id` | String | ACP 协议 | 选项 ID |
+| `optionId` | String | ACP 协议 | 选项 ID |
 | `name` | String | ACP 协议 | 选项显示名称 |
 | `kind` | String | ACP 协议 | 选项类型（allow_once/allow_always/reject_once/reject_always） |
 | `_meta` | Object | ACP 协议 | ACP 协议扩展字段（可选） |
@@ -363,21 +367,21 @@ pub enum SessionMessageType {
 
 | 字段 | 类型 | 来源 | 说明 |
 |------|------|------|------|
-| `tool_call_id` | String | RCoder 扩展 | 工具调用 ID（从 tool_call.tool_call_id 提取，用于关联审批结果） |
+| `tool_call_id` | String | RCoder 扩展 | 工具调用 ID（从 toolCall.toolCallId 提取，用于关联审批结果） |
 | `save_rule` | Object | RCoder 扩展 | 规则建议（可选） |
 
 **设计原则**：
 - **`message_type` = `acpRequestPermission`** 表示这是权限请求事件
-- **`data` 字段包含完整的 `RequestPermissionRequest` 内容**，直接透传 ACP 协议
-- **`tool_call_id`**：RCoder 从 `tool_call.id` 提取，用于后续关联审批结果
+- **`data` 字段包含完整的 `RequestPermissionRequest` 内容**，直接透传 ACP 协议（驼峰格式）
+- **`tool_call_id`**：RCoder 从 `toolCall.toolCallId` 提取，用于后续关联审批结果
 - **`save_rule`**：RCoder 根据命令内容生成的规则建议
 
 **前端展示建议**:
 - `data.options` 中的每个选项直接展示给用户
-- `option_id` 可当作不透明字符串，用户选择后原样传回
+- `optionId` 可当作不透明字符串，用户选择后原样传回
 - 当用户选择 "始终允许" 时，`data.save_rule` 告诉前端可以保存规则
 - 前端可以显示一个复选框："以后自动允许类似命令"
-- 如果用户勾选，回传时设置 `save_rule: true`
+- 如果用户勾选，回传时设置 `saveRule: true`
 
 ---
 
