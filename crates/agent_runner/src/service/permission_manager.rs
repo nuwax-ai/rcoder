@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
 
 use agent_abstraction::{PermissionRequestContext, PermissionRequestHandler};
 use agent_client_protocol::Responder;
@@ -20,8 +18,6 @@ use tracing::{error, info, warn};
 
 use super::push_session_update_with_project;
 
-const PENDING_TIMEOUT: Duration = Duration::from_secs(300);
-
 pub static PERMISSION_MANAGER: LazyLock<Arc<PermissionManager>> =
     LazyLock::new(|| Arc::new(PermissionManager::default()));
 
@@ -32,8 +28,6 @@ struct PendingPermission {
     request: RequestPermissionRequest,
     responder: Responder<RequestPermissionResponse>,
     context: PermissionRequestContext,
-    created_at: Instant,
-    generation: u64,
     save_rule: Option<SaveRuleSuggestion>,
 }
 
@@ -61,7 +55,6 @@ struct PermissionRule {
 
 pub struct PermissionManager {
     pending: Mutex<HashMap<PendingKey, PendingPermission>>,
-    pending_generation: AtomicU64,
     rules: DashMap<RuleKey, Vec<PermissionRule>>,
 }
 
@@ -69,7 +62,6 @@ impl Default for PermissionManager {
     fn default() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
-            pending_generation: AtomicU64::new(1),
             rules: DashMap::new(),
         }
     }
@@ -104,23 +96,6 @@ impl PermissionManager {
                 message: Some("permission request not found or already resolved".to_string()),
             };
         };
-
-        if pending.created_at.elapsed() > PENDING_TIMEOUT {
-            let response = cancelled_response();
-            let outcome_json = serde_json::to_string(&response).ok();
-            if let Err(err) = pending.responder.respond(response) {
-                error!("[Permission] failed to respond expired permission: {err}");
-            }
-            return ResolvePermissionResponseDto {
-                success: false,
-                session_id,
-                tool_call_id,
-                outcome_json,
-                rule_saved: false,
-                error_code: Some(shared_types::error_codes::ERR_PERMISSION_EXPIRED.to_string()),
-                message: Some("permission request expired".to_string()),
-            };
-        }
 
         if let Some(project_id) = input.project_id.as_deref().filter(|s| !s.trim().is_empty())
             && project_id != pending.context.project_id
@@ -301,9 +276,7 @@ impl PermissionManager {
         count
     }
 
-    fn store_pending(&self, key: PendingKey, mut pending: PendingPermission) {
-        let generation = self.pending_generation.fetch_add(1, Ordering::Relaxed);
-        pending.generation = generation;
+    fn store_pending(&self, key: PendingKey, pending: PendingPermission) {
         let replaced = self.pending.lock().insert(key.clone(), pending);
         if let Some(replaced) = replaced {
             warn!(
@@ -314,38 +287,6 @@ impl PermissionManager {
                 warn!("[Permission] failed to cancel replaced pending permission: {err}");
             }
         }
-
-        // PERMISSION_MANAGER is the single global instance (LazyLock<Arc<PermissionManager>>).
-        // It is safe to capture via Arc clone here because:
-        // 1. There is exactly one instance in the agent_runner process.
-        // 2. The spawned task accesses the same `pending` map as the one
-        //    the caller inserted into via `&self`.
-        let manager = PERMISSION_MANAGER.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(PENDING_TIMEOUT).await;
-            let pending = {
-                let mut pending_map = manager.pending.lock();
-                if pending_map
-                    .get(&key)
-                    .map(|pending| pending.generation == generation)
-                    .unwrap_or(false)
-                {
-                    pending_map.remove(&key)
-                } else {
-                    None
-                }
-            };
-
-            if let Some(pending) = pending {
-                warn!(
-                    "[Permission] permission request expired: session_id={}, tool_call_id={}",
-                    key.0, key.1
-                );
-                if let Err(err) = pending.responder.respond(cancelled_response()) {
-                    warn!("[Permission] failed to respond expired permission: {err}");
-                }
-            }
-        });
     }
 
     fn save_rule_from_option_kind(
@@ -493,8 +434,6 @@ impl PermissionRequestHandler for PermissionManager {
             request,
             responder,
             context: context.clone(),
-            created_at: Instant::now(),
-            generation: 0,
             save_rule,
         };
         self.store_pending((session_id.clone(), tool_call_id.clone()), pending);
