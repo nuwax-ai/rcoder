@@ -310,14 +310,16 @@ pub async fn install_from_bytes(
         registry,
         &staging,
         &agent_dir,
-        agent_id,
-        command,
-        args,
-        install_type,
-        file_type,
-        file_size,
-        param_version,
-        param_source,
+        StagingInstallParams {
+            agent_id,
+            command,
+            args,
+            install_type,
+            file_type,
+            file_size,
+            version: param_version,
+            source: param_source,
+        },
     )
     .await
 }
@@ -400,16 +402,30 @@ pub async fn install_from_file(
         registry,
         &staging,
         &agent_dir,
-        agent_id,
-        command,
-        args,
-        install_type,
-        file_type,
-        file_size,
-        param_version,
-        param_source,
+        StagingInstallParams {
+            agent_id,
+            command,
+            args,
+            install_type,
+            file_type,
+            file_size,
+            version: param_version,
+            source: param_source,
+        },
     )
     .await
+}
+
+/// staging 安装参数
+struct StagingInstallParams<'a> {
+    agent_id: &'a str,
+    command: &'a str,
+    args: &'a [String],
+    install_type: InstallType,
+    file_type: String,
+    file_size: u64,
+    version: Option<&'a str>,
+    source: Option<&'a str>,
 }
 
 /// 共享的 staging → 解压 → 注册逻辑。
@@ -420,15 +436,18 @@ async fn _install_from_staging(
     registry: &AgentRegistry,
     staging: &Path,
     agent_dir: &Path,
-    agent_id: &str,
-    command: &str,
-    args: &[String],
-    install_type: InstallType,
-    file_type: String,
-    file_size: u64,
-    param_version: Option<&str>,
-    param_source: Option<&str>,
+    params: StagingInstallParams<'_>,
 ) -> AgentMgmtResult<InstallAgentResponse> {
+    let StagingInstallParams {
+        agent_id,
+        command,
+        args,
+        install_type,
+        file_type,
+        file_size,
+        version: param_version,
+        source: param_source,
+    } = params;
     // 同步解压 + entrypoint 查找放到阻塞线程(避免 tar/zip IO 阻塞 tokio runtime)
     let command = command.to_string();
     let command_for_block = command.clone();
