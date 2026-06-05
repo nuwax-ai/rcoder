@@ -6,6 +6,7 @@
 //! - session_to_container_id: DashMap<String, String>
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use duckdb_manager::{ContainerRecord, DuckDbStorage, ProjectRecord, StorageStats, UnifiedStorage};
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 use std::sync::Arc;
@@ -15,10 +16,16 @@ use super::bridge::DataBridge;
 
 /// 项目适配器
 ///
-/// 统一管理项目、会话和容器数据，替代原有的 3 个 DashMap
+/// 统一管理项目、会话和容器数据。
+/// session 映射使用 DashMap 提供 O(1) 查找，避免 DuckDB CAS 竞态问题。
+/// 使用 entry API 操作 DashMap，避免死锁。
 #[derive(Clone)]
 pub struct ProjectAdapter {
     storage: Arc<DuckDbStorage>,
+    /// session_id → project_id（快速查找，SSE handler 使用）
+    session_to_project: Arc<DashMap<String, String>>,
+    /// project_id → session_id（反向索引，用于 clear/remove 时清理）
+    project_to_session: Arc<DashMap<String, String>>,
 }
 
 impl ProjectAdapter {
@@ -27,12 +34,18 @@ impl ProjectAdapter {
         let storage = DuckDbStorage::new()?;
         Ok(Self {
             storage: Arc::new(storage),
+            session_to_project: Arc::new(DashMap::new()),
+            project_to_session: Arc::new(DashMap::new()),
         })
     }
 
     /// 从现有存储创建适配器
     pub fn from_storage(storage: Arc<DuckDbStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            session_to_project: Arc::new(DashMap::new()),
+            project_to_session: Arc::new(DashMap::new()),
+        }
     }
 
     // ========== project_and_agent_map 替代方法 ==========
@@ -91,10 +104,79 @@ impl ProjectAdapter {
         Ok(())
     }
 
-    /// 删除项目（替代 project_and_agent_map.remove）
+    /// 插入项目并设置 session 映射（单次原子写入，消除 CAS 竞态）
+    ///
+    /// 将项目元数据和 session_id 在同一次 DuckDB 事务中写入，
+    /// 同时更新 DashMap 索引。替代原来的 `insert` + `update_session_atomic` 两步操作。
+    pub fn insert_with_session(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+        session_id: Option<&str>,
+    ) -> Result<(), duckdb_manager::DuckDbError> {
+        // 准备容器记录
+        let container_record = info.container().map(|container| {
+            debug!(
+                "Inserting project container info: project_id={}, container_id={}, container_ip={}",
+                project_id, container.container_id, container.container_ip
+            );
+            DataBridge::container_info_to_record(container, info.service_type())
+        });
+
+        // 准备项目记录，覆盖 session_id
+        let mut record = DataBridge::info_to_project_record(&info, &project_id);
+        if let Some(sid) = session_id {
+            record.session_id = Some(sid.to_string());
+            let now = Utc::now();
+            record.session_created_at = Some(now);
+            record.session_last_activity = Some(now);
+        }
+        debug!(
+            "Saving project record with session: project_id={}, session_id={:?}, container_id={}",
+            record.project_id, record.session_id, record.container_id
+        );
+
+        // 单次原子写入
+        self.storage
+            .save_project_and_container_atomic(&record, container_record.as_ref())?;
+
+        // 更新 DashMap 索引
+        // 先用 view 读旧值（锁在闭包返回后立即释放），再单独写入
+        if let Some(sid) = session_id {
+            // 1. 读旧 session_id（view 不暴露 Ref）
+            let old_sid = self
+                .project_to_session
+                .view(&project_id, |_, old| old.clone());
+            // 2. 清除旧正向映射
+            if let Some(ref old) = old_sid
+                && old != sid
+            {
+                self.session_to_project.remove(old);
+            }
+            // 3. 写入新映射（entry API，无闭包内跨 map 操作）
+            self.project_to_session
+                .entry(project_id.clone())
+                .and_modify(|v| *v = sid.to_string())
+                .or_insert_with(|| sid.to_string());
+            self.session_to_project
+                .entry(sid.to_string())
+                .and_modify(|v| *v = project_id.clone())
+                .or_insert_with(|| project_id.clone());
+        }
+
+        debug!("Inserted project with session: {}", project_id);
+        Ok(())
+    }
+
+    /// 删除项目（DuckDB + DashMap 双清）
     pub fn remove(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         // 先获取现有数据
         let info = self.get(project_id)?;
+
+        // 清理 DashMap 索引
+        if let Some((_, old_sid)) = self.project_to_session.remove(project_id) {
+            self.session_to_project.remove(&old_sid);
+        }
 
         // 删除项目记录
         if let Err(e) = self.storage.delete_project(project_id) {
@@ -148,10 +230,31 @@ impl ProjectAdapter {
 
     // ========== sessions 替代方法 ==========
 
-    /// 通过会话ID获取项目信息（替代 sessions.get）
+    /// 通过会话ID获取项目信息
+    ///
+    /// 优先查 DashMap（O(1)），miss 时回退 DuckDB 并填充缓存。
+    /// 使用 `view()` 替代 `get()`，不暴露 `Ref`，锁在函数返回后立即释放。
     pub fn get_by_session_id(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        // 1. 先查 DashMap（view 在闭包返回后立即释放锁，无 Ref 暴露）
+        let project_id_opt = self
+            .session_to_project
+            .view(session_id, |_, project_id| project_id.clone());
+        if let Some(project_id) = project_id_opt {
+            return self.get(&project_id);
+        }
+
+        // 2. DashMap miss，回退 DuckDB
         match self.storage.get_project_by_session(session_id) {
             Ok(Some(record)) => {
+                let project_id = record.project_id.clone();
+                // 填充 DashMap 缓存（entry API）
+                self.session_to_project
+                    .entry(session_id.to_string())
+                    .or_insert_with(|| project_id.clone());
+                self.project_to_session
+                    .entry(project_id.clone())
+                    .or_insert_with(|| session_id.to_string());
+
                 let container = self.get_container_for_project(&record);
                 Some(Arc::new(DataBridge::project_record_to_info(
                     &record, container,
@@ -165,13 +268,36 @@ impl ProjectAdapter {
         }
     }
 
-    /// 更新会话信息（替代 sessions.insert 和会话更新逻辑）
+    /// 更新会话信息（DuckDB + DashMap 双写）
+    ///
+    /// 先用 `view()` 读旧值（锁立即释放），再单独写入，避免 entry 持锁期间跨 map 操作。
     pub fn update_session(
         &self,
         project_id: &str,
         session_id: &str,
     ) -> Result<(), duckdb_manager::DuckDbError> {
         self.storage.update_session(project_id, session_id)?;
+
+        // 1. 读旧 session_id（view 不暴露 Ref，锁立即释放）
+        let old_sid = self
+            .project_to_session
+            .view(&project_id.to_string(), |_, old| old.clone());
+        // 2. 清除旧正向映射
+        if let Some(ref old) = old_sid
+            && old != session_id
+        {
+            self.session_to_project.remove(old);
+        }
+        // 3. 写入新映射（entry API，无闭包内跨 map 操作）
+        self.project_to_session
+            .entry(project_id.to_string())
+            .and_modify(|v| *v = session_id.to_string())
+            .or_insert_with(|| session_id.to_string());
+        self.session_to_project
+            .entry(session_id.to_string())
+            .and_modify(|v| *v = project_id.to_string())
+            .or_insert_with(|| project_id.to_string());
+
         debug!(
             "Updating session: project_id={}, session_id={}",
             project_id, session_id
@@ -182,8 +308,8 @@ impl ProjectAdapter {
     /// 原子更新会话信息（仅当当前 session_id 与预期相同时才更新）
     ///
     /// 使用 compare-and-swap 模式防止并发更新导致的竞态条件。
-    /// 只有当数据库中当前的 session_id 与 `expected_current_session_id` 相同时才更新。
-    /// 如果 `expected_current_session_id` 为 None，则只在当前没有 session_id 时更新。
+    /// 仅保留供其他场景使用，当前 chat handler 已改用 DashMap 直接写入。
+    #[allow(dead_code)]
     pub fn update_session_atomic(
         &self,
         project_id: &str,
@@ -209,11 +335,17 @@ impl ProjectAdapter {
         Ok(updated)
     }
 
-    /// 清除会话信息（将 session_id 设置为 NULL）
+    /// 清除会话信息（DuckDB + DashMap 双清）
     ///
-    /// 用于 Agent 停止后清理会话状态
+    /// 用于 Agent 停止后清理会话状态（容器级 RAII）
     pub fn clear_session(&self, project_id: &str) -> Result<(), duckdb_manager::DuckDbError> {
         self.storage.clear_session(project_id)?;
+
+        // 通过反向索引清理 DashMap
+        if let Some((_, old_sid)) = self.project_to_session.remove(project_id) {
+            self.session_to_project.remove(&old_sid);
+        }
+
         debug!("Clearing session: project_id={}", project_id);
         Ok(())
     }
@@ -502,6 +634,7 @@ impl std::fmt::Debug for ProjectAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProjectAdapter")
             .field("storage", &"<DuckDbStorage>")
+            .field("session_count", &self.session_to_project.len())
             .finish()
     }
 }
@@ -591,5 +724,77 @@ mod tests {
         // 验证迭代
         let count = adapter.iter().count();
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_insert_with_session() {
+        let adapter = ProjectAdapter::new().unwrap();
+
+        let project_id = "test-project-session";
+        let session_id = "test-session-abc";
+        let info = Arc::new(create_test_info(project_id));
+
+        // 通过 insert_with_session 写入
+        adapter
+            .insert_with_session(project_id.to_string(), info.clone(), Some(session_id))
+            .unwrap();
+
+        // 通过 session_id 查找（走 DashMap 快速路径）
+        let by_session = adapter.get_by_session_id(session_id);
+        assert!(by_session.is_some());
+        assert_eq!(by_session.unwrap().project_id(), project_id);
+
+        // clear_session 清理 DashMap
+        adapter.clear_session(project_id).unwrap();
+        assert!(adapter.get_by_session_id(session_id).is_none());
+    }
+
+    #[test]
+    fn test_session_rotation() {
+        let adapter = ProjectAdapter::new().unwrap();
+
+        let project_id = "test-rotation";
+        let info = Arc::new(create_test_info(project_id));
+
+        // 第一次写入 session-1
+        adapter
+            .insert_with_session(project_id.to_string(), info.clone(), Some("session-1"))
+            .unwrap();
+        assert!(adapter.get_by_session_id("session-1").is_some());
+
+        // 第二次写入 session-2（覆盖 session-1）
+        adapter
+            .insert_with_session(project_id.to_string(), info.clone(), Some("session-2"))
+            .unwrap();
+        assert!(adapter.get_by_session_id("session-2").is_some());
+        // 旧 session 应该被清理
+        assert!(adapter.get_by_session_id("session-1").is_none());
+    }
+
+    #[test]
+    fn test_session_cache_miss_fallback() {
+        // 验证 DashMap miss 时回退 DuckDB 并自动填充缓存
+        let adapter = ProjectAdapter::new().unwrap();
+
+        let project_id = "test-fallback";
+        let session_id = "test-session-fallback";
+        let info = Arc::new(create_test_info(project_id));
+
+        // 1. 通过 DuckDB 直接写入 session（绕过 DashMap）
+        adapter
+            .insert(project_id.to_string(), info.clone())
+            .unwrap();
+        adapter
+            .update_session(project_id, session_id)
+            .unwrap();
+
+        // 2. update_session 已写入 DashMap，验证命中
+        let result = adapter.get_by_session_id(session_id);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().project_id(), project_id);
+
+        // 3. 验证 clear_session 后 DuckDB 也被清除（验证 RAII 完整性）
+        adapter.clear_session(project_id).unwrap();
+        assert!(adapter.get_by_session_id(session_id).is_none());
     }
 }

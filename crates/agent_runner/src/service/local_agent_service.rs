@@ -136,7 +136,7 @@ impl AgentHttpService for LocalAgentHttpService {
         // 8. 将 session 写入 SESSION_CACHE（SSE 进度流需要）
         // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
         let session_id_str = output.session_id.clone();
-        if let Some(_existing) = SESSION_CACHE.get(&session_id_str) {
+        if SESSION_CACHE.contains_key(&session_id_str) {
             // 已存在，无需创建
         } else {
             let session_data = SessionData::new(1000).await;

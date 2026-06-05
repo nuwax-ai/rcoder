@@ -760,9 +760,8 @@ pub async fn pod_ensure(
     // 创建者可能已经移除了标记并发送了通知，导致我们错过消息。
     let mut rx = state.pod_created_tx.subscribe();
 
-    if let Some(creating_since) = state.pod_creating.get(&request.user_id) {
-        let elapsed = creating_since.elapsed();
-        drop(creating_since); // 释放 DashMap ref
+    // view() 在闭包返回后立即释放锁，无 Ref 暴露
+    if let Some(elapsed) = state.pod_creating.view(&request.user_id, |_, t| t.elapsed()) {
 
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {

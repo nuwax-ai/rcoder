@@ -128,6 +128,26 @@ impl AppState {
         }
     }
 
+    /// 插入项目并设置 session 映射（单次原子写入，消除 CAS 竞态）
+    #[inline]
+    pub fn insert_project_with_session(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+        session_id: &str,
+    ) {
+        if let Err(e) = self
+            .projects
+            .insert_with_session(project_id.clone(), info, Some(session_id))
+        {
+            tracing::error!(
+                "Failed to insert project with session: project_id={}, error={}",
+                project_id,
+                e
+            );
+        }
+    }
+
     /// 删除项目（替代 project_and_agent_map.remove）
     #[inline]
     pub fn remove_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {

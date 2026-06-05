@@ -44,12 +44,13 @@ pub async fn subscribe_progress(
             use dashmap::mapref::entry::Entry;
 
             // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
-            let session_data = if let Some(existing) = SESSION_CACHE.get(&session_id_clone) {
+            // view() 在闭包返回后立即释放锁，无 Ref 暴露
+            let session_data = if let Some(existing) = SESSION_CACHE.view(&session_id_clone, |_, d| d.clone()) {
                 info!(
                     "📦 [gRPC] SESSION_CACHE already exists, reusing: session_id={}",
                     session_id_clone
                 );
-                existing.clone()
+                existing
             } else {
                 let session_data = crate::service::SessionData::new(1000).await;
                 match SESSION_CACHE.entry(session_id_clone.clone()) {

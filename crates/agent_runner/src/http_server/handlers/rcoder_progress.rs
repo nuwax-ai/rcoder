@@ -162,8 +162,9 @@ pub async fn handle_rcoder_progress(
 
     // 1. 从 SESSION_CACHE 获取 session_data
     // 🛡️ 关键：先 clone Arc<SessionData>，立即释放 DashMap shard 读锁
-    let session_data = match SESSION_CACHE.get(&session_id) {
-        Some(data) => data.value().clone(),
+    // view() 在闭包返回后立即释放锁，无 Ref 暴露
+    let session_data = match SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
+        Some(data) => data,
         None => {
             warn!(" [RCoder] Session not found: session_id={}", session_id);
             return Err((

@@ -372,53 +372,26 @@ pub async fn handle_chat(
                 http_result.is_success()
             );
 
-            // 使用原子更新防止竞态条件
-            // 只有当当前 session_id 与我们之前读取的相同时才更新
-            // 这样可以防止并发请求覆盖彼此的 session_id
-            //
-            // 🛡️ 关键修复：使用 session_id_to_use（我们发送给 agent 的实际值）作为 CAS 预期值
-            // 而不是 request.session_id（用户原始输入，可能为 None）
-            // 当用户未传 session_id 但自动检测到已有 session 时：
-            //   - request.session_id = None
-            //   - session_id_to_use = "existing-session" (DB 中的真实值)
-            //   - CAS 预期应该是 "existing-session"，而不是 None
-            let expected_current = if session_id_to_use.is_empty() {
-                None
-            } else {
-                Some(session_id_to_use.as_str())
-            };
-            let updated = state.update_session_atomic(
-                &project_id,
-                &session_id,
-                expected_current,
+            // 直接更新 session 映射（DashMap + DuckDB 双写，无 CAS 竞态）
+            state.update_session(&project_id, &session_id);
+
+            info!(
+                "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
+                session_id, project_id
             );
 
-            if updated {
+            // 更新项目活动时间
+            state.update_activity(&project_id);
+
+            if http_result.is_success() {
                 info!(
-                    "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
-                    session_id, project_id
+                    "🎯 [CHAT] All state updates completed: project_id={}, session_id={}",
+                    project_id, session_id
                 );
-
-                // 更新项目活动时间
-                state.update_activity(&project_id);
-
-                if http_result.is_success() {
-                    info!(
-                        "🎯 [CHAT] All state updates completed: project_id={}, session_id={}",
-                        project_id, session_id
-                    );
-                } else {
-                    warn!(
-                        "⚠️ [CHAT] Request failed but session mapping saved: project_id={}, session_id={}, code={}, message={}",
-                        project_id, session_id, http_result.code, http_result.message
-                    );
-                }
             } else {
-                // 另一个并发请求已经更新了这个 project 的 session_id
-                // 我们不覆盖它，避免竞态条件
                 warn!(
-                    "⚠️ [CHAT] Session already updated by another request, skipping update: project_id={}, our_session_id={}, expected_current={:?}",
-                    project_id, session_id, expected_current
+                    "⚠️ [CHAT] Request failed but session mapping saved: project_id={}, session_id={}, code={}, message={}",
+                    project_id, session_id, http_result.code, http_result.message
                 );
             }
         }

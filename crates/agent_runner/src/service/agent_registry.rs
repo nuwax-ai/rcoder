@@ -539,10 +539,8 @@ impl AgentSessionRegistry {
         &self,
         session_id: &str,
     ) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
-        // 先通过 session_id 找到 project_id
-        let project_id = self.session_to_project.get(session_id)?;
-        let project_id_str = project_id.value().clone();
-        drop(project_id); // 显式释放 session_to_project 的读锁
+        // view() 在闭包返回后立即释放锁，无 Ref 暴露
+        let project_id_str = self.session_to_project.view(session_id, |_, v| v.clone())?;
 
         // 再通过 project_id 获取 agent_info
         self.agent_info_map.get(&project_id_str)

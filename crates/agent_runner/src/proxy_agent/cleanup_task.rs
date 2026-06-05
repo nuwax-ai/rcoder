@@ -103,10 +103,8 @@ impl AgentCleaner {
             // 如果session_id不在活跃映射中，则为孤立session
             if !active_session_ids.contains(&session_id) {
                 // 检查session中是否有消息
-                if let Some(session_data_ref) = SESSION_CACHE.get(&session_id) {
-                    let session_data = session_data_ref.clone();
-                    drop(session_data_ref);
-
+                // view() 在闭包返回后立即释放锁，无 Ref 暴露
+                if let Some(session_data) = SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
                     let message_count = session_data.message_count().await;
 
                     if message_count > 0 {

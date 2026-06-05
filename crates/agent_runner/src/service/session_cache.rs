@@ -426,10 +426,8 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
     // 2. 慢速路径：先在 entry() 外部 await 创建 SessionData，再原子插入
 
     // 快速路径：session 存在 → 检查 worker 状态 → 推送
-    if let Some(existing_data) = SESSION_CACHE.get(session_id) {
-        let existing = existing_data.clone();
-        drop(existing_data); // 立即释放 DashMap 读锁
-
+    // view() 在闭包返回后立即释放锁，无 Ref 暴露
+    if let Some(existing) = SESSION_CACHE.view(session_id, |_, d| d.clone()) {
         if existing.has_worker_panicked().await {
             // Worker panic：在 entry() 外部创建新 SessionData
             warn!(
@@ -437,8 +435,11 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
                 session_id
             );
             let new_data = SessionData::new(1000).await;
-            // 原子替换
-            SESSION_CACHE.insert(session_id.to_string(), new_data.clone());
+            // entry API 原子替换（语义更明确）
+            SESSION_CACHE
+                .entry(session_id.to_string())
+                .and_modify(|d| *d = new_data.clone())
+                .or_insert_with(|| new_data.clone());
             new_data.push_message(notify.to_unified_message());
         } else {
             existing.push_message(notify.to_unified_message());

@@ -495,9 +495,8 @@ pub async fn handle_chat_core(
                         push_session_update_with_project(&project_id, &old_session_id, notify)
                             .await;
 
-                    if let Some(sd_ref) = SESSION_CACHE.get(&old_session_id) {
-                        let sd = sd_ref.clone();
-                        drop(sd_ref);
+                    // view() 在闭包返回后立即释放锁，无 Ref 暴露
+                    if let Some(sd) = SESSION_CACHE.view(&old_session_id, |_, d| d.clone()) {
                         sd.close_current_connection().await;
                     }
                     SESSION_CACHE.remove(&old_session_id);

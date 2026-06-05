@@ -219,9 +219,8 @@ pub async fn handle_computer_chat(
     // 创建者可能已经移除了标记并发送了通知，导致我们错过消息。
     let mut rx = state.pod_created_tx.subscribe();
 
-    if let Some(creating_since) = state.pod_creating.get(&user_id) {
-        let elapsed = creating_since.elapsed();
-        drop(creating_since); // 释放 DashMap ref
+    // view() 在闭包返回后立即释放锁，无 Ref 暴露
+    if let Some(elapsed) = state.pod_creating.view(&user_id, |_, t| t.elapsed()) {
 
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {
@@ -616,10 +615,8 @@ pub async fn handle_computer_chat(
 
                 // 更新活动时间
                 updated_info.update_activity();
-                // 🛡️ 关键修复：不在这里设置 session_id，避免双重写入导致 CAS 永远失败
-                // insert_project 会将 session_id 写入 DB，然后 update_session_atomic 再写一次
-                // 但 CAS 检查的是旧 session_id，而 DB 已经是新 session_id，导致 CAS 永远失败
-                // 修复：只通过 update_session_atomic 设置 session_id
+                // 设置 session_id
+                updated_info.set_session_id(Some(session_id.clone()));
 
                 // 更新扩展信息
                 updated_info.update_extended_from_request(
@@ -629,22 +626,8 @@ pub async fn handle_computer_chat(
                     Some(shared_types::ServiceType::ComputerAgentRunner),
                 );
 
-                state.insert_project(map_key.clone(), Arc::new(updated_info));
-
-                // 🛡️ 使用原子更新防止竞态条件
-                // 预期值：如果 session_id_to_use 非空，预期 DB 中是该值；否则预期是 None
-                let expected_current = if session_id_to_use.is_empty() {
-                    None
-                } else {
-                    Some(session_id_to_use.as_str())
-                };
-                let updated = state.update_session_atomic(&map_key, &session_id, expected_current);
-                if !updated {
-                    warn!(
-                        "⚠️ [COMPUTER_CHAT] Session CAS failed: project_id={}, expected={:?}, new={}",
-                        map_key, expected_current, session_id
-                    );
-                }
+                // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
+                state.insert_project_with_session(map_key.clone(), Arc::new(updated_info), &session_id);
 
                 info!(
                     "🔄 [COMPUTER_CHAT] Updated existing container mapping: user_id={}, project_id={}, session_id={} (last_activity refreshed)",
@@ -658,10 +641,8 @@ pub async fn handle_computer_chat(
                 project_info.set_user_id(Some(user_id.clone()));
                 // 设置 pod_id（共享容器模式）
                 project_info.set_pod_id(request.pod_id.clone());
-
-                // 🛡️ 关键修复：不在这里设置 session_id，避免双重写入导致 CAS 永远失败
-                // insert_project 会将 session_id = NULL 写入 DB
-                // 然后 update_session_atomic 检查 WHERE session_id IS NULL → 匹配 → 更新
+                // 设置 session_id
+                project_info.set_session_id(Some(session_id.clone()));
 
                 // 更新扩展信息（容器、模型配置等）
                 project_info.update_extended_from_request(
@@ -671,21 +652,8 @@ pub async fn handle_computer_chat(
                     Some(shared_types::ServiceType::ComputerAgentRunner),
                 );
 
-                state.insert_project(map_key.clone(), Arc::new(project_info));
-
-                // 🛡️ 新项目：预期 DB 中没有 session_id，使用 None
-                let expected_current = if session_id_to_use.is_empty() {
-                    None
-                } else {
-                    Some(session_id_to_use.as_str())
-                };
-                let updated = state.update_session_atomic(&map_key, &session_id, expected_current);
-                if !updated {
-                    warn!(
-                        "⚠️ [COMPUTER_CHAT] Session CAS failed (new project): project_id={}, expected={:?}, new={}",
-                        map_key, expected_current, session_id
-                    );
-                }
+                // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
+                state.insert_project_with_session(map_key.clone(), Arc::new(project_info), &session_id);
 
                 info!(
                     "🆕 [COMPUTER_CHAT] Created new container mapping: user_id={}, project_id={}, session_id={}",
