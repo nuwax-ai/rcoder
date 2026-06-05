@@ -48,6 +48,9 @@ pub enum AgentMgmtError {
     #[error("invalid version: {0}")]
     InvalidVersion(String),
 
+    #[error("install cancelled by force reinstall")]
+    InstallCancelled,
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -91,6 +94,7 @@ impl AgentMgmtError {
             Self::InvalidChunk(_) => ec::ERR_AGENT_MGMT_INVALID_CHUNK,
             Self::PlatformNotFound(_) => ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
             Self::InvalidVersion(_) => ec::ERR_AGENT_MGMT_INVALID_VERSION,
+            Self::InstallCancelled => ec::ERR_AGENT_MGMT_INSTALL_CANCELLED,
             Self::UnsupportedType(_) => ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
             Self::Io(_) | Self::Archive(_) | Self::Json(_) => {
                 ec::ERR_INTERNAL_SERVER_ERROR

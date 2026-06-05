@@ -39,6 +39,7 @@ use super::uninstaller;
 pub struct AgentMgmtServiceImpl {
     pub registry: Arc<AgentRegistry>,
     pub path_manager: PathManager,
+    pub lock_manager: Arc<super::InstallLockManager>,
 }
 
 impl AgentMgmtServiceImpl {
@@ -46,6 +47,7 @@ impl AgentMgmtServiceImpl {
         Self {
             registry,
             path_manager,
+            lock_manager: Arc::new(super::InstallLockManager::new()),
         }
     }
 
@@ -130,6 +132,7 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
             npm_package,
             version,
             platforms,
+            force,
         } = metadata;
 
         let agent_id = agent_id.ok_or_else(|| {
@@ -162,7 +165,9 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
                                 ))
                             })?;
                         if !platforms.is_empty() {
+                            let force = force.unwrap_or(false);
                             return url_installer::install_with_version_check(
+                                &self.lock_manager,
                                 &self.registry,
                                 &self.path_manager,
                                 &agent_id,
@@ -170,6 +175,7 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
                                 &args,
                                 ver,
                                 &platforms,
+                                force,
                             )
                             .await
                             .map_err(Self::to_status)

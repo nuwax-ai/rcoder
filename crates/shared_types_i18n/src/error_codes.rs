@@ -157,6 +157,9 @@ pub const ERR_AGENT_MGMT_PLATFORM_NOT_FOUND: &str = "ERR_AGENT_MGMT_PLATFORM_NOT
 /// version 格式不合法(非语义化版本号)
 pub const ERR_AGENT_MGMT_INVALID_VERSION: &str = "ERR_AGENT_MGMT_INVALID_VERSION";
 
+/// 安装被取消(force=true 时取消正在进行的安装)
+pub const ERR_AGENT_MGMT_INSTALL_CANCELLED: &str = "ERR_AGENT_MGMT_INSTALL_CANCELLED";
+
 /// 项目不存在(P0-4: rcoder 转发层用于找不到 project_id 时)
 pub const ERR_PROJECT_NOT_FOUND: &str = "ERR_PROJECT_NOT_FOUND";
 

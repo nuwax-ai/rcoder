@@ -60,16 +60,15 @@ pub struct AgentMgmtForwardCtx {
 /// InstallAgent 的 metadata 参数(独立参数,避免 install 三 endpoint 各自重复字段)
 #[derive(Debug, Clone)]
 pub struct InstallAgentParams {
-    pub agent_id: String,
-    pub command: String,
-    pub args: Vec<String>,
+    pub agent: shared_types::AgentIdentity,
     pub install_type: InstallType,
     pub source_url: Option<String>,
     pub npm_package: Option<String>,
     pub sha256: Option<String>,
     // === 多平台版本管理 ===
-    pub version: Option<String>,
     pub platforms: Option<std::collections::HashMap<String, shared_types::PlatformEntry>>,
+    /// 强制重新安装(取消正在进行的安装)
+    pub force: bool,
 }
 
 impl AgentMgmtForwardCtx {
@@ -231,7 +230,7 @@ pub async fn list_agents(
 ///
 /// `body` 是 HTTP 收到的完整二进制 body(URL/NPM 安装时 body 为空)。
 /// 拆 1MB chunk 推到 agent-runner。
-#[instrument(skip(ctx, project, body, params), fields(agent_id = %params.agent_id))]
+#[instrument(skip(ctx, project, body, params), fields(agent_id = %params.agent.agent_id))]
 pub async fn install_agent(
     ctx: &AgentMgmtForwardCtx,
     project: &ProjectAndContainerInfo,
@@ -243,24 +242,25 @@ pub async fn install_agent(
     // 1. metadata-only 首包
     let first_chunk = InstallAgentRequest {
         metadata: Some(InstallMetadata {
-            agent_id: Some(params.agent_id.clone()),
-            command: Some(params.command.clone()),
-            args: params.args.clone(),
+            agent_id: Some(params.agent.agent_id.clone()),
+            command: Some(params.agent.command.clone()),
+            args: params.agent.args.clone(),
             sha256: params.sha256.clone(),
             install_type: Some(install_type_to_proto_i32(params.install_type)),
             source_url: params.source_url.clone(),
             npm_package: params.npm_package.clone(),
-            version: params.version.clone(),
+            version: params.agent.version.clone(),
             platforms: params.platforms.as_ref().and_then(|p| {
                 serde_json::to_string(p).ok()
             }),
+            force: Some(params.force),
         }),
         data: vec![],
     };
     let total_bytes = body.len();
     debug!(
         "[agent_mgmt_forward] streaming install: agent_id={}, body_bytes={}",
-        params.agent_id, total_bytes
+        params.agent.agent_id, total_bytes
     );
 
     // 2. body 拆 chunk(URL/NPM 模式下 body 为空 → 只有一个首包)

@@ -232,9 +232,11 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
   -H "Content-Type: application/json" \
   -d '{
     "project_id": "p1",
-    "agent_id": "codex-acp",
-    "command": "codex-acp",
-    "version": "1.2.0",
+    "agent": {
+      "agent_id": "codex-acp",
+      "command": "codex-acp",
+      "version": "1.2.0"
+    },
     "platforms": {
       "linux-x86_64": { "url": "https://cdn.example.com/codex-acp-linux-amd64.tar.gz" },
       "linux-aarch64": { "url": "https://cdn.example.com/codex-acp-linux-arm64.tar.gz" }
@@ -249,8 +251,10 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-npm \
   -H "Content-Type: application/json" \
   -d '{
     "project_id": "p1",
-    "agent_id": "claude-code-acp",
-    "command": "claude-code-acp",
+    "agent": {
+      "agent_id": "claude-code-acp",
+      "command": "claude-code-acp"
+    },
     "package": "@anthropic-ai/claude-code-acp"
   }'
 ```
@@ -745,14 +749,11 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 ```json
 {
   "project_id": "p1",
-  "agent_id": "claude-code-acp",
-  "command": "claude-code-acp",
-  "package": "@anthropic-ai/claude-code-acp",
-  "user_id": null,
-  "pod_id": null,
-  "tenant_id": null,
-  "space_id": null,
-  "isolation_type": null
+  "agent": {
+    "agent_id": "claude-code-acp",
+    "command": "claude-code-acp"
+  },
+  "package": "@anthropic-ai/claude-code-acp"
 }
 ```
 
@@ -761,14 +762,21 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
-| agent_id | string | 是 | Agent 标识符 |
-| command | string | 是 | 入口可执行文件名（通常是包名去掉 scope） |
+| agent | object | 是 | Agent 身份信息（见下表） |
 | package | string | 是 | npm 包名（如 `@anthropic-ai/claude-code-acp`） |
 | user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
 | tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
 | space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
 | isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
+
+**agent 子对象字段说明**:
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| agent_id | string | 是 | Agent 标识符 |
+| command | string | 是 | 入口可执行文件名（通常是包名去掉 scope） |
+| args | string[] | 否 | 启动参数（默认空） |
 
 #### 响应
 
@@ -828,9 +836,12 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 ```json
 {
   "project_id": "p1",
-  "agent_id": "codex-acp",
-  "command": "codex-acp",
-  "version": "1.2.0",
+  "agent": {
+    "agent_id": "codex-acp",
+    "command": "codex-acp",
+    "args": ["--serve"],
+    "version": "1.2.0"
+  },
   "platforms": {
     "linux-x86_64": {
       "url": "https://cdn.example.com/agents/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz",
@@ -842,12 +853,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
       "sha256": "a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef1234567890",
       "size": 14680064
     }
-  },
-  "user_id": "user_123",
-  "pod_id": null,
-  "tenant_id": null,
-  "space_id": null,
-  "isolation_type": null
+  }
 }
 ```
 
@@ -856,16 +862,22 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
+| agent | object | 是 | Agent 身份信息（见下表） |
+| platforms | object | 是 | 平台 → 下载信息映射 |
 | user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式，定位容器） |
 | pod_id | string | 否 | Pod ID（有值时覆盖 user_id 作为容器标识） |
 | tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
 | space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
 | isolation_type | string | 条件必填 | 隔离类型：tenant / space / project（pod_id 有值时必填） |
+
+**agent 子对象字段说明**:
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
 | agent_id | string | 是 | Agent 标识符（如 "codex-acp"） |
 | command | string | 是 | 入口可执行文件名（如 "codex-acp"） |
-| version | string | 是 | 期望安装的语义化版本号（用于比较是否需要更新） |
-| platforms | object | 是 | 平台 → 下载信息映射 |
-| args | string[] | 否 | 默认启动参数（默认空） |
+| args | string[] | 否 | 启动参数（默认空） |
+| version | string | 否 | 期望安装的语义化版本号（用于比较是否需要更新） |
 
 #### PlatformEntry 字段说明（platforms 的值）
 
@@ -1241,13 +1253,15 @@ curl -X POST http://localhost:8087/computer/chat \
 ### 5.2 场景二：通过 npm 安装 kimi-cli 并使用
 
 ```bash
-# 1. 通过 npm 安装 kimi-cli
+# 1. 通过 npm 安装 claude-code-acp
 curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-npm \
   -H "Content-Type: application/json" \
   -d '{
     "project_id": "p1",
-    "agent_id": "claude-code-acp",
-    "command": "claude-code-acp",
+    "agent": {
+      "agent_id": "claude-code-acp",
+      "command": "claude-code-acp"
+    },
     "package": "@anthropic-ai/claude-code-acp"
   }'
 # → { "status": "available", "version": "1.0.38" }
@@ -1314,9 +1328,11 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
   -H "Content-Type: application/json" \
   -d '{
     "user_id": "user_123",
-    "agent_id": "codex-acp",
-    "command": "codex-acp",
-    "version": "1.2.0",
+    "agent": {
+      "agent_id": "codex-acp",
+      "command": "codex-acp",
+      "version": "1.2.0"
+    },
     "platforms": {
       "linux-x86_64": {
         "url": "https://cdn.example.com/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz"
@@ -1338,9 +1354,11 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
   -H "Content-Type: application/json" \
   -d '{
     "user_id": "user_123",
-    "agent_id": "codex-acp",
-    "command": "codex-acp",
-    "version": "1.2.0",
+    "agent": {
+      "agent_id": "codex-acp",
+      "command": "codex-acp",
+      "version": "1.2.0"
+    },
     "platforms": { ... }
   }'
 # → action: "skipped", installed: false, version: "1.2.0"
@@ -1355,9 +1373,11 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
   -H "Content-Type: application/json" \
   -d '{
     "user_id": "user_123",
-    "agent_id": "codex-acp",
-    "command": "codex-acp",
-    "version": "1.3.0",
+    "agent": {
+      "agent_id": "codex-acp",
+      "command": "codex-acp",
+      "version": "1.3.0"
+    },
     "platforms": {
       "linux-x86_64": {
         "url": "https://cdn.example.com/codex-acp/1.3.0/codex-acp-linux-amd64.tar.gz",
@@ -1377,11 +1397,14 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
 
 ```java
 // 业务方每次使用 agent 前调用，无需关心是否已安装
+String version = configCenter.getLatestVersion("codex-acp");
 InstallResponse resp = httpClient.post("/agent-mgmt/agents/install-from-url", Map.of(
     "user_id", userId,
-    "agent_id", "codex-acp",
-    "command", "codex-acp",
-    "version", configCenter.getLatestVersion("codex-acp"),  // 从配置中心获取
+    "agent", Map.of(
+        "agent_id", "codex-acp",
+        "command", "codex-acp",
+        "version", version
+    ),
     "platforms", Map.of(
         "linux-x86_64", Map.of("url", "https://cdn.example.com/codex-acp/" + version + "/linux-amd64.tar.gz"),
         "linux-aarch64", Map.of("url", "https://cdn.example.com/codex-acp/" + version + "/linux-arm64.tar.gz")
@@ -1742,19 +1765,26 @@ pub struct RoutingParams {
     pub isolation_type: Option<String>,
 }
 
+/// Agent 身份信息（所有安装端点共享）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct AgentIdentity {
+    pub agent_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
 /// URL 安装请求（多平台 + 版本检查）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InstallFromUrlRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
-    pub agent_id: String,
-    pub command: String,
-    /// 期望安装的版本号（semver 格式,用于版本比较）
-    pub version: String,
+    /// Agent 身份信息（agent_id, command, args, version）
+    pub agent: AgentIdentity,
     /// 平台 → 下载信息映射（key 如 "linux-x86_64", "linux-aarch64"）
     pub platforms: HashMap<String, PlatformEntry>,
-    #[serde(default)]
-    pub args: Vec<String>,
 }
 
 /// 平台下载信息（platforms map 的值）

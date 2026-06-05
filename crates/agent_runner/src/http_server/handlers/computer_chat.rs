@@ -173,6 +173,7 @@ pub async fn handle_computer_chat(
         need_fallback: None,
         fallback_reason: None,
         reloaded: if output.reloaded { Some(true) } else { None },
+        agent_version: output.agent_version.clone(),
     };
 
     // 10. 根据执行结果返回成功或错误

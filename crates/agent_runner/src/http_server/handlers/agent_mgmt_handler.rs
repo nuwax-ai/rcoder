@@ -20,14 +20,13 @@ use axum::{
 use bytes::Bytes;
 use shared_types::HttpResult;
 use shared_types::error_codes as ec;
-use shared_types_grpc::InstallAgentRequest;
 use tracing::{instrument, warn};
 
 use crate::agent_mgmt::conversion;
 use crate::agent_mgmt::error::AgentMgmtError;
-use crate::agent_mgmt::installer::AgentManifest;
 use crate::agent_mgmt::{
-    AgentMgmtResult, AgentRegistry, PathManager, checker::AgentChecker, installer, uninstaller,
+    AgentMgmtResult, AgentRegistry, InstallLockManager, PathManager, checker::AgentChecker,
+    installer, uninstaller,
 };
 use shared_types::{InstallType, ListAgentsRequest};
 
@@ -36,6 +35,7 @@ use shared_types::{InstallType, ListAgentsRequest};
 pub struct AgentMgmtHttpState {
     pub registry: Arc<AgentRegistry>,
     pub path_manager: PathManager,
+    pub lock_manager: Arc<InstallLockManager>,
 }
 
 impl AgentMgmtHttpState {
@@ -43,6 +43,7 @@ impl AgentMgmtHttpState {
         Self {
             registry,
             path_manager,
+            lock_manager: Arc::new(InstallLockManager::new()),
         }
     }
 }
@@ -52,7 +53,8 @@ fn error_to_response(e: AgentMgmtError) -> Response {
     let code = e.error_code();
     let status = match code {
         ec::ERR_AGENT_MGMT_NOT_FOUND => StatusCode::NOT_FOUND,
-        ec::ERR_AGENT_MGMT_ALREADY_INSTALLED => StatusCode::CONFLICT,
+        ec::ERR_AGENT_MGMT_ALREADY_INSTALLED
+        | ec::ERR_AGENT_MGMT_INSTALL_CANCELLED => StatusCode::CONFLICT,
         ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED => StatusCode::FORBIDDEN,
         ec::ERR_AGENT_MGMT_INVALID_MANIFEST
         | ec::ERR_AGENT_MGMT_INVALID_CHUNK
@@ -140,8 +142,16 @@ pub async fn install_agent(
             )));
         }
     };
-    let agent_id = meta.get("agent_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let command = meta.get("command").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    // agent 字段从嵌套的 "agent" 子对象提取
+    let agent_obj = meta.get("agent").unwrap_or(&serde_json::Value::Null);
+    let agent_id = agent_obj.get("agent_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let command = agent_obj.get("command").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let version = agent_obj.get("version").and_then(|v| v.as_str()).map(String::from);
+    let meta_args: Vec<String> = agent_obj
+        .get("args")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    // install_type / source_url / npm_package / sha256 仍在顶层
     let install_type_str = meta
         .get("install_type")
         .and_then(|v| v.as_str())
@@ -155,11 +165,6 @@ pub async fn install_agent(
     let source_url = meta.get("source_url").and_then(|v| v.as_str()).map(String::from);
     let npm_package = meta.get("npm_package").and_then(|v| v.as_str()).map(String::from);
     let sha256 = meta.get("sha256").and_then(|v| v.as_str()).map(String::from);
-    let version = meta.get("version").and_then(|v| v.as_str()).map(String::from);
-    let meta_args: Vec<String> = meta
-        .get("args")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
 
     let result: AgentMgmtResult<shared_types_grpc::InstallAgentResponse> = match install_type {
         InstallType::Url => {
@@ -178,7 +183,9 @@ pub async fn install_agent(
                         }
                     };
                 if !platforms.is_empty() {
+                    let force = meta.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
                     return installer::url_installer::install_with_version_check(
+                        &state.lock_manager,
                         &state.registry,
                         &state.path_manager,
                         &agent_id,
@@ -186,6 +193,7 @@ pub async fn install_agent(
                         &meta_args,
                         ver,
                         &platforms,
+                        force,
                     )
                     .await
                     .map(|r| {
@@ -289,13 +297,15 @@ pub async fn install_from_url(
     Json(req): Json<shared_types::InstallFromUrlRequest>,
 ) -> Response {
     match installer::url_installer::install_with_version_check(
+        &state.lock_manager,
         &state.registry,
         &state.path_manager,
-        &req.agent_id,
-        &req.command,
-        &req.args,
-        &req.version,
+        &req.agent.agent_id,
+        &req.agent.command,
+        &req.agent.args,
+        req.agent.version.as_deref().unwrap_or(""),
         &req.platforms,
+        req.force,
     )
     .await
     {
@@ -322,7 +332,7 @@ pub async fn install_from_npm(
     State(state): State<AgentMgmtHttpState>,
     Json(req): Json<shared_types::InstallFromPackageManagerRequest>,
 ) -> Response {
-    if req.command.is_empty() {
+    if req.agent.command.is_empty() {
         return error_to_response(AgentMgmtError::InvalidManifest(
             "command is required for NPM install".into(),
         ));
@@ -330,9 +340,9 @@ pub async fn install_from_npm(
     match installer::npm_installer::install_from_npm(
         &state.registry,
         &state.path_manager,
-        &req.agent_id,
+        &req.agent.agent_id,
         &req.package,
-        &req.command,
+        &req.agent.command,
     )
     .await
     {
@@ -445,11 +455,3 @@ pub async fn get_agent(
         }
     }
 }
-
-// 保持 AgentManifest 在编译范围内
-#[allow(dead_code)]
-fn _ensure_agent_manifest(_: &AgentManifest) {}
-
-// 保持 InstallAgentRequest 在编译范围内(供未来 streaming HTTP 支持)
-#[allow(dead_code)]
-fn _ensure_chunk(_: &InstallAgentRequest) {}

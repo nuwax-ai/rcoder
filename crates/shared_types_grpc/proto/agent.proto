@@ -95,6 +95,9 @@ message ChatResponse {
 
   // 🆕 Auto-reload 标识（DevComputer 调试模式下 agent 二进制变化时触发）
   bool reloaded = 9; // true 表示本次请求触发了 agent 热重载
+
+  // 🆕 Agent 版本号（可选，检测失败时为空）
+  optional string agent_version = 10;
 }
 
 // === Progress Streaming ===
@@ -521,6 +524,7 @@ message InstallAgentRequest {
     // === 多平台版本管理(install-from-url 新模式) ===
     optional string version = 8;                 // 期望安装的版本号(semver)
     optional string platforms = 9;               // HashMap<String, PlatformEntry> 的 JSON 序列化(字符串)
+    optional bool force = 10;                    // 强制重新安装(取消正在进行的安装)
   }
   // 元数据(只首包携带)
   Metadata metadata = 1;

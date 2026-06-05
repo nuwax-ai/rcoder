@@ -167,6 +167,7 @@ impl AgentHttpService for LocalAgentHttpService {
                 need_fallback: None,
                 fallback_reason: None,
                 reloaded: if output.reloaded { Some(true) } else { None },
+                agent_version: output.agent_version,
             })
         }
     }

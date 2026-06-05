@@ -127,6 +127,7 @@ pub async fn chat(
         need_fallback: output.need_fallback,
         fallback_reason: output.fallback_reason,
         reloaded: output.reloaded,
+        agent_version: output.agent_version,
     };
 
     info!("[gRPC] Chat completed: success={}", grpc_response.success);

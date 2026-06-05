@@ -98,6 +98,7 @@ pub fn grpc_response_to_chat_response(grpc_resp: GrpcChatResponse) -> shared_typ
         need_fallback: None,
         fallback_reason: None,
         reloaded: if grpc_resp.reloaded { Some(true) } else { None },
+        agent_version: grpc_resp.agent_version,
     }
 }
 

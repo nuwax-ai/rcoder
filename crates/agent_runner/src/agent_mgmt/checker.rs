@@ -105,8 +105,38 @@ fn supports_version_check(command: &str) -> bool {
     !matches!(command, "codex-acp" | "codex")
 }
 
+/// 用 which crate（跨平台）检查 agent 命令是否在 PATH 中
+///
+/// 返回解析后的完整路径，未找到时返回错误消息（提示安装）。
+pub fn check_agent_exists(command: &str) -> Result<std::path::PathBuf, String> {
+    which::which(command).map_err(|_| {
+        format!(
+            "agent '{}' not found in PATH, please install via /agent-mgmt/agents/install-from-url",
+            command
+        )
+    })
+}
+
+/// 执行 `{command} -v` 检测 agent 版本号（5s 超时，best-effort）
+///
+/// 成功返回版本字符串，失败/超时/解析失败返回 None。
+pub async fn detect_agent_version(command: &str) -> Option<String> {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(command).arg("-v").output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            parse_version(&stdout)
+        }
+        _ => None,
+    }
+}
+
 /// 解析 "<tool> X.Y.Z" 格式
-#[allow(dead_code)]
 fn parse_version(text: &str) -> Option<String> {
     // 常见格式: "codex-acp 1.2.3", "v1.2.3", "1.2.3", "name version 1.2.3"
     for line in text.lines() {
@@ -166,5 +196,28 @@ mod tests {
         let checks = checker.static_check(&m);
         assert!(!checks.file_exists);
         assert!(!checks.executable);
+    }
+
+    #[test]
+    fn check_agent_exists_finds_real_command() {
+        // "sh" 应该在 PATH 中（Unix）
+        #[cfg(unix)]
+        {
+            let result = check_agent_exists("sh");
+            assert!(result.is_ok(), "sh should be in PATH");
+        }
+    }
+
+    #[test]
+    fn check_agent_exists_rejects_missing_command() {
+        let result = check_agent_exists("definitely-nonexistent-agent-xyz");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found in PATH"));
+    }
+
+    #[tokio::test]
+    async fn detect_agent_version_returns_none_for_missing() {
+        let version = detect_agent_version("definitely-nonexistent-agent-xyz").await;
+        assert!(version.is_none());
     }
 }

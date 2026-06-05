@@ -17,7 +17,7 @@
 //! - **简单 JSON 端点**:使用 [`I18nJsonOrQuery`] 提取器,优先 JSON body,兼容 `?project_id=xxx` query 调试
 //! - **`install` 端点**:使用 `multipart/form-data`,字段:
 //!   - `file`: 二进制文件(单文件 / tar.gz / zip)
-//!   - `metadata`: JSON 字符串(含 `project_id` / `agent_id` / `command` / `args` / `install_type` / `source_url` / `npm_package` / `sha256`)
+//!   - `metadata`: JSON 字符串(含 `project_id` / `agent`(`agent_id` / `command` / `args` / `version`) / `install_type` / `source_url` / `npm_package` / `sha256`)
 //!
 //! # 错误模型
 //!
@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)] // `json!` 仅在 `#[schema(example = json!(...))]` 宏内使用
 use serde_json::json;
 use shared_types::{
-    AppError, HttpResult, InstallType, IsolationType, RoutingParams, ServiceType, error_codes as ec,
+    AgentIdentity, AppError, HttpResult, InstallType, IsolationType, RoutingParams, ServiceType,
+    error_codes as ec,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -71,16 +72,8 @@ pub struct InstallMultipartBody {
 pub struct InstallMetadataBody {
     #[serde(flatten)]
     pub routing: RoutingParams,
-    /// Agent ID(必填,在容器内唯一标识)
-    #[schema(example = "codex-acp")]
-    pub agent_id: String,
-    /// 入口可执行文件名(必填,例如 `codex-acp` / `kimi` / `claude-code-acp`)
-    #[schema(example = "codex-acp")]
-    pub command: String,
-    /// 启动参数(可选,默认空)
-    #[serde(default)]
-    #[schema(value_type = Vec<String>, example = json!(["--serve", "--port", "7091"]))]
-    pub args: Vec<String>,
+    /// Agent 身份信息(agent_id, command, args, version)
+    pub agent: AgentIdentity,
     /// `binary` / `url` / `npm`,大小写不敏感,默认 `binary`
     #[serde(default = "default_install_type")]
     #[schema(example = "BINARY")]
@@ -547,8 +540,8 @@ pub async fn install_agent(
     let meta = meta.ok_or_else(|| {
         AppError::with_message(ec::ERR_VALIDATION, "metadata field is required")
     })?;
-    require_field(Some(&meta.agent_id), "agent_id")?;
-    require_field(Some(&meta.command), "command")?;
+    require_field(Some(&meta.agent.agent_id), "agent_id")?;
+    require_field(Some(&meta.agent.command), "command")?;
 
     let install_type = parse_install_type(
         Some(&meta.install_type),
@@ -571,15 +564,18 @@ pub async fn install_agent(
 
     // 3. 构造 forward 参数
     let params = InstallAgentParams {
-        agent_id: meta.agent_id.clone(),
-        command: meta.command.clone(),
-        args: meta.args.clone(),
+        agent: shared_types::AgentIdentity {
+            agent_id: meta.agent.agent_id.clone(),
+            command: meta.agent.command.clone(),
+            args: meta.agent.args.clone(),
+            version: meta.agent.version.clone(),
+        },
         install_type,
         source_url: meta.source_url.clone(),
         npm_package: meta.npm_package.clone(),
         sha256: meta.sha256.clone().filter(|s| !s.is_empty()),
-        version: None,
         platforms: None,
+        force: false,
     };
 
     let resp = fwd_install(&ctx, &project, params, file_bytes).await?;
@@ -600,9 +596,11 @@ pub async fn install_agent(
 /// ```json
 /// {
 ///   "user_id": "user_123",
-///   "agent_id": "codex-acp",
-///   "command": "codex-acp",
-///   "version": "1.2.0",
+///   "agent": {
+///     "agent_id": "codex-acp",
+///     "command": "codex-acp",
+///     "version": "1.2.0"
+///   },
 ///   "platforms": {
 ///     "linux-x86_64": { "url": "https://cdn.example.com/codex-acp-linux-amd64.tar.gz" },
 ///     "linux-aarch64": { "url": "https://cdn.example.com/codex-acp-linux-arm64.tar.gz" }
@@ -647,9 +645,9 @@ pub async fn install_from_url(
 ) -> Result<Json<HttpResult<shared_types::InstallAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
     let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
-    require_field(Some(&body.agent_id), "agent_id")?;
-    require_field(Some(&body.command), "command")?;
-    require_field(Some(&body.version), "version")?;
+    require_field(Some(&body.agent.agent_id), "agent_id")?;
+    require_field(Some(&body.agent.command), "command")?;
+    require_field(body.agent.version.as_deref(), "version")?;
     if body.platforms.is_empty() {
         return Err(AppError::with_message(
             ec::ERR_VALIDATION,
@@ -666,15 +664,13 @@ pub async fn install_from_url(
         }
     }
     let params = InstallAgentParams {
-        agent_id: body.agent_id.clone(),
-        command: body.command.clone(),
-        args: body.args.clone(),
+        agent: body.agent.clone(),
         install_type: InstallType::Url,
         source_url: None,
         npm_package: None,
         sha256: None,
-        version: Some(body.version.clone()),
         platforms: Some(body.platforms.clone()),
+        force: body.force,
     };
     let ctx = build_ctx(&state);
     let resp = fwd_install(&ctx, &project, params, Bytes::new()).await?;
@@ -695,8 +691,10 @@ pub async fn install_from_url(
 /// ```json
 /// {
 ///   "project_id": "demo-project-001",
-///   "agent_id": "claude-code-acp",
-///   "command": "claude-code-acp",
+///   "agent": {
+///     "agent_id": "claude-code-acp",
+///     "command": "claude-code-acp"
+///   },
 ///   "package": "@anthropic-ai/claude-code-acp"
 /// }
 /// ```
@@ -740,19 +738,17 @@ pub async fn install_from_npm(
 ) -> Result<Json<HttpResult<shared_types::InstallAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
     let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
-    require_field(Some(&body.agent_id), "agent_id")?;
-    require_field(Some(&body.command), "command")?;
+    require_field(Some(&body.agent.agent_id), "agent_id")?;
+    require_field(Some(&body.agent.command), "command")?;
     require_field(Some(&body.package), "package")?;
     let params = InstallAgentParams {
-        agent_id: body.agent_id.clone(),
-        command: body.command.clone(),
-        args: vec![],
+        agent: body.agent.clone(),
         install_type: InstallType::Npm,
         source_url: None,
         npm_package: Some(body.package.clone()),
         sha256: None,
-        version: None,
         platforms: None,
+        force: false,
     };
     let ctx = build_ctx(&state);
     let resp = fwd_install(&ctx, &project, params, Bytes::new()).await?;

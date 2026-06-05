@@ -248,6 +248,7 @@ fn create_swagger_ui() -> SwaggerUi {
             shared_types::GetAgentRequest,
             shared_types::CheckAgentRequest,
             shared_types::CheckAgentResponse,
+            shared_types::AgentIdentity,
             shared_types::InstallFromUrlRequest,
             shared_types::InstallFromPackageManagerRequest,
             shared_types::InstallAgentResponse,

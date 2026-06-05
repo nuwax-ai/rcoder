@@ -84,45 +84,12 @@ fn infer_status(m: &AgentManifest) -> SharedStatus {
     }
 }
 
-/// shared AgentInfo → AgentManifest
-#[allow(dead_code)]
-pub fn shared_agent_info_to_manifest(info: &AgentInfo) -> AgentManifest {
-    AgentManifest {
-        agent_id: info.agent_id.clone(),
-        install_type: info.install_type,
-        command: info
-            .binary_path
-            .as_ref()
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("agent")
-            .to_string(),
-        args: vec![],
-        binary_path: info.binary_path.clone().unwrap_or_default(),
-        source: None,
-        version: info.version.clone(),
-        file_size: 0,
-        file_type: "executable".into(),
-        installed_at: info.installed_at.unwrap_or(0),
-    }
-}
-
 /// 包装 shared SystemInfo 为 proto(便于通过 tonic 直接序列化)
 pub fn system_info_to_proto(s: &shared_types::SystemInfo) -> ProtoSystemInfo {
     ProtoSystemInfo {
         os: s.os.clone(),
         arch: s.arch.clone(),
         platform: s.platform.clone(),
-    }
-}
-
-/// 包装 proto SystemInfo 为 shared
-#[allow(dead_code)]
-pub fn system_info_from_proto(p: &ProtoSystemInfo) -> shared_types::SystemInfo {
-    shared_types::SystemInfo {
-        os: p.os.clone(),
-        arch: p.arch.clone(),
-        platform: p.platform.clone(),
     }
 }
 

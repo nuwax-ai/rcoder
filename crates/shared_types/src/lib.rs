@@ -63,6 +63,7 @@ pub use shared_types_i18n::{
     ERR_AGENT_MGMT_DISK_FULL, ERR_AGENT_MGMT_PERMISSION_DENIED,
     ERR_AGENT_MGMT_UNKNOWN_AGENT, ERR_AGENT_MGMT_INVALID_CHUNK,
     ERR_AGENT_MGMT_PLATFORM_NOT_FOUND, ERR_AGENT_MGMT_INVALID_VERSION,
+    ERR_AGENT_MGMT_INSTALL_CANCELLED,
     ERR_PROJECT_NOT_FOUND, ERR_AGENT_RUNNER_UNAVAILABLE,
 };
 
@@ -167,7 +168,7 @@ pub use rcoder_agent_types::*;
 pub mod http_handlers;
 pub mod agent_mgmt_types;
 pub use agent_mgmt_types::{
-    AgentDetailInfo, AgentInfo, AgentInstallStatus, CheckAgentRequest, CheckAgentResponse,
+    AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus, CheckAgentRequest, CheckAgentResponse,
     GetAgentRequest, InstallAction, InstallAgentResponse, InstallBinaryRequest,
     InstallFromPackageManagerRequest, InstallFromUrlRequest, InstallType, ListAgentsRequest,
     ListAgentsResponse, PlatformEntry, RoutingParams, StaticCheckResult, SystemInfo,

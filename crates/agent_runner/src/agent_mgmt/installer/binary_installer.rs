@@ -746,6 +746,7 @@ mod tests {
                 npm_package: None,
                 version: None,
                 platforms: None,
+                force: None,
             }),
             data: first_data,
         };

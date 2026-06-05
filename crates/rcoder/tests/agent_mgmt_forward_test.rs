@@ -340,15 +340,18 @@ async fn install_agent_streams_chunks_to_mock_server() {
     let expected_chunks = 1 + 2 + 1; // metadata + 1MB + 1MB + 0.5MB
 
     let params = InstallAgentParams {
-        agent_id: "codex-acp".to_string(),
-        command: "codex-acp".to_string(),
-        args: vec!["--serve".to_string()],
+        agent: shared_types::AgentIdentity {
+            agent_id: "codex-acp".to_string(),
+            command: "codex-acp".to_string(),
+            args: vec!["--serve".to_string()],
+            version: None,
+        },
         install_type: SharedInstallType::Binary,
         source_url: None,
         npm_package: None,
         sha256: Some("deadbeef".to_string()),
-        version: None,
         platforms: None,
+        force: false,
     };
 
     let resp = install_agent(&ctx, &project, params, body)
@@ -386,15 +389,18 @@ async fn install_agent_url_mode_uses_single_metadata_chunk() {
 
     // URL 安装: body 为空,期望只发 1 个 metadata-only chunk
     let params = InstallAgentParams {
-        agent_id: "remote-agent".to_string(),
-        command: "remote-agent".to_string(),
-        args: vec![],
+        agent: shared_types::AgentIdentity {
+            agent_id: "remote-agent".to_string(),
+            command: "remote-agent".to_string(),
+            args: vec![],
+            version: None,
+        },
         install_type: SharedInstallType::Url,
         source_url: Some("https://example.com/agent.tar.gz".to_string()),
         npm_package: None,
         sha256: None,
-        version: None,
         platforms: None,
+        force: false,
     };
     let resp = install_agent(&ctx, &project, params, Bytes::new())
         .await
@@ -489,15 +495,18 @@ async fn business_code_in_status_propagates_as_app_error() {
     let project = make_project(addr);
 
     let params = InstallAgentParams {
-        agent_id: "codex-acp".to_string(),
-        command: "codex-acp".to_string(),
-        args: vec![],
+        agent: shared_types::AgentIdentity {
+            agent_id: "codex-acp".to_string(),
+            command: "codex-acp".to_string(),
+            args: vec![],
+            version: None,
+        },
         install_type: SharedInstallType::Binary,
         source_url: None,
         npm_package: None,
         sha256: None,
-        version: None,
         platforms: None,
+        force: false,
     };
     let err = install_agent(&ctx, &project, params, Bytes::new())
         .await

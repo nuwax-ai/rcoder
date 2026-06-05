@@ -19,10 +19,12 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use shared_types::InstallType;
 use shared_types_grpc::InstallAgentResponse;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::binary_installer;
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
+use crate::agent_mgmt::install_lock::InstallLockManager;
 use crate::agent_mgmt::path_manager::PathManager;
 use crate::agent_mgmt::registry::AgentRegistry;
 
@@ -55,7 +57,8 @@ pub async fn install_from_url(
     // 下载到临时文件(支持重试 + 断点续传)
     let staging_path = path_manager.install_dir()
         .join(format!(".download-staging-{}", uuid::Uuid::new_v4()));
-    download_to_file(url, &staging_path, shared_types::MAX_BINARY_SIZE, expected_sha256).await?;
+    let cancel = CancellationToken::new(); // install_from_url 不支持取消
+    download_to_file(url, &staging_path, shared_types::MAX_BINARY_SIZE, expected_sha256, &cancel).await?;
 
     // 文件大小（download_to_file 已校验，传递给 install_from_file）
     let file_size = std::fs::metadata(&staging_path)
@@ -88,10 +91,83 @@ pub async fn install_from_url(
 
 /// 多平台版本管理安装(幂等)
 ///
-/// 1. 查注册表判断 action (installed/updated/skipped)
-/// 2. skipped → 直接返回现有信息
-/// 3. 匹配当前系统平台 → 查 platforms map → 下载 → 安装
+/// 1. 获取 per-agent-id 安装锁（防并发）
+/// 2. 查注册表判断 action (installed/updated/skipped)
+/// 3. skipped → 直接返回现有信息
+/// 4. 匹配当前系统平台 → 查 platforms map → 下载 → 安装
+#[allow(clippy::too_many_arguments)]
 pub async fn install_with_version_check(
+    lock_manager: &InstallLockManager,
+    registry: &AgentRegistry,
+    path_manager: &PathManager,
+    agent_id: &str,
+    command: &str,
+    args: &[String],
+    version: &str,
+    platforms: &std::collections::HashMap<String, shared_types::PlatformEntry>,
+    force: bool,
+) -> AgentMgmtResult<InstallAgentResponse> {
+    crate::agent_mgmt::path_manager::validate_agent_id(agent_id)
+        .map_err(AgentMgmtError::InvalidManifest)?;
+    crate::agent_mgmt::path_manager::validate_command(command)
+        .map_err(AgentMgmtError::InvalidManifest)?;
+
+    // 0. 版本格式校验(至少包含一个数字)
+    validate_version_format(version)?;
+
+    // 0.5 获取 per-agent-id 安装锁
+    let state = lock_manager.get_or_create(agent_id);
+    if force {
+        // 强制模式：取消当前安装，等待锁
+        state.cancel();
+    }
+    let _guard = if force {
+        state.lock().await
+    } else {
+        match state.try_lock() {
+            Some(guard) => guard,
+            None => {
+                // 正在安装中，返回当前状态
+                let current_version = state.installing_version();
+                info!(
+                    "[agent_mgmt] install in progress: agent_id={}, version={:?}, requested={}",
+                    agent_id, current_version, version
+                );
+                let mut resp = make_in_progress_response(agent_id, current_version.as_deref());
+                resp.previous_version = version.to_string();
+                return Ok(resp);
+            }
+        }
+    };
+
+    // 标记安装开始，替换取消令牌（确保 force-cancel 后新安装使用干净的 token）
+    state.set_installing(version);
+    let cancel_token = CancellationToken::new();
+    state.replace_cancel_token(cancel_token.clone());
+
+    // 执行安装（内部检查 cancel token）
+    let result = do_install_with_version_check(
+        cancel_token,
+        registry,
+        path_manager,
+        agent_id,
+        command,
+        args,
+        version,
+        platforms,
+    )
+    .await;
+
+    // 安装完成（成功或失败），清除状态
+    state.clear_installing();
+
+    result
+}
+
+/// 实际安装逻辑（从 install_with_version_check 中提取，便于锁管理）
+#[allow(clippy::too_many_arguments)]
+async fn do_install_with_version_check(
+    cancel_token: CancellationToken,
     registry: &AgentRegistry,
     path_manager: &PathManager,
     agent_id: &str,
@@ -101,14 +177,6 @@ pub async fn install_with_version_check(
     platforms: &std::collections::HashMap<String, shared_types::PlatformEntry>,
 ) -> AgentMgmtResult<InstallAgentResponse> {
     use crate::agent_mgmt::registry::{compare_versions, normalize_platform_key};
-
-    crate::agent_mgmt::path_manager::validate_agent_id(agent_id)
-        .map_err(AgentMgmtError::InvalidManifest)?;
-    crate::agent_mgmt::path_manager::validate_command(command)
-        .map_err(AgentMgmtError::InvalidManifest)?;
-
-    // 0. 版本格式校验(至少包含一个数字)
-    validate_version_format(version)?;
 
     // 1. 版本检查
     let existing = registry.get(agent_id);
@@ -166,7 +234,7 @@ pub async fn install_with_version_check(
     let expected_sha256 = entry.sha256.as_deref().filter(|s| !s.is_empty());
     let staging_path = path_manager.install_dir()
         .join(format!(".download-staging-{}", uuid::Uuid::new_v4()));
-    download_to_file(&entry.url, &staging_path, shared_types::MAX_BINARY_SIZE, expected_sha256).await?;
+    download_to_file(&entry.url, &staging_path, shared_types::MAX_BINARY_SIZE, expected_sha256, &cancel_token).await?;
 
     // 文件大小（download_to_file 已校验，传递给 install_from_file）
     let file_size = std::fs::metadata(&staging_path)
@@ -223,6 +291,24 @@ fn validate_version_format(version: &str) -> AgentMgmtResult<()> {
     Ok(())
 }
 
+/// 构造 in-progress response(正在安装中,force=false 时返回)
+fn make_in_progress_response(agent_id: &str, version: Option<&str>) -> InstallAgentResponse {
+    InstallAgentResponse {
+        agent_id: agent_id.to_string(),
+        status: shared_types_grpc::AgentInstallStatus::Available as i32,
+        binary_path: String::new(),
+        file_type: String::new(),
+        file_count: None,
+        file_size: 0,
+        version: version.map(String::from),
+        source_url: None,
+        action: "in_progress".to_string(),
+        installed: false,
+        previous_version: String::new(),
+        platform: String::new(),
+    }
+}
+
 /// 构造 skip response(版本已是最新,不需要安装)
 fn make_skip_response(manifest: &crate::agent_mgmt::installer::AgentManifest) -> InstallAgentResponse {
     InstallAgentResponse {
@@ -244,17 +330,19 @@ fn make_skip_response(manifest: &crate::agent_mgmt::installer::AgentManifest) ->
 const MAX_DOWNLOAD_RETRIES: usize = 3;
 const RETRY_BACKOFF_BASE_SECS: u64 = 1;
 
-/// 下载 URL 内容到文件,支持重试 + 断点续传
+/// 下载 URL 内容到文件,支持重试 + 断点续传 + 取消
 ///
 /// - 最多重试 3 次,指数退避(1s/2s/4s)
 /// - 支持 HTTP Range 断点续传(服务器需支持)
 /// - 流式写入文件,避免大文件占满内存
 /// - 下载完成后校验 SHA-256(如果提供)
+/// - 支持通过 `cancel_token` 取消正在进行的下载
 async fn download_to_file(
     url: &str,
     dest_path: &std::path::Path,
     max_bytes: u64,
     expected_sha256: Option<&str>,
+    cancel_token: &CancellationToken,
 ) -> AgentMgmtResult<u64> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(shared_types::URL_DOWNLOAD_TIMEOUT_SECS))
@@ -361,6 +449,7 @@ async fn download_to_file(
             downloaded,
             max_bytes,
             append,
+            cancel_token,
         )
         .await;
 
@@ -418,13 +507,14 @@ async fn download_to_file(
     Ok(file_size)
 }
 
-/// 流式写入 HTTP response body 到文件
+/// 流式写入 HTTP response body 到文件（支持取消）
 async fn write_response_to_file(
     response: reqwest::Response,
     dest_path: &std::path::Path,
     initial_offset: u64,
     max_bytes: u64,
     append: bool,
+    cancel_token: &CancellationToken,
 ) -> AgentMgmtResult<u64> {
     let mut file = if append {
         std::fs::OpenOptions::new()
@@ -439,18 +529,33 @@ async fn write_response_to_file(
     let mut total = initial_offset;
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AgentMgmtError::InstallFailed(format!("read body: {e}")))?;
-        total += chunk.len() as u64;
-        if total > max_bytes {
-            // 超限,删除文件
-            let _ = std::fs::remove_file(dest_path);
-            return Err(AgentMgmtError::BinaryTooLarge {
-                size: total,
-                max: max_bytes,
-            });
+    loop {
+        tokio::select! {
+            chunk = stream.next() => {
+                match chunk {
+                    Some(Ok(bytes)) => {
+                        total += bytes.len() as u64;
+                        if total > max_bytes {
+                            let _ = std::fs::remove_file(dest_path);
+                            return Err(AgentMgmtError::BinaryTooLarge {
+                                size: total,
+                                max: max_bytes,
+                            });
+                        }
+                        file.write_all(&bytes).map_err(AgentMgmtError::Io)?;
+                    }
+                    Some(Err(e)) => {
+                        return Err(AgentMgmtError::InstallFailed(format!("read body: {e}")));
+                    }
+                    None => break, // 下载完成
+                }
+            }
+            _ = cancel_token.cancelled() => {
+                info!("[agent_mgmt] download cancelled");
+                let _ = std::fs::remove_file(dest_path);
+                return Err(AgentMgmtError::InstallCancelled);
+            }
         }
-        file.write_all(&chunk).map_err(AgentMgmtError::Io)?;
     }
     file.flush().map_err(AgentMgmtError::Io)?;
 
@@ -541,7 +646,7 @@ mod tests {
 
         // 限制只下载前 1MB(文件总大小 ~393MB)
         let max_bytes = 1024 * 1024;
-        let result = download_to_file(url, &dest, max_bytes, None).await;
+        let result = download_to_file(url, &dest, max_bytes, None, &CancellationToken::new()).await;
 
         // 应该成功(下载了 1MB 后超限报错,或服务器不支持 Range 时下载完整小块)
         // 实际行为取决于服务器是否支持 Range
@@ -582,7 +687,7 @@ mod tests {
 
         // 先下载前 100KB
         let first_bytes = 100 * 1024;
-        let result1 = download_to_file(url, &dest, first_bytes, None).await;
+        let result1 = download_to_file(url, &dest, first_bytes, None, &CancellationToken::new()).await;
 
         let downloaded = match result1 {
             Ok(size) => size,
@@ -604,7 +709,7 @@ mod tests {
 
         // 现在用更大的 max_bytes 继续下载(续传)
         let max_bytes = 200 * 1024; // 200KB
-        let result2 = download_to_file(url, &dest, max_bytes, None).await;
+        let result2 = download_to_file(url, &dest, max_bytes, None, &CancellationToken::new()).await;
 
         match result2 {
             Ok(total_size) => {
@@ -643,7 +748,7 @@ mod tests {
         let dest = tmp_dir.join("test-404.zip");
         let _ = std::fs::remove_file(&dest);
 
-        let result = download_to_file(url, &dest, 1024, None).await;
+        let result = download_to_file(url, &dest, 1024, None, &CancellationToken::new()).await;
 
         match result {
             Err(AgentMgmtError::InstallFailed(msg)) => {
@@ -698,7 +803,7 @@ mod tests {
 
         // === Step 2: 调用 download_to_file 续传(max_bytes 设大,允许完成) ===
         let max_bytes = 5 * 1024 * 1024; // 5MB (测试文件更大,但只要超过续传后的大小即可验证)
-        let result = download_to_file(url, &dest, max_bytes, None).await;
+        let result = download_to_file(url, &dest, max_bytes, None, &CancellationToken::new()).await;
 
         match result {
             Ok(total) => {
@@ -749,7 +854,7 @@ mod tests {
 
         // 尝试续传,但服务器不支持 Range → 从头下载 → 超限
         let max_bytes = 1024 * 1024; // 1MB
-        let result = download_to_file(url, &dest, max_bytes, None).await;
+        let result = download_to_file(url, &dest, max_bytes, None, &CancellationToken::new()).await;
 
         match result {
             Err(AgentMgmtError::BinaryTooLarge { size, max }) => {

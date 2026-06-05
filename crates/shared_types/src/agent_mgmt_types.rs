@@ -269,6 +269,38 @@ pub struct InstallBinaryRequest {
     pub sha256: Option<String>,
 }
 
+/// Agent 身份信息(所有安装端点共享)
+///
+/// 描述 agent 的标识、启动命令和版本，作为嵌套 `"agent"` 对象用于安装请求 JSON。
+///
+/// ## 示例
+///
+/// ```json
+/// {
+///   "agent_id": "codex-acp",
+///   "command": "codex-acp",
+///   "args": ["--serve", "--port", "7091"],
+///   "version": "1.2.0"
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct AgentIdentity {
+    /// Agent ID(容器内唯一标识,如 "codex-acp", "kimi-cli")
+    #[schema(example = "codex-acp")]
+    pub agent_id: String,
+    /// 入口可执行文件名(安装后可直接调用的命令,如 "codex-acp")
+    #[schema(example = "codex-acp")]
+    pub command: String,
+    /// 启动参数(可选,传递给 agent 进程,默认空)
+    #[serde(default)]
+    #[schema(example = json!(["--serve", "--port", "7091"]))]
+    pub args: Vec<String>,
+    /// 期望安装的版本号(semver 格式,如 "1.2.0",可选)
+    #[serde(default)]
+    #[schema(example = "1.2.0")]
+    pub version: Option<String>,
+}
+
 /// URL 安装 Agent 的请求(多平台 + 版本管理)
 ///
 /// agent-runner 独立运行时直接使用此类型（路由字段忽略）。
@@ -279,9 +311,12 @@ pub struct InstallBinaryRequest {
 /// ```json
 /// {
 ///   "project_id": "demo-project-001",
-///   "agent_id": "codex-acp",
-///   "command": "codex-acp",
-///   "version": "1.2.0",
+///   "agent": {
+///     "agent_id": "codex-acp",
+///     "command": "codex-acp",
+///     "args": ["--serve"],
+///     "version": "1.2.0"
+///   },
 ///   "platforms": {
 ///     "linux-x86_64": {
 ///       "url": "https://cdn.example.com/releases/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz",
@@ -317,25 +352,46 @@ pub struct InstallBinaryRequest {
 pub struct InstallFromUrlRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
-    /// Agent ID(容器内唯一标识,如 "codex-acp", "kimi-cli")
-    #[schema(example = "codex-acp")]
-    pub agent_id: String,
-    /// 入口可执行文件名(安装后可直接调用的命令,如 "codex-acp")
-    #[schema(example = "codex-acp")]
-    pub command: String,
-    /// 期望安装的版本号(semver 格式,如 "1.2.0")
-    #[schema(example = "1.2.0")]
-    pub version: String,
+    /// Agent 身份信息(agent_id, command, args, version)
+    #[schema(example = json!({
+        "agent_id": "codex-acp",
+        "command": "codex-acp",
+        "args": ["--serve", "--port", "7091"],
+        "version": "1.2.0"
+    }))]
+    pub agent: AgentIdentity,
     /// 多平台下载信息映射
     ///
     /// key 为 `{os}-{arch}` 格式(如 `linux-x86_64`, `darwin-arm64`),
     /// value 包含该平台的下载 URL、SHA-256 校验和、文件大小。
     /// agent-runner 根据容器系统自动选择匹配的平台。
+    ///
+    /// 常用平台 key:
+    /// - `linux-x86_64` — Linux AMD64 服务器
+    /// - `linux-arm64` — Linux ARM64 (AWS Graviton)
+    /// - `darwin-arm64` — macOS Apple Silicon
+    /// - `darwin-x86_64` — macOS Intel
+    /// - `windows-x86_64` — Windows AMD64
+    #[schema(example = json!({
+        "linux-x86_64": {
+            "url": "https://cdn.example.com/agent/1.0.0/agent-linux-amd64.tar.gz",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "size": 52428800
+        },
+        "linux-arm64": {
+            "url": "https://cdn.example.com/agent/1.0.0/agent-linux-arm64.tar.gz",
+            "sha256": "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+            "size": 49283072
+        },
+        "darwin-arm64": {
+            "url": "https://cdn.example.com/agent/1.0.0/agent-darwin-arm64.tar.gz",
+            "size": 47185920
+        }
+    }))]
     pub platforms: std::collections::HashMap<String, PlatformEntry>,
-    /// 启动参数(可选,传递给 agent 进程)
+    /// 强制重新安装(取消正在进行的安装，重新开始)
     #[serde(default)]
-    #[schema(example = json!(["--serve", "--port", "7091"]))]
-    pub args: Vec<String>,
+    pub force: bool,
 }
 
 /// 包管理器安装 Agent 的请求
@@ -348,24 +404,22 @@ pub struct InstallFromUrlRequest {
 /// ```json
 /// {
 ///   "project_id": "demo-project-001",
-///   "agent_id": "claude-code-acp",
-///   "package": "@anthropic-ai/claude-code-acp",
-///   "command": "claude-code-acp"
+///   "agent": {
+///     "agent_id": "claude-code-acp",
+///     "command": "claude-code-acp"
+///   },
+///   "package": "@anthropic-ai/claude-code-acp"
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct InstallFromPackageManagerRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
-    /// Agent ID(容器内唯一标识)
-    #[schema(example = "claude-code-acp")]
-    pub agent_id: String,
+    /// Agent 身份信息(agent_id, command; args 默认空)
+    pub agent: AgentIdentity,
     /// npm 包名(含 scope,如 `@anthropic-ai/claude-code-acp`)
     #[schema(example = "@anthropic-ai/claude-code-acp")]
     pub package: String,
-    /// 入口可执行文件名(一般是包名去掉 scope 后的命令名)
-    #[schema(example = "claude-code-acp")]
-    pub command: String,
 }
 
 /// 安装响应(上传/URL/npm 通用)
@@ -533,5 +587,29 @@ mod tests {
             serde_json::to_string(&AgentInstallStatus::NotInstalled).unwrap(),
             "\"not_installed\""
         );
+    }
+
+    #[test]
+    fn agent_identity_serde_round_trip() {
+        let identity = AgentIdentity {
+            agent_id: "codex-acp".to_string(),
+            command: "codex-acp".to_string(),
+            args: vec!["--serve".to_string()],
+            version: Some("1.2.0".to_string()),
+        };
+        let json = serde_json::to_string(&identity).unwrap();
+        let parsed: AgentIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.agent_id, identity.agent_id);
+        assert_eq!(parsed.command, identity.command);
+        assert_eq!(parsed.args, identity.args);
+        assert_eq!(parsed.version, identity.version);
+    }
+
+    #[test]
+    fn agent_identity_defaults_args_and_version() {
+        let identity: AgentIdentity =
+            serde_json::from_str(r#"{"agent_id":"x","command":"x"}"#).unwrap();
+        assert!(identity.args.is_empty());
+        assert!(identity.version.is_none());
     }
 }

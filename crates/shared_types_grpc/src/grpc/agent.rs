@@ -66,6 +66,9 @@ pub struct ChatResponse {
     /// true 表示本次请求触发了 agent 热重载
     #[prost(bool, tag = "9")]
     pub reloaded: bool,
+    /// 🆕 Agent 版本号（可选，检测失败时为空）
+    #[prost(string, optional, tag = "10")]
+    pub agent_version: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProgressRequest {
@@ -648,6 +651,9 @@ pub mod install_agent_request {
         /// HashMap\<String, PlatformEntry> 的 JSON 序列化(字符串)
         #[prost(string, optional, tag = "9")]
         pub platforms: ::core::option::Option<::prost::alloc::string::String>,
+        /// 强制重新安装(取消正在进行的安装)
+        #[prost(bool, optional, tag = "10")]
+        pub force: ::core::option::Option<bool>,
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

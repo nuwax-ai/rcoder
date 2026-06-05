@@ -18,10 +18,12 @@ pub mod conversion;
 pub mod error;
 pub mod grpc;
 pub mod installer;
+pub mod install_lock;
 pub mod path_manager;
 pub mod registry;
 pub mod uninstaller;
 
 pub use error::AgentMgmtResult;
+pub use install_lock::InstallLockManager;
 pub use path_manager::PathManager;
 pub use registry::AgentRegistry;

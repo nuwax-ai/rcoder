@@ -83,6 +83,8 @@ pub struct ChatHandlerOutput {
     pub fallback_reason: Option<String>,
     /// 是否触发了 agent 二进制热重载
     pub reloaded: bool,
+    /// agent 版本号（可选，检测失败时为 None）
+    pub agent_version: Option<String>,
 }
 
 impl ChatHandlerOutput {
@@ -103,6 +105,7 @@ impl ChatHandlerOutput {
             need_fallback: false,
             fallback_reason: None,
             reloaded: false,
+            agent_version: None,
         }
     }
 
@@ -118,6 +121,7 @@ impl ChatHandlerOutput {
             need_fallback: false,
             fallback_reason: None,
             reloaded: false,
+            agent_version: None,
         }
     }
 }
@@ -322,6 +326,44 @@ pub async fn handle_chat_core(
         );
         AGENT_REGISTRY.get_agent_info(&project_id)
     });
+
+    // ========== 步骤1.5: 检查 agent 二进制是否存在 + 版本检测 ==========
+    use crate::agent_mgmt::checker;
+    let agent_version = if let Some(ref agent_config) = input.agent_config_override {
+        if let Some(ref server) = agent_config.agent_server {
+            if let Some(ref command) = server.command {
+                if let Err(e) = checker::check_agent_exists(command) {
+                    error!("[ChatHandler] Agent not found: {}", e);
+                    return ChatHandlerOutput::error(
+                        project_id,
+                        session_id.unwrap_or_default(),
+                        e,
+                        error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
+                    );
+                }
+                checker::detect_agent_version(command).await
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        // 默认 agent: claude-code-acp-ts
+        if let Err(e) = checker::check_agent_exists("claude-code-acp-ts") {
+            error!("[ChatHandler] Default agent not found: {}", e);
+            return ChatHandlerOutput::error(
+                project_id,
+                session_id.unwrap_or_default(),
+                e,
+                error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
+            );
+        }
+        checker::detect_agent_version("claude-code-acp-ts").await
+    };
+    if let Some(ref v) = agent_version {
+        info!("[ChatHandler] Agent version detected: {}", v);
+    }
 
     // ========== 步骤2: 检查 Agent Busy 状态，如果忙则取消当前任务 ==========
     use crate::model::AgentStatus;
@@ -606,6 +648,7 @@ pub async fn handle_chat_core(
                 need_fallback: false,
                 fallback_reason: None,
                 reloaded: was_reloaded,
+                agent_version,
             };
 
             info!(

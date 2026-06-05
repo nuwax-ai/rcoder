@@ -165,8 +165,7 @@ async fn install_binary_succeeds() {
     // 构造 tar.gz 压缩包(内含 shell 脚本)
     let archive = build_minimal_tar_gz("demo", b"#!/bin/sh\necho hello\n");
     let metadata = serde_json::json!({
-        "agent_id": "demo",
-        "command": "demo",
+        "agent": {"agent_id": "demo", "command": "demo"},
         "install_type": "BINARY"
     });
 
@@ -216,8 +215,7 @@ async fn install_binary_rejects_oversize() {
     let big: Vec<u8> = vec![0u8; 1024 * 1024];
     let oversize = big.repeat(501);
     let metadata = serde_json::json!({
-        "agent_id": "oversize-test",
-        "command": "oversize-test"
+        "agent": {"agent_id": "oversize-test", "command": "oversize-test"}
     });
     let req = Request::builder()
         .method("POST")
@@ -256,9 +254,7 @@ async fn install_from_url_rejects_non_http_scheme() {
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({
-        "agent_id": "evil",
-        "command": "evil",
-        "version": "1.0.0",
+        "agent": {"agent_id": "evil", "command": "evil", "version": "1.0.0"},
         "platforms": {"linux-x86_64": {"url": "file:///etc/passwd"}}
     });
     let req = Request::builder()
@@ -279,9 +275,7 @@ async fn install_from_url_rejects_empty_command() {
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({
-        "agent_id": "x",
-        "command": "",
-        "version": "1.0.0",
+        "agent": {"agent_id": "x", "command": "", "version": "1.0.0"},
         "platforms": {"linux-x86_64": {"url": "https://example.com/agent"}}
     });
     let req = Request::builder()
@@ -308,9 +302,8 @@ async fn install_from_npm_rejects_when_npm_unavailable() {
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({
-        "agent_id": "npm-test-xyz",
-        "package": "@nonexistent-scope-12345/nonexistent-pkg-99999",
-        "command": "nonexistent-bin"
+        "agent": {"agent_id": "npm-test-xyz", "command": "nonexistent-bin"},
+        "package": "@nonexistent-scope-12345/nonexistent-pkg-99999"
     });
     let req = Request::builder()
         .method("POST")

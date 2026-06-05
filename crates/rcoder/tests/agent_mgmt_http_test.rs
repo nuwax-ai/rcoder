@@ -65,47 +65,44 @@ fn uninstall_agent_body_parses() {
 #[test]
 fn install_from_url_body_parses() {
     let body: shared_types::InstallFromUrlRequest = serde_json::from_str(
-        r#"{"project_id":"p1","agent_id":"codex-acp","command":"codex-acp","version":"1.2.0","platforms":{"linux-x86_64":{"url":"https://x.example/agent-linux-amd64.tar.gz","sha256":"abc"}},"args":["--serve"]}"#,
+        r#"{"project_id":"p1","agent":{"agent_id":"codex-acp","command":"codex-acp","args":["--serve"],"version":"1.2.0"},"platforms":{"linux-x86_64":{"url":"https://x.example/agent-linux-amd64.tar.gz","sha256":"abc"}}}"#,
     )
     .unwrap();
-    assert_eq!(body.version, "1.2.0");
+    assert_eq!(body.agent.version.as_deref(), Some("1.2.0"));
     assert_eq!(body.platforms.len(), 1);
     assert_eq!(body.platforms["linux-x86_64"].url, "https://x.example/agent-linux-amd64.tar.gz");
     assert_eq!(body.platforms["linux-x86_64"].sha256.as_deref(), Some("abc"));
-    assert_eq!(body.args, vec!["--serve"]);
+    assert_eq!(body.agent.args, vec!["--serve"]);
 }
 
 #[test]
 fn install_from_npm_body_parses() {
     let body: shared_types::InstallFromPackageManagerRequest = serde_json::from_str(
-        r#"{"project_id":"p1","agent_id":"kimi","command":"kimi","package":"@scope/kimi"}"#,
+        r#"{"project_id":"p1","agent":{"agent_id":"kimi","command":"kimi"},"package":"@scope/kimi"}"#,
     )
     .unwrap();
     assert_eq!(body.package, "@scope/kimi");
-    assert_eq!(body.command, "kimi");
+    assert_eq!(body.agent.command, "kimi");
 }
 
 #[test]
 fn install_metadata_body_parses_with_default_install_type() {
     let json = r#"{
         "project_id": "p1",
-        "agent_id": "codex-acp",
-        "command": "codex-acp",
-        "args": ["--serve"],
+        "agent": {"agent_id": "codex-acp", "command": "codex-acp", "args": ["--serve"]},
         "sha256": "deadbeef"
     }"#;
     let m: handler::InstallMetadataBody = serde_json::from_str(json).unwrap();
     assert_eq!(m.install_type, "BINARY"); // default
     assert_eq!(m.routing.project_id.as_deref(), Some("p1"));
-    assert_eq!(m.agent_id, "codex-acp");
+    assert_eq!(m.agent.agent_id, "codex-acp");
 }
 
 #[test]
 fn install_metadata_body_explicit_install_type_url() {
     let json = r#"{
         "project_id": "p1",
-        "agent_id": "remote",
-        "command": "remote",
+        "agent": {"agent_id": "remote", "command": "remote"},
         "install_type": "URL",
         "source_url": "https://example.com/x.tar.gz"
     }"#;
@@ -118,8 +115,7 @@ fn install_metadata_body_explicit_install_type_url() {
 fn install_metadata_body_npm_with_package() {
     let json = r#"{
         "project_id": "p1",
-        "agent_id": "kimi",
-        "command": "kimi",
+        "agent": {"agent_id": "kimi", "command": "kimi"},
         "install_type": "NPM",
         "npm_package": "@scope/kimi"
     }"#;
@@ -259,7 +255,7 @@ async fn install_route_accepts_1mb_multipart_body() {
         );
 
     let payload = vec![0u8; 1024 * 1024]; // 1MB
-    let meta = r#"{"agent_id":"x","command":"x","install_type":"BINARY"}"#;
+    let meta = r#"{"agent":{"agent_id":"x","command":"x"},"install_type":"BINARY"}"#;
     let (ct, body) = build_multipart_body(&payload, meta);
     let req = Request::builder()
         .method("POST")
@@ -299,7 +295,7 @@ async fn install_route_accepts_10mb_multipart_body() {
         );
 
     let payload = vec![0u8; 10 * 1024 * 1024]; // 10MB
-    let meta = r#"{"agent_id":"x","command":"x"}"#;
+    let meta = r#"{"agent":{"agent_id":"x","command":"x"}}"#;
     let (ct, body) = build_multipart_body(&payload, meta);
     let req = Request::builder()
         .method("POST")
@@ -320,7 +316,7 @@ async fn install_route_accepts_10mb_multipart_body() {
 fn install_metadata_body_empty_install_type_defaults_to_binary() {
     // `Some("")` 会被 parse_install_type 视为缺失(走 trim+filter)
     let m: handler::InstallMetadataBody = serde_json::from_str(
-        r#"{"agent_id":"x","command":"x","install_type":""}"#,
+        r#"{"agent":{"agent_id":"x","command":"x"},"install_type":""}"#,
     )
     .unwrap();
     assert_eq!(m.install_type, ""); // 字段本身保持空串(handler 才规范化)
@@ -329,7 +325,7 @@ fn install_metadata_body_empty_install_type_defaults_to_binary() {
 #[test]
 fn install_metadata_body_explicit_binary_works() {
     let m: handler::InstallMetadataBody = serde_json::from_str(
-        r#"{"agent_id":"x","command":"x","install_type":"BINARY"}"#,
+        r#"{"agent":{"agent_id":"x","command":"x"},"install_type":"BINARY"}"#,
     )
     .unwrap();
     assert_eq!(m.install_type, "BINARY");
@@ -338,7 +334,7 @@ fn install_metadata_body_explicit_binary_works() {
 #[test]
 fn install_metadata_body_lowercase_npm_works() {
     let m: handler::InstallMetadataBody = serde_json::from_str(
-        r#"{"agent_id":"x","command":"x","install_type":"npm","npm_package":"@scope/p"}"#,
+        r#"{"agent":{"agent_id":"x","command":"x"},"install_type":"npm","npm_package":"@scope/p"}"#,
     )
     .unwrap();
     assert_eq!(m.install_type, "npm");
@@ -347,27 +343,27 @@ fn install_metadata_body_lowercase_npm_works() {
 #[test]
 fn install_metadata_body_mixed_case_url_works() {
     let m: handler::InstallMetadataBody = serde_json::from_str(
-        r#"{"agent_id":"x","command":"x","install_type":"Url","source_url":"https://x/y"}"#,
+        r#"{"agent":{"agent_id":"x","command":"x"},"install_type":"Url","source_url":"https://x/y"}"#,
     )
     .unwrap();
     assert_eq!(m.install_type, "Url");
 }
 
 #[test]
-fn install_from_url_body_requires_agent_id() {
-    // 缺失 agent_id 字段 → serde 拒绝(没有 `#[serde(default)]`)
+fn install_from_url_body_requires_agent() {
+    // 缺失 agent 子对象 → serde 拒绝
     let r: Result<shared_types::InstallFromUrlRequest, _> = serde_json::from_str(
-        r#"{"command":"x","url":"https://x/y"}"#,
+        r#"{"version":"1.0.0","platforms":{"linux-x86_64":{"url":"https://x/y"}}}"#,
     );
-    assert!(r.is_err(), "missing agent_id should fail deserialization");
+    assert!(r.is_err(), "missing agent should fail deserialization");
 }
 
 #[test]
-fn install_from_npm_body_requires_agent_id() {
+fn install_from_npm_body_requires_agent() {
     let r: Result<shared_types::InstallFromPackageManagerRequest, _> = serde_json::from_str(
-        r#"{"command":"x","package":"@scope/p"}"#,
+        r#"{"package":"@scope/p"}"#,
     );
-    assert!(r.is_err(), "missing agent_id should fail deserialization");
+    assert!(r.is_err(), "missing agent should fail deserialization");
 }
 
 #[test]
@@ -375,17 +371,17 @@ fn install_from_url_body_empty_agent_id_parses_but_handler_rejects() {
     // 显式空串能 parse 过去(serde String 接受空串),
     // 但 handler 里的 require_field 会拦下。这条测试保护这条契约。
     let body: shared_types::InstallFromUrlRequest = serde_json::from_str(
-        r#"{"agent_id":"","command":"x","version":"1.0.0","platforms":{"linux-x86_64":{"url":"https://x/y"}}}"#,
+        r#"{"agent":{"agent_id":"","command":"x","version":"1.0.0"},"platforms":{"linux-x86_64":{"url":"https://x/y"}}}"#,
     )
     .unwrap();
-    assert_eq!(body.agent_id, "");
+    assert_eq!(body.agent.agent_id, "");
 }
 
 #[test]
 fn install_from_npm_body_empty_agent_id_parses_but_handler_rejects() {
     let body: shared_types::InstallFromPackageManagerRequest = serde_json::from_str(
-        r#"{"agent_id":"","command":"x","package":"@scope/p"}"#,
+        r#"{"agent":{"agent_id":"","command":"x"},"package":"@scope/p"}"#,
     )
     .unwrap();
-    assert_eq!(body.agent_id, "");
+    assert_eq!(body.agent.agent_id, "");
 }
