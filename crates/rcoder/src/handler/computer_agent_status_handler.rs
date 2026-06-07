@@ -267,7 +267,7 @@ pub async fn computer_agent_status(
         )));
     }
 
-    // 6. Agent 存活，从 DuckDB 获取完整信息
+    // 6. Agent 存活，从 存储 获取完整信息
     let response = if let Some(project_info) = state.get_project(project_id) {
         ComputerAgentStatusResponse {
             user_id: request.user_id.clone(),
@@ -279,9 +279,9 @@ pub async fn computer_agent_status(
             created_at: Some(project_info.created_at()),
         }
     } else {
-        // DuckDB 中无记录，但 gRPC 确认 Agent 存在
+        // no project record found，但 gRPC 确认 Agent 存在
         warn!(
-            "⚠️ [COMPUTER_AGENT_STATUS] Agent exists but no DuckDB record (may be due to service restart causing state loss): {}, project_id={}. Attempting self-healing...",
+            "⚠️ [COMPUTER_AGENT_STATUS] Agent exists but no project record (may be due to service restart causing state loss): {}, project_id={}. Attempting self-healing...",
             identifier_display, project_id
         );
 
@@ -304,7 +304,7 @@ pub async fn computer_agent_status(
         // 但目前的 GetStatusResponse 没有 session_id 字段，所以只能置空或尝试从其他地方恢复
         // 这里暂时置空，等下次聊天时会自动更新
 
-        // 插入到 DuckDB
+        // insert into storage
         state.insert_project(project_id.to_string(), Arc::new(project_info.clone()))
             .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
 

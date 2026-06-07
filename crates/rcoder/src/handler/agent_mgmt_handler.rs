@@ -149,7 +149,7 @@ fn validate_routing_params(routing: &RoutingParams) -> Result<(), AppError> {
 
 /// 解析容器目标（支持 project_id 和 user_id/pod_id 两条查找路径）
 ///
-/// - Path A: `project_id` 有值 → DuckDB 查找（向后兼容）
+/// - Path A: `project_id` 有值 → storage lookup（向后兼容）
 /// - Path B: `user_id` 或 `pod_id` 有值 → 运行时容器查找（多租户模式）
 /// - Path C: 都没有 → ERR_VALIDATION
 async fn resolve_container_target(

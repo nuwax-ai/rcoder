@@ -831,7 +831,7 @@ pub async fn pod_ensure(
                     );
                 }
 
-                // 更新 DuckDB 记录
+                // 更新存储 记录
                 let project_info = if let Some(existing) = state.get_project(&request.project_id) {
                     let mut pinfo = (*existing).clone();
                     pinfo.set_container(Some(info.clone()));
@@ -847,7 +847,7 @@ pub async fn pod_ensure(
                 state.insert_project(request.project_id.clone(), Arc::new(project_info))
                     .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
                 debug!(
-                    "📝 [POD_ENSURE] DuckDB record updated: project_id={}, user_id={}, container_id={}",
+                    "📝 [POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
                     request.project_id, request.user_id, info.container_id
                 );
 
@@ -1184,8 +1184,8 @@ pub async fn pod_ensure(
         );
     }
 
-    // 5. 更新 DuckDB 存储中的容器信息（用于后续保活）
-    // 无论容器是新建还是已存在，都要确保 DuckDB 记录是最新的
+    // 5. 更新存储中的容器信息（用于后续保活）
+    // 无论容器是新建还是已存在，都要确保 存储 记录是最新的
     let project_info = if let Some(existing) = state.get_project(&request.project_id) {
         // 如果已存在记录，更新容器信息
         let mut info = (*existing).clone();
@@ -1204,7 +1204,7 @@ pub async fn pod_ensure(
     state.insert_project(request.project_id.clone(), Arc::new(project_info))
         .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
     debug!(
-        "📝 [POD_ENSURE] DuckDB record updated: project_id={}, user_id={}, container_id={}",
+        "📝 [POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
         request.project_id, request.user_id, container_info.container_id
     );
 
@@ -1306,7 +1306,7 @@ pub async fn pod_keepalive(
         request.user_id, request.project_id, container_identifier
     );
 
-    // 2. 检查 DuckDB 存储中是否有记录，并更新活动时间
+    // 2. 检查 存储中是否有记录，并更新活动时间
     // 更新当前项目的 last_activity；共享容器场景下还需更新同容器下其他项目
     let (previous_activity_time, current_activity_time, existed) = {
         if let Some(existing_info) = state.get_project(&request.project_id) {
@@ -1338,13 +1338,13 @@ pub async fn pod_keepalive(
 
     // 3. 获取或创建容器
     let (container_info, created) = if !existed {
-        // DuckDB 存储中没有记录，检查 Docker 中是否有容器
+        // 存储中没有记录，检查 Docker 中是否有容器
         let existing_container =
             ComputerContainerManager::get_container_info(&container_identifier, state.runtime()).await?;
 
         match existing_container {
             Some(info) => {
-                // Docker 中有容器，检查并插入到 DuckDB 存储
+                // Docker 中有容器，检查并insert into storage
                 if !state.contains_project(&request.project_id) {
                     let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
                     project_info.set_user_id(Some(request.user_id.clone()));
@@ -1354,10 +1354,10 @@ pub async fn pod_keepalive(
                     project_info.set_container(Some(info.clone()));
                     state.insert_project(request.project_id.clone(), Arc::new(project_info))
                         .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
-                    info!("[POD_KEEPALIVE] container already exists (Docker), updating DuckDB");
+                    info!("[POD_KEEPALIVE] container already exists (Docker), updating 存储");
                 } else {
                     info!(
-                        "[POD_KEEPALIVE] container already exists (Docker), DuckDB already up to date"
+                        "[POD_KEEPALIVE] container already exists (Docker), 存储 already up to date"
                     );
                 }
                 (info, false)
@@ -1375,12 +1375,12 @@ pub async fn pod_keepalive(
             }
         }
     } else {
-        // DuckDB 存储中有记录，直接获取容器信息
+        // 存储中有记录，直接获取容器信息
         let info = ComputerContainerManager::get_container_info(&container_identifier, state.runtime())
             .await?
             .ok_or_else(|| {
                 error!(
-                    "[POD_KEEPALIVE] Container status abnormal: DuckDB has record but container not found in Docker"
+                    "[POD_KEEPALIVE] Container status abnormal: 存储 has record but container not found in Docker"
                 );
                 AppError::internal_server_error("Container status abnormal")
             })?;
@@ -1637,7 +1637,7 @@ pub async fn pod_restart(
         );
     }
 
-    // 6. 在 DuckDB 存储中记录容器信息
+    // 6. 在 存储中记录容器信息
     {
         // 🛡️ 关键修复：如果项目已存在，保留现有的 session_id
         let project_info = if let Some(existing) = state.get_project(&request.project_id) {
@@ -2129,7 +2129,7 @@ pub async fn pod_vnc_status(
                 .await,
         )
     } else if let Some(pid) = project_id {
-        // 如果只有 project_id，通过 DuckDB 查找关联的容器
+        // 如果只有 project_id，通过 storage lookup关联的容器
         if state.projects.get_container_by_user_id(pid).is_some() {
             // project_id 可能实际上是 user_id
             (

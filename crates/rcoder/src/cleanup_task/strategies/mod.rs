@@ -25,7 +25,7 @@ pub enum DestroyReason {
         timeout_secs: u64,
     },
 
-    /// 孤立容器 - DuckDB 中没有对应记录
+    /// 孤立容器 - 存储中没有对应记录
     /// - 容器存在但状态管理系统中没有记录
     /// - 可能是由于系统重启、异常退出等原因导致
     Orphaned {

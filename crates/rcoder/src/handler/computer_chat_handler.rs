@@ -407,18 +407,18 @@ pub async fn handle_computer_chat(
         );
     }
 
-    // 🛡️ 关键修复：容器创建成功后立即插入 DuckDB 记录
+    // 🛡️ 关键修复：容器创建成功后立即插入 存储 记录
     // 这样可以防止孤立容器清理器误判并清理刚创建的容器
     //
     // 必须在 gRPC 请求之前就插入记录，因为：
-    // 1. 孤立容器清理器会检查 DuckDB 中是否存在该 user_id 的记录
+    // 1. 孤立容器清理器会检查 存储 中是否存在该 user_id 的记录
     // 2. 如果记录不存在，容器会被判定为孤立并清理
     // 3. gRPC 请求是异步的，可能需要较长时间才能返回
     ensure_project_mapping_in_state(&state, &user_id, &project_id, &container_info, &request)?;
 
     // 请求到达时立即更新活动时间（不等待请求执行结果）
     // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
-    // 注意：这里使用 project_id 而不是 user_id，因为 DuckDB 的 key 是 project_id
+    // 注意：这里使用 project_id 而不是 user_id，因为 存储 的 key 是 project_id
     state.update_activity(&project_id);
     debug!(
         "🔄 [COMPUTER_CHAT] Updated activity time: project_id={}",
@@ -939,12 +939,12 @@ async fn ensure_project_workspace_exists(
     Ok(())
 }
 
-/// 确保 DuckDB 中存在 project_id 到容器的映射
+/// 确保 存储 中存在 project_id 到容器的映射
 ///
-/// 🛡️ 关键修复：容器创建成功后立即插入 DuckDB 记录
+/// 🛡️ 关键修复：容器创建成功后立即插入 存储 记录
 ///
 /// 这样可以防止孤立容器清理器误判并清理刚创建的容器，因为：
-/// 1. 孤立容器清理器会检查 DuckDB 中是否存在该 user_id 关联的记录
+/// 1. 孤立容器清理器会检查 存储 中是否存在该 user_id 关联的记录
 /// 2. 如果记录不存在，容器会被判定为孤立并清理
 /// 3. gRPC 请求是异步的，可能需要较长时间才能返回
 ///
@@ -968,7 +968,7 @@ fn ensure_project_mapping_in_state(
         if let Some(existing_container) = existing.container() {
             if existing_container.container_id == container_info.container_id {
                 debug!(
-                    "🔄 [COMPUTER_CHAT] DuckDB record already exists and container unchanged: project_id={}",
+                    "🔄 [COMPUTER_CHAT] project record already exists and container unchanged: project_id={}",
                     project_id
                 );
                 return Ok(());
@@ -1012,12 +1012,12 @@ fn ensure_project_mapping_in_state(
         Some(shared_types::ServiceType::ComputerAgentRunner),
     );
 
-    // 立即插入到 DuckDB
+    // immediately insert project record
     state.insert_project(project_id.to_string(), Arc::new(project_info))
         .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
 
     info!(
-        "🆕 [COMPUTER_CHAT] Inserted DuckDB record (immediately after container creation): user_id={}, project_id={}, container_id={}",
+        "🆕 [COMPUTER_CHAT] Inserted project record (immediately after container creation): user_id={}, project_id={}, container_id={}",
         user_id, project_id, container_info.container_id
     );
 

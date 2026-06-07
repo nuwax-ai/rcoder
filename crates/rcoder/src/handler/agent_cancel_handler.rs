@@ -297,7 +297,7 @@ async fn check_container_exists_by_info(
 
 /// 内部核心处理函数 v2：处理会话取消请求（支持多种服务类型）
 ///
-/// 使用 DuckDB 统一查询，支持 RCoder 和 ComputerAgentRunner 两种模式
+/// 使用 storage lookup，支持 RCoder 和 ComputerAgentRunner 两种模式
 async fn handle_session_cancel_internal_v2(
     state: &AppState,
     identifier: CancelIdentifier,

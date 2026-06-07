@@ -218,7 +218,7 @@ pub async fn handle_chat(
         )
         .await?;
 
-    // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
+    // 第二步：获取或创建 ProjectAndContainerInfo - 使用 存储
     let _ = {
         info!("[CHAT] Getting/creating project: project_id={}", project_id);
 
@@ -358,7 +358,7 @@ pub async fn handle_chat(
         result.is_ok()
     );
 
-    // 响应后状态更新 - 使用 DuckDB 存储
+    // 响应后状态更新 - 使用 存储
     // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
     // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
     if let Ok(http_result) = &result
@@ -374,7 +374,7 @@ pub async fn handle_chat(
                 http_result.is_success()
             );
 
-            // 直接更新 session 映射（DashMap + DuckDB 双写，无 CAS 竞态）
+            // 直接更新 session 映射（DashMap 单写，无 CAS 竞态）
             state.update_session(&project_id, &session_id);
 
             info!(

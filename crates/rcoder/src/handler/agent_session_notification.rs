@@ -453,19 +453,19 @@ async fn validate_and_get_session_context(
     let container_name = match state.get_container_name_by_session(session_id) {
         Some(name) => {
             debug!(
-                "🔍 [SSE_PROXY] Getting container name from DuckDB: session_id={}, container_name={}",
+                "🔍 [SSE_PROXY] Getting container name from storage: session_id={}, container_name={}",
                 session_id, name
             );
             name
         }
         None => {
-            // 🔄 DuckDB 中没有记录，触发降级查询
+            // 🔄 存储 中没有记录，触发降级查询
             // 可能原因：
-            // 1. 新 session 尚未写入 DuckDB（正常情况）
+            // 1. 新 session 尚未写入 存储（正常情况）
             // 2. 测试环境脏数据
-            // 3. 容器重建后 DuckDB 未更新
+            // 3. 容器重建后 存储 未更新
             info!(
-                "🔄 [SSE_PROXY] session_id record not found in DuckDB, executing fallback query: session_id={}, project_id={}",
+                "🔄 [SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
                 session_id,
                 project_info.project_id()
             );
@@ -528,7 +528,7 @@ async fn validate_and_get_session_context(
                 _ => {
                     // RCoder 模式：从 project_info 获取容器名称，或使用 project_id 作为容器名称
                     //
-                    // ⚠️ 注意：project_info 从 DuckDB 读取，可能包含部分过时数据
+                    // ⚠️ 注意：project_info 从 存储 读取，可能包含部分过时数据
                     // - container_name: 稳定不变（容器重建后仍有效）
                     // - container_id, container_ip: 可能过时（容器重建后会变化）
                     //
@@ -537,14 +537,14 @@ async fn validate_and_get_session_context(
                     match project_info.container() {
                         Some(container) => {
                             info!(
-                                "✅ [SSE_PROXY] Fallback query succeeded: got container name from project_info (DuckDB): container_name={}",
+                                "✅ [SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
                                 container.container_name
                             );
                             container.container_name.clone()
                         }
                         None => {
                             // project_info 中没有容器信息，使用 project_id 作为容器名称
-                            // 这通常发生在容器刚创建但尚未写入 DuckDB 的情况
+                            // 这通常发生在容器刚创建但尚未写入 存储 的情况
                             // 阶段 3 会通过 Docker API 验证容器是否存在
                             warn!(
                                 "⚠️ [SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",

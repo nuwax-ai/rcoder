@@ -269,7 +269,7 @@ impl ContainerStatusChecker {
 
                 if is_active {
                     // 容器有活跃任务，更新活动时间和状态
-                    // 注意：使用 project_id 更新 DuckDB，而不是 lookup_key
+                    // 注意：使用 project_id 更新存储，而不是 lookup_key
                     if let Err(e) = update_project_activity(&project_id, &self.state).await {
                         warn!(
                             "⚠️ [STATUS_CHECKER] Failed to update activity time: project_id={}, {}",
@@ -316,7 +316,7 @@ impl ContainerStatusChecker {
                     );
                     self.health_states.remove(lookup_key);
                     self.state.grpc_pool.remove(&grpc_addr);
-                    // 注意：不移除 DuckDB 存储中的项目记录，由清理任务统一处理
+                    // 注意：不移除存储中的项目记录，由清理任务统一处理
                     return Err(e);
                 }
 
@@ -634,7 +634,7 @@ async fn query_container_status(
 
 /// 更新项目活动时间（并同步更新关联容器的活动时间）
 ///
-/// 使用 DuckDB 存储更新 projects 表的 last_activity 字段
+/// 更新项目的 last_activity 字段
 async fn update_project_activity(project_id: &str, state: &Arc<AppState>) -> anyhow::Result<()> {
     // 使用 ProjectAdapter 的 update_activity 方法
     // 该方法会同时更新 project 和关联 container 的 last_activity
