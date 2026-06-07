@@ -766,7 +766,9 @@ mod tests {
         let info = Arc::new(create_test_info(project_id));
 
         // insert
-        adapter.insert(project_id.to_string(), info.clone());
+        adapter
+            .insert(project_id.to_string(), info.clone())
+            .unwrap();
         assert!(adapter.contains_key(project_id));
 
         // get
@@ -787,7 +789,7 @@ mod tests {
         let session_id = "test-session-1";
 
         let info = Arc::new(create_test_info_with_container(project_id, "container-1"));
-        adapter.insert(project_id.to_string(), info);
+        adapter.insert(project_id.to_string(), info).unwrap();
 
         adapter.update_session(project_id, session_id);
 
@@ -804,7 +806,9 @@ mod tests {
         let adapter = make_adapter();
         for i in 0..3 {
             let pid = format!("iter-project-{}", i);
-            adapter.insert(pid.clone(), Arc::new(create_test_info(&pid)));
+            adapter
+                .insert(pid.clone(), Arc::new(create_test_info(&pid)))
+                .unwrap();
         }
         assert_eq!(adapter.iter().len(), 3);
     }
@@ -816,7 +820,9 @@ mod tests {
         let session_id = "test-session-abc";
         let info = Arc::new(create_test_info(project_id));
 
-        adapter.insert_with_session(project_id.to_string(), info, Some(session_id));
+        adapter
+            .insert_with_session(project_id.to_string(), info, Some(session_id))
+            .unwrap();
 
         let by_session = adapter.get_by_session_id(session_id);
         assert!(by_session.is_some());
@@ -832,10 +838,14 @@ mod tests {
         let project_id = "test-rotation";
         let info = Arc::new(create_test_info(project_id));
 
-        adapter.insert_with_session(project_id.to_string(), info.clone(), Some("session-1"));
+        adapter
+            .insert_with_session(project_id.to_string(), info.clone(), Some("session-1"))
+            .unwrap();
         assert!(adapter.get_by_session_id("session-1").is_some());
 
-        adapter.insert_with_session(project_id.to_string(), info.clone(), Some("session-2"));
+        adapter
+            .insert_with_session(project_id.to_string(), info.clone(), Some("session-2"))
+            .unwrap();
         assert!(adapter.get_by_session_id("session-2").is_some());
         assert!(adapter.get_by_session_id("session-1").is_none());
     }
@@ -846,7 +856,9 @@ mod tests {
         assert!(adapter.is_empty());
         assert_eq!(adapter.len(), 0);
 
-        adapter.insert("p1".to_string(), Arc::new(create_test_info("p1")));
+        adapter
+            .insert("p1".to_string(), Arc::new(create_test_info("p1")))
+            .unwrap();
         assert_eq!(adapter.len(), 1);
         assert!(!adapter.is_empty());
     }
@@ -855,7 +867,9 @@ mod tests {
     fn test_update_activity() {
         let adapter = make_adapter();
         let pid = "test-activity";
-        adapter.insert(pid.to_string(), Arc::new(create_test_info(pid)));
+        adapter
+            .insert(pid.to_string(), Arc::new(create_test_info(pid)))
+            .unwrap();
 
         let ts = adapter.update_activity(pid);
         assert!(ts.is_some());
@@ -924,8 +938,12 @@ mod tests {
         );
         info2.set_service_type(Some(ServiceType::ComputerAgentRunner));
 
-        adapter.insert("proj-1".to_string(), Arc::new(info1));
-        adapter.insert("proj-2".to_string(), Arc::new(info2));
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info1))
+            .unwrap();
+        adapter
+            .insert("proj-2".to_string(), Arc::new(info2))
+            .unwrap();
 
         // 容器只有 1 个条目（container_key = "user-1"，第二个 insert 走 inc_ref）
         assert_eq!(adapter.containers.len(), 1);
@@ -955,11 +973,15 @@ mod tests {
         let info = Arc::new(create_test_info_with_container("proj-A", "container-A"));
 
         // 第一次 insert：创建容器条目，ref_count = 1
-        adapter.insert("proj-A".to_string(), info.clone());
+        adapter
+            .insert("proj-A".to_string(), info.clone())
+            .unwrap();
         assert_eq!(adapter.containers.len(), 1);
 
         // 第二次 insert（相同 container_key）：不应 inc_ref
-        adapter.insert("proj-A".to_string(), info.clone());
+        adapter
+            .insert("proj-A".to_string(), info.clone())
+            .unwrap();
         assert_eq!(adapter.containers.len(), 1);
 
         // remove：ref_count 从 1→0，容器应被清理
@@ -969,5 +991,479 @@ mod tests {
             0,
             "重复 insert 不应导致 ref_count 泄露，remove 后容器应被清理"
         );
+    }
+
+    // ========== 并发 RAII + 死锁验证测试 ==========
+
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// 超时 join：如果线程在 timeout 内未完成，返回 None（表示可能死锁）
+    fn join_with_timeout<T>(handle: thread::JoinHandle<T>, timeout_secs: u64) -> Option<T> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        while !handle.is_finished() {
+            if Instant::now() > deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().ok()
+    }
+
+    /// 从 receiver 中收集所有待处理的 CleanupRequest
+    fn drain_cleanup_requests(
+        rx: &std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<CleanupRequest>>,
+    ) -> Vec<CleanupRequest> {
+        let mut guard = rx.lock().unwrap();
+        let mut requests = vec![];
+        while let Ok(req) = guard.try_recv() {
+            requests.push(req);
+        }
+        requests
+    }
+
+    /// 创建共享容器模式的 project（ComputerAgentRunner，同一 user_id）
+    fn create_shared_project(
+        project_id: &str,
+        user_id: &str,
+        container: &ContainerBasicInfo,
+    ) -> ProjectAndContainerInfo {
+        let mut info = ProjectAndContainerInfo::from_parts(
+            project_id.to_string(),
+            Some(user_id.to_string()),
+            None,
+            None,
+            Some(container.clone()),
+            None,
+            Some(ServiceType::ComputerAgentRunner),
+            Utc::now(),
+            Utc::now(),
+        );
+        info.set_service_type(Some(ServiceType::ComputerAgentRunner));
+        info
+    }
+
+    /// 测试：多线程并发 insert + remove 不同项目（各自有独立容器）
+    /// 验证无死锁 + RAII 清理正确
+    #[test]
+    fn test_concurrent_insert_remove_no_deadlock() {
+        let (adapter, rx) = ProjectAdapter::new();
+        let adapter = Arc::new(adapter);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 50;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = vec![];
+
+        for t in 0..THREADS {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for i in 0..ITERS {
+                    let pid = format!("t{}-i{}", t, i);
+                    let info = Arc::new(create_test_info_with_container(
+                        &pid,
+                        &format!("c-t{}-i{}", t, i),
+                    ));
+                    let _ = adapter.insert(pid.clone(), info);
+                    let _ = adapter.remove(&pid);
+                }
+            }));
+        }
+
+        for h in handles {
+            let result = join_with_timeout(h, 15);
+            assert!(
+                result.is_some(),
+                "DEADLOCK: thread did not complete within 15s"
+            );
+        }
+
+        // 所有 project 和 container 都应被清理
+        assert_eq!(adapter.len(), 0, "all projects should be removed");
+        assert_eq!(
+            adapter.containers.len(),
+            0,
+            "all containers should be cleaned via RAII"
+        );
+
+        // 每个 remove 都应触发一次 RAII cleanup
+        let cleanups = drain_cleanup_requests(&rx);
+        assert_eq!(
+            cleanups.len(),
+            THREADS * ITERS,
+            "RAII should send one cleanup per container"
+        );
+    }
+
+    /// 测试：多线程并发 insert + remove 同一个 project_id
+    /// 竞态场景：只有一个线程的 insert/remove 对生效
+    #[test]
+    fn test_concurrent_same_project_insert_remove() {
+        let (adapter, _rx) = ProjectAdapter::new();
+        let adapter = Arc::new(adapter);
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 200;
+        let project_id = "shared-project";
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = vec![];
+
+        for _ in 0..THREADS {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERS {
+                    let info = Arc::new(create_test_info_with_container(
+                        project_id,
+                        "shared-container",
+                    ));
+                    let _ = adapter.insert(project_id.to_string(), info);
+                    let _ = adapter.remove(project_id);
+                }
+            }));
+        }
+
+        for h in handles {
+            let result = join_with_timeout(h, 15);
+            assert!(
+                result.is_some(),
+                "DEADLOCK: concurrent insert/remove of same project_id"
+            );
+        }
+    }
+
+    /// 测试：两个 project 共享容器，并发 remove 验证 RAII 清理只触发一次
+    #[test]
+    fn test_concurrent_shared_container_remove() {
+        let (adapter, rx) = ProjectAdapter::new();
+        let adapter = Arc::new(adapter);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+
+        let container = ContainerBasicInfo {
+            container_id: "shared-id".to_string(),
+            container_name: "shared-container".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: String::new(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://shared".to_string(),
+        };
+
+        let info1 = create_shared_project("proj-1", "user-1", &container);
+        let info2 = create_shared_project("proj-2", "user-1", &container);
+
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info1))
+            .unwrap();
+        adapter
+            .insert("proj-2".to_string(), Arc::new(info2))
+            .unwrap();
+
+        // 共享容器只有一个条目，ref_count = 2
+        assert_eq!(adapter.containers.len(), 1);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = vec![];
+
+        for pid in ["proj-1", "proj-2"] {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                adapter.remove(pid)
+            }));
+        }
+
+        for h in handles {
+            let result = join_with_timeout(h, 10);
+            assert!(
+                result.is_some(),
+                "DEADLOCK: concurrent remove of shared container projects"
+            );
+        }
+
+        assert_eq!(adapter.len(), 0);
+        assert_eq!(adapter.containers.len(), 0, "container should be cleaned up");
+
+        // RAII 清理应恰好触发 1 次（ref_count 从 2→1→0）
+        let cleanups = drain_cleanup_requests(&rx);
+        assert_eq!(
+            cleanups.len(),
+            1,
+            "RAII should send exactly 1 cleanup for shared container"
+        );
+        assert_eq!(cleanups[0].identifier, "user-1");
+        assert_eq!(cleanups[0].container_ip, "10.0.0.1");
+    }
+
+    /// 测试：一个线程更新 session，另一个线程并发 remove 同一 project
+    #[test]
+    fn test_concurrent_session_update_and_remove() {
+        let (adapter, _rx) = ProjectAdapter::new();
+        let adapter = Arc::new(adapter);
+
+        let pid = "concurrent-session-proj";
+        let info = Arc::new(create_test_info_with_container(pid, "session-container"));
+        adapter.insert(pid.to_string(), info).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = vec![];
+
+        // Thread 1: 持续更新 session
+        {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for i in 0..100 {
+                    let sid = format!("session-{}", i);
+                    adapter.update_session(pid, &sid);
+                }
+            }));
+        }
+
+        // Thread 2: 短暂延迟后 remove
+        {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                thread::sleep(Duration::from_millis(5));
+                let _ = adapter.remove(pid);
+            }));
+        }
+
+        for h in handles {
+            let result = join_with_timeout(h, 10);
+            assert!(
+                result.is_some(),
+                "DEADLOCK: concurrent session update and remove"
+            );
+        }
+    }
+
+    /// 测试：多线程并发对同一 project 做 insert_with_session + remove
+    #[test]
+    fn test_concurrent_insert_with_session_and_remove() {
+        let (adapter, _rx) = ProjectAdapter::new();
+        let adapter = Arc::new(adapter);
+
+        const THREADS: usize = 4;
+        const ITERS: usize = 50;
+        let pid = "session-battle";
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = vec![];
+
+        for t in 0..THREADS {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for i in 0..ITERS {
+                    let info = Arc::new(create_test_info_with_container(pid, "battle-c"));
+                    let sid = format!("sid-{}-{}", t, i);
+                    let _ = adapter.insert_with_session(
+                        pid.to_string(),
+                        info,
+                        Some(&sid),
+                    );
+                    let _ = adapter.remove(pid);
+                }
+            }));
+        }
+
+        for h in handles {
+            let result = join_with_timeout(h, 15);
+            assert!(
+                result.is_some(),
+                "DEADLOCK: concurrent insert_with_session and remove"
+            );
+        }
+    }
+
+    /// 测试：多线程并发 remove 不存在的 project_id
+    #[test]
+    fn test_concurrent_remove_nonexistent() {
+        let (adapter, _rx) = ProjectAdapter::new();
+        let adapter = Arc::new(adapter);
+
+        const THREADS: usize = 8;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = vec![];
+
+        for _ in 0..THREADS {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..100 {
+                    let result = adapter.remove("nonexistent-project");
+                    assert!(
+                        result.is_none(),
+                        "removing nonexistent should return None"
+                    );
+                }
+            }));
+        }
+
+        for h in handles {
+            let result = join_with_timeout(h, 10);
+            assert!(
+                result.is_some(),
+                "DEADLOCK: concurrent remove of nonexistent project"
+            );
+        }
+    }
+
+    /// 压力测试：多线程混合操作（insert/remove/update_session/get/clear_session）
+    #[test]
+    fn test_concurrent_stress_mixed_operations() {
+        let (adapter, _rx) = ProjectAdapter::new();
+        let adapter = Arc::new(adapter);
+
+        // 预填充 10 个 project
+        for i in 0..10 {
+            let pid = format!("preload-{}", i);
+            let info =
+                Arc::new(create_test_info_with_container(&pid, &format!("c-pre-{}", i)));
+            adapter.insert(pid, info).unwrap();
+        }
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 30;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = vec![];
+
+        for t in 0..THREADS {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for i in 0..ITERS {
+                    let pid = format!("stress-{}-{}", t, i);
+                    let info = Arc::new(create_test_info_with_container(
+                        &pid,
+                        &format!("sc-{}-{}", t, i),
+                    ));
+
+                    // insert
+                    let _ = adapter.insert(pid.clone(), info);
+
+                    // 混合读操作
+                    let _ = adapter.get(&pid);
+                    let _ = adapter.update_activity(&pid);
+
+                    // session 操作
+                    let sid = format!("sid-{}-{}", t, i);
+                    adapter.update_session(&pid, &sid);
+                    let _ = adapter.get_by_session_id(&sid);
+                    let _ = adapter.get_container_name_by_session(&sid);
+
+                    // clear + remove
+                    adapter.clear_session(&pid);
+                    let _ = adapter.remove(&pid);
+                }
+            }));
+        }
+
+        for h in handles {
+            let result = join_with_timeout(h, 15);
+            assert!(
+                result.is_some(),
+                "DEADLOCK: stress test with mixed operations"
+            );
+        }
+    }
+
+    /// 测试：RAII CleanupRequest 内容正确性
+    #[test]
+    fn test_raii_cleanup_request_content() {
+        let (adapter, rx) = ProjectAdapter::new();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+
+        let info = Arc::new(create_test_info_with_container("proj-verify", "c-verify"));
+        adapter.insert("proj-verify".to_string(), info).unwrap();
+
+        let removed = adapter.remove("proj-verify");
+        assert!(removed.is_some());
+
+        // 验证 CleanupRequest 内容
+        let cleanups = drain_cleanup_requests(&rx);
+        assert_eq!(cleanups.len(), 1);
+
+        let req = &cleanups[0];
+        assert_eq!(req.identifier, "proj-verify");
+        assert_eq!(req.container_name, "c-verify");
+        assert_eq!(req.container_ip, "127.0.0.1");
+        assert_eq!(req.service_type, ServiceType::RCoder);
+    }
+
+    /// 测试：共享容器多次 insert/remove 循环后 ref_count 不泄露
+    #[test]
+    fn test_shared_container_ref_count_no_leak_under_reinsert() {
+        let (adapter, rx) = ProjectAdapter::new();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+
+        let container = ContainerBasicInfo {
+            container_id: "leak-test-id".to_string(),
+            container_name: "leak-test".to_string(),
+            container_ip: "10.0.0.5".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: String::new(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://leak".to_string(),
+        };
+
+        // 循环 5 次：insert proj-1 和 proj-2（共享容器），然后全部 remove
+        for round in 0..5 {
+            let info1 = create_shared_project("proj-1", "user-leak", &container);
+            let info2 = create_shared_project("proj-2", "user-leak", &container);
+
+            adapter
+                .insert("proj-1".to_string(), Arc::new(info1))
+                .unwrap();
+            adapter
+                .insert("proj-2".to_string(), Arc::new(info2))
+                .unwrap();
+
+            // 容器始终只有 1 个条目
+            assert_eq!(
+                adapter.containers.len(),
+                1,
+                "round {}: should have 1 container",
+                round
+            );
+
+            adapter.remove("proj-1");
+            // 移除 proj-1 后容器仍存在（ref_count > 0）
+            assert_eq!(
+                adapter.containers.len(),
+                1,
+                "round {}: container should persist after removing proj-1",
+                round
+            );
+
+            adapter.remove("proj-2");
+            // 移除 proj-2 后容器应被清理（ref_count = 0）
+            assert_eq!(
+                adapter.containers.len(),
+                0,
+                "round {}: container should be cleaned after removing last project",
+                round
+            );
+        }
+
+        // 5 轮循环应产生 5 次 RAII 清理
+        let cleanups = drain_cleanup_requests(&rx);
+        assert_eq!(cleanups.len(), 5, "5 rounds should produce 5 cleanup requests");
     }
 }
