@@ -137,9 +137,9 @@ impl ContainerStatusChecker {
     async fn check_all_containers(&self) -> anyhow::Result<()> {
         use futures_util::future::join_all;
 
-        // 收集所有需要检查的容器（创建快照，使用 DuckDB 存储）
+        // 收集所有需要检查的容器（创建快照）
         let containers: Vec<(String, Arc<shared_types::ProjectAndContainerInfo>)> =
-            self.state.projects.iter().collect();
+            self.state.projects.iter();
 
         if containers.is_empty() {
             debug!("📭 [STATUS_CHECKER] No containers to check");
@@ -277,34 +277,24 @@ impl ContainerStatusChecker {
                         );
                         return Ok(false);
                     }
-                    // 🆕 同步更新 agent 状态为 Active
-                    if let Err(e) = self.state.projects.update_agent_status(
+                    // 同步更新 agent 状态为 Active
+                    self.state.projects.update_agent_status(
                         &project_id,
                         1, // Active
                         "active",
-                    ) {
-                        warn!(
-                            "⚠️ [STATUS_CHECKER] Failed to update agent status to Active: project_id={}, error={}",
-                            project_id, e
-                        );
-                    }
+                    );
                     debug!(
                         "✅ [STATUS_CHECKER] Container is active, updated activity time and status: container_key={}, project_id={}",
                         lookup_key, project_id
                     );
                     Ok(true)
                 } else {
-                    // 🆕 同步更新 agent 状态为 Idle
-                    if let Err(e) = self.state.projects.update_agent_status(
+                    // 同步更新 agent 状态为 Idle
+                    self.state.projects.update_agent_status(
                         &project_id,
                         0, // Idle
                         "idle",
-                    ) {
-                        warn!(
-                            "⚠️ [STATUS_CHECKER] Failed to update agent status to Idle: project_id={}, error={}",
-                            project_id, e
-                        );
-                    }
+                    );
                     debug!(
                         "📭 [STATUS_CHECKER] Container is idle, updated status to Idle: container_key={}, project_id={}",
                         lookup_key, project_id
@@ -399,27 +389,24 @@ impl ContainerStatusChecker {
         exists
     }
 
-    /// 判断是否应该跳过检查
+    /// 判断是否应该跳过检查（view: 闭包结束读锁立即释放）
     fn should_skip_check(&self, lookup_key: &str) -> bool {
-        if let Some(health) = self.health_states.get(lookup_key) {
-            let now = Utc::now();
-
-            // 如果连续失败次数超过阈值
-            if health.consecutive_failures >= self.config.failure_threshold {
-                // 检查是否还在跳过期内
-                if let Some(first_failure) = health.first_failure_time {
-                    let elapsed = now.signed_duration_since(first_failure);
-                    if let Ok(skip_duration) = chrono::Duration::from_std(self.config.skip_duration)
-                        && elapsed < skip_duration
-                    {
-                        return true; // 仍在跳过期内
+        let now = Utc::now();
+        self.health_states
+            .view(lookup_key, |_, health| {
+                if health.consecutive_failures >= self.config.failure_threshold {
+                    if let Some(first_failure) = health.first_failure_time {
+                        let elapsed = now.signed_duration_since(first_failure);
+                        if let Ok(skip_duration) =
+                            chrono::Duration::from_std(self.config.skip_duration)
+                        {
+                            return elapsed < skip_duration;
+                        }
                     }
                 }
-                // 跳过期已过，允许重新检查（但不重置失败计数器）
-            }
-        }
-
-        false // 默认不跳过
+                false
+            })
+            .unwrap_or(false)
     }
 
     /// 记录成功并重置失败计数器
@@ -524,30 +511,29 @@ impl ContainerStatusChecker {
 
         let mut removed_count = 0;
 
-        // 收集需要移除的 key
-        let keys_to_remove: Vec<String> = self
+        // 第一步：从 health_states 收集数据（iter 读锁在 collect 后释放）
+        let candidates: Vec<(String, bool)> = self
             .health_states
             .iter()
-            .filter_map(|entry| {
-                let lookup_key = entry.key();
-                let health = entry.value();
-
-                // 移除条件：
-                // 1. 容器已不在 DuckDB 存储中
-                // 2. 最后检查时间超过健康重置周期
-                let not_in_storage = !self.state.contains_project(lookup_key);
-                let elapsed = now.signed_duration_since(health.last_check_time);
+            .map(|entry| {
+                let lookup_key = entry.key().clone();
+                let elapsed = now.signed_duration_since(entry.value().last_check_time);
                 let is_stale = elapsed > retention_duration;
-
-                if not_in_storage || is_stale {
-                    Some(lookup_key.clone())
-                } else {
-                    None
-                }
+                (lookup_key, is_stale)
             })
             .collect();
 
-        // 批量移除
+        // 第二步：跨 map 查询（health_states 锁已释放，无死锁风险）
+        let keys_to_remove: Vec<String> = candidates
+            .into_iter()
+            .filter(|(lookup_key, is_stale)| {
+                let not_in_storage = !self.state.contains_project(lookup_key);
+                not_in_storage || *is_stale
+            })
+            .map(|(k, _)| k)
+            .collect();
+
+        // 第三步：批量移除
         for key in keys_to_remove {
             if self.health_states.remove(&key).is_some() {
                 removed_count += 1;

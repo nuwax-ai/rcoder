@@ -75,7 +75,8 @@ impl AppState {
 /// 组合 Computer Agent 路由和 RCoder Agent 路由
 pub fn create_router(state: Arc<AppState>) -> Router {
     use super::handlers::{
-        computer_cancel, computer_chat, computer_progress, computer_status, computer_stop,
+        computer_cancel, computer_chat, computer_container_status, computer_progress,
+        computer_permission_resolve, computer_status, computer_stop, computer_vnc_status,
         pod_count, rcoder_progress,
     };
     use shared_types::http_handlers;
@@ -97,6 +98,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/computer/agent/session/cancel",
             post(computer_cancel::handle_computer_cancel),
+        )
+        .route(
+            "/computer/agent/permission/resolve",
+            post(computer_permission_resolve::handle_computer_permission_resolve),
+        )
+        .route(
+            "/computer/agent/container-status",
+            get(computer_container_status::handle_computer_container_status),
+        )
+        .route(
+            "/computer/agent/vnc-status",
+            get(computer_vnc_status::handle_computer_vnc_status),
         )
         .route(
             "/computer/progress/{session_id}",

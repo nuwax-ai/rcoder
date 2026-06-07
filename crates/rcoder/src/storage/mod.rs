@@ -1,9 +1,16 @@
-//! 存储适配层
+//! 存储层：纯 DashMap 内存存储 + RAII 自动资源回收
 //!
-//! 提供从 DashMap 到 DuckDB 存储的适配器
+//! 替代 DuckDB 内存模式，提供：
+//! - O(1) 热路径访问（project/session 查找）
+//! - 引用计数容器管理（共享容器安全）
+//! - RAII 清理（移除 project 时自动销毁无引用的容器）
 
 mod adapter;
-mod bridge;
+mod container_entry;
+mod resource_reaper;
+mod types;
 
 pub use adapter::ProjectAdapter;
-pub use bridge::DataBridge;
+pub use container_entry::ContainerEntry;
+pub use resource_reaper::{CleanupRequest, ResourceReaper};
+pub use types::{IdleContainerInfo, StorageStats};

@@ -65,8 +65,8 @@ enum CancelIdentifier {
     Pod(String),
 }
 
-/// 统一的容器查询函数 - 通过 DuckDB 查询
-async fn get_container_for_cancel_duckdb(
+/// 统一的容器查询函数
+async fn get_container_for_cancel(
     state: &AppState,
     identifier: &CancelIdentifier,
 ) -> Result<Option<ContainerBasicInfo>, AppError> {
@@ -322,7 +322,7 @@ async fn handle_session_cancel_internal_v2(
     );
 
     // 获取容器（不创建）
-    let container_info = get_container_for_cancel_duckdb(state, &identifier).await?;
+    let container_info = get_container_for_cancel(state, &identifier).await?;
 
     // 如果容器不存在，说明任务已经结束或从未启动，直接返回成功
     let Some(container_info) = container_info else {

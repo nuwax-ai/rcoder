@@ -1,6 +1,7 @@
 //! Computer Agent Cancel Handler
 //!
 //! 处理 POST /computer/agent/session/cancel 请求
+//! 增强版：等待取消结果 + 清理 pending permissions
 
 use agent_client_protocol::schema::{CancelNotification, SessionId};
 use axum::{Json, extract::State, http::HeaderMap};
@@ -11,6 +12,7 @@ use tracing::{info, warn};
 use crate::CancelNotificationRequestWrapper;
 use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
+use crate::service::PERMISSION_MANAGER;
 use shared_types::{
     AppError, ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult, I18nJsonOrQuery,
     error_codes::ERR_VALIDATION, get_i18n_message,
@@ -18,9 +20,14 @@ use shared_types::{
 
 use super::locale_from_headers;
 
+/// 取消超时（秒）
+const CANCEL_TIMEOUT_SECS: u64 = 10;
+
 /// 取消 Computer Agent 会话任务
 ///
-/// 直接操作 AGENT_REGISTRY 发送取消信号
+/// 增强版：
+/// 1. 发送取消信号并等待结果（最多 10s）
+/// 2. 清理该 session 的 pending permissions
 #[utoipa::path(
     post,
     path = "/computer/agent/session/cancel",
@@ -45,8 +52,6 @@ pub async fn handle_computer_cancel(
         request.user_id, request.project_id, request.session_id
     );
 
-    // 1. 验证必填字段
-    // user_id 是 Option<String>，需要用 as_ref() 或直接检查
     if request.user_id.as_ref().is_none_or(|s| s.is_empty()) {
         return Err(AppError::with_i18n_key(
             ERR_VALIDATION,
@@ -61,18 +66,13 @@ pub async fn handle_computer_cancel(
         ));
     }
 
-    // 2. 查找 session_id (如果未提供,从 AGENT_REGISTRY 获取)
+    // 查找 session_id (如果未提供,从 AGENT_REGISTRY 获取)
     let session_id = if let Some(sid) = request.session_id {
         sid
     } else {
-        // 从 AGENT_REGISTRY 查找
         match AGENT_REGISTRY.get_agent_info(&request.project_id) {
-            Some(info) => {
-                // session_id 是 SessionId 类型,直接转换为 String
-                info.session_id.to_string()
-            }
+            Some(info) => info.session_id.to_string(),
             None => {
-                // Agent 不存在,幂等返回成功
                 info!(
                     "ℹ️  [HTTP] Agent 不存在,幂等返回成功: project_id={}",
                     request.project_id
@@ -86,36 +86,49 @@ pub async fn handle_computer_cancel(
         }
     };
 
-    // 3. 从 AGENT_REGISTRY 获取 Agent 信息并发送取消信号
+    // 从 AGENT_REGISTRY 获取 Agent 信息并发送取消信号
     if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&request.project_id) {
-        // 获取 cancel_tx
         let cancel_tx = agent_info.cancel_tx.clone();
-
-        // 释放读锁
         drop(agent_info);
 
-        // 检查是否已经空闲或停止中(幂等性)
         if cancel_tx.is_closed() {
             info!(
                 "ℹ️  [HTTP] Agent stopped, cancel channel is closed: session_id={}",
                 session_id
             );
         } else {
-            // 创建取消通知
             let session_id_obj = SessionId::new(Arc::from(session_id.as_str()));
             let cancel_notification = CancelNotification::new(session_id_obj);
 
-            // 创建 oneshot channel 接收取消结果 (HTTP 不等待结果,直接丢弃)
-            let (result_tx, _result_rx) = oneshot::channel();
+            // 等待取消结果（带超时）
+            let (result_tx, result_rx) = oneshot::channel();
             let cancel_request = CancelNotificationRequestWrapper {
                 cancel_notification,
                 result_tx,
             };
 
-            // 发送取消信号 (异步)
             match cancel_tx.send(cancel_request).await {
                 Ok(_) => {
-                    info!("[HTTP] Cancel signal sent: session_id={}", session_id);
+                    info!("[HTTP] Cancel signal sent, waiting for result: session_id={}", session_id);
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(CANCEL_TIMEOUT_SECS),
+                        result_rx,
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => {
+                            info!("[HTTP] Cancel result: session_id={}, result={:?}", session_id, result);
+                        }
+                        Ok(Err(_)) => {
+                            warn!("[HTTP] Cancel result channel dropped: session_id={}", session_id);
+                        }
+                        Err(_) => {
+                            warn!(
+                                "[HTTP] Cancel timed out after {}s: session_id={}",
+                                CANCEL_TIMEOUT_SECS, session_id
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -126,12 +139,14 @@ pub async fn handle_computer_cancel(
             }
         }
     } else {
-        // Session 不存在,幂等返回成功
         info!(
             "ℹ️  [HTTP] Agent not found, returning success idempotently: session_id={}",
             session_id
         );
     }
+
+    // 清理该 session 的 pending permissions
+    PERMISSION_MANAGER.cancel_session_permissions(&session_id);
 
     let response = ComputerAgentCancelResponse {
         success: true,

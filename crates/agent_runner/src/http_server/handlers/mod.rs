@@ -7,11 +7,14 @@ use axum::http::HeaderMap;
 pub mod agent_mgmt_handler;
 pub mod computer_cancel;
 pub mod computer_chat;
+pub mod computer_container_status;
 pub mod computer_progress;
+pub mod computer_permission_resolve;
 pub mod computer_status;
 pub mod computer_stop;
+pub mod computer_vnc_status;
 pub mod pod_count;
-pub mod rcoder_progress; // RCoder 模式的 SSE 进度流
+pub mod rcoder_progress;
 
 pub(super) fn locale_from_headers(headers: &HeaderMap) -> &'static str {
     let accept_language = headers.get("accept-language").and_then(|v| v.to_str().ok());

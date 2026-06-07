@@ -15,7 +15,7 @@ use container_runtime_api::{
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
     Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaim,
-    Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements, Volume, VolumeMount,
+    Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements, Service, Volume, VolumeMount,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -24,7 +24,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
 use kube::Config;
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
@@ -41,7 +41,7 @@ use tracing::{info, warn};
 #[cfg(feature = "kubernetes")]
 use crate::types::DockerManagerConfig;
 #[cfg(feature = "kubernetes")]
-use super::{k8s_pod::K8sPodOps, k8s_pvc::K8sPvcOps};
+use super::{k8s_backend_crd::K8sBackendCRDOps, k8s_pod::K8sPodOps, k8s_pvc::K8sPvcOps, k8s_service::K8sServiceOps};
 #[cfg(feature = "kubernetes")]
 const RUNTIME_MANAGED_LABEL: &str = "managed-by=rcoder-runtime";
 
@@ -567,6 +567,12 @@ impl ContainerRuntime for KubernetesRuntime {
         // Wait for pod to be ready
         self.wait_for_pod_ready(identifier, &service_type).await?;
 
+        // Create K8s Service for Envoy Gateway routing
+        self.create_agent_service(identifier, &service_type).await?;
+
+        // Create Backend CRD for Envoy Gateway discovery
+        self.create_backend_crd(identifier, &service_type).await?;
+
         // Get pod info
         self.get_container_info_by_identifier(identifier, &service_type)
             .await?
@@ -748,6 +754,24 @@ impl ContainerRuntime for KubernetesRuntime {
             pod_name, identifier, service_type
         );
 
+        // ── Step 0: 删除 Backend CRD + K8s Service（Envoy Gateway 清理）──
+        //
+        // 先删除 Backend CRD，让 Envoy 停止向该 Pod 路由新流量；
+        // 再删除 K8s Service，移除 DNS 条目。两者均在 Pod 终止前完成，
+        // 确保流量不再进入即将销毁的 Pod。
+        if let Err(e) = self.delete_backend_crd(identifier).await {
+            warn!(
+                "[K8S] Failed to delete Backend CRD for {}: {} (continuing)",
+                identifier, e
+            );
+        }
+        if let Err(e) = self.delete_agent_service(identifier, service_type).await {
+            warn!(
+                "[K8S] Failed to delete Service for {}: {} (continuing)",
+                identifier, e
+            );
+        }
+
         // ── Step 1: 发送 Pod 删除请求（graceful，grace period = 60s）──
         //
         // 使用 Foreground propagation 确保 Pod 的子资源先于 Pod 被删除。
@@ -918,9 +942,43 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         let total_start = std::time::Instant::now();
-        info!("[K8S_CLEANUP] Starting cleanup_all — sequential pod → PVC deletion");
+        info!("[K8S_CLEANUP] Starting cleanup_all — sequential Backend CRD → Service → Pod → PVC deletion");
 
         let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
+
+        // ── Step 0: 批量删除 Backend CRD（停止 Envoy 路由）──
+        let backends: Api<DynamicObject> = Api::namespaced_with(
+            self.client.clone(),
+            &self.namespace,
+            &super::k8s_backend_crd::backend_api_resource(),
+        );
+        match backends
+            .delete_collection(&DeleteParams::default(), &lp)
+            .await
+        {
+            Ok(_) => info!("[K8S_CLEANUP] Backend CRD delete_collection requested"),
+            Err(e) => {
+                tracing::warn!(
+                    "[K8S_CLEANUP] Backend CRD delete_collection failed: {} (continuing)",
+                    e
+                );
+            }
+        }
+
+        // ── Step 0.5: 批量删除 K8s Service ──
+        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
+        match services
+            .delete_collection(&DeleteParams::default(), &lp)
+            .await
+        {
+            Ok(_) => info!("[K8S_CLEANUP] Service delete_collection requested"),
+            Err(e) => {
+                tracing::warn!(
+                    "[K8S_CLEANUP] Service delete_collection failed: {} (continuing)",
+                    e
+                );
+            }
+        }
 
         // ── Step 1: 获取所有 managed Pod 名称（用于后续等待终止）──
         let pods_to_wait: Vec<String> = self

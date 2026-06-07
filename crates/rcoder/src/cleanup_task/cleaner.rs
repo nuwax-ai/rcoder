@@ -228,22 +228,12 @@ impl AgentCleaner {
                 .container()
                 .map(|c| c.container_id.clone())
                 .unwrap_or_default();
-            match self.state.projects.delete_container_with_projects(&container_id) {
-                Ok((deleted, project_count)) => {
-                    info!(
-                        "[cleaner] Deleted container and {} associated projects from DuckDB: container_id={}, container_deleted={}",
-                        project_count, container_id, deleted
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "[cleaner] Failed to delete container record from DuckDB, falling back to remove_project: container_id={}, error={}",
-                        container_id, e
-                    );
-                    // 回退：至少删除当前项目记录
-                    self.state.remove_project(project_id);
-                }
-            }
+            let (deleted, project_count) =
+                self.state.projects.delete_container_with_projects(&container_id);
+            info!(
+                "[cleaner] Deleted container and {} associated projects from storage: container_id={}, container_deleted={}",
+                project_count, container_id, deleted
+            );
         } else {
             // 容器未销毁（仅超时等原因）：只删除当前项目记录
             self.state.remove_project(project_id);
@@ -272,13 +262,15 @@ impl AgentCleaner {
                 Err(e) => warn!("[cleaner] Cleanup failed: {}", e),
             }
 
-            // 定期输出 DuckDB 内存使用统计
+            // 定期输出存储统计信息
             memory_log_counter += 1;
             if memory_log_counter >= MEMORY_LOG_INTERVAL {
                 memory_log_counter = 0;
-                if let Ok(stats) = self.state.projects.get_memory_stats() {
-                    debug!("[cleaner] DuckDB Memory Stats:\n{}", stats);
-                }
+                let stats = self.state.projects.get_stats();
+                debug!(
+                    "[cleaner] Storage Stats: projects={}, containers={}, sessions={}",
+                    stats.total_projects, stats.total_containers, stats.active_sessions
+                );
             }
         }
     }

@@ -250,7 +250,8 @@ pub async fn handle_chat(
                 mutable_info.update_activity();
 
                 let arc_info = Arc::new(mutable_info);
-                state.insert_project(project_id.clone(), arc_info.clone());
+                state.insert_project(project_id.clone(), arc_info.clone())
+                    .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
 
                 info!(
                     "✅ [CHAT] Project info fully updated: project_id={}, container_id={}",
@@ -278,7 +279,8 @@ pub async fn handle_chat(
             );
 
             let arc_info = Arc::new(new_info);
-            state.insert_project(project_id.clone(), arc_info.clone());
+            state.insert_project(project_id.clone(), arc_info.clone())
+                .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
 
             info!(
                 "✅ [CHAT] Project info created: project_id={}, container_id={}",

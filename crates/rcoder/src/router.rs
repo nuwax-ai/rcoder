@@ -56,7 +56,7 @@ pub struct SessionInfo {
 pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
-    /// 项目适配器 - 统一管理项目、会话和容器数据（替代原有的 3 个 DashMap）
+    /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
     pub projects: ProjectAdapter,
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
@@ -75,6 +75,8 @@ pub struct AppState {
     pub container_prefix_computer: String,
     /// 容器运行时（通过 DI 注入，替代全局 RuntimeManager::get()）
     pub runtime: Arc<dyn ContainerRuntime>,
+    /// RAII 资源回收器接收端（在 start_cleanup_task 中取出并启动 ResourceReaper）
+    pub cleanup_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>>>>,
 }
 
 impl AppState {
@@ -86,8 +88,7 @@ impl AppState {
         container_prefix_computer: String,
         runtime: Arc<dyn ContainerRuntime>,
     ) -> anyhow::Result<Self> {
-        let projects = ProjectAdapter::new()
-            .map_err(|e| anyhow::anyhow!("Failed to initialize ProjectAdapter: {}", e))?;
+        let (projects, cleanup_rx) = ProjectAdapter::new();
 
         // 创建容器创建完成通知通道（缓冲区大小 32，足够应对并发创建）
         let (pod_created_tx, _) = broadcast::channel(32);
@@ -103,6 +104,7 @@ impl AppState {
             container_prefix_rcoder,
             container_prefix_computer,
             runtime,
+            cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
         })
     }
 
@@ -121,31 +123,27 @@ impl AppState {
     }
 
     /// 插入项目信息（替代 project_and_agent_map.insert）
+    ///
+    /// # Errors
+    /// 如果 `service_type` 未设置，透传错误。
     #[inline]
-    pub fn insert_project(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) {
-        if let Err(e) = self.projects.insert(project_id.clone(), info) {
-            tracing::error!("Failed to insert project {}: {}", project_id, e);
-        }
+    pub fn insert_project(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) -> anyhow::Result<()> {
+        self.projects.insert(project_id.clone(), info)
     }
 
     /// 插入项目并设置 session 映射（单次原子写入，消除 CAS 竞态）
+    ///
+    /// # Errors
+    /// 如果 `service_type` 未设置，透传错误。
     #[inline]
     pub fn insert_project_with_session(
         &self,
         project_id: String,
         info: Arc<ProjectAndContainerInfo>,
         session_id: &str,
-    ) {
-        if let Err(e) = self
-            .projects
-            .insert_with_session(project_id.clone(), info, Some(session_id))
-        {
-            tracing::error!(
-                "Failed to insert project with session: project_id={}, error={}",
-                project_id,
-                e
-            );
-        }
+    ) -> anyhow::Result<()> {
+        self.projects
+            .insert_with_session(project_id, info, Some(session_id))
     }
 
     /// 删除项目（替代 project_and_agent_map.remove）
@@ -178,24 +176,10 @@ impl AppState {
     /// 更新会话信息
     #[inline]
     pub fn update_session(&self, project_id: &str, session_id: &str) {
-        if let Err(e) = self.projects.update_session(project_id, session_id) {
-            tracing::error!(
-                "Failed to update session: project_id={}, session_id={}, error={}",
-                project_id,
-                session_id,
-                e
-            );
-        }
+        self.projects.update_session(project_id, session_id);
     }
 
     /// 原子更新会话信息（仅当当前 session_id 与预期相同时才更新）
-    ///
-    /// 使用 compare-and-swap 模式防止并发更新导致的竞态条件。
-    /// 只有当数据库中当前的 session_id 与 `expected_current_session_id` 相同时才更新。
-    /// 如果 `expected_current_session_id` 为 None，则只在当前没有 session_id 时更新。
-    ///
-    /// # Returns
-    /// 返回是否成功更新。如果返回 false，说明当前 session_id 与预期不同，更新被跳过。
     #[inline]
     pub fn update_session_atomic(
         &self,
@@ -203,37 +187,17 @@ impl AppState {
         new_session_id: &str,
         expected_current_session_id: Option<&str>,
     ) -> bool {
-        match self.projects.update_session_atomic(
+        self.projects.update_session_atomic(
             project_id,
             new_session_id,
             expected_current_session_id,
-        ) {
-            Ok(updated) => updated,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to atomic update session: project_id={}, new_session_id={}, expected_current={:?}, error={}",
-                    project_id,
-                    new_session_id,
-                    expected_current_session_id,
-                    e
-                );
-                false
-            }
-        }
+        )
     }
 
-    /// 清除会话信息（将 session_id 设置为 NULL）
-    ///
-    /// 用于 Agent 停止后清理会话状态
+    /// 清除会话信息
     #[inline]
     pub fn clear_session(&self, project_id: &str) {
-        if let Err(e) = self.projects.clear_session(project_id) {
-            tracing::error!(
-                "Failed to clear session: project_id={}, error={}",
-                project_id,
-                e
-            );
-        }
+        self.projects.clear_session(project_id);
     }
 
     /// 更新项目活动时间，返回实际更新使用的时间戳
@@ -247,6 +211,22 @@ impl AppState {
     pub fn update_session_activity(&self, session_id: &str) {
         self.projects.update_session_activity(session_id);
     }
+}
+
+/// 内部 API 路由（供 rcoder-gateway 调用）
+///
+/// 这些端点挂载在中间件之前，绕过 API Key 鉴权。
+fn create_internal_routes(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/internal/pod/ensure",
+            post(handler::internal_pod_ensure),
+        )
+        .route(
+            "/internal/session/{session_id}/resolve",
+            get(handler::internal_session_resolve),
+        )
+        .with_state(state)
 }
 
 /// 创建 Axum 路由
@@ -351,7 +331,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     // 调试路由（仅用于开发和问题排查，需要 feature flag "debug" 启用）
     #[cfg(feature = "debug")]
     let debug_routes = Router::new()
-        .route("/debug/sql", post(handler::debug_sql_query))
+        .route("/debug/sql", get(handler::debug_dump_summary))
         .route("/debug/projects", get(handler::debug_list_projects))
         .route("/debug/containers", get(handler::debug_list_containers))
         .route("/debug/storage/stats", get(handler::debug_storage_stats))
@@ -452,7 +432,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             )
         }))
         .layer(axum::middleware::from_fn(locale_context_middleware))
-        // 安全响应头 — 防止常见 Web 攻击
+        // 内部 API（供 rcoder-gateway 调用，绕过 API Key 鉴权）
+        .merge(create_internal_routes(state))
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             axum::http::header::HeaderName::from_static("x-frame-options"),
             axum::http::HeaderValue::from_static("DENY"),

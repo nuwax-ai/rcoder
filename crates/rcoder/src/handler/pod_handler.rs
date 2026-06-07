@@ -21,8 +21,8 @@ use crate::service::ComputerContainerManager;
 use crate::service::vnc_sync::sync_single_vnc_backend;
 use crate::{AppError, HttpResult};
 use shared_types::{
-    PodCountByServiceType, PodCountResponse, ProjectAndContainerInfo, ServiceResourceLimits,
-    ServiceType,
+    ContainerBasicInfo, PodCountByServiceType, PodCountResponse, ProjectAndContainerInfo,
+    ServiceResourceLimits, ServiceType,
 };
 
 // ============================================================================
@@ -558,21 +558,18 @@ pub async fn pod_list(
         AppError::internal_server_error(&format!("Failed to list runtime containers: {}", e))
     })?;
 
-    // 2. 获取 DuckDB 存储中的容器记录
-    let duckdb_containers = state.projects.get_all_container_records().map_err(|e| {
-        error!("[POD_LIST] Failed to get DuckDB container list: {}", e);
-        AppError::internal_server_error(&format!("Failed to get DuckDB container list: {}", e))
-    })?;
+    // 2. 获取存储中的容器记录
+    let stored_containers = state.projects.get_all_container_records();
 
     // 3. 获取容器前缀（从 AppState 获取，启动时已初始化）
     let rcoder_prefix = state.container_prefix_rcoder.as_str();
     let computer_prefix = state.container_prefix_computer.as_str();
 
-    // 4. 创建容器ID到DuckDB记录的映射
-    let mut duckdb_map: std::collections::HashMap<String, &duckdb_manager::ContainerRecord> =
+    // 4. 创建容器ID到存储记录的映射
+    let mut stored_map: std::collections::HashMap<String, &ContainerBasicInfo> =
         std::collections::HashMap::new();
-    for record in &duckdb_containers {
-        duckdb_map.insert(record.container_id.clone(), record);
+    for record in &stored_containers {
+        stored_map.insert(record.container_id.clone(), record);
     }
 
     // 5. 合并数据，构建容器详细信息列表
@@ -584,7 +581,7 @@ pub async fn pod_list(
             continue;
         }
 
-        let duckdb_record = duckdb_map.get(&docker_container.container_id);
+        let stored_record = stored_map.get(&docker_container.container_id);
 
         // 确定服务类型
         let container_identity = container_identity_from_name(
@@ -607,18 +604,18 @@ pub async fn pod_list(
             _ => None,
         };
 
-        // 获取项目ID和用户ID（从DuckDB或Docker容器信息）
-        let project_id = duckdb_record
+        // 获取项目ID和用户ID（从存储或Docker容器信息）
+        let project_id = stored_record
             .and_then(|r| {
-                // 尝试从DuckDB关联的项目中获取project_id
+                // 尝试从存储关联的项目中获取project_id
                 state
                     .projects
                     .get_projects_by_container_id(&r.container_id)
-                    .ok()
-                    .and_then(|projects| projects.first().map(|p| p.project_id.clone()))
+                    .first()
+                    .map(|p| p.project_id().to_string())
             })
             .or_else(|| {
-                // 如果DuckDB中没有，使用Docker容器中的project_id
+                // 如果存储中没有，使用Docker容器中的project_id
                 if !docker_container.container_name.is_empty()
                     && docker_container.container_name != "unknown"
                 {
@@ -629,12 +626,12 @@ pub async fn pod_list(
             });
 
         let final_user_id = user_id.or_else(|| {
-            duckdb_record.and_then(|r| {
+            stored_record.and_then(|r| {
                 state
                     .projects
                     .get_projects_by_container_id(&r.container_id)
-                    .ok()
-                    .and_then(|projects| projects.first().and_then(|p| p.user_id.clone()))
+                    .first()
+                    .and_then(|p| p.user_id().map(|s| s.to_string()))
             })
         });
 
@@ -642,10 +639,10 @@ pub async fn pod_list(
         let container_info = PodDetailInfo {
             container_id: docker_container.container_id.clone(),
             container_name: docker_container.container_name.clone(),
-            container_ip: duckdb_record
+            container_ip: stored_record
                 .map(|r| r.container_ip.clone())
                 .unwrap_or_else(|| docker_container.container_ip.clone()),
-            service_url: duckdb_record
+            service_url: stored_record
                 .map(|r| r.service_url.clone())
                 .unwrap_or_else(|| format!("http://{}:{}", docker_container.container_ip, 8086)),
             status: String::from(docker_container.status.clone()),
@@ -653,10 +650,10 @@ pub async fn pod_list(
             project_id,
             user_id: final_user_id,
             created_at: docker_container.created_at.timestamp_millis().max(0) as u64,
-            last_activity: duckdb_record.map(|r| r.last_activity.timestamp_millis().max(0) as u64),
+            last_activity: stored_record.map(|r| r.created_at.timestamp_millis().max(0) as u64),
             image: None,
-            internal_port: Some(8086),
-            external_port: duckdb_record.map(|r| r.external_port),
+            internal_port: stored_record.map(|r| r.internal_port),
+            external_port: stored_record.map(|r| r.external_port),
         };
 
         containers.push(container_info);
@@ -847,7 +844,8 @@ pub async fn pod_ensure(
                     pinfo.set_container(Some(info.clone()));
                     pinfo
                 };
-                state.insert_project(request.project_id.clone(), Arc::new(project_info));
+                state.insert_project(request.project_id.clone(), Arc::new(project_info))
+                    .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
                 debug!(
                     "📝 [POD_ENSURE] DuckDB record updated: project_id={}, user_id={}, container_id={}",
                     request.project_id, request.user_id, info.container_id
@@ -1203,7 +1201,8 @@ pub async fn pod_ensure(
         info
     };
 
-    state.insert_project(request.project_id.clone(), Arc::new(project_info));
+    state.insert_project(request.project_id.clone(), Arc::new(project_info))
+        .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
     debug!(
         "📝 [POD_ENSURE] DuckDB record updated: project_id={}, user_id={}, container_id={}",
         request.project_id, request.user_id, container_info.container_id
@@ -1323,8 +1322,8 @@ pub async fn pod_keepalive(
             if let Some(ref pod_id) = request.pod_id {
                 let related_projects = state.projects.find_projects_by_pod_id(pod_id);
                 for related in &related_projects {
-                    if related.project_id != request.project_id {
-                        state.update_activity(&related.project_id);
+                    if related.project_id() != request.project_id {
+                        state.update_activity(related.project_id());
                     }
                 }
             }
@@ -1353,7 +1352,8 @@ pub async fn pod_keepalive(
                     project_info
                         .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                     project_info.set_container(Some(info.clone()));
-                    state.insert_project(request.project_id.clone(), Arc::new(project_info));
+                    state.insert_project(request.project_id.clone(), Arc::new(project_info))
+                        .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
                     info!("[POD_KEEPALIVE] container already exists (Docker), updating DuckDB");
                 } else {
                     info!(
@@ -1501,26 +1501,15 @@ pub async fn pod_restart(
             container_info.container_id
         );
 
-        // 从 DuckDB 存储中彻底移除旧容器及其所有关联记录
+        // 从存储中彻底移除旧容器及其所有关联记录
         // 使用 container_id 删除,确保清理该容器关联的所有 project_id
-        match state
+        let (container_deleted, deleted_projects) = state
             .projects
-            .delete_container_with_projects(&container_info.container_id)
-        {
-            Ok((container_deleted, deleted_projects)) => {
-                info!(
-                    "🧹 [POD_RESTART] Cleaned up old container records: container_id={}, container_deleted={}, deleted_projects={}",
-                    container_info.container_id, container_deleted, deleted_projects
-                );
-            }
-            Err(e) => {
-                // 记录错误但继续执行(不阻塞容器创建)
-                error!(
-                    "⚠️ [POD_RESTART] Failed to clean up old container records (will continue creating): container_id={}, error={}",
-                    container_info.container_id, e
-                );
-            }
-        }
+            .delete_container_with_projects(&container_info.container_id);
+        info!(
+            "🧹 [POD_RESTART] Cleaned up old container records: container_id={}, container_deleted={}, deleted_projects={}",
+            container_info.container_id, container_deleted, deleted_projects
+        );
 
         let runtime = state.runtime().clone();
 
@@ -1665,7 +1654,8 @@ pub async fn pod_restart(
             info.set_container(Some(container_info.clone()));
             info
         };
-        state.insert_project(request.project_id.clone(), Arc::new(project_info));
+        state.insert_project(request.project_id.clone(), Arc::new(project_info))
+            .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
     }
 
     // 7. 构建响应

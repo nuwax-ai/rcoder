@@ -73,6 +73,38 @@ agentRunner:
     repository: rcoder-agent-runner
     tag: ""                 # 空时继承 .Chart.appVersion
 
+# rcoder-gateway: K8s 模式下的无状态网关
+# 启用后，rcoder Service 的 selector 从 rcoder-main 切换到 rcoder-gateway
+# 流量路径: Backend Netty → rcoder-gateway → Envoy Gateway (数据面) / rcoder-control (控制面)
+gateway:
+  enabled: false
+  replicas: 2
+  image:
+    repository: rcoder-gateway
+    tag: ""                 # 空时继承 .Chart.appVersion
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+  rustLog: info
+  cacheTTLSeconds: 600
+
+# Envoy Gateway 配置
+# 前置条件: 需要先部署 Envoy Gateway controller
+#   helm install eg envoy-gateway/gateway-helm -n envoy-gateway-system --create-namespace \
+#     --set extensionApis.enableBackend=true
+envoyGateway:
+  enabled: false
+  # Envoy Gateway 监听端口（Gateway 资源中的 listener port）
+  listenerPort: 8090
+  # Envoy Gateway 代理 Service 名称（由 EG controller 自动创建）
+  serviceName: "envoy-rcoder-gateway"
+  # Envoy Gateway 代理 Service 端口
+  servicePort: 8090
+
 # ----------------------------------------------------------------------------
 # 存储层
 # ----------------------------------------------------------------------------

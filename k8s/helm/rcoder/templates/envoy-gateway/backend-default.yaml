@@ -1,0 +1,21 @@
+{{- if and .Values.gateway.enabled .Values.envoyGateway.enabled }}
+# 默认 Backend CRD（占位 + fallback）
+#
+# HTTPRoute 必须引用一个有效的 Backend CRD，否则 Envoy Gateway 会拒绝该路由。
+# 此默认 Backend 指向 rcoder-control 服务作为兜底目标。
+# 实际流量由 EnvoyPatchPolicy 的 cluster_header 路由覆盖，
+# 仅在没有 x-backend-cluster header 时才会路由到此默认 Backend。
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: backend-default
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: rcoder-control.{{ .Release.Namespace }}.svc.cluster.local
+        port: {{ .Values.rcoder.service.port }}
+{{- end }}

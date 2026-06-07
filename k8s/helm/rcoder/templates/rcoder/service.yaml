@@ -7,10 +7,16 @@ metadata:
     {{- include "rcoder.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.rcoder.service.type }}
-  # component=rcoder-main 把动态创建的 rcoder-agent / computer-agent-runner pod
-  # (它们也带 app=rcoder 标签) 排除在外, 避免 NodePort 把流量路由到不监听 8087 的 agent pod
+  {{- if .Values.gateway.enabled }}
+  # gateway 模式: 流量先到 rcoder-gateway → 数据面转发 Envoy / 控制面转发 rcoder-control
+  selector:
+    app: rcoder
+    component: rcoder-gateway
+  {{- else }}
+  # 直连模式: 流量直达 rcoder Pod
   selector:
     {{- include "rcoder.selectorLabels" . | nindent 4 }}
+  {{- end }}
   ports:
     - port: {{ .Values.rcoder.service.port }}
       targetPort: {{ .Values.rcoder.service.port }}

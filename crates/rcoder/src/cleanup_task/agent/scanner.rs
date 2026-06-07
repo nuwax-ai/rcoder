@@ -37,10 +37,9 @@ impl AgentScanner {
 
         info!("🔍 [scanner] Starting agent scan");
 
-        // 🚀 修复 N+1：iter() 已经 JOIN 获取了所有项目+容器数据
-        // 直接收集 (project_id, Arc<ProjectAndContainerInfo>)，避免逐个 get_project() 重新查询
-        let projects: Vec<(String, Arc<shared_types::ProjectAndContainerInfo>)> =
-            self.state.projects.iter().collect();
+        // 🚀 修复 N+1：iter() 返回所有项目+容器数据
+        // 直接获取 (project_id, Arc<ProjectAndContainerInfo>)，避免逐个 get_project() 重新查询
+        let projects = self.state.projects.iter();
 
         // 🚀 优化：使用流式并发替代批次等待，提高吞吐量
         // buffered(10) 表示最多 10 个并发任务

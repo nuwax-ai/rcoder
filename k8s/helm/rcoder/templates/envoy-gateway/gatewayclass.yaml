@@ -1,0 +1,15 @@
+{{- if and .Values.gateway.enabled .Values.envoyGateway.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Release.Namespace }}-rcoder-gateway-class
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: ""
+    kind: ConfigMap
+    name: envoy-gateway-config
+    namespace: envoy-gateway-system
+{{- end }}

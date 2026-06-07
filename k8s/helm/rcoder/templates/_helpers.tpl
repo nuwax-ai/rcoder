@@ -79,6 +79,11 @@ component: rcoder-main
 {{- include "rcoder.ownImage" (dict "repository" .Values.agentRunner.image.repository "tag" .Values.agentRunner.image.tag "ctx" .) -}}
 {{- end -}}
 
+{{/* 快捷: rcoder-gateway image */}}
+{{- define "rcoder.gatewayImage" -}}
+{{- include "rcoder.ownImage" (dict "repository" .Values.gateway.image.repository "tag" .Values.gateway.image.tag "ctx" .) -}}
+{{- end -}}
+
 {{/* 镜像仓库前缀 (config.yml 里 docker_config.multi_image_config.global_defaults.registry_prefix 使用) */}}
 {{- define "rcoder.registryPrefix" -}}
 {{- default "" .Values.global.imageRegistry -}}

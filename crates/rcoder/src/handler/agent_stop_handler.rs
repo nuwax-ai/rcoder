@@ -63,7 +63,7 @@ async fn destroy_container_for_project(
             state.grpc_pool.remove(&old_grpc_addr);
         }
 
-        // 从 DuckDB 存储中移除项目（如果 project_id 不是 "unknown"）
+        // 从存储中移除项目（如果 project_id 不是 "unknown"）
         if container_info.project_id != "unknown" {
             state.remove_project(&container_info.project_id);
         }
@@ -185,10 +185,16 @@ pub async fn agent_stop(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request
-        .project_id
-        .as_ref()
-        .expect("validated: project_id is required and non-empty");
+    let project_id = match request.project_id.as_ref() {
+        Some(pid) => pid,
+        None => {
+            tracing::error!("[STOP_DESTROY] project_id is None after validation");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+    };
 
     info!(
         "🛑 [STOP_DESTROY] Received container destroy request: project_id={}, pod_id={:?}",

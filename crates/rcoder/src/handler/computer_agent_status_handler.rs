@@ -97,10 +97,16 @@ pub async fn computer_agent_status(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request
-        .project_id
-        .as_ref()
-        .expect("validated: project_id is required and non-empty");
+    let project_id = match request.project_id.as_ref() {
+        Some(pid) => pid,
+        None => {
+            tracing::error!("[COMPUTER_AGENT_STATUS] project_id is None after validation");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+    };
 
     // 1. 参数验证：user_id 或 pod_id 至少有一个
     let has_user_id = request
@@ -121,11 +127,11 @@ pub async fn computer_agent_status(
         ));
     }
 
-    // 用于日志输出的标识符
+    // 用于日志输出的标识符（has_user_id / has_pod_id 已确保至少一个非空）
     let identifier_display = if has_user_id {
-        format!("user_id={}", request.user_id.as_ref().unwrap())
+        format!("user_id={}", request.user_id.as_deref().unwrap_or(""))
     } else {
-        format!("pod_id={}", request.pod_id.as_ref().unwrap())
+        format!("pod_id={}", request.pod_id.as_deref().unwrap_or(""))
     };
 
     info!(
@@ -299,7 +305,8 @@ pub async fn computer_agent_status(
         // 这里暂时置空，等下次聊天时会自动更新
 
         // 插入到 DuckDB
-        state.insert_project(project_id.to_string(), Arc::new(project_info.clone()));
+        state.insert_project(project_id.to_string(), Arc::new(project_info.clone()))
+            .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
 
         info!(
             "🔄 [COMPUTER_AGENT_STATUS] ✅ Self-healing succeeded: restored project record project_id={}, {}",

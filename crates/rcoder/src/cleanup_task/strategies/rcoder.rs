@@ -8,7 +8,8 @@ use super::{CleanupContext, CleanupStrategy, DestroyReason, ProjectInfo};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use duckdb_manager::ProjectRecord;
+use shared_types::ProjectAndContainerInfo;
+use std::sync::Arc;
 use tracing::info;
 
 /// RCoder 清理策略
@@ -40,7 +41,7 @@ impl CleanupStrategy for RCoderStrategy {
             let related_projects = context.state.projects.find_projects_by_pod_id(pod_id);
 
             let has_active_refs = related_projects.iter().any(|p| {
-                p.project_id != project_id
+                p.project_id() != project_id
                     && super::computer_runner::is_project_active(p, &context.config)
             });
 
@@ -81,11 +82,11 @@ impl CleanupStrategy for RCoderStrategy {
 }
 
 /// 计算一组项目的最大闲置时间（秒）
-fn compute_max_idle_duration(projects: &[ProjectRecord]) -> i64 {
+fn compute_max_idle_duration(projects: &[Arc<ProjectAndContainerInfo>]) -> i64 {
     let now = Utc::now();
     projects
         .iter()
-        .map(|p| (now - p.last_activity).num_seconds())
+        .map(|p| (now - p.last_activity()).num_seconds())
         .max()
         .unwrap_or(0)
 }

@@ -1,0 +1,24 @@
+{{- if .Values.gateway.enabled }}
+# rcoder-control Service: 指向 rcoder Pod（控制面）
+#
+# rcoder-gateway 将控制面请求（Pod 生命周期管理）透传到此 Service。
+# selector: component=rcoder-main 匹配 rcoder Deployment 的 Pod。
+apiVersion: v1
+kind: Service
+metadata:
+  name: rcoder-control
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+    app: rcoder
+    component: rcoder-control
+spec:
+  type: ClusterIP
+  selector:
+    app: rcoder
+    component: rcoder-main
+  ports:
+    - port: {{ .Values.rcoder.service.port }}
+      targetPort: {{ .Values.rcoder.service.port }}
+      name: http
+{{- end }}

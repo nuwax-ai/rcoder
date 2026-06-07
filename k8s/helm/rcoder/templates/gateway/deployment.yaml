@@ -1,0 +1,62 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rcoder-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+    app: rcoder
+    component: rcoder-gateway
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      app: rcoder
+      component: rcoder-gateway
+  template:
+    metadata:
+      labels:
+        {{- include "rcoder.labels" . | nindent 8 }}
+        app: rcoder
+        component: rcoder-gateway
+    spec:
+      {{- include "rcoder.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: rcoder-gateway
+          image: {{ include "rcoder.gatewayImage" . }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - containerPort: {{ .Values.rcoder.service.port }}
+          env:
+            - name: GATEWAY_PORT
+              value: {{ .Values.rcoder.service.port | quote }}
+            - name: RCODER_CONTROL_URL
+              value: "http://rcoder-control.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.rcoder.service.port }}"
+            {{- if .Values.envoyGateway.enabled }}
+            - name: ENVOY_GATEWAY_URL
+              value: "http://{{ .Values.envoyGateway.serviceName }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.envoyGateway.servicePort }}"
+            {{- end }}
+            - name: RCODER_K8S_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.gateway.rustLog | quote }}
+            - name: CACHE_TTL_SECONDS
+              value: {{ .Values.gateway.cacheTTLSeconds | quote }}
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /gateway/health
+              port: {{ .Values.rcoder.service.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /gateway/health
+              port: {{ .Values.rcoder.service.port }}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+{{- end }}

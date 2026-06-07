@@ -7,10 +7,11 @@
 use axum::{Json, extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 
 use crate::router::AppState;
+use crate::storage::types::StorageStats;
 use shared_types::{
     HttpResult,
     error_codes::{ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS},
@@ -18,36 +19,6 @@ use shared_types::{
 };
 
 use super::utils::get_locale_from_headers;
-
-/// DuckDB 查询请求
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct DebugSqlQueryRequest {
-    /// SQL 查询语句
-    ///
-    /// 支持的表：
-    /// - `projects`: 项目记录表
-    /// - `containers`: 容器记录表
-    ///
-    /// 示例查询：
-    /// - `SELECT * FROM projects`
-    /// - `SELECT * FROM containers`
-    /// - `SELECT project_id, session_id, container_id FROM projects WHERE session_id = 'xxx'`
-    #[schema(example = "SELECT * FROM projects LIMIT 10")]
-    pub sql: String,
-}
-
-/// DuckDB 查询响应
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DebugSqlQueryResponse {
-    /// 查询结果的列名
-    pub columns: Vec<String>,
-    /// 查询结果的行数据（每行是一个列名到值的映射）
-    pub rows: Vec<serde_json::Value>,
-    /// 返回的行数
-    pub row_count: usize,
-    /// 执行时间（毫秒）
-    pub execution_time_ms: u64,
-}
 
 /// 存储统计信息响应
 #[derive(Debug, Serialize, ToSchema)]
@@ -62,120 +33,51 @@ pub struct DebugStorageStatsResponse {
     pub projects_by_service_type: std::collections::HashMap<String, usize>,
 }
 
-/// 执行 DuckDB SQL 查询（调试用）
-///
-/// ⚠️ 此接口仅用于开发和调试目的
-///
-/// 支持任意 SELECT 查询，用于查看内存数据库中的数据状态
-#[utoipa::path(
-    post,
-    path = "/debug/sql",
-    request_body(
-        content = DebugSqlQueryRequest,
-        description = "SQL 查询请求",
-        content_type = "application/json"
-    ),
-    responses(
-        (
-            status = 200,
-            description = "查询成功",
-            body = HttpResult<DebugSqlQueryResponse>,
-            example = json!({
-                "success": true,
-                "data": {
-                    "columns": ["project_id", "session_id", "container_id"],
-                    "rows": [
-                        {"project_id": "user_123", "session_id": "xxx", "container_id": "yyy"}
-                    ],
-                    "row_count": 1,
-                    "execution_time_ms": 5
-                },
-                "code": "0"
-            })
-        ),
-        (
-            status = 400,
-            description = "SQL 语法错误或不支持的操作",
-            body = HttpResult<String>
-        )
-    ),
-    tag = "debug",
-    operation_id = "debug_sql_query",
-    summary = "执行 DuckDB SQL 查询（调试用）",
-    description = "执行任意 SELECT 查询，用于查看内存数据库中的数据状态。\n\n⚠️ 仅用于开发和调试，生产环境应禁用此接口。"
-)]
-#[axum::debug_handler]
-pub async fn debug_sql_query(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(request): Json<DebugSqlQueryRequest>,
-) -> HttpResult<DebugSqlQueryResponse> {
-    let locale = get_locale_from_headers(&headers);
-    let start_time = std::time::Instant::now();
+/// 存储摘要响应（替代 SQL raw query）
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DebugDumpResponse {
+    /// 存储摘要
+    pub summary: String,
+    /// 项目列表（简化信息）
+    pub projects: Vec<DebugProjectInfo>,
+    /// 容器列表（简化信息）
+    pub containers: Vec<DebugContainerInfo>,
+}
 
-    debug!("[DEBUG_SQL] executing: {}", request.sql);
+/// 调试用的项目简化信息
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DebugProjectInfo {
+    /// 项目ID
+    pub project_id: String,
+    /// 会话ID
+    pub session_id: Option<String>,
+    /// 用户ID
+    pub user_id: Option<String>,
+    /// 服务类型
+    pub service_type: Option<String>,
+    /// 容器ID
+    pub container_id: Option<String>,
+    /// Agent 状态名称
+    pub agent_status_name: Option<String>,
+    /// 创建时间
+    pub created_at: String,
+    /// 最后活动时间
+    pub last_activity: String,
+}
 
-    // 安全检查：Only SELECT queries are allowed
-    let sql_trimmed = request.sql.trim().to_uppercase();
-    if !sql_trimmed.starts_with("SELECT") {
-        warn!("[DEBUG_SQL] non-SELECT query: {}", request.sql);
-        return HttpResult::error_with_message(
-            ERR_INVALID_PARAMS,
-            locale,
-            &get_i18n_message("error.select_only", locale),
-        );
-    }
-
-    // 安全检查：阻止 DuckDB 文件读取和危险函数
-    let blocked_patterns = [
-        "READFILE", "READ_CSV", "READ_JSON", "READ_PARQUET", "READ_BLOB",
-        "READ_TEXT", "LIST_FILES",
-        "GLOB(", "PARQUET_SCAN", "SQLITE_SCAN", "POSTGRES_SCAN",
-        "HTTPGET", "JSON_SCAN", "ST_READ", "FILE_SCAN",
-        "PRAGMA", "DUCKDB_",
-        "COPY", "EXPORT", "ATTACH", "INSTALL", "LOAD", "IMPORT",
-        "CREATE", "INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
-    ];
-    if blocked_patterns.iter().any(|p| sql_trimmed.contains(p)) {
-        warn!("[DEBUG_SQL] blocked dangerous pattern in query: {}", request.sql);
-        return HttpResult::error_with_message(
-            ERR_INVALID_PARAMS,
-            locale,
-            "Query contains blocked functions/keywords",
-        );
-    }
-
-    // 执行查询
-    match execute_sql_query(&state.projects, &request.sql) {
-        Ok((columns, rows)) => {
-            let row_count = rows.len();
-            let execution_time_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
-
-            debug!(
-                "✅ [DEBUG_SQL] Query succeeded: {} rows, {} ms",
-                row_count, execution_time_ms
-            );
-
-            HttpResult::success(DebugSqlQueryResponse {
-                columns,
-                rows,
-                row_count,
-                execution_time_ms,
-            })
-        }
-        Err(e) => {
-            error!("[DEBUG_SQL] Query failed: {}", e);
-            HttpResult::error_with_message(
-                ERR_INTERNAL_SERVER_ERROR,
-                locale,
-                &format!(
-                    "{}: {}",
-                    get_i18n_message("error.query_execution_failed", locale),
-                    e
-                ),
-            )
-        }
-    }
+/// 调试用的容器简化信息
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DebugContainerInfo {
+    /// 容器ID
+    pub container_id: String,
+    /// 容器名称
+    pub container_name: String,
+    /// 容器IP
+    pub container_ip: String,
+    /// 状态
+    pub status: String,
+    /// 服务URL
+    pub service_url: String,
 }
 
 /// 获取存储统计信息（调试用）
@@ -191,7 +93,7 @@ pub async fn debug_sql_query(
     ),
     tag = "debug",
     operation_id = "debug_storage_stats",
-    summary = "获取 DuckDB 存储统计信息（调试用）"
+    summary = "获取存储统计信息（调试用）"
 )]
 #[axum::debug_handler]
 pub async fn debug_storage_stats(
@@ -221,7 +123,7 @@ pub async fn debug_storage_stats(
         (
             status = 200,
             description = "获取项目列表成功",
-            body = HttpResult<DebugSqlQueryResponse>
+            body = HttpResult<Vec<DebugProjectInfo>>
         )
     ),
     tag = "debug",
@@ -231,29 +133,30 @@ pub async fn debug_storage_stats(
 #[axum::debug_handler]
 pub async fn debug_list_projects(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> HttpResult<DebugSqlQueryResponse> {
-    let locale = get_locale_from_headers(&headers);
-    let start_time = std::time::Instant::now();
-    let sql = "SELECT project_id, session_id, service_type, container_id, user_id, agent_status_name, created_at, last_activity FROM projects ORDER BY last_activity DESC";
+    _headers: HeaderMap,
+) -> HttpResult<Vec<DebugProjectInfo>> {
+    let projects = state.projects.iter();
 
-    match execute_sql_query(&state.projects, sql) {
-        Ok((columns, rows)) => HttpResult::success(DebugSqlQueryResponse {
-            columns,
-            row_count: rows.len(),
-            rows,
-            execution_time_ms: start_time.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        }),
-        Err(e) => HttpResult::error_with_message(
-            ERR_INTERNAL_SERVER_ERROR,
-            locale,
-            &format!(
-                "{}: {}",
-                get_i18n_message("error.query_execution_failed", locale),
-                e
-            ),
-        ),
-    }
+    let result: Vec<DebugProjectInfo> = projects
+        .into_iter()
+        .map(|(pid, info)| DebugProjectInfo {
+            project_id: pid.clone(),
+            session_id: info.session_id().map(|s| s.to_string()),
+            user_id: info.user_id().map(|s| s.to_string()),
+            service_type: info.service_type().map(|st| st.to_string()),
+            container_id: info.container().map(|c| c.container_id.clone()),
+            agent_status_name: info.status().map(|s| format!("{:?}", s)),
+            created_at: info.created_at().to_rfc3339(),
+            last_activity: info.last_activity().to_rfc3339(),
+        })
+        .collect();
+
+    info!(
+        "✅ [DEBUG_PROJECTS] Listed {} projects",
+        result.len()
+    );
+
+    HttpResult::success(result)
 }
 
 /// 快捷查询：获取所有容器
@@ -264,7 +167,7 @@ pub async fn debug_list_projects(
         (
             status = 200,
             description = "获取容器列表成功",
-            body = HttpResult<DebugSqlQueryResponse>
+            body = HttpResult<Vec<DebugContainerInfo>>
         )
     ),
     tag = "debug",
@@ -274,36 +177,84 @@ pub async fn debug_list_projects(
 #[axum::debug_handler]
 pub async fn debug_list_containers(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> HttpResult<DebugSqlQueryResponse> {
-    let locale = get_locale_from_headers(&headers);
-    let start_time = std::time::Instant::now();
-    let sql = "SELECT container_id, container_name, container_ip, service_type, status, created_at, last_activity FROM containers ORDER BY last_activity DESC";
+    _headers: HeaderMap,
+) -> HttpResult<Vec<DebugContainerInfo>> {
+    let containers = state.projects.get_all_container_records();
 
-    match execute_sql_query(&state.projects, sql) {
-        Ok((columns, rows)) => HttpResult::success(DebugSqlQueryResponse {
-            columns,
-            row_count: rows.len(),
-            rows,
-            execution_time_ms: start_time.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        }),
-        Err(e) => HttpResult::error_with_message(
-            ERR_INTERNAL_SERVER_ERROR,
-            locale,
-            &format!(
-                "{}: {}",
-                get_i18n_message("error.query_execution_failed", locale),
-                e
-            ),
-        ),
-    }
+    let result: Vec<DebugContainerInfo> = containers
+        .iter()
+        .map(|c| DebugContainerInfo {
+            container_id: c.container_id.clone(),
+            container_name: c.container_name.clone(),
+            container_ip: c.container_ip.clone(),
+            status: c.status.clone(),
+            service_url: c.service_url.clone(),
+        })
+        .collect();
+
+    info!(
+        "✅ [DEBUG_CONTAINERS] Listed {} containers",
+        result.len()
+    );
+
+    HttpResult::success(result)
 }
 
-/// 执行 SQL 查询的内部函数
-fn execute_sql_query(
-    adapter: &crate::storage::ProjectAdapter,
-    sql: &str,
-) -> Result<(Vec<String>, Vec<serde_json::Value>), String> {
-    // 获取底层 DuckDB 存储
-    adapter.execute_raw_query(sql)
+/// 获取存储完整摘要（调试用）
+#[utoipa::path(
+    get,
+    path = "/debug/sql",
+    responses(
+        (
+            status = 200,
+            description = "获取存储摘要成功",
+            body = HttpResult<DebugDumpResponse>
+        )
+    ),
+    tag = "debug",
+    operation_id = "debug_dump_summary",
+    summary = "获取存储摘要（调试用）",
+    description = "返回存储中所有项目和容器的完整摘要信息，替代原有的 SQL raw query 接口。"
+)]
+#[axum::debug_handler]
+pub async fn debug_dump_summary(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+) -> HttpResult<DebugDumpResponse> {
+    let summary = state.projects.dump_summary();
+
+    let projects: Vec<DebugProjectInfo> = state
+        .projects
+        .iter()
+        .into_iter()
+        .map(|(pid, info)| DebugProjectInfo {
+            project_id: pid.clone(),
+            session_id: info.session_id().map(|s| s.to_string()),
+            user_id: info.user_id().map(|s| s.to_string()),
+            service_type: info.service_type().map(|st| st.to_string()),
+            container_id: info.container().map(|c| c.container_id.clone()),
+            agent_status_name: info.status().map(|s| format!("{:?}", s)),
+            created_at: info.created_at().to_rfc3339(),
+            last_activity: info.last_activity().to_rfc3339(),
+        })
+        .collect();
+
+    let containers: Vec<DebugContainerInfo> = state
+        .projects
+        .get_all_container_records()
+        .iter()
+        .map(|c| DebugContainerInfo {
+            container_id: c.container_id.clone(),
+            container_name: c.container_name.clone(),
+            container_ip: c.container_ip.clone(),
+            status: c.status.clone(),
+            service_url: c.service_url.clone(),
+        })
+        .collect();
+
+    HttpResult::success(DebugDumpResponse {
+        summary,
+        projects,
+        containers,
+    })
 }

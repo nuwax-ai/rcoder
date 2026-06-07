@@ -206,6 +206,39 @@ impl ProjectAndContainerInfo {
         }
     }
 
+    /// 从各部分构造（主要用于测试）
+    #[allow(dead_code)]
+    pub fn from_parts(
+        project_id: String,
+        user_id: Option<String>,
+        pod_id: Option<String>,
+        session_id: Option<String>,
+        container: Option<ContainerBasicInfo>,
+        request_id: Option<String>,
+        service_type: Option<ServiceType>,
+        last_activity: DateTime<Utc>,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        let core = ProjectCoreState {
+            project_id,
+            user_id,
+            pod_id,
+            session_id,
+            last_activity,
+            created_at,
+        };
+        let mut extended = ProjectExtendedState::new();
+        extended.container = container;
+        extended.request_id = request_id;
+        extended.service_type = service_type;
+        Self {
+            state: ProjectState {
+                core: Arc::new(core),
+                extended: Arc::new(extended),
+            },
+        }
+    }
+
     /// 高效更新核心状态 - 新的推荐方法
     pub fn update_session(&mut self, session_id: String) {
         self.state.update_core(|core| {

@@ -627,7 +627,8 @@ pub async fn handle_computer_chat(
                 );
 
                 // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
-                state.insert_project_with_session(map_key.clone(), Arc::new(updated_info), &session_id);
+                state.insert_project_with_session(map_key.clone(), Arc::new(updated_info), &session_id)
+                    .map_err(|e| { tracing::error!("[STORAGE] insert_project_with_session failed: {}", e); e })?;
 
                 info!(
                     "🔄 [COMPUTER_CHAT] Updated existing container mapping: user_id={}, project_id={}, session_id={} (last_activity refreshed)",
@@ -653,7 +654,8 @@ pub async fn handle_computer_chat(
                 );
 
                 // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
-                state.insert_project_with_session(map_key.clone(), Arc::new(project_info), &session_id);
+                state.insert_project_with_session(map_key.clone(), Arc::new(project_info), &session_id)
+                    .map_err(|e| { tracing::error!("[STORAGE] insert_project_with_session failed: {}", e); e })?;
 
                 info!(
                     "🆕 [COMPUTER_CHAT] Created new container mapping: user_id={}, project_id={}, session_id={}",
@@ -1011,7 +1013,8 @@ fn ensure_project_mapping_in_state(
     );
 
     // 立即插入到 DuckDB
-    state.insert_project(project_id.to_string(), Arc::new(project_info));
+    state.insert_project(project_id.to_string(), Arc::new(project_info))
+        .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
 
     info!(
         "🆕 [COMPUTER_CHAT] Inserted DuckDB record (immediately after container creation): user_id={}, project_id={}, container_id={}",

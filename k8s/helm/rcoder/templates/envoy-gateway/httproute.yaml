@@ -1,0 +1,52 @@
+{{- if and .Values.gateway.enabled .Values.envoyGateway.enabled }}
+# Catch-all HTTPRoute for agent_runner traffic
+#
+# Envoy Gateway 使用 cluster_header 路由模式：
+# rcoder-gateway 注入 x-backend-cluster header → Envoy 根据 header 值路由到对应 Backend CRD
+#
+# 默认 backend 仅用于 HTTPRoute 校验，实际路由由 EnvoyPatchPolicy 覆盖。
+# 需要在 Envoy Gateway 侧配置 EnvoyPatchPolicy 启用 cluster_header 路由：
+#
+# apiVersion: gateway.envoyproxy.io/v1alpha1
+# kind: EnvoyPatchPolicy
+# metadata:
+#   name: rcoder-cluster-header-routing
+# spec:
+#   targetRef:
+#     group: gateway.networking.k8s.io
+#     kind: HTTPRoute
+#     name: rcoder-agent-catch-all
+#   type: JSONPatch
+#   jsonPatches:
+#     - type: "route"
+#       name: "rcoder-agent-catch-all"
+#       patch:
+#         operation: add
+#         path: ""
+#         value:
+#           route:
+#             cluster_header: "x-backend-cluster"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rcoder-agent-catch-all
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rcoder.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: rcoder-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        # 默认 backend（占位，被 EnvoyPatchPolicy 覆盖）
+        # 首个 agent_runner Pod 的 Backend CRD 创建后可更新此引用
+        - group: gateway.envoyproxy.io
+          kind: Backend
+          name: backend-default
+          port: 8086
+{{- end }}
