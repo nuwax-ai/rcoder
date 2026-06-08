@@ -444,11 +444,11 @@ impl AgentLifecycleGuard {
     /// # 参数
     ///
     /// * `force` - 是否强制使用 SIGKILL（否则使用 SIGTERM）
+    #[allow(unused_variables)]
     async fn kill_process_group(&self, force: bool) -> Result<()> {
-        let pgid = self.inner.pgid;
-
         #[cfg(unix)]
         {
+        let pgid = self.inner.pgid;
             use nix::errno::Errno;
             use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
