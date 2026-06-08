@@ -61,10 +61,13 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: |
+          for i in 1 2 3 4 5; do
+            curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -129,7 +132,15 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        shell: bash
+        run: |
+          if ! command -v dist > /dev/null 2>&1; then
+            for i in 1 2 3 4 5; do
+              ${{ matrix.install_dist.run }} && break
+              echo "Attempt $i failed, retrying in 10s..."
+              sleep 10
+            done
+          fi
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
