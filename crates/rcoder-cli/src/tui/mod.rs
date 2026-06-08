@@ -135,7 +135,7 @@ async fn build_tui_client(
 }
 
 /// 执行 tui 子命令
-pub async fn execute_tui(args: TuiArgs, verbose: u8, quiet: bool) -> ExitCode {
+pub async fn execute_tui(args: TuiArgs, _verbose: u8, quiet: bool) -> ExitCode {
     let use_markdown = !args.no_markdown;
 
     // 创建事件通道（有界通道，提供背压保护，防止 OOM）
@@ -168,7 +168,7 @@ pub async fn execute_tui(args: TuiArgs, verbose: u8, quiet: bool) -> ExitCode {
 
     // 创建并运行 TUI 应用
     let client = Arc::new(client);
-    let app = App::new(client, event_tx, event_rx, tui_terminal, use_markdown, verbose, quiet);
+    let app = App::new(client, event_tx, event_rx, tui_terminal, use_markdown, quiet);
     let exit_code = app.run().await;
 
     if exit_code == 0 {

@@ -6,8 +6,7 @@
 use std::io::IsTerminal;
 
 /// ANSI 颜色代码
-#[allow(dead_code)]
-mod colors {
+pub(crate) mod colors {
     pub const RESET: &str = "\x1b[0m";
     pub const BOLD: &str = "\x1b[1m";
     pub const DIM: &str = "\x1b[2m";
@@ -16,7 +15,9 @@ mod colors {
     pub const YELLOW: &str = "\x1b[33m";
     pub const BLUE: &str = "\x1b[34m";
     pub const MAGENTA: &str = "\x1b[35m";
+    #[allow(dead_code)]
     pub const CYAN: &str = "\x1b[36m";
+    #[allow(dead_code)]
     pub const WHITE: &str = "\x1b[37m";
 }
 

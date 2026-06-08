@@ -4660,6 +4660,7 @@ dependencies = [
  "shared_types",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "unicode-width 0.2.0",
 ]

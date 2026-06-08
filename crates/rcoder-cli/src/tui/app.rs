@@ -109,7 +109,6 @@ impl App {
         event_rx: mpsc::Receiver<AppEvent>,
         terminal: TuiTerminal,
         use_markdown: bool,
-        _verbose: u8,
         quiet: bool,
     ) -> Self {
         let project_id = client.project_id().to_string();

@@ -29,6 +29,10 @@ pub struct Cli {
     /// 静默模式，仅输出 agent 响应内容
     #[arg(short, long, global = true)]
     pub quiet: bool,
+
+    /// 日志文件路径（同时输出到 stderr 和文件，便于排查问题）
+    #[arg(long, global = true, value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]

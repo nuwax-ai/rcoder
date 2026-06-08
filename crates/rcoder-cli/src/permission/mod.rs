@@ -2,32 +2,28 @@
 //!
 //! 实现 `PermissionPrompt` trait，在终端中显示权限请求并等待用户确认。
 
+use std::io::IsTerminal;
+
 use agent_abstraction::{PermissionPrompt, PermissionRequestContext};
 use agent_client_protocol::schema::RequestPermissionRequest;
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::output::formatter::colors;
+
 /// 终端权限确认提示
 ///
 /// 当 Agent 请求权限时（如执行危险命令），在终端显示选项并等待用户输入。
-///
-/// # 显示格式
-///
-/// ```text
-/// ┌─ Permission Request ─────────────────────────────┐
-/// │ Agent requests permission for: <tool_name>       │
-/// │   [1] Allow once                                 │
-/// │   [2] Allow always                               │
-/// │   [3] Deny                                       │
-/// │                                                  │
-/// │ Enter choice (1-3) or 'q' to cancel:             │
-/// └──────────────────────────────────────────────────┘
-/// ```
-pub struct TerminalPermissionPrompt;
+/// 自动检测 stderr 是否为 TTY，非 TTY 时禁用 ANSI 颜色码。
+pub struct TerminalPermissionPrompt {
+    color: bool,
+}
 
 impl TerminalPermissionPrompt {
     pub fn new() -> Self {
-        Self
+        Self {
+            color: std::io::stderr().is_terminal(),
+        }
     }
 
     /// Render option kind to human-readable text
@@ -41,6 +37,39 @@ impl TerminalPermissionPrompt {
             PermissionOptionKind::RejectOnce => "Deny (this time)",
             PermissionOptionKind::RejectAlways => "Deny (always)",
             _ => "Unknown",
+        }
+    }
+
+    /// 输出带颜色或纯文本的权限框行
+    fn print_border(&self, text: &str) {
+        if self.color {
+            eprintln!("{}{}{}{}", colors::YELLOW, colors::BOLD, text, colors::RESET);
+        } else {
+            eprintln!("{}", text);
+        }
+    }
+
+    /// 输出带黄色竖线前缀的行
+    fn print_line(&self, content: &str) {
+        if self.color {
+            eprintln!(
+                "{}│{} {}",
+                colors::YELLOW, colors::RESET, content
+            );
+        } else {
+            eprintln!("│ {}", content);
+        }
+    }
+
+    /// 输出带黄色竖线前缀的行（带粗体高亮部分）
+    fn print_line_with_bold(&self, prefix: &str, bold_part: &str, suffix: &str) {
+        if self.color {
+            eprintln!(
+                "{}│{} {}{}{}{}{}",
+                colors::YELLOW, colors::RESET, prefix, colors::BOLD, bold_part, colors::RESET, suffix
+            );
+        } else {
+            eprintln!("│ {}{}{}", prefix, bold_part, suffix);
         }
     }
 }
@@ -58,7 +87,6 @@ impl PermissionPrompt for TerminalPermissionPrompt {
         _context: &PermissionRequestContext,
         request: &RequestPermissionRequest,
     ) -> Result<Option<String>> {
-        // Extract tool name from tool_call
         let tool_name = request
             .tool_call
             .fields
@@ -66,32 +94,39 @@ impl PermissionPrompt for TerminalPermissionPrompt {
             .as_deref()
             .unwrap_or("unknown tool");
 
-        // Display the permission request
         eprintln!();
-        eprintln!("\x1b[33m\x1b[1m┌─ Permission Request ─────────────────────────────┐\x1b[0m");
-        eprintln!(
-            "\x1b[33m│\x1b[0m Agent requests permission for: \x1b[1m{}\x1b[0m",
-            tool_name
+        self.print_border("┌─ Permission Request ─────────────────────────────┐");
+        self.print_line_with_bold(
+            "Agent requests permission for: ",
+            tool_name,
+            "",
         );
-        eprintln!("\x1b[33m│\x1b[0m");
+        self.print_line("");
 
         for (i, opt) in request.options.iter().enumerate() {
             let kind_text = Self::render_option_kind(&opt.kind);
-            // Use opt.name if available, otherwise fall back to kind text
             let label = if opt.name.is_empty() {
                 kind_text.to_string()
             } else {
                 format!("{} ({})", opt.name, kind_text)
             };
-            eprintln!("\x1b[33m│\x1b[0m   [{}] {}", i + 1, label);
+            self.print_line(&format!("  [{}] {}", i + 1, label));
         }
-        eprintln!("\x1b[33m│\x1b[0m");
-        eprint!(
-            "\x1b[33m│\x1b[0m Enter choice (1-{}) or 'q' to cancel: ",
-            request.options.len()
-        );
+        self.print_line("");
+        if self.color {
+            eprint!(
+                "{}│{} Enter choice (1-{}) or 'q' to cancel: ",
+                colors::YELLOW,
+                colors::RESET,
+                request.options.len()
+            );
+        } else {
+            eprint!(
+                "│ Enter choice (1-{}) or 'q' to cancel: ",
+                request.options.len()
+            );
+        }
 
-        // Read user input (blocking in a spawned task to avoid blocking the async runtime)
         let input = tokio::task::spawn_blocking(|| {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).ok()?;
@@ -99,30 +134,29 @@ impl PermissionPrompt for TerminalPermissionPrompt {
         })
         .await?;
 
-        eprintln!(
-            "\x1b[33m└──────────────────────────────────────────────────┘\x1b[0m"
-        );
+        self.print_border("└──────────────────────────────────────────────────┘");
         eprintln!();
 
         let input = match input {
             Some(s) => s,
-            None => return Ok(None), // EOF
+            None => return Ok(None),
         };
 
-        // Parse input
         match input.to_lowercase().as_str() {
             "q" | "quit" | "cancel" | "n" => Ok(None),
             "" => Ok(None),
             _ => {
-                // Try to parse as number
                 match input.parse::<usize>() {
                     Ok(n) if n >= 1 && n <= request.options.len() => {
-                        // Convert PermissionOptionId to String
                         let option_id = request.options[n - 1].option_id.0.to_string();
                         Ok(Some(option_id))
                     }
                     _ => {
-                        eprintln!("\x1b[31mInvalid choice: {}\x1b[0m", input);
+                        if self.color {
+                            eprintln!("{}Invalid choice: {}{}", colors::RED, input, colors::RESET);
+                        } else {
+                            eprintln!("Invalid choice: {}", input);
+                        }
                         Ok(None)
                     }
                 }
