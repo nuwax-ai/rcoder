@@ -14,13 +14,14 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cluster_cache::ClusterCache;
 use crate::config::GatewayConfig;
 use crate::control_plane_client::ControlPlaneClient;
 use crate::identifier_extractor::IdentifierExtractor;
 use crate::route_table::{DataPlaneRoute, IdentifierSource, RouteType, build_route_table};
+use std::collections::HashMap;
 use crate::session_resolver::SessionResolver;
 
 /// 请求路由目标
@@ -62,6 +63,9 @@ fn service_prefix(service_type: &str) -> &str {
 /// Agent Runner HTTP 端口
 const AGENT_HTTP_PORT: u16 = 8086;
 
+/// 请求 body 最大大小（100MB）
+const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
+
 /// Gateway 代理服务
 pub struct GatewayProxy {
     pub route_table: Router<RouteType>,
@@ -91,10 +95,17 @@ impl GatewayProxy {
         }
     }
 
-    fn resolve_route(&self, path: &str) -> RouteType {
+    fn resolve_route(&self, path: &str) -> (RouteType, HashMap<String, String>) {
         match self.route_table.at(path) {
-            Ok(matched) => matched.value.clone(),
-            Err(_) => RouteType::ControlPlane,
+            Ok(matched) => {
+                let params: HashMap<String, String> = matched
+                    .params
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                (matched.value.clone(), params)
+            }
+            Err(_) => (RouteType::ControlPlane, HashMap::new()),
         }
     }
 
@@ -104,14 +115,15 @@ impl GatewayProxy {
         route: &DataPlaneRoute,
         path: &str,
         body: Option<&[u8]>,
+        path_params: &HashMap<String, String>,
     ) -> Option<String> {
         match &route.source {
             IdentifierSource::Body => {
                 let body = body?;
                 IdentifierExtractor::from_body(body, route.identifier_field)
             }
-            IdentifierSource::Path(idx) => {
-                IdentifierExtractor::from_path_by_index(path, *idx)
+            IdentifierSource::Path(param_name) => {
+                IdentifierExtractor::from_path_params(path_params, param_name)
             }
             IdentifierSource::Session => {
                 let session_id = path.split('/').next_back()?;
@@ -130,13 +142,26 @@ impl GatewayProxy {
         )
     }
 
-    /// 读取 request body（用于 POST 请求）
-    async fn read_request_body(session: &mut Session) -> Option<Vec<u8>> {
-        let body = session.downstream_session.read_request_body().await.ok()??;
-        if body.is_empty() {
-            return None;
+    /// 读取 request body（用于 POST 请求），带大小限制
+    async fn read_request_body(session: &mut Session) -> Result<Option<Vec<u8>>, &'static str> {
+        let mut body = Vec::new();
+        loop {
+            match session.downstream_session.read_request_body().await {
+                Ok(Some(chunk)) => {
+                    body.extend_from_slice(&chunk);
+                    if body.len() > MAX_BODY_SIZE {
+                        return Err("request body too large");
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return Err("failed to read request body"),
+            }
         }
-        Some(body.to_vec())
+        if body.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(body))
+        }
     }
 }
 
@@ -156,7 +181,8 @@ impl ProxyHttp for GatewayProxy {
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.as_str();
 
-        match self.resolve_route(&path) {
+        let (route_type, path_params) = self.resolve_route(&path);
+        match route_type {
             RouteType::GatewayHealth => {
                 debug!("[GATEWAY] health check");
                 let resp = ResponseHeader::build(200, None)?;
@@ -172,7 +198,14 @@ impl ProxyHttp for GatewayProxy {
             RouteType::DataPlane(route) => {
                 // 缓冲 body（POST 请求需要从 body 提取 identifier）
                 let body = if matches!(route.source, IdentifierSource::Body) && method == "POST" {
-                    Self::read_request_body(session).await
+                    match Self::read_request_body(session).await {
+                        Ok(body) => body,
+                        Err(e) => {
+                            warn!("[GATEWAY] body read error for {}: {}", path, e);
+                            ctx.target = RouteTarget::ControlPlane;
+                            return Ok(false);
+                        }
+                    }
                 } else {
                     None
                 };
@@ -180,7 +213,7 @@ impl ProxyHttp for GatewayProxy {
 
                 // 提取 identifier
                 let identifier = self
-                    .extract_identifier(&route, &path, body.as_deref())
+                    .extract_identifier(&route, &path, body.as_deref(), &path_params)
                     .await;
 
                 let identifier = match identifier {
@@ -214,7 +247,7 @@ impl ProxyHttp for GatewayProxy {
                         ctx.target = RouteTarget::AgentService(fqdn);
                     }
                     Err(e) => {
-                        warn!(
+                        error!(
                             "[GATEWAY] cluster cache ensure failed for {}: {}, falling back to control plane",
                             identifier, e
                         );

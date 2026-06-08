@@ -33,8 +33,8 @@ pub struct DataPlaneRoute {
 pub enum IdentifierSource {
     /// 从 JSON body 提取
     Body,
-    /// 从 URL path 参数提取（按段索引）
-    Path(usize),
+    /// 从 URL path 命名参数提取（如 "project_id"）
+    Path(String),
     /// 通过 session_id 解析
     Session,
 }
@@ -96,7 +96,7 @@ pub fn build_route_table() -> Router<RouteType> {
     router
         .insert("/agent/status/{project_id}", RouteType::DataPlane(DataPlaneRoute {
             identifier_field: "project_id",
-            source: IdentifierSource::Path(3),
+            source: IdentifierSource::Path("project_id".to_string()),
             service_type: "RCoder",
             read_only: true,
         }))
@@ -176,7 +176,7 @@ mod tests {
         match &result.value {
             RouteType::DataPlane(route) => {
                 assert_eq!(route.identifier_field, "project_id");
-                assert!(matches!(route.source, IdentifierSource::Path(3)));
+                assert!(matches!(&route.source, IdentifierSource::Path(s) if s == "project_id"));
             }
             _ => panic!("expected DataPlane"),
         }

@@ -2,8 +2,10 @@
 //!
 //! 支持三种提取方式：
 //! 1. 从 JSON body 字段提取
-//! 2. 从 URL path 参数提取
+//! 2. 从 URL path 命名参数提取（matchit params）
 //! 3. 通过 session_id 解析（由 SessionResolver 处理）
+
+use std::collections::HashMap;
 
 /// 标识符提取器
 pub struct IdentifierExtractor;
@@ -29,13 +31,12 @@ impl IdentifierExtractor {
         }
     }
 
-    /// 从 URL path 提取参数
+    /// 从 matchit 路径参数中提取指定参数
     ///
-    /// 例如 path = "/agent/status/user-123"，需要提取第 3 段
-    /// 调用 `from_path(path, 2)` 返回 `Some("user-123")`
-    pub fn from_path_by_index(path: &str, segment_index: usize) -> Option<String> {
-        let segment = path.split('/').nth(segment_index)?;
-        let trimmed = segment.trim();
+    /// 例如 params = {"project_id": "proj-456"}，调用 `from_path_params(params, "project_id")` 返回 `Some("proj-456")`
+    pub fn from_path_params(params: &HashMap<String, String>, param_name: &str) -> Option<String> {
+        let value = params.get(param_name)?;
+        let trimmed = value.trim();
         if trimmed.is_empty() {
             None
         } else {
@@ -47,6 +48,7 @@ impl IdentifierExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_from_body_string() {
@@ -85,20 +87,31 @@ mod tests {
     }
 
     #[test]
-    fn test_from_path_by_index() {
+    fn test_from_path_params() {
+        let mut params = HashMap::new();
+        params.insert("project_id".to_string(), "proj-456".to_string());
         assert_eq!(
-            IdentifierExtractor::from_path_by_index("/agent/status/user-123", 3),
-            Some("user-123".to_string())
+            IdentifierExtractor::from_path_params(&params, "project_id"),
+            Some("proj-456".to_string())
         );
     }
 
     #[test]
-    fn test_from_path_out_of_bounds() {
-        assert_eq!(IdentifierExtractor::from_path_by_index("/agent/status", 5), None);
+    fn test_from_path_params_missing() {
+        let params = HashMap::new();
+        assert_eq!(
+            IdentifierExtractor::from_path_params(&params, "project_id"),
+            None
+        );
     }
 
     #[test]
-    fn test_from_path_empty_segment() {
-        assert_eq!(IdentifierExtractor::from_path_by_index("/agent//status", 2), None);
+    fn test_from_path_params_empty() {
+        let mut params = HashMap::new();
+        params.insert("project_id".to_string(), "".to_string());
+        assert_eq!(
+            IdentifierExtractor::from_path_params(&params, "project_id"),
+            None
+        );
     }
 }

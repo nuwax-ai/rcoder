@@ -31,8 +31,8 @@ use super::types::{IdleContainerInfo, StorageStats};
 pub struct ProjectAdapter {
     /// project_id → project 信息（主存储）
     projects: DashMap<String, Arc<ProjectAndContainerInfo>>,
-    /// container_key → 容器条目（带引用计数）
-    containers: DashMap<String, ContainerEntry>,
+    /// container_key → 容器条目（带引用计数，Arc 共享确保原子状态一致）
+    containers: DashMap<String, Arc<ContainerEntry>>,
     /// session_id → (container_key, project_id)
     session_index: DashMap<String, (String, String)>,
     /// project_id → container_key（反向索引）
@@ -115,7 +115,7 @@ impl ProjectAdapter {
                         e.get().inc_ref();
                     }
                     Entry::Vacant(e) => {
-                        e.insert(ContainerEntry::new(container.clone(), st));
+                        e.insert(Arc::new(ContainerEntry::new(container.clone(), st)));
                     }
                 }
             }
@@ -186,12 +186,26 @@ impl ProjectAdapter {
 
     // ========== Session 操作 ==========
 
-    /// 通过 session_id 获取项目信息（view: 两次锁获取均立即释放）
+    /// 通过 session_id 获取项目信息
+    ///
+    /// 读时清理孤儿条目：如果 session_index 指向的 project 不存在，自动清理。
     pub fn get_by_session_id(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         let pid = self
             .session_index
             .view(session_id, |_, v| v.1.clone())?;
-        self.projects.view(&pid, |_, v| v.clone())
+
+        match self.projects.view(&pid, |_, v| v.clone()) {
+            Some(info) => Some(info),
+            None => {
+                // 孤儿条目：session_index 指向的 project 已不存在，清理
+                debug!(
+                    "[STORAGE] orphan session_index entry detected, cleaning: session_id={}, project_id={}",
+                    session_id, pid
+                );
+                self.session_index.remove(session_id);
+                None
+            }
+        }
     }
 
     /// 插入项目并设置 session 映射（原子操作，消除 CAS 竞态）
@@ -314,7 +328,7 @@ impl ProjectAdapter {
     /// 通过 session_id 获取容器名称（view: 两次锁获取均立即释放）
     pub fn get_container_name_by_session(&self, session_id: &str) -> Option<String> {
         let ck = self.session_index.view(session_id, |_, v| v.0.clone())?;
-        self.containers.view(&ck, |_, ce| ce.info.container_name.clone())
+        self.containers.view(&ck, |_, ce| ce.info().container_name.clone())
     }
 
     // ========== 活动时间更新 ==========
@@ -379,8 +393,8 @@ impl ProjectAdapter {
 
     /// 保存容器信息（更新或创建）
     ///
-    /// 优化：先 iter()（读锁）查找 key，再 entry()（写锁）精确更新，
-    /// 避免 iter_mut() 全程持写锁阻塞并发读。
+    /// 通过 view() 获取 Arc<ContainerEntry>，利用内部可变性（RwLock）更新。
+    /// DashMap 读锁在 view() 闭包返回后立即释放，update() 仅持有 RwLock。
     ///
     /// # Errors
     /// 如果 `service_type` 为 `None`，返回错误（Fail Fast）。
@@ -403,25 +417,19 @@ impl ProjectAdapter {
             }
         };
 
-        // iter()（读锁）查找匹配的 key
-        let found_key = self
-            .containers
-            .iter()
-            .find(|e| e.value().info.container_id == container.container_id)
-            .map(|e| e.key().clone());
+        // view() 获取 Arc（DashMap 读锁立即释放），通过 RwLock 更新字段
+        let existing = self.containers.view(&container.container_id, |_, ce| ce.clone());
 
-        if let Some(key) = found_key {
-            // entry()（写锁）精确更新单条记录
-            if let Entry::Occupied(mut e) = self.containers.entry(key) {
-                e.get_mut().info = container.clone();
-                e.get_mut().service_type = st;
+        match existing {
+            Some(ce) => {
+                ce.update(container.clone(), st);
             }
-        } else {
-            // 未找到：创建新条目（ref_count = 0，等待 project insert 关联）
-            let key = container.container_id.clone();
-            let ce = ContainerEntry::new(container.clone(), st);
-            ce.dec_ref();
-            self.containers.insert(key, ce);
+            None => {
+                self.containers.insert(
+                    container.container_id.clone(),
+                    Arc::new(ContainerEntry::with_ref_count(container.clone(), st, 0)),
+                );
+            }
         }
         Ok(())
     }
@@ -430,8 +438,8 @@ impl ProjectAdapter {
     pub fn get_container(&self, container_id: &str) -> Option<ContainerBasicInfo> {
         self.containers
             .iter()
-            .find(|e| e.value().info.container_id == container_id)
-            .map(|e| e.value().info.clone())
+            .find(|e| e.value().info().container_id == container_id)
+            .map(|e| e.value().info())
     }
 
     /// 删除容器及其关联的所有项目（RAII 触发物理销毁）
@@ -461,19 +469,19 @@ impl ProjectAdapter {
         let ck_to_remove: Option<String> = self
             .containers
             .iter()
-            .find(|e| e.value().info.container_id == container_id)
+            .find(|e| e.value().info().container_id == container_id)
             .map(|e| e.key().clone());
 
         let container_existed = ck_to_remove.is_some();
         if let Some(ck) = ck_to_remove {
             if let Entry::Occupied(e) = self.containers.entry(ck) {
-                // remove_entry 返回 (K, V)，K 即 container_key（逻辑标识符）
                 let (container_key, entry) = e.remove_entry();
+                let info = entry.info();
                 let _ = self.cleanup_tx.send(CleanupRequest {
                     identifier: container_key,
-                    container_name: entry.info.container_name,
-                    service_type: entry.service_type,
-                    container_ip: entry.info.container_ip,
+                    container_name: info.container_name,
+                    service_type: entry.service_type(),
+                    container_ip: info.container_ip,
                     project_ids,
                 });
             }
@@ -489,8 +497,8 @@ impl ProjectAdapter {
     ) -> Vec<ContainerBasicInfo> {
         self.containers
             .iter()
-            .filter(|e| e.value().service_type == service_type)
-            .map(|e| e.value().info.clone())
+            .filter(|e| e.value().service_type() == service_type)
+            .map(|e| e.value().info())
             .collect()
     }
 
@@ -498,7 +506,7 @@ impl ProjectAdapter {
     pub fn get_all_container_records(&self) -> Vec<ContainerBasicInfo> {
         self.containers
             .iter()
-            .map(|e| e.value().info.clone())
+            .map(|e| e.value().info())
             .collect()
     }
 
@@ -578,8 +586,8 @@ impl ProjectAdapter {
             .filter(|e| e.value().is_idle(idle_minutes))
             .map(|e| {
                 (
-                    e.value().info.clone(),
-                    e.value().service_type.clone(),
+                    e.value().info(),
+                    e.value().service_type(),
                     e.value().last_activity(),
                 )
             })
@@ -622,7 +630,7 @@ impl ProjectAdapter {
         let mut projects_by_service_type = std::collections::HashMap::new();
 
         for entry in self.containers.iter() {
-            let st = entry.value().service_type.clone();
+            let st = entry.value().service_type();
             *projects_by_service_type.entry(st).or_insert(0usize) += 1;
         }
 
@@ -689,15 +697,16 @@ impl ProjectAdapter {
         let remaining = entry.get().dec_ref();
         if remaining == 0 {
             let (ck, entry) = entry.remove_entry();
+            let info = entry.info();
             info!(
                 "[STORAGE] RAII: container refcount=0, sending cleanup for {}",
-                entry.info.container_name
+                info.container_name
             );
             let _ = self.cleanup_tx.send(CleanupRequest {
                 identifier: ck,
-                container_name: entry.info.container_name,
-                service_type: entry.service_type,
-                container_ip: entry.info.container_ip,
+                container_name: info.container_name,
+                service_type: entry.service_type(),
+                container_ip: info.container_ip,
                 project_ids: vec![],
             });
         }
@@ -898,8 +907,6 @@ mod tests {
     fn test_raii_cleanup_on_last_project_remove() {
         let adapter = make_adapter();
 
-        // ComputerAgentRunner 模式：同一 user_id 的多个 project 共享容器
-        // container_key() 返回 user_id，所以两个 project 共享同一个 ContainerEntry
         let container = ContainerBasicInfo {
             container_id: "shared-container-id".to_string(),
             container_name: "shared-container".to_string(),
@@ -914,7 +921,7 @@ mod tests {
 
         let mut info1 = ProjectAndContainerInfo::from_parts(
             "proj-1".to_string(),
-            Some("user-1".to_string()), // user_id 作为 container_key
+            Some("user-1".to_string()),
             None,
             None,
             Some(container.clone()),
@@ -927,7 +934,7 @@ mod tests {
 
         let mut info2 = ProjectAndContainerInfo::from_parts(
             "proj-2".to_string(),
-            Some("user-1".to_string()), // 同一 user_id
+            Some("user-1".to_string()),
             None,
             None,
             Some(container.clone()),
@@ -945,10 +952,8 @@ mod tests {
             .insert("proj-2".to_string(), Arc::new(info2))
             .unwrap();
 
-        // 容器只有 1 个条目（container_key = "user-1"，第二个 insert 走 inc_ref）
         assert_eq!(adapter.containers.len(), 1);
 
-        // 移除第一个 project — 容器不应被销毁（ref_count > 0）
         adapter.remove("proj-1");
         assert_eq!(
             adapter.containers.len(),
@@ -956,7 +961,6 @@ mod tests {
             "容器应保留（ref_count 应 > 0）"
         );
 
-        // 移除最后一个 project — 容器应被销毁（ref_count = 0）
         adapter.remove("proj-2");
         assert_eq!(
             adapter.containers.len(),
@@ -965,26 +969,22 @@ mod tests {
         );
     }
 
-    /// 测试同一 project_id 重复 insert 不会导致 ref_count 泄露
     #[test]
     fn test_reinsert_same_project_no_ref_leak() {
         let adapter = make_adapter();
 
         let info = Arc::new(create_test_info_with_container("proj-A", "container-A"));
 
-        // 第一次 insert：创建容器条目，ref_count = 1
         adapter
             .insert("proj-A".to_string(), info.clone())
             .unwrap();
         assert_eq!(adapter.containers.len(), 1);
 
-        // 第二次 insert（相同 container_key）：不应 inc_ref
         adapter
             .insert("proj-A".to_string(), info.clone())
             .unwrap();
         assert_eq!(adapter.containers.len(), 1);
 
-        // remove：ref_count 从 1→0，容器应被清理
         adapter.remove("proj-A");
         assert_eq!(
             adapter.containers.len(),
@@ -993,13 +993,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_save_container_update() {
+        let adapter = make_adapter();
+
+        // container_key 对于 RCoder 是 pod_id 或 project_id
+        // 这里使用 project_id 作为 container_id，确保 save_container 和 insert 使用相同的 key
+        let container = ContainerBasicInfo {
+            container_id: "proj-1".to_string(),
+            container_name: "save-test".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: "proj-1".to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://test".to_string(),
+        };
+
+        // 第一次 save：创建新条目（ref_count=0）
+        adapter
+            .save_container(&container, Some(ServiceType::RCoder))
+            .unwrap();
+        assert_eq!(adapter.containers.len(), 1);
+
+        // 通过 project insert 关联容器（ref_count 0→1）
+        let mut info = create_test_info("proj-1");
+        info.set_container(Some(container.clone()));
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info))
+            .unwrap();
+
+        // 验证 ref_count = 1
+        let ce = adapter.containers.get("proj-1").unwrap();
+        assert_eq!(ce.value().ref_count(), 1);
+
+        // 第二次 save：更新已有条目，ref_count 应保持不变
+        let mut updated_container = container.clone();
+        updated_container.container_name = "updated-name".to_string();
+        adapter
+            .save_container(&updated_container, Some(ServiceType::ComputerAgentRunner))
+            .unwrap();
+
+        let ce = adapter.containers.get("proj-1").unwrap();
+        assert_eq!(ce.value().ref_count(), 1, "save_container 更新不应改变 ref_count");
+        assert_eq!(ce.value().info().container_name, "updated-name");
+        assert_eq!(ce.value().service_type(), ServiceType::ComputerAgentRunner);
+    }
+
     // ========== 并发 RAII + 死锁验证测试 ==========
 
     use std::sync::Barrier;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    /// 超时 join：如果线程在 timeout 内未完成，返回 None（表示可能死锁）
     fn join_with_timeout<T>(handle: thread::JoinHandle<T>, timeout_secs: u64) -> Option<T> {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         while !handle.is_finished() {
@@ -1011,7 +1058,6 @@ mod tests {
         handle.join().ok()
     }
 
-    /// 从 receiver 中收集所有待处理的 CleanupRequest
     fn drain_cleanup_requests(
         rx: &std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<CleanupRequest>>,
     ) -> Vec<CleanupRequest> {
@@ -1023,7 +1069,6 @@ mod tests {
         requests
     }
 
-    /// 创建共享容器模式的 project（ComputerAgentRunner，同一 user_id）
     fn create_shared_project(
         project_id: &str,
         user_id: &str,
@@ -1044,8 +1089,6 @@ mod tests {
         info
     }
 
-    /// 测试：多线程并发 insert + remove 不同项目（各自有独立容器）
-    /// 验证无死锁 + RAII 清理正确
     #[test]
     fn test_concurrent_insert_remove_no_deadlock() {
         let (adapter, rx) = ProjectAdapter::new();
@@ -1082,7 +1125,6 @@ mod tests {
             );
         }
 
-        // 所有 project 和 container 都应被清理
         assert_eq!(adapter.len(), 0, "all projects should be removed");
         assert_eq!(
             adapter.containers.len(),
@@ -1090,7 +1132,6 @@ mod tests {
             "all containers should be cleaned via RAII"
         );
 
-        // 每个 remove 都应触发一次 RAII cleanup
         let cleanups = drain_cleanup_requests(&rx);
         assert_eq!(
             cleanups.len(),
@@ -1099,8 +1140,6 @@ mod tests {
         );
     }
 
-    /// 测试：多线程并发 insert + remove 同一个 project_id
-    /// 竞态场景：只有一个线程的 insert/remove 对生效
     #[test]
     fn test_concurrent_same_project_insert_remove() {
         let (adapter, _rx) = ProjectAdapter::new();
@@ -1137,7 +1176,6 @@ mod tests {
         }
     }
 
-    /// 测试：两个 project 共享容器，并发 remove 验证 RAII 清理只触发一次
     #[test]
     fn test_concurrent_shared_container_remove() {
         let (adapter, rx) = ProjectAdapter::new();
@@ -1166,7 +1204,6 @@ mod tests {
             .insert("proj-2".to_string(), Arc::new(info2))
             .unwrap();
 
-        // 共享容器只有一个条目，ref_count = 2
         assert_eq!(adapter.containers.len(), 1);
 
         let barrier = Arc::new(Barrier::new(2));
@@ -1192,7 +1229,6 @@ mod tests {
         assert_eq!(adapter.len(), 0);
         assert_eq!(adapter.containers.len(), 0, "container should be cleaned up");
 
-        // RAII 清理应恰好触发 1 次（ref_count 从 2→1→0）
         let cleanups = drain_cleanup_requests(&rx);
         assert_eq!(
             cleanups.len(),
@@ -1203,7 +1239,6 @@ mod tests {
         assert_eq!(cleanups[0].container_ip, "10.0.0.1");
     }
 
-    /// 测试：一个线程更新 session，另一个线程并发 remove 同一 project
     #[test]
     fn test_concurrent_session_update_and_remove() {
         let (adapter, _rx) = ProjectAdapter::new();
@@ -1216,7 +1251,6 @@ mod tests {
         let barrier = Arc::new(Barrier::new(2));
         let mut handles = vec![];
 
-        // Thread 1: 持续更新 session
         {
             let adapter = adapter.clone();
             let barrier = barrier.clone();
@@ -1229,7 +1263,6 @@ mod tests {
             }));
         }
 
-        // Thread 2: 短暂延迟后 remove
         {
             let adapter = adapter.clone();
             let barrier = barrier.clone();
@@ -1249,7 +1282,6 @@ mod tests {
         }
     }
 
-    /// 测试：多线程并发对同一 project 做 insert_with_session + remove
     #[test]
     fn test_concurrent_insert_with_session_and_remove() {
         let (adapter, _rx) = ProjectAdapter::new();
@@ -1288,7 +1320,6 @@ mod tests {
         }
     }
 
-    /// 测试：多线程并发 remove 不存在的 project_id
     #[test]
     fn test_concurrent_remove_nonexistent() {
         let (adapter, _rx) = ProjectAdapter::new();
@@ -1322,13 +1353,11 @@ mod tests {
         }
     }
 
-    /// 压力测试：多线程混合操作（insert/remove/update_session/get/clear_session）
     #[test]
     fn test_concurrent_stress_mixed_operations() {
         let (adapter, _rx) = ProjectAdapter::new();
         let adapter = Arc::new(adapter);
 
-        // 预填充 10 个 project
         for i in 0..10 {
             let pid = format!("preload-{}", i);
             let info =
@@ -1353,20 +1382,15 @@ mod tests {
                         &format!("sc-{}-{}", t, i),
                     ));
 
-                    // insert
                     let _ = adapter.insert(pid.clone(), info);
-
-                    // 混合读操作
                     let _ = adapter.get(&pid);
                     let _ = adapter.update_activity(&pid);
 
-                    // session 操作
                     let sid = format!("sid-{}-{}", t, i);
                     adapter.update_session(&pid, &sid);
                     let _ = adapter.get_by_session_id(&sid);
                     let _ = adapter.get_container_name_by_session(&sid);
 
-                    // clear + remove
                     adapter.clear_session(&pid);
                     let _ = adapter.remove(&pid);
                 }
@@ -1382,7 +1406,6 @@ mod tests {
         }
     }
 
-    /// 测试：RAII CleanupRequest 内容正确性
     #[test]
     fn test_raii_cleanup_request_content() {
         let (adapter, rx) = ProjectAdapter::new();
@@ -1394,7 +1417,6 @@ mod tests {
         let removed = adapter.remove("proj-verify");
         assert!(removed.is_some());
 
-        // 验证 CleanupRequest 内容
         let cleanups = drain_cleanup_requests(&rx);
         assert_eq!(cleanups.len(), 1);
 
@@ -1405,7 +1427,6 @@ mod tests {
         assert_eq!(req.service_type, ServiceType::RCoder);
     }
 
-    /// 测试：共享容器多次 insert/remove 循环后 ref_count 不泄露
     #[test]
     fn test_shared_container_ref_count_no_leak_under_reinsert() {
         let (adapter, rx) = ProjectAdapter::new();
@@ -1423,7 +1444,6 @@ mod tests {
             service_url: "http://leak".to_string(),
         };
 
-        // 循环 5 次：insert proj-1 和 proj-2（共享容器），然后全部 remove
         for round in 0..5 {
             let info1 = create_shared_project("proj-1", "user-leak", &container);
             let info2 = create_shared_project("proj-2", "user-leak", &container);
@@ -1435,7 +1455,6 @@ mod tests {
                 .insert("proj-2".to_string(), Arc::new(info2))
                 .unwrap();
 
-            // 容器始终只有 1 个条目
             assert_eq!(
                 adapter.containers.len(),
                 1,
@@ -1444,7 +1463,6 @@ mod tests {
             );
 
             adapter.remove("proj-1");
-            // 移除 proj-1 后容器仍存在（ref_count > 0）
             assert_eq!(
                 adapter.containers.len(),
                 1,
@@ -1453,7 +1471,6 @@ mod tests {
             );
 
             adapter.remove("proj-2");
-            // 移除 proj-2 后容器应被清理（ref_count = 0）
             assert_eq!(
                 adapter.containers.len(),
                 0,
@@ -1462,7 +1479,6 @@ mod tests {
             );
         }
 
-        // 5 轮循环应产生 5 次 RAII 清理
         let cleanups = drain_cleanup_requests(&rx);
         assert_eq!(cleanups.len(), 5, "5 rounds should produce 5 cleanup requests");
     }

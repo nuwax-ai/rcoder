@@ -4,6 +4,7 @@
 //! 使用 tokio mpsc channel 与 ProjectAdapter 解耦（同步发送、异步处理）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use shared_types::{GRPC_DEFAULT_PORT, ServiceType};
 use tracing::{info, warn};
@@ -24,6 +25,9 @@ pub struct CleanupRequest {
     /// 关联的 project_id 列表（日志用）
     pub project_ids: Vec<String>,
 }
+
+/// 单个清理操作超时时间（防止慢清理阻塞队列）
+const CLEANUP_TIMEOUT_SECS: u64 = 120;
 
 /// 后台资源回收器
 pub struct ResourceReaper {
@@ -52,10 +56,26 @@ impl ResourceReaper {
     }
 
     /// 主循环：持续接收并处理清理请求
+    ///
+    /// 单个清理操作超时 120s，超时后跳过并告警，防止慢清理阻塞队列。
     pub async fn run(mut self) {
         info!("[REAPER] started");
         while let Some(req) = self.rx.recv().await {
-            self.process_cleanup(req).await;
+            let identifier = req.identifier.clone();
+            match tokio::time::timeout(
+                Duration::from_secs(CLEANUP_TIMEOUT_SECS),
+                self.process_cleanup(req),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(_) => {
+                    warn!(
+                        "[REAPER] cleanup timed out after {}s, skipping: {}",
+                        CLEANUP_TIMEOUT_SECS, identifier
+                    );
+                }
+            }
         }
         info!("[REAPER] shutdown");
     }

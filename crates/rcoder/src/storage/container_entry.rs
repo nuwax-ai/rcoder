@@ -2,18 +2,24 @@
 //!
 //! 每个 ContainerEntry 对应一个物理容器（Docker container 或 K8s Pod）。
 //! ref_count 跟踪有多少 project 引用此容器，归零时触发 RAII 清理。
+//!
+//! 使用 `Arc<ContainerEntry>` 共享，避免 Clone 导致原子状态分裂。
+//! `info` 和 `service_type` 使用 `RwLock` 实现内部可变性。
 
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::RwLock;
 
 use chrono::{DateTime, Utc};
 use shared_types::{ContainerBasicInfo, ServiceType};
 
 /// 容器条目（存储在 DashMap 中，container_key 为 key）
+///
+/// 通过 `Arc` 共享，确保引用计数和活跃时间在所有持有者之间一致。
 pub struct ContainerEntry {
-    /// 容器基本信息
-    pub info: ContainerBasicInfo,
-    /// 服务类型（RCoder / ComputerAgentRunner）
-    pub service_type: ServiceType,
+    /// 容器基本信息（RwLock: 允许通过 Arc 更新）
+    info: RwLock<ContainerBasicInfo>,
+    /// 服务类型（RwLock: 允许通过 Arc 更新）
+    service_type: RwLock<ServiceType>,
     /// 引用计数：有多少 project 引用此容器
     ref_count: AtomicUsize,
     /// 最后活跃时间（Unix 秒，原子更新，无锁）
@@ -25,26 +31,53 @@ impl ContainerEntry {
     pub fn new(info: ContainerBasicInfo, service_type: ServiceType) -> Self {
         let now = Utc::now().timestamp();
         Self {
-            info,
-            service_type,
+            info: RwLock::new(info),
+            service_type: RwLock::new(service_type),
             ref_count: AtomicUsize::new(1),
             last_activity_ts: AtomicI64::new(now),
         }
     }
 
+    /// 创建新条目，指定初始 ref_count
+    pub fn with_ref_count(info: ContainerBasicInfo, service_type: ServiceType, ref_count: usize) -> Self {
+        let now = Utc::now().timestamp();
+        Self {
+            info: RwLock::new(info),
+            service_type: RwLock::new(service_type),
+            ref_count: AtomicUsize::new(ref_count),
+            last_activity_ts: AtomicI64::new(now),
+        }
+    }
+
+    /// 获取容器信息的克隆
+    pub fn info(&self) -> ContainerBasicInfo {
+        self.info.read().unwrap().clone()
+    }
+
+    /// 获取服务类型
+    pub fn service_type(&self) -> ServiceType {
+        self.service_type.read().unwrap().clone()
+    }
+
+    /// 更新容器信息和服务类型
+    pub fn update(&self, new_info: ContainerBasicInfo, new_service_type: ServiceType) {
+        *self.info.write().unwrap() = new_info;
+        *self.service_type.write().unwrap() = new_service_type;
+    }
+
     /// 当前引用计数
     pub fn ref_count(&self) -> usize {
-        self.ref_count.load(Ordering::Relaxed)
+        self.ref_count.load(Ordering::Acquire)
     }
 
     /// 增加引用，返回增加后的值
     pub fn inc_ref(&self) -> usize {
-        self.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+        self.ref_count.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// 减少引用，返回减少后的值
     pub fn dec_ref(&self) -> usize {
-        self.ref_count.fetch_sub(1, Ordering::Relaxed) - 1
+        self.ref_count.fetch_sub(1, Ordering::AcqRel) - 1
     }
 
     /// 最后活跃时间
@@ -69,22 +102,11 @@ impl ContainerEntry {
     }
 }
 
-impl Clone for ContainerEntry {
-    fn clone(&self) -> Self {
-        Self {
-            info: self.info.clone(),
-            service_type: self.service_type.clone(),
-            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
-            last_activity_ts: AtomicI64::new(self.last_activity_ts.load(Ordering::Relaxed)),
-        }
-    }
-}
-
 impl std::fmt::Debug for ContainerEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContainerEntry")
-            .field("container_name", &self.info.container_name)
-            .field("service_type", &self.service_type)
+            .field("container_name", &self.info())
+            .field("service_type", &self.service_type())
             .field("ref_count", &self.ref_count())
             .field("last_activity", &self.last_activity())
             .finish()
@@ -133,7 +155,6 @@ mod tests {
     fn test_update_activity() {
         let entry = make_entry();
         let before = entry.last_activity();
-        // Small sleep is not needed — update_activity sets to Utc::now()
         entry.update_activity();
         let after = entry.last_activity();
         assert!(after >= before);
@@ -142,7 +163,48 @@ mod tests {
     #[test]
     fn test_is_idle() {
         let entry = make_entry();
-        // Just created, should not be idle
         assert!(!entry.is_idle(1));
+    }
+
+    #[test]
+    fn test_with_ref_count() {
+        let entry = ContainerEntry::with_ref_count(
+            ContainerBasicInfo {
+                container_id: "test-id".to_string(),
+                container_name: "test-name".to_string(),
+                container_ip: "127.0.0.1".to_string(),
+                internal_port: 8086,
+                external_port: 0,
+                project_id: "proj-1".to_string(),
+                status: "running".to_string(),
+                created_at: Utc::now(),
+                service_url: "http://test".to_string(),
+            },
+            ServiceType::RCoder,
+            0,
+        );
+        assert_eq!(entry.ref_count(), 0);
+    }
+
+    #[test]
+    fn test_update_info() {
+        let entry = make_entry();
+        assert_eq!(entry.info().container_name, "test-name");
+
+        let new_info = ContainerBasicInfo {
+            container_id: "new-id".to_string(),
+            container_name: "new-name".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 9090,
+            external_port: 0,
+            project_id: "proj-2".to_string(),
+            status: "stopped".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://new".to_string(),
+        };
+        entry.update(new_info, ServiceType::ComputerAgentRunner);
+        assert_eq!(entry.info().container_name, "new-name");
+        assert_eq!(entry.info().container_id, "new-id");
+        assert_eq!(entry.service_type(), ServiceType::ComputerAgentRunner);
     }
 }

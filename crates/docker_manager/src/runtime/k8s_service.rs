@@ -109,10 +109,9 @@ impl K8sServiceOps for KubernetesRuntime {
 
         let mut selector = BTreeMap::new();
         selector.insert("managed-by".to_string(), "rcoder-runtime".to_string());
-        selector.insert(
-            identifier_label_key.to_string(),
-            identifier.replace('_', "-"),
-        );
+        // identifier 直接作为 label value（K8s labels 允许下划线）
+        // 必须与 Pod labels 中的值一致（kubernetes_runtime.rs:374-378 使用原始 identifier）
+        selector.insert(identifier_label_key.to_string(), identifier.to_string());
 
         let service = Service {
             metadata: ObjectMeta {

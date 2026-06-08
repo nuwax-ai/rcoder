@@ -109,7 +109,7 @@ impl K8sBackendCRDOps for KubernetesRuntime {
                     {
                         "fqdn": {
                             "hostname": fqdn,
-                            "port": *HTTP_DEFAULT_PORT
+                            "port": HTTP_DEFAULT_PORT
                         }
                     }
                 ]
