@@ -144,7 +144,10 @@ jobs:
         run: brew install protobuf
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
-        run: apt-get update && apt-get install -y protobuf-compiler
+        run: |
+          curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip
+          unzip protoc-25.1-linux-x86_64.zip -d $HOME/.local
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
         run: choco install protoc -y
