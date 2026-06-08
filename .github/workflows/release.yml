@@ -133,7 +133,7 @@ jobs:
         shell: "bash"
       - name: "Install protoc (Linux)"
         if: "runner.os == 'Linux'"
-        run: "sudo apt-get update && sudo apt-get install -y protobuf-compiler"
+        run: "apt-get update && apt-get install -y protobuf-compiler"
         shell: "bash"
       - name: "Install protoc (Windows)"
         if: "runner.os == 'Windows'"
