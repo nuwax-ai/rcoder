@@ -1,0 +1,14 @@
+- name: Install protoc (macOS)
+  if: runner.os == 'macOS'
+  shell: bash
+  run: brew install protobuf
+
+- name: Install protoc (Linux)
+  if: runner.os == 'Linux'
+  shell: bash
+  run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+- name: Install protoc (Windows)
+  if: runner.os == 'Windows'
+  shell: bash
+  run: choco install protoc -y && echo "C:\ProgramData\chocolatey\bin" >> $GITHUB_PATH
