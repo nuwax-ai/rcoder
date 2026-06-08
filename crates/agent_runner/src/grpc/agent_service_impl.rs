@@ -522,6 +522,12 @@ impl AgentService for AgentServiceImpl {
                             }
                         }
                     }
+
+                    // 🛡️ 关键修复：gRPC 流结束时清理 SSE sender
+                    // 之前没有清理 current_sender，导致下次 Chat 请求到达时
+                    // try_send 使用已关闭的旧 sender，消息被丢弃
+                    info!("🔌 [gRPC] SubscribeProgress stream ended, cleaning up SSE sender: session_id={}", session_id_clone);
+                    session_data.close_current_connection().await;
                 }
                 Err(e) => {
                     warn!("[gRPC] Failed to create session connection: {}", e);
