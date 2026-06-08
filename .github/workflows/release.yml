@@ -112,6 +112,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      RUSTUP_TOOLCHAIN: "1.91.0"
     steps:
       - name: enable windows longpaths
         run: |
