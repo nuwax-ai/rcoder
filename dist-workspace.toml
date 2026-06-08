@@ -15,3 +15,5 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 npm-scope = "@nuwax"
 # npm publish job
 publish-jobs = ["npm"]
+# allow manual edits to generated CI (for protoc install steps)
+allow-dirty = ["ci"]
