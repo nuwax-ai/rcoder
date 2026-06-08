@@ -132,19 +132,11 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
+        run: ${{ matrix.install_dist.run }}
+      - name: Ensure dist in PATH (Windows)
+        if: runner.os == 'Windows'
         shell: bash
-        run: |
-          if ! command -v dist > /dev/null 2>&1; then
-            for i in 1 2 3 4 5; do
-              ${{ matrix.install_dist.run }} && break
-              echo "Attempt $i failed, retrying in 10s..."
-              sleep 10
-            done
-          fi
-          # Ensure dist is in PATH (installer may not update current session)
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          export PATH="$HOME/.cargo/bin:$PATH"
-          dist --version
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
