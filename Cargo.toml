@@ -29,6 +29,8 @@ edition = "2024"
 authors = ["soddy <soddygo@qq.com>"]
 license = "MIT OR Apache-2.0"
 description = "Rust-based AI agent framework"
+homepage = "https://github.com/nuwax-ai/rcoder"
+repository = "https://github.com/nuwax-ai/rcoder"
 publish = false
 
 [workspace.dependencies]
@@ -228,3 +230,8 @@ rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 # Pyroscope Continuous Profiling
 pyroscope = "0.5"
 pyroscope_pprofrs = "0.2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

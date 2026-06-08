@@ -5,7 +5,12 @@ edition = "2024"
 authors = ["soddy <soddygo@qq.com>"]
 license = "MIT OR Apache-2.0"
 description = "CLI tool for testing ACP agents locally"
+homepage = "https://github.com/nuwax-ai/rcoder"
+repository = "https://github.com/nuwax-ai/rcoder"
 publish = false
+
+[package.metadata.dist]
+dist = true
 
 [[bin]]
 name = "rcoder-cli"

@@ -7,6 +7,9 @@ license.workspace = true
 description = "Stateless gateway for K8s deployment: header injection + Envoy Gateway routing"
 publish = false
 
+[package.metadata.dist]
+dist = false
+
 [[bin]]
 name = "rcoder-gateway"
 path = "src/main.rs"
