@@ -9,6 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use agent_abstraction::{AcpClient, AcpClientBuilder, PromptCompletionSignal};
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::cli::ChatArgs;
@@ -197,7 +198,8 @@ async fn run_interactive_loop(
     formatter.info("进入交互模式（输入 exit/quit 退出，Ctrl+C 中断）");
     formatter.separator();
 
-    // Reusable SIGINT handler (unlike ctrl_c(), can fire multiple times)
+    // Reusable Ctrl+C handler
+    #[cfg(unix)]
     let mut sigint = match signal(SignalKind::interrupt()) {
         Ok(s) => s,
         Err(e) => {
@@ -243,7 +245,10 @@ async fn run_interactive_loop(
                     }
                 }
             }
-            _ = sigint.recv() => {
+            _ = async {
+                #[cfg(unix)] { sigint.recv().await; }
+                #[cfg(not(unix))] { tokio::signal::ctrl_c().await.ok(); }
+            } => {
                 eprintln!();
                 formatter.info("收到 Ctrl+C，退出");
                 return ExitCode::Interrupted;
@@ -274,7 +279,10 @@ async fn run_interactive_loop(
                     }
                 }
             }
-            _ = sigint.recv() => {
+            _ = async {
+                #[cfg(unix)] { sigint.recv().await; }
+                #[cfg(not(unix))] { tokio::signal::ctrl_c().await.ok(); }
+            } => {
                 formatter.warn("收到 Ctrl+C，正在取消当前操作...");
                 if let Err(e) = client.cancel().await {
                     formatter.error(&format!("取消失败: {}", e));
