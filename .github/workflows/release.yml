@@ -127,18 +127,6 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "Install protoc (macOS)"
-        if: "runner.os == 'macOS'"
-        run: "brew install protobuf"
-        shell: "bash"
-      - name: "Install protoc (Linux)"
-        if: "runner.os == 'Linux'"
-        run: "apt-get update && apt-get install -y protobuf-compiler"
-        shell: "bash"
-      - name: "Install protoc (Windows)"
-        if: "runner.os == 'Windows'"
-        run: "choco install protoc -y && echo \"C:\\ProgramData\\chocolatey\\bin\" >> $GITHUB_PATH"
-        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -151,6 +139,15 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y protobuf-compiler
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

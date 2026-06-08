@@ -15,5 +15,3 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 npm-scope = "@nuwax"
 # npm publish job
 publish-jobs = ["npm"]
-# custom build setup (install protoc for gRPC)
-github-build-setup = "../actions/install-protoc/action.yml"
