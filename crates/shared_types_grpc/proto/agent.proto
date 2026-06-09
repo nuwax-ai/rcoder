@@ -326,6 +326,18 @@ message ChatAgentServerConfig {
   repeated ModelEnvBinding model_env_bindings = 6;
   // Permission approval mode: "yolo" (default) or "ask"
   optional string agent_mode = 7;
+  // 工具审批规则（可选）
+  repeated ToolApprovalRule tool_approval_rules = 8;
+}
+
+// 工具审批规则
+message ToolApprovalRule {
+  // 通配符模式列表（大小写不敏感，任一命中即触发）
+  repeated string patterns = 1;
+  // 审批动作: "ask" | "allow" | "deny"
+  string action = 2;
+  // ACP ToolKind 过滤（可选），不传默认 "Execute"
+  optional string tool_kind = 3;
 }
 
 message ModelEnvBinding {

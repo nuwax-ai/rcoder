@@ -194,10 +194,78 @@ pub struct ChatAgentServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_mode: Option<String>,
 
+    /// 工具审批规则（可选）
+    ///
+    /// 用于精细控制工具审批行为：
+    /// - YOLO 模式下可配置特定工具需要审批
+    /// - ASK 模式下可配置特定工具自动放行
+    /// - 支持 deny 直接拒绝
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_approval_rules: Option<Vec<ToolApprovalRule>>,
+
     /// 元数据（可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
 }
+
+/// 工具审批规则
+///
+/// 用于精细控制工具审批行为，规则独立于 agent_mode，按配置的 action 生效。
+/// - `patterns` 使用 glob 通配符语法（大小写不敏感）
+/// - `tool_kind` 决定匹配目标：Execute 匹配命令内容，其他匹配工具名称
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ToolApprovalRule {
+    /// 通配符模式列表（大小写不敏感，任一命中即触发，OR 逻辑）
+    pub patterns: Vec<String>,
+    /// 审批动作: "ask" | "allow" | "deny"
+    pub action: ToolApprovalAction,
+    /// ACP ToolKind 过滤（可选），不传默认 "Execute"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_kind: Option<String>,
+}
+
+/// 审批动作枚举
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalAction {
+    /// 要求用户审批（即使在 YOLO 模式下）
+    Ask,
+    /// 自动放行（即使在 ASK 模式下）
+    Allow,
+    /// 直接拒绝，不询问用户
+    Deny,
+}
+
+impl ToolApprovalAction {
+    pub const VALID_VALUES: &'static [&'static str] = &["ask", "allow", "deny"];
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "allow" => Ok(Self::Allow),
+            "deny" => Ok(Self::Deny),
+            other => Err(format!(
+                "action must be one of {:?}, got: {}",
+                Self::VALID_VALUES,
+                other
+            )),
+        }
+    }
+}
+
+/// ACP ToolKind 合法值
+pub const VALID_TOOL_KINDS: &[&str] = &[
+    "Read",
+    "Edit",
+    "Delete",
+    "Move",
+    "Search",
+    "Execute",
+    "Think",
+    "Fetch",
+    "SwitchMode",
+    "Other",
+];
 
 /// 模型环境变量绑定规则
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]

@@ -21,7 +21,8 @@ pub use i18n_extractors::I18nJsonOrQuery;
 mod chat_agent_config;
 pub use chat_agent_config::{
     AgentMode, AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
-    ModelEnvBinding, ModelEnvBindingSource,
+    ModelEnvBinding, ModelEnvBindingSource, ToolApprovalAction, ToolApprovalRule,
+    VALID_TOOL_KINDS,
 };
 
 // API Key 验证器模块
@@ -117,6 +118,7 @@ pub use model::{
     PodCountResponse,
     ProjectAndAgentInfo,
     ProjectAndContainerInfo,
+    ProjectExtendedFields,
     // Session trait
     SessionEntry,
     SessionMessageType,

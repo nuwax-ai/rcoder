@@ -42,6 +42,12 @@ pub struct GatewayCtx {
     pub buffered_body: Option<Vec<u8>>,
 }
 
+impl Default for GatewayCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GatewayCtx {
     pub fn new() -> Self {
         Self {

@@ -54,10 +54,10 @@ impl GatewayConfig {
     pub fn parse_addr(url: &str) -> (&str, u16) {
         let stripped = url.strip_prefix("http://").unwrap_or(url);
         let stripped = stripped.strip_suffix('/').unwrap_or(stripped);
-        if let Some((host, port)) = stripped.rsplit_once(':') {
-            if let Ok(p) = port.parse() {
-                return (host, p);
-            }
+        if let Some((host, port)) = stripped.rsplit_once(':')
+            && let Ok(p) = port.parse()
+        {
+            return (host, p);
         }
         (stripped, 80)
     }

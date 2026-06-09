@@ -394,15 +394,12 @@ impl ContainerStatusChecker {
         let now = Utc::now();
         self.health_states
             .view(lookup_key, |_, health| {
-                if health.consecutive_failures >= self.config.failure_threshold {
-                    if let Some(first_failure) = health.first_failure_time {
-                        let elapsed = now.signed_duration_since(first_failure);
-                        if let Ok(skip_duration) =
-                            chrono::Duration::from_std(self.config.skip_duration)
-                        {
-                            return elapsed < skip_duration;
-                        }
-                    }
+                if health.consecutive_failures >= self.config.failure_threshold
+                    && let Some(first_failure) = health.first_failure_time
+                    && let Ok(skip_duration) =
+                        chrono::Duration::from_std(self.config.skip_duration)
+                {
+                    return now.signed_duration_since(first_failure) < skip_duration;
                 }
                 false
             })
@@ -451,9 +448,8 @@ impl ContainerStatusChecker {
                 if health.first_failure_time.is_none() {
                     health.first_failure_time = Some(now);
                 }
-                let failures = health.consecutive_failures;
                 // 无需 insert，修改已生效
-                failures
+                health.consecutive_failures
             }
             Entry::Vacant(entry) => {
                 entry.insert(ContainerHealthState::new_failed());

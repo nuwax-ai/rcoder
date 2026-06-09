@@ -63,6 +63,9 @@ pub struct AcpClientBuilder<N: SessionNotifier, R: SessionRegistry> {
     // Diagnostics
     diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
 
+    // Tool approval rules
+    tool_approval_rules: Option<Vec<shared_types::ToolApprovalRule>>,
+
     // Completion signaling — the builder creates a oneshot channel,
     // the builder stores the sender in the notifier wrapper (if desired).
     // For now, expose the receiver so the caller can await it.
@@ -97,6 +100,7 @@ where
             permission_handler: None,
             timeout: Duration::from_secs(300),
             diagnostics_listener: None,
+            tool_approval_rules: None,
             completion_signal: None,
         }
     }
@@ -195,6 +199,15 @@ where
         self
     }
 
+    /// Set tool approval rules for fine-grained permission control.
+    pub fn tool_approval_rules(
+        mut self,
+        rules: Option<Vec<shared_types::ToolApprovalRule>>,
+    ) -> Self {
+        self.tool_approval_rules = rules;
+        self
+    }
+
     /// Inject a diagnostics listener to receive agent process lifecycle events.
     ///
     /// The listener receives callbacks when the agent subprocess starts,
@@ -254,6 +267,7 @@ where
                 },
                 model_env_bindings: Vec::new(),
                 agent_mode: Some(format!("{:?}", self.agent_mode).to_lowercase()),
+                tool_approval_rules: self.tool_approval_rules.clone(),
                 metadata: None,
             })
         } else {
@@ -271,6 +285,9 @@ where
         }
         if let Some(ref sid) = self.session_id_hint {
             start_config = start_config.with_resume_session_id(sid.clone());
+        }
+        if self.tool_approval_rules.is_some() {
+            start_config = start_config.with_tool_approval_rules(self.tool_approval_rules);
         }
 
         // Create session manager

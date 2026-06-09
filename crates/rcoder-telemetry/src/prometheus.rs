@@ -57,11 +57,9 @@ pub const AGENT_ACTIVE_TASKS: &str = "agent_active_tasks";
 /// ```no_run
 /// use rcoder_telemetry::prometheus::init_prometheus;
 ///
-/// fn main() {
-///     let handle = init_prometheus().expect("Failed to init prometheus");
-///     let metrics_text = handle.render();
-///     println!("{}", metrics_text);
-/// }
+/// let handle = init_prometheus().expect("Failed to init prometheus");
+/// let metrics_text = handle.render();
+/// println!("{}", metrics_text);
 /// ```
 pub fn init_prometheus() -> Result<PrometheusHandle, TelemetryError> {
     let handle = PrometheusBuilder::new()

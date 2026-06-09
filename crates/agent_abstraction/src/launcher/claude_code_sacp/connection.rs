@@ -92,6 +92,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         agent_mode: start_config.agent_mode,
         service_type: start_config.service_type.clone(),
         request_id: None,
+        tool_approval_rules: start_config.tool_approval_rules.clone(),
     };
     // 克隆 notifier 和 project_id 供 prompt 结束通知使用
     let notifier_for_prompt_end = notifier.clone();

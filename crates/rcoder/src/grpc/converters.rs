@@ -239,6 +239,19 @@ pub fn to_grpc_chat_agent_server_config(
             .map(to_grpc_model_env_binding)
             .collect(),
         agent_mode: config.agent_mode,
+        tool_approval_rules: config
+            .tool_approval_rules
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| shared_types::grpc::ToolApprovalRule {
+                patterns: r.patterns,
+                action: serde_json::to_value(&r.action)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default(),
+                tool_kind: r.tool_kind,
+            })
+            .collect(),
     }
 }
 

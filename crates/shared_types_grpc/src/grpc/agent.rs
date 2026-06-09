@@ -397,6 +397,22 @@ pub struct ChatAgentServerConfig {
     /// Permission approval mode: "yolo" (default) or "ask"
     #[prost(string, optional, tag = "7")]
     pub agent_mode: ::core::option::Option<::prost::alloc::string::String>,
+    /// 工具审批规则（可选）
+    #[prost(message, repeated, tag = "8")]
+    pub tool_approval_rules: ::prost::alloc::vec::Vec<ToolApprovalRule>,
+}
+/// 工具审批规则
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolApprovalRule {
+    /// 通配符模式列表（大小写不敏感，任一命中即触发）
+    #[prost(string, repeated, tag = "1")]
+    pub patterns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// 审批动作: "ask" | "allow" | "deny"
+    #[prost(string, tag = "2")]
+    pub action: ::prost::alloc::string::String,
+    /// ACP ToolKind 过滤（可选），不传默认 "Execute"
+    #[prost(string, optional, tag = "3")]
+    pub tool_kind: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ModelEnvBinding {

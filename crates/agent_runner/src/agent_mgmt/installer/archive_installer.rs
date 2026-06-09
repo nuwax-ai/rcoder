@@ -41,12 +41,12 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
         let dest_path = dest_dir.join(&sanitized);
 
         // 路径安全检查：只对首次出现的目录做 canonicalize
-        if let Some(parent) = dest_path.parent() {
-            if !created_dirs.contains(parent) {
-                std::fs::create_dir_all(parent)?;
-                ensure_within(&dest_path, dest_dir)?;
-                created_dirs.insert(parent.to_path_buf());
-            }
+        if let Some(parent) = dest_path.parent()
+            && !created_dirs.contains(parent)
+        {
+            std::fs::create_dir_all(parent)?;
+            ensure_within(&dest_path, dest_dir)?;
+            created_dirs.insert(parent.to_path_buf());
         }
 
         let entry_type = entry.header().entry_type();
@@ -123,12 +123,12 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
         let sanitized = sanitize_entry_path(&entry_path)?;
         let dest_path = dest_dir.join(&sanitized);
 
-        if let Some(parent) = dest_path.parent() {
-            if !created_dirs.contains(parent) {
-                std::fs::create_dir_all(parent)?;
-                ensure_within(&dest_path, dest_dir)?;
-                created_dirs.insert(parent.to_path_buf());
-            }
+        if let Some(parent) = dest_path.parent()
+            && !created_dirs.contains(parent)
+        {
+            std::fs::create_dir_all(parent)?;
+            ensure_within(&dest_path, dest_dir)?;
+            created_dirs.insert(parent.to_path_buf());
         }
 
         let entry_size = entry.size();

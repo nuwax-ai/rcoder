@@ -118,10 +118,10 @@ impl ResourceReaper {
         }
 
         // 4. 清理 Pingora VNC backend（ComputerAgentRunner）
-        if req.service_type == ServiceType::ComputerAgentRunner {
-            if let Some(ref pingora) = self.pingora {
-                pingora.remove_vnc_backend(&req.identifier);
-            }
+        if req.service_type == ServiceType::ComputerAgentRunner
+            && let Some(ref pingora) = self.pingora
+        {
+            pingora.remove_vnc_backend(&req.identifier);
         }
     }
 }

@@ -77,7 +77,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     use super::handlers::{
         computer_cancel, computer_chat, computer_container_status, computer_progress,
         computer_permission_resolve, computer_status, computer_stop, computer_vnc_status,
-        pod_count, rcoder_progress,
+        devcomputer_chat, devcomputer_handlers, pod_count, rcoder_progress,
     };
     use shared_types::http_handlers;
 
@@ -116,6 +116,44 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(computer_progress::handle_computer_progress),
         )
         .route("/computer/pod/count", get(pod_count::handle_pod_count))
+        .route(
+            "/computer/notify-resolved",
+            post(computer_permission_resolve::handle_computer_permission_resolve),
+        )
+        .with_state(state.clone());
+
+    // DevComputer 调试路由 — 共享 /computer/* 容器和处理逻辑
+    // chat 需要注入 auto_reload（devcomputer_chat.rs），progress 需要返回类型适配（devcomputer_handlers.rs）
+    // 其余路由直接复用 computer_* handler
+    let devcomputer_routes = Router::new()
+        .route(
+            "/devcomputer/chat",
+            post(devcomputer_chat::handle_devcomputer_chat),
+        )
+        .route(
+            "/devcomputer/agent/stop",
+            post(computer_stop::handle_computer_stop),
+        )
+        .route(
+            "/devcomputer/agent/status",
+            post(computer_status::handle_computer_status),
+        )
+        .route(
+            "/devcomputer/agent/session/cancel",
+            post(computer_cancel::handle_computer_cancel),
+        )
+        .route(
+            "/devcomputer/agent/permission/resolve",
+            post(computer_permission_resolve::handle_computer_permission_resolve),
+        )
+        .route(
+            "/devcomputer/progress/{session_id}",
+            get(devcomputer_handlers::devcomputer_progress),
+        )
+        .route(
+            "/devcomputer/notify-resolved",
+            post(computer_permission_resolve::handle_computer_permission_resolve),
+        )
         .with_state(state.clone());
 
     // RCoder Agent 路由（使用 LocalAgentHttpService）
@@ -157,6 +195,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // 组合路由
     Router::new()
         .merge(computer_routes)
+        .merge(devcomputer_routes)
         .merge(rcoder_routes)
         .merge(api_routes)
         .merge(agent_mgmt_routes)
@@ -204,6 +243,8 @@ fn create_swagger_ui() -> SwaggerUi {
         computer_cancel::__path_handle_computer_cancel, computer_chat::__path_handle_computer_chat,
         computer_progress::__path_handle_computer_progress,
         computer_status::__path_handle_computer_status, computer_stop::__path_handle_computer_stop,
+        devcomputer_chat::__path_handle_devcomputer_chat,
+        devcomputer_handlers::__path_devcomputer_progress,
         pod_count::__path_handle_pod_count,
         agent_mgmt_handler::{
             __path_list_agents, __path_get_agent, __path_check_agent,
@@ -220,6 +261,9 @@ fn create_swagger_ui() -> SwaggerUi {
             handle_computer_stop,
             handle_computer_cancel,
             handle_computer_progress,
+            // DevComputer Agent 端点
+            handle_devcomputer_chat,
+            devcomputer_progress,
             // Pod 管理端点
             handle_pod_count,
             // 健康检查
@@ -278,6 +322,7 @@ fn create_swagger_ui() -> SwaggerUi {
         )),
         tags(
             (name = "Computer Agent", description = "Computer Agent HTTP API"),
+            (name = "DevComputer", description = "DevComputer 调试接口（与 /computer 共享容器，自动注入 auto_reload 配置）"),
             (name = "RCoder Agent", description = "RCoder Agent HTTP API"),
             (name = "pod", description = "Pod 容器管理接口"),
             (name = "system", description = "系统管理接口"),

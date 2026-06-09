@@ -10,7 +10,7 @@ mod tests {
     use super::super::*;
     use crate::cleanup_task::strategies::CleanupStrategy;
     use chrono::{Duration as ChronoDuration, Utc};
-    use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
+    use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ProjectExtendedFields, ServiceType};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -41,10 +41,12 @@ mod tests {
             None,
             None,
             Some(container),
-            None,
-            Some(service_type),
-            last_activity,
-            created_at,
+            ProjectExtendedFields {
+                service_type: Some(service_type),
+                last_activity: Some(last_activity),
+                created_at: Some(created_at),
+                ..Default::default()
+            },
         ))
     }
 
@@ -76,10 +78,12 @@ mod tests {
             Some(pod_id.to_string()),
             None,
             Some(container),
-            None,
-            Some(service_type),
-            last_activity,
-            created_at,
+            ProjectExtendedFields {
+                service_type: Some(service_type),
+                last_activity: Some(last_activity),
+                created_at: Some(created_at),
+                ..Default::default()
+            },
         ))
     }
 

@@ -144,6 +144,7 @@ dependencies = [
  "futures 0.3.32",
  "futures-util",
  "garde",
+ "globset",
  "hex",
  "http-body-util",
  "nix 0.31.2",

@@ -16,7 +16,7 @@ use shared_types::{
 };
 use shared_types::{
     ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
-    ModelEnvBindingSource,
+    ModelEnvBindingSource, ToolApprovalAction, ToolApprovalRule, VALID_TOOL_KINDS,
 };
 use tracing::warn;
 use tonic::Status;
@@ -74,6 +74,17 @@ pub fn convert_agent_server_config(
         return Err(Status::invalid_argument(err));
     }
 
+    let tool_approval_rules = if grpc_config.tool_approval_rules.is_empty() {
+        None
+    } else {
+        let rules = grpc_config
+            .tool_approval_rules
+            .into_iter()
+            .map(convert_tool_approval_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+        Some(rules)
+    };
+
     Ok(ChatAgentServerConfig {
         agent_id: grpc_config.agent_id,
         command: grpc_config.command,
@@ -93,11 +104,43 @@ pub fn convert_agent_server_config(
             .map(convert_model_env_binding)
             .collect::<Result<Vec<_>, _>>()?,
         agent_mode: grpc_config.agent_mode,
+        tool_approval_rules,
         metadata: if grpc_config.metadata.is_empty() {
             None
         } else {
             Some(grpc_config.metadata)
         },
+    })
+}
+
+fn convert_tool_approval_rule(
+    grpc_rule: shared_types::grpc::ToolApprovalRule,
+) -> Result<ToolApprovalRule, Status> {
+    // 校验 action 合法性
+    let action = ToolApprovalAction::parse(&grpc_rule.action)
+        .map_err(|e| Status::invalid_argument(format!("tool_approval_rules: {}", e)))?;
+
+    // 校验 tool_kind 合法性（如果提供）
+    if let Some(ref kind) = grpc_rule.tool_kind
+        && !VALID_TOOL_KINDS.contains(&kind.as_str())
+    {
+        return Err(Status::invalid_argument(format!(
+            "tool_approval_rules: tool_kind must be one of {:?}, got: {}",
+            VALID_TOOL_KINDS, kind
+        )));
+    }
+
+    // 过滤空 pattern
+    let patterns: Vec<String> = grpc_rule
+        .patterns
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .collect();
+
+    Ok(ToolApprovalRule {
+        patterns,
+        action,
+        tool_kind: grpc_rule.tool_kind,
     })
 }
 

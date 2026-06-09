@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use shared_types::{
     AcpRequestPermission, AgentMode, ResolvePermissionRequestDto, ResolvePermissionResponseDto,
-    SessionNotify,
+    SessionNotify, ToolApprovalAction,
 };
 use tracing::{error, info, warn};
 
@@ -29,6 +29,14 @@ struct PendingPermission {
     responder: Responder<RequestPermissionResponse>,
     context: PermissionRequestContext,
     save_rule: Option<SaveRuleSuggestion>,
+}
+
+/// 从权限请求中提取的字段，用于传递给 push_permission_to_frontend
+struct ExtractedPermissionInfo {
+    session_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -359,68 +367,16 @@ impl PermissionManager {
 
         allow.then_some(RuleDecision::Allow)
     }
-}
 
-#[async_trait]
-impl PermissionRequestHandler for PermissionManager {
-    async fn handle_permission_request(
+    /// 将权限请求推送到前端 SSE，等待用户审批
+    async fn push_permission_to_frontend(
         &self,
         context: PermissionRequestContext,
         request: RequestPermissionRequest,
         responder: Responder<RequestPermissionResponse>,
+        info: &ExtractedPermissionInfo,
     ) -> Result<(), agent_client_protocol::Error> {
-        let tool_call_id = request.tool_call.tool_call_id.to_string();
-        let session_id = request.session_id.to_string();
-        let tool_name = extract_tool_name(&request);
-        let command = extract_command(&request);
-
-        info!(
-            "[Permission] Received permission request: session_id={}, tool_call_id={}, tool={}, command={:?}, agent_mode={:?}",
-            session_id, tool_call_id, tool_name, command, context.agent_mode
-        );
-
-        if is_dangerous_command(command.as_deref()) {
-            info!(
-                "[Permission] dangerous command detected, will push to user for approval: session_id={}, tool_call_id={}, command={:?}",
-                session_id, tool_call_id, command
-            );
-        }
-
-        if let Some(decision) = self.rule_decision(&context, &tool_name, command.as_deref()) {
-            let preferred = match decision {
-                RuleDecision::Allow => [
-                    PermissionOptionKind::AllowAlways,
-                    PermissionOptionKind::AllowOnce,
-                ],
-                RuleDecision::Deny => [
-                    PermissionOptionKind::RejectAlways,
-                    PermissionOptionKind::RejectOnce,
-                ],
-            };
-            return respond_with_preferred_option(&request, responder, &preferred);
-        }
-
-        if context.agent_mode == AgentMode::Yolo {
-            info!(
-                "[Permission] Yolo mode, auto-approving: session_id={}, tool_call_id={}, tool={}",
-                session_id, tool_call_id, tool_name
-            );
-            return respond_with_preferred_option(
-                &request,
-                responder,
-                &[
-                    PermissionOptionKind::AllowAlways,
-                    PermissionOptionKind::AllowOnce,
-                ],
-            );
-        }
-
-        info!(
-            "[Permission] Ask mode, pushing SSE to frontend: session_id={}, tool_call_id={}, tool={}",
-            session_id, tool_call_id, tool_name
-        );
-
-        let save_rule = build_save_rule_suggestion(&tool_name, command.as_deref());
+        let save_rule = build_save_rule_suggestion(&info.tool_name, info.command.as_deref());
         let request_json = serde_json::to_value(&request).unwrap_or_else(|_| serde_json::json!({}));
         let save_rule_json = save_rule.as_ref().map(|suggestion| {
             serde_json::json!({
@@ -436,24 +392,27 @@ impl PermissionRequestHandler for PermissionManager {
             context: context.clone(),
             save_rule,
         };
-        self.store_pending((session_id.clone(), tool_call_id.clone()), pending);
+        self.store_pending(
+            (info.session_id.clone(), info.tool_call_id.clone()),
+            pending,
+        );
 
         let notify = SessionNotify::AcpRequestPermission(Box::new(AcpRequestPermission {
-            session_id: session_id.clone(),
+            session_id: info.session_id.clone(),
             request_permission_request: request_json,
-            tool_call_id: tool_call_id.clone(),
+            tool_call_id: info.tool_call_id.clone(),
             save_rule: save_rule_json,
             request_id: context.request_id.clone(),
         }));
 
         if let Err(err) =
-            push_session_update_with_project(&context.project_id, &session_id, notify).await
+            push_session_update_with_project(&context.project_id, &info.session_id, notify).await
         {
             error!(
                 "[Permission] failed to push permission SSE event: project_id={}, session_id={}, error={}",
-                context.project_id, session_id, err
+                context.project_id, info.session_id, err
             );
-            let key = (session_id.clone(), tool_call_id);
+            let key = (info.session_id.clone(), info.tool_call_id.clone());
             if let Some(pending) = self.pending.lock().remove(&key) {
                 warn!(
                     "[Permission] SSE push failed, cancelling pending permission: session_id={}, tool_call_id={}",
@@ -464,6 +423,108 @@ impl PermissionRequestHandler for PermissionManager {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl PermissionRequestHandler for PermissionManager {
+    async fn handle_permission_request(
+        &self,
+        context: PermissionRequestContext,
+        request: RequestPermissionRequest,
+        responder: Responder<RequestPermissionResponse>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let info = ExtractedPermissionInfo {
+            session_id: request.session_id.to_string(),
+            tool_call_id: request.tool_call.tool_call_id.to_string(),
+            tool_name: extract_tool_name(&request),
+            command: extract_command(&request),
+        };
+
+        info!(
+            "[Permission] Received permission request: session_id={}, tool_call_id={}, tool={}, command={:?}, agent_mode={:?}",
+            info.session_id, info.tool_call_id, info.tool_name, info.command, context.agent_mode
+        );
+
+        if is_dangerous_command(info.command.as_deref()) {
+            info!(
+                "[Permission] dangerous command detected, will push to user for approval: session_id={}, tool_call_id={}, command={:?}",
+                info.session_id, info.tool_call_id, info.command
+            );
+        }
+
+        if let Some(decision) = self.rule_decision(&context, &info.tool_name, info.command.as_deref()) {
+            let preferred = match decision {
+                RuleDecision::Allow => [
+                    PermissionOptionKind::AllowAlways,
+                    PermissionOptionKind::AllowOnce,
+                ],
+                RuleDecision::Deny => [
+                    PermissionOptionKind::RejectAlways,
+                    PermissionOptionKind::RejectOnce,
+                ],
+            };
+            return respond_with_preferred_option(&request, responder, &preferred);
+        }
+
+        // tool_approval_rules 匹配（首条命中即停）
+        if let Some(action) = match_tool_approval_rules(&context, &request) {
+            info!(
+                "[Permission] tool_approval_rules matched: session_id={}, tool_call_id={}, action={:?}",
+                info.session_id, info.tool_call_id, action
+            );
+            match action {
+                ToolApprovalAction::Allow => {
+                    return respond_with_preferred_option(
+                        &request,
+                        responder,
+                        &[
+                            PermissionOptionKind::AllowAlways,
+                            PermissionOptionKind::AllowOnce,
+                        ],
+                    );
+                }
+                ToolApprovalAction::Deny => {
+                    return respond_with_preferred_option(
+                        &request,
+                        responder,
+                        &[
+                            PermissionOptionKind::RejectAlways,
+                            PermissionOptionKind::RejectOnce,
+                        ],
+                    );
+                }
+                ToolApprovalAction::Ask => {
+                    // 与 Ask 模式相同: 推 SSE 到前端
+                    return self
+                        .push_permission_to_frontend(context, request, responder, &info)
+                        .await;
+                }
+            }
+        }
+
+        if context.agent_mode == AgentMode::Yolo {
+            info!(
+                "[Permission] Yolo mode, auto-approving: session_id={}, tool_call_id={}, tool={}",
+                info.session_id, info.tool_call_id, info.tool_name
+            );
+            return respond_with_preferred_option(
+                &request,
+                responder,
+                &[
+                    PermissionOptionKind::AllowAlways,
+                    PermissionOptionKind::AllowOnce,
+                ],
+            );
+        }
+
+        info!(
+            "[Permission] Ask mode, pushing SSE to frontend: session_id={}, tool_call_id={}, tool={}",
+            info.session_id, info.tool_call_id, info.tool_name
+        );
+
+        self.push_permission_to_frontend(context, request, responder, &info)
+            .await
     }
 }
 
@@ -498,6 +559,57 @@ fn select_option<'a>(
 
 fn cancelled_response() -> RequestPermissionResponse {
     RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
+}
+
+/// 检查 tool_approval_rules 中是否有规则命中（首条命中即停）
+fn match_tool_approval_rules(
+    context: &PermissionRequestContext,
+    request: &RequestPermissionRequest,
+) -> Option<ToolApprovalAction> {
+    let rules = context.tool_approval_rules.as_ref()?;
+    let kind_str = request
+        .tool_call
+        .fields
+        .kind
+        .as_ref()
+        .map(|k| format!("{:?}", k))
+        .unwrap_or_else(|| "Other".to_string());
+
+    for rule in rules {
+        let rule_kind = rule.tool_kind.as_deref().unwrap_or("Execute");
+        if kind_str != rule_kind {
+            continue;
+        }
+
+        // 根据 tool_kind 提取匹配目标
+        let target = if rule_kind == "Execute" {
+            extract_command(request).unwrap_or_default()
+        } else {
+            extract_tool_name(request)
+        };
+
+        // 通配符匹配（大小写不敏感，OR 逻辑）
+        for pattern in &rule.patterns {
+            if pattern.is_empty() {
+                continue;
+            }
+            if glob_match(pattern, &target) {
+                return Some(rule.action.clone());
+            }
+        }
+    }
+    None
+}
+
+/// 使用 glob 通配符匹配目标字符串（大小写不敏感）
+fn glob_match(pattern: &str, target: &str) -> bool {
+    let Ok(glob) = globset::GlobBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+    else {
+        return false;
+    };
+    glob.compile_matcher().is_match(target)
 }
 
 fn extract_tool_name(request: &RequestPermissionRequest) -> String {
@@ -962,6 +1074,7 @@ mod tests {
             agent_mode: AgentMode::Ask,
             service_type: shared_types::ServiceType::RCoder,
             request_id: None,
+            tool_approval_rules: None,
         }
     }
 
@@ -1087,5 +1200,231 @@ mod tests {
             PermissionOptionKind::AllowAlways
         ));
         assert_eq!(pm.rule_decision(&ctx, "bash", Some("anything")), None);
+    }
+
+    // === glob_match tests ===
+
+    #[test]
+    fn glob_match_basic_wildcards() {
+        assert!(glob_match("rm -rf *", "rm -rf /tmp"));
+        assert!(glob_match("rm -rf *", "rm -rf /tmp/cache"));
+        assert!(!glob_match("rm -rf *", "rm -f /tmp"));
+        assert!(!glob_match("rm -rf *", "rmdir /tmp"));
+
+        assert!(glob_match("ls *", "ls -la"));
+        assert!(!glob_match("ls *", "ls")); // "ls *" requires space + content
+        assert!(!glob_match("ls *", "lsof"));
+
+        assert!(glob_match("*delete*", "file_delete"));
+        assert!(glob_match("*delete*", "delete_item"));
+        assert!(!glob_match("*delete*", "remove"));
+
+        assert!(glob_match("sudo *", "sudo rm -rf"));
+        assert!(!glob_match("sudo *", "pseudo"));
+    }
+
+    #[test]
+    fn glob_match_case_insensitive() {
+        assert!(glob_match("RM *", "rm -rf /tmp"));
+        assert!(glob_match("rm *", "RM -RF /tmp"));
+        assert!(glob_match("*DELETE*", "file_delete"));
+    }
+
+    #[test]
+    fn glob_match_question_mark() {
+        assert!(glob_match("rm ?", "rm f"));
+        assert!(glob_match("rm ?", "rm x"));
+        assert!(!glob_match("rm ?", "rm ff"));
+    }
+
+    #[test]
+    fn glob_match_character_class() {
+        assert!(glob_match("[rc]m", "rm"));
+        assert!(glob_match("[rc]m", "cm"));
+        assert!(!glob_match("[rc]m", "dm"));
+    }
+
+    #[test]
+    fn glob_match_invalid_pattern_returns_false() {
+        assert!(!glob_match("[invalid", "test"));
+    }
+
+    #[test]
+    fn glob_match_empty_pattern_returns_false() {
+        // Empty patterns are skipped in match_tool_approval_rules,
+        // but glob_match itself handles them gracefully
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "something"));
+    }
+
+    // === match_tool_approval_rules tests ===
+
+    fn make_request_context_with_rules(
+        rules: Option<Vec<shared_types::ToolApprovalRule>>,
+    ) -> PermissionRequestContext {
+        PermissionRequestContext {
+            project_id: "proj1".to_string(),
+            user_id: Some("user1".to_string()),
+            agent_mode: AgentMode::Yolo,
+            service_type: shared_types::ServiceType::RCoder,
+            request_id: None,
+            tool_approval_rules: rules,
+        }
+    }
+
+    fn make_execute_request(command: &str) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        let fields = ToolCallUpdateFields::new()
+            .kind(ToolKind::Execute)
+            .title("bash")
+            .raw_input(serde_json::json!({"command": command}));
+        let tool_call = ToolCallUpdate::new("tc1", fields);
+        RequestPermissionRequest::new("session1", tool_call, vec![])
+    }
+
+    fn make_read_request(tool_name: &str) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        let fields = ToolCallUpdateFields::new()
+            .kind(ToolKind::Read)
+            .title(tool_name)
+            .raw_input(serde_json::json!({"tool_name": tool_name}));
+        let tool_call = ToolCallUpdate::new("tc1", fields);
+        RequestPermissionRequest::new("session1", tool_call, vec![])
+    }
+
+    #[test]
+    fn tool_approval_rules_execute_matches_command() {
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["rm -rf *".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: None, // defaults to Execute
+        }]));
+
+        let req = make_execute_request("rm -rf /tmp/cache");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask)
+        );
+
+        // Non-matching command
+        let req = make_execute_request("ls -la");
+        assert_eq!(match_tool_approval_rules(&ctx, &req), None);
+    }
+
+    #[test]
+    fn tool_approval_rules_read_matches_tool_name() {
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["*read*".to_string(), "*list*".to_string()],
+            action: ToolApprovalAction::Allow,
+            tool_kind: Some("Read".to_string()),
+        }]));
+
+        let req = make_read_request("mcp__server__read_items");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Allow)
+        );
+
+        let req = make_read_request("mcp__server__list_items");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Allow)
+        );
+
+        // Non-matching tool name
+        let req = make_read_request("mcp__server__delete_item");
+        assert_eq!(match_tool_approval_rules(&ctx, &req), None);
+    }
+
+    #[test]
+    fn tool_approval_rules_kind_mismatch_skips() {
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["*".to_string()],
+            action: ToolApprovalAction::Deny,
+            tool_kind: Some("Delete".to_string()),
+        }]));
+
+        // Execute request should not match Delete rule
+        let req = make_execute_request("rm -rf /tmp");
+        assert_eq!(match_tool_approval_rules(&ctx, &req), None);
+    }
+
+    #[test]
+    fn tool_approval_rules_first_match_wins() {
+        let ctx = make_request_context_with_rules(Some(vec![
+            shared_types::ToolApprovalRule {
+                patterns: vec!["rm *".to_string()],
+                action: ToolApprovalAction::Ask,
+                tool_kind: None,
+            },
+            shared_types::ToolApprovalRule {
+                patterns: vec!["*".to_string()],
+                action: ToolApprovalAction::Deny,
+                tool_kind: None,
+            },
+        ]));
+
+        let req = make_execute_request("rm -rf /tmp");
+        // First rule matches with Ask
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_no_rules_returns_none() {
+        let ctx = make_request_context_with_rules(None);
+        let req = make_execute_request("rm -rf /tmp");
+        assert_eq!(match_tool_approval_rules(&ctx, &req), None);
+    }
+
+    #[test]
+    fn tool_approval_rules_empty_rules_returns_none() {
+        let ctx = make_request_context_with_rules(Some(vec![]));
+        let req = make_execute_request("rm -rf /tmp");
+        assert_eq!(match_tool_approval_rules(&ctx, &req), None);
+    }
+
+    #[test]
+    fn tool_approval_rules_deny_action() {
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["sudo *".to_string()],
+            action: ToolApprovalAction::Deny,
+            tool_kind: None,
+        }]));
+
+        let req = make_execute_request("sudo rm -rf /");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Deny)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_multiple_patterns_or_logic() {
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["rm -rf *".to_string(), "sudo *".to_string(), "chmod 777 *".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: None,
+        }]));
+
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_execute_request("rm -rf /tmp")),
+            Some(ToolApprovalAction::Ask)
+        );
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_execute_request("sudo apt install")),
+            Some(ToolApprovalAction::Ask)
+        );
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_execute_request("chmod 777 /var")),
+            Some(ToolApprovalAction::Ask)
+        );
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_execute_request("ls -la")),
+            None
+        );
     }
 }

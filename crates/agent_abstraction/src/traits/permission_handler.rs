@@ -15,6 +15,8 @@ pub struct PermissionRequestContext {
     pub agent_mode: shared_types::AgentMode,
     pub service_type: shared_types::ServiceType,
     pub request_id: Option<String>,
+    /// 工具审批规则（来自请求参数）
+    pub tool_approval_rules: Option<Vec<shared_types::ToolApprovalRule>>,
 }
 
 /// Handles ACP permission requests without coupling agent_abstraction to agent_runner.

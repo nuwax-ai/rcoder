@@ -88,35 +88,35 @@ impl ProjectAdapter {
         };
 
         // 旧容器引用 -1（容器变更时）
-        if let Some(old) = old_ck {
-            if container_changed {
-                self.dec_container_ref(&old);
-            }
+        if let Some(old) = old_ck
+            && container_changed
+        {
+            self.dec_container_ref(&old);
         }
 
         // 新容器引用 +1（仅容器变更或新 project 时）— entry API 原子操作
-        if container_changed {
-            if let Some(container) = info.container() {
-                let st = match info.service_type() {
-                    Some(st) => st,
-                    None => {
-                        tracing::error!(
-                            "[STORAGE] service_type is None, cannot insert project: project_id={}, container_key={}",
-                            project_id, container_key
-                        );
-                        return Err(anyhow::anyhow!(
-                            "service_type is required for project insert: project_id={}",
-                            project_id
-                        ));
-                    }
-                };
-                match self.containers.entry(container_key.clone()) {
-                    Entry::Occupied(e) => {
-                        e.get().inc_ref();
-                    }
-                    Entry::Vacant(e) => {
-                        e.insert(Arc::new(ContainerEntry::new(container.clone(), st)));
-                    }
+        if container_changed
+            && let Some(container) = info.container()
+        {
+            let st = match info.service_type() {
+                Some(st) => st,
+                None => {
+                    tracing::error!(
+                        "[STORAGE] service_type is None, cannot insert project: project_id={}, container_key={}",
+                        project_id, container_key
+                    );
+                    return Err(anyhow::anyhow!(
+                        "service_type is required for project insert: project_id={}",
+                        project_id
+                    ));
+                }
+            };
+            match self.containers.entry(container_key.clone()) {
+                Entry::Occupied(e) => {
+                    e.get().inc_ref();
+                }
+                Entry::Vacant(e) => {
+                    e.insert(Arc::new(ContainerEntry::new(container.clone(), st)));
                 }
             }
         }
@@ -228,10 +228,10 @@ impl ProjectAdapter {
         self.insert(project_id.clone(), info)?;
 
         // 清理旧 session 索引
-        if let Some(ref old) = old_sid {
-            if session_id.map_or(true, |s| s != old) {
-                self.session_index.remove(old);
-            }
+        if let Some(ref old) = old_sid
+            && session_id.is_none_or(|s| s != old)
+        {
+            self.session_index.remove(old);
         }
 
         // 写入新 session 索引 + 更新 project info
@@ -473,18 +473,18 @@ impl ProjectAdapter {
             .map(|e| e.key().clone());
 
         let container_existed = ck_to_remove.is_some();
-        if let Some(ck) = ck_to_remove {
-            if let Entry::Occupied(e) = self.containers.entry(ck) {
-                let (container_key, entry) = e.remove_entry();
-                let info = entry.info();
-                let _ = self.cleanup_tx.send(CleanupRequest {
-                    identifier: container_key,
-                    container_name: info.container_name,
-                    service_type: entry.service_type(),
-                    container_ip: info.container_ip,
-                    project_ids,
-                });
-            }
+        if let Some(ck) = ck_to_remove
+            && let Entry::Occupied(e) = self.containers.entry(ck)
+        {
+            let (container_key, entry) = e.remove_entry();
+            let info = entry.info();
+            let _ = self.cleanup_tx.send(CleanupRequest {
+                identifier: container_key,
+                container_name: info.container_name,
+                service_type: entry.service_type(),
+                container_ip: info.container_ip,
+                project_ids,
+            });
         }
 
         (container_existed, count)
@@ -667,10 +667,10 @@ impl ProjectAdapter {
             .flatten();
 
         // 2. 清除旧正向映射
-        if let Some(ref old) = old_sid {
-            if old != session_id {
-                self.session_index.remove(old);
-            }
+        if let Some(ref old) = old_sid
+            && old != session_id
+        {
+            self.session_index.remove(old);
         }
 
         // 3. 写入新映射（view: 读 ck 后立即释放锁）
@@ -737,6 +737,7 @@ fn code_to_agent_status(code: i32, _name: &str) -> shared_types::AgentStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::ProjectExtendedFields;
 
     fn create_test_info(project_id: &str) -> ProjectAndContainerInfo {
         let mut info = ProjectAndContainerInfo::new(project_id.to_string());
@@ -925,10 +926,10 @@ mod tests {
             None,
             None,
             Some(container.clone()),
-            None,
-            Some(ServiceType::ComputerAgentRunner),
-            Utc::now(),
-            Utc::now(),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::ComputerAgentRunner),
+                ..Default::default()
+            },
         );
         info1.set_service_type(Some(ServiceType::ComputerAgentRunner));
 
@@ -938,10 +939,10 @@ mod tests {
             None,
             None,
             Some(container.clone()),
-            None,
-            Some(ServiceType::ComputerAgentRunner),
-            Utc::now(),
-            Utc::now(),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::ComputerAgentRunner),
+                ..Default::default()
+            },
         );
         info2.set_service_type(Some(ServiceType::ComputerAgentRunner));
 
@@ -1080,10 +1081,10 @@ mod tests {
             None,
             None,
             Some(container.clone()),
-            None,
-            Some(ServiceType::ComputerAgentRunner),
-            Utc::now(),
-            Utc::now(),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::ComputerAgentRunner),
+                ..Default::default()
+            },
         );
         info.set_service_type(Some(ServiceType::ComputerAgentRunner));
         info

@@ -92,6 +92,15 @@ impl ProjectCoreState {
 
 /// 项目扩展状态 - 包含较少变更的大字段
 ///
+/// 用于 `from_parts` 构造的可选字段参数
+#[derive(Debug, Clone, Default)]
+pub struct ProjectExtendedFields {
+    pub request_id: Option<String>,
+    pub service_type: Option<ServiceType>,
+    pub last_activity: Option<DateTime<Utc>>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// 这些字段相对稳定，不需要频繁更新
 #[derive(Debug, Clone)]
 pub struct ProjectExtendedState {
@@ -214,23 +223,21 @@ impl ProjectAndContainerInfo {
         pod_id: Option<String>,
         session_id: Option<String>,
         container: Option<ContainerBasicInfo>,
-        request_id: Option<String>,
-        service_type: Option<ServiceType>,
-        last_activity: DateTime<Utc>,
-        created_at: DateTime<Utc>,
+        fields: ProjectExtendedFields,
     ) -> Self {
+        let now = Utc::now();
         let core = ProjectCoreState {
             project_id,
             user_id,
             pod_id,
             session_id,
-            last_activity,
-            created_at,
+            last_activity: fields.last_activity.unwrap_or(now),
+            created_at: fields.created_at.unwrap_or(now),
         };
         let mut extended = ProjectExtendedState::new();
         extended.container = container;
-        extended.request_id = request_id;
-        extended.service_type = service_type;
+        extended.request_id = fields.request_id;
+        extended.service_type = fields.service_type;
         Self {
             state: ProjectState {
                 core: Arc::new(core),

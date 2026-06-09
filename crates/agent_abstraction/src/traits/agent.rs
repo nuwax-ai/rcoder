@@ -55,6 +55,9 @@ pub struct AgentStartConfig {
     ///
     /// Maximum wait time for Agent internal cancel operations
     pub agent_cancel_timeout_secs: Option<u64>,
+
+    /// 工具审批规则（来自请求参数）
+    pub tool_approval_rules: Option<Vec<shared_types::ToolApprovalRule>>,
 }
 
 impl AgentStartConfig {
@@ -74,6 +77,7 @@ impl AgentStartConfig {
             agent_server_override: None,
             acp_session_create_timeout_secs: None,
             agent_cancel_timeout_secs: None,
+            tool_approval_rules: None,
         }
     }
 
@@ -140,6 +144,15 @@ impl AgentStartConfig {
     /// 🆕 Set Agent cancel call timeout
     pub fn with_agent_cancel_timeout(mut self, timeout_secs: u64) -> Self {
         self.agent_cancel_timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    /// Set tool approval rules
+    pub fn with_tool_approval_rules(
+        mut self,
+        rules: Option<Vec<shared_types::ToolApprovalRule>>,
+    ) -> Self {
+        self.tool_approval_rules = rules;
         self
     }
 

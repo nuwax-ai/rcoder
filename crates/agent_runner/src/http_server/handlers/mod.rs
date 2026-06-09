@@ -13,6 +13,8 @@ pub mod computer_permission_resolve;
 pub mod computer_status;
 pub mod computer_stop;
 pub mod computer_vnc_status;
+pub mod devcomputer_chat;
+pub mod devcomputer_handlers;
 pub mod pod_count;
 pub mod rcoder_progress;
 
