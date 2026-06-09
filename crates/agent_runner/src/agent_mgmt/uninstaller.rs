@@ -14,6 +14,10 @@ use crate::agent_mgmt::installer::AgentManifest;
 use crate::agent_mgmt::registry::AgentRegistry;
 
 /// 执行卸载
+///
+/// 支持两种 binary_path 类型：
+/// - 目录型（directory-based agent）：binary_path 指向 agent 安装目录，直接 `remove_dir_all`
+/// - 文件型（binary agent）：binary_path 指向入口文件，删除文件后清理父目录
 pub async fn uninstall(registry: &AgentRegistry, agent_id: &str) -> AgentMgmtResult<AgentManifest> {
     let manifest = registry
         .get(agent_id)
@@ -27,7 +31,12 @@ pub async fn uninstall(registry: &AgentRegistry, agent_id: &str) -> AgentMgmtRes
     // 0. 安全检查:binary_path 必须在安装目录下(防止 manifest 被篡改后删除系统文件)
     let binary_path = std::path::PathBuf::from(&manifest.binary_path);
     let install_dir = registry.install_dir();
-    if !binary_path.starts_with(install_dir) {
+    // 尝试 canonicalize 防止 ../.. 绕过;回退到原始路径比较(兼容路径不存在的情况)
+    let within_install = match (binary_path.canonicalize(), install_dir.canonicalize()) {
+        (Ok(canon_bin), Ok(canon_inst)) => canon_bin.starts_with(&canon_inst),
+        _ => binary_path.starts_with(install_dir),
+    };
+    if !within_install {
         return Err(AgentMgmtError::InvalidManifest(format!(
             "binary_path '{}' is outside install_dir '{}'",
             binary_path.display(),
@@ -35,33 +44,45 @@ pub async fn uninstall(registry: &AgentRegistry, agent_id: &str) -> AgentMgmtRes
         )));
     }
 
-    // 1. 删除入口二进制/符号链接(若存在)
-    if (binary_path.exists() || binary_path.symlink_metadata().is_ok())
-        && let Err(e) = tokio::fs::remove_file(&binary_path).await {
+    // 1. 根据 binary_path 类型清理
+    if binary_path.is_dir() {
+        // 目录型 agent：直接删除整个 agent 目录
+        if let Err(e) = tokio::fs::remove_dir_all(&binary_path).await {
             warn!(
-                "[agent_mgmt] Failed to remove binary during uninstall: path={}, error={}",
+                "[agent_mgmt] Failed to remove agent directory during uninstall: path={}, error={}",
                 binary_path.display(),
                 e
             );
         }
+    } else {
+        // 文件型 agent：删除入口二进制/符号链接
+        if (binary_path.exists() || binary_path.symlink_metadata().is_ok())
+            && let Err(e) = tokio::fs::remove_file(&binary_path).await {
+                warn!(
+                    "[agent_mgmt] Failed to remove binary during uninstall: path={}, error={}",
+                    binary_path.display(),
+                    e
+                );
+            }
 
-    // 2. 清理 agent 自己的子目录(若存在,残留的 tar/zip 解压文件)
-    //    取 binary_path 父目录的父目录(避开 bin_dir 公共目录)
-    if let Some(bin_dir) = binary_path.parent()
-        && let Some(agent_dir) = bin_dir.parent() {
-            // 只清理与 agent_id 严格同名(防止误删)
-            let dir_name = agent_dir.file_name().and_then(|n| n.to_str());
-            if dir_name == Some(agent_id) && agent_dir.exists()
-                && let Err(e) = tokio::fs::remove_dir_all(agent_dir).await {
-                    warn!(
-                        "[agent_mgmt] Failed to remove agent subdir during uninstall: path={}, error={}",
-                        agent_dir.display(),
-                        e
-                    );
-                }
-        }
+        // 清理 agent 自己的子目录(若存在,残留的 tar/zip 解压文件)
+        //    取 binary_path 父目录的父目录(避开 bin_dir 公共目录)
+        if let Some(bin_dir) = binary_path.parent()
+            && let Some(agent_dir) = bin_dir.parent() {
+                // 只清理与 agent_id 严格同名(防止误删)
+                let dir_name = agent_dir.file_name().and_then(|n| n.to_str());
+                if dir_name == Some(agent_id) && agent_dir.exists()
+                    && let Err(e) = tokio::fs::remove_dir_all(agent_dir).await {
+                        warn!(
+                            "[agent_mgmt] Failed to remove agent subdir during uninstall: path={}, error={}",
+                            agent_dir.display(),
+                            e
+                        );
+                    }
+            }
+    }
 
-    // 3. 从注册表移除
+    // 2. 从注册表移除
     let removed = registry.remove(agent_id)?;
     info!(
         "[agent_mgmt] Uninstalled: agent_id={}, install_type={:?}, binary_path={}",

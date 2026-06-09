@@ -20,7 +20,7 @@ use futures_util::StreamExt;
 use shared_types::InstallType;
 use shared_types_grpc::InstallAgentResponse;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::binary_installer;
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
@@ -242,6 +242,8 @@ async fn do_install_with_version_check(
         .map_err(AgentMgmtError::Io)?;
 
     // 5. 安装(复用 binary_installer::install_from_file，避免全量读入内存)
+    let t_install = std::time::Instant::now();
+    debug!("[agent_mgmt] starting install_from_file: agent_id={}, file_size={}", agent_id, file_size);
     let response = binary_installer::install_from_file(
         registry,
         path_manager,
@@ -257,6 +259,7 @@ async fn do_install_with_version_check(
         },
     )
     .await;
+    debug!("[agent_mgmt] install_from_file completed: took {:?}", t_install.elapsed());
 
     // install_from_file 成功时已 rename 走了 staging，失败时需清理
     let _ = std::fs::remove_file(&staging_path);

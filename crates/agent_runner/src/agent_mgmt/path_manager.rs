@@ -3,16 +3,23 @@
 //! 默认布局(可在 `PathManager::new_with_root` 覆盖):
 //! ```text
 //! {install_dir}/
-//! ├── bin/                    # 所有安装的 agent 二进制统一放这里(写入 PATH)
-//! │   ├── claude-code-acp
-//! │   └── codex-acp
-//! ├── registry.json           # 已安装 agent 注册表(持久化)
-//! ├── claude-code-acp/        # builtin agent 目录(只读,不可卸载)
+//! ├── registry.json               # 已安装 agent 注册表(持久化)
+//! ├── claude-code-acp/            # builtin agent 目录(只读,不可卸载)
 //! │   └── ...
-//! └── codex-acp/              # 用户上传/解压后的目录
-//!     ├── bin/
-//!     └── lib/
+//! ├── codex-acp/                  # 二进制型 agent
+//! │   ├── codex-acp               # 入口可执行文件 (binary_path)
+//! │   └── ...
+//! └── deepagents-app-agent/       # 目录型 agent (Node.js / Bun / Python)
+//!     ├── dist/index.js            # 入口脚本 (bin.start)
+//!     ├── node_modules/
+//!     └── agent-package.json
 //! ```
+//!
+//! ## PATH 策略
+//!
+//! - Dockerfile 将 `{install_dir}` 加入 PATH
+//! - start-up.sh 动态注入子目录到 PATH（使二进制型 agent 可被 `which` 找到）
+//! - 目录型 agent 的 command 是解释器（node / bun / python），已在系统 PATH 中
 
 use std::path::{Path, PathBuf};
 

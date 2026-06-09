@@ -3,7 +3,7 @@
 # ============================================================================
 
 IMAGE ?= rcoder:test-k8s
-K8S_IMAGE_REGISTRY ?= nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest
+K8S_IMAGE_REGISTRY ?= nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest
 KUSTOMIZE_DIR ?= k8s/manifests
 ROLLOUT_TIMEOUT ?= 180s
 

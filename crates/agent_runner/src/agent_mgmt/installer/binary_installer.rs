@@ -22,7 +22,7 @@ use futures_util::Stream;
 use shared_types::InstallType;
 use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{debug, info};
 
 use super::archive_installer;
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
@@ -375,10 +375,16 @@ pub async fn install_from_file(
     }
 
     // 3. 准备 staging 目录 + rename 文件
+    let t0 = std::time::Instant::now();
     path_manager.ensure_dirs().await?;
+    debug!("[agent_mgmt] install_from_file: ensure_dirs took {:?}", t0.elapsed());
+
+    let t1 = std::time::Instant::now();
     if let Ok(agent_dir) = path_manager.agent_dir(agent_id)
         && agent_dir.exists() {
+            debug!("[agent_mgmt] install_from_file: removing existing agent_dir");
             tokio::fs::remove_dir_all(&agent_dir).await.ok();
+            info!("[agent_mgmt] install_from_file: remove_dir_all took {:?}", t1.elapsed());
         }
     let agent_dir = path_manager
         .agent_dir(agent_id)
@@ -392,10 +398,13 @@ pub async fn install_from_file(
     };
     let staging = agent_dir.join(format!("staging.{staging_ext}"));
     // rename（同文件系统零拷贝）或 copy（跨文件系统降级）
+    let t2 = std::time::Instant::now();
     if tokio::fs::rename(download_path, &staging).await.is_err() {
+        debug!("[agent_mgmt] install_from_file: rename failed, falling back to copy");
         tokio::fs::copy(download_path, &staging).await?;
         let _ = tokio::fs::remove_file(download_path).await;
     }
+    debug!("[agent_mgmt] install_from_file: staging file ready, took {:?}", t2.elapsed());
 
     // 4. 共享解压/注册逻辑
     _install_from_staging(
@@ -432,6 +441,14 @@ struct StagingInstallParams<'a> {
 ///
 /// 被 `install_from_bytes` 和 `install_from_file` 共同调用。
 /// staging 文件在解压完成后被清理。
+///
+/// ## 安装模式
+///
+/// 解压后自动检测包类型：
+/// - **目录型包**：存在 `agent-package.json` 或 `package.json`（含 `bin.start`）
+///   → 整个目录保持完整，`binary_path` = agent_dir
+/// - **二进制包**：无 metadata 文件
+///   → 查找入口可执行文件，`binary_path` = entrypoint 路径（不复制到 bin/）
 async fn _install_from_staging(
     registry: &AgentRegistry,
     staging: &Path,
@@ -454,37 +471,91 @@ async fn _install_from_staging(
     let agent_dir_clone = agent_dir.to_path_buf();
     let staging_clone = staging.to_path_buf();
     let file_type_clone = file_type.clone();
-    let (binary_path_str, file_count) = tokio::task::spawn_blocking(move || {
+    // spawn_blocking 返回 (binary_path, file_count, resolved_args)
+    // resolved_args: 目录型包从 metadata 解析的 args（如 ["dist/index.js"]），二进制型为 None
+    let t3 = std::time::Instant::now();
+    let spawn_result = tokio::task::spawn_blocking(move || {
+        debug!("[agent_mgmt] spawn_blocking started, queue wait: {:?}", t3.elapsed());
+        let t_extract = std::time::Instant::now();
         let count = match file_type_clone.as_str() {
             "tar.gz" => archive_installer::extract_tar_gz(&staging_clone, &agent_dir_clone)?,
             "zip" => archive_installer::extract_zip(&staging_clone, &agent_dir_clone)?,
             _ => unreachable!(),
         };
+        debug!("[agent_mgmt] extraction done: {} files, took {:?}", count, t_extract.elapsed());
         let _ = std::fs::remove_file(&staging_clone);
 
+        // 剥掉单个顶层目录包装（如 deepagents-dev-templates-0.2.9/）
+        archive_installer::normalize_extracted_dir(&agent_dir_clone)?;
+
+        // 尝试从 metadata 读取入口（目录型包：Node.js / Bun / Python 等）
+        if let Some((entrypoint_script, meta_args)) =
+            archive_installer::find_entrypoint_from_metadata(&agent_dir_clone)
+        {
+            let entrypoint_path = agent_dir_clone.join(&entrypoint_script);
+            if !entrypoint_path.exists() {
+                return Err(AgentMgmtError::InstallFailed(format!(
+                    "entrypoint '{}' declared in package metadata but not found at {}",
+                    entrypoint_script,
+                    entrypoint_path.display()
+                )));
+            }
+            // 目录型包：binary_path 指向 agent 目录本身，返回 metadata args
+            let mut resolved_args = vec![entrypoint_script];
+            resolved_args.extend(meta_args);
+            return Ok::<(String, usize, Option<Vec<String>>), AgentMgmtError>((
+                agent_dir_clone.to_string_lossy().to_string(),
+                count,
+                Some(resolved_args),
+            ));
+        }
+
+        // 二进制型包：查找入口可执行文件
         let entrypoint = archive_installer::find_entrypoint(&agent_dir_clone, &command_for_block)
             .ok_or_else(|| {
                 AgentMgmtError::InstallFailed(format!(
                     "could not find entrypoint '{command_for_block}' in extracted archive"
                 ))
             })?;
-        let final_path = agent_dir_clone.parent().unwrap().join("bin").join(&command_for_block);
-        std::fs::copy(&entrypoint, &final_path)?;
-        make_executable_sync(&final_path).ok();
-        Ok::<(String, usize), AgentMgmtError>((final_path.to_string_lossy().to_string(), count))
+        // binary_path 直接指向入口文件（不复制到 bin/，由 Dockerfile PATH 配置解决查找）
+        Ok::<(String, usize, Option<Vec<String>>), AgentMgmtError>((
+            entrypoint.to_string_lossy().to_string(),
+            count,
+            None,
+        ))
     })
     .await
-    .map_err(|e| AgentMgmtError::InstallFailed(format!("extraction task panicked: {e}")))??;
+    .map_err(|e| AgentMgmtError::InstallFailed(format!("extraction task panicked: {e}")));
 
     // 清理 staging 文件(如果 spawn_blocking 没删干净)
     tokio::fs::remove_file(staging).await.ok();
+
+    // 如果解压/查找失败，清理残留的 agent_dir
+    let (binary_path_str, file_count, resolved_args) = match spawn_result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tokio::fs::remove_dir_all(agent_dir).await.ok();
+            return Err(e);
+        }
+        Err(outer) => {
+            tokio::fs::remove_dir_all(agent_dir).await.ok();
+            return Err(outer);
+        }
+    };
+
+    // 目录型包：如果用户未提供 args，使用 metadata 解析的 args（如 ["dist/index.js"]）
+    let final_args = if args.is_empty() {
+        resolved_args.unwrap_or_default()
+    } else {
+        args.to_vec()
+    };
 
     // 注册到注册表
     let manifest = AgentManifest {
         agent_id: agent_id.to_string(),
         install_type,
         command: command.clone(),
-        args: args.to_vec(),
+        args: final_args,
         binary_path: binary_path_str.clone(),
         source: param_source.map(String::from),
         version: param_version.map(String::from),
@@ -496,8 +567,8 @@ async fn _install_from_staging(
     registry.upsert(manifest)?;
 
     info!(
-        "[agent_mgmt] Installed binary: agent_id={}, command={}, file_type={}, size={}",
-        agent_id, command, file_type, file_size
+        "[agent_mgmt] Installed: agent_id={}, command={}, binary_path={}, file_type={}, size={}",
+        agent_id, command, binary_path_str, file_type, file_size
     );
 
     Ok(InstallAgentResponse {
@@ -521,6 +592,10 @@ async fn _install_from_staging(
 ///
 /// **Note**: only `"tar.gz"` and `"zip"` are accepted by the installer;
 /// other types cause [`AgentMgmtError::UnsupportedType`].
+///
+/// **Limitation**: any gzip file (magic `1F 8B`) is classified as `"tar.gz"`.
+/// Plain `.gz` files will fail at the `tar::Archive::entries()` stage with
+/// a tar-specific error message.
 pub fn detect_file_type(bytes: &[u8]) -> String {
     if bytes.len() >= 4 {
         // ELF: 7F 45 4C 46
@@ -546,6 +621,7 @@ pub fn detect_file_type(bytes: &[u8]) -> String {
     "executable".into()
 }
 
+#[allow(dead_code)]
 fn make_executable_sync(path: &Path) -> AgentMgmtResult<()> {
     #[cfg(unix)]
     {

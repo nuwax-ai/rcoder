@@ -12,7 +12,7 @@ docker-build:
 	@echo ""
 	@echo "✅ 所有 Docker 镜像构建完成！"
 	@echo "  ✓ master-rcoder:latest"
-	@echo "  ✓ rcoder-agent-runner:latest"
+	@echo "  ✓ dev-computer-agent-runner:latest"
 	@echo ""
 	@echo "🎯 使用方式："
 	@echo "  docker run -d -p 8087:8087 master-rcoder:latest"
@@ -53,9 +53,9 @@ docker-build-master:
 		-f docker/rcoder-master/Dockerfile -t master-rcoder:latest .;)
 	@echo "✅ master-rcoder 镜像构建完成！"
 	@echo "📤 推送镜像到阿里云仓库..."
-	@docker tag master-rcoder:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest
-	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest
-	@echo "✅ 镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder:latest"
+	@docker tag master-rcoder:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/master-rcoder:latest
+	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/master-rcoder:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/master-rcoder:latest
+	@echo "✅ 镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/master-rcoder:latest"
 
 # 构建 master-base 基础镜像（包含所有运行时依赖，很少需要重新构建）
 docker-build-master-base:
@@ -65,9 +65,9 @@ docker-build-master-base:
 	@docker build -f docker/rcoder-master/Dockerfile.base -t master-rcoder-base:latest .
 	@echo "✅ master-rcoder-base 基础镜像构建完成！"
 	@echo "📤 推送基础镜像到阿里云仓库..."
-	@docker tag master-rcoder-base:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder-base:latest
-	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder-base:latest
-	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/master-rcoder-base:latest"
+	@docker tag master-rcoder-base:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/master-rcoder-base:latest
+	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/master-rcoder-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/master-rcoder-base:latest
+	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/master-rcoder-base:latest"
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
 
 # ============================================================================
@@ -95,8 +95,8 @@ CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,kubernetes
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
 docker-build-agent-runner:
-	@echo "🐳 构建 rcoder-agent-runner 镜像..."
-	@echo "📍 镜像名称: rcoder-agent-runner:latest"
+	@echo "🐳 构建 rcoder-agent-runner 镜像（本地开发用 dev-computer-agent-runner）..."
+	@echo "📍 镜像名称: dev-computer-agent-runner:latest"
 	@# 检查基础镜像是否存在
 	@if ! docker image inspect rcoder-agent-base:latest >/dev/null 2>&1; then \
 		echo "⚠️  基础镜像 rcoder-agent-base:latest 不存在，先构建基础镜像..."; \
@@ -137,17 +137,16 @@ docker-build-agent-runner:
 			--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
 			--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
 			-f Dockerfile -t rcoder-agent-runner:latest .;)
-	@echo "✅ rcoder-agent-runner 镜像构建完成！"
+	@echo "✅ dev-computer-agent-runner 镜像构建完成！"
 	@if [ "$(CARGO_FEATURES)" != "" ]; then \
 		echo "🔧 eBPF 调试模式已启用，容器将以特权模式运行"; \
 	else \
 		echo "🔒 生产模式，容器权限受限"; \
 	fi
-	@echo "📤 推送镜像到阿里云仓库..."
+	@echo "📤 打标签（本地开发用 dev-computer-agent-runner，避免覆盖测试环境镜像）..."
 	@docker tag rcoder-agent-runner:latest $(K8S_IMAGE_REGISTRY)
-	@docker tag rcoder-agent-runner:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest
-	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest
-	@echo "✅ 镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+	@docker tag rcoder-agent-runner:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-computer-agent-runner:latest
+	@echo "✅ 镜像已标记: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-computer-agent-runner:latest"
 
 # 构建生产版本（禁用 eBPF 工具，减小镜像大小）
 docker-build-agent-production:

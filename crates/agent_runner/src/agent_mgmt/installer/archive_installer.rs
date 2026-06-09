@@ -31,20 +31,23 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
 
     let mut total_uncompressed: u64 = 0;
     let mut file_count: usize = 0;
+    let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
         let entry_path = entry.path()?.into_owned();
 
         let sanitized = sanitize_entry_path(&entry_path)?;
-
         let dest_path = dest_dir.join(&sanitized);
 
-        // 先创建父目录,确保 canonicalize 能解析(避免 macOS 上 /var -> /private 软链错位)
+        // 路径安全检查：只对首次出现的目录做 canonicalize
         if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !created_dirs.contains(parent) {
+                std::fs::create_dir_all(parent)?;
+                ensure_within(&dest_path, dest_dir)?;
+                created_dirs.insert(parent.to_path_buf());
+            }
         }
-        ensure_within(&dest_path, dest_dir)?;
 
         let entry_type = entry.header().entry_type();
         let entry_size = entry.header().size()?;
@@ -58,12 +61,12 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
         }
 
         if entry_type.is_dir() {
-            std::fs::create_dir_all(&dest_path)?;
+            if !created_dirs.contains(&dest_path) {
+                std::fs::create_dir_all(&dest_path)?;
+                created_dirs.insert(dest_path);
+            }
         } else if entry_type.is_file() {
             file_count += 1;
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
             let mut out = File::create(&dest_path)?;
             let mut buf = [0u8; 64 * 1024];
             loop {
@@ -73,7 +76,8 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
                 }
                 out.write_all(&buf[..n])?;
             }
-            out.sync_all()?;
+            // 不调用 sync_all() — 安装场景不需要每个文件都 fsync
+            // 数据会在进程结束后由 OS 自动刷盘
 
             #[cfg(unix)]
             {
@@ -107,6 +111,7 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
 
     let mut total_uncompressed: u64 = 0;
     let mut file_count: usize = 0;
+    let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for i in 0..archive.len() {
         let mut entry = archive
@@ -117,10 +122,14 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
 
         let sanitized = sanitize_entry_path(&entry_path)?;
         let dest_path = dest_dir.join(&sanitized);
+
         if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !created_dirs.contains(parent) {
+                std::fs::create_dir_all(parent)?;
+                ensure_within(&dest_path, dest_dir)?;
+                created_dirs.insert(parent.to_path_buf());
+            }
         }
-        ensure_within(&dest_path, dest_dir)?;
 
         let entry_size = entry.size();
         total_uncompressed = total_uncompressed.saturating_add(entry_size);
@@ -132,15 +141,15 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
         }
 
         if entry.is_dir() {
-            std::fs::create_dir_all(&dest_path)?;
+            if !created_dirs.contains(&dest_path) {
+                std::fs::create_dir_all(&dest_path)?;
+                created_dirs.insert(dest_path);
+            }
         } else if entry.is_file() {
             file_count += 1;
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
             let mut out = File::create(&dest_path)?;
             std::io::copy(&mut entry, &mut out)?;
-            out.sync_all()?;
+            // 不调用 sync_all() — 安装场景不需要每个文件都 fsync
 
             #[cfg(unix)]
             if let Some(mode) = entry.unix_mode() {
@@ -163,20 +172,189 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
 /// Checks exact paths only (no ambiguous fallback):
 /// 1. `<extract_dir>/<command>`
 /// 2. `<extract_dir>/bin/<command>`
+///
+/// Note: uses `is_file()` instead of `is_executable_file()` to support
+/// non-binary entrypoints (e.g. Node.js scripts without +x permission).
 pub fn find_entrypoint(extract_dir: &Path, command: &str) -> Option<PathBuf> {
     let direct = extract_dir.join(command);
-    if is_executable_file(&direct) {
+    if direct.is_file() {
         return Some(direct);
     }
 
     let in_bin = extract_dir.join("bin").join(command);
-    if is_executable_file(&in_bin) {
+    if in_bin.is_file() {
         return Some(in_bin);
     }
 
     None
 }
 
+/// Normalize extracted directory: strip single top-level wrapper.
+///
+/// If the extraction produced a single top-level directory (e.g. `deepagents-dev-templates-0.2.9/`),
+/// move its contents up to `agent_dir` directly. This ensures the installed layout
+/// matches the expected structure without an extra nesting level.
+///
+/// Returns `true` if a wrapper was stripped, `false` otherwise.
+pub fn normalize_extracted_dir(agent_dir: &Path) -> AgentMgmtResult<bool> {
+    let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(agent_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            name != ".DS_Store" && name != "staging.tar.gz" && name != "staging.zip"
+        })
+        .collect();
+
+    // Check: exactly one directory entry (the wrapper)
+    if entries.len() != 1 {
+        return Ok(false);
+    }
+    let only = &entries[0];
+    if !only.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+        return Ok(false);
+    }
+
+    let wrapper = only.path();
+    let tmp_name = format!(
+        "{}__wrapper_tmp",
+        agent_dir.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let tmp_rename = agent_dir.parent().unwrap_or(agent_dir).join(tmp_name);
+
+    // Rename wrapper out of the way
+    std::fs::rename(&wrapper, &tmp_rename).map_err(|e| {
+        AgentMgmtError::InstallFailed(format!(
+            "rename wrapper dir: {} -> {}: {}",
+            wrapper.display(),
+            tmp_rename.display(),
+            e
+        ))
+    })?;
+
+    // Move wrapper's children into agent_dir, tracking moved entries for rollback
+    let mut moved_names: Vec<std::ffi::OsString> = Vec::new();
+    let mut move_err: Option<std::io::Error> = None;
+    for entry in std::fs::read_dir(&tmp_rename)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let dest = agent_dir.join(&name);
+        if let Err(e) = std::fs::rename(entry.path(), &dest) {
+            move_err = Some(e);
+            break;
+        }
+        moved_names.push(name);
+    }
+
+    if let Some(e) = move_err {
+        // Rollback: only move back the entries that were successfully moved
+        for name in &moved_names {
+            let src = agent_dir.join(name);
+            let dst = tmp_rename.join(name);
+            if let Err(re) = std::fs::rename(&src, &dst) {
+                warn!(
+                    "[agent_mgmt] Rollback failed to move back {}: {}",
+                    src.display(),
+                    re
+                );
+            }
+        }
+        if let Err(re) = std::fs::rename(&tmp_rename, &wrapper) {
+            warn!(
+                "[agent_mgmt] Rollback failed to restore wrapper dir {}: {}",
+                wrapper.display(),
+                re
+            );
+        }
+        return Err(AgentMgmtError::InstallFailed(format!(
+            "move wrapper child: {}",
+            e
+        )));
+    }
+
+    // Cleanup the now-empty wrapper directory
+    let _ = std::fs::remove_dir(&tmp_rename);
+
+    debug!(
+        "[agent_mgmt] Stripped top-level wrapper directory: {}",
+        wrapper.display()
+    );
+    Ok(true)
+}
+
+/// Read entrypoint from package metadata (`agent-package.json` or `package.json`).
+///
+/// Returns `(entrypoint_script, extra_args)` if found, e.g. `("dist/index.js", [])`.
+/// Checks `agent-package.json` first, then falls back to `package.json`.
+pub fn find_entrypoint_from_metadata(agent_dir: &Path) -> Option<(String, Vec<String>)> {
+    // Try agent-package.json first
+    let agent_pkg = agent_dir.join("agent-package.json");
+    if let Some(result) = read_bin_start_from_json(&agent_pkg) {
+        return Some(result);
+    }
+
+    // Fallback to package.json
+    let pkg = agent_dir.join("package.json");
+    if let Some(result) = read_bin_start_from_json(&pkg) {
+        return Some(result);
+    }
+
+    None
+}
+
+/// Read `bin.start` from a JSON file and split into (script, extra_args).
+///
+/// Supported formats:
+/// - `"dist/index.js"` → `("dist/index.js", [])`
+/// - `"node dist/index.js"` → `("dist/index.js", [])`
+/// - `"node --max-old-space-size=4096 dist/index.js"` → `("dist/index.js", ["--max-old-space-size=4096"])`
+fn read_bin_start_from_json(path: &Path) -> Option<(String, Vec<String>)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let bin_start = value
+        .get("bin")?
+        .get("start")?
+        .as_str()?;
+
+    let parts: Vec<&str> = bin_start.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let runtimes = ["node", "deno", "bun", "python", "python3"];
+    if parts.len() > 1 && runtimes.contains(&parts[0]) {
+        // Skip runtime, collect flags (starting with -), then find the script path
+        let rest = &parts[1..];
+        let mut flags: Vec<String> = Vec::new();
+        let mut script: Option<String> = None;
+        let mut extra_args: Vec<String> = Vec::new();
+
+        for part in rest {
+            if script.is_none() {
+                if part.starts_with('-') {
+                    flags.push(part.to_string());
+                } else {
+                    script = Some(part.to_string());
+                }
+            } else {
+                extra_args.push(part.to_string());
+            }
+        }
+
+        // Return script with flags prepended to args
+        let script = script?;
+        let mut args = flags;
+        args.extend(extra_args);
+        Some((script, args))
+    } else {
+        // Single entrypoint like "dist/index.js"
+        let script = parts[0].to_string();
+        let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+        Some((script, args))
+    }
+}
+
+#[allow(dead_code)]
 fn is_executable_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;

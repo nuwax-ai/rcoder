@@ -119,7 +119,7 @@ docker-build-agent-base: docker-pre-download-libreoffice
 		-f Dockerfile.base -t rcoder-agent-base:latest .
 	@echo "✅ rcoder-agent-base 基础镜像构建完成！"
 	@echo "📤 推送基础镜像到阿里云仓库..."
-	@docker tag rcoder-agent-base:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-base:latest
-	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-base:latest
-	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-base:latest"
+	@docker tag rcoder-agent-base:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-agent-base:latest
+	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-agent-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-agent-base:latest
+	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-agent-base:latest"
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"

@@ -131,9 +131,9 @@ docker_config:
       computer-agent-runner:
         service_type: "ComputerAgentRunner"
         # 镜像配置（使用架构特定镜像）
-        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
-        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
-        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest"
+        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-computer-agent-runner:latest"
+        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-computer-agent-runner:latest"
+        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-computer-agent-runner:latest"
         image_tag_prefix: "rcoder-computer-agent-runner"
         enabled: true
 

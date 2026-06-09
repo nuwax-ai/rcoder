@@ -22,8 +22,21 @@ impl AgentChecker {
     }
 
     /// 静态检查:文件存在 / 可执行 / bin 目录在 PATH 中
+    ///
+    /// 支持两种 binary_path 类型：
+    /// - 目录型 agent：binary_path 是目录 → 检查 command 是否在 PATH
+    /// - 二进制 agent：binary_path 是文件 → 检查存在性和可执行权限
     pub fn static_check(&self, manifest: &AgentManifest) -> StaticCheckResult {
         let path = Path::new(&manifest.binary_path);
+        if path.is_dir() {
+            // 目录型 agent（Node.js / Bun / Python 等）：检查 command 是否在 PATH
+            let in_path = which::which(&manifest.command).is_ok();
+            return StaticCheckResult {
+                file_exists: true,
+                executable: in_path, // command 可找到即视为可执行
+                in_path,
+            };
+        }
         let file_exists = path.exists();
         let executable = if file_exists {
             is_executable(path)
