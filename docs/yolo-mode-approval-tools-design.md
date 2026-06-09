@@ -11,9 +11,10 @@
 ### 设计目标
 
 1. **模式无关**: 规则独立于 `agent_mode`，按配置的 `action` 生效
-2. **双向覆盖**: 既可强制审批，也可强制放行
+2. **三种动作**: `ask`（要求审批）、`allow`（自动放行）、`deny`（直接拒绝）
 3. **工具类型感知**: 根据 `tool_kind` 决定匹配命令内容还是工具名称
-4. **向后兼容**: 不传参时行为完全不变
+4. **通配符匹配**: 使用 glob 通配符语法，比正则更易用
+5. **向后兼容**: 不传参时行为完全不变
 
 ---
 
@@ -45,20 +46,21 @@ POST /devcomputer/chat
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `patterns` | `string[]` | 是 | - | 正则表达式列表（大小写不敏感，任一命中即触发，空数组则该规则不匹配任何工具） |
-| `action` | `string` | 是 | - | `"require_approval"` 或 `"auto_approve"` |
+| `patterns` | `string[]` | 是 | - | 通配符模式列表（大小写不敏感，任一命中即触发，空数组则该规则不匹配任何工具） |
+| `action` | `string` | 是 | - | `"ask"`、`"allow"` 或 `"deny"` |
 | `tool_kind` | `string` | 否 | `"Execute"` | ACP ToolKind 过滤，决定匹配目标 |
 
 #### `action` 取值说明
 
 | 值 | 说明 |
 |----|------|
-| `"require_approval"` | 命中时强制要求用户审批（即使在 YOLO 模式下） |
-| `"auto_approve"` | 命中时自动放行（即使在 ASK 模式下） |
+| `"ask"` | 命中时要求用户审批（即使在 YOLO 模式下） |
+| `"allow"` | 命中时自动放行（即使在 ASK 模式下） |
+| `"deny"` | 命中时直接拒绝，不询问用户 |
 
 #### `tool_kind` 取值与匹配目标
 
-`tool_kind` 对应 ACP 协议的 `ToolKind` 枚举，决定正则表达式匹配什么内容：
+`tool_kind` 对应 ACP 协议的 `ToolKind` 枚举，决定通配符匹配什么内容：
 
 | `tool_kind` | 匹配目标 | 说明 |
 |-------------|---------|------|
@@ -77,6 +79,30 @@ POST /devcomputer/chat
 - `Execute` 类型的工具（bash/shell），用户关心的是**执行什么命令**，所以匹配命令内容
 - 其他类型的工具，用户关心的是**调用什么工具**，所以匹配工具名称
 
+#### 通配符语法
+
+`patterns` 使用 glob 通配符语法（大小写不敏感）：
+
+| 通配符 | 含义 | 示例 | 匹配 |
+|--------|------|------|------|
+| `*` | 匹配任意数量字符（包括空字符） | `rm*` | `rm`, `rm -rf /tmp`, `rmdir` |
+| `?` | 匹配单个字符 | `rm ?` | `rm f`, `rm x` |
+| `[abc]` | 匹配括号内任一字符 | `[rc]m` | `rm`, `cm` |
+| `[a-z]` | 匹配范围内任一字符 | `[a-z]m` | `am`, `bm`, ..., `zm` |
+| `!` | 在 `[]` 开头表示取反 | `[!0-9]*` | `abc`, `hello`（不匹配数字开头） |
+
+**常用模式示例**：
+
+| 模式 | 含义 | 匹配 | 不匹配 |
+|------|------|------|--------|
+| `rm *` | `rm` 开头后跟空格和任意内容 | `rm -rf /tmp` | `rmdir`, `rmfile` |
+| `rm -rf *` | 精确 `rm -rf` 前缀 | `rm -rf /tmp` | `rm -f /tmp` |
+| `*delete*` | 包含 `delete` | `file_delete`, `delete_item` | `remove` |
+| `*drop*` | 包含 `drop` | `drop_table`, `user_drop` | `delete` |
+| `sudo *` | `sudo` 开头 | `sudo rm -rf` | `pseudo` |
+| `git push*` | `git push` 开头 | `git push origin main` | `git pull` |
+| `*` | 匹配所有 | 任意字符串 | - |
+
 ---
 
 ## 二、入参示例
@@ -93,8 +119,8 @@ POST /devcomputer/chat
       "agent_mode": "yolo",
       "tool_approval_rules": [
         {
-          "patterns": ["rm\\s+-[a-z]*r[a-z]*f", "sudo", "chmod\\s+777"],
-          "action": "require_approval"
+          "patterns": ["rm -rf *", "sudo *", "chmod 777 *"],
+          "action": "ask"
         }
       ]
     }
@@ -116,8 +142,8 @@ POST /devcomputer/chat
       "agent_mode": "ask",
       "tool_approval_rules": [
         {
-          "patterns": ["^(ls|cat|head|tail|grep|find|wc|echo|pwd|git\\s+status|git\\s+log)\\b"],
-          "action": "auto_approve"
+          "patterns": ["ls *", "cat *", "head *", "tail *", "grep *", "find *", "git status*", "git log*", "git diff*"],
+          "action": "allow"
         }
       ]
     }
@@ -125,7 +151,7 @@ POST /devcomputer/chat
 }
 ```
 
-### 场景 3: YOLO 模式 + 混合（Bash 审批 + MCP Delete 审批）
+### 场景 3: YOLO 模式 + 混合（Bash 审批 + MCP Delete 拒绝）
 
 ```json
 {
@@ -137,12 +163,12 @@ POST /devcomputer/chat
       "agent_mode": "yolo",
       "tool_approval_rules": [
         {
-          "patterns": ["rm\\s+-rf", "sudo"],
-          "action": "require_approval"
+          "patterns": ["rm -rf *", "sudo *"],
+          "action": "ask"
         },
         {
-          "patterns": [".*delete.*", ".*drop.*", ".*truncate.*"],
-          "action": "require_approval",
+          "patterns": ["*delete*", "*drop*", "*truncate*"],
+          "action": "deny",
           "tool_kind": "Delete"
         }
       ]
@@ -151,8 +177,8 @@ POST /devcomputer/chat
 }
 ```
 
-> 第 1 条: `tool_kind=Execute`(默认) → 匹配命令内容中的 `rm -rf` / `sudo`
-> 第 2 条: `tool_kind=Delete` → 匹配工具名称中的 `delete` / `drop` / `truncate`
+> 第 1 条: `tool_kind=Execute`(默认) → 匹配命令内容中的 `rm -rf *` / `sudo *`
+> 第 2 条: `tool_kind=Delete` → 匹配工具名称中的 `*delete*` / `*drop*` / `*truncate*` → 直接拒绝
 
 ### 场景 4: ASK 模式 + 混合（Read 放行 + Edit 审批）
 
@@ -166,17 +192,17 @@ POST /devcomputer/chat
       "agent_mode": "ask",
       "tool_approval_rules": [
         {
-          "patterns": ["^(ls|cat|head|tail|grep|find|git\\s+status)\\b"],
-          "action": "auto_approve"
+          "patterns": ["ls *", "cat *", "head *", "tail *", "grep *", "find *", "git status*"],
+          "action": "allow"
         },
         {
-          "patterns": [".*read.*", ".*list.*", ".*get.*", ".*search.*"],
-          "action": "auto_approve",
+          "patterns": ["*read*", "*list*", "*get*", "*search*"],
+          "action": "allow",
           "tool_kind": "Read"
         },
         {
-          "patterns": [".*write.*", ".*edit.*", ".*delete.*"],
-          "action": "require_approval",
+          "patterns": ["*write*", "*edit*", "*delete*"],
+          "action": "ask",
           "tool_kind": "Edit"
         }
       ]
@@ -189,7 +215,7 @@ POST /devcomputer/chat
 > 第 2 条: Read 类型 MCP 工具自动放行
 > 第 3 条: Edit 类型 MCP 工具强制审批
 
-### 场景 5: 全部 Delete 类型工具审批（不限工具名称）
+### 场景 5: 全部 Delete 类型工具拒绝
 
 ```json
 {
@@ -201,8 +227,8 @@ POST /devcomputer/chat
       "agent_mode": "yolo",
       "tool_approval_rules": [
         {
-          "patterns": [".*"],
-          "action": "require_approval",
+          "patterns": ["*"],
+          "action": "deny",
           "tool_kind": "Delete"
         }
       ]
@@ -242,8 +268,9 @@ POST /devcomputer/chat
     │ 未命中 ↓
     │
 ② tool_approval_rules 规则匹配（按数组顺序，首条命中即停）
-    │ 命中 require_approval → 强制审批（SSE 推送前端）
-    │ 命中 auto_approve → 自动放行
+    │ 命中 ask → 要求审批（SSE 推送前端）
+    │ 命中 allow → 自动放行
+    │ 命中 deny → 直接拒绝
     │ 未命中 ↓
     │
 ③ agent_mode 默认行为
@@ -259,7 +286,7 @@ POST /devcomputer/chat
 2. **提取匹配目标**:
    - `tool_kind == "Execute"` → 取 `tool_call.raw_input.command`
    - 其他 → 取 `tool_call.raw_input.tool_name`（回退: `toolName` → `title` 首词 → `"tool"`）
-3. **正则匹配**: 用 `patterns` 中的每个正则（大小写不敏感）匹配目标字符串，任一命中即触发
+3. **通配符匹配**: 用 `patterns` 中的每个通配符（大小写不敏感）匹配目标字符串，任一命中即触发
 4. **返回 action**: 首条命中规则的 `action` 决定行为
 
 ### 3.3 匹配示例
@@ -268,25 +295,26 @@ POST /devcomputer/chat
 
 | `action` | `patterns` | 命令内容 | 结果 |
 |----------|-----------|---------|------|
-| `require_approval` | `["rm\\s+-rf"]` | `rm -rf /tmp/cache` | 强制审批 |
-| `require_approval` | `["rm\\s+-rf"]` | `rm -f /tmp/file` | 不匹配 |
-| `auto_approve` | `["^(ls\|cat)\\b"]` | `ls -la` | 自动放行 |
-| `auto_approve` | `["^(ls\|cat)\\b"]` | `rm -rf /` | 不匹配 |
+| `ask` | `["rm -rf *"]` | `rm -rf /tmp/cache` | 要求审批 |
+| `ask` | `["rm -rf *"]` | `rm -f /tmp/file` | 不匹配 |
+| `allow` | `["ls *", "cat *"]` | `ls -la` | 自动放行 |
+| `allow` | `["ls *", "cat *"]` | `rm -rf /` | 不匹配 |
+| `deny` | `["sudo *"]` | `sudo rm -rf` | 直接拒绝 |
 
 #### Delete 类型（匹配工具名称）
 
 | `action` | `patterns` | 工具名称 | 结果 |
 |----------|-----------|---------|------|
-| `require_approval` | `[".*delete.*"]` | `file_delete` | 强制审批 |
-| `require_approval` | `[".*delete.*"]` | `read_file` | 不匹配 |
-| `require_approval` | `[".*"]` | `any_tool` | 强制审批 |
+| `ask` | `["*delete*"]` | `file_delete` | 要求审批 |
+| `ask` | `["*delete*"]` | `read_file` | 不匹配 |
+| `deny` | `["*"]` | `any_tool` | 直接拒绝 |
 
 #### Read 类型（匹配工具名称）
 
 | `action` | `patterns` | 工具名称 | 结果 |
 |----------|-----------|---------|------|
-| `auto_approve` | `[".*read.*", ".*list.*"]` | `mcp__server__list_items` | 自动放行 |
-| `auto_approve` | `[".*read.*", ".*list.*"]` | `mcp__server__delete_item` | 不匹配 |
+| `allow` | `["*read*", "*list*"]` | `mcp__server__list_items` | 自动放行 |
+| `allow` | `["*read*", "*list*"]` | `mcp__server__delete_item` | 不匹配 |
 
 ---
 
@@ -294,7 +322,7 @@ POST /devcomputer/chat
 
 ### 4.1 事件推送
 
-当规则命中 `require_approval` 时，SSE 推送行为与 ASK 模式**完全一致**：
+当规则命中 `ask` 时，SSE 推送行为与 ASK 模式**完全一致**：
 
 - **事件类型**: `AcpRequestPermission`
 - **数据结构**: 与现有 ASK 模式的 SSE 事件相同
@@ -313,10 +341,12 @@ POST /devcomputer/chat
 | 不传 `tool_approval_rules` | `agent_mode` 决定默认行为（完全不变） |
 | `tool_approval_rules = []` | 空数组，`agent_mode` 决定默认行为 |
 | 规则都不匹配 | `agent_mode` 决定默认行为 |
-| YOLO + 命中 `require_approval` | 强制审批 |
-| YOLO + 命中 `auto_approve` | 自动放行（与默认一致） |
-| ASK + 命中 `auto_approve` | 自动放行 |
-| ASK + 命中 `require_approval` | 强制审批（与默认一致） |
+| YOLO + 命中 `ask` | 要求审批 |
+| YOLO + 命中 `allow` | 自动放行（与默认一致） |
+| YOLO + 命中 `deny` | 直接拒绝 |
+| ASK + 命中 `allow` | 自动放行 |
+| ASK + 命中 `ask` | 要求审批（与默认一致） |
+| ASK + 命中 `deny` | 直接拒绝 |
 
 ---
 
@@ -324,10 +354,10 @@ POST /devcomputer/chat
 
 | 场景 | 处理方式 |
 |------|----------|
-| `action` 值不合法 | 返回参数校验错误 |
+| `action` 值不合法（非 `ask`/`allow`/`deny`） | 返回参数校验错误 |
 | `tool_kind` 值不合法 | 返回参数校验错误 |
 | `patterns` 中包含空字符串 | 忽略空字符串，继续匹配其他 pattern |
-| `patterns` 中的正则表达式无效 | 该 pattern 匹配失败，继续匹配其他 pattern |
+| `patterns` 中的通配符语法无效 | 该 pattern 匹配失败，继续匹配其他 pattern |
 | `patterns` 为空数组 | 该规则不匹配任何工具 |
 | 工具调用的 `kind` 为空 | 当作 `"Other"` 处理 |
 
@@ -340,12 +370,18 @@ POST /devcomputer/chat
 所有命令在容器内执行，不存在需要自动拒绝的"危险命令"。`rm -rf /` 等操作在容器内只影响容器自身，不会影响宿主机。因此：
 - 不设置硬编码安全规则自动拒绝
 - 所有命令的审批与否完全由 `tool_approval_rules` 和 `agent_mode` 决定
-- 用户可以通过 `require_approval` 规则对敏感操作进行人工审批
+- 用户可以通过 `ask` 规则对敏感操作进行人工审批
 
-### 7.2 ASK 模式下 auto_approve 的安全边界
+### 7.2 `deny` 动作的使用场景
 
-- 建议只对只读/低风险工具配置 `auto_approve`
-- 敏感操作（删除、写入、执行等）建议保持默认审批或配置 `require_approval`
+- `deny` 用于明确禁止某些工具调用，不经过用户审批直接拒绝
+- 适用于已知不需要的危险操作（如生产环境禁止 `DROP TABLE`）
+- `deny` 优先级高于 `ask` 和 `allow`（先匹配到的规则生效）
+
+### 7.3 ASK 模式下 `allow` 的安全边界
+
+- 建议只对只读/低风险工具配置 `allow`
+- 敏感操作（删除、写入、执行等）建议保持默认审批或配置 `ask`
 
 ---
 
@@ -401,7 +437,7 @@ Read | Edit | Delete | Move | Search | Execute | Think | Fetch | SwitchMode | Ot
 | `crates/agent_abstraction/src/session/acp_worker.rs` | 传播 `tool_approval_rules` 到 `AgentStartConfig` |
 | `crates/agent_abstraction/src/launcher/claude_code_sacp/connection.rs` | 构建 `PermissionRequestContext` 时传入 `tool_approval_rules` |
 | `crates/agent_runner/src/grpc/conversion.rs` | 校验 `action`、`tool_kind` 合法性，透传配置 |
-| `crates/agent_runner/src/service/permission_manager.rs` | 新增匹配逻辑，修改决策流程 |
+| `crates/agent_runner/src/service/permission_manager.rs` | 新增匹配逻辑（通配符转正则），修改决策流程 |
 
 ### A.2 数据结构定义
 
@@ -409,9 +445,9 @@ Read | Edit | Delete | Move | Search | Execute | Think | Fetch | SwitchMode | Ot
 /// 工具审批规则
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ToolApprovalRule {
-    /// 正则表达式列表（大小写不敏感，任一命中即触发，OR 逻辑）
+    /// 通配符模式列表（大小写不敏感，任一命中即触发，OR 逻辑）
     pub patterns: Vec<String>,
-    /// 审批动作: "require_approval" | "auto_approve"
+    /// 审批动作: "ask" | "allow" | "deny"
     pub action: ToolApprovalAction,
     /// ACP ToolKind 过滤（可选），不传默认 "Execute"
     #[serde(default)]
@@ -422,12 +458,33 @@ pub struct ToolApprovalRule {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolApprovalAction {
-    RequireApproval,
-    AutoApprove,
+    Ask,   // 要求用户审批
+    Allow, // 自动放行
+    Deny,  // 直接拒绝
 }
 ```
 
-### A.3 匹配逻辑伪代码
+### A.3 通配符转正则
+
+后端收到通配符后，需要转换为正则表达式进行匹配：
+
+```
+通配符 → 正则 转换规则:
+  *    → .*     (匹配任意字符)
+  ?    → .      (匹配单个字符)
+  [abc] → [abc] (字符类保持不变)
+  其他  → 字面量转义
+
+转换后添加 (?i) 前缀实现大小写不敏感，添加 ^ 前缀和 $ 后缀实现全匹配。
+
+示例:
+  "rm -rf *"     → ^(?i)rm\ -rf\ .*$
+  "*delete*"     → ^(?i).*delete.*$
+  "ls *"         → ^(?i)ls\ .*$
+  "[rc]m"        → ^(?i)[rc]m$
+```
+
+### A.4 匹配逻辑伪代码
 
 ```
 function match_approval_rules(request, rules):
@@ -447,15 +504,16 @@ function match_approval_rules(request, rules):
                  ?? first_word(request.tool_call.title)
                  ?? "tool"
 
-        // ③ 正则匹配（大小写不敏感）
+        // ③ 通配符匹配（大小写不敏感）
         for pattern in rule.patterns:
-            if regex_match(pattern, target, case_insensitive=true):
+            regex = glob_to_regex(pattern)  // 通配符转正则
+            if regex_match(regex, target, case_insensitive=true):
                 return rule.action
 
     return null  // 无匹配，按 agent_mode 默认行为
 ```
 
-### A.4 后端测试用例
+### A.5 后端测试用例
 
 ```bash
 # 测试 1: YOLO + Bash 危险命令审批
@@ -469,7 +527,7 @@ curl -X POST http://localhost:8087/computer/chat \
       "agent_server": {
         "agent_mode": "yolo",
         "tool_approval_rules": [
-          { "patterns": ["rm\\s+-[a-z]*r[a-z]*f", "sudo"], "action": "require_approval" }
+          { "patterns": ["rm -rf *", "sudo *"], "action": "ask" }
         ]
       }
     }'
@@ -486,13 +544,30 @@ curl -X POST http://localhost:8087/computer/chat \
       "agent_server": {
         "agent_mode": "ask",
         "tool_approval_rules": [
-          { "patterns": ["^(ls|cat|head|tail|grep|find)\\b"], "action": "auto_approve" }
+          { "patterns": ["ls *", "cat *", "head *", "tail *", "grep *", "find *"], "action": "allow" }
         ]
       }
     }'
 # 预期: "ls -la" 自动放行，"rm -rf" 触发审批
 
-# 测试 3: 不传规则 → 行为不变
+# 测试 3: YOLO + Delete 工具直接拒绝
+curl -X POST http://localhost:8087/computer/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "test_user",
+    "project_id": "test_project",
+    "prompt": "清理文件",
+    "agent_config": {
+      "agent_server": {
+        "agent_mode": "yolo",
+        "tool_approval_rules": [
+          { "patterns": ["*delete*", "*drop*"], "action": "deny", "tool_kind": "Delete" }
+        ]
+      }
+    }'
+# 预期: Delete 类型工具直接拒绝
+
+# 测试 4: 不传规则 → 行为不变
 curl -X POST http://localhost:8087/computer/chat \
   -H "Content-Type: application/json" \
   -d '{
