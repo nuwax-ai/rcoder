@@ -23,17 +23,17 @@ data:
         services:
           rcoder:
             service_type: "RCoder"
-            arm64_image: "rcoder-local:latest"
-            amd64_image: "rcoder-local:latest"
-            default_image: "rcoder-local:latest"
-            image_tag_prefix: "rcoder"
+            arm64_image: "dev-rcoder-local:latest"
+            amd64_image: "dev-rcoder-local:latest"
+            default_image: "dev-rcoder-local:latest"
+            image_tag_prefix: "dev-rcoder"
             enabled: true
           computer-agent-runner:
             service_type: "ComputerAgentRunner"
-            arm64_image: "rcoder-agent-runner-local:latest"
-            amd64_image: "rcoder-agent-runner-local:latest"
-            default_image: "rcoder-agent-runner-local:latest"
-            image_tag_prefix: "rcoder-agent-runner"
+            arm64_image: "dev-rcoder-agent-runner-local:latest"
+            amd64_image: "dev-rcoder-agent-runner-local:latest"
+            default_image: "dev-rcoder-agent-runner-local:latest"
+            image_tag_prefix: "dev-rcoder-agent-runner"
             enabled: true
         selection_strategy: "ServiceOnly"
 

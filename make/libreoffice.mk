@@ -107,7 +107,7 @@ docker-clean-libreoffice-downloads:
 # 构建 agent-base 基础镜像（包含所有系统依赖，很少需要重新构建）
 docker-build-agent-base: docker-pre-download-libreoffice
 	@echo "🐳 构建 rcoder-agent-base 基础镜像..."
-	@echo "📍 镜像名称: rcoder-agent-base:latest"
+	@echo "📍 镜像名称: dev-rcoder-agent-base:latest"
 	@echo "📦 LibreOffice: $(LIBREOFFICE_VERSION) ($(LIBREOFFICE_ARCH))"
 	@echo "⏳ 这可能需要较长时间（包含所有系统依赖安装）..."
 	@# CACHEBUST_NOVNC: 传入时间戳强制每次重新克隆 noVNC
@@ -116,10 +116,9 @@ docker-build-agent-base: docker-pre-download-libreoffice
 		docker buildx build --platform linux/$(LIBREOFFICE_ARCH) --load \
 		--build-arg LIBREOFFICE_FILE=$(LIBREOFFICE_FILE) \
 		--build-arg CACHEBUST_NOVNC=$$(date +%s) \
-		-f Dockerfile.base -t rcoder-agent-base:latest .
+		-f Dockerfile.base -t dev-rcoder-agent-base:latest .
 	@echo "✅ rcoder-agent-base 基础镜像构建完成！"
 	@echo "📤 推送基础镜像到阿里云仓库..."
-	@docker tag rcoder-agent-base:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-agent-base:latest
-	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-agent-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-agent-base:latest
-	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-agent-base:latest"
+	@skopeo copy docker-daemon:dev-rcoder-agent-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder-agent-base:latest
+	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder-agent-base:latest"
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
