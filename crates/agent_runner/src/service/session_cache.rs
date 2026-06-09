@@ -151,9 +151,10 @@ impl SessionData {
     /// 如果 worker 已经 panic，返回 true 并记录错误信息
     pub async fn has_worker_panicked(&self) -> bool {
         let mut guard = self.worker_handle.lock().await;
-        match guard.take() {
-            Some(handle) if handle.is_finished() => {
-                // 尝试 await 获取结果，检查是否 panic
+        if let Some(handle) = guard.as_ref() {
+            if handle.is_finished() {
+                // take() 消耗 handle 来 await 获取结果
+                let handle = guard.take().unwrap();
                 match handle.await {
                     Err(e) if e.is_panic() => {
                         warn!("⚠️ [SessionData] SessionWorker panicked: {:?}", e);
@@ -167,13 +168,13 @@ impl SessionData {
                         debug!("[SessionData] SessionWorker exited normally");
                         false
                     }
-                    _ => false, // 尚未完成
+                    _ => false,
                 }
-            }
-            other => {
-                *guard = other; // 恢复未完成的 handle
+            } else {
                 false
             }
+        } else {
+            false
         }
     }
 
@@ -364,16 +365,27 @@ impl SessionWorker {
                     // try_lock() 可能失败导致消息丢失，造成 SSE 卡死
                     let mut current_sender_guard = self.current_sender.lock().await;
                     if let Some(sender) = current_sender_guard.as_mut() {
-                        if sender.try_send(message.clone()).is_err() {
-                            // 如果发送失败，可能是缓冲区满了或连接已关闭
-                            // 注意：truncate 在锁内执行，但 50 字符开销可忽略
-                            warn!(
-                                "⚠️ SSE sender send failed, disabling real-time delivery: message_type={:?}, sub_type={}, data={}",
-                                message.message_type,
-                                message.sub_type,
-                                truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
-                            );
-                            *current_sender_guard = None;
+                        use tokio::sync::mpsc::error::TrySendError;
+                        if let Err(send_err) = sender.try_send(message.clone()) {
+                            match send_err {
+                                TrySendError::Full(_) => {
+                                    // buffer 满（客户端暂时慢）：不禁用 sender，等客户端消费后恢复
+                                    // 消息已在 ring buffer 中备份，不会真正丢失
+                                    warn!(
+                                        "⚠️ SSE sender buffer full, message buffered: message_type={:?}, sub_type={}",
+                                        message.message_type, message.sub_type,
+                                    );
+                                }
+                                TrySendError::Closed(_) => {
+                                    // receiver 已断开：禁用 sender，避免后续每条消息都 try_send 失败
+                                    // SubscribeProgress 会在 recv() 返回 None 时检测到并清理
+                                    warn!(
+                                        "⚠️ SSE sender receiver dropped, disabling sender: message_type={:?}, sub_type={}",
+                                        message.message_type, message.sub_type,
+                                    );
+                                    *current_sender_guard = None;
+                                }
+                            }
                         }
                     } else {
                         // 连接不存在，跳过实时推送（记录为 info 级别，便于排查问题）

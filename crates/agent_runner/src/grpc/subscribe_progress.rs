@@ -77,11 +77,14 @@ pub async fn subscribe_progress(
                     info!("📡 [gRPC] Session connection created successfully: {}", session_id_clone);
 
                     let mut last_message_time = Instant::now();
+                    #[allow(unused_assignments)]
+                    let mut exit_reason = "unknown";
 
                     loop {
                         tokio::select! {
                             _ = cancellation_token.cancelled() => {
                                 info!("📡 [gRPC] Session connection cancelled, sending SessionPromptEnd: session_id={}", session_id_clone);
+                                exit_reason = "cancelled";
 
                                 use agent_client_protocol::schema::StopReason;
                                 use shared_types::{SessionNotify, SessionPromptEnd};
@@ -120,6 +123,7 @@ pub async fn subscribe_progress(
                                         let event = unified_message_to_progress_event(&unified_message);
                                         if tx.send(Ok(event)).await.is_err() {
                                             debug!("📡 [gRPC] Client disconnected");
+                                            exit_reason = "client_disconnected";
                                             break;
                                         }
 
@@ -128,11 +132,13 @@ pub async fn subscribe_progress(
                                                 "🔚 [gRPC] Received SessionPromptEnd, closing stream: session_id={}, sub_type={}",
                                                 session_id_clone, unified_message.sub_type
                                             );
+                                            exit_reason = "terminal_message";
                                             break;
                                         }
                                     }
                                     None => {
                                         debug!("📡 [gRPC] Session channel closed, sending SessionPromptEnd event");
+                                        exit_reason = "channel_closed";
                                         let end_event = ProgressEvent {
                                             message_type: "SessionPromptEnd".to_string(),
                                             sub_type: "end_turn".to_string(),
@@ -178,6 +184,7 @@ pub async fn subscribe_progress(
                                         timestamp: chrono::Utc::now().timestamp_millis(),
                                     };
                                     let _ = tx.send(Ok(timeout_event)).await;
+                                    exit_reason = "idle_timeout";
                                     break;
                                 }
 
@@ -191,11 +198,17 @@ pub async fn subscribe_progress(
 
                                 if tx.send(Ok(heartbeat)).await.is_err() {
                                     debug!("📡 [gRPC] Failed to send heartbeat; client disconnected");
+                                    exit_reason = "heartbeat_failed";
                                     break;
                                 }
                             }
                         }
                     }
+
+                    // gRPC 流结束时清理 SSE sender
+                    // 防止下次 Chat 请求时 try_send 使用已关闭的旧 sender 导致消息丢失
+                    info!("🔌 [gRPC] SubscribeProgress stream ended, cleaning up SSE sender: session_id={}, reason={}", session_id_clone, exit_reason);
+                    session_data.close_current_connection().await;
                 }
                 Err(e) => {
                     warn!("[gRPC] Failed to create session connection: {}", e);
