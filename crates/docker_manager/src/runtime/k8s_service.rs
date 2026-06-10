@@ -25,7 +25,7 @@ use super::kubernetes_runtime::KubernetesRuntime;
 use super::k8s_pod::K8sPodOps;
 
 /// Agent Runner HTTP 端口（使用 shared_types 共享常量）
-const AGENT_HTTP_PORT: u32 = shared_types::HTTP_DEFAULT_PORT as u32;
+const AGENT_HTTP_PORT: u32 = HTTP_DEFAULT_PORT as u32;
 
 /// K8s Service 生命周期管理 trait extension
 ///

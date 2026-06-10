@@ -4,21 +4,14 @@
 //!
 //! ⚠️ 警告：这些接口仅用于开发和调试，生产环境应禁用或添加权限控制
 
-use axum::{Json, extract::State, http::HeaderMap};
-use serde::{Deserialize, Serialize};
+use axum::{extract::State, http::HeaderMap};
+use serde::Serialize;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::info;
 use utoipa::ToSchema;
 
 use crate::router::AppState;
-use crate::storage::types::StorageStats;
-use shared_types::{
-    HttpResult,
-    error_codes::{ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS},
-    get_i18n_message,
-};
-
-use super::utils::get_locale_from_headers;
+use shared_types::HttpResult;
 
 /// 存储统计信息响应
 #[derive(Debug, Serialize, ToSchema)]
