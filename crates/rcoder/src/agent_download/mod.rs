@@ -17,6 +17,34 @@ use tracing::info;
 
 use error::AgentDownloadError;
 
+/// Validate that an identifier (agent_id or version) is safe for path construction.
+///
+/// Only allows alphanumeric characters, dash, underscore, and dot.
+/// Rejects empty strings and path traversal sequences (`..`).
+fn validate_download_identifier(id: &str, label: &str) -> Result<(), AgentDownloadError> {
+    if id.is_empty() {
+        return Err(AgentDownloadError::NotFound(format!("{} is empty", label)));
+    }
+    // Only allow alphanumeric, dash, underscore, dot
+    if !id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AgentDownloadError::NotFound(format!(
+            "{} contains invalid characters: {}",
+            label, id
+        )));
+    }
+    // Reject path traversal
+    if id.contains("..") {
+        return Err(AgentDownloadError::NotFound(format!(
+            "{} contains path traversal: {}",
+            label, id
+        )));
+    }
+    Ok(())
+}
+
 /// 下载结果
 pub struct DownloadResult {
     /// 缓存目录路径
@@ -122,6 +150,9 @@ impl AgentDownloadManager {
         version: &str,
         url: &str,
     ) -> Result<DownloadResult, AgentDownloadError> {
+        validate_download_identifier(agent_id, "agent_id")?;
+        validate_download_identifier(version, "version")?;
+
         // 获取锁（同一版本只有一个下载任务）
         let lock = self.get_download_lock(agent_id, version);
         let _guard = lock.lock().await;
@@ -158,8 +189,18 @@ impl AgentDownloadManager {
 
         // 创建版本目录并移动文件
         tokio::fs::create_dir_all(&version_dir).await?;
-        let filename = url.split('/').last().unwrap_or("package.tar.gz");
-        let dest_path = version_dir.join(filename);
+        let raw_filename = url.split('/').next_back().unwrap_or("package.tar.gz");
+        // Reject path traversal and use safe default
+        if raw_filename.is_empty()
+            || raw_filename == "."
+            || raw_filename == ".."
+            || raw_filename.contains(std::path::MAIN_SEPARATOR)
+        {
+            return Err(AgentDownloadError::NotFound(
+                "invalid filename from URL".into(),
+            ));
+        }
+        let dest_path = version_dir.join(raw_filename);
         tokio::fs::rename(&temp_file, &dest_path)
             .await?;
 
@@ -196,6 +237,9 @@ impl AgentDownloadManager {
         version: &str,
         target_base: &Path,
     ) -> Result<PathBuf, AgentDownloadError> {
+        validate_download_identifier(agent_id, "agent_id")?;
+        validate_download_identifier(version, "version")?;
+
         let source = self.version_dir(agent_id, version);
         let target = target_base.join(agent_id).join(version);
 
@@ -348,5 +392,35 @@ mod tests {
         let result = manager.copy_to_target("test-agent", "1.0.0", &target_base).await;
 
         assert!(matches!(result, Err(AgentDownloadError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_validate_download_identifier_valid() {
+        assert!(validate_download_identifier("codex-acp", "agent_id").is_ok());
+        assert!(validate_download_identifier("my_agent", "agent_id").is_ok());
+        assert!(validate_download_identifier("agent.v2", "agent_id").is_ok());
+        assert!(validate_download_identifier("1.0.0-beta", "version").is_ok());
+        assert!(validate_download_identifier("2_3_4", "version").is_ok());
+    }
+
+    #[test]
+    fn test_validate_download_identifier_empty() {
+        assert!(validate_download_identifier("", "agent_id").is_err());
+        assert!(validate_download_identifier("", "version").is_err());
+    }
+
+    #[test]
+    fn test_validate_download_identifier_path_traversal() {
+        assert!(validate_download_identifier("..", "agent_id").is_err());
+        assert!(validate_download_identifier("../etc", "agent_id").is_err());
+        assert!(validate_download_identifier("foo..bar", "agent_id").is_err());
+    }
+
+    #[test]
+    fn test_validate_download_identifier_invalid_chars() {
+        assert!(validate_download_identifier("/etc/passwd", "agent_id").is_err());
+        assert!(validate_download_identifier("agent\\name", "agent_id").is_err());
+        assert!(validate_download_identifier("agent id", "agent_id").is_err());
+        assert!(validate_download_identifier("agent;rm", "agent_id").is_err());
     }
 }

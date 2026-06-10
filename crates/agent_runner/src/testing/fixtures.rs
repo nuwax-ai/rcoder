@@ -15,7 +15,7 @@ use std::path::PathBuf;
 /// use agent_runner::testing::fixtures::TestRequestBuilder;
 ///
 /// // 创建基础测试请求
-/// let (req, resp_rx) = TestRequestBuilder::new()
+/// let req = TestRequestBuilder::new()
 ///     .project_id("test-project")
 ///     .content("Hello, Agent!")
 ///     .build();

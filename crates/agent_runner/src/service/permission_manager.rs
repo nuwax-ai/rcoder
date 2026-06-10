@@ -446,11 +446,13 @@ impl PermissionRequestHandler for PermissionManager {
             info.session_id, info.tool_call_id, info.tool_name, info.command, context.agent_mode
         );
 
+        // Priority 1: Dangerous-command rejection (cannot be overridden by any rule)
         if is_dangerous_command(info.command.as_deref()) {
             info!(
-                "[Permission] dangerous command detected, will push to user for approval: session_id={}, tool_call_id={}, command={:?}",
+                "[Permission] dangerous command detected, forcing frontend approval: session_id={}, tool_call_id={}, command={:?}",
                 info.session_id, info.tool_call_id, info.command
             );
+            return self.push_permission_to_frontend(context, request, responder, &info).await;
         }
 
         if let Some(decision) = self.rule_decision(&context, &info.tool_name, info.command.as_deref()) {
@@ -567,13 +569,28 @@ fn match_tool_approval_rules(
     request: &RequestPermissionRequest,
 ) -> Option<ToolApprovalAction> {
     let rules = context.tool_approval_rules.as_ref()?;
+    // Use explicit match instead of Debug formatting to avoid depending on
+    // #[non_exhaustive] enum's Debug representation, which may change across
+    // agent-client-protocol-schema crate versions.
     let kind_str = request
         .tool_call
         .fields
         .kind
         .as_ref()
-        .map(|k| format!("{:?}", k))
-        .unwrap_or_else(|| "Other".to_string());
+        .map(|k| match k {
+            agent_client_protocol::schema::ToolKind::Read => "Read",
+            agent_client_protocol::schema::ToolKind::Edit => "Edit",
+            agent_client_protocol::schema::ToolKind::Delete => "Delete",
+            agent_client_protocol::schema::ToolKind::Move => "Move",
+            agent_client_protocol::schema::ToolKind::Search => "Search",
+            agent_client_protocol::schema::ToolKind::Execute => "Execute",
+            agent_client_protocol::schema::ToolKind::Think => "Think",
+            agent_client_protocol::schema::ToolKind::Fetch => "Fetch",
+            agent_client_protocol::schema::ToolKind::SwitchMode => "SwitchMode",
+            _ => "Other",
+        })
+        .unwrap_or("Other")
+        .to_string();
 
     for rule in rules {
         let rule_kind = rule.tool_kind.as_deref().unwrap_or("Execute");
@@ -650,9 +667,9 @@ fn extract_command(request: &RequestPermissionRequest) -> Option<String> {
 /// Hardcoded safety rules that always reject before any user-saved rule is consulted.
 ///
 /// Priority chain (highest first):
-/// 1. Dangerous-command rejection (this function) — cannot be overridden
-/// 2. User deny rules (always_deny)
-/// 3. User allow rules (always_allow)
+/// 1. Dangerous-command rejection — cannot be overridden (forces frontend approval)
+/// 2. User deny/allow rules via `rule_decision` (always_deny, always_allow)
+/// 3. tool_approval_rules matching (first-match-wins)
 /// 4. agent_mode fallback (yolo = auto-allow, ask = push SSE)
 fn is_dangerous_command(command: Option<&str>) -> bool {
     let Some(command) = command else {

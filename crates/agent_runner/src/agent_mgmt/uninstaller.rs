@@ -45,15 +45,16 @@ pub async fn uninstall(registry: &AgentRegistry, agent_id: &str) -> AgentMgmtRes
     }
 
     // 1. 删除整个 agent 目录（包含所有版本）
+    // TODO: 支持 per-version 卸载时，改为只删除 {agent_dir}/{version}
     let agent_dir = install_dir.join(agent_id);
-    if agent_dir.exists() {
-        if let Err(e) = tokio::fs::remove_dir_all(&agent_dir).await {
-            warn!(
-                "[agent_mgmt] Failed to remove agent directory during uninstall: path={}, error={}",
-                agent_dir.display(),
-                e
-            );
-        }
+    if agent_dir.exists()
+        && let Err(e) = tokio::fs::remove_dir_all(&agent_dir).await
+    {
+        warn!(
+            "[agent_mgmt] Failed to remove agent directory during uninstall: path={}, error={}",
+            agent_dir.display(),
+            e
+        );
     }
 
     // 2. 从注册表移除（所有版本）

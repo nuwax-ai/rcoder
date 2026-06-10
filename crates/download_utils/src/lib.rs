@@ -10,6 +10,7 @@
 //! ## Usage
 //!
 //! ```rust,no_run
+//! use std::path::Path;
 //! use download_utils::{Downloader, DownloadConfig};
 //! use tokio_util::sync::CancellationToken;
 //!
@@ -19,7 +20,7 @@
 //!
 //! downloader.download_to_file(
 //!     "https://example.com/file.tar.gz",
-//!     "/tmp/file.tar.gz",
+//!     Path::new("/tmp/file.tar.gz"),
 //!     None,  // no SHA-256 check
 //!     &cancel,
 //! ).await?;

@@ -55,9 +55,6 @@ pub trait AgentInstallStrategy: Send + Sync {
         project: &ProjectAndContainerInfo,
         routing: &RoutingParams,
     ) -> Result<InstallContext, AppError>;
-
-    /// 返回此策略处理的 ServiceType
-    fn service_type(&self) -> ServiceType;
 }
 
 // =============================================================================
@@ -99,10 +96,6 @@ impl AgentInstallStrategy for ComputerAgentRunnerStrategy {
             install_dir,
             container_identifier: user_id.to_string(),
         })
-    }
-
-    fn service_type(&self) -> ServiceType {
-        ServiceType::ComputerAgentRunner
     }
 }
 
@@ -152,10 +145,6 @@ impl AgentInstallStrategy for RcoderStrategy {
             install_dir,
             container_identifier,
         })
-    }
-
-    fn service_type(&self) -> ServiceType {
-        ServiceType::RCoder
     }
 }
 

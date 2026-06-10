@@ -68,19 +68,6 @@ pub enum AgentMgmtError {
 }
 
 impl AgentMgmtError {
-    /// 判断是否可重试(网络错误/IO 错误/传输中断)
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::InstallFailed(msg) => {
-                // HTTP 4xx 不可重试,网络错误/5xx 可重试
-                !msg.contains("HTTP 4")
-            }
-            Self::Io(_) | Self::StreamTruncated => true,
-            Self::ChecksumMismatch { .. } => true, // 可能是下载损坏
-            _ => false,
-        }
-    }
-
     /// 映射到业务错误码
     pub fn error_code(&self) -> &'static str {
         match self {
@@ -98,7 +85,7 @@ impl AgentMgmtError {
             Self::PlatformNotFound(_) => ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
             Self::InvalidVersion(_) => ec::ERR_AGENT_MGMT_INVALID_VERSION,
             Self::InstallCancelled => ec::ERR_AGENT_MGMT_INSTALL_CANCELLED,
-            Self::VersionAlreadyInstalled { .. } => ec::ERR_AGENT_MGMT_INVALID_MANIFEST,
+            Self::VersionAlreadyInstalled { .. } => ec::ERR_AGENT_MGMT_ALREADY_INSTALLED,
             Self::UnsupportedType(_) => ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
             Self::Io(_) | Self::Archive(_) | Self::Json(_) => {
                 ec::ERR_INTERNAL_SERVER_ERROR

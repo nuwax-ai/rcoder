@@ -36,7 +36,7 @@ use shared_types::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{instrument, warn};
+use tracing::{info, instrument, warn};
 
 use super::utils::{
     AgentMgmtForwardCtx, I18nJsonOrQuery, InstallAgentParams, check_agent as fwd_check,
@@ -688,6 +688,12 @@ pub async fn install_from_url(
 
     let install_ctx = strategy.resolve_install_context(&project, &body.routing)?;
 
+    info!(
+        "[agent_mgmt] Install context resolved: install_dir={}, container={}",
+        install_ctx.install_dir.display(),
+        install_ctx.container_identifier
+    );
+
     // 下载到缓存（rcoder 主动）
     // version 已在前面通过 require_field 校验为必填
     let download_manager = &state.agent_download_manager;
@@ -727,6 +733,7 @@ pub async fn install_from_url(
         &body.agent.command,
         &body.agent.args,
     )
+    .await
     .map_err(|e| {
         warn!("[agent_mgmt] update registry failed: {}", e);
         AppError::with_message(ec::ERR_AGENT_MGMT_INSTALL_FAILED, format!("registry update failed: {}", e))

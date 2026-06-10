@@ -9,7 +9,7 @@
 use shared_types::InstallType;
 use shared_types_grpc::InstallAgentResponse;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use download_utils::{DownloadConfig, Downloader};
 

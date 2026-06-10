@@ -41,7 +41,27 @@ pub struct AgentManifest {
 /// 在单实例部署场景下是安全的。
 /// 多实例并发写入时，后写入的会覆盖先写入的（可能丢失更新），
 /// 但不会导致文件损坏。如需多实例完全安全，应引入文件锁。
-pub fn update_registry(
+pub async fn update_registry(
+    acp_agent_dir: &Path,
+    agent_id: &str,
+    version: &str,
+    command: &str,
+    args: &[String],
+) -> Result<(), AgentDownloadError> {
+    let acp_agent_dir = acp_agent_dir.to_path_buf();
+    let agent_id = agent_id.to_string();
+    let version = version.to_string();
+    let command = command.to_string();
+    let args = args.to_vec();
+
+    tokio::task::spawn_blocking(move || {
+        update_registry_sync(&acp_agent_dir, &agent_id, &version, &command, &args)
+    })
+    .await
+    .map_err(|e| AgentDownloadError::Io(std::io::Error::other(e.to_string())))?
+}
+
+fn update_registry_sync(
     acp_agent_dir: &Path,
     agent_id: &str,
     version: &str,
@@ -102,7 +122,7 @@ pub fn update_registry(
                 a.version
                     .as_deref()
                     .unwrap_or("")
-                    .cmp(&b.version.as_deref().unwrap_or(""))
+                    .cmp(b.version.as_deref().unwrap_or(""))
             })
     });
 
@@ -110,7 +130,10 @@ pub fn update_registry(
     let json = serde_json::to_string_pretty(&manifests)?;
     let tmp_path = registry_path.with_extension("json.tmp");
     std::fs::write(&tmp_path, json.as_bytes())?;
-    std::fs::rename(&tmp_path, &registry_path)?;
+    if std::fs::rename(&tmp_path, &registry_path).is_err() {
+        std::fs::copy(&tmp_path, &registry_path)?;
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 
     info!(
         registry_path = %registry_path.display(),
@@ -125,12 +148,12 @@ pub fn update_registry(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_update_registry_new_file() {
+    #[tokio::test]
+    async fn test_update_registry_new_file() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let acp_agent_dir = tmp_dir.path();
 
-        update_registry(acp_agent_dir, "test-agent", "1.0.0", "test-cmd", &[]).unwrap();
+        update_registry(acp_agent_dir, "test-agent", "1.0.0", "test-cmd", &[]).await.unwrap();
 
         // 验证文件存在
         let registry_path = acp_agent_dir.join("registry.json");
@@ -144,16 +167,16 @@ mod tests {
         assert_eq!(manifests[0].version, Some("1.0.0".to_string()));
     }
 
-    #[test]
-    fn test_update_registry_add_version() {
+    #[tokio::test]
+    async fn test_update_registry_add_version() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let acp_agent_dir = tmp_dir.path();
 
         // 添加第一个版本
-        update_registry(acp_agent_dir, "test-agent", "1.0.0", "test-cmd", &[]).unwrap();
+        update_registry(acp_agent_dir, "test-agent", "1.0.0", "test-cmd", &[]).await.unwrap();
 
         // 添加第二个版本
-        update_registry(acp_agent_dir, "test-agent", "2.0.0", "test-cmd", &[]).unwrap();
+        update_registry(acp_agent_dir, "test-agent", "2.0.0", "test-cmd", &[]).await.unwrap();
 
         // 验证有两个版本
         let registry_path = acp_agent_dir.join("registry.json");
@@ -162,16 +185,16 @@ mod tests {
         assert_eq!(manifests.len(), 2);
     }
 
-    #[test]
-    fn test_update_registry_update_existing() {
+    #[tokio::test]
+    async fn test_update_registry_update_existing() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let acp_agent_dir = tmp_dir.path();
 
         // 添加版本
-        update_registry(acp_agent_dir, "test-agent", "1.0.0", "old-cmd", &[]).unwrap();
+        update_registry(acp_agent_dir, "test-agent", "1.0.0", "old-cmd", &[]).await.unwrap();
 
         // 更新同一版本
-        update_registry(acp_agent_dir, "test-agent", "1.0.0", "new-cmd", &["--flag".to_string()]).unwrap();
+        update_registry(acp_agent_dir, "test-agent", "1.0.0", "new-cmd", &["--flag".to_string()]).await.unwrap();
 
         // 验证只有一个版本，但命令已更新
         let registry_path = acp_agent_dir.join("registry.json");
@@ -182,13 +205,13 @@ mod tests {
         assert_eq!(manifests[0].args, vec!["--flag".to_string()]);
     }
 
-    #[test]
-    fn test_update_registry_multiple_agents() {
+    #[tokio::test]
+    async fn test_update_registry_multiple_agents() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let acp_agent_dir = tmp_dir.path();
 
-        update_registry(acp_agent_dir, "agent-a", "1.0.0", "cmd-a", &[]).unwrap();
-        update_registry(acp_agent_dir, "agent-b", "1.0.0", "cmd-b", &[]).unwrap();
+        update_registry(acp_agent_dir, "agent-a", "1.0.0", "cmd-a", &[]).await.unwrap();
+        update_registry(acp_agent_dir, "agent-b", "1.0.0", "cmd-b", &[]).await.unwrap();
 
         let registry_path = acp_agent_dir.join("registry.json");
         let data = std::fs::read_to_string(&registry_path).unwrap();

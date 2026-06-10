@@ -110,6 +110,8 @@ impl AgentRegistry {
     }
 
     /// 获取 agent 的所有版本
+    /// TODO: per-version uninstall 实现时移除 cfg(test)
+    #[cfg(test)]
     pub fn get_all_versions(&self, agent_id: &str) -> Vec<AgentManifest> {
         let guard = self.inner.lock();
         match guard.get(agent_id) {
@@ -143,13 +145,12 @@ impl AgentRegistry {
         manifest.validate()?;
         let mut guard = self.inner.lock();
         let vkey = version_key(manifest.version.as_deref());
-        let versions = guard.entry(manifest.agent_id.clone()).or_insert_with(HashMap::new);
+        let versions = guard.entry(manifest.agent_id.clone()).or_default();
         if versions.contains_key(&vkey) {
-            return Err(AgentMgmtError::InvalidManifest(format!(
-                "agent version already installed: {}@{}",
-                manifest.agent_id,
-                manifest.version.as_deref().unwrap_or("none")
-            )));
+            return Err(AgentMgmtError::VersionAlreadyInstalled {
+                agent_id: manifest.agent_id.clone(),
+                version: manifest.version.as_deref().unwrap_or("none").to_string(),
+            });
         }
         versions.insert(vkey, manifest);
         drop(guard);
@@ -161,7 +162,7 @@ impl AgentRegistry {
         manifest.validate()?;
         let mut guard = self.inner.lock();
         let vkey = version_key(manifest.version.as_deref());
-        let versions = guard.entry(manifest.agent_id.clone()).or_insert_with(HashMap::new);
+        let versions = guard.entry(manifest.agent_id.clone()).or_default();
         versions.insert(vkey, manifest);
         drop(guard);
         self.save_to_disk()
@@ -180,6 +181,8 @@ impl AgentRegistry {
     }
 
     /// 删除指定版本(立即落盘)
+    /// TODO: per-version uninstall 实现时移除 cfg(test)
+    #[cfg(test)]
     pub fn remove_version(&self, agent_id: &str, version: &str) -> AgentMgmtResult<AgentManifest> {
         let mut guard = self.inner.lock();
         let vkey = version_key(Some(version));
@@ -239,7 +242,10 @@ impl AgentRegistry {
         // 原子写:tmp → rename
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json.as_bytes())?;
-        std::fs::rename(&tmp, &path)?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            std::fs::copy(&tmp, &path)?;
+            let _ = std::fs::remove_file(&tmp);
+        }
         info!(
             "[agent_mgmt] Registry persisted: path={}, count={}",
             path.display(),
@@ -261,10 +267,21 @@ impl AgentRegistry {
             Ok(v) => v,
             Err(e) => {
                 warn!(
-                    "[agent_mgmt] Registry parse error (treat as empty): path={}, error={}",
+                    "[agent_mgmt] Registry parse error, backing up corrupt file: path={}, error={}",
                     path.display(),
                     e
                 );
+                // Backup corrupt file for forensic analysis
+                let backup = path.with_extension("json.corrupt");
+                if std::fs::rename(path, &backup)
+                    .or_else(|_| std::fs::copy(path, &backup).map(|_| ()))
+                    .is_err()
+                {
+                    warn!(
+                        "[agent_mgmt] Failed to backup corrupt registry: path={}",
+                        path.display()
+                    );
+                }
                 return Ok(HashMap::new());
             }
         };
@@ -272,7 +289,7 @@ impl AgentRegistry {
         for m in manifests {
             let vkey = version_key(m.version.as_deref());
             map.entry(m.agent_id.clone())
-                .or_insert_with(HashMap::new)
+                .or_default()
                 .insert(vkey, m);
         }
         Ok(map)
@@ -360,7 +377,7 @@ mod tests {
         let err = r
             .insert(sample_manifest_with_version("codex-acp", "1.0.0"))
             .unwrap_err();
-        assert!(matches!(err, AgentMgmtError::InvalidManifest(_)));
+        assert!(matches!(err, AgentMgmtError::VersionAlreadyInstalled { .. }));
     }
 
     #[test]

@@ -17,12 +17,11 @@ default-members = [
 
 
 [workspace.lints]
-rustdoc.unbroken_backticks = "warn"
+rustdoc.unescaped_backticks = "warn"
 rustdoc.redundant_explicit_links = "warn"
 rust.unused_lifetimes = "warn"
 rust.unused_qualifications = "warn"
 rust.variant_size_differences = "warn"
-rust.allow_leading_underscore = "warn"
 
 [workspace.package]
 version = "0.1.0"

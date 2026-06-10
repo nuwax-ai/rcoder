@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::error::DownloadError;
 
