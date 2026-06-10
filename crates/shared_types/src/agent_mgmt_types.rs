@@ -54,6 +54,9 @@ pub struct RoutingParams {
 /// 默认安装目录常量
 pub const DEFAULT_ACP_AGENT_INSTALL_DIR: &str = "/home/user/acp-agent";
 
+/// Agent 缓存目录常量（rcoder 统一下载缓存）
+pub const AGENT_CACHE_DIR: &str = "/app/agent-cache";
+
 /// 二进制上传时单 chunk 大小(1 MB)
 pub const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 
@@ -499,6 +502,17 @@ pub enum InstallAction {
     Updated,
     /// 跳过(已安装版本 >= 请求版本)
     Skipped,
+}
+
+impl InstallAction {
+    /// 转换为字符串
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Updated => "updated",
+            Self::Skipped => "skipped",
+        }
+    }
 }
 
 impl std::str::FromStr for InstallAction {

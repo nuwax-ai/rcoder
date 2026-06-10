@@ -51,6 +51,9 @@ pub enum AgentMgmtError {
     #[error("install cancelled by force reinstall")]
     InstallCancelled,
 
+    #[error("version already installed: {agent_id}@{version}")]
+    VersionAlreadyInstalled { agent_id: String, version: String },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -95,6 +98,7 @@ impl AgentMgmtError {
             Self::PlatformNotFound(_) => ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
             Self::InvalidVersion(_) => ec::ERR_AGENT_MGMT_INVALID_VERSION,
             Self::InstallCancelled => ec::ERR_AGENT_MGMT_INSTALL_CANCELLED,
+            Self::VersionAlreadyInstalled { .. } => ec::ERR_AGENT_MGMT_INVALID_MANIFEST,
             Self::UnsupportedType(_) => ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
             Self::Io(_) | Self::Archive(_) | Self::Json(_) => {
                 ec::ERR_INTERNAL_SERVER_ERROR

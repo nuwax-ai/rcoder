@@ -170,10 +170,10 @@ pub use rcoder_agent_types::*;
 pub mod http_handlers;
 pub mod agent_mgmt_types;
 pub use agent_mgmt_types::{
-    AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus, CheckAgentRequest, CheckAgentResponse,
-    GetAgentRequest, InstallAction, InstallAgentResponse, InstallBinaryRequest,
-    InstallFromPackageManagerRequest, InstallFromUrlRequest, InstallType, ListAgentsRequest,
-    ListAgentsResponse, PlatformEntry, RoutingParams, StaticCheckResult, SystemInfo,
-    UninstallAgentRequest, UninstallAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR,
+    AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus, AGENT_CACHE_DIR,
+    CheckAgentRequest, CheckAgentResponse, GetAgentRequest, InstallAction, InstallAgentResponse,
+    InstallBinaryRequest, InstallFromPackageManagerRequest, InstallFromUrlRequest, InstallType,
+    ListAgentsRequest, ListAgentsResponse, PlatformEntry, RoutingParams, StaticCheckResult,
+    SystemInfo, UninstallAgentRequest, UninstallAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR,
     MAX_BINARY_SIZE, MAX_EXTRACTED_SIZE, UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS,
 };

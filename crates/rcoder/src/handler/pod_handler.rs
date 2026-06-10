@@ -720,16 +720,18 @@ pub async fn pod_ensure(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_ENSURE] user_id is required");
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "user_id is required and cannot be empty",
         ));
     }
     if request.project_id.trim().is_empty() {
         error!("[POD_ENSURE] project_id is required");
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "project_id is required and cannot be empty",
         ));
     }
 
@@ -738,9 +740,10 @@ pub async fn pod_ensure(
         && let Err(e) = validate_resource_limits(limits)
     {
         error!("[POD_ENSURE] resources update failed: {}", e);
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
             locale,
+            &e,
         ));
     }
 
@@ -1043,13 +1046,10 @@ pub async fn pod_ensure(
             None => {
                 // 创建失败，也要清除标记
                 state.pod_creating.remove(&request.user_id);
-                let error_msg = last_error
-                    .as_ref()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| {
-                        "Container creation failed but no error info captured".to_string()
-                    });
-                return Err(AppError::internal_server_error(&error_msg));
+                // 直接返回原始错误，保留具体的错误信息
+                return Err(last_error.unwrap_or_else(|| {
+                    AppError::internal_server_error("Container creation failed but no error info captured")
+                }));
             }
         }
     } else {
@@ -1258,16 +1258,18 @@ pub async fn pod_keepalive(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_KEEPALIVE] user_id is required");
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "user_id is required and cannot be empty",
         ));
     }
     if request.project_id.trim().is_empty() {
         error!("[POD_KEEPALIVE] project_id is required");
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "project_id is required and cannot be empty",
         ));
     }
 
@@ -1280,9 +1282,10 @@ pub async fn pod_keepalive(
             error!(
                 "[POD_KEEPALIVE] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
             );
-            return Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
+                "isolation_type, tenant_id, space_id are all required when pod_id is provided",
             ));
         }
         // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
@@ -1461,16 +1464,18 @@ pub async fn pod_restart(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_RESTART] user_id is required");
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "user_id is required and cannot be empty",
         ));
     }
     if request.project_id.trim().is_empty() {
         error!("[POD_RESTART] project_id is required");
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "project_id is required and cannot be empty",
         ));
     }
 
@@ -1479,9 +1484,10 @@ pub async fn pod_restart(
         && let Err(e) = validate_resource_limits(limits)
     {
         error!("[POD_RESTART] resources update failed: {}", e);
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
             locale,
+            &e,
         ));
     }
 
@@ -1801,9 +1807,10 @@ pub async fn pod_status(
     // 1. 验证参数：至少需要 pod_id、user_id 或 project_id 之一
     if params.pod_id.is_none() && params.user_id.is_none() && params.project_id.is_none() {
         error!("[POD_STATUS] pod_id, user_id and project_id are all empty");
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "at least one of pod_id, user_id or project_id is required",
         ));
     }
 
@@ -1816,9 +1823,10 @@ pub async fn pod_status(
             error!(
                 "[POD_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
             );
-            return Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
+                "isolation_type, tenant_id, space_id are all required when pod_id is provided",
             ));
         }
         // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
@@ -2089,17 +2097,19 @@ pub async fn pod_vnc_status(
         error!(
             "[POD_VNC_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
         );
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "isolation_type, tenant_id, space_id are all required when pod_id is provided",
         ));
     }
 
     if pod_id.is_none() && user_id.is_none() && project_id.is_none() {
         warn!("[POD_VNC_STATUS] pod_id, user_id and project_id are all empty");
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
+            "at least one of pod_id, user_id or project_id is required",
         ));
     }
 

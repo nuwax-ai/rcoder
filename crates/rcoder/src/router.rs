@@ -21,6 +21,7 @@ use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
 use crate::{
+    agent_download::AgentDownloadManager,
     config::{ApiKeyAuthConfig, AppConfig},
     handler,
     storage::ProjectAdapter,
@@ -77,6 +78,8 @@ pub struct AppState {
     pub runtime: Arc<dyn ContainerRuntime>,
     /// RAII 资源回收器接收端（在 start_cleanup_task 中取出并启动 ResourceReaper）
     pub cleanup_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>>>>,
+    /// Agent 下载管理器（统一缓存）
+    pub agent_download_manager: Arc<AgentDownloadManager>,
 }
 
 impl AppState {
@@ -93,6 +96,14 @@ impl AppState {
         // 创建容器创建完成通知通道（缓冲区大小 32，足够应对并发创建）
         let (pod_created_tx, _) = broadcast::channel(32);
 
+        // 初始化 Agent 下载管理器
+        let cache_dir = std::env::var("AGENT_CACHE_DIR")
+            .unwrap_or_else(|_| shared_types::AGENT_CACHE_DIR.to_string());
+        let agent_download_manager = Arc::new(
+            AgentDownloadManager::new(cache_dir)
+                .map_err(|e| anyhow::anyhow!("failed to initialize agent download manager: {}", e))?
+        );
+
         Ok(Self {
             config,
             projects,
@@ -105,6 +116,7 @@ impl AppState {
             container_prefix_computer,
             runtime,
             cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
+            agent_download_manager,
         })
     }
 

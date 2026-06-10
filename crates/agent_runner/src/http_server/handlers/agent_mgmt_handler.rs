@@ -378,15 +378,24 @@ pub async fn uninstall_agent(
     State(state): State<AgentMgmtHttpState>,
     Json(req): Json<shared_types::UninstallAgentRequest>,
 ) -> Response {
-    match uninstaller::uninstall(&state.registry, &req.agent_id).await {
-        Ok(manifest) => {
-            let resp = shared_types::UninstallAgentResponse {
-                uninstalled: true,
-                install_type: manifest.install_type,
-                agent_id: manifest.agent_id,
-            };
-            Json(HttpResult::success(resp)).into_response()
-        }
+    let result = async {
+        let removed = uninstaller::uninstall(&state.registry, &req.agent_id).await?;
+
+        let first = removed.first().ok_or_else(|| {
+            tracing::error!(agent_id = %req.agent_id, "[agent_mgmt] uninstall returned empty list");
+            AgentMgmtError::InstallFailed("uninstall succeeded but no manifests returned".to_string())
+        })?;
+
+        Ok(shared_types::UninstallAgentResponse {
+            uninstalled: true,
+            install_type: first.install_type,
+            agent_id: req.agent_id,
+        })
+    }
+    .await;
+
+    match result {
+        Ok(resp) => Json(HttpResult::success(resp)).into_response(),
         Err(e) => error_to_response(e),
     }
 }

@@ -4,7 +4,7 @@
 //! - 拒绝卸载 builtin agent
 //! - 删除 manifest 指定的入口文件(若存在)
 //! - 删除 agent 自己的子目录(若存在,避免 tar/zip 解压残留)
-//! - 从注册表移除条目
+//! - 从注册表移除条目（所有版本）
 
 use shared_types::InstallType;
 use tracing::{info, warn};
@@ -13,12 +13,12 @@ use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::installer::AgentManifest;
 use crate::agent_mgmt::registry::AgentRegistry;
 
-/// 执行卸载
+/// 执行卸载（删除所有版本）
 ///
 /// 支持两种 binary_path 类型：
 /// - 目录型（directory-based agent）：binary_path 指向 agent 安装目录，直接 `remove_dir_all`
 /// - 文件型（binary agent）：binary_path 指向入口文件，删除文件后清理父目录
-pub async fn uninstall(registry: &AgentRegistry, agent_id: &str) -> AgentMgmtResult<AgentManifest> {
+pub async fn uninstall(registry: &AgentRegistry, agent_id: &str) -> AgentMgmtResult<Vec<AgentManifest>> {
     let manifest = registry
         .get(agent_id)
         .ok_or_else(|| AgentMgmtError::NotFound(agent_id.to_string()))?;
@@ -44,49 +44,24 @@ pub async fn uninstall(registry: &AgentRegistry, agent_id: &str) -> AgentMgmtRes
         )));
     }
 
-    // 1. 根据 binary_path 类型清理
-    if binary_path.is_dir() {
-        // 目录型 agent：直接删除整个 agent 目录
-        if let Err(e) = tokio::fs::remove_dir_all(&binary_path).await {
+    // 1. 删除整个 agent 目录（包含所有版本）
+    let agent_dir = install_dir.join(agent_id);
+    if agent_dir.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(&agent_dir).await {
             warn!(
                 "[agent_mgmt] Failed to remove agent directory during uninstall: path={}, error={}",
-                binary_path.display(),
+                agent_dir.display(),
                 e
             );
         }
-    } else {
-        // 文件型 agent：删除入口二进制/符号链接
-        if (binary_path.exists() || binary_path.symlink_metadata().is_ok())
-            && let Err(e) = tokio::fs::remove_file(&binary_path).await {
-                warn!(
-                    "[agent_mgmt] Failed to remove binary during uninstall: path={}, error={}",
-                    binary_path.display(),
-                    e
-                );
-            }
-
-        // 清理 agent 自己的子目录(若存在,残留的 tar/zip 解压文件)
-        //    取 binary_path 父目录的父目录(避开 bin_dir 公共目录)
-        if let Some(bin_dir) = binary_path.parent()
-            && let Some(agent_dir) = bin_dir.parent() {
-                // 只清理与 agent_id 严格同名(防止误删)
-                let dir_name = agent_dir.file_name().and_then(|n| n.to_str());
-                if dir_name == Some(agent_id) && agent_dir.exists()
-                    && let Err(e) = tokio::fs::remove_dir_all(agent_dir).await {
-                        warn!(
-                            "[agent_mgmt] Failed to remove agent subdir during uninstall: path={}, error={}",
-                            agent_dir.display(),
-                            e
-                        );
-                    }
-            }
     }
 
-    // 2. 从注册表移除
+    // 2. 从注册表移除（所有版本）
     let removed = registry.remove(agent_id)?;
+    let count = removed.len();
     info!(
-        "[agent_mgmt] Uninstalled: agent_id={}, install_type={:?}, binary_path={}",
-        removed.agent_id, removed.install_type, removed.binary_path
+        "[agent_mgmt] Uninstalled: agent_id={}, versions_count={}",
+        agent_id, count
     );
     Ok(removed)
 }
@@ -141,7 +116,8 @@ mod tests {
         let install_dir = r.install_dir().to_path_buf();
         r.insert(sample("user-1", InstallType::Binary, &install_dir)).unwrap();
         let removed = uninstall(&r, "user-1").await.unwrap();
-        assert_eq!(removed.agent_id, "user-1");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].agent_id, "user-1");
         assert!(!r.contains("user-1"));
     }
 

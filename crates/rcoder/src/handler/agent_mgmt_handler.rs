@@ -654,26 +654,100 @@ pub async fn install_from_url(
             "platforms cannot be empty",
         ));
     }
-    // 验证每个 platform entry 的 URL 格式
-    for (key, entry) in &body.platforms {
-        if !entry.url.starts_with("http://") && !entry.url.starts_with("https://") {
-            return Err(AppError::with_message(
-                ec::ERR_VALIDATION,
-                format!("platforms[{key}].url must start with http:// or https://"),
-            ));
-        }
+
+    // 获取平台 URL
+    let sys_info = shared_types::SystemInfo::current();
+    let platform_key = format!("{}-{}", sys_info.os, sys_info.arch);
+    let platform_entry = body.platforms.get(&platform_key).ok_or_else(|| {
+        AppError::with_message(
+            ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
+            format!("platform not found: {}", platform_key),
+        )
+    })?;
+
+    // 验证 URL 格式
+    if !platform_entry.url.starts_with("http://") && !platform_entry.url.starts_with("https://") {
+        return Err(AppError::with_message(
+            ec::ERR_VALIDATION,
+            format!("platforms[{}].url must start with http:// or https://", platform_key),
+        ));
     }
-    let params = InstallAgentParams {
-        agent: body.agent.clone(),
-        install_type: InstallType::Url,
-        source_url: None,
-        npm_package: None,
-        sha256: None,
-        platforms: Some(body.platforms.clone()),
-        force: body.force,
+
+    // 使用策略模式解析安装目录
+    let service_type = project.service_type()
+        .ok_or_else(|| AppError::with_message(
+            ec::ERR_VALIDATION,
+            "service_type is required for agent installation"
+        ))?;
+
+    let strategy = super::agent_install_strategy::create_strategy(&service_type)
+        .ok_or_else(|| AppError::with_message(
+            ec::ERR_VALIDATION,
+            format!("agent installation is not supported for service type: {:?}", service_type),
+        ))?;
+
+    let install_ctx = strategy.resolve_install_context(&project, &body.routing)?;
+
+    // 下载到缓存（rcoder 主动）
+    // version 已在前面通过 require_field 校验为必填
+    let download_manager = &state.agent_download_manager;
+    let version = body.agent.version.as_deref()
+        .expect("version should be validated as required");
+
+    let download_result = download_manager
+        .download_to_cache(
+            &body.agent.agent_id,
+            version,
+            &platform_entry.url,
+        )
+        .await
+        .map_err(|e| {
+            warn!("[agent_mgmt] download to cache failed: {}", e);
+            AppError::with_message(ec::ERR_AGENT_MGMT_INSTALL_FAILED, format!("download failed: {}", e))
+        })?;
+
+    // 复制到策略指定的安装目录
+    download_manager
+        .copy_to_target(
+            &body.agent.agent_id,
+            version,
+            &install_ctx.install_dir,
+        )
+        .await
+        .map_err(|e| {
+            warn!("[agent_mgmt] copy to target failed: {}", e);
+            AppError::with_message(ec::ERR_AGENT_MGMT_INSTALL_FAILED, format!("copy failed: {}", e))
+        })?;
+
+    // 更新 registry
+    crate::agent_download::registry_update::update_registry(
+        &install_ctx.install_dir,
+        &body.agent.agent_id,
+        version,
+        &body.agent.command,
+        &body.agent.args,
+    )
+    .map_err(|e| {
+        warn!("[agent_mgmt] update registry failed: {}", e);
+        AppError::with_message(ec::ERR_AGENT_MGMT_INSTALL_FAILED, format!("registry update failed: {}", e))
+    })?;
+
+    // 返回结果
+    let resp = shared_types::InstallAgentResponse {
+        agent_id: body.agent.agent_id,
+        status: shared_types::AgentInstallStatus::Available,
+        binary_path: body.agent.command,
+        file_type: "binary".to_string(),
+        file_count: None,
+        file_size: download_result.file_size,
+        version: body.agent.version,
+        source_url: Some(platform_entry.url.clone()),
+        action: Some(shared_types::InstallAction::Installed),
+        installed: true,
+        previous_version: None,
+        platform: Some(platform_key),
     };
-    let ctx = build_ctx(&state);
-    let resp = fwd_install(&ctx, &project, params, Bytes::new()).await?;
+
     Ok(Json(HttpResult::success(resp)))
 }
 

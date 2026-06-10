@@ -1,17 +1,20 @@
 //! Agent 注册表 (P0-1)
 //!
-//! 内存中存 `Mutex<HashMap<agent_id, AgentManifest>>`,序列化到 `registry.json`。
+//! 内存中存 `Mutex<HashMap<agent_id, HashMap<version, AgentManifest>>>`,序列化到 `registry.json`。
+//! 支持同一 agent 多个版本并存。
 //! 用 `parking_lot::Mutex` 而非 DashMap:
 //! - 写少读多(list/check 频繁,install/uninstall 偶尔)
 //! - 写时还要同步落盘,Mutex 的"写时锁"语义更直接
 //!
 //! ## 持久化策略
 //! 每次 `insert`/`remove` 立即 `save_to_disk`,启动时 `load_from_disk` 恢复。
+//! 序列化格式保持 `Vec<AgentManifest>`，反序列化时按 (agent_id, version) 分组。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
+use semver::Version;
 use shared_types::InstallType;
 use tracing::{info, warn};
 
@@ -19,9 +22,33 @@ use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::installer::AgentManifest;
 use crate::agent_mgmt::path_manager::PathManager;
 
-/// Agent 注册表(线程安全)
+/// 版本键：空字符串表示无版本（向后兼容）
+fn version_key(version: Option<&str>) -> String {
+    version.unwrap_or("").to_string()
+}
+
+/// 解析版本字符串，支持 "v" 前缀
+///
+/// 返回 None 表示版本格式无效或为空
+fn parse_version(version: Option<&str>) -> Option<Version> {
+    let v = version?.trim();
+    let v = v.strip_prefix('v').or_else(|| v.strip_prefix('V')).unwrap_or(v);
+    Version::parse(v).ok()
+}
+
+/// 比较两个版本
+///
+/// 无效版本视为最低版本 "0.0.0"
+fn compare_versions(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    let a_ver = parse_version(a).unwrap_or(Version::new(0, 0, 0));
+    let b_ver = parse_version(b).unwrap_or(Version::new(0, 0, 0));
+    a_ver.cmp(&b_ver)
+}
+
+/// Agent 注册表(线程安全，支持多版本)
 pub struct AgentRegistry {
-    inner: Mutex<HashMap<String, AgentManifest>>,
+    /// 外层 key: agent_id, 内层 key: version (空字符串表示无版本)
+    inner: Mutex<HashMap<String, HashMap<String, AgentManifest>>>,
     path_manager: PathManager,
 }
 
@@ -48,38 +75,83 @@ impl AgentRegistry {
         }
     }
 
-    /// 列出所有已安装 agent(不含 builtin)
+    /// 列出所有已安装 agent(不含 builtin)，每个 agent_id 返回最新版本
     pub fn list(&self) -> Vec<AgentManifest> {
         let guard = self.inner.lock();
         guard
             .values()
-            .filter(|m| m.install_type != InstallType::Builtin)
-            .cloned()
+            .filter_map(|versions| {
+                // 获取最新版本（排除 builtin）
+                versions
+                    .values()
+                    .filter(|m| m.install_type != InstallType::Builtin)
+                    .max_by(|a, b| compare_versions(a.version.as_deref(), b.version.as_deref()))
+                    .cloned()
+            })
             .collect()
     }
 
-    /// 查询单个 agent
+    /// 查询单个 agent（返回最新版本）
     pub fn get(&self, agent_id: &str) -> Option<AgentManifest> {
-        self.inner.lock().get(agent_id).cloned()
+        let guard = self.inner.lock();
+        let versions = guard.get(agent_id)?;
+        versions
+            .values()
+            .max_by(|a, b| compare_versions(a.version.as_deref(), b.version.as_deref()))
+            .cloned()
     }
 
-    /// 是否已安装
+    /// 查询指定版本的 agent
+    pub fn get_version(&self, agent_id: &str, version: &str) -> Option<AgentManifest> {
+        let guard = self.inner.lock();
+        let versions = guard.get(agent_id)?;
+        let vkey = version_key(Some(version));
+        versions.get(&vkey).cloned()
+    }
+
+    /// 获取 agent 的所有版本
+    pub fn get_all_versions(&self, agent_id: &str) -> Vec<AgentManifest> {
+        let guard = self.inner.lock();
+        match guard.get(agent_id) {
+            Some(versions) => versions.values().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 是否已安装（任何版本）
     pub fn contains(&self, agent_id: &str) -> bool {
-        self.inner.lock().contains_key(agent_id)
+        let guard = self.inner.lock();
+        guard
+            .get(agent_id)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
     }
 
-    /// 插入/更新条目(立即落盘)
+    /// 是否已安装指定版本
+    pub fn contains_version(&self, agent_id: &str, version: &str) -> bool {
+        let guard = self.inner.lock();
+        let vkey = version_key(Some(version));
+        guard
+            .get(agent_id)
+            .map(|versions| versions.contains_key(&vkey))
+            .unwrap_or(false)
+    }
+
+    /// 插入条目(立即落盘)，拒绝重复的精确版本
     #[allow(dead_code)] // used in tests and default_agents registration
     pub fn insert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
         manifest.validate()?;
         let mut guard = self.inner.lock();
-        if guard.contains_key(&manifest.agent_id) {
+        let vkey = version_key(manifest.version.as_deref());
+        let versions = guard.entry(manifest.agent_id.clone()).or_insert_with(HashMap::new);
+        if versions.contains_key(&vkey) {
             return Err(AgentMgmtError::InvalidManifest(format!(
-                "agent already installed: {}",
-                manifest.agent_id
+                "agent version already installed: {}@{}",
+                manifest.agent_id,
+                manifest.version.as_deref().unwrap_or("none")
             )));
         }
-        guard.insert(manifest.agent_id.clone(), manifest);
+        versions.insert(vkey, manifest);
         drop(guard);
         self.save_to_disk()
     }
@@ -88,17 +160,39 @@ impl AgentRegistry {
     pub fn upsert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
         manifest.validate()?;
         let mut guard = self.inner.lock();
-        guard.insert(manifest.agent_id.clone(), manifest);
+        let vkey = version_key(manifest.version.as_deref());
+        let versions = guard.entry(manifest.agent_id.clone()).or_insert_with(HashMap::new);
+        versions.insert(vkey, manifest);
         drop(guard);
         self.save_to_disk()
     }
 
-    /// 删除条目(立即落盘)
-    pub fn remove(&self, agent_id: &str) -> AgentMgmtResult<AgentManifest> {
+    /// 删除 agent 的所有版本(立即落盘)
+    pub fn remove(&self, agent_id: &str) -> AgentMgmtResult<Vec<AgentManifest>> {
         let mut guard = self.inner.lock();
         let removed = guard
             .remove(agent_id)
             .ok_or_else(|| AgentMgmtError::NotFound(agent_id.to_string()))?;
+        let removed_vec: Vec<AgentManifest> = removed.into_values().collect();
+        drop(guard);
+        self.save_to_disk()?;
+        Ok(removed_vec)
+    }
+
+    /// 删除指定版本(立即落盘)
+    pub fn remove_version(&self, agent_id: &str, version: &str) -> AgentMgmtResult<AgentManifest> {
+        let mut guard = self.inner.lock();
+        let vkey = version_key(Some(version));
+        let versions = guard
+            .get_mut(agent_id)
+            .ok_or_else(|| AgentMgmtError::NotFound(agent_id.to_string()))?;
+        let removed = versions
+            .remove(&vkey)
+            .ok_or_else(|| AgentMgmtError::NotFound(format!("{}@{}", agent_id, version)))?;
+        // 如果 agent 没有任何版本了，清理空条目
+        if versions.is_empty() {
+            guard.remove(agent_id);
+        }
         drop(guard);
         self.save_to_disk()?;
         Ok(removed)
@@ -106,14 +200,15 @@ impl AgentRegistry {
 
     /// builtin agent 数量
     pub fn builtin_count(&self) -> usize {
-        self.inner
-            .lock()
+        let guard = self.inner.lock();
+        guard
             .values()
+            .flat_map(|versions| versions.values())
             .filter(|m| m.install_type == InstallType::Builtin)
             .count()
     }
 
-    /// 总数
+    /// 总数（unique agent_id 数量）
     pub fn total(&self) -> usize {
         self.inner.lock().len()
     }
@@ -125,8 +220,20 @@ impl AgentRegistry {
     fn save_to_disk(&self) -> AgentMgmtResult<()> {
         let snapshot: Vec<AgentManifest> = {
             let guard = self.inner.lock();
-            let mut v: Vec<AgentManifest> = guard.values().cloned().collect();
-            v.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+            let mut v: Vec<AgentManifest> = guard
+                .values()
+                .flat_map(|versions| versions.values().cloned())
+                .collect();
+            v.sort_by(|a, b| {
+                a.agent_id
+                    .cmp(&b.agent_id)
+                    .then_with(|| {
+                        a.version
+                            .as_deref()
+                            .unwrap_or("")
+                            .cmp(&b.version.as_deref().unwrap_or(""))
+                    })
+            });
             v
         };
         let json = serde_json::to_string_pretty(&snapshot)?;
@@ -146,7 +253,8 @@ impl AgentRegistry {
         Ok(())
     }
 
-    fn read_from_disk(path: &std::path::Path) -> AgentMgmtResult<HashMap<String, AgentManifest>> {
+    /// 从磁盘读取，按 (agent_id, version) 分组
+    fn read_from_disk(path: &std::path::Path) -> AgentMgmtResult<HashMap<String, HashMap<String, AgentManifest>>> {
         if !path.exists() {
             return Ok(HashMap::new());
         }
@@ -165,35 +273,14 @@ impl AgentRegistry {
                 return Ok(HashMap::new());
             }
         };
-        Ok(manifests
-            .into_iter()
-            .map(|m| (m.agent_id.clone(), m))
-            .collect())
-    }
-}
-
-/// 语义化版本比较(major.minor.patch)
-///
-/// 格式不规范时返回 `Ordering::Less`(保守策略:触发更新)。
-/// 支持 "v1.2.3" 前缀,自动剥离。
-pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let parse = |s: &str| -> (u64, u64, u64) {
-        let s = s.trim().trim_start_matches('v').trim_start_matches('V');
-        let parts: Vec<&str> = s.split('.').collect();
-        let major = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-        let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
-        (major, minor, patch)
-    };
-    let (a_major, a_minor, a_patch) = parse(a);
-    let (b_major, b_minor, b_patch) = parse(b);
-    match a_major.cmp(&b_major) {
-        Ordering::Equal => match a_minor.cmp(&b_minor) {
-            Ordering::Equal => a_patch.cmp(&b_patch),
-            other => other,
-        },
-        other => other,
+        let mut map: HashMap<String, HashMap<String, AgentManifest>> = HashMap::new();
+        for m in manifests {
+            let vkey = version_key(m.version.as_deref());
+            map.entry(m.agent_id.clone())
+                .or_insert_with(HashMap::new)
+                .insert(vkey, m);
+        }
+        Ok(map)
     }
 }
 
@@ -242,6 +329,12 @@ mod tests {
         m
     }
 
+    fn sample_manifest_with_version(id: &str, version: &str) -> AgentManifest {
+        let mut m = sample_manifest(id);
+        m.version = Some(version.to_string());
+        m
+    }
+
     #[test]
     fn insert_list_get_remove() {
         let pm = temp_pm();
@@ -259,16 +352,103 @@ mod tests {
         assert!(!r.contains("ghost"));
 
         let removed = r.remove("kimi-cli").unwrap();
-        assert_eq!(removed.agent_id, "kimi-cli");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].agent_id, "kimi-cli");
         assert_eq!(r.total(), 1);
     }
 
     #[test]
-    fn insert_rejects_duplicate() {
+    fn insert_rejects_duplicate_exact_version() {
         let r = AgentRegistry::empty(temp_pm());
-        r.insert(sample_manifest("codex-acp")).unwrap();
-        let err = r.insert(sample_manifest("codex-acp")).unwrap_err();
+        r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .unwrap();
+        let err = r
+            .insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .unwrap_err();
         assert!(matches!(err, AgentMgmtError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn insert_allows_different_versions() {
+        let r = AgentRegistry::empty(temp_pm());
+        r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .unwrap();
+        r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .unwrap();
+        assert_eq!(r.total(), 1); // 同一个 agent_id
+        assert_eq!(r.get_all_versions("codex-acp").len(), 2);
+    }
+
+    #[test]
+    fn get_returns_latest_version() {
+        let r = AgentRegistry::empty(temp_pm());
+        r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .unwrap();
+        r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .unwrap();
+        r.insert(sample_manifest_with_version("codex-acp", "1.5.0"))
+            .unwrap();
+
+        let latest = r.get("codex-acp").unwrap();
+        assert_eq!(latest.version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn get_version_returns_specific() {
+        let r = AgentRegistry::empty(temp_pm());
+        r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .unwrap();
+        r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .unwrap();
+
+        let v1 = r.get_version("codex-acp", "1.0.0").unwrap();
+        assert_eq!(v1.version.as_deref(), Some("1.0.0"));
+
+        let v2 = r.get_version("codex-acp", "2.0.0").unwrap();
+        assert_eq!(v2.version.as_deref(), Some("2.0.0"));
+
+        assert!(r.get_version("codex-acp", "3.0.0").is_none());
+    }
+
+    #[test]
+    fn contains_version_checks_specific() {
+        let r = AgentRegistry::empty(temp_pm());
+        r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .unwrap();
+
+        assert!(r.contains("codex-acp"));
+        assert!(r.contains_version("codex-acp", "1.0.0"));
+        assert!(!r.contains_version("codex-acp", "2.0.0"));
+        assert!(!r.contains("ghost"));
+    }
+
+    #[test]
+    fn remove_version_removes_specific() {
+        let r = AgentRegistry::empty(temp_pm());
+        r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .unwrap();
+        r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .unwrap();
+
+        let removed = r.remove_version("codex-acp", "1.0.0").unwrap();
+        assert_eq!(removed.version.as_deref(), Some("1.0.0"));
+        assert_eq!(r.total(), 1);
+        assert!(r.contains_version("codex-acp", "2.0.0"));
+        assert!(!r.contains_version("codex-acp", "1.0.0"));
+    }
+
+    #[test]
+    fn remove_removes_all_versions() {
+        let r = AgentRegistry::empty(temp_pm());
+        r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .unwrap();
+        r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .unwrap();
+
+        let removed = r.remove("codex-acp").unwrap();
+        assert_eq!(removed.len(), 2);
+        assert_eq!(r.total(), 0);
+        assert!(!r.contains("codex-acp"));
     }
 
     #[test]
@@ -281,8 +461,8 @@ mod tests {
     #[test]
     fn upsert_overwrites() {
         let r = AgentRegistry::empty(temp_pm());
-        r.upsert(sample_manifest("a")).unwrap();
-        r.upsert(sample_manifest("a")).unwrap();
+        r.upsert(sample_manifest_with_version("a", "1.0.0")).unwrap();
+        r.upsert(sample_manifest_with_version("a", "1.0.0")).unwrap();
         assert_eq!(r.total(), 1);
     }
 
@@ -299,22 +479,28 @@ mod tests {
     fn load_persists_and_reloads() {
         let pm = temp_pm();
         let r1 = AgentRegistry::empty(pm.clone());
-        r1.insert(sample_manifest("alpha")).unwrap();
-        r1.insert(sample_manifest("beta")).unwrap();
+        r1.insert(sample_manifest_with_version("alpha", "1.0.0"))
+            .unwrap();
+        r1.insert(sample_manifest_with_version("alpha", "2.0.0"))
+            .unwrap();
+        r1.insert(sample_manifest_with_version("beta", "1.0.0"))
+            .unwrap();
 
         // 重新加载
         let r2 = AgentRegistry::load(pm).unwrap();
         assert_eq!(r2.total(), 2);
         assert!(r2.contains("alpha"));
         assert!(r2.contains("beta"));
+        assert_eq!(r2.get_all_versions("alpha").len(), 2);
     }
 
     #[test]
     fn list_filters_builtin() {
         let pm = temp_pm();
         let r = AgentRegistry::empty(pm);
-        r.insert(sample_manifest("user-1")).unwrap();
-        let mut builtin = sample_manifest("builtin-1");
+        r.insert(sample_manifest_with_version("user-1", "1.0.0"))
+            .unwrap();
+        let mut builtin = sample_manifest_with_version("builtin-1", "1.0.0");
         builtin.install_type = InstallType::Builtin;
         r.insert(builtin).unwrap();
 
@@ -326,26 +512,35 @@ mod tests {
     #[test]
     fn compare_versions_basic() {
         use std::cmp::Ordering;
-        assert_eq!(compare_versions("1.0.0", "1.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("1.0.0", "1.0.1"), Ordering::Less);
-        assert_eq!(compare_versions("1.0.1", "1.0.0"), Ordering::Greater);
-        assert_eq!(compare_versions("1.0.0", "2.0.0"), Ordering::Less);
-        assert_eq!(compare_versions("1.2.3", "1.2.4"), Ordering::Less);
+        assert_eq!(compare_versions(Some("1.0.0"), Some("1.0.0")), Ordering::Equal);
+        assert_eq!(compare_versions(Some("1.0.0"), Some("1.0.1")), Ordering::Less);
+        assert_eq!(compare_versions(Some("1.0.1"), Some("1.0.0")), Ordering::Greater);
+        assert_eq!(compare_versions(Some("1.0.0"), Some("2.0.0")), Ordering::Less);
+        assert_eq!(compare_versions(Some("1.2.3"), Some("1.2.4")), Ordering::Less);
     }
 
     #[test]
     fn compare_versions_with_v_prefix() {
         use std::cmp::Ordering;
-        assert_eq!(compare_versions("v1.0.0", "1.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("V2.0.0", "1.9.9"), Ordering::Greater);
+        assert_eq!(compare_versions(Some("v1.0.0"), Some("1.0.0")), Ordering::Equal);
+        assert_eq!(compare_versions(Some("V2.0.0"), Some("1.9.9")), Ordering::Greater);
     }
 
     #[test]
-    fn compare_versions_malformed_defaults_to_less() {
+    fn compare_versions_malformed_defaults_to_zero() {
         use std::cmp::Ordering;
-        // 格式不规范时,缺失的 patch 默认为 0
-        assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("1.0", "1.0.1"), Ordering::Less);
+        // 格式不规范时，视为 0.0.0
+        assert_eq!(compare_versions(Some("invalid"), Some("0.0.0")), Ordering::Equal);
+        assert_eq!(compare_versions(Some("invalid"), Some("1.0.0")), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_versions_none() {
+        use std::cmp::Ordering;
+        // None 视为 0.0.0
+        assert_eq!(compare_versions(None, Some("0.0.0")), Ordering::Equal);
+        assert_eq!(compare_versions(None, Some("1.0.0")), Ordering::Less);
+        assert_eq!(compare_versions(Some("1.0.0"), None), Ordering::Greater);
     }
 
     #[test]

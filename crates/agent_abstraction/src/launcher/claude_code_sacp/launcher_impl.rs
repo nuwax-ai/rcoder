@@ -74,12 +74,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
         permission_handler: Arc<dyn PermissionRequestHandler>,
     ) -> Self {
-        Self::with_diagnostics_listener(
-            notifier,
-            model_env_resolver,
-            permission_handler,
-            None,
-        )
+        Self::with_diagnostics_listener(notifier, model_env_resolver, permission_handler, None)
     }
 
     /// 注入诊断监听器
@@ -283,15 +278,15 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         );
         merged_envs.insert(ENV_AGENT_PROJECT_ID.to_string(), project_id.clone());
 
-        // 🆕 当 agent_mode=ask 时，设置子进程的权限模式
-        // nuwaxcode: 通过 OPENCODE_PERMISSION 环境变量覆盖危险工具为 "ask"
+        // 设置子进程的权限模式（ask 和 yolo 模式均生效）
+        // nuwaxcode: 通过 OPENCODE_PERMISSION 环境变量控制工具权限，由 permission_manager 根据 tool_approval_rules 做最终决策
         // claude-code-acp-ts: 通过 ACP SetSessionModeRequest 设置 "default" 模式（在 connection.rs 中处理）
-        if start_config.agent_mode == shared_types::AgentMode::Ask {
-            let cmd_lower = command_path.to_lowercase();
-            if cmd_lower.contains("nuwaxcode") || cmd_lower.contains("opencode") {
-                // nuwaxcode 使用 OPENCODE_PERMISSION 环境变量控制具体工具权限
-                // 覆盖危险工具（bash、edit）为 "ask"，触发 RequestPermissionRequest
-                // question 设为 "deny"，使用自定义 MCP 实现
+        let cmd_lower = command_path.to_lowercase();
+        if cmd_lower.contains("nuwaxcode") || cmd_lower.contains("opencode") {
+            // nuwaxcode 使用 OPENCODE_PERMISSION 环境变量控制具体工具权限
+            // 请求中传入的值优先，未传时使用默认值（全部 ask）
+            // permission_manager 会根据 tool_approval_rules 和 agent_mode 做最终决策
+            if !merged_envs.contains_key(ENV_OPENCODE_PERMISSION) {
                 let permission_config = serde_json::json!({
                     "bash": "ask",
                     "edit": "ask",
@@ -302,8 +297,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     permission_config.to_string(),
                 );
                 info!(
-                    "[SACP] 🔒 Agent mode=ask, setting OPENCODE_PERMISSION for nuwaxcode: {}",
-                    permission_config
+                    "[SACP] 🔒 Setting default OPENCODE_PERMISSION for nuwaxcode (agent_mode={:?}): {}",
+                    start_config.agent_mode, permission_config
+                );
+            } else {
+                info!(
+                    "[SACP] 🔒 Using request-provided OPENCODE_PERMISSION: {}",
+                    merged_envs.get(ENV_OPENCODE_PERMISSION).unwrap()
                 );
             }
         }
@@ -392,11 +392,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 启动子进程（使用进程组/Job Object 来管理整个进程树）
         // Unix: ProcessGroup::leader() 创建进程组，确保能够清理所有孙进程
         // Windows: JobObject 管理进程树
-        let full_command_line = format!(
-            "{} {}",
-            command_path,
-            command_args.join(" ")
-        );
+        let full_command_line = format!("{} {}", command_path, command_args.join(" "));
         info!(
             "[SACP] 🚀 Spawning subprocess: cmd=[{}], cwd={}",
             full_command_line,
@@ -729,8 +725,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // stderr 任务已在子进程启动后立即创建（stderr_task_handle），无需重复创建
 
         // 创建生命周期守卫（带异常退出标志 + 诊断监听器）
-        let lifecycle_guard = AgentLifecycleGuard::new_claude_full(
-            crate::launcher::lifecycle::ClaudeProcessParams {
+        let lifecycle_guard =
+            AgentLifecycleGuard::new_claude_full(crate::launcher::lifecycle::ClaudeProcessParams {
                 project_id: project_id.clone(),
                 session_id: session_id.clone(),
                 child_process: child,
@@ -744,8 +740,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 process_command: command_path,
                 process_args: command_args,
                 working_dir: project_path,
-            },
-        );
+            });
 
         Ok(SacpLauncherConnectionInfo {
             session_id,

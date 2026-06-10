@@ -21,7 +21,7 @@ use shared_types_grpc::{
     StaticCheckResult, UninstallAgentRequest, UninstallAgentResponse,
 };
 use tonic::{Request, Response, Status};
-use tracing::{instrument, warn};
+use tracing::{error, instrument, warn};
 
 use super::error::AgentMgmtResult;
 
@@ -256,17 +256,23 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
         request: Request<UninstallAgentRequest>,
     ) -> Result<Response<UninstallAgentResponse>, Status> {
         let agent_id = request.into_inner().agent_id;
-        match uninstaller::uninstall(&self.registry, &agent_id).await {
-            Ok(manifest) => Ok(Response::new(UninstallAgentResponse {
-                uninstalled: true,
-                install_type: conversion::install_type_to_proto(manifest.install_type) as i32,
-                agent_id: manifest.agent_id,
-            })),
-            Err(e) => {
+        let removed = uninstaller::uninstall(&self.registry, &agent_id)
+            .await
+            .map_err(|e| {
                 warn!("[agent_mgmt] uninstall_agent failed: {e}");
-                Err(Self::to_status(e))
-            }
-        }
+                Self::to_status(e)
+            })?;
+
+        let first = removed.first().ok_or_else(|| {
+            error!(agent_id = %agent_id, "[agent_mgmt] uninstall returned empty list");
+            Status::internal("uninstall succeeded but no manifests returned")
+        })?;
+
+        Ok(Response::new(UninstallAgentResponse {
+            uninstalled: true,
+            install_type: conversion::install_type_to_proto(first.install_type) as i32,
+            agent_id,
+        }))
     }
 
     #[instrument(skip(self, request))]

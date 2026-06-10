@@ -12,6 +12,7 @@ default-members = [
     "crates/container-runtime-api",
     "crates/rcoder-cli",
     "crates/rcoder-gateway",
+    "crates/download_utils",
 ]
 
 

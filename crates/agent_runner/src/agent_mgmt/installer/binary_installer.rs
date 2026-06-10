@@ -287,21 +287,30 @@ pub async fn install_from_bytes(
 
     // 3. 写入 staging 文件
     path_manager.ensure_dirs().await?;
-    if let Ok(agent_dir) = path_manager.agent_dir(agent_id)
-        && agent_dir.exists() {
-            tokio::fs::remove_dir_all(&agent_dir).await.ok();
-        }
-    let agent_dir = path_manager
-        .agent_dir(agent_id)
-        .map_err(AgentMgmtError::InvalidManifest)?;
-    tokio::fs::create_dir_all(&agent_dir).await?;
+
+    // 使用版本目录（如果提供了版本号）
+    let version_dir = if let Some(version) = param_version {
+        path_manager
+            .agent_version_dir(agent_id, version)
+            .map_err(AgentMgmtError::InvalidManifest)?
+    } else {
+        path_manager
+            .agent_dir(agent_id)
+            .map_err(AgentMgmtError::InvalidManifest)?
+    };
+
+    // 只删除特定版本目录，不影响其他版本
+    if version_dir.exists() {
+        tokio::fs::remove_dir_all(&version_dir).await.ok();
+    }
+    tokio::fs::create_dir_all(&version_dir).await?;
 
     let staging_ext = match file_type.as_str() {
         "tar.gz" => "tar.gz",
         "zip" => "zip",
         other => unreachable!("file_type already validated, got: {other}"),
     };
-    let staging = agent_dir.join(format!("staging.{staging_ext}"));
+    let staging = version_dir.join(format!("staging.{staging_ext}"));
     tokio::fs::write(&staging, &bytes).await?;
     let file_size = bytes.len() as u64;
 
@@ -309,7 +318,7 @@ pub async fn install_from_bytes(
     _install_from_staging(
         registry,
         &staging,
-        &agent_dir,
+        &version_dir,
         StagingInstallParams {
             agent_id,
             command,
@@ -379,24 +388,32 @@ pub async fn install_from_file(
     path_manager.ensure_dirs().await?;
     debug!("[agent_mgmt] install_from_file: ensure_dirs took {:?}", t0.elapsed());
 
+    // 使用版本目录（如果提供了版本号）
     let t1 = std::time::Instant::now();
-    if let Ok(agent_dir) = path_manager.agent_dir(agent_id)
-        && agent_dir.exists() {
-            debug!("[agent_mgmt] install_from_file: removing existing agent_dir");
-            tokio::fs::remove_dir_all(&agent_dir).await.ok();
-            info!("[agent_mgmt] install_from_file: remove_dir_all took {:?}", t1.elapsed());
-        }
-    let agent_dir = path_manager
-        .agent_dir(agent_id)
-        .map_err(AgentMgmtError::InvalidManifest)?;
-    tokio::fs::create_dir_all(&agent_dir).await?;
+    let version_dir = if let Some(version) = param_version {
+        path_manager
+            .agent_version_dir(agent_id, version)
+            .map_err(AgentMgmtError::InvalidManifest)?
+    } else {
+        path_manager
+            .agent_dir(agent_id)
+            .map_err(AgentMgmtError::InvalidManifest)?
+    };
+
+    // 只删除特定版本目录，不影响其他版本
+    if version_dir.exists() {
+        debug!("[agent_mgmt] install_from_file: removing existing version_dir");
+        tokio::fs::remove_dir_all(&version_dir).await.ok();
+        info!("[agent_mgmt] install_from_file: remove_dir_all took {:?}", t1.elapsed());
+    }
+    tokio::fs::create_dir_all(&version_dir).await?;
 
     let staging_ext = match file_type.as_str() {
         "tar.gz" => "tar.gz",
         "zip" => "zip",
         other => unreachable!("file_type already validated, got: {other}"),
     };
-    let staging = agent_dir.join(format!("staging.{staging_ext}"));
+    let staging = version_dir.join(format!("staging.{staging_ext}"));
     // rename（同文件系统零拷贝）或 copy（跨文件系统降级）
     let t2 = std::time::Instant::now();
     if tokio::fs::rename(download_path, &staging).await.is_err() {
@@ -410,7 +427,7 @@ pub async fn install_from_file(
     _install_from_staging(
         registry,
         &staging,
-        &agent_dir,
+        &version_dir,
         StagingInstallParams {
             agent_id,
             command,

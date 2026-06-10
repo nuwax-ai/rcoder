@@ -2,6 +2,7 @@
 //!
 //! 提供 ACP 协议集成和 AI 代理管理功能
 
+pub mod agent_download;
 pub mod cleanup_task;
 mod config;
 pub mod grpc;

@@ -5,14 +5,18 @@
 //! {install_dir}/
 //! ├── registry.json               # 已安装 agent 注册表(持久化)
 //! ├── claude-code-acp/            # builtin agent 目录(只读,不可卸载)
-//! │   └── ...
+//! │   └── 1.0.0/                  # 版本目录
+//! │       └── ...
 //! ├── codex-acp/                  # 二进制型 agent
-//! │   ├── codex-acp               # 入口可执行文件 (binary_path)
-//! │   └── ...
+//! │   ├── 1.0.0/
+//! │   │   └── codex-acp           # 入口可执行文件 (binary_path)
+//! │   └── 2.0.0/
+//! │       └── codex-acp
 //! └── deepagents-app-agent/       # 目录型 agent (Node.js / Bun / Python)
-//!     ├── dist/index.js            # 入口脚本 (bin.start)
-//!     ├── node_modules/
-//!     └── agent-package.json
+//!     └── 1.0.0/
+//!         ├── dist/index.js        # 入口脚本 (bin.start)
+//!         ├── node_modules/
+//!         └── agent-package.json
 //! ```
 //!
 //! ## PATH 策略
@@ -75,6 +79,16 @@ impl PathManager {
         Ok(self.install_dir.join(agent_id))
     }
 
+    /// 单个 agent 的版本隔离目录
+    ///
+    /// 返回 `{install_dir}/{agent_id}/{version}`，支持多版本并存。
+    /// **注意**:若 `agent_id` 或 `version` 非法,返回 `Err(String)`。
+    pub fn agent_version_dir(&self, agent_id: &str, version: &str) -> Result<PathBuf, String> {
+        validate_agent_id(agent_id)?;
+        validate_version(version)?;
+        Ok(self.install_dir.join(agent_id).join(version))
+    }
+
     /// 确保 bin 目录存在(惰性创建)
     pub async fn ensure_dirs(&self) -> Result<(), std::io::Error> {
         tokio::fs::create_dir_all(&self.install_dir).await?;
@@ -97,6 +111,24 @@ pub fn validate_agent_id(agent_id: &str) -> Result<(), String> {
     }
     if agent_id.starts_with('.') || agent_id.contains("..") {
         return Err("agent_id may not start with '.' or contain '..'".to_string());
+    }
+    Ok(())
+}
+
+/// 校验 version 合法性(防路径遍历)
+/// 仅允许 ASCII 字母/数字/`-`/`_`/`.`,长度 1-64
+pub fn validate_version(version: &str) -> Result<(), String> {
+    if version.is_empty() || version.len() > 64 {
+        return Err("version length must be 1-64".to_string());
+    }
+    if !version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err("version may only contain [A-Za-z0-9._-]".to_string());
+    }
+    if version.starts_with('.') || version.contains("..") {
+        return Err("version may not start with '.' or contain '..'".to_string());
     }
     Ok(())
 }
@@ -220,5 +252,59 @@ mod tests {
             pm.agent_dir("codex-acp").unwrap(),
             PathBuf::from("/tmp/test-acp/codex-acp")
         );
+    }
+
+    #[test]
+    fn validates_safe_versions() {
+        assert!(validate_version("1.0.0").is_ok());
+        assert!(validate_version("v1.0.0").is_ok());
+        assert!(validate_version("1.0.0-beta").is_ok());
+        assert!(validate_version("1.0.0-rc.1").is_ok());
+        assert!(validate_version("latest").is_ok());
+        assert!(validate_version("a").is_ok());
+    }
+
+    #[test]
+    fn rejects_path_traversal_versions() {
+        assert!(validate_version("../etc").is_err());
+        assert!(validate_version("foo/bar").is_err());
+        assert!(validate_version("foo\\bar").is_err());
+        assert!(validate_version("..").is_err());
+        assert!(validate_version(".hidden").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_versions() {
+        assert!(validate_version("").is_err());
+        let long: String = "a".repeat(65);
+        assert!(validate_version(&long).is_err());
+    }
+
+    #[test]
+    fn rejects_non_ascii_versions() {
+        assert!(validate_version("中文版本").is_err());
+        assert!(validate_version("1.0.0🚀").is_err());
+    }
+
+    #[test]
+    fn agent_version_dir_uses_version_subdirectory() {
+        let pm = PathManager::new_with_root(PathBuf::from("/tmp/test-acp"));
+        assert_eq!(
+            pm.agent_version_dir("codex-acp", "1.0.0").unwrap(),
+            PathBuf::from("/tmp/test-acp/codex-acp/1.0.0")
+        );
+        assert_eq!(
+            pm.agent_version_dir("codex-acp", "2.0.0-beta").unwrap(),
+            PathBuf::from("/tmp/test-acp/codex-acp/2.0.0-beta")
+        );
+    }
+
+    #[test]
+    fn agent_version_dir_rejects_invalid_inputs() {
+        let pm = PathManager::new_with_root(PathBuf::from("/tmp/test-acp"));
+        assert!(pm.agent_version_dir("../evil", "1.0.0").is_err());
+        assert!(pm.agent_version_dir("codex-acp", "../evil").is_err());
+        assert!(pm.agent_version_dir("", "1.0.0").is_err());
+        assert!(pm.agent_version_dir("codex-acp", "").is_err());
     }
 }

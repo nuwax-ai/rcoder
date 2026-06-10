@@ -257,10 +257,12 @@ impl ComputerContainerManager {
         let params = params_builder.build();
 
         let container_info = runtime.create_container(params).await.map_err(|e| {
-            error!("[COMPUTER_CONTAINER] Failed to start container: {}", e);
+            let error_msg = e.to_string();
+            error!("[COMPUTER_CONTAINER] Failed to start container: {}", error_msg);
+
             AppError::with_message(
                 ERR_CONTAINER_ERROR,
-                format!("Failed to start container: {}", e),
+                format!("Failed to start container: {}", error_msg),
             )
         })?;
 

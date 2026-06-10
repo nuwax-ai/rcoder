@@ -93,7 +93,10 @@ impl axum::response::IntoResponse for AppError {
             );
         }
 
-        let response = if let Some(key) = i18n_key {
+        // 优先使用 internal_message 作为具体错误信息返回给客户端
+        let response = if let Some(ref msg) = internal_message {
+            crate::HttpResult::<String>::error_with_message(&code, locale, msg)
+        } else if let Some(key) = i18n_key {
             crate::HttpResult::<String>::error_with_message(
                 &code,
                 locale,

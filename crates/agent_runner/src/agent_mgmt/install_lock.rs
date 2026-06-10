@@ -1,6 +1,7 @@
-//! Per-agent-id 安装并发控制
+//! Per-agent-version 安装并发控制
 //!
-//! 防止同一 agent 的重复安装，支持强制重装（取消正在进行的安装）。
+//! 防止同一 agent 同一版本的重复安装，支持强制重装（取消正在进行的安装）。
+//! 允许同一 agent 的不同版本并发安装。
 
 use std::sync::Arc;
 
@@ -70,6 +71,8 @@ impl InstallState {
 ///
 /// 持有 `Arc<InstallLockManager>` 在 `AgentMgmtHttpState` 中，
 /// 所有 install 端点共享同一实例。
+///
+/// 锁键为 `"{agent_id}:{version}"`，允许同一 agent 的不同版本并发安装。
 pub struct InstallLockManager {
     states: DashMap<String, Arc<InstallState>>,
 }
@@ -81,10 +84,16 @@ impl InstallLockManager {
         }
     }
 
-    /// 获取指定 agent 的安装状态（不存在则创建）
-    pub fn get_or_create(&self, agent_id: &str) -> Arc<InstallState> {
+    /// 构造锁键："{agent_id}:{version}"
+    fn lock_key(agent_id: &str, version: &str) -> String {
+        format!("{}:{}", agent_id, version)
+    }
+
+    /// 获取指定 agent 版本的安装状态（不存在则创建）
+    pub fn get_or_create(&self, agent_id: &str, version: &str) -> Arc<InstallState> {
+        let key = Self::lock_key(agent_id, version);
         self.states
-            .entry(agent_id.to_string())
+            .entry(key)
             .or_insert_with(|| {
                 Arc::new(InstallState {
                     lock: Mutex::new(()),
@@ -95,11 +104,12 @@ impl InstallLockManager {
             .clone()
     }
 
-    /// 检查指定 agent 是否正在安装（仅供测试使用）
+    /// 检查指定 agent 版本是否正在安装（仅供测试使用）
     #[cfg(test)]
-    pub fn is_installing(&self, agent_id: &str) -> Option<String> {
+    pub fn is_installing(&self, agent_id: &str, version: &str) -> Option<String> {
+        let key = Self::lock_key(agent_id, version);
         self.states
-            .get(agent_id)
+            .get(&key)
             .and_then(|s| s.installing_version())
     }
 }
@@ -117,57 +127,65 @@ mod tests {
     #[test]
     fn new_manager_has_no_installing() {
         let mgr = InstallLockManager::new();
-        assert!(mgr.is_installing("agent-x").is_none());
+        assert!(mgr.is_installing("agent-x", "1.0.0").is_none());
     }
 
     #[test]
     fn get_or_create_returns_same_state() {
         let mgr = InstallLockManager::new();
-        let s1 = mgr.get_or_create("agent-x");
-        let s2 = mgr.get_or_create("agent-x");
+        let s1 = mgr.get_or_create("agent-x", "1.0.0");
+        let s2 = mgr.get_or_create("agent-x", "1.0.0");
         assert!(Arc::ptr_eq(&s1, &s2));
+    }
+
+    #[test]
+    fn different_versions_get_different_states() {
+        let mgr = InstallLockManager::new();
+        let s1 = mgr.get_or_create("agent-x", "1.0.0");
+        let s2 = mgr.get_or_create("agent-x", "2.0.0");
+        assert!(!Arc::ptr_eq(&s1, &s2));
     }
 
     #[test]
     fn different_agents_get_different_states() {
         let mgr = InstallLockManager::new();
-        let s1 = mgr.get_or_create("agent-a");
-        let s2 = mgr.get_or_create("agent-b");
+        let s1 = mgr.get_or_create("agent-a", "1.0.0");
+        let s2 = mgr.get_or_create("agent-b", "1.0.0");
         assert!(!Arc::ptr_eq(&s1, &s2));
     }
 
     #[test]
     fn set_and_clear_installing() {
         let mgr = InstallLockManager::new();
-        let state = mgr.get_or_create("agent-x");
+        let state = mgr.get_or_create("agent-x", "1.0.0");
 
         state.set_installing("1.0.0");
-        assert_eq!(mgr.is_installing("agent-x"), Some("1.0.0".to_string()));
+        assert_eq!(mgr.is_installing("agent-x", "1.0.0"), Some("1.0.0".to_string()));
 
         state.clear_installing();
-        assert!(mgr.is_installing("agent-x").is_none());
+        assert!(mgr.is_installing("agent-x", "1.0.0").is_none());
     }
 
     #[tokio::test]
     async fn try_lock_succeeds_when_free() {
         let mgr = InstallLockManager::new();
-        let state = mgr.get_or_create("agent-x");
+        let state = mgr.get_or_create("agent-x", "1.0.0");
         assert!(state.try_lock().is_some());
     }
 
     #[tokio::test]
     async fn try_lock_fails_when_held() {
         let mgr = InstallLockManager::new();
-        let state = mgr.get_or_create("agent-x");
+        let state = mgr.get_or_create("agent-x", "1.0.0");
         let _guard = state.try_lock().unwrap();
         assert!(state.try_lock().is_none());
     }
 
     #[tokio::test]
-    async fn cancel_does_not_affect_other_agents() {
+    async fn cancel_does_not_affect_other_versions() {
         let mgr = InstallLockManager::new();
-        let s1 = mgr.get_or_create("agent-a");
-        let s2 = mgr.get_or_create("agent-b");
+        let s1 = mgr.get_or_create("agent-x", "1.0.0");
+        let s2 = mgr.get_or_create("agent-x", "2.0.0");
 
         // s2 的初始 token 不受影响
         let token_before = s2.cancel_token_snapshot();
