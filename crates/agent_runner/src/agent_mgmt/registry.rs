@@ -227,12 +227,7 @@ impl AgentRegistry {
             v.sort_by(|a, b| {
                 a.agent_id
                     .cmp(&b.agent_id)
-                    .then_with(|| {
-                        a.version
-                            .as_deref()
-                            .unwrap_or("")
-                            .cmp(&b.version.as_deref().unwrap_or(""))
-                    })
+                    .then_with(|| compare_versions(a.version.as_deref(), b.version.as_deref()))
             });
             v
         };

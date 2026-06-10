@@ -79,6 +79,7 @@ impl AgentInstallStrategy for ComputerAgentRunnerStrategy {
         // ComputerAgentRunner 需要 user_id 或 pod_id
         let user_id = project
             .user_id()
+            .or(project.pod_id())
             .or(routing.user_id.as_deref())
             .or(routing.pod_id.as_deref())
             .ok_or_else(|| {
