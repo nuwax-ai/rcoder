@@ -27,6 +27,15 @@ use super::types::{IdleContainerInfo, StorageStats};
 ///
 /// 纯内存存储，使用 DashMap 分片实现高并发。
 /// 容器引用计数归零时通过 channel 触发异步物理销毁（RAII）。
+///
+/// ## 反向索引
+///
+/// 为避免全量遍历，维护 3 个反向索引：
+/// - `container_id_to_key`: container_id → container_key（O(1) 按容器 ID 查找）
+/// - `user_id_to_project_id`: user_id → project_id（O(1) 按用户 ID 查找）
+/// - `pod_id_to_project_id`: pod_id → project_id（O(1) 按 pod ID 查找）
+///
+/// 索引在 `insert`、`remove`、`save_container`、`delete_container_with_projects` 中同步维护。
 #[derive(Clone)]
 pub struct ProjectAdapter {
     /// project_id → project 信息（主存储）
@@ -39,6 +48,14 @@ pub struct ProjectAdapter {
     project_to_container: DashMap<String, String>,
     /// RAII 清理通道（unbounded，send 是同步的）
     cleanup_tx: tokio::sync::mpsc::UnboundedSender<CleanupRequest>,
+
+    // === 反向索引（CQRS：写入时维护，读取时 O(1)） ===
+    /// container_id → container_key（按容器 ID 快速查找）
+    container_id_to_key: DashMap<String, String>,
+    /// user_id → project_id（按用户 ID 快速查找）
+    user_id_to_project_id: DashMap<String, String>,
+    /// pod_id → project_id（按 pod ID 快速查找）
+    pod_id_to_project_id: DashMap<String, String>,
 }
 
 impl ProjectAdapter {
@@ -54,6 +71,9 @@ impl ProjectAdapter {
             session_index: DashMap::new(),
             project_to_container: DashMap::new(),
             cleanup_tx: tx,
+            container_id_to_key: DashMap::new(),
+            user_id_to_project_id: DashMap::new(),
+            pod_id_to_project_id: DashMap::new(),
         };
         info!("[STORAGE] ProjectAdapter initialized (DashMap, RAII enabled)");
         (adapter, rx)
@@ -123,8 +143,25 @@ impl ProjectAdapter {
 
         // 写入主存储和索引
         self.project_to_container
-            .insert(project_id.clone(), container_key);
-        self.projects.insert(project_id, info);
+            .insert(project_id.clone(), container_key.clone());
+        self.projects.insert(project_id.clone(), info.clone());
+
+        // 维护反向索引
+        // container_id → container_key（更新 save_container 暂存的值）
+        if let Some(container) = info.container() {
+            self.container_id_to_key
+                .insert(container.container_id.clone(), container_key);
+        }
+        // user_id → project_id
+        if let Some(uid) = info.user_id() {
+            self.user_id_to_project_id
+                .insert(uid.to_string(), project_id.clone());
+        }
+        // pod_id → project_id
+        if let Some(pid) = info.pod_id() {
+            self.pod_id_to_project_id
+                .insert(pid.to_string(), project_id);
+        }
         Ok(())
     }
 
@@ -139,6 +176,14 @@ impl ProjectAdapter {
         // 2. 从已获取的 info 中读取 session_id（无需再锁 projects map）
         if let Some(sid) = info.session_id() {
             self.session_index.remove(sid);
+        }
+
+        // 2.1 清理反向索引
+        if let Some(uid) = info.user_id() {
+            self.user_id_to_project_id.remove(uid);
+        }
+        if let Some(pid) = info.pod_id() {
+            self.pod_id_to_project_id.remove(pid);
         }
 
         // 3. 清理 container 映射（防御性：即使映射缺失也返回已获取的 info）
@@ -436,34 +481,37 @@ impl ProjectAdapter {
                         e.insert(Arc::new(ContainerEntry::with_ref_count(container.clone(), st, 0)));
                     }
                 }
+                // 维护反向索引：container_id → container_key
+                // 此时 container_key 可能尚未注册（insert 未调用），
+                // 先暂存 container_id 本身，insert 被调用时再更新为正确的 container_key。
+                self.container_id_to_key
+                    .insert(container.container_id.clone(), container.container_id.clone());
             }
         }
         Ok(())
     }
 
-    /// 获取容器信息（按 container_id 查找）
+    /// 获取容器信息（按 container_id 查找，O(1) 索引查找）
     pub fn get_container(&self, container_id: &str) -> Option<ContainerBasicInfo> {
-        self.containers
-            .iter()
-            .find(|e| e.value().info().container_id == container_id)
-            .map(|e| e.value().info())
+        let container_key = self.container_id_to_key.get(container_id)?;
+        self.containers.view(container_key.value(), |_, ce| ce.info())
     }
 
     /// 删除容器及其关联的所有项目（RAII 触发物理销毁）
     ///
     /// 返回 (容器是否存在, 删除的项目数)
     pub fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize) {
-        // 收集所有关联此容器的 project_id
-        let project_ids: Vec<String> = self
-            .projects
-            .iter()
-            .filter(|e| {
-                e.container()
-                    .map(|c| c.container_id == container_id)
-                    .unwrap_or(false)
-            })
-            .map(|e| e.key().clone())
-            .collect();
+        // 收集所有关联此容器的 project_id（通过索引 O(1) + O(n)）
+        let container_key = self.container_id_to_key.get(container_id).map(|r| r.value().clone());
+        let project_ids: Vec<String> = match &container_key {
+            Some(ck) => self
+                .project_to_container
+                .iter()
+                .filter(|e| e.value() == ck)
+                .map(|e| e.key().clone())
+                .collect(),
+            None => vec![],
+        };
 
         let count = project_ids.len();
 
@@ -473,18 +521,27 @@ impl ProjectAdapter {
         }
 
         // 如果容器条目还存在（没有 project 触发清理），用 entry 原子移除
+        // 先通过索引 O(1) 查找 container_key
         let ck_to_remove: Option<String> = self
-            .containers
-            .iter()
-            .find(|e| e.value().info().container_id == container_id)
-            .map(|e| e.key().clone());
+            .container_id_to_key
+            .get(container_id)
+            .map(|r| r.value().clone())
+            .or_else(|| {
+                // 索引未命中时回退到遍历（防御性）
+                self.containers
+                    .iter()
+                    .find(|e| e.value().info().container_id == container_id)
+                    .map(|e| e.key().clone())
+            });
 
         let container_existed = ck_to_remove.is_some();
         if let Some(ck) = ck_to_remove
             && let Entry::Occupied(e) = self.containers.entry(ck)
         {
             let (container_key, entry) = e.remove_entry();
+            // 清理反向索引
             let info = entry.info();
+            self.container_id_to_key.remove(&info.container_id);
             let _ = self.cleanup_tx.send(CleanupRequest {
                 identifier: container_key,
                 container_name: info.container_name,
@@ -518,46 +575,46 @@ impl ProjectAdapter {
     }
 
     /// 根据 container_id 获取关联的项目列表
+    ///
+    /// 先通过 `container_id_to_key` 索引找到 container_key，
+    /// 再通过 `project_to_container` 反向索引找到关联的 project_id。
     pub fn get_projects_by_container_id(
         &self,
         container_id: &str,
     ) -> Vec<Arc<ProjectAndContainerInfo>> {
-        self.projects
+        // 通过索引找到 container_key
+        let container_key = match self.container_id_to_key.get(container_id) {
+            Some(r) => r.value().clone(),
+            None => return vec![],
+        };
+        // 通过 project_to_container 反向索引找到关联的 project_id
+        self.project_to_container
             .iter()
-            .filter(|e| {
-                e.container()
-                    .map(|c| c.container_id == container_id)
-                    .unwrap_or(false)
-            })
-            .map(|e| e.value().clone())
+            .filter(|e| e.value() == &container_key)
+            .filter_map(|e| self.projects.view(e.key(), |_, v| v.clone()))
             .collect()
     }
 
     // ========== ComputerAgentRunner 模式 ==========
 
-    /// 通过 user_id 获取容器信息
+    /// 通过 user_id 获取容器信息（O(1) 索引查找）
     pub fn get_container_by_user_id(&self, user_id: &str) -> Option<ContainerBasicInfo> {
-        self.projects.iter().find_map(|e| {
-            if e.value().user_id() == Some(user_id) {
-                e.value().container().cloned()
-            } else {
-                None
-            }
-        })
+        let project_id = self.user_id_to_project_id.get(user_id)?;
+        let info = self.projects.view(project_id.value(), |_, v| v.clone())?;
+        info.container().cloned()
     }
 
-    /// 通过 pod_id 获取容器信息
+    /// 通过 pod_id 获取容器信息（O(1) 索引查找）
     pub fn get_container_by_pod_id(&self, pod_id: &str) -> Option<ContainerBasicInfo> {
-        self.projects.iter().find_map(|e| {
-            if e.value().pod_id() == Some(pod_id) {
-                e.value().container().cloned()
-            } else {
-                None
-            }
-        })
+        let project_id = self.pod_id_to_project_id.get(pod_id)?;
+        let info = self.projects.view(project_id.value(), |_, v| v.clone())?;
+        info.container().cloned()
     }
 
     /// 通过 user_id 查找所有项目
+    ///
+    /// 注意：一个 user_id 可能关联多个 project，索引仅存储最新一个。
+    /// 此方法保留全量遍历以确保返回完整结果。
     pub fn find_projects_by_user_id(
         &self,
         user_id: &str,
@@ -569,13 +626,15 @@ impl ProjectAdapter {
             .collect()
     }
 
-    /// 通过 pod_id 查找所有项目
+    /// 通过 pod_id 查找所有项目（O(1) 索引查找）
     pub fn find_projects_by_pod_id(&self, pod_id: &str) -> Vec<Arc<ProjectAndContainerInfo>> {
-        self.projects
-            .iter()
-            .filter(|e| e.value().pod_id() == Some(pod_id))
-            .map(|e| e.value().clone())
-            .collect()
+        // 通过索引快速找到 project_id，再从 projects 获取完整信息
+        if let Some(project_id) = self.pod_id_to_project_id.get(pod_id)
+            && let Some(info) = self.projects.view(project_id.value(), |_, v| v.clone())
+        {
+            return vec![info];
+        }
+        vec![]
     }
 
     // ========== 清理相关 ==========
@@ -705,6 +764,8 @@ impl ProjectAdapter {
         if remaining == 0 {
             let (ck, entry) = entry.remove_entry();
             let info = entry.info();
+            // 清理反向索引
+            self.container_id_to_key.remove(&info.container_id);
             info!(
                 "[STORAGE] RAII: container refcount=0, sending cleanup for {}",
                 info.container_name
@@ -726,6 +787,9 @@ impl std::fmt::Debug for ProjectAdapter {
             .field("projects", &self.projects.len())
             .field("containers", &self.containers.len())
             .field("sessions", &self.session_index.len())
+            .field("idx_container_id", &self.container_id_to_key.len())
+            .field("idx_user_id", &self.user_id_to_project_id.len())
+            .field("idx_pod_id", &self.pod_id_to_project_id.len())
             .finish()
     }
 }
@@ -1489,5 +1553,291 @@ mod tests {
 
         let cleanups = drain_cleanup_requests(&rx);
         assert_eq!(cleanups.len(), 5, "5 rounds should produce 5 cleanup requests");
+    }
+
+    // ========== 索引一致性测试 ==========
+
+    #[test]
+    fn test_index_container_id_lookup() {
+        // save_container + insert 后，get_container 通过索引 O(1) 查找
+        let adapter = make_adapter();
+
+        let container = ContainerBasicInfo {
+            container_id: "cid-123".to_string(),
+            container_name: "test-container".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: "proj-1".to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://test".to_string(),
+        };
+
+        // save_container 注册容器
+        adapter
+            .save_container(&container, Some(ServiceType::RCoder))
+            .unwrap();
+
+        // insert 关联项目（container_key = project_id for RCoder without pod_id）
+        let mut info = create_test_info("proj-1");
+        info.set_container(Some(container.clone()));
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info))
+            .unwrap();
+
+        // get_container 通过索引查找
+        let found = adapter.get_container("cid-123");
+        assert!(found.is_some(), "get_container 应通过索引找到容器");
+        assert_eq!(found.unwrap().container_id, "cid-123");
+
+        // 不存在的 container_id
+        assert!(adapter.get_container("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_index_user_id_lookup() {
+        // insert 后，get_container_by_user_id 通过索引 O(1) 查找
+        let adapter = make_adapter();
+
+        let container = ContainerBasicInfo {
+            container_id: "cid-user-1".to_string(),
+            container_name: "user-container".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: "proj-1".to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://test".to_string(),
+        };
+
+        let mut info = ProjectAndContainerInfo::from_parts(
+            "proj-1".to_string(),
+            Some("user-abc".to_string()),
+            None,
+            None,
+            Some(container),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::ComputerAgentRunner),
+                ..Default::default()
+            },
+        );
+        info.set_service_type(Some(ServiceType::ComputerAgentRunner));
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info))
+            .unwrap();
+
+        // 通过 user_id 查找容器
+        let found = adapter.get_container_by_user_id("user-abc");
+        assert!(found.is_some(), "get_container_by_user_id 应通过索引找到容器");
+        assert_eq!(found.unwrap().container_id, "cid-user-1");
+
+        // 不存在的 user_id
+        assert!(adapter.get_container_by_user_id("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_index_pod_id_lookup() {
+        // insert 后，get_container_by_pod_id 和 find_projects_by_pod_id 通过索引 O(1) 查找
+        let adapter = make_adapter();
+
+        let container = ContainerBasicInfo {
+            container_id: "cid-pod-1".to_string(),
+            container_name: "pod-container".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: "proj-1".to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://test".to_string(),
+        };
+
+        let mut info = ProjectAndContainerInfo::from_parts(
+            "proj-1".to_string(),
+            None,
+            Some("pod-abc".to_string()),
+            None,
+            Some(container),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::RCoder),
+                ..Default::default()
+            },
+        );
+        info.set_service_type(Some(ServiceType::RCoder));
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info))
+            .unwrap();
+
+        // get_container_by_pod_id
+        let found = adapter.get_container_by_pod_id("pod-abc");
+        assert!(found.is_some(), "get_container_by_pod_id 应通过索引找到容器");
+
+        // find_projects_by_pod_id
+        let projects = adapter.find_projects_by_pod_id("pod-abc");
+        assert_eq!(projects.len(), 1, "find_projects_by_pod_id 应返回 1 个项目");
+        assert_eq!(projects[0].project_id(), "proj-1");
+
+        // 不存在的 pod_id
+        assert!(adapter.get_container_by_pod_id("nonexistent").is_none());
+        assert!(adapter.find_projects_by_pod_id("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_index_cleanup_on_remove() {
+        // remove 后 user_id/pod_id 索引应被清理
+        let adapter = make_adapter();
+
+        let container = ContainerBasicInfo {
+            container_id: "cid-cleanup".to_string(),
+            container_name: "cleanup-container".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: "proj-1".to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://test".to_string(),
+        };
+
+        let mut info = ProjectAndContainerInfo::from_parts(
+            "proj-1".to_string(),
+            Some("user-cleanup".to_string()),
+            Some("pod-cleanup".to_string()),
+            None,
+            Some(container),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::RCoder),
+                ..Default::default()
+            },
+        );
+        info.set_service_type(Some(ServiceType::RCoder));
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info))
+            .unwrap();
+
+        // 索引存在
+        assert!(adapter.user_id_to_project_id.contains_key("user-cleanup"));
+        assert!(adapter.pod_id_to_project_id.contains_key("pod-cleanup"));
+        assert!(adapter.container_id_to_key.contains_key("cid-cleanup"));
+
+        // remove 后索引应被清理
+        adapter.remove("proj-1");
+        assert!(
+            !adapter.user_id_to_project_id.contains_key("user-cleanup"),
+            "user_id 索引应在 remove 后被清理"
+        );
+        assert!(
+            !adapter.pod_id_to_project_id.contains_key("pod-cleanup"),
+            "pod_id 索引应在 remove 后被清理"
+        );
+        // container_id_to_key 在 dec_container_ref 中清理（ref_count=0 时）
+        assert!(
+            !adapter.container_id_to_key.contains_key("cid-cleanup"),
+            "container_id_to_key 索引应在 RAII 清理后被清理"
+        );
+    }
+
+    #[test]
+    fn test_index_cleanup_on_delete_container_with_projects() {
+        // delete_container_with_projects 后所有索引应被清理
+        let adapter = make_adapter();
+
+        let container = ContainerBasicInfo {
+            container_id: "cid-del".to_string(),
+            container_name: "del-container".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: "proj-1".to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://test".to_string(),
+        };
+
+        let mut info = ProjectAndContainerInfo::from_parts(
+            "proj-1".to_string(),
+            Some("user-del".to_string()),
+            None,
+            None,
+            Some(container.clone()),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::ComputerAgentRunner),
+                ..Default::default()
+            },
+        );
+        info.set_service_type(Some(ServiceType::ComputerAgentRunner));
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info))
+            .unwrap();
+
+        // 索引存在
+        assert!(adapter.container_id_to_key.contains_key("cid-del"));
+        assert!(adapter.user_id_to_project_id.contains_key("user-del"));
+
+        // delete_container_with_projects 清理所有
+        // 注意：remove 已通过 RAII 清理了容器（ref_count=0），所以 existed=false
+        let (existed, count) = adapter.delete_container_with_projects("cid-del");
+        assert!(!existed, "容器已被 RAII 清理（remove 时 ref_count 归零）");
+        assert_eq!(count, 1, "应删除 1 个项目");
+
+        // 索引应全部清理
+        assert!(
+            !adapter.container_id_to_key.contains_key("cid-del"),
+            "container_id_to_key 索引应在 delete_container_with_projects 后被清理"
+        );
+        assert!(
+            !adapter.user_id_to_project_id.contains_key("user-del"),
+            "user_id 索引应在 delete_container_with_projects 后被清理"
+        );
+        assert!(
+            adapter.containers.is_empty(),
+            "容器应在 delete_container_with_projects 后被清理"
+        );
+    }
+
+    #[test]
+    fn test_index_consistency_under_raii() {
+        // 验证 RAII 清理后索引一致性：多个 project 共享容器
+        let (adapter, _rx) = ProjectAdapter::new();
+
+        let container = ContainerBasicInfo {
+            container_id: "cid-shared".to_string(),
+            container_name: "shared-container".to_string(),
+            container_ip: "10.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: String::new(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://shared".to_string(),
+        };
+
+        // 两个 project 共享同一容器（同一 user_id → container_key = user_id）
+        let info1 = create_shared_project("proj-1", "user-shared", &container);
+        let info2 = create_shared_project("proj-2", "user-shared", &container);
+
+        adapter.insert("proj-1".to_string(), Arc::new(info1)).unwrap();
+        adapter.insert("proj-2".to_string(), Arc::new(info2)).unwrap();
+
+        assert_eq!(adapter.containers.len(), 1, "共享容器应只有 1 个条目");
+        assert!(adapter.container_id_to_key.contains_key("cid-shared"));
+
+        // 移除 proj-1：容器不销毁（ref_count > 0），索引保留
+        adapter.remove("proj-1");
+        assert_eq!(adapter.containers.len(), 1, "容器应保留（还有 proj-2 引用）");
+
+        // 移除 proj-2：容器销毁（ref_count = 0），索引清理
+        adapter.remove("proj-2");
+        assert_eq!(adapter.containers.len(), 0, "容器应在最后一个 project 移除后销毁");
+        assert!(
+            !adapter.container_id_to_key.contains_key("cid-shared"),
+            "container_id_to_key 索引应在 RAII 清理后被清理"
+        );
+        assert!(
+            !adapter.user_id_to_project_id.contains_key("user-shared"),
+            "user_id 索引应在 remove 后被清理"
+        );
     }
 }
