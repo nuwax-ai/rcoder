@@ -48,6 +48,7 @@ docker-build-master:
 		echo "🔒 master-rcoder 生产模式（无 eBPF 调试）"; \
 	fi; \
 	docker build \
+		--build-arg BASE_IMAGE=dev-master-rcoder-base:latest \
 		--build-arg CARGO_FLAGS="$$MASTER_CARGO_FLAGS" \
 		--build-arg CACHEBUST=$$(date +%s) \
 		-f docker/rcoder-master/Dockerfile -t dev-master-rcoder:latest .;)
