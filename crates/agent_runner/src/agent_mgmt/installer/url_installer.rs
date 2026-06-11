@@ -341,8 +341,13 @@ pub(crate) async fn download_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::StreamExt;
-    use std::io::Write;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{StatusCode, header};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use std::net::SocketAddr;
     use std::time::Duration;
 
     #[test]
@@ -357,101 +362,255 @@ mod tests {
         url.starts_with("http://") || url.starts_with("https://")
     }
 
-    /// 测试真实 URL 下载(限制下载大小避免测试太慢)
-    #[tokio::test]
-    #[ignore] // 依赖外部网络，手动运行: cargo test -- --ignored
-    async fn download_to_file_real_url() {
-        let url = "https://s3.nuwax.com:9443/nuwaclaw/nuwaclaw-electron/electron-v0.11.43/NuwaClaw-0.11.43-arm64-mac.zip";
-        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
-        let dest = tmp_dir.join("test-download.zip");
+    // ========== 本地 HTTP 测试服务器 ==========
 
-        // 清理
-        let _ = std::fs::remove_file(&dest);
+    /// 测试数据：100KB 的伪随机数据（可预测，便于验证完整性）
+    fn test_data() -> Vec<u8> {
+        let size = 100 * 1024; // 100KB
+        (0..size).map(|i| (i % 251) as u8).collect() // 251 是质数，避免周期性
+    }
 
-        // 限制只下载前 1MB(文件总大小 ~393MB)
-        let max_bytes = 1024 * 1024;
-        let result = download_to_file(url, &dest, max_bytes, None, &CancellationToken::new()).await;
+    /// 启动本地 HTTP 服务器，返回绑定地址
+    async fn start_server(app: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // 等待服务器就绪
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        addr
+    }
 
-        // 应该成功(下载了 1MB 后超限报错,或服务器不支持 Range 时下载完整小块)
-        // 实际行为取决于服务器是否支持 Range
-        match result {
-            Ok(size) => {
-                assert!(size > 0, "downloaded size should be > 0");
-                assert!(size <= max_bytes, "should not exceed max_bytes");
-                // 验证文件存在且大小一致
-                let file_size = std::fs::metadata(&dest).unwrap().len();
-                assert_eq!(file_size, size, "file size should match returned size");
-                println!("downloaded {} bytes", size);
-            }
-            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
-                // 下载超过 max_bytes 也是预期行为(服务器不支持 Range 时)
-                assert!(size > max, "should report actual size > max");
-                println!("file too large: {} bytes (max {})", size, max);
-            }
-            Err(e) => {
-                panic!("unexpected error: {}", e);
+    /// 支持 Range 请求的处理器（模拟 S3/OSS）
+    async fn handler_with_range(req: Request<Body>) -> Response {
+        let data = test_data();
+        let total_size = data.len() as u64;
+        let headers = req.headers();
+
+        if let Some(range_header) = headers.get(header::RANGE) {
+            let range_str = range_header.to_str().unwrap_or("");
+            if let Some(range) = parse_range(range_str, total_size) {
+                let content = &data[range.0 as usize..range.1 as usize];
+                let mut resp = Response::new(Body::from(content.to_vec()));
+                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                resp.headers_mut().insert(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", range.0, range.1 - 1, total_size)
+                        .parse()
+                        .unwrap(),
+                );
+                resp.headers_mut().insert(
+                    header::CONTENT_LENGTH,
+                    content.len().to_string().parse().unwrap(),
+                );
+                resp.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    "application/octet-stream".parse().unwrap(),
+                );
+                return resp;
             }
         }
 
-        // 清理
-        let _ = std::fs::remove_file(&dest);
+        // 无 Range 或 Range 无效，返回完整内容
+        let mut resp = Response::new(Body::from(data));
+        resp.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            total_size.to_string().parse().unwrap(),
+        );
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        resp
     }
 
-    /// 测试断点续传:先写入部分文件,再下载剩余部分
-    #[tokio::test]
-    #[ignore] // 依赖外部网络
-    async fn download_to_file_resume() {
-        let url = "https://s3.nuwax.com:9443/nuwaclaw/nuwaclaw-electron/electron-v0.11.43/NuwaClaw-0.11.43-arm64-mac.zip";
-        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
-        let dest = tmp_dir.join("test-resume.zip");
+    /// 不支持 Range 的处理器（模拟 MinIO 默认行为）
+    async fn handler_no_range(_req: Request<Body>) -> Response {
+        let data = test_data();
+        let len = data.len();
+        let mut resp = Response::new(Body::from(data));
+        resp.headers_mut()
+            .insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        resp
+    }
 
-        // 清理
+    /// 404 处理器
+    async fn handler_404() -> impl IntoResponse {
+        StatusCode::NOT_FOUND
+    }
+
+    /// 解析 Range: bytes=start-end
+    fn parse_range(range_str: &str, total_size: u64) -> Option<(u64, u64)> {
+        let range_str = range_str.strip_prefix("bytes=")?;
+        if let Some((start_str, end_str)) = range_str.split_once('-') {
+            let start: u64 = start_str.parse().ok()?;
+            let end: u64 = if end_str.is_empty() {
+                total_size - 1
+            } else {
+                end_str.parse().ok()?
+            };
+            if start <= end && end < total_size {
+                return Some((start, end + 1)); // [start, end) 半开区间
+            }
+        }
+        None
+    }
+
+    // ========== 本地 HTTP 服务器测试（替代 #[ignore] 测试） ==========
+
+    /// 测试基本下载（本地服务器）
+    #[tokio::test]
+    async fn test_download_basic() {
+        let app = Router::new().route("/file", get(handler_with_range));
+        let addr = start_server(app).await;
+        let url = format!("http://{}/file", addr);
+
+        let dest = std::env::temp_dir().join("test-download-basic.bin");
         let _ = std::fs::remove_file(&dest);
 
-        // 先下载前 100KB
-        let first_bytes = 100 * 1024;
-        let result1 = download_to_file(url, &dest, first_bytes, None, &CancellationToken::new()).await;
+        let max_bytes = test_data().len() as u64 * 2; // 足够大
+        let result =
+            download_to_file(&url, &dest, max_bytes, None, &CancellationToken::new()).await;
 
-        let downloaded = match result1 {
-            Ok(size) => size,
-            Err(AgentMgmtError::BinaryTooLarge { .. }) => {
-                // 服务器不支持 Range,整个文件太大,跳过续传测试
-                let _ = std::fs::remove_file(&dest);
-                println!("server does not support Range, skipping resume test");
-                return;
+        match result {
+            Ok(size) => {
+                assert_eq!(size, test_data().len() as u64);
+                let file_content = std::fs::read(&dest).unwrap();
+                assert_eq!(file_content, test_data());
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&dest);
-                panic!("first download failed: {}", e);
+                panic!("download failed: {}", e);
             }
-        };
+        }
 
-        assert!(downloaded > 0, "first download should get some bytes");
-        let file_size_1 = std::fs::metadata(&dest).unwrap().len();
-        assert_eq!(file_size_1, downloaded);
+        let _ = std::fs::remove_file(&dest);
+    }
 
-        // 现在用更大的 max_bytes 继续下载(续传)
-        let max_bytes = 200 * 1024; // 200KB
-        let result2 = download_to_file(url, &dest, max_bytes, None, &CancellationToken::new()).await;
+    /// 测试 max_bytes 限制（下载过程中超限）
+    #[tokio::test]
+    async fn test_download_max_bytes() {
+        let app = Router::new().route("/file", get(handler_with_range));
+        let addr = start_server(app).await;
+        let url = format!("http://{}/file", addr);
 
-        match result2 {
-            Ok(total_size) => {
-                // 续传成功,文件应该更大了
-                let file_size_2 = std::fs::metadata(&dest).unwrap().len();
-                assert_eq!(file_size_2, total_size);
-                // 如果服务器支持 Range,文件应该从断点继续
-                // 如果不支持,文件会被重新下载
-                println!(
-                    "resume: first={}, total={}, grew by {} bytes",
-                    downloaded,
-                    total_size,
-                    total_size - downloaded
+        let dest = std::env::temp_dir().join("test-download-maxbytes.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        // max_bytes 小于文件大小（100KB），下载过程中触发 BinaryTooLarge
+        let max_bytes = 30 * 1024u64; // 30KB
+        let result =
+            download_to_file(&url, &dest, max_bytes, None, &CancellationToken::new()).await;
+
+        match result {
+            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
+                assert!(size > max, "should report actual > max");
+                assert_eq!(max, max_bytes);
+                // size 是下载到超限时的实际字节数（略大于 max_bytes）
+                assert!(size > max_bytes, "size should exceed max_bytes");
+            }
+            other => {
+                let _ = std::fs::remove_file(&dest);
+                panic!("expected BinaryTooLarge, got: {:?}", other);
+            }
+        }
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// 测试 404 错误不重试（本地服务器）
+    #[tokio::test]
+    async fn test_download_404_no_retry() {
+        let app = Router::new().route("/notfound", get(handler_404));
+        let addr = start_server(app).await;
+        let url = format!("http://{}/notfound", addr);
+
+        let dest = std::env::temp_dir().join("test-download-404.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        let result =
+            download_to_file(&url, &dest, 1024, None, &CancellationToken::new()).await;
+
+        match result {
+            Err(AgentMgmtError::InstallFailed(msg)) => {
+                assert!(
+                    msg.contains("404") || msg.contains("HTTP"),
+                    "should be HTTP 404 error: {}",
+                    msg
                 );
             }
-            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
-                println!("resume: file too large after resume: {} (max {})", size, max);
+            other => {
+                let _ = std::fs::remove_file(&dest);
+                panic!("expected InstallFailed with HTTP 404, got: {:?}", other);
+            }
+        }
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// 测试断点续传（本地服务器，支持 Range）
+    ///
+    /// 1. 手动下载前半部分到文件（模拟中断）
+    /// 2. 调用 download_to_file 续传（max_bytes 足够大）
+    /// 3. 验证文件完整性
+    #[tokio::test]
+    async fn test_download_resume() {
+        let app = Router::new().route("/file", get(handler_with_range));
+        let addr = start_server(app).await;
+        let url = format!("http://{}/file", addr);
+
+        let dest = std::env::temp_dir().join("test-download-resume.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        // Step 1: 手动下载前 30KB（模拟中断）
+        let partial_size = 30 * 1024usize;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("Range", format!("bytes=0-{}", partial_size - 1))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 206, "server should support Range");
+        let partial_bytes = resp.bytes().await.unwrap();
+        assert_eq!(partial_bytes.len(), partial_size);
+        std::fs::write(&dest, &partial_bytes).unwrap();
+
+        let first_50: Vec<u8> = partial_bytes[..50].to_vec();
+
+        // Step 2: 调用 download_to_file 续传
+        let max_bytes = test_data().len() as u64 * 2; // 足够大
+        let result =
+            download_to_file(&url, &dest, max_bytes, None, &CancellationToken::new()).await;
+
+        match result {
+            Ok(total) => {
+                let file_size = std::fs::metadata(&dest).unwrap().len();
+                assert_eq!(file_size, total);
+                assert!(
+                    total > partial_size as u64,
+                    "should have grown: {} > {}",
+                    total,
+                    partial_size
+                );
+                // 验证续传后文件内容正确
+                let final_content = std::fs::read(&dest).unwrap();
+                assert_eq!(
+                    final_content,
+                    test_data(),
+                    "final content should match test data"
+                );
+                // 验证前 50 字节保持不变（Range 续传不覆盖已有数据）
+                assert_eq!(
+                    &final_content[..50],
+                    &first_50[..],
+                    "first 50 bytes should be preserved after resume"
+                );
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&dest);
@@ -459,140 +618,43 @@ mod tests {
             }
         }
 
-        // 清理
         let _ = std::fs::remove_file(&dest);
     }
 
-    /// 测试 4xx 错误不重试
+    /// 测试不支持 Range 的服务器（模拟 MinIO）
+    ///
+    /// 服务器忽略 Range 头，返回完整文件。
+    /// 已有部分文件会被重新下载覆盖。
     #[tokio::test]
-    #[ignore] // 依赖外部网络 (httpbin.org)
-    async fn download_to_file_404_no_retry() {
-        let url = "https://httpbin.org/status/404";
-        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
-        let dest = tmp_dir.join("test-404.zip");
+    async fn test_download_no_resume() {
+        let app = Router::new().route("/file", get(handler_no_range));
+        let addr = start_server(app).await;
+        let url = format!("http://{}/file", addr);
+
+        let dest = std::env::temp_dir().join("test-download-noresume.bin");
         let _ = std::fs::remove_file(&dest);
 
-        let result = download_to_file(url, &dest, 1024, None, &CancellationToken::new()).await;
-
-        match result {
-            Err(AgentMgmtError::InstallFailed(msg)) => {
-                assert!(msg.contains("HTTP 404"), "should be HTTP 404 error: {}", msg);
-            }
-            other => panic!("expected InstallFailed with HTTP 404, got: {:?}", other),
-        }
-
-        let _ = std::fs::remove_file(&dest);
-    }
-
-    /// 断点续传验证(阿里云 OSS,支持 Range):
-    /// 1. 手动下载前 500KB 到文件(模拟中断)
-    /// 2. 调用 download_to_file 续传
-    /// 3. 验证文件增长 + 数据完整性
-    #[tokio::test]
-    #[ignore] // 依赖外部网络 (阿里云 OSS)
-    async fn download_resume_oss() {
-        let url = "https://nuwa-packages.oss-rg-china-mainland.aliyuncs.com/docker/20260529122753/docker-aarch64.zip";
-        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
-        let dest = tmp_dir.join("test-resume-oss.zip");
-        let _ = std::fs::remove_file(&dest);
-
-        // === Step 1: 手动下载前 500KB ===
-        let partial_size: u64 = 500 * 1024;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap();
-        let resp = client.get(url).send().await.unwrap();
-        assert!(resp.status().is_success(), "should be 200");
-
-        let mut file = std::fs::File::create(&dest).unwrap();
-        let mut written: u64 = 0;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.unwrap();
-            let remaining = partial_size - written;
-            if remaining == 0 {
-                break;
-            }
-            let write_len = (chunk.len() as u64).min(remaining);
-            file.write_all(&chunk[..write_len as usize]).unwrap();
-            written += write_len;
-        }
-        file.flush().unwrap();
-        drop(file);
-        println!("[step1] wrote {} bytes (simulated interrupt)", written);
-
-        let first_100: Vec<u8> = std::fs::read(&dest).unwrap()[..100].to_vec();
-
-        // === Step 2: 调用 download_to_file 续传(max_bytes 设大,允许完成) ===
-        let max_bytes = 5 * 1024 * 1024; // 5MB (测试文件更大,但只要超过续传后的大小即可验证)
-        let result = download_to_file(url, &dest, max_bytes, None, &CancellationToken::new()).await;
-
-        match result {
-            Ok(total) => {
-                // 续传成功完成
-                let file_size = std::fs::metadata(&dest).unwrap().len();
-                assert_eq!(file_size, total);
-                assert!(total > written, "should have grown: {} > {}", total, written);
-
-                let final_content = std::fs::read(&dest).unwrap();
-                assert_eq!(&final_content[..100], &first_100[..], "first 100 bytes preserved");
-
-                println!(
-                    "[resume OK] {} → {} bytes (grew {}), first 100 bytes intact",
-                    written, total, total - written
-                );
-            }
-            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
-                // 文件超过 5MB,但续传逻辑已正确工作(文件被清理)
-                println!(
-                    "[resume OK but exceeded] file grew beyond {}MB: {} bytes",
-                    max / 1024 / 1024, size
-                );
-                // 验证:续传前 512000,续传后应远大于此
-                assert!(size > written, "should have grown beyond partial: {} > {}", size, written);
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&dest);
-                panic!("resume failed: {}", e);
-            }
-        }
-
-        let _ = std::fs::remove_file(&dest);
-    }
-
-    /// MinIO 不支持 Range:验证下载到 max_bytes 后正确返回 BinaryTooLarge
-    #[tokio::test]
-    #[ignore] // 依赖外部网络 (MinIO)
-    async fn download_no_resume_minio() {
-        let url = "https://s3.nuwax.com:9443/nuwaclaw/nuwaclaw-electron/electron-v0.11.43/NuwaClaw-0.11.43-arm64-mac.zip";
-        let tmp_dir = std::env::temp_dir().join("agent-mgmt-download-test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
-        let dest = tmp_dir.join("test-no-resume-minio.zip");
-        let _ = std::fs::remove_file(&dest);
-
-        // 先写入 100KB 模拟中断
-        let partial = vec![0xABu8; 100 * 1024];
+        // 先写入部分数据模拟中断
+        let partial = vec![0xABu8; 30 * 1024];
         std::fs::write(&dest, &partial).unwrap();
 
-        // 尝试续传,但服务器不支持 Range → 从头下载 → 超限
-        let max_bytes = 1024 * 1024; // 1MB
-        let result = download_to_file(url, &dest, max_bytes, None, &CancellationToken::new()).await;
+        // 尝试续传，但服务器不支持 Range → 从头下载 → 成功（max_bytes 足够大）
+        let max_bytes = test_data().len() as u64 * 2;
+        let result =
+            download_to_file(&url, &dest, max_bytes, None, &CancellationToken::new()).await;
 
         match result {
-            Err(AgentMgmtError::BinaryTooLarge { size, max }) => {
-                assert!(size > max, "should report actual > max");
-                println!("[no-resume OK] MinIO returned full file, caught at {} bytes (max {})", size, max);
+            Ok(size) => {
+                // 服务器不支持 Range，从头下载成功
+                assert_eq!(size, test_data().len() as u64);
+                let file_content = std::fs::read(&dest).unwrap();
+                assert_eq!(file_content, test_data());
+                // 文件被重新下载，不是续传
+                assert_ne!(&file_content[..30], &partial[..], "should be重新下载，不是续传");
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&dest);
                 panic!("unexpected error: {}", e);
-            }
-            Ok(size) => {
-                // 如果文件刚好小于 1MB(不太可能,文件 393MB)
-                println!("[unexpected] download completed: {} bytes", size);
             }
         }
 
