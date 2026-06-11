@@ -35,10 +35,10 @@ publish = false
 
 [workspace.dependencies]
 # ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）
-agent-client-protocol = { version = "0.12.1", features = ["unstable_session_usage"] }
+agent-client-protocol = { version = "0.14" }
 
-# MCP 协议 - rmcp 官方库 (升级到 0.12 以兼容 SACP)
-rmcp = { version = "0.12.0", features = ["server", "client", "transport-io", "transport-child-process", "schemars"] }
+# MCP 协议 - rmcp 官方库
+rmcp = { version = "1.7"}
 
 piper = "0.2"
 
